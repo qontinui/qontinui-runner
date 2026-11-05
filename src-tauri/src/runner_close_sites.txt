@@ -78,6 +78,7 @@ mcp/backend_relay.rs | end_admitted_terminal | helper | end_admitted_terminal(
 mcp/backend_relay.rs | handle_terminal_end | relay | TARGET `terminal_end` from a source device under an attach grant (no user-session stamp): graceful → refused `no_close_authority` on a live claude, `NoLiveClaude` → the bare shell's close; `force` → `tm.close`
 
 # ── the relay's other closes
+mcp/backend_relay.rs | end_under_create_grant | relay | TARGET `terminal_end` from a source device under the CREATE grant that spawned the pane (plan 2026-09-23-remote-create-residuals Phase 2), admitted by `admit_create_grant_end` only for the tombstone's own terminal while no attach grant has ever bound it; graceful → refused `no_close_authority` on a live claude, `force` → `tm.close`
 mcp/backend_relay.rs | handle_terminal_close | relay | TARGET `terminal_close` from the relay — qontinui-web's user-session terminal path, which carries no `origin: user_session` stamp before P6f-1
 mcp/backend_relay.rs | handle_inbound | exempt | a terminal never handed to a session: a remote create whose `terminal_created` reply could not be delivered (`deliver_create_reply`), closed before any source learned its id
 mcp/backend_relay.rs | handle_terminal_create | exempt | a terminal never handed to a session: a remote create whose coord registration failed (`settle_remote_registration`), closed and the create refused before any reply
@@ -92,6 +93,7 @@ mcp/backend_relay.rs | terminal_gone_after_confirm | exempt | closes the coord r
 mcp/remote_terminal.rs | end | helper | client().end(
 commands/remote_end.rs | end_remote_session | helper | end_remote_session(
 commands/remote_end.rs | remote_session_end | webview | the plain `remote_session_end` Tauri command (the single-session end flow and the bulk "Close all finished"); its end arrives at the target as a `relay` end (`handle_terminal_end`), where a graceful end is refused `no_close_authority` on a live claude
+commands/remote_create.rs | terminal_create_remote | webview | the plain `terminal_create_remote` Tauri command: on an attach-stage failure it sends one forced `remote_terminal_end` under the create grant it just spent (`EndGrant::Create`), closing the orphan it spawned; it arrives at the target as a `relay` end (`end_under_create_grant`), refused unless the tombstone binds that terminal and nothing ever attached
 mcp/tauri_proxy.rs | dispatch | agent | POST /ui-bridge/tauri/invoke, which any local process reaches: its `terminal_close` arm (`tm.close`) and its `remote_session_end` arm (`end_remote_session`, force passed through)
 
 # ── local closes

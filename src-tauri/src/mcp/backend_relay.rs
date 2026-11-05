@@ -2594,19 +2594,6 @@ async fn sleep_with_kick(
     }
 }
 
-/// Handle an inbound command from the backend.
-///
-/// Recognized message types:
-///
-/// - `dispatch` — start a workflow run. Replies with `dispatch_ack`.
-/// - `command`, `chat`, `terminal` — currently routed to the legacy
-///   chat/terminal handlers below for back-compat. Phase 4 will rename
-///   the inbound types but the routing stays the same.
-/// - `chat_*` — legacy chat session commands (kept for mobile relay).
-/// - `terminal_*` — legacy terminal commands (kept for mobile relay).
-/// - `heartbeat` — server pong; reply with `heartbeat_ack`.
-/// - `devenv_enroll` — server-pushed devenv enrollment; reply with
-///   `devenv_enroll_ack`.
 /// Message types a frame carrying a `remote` block may be, by ROLE.
 ///
 /// This is a POSITIVE allowlist because the alternative — each handler opting
@@ -2630,7 +2617,8 @@ async fn sleep_with_kick(
 /// halves of the original defect are closed in different places, deliberately:
 /// this predicate stops an attach grant reaching the handler at all, and the
 /// handler's own gate stops a create grant choosing where the PTY lands. See
-/// [`remote_frame_admitted`] for the kind arm.
+/// [`remote_frame_admitted`] for the kind arm. `terminal_end` is the other entry
+/// a create grant reaches, for the one terminal it spawned.
 const REMOTE_TARGET_ADMITTED: &[&str] = &[
     "terminal_input",
     "terminal_resize",
@@ -2704,6 +2692,15 @@ const REMOTE_SOURCE_ADMITTED: &[&str] = &[
 /// the envelope level rather than inside `payload`.
 const REMOTE_ENVELOPE_TYPES: &[&str] = &["command", "chat", "terminal"];
 
+/// Does this frame's `remote` block claim a create grant? The one reading both
+/// the admission predicate and `handle_terminal_end`'s branch use. A malformed
+/// block parses as `Err` and answers `false`, the narrower kind, so it can never
+/// reach a create arm.
+fn carries_create_grant(data: &Value) -> bool {
+    use crate::mcp::remote_terminal::{parse_remote_block, RemoteGrantKind};
+    matches!(parse_remote_block(data), Some(Ok(block)) if block.kind == RemoteGrantKind::Create)
+}
+
 /// May a frame of `msg_type` carry the `remote` block it is carrying?
 ///
 /// Pure so the enforcement point is testable without an `ApiState`. A frame
@@ -2714,13 +2711,10 @@ const REMOTE_ENVELOPE_TYPES: &[&str] = &["command", "chat", "terminal"];
 /// web control path. A malformed block is still a block, and is refused here
 /// unless its type is admitted, then refused again by the handler's own gate.
 fn remote_frame_admitted(msg_type: &str, data: &Value) -> bool {
-    use crate::mcp::remote_terminal::RemoteGrantKind;
-    let Some(parsed) = crate::mcp::remote_terminal::parse_remote_block(data) else {
+    if crate::mcp::remote_terminal::parse_remote_block(data).is_none() {
         return true;
-    };
-    // A malformed block parses as `Err` and is `Attach` for this predicate —
-    // the narrower kind — so it can never reach `terminal_create`.
-    let create_grant = matches!(&parsed, Ok(block) if block.kind == RemoteGrantKind::Create);
+    }
+    let create_grant = carries_create_grant(data);
 
     // `terminal_create` SPAWNS a PTY: admitted under a create grant and under
     // nothing else. An attach grant naming it is refused here, before the
@@ -2729,10 +2723,11 @@ fn remote_frame_admitted(msg_type: &str, data: &Value) -> bool {
         return create_grant;
     }
     // And the converse, which is the same rule read the other way: a create
-    // grant is not an attach grant, so it may not drive an existing PTY. It
-    // buys exactly one frame type, the one above.
+    // grant is not an attach grant, so it may not drive an existing PTY. It buys
+    // the spawn above and one close of what it spawned; `terminal_end`'s create
+    // arm (`admit_create_grant_end`) holds it to that terminal, unattached.
     if create_grant && REMOTE_TARGET_ADMITTED.contains(&msg_type) {
-        return false;
+        return msg_type == "terminal_end";
     }
 
     REMOTE_TARGET_ADMITTED.contains(&msg_type)
@@ -2954,6 +2949,19 @@ fn outbound_egress_permitted(channel: &str, event: &Value) -> bool {
     }
 }
 
+/// Handle an inbound command from the backend.
+///
+/// Recognized message types:
+///
+/// - `dispatch` — start a workflow run. Replies with `dispatch_ack`.
+/// - `command`, `chat`, `terminal` — currently routed to the legacy
+///   chat/terminal handlers below for back-compat. Phase 4 will rename
+///   the inbound types but the routing stays the same.
+/// - `chat_*` — legacy chat session commands (kept for mobile relay).
+/// - `terminal_*` — legacy terminal commands (kept for mobile relay).
+/// - `heartbeat` — server pong; reply with `heartbeat_ack`.
+/// - `devenv_enroll` — server-pushed devenv enrollment; reply with
+///   `devenv_enroll_ack`.
 async fn handle_relay_command(
     api_state: &Arc<ApiState>,
     msg_type: &str,
@@ -5918,6 +5926,20 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
                         refusal["remote"] = crate::mcp::remote_terminal::remote_echo(data);
                         return Some(refusal);
                     }
+                    // The tombstone and the reaper both learn the terminal before
+                    // the reply below is built, so no source can present this id
+                    // to `admit_create_grant_end` ahead of either. A failed bind
+                    // leaves the close refused; the reaper is the backstop.
+                    if !crate::mcp::remote_terminal::create_grants()
+                        .bind_spent_terminal(&create.block.grant_jti, &info.id)
+                    {
+                        warn!(
+                            grant_jti = %create.block.grant_jti,
+                            terminal_id = %info.id,
+                            "remote create: no tombstone took this terminal, so its source \
+                             cannot close it if the attach fails"
+                        );
+                    }
                     // Reap it if no source ever attaches (a reply lost at relay
                     // teardown). Plan 2026-09-23-remote-create-residuals-…, Phase 1.
                     crate::mcp::remote_create_reaper::arm_remote_created(
@@ -6213,7 +6235,8 @@ async fn handle_terminal_attach(api_state: &Arc<ApiState>, data: &Value) -> Opti
 
 /// TARGET role: a SOURCE device asks to END one of our sessions under its
 /// attach grant (plan `2026-09-30-close-remote-sessions-from-the-local-runner`,
-/// Phase 1). Runs in its own task (`runs_off_read_loop`).
+/// Phase 1), or to close the terminal its create grant just spawned
+/// ([`end_under_create_grant`]). Runs in its own task (`runs_off_read_loop`).
 ///
 /// Admission is `admit_terminal_end`: the terminal comes from the grant ROW's
 /// session, a named terminal is only compared, a missing `remote` block is
@@ -6244,6 +6267,12 @@ async fn handle_terminal_end(api_state: &Arc<ApiState>, data: &Value) -> Option<
         }));
     };
     let force = data.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    // Before the attach gate, which must never see a create block: it would
+    // refuse it `grant_unknown` and spend a coord re-read of the attach feed.
+    if carries_create_grant(data) {
+        return Some(end_under_create_grant(tm, data, force).await);
+    }
 
     let gate = || {
         admit_terminal_end(
@@ -6341,6 +6370,58 @@ async fn handle_terminal_end(api_state: &Arc<ApiState>, data: &Value) -> Option<
         Some(&terminal_id),
         &verdict,
     ))
+}
+
+/// The create-grant arm of `terminal_end`: the source closes the terminal its
+/// spent grant spawned (plan
+/// `2026-09-23-remote-create-residuals-after-coord-registration-confirm`,
+/// Phase 2). The tombstone is local, so a refusal has no coord list to re-read.
+async fn end_under_create_grant(
+    tm: Arc<crate::terminal::TerminalManager>,
+    data: &Value,
+    force: bool,
+) -> Value {
+    use crate::mcp::remote_terminal::{
+        admit_create_grant_end, create_grants, grants, now_epoch_secs, terminal_ended_frame,
+        EndOutcome, EndVerdict,
+    };
+    let (block, terminal_id) = match admit_create_grant_end(
+        grants(),
+        create_grants(),
+        crate::settings::get_remote_create_preference,
+        qontinui_runner_lib::pair::read_paired_user_id_from_disk,
+        crate::mcp::remote_create_reaper::was_ever_attached,
+        data,
+        now_epoch_secs(),
+    ) {
+        Ok(admitted) => admitted,
+        Err(frame) => return frame,
+    };
+    if tm.get(&terminal_id).is_none() {
+        let verdict = EndVerdict {
+            outcome: EndOutcome::NotFound,
+            via: None,
+            reason: Some("terminal_gone: the terminal this grant created is already gone".into()),
+        };
+        return terminal_ended_frame(data, None, Some(&terminal_id), &verdict);
+    }
+    info!(
+        grant_jti = %block.grant_jti,
+        source_device = ?block.source_device_id,
+        terminal_id = %terminal_id,
+        force,
+        "remote end: admitted under a create grant — closing the terminal it spawned"
+    );
+    let verdict = end_admitted_terminal(tm, &terminal_id, force).await;
+    info!(
+        grant_jti = %block.grant_jti,
+        terminal_id = %terminal_id,
+        outcome = verdict.outcome.as_str(),
+        via = ?verdict.via,
+        reason = ?verdict.reason,
+        "remote end: answered"
+    );
+    terminal_ended_frame(data, None, Some(&terminal_id), &verdict)
 }
 
 /// TARGET role: end one ADMITTED remote end's terminal on `tm`. This is
@@ -8727,7 +8808,7 @@ mod remote_admission_tests {
     //! calls — not the constants. A test that only reads the lists would pass
     //! on a build where the `if` in `handle_relay_command` had been deleted.
 
-    use super::remote_frame_admitted;
+    use super::{carries_create_grant, remote_frame_admitted, REMOTE_TARGET_ADMITTED};
     use serde_json::json;
 
     fn with_grant(v: serde_json::Value) -> serde_json::Value {
@@ -8827,11 +8908,21 @@ mod remote_admission_tests {
         );
     }
 
-    /// …and buys nothing else on this device. A create grant is not an attach
-    /// grant: it may not type into, resize, close, read or attach a PTY, and
-    /// it may not enumerate them either.
+    /// …and buys nothing else on this device but the one close (`terminal_end`,
+    /// held to its own terminal by `admit_create_grant_end`). A create grant is
+    /// not an attach grant: it may not type into, resize, read or attach a PTY,
+    /// and it may not enumerate them either. `terminal_close` stays refused: it
+    /// is the attach grant's door, and the relay forwards none from a source.
     #[test]
     fn a_create_grant_drives_no_existing_terminal() {
+        for t in REMOTE_TARGET_ADMITTED {
+            let admitted = remote_frame_admitted(t, &with_create_grant(json!({ "type": t })));
+            assert_eq!(
+                admitted,
+                matches!(*t, "terminal_create" | "terminal_end"),
+                "`{t}` under a CREATE grant"
+            );
+        }
         for t in [
             "terminal_input",
             "terminal_resize",
@@ -9010,6 +9101,99 @@ mod remote_admission_tests {
         assert!(!remote_frame_admitted("terminal_create", &malformed));
         let not_an_object = json!({ "type": "terminal_create", "remote": 7 });
         assert!(!remote_frame_admitted("terminal_create", &not_an_object));
+    }
+
+    /// A malformed block on `terminal_end` passes this predicate (its own gate
+    /// refuses it), so what matters is that it reads as no create grant and
+    /// takes the ATTACH arm, whichever way it spells `kind`.
+    #[test]
+    fn a_malformed_block_never_reaches_the_create_arm() {
+        for remote in [
+            json!({ "grant_jti": "", "kind": "create" }),
+            json!({ "kind": "create" }),
+            json!(7),
+            json!({ "grant_jti": "j", "kind": "Create" }),
+        ] {
+            let frame = json!({ "type": "terminal_end", "remote": remote });
+            assert!(!carries_create_grant(&frame), "{frame}");
+        }
+        assert!(!carries_create_grant(&json!({ "type": "terminal_end" })));
+        assert!(carries_create_grant(&with_create_grant(
+            json!({ "type": "terminal_end" })
+        )));
+    }
+
+    /// `handle_terminal_end` cannot run without an `ApiState`, so its wiring is
+    /// pinned by shape: the create branch exists, comes before the attach gate,
+    /// and admits through `admit_create_grant_end` with the reaper's read. Both
+    /// arms then share the one driver.
+    #[test]
+    fn terminal_end_branches_to_the_create_arm_before_the_attach_gate() {
+        const SRC: &str = include_str!("backend_relay.rs");
+        let body = |sig: &str| {
+            let start = SRC.find(sig).unwrap_or_else(|| panic!("`{sig}` not found"));
+            let rest = SRC.get(start + sig.len()..).expect("char boundary");
+            rest.get(..rest.find("\nasync fn ").unwrap_or(rest.len()))
+                .expect("char boundary")
+        };
+        let end = body("async fn handle_terminal_end(");
+        let branch = end
+            .find("if carries_create_grant(data) {")
+            .expect("handle_terminal_end must branch on the block kind");
+        let arm = end
+            .find("end_under_create_grant(tm, data, force)")
+            .expect("the create branch must run the create arm");
+        let attach_gate = end.find("admit_terminal_end(").expect("the attach gate");
+        assert!(branch < arm && arm < attach_gate, "create branch first");
+        assert!(
+            end.contains("end_admitted_terminal("),
+            "attach arm's driver"
+        );
+
+        let create = body("async fn end_under_create_grant(");
+        let admit = create
+            .find("admit_create_grant_end(")
+            .expect("the create arm must admit through admit_create_grant_end");
+        // Retention guard: dropping the reaper read turns the refusal off.
+        assert!(
+            create.contains("remote_create_reaper::was_ever_attached"),
+            "the ever-attached refusal must read the reaper"
+        );
+        let driver = create
+            .find("end_admitted_terminal(")
+            .expect("the one driver");
+        assert!(admit < driver, "admission before the driver");
+        assert!(
+            !create.contains("catch_up_now_within("),
+            "no feed re-read fires for a close under a create grant"
+        );
+        let shared = body("pub(crate) async fn end_admitted_terminal(");
+        assert!(shared.contains("single_flight_end(") && shared.contains("execute_terminal_end("));
+    }
+
+    /// Retention guard: without the bind every close is refused `grant_unknown`
+    /// and the feature silently degrades to the reaper. It must also precede the
+    /// reply, or the source could learn an id the tombstone does not hold.
+    #[test]
+    fn a_remote_create_binds_its_tombstone_before_the_reply() {
+        const SRC: &str = include_str!("backend_relay.rs");
+        let start = SRC
+            .find("async fn handle_terminal_create(")
+            .expect("handle_terminal_create");
+        let create = SRC.get(start..).expect("char boundary");
+        let settle = create
+            .find("settle_remote_registration(")
+            .expect("registration settle");
+        let bind = create
+            .find("bind_spent_terminal(&create.block.grant_jti, &info.id)")
+            .expect("handle_terminal_create must bind the spent grant to its terminal");
+        let reply = create
+            .find("\"type\": \"terminal_created\",")
+            .expect("created reply");
+        assert!(
+            settle < bind && bind < reply,
+            "bind after settle, before the reply"
+        );
     }
 }
 
@@ -9280,20 +9464,17 @@ mod relay_routing_tests {
         assert_eq!(data, frame);
     }
 
-    /// `terminal_end` ends a session: admitted under an ATTACH grant (D3 — its
-    /// holder can already type `/exit`), never under a CREATE grant, which
-    /// buys exactly one spawn.
+    /// `terminal_end` is admitted under an ATTACH grant (D3 — its holder can
+    /// already type `/exit`) and under a CREATE grant, whose handler arm holds it
+    /// to the one unattached terminal it spawned.
     #[test]
-    fn terminal_end_is_admitted_under_an_attach_grant_only() {
+    fn terminal_end_is_admitted_under_either_grant() {
         let mut attach = json!({ "type": "terminal_end", "force": false });
         attach["remote"] = attach_block();
         assert!(super::remote_frame_admitted("terminal_end", &attach));
         let mut create = json!({ "type": "terminal_end", "force": true });
         create["remote"] = create_block();
-        assert!(
-            !super::remote_frame_admitted("terminal_end", &create),
-            "a create grant must not end a session"
-        );
+        assert!(super::remote_frame_admitted("terminal_end", &create));
     }
 
     /// A graceful end waits up to 60 s for `claude` to leave — longer than the
@@ -9574,7 +9755,7 @@ mod relay_writer_tests {
             // Drain everything.
             gate.release(RELAY_BULK_LANE_CAPACITY + 1);
             assert!(
-                settle(|| gate.written_len() >= RELAY_BULK_LANE_CAPACITY + 1).await,
+                settle(|| gate.written_len() > RELAY_BULK_LANE_CAPACITY).await,
                 "round {round}: writer should drain every queued frame once the \
                  sink unblocks"
             );
@@ -9635,7 +9816,7 @@ mod relay_writer_tests {
                 .count()
         };
         assert!(
-            settle(|| bulk_count() >= OUT + 1).await,
+            settle(|| bulk_count() > OUT).await,
             "expected {} bulk frames, saw {}",
             OUT + 1,
             bulk_count()
@@ -9815,7 +9996,7 @@ mod relay_writer_tests {
         writer.try_send_reply(text("terminal_attached")).unwrap();
 
         gate.release(RELAY_BULK_LANE_CAPACITY + 1);
-        assert!(settle(|| gate.written_len() >= RELAY_BULK_LANE_CAPACITY + 1).await);
+        assert!(settle(|| gate.written_len() > RELAY_BULK_LANE_CAPACITY).await);
 
         let written = gate.written();
         let reply_at = written
