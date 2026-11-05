@@ -17,64 +17,111 @@ __osc633() {
     printf '\033]633;%s\007' "$1" > /dev/tty
 }
 
-# Saved exit code for D marker (captured before PROMPT_COMMAND clobbers $?)
-__qontinui_last_exit=0
-
-# PROMPT_COMMAND: emit D;<code>, P;Cwd=<path> and P;CommandMarks=1. The last
-# announces that this shell marks every command start (the DEBUG trap below
-# emits C), so the runner can read a prompt mark (A) as "nothing is running".
-# It rides every prompt, not just the first: a pane remounted or hidden in the
-# runner stops parsing marks, and the next prompt re-announces it.
-__qontinui_prompt_command() {
-    __osc633 "D;${__qontinui_last_exit}"
-    __osc633 "P;Cwd=$(pwd)"
-    __osc633 "P;CommandMarks=1"
-}
-
-# Prepend to any existing PROMPT_COMMAND
-if [ -n "${PROMPT_COMMAND}" ]; then
-    PROMPT_COMMAND="__qontinui_prompt_command;${PROMPT_COMMAND}"
+# ── Prompt-state marks ──────────────────────────────────────────────────────
+# Per prompt: D;<code>, P;Cwd=<path>, P;CommandMarks=1 (bash >= 4.4 only, see
+# below), then A — all from PROMPT_COMMAND, so a PROMPT_COMMAND that rewrites
+# PS1 (starship, __git_ps1) cannot drop them. B stays in PS1: it is cosmetic.
+# Per command line: C (and nothing for PROMPT_COMMAND's own entries) — from
+# PS0 on bash >= 4.4, the DEBUG trap before that.
+#
+# P;CommandMarks=1 tells the runner a prompt mark (A) here means "nothing is
+# running": it is sent only where every typed command line gets a C, i.e. only
+# on the PS0 path. The DEBUG trap cannot promise that — once the user has a
+# PROMPT_COMMAND of their own (history -a, direnv, zoxide) its entries spend the
+# trap's once-per-line C before the typed command runs. It rides every prompt,
+# not just the first: a runner pane that stopped parsing marks (remounted, or
+# hidden) learns it again at the next prompt.
+#
+# The shared literal: `P;CommandMarks=1` is pinned against the webview's
+# `COMMAND_MARKS_CAPABILITY` (src/components/terminal/shellIntegrationEvents.ts)
+# by a source scan in src-tauri/src/session/spawn_prompt.rs.
+__osc633_b=$'\033]633;B\007'
+if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4) )); then
+    __qontinui_command_marks=1
 else
-    PROMPT_COMMAND="__qontinui_prompt_command"
+    __qontinui_command_marks=0
 fi
 
-# Wrap PS1 with A (prompt start) and B (command ready) markers.
-# Use \[...\] so bash doesn't count the OSC bytes toward prompt width.
-__osc633_a=$'\033]633;A\007'
-__osc633_b=$'\033]633;B\007'
-PS1="\[${__osc633_a}\]${PS1}\[${__osc633_b}\]"
+# The history number of the last command line E was sent for (PS0 path).
+# Unset until the first prompt records it, so that prompt never re-sends the
+# last command of a previous session (the history file loads after this rc).
+unset __qontinui_last_histnum
 
-# Track whether we are inside a user-initiated command (not PROMPT_COMMAND internals)
-__qontinui_in_command=0
-
-# DEBUG trap: fires before each command about to execute.
-# We only want to emit E/C once per user-typed line, not for every sub-command.
-__qontinui_debug_trap() {
-    # Capture exit code before anything else changes it
-    __qontinui_last_exit=$?
-    local cmd="${BASH_COMMAND}"
-    # Ignore internal housekeeping commands
-    case "${cmd}" in
-        __qontinui_*|__osc633*) return ;;
-    esac
-    # Only emit E/C for the first command of a new user input (not sub-commands)
-    if [ "${__qontinui_in_command}" = "0" ]; then
-        __qontinui_in_command=1
-        local escaped="${cmd//;/\\x3b}"
-        __osc633 "E;${escaped}"
-        __osc633 "C"
+# First PROMPT_COMMAND entry: the finished command's E (PS0 path: read back
+# from history, so PROMPT_COMMAND entries never masquerade as it), its D, the
+# cwd and the capability. `$?` is still the command's status here.
+__qontinui_prompt_start() {
+    local code=$?
+    if [ "${__qontinui_command_marks}" = "1" ]; then
+        local line num=0 cmd=
+        line=$(HISTTIMEFORMAT= builtin history 1)
+        if [[ "${line}" =~ ^[[:space:]]*([0-9]+)[*[:space:]]+(.*)$ ]]; then
+            num="${BASH_REMATCH[1]}"
+            cmd="${BASH_REMATCH[2]//$'\n'/ }"
+        fi
+        if [ -z "${__qontinui_last_histnum+set}" ]; then
+            __qontinui_last_histnum="${num}"
+        elif [ "${num}" != "${__qontinui_last_histnum}" ]; then
+            __qontinui_last_histnum="${num}"
+            __osc633 "E;${cmd//;/\\x3b}"
+        fi
     fi
+    __osc633 "D;${code}"
+    __osc633 "P;Cwd=$(pwd)"
+    if [ "${__qontinui_command_marks}" = "1" ]; then
+        __osc633 "P;CommandMarks=1"
+    fi
+    return "${code}"
 }
 
-# Reset in_command flag when PROMPT_COMMAND runs (a new prompt is about to appear)
-__qontinui_reset_command() {
-    __qontinui_in_command=0
+# Last PROMPT_COMMAND entry: A, after every entry of the user's own.
+__qontinui_prompt_end() {
+    local code=$?
+    __osc633 "A"
+    return "${code}"
 }
 
-# Prepend reset to PROMPT_COMMAND so in_command is cleared each new prompt
-PROMPT_COMMAND="__qontinui_reset_command;${PROMPT_COMMAND}"
+# Install: our start entry first, our end entry last, the user's (string or
+# array form) untouched between. Newlines, not `;`, join the string form, so a
+# user value ending in `;` stays valid.
+if [[ "$(declare -p PROMPT_COMMAND 2>/dev/null)" == "declare -a"* ]]; then
+    PROMPT_COMMAND=("__qontinui_prompt_start" "${PROMPT_COMMAND[@]}" "__qontinui_prompt_end")
+elif [ -n "${PROMPT_COMMAND}" ]; then
+    PROMPT_COMMAND=$'__qontinui_prompt_start\n'"${PROMPT_COMMAND}"$'\n__qontinui_prompt_end'
+else
+    PROMPT_COMMAND=$'__qontinui_prompt_start\n__qontinui_prompt_end'
+fi
 
-trap '__qontinui_debug_trap' DEBUG
+# B (command ready) at the end of the prompt. \[...\] so bash doesn't count the
+# OSC bytes toward the prompt width.
+PS1="${PS1}\[${__osc633_b}\]"
+
+if [ "${__qontinui_command_marks}" = "1" ]; then
+    # PS0 is expanded once per command line read, after it is read and before
+    # it runs — never for PROMPT_COMMAND's entries. `\e`/`\a` are prompt
+    # escapes, so this needs no command substitution (and no promptvars).
+    PS0='\e]633;C\a'"${PS0}"
+else
+    # bash < 4.4 has no PS0: E/C from the DEBUG trap, best effort and never
+    # announced (see above).
+    __qontinui_in_command=1
+    __qontinui_debug_trap() {
+        local cmd="${BASH_COMMAND}"
+        case "${cmd}" in
+            __qontinui_*|__osc633*) return ;;
+        esac
+        if [ "${__qontinui_in_command}" = "0" ]; then
+            __qontinui_in_command=1
+            __osc633 "E;${cmd//;/\\x3b}"
+            __osc633 "C"
+        fi
+    }
+    __qontinui_reset_command() {
+        __qontinui_in_command=0
+    }
+    PROMPT_COMMAND=$'__qontinui_reset_command\n'"${PROMPT_COMMAND}"
+    trap '__qontinui_debug_trap' DEBUG
+fi
 
 # ── Claude Code runner context ─────────────────────────────────────────────
 # Wrap the `claude` command so sessions launched from this terminal

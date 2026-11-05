@@ -26,9 +26,12 @@ autoload -Uz add-zsh-hook
 __qontinui_osc633() { printf '\033]633;%s\007' "$1" > /dev/tty }
 
 # precmd: fires before each prompt. Emit D;<exit-code>, P;Cwd=<path> and
-# P;CommandMarks=1 — the last announces that this shell marks every command
-# start (preexec below emits C), on every prompt so a runner pane that stopped
-# parsing marks (remounted, or hidden) learns it again at the next prompt.
+# P;CommandMarks=1 — the last tells the runner a prompt mark (A) here means
+# "nothing is running": preexec below emits C once per typed command line, and
+# never for a hook. It rides every prompt, so a runner pane that stopped parsing
+# marks (remounted, or hidden) learns it again at the next prompt. The literal
+# is pinned against the webview's COMMAND_MARKS_CAPABILITY by a source scan in
+# src-tauri/src/session/spawn_prompt.rs.
 __qontinui_precmd() {
     local code=$?
     __qontinui_osc633 "D;${code}"
@@ -44,12 +47,21 @@ __qontinui_preexec() {
     __qontinui_osc633 "C"
 }
 
+# precmd, registered LAST: A (prompt start). Written here rather than baked into
+# PROMPT, so a theme that reassigns PROMPT in its own precmd (or a hook added
+# after this one) cannot drop it — and no hook can emit a C after it.
+__qontinui_precmd_prompt_start() {
+    __qontinui_osc633 "A"
+}
+
 add-zsh-hook precmd __qontinui_precmd
 add-zsh-hook preexec __qontinui_preexec
+add-zsh-hook precmd __qontinui_precmd_prompt_start
 
-# Wrap PROMPT with A (prompt start) and B (command ready) markers. %{...%} marks
-# them zero-width so zsh doesn't miscount the prompt length.
-PROMPT="%{$(printf '\033]633;A\007')%}${PROMPT}%{$(printf '\033]633;B\007')%}"
+# B (command ready) at the end of PROMPT. %{...%} marks it zero-width so zsh
+# doesn't miscount the prompt length. Cosmetic: a theme that rewrites PROMPT
+# drops it, and nothing reads it as state.
+PROMPT="${PROMPT}%{$(printf '\033]633;B\007')%}"
 
 # ── Claude Code runner context ─────────────────────────────────────────────
 # Wrap `claude` so sessions launched from this terminal know they run inside
