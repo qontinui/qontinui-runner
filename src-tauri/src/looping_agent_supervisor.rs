@@ -107,7 +107,52 @@ static SPAWN_FAILURES: Mutex<Option<HashMap<String, (u32, i64)>>> = Mutex::new(N
 /// re-adopted rather than stranded. Persisting it would create a second,
 /// disagreeing source of truth — the exact tier-0-CHECK-vs-tier-1-RECORD
 /// mismatch that produced the #1025 spawn storm.
+///
+/// The memo also carries the hold's LIVENESS CLOCK (`acquired_at_ms`,
+/// `last_proven_alive_ms` — the anchor of the orphan grace, see
+/// [`lease::hold_decision`]). It is in memory only for the same reason, and a
+/// restart resets it to the `renewed` instant, which only ever lengthens the
+/// grace a restarted runner gives its own tab.
 static HELD_SLOTS: Mutex<Option<HashMap<String, HeldSlot>>> = Mutex::new(None);
+
+/// When this supervisor last released an agent's slot because its tab was not
+/// alive past the orphan grace (`agent_id -> unix ms`). Drives the one-TTL
+/// cooldown in [`lease::acquire_permitted`]. In memory only: a restart forgets
+/// it, which costs at most one early re-acquire.
+static LAST_ORPHAN_RELEASE: Mutex<Option<HashMap<String, i64>>> = Mutex::new(None);
+
+fn last_orphan_release_for(agent_id: &str) -> Option<i64> {
+    let guard = LAST_ORPHAN_RELEASE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    guard.as_ref().and_then(|m| m.get(agent_id)).copied()
+}
+
+fn set_last_orphan_release(agent_id: &str, at_ms: i64) {
+    let mut guard = LAST_ORPHAN_RELEASE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    guard
+        .get_or_insert_with(HashMap::new)
+        .insert(agent_id.to_string(), at_ms);
+}
+
+fn clear_last_orphan_release(agent_id: &str) {
+    let mut guard = LAST_ORPHAN_RELEASE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(map) = guard.as_mut() {
+        map.remove(agent_id);
+    }
+}
+
+/// Update the held-slot memo in place (e.g. stamp `last_proven_alive_ms`).
+fn touch_held_slot(agent_id: &str, f: impl FnOnce(&mut HeldSlot)) {
+    let mut guard = HELD_SLOTS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(slot) = guard.as_mut().and_then(|m| m.get_mut(agent_id)) {
+        f(slot);
+    }
+}
 
 fn held_slot_for(agent_id: &str) -> Option<HeldSlot> {
     let guard = HELD_SLOTS.lock().unwrap_or_else(|e| e.into_inner());
@@ -512,14 +557,19 @@ async fn supervise_one(
     //     snapshot would then acquire the freed slot and spawn a second copy —
     //     the #1025 double-spawn this lease exists to prevent, re-opened by a
     //     fleet-wide decision that reaches runners at different times.
-    //   * So instead: `may_acquire` stops us taking a NEW lease, while an
-    //     existing hold keeps heart-beating for as long as the agent is
-    //     DESIRED RUNNING (the heartbeat branch is gated on `effective`, not
-    //     on tab liveness — which is resolved later in this fn — so a refused
-    //     agent whose tab has already exited also keeps its slot warm; that is
-    //     the safe direction during rollout skew, since a peer runner reading
-    //     the same tenant verdict is refused too and starves on nothing); and
-    //     the action gate below rewrites Spawn/Relaunch to None.
+    //   * So instead: a refusal stops us taking a NEW lease for a tab we would
+    //     have to spawn ([`lease::acquire_permitted`] — adopting a free slot
+    //     for a tab that is already alive is not a spawn and stays allowed);
+    //     an existing hold keeps heart-beating for as long as its tab is ALIVE
+    //     ([`lease::hold_decision`]); and the action gate below rewrites
+    //     Spawn/Relaunch to None.
+    //   * The invariant is therefore: a slot whose tab is alive is never
+    //     released by a refusal; a slot whose tab is dead past the orphan grace
+    //     is released whatever the reason. (This used to keep a refused
+    //     agent's slot warm even over an exited tab, on the assumption that
+    //     every peer was refused too. Authorization is a per-runner standing
+    //     opt-in, so that is not guaranteed — and the slot then ran no
+    //     shepherd at all: coord's `holder_without_live_session`.)
     //
     // A refusal therefore stops NEW spawns and relaunches without killing or
     // orphaning a live session. That is the correct reading: the clause governs
@@ -545,13 +595,14 @@ async fn supervise_one(
     };
     let authz_permits_spawn = authz.allows_spawn();
 
-    // -- Slot lease reconciliation (claim-first — D3 / the #1025 lesson). --
-    //
-    // MUST happen BEFORE `policy::decide` is acted on: `gate_action` rewrites
-    // any session-creating action to `None` unless we hold a lease, so the
-    // lease state is an INPUT to acting, never a check performed afterwards.
-    let holds_lease = reconcile_slot_lease(app, rec, &effective, authz_permits_spawn).await;
-
+    // Liveness is resolved BEFORE the lease reconcile (plan
+    // `2026-11-05-looping-agent-slot-lease-tracks-tab-liveness`, D1): the hold
+    // decision needs to know whether the tab the slot licenses is alive. One
+    // observation per tick, threaded through — never a second read inside the
+    // lease code that could disagree with this one. The resolution reads only
+    // the runtime record, the TerminalManager and the lifecycle store, none of
+    // which the lease reconcile touches, so the swap changes no other
+    // behaviour.
     let (liveness, live, exited_tab) = resolve_live_session(app, rec);
 
     // Re-attach bookkeeping: adopt a lifecycle-resolved terminal id so the
@@ -589,6 +640,32 @@ async fn supervise_one(
             }
         }
     }
+
+    let spawn_grace_elapsed = policy::spawn_grace_elapsed(
+        now_ms,
+        rec.runtime.last_spawn_at_ms,
+        rec.def.lifecycle_policy.spawn_grace_secs,
+    );
+    let backoff_elapsed = spawn_backoff_elapsed(&rec.def.id, now_ms);
+    // A synchronous read, reused unchanged by the drain rewrite below.
+    let drain =
+        crate::coord_drain_state::drain_gate(crate::coord_drain_state::SpawnOrigin::LoopingAgent);
+
+    // -- Slot lease reconciliation (claim-first — D3 / the #1025 lesson). --
+    //
+    // MUST happen BEFORE `policy::decide` is acted on: `gate_action` rewrites
+    // any session-creating action to `None` unless we hold a lease, so the
+    // lease state is an INPUT to acting, never a check performed afterwards.
+    let lease_obs = lease::LeaseTickObs {
+        now_ms,
+        liveness,
+        proven_alive: spawn_streak_clears(liveness, spawn_grace_elapsed),
+        spawn_able: authz_permits_spawn && drain.allows() && backoff_elapsed,
+        spawn_grace_secs: rec.def.lifecycle_policy.spawn_grace_secs,
+        source: effective.source,
+        slots: effective.slots,
+    };
+    let lease_tick = reconcile_slot_lease(app, rec, &effective, &lease_obs).await;
 
     // Observe idle/context-low on the live grid, through the ONE quiescence
     // debounce (`TerminalSession::idle_quiescence_probe`) — never nudge into a
@@ -663,12 +740,8 @@ async fn supervise_one(
         desired_running: effective.running,
         tab_alive: liveness.tab_alive(),
         ever_spawned: rec.runtime.last_spawn_at_ms.is_some(),
-        spawn_backoff_elapsed: spawn_backoff_elapsed(&rec.def.id, now_ms),
-        spawn_grace_elapsed: policy::spawn_grace_elapsed(
-            now_ms,
-            rec.runtime.last_spawn_at_ms,
-            rec.def.lifecycle_policy.spawn_grace_secs,
-        ),
+        spawn_backoff_elapsed: backoff_elapsed,
+        spawn_grace_elapsed,
         idle,
         context_low,
         cadence_elapsed: policy::cadence_elapsed(
@@ -691,7 +764,7 @@ async fn supervise_one(
     // shepherd exists and spawn if not" (a TOCTOU race every runner in the
     // fleet loses simultaneously — #1025), but "you already won the atomic
     // slot, therefore you may spawn".
-    let action = lease::gate_action(policy::decide(&input), holds_lease);
+    let action = lease::gate_action(policy::decide(&input), lease_tick.holds);
 
     // Coord device drain (plan `2026-09-13-drained-runner-never-reaches-idle`,
     // D6 / Phase 3). While the device is drained — or its drain state is
@@ -700,9 +773,8 @@ async fn supervise_one(
     // the registry gate below lets it through, because a nudge begins the next
     // cycle of an autonomous loop, which is the work a drain exists to stop. The
     // loop definition is untouched: the first tick after undrain decides afresh
-    // (a `FirstSpawn`/`DeathRespawn` if the tab has gone meanwhile).
-    let drain =
-        crate::coord_drain_state::drain_gate(crate::coord_drain_state::SpawnOrigin::LoopingAgent);
+    // (a `FirstSpawn`/`DeathRespawn` if the tab has gone meanwhile). `drain`
+    // was read once above, before the lease reconcile.
     let undrained = action;
     let action = drain_rewrite(undrained, &drain);
     if action != undrained {
@@ -931,42 +1003,50 @@ async fn spawn_prompt(def: &LoopingAgentDef, is_relaunch: bool) -> String {
 /// Lifecycle:
 /// * Not running (disarmed / locally stopped) + we hold a lease → RELEASE it,
 ///   so a peer can fill the slot immediately instead of waiting out the TTL.
-/// * Running + we hold a lease → HEARTBEAT. `stolen` drops it (coord's
+/// * Running + we hold a lease → first [`lease::hold_decision`] (plan
+///   `2026-11-05-looping-agent-slot-lease-tracks-tab-liveness`): a slot above
+///   a coord-lowered count is released and the walk re-run; a slot whose tab
+///   has not been alive for the orphan grace is released and NOT re-walked
+///   this tick. Otherwise HEARTBEAT: `stolen`/`not_held` drops it (coord's
 ///   authoritative answer); a transport error keeps it (see
 ///   `lease::still_held_after_heartbeat`).
-/// * Running + no lease → ACQUIRE, walking the candidate slots in order. The
-///   FIRST `claimed`/`renewed` is ours and is the permission to spawn. All
-///   slots `held` → other live shepherds own them → we do nothing at all.
+/// * Running + no lease → ACQUIRE, if [`lease::acquire_permitted`] (a live
+///   tab to adopt, or a tab this runner can spawn and is not cooling down
+///   from an orphan release), walking the candidate slots in order. The FIRST
+///   `claimed`/`renewed` is ours and is the permission to spawn. All slots
+///   `held` → other live shepherds own them → we do nothing at all.
 ///
-/// Returns `true` only when this supervisor genuinely holds a slot. Every
-/// "can't tell" path returns `false`, because the one thing that must never
-/// happen is spawning on an assumption.
+/// Reports `holds: true` only when this supervisor genuinely holds a slot.
+/// Every "can't tell" path reports `false`, because the one thing that must
+/// never happen is spawning on an assumption.
 async fn reconcile_slot_lease(
     app: &tauri::AppHandle,
     rec: &LoopingAgentRecord,
     effective: &EffectiveDesired,
-    may_acquire: bool,
-) -> bool {
+    obs: &lease::LeaseTickObs,
+) -> lease::LeaseTick {
+    const NOT_HELD: lease::LeaseTick = lease::LeaseTick::NOT_HELD;
+    const HELD: lease::LeaseTick = lease::LeaseTick::HELD;
     let agent_id = &rec.def.id;
 
     // Identity needed to build the lease key. Missing either one means we
     // cannot name the slot — so we cannot hold it, so we must not spawn.
     // (A tenant-less runner is unpaired; a role-less agent has no fleet slot.)
     let Some(role) = role_for_agent(&rec.def.playbook_ref) else {
-        return false;
+        return NOT_HELD;
     };
     let Some(tenant_id) = crate::fleet::resolve_tenant_id() else {
         debug!(
             agent = %agent_id,
             "looping_agent_supervisor: no tenant binding — cannot claim a slot lease, not spawning"
         );
-        return false;
+        return NOT_HELD;
     };
     let Some(machine_id) = app
         .try_state::<Arc<crate::session::SessionRegistry>>()
         .map(|s| s.inner().machine_id())
     else {
-        return false;
+        return NOT_HELD;
     };
 
     let held = held_slot_for(agent_id);
@@ -974,6 +1054,7 @@ async fn reconcile_slot_lease(
 
     // -- Clean stop: release what we hold. --
     if !effective.running {
+        clear_last_orphan_release(agent_id);
         if let Some(slot) = clear_held_slot(agent_id) {
             info!(
                 agent = %agent_id,
@@ -983,47 +1064,88 @@ async fn reconcile_slot_lease(
             crate::looping_agent_coord::release_slot(&slot.resource_key, &machine_id, agent_id)
                 .await;
         }
-        return false;
+        return NOT_HELD;
     }
 
-    // -- Hold: heartbeat it. --
-    if let Some(slot) = &held {
-        let outcome = crate::looping_agent_coord::heartbeat_slot(
-            &slot.resource_key,
-            &machine_id,
-            agent_id,
-            claude_session_id.as_deref(),
-        )
-        .await;
-        if lease::still_held_after_heartbeat(&outcome) {
-            return true;
+    // -- Hold: keep it only while the tab backs it, then heartbeat it. --
+    if let Some(mut slot) = held {
+        if obs.proven_alive {
+            slot.last_proven_alive_ms = Some(obs.now_ms);
+            touch_held_slot(agent_id, |s| s.last_proven_alive_ms = Some(obs.now_ms));
         }
-        // Stolen: another supervisor owns this slot now. Drop our memo and fall
-        // through to the acquire path — if a slot is genuinely free we take it,
-        // otherwise we do nothing this tick.
-        warn!(
-            agent = %agent_id,
-            resource_key = %slot.resource_key,
-            "looping_agent_supervisor: slot lease lost (stolen/expired) — another runner owns \
-             this slot now"
-        );
-        clear_held_slot(agent_id);
+        match lease::hold_decision(slot.slot, slot.anchor_ms(), obs) {
+            lease::HoldDecision::Release(reason) => {
+                warn!(
+                    agent = %agent_id,
+                    resource_key = %slot.resource_key,
+                    ?reason,
+                    slot = slot.slot,
+                    slots = obs.slots,
+                    anchor_age_ms = obs.now_ms.saturating_sub(slot.anchor_ms()),
+                    liveness = ?obs.liveness,
+                    "looping_agent_supervisor: releasing the slot lease — it no longer licenses \
+                     a live tab (TabNotAlive) or is above coord's count (OutOfRange)"
+                );
+                clear_held_slot(agent_id);
+                crate::looping_agent_coord::release_slot(&slot.resource_key, &machine_id, agent_id)
+                    .await;
+                if reason == lease::ReleaseReason::TabNotAlive {
+                    // Never walk on the tick we gave a slot up: we would take
+                    // back the slot we just released. The cooldown keeps us
+                    // out of the race for one TTL after this.
+                    set_last_orphan_release(agent_id, obs.now_ms);
+                    return NOT_HELD;
+                }
+                // OutOfRange: a live tab may re-home onto a lower free slot.
+            }
+            lease::HoldDecision::Keep => {
+                let outcome = crate::looping_agent_coord::heartbeat_slot(
+                    &slot.resource_key,
+                    &machine_id,
+                    agent_id,
+                    claude_session_id.as_deref(),
+                )
+                .await;
+                if lease::still_held_after_heartbeat(&outcome) {
+                    return HELD;
+                }
+                // Stolen / expired: another supervisor owns this slot now, or
+                // nobody does. Drop our memo and fall through to the acquire
+                // path — if a slot is genuinely free we take it, otherwise we do
+                // nothing this tick.
+                warn!(
+                    agent = %agent_id,
+                    resource_key = %slot.resource_key,
+                    "looping_agent_supervisor: slot lease lost (stolen/expired) — another runner \
+                     owns this slot now"
+                );
+                clear_held_slot(agent_id);
+            }
+        }
     }
 
     // -- Acquire: claim-first. The FIRST win is the permission to spawn. --
     //
-    // Phase 4c: an agent-registry refusal stops us taking a NEW slot (it would
-    // starve the rest of the fleet of a slot nothing can use) but deliberately
-    // does NOT reach the release branch above — an agent whose tab is still
-    // alive keeps heart-beating the slot it already holds, so no peer runner
-    // can acquire it and spawn a second copy while this one lives.
-    if !may_acquire {
+    // Only for a slot this runner can use: to adopt a tab that is already
+    // alive (not a spawn — no refusal governs it), or to spawn one it is
+    // allowed and able to spawn, outside the cooldown after an orphan release.
+    // A runner that cannot use a slot must not take one: it would starve the
+    // rest of the fleet of a slot nothing fills.
+    let last_orphan_release = last_orphan_release_for(agent_id);
+    if !lease::acquire_permitted(obs, last_orphan_release) {
+        let why = if lease::in_orphan_cooldown(obs.now_ms, last_orphan_release) {
+            "cooling down after releasing a slot for a dead tab"
+        } else {
+            "cannot spawn (agent-registry refusal, device drain, or spawn backoff)"
+        };
         debug!(
             agent = %agent_id,
-            "looping_agent_supervisor: agent-registry refusal — not acquiring a new slot lease"
+            liveness = ?obs.liveness,
+            "looping_agent_supervisor: no live tab to adopt and {why} — not acquiring a slot lease"
         );
-        return false;
+        return NOT_HELD;
     }
+    let mut outcomes: Vec<(u32, lease::AcquireOutcome)> = Vec::new();
     for slot in lease::candidate_slots(effective.slots, None) {
         let resource_key = lease::slot_resource_key(&tenant_id.to_string(), role, slot);
         let outcome = crate::looping_agent_coord::acquire_slot(
@@ -1033,23 +1155,31 @@ async fn reconcile_slot_lease(
             claude_session_id.as_deref(),
         )
         .await;
-        match &outcome {
+        let stop = match &outcome {
             _ if lease::spawn_permitted(&outcome) => {
                 info!(
                     agent = %agent_id,
                     %resource_key,
                     "looping_agent_supervisor: acquired slot lease — spawn permitted"
                 );
-                set_held_slot(agent_id, HeldSlot { slot, resource_key });
-                return true;
+                set_held_slot(
+                    agent_id,
+                    HeldSlot {
+                        slot,
+                        resource_key: resource_key.clone(),
+                        acquired_at_ms: obs.now_ms,
+                        last_proven_alive_ms: obs.proven_alive.then_some(obs.now_ms),
+                    },
+                );
+                true
             }
-            lease::AcquireOutcome::Held { current_holder } => {
+            lease::AcquireOutcome::Held { .. } => {
                 debug!(
                     agent = %agent_id,
                     %resource_key,
-                    holder = current_holder.as_deref().unwrap_or("unknown"),
                     "looping_agent_supervisor: slot held by another runner — trying the next"
                 );
+                false
             }
             lease::AcquireOutcome::Unavailable(e) => {
                 // Coord unreachable is NOT a free slot. Stop walking (the rest
@@ -1060,13 +1190,17 @@ async fn reconcile_slot_lease(
                     error = %e,
                     "looping_agent_supervisor: slot acquire unavailable — not spawning"
                 );
-                return false;
+                true
             }
             // `spawn_permitted` already covered Acquired.
             lease::AcquireOutcome::Acquired => unreachable!(),
+        };
+        outcomes.push((slot, outcome));
+        if stop {
+            break;
         }
     }
-    false
+    lease::LeaseTick::walked(lease::walk_verdict(&outcomes))
 }
 
 /// Edge-triggered posture logging: emit a line only when an agent's effective

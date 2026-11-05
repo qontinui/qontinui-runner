@@ -44,13 +44,29 @@
 //!                                       ──stolen───────────> we lost it
 //! release on clean stop                                       (frees the slot
 //!                                                              immediately)
+//! hold + tab dead past the orphan grace ────────────────────> release (a peer
+//!                                                              can fill it)
+//! hold + slot index >= a coord-lowered count ───────────────> release, re-walk
 //! ```
+//!
+//! ## The hold tracks the tab
+//!
+//! Plan `2026-11-05-looping-agent-slot-lease-tracks-tab-liveness`. A slot
+//! licenses a TAB. Renewing a slot whose tab is gone strands it: every peer
+//! sees `held`, nobody fills it, and coord's placement view reports
+//! `holder_without_live_session`. So the hold is conditional on the tab
+//! ([`hold_decision`]): a tab that is alive (or being boot-restored) keeps its
+//! slot unconditionally; a tab that has been dead for longer than
+//! [`orphan_grace_ms`] since it last PROVED itself releases it. And a runner
+//! only walks for a slot it can use ([`acquire_permitted`]): to adopt a live
+//! tab, or to spawn one it is able and allowed to spawn.
 //!
 //! A dead runner stops heartbeating, its lease expires on TTL, and the freed
 //! slot is acquired by exactly ONE surviving supervisor — one respawn, not a
 //! storm, because the atomic acquire admits exactly one winner.
 
-use super::policy::Action;
+use super::desired_state::DesiredSource;
+use super::policy::{self, Action, Liveness};
 
 /// Coord `ClaimKind` used for slot leases (snake_case wire form).
 ///
@@ -113,6 +129,187 @@ pub enum HeartbeatOutcome {
 pub struct HeldSlot {
     pub slot: u32,
     pub resource_key: String,
+    /// When this supervisor took or re-adopted the slot (`claimed`/`granted`/
+    /// `renewed`). After a runner restart this is the `renewed` instant.
+    pub acquired_at_ms: i64,
+    /// The last tick on which the agent's tab PROVED itself alive: running
+    /// past its spawn grace (the supervisor's `spawn_streak_clears`).
+    pub last_proven_alive_ms: Option<i64>,
+}
+
+impl HeldSlot {
+    /// The orphan-grace anchor: `max(acquired_at_ms, last_proven_alive_ms)`.
+    ///
+    /// Anchored on PROVEN alive, not merely alive: a respawn that reads live
+    /// for ten seconds and exits (the trust-dialog / 401 pattern) must not
+    /// reset the clock on every attempt.
+    pub fn anchor_ms(&self) -> i64 {
+        self.last_proven_alive_ms
+            .map_or(self.acquired_at_ms, |p| p.max(self.acquired_at_ms))
+    }
+}
+
+/// How many spawn-failure backoff steps the orphan grace covers.
+const ORPHAN_GRACE_BACKOFF_STEPS: u32 = 3;
+
+/// How long a held slot may sit over a tab that is not alive before it is
+/// released: one full spawn grace plus the first three spawn-failure backoffs
+/// (`(90 + 30 + 60 + 120) s = 300 s` at the default policy). Derived from the
+/// existing policy fields rather than a new knob.
+///
+/// A routine `DeathRespawn` never comes near it — the tab is respawned on the
+/// tick it dies and reads alive again within a tick — so only a holder that
+/// has failed to keep ANY tab alive for about five minutes loses the slot.
+pub fn orphan_grace_ms(spawn_grace_secs: u64) -> i64 {
+    let backoffs: u64 = (1..=ORPHAN_GRACE_BACKOFF_STEPS)
+        .map(policy::spawn_backoff_secs)
+        .sum();
+    let secs = spawn_grace_secs.saturating_add(backoffs);
+    i64::try_from(secs).unwrap_or(i64::MAX).saturating_mul(1000)
+}
+
+/// The per-tick observation the supervisor hands the lease layer. Resolved
+/// ONCE per tick, before the lease reconcile, so the lease and the decision
+/// core judge the same tab (two reads per tick could disagree — the #1025
+/// shape).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LeaseTickObs {
+    pub now_ms: i64,
+    pub liveness: Liveness,
+    /// The tab proved itself this tick: `Live` and past its spawn grace.
+    pub proven_alive: bool,
+    /// This runner could spawn a tab this tick: the agent registry permits it,
+    /// the device drain allows it, and the spawn-failure backoff has elapsed.
+    pub spawn_able: bool,
+    pub spawn_grace_secs: u64,
+    pub source: DesiredSource,
+    pub slots: u32,
+}
+
+/// Why a held slot is being given up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleaseReason {
+    /// The tab has not been alive for longer than the orphan grace.
+    TabNotAlive,
+    /// Coord lowered the count below this slot's index.
+    OutOfRange,
+}
+
+/// What to do with a slot we hold, this tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HoldDecision {
+    Keep,
+    Release(ReleaseReason),
+}
+
+/// **Should a slot we hold be kept this tick?** Pure; evaluated before the
+/// heartbeat.
+///
+/// 1. A slot index at or above a COORD-sourced count is released
+///    (`OutOfRange`): the count was lowered. Only under `Coord` — the
+///    local-registry fallback always reports one slot, so a failed
+///    desired-state read must never release slot 1.
+/// 2. A tab that is alive (`Live` or `PendingRestore`) keeps its slot,
+///    unconditionally: never freed by an authz refusal, a drain, a backoff or
+///    anything else.
+/// 3. Otherwise (`Dead`/`Exited`) the slot is kept while
+///    `now - anchor < orphan_grace` and released (`TabNotAlive`) once the
+///    grace has passed. A clock that runs backwards keeps.
+pub fn hold_decision(held_slot: u32, anchor_ms: i64, obs: &LeaseTickObs) -> HoldDecision {
+    if obs.source == DesiredSource::Coord && held_slot >= obs.slots {
+        return HoldDecision::Release(ReleaseReason::OutOfRange);
+    }
+    if obs.liveness.tab_alive() {
+        return HoldDecision::Keep;
+    }
+    if obs.now_ms.saturating_sub(anchor_ms) >= orphan_grace_ms(obs.spawn_grace_secs) {
+        HoldDecision::Release(ReleaseReason::TabNotAlive)
+    } else {
+        HoldDecision::Keep
+    }
+}
+
+/// Whether `now` is still inside the cooldown that follows an orphan release
+/// (one lease TTL). At exactly one TTL the cooldown is over.
+pub fn in_orphan_cooldown(now_ms: i64, last_orphan_release_ms: Option<i64>) -> bool {
+    last_orphan_release_ms.is_some_and(|t| now_ms.saturating_sub(t) < LEASE_TTL_SECS * 1000)
+}
+
+/// **May this tick walk the candidate slots at all?** Pure.
+///
+/// * A live (or restoring) tab may always adopt a free slot: adopting is not a
+///   spawn, so neither the agent registry nor the drain governs it.
+/// * Otherwise only a runner that could actually spawn may take a slot, and
+///   not inside the cooldown after it released one for a dead tab. Without
+///   that, a runner whose spawns keep failing — or are refused with no backoff
+///   (the resource guard, an unread trust dial) — would re-take the slot it
+///   just gave up on the next tick.
+pub fn acquire_permitted(obs: &LeaseTickObs, last_orphan_release_ms: Option<i64>) -> bool {
+    obs.liveness.tab_alive()
+        || (obs.spawn_able && !in_orphan_cooldown(obs.now_ms, last_orphan_release_ms))
+}
+
+/// What one tick's acquire walk established.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalkVerdict {
+    Acquired {
+        slot: u32,
+    },
+    /// Every candidate answered `held`. The only authoritative "no room" answer.
+    AllHeld,
+    /// A transport/parse failure stopped the walk. Never evidence.
+    Unavailable,
+    /// The walk did not run (not permitted, no identity, not running, or we
+    /// already hold a slot).
+    NotWalked,
+}
+
+/// Pure fold of a walk's ordered outcomes. Stops at the first `Acquired` or
+/// `Unavailable`, exactly as the supervisor's loop does; nothing observed is
+/// `NotWalked`.
+pub fn walk_verdict(outcomes: &[(u32, AcquireOutcome)]) -> WalkVerdict {
+    if outcomes.is_empty() {
+        return WalkVerdict::NotWalked;
+    }
+    for (slot, outcome) in outcomes {
+        match outcome {
+            AcquireOutcome::Acquired => return WalkVerdict::Acquired { slot: *slot },
+            AcquireOutcome::Unavailable(_) => return WalkVerdict::Unavailable,
+            AcquireOutcome::Held { .. } => {}
+        }
+    }
+    WalkVerdict::AllHeld
+}
+
+/// What the lease reconcile reports to the supervisor for one tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LeaseTick {
+    /// This supervisor holds a slot lease right now.
+    pub holds: bool,
+    /// What this tick's acquire walk established (`NotWalked` when it did not
+    /// run — including every tick on which we already held a slot).
+    pub walk: WalkVerdict,
+}
+
+impl LeaseTick {
+    /// A tick on which we hold no slot and did not walk.
+    pub const NOT_HELD: LeaseTick = LeaseTick {
+        holds: false,
+        walk: WalkVerdict::NotWalked,
+    };
+    /// A tick on which we kept the slot we already held.
+    pub const HELD: LeaseTick = LeaseTick {
+        holds: true,
+        walk: WalkVerdict::NotWalked,
+    };
+
+    /// The report for a tick whose walk ran.
+    pub fn walked(walk: WalkVerdict) -> LeaseTick {
+        LeaseTick {
+            holds: matches!(walk, WalkVerdict::Acquired { .. }),
+            walk,
+        }
+    }
 }
 
 /// Build the canonical slot resource key: `role:<tenant>:<role>:<slot>` (D3).
@@ -521,5 +718,640 @@ mod tests {
             "a runner must be able to re-acquire (renew) its OWN lease after a restart"
         );
         assert_eq!(held_after_restart, Some(0));
+    }
+
+    // -- The hold tracks the tab (plan 2026-11-05-…-tracks-tab-liveness) ----
+
+    const GRACE_SECS: u64 = 90;
+    const TICK_MS: i64 = 5_000;
+    const TTL_MS: i64 = LEASE_TTL_SECS * 1000;
+
+    fn obs(now_ms: i64, liveness: Liveness) -> LeaseTickObs {
+        LeaseTickObs {
+            now_ms,
+            liveness,
+            proven_alive: false,
+            spawn_able: true,
+            spawn_grace_secs: GRACE_SECS,
+            source: DesiredSource::Coord,
+            slots: 1,
+        }
+    }
+
+    fn held() -> AcquireOutcome {
+        AcquireOutcome::Held {
+            current_holder: None,
+        }
+    }
+
+    #[test]
+    fn orphan_grace_is_spawn_grace_plus_three_backoffs() {
+        assert_eq!(orphan_grace_ms(90), 300_000);
+        // One ordinary failed respawn (grace + first backoff) never costs the slot.
+        assert!(
+            orphan_grace_ms(90)
+                > (GRACE_SECS as i64) * 1000 + (policy::spawn_backoff_secs(1) as i64) * 1000
+        );
+        assert_eq!(
+            orphan_grace_ms(u64::MAX),
+            i64::MAX,
+            "saturates, never panics"
+        );
+    }
+
+    #[test]
+    fn the_anchor_is_the_later_of_acquire_and_last_proof() {
+        let mut h = HeldSlot {
+            slot: 0,
+            resource_key: "k".into(),
+            acquired_at_ms: 1_000,
+            last_proven_alive_ms: None,
+        };
+        assert_eq!(h.anchor_ms(), 1_000);
+        h.last_proven_alive_ms = Some(500);
+        assert_eq!(h.anchor_ms(), 1_000, "a proof older than the acquire");
+        h.last_proven_alive_ms = Some(9_000);
+        assert_eq!(h.anchor_ms(), 9_000);
+    }
+
+    #[test]
+    fn a_live_or_pending_tab_keeps_its_slot_at_any_age() {
+        // The authz-refusal invariant: tab liveness — never `spawn_able` — is
+        // what keeps the slot.
+        let ten_days = 10 * 24 * 3_600 * 1000;
+        for l in [Liveness::Live, Liveness::PendingRestore] {
+            let o = LeaseTickObs {
+                spawn_able: false,
+                ..obs(ten_days, l)
+            };
+            assert_eq!(hold_decision(0, 0, &o), HoldDecision::Keep, "{l:?}");
+        }
+    }
+
+    #[test]
+    fn a_dead_tab_keeps_its_slot_inside_the_grace() {
+        let g = orphan_grace_ms(GRACE_SECS);
+        for l in [Liveness::Dead, Liveness::Exited] {
+            assert_eq!(hold_decision(0, 0, &obs(g - 1, l)), HoldDecision::Keep);
+        }
+    }
+
+    #[test]
+    fn a_dead_tab_releases_past_the_grace() {
+        let g = orphan_grace_ms(GRACE_SECS);
+        for l in [Liveness::Dead, Liveness::Exited] {
+            assert_eq!(
+                hold_decision(0, 1_000, &obs(1_000 + g, l)),
+                HoldDecision::Release(ReleaseReason::TabNotAlive),
+                "{l:?}: the grace boundary is inclusive"
+            );
+        }
+    }
+
+    #[test]
+    fn clock_skew_never_releases() {
+        assert_eq!(
+            hold_decision(0, 10_000_000, &obs(0, Liveness::Dead)),
+            HoldDecision::Keep
+        );
+    }
+
+    #[test]
+    fn an_out_of_range_slot_releases_only_under_a_coord_count() {
+        assert_eq!(
+            hold_decision(1, 0, &obs(0, Liveness::Live)),
+            HoldDecision::Release(ReleaseReason::OutOfRange),
+            "even with a live tab"
+        );
+        let local = LeaseTickObs {
+            source: DesiredSource::LocalRegistry,
+            ..obs(0, Liveness::Live)
+        };
+        assert_eq!(
+            hold_decision(1, 0, &local),
+            HoldDecision::Keep,
+            "a failed desired-state read (local fallback = 1 slot) never releases slot 1"
+        );
+        assert_eq!(
+            hold_decision(0, 0, &obs(0, Liveness::Live)),
+            HoldDecision::Keep
+        );
+    }
+
+    #[test]
+    fn acquire_permitted_matrix() {
+        let now = 1_000_000;
+        // Alive → adopt, even when this runner could not spawn.
+        for l in [Liveness::Live, Liveness::PendingRestore] {
+            let o = LeaseTickObs {
+                spawn_able: false,
+                ..obs(now, l)
+            };
+            assert!(acquire_permitted(&o, Some(now)), "{l:?}");
+        }
+        for l in [Liveness::Dead, Liveness::Exited] {
+            assert!(acquire_permitted(&obs(now, l), None));
+            let refused = LeaseTickObs {
+                spawn_able: false,
+                ..obs(now, l)
+            };
+            assert!(!acquire_permitted(&refused, None));
+            // Inside the cooldown after an orphan release.
+            assert!(!acquire_permitted(&obs(now, l), Some(now - TTL_MS + 1)));
+            // The boundary: exactly one TTL later the cooldown is over.
+            assert!(acquire_permitted(&obs(now, l), Some(now - TTL_MS)));
+        }
+    }
+
+    #[test]
+    fn walk_verdict_folds() {
+        let unavailable = || AcquireOutcome::Unavailable("timeout".into());
+        assert_eq!(
+            walk_verdict(&[(0, held()), (1, held())]),
+            WalkVerdict::AllHeld
+        );
+        assert_eq!(
+            walk_verdict(&[(0, held()), (1, unavailable())]),
+            WalkVerdict::Unavailable
+        );
+        assert_eq!(
+            walk_verdict(&[(0, held()), (1, AcquireOutcome::Acquired)]),
+            WalkVerdict::Acquired { slot: 1 }
+        );
+        assert_eq!(
+            walk_verdict(&[(0, unavailable())]),
+            WalkVerdict::Unavailable
+        );
+        assert_eq!(walk_verdict(&[]), WalkVerdict::NotWalked);
+        // A `held` naming nobody is still held.
+        assert_eq!(
+            walk_verdict(&[(
+                0,
+                AcquireOutcome::Held {
+                    current_holder: None
+                }
+            )]),
+            WalkVerdict::AllHeld
+        );
+    }
+
+    // -- Fleet simulations --------------------------------------------------
+
+    /// A richer model of coord's slot mutex than [`FakeCoordMutex`]: TTLs in
+    /// MILLISECONDS, heartbeat/release, and an outage switch under which every
+    /// call answers `Unavailable`.
+    struct SimCoord {
+        owners: std::collections::HashMap<String, (String, i64)>,
+        outage: bool,
+    }
+
+    impl SimCoord {
+        fn new() -> Self {
+            Self {
+                owners: std::collections::HashMap::new(),
+                outage: false,
+            }
+        }
+        fn live_owner(&self, key: &str, now: i64) -> Option<&str> {
+            self.owners
+                .get(key)
+                .filter(|(_, exp)| *exp > now)
+                .map(|(o, _)| o.as_str())
+        }
+        fn acquire(&mut self, key: &str, owner: &str, now: i64) -> AcquireOutcome {
+            if self.outage {
+                return AcquireOutcome::Unavailable("outage".into());
+            }
+            match self.live_owner(key, now) {
+                Some(h) if h != owner => AcquireOutcome::Held {
+                    current_holder: Some(h.to_string()),
+                },
+                _ => {
+                    self.owners
+                        .insert(key.to_string(), (owner.to_string(), now + TTL_MS));
+                    AcquireOutcome::Acquired
+                }
+            }
+        }
+        fn heartbeat(&mut self, key: &str, owner: &str, now: i64) -> HeartbeatOutcome {
+            if self.outage {
+                return HeartbeatOutcome::Unavailable("outage".into());
+            }
+            match self.live_owner(key, now) {
+                Some(h) if h == owner => {
+                    self.owners
+                        .insert(key.to_string(), (owner.to_string(), now + TTL_MS));
+                    HeartbeatOutcome::Ok
+                }
+                Some(_) => HeartbeatOutcome::Stolen,
+                None => HeartbeatOutcome::NotHeld,
+            }
+        }
+        fn release(&mut self, key: &str, owner: &str) {
+            if self.outage {
+                return; // best effort: the TTL is the backstop
+            }
+            if self.owners.get(key).is_some_and(|(o, _)| o == owner) {
+                self.owners.remove(key);
+            }
+        }
+    }
+
+    /// How a runner's spawns behave.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum SpawnBehavior {
+        /// The spawn succeeds and the tab stays up.
+        Ok,
+        /// Every spawn fails (bad account, refused by a guard with a backoff).
+        Fails,
+        /// The spawn succeeds, then the tab exits one tick later (the
+        /// trust-dialog / 401 pattern) — an early exit takes the backoff.
+        ExitsEarly,
+    }
+
+    struct SimRunner {
+        name: &'static str,
+        held: Option<HeldSlot>,
+        tab: Liveness,
+        last_spawn_at: Option<i64>,
+        spawn: SpawnBehavior,
+        /// The agent registry permits a spawn (the authz opt-in).
+        authz: bool,
+        /// The idle probe reads turn-complete.
+        idle: bool,
+        failures: u32,
+        next_spawn_at: i64,
+        last_orphan_release: Option<i64>,
+        spawns: u32,
+        nudges: u32,
+        releases: Vec<(i64, ReleaseReason)>,
+    }
+
+    impl SimRunner {
+        fn new(name: &'static str, tab: Liveness, spawn: SpawnBehavior) -> Self {
+            Self {
+                name,
+                held: None,
+                tab,
+                last_spawn_at: None,
+                spawn,
+                authz: true,
+                idle: true,
+                failures: 0,
+                next_spawn_at: 0,
+                last_orphan_release: None,
+                spawns: 0,
+                nudges: 0,
+                releases: Vec::new(),
+            }
+        }
+        /// Start the runner already holding `slot`, its tab proven at `at`.
+        fn holding(mut self, slot: u32, at: i64) -> Self {
+            self.held = Some(HeldSlot {
+                slot,
+                resource_key: key(slot),
+                acquired_at_ms: at,
+                last_proven_alive_ms: Some(at),
+            });
+            self
+        }
+        fn live_tab(&self) -> bool {
+            self.tab == Liveness::Live
+        }
+    }
+
+    fn key(slot: u32) -> String {
+        slot_resource_key("tenant-x", "merge_shepherd", slot)
+    }
+
+    /// What one simulated tick did.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct SimTick {
+        action: Action,
+        walk: WalkVerdict,
+    }
+
+    /// One supervisor tick over the PURE core, composed in the order the real
+    /// supervisor composes it: liveness first; `hold_decision`, then the
+    /// heartbeat; `acquire_permitted`, then the walk and its verdict; then
+    /// `decide` → `gate_action`; then the action is applied to the tab.
+    fn sim_tick(
+        coord: &mut SimCoord,
+        r: &mut SimRunner,
+        slots: u32,
+        source: DesiredSource,
+        now: i64,
+    ) -> SimTick {
+        // An early-exit tab dies on the tick after its spawn and backs off.
+        if r.spawn == SpawnBehavior::ExitsEarly
+            && r.tab == Liveness::Live
+            && r.last_spawn_at.is_some_and(|t| t < now)
+        {
+            r.tab = Liveness::Exited;
+            r.failures += 1;
+            r.next_spawn_at = now + (policy::spawn_backoff_secs(r.failures) as i64) * 1000;
+        }
+
+        let grace_elapsed = policy::spawn_grace_elapsed(now, r.last_spawn_at, GRACE_SECS);
+        let backoff_elapsed = now >= r.next_spawn_at;
+        let o = LeaseTickObs {
+            now_ms: now,
+            liveness: r.tab,
+            proven_alive: r.tab == Liveness::Live && grace_elapsed,
+            spawn_able: r.authz && backoff_elapsed,
+            spawn_grace_secs: GRACE_SECS,
+            source,
+            slots,
+        };
+
+        // -- Hold. --
+        let mut holds = false;
+        let mut may_walk = true;
+        if let Some(h) = r.held.as_mut() {
+            if o.proven_alive {
+                h.last_proven_alive_ms = Some(now);
+            }
+            match hold_decision(h.slot, h.anchor_ms(), &o) {
+                HoldDecision::Release(reason) => {
+                    coord.release(&h.resource_key, r.name);
+                    r.releases.push((now, reason));
+                    r.held = None;
+                    if reason == ReleaseReason::TabNotAlive {
+                        r.last_orphan_release = Some(now);
+                        may_walk = false; // never re-take the slot just given up
+                    }
+                }
+                HoldDecision::Keep => {
+                    if still_held_after_heartbeat(&coord.heartbeat(&h.resource_key, r.name, now)) {
+                        holds = true;
+                        may_walk = false;
+                    } else {
+                        r.held = None;
+                    }
+                }
+            }
+        }
+
+        // -- Acquire walk. --
+        let mut walk = WalkVerdict::NotWalked;
+        if may_walk && acquire_permitted(&o, r.last_orphan_release) {
+            let mut outcomes = Vec::new();
+            for slot in candidate_slots(slots, None) {
+                let outcome = coord.acquire(&key(slot), r.name, now);
+                let stop = !matches!(outcome, AcquireOutcome::Held { .. });
+                outcomes.push((slot, outcome));
+                if stop {
+                    break;
+                }
+            }
+            walk = walk_verdict(&outcomes);
+            if let WalkVerdict::Acquired { slot } = walk {
+                r.held = Some(HeldSlot {
+                    slot,
+                    resource_key: key(slot),
+                    acquired_at_ms: now,
+                    last_proven_alive_ms: o.proven_alive.then_some(now),
+                });
+                holds = true;
+            }
+        }
+
+        // -- Decide → gate. --
+        let input = policy::TickInput {
+            enabled: true,
+            desired_running: true,
+            tab_alive: r.tab.tab_alive(),
+            ever_spawned: true,
+            spawn_backoff_elapsed: backoff_elapsed,
+            spawn_grace_elapsed: grace_elapsed,
+            idle: r.idle,
+            context_low: false,
+            cadence_elapsed: true,
+            cycles_since_relaunch: 1,
+            relaunch_every_cycles: 1_000,
+        };
+        let action = gate_action(policy::decide(&input), holds);
+        if !r.authz && matches!(action, Action::Spawn(_) | Action::Relaunch(_)) {
+            // The supervisor's Phase 4c rewrite.
+            return SimTick {
+                action: Action::None,
+                walk,
+            };
+        }
+
+        // -- Act. --
+        match action {
+            Action::Spawn(_) => match r.spawn {
+                SpawnBehavior::Fails => {
+                    r.failures += 1;
+                    r.next_spawn_at = now + (policy::spawn_backoff_secs(r.failures) as i64) * 1000;
+                }
+                SpawnBehavior::Ok | SpawnBehavior::ExitsEarly => {
+                    r.tab = Liveness::Live;
+                    r.last_spawn_at = Some(now);
+                    r.spawns += 1;
+                }
+            },
+            Action::Nudge => r.nudges += 1,
+            Action::None | Action::Relaunch(_) => {}
+        }
+        SimTick { action, walk }
+    }
+
+    fn slotted_live_tabs(runners: &[&SimRunner]) -> usize {
+        runners
+            .iter()
+            .filter(|r| r.held.is_some() && r.live_tab())
+            .count()
+    }
+
+    /// S1: the holder's tab died and every respawn fails. It keeps the slot
+    /// through the grace, releases it at the grace, a peer fills it within a
+    /// tick, and the releaser does not take it back.
+    #[test]
+    fn a_dead_tab_holder_releases_and_a_peer_fills_the_slot() {
+        let mut coord = SimCoord::new();
+        coord.owners.insert(key(0), ("r0".into(), TTL_MS));
+        let mut r0 = SimRunner::new("r0", Liveness::Dead, SpawnBehavior::Fails).holding(0, 0);
+        let mut r1 = SimRunner::new("r1", Liveness::Dead, SpawnBehavior::Ok);
+        let grace = orphan_grace_ms(GRACE_SECS);
+
+        let mut now = 0;
+        while now < grace {
+            sim_tick(&mut coord, &mut r0, 1, DesiredSource::Coord, now);
+            let t1 = sim_tick(&mut coord, &mut r1, 1, DesiredSource::Coord, now);
+            assert!(r0.held.is_some(), "kept inside the grace (t={now})");
+            assert_eq!(t1.walk, WalkVerdict::AllHeld);
+            assert_eq!(r1.spawns, 0, "no spawn without the slot");
+            now += TICK_MS;
+        }
+        // The tick at the grace: R0 releases, R1 acquires and spawns.
+        sim_tick(&mut coord, &mut r0, 1, DesiredSource::Coord, now);
+        assert_eq!(r0.releases, vec![(grace, ReleaseReason::TabNotAlive)]);
+        let t1 = sim_tick(&mut coord, &mut r1, 1, DesiredSource::Coord, now);
+        assert_eq!(t1.walk, WalkVerdict::Acquired { slot: 0 });
+        assert_eq!(r1.spawns, 1);
+
+        // R0 never takes it back — not in its cooldown, not after it.
+        for _ in 0..200 {
+            now += TICK_MS;
+            sim_tick(&mut coord, &mut r0, 1, DesiredSource::Coord, now);
+            sim_tick(&mut coord, &mut r1, 1, DesiredSource::Coord, now);
+            assert!(r0.held.is_none());
+            assert_eq!(slotted_live_tabs(&[&r0, &r1]), 1);
+        }
+    }
+
+    /// The cooldown, on its own: a releaser whose spawns are refused WITHOUT a
+    /// backoff (resource guard, unread trust dial) stays out of the race for
+    /// one TTL instead of re-taking the slot on the next tick.
+    #[test]
+    fn a_releaser_stays_out_of_the_race_for_one_ttl() {
+        let mut coord = SimCoord::new();
+        let mut r0 = SimRunner::new("r0", Liveness::Dead, SpawnBehavior::Fails).holding(0, 0);
+        coord.owners.insert(key(0), ("r0".into(), TTL_MS));
+        // No backoff: a refusal that retries every tick.
+        let grace = orphan_grace_ms(GRACE_SECS);
+        let mut now = grace;
+        r0.next_spawn_at = 0;
+        sim_tick(&mut coord, &mut r0, 1, DesiredSource::Coord, now);
+        assert!(r0.held.is_none(), "released at the grace");
+        while now < grace + TTL_MS {
+            r0.next_spawn_at = 0; // spawn_able stays true
+            let t = sim_tick(&mut coord, &mut r0, 1, DesiredSource::Coord, now);
+            assert_eq!(t.walk, WalkVerdict::NotWalked, "cooldown (t={now})");
+            now += TICK_MS;
+        }
+        r0.next_spawn_at = 0;
+        let t = sim_tick(&mut coord, &mut r0, 1, DesiredSource::Coord, now);
+        assert_eq!(t.walk, WalkVerdict::Acquired { slot: 0 }, "after one TTL");
+    }
+
+    /// S8: a long-lived tab dies and is respawned on the same tick. The slot
+    /// is never vacated across two graces.
+    #[test]
+    fn a_normal_death_respawn_keeps_the_slot() {
+        let mut coord = SimCoord::new();
+        let hours = 6 * 3_600 * 1000;
+        coord.owners.insert(key(0), ("r0".into(), TTL_MS));
+        let mut r0 = SimRunner::new("r0", Liveness::Live, SpawnBehavior::Ok).holding(0, 0);
+        r0.last_spawn_at = Some(-hours);
+        let grace = orphan_grace_ms(GRACE_SECS);
+        let mut now = 0;
+        while now < 2 * grace {
+            if now == 60_000 {
+                r0.tab = Liveness::Dead; // the routine death
+            }
+            sim_tick(&mut coord, &mut r0, 1, DesiredSource::Coord, now);
+            assert!(r0.held.is_some(), "t={now}");
+            assert!(r0.releases.is_empty());
+            now += TICK_MS;
+        }
+        assert_eq!(r0.spawns, 1, "one DeathRespawn");
+        assert!(r0.live_tab());
+    }
+
+    /// S9: every respawn reads live for one tick and exits, with the backoff
+    /// escalating. The release lands at last PROOF of life + grace — not when
+    /// the backoff alone has outgrown the grace.
+    #[test]
+    fn an_early_exit_loop_releases_on_the_proven_alive_clock() {
+        let mut coord = SimCoord::new();
+        coord.owners.insert(key(0), ("r0".into(), TTL_MS));
+        // Proven alive at t=0 (an adopted tab: no spawn recorded), dies at t=5s.
+        let mut r0 = SimRunner::new("r0", Liveness::Live, SpawnBehavior::ExitsEarly).holding(0, 0);
+        let grace = orphan_grace_ms(GRACE_SECS);
+        let mut now = 0;
+        while r0.releases.is_empty() && now < 10 * grace {
+            if now == TICK_MS {
+                r0.tab = Liveness::Dead;
+            }
+            sim_tick(&mut coord, &mut r0, 1, DesiredSource::Coord, now);
+            now += TICK_MS;
+        }
+        assert!(r0.spawns >= 3, "it kept trying: {} spawns", r0.spawns);
+        let (at, reason) = r0.releases[0];
+        assert_eq!(reason, ReleaseReason::TabNotAlive);
+        assert!(
+            (grace..grace + 2 * TICK_MS).contains(&at),
+            "released at {at}, expected last proof (0) + grace ({grace})"
+        );
+    }
+
+    /// S10: an authz-refused runner with a live tab keeps its slot forever.
+    #[test]
+    fn a_refused_runner_with_a_live_tab_keeps_its_slot_forever() {
+        let mut coord = SimCoord::new();
+        coord.owners.insert(key(0), ("r0".into(), TTL_MS));
+        let mut r0 = SimRunner::new("r0", Liveness::Live, SpawnBehavior::Ok).holding(0, 0);
+        r0.authz = false;
+        let grace = orphan_grace_ms(GRACE_SECS);
+        let mut now = 0;
+        while now < 10 * grace {
+            let t = sim_tick(&mut coord, &mut r0, 1, DesiredSource::Coord, now);
+            assert!(r0.held.is_some() && r0.releases.is_empty(), "t={now}");
+            assert_eq!(t.action, Action::Nudge, "nudging is not spawning");
+            now += TICK_MS;
+        }
+        assert!(r0.nudges > 0 && r0.spawns == 0);
+    }
+
+    /// S3 (release side): a coord outage of ten TTLs never releases a hold and
+    /// never lets anybody spawn.
+    #[test]
+    fn a_coord_outage_never_releases_and_nobody_spawns() {
+        let mut coord = SimCoord::new();
+        coord.owners.insert(key(0), ("r0".into(), TTL_MS));
+        let mut r0 = SimRunner::new("r0", Liveness::Live, SpawnBehavior::Ok).holding(0, 0);
+        let mut r1 = SimRunner::new("r1", Liveness::Live, SpawnBehavior::Ok);
+        let mut r2 = SimRunner::new("r2", Liveness::Dead, SpawnBehavior::Ok);
+        coord.outage = true;
+        let mut now = 0;
+        while now < 10 * TTL_MS {
+            sim_tick(&mut coord, &mut r0, 1, DesiredSource::Coord, now);
+            let t1 = sim_tick(&mut coord, &mut r1, 1, DesiredSource::Coord, now);
+            let t2 = sim_tick(&mut coord, &mut r2, 1, DesiredSource::Coord, now);
+            assert!(r0.held.is_some(), "a heartbeat Unavailable keeps the hold");
+            assert_eq!(t1.walk, WalkVerdict::Unavailable);
+            assert_eq!(t2.walk, WalkVerdict::Unavailable);
+            now += TICK_MS;
+        }
+        assert_eq!(r0.spawns + r1.spawns + r2.spawns, 0);
+        assert!(r0.releases.is_empty());
+    }
+
+    /// S11 (release side): coord lowers the count 2 → 1. The holder of slot 1
+    /// releases it (`OutOfRange`) and re-walks the lower slots, which are held.
+    #[test]
+    fn lowering_the_count_releases_the_out_of_range_slot() {
+        let mut coord = SimCoord::new();
+        coord.owners.insert(key(0), ("r0".into(), TTL_MS));
+        coord.owners.insert(key(1), ("r1".into(), TTL_MS));
+        let mut r0 = SimRunner::new("r0", Liveness::Live, SpawnBehavior::Ok).holding(0, 0);
+        let mut r1 = SimRunner::new("r1", Liveness::Live, SpawnBehavior::Ok).holding(1, 0);
+        sim_tick(&mut coord, &mut r0, 2, DesiredSource::Coord, 0);
+        sim_tick(&mut coord, &mut r1, 2, DesiredSource::Coord, 0);
+        assert!(r1.held.is_some());
+
+        sim_tick(&mut coord, &mut r0, 1, DesiredSource::Coord, TICK_MS);
+        let t1 = sim_tick(&mut coord, &mut r1, 1, DesiredSource::Coord, TICK_MS);
+        assert_eq!(r1.releases, vec![(TICK_MS, ReleaseReason::OutOfRange)]);
+        assert_eq!(t1.walk, WalkVerdict::AllHeld, "falls through to the walk");
+        assert!(coord.live_owner(&key(1), TICK_MS).is_none(), "slot 1 freed");
+        assert_eq!(r0.held.as_ref().map(|h| h.slot), Some(0));
+
+        // A local-registry fallback (a failed desired-state read) never does.
+        let mut r2 = SimRunner::new("r2", Liveness::Live, SpawnBehavior::Ok).holding(1, 0);
+        coord
+            .owners
+            .insert(key(1), ("r2".into(), 2 * TICK_MS + TTL_MS));
+        sim_tick(
+            &mut coord,
+            &mut r2,
+            1,
+            DesiredSource::LocalRegistry,
+            2 * TICK_MS,
+        );
+        assert!(r2.releases.is_empty() && r2.held.is_some());
     }
 }
