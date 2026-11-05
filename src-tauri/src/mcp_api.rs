@@ -5902,6 +5902,7 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_send_message",
     "coord_session_obligations",
     "coord_session_worktrees",
+    "coord_sessions_unfinished",
     "coord_set_gate_audience",
     "coord_signature",
     "coord_slo_metrics",

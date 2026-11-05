@@ -3458,7 +3458,11 @@ fn state_change_body(payload: &JsonValue) -> JsonValue {
 ///
 /// A payload with no usable `finished_at` (a row queued by an older build, a
 /// `null`, or a value chrono cannot represent) omits the field, and coord
-/// stamps `now()` exactly as before. Pure.
+/// stamps `now()` exactly as before.
+///
+/// A non-blank `finish_reason` in the payload rides along as
+/// `progress.finish_reason`, which coord stores on the row beside the status. A
+/// finish with no reason omits it. Pure.
 fn finished_body(payload: &JsonValue) -> JsonValue {
     let mut progress = serde_json::Map::new();
     progress.insert("session_status".into(), json!("finished"));
@@ -3471,6 +3475,14 @@ fn finished_body(payload: &JsonValue) -> JsonValue {
             "last_progress_at".into(),
             json!(at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)),
         );
+    }
+    if let Some(reason) = payload
+        .get("finish_reason")
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+    {
+        progress.insert("finish_reason".into(), json!(reason));
     }
     json!({ "progress": JsonValue::Object(progress) })
 }
@@ -9067,6 +9079,24 @@ mod tests {
         assert!(body.get("repo").is_none());
         assert!(body.get("branch").is_none());
         assert!(body.get("intent_updates").is_none());
+    }
+
+    #[test]
+    fn finished_body_carries_a_reason_only_when_there_is_one() {
+        assert_eq!(
+            finished_body(&json!({"finish_reason": "dismissed"}))["progress"]["finish_reason"],
+            json!("dismissed")
+        );
+        for payload in [
+            json!({}),
+            json!({"finish_reason": null}),
+            json!({"finish_reason": "   "}),
+        ] {
+            assert!(
+                finished_body(&payload)["progress"].get("finish_reason").is_none(),
+                "{payload}"
+            );
+        }
     }
 
     /// A `finished` row's PATCH carries the mark's own `finished_at` as an

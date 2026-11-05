@@ -387,6 +387,7 @@ const READ_TOOLS: &[&str] = &[
     "coord_reevaluate_dry",
     "coord_session_obligations",
     "coord_session_worktrees",
+    "coord_sessions_unfinished",
     "coord_verification_queue",
     "coord_watch_verdict",
     "coord_who_is_working_on",
