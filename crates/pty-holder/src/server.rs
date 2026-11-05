@@ -252,13 +252,14 @@ impl Holder {
                 })
             }
         };
-        let spec = crate::spec::consume_spec(pane_dir, pane_id).map_err(StartError::Spec)?;
-        // Resolved ONCE, before the child exists: an unusable socket root is a
-        // refusal with nothing to kill, and the stale-socket unlink and the
-        // bind below cannot land in different roots if the preferred root
+        // Resolved ONCE, under the lock and before the spec is consumed or the
+        // child exists: an unusable socket root is a refusal with nothing to
+        // kill and the spec left for a retry, and the stale-socket unlink and
+        // the bind below cannot land in different roots if the preferred root
         // changes in between (`crate::pane::socket_root`).
         #[cfg(unix)]
         let sock = crate::pane::socket_path(pane_dir, pane_id).map_err(StartError::Io)?;
+        let spec = crate::spec::consume_spec(pane_dir, pane_id).map_err(StartError::Spec)?;
         let pane = Pane::spawn(&spec).map_err(StartError::Child)?;
         let scrollback = Arc::new(Mutex::new(crate::scrollback::ScrollbackWriter::new(
             pane_dir,

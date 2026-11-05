@@ -36,18 +36,13 @@ mod windows;
 #[cfg(windows)]
 pub use windows::{Conn, Listener};
 
-/// Bind the pane's endpoint. The caller MUST already hold the pane lock
-/// (lock-before-endpoint, plan D3) and must have removed any stale Unix socket
-/// file under that lock.
+/// Bind the pane's Windows endpoint (its named pipe). The caller MUST already
+/// hold the pane lock (lock-before-endpoint, plan D3). On Unix the holder binds
+/// `Listener::bind` at the socket path it resolved once (`server`), so there is
+/// no Unix arm here to resolve it a second time.
+#[cfg(windows)]
 pub fn bind(pane_dir: &Path, pane: &PaneId) -> io::Result<Listener> {
-    #[cfg(unix)]
-    {
-        Listener::bind(&crate::pane::socket_path(pane_dir, pane)?)
-    }
-    #[cfg(windows)]
-    {
-        Listener::bind(&crate::pane::pipe_name(pane_dir, pane))
-    }
+    Listener::bind(&crate::pane::pipe_name(pane_dir, pane))
 }
 
 /// Bind a holder upgrade's successor endpoint at the STAGED path beside the
@@ -76,7 +71,8 @@ pub fn connect(pane_dir: &Path, pane: &PaneId, deadline: Instant) -> io::Result<
         // Every place this pane's holder may be listening (`socket_candidates`:
         // both socket roots, then a pre-Phase-4 holder's path in the pane dir),
         // most likely first. A candidate with nothing listening (`NotFound`,
-        // `ConnectionRefused`) is passed over; any other answer — a
+        // `ConnectionRefused`) or that this user cannot reach
+        // (`PermissionDenied`) is passed over; any other answer — a
         // connection, or a timeout from a wedged holder's full backlog — is
         // THE answer. When none answers, a refusal (a socket file with no
         // listener: a dead holder's) is reported over a plain absence.
@@ -84,7 +80,12 @@ pub fn connect(pane_dir: &Path, pane: &PaneId, deadline: Instant) -> io::Result<
         for path in crate::pane::socket_candidates(pane_dir, pane) {
             match unix::connect(&path, deadline) {
                 Ok(conn) => return Ok(conn),
-                Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::ConnectionRefused | io::ErrorKind::PermissionDenied
+                    ) =>
+                {
                     refused.get_or_insert(e);
                 }
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
