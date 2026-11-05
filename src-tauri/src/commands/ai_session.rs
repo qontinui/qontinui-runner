@@ -1601,6 +1601,8 @@ async fn reacquire_and_restore_session_worktree(
         spawn_tenant: None,
         shared_branch: crate::agent_worktree::SharedBranchPolicy::Honor,
         edit_siblings: &edit_siblings,
+        // An interactive spawn has a user waiting: no retry budget.
+        transport_retry: std::time::Duration::ZERO,
     })
     .await
     {
