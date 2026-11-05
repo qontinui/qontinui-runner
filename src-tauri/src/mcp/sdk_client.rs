@@ -8336,12 +8336,12 @@ mod tests {
         // the same set `scripts/validate-ws-actions.mjs` matches (#2480):
         // `dispatch_app_request` and `dispatch_app_request_typed` and
         // `try_ws_dispatch` take the action as the 2nd argument;
-        // `dispatch_app_request_by_id` takes it as the 3rd (the 2nd is the
-        // app id). `\s*` crosses newlines, so rustfmt's multi-line call
+        // `dispatch_app_request_by_id` (and its `_typed` twin, counted as
+        // the same shape) takes it as the 3rd (the 2nd is the app id). `\s*` crosses newlines, so rustfmt's multi-line call
         // shape is matched — a literal single-line needle saw 8 of ~145.
         let site = regex::Regex::new(concat!(
             r#"\b(?:(dispatch_app_request(?:_typed)?|try_ws_dispatch)\(\s*&state,\s*"#,
-            r#"|(dispatch_app_request_by_id)\(\s*&state,\s*&?[A-Za-z_][A-Za-z0-9_.]*,\s*)"#,
+            r#"|(dispatch_app_request_by_id)(?:_typed)?\(\s*&state,\s*&?[A-Za-z_][A-Za-z0-9_.]*,\s*)"#,
             r#""([^"]*)""#,
         ))
         .expect("dispatch-site regex compiles");
