@@ -468,6 +468,12 @@ pub(crate) struct MountReading {
     /// Phase 7). A small stick holding BIOS files is "under the 25 GiB floor"
     /// forever, and alarming on it buried the real alarms.
     pub(crate) removable: bool,
+    /// `sysinfo::Disk::is_read_only()` (sysinfo 0.32): `ST_RDONLY` on Linux,
+    /// `FILE_READ_ONLY_VOLUME` on Windows. A read-only mount (an ISO, a
+    /// write-protected card) reads 0 free by construction, so its free space
+    /// answers no capacity question (plan
+    /// `2026-11-03-devops-headroom-grades-read-only-and-esp-volumes-against-the-disk-floor`).
+    pub(crate) read_only: bool,
 }
 
 /// Pick the volume holding `root` from a mount list — longest matching mount
@@ -514,6 +520,7 @@ pub(crate) fn enumerate_mounts() -> Vec<MountReading> {
             total: d.total_space(),
             available: d.available_space(),
             removable: d.is_removable(),
+            read_only: d.is_read_only(),
         })
         .collect()
 }
@@ -1629,6 +1636,7 @@ mod tests {
             total,
             available,
             removable: false,
+            read_only: false,
         }
     }
 
