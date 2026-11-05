@@ -390,9 +390,12 @@ pub const SESSION_START_CHILD_WINDOW_S: i64 = 60;
 ///   seen, since only direct children are inspected.
 ///
 /// Counting boot-time MCP servers as work made every MCP-equipped session
-/// permanently "busy", so wind-down could never close one (plan
+/// permanently "busy", so wind-down could never rate one idle (plan
 /// `2026-10-03-finished-runner-sessions-close-their-window-without-a-drain`,
-/// Phase 2 on a temp runner, 2026-10-04).
+/// Phase 2 on a temp runner, 2026-10-04). This exemption is about idleness
+/// only: `terminal::graceful_exit` still refuses any `claude` holding a child
+/// process, these MCP servers included, so an idle session that holds one is
+/// still not closed.
 pub fn child_signals_work(
     image: Option<&str>,
     child_created_s: Option<i64>,
