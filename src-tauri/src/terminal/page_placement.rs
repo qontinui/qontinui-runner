@@ -8,19 +8,36 @@
 //! An explicit page — an operator spawning on the page they are looking at —
 //! and an adopted holder pane (`insert_with_io`) never come through here.
 //!
-//! **A page's load counts what the restore is about to bring back.** Right
+//! **A page's load counts the rows a restore is about to bring back.** Right
 //! after a restart the live terminal list is nearly empty while the boot
 //! restore is still re-creating panes, so a live-only count let `default` take
 //! new spawns before its restore re-added 58 rows (coord finding `8c9e1419`,
-//! 2026-11-05). [`page_loads`] therefore adds, per page, the rows of the
-//! restorable set whose terminal is not live yet, on the page they were
-//! recorded on. A restored row bound to a live terminal counts once, through
-//! the live terminal. The restorable set is read under the same boot
-//! classification `terminal_session_list_open` uses
+//! 2026-11-05). [`page_loads`] therefore adds, per page, each row of the
+//! restorable set that is not bound to a live terminal, on the page it was
+//! recorded on. The restorable set is read under the same boot classification
+//! `terminal_session_list_open` uses
 //! ([`crate::session::shutdown_marker::restore_admission_inputs`]), so the
-//! picker and the restore cannot disagree about which rows are coming back.
+//! picker and the restore agree about which rows are coming back.
+//!
+//! What counts, and the known edges:
+//! - A restored row bound to a live terminal counts once, through the live
+//!   terminal (on that terminal's page, so a moved pane counts where it is).
+//!   Between a restored pane's create and its record's rebind, the row still
+//!   names the old terminal id and the session counts twice for that moment;
+//!   the error is always an overcount, never an under-fill.
+//! - A row THIS process closed (a pane that exited since boot) is never
+//!   awaiting restore — no restore in this process brings it back — so it does
+//!   not count, although the restorable set keeps it for a while for the NEXT
+//!   boot.
+//! - A prior-boot row the boot restore declines (a page no window owns, a
+//!   deselected or failed restore) keeps counting until the store prunes it.
+//!   The restore marks rows one at a time as it reaches them, and is gated per
+//!   page, so "the restore has run" is not a signal that an unmarked row will
+//!   not come back; counting it costs at most an extra page, and placing a new
+//!   session onto a page its restore then refills is the defect this fixes.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use super::types::TerminalInfo;
 use super::TerminalManager;
@@ -71,6 +88,48 @@ pub(crate) fn pick_page(
     mint()
 }
 
+/// The lifecycle store a running runner manages, for the placement sites that
+/// hold an `AppHandle` (the gate continuation, the condition check, the
+/// looping agent, `TerminalManager::create`). `None` only where it is not
+/// managed; the loads are then the live terminals alone.
+pub(crate) fn lifecycle_store(app: &tauri::AppHandle) -> Option<Arc<SessionLifecycleStore>> {
+    use tauri::Manager;
+    app.try_state::<Arc<SessionLifecycleStore>>()
+        .map(|s| s.inner().clone())
+}
+
+/// The boot facts the loads are read under: the restorable set's two
+/// admission inputs, and the instant this process booted.
+#[derive(Debug, Clone, Copy)]
+struct RestoreView {
+    prior_marker_at: Option<i64>,
+    boot_was_clean: bool,
+    /// `None` before the boot is classified; nothing is then known to have
+    /// been closed by this process.
+    booted_at_ms: Option<i64>,
+}
+
+impl RestoreView {
+    /// This process's view — the same classification
+    /// `terminal_session_list_open` reads the restore set under.
+    fn current() -> Self {
+        let (prior_marker_at, boot_was_clean) =
+            crate::session::shutdown_marker::restore_admission_inputs();
+        Self {
+            prior_marker_at,
+            boot_was_clean,
+            booted_at_ms: crate::session::shutdown_marker::boot_classification()
+                .map(|c| c.booted_at_ms),
+        }
+    }
+
+    /// Whether `row` was closed by this process — an exit since boot, which
+    /// no restore in this process will bring back.
+    fn closed_since_boot(&self, row: &TerminalSessionRecord) -> bool {
+        matches!((row.closed_at, self.booted_at_ms), (Some(closed), Some(boot)) if closed >= boot)
+    }
+}
+
 /// A recorded page id as the webview reads it: blank means `"default"`
 /// (`useTerminalPages.ts`, `t.pageId || t.page_id || "default"`).
 fn normalized_page(page_id: &str) -> &str {
@@ -81,10 +140,10 @@ fn normalized_page(page_id: &str) -> &str {
     }
 }
 
-/// Pure core of [`page_loads`]: live terminals per page, plus each restorable
-/// row whose `terminal_id` is blank or names no live terminal, on its recorded
-/// page. Sorted by page id so the output is deterministic.
-fn loads_from(live: &[TerminalInfo], restorable: &[TerminalSessionRecord]) -> Vec<(String, usize)> {
+/// Pure core of [`page_loads`]: live terminals per page, plus each row of
+/// `awaiting` whose `terminal_id` is blank or names no live terminal, on its
+/// recorded page. Sorted by page id so the output is deterministic.
+fn loads_from(live: &[TerminalInfo], awaiting: &[TerminalSessionRecord]) -> Vec<(String, usize)> {
     let mut per_page: HashMap<String, usize> = HashMap::new();
     let live_ids: HashSet<&str> = live.iter().map(|t| t.id.as_str()).collect();
     for info in live {
@@ -92,7 +151,7 @@ fn loads_from(live: &[TerminalInfo], restorable: &[TerminalSessionRecord]) -> Ve
             .entry(normalized_page(&info.page_id).to_string())
             .or_insert(0) += 1;
     }
-    for row in restorable {
+    for row in awaiting {
         if row.terminal_id.is_empty() || !live_ids.contains(row.terminal_id.as_str()) {
             *per_page
                 .entry(normalized_page(&row.page_id).to_string())
@@ -104,23 +163,53 @@ fn loads_from(live: &[TerminalInfo], restorable: &[TerminalSessionRecord]) -> Ve
     loads
 }
 
-/// Per-page load: live terminals, plus the restorable rows not yet bound to a
-/// live terminal (see the module doc).
+/// [`page_loads`] under an explicit [`RestoreView`].
 ///
-/// `store` is `None` only where the lifecycle store is not managed (it always
-/// is in a running runner); the loads are then the live terminals alone.
+/// The store and the terminal list are read one after the other, not as one
+/// snapshot; a spawn or exit between the two reads is at worst a transient
+/// miscount of one.
+fn page_loads_under(
+    tm: &TerminalManager,
+    store: Option<&SessionLifecycleStore>,
+    view: RestoreView,
+) -> Vec<(String, usize)> {
+    let restorable = store
+        .map(|s| s.restorable_records(view.prior_marker_at, view.boot_was_clean))
+        .unwrap_or_default();
+    loads_from(&tm.list(), &awaiting_restore(restorable, view))
+}
+
+/// The restorable rows a restore in THIS process may still bring back: the
+/// set minus the rows this process closed (see the module doc).
+fn awaiting_restore(
+    restorable: Vec<TerminalSessionRecord>,
+    view: RestoreView,
+) -> Vec<TerminalSessionRecord> {
+    restorable
+        .into_iter()
+        .filter(|row| !view.closed_since_boot(row))
+        .collect()
+}
+
+/// Per-page load: live terminals, plus the rows awaiting restore that are not
+/// bound to a live terminal yet (see the module doc).
 pub(crate) fn page_loads(
     tm: &TerminalManager,
     store: Option<&SessionLifecycleStore>,
 ) -> Vec<(String, usize)> {
-    let restorable = store
-        .map(|s| {
-            let (prior_marker_at, boot_was_clean) =
-                crate::session::shutdown_marker::restore_admission_inputs();
-            s.restorable_records(prior_marker_at, boot_was_clean)
-        })
-        .unwrap_or_default();
-    loads_from(&tm.list(), &restorable)
+    page_loads_under(tm, store, RestoreView::current())
+}
+
+fn pick_under(
+    tm: &TerminalManager,
+    store: Option<&SessionLifecycleStore>,
+    view: RestoreView,
+) -> String {
+    pick_page(
+        &page_loads_under(tm, store, view),
+        PAGE_ZONE_CEILING,
+        || uuid::Uuid::new_v4().to_string(),
+    )
 }
 
 /// The page a new automatically placed session lands on: [`pick_page`] over
@@ -130,9 +219,7 @@ pub(crate) fn pick_page_for_new_session(
     tm: &TerminalManager,
     store: Option<&SessionLifecycleStore>,
 ) -> String {
-    pick_page(&page_loads(tm, store), PAGE_ZONE_CEILING, || {
-        uuid::Uuid::new_v4().to_string()
-    })
+    pick_under(tm, store, RestoreView::current())
 }
 
 #[cfg(test)]
@@ -141,6 +228,25 @@ mod tests {
     use std::sync::Arc;
 
     const MINTED: &str = "MINTED";
+
+    /// This process booted at this instant in every record-aware test.
+    const BOOT_MS: i64 = 1_000_000;
+
+    /// An explicit view, so no test depends on the process-wide boot
+    /// classification (another test in the binary could latch it).
+    const VIEW: RestoreView = RestoreView {
+        prior_marker_at: None,
+        boot_was_clean: false,
+        booted_at_ms: Some(BOOT_MS),
+    };
+
+    fn loads(tm: &TerminalManager, store: &SessionLifecycleStore) -> Vec<(String, usize)> {
+        page_loads_under(tm, Some(store), VIEW)
+    }
+
+    fn pick(tm: &TerminalManager, store: &SessionLifecycleStore) -> String {
+        pick_under(tm, Some(store), VIEW)
+    }
 
     fn page(id: &str, n: usize) -> (String, usize) {
         (id.to_string(), n)
@@ -227,17 +333,22 @@ mod tests {
         tm.insert_for_test(id, session);
     }
 
-    /// A store holding `rows` that the restorable read admits under the same
-    /// inputs `page_loads` passes it.
+    /// A store holding `rows`, every one of which the restorable read admits
+    /// under [`VIEW`].
     fn store_with(rows: Vec<TerminalSessionRecord>) -> (tempfile::TempDir, SessionLifecycleStore) {
         let dir = tempfile::tempdir().unwrap();
         let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
+        let n = rows.len();
         for r in rows {
             store.record_open(r);
         }
-        let (prior, clean) = crate::session::shutdown_marker::restore_admission_inputs();
-        let admitted = store.restorable_records(prior, clean).len();
-        assert!(admitted > 0, "fixture rows must be restorable");
+        assert_eq!(
+            store
+                .restorable_records(VIEW.prior_marker_at, VIEW.boot_was_clean)
+                .len(),
+            n,
+            "every fixture row must be restorable"
+        );
         (dir, store)
     }
 
@@ -249,11 +360,11 @@ mod tests {
         let tm = TerminalManager::new();
         let (_dir, store) = store_with(rows_on("default", 58));
         assert_eq!(
-            page_loads(&tm, Some(&store)),
+            loads(&tm, &store),
             vec![page("default", 58)],
             "58 restorable rows count on default with nothing live"
         );
-        let picked = pick_page_for_new_session(&tm, Some(&store));
+        let picked = pick(&tm, &store);
         assert_ne!(
             picked, "default",
             "default is full of rows awaiting restore"
@@ -272,11 +383,8 @@ mod tests {
         let tm = TerminalManager::new();
         live(&tm, "t-p1", "p1");
         let (_dir, store) = store_with(rows_on("default", 58));
-        assert_eq!(
-            page_loads(&tm, Some(&store)),
-            vec![page("default", 58), page("p1", 1)]
-        );
-        assert_eq!(pick_page_for_new_session(&tm, Some(&store)), "p1");
+        assert_eq!(loads(&tm, &store), vec![page("default", 58), page("p1", 1)]);
+        assert_eq!(pick(&tm, &store), "p1");
     }
 
     #[test]
@@ -284,7 +392,7 @@ mod tests {
         let tm = TerminalManager::new();
         live(&tm, "term-restored", "p1");
         let (_dir, store) = store_with(vec![row("s-restored", "p1", "term-restored")]);
-        assert_eq!(page_loads(&tm, Some(&store)), vec![page("p1", 1)]);
+        assert_eq!(loads(&tm, &store), vec![page("p1", 1)]);
     }
 
     /// A row naming a terminal that is not live (the pane died with the
@@ -294,10 +402,7 @@ mod tests {
         let tm = TerminalManager::new();
         live(&tm, "term-other", "p2");
         let (_dir, store) = store_with(vec![row("s-gone", "p1", "term-dead")]);
-        assert_eq!(
-            page_loads(&tm, Some(&store)),
-            vec![page("p1", 1), page("p2", 1)]
-        );
+        assert_eq!(loads(&tm, &store), vec![page("p1", 1), page("p2", 1)]);
     }
 
     #[test]
@@ -308,10 +413,10 @@ mod tests {
         let tm = TerminalManager::new();
         let (_dir, store) = store_with(rows);
         assert_eq!(
-            page_loads(&tm, Some(&store)),
+            loads(&tm, &store),
             vec![page("default", 9), page("p1", 9), page("p2", 8)]
         );
-        assert_eq!(pick_page_for_new_session(&tm, Some(&store)), "p2");
+        assert_eq!(pick(&tm, &store), "p2");
     }
 
     #[test]
@@ -324,22 +429,23 @@ mod tests {
         rows.extend((0..4).map(|i| row(&format!("d-extra-{i}"), "", "")));
         let (_dir, store) = store_with(rows);
         assert_eq!(
-            page_loads(&tm, Some(&store)),
+            loads(&tm, &store),
             vec![page("default", 9), page("p1", 9)],
             "a blank recorded page counts as default"
         );
-        let picked = pick_page_for_new_session(&tm, Some(&store));
+        let picked = pick(&tm, &store);
         assert!(
             picked != "default" && picked != "p1" && picked.len() == 36,
             "every page full → a fresh uuid page, got {picked}"
         );
     }
 
-    /// `TerminalManager::create`'s page step, on a real manager: an unpaged
-    /// create (`POST /terminals` without `pageId`, a steward, a transport)
-    /// lands where the picker says, not on the `default` its restore refills.
+    /// `TerminalManager::create`'s page step on a real manager: with no page
+    /// (`POST /terminals` without `pageId`, a steward, a SessionRegistry
+    /// transport — all reach `create(…, None, …)`) it resolves through the
+    /// picker, not to the `default` its restore is about to refill.
     #[test]
-    fn an_unpaged_create_lands_where_the_picker_says() {
+    fn an_unpaged_create_resolves_through_the_picker() {
         let tm = TerminalManager::new();
         live(&tm, "t-p1", "p1");
         let (_dir, store) = store_with(rows_on("default", 58));
@@ -359,6 +465,40 @@ mod tests {
         assert_eq!(
             tm.resolve_page_id(Some("p-op".to_string()), Some(&store)),
             "p-op"
+        );
+    }
+
+    /// A pane this process saw exit is not awaiting restore; a prior-boot
+    /// closed row and an open row still are.
+    #[test]
+    fn a_row_closed_since_boot_is_not_awaiting_restore() {
+        let closed_at = |session: &str, at: i64| {
+            let mut r = row(session, "p1", "term-gone");
+            r.state = "closed".to_string();
+            r.close_reason = Some("pty-exit".to_string());
+            r.closed_at = Some(at);
+            r
+        };
+        let rows = vec![
+            closed_at("exited-after-boot", BOOT_MS + 5),
+            closed_at("exited-at-boot", BOOT_MS),
+            closed_at("exited-before-boot", BOOT_MS - 5),
+            row("open-awaiting", "p1", ""),
+        ];
+        let kept: Vec<String> = awaiting_restore(rows, VIEW)
+            .into_iter()
+            .map(|r| r.claude_session_id)
+            .collect();
+        assert_eq!(kept, vec!["exited-before-boot", "open-awaiting"]);
+
+        let unclassified = RestoreView {
+            booted_at_ms: None,
+            ..VIEW
+        };
+        assert_eq!(
+            awaiting_restore(vec![closed_at("exited", BOOT_MS + 5)], unclassified).len(),
+            1,
+            "before the boot is classified nothing is known to be this process's exit"
         );
     }
 

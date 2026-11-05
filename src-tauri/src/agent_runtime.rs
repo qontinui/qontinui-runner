@@ -6972,14 +6972,10 @@ async fn run_continuation_terminal(
         // rows a boot restore is about to bring back (`terminal::page_placement`),
         // and persist it in the durable record so a restart re-lands on the same
         // page.
-        let target_page = {
-            let store = app
-                .try_state::<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>();
-            crate::terminal::page_placement::pick_page_for_new_session(
-                &terminal_manager,
-                store.as_ref().map(|s| s.inner().as_ref()),
-            )
-        };
+        let target_page = crate::terminal::page_placement::pick_page_for_new_session(
+            &terminal_manager,
+            crate::terminal::page_placement::lifecycle_store(&app).as_deref(),
+        );
 
         let mut capture_hint = crate::commands::terminal::SessionCaptureHint {
             config_dir: selected_config_dir.clone(),
@@ -8061,14 +8057,10 @@ async fn run_condition_check_terminal(
     }
 
     // Spread across pages with room (the one page-capacity rule, as the gate path).
-    let target_page = {
-        let store =
-            app.try_state::<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>();
-        crate::terminal::page_placement::pick_page_for_new_session(
-            &terminal_manager,
-            store.as_ref().map(|s| s.inner().as_ref()),
-        )
-    };
+    let target_page = crate::terminal::page_placement::pick_page_for_new_session(
+        &terminal_manager,
+        crate::terminal::page_placement::lifecycle_store(&app).as_deref(),
+    );
 
     // Kept for the start verdict below: the transcript probe looks in the
     // selected account's config dir first.

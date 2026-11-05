@@ -465,12 +465,10 @@ impl TerminalManager {
             },
         }
 
-        let page_id = {
-            use tauri::Manager;
-            let store = app_handle
-                .try_state::<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>();
-            self.resolve_page_id(page_id, store.as_ref().map(|s| s.inner().as_ref()))
-        };
+        let page_id = self.resolve_page_id(
+            page_id,
+            super::page_placement::lifecycle_store(&app_handle).as_deref(),
+        );
         let cols = cols.unwrap_or(120);
         let rows = rows.unwrap_or(30);
 

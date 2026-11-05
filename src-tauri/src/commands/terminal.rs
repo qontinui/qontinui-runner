@@ -2798,8 +2798,10 @@ pub(crate) fn create_terminal_session_backend(
                 policy_delivery: _,
             } = hint;
             // Single source of truth for the recorded page: the hint's page_id
-            // (set by the caller to the picked page), defaulting to "default".
-            let record_page_id = hint_page_id.unwrap_or_else(|| "default".to_string());
+            // (set by the caller to the picked page), else the page `create`
+            // actually put the pane on (its unpaged arm picks one), so the
+            // record and the live pane never disagree.
+            let record_page_id = hint_page_id.unwrap_or_else(|| info.page_id.clone());
             let record_zone_index = hint_zone_index.unwrap_or(0);
             if let Some(pinned) = pinned_session_id {
                 // Pre-pinned id: record synchronously, then verify async that

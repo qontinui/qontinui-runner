@@ -1411,14 +1411,10 @@ async fn spawn_looping_agent_terminal(
     }
 
     // Spread across pages with room (the one page-capacity rule, as continuations).
-    let target_page = {
-        let store =
-            app.try_state::<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>();
-        crate::terminal::page_placement::pick_page_for_new_session(
-            &terminal_manager,
-            store.as_ref().map(|s| s.inner().as_ref()),
-        )
-    };
+    let target_page = crate::terminal::page_placement::pick_page_for_new_session(
+        &terminal_manager,
+        crate::terminal::page_placement::lifecycle_store(&app).as_deref(),
+    );
 
     let capture_hint = crate::commands::terminal::SessionCaptureHint {
         config_dir: selected_config_dir,
