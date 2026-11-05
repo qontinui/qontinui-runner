@@ -864,12 +864,8 @@ pub(crate) async fn judge_custody<P: CustodyProbe + ?Sized>(
     workspace_root: Option<&Path>,
     session_id: &str,
 ) -> CustodyVerdict {
-    let attributed = wind_down_observer::attributed_worktrees(
-        ownership,
-        session_id,
-        context.coord_session_id.as_deref(),
-        workspace_root,
-    );
+    let attributed =
+        wind_down_observer::attributed_worktrees(ownership, session_id, workspace_root);
     let inputs = wind_down_observer::gather_custody(probe, context, attributed, session_id).await;
     let verdict = wind_down::custody_gate(&inputs);
     debug!(
@@ -904,8 +900,8 @@ pub(crate) trait FinishedCloseWorld: Sync {
         &'p [LiveClaudeProcess],
         &'p wind_down_observer::ObservedInputs,
     );
-    /// The attributed-worktree read, made once per pass, with the liveness of
-    /// `claude_session_ids`' coord rows.
+    /// The keyed attributed-worktree read of `claude_session_ids`, made once per
+    /// pass.
     async fn ownership(&self, claude_session_ids: &[String]) -> OwnershipRead;
     /// The root a relative ledger path is anchored on.
     fn workspace_root(&self) -> Option<PathBuf>;
@@ -1517,7 +1513,7 @@ struct LiveCloseEffects<'a> {
 /// custody re-check. A batch's later closes can start minutes after the pass
 /// (each waits up to [`EXIT_DEADLINE`]); past this age the re-check reads
 /// coord again rather than trust an allocation list that old. Within it, one
-/// read serves the whole batch instead of four tenant-wide reads per close.
+/// read serves the whole batch instead of one read per close.
 pub const OWNERSHIP_REUSE_MAX_AGE: Duration = Duration::from_secs(60);
 
 /// PURE: may a re-check reuse an ownership read made at `read_at`?
@@ -3855,6 +3851,7 @@ mod tests {
                 .map(|s| format!("coord-{s}"))
                 .collect();
             index.mark_live(live.iter().map(String::as_str));
+            index.record_coord_rows(claude_session_ids.iter().cloned().zip(live.iter().cloned()));
             Ok(index)
         }
         fn workspace_root(&self) -> Option<PathBuf> {
@@ -3868,7 +3865,6 @@ mod tests {
         ) -> SessionCustodyContext {
             SessionCustodyContext {
                 session_dir: Some(PathBuf::from(format!("/ws/{session_id}"))),
-                coord_session_id: Some(format!("coord-{session_id}")),
                 isolated_worktrees: Ok(Vec::new()),
             }
         }
@@ -4000,8 +3996,8 @@ mod tests {
     /// known live (auto-closed) is never closed, whatever its trees show.
     #[tokio::test]
     async fn finished_close_tick_never_closes_a_session_whose_coord_row_is_not_live() {
-        // A valid read that marks nothing live: the coord row was closed, or
-        // moved between states while the pages were read.
+        // A valid read that resolves nothing live: an index holding no coord row
+        // for the candidate.
         let mut world = FakeWorld::with_sessions(&["t1"]);
         world.ownership_override = Some(Ok(CoordOwnership::default()));
         let FinishedCloseTick::Ran { judged, outcomes } = tick(&world).await else {

@@ -112,10 +112,6 @@ struct WireRow {
     /// the key is not unique). Absent on a coord that predates the field.
     #[serde(default)]
     coord_session_id: Option<String>,
-    /// That row's LIVENESS axis (`expected` | `active` | `pending_resolution` |
-    /// `stale` | `closed`), orthogonal to the work axis.
-    #[serde(default)]
-    state: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -176,9 +172,6 @@ pub struct StatusFetch {
     /// wind-down's floor can sit earlier than it did before that change, by up
     /// to the outbox lag.
     pub finished_at_by_session_id: HashMap<String, i64>,
-    /// `claude_session_id` → the `coord.sessions` row that answered and its
-    /// liveness `state`, for rows that carried both. Absent ⇒ unknown.
-    pub liveness_by_session_id: HashMap<String, CoordLiveness>,
     /// `"coord"` when the door answered, `"unavailable"` when it did not,
     /// `"not_needed"` when there was nothing to ask about.
     pub source: &'static str,
@@ -187,15 +180,6 @@ pub struct StatusFetch {
     pub note: String,
     pub requested: usize,
     pub resolved: usize,
-}
-
-/// One coord session row's identity and liveness, as work-status served it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CoordLiveness {
-    /// `coord.sessions.id`.
-    pub coord_session_id: String,
-    /// `coord.sessions.state`.
-    pub state: String,
 }
 
 impl StatusFetch {
@@ -214,7 +198,6 @@ impl StatusFetch {
             by_session_id: HashMap::new(),
             since_by_session_id: HashMap::new(),
             finished_at_by_session_id: HashMap::new(),
-            liveness_by_session_id: HashMap::new(),
             source: "unavailable",
             degraded: true,
             note: note.into(),
@@ -343,31 +326,6 @@ fn finished_at_from_body(body: &WireResponse) -> HashMap<String, i64> {
             .is_some_and(|s| s == SessionWorkStatus::Finished)
     });
     since
-}
-
-/// `claude_session_id` → [`CoordLiveness`] for every row carrying both a
-/// `coord_session_id` and a `state`. Pure. A body with
-/// `sessionBridgeColumnPresent: false` yields nothing.
-fn liveness_from_body(body: &WireResponse) -> HashMap<String, CoordLiveness> {
-    if !body.session_bridge_column_present {
-        return HashMap::new();
-    }
-    body.statuses
-        .iter()
-        .filter_map(|(id, row)| {
-            let coord_session_id = row.coord_session_id.as_deref()?.trim();
-            let state = row.state.as_deref()?.trim();
-            (!coord_session_id.is_empty() && !state.is_empty()).then(|| {
-                (
-                    id.clone(),
-                    CoordLiveness {
-                        coord_session_id: coord_session_id.to_string(),
-                        state: state.to_string(),
-                    },
-                )
-            })
-        })
-        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -533,7 +491,6 @@ pub async fn fetch(ids: &[String]) -> StatusFetch {
             by_session_id: HashMap::new(),
             since_by_session_id: HashMap::new(),
             finished_at_by_session_id: HashMap::new(),
-            liveness_by_session_id: HashMap::new(),
             source: "not_needed",
             degraded: false,
             note: String::new(),
@@ -573,7 +530,6 @@ pub async fn fetch(ids: &[String]) -> StatusFetch {
     StatusFetch {
         since_by_session_id: since_from_body(&body),
         finished_at_by_session_id: finished_at_from_body(&body),
-        liveness_by_session_id: liveness_from_body(&body),
         by_session_id,
         source: "coord",
         degraded: false,
@@ -804,37 +760,6 @@ mod tests {
             "sessionBridgeColumnPresent": false
         }));
         assert!(since_from_body(&no_bridge).is_empty());
-    }
-
-    #[test]
-    fn liveness_is_read_only_from_rows_naming_both_the_coord_row_and_its_state() {
-        let b = body(serde_json::json!({
-            "statuses": {
-                "live": {"session_status": "finished", "coord_session_id": "c-1", "state": "active"},
-                "closed": {"session_status": "finished", "coord_session_id": "c-2", "state": "closed"},
-                "no-state": {"session_status": "finished", "coord_session_id": "c-3"},
-                "old-coord": {"session_status": "finished"},
-            },
-            "unknown": [], "invalid": [], "accepted": 4, "truncated": false,
-            "sessionBridgeColumnPresent": true
-        }));
-        let m = liveness_from_body(&b);
-        assert_eq!(m.len(), 2, "{m:?}");
-        assert_eq!(
-            m.get("live"),
-            Some(&CoordLiveness {
-                coord_session_id: "c-1".to_string(),
-                state: "active".to_string()
-            })
-        );
-        assert_eq!(m.get("closed").map(|l| l.state.as_str()), Some("closed"));
-
-        let absent = body(serde_json::json!({
-            "statuses": {"x": {"coord_session_id": "c-1", "state": "active"}},
-            "unknown": [], "invalid": [], "accepted": 1, "truncated": false,
-            "sessionBridgeColumnPresent": false
-        }));
-        assert!(liveness_from_body(&absent).is_empty());
     }
 
     #[test]
