@@ -1301,9 +1301,9 @@ describe("recheckRefusedAfterSweep — sessions refused as live before the sweep
   });
 
   it("by default resumes nothing a PARTIAL registry read does not show", async () => {
-    // The production caller passes no `liveIds`: the default must be the
-    // STRICT oracle, because "hidden" may be live in the dir that could not
-    // be listed — resuming it would fork it.
+    // Pins the DEFAULT: a caller that omits `liveIds` gets the STRICT
+    // oracle, because "hidden" may be live in the dir that could not be
+    // listed — resuming it would fork it.
     mockInvoke.mockImplementation(async (cmd: unknown) =>
       cmd === "terminal_claude_session_list_live" ? partialLiveRead : settledSweep,
     );

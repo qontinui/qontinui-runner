@@ -857,10 +857,11 @@ pub async fn gather_activity_evidence(
                 claude_activity::RecordDepth::Activity,
             );
             // An unlistable `sessions/` dir has already turned every would-be
-            // `Missing` into `Unlisted`, which classifies `unknown` — so the
-            // counts stay honest by construction. The dir is named in the log,
-            // once per transition, because nothing else says WHY those
-            // processes read unknown.
+            // `Missing` or `PidReused` into `Unlisted`, which classifies
+            // `unknown` as both of those already did — so the counts stay
+            // honest by construction. The dir is named in the log, once per
+            // transition, because nothing else says WHY those processes read
+            // unknown.
             UNLISTABLE_SESSIONS_LOG.observe(&config_dirs, &readings.unlistable);
             readings
         });

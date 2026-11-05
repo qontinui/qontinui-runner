@@ -1603,6 +1603,11 @@ fn mark_awaiting_account_unless_live(
 /// directory cannot be resolved. A resume under it must type NO
 /// `CLAUDE_CONFIG_DIR` (see `discovery::is_default_config_home`), so every
 /// frontend resume normalises against THIS path rather than guessing `$HOME`.
+///
+/// Its second caller is the graceful-exit probe's registry read
+/// (`terminal::graceful_exit`'s `default_config_home`), which reads this home's
+/// `sessions/` dir even before discovery counts it (no `projects/` yet), so a
+/// first npm-installed session there is seen.
 #[tauri::command]
 pub fn claude_default_config_home() -> Option<String> {
     dirs::home_dir().and_then(|h| h.join(".claude").to_str().map(|p| p.replace('\\', "/")))
@@ -2174,17 +2179,16 @@ pub fn terminal_report_bridge_registration_failure(
 /// the caller's decision.
 ///
 /// `data` is `{ sessions, unlistable, unreadableRecords }`. The two trailing
-/// lists name what the read could NOT see — `sessions/` dirs that exist and
-/// cannot be listed, and records named for live pids that could host Claude
-/// Code that could not be read or parsed — and while either is non-empty a
-/// session MISSING from `sessions`
-/// may still be live. The read still succeeds then, because its two kinds of
-/// caller need different things from it: the unattended restore paths treat
-/// an incomplete read as indeterminate (`fetchLiveClaudeSessionIds` returns
-/// `null`, and nothing is respawned), while an operator's click refuses a
-/// session the partial read DOES show live, and the window-name hook keeps
-/// updating. Failing the whole read would hand the click paths `null`, which
-/// they read as "go ahead".
+/// lists name what the read could NOT see: `sessions/` dirs that exist and
+/// cannot be listed, and unreadable or unparseable records named for live pids
+/// whose image could host Claude Code. While either is non-empty, a session
+/// MISSING from `sessions` may still be live. The read still succeeds then,
+/// because its two kinds of caller need different things from it: the
+/// unattended restore paths treat an incomplete read as indeterminate
+/// (`fetchLiveClaudeSessionIds` returns `null`, and nothing is respawned),
+/// while an operator's click refuses a session the partial read DOES show
+/// live, and the window-name hook keeps updating. Failing the whole read would
+/// hand the click paths `null`, which they read as "go ahead".
 #[tauri::command]
 pub async fn terminal_claude_session_list_live() -> Result<CommandResponse, String> {
     let config_dirs = crate::terminal::transcript::find_claude_config_dirs();

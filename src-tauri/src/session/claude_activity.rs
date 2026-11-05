@@ -49,8 +49,9 @@
 //!      ago by one long tool call reads `stale`), used only because the
 //!      stronger one is absent. No `statusUpdatedAt` either is `unknown`;
 //!    - a missing, unlisted, unparseable, ambiguous or unrecognised-status
-//!      record → `unknown` (`unlisted`: no record in any dir that could be
-//!      listed while some `<config-dir>/sessions` exists and could not be —
+//!      record → `unknown` (`unlisted`: no record of the live process — none,
+//!      or only an earlier holder's — in any dir that could be listed, while
+//!      some `<config-dir>/sessions` exists and could not be —
 //!      [`SessionsListing`]), and so is a record that belongs to an EARLIER
 //!      process that held the same pid ([`RecordReading::PidReused`]): on Linux the
 //!      record's `procStart` is compared with `/proc/<pid>/stat` field 22
@@ -580,7 +581,7 @@ impl UnlistableLog {
 /// wanted `<pid>.json` files are opened; at [`RecordDepth::Activity`] the
 /// transcript tail is read for `busy`/`shell` records too. A dir that exists
 /// and cannot be listed is reported in [`RecordReadings::unlistable`] and
-/// turns every would-be `Missing` into `Unlisted`. `proc_start` is
+/// turns every would-be `Missing` or `PidReused` into `Unlisted`. `proc_start` is
 /// [`proc_start_ticks`] in production and injectable in tests. Blocking file
 /// I/O — call it off the async executor.
 pub fn read_records(

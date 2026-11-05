@@ -2424,8 +2424,9 @@ mod tests {
             "commands/terminal.rs",
             1,
             "`claude_default_config_home`: the default Claude account home (`~/.claude`), read \
-             only so a resume never types it as `CLAUDE_CONFIG_DIR` — Claude Code's, not runner \
-             state",
+             so a resume never types it as `CLAUDE_CONFIG_DIR`, and so the graceful-exit probe's \
+             registry read can find a first session's record in its `sessions/` — Claude \
+             Code's, not runner state",
         ),
         (
             "wrappers/clients.rs",

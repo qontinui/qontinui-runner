@@ -444,8 +444,10 @@ static UNLISTABLE_SESSIONS_LOG: claude_activity::UnlistableLog = claude_activity
 /// | `Unlisted` (no record of THIS process — none, or only an earlier holder's — in any dir that listed, and some dir did not) | UNDECIDED |
 /// | the read failed or overran its budget | UNDECIDED, for every pid |
 ///
-/// A record found in a dir that DID list still decides while another dir
-/// cannot be listed. An UNDECIDED pid makes the probe `Unreadable` only when
+/// A record OF THE LIVE PROCESS found in a dir that DID list still decides
+/// while another dir cannot be listed; a pid with none there — no record, or
+/// only an earlier holder's — is `Unlisted`. An UNDECIDED pid makes the probe
+/// `Unreadable` only when
 /// its image could BE a JS-runtime Claude Code — `node`, `nodejs`, `bun`, or
 /// an image the snapshot could not read
 /// ([`crate::process_capture::process_tree::may_be_js_runtime_claude`]) — and
@@ -648,8 +650,8 @@ fn with_default_home(mut dirs: Vec<PathBuf>, default_home: Option<PathBuf>) -> V
 }
 
 /// The default Claude config home, through the runner's one resolver for it
-/// (`commands::terminal::claude_default_config_home`, the allowlisted seam for
-/// reading the user's home — see `ambient`'s `USER_GLOBAL_DIRS_ALLOWLIST`).
+/// (`commands::terminal::claude_default_config_home`, whose read of the user's
+/// home has a row in `ambient`'s `USER_GLOBAL_DIRS_ALLOWLIST`).
 fn default_config_home() -> Option<PathBuf> {
     crate::commands::terminal::claude_default_config_home().map(PathBuf::from)
 }
@@ -663,9 +665,10 @@ fn registry_witness_from(
     let readings =
         claude_activity::read_records(config_dirs, candidates, proc_start, RecordDepth::Identity);
     UNLISTABLE_SESSIONS_LOG.observe(config_dirs, &readings.unlistable);
-    // NO early return on an unlistable dir: a record found in a dir that DID
-    // list is still a positive witness, and `read_records` has already turned
-    // every pid with no record into `Unlisted`, which lands in `undecided`.
+    // NO early return on an unlistable dir: a record of the live process found
+    // in a dir that DID list is still a positive witness, and `read_records`
+    // has already turned every would-be `Missing` or `PidReused` into
+    // `Unlisted`, which lands in `undecided`.
     let unlistable = (!readings.unlistable.is_empty()).then(|| {
         let dirs: Vec<String> = readings
             .unlistable
@@ -698,7 +701,8 @@ fn registry_witness_from(
             RecordReading::Unlisted => {
                 undecided.insert(
                     pid,
-                    "is in no dir that listed, and may sit in a sessions dir that could not be listed"
+                    "is missing from every dir that listed (none there, or only an earlier \
+                     holder's), and may sit in a sessions dir that could not be listed"
                         .to_string(),
                 );
             }
@@ -1918,7 +1922,8 @@ mod tests {
         );
     }
 
-    /// A record found in a dir that DID list is a positive witness even while
+    /// A record of the live process found in a dir that DID list is a
+    /// positive witness even while
     /// another dir cannot be listed: the npm session it names reads `live`,
     /// and the look still says the registry was incomplete.
     #[tokio::test]

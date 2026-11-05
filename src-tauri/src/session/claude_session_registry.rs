@@ -344,15 +344,18 @@ fn pid_of_record_path(path: &Path) -> Option<u32> {
 /// in `live_pids`.
 ///
 /// Per FILE, one corrupt file never hides the others: every readable row is
-/// still returned. A file named for a pid that is not live, or for a live pid
+/// still returned. A READABLE record is reported when the pid it names is
+/// live, whatever that pid's image, as before — dropping one by image would
+/// read a `claude` under a runtime nobody listed (`deno`, `node22`) as closed,
+/// and the strict oracle would then fork it. An UNREADABLE one is weighed by
+/// the pid its file name gives: for a pid that is not live, or for a live pid
 /// whose image could not host Claude Code (`may_host_claude` says no — a
-/// reused pid), is a stale record and is skipped, readable or not. One named
-/// for a live pid that could host Claude Code and that cannot be read or
-/// parsed is reported in [`LiveSessions::unreadable_records`] rather than
-/// dropped — dropping it would read that live session as closed. Per DIR, a
-/// `sessions/` dir that
-/// exists and cannot be listed is reported in [`LiveSessions::unlistable`]
-/// rather than read as an account with no live session ([`list_sessions_dir`]).
+/// reused pid), it is a stale record and is skipped; for a live pid that could
+/// host Claude Code it is reported in [`LiveSessions::unreadable_records`]
+/// rather than dropped, since dropping it would read that live session as
+/// closed. Per DIR, a `sessions/` dir that exists and cannot be listed is
+/// reported in [`LiveSessions::unlistable`] rather than read as an account
+/// with no live session ([`list_sessions_dir`]).
 /// Results are sorted by account then name so the output is stable between
 /// calls (PID iteration order is not).
 pub fn read_live_sessions(
