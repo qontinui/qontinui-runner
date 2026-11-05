@@ -1240,19 +1240,28 @@ impl UnifiedAiSessionExecutor {
                     .with_turn_count(completion_turn)
             }
         };
-        // This session's own account when the caller set one (a resume pinned
-        // to its transcript's account), else the workflow's own pick
-        // (`AccountChoice::Picked`).
-        // An ambient resume (`inherit_ambient_account`) carries no account at
-        // all — not even the workflow's pick.
+        Self::apply_session_account(&mut ctx, config, self.account.as_ref());
+
+        Some(ctx)
+    }
+
+    /// Set a session context's account, in precedence order: this session's
+    /// own `config.account` when the caller set one (a resume pinned to its
+    /// transcript's account); else, for an ambient resume
+    /// (`config.inherit_ambient_account`), NO account at all — not even the
+    /// workflow's pick — plus the inherit flag; else the workflow's own pick
+    /// (`AccountChoice::Picked`). PURE over its arguments.
+    fn apply_session_account(
+        ctx: &mut AiSessionContext,
+        config: &AiSessionConfig,
+        workflow_pick: Option<&crate::ai_provider::AccountChoice>,
+    ) {
         if config.account.is_none() && config.inherit_ambient_account {
             ctx.account = None;
             ctx.inherit_ambient_account = true;
         } else {
-            ctx.account = config.account.clone().or_else(|| self.account.clone());
+            ctx.account = config.account.clone().or_else(|| workflow_pick.cloned());
         }
-
-        Some(ctx)
     }
 
     /// Build the FindingContext based on the phase.
@@ -1394,6 +1403,43 @@ impl UnifiedAiSessionExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A session's account precedence:** the session's own account beats
+    /// the workflow pick; an ambient resume clears the workflow pick (and sets
+    /// the inherit flag); otherwise the workflow pick rides.
+    #[test]
+    fn a_session_account_precedence_is_own_then_ambient_then_workflow_pick() {
+        use crate::ai_provider::AccountChoice;
+        let pick = AccountChoice::Picked("/acct/workflow".into());
+        let fresh_ctx = || AiSessionContext::agentic("task-prec", "Prec", 1);
+
+        let mut own = AiSessionConfig::agentic("task-prec", "Prec", 1);
+        own.account = Some(AccountChoice::Pinned("/acct/transcript".into()));
+        own.inherit_ambient_account = true;
+        let mut ctx = fresh_ctx();
+        UnifiedAiSessionExecutor::apply_session_account(&mut ctx, &own, Some(&pick));
+        assert_eq!(
+            ctx.account,
+            Some(AccountChoice::Pinned("/acct/transcript".into()))
+        );
+        assert!(!ctx.inherit_ambient_account);
+
+        let mut ambient = AiSessionConfig::agentic("task-prec", "Prec", 1);
+        ambient.inherit_ambient_account = true;
+        let mut ctx = fresh_ctx();
+        UnifiedAiSessionExecutor::apply_session_account(&mut ctx, &ambient, Some(&pick));
+        assert_eq!(
+            ctx.account, None,
+            "an ambient resume carries no workflow pick"
+        );
+        assert!(ctx.inherit_ambient_account);
+
+        let plain = AiSessionConfig::agentic("task-prec", "Prec", 1);
+        let mut ctx = fresh_ctx();
+        UnifiedAiSessionExecutor::apply_session_account(&mut ctx, &plain, Some(&pick));
+        assert_eq!(ctx.account, Some(pick));
+        assert!(!ctx.inherit_ambient_account);
+    }
 
     #[test]
     fn test_strip_completion_marker_instructions() {
