@@ -72,6 +72,8 @@ if "%QONTINUI_INSTALL_INTERCEPT_GUARD%"=="1" (
   exit /b 127
 )
 :resolved
+rem The PATH-walk scratch variables must not reach the real tool's env.
+for %%V in (DENTRY DTRIM DNAME DSKIP) do set "%%V="
 
 rem ---- recursion guard: a nested invocation never re-pins -------------------
 if "%QONTINUI_INSTALL_INTERCEPT_GUARD%"=="1" goto :passthrough
