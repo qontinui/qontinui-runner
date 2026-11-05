@@ -407,6 +407,15 @@ fn parse_write_body<T: serde::de::DeserializeOwned>(
     body: &Bytes,
 ) -> Result<T, (StatusCode, Json<ApiResponse<()>>)> {
     serde_json::from_slice(body).map_err(|e| {
+        // A body that is not UTF-8 at all is an ENCODING problem, not a JSON
+        // one — the same diagnosis the `Json<T>` extractor paths give (see
+        // `envelope::invalid_utf8_message`). This door hand-parses because of
+        // the gate above, so it would otherwise answer the generic
+        // deserialize text, stamped `INVALID_JSON` — and plan bodies, full of
+        // em dashes, are exactly what Git Bash curl mis-encodes.
+        if let Some(msg) = crate::mcp::envelope::invalid_utf8_message(&e.to_string()) {
+            return crate::mcp::envelope::envelope_400_invalid_utf8(msg);
+        }
         (
             StatusCode::BAD_REQUEST,
             Json(api_error(format!(
@@ -2052,6 +2061,34 @@ pub fn routes() -> Router<Arc<ApiState>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The write door hand-parses its body (after the gate), so it must give
+    /// the same `INVALID_UTF8` diagnosis the extractor paths give — here with
+    /// the exact `0x97` byte Windows Git Bash curl sends for an em dash.
+    #[test]
+    fn write_body_that_is_not_utf8_is_invalid_utf8_not_a_deserialize_error() {
+        let body = Bytes::from_static(b"{\"kind\":\"plan\",\"slug\":\"a \x97 b\"}");
+        let (status, Json(env)) =
+            parse_write_body::<ArtifactWriteRequest>(&body).expect_err("not UTF-8");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let env = serde_json::to_value(env).unwrap();
+        assert_eq!(env["code"], "INVALID_UTF8");
+        assert!(env["error"]
+            .as_str()
+            .unwrap()
+            .contains("request body is not valid UTF-8"));
+
+        // Valid UTF-8 that is merely malformed JSON keeps the generic text.
+        let (_, Json(env)) =
+            parse_write_body::<ArtifactWriteRequest>(&Bytes::from_static(b"not json"))
+                .expect_err("not JSON");
+        let env = serde_json::to_value(env).unwrap();
+        assert_ne!(env["code"], "INVALID_UTF8");
+        assert!(env["error"]
+            .as_str()
+            .unwrap()
+            .contains("Failed to deserialize the JSON body"));
+    }
 
     fn req(kind: &str, slug: &str) -> ArtifactWriteRequest {
         ArtifactWriteRequest {
