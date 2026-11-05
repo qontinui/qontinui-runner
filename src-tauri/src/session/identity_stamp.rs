@@ -247,18 +247,22 @@ pub struct LiveRow {
 /// Read every live registry row, one account home at a time so each row keeps
 /// the config dir it came from (`read_live_sessions` reports the account label
 /// but not the path).
-pub fn read_live_rows(homes: &[PathBuf], live_pids: &HashSet<u32>) -> Vec<LiveRow> {
-    homes
-        .iter()
-        .flat_map(|home| {
-            read_live_sessions(std::slice::from_ref(home), live_pids)
-                .into_iter()
-                .map(move |session| LiveRow {
-                    config_dir: home.clone(),
-                    session,
-                })
-        })
-        .collect()
+///
+/// `Err` when any home's `sessions/` dir exists and cannot be listed. A row it
+/// hides is a LIVE session this pass would otherwise report `live: false` —
+/// and coord inserts a never-seen ended session as closed — so the pass is
+/// skipped exactly as an indeterminate process snapshot skips it
+/// ([`LiveSessions::complete`](super::claude_session_registry::LiveSessions::complete)).
+pub fn read_live_rows(homes: &[PathBuf], live_pids: &HashSet<u32>) -> Result<Vec<LiveRow>, String> {
+    let mut rows = Vec::new();
+    for home in homes {
+        let sessions = read_live_sessions(std::slice::from_ref(home), live_pids).complete()?;
+        rows.extend(sessions.into_iter().map(|session| LiveRow {
+            config_dir: home.clone(),
+            session,
+        }));
+    }
+    Ok(rows)
 }
 
 /// What one build produced.
@@ -683,6 +687,9 @@ pub enum PassState {
     Unpaired,
     /// The process snapshot was indeterminate.
     Snapshot,
+    /// A Claude Code `sessions/` dir exists and could not be listed, so which
+    /// sessions are live was indeterminate.
+    Registry,
     /// The blocking build task failed.
     Build,
     Unavailable,
@@ -892,17 +899,22 @@ impl Reporter {
             use super::transcript_last_turn::{last_turn_ms, retain_paths, ReadBudget};
             let dir = SessionDirectory::cached();
             let homes = crate::terminal::transcript::find_claude_config_dirs();
-            let live = read_live_rows(&homes, &live_pids);
+            let live = read_live_rows(&homes, &live_pids)?;
             let mut budget = ReadBudget::Limited(TAIL_READS_PER_PASS);
             let candidates = build_candidates(&dir, &live, &mut |c| {
                 last_turn_ms(&c.path, c.stamp, &mut budget)
             });
             retain_paths(&dir.transcript_paths());
-            candidates
+            Ok::<_, String>(candidates)
         })
         .await;
-        let Ok(candidates) = built else {
-            return PassState::Build;
+        let candidates = match built {
+            Ok(Ok(candidates)) => candidates,
+            Ok(Err(e)) => {
+                debug!(error = %e, "session identity: live-session registry indeterminate");
+                return PassState::Registry;
+            }
+            Err(_) => return PassState::Build,
         };
 
         self.prune_watermark(
@@ -985,6 +997,10 @@ fn log_transition(state: &PassState) {
         PassState::Snapshot => warn!(
             "session identity: process snapshot indeterminate — pass skipped (a live session \
              would otherwise be reported as ended)"
+        ),
+        PassState::Registry => warn!(
+            "session identity: a Claude Code sessions dir could not be listed — pass skipped (a \
+             live session recorded there would otherwise be reported as ended)"
         ),
         PassState::Build => warn!("session identity: the build task failed — retrying next pass"),
         PassState::Unavailable => info!(
@@ -1179,7 +1195,7 @@ mod tests {
         .unwrap();
 
         let homes = vec![q.clone()];
-        let live = read_live_rows(&homes, &HashSet::from([1_u32]));
+        let live = read_live_rows(&homes, &HashSet::from([1_u32])).unwrap();
         let dir = SessionDirectory::discover_from(&names, &homes);
         let got = build_candidates(&dir, &live, &mut unbounded());
         assert!(got.rows.is_empty(), "rows: {:?}", got.rows);
@@ -1188,6 +1204,28 @@ mod tests {
             "neither the stale ghost, the name-only id nor the non-session stem is known: {:?}",
             got.known_ids
         );
+    }
+
+    /// A home whose `sessions/` dir cannot be listed hides its live rows, so
+    /// the read refuses rather than letting the pass report those sessions
+    /// `live: false`. A home with NO sessions dir is still a complete read.
+    #[cfg(unix)]
+    #[test]
+    fn an_unlistable_sessions_dir_refuses_the_live_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = home(tmp.path(), ".claude-gmail");
+        assert!(read_live_rows(&[bare.clone()], &HashSet::from([1_u32]))
+            .unwrap()
+            .is_empty());
+        let hidden = home(tmp.path(), ".claude-qontinui");
+        let Some(_restore) =
+            crate::session::claude_activity::unlistable_fixture::unreadable_sessions_dir(&hidden)
+        else {
+            return;
+        };
+        let err = read_live_rows(&[bare, hidden], &HashSet::from([1_u32]))
+            .expect_err("an unlistable sessions dir is indeterminate");
+        assert!(err.contains("indeterminate"), "{err}");
     }
 
     #[test]
@@ -1254,7 +1292,7 @@ mod tests {
 
         let homes = vec![q.clone(), d.clone()];
         let live_pids: HashSet<u32> = [101, 202].into_iter().collect();
-        let live = read_live_rows(&homes, &live_pids);
+        let live = read_live_rows(&homes, &live_pids).unwrap();
         let dir = SessionDirectory::discover_from(&tmp.path().join("none"), &homes);
         let got = build_candidates(&dir, &live, &mut unbounded());
 
@@ -1310,7 +1348,7 @@ mod tests {
         assert!(ENDED_FIRST < SID_A);
 
         let homes = vec![q.clone()];
-        let live = read_live_rows(&homes, &HashSet::from([101_u32]));
+        let live = read_live_rows(&homes, &HashSet::from([101_u32])).unwrap();
         let dir = SessionDirectory::discover_from(&tmp.path().join("none"), &homes);
         let mut one = ReadBudget::Limited(1);
         let got = build_candidates(&dir, &live, &mut |c| {

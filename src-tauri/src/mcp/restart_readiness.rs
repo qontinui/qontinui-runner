@@ -843,10 +843,35 @@ pub async fn gather_activity_evidence(
             // Released when the read ENDS (or unwinds), not when the caller
             // stops waiting for it.
             let _guard = guard;
-            claude_activity::read_records(&config_dirs, &pids, &proc_start)
+            claude_activity::read_records(
+                &config_dirs,
+                &pids,
+                &proc_start,
+                claude_activity::RecordDepth::Activity,
+            )
         });
         match tokio::time::timeout(read_timeout, read).await {
-            Ok(Ok(records)) => records,
+            Ok(Ok(readings)) => {
+                // An unlistable `sessions/` dir has already turned every
+                // would-be `Missing` into `Unlisted`, which classifies
+                // `unknown` — so the counts stay honest by construction. The
+                // dir is named here because nothing else says WHY those
+                // processes read unknown.
+                if !readings.unlistable.is_empty() {
+                    let dirs: Vec<String> = readings
+                        .unlistable
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect();
+                    tracing::warn!(
+                        unlistable = ?dirs,
+                        "restart-readiness: a Claude Code sessions dir exists but could not be \
+                         listed — every undecided process without a record elsewhere reads \
+                         activity `unknown`"
+                    );
+                }
+                readings.by_pid
+            }
             Ok(Err(e)) => {
                 tracing::warn!(
                     "restart-readiness: Claude Code session-record read failed ({e}) — \
@@ -3630,6 +3655,55 @@ mod tests {
                 idle: 6,
                 stale: 0,
                 unknown: 2,
+            }
+        );
+        assert_eq!(totals.by_activity.sum(), totals.total);
+    }
+
+    /// A `sessions/` dir that exists and cannot be listed: every undecided
+    /// process whose record sits there reads `unknown` (its reading is
+    /// `Unlisted`, never `Missing`), while the records of a dir that WAS
+    /// listed still decide, and the sum holds.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unlistable_sessions_dir_leaves_its_processes_unknown() {
+        let root = tempfile::tempdir().unwrap();
+        let listed = root.path().join(".claude-x");
+        for pid in [3, 4, 5] {
+            write_record(&listed, pid, "idle");
+        }
+        let hidden = root.path().join(".claude-y");
+        for pid in 6..=9 {
+            write_record(&hidden, pid, "idle");
+        }
+        let Some(_restore) =
+            crate::session::claude_activity::unlistable_fixture::unreadable_sessions_dir(&hidden)
+        else {
+            return;
+        };
+        static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+        let report = activity_report();
+        let evidence = gather_activity_evidence(
+            &report,
+            &ObservedInputs::default(),
+            vec![listed, hidden],
+            kernel_agrees,
+            RECORD_READ_TIMEOUT,
+            &IN_FLIGHT,
+        )
+        .await;
+        for pid in 6..=9 {
+            assert_eq!(evidence.records[&pid], RecordReading::Unlisted, "pid {pid}");
+        }
+        let totals = live_claude_totals_observed(&report, &evidence);
+        // 3-5 idle from the listed dir; 1, 2 have no record anywhere and the
+        // hidden dir could hold theirs too; 6-9 sit in the hidden dir.
+        assert_eq!(
+            totals.by_activity,
+            ActivityCounts {
+                idle: 3,
+                unknown: 6,
+                ..ActivityCounts::default()
             }
         );
         assert_eq!(totals.by_activity.sum(), totals.total);

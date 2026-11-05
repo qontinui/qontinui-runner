@@ -4824,10 +4824,17 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                 StdHashMap::new()
                             } else {
                                 match session::claude_session_registry::live_pids_from_snapshot(&snap) {
+                                    // A PARTIAL read is safe here, so the rows of
+                                    // every listable dir are used and an unlistable
+                                    // dir only costs its own: a session missing from
+                                    // this map gets no update at all (the sticky rule
+                                    // above), so a hidden row can never blank a stored
+                                    // account or name.
                                     Ok(live_pids) => session::claude_session_registry::read_live_sessions(
                                         &terminal::transcript::find_claude_config_dirs(),
                                         &live_pids,
                                     )
+                                    .sessions
                                     .into_iter()
                                     // `read_live_sessions` returns one row per
                                     // PROCESS and several processes may report

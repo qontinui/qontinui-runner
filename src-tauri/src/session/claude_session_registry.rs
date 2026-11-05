@@ -46,12 +46,19 @@
 //! - **Liveness is re-checked here.** A crashed process cannot clean up after
 //!   itself, so an entry whose PID is absent from the live process table is
 //!   dropped rather than reported as open.
+//! - **An unlistable account is reported, not skipped.** A
+//!   `<config_dir>/sessions` that exists and cannot be listed hides live
+//!   sessions, so [`read_live_sessions`] names it ([`LiveSessions::unlistable`])
+//!   and a caller that reads a missing row as "not live" refuses the read
+//!   ([`LiveSessions::complete`]). Only an ABSENT dir is an account with
+//!   nothing open.
 
 use std::collections::HashSet;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use super::claude_activity::{list_sessions_dir, SessionsListing, UnlistableSessionsDir};
 use super::past_sessions::{account_from_config_dir, PastSessionAccount};
 
 /// Raw on-disk shape of `<config_dir>/sessions/<pid>.json`.
@@ -229,25 +236,61 @@ pub fn live_pids_from_snapshot(
     Ok(snapshot.names.keys().copied().collect())
 }
 
+/// What one [`read_live_sessions`] saw.
+#[derive(Debug, Default)]
+pub struct LiveSessions {
+    /// The live rows found in every `sessions/` dir that could be listed,
+    /// sorted by account, then name, then pid.
+    pub sessions: Vec<LiveClaudeSession>,
+    /// Every `<config_dir>/sessions` that exists but could not be listed. While
+    /// this is non-empty, a session MISSING from [`Self::sessions`] may still
+    /// be live — its record is in a dir nobody could read.
+    pub unlistable: Vec<UnlistableSessionsDir>,
+}
+
+impl LiveSessions {
+    /// The rows, for a caller that reads a MISSING row as "not live" — the
+    /// restore path's liveness oracle, the identity reporter's `live` bit.
+    /// `Err` when any dir could not be listed: such a caller must treat the
+    /// whole read as indeterminate, never as an account with nothing open.
+    pub fn complete(self) -> Result<Vec<LiveClaudeSession>, String> {
+        if self.unlistable.is_empty() {
+            return Ok(self.sessions);
+        }
+        let dirs: Vec<String> = self.unlistable.iter().map(ToString::to_string).collect();
+        Err(format!(
+            "Claude Code's session registry could not be listed in full ({}) — a session \
+             recorded there may be live, so liveness is indeterminate",
+            dirs.join("; ")
+        ))
+    }
+}
+
 /// Read every `<config_dir>/sessions/*.json`, keeping only entries whose PID is
 /// in `live_pids`.
 ///
-/// Fail-open per file: an unreadable or malformed entry is skipped rather than
+/// Fail-open per FILE: an unreadable or malformed entry is skipped rather than
 /// failing the whole listing — one corrupt file must not hide 118 good ones.
-/// Results are sorted by account then name so the output is stable between
-/// calls (PID iteration order is not).
+/// Not per DIR: a `sessions/` dir that exists and cannot be listed is reported
+/// in [`LiveSessions::unlistable`] rather than read as an account with no live
+/// session ([`list_sessions_dir`]). Results are sorted by account then name so
+/// the output is stable between calls (PID iteration order is not).
 pub fn read_live_sessions(
     config_dirs: &[std::path::PathBuf],
     live_pids: &HashSet<u32>,
-) -> Vec<LiveClaudeSession> {
+) -> LiveSessions {
     let mut out = Vec::new();
+    let mut unlistable = Vec::new();
     for dir in config_dirs {
-        let sessions_dir = dir.join("sessions");
-        let Ok(entries) = std::fs::read_dir(&sessions_dir) else {
-            continue; // no sessions dir on this account — normal
+        let paths = match list_sessions_dir(dir) {
+            SessionsListing::Listed(paths) => paths,
+            SessionsListing::Absent => continue, // no sessions dir on this account — normal
+            SessionsListing::Unlistable(why) => {
+                unlistable.push(why);
+                continue;
+            }
         };
-        for entry in entries.flatten() {
-            let path = entry.path();
+        for path in paths {
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
@@ -270,7 +313,10 @@ pub fn read_live_sessions(
             .then_with(|| a.name.cmp(&b.name))
             .then_with(|| a.pid.cmp(&b.pid))
     });
-    out
+    LiveSessions {
+        sessions: out,
+        unlistable,
+    }
 }
 
 /// Find the live-registry row for ONE session id, WITHOUT taking a
@@ -292,7 +338,10 @@ pub fn read_live_sessions(
 /// Returns `None` when no file names the id — the common case at startup, since
 /// Claude Code may not have written its registry file by the time the
 /// SessionStart hook fires. `None` means UNKNOWN: callers must leave the stored
-/// value alone (the sticky rule), never blank it.
+/// value alone (the sticky rule), never blank it. That is also why a
+/// `sessions/` dir that cannot be listed needs no answer of its own here: it
+/// costs only that dir's rows, and a row it hid reads `None` — already UNKNOWN
+/// to every caller, which is an identity stamp and never a liveness decision.
 ///
 /// When several files name the same id (22 of 80 did on the operator's box),
 /// an OPERATOR-named row wins over a `nameSource: "derived"` one — a `/rename`
@@ -304,11 +353,12 @@ pub fn find_live_session_by_id(
 ) -> Option<LiveClaudeSession> {
     let mut best: Option<LiveClaudeSession> = None;
     for dir in config_dirs {
-        let Ok(entries) = std::fs::read_dir(dir.join("sessions")) else {
-            continue; // no sessions dir on this account — normal
+        let SessionsListing::Listed(paths) = list_sessions_dir(dir) else {
+            // Absent (normal) or unlistable: either way this dir names no row,
+            // and a missing row is `None` — UNKNOWN — to every caller.
+            continue;
         };
-        for entry in entries.flatten() {
-            let path = entry.path();
+        for path in paths {
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
@@ -512,7 +562,7 @@ mod tests {
         )
         .unwrap();
         let live: HashSet<u32> = [42].into_iter().collect();
-        let got = read_live_sessions(&[acct], &live);
+        let got = read_live_sessions(&[acct], &live).complete().unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].name_source.as_deref(), Some("derived"));
         let _ = fs::remove_dir_all(&root);
@@ -557,7 +607,7 @@ mod tests {
         .unwrap();
 
         let live: HashSet<u32> = [42].into_iter().collect();
-        let got = read_live_sessions(&[acct], &live);
+        let got = read_live_sessions(&[acct], &live).complete().unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].session_id, "live-id");
         assert_eq!(got[0].name, "");
@@ -615,10 +665,16 @@ mod tests {
         fs::write(acct.join("sessions").join("2804.json"), SAMPLE).unwrap();
 
         let none: HashSet<u32> = HashSet::new();
-        assert!(read_live_sessions(&[acct.clone()], &none).is_empty());
+        assert!(read_live_sessions(&[acct.clone()], &none)
+            .complete()
+            .unwrap()
+            .is_empty());
 
         let live: HashSet<u32> = [2804].into_iter().collect();
-        assert_eq!(read_live_sessions(&[acct], &live).len(), 1);
+        assert_eq!(
+            read_live_sessions(&[acct], &live).complete().unwrap().len(),
+            1
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -632,7 +688,7 @@ mod tests {
         fs::write(sdir.join("notes.txt"), SAMPLE).unwrap(); // non-json ignored
 
         let live: HashSet<u32> = [2804, 9999].into_iter().collect();
-        let got = read_live_sessions(&[acct], &live);
+        let got = read_live_sessions(&[acct], &live).complete().unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].name, "per-agent coord-mcp proxy");
         let _ = fs::remove_dir_all(&root);
@@ -644,7 +700,12 @@ mod tests {
         let bare = root.join(".claude-hotmail");
         fs::create_dir_all(&bare).unwrap();
         let live: HashSet<u32> = [1].into_iter().collect();
-        assert!(read_live_sessions(&[bare], &live).is_empty());
+        // An ABSENT sessions dir is an account with nothing open: a complete
+        // read, not an indeterminate one.
+        assert!(read_live_sessions(&[bare], &live)
+            .complete()
+            .unwrap()
+            .is_empty());
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -673,9 +734,48 @@ mod tests {
         .unwrap();
 
         let live: HashSet<u32> = [10, 11].into_iter().collect();
-        let got = read_live_sessions(&[acct], &live);
+        let got = read_live_sessions(&[acct], &live).complete().unwrap();
         assert_eq!(got.len(), 2);
         assert_eq!(got.iter().filter(|s| s.session_id == "same-id").count(), 2);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The restore path's liveness oracle must not read a `sessions/` dir it
+    /// cannot list as an account with nothing open: the live session recorded
+    /// there would read "not live", and the restore would type `claude
+    /// --resume` for it — a fork. The read reports the dir, `complete()`
+    /// refuses, and a row from a dir that WAS listed is still returned beside
+    /// it for the callers that can use a partial read.
+    #[cfg(unix)]
+    #[test]
+    fn an_unlistable_sessions_dir_makes_the_read_indeterminate() {
+        let root = tmpdir("unlistable");
+        let readable = root.join(".claude-paktis");
+        fs::write(readable.join("sessions").join("2804.json"), SAMPLE).unwrap();
+        let hidden = root.join(".claude-gmail");
+        fs::create_dir_all(hidden.join("sessions")).unwrap();
+        fs::write(
+            hidden.join("sessions").join("77.json"),
+            r#"{"pid":77,"sessionId":"hidden-live","name":"n","cwd":"/w"}"#,
+        )
+        .unwrap();
+        let Some(restore) =
+            crate::session::claude_activity::unlistable_fixture::unreadable_sessions_dir(&hidden)
+        else {
+            let _ = fs::remove_dir_all(&root);
+            return;
+        };
+
+        let live: HashSet<u32> = [2804, 77].into_iter().collect();
+        let read = read_live_sessions(&[readable, hidden.clone()], &live);
+        assert_eq!(read.sessions.len(), 1, "the listable dir's row is kept");
+        assert_eq!(read.unlistable.len(), 1);
+        assert_eq!(read.unlistable[0].sessions_dir, hidden.join("sessions"));
+        let err = read
+            .complete()
+            .expect_err("an unlistable dir is indeterminate");
+        assert!(err.contains("indeterminate"), "{err}");
+        drop(restore);
         let _ = fs::remove_dir_all(&root);
     }
 }
