@@ -14,21 +14,101 @@ pub struct PhaseSpendTotals {
     pub input_tokens: u64,
     pub output_tokens: u64,
     /// Integer cents, as stored. `phase_token_usage.cost_cents` is a bigint and
-    /// the writer ROUNDS to the nearest cent (`ai_pricing` uses `f64::round`,
-    /// not truncation), so a call under half a cent contributes 0 while one just
-    /// over it contributes 1. This total is therefore an approximation in both
-    /// directions, not a floor.
+    /// the writer ROUNDS to the nearest cent (`f64::round`, not truncation),
+    /// so a call under half a cent contributes 0 while one just over it
+    /// contributes 1. This total is therefore an approximation in both
+    /// directions, not a floor. The sub-cent figure lives in `cost_microusd`,
+    /// which this reload does not read.
     ///
-    /// It is also an ESTIMATE wherever the catalog cannot price the model:
-    /// `record_phase_token_usage_with_cache` writes
-    /// `ai_pricing::calculate_cost_cents_or_estimate`, which borrows a
-    /// same-family price and logs that it did. It used to write `0` in that
-    /// case, which made this total silently unusable as prior spend.
+    /// Per row the figure is either the CLI-REPORTED cost (`cost_source =
+    /// 'reported'`) or an ESTIMATE (`'estimated'`): `record_phase_token_usage_with_cache`
+    /// prices tokens through `ai_pricing::calculate_cost_usd_with_cache`, which
+    /// borrows a same-family price for a model the catalog cannot price and
+    /// logs that it did. It used to write `0` in that case, which made this
+    /// total silently unusable as prior spend.
     pub cost_cents: u64,
+}
+
+/// Where a recorded phase cost came from — `phase_token_usage.cost_source`.
+///
+/// The column is CHECK-constrained to exactly these two strings
+/// (`ck_phase_token_usage_cost_source`, qontinui-web alembic revision
+/// `kpi_01_phase_token_usage_cost_precision`). NULL in the column is
+/// "unknown provenance": every row written before that revision, and any row
+/// for which no cost could be determined at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CostSource {
+    /// The provider reported the cost (Claude CLI `total_cost_usd`).
+    Reported,
+    /// Computed from token counts against the `ai_pricing` table.
+    Estimated,
+}
+
+impl CostSource {
+    pub fn as_db_str(self) -> &'static str {
+        match self {
+            CostSource::Reported => "reported",
+            CostSource::Estimated => "estimated",
+        }
+    }
+}
+
+/// The cost of one `phase_token_usage` row, in the three columns that carry it.
+///
+/// `cost_cents` stays the whole-cent figure every existing reader sums;
+/// `cost_microusd` is the same cost in millionths of a dollar, so a call that
+/// costs a fraction of a cent is not rounded to a fabricated `$0`;
+/// `cost_source` says whether the number was reported or estimated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PhaseCost {
+    /// Whole cents, rounded to nearest — `round(usd * 100)`.
+    pub cents: u64,
+    /// Millionths of a USD — `round(usd * 1_000_000)`. `None` when no
+    /// microdollar-precision figure exists; never a stand-in for zero.
+    pub microusd: Option<i64>,
+    /// `None` = unknown provenance.
+    pub source: Option<CostSource>,
+}
+
+impl PhaseCost {
+    /// A cost the provider reported, in USD.
+    pub fn reported(total_cost_usd: f64) -> Self {
+        Self::from_usd(total_cost_usd, CostSource::Reported)
+    }
+
+    /// A cost estimated from token counts, in USD.
+    pub fn estimated(estimate_usd: f64) -> Self {
+        Self::from_usd(estimate_usd, CostSource::Estimated)
+    }
+
+    /// A whole-cent figure of unknown provenance and no sub-cent precision —
+    /// what a writer that only knows `cost_cents` records.
+    pub fn cents_only(cents: u64) -> Self {
+        Self {
+            cents,
+            microusd: None,
+            source: None,
+        }
+    }
+
+    fn from_usd(usd: f64, source: CostSource) -> Self {
+        // Negative or non-finite input is clamped to 0 rather than written:
+        // `as` saturates, but a NaN would otherwise read as a real $0.
+        let usd = if usd.is_finite() { usd.max(0.0) } else { 0.0 };
+        Self {
+            cents: (usd * 100.0).round() as u64,
+            microusd: Some((usd * 1_000_000.0).round() as i64),
+            source: Some(source),
+        }
+    }
 }
 
 impl PgDb {
     /// Record token usage for a single AI call within a workflow phase.
+    ///
+    /// Whole-cent convenience over [`Self::create_phase_token_usage_with_cache`]
+    /// for a writer that has no cache counters and no provenance for its
+    /// figure (`cost_microusd` / `cost_source` are written NULL).
     pub async fn create_phase_token_usage(
         &self,
         task_run_id: &str,
@@ -42,7 +122,7 @@ impl PgDb {
         cost_cents: u64,
         duration_ms: Option<u64>,
     ) -> Result<(), String> {
-        self.create_phase_token_usage_with_target(
+        self.create_phase_token_usage_with_cache(
             task_run_id,
             phase,
             stage_index,
@@ -51,16 +131,31 @@ impl PgDb {
             provider_used,
             input_tokens,
             output_tokens,
-            cost_cents,
+            PhaseCost::cents_only(cost_cents),
             duration_ms,
+            0,
+            0,
             None,
             None,
         )
         .await
     }
 
-    /// Record token usage with optional target app/page context.
-    pub async fn create_phase_token_usage_with_target(
+    /// Record token usage with prompt cache metrics, the full cost triple
+    /// (`cost_cents`, `cost_microusd`, `cost_source`) and optional UI Bridge
+    /// target. The one writer of `phase_token_usage`.
+    ///
+    /// The cache counters are bound as `Some(n)` — including `Some(0)` —
+    /// never `None`: `phase_token_usage.cache_creation_tokens` and
+    /// `.cache_read_tokens` are `bigint NOT NULL DEFAULT 0`, and the
+    /// Clorinde-generated INSERT names every column explicitly, so a bound
+    /// NULL does not fall back to the column default — it violates NOT NULL
+    /// and the whole row is rejected with an opaque `db error`. That used to
+    /// be the silent-data-loss path for every call with no prompt-cache
+    /// activity (the caller in `unified_workflow_executor/phase_helpers.rs`
+    /// writes from a detached `tokio::spawn` that only `warn!`s on failure);
+    /// the round-trip tests below pin it.
+    pub async fn create_phase_token_usage_with_cache(
         &self,
         task_run_id: &str,
         phase: &str,
@@ -70,8 +165,10 @@ impl PgDb {
         provider_used: Option<&str>,
         input_tokens: u64,
         output_tokens: u64,
-        cost_cents: u64,
+        cost: PhaseCost,
         duration_ms: Option<u64>,
+        cache_creation_tokens: u64,
+        cache_read_tokens: u64,
         target_app: Option<&str>,
         target_page_url: Option<&str>,
     ) -> Result<(), String> {
@@ -86,28 +183,14 @@ impl PgDb {
         let provider_owned = provider_used.map(|s| s.to_string());
         let input_i = input_tokens as i64;
         let output_i = output_tokens as i64;
-        let cost_i = cost_cents as i64;
+        let cost_i = cost.cents as i64;
         let duration_i = duration_ms.map(|v| v as i64);
+        let cache_creation: Option<i64> = Some(cache_creation_tokens as i64);
+        let cache_read: Option<i64> = Some(cache_read_tokens as i64);
         let target_app_owned = target_app.map(|s| s.to_string());
         let target_page_owned = target_page_url.map(|s| s.to_string());
+        let cost_source: Option<&str> = cost.source.map(CostSource::as_db_str);
 
-        // `Some(0)`, NOT `None`. `phase_token_usage.cache_creation_tokens` and
-        // `.cache_read_tokens` are `bigint NOT NULL DEFAULT 0`, and the
-        // Clorinde-generated INSERT names every column explicitly — so binding
-        // NULL here does not fall back to the column default, it violates the
-        // NOT NULL constraint and the whole row is rejected with an opaque
-        // `db error`.
-        //
-        // That made this the SILENT-DATA-LOSS path for every AI call with no
-        // prompt-cache activity: `create_phase_token_usage_with_cache`
-        // delegates here whenever both cache counts are 0, and the caller
-        // (`unified_workflow_executor/phase_helpers.rs`) issues the write from
-        // a detached `tokio::spawn` that only `warn!`s on failure. The run
-        // continued; the spend was never recorded. Caught by the round-trip
-        // test below while wiring the budget reload — which reads exactly this
-        // ledger, so an unwritten row is an under-counted budget.
-        let cache_creation: Option<i64> = Some(0);
-        let cache_read: Option<i64> = Some(0);
         qontinui_db::queries::token_usage::create_phase_token_usage()
             .bind(
                 &conn,
@@ -125,86 +208,11 @@ impl PgDb {
                 &cache_read,
                 &target_app_owned,
                 &target_page_owned,
+                &cost.microusd,
+                &cost_source,
             )
             .await
             .map_err(|e| crate::database::pg::pg_err("PG insert phase_token_usage", &e))?;
-        Ok(())
-    }
-
-    /// Record token usage with prompt cache metrics and optional UI Bridge target.
-    ///
-    /// This extends `create_phase_token_usage_with_target` to also persist
-    /// `cache_creation_tokens` and `cache_read_tokens` for cost-optimization
-    /// tracking. Uses a raw query because the Clorinde-generated insert
-    /// does not yet include the cache columns.
-    pub async fn create_phase_token_usage_with_cache(
-        &self,
-        task_run_id: &str,
-        phase: &str,
-        stage_index: Option<u32>,
-        iteration: Option<u32>,
-        model_used: Option<&str>,
-        provider_used: Option<&str>,
-        input_tokens: u64,
-        output_tokens: u64,
-        cost_cents: u64,
-        duration_ms: Option<u64>,
-        cache_creation_tokens: u64,
-        cache_read_tokens: u64,
-        target_app: Option<&str>,
-        target_page_url: Option<&str>,
-    ) -> Result<(), String> {
-        // If no cache data, delegate to the standard path to avoid unnecessary raw SQL.
-        if cache_creation_tokens == 0 && cache_read_tokens == 0 {
-            return self
-                .create_phase_token_usage_with_target(
-                    task_run_id,
-                    phase,
-                    stage_index,
-                    iteration,
-                    model_used,
-                    provider_used,
-                    input_tokens,
-                    output_tokens,
-                    cost_cents,
-                    duration_ms,
-                    target_app,
-                    target_page_url,
-                )
-                .await;
-        }
-
-        let conn = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| format!("PG pool error: {}", e))?;
-        conn.execute(
-            r#"INSERT INTO phase_token_usage
-                (task_run_id, phase, stage_index, iteration, model_used, provider_used,
-                 input_tokens, output_tokens, cost_cents, duration_ms,
-                 cache_creation_tokens, cache_read_tokens,
-                 target_app, target_page_url)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)"#,
-            &[
-                &task_run_id,
-                &phase,
-                &stage_index.map(|v| v as i32) as &(dyn tokio_postgres::types::ToSql + Sync),
-                &iteration.map(|v| v as i32) as &(dyn tokio_postgres::types::ToSql + Sync),
-                &model_used as &(dyn tokio_postgres::types::ToSql + Sync),
-                &provider_used as &(dyn tokio_postgres::types::ToSql + Sync),
-                &(input_tokens as i64),
-                &(output_tokens as i64),
-                &(cost_cents as i64),
-                &duration_ms.map(|v| v as i64) as &(dyn tokio_postgres::types::ToSql + Sync),
-                &(cache_creation_tokens as i64),
-                &(cache_read_tokens as i64),
-                &target_app as &(dyn tokio_postgres::types::ToSql + Sync),
-                &target_page_url as &(dyn tokio_postgres::types::ToSql + Sync),
-            ],
-        )
-        .await
-        .map_err(|e| crate::database::pg::pg_err("PG insert phase_token_usage (cache)", &e))?;
         Ok(())
     }
 
@@ -278,8 +286,7 @@ impl PgDb {
     /// total; the totals are derived by summing these rows, so the two can
     /// never disagree.
     ///
-    /// Raw SQL, matching `create_phase_token_usage_with_cache` above: the
-    /// checked-in Clorinde bindings are generated from `queries/*.sql` against
+    /// Raw SQL: the checked-in Clorinde bindings are generated from `queries/*.sql` against
     /// a live Postgres (see `.github/workflows/clorinde-bindings-fresh.yml`),
     /// so adding a `--!` block would not compile until that regeneration
     /// lands. Nothing here needs a generated type — it is one aggregate over
@@ -357,6 +364,39 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn phase_cost_converts_usd_to_whole_cents_and_microdollars() {
+        assert_eq!(
+            PhaseCost::reported(1.234_567_8),
+            PhaseCost {
+                cents: 123,
+                microusd: Some(1_234_568),
+                source: Some(CostSource::Reported),
+            }
+        );
+        assert_eq!(
+            PhaseCost::estimated(0.000_004),
+            PhaseCost {
+                cents: 0,
+                microusd: Some(4),
+                source: Some(CostSource::Estimated),
+            }
+        );
+    }
+
+    #[test]
+    fn phase_cost_never_writes_a_negative_or_nan_figure() {
+        assert_eq!(PhaseCost::reported(-3.0).microusd, Some(0));
+        assert_eq!(PhaseCost::reported(f64::NAN).cents, 0);
+    }
+
+    #[test]
+    fn cost_source_strings_match_the_column_check() {
+        // ck_phase_token_usage_cost_source: cost_source IN ('reported','estimated')
+        assert_eq!(CostSource::Reported.as_db_str(), "reported");
+        assert_eq!(CostSource::Estimated.as_db_str(), "estimated");
+    }
+
     /// NOTE: the fallback DSN here deliberately differs from the one the other
     /// `database/pg/*` and `spec_api/*` test modules hardcode
     /// (`qontinui_password`). That value is STALE — canonical dev Postgres is
@@ -431,7 +471,7 @@ mod tests {
         // earlier attempts leave behind.
         //
         // Doubles as the regression test for the NOT NULL cache-column bug
-        // fixed in `create_phase_token_usage_with_target`: these writes carry
+        // fixed in `create_phase_token_usage_with_cache`: these writes carry
         // no prompt-cache activity, which is precisely the path that used to
         // be rejected by Postgres and swallowed by the caller's detached
         // `tokio::spawn`. If that regresses, these inserts fail here instead
@@ -552,5 +592,67 @@ mod tests {
 
         cleanup_task_run(&pg, &mine).await;
         cleanup_task_run(&pg, &theirs).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PG via DATABASE_URL"]
+    async fn reported_cost_round_trips_with_microdollar_precision_and_provenance() {
+        let pg = test_pg().await;
+        let run_id = unique_run_id("reported");
+        create_task_run(&pg, &run_id).await;
+
+        pg.create_phase_token_usage_with_cache(
+            &run_id,
+            "agentic",
+            None,
+            Some(1),
+            Some("claude-sonnet-4"),
+            Some("claude_cli"),
+            11,
+            397,
+            PhaseCost::reported(0.0042),
+            None,
+            6_402,
+            31_002,
+            None,
+            None,
+        )
+        .await
+        .expect("insert reported-cost row");
+
+        let conn = pg.pool.get().await.expect("PG pool");
+        let row = conn
+            .query_one(
+                "SELECT cost_cents, cost_microusd, cost_source, cache_creation_tokens, \
+                        cache_read_tokens \
+                 FROM phase_token_usage WHERE task_run_id = $1",
+                &[&run_id],
+            )
+            .await
+            .expect("read back");
+        assert_eq!(row.try_get::<_, i64>("cost_cents").expect("cost_cents"), 0);
+        assert_eq!(
+            row.try_get::<_, Option<i64>>("cost_microusd")
+                .expect("cost_microusd"),
+            Some(4_200)
+        );
+        assert_eq!(
+            row.try_get::<_, Option<String>>("cost_source")
+                .expect("cost_source")
+                .as_deref(),
+            Some("reported")
+        );
+        assert_eq!(
+            row.try_get::<_, i64>("cache_creation_tokens")
+                .expect("cache_creation_tokens"),
+            6_402
+        );
+        assert_eq!(
+            row.try_get::<_, i64>("cache_read_tokens")
+                .expect("cache_read_tokens"),
+            31_002
+        );
+
+        cleanup_task_run(&pg, &run_id).await;
     }
 }

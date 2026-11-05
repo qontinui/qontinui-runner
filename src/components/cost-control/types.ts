@@ -39,8 +39,19 @@ export interface CostAnomalyEvent {
   timestamp: number;
 }
 
+/**
+ * How many `phase_token_usage` rows behind a cost figure were provider-reported,
+ * price-table estimated, or of unknown provenance (rows predating the column).
+ */
+export interface CostProvenance {
+  reported_rows: number;
+  estimated_rows: number;
+  unknown_rows: number;
+}
+
 export interface CostDashboard {
   total_cost_usd: number;
+  cost_provenance: CostProvenance;
   total_tokens: number;
   cache_hit_rate: number;
   cache_savings_usd: number;
@@ -55,6 +66,7 @@ export interface PhaseCostBreakdown {
   cache_creation_tokens: number;
   cache_read_tokens: number;
   cost_usd: number;
+  cost_provenance: CostProvenance;
 }
 
 export interface ActiveBudgetStatus {

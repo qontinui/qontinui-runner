@@ -279,6 +279,13 @@ pub struct AiSessionResult {
     pub input_tokens: Option<u64>,
     /// Output tokens generated (available for API providers only, None for CLI).
     pub output_tokens: Option<u64>,
+    /// Prompt-cache write tokens reported by the CLI session, when known.
+    pub cache_creation_tokens: Option<u64>,
+    /// Prompt-cache read tokens reported by the CLI session, when known.
+    pub cache_read_tokens: Option<u64>,
+    /// Session cost the CLI itself reported (`total_cost_usd`). `None` means
+    /// not reported — the recorder then estimates from the token counts.
+    pub reported_cost_usd: Option<f64>,
     /// Blueprint telemetry (Phase 4): de-duplicated, order-preserving list of
     /// tool names the agentic session actually used.
     pub tools_used: Vec<String>,
@@ -664,6 +671,9 @@ impl UnifiedAiSessionExecutor {
                 error: refusal,
                 input_tokens: None,
                 output_tokens: None,
+                cache_creation_tokens: None,
+                cache_read_tokens: None,
+                reported_cost_usd: None,
                 tools_used: Vec::new(),
                 tools_rejected: Vec::new(),
             };
@@ -868,10 +878,13 @@ impl UnifiedAiSessionExecutor {
                 let injected_steps = cli_result.injected_steps;
                 let cli_input_tokens = cli_result.input_tokens;
                 let cli_output_tokens = cli_result.output_tokens;
+                let cli_cache_creation_tokens = cli_result.cache_creation_tokens;
+                let cli_cache_read_tokens = cli_result.cache_read_tokens;
+                let cli_reported_cost_usd = cli_result.total_cost_usd;
                 let cli_tools_used = cli_result.tools_used;
                 let cli_tools_rejected = cli_result.tools_rejected;
                 info!(
-                    "UNIFIED-AI-SESSION: {} completed (success={}, output={} chars, duration={}ms, injected_steps={}, tokens={:?}/{:?})",
+                    "UNIFIED-AI-SESSION: {} completed (success={}, output={} chars, duration={}ms, injected_steps={}, tokens={:?}/{:?}, cache={:?}/{:?}, reported_cost_usd={:?})",
                     config.phase.as_str(),
                     success,
                     output.len(),
@@ -879,6 +892,9 @@ impl UnifiedAiSessionExecutor {
                     injected_steps.len(),
                     cli_input_tokens,
                     cli_output_tokens,
+                    cli_cache_creation_tokens,
+                    cli_cache_read_tokens,
+                    cli_reported_cost_usd,
                 );
 
                 // Record token usage on the tracing span for the SQLite/JSONL layers
@@ -896,10 +912,20 @@ impl UnifiedAiSessionExecutor {
                         .model_override
                         .as_deref()
                         .unwrap_or("claude-sonnet-4-20250514");
-                    if let Some(cost) =
-                        crate::ai_pricing::calculate_cost_cents(input_t, output_t, model_id)
-                    {
-                        tracing::Span::current().record("ai.cost_cents", cost as i64);
+                    // The CLI's own figure wins; the price table is the fallback.
+                    let cost_cents = match cli_reported_cost_usd {
+                        Some(reported) => Some((reported * 100.0).round() as i64),
+                        None => crate::ai_pricing::calculate_cost_cents_with_cache(
+                            input_t,
+                            output_t,
+                            cli_cache_creation_tokens.unwrap_or(0),
+                            cli_cache_read_tokens.unwrap_or(0),
+                            model_id,
+                        )
+                        .map(i64::from),
+                    };
+                    if let Some(cost) = cost_cents {
+                        tracing::Span::current().record("ai.cost_cents", cost);
                     }
                     tracing::Span::current().record("gen_ai.request.model", model_id);
                 }
@@ -1015,6 +1041,9 @@ impl UnifiedAiSessionExecutor {
                     error: String::new(),
                     input_tokens: cli_input_tokens,
                     output_tokens: cli_output_tokens,
+                    cache_creation_tokens: cli_cache_creation_tokens,
+                    cache_read_tokens: cli_cache_read_tokens,
+                    reported_cost_usd: cli_reported_cost_usd,
                     tools_used: cli_tools_used,
                     tools_rejected: cli_tools_rejected,
                 }
@@ -1042,6 +1071,9 @@ impl UnifiedAiSessionExecutor {
                     error: e.to_string(),
                     input_tokens: None,
                     output_tokens: None,
+                    cache_creation_tokens: None,
+                    cache_read_tokens: None,
+                    reported_cost_usd: None,
                     tools_used: Vec::new(),
                     tools_rejected: Vec::new(),
                 }
@@ -1070,6 +1102,9 @@ impl UnifiedAiSessionExecutor {
                     error: error_msg,
                     input_tokens: None,
                     output_tokens: None,
+                    cache_creation_tokens: None,
+                    cache_read_tokens: None,
+                    reported_cost_usd: None,
                     tools_used: Vec::new(),
                     tools_rejected: Vec::new(),
                 }

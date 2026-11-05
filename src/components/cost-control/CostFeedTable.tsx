@@ -6,6 +6,7 @@
 
 import { List } from "lucide-react";
 import type { CostUpdateEvent } from "./types";
+import { LIST_PRICE_EQUIVALENT } from "./costProvenance";
 
 interface CostFeedTableProps {
   events: CostUpdateEvent[];
@@ -58,14 +59,23 @@ export function CostFeedTable({ events }: CostFeedTableProps) {
       ) : (
         <div className="max-h-64 overflow-y-auto">
           <table className="w-full text-xs">
+            {/* Per-task cost is a labelled list-price equivalent (served policy
+                production-and-cost `per-task-cost-is-a-labelled-equivalent`). */}
+            <caption className="caption-top text-left text-muted-foreground pb-1">
+              Cost and Cumulative: {LIST_PRICE_EQUIVALENT}
+            </caption>
             <thead className="sticky top-0 bg-card">
               <tr className="border-b border-border text-muted-foreground">
                 <th className="text-left py-2 px-2 font-medium">Time</th>
                 <th className="text-left py-2 px-2 font-medium">Phase</th>
                 <th className="text-right py-2 px-2 font-medium">Iter</th>
                 <th className="text-right py-2 px-2 font-medium">Tokens</th>
-                <th className="text-right py-2 px-2 font-medium">Cost</th>
-                <th className="text-right py-2 px-2 font-medium">Cumulative</th>
+                <th className="text-right py-2 px-2 font-medium" title={LIST_PRICE_EQUIVALENT}>
+                  Cost
+                </th>
+                <th className="text-right py-2 px-2 font-medium" title={LIST_PRICE_EQUIVALENT}>
+                  Cumulative
+                </th>
                 <th className="text-right py-2 px-2 font-medium">Cache</th>
               </tr>
             </thead>

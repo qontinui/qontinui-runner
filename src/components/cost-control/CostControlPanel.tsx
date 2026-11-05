@@ -17,6 +17,7 @@ import { CircuitBreakerStatus } from "./CircuitBreakerStatus";
 import { AnomalyFeed } from "./AnomalyFeed";
 import { BudgetWarningBanner } from "./BudgetWarningBanner";
 import { CostRecommendations } from "./CostRecommendations";
+import { LIST_PRICE_EQUIVALENT, describeCostFigure } from "./costProvenance";
 
 /** Source id → label used in the error banner. */
 const SOURCE_LABELS: Record<string, string> = {
@@ -48,6 +49,11 @@ export default function CostControlPanel() {
     status,
     refresh,
   } = useCostControl();
+
+  // Label the total as a list-price equivalent (never the user's bill) and say
+  // how much of it the CLI reported versus the price table estimated — served
+  // policy production-and-cost `per-task-cost-is-a-labelled-equivalent`.
+  const totalCostSubtitle = `Last 30 days · ${describeCostFigure(dashboard?.cost_provenance)}`;
 
   // Render the page header unconditionally so navigation tests/snapshots
   // always see "Cost Control" even while data is loading or fetches fail.
@@ -156,7 +162,7 @@ export default function CostControlPanel() {
         <MetricCard
           title="Total Cost"
           value={dashboard ? formatCost(dashboard.total_cost_usd) : "$0.00"}
-          subtitle="Last 30 days"
+          subtitle={totalCostSubtitle}
           icon={DollarSign}
         />
         <MetricCard
@@ -173,7 +179,7 @@ export default function CostControlPanel() {
         <MetricCard
           title="Cache Savings"
           value={dashboard ? formatCost(dashboard.cache_savings_usd) : "$0.00"}
-          subtitle="Estimated savings"
+          subtitle={`Estimated savings · ${LIST_PRICE_EQUIVALENT}`}
           variant="success"
         />
       </div>

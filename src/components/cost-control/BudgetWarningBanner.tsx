@@ -7,6 +7,7 @@
 import { useState } from "react";
 import { AlertTriangle, X } from "lucide-react";
 import type { BudgetWarningEvent } from "./types";
+import { LIST_PRICE_EQUIVALENT } from "./costProvenance";
 
 interface BudgetWarningBannerProps {
   warnings: BudgetWarningEvent[];
@@ -30,7 +31,8 @@ export function BudgetWarningBanner({ warnings }: BudgetWarningBannerProps) {
         </p>
         <p className="text-xs text-muted-foreground mt-1">{latest.message}</p>
         <p className="text-xs text-muted-foreground mt-0.5">
-          ${latest.total_cost_usd.toFixed(2)} / ${latest.budget_limit_usd.toFixed(2)}
+          ${latest.total_cost_usd.toFixed(2)} / ${latest.budget_limit_usd.toFixed(2)} (
+          {LIST_PRICE_EQUIVALENT})
         </p>
         {visible.length > 1 && (
           <p className="text-xs text-yellow-500/70 mt-1">
