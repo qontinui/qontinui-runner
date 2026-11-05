@@ -7,8 +7,10 @@
  * anything, this renders the state `useProjectTerminalReconcile` computes as a
  * soft, dismissible advisory with the two honest choices:
  *
- *   [Move them]  — open replacements at the project root, close the originals
- *                  only once their replacement exists;
+ *   [Move them]  — replace each pane that is a bare idle shell with one at the
+ *                  project root (closing the original only once its
+ *                  replacement exists); every pane with anything running in it
+ *                  is kept and named below the prose with the reason;
  *   [Leave them] — dismiss for this project root.
  *
  * Renders nothing when no project is active, when every live terminal is
@@ -38,7 +40,7 @@ export function ProjectFolderChip({ projectRoot, projectName }: ProjectFolderChi
   const root = projectRoot ?? hint?.path ?? null;
   const name = projectName ?? hint?.name ?? null;
 
-  const { count, moving, error, moveThem, dismiss, shouldPrompt } =
+  const { count, moving, error, kept, moveThem, dismiss, shouldPrompt } =
     useProjectTerminalReconcile(root);
 
   if (!shouldPrompt) return null;
@@ -59,6 +61,18 @@ export function ProjectFolderChip({ projectRoot, projectName }: ProjectFolderChi
               <span className="font-semibold">{name ?? "the project folder"}</span>.
             </div>
             {error && <div className="mt-1 text-[10px] text-[#f7768e]">{error}</div>}
+            {kept.length > 0 && (
+              <ul
+                data-ui-bridge-id="terminal.project-folder-chip-kept"
+                className="mt-1 space-y-0.5 text-[10px] text-[#a9b1d6]"
+              >
+                {kept.map((k) => (
+                  <li key={k.id} title={k.id}>
+                    Left in place: <span className="text-[#c0caf5]">{k.title}</span> — {k.reason}
+                  </li>
+                ))}
+              </ul>
+            )}
             <div className="mt-1.5 flex items-center gap-2">
               <button
                 type="button"
