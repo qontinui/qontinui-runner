@@ -515,12 +515,19 @@ fn run_claude_session_inline(
         extra_required,
         ..Default::default()
     };
-    let launch_cfg = {
+    // ONE account resolution, so the launch template and the trust pre-accept
+    // below name the same account. The resolved dir is a process-global that
+    // every `pick_best_account` rewrites, and under `WeightedRandom` (the
+    // default) each pick is a fresh draw, so two reads could disagree when a
+    // sibling spawn picks in between. (This seam sets no `CLAUDE_CONFIG_DIR`
+    // on the child itself — see plan
+    // `2026-11-05-a-spawn-takes-its-own-account-pick-not-the-shared-resolved-dir`.)
+    let config_dir = {
         let ai = crate::settings::get_ai_settings();
-        let (config_dir, _config_dir_source) =
-            crate::ai_provider::get_effective_config_dir(&ai.claude_cli);
-        crate::claude_session::launch_spec::LaunchConfig::from_settings(config_dir.as_deref())
+        crate::ai_provider::get_effective_config_dir(&ai.claude_cli).0
     };
+    let launch_cfg =
+        crate::claude_session::launch_spec::LaunchConfig::from_settings(config_dir.as_deref());
     let (program, cli_args) =
         crate::claude_session::launch_spec::render_program_and_argv(&spec, &launch_cfg);
 
@@ -536,11 +543,9 @@ fn run_claude_session_inline(
     // arm and the dial is read from cache, both of which say so in the report
     // rather than pretending coord was asked.
     {
-        let ai = crate::settings::get_ai_settings();
-        let (trust_dir, _src) = crate::ai_provider::get_effective_config_dir(&ai.claude_cli);
         let gate = crate::claude_session::trust_gate::pre_accept_for_account_sync(
             working_dir,
-            trust_dir.as_deref(),
+            config_dir.as_deref(),
             crate::claude_session::trust_gate::SpawnSurface::NonInteractive,
         );
         if let Some(refusal) = gate.decision.refusal() {

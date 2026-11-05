@@ -549,13 +549,15 @@ mod tests {
         // Corrupt → None (fail-open, no panic/error).
         std::fs::write(&path, b"{not json!!").unwrap();
         assert_eq!(load_from(&path), None);
-        // Partial JSON (missing fields) → defaults fill in.
+        // Partial JSON (missing fields) → defaults fill in. The mode is spelled
+        // as a literal: a roster storing no mode spreads spawns (weighted
+        // random), and moving the enum's `#[default]` must redden this.
         std::fs::write(&path, br#"{"claude_config_dirs":["/a"]}"#).unwrap();
         let parsed = load_from(&path).unwrap();
         assert_eq!(parsed.claude_config_dirs, vec!["/a".to_string()]);
         assert_eq!(
             parsed.account_selection_mode,
-            AccountSelectionMode::default()
+            AccountSelectionMode::WeightedRandom
         );
         assert_eq!(parsed.config_dir, None);
         // A roster written before the pin existed decodes UNPINNED.

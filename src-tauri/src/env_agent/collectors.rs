@@ -3190,6 +3190,13 @@ pub fn collect_env_contract() -> Section {
 // call it. We re-implement the tiny roster read inline against the same
 // on-disk shape.
 
+/// The wire spelling of the bin crate's `AccountSelectionMode::default()`
+/// (settings.rs) — the mode a roster/settings file with no explicit field
+/// resolves to. A string because this crate cannot name that enum; the bin
+/// crate's `collector_default_spelling_matches_the_enum_default` test keeps
+/// the two in step.
+pub const DEFAULT_LOCAL_SELECTION_MODE: &str = "weighted_random";
+
 /// On-disk probe of `claude-accounts.json` — only the fields this collector
 /// needs. Selection mode is read as a raw string (snake_case on disk) to avoid
 /// depending on the bin-crate `AccountSelectionMode` enum.
@@ -3343,9 +3350,7 @@ fn collect_claude_accounts_from(
     let settings_file = runner_dir.join("settings.json");
 
     let mut config_dirs: Vec<String> = Vec::new();
-    // Mirrors `AccountSelectionMode::default()` (settings.rs) — the mode a
-    // roster/settings file with no explicit field resolves to.
-    let mut local_selection_mode = String::from("alternating_handoff");
+    let mut local_selection_mode = String::from(DEFAULT_LOCAL_SELECTION_MODE);
     let mut launch_commands: HashMap<String, String> = HashMap::new();
     let mut accounts_file_found = false;
 
@@ -6889,6 +6894,28 @@ dependencies = [
         assert_eq!(
             section.get("accounts").and_then(|v| v.as_str()),
             Some("personal")
+        );
+    }
+
+    /// A roster that stores no mode reports the runner's default as the local
+    /// mode — spelled as a LITERAL here, so changing the constant reddens this
+    /// test as well as the bin crate's enum-agreement test.
+    #[test]
+    fn claude_accounts_roster_without_a_mode_reports_weighted_random() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let runner = root.join("com.qontinui.runner");
+        let acct = root.join(".claude-personal");
+        std::fs::create_dir_all(&acct).unwrap();
+        write_roster(
+            &runner,
+            &format!("{{\"claude_config_dirs\":[{:?}]}}", acct.to_string_lossy()),
+        );
+
+        let section = collect_claude_accounts_from(root, None, None).unwrap();
+        assert_eq!(
+            section.get("local_selection_mode").and_then(|v| v.as_str()),
+            Some("weighted_random")
         );
     }
 

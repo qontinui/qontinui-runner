@@ -21,7 +21,7 @@
 //!    limit message never migrates anything.
 //! 3. **Pick target** — a non-exhausted, credential-valid, non-cooled account,
 //!    chosen by the selection mode's handoff strategy (`pick_migration_target`;
-//!    `AlternatingHandoff`, the default, and `WeightedRandom` are described in
+//!    `WeightedRandom`, the default, and `AlternatingHandoff` are described in
 //!    `ai_provider::account_usage`). Every other mode, and the fallback when no
 //!    account is under pace, takes the account whose spare weekly capacity is
 //!    closest to expiring (the same `ai_provider::config::cmp_rank` key

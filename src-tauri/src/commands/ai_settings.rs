@@ -2686,10 +2686,11 @@ mod save_selection_mode_tests {
             resolve_saved_selection_mode(Some("alternating_handoff"), stored),
             AccountSelectionMode::AlternatingHandoff
         );
-        // An unknown spelling falls back to the default.
+        // An unknown spelling falls back to the default, weighted random —
+        // spelled as a literal so a moved `#[default]` reddens this.
         assert_eq!(
             resolve_saved_selection_mode(Some("bogus"), stored),
-            AccountSelectionMode::default()
+            AccountSelectionMode::WeightedRandom
         );
     }
 }

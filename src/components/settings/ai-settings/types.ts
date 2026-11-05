@@ -159,14 +159,15 @@ export const SELECTION_MODE_OPTIONS: {
 }[] = [
   { mode: "manual", label: "Manual", hint: "Select account above" },
   {
-    mode: "alternating_handoff",
-    label: "Alternating Handoff",
-    hint: "Handoffs alternate between the top under-pace account and each of the others",
-  },
-  {
+    // The runner's default (`AccountSelectionMode::default()`, settings.rs).
     mode: "weighted_random",
     label: "Weighted Random",
-    hint: "Random under-pace account, weighted by expected usage times how far behind it is",
+    hint: "Default. A fresh draw per spawn and handoff among under-pace accounts, weighted by expected usage times how far behind it is",
+  },
+  {
+    mode: "alternating_handoff",
+    label: "Alternating Handoff",
+    hint: "Spawns take the top under-pace account; handoffs alternate between it and each of the others",
   },
   {
     mode: "highest_expected_usage",
