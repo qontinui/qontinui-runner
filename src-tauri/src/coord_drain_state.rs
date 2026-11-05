@@ -407,10 +407,41 @@ pub fn parse_register_response(body: &str) -> DrainObservation {
 /// PURE: a `GET /coord/devices/me/drain` 200 body (the drain object flattened
 /// beside `device_id` / `as_of`).
 pub fn parse_me_drain_response(body: &str) -> DrainObservation {
+    parse_me_drain_read(body).observation
+}
+
+/// PURE: one drain object as coord serves it (`DeviceDrainWire`), wherever it
+/// is nested — e.g. the `read_back` of a `me/release` answer.
+pub(crate) fn parse_drain_object(value: &serde_json::Value) -> DrainObservation {
+    observation_from_wire(value)
+}
+
+/// A `GET /coord/devices/me/drain` answer with the machine's dispatch role
+/// beside the drain itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MeDrainRead {
+    pub observation: DrainObservation,
+    /// `"workhorse" | "bench" | "ci_node"` as coord served it; `None` when the
+    /// field is absent, which coord does when the lane read was unreadable.
+    pub dispatch_role: Option<String>,
+}
+
+/// PURE: [`parse_me_drain_response`] plus the `dispatch_role` coord serves
+/// beside the drain (additive; an older coord omits it).
+pub(crate) fn parse_me_drain_read(body: &str) -> MeDrainRead {
     match serde_json::from_str::<serde_json::Value>(body) {
-        Ok(json) => observation_from_wire(&json),
-        Err(_) => DrainObservation::Absent {
-            detail: "me/drain response is not JSON".to_string(),
+        Ok(json) => MeDrainRead {
+            observation: observation_from_wire(&json),
+            dispatch_role: json
+                .get("dispatch_role")
+                .and_then(|r| r.as_str())
+                .map(str::to_string),
+        },
+        Err(_) => MeDrainRead {
+            observation: DrainObservation::Absent {
+                detail: "me/drain response is not JSON".to_string(),
+            },
+            dispatch_role: None,
         },
     }
 }
@@ -1095,20 +1126,51 @@ fn enrollment() -> Enrollment {
     }
 }
 
-/// `GET {base}/coord/devices/me/drain` → an observation, or the failure cause.
-async fn read_me_drain(base: &str) -> Result<DrainObservation, String> {
-    let url = format!("{}/coord/devices/me/drain", base.trim_end_matches('/'));
-    // A per-read client, like the heartbeat's: the caller may run on the
-    // heartbeat's dedicated current-thread runtime, and a pooled connection
-    // must not outlive the runtime that opened it.
-    // OS resolver (outbound_net::os_dns): the hickory resolver this replaced
-    // spent the whole timeout on DNS on a VPN box.
-    let client = qontinui_runner_lib::outbound_net::os_dns::client_builder()
+/// The coord base when this runner is positively an enrolled coord device, else
+/// `None` (not enrolled, or the local files could not answer).
+pub(crate) fn enrolled_coord_base() -> Option<String> {
+    match enrollment() {
+        Enrollment::Enrolled(base) => Some(base),
+        Enrollment::NotEnrolled(_) | Enrollment::Indeterminate(_) => None,
+    }
+}
+
+/// A per-call client for this module's coord calls.
+///
+/// Per call, like the heartbeat's: the caller may run on the heartbeat's
+/// dedicated current-thread runtime, and a pooled connection must not outlive
+/// the runtime that opened it. OS resolver (`outbound_net::os_dns`): the
+/// hickory resolver this replaced spent the whole timeout on DNS on a VPN box.
+fn device_client() -> Result<reqwest::Client, String> {
+    qontinui_runner_lib::outbound_net::os_dns::client_builder()
         .timeout(ME_DRAIN_TIMEOUT)
         .build()
-        .map_err(|e| format!("reqwest builder: {e}"))?;
-    // coord-tenant-scope(device): the route answers for the device JWT's own device; there is no tenant in the request.
-    let resp = crate::auth::attach_device_auth(client.get(&url))
+        .map_err(|e| format!("reqwest builder: {e}"))
+}
+
+/// The ONE device-JWT seam for this module's coord calls: the drain read, and
+/// the account hold's self-hold and release (plan
+/// `2026-11-03-a-runner-with-no-logged-in-claude-account-keeps-an-open-agent-lane-so-coord-burns-spawns-on-it`,
+/// Phase 3), which act on the same drain row the read returns.
+fn device_request(
+    client: &reqwest::Client,
+    method: reqwest::Method,
+    url: &str,
+) -> reqwest::RequestBuilder {
+    // coord-tenant-scope(device): every route sent through here (`me/drain`, `me/hold`, `me/release`) acts on the device the JWT was minted for; coord keys the drain row by device_id and the request carries no tenant field to set.
+    crate::auth::attach_device_auth(client.request(method, url))
+}
+
+/// `GET {base}/coord/devices/me/drain` → an observation, or the failure cause.
+async fn read_me_drain(base: &str) -> Result<DrainObservation, String> {
+    read_me_drain_with_role(base).await.map(|r| r.observation)
+}
+
+/// [`read_me_drain`] keeping the `dispatch_role` coord serves beside the drain.
+pub(crate) async fn read_me_drain_with_role(base: &str) -> Result<MeDrainRead, String> {
+    let url = format!("{}/coord/devices/me/drain", base.trim_end_matches('/'));
+    let client = device_client()?;
+    let resp = device_request(&client, reqwest::Method::GET, &url)
         .send()
         .await
         .map_err(|e| format!("GET {url}: {e}"))?;
@@ -1118,7 +1180,68 @@ async fn read_me_drain(base: &str) -> Result<DrainObservation, String> {
         let excerpt: String = body.chars().take(200).collect();
         return Err(format!("GET {url} returned {status}: {excerpt}"));
     }
-    Ok(parse_me_drain_response(&body))
+    Ok(parse_me_drain_read(&body))
+}
+
+/// Send a JSON POST and hand back the status and body as coord gave them (any
+/// status — the caller maps them), or the transport failure.
+async fn send_device_json(
+    rb: reqwest::RequestBuilder,
+    url: &str,
+    body: &serde_json::Value,
+) -> Result<(u16, String), String> {
+    let resp = rb
+        .json(body)
+        .send()
+        .await
+        .map_err(|e| format!("POST {url}: {e}"))?;
+    let status = resp.status().as_u16();
+    let text = resp.text().await.unwrap_or_default();
+    Ok((status, text))
+}
+
+/// `POST {base}{path}` with a JSON body under the device JWT → the status and
+/// body as coord gave them, or the transport failure. For the account hold's
+/// `me/hold` and `me/release`.
+pub(crate) async fn post_device_json(
+    base: &str,
+    path: &str,
+    body: &serde_json::Value,
+) -> Result<(u16, String), String> {
+    let url = format!("{}{path}", base.trim_end_matches('/'));
+    let client = device_client()?;
+    send_device_json(
+        device_request(&client, reqwest::Method::POST, &url),
+        &url,
+        body,
+    )
+    .await
+}
+
+/// [`post_device_json`] under ONE named tenant's credential. A self-hold lives
+/// in the drain map of the tenant whose token wrote it, so a release presented
+/// under another tenant's token answers `absent`; this is the retry that names
+/// the tenant instead of taking the default binding.
+pub(crate) async fn post_device_json_for_tenant(
+    base: &str,
+    path: &str,
+    body: &serde_json::Value,
+    tenant: uuid::Uuid,
+) -> Result<(u16, String), String> {
+    let url = format!("{}{path}", base.trim_end_matches('/'));
+    let client = device_client()?;
+    let rb = crate::auth::attach_device_auth_for(
+        client.request(reqwest::Method::POST, &url),
+        crate::auth::TenantScope::Owned(tenant),
+    );
+    send_device_json(rb, &url, body).await
+}
+
+/// Fold one successful `me/drain` read made outside the heartbeat (the account
+/// hold re-reads after each of its writes, so the cached state and the banner
+/// follow the write at once rather than a heartbeat later).
+pub(crate) fn observe_me_drain(obs: DrainObservation) {
+    fold(|tr, now| tr.observe(obs, now));
 }
 
 /// Fold one heartbeat tick's result. Reads `me/drain` when the tick shows a

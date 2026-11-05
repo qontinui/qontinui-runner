@@ -75,7 +75,7 @@ pub(crate) const SUMMARY_WINDOW: Duration = Duration::from_secs(10 * 60);
 
 /// Heartbeat interval from `COORD_HEARTBEAT_INTERVAL_SECS` (default 30s,
 /// floored at 1s).
-fn heartbeat_interval() -> Duration {
+pub(crate) fn heartbeat_interval() -> Duration {
     let secs: u64 = std::env::var("COORD_HEARTBEAT_INTERVAL_SECS")
         .ok()
         .and_then(|s| s.parse().ok())

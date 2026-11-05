@@ -57,6 +57,14 @@ pub(crate) mod imagegen_probe;
 pub(crate) mod heartbeat_loop;
 pub use heartbeat_loop::spawn_heartbeat;
 
+/// While no Claude account is credential-valid, hold this runner's own agent
+/// lane through coord's device self-hold door, and release it on the first
+/// valid account (plan
+/// `2026-11-03-a-runner-with-no-logged-in-claude-account-keeps-an-open-agent-lane-so-coord-burns-spawns-on-it`,
+/// Phase 3). Spawned beside [`spawn_heartbeat`] at its interval.
+pub(crate) mod claude_account_hold;
+pub use claude_account_hold::spawn_claude_account_hold;
+
 /// Per-machine resource samples (plan §A1/§A2). Driven from
 /// [`spawn_budget_republisher`] so it inherits that function's
 /// shared-machine-state ownership gate instead of restating it — see the
