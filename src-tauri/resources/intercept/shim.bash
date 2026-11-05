@@ -55,7 +55,38 @@ LOCKSYNC_VERBS="@@LOCKSYNC_VERBS@@"
 NEVER_GATE="@@NEVER_GATE@@"
 
 # ---------------------------------------------------------------------------
-# Resolve the REAL tool: first match on PATH that is NOT inside SHIM_DIR.
+# is_qontinui_shim_dir <dir>: true for ANY qontinui shim dir, not only ours.
+# A PATH inherited from another runner session (a supervisor started inside a
+# session, then a temp runner spawned from it) carries THAT session's shim dir
+# too; resolving its shim as the "real" tool made two shims exec each other for
+# ever, keeping the pid (plan 2026-11-04-identity-shim-foreign-shim-ping-pong-
+# and-secondary-runner-pty-socket-overflow, Phase 1). The same predicate as
+# intercept_core::shim_dir::is_qontinui_shim_dir: the dir's final name starts
+# with qontinui-identity- or qontinui-shim-, or it holds the identity-build
+# marker. Trailing separators are ignored, and the name splits on `/` and `\`
+# alike, so the MSYS and Windows spellings of one dir (our own included) read
+# the same. Builtins only (no fork per PATH entry).
+# ---------------------------------------------------------------------------
+is_qontinui_shim_dir() {
+  local d="$1" name
+  while :; do
+    case "$d" in
+      */|*\\) d="${d%?}" ;;
+      *) break ;;
+    esac
+  done
+  [ -n "$d" ] || return 1
+  name="${d##*/}"
+  name="${name##*\\}"
+  case "$name" in
+    qontinui-identity-*|qontinui-shim-*) return 0 ;;
+  esac
+  [ -e "$d/.qontinui-identity-build" ]
+}
+
+# ---------------------------------------------------------------------------
+# Resolve the REAL tool: first match on PATH that is NOT inside SHIM_DIR (or any
+# other qontinui shim dir).
 # Mirrors pm_detect::pm_command intent (try <tool> then <tool>.cmd/.exe).
 # ---------------------------------------------------------------------------
 resolve_real() {
@@ -67,6 +98,7 @@ resolve_real() {
     case "${dir%/}" in
       "${SHIM_DIR%/}") continue ;;
     esac
+    is_qontinui_shim_dir "$dir" && continue
     for cand in "$dir/$TOOL" "$dir/$TOOL.cmd" "$dir/$TOOL.exe"; do
       if [ -x "$cand" ] || [ -f "$cand" ]; then
         printf '%s' "$cand"
@@ -163,13 +195,15 @@ passthrough() {
   if [ -n "${REAL:-}" ]; then
     exec_with_retry exec "$REAL" "$@"
   fi
-  # No resolved real tool: strip our dir from PATH and re-dispatch by name so
-  # the shell finds whatever it would have without us.
+  # No resolved real tool: strip our dir (and every other qontinui shim dir)
+  # from PATH and re-dispatch by name so the shell finds whatever it would have
+  # without us.
   report_unresolved
   local newpath="" d
   local IFS=':'
   for d in $PATH; do
     case "${d%/}" in "${SHIM_DIR%/}") continue ;; esac
+    is_qontinui_shim_dir "$d" && continue
     if [ -z "$newpath" ]; then newpath="$d"; else newpath="$newpath:$d"; fi
   done
   # Whatever answers the name-dispatch below must not wait again: if it is

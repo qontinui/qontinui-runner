@@ -318,11 +318,11 @@ fn persistent_identity_shim_dir() -> Option<&'static str> {
 /// True iff `exe_path` points into one of qontinui's own claude-shim
 /// directories:
 ///
-/// - a per-terminal identity dir (`qontinui-identity-<terminal_id>`) or
-///   install-intercept dir (`qontinui-shim-<terminal_id>`), matched by the
-///   containing dir's basename prefix (the dirs are materialized under the
-///   system temp dir by `install_effects_producer::intercept::shim_materializer`,
-///   whose prefix constants are reused here), or
+/// - any qontinui shim dir, by the shared predicate
+///   [`is_qontinui_shim_dir`](crate::install_effects_producer::intercept::shim_materializer::is_qontinui_shim_dir)
+///   applied to the containing dir (an identity dir `qontinui-identity-*` or
+///   install-intercept dir `qontinui-shim-*` by name, or any dir sealed by the
+///   identity-build marker), or
 /// - the persistent identity dir (`persistent_identity_dir`, in prod
 ///   `profile_cli::identity_shim_dir()` = `~/.qontinui/runner/identity-shim`),
 ///   matched by the full containing dir (separator- and case-normalized —
@@ -336,22 +336,17 @@ fn persistent_identity_shim_dir() -> Option<&'static str> {
     reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
 )]
 fn is_shim_dir_exe_path(exe_path: &str, persistent_identity_dir: Option<&str>) -> bool {
-    use crate::install_effects_producer::intercept::shim_materializer::{
-        IDENTITY_DIR_PREFIX, SHIM_DIR_PREFIX,
-    };
+    use crate::install_effects_producer::intercept::shim_materializer::is_qontinui_shim_dir;
     let trimmed = exe_path.trim_end_matches(['/', '\\']);
     // Split off the file name; what remains is the containing directory.
     let Some(sep_idx) = trimmed.rfind(['/', '\\']) else {
         return false; // bare name — no directory to key on
     };
     let dir = &trimmed[..sep_idx];
-    let dir_base = dir.rsplit(['/', '\\']).next().unwrap_or(dir);
-    // Case-folded like `normalize_dir` below: WMI can report case-mangled
-    // paths, and a miss here fails open to counting the shim as real.
-    let dir_base_lower = dir_base.to_ascii_lowercase();
-    if dir_base_lower.starts_with(IDENTITY_DIR_PREFIX)
-        || dir_base_lower.starts_with(SHIM_DIR_PREFIX)
-    {
+    // The name half splits on `/` AND `\` whatever the host and case-folds
+    // (WMI can report case-mangled paths; a miss fails open to counting the
+    // shim as real).
+    if is_qontinui_shim_dir(std::path::Path::new(dir)) {
         return true;
     }
     if let Some(stable) = persistent_identity_dir {

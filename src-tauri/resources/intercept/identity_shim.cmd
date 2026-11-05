@@ -46,7 +46,8 @@ for %%X in (cmd exe bat) do (
     for %%D in ("%PATH:;=" "%") do (
       if not defined REAL (
         set "DENTRY=%%~D"
-        if /I not "!DENTRY!"=="%SHIM_DIR%" (
+        call :is_qontinui_shim_dir
+        if "!DSKIP!"=="0" (
           if exist "!DENTRY!\%TOOL%.%%X" set "REAL=!DENTRY!\%TOOL%.%%X"
         )
       )
@@ -185,3 +186,34 @@ if defined REAL (
   call %TOOL% %* %SETTINGS_ARGS% %MCPCFG_ARGS%
 )
 endlocal & exit /b %ERRORLEVEL%
+
+rem ---- is_qontinui_shim_dir: DSKIP=1 when DENTRY is ANY qontinui shim dir ---
+rem Not only our own SHIM_DIR: a PATH inherited from another runner session
+rem carries THAT session's qontinui-identity-*/qontinui-shim-* dir too, and
+rem resolving its shim as the "real" tool made two shims dispatch to each other
+rem for ever (plan 2026-11-04-identity-shim-foreign-shim-ping-pong-and-
+rem secondary-runner-pty-socket-overflow, Phase 1). The same predicate as
+rem intercept_core::shim_dir::is_qontinui_shim_dir: the dir's final name starts
+rem with qontinui-identity- or qontinui-shim-, or it holds the identity-build
+rem marker. Trailing separators are ignored.
+:is_qontinui_shim_dir
+set "DSKIP=0"
+if not defined DENTRY exit /b 0
+if /I "!DENTRY!"=="%SHIM_DIR%" set "DSKIP=1"
+set "DTRIM=!DENTRY!"
+:is_qontinui_shim_dir_trim
+if not defined DTRIM exit /b 0
+if "!DTRIM:~-1!"=="\" (
+  set "DTRIM=!DTRIM:~0,-1!"
+  goto :is_qontinui_shim_dir_trim
+)
+if "!DTRIM:~-1!"=="/" (
+  set "DTRIM=!DTRIM:~0,-1!"
+  goto :is_qontinui_shim_dir_trim
+)
+set "DNAME="
+for %%N in ("!DTRIM!") do set "DNAME=%%~nxN"
+if /I "!DNAME:~0,18!"=="qontinui-identity-" set "DSKIP=1"
+if /I "!DNAME:~0,14!"=="qontinui-shim-" set "DSKIP=1"
+if exist "!DTRIM!\.qontinui-identity-build" set "DSKIP=1"
+exit /b 0

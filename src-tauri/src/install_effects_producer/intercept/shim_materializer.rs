@@ -51,6 +51,12 @@ const IDENTITY_SHIM_CMD: &str = include_str!("../../../resources/intercept/ident
 /// flag. `claude` is provider #1, `gemini` #2.
 pub const IDENTITY_TOOLS: &[&str] = &["claude", "gemini"];
 
+/// The one predicate every PATH walker (the bash/`.cmd` templates, the native
+/// stub, the PTY PATH composer, the process census) uses to skip ANY qontinui
+/// shim dir, not only its own. Defined in the lib crate beside the prefixes so
+/// the native stub binary shares it.
+pub use qontinui_runner_lib::intercept_core::shim_dir::is_qontinui_shim_dir;
+
 /// Filename prefix for the CONTENT-ADDRESSED identity shim dir
 /// (`qontinui-identity-<build-tag>`, see [`identity_build_tag`]). Distinct from
 /// [`SHIM_DIR_PREFIX`] so the always-on identity family has its own lifecycle
@@ -63,13 +69,14 @@ pub const IDENTITY_TOOLS: &[&str] = &["claude", "gemini"];
 /// `@@SHIM_DIR@@`; the terminal id rides env vars), so the dir is now shared
 /// across every terminal of one runner build. The prefix is unchanged so
 /// [`sweep_stale`] still reaps the legacy per-terminal dirs.
-pub const IDENTITY_DIR_PREFIX: &str = "qontinui-identity-";
+pub use qontinui_runner_lib::intercept_core::shim_dir::IDENTITY_DIR_PREFIX;
 
 /// Completion marker written LAST inside a materialized identity dir. Its
 /// presence means "this dir is complete and matches its build tag"; its absence
 /// means a materialize was interrupted and must be redone. Also carries the
-/// dir's liveness timestamp (see [`refresh_identity_liveness`]).
-const IDENTITY_MARKER: &str = ".qontinui-identity-build";
+/// dir's liveness timestamp (see [`refresh_identity_liveness`]), and marks the
+/// dir as a qontinui shim dir whatever its name ([`is_qontinui_shim_dir`]).
+use qontinui_runner_lib::intercept_core::shim_dir::IDENTITY_MARKER;
 
 /// How stale the identity dir's liveness marker may get before an in-use dir
 /// re-touches it. Far below [`STALE_SHIM_MAX_AGE`], so a dir in continuous use
@@ -110,7 +117,7 @@ pub const PORT_ENV: &str = "QONTINUI_INSTALL_INTERCEPT_PORT";
 pub const MODE_ENV: &str = "QONTINUI_INSTALL_INTERCEPT_MODE";
 
 /// Filename prefix for a per-terminal shim dir (`qontinui-shim-<terminal_id>`).
-pub const SHIM_DIR_PREFIX: &str = "qontinui-shim-";
+pub use qontinui_runner_lib::intercept_core::shim_dir::SHIM_DIR_PREFIX;
 
 /// Age beyond which an orphaned per-terminal shim dir is swept at materialize
 /// time (plan §4 Phase 4 cleanup): 24h. A live terminal re-materializes per
@@ -165,17 +172,6 @@ pub struct SeamEnv {
     /// [`resolve_mode`] (plan §3 step 3); a garbled runner-env value fails open
     /// to `observe`.
     pub mode: String,
-}
-
-/// Build the new `PATH` value (shim dir prepended) given the child's current
-/// `PATH`. Kept pure so the seam test asserts the prepend without a PTY.
-pub fn prepend_path(shim_dir: &Path, current_path: Option<&str>) -> String {
-    let sep = if cfg!(windows) { ';' } else { ':' };
-    let dir = shim_dir.to_string_lossy();
-    match current_path {
-        Some(p) if !p.is_empty() => format!("{dir}{sep}{p}"),
-        _ => dir.to_string(),
-    }
 }
 
 /// Render a shim script payload for `tool` by substituting the `@@…@@`
@@ -1707,23 +1703,6 @@ mod tests {
     }
 
     #[test]
-    fn prepend_path_puts_shim_first() {
-        let dir = Path::new("/tmp/qontinui-shim-abc");
-        let sep = if cfg!(windows) { ";" } else { ":" };
-        let got = prepend_path(dir, Some("/usr/bin:/bin"));
-        assert!(got.starts_with(&dir.to_string_lossy().to_string()));
-        assert!(got.contains(sep));
-        assert!(got.ends_with("/usr/bin:/bin") || got.ends_with("/bin"));
-    }
-
-    #[test]
-    fn prepend_path_empty_current() {
-        let dir = Path::new("/tmp/shim");
-        assert_eq!(prepend_path(dir, None), "/tmp/shim");
-        assert_eq!(prepend_path(dir, Some("")), "/tmp/shim");
-    }
-
-    #[test]
     fn render_substitutes_all_placeholders() {
         let dir = Path::new("/tmp/qontinui-shim-xyz");
         let out = render(SHIM_BASH, ShimTool::Npm, dir);
@@ -2876,6 +2855,102 @@ mod resolve_wait_tests {
                 "0 disables the wait: {stderr}"
             );
         }
+    }
+
+    /// `timeout` by ABSOLUTE path, for the same reason as [`bash`].
+    fn timeout_bin() -> Option<&'static str> {
+        ["/usr/bin/timeout", "/bin/timeout", "/usr/local/bin/timeout"]
+            .into_iter()
+            .find(|p| Path::new(p).exists())
+    }
+
+    /// Two materialized shims of one family stacked on PATH ahead of the real
+    /// tool, each in a dir carrying a qontinui shim-dir name. Runs `<tool>
+    /// --version` through EACH shim under `timeout -k 2 5` and asserts the
+    /// real tool's sentinel came back with exit 0.
+    ///
+    /// Before plan
+    /// `2026-11-04-identity-shim-foreign-shim-ping-pong-and-secondary-runner-pty-socket-overflow`
+    /// Phase 1 each shim skipped only its OWN dir, so each resolved the other
+    /// shim as the "real" tool and `exec`ed it: an exec ping-pong that keeps
+    /// the pid and never returns (exit 124 here).
+    fn assert_stacked_shims_reach_the_real_tool(
+        family_prefix: &str,
+        tool: &str,
+        render_into: impl Fn(&Path) -> String,
+    ) {
+        let Some(timeout) = timeout_bin() else {
+            return; // no coreutils `timeout`: nothing can bound the hang
+        };
+        let _serial = EXE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let dir_a = tmp.path().join(format!("{family_prefix}a"));
+        let dir_b = tmp.path().join(format!("{family_prefix}b"));
+        let real_dir = tmp.path().join("real");
+        for d in [&dir_a, &dir_b, &real_dir] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        write_exe(&dir_a.join(tool), &render_into(&dir_a));
+        write_exe(&dir_b.join(tool), &render_into(&dir_b));
+        write_exe(
+            &real_dir.join(tool),
+            "#!/bin/sh\necho REAL-TOOL-SENTINEL\nexit 0\n",
+        );
+        let path = format!(
+            "{}:{}:{}:/usr/bin:/bin",
+            dir_a.display(),
+            dir_b.display(),
+            real_dir.display()
+        );
+        for shim_dir in [&dir_a, &dir_b] {
+            let mut cmd = Command::new(timeout);
+            cmd.args(["-k", "2", "5", bash()])
+                .arg(shim_dir.join(tool))
+                .arg("--version")
+                .current_dir(tmp.path())
+                .env_clear()
+                .env("PATH", &path)
+                .env("QONTINUI_SHIM_RESOLVE_WAIT_SECS", "0");
+            let out = crate::process_helpers::output_with_timeout(cmd, BUDGET).unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(
+                out.status.code(),
+                Some(0),
+                "{} through {} must reach the real tool, not another qontinui shim \
+                 (124 = the exec ping-pong timed out); stdout: {stdout} stderr: {stderr}",
+                tool,
+                shim_dir.display()
+            );
+            assert!(
+                stdout.contains("REAL-TOOL-SENTINEL"),
+                "the real {tool} never ran via {}: stdout: {stdout} stderr: {stderr}",
+                shim_dir.display()
+            );
+        }
+    }
+
+    /// Plan `2026-11-04-identity-shim-foreign-shim-ping-pong-…` Phase 1: an
+    /// identity shim never dispatches to ANOTHER qontinui identity-shim dir
+    /// (the inherited `qontinui-identity-*` dir of a calling session).
+    ///
+    /// No `system_claude_present` skip: the fake real dir sits AHEAD of the
+    /// system dirs on PATH, so a system `claude` can never satisfy the scan
+    /// first.
+    #[test]
+    fn identity_shim_skips_foreign_qontinui_shim_dir() {
+        assert_stacked_shims_reach_the_real_tool(IDENTITY_DIR_PREFIX, "claude", |dir| {
+            render_identity_for_test("claude", dir)
+        });
+    }
+
+    /// The same, for the install-interception family (`qontinui-shim-*`).
+    /// Same PATH order, so a system `npm` cannot mask it either.
+    #[test]
+    fn install_shim_skips_foreign_qontinui_shim_dir() {
+        assert_stacked_shims_reach_the_real_tool(SHIM_DIR_PREFIX, "npm", |dir| {
+            render_for_test(SHIM_BASH, ShimTool::Npm, dir)
+        });
     }
 }
 
