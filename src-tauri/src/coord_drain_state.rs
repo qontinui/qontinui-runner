@@ -526,6 +526,19 @@ impl DrainTracker {
 
     /// Fold one successful read.
     pub fn observe(&mut self, obs: DrainObservation, now: DateTime<Utc>) -> Transition {
+        self.fold(obs, now, true)
+    }
+
+    /// The shared fold. `carry_reason` keeps the previous reason for the same
+    /// drain when the observation has none — right for the register heartbeat,
+    /// which never carries `reason`, and wrong for a `me/drain` read, whose
+    /// answer IS the reason coord serves (a served `None` means none given).
+    fn fold(
+        &mut self,
+        obs: DrainObservation,
+        now: DateTime<Utc>,
+        carry_reason: bool,
+    ) -> Transition {
         self.misses = 0;
         let next = match obs {
             DrainObservation::Clear => CoordDrainState::Clear,
@@ -537,6 +550,7 @@ impl DrainTracker {
                     // The heartbeat never carries `reason`; keep the one the
                     // last me/drain read supplied for this same drain.
                     let reason = reason.or_else(|| match &self.state {
+                        _ if !carry_reason => None,
                         CoordDrainState::Drained {
                             until: prev_until,
                             reason: prev_reason,
@@ -559,12 +573,15 @@ impl DrainTracker {
         self.set(next)
     }
 
-    /// Fold one successful `me/drain` read: [`Self::observe`], and — when the
-    /// folded state is `Drained` — record that this drain's reason has been
-    /// read. The register heartbeat never carries `reason`, so it folds through
-    /// plain [`Self::observe`] and leaves the mark alone.
+    /// Fold one successful `me/drain` read and — when the folded state is
+    /// `Drained` — record that this drain's reason has been read. Unlike
+    /// [`Self::observe`] it carries no earlier reason forward: the read's
+    /// reason is what coord serves now, so a reason coord stopped serving for
+    /// the same `until` is dropped rather than kept and marked read. The
+    /// register heartbeat never carries `reason`, so it folds through plain
+    /// [`Self::observe`] and leaves the mark alone.
     pub fn observe_read(&mut self, obs: DrainObservation, now: DateTime<Utc>) -> Transition {
-        let t = self.observe(obs, now);
+        let t = self.fold(obs, now, false);
         if let CoordDrainState::Drained { until, .. } = &self.state {
             self.reason_read_for = Some(*until);
         }
@@ -723,12 +740,15 @@ pub fn current() -> CoordDrainState {
 }
 
 /// [`current`] plus whether its reason has been read
-/// ([`DrainTracker::reason_read`]): `true` only for a `Drained` state whose
-/// `me/drain` read has landed, so its `reason: None` means the operator gave
-/// none. Both come from ONE lock, so the flag always describes the state
-/// returned beside it.
+/// ([`DrainTracker::reason_read`]): `true` only when the returned state is
+/// `Drained` and that drain's `me/drain` read has landed, so its
+/// `reason: None` means the operator gave none. Both come from ONE lock; the
+/// flag is forced `false` when staleness or expiry turned the returned state
+/// into something other than `Drained`.
 pub(crate) fn current_with_reason_read() -> (CoordDrainState, bool) {
-    current_and(|inner| inner.tracker.reason_read())
+    let (state, read) = current_and(|inner| inner.tracker.reason_read());
+    let read = read && matches!(state, CoordDrainState::Drained { .. });
+    (state, read)
 }
 
 /// The current state and `also(inner)`, read under one lock, emitting a
@@ -2075,12 +2095,45 @@ mod tests {
     }
 
     #[test]
+    fn a_me_drain_read_that_serves_no_reason_drops_the_one_it_had() {
+        // A read is coord's answer now: a reason it stopped serving for the
+        // same `until` must not be carried forward and marked read (an own
+        // hold's stale prefix would otherwise force a read every tick).
+        let until = Some(t0() + chrono::Duration::hours(2));
+        let mut tr = DrainTracker::new(t0());
+        tr.observe_read(drained(until, Some("operator: disk replacement")), t0());
+        tr.observe_read(drained(until, None), t0());
+        assert!(tr.reason_read());
+        assert!(matches!(
+            tr.state(),
+            CoordDrainState::Drained { reason: None, .. }
+        ));
+        // The heartbeat path still carries a read reason forward.
+        let mut tr = DrainTracker::new(t0());
+        tr.observe_read(drained(until, Some("operator: disk replacement")), t0());
+        tr.observe(drained(until, None), t0());
+        assert!(matches!(
+            tr.state(),
+            CoordDrainState::Drained {
+                reason: Some(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn a_moved_until_or_a_cleared_drain_forgets_the_mark() {
         let until = Some(t0() + chrono::Duration::hours(2));
         let mut tr = DrainTracker::new(t0());
         tr.observe_read(drained(until, None), t0());
         tr.observe(drained(Some(t0() + chrono::Duration::hours(3)), None), t0());
         assert!(!tr.reason_read(), "the until moved: a different drain");
+        // Moving back is still a new drain, so the clear in `set` must have run.
+        tr.observe(drained(until, None), t0());
+        assert!(
+            !tr.reason_read(),
+            "moved back to the first until: still unread"
+        );
 
         let mut tr = DrainTracker::new(t0());
         tr.observe_read(drained(until, None), t0());
