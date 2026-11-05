@@ -5802,6 +5802,15 @@ pub(crate) mod tests {
     /// is a `CapturingWriter` and whose other fields are inert. The
     /// reader/waiter threads are NOT spawned — `submit_prompt` only
     /// touches `self.writer`, so this is enough.
+    /// [`make_test_session`] under `id`, so `info().id` matches the key a
+    /// test holds it under in a [`super::super::TerminalManager`], as a real
+    /// spawn's does.
+    pub(crate) fn make_test_session_with_id(id: &str) -> TerminalSession {
+        let mut session = make_test_session(Arc::new(Mutex::new(Vec::new())));
+        session.id = id.to_string();
+        session
+    }
+
     pub(crate) fn make_test_session(buf: Arc<Mutex<Vec<u8>>>) -> TerminalSession {
         let writer: Box<dyn Write + Send> = Box::new(CapturingWriter(buf));
         let (output_tx, _) = broadcast::channel::<String>(1);
