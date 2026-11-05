@@ -10023,6 +10023,7 @@ mod text_visibility_dispatch_tests {
                 transport_kind: None,
                 physical_device_id: None,
                 activated_by: None,
+                bearer: super::ConnectionBearer::Absent,
             },
         );
         mgr.active_url = Some(url.to_string());
