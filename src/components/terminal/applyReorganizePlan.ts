@@ -9,8 +9,8 @@
  *     off-page and closed and re-created all of them — m7-4);
  *  2. resolve each planned page by name, creating the ones that do not exist;
  *  3. wait until each target page listens for `terminal-page-changed` (a page
- *     created a moment ago has no listener yet, and a move it misses is
- *     adopted by nobody);
+ *     created a moment ago has no listener yet, and a move it misses is not
+ *     adopted until that page's next re-sync — its tab is gone meanwhile);
  *  4. move each pane the plan places on ANOTHER page with `terminal_set_page`
  *     — the PTY and whatever runs in it (an AI session) keep running; a pane
  *     already on its target page is not touched. A move that fails leaves the
