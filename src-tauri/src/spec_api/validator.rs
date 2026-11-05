@@ -590,6 +590,7 @@ mod tests {
     #[test]
     fn gate_coverage_passes_at_full_coverage() {
         let _guard = env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&["QONTINUI_SPEC_COVERAGE_FLOOR"]);
         std::env::remove_var("QONTINUI_SPEC_COVERAGE_FLOOR");
         // 3-state chain s0→s1→s2 — every state touched, every state
         // reachable from s0. Ratio = 1.0 ≥ default 0.80 floor.
@@ -601,12 +602,12 @@ mod tests {
     #[test]
     fn gate_coverage_rejects_when_below_floor() {
         let _guard = env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&["QONTINUI_SPEC_COVERAGE_FLOOR"]);
         // 5 states, chain transitions linking ALL states — coverage = 1.0.
         // Set floor to >1.0 to guarantee failure regardless of inputs.
         let ir = chain_ir("cov-fail", 5, true);
         std::env::set_var("QONTINUI_SPEC_COVERAGE_FLOOR", "1.5");
         let result = gate_coverage(&ir);
-        std::env::remove_var("QONTINUI_SPEC_COVERAGE_FLOOR");
         match result {
             Err(ValidatorError::CoverageBelowFloor { ratio, floor }) => {
                 assert!(ratio <= 1.0001);
@@ -619,6 +620,7 @@ mod tests {
     #[test]
     fn gate_coverage_disconnected_subgraph_below_default_floor() {
         let _guard = env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&["QONTINUI_SPEC_COVERAGE_FLOOR"]);
         // Ensure the env var is not set from a prior test that may not have
         // cleaned up if it panicked mid-run.
         std::env::remove_var("QONTINUI_SPEC_COVERAGE_FLOOR");
@@ -751,6 +753,7 @@ mod tests {
     #[test]
     fn all_gates_pass_smoke() {
         let _guard = env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&["QONTINUI_SPEC_COVERAGE_FLOOR"]);
         std::env::remove_var("QONTINUI_SPEC_COVERAGE_FLOOR");
         // Single-state IR with one assertion + no transitions. Distinctness
         // passes (no peers to be identical-with); gate-2 round-trips
@@ -763,7 +766,6 @@ mod tests {
         let r1 = distinctness::validate(&ir);
         let r2 = gate_round_trip(&ir);
         let r3 = gate_coverage(&ir);
-        std::env::remove_var("QONTINUI_SPEC_COVERAGE_FLOOR");
         r1.expect("distinctness");
         r2.expect("round-trip");
         let _ = r3.expect("coverage");

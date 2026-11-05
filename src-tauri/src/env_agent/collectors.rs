@@ -5775,9 +5775,9 @@ dependencies = [
     fn secret_safety_env_contract_emits_name_not_value() {
         let _env_lock = env_lock();
         let var = "QONTINUI_SECRET_TOKEN_TEST_UNIQUE";
+        let _restore = crate::test_env::EnvVarRestore::capture(&[var]);
         std::env::set_var(var, "supersecret123");
         let section = collect_env_contract();
-        std::env::remove_var(var);
 
         // Name present, value "present".
         assert_eq!(

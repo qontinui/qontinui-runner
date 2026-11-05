@@ -165,6 +165,7 @@ mod tests {
     #[test]
     fn gate_reads_env_var() {
         let _env_lock = env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&[DEV_ENV_VAR]);
         std::env::remove_var(DEV_ENV_VAR);
         assert!(
             !is_dev_endpoints_enabled(),

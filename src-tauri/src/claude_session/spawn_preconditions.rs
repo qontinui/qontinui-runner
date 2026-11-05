@@ -1628,6 +1628,7 @@ mod tests {
     #[test]
     fn stall_window_defaults_and_can_be_overridden_or_disabled() {
         let _g = crate::test_env::env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&[STALL_WINDOW_ENV]);
         std::env::remove_var(STALL_WINDOW_ENV);
         assert_eq!(
             stall_window(),
@@ -1646,7 +1647,6 @@ mod tests {
             stall_window(),
             Some(Duration::from_secs(DEFAULT_STALL_WINDOW_SECS))
         );
-        std::env::remove_var(STALL_WINDOW_ENV);
     }
 
     // ------------------------------------------------------- the bundle
