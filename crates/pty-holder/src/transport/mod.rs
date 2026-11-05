@@ -73,7 +73,33 @@ pub fn staged_socket_path(pane_dir: &Path, pane: &PaneId) -> io::Result<std::pat
 pub fn connect(pane_dir: &Path, pane: &PaneId, deadline: Instant) -> io::Result<Conn> {
     #[cfg(unix)]
     {
-        unix::connect(&crate::pane::socket_path(pane_dir, pane)?, deadline)
+        // Every place this pane's holder may be listening (`socket_candidates`:
+        // both socket roots, then a pre-Phase-4 holder's path in the pane dir),
+        // most likely first. A candidate with nothing listening (`NotFound`,
+        // `ConnectionRefused`) or too long to address (`InvalidInput`, only the
+        // legacy path) is passed over; any other answer — a connection, or a
+        // timeout from a wedged holder's full backlog — is THE answer.
+        let mut last = io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("no endpoint for pane {pane}"),
+        );
+        for path in crate::pane::socket_candidates(pane_dir, pane) {
+            match unix::connect(&path, deadline) {
+                Ok(conn) => return Ok(conn),
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::NotFound
+                            | io::ErrorKind::ConnectionRefused
+                            | io::ErrorKind::InvalidInput
+                    ) =>
+                {
+                    last = e;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last)
     }
     #[cfg(windows)]
     {

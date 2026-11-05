@@ -7,6 +7,9 @@
 //! Windows this suite has exactly one test, IGNORED with the reason — it
 //! reports "not applicable", never "passed".
 
+#[cfg(unix)]
+mod common;
+
 #[cfg(not(unix))]
 #[test]
 #[ignore = "not applicable: holder upgrade (plan Phase 8, D12a) is Unix-only — a Windows holder answers prepare_upgrade with `unsupported`"]
@@ -104,7 +107,7 @@ mod unix {
             kill_verified(self.child_pid, &self.child_token);
             let _ = self.holder.kill();
             let _ = self.holder.wait();
-            let _ = std::fs::remove_dir_all(&self.dir);
+            let _ = crate::common::remove_pane_dir(&self.dir);
         }
     }
 
@@ -1100,7 +1103,7 @@ mod unix {
         let got = std::fs::read_to_string(&file).unwrap_or_default();
         assert_eq!(got.matches("held").count(), 1, "held input once: {got:?}");
         assert_eq!(got.matches("after").count(), 1, "{got:?}");
-        let _ = std::fs::remove_dir_all(&out);
+        let _ = crate::common::remove_pane_dir(&out);
         no_snapshot_left(&dir);
         assert!(!staged_socket(&dir).exists());
     }
@@ -1184,7 +1187,7 @@ mod unix {
             matches!(probe(&dir, &p1(), soon()), Probe::Unknown { .. }),
             "unreachable but held: UNKNOWN, never dead"
         );
-        let _ = std::fs::remove_dir_all(&out);
+        let _ = crate::common::remove_pane_dir(&out);
     }
 
     /// Review r4, H2: the faults several tests here rely on exist only in a

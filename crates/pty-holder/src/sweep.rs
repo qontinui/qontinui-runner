@@ -535,7 +535,7 @@ fn reap_dead_into(pane_dir: &Path, pane: &PaneId, errors: &mut Vec<String>) -> S
         // stays for a restorer (`crate::scrollback`).
         scrollback_tmp_path(pane_dir, pane),
     ];
-    files.extend(endpoint_files(pane_dir, pane, errors));
+    files.extend(endpoint_files(pane_dir, pane));
     for f in files {
         match std::fs::remove_file(&f) {
             Ok(()) => {}
@@ -574,25 +574,23 @@ fn reap_dead_into(pane_dir: &Path, pane: &PaneId, errors: &mut Vec<String>) -> S
     }
 }
 
-/// A dead pane's Unix endpoint and a successor's staged twin. Both live in the
-/// SHARED per-user socket root (`crate::pane::socket_root`), not in the pane
-/// dir, so they are DERIVED from this pane's (pane dir, id) — never found by
-/// listing the root, which holds every runner instance's sockets. None on
-/// Windows, whose endpoint is a named pipe that vanishes with its holder.
-fn endpoint_files(pane_dir: &Path, pane: &PaneId, errors: &mut Vec<String>) -> Vec<PathBuf> {
+/// A dead pane's Unix endpoint and a successor's staged twin, wherever they may
+/// lie (`crate::pane::socket_candidates`: either per-user socket root, or the
+/// pane dir for a pre-Phase-4 holder). The roots are SHARED by every runner
+/// instance, so these are DERIVED from this pane's (pane dir, id) — the roots
+/// are never listed. None on Windows, whose endpoint is a named pipe that
+/// vanishes with its holder.
+fn endpoint_files(pane_dir: &Path, pane: &PaneId) -> Vec<PathBuf> {
     #[cfg(unix)]
     {
-        match crate::pane::socket_path(pane_dir, pane) {
-            Ok(sock) => vec![crate::transport::staged_path(&sock), sock],
-            Err(e) => {
-                errors.push(format!("socket path of pane {pane}: {e}"));
-                Vec::new()
-            }
-        }
+        crate::pane::socket_candidates(pane_dir, pane)
+            .into_iter()
+            .flat_map(|sock| [crate::transport::staged_path(&sock), sock])
+            .collect()
     }
     #[cfg(windows)]
     {
-        let _ = (pane_dir, pane, errors);
+        let _ = (pane_dir, pane);
         Vec::new()
     }
 }

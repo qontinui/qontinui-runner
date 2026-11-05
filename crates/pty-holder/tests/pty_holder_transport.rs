@@ -8,6 +8,8 @@
 //! Unix file modes; on Windows everything else runs as-is (UNRUN on the Linux
 //! box this was written on).
 
+mod common;
+
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -231,7 +233,7 @@ fn pty_holder_handshake_ping_census_and_lock_record() {
         other => panic!("{other:?}"),
     }
     drop(h);
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = common::remove_pane_dir(&dir);
 }
 
 /// The positive allowlist (plan D5): an unknown verb gets a typed rejection
@@ -262,7 +264,7 @@ fn pty_holder_unknown_verb_is_rejected_and_closed() {
         Probe::Healthy { .. }
     ));
     drop(h);
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = common::remove_pane_dir(&dir);
 }
 
 #[test]
@@ -330,7 +332,7 @@ fn pty_holder_refusals_before_and_after_handshake() {
 
     assert!(matches!(probe(&dir, &pane, soon()), Probe::Healthy { .. }));
     drop(h);
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = common::remove_pane_dir(&dir);
 }
 
 /// D15: no common version is a visible, typed state — and the envelope verbs
@@ -388,7 +390,7 @@ fn pty_holder_no_common_version_is_incompatible_not_dead() {
     );
 
     drop(h);
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = common::remove_pane_dir(&dir);
 }
 
 /// Lock before endpoint: a second holder for a live pane exits `lock_held`
@@ -410,7 +412,7 @@ fn pty_holder_second_holder_for_a_live_pane_refuses() {
         other => panic!("{other:?}"),
     }
     drop(first);
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = common::remove_pane_dir(&dir);
 }
 
 /// A killed holder is Dead (its lock is acquirable); a new holder for the same
@@ -443,7 +445,7 @@ fn pty_holder_killed_holder_is_dead_and_the_pane_is_reusable() {
         other => panic!("{other:?}"),
     }
     drop(h2);
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = common::remove_pane_dir(&dir);
 }
 
 /// Plan 2026-11-04 (socket-overflow) Phase 4: a pane dir far past `sun_path`
@@ -491,7 +493,7 @@ fn pty_holder_long_pane_dir_spawns_connects_and_readopts() {
     drop(h);
     // The socket lives in the shared root, not the pane dir: remove ours.
     let _ = std::fs::remove_file(&sock);
-    let _ = std::fs::remove_dir_all(&base);
+    let _ = common::remove_pane_dir(&base);
 }
 
 /// A held lock with no endpoint (a holder between lock and bind, or one that
@@ -508,7 +510,7 @@ fn pty_holder_held_lock_without_handshake_is_unknown() {
         Probe::Unknown { .. } => {}
         other => panic!("held lock must be Unknown, got {other:?}"),
     }
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = common::remove_pane_dir(&dir);
 }
 
 /// THE health rule: a wedged holder still accepts from the kernel backlog, so
@@ -547,7 +549,7 @@ fn pty_holder_wedged_holder_is_unknown_within_the_deadline() {
         "probe overran its deadline: {took:?}"
     );
     drop(h);
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = common::remove_pane_dir(&dir);
 }
 
 /// Census: every lock file probed concurrently under ONE deadline, each pane
@@ -615,7 +617,7 @@ fn pty_holder_census_classifies_every_pane_under_one_deadline() {
     );
     assert!(matches!(by["not a pane"], Probe::Unknown { .. }));
     drop((healthy, wedged, wedged2, wedged3));
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = common::remove_pane_dir(&dir);
 }
 
 /// Census without Unix-only machinery: healthy + dead, on every OS.
@@ -653,7 +655,7 @@ fn pty_holder_census_healthy_and_dead() {
     assert_eq!(rows[1].pane_id, "live");
     assert!(matches!(rows[1].probe, Probe::Healthy { .. }));
     drop(healthy);
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = common::remove_pane_dir(&dir);
 }
 
 /// D5 on Unix: the pane dir is 0700 and the socket 0600, even when the dir
@@ -671,7 +673,7 @@ fn pty_holder_unix_endpoint_and_dir_are_private() {
     assert_eq!(mode(&socket_path(&dir, &pid("p1")).unwrap()), 0o600);
     assert_eq!(mode(&dir.join("p1.lock")) & 0o077, 0);
     drop(h);
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = common::remove_pane_dir(&dir);
 }
 
 #[test]
@@ -708,7 +710,7 @@ fn pty_holder_census_skip_is_counted_not_probed() {
         other => panic!("{other:?}"),
     }
     drop(h);
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = common::remove_pane_dir(&dir);
 }
 
 /// The connection cap: past MAX_CONNECTIONS live connections a new client
@@ -738,7 +740,7 @@ fn pty_holder_connection_cap_rejects_busy() {
     }
     drop(held);
     drop(h);
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = common::remove_pane_dir(&dir);
 }
 
 /// M2: the probe deadline bounds the whole OPERATION, not each syscall. A fake
@@ -795,7 +797,7 @@ fn pty_holder_trickling_peer_cannot_stretch_the_probe_deadline() {
         took < deadline + Duration::from_millis(300),
         "probe overran its deadline: {took:?}"
     );
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = common::remove_pane_dir(&dir);
 }
 
 /// L1: a pre-existing group/other-WRITABLE pane dir is refused, not repaired.
@@ -825,7 +827,7 @@ fn pty_holder_writable_pane_dir_is_refused() {
     ));
     let err = census(&dir, Duration::from_secs(1), &[]).unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = common::remove_pane_dir(&dir);
 }
 
 /// M-1: a request that times out mid-reply POISONS the client. Without it the
@@ -900,7 +902,7 @@ fn pty_holder_client_is_poisoned_after_a_mid_frame_timeout() {
     ));
     drop(c);
     fake.join().unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = common::remove_pane_dir(&dir);
 }
 
 /// M-1: a `rejected` reply poisons too — the holder closes after sending it.
@@ -917,5 +919,5 @@ fn pty_holder_client_is_poisoned_after_a_rejection() {
     assert!(matches!(reply, Reply::Rejected { .. }), "{reply:?}");
     assert!(matches!(c.ping(soon()), Err(ConnectError::Poisoned(_))));
     drop(h);
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = common::remove_pane_dir(&dir);
 }

@@ -24,6 +24,8 @@
 //! `holder-crates (windows-latest)` CI leg. Recorded as UNRUN, never passed.
 #![cfg(windows)]
 
+mod common;
+
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -211,7 +213,7 @@ fn pty_holder_breakaway_survives_an_outer_job_that_allows_breakaway() {
     }
     assert_survived(&dir, &r);
     kill_via_protocol(&dir);
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = common::remove_pane_dir(&dir);
 }
 
 /// The WMI fallback: breakaway is refused, `Win32_Process.Create` spawns the
@@ -235,7 +237,7 @@ fn pty_holder_breakaway_wmi_fallback_survives_an_outer_job_that_forbids_breakawa
     assert!(r.ready_after < DEFAULT_REPORT_TIMEOUT);
     assert_survived(&dir, &r);
     kill_via_protocol(&dir);
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = common::remove_pane_dir(&dir);
 }
 
 /// The WMI route asked for directly, from a spawner in an outer job that
@@ -248,5 +250,5 @@ fn pty_holder_breakaway_forced_wmi_route_survives_too() {
     assert_eq!(r.route, "wmi");
     assert_survived(&dir, &r);
     kill_via_protocol(&dir);
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = common::remove_pane_dir(&dir);
 }

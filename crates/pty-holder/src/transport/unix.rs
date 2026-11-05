@@ -124,9 +124,10 @@ pub struct Listener {
 }
 
 impl Listener {
-    /// Bind at `path` and tighten it to 0600. The pane directory's 0700 is the
-    /// real barrier (nobody else can reach the path at all); the socket mode is
-    /// defence in depth for the moment between `bind` and `chmod`.
+    /// Bind at `path` and tighten it to 0600. The socket root's 0700
+    /// (`crate::pane::socket_root`) is the real barrier (nobody else can reach
+    /// the path at all); the socket mode is defence in depth for the moment
+    /// between `bind` and `chmod`.
     pub fn bind(path: &Path) -> io::Result<Listener> {
         check_path_len(path)?;
         let inner = UnixListener::bind(path)?;
