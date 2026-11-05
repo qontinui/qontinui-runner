@@ -320,6 +320,10 @@ pub(crate) fn rebind_adopted_coord_session(
 /// `SessionRegistry` before it gives the rebind up. The boot sweep starts in
 /// `setup()` well before the registry is managed, so a fast census can adopt a
 /// pane first; the wait is on the sweep's own OS thread.
+///
+/// Deliberately NOT a term of `holder_boot_sweep::RESTORE_WAIT`: it ends when
+/// `setup()` reaches `mark_runtime_ready` (right after the registry is
+/// managed), which nothing the sweep's own steps do can delay.
 const ADOPTION_REGISTRY_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Wait (bounded by `bound`, polling) until `ready` answers true. Returns
@@ -423,7 +427,28 @@ pub(crate) fn rebind_adopted_terminal(
                 coord_id,
                 Some(pane_store.clone()),
                 Some(continuation_exit),
-            )
+            );
+            // The hook is installed FIRST and the exit checked AFTER (the
+            // relay's remote-create pattern): a pane that exited before the
+            // hook was in place — during the registry wait or the resume — ran
+            // its exit with no hook, so close the row it just resumed here.
+            // An exit after the install fires the hook; both is a no-op repeat.
+            // The REAL exit is the waiter's `exit_snapshot`, never `!is_alive()`:
+            // a handoff detach (a restart landing inside this window) also
+            // clears `alive`, and closing then would retire a live process's
+            // row and drop the binding the next runner adopts it by.
+            if session.exit_snapshot().is_some() {
+                if let Err(e) = registry.close_by_id(coord_id) {
+                    warn!(
+                        terminal_id = %session.id(),
+                        coord_session = %coord_id,
+                        error = %e,
+                        "adoption: the adopted pane exited before its hook was installed — \
+                         coord session close failed"
+                    );
+                }
+                pane_store.remove_terminal(session.id());
+            }
         },
     )
 }

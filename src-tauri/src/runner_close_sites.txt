@@ -109,6 +109,7 @@ session/mod.rs | close_by_id | helper | close_by_id(
 agent_runtime.rs | run_continuation_terminal | exempt | a never-started gate-continuation pane: closes its coord registry row after the start verdict saw no session start; an External row (terminal panes register external), so it reaches no terminal
 agent_runtime.rs | run_condition_check_terminal | exempt | a never-started condition-check pane: closes its coord registry row after the start verdict saw no session start; External row — reaches no terminal
 commands/terminal.rs | close_session | exempt | `SessionRegistry`'s `CoordExitTarget` arm: the ONE coord exit hook every terminal create path installs (the operator tab, a backend-created pane, a relay remote-create pane, an adopted holder pane) closes its coord registry row once the PTY has really exited — never on a handoff detach; External row — reaches no terminal
+commands/terminal.rs | rebind_adopted_terminal | exempt | an adopted holder pane that really exited (its exit snapshot recorded) before its coord exit hook was installed: closes the coord registry row the adoption just resumed; External row — reaches no terminal
 
 # ── runner exit
 mcp/ai_session.rs | run_teardown | runner_exit | `TerminalManager::close_all` at shutdown, under the teardown budget (NC5-7)
