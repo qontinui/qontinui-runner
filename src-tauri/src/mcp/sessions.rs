@@ -808,6 +808,18 @@ pub struct FinishSessionRequest {
 /// mark answers `coord.queued: false` (`reason: "no_coord_session"`) until
 /// that id gets a coord row of its own.
 ///
+/// **The read-back observes coord** (plan
+/// `2026-11-05-finish-synced-is-stamped-on-a-2xx-that-did-not-move-session-status`,
+/// Phase 5). On a reason-less re-finish of a finished session the route reads
+/// coord's work-status row for the session and adds `coord.observed:
+/// {sessionStatus, since, coordSessionId, observedAt}` (`null` plus
+/// `coord.observedReason` when coord could not be read) and `coord.heal:
+/// {outcome}`. `session.finishSynced` is then `true` only when the stored
+/// stamp is AND coord's own row reads `finished`; unreadable, it keeps the
+/// stored value. A synced mark coord's own row contradicts (not finished,
+/// `since` before the finish) is healed in the same call — its stamp
+/// withdrawn and the finish re-queued (`coord.queued: true`).
+///
 /// [`FinishOutcome::response_json`]: crate::session::session_lifecycle_store::FinishOutcome::response_json
 async fn finish_session(
     State(state): State<Arc<ApiState>>,
@@ -824,7 +836,35 @@ async fn finish_session(
             "session lifecycle store unavailable".to_string(),
         ))?;
 
-    apply_finish(store.inner(), &id, req).map(Json)
+    let outcome = apply_finish_outcome(store.inner(), &id, req)?;
+    let mut body = outcome.response_json();
+    // The READ-BACK (a reason-less re-finish of a finished mark) observes
+    // coord: `coord.observed` is coord's own work-status row for this session,
+    // and a synced mark coord's own row contradicts is healed — its stamp
+    // withdrawn and the finish re-sent (plan
+    // 2026-11-05-finish-synced-is-stamped-on-a-2xx-that-did-not-move-session-
+    // status, Phase 5). Bounded by the work-status read's own ≈4 s worst case.
+    if is_finish_read_back(&outcome) {
+        use crate::session::finish_heal;
+        let registrar = state
+            .app_handle
+            .try_state::<Arc<crate::claude_session::coord_register::AiCoordRegistrar>>();
+        let port = registrar
+            .as_ref()
+            .map(|r| r.inner().as_ref() as &dyn finish_heal::HealPort);
+        let rb = finish_heal::read_back(store.inner(), port, &id).await;
+        finish_heal::decorate_read_back(&mut body, &rb, store.get(&id).as_ref());
+    }
+    Ok(Json(body))
+}
+
+/// Whether a finish outcome is the READ-BACK: a re-finish that wrote nothing
+/// on a session that is (still) finished.
+fn is_finish_read_back(
+    outcome: &crate::session::session_lifecycle_store::FinishOutcome,
+) -> bool {
+    use crate::session::session_lifecycle_store::FinishChange;
+    outcome.changed == FinishChange::None && outcome.record.finished_at.is_some()
 }
 
 /// The finish route's body, minus axum — pure over the store so the response
@@ -834,6 +874,15 @@ fn apply_finish(
     id: &str,
     req: FinishSessionRequest,
 ) -> Result<serde_json::Value, (StatusCode, String)> {
+    apply_finish_outcome(store, id, req).map(|o| o.response_json())
+}
+
+/// [`apply_finish`], returning the outcome itself.
+fn apply_finish_outcome(
+    store: &crate::session::session_lifecycle_store::SessionLifecycleStore,
+    id: &str,
+    req: FinishSessionRequest,
+) -> Result<crate::session::session_lifecycle_store::FinishOutcome, (StatusCode, String)> {
     let finished = req.finished.unwrap_or(true);
     let outcome = store
         .set_finished(id, finished, req.reason)
@@ -845,7 +894,7 @@ fn apply_finish(
         coord = ?outcome.coord,
         "sessions: finished marker request"
     );
-    Ok(outcome.response_json())
+    Ok(outcome)
 }
 
 /// The finish route's error status for a [`SetFinishedError`]: an unknown id
