@@ -150,9 +150,19 @@ impl Drop for ResolvedConfigDirRestore {
 /// report (layer 11) and are meant to be greppable across machines.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClaudeConfigDirSource {
-    /// A per-request account override was supplied and returned verbatim. Only
-    /// reachable through [`get_effective_config_dir_with_override`].
+    /// The caller PINNED an account ([`AccountChoice::Pinned`]) and it was
+    /// returned verbatim, with no credential check here. Only reachable through
+    /// [`get_effective_config_dir_for`].
     RequestOverride,
+    /// The spawn's OWN pick ([`AccountChoice::Picked`], the value
+    /// [`pick_best_account`](super::account_usage::pick_best_account) returned
+    /// to this spawn) re-passed the credential check. Distinct from
+    /// [`Self::LeastUsageResolved`] on purpose: that arm reads the shared
+    /// `RESOLVED_CONFIG_DIR`, which a concurrent sibling pick may have
+    /// rewritten, so a report showing `least_usage_resolved` on a spawn path
+    /// names a site that still reads the global. Only reachable through
+    /// [`get_effective_config_dir_for`].
+    PickedForThisSpawn,
     /// `LeastUsage` mode; the credential-aware picker's resolved dir won
     /// ([`get_resolved_config_dir`]).
     LeastUsageResolved,
@@ -182,6 +192,7 @@ impl ClaudeConfigDirSource {
     pub fn as_str(self) -> &'static str {
         match self {
             ClaudeConfigDirSource::RequestOverride => "request_override",
+            ClaudeConfigDirSource::PickedForThisSpawn => "picked_for_this_spawn",
             ClaudeConfigDirSource::LeastUsageResolved => "least_usage_resolved",
             ClaudeConfigDirSource::LeastUsageConfigDirFallback => "least_usage_config_dir_fallback",
             ClaudeConfigDirSource::Manual => "manual_config_dir",
@@ -267,33 +278,97 @@ pub fn get_effective_config_dir(
     }
 }
 
-/// Like [`get_effective_config_dir`], but honours an explicit per-request
-/// account override. Same `(value, source)` shape.
+/// One spawn's account, as the caller decided it — the typed carrier that keeps
+/// a PICK distinct from a PIN all the way to [`get_effective_config_dir_for`].
 ///
-/// When `override_dir` is `Some`, it is returned verbatim with
-/// [`ClaudeConfigDirSource::RequestOverride`] — the caller is responsible for
-/// validating it first (per-request account selection resolves it via
-/// [`super::account_usage::resolve_requested_account`], which restricts the
-/// choice to credential-valid roster dirs), which is exactly why the arm must
-/// name it: this is the one path that did NOT go through the credential check
-/// here, and a reader of the report has to be able to tell.
-/// When `None`, delegates to the global [`get_effective_config_dir`] resolution
-/// (unchanged default behaviour).
-pub fn get_effective_config_dir_with_override(
+/// The two are resolved differently and reported differently, which is why
+/// they cannot share a bare `Option<String>`:
+///
+/// - [`Self::Pinned`] — the caller pinned an account (a per-request
+///   `LaunchPayload::account`, already validated against the roster and its
+///   credentials by `resolve_requested_account`). Returned verbatim as
+///   [`ClaudeConfigDirSource::RequestOverride`]; it is what
+///   `SpawnPreconditions.account` records.
+/// - [`Self::Picked`] — the dir
+///   [`pick_best_account`](super::account_usage::pick_best_account) returned
+///   to THIS spawn. Re-checked for credentials and reported as
+///   [`ClaudeConfigDirSource::PickedForThisSpawn`]; it is the runner's own
+///   rotation, so it is never recorded as a pin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccountChoice {
+    Pinned(String),
+    Picked(String),
+}
+
+impl AccountChoice {
+    /// The config dir, whichever way it was chosen.
+    pub fn dir(&self) -> &str {
+        match self {
+            AccountChoice::Pinned(dir) | AccountChoice::Picked(dir) => dir,
+        }
+    }
+}
+
+/// The ONE per-spawn account resolver: [`get_effective_config_dir`]'s
+/// `(value, source)` shape, for a spawn that carries its own
+/// [`AccountChoice`] — and, crucially, one that never reads the shared
+/// `RESOLVED_CONFIG_DIR` in an auto mode.
+///
+/// - A declared model gateway wins over everything, a pin included: a pin is a
+///   subscription account, and with a gateway declared those are off.
+/// - [`AccountChoice::Pinned`] is returned verbatim with
+///   [`ClaudeConfigDirSource::RequestOverride`]. The caller validated it first,
+///   which is exactly why the arm must name it: this is the one path that did
+///   NOT go through the credential check here.
+/// - [`AccountChoice::Picked`] is re-checked with `has_valid_credentials`
+///   (the account can expire between the pick and the spawn) and yields
+///   [`ClaudeConfigDirSource::PickedForThisSpawn`], or `None` with
+///   [`ClaudeConfigDirSource::RejectedNoCredentials`].
+/// - `None` in an auto mode falls back to the configured `config_dir`
+///   ([`ClaudeConfigDirSource::LeastUsageConfigDirFallback`]) or nothing
+///   ([`ClaudeConfigDirSource::Unconfigured`]). It deliberately does NOT read
+///   the global: `pick_best_account` publishes nothing when a gateway is
+///   declared, the mode is `Manual`, no dirs are configured or no account is
+///   credential-valid, so whatever the global holds at that point is stale or
+///   a concurrent sibling's draw — never this spawn's.
+/// - `None` in `Manual` mode is [`get_effective_config_dir`]'s `Manual` arm,
+///   unchanged.
+pub fn get_effective_config_dir_for(
     cli_settings: &settings::ClaudeCliSettings,
-    override_dir: Option<&str>,
+    choice: Option<&AccountChoice>,
 ) -> (Option<String>, ClaudeConfigDirSource) {
-    // A per-request account is a subscription account; with a gateway declared
-    // those are off, so the gateway dir wins over the override as well.
     if let Some(dir) = crate::model_gateway::session_config_dir_override() {
         return (Some(dir), ClaudeConfigDirSource::ModelGateway);
     }
-    match override_dir {
-        Some(dir) => (
-            Some(dir.to_string()),
-            ClaudeConfigDirSource::RequestOverride,
-        ),
-        None => get_effective_config_dir(cli_settings),
+    let (candidate, source) = match choice {
+        Some(AccountChoice::Pinned(dir)) => {
+            return (Some(dir.clone()), ClaudeConfigDirSource::RequestOverride);
+        }
+        Some(AccountChoice::Picked(dir)) => {
+            (Some(dir.clone()), ClaudeConfigDirSource::PickedForThisSpawn)
+        }
+        // The EFFECTIVE mode, resolved off `cli_settings` exactly as
+        // `get_effective_config_dir` does, so the two cannot disagree on
+        // whether this machine is in an auto mode.
+        None => match crate::claude_accounts::resolve_for_cli_settings(cli_settings) {
+            AccountSelectionMode::LeastUsage
+            | AccountSelectionMode::HighestExpectedUsage
+            | AccountSelectionMode::WeightedRandom
+            | AccountSelectionMode::AlternatingHandoff => (
+                cli_settings.config_dir.clone(),
+                ClaudeConfigDirSource::LeastUsageConfigDirFallback,
+            ),
+            AccountSelectionMode::Manual => (
+                cli_settings.config_dir.clone(),
+                ClaudeConfigDirSource::Manual,
+            ),
+        },
+    };
+
+    match candidate {
+        Some(dir) if super::oauth_refresh::has_valid_credentials(&dir) => (Some(dir), source),
+        Some(_) => (None, ClaudeConfigDirSource::RejectedNoCredentials),
+        None => (None, ClaudeConfigDirSource::Unconfigured),
     }
 }
 
@@ -1022,12 +1097,11 @@ mod tests {
         );
     }
 
-    /// A per-request override is returned VERBATIM and names itself — it is the
-    /// one path that skips the credential check here, so a report that showed
-    /// it as `manual_config_dir` would be claiming a validation that did not
-    /// happen.
+    /// A pin is returned VERBATIM and names itself — it is the one path that
+    /// skips the credential check here, so a report that showed it as
+    /// `manual_config_dir` would be claiming a validation that did not happen.
     #[test]
-    fn effective_config_dir_override_is_verbatim_and_names_itself() {
+    fn effective_config_dir_pin_is_verbatim_and_names_itself() {
         let _fleet = crate::mcp::fleet_policy_poller::pin_account_selection_for_test(None);
         let cli = settings::ClaudeCliSettings {
             account_selection_mode: AccountSelectionMode::Manual,
@@ -1035,12 +1109,106 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            get_effective_config_dir_with_override(&cli, Some("/pinned/by/request")),
+            get_effective_config_dir_for(
+                &cli,
+                Some(&AccountChoice::Pinned("/pinned/by/request".to_string()))
+            ),
             (
                 Some("/pinned/by/request".to_string()),
                 ClaudeConfigDirSource::RequestOverride
             )
         );
+    }
+
+    /// Settings for an UNPINNED machine under the fleet auto mode the caller
+    /// pins, with `config_dir` as the manual fallback.
+    fn auto_mode_cli(config_dir: Option<String>) -> settings::ClaudeCliSettings {
+        settings::ClaudeCliSettings {
+            account_selection_mode: AccountSelectionMode::WeightedRandom,
+            account_selection_pinned: false,
+            config_dir,
+            ..Default::default()
+        }
+    }
+
+    /// **The race this resolver exists to close.** A spawn picks A; before it
+    /// resolves, a concurrent sibling's pick publishes B to
+    /// `RESOLVED_CONFIG_DIR`. Carried as `Picked(A)`, the spawn still resolves
+    /// to A — and says it took its OWN pick, not the shared one.
+    #[test]
+    fn a_sibling_pick_between_this_pick_and_resolution_does_not_move_this_spawn() {
+        let _fleet = crate::mcp::fleet_policy_poller::pin_account_selection_for_test(Some(
+            AccountSelectionMode::WeightedRandom,
+        ));
+        let (_mine_guard, mine) = dir_with_live_credentials();
+        let (_sibling_guard, sibling) = dir_with_live_credentials();
+        let _restore = ResolvedConfigDirRestore::capture();
+
+        // This spawn's pick, published as `pick_best_account` publishes it …
+        set_resolved_config_dir(Some(mine.clone()));
+        let choice = AccountChoice::Picked(mine.clone());
+        // … then a sibling's draw overwrites the global.
+        set_resolved_config_dir(Some(sibling.clone()));
+
+        assert_eq!(
+            get_effective_config_dir_for(&auto_mode_cli(None), Some(&choice)),
+            (Some(mine), ClaudeConfigDirSource::PickedForThisSpawn)
+        );
+        assert_eq!(get_resolved_config_dir(), Some(sibling));
+    }
+
+    /// A pick is re-checked: an account whose credentials died between the
+    /// pick and the spawn yields no dir rather than a 401-zombie child — unlike
+    /// a pin, which the caller validated and which is returned verbatim.
+    #[test]
+    fn a_pick_without_live_credentials_is_rejected() {
+        let _fleet = crate::mcp::fleet_policy_poller::pin_account_selection_for_test(Some(
+            AccountSelectionMode::WeightedRandom,
+        ));
+        let dead = "/qontinui-test/no-such-account-dir/picked_for_this_spawn".to_string();
+        assert_eq!(
+            get_effective_config_dir_for(&auto_mode_cli(None), Some(&AccountChoice::Picked(dead))),
+            (None, ClaudeConfigDirSource::RejectedNoCredentials)
+        );
+    }
+
+    /// With NO choice in an auto mode the resolver never reads the shared
+    /// `RESOLVED_CONFIG_DIR`, even when it holds a live account: whatever it
+    /// holds is a sibling's draw or stale, never this spawn's. It falls back to
+    /// the configured `config_dir`, else to nothing.
+    #[test]
+    fn no_choice_in_an_auto_mode_never_takes_the_global() {
+        let _fleet = crate::mcp::fleet_policy_poller::pin_account_selection_for_test(Some(
+            AccountSelectionMode::WeightedRandom,
+        ));
+        let (_manual_guard, manual) = dir_with_live_credentials();
+        let (_global_guard, global) = dir_with_live_credentials();
+        let _restore = ResolvedConfigDirRestore::capture();
+        set_resolved_config_dir(Some(global.clone()));
+
+        assert_eq!(
+            get_effective_config_dir_for(&auto_mode_cli(Some(manual.clone())), None),
+            (
+                Some(manual),
+                ClaudeConfigDirSource::LeastUsageConfigDirFallback
+            )
+        );
+        assert_eq!(
+            get_effective_config_dir_for(&auto_mode_cli(None), None),
+            (None, ClaudeConfigDirSource::Unconfigured)
+        );
+        // The global-reading resolver WOULD have taken it — the contrast is the
+        // point of the test, and proves the fixture really is an auto mode.
+        assert_eq!(
+            get_effective_config_dir(&auto_mode_cli(None)),
+            (Some(global), ClaudeConfigDirSource::LeastUsageResolved)
+        );
+    }
+
+    #[test]
+    fn account_choice_dir_names_the_dir_either_way() {
+        assert_eq!(AccountChoice::Pinned("/p".to_string()).dir(), "/p");
+        assert_eq!(AccountChoice::Picked("/q".to_string()).dir(), "/q");
     }
 
     /// The arm vocabulary is a WIRE contract (it is printed verbatim in
@@ -1051,6 +1219,10 @@ mod tests {
         assert_eq!(
             ClaudeConfigDirSource::RequestOverride.as_str(),
             "request_override"
+        );
+        assert_eq!(
+            ClaudeConfigDirSource::PickedForThisSpawn.as_str(),
+            "picked_for_this_spawn"
         );
         assert_eq!(
             ClaudeConfigDirSource::LeastUsageResolved.as_str(),
@@ -1066,6 +1238,10 @@ mod tests {
             "rejected_no_credentials"
         );
         assert_eq!(ClaudeConfigDirSource::Unconfigured.as_str(), "unconfigured");
+        assert_eq!(
+            ClaudeConfigDirSource::ModelGateway.as_str(),
+            "model_gateway"
+        );
     }
 
     #[test]
