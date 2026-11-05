@@ -1,10 +1,11 @@
 //! Tests of the account hold: the table ([`decide_hold_action`]) row by row, the
 //! wire parsing, the memory's answer handling, and the tick driven against a fake
-//! coord over HTTP — the arming test enters through [`account_hold_tick`], the
-//! tick body `run_account_hold_loop` runs on every interval. The loop around it
-//! (the boot-read wait, the ticker, the per-tick timeout) and the `main.rs`
-//! spawn are not driven here; the spawn is pinned by `worker_supervisor`'s
-//! source-text test.
+//! coord over HTTP. The arming test drives the loop itself,
+//! [`run_account_hold_loop`] (boot-read wait, ticker, per-tick timeout); the
+//! other over_http tests call its tick body [`account_hold_tick`] directly. The
+//! `main.rs` spawn is not run here; it is pinned by `worker_supervisor`'s
+//! source-text test. The fake coord does not check `Authorization`, so the
+//! bearer choice is not covered.
 
 use super::*;
 use chrono::TimeZone;
@@ -962,9 +963,8 @@ mod over_http {
     /// tick and not before, writes nothing on a repeat, and POSTs a release on
     /// its first ready tick — entered through [`account_hold_tick`], the tick
     /// body `run_account_hold_loop` runs on every interval, against coord over
-    /// HTTP. The loop itself and the spawn are not driven (see the module doc),
-    /// and the fake does not check `Authorization`, so the bearer choice is not
-    /// covered here.
+    /// HTTP, one tick at a time. The loop around the tick is driven by
+    /// `the_account_hold_loop_holds_a_lane_with_no_account_and_releases_it_on_login`.
     #[tokio::test]
     #[cfg_attr(
         target_os = "macos",
@@ -1049,9 +1049,14 @@ mod over_http {
         let runner = NoAccountRunner::arrange(&base).await;
         let ticks = Arc::new(AtomicU32::new(0));
         let counted = ticks.clone();
-        let looped = run_account_hold_loop(Duration::from_millis(100), primary_env(), move || {
-            counted.fetch_add(1, Ordering::SeqCst);
-        });
+        let looped = run_account_hold_loop(
+            Duration::from_millis(100),
+            Duration::from_millis(200),
+            primary_env(),
+            move || {
+                counted.fetch_add(1, Ordering::SeqCst);
+            },
+        );
         let watched = async {
             let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
             while lock(&coord).holds.is_empty() {
@@ -1086,6 +1091,32 @@ mod over_http {
             () = looped => unreachable!("the account-hold loop never returns"),
             () = watched => {}
         }
+    }
+
+    /// A release whose answer was lost landed anyway: once a ready tick reads the
+    /// lane with no own hold, the record is dropped, so a later not-ready spell
+    /// holds again instead of reading as an operator undrain.
+    #[tokio::test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "the default-location check reads the real login Keychain on macOS"
+    )]
+    async fn a_ready_tick_on_a_lane_with_no_own_hold_drops_the_record() {
+        let (base, coord) = start_fake_coord().await;
+        let runner = NoAccountRunner::arrange(&base).await;
+        runner.log_in();
+        // The own hold's release landed, but this process never saw the answer.
+        let mut mem = HoldMemory {
+            recorded: Some(RecordedHold {
+                until: Utc::now() + chrono::Duration::hours(20),
+                tenant_id: None,
+            }),
+            ..Default::default()
+        };
+        let env = primary_env();
+        account_hold_tick(&mut mem, &env).await;
+        assert_eq!(mem.recorded, None, "nothing is left to release");
+        assert!(lock(&coord).holds.is_empty());
     }
 
     /// A runner that boots into its own hold (left by the previous run) and is

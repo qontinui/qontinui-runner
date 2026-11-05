@@ -1148,16 +1148,17 @@ fn device_client() -> Result<reqwest::Client, String> {
         .map_err(|e| format!("reqwest builder: {e}"))
 }
 
-/// The ONE device-JWT seam for this module's coord calls: the drain read, and
-/// the account hold's self-hold and release (plan
+/// The device-JWT seam for this module's `me/drain` read, the heartbeat's and the
+/// account hold's alike. The account hold's writes (plan
 /// `2026-11-03-a-runner-with-no-logged-in-claude-account-keeps-an-open-agent-lane-so-coord-burns-spawns-on-it`,
-/// Phase 3), which act on the same drain row the read returns.
+/// Phase 3) go through [`post_device_json`] instead, under the heartbeat's
+/// bearer scope.
 fn device_request(
     client: &reqwest::Client,
     method: reqwest::Method,
     url: &str,
 ) -> reqwest::RequestBuilder {
-    // coord-tenant-scope(device): only the `me/drain` READ is sent through here; it answers for the device the JWT was minted for and carries no tenant to set. The self-hold WRITES name their tenant (`post_device_json`).
+    // coord-tenant-scope(device): only the `me/drain` READ is sent through here; it answers for the device the JWT was minted for and carries no tenant to set. The self-hold writes go through `post_device_json` under the heartbeat's bearer scope instead.
     crate::auth::attach_device_auth(client.request(method, url))
 }
 
@@ -1209,6 +1210,12 @@ async fn send_device_json(
 /// the hold lands in the tenant the heartbeat reports the lane under, and a
 /// device whose legacy slot is dead still sends a live per-tenant token. With
 /// no binding set resolvable the default binding is the only choice left.
+///
+/// Limit: the `me/drain` read the account hold makes before every write still
+/// goes out under the default binding ([`device_request`]), so on a device whose
+/// legacy slot is dead the read fails and no write is reached. That read is
+/// shared with the heartbeat and pinned by `tests/coord_auth_pin.rs`; moving it
+/// is its own change.
 pub(crate) async fn post_device_json(
     base: &str,
     path: &str,

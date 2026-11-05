@@ -179,11 +179,20 @@ pub(crate) struct RecordedHold {
 
 /// What the loop remembers between ticks. Process memory only: it resets at
 /// boot, which coord's door doc allows (a hold is a record, not an intent).
+///
+/// Two accepted limits follow from that. An operator undrain made while the
+/// runner is DOWN is invisible to the next process: it reads a clear lane and
+/// holds again once two ticks read no account. And an operator drain that
+/// REPLACED the own hold and then expired before the own `until` reads as an
+/// undrain of the own hold, so the lane stays open until that `until`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct HoldMemory {
     /// Consecutive not-ready readings.
     pub not_ready_streak: u32,
-    /// The last hold coord accepted from this process.
+    /// The own hold this process knows to be on the lane: one coord accepted
+    /// from it, or one it read back from the lane (the previous run's, or one
+    /// whose 200 was lost). Cleared once a ready tick reads the lane with no own
+    /// hold on it.
     pub recorded: Option<RecordedHold>,
     /// A 409 answered a write decided against this lane; no write until the
     /// lane reads differently.
@@ -828,6 +837,17 @@ pub(crate) async fn account_hold_tick(mem: &mut HoldMemory, env: &HoldEnv) -> Ho
     if mem.recorded.is_some_and(|r| r.until <= now) {
         mem.recorded = None;
     }
+    // The heartbeat's cached drain may already show the own hold (a hold whose
+    // 200 was lost, read back by the heartbeat before this tick): record it too,
+    // so an undrain that follows is not taken for a lane to hold.
+    if let CoordDrainState::Drained { until, reason } = &cached {
+        if is_own_reason(reason.as_deref()) {
+            mem.note_lane(&LaneView::Drained {
+                until: *until,
+                reason: reason.clone(),
+            });
+        }
+    }
     inputs.ready = read_readiness(env).await;
     let Some(ready) = inputs.ready else {
         return HoldAction::Nothing(Idle::ReadinessUnread);
@@ -870,6 +890,13 @@ pub(crate) async fn account_hold_tick(mem: &mut HoldMemory, env: &HoldEnv) -> Ho
     };
     if let Some(lane) = &lane {
         mem.note_lane(lane);
+        // Ready, and the lane carries no own hold: nothing is left to release
+        // (a release whose answer was lost landed anyway), and the next
+        // not-ready spell is a new one, not an operator undrain.
+        if ready && lane.own_until().is_none() {
+            mem.recorded = None;
+            mem.release_left_to = None;
+        }
     }
 
     let action = decide_hold_action(mem, &inputs);
@@ -1033,9 +1060,15 @@ async fn write_release(
     }
 }
 
-/// The loop body: wait for the boot drain read, then tick on `interval`.
-async fn run_account_hold_loop(interval: Duration, env: HoldEnv, on_tick: impl Fn()) {
-    crate::coord_drain_state::await_boot_read(BOOT_READ_WAIT).await;
+/// The loop body: wait up to `boot_wait` for the boot drain read, then tick on
+/// `interval`.
+async fn run_account_hold_loop(
+    interval: Duration,
+    boot_wait: Duration,
+    env: HoldEnv,
+    on_tick: impl Fn(),
+) {
+    crate::coord_drain_state::await_boot_read(boot_wait).await;
     let limit = super::heartbeat_loop::tick_timeout(interval);
     let mut mem = HoldMemory::default();
     let mut ticker = tokio::time::interval(interval);
@@ -1068,7 +1101,10 @@ pub fn spawn_claude_account_hold() {
     crate::worker_supervisor::spawn_supervised_with_heartbeat(
         "fleet.claude_account_hold",
         move |hb| async move {
-            run_account_hold_loop(interval, HoldEnv::production(), move || hb.tick()).await;
+            run_account_hold_loop(interval, BOOT_READ_WAIT, HoldEnv::production(), move || {
+                hb.tick()
+            })
+            .await;
         },
     );
 }
