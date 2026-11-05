@@ -117,6 +117,7 @@ async fn wait_for_hits(coord: &ScriptedCoord, prefix: &str, n: usize) -> usize {
 
 #[tokio::test]
 async fn a_failing_then_succeeding_claim_is_retried_and_the_acquire_proceeds() {
+    let _amb = super::test_coord::isolate();
     let coord = ScriptedCoord::start(vec![
         (CLAIMS, vec![(503, "{}".to_string()), claimed()]),
         (ALLOCATE, vec![wait_answer()]),
@@ -139,6 +140,7 @@ async fn a_failing_then_succeeding_claim_is_retried_and_the_acquire_proceeds() {
 
 #[tokio::test]
 async fn a_zero_budget_makes_one_attempt_as_before() {
+    let _amb = super::test_coord::isolate();
     let coord = ScriptedCoord::start(vec![
         (CLAIMS, vec![(503, "{}".to_string()), claimed()]),
         (ALLOCATE, vec![wait_answer()]),
@@ -166,6 +168,7 @@ async fn a_zero_budget_makes_one_attempt_as_before() {
 
 #[tokio::test]
 async fn a_failing_allocate_is_retried_and_keeps_its_claim_until_final() {
+    let _amb = super::test_coord::isolate();
     let coord = ScriptedCoord::start(vec![
         (CLAIMS, vec![claimed()]),
         (
@@ -193,6 +196,7 @@ async fn a_failing_allocate_is_retried_and_keeps_its_claim_until_final() {
 
 #[tokio::test]
 async fn an_exhausted_budget_still_releases_the_claims_already_held() {
+    let _amb = super::test_coord::isolate();
     let coord = ScriptedCoord::start(vec![
         (CLAIMS, vec![claimed()]),
         (ALLOCATE, vec![(502, "bad gateway".to_string())]),
@@ -221,6 +225,7 @@ async fn an_exhausted_budget_still_releases_the_claims_already_held() {
 
 #[tokio::test]
 async fn final_answers_are_never_retried() {
+    let _amb = super::test_coord::isolate();
     // A held claim before the allocate.
     let coord = ScriptedCoord::start(vec![(
         CLAIMS,
@@ -293,6 +298,7 @@ async fn final_answers_are_never_retried() {
 
 #[tokio::test]
 async fn a_post_allocate_unwind_retires_coords_rows_and_keeps_its_error() {
+    let _amb = super::test_coord::isolate();
     let coord = ScriptedCoord::start(vec![
         (ALLOCATE, vec![shared_branch_answer()]),
         (
@@ -324,6 +330,7 @@ async fn a_post_allocate_unwind_retires_coords_rows_and_keeps_its_error() {
 
 #[tokio::test]
 async fn a_post_allocate_claim_conflict_retires() {
+    let _amb = super::test_coord::isolate();
     let coord = ScriptedCoord::start(vec![
         (ALLOCATE, vec![shared_branch_answer()]),
         (
@@ -351,6 +358,7 @@ async fn a_post_allocate_claim_conflict_retires() {
 
 #[tokio::test]
 async fn a_refused_or_failing_retire_never_changes_the_returned_error() {
+    let _amb = super::test_coord::isolate();
     for done in [
         (
             200,
