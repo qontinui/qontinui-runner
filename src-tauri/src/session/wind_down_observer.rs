@@ -541,10 +541,10 @@ pub const CUSTODY_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 /// once per arm pass and shared by every candidate in it.
 pub type OwnershipRead = Result<CoordOwnership, String>;
 
-/// Read coord's attributed-worktree index for every live session —
-/// `custody::coord::fetch_live_ownership`, which is complete or `Err`, never
-/// a silently short page (its docs say why the plain survey read is not) —
-/// with the liveness of `claude_session_ids`' coord rows read after it.
+/// Read coord's attributed-worktree index for exactly `claude_session_ids` —
+/// `custody::coord::fetch_live_ownership`, coord's keyed one-snapshot read,
+/// which is complete or `Err` and records every id it did not answer as
+/// UNKNOWN.
 pub async fn fetch_ownership(claude_session_ids: &[String]) -> OwnershipRead {
     custody::coord::fetch_live_ownership(claude_session_ids).await
 }
@@ -555,9 +555,6 @@ pub struct SessionCustodyContext {
     /// The lifecycle record's `working_dir`, else the process cwd (which is
     /// `None` on Windows — `tracking_health` reads it from `/proc`).
     pub session_dir: Option<PathBuf>,
-    /// The `coord.sessions.id` the pane registered under — the key
-    /// `/coord/sessions/worktrees` lists allocations by.
-    pub coord_session_id: Option<String>,
     /// The parked isolated-edit context's materialized worktrees; `Err` when
     /// the context's slot could not be read (a poisoned lock), which must not
     /// read as "no isolated worktrees".
@@ -591,10 +588,6 @@ pub fn custody_context(
         .and_then(|m| m.get(terminal_id));
     SessionCustodyContext {
         session_dir,
-        coord_session_id: pane
-            .as_ref()
-            .and_then(|s| s.coord_session_id())
-            .map(|id| id.to_string()),
         // A pane that is gone parks no context at all.
         isolated_worktrees: pane.map_or(Ok(Vec::new()), |s| s.isolated_edit_worktree_paths()),
     }
@@ -628,50 +621,34 @@ pub struct AttributedWorktree {
 /// PURE: the worktrees coord attributes to the session, as absolute paths.
 ///
 /// `Err` — which the gate reads as `Unknown` — when the index could not be
-/// read, when no coord session is known for the Claude session (neither the
-/// work-status reads nor the pane name one — its allocations cannot be looked
-/// up at all), when that session is not POSITIVELY known live (a
-/// session coord closed, or one that moved between states while the pages
-/// were read, is on no live page although its rows may exist — so its absence
-/// is not "no worktrees"; see `custody::coord::fetch_live_ownership`), or
-/// when a ledger path is relative
-/// and no workspace root resolves to anchor it.
+/// read, when coord's keyed read did not answer `claude_session_id` (it was
+/// `unknown`, `invalid`, cut by `inputTruncated`, or had no entry of its
+/// own), or when a ledger path is relative and no workspace root resolves to
+/// anchor it.
 ///
-/// The coord session is the one coord's own work-status reads agreed answers
-/// for `claude_session_id` — the row the route attributes that Claude
-/// session's ledger rows to. The pane's own coord id is only a fallback: a
-/// plain terminal the runner never bound carries none, yet coord can still
-/// hold a row (and worktrees) for its Claude session.
+/// The Claude session resolves ONLY through its own keyed entry
+/// (`claudeCodeSessionId → sessionId`). There is deliberately no fallback to
+/// the pane's own coord id: a pane id that differs from the row coord files
+/// the Claude session's worktrees under would look up a row holding none of
+/// them and read `[]` — a false Clean.
 pub fn attributed_worktrees(
     ownership: &OwnershipRead,
     claude_session_id: &str,
-    pane_coord_session_id: Option<&str>,
     workspace_root: Option<&Path>,
 ) -> Result<Vec<AttributedWorktree>, String> {
     let index = ownership.as_ref().map_err(String::clone)?;
-    // The agreed row owns the Claude session's ledger rows; but when it is
-    // not known live and the pane's own row is, the pane's row is the one a
-    // live page listed them under, so prefer it rather than read Unknown.
-    let agreed = index.coord_session_for_claude(claude_session_id);
-    let resolved = match (agreed, pane_coord_session_id) {
-        (Some(agreed), Some(pane)) if !index.is_known_live(agreed) && index.is_known_live(pane) => {
-            Some(pane)
-        }
-        (agreed, pane) => agreed.or(pane),
-    };
-    let Some(session_id) = resolved else {
-        return Err(
-            "no coord session is known for this Claude session (coord's work-status reads did not \
-             agree on one and the pane carries none), so its worktree allocations cannot be looked up"
-                .to_string(),
-        );
-    };
-    if !index.is_known_live(session_id) {
+    if let Some(why) = index.unanswered_reason(claude_session_id) {
         return Err(format!(
-            "coord session {session_id} not on any live page (closed or unknown), so the \
-             worktrees allocated to it cannot be read"
+            "coord's keyed worktree read did not answer Claude session {claude_session_id} \
+             ({why}), so its worktree allocations cannot be read"
         ));
     }
+    let Some(session_id) = index.coord_session_for_claude(claude_session_id) else {
+        return Err(format!(
+            "coord's keyed worktree read carries no entry for Claude session \
+             {claude_session_id}, so its worktree allocations cannot be read"
+        ));
+    };
     index
         .worktrees_for_session(session_id)
         .into_iter()
@@ -1228,7 +1205,6 @@ mod tests {
     fn context(dir: Option<&str>, isolated: &[&str]) -> SessionCustodyContext {
         SessionCustodyContext {
             session_dir: dir.map(PathBuf::from),
-            coord_session_id: Some("c-1".to_string()),
             isolated_worktrees: Ok(isolated.iter().map(PathBuf::from).collect()),
         }
     }
@@ -1452,25 +1428,43 @@ mod tests {
         assert_eq!(session_dir_from(None, None), None);
     }
 
-    /// An index read from `json`, with `live` marked positively live.
-    fn ownership(json: &str, live: &[&str]) -> OwnershipRead {
-        let mut index = CoordOwnership::from_response(serde_json::from_str(json).unwrap());
-        index.mark_live(live.iter().copied());
-        Ok(index)
+    /// coord's keyed answer for `asked`: `sessions` is the raw `sessions[]`
+    /// JSON array, every asked id is echoed, and `unknown` lists the ids coord
+    /// resolved to no session row.
+    fn keyed_ownership(asked: &[&str], sessions: &str, unknown: &[&str]) -> OwnershipRead {
+        let echo: Vec<String> = asked.iter().map(|s| format!("\"{s}\"")).collect();
+        let unknown: Vec<String> = unknown
+            .iter()
+            .map(|s| format!(r#"{{"claudeCodeSessionId":"{s}","worktrees":[]}}"#))
+            .collect();
+        let json = format!(
+            r#"{{"sessionBridgeColumnPresent":true,"inputTruncated":false,"invalid":[],
+                "claudeCodeSessionIds":[{}],"unknown":[{}],"sessions":{sessions}}}"#,
+            echo.join(","),
+            unknown.join(",")
+        );
+        custody::coord::ownership_from_keyed(vec![(
+            asked.iter().map(|s| s.to_string()).collect(),
+            serde_json::from_str(&json).unwrap(),
+        )])
     }
 
     #[test]
     fn attributed_worktrees_are_anchored_on_the_workspace_root() {
-        let own = ownership(
-            r#"{"sessions":[{"sessionId":"c-1","ownerSessionState":"active","worktrees":[
+        let own = keyed_ownership(
+            &["claude-x", "claude-empty"],
+            r#"[{"sessionId":"c-1","claudeCodeSessionId":"claude-x","ownerSessionState":"active",
+                "worktrees":[
                 {"worktreePath":"agent-worktrees/a/repo","repo":"repo","ledgerStatus":"active"},
                 {"worktreePath":"/abs/wt","repo":"repo2","ledgerStatus":"merged"},
                 {"worktreePath":"/abs/old","repo":"repo3","ledgerStatus":"abandoned"},
-                {"worktreePath":"/abs/new","repo":"repo4"}]}]}"#,
-            &["c-1", "c-other"],
+                {"worktreePath":"/abs/new","repo":"repo4"}]},
+               {"sessionId":"c-other","claudeCodeSessionId":"claude-empty",
+                "ownerSessionState":"closed","worktrees":[]}]"#,
+            &[],
         );
         assert_eq!(
-            attributed_worktrees(&own, "claude-x", Some("c-1"), Some(Path::new("/ws"))).unwrap(),
+            attributed_worktrees(&own, "claude-x", Some(Path::new("/ws"))).unwrap(),
             vec![
                 live("/ws/agent-worktrees/a/repo"),
                 AttributedWorktree {
@@ -1485,109 +1479,88 @@ mod tests {
                 live("/abs/new"),
             ]
         );
+        let err = attributed_worktrees(&own, "claude-x", None).unwrap_err();
         assert!(
-            attributed_worktrees(&own, "claude-x", Some("c-1"), None).is_err(),
-            "a relative ledger path with no root to anchor it is not guessed"
+            err.contains("is relative") && err.contains("workspace root"),
+            "a relative ledger path with no root to anchor it is not guessed: {err}"
         );
         assert_eq!(
-            attributed_worktrees(&own, "claude-x", Some("c-other"), None).unwrap(),
+            attributed_worktrees(&own, "CLAUDE-X", Some(Path::new("/ws")))
+                .unwrap()
+                .len(),
+            4,
+            "the Claude session id matches case-insensitively"
+        );
+        assert_eq!(
+            attributed_worktrees(&own, "claude-empty", None).unwrap(),
             Vec::<AttributedWorktree>::new(),
-            "a session positively known live that holds no rows has nothing attributed"
+            "an entry of its own with `worktrees: []` is positively empty, whatever its state"
         );
     }
 
-    /// Round-2 CRITICAL 1: a pane whose coord session is on NO validated live
-    /// page and not otherwise known live — coord auto-closed it — is Unknown,
-    /// never "nothing attributed". Its rows (a dirty sibling, say) may exist.
+    /// The pane-id fallback is gone: coord's keyed read answers the Claude
+    /// session `unknown` while the pane's own (differing) coord id names a
+    /// row holding nothing. Under the old fallback that read `[]` — a false
+    /// Clean. Now it is Unknown, end to end.
     #[tokio::test]
-    async fn a_coord_session_absent_from_every_live_page_is_unknown() {
-        let own = ownership(
-            r#"{"sessions":[{"sessionId":"c-live","worktrees":[{"worktreePath":"/abs/a"}]}]}"#,
-            &["c-live"],
+    async fn a_differing_pane_coord_id_never_reads_clean() {
+        let own = keyed_ownership(
+            &["claude-x", "claude-y"],
+            r#"[{"sessionId":"c-pane","claudeCodeSessionId":"claude-y","worktrees":[]}]"#,
+            &["claude-x"],
         );
-        let err = attributed_worktrees(
-            &own,
-            "claude-x",
-            Some("c-autoclosed"),
-            Some(Path::new("/ws")),
-        )
-        .unwrap_err();
-        assert!(err.contains("not on any live page"), "{err}");
+        let err = attributed_worktrees(&own, "claude-x", Some(Path::new("/ws"))).unwrap_err();
+        assert!(err.contains("`unknown`"), "{err}");
         let inputs = gather_custody(
             &FakeProbe::default().root("/ws/wt/a", "/ws/wt/a"),
             &context(Some("/ws/wt/a"), &[]),
-            attributed_worktrees(
-                &own,
-                "claude-x",
-                Some("c-autoclosed"),
-                Some(Path::new("/ws")),
-            ),
+            attributed_worktrees(&own, "claude-x", Some(Path::new("/ws"))),
             "s",
         )
         .await;
         assert_eq!(custody_gate(&inputs).reason(), Some("ownership_unreadable"));
     }
 
-    /// Phase 2 (temp runner, 2026-10-04): a plain runner terminal running
-    /// `claude` carries no coord id on its pane, yet coord holds a row for its
-    /// Claude session. The work-status reads' agreed row is the lookup key, and
-    /// it wins over a pane id that names a different (older) row.
-    #[test]
-    fn the_coord_row_work_status_agreed_on_is_used_when_the_pane_has_none() {
-        let mut index = CoordOwnership::from_response(
-            serde_json::from_str(
-                r#"{"sessions":[{"sessionId":"c-row","worktrees":[{"worktreePath":"/abs/sib"}]}]}"#,
-            )
-            .unwrap(),
+    /// The positive mirror: the Claude session's OWN entry (`c-real`, holding
+    /// a dirty worktree) answers it, never another entry that holds nothing
+    /// (`c-pane`, the id a pane might carry). Custody reads the dirt.
+    #[tokio::test]
+    async fn a_session_resolves_through_its_own_entry_not_an_empty_one() {
+        let own = keyed_ownership(
+            &["claude-x", "claude-y"],
+            r#"[{"sessionId":"c-real","claudeCodeSessionId":"claude-x",
+                 "worktrees":[{"worktreePath":"/ws/wt/dirty","repo":"r"}]},
+                {"sessionId":"c-pane","claudeCodeSessionId":"claude-y","worktrees":[]}]"#,
+            &[],
         );
-        index.mark_live(["c-row"]);
-        index.record_coord_rows([("CLAUDE-X".to_string(), "c-row".to_string())]);
-        let own: OwnershipRead = Ok(index);
-        assert_eq!(
-            attributed_worktrees(&own, "claude-x", None, Some(Path::new("/ws"))).unwrap(),
-            vec![live("/abs/sib")],
-            "the pane has no coord id, but coord's agreed row still finds the sibling"
-        );
-        assert_eq!(
-            attributed_worktrees(&own, "claude-x", Some("c-older"), Some(Path::new("/ws")))
-                .unwrap(),
-            vec![live("/abs/sib")],
-            "the agreed row, not the pane's older one, owns the Claude session's rows"
-        );
-        assert!(
-            attributed_worktrees(&own, "claude-other", None, Some(Path::new("/ws"))).is_err(),
-            "no agreed row and no pane id stays Unknown"
-        );
-
-        // The agreed (newest) row is closed while the pane's own row is live
-        // and holds the rows: the pane's row is used.
-        let mut index = CoordOwnership::from_response(
-            serde_json::from_str(
-                r#"{"sessions":[{"sessionId":"c-pane","worktrees":[{"worktreePath":"/abs/p"}]}]}"#,
-            )
-            .unwrap(),
-        );
-        index.mark_live(["c-pane"]);
-        index.record_coord_rows([("claude-y".to_string(), "c-closed".to_string())]);
-        let own: OwnershipRead = Ok(index);
-        assert_eq!(
-            attributed_worktrees(&own, "claude-y", Some("c-pane"), Some(Path::new("/ws"))).unwrap(),
-            vec![live("/abs/p")],
-            "a live pane row wins over a closed agreed row"
-        );
-        assert!(
-            attributed_worktrees(&own, "claude-y", None, Some(Path::new("/ws"))).is_err(),
-            "a closed agreed row with no live pane row stays Unknown"
-        );
+        let attributed = attributed_worktrees(&own, "claude-x", Some(Path::new("/ws")));
+        assert_eq!(attributed, Ok(vec![live("/ws/wt/dirty")]));
+        let probe = FakeProbe::default()
+            .root("/ws/wt/a", "/ws/wt/a")
+            .root("/ws/wt/dirty", "/ws/wt/dirty")
+            .state(
+                "/ws/wt/dirty",
+                MemberState::Probed {
+                    dirty: true,
+                    ahead: 0,
+                },
+            );
+        let inputs = gather_custody(&probe, &context(Some("/ws/wt/a"), &[]), attributed, "s").await;
+        assert_eq!(custody_gate(&inputs).as_str(), "dirty");
     }
 
     #[test]
-    fn attributed_worktrees_fail_closed_without_a_read_or_a_coord_id() {
-        let own = ownership(r#"{"sessions":[]}"#, &["c-1"]);
-        assert!(attributed_worktrees(&own, "claude-x", None, Some(Path::new("/ws"))).is_err());
+    fn attributed_worktrees_fail_closed_without_a_read_or_an_entry() {
+        let own = keyed_ownership(&[], "[]", &[]);
+        let err = attributed_worktrees(&own, "claude-x", Some(Path::new("/ws"))).unwrap_err();
+        assert!(err.contains("no entry"), "{err}");
+        assert!(
+            attributed_worktrees(&Ok(CoordOwnership::default()), "claude-x", None).is_err(),
+            "an index that answered nothing answers nothing"
+        );
         let failed: OwnershipRead = Err("coord returned 503".to_string());
         assert_eq!(
-            attributed_worktrees(&failed, "claude-x", Some("c-1"), Some(Path::new("/ws"))),
+            attributed_worktrees(&failed, "claude-x", Some(Path::new("/ws"))),
             Err("coord returned 503".to_string())
         );
     }
