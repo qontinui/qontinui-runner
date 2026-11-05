@@ -561,8 +561,9 @@ pub fn terminal_set_page(
     terminal_id: String,
     page_id: String,
 ) -> Result<CommandResponse, String> {
-    require_page_id(&page_id)?;
-    terminal_manager.set_page(&terminal_id, page_id, &app_handle)?;
+    route_set_page(page_id, |page_id| {
+        terminal_manager.set_page(&terminal_id, page_id, &app_handle)
+    })?;
     Ok(CommandResponse {
         success: true,
         message: None,
@@ -570,14 +571,17 @@ pub fn terminal_set_page(
     })
 }
 
-/// The one refusal [`terminal_set_page`] makes before it reaches the manager:
-/// a page id must name a page, so an empty one is refused rather than parking
-/// the terminal on a page no tab renders. PURE.
-fn require_page_id(page_id: &str) -> Result<(), String> {
+/// [`terminal_set_page`]'s routing: refuse an empty page id — it names no page,
+/// and a terminal parked there renders on no tab — and otherwise hand the id to
+/// `set`. `set` is never called for a refused id.
+fn route_set_page(
+    page_id: String,
+    set: impl FnOnce(String) -> Result<(), String>,
+) -> Result<(), String> {
     if page_id.is_empty() {
         return Err("pageId is required and must be non-empty".to_string());
     }
-    Ok(())
+    set(page_id)
 }
 
 /// Resize a terminal's PTY dimensions.
@@ -3321,13 +3325,30 @@ mod tests {
     use std::time::Duration;
 
     /// `terminal_set_page` refuses an empty page id before it reaches the
-    /// manager, as its HTTP twin answers 400 for one; any real id passes.
+    /// manager, as its HTTP twin answers 400 for one; a real id is handed on.
     #[test]
     fn set_page_refuses_an_empty_page_id() {
-        let refused = require_page_id("").expect_err("an empty page id must be refused");
+        let mut reached = Vec::new();
+        let refused = route_set_page(String::new(), |id| {
+            reached.push(id);
+            Ok(())
+        })
+        .expect_err("an empty page id must be refused");
         assert!(refused.contains("pageId"), "{refused}");
-        assert!(require_page_id("default").is_ok());
-        assert!(require_page_id("6f1c9a2e-0b7d-4e55-9a3f-1d2c3b4a5e6f").is_ok());
+        assert!(reached.is_empty(), "the manager must not see a refused id");
+
+        route_set_page("default".to_string(), |id| {
+            reached.push(id);
+            Ok(())
+        })
+        .expect("a real page id is routed");
+        assert_eq!(reached, vec!["default".to_string()]);
+
+        // The manager's own refusal (an unknown terminal) comes back as is.
+        let unknown = route_set_page("p".to_string(), |_| {
+            Err("Terminal session not found: t".into())
+        });
+        assert_eq!(unknown, Err("Terminal session not found: t".to_string()));
     }
 
     fn pane(image: Option<&str>, descendants: usize, claude: &[u32]) -> PaneProcesses {
