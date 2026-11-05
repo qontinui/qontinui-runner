@@ -49,7 +49,7 @@ use crate::client::{census, Probe};
 use crate::lock::{read_record, LockRecord, PaneLock, TryLock};
 use crate::pane::{
     check_private_dir, lock_path, orphan_path, report_path, report_tmp_path, scrollback_tmp_path,
-    socket_path, spec_path, PaneId,
+    spec_path, PaneId,
 };
 use crate::protocol::HelloAck;
 use crate::reap::{reap_orphans_of_dead_holder, ReapReport};
@@ -535,9 +535,7 @@ fn reap_dead_into(pane_dir: &Path, pane: &PaneId, errors: &mut Vec<String>) -> S
         // stays for a restorer (`crate::scrollback`).
         scrollback_tmp_path(pane_dir, pane),
     ];
-    if cfg!(unix) {
-        files.push(socket_path(pane_dir, pane));
-    }
+    files.extend(endpoint_files(pane_dir, pane, errors));
     for f in files {
         match std::fs::remove_file(&f) {
             Ok(()) => {}
@@ -576,8 +574,37 @@ fn reap_dead_into(pane_dir: &Path, pane: &PaneId, errors: &mut Vec<String>) -> S
     }
 }
 
+/// A dead pane's Unix endpoint and a successor's staged twin. Both live in the
+/// SHARED per-user socket root (`crate::pane::socket_root`), not in the pane
+/// dir, so they are DERIVED from this pane's (pane dir, id) — never found by
+/// listing the root, which holds every runner instance's sockets. None on
+/// Windows, whose endpoint is a named pipe that vanishes with its holder.
+fn endpoint_files(pane_dir: &Path, pane: &PaneId, errors: &mut Vec<String>) -> Vec<PathBuf> {
+    #[cfg(unix)]
+    {
+        match crate::pane::socket_path(pane_dir, pane) {
+            Ok(sock) => vec![crate::transport::staged_path(&sock), sock],
+            Err(e) => {
+                errors.push(format!("socket path of pane {pane}: {e}"));
+                Vec::new()
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        let _ = (pane_dir, pane, errors);
+        Vec::new()
+    }
+}
+
 /// The per-pane file kinds the stray pass may remove: the pane id a file name
 /// belongs to, and the age the file must reach first.
+///
+/// The stray pass lists THIS pane dir only. Sockets now live in the shared
+/// per-user root (`crate::pane::socket_root`), which this pass never lists; the
+/// `sock` / `sock.upg` arms remain for sockets an older holder build left in
+/// the pane dir. A current socket is removed with its pane's lock by
+/// [`reap_dead_into`], which derives it from the pane id.
 fn stray_kind(file_name: &str) -> Option<(&str, Duration)> {
     if let Some(pane) = file_name.strip_suffix(".scrollback.tmp") {
         return Some((pane, STRAY_MIN_AGE));

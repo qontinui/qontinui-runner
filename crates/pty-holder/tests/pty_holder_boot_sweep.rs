@@ -400,7 +400,10 @@ fn pty_holder_boot_sweep_reaps_the_orphans_of_a_killed_holder() {
         !lock_path(&dir, &pane).exists(),
         "the dead pane's lock is gone"
     );
-    assert!(!socket_path(&dir, &pane).exists(), "and its endpoint");
+    assert!(
+        !socket_path(&dir, &pane).unwrap().exists(),
+        "and its endpoint"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

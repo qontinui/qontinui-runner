@@ -1,7 +1,8 @@
 //! The local IPC transport: one endpoint per pane, authorized by the OS.
 //!
-//! - Unix: a Unix-domain stream socket at `<pane-dir>/<pane-id>.sock`, mode
-//!   0600, inside a pane directory the holder keeps at 0700; every accepted
+//! - Unix: a Unix-domain stream socket at [`crate::pane::socket_path`] — a
+//!   hashed name in the per-user 0700 [`crate::pane::socket_root`], so the
+//!   path fits `sun_path` whatever the pane dir — mode 0600; every accepted
 //!   peer's uid is read from the kernel (`SO_PEERCRED` on Linux, `getpeereid`
 //!   on macOS/BSD) and must equal the holder's (plan D5).
 //! - Windows: a named pipe ([`crate::pane::pipe_name`]) whose DACL grants only
@@ -28,7 +29,7 @@ use crate::pane::PaneId;
 #[cfg(unix)]
 mod unix;
 #[cfg(unix)]
-pub use unix::{own_uid, Conn, Listener, StagedListener};
+pub use unix::{max_path_len, own_uid, staged_path, Conn, Listener, StagedListener};
 
 #[cfg(windows)]
 mod windows;
@@ -41,7 +42,7 @@ pub use windows::{Conn, Listener};
 pub fn bind(pane_dir: &Path, pane: &PaneId) -> io::Result<Listener> {
     #[cfg(unix)]
     {
-        Listener::bind(&crate::pane::socket_path(pane_dir, pane))
+        Listener::bind(&crate::pane::socket_path(pane_dir, pane)?)
     }
     #[cfg(windows)]
     {
@@ -54,13 +55,14 @@ pub fn bind(pane_dir: &Path, pane: &PaneId) -> io::Result<Listener> {
 /// pane lock (inherited).
 #[cfg(unix)]
 pub fn bind_staged(pane_dir: &Path, pane: &PaneId) -> io::Result<StagedListener> {
-    Listener::bind_staged(&crate::pane::socket_path(pane_dir, pane))
+    Listener::bind_staged(&crate::pane::socket_path(pane_dir, pane)?)
 }
 
-/// The staged successor socket's path, `<pane-id>.sock.upg`.
+/// The staged successor socket's path: [`crate::pane::socket_path`] plus
+/// `.upg`, in the same root. Fails as `socket_path` does.
 #[cfg(unix)]
-pub fn staged_socket_path(pane_dir: &Path, pane: &PaneId) -> std::path::PathBuf {
-    unix::staged_path(&crate::pane::socket_path(pane_dir, pane))
+pub fn staged_socket_path(pane_dir: &Path, pane: &PaneId) -> io::Result<std::path::PathBuf> {
+    Ok(unix::staged_path(&crate::pane::socket_path(pane_dir, pane)?))
 }
 
 /// Connect to the pane's endpoint, giving up at `deadline`.
@@ -71,7 +73,7 @@ pub fn staged_socket_path(pane_dir: &Path, pane: &PaneId) -> std::path::PathBuf 
 pub fn connect(pane_dir: &Path, pane: &PaneId, deadline: Instant) -> io::Result<Conn> {
     #[cfg(unix)]
     {
-        unix::connect(&crate::pane::socket_path(pane_dir, pane), deadline)
+        unix::connect(&crate::pane::socket_path(pane_dir, pane)?, deadline)
     }
     #[cfg(windows)]
     {
