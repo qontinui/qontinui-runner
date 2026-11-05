@@ -2108,6 +2108,7 @@ mod tests {
                 total_bytes: 4_000,
                 free_bytes: 93,
                 removable: false,
+                read_only: false,
             }],
             taken_at: chrono::Utc::now(),
         };
