@@ -2154,37 +2154,52 @@ mod live {
 
     /// Send `sig` to the stray only while it is still the recorded process: through
     /// a pidfd where the kernel has one, so a pid reused after the check cannot be hit.
-    fn signal_pid(stray: &RecordedStray, sig: libc::c_int) -> bool {
+    ///
+    /// `Err(Some(e))` carries the error of the syscall that failed, read right after
+    /// it and before any `/proc` re-check could overwrite errno. `Err(None)` means
+    /// nothing was sent because the stray is no longer the recorded process.
+    fn signal_pid(stray: &RecordedStray, sig: libc::c_int) -> Result<(), Option<std::io::Error>> {
         let Ok(pid) = libc::pid_t::try_from(stray.pid) else {
-            return false;
+            return Err(None);
         };
         // SAFETY: pidfd_open takes two integers and touches no caller memory.
         let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
         if fd < 0 {
-            if std::io::Error::last_os_error().raw_os_error() != Some(libc::ENOSYS) {
-                return false;
+            let open_err = std::io::Error::last_os_error();
+            if open_err.raw_os_error() != Some(libc::ENOSYS) {
+                return Err(Some(open_err));
             }
             if !stray_now(stray) {
-                return false;
+                return Err(None);
             }
             // SAFETY: kill takes two integers and touches no caller memory.
-            return unsafe { libc::kill(pid, sig) } == 0;
+            if unsafe { libc::kill(pid, sig) } != 0 {
+                return Err(Some(std::io::Error::last_os_error()));
+            }
+            return Ok(());
         }
-        let sent = stray_now(stray)
-            // SAFETY: a pidfd this function owns, a signal number, a null siginfo
-            // (which the syscall documents as "as if by kill") and zero flags.
-            && unsafe {
-                libc::syscall(
-                    libc::SYS_pidfd_send_signal,
-                    fd,
-                    sig,
-                    std::ptr::null::<libc::siginfo_t>(),
-                    0,
-                )
-            } == 0;
+        let result = if !stray_now(stray) {
+            Err(None)
+        } else if
+        // SAFETY: a pidfd this function owns, a signal number, a null siginfo
+        // (which the syscall documents as "as if by kill") and zero flags.
+        unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                fd,
+                sig,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        } != 0
+        {
+            Err(Some(std::io::Error::last_os_error()))
+        } else {
+            Ok(())
+        };
         // SAFETY: closes the fd opened above, exactly once.
         unsafe { libc::close(fd as libc::c_int) };
-        sent
+        result
     }
 
     /// One log line per stray that outlived its pane. Each is ended only while it
@@ -2229,9 +2244,10 @@ mod live {
                         why = std::io::Error::last_os_error().to_string();
                         break;
                     }
-                } else if !signal_pid(stray, sig) {
-                    if stray_now(stray) {
-                        why = std::io::Error::last_os_error().to_string();
+                } else if let Err(failed) = signal_pid(stray, sig) {
+                    // Only a stray still present makes a failed signal worth naming.
+                    if let Some(e) = failed.filter(|_| stray_now(stray)) {
+                        why = e.to_string();
                     }
                     break;
                 }
@@ -2444,11 +2460,20 @@ pub async fn end_strays(recorded: Vec<RecordedStray>) -> Vec<String> {
         let budget = END_BUDGET_PER_STRAY
             .saturating_mul(count)
             .min(END_BUDGET_MAX);
-        bounded(&END_IN_FLIGHT, budget, move || {
+        let recorded_n = recorded.len();
+        match bounded_outcome(&END_IN_FLIGHT, budget, move || {
             live::end(&recorded, IDLE_MIN, Duration::from_secs(5))
         })
         .await
-        .unwrap_or_else(|| vec!["could not finish ending its stray wait loops in time".to_string()])
+        {
+            Ok(lines) => lines,
+            Err(Miss::Busy) => vec![format!(
+                "another stray end is still running; {recorded_n} recorded stray wait loop(s) not ended"
+            )],
+            Err(Miss::Late) => {
+                vec!["could not finish ending its stray wait loops in time".to_string()]
+            }
+        }
     }
     #[cfg(not(target_os = "linux"))]
     {
