@@ -154,15 +154,17 @@ fn one_line(s: &str) -> String {
 }
 
 async fn retire_once(url: &str, body: &serde_json::Value) -> Attempt<RetireOutcome, String> {
-    let builder = match crate::coord_http::coord_client() {
-        Some(c) => c.post(url),
-        None => reqwest::Client::new().post(url),
-    };
-    let resp = match builder
-        .timeout(RETIRE_ATTEMPT_TIMEOUT)
-        .json(body)
-        .send()
-        .await
+    let client = crate::coord_http::coord_client()
+        .cloned()
+        .unwrap_or_else(reqwest::Client::new);
+    // The retire door is keyed by device alone, which is what `Device` scope
+    // presents.
+    let resp = match crate::auth::attach_device_auth_for(
+        client.post(url).timeout(RETIRE_ATTEMPT_TIMEOUT).json(body),
+        crate::auth::TenantScope::Device,
+    )
+    .send()
+    .await
     {
         Ok(r) => r,
         Err(e) => {
@@ -349,6 +351,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_loop_stops_on_a_typed_refusal() {
+        let _amb = super::super::test_coord::isolate();
         let coord = super::super::test_coord::ScriptedCoord::start(vec![(
             "/coord/worktree-done/",
             vec![
@@ -380,6 +383,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_loop_stops_on_its_budget() {
+        let _amb = super::super::test_coord::isolate();
         let coord = super::super::test_coord::ScriptedCoord::start(vec![(
             "/coord/worktree-done/",
             vec![(503, "{}".to_string())],

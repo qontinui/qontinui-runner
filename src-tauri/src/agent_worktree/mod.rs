@@ -2297,6 +2297,17 @@ async fn post_allocate(
     .await
 }
 
+/// Apply `timeout` to a request when one is given; leave it unbounded when not.
+fn with_optional_timeout(
+    rb: reqwest::RequestBuilder,
+    timeout: Option<Duration>,
+) -> reqwest::RequestBuilder {
+    match timeout {
+        Some(t) => rb.timeout(t),
+        None => rb,
+    }
+}
+
 /// One allocate attempt. Transient: a transport error, a body that could not
 /// be READ (distinct from one read in full that does not parse, which is
 /// final), and a 5xx. Final: a `repo_not_registered` 409, any other non-2xx,
@@ -2313,16 +2324,21 @@ async fn post_allocate_once(
     timeout: Option<Duration>,
 ) -> acquire_retry::Attempt<CoordAllocateResponse, AllocateError> {
     use acquire_retry::Attempt;
-    let builder = match timeout {
-        None => reqwest::Client::new().post(url),
-        Some(t) => match crate::coord_http::coord_client() {
-            Some(c) => c.post(url).timeout(t),
-            None => reqwest::Client::new().post(url).timeout(t),
-        },
+    // The client is chosen first so the `.post(` stays inside the
+    // `attach_device_auth_for(` statement (the coord-auth pin test reads it
+    // there).
+    let client = match timeout {
+        None => reqwest::Client::new(),
+        Some(_) => crate::coord_http::coord_client()
+            .cloned()
+            .unwrap_or_else(reqwest::Client::new),
     };
-    let resp = match crate::auth::attach_device_auth_for(builder.json(body), scope)
-        .send()
-        .await
+    let resp = match crate::auth::attach_device_auth_for(
+        with_optional_timeout(client.post(url).json(body), timeout),
+        scope,
+    )
+    .send()
+    .await
     {
         Ok(r) => r,
         Err(e) => {

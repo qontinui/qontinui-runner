@@ -643,7 +643,7 @@ pub(crate) fn append_no_worktree_note(base: String, workdir: &str, cause: Option
          your cwd `{workdir}` is the runner's shared fallback directory, not an isolated \
          worktree. Any worktree your prompt names was not created (cause: {cause}). \
          Peers' uncommitted state may be here. Before writing, allocate a worktree for \
-         yourself (`qontinui-claude-config/scripts/allocate-worktree.sh` where it exists)."
+         yourself (`allocate-worktree.sh` where this fleet ships it)."
     ));
     out
 }
@@ -14951,6 +14951,7 @@ mod tests {
             None,
             AnchorReservation::none(),
             uuid::Uuid::new_v4(),
+            None,
         )
         .await;
         assert!(

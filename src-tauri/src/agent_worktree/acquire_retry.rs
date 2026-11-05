@@ -148,7 +148,14 @@ where
 {
     let mut failures: u32 = 0;
     loop {
-        let timeout = deadline.attempt_timeout(Instant::now());
+        // A call's FIRST attempt always gets the full per-attempt bound, so a
+        // claim taken after a late allocate is never worse off than with no
+        // budget at all; the deadline bounds only the retries.
+        let timeout = if failures == 0 && deadline.is_active() {
+            Some(PER_ATTEMPT_TIMEOUT)
+        } else {
+            deadline.attempt_timeout(Instant::now())
+        };
         match op(timeout).await {
             Attempt::Done(r) => return r,
             Attempt::Transient(msg) => {
