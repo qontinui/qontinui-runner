@@ -5,6 +5,21 @@ function namespacedKey(key: string): string {
   return port === 9876 ? key : `${key}:${port}`;
 }
 
+/**
+ * Whether raw `localStorage` key `rawKey` is one of THIS instance's keys under
+ * `prefix`. A secondary instance stores `<key>:<port>`, so its keys must start
+ * with the prefix AND end with its own port; the primary (9876) stores the bare
+ * key, so a key carrying another instance's `:<port>` suffix is not its own.
+ * (The old `includes(namespacedKey(prefix))` matched nothing on a secondary —
+ * its namespaced prefix is `page:X::<port>` — and matched every instance's
+ * keys on the primary.) Exported for tests.
+ */
+export function isOwnKeyUnderPrefix(rawKey: string, prefix: string, port: number): boolean {
+  if (!rawKey.startsWith(prefix)) return false;
+  if (port !== 9876) return rawKey.endsWith(`:${port}`);
+  return !/:\d{4,5}$/.test(rawKey);
+}
+
 export const instanceStorage = {
   getItem(key: string): string | null {
     return localStorage.getItem(namespacedKey(key));
@@ -35,11 +50,11 @@ export const instanceStorage = {
    * match), so a removal can be undone with {@link restoreEntries}.
    */
   entriesByPrefix(prefix: string): Array<[string, string]> {
-    const nsPrefix = namespacedKey(prefix);
+    const port = getApiPort();
     const out: Array<[string, string]> = [];
     for (let i = 0; i < localStorage.length; i++) {
       const key = localStorage.key(i);
-      if (key && key.includes(nsPrefix)) {
+      if (key && isOwnKeyUnderPrefix(key, prefix, port)) {
         const value = localStorage.getItem(key);
         if (value !== null) out.push([key, value]);
       }
@@ -56,13 +71,13 @@ export const instanceStorage = {
       }
     }
   },
-  /** Remove all keys whose namespaced form contains the given prefix. */
+  /** Remove all of this instance's keys under the given prefix (see {@link isOwnKeyUnderPrefix}). */
   removeByPrefix(prefix: string): void {
-    const nsPrefix = namespacedKey(prefix);
+    const port = getApiPort();
     const keysToRemove: string[] = [];
     for (let i = 0; i < localStorage.length; i++) {
       const key = localStorage.key(i);
-      if (key && key.includes(nsPrefix)) {
+      if (key && isOwnKeyUnderPrefix(key, prefix, port)) {
         keysToRemove.push(key);
       }
     }
