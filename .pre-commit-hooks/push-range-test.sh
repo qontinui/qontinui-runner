@@ -59,7 +59,8 @@ unset CARGO_TARGET_DIR QONTINUI_PREPUSH_CARGO_GUARD QONTINUI_ROOT
 # claim would put the guard arms below under the developer's own environment.
 unset QONTINUI_PREPUSH_TREE_GUARD_LIB_DIR QONTINUI_PREPUSH_TREE_LOCK_MAX_WAIT \
     CARGO_VERIFY_TREE_LOCK_HELD CARGO_VERIFY_TREE_LOCK_PROOF CARGO_BUILD_TARGET_DIR \
-    CARGO_VERIFY_TREE_LOCK_MAX_WAIT CARGO_VERIFY_TREE_LOCK_MODE
+    CARGO_VERIFY_TREE_LOCK_MAX_WAIT CARGO_VERIFY_TREE_LOCK_MODE \
+    AGENT_BUILD_STALL_SECS AGENT_BUILD_MAX_WALL_SECS
 # The guard's "taking the tree lock" notice goes to /dev/tty; ~20 hook runs
 # below must not write it onto the developer's terminal.
 export QONTINUI_PREPUSH_NO_TTY=1
@@ -754,6 +755,94 @@ case "$HOOK_OUT" in
         pass_note "(h) an UNGUARDED compile error says a peer's stale build may be the cause" ;;
     *) fail_note "(h) expected the unguarded hint, got: $HOOK_OUT" ;;
 esac
+
+echo "  -- the guarded clippy runs under the holder deadline (abs_run) --"
+
+# plan 2026-10-18-a-live-sessions-stalled-cargo-verify-holds-the-tree-lock-with-
+# no-deadline, Phase 1b. A clippy blocked on cargo's own target lock held the
+# tree lock with no bound (33 min measured, 2026-11-05). A stub
+# agent-build-scope.sh in the stub lib dir records `abs_run stall=… wall=…` into
+# the SAME ordered log, then runs the build — or returns STUB_ABS_RC without it.
+# shared-target-test.sh pins the library half (bounds, overrides, the verdict).
+stub_abs_fixture() {
+    cat > "$STUB_LIB/agent-build-scope.sh" <<'STUBABS'
+abs_run() {
+    printf 'abs_run stall=%s wall=%s %s\n' "${AGENT_BUILD_STALL_SECS:-unset}" \
+        "${AGENT_BUILD_MAX_WALL_SECS:-unset}" "$*" >> "$STUB_LIB_LOG"
+    if [ -n "${STUB_ABS_RC:-}" ]; then echo "partial clippy output"; return "$STUB_ABS_RC"; fi
+    "$@"
+}
+STUBABS
+}
+
+# (i) clippy, and only clippy, goes through abs_run with the hook's bounds,
+# inside the lock.
+worktree_fixture; stub_lib_fixture; stub_abs_fixture
+run_guarded_in_wt CARGO_TARGET_DIR=/caller/chose/this
+check "(i) clippy runs through abs_run (stall 600, wall 2700) under the lock" \
+    "cargo fmt held=no;acquire /caller/chose/this 300;refresh /caller/chose/this;abs_run stall=600 wall=2700 cargo clippy;cargo clippy held=yes;release" \
+    "$(lib_seq)"
+check "(i) and the push passes" "0" "$HOOK_RC"
+case "$HOOK_OUT" in
+    *UNBOUNDED*) fail_note "(i) a loaded abs_run must not print the UNBOUNDED note" ;;
+    *) pass_note "(i) and no UNBOUNDED note" ;;
+esac
+
+# (j) the caller's bounds win.
+worktree_fixture; stub_lib_fixture; stub_abs_fixture
+run_guarded_in_wt CARGO_TARGET_DIR=/caller/chose/this AGENT_BUILD_STALL_SECS=30 AGENT_BUILD_MAX_WALL_SECS=90
+check "(j) AGENT_BUILD_STALL_SECS / AGENT_BUILD_MAX_WALL_SECS override the hook's bounds" \
+    "abs_run stall=30 wall=90 cargo clippy" "$(grep '^abs_run' "$STUB_LIB_LOG")"
+
+# (k) a deadline stop (exit 124) is the tree-lock-timeout decline: not a lint,
+# not blocking, the lock released.
+worktree_fixture; stub_lib_fixture; stub_abs_fixture
+run_guarded_in_wt CARGO_TARGET_DIR=/caller/chose/this STUB_ABS_RC=124
+check "(k) deadline stop (124) -> the push is not blocked" "0" "$HOOK_RC"
+case "$HOOK_OUT" in
+    *"CANNOT RUN CLIPPY GUARDED"*"holder deadline"*"CI still gates clippy"*"LATENCY, NOT COVERAGE"*"Not blocking the push"*)
+        pass_note "(k) and it is reported as CANNOT RUN CLIPPY GUARDED / holder deadline / LATENCY, NOT COVERAGE" ;;
+    *) fail_note "(k) expected the guarded-decline wording naming the holder deadline, got: $HOOK_OUT" ;;
+esac
+case "$HOOK_OUT" in
+    *"[pre-push] FAIL"*) fail_note "(k) a deadline stop must not be classified as a clippy FAIL" ;;
+    *) pass_note "(k) and it is not classified as a clippy FAIL" ;;
+esac
+check "(k) and the lock is released" \
+    "cargo fmt held=no;acquire /caller/chose/this 300;refresh /caller/chose/this;abs_run stall=600 wall=2700 cargo clippy;release" \
+    "$(lib_seq)"
+
+# (l) STRICT turns it into a refusal, as it does a lock timeout.
+worktree_fixture; stub_lib_fixture; stub_abs_fixture
+run_guarded_in_wt CARGO_TARGET_DIR=/caller/chose/this STUB_ABS_RC=124 QONTINUI_PREPUSH_STRICT=1
+check "(l) deadline stop + QONTINUI_PREPUSH_STRICT=1 -> the push is refused" "1" "$HOOK_RC"
+case "$HOOK_OUT" in
+    *"holder deadline"*"QONTINUI_PREPUSH_STRICT=1 — treating this as a failure"*)
+        pass_note "(l) and it names the strict switch" ;;
+    *) fail_note "(l) expected the strict refusal wording, got: $HOOK_OUT" ;;
+esac
+check "(l) and the lock is still released" "no" "$([ -f "$STUB_HELD" ] && echo yes || echo no)"
+
+# (m) an ordinary clippy failure through abs_run is still classified as before.
+worktree_fixture; stub_lib_fixture; stub_abs_fixture
+run_guarded_in_wt CARGO_TARGET_DIR=/caller/chose/this STUB_CLIPPY_RC=101 \
+    STUB_CLIPPY_OUT="error: this lint is denied"
+check "(m) a real clippy failure through abs_run -> still refused" "1" "$HOOK_RC"
+case "$HOOK_OUT" in
+    *"clippy lint fired"*) pass_note "(m) and still reported as a lint" ;;
+    *) fail_note "(m) expected the lint wording, got: $HOOK_OUT" ;;
+esac
+
+# (n) no agent-build-scope.sh in the lib dir: clippy runs raw, as before, and
+# ONE NOTE says it is unbounded.
+worktree_fixture; stub_lib_fixture
+run_guarded_in_wt CARGO_TARGET_DIR=/caller/chose/this
+check "(n) no abs_run -> clippy runs raw under the lock" \
+    "cargo fmt held=no;acquire /caller/chose/this 300;refresh /caller/chose/this;cargo clippy held=yes;release" \
+    "$(lib_seq)"
+check "(n) and the push passes" "0" "$HOOK_RC"
+check "(n) and ONE NOTE says the build is UNBOUNDED" "1" \
+    "$(printf '%s\n' "$HOOK_OUT" | grep -c 'this build is UNBOUNDED')"
 
 echo "  -- Defect B: decline honestly when cargo cannot load the workspace --"
 

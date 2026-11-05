@@ -44,7 +44,8 @@ unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY \
 unset CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR QONTINUI_PREPUSH_CARGO_GUARD QONTINUI_ROOT \
     QONTINUI_PREPUSH_TREE_GUARD_LIB_DIR QONTINUI_PREPUSH_TREE_LOCK_MAX_WAIT \
     CARGO_VERIFY_TREE_LOCK_HELD CARGO_VERIFY_TREE_LOCK_PROOF \
-    CARGO_VERIFY_TREE_LOCK_MAX_WAIT CARGO_VERIFY_TREE_LOCK_MODE
+    CARGO_VERIFY_TREE_LOCK_MAX_WAIT CARGO_VERIFY_TREE_LOCK_MODE \
+    AGENT_BUILD_STALL_SECS AGENT_BUILD_MAX_WALL_SECS
 # The guard's "taking the tree lock" notice goes to /dev/tty; keep it off the
 # developer's terminal.
 export QONTINUI_PREPUSH_NO_TTY=1
@@ -289,6 +290,165 @@ if grep -A8 'guard_shared_target "\$RUNNER_DIR"' "$HOOK" | grep -q 'cannot_evalu
     pass_note "and declines (cannot_evaluate) rather than building unguarded when the guard fails"
 else
     fail_note "gen-events-drift.sh does not decline when the guard cannot be taken"
+fi
+
+if grep -q 'guarded_build bash src-tauri/scripts/generate_types.sh --ts-only' "$HOOK"; then
+    pass_note "and builds generate_types.sh through guarded_build (the holder deadline)"
+else
+    fail_note "gen-events-drift.sh does not run generate_types.sh through guarded_build — a stalled build holds the tree lock unbounded"
+fi
+if grep -A4 'shared_target_build_stopped "\$GEN_RC"' "$HOOK" | grep -q 'cannot_evaluate'; then
+    pass_note "and a deadline stop is 'cannot evaluate' (non-blocking; STRICT blocks), like a lock timeout"
+else
+    fail_note "gen-events-drift.sh does not map a holder-deadline stop to cannot_evaluate"
+fi
+
+echo "  -- the guarded build runs under the holder deadline (abs_run) --"
+
+# plan 2026-10-18-a-live-sessions-stalled-cargo-verify-holds-the-tree-lock-with-
+# no-deadline, Phase 1b. A FAKE lib dir stands in for qontinui-claude-config's
+# lib/agent-build-scope.sh: its abs_run records the bounds it was handed and the
+# command, then runs it, or returns FAKE_ABS_RC without running it. The hook
+# arms (exit 124 -> the non-blocking decline, STRICT blocks) are in
+# push-range-test.sh beside the other tree-lock arms.
+ABS_ROOT="$(mktemp -d -t shared-target-abs-XXXXXX)"
+FIXTURE_ROOTS+=("$ABS_ROOT")
+FAKE_ABS="$ABS_ROOT/lib"
+mkdir -p "$FAKE_ABS"
+cat > "$FAKE_ABS/agent-build-scope.sh" <<'FAKE'
+abs_run() {
+    printf 'abs_run stall=%s wall=%s %s\n' "${AGENT_BUILD_STALL_SECS:-unset}" \
+        "${AGENT_BUILD_MAX_WALL_SECS:-unset}" "$*" >> "$FAKE_ABS_LOG"
+    [ -n "${FAKE_ABS_RC:-}" ] && return "$FAKE_ABS_RC"
+    "$@"
+}
+FAKE
+FAKE_ABS_LOG="$ABS_ROOT/abs.log"
+# Under `set -euo pipefail`, as both hooks run. Prints the library's output, then
+# `rc=<status> stopped=<0|1> reason=<reason>` for one guarded build piped
+# through tee, the shape cargo-prepush.sh uses.
+abs_case() {
+    local libdir="$1"; shift
+    : > "$FAKE_ABS_LOG"
+    env FAKE_ABS_LOG="$FAKE_ABS_LOG" "$@" bash -c '
+        set -euo pipefail
+        . "$1"
+        _shared_target_abs_load "$2" "[t]"
+        rc=0
+        guarded_build printf "built\n" 2>&1 | tee "$3.tee" >/dev/null || rc=$?
+        stopped=0
+        shared_target_build_stopped "$rc" "[t]" && stopped=1
+        printf "rc=%s stopped=%s tee=%s reason=%s\n" "$rc" "$stopped" "$(cat "$3.tee")" "$SHARED_TARGET_GUARD_REASON"
+    ' _ "$LIB" "$libdir" "$ABS_ROOT/out" 2>&1
+}
+
+out="$(abs_case "$FAKE_ABS")"
+check "abs_run is invoked with the hook's own bounds (stall 600, wall 2700)" \
+    "abs_run stall=600 wall=2700 printf built\n" "$(cat "$FAKE_ABS_LOG")"
+case "$out" in
+    *"rc=0 stopped=0 tee=built reason="*) pass_note "and the build's output and status pass through tee" ;;
+    *) fail_note "expected rc=0, not stopped, output captured; got: $out" ;;
+esac
+case "$out" in
+    *UNBOUNDED*) fail_note "a loaded abs_run must not print the UNBOUNDED note" ;;
+    *) pass_note "and no UNBOUNDED note is printed" ;;
+esac
+
+out="$(abs_case "$FAKE_ABS" AGENT_BUILD_STALL_SECS=30 AGENT_BUILD_MAX_WALL_SECS=90)"
+check "a caller's AGENT_BUILD_STALL_SECS / AGENT_BUILD_MAX_WALL_SECS win" \
+    "abs_run stall=30 wall=90 printf built\n" "$(cat "$FAKE_ABS_LOG")"
+
+out="$(abs_case "$FAKE_ABS" FAKE_ABS_RC=124)"
+case "$out" in
+    *"rc=124 stopped=1 tee= reason=the build was stopped by the holder deadline"*)
+        pass_note "exit 124 through the pipeline is a deadline stop, with the reason named" ;;
+    *) fail_note "expected rc=124 stopped=1 and a holder-deadline reason; got: $out" ;;
+esac
+out="$(abs_case "$FAKE_ABS" FAKE_ABS_RC=101)"
+case "$out" in
+    *"rc=101 stopped=0 "*) pass_note "an ordinary build failure (101) is NOT a deadline stop" ;;
+    *) fail_note "expected rc=101 stopped=0; got: $out" ;;
+esac
+
+# The exec'd path: cargo died of the watcher's SIGTERM (143) and abs_run never
+# returned, so only the owner guard's verdict for the hook's pid says why.
+mkdir -p "$ABS_ROOT/verdict-lib"
+{
+    cat "$FAKE_ABS/agent-build-scope.sh"
+    cat <<'FAKE'
+abog_deadline_check() {
+    printf 'check %s %s\n' "$1" "$2" >> "$FAKE_ABS_LOG"
+    [ "${FAKE_VERDICT:-}" = stall ] && [ "$1" != 0 ] || return 1
+    ABOG_STOPPED_BY=stall
+    printf '%s run_stopped=stall exit=124\n' "$2" >&2
+}
+FAKE
+} > "$ABS_ROOT/verdict-lib/agent-build-scope.sh"
+out="$(abs_case "$ABS_ROOT/verdict-lib" FAKE_ABS_RC=143 FAKE_VERDICT=stall)"
+case "$out" in
+    *"run_stopped=stall exit=124"*"rc=143 stopped=1 tee= reason=the build was stopped by the holder deadline (stall"*)
+        pass_note "a 143 with the deadline's verdict for this hook is a deadline stop (exec'd path)" ;;
+    *) fail_note "expected the verdict to turn 143 into a stall stop; got: $out" ;;
+esac
+check "and the verdict is asked with the hook's tag" "check 143 [t]" "$(grep '^check' "$FAKE_ABS_LOG")"
+out="$(abs_case "$ABS_ROOT/verdict-lib" FAKE_ABS_RC=143)"
+case "$out" in
+    *"rc=143 stopped=0 "*) pass_note "a 143 with no verdict is NOT a deadline stop" ;;
+    *) fail_note "expected rc=143 stopped=0; got: $out" ;;
+esac
+
+out="$(abs_case "$ABS_ROOT/no-such-lib" FAKE_ABS_RC=124)"
+case "$out" in
+    *"[t] NOTE — no qontinui-claude-config holder-deadline library"*"UNBOUNDED"*"rc=0 stopped=0 tee=built"*)
+        pass_note "an absent lib: one NOTE says UNBOUNDED, and the build runs raw" ;;
+    *) fail_note "expected the UNBOUNDED note and a raw build; got: $out" ;;
+esac
+check "and abs_run is never called" "" "$(cat "$FAKE_ABS_LOG")"
+check "and the NOTE is ONE line" "1" "$(printf '%s\n' "$out" | grep -c 'UNBOUNDED')"
+mkdir -p "$ABS_ROOT/no-abs-run"
+printf 'abs_something_else() { :; }\n' > "$ABS_ROOT/no-abs-run/agent-build-scope.sh"
+out="$(abs_case "$ABS_ROOT/no-abs-run")"
+case "$out" in
+    *UNBOUNDED*"rc=0 stopped=0 tee=built"*) pass_note "a lib that defines no abs_run: UNBOUNDED, raw build" ;;
+    *) fail_note "expected UNBOUNDED and a raw build for a lib without abs_run; got: $out" ;;
+esac
+out="$(abs_case "")"
+case "$out" in
+    *UNBOUNDED*"rc=0 stopped=0 tee=built"*) pass_note "no lib dir resolved at all: UNBOUNDED, raw build" ;;
+    *) fail_note "expected UNBOUNDED and a raw build with no lib dir; got: $out" ;;
+esac
+
+# guard_shared_target loads it from the lib dir it resolved, even when it then
+# returns 10 (no tree-lock library there): an unguarded build is still bounded.
+got="$(cd "$ABS_ROOT" && QONTINUI_PREPUSH_TREE_GUARD_LIB_DIR="$FAKE_ABS" bash -c '
+    set -euo pipefail
+    . "$1"
+    rc=0; guard_shared_target "$2" "[t]" >/dev/null || rc=$?
+    echo "guard_rc=$rc loaded=$SHARED_TARGET_ABS_LOADED"
+' _ "$LIB" "$ABS_ROOT" 2>&1)"
+check "guard_shared_target loads abs_run from its lib dir (rc 10 path too)" "guard_rc=10 loaded=1" "$got"
+
+# The REAL lib/agent-build-scope.sh, on its plain path (forced: not Linux), as a
+# pipeline element under pipefail — the exec'd path the hook takes. Pins the
+# contract the hook relies on: output reaches tee and the status is the build's.
+REAL_ABS=""
+if common="$(git -C "$REPO_ROOT" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"; then
+    cand="$(dirname "$(dirname "$common")")/qontinui-claude-config/scripts/lib"
+    [ -r "$cand/agent-build-scope.sh" ] && REAL_ABS="$cand"
+fi
+if [ -z "$REAL_ABS" ]; then
+    printf '  SKIP real abs_run arm: no qontinui-claude-config/scripts/lib/agent-build-scope.sh beside this checkout\n'
+    SKIP=$((SKIP + 1))
+else
+    got="$(AGENT_BUILD_SCOPE_UNAME_S=Darwin ABOG_UNAME_S=Darwin bash -c '
+        set -euo pipefail
+        . "$1"
+        _shared_target_abs_load "$2" "[t]"
+        rc=0; guarded_build bash -c "echo real-out; exit 7" 2>&1 | tee "$3" >/dev/null || rc=$?
+        echo "loaded=$SHARED_TARGET_ABS_LOADED rc=$rc tee=$(cat "$3")"
+    ' _ "$LIB" "$REAL_ABS" "$ABS_ROOT/real.tee" 2>&1)"
+    check "real abs_run (plain path) in a pipeline: output captured, status passed through" \
+        "loaded=1 rc=7 tee=real-out" "$got"
 fi
 
 echo "  -- the guard asks cargo which target it builds into --"
