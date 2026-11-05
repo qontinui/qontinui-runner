@@ -4013,16 +4013,34 @@ mod tests {
     /// for the candidate but not in a live state, so it is never closed.
     #[tokio::test]
     async fn finished_close_tick_never_closes_a_session_whose_coord_row_is_not_live() {
-        let mut world = FakeWorld::with_sessions(&["t1"]);
-        let mut index = CoordOwnership::default();
-        index.record_coord_rows([("t1".to_string(), "coord-t1".to_string())]);
-        world.ownership_override = Some(Ok(index));
-        let FinishedCloseTick::Ran { judged, outcomes } = tick(&world).await else {
-            panic!("the census should have run");
-        };
-        assert_eq!(judged[0].1.reason(), Some("ownership_unreadable"));
-        assert!(outcomes.is_empty());
-        assert!(world.exits().is_empty());
+        // The candidate's Claude session is `s-t1` (`with_sessions` names it).
+        // The negative control marks the same row live and must close, so this
+        // test fails if the gate stops telling a closed row from a live one.
+        for live in [false, true] {
+            let mut world = FakeWorld::with_sessions(&["t1"]);
+            let mut index = CoordOwnership::default();
+            index.record_coord_rows([("s-t1".to_string(), "coord-t1".to_string())]);
+            if live {
+                index.mark_live(["coord-t1"]);
+            }
+            world.ownership_override = Some(Ok(index));
+            let FinishedCloseTick::Ran { judged, outcomes } = tick(&world).await else {
+                panic!("the census should have run");
+            };
+            if live {
+                assert_eq!(
+                    judged[0].1.reason(),
+                    None,
+                    "live control: {:?}",
+                    judged[0].1
+                );
+                assert_eq!(world.exits().len(), 1, "a live rowless row must close");
+            } else {
+                assert_eq!(judged[0].1.reason(), Some("ownership_unreadable"));
+                assert!(outcomes.is_empty());
+                assert!(world.exits().is_empty());
+            }
+        }
     }
 
     /// Review item 9: custody probing stops once a batch's worth of clean
