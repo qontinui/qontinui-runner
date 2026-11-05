@@ -150,6 +150,10 @@ pub async fn terminal_create(
     // before `page_id` is moved into `terminal_manager.create`. Used to
     // look up / persist this pane's coord session id so a restart RESUMES
     // the prior coord row instead of orphaning it.
+    // An OPERATOR-opened terminal: the webview sends the `default` page as
+    // `null`, so `None` here is the default page, never "place automatically"
+    // (see `page_placement::operator_page`).
+    let page_id = Some(crate::terminal::page_placement::operator_page(page_id));
     let pane_key = PaneKey::from_create_in_window(
         page_id.as_deref().unwrap_or("default"),
         title.as_deref().unwrap_or(""),
