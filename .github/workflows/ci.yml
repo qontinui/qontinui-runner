@@ -2449,10 +2449,11 @@ jobs:
       # (moderate+, or an unrecognised severity) present at HEAD and absent at
       # BASE; an unchanged package.json + pnpm-lock.yaml exits 0 with no
       # network call; an audit that cannot run is UNKNOWN and fails; and a
-      # change to pnpm.auditConfig or .npmrc registry/audit keys fails. BASE
-      # (PR merge-base / trunk push `before` / merge-base with main for
-      # merge-candidate refs) is resolved inside the script, fetching as
-      # needed. Logic and rationale: scripts/ci-pnpm-audit-diff.mjs. Plan
+      # change to package.json pnpm.auditConfig fails (.npmrc key changes only
+      # warn: the audit never reads .npmrc). BASE (PR merge-base / trunk push
+      # `before` / merge-base with main for merge-candidate refs, where an
+      # unresolvable BASE is UNKNOWN, never HEAD^) is resolved inside the
+      # script, fetching as needed. Logic and rationale: scripts/ci-pnpm-audit-diff.mjs. Plan
       # 2026-11-02-only-cargo-lock-is-gated-by-a-dependency-audit.
       - name: pnpm audit (fail on advisories this change introduces)
         env:

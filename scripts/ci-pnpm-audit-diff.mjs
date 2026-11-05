@@ -14,13 +14,17 @@
  *   0. Resolves BASE (resolveBase): a PR's merge-base with its base branch; a
  *      push to main/develop's `before` when it is a real ancestor of HEAD; any
  *      other push (merge-candidate refs, new refs, force pushes) the merge-base
- *      with origin/main; HEAD^ only as a loudly announced last resort. A
- *      merge-candidate ref is new (before = all zeros) and may carry several
- *      commits, so HEAD^ there would miss a lockfile change in an earlier one.
+ *      with origin/main. HEAD^ is a loudly announced last resort for a TRUNK
+ *      push only; for a non-trunk ref an unreachable main or merge-base is
+ *      UNKNOWN (exit 2). A merge-candidate ref is new (before = all zeros) and
+ *      may carry several commits, so HEAD^ there would miss a lockfile change
+ *      in an earlier one.
  *   1. Refuses audit-config drift: a change to package.json `pnpm.auditConfig`
- *      or to a registry/audit key of .npmrc fails, because either could make
- *      the HEAD audit lie (ignore an advisory, or ask a registry that answers
- *      an empty report). Such a change needs its own justification and review.
+ *      fails, because pnpm audit honours it (an added ignoreGhsas entry drops
+ *      that advisory from the report — verified) and package.json reaches the
+ *      audit. A change to a registry/audit key of .npmrc is only a WARNING:
+ *      .npmrc never reaches the audit (step 3), and only key names are ever
+ *      printed, never values.
  *   2. Reads package.json + pnpm-lock.yaml at BASE and at HEAD. If both are
  *      byte-identical: exit 0 with NO network call.
  *   3. Otherwise audits each side in a temp dir holding ONLY those two files,
@@ -54,6 +58,7 @@
  *   1  something blocking introduced, audit-config drift, pnpm-lock.yaml
  *      deleted, OR the audit could not be performed (UNKNOWN)
  *   2  bad usage, an unresolvable revision, or BASE could not be determined
+ *      (UNKNOWN — never a pass)
  *
  * Imports Node built-ins only, so CI runs it with no install step.
  */
@@ -215,16 +220,24 @@ export function decide(base, head) {
 
 // ------------------------------------------------------- audit-config drift
 
-/** The registry/audit-related `key=value` lines of an .npmrc, normalised. */
+/** The registry/audit-related keys of an .npmrc: Map<key, value>. */
 export function npmrcAuditKeys(text) {
-  if (text === null) return [];
-  return text
-    .split(/\r?\n/)
-    .map((l) => l.trim())
-    .filter((l) => l && !l.startsWith("#") && !l.startsWith(";"))
-    .filter((l) => /registry|audit/i.test(l.split("=")[0]))
-    .map((l) => l.replace(/\s*=\s*/, "="))
-    .sort();
+  const out = new Map();
+  if (text === null || text === undefined) return out;
+  for (const raw of text.split(/\r?\n/)) {
+    const l = raw.trim();
+    if (!l || l.startsWith("#") || l.startsWith(";")) continue;
+    const eq = l.indexOf("=");
+    const key = (eq < 0 ? l : l.slice(0, eq)).trim();
+    if (!/registry|audit|_auth|token|password/i.test(key)) continue;
+    out.set(key, eq < 0 ? "" : l.slice(eq + 1).trim());
+  }
+  return out;
+}
+
+/** A key as it may be printed: credential-shaped keys are masked entirely. */
+export function printableKey(key) {
+  return /_auth|token|password/i.test(key) ? "<credential key>" : key;
 }
 
 function auditConfigOf(pkgText) {
@@ -236,16 +249,30 @@ function auditConfigOf(pkgText) {
   }
 }
 
-/** Pure: reasons the HEAD audit configuration differs from BASE's ([] = none). */
+/**
+ * Pure: how HEAD's audit configuration differs from BASE's.
+ *   failures — pnpm.auditConfig changes (package.json reaches the audit)
+ *   warnings — .npmrc registry/audit key changes (KEY NAMES only, never values)
+ */
 export function auditConfigDrift(base, head) {
-  const out = [];
+  const failures = [];
+  const warnings = [];
   const b = JSON.stringify(auditConfigOf(base["package.json"]));
   const h = JSON.stringify(auditConfigOf(head["package.json"]));
-  if (b !== h) out.push(`package.json pnpm.auditConfig changed: ${b} -> ${h}`);
-  const rb = npmrcAuditKeys(base[".npmrc"]).join("\n");
-  const rh = npmrcAuditKeys(head[".npmrc"]).join("\n");
-  if (rb !== rh) out.push(`.npmrc registry/audit keys changed: [${rb.replace(/\n/g, "; ")}] -> [${rh.replace(/\n/g, "; ")}]`);
-  return out;
+  if (b !== h) failures.push(`package.json pnpm.auditConfig changed: ${b} -> ${h}`);
+  const rb = npmrcAuditKeys(base[".npmrc"]);
+  const rh = npmrcAuditKeys(head[".npmrc"]);
+  const changed = [...new Set([...rb.keys(), ...rh.keys()])]
+    .filter((k) => rb.get(k) !== rh.get(k))
+    .map((k) => `${printableKey(k)} (${!rb.has(k) ? "added" : !rh.has(k) ? "removed" : "changed"})`)
+    .sort();
+  if (changed.length) {
+    warnings.push(
+      `.npmrc registry/audit keys changed: ${changed.join(", ")}. The audit does not read .npmrc, so this does not affect the verdict; ` +
+        "review the change on its own merits.",
+    );
+  }
+  return { failures, warnings };
 }
 
 // ------------------------------------------------------------------- gate
@@ -284,16 +311,25 @@ export function runGate({ base, head, resolveRev, readFile, audit, log = () => {
   const headFiles = read(head, [...GATED_FILES, ".npmrc"]);
 
   const drift = auditConfigDrift(baseFiles, headFiles);
-  if (drift.length) {
+  const warn = (result) => ({
+    ...result,
+    lines: [...drift.warnings.map((w) => `pnpm-audit-diff: WARNING — ${w}`), ...result.lines],
+    annotations: [...drift.warnings.map((w) => `::warning title=pnpm audit::${w}`), ...result.annotations],
+  });
+  if (drift.failures.length) {
     const lines = [
       "pnpm-audit-diff: FAIL — this change alters how the audit itself is configured:",
-      ...drift.map((d) => `  ${d}`),
-      "A change to pnpm.auditConfig or to .npmrc registry/audit keys can make this gate pass falsely, " +
-        "so it is never accepted silently. Land it in its own PR with a stated justification (and, for an " +
-        "ignore, the advisory and why it does not apply).",
+      ...drift.failures.map((d) => `  ${d}`),
+      "pnpm audit honours package.json pnpm.auditConfig, so a change to it can make this gate pass falsely " +
+        "and is never accepted silently. Land it in its own PR with a stated justification (for an ignore: " +
+        "the advisory and why it does not apply).",
     ];
-    return { exitCode: 1, verdict: "config-drift", lines, annotations: drift.map((d) => `::error title=pnpm audit::${d}`) };
+    return warn({ exitCode: 1, verdict: "config-drift", lines, annotations: drift.failures.map((d) => `::error title=pnpm audit::${d}`) });
   }
+  return warn(gateAfterDrift({ base, head, baseFiles, headFiles, audit, log }));
+}
+
+function gateAfterDrift({ base, head, baseFiles, headFiles, audit, log }) {
 
   if (GATED_FILES.every((n) => baseFiles[n] === headFiles[n])) {
     const lines = [`pnpm-audit-diff: ${GATED_FILES.join(" and ")} are unchanged between ${base} and ${head}; nothing to audit (no network call).`];
@@ -377,8 +413,9 @@ export function resolveBase(ctx, git, log = () => {}) {
   }
 
   const branch = (ctx.ref ?? "").replace(/^refs\/heads\//, "");
+  const trunk = TRUNK_BRANCHES.has(branch);
   const before = ctx.before ?? "";
-  if (ctx.eventName === "push" && TRUNK_BRANCHES.has(branch) && before && !ZERO_SHA.test(before)) {
+  if (ctx.eventName === "push" && trunk && before && !ZERO_SHA.test(before)) {
     if (git.fetch([before], { depth: 1 })) {
       let anc = git.isAncestor(before, head);
       if (!anc) {
@@ -392,17 +429,23 @@ export function resolveBase(ctx, git, log = () => {}) {
     }
   }
 
-  if (git.fetch([MAIN_REFSPEC], { depth: 2 })) {
-    const m = mergeBaseDeep(MAIN_REF, [MAIN_REFSPEC]);
-    if (m && m !== head) return { base: m, how: "merge-base of HEAD with origin/main" };
+  const fetchedMain = git.fetch([MAIN_REFSPEC], { depth: 2 });
+  const m = fetchedMain ? mergeBaseDeep(MAIN_REF, [MAIN_REFSPEC]) : null;
+  if (!trunk) {
+    // A non-trunk ref (merge-candidate*) may carry several commits, so HEAD^
+    // would compare only the last one: no fallback, the BASE is UNKNOWN.
+    if (!fetchedMain) throw new GateUsageError(`UNKNOWN BASE for ${ctx.ref ?? "this ref"}: could not fetch origin/main`);
+    if (!m) throw new GateUsageError(`UNKNOWN BASE for ${ctx.ref ?? "this ref"}: no merge-base between HEAD and origin/main (even after unshallowing)`);
+    return { base: m, how: "merge-base of HEAD with origin/main" };
   }
+  if (m && m !== head) return { base: m, how: "merge-base of HEAD with origin/main" };
 
   let parent = git.revParse("HEAD^");
   if (!parent) {
     deepen([]);
     parent = git.revParse("HEAD^");
   }
-  if (!parent) throw new GateUsageError("could not determine BASE: no usable before, no merge-base with main, no HEAD^");
+  if (!parent) throw new GateUsageError("UNKNOWN BASE: no usable before, no merge-base with main, no HEAD^");
   log(
     "::warning title=pnpm audit::BASE fell back to HEAD^ (no usable push 'before' and no merge-base with main below HEAD). " +
       "Only the LAST commit's dependency changes are compared.",

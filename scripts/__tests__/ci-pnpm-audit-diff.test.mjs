@@ -289,12 +289,35 @@ test("pnpm.auditConfig drift fails before any audit", () => {
   assert.equal(h.calls.length, 0);
 });
 
-test(".npmrc registry drift fails even with an unchanged lock; unrelated .npmrc edits do not", () => {
+test(".npmrc registry drift is a warning, not a failure (the audit never reads .npmrc)", () => {
   const base = { "package.json": PKG, "pnpm-lock.yaml": "lockA", ".npmrc": "legacy-peer-deps=true\n" };
   const evil = harness({ base, head: { ...base, ".npmrc": "legacy-peer-deps=true\nregistry = https://evil.example/\n" }, audits: {} });
-  assert.equal(runGate(evil.deps).verdict, "config-drift");
+  const r = runGate(evil.deps);
+  assert.equal(r.exitCode, 0);
+  assert.equal(r.verdict, "unchanged");
+  assert.ok(r.annotations.some((a) => a.startsWith("::warning") && a.includes("registry (added)")));
   const benign = harness({ base, head: { ...base, ".npmrc": "# comment\nlegacy-peer-deps=true\npublic-hoist-pattern[]=x\n" }, audits: {} });
-  assert.equal(runGate(benign.deps).verdict, "unchanged");
+  const rb = runGate(benign.deps);
+  assert.equal(rb.verdict, "unchanged");
+  assert.equal(rb.annotations.length, 0);
+});
+
+test(".npmrc values never appear in any output; credential keys are masked", () => {
+  const SECRET = "npm_SuperSecretToken123";
+  const HOST = "private.example.internal";
+  const base = { "package.json": PKG, "pnpm-lock.yaml": "lockA", ".npmrc": "registry=https://registry.npmjs.org/\n" };
+  const head = {
+    "package.json": PKG,
+    "pnpm-lock.yaml": "lockB",
+    ".npmrc": `registry=https://${HOST}/\n//${HOST}/:_authToken=${SECRET}\n_password=${SECRET}\n`,
+  };
+  const h = harness({ base, head, audits: { lockA: report(), lockB: report() } });
+  const r = runGate(h.deps);
+  const all = [...r.lines, ...r.annotations].join("\n");
+  assert.ok(!all.includes(SECRET), all);
+  assert.ok(!all.includes(HOST), all);
+  assert.match(all, /<credential key> \(added\)/);
+  assert.match(all, /registry \(changed\)/);
 });
 
 test("only package.json + pnpm-lock.yaml reach the audit (never the change's .npmrc)", () => {
@@ -310,10 +333,16 @@ test("only package.json + pnpm-lock.yaml reach the audit (never the change's .np
 });
 
 test("npmrcAuditKeys and auditConfigDrift normalise whitespace and order", () => {
-  assert.deepEqual(npmrcAuditKeys("b=1\n@s:registry = https://r/\naudit=false\n"), ["@s:registry=https://r/", "audit=false"]);
+  assert.deepEqual(
+    [...npmrcAuditKeys("b=1\n@s:registry = https://r/\naudit=false\n")],
+    [
+      ["@s:registry", "https://r/"],
+      ["audit", "false"],
+    ],
+  );
   assert.deepEqual(
     auditConfigDrift({ "package.json": PKG, ".npmrc": "audit=false\nregistry=a" }, { "package.json": PKG, ".npmrc": "registry=a\naudit = false" }),
-    [],
+    { failures: [], warnings: [] },
   );
 });
 
@@ -414,5 +443,22 @@ test("resolveBase: HEAD^ missing from a shallow clone is fetched by unshallowing
   f.git.revParse = (rev) => (rev === "HEAD^" && f.git.isShallow() ? null : revParse(rev));
   const r = resolveBase({ eventName: "push", ref: "refs/heads/main", before: "0000" }, f.git);
   assert.equal(r.base, "C");
+  assert.ok(f.log.some((l) => l.startsWith("fetch unshallow")));
+});
+
+test("resolveBase: a non-trunk push never falls back to HEAD^ — unfetchable main is UNKNOWN", () => {
+  const f = fakeGit({ unfetchable: ["+refs/heads/main:refs/remotes/origin/main"] });
+  assert.throws(
+    () => resolveBase({ eventName: "push", ref: "refs/heads/merge-candidate/1", before: "0000" }, f.git),
+    (e) => e instanceof GateUsageError && /UNKNOWN BASE/.test(e.message) && /fetch origin\/main/.test(e.message),
+  );
+});
+
+test("resolveBase: a non-trunk push with no merge-base even after unshallow is UNKNOWN", () => {
+  const f = fakeGit({ shallow: true, mergeBases: { [MAIN]: { shallow: null, full: null } } });
+  assert.throws(
+    () => resolveBase({ eventName: "push", ref: "refs/heads/merge-candidate-spec/2", before: "0000" }, f.git),
+    (e) => e instanceof GateUsageError && /no merge-base/.test(e.message),
+  );
   assert.ok(f.log.some((l) => l.startsWith("fetch unshallow")));
 });
