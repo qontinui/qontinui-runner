@@ -1358,7 +1358,8 @@ pub mod coord {
         pub session_id: String,
         /// The Claude session this row answers for — the KEY of the keyed read,
         /// which is how [`judge_keyed_read`] maps an entry back to the id it
-        /// asked about. `None` from a page that omits it.
+        /// asked about. Coord serves it in both modes; `None` only from a coord
+        /// predating the field, which the keyed judge refuses.
         #[serde(default)]
         pub claude_code_session_id: Option<String>,
         /// `expected` | `active` | `pending_resolution` | `stale` | `closed`.
@@ -1587,7 +1588,8 @@ pub mod coord {
         /// so this index is a PREFIX of the ledger: a worktree that
         /// [`Self::owner_for`] does not find is UNKNOWN, never "unowned".
         /// `None` ⇒ the walk reached `nextCursor: null` (or an old coord's one
-        /// and only page).
+        /// and only page). Survey walk only: the keyed read is complete or
+        /// `Err`, and never sets it.
         pub partial: Option<String>,
         /// `coord.sessions.id`s (lowercased) POSITIVELY known live for this
         /// read: the keyed read served each in a [`LIVE_SESSION_STATES`] state.
@@ -1854,9 +1856,17 @@ pub mod coord {
         input_truncated: Option<bool>,
     }
 
+    /// Most ids one keyed read sends. Coord accepts up to
+    /// [`MAX_IDS`](crate::mcp::session_work_status::MAX_IDS) (500), but 500
+    /// hyphenated UUIDs are a ~18.5 KB query string, past the request-line limit
+    /// of common load balancers: a refused URL is Err for the whole tick, every
+    /// tick, so nothing would ever close while the backlog stayed that large.
+    /// 200 ids is ~7.4 KB. An id past this cap reads Unknown this tick.
+    pub const KEYED_READ_MAX_IDS: usize = 200;
+    const _: () = assert!(KEYED_READ_MAX_IDS <= crate::mcp::session_work_status::MAX_IDS);
+
     /// PURE: the ids one keyed read sends: lowercased, deduplicated, blanks
-    /// dropped, and at most coord's cap of
-    /// [`MAX_IDS`](crate::mcp::session_work_status::MAX_IDS). An id past the cap is
+    /// dropped, and at most [`KEYED_READ_MAX_IDS`]. An id past the cap is
     /// simply not asked about, so it has no coord row in the index and reads
     /// Unknown. One read per tick stays one read.
     pub fn keyed_request_ids(claude_session_ids: &[String]) -> Vec<String> {
@@ -1865,7 +1875,7 @@ pub mod coord {
             .iter()
             .map(|id| id.trim().to_ascii_lowercase())
             .filter(|id| !id.is_empty() && seen.insert(id.clone()))
-            .take(crate::mcp::session_work_status::MAX_IDS)
+            .take(KEYED_READ_MAX_IDS)
             .collect()
     }
 
@@ -2477,11 +2487,11 @@ pub mod coord {
                 keyed_request_ids(&asked(&[A, &upper, "  ", B])),
                 asked(&[A, B])
             );
-            let many: Vec<String> = (0..crate::mcp::session_work_status::MAX_IDS + 7)
+            let many: Vec<String> = (0..KEYED_READ_MAX_IDS + 7)
                 .map(|i| format!("id-{i}"))
                 .collect();
             let sent = keyed_request_ids(&many);
-            assert_eq!(sent.len(), crate::mcp::session_work_status::MAX_IDS);
+            assert_eq!(sent.len(), KEYED_READ_MAX_IDS);
             assert!(!sent.contains(many.last().unwrap()));
         }
 

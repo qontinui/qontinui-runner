@@ -3992,14 +3992,31 @@ mod tests {
         ));
     }
 
-    /// Round-2 CRITICAL 1, end to end: a candidate whose coord session is not
-    /// known live (auto-closed) is never closed, whatever its trees show.
+    /// Round-2 CRITICAL 1, end to end, no-row arm: a candidate the keyed read
+    /// returned no coord row for is never closed, whatever its trees show. The
+    /// row-present-but-closed arm is the next test.
     #[tokio::test]
-    async fn finished_close_tick_never_closes_a_session_whose_coord_row_is_not_live() {
+    async fn finished_close_tick_never_closes_a_session_with_no_coord_row() {
         // A valid read that resolves nothing live: an index holding no coord row
         // for the candidate.
         let mut world = FakeWorld::with_sessions(&["t1"]);
         world.ownership_override = Some(Ok(CoordOwnership::default()));
+        let FinishedCloseTick::Ran { judged, outcomes } = tick(&world).await else {
+            panic!("the census should have run");
+        };
+        assert_eq!(judged[0].1.reason(), Some("ownership_unreadable"));
+        assert!(outcomes.is_empty());
+        assert!(world.exits().is_empty());
+    }
+
+    /// Round-2 CRITICAL 1, end to end, closed arm: the keyed read served a row
+    /// for the candidate but not in a live state, so it is never closed.
+    #[tokio::test]
+    async fn finished_close_tick_never_closes_a_session_whose_coord_row_is_not_live() {
+        let mut world = FakeWorld::with_sessions(&["t1"]);
+        let mut index = CoordOwnership::default();
+        index.record_coord_rows([("t1".to_string(), "coord-t1".to_string())]);
+        world.ownership_override = Some(Ok(index));
         let FinishedCloseTick::Ran { judged, outcomes } = tick(&world).await else {
             panic!("the census should have run");
         };
