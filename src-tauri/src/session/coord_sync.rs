@@ -681,8 +681,10 @@ impl CoordSync {
                     }
                     ResumeProbe::Found(tenant)
                 } else if status == StatusCode::NOT_FOUND || status == StatusCode::GONE {
+                    drain_body(resp).await;
                     ResumeProbe::NotFound
                 } else if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+                    drain_body(resp).await;
                     tracing::warn!(
                         session = %session_id,
                         %status,
@@ -690,6 +692,7 @@ impl CoordSync {
                     );
                     ResumeProbe::Refused(status.as_u16())
                 } else {
+                    drain_body(resp).await;
                     tracing::debug!(
                         session = %session_id,
                         %status,
@@ -2414,6 +2417,7 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
                 return PushOutcome::Transport(format!("{status}: {detail}"));
             }
             if status.is_success() {
+                drain_body(resp).await;
                 // `landed` moves ONLY here — coord accepted the id.
                 if let Some(id) = rekey_id(rec) {
                     if let Some(source) =
@@ -2450,6 +2454,7 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
                     StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
                 )
             {
+                drain_body(resp).await;
                 // Coord build without the session-events ingest route (the
                 // coord slice of Phase 4 ships it in parallel), or a
                 // `coord.sessions` row that has since been GC'd — the ingest
@@ -2566,6 +2571,8 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
                         id,
                         super::coord_identity::DeclineKind::Rejected,
                     );
+                } else {
+                    drain_body(resp).await;
                 }
                 return PushOutcome::Acked;
             }
@@ -2599,6 +2606,17 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
         // TLS / DNS / timeout reason lives in `.source()`.
         Err(e) => PushOutcome::Transport(transport_error(&e)),
     }
+}
+
+/// Read a coord response body to its end and discard it, chunk by chunk (no
+/// buffering). Every response from the shared coord client must be consumed
+/// before it is dropped: an unread HTTP/2 body leaves DATA frames unconsumed
+/// on the connection, and coord answered that with `too_many_data_frames`
+/// GOAWAYs that quarantined sessions in the outbox (lifecycle plan Phase 85).
+/// A read error mid-body is ignored — the caller has already decided on the
+/// status, and there is nothing left to drain.
+pub(crate) async fn drain_body(mut resp: reqwest::Response) {
+    while let Ok(Some(_)) = resp.chunk().await {}
 }
 
 /// A reqwest transport failure rendered with its FULL source chain
@@ -3111,6 +3129,7 @@ async fn bootstrap_then_register(
                     format!("work-unit bootstrap upsert: {status}: {detail}"),
                 );
             }
+            drain_body(resp).await;
             tracing::info!(
                 session = %rec.session_id,
                 seq = rec.seq,
@@ -3896,6 +3915,8 @@ async fn read_refusal_body(mut resp: reqwest::Response) -> Result<String, String
             Err(e) => return Err(e.to_string()),
         }
     }
+    // Past the cap: discard the rest unbuffered rather than drop it unread.
+    drain_body(resp).await;
     // Lossy rather than fatal: a cap can land mid-codepoint, and the result
     // is only ever JSON-parsed or counted. A body that is genuinely not UTF-8
     // fails the parse and is reported by shape, which is the right answer.
@@ -4110,6 +4131,7 @@ async fn fetch_session_coordination_flag(
                 reason,
             });
         }
+        drain_body(resp).await;
         return Err(FlagPollError::Other(format!("status {status}")));
     }
     let body: JsonValue = resp
@@ -11526,5 +11548,118 @@ pub(crate) mod egress_tests {
             check < dispatch,
             "the check must run before any request is built"
         );
+    }
+}
+
+/// Every response path on the shared coord client reads its body to the end
+/// (lifecycle plan Phase 85). Each test fails if the drain at its site is
+/// removed — see [`super::drain_probe`].
+#[cfg(test)]
+mod drain_tests {
+    use super::*;
+    use crate::session::drain_probe::{DrainProbe, Fixed};
+
+    fn coord_at(base: &str) -> (CoordSync, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = Arc::new(OutboxWriter::open(dir.path().join("outbox.jsonl")).unwrap());
+        let coord = CoordSync::new_for_test(
+            outbox,
+            base.to_string(),
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        (coord, dir)
+    }
+
+    fn rec(kind: &str, payload: JsonValue) -> OutboxRecord {
+        OutboxRecord {
+            machine_id: Uuid::new_v4(),
+            session_id: Uuid::new_v4(),
+            seq: 1,
+            event_kind: kind.to_string(),
+            payload,
+            recorded_at: Utc::now(),
+            acked_at: None,
+        }
+    }
+
+    async fn push(status: u16, kind: &str) -> (PushOutcome, DrainProbe) {
+        let probe = DrainProbe::spawn(status).await;
+        let (coord, _dir) = coord_at(&probe.base);
+        let out = push_record(&coord.inner, &rec(kind, json!({}))).await;
+        (out, probe)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn push_2xx_reads_the_body() {
+        let _amb = crate::test_env::isolated_ambient();
+        let (out, probe) = push(200, "heartbeat").await;
+        assert!(matches!(out, PushOutcome::Acked));
+        probe.assert_all_drained().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn push_mirror_404_405_reads_the_body() {
+        let _amb = crate::test_env::isolated_ambient();
+        for (status, kind) in [(404, "restore-record"), (405, "coord-transport-rung")] {
+            let (out, probe) = push(status, kind).await;
+            assert!(matches!(out, PushOutcome::Acked), "{kind} {status}");
+            probe.assert_all_drained().await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn push_patch_409_reads_the_body() {
+        let _amb = crate::test_env::isolated_ambient();
+        let (out, probe) = push(409, "heartbeat").await;
+        assert!(matches!(out, PushOutcome::Acked));
+        probe.assert_all_drained().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bootstrap_upsert_2xx_reads_the_body() {
+        let _amb = crate::test_env::isolated_ambient();
+        let probe = DrainProbe::spawn_with(
+            200,
+            vec![Fixed {
+                path: "/coord/work-units/wu-drain/register-gate".into(),
+                status: 404,
+                body: r#"{"error":"work_unit_not_found"}"#,
+            }],
+        )
+        .await;
+        let (coord, _dir) = coord_at(&probe.base);
+        let payload = json!({
+            "work_unit_slug": "wu-drain",
+            "predicate": {"kind": "manual"},
+            "work_unit_upsert": {"title": "t"},
+        });
+        // Upsert (probe body, 200) then the re-register (fixed 404).
+        let _ = push_record(&coord.inner, &rec("gate_registration", payload)).await;
+        probe.assert_all_drained().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resume_probe_non_2xx_reads_the_body() {
+        let _amb = crate::test_env::isolated_ambient();
+        for status in [404, 401, 500] {
+            let probe = DrainProbe::spawn(status).await;
+            let (coord, _dir) = coord_at(&probe.base);
+            let _ = coord.probe_resume(Uuid::new_v4(), None).await;
+            probe.assert_all_drained().await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn flag_poll_non_2xx_reads_the_body() {
+        let _amb = crate::test_env::isolated_ambient();
+        // 500: the generic arm. 403: the capped refusal read, past its cap.
+        for status in [500, 403] {
+            let probe = DrainProbe::spawn(status).await;
+            let (coord, _dir) = coord_at(&probe.base);
+            let r = fetch_session_coordination_flag(&coord.inner, Uuid::new_v4()).await;
+            assert!(r.is_err());
+            probe.assert_all_drained().await;
+        }
     }
 }

@@ -251,6 +251,11 @@ const CONSUME_BACKOFF: &[Duration] = &[
 pub async fn notify_consumed(registry: &Arc<SessionRegistry>, grant_jti: &str) {
     let http = registry.coord_sync().http_client();
     let coord_url = registry.coord_sync().coord_url().to_string();
+    post_consumed(&http, &coord_url, grant_jti).await;
+}
+
+/// The send half of [`notify_consumed`], with the client passed in.
+async fn post_consumed(http: &reqwest::Client, coord_url: &str, grant_jti: &str) {
     let url = format!(
         "{}/sessions/create-requests/{}/consume",
         coord_url.trim_end_matches('/'),
@@ -258,12 +263,14 @@ pub async fn notify_consumed(registry: &Arc<SessionRegistry>, grant_jti: &str) {
     );
     let mut last = String::new();
     for attempt in 0..=CONSUME_BACKOFF.len() {
-        let resp = crate::coord_http::coord_post(&http, &url)
+        let resp = crate::coord_http::coord_post(http, &url)
             .timeout(Duration::from_secs(10))
             .send()
             .await;
         match resp {
             Ok(r) if r.status().is_success() => {
+                // An unread HTTP/2 body is a defect on the shared client.
+                crate::session::coord_sync::drain_body(r).await;
                 tracing::debug!(
                     grant_jti,
                     attempt,
@@ -273,6 +280,7 @@ pub async fn notify_consumed(registry: &Arc<SessionRegistry>, grant_jti: &str) {
             }
             Ok(r) => {
                 let status = r.status();
+                crate::session::coord_sync::drain_body(r).await;
                 last = format!("HTTP {}", status.as_u16());
                 let retryable = status.is_server_error()
                     || status == reqwest::StatusCode::REQUEST_TIMEOUT
@@ -672,5 +680,23 @@ mod tests {
         let grant = pending.into_grant().unwrap();
         assert_eq!(grant.grant_jti, "0192a1b2-0000-7000-8000-000000000001");
         assert_eq!(grant.expires_at, 1_900_000_000);
+    }
+}
+
+/// The consume notice reads coord's answer to the end on success and on a
+/// final refusal (lifecycle plan Phase 85) — fails if either drain is removed.
+#[cfg(test)]
+mod drain_tests {
+    use super::*;
+    use crate::session::drain_probe::DrainProbe;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn consume_notice_reads_the_body() {
+        let _amb = crate::test_env::isolated_ambient();
+        for status in [200, 403] {
+            let probe = DrainProbe::spawn(status).await;
+            post_consumed(&reqwest::Client::new(), &probe.base, "jti-drain").await;
+            probe.assert_all_drained().await;
+        }
     }
 }
