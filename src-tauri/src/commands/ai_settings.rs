@@ -1610,11 +1610,8 @@ struct UsageRefreshPlan {
 /// behaviour does not change. The fleet report also covers a runner with fewer
 /// than two, by probing the account it spends, because coord's launch budget
 /// has to count it. That probe's only consumer is the report, so it runs only
-/// when `reports_lone_account`: the runner has a coord to report to, and it is
-/// the box's primary. A secondary (a named or temp runner, or a subject under
-/// an instance root) resolves the same machine-global roster and the same
-/// `~/.claude`, so its report would write the primary's account row a second
-/// time.
+/// when `reports_lone_account`: the runner has a coord to report to. Which
+/// lone account a secondary reports is [`spent_account_dir`]'s rule.
 fn plan_usage_refresh(
     dir_count: usize,
     caller: UsageRefreshCaller,
@@ -1638,18 +1635,31 @@ fn plan_usage_refresh(
 /// account in use: in `Manual` mode the spawn takes `config_dir`, whatever the
 /// roster lists. `None` under a model gateway, which has no subscription
 /// account, and when no candidate exists.
-fn spent_account_dir() -> Option<String> {
+///
+/// `include_inherited` is false on a secondary (a named or temp runner, or a
+/// subject under an instance root), which then reports only a pinned account.
+/// The two inherited steps are never its own: `HOME` is not re-rooted for any
+/// runner, and its environment is the one its launcher (the harness, or the
+/// supervisor) runs on, so the inherited `CLAUDE_CONFIG_DIR` and `~/.claude`
+/// are the primary's account, and reporting them would write the primary's
+/// row a second time. A pinned account comes from the secondary's own
+/// roster and settings (a subject's roster sits under its instance root,
+/// `claude_accounts::claude_accounts_file_path`), so it is reported exactly as
+/// a secondary's two-or-more-account roster is. A named runner with no roster
+/// of its own that runs on its launcher's single account is therefore not
+/// reported by it: the primary already reports that account.
+fn spent_account_dir(include_inherited: bool) -> Option<String> {
     if crate::model_gateway::gateway_declared() {
         return None;
     }
     let (pinned, _source) =
         crate::ai_provider::get_effective_config_dir(&settings::get_ai_settings().claude_cli);
-    pinned
-        .or_else(|| {
-            std::env::var("CLAUDE_CONFIG_DIR")
-                .ok()
-                .filter(|dir| !dir.trim().is_empty())
-        })
+    if pinned.is_some() || !include_inherited {
+        return pinned;
+    }
+    std::env::var("CLAUDE_CONFIG_DIR")
+        .ok()
+        .filter(|dir| !dir.trim().is_empty())
         .or_else(|| {
             default_claude_config_dir()
                 .filter(|dir| dir.is_dir())
@@ -1660,9 +1670,7 @@ fn spent_account_dir() -> Option<String> {
 async fn refresh_usage(caller: UsageRefreshCaller) -> Vec<AccountUsageInfo> {
     let mut config_dirs = crate::settings::get_claude_config_dirs();
     let report_base = usage_twin_report::report_base();
-    let reports_lone_account =
-        report_base.is_some() && !qontinui_runner_lib::instance_env::is_secondary();
-    let plan = plan_usage_refresh(config_dirs.len(), caller, reports_lone_account);
+    let plan = plan_usage_refresh(config_dirs.len(), caller, report_base.is_some());
     if !plan.probe_configured {
         config_dirs.clear();
     }
@@ -1670,7 +1678,7 @@ async fn refresh_usage(caller: UsageRefreshCaller) -> Vec<AccountUsageInfo> {
     // selection (`account_infos`, one source with the Tauri command). A lone
     // spent account is in use by construction: it is what a spawn runs on.
     let active_dirs: std::collections::HashSet<String> = if plan.probe_spent {
-        let spent = spent_account_dir();
+        let spent = spent_account_dir(!qontinui_runner_lib::instance_env::is_secondary());
         config_dirs.extend(spent.clone());
         spent.into_iter().collect()
     } else {
@@ -2948,11 +2956,32 @@ mod usage_report_scope_tests {
         }
     }
 
-    /// Env keys these tests set that `isolated_ambient` does not restore.
-    /// `XDG_CONFIG_HOME` matters most: an inherited value would put a roster
-    /// write in the operator's real `claude-accounts.json`.
+    /// The env these tests need beyond `isolated_ambient`, restored on drop.
+    /// - `XDG_CONFIG_HOME`: an inherited value would put a roster write in the
+    ///   operator's real `claude-accounts.json` (set per test by
+    ///   [`write_roster`]).
+    /// - The kill switch is removed, or a box exporting it reads every
+    ///   positive test as red.
+    /// - The prepaid half of every fleet report must find no key: the keychain
+    ///   is switched to its file store and both env fallbacks are removed, so
+    ///   no test calls a provider or blocks on a locked secret service.
     fn extra_env() -> EnvVarRestore {
-        EnvVarRestore::capture(&["XDG_CONFIG_HOME", "QONTINUI_ACCOUNT_USAGE_REPORT_DISABLED"])
+        let restore = EnvVarRestore::capture(&[
+            "XDG_CONFIG_HOME",
+            "QONTINUI_ACCOUNT_USAGE_REPORT_DISABLED",
+            "QONTINUI_DISABLE_KEYCHAIN",
+            "DEEPSEEK_API_KEY",
+            "OPENAI_COMPATIBLE_API_KEY",
+        ]);
+        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
+        for key in [
+            "QONTINUI_ACCOUNT_USAGE_REPORT_DISABLED",
+            "DEEPSEEK_API_KEY",
+            "OPENAI_COMPATIBLE_API_KEY",
+        ] {
+            std::env::remove_var(key);
+        }
+        restore
     }
 
     /// Write the machine-global roster inside the fixture: `dirs` in `mode`,
@@ -3134,10 +3163,11 @@ mod usage_report_scope_tests {
     }
 
     /// A secondary (named or temp runner, or a subject under an instance
-    /// root) reports no lone account: it resolves the primary's roster and
-    /// environment, so its row would be the primary's written twice.
+    /// root) reports a lone account only when it is pinned in its own roster
+    /// and settings. An inherited `CLAUDE_CONFIG_DIR` is its launcher's
+    /// account, which the primary reports, so a second row would duplicate it.
     #[tokio::test]
-    async fn a_secondary_runner_reports_no_lone_account() {
+    async fn a_secondary_runner_reports_only_a_pinned_lone_account() {
         let amb = crate::test_env::isolated_ambient();
         let _env = extra_env();
         let coord = FakeCoord::start().await;
@@ -3147,17 +3177,21 @@ mod usage_report_scope_tests {
 
         std::env::set_var("QONTINUI_INSTANCE_NAME", "temp-runner");
         let named = refresh_fleet_usage_report().await;
-        std::env::remove_var("QONTINUI_INSTANCE_NAME");
         assert!(named.is_empty(), "a named secondary reported: {named:?}");
+        std::env::remove_var("QONTINUI_INSTANCE_NAME");
 
         std::env::set_var("QONTINUI_INSTANCE_ROOT", amb.root());
         let subject = refresh_fleet_usage_report().await;
-        std::env::remove_var("QONTINUI_INSTANCE_ROOT");
         assert!(subject.is_empty(), "a subject reported: {subject:?}");
+        std::env::remove_var("QONTINUI_INSTANCE_ROOT");
         assert!(coord.reported_labels().is_empty());
 
+        std::env::set_var("QONTINUI_INSTANCE_NAME", "temp-runner");
+        let pinned = logged_in_dir(&amb, ".claude-own", None).await;
+        write_roster(&amb, Vec::new(), AccountSelectionMode::Manual, Some(pinned));
         refresh_fleet_usage_report().await;
-        assert_eq!(coord.reported_labels(), vec![".claude-env".to_string()]);
+        std::env::remove_var("QONTINUI_INSTANCE_NAME");
+        assert_eq!(coord.reported_labels(), vec![".claude-own".to_string()]);
     }
 
     /// No list, no pin, nothing inherited: the default `~/.claude`. Unix only:
