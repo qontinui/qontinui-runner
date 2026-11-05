@@ -135,6 +135,27 @@ pub fn claude_pids_in_inclusive_subtree(root_pid: u32, snapshot: &ProcessSnapsho
     out
 }
 
+/// Every PID in the **inclusive** subtree rooted at `root_pid`, in the order
+/// [`claude_pids_in_inclusive_subtree`] reports: the root first — only when
+/// the table holds it, so a root that has already exited is not reported as a
+/// live process — then its descendants breadth-first. The walk the
+/// graceful-exit probe classifies pid by pid
+/// (`crate::terminal::graceful_exit::probe_from_snapshot`), where an image
+/// name is one witness of a `claude` and Claude Code's own registry record is
+/// the other.
+pub fn inclusive_subtree_pids(root_pid: u32, snapshot: &ProcessSnapshot) -> Vec<u32> {
+    let mut out = Vec::new();
+    if snapshot.names.contains_key(&root_pid) || snapshot.creation_times.contains_key(&root_pid) {
+        out.push(root_pid);
+    }
+    out.extend(
+        bfs_descendants_from(root_pid, &snapshot.parent_map, &snapshot.creation_times)
+            .iter()
+            .map(|d| d.pid),
+    );
+    out
+}
+
 /// The claude-image PID in the **inclusive** subtree rooted at `root_pid` with
 /// the EARLIEST KNOWN creation time, returned as `(pid, creation_secs)`.
 ///

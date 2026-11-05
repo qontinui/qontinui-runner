@@ -1522,6 +1522,39 @@ mod tests {
         );
     }
 
+    /// R0c-2 through the manager: a registered pane whose shell runs an
+    /// npm-installed `claude` — a `node` process its Claude Code registry
+    /// record names. Its image alone read as a bare shell, so `graceful_exit`
+    /// answered `NoLiveClaude`, and every caller that closes on that answer
+    /// kill-closed a live session. Now it is the live `claude` it is: with no
+    /// authority, `NoCloseAuthority` naming the `node` pid. Nothing typed,
+    /// nothing killed, the pane still registered.
+    #[tokio::test(start_paused = true)]
+    async fn graceful_exit_reads_a_registry_named_node_pane_as_a_live_claude() {
+        use crate::terminal::graceful_exit::GracefulExitOutcome;
+        use std::sync::Arc;
+
+        let tm = Arc::new(TerminalManager::new());
+        let pane = crate::terminal::session::tests::npm_claude_pane();
+        tm.insert_for_test("npm-claude", pane.session.clone());
+
+        let outcome = tm
+            .graceful_exit("npm-claude", std::time::Duration::from_secs(60), None)
+            .await
+            .expect("the pane is registered");
+
+        assert_eq!(
+            outcome,
+            GracefulExitOutcome::NoCloseAuthority {
+                claude_pids: vec![crate::terminal::session::tests::NPM_CLAUDE_PID]
+            },
+            "a registry-named `node` pane must not read NoLiveClaude"
+        );
+        assert!(pane.typed().is_empty(), "typed into a live claude");
+        assert_eq!(pane.kills(), 0);
+        assert!(tm.get("npm-claude").is_some());
+    }
+
     fn account_with(projects: serde_json::Value) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(

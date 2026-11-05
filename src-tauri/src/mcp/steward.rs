@@ -465,14 +465,20 @@ pub(crate) fn steward_pane_is_emptied(ev: &PaneEvidence) -> bool {
 }
 
 /// Does a `claude` live in the pane rooted at `root_pid`, as one already-taken
-/// process snapshot sees it? `None` when the question cannot be answered — a
-/// remote pane with no local pid, or an unreadable table.
+/// look sees it? `None` when the question cannot be answered — a remote pane
+/// with no local pid, an unreadable table, or a pane holding a process only
+/// Claude Code's registry could settle while the registry could not be read.
+///
+/// A `claude` is the graceful-exit probe's: an image named `claude`, OR a pid
+/// a Claude Code registry record names, which is how an npm-installed
+/// `claude` (running as `node … cli.js`) is seen — a steward launched by one
+/// used to read `Some(false)` here, vacant, while it ran.
 pub(crate) fn pane_hosts_claude(
-    snapshot: &crate::process_capture::process_tree::ProcessSnapshot,
+    look: &crate::terminal::graceful_exit::PaneLook,
     root_pid: Option<u32>,
 ) -> Option<bool> {
     let root = root_pid?;
-    match crate::terminal::graceful_exit::probe_from_snapshot(root, snapshot, &[]) {
+    match look.probe(root, &[]) {
         crate::terminal::graceful_exit::ClaudeProbe::Readable(view) => {
             Some(!view.subtree_claude.is_empty())
         }
@@ -508,7 +514,7 @@ struct TrackedPane {
 fn tracked_panes(
     terminal_manager: &TerminalManager,
     kind: &str,
-    snapshot: &crate::process_capture::process_tree::ProcessSnapshot,
+    look: &crate::terminal::graceful_exit::PaneLook,
     now_ms: u64,
 ) -> Vec<TrackedPane> {
     let tracked_ids = steward_meta_store()
@@ -523,8 +529,8 @@ fn tracked_panes(
         .into_iter()
         .filter(|info| tracked_ids.contains(&info.id))
         .map(|info| {
-            let hosts = pane_hosts_claude(snapshot, info.pid);
-            let children = pane_child_count(snapshot, info.pid);
+            let hosts = pane_hosts_claude(look, info.pid);
+            let children = pane_child_count(look.snapshot(), info.pid);
             (info, hosts, children)
         })
         .collect();
@@ -618,19 +624,19 @@ pub(crate) fn record_claude_seen(terminal_id: &str) -> bool {
     }
 }
 
-/// [`find_running_steward`] against an already-taken process snapshot.
+/// [`find_running_steward`] against an already-taken look.
 ///
-/// The snapshot is required rather than optional. A caller with nothing to
-/// judge passes `ProcessSnapshot::default()`, whose empty parent map makes
+/// The look is required rather than optional. A caller with nothing to judge
+/// passes `PaneLook::default()`, whose empty snapshot makes
 /// [`pane_hosts_claude`] answer `None` — the same fall-back-to-shell-liveness
 /// behaviour an `Option::None` used to encode, without a second way to spell
 /// it or an arm to keep in sync.
 fn find_running_steward_in(
     terminal_manager: &TerminalManager,
     kind: &str,
-    snapshot: &crate::process_capture::process_tree::ProcessSnapshot,
+    look: &crate::terminal::graceful_exit::PaneLook,
 ) -> Option<TerminalInfo> {
-    tracked_panes(terminal_manager, kind, snapshot, now_ms())
+    tracked_panes(terminal_manager, kind, look, now_ms())
         .into_iter()
         .find(|pane| steward_pane_is_running(&pane.evidence))
         .map(|pane| pane.info)
@@ -666,7 +672,7 @@ fn find_running_steward_in(
 /// An unconditional sweep on the wind-down tick would buy that narrow case at
 /// the price of running this predicate — and therefore taking a process-table
 /// snapshot — on every tick forever. That is the same trade declined for the
-/// roster's own snapshot (see [`snapshot_for_kind`]: uncached, but skipped
+/// roster's own look (see [`look_for_kind`]: uncached, but skipped
 /// entirely when nothing is tracked), and taking it here while declining it
 /// there would be inconsistent. The tick is also the wrong edge: it is gated
 /// on `Drained`, and the husk only becomes a leak on the UNDRAIN edge, which
@@ -674,9 +680,9 @@ fn find_running_steward_in(
 async fn reap_emptied_panes(
     terminal_manager: &Arc<TerminalManager>,
     kind: &str,
-    snapshot: &crate::process_capture::process_tree::ProcessSnapshot,
+    look: &crate::terminal::graceful_exit::PaneLook,
 ) -> usize {
-    let emptied: Vec<String> = tracked_panes(terminal_manager, kind, snapshot, now_ms())
+    let emptied: Vec<String> = tracked_panes(terminal_manager, kind, look, now_ms())
         .into_iter()
         .filter(|pane| steward_pane_is_emptied(&pane.evidence))
         .map(|pane| pane.info.id)
@@ -724,29 +730,45 @@ async fn reap_emptied_panes(
 /// creation as the terminal's initial cosmetic label, but only the
 /// metadata-store id membership is authoritative for "running".
 ///
-/// Takes a process snapshot ONLY when this kind has a tracked pane to judge,
-/// so the common "not running" answer stays free.
+/// Takes a look ONLY when this kind has a tracked pane to judge, so the common
+/// "not running" answer stays free.
 async fn find_running_steward(
     terminal_manager: &TerminalManager,
     kind: &str,
 ) -> Option<TerminalInfo> {
-    let snapshot = snapshot_for_kind(kind).await;
-    find_running_steward_in(terminal_manager, kind, &snapshot)
+    let look = look_for_kind(terminal_manager, kind).await;
+    find_running_steward_in(terminal_manager, kind, &look)
 }
 
-/// A process snapshot for judging one kind's panes — taken only when that kind
-/// has a tracked pane, and otherwise the empty default (see
-/// [`find_running_steward_in`]).
-async fn snapshot_for_kind(kind: &str) -> crate::process_capture::process_tree::ProcessSnapshot {
-    let has_tracked = steward_meta_store()
+/// The local root pids of the live terminals whose ids `tracked` holds — the
+/// subtrees a look must read Claude Code's registry for.
+fn tracked_roots(
+    terminal_manager: &TerminalManager,
+    tracked: &std::collections::HashSet<String>,
+) -> Vec<u32> {
+    terminal_manager
+        .list()
+        .into_iter()
+        .filter(|info| tracked.contains(&info.id))
+        .filter_map(|info| info.pid)
+        .collect()
+}
+
+/// A look for judging one kind's panes — the process table plus the registry
+/// read for that kind's tracked panes — taken only when the kind has a tracked
+/// pane, and otherwise the empty default (see [`find_running_steward_in`]).
+async fn look_for_kind(
+    terminal_manager: &TerminalManager,
+    kind: &str,
+) -> crate::terminal::graceful_exit::PaneLook {
+    let tracked = steward_meta_store()
         .lock()
-        .map(|guard| !tracked_ids_for_kind(&guard, kind).is_empty())
-        .unwrap_or(false);
-    if has_tracked {
-        crate::process_capture::process_tree::snapshot_process_table_public().await
-    } else {
-        Default::default()
+        .map(|guard| tracked_ids_for_kind(&guard, kind))
+        .unwrap_or_default();
+    if tracked.is_empty() {
+        return Default::default();
     }
+    crate::terminal::graceful_exit::PaneLook::take(&tracked_roots(terminal_manager, &tracked)).await
 }
 
 // ============================================================================
@@ -797,9 +819,9 @@ pub struct StewardStatusResponse {
 fn steward_status_in(
     terminal_manager: &TerminalManager,
     spec: &'static StewardSpec,
-    snapshot: &crate::process_capture::process_tree::ProcessSnapshot,
+    look: &crate::terminal::graceful_exit::PaneLook,
 ) -> StewardStatusResponse {
-    let running = find_running_steward_in(terminal_manager, spec.kind, snapshot);
+    let running = find_running_steward_in(terminal_manager, spec.kind, look);
     prune_stale_meta(terminal_manager);
 
     let base = StewardStatusResponse {
@@ -939,32 +961,33 @@ fn get_terminal_manager(state: &ApiState) -> Arc<TerminalManager> {
 // Handlers
 // ============================================================================
 
-/// [`steward_status_in`] taking its own process snapshot. One snapshot serves
-/// every kind, and it is skipped entirely when nothing is tracked.
+/// [`steward_status_in`] taking its own look. One look serves every kind, and
+/// it is skipped entirely when nothing is tracked.
 async fn steward_status_all(terminal_manager: &TerminalManager) -> Vec<StewardStatusResponse> {
-    let any_tracked = steward_meta_store()
+    let tracked: std::collections::HashSet<String> = steward_meta_store()
         .lock()
-        .map(|guard| !guard.is_empty())
-        .unwrap_or(false);
-    let snapshot = if any_tracked {
-        crate::process_capture::process_tree::snapshot_process_table_public().await
-    } else {
+        .map(|guard| guard.keys().cloned().collect())
+        .unwrap_or_default();
+    let look = if tracked.is_empty() {
         Default::default()
+    } else {
+        crate::terminal::graceful_exit::PaneLook::take(&tracked_roots(terminal_manager, &tracked))
+            .await
     };
     STEWARDS
         .iter()
-        .map(|spec| steward_status_in(terminal_manager, spec, &snapshot))
+        .map(|spec| steward_status_in(terminal_manager, spec, &look))
         .collect()
 }
 
-/// [`steward_status_in`] for ONE kind, taking its own snapshot when that kind
-/// has a tracked pane to judge.
+/// [`steward_status_in`] for ONE kind, taking its own look when that kind has
+/// a tracked pane to judge.
 async fn steward_status(
     terminal_manager: &TerminalManager,
     spec: &'static StewardSpec,
 ) -> StewardStatusResponse {
-    let snapshot = snapshot_for_kind(spec.kind).await;
-    steward_status_in(terminal_manager, spec, &snapshot)
+    let look = look_for_kind(terminal_manager, spec.kind).await;
+    steward_status_in(terminal_manager, spec, &look)
 }
 
 /// `GET /stewards` — the whole roster with each steward's live status.
@@ -1211,11 +1234,11 @@ async fn start_steward(
     // the undrain restart below opens a second pane beside the husk and the
     // runner accumulates one per drain/undrain cycle.
     //
-    // Its snapshot is NOT reused for the guard. The guard takes its own,
+    // Its look is NOT reused for the guard. The guard takes its own,
     // deliberately: it must see the state AFTER these closes, and it is the
     // one read where a stale answer re-opens the double-start window.
-    let reaper_snapshot = snapshot_for_kind(spec.kind).await;
-    let reaped = reap_emptied_panes(&terminal_manager, spec.kind, &reaper_snapshot).await;
+    let reaper_look = look_for_kind(&terminal_manager, spec.kind).await;
+    let reaped = reap_emptied_panes(&terminal_manager, spec.kind, &reaper_look).await;
     if reaped > 0 {
         info!(
             "HTTP: reaped {} emptied {} pane(s) before starting",
@@ -1869,6 +1892,46 @@ mod tests {
             kept,
             "a steward left running must stay reachable by status and stop"
         );
+    }
+
+    /// R0c-2 at the steward: a steward launched by an npm-installed Claude
+    /// Code runs as `node`. A registry record naming that pid makes the pane
+    /// host a `claude` — never vacant, so never reaped as an emptied husk —
+    /// and a registry that could not be read leaves it UNKNOWN (`None`, which
+    /// both predicates read as "running, not reaped").
+    #[test]
+    fn a_registry_named_node_steward_hosts_claude_and_an_unread_registry_is_unknown() {
+        use crate::process_capture::process_tree::ProcessSnapshot;
+        use crate::terminal::graceful_exit::{PaneLook, RegistryWitness};
+
+        let table = || {
+            let mut snap = ProcessSnapshot::default();
+            for (pid, ppid, name) in [(100, 1, "bash"), (210, 100, "node")] {
+                snap.parent_map.entry(ppid).or_default().push(pid);
+                snap.creation_times.insert(pid, 10);
+                snap.names.insert(pid, name.to_string());
+            }
+            snap
+        };
+        let named = PaneLook::from_parts(&[100], table(), RegistryWitness::naming(&[210]));
+        assert_eq!(pane_hosts_claude(&named, Some(100)), Some(true));
+        let unnamed = PaneLook::from_parts(&[100], table(), RegistryWitness::naming(&[]));
+        assert_eq!(pane_hosts_claude(&unnamed, Some(100)), Some(false));
+        let unread = PaneLook::from_parts(
+            &[100],
+            table(),
+            RegistryWitness::Unreadable("a sessions dir could not be listed".to_string()),
+        );
+        assert_eq!(pane_hosts_claude(&unread, Some(100)), None);
+        let husk = PaneEvidence {
+            is_alive: true,
+            hosts_claude: pane_hosts_claude(&unread, Some(100)),
+            claude_seen: true,
+            age: STARTUP_GRACE * 2,
+            shell_children: Some(0),
+        };
+        assert!(steward_pane_is_running(&husk));
+        assert!(!steward_pane_is_emptied(&husk));
     }
 
     #[test]

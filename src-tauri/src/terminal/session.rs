@@ -6029,6 +6029,12 @@ pub(crate) mod tests {
     ///   refusal observable: nothing typed, nothing killed.
     /// * [`bare_shell_pane`] — no `claude` at all, which every caller must still
     ///   be able to handle exactly as before.
+    /// * [`npm_claude_pane`] — a shell running ONE `node` process that a Claude
+    ///   Code registry record names: an npm-installed `claude` (plan Phase 15 /
+    ///   R0c-2). Its image alone reads as a bare shell; the registry witness
+    ///   is what makes every caller see it as the live `claude` it is. Unlike
+    ///   the two above, its probe runs the PRODUCTION derivation (registry
+    ///   read included) over a scripted table.
     ///
     /// The probe is the production `probe_claude_under`, answering from the
     /// scripted table (`graceful_exit::fake_process_table`) under a root pid no
@@ -6041,6 +6047,8 @@ pub(crate) mod tests {
         io: Arc<KillCountingPaneIo>,
         typed: Arc<Mutex<Vec<u8>>>,
         _scripted: crate::terminal::graceful_exit::fake_process_table::FakePane,
+        /// The Claude Code config dir a scripted TABLE's registry is read from.
+        _registry: Option<tempfile::TempDir>,
     }
 
     impl ScriptedPane {
@@ -6080,6 +6088,59 @@ pub(crate) mod tests {
             io,
             typed,
             _scripted: scripted,
+            _registry: None,
+        }
+    }
+
+    /// The `node` pid of [`npm_claude_pane`]'s npm-installed `claude`.
+    pub(crate) const NPM_CLAUDE_PID: u32 = 7_001;
+
+    /// A shell running one `node` process with ZERO children, which a Claude
+    /// Code registry record (`<config-dir>/sessions/7001.json`) names as the
+    /// same process — an npm-installed `claude` — see [`ScriptedPane`].
+    pub(crate) fn npm_claude_pane() -> ScriptedPane {
+        use crate::process_capture::process_tree::ProcessSnapshot;
+
+        fn no_kernel(_: u32) -> Option<String> {
+            None
+        }
+        let registry = tempfile::tempdir().unwrap();
+        let config_dir = registry.path().join(".claude-npm");
+        std::fs::create_dir_all(config_dir.join("sessions")).unwrap();
+        // The process began at 20 s; Claude Code stamps `startedAt` a second
+        // after its own start, which the record's identity check expects.
+        std::fs::write(
+            config_dir
+                .join("sessions")
+                .join(format!("{NPM_CLAUDE_PID}.json")),
+            format!(
+                r#"{{"pid":{NPM_CLAUDE_PID},"sessionId":"npm-session","status":"idle","startedAt":21000}}"#
+            ),
+        )
+        .unwrap();
+        let scripted = crate::terminal::graceful_exit::fake_process_table::register_table(|root| {
+            let mut snapshot = ProcessSnapshot::default();
+            for (pid, ppid, name, started) in
+                [(root, 1, "bash", 10), (NPM_CLAUDE_PID, root, "node", 20)]
+            {
+                snapshot.parent_map.entry(ppid).or_default().push(pid);
+                snapshot.creation_times.insert(pid, started);
+                snapshot.names.insert(pid, name.to_string());
+            }
+            crate::terminal::graceful_exit::fake_process_table::ScriptedTable {
+                snapshot,
+                config_dirs: vec![config_dir],
+                proc_start: no_kernel,
+            }
+        });
+        let (session, io, typed) = live_prompt_parts(EMPTY_PROMPT, true, Some(scripted.root_pid));
+        ScriptedPane {
+            session: Arc::new(session),
+            claude_pids: vec![NPM_CLAUDE_PID],
+            io,
+            typed,
+            _scripted: scripted,
+            _registry: Some(registry),
         }
     }
 

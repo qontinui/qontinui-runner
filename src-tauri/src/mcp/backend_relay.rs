@@ -11290,6 +11290,28 @@ mod remote_end_close_authority_tests {
             .is_some_and(|r| r.starts_with("no_close_authority")));
     }
 
+    /// R0c-2 at the relay: its graceful end answers `NoLiveClaude` with an
+    /// ordinary kill-close, so a pane running an npm-installed `claude` — a
+    /// `node` process only its Claude Code registry record names — was KILLED
+    /// as a bare shell. It is now refused `no_close_authority` like any live
+    /// `claude`: nothing typed, nothing killed, the pane still registered.
+    #[tokio::test(start_paused = true)]
+    async fn a_graceful_remote_end_never_closes_an_npm_installed_claude_as_a_bare_shell() {
+        let pane = crate::terminal::session::tests::npm_claude_pane();
+        let tm = Arc::new(TerminalManager::new());
+        let id = "relay-end-r0c2-npm";
+        tm.insert_for_test(id, pane.session.clone());
+
+        let verdict = end_admitted_terminal(tm.clone(), id, false).await;
+
+        assert_eq!(verdict.outcome, EndOutcome::Refused, "{verdict:?}");
+        let reason = verdict.reason.clone().unwrap_or_default();
+        assert!(reason.starts_with("no_close_authority"), "{reason}");
+        assert!(pane.typed().is_empty(), "typed into a live claude");
+        assert_eq!(pane.kills(), 0, "an npm-installed claude was killed");
+        assert!(tm.get(id).is_some(), "the live claude's pane was closed");
+    }
+
     /// The other half of R0a's placement: a pane with NO live `claude` needs
     /// no authority. The relay still answers `NoLiveClaude` by closing the bare
     /// shell, exactly as before.
