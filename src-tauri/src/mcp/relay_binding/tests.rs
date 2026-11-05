@@ -2691,3 +2691,46 @@ async fn an_http_apps_object_error_answers_the_agent_with_its_code_and_retry_ver
         "{body}"
     );
 }
+
+/// The two refusals that fire BEFORE any binding rule runs -- a first frame
+/// that is not a register frame, and a register frame declaring a transport
+/// other than `websocket` -- both end in a WebSocket Close frame through the
+/// same bounded close path as a refused claim (`close_gracefully`), and
+/// register nothing.
+///
+/// What this pins is the clean-close CONTRACT (a Close frame, not EOF or a
+/// transport error). It does not reproduce the Windows RST that motivated
+/// the shared drain: on loopback the refused frame and anything after it are
+/// already in tungstenite's userspace buffer, so no unread kernel data is
+/// left to trigger one. That mechanism is exercised only by
+/// `concurrent_claims_single_winner` on the Windows CI job.
+#[tokio::test]
+async fn pre_register_rejections_close_cleanly() {
+    let s = spawn(BindingConfig::default()).await;
+    let wrong_transport = json!({
+        "type": "register",
+        "transport": "sse",
+        "appId": "app",
+        "appName": "app (test)",
+        "appType": "wrapper",
+        "origin": GOOD,
+        "pageUrl": format!("{GOOD}/page"),
+    });
+    let not_register = json!({ "type": "hello", "appId": "app" });
+    for (case, first) in [
+        ("wrong transport", wrong_transport),
+        ("not a register frame", not_register),
+    ] {
+        let mut ws = s.ws_open_try(Some(GOOD)).await.expect("upgrade");
+        ws.send(first).await;
+        let seen = tokio::time::timeout(PROMPT, ws.stream.next()).await;
+        assert!(
+            matches!(seen, Ok(Some(Ok(WsMessage::Close(_))))),
+            "{case}: a refused first frame must end in a Close frame, got {seen:?}"
+        );
+        assert!(
+            s.registered("app").await.is_none(),
+            "{case}: a refused first frame must not register the app"
+        );
+    }
+}

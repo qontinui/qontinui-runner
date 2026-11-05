@@ -6,7 +6,7 @@
 # claims to detect reduces to "does the surface digest change?". A field
 # silently dropped from surface() is a bypass, so every field the header
 # advertises has a case here.
-import hashlib, io, json, os, re, sys, textwrap, yaml
+import ast, hashlib, io, json, os, re, sys, textwrap, yaml
 
 WF = sys.argv[1] if len(sys.argv) > 1 else os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
@@ -441,39 +441,236 @@ eq("a YAML workflow still goes through surface()",
 eq("token() is unchanged for a .py.yml workflow (no new collision)",
    "ci.py#test", token(".github/workflows/ci.py.yml", "test"))
 
-print("\n7. The three lists of exact gating paths stay in step.")
-# An exact (non-glob) gating path is named THREE times: the `paths:` trigger
-# (or the run never fires), the scope filter's `case` arm (or the run drops it
-# before scanning), and WHOLE_FILE_GATES (or a non-YAML path is the `!PARSE`
-# deadlock section 6 exists for). The scope-filter comment says "either half
-# alone guards nothing"; nothing checked the halves, and the third is new. Adding
-# a gating script to the first two but not the table re-creates the deadlock,
-# and adding it to the table alone guards nothing while reading as guarded.
-wf_doc = yaml.safe_load(io.open(WF, encoding="utf-8"))
-# YAML 1.1 parses a bare `on:` key as the boolean True.
-trigger = (wf_doc.get(True) or wf_doc.get("on") or {})["pull_request_target"]["paths"]
-# `!` too: a negation entry is not a path the trigger fires on.
-trigger_exact = {p for p in trigger if not any(c in p for c in "*?[!")}
-# Exact arms of the scope filter, e.g. `scripts/check_untimed_subprocess.py) ;;`,
-# with an alternation (`a.py|b.py) ;;`) split. A glob arm, the `*) continue ;;`
-# default and the dedup arm all carry a `*`, which the character class excludes.
-case_exact = {a for m in (
-    re.match(r"^\s*([A-Za-z0-9_./|-]+)\)\s*;;\s*(#.*)?$", l) for l in run.split("\n"))
-    if m for a in m.group(1).split("|") if a}
-gates = set(ns["WHOLE_FILE_GATES"])
-eq("the trigger names at least one exact path (else this section is vacuous)",
-   True, bool(trigger_exact))
-eq("scope-filter exact arms == trigger exact paths", sorted(trigger_exact), sorted(case_exact))
-eq("WHOLE_FILE_GATES keys == trigger exact paths", sorted(trigger_exact), sorted(gates))
+print("\n7. The trigger, the scope filter and WHOLE_FILE_GATES stay in step.")
+# A gating path is named more than once, and each name does a different job. The
+# `paths:` trigger decides whether the run fires at all. The scope filter's `case`
+# arm decides whether the run drops the path before scanning it; the workflow says
+# "either half alone guards nothing". WHOLE_FILE_GATES decides whether a non-YAML
+# path is compared or hits the `!PARSE` deadlock section 6 exists for. Each of these
+# fails silently: the guard reports "No gating workflow modified" for a path the
+# filter dropped, and a table entry alone reads as guarded while guarding nothing.
+#
+# Agreement between the lists is not enough, so the shape of each is pinned too. An
+# arm that `continue`s, or one placed after the default, drops a path while every
+# list still names it. And a glob reading the same on both sides need not match the
+# same paths, because GitHub's `*` stops at a `/` and the shell's does not. That is
+# why a trigger glob must be `<dir>/**`, which does mean what its arm `<dir>/*` means.
+SCOPE_FILTER_OPEN = 'case "${f}" in'
+# GitHub only runs workflows from the first, and `uses: ./` actions live in the second.
+GATE_DIRECTORIES = {".github/workflows/", ".github/actions/"}
+
+
+def gate_lists(wf_text):
+    """Every name for a gating path in one workflow's text."""
+    doc = yaml.safe_load(wf_text)
+    body = doc["jobs"]["guard-gating-workflows"]["steps"][0]["run"].split("\n")
+    # YAML 1.1 parses a bare `on:` key as the boolean True.
+    event = (doc.get(True) or doc.get("on") or {})["pull_request_target"]
+    trigger = event["paths"]
+    # Only the scope filter's own `case`. Scanning the whole run block let an empty
+    # arm in any other `case` stand in for a removed scope arm (a false green), and
+    # let an unrelated empty arm read as scope-filter drift (a false red).
+    opens = [i for i, l in enumerate(body) if l.strip() == SCOPE_FILTER_OPEN]
+    rows = []
+    for l in body[opens[0] + 1:] if opens else []:
+        l = l.strip()
+        if l.split("#")[0].strip() == "esac":
+            break
+        if l and not l.startswith("#"):
+            rows.append(l)
+    arms, shape = set(), []
+    for n, row in enumerate(rows):
+        m = re.match(r"^([^()]+?)\)\s*(.*?)\s*;;\s*(#.*)?$", row)
+        pattern, action = m.groups()[:2] if m else (None, None)
+        if n == len(rows) - 1:
+            if (pattern, action) != ("*", "continue"):
+                shape.append("the last arm is not `*) continue ;;`: " + row)
+        elif action != "":
+            shape.append("an arm before the default does not fall through: " + row)
+        else:
+            arms.update(a.strip() for a in pattern.split("|") if a.strip())
+
+    def is_glob(p):
+        return any(c in p for c in "*?[")
+
+    plain = [p for p in trigger if not p.startswith("!")]
+    trigger_globs = [p for p in plain if is_glob(p)]
+    case_globs = [a for a in arms if is_glob(a)]
+    table = next((l.strip() for l in body if l.lstrip().startswith("WHOLE_FILE_GATES = ")), None)
+    table = ast.literal_eval(table.split(" = ", 1)[1]) if table else {}
+    return {
+        "event_keys": sorted(event),
+        "opens": len(opens),
+        "shape": shape,
+        "negated": sorted(p for p in trigger if p.startswith("!")),
+        "odd_globs": sorted(p for p in trigger_globs if not re.match(r"^[^*?\[]+/\*\*$", p)),
+        "trigger_exact": sorted(p for p in plain if not is_glob(p)),
+        "trigger_globs": sorted(p.rstrip("*") for p in trigger_globs),
+        "case_exact": sorted(a for a in arms if not is_glob(a)),
+        "case_globs": sorted(a.rstrip("*") for a in case_globs),
+        "gates": sorted(table),
+        "tokens": list(table.values()),
+    }
+
+
+ONLY_PATHS = "the trigger filters on `paths:` alone (no base-branch or `types:` filter)"
+ONE_FILTER = "exactly one scope filter was found (else its arms measure nothing)"
+SHAPE = "the scope filter is fall-through arms, then one `*) continue ;;`"
+EXACT_ANY = "the trigger names at least one exact path (else this section is vacuous)"
+COVERS = "the trigger covers every workflow and composite action"
+NEGATED = "the trigger has no `!` entry (NON_GATING is the one exception list)"
+GLOB_FORM = "every trigger glob is `<dir>/**`"
+TRIG_EXACT = "scope-filter exact arms == trigger exact paths"
+TRIG_GLOB = "scope-filter glob arms == trigger globs"
+TABLE_KEYS = "WHOLE_FILE_GATES keys == trigger exact paths"
+TOKENS = "WHOLE_FILE_GATES tokens are distinct"
+# (name, expected, actual) per check. One table, so the live workflow and every
+# mutation below are judged by the same rules.
+LIST_CHECKS = [
+    (ONLY_PATHS, lambda l: ["paths"], lambda l: l["event_keys"]),
+    (ONE_FILTER, lambda l: 1, lambda l: l["opens"]),
+    (SHAPE, lambda l: [], lambda l: l["shape"]),
+    (EXACT_ANY, lambda l: True, lambda l: bool(l["trigger_exact"])),
+    (COVERS, lambda l: [], lambda l: sorted(GATE_DIRECTORIES - set(l["trigger_globs"]))),
+    (NEGATED, lambda l: [], lambda l: l["negated"]),
+    (GLOB_FORM, lambda l: [], lambda l: l["odd_globs"]),
+    (TRIG_EXACT, lambda l: l["trigger_exact"], lambda l: l["case_exact"]),
+    (TRIG_GLOB, lambda l: l["trigger_globs"], lambda l: l["case_globs"]),
+    (TABLE_KEYS, lambda l: l["trigger_exact"], lambda l: l["gates"]),
+    (TOKENS, lambda l: len(l["tokens"]), lambda l: len(set(l["tokens"]))),
+]
+live_lists = gate_lists(io.open(WF, encoding="utf-8").read())
+for name, want, got in LIST_CHECKS:
+    eq(name, want(live_lists), got(live_lists))
 # From this file, not from WF: a workflow copy passed as argv[1] for mutation
 # testing lives outside the tree, and the scripts it names do not.
 REPO = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".."))
 # A renamed or deleted script leaves all three lists agreeing on a path that no
 # longer exists: the trigger then never fires for the script that replaced it.
 eq("every WHOLE_FILE_GATES path exists in the tree", [],
-   sorted(p for p in gates if not os.path.isfile(os.path.join(REPO, p))))
-tokens = list(ns["WHOLE_FILE_GATES"].values())
-eq("WHOLE_FILE_GATES tokens are distinct", len(tokens), len(set(tokens)))
+   sorted(p for p in live_lists["gates"] if not os.path.isfile(os.path.join(REPO, p))))
+
+# The checks above pass on a list extractor that has quietly stopped working, as
+# long as it stopped working the same way on both sides. So each drift they exist
+# to catch is kept here as an assertion, naming exactly the checks it must trip.
+# A fixture rather than the live workflow, so an ordinary edit to the guard cannot
+# break these and they stay a statement about the rules.
+LIST_FIXTURE = textwrap.dedent("""\
+    on:
+      pull_request_target:
+        paths:
+          - '.github/workflows/**'
+          - '.github/actions/**'
+          # a YAML comment is not an entry
+          - 'scripts/gate.py'
+    jobs:
+      guard-gating-workflows:
+        steps:
+          - run: |
+              while IFS= read -r f; do
+                case "${f}" in
+                  .github/workflows/*|.github/actions/*) ;;
+                  # a shell comment is not an arm
+                  scripts/gate.py) ;;
+                  *) continue ;;
+                esac
+              done <<< "${CHANGED}"
+              case "${OTHER}" in
+                unrelated.py) ;;
+              esac
+              python3 - <<'PY'
+              WHOLE_FILE_GATES = {"scripts/gate.py": "gate#file"}
+              PY
+    """)
+GLOB_ARM = ".github/workflows/*|.github/actions/*) ;;"
+EXACT_ARM = "scripts/gate.py) ;;"
+DEFAULT_ARM = "*) continue ;;"
+TRIGGER_EXACT = "- 'scripts/gate.py'"
+TRIGGER_ACTIONS = "- '.github/actions/**'"
+TRIGGER_WORKFLOWS = "- '.github/workflows/**'"
+TABLE = 'WHOLE_FILE_GATES = {"scripts/gate.py": "gate#file"}'
+ARM_BREAK, TRIGGER_BREAK = "\n              ", "\n      "
+
+
+def list_drift(edits):
+    """The name of every LIST_CHECKS row the fixture fails after `edits`, or None."""
+    text = LIST_FIXTURE
+    for old, new in edits:
+        if old not in text:
+            return None
+        text = text.replace(old, new, 1)
+    lists = gate_lists(text)
+    return sorted(n for n, want, got in LIST_CHECKS if want(lists) != got(lists))
+
+
+for name, edits, fired in [
+    # Stays green. A red here is the suite crying wolf, which teaches people to ignore it.
+    ("the fixture itself is clean", [], []),
+    ("two spaces before `;;`", [(EXACT_ARM, "scripts/gate.py)  ;;")], []),
+    ("a trailing comment on an arm", [(EXACT_ARM, EXACT_ARM + " # why")], []),
+    ("spaces around an alternation", [(GLOB_ARM, ".github/workflows/* | .github/actions/*) ;;")], []),
+    ("a commented-out arm is not an arm", [(EXACT_ARM, EXACT_ARM + ARM_BREAK + "# old.py) ;;")], []),
+    # The exact half.
+    ("the table gains a path",
+     [(TABLE, 'WHOLE_FILE_GATES = {"scripts/gate.py": "gate#file", "x.py": "x#file"}')], [TABLE_KEYS]),
+    ("the table loses a path", [(TABLE, "WHOLE_FILE_GATES = {}")], [TABLE_KEYS]),
+    ("the trigger gains an exact path",
+     [(TRIGGER_EXACT, TRIGGER_EXACT + TRIGGER_BREAK + "- 'x.py'")], [TABLE_KEYS, TRIG_EXACT]),
+    ("the exact arm is renamed", [(EXACT_ARM, "scripts/gatee.py) ;;")], [TRIG_EXACT]),
+    ("the exact arm is removed", [(EXACT_ARM, "")], [TRIG_EXACT]),
+    ("an alternation arm adds a path", [(EXACT_ARM, "scripts/gate.py|x.py) ;;")], [TRIG_EXACT]),
+    ("another `case` cannot stand in for the scope filter's arm",
+     [(EXACT_ARM, ""), ("unrelated.py) ;;", EXACT_ARM)], [TRIG_EXACT]),
+    ("two table paths share a token",
+     [(TABLE, 'WHOLE_FILE_GATES = {"scripts/gate.py": "t#file", "x.py": "t#file"}')], [TABLE_KEYS, TOKENS]),
+    ("every exact path is gone from all three lists",
+     [(TRIGGER_EXACT, ""), (EXACT_ARM, ""), (TABLE, "WHOLE_FILE_GATES = {}")], [EXACT_ANY]),
+    # The glob half.
+    ("the trigger gains a glob with no arm",
+     [(TRIGGER_EXACT, TRIGGER_EXACT + TRIGGER_BREAK + "- '.github/scripts/**'")], [TRIG_GLOB]),
+    ("a glob arm is narrowed to a subdirectory",
+     [(GLOB_ARM, ".github/workflows/gates/*|.github/actions/*) ;;")], [TRIG_GLOB]),
+    ("a glob arm is dropped", [(GLOB_ARM, ".github/workflows/*) ;;")], [TRIG_GLOB]),
+    ("a glob arm is added with no trigger",
+     [(GLOB_ARM, ".github/workflows/*|.github/actions/*|docs/*) ;;")], [TRIG_GLOB]),
+    ("both sides narrow to the same subdirectory",
+     [(TRIGGER_ACTIONS, "- '.github/actions/gates/**'"),
+      (GLOB_ARM, ".github/workflows/*|.github/actions/gates/*) ;;")], [COVERS]),
+    ("both sides narrow workflows to the same subdirectory",
+     [(TRIGGER_WORKFLOWS, "- '.github/workflows/gates/**'"),
+      (GLOB_ARM, ".github/workflows/gates/*|.github/actions/*) ;;")], [COVERS]),
+    ("the trigger stops at one directory level", [(TRIGGER_ACTIONS, "- '.github/actions/*'")], [GLOB_FORM]),
+    ("both sides narrow to one extension",
+     [(TRIGGER_ACTIONS, "- '.github/actions/**/*.yml'"),
+      (GLOB_ARM, ".github/workflows/*|.github/actions/**/*.yml) ;;")], [COVERS, GLOB_FORM]),
+    ("a `?` in a trigger entry makes it a glob",
+     [(TRIGGER_EXACT, TRIGGER_EXACT + TRIGGER_BREAK + "- 'scripts/g?te.py'")], [GLOB_FORM, TRIG_GLOB]),
+    ("a `[` in a trigger entry makes it a glob",
+     [(TRIGGER_EXACT, TRIGGER_EXACT + TRIGGER_BREAK + "- 'scripts/g[a]te.py'")], [GLOB_FORM, TRIG_GLOB]),
+    # What narrows the trigger without touching a path. A `!` entry is an exception
+    # list with no justification attached, and the workflow's header records why it
+    # carries no base-branch filter.
+    ("a trigger negation exempts one workflow",
+     [(TRIGGER_EXACT, TRIGGER_EXACT + TRIGGER_BREAK + "- '!.github/workflows/ci.yml'")], [NEGATED]),
+    ("a base-branch filter comes back", [("    paths:\n", "    branches: [main]\n    paths:\n")], [ONLY_PATHS]),
+    # Every list agrees in these, and the path is dropped anyway.
+    ("a `continue` carve-out of one gate",
+     [(GLOB_ARM, ".github/workflows/secret-scan.yml) continue ;;" + ARM_BREAK + GLOB_ARM)], [SHAPE]),
+    ("a `continue` carve-out by glob", [(GLOB_ARM, "*.sh) continue ;;" + ARM_BREAK + GLOB_ARM)], [SHAPE]),
+    ("the exact arm sits after the default",
+     [(EXACT_ARM, ""), (DEFAULT_ARM, DEFAULT_ARM + ARM_BREAK + EXACT_ARM)], [SHAPE, TRIG_EXACT]),
+    ("the default moves above every arm",
+     [(DEFAULT_ARM, ""), (GLOB_ARM, DEFAULT_ARM + ARM_BREAK + GLOB_ARM)], [SHAPE, TRIG_EXACT]),
+    ("the default arm stops dropping paths", [(DEFAULT_ARM, "*) ;;")], [SHAPE]),
+    ("the last arm drops only some paths", [(DEFAULT_ARM, "docs/*) continue ;;")], [SHAPE]),
+    ("`esac` with a trailing comment still ends the filter", [("  esac\n", "  esac  # scope filter\n")], []),
+    ("an arm this parser cannot read", [(EXACT_ARM, "scripts/gate.py)" + ARM_BREAK + ";;")], [SHAPE, TRIG_EXACT]),
+    # The filter cannot be found, or found twice: nothing it reports can be trusted.
+    ("the scope filter's opening line is reworded",
+     [('case "${f}" in\n', 'case "$f" in\n')], [ONE_FILTER, TRIG_EXACT, TRIG_GLOB]),
+    ("a second `case` on the same variable", [('case "${OTHER}" in\n', 'case "${f}" in\n')], [ONE_FILTER]),
+]:
+    eq("list drift: " + name, sorted(fired), list_drift(edits))
 
 print()
 if failures:

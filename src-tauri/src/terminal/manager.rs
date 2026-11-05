@@ -954,10 +954,22 @@ impl TerminalManager {
     /// after the driver's last probe is not killed. That answers
     /// `CloseRefused`, never a false `Exited` — see
     /// `crate::terminal::graceful_exit::CloseTabResult`.
+    ///
+    /// **`authority`** (plan `2026-10-28-one-session-lifecycle-authority`,
+    /// Phase 14 / R0a): once the probe has found a live `claude`, and before any
+    /// byte is typed into it, a call presenting `None` is refused
+    /// `NoCloseAuthority`, with nothing typed and nothing closed. Nothing in
+    /// production can mint a [`CloseAuthority`] until the lifecycle Closer does
+    /// (Phase 93), so every caller passes `None` today and is refused on any
+    /// pane holding a live `claude`. A bare shell pane still answers
+    /// `NoLiveClaude`, as before. See [`crate::terminal::close_authority`].
+    ///
+    /// [`CloseAuthority`]: crate::terminal::close_authority::CloseAuthority
     pub async fn graceful_exit(
         self: &std::sync::Arc<Self>,
         id: &str,
         deadline: std::time::Duration,
+        authority: Option<crate::terminal::close_authority::CloseAuthority>,
     ) -> Result<crate::terminal::graceful_exit::GracefulExitOutcome, String> {
         let session = self
             .get(id)
@@ -986,7 +998,7 @@ impl TerminalManager {
                 // NARROWER than the driver's own gone-gate on purpose: that
                 // gate requires `subtree_claude.is_empty() &&
                 // tracked_alive.is_empty()`, this one re-proves only the
-                // subtree (the tracked set lives inside `drive` and is not
+                // subtree (the tracked set lives inside `drive_graceful_exit` and is not
                 // reachable here). The scope is right for what this guard
                 // protects — `close_inner`'s kill reaches the PANE's process
                 // and nothing else, so a tracked `claude` that has drifted out
@@ -1039,7 +1051,9 @@ impl TerminalManager {
                         }
                     }
                 }
-            })
+                },
+                authority,
+            )
             .await)
     }
 
@@ -1075,7 +1089,26 @@ impl TerminalManager {
     }
 
     /// List all terminal sessions with their info, sorted by creation time.
+    /// Derived from [`Self::list_with_permission_request_hooks`], so the two
+    /// listings cannot disagree on membership or order.
     pub fn list(&self) -> Vec<TerminalInfo> {
+        self.list_with_permission_request_hooks()
+            .into_iter()
+            .map(|(info, _)| info)
+            .collect()
+    }
+
+    /// [`Self::list`] with each terminal's `permissionRequestHook` beside its
+    /// info, same order — for `GET /terminals` (plan
+    /// `2026-10-23-runner-sessions-stop-at-permission-dialogs-so-accept-them-by-default-with-a-tenant-switch`
+    /// D7). Beside, not inside: `TerminalInfo` is the cross-repo wire schema and
+    /// gains no runner-local field.
+    pub fn list_with_permission_request_hooks(
+        &self,
+    ) -> Vec<(
+        TerminalInfo,
+        crate::session::claude_hook::PermissionRequestHook,
+    )> {
         let sessions = match self.sessions.lock() {
             Ok(s) => s,
             Err(e) => {
@@ -1084,9 +1117,12 @@ impl TerminalManager {
             }
         };
 
-        let mut infos: Vec<TerminalInfo> = sessions.values().map(|s| s.info()).collect();
-        infos.sort_by_key(|info| info.created_at);
-        infos
+        let mut rows: Vec<_> = sessions
+            .values()
+            .map(|s| (s.info(), s.permission_request_hook()))
+            .collect();
+        rows.sort_by_key(|(info, _)| info.created_at);
+        rows
     }
 
     /// Get the number of active sessions, with a poisoned lock rendered as `0`.
@@ -1452,6 +1488,38 @@ mod tests {
             "a kill-only fallback is a degraded teardown"
         );
         assert_eq!(exhausted.count_checked(), Some(0));
+    }
+
+    /// R0a through the manager: a registered pane holding one live `claude`
+    /// with zero children, at an empty prompt that would accept `/exit`.
+    /// `graceful_exit` with no authority answers `NoCloseAuthority`. Nothing
+    /// is typed, nothing is killed, and the pane stays registered.
+    #[tokio::test(start_paused = true)]
+    async fn graceful_exit_without_an_authority_leaves_a_live_claude_pane_registered() {
+        use crate::terminal::graceful_exit::GracefulExitOutcome;
+        use std::sync::Arc;
+
+        let tm = Arc::new(TerminalManager::new());
+        let pane = crate::terminal::session::tests::live_claude_pane();
+        tm.insert_for_test("live-claude", pane.session.clone());
+
+        let outcome = tm
+            .graceful_exit("live-claude", std::time::Duration::from_secs(60), None)
+            .await
+            .expect("the pane is registered");
+
+        assert_eq!(
+            outcome,
+            GracefulExitOutcome::NoCloseAuthority {
+                claude_pids: pane.claude_pids.clone()
+            }
+        );
+        assert!(pane.typed().is_empty(), "typed into a live claude");
+        assert_eq!(pane.kills(), 0);
+        assert!(
+            tm.get("live-claude").is_some(),
+            "a refused close must leave the pane registered"
+        );
     }
 
     fn account_with(projects: serde_json::Value) -> tempfile::TempDir {

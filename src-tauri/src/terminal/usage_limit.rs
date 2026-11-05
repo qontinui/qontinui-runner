@@ -54,20 +54,15 @@ const USAGE_LIMIT_PATTERNS: &[&str] = &[
     "5-hour limit reached",
     "weekly limit reached",
     "hit your usage limit",
-    // Claude Code's current banner: "You've hit your weekly limit · resets
-    // Oct 21, 10pm". None of the "… limit reached" spellings match it.
+    // CLI 2.1.x banner: "You've hit your weekly limit · resets Oct 17, 10pm".
+    // None of the "… limit reached" spellings match it (2026-10-16 and
+    // 2026-10-20: sessions stranded on it with a healthy migration target
+    // idle). The leading "You've" is omitted — apostrophe style varies.
     "hit your weekly limit",
     "hit your 5-hour limit",
     "hit your session limit",
     "out of extra usage",
     "session limit reached",
-    // CLI 2.1.x phrasing: "You've hit your weekly limit · resets Oct 17, 10pm".
-    // None of the "... limit reached" forms above match it (2026-10-16: two
-    // hotmail sessions stranded on it with a healthy migration target idle).
-    // The leading "You've" is omitted - apostrophe style varies.
-    "hit your weekly limit",
-    "hit your 5-hour limit",
-    "hit your session limit",
     "hit your opus limit",
     "hit your sonnet limit",
     "hit your limit",
@@ -78,7 +73,6 @@ const USAGE_LIMIT_PATTERNS: &[&str] = &[
     // probe-confirmed no-op.
     "limit reached",
     "out of usage",
-    "hit your limit",
 ];
 
 /// Minimum gap between two hint firings for the same terminal. A limit message
@@ -281,6 +275,40 @@ mod tests {
         assert_eq!(
             window_indicates_usage_limit("You\u{2019}ve hit your 5-hour limit \u{b7} resets 3am"),
             Some("hit your 5-hour limit")
+        );
+    }
+
+    #[test]
+    fn every_pattern_is_reachable() {
+        // `find` returns the FIRST match, so a pattern that repeats an earlier
+        // one, or contains an earlier one as a substring, can never be the
+        // label returned. Two parallel fixes once left five such dead entries.
+        for (j, later) in USAGE_LIMIT_PATTERNS.iter().enumerate() {
+            for earlier in &USAGE_LIMIT_PATTERNS[..j] {
+                assert!(
+                    !later.contains(earlier),
+                    "pattern {later:?} is shadowed by earlier pattern {earlier:?}"
+                );
+            }
+            assert_eq!(window_indicates_usage_limit(later), Some(*later));
+        }
+    }
+
+    #[test]
+    fn hit_your_banners_keep_their_label_beside_other_phrases() {
+        // Priority order, not just reachability: these labels are what the
+        // migration reads, so a co-painted generic phrase must not take over.
+        assert_eq!(
+            window_indicates_usage_limit("out of extra usage\nYou've hit your weekly limit"),
+            Some("hit your weekly limit")
+        );
+        assert_eq!(
+            window_indicates_usage_limit("session limit reached · You've hit your session limit"),
+            Some("hit your session limit")
+        );
+        assert_eq!(
+            window_indicates_usage_limit("limit reached · You've hit your limit · out of usage"),
+            Some("hit your limit")
         );
     }
 

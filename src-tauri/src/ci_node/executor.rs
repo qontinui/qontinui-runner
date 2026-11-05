@@ -156,6 +156,16 @@ impl CiJob {
         }
     }
 
+    /// The dispatch cgroup's cumulative kernel `oom_kill` count. `None` off
+    /// Linux, when uncontained, or when `memory.events` is unreadable.
+    fn oom_kill_count(&self) -> Option<u64> {
+        #[cfg(target_os = "linux")]
+        if let super::cgroup::Containment::Cgroup(c) = &self.cgroup {
+            return c.oom_kill_count();
+        }
+        None
+    }
+
     /// A log line when the kernel OOM-killed part of the dispatch since the
     /// last call, so a memory kill reads as one rather than as a bare signal.
     fn memory_kill_note(&self) -> Option<String> {
@@ -526,6 +536,7 @@ pub(crate) async fn run_dispatch(
 
     // ── Steps (sequential; first failure short-circuits) ──
     let mut overall = StepOutcome::Success;
+    let mut result_reason: Option<&'static str> = None;
     for step in &manifest.steps {
         if cancel.is_cancelled() {
             overall = StepOutcome::Cancelled;
@@ -538,7 +549,9 @@ pub(crate) async fn run_dispatch(
             step.effective_timeout_secs()
         ));
         let step_started = Instant::now();
+        let oom_before = ci_job.oom_kill_count();
         let outcome = run_step(step, &dispatch_env, &worktree, &ci_job, &sink, &cancel).await;
+        let oom_after = ci_job.oom_kill_count();
         let duration = step_started.elapsed().as_secs();
         sink.push(&format!(
             "[ci-node] step {} → {} in {duration}s",
@@ -551,6 +564,7 @@ pub(crate) async fn run_dispatch(
             duration_secs: duration,
         });
         if outcome != StepOutcome::Success {
+            result_reason = step_failure_reason(&outcome, oom_before, oom_after);
             overall = outcome;
             break;
         }
@@ -587,7 +601,7 @@ pub(crate) async fn run_dispatch(
         &payload.dispatch_id,
         conclusion,
         &steps_summary,
-        None,
+        result_reason,
         &tail,
         capture.artifact(),
         Some(&canonical_outcome),
@@ -595,6 +609,31 @@ pub(crate) async fn run_dispatch(
     .await;
     // The receipt is the only key to cleanup; the artifact is already sent.
     workspace.cleanup(reported).await;
+}
+
+/// `summary.reason` for a dispatch whose failing step the kernel OOM-killed
+/// inside the dispatch cgroup. Same vocabulary as the Actions lane's
+/// `out_of_memory` no-verdict marker (coord `main_baseline_no_verdict`). Coord
+/// stores a dispatch `summary` as opaque JSON today and acts on no reason, so
+/// this is an operator-readable label until coord's dispatch-result ingest
+/// reads it. The conclusion stays `failure`; this only names why.
+const OUT_OF_MEMORY_REASON: &str = "out_of_memory";
+
+/// The result reason for a non-success step: `out_of_memory` only when the
+/// cgroup's `oom_kill` counter PROVABLY rose across the step. An unreadable
+/// counter on either side is UNKNOWN and claims nothing.
+fn step_failure_reason(
+    outcome: &StepOutcome,
+    oom_before: Option<u64>,
+    oom_after: Option<u64>,
+) -> Option<&'static str> {
+    if matches!(outcome, StepOutcome::Success | StepOutcome::Cancelled) {
+        return None;
+    }
+    match (oom_before, oom_after) {
+        (Some(b), Some(a)) if a > b => Some(OUT_OF_MEMORY_REASON),
+        _ => None,
+    }
 }
 
 /// Provision what the manifest declares. Returns the tool directories to
@@ -1001,6 +1040,26 @@ mod tests {
                 "a git CI step must not inherit {var}; removed: {removed:?}"
             );
         }
+    }
+
+    #[test]
+    fn oom_reason_only_when_the_counter_provably_rose() {
+        use StepOutcome::*;
+        assert_eq!(
+            step_failure_reason(&Failure, Some(0), Some(1)),
+            Some("out_of_memory")
+        );
+        assert_eq!(
+            step_failure_reason(&Timeout, Some(2), Some(3)),
+            Some("out_of_memory")
+        );
+        // No rise, or an unreadable counter on either side: claims nothing.
+        assert_eq!(step_failure_reason(&Failure, Some(1), Some(1)), None);
+        assert_eq!(step_failure_reason(&Failure, None, Some(1)), None);
+        assert_eq!(step_failure_reason(&Failure, Some(0), None), None);
+        // A cancelled or successful step is never relabelled.
+        assert_eq!(step_failure_reason(&Cancelled, Some(0), Some(1)), None);
+        assert_eq!(step_failure_reason(&Success, Some(0), Some(1)), None);
     }
 
     #[test]

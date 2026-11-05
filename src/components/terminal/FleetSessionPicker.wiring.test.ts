@@ -567,7 +567,7 @@ describe("a walked list shows when each row was last observed", () => {
 
   it("renders nothing at all when coord served no parseable timestamp", () => {
     // Null is UNKNOWN. A placeholder would look like an answer coord never gave.
-    expect(SOURCE).toContain("if (free.length === 0 && !activity) return null;");
+    expect(SOURCE).toContain("if (free.length === 0 && !activity && !moved) return null;");
   });
 
   it("projects the exact instant for a driver, not only the locale prose", () => {
@@ -575,6 +575,12 @@ describe("a walked list shows when each row was last observed", () => {
     // clock-dependent and the span is `truncate`d, so it is not a contract.
     expect(SOURCE).toContain("data-session-activity={activity.iso}");
     expect(SOURCE).toContain("data-session-activity-kind={activity.verb}");
+  });
+
+  it("shows how long ago the work axis moved, with the exact instant for a driver", () => {
+    expect(SOURCE).toContain("const moved = workStatusMoved(s);");
+    expect(SOURCE).toContain("data-session-status-since={moved.iso}");
+    expect(SOURCE).toContain("{moved.label}");
   });
 
   it("keeps the relative label moving while the panel sits open", () => {

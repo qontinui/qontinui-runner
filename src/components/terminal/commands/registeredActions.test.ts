@@ -8,8 +8,9 @@
  * `resolveCount` had a floor but no ceiling. A fixture registry cannot see
  * either, because a fixture declares whatever the test needs.
  *
- * So this file registers the ACTUAL 41 actions. `useTerminalCommands` is a
- * hook only in the sense that it calls context hooks and `useCommandAction`;
+ * So this file registers the ACTUAL actions (the count is pinned once, in
+ * "registers the whole set" below). `useTerminalCommands` is a hook only
+ * in the sense that it calls context hooks and `useCommandAction`;
  * with those mocked it is an ordinary function, which is why this runs under
  * vitest's `environment: "node"` with no React renderer.
  */

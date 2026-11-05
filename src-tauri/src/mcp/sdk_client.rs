@@ -8298,35 +8298,49 @@ mod tests {
     /// which exercise the same `CommandRelay::dispatch` code path both
     /// helpers ultimately delegate to.
     #[test]
-    #[expect(
-        clippy::string_slice,
-        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
-    )]
     fn ws_dispatch_action_names_are_well_formed() {
         let src = include_str!("sdk_client.rs");
-        let patterns = [
-            "dispatch_app_request(&state, \"",
-            "try_ws_dispatch(&state, \"",
-        ];
+        // Every dispatch entry point that carries a literal action name —
+        // the same set `scripts/validate-ws-actions.mjs` matches (#2480):
+        // `dispatch_app_request` and `dispatch_app_request_typed` and
+        // `try_ws_dispatch` take the action as the 2nd argument;
+        // `dispatch_app_request_by_id` takes it as the 3rd (the 2nd is the
+        // app id). `\s*` crosses newlines, so rustfmt's multi-line call
+        // shape is matched — a literal single-line needle saw 8 of ~145.
+        let site = regex::Regex::new(concat!(
+            r#"\b(?:(dispatch_app_request(?:_typed)?|try_ws_dispatch)\(\s*&state,\s*"#,
+            r#"|(dispatch_app_request_by_id)\(\s*&state,\s*&?[A-Za-z_][A-Za-z0-9_.]*,\s*)"#,
+            r#""([^"]*)""#,
+        ))
+        .expect("dispatch-site regex compiles");
+        let mut per_shape: std::collections::BTreeMap<&str, usize> = Default::default();
         let mut names = Vec::new();
-        for pattern in &patterns {
-            let mut cursor = 0;
-            while let Some(idx) = src[cursor..].find(pattern) {
-                let start = cursor + idx + pattern.len();
-                let end = src[start..]
-                    .find('"')
-                    .unwrap_or_else(|| panic!("unterminated action name at byte {}", start));
-                names.push(&src[start..start + end]);
-                cursor = start + end + 1;
-            }
+        for caps in site.captures_iter(src) {
+            let shape = caps
+                .get(1)
+                .or_else(|| caps.get(2))
+                .map(|m| m.as_str())
+                .expect("one shape group always matches");
+            *per_shape.entry(shape).or_default() += 1;
+            names.push(caps.get(3).map_or("", |m| m.as_str()));
         }
-        assert!(
-            !names.is_empty(),
-            "expected at least one dispatch_app_request or try_ws_dispatch call site"
-        );
+        // Floors pinned from origin/main (2026-10-31: 119 / 17 / 2 / 7). A
+        // regression to a narrower pattern drops a count below its floor.
+        for (shape, floor) in [
+            ("dispatch_app_request", 100),
+            ("dispatch_app_request_typed", 15),
+            ("dispatch_app_request_by_id", 2),
+            ("try_ws_dispatch", 5),
+        ] {
+            let found = per_shape.get(shape).copied().unwrap_or(0);
+            assert!(
+                found >= floor,
+                "scanner found {found} `{shape}` call sites, expected at least {floor} — \
+                 the dispatch-site pattern no longer recognises this call shape"
+            );
+        }
         for name in &names {
-            let valid = !name.is_empty()
-                && name.chars().next().unwrap().is_ascii_lowercase()
+            let valid = name.chars().next().is_some_and(|c| c.is_ascii_lowercase())
                 && name.chars().all(|c| c.is_ascii_alphanumeric());
             assert!(
                 valid,

@@ -717,16 +717,17 @@ three ways relative to a whole-plan vet:
    transition and both §5.4 gates skipped by design (Phase 1 of
    `2026-09-06-…`)" — in the report, so a reader sees a sanctioned skip rather
    than an omission.
-4. **Record the scoped verdict on the work unit's `metadata.phase_vets[]`**
-   (`{phase, verdict, date, session, pr}`), through
-   `coord_work_unit_upsert`'s `metadata_patch` merge arm when the running
-   coord serves it (Phase 2 of the plan cited above); when it does not yet,
-   read the current `metadata.phase_vets` first, append this phase's entry,
-   and send the FULL merged object back (a plain `metadata` upsert REPLACES
-   the whole object) — and say in the report that this was a manual
-   read-modify-write rather than an atomic merge, so a concurrent phase
-   session's own write is not silently lost to a race between your read and
-   your write.
+4. **Record the scoped verdict on the work unit's `metadata.phase_vets`**, an
+   object keyed by phase index:
+   `metadata.phase_vets.<N> = {verdict, date, session, pr}`, written ONLY as
+   `coord_work_unit_upsert`'s `metadata_patch: {"phase_vets": {"<N>": {…}}}`
+   (coord has served `metadata_patch` since `f244a754e`). Send all four
+   fields; never read the stored value and merge it yourself, and never send
+   `phase_vets` as an array: a patch replaces an array whole, so it would
+   erase the other phases' verdicts, while object keys merge, so concurrent
+   phase sessions each land their own entry with no read. `phase_vets` is
+   outside the runner plan adapter's `SCANNER_OWNED_KEYS`, so it survives the
+   adapter's scans on runner builds containing qontinui-runner `f0cb511f1`; a build containing `3a8408558` but not `f0cb511f1` still erases it on a plan with detected phases, and an older one on every plan. A later `/implement-plan` shipped entry for the same phase replaces this one by design: one verdict per phase, the latest.
 
 A whole-plan `/vet-plan` (no `--phase` flag) is unaffected by any of this —
 every rule above applies only to the `--phase N` invocation on a
@@ -2677,8 +2678,8 @@ Register exactly once per VETTED stamp (refresh, don't duplicate):
 > `phase_name`). `/coord/agent-gates` is the **read** door; the gate **writes**
 > have their own device-authed routes under an `/agent/` **INFIX** —
 > `POST /coord/gates/:gate_id/agent/{reject,reopen,mute,unmute,snooze,
-> continuation-cancel,force-clear,audience,repoint}` (`repoint` is agent-only,
-> with no operator twin). Note the two spellings: `agent-`
+> continuation-cancel,force-clear,audience,repoint,correct}` (`repoint` and
+> `correct` are agent-only, with no operator twin). Note the two spellings: `agent-`
 > PREFIX for reads, `/agent/` INFIX for writes. `attest` **and `withdraw`** are
 > device-authed on their BARE paths (no twin exists, and there is no operator
 > withdraw route at all). `continuation-consumed` / `continuation-deferred` are
@@ -2703,14 +2704,25 @@ Register exactly once per VETTED stamp (refresh, don't duplicate):
    REPLACES the stored one whole — every key you left out is dropped EXCEPT
    `attestations`, which coord carries forward from the stored row when the
    object you send omits that key (qontinui-coord#2574, `d9f525e92`, read as the
-   serving build 2026-10-09; an `attestations` key you DO send, `null` included,
-   still wins); `{}` clears the rest — so add no
-   defensive read-merge-write here. If you must set a key (e.g. `area`), read
-   the row and send the full object, `phases` included; the runner's plan
-   adapter re-upserts scanned plans about every 68 s and can land between your
-   read and your write.
-   To set one key without replacing the rest, send `metadata_patch` (the
-   non-clobbering write shape) instead of `metadata`. Separately, VERIFIED against
+   serving build 2026-10-09; once the row holds a ledger, the stored one also
+   wins over an `attestations` key you DO send, `null` included, by `metadata`
+   or `metadata_patch`, because `UPSERT_WORK_UNIT_SQL`'s graft runs after
+   `resolved_metadata_value` in qontinui-coord `work_unit_registry.rs`); `{}`
+   clears the rest — so add no defensive read-merge-write here.
+   To set a key, send `metadata_patch` (an RFC 7396 merge) naming only that
+   key, never a read-modify-write: a concurrent writer's key is lost between
+   your read and your write. On a plan-backed unit (`metadata.source_path`
+   set) the keys in qontinui-runner
+   `src-tauri/src/plan_workunit_adapter/metadata.rs` `SCANNER_OWNED_KEYS`
+   belong to the plan file, which the runner's plan adapter re-asserts from the plan per each key's absent-rule in that roster (read 2026-11-01: `source_path`, `depends_on`, `area`, `archive_path`, `phases`; a scan that detects no phases leaves `phases` alone), so edit those in the plan itself, its `Area:`
+   and `Depends-On:` lines, not on the unit. Every other key persists across
+   scans on runner builds containing qontinui-runner `f0cb511f1`; a build containing `3a8408558` but not `f0cb511f1` still erases it on a plan with detected phases, and an older one on every plan. A patch merges an
+   object-valued key recursively, so to replace one whole (e.g.
+   `metadata.dispatch`), patch it to `null` first; an array is replaced
+   whole, so per-item records belong in an object keyed by item. For
+   `metadata.dispatch` the null-first step also avoids a refused hybrid:
+   coord validates the stored dispatch as merged since `12591ee50`
+   (2026-10-31; nothing is written: HTTP 422, or a `coord_work_unit_upsert` tool error, with a message beginning `invalid metadata.dispatch`). Separately, VERIFIED against
    the serving build's source: an upsert that carries NO vet manifest and does
    not TRANSITION the unit into `vetted` never retires the stored vet manifest
    (coord `f1400f2d8`, an ancestor of serving build `601c2bda` as of 2026-10-07:

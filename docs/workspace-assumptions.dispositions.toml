@@ -298,6 +298,16 @@ reviewed = [
 ]
 
 [[disposition]]
+class = "dev_ports"
+file = "src/pair.rs"
+symbol = "BrowserPairPage::provenance"
+disposition = "dev_only_surface"
+note = "Operator-facing provenance text for `device pair --browser`: it names the qontinui-web dev frontend on :3001 only as an example value for $QONTINUI_WEB_FRONTEND_BASE when the page origin was derived from the API base. Nothing dials it; the page URL comes from the env override or the API-base derivation (runner#2287)."
+reviewed = [
+    "to override (local dev: http://localhost:3001)\",",
+]
+
+[[disposition]]
 class = "supervisor_dependency"
 file = "src/mcp/session_briefing.rs"
 symbol = "session_briefing_handler"
@@ -605,6 +615,19 @@ file = "src/session/tracking_health.rs"
 symbol = "const WORK_CHILD_IMAGES"
 disposition = "fallback_correct"
 note = "Process-IMAGE names compared against a session's direct children on every OS, never launched or required: a pwsh/powershell direct child (a shell a tool runs under) counts as WORK. On a box without PowerShell nothing matches, and the rest of child_signals_work decides as before."
+reviewed = [
+    "\"powershell\",",
+    "\"pwsh\",",
+]
+
+# qontinui-runner#2376 (plan 2026-10-23-runner-sessions-stop-at-permission-dialogs-so-accept-them-by-default-with-a-tenant-switch
+# Phase 2): the PermissionRequest hook carrier's shell-program list.
+[[disposition]]
+class = "os_bound_tooling"
+file = "src/session/claude_hook.rs"
+symbol = "const SHELL_PROGRAMS"
+disposition = "fallback_correct"
+note = "Shell-name stems compared against the argv[0] of a spawn on every OS, never launched or required: the env-var carrier applies only where an interactive shell resolves `claude` through the identity shim. pwsh/powershell are two entries among ten (bash, sh, zsh, fish, dash, ksh, cmd, nu); on a box without PowerShell they match nothing and the rest decide as before."
 reviewed = [
     "\"powershell\",",
     "\"pwsh\",",

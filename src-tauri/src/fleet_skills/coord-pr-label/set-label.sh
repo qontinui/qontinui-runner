@@ -255,6 +255,17 @@ validate_label() {
       ;;
   esac
 
+  # The destructive-migration attestation -- the same provenance gate, mirrored
+  # from coord's DESTRUCTIVE_ATTESTED_LABEL_ERR. Every value is refused, well
+  # formed or not. Without this arm the bare label reports `parameterised labels
+  # need "=value"` and adding a digest then reports `unknown coord:* label key`.
+  case "$rest" in
+    destructive-attested|destructive-attested=*)
+      echo "error: coord:destructive-attested=<digest12> must be set on the PR itself by a holder of repo write (\`gh api -X POST repos/<owner>/<repo>/issues/<n>/labels -f 'labels[]=coord:destructive-attested=<digest12>'\`), then read back with \`gh api repos/<owner>/<repo>/issues/<n>/labels\`. coord honours only source='github' rows of this label and its door refuses a skill-set row." >&2
+      return 1
+      ;;
+  esac
+
   # The DECLARED cross-repo red-main-fix edge -- the same provenance gate as
   # `coord:priority`, mirrored from coord's refusal: coord honours
   # `coord:clears-red=[<owner>/]<repo>` ONLY from a GitHub-applied label
@@ -271,19 +282,29 @@ validate_label() {
   esac
 
   # Flag labels (no =). Accepted because live consumers read the rows
-  # (the Tier-7 credibility gate; the migrate self-blocking check).
+  # (the Tier-7 credibility gate; the Tier-8b blast-radius gate; the migrate
+  # self-blocking check).
   #
-  # `credibility-override` is BOUNDED — it relaxes a credibility threshold
-  # inside a gate that still runs. `migrate-repair` is the ODD ONE
-  # OUT, and the asymmetry is deliberate: it is the only flag here that
-  # RELEASES a hold, i.e. can make a land happen that otherwise would not.
-  # coord bounds it at the CONSUMING end rather than here — the validator
-  # only decides whether the label may be SET, and
-  # `merge_scheduler::migrate_self_blocking` independently refuses to honour
-  # it unless the land is genuinely self-blocking. Setting it is cheap and
-  # auditable; acting on it is not, and coord keeps those two decisions
-  # separate. (Value mirrored from `MIGRATE_REPAIR_LABEL_SUFFIX`.)
-  if [[ "$rest" == "credibility-override" || "$rest" == "migrate-repair" ]]; then
+  # All three RELEASE a block — each can make a land happen that otherwise
+  # would not — and only one of them is bounded where it is consumed:
+  #
+  # - `credibility-override` is NOT bounded: with it on the PR, coord's
+  #   Tier 7 (`pr_merge/predicate.rs`) skips the credibility gate outright.
+  # - `blast-radius-override`, its Tier-8b twin, is NOT bounded either: Tier 8b
+  #   skips its `removes-referenced-export` block whatever the removal. It is
+  #   the per-PR escape hatch for a blast-radius false positive.
+  # - `migrate-repair` IS bounded, at the CONSUMING end rather than here — the
+  #   validator only decides whether the label may be SET, and
+  #   `merge_scheduler::migrate_self_blocking` independently refuses to honour
+  #   it unless the land is genuinely self-blocking. Setting it is cheap and
+  #   auditable; acting on it is not, and coord keeps those two decisions
+  #   separate. (Value mirrored from `MIGRATE_REPAIR_LABEL_SUFFIX`.)
+  #
+  # Setting any of the three notifies the operator (coord's gate-override
+  # notice, `GATE_OVERRIDE_LABELS`), which is the only control on an unbounded
+  # override.
+  if [[ "$rest" == "credibility-override" || "$rest" == "blast-radius-override" \
+        || "$rest" == "migrate-repair" ]]; then
     return 0
   fi
 

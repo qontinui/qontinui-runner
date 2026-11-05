@@ -19559,9 +19559,9 @@ mod tests {
 
         // Point the root-config self-heal (Phase 5b) at `base` — which holds no
         // `.mcp.json` — so this test exercises ONLY the session path and never
-        // touches the operator's real `qontinui-root/.mcp.json`. Restored below.
+        // touches the operator's real `qontinui-root/.mcp.json`. The fixture
+        // captures QONTINUI_ROOT and restores it on drop, unwinding included.
         std::fs::create_dir_all(&base).unwrap();
-        let prev_root = std::env::var("QONTINUI_ROOT").ok();
         std::env::set_var("QONTINUI_ROOT", &base);
 
         // Stale proxy config on :9999 → must be rewritten to :9876.
@@ -19742,10 +19742,6 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&base);
-        match prev_root {
-            Some(p) => std::env::set_var("QONTINUI_ROOT", p),
-            None => std::env::remove_var("QONTINUI_ROOT"),
-        }
     }
 
     /// **Security regression pin.** An AGENT-class `.mcp.json` sitting on the

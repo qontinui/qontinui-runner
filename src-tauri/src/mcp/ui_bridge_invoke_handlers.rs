@@ -54,15 +54,95 @@ impl From<&ProxyableCommand> for CommandDescriptor {
     }
 }
 
-/// Request body for `POST /ui-bridge/invoke/{command_name}`.
+/// Request body for `POST /ui-bridge/invoke/{command_name}` (and the observe
+/// tier's `POST /ui-bridge/observe/{command}`).
 ///
 /// `args` is a free-form JSON object forwarded verbatim to the frontend's
 /// `invoke(command, args)` call. Tauri's IPC maps top-level camelCase
 /// keys to the Rust command's snake_case parameters.
+///
+/// Any OTHER top-level key is captured in `extra` rather than dropped, and
+/// [`InvokeRequestBody::resolve_args`] decides what it means — it is never
+/// silently ignored. Before this, `{"tenantId": "<uuid>"}` (the shape every
+/// fleet credential script sends to `get_coord_device_token`) deserialized
+/// with `args = {}`, so the door answered the DEFAULT tenant's token to a
+/// caller that had named a different tenant — a silent cross-tenant
+/// substitution, measured 2026-10-17 against the live runner on a device bound
+/// to two tenants (the reply's `tenant_id` claim named the default tenant).
+///
+/// A JSON ARRAY body (which a plain struct used to accept positionally) is
+/// now refused by the extractor; no caller sends one.
 #[derive(Debug, Deserialize)]
 pub struct InvokeRequestBody {
+    // Both fields are PRIVATE on purpose: [`InvokeRequestBody::resolve_args`]
+    // is the only way to read the args, so a handler cannot skip the rule.
     #[serde(default = "default_args")]
-    pub args: Value,
+    args: Value,
+    /// Top-level keys other than `args`. See [`InvokeRequestBody::resolve_args`].
+    #[serde(flatten)]
+    extra: serde_json::Map<String, Value>,
+}
+
+/// Commands whose args may ALSO be sent at the top level of the body, beside
+/// (not inside) `args`. Only commands whose documented wire contract has been
+/// spelled that way belong here: `get_coord_device_token`'s `{"tenantId": …}`
+/// is what `coord-revive.sh`, `coord-tenant-credential.sh` and the runner's own
+/// bundled skills send. Every other command refuses a stray top-level key.
+const TOP_LEVEL_ARGS_COMMANDS: &[&str] = &["get_coord_device_token"];
+
+impl InvokeRequestBody {
+    /// The args to dispatch `command` with, or a 400 when the body is
+    /// ambiguous. Never drops a key the caller sent:
+    ///
+    /// - no stray top-level key → `args` (default `{}`), unchanged behaviour;
+    /// - stray top-level keys, `command` in [`TOP_LEVEL_ARGS_COMMANDS`], and
+    ///   `args` absent / `null` / `{}` → the top-level keys ARE the args;
+    /// - stray top-level keys beside a non-empty `args` → 400 (one place only);
+    /// - stray top-level keys for any other command → 400 naming them.
+    pub(crate) fn resolve_args(
+        self,
+        command: &str,
+    ) -> Result<Value, (StatusCode, Json<ApiResponse<()>>)> {
+        if self.extra.is_empty() {
+            return Ok(self.args);
+        }
+        let mut keys: Vec<&str> = self.extra.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        let keys = keys.join("`, `");
+        let args_empty = match &self.args {
+            Value::Null => true,
+            Value::Object(o) => o.is_empty(),
+            _ => false,
+        };
+        let refuse = |detail: String| {
+            Err((
+                StatusCode::BAD_REQUEST,
+                Json(api_error(format!(
+                    "invoke proxy: ambiguous body for '{command}': {detail}"
+                ))),
+            ))
+        };
+        let args_is_object_or_null = matches!(self.args, Value::Null | Value::Object(_));
+        if !args_empty {
+            let what = if args_is_object_or_null {
+                "a non-empty `args`"
+            } else {
+                "an `args` that is not an object"
+            };
+            return refuse(format!(
+                "top-level key(s) `{keys}` sent beside {what} -- send the command's \
+                 arguments in ONE place, `{{\"args\": {{...}}}}`"
+            ));
+        }
+        if TOP_LEVEL_ARGS_COMMANDS.contains(&command) {
+            return Ok(Value::Object(self.extra));
+        }
+        refuse(format!(
+            "unknown top-level key(s) `{keys}` -- the body's only key is `args`; send \
+             `{{\"args\": {{...}}}}` (a top-level key was never read, and is refused rather \
+             than dropped)"
+        ))
+    }
 }
 
 fn default_args() -> Value {
@@ -134,8 +214,9 @@ pub async fn ui_bridge_invoke_handler(
         ));
     }
 
+    let args = body.resolve_args(&command)?;
     let timeout_ms = q.timeout_ms.unwrap_or(DEFAULT_INVOKE_TIMEOUT_MS);
-    let value = perform_invoke_round_trip(&state, &command, &body.args, timeout_ms).await?;
+    let value = perform_invoke_round_trip(&state, &command, &args, timeout_ms).await?;
     Ok(Json(ApiResponse::success(value)))
 }
 
@@ -482,13 +563,18 @@ async fn in_process_dismiss_recent_crash(
 ///
 /// # Args (plan `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential` P3)
 ///
-/// `{"tenantId": "<uuid>"}` names the tenant whose token the caller wants --
+/// `{"args": {"tenantId": "<uuid>"}}` names the tenant whose token the caller
+/// wants; the bare top-level `{"tenantId": "<uuid>"}` is accepted as the same
+/// request ([`InvokeRequestBody::resolve_args`], `TOP_LEVEL_ARGS_COMMANDS`) because
+/// that is the shape the fleet's scripts send -- before 2026-10-17 it was
+/// silently dropped and the default tenant's token came back. `tenantId` is
 /// the same key the Tauri command's `tenant_id` parameter takes over IPC.
 /// `tenant_id` is accepted as an alias (shell callers spell it that way); both
 /// present and disagreeing is a 400, as is a non-string value or any other key.
 /// `{}` / `null` names no tenant, which on a runner holding several tenant slots
 /// is REFUSED -- see `commands::auth::get_coord_device_token`. An older runner
-/// ignores the args entirely, so a caller may always send them.
+/// ignores the args entirely, so a caller may always send them (on this build,
+/// inside `args` or at the top level; any other stray top-level key is a 400).
 ///
 /// Mapping, deliberately three-valued so a caller can tell them apart:
 /// - `Ok(Some(jwt))` -> the JWT as a JSON string;
@@ -1518,5 +1604,116 @@ mod coord_device_token_arg_tests {
         assert!(parse(&json!({"tenantId": 7})).is_err());
         assert!(parse(&json!({"tenant": "t1"})).is_err());
         assert!(parse(&json!("t1")).is_err());
+    }
+}
+
+/// The body-level rule: a top-level key beside `args` is resolved or refused,
+/// never dropped. Regression for the 2026-10-17 measurement where
+/// `{"tenantId": "<qontinui>"}` returned the meryts-2-0 default token.
+#[cfg(test)]
+mod invoke_body_resolve_tests {
+    use super::{coord_device_token_tenant_arg, InvokeRequestBody};
+    use axum::http::StatusCode;
+    use serde_json::{json, Value};
+
+    const T: &str = "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a";
+
+    fn body(v: Value) -> InvokeRequestBody {
+        serde_json::from_value(v).expect("the body deserializes")
+    }
+
+    fn refused(v: Value, command: &str) -> String {
+        let (status, json) = body(v).resolve_args(command).expect_err("must be refused");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let msg = json.0.error.expect("an error message");
+        assert!(
+            !msg.contains("  "),
+            "no garbled continuation whitespace: {msg:?}"
+        );
+        msg
+    }
+
+    #[test]
+    fn top_level_tenant_reaches_get_coord_device_token() {
+        // The exact shape coord-revive.sh / coord-tenant-credential.sh send.
+        let args = body(json!({ "tenantId": T }))
+            .resolve_args("get_coord_device_token")
+            .expect("accepted");
+        assert_eq!(args, json!({ "tenantId": T }));
+        // ... and the tenant parser then sees the tenant, not `None`.
+        assert_eq!(
+            coord_device_token_tenant_arg(&args).unwrap().as_deref(),
+            Some(T)
+        );
+    }
+
+    #[test]
+    fn top_level_snake_case_alias_also_reaches_it() {
+        let args = body(json!({ "tenant_id": T }))
+            .resolve_args("get_coord_device_token")
+            .unwrap();
+        assert_eq!(
+            coord_device_token_tenant_arg(&args).unwrap().as_deref(),
+            Some(T)
+        );
+    }
+
+    #[test]
+    fn top_level_with_explicit_empty_or_null_args_is_still_the_tenant() {
+        for v in [
+            json!({ "args": {}, "tenantId": T }),
+            json!({ "args": null, "tenantId": T }),
+        ] {
+            let args = body(v).resolve_args("get_coord_device_token").unwrap();
+            assert_eq!(
+                coord_device_token_tenant_arg(&args).unwrap().as_deref(),
+                Some(T)
+            );
+        }
+    }
+
+    #[test]
+    fn wrapped_args_are_unchanged() {
+        let args = body(json!({ "args": { "tenantId": T } }))
+            .resolve_args("get_coord_device_token")
+            .unwrap();
+        assert_eq!(args, json!({ "tenantId": T }));
+        assert_eq!(body(json!({})).resolve_args("anything").unwrap(), json!({}));
+    }
+
+    #[test]
+    fn top_level_beside_non_empty_args_is_refused_not_merged() {
+        let msg = refused(
+            json!({ "args": { "tenantId": T }, "tenant_id": "b3ecb579-2dea-47c4-b03e-a23e0ce7e3a5" }),
+            "get_coord_device_token",
+        );
+        assert!(msg.contains("ONE place"), "{msg}");
+        assert!(msg.contains("`tenant_id`"), "{msg}");
+    }
+
+    #[test]
+    fn top_level_beside_non_object_args_says_so() {
+        let msg = refused(
+            json!({ "args": [], "tenantId": T }),
+            "get_coord_device_token",
+        );
+        assert!(msg.contains("not an object"), "{msg}");
+    }
+
+    #[test]
+    fn unknown_top_level_key_on_other_commands_is_refused() {
+        let msg = refused(json!({ "foo": 1, "bar": 2 }), "get_cloud_sync_settings");
+        assert!(msg.contains("`bar`, `foo`"), "keys named, sorted: {msg}");
+        assert!(msg.contains("\"args\""), "{msg}");
+    }
+
+    #[test]
+    fn unknown_top_level_key_still_reaches_the_tenant_parser_and_is_refused_there() {
+        // Promoted, then the command's own parser refuses the stray key -- a
+        // typo never degrades to the tenant-less (default-slot) answer.
+        let args = body(json!({ "tenantID": T }))
+            .resolve_args("get_coord_device_token")
+            .unwrap();
+        assert!(coord_device_token_tenant_arg(&args).is_err());
     }
 }

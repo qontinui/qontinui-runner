@@ -274,8 +274,50 @@ pub fn dispatch_line(
     Some(text)
 }
 
+/// The control-request subtype that asks permission for a tool — the only one
+/// the tenant's `permission_auto_accept` dial may refuse.
+const CAN_USE_TOOL_SUBTYPE: &str = "can_use_tool";
+
+/// The answer to one CLI control request. PURE.
+///
+/// Every request is approved, as it always was (these sessions run in
+/// `bypassPermissions`), EXCEPT a `can_use_tool` request while the tenant's
+/// `permission_auto_accept` dial is answered `off` FROM AN EXPLICIT ROW
+/// (`denies`, [`crate::session::permission_accept::stream_json_denies`] — an
+/// `off` that is coord's no-row default never denies): that one is
+/// refused with [`crate::session::permission_accept::STREAM_JSON_DENY_MESSAGE`],
+/// because no human can answer a headless request and the tenant switch must
+/// mean what it says on this path too (plan
+/// `2026-10-23-runner-sessions-stop-at-permission-dialogs-so-accept-them-by-default-with-a-tenant-switch`
+/// D5). An unanswered dial keeps the allow, so a coord outage cannot start
+/// failing headless sessions that work today. Other subtypes are not
+/// permission requests and are never refused here.
+fn control_response_for(request_id: &str, subtype: &str, denies: bool) -> OutgoingControlResponse {
+    if denies && subtype == CAN_USE_TOOL_SUBTYPE {
+        OutgoingControlResponse::deny_tool(
+            request_id,
+            crate::session::permission_accept::STREAM_JSON_DENY_MESSAGE,
+        )
+    } else {
+        OutgoingControlResponse::allow_tool(request_id)
+    }
+}
+
 /// Handle a control request from the CLI.
-/// In bypass permissions mode, we auto-approve everything.
+/// In bypass permissions mode we approve everything, unless the tenant's
+/// permission auto-accept dial is answered `off` — see [`control_response_for`].
+///
+/// **The deny arm is believed INERT on today's launch arguments.** As far as
+/// the Claude Agent SDK's permission flow is understood here (not measured
+/// against a live Claude Code by this change), a `can_use_tool` control
+/// request is sent to a session started with `--permission-prompt-tool stdio`,
+/// and no runner launch path passes that flag (these sessions run in
+/// `bypassPermissions`), so no `can_use_tool` is expected here today. The arm exists so the tenant switch holds the
+/// day a launch path does pass it. Its wire shape (`behavior: "deny"` +
+/// `message`, beside the `allowed` mirror) follows the runner's existing allow
+/// envelope and Claude Code's documented permission result; it is NOT pinned
+/// against a live Claude Code control exchange — verify it there before
+/// relying on it.
 fn handle_control_request(
     ctrl_req: &crate::claude_protocol::types::CliControlRequest,
     stdin_writer: &Arc<StdinWriter>,
@@ -284,10 +326,16 @@ fn handle_control_request(
     debug!("CLI control request: subtype={}", subtype);
 
     if let Some(ref request_id) = ctrl_req.request_id {
-        // Auto-approve tool use requests (we run in bypassPermissions mode)
-        let response = OutgoingControlResponse::allow_tool(request_id);
+        let denies = subtype == CAN_USE_TOOL_SUBTYPE
+            && crate::session::permission_accept::stream_json_denies();
+        let response = control_response_for(request_id, subtype, denies);
         if let Err(e) = stdin_writer.write_message(&response) {
             warn!("Failed to send control response: {}", e);
+        } else if denies {
+            info!(
+                "Denied control request {}: permission auto-accept is off for this tenant",
+                subtype
+            );
         } else {
             trace!("Auto-approved control request: {}", subtype);
         }
@@ -803,6 +851,77 @@ pub fn flush_line_buffer(
     if let Some(parser) = progress_parser {
         if let Some(parsed_progress) = parser.parse_line(line_buffer) {
             let _ = progress_tx.send(parsed_progress);
+        }
+    }
+}
+
+#[cfg(test)]
+mod permission_dial_tests {
+    use super::*;
+
+    fn response_json(r: &OutgoingControlResponse) -> serde_json::Value {
+        serde_json::to_value(r).unwrap()
+    }
+
+    /// Only a `can_use_tool` request under an answered `off` FROM AN EXPLICIT
+    /// ROW is denied.
+    #[test]
+    fn the_stream_json_control_request_is_denied_only_on_an_answered_off() {
+        let pin = crate::mcp::fleet_policy_poller::pin_permission_auto_accept_for_test();
+        let answer = || {
+            let denies = crate::session::permission_accept::stream_json_denies();
+            response_json(&control_response_for("req-1", CAN_USE_TOOL_SUBTYPE, denies))
+        };
+
+        // Unanswered (cold start / coord outage): today's allow.
+        assert_eq!(answer()["response"]["allowed"], true);
+
+        pin.set("on");
+        assert_eq!(answer()["response"]["allowed"], true);
+
+        pin.set("");
+        assert_eq!(
+            answer()["response"]["allowed"],
+            true,
+            "unrecognised keeps allow"
+        );
+
+        // DEPLOY ORDER: today's coord answers this domain `off` from NO row
+        // (`resolved_scope: "none"`, the unknown-domain default). A runner
+        // shipped before coord's Phase 1 must keep allowing.
+        pin.set_with_scope("off", Some("none"));
+        assert_eq!(
+            answer()["response"]["allowed"],
+            true,
+            "an off from resolved_scope none is still allowed"
+        );
+        pin.set_with_scope("off", None);
+        assert_eq!(
+            answer()["response"]["allowed"],
+            true,
+            "an off with no scope keeps allow"
+        );
+
+        // An `off` the tenant chose (an explicit row) denies.
+        pin.set_with_scope("off", Some("tenant"));
+        let denied = answer();
+        assert_eq!(denied["type"], "control_response");
+        assert_eq!(denied["request_id"], "req-1");
+        assert_eq!(denied["response"]["behavior"], "deny");
+        assert_eq!(
+            denied["response"]["message"],
+            "permission auto-accept is off for this tenant"
+        );
+        assert_eq!(denied["response"]["allowed"], false);
+    }
+
+    /// Other control subtypes are not permission requests: never refused.
+    #[test]
+    fn non_permission_control_requests_are_never_denied() {
+        for subtype in ["initialize", "hook_callback", "mcp_message", ""] {
+            let r = response_json(&control_response_for("req-2", subtype, true));
+            assert_eq!(r["response"]["allowed"], true, "{subtype:?}");
+            assert!(r["response"].get("behavior").is_none(), "{subtype:?}");
         }
     }
 }

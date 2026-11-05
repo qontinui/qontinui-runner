@@ -39,12 +39,11 @@ name: schema.pg.sql.generated nightly freshness
 # blocking a runner PR that lands a stale dump beside a `src-tauri/queries/**`
 # change. And do not fold this file's logic INTO it — `schema-pg-sql-fresh.yml`
 # is inside `ci-integrity.yml`'s scope — which is its trigger
-# (`.github/workflows/**`) minus an empty NON_GATING list, NOT the
+# (which covers `.github/workflows/**`) minus an empty NON_GATING list, NOT the
 # `GATING_WORKFLOWS` allowlist this line used to name; that allowlist is gone,
 # and with it any notion of a workflow file being excluded by an allowlist entry.
-# Every workflow file is in scope ON A PR BASED ON `main` — the guard is
-# `pull_request_target: branches: [main]`, so a STACKED PR editing a workflow
-# fires no ci-integrity run at all. On a main-based PR even a comment-only edit
+# Every workflow file is in scope on a PR with any base: the guard has carried no
+# base-branch filter since qontinui-runner#1253. Even a comment-only edit
 # reds the guard until the PR is declared. WHICH declaration is decided PER-PR,
 # not per-edit: `ci:gate-change=declared` when nothing in the whole PR moves a
 # surface, and `alters-a-gate` plus a `Gate-Change:` body line per altered item

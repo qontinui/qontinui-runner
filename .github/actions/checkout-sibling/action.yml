@@ -115,14 +115,24 @@ description: >-
 # runner-consumer-check.yml:404-405 and silently misses every bare-form label,
 # reddening pairs that ARE properly declared.
 #
-# BOTH forms are evaluated UNCONDITIONALLY, even when the primary hits, and
-# EVERY declaration in each form is collected rather than taking the first or
-# the last. That is not redundant work — it is the only way to detect two
+# ALL FOUR forms are evaluated UNCONDITIONALLY, even when one of them hits,
+# and EVERY declaration in each form is collected rather than taking the first
+# or the last. That is not redundant work — it is the only way to detect two
 # declarations naming DIFFERENT sibling PRs. We can check out exactly one tree,
 # so silently preferring one would resolve an ambiguity that is the author's to
-# resolve. There are three ways to be ambiguous and all three hard-fail alike:
-# two `downstream-of` labels on this PR, two sibling PRs declaring
-# `upstream-of` at this PR, or the two forms naming different PRs.
+# resolve. The ways to be ambiguous all hard-fail alike: two `downstream-of`
+# labels on this PR, two sibling PRs declaring `upstream-of` at this PR, a
+# LEADING form and any other form naming different PRs, or — only on a step
+# that sets `accept-trailing-sibling` — the trailing forms naming different
+# PRs.
+#
+# Several TRAILING declarations are NOT ambiguous on a step that leaves the
+# opt-in off. Every one of them is declined, so the answer is the default
+# branch no matter how many there are; refusing them there was a false red
+# (runner#2311, 2026-10-31: ui-bridge#266 and #270 both legitimately declared
+# `coord:downstream-of=qontinui-runner#2311`, and three required contexts red
+# within seconds on the PR both were waiting for). The declined set is listed
+# in the log so it stays visible.
 #
 # Renaming a branch is no longer a way to satisfy anything.
 #
@@ -236,10 +246,10 @@ inputs:
       against when this change lands, so a compile gate that followed it would
       go green against code that is not there yet and red main on landing. Set
       it ONLY on a step whose question is about the PAIR rather than about what
-      main will look like — today that is exactly `check-drift` in
-      qontinui-types-drift.yml. A declined trailing declaration resolves to the
-      default branch and SAYS SO; it is never silently indistinguishable from
-      "no declaration".
+      main will look like (`check-drift` in qontinui-types-drift.yml is one;
+      grep the callers rather than trusting a count). A declined trailing
+      declaration resolves to the default branch and SAYS SO; it is never
+      silently indistinguishable from "no declaration".
     required: false
     default: 'false'
   pr-number:
@@ -286,8 +296,9 @@ outputs:
       Which declaration form(s) named the target, `+`-joined in a stable order
       — any of `downstream-of`, `upstream-of`, `self-upstream-of`,
       `sibling-downstream-of`; `none` when nothing was declared; or
-      `trailing-declined` when an unambiguous declaration was found but orders
-      the sibling after this side and this step did not opt in. More than one
+      `trailing-declined` when only declarations ordering the sibling after
+      this side were found (one or several — several are not ambiguous when
+      none is followed) and this step did not opt in. More than one
       form is the COMMON case: a single dep-edge declaration is visible from
       both ends, which is what lets it serve both repos' gates.
 
@@ -521,7 +532,7 @@ runs:
         }
 
         # Every "you declared two different things" red, in one shape so the
-        # three ways of being ambiguous read alike (§3.2 / §3.7 of the plan).
+        # ways of being ambiguous read alike (§3.2 / §3.7 of the plan).
         # $1 = what was contradictory, $2 = newline-separated sibling PR numbers.
         ambiguous() {
           local t
@@ -629,11 +640,13 @@ runs:
         fi
         target_down="${UNIQ%$'\n'}"
 
-        uniq_list "${self_ups}"
-        if [ "${UNIQ_N}" -gt 1 ]; then
-          ambiguous "this PR carries coord:upstream-of labels naming DIFFERENT ${SIBLING_SHORT} PRs" "${UNIQ}"
-        fi
-        target_selfup="${UNIQ%$'\n'}"
+        # `self_ups` is deliberately NOT refused here when it names several
+        # sibling PRs. It is a TRAILING form (this side leads), and several
+        # trailing declarations are only a contradiction when a tree must be
+        # chosen from among them — which depends on ACCEPT_TRAILING (validated
+        # above) and on whether a leading form exists, which is only known
+        # after the reverse search (a sibling PR's `upstream-of` is a leading
+        # form). So the trailing set is reconciled there. See "Reconcile".
 
         # --- Reverse search: BOTH dep-edge directions on the sibling's PRs. ---
         # Evaluated UNCONDITIONALLY, even when the self-read hit, so a
@@ -684,9 +697,10 @@ runs:
           [ -n "${hits}" ] && ups="${ups}${hits}"$'\n'
 
           # Same query, opposite direction. Kept as a separate `jq` rather than
-          # one pass emitting "form:number" pairs: the two lists are checked for
-          # ambiguity independently, and a combined capture would need splitting
-          # back apart right here — for no saved subprocess on the page that
+          # one pass emitting "form:number" pairs: the two lists are reconciled
+          # differently (`ups` is a leading form, refused at >1; `sib_downs` is
+          # a trailing form, kept as a set), and a combined capture would need
+          # splitting back apart right here — for no saved subprocess on the page that
           # matters (the first).
           hits="$(printf '%s' "${API_BODY}" | jq -r --arg short "${THIS_SHORT}" --arg num "${PR_NUMBER}" '
             [ .[]
@@ -715,25 +729,39 @@ runs:
         fi
         target_up="${UNIQ%$'\n'}"
 
+        # The two TRAILING forms are kept as SETS, not refused at >1 the way
+        # the two leading forms are above. Several sibling PRs declaring that
+        # they land AFTER this one is an ordinary, legitimate state — a runner
+        # change that two independent ui-bridge adaptations both wait on — and
+        # it is not by itself a contradiction. It becomes one only when this
+        # step must pick ONE tree out of the set, which is decided below.
+        #
+        # Refusing it here (the pre-2026-10-31 behaviour) ran BEFORE the
+        # trailing-declined branch, so a step that would have built `main`
+        # regardless of how many siblings trail hard-failed instead — a false
+        # red that blocked runner#2311 (`test (ubuntu-22.04)`,
+        # `test (windows-latest)` and `Clippy (windows)`, all within seconds,
+        # on ui-bridge#266 and ui-bridge#270 both declaring
+        # coord:downstream-of=qontinui-runner#2311). It struck exactly the PR
+        # that most needs to land: the one several siblings are waiting on.
+        uniq_list "${self_ups}"
+        trail_selfup="${UNIQ}"
         uniq_list "${sib_downs}"
-        if [ "${UNIQ_N}" -gt 1 ]; then
-          ambiguous "several open ${SIBLING_SHORT} PRs declare coord:downstream-of=${THIS_SHORT}#${PR_NUMBER}" "${UNIQ}"
-        fi
-        target_sibdown="${UNIQ%$'\n'}"
+        trail_sibdown="${UNIQ}"
 
         # --- Reconcile the four forms. ---------------------------------------
-        # All four name the SAME thing — the paired sibling PR — so they are
-        # unioned and any disagreement about WHICH PR is one ambiguity, reported
-        # once. The direction each form implies is tracked separately below,
-        # because that is a different question with a different answer.
+        # All four name the SAME kind of thing — a paired sibling PR — so a
+        # disagreement about WHICH PR is one ambiguity, reported once. The
+        # direction each form implies is tracked separately, because that is a
+        # different question with a different answer.
         SOURCE=""
         add_form() { if [ -z "${SOURCE}" ]; then SOURCE="$1"; else SOURCE="${SOURCE}+$1"; fi; }
         leads=""   # forms saying the SIBLING merges first
         trails=""  # forms saying THIS side merges first
-        [ -n "${target_down}" ]    && { add_form "downstream-of";         leads="${leads}downstream-of "; }
-        [ -n "${target_up}" ]      && { add_form "upstream-of";           leads="${leads}upstream-of "; }
-        [ -n "${target_selfup}" ]  && { add_form "self-upstream-of";      trails="${trails}self-upstream-of "; }
-        [ -n "${target_sibdown}" ] && { add_form "sibling-downstream-of"; trails="${trails}sibling-downstream-of "; }
+        [ -n "${target_down}" ]   && { add_form "downstream-of";         leads="${leads}downstream-of "; }
+        [ -n "${target_up}" ]     && { add_form "upstream-of";           leads="${leads}upstream-of "; }
+        [ -n "${trail_selfup}" ]  && { add_form "self-upstream-of";      trails="${trails}self-upstream-of "; }
+        [ -n "${trail_sibdown}" ] && { add_form "sibling-downstream-of"; trails="${trails}sibling-downstream-of "; }
 
         if [ -z "${SOURCE}" ]; then
           SOURCE="none"
@@ -742,41 +770,82 @@ runs:
           exit 0
         fi
 
-        uniq_list "${target_down}"$'\n'"${target_up}"$'\n'"${target_selfup}"$'\n'"${target_sibdown}"
-        if [ "${UNIQ_N}" -gt 1 ]; then
-          ambiguous "the coord dep labels on this PR and on ${SIBLING_REPO}'s open PRs name DIFFERENT ${SIBLING_SHORT} PRs" "${UNIQ}"
-        fi
-        target="${UNIQ%$'\n'}"
+        # Every trailing target, both forms unioned. Each UNIQ above is
+        # newline-terminated, so plain concatenation is a well-formed list.
+        uniq_list "${trail_selfup}${trail_sibdown}"
+        trail_targets="${UNIQ}"
+        TRAIL_N="${UNIQ_N}"
 
-        echo "Declared adaptation: ${SIBLING_REPO}#${target} (via ${SOURCE})"
+        if [ -n "${leads}" ]; then
+          # A LEADING form exists, so the tree is the leading target and every
+          # trailing declaration must be reconciled against it — strictness is
+          # unchanged here. The union check runs FIRST so that a trailing
+          # target DIFFERENT from the leading one reads as the ambiguity it is;
+          # only when every form names the same PR does the cycle check below
+          # get to say "both directions on one pair".
+          #
+          # DELIBERATE: a leading target PLUS a trailing declaration naming a
+          # DIFFERENT sibling PR (this PR waits on #5 while #7 waits on this
+          # PR) is acyclic and the tree is plainly #5, yet it is still refused.
+          # That keeps the pre-existing strictness for mixed directions; relax
+          # it only as its own, separately reviewed change.
+          uniq_list "${target_down}"$'\n'"${target_up}"$'\n'"${trail_targets}"
+          if [ "${UNIQ_N}" -gt 1 ]; then
+            ambiguous "the coord dep labels on this PR and on ${SIBLING_REPO}'s open PRs name DIFFERENT ${SIBLING_SHORT} PRs" "${UNIQ}"
+          fi
+          target="${UNIQ%$'\n'}"
 
-        # A pair declared in BOTH directions is a cycle in coord's dep graph:
-        # each side waits for the other and neither is ever proposed. Which
-        # direction is right is the author's call — but resolving the tree and
-        # going green would hide the cycle behind a passing check.
-        if [ -n "${leads}" ] && [ -n "${trails}" ]; then
-          echo "::error::Contradictory merge ORDER declared for the pair ${THIS_SHORT}#${PR_NUMBER} / ${SIBLING_REPO}#${target}:"
-          echo "  ${leads% } order ${SIBLING_SHORT} first"
-          echo "  ${trails% } order ${THIS_SHORT} first"
-          echo ""
-          echo "That is a cycle in coord's dependency graph — it would hold BOTH pull requests"
-          echo "forever. Keep exactly one direction; remove the other with the coord-pr-label"
-          echo "skill (it validates the namespace before sending)."
-          exit 1
-        fi
+          echo "Declared adaptation: ${SIBLING_REPO}#${target} (via ${SOURCE})"
 
-        # The sibling TRAILS and this step did not opt in. Resolve to the
-        # default branch — but as a DECIDED outcome that names itself, never a
-        # silent fallback indistinguishable from "nobody declared anything".
-        if [ -z "${leads}" ] && [ "${ACCEPT_TRAILING:-false}" != "true" ]; then
-          echo "Declaration ${SIBLING_REPO}#${target} (via ${SOURCE}) orders ${SIBLING_SHORT} AFTER"
-          echo "${THIS_SHORT}#${PR_NUMBER}, and this step does not accept a trailing sibling."
-          echo "Its tree is not what ${THIS_SHORT} compiles against when this change lands, so"
-          echo "following it would go green against code that is not there yet."
-          echo "Using ${SIBLING_REPO} ref: main (trailing declaration declined)"
-          SOURCE="trailing-declined"
-          emit
-          exit 0
+          # A pair declared in BOTH directions is a cycle in coord's dep graph:
+          # each side waits for the other and neither is ever proposed. Which
+          # direction is right is the author's call — but resolving the tree
+          # and going green would hide the cycle behind a passing check.
+          if [ -n "${trails}" ]; then
+            echo "::error::Contradictory merge ORDER declared for the pair ${THIS_SHORT}#${PR_NUMBER} / ${SIBLING_REPO}#${target}:"
+            echo "  ${leads% } order ${SIBLING_SHORT} first"
+            echo "  ${trails% } order ${THIS_SHORT} first"
+            echo ""
+            echo "That is a cycle in coord's dependency graph — it would hold BOTH pull requests"
+            echo "forever. Keep exactly one direction; remove the other with the coord-pr-label"
+            echo "skill (it validates the namespace before sending)."
+            exit 1
+          fi
+        else
+          # TRAILING forms only: every declared sibling PR lands AFTER this one.
+          #
+          # The sibling TRAILS and this step did not opt in. Resolve to the
+          # default branch — but as a DECIDED outcome that names itself, never a
+          # silent fallback indistinguishable from "nobody declared anything".
+          # The count of trailing PRs is irrelevant to that answer: none of
+          # their trees is followed, so several of them cannot be ambiguous.
+          if [ "${ACCEPT_TRAILING:-false}" != "true" ]; then
+            if [ "${TRAIL_N}" -eq 1 ]; then
+              echo "Declaration ${SIBLING_REPO}#${trail_targets%$'\n'} (via ${SOURCE}) orders ${SIBLING_SHORT} AFTER"
+            else
+              echo "${TRAIL_N} declarations (via ${SOURCE}) order ${SIBLING_SHORT} AFTER ${THIS_SHORT}#${PR_NUMBER}:"
+              while IFS= read -r t; do
+                [ -n "${t}" ] && echo "  - ${SIBLING_REPO}#${t}"
+              done <<< "${trail_targets}"
+              echo "Each of them orders ${SIBLING_SHORT} AFTER"
+            fi
+            echo "${THIS_SHORT}#${PR_NUMBER}, and this step does not accept a trailing sibling."
+            echo "A trailing tree is not what ${THIS_SHORT} compiles against when this change lands,"
+            echo "so following one would go green against code that is not there yet."
+            echo "Using ${SIBLING_REPO} ref: main (trailing declaration declined)"
+            SOURCE="trailing-declined"
+            emit
+            exit 0
+          fi
+
+          # This step DOES follow a trailing sibling, so exactly one trailing
+          # tree must be chosen — and several distinct ones are ambiguous.
+          if [ "${TRAIL_N}" -gt 1 ]; then
+            ambiguous "this step follows a trailing sibling, and the coord dep labels ordering ${SIBLING_SHORT} after ${THIS_SHORT}#${PR_NUMBER} name DIFFERENT ${SIBLING_SHORT} PRs" "${trail_targets}"
+          fi
+          target="${trail_targets%$'\n'}"
+
+          echo "Declared adaptation: ${SIBLING_REPO}#${target} (via ${SOURCE})"
         fi
 
         # --- Validate the declaration. ---------------------------------------

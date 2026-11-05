@@ -14,6 +14,11 @@ documents every verdict and the evidence it rests on.
 Exit codes: 0 done (every attempted close verified), 1 a close was skipped or
 did not verify, 3 UNKNOWN: the runner could not be read (nothing screened), or
 --close was refused because /restart-readiness could not be read.
+
+close-finished-sessions.py --own-tasks [--idle-min N] [--json] lists the calling
+session's own background tasks, each STRAY (a wait loop that can never end) or
+LIVE, from /proc alone. /finish-session runs it. Exit 0 none live, 1 a live one,
+3 UNKNOWN (no /proc, or no claude above the caller).
 """
 import argparse
 import datetime as dt
@@ -667,6 +672,8 @@ WIN_TOOL_BASH = r'''"C:\Program Files\Git\bin\bash.exe" -c -l "export TEMP='C:\T
 
 
 FT = "Review found nothing to follow up.\n\n**POLICY_COMPLIANCE**\n"
+# A replayed Linux pane whose input prompt is empty (the selftests' idle screen).
+EMPTY_PROMPT_SCREEN = "\x1b[H\r\x1b[17B\u276f\xa0\r\x1b[50C\x1b[2Bfor agents\x1b[K\x1b[20;1H\x1b[18;3H\x1b[?25h"
 FOOTER_CASES = [
     (FT + "- **Final state:** #1816 is landed and nothing further is owed.\n- **Clauses applied:** x", True),
     (FT + "- Final state: nothing owed.\n- POLICY_GAPs: none.", True),
@@ -792,7 +799,7 @@ def selftest():
         bad.append(f"win_table stale-parent cut / name fallback / self-parent: {wt}")
     if sorted(subtree({1: (2, []), 2: (1, [])}, 1)) != [1, 2]:
         bad.append("subtree does not terminate on a parent cycle")
-    empty = "\x1b[H\r\x1b[17B\u276f\xa0\r\x1b[50C\x1b[2Bfor agents\x1b[K\x1b[20;1H\x1b[18;3H\x1b[?25h"
+    empty = EMPTY_PROMPT_SCREEN
     for raw, want in [(empty, "empty"),
                       ("\x1b[26;1H\r\x1b[2B\x1b[39m\u276f\xa0\x1b[2mrun /vet-imp on the plan\r\x1b[47C\x1b[22m"
                        "\x1b[K\x1b[30;1H\x1b[28;3H\x1b[?25h", "empty"),
@@ -861,11 +868,12 @@ def selftest():
     if two["t"]["claudeSessionId"] != "new":
         bad.append("a terminal with two open rows must resolve to the newest openedAt")
     finish_cases = finish_time_cases(bad)
+    stray_cases = stray_selftest(bad, empty) + end_strays_selftest(bad)
     for line in bad:
         print("SELFTEST FAIL: " + line)
     print(f"selftest: {len(PHRASE_CASES)} phrase cases, {len(WIND_DOWN_CASES)} wind-down reason cases, "
           f"{len(NO_VETO_CASES)} no-veto cases, {finish_cases} finish-time cases + turn-end, shell "
-          f"and prompt cases, {len(bad)} failure(s)")
+          f"and prompt cases, {stray_cases} stray-shell cases, {len(bad)} failure(s)")
     return 1 if bad else 0
 
 
@@ -1046,6 +1054,363 @@ def finish_time_cases(bad):
             if v != "REVIVED" or "a turn opened" not in "; ".join(why):
                 bad.append(f"a Session Bus delivery after coord's stamp = {v} {why}, want REVIVED (a turn opened)")
     return len(cases) + 1 + len(turn_cases) + 1
+
+
+def _tool_argv(cmd, acct="sales", cwd_file="/tmp/claude-1a2b-cwd"):
+    """A Linux tool shell's argv as Claude Code builds it (measured 2026-10-23)."""
+    return ["/bin/bash", "-c", f"source /x/.claude-{acct}/shell-snapshots/snapshot-bash-1-x.sh 2>/dev/null || "
+            "true && shopt -u extglob 2>/dev/null || true && { \\builtin unalias -- 'unsetenv'; \\builtin unset -f -- "
+            "'unsetenv'; } >/dev/null 2>&1 || true && eval '" + cmd.replace("'", "'\"'\"'")
+            + f"' < /dev/null && pwd -P >| {cwd_file}"]
+
+
+def end_strays_selftest(bad):
+    """close_one's signalling half, end_strays(), on wait loops this test starts
+    itself (Linux only; skipped elsewhere). It signals nothing but its own children
+    and reaps them on every path. A recorded stray is ended; an entry whose start
+    time or argv is wrong is left alone; a loop whose condition flipped, now running
+    its post-loop command, is left alone. Returns the number of cases run."""
+    if WINDOWS or not os.path.isdir("/proc/self") or not os.path.exists("/bin/bash"):
+        return 0
+    import ctypes
+    import shutil
+    import signal
+    import tempfile
+    n, kids, d = 0, [], tempfile.mkdtemp(prefix="cfs-endstray-")
+    token = f"cfs-endstray-{os.getpid()}-{os.urandom(4).hex()}"
+    log, log2 = os.path.join(d, "build.log"), os.path.join(d, "other.log")
+    libc, parent = ctypes.CDLL(None, use_errno=True), os.getpid()
+
+    def die_with_parent():  # in the child, before exec: a parent that dies by any signal takes the loop with it
+        libc.prctl(1, signal.SIGKILL, 0, 0, 0)  # PR_SET_PDEATHSIG
+        if os.getppid() != parent:
+            os._exit(1)  # the parent died before the line above ran
+
+    def spawn(cmd):
+        argv = _tool_argv(cmd, cwd_file=os.path.join(d, "cwd"))
+        kid = subprocess.Popen(argv, start_new_session=True, stdin=subprocess.DEVNULL, preexec_fn=die_with_parent,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        kids.append(kid)
+        return kid, argv
+
+    def on_signal(signum, _frame):
+        raise SystemExit(128 + signum)  # so the `finally` below still reaps the children
+
+    handlers = {}
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        try:
+            handlers[sig] = signal.signal(sig, on_signal)
+        except ValueError:  # not the main thread: PR_SET_PDEATHSIG still covers a dying parent
+            pass
+    try:
+        for f in (log, log2):
+            with open(f, "w") as fh:
+                fh.write("Compiling\n")
+            os.utime(f, (time.time() - 3600, time.time() - 3600))
+        if shutil.which("pgrep"):
+            a, a_argv, a_cls = *spawn(f"until ! pgrep -f {token} >/dev/null; do sleep 0.2; done; true"), "a"
+        else:
+            a, a_argv, a_cls = *spawn(f"until grep -q DONE {log2}; do sleep 0.2; done; true"), "b-file"
+        b, b_argv = spawn(f"until grep -q DONE {log}; do sleep 0.2; done; sleep 30")
+        verdicts, deadline = None, time.time() + 5
+        while time.time() < deadline:  # bounded: until both children have exec'd and been seen
+            time.sleep(0.2)
+            t = proc_table() or {}
+            if a.pid in t and b.pid in t and t[a.pid][1] == a_argv and t[b.pid][1] == b_argv:
+                f = ProcFacts(t)
+                verdicts = stray_verdict(t, a.pid, f, 15)[:2], stray_verdict(t, b.pid, f, 15)[:2]
+                break
+        n += 1
+        if verdicts != ((True, a_cls), (True, "b-file")):
+            bad.append(f"end_strays: this test's own loops did not read as strays: {verdicts}")
+            return n
+        sa, sb = proc_start(a.pid), proc_start(b.pid)
+        n += 1
+        msg = end_strays([(a.pid, sa + 1, a_argv, a_cls), (a.pid, sa, a_argv + ["x"], a_cls)], 15, wait_s=0.5)
+        if a.poll() is not None or msg != "; 2 stray wait loop(s) gone with the pane":
+            bad.append(f"end_strays signalled an entry whose start time or argv was wrong: {msg!r}")
+        n += 1
+        with open(log, "a") as fh:
+            fh.write("DONE\n")  # the condition flips: the loop moves on to its post-loop sleep
+        time.sleep(0.6)
+        msg = end_strays([(b.pid, sb, b_argv, "b-file")], 15, wait_s=0.5)
+        if b.poll() is not None or "could not end: no longer a b-file stray" not in msg:
+            bad.append(f"end_strays signalled a loop whose condition flipped: {msg!r}")
+        n += 1
+        saved = globals()["proc_table"]
+        globals()["proc_table"] = lambda: None  # the re-check cannot read the table: nothing may be sent
+        try:
+            msg = end_strays([(a.pid, sa, a_argv, a_cls)], 15, wait_s=0.5)
+        finally:
+            globals()["proc_table"] = saved
+        if a.poll() is not None or msg != f"; stray pid {a.pid} outlived the pane close; could not end: process " \
+                                          "table unreadable at re-check":
+            bad.append(f"end_strays with an unreadable process table: {msg!r}")
+        n += 1
+        msg = end_strays([(a.pid, sa, a_argv, a_cls)], 15, wait_s=2)
+        try:
+            a.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        if msg != f"; stray pid {a.pid} outlived the pane close; ended" or a.poll() is None:
+            bad.append(f"end_strays did not end a recorded, unchanged stray: {msg!r}")
+    finally:
+        for kid in kids:  # this test's own children, each in its own session: never anything else
+            if kid.poll() is None:
+                try:
+                    os.killpg(kid.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+            try:
+                kid.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+        shutil.rmtree(d, ignore_errors=True)
+        for sig, old in handlers.items():
+            signal.signal(sig, old)
+    return n
+
+
+def stray_selftest(bad, empty_prompt=EMPTY_PROMPT_SCREEN):
+    """The stray-wait-loop classifier on synthetic process tables (nothing live is
+    read). Returns the number of cases run."""
+    empty_prompt = empty_prompt or EMPTY_PROMPT_SCREEN
+    n, now, me = 0, 1e9, _user(my_uid())
+    gp, cg, out = "git push -u origin HEAD", "cargo-guard.sh test -- mcp::bridges", \
+        "/scratch/claude-1000/-s-proj/f116bbce-1e85-4828-a73f-06f0b90430b7/tasks/b1r1ys0pd.output"
+    # The measured d2dd1423 set: 8 self-matching loops on 2 patterns, each with a sleep child.
+    loops = {445646: f'until ! pgrep -f "{gp}" >/dev/null; do sleep 15; done; cat {out}',
+             464345: f'until ! pgrep -f "{gp}" >/dev/null; do sleep 15; done; cat {out}',
+             1873808: f'until ! pgrep -f "{gp}" >/dev/null; do sleep 15; done; cat {out}',
+             3135797: f'until ! pgrep -f "{gp}" >/dev/null; do sleep 15; done; cat {out}',
+             3139942: f'until ! pgrep -f "{gp}" >/dev/null; do sleep 15; done; echo finished',
+             2786305: f'until ! pgrep -f "{cg}" >/dev/null; do sleep 15; done; grep -E "^error|bridges::|test result: '
+                      'ok. [1-9]|FAILED|verdict" /s/cargotest.log | head',
+             3690915: f'until ! pgrep -f "{cg}" >/dev/null; do sleep 15; done; echo done',
+             3743706: (f'until ! pgrep -f "{cg}" >/dev/null; do sleep 15; done; '
+                       f'cat {out.rsplit("/", 1)[0]}/b2rb7udxa.output')}
+    base = {1: (0, ["/sbin/init"]), 20: (1, ["pty-holder", "--", "claude"]),
+            21033: (20, ["/usr/bin/claude", "--resume", "f116bbce"]), 30: (1, ["python3", "cfs.py", "--report"]),
+            50: (1, ["vim", "notes.txt"])}
+    d2 = dict(base)
+    for p, c in loops.items():
+        d2[p], d2[p + 1] = (21033, _tool_argv(c)), (p, ["sleep", "15"])
+    d2[445648] = (445646, ["pgrep", "-f", gp])  # a loop's own probe caught mid-flight is a watcher, not a target
+
+    def split(table, files=None, start=None, windows=False):
+        _FACTS[:] = [table, ProcFacts(table, start=start or {}, uids={}, files=files or {}, self_pids={30}, now=now)]
+        return split_strays(table, proc_facts(table, 20, windows=False)[1], 15, windows=windows)
+
+    tdir = "/scratch/claude-1000/-s-proj/5b330eb3-5df7-459f-adf6-7927a533d510/tasks"  # a harness tasks dir, present
+
+    def one(cmd, extra=None, files=None, start=None, kids=(("sleep", "15"),), dirs=None):
+        t = {1: (0, ["/sbin/init"]), 10: (1, ["/usr/bin/claude"]), 30: (1, ["python3", "cfs.py"]),
+             40: (10, _tool_argv(cmd))}
+        t.update({41 + k: (40, list(argv)) for k, argv in enumerate(kids)})
+        t.update(extra or {})
+        files = files or {}
+        # present dirs: the harness tasks dir, two ordinary `tasks` dirs, and each file's own
+        if dirs is None:
+            dirs = {tdir, "/s/proj/tasks", "/s/ci/tasks", "/s/jobs/0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b/tasks"} | {
+                f.rsplit("/", 1)[0] for f in files}
+        return stray_verdict(t, 40, ProcFacts(t, start=start or {}, uids={}, files=files, self_pids={30},
+                                              now=now, dirs=dirs), 15)
+
+    try:
+        n += 1
+        work, strays, waits = split(d2)
+        if work or sorted(p for p, _, _ in strays) != sorted(loops) or {c for _, c, _ in strays} != {"a"}:
+            bad.append(f"d2dd1423 set: work={work} strays={[(p, c) for p, c, _ in strays]}")
+        # (2) one stray beside one real cargo test: the cargo shell is work.
+        n += 1
+        mix = dict(d2)
+        mix[700], mix[701] = (21033, _tool_argv("cargo test -p qontinui-runner 2>&1 | tail -20")), \
+            (700, ["cargo", "test", "-p", "qontinui-runner"])
+        work, strays, _ = split(mix)
+        if work != [700] or len(strays) != 8:
+            bad.append(f"stray + cargo test: work={work}, {len(strays)} strays")
+        # (4) a self-matching loop whose target still runs waits on live work.
+        n += 1
+        live = dict(d2)
+        live[800] = (1, ["git", "push", "-u", "origin", "HEAD"])
+        work, strays, waits = split(live)
+        if sorted(work) != sorted(p for p in loops if gp in loops[p]) or len(strays) != 3 or \
+                not waits or waits[0] != "waits on live pid 800 (self-matching loop: will never exit on its own)":
+            bad.append(f"live target: work={work} strays={len(strays)} waits={waits[:1]}")
+        # (6) Windows command lines are not read: every shell is work.
+        n += 1
+        if split(d2, windows=True)[1] or one("x")[0] or \
+                stray_verdict({7: (1, ["bash.exe", UNREADABLE_CMDLINE])}, 7, ProcFacts({}, start={}, uids={}, files={},
+                                                                                  self_pids=set()), 15)[0]:
+            bad.append("a Windows / unreadable command line must never read as stray")
+        # The classifier, case by case: (want_stray, class or None, command, extra, files, start, kids).
+        census = "/s/census/cargo.log"
+        old, held = (now - 3 * 3600, set(), "Compiling x\n"), (now - 3 * 3600, {950}, "Compiling x\n")
+        task = f"{tdir}/brm8jg1o0.output"
+        twait = f"until grep -qE 'exit=' {task} 2>/dev/null; do sleep 20; done; cat {task}"
+        esc = (f"L={census}; until grep -qE 'test result|^error|could not compile' $L || ! pgrep -f "
+               "'cargo test -- zz_census' >/dev/null; do sleep 15; done; tail -8 $L")
+        cases = [
+            # (5) a tasks/<id>.output marker wait
+            (True, "b-file", twait, None, {task: old}, None, (("sleep", "20"),)),
+            (False, None, twait, None, {task: held}, None, (("sleep", "20"),)),  # a process holds it open
+            (False, None, twait, None, {task: (now - 60, set(), "x\n")}, None, ()),  # changed inside the idle floor
+            (False, None, twait, None, {task: (now - 3 * 3600, set(), "exit=0\n")}, None, ()),  # already holds
+            (True, "b-file", twait, None, {}, None, ()),  # a harness task file gone from a live tasks dir
+            # a tasks/*.output outside the harness layout is an ordinary file: missing means "not yet"
+            (False, None, "until [ -f /s/proj/tasks/build.output ]; do sleep 5; done; ./deploy.sh", None, {}, None,
+             ()),
+            (False, None, "until grep -q DONE /s/ci/tasks/job42.output; do sleep 30; done; ./release.sh", None, {},
+             None, ()),
+            (False, None, "until [ -f /s/jobs/0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b/tasks/out.output ]; do sleep 5; "
+                          "done; ./ship.sh", None, {}, None, ()),  # a uuid dir outside the harness scratch layout
+            (False, None, "L=/s/a.log; L=/s/b.log :; until grep -q DONE $L; do sleep 5; done", None,
+             {"/s/a.log": old, "/s/b.log": old}, None, ()),  # a prefix assignment's persistence depends on the shell
+            # only inert commands may precede the loop: a detached producer there may be the writer
+            (False, None, "setsid -f bash -c 'sleep 3600; echo DONE >> /s/x.log'; until grep -q DONE /s/x.log; "
+                          "do sleep 5; done", None, {"/s/x.log": old}, None, ()),
+            (False, None, "X=$(setsid -f prod); until grep -q DONE /s/x.log; do sleep 5; done", None,
+             {"/s/x.log": old}, None, ()),  # a value can hide a command substitution
+            (True, "b-file", "S=/s; cd $S; export L=$S/x.log; echo watching; until grep -q DONE $L; do sleep 5; "
+                             "done", None, {"/s/x.log": old}, None, ()),
+            # a missing file that is not a task file does not exist YET: the standard wait on real work
+            (False, None, "until [ -f /s/build.done ]; do sleep 10; done; ./deploy.sh", None, {}, None, ()),
+            (False, None, "while [ ! -f /s/build.done ]; do sleep 10; done; git push", None, {}, None, ()),
+            (False, None, "until grep -q DONE /s/build.log 2>/dev/null; do sleep 10; done; echo ok", None, {}, None,
+             ()),
+            # brace expansion and a changed IFS make the path unknown, even when a file of that literal name is frozen
+            (False, None, "until grep -q DONE /s/{build,test}.log; do sleep 5; done", None,
+             {"/s/{build,test}.log": old}, None, ()),
+            (False, None, "IFS=,; L=/s/a.log,/s/b; until grep -q DONE $L; do sleep 5; done", None,
+             {"/s/a.log,/s/b": old}, None, ()),
+            # a body that does more than wait: a command substitution, printf -v, a write
+            (False, None, f'until ! pgrep -f "{gp}"; do sleep $(git push -u origin HEAD; echo 5); done', None, {},
+             None, ()),
+            (False, None, 'until ! pgrep -f "zzq"; do echo $(make deploy); sleep 5; done', None, {}, None, ()),
+            (False, None, "L=/s/a; until grep -q DONE $L; do printf -v L %s /s/b; sleep 5; done", None,
+             {"/s/a": old}, None, ()),
+            (False, None, "until grep -q DONE /s/a.log; do echo tick >> /s/a.log; sleep 5; done", None,
+             {"/s/a.log": old}, None, ()),
+            (True, "b-file", "until grep -q DONE /s/a.log; do sleep 5 >/dev/null 2>&1; done", None,
+             {"/s/a.log": old}, None, ()),  # redirects to /dev/null are still only waiting
+            # a job backgrounded before the loop may still be the writer
+            (False, None, f"(sleep 9; echo x > {task}) & until [ -s {task} ]; do sleep 5; done", None,
+             {task: (now - 7200, set(), "")}, None, ()),
+            (True, "b-file", f"until [ -s {task} ]; do sleep 5; done", None, {task: (now - 7200, set(), "")}, None, ()),
+            (False, None, f"until [ -s {task} ]; do sleep 5; done", None, {task: (now - 7200, set(), "x")}, None, ()),
+            # the census's `|| ! pgrep -f` escape, with $L expanded from its literal assignment
+            (True, "a+b-file", esc, None, {census: old}, None, ()),
+            (False, None, esc, {90: (1, ["cargo", "test", "--", "zz_census"])}, {census: old}, None, ()),
+            (False, None, "until grep -q x $NOPE; do sleep 5; done", None, {}, None, ()),  # unexpandable
+            (False, None, f"L='{task} x'; until grep -q DONE $L; do sleep 5; done", None, {task: old}, None,
+             ()),  # an unquoted value that word-splits is not one known path
+            (True, "b-file", f"until grep -q DONE {task}; do sleep 5; done", None, {task: old}, None,
+             (("sleep", "5"), ("grep", "-q", "DONE", task))),  # its own sleep and probe only
+            (False, None, f"until grep -q DONE {task}; do sleep 5; done", None, {task: old}, None,
+             (("sleep", "5"), ("cargo", "build"))),  # work running under the loop
+            (False, None, f'until ! pgrep -f "{gp}"; do cargo build; sleep 5; done', None, {}, None, ()),  # body works
+            # (7) bounded waits: class (c), never stray
+            (False, "c", f"timeout 600 bash -c 'until ! pgrep -f \"{gp}\" >/dev/null; do sleep 5; done'", None, {},
+             None, (("timeout", "600", "bash", "-c", "..."),)),
+            (False, "c", f'i=0; until ! pgrep -f "{gp}"; do sleep 5; i=$((i+1)); done', None, {}, None, ()),
+            (False, "c", (f'end=$(( $(date +%s) + 600 )); while [ $(date +%s) -lt $end ] && pgrep -f "{gp}"; '
+                          'do sleep 5; done'), None, {}, None, ()),
+            # self-excluding patterns are real waits, not class (a)
+            (False, None, "until ! pgrep -f '[g]it push' >/dev/null; do sleep 15; done", None, {}, None, ()),
+            (False, None, f'until ! pgrep -fx "{gp}" >/dev/null; do sleep 15; done', None, {}, None, ()),
+            (False, None, f'until ! pgrep -fA "{gp}" >/dev/null; do sleep 15; done', None, {}, None, ()),
+            (False, None, "until ! pgrep cargo; do sleep 15; done", None, {}, None, ()),  # no -f: names, not argv
+            (True, "a", "while ps aux | grep cargo >/dev/null; do sleep 5; done", None, {}, None, ()),
+            (False, None, "while ps aux | grep cargo | grep -v grep >/dev/null; do sleep 5; done", None, {}, None,
+             ()),  # -v grep drops the loop's own line too, so it ends with its target
+            (False, None, "while ps -p 4242 | grep -q 4242; do sleep 5; done", None, {}, None, ()),  # ps -p: selective
+            # `ps aux` prints the user column: a pattern on it still finds the live target
+            (False, None, f'while ps aux | grep -q "{me}.*cargo build"; do sleep 5; done',
+             {90: (1, ["cargo", "build"])}, {}, None, ()),
+            (True, "a", f'while ps aux | grep -q "{me}.*cargo build"; do sleep 5; done', None, {}, None, ()),
+            (False, None, 'while ps -eo args | grep -q "^cargo build"; do sleep 5; done', None, {}, None, ()),
+            # kill -0: reused pid -> stray; the same process -> a real wait; a gone pid ends a while-loop
+            (True, "b-pid", "while kill -0 4242 2>/dev/null; do sleep 5; done", {4242: (1, ["daemon"])}, {},
+             {40: 100, 4242: 200}, ()),
+            (False, None, "while kill -0 4242 2>/dev/null; do sleep 5; done", {4242: (1, ["make"])}, {},
+             {40: 100, 4242: 50}, ()),
+            (False, None, "while kill -0 4243 2>/dev/null; do sleep 5; done", None, {}, {40: 100}, ()),
+            (False, None, f'until ! pgrep -f "{gp}"; do sleep 5; done & wait', None, {}, None, ()),  # backgrounded
+            (False, None, "cat <<EOF\nx\nEOF", None, {}, None, ()),  # heredoc: not read
+        ]
+        for want, cls, cmd, extra, files, start, kids in cases:
+            n += 1
+            got = one(cmd, extra, files, start, kids)
+            if got[0] != want or (cls is not None and got[1] != cls):
+                bad.append(f"stray_verdict {cmd[:70]!r} -> {got}, want stray={want} class={cls}")
+        n += 1  # the harness layout, but its tasks dir is gone too: the path is not known to be the harness's
+        if one(twait, dirs=set())[0]:
+            bad.append("a task file whose tasks dir is gone must not read as stray")
+        if tool_command(_tool_argv("echo 'a b' \"$X\"")) != "echo 'a b' \"$X\"":
+            bad.append(f"tool_command round trip: {tool_command(_tool_argv(chr(39)))!r}")
+        for pat, ere, line, want in [(r"test rc=\|clippy rc=[1-9]", False, "clippy rc=2", True),
+                                     (r"error(\[|:)", True, "error[E0425]", True), ("a+", False, "aa", False),
+                                     ("a+", False, "a+", True), ("[[:alpha:]]", True, "x", None)]:
+            n += 1
+            r = posix_re(pat, ere)
+            if (None if r is None else bool(re.search(r, line))) != want:
+                bad.append(f"posix_re({pat!r}, ere={ere}) on {line!r} -> {r!r}")
+        # (1)/(3) the verdict a row reaches. Linux only: on Windows every shell is work by design.
+        if not WINDOWS:
+            n += 1
+            saved = {k: globals()[k] for k in ("raw_tail", "transcript_facts", "live_session_ids")}
+            now_ms = time.time() * 1000
+            tx = {"path": "x", "last_activity": now_ms - 31 * 3600e3, "last_prompt": now_ms - 32 * 3600e3,
+                  "last_prompt_text": "push it", "last_asst": now_ms - 31 * 3600e3, "final_text_at": None,
+                  "final_text": "Pushed the branch.\n\n**POLICY_COMPLIANCE**\n- **Clauses applied:** finish-to-zero.",
+                  "pending_tool": False, "task_prompts": 1, "work_tools_since_nudge": 0, "nudge_streak": 0, "cwd": None}
+            globals().update(raw_tail=lambda tid, chars=30000: empty_prompt, transcript_facts=lambda row: dict(tx),
+                             live_session_ids=lambda claudes: {"s"})
+            term = {"id": "t1", "isAlive": True, "pid": 20}
+            marked = {"finished": True, "finishedAt": now_ms - 31.1 * 3600e3, "claudeSessionId": "s"}
+            plain = {"finished": False, "claudeSessionId": "s"}
+            coord = {"s": {"sessionStatus": "finished"}}
+            try:
+                def verdict(table, row, ready):
+                    _FACTS[:] = [table, ProcFacts(table, start={}, uids={}, files={}, self_pids={30}, now=now)]
+                    return classify(term, row, table, 15, "", ready)
+                for row, ready, want in [(marked, {}, "FINISHED"), (plain, coord, "FOOTER-ONLY"),
+                                         (plain, {}, "FOOTER-ONLY")]:
+                    zero, held_by = verdict(base, row, ready), verdict(d2, row, ready)
+                    if zero[0] != want or held_by[0] != want or held_by[1] != zero[1] + ["8 stray wait loop(s)"]:
+                        bad.append(f"stray-held row (finished={row['finished']}, ready={ready}) -> {held_by}, "
+                                   f"zero shells -> {zero}, want {want}")
+                got = verdict(mix, marked, {})
+                shell_reason = "1 tool shell(s) running under claude (Bash/Monitor/background task)"
+                if got[0] != "BUSY" or got[1][:2] != ["marked finished, but", shell_reason] or \
+                        got[1][-1] != "8 stray wait loop(s)":
+                    bad.append(f"stray + cargo test on a finished row -> {got}")
+                got = verdict(live, marked, {})
+                if got[0] != "BUSY" or "waits on live pid 800 (self-matching loop: will never exit on its own)" \
+                        not in got[1]:
+                    bad.append(f"self-matching loop with a live target -> {got}")
+            finally:
+                globals().update(saved)
+        # --own-tasks: the direct tool-shell children of this session's claude, minus the caller's own ancestry.
+        n += 1
+        ot = {1: (0, ["/sbin/init"]), 10: (1, ["/usr/bin/claude"]), 11: (10, _tool_argv("python3 cfs.py --own-tasks")),
+              12: (11, ["python3", "cfs.py", "--own-tasks"]),
+              13: (10, _tool_argv(f'until ! pgrep -f "{gp}" >/dev/null; do sleep 15; done')), 14: (13, ["sleep", "15"]),
+              15: (10, _tool_argv("cargo test")), 16: (15, ["cargo", "test"]), 17: (10, ["python3", "mcp-shim.py"]),
+              18: (1, _tool_argv(f'until ! pgrep -f "{cg}" >/dev/null; do sleep 15; done'))}
+        fk = ProcFacts(ot, start={}, uids={}, files={}, self_pids={1, 10, 11, 12}, now=now)
+        claude, rows = own_tasks(ot, 12, 15, facts=fk, task_of={13: "bstray", 15: "blive"}.get)
+        got = [(r["pid"], r["task_id"], r["stray"]) for r in rows]
+        if claude != 10 or got != [(13, "bstray", True), (15, "blive", False)]:
+            bad.append(f"own_tasks: claude={claude} rows={got}")
+        del ot[15], ot[16]
+        if [r["stray"] for r in own_tasks(ot, 12, 15, facts=fk, task_of=lambda p: None)[1]] != [True]:
+            bad.append("own_tasks without the cargo task must list only the stray")
+        if own_tasks({1: (0, ["init"]), 5: (1, ["bash"]), 6: (5, ["python3"])}, 6, 15, facts=fk) != (None, []):
+            bad.append("own_tasks with no claude above the caller must be UNKNOWN (None)")
+    finally:
+        _FACTS[:] = [None, None]
+    return n
 
 
 # ---------------------------------------------------------------- runner reads
@@ -1616,6 +1981,13 @@ def is_bare_shell(argv, windows=WINDOWS):
 
 
 WIN_TOOL_SHELLS = ("bash", "sh", "powershell", "pwsh")
+SNAPSHOT = "shell-snapshots/snapshot-"  # what a Linux tool shell sources
+TASK_OUTPUT_RE = re.compile(r"/tasks/([^/]+)\.output$")  # where a tool shell's fd 1 points
+# A harness task's output file: .../claude-<uid>/<project dir>/<session uuid>/tasks/<id>.output,
+# the project dir being the session's cwd with every "/" turned into "-" (measured on every
+# live task file on one Linux box, 2026-10-24). Only this layout is the harness's.
+HARNESS_TASK_FILE_RE = re.compile(r"/claude-\d+/-[^/]*/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+                                  r"/tasks/[^/]+\.output$")
 
 
 def proc_facts(table, pid, windows=WINDOWS):
@@ -1627,7 +1999,7 @@ def proc_facts(table, pid, windows=WINDOWS):
     MCP stdio servers run under `cmd.exe /c`, so they do not count."""
     pids = subtree(table, pid)
     claudes = [p for p in pids if is_claude(table[p][1])]
-    shells = [p for p in pids if any("shell-snapshots/snapshot-" in a for a in table[p][1])
+    shells = [p for p in pids if any(SNAPSHOT in a for a in table[p][1])
               or (windows and table[p][0] in claudes and table[p][1]
                   and exe_base(table[p][1][0]) in WIN_TOOL_SHELLS)]
     other = [p for p in pids if p not in claudes and p not in shells and not is_bare_shell(table[p][1], windows)
@@ -1676,6 +2048,1120 @@ def live_session_ids(claudes):
             if m:
                 ids.add(m.group(1))
     return ids
+
+
+# ---------------------------------------------------------------- stray wait loops
+# A background wait loop whose condition can never change is not work: it would
+# hold a finished session BUSY forever. The commonest shape is self-matching:
+# `until ! pgrep -f X` reads the loop's OWN `bash -c` command line, which holds X,
+# so it never ends (2026-10-23: 15 such loops on one box, 31-48 h old). The rest
+# poll a file nothing writes any more, or a pid that is gone or was reused.
+# A shell is STRAY only when every part of its loop condition is proven frozen
+# and the condition still says "loop"; anything this cannot read is work.
+SH_OPS = ("&&", "||", "&>", ";;", "|&", ">>", ">|", ">&", "<&", "<<", "<>", ";", "&", "|", "(", ")", "<", ">", "\n")
+SH_REDIRS = (">", ">>", ">|", "&>", ">&", "<&", "<>", "<")
+# A bound (an outer timeout, a counter or a deadline) turns "never" into "later": class (c), never stray.
+BOUNDED_RE = re.compile(r"\btimeout\b|\bSECONDS\b|\bdate\b[^;&|\n]*\+%s|\bseq\b|\s-(?:lt|le|gt|ge)\b|\$\(\(|\(\(|"
+                        r"\blet\b|\bbreak\b")
+LOOP_BODY = ("sleep", ":", "true", "echo", "printf")  # a body that only waits
+# What may run before the loop. Anything else might start the writer the loop
+# waits on outside the shell's subtree (`setsid -f …`, a daemon) or change state.
+PRE_LOOP = (":", "true", "cd", "echo", "printf", "export")
+PROBES = ("pgrep", "grep", "egrep", "fgrep")
+FILE_MAX = 16 << 20  # a polled file larger than this is not read: its wait is not judged
+
+
+class ShError(Exception):
+    """Shell syntax this reader does not model."""
+
+
+class Word:
+    """One shell word: ("lit", text) / ("var", name) / ("unk", raw) parts, and
+    whether an unquoted part holds a glob character."""
+    __slots__ = ("glob", "segs")
+
+    def __init__(self):
+        self.segs, self.glob = [], False
+
+    def add(self, kind, text):
+        if kind == "lit" and self.segs and self.segs[-1][0] == "lit":
+            self.segs[-1] = ("lit", self.segs[-1][1] + text)
+        else:
+            self.segs.append((kind, text))
+
+    def text(self, env=None):
+        """The word's value, expanding $NAME from `env`; None when any part cannot be
+        known, or when a value would word-split or glob (whitespace, `*?[`)."""
+        if self.glob:
+            return None
+        out = []
+        for kind, t in self.segs:
+            if kind == "lit":
+                out.append(t)
+            elif kind == "var" and isinstance((env or {}).get(t), str) and not re.search(r"[\s*?\[]", env[t]):
+                out.append(env[t])
+            else:
+                return None
+        return "".join(out)
+
+
+def _sh_skip(s, i, close):
+    """The index just past the `close` that ends the $( / ${ / ` group opened before i."""
+    depth, n = 1, len(s)
+    while i < n:
+        c = s[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == "'" and close != "`":
+            j = s.find("'", i + 1)
+            if j < 0:
+                raise ShError("unterminated quote")
+            i = j + 1
+            continue
+        if close == ")" and c == "(":
+            depth += 1
+        elif c == close:
+            depth -= 1
+            if not depth:
+                return i + 1
+        i += 1
+    raise ShError("unterminated expansion")
+
+
+def _sh_dollar(s, i, w):
+    """Lex a $-expansion at s[i] into word w; return the index after it."""
+    nxt = s[i + 1] if i + 1 < len(s) else ""
+    if nxt == "'":
+        raise ShError("ANSI-C quoting")
+    if nxt == "(":
+        j = _sh_skip(s, i + 2, ")")
+        w.add("unk", s[i:j])
+        return j
+    if nxt == "{":
+        j = _sh_skip(s, i + 2, "}")
+        name = s[i + 2:j - 1]
+        w.add("var" if re.fullmatch(r"[A-Za-z_]\w*", name) else "unk", name)
+        return j
+    m = re.match(r"[A-Za-z_]\w*", s[i + 1:])
+    if m:
+        w.add("var", m.group(0))
+        return i + 1 + m.end()
+    if nxt and nxt in "?$!#@*-0123456789":
+        w.add("unk", s[i:i + 2])
+        return i + 2
+    w.add("lit", "$")
+    return i + 1
+
+
+def sh_lex(s):
+    """Shell tokens of `s`: Word objects and operator strings. Raises ShError on
+    syntax this reader does not model (a heredoc, ANSI-C quoting, an open quote)."""
+    toks, w, i, n = [], None, 0, len(s)
+
+    def end():
+        nonlocal w
+        if w is not None:
+            toks.append(w)
+            w = None
+
+    while i < n:
+        c = s[i]
+        if c in " \t":
+            end()
+            i += 1
+        elif c == "\\":
+            if s[i + 1:i + 2] != "\n":
+                w = w or Word()
+                w.add("lit", s[i + 1:i + 2])
+            i += 2
+        elif c == "#" and w is None:
+            j = s.find("\n", i)
+            i = n if j < 0 else j
+        elif c == "'":
+            j = s.find("'", i + 1)
+            if j < 0:
+                raise ShError("unterminated quote")
+            w = w or Word()
+            w.add("lit", s[i + 1:j])
+            i = j + 1
+        elif c == '"':
+            w, i = w or Word(), i + 1
+            while True:
+                if i >= n:
+                    raise ShError("unterminated quote")
+                d = s[i]
+                if d == '"':
+                    i += 1
+                    break
+                if d == "\\" and s[i + 1:i + 2] in ('$', '`', '"', "\\", "\n"):
+                    w.add("lit", s[i + 1] if s[i + 1] != "\n" else "")
+                    i += 2
+                elif d == "$":
+                    i = _sh_dollar(s, i, w)
+                elif d == "`":
+                    j = _sh_skip(s, i + 1, "`")
+                    w.add("unk", s[i:j])
+                    i = j
+                else:
+                    w.add("lit", d)
+                    i += 1
+        elif c == "$":
+            w = w or Word()
+            i = _sh_dollar(s, i, w)
+        elif c == "`":
+            j = _sh_skip(s, i + 1, "`")
+            w = w or Word()
+            w.add("unk", s[i:j])
+            i = j
+        else:
+            op = next((o for o in SH_OPS if s.startswith(o, i)), None)
+            if op is None:
+                w = w or Word()
+                if c in "*?" or (c == "[" and re.match(r"\[[^\s;&|()<>]*\]", s[i:])) or \
+                        (c == "{" and re.match(r"\{[^\s;&|()<>{}]*(?:,|\.\.)[^\s;&|()<>{}]*\}", s[i:])):
+                    w.glob = True  # a glob or a brace expansion: not one known word
+                w.add("lit", c)
+                i += 1
+                continue
+            if op == "<<":
+                raise ShError("heredoc")
+            if op in SH_REDIRS and w is not None and (w.text() or "").isdigit():
+                w = None  # an io-number (`2>`) belongs to its redirect
+            end()
+            toks.append(op)
+            i += len(op)
+    end()
+    return toks
+
+
+class _Sh:
+    """A recursive-descent reader of the shell grammar a wait loop is written in:
+    lists, and-or chains, pipelines, simple commands, until/while/if/for loops,
+    `{ }` and `( )` groups. Anything else raises ShError."""
+
+    def __init__(self, toks):
+        self.t, self.i = toks, 0
+
+    def peek(self):
+        return self.t[self.i] if self.i < len(self.t) else None
+
+    def kw(self, names):
+        tok = self.peek()
+        return isinstance(tok, Word) and tok.text() in names
+
+    def expect(self, name):
+        if not self.kw((name,)):
+            raise ShError(f"expected {name}")
+        self.i += 1
+
+    def parse_list(self, stop=()):
+        items = []
+        while True:
+            while self.peek() in (";", "\n"):
+                self.i += 1
+            if self.peek() is None or self.peek() == ")" or self.kw(stop):
+                return items
+            ao = self.and_or()
+            sep = self.peek()
+            if sep in (";", "&", "\n"):
+                self.i += 1
+            elif not (sep is None or sep == ")" or self.kw(stop)):
+                raise ShError(f"unexpected {sep!r}")
+            items.append((ao, sep if sep in (";", "&", "\n") else None))
+
+    def and_or(self):
+        chain = [(None, self.pipeline())]
+        while self.peek() in ("&&", "||"):
+            op = self.peek()
+            self.i += 1
+            while self.peek() == "\n":
+                self.i += 1
+            chain.append((op, self.pipeline()))
+        return chain
+
+    def pipeline(self):
+        neg = self.kw(("!",))
+        self.i += neg
+        cmds = [self.command()]
+        while self.peek() in ("|", "|&"):
+            self.i += 1
+            while self.peek() == "\n":
+                self.i += 1
+            cmds.append(self.command())
+        return neg, cmds
+
+    def redirs(self):
+        out = []
+        while self.peek() in SH_REDIRS:
+            op = self.peek()
+            self.i += 1
+            if not isinstance(self.peek(), Word):
+                raise ShError("redirect without a target")
+            out.append((op, self.peek()))
+            self.i += 1
+        return out
+
+    def command(self):
+        if self.kw(("until", "while")):
+            kind = self.peek().text()
+            self.i += 1
+            cond = self.parse_list(("do",))
+            self.expect("do")
+            body = self.parse_list(("done",))
+            self.expect("done")
+            return {"kind": kind, "cond": cond, "body": body, "redirs": self.redirs()}
+        if self.kw(("if",)):
+            self.i += 1
+            while True:
+                self.parse_list(("then",))
+                self.expect("then")
+                self.parse_list(("elif", "else", "fi"))
+                if self.kw(("elif",)):
+                    self.i += 1
+                    continue
+                if self.kw(("else",)):
+                    self.i += 1
+                    self.parse_list(("fi",))
+                self.expect("fi")
+                return {"kind": "compound", "redirs": self.redirs()}
+        if self.kw(("for", "select")):
+            self.i += 2
+            if self.kw(("in",)):
+                while isinstance(self.peek(), Word):
+                    self.i += 1
+            while self.peek() in (";", "\n"):
+                self.i += 1
+            self.expect("do")
+            self.parse_list(("done",))
+            self.expect("done")
+            return {"kind": "compound", "redirs": self.redirs()}
+        if self.kw(("{",)):
+            self.i += 1
+            self.parse_list(("}",))
+            self.expect("}")
+            return {"kind": "compound", "redirs": self.redirs()}
+        if self.peek() == "(":
+            self.i += 1
+            self.parse_list()
+            if self.peek() != ")":
+                raise ShError("unclosed subshell")
+            self.i += 1
+            return {"kind": "compound", "redirs": self.redirs()}
+        if self.kw(("case", "function", "then", "do", "done", "fi", "elif", "else", "esac", "}")):
+            raise ShError(f"unmodelled {self.peek().text()}")
+        words, redirs = [], []
+        while True:
+            tok = self.peek()
+            if isinstance(tok, Word):
+                words.append(tok)
+                self.i += 1
+            elif tok in SH_REDIRS:
+                redirs += self.redirs()
+            else:
+                break
+        if not words and not redirs:
+            raise ShError(f"empty command at {self.peek()!r}")
+        return {"kind": "simple", "words": words, "redirs": redirs}
+
+
+def parse_sh(s):
+    """The parsed list of `s`, or None when it is not shell this reader models."""
+    try:
+        p = _Sh(sh_lex(s))
+        items = p.parse_list()
+        if p.peek() is not None:
+            raise ShError("trailing tokens")
+        return items
+    except (ShError, IndexError):
+        return None
+
+
+def tool_command(argv):
+    """The command a Linux tool shell runs: the word Claude Code hands `eval` in
+    `bash -c "source <snapshot> ... && eval '<command>' < /dev/null && pwd -P >| <file>"`.
+    None when argv is not that shape."""
+    script = next((a for a in argv[1:] if SNAPSHOT in a), None)
+    try:
+        toks = sh_lex(script) if script else []
+    except ShError:
+        return None
+    for k, tok in enumerate(toks[:-1]):
+        if isinstance(tok, Word) and tok.text() == "eval" and isinstance(toks[k + 1], Word):
+            return toks[k + 1].text()
+    return None
+
+
+def proc_stat(pid):
+    """/proc/<pid>/stat's fields after the command name, so index 0 is field 3
+    (state): ppid is [1], pgid [2], start time in clock ticks [19]. None when unreadable."""
+    try:
+        return open(f"/proc/{pid}/stat").read().rsplit(")", 1)[1].split()
+    except (OSError, IndexError):
+        return None
+
+
+def proc_start(pid):
+    """The process's start time in clock ticks (/proc/<pid>/stat field 22), or None."""
+    st = proc_stat(pid)
+    try:
+        return int(st[19]) if st else None
+    except (ValueError, IndexError):
+        return None
+
+
+def my_uid():
+    """This process's uid, or None where the OS has none (Windows)."""
+    return os.getuid() if hasattr(os, "getuid") else None
+
+
+def own_tree(table, me):
+    """`me`, everything under it, and its ancestors: the screener's own processes."""
+    out = set(subtree(table, me)) | {me}
+    p = table.get(me, (None,))[0]
+    while p in table and p not in out:
+        out.add(p)
+        p = table[p][0]
+    return out
+
+
+def posix_re(pat, ere):
+    """A Python regex for a GNU BRE (`ere` False) or ERE pattern, or None for
+    syntax this does not model (bracket classes, back-references, a backslash
+    inside brackets)."""
+    out, i, n = [], 0, len(pat)
+    while i < n:
+        c = pat[i]
+        if c == "\\":
+            d = pat[i + 1:i + 2]
+            if not d or d.isdigit():
+                return None
+            if d in "wWsSbB":
+                out.append("\\" + d)
+            elif d in "<>":
+                out.append(r"\b(?=\w)" if d == "<" else r"\b(?<=\w)")
+            elif not ere and d in "(){}|+?":
+                out.append(d)
+            elif d in ".[]()*+?{}|^$\\/-":
+                out.append("\\" + d)
+            else:
+                return None
+            i += 2
+        elif c == "[":
+            k = i + 1 + (pat[i + 1:i + 2] == "^")
+            k += pat[k:k + 1] == "]"
+            j = pat.find("]", k)
+            if j < 0:
+                return None
+            body = pat[i + 1:j]
+            neg = body.startswith("^")
+            core = body[1:] if neg else body
+            if "\\" in core or "[" in core or "--" in core:
+                return None
+            core = core.replace("]", r"\]").replace("&", r"\&").replace("~", r"\~").replace("|", r"\|")
+            out.append("[" + ("^" if neg else "") + core + "]")
+            i = j + 1
+        else:
+            out.append(c if c in ".*^$" or (ere and c in "(){}|+?") else re.escape(c))
+            i += 1
+    return "".join(out)
+
+
+def grep_spec(words):
+    """(patterns, mode, icase, invert, wordx, files) of a grep command's literal
+    words, or None for options this does not model."""
+    pats, icase, invert, wordx, pos = [], False, False, "", []
+    mode = {"egrep": "E", "fgrep": "F"}.get(exe_base(words[0]), "G")
+    i, opts = 1, True
+    while i < len(words):
+        a = words[i]
+        i += 1
+        if not opts or a == "-" or not a.startswith("-"):
+            pos.append(a)
+            continue
+        if a == "--":
+            opts = False
+            continue
+        if a.startswith("--"):
+            name, _, val = a[2:].partition("=")
+            if name in ("quiet", "silent", "count", "no-messages", "line-number", "with-filename", "no-filename",
+                        "files-with-matches", "only-matching", "color", "colour", "max-count"):
+                i += name == "max-count" and not val
+                continue
+            flag = {"invert-match": "v", "ignore-case": "i", "word-regexp": "w", "line-regexp": "x",
+                    "extended-regexp": "E", "fixed-strings": "F", "basic-regexp": "G"}.get(name)
+            if name == "regexp" and val:
+                pats.append(val)
+                continue
+            if flag is None:
+                return None
+            a = "-" + flag
+        for k, f in enumerate(a[1:], 1):
+            if f in "qscnhHlob":
+                continue
+            if f in "EFG":
+                mode = f
+            elif f in "iy":
+                icase = True
+            elif f == "v":
+                invert = True
+            elif f in "wx":
+                wordx = f
+            elif f in "em":
+                val = a[k + 1:] or (words[i] if i < len(words) else None)
+                if val is None:
+                    return None
+                if not a[k + 1:]:
+                    i += 1
+                if f == "e":
+                    pats.append(val)
+                break
+            else:
+                return None  # -f, -r, -z, -P, -L, context lines ...: not modelled
+    if not pats:
+        if not pos:
+            return None
+        pats = [pos.pop(0)]
+    return [p for q in pats for p in q.split("\n")], mode, icase, invert, wordx, pos
+
+
+def grep_matcher(spec):
+    """line -> selected, for a grep_spec; None when the pattern does not translate."""
+    pats, mode, icase, invert, wordx, _ = spec
+    parts = []
+    for p in pats:
+        r = re.escape(p) if mode == "F" else posix_re(p, mode == "E")
+        if r is None:
+            return None
+        parts.append(r)
+    rx = "|".join(f"(?:{r})" for r in parts)
+    if wordx == "w":
+        rx = rf"(?<![A-Za-z0-9_])(?:{rx})(?![A-Za-z0-9_])"
+    try:
+        c = re.compile(rx, re.I if icase else 0)
+    except (re.error, OverflowError):
+        return None
+    hit = c.fullmatch if wordx == "x" else c.search
+    return lambda line: (hit(line) is None) if invert else (hit(line) is not None)
+
+
+def pgrep_spec(words):
+    """(pattern, icase, exact, no_ancestors) of a `pgrep -f` command, or None:
+    without -f pgrep reads process names, not command lines, and the selection
+    options (-u, -P, -g, ...) are not modelled."""
+    full = icase = exact = anc = False
+    pats, i = [], 1
+    while i < len(words):
+        a = words[i]
+        i += 1
+        if a in ("--full",):
+            full = True
+        elif a in ("--ignore-case",):
+            icase = True
+        elif a in ("--exact",):
+            exact = True
+        elif a in ("--ignore-ancestors",):
+            anc = True
+        elif a in ("--list-full", "--list-name", "--count", "--newest", "--oldest", "--lightweight"):
+            pass
+        elif a.startswith("--delimiter"):
+            i += "=" not in a
+        elif a.startswith("-") and len(a) > 1:
+            for k, f in enumerate(a[1:], 1):
+                if f == "f":
+                    full = True
+                elif f == "i":
+                    icase = True
+                elif f == "x":
+                    exact = True
+                elif f == "A":
+                    anc = True
+                elif f in "alcnow":
+                    continue
+                elif f == "d":
+                    i += not a[k + 1:]
+                    break
+                else:
+                    return None
+        else:
+            pats.append(a)
+    if not full or len(pats) != 1:
+        return None
+    return pats[0], icase, exact, anc
+
+
+def ps_all(words):
+    """None when a `ps` command does not list every process with its full command
+    line; else "args" for an args-only format (`ps -eo args`), "full" otherwise."""
+    allp, i, fmt_only = False, 1, None
+    while i < len(words):
+        a = words[i]
+        i += 1
+        if a in ("--no-headers", "--no-heading", "-w", "-ww"):
+            continue
+        if a in ("--cols", "--columns", "--width", "--sort"):
+            i += 1
+            continue
+        fmt = None
+        if a in ("-o", "o", "-O", "O", "--format", "-eo", "axo", "-eO"):
+            fmt = words[i] if i < len(words) else ""
+            i += 1
+            allp = allp or a in ("-eo", "axo", "-eO")
+            if not re.search(r"\b(?:args|cmd|command)\b", fmt):
+                return None
+            fmt_only = re.fullmatch(r"(?:args|cmd|command)=?", fmt) is not None and a not in ("-O", "O", "-eO")
+            continue
+        if re.fullmatch(r"-?[auxwfjlvhSe]+", a) and "a" in a and "x" in a and not a.startswith("-e"):
+            allp = True
+        elif re.fullmatch(r"-[eAfFlwjHyM]+", a) and ("e" in a or "A" in a):
+            allp = True
+        else:
+            return None
+    return ("args" if fmt_only else "full") if allp else None
+
+
+class ProcFacts:
+    """The /proc reads the stray classifier needs beyond the (ppid, argv) table,
+    read lazily and at most once per table. A selftest passes `start`, `uids`,
+    `files` and `self_pids` and reads nothing live: `files` maps a path to
+    (mtime, holder pids, text), and a path missing from it is gone; `dirs` is the
+    set of directories that exist (by default, those holding a `files` path)."""
+
+    def __init__(self, table, start=None, uids=None, files=None, self_pids=None, now=None, dirs=None):
+        self.table, self._start, self._uids, self._files = table, start, uids, files
+        self._dirs = set(dirs) if dirs is not None else (
+            None if files is None else {f.rsplit("/", 1)[0] for f in files})
+        self.now = time.time() if now is None else now
+        self.self_pids = own_tree(table, os.getpid()) if self_pids is None else set(self_pids)
+        self._holders, self._probes = None, {}
+
+    def start(self, pid):
+        """The process's start time in clock ticks (/proc/<pid>/stat field 22), or None."""
+        return self._start.get(pid) if self._start is not None else proc_start(pid)
+
+    def isdir(self, path):
+        return path in self._dirs if self._dirs is not None else os.path.isdir(path)
+
+    def uid(self, pid):
+        if self._uids is not None:
+            return self._uids[pid] if pid in self._uids else my_uid()
+        try:
+            return os.stat(f"/proc/{pid}").st_uid
+        except OSError:
+            return None
+
+    def probes(self, pid):
+        """The patterns `pid` greps or pgreps for, from its own argv and any shell script it carries."""
+        if pid not in self._probes:
+            self._probes[pid] = probes_of(self.table[pid][1])
+        return self._probes[pid]
+
+    def file(self, path):
+        """("gone", None, set(), None) / ("ok", mtime, holders, text) / None when unreadable.
+        `text` is None for a file too large to read. Holders are every process with
+        an fd open on it except the screener's own; a process whose fds this user
+        cannot list (another uid's, or a non-dumpable one) is not seen."""
+        if self._files is not None:
+            if path not in self._files:
+                return "gone", None, set(), None
+            mtime, holders, text = self._files[path]
+            return "ok", mtime, set(holders) - self.self_pids, text
+        try:
+            st = os.stat(path)
+        except FileNotFoundError:
+            return "gone", None, set(), None
+        except OSError:
+            return None
+        if st.st_mode & 0o170000 != 0o100000:  # a regular file only
+            return None
+        text = None
+        if st.st_size <= FILE_MAX:
+            try:
+                with open(path, encoding="utf-8", errors="replace") as fh:
+                    text = fh.read()
+            except OSError:
+                return None
+        if self._holders is None:
+            self._holders = {}
+            for d in os.listdir("/proc"):
+                if not d.isdigit():
+                    continue
+                try:
+                    fds = os.listdir(f"/proc/{d}/fd")
+                except OSError:
+                    continue
+                for fd in fds:
+                    try:
+                        target = os.readlink(f"/proc/{d}/fd/{fd}")
+                    except OSError:
+                        continue
+                    self._holders.setdefault(target.removesuffix(" (deleted)"), set()).add(int(d))
+        holders = self._holders.get(os.path.realpath(path), set()) - self.self_pids
+        return "ok", st.st_mtime, holders, text
+
+
+def probes_of(argv, depth=0):
+    """The patterns a process greps or pgreps for: its own when it IS pgrep or grep,
+    plus those of every pgrep/grep inside a shell script it carries (`bash -c`,
+    `eval`, a watcher's `--probe`), three levels deep."""
+    out = set()
+    if argv and exe_base(argv[0]) in PROBES:
+        out |= _probe_pats(argv)
+    for a in (argv[1:] if depth < 3 else []):
+        if "grep" in a and re.search(r"\s", a):
+            try:
+                toks = sh_lex(a)
+            except ShError:
+                continue
+            run = []
+            for tok in toks + [";"]:
+                if isinstance(tok, Word):
+                    run.append(tok.text())
+                    continue
+                while run and run[0] in ("until", "while", "if", "elif", "then", "do", "else", "!", "{", "time",
+                                         "exec", "command", "nohup"):
+                    run.pop(0)
+                if run and run[0] is not None and exe_base(run[0]) in PROBES:
+                    out |= _probe_pats([w or "" for w in run])
+                for w in run:
+                    if w and "grep" in w:
+                        out |= probes_of(["sh", w], depth + 1)
+                run = []
+    return out
+
+
+def _probe_pats(words):
+    if exe_base(words[0]) == "pgrep":
+        spec = pgrep_spec(words)
+        return {spec[0]} if spec else {w for w in words[1:] if w and not w.startswith("-")}
+    spec = grep_spec(words)
+    return set(spec[0]) if spec else set()
+
+
+def _pre_loop(c, env, record):
+    """Whether one command before a wait loop is inert: plain assignments,
+    `export`, `cd`, `:`, `true`, or a literal `echo`/`printf` (no -v), with every
+    word, assigned value and redirect target readable (a value can hide a command
+    substitution). When `record`, the assignments that persist are added to
+    `env`; else they make those names unknown. Setting IFS is not inert."""
+    if c["kind"] != "simple":
+        return False
+    words = c["words"]
+    sets = [re.match(r"([A-Za-z_]\w*)=", w.segs[0][1]) if w.segs and w.segs[0][0] == "lit" else None
+            for w in words]
+    values = {}
+    for w, m in zip(words, sets):
+        if m:
+            value = Word()
+            for kind, t in [("lit", w.segs[0][1][m.end():])] + w.segs[1:]:
+                value.add(kind, t)
+            value.glob = w.glob
+            values[id(w)] = value.text(env)
+            if values[id(w)] is None or m.group(1) == "IFS":
+                return False
+    k = next((i for i, m in enumerate(sets) if m is None), len(words))
+    cmd = [w.text(env) for w in words[k:]]
+    if cmd and (None in cmd or cmd[0] not in PRE_LOOP or (cmd[0] == "printf" and "-v" in cmd)):
+        return False
+    if any(t.text(env) is None for _, t in c["redirs"]):
+        return False
+    persist = list(zip(words[:k], sets[:k])) if not cmd else (
+        [(w, m) for w, m in zip(words[k + 1:], sets[k + 1:]) if m] if cmd[0] == "export" else [])
+    for w, m in persist:
+        env[m.group(1)] = values[id(w)] if record else None
+    for m in sets[:k] if cmd else []:
+        env[m.group(1)] = None  # `X=v :` keeps X in a POSIX-mode shell and drops it in bash's default mode
+    return True
+
+
+def _cond_atoms(cond, env):
+    """The condition of a loop as [(negated, [command words...], [input files])] per
+    pipeline plus the and-or operators, or None when it is not one and-or chain of
+    simple commands with literal words."""
+    if len(cond) != 1 or cond[0][1] == "&":
+        return None
+    chain = []
+    for op, (neg, cmds) in cond[0][0]:
+        pipe = []
+        for c in cmds:
+            if c["kind"] != "simple" or not c["words"]:
+                return None
+            words = [w.text(env) for w in c["words"]]
+            if None in words:
+                return None
+            inputs = []
+            for rop, target in c["redirs"]:
+                t = target.text(env)
+                if t is None:
+                    return None
+                if rop == "<":
+                    inputs.append(t)
+            pipe.append((words, inputs))
+        chain.append((op, neg, pipe))
+    return chain
+
+
+def _lines(text):
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    return lines
+
+
+def _ps_line(table, p, facts, args_only):
+    """The line `ps` prints for p: the command alone for an args-only format
+    (`-o args`), else user, pid and ppid before it (`ps aux` / `ps -ef`). Other
+    columns (%CPU, STAT, TTY, times) are not modelled."""
+    cmd = " ".join(table[p][1])
+    if args_only:
+        return cmd
+    return f"{_user(facts.uid(p))} {p} {table[p][0]} {cmd}"
+
+
+def _user(uid):
+    try:
+        import pwd
+        return pwd.getpwuid(uid).pw_name
+    except (ImportError, KeyError, TypeError, OverflowError):
+        return str(uid)
+
+
+def _atom(table, shell, pipe, facts, idle_min):
+    """One condition pipeline -> (status, frozen, kind, label) or None (not modelled).
+    `status` is the exit status it has now; `frozen` means it can never change."""
+    words, inputs = pipe[0]
+    base = exe_base(words[0])
+    own = " ".join(table[shell][1])
+    if base == "kill" and len(pipe) == 1 and len(words) == 3 and words[1] == "-0" and words[2].isdigit():
+        pid = int(words[2])
+        if pid not in table:
+            return 1, True, "b-pid", f"kill -0 {pid}: pid gone"
+        st, born = facts.start(pid), facts.start(shell)
+        if st is None or born is None:
+            return None
+        status = 0 if facts.uid(pid) == my_uid() else 1
+        if st > born:
+            return status, True, "b-pid", f"kill -0 {pid}: pid reused by a process newer than the loop"
+        return status, False, "b-pid", f"waits on live pid {pid}"
+    if base in ("[", "test", "[[") and len(pipe) == 1:
+        args = words[1:]
+        if base != "test":
+            if not args or args[-1] != ("]" if base == "[" else "]]"):
+                return None
+            args = args[:-1]
+        neg = bool(args) and args[0] == "!"
+        args = args[1:] if neg else args
+        if len(args) != 2 or args[0] not in ("-f", "-e", "-s"):
+            return None
+        files, test = [args[1]], args[0]
+        filters = []
+    elif base in ("ps", "pgrep"):
+        return _probe_atom(table, shell, pipe, facts, own)
+    elif base in ("cat", "tail", "head") + PROBES:
+        files, test, neg = list(inputs), None, False
+        rest = words[1:]
+        if base in PROBES:
+            spec = grep_spec(words)
+            if spec is None:
+                return None
+            files += spec[5]
+            filters = [spec]
+        else:
+            n, k = None, 0
+            while k < len(rest):
+                a = rest[k]
+                if base != "cat" and re.fullmatch(r"-n\d+|-\d+", a):
+                    n = int(a.lstrip("-n"))
+                elif base != "cat" and a == "-n" and k + 1 < len(rest) and rest[k + 1].isdigit():
+                    n, k = int(rest[k + 1]), k + 1
+                elif a.startswith("-"):
+                    return None  # tail -f, -c, ...: not a one-shot read
+                else:
+                    files.append(a)
+                k += 1
+            filters = [(base, 10 if n is None else n)]
+        for words2, inputs2 in pipe[1:]:
+            spec = grep_spec(words2) if exe_base(words2[0]) in PROBES else None
+            if spec is None or spec[5] or inputs2:
+                return None
+            filters.append(spec)
+    else:
+        return None
+    if not files:
+        return None
+    frozen, label, lines, texts = True, [], [], []
+    for f in files:
+        if not f.startswith("/"):  # a /proc-model path: POSIX rules on every OS the selftest runs on
+            return None
+        got = facts.file(f)
+        if got is None:
+            return None
+        state, mtime, holders, text = got
+        texts.append(text if state == "ok" else False)
+        if state == "gone":
+            # A missing file is usually one that does not exist YET: `until [ -f
+            # build.done ]` waits on work that will create it, and no holder can
+            # show for a file nobody has opened. The one exception is a harness
+            # task's output file in its own session's tasks/ dir, still present:
+            # the harness creates it when the task starts, so once it is gone
+            # from a live tasks dir the task is gone and nothing will write it.
+            if HARNESS_TASK_FILE_RE.search(f) and facts.isdir(f.rsplit("/", 1)[0]):
+                label.append(f"{f} is gone from its session's tasks dir (its task ended)")
+            else:
+                frozen = False
+                label.append(f"{f} does not exist yet")
+            continue
+        if holders:
+            frozen = False
+            label.append(f"{f} is held open by pid {min(holders)}")
+        elif facts.now - mtime < idle_min * 60:
+            frozen = False
+            label.append(f"{f} changed {fmt_age(mtime * 1000)} ago")
+        else:
+            label.append(f"{f} unchanged for {fmt_age(mtime * 1000)}, no process holds it")
+        if test is None:
+            if text is None:
+                return None
+            lines += _lines(text)
+    if test is not None:
+        # texts[0]: False = gone; None = present but too large to read (so not empty)
+        ok = texts[0] is not False and (test != "-s" or texts[0] is None or texts[0] != "")
+        status = 0 if ok != neg else 1
+    else:
+        for flt in filters:
+            if flt[0] in ("cat", "tail", "head"):
+                lines = lines if flt[0] == "cat" else (lines[-flt[1]:] if flt[0] == "tail" else lines[:flt[1]])
+                continue
+            m = grep_matcher(flt)
+            if m is None:
+                return None
+            lines = [ln for ln in lines if m(ln)]
+        status = 0 if lines else 1
+    return status, frozen, "b-file", "; ".join(label)
+
+
+def _probe_atom(table, shell, pipe, facts, own):
+    """A pgrep -f or ps|grep condition -> (status, frozen, "a", label) or None."""
+    words, inputs = pipe[0]
+    if inputs:
+        return None
+    if exe_base(words[0]) == "pgrep":
+        if len(pipe) != 1:
+            return None
+        spec = pgrep_spec(words)
+        if spec is None:
+            return None
+        pat, icase, exact, anc = spec
+        r = posix_re(pat, True)
+        if r is None:
+            return None
+        try:
+            rx = re.compile(r, re.I if icase else 0)
+        except (re.error, OverflowError):
+            return None
+        hit = rx.fullmatch if exact else rx.search
+        # -A drops pgrep's ancestors: the loop shell and everything above it
+        excluded = own_tree(table, shell) - (set(subtree(table, shell)) - {shell}) if anc else set()
+        line = lambda p: " ".join(table[p][1])  # noqa: E731
+        selfm = shell not in excluded and hit(own) is not None
+        pats = {pat}
+    else:
+        kind = ps_all(words)
+        if kind is None or len(pipe) < 2:
+            return None
+        filters = []
+        for words2, inputs2 in pipe[1:]:
+            spec = grep_spec(words2) if exe_base(words2[0]) in PROBES else None
+            m = grep_matcher(spec) if spec and not spec[5] and not inputs2 else None
+            if m is None:
+                return None
+            filters.append(m)
+        hit = lambda s: all(m(s) for m in filters) or None  # noqa: E731
+        excluded, line = set(), lambda p: _ps_line(table, p, facts, kind == "args")  # noqa: E731
+        selfm = hit(line(shell)) is not None
+        pats = set()
+        for words2, _ in pipe[1:]:
+            spec = grep_spec(words2)
+            pats |= set() if spec[3] else set(spec[0])  # what the chain selects for, not what -v drops
+        if not pats:
+            return None
+    if not selfm:
+        return 1, False, "a", "not self-matching"  # it ends when its target does: a real wait
+    targets = sorted(p for p in table if p not in facts.self_pids and p not in excluded and table[p][1]
+                     and hit(line(p)) is not None and not (facts.probes(p) & pats))
+    shown = "pgrep" if exe_base(words[0]) == "pgrep" else "ps|grep"
+    if targets:
+        return 0, False, "a", f"waits on live pid {targets[0]} (self-matching loop: will never exit on its own)"
+    return 0, True, "a", f"self-matching {shown} {min(pats)!r}, no live target"
+
+
+def stray_verdict(table, pid, facts, idle_min):
+    """_stray_verdict(), failing safe: a command line this reader trips on is work,
+    never a crash of the whole screen."""
+    try:
+        return _stray_verdict(table, pid, facts, idle_min)
+    except Exception as e:  # noqa: BLE001 - any failure here must read as "not stray"
+        return False, None, f"not judged ({type(e).__name__})"
+
+
+def _stray_verdict(table, pid, facts, idle_min):
+    """(stray, class, why) for one Linux tool shell. Stray only when the shell runs
+    one unbounded until/while loop whose body only sleeps, nothing but that loop's
+    own probes and sleeps runs under it, every part of its condition is frozen
+    (class a: a self-matching pgrep -f / ps|grep with no live target; b-file: a
+    file no process holds open and unchanged past the idle floor, or a harness
+    task's output file that is gone; b-pid: a kill -0 pid that is gone or was
+    reused), and the condition still says "loop".
+    `class` is "a", "b-file", "b-pid" or a "+" mix for a stray, "c" for a bounded
+    wait, None otherwise."""
+    argv = table[pid][1]
+    cmd = tool_command(argv) if UNREADABLE_CMDLINE not in argv else None
+    if cmd is None:
+        return False, None, "command line not readable as a tool shell"
+    if re.search(r"\b(?:until|while)\b", cmd) and BOUNDED_RE.search(cmd):
+        return False, "c", "bounded wait (a timeout, counter or deadline ends it)"
+    items = parse_sh(cmd)
+    if items is None:
+        return False, None, "not shell this classifier reads"
+    loops = [k for k, (ao, sep) in enumerate(items)
+             if len(ao) == 1 and not ao[0][1][0] and len(ao[0][1][1]) == 1
+             and ao[0][1][1][0]["kind"] in ("until", "while") and sep != "&"]
+    if len(loops) != 1:
+        return False, None, "not one wait loop"
+    env = {}
+    for ao, sep in items[:loops[0]]:
+        if sep == "&":
+            return False, None, "starts a background job before its loop"
+        single = len(ao) == 1 and len(ao[0][1][1]) == 1
+        for _, (_, cmds) in ao:
+            for c in cmds:
+                if not _pre_loop(c, env, single):
+                    return False, None, "runs more than assignments, cd and literal echo before its loop"
+    loop = items[loops[0]][0][0][1][1][0]
+    for ao, _ in loop["body"]:
+        for _, (_, cmds) in ao:
+            for c in cmds:
+                words = [w.text() for w in c.get("words", [])]
+                if c["kind"] != "simple" or not words or words[0] not in LOOP_BODY or None in words \
+                        or (words[0] == "printf" and "-v" in words) \
+                        or any(t.text() != "/dev/null" and not (op == ">&" and (t.text() or "").isdigit())
+                               for op, t in c["redirs"]):
+                    return False, None, "the loop body does more than wait"
+    chain = _cond_atoms(loop["cond"], env or {})
+    if chain is None:
+        return False, None, "loop condition not readable"
+    allowed = {"sleep"} | {exe_base(w[0]) for _, _, pipe in chain for w, _ in pipe}
+    for d in subtree(table, pid):
+        dv = table[d][1]
+        if d != pid and dv != argv and not (dv and exe_base(dv[0]) in allowed
+                                            and not (exe_base(dv[0]) == "tail" and any(
+                                                a.startswith(("-f", "-F", "--follow")) for a in dv[1:]))):
+            return False, None, "runs " + " ".join(dv)[:60]
+    status, parts = None, []
+    for op, neg, pipe in chain:
+        atom = _atom(table, pid, pipe, facts, idle_min)
+        if atom is None:
+            return False, None, "loop condition not judged"
+        s = (1 if atom[0] == 0 else 0) if neg else atom[0]
+        if op is None or (op == "&&" and status == 0) or (op == "||" and status != 0):
+            status = s
+        parts.append(atom)
+    live = next((a for a in parts if not a[1]), None)
+    if live:
+        return False, None, live[3]
+    if (status == 0) != (loop["kind"] == "while"):
+        return False, None, "its condition already holds: the loop ends on its next pass"
+    return True, "+".join(sorted({a[2] for a in parts})), "; ".join(a[3] for a in parts)
+
+
+_FACTS = [None, None]  # (table, ProcFacts): one set of /proc reads per process table
+
+
+def split_strays(table, shells, idle_min, windows=WINDOWS):
+    """(work, strays, waits) for a pane's tool shells: the shells that are work, the
+    proven-stray wait loops as (pid, class, why), and the reasons of self-matching
+    loops that still wait on live work. Windows' command lines are not read, so
+    there every shell is work."""
+    if windows or not shells:
+        return list(shells), [], []
+    if _FACTS[0] is not table:
+        _FACTS[:] = [table, ProcFacts(table)]
+    work, strays, waits = [], [], []
+    for p in shells:
+        stray, cls, why = stray_verdict(table, p, _FACTS[1], idle_min)
+        if stray:
+            strays.append((p, cls, why))
+        else:
+            work.append(p)
+            if why.startswith("waits on live pid") and "self-matching" in why and why not in waits:
+                waits.append(why)
+    return work, strays, waits
+
+
+def task_id_of(pid):
+    """The harness task id a tool shell writes to: the stem of the
+    `<...>/tasks/<task_id>.output` its fd 1 points at, or None."""
+    try:
+        m = TASK_OUTPUT_RE.search(os.readlink(f"/proc/{pid}/fd/1"))
+    except OSError:
+        return None
+    return m.group(1) if m else None
+
+
+def own_tasks(table, me, idle_min, facts=None, task_of=task_id_of):
+    """(claude_pid, rows) for the session running `me`: one row per tool shell that
+    is a direct child of the nearest claude above `me`, `me`'s own ancestry left
+    out, as {task_id, pid, stray, class, why, command}. claude_pid is None when no
+    claude runs above `me`. A subagent shares its parent's claude, so from one
+    this lists the parent's tasks too."""
+    ancestry, claude, p = {me}, None, table.get(me, (None,))[0]
+    while p in table and p not in ancestry:
+        if is_claude(table[p][1]):
+            claude = p
+            break
+        ancestry.add(p)
+        p = table[p][0]
+    if claude is None:
+        return None, []
+    facts = facts or ProcFacts(table)
+    rows = []
+    for c in sorted(table):
+        ppid, argv = table[c]
+        if ppid != claude or c in ancestry or not any(SNAPSHOT in a for a in argv):
+            continue
+        stray, cls, why = stray_verdict(table, c, facts, idle_min)
+        cmd = tool_command(argv) or " ".join(argv)
+        rows.append({"task_id": task_of(c), "pid": c, "stray": stray, "class": cls, "why": why,
+                     "command": re.sub(r"\s+", " ", cmd).strip()[:120]})
+    return claude, rows
+
+
+def own_tasks_main(idle_min, as_json):
+    """--own-tasks: list this session's background tasks. Exit 0 when none is live
+    work (every one is a proven stray, or there are none), 1 when one is, 3 UNKNOWN
+    (no /proc, the process table unreadable, or no claude above this process)."""
+    table = None if WINDOWS else proc_table()
+    claude, rows = own_tasks(table, os.getpid(), idle_min) if table else (None, [])
+    if claude is None:
+        why = "no /proc on this OS" if WINDOWS or table is None else "this process runs under no claude"
+        if as_json:
+            print(json.dumps({"verdict": "UNKNOWN", "reason": why, "claude_pid": None, "tasks": []}))
+        else:
+            print(f"UNKNOWN: background tasks cannot be enumerated: {why}")
+        return 3
+    live = [r for r in rows if not r["stray"]]
+    if as_json:
+        print(json.dumps({"verdict": "LIVE" if live else "CLEAR", "claude_pid": claude, "tasks": rows}, indent=1))
+        return 1 if live else 0
+    print(f"own tasks of claude pid {claude}: {len(rows)} background task(s), {len(rows) - len(live)} stray, "
+          f"{len(live)} live")
+    for r in rows:
+        tid = r["task_id"] or "-"
+        if r["stray"]:
+            print(f"STRAY {tid} pid={r['pid']} {r['class']}: {r['command']}")
+        else:
+            print(f"LIVE {tid} pid={r['pid']} {r['why']}: {r['command']}")
+    return 1 if live else 0
 
 
 # ---------------------------------------------------------------- transcript
@@ -1935,9 +3421,20 @@ def status_since(rp, now_ms=None):
     return v
 
 
-def classify(term, row, table, idle_min, own_tid, ready):
+def classify(term, row, table, idle_min, own_tid, ready, strays=None):
     """Return (verdict, reasons[]). Verdicts: SELF, SHELL, UNKNOWN, BUSY, LIMITED,
-    REVIVED, FINISHED, CLOSEOUT, FOOTER-FINISHED, FOOTER-ONLY, EXITED-FINISHED, EXITED, ACTIVE."""
+    REVIVED, FINISHED, CLOSEOUT, FOOTER-FINISHED, FOOTER-ONLY, EXITED-FINISHED, EXITED, ACTIVE.
+    A proven-stray wait loop (split_strays) is not work: it never makes a row
+    BUSY and never finishes one; it only adds an `N stray wait loop(s)` note to
+    whatever verdict the row reaches. Pass a list as `strays` to receive them as
+    (pid, class, why)."""
+    strays = [] if strays is None else strays
+    verdict, why = classify_row(term, row, table, idle_min, own_tid, ready, strays)
+    return verdict, why + ([f"{len(strays)} stray wait loop(s)"] if strays else [])
+
+
+def classify_row(term, row, table, idle_min, own_tid, ready, strays):
+    """classify()'s verdict, with the pane's stray wait loops appended to `strays`."""
     if term["id"] == own_tid:
         return "SELF", ["the terminal running this command"]
     if row is None:
@@ -1966,9 +3463,12 @@ def classify(term, row, table, idle_min, own_tid, ready):
     if tx is None:
         return "UNKNOWN", ["transcript not found under " + (row.get("configDir") or "~/.claude")]
 
+    work, found, waits = split_strays(table, shells, idle_min)
+    strays.extend(found)
     busy = []
-    if shells:
-        busy.append(f"{len(shells)} tool shell(s) running under claude (Bash/Monitor/background task)")
+    if work:
+        busy.append(f"{len(work)} tool shell(s) running under claude (Bash/Monitor/background task)")
+        busy += waits
     if tx["pending_tool"]:
         busy.append("last assistant turn has a tool call with no result")
     idle_for = (time.time() * 1000 - (tx["last_activity"] or 0)) / 60000
@@ -2067,9 +3567,9 @@ def classify(term, row, table, idle_min, own_tid, ready):
     return "ACTIVE", ["no finished marker, no closeout phrase"]
 
 
-def screen_one(term, row, table, idle_min, own, ready):
+def screen_one(term, row, table, idle_min, own, ready, strays=None):
     """classify(), plus the slow output-moving sample for rows that would close."""
-    verdict, why = classify(term, row, table, idle_min, own, ready)
+    verdict, why = classify(term, row, table, idle_min, own, ready, strays)
     if verdict in CLOSABLE - {"EXITED-FINISHED"}:
         moving = output_moving(term["id"])
         if moving is not False:
@@ -2145,10 +3645,17 @@ def close_one(tid, idle_min, own, allowed):
     if err:
         return False, f"readiness unreadable at re-screen ({err[:80]})"
     table = proc_table()
-    verdict, why = screen_one(t, open_rows().get(tid), table, idle_min, own, ready)
+    found = []
+    verdict, why = screen_one(t, open_rows().get(tid), table, idle_min, own, ready, found)
     if verdict not in allowed:
         return False, f"re-screen now says {verdict}: {'; '.join(why)}"
     claudes = proc_facts(table, t["pid"])[0] if table and t.get("pid") in table else []
+    # The runner's pane kill reaches a stray background shell by neither route:
+    # the in-process pane SIGTERMs the root pid alone, the PTY holder signals
+    # the PTY child and its group, and a background shell leads its own session
+    # and group (pid = pgid = sid), so no hangup reaches it either. Record each
+    # stray now; only these, still stray and unchanged, are ever signalled below.
+    recorded = [(p, proc_start(p), table[p][1], cls) for p, cls, _ in found]
     sent = "sent"
     try:
         req = urllib.request.Request(f"{API}/terminals/{tid}", method="DELETE")
@@ -2166,8 +3673,119 @@ def close_one(tid, idle_min, own, allowed):
             listed = None
         alive = [p for p in claudes if pid_alive(p)]
         if listed is False and not alive:
-            return True, f"DELETE {sent}; read back: tab gone from /terminals, claude process gone"
+            return True, f"DELETE {sent}; read back: tab gone from /terminals, claude process gone" + \
+                end_strays(recorded, idle_min)
     return False, f"DELETE {sent}; read back: listed={listed}, claude pids still alive={alive}"
+
+
+def stray_now(pid, start, argv):
+    """Whether `pid` is still the recorded process: same start time and argv (a
+    reused pid or a zombie is not)."""
+    try:
+        av = [a for a in open(f"/proc/{pid}/cmdline", "rb").read().decode(errors="replace").split("\0") if a]
+    except OSError:
+        return False
+    return start is not None and proc_start(pid) == start and av == argv
+
+
+def still_stray(pid, start, argv, cls, idle_min):
+    """Why `pid` may NOT be signalled, or None when it may: it must be the
+    recorded process (start time and argv) AND, on a fresh process table, still
+    a stray of the same class. A loop whose condition flipped moves on to its
+    post-loop commands in the same process, with the same argv and start time,
+    so identity alone would not tell that work from the loop. Returns
+    (reason, table)."""
+    if not stray_now(pid, start, argv):
+        return "gone", None
+    table = proc_table()
+    if not table or pid not in table:
+        return "process table unreadable at re-check", None
+    stray, now_cls, why = stray_verdict(table, pid, ProcFacts(table), idle_min)
+    if not stray or now_cls != cls:
+        return f"no longer a {cls} stray ({why[:80]})", table
+    return None, table
+
+
+def _signal_pid(pid, start, argv, sig):
+    """Send `sig` to `pid` only while it is still (start, argv): through a pidfd
+    where the OS has one, so a pid reused after the check cannot be hit."""
+    import signal
+    fd = None
+    if hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal"):
+        try:
+            fd = os.pidfd_open(pid)
+        except OSError:
+            return False
+    try:
+        if not stray_now(pid, start, argv):
+            return False
+        if fd is not None:
+            signal.pidfd_send_signal(fd, sig)
+        else:
+            os.kill(pid, sig)
+        return True
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def _group_is_the_loop(table, pid):
+    """Whether every member of pid's process group is pid itself, a fork of it,
+    or one of its own sleeps and probes, so that signalling the group ends
+    nothing but the loop."""
+    allowed = {"sleep", "ps", "cat", "tail", "head"} | set(PROBES)
+    mine = set(subtree(table, pid))
+    for p, (_, av) in table.items():
+        st = proc_stat(p)
+        if not st or st[2] != str(pid):
+            continue
+        if p not in mine or not (p == pid or av == table[pid][1] or (av and exe_base(av[0]) in allowed)):
+            return False
+    return True
+
+
+def end_strays(recorded, idle_min, wait_s=5.0):
+    """The close message's stray suffix. Each recorded stray of this pane that
+    outlived the close is ended (Linux only), and only while it is still the
+    recorded process AND still a stray of its recorded class on a fresh process
+    table, checked again before every signal: SIGTERM, then SIGKILL after
+    `wait_s`. The signal goes to its process group only when that group holds
+    nothing but the loop and its own sleeps and probes, else to the pid alone."""
+    import signal
+    out, gone = [], 0
+    for pid, start, argv, cls in recorded:
+        if WINDOWS or not stray_now(pid, start, argv):
+            gone += 1
+            continue
+        why, sent = "still alive after SIGKILL", False
+        try:
+            for sig, wait in ((signal.SIGTERM, wait_s), (signal.SIGKILL, 2.0)):
+                refusal, table = still_stray(pid, start, argv, cls, idle_min)
+                if refusal == "gone":
+                    break
+                if refusal:
+                    why = refusal
+                    break
+                if _group_is_the_loop(table, pid) and os.getpgid(pid) == pid:
+                    os.killpg(pid, sig)  # a group id is not reused while its group exists
+                elif not _signal_pid(pid, start, argv, sig):
+                    break
+                sent = True
+                deadline = time.time() + wait
+                while time.time() < deadline and stray_now(pid, start, argv):
+                    time.sleep(0.1)
+                if not stray_now(pid, start, argv):
+                    break
+        except OSError as e:
+            why = f"{type(e).__name__}: {e}"
+        if not stray_now(pid, start, argv) and not sent:
+            gone += 1  # it went by itself before anything was sent
+            continue
+        out.append(f"stray pid {pid} outlived the pane close; "
+                   + ("ended" if not stray_now(pid, start, argv) else f"could not end: {why}"))
+    if gone:
+        out.insert(0, f"{gone} stray wait loop(s) gone with the pane")
+    return "".join("; " + s for s in out)
 
 
 def main():
@@ -2180,6 +3798,9 @@ def main():
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--port", help="runner API port (default $QONTINUI_RUNNER_API_PORT or 9876)")
     ap.add_argument("--selftest", action="store_true", help="run the regression table and exit; reads nothing")
+    ap.add_argument("--own-tasks", action="store_true",
+                    help="list THIS session's background tasks as STRAY or LIVE (reads /proc only); exit 0 none "
+                         "live, 1 a live one, 3 UNKNOWN")
     a = ap.parse_args()
     # A piped Windows console is cp1252: write UTF-8 so a name, reason or prompt
     # glyph never dies with UnicodeEncodeError after the work is done.
@@ -2193,6 +3814,8 @@ def main():
             pass
     if a.selftest:
         return selftest()
+    if a.own_tasks:
+        return own_tasks_main(a.idle_min, a.json)
     if a.port:
         global API
         API = f"http://127.0.0.1:{a.port}"

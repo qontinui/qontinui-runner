@@ -202,13 +202,20 @@ pub(crate) fn forms_label(forms: &[DeclarationForm]) -> String {
 pub(crate) enum DeclaredTarget {
     /// No declaration — resolve to the sibling's branch.
     None,
-    /// A declaration exists and is unambiguous, but it orders the sibling
-    /// AFTER this side and this step did not opt in
-    /// ([`CiSibling::accept_trailing_sibling`]). Resolve to the branch — but
-    /// as a DECIDED outcome that names itself in the log, never as a silent
-    /// fallback that is indistinguishable from "nobody declared anything".
+    /// Only declarations ordering the sibling AFTER this side exist, and this
+    /// step did not opt in ([`CiSibling::accept_trailing_sibling`]). Resolve
+    /// to the branch — but as a DECIDED outcome that names itself in the log,
+    /// never as a silent fallback that is indistinguishable from "nobody
+    /// declared anything".
+    ///
+    /// `numbers` may hold SEVERAL sibling PRs, and that is not ambiguous here:
+    /// none of their trees is followed, so the answer is the branch however
+    /// many trail. Refusing them was a false red (runner#2311, 2026-10-31:
+    /// ui-bridge#266 and #270 both legitimately declared
+    /// `coord:downstream-of=qontinui-runner#2311`). Mirrors
+    /// `.github/actions/checkout-sibling/action.yml`.
     TrailingSiblingDeclined {
-        number: u64,
+        numbers: Vec<u64>,
         forms: Vec<DeclarationForm>,
     },
     Pr {
@@ -270,9 +277,12 @@ fn ambiguous(what: &str, sibling_repo: &str, numbers: &[u64]) -> String {
 /// the author's to resolve, never ours to guess. Ways to be ambiguous, all
 /// hard-failing alike:
 ///
-/// * two same-direction labels on the dispatched PR naming different siblings,
-/// * two sibling PRs declaring the same form at this one,
-/// * any two forms naming DIFFERENT sibling PRs,
+/// * two `downstream-of` labels on the dispatched PR naming different siblings,
+/// * two sibling PRs declaring `upstream-of` at this one,
+/// * a LEADING form and any other form naming DIFFERENT sibling PRs,
+/// * only when `accept_trailing_sibling` is set: the TRAILING forms naming
+///   different sibling PRs (with it unset they are all declined, so several
+///   of them are [`DeclaredTarget::TrailingSiblingDeclined`], not an error),
 /// * both merge ORDERS declared for the same pair — a cycle in coord's dep
 ///   graph, which holds BOTH pull requests forever. Compiling against the
 ///   right tree would hide that behind a green check, so it reds here.
@@ -347,17 +357,6 @@ pub(crate) fn resolve_declaration(
             &downs,
         ));
     }
-    let self_ups = dedup(self_ups);
-    if self_ups.len() > 1 {
-        return Err(ambiguous(
-            &format!(
-                "this pull request carries {UPSTREAM_PREFIX} labels naming DIFFERENT \
-                 {sibling_short} pull requests"
-            ),
-            sibling_repo,
-            &self_ups,
-        ));
-    }
     let ups = dedup(ups);
     if ups.len() > 1 {
         return Err(ambiguous(
@@ -369,33 +368,27 @@ pub(crate) fn resolve_declaration(
             &ups,
         ));
     }
+    // The two TRAILING forms (this side leads) are kept as SETS rather than
+    // refused at >1 the way the leading forms are above. Several sibling PRs
+    // declaring that they land AFTER this one is an ordinary state — one
+    // change that two independent adaptations both wait on — and it is a
+    // contradiction only when ONE tree must be chosen from the set: when a
+    // leading form exists, or when this step follows a trailing sibling. Both
+    // are decided below. Refusing it here hard-failed runner#2311 (ui-bridge
+    // #266 and #270) on a step that would have built the branch anyway.
+    let self_ups = dedup(self_ups);
     let sib_downs = dedup(sib_downs);
-    if sib_downs.len() > 1 {
-        return Err(ambiguous(
-            &format!(
-                "several open {sibling_short} pull requests declare \
-                 {DOWNSTREAM_PREFIX}{this_short}#{this_pr}"
-            ),
-            sibling_repo,
-            &sib_downs,
-        ));
-    }
 
     // Reconcile the four forms. Order is stable so the provenance string and
     // the tests do not depend on hash iteration order.
     let mut forms: Vec<DeclarationForm> = Vec::new();
-    let mut targets: Vec<u64> = Vec::new();
-    for (hit, form) in [
-        (downs.first().copied(), DeclarationForm::DownstreamOf),
-        (ups.first().copied(), DeclarationForm::UpstreamOf),
-        (self_ups.first().copied(), DeclarationForm::SelfUpstreamOf),
-        (
-            sib_downs.first().copied(),
-            DeclarationForm::SiblingDownstreamOf,
-        ),
+    for (hits, form) in [
+        (&downs, DeclarationForm::DownstreamOf),
+        (&ups, DeclarationForm::UpstreamOf),
+        (&self_ups, DeclarationForm::SelfUpstreamOf),
+        (&sib_downs, DeclarationForm::SiblingDownstreamOf),
     ] {
-        if let Some(n) = hit {
-            targets.push(n);
+        if !hits.is_empty() {
             forms.push(form);
         }
     }
@@ -403,7 +396,52 @@ pub(crate) fn resolve_declaration(
         return Ok(DeclaredTarget::None);
     }
 
-    let distinct = dedup(targets);
+    // Every trailing target, both forms unioned.
+    let trail_targets = dedup(self_ups.iter().chain(sib_downs.iter()).copied().collect());
+    let has_leads = !downs.is_empty() || !ups.is_empty();
+
+    if !has_leads {
+        // TRAILING forms only. Not opted in: every one is declined, so the
+        // count is irrelevant to the answer — see `TrailingSiblingDeclined`.
+        // See [`CiSibling::accept_trailing_sibling`] for why declining is the
+        // safe default.
+        if !accept_trailing_sibling {
+            return Ok(DeclaredTarget::TrailingSiblingDeclined {
+                numbers: trail_targets,
+                forms,
+            });
+        }
+        // Opted in: exactly one trailing tree must be chosen, so several
+        // distinct ones are ambiguous.
+        if trail_targets.len() > 1 {
+            return Err(ambiguous(
+                &format!(
+                    "this step follows a trailing sibling, and the coord dep labels ordering \
+                     {sibling_short} after {this_short}#{this_pr} name DIFFERENT \
+                     {sibling_short} pull requests"
+                ),
+                sibling_repo,
+                &trail_targets,
+            ));
+        }
+        return Ok(DeclaredTarget::Pr {
+            number: trail_targets[0],
+            forms,
+        });
+    }
+
+    // A LEADING form exists, so strictness is unchanged: every form — the
+    // trailing set included — must name the same PR. The union check runs
+    // FIRST so a trailing target DIFFERENT from the leading one reads as the
+    // ambiguity it is; only when all agree does the cycle check speak.
+    let distinct = dedup(
+        downs
+            .iter()
+            .chain(ups.iter())
+            .chain(trail_targets.iter())
+            .copied()
+            .collect(),
+    );
     if distinct.len() > 1 {
         return Err(ambiguous(
             &format!(
@@ -429,7 +467,7 @@ pub(crate) fn resolve_declaration(
         .copied()
         .filter(|f| !f.sibling_leads())
         .collect();
-    if !leads.is_empty() && !trails.is_empty() {
+    if !trails.is_empty() {
         return Err(format!(
             "contradictory merge ORDER declared for the pair {this_short}#{this_pr} / \
              {sibling_repo}#{number}: {} order {sibling_short} first, while {} order \
@@ -438,14 +476,6 @@ pub(crate) fn resolve_declaration(
             forms_label(&leads),
             forms_label(&trails),
         ));
-    }
-
-    // The sibling TRAILS. Following it would compile against a tree that is
-    // not this repo's main yet and will not be until after this change lands,
-    // so only a step that opted in gets it. See
-    // [`CiSibling::accept_trailing_sibling`] for why that is the safe default.
-    if leads.is_empty() && !accept_trailing_sibling {
-        return Ok(DeclaredTarget::TrailingSiblingDeclined { number, forms });
     }
 
     Ok(DeclaredTarget::Pr { number, forms })
@@ -998,15 +1028,24 @@ async fn resolve_one(
         &inputs,
     )? {
         DeclaredTarget::None => no_declaration(cwd, worktree, sibling, "no declaration").await,
-        DeclaredTarget::TrailingSiblingDeclined { number, forms } => {
+        DeclaredTarget::TrailingSiblingDeclined { numbers, forms } => {
+            let list = numbers
+                .iter()
+                .map(|n| format!("{}#{n}", sibling.repo))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let (noun, verb) = if numbers.len() == 1 {
+                ("declaration", "orders")
+            } else {
+                ("declarations", "order")
+            };
             no_declaration(
                 cwd,
                 worktree,
                 sibling,
                 &format!(
-                    "declaration {}#{number} (via {}) orders {} AFTER this side; \
+                    "{noun} {list} (via {}) {verb} {} AFTER this side; \
                      this step does not accept a trailing sibling",
-                    sibling.repo,
                     forms_label(&forms),
                     short_name(&sibling.repo),
                 ),
@@ -1408,7 +1447,7 @@ mod tests {
         assert_eq!(
             got,
             DeclaredTarget::TrailingSiblingDeclined {
-                number: 104,
+                numbers: vec![104],
                 forms: vec![DeclarationForm::SiblingDownstreamOf]
             }
         );
@@ -1424,7 +1463,7 @@ mod tests {
         assert_eq!(
             got,
             DeclaredTarget::TrailingSiblingDeclined {
-                number: 104,
+                numbers: vec![104],
                 forms: vec![DeclarationForm::SelfUpstreamOf]
             }
         );
@@ -1538,6 +1577,102 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("contradictory"), "got: {err}");
+    }
+
+    /// Several TRAILING declarations are not ambiguous on a step that does not
+    /// follow a trailing sibling: every one is declined, so the answer is the
+    /// branch however many there are. Refusing them was a false red on
+    /// runner#2311 (ui-bridge#266 and #270 both declared
+    /// `coord:downstream-of=qontinui-runner#2311`). They become ambiguous only
+    /// when a tree must be chosen from among them.
+    #[test]
+    fn several_trailing_declarations_are_declined_not_ambiguous() {
+        let two_sibling_trails = inputs(
+            &[],
+            &[
+                (266, &["coord:downstream-of=qontinui-runner#7"]),
+                (270, &["coord:downstream-of=qontinui/qontinui-runner#7"]),
+            ],
+        );
+
+        // (a) two trailing, not opted in -> the branch, both listed.
+        let got =
+            super::resolve_declaration(SCHEMAS, RUNNER, 7, false, &two_sibling_trails).unwrap();
+        assert_eq!(
+            got,
+            DeclaredTarget::TrailingSiblingDeclined {
+                numbers: vec![266, 270],
+                forms: vec![DeclarationForm::SiblingDownstreamOf]
+            }
+        );
+
+        // Both trailing forms at once, naming different PRs, not opted in.
+        let got = super::resolve_declaration(
+            SCHEMAS,
+            RUNNER,
+            7,
+            false,
+            &inputs(
+                &[
+                    "coord:upstream-of=qontinui-schemas#104",
+                    "coord:upstream-of=qontinui-schemas#105",
+                ],
+                &[(266, &["coord:downstream-of=qontinui-runner#7"])],
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            got,
+            DeclaredTarget::TrailingSiblingDeclined {
+                numbers: vec![104, 105, 266],
+                forms: vec![
+                    DeclarationForm::SelfUpstreamOf,
+                    DeclarationForm::SiblingDownstreamOf
+                ]
+            }
+        );
+
+        // (b) two trailing, opted in -> a tree must be chosen: ambiguous.
+        let err =
+            super::resolve_declaration(SCHEMAS, RUNNER, 7, true, &two_sibling_trails).unwrap_err();
+        assert!(err.contains("contradictory"), "got: {err}");
+        assert!(err.contains("#266") && err.contains("#270"), "got: {err}");
+
+        // (c) one leading plus two trailing -> refused, in either setting.
+        for accept in [false, true] {
+            let err = super::resolve_declaration(
+                SCHEMAS,
+                RUNNER,
+                7,
+                accept,
+                &inputs(
+                    &["coord:downstream-of=qontinui-schemas#300"],
+                    &[
+                        (266, &["coord:downstream-of=qontinui-runner#7"]),
+                        (270, &["coord:downstream-of=qontinui-runner#7"]),
+                    ],
+                ),
+            )
+            .unwrap_err();
+            assert!(err.contains("DIFFERENT"), "accept={accept} got: {err}");
+        }
+
+        // A leading target that one of several trailing targets coincides
+        // with is still the different-target ambiguity, not a silent pick.
+        let err = resolve_declaration(
+            SCHEMAS,
+            RUNNER,
+            7,
+            &inputs(
+                &["coord:downstream-of=qontinui-schemas#266"],
+                &[
+                    (266, &["coord:downstream-of=qontinui-runner#7"]),
+                    (270, &["coord:downstream-of=qontinui-runner#7"]),
+                ],
+            ),
+        )
+        .unwrap_err();
+        assert!(err.contains("DIFFERENT"), "got: {err}");
     }
 
     /// Duplicates of the SAME declaration are not a contradiction.

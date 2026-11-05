@@ -211,7 +211,7 @@ export function repoTenantHint(answer: unknown, candidates: readonly string[]): 
       return {
         inferred: null,
         note: "repo: no tenant",
-        detail: `Repo ${text(a.repo)} has no owning tenant in coord's registry.`,
+        detail: `Repo ${text(a.repo)} is owned by no tenant this device is paired to.`,
       };
     case "several": {
       const ids = Array.isArray(a.tenantIds)

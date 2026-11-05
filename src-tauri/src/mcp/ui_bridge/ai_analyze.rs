@@ -2,7 +2,7 @@
 //!
 //! Macro-generated handlers that proxy AI-side operations (analysis of
 //! tabular/region/structured data, cross-app comparison, recovery attempts,
-//! semantic search, semantic diff, media compare, pixel-accurate image diff)
+//! semantic search, semantic diff, pixel-accurate image diff)
 //! to the webview SDK via `ui_bridge_request_sync`.
 //!
 //! Namespace note: most handlers sit under `/ai/*`; `image-diff` also has a

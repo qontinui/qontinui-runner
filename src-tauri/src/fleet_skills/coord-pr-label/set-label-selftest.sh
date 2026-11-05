@@ -238,6 +238,11 @@ expect_accept "coord:stacked-on=qontinui-web#748"
 expect_reject "coord:blocked"                 "retired hold label"
 expect_reject "coord:experimental"            "retired hold label"
 expect_accept "coord:credibility-override"
+# The Tier-8b twin of credibility-override: a bare FLAG, so it must clear the
+# validator without "=value" -- and its valued spellings are still malformed.
+expect_accept "coord:blast-radius-override"
+expect_dry_absent "coord:blast-radius-override" 'parameterised labels need "=value"'
+expect_reject "coord:blast-radius-override=1" "unknown coord:* label key"
 expect_accept "coord:migrate-repair"
 expect_accept "coord:merge-strategy=squash"
 expect_accept "coord:requires-tag=ts-v*"
@@ -273,6 +278,8 @@ expect_dry_absent "$DYN_LABEL" "does not exist"
 # A flag label: caveat yes, create-the-label command no.
 expect_dry_contains "coord:credibility-override" "NOT checked"
 expect_dry_absent   "coord:credibility-override" "gh label create"
+expect_dry_contains "coord:blast-radius-override" "NOT checked"
+expect_dry_absent   "coord:blast-radius-override" "gh label create"
 # `merge-strategy` is the case that makes the arm KEYED rather than a `*=*`
 # test, and it is the only one that can catch that regression: it CARRIES A
 # VALUE, so the loose form sweeps it in with the dep labels -- and then justifies
@@ -339,6 +346,8 @@ expect_reject "coord:requires-tag="           'value after "=" cannot be empty'
 # that carries the fix, so a reworded preamble does not silently un-pin it.
 expect_reject "coord:priority"                "must be set on the PR itself"
 expect_reject "coord:priority=1"              "must be set on the PR itself"
+expect_reject "coord:destructive-attested"              "must be set on the PR itself"
+expect_reject "coord:destructive-attested=abcdef123456" "must be set on the PR itself"
 
 # `coord:red-main-fix` is rejected by coord with the GENERIC message -- coord
 # has no bespoke arm for it, so this mirror must not invent one. This case pins

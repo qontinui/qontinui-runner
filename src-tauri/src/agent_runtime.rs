@@ -8547,7 +8547,10 @@ async fn run_continuation_headless(
     let coord_mcp = crate::coord_mcp::provision_coord_mcp_for_session(workdir, bound_port, None);
     // No per-spawn pin here: a gate continuation carries no account field —
     // the `pick_best_account` call above is the whole selection.
-    let session_args = pinned_session_args(pinned_session_id);
+    let session_args = headless_agent_args(
+        &crate::settings::get_claude_session_permission(),
+        pinned_session_args(pinned_session_id),
+    );
     match spawn_claude_child(
         workdir,
         initial_prompt,
@@ -9449,7 +9452,10 @@ async fn run_agent_subprocess(
         // Pin this attempt's Claude session id so coord can be told which
         // session the dispatch launched. Minted INSIDE the loop, fresh per
         // attempt: a restart is a new session, and the CLI refuses a reused id.
-        let session_args = session_pins.next_attempt();
+        let session_args = headless_agent_args(
+            &crate::settings::get_claude_session_permission(),
+            session_pins.next_attempt(),
+        );
         match spawn_claude_child(
             &primary_wt,
             &payload.initial_prompt,
@@ -10205,11 +10211,12 @@ pub(crate) async fn spawn_claude_child(
     // briefing whose memory clause it gates.
     coord_mcp: crate::coord_mcp::CoordMcpDelivery,
     // Extra `claude` CLI flags, verbatim and in order, placed before the env
-    // finalize. The agent-runtime callers pass none (their child reads the
-    // prompt from stdin with no flags at all); the scheduler's RemoteAgent
-    // launch (`crate::scheduler_remote_agent`) passes `-p`, `--max-turns`,
-    // `--model` and `--allowedTools`, which is what makes its child a bounded
-    // single-shot run whose exit is the completion signal.
+    // finalize. The agent-runtime callers pass the permission posture and the
+    // session pin ([`headless_agent_args`]); their child reads the prompt from
+    // stdin. The scheduler's RemoteAgent launch (`crate::scheduler_remote_agent`)
+    // passes `-p`, `--max-turns`, `--model`, its own permission flags and
+    // `--allowedTools`, which is what makes its child a bounded single-shot run
+    // whose exit is the completion signal.
     extra_args: &[String],
     // Make the child the leader of its OWN process group (Unix; a no-op on
     // Windows, where the caller attaches a job object after the spawn via
@@ -10622,6 +10629,34 @@ async fn heartbeat_once(payload: &LaunchPayload) -> anyhow::Result<()> {
 /// must be fresh for each spawn attempt, because the CLI refuses to reuse one.
 fn pinned_session_args(session_id: uuid::Uuid) -> Vec<String> {
     vec!["--session-id".to_string(), session_id.to_string()]
+}
+
+/// The `extra_args` an agent-runtime HEADLESS child is spawned with: the
+/// operator's session permission posture rendered over the autonomous default
+/// ([`PermissionMode::DangerouslySkip`]), then the session pin.
+///
+/// The terminal seam has carried `--dangerously-skip-permissions` since #459
+/// (`build_continuation_claude_command`), but the headless twin passed only the
+/// session pin, so its child ran in Claude Code's `default` mode. A headless
+/// child cannot answer a prompt, so every tool call outside a pre-approved
+/// allow list came back "This command requires approval" and the session gave
+/// up: merge-shepherd and PR-fix dispatches could not run `gh`, `git` or a
+/// coord-mcp tool. `permission` is passed in, not read here, so the argv shape
+/// is testable against a fixed setting; an `AllowList` posture renders
+/// `--permission-mode dontAsk --allowedTools …` exactly as on the terminal seam.
+///
+/// The scheduler's RemoteAgent launch does NOT go through here: it passes its
+/// own bounded `-p --allowedTools` set to [`spawn_claude_child`].
+///
+/// [`PermissionMode::DangerouslySkip`]: crate::claude_session::launch_spec::PermissionMode::DangerouslySkip
+fn headless_agent_args(
+    permission: &crate::claude_session::launch_spec::SessionPermissionSetting,
+    session_args: Vec<String>,
+) -> Vec<String> {
+    use crate::claude_session::launch_spec::PermissionMode;
+    let mut args = permission.apply(PermissionMode::DangerouslySkip).render();
+    args.extend(session_args);
+    args
 }
 
 /// The Claude session ids of one launch's spawn attempts.
@@ -14143,7 +14178,7 @@ mod tests {
     fn launchable_or_bare_falls_back_for_a_non_executable_file() {
         use std::os::unix::fs::PermissionsExt;
         let _env_lock = env_lock();
-        let prev_bin = std::env::var("QONTINUI_CLAUDE_BIN").ok();
+        let _restore = crate::test_env::EnvVarRestore::capture(&["QONTINUI_CLAUDE_BIN"]);
         std::env::remove_var("QONTINUI_CLAUDE_BIN");
         let tmp = tempfile::tempdir().unwrap();
         let f = tmp.path().join("claude");
@@ -14153,9 +14188,6 @@ mod tests {
         std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
         let exec = launchable_or_bare(f.to_string_lossy().into_owned());
         let missing = launchable_or_bare(tmp.path().join("gone").to_string_lossy().into_owned());
-        if let Some(v) = prev_bin {
-            std::env::set_var("QONTINUI_CLAUDE_BIN", v);
-        }
         assert_eq!(non_exec, "claude");
         assert_eq!(exec, f.to_string_lossy());
         assert_eq!(missing, "claude");
@@ -14164,13 +14196,9 @@ mod tests {
     #[test]
     fn claude_bin_respects_env_override() {
         let _env_lock = env_lock();
-        let prev = std::env::var("QONTINUI_CLAUDE_BIN").ok();
+        let _restore = crate::test_env::EnvVarRestore::capture(&["QONTINUI_CLAUDE_BIN"]);
         std::env::set_var("QONTINUI_CLAUDE_BIN", "/some/fake/claude-fixture");
         assert_eq!(claude_bin_path(), "/some/fake/claude-fixture");
-        match prev {
-            Some(v) => std::env::set_var("QONTINUI_CLAUDE_BIN", v),
-            None => std::env::remove_var("QONTINUI_CLAUDE_BIN"),
-        }
     }
 
     /// Smoke test using a fake claude binary fixture (the existing
@@ -14228,7 +14256,7 @@ mod tests {
     #[tokio::test]
     async fn a_stalled_child_is_reported_but_never_touched() {
         let _env_lock = env_lock();
-        let prev = std::env::var("QONTINUI_SPAWN_STALL_SECS").ok();
+        let _restore = crate::test_env::EnvVarRestore::capture(&["QONTINUI_SPAWN_STALL_SECS"]);
         std::env::set_var("QONTINUI_SPAWN_STALL_SECS", "1");
 
         let tmp = std::env::temp_dir();
@@ -14256,11 +14284,6 @@ mod tests {
             exit, 0,
             "the stall watch reports; it must never kill or alter the child"
         );
-
-        match prev {
-            Some(v) => std::env::set_var("QONTINUI_SPAWN_STALL_SECS", v),
-            None => std::env::remove_var("QONTINUI_SPAWN_STALL_SECS"),
-        }
     }
 
     /// The terminal arm launches the `claude` CLI with the prompt as a single
@@ -14272,7 +14295,7 @@ mod tests {
     #[test]
     fn terminal_continuation_command_is_interactive_positional_prompt() {
         let _env_lock = env_lock();
-        let prev = std::env::var("QONTINUI_CLAUDE_BIN").ok();
+        let _restore = crate::test_env::EnvVarRestore::capture(&["QONTINUI_CLAUDE_BIN"]);
         std::env::set_var("QONTINUI_CLAUDE_BIN", "/fake/claude");
 
         // Mirror the construction in `run_continuation_terminal` (a fixed-size
@@ -14289,11 +14312,6 @@ mod tests {
             !command.iter().any(|a| a == "--print" || a == "-p"),
             "must NOT use --print/-p: the session must stay interactive"
         );
-
-        match prev {
-            Some(v) => std::env::set_var("QONTINUI_CLAUDE_BIN", v),
-            None => std::env::remove_var("QONTINUI_CLAUDE_BIN"),
-        }
     }
 
     /// Phase 3 of `2026-08-20-worktree-spawn-autonomy-and-trust-preconditions`:
@@ -14583,6 +14601,51 @@ mod tests {
         );
     }
 
+    /// A headless agent-runtime child runs with the autonomous permission flag
+    /// ahead of its session pin — the same `--dangerously-skip-permissions` the
+    /// terminal seam passes — so it never stalls on a prompt it cannot answer.
+    #[test]
+    fn headless_agent_args_skip_permissions_by_default() {
+        use crate::claude_session::launch_spec::SessionPermissionSetting;
+        let id = uuid::Uuid::parse_str("99999999-9999-4999-8999-999999999999").unwrap();
+        assert_eq!(
+            headless_agent_args(
+                &SessionPermissionSetting::SiteDefault,
+                pinned_session_args(id)
+            ),
+            vec![
+                "--dangerously-skip-permissions".to_string(),
+                "--session-id".to_string(),
+                "99999999-9999-4999-8999-999999999999".to_string(),
+            ]
+        );
+    }
+
+    /// An operator allow-list posture governs the headless child too: it runs
+    /// `dontAsk` with exactly the configured tools, never the bypass flag.
+    #[test]
+    fn headless_agent_args_follow_an_allow_list_posture() {
+        use crate::claude_session::launch_spec::SessionPermissionSetting;
+        let id = uuid::Uuid::parse_str("99999999-9999-4999-8999-999999999999").unwrap();
+        let posture = SessionPermissionSetting::AllowList {
+            tools: vec!["Read".to_string(), "Bash(git status)".to_string()],
+        };
+        let args = headless_agent_args(&posture, pinned_session_args(id));
+        assert_eq!(
+            args,
+            vec![
+                "--permission-mode".to_string(),
+                "dontAsk".to_string(),
+                "--allowedTools".to_string(),
+                "Read".to_string(),
+                "Bash(git status)".to_string(),
+                "--session-id".to_string(),
+                "99999999-9999-4999-8999-999999999999".to_string(),
+            ]
+        );
+        assert!(!args.iter().any(|a| a == "--dangerously-skip-permissions"));
+    }
+
     /// Every spawn attempt runs under a FRESH session id, and the session
     /// reported is the first one that actually spawned: here attempt 1 fails to
     /// start, attempt 2 spawns (reported), and attempt 3's restart is not.
@@ -14739,7 +14802,10 @@ mod tests {
         // The headless arm passes `--session-id <uuid>`, which a bare `sh`
         // rejects as an illegal option, so on Unix the fake is a tiny script
         // that RECORDS its argv (one arg per line) and runs stdin through `sh`.
-        let prev = std::env::var("QONTINUI_CLAUDE_BIN").ok();
+        let _restore = crate::test_env::EnvVarRestore::capture(&[
+            "QONTINUI_CLAUDE_BIN",
+            "QONTINUI_TRUST_GATE_TIER",
+        ]);
         let fake_dir = tempfile::tempdir().expect("tempdir for fake claude");
         let argv_file = fake_dir.path().join("argv");
         let fake_bin = if cfg!(target_os = "windows") {
@@ -14774,7 +14840,6 @@ mod tests {
         // the dial to `proceed` (today's live tenant value) so this test keeps
         // asserting the SPAWN path rather than the gate. The env override is the
         // same injectable seam the dial-flip tests use.
-        let prev_tier = std::env::var("QONTINUI_TRUST_GATE_TIER").ok();
         std::env::set_var("QONTINUI_TRUST_GATE_TIER", "proceed");
         let agent_id = uuid::Uuid::now_v7();
         let pinned = uuid::Uuid::new_v4();
@@ -14786,10 +14851,6 @@ mod tests {
             pinned,
         )
         .await;
-        match prev_tier {
-            Some(v) => std::env::set_var("QONTINUI_TRUST_GATE_TIER", v),
-            None => std::env::remove_var("QONTINUI_TRUST_GATE_TIER"),
-        }
         assert!(
             res.is_ok(),
             "gate-continuation headless dispatch must spawn + return Ok: {res:?}"
@@ -14808,11 +14869,19 @@ mod tests {
                 Some(pinned_text.as_str()),
                 "the child runs under the pinned id the spawned outcome binds"
             );
-        }
-
-        match prev {
-            Some(v) => std::env::set_var("QONTINUI_CLAUDE_BIN", v),
-            None => std::env::remove_var("QONTINUI_CLAUDE_BIN"),
+            // The REAL call site, not just the helper: the permission flags the
+            // operator posture renders over the autonomous default sit directly
+            // ahead of the session pin, so the headless child never runs in
+            // `default` mode and stalls on a prompt it cannot answer.
+            let expected = crate::settings::get_claude_session_permission()
+                .apply(crate::claude_session::launch_spec::PermissionMode::DangerouslySkip)
+                .render();
+            let expected: Vec<&str> = expected.iter().map(String::as_str).collect();
+            assert!(
+                args[..at].ends_with(&expected),
+                "the headless child carries its permission flags {expected:?} ahead of \
+                 --session-id: {args:?}"
+            );
         }
     }
 

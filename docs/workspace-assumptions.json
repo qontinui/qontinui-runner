@@ -79,6 +79,15 @@
     },
     {
       "class": "dev_ports",
+      "file": "src/pair.rs",
+      "symbol": "BrowserPairPage::provenance",
+      "excerpt": "to override (local dev: http://localhost:3001)\",",
+      "count": 1,
+      "disposition": "dev_only_surface",
+      "note": "Operator-facing provenance text for `device pair --browser`: it names the qontinui-web dev frontend on :3001 only as an example value for $QONTINUI_WEB_FRONTEND_BASE when the page origin was derived from the API base. Nothing dials it; the page URL comes from the env override or the API-base derivation (runner#2287)."
+    },
+    {
+      "class": "dev_ports",
       "file": "src/reflection/workflow.rs",
       "symbol": "build_ui_bridge_agentic_prompt",
       "excerpt": "- **Web relay health**: `curl http://localhost:3001/api/ui-bridge/health` — is a browser tab connected? Are there SSE listeners?",
@@ -818,6 +827,24 @@
       "excerpt": "cfg(windows)-only fn `set_windows_dpi_awareness` has no cfg(not(windows)) sibling in this file",
       "count": 1,
       "disposition": "unreviewed"
+    },
+    {
+      "class": "os_bound_tooling",
+      "file": "src/session/claude_hook.rs",
+      "symbol": "const SHELL_PROGRAMS",
+      "excerpt": "\"powershell\",",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "Shell-name stems compared against the argv[0] of a spawn on every OS, never launched or required: the env-var carrier applies only where an interactive shell resolves `claude` through the identity shim. pwsh/powershell are two entries among ten (bash, sh, zsh, fish, dash, ksh, cmd, nu); on a box without PowerShell they match nothing and the rest decide as before."
+    },
+    {
+      "class": "os_bound_tooling",
+      "file": "src/session/claude_hook.rs",
+      "symbol": "const SHELL_PROGRAMS",
+      "excerpt": "\"pwsh\",",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "Shell-name stems compared against the argv[0] of a spawn on every OS, never launched or required: the env-var carrier applies only where an interactive shell resolves `claude` through the identity shim. pwsh/powershell are two entries among ten (bash, sh, zsh, fish, dash, ksh, cmd, nu); on a box without PowerShell they match nothing and the rest decide as before."
     },
     {
       "class": "os_bound_tooling",

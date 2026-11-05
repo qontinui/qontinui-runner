@@ -1355,6 +1355,16 @@ pub fn graceful_end_step(
             )),
         )),
         Ok(G::Refused { reason, .. }) => refused(format!("refused: {reason}")),
+        // R0a: a live `claude` is in the pane and a relay end carries no close
+        // authority (only the lifecycle Closer will mint one), so the primitive
+        // refused before typing anything. NOT `CloseBareShell`: the pane holds
+        // a live session, so the bare-shell close must never follow.
+        Ok(G::NoCloseAuthority { claude_pids }) => refused(format!(
+            "no_close_authority: a graceful end needs a close authority, which only the \
+             lifecycle Closer will mint (plan Phase 93); the session was left running (live \
+             claude pids {}, nothing typed)",
+            pids(claude_pids)
+        )),
         Ok(G::CloseRefused { reason, .. }) => refused(format!("close_refused: {reason}")),
         Ok(G::WriteFailed { error, .. }) => refused(format!("write_failed: {error}")),
         Ok(G::ProbeUnavailable { detail }) => refused(format!("probe_unavailable: {detail}")),
@@ -5552,6 +5562,9 @@ mod tests {
                 claude_pids: vec![1],
             },
             G::NoLiveClaude,
+            G::NoCloseAuthority {
+                claude_pids: vec![7],
+            },
             G::ProbeUnavailable {
                 detail: "ps failed".to_string(),
             },
@@ -5579,6 +5592,11 @@ mod tests {
                 G::Refused { .. } => {
                     Some((EndOutcome::Refused, None, Some("refused: unsent draft")))
                 }
+                G::NoCloseAuthority { .. } => Some((
+                    EndOutcome::Refused,
+                    None,
+                    Some("no_close_authority: a graceful end needs a close authority"),
+                )),
                 G::CloseRefused { .. } => {
                     Some((EndOutcome::Refused, None, Some("close_refused: relaunched")))
                 }
@@ -5670,6 +5688,38 @@ mod tests {
             fx.close_calls.load(SeqCst),
             0,
             "a refusal must not close the PTY"
+        );
+    }
+
+    /// R0a: the close-authority refusal is a refusal like any other. It is
+    /// answered `refused` with its reason, and above all it never takes the
+    /// bare-shell close, because a live `claude` is in that pane.
+    #[tokio::test]
+    async fn a_no_close_authority_refusal_never_reaches_the_bare_shell_close() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let fx = EndEffects::default();
+        let v = run_end(
+            &fx,
+            false,
+            Ok(
+                crate::terminal::graceful_exit::GracefulExitOutcome::NoCloseAuthority {
+                    claude_pids: vec![42],
+                },
+            ),
+            Ok(()),
+        )
+        .await;
+        assert_eq!(v.outcome, EndOutcome::Refused);
+        assert!(
+            v.reason
+                .as_deref()
+                .is_some_and(|r| r.starts_with("no_close_authority")),
+            "{v:?}"
+        );
+        assert_eq!(
+            fx.close_calls.load(SeqCst),
+            0,
+            "a live claude's pane must not be closed"
         );
     }
 

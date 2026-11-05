@@ -123,6 +123,8 @@ mod dom_capture;
 mod drain;
 mod egress; // Plan 2026-10-10-spec-front-end-phase-9-generic-boundary Phase 7 — per-tenant egress switches
 #[cfg(test)]
+mod runner_close_sites;
+#[cfg(test)]
 mod runner_spawn_sites;
 // `embedded_pg` lives in the LIB crate as of P4 (lib-side consumers need it).
 // Re-bound here as `pub(crate)` so every existing `crate::embedded_pg::...`
@@ -2259,7 +2261,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // one-shot best-effort sweep of stale credential-helper
                 // config files (%TEMP%/qontinui-git-cred-*.json older than
                 // 24h). Sessions normally remove their own file via the
-                // SessionRegistry::close funnel; the sweep reaps files
+                // SessionRegistry::close_by_id funnel; the sweep reaps files
                 // orphaned by crashes/kills. Never fails or slows the boot.
                 credential_helper::spawn_startup_sweep();
                 // Scheduled-maintenance executor (Phase 1, plan

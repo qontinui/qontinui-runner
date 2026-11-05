@@ -55,9 +55,9 @@ with the shrunken list going only to `--list-roots`, i.e. to a log nobody diffs.
 The discovered list is now compared against `EXPECTED_SCAN_ROOTS` in this file
 on every check run, and a difference in either direction FAILS. Changing what is
 scanned is a deliberate two-line diff in this file, not a side-effect of a
-manifest edit. This file is NOT ci-integrity-guarded: ci-integrity.yml watches
-only `.github/workflows/**` and `.github/actions/**`, so an edit here gets
-ordinary PR review and nothing more (see the SELF-PROTECTION paragraph in
+manifest edit. ci-integrity.yml compares this file whole (WHOLE_FILE_GATES), so
+any edit here must be declared and is recorded, and what it does otherwise gets
+ordinary PR review (see the SELF-PROTECTION paragraph in
 `.github/workflows/forbid-untimed-subprocess.yml`).
 
 BOTH dependency spellings are followed:
@@ -491,8 +491,9 @@ DEFAULT_ROOT = Path(__file__).resolve().parent.parent
 #: mismatch is a FAILURE, not a warning: adding or removing a linked crate is a
 #: real change to what this gate covers, and it is now a visible two-line diff in
 #: this file (`scripts/check_untimed_subprocess.py`) rather than an invisible
-#: consequence of a manifest edit. This file is NOT ci-integrity-guarded, so that
-#: diff gets ordinary PR review only (see the module docstring).
+#: consequence of a manifest edit. ci-integrity.yml compares this file whole, so
+#: that diff must be declared and otherwise gets ordinary PR review (see the module
+#: docstring).
 #:
 #: Update it in the same commit that changes the dependency, and say in the
 #: commit message why the coverage change is correct.

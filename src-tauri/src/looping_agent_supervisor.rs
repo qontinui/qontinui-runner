@@ -272,7 +272,11 @@ fn role_for_agent(playbook_ref: &str) -> Option<&'static str> {
 /// through the durable lifecycle record (whose terminal id a boot-restore
 /// rewrites). Returns the pure [`Liveness`], the live session handle (only for
 /// a tab whose process is RUNNING), and the id of a registered tab whose
-/// process has EXITED — the stale pane the death-respawn arm closes.
+/// process has EXITED — the stale pane to close. On [`Liveness::Exited`] that
+/// is the pane the death-respawn arm closes before respawning; on a
+/// [`Liveness::Live`] re-attach through the lifecycle record it is the
+/// abandoned direct pane, closed by the re-attach bookkeeping
+/// ([`stale_tab_to_close`]).
 ///
 /// "Registered" alone used to mean live, so a tab whose `claude` had exited
 /// read [`Liveness::Live`] and the supervisor nudged into its dead PTY every
@@ -341,12 +345,28 @@ fn resolve_live_session(
     }
 
     let liveness = policy::resolve_liveness(direct, lifecycle_open, lifecycle_tab);
-    if liveness != Liveness::Exited {
-        // Only an `Exited` verdict hands a stale tab to the respawn arm; on
-        // `Live` via a re-attached tab the stale direct id is simply dropped.
-        exited = None;
-    }
+    let live_id = live.as_ref().map(|(tid, _)| tid.as_str());
+    let exited = stale_tab_to_close(liveness, exited.as_deref(), live_id);
     (liveness, live, exited)
+}
+
+/// Which registered-but-exited tab, if any, the supervisor should close this
+/// tick. `Exited` hands its stale pane to the death-respawn arm. `Live` via a
+/// lifecycle re-attach hands over the abandoned DIRECT pane, which would
+/// otherwise stay registered as a frozen frame over a dead PTY for the life of
+/// the runner. Never the live tab itself, and nothing on `PendingRestore` or
+/// `Dead`.
+fn stale_tab_to_close(
+    liveness: Liveness,
+    exited: Option<&str>,
+    live_id: Option<&str>,
+) -> Option<String> {
+    match liveness {
+        Liveness::Exited | Liveness::Live => exited
+            .filter(|stale| Some(*stale) != live_id)
+            .map(str::to_string),
+        Liveness::PendingRestore | Liveness::Dead => None,
+    }
 }
 
 /// The supervisor's NUDGE-SAFE idle read over one settled grid: the shared
@@ -439,11 +459,13 @@ fn spawn_streak_clears(liveness: Liveness, spawn_grace_elapsed: bool) -> bool {
 /// failed coord read (Withhold, promoted to a block on the interactive PTY),
 /// and backing it off would keep the agent down for up to 15 minutes after
 /// coord recovers — the same reason the resource-guard refusal takes none.
-fn trust_refusal_backs_off(dial: &crate::claude_session::trust_gate::DialResolution) -> bool {
-    !matches!(
-        dial,
-        crate::claude_session::trust_gate::DialResolution::Unresolved { .. }
-    )
+///
+/// Decided from the refusal TEXT, which names the dial the gate actually
+/// decided on ([`crate::claude_session::trust_gate::annotate_unread_dial`]),
+/// never from a second peek: the dial cache can refresh or expire between the
+/// gate's decision and this read.
+fn trust_refusal_backs_off(refusal: &str) -> bool {
+    !crate::claude_session::trust_gate::refusal_rests_on_unread_dial(refusal)
 }
 
 /// Supervise a single agent for one tick: observe, decide (pure), act.
@@ -543,6 +565,28 @@ async fn supervise_one(
                 "looping_agent_supervisor: re-attached to boot-restored tab"
             );
             registry.update_runtime(&rec.def.id, |rt| rt.terminal_id = Some(tid));
+        }
+        // The direct id this record held pointed at a tab whose process
+        // exited; the agent lives on in the re-attached tab. Close the frozen
+        // pane so it does not sit in the tab bar over a dead PTY.
+        if let (Some(stale), Some(tm)) = (
+            exited_tab.as_deref(),
+            app.try_state::<Arc<crate::terminal::TerminalManager>>(),
+        ) {
+            info!(
+                agent = %rec.def.id,
+                terminal = %stale,
+                live = %tid,
+                "looping_agent_supervisor: closing the exited tab the re-attach abandoned"
+            );
+            if let Err(e) = tm.inner().close(stale) {
+                warn!(
+                    agent = %rec.def.id,
+                    terminal = %stale,
+                    error = %e,
+                    "looping_agent_supervisor: closing the abandoned exited tab failed"
+                );
+            }
         }
     }
 
@@ -1190,12 +1234,10 @@ async fn do_spawn(
             // coord read, not a verdict, and takes no backoff
             // ([`trust_refusal_backs_off`]) — the next tick re-asks, exactly as
             // the resource-guard refusal does.
-            let dial = crate::claude_session::trust_gate::peek_dial();
-            if trust_refusal_backs_off(&dial) {
+            if trust_refusal_backs_off(&e) {
                 warn!(
                     agent = %def.id,
                     error = %e,
-                    dial = ?dial,
                     "looping_agent_supervisor: spawn refused by the workspace-trust gate — \
                      a policy verdict, backing off; trust the agent's home dir for the pinned \
                      account or move the tenant's autonomy dial"
@@ -1205,7 +1247,6 @@ async fn do_spawn(
                 warn!(
                     agent = %def.id,
                     error = %e,
-                    dial = ?dial,
                     "looping_agent_supervisor: spawn refused by the workspace-trust gate \
                      because the tenant's autonomy dial could not be read — retrying on the \
                      next tick, no backoff"
@@ -1458,6 +1499,12 @@ pub(crate) struct LoopingAgentStatus {
     /// Rendered-grid idle read (`None` when there is no live tab). Single
     /// read, no quiescence debounce — status is observational.
     pub idle: Option<bool>,
+    /// The dialog marker that vetoed `idle`: says WHY a quiet-looking tab
+    /// reads `idle: false` — a Claude Code dialog is waiting to be answered.
+    /// `None` when there is no live tab, when no dialog is on screen, and
+    /// also when the grid already reads busy (the dialog check only runs on
+    /// a grid the idle predicate passed).
+    pub dialog: Option<&'static str>,
 }
 
 /// Assemble the live status for one record.
@@ -1466,14 +1513,15 @@ pub(crate) fn status_snapshot(
     rec: &LoopingAgentRecord,
 ) -> LoopingAgentStatus {
     let (liveness, live, _exited) = resolve_live_session(app, rec);
-    let idle = live.as_ref().map(|(_, session)| {
+    let read = live.as_ref().map(|(_, session)| {
         let (lines, cursor_row) = session.grid_text();
-        nudge_safe_idle(snapshot_looks_idle(&lines, cursor_row), &lines).0
+        nudge_safe_idle(snapshot_looks_idle(&lines, cursor_row), &lines)
     });
     LoopingAgentStatus {
         record: rec.clone(),
         tab_alive: liveness.tab_alive(),
-        idle,
+        idle: read.map(|(safe, _)| safe),
+        dialog: read.and_then(|(_, dialog)| dialog),
     }
 }
 
@@ -1522,6 +1570,38 @@ mod nudge_and_exit_tests {
     }
 
     #[test]
+    fn a_reattach_closes_the_abandoned_exited_pane_but_never_the_live_one() {
+        // The combination the re-attach close exists for: the direct tab
+        // exited, the lifecycle record moved to a running tab. It must read
+        // Live (so the Spawn arm, which needs Exited/Dead, never also takes the
+        // stale pane) AND hand the direct id over for closing.
+        assert_eq!(
+            policy::resolve_liveness(TabProbe::Exited, true, TabProbe::Running),
+            Liveness::Live
+        );
+        // Exited: the stale pane goes to the death-respawn arm.
+        assert_eq!(
+            stale_tab_to_close(Liveness::Exited, Some("t1"), None),
+            Some("t1".to_string())
+        );
+        // Live via the lifecycle record: the abandoned direct pane is closed.
+        assert_eq!(
+            stale_tab_to_close(Liveness::Live, Some("t1"), Some("t2")),
+            Some("t1".to_string())
+        );
+        // Never the live tab itself.
+        assert_eq!(
+            stale_tab_to_close(Liveness::Live, Some("t2"), Some("t2")),
+            None
+        );
+        assert_eq!(stale_tab_to_close(Liveness::Live, None, Some("t2")), None);
+        // Nothing while a restore may be in flight, or with no tab at all.
+        for l in [Liveness::PendingRestore, Liveness::Dead] {
+            assert_eq!(stale_tab_to_close(l, Some("t1"), None), None, "{l:?}");
+        }
+    }
+
+    #[test]
     fn only_an_early_agent_caused_exit_backs_off() {
         assert!(exited_tab_backs_off(true, false));
         // A runner-initiated close inside the grace is not a broken spawn.
@@ -1544,14 +1624,29 @@ mod nudge_and_exit_tests {
 
     #[test]
     fn a_trust_refusal_backs_off_unless_the_dial_could_not_be_read() {
-        use crate::claude_session::trust_gate::{AutonomyTier, DialResolution};
-        assert!(!trust_refusal_backs_off(&DialResolution::Unresolved {
-            error: "coord unreachable".to_string()
-        }));
-        assert!(trust_refusal_backs_off(&DialResolution::Fresh {
+        use crate::claude_session::trust_gate::{
+            annotate_unread_dial, AutonomyTier, DialResolution, TrustGateDecision,
+        };
+        let block = || TrustGateDecision::SpawnBlocked {
+            rule: "dial-withholds-underived-mint-on-interactive-pty",
+            failed: vec!["coord_allocation_row=unsatisfied (no row)".to_string()],
+        };
+        // The refusal the gate renders from the dial it DECIDED on — never a
+        // later peek of the cache.
+        let rendered = |dial: DialResolution| {
+            annotate_unread_dial(block(), &dial)
+                .refusal()
+                .expect("a block renders a refusal")
+        };
+        assert!(!trust_refusal_backs_off(&rendered(
+            DialResolution::Unresolved {
+                error: "coord unreachable".to_string()
+            }
+        )));
+        assert!(trust_refusal_backs_off(&rendered(DialResolution::Fresh {
             tier: AutonomyTier::DraftRequired
-        }));
-        assert!(trust_refusal_backs_off(&DialResolution::Absent));
+        })));
+        assert!(trust_refusal_backs_off(&rendered(DialResolution::Absent)));
     }
 
     #[test]

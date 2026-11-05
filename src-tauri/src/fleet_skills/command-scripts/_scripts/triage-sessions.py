@@ -378,19 +378,128 @@ def tids_in(out, prefix_labels):
 
 # ---------------------------------------------------------------- names
 # Claude Code's permission-mode indicators, as its status line draws them.
-MODE_LINE = re.compile(r"(bypass|accept\s*edits|plan\s*mode|auto\s*mode)\s*(?:permissions\s*)?on", re.I)
+# Captures of 2.1.309 show "bypass permissions on", "accept edits on", "plan
+# mode on", "manual mode on" and "don't ask on"; "auto mode on" is matched too,
+# but no capture shows it. The right boundary keeps prose after an indicator
+# ("bypass once", "auto mode only") from reading as the last one; on
+# 2026-10-24 it dropped none of the 427 indicators in 104 live runner panes.
+# That measurement covered bypass status lines only: every one of those panes
+# was in bypass mode.
+# The status-line glyph is not required: those panes carried only the bypass
+# one, so whether the manual/plan glyph survives a redraw in the raw buffer is
+# unmeasured.
+MODE_LINE = re.compile(r"(bypass|accept\s*edits|plan\s*mode|auto\s*mode|manual\s*mode|don['\u2019]?t\s*ask)"
+                       r"\s*(?:permissions\s*)?on(?![a-z])", re.I)
+# An indicator folded to one word (case, spaces, apostrophe dropped) -> its mode.
+MODE_WORDS = {"bypass": "bypass", "acceptedits": "accept edits", "planmode": "plan", "automode": "auto",
+              "manualmode": "manual", "dontask": "don't ask"}
+# The modes the runner never auto-accepts in: plan approval, and an explicit
+# allow-list posture (plan
+# 2026-10-23-runner-sessions-stop-at-permission-dialogs-so-accept-them-by-default-with-a-tenant-switch, D3).
+NO_AUTO_ACCEPT = ("plan", "don't ask")
+# permission_mode() when the pane's screen could not be read, which is not the
+# same as a tail read with no indicator in it (None).
+MODE_UNREAD = "UNKNOWN"
+# session_hold() for a pane the runner no longer lists: not a permission hold.
+NOT_LISTED = "terminal no longer listed"
 
 
-def bypass_mode(tid):
-    """True when the LAST permission-mode indicator in the pane's tail is
-    bypass. A session switched out of bypass keeps the old status text in its
-    scrollback, so the last indicator decides, not any one. False when none is
-    found or the screen cannot be read. The status line is redrawn
+def last_mode(text):
+    """The mode of the LAST permission-mode indicator in `text` (a MODE_WORDS
+    value), or None when there is none. A session switched out of a mode keeps
+    the old status text in its scrollback, so the last indicator decides, not
+    any one."""
+    found = MODE_LINE.findall(text or "")
+    return MODE_WORDS.get(re.sub(r"[\s'\u2019]", "", found[-1]).lower()) if found else None
+
+
+def permission_mode(tid):
+    """last_mode() of the pane's tail (None when it holds no indicator), or
+    MODE_UNREAD when the screen cannot be read. The status line is redrawn
     differentially, so a short tail can miss it: a 30000-character tail held it
     on 40 of 44 STOPPED panes measured on 2026-10-18."""
     raw = cfs.raw_tail(tid, 30000)
-    modes = MODE_LINE.findall(cfs.ANSI_RE.sub("", raw)) if raw else []
-    return bool(modes) and modes[-1].lower() == "bypass"
+    return MODE_UNREAD if raw is None else last_mode(cfs.ANSI_RE.sub("", raw))
+
+
+def dial_verdict(dial):
+    """(active, why) for a /health `permissionAutoAccept` value: active only
+    when it reads answered == true and level == "on". Pure, so the selftest
+    can pin it."""
+    if not isinstance(dial, dict):
+        return False, f"auto-accept dial not answered on (permissionAutoAccept is a {type(dial).__name__})"
+    answered, level = dial.get("answered"), dial.get("level")
+    if answered is True and level == "on":
+        return True, ""
+    return False, f"auto-accept dial not answered on (answered={answered!r}, level={level!r})"
+
+
+def health_dial(body):
+    """(active, why) for a GET /health body. Only a success envelope whose
+    `data` object lacks `permissionAutoAccept` is a runner build without the
+    dial; a missing or non-object `data`, or an error envelope, is UNKNOWN.
+    Neither is active. Pure, so the selftest can pin it."""
+    from envelope import require_key  # lib/ is on sys.path: close-finished-sessions.py put it there
+    if not isinstance(body, dict) or body.get("success") is not True:
+        return False, "auto-accept dial UNKNOWN (/health answered no success envelope)"
+    try:
+        data, _ = require_key(body, "data", "GET /health")
+    except cfs.EnvelopeUnknown:
+        data = None
+    if not isinstance(data, dict):
+        return False, f"auto-accept dial UNKNOWN (/health data is {type(data).__name__})"
+    if "permissionAutoAccept" not in data:
+        return False, ("auto-accept dial not answered on (/health has no permissionAutoAccept: "
+                       "a runner build without it)")
+    return dial_verdict(data["permissionAutoAccept"])
+
+
+def auto_accept_dial():
+    """(active, why) for the runner's permission auto-accept dial, read from
+    GET /health once per run. Any read failure is UNKNOWN and not active."""
+    try:
+        return health_dial(cfs.read("/health", "."))
+    except Exception as e:  # any failure, http.client's included, fails closed before a session is typed into
+        return False, f"auto-accept dial UNKNOWN (/health unreadable: {str(e)[:80]})"
+
+
+def name_hold(mode, hook, dial):
+    """Why the name step must skip a session, or "" when /name may be typed.
+    `mode` is permission_mode(), `hook` the terminal's `permissionRequestHook`
+    (None when the field is missing), `dial` auto_accept_dial()'s (active, why).
+
+    A bypass session is named, as it always was. Any other session is named
+    only when the runner will answer a permission dialog /name raises: its
+    mode is one the runner accepts in, its carrier registered the hook, and the
+    dial reads answered on. Every condition that fails is named. Pure, so the
+    selftest can pin every arm."""
+    if mode == "bypass":
+        return ""
+    held = []
+    if mode == MODE_UNREAD:
+        held.append("permission mode UNKNOWN (the pane's screen could not be read)")
+    elif mode is None:
+        held.append("no permission-mode indicator in the pane's tail")
+    elif mode in NO_AUTO_ACCEPT:
+        held.append(f"{mode} mode (the runner never auto-accepts there)")
+    if hook != "registered":
+        held.append("auto-accept not registered for this session (permissionRequestHook "
+                    + ("field missing: a runner build without it)" if hook is None else f"{hook!r})"))
+    if not dial[0]:
+        held.append(dial[1])
+    return "; ".join(held)
+
+
+def session_hold(tid, dial):
+    """name_hold() for one pane: its status line and, outside bypass mode, its
+    /terminals row. Raises when that row cannot be read; the caller holds."""
+    mode = permission_mode(tid)
+    if mode == "bypass":
+        return ""
+    term = next((t for t in cfs.terminals() if t["id"] == tid), None)
+    if term is None:
+        return NOT_LISTED
+    return name_hold(mode, term.get("permissionRequestHook"), dial)
 
 
 def custom_title(path):
@@ -439,29 +548,49 @@ def turn_done(tid, path, sent_ms):
     return True, tx.get("final_text") or ""
 
 
+def hold_line(tid, dial):
+    """Why /name must not be typed into this pane, or "" when it may be. The
+    one place the hold is worded, so a report and a run cannot disagree about it.
+    Reads only; any failure, http.client's included, holds the session."""
+    try:
+        hold = session_hold(tid, dial)
+    except Exception as e:
+        hold = f"UNKNOWN: the pane or its /terminals row could not be read ({str(e)[:80]})"
+    if not hold:
+        return ""
+    return hold if hold == NOT_LISTED else f"/name could stop at a permission dialog: {hold}"
+
+
+def name_report(targets):
+    """The report-mode name step: the hold check a run applies, so a report names
+    only the sessions a run would, and says why it would skip the rest."""
+    dial = auto_accept_dial() if targets else (False, "")
+    for r in targets:
+        why = hold_line(r["terminalId"], dial)
+        verb, tail = ("would skip", f" - {why}") if why else ("would name", "")
+        print(f"  {verb} {r['terminalId'][:8]}  {r['tab']:<14.14}  {r['name'][:50]}{tail}")
+
+
 def name_sessions(targets, a, own):
     """Run /name in each target, then type the /rename line it suggests.
     Returns (named terminal ids, failures)."""
     sent = {}  # tid -> (sent_ms, transcript path, row)
     failures = 0
+    dial = auto_accept_dial() if targets else (False, "")
     for r in targets:
         tid = r["terminalId"]
         # /name runs git and gh. Outside bypass mode a session can stop at a
         # permission dialog for one of them, and triage would leave that dialog
-        # open in a session it does not own, so such a session is not named.
-        # Checked first, so it adds nothing to the gap between the empty-prompt
-        # check and the send.
-        try:
-            in_bypass = bypass_mode(tid)
-        except cfs.READ_ERRORS:
-            in_bypass = False
-        if not in_bypass:
-            print(f"  SKIPPED {tid[:8]}  {r['name'][:50]} - not in bypass-permissions mode, or the mode "
-                  "could not be read; /name could stop at a permission dialog")
+        # open in a session it does not own, so such a session is named only
+        # when the runner answers its dialogs (name_hold). Checked first, so it
+        # adds nothing to the gap between the empty-prompt check and the send.
+        why = hold_line(tid, dial)
+        if why:
+            print(f"  SKIPPED {tid[:8]}  {r['name'][:50]} - {why}")
             continue
         try:
             ok, msg, tx = ready_to_type(tid, a.idle_min, a.cooldown_hours, own)
-        except cfs.READ_ERRORS as e:
+        except Exception as e:  # http.client's too: nothing is sent, and the run goes on
             ok, msg, tx = False, f"UNKNOWN at re-screen, not sent: {e}", None
         if not ok or not (tx or {}).get("path"):
             failures += 1
@@ -480,7 +609,7 @@ def name_sessions(targets, a, own):
         for tid, (at, path, r) in list(sent.items()):
             try:
                 result = poll_one(tid, at, path, r, ran, a, own)
-            except cfs.READ_ERRORS as e:
+            except Exception as e:  # http.client's too: reported SENT?, and the run goes on
                 result = ("SENT?  ", r["name"], f"/name was typed; a runner read failed before the title was read back: {e}")
             if result is None:
                 continue
@@ -583,8 +712,9 @@ def common(a):
 # checks they still exist, so a rename there fails CI here rather than at the
 # first --act run.
 USES_NSS = ("judge", "row_facts", "screen", "external_signals", "STOPPED_FROM")
-USES_CFS = ("API", "ANSI_RE", "READ_ERRORS", "classify", "open_rows", "output_moving", "page_names", "proc_table",
-            "prompt_state", "raw_tail", "readiness", "running_turn", "terminals", "transcript_facts")
+USES_CFS = ("API", "ANSI_RE", "EnvelopeUnknown", "READ_ERRORS", "classify", "load", "open_rows", "output_moving",
+            "page_names", "proc_table", "prompt_state", "raw_tail", "read", "readiness", "running_turn", "terminals",
+            "transcript_facts")
 
 
 def selftest():
@@ -593,14 +723,124 @@ def selftest():
         for missing in [n for n in names if not hasattr(mod, n)]:
             print(f"FAIL {mod.__name__}.{missing} no longer exists")
             failures += 1
-    modes = [("x bypass permissions on y", True), ("bypass permissions on ... accept edits on", False),
-             ("accept edits on ... bypasspermissionson", True), ("no indicator", False),
-             ("plan mode on", False)]
+    modes = [("x bypass permissions on y", "bypass"), ("bypass permissions on ... accept edits on", "accept edits"),
+             ("accept edits on ... bypasspermissionson", "bypass"), ("no indicator", None),
+             ("plan mode on", "plan"), ("\u23f5\u23f5 don't ask on (shift+tab to cycle)", "don't ask"),
+             ("don\u2019t ask on", "don't ask"), ("  manual mode on \u00b7 ? for shortcuts", "manual"),
+             ("auto mode on", "auto"), ("\u276f 1. Yes, and use auto mode\n   2. No", None),
+             ("bypass permissions on ... plan mode on (shift+tab to cycle)", "plan"),
+             # Prose printed after an indicator never reads as one.
+             ("\u23f8 plan mode on (shift+tab to cycle)\nSwitch to auto mode only if needed", "plan"),
+             ("\u23f8 plan mode on\nrun it in bypass once, then stop", "plan"),
+             ("\u23f8 manual mode on\nthe plan mode one-pager is onto main", "manual"),
+             ("\u23f5\u23f5 don't ask on\naccept edits onward", "don't ask")]
     for text, want in modes:
-        got = bool(MODE_LINE.findall(text)) and MODE_LINE.findall(text)[-1].lower() == "bypass"
+        got = last_mode(text)
         if got != want:
-            print(f"FAIL mode({text!r}) = {got}, want {want}")
+            print(f"FAIL last_mode({text!r}) = {got!r}, want {want!r}")
             failures += 1
+    # name_hold: (mode, permissionRequestHook, dial, what the skip names; () = named).
+    on, off = dial_verdict({"answered": True, "level": "on"}), dial_verdict({"answered": True, "level": "off"})
+    holds = [
+        ("bypass", None, (False, "dial UNKNOWN"), ()),  # bypass is named exactly as before
+        ("manual", "registered", on, ()), ("accept edits", "registered", on, ()), ("auto", "registered", on, ()),
+        ("manual", "absent", on, ("not registered",)),
+        ("manual", None, on, ("not registered", "field missing")),  # a runner build without the field
+        ("manual", "Registered", on, ("not registered",)),
+        ("manual", "registered", off, ("dial not answered on", "'off'")),
+        ("manual", "registered", dial_verdict({"answered": False, "level": "on"}), ("dial not answered on",)),
+        ("manual", "registered", dial_verdict({"answered": "true", "level": "on"}), ("dial not answered on",)),
+        ("manual", "registered", dial_verdict({"level": "on"}), ("dial not answered on",)),
+        ("manual", "registered", dial_verdict({"answered": True}), ("dial not answered on",)),
+        ("manual", "registered", dial_verdict({"answered": True, "level": "ON"}), ("dial not answered on",)),
+        ("manual", "registered", dial_verdict(None), ("dial not answered on",)),
+        ("plan", "registered", on, ("plan mode",)),
+        ("don't ask", "registered", on, ("don't ask mode",)),
+        (None, "registered", on, ("no permission-mode indicator",)),
+        (MODE_UNREAD, "registered", on, ("permission mode UNKNOWN",)),
+        (MODE_UNREAD, None, (False, "auto-accept dial UNKNOWN (x)"),
+         ("permission mode UNKNOWN", "field missing", "dial UNKNOWN")),
+    ]
+    for mode, hook, dial, want in holds:
+        got = name_hold(mode, hook, dial)
+        if bool(got) != bool(want) or any(w not in got for w in want):
+            print(f"FAIL name_hold({mode!r}, {hook!r}, {dial!r}) = {got!r}, want {want or 'named'}")
+            failures += 1
+    # The reads behind it, against stubbed runner doors: /health is read at
+    # data.permissionAutoAccept, and the terminal row only outside bypass mode.
+    import http.client
+    real = cfs.read, cfs.raw_tail, cfs.terminals
+    paths = []
+
+    def health(body):
+        def read(path, key, timeout=60):
+            paths.append(path)
+            return cfs.load(body, door="GET " + path, source="selftest").require_key(key)[0]
+        return read
+
+    def unreachable(*_a, **_k):
+        raise urllib.error.URLError("selftest: refused")
+
+    def torn(*_a, **_k):  # not one of cfs.READ_ERRORS
+        raise http.client.IncompleteRead(b"{")
+    screens = {"t-bypass": "bypass permissions on", "t-manual": "manual\x1b[1m mode on", "t-plan": "plan mode on",
+               "t-gone": "manual mode on", "t-blank": "no status line here", "t-old": "manual mode on",
+               "t-dark": None}  # raw_tail's answer for a screen it could not read
+    rows = [{"id": "t-manual", "permissionRequestHook": "registered"},
+            {"id": "t-plan", "permissionRequestHook": "registered"},
+            {"id": "t-blank", "permissionRequestHook": "registered"},
+            {"id": "t-dark", "permissionRequestHook": "registered"},
+            {"id": "t-old"}]  # spawned by a runner build without the field
+    reads = [
+        (health(b'{"success":true,"data":{"permissionAutoAccept":{"answered":true,"level":"on"}}}'), True, ""),
+        (health(b'{"success":true,"data":{"permissionAutoAccept":{"answered":true,"level":"off"}}}'), False,
+         "not answered on"),
+        (health(b'{"success":true,"data":{"buildId":"x"}}'), False, "a runner build without it"),
+        (health(b'{"success":true,"permissionAutoAccept":{"answered":true,"level":"on"},"data":{}}'), False,
+         "a runner build without it"),
+        (health(b'{"success":true}'), False, "UNKNOWN"),
+        (health(b'{"success":true,"data":null}'), False, "UNKNOWN"),
+        (health(b'{"success":false,"error":"boom","data":{}}'), False, "UNKNOWN"),
+        (health(b"<html>"), False, "UNKNOWN"),
+        (unreachable, False, "UNKNOWN"),
+        (torn, False, "UNKNOWN"),
+    ]
+    sessions = [("t-bypass", on, ""), ("t-manual", on, ""), ("t-manual", off, "dial not answered on"),
+                ("t-plan", on, "plan mode"), ("t-gone", on, NOT_LISTED),
+                ("t-blank", on, "no permission-mode indicator"), ("t-dark", on, "permission mode UNKNOWN"),
+                ("t-old", on, "permissionRequestHook field missing")]
+    try:
+        for stub, want_on, want_why in reads:
+            cfs.read = stub
+            try:
+                got_on, why = auto_accept_dial()
+            except Exception as e:
+                got_on, why = None, f"raised {e!r}"
+            if got_on != want_on or want_why not in why:
+                print(f"FAIL auto_accept_dial() = {(got_on, why)!r}, want {want_on} naming {want_why!r}")
+                failures += 1
+        cfs.raw_tail = lambda tid, chars=30000: screens[tid]
+        cfs.terminals = unreachable  # a bypass session never reads its row
+        try:
+            bypass_named = session_hold("t-bypass", (False, "x")) == ""
+        except cfs.READ_ERRORS:
+            bypass_named = False
+        if not bypass_named:
+            print("FAIL session_hold: a bypass session must be named without reading /terminals")
+            failures += 1
+        cfs.terminals = lambda: rows
+        for tid, dial, want in sessions:
+            got = session_hold(tid, dial)
+            if bool(got) != bool(want) or want not in got:
+                print(f"FAIL session_hold({tid!r}) = {got!r}, want {want or 'named'!r}")
+                failures += 1
+    finally:
+        cfs.read, cfs.raw_tail, cfs.terminals = real
+    if any(p != "/health" for p in paths):
+        print(f"FAIL auto_accept_dial read {sorted(set(paths))}, want only /health")
+        failures += 1
+    step_failures, steps = selftest_name_sessions()
+    failures += step_failures
     cases = [
         ("```\n/rename 614,615 headless agent provisioning\n```\nDerived from #614.",
          "614,615 headless agent provisioning"),
@@ -631,9 +871,122 @@ def selftest():
         if got != want:
             print(f"FAIL tab_pages({names!r}) = {got!r}, want {want!r}")
             failures += 1
-    print(f"selftest: {len(cases)} name cases, {len(modes)} mode cases, {len(tabs)} tab cases, "
-          f"{failures} failure(s)")
+    print(f"selftest: {len(cases)} name cases, {len(modes)} mode cases, {len(holds)} hold cases, "
+          f"{len(reads)} dial reads, {len(sessions) + 1} session holds, {steps} name-step runs, "
+          f"{len(tabs)} tab cases, {failures} failure(s)")
     return 1 if failures else 0
+
+
+def selftest_name_sessions():
+    """Drive name_sessions() itself against stubbed runner doors. The
+    ready_to_type stub records each row that reaches it and refuses it, and
+    submit raises, so no run can type into a pane; cfs.API points at a closed
+    port as a backstop. Returns (failures, runs)."""
+    import contextlib
+    import http.client
+    import io
+    failures = 0
+    g = globals()
+    saved = cfs.API, cfs.read, cfs.raw_tail, cfs.terminals, g["ready_to_type"], g["submit"]
+    screens = {"t-bypass": "\u23f5\u23f5 bypass permissions on (shift+tab to cycle)",
+               "t-manual": "\u23f8 manual\x1b[1m mode on",  # the ANSI strip must run before the match
+               "t-old": "\u23f8 manual mode on", "t-plan": "\u23f8 plan mode on", "t-gone": "\u23f8 manual mode on",
+               "t-blank": "no status line here", "t-dark": None}  # None: raw_tail could not read the screen
+    rows = [{"id": "t-manual", "permissionRequestHook": "registered"}, {"id": "t-old"},
+            {"id": "t-plan", "permissionRequestHook": "registered"},
+            {"id": "t-blank", "permissionRequestHook": "registered"},
+            {"id": "t-dark", "permissionRequestHook": "registered"}]  # no t-bypass row: bypass never reads one
+    on = b'{"success":true,"data":{"permissionAutoAccept":{"answered":true,"level":"on"}}}'
+    off = b'{"success":true,"data":{"permissionAutoAccept":{"answered":true,"level":"off"}}}'
+
+    def torn(*_a, **_k):  # not one of cfs.READ_ERRORS
+        raise http.client.IncompleteRead(b"{")
+    # (case, /health body or None to raise, /terminals, targets, rows that reach ready_to_type,
+    #  {tid: what its SKIPPED line names}, /health reads, whether the re-screen raises)
+    runs = [
+        ("dial on", on, lambda: rows, ["t-bypass", "t-manual", "t-old", "t-plan", "t-blank", "t-dark", "t-gone"],
+         {"t-bypass", "t-manual"},
+         {"t-old": "permissionRequestHook field missing", "t-plan": "plan mode",
+          "t-blank": "no permission-mode indicator", "t-dark": "permission mode UNKNOWN",
+          "t-gone": "- " + NOT_LISTED}, 1, False),  # not listed: no permission-dialog prefix
+        ("dial off", off, lambda: rows, ["t-bypass", "t-manual"], {"t-bypass"},
+         {"t-manual": "dial not answered on"}, 1, False),
+        ("/terminals fails", on, torn, ["t-bypass", "t-manual"], {"t-bypass"}, {"t-manual": "UNKNOWN"}, 1, False),
+        ("/health fails", None, lambda: rows, ["t-manual", "t-old"], set(),
+         {"t-manual": "dial UNKNOWN", "t-old": "permissionRequestHook field missing"}, 1, False),
+        ("re-screen fails", on, lambda: rows, ["t-bypass"], {"t-bypass"},
+         {"t-bypass": "UNKNOWN at re-screen, not sent"}, 1, True),
+        ("no targets", on, lambda: rows, [], set(), {}, 0, False),
+    ]
+    try:
+        cfs.API = "http://127.0.0.1:9"
+        cfs.raw_tail = lambda tid, chars=30000: screens[tid]
+        for case, body, terms, tids, want_reached, want_skips, want_reads, ready_raises in runs:
+            reached, paths = [], []
+
+            def read(path, key, timeout=60, body=body):
+                paths.append(path)
+                if body is None:
+                    raise http.client.IncompleteRead(b"{")
+                return cfs.load(body, door="GET " + path, source="selftest").require_key(key)[0]
+
+            def ready(tid, *_a, reached=reached, raises=ready_raises, **_k):
+                reached.append(tid)
+                if raises:  # not one of cfs.READ_ERRORS
+                    raise http.client.IncompleteRead(b"{")
+                return False, "selftest stub", None
+
+            def typed(tid, message):
+                raise AssertionError(f"name_sessions tried to type {message!r} into {tid}")
+            cfs.read, cfs.terminals, g["ready_to_type"], g["submit"] = read, terms, ready, typed
+            out = io.StringIO()
+            a = argparse.Namespace(idle_min=15, cooldown_hours=None, name_timeout=0)
+            try:
+                with contextlib.redirect_stdout(out):
+                    name_sessions([{"terminalId": t, "name": t} for t in tids], a, "")
+            except Exception as e:
+                print(f"FAIL name_sessions [{case}] raised {e!r}")
+                failures += 1
+                continue
+            lines = out.getvalue().splitlines()
+            # The report path applies the same hold: it would name exactly the
+            # rows a run lets through to ready_to_type, and says why for the rest.
+            run_paths, paths[:] = list(paths), []
+            rep = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(rep):
+                    name_report([{"terminalId": t, "name": t, "tab": "tab"} for t in tids])
+            except Exception as e:
+                print(f"FAIL name_report [{case}] raised {e!r}")
+                failures += 1
+                continue
+            rlines = rep.getvalue().splitlines()
+            would = {t for t in tids if any(f"would name {t[:8]}" in ln for ln in rlines)}
+            if would != (want_reached if not ready_raises else set(tids)):
+                print(f"FAIL name_report [{case}] would name {sorted(would)}, want {sorted(want_reached)}: {rlines}")
+                failures += 1
+            if not ready_raises:  # a re-screen failure is not a hold, so the report cannot name it
+                for tid, why in want_skips.items():
+                    if not any(f"would skip {tid[:8]}" in ln and why in ln for ln in rlines):
+                        print(f"FAIL name_report [{case}] printed no 'would skip' {tid} naming {why!r}: {rlines}")
+                        failures += 1
+            if len(paths) != want_reads or any(p != "/health" for p in paths):
+                print(f"FAIL name_report [{case}] read {paths}, want /health {want_reads} time(s)")
+                failures += 1
+            if set(reached) != want_reached:
+                print(f"FAIL name_sessions [{case}] reached ready_to_type for {sorted(reached)}, "
+                      f"want {sorted(want_reached)}")
+                failures += 1
+            for tid, why in want_skips.items():
+                if not any(f"SKIPPED {tid[:8]}" in ln and why in ln for ln in lines):
+                    print(f"FAIL name_sessions [{case}] printed no SKIPPED {tid} naming {why!r}: {lines}")
+                    failures += 1
+            if len(run_paths) != want_reads or any(p != "/health" for p in run_paths):
+                print(f"FAIL name_sessions [{case}] read {run_paths}, want /health {want_reads} time(s)")
+                failures += 1
+    finally:
+        cfs.API, cfs.read, cfs.raw_tail, cfs.terminals, g["ready_to_type"], g["submit"] = saved
+    return failures, len(runs)
 
 
 def main():
@@ -765,8 +1118,7 @@ def main():
             failed += n_failed > 0
             PASS.named(targets, named, dict(SUBMITTED))
         else:
-            for r in targets:
-                print(f"  would name {r['terminalId'][:8]}  {r['tab']:<14.14}  {r['name'][:50]}")
+            name_report(targets)
 
     if "layout" not in skip:
         print("\n== layout (trim each page to its tabs)")
@@ -1287,7 +1639,7 @@ class PassRecorder:
     def named(self, targets, named, typed):
         """The name step's rows. `typed` is what submit() recorded during the
         step ({terminal id: "sent" | "refused"}): done for a title read back,
-        skipped for a row never typed into (no bypass mode, or held at its
+        skipped for a row never typed into (held by name_hold, or by its
         re-screen), failed for a POST the runner refused, sent_unconfirmed for
         a prompt typed whose title did not read back."""
         rows = []
