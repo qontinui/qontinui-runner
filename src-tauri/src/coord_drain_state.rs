@@ -32,7 +32,13 @@
 //!   intervals. FAIL-CLOSED for autonomous spawns (the same posture as coord's
 //!   `DrainVerdict::Unreadable`), and never a trigger for wind-down. An absent
 //!   field is NOT read as clear — served policy `verification-and-evidence`
-//!   `unknown-must-not-render-as-a-default`.
+//!   `unknown-must-not-render-as-a-default`. Only a successful read ends it: a
+//!   failed read after a silence does not bring back the state from before
+//!   the silence ([`DrainTracker::adopt_stale`]). One heartbeat tick that hangs
+//!   to its timeout therefore reads `Unknown` until the next good read; the
+//!   three-miss allowance covers reads that fail, not a silence. `since` is
+//!   fixed for the whole episode, and the banner keys its dismissal on it; the
+//!   `cause` is detail and is rewritten without an event ([`same_episode`]).
 //! * `NotEnrolled { why }` — this runner is not a coord device at all (no
 //!   `machine.json`, no coord URL, no tenant binding), so no device drain can
 //!   exist for it. Autonomous spawns run. This is a KNOWN state, not an unknown
@@ -418,7 +424,9 @@ pub fn parse_me_drain_response(body: &str) -> DrainObservation {
 /// What one fold changed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Transition {
-    /// The state is different from before.
+    /// From [`DrainTracker`]: the tracked state is different from before. From
+    /// [`fold`]: the current state is a different episode from the last one
+    /// announced ([`same_episode`]), so it is worth an event and a log line.
     pub changed: bool,
     /// The state became `Drained` from something else, or its `until` moved —
     /// the caller should read `me/drain` for the reason.
@@ -430,6 +438,11 @@ pub struct Transition {
 pub struct DrainTracker {
     state: CoordDrainState,
     misses: u32,
+    /// The drain (`until`, `reason`) an `Unknown` interrupted, kept while the
+    /// state stays `Unknown`. The heartbeat never carries `reason`, so when the
+    /// same drain comes back this is where its reason is found. Otherwise the
+    /// banner would depend on one `me/drain` read that is never retried.
+    interrupted_drain: Option<(Option<DateTime<Utc>>, Option<String>)>,
 }
 
 impl DrainTracker {
@@ -441,6 +454,29 @@ impl DrainTracker {
                 cause: "coord drain state not read yet".to_string(),
             },
             misses: 0,
+            interrupted_drain: None,
+        }
+    }
+
+    /// The single writer of `state`, which keeps `interrupted_drain` in step.
+    fn replace_state(&mut self, next: CoordDrainState) {
+        match (&self.state, &next) {
+            (CoordDrainState::Drained { until, reason }, CoordDrainState::Unknown { .. }) => {
+                self.interrupted_drain = Some((*until, reason.clone()));
+            }
+            (CoordDrainState::Unknown { .. }, CoordDrainState::Unknown { .. }) => {}
+            _ => self.interrupted_drain = None,
+        }
+        self.state = next;
+    }
+
+    /// The reason last read for the drain ending at `until`, if this tracker
+    /// still remembers that drain.
+    fn remembered_reason(&self, until: Option<DateTime<Utc>>) -> Option<String> {
+        match (&self.state, &self.interrupted_drain) {
+            (CoordDrainState::Drained { until: u, reason }, _) if *u == until => reason.clone(),
+            (CoordDrainState::Unknown { .. }, Some((u, reason))) if *u == until => reason.clone(),
+            _ => None,
         }
     }
 
@@ -455,6 +491,30 @@ impl DrainTracker {
         }
     }
 
+    /// Take over an `Unknown` that staleness produced ([`effective_state`])
+    /// while the tracked state still holds the last known one. Call it before
+    /// folding the next read.
+    ///
+    /// Without it, two things go wrong on the first read after a silence:
+    ///
+    /// * a FAILED read restores the stale `Clear`. A miss under the
+    ///   three-miss budget leaves the tracked state alone, and the fold resets
+    ///   the staleness clock, so the state goes back to `Clear` even though
+    ///   nothing was read. That is fail-open.
+    /// * an `Unknown` that IS tracked (an `unreadable` answer, or a third miss)
+    ///   takes `since = now`. The episode has been unknown since the last fold,
+    ///   and the banner keys its dismissal on `since`, so the dismissal resets.
+    ///
+    /// A drain it replaces is remembered (`interrupted_drain`), so that drain's
+    /// reason survives the silence.
+    pub fn adopt_stale(&mut self, effective: &CoordDrainState) {
+        if matches!(effective, CoordDrainState::Unknown { .. })
+            && !matches!(self.state, CoordDrainState::Unknown { .. })
+        {
+            self.replace_state(effective.clone());
+        }
+    }
+
     fn set(&mut self, next: CoordDrainState) -> Transition {
         let entered_drained = match (&self.state, &next) {
             (
@@ -465,7 +525,7 @@ impl DrainTracker {
             _ => false,
         };
         let changed = self.state != next;
-        self.state = next;
+        self.replace_state(next);
         Transition {
             changed,
             entered_drained,
@@ -483,14 +543,9 @@ impl DrainTracker {
                     CoordDrainState::Clear
                 } else {
                     // The heartbeat never carries `reason`; keep the one the
-                    // last me/drain read supplied for this same drain.
-                    let reason = reason.or_else(|| match &self.state {
-                        CoordDrainState::Drained {
-                            until: prev_until,
-                            reason: prev_reason,
-                        } if *prev_until == until => prev_reason.clone(),
-                        _ => None,
-                    });
+                    // last me/drain read supplied for this same drain, also
+                    // across an `Unknown` that interrupted it.
+                    let reason = reason.or_else(|| self.remembered_reason(until));
                     CoordDrainState::Drained { until, reason }
                 }
             }
@@ -569,6 +624,22 @@ pub fn effective_state(
     tracked.clone()
 }
 
+/// PURE: whether `a` and `b` are the same drain episode, so moving from one to
+/// the other needs no event and no transition log.
+///
+/// Two `Unknown`s are the same episode when their `since` matches. The `cause`
+/// is rewritten on every read: a miss count, or a stale age in seconds. That is
+/// detail, not a new episode. Every other pair is compared in full, so a
+/// drained `reason` filled in by `me/drain` is still a change.
+pub fn same_episode(a: &CoordDrainState, b: &CoordDrainState) -> bool {
+    match (a, b) {
+        (CoordDrainState::Unknown { since: x, .. }, CoordDrainState::Unknown { since: y, .. }) => {
+            x == y
+        }
+        _ => a == b,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Process-global cache
 // ---------------------------------------------------------------------------
@@ -643,13 +714,23 @@ fn stale_after() -> Duration {
 }
 
 fn current_locked(inner: &Inner) -> CoordDrainState {
+    current_at(inner, Instant::now(), Utc::now(), stale_after())
+}
+
+/// PURE: [`current_locked`] at an explicit clock.
+fn current_at(
+    inner: &Inner,
+    now: Instant,
+    now_utc: DateTime<Utc>,
+    stale_after: Duration,
+) -> CoordDrainState {
     effective_state(
         inner.tracker.state(),
         inner.last_fold,
         inner.last_fold_at,
-        stale_after(),
-        Instant::now(),
-        Utc::now(),
+        stale_after,
+        now,
+        now_utc,
     )
 }
 
@@ -657,23 +738,48 @@ fn current_locked(inner: &Inner) -> CoordDrainState {
 pub fn current() -> CoordDrainState {
     let (state, emit) = {
         let mut inner = lock_inner();
-        let state = current_locked(&inner);
-        let emit = inner.last_emitted.as_ref() != Some(&state) && inner.last_emitted.is_some();
+        let (state, emit) = read_locked(&mut inner, Instant::now(), Utc::now(), stale_after());
         if emit {
-            inner.last_emitted = Some(state.clone());
-            if state.allows_autonomous_spawns() {
-                inner.deferred.clear();
-                inner.deferred_capped = false;
-            }
+            // Published under the lock, so a fold that lands right after this
+            // read cannot have its newer state overwritten by this older one.
+            // Lock order is `inner` then the watch; no watch borrow is ever
+            // held across a call into this module.
+            global().tx.send_replace(state.clone());
         }
         (state, emit)
     };
     if emit {
         // A staleness flip observed by a reader, not by a fold.
-        global().tx.send_replace(state.clone());
+        log_transition(&state);
         emit_snapshot();
     }
     state
+}
+
+/// PURE: [`current`]'s locked half at an explicit clock. Returns the state and
+/// whether it is a new episode to announce. Nothing is announced before the
+/// first fold.
+fn read_locked(
+    inner: &mut Inner,
+    now: Instant,
+    now_utc: DateTime<Utc>,
+    stale_after: Duration,
+) -> (CoordDrainState, bool) {
+    let state = current_at(inner, now, now_utc, stale_after);
+    // `same_episode`, not `!=`: a stale `Unknown`'s cause carries its age in
+    // seconds, so a full compare would emit on every call.
+    let emit = inner
+        .last_emitted
+        .as_ref()
+        .is_some_and(|last| !same_episode(last, &state));
+    if emit {
+        inner.last_emitted = Some(state.clone());
+        if state.allows_autonomous_spawns() {
+            inner.deferred.clear();
+            inner.deferred_capped = false;
+        }
+    }
+    (state, emit)
 }
 
 /// Everything the UI and `/restart-readiness` render.
@@ -761,6 +867,10 @@ pub fn snapshot() -> CoordDrainSnapshot {
 }
 
 /// Subscribe to state changes. The value is the state as of the last change.
+///
+/// Drop any borrow of the receiver before calling back into this module.
+/// `fold` and `current` publish while holding the `inner` lock, so a held
+/// borrow plus one of those calls is a lock-order inversion.
 pub fn subscribe() -> tokio::sync::watch::Receiver<CoordDrainState> {
     global().tx.subscribe()
 }
@@ -775,39 +885,65 @@ fn emit_snapshot() {
     }
 }
 
-/// Fold under the lock, then publish and emit outside it.
+/// Fold and publish under the lock, then log and emit outside it.
 fn fold(f: impl FnOnce(&mut DrainTracker, DateTime<Utc>) -> Transition) -> Transition {
-    let now = Utc::now();
     let (transition, state) = {
         let mut inner = lock_inner();
-        let before = current_locked(&inner);
-        let transition = f(&mut inner.tracker, now);
-        inner.folded_once = true;
-        inner.last_fold = Instant::now();
-        inner.last_fold_at = now;
-        let after = current_locked(&inner);
-        let changed = transition.changed || before != after;
-        if after.allows_autonomous_spawns() {
-            inner.deferred.clear();
-            inner.deferred_capped = false;
+        let (transition, state) =
+            fold_locked(&mut inner, f, Instant::now(), Utc::now(), stale_after());
+        if transition.changed {
+            // Under the lock for the same reason as in `current`.
+            global().tx.send_replace(state.clone());
         }
-        if changed || inner.last_emitted.is_none() {
-            inner.last_emitted = Some(after.clone());
-        }
-        (
-            Transition {
-                changed,
-                entered_drained: transition.entered_drained,
-            },
-            after,
-        )
+        (transition, state)
     };
     if transition.changed {
         log_transition(&state);
-        global().tx.send_replace(state);
         emit_snapshot();
     }
     transition
+}
+
+/// PURE: [`fold`]'s locked half at an explicit clock. Returns the transition
+/// and the state as of now. `changed` means "a different episode from the last
+/// one announced" ([`same_episode`] against `last_emitted`), which is the same
+/// rule [`current`] emits by. The state before the fold is not the baseline: a
+/// stale `Unknown` nobody has read yet was never announced, so the fold that
+/// adopts it has to announce it.
+fn fold_locked(
+    inner: &mut Inner,
+    f: impl FnOnce(&mut DrainTracker, DateTime<Utc>) -> Transition,
+    now: Instant,
+    now_utc: DateTime<Utc>,
+    stale_after: Duration,
+) -> (Transition, CoordDrainState) {
+    let before = current_at(inner, now, now_utc, stale_after);
+    // A silence that already read as `Unknown` stays that episode until a
+    // successful read ends it (see `adopt_stale`).
+    inner.tracker.adopt_stale(&before);
+    let transition = f(&mut inner.tracker, now_utc);
+    inner.folded_once = true;
+    inner.last_fold = now;
+    inner.last_fold_at = now_utc;
+    let after = current_at(inner, now, now_utc, stale_after);
+    let changed = inner
+        .last_emitted
+        .as_ref()
+        .is_none_or(|last| !same_episode(last, &after));
+    if after.allows_autonomous_spawns() {
+        inner.deferred.clear();
+        inner.deferred_capped = false;
+    }
+    if changed {
+        inner.last_emitted = Some(after.clone());
+    }
+    (
+        Transition {
+            changed,
+            entered_drained: transition.entered_drained,
+        },
+        after,
+    )
 }
 
 fn log_transition(state: &CoordDrainState) {
@@ -1591,6 +1727,383 @@ mod tests {
             ),
             CoordDrainState::Unknown { .. }
         ));
+    }
+
+    const STALE: Duration = Duration::from_secs(95);
+
+    /// A cache that last folded a successful `Clear` read at `t0()` / `base`,
+    /// and has announced it.
+    fn inner_read_clear_at(base: Instant) -> Inner {
+        let mut tracker = DrainTracker::new(t0());
+        tracker.observe(DrainObservation::Clear, t0());
+        Inner {
+            tracker,
+            last_fold: base,
+            last_fold_at: t0(),
+            deferred: BTreeSet::new(),
+            deferred_capped: false,
+            last_emitted: Some(CoordDrainState::Clear),
+            folded_once: true,
+        }
+    }
+
+    /// `base` and `t0()` advanced by the same `secs`.
+    fn after(base: Instant, secs: u64) -> (Instant, DateTime<Utc>) {
+        (
+            base + Duration::from_secs(secs),
+            t0() + chrono::Duration::seconds(secs as i64),
+        )
+    }
+
+    #[test]
+    fn a_failed_read_after_a_silence_stays_unknown_and_never_restores_clear() {
+        // The heartbeat went silent past `stale_after`, so the state already
+        // reads Unknown. The next tick then FAILS. Before the fix, that miss
+        // (the first of three) left the tracked `Clear` alone and reset the
+        // staleness clock, which brought `Clear` back on a read that saw
+        // nothing.
+        let base = Instant::now();
+        let mut inner = inner_read_clear_at(base);
+        let (now, now_utc) = after(base, 600);
+        assert!(matches!(
+            current_at(&inner, now, now_utc, STALE),
+            CoordDrainState::Unknown { .. }
+        ));
+
+        let (t, state) = fold_locked(
+            &mut inner,
+            |tr, now| tr.miss("network unreachable", now),
+            now,
+            now_utc,
+            STALE,
+        );
+        assert!(
+            !state.allows_autonomous_spawns(),
+            "a failed read must not end a silence: got {state:?}"
+        );
+        // Unknown since the last read that DID land, not since this miss.
+        assert!(
+            matches!(&state, CoordDrainState::Unknown { since, .. } if *since == t0()),
+            "got {state:?}"
+        );
+        // Nothing had announced the stale Unknown, so this fold does.
+        assert!(t.changed);
+    }
+
+    #[test]
+    fn a_tracked_unknown_after_a_silence_keeps_the_silences_since() {
+        // The banner keys an unknown episode on `since`. An `unreadable`
+        // answer after a silence is the same episode, so `since` must not
+        // jump to the moment of the answer.
+        let base = Instant::now();
+        let mut inner = inner_read_clear_at(base);
+        let (now, now_utc) = after(base, 600);
+        // A reader saw the silence first, so it was announced.
+        inner.last_emitted = Some(current_at(&inner, now, now_utc, STALE));
+
+        let (t, state) = fold_locked(
+            &mut inner,
+            |tr, now| tr.observe(DrainObservation::Unreadable, now),
+            now,
+            now_utc,
+            STALE,
+        );
+        assert!(
+            matches!(&state, CoordDrainState::Unknown { since, .. } if *since == t0()),
+            "got {state:?}"
+        );
+        assert!(!t.changed, "the same unknown episode is not a new event");
+    }
+
+    #[test]
+    fn a_successful_read_ends_a_silence() {
+        let base = Instant::now();
+        let mut inner = inner_read_clear_at(base);
+        let (now, now_utc) = after(base, 600);
+        inner.last_emitted = Some(current_at(&inner, now, now_utc, STALE));
+
+        let (t, state) = fold_locked(
+            &mut inner,
+            |tr, now| tr.observe(DrainObservation::Clear, now),
+            now,
+            now_utc,
+            STALE,
+        );
+        assert_eq!(state, CoordDrainState::Clear);
+        assert!(t.changed);
+    }
+
+    #[test]
+    fn a_miss_inside_the_budget_keeps_a_fresh_known_state() {
+        // The three-miss budget is unchanged when there was no silence.
+        let base = Instant::now();
+        let mut inner = inner_read_clear_at(base);
+        let (now, now_utc) = after(base, 30);
+        let (t, state) = fold_locked(
+            &mut inner,
+            |tr, now| tr.miss("timeout", now),
+            now,
+            now_utc,
+            STALE,
+        );
+        assert_eq!(state, CoordDrainState::Clear);
+        assert!(!t.changed);
+    }
+
+    #[test]
+    fn a_cause_only_unknown_rewrite_is_not_a_change() {
+        // `miss` says a cause-only rewrite of an Unknown is not worth an event
+        // per tick. The fold used to override that by comparing the causes.
+        let base = Instant::now();
+        let mut inner = inner_read_clear_at(base);
+        let mut clock = 0;
+        let mut last = None;
+        for _ in 0..5 {
+            clock += 30;
+            let (now, now_utc) = after(base, clock);
+            last = Some(fold_locked(
+                &mut inner,
+                |tr, now| tr.miss("timeout", now),
+                now,
+                now_utc,
+                STALE,
+            ));
+        }
+        let (t, state) = last.expect("folded");
+        assert!(
+            matches!(&state, CoordDrainState::Unknown { cause, .. } if cause.contains("5 consecutive")),
+            "got {state:?}"
+        );
+        assert!(!t.changed, "the 5th miss rewrote the cause only");
+    }
+
+    /// A cache that last folded a successful drained read (until X, reason R)
+    /// at `t0()` / `base`, and has announced it.
+    fn inner_read_drained_at(base: Instant) -> (Inner, Option<DateTime<Utc>>) {
+        let until = Some(t0() + chrono::Duration::hours(4));
+        let mut inner = inner_read_clear_at(base);
+        inner.tracker.observe(
+            DrainObservation::Drained {
+                until,
+                reason: Some("rebuild".into()),
+            },
+            t0(),
+        );
+        inner.last_emitted = Some(inner.tracker.state().clone());
+        (inner, until)
+    }
+
+    #[test]
+    fn a_failed_read_after_a_silence_does_not_bring_a_drain_back_either() {
+        let base = Instant::now();
+        let (mut inner, _) = inner_read_drained_at(base);
+        let (now, now_utc) = after(base, 600);
+        let (_, state) = fold_locked(
+            &mut inner,
+            |tr, now| tr.miss("timeout", now),
+            now,
+            now_utc,
+            STALE,
+        );
+        assert!(
+            matches!(&state, CoordDrainState::Unknown { since, .. } if *since == t0()),
+            "got {state:?}"
+        );
+    }
+
+    #[test]
+    fn a_drains_reason_survives_a_silence_that_interrupted_it() {
+        // The heartbeat never carries `reason`. When the same drain comes back
+        // after the silence, the reason read before it must still be there:
+        // the one `me/drain` re-read is not retried if it fails.
+        let base = Instant::now();
+        let (mut inner, until) = inner_read_drained_at(base);
+        let (now, now_utc) = after(base, 600);
+        let (t, state) = fold_locked(
+            &mut inner,
+            |tr, now| {
+                tr.observe(
+                    DrainObservation::Drained {
+                        until,
+                        reason: None,
+                    },
+                    now,
+                )
+            },
+            now,
+            now_utc,
+            STALE,
+        );
+        assert_eq!(
+            state,
+            CoordDrainState::Drained {
+                until,
+                reason: Some("rebuild".into())
+            }
+        );
+        assert!(t.entered_drained, "the reason is still re-read once");
+    }
+
+    #[test]
+    fn a_drains_reason_survives_three_misses_too() {
+        let mut tr = DrainTracker::new(t0());
+        let until = Some(t0() + chrono::Duration::hours(4));
+        tr.observe(
+            DrainObservation::Drained {
+                until,
+                reason: Some("rebuild".into()),
+            },
+            t0(),
+        );
+        for _ in 0..4 {
+            tr.miss("timeout", t0());
+        }
+        assert!(matches!(tr.state(), CoordDrainState::Unknown { .. }));
+        tr.observe(
+            DrainObservation::Drained {
+                until,
+                reason: None,
+            },
+            t0(),
+        );
+        assert_eq!(
+            tr.state(),
+            &CoordDrainState::Drained {
+                until,
+                reason: Some("rebuild".into())
+            }
+        );
+        // A DIFFERENT drain is not given the old one's reason.
+        let mut tr2 = tr.clone();
+        tr2.miss("x", t0());
+        tr2.miss("x", t0());
+        tr2.miss("x", t0());
+        tr2.observe(
+            DrainObservation::Drained {
+                until: Some(t0() + chrono::Duration::hours(9)),
+                reason: None,
+            },
+            t0(),
+        );
+        assert!(
+            matches!(tr2.state(), CoordDrainState::Drained { reason: None, .. }),
+            "got {:?}",
+            tr2.state()
+        );
+        // A clear in between forgets the drain.
+        tr.miss("x", t0());
+        tr.miss("x", t0());
+        tr.miss("x", t0());
+        tr.observe(DrainObservation::Clear, t0());
+        tr.observe(
+            DrainObservation::Drained {
+                until,
+                reason: None,
+            },
+            t0(),
+        );
+        assert!(
+            matches!(tr.state(), CoordDrainState::Drained { reason: None, .. }),
+            "got {:?}",
+            tr.state()
+        );
+    }
+
+    #[test]
+    fn a_failed_local_read_after_a_silence_keeps_a_non_coord_box_unknown() {
+        // NotEnrolled + silence + an INDETERMINATE local read (folded as a
+        // miss) stays Unknown: the same fail-closed posture as
+        // `an_indeterminate_local_read_defers_while_an_absent_one_allows`.
+        // The next positive NotEnrolled read ends it.
+        let base = Instant::now();
+        let mut inner = inner_read_clear_at(base);
+        inner.tracker.observe(
+            DrainObservation::NotEnrolled {
+                why: "no machine.json",
+            },
+            t0(),
+        );
+        inner.last_emitted = Some(inner.tracker.state().clone());
+        let (now, now_utc) = after(base, 600);
+        let (_, state) = fold_locked(
+            &mut inner,
+            |tr, now| tr.miss("machine.json unreadable", now),
+            now,
+            now_utc,
+            STALE,
+        );
+        assert!(!state.allows_autonomous_spawns(), "got {state:?}");
+        let (now, now_utc) = after(base, 630);
+        let (_, state) = fold_locked(
+            &mut inner,
+            |tr, now| {
+                tr.observe(
+                    DrainObservation::NotEnrolled {
+                        why: "no machine.json",
+                    },
+                    now,
+                )
+            },
+            now,
+            now_utc,
+            STALE,
+        );
+        assert!(state.allows_autonomous_spawns(), "got {state:?}");
+    }
+
+    #[test]
+    fn a_reader_announces_a_silence_once_not_once_per_second() {
+        // The stale cause carries its age in seconds. Compared in full, every
+        // `current()` call during the silence was a new state to announce.
+        let base = Instant::now();
+        let mut inner = inner_read_clear_at(base);
+        let (now, now_utc) = after(base, 100);
+        let (state, emit) = read_locked(&mut inner, now, now_utc, STALE);
+        assert!(matches!(state, CoordDrainState::Unknown { .. }));
+        assert!(emit, "the first read of the silence announces it");
+        for secs in [101, 150, 400] {
+            let (now, now_utc) = after(base, secs);
+            let (state, emit) = read_locked(&mut inner, now, now_utc, STALE);
+            assert!(
+                matches!(&state, CoordDrainState::Unknown { cause, .. } if cause.contains(&format!("{secs}s"))),
+                "got {state:?}"
+            );
+            assert!(!emit, "{secs}s: same silence, same episode");
+        }
+        // And nothing is announced before the first fold.
+        let mut fresh = inner_read_clear_at(base);
+        fresh.last_emitted = None;
+        let (now, now_utc) = after(base, 100);
+        assert!(!read_locked(&mut fresh, now, now_utc, STALE).1);
+    }
+
+    #[test]
+    fn same_episode_ignores_an_unknowns_cause_and_nothing_else() {
+        let unknown = |since, cause: &str| CoordDrainState::Unknown {
+            since,
+            cause: cause.to_string(),
+        };
+        assert!(same_episode(
+            &unknown(t0(), "no drain read for 96s"),
+            &unknown(t0(), "no drain read for 97s"),
+        ));
+        assert!(!same_episode(
+            &unknown(t0(), "x"),
+            &unknown(t0() + chrono::Duration::seconds(1), "x"),
+        ));
+        let until = Some(t0() + chrono::Duration::hours(1));
+        // A reason filled in by me/drain is still worth an event.
+        assert!(!same_episode(
+            &CoordDrainState::Drained {
+                until,
+                reason: None
+            },
+            &CoordDrainState::Drained {
+                until,
+                reason: Some("rebuild".into())
+            },
+        ));
+        assert!(!same_episode(&CoordDrainState::Clear, &unknown(t0(), "x")));
     }
 
     #[test]
