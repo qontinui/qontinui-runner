@@ -14,10 +14,11 @@ import { describe, expect, it } from "vitest";
 import {
   accountSelectionModeLabel,
   displayedAccountSelection,
+  hasDeterministicPick,
   type AccountSelectionMode,
   type AiSettings,
 } from "../types";
-import { DEFAULT_AI_SETTINGS } from "../ai-settings/types";
+import { DEFAULT_AI_SETTINGS, SELECTION_MODE_OPTIONS } from "../ai-settings/types";
 
 function settingsWith(patch: {
   local?: AccountSelectionMode;
@@ -169,5 +170,42 @@ describe("accountSelectionModeLabel", () => {
     expect(accountSelectionModeLabel("highest_expected_usage")).toBe("Highest Expected Usage");
     expect(accountSelectionModeLabel("weighted_random")).toBe("Weighted Random");
     expect(accountSelectionModeLabel("alternating_handoff")).toBe("Alternating Handoff");
+  });
+});
+
+describe("SELECTION_MODE_OPTIONS", () => {
+  // The selector tells the operator which mode is the runner's default
+  // (`AccountSelectionMode::default()` in settings.rs). Exactly one option may
+  // say so, and it must be weighted random — a label naming the wrong mode is
+  // a false claim on the page that edits the setting.
+  it("marks weighted_random, and only it, as the default", () => {
+    const marked = SELECTION_MODE_OPTIONS.filter((o) => /^Default\b/.test(o.hint));
+    expect(marked.map((o) => o.mode)).toEqual(["weighted_random"]);
+  });
+
+  it("offers every mode exactly once", () => {
+    expect(SELECTION_MODE_OPTIONS.map((o) => o.mode).sort()).toEqual([
+      "alternating_handoff",
+      "highest_expected_usage",
+      "least_usage",
+      "manual",
+      "weighted_random",
+    ]);
+  });
+});
+
+describe("hasDeterministicPick — whether the page may mark one account Auto-selected", () => {
+  it("is true only for the modes that rank to one account", () => {
+    expect(hasDeterministicPick("least_usage")).toBe(true);
+    expect(hasDeterministicPick("highest_expected_usage")).toBe(true);
+    expect(hasDeterministicPick("alternating_handoff")).toBe(true);
+    expect(hasDeterministicPick("manual")).toBe(false);
+    expect(hasDeterministicPick("weighted_random")).toBe(false);
+  });
+
+  // A failed settings load leaves the mode unknown; claiming a pick then would
+  // put an "Auto-selected" badge on an account the runner may not use.
+  it("is false when the mode is unknown", () => {
+    expect(hasDeterministicPick(undefined)).toBe(false);
   });
 });

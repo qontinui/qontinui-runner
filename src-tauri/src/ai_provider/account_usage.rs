@@ -4,9 +4,11 @@
 //! configured `claude_config_dirs`, using one of four ranking strategies
 //! depending on `account_selection_mode`:
 //!
-//! - `AlternatingHandoff` (the default) and `WeightedRandom`: see "Handoff
-//!   strategies" below. At spawn time `AlternatingHandoff` picks exactly as
-//!   `HighestExpectedUsage` does (its "account 1"); `WeightedRandom` draws.
+//! - `WeightedRandom` (the default) and `AlternatingHandoff`: see "Handoff
+//!   strategies" below. `WeightedRandom` draws at spawn time too, so a burst
+//!   of spawns spreads across the under-pace accounts; at spawn time
+//!   `AlternatingHandoff` picks exactly as `HighestExpectedUsage` does (its
+//!   "account 1").
 //! - `HighestExpectedUsage`: among accounts that are **not** in
 //!   a rate-limit cooldown, not exhausted, AND currently under their expected
 //!   linear pace (actual 7-day utilization < expected utilization at this
@@ -129,10 +131,10 @@ static HANDOFFS: Mutex<VecDeque<(Instant, String)>> = Mutex::new(VecDeque::new()
 /// With a single configured account it simply pins that account (so the
 /// effective config dir resolves even for users who never set a manual
 /// `config_dir`). With several, selection prefers (per the active mode) the
-/// non-cooled, non-exhausted account either furthest under its expected pace
-/// (`LeastUsage`) or, among those under pace, with the highest expected usage
-/// (`HighestExpectedUsage` and `AlternatingHandoff`, the default; or a weighted
-/// draw under `WeightedRandom`); falls back to first-non-cooled
+/// non-cooled, non-exhausted account either first in the use-it-or-lose-it
+/// `cmp_rank` order (`LeastUsage`) or, among those under pace, with the highest expected usage
+/// (`HighestExpectedUsage` and `AlternatingHandoff`; or a weighted draw under
+/// `WeightedRandom`, the default); falls back to first-non-cooled
 /// (cold start), then to the soonest-to-expire cooldown when every account is
 /// rate-limited. Full key: the module doc.
 pub fn pick_best_account() {
