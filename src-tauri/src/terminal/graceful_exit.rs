@@ -18,11 +18,12 @@
 //!
 //!    A pid is a `claude` on either of two witnesses: its image name, or a
 //!    Claude Code registry record (`<CLAUDE_CONFIG_DIR>/sessions/<pid>.json`)
-//!    that names it — the one an npm-installed Claude Code, which runs as
-//!    `node … cli.js`, is seen by ([`RegistryWitness`]). A registry that
-//!    cannot settle a pid the image leaves open (a `sessions/` dir that exists
-//!    and cannot be listed, a record that does not parse) is an unreadable
-//!    probe — `ProbeUnavailable` — never `NoLiveClaude`.
+//!    that names it, whatever its image — the one an npm-installed Claude
+//!    Code, which runs as `node … cli.js`, is seen by ([`RegistryWitness`]).
+//!    A registry that cannot settle a pid whose image could be a JS-runtime
+//!    Claude Code (`node`, `bun`; a `sessions/` dir that exists and cannot be
+//!    listed, a record that does not parse) is an unreadable probe —
+//!    `ProbeUnavailable` — never `NoLiveClaude`.
 //!
 //!    **Then check the close authority.** A live `claude` has been found and
 //!    nothing has been typed yet. A caller that presents no
@@ -85,7 +86,7 @@ use std::time::Duration;
 use serde::Serialize;
 
 use crate::process_capture::process_tree::{
-    inclusive_subtree_pids, is_countable_claude, ProcessSnapshot,
+    inclusive_subtree_pids, is_countable_claude, may_be_js_runtime_claude, ProcessSnapshot,
 };
 use crate::session::claude_activity::{self, LivePid, RecordDepth, RecordReading};
 use crate::terminal::close_authority::CloseAuthority;
@@ -389,8 +390,10 @@ pub fn alive_in(snapshot: &ProcessSnapshot, id: ProcIdentity) -> bool {
 // ---------------------------------------------------------------------------
 
 /// How long one registry read may take before the witness reads UNKNOWN. The
-/// read lists each account's `sessions/` dir and opens only the records of
-/// the pids asked about, so a healthy one takes milliseconds.
+/// read lists each account's `sessions/` dir and opens only the records of the
+/// pids asked about. Its duration has not been measured; the budget matches
+/// restart-readiness's record read (`RECORD_READ_TIMEOUT`, 3 s), which does
+/// the same work.
 pub const REGISTRY_READ_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// At most this many registry reads run at once. A read that overran
@@ -400,10 +403,17 @@ pub const REGISTRY_READ_TIMEOUT: Duration = Duration::from_secs(3);
 /// an uncapped probe would leak a thread on every poll. Past the cap a probe
 /// reads UNKNOWN instead. The cap is generous because concurrent probes are
 /// ordinary (the steward, the message poller and a wind-down can all probe at
-/// once) and each healthy read is brief.
+/// once).
 pub const MAX_REGISTRY_READS_IN_FLIGHT: usize = 16;
 
 static REGISTRY_READS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+/// The unlistable-`sessions/`-dir condition as the probe last logged it.
+static UNLISTABLE_SESSIONS_LOG: claude_activity::UnlistableLog = claude_activity::UnlistableLog::new(
+    "graceful-exit probe",
+    "every pane process whose image could be a JS-runtime Claude Code (node, nodejs, bun) reads \
+     UNKNOWN until it is listable, in every pane on this box",
+);
 
 /// Claude Code's own session registry, read for one look at the process
 /// table: the probe's SECOND witness that a pid is a live `claude` (plan
@@ -416,35 +426,63 @@ static REGISTRY_READS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 /// relay's end and the remote-create reaper answer with an ordinary
 /// kill-close. Claude Code writes `<CLAUDE_CONFIG_DIR>/sessions/<pid>.json`
 /// whatever binary it runs as, so a pid such a record names counts as a live
-/// `claude` too. The records are read through [`claude_activity::read_records`]
-/// over the runner's known config dirs
-/// ([`crate::terminal::transcript::find_claude_config_dirs`]).
+/// `claude` too, WHATEVER its image. The records are read through
+/// [`claude_activity::read_records`] over the runner's known config dirs
+/// ([`crate::terminal::transcript::find_claude_config_dirs`]) plus each
+/// candidate pid's own `CLAUDE_CONFIG_DIR`
+/// ([`crate::process_capture::process_tree::config_dir_of_pid`]).
 ///
 /// What each reading of a pid's record makes of the pid:
 ///
 /// | reading | the pid |
 /// |---|---|
-/// | `Parsed`, `Ambiguous` | a live `claude`: a record names it as the SAME process |
-/// | `PidReused` | judged by its image alone: the record is an earlier holder's |
-/// | `Missing` | judged by its image alone |
-/// | `Unparseable` | UNKNOWN: it may be the live record caught mid-write |
-/// | any `sessions/` dir unlistable | UNKNOWN for every pid its image does not settle |
+/// | `Parsed`, `Ambiguous` | a live `claude`, whatever its image: a record names it as the SAME process |
+/// | `PidReused` | judged by its image: `procStart` disagrees with the kernel, or `startedAt` predates the process — an earlier holder's record |
+/// | `Missing` | judged by its image (see the residual below) |
+/// | `LateStamp`, `Unparseable` | UNDECIDED: either may be the live process's own record |
+/// | any `sessions/` dir unlistable, or the read failed | UNDECIDED, for every pid |
 ///
-/// "The same process" is the start-time check `read_records` already makes:
-/// `procStart` against the kernel's start time on Linux, else `startedAt`
-/// against the creation time the snapshot gives the pid. A record neither
-/// check can reach is accepted on its pid. That errs toward `live`: every
-/// consumer that closes, reaps or replaces a pane does so only on `absent`,
-/// and the two that WRITE on `live` (a graceful exit holding an authority,
-/// the message poller) each check the screen for Claude Code's own prompt
-/// between the probe and the write.
+/// An UNDECIDED pid makes the probe `Unreadable` only when its image could BE
+/// a JS-runtime Claude Code — `node`, `nodejs`, `bun`, or an image the
+/// snapshot could not read
+/// ([`crate::process_capture::process_tree::may_be_js_runtime_claude`]). Any
+/// other image is judged by itself, so a shell running a native `claude`
+/// stays readable. What an unlistable dir still blinds: every `node`/`bun`
+/// process in EVERY pane on the box reads UNKNOWN while it lasts — box-wide
+/// for npm-installed sessions, and logged once each time it appears and
+/// clears.
+///
+/// "The same process" is `read_records`' own start-time check: `procStart`
+/// against the kernel's start time on Linux, else `startedAt` against the
+/// creation time the snapshot gives the pid. A record neither check can reach
+/// is accepted on its pid. That errs toward `live`: every consumer that
+/// closes, reaps or replaces a pane does so only on `absent`, and the two that
+/// WRITE on `live` (a graceful exit holding an authority, the message poller)
+/// each check the screen for Claude Code's own prompt between the probe and
+/// the write.
+///
+/// **Residual `absent`.** A record under a config dir the runner never found
+/// reads `Missing`. Discovery keeps only a home with a `projects/` dir, and on
+/// Linux finds a `~/.claude-*` home only through the account roster (the
+/// directory scan is `C:/claude/.claude-*`). Each candidate's own
+/// `CLAUDE_CONFIG_DIR` closes that gap on Linux; elsewhere, or for a pid whose
+/// environment cannot be read, a `node` claude under such a home still reads
+/// `absent`.
+///
+/// Opaque on purpose: the only way to hold a witness that names nothing is a
+/// real read ([`read_registry_witness`], [`PaneLook::take`]), so no caller can
+/// hand the probe an empty-but-"complete" registry and quietly restore
+/// npm-reads-`absent`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RegistryWitness {
+pub struct RegistryWitness(Witness);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Witness {
     /// Every `sessions/` dir was listed.
     Read {
         /// Pids a record names as the same live process.
         named: BTreeSet<u32>,
-        /// Pids whose record could not be read or parsed, and why.
+        /// Pids whose record is UNDECIDED, and why.
         undecided: BTreeMap<u32, String>,
     },
     /// The registry could not answer: a `sessions/` dir exists and could not
@@ -452,51 +490,81 @@ pub enum RegistryWitness {
     Unreadable(String),
 }
 
+/// What the registry says about one pid.
+enum RegistryAnswer {
+    /// A record names it as the same live process.
+    Named,
+    /// No record names it (or only an earlier holder's does).
+    NotNamed,
+    /// The registry cannot say, and why.
+    Undecided(String),
+}
+
 impl Default for RegistryWitness {
     /// No read taken is UNKNOWN — never "the registry named nothing".
     fn default() -> Self {
-        Self::Unreadable("Claude Code's session registry was not read".to_string())
+        Self::unreadable("Claude Code's session registry was not read")
     }
 }
 
 impl RegistryWitness {
-    /// A complete read that named exactly `pids`.
-    pub fn naming(pids: &[u32]) -> Self {
-        Self::Read {
-            named: pids.iter().copied().collect(),
-            undecided: BTreeMap::new(),
+    /// A registry that could not answer — the safe direction, so anyone may
+    /// build one.
+    pub fn unreadable(why: impl Into<String>) -> Self {
+        Self(Witness::Unreadable(why.into()))
+    }
+
+    /// Why the registry could not answer at all, or `None` when it was read.
+    pub fn unreadable_reason(&self) -> Option<&str> {
+        match &self.0 {
+            Witness::Unreadable(why) => Some(why.as_str()),
+            Witness::Read { .. } => None,
         }
     }
 
-    /// Is `pid` — not a `claude` by its image — a live `claude` by the
-    /// registry? `Err` when the registry cannot say.
-    fn names_live_claude(&self, pid: u32) -> Result<bool, String> {
-        const WHY_IT_MATTERS: &str = "an npm-installed Claude Code runs as `node`, so its image \
-                                      cannot rule it out";
-        match self {
-            Self::Read { named, undecided } => {
+    /// A look whose subtrees hold only `claude` images leaves the registry
+    /// nothing to decide. Private: see the type's docs.
+    fn nothing_to_decide() -> Self {
+        Self(Witness::Read {
+            named: BTreeSet::new(),
+            undecided: BTreeMap::new(),
+        })
+    }
+
+    /// A complete read that named exactly `pids`. Test builds only.
+    #[cfg(test)]
+    pub(crate) fn naming(pids: &[u32]) -> Self {
+        Self(Witness::Read {
+            named: pids.iter().copied().collect(),
+            undecided: BTreeMap::new(),
+        })
+    }
+
+    /// What the registry says about `pid`.
+    fn answer_for(&self, pid: u32) -> RegistryAnswer {
+        match &self.0 {
+            Witness::Read { named, undecided } => {
                 if named.contains(&pid) {
-                    return Ok(true);
-                }
-                match undecided.get(&pid) {
-                    Some(why) => Err(format!(
-                        "pid {pid}'s Claude Code session record {why}, so whether it is a \
-                         `claude` is unknown ({WHY_IT_MATTERS})"
-                    )),
-                    None => Ok(false),
+                    RegistryAnswer::Named
+                } else if let Some(why) = undecided.get(&pid) {
+                    RegistryAnswer::Undecided(format!(
+                        "pid {pid}'s Claude Code session record {why}, so whether that \
+                         process is a JS-runtime `claude` is unknown"
+                    ))
+                } else {
+                    RegistryAnswer::NotNamed
                 }
             }
-            Self::Unreadable(why) => Err(format!(
-                "{why}, so whether pid {pid} in the pane is a `claude` is unknown \
-                 ({WHY_IT_MATTERS})"
+            Witness::Unreadable(why) => RegistryAnswer::Undecided(format!(
+                "{why}, so whether pid {pid} in the pane is a JS-runtime `claude` is unknown"
             )),
         }
     }
 }
 
-/// The pids of `roots`' subtrees that only the registry can settle — every one
-/// whose image is not a `claude` — each with the start time the snapshot
-/// gives it, for the record's identity check.
+/// The pids of `roots`' subtrees that the image does not already prove a
+/// `claude` — every one the registry may name — each with the start time the
+/// snapshot gives it, for the record's identity check.
 fn registry_candidates(roots: &[u32], snapshot: &ProcessSnapshot) -> Vec<LivePid> {
     let mut seen = BTreeSet::new();
     roots
@@ -515,21 +583,41 @@ fn registry_candidates(roots: &[u32], snapshot: &ProcessSnapshot) -> Vec<LivePid
         .collect()
 }
 
+/// The config dirs to read the registry from: the discovered ones, then each
+/// candidate's own `CLAUDE_CONFIG_DIR` as `pid_config_dir` reports it, first
+/// seen first and without repeats.
+fn with_pid_config_dirs(
+    discovered: Vec<PathBuf>,
+    candidates: &[LivePid],
+    pid_config_dir: impl Fn(u32) -> Option<String>,
+) -> Vec<PathBuf> {
+    let mut dirs = discovered;
+    for candidate in candidates {
+        if let Some(dir) = pid_config_dir(candidate.pid).map(PathBuf::from) {
+            if !dirs.contains(&dir) {
+                dirs.push(dir);
+            }
+        }
+    }
+    dirs
+}
+
 /// Read the witness for `candidates` from `config_dirs`. Blocking file I/O.
-pub fn registry_witness_from(
+fn registry_witness_from(
     config_dirs: &[PathBuf],
     candidates: &[LivePid],
     proc_start: &dyn Fn(u32) -> Option<String>,
 ) -> RegistryWitness {
     let readings =
         claude_activity::read_records(config_dirs, candidates, proc_start, RecordDepth::Identity);
+    UNLISTABLE_SESSIONS_LOG.observe(&readings.unlistable);
     if !readings.unlistable.is_empty() {
         let dirs: Vec<String> = readings
             .unlistable
             .iter()
             .map(ToString::to_string)
             .collect();
-        return RegistryWitness::Unreadable(format!(
+        return RegistryWitness::unreadable(format!(
             "Claude Code's session registry could not be listed ({})",
             dirs.join("; ")
         ));
@@ -546,24 +634,37 @@ pub fn registry_witness_from(
             RecordReading::Unparseable => {
                 undecided.insert(pid, "could not be read or parsed".to_string());
             }
+            RecordReading::LateStamp => {
+                undecided.insert(
+                    pid,
+                    "is stamped later than its process's start allows".to_string(),
+                );
+            }
             RecordReading::Unlisted => {
                 undecided.insert(pid, "may sit in a dir that could not be listed".to_string());
             }
             RecordReading::Missing | RecordReading::PidReused => {}
         }
     }
-    RegistryWitness::Read { named, undecided }
+    RegistryWitness(Witness::Read { named, undecided })
 }
 
 /// The registry witness for `roots`' subtrees in `snapshot`, over the runner's
-/// known config dirs: off the async executor, bounded by
-/// [`REGISTRY_READ_TIMEOUT`] and [`MAX_REGISTRY_READS_IN_FLIGHT`]. A look whose
-/// subtrees hold only `claude` images needs no read and takes none.
+/// known config dirs plus each candidate's own: off the async executor,
+/// bounded by [`REGISTRY_READ_TIMEOUT`] and [`MAX_REGISTRY_READS_IN_FLIGHT`].
+/// A look whose subtrees hold only `claude` images needs no read and takes
+/// none.
 pub async fn read_registry_witness(roots: &[u32], snapshot: &ProcessSnapshot) -> RegistryWitness {
     read_registry_witness_with(
         roots,
         snapshot,
-        crate::terminal::transcript::find_claude_config_dirs,
+        |candidates: &[LivePid]| {
+            with_pid_config_dirs(
+                crate::terminal::transcript::find_claude_config_dirs(),
+                candidates,
+                crate::process_capture::process_tree::config_dir_of_pid,
+            )
+        },
         claude_activity::proc_start_ticks,
         REGISTRY_READ_TIMEOUT,
         &REGISTRY_READS_IN_FLIGHT,
@@ -572,7 +673,7 @@ pub async fn read_registry_witness(roots: &[u32], snapshot: &ProcessSnapshot) ->
 }
 
 /// [`read_registry_witness`] with every input injected. The config dirs are
-/// resolved INSIDE the blocking read, because discovering them reads the
+/// resolved INSIDE the blocking read, because finding them reads the
 /// filesystem too.
 async fn read_registry_witness_with<D>(
     roots: &[u32],
@@ -583,14 +684,14 @@ async fn read_registry_witness_with<D>(
     in_flight: &'static AtomicUsize,
 ) -> RegistryWitness
 where
-    D: FnOnce() -> Vec<PathBuf> + Send + 'static,
+    D: FnOnce(&[LivePid]) -> Vec<PathBuf> + Send + 'static,
 {
     let candidates = registry_candidates(roots, snapshot);
     if candidates.is_empty() {
-        return RegistryWitness::naming(&[]);
+        return RegistryWitness::nothing_to_decide();
     }
     let Some(slot) = InFlightRead::claim(in_flight) else {
-        return RegistryWitness::Unreadable(format!(
+        return RegistryWitness::unreadable(format!(
             "{MAX_REGISTRY_READS_IN_FLIGHT} earlier Claude Code session-registry reads are still \
              in flight"
         ));
@@ -599,14 +700,18 @@ where
         // Released when the read ENDS (or unwinds), not when the caller stops
         // waiting for it.
         let _slot = slot;
-        registry_witness_from(&config_dirs(), &candidates, &proc_start)
+        registry_witness_from(
+            &config_dirs(candidates.as_slice()),
+            &candidates,
+            &proc_start,
+        )
     });
     match tokio::time::timeout(timeout, read).await {
         Ok(Ok(witness)) => witness,
-        Ok(Err(e)) => RegistryWitness::Unreadable(format!(
+        Ok(Err(e)) => RegistryWitness::unreadable(format!(
             "the Claude Code session-registry read failed ({e})"
         )),
-        Err(_) => RegistryWitness::Unreadable(format!(
+        Err(_) => RegistryWitness::unreadable(format!(
             "the Claude Code session-registry read exceeded {timeout:?}"
         )),
     }
@@ -696,8 +801,10 @@ impl PaneLook {
 }
 
 /// Every live `claude` in the inclusive subtree, root first then
-/// breadth-first: a pid whose image is a `claude`, or one `registry` names.
-/// `Err` when the registry cannot settle a pid the image leaves open.
+/// breadth-first: a pid whose image is a `claude`, or one `registry` names
+/// (whatever its image). `Err` when the registry cannot settle a pid whose
+/// image could be a JS-runtime Claude Code; any other undecided pid is judged
+/// by its image.
 fn subtree_claude_pids(
     root_pid: u32,
     snapshot: &ProcessSnapshot,
@@ -705,7 +812,16 @@ fn subtree_claude_pids(
 ) -> Result<Vec<u32>, String> {
     let mut pids = Vec::new();
     for pid in inclusive_subtree_pids(root_pid, snapshot) {
-        if is_countable_claude(pid, snapshot) || registry.names_live_claude(pid)? {
+        let live = is_countable_claude(pid, snapshot)
+            || match registry.answer_for(pid) {
+                RegistryAnswer::Named => true,
+                RegistryAnswer::NotNamed => false,
+                RegistryAnswer::Undecided(why) if may_be_js_runtime_claude(pid, snapshot) => {
+                    return Err(why)
+                }
+                RegistryAnswer::Undecided(_) => false,
+            };
+        if live {
             pids.push(pid);
         }
     }
@@ -1224,7 +1340,7 @@ pub(crate) mod fake_process_table {
                 let registry = super::read_registry_witness_with(
                     &[root_pid],
                     &scripted.snapshot,
-                    move || config_dirs,
+                    move |_| config_dirs,
                     scripted.proc_start,
                     super::REGISTRY_READ_TIMEOUT,
                     &super::REGISTRY_READS_IN_FLIGHT,
@@ -1572,11 +1688,16 @@ mod tests {
     }
 
     /// The record Claude Code writes for a process that began at `started_s`
-    /// (epoch seconds): `startedAt` one second later, the lag it always shows.
+    /// (epoch seconds): `startedAt` one second later, inside the +0.9 s to
+    /// +78 s lag `claude_activity::START_LEAD_MS` documents as measured.
     fn npm_record(pid: u32, started_s: i64) -> String {
+        npm_record_stamped(pid, started_s * 1000 + 1_000)
+    }
+
+    /// The same record with an explicit `startedAt` (epoch millis).
+    fn npm_record_stamped(pid: u32, started_at_ms: i64) -> String {
         format!(
-            r#"{{"pid":{pid},"sessionId":"npm-session","status":"idle","startedAt":{}}}"#,
-            started_s * 1000 + 1_000
+            r#"{{"pid":{pid},"sessionId":"npm-session","status":"idle","startedAt":{started_at_ms}}}"#
         )
     }
 
@@ -1639,8 +1760,10 @@ mod tests {
         }
     }
 
-    /// A `sessions` path that is not a directory is unlistable too.
-    #[cfg(unix)]
+    /// A `sessions` path that is not a directory is unlistable too, and a
+    /// pane whose shell runs a `node` reads UNKNOWN under it. Not gated on the
+    /// platform or the user: unlike a mode-000 dir this is unlistable to root
+    /// and on Windows, where an npm `claude` is `node.exe`.
     #[tokio::test]
     async fn a_sessions_path_that_is_not_a_directory_reads_unknown() {
         let root = tempfile::tempdir().unwrap();
@@ -1652,6 +1775,84 @@ mod tests {
             probe_claude_under(Some(pane.root_pid), vec![]).await,
             ClaudeProbe::Unreadable(_)
         ));
+    }
+
+    /// A shell running a NATIVE `claude` stays readable — and live — under a
+    /// `sessions` dir that cannot be listed: the image settles every process
+    /// in the pane, so one bad account dir does not blind the probe to it.
+    #[tokio::test]
+    async fn a_shell_running_a_native_claude_stays_readable_under_an_unlistable_dir() {
+        const NATIVE: u32 = 7_002;
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join(".claude-file");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("sessions"), "not a directory").unwrap();
+        let pane = fake_process_table::register_table(|r| fake_process_table::ScriptedTable {
+            snapshot: snapshot(&[(r, 1, "bash", 10), (NATIVE, r, "claude", 20)]),
+            config_dirs: vec![dir],
+            proc_start: no_kernel,
+        });
+        assert_eq!(
+            probe_claude_under(Some(pane.root_pid), vec![]).await,
+            readable(&[id(NATIVE, 20)], 0, &[])
+        );
+    }
+
+    /// A record stamped MORE than `START_LAG_MS` after its process began (a
+    /// slow start, a startup dialog) is not reuse — a reused pid's stale
+    /// record always predates the live process — so the npm session it names
+    /// is never read `absent`. It is not proven either, so the pane reads
+    /// UNKNOWN.
+    #[tokio::test]
+    async fn a_late_started_at_never_reads_the_npm_session_absent() {
+        let root = tempfile::tempdir().unwrap();
+        let six_minutes_late = 20 * 1000 + 6 * 60 * 1000;
+        let late = config_dir(
+            root.path(),
+            ".claude-npm",
+            &[(NODE, npm_record_stamped(NODE, six_minutes_late))],
+        );
+        let pane = node_pane(vec![late], no_kernel);
+        match probe_claude_under(Some(pane.root_pid), vec![]).await {
+            ClaudeProbe::Unreadable(detail) => {
+                assert!(detail.contains("stamped later"), "{detail}");
+            }
+            other => panic!("a late-stamped record must not read absent, got {other:?}"),
+        }
+    }
+
+    /// Each candidate's own `CLAUDE_CONFIG_DIR` is read beside the discovered
+    /// dirs, so a `node` claude under a home discovery never found is still
+    /// seen. A dir already discovered, or reported twice, is listed once.
+    #[test]
+    fn each_candidates_own_config_dir_is_read_too() {
+        let discovered = vec![PathBuf::from("/home/u/.claude")];
+        let candidates = [
+            LivePid {
+                pid: 10,
+                process_started_ms: None,
+            },
+            LivePid {
+                pid: 11,
+                process_started_ms: None,
+            },
+            LivePid {
+                pid: 12,
+                process_started_ms: None,
+            },
+        ];
+        let env = |pid: u32| match pid {
+            10 => Some("/home/u/.claude-work".to_string()),
+            11 => Some("/home/u/.claude".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            with_pid_config_dirs(discovered, &candidates, env),
+            vec![
+                PathBuf::from("/home/u/.claude"),
+                PathBuf::from("/home/u/.claude-work"),
+            ]
+        );
     }
 
     /// `NotFound` is the one genuine absence: an account with no `sessions/`
@@ -1745,28 +1946,38 @@ mod tests {
         }
     }
 
-    /// The registry is consulted only for a pid its image leaves open: a
-    /// subtree of `claude` images reads the same whatever the registry says,
-    /// while a shell root under an unreadable registry is UNKNOWN — and so is
+    /// An undecided registry leaves open only a pid whose image could be a
+    /// JS-runtime Claude Code. A shell running a native `claude` reads the
+    /// same whatever the registry says; a shell running a `node` (or `bun`,
+    /// or an image the table could not read) is UNKNOWN — and so is it under
     /// a look that took no registry read at all.
     #[test]
-    fn the_registry_decides_only_the_pids_the_image_leaves_open() {
-        let unreadable = RegistryWitness::Unreadable("x".to_string());
-        let claude_root = snapshot(&[(100, 1, "claude", 10)]);
-        assert_eq!(
-            probe_from_snapshot(100, &claude_root, &[], &unreadable),
-            readable(&[id(100, 10)], 0, &[])
-        );
-        let shell = snapshot(&[(100, 1, "bash", 10), (200, 100, "claude", 20)]);
-        for witness in [unreadable, RegistryWitness::default()] {
-            assert!(
-                matches!(
-                    probe_from_snapshot(100, &shell, &[], &witness),
-                    ClaudeProbe::Unreadable(_)
-                ),
+    fn an_undecided_registry_leaves_open_only_a_js_runtime_image() {
+        let unreadable = RegistryWitness::unreadable("x");
+        let native = snapshot(&[(100, 1, "bash", 10), (200, 100, "claude", 20)]);
+        for witness in [unreadable.clone(), RegistryWitness::default()] {
+            assert_eq!(
+                probe_from_snapshot(100, &native, &[], &witness),
+                readable(&[id(200, 20)], 0, &[]),
                 "{witness:?}"
             );
         }
+        for runtime in ["node", "nodejs", "bun", "node.exe", "/usr/bin/node"] {
+            let js = snapshot(&[(100, 1, "bash", 10), (210, 100, runtime, 21)]);
+            assert!(
+                matches!(
+                    probe_from_snapshot(100, &js, &[], &unreadable),
+                    ClaudeProbe::Unreadable(_)
+                ),
+                "{runtime}"
+            );
+        }
+        let mut nameless = snapshot(&[(100, 1, "bash", 10), (210, 100, "node", 21)]);
+        nameless.names.remove(&210);
+        assert!(matches!(
+            probe_from_snapshot(100, &nameless, &[], &unreadable),
+            ClaudeProbe::Unreadable(_)
+        ));
     }
 
     /// A registry-named pid takes its place in the probe's root-first,
@@ -1816,7 +2027,7 @@ mod tests {
         let witness = read_registry_witness_with(
             &[100],
             &snap,
-            || -> Vec<PathBuf> { panic!("no registry read is needed") },
+            |_: &[LivePid]| -> Vec<PathBuf> { panic!("no registry read is needed") },
             no_kernel,
             REGISTRY_READ_TIMEOUT,
             &FULL,
@@ -1834,14 +2045,16 @@ mod tests {
         let witness = read_registry_witness_with(
             &[100],
             &snap,
-            Vec::new,
+            |_: &[LivePid]| Vec::new(),
             no_kernel,
             REGISTRY_READ_TIMEOUT,
             &FULL,
         )
         .await;
         assert!(
-            matches!(&witness, RegistryWitness::Unreadable(why) if why.contains("in flight")),
+            witness
+                .unreadable_reason()
+                .is_some_and(|why| why.contains("in flight")),
             "{witness:?}"
         );
         assert_eq!(FULL.load(Ordering::SeqCst), MAX_REGISTRY_READS_IN_FLIGHT);
@@ -1856,7 +2069,7 @@ mod tests {
         let witness = read_registry_witness_with(
             &[100],
             &snap,
-            || {
+            |_: &[LivePid]| {
                 std::thread::sleep(Duration::from_millis(200));
                 Vec::new()
             },
@@ -1866,7 +2079,9 @@ mod tests {
         )
         .await;
         assert!(
-            matches!(&witness, RegistryWitness::Unreadable(why) if why.contains("exceeded")),
+            witness
+                .unreadable_reason()
+                .is_some_and(|why| why.contains("exceeded")),
             "{witness:?}"
         );
         let deadline = std::time::Instant::now() + Duration::from_secs(5);

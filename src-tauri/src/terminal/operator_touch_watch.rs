@@ -252,22 +252,7 @@ pub fn scan_idle_touches_once() {
         return;
     }
 
-    // A registry that could not be read leaves every candidate its image does
-    // not settle UNDECIDED, and an unreadable `sessions/` dir does not heal
-    // between ticks — so it backs further looks off exactly as an unreadable
-    // table does, once the candidates the table alone settles are handled.
-    if let crate::terminal::graceful_exit::RegistryWitness::Unreadable(why) = look.registry() {
-        *PROBE_NOT_BEFORE_MS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = now_ms + UNREADABLE_PROBE_BACKOFF_MS;
-        warn!(
-            candidates = candidates.len(),
-            registry = %why,
-            "operator_touch_watch: Claude Code session registry unreadable — candidates it would \
-             have settled are left undecided, retrying after backoff"
-        );
-    }
-
+    let mut left_undecided = 0usize;
     for (tid, session, coord_session_id, since_ms) in candidates {
         match decide_candidate(crate::mcp::steward::pane_hosts_claude(
             &look,
@@ -278,7 +263,10 @@ pub fn scan_idle_touches_once() {
                 settle_episode(tid, since_ms);
                 continue;
             }
-            CandidateDecision::Undecided => continue,
+            CandidateDecision::Undecided => {
+                left_undecided += 1;
+                continue;
+            }
         }
 
         // `&str`, not `Option` — a terminal with no identity-seam pin reports
@@ -306,6 +294,26 @@ pub fn scan_idle_touches_once() {
                     "operator_touch_watch: idle_at_prompt enqueue failed — will retry next tick"
                 );
             }
+        }
+    }
+
+    // A registry that could not be read leaves a candidate UNDECIDED only when
+    // its pane holds a process whose image could be a JS-runtime `claude`
+    // (`node`, `bun`); the candidates the image settles were handled above. An
+    // unreadable `sessions/` dir does not heal between ticks, so when it left
+    // any candidate open, further looks back off exactly as for an unreadable
+    // table. The condition itself is logged by the probe once per transition.
+    if left_undecided > 0 {
+        if let Some(why) = look.registry().unreadable_reason() {
+            *PROBE_NOT_BEFORE_MS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = now_ms + UNREADABLE_PROBE_BACKOFF_MS;
+            tracing::debug!(
+                left_undecided,
+                registry = %why,
+                "operator_touch_watch: Claude Code session registry unreadable — undecided \
+                 candidates retried after backoff"
+            );
         }
     }
 }

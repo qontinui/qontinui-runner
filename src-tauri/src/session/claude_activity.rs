@@ -58,7 +58,11 @@
 //!      record checked on merytshost 2026-09-29); where that cannot be read,
 //!      `startedAt` is compared with the process start the census implies
 //!      (its snapshot time minus the process age) inside the ONE-SIDED window
-//!      [`START_LEAD_MS`] / [`START_LAG_MS`]. An empty or non-numeric
+//!      [`START_LEAD_MS`] / [`START_LAG_MS`]. Only a stamp EARLIER than the
+//!      window is reuse; one LATER than it is [`RecordReading::LateStamp`] —
+//!      unknown, because a reused pid's stale record always predates the live
+//!      process, so lateness is no evidence of reuse, and it is no proof of
+//!      identity either. An empty or non-numeric
 //!      `procStart` counts as absent and falls through to that `startedAt`
 //!      check. A record neither check can reach is accepted
 //!      on its `pid` match alone — the census only lists live `claude`
@@ -163,6 +167,12 @@ pub enum RecordReading {
     /// The record's start stamp disagrees with the live process's: it was
     /// written by an earlier process that held the same pid.
     PidReused,
+    /// The record's `startedAt` is LATER than [`START_LAG_MS`] after the live
+    /// process began, and no `procStart` decided. A reused pid's stale record
+    /// is always EARLIER (it was written before the live process existed), so
+    /// this is not reuse — but nor is it proof that the record is this
+    /// process's. UNKNOWN; never [`Self::PidReused`].
+    LateStamp,
     Parsed(RecordEvidence),
 }
 
@@ -303,18 +313,53 @@ fn parse_record(bytes: &str, pid: u32) -> Result<(RawRecord, RecordEvidence), ()
     Ok((raw, evidence))
 }
 
-/// Does `raw` describe the process that holds `live.pid` NOW? `Some(false)` is
-/// a positive mismatch (pid reuse); `None` means neither check could be made.
-fn same_process(
+/// How a record's identity stamp compares with the live process holding its
+/// pid. DIRECTIONAL, because the two ways out of the window mean different
+/// things: a stamp from before the live process began is an earlier holder's
+/// record, while a stamp after the window is merely unexplained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Identity {
+    /// The same process: `procStart` agrees with the kernel, or `startedAt`
+    /// falls inside the window.
+    Same,
+    /// An earlier holder of the pid wrote it: `procStart` disagrees with the
+    /// kernel (either way — a stale record can survive a reboot, when the tick
+    /// count restarts), or `startedAt` is more than [`START_LEAD_MS`] BEFORE
+    /// the live process began. The one reading that is reuse.
+    Earlier,
+    /// `startedAt` is more than [`START_LAG_MS`] AFTER the live process began.
+    /// Never reuse (see [`RecordReading::LateStamp`]), never proof either.
+    Later,
+    /// Neither check could be made.
+    Unchecked,
+}
+
+/// Does `raw` describe the process that holds `live.pid` NOW? See
+/// [`Identity`].
+fn identity_of(
     raw: &RawRecord,
     live: LivePid,
     proc_start: &dyn Fn(u32) -> Option<String>,
-) -> Option<bool> {
+) -> Identity {
     if let (Some(recorded), Some(actual)) = (raw.proc_start(), proc_start(live.pid)) {
-        return Some(recorded == actual);
+        return if recorded == actual {
+            Identity::Same
+        } else {
+            Identity::Earlier
+        };
     }
-    let lag_ms = raw.started_at? - live.process_started_ms?;
-    Some((-START_LEAD_MS..=START_LAG_MS).contains(&lag_ms))
+    let (Some(started_at), Some(process_started)) = (raw.started_at, live.process_started_ms)
+    else {
+        return Identity::Unchecked;
+    };
+    let lag_ms = started_at - process_started;
+    if lag_ms < -START_LEAD_MS {
+        Identity::Earlier
+    } else if lag_ms > START_LAG_MS {
+        Identity::Later
+    } else {
+        Identity::Same
+    }
 }
 
 /// The kernel's start time for `pid` in clock ticks since boot — field 22 of
@@ -461,6 +506,59 @@ pub struct RecordReadings {
     pub unlistable: Vec<UnlistableSessionsDir>,
 }
 
+/// One reader's memory of the unlistable `sessions/` dirs it last reported, so
+/// the condition is logged once per TRANSITION — when it appears, when its dir
+/// set changes, when it clears — rather than on every read. A graceful exit
+/// probes every half second and restart-readiness answers every Stop turn, so
+/// a per-read line would bury everything else in the log.
+pub struct UnlistableLog {
+    last: std::sync::Mutex<Option<String>>,
+    reader: &'static str,
+    consequence: &'static str,
+}
+
+impl UnlistableLog {
+    /// `reader` names who read; `consequence` says what the condition costs it.
+    pub const fn new(reader: &'static str, consequence: &'static str) -> Self {
+        Self {
+            last: std::sync::Mutex::new(None),
+            reader,
+            consequence,
+        }
+    }
+
+    /// Record what one read saw, logging only a change.
+    pub fn observe(&self, unlistable: &[UnlistableSessionsDir]) {
+        let now = (!unlistable.is_empty()).then(|| {
+            unlistable
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; ")
+        });
+        let mut last = self
+            .last
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *last == now {
+            return;
+        }
+        match &now {
+            Some(dirs) => tracing::warn!(
+                unlistable = %dirs,
+                "{}: a Claude Code sessions dir exists but cannot be listed — {}",
+                self.reader,
+                self.consequence
+            ),
+            None => tracing::info!(
+                "{}: every Claude Code sessions dir is listable again",
+                self.reader
+            ),
+        }
+        *last = now;
+    }
+}
+
 /// Read Claude Code's record for each of `pids` across `config_dirs`.
 ///
 /// Each `sessions/` dir is listed ONCE ([`list_sessions_dir`]) and only the
@@ -529,6 +627,7 @@ fn read_one(
 ) -> RecordReading {
     let mut parsed: Vec<(&Path, RawRecord, RecordEvidence)> = Vec::new();
     let mut reused = false;
+    let mut late = false;
     let mut unreadable = false;
     for (dir, path) in candidates {
         let body = match std::fs::read_to_string(path) {
@@ -548,11 +647,11 @@ fn read_one(
             unreadable = true;
             continue;
         };
-        if same_process(&raw, live, proc_start) == Some(false) {
-            reused = true;
-            continue;
+        match identity_of(&raw, live, proc_start) {
+            Identity::Same | Identity::Unchecked => parsed.push((dir.as_path(), raw, ev)),
+            Identity::Earlier => reused = true,
+            Identity::Later => late = true,
         }
-        parsed.push((dir.as_path(), raw, ev));
     }
     let first_session = parsed
         .first()
@@ -565,13 +664,15 @@ fn read_one(
         return RecordReading::Ambiguous;
     }
     let Some((dir, raw, mut ev)) = parsed.into_iter().next() else {
-        // Each candidate failed to read or parse, belonged to an earlier
-        // holder of this pid, or vanished before it could be opened. A file
-        // that could not be read OUTRANKS a reused one: it may be the live
-        // process's own record (one caught mid-write), so the pid stays
-        // undecided rather than settling on "an earlier holder's".
+        // Each candidate failed to read or parse, was stamped late, belonged
+        // to an earlier holder of this pid, or vanished before it could be
+        // opened. A file that could not be read, or one stamped late, OUTRANKS
+        // a reused one: either may be the live process's own record, so the
+        // pid stays undecided rather than settling on "an earlier holder's".
         return if unreadable {
             RecordReading::Unparseable
+        } else if late {
+            RecordReading::LateStamp
         } else if reused {
             RecordReading::PidReused
         } else {
@@ -736,6 +837,7 @@ mod tests {
             RecordReading::Unparseable,
             RecordReading::Ambiguous,
             RecordReading::PidReused,
+            RecordReading::LateStamp,
             parsed("thinking-hard", Some(1), Some(1)),
             parsed("", Some(1), Some(1)),
         ] {
@@ -999,7 +1101,8 @@ mod tests {
     /// unknown: by `procStart` where the kernel's start time is readable, by
     /// `startedAt` against the census's implied process start where it is
     /// not. The `startedAt` window is one-sided (Claude Code stamps it AFTER
-    /// the process starts), and each edge is pinned.
+    /// the process starts), and each edge is pinned. Only the EARLY side is
+    /// reuse: one past the lag edge is `LateStamp`, unknown but never reuse.
     #[test]
     fn a_record_from_an_earlier_holder_of_the_pid_is_pid_reused() {
         let root = scratch("reuse");
@@ -1023,7 +1126,7 @@ mod tests {
         rec(6, "", started + 1_000); // empty procStart = absent: startedAt decides
         rec(7, "abc", started + 1_000); // non-numeric procStart = absent too
         rec(8, "", started + START_LAG_MS); // lag edge, inclusive
-        rec(9, "", started + START_LAG_MS + 1); // one past the lag edge
+        rec(9, "", started + START_LAG_MS + 1); // one past the lag edge: late, not reused
         rec(10, "", started - START_LEAD_MS); // lead edge, inclusive
         rec(11, "", started - START_LEAD_MS - 1); // one past the lead edge
         let kernel = |pid: u32| match pid {
@@ -1056,13 +1159,42 @@ mod tests {
                 readings[&pid]
             );
         }
-        for pid in [2, 4, 9, 11] {
+        for pid in [2, 4, 11] {
             assert_eq!(readings[&pid], RecordReading::PidReused, "pid {pid}");
             assert_eq!(
                 classify_from_record(&readings[&pid], NOW),
                 Activity::Unknown
             );
         }
+        assert_eq!(readings[&9], RecordReading::LateStamp);
+        assert_eq!(classify_from_record(&readings[&9], NOW), Activity::Unknown);
+    }
+
+    /// A record stamped LATER than the lag window, beside one an earlier
+    /// holder left in another dir, is `LateStamp`: the late one may be the
+    /// live process's own record, so the pid is not settled as reused.
+    #[test]
+    fn a_late_stamp_outranks_a_reused_one() {
+        let root = scratch("late-outrank");
+        let a = root.path().join(".claude-a");
+        let b = root.path().join(".claude-b");
+        let started = NOW - 3_600_000;
+        for (dir, started_at) in [(&a, started - 86_400_000), (&b, started + 6 * MIN)] {
+            std::fs::create_dir_all(dir.join("sessions")).unwrap();
+            std::fs::write(
+                dir.join("sessions/60.json"),
+                format!(
+                    r#"{{"pid":60,"sessionId":"s60","status":"idle","startedAt":{started_at}}}"#
+                ),
+            )
+            .unwrap();
+        }
+        let live = LivePid {
+            pid: 60,
+            process_started_ms: Some(started),
+        };
+        let readings = read_records(&[a, b], &[live], &no_proc, RecordDepth::Identity);
+        assert_eq!(readings.by_pid[&60], RecordReading::LateStamp);
     }
 
     #[test]
@@ -1104,8 +1236,9 @@ mod tests {
     }
 
     /// A `sessions` that is not a directory cannot be listed, and says so —
-    /// it is not read as an account with no live session.
-    #[cfg(unix)]
+    /// it is not read as an account with no live session. Not gated on the
+    /// platform or the user: unlike a mode-000 dir it is unlistable to root
+    /// and on Windows too.
     #[test]
     fn a_sessions_path_that_is_not_a_directory_is_unlistable() {
         let root = scratch("not-a-dir");

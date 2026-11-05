@@ -762,6 +762,13 @@ pub const RECORD_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 /// [`gather_activity_evidence`].
 pub static RECORD_READ_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
+/// The unlistable-`sessions/`-dir condition as this reader last logged it.
+static UNLISTABLE_SESSIONS_LOG: claude_activity::UnlistableLog =
+    claude_activity::UnlistableLog::new(
+        "restart-readiness",
+        "every undecided process without a record elsewhere reads activity `unknown`",
+    );
+
 /// Clears the in-flight flag when dropped — i.e. when the blocking read
 /// finishes or unwinds.
 struct InFlightRead(&'static AtomicBool);
@@ -855,21 +862,9 @@ pub async fn gather_activity_evidence(
                 // An unlistable `sessions/` dir has already turned every
                 // would-be `Missing` into `Unlisted`, which classifies
                 // `unknown` — so the counts stay honest by construction. The
-                // dir is named here because nothing else says WHY those
-                // processes read unknown.
-                if !readings.unlistable.is_empty() {
-                    let dirs: Vec<String> = readings
-                        .unlistable
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect();
-                    tracing::warn!(
-                        unlistable = ?dirs,
-                        "restart-readiness: a Claude Code sessions dir exists but could not be \
-                         listed — every undecided process without a record elsewhere reads \
-                         activity `unknown`"
-                    );
-                }
+                // dir is named in the log, once per transition, because
+                // nothing else says WHY those processes read unknown.
+                UNLISTABLE_SESSIONS_LOG.observe(&readings.unlistable);
                 readings.by_pid
             }
             Ok(Err(e)) => {

@@ -6107,8 +6107,9 @@ pub(crate) mod tests {
         let registry = tempfile::tempdir().unwrap();
         let config_dir = registry.path().join(".claude-npm");
         std::fs::create_dir_all(config_dir.join("sessions")).unwrap();
-        // The process began at 20 s; Claude Code stamps `startedAt` a second
-        // after its own start, which the record's identity check expects.
+        // The process began at 20 s; `startedAt` is one second later, inside
+        // the +0.9 s to +78 s lag `claude_activity::START_LEAD_MS` documents
+        // as measured, so the record's identity check accepts it.
         std::fs::write(
             config_dir
                 .join("sessions")

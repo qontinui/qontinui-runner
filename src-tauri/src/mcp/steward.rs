@@ -1920,7 +1920,7 @@ mod tests {
         let unread = PaneLook::from_parts(
             &[100],
             table(),
-            RegistryWitness::Unreadable("a sessions dir could not be listed".to_string()),
+            RegistryWitness::unreadable("a sessions dir could not be listed"),
         );
         assert_eq!(pane_hosts_claude(&unread, Some(100)), None);
         let husk = PaneEvidence {
