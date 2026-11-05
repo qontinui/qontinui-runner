@@ -68,9 +68,17 @@ pub(crate) struct TopConsumers {
     /// runner cannot open protected or other-session processes; on Linux, a
     /// process that exited mid-scan or a hidden `/proc` entry).
     pub(crate) unreadable: u64,
-    /// Sum of `private_bytes` over every READABLE process — set against
-    /// `commit_used_bytes` it shows how much commit sits outside
-    /// process-private memory.
+    /// Sum of `private_bytes` over every READABLE process. What it may be set
+    /// against differs by OS:
+    ///
+    /// * **Windows** — a sum of `PrivateUsage`, i.e. per-process commit charge;
+    ///   set against `commit_used_bytes` it shows how much commit sits outside
+    ///   process-private memory (AWE, shared sections, kernel pools).
+    /// * **Linux** — a sum of `RssAnon + VmSwap`. It can DOUBLE-COUNT
+    ///   copy-on-write anonymous pages shared between a parent and its forked
+    ///   children, and it EXCLUDES shmem / tmpfs. It is a ranking aid, not an
+    ///   accounting identity: never subtract it from a commit or used-memory
+    ///   total.
     pub(crate) attributed_private_bytes: u64,
 }
 
@@ -117,12 +125,31 @@ pub(crate) fn collect() -> Option<TopConsumers> {
 /// Collect with an explicit cap (tests pass a large one to find their own pid
 /// on a busy box). `None` when the process table cannot be enumerated at all.
 pub(crate) fn collect_top(top_n: usize) -> Option<TopConsumers> {
-    let (rows, scanned, unreadable) = scan()?;
+    finish(scan(), top_n)
+}
+
+/// The UNKNOWN-vs-measured decision, pure so it is testable on every OS.
+///
+/// `None` when the scan itself failed, and ALSO when it "succeeded" having
+/// enumerated nothing: a live process table always holds at least the
+/// enumerating process, so `scanned == 0` is a failed enumeration, and
+/// publishing it would render an empty list as "no consumers".
+pub(crate) fn finish(
+    scan: Option<(Vec<ConsumerEntry>, u64, u64)>,
+    top_n: usize,
+) -> Option<TopConsumers> {
+    let (rows, scanned, unreadable) = scan?;
     if scanned == 0 {
-        // An enumeration that saw no process — not even this one — failed.
         return None;
     }
     Some(rank(rows, scanned, unreadable, top_n))
+}
+
+/// The file-name part of an image path (`C:\x\node.exe` → `node.exe`),
+/// splitting on either separator. `None` for an empty result.
+pub(crate) fn image_file_name(path: &str) -> Option<String> {
+    let leaf = path.rsplit(['\\', '/']).next()?.trim();
+    (!leaf.is_empty()).then(|| sanitize_name(leaf))
 }
 
 /// Format a Unix timestamp (seconds) as RFC3339 UTC.
@@ -135,8 +162,13 @@ fn rfc3339_utc(unix_secs: i64) -> Option<String> {
 
 /// Read one process by pid: `Some(entry)` when readable, `None` when
 /// `OpenProcess` or the memory query was refused (counted as `unreadable`).
+///
+/// `name` is taken from the OPENED handle (`QueryFullProcessImageNameW`), not
+/// the snapshot: between the snapshot and `OpenProcess` the pid can exit and be
+/// reused, and the handle is the one thing that names the process whose memory
+/// is being read. `snapshot_name` is the fallback only when that query fails.
 #[cfg(target_os = "windows")]
-pub(crate) fn read_process(pid: u32, name: &str) -> Option<ConsumerEntry> {
+pub(crate) fn read_process(pid: u32, snapshot_name: &str) -> Option<ConsumerEntry> {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 
@@ -147,15 +179,36 @@ pub(crate) fn read_process(pid: u32, name: &str) -> Option<ConsumerEntry> {
     }
     let counters = crate::health_monitor::process_memory_counters(handle);
     let started_at = windows_creation_time(handle);
+    let name = windows_image_name(handle).unwrap_or_else(|| sanitize_name(snapshot_name));
     // SAFETY: closing the handle we opened, exactly once.
     unsafe { CloseHandle(handle) };
     let counters = counters?;
     Some(ConsumerEntry {
         pid,
-        name: sanitize_name(name),
+        name,
         private_bytes: counters.PrivateUsage as u64,
         started_at,
     })
+}
+
+/// The image file name of an opened process. `PROCESS_QUERY_LIMITED_INFORMATION`
+/// suffices for `QueryFullProcessImageNameW`.
+#[cfg(target_os = "windows")]
+fn windows_image_name(handle: windows_sys::Win32::Foundation::HANDLE) -> Option<String> {
+    use windows_sys::Win32::System::Threading::{QueryFullProcessImageNameW, PROCESS_NAME_WIN32};
+
+    let mut buf = [0u16; 1024];
+    let mut len = buf.len() as u32;
+    // SAFETY: `buf` holds `len` u16s; on success `len` is set to the written
+    // length, excluding the terminator.
+    let ok = unsafe {
+        QueryFullProcessImageNameW(handle, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut len)
+    };
+    if ok == 0 {
+        return None;
+    }
+    let path = String::from_utf16_lossy(buf.get(..len as usize)?);
+    image_file_name(&path)
 }
 
 #[cfg(target_os = "windows")]
@@ -381,9 +434,50 @@ mod tests {
     }
 
     #[test]
+    fn finish_is_unknown_on_a_failed_or_empty_scan_and_measured_otherwise() {
+        assert_eq!(
+            finish(None, TOP_CONSUMERS_MAX),
+            None,
+            "a failed scan is UNKNOWN"
+        );
+        assert_eq!(
+            finish(Some((vec![], 0, 0)), TOP_CONSUMERS_MAX),
+            None,
+            "a scan that enumerated nothing failed — never an empty list"
+        );
+        let t = finish(Some((vec![e(1, 10), e(2, 20)], 3, 1)), TOP_CONSUMERS_MAX)
+            .expect("a non-empty scan is measured");
+        assert_eq!(
+            t.entries.iter().map(|r| r.pid).collect::<Vec<_>>(),
+            vec![2, 1]
+        );
+        assert_eq!(
+            (t.scanned, t.unreadable, t.attributed_private_bytes),
+            (3, 1, 30)
+        );
+        // All-unreadable is still a measurement: scanned > 0, nothing attributed.
+        let u = finish(Some((vec![], 4, 4)), TOP_CONSUMERS_MAX).expect("scanned > 0");
+        assert!(u.entries.is_empty());
+        assert_eq!(u.unreadable, 4);
+    }
+
+    #[test]
+    fn image_file_name_keeps_only_the_leaf() {
+        let win = ["C:", "Program Files", "nodejs", "node.exe"].join(&'\\'.to_string());
+        assert_eq!(image_file_name(&win).as_deref(), Some("node.exe"));
+        assert_eq!(image_file_name("/usr/bin/node").as_deref(), Some("node"));
+        assert_eq!(image_file_name("node.exe").as_deref(), Some("node.exe"));
+        assert_eq!(image_file_name(""), None);
+        assert_eq!(image_file_name("C:/dir/"), None);
+    }
+
+    #[test]
     fn sanitize_strips_control_chars_and_caps_length() {
         assert_eq!(sanitize_name("no\0de\n.exe"), "node.exe");
-        assert_eq!(sanitize_name(&"x".repeat(500)).chars().count(), NAME_MAX_CHARS);
+        assert_eq!(
+            sanitize_name(&"x".repeat(500)).chars().count(),
+            NAME_MAX_CHARS
+        );
     }
 
     #[test]
@@ -401,10 +495,16 @@ mod tests {
     #[test]
     fn proc_stat_starttime_survives_a_comm_with_spaces_and_parens() {
         // Fields 3..=21 are filler; field 22 (starttime) = 4242.
-        let filler = (3..=21).map(|i| i.to_string()).collect::<Vec<_>>().join(" ");
+        let filler = (3..=21)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
         let stat = format!("123 (a (weird) name) {filler} 4242 99 100");
         assert_eq!(parse_proc_stat_starttime(&stat), Some(4242));
-        assert_eq!(parse_proc_stat_btime("cpu 1 2\nbtime 1700000000\n"), Some(1_700_000_000));
+        assert_eq!(
+            parse_proc_stat_btime("cpu 1 2\nbtime 1700000000\n"),
+            Some(1_700_000_000)
+        );
     }
 
     #[test]
@@ -414,7 +514,12 @@ mod tests {
         let keys: Vec<_> = v.as_object().unwrap().keys().cloned().collect();
         assert_eq!(
             keys,
-            vec!["attributed_private_bytes", "entries", "scanned", "unreadable"]
+            vec![
+                "attributed_private_bytes",
+                "entries",
+                "scanned",
+                "unreadable"
+            ]
         );
         let entry = v["entries"][0].as_object().unwrap();
         let mut ek: Vec<_> = entry.keys().cloned().collect();
@@ -460,7 +565,10 @@ mod tests {
             .find(|r| r.pid == me)
             .expect("own pid must appear in the uncapped collector output");
         assert!(mine.private_bytes >= FLOOR as u64);
-        assert!(mine.started_at.is_some(), "started_at must resolve from /proc stat + btime");
+        assert!(
+            mine.started_at.is_some(),
+            "started_at must resolve from /proc stat + btime"
+        );
         drop(buf);
     }
 
@@ -481,9 +589,14 @@ mod tests {
         let before = read();
         // SAFETY: a fresh anonymous reservation+commit, released below.
         let p = unsafe {
-            VirtualAlloc(std::ptr::null(), ALLOC, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
+            VirtualAlloc(
+                std::ptr::null(),
+                ALLOC,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_READWRITE,
+            )
         };
-        assert!(!p.is_null(), "VirtualAlloc of 256 MiB failed");
+        assert!(!p.is_null(), "VirtualAlloc of {ALLOC} bytes failed");
         let after = read();
         let all = collect_top(usize::MAX);
         // SAFETY: releasing the region we allocated, exactly once.

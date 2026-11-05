@@ -3033,6 +3033,22 @@ MemAvailable:   15335424 kB
         &body[..end]
     }
 
+    /// `top_consumers: None` must OMIT the key (UNKNOWN), never serialize it as
+    /// `null` or as an empty object; `Some` must serialize it.
+    #[test]
+    fn top_consumers_none_omits_the_key_and_some_publishes_it() {
+        let mut s = ResourceSample::empty(Lane::Host, None);
+        let v = serde_json::to_value(&s).unwrap();
+        assert!(
+            v.as_object().unwrap().get("top_consumers").is_none(),
+            "None must omit the key entirely: {v}"
+        );
+        s.top_consumers = crate::fleet::top_consumers::finish(Some((vec![], 2, 2)), 5);
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(v["top_consumers"]["scanned"], 2);
+        assert_eq!(v["top_consumers"]["entries"], serde_json::json!([]));
+    }
+
     /// The production source of `fleet::top_consumers`, test module split off
     /// for the same reason as [`collect_host_lane_src`].
     fn top_consumers_prod_src() -> &'static str {
