@@ -529,17 +529,34 @@ jobs:
       #   3. A WARM, PERSISTENT TARGET. actions/checkout cleans with `git clean
       #      -ffdx`, which deletes ./target on every job. So the target lives
       #      outside the workspace, under the account's persistent home
-      #      (CI_POOL_HOME, set above), ONE per runner registration (two jobs
-      #      never share a cargo build lock), and ./target is a symlink to it:
-      #      the clean removes the link, never the tree behind it.
+      #      (CI_POOL_HOME, set above), in a slot of a fixed pool
+      #      (.github/scripts/ci-cache-slot.sh: K slots, default 2 here,
+      #      because 4 slots would leave B/4 per entry; tune with repo var
+      #      CI_CACHE_SLOTS after measuring a warm slot on nawa. The root's
+      #      total is bounded by B,
+      #      default 64 GiB, repo var CI_CACHE_BUDGET_GIB), and ./target is a
+      #      symlink to it: the clean removes the link, never the tree behind
+      #      it. A slot is flock-held for the whole job, so two jobs never
+      #      share a cargo build lock; with every slot held the job builds
+      #      cold under $RUNNER_TEMP.
+      #      It used to be ONE per runner registration, which an org-wide pool
+      #      multiplied without bound (plan
+      #      2026-11-04-devops-ci-persistent-target-caches-keyed-per-registration-grow-without-bound-on-the-org-pool),
+      #      so the helper also reaps those legacy per-registration dirs.
+      #      RUSTUP_HOME stays the account's shared one (set above).
       #      CARGO_TARGET_DIR is deliberately NOT set. The link is added to
       #      .git/info/exclude, because `target/` in .gitignore does not match
       #      a symlink, and build.rs's `git status --porcelain` would otherwise
-      #      stamp every pool build dirty. Bounded: a target over 150 GiB, under
-      #      60 GiB free on its filesystem, or unreadable, starts cold.
+      #      stamp every pool build dirty. Bounded: a target over min(150 GiB,
+      #      B/K) or unreadable starts cold; over B in total, or under 60 GiB
+      #      free on its filesystem, other unlocked slots are evicted first,
+      #      then this job's target.
       - name: "Self-hosted: system packages, compile caps and the persistent target"
         if: runner.environment == 'self-hosted'
         shell: bash
+        env:
+          CI_CACHE_SLOTS: ${{ vars.CI_CACHE_SLOTS || '2' }}
+          CI_CACHE_BUDGET_GIB: ${{ vars.CI_CACHE_BUDGET_GIB }}
         run: |
           set -euo pipefail
 
@@ -552,7 +569,7 @@ jobs:
           else
             missing="$missing pkg-config"
           fi
-          for tool in cc make curl wget file git python3; do
+          for tool in cc make curl wget file git python3 flock; do
             command -v "$tool" >/dev/null || missing="$missing $tool"
           done
           python3 -c 'import yaml' 2>/dev/null || missing="$missing python3-yaml"
@@ -585,23 +602,15 @@ jobs:
           echo "VITEST_MAX_WORKERS=$vitest_workers" >> "$GITHUB_ENV"
           echo "memory budget $((budget_kb / 1048576)) GiB, nproc $cpus -> CARGO_BUILD_JOBS=$jobs RUST_TEST_THREADS=$threads VITEST_MAX_WORKERS=$vitest_workers"
 
-          cache="$CI_POOL_HOME/.cache/qontinui-runner-ci/$RUNNER_NAME/target"
-          mkdir -p "$cache"
-          if ! used_kb=$(du -sk "$cache" 2>/dev/null | cut -f1) || [ -z "$used_kb" ]; then
-            echo "::notice title=persistent target reset::du could not read $cache: starting cold"
-            chmod -R u+rwX "${cache:?}" 2>/dev/null || true
-            rm -rf "${cache:?}"
-            mkdir -p "$cache"
-            used_kb=0
-          fi
-          free_kb=$(df -Pk "$cache" | awk 'NR == 2 {print $4}')
-          if [ "$used_kb" -gt $((150 * 1048576)) ] || [ "$free_kb" -lt $((60 * 1048576)) ]; then
-            echo "::notice title=persistent target reset::$((used_kb / 1048576)) GiB used, $((free_kb / 1048576)) GiB free on its filesystem: starting cold"
-            chmod -R u+rwX "${cache:?}" 2>/dev/null || true
-            rm -rf "${cache:?}"
-            mkdir -p "$cache"
-            used_kb=0
-          fi
+          # A slot of a bounded pool, flock-held for the whole job (see 3.
+          # above); it is bounded (unreadable, over its bound, or under the
+          # free-space floor: cold) and created before this returns.
+          # shellcheck source=/dev/null
+          . .github/scripts/ci-cache-slot.sh
+          ci_cache_slot_select --root "$CI_POOL_HOME/.cache/qontinui-runner-ci" \
+            --budget-gib 64 --entry-bound-gib 150 --floor-gib 60 --entry target
+          cache="$CI_CACHE_ENTRY_DIR"
+          used_kb="$CI_CACHE_ENTRY_USED_KB"
           if [ -e target ] && [ ! -L target ]; then rm -rf target; fi
           ln -sfn "$cache" target
           exclude="$(git rev-parse --git-path info/exclude)"
