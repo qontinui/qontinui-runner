@@ -518,6 +518,21 @@ fn pty_holder_connect_passes_a_refused_socket_for_a_later_candidate() {
     qontinui_pty_holder::transport::connect(&dir, &pane, soon())
         .expect("the legacy listener is reached");
     assert!(accepted.join().unwrap());
+    // A candidate this user may not connect to (mode 000) is passed over too.
+    // Root ignores the mode bits, so this half is skipped as root.
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } != 0 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&preferred, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let listener = UnixListener::bind(dir.join("p1.sock.tmp")).unwrap();
+        let _ = std::fs::remove_file(&legacy);
+        std::fs::rename(dir.join("p1.sock.tmp"), &legacy).unwrap();
+        let accepted = std::thread::spawn(move || listener.accept().is_ok());
+        qontinui_pty_holder::transport::connect(&dir, &pane, soon())
+            .expect("a permission-denied candidate is passed over");
+        assert!(accepted.join().unwrap());
+        std::fs::set_permissions(&preferred, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
     // With nothing listening anywhere, the refusal is what is reported.
     let _ = std::fs::remove_file(&legacy);
     let e = qontinui_pty_holder::transport::connect(&dir, &pane, soon()).unwrap_err();

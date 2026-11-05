@@ -75,7 +75,8 @@ pub fn connect(pane_dir: &Path, pane: &PaneId, deadline: Instant) -> io::Result<
         // (`PermissionDenied`) is passed over; any other answer — a
         // connection, or a timeout from a wedged holder's full backlog — is
         // THE answer. When none answers, a refusal (a socket file with no
-        // listener: a dead holder's) is reported over a plain absence.
+        // listener: a dead holder's) is reported first, then a permission
+        // error, then a plain absence.
         let mut refused: Option<io::Error> = None;
         for path in crate::pane::socket_candidates(pane_dir, pane) {
             match unix::connect(&path, deadline) {
@@ -86,7 +87,13 @@ pub fn connect(pane_dir: &Path, pane: &PaneId, deadline: Instant) -> io::Result<
                         io::ErrorKind::ConnectionRefused | io::ErrorKind::PermissionDenied
                     ) =>
                 {
-                    refused.get_or_insert(e);
+                    let better = refused.as_ref().is_none_or(|r| {
+                        e.kind() == io::ErrorKind::ConnectionRefused
+                            && r.kind() != io::ErrorKind::ConnectionRefused
+                    });
+                    if better {
+                        refused = Some(e);
+                    }
                 }
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e),
