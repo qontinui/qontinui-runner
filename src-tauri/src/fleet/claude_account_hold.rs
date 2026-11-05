@@ -42,7 +42,7 @@
 //! | not ready, own hold, under [`RENEW_UNDER`] left | hold again with a new `until` (extends only) |
 //! | not ready, own hold, more left | nothing — so a repeat writes nothing |
 //! | not ready, drained by any other owner | nothing |
-//! | not ready, `clear`, recorded `until` still ahead | nothing, logged once: an operator undrained (until that `until`, or until an account is valid again) |
+//! | not ready, `clear`, recorded `until` still ahead | nothing, logged once: an operator undrained (until that `until`, or until a ready tick reads the lane with no own hold) |
 //! | ready, own hold | release, on the first ready reading |
 //!
 //! Then the answers: `released` / `not_owner` end it; `absent` while `me/drain`
@@ -62,8 +62,9 @@
 //! it boots again …, never on a timer". This module is a bounded timer caller,
 //! and that is the doc's concern answered rather than ignored: it re-holds only
 //! while no account is valid, never after an operator undrain until the
-//! recorded `until` passes or an account is valid again (a ready reading ends
-//! the no-account spell the undrain answered), and a renewal is about one
+//! recorded `until` passes or a ready tick reads the lane with no own hold (an
+//! account came back, ending the no-account spell the undrain answered), and a
+//! renewal is about one
 //! write per 18 h. coord's
 //! doc is coord's to amend; this note is the runner half.
 //!
@@ -284,7 +285,7 @@ pub(crate) enum Idle {
     DrainedByOther,
     /// The lane reads clear while the hold this process recorded is unexpired:
     /// an operator undrained. Respected until that `until`, or until a ready
-    /// reading ends the no-account spell.
+    /// tick whose lane read succeeds ends the no-account spell.
     OperatorUndrained {
         until: DateTime<Utc>,
     },

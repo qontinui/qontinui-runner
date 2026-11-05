@@ -806,6 +806,10 @@ mod over_http {
             ("POST", "/coord/devices/me/release") => {
                 c.releases.push(body.clone());
                 if let Some(scripted) = c.release_script.pop_front() {
+                    // A scripted `released` removed the record, as the door does.
+                    if scripted["outcome"] == "released" {
+                        c.lane = None;
+                    }
                     return axum::Json(scripted).into_response();
                 }
                 let outcome = if c.lane.is_some() {
@@ -942,6 +946,11 @@ mod over_http {
         /// `/login`: the default location now holds a live login.
         fn log_in(&self) {
             write_creds(self.default_location.path(), true);
+        }
+
+        /// The login expires again.
+        fn log_out(&self) {
+            write_creds(self.default_location.path(), false);
         }
     }
 
@@ -1132,6 +1141,9 @@ mod over_http {
         let (base, coord) = start_fake_coord().await;
         let _runner = NoAccountRunner::arrange(&base).await;
         let until = Utc::now() + chrono::Duration::hours(20);
+        // The heartbeat sees the lane go drained and reads its reason from coord,
+        // which holds the own hold.
+        lock(&coord).lane = Some((own_reason(), until));
         crate::coord_drain_state::note_heartbeat(
             crate::coord_drain_state::HeartbeatOutcome::Registered {
                 drain: DrainObservation::Drained {
@@ -1141,11 +1153,16 @@ mod over_http {
             },
         )
         .await;
-        crate::coord_drain_state::observe_me_drain(DrainObservation::Drained {
-            until: Some(until),
-            reason: Some(own_reason()),
-        });
-        // The fake coord's lane is clear: the operator already undrained.
+        assert!(
+            matches!(
+                crate::coord_drain_state::current(),
+                CoordDrainState::Drained { reason: Some(ref r), .. } if is_own_reason(Some(r.as_str()))
+            ),
+            "the heartbeat cached the own reason: {:?}",
+            crate::coord_drain_state::current()
+        );
+        // Then the operator undrains, before this process's own lane read.
+        lock(&coord).lane = None;
         let mut mem = streak(5);
         let action = account_hold_tick(&mut mem, &primary_env()).await;
         assert!(
@@ -1153,6 +1170,44 @@ mod over_http {
             "{action:?}"
         );
         assert!(lock(&coord).holds.is_empty());
+    }
+
+    /// A release answered with no `read_back` re-reads the drain, so the cache
+    /// does not keep the released hold: when the account expires again, the
+    /// runner holds again instead of taking the clear lane for an undrain.
+    #[tokio::test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "the default-location check reads the real login Keychain on macOS"
+    )]
+    async fn a_release_with_no_read_back_lets_a_later_no_account_spell_hold_again() {
+        let (base, coord) = start_fake_coord().await;
+        let runner = NoAccountRunner::arrange(&base).await;
+        let env = primary_env();
+        let mut mem = HoldMemory::default();
+        account_hold_tick(&mut mem, &env).await;
+        account_hold_tick(&mut mem, &env).await;
+        assert_eq!(lock(&coord).holds.len(), 1, "held");
+
+        runner.log_in();
+        lock(&coord)
+            .release_script
+            .push_back(serde_json::json!({ "outcome": "released" }));
+        account_hold_tick(&mut mem, &env).await;
+        {
+            let c = lock(&coord);
+            assert_eq!(c.releases.len(), 1, "released: {c:?}");
+            assert!(c.lane.is_none());
+        }
+
+        runner.log_out();
+        account_hold_tick(&mut mem, &env).await;
+        account_hold_tick(&mut mem, &env).await;
+        assert_eq!(
+            lock(&coord).holds.len(),
+            2,
+            "a new no-account spell holds again"
+        );
     }
 
     /// A runner that boots into its own hold (left by the previous run) and is
