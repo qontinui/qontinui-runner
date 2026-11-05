@@ -3916,6 +3916,8 @@ async fn read_refusal_body(mut resp: reqwest::Response) -> Result<String, String
         }
     }
     // Past the cap: discard the rest unbuffered rather than drop it unread.
+    // Trade-off: the cap bounds memory; the drain still reads the rest on every poll, bounded
+    // in time by the client's 30 s timeout.
     drain_body(resp).await;
     // Lossy rather than fatal: a cap can land mid-codepoint, and the result
     // is only ever JSON-parsed or counted. A body that is genuinely not UTF-8

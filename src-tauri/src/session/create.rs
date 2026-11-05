@@ -46,6 +46,7 @@ use std::time::Duration;
 use serde::Deserialize;
 use uuid::Uuid;
 
+use super::coord_sync::drain_body;
 use super::handoff::HandoffError;
 use super::SessionRegistry;
 use crate::mcp::remote_terminal::{create_grants, now_epoch_secs, CreateGrant};
@@ -269,8 +270,7 @@ async fn post_consumed(http: &reqwest::Client, coord_url: &str, grant_jti: &str)
             .await;
         match resp {
             Ok(r) if r.status().is_success() => {
-                // An unread HTTP/2 body is a defect on the shared client.
-                crate::session::coord_sync::drain_body(r).await;
+                drain_body(r).await;
                 tracing::debug!(
                     grant_jti,
                     attempt,
@@ -280,7 +280,7 @@ async fn post_consumed(http: &reqwest::Client, coord_url: &str, grant_jti: &str)
             }
             Ok(r) => {
                 let status = r.status();
-                crate::session::coord_sync::drain_body(r).await;
+                drain_body(r).await;
                 last = format!("HTTP {}", status.as_u16());
                 let retryable = status.is_server_error()
                     || status == reqwest::StatusCode::REQUEST_TIMEOUT

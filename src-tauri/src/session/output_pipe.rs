@@ -74,6 +74,7 @@ use uuid::Uuid;
 
 use crate::auth::TenantScope;
 
+use super::coord_sync::drain_body;
 use super::coord_sync::CoordSync;
 
 /// Flush the coalescing buffer at least this often, even if it hasn't hit
@@ -288,8 +289,7 @@ async fn flush(
                 // transient failure re-sends the same offset (idempotent
                 // on coord). On success, the bytes are durably in warm.
                 *next_offset += len;
-                // An unread HTTP/2 body is a defect on the shared client.
-                crate::session::coord_sync::drain_body(resp).await;
+                drain_body(resp).await;
             } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
                 let reason = refusal_log_reason(&resp.text().await.unwrap_or_default());
                 tracing::info!(
@@ -301,7 +301,7 @@ async fn flush(
                 // resend; the bytes are gone for the shared tail). Clearing
                 // below handles it.
             } else {
-                crate::session::coord_sync::drain_body(resp).await;
+                drain_body(resp).await;
                 tracing::debug!(
                     session = %session_id,
                     %status,

@@ -88,6 +88,7 @@ use base64::Engine;
 use serde::Deserialize;
 use uuid::Uuid;
 
+use super::coord_sync::drain_body;
 use super::handoff::HandoffError;
 use super::session_lifecycle_store::SessionLifecycleStore;
 use super::SessionRegistry;
@@ -618,8 +619,7 @@ async fn fetch_transcript_tier(
             session = %session_id,
             "session respawn: transcript fetch rejected"
         );
-        // An unread HTTP/2 body is a defect on the shared client.
-        crate::session::coord_sync::drain_body(resp).await;
+        drain_body(resp).await;
         return Vec::new();
     }
     let body: serde_json::Value = match resp.json().await {

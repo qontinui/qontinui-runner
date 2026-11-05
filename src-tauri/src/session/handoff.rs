@@ -126,6 +126,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
 
+use super::coord_sync::drain_body;
 use super::intent::Intent;
 use super::provider_adapter::RestoreTier;
 use super::restore_record_emitter::{RESTORE_RECORD_EVENT, TIER_FULL, TIER_TERMINAL_ONLY};
@@ -336,8 +337,7 @@ pub async fn trigger_handoff(
             body.chars().take(500).collect(),
         ));
     }
-    // An unread HTTP/2 body is a defect on the shared client.
-    crate::session::coord_sync::drain_body(resp).await;
+    drain_body(resp).await;
     Ok(())
 }
 
@@ -1192,10 +1192,12 @@ async fn fetch_latest_restore_record(
             session = %session_id,
             "session handoff: restore-record fetch rejected — proceeding without registry record"
         );
-        crate::session::coord_sync::drain_body(resp).await;
+        drain_body(resp).await;
         return None;
     }
 
+    // Deliberately NOT drained: the live-tail SSE never ends, so a drain would block to the
+    // deadline; dropping it resets the h2 stream instead.
     let mut resp = resp;
     let mut buf = String::new();
     let deadline = tokio::time::Instant::now() + RESTORE_RECORD_FETCH_DEADLINE;
@@ -1515,8 +1517,7 @@ pub(super) async fn reacquire_claim(
             text.chars().take(200).collect(),
         ));
     }
-    // An unread HTTP/2 body is a defect on the shared client.
-    crate::session::coord_sync::drain_body(resp).await;
+    drain_body(resp).await;
     Ok(())
 }
 
@@ -1544,8 +1545,7 @@ async fn close_source(
             text.chars().take(200).collect(),
         ));
     }
-    // An unread HTTP/2 body is a defect on the shared client.
-    crate::session::coord_sync::drain_body(resp).await;
+    drain_body(resp).await;
     Ok(())
 }
 

@@ -6,6 +6,10 @@
 //! the loopback socket buffers can absorb: the server's body stream can only
 //! reach its end when the client actually reads it. A caller that drops the
 //! response unread closes the connection and the stream never completes.
+//!
+//! Assumption: the loopback socket buffers hold far less than one body. The
+//! Linux defaults cap tcp_rmem at 6 MiB and tcp_wmem at 4 MiB (~10 MiB
+//! together), so a 64 MiB body leaves a ~6x margin.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -15,9 +19,9 @@ use axum::body::{Body, Bytes};
 use axum::http::{StatusCode, Uri};
 use axum::response::Response;
 
-/// 64 KiB per chunk x 256 = 16 MiB per body.
+/// 64 KiB per chunk x 1024 = 64 MiB per body.
 const CHUNK_LEN: usize = 64 * 1024;
-const CHUNKS: usize = 256;
+const CHUNKS: usize = 1024;
 static CHUNK: [u8; CHUNK_LEN] = [b' '; CHUNK_LEN];
 
 /// A fixed answer for one exact path, served instead of the probe body (not
