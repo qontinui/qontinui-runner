@@ -54,9 +54,7 @@ use serde::Serialize;
 use tracing::{info, warn};
 
 use crate::session::session_ledger::{observe_row, LiveView, Observed};
-use crate::session::session_lifecycle_store::{
-    SessionLifecycleStore, TerminalSessionRecord, RESTORE_TIER_TERMINAL_ONLY,
-};
+use crate::session::session_lifecycle_store::{SessionLifecycleStore, TerminalSessionRecord};
 use crate::session::shutdown_marker::BootClassification;
 use crate::session::snapshot_history::{is_restorable_identity, TranscriptProbe};
 
@@ -371,10 +369,10 @@ pub fn latched() -> Option<&'static BootCensus> {
 ///   [`Observed::Back`]) is a
 ///   restore — including a pane this boot ADOPTED with its `claude` still
 ///   running, which carries no restore stamp at all;
-/// - an unverified `terminal-only`-tier stamp is NOT a restore — a terminal
-///   came back, the conversation did not — so it is counted in
-///   `terminal_only`, neither restored nor missing, and the verdict is not
-///   `match`;
+/// - an OPEN row the ledger observes [`Observed::TerminalOnly`] is NOT a
+///   restore — a terminal came back, the conversation did not — so it is
+///   counted in `terminal_only`, neither restored nor missing, and the
+///   verdict is not `match` (a closed one is `missing`, as on the ledger);
 /// - any other unverified stamp (a `failed` tier: attempted, not landed) is
 ///   NOT a restore either — the tile may exist but the session did not come
 ///   back, so it is `missing` / [`MISSING_RESUME_FAILED`];
@@ -420,8 +418,9 @@ pub fn diff_census(
             continue;
         }
         let verified = obs.observed == Some(Observed::Back);
-        let bare_terminal = obs.restore_tier.as_deref() == Some(RESTORE_TIER_TERMINAL_ONLY)
-            && obs.observed != Some(Observed::Unknown);
+        // The ledger's own verdict, so a CLOSED terminal-only stamp (missing
+        // there) is not a bare terminal here either.
+        let bare_terminal = obs.observed == Some(Observed::TerminalOnly);
         if !verified && !bare_terminal {
             // Attempted and not landed — accounted for under `missing` below,
             // never as a restore.
@@ -623,7 +622,9 @@ pub fn build_census(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::session_lifecycle_store::{RESTORE_TIER_FAILED, RESTORE_TIER_RESUMED};
+    use crate::session::session_lifecycle_store::{
+        RESTORE_TIER_FAILED, RESTORE_TIER_RESUMED, RESTORE_TIER_TERMINAL_ONLY,
+    };
 
     fn expected(id: &str, restorable: bool) -> CensusExpected {
         CensusExpected {

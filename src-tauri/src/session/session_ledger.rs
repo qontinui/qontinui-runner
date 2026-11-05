@@ -1220,6 +1220,10 @@ pub fn registry_now(store: &SessionLifecycleStore) -> RegistryNow {
 /// below `Back` because an unreadable pane might be the one that IS back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Observed {
+    /// A CLOSED row this boot attempted to restore and never verified. It is
+    /// `missing` — nothing holds it and the resume door takes it — with the
+    /// honest reason `resume-failed`, never "nothing tried".
+    StampedClosed,
     /// Bound to a live terminal (or restored as one) in which no `claude` runs.
     TerminalOnly,
     /// A resume was attempted this boot and ended without landing.
@@ -1277,6 +1281,20 @@ fn unique_sessions(led: &SessionLedger) -> Vec<LedgerEntry> {
         .collect()
 }
 
+/// Why a `missing` session is missing — the census's vocabulary. A session
+/// never identity-restorable is not a restore defect; one this boot tried
+/// and failed to bring back is `resume-failed`; otherwise nothing tried.
+fn missing_reason(restorable: Option<bool>, attempted: bool) -> &'static str {
+    match (restorable, attempted) {
+        (Some(false), _) => "not-restorable",
+        (_, true) => "resume-failed",
+        (Some(true), false) => "no-attempt",
+        // Never "not-restorable": that sentence tells the operator the
+        // conversation could not have come back, which we do not know.
+        (None, false) => "restorability-unknown",
+    }
+}
+
 /// PURE classification of one prior ledger against what this boot observed.
 ///
 /// Back wins (it came back, finished or not); otherwise a FINISHED session —
@@ -1324,24 +1342,24 @@ fn classify(
                 Observed::TerminalOnly => c.terminal_only.push(out(OUTCOME_TERMINAL_ONLY)),
                 Observed::Failed => c.failed.push(out(OUTCOME_FAILED)),
                 Observed::Unknown => c.unknown.push(out(OUTCOME_UNKNOWN)),
+                Observed::StampedClosed => c.missing.push(outcome_of(
+                    e,
+                    OUTCOME_MISSING,
+                    Some(missing_reason(e.restorable, true)),
+                    false,
+                )),
                 // Taken by the first arm; spelled so the match is total.
                 Observed::Back => c
                     .returned
                     .push(outcome_of(e, OUTCOME_BACK, None, is_finished)),
             }
         } else {
-            // Two honest reasons, and no third: a session that was never
-            // identity-restorable is not a restore defect, and everything else
-            // is simply "nothing brought it back".
-            let reason = match e.restorable {
-                Some(true) => "no-attempt",
-                Some(false) => "not-restorable",
-                // Never "not-restorable": that sentence tells the operator the
-                // conversation could not have come back, which we do not know.
-                None => "restorability-unknown",
-            };
-            c.missing
-                .push(outcome_of(e, OUTCOME_MISSING, Some(reason), false));
+            c.missing.push(outcome_of(
+                e,
+                OUTCOME_MISSING,
+                Some(missing_reason(e.restorable, false)),
+                false,
+            ));
         }
     }
 
@@ -1684,49 +1702,63 @@ pub struct LiveView {
 /// "nothing is live". An unreadable process table leaves every pane's read an
 /// `Err`, which [`observe_returns`] reads as [`Observed::Unknown`].
 ///
-/// Memoised for [`LIVE_VIEW_TTL`]: the ledger, the census and the strip's
-/// refreshes each ask, and one process-table read (PowerShell WMI on
-/// Windows) answers them all. A memo rather than a roster-only bypass,
-/// because it bounds every caller at one place — including the ones that DO
-/// need the live read — with no per-route flag to keep right.
+/// The live terminal SET is read fresh on every request. The pane reads
+/// (one process-table read, PowerShell WMI on Windows) are memoised for
+/// [`LIVE_VIEW_TTL`] and reused only while that set is identical, so a pane
+/// that appeared or went since — a resume that just landed — is always read
+/// fresh. A memo rather than a roster-only bypass, because it bounds every
+/// caller at one place, including the ones that DO need the live read.
+///
+/// Single flight: the memo's lock is held across the refill, so concurrent
+/// misses share one read and no slow older read can overwrite a newer one.
+/// The entry is stamped when its read COMPLETES.
 pub async fn live_view<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Option<LiveView> {
     use tauri::Manager;
     let tm = app
         .try_state::<std::sync::Arc<crate::terminal::TerminalManager>>()?
         .inner()
         .clone();
-    let now = std::time::Instant::now();
-    let cached = memo_fresh(
-        &live_view_memo().lock().unwrap_or_else(|e| e.into_inner()),
-        now,
-    );
-    if cached.is_some() {
-        return cached;
-    }
+    let mut memo = live_view_memo().lock().await;
     let terminals = alive_terminal_ids(tm.list(), crate::process_capture::health::pid_alive);
+    if let Some(view) = memo_reuse(memo.as_ref(), &terminals, std::time::Instant::now()) {
+        return Some(view);
+    }
     let panes = proc_read::read_panes(&tm, terminals.iter().cloned()).await;
     let view = LiveView { terminals, panes };
-    *live_view_memo().lock().unwrap_or_else(|e| e.into_inner()) = Some((now, view.clone()));
+    *memo = Some(PaneMemo {
+        read_at: std::time::Instant::now(),
+        view: view.clone(),
+    });
     Some(view)
 }
 
-/// How long one [`live_view`] read serves later requests.
+/// How long one [`live_view`] pane read serves later requests.
 pub const LIVE_VIEW_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 
-fn live_view_memo() -> &'static Mutex<Option<(std::time::Instant, LiveView)>> {
-    static MEMO: OnceLock<Mutex<Option<(std::time::Instant, LiveView)>>> = OnceLock::new();
-    MEMO.get_or_init(|| Mutex::new(None))
+/// One completed [`live_view`] read and when it completed.
+#[derive(Debug, Clone)]
+struct PaneMemo {
+    read_at: std::time::Instant,
+    view: LiveView,
 }
 
-/// PURE: the memoised view when it was read less than [`LIVE_VIEW_TTL`]
-/// before `now`.
-fn memo_fresh(
-    memo: &Option<(std::time::Instant, LiveView)>,
+fn live_view_memo() -> &'static tokio::sync::Mutex<Option<PaneMemo>> {
+    static MEMO: OnceLock<tokio::sync::Mutex<Option<PaneMemo>>> = OnceLock::new();
+    MEMO.get_or_init(|| tokio::sync::Mutex::new(None))
+}
+
+/// PURE: the memoised view, only when it completed less than
+/// [`LIVE_VIEW_TTL`] before `now` AND was read over exactly the live
+/// `terminals` this request sees.
+fn memo_reuse(
+    memo: Option<&PaneMemo>,
+    terminals: &HashSet<String>,
     now: std::time::Instant,
 ) -> Option<LiveView> {
-    memo.as_ref()
-        .filter(|(at, _)| now.saturating_duration_since(*at) < LIVE_VIEW_TTL)
-        .map(|(_, view)| view.clone())
+    memo.filter(|m| {
+        now.saturating_duration_since(m.read_at) < LIVE_VIEW_TTL && m.view.terminals == *terminals
+    })
+    .map(|m| m.view.clone())
 }
 
 /// The ids of the listed terminals whose PTY process is actually alive. The
@@ -1869,9 +1901,10 @@ pub fn observe_row(
     }
     // A CLOSED row that never verified is not a pending outcome of this
     // boot: nothing holds it, and the resume door takes it. It reads as
-    // `missing` (resumable), so every non-back outcome names an OPEN row.
+    // `missing` (resumable) — `resume-failed` when this boot tried — so every
+    // non-back, non-missing outcome names an OPEN row.
     if r.state != "open" {
-        return None;
+        return stamp.map(|_| Observed::StampedClosed);
     }
     let live_pane = live.filter(|l| r.state == "open" && l.terminals.contains(&r.terminal_id));
     let Some(view) = live_pane else {
@@ -3124,25 +3157,70 @@ mod tests {
             store.record_close(id, "pty-exit");
             assert_eq!(store.get(id).unwrap().state, "closed");
         }
-        let seen = observe_returns(&store, Some(boot), Some(&view(Vec::new())));
-        assert_eq!(seen.get("closed-shell"), None);
+        let live = view(Vec::new());
+        let seen = observe_returns(&store, Some(boot), Some(&live));
+        assert_eq!(seen.get("closed-shell"), Some(&Observed::StampedClosed));
         assert_eq!(seen.get("closed-back"), Some(&Observed::Back));
+
+        // The ledger: missing and resumable, and honest about why.
+        let prior = ledger(vec![
+            entry("closed-shell", Some(true), None),
+            entry("closed-back", Some(true), None),
+        ]);
+        let report = diff(Some(&prior), &seen, &none(), ledger(Vec::new()), true);
+        assert_eq!(report.missing.len(), 1);
+        assert_eq!(report.missing[0].claude_session_id, "closed-shell");
+        assert_eq!(report.missing[0].reason.as_deref(), Some("resume-failed"));
+        assert!(report.terminal_only.is_empty());
+
+        // The census agrees: a closed terminal-only stamp is not `terminal_only`.
+        use crate::session::restore_census::{
+            diff_census, observe_restored, CensusExpected, MISSING_RESUME_FAILED,
+        };
+        let expected: Vec<CensusExpected> = ["closed-shell", "closed-back"]
+            .iter()
+            .map(|id| CensusExpected {
+                claude_session_id: id.to_string(),
+                terminal_id: None,
+                page_id: "default".to_string(),
+                zone_index: 0,
+                account_label: None,
+                session_name: None,
+                restorable: true,
+            })
+            .collect();
+        let census = diff_census(
+            &expected,
+            &observe_restored(&store, boot, Some(&live)),
+            Some(true),
+            true,
+        );
+        assert!(census.terminal_only.is_empty(), "{census:?}");
+        assert_eq!(census.restored.len(), 1);
+        assert_eq!(census.missing.len(), 1);
+        assert_eq!(census.missing[0].reason, MISSING_RESUME_FAILED);
     }
 
-    /// One process-table read serves requests for [`LIVE_VIEW_TTL`], then
-    /// is read again.
+    /// The memo serves a pane read only within [`LIVE_VIEW_TTL`] AND while
+    /// the live terminal set is unchanged: a pane that a resume just opened
+    /// (or one that just went) forces a fresh read, so the post-queue refresh
+    /// never sees a pre-resume view.
     #[test]
-    fn the_live_view_memo_serves_within_its_ttl_only() {
+    fn the_live_view_memo_serves_only_a_fresh_read_of_the_same_terminals() {
         let at = std::time::Instant::now();
-        let memo = Some((at, view(vec![("t", Ok(Vec::new()))])));
-        assert!(memo_fresh(&memo, at).is_some());
-        assert!(memo_fresh(
-            &memo,
-            at + LIVE_VIEW_TTL - std::time::Duration::from_millis(1)
-        )
-        .is_some());
-        assert!(memo_fresh(&memo, at + LIVE_VIEW_TTL).is_none());
-        assert!(memo_fresh(&None, at).is_none());
+        let memo = PaneMemo {
+            read_at: at,
+            view: view(vec![("t", Ok(Vec::new()))]),
+        };
+        let same = view(vec![("t", Ok(Vec::new()))]).terminals;
+        assert!(memo_reuse(Some(&memo), &same, at).is_some());
+        let just_inside = at + LIVE_VIEW_TTL - std::time::Duration::from_millis(1);
+        assert!(memo_reuse(Some(&memo), &same, just_inside).is_some());
+        assert!(memo_reuse(Some(&memo), &same, at + LIVE_VIEW_TTL).is_none());
+        let resumed = view(vec![("t", Ok(Vec::new())), ("new", Ok(Vec::new()))]).terminals;
+        assert!(memo_reuse(Some(&memo), &resumed, at).is_none());
+        assert!(memo_reuse(Some(&memo), &HashSet::new(), at).is_none());
+        assert!(memo_reuse(None, &same, at).is_none());
     }
 
     /// D2: an unreadable process table is UNKNOWN, never back — and the

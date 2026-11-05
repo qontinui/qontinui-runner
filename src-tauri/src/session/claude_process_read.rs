@@ -192,39 +192,56 @@ async fn claude_procs_under(
         .map(|(key, pids)| {
             (
                 key,
-                pane_read_of(&pids, &cmdlines, &cwds, config_dir_of_pid),
+                pane_read_of(&pids, &cmdlines, &cwds, config_dir_of_pid, pid_exists),
             )
         })
         .collect())
 }
 
 /// PURE: one pane's read from the per-pid facts. A `claude` pid with no
-/// command line makes the whole pane [`PaneReadError::CmdlineUnreadable`]:
-/// dropping it would read a running `claude` as "no claude here". A cwd the
-/// kernel marks ` (deleted)` (Linux, a removed directory) is compared as the
-/// path it names.
-fn pane_read_of(
+/// command line makes the whole pane [`PaneReadError::CmdlineUnreadable`]
+/// while that pid still EXISTS (`exists`): dropping it would read a running
+/// `claude` as "no claude here". A pid that exited between the snapshot and
+/// the read is simply gone, and is skipped. A cwd the kernel marks
+/// ` (deleted)` (Linux, a removed directory) is compared as the path it names.
+pub(crate) fn pane_read_of(
     pids: &[u32],
     cmdlines: &HashMap<u32, String>,
     cwds: &HashMap<u32, String>,
     config_dir_of: impl Fn(u32) -> Option<String>,
+    exists: impl Fn(u32) -> bool,
 ) -> PaneRead {
-    pids.iter()
-        .map(|&pid| {
-            let cmdline = cmdlines
+    let mut out = Vec::with_capacity(pids.len());
+    for &pid in pids {
+        let Some(cmdline) = cmdlines.get(&pid) else {
+            if exists(pid) {
+                return Err(PaneReadError::CmdlineUnreadable);
+            }
+            continue;
+        };
+        out.push(ClaudeProc {
+            pid,
+            cmdline: cmdline.clone(),
+            cwd: cwds
                 .get(&pid)
-                .ok_or(PaneReadError::CmdlineUnreadable)?
-                .clone();
-            Ok(ClaudeProc {
-                pid,
-                cmdline,
-                cwd: cwds
-                    .get(&pid)
-                    .map(|c| without_deleted_suffix(c).to_string()),
-                config_dir: config_dir_of(pid),
-            })
-        })
-        .collect()
+                .map(|c| without_deleted_suffix(c).to_string()),
+            config_dir: config_dir_of(pid),
+        });
+    }
+    Ok(out)
+}
+
+/// Does `pid` still exist? Linux reads `/proc/<pid>`. Elsewhere the platform
+/// cannot say cheaply, so every pid is taken to exist: a missing command
+/// line then reads UNKNOWN, never "gone".
+#[cfg(target_os = "linux")]
+pub(crate) fn pid_exists(pid: u32) -> bool {
+    std::path::Path::new(&format!("/proc/{pid}")).exists()
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn pid_exists(_pid: u32) -> bool {
+    true
 }
 
 /// `/proc/<pid>/cwd` of a directory removed since reads `<path> (deleted)`.
@@ -349,19 +366,36 @@ mod tests {
         let cmd: HashMap<u32, String> = [(1, format!("claude --resume {ID}"))].into();
         let none = HashMap::new();
         assert_eq!(
-            pane_read_of(&[1, 2], &cmd, &none, |_| None),
+            pane_read_of(&[1, 2], &cmd, &none, |_| None, |_| true),
             Err(PaneReadError::CmdlineUnreadable)
         );
         // Windows' WMI timeout: an empty command-line map for found pids.
         assert_eq!(
-            pane_read_of(&[1], &none, &none, |_| None),
+            pane_read_of(&[1], &none, &none, |_| None, |_| true),
             Err(PaneReadError::CmdlineUnreadable)
         );
         // No claude pid at all is a real, readable, empty pane.
-        assert_eq!(pane_read_of(&[], &none, &none, |_| None), Ok(Vec::new()));
-        let one = pane_read_of(&[1], &cmd, &none, |_| Some("/cfg".to_string())).unwrap();
+        assert_eq!(
+            pane_read_of(&[], &none, &none, |_| None, |_| true),
+            Ok(Vec::new())
+        );
+        let one = pane_read_of(&[1], &cmd, &none, |_| Some("/cfg".to_string()), |_| true).unwrap();
         assert_eq!(one.len(), 1);
         assert_eq!(one[0].config_dir.as_deref(), Some("/cfg"));
+    }
+
+    /// A claude pid that EXITED between the snapshot and the read is gone,
+    /// not unreadable; one that still exists without a command line is.
+    #[test]
+    fn an_exited_pid_is_skipped_and_an_existing_unreadable_one_is_not() {
+        let cmd: HashMap<u32, String> = [(1, format!("claude --resume {ID}"))].into();
+        let none = HashMap::new();
+        let gone = pane_read_of(&[1, 2], &cmd, &none, |_| None, |pid| pid != 2).unwrap();
+        assert_eq!(gone.iter().map(|p| p.pid).collect::<Vec<_>>(), [1]);
+        assert_eq!(
+            pane_read_of(&[1, 2], &cmd, &none, |_| None, |_| true),
+            Err(PaneReadError::CmdlineUnreadable)
+        );
     }
 
     /// Linux marks the cwd of a removed directory ` (deleted)`; the path it
@@ -370,7 +404,7 @@ mod tests {
     fn a_deleted_cwd_is_compared_as_the_path_it_names() {
         let cmd: HashMap<u32, String> = [(1, format!("claude --resume {ID}"))].into();
         let cwd: HashMap<u32, String> = [(1, "/work (deleted)".to_string())].into();
-        let procs = pane_read_of(&[1], &cmd, &cwd, |_| None).unwrap();
+        let procs = pane_read_of(&[1], &cmd, &cwd, |_| None, |_| true).unwrap();
         assert_eq!(procs[0].cwd.as_deref(), Some("/work"));
         assert!(judge(&procs, &want(), "t").is_ok());
         assert_eq!(without_deleted_suffix("/work"), "/work");

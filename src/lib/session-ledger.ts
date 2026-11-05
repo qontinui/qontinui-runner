@@ -45,10 +45,16 @@ export type LedgerOutcomeClass =
 /**
  * Why a `missing` session is missing:
  * - `no-attempt` — it was resumable and nothing brought it back;
+ * - `resume-failed` — this boot tried to restore it and it did not land (its
+ *   row is closed now, so it can be resumed);
  * - `not-restorable` — it was never identity-restorable;
  * - `restorability-unknown` — could not be determined; NOT evidence either way.
  */
-export type LedgerMissingReason = "no-attempt" | "not-restorable" | "restorability-unknown";
+export type LedgerMissingReason =
+  | "no-attempt"
+  | "resume-failed"
+  | "not-restorable"
+  | "restorability-unknown";
 
 /** One session on the roster, as it stood when a ledger was captured. */
 export interface LedgerEntry {

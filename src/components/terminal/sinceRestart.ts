@@ -185,6 +185,7 @@ const SESSION_ID_RE = /^[a-zA-Z0-9_-]+$/;
 
 const MISSING_DETAIL: Record<string, string> = {
   "no-attempt": "it was resumable and nothing brought it back",
+  "resume-failed": "this boot tried to restore it and the resume did not land",
   "not-restorable":
     "it was never identity-restorable (unconfirmed, or no transcript), so a resume cannot bring its conversation back",
   "restorability-unknown": "whether it can be resumed could not be determined",
@@ -305,9 +306,11 @@ export function buildRow(outcome: LedgerOutcome, ctx: RowContext): SinceRestartR
     // Still open on its terminal, and whether its claude runs is unreadable.
     blockedReason = "can't resume yet: whether it is still running could not be read";
   } else if (isUnreturned(state)) {
-    // Every such row is OPEN (the backend reports a closed unverified row as
-    // `missing`), and the resume door takes closed rows only.
-    blockedReason = "can't resume yet: the session is still open on its old terminal";
+    // Every such row is recorded OPEN (the backend reports a closed
+    // unverified row as `missing`), and the resume door takes closed rows
+    // only. Whether its bound terminal is still alive is not claimed.
+    blockedReason =
+      "can't resume yet: the session is still recorded as open, and only closed sessions can be resumed from here";
   } else if (state !== "missing" && state !== "closed-by-user") {
     blockedReason = `nothing to resume: ${label}`;
   } else if (!account.known) {

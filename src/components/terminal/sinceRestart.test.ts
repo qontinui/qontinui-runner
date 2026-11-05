@@ -345,13 +345,20 @@ describe("rows the backend did not verify back", () => {
     // Plain about why: these rows are still open, and the door takes closed ones.
     for (const id of ["u", "t", "f"]) {
       expect(byId.get(id)?.blockedReason).toBe(
-        "can't resume yet: the session is still open on its old terminal",
+        "can't resume yet: the session is still recorded as open, and only closed sessions can be resumed from here",
       );
     }
     expect(byId.get("x")?.blockedReason).toBe(
       "can't resume yet: whether it is still running could not be read",
     );
     expect(rows.map((r) => r.outcome.claudeSessionId)).toEqual(["f", "u", "t", "x", "b"]);
+  });
+
+  it("a closed row whose resume failed is a resumable miss that says why", () => {
+    const row = buildRow(outcome("r", { reason: "resume-failed" }), ctx());
+    expect(row).toMatchObject({ state: "missing", selectable: true });
+    expect(row.label).toBe("missing: resume-failed");
+    expect(row.detail).toBe("this boot tried to restore it and the resume did not land");
   });
 
   it("an attempted resume on a page not opened is still the attempt, not a page wait", () => {

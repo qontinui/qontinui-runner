@@ -367,14 +367,35 @@ impl Drop for InFlight {
     }
 }
 
-/// Pure: the pid of a `claude` among `procs` (`(pid, cmdline)`) that is
-/// already running session `id`.
-fn holder_of(procs: &[(u32, String)], id: &str) -> Option<u32> {
-    procs.iter().find_map(|(pid, cmd)| {
-        (crate::process_capture::process_tree::parse_session_id_from_cmdline(cmd).as_deref()
+/// Pure: the pid of a `claude` among `procs` that is already running session
+/// `id`.
+fn holder_of(procs: &[proc_read::ClaudeProc], id: &str) -> Option<u32> {
+    procs.iter().find_map(|p| {
+        (crate::process_capture::process_tree::parse_session_id_from_cmdline(&p.cmdline).as_deref()
             == Some(id))
-        .then_some(*pid)
+        .then_some(p.pid)
     })
+}
+
+/// Pure: [`holder_of`] over the machine's `claude` pids and their command
+/// lines. A pid that still exists with no readable command line (a WMI
+/// timeout, an unreadable `/proc/<pid>/cmdline`) could be the holder, so the
+/// answer is `Err` — a refusal — never "nobody holds it".
+fn holder_among(
+    pids: &[u32],
+    cmdlines: &std::collections::HashMap<u32, String>,
+    exists: impl Fn(u32) -> bool,
+    id: &str,
+) -> Result<Option<u32>, String> {
+    let procs = proc_read::pane_read_of(
+        pids,
+        cmdlines,
+        &std::collections::HashMap::new(),
+        |_| None,
+        exists,
+    )
+    .map_err(|_| "process_cmdline_unreadable".to_string())?;
+    Ok(holder_of(&procs, id))
 }
 
 /// Is any live `claude` on this machine already running session `id`
@@ -393,8 +414,7 @@ async fn live_holder(id: &str) -> Result<Option<u32>, String> {
         .filter(|p| pt::is_countable_claude(*p, &snap))
         .collect();
     let cmdlines = pt::command_lines_for_pids(&pids).await;
-    let procs: Vec<(u32, String)> = cmdlines.into_iter().collect();
-    Ok(holder_of(&procs, id))
+    holder_among(&pids, &cmdlines, proc_read::pid_exists, id)
 }
 
 // ---------------------------------------------------------------------------
@@ -915,16 +935,30 @@ mod tests {
 
     #[test]
     fn a_live_claude_on_the_id_is_found_by_its_cmdline() {
-        let procs = vec![
+        let cmdlines: std::collections::HashMap<u32, String> = [
             (
                 7,
                 "/bin/claude --resume 11111111-1111-4111-8111-111111111111".to_string(),
             ),
             (9, format!("/bin/claude --session-id {ID}")),
-        ];
-        assert_eq!(holder_of(&procs, ID), Some(9));
-        assert_eq!(holder_of(&procs[..1], ID), None);
-        assert_eq!(holder_of(&[], ID), None);
+        ]
+        .into();
+        assert_eq!(holder_among(&[7, 9], &cmdlines, |_| true, ID), Ok(Some(9)));
+        assert_eq!(holder_among(&[7], &cmdlines, |_| true, ID), Ok(None));
+        assert_eq!(holder_among(&[], &cmdlines, |_| true, ID), Ok(None));
+    }
+
+    /// A claude whose command line cannot be read might be the holder: the
+    /// door refuses rather than conclude "nobody holds it" and fork the
+    /// transcript. A pid that exited since the snapshot is simply gone.
+    #[test]
+    fn an_unreadable_cmdline_refuses_rather_than_reads_as_no_holder() {
+        let none = std::collections::HashMap::new();
+        assert_eq!(
+            holder_among(&[7], &none, |_| true, ID),
+            Err("process_cmdline_unreadable".to_string())
+        );
+        assert_eq!(holder_among(&[7], &none, |_| false, ID), Ok(None));
     }
 
     #[test]
