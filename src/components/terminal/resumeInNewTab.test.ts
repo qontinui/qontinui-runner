@@ -20,6 +20,7 @@ vi.mock("@/lib/instance-storage", () => ({
   },
 }));
 
+import { invoke } from "@tauri-apps/api/core";
 import { recallSessionId } from "./lastKnownSessionIds";
 import {
   describeResumeFailure,
@@ -121,6 +122,36 @@ describe("resumeInNewTab", () => {
       tabId: null,
     });
     expect(createTerminal).not.toHaveBeenCalled();
+  });
+
+  it("by default refuses a session a PARTIAL registry read shows live", async () => {
+    // The production caller passes no `liveSessionIds`, so the default oracle
+    // decides. One unlistable dir elsewhere must not turn a visibly live
+    // session into "go ahead": the strict oracle would answer null here.
+    vi.mocked(invoke).mockImplementation(async (cmd: string) =>
+      cmd === "terminal_claude_session_list_live"
+        ? {
+            success: true,
+            message: null,
+            data: {
+              sessions: [{ sessionId: target.claudeSessionId, pid: 7 }],
+              unlistable: ["/home/u/.claude-x/sessions (Permission denied)"],
+              unreadableRecords: [],
+            },
+          }
+        : {},
+    );
+    try {
+      const { d, createTerminal } = deps({ liveSessionIds: undefined });
+      await expect(resumeInNewTab(d, target)).resolves.toEqual({
+        kind: "failed",
+        failure: "already-running",
+        tabId: null,
+      });
+      expect(createTerminal).not.toHaveBeenCalled();
+    } finally {
+      vi.mocked(invoke).mockImplementation(async () => ({}));
+    }
   });
 
   it("an unreadable live registry does not refuse an operator's explicit resume", async () => {

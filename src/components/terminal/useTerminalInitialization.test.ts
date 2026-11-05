@@ -1270,6 +1270,18 @@ describe("waitForHolderSweep — PTY-holder boot sweep before the restore", () =
   });
 });
 
+/** A registry read that could not see everything: one dir was unlistable. */
+const partialLiveRead = {
+  success: true,
+  message: null,
+  data: {
+    sessions: [{ sessionId: "visible-live", pid: 7 }],
+    unlistable: ["/home/u/.claude-x/sessions (Permission denied)"],
+    unreadableRecords: [],
+  },
+};
+const settledSweep = { success: true, message: null, data: { settled: true } };
+
 describe("recheckRefusedAfterSweep — sessions refused as live before the sweep settled", () => {
   beforeEach(() => {
     mockInvoke.mockReset();
@@ -1286,6 +1298,17 @@ describe("recheckRefusedAfterSweep — sessions refused as live before the sweep
     ).resolves.toEqual(["reaped-by-sweep"]);
     expect(mockInvoke).toHaveBeenCalledTimes(2);
     expect(live).toHaveBeenCalledTimes(1);
+  });
+
+  it("by default resumes nothing a PARTIAL registry read does not show", async () => {
+    // The production caller passes no `liveIds`: the default must be the
+    // STRICT oracle, because "hidden" may be live in the dir that could not
+    // be listed — resuming it would fork it.
+    mockInvoke.mockImplementation(async (cmd: unknown) =>
+      cmd === "terminal_claude_session_list_live" ? partialLiveRead : settledSweep,
+    );
+    await expect(recheckRefusedAfterSweep(["hidden"])).resolves.toEqual([]);
+    expect(mockInvoke).toHaveBeenCalledWith("terminal_claude_session_list_live");
   });
 
   it("resumes nothing when the sweep never settles", async () => {
@@ -1395,6 +1418,18 @@ describe("onHolderSessionReleased — a deferred holder died before adoption", (
     const live = vi.fn().mockResolvedValue(new Set<string>());
     await onHolderSessionReleased({ ...payload, pageId: null }, schedule, live);
     expect(schedule).toHaveBeenCalledWith("default", ["sess-1"]);
+  });
+
+  it("by default schedules nothing on a PARTIAL registry read that does not show the session", async () => {
+    // The production caller passes no `liveIds`, so the STRICT oracle must be
+    // the default: a session missing from a partial read may sit in the dir
+    // that could not be listed, and re-running its restore would fork it.
+    mockInvoke.mockImplementation(async (cmd: unknown) =>
+      cmd === "terminal_claude_session_list_live" ? partialLiveRead : settledSweep,
+    );
+    const schedule = vi.fn();
+    await expect(onHolderSessionReleased(payload, schedule)).resolves.toBe(false);
+    expect(schedule).not.toHaveBeenCalled();
   });
 });
 
