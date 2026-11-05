@@ -97,10 +97,7 @@ fn bundled_docs() -> Vec<(String, &'static str)> {
         for file in dir.files() {
             if file.path().extension().is_some_and(|e| e == "md") {
                 if let Some(text) = file.contents_utf8() {
-                    out.push((
-                        format!("fleet_skills/{}", file.path().display()),
-                        text,
-                    ));
+                    out.push((format!("fleet_skills/{}", file.path().display()), text));
                 }
             }
         }
@@ -140,8 +137,7 @@ fn is_runner_base(prefix: &str) -> bool {
     // loopback host without one. A bare word (`qontinui`, `api`, `..`) is a
     // repo or web-relay path, not the runner.
     let host = last.split(':').next().unwrap_or(last);
-    last.contains(':') && !host.is_empty()
-        || matches!(host, "localhost" | "127.0.0.1" | "[::1]")
+    last.contains(':') && !host.is_empty() || matches!(host, "localhost" | "127.0.0.1" | "[::1]")
 }
 
 /// Strip what is not part of the path: a query, a fragment, and trailing
@@ -149,7 +145,8 @@ fn is_runner_base(prefix: &str) -> bool {
 fn clean_path(raw: &str) -> String {
     let end = raw.find(['?', '#']).unwrap_or(raw.len());
     let path = raw.get(..end).unwrap_or(raw);
-    path.trim_end_matches(['.', ',', ';', ':', ')', ']']).to_string()
+    path.trim_end_matches(['.', ',', ';', ':', ')', ']'])
+        .to_string()
 }
 
 /// Every runner `/ui-bridge` literal in `text`.
@@ -309,7 +306,9 @@ fn offenders(literals: &[DocLiteral], routes: &[String]) -> Vec<String> {
         .filter(|lit| {
             let served = routes.iter().any(|r| names_served(&lit.path, r))
                 || (FAMILY_NAMES.contains(&lit.path.as_str())
-                    && routes.iter().any(|r| r.starts_with(&format!("{}/", lit.path))));
+                    && routes
+                        .iter()
+                        .any(|r| r.starts_with(&format!("{}/", lit.path))));
             let reported_removed = removed_route_replacement(lit.path.trim_end_matches('*'))
                 .is_some()
                 && (lit.paragraph.contains("deleted") || lit.paragraph.contains("removed"));
@@ -382,7 +381,10 @@ fn allow_list_is_live() {
     let literals = all_literals();
     let routes = served_route_templates();
     for (path, reason) in ALLOW_LIST {
-        assert!(!reason.trim().is_empty(), "{path}: allow-list entry needs a reason");
+        assert!(
+            !reason.trim().is_empty(),
+            "{path}: allow-list entry needs a reason"
+        );
         assert!(
             literals.iter().any(|l| l.path == *path),
             "{path}: no bundled doc names it any more — delete the allow-list entry"
@@ -436,7 +438,10 @@ curl $RUNNER/ui-bridge/health\n\
 see `/ui-bridge/vision/cache/<sha256>`, then GET /ui-bridge/vision/cache/{sha256}.\n\
 the repo qontinui/ui-bridge, the relay at https://qontinui.io/api/ui-bridge/control/x\n\
 node ../ui-bridge/packages/ui-bridge-wrapper/dist/inject-cli.cjs\n";
-    let paths: Vec<String> = extract_literals("t", text).into_iter().map(|l| l.path).collect();
+    let paths: Vec<String> = extract_literals("t", text)
+        .into_iter()
+        .map(|l| l.path)
+        .collect();
     assert_eq!(
         paths,
         vec![
@@ -457,13 +462,34 @@ fn matching_is_segment_wise() {
     assert!(names_served("/ui-bridge/invoke/{name}", r));
     assert!(!names_served("/ui-bridge/invoke/a/b", r));
     assert!(!names_served("/ui-bridge/invok", r));
-    assert!(names_served("/ui-bridge/vision/*", "/ui-bridge/vision/capture"));
-    assert!(names_served("/ui-bridge/vision/cap*", "/ui-bridge/vision/capture"));
-    assert!(!names_served("/ui-bridge/vision/cache*", "/ui-bridge/vision/capture"));
-    assert!(!names_served("/ui-bridge/control/screenshot", "/ui-bridge/control/screenshots"));
+    assert!(names_served(
+        "/ui-bridge/vision/*",
+        "/ui-bridge/vision/capture"
+    ));
+    assert!(names_served(
+        "/ui-bridge/vision/cap*",
+        "/ui-bridge/vision/capture"
+    ));
+    assert!(!names_served(
+        "/ui-bridge/vision/cache*",
+        "/ui-bridge/vision/capture"
+    ));
+    assert!(!names_served(
+        "/ui-bridge/control/screenshot",
+        "/ui-bridge/control/screenshots"
+    ));
     // A truncated or partial literal is not a route, and the route is.
-    assert!(!names_served("/ui-bridge/vision", "/ui-bridge/vision/capture"));
+    assert!(!names_served(
+        "/ui-bridge/vision",
+        "/ui-bridge/vision/capture"
+    ));
     // A catch-all route never stands in for a named one.
-    assert!(!names_served("/ui-bridge/sdk/a/b/c", "/ui-bridge/sdk/{*rest}"));
-    assert!(!names_served("/ui-bridge/sdk/ai/media/*", "/ui-bridge/sdk/{*rest}"));
+    assert!(!names_served(
+        "/ui-bridge/sdk/a/b/c",
+        "/ui-bridge/sdk/{*rest}"
+    ));
+    assert!(!names_served(
+        "/ui-bridge/sdk/ai/media/*",
+        "/ui-bridge/sdk/{*rest}"
+    ));
 }
