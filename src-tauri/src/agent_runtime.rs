@@ -618,6 +618,76 @@ pub(crate) fn append_sibling_notes(base: String, notes: &[String]) -> String {
     out
 }
 
+/// Tell a continuation that its worktree acquire FAILED and it is running in
+/// the runner's fallback cwd, after a blank line (plan
+/// `2026-10-31-continuation-worktree-acquire-failure-strands-the-allocation-and-tells-the-session-nothing`
+/// Phase 2). `cause == None` ⇒ `base` unchanged: a worktree was acquired, or
+/// none was ever intended (worktree mode off, no repos).
+///
+/// Coord's prompt still says to leave "the allocated worktree" in place, and
+/// before this note nothing contradicted it, so each such session spent a turn
+/// rediscovering the mismatch as an unexplained anomaly. The note is a
+/// runner report, labelled as a fact about the checkout and not an order,
+/// like coord's allocation notes beside it; it names one optional door and
+/// does not tell a read-only continuation to allocate. The cause is bounded
+/// to one line by the same sanitizer as coord's notes.
+pub(crate) fn append_no_worktree_note(base: String, workdir: &str, cause: Option<&str>) -> String {
+    let Some(cause) = cause else {
+        return base;
+    };
+    let cause = crate::agent_worktree::sibling_note_log_line(cause);
+    let workdir = crate::agent_worktree::sibling_note_log_line(workdir);
+    let mut out = base;
+    out.push_str(&format!(
+        "\n\nWorkspace note from the runner (a fact about your checkout, not an order): \
+         your cwd `{workdir}` is the runner's shared fallback directory, not an isolated \
+         worktree. Any worktree your prompt names was not created (cause: {cause}). \
+         Peers' uncommitted state may be here. Before writing, allocate a worktree for \
+         yourself (`qontinui-claude-config/scripts/allocate-worktree.sh` where it exists)."
+    ));
+    out
+}
+
+/// The TERMINAL presentation's full system prompt for a continuation: the
+/// runner context plus coord's brief, coord's allocation notes and the
+/// runner's no-worktree note. Pure, so both composed prompts are testable.
+fn compose_continuation_terminal_system_prompt(
+    runner_context: String,
+    brief: Option<&ContinuationBrief>,
+    sibling_notes: &[String],
+    workdir: &str,
+    no_worktree_cause: Option<&str>,
+) -> String {
+    append_no_worktree_note(
+        append_sibling_notes(
+            compose_continuation_system_prompt(runner_context, brief),
+            sibling_notes,
+        ),
+        workdir,
+        no_worktree_cause,
+    )
+}
+
+/// The HEADLESS presentation's full prompt for a continuation — the same three
+/// additions as [`compose_continuation_terminal_system_prompt`], on the prompt
+/// because this presentation has no system-prompt carrier.
+fn compose_continuation_headless_full_prompt(
+    initial_prompt: &str,
+    brief: Option<&ContinuationBrief>,
+    sibling_notes: &[String],
+    workdir: &str,
+    no_worktree_cause: Option<&str>,
+) -> String {
+    append_no_worktree_note(
+        append_sibling_notes(
+            compose_continuation_headless_prompt(initial_prompt, brief),
+            sibling_notes,
+        ),
+        workdir,
+        no_worktree_cause,
+    )
+}
+
 /// The HEADLESS half of the same seam.
 ///
 /// `Presentation::Headless` reaches `run_continuation_headless` ->
@@ -6421,14 +6491,13 @@ async fn run_gate_continuation_inner(
     // release a claim the re-delivered session holds.
     let pinned_session_id = uuid::Uuid::new_v4();
 
-    let (workdir, ctx, agent_id) = match acquire_continuation_workdir(
-        &payload.repos,
-        &intent,
-        Some(pinned_session_id),
-    )
-    .await
-    {
-        Ok(triple) => triple,
+    let ContinuationWorkdir {
+        workdir,
+        ctx,
+        agent_id,
+        no_worktree_cause,
+    } = match acquire_continuation_workdir(&payload.repos, &intent, Some(pinned_session_id)).await {
+        Ok(w) => w,
         Err(e) => {
             warn!("agent_runtime: continuation worktree acquisition failed: {e:#}");
             // The gate claim was already posted (step 2): record the honest
@@ -6476,6 +6545,7 @@ async fn run_gate_continuation_inner(
                 ctx,
                 reservation,
                 pinned_session_id,
+                no_worktree_cause.as_deref(),
             )
             .await;
             let res = res.map(|start| {
@@ -6495,12 +6565,12 @@ async fn run_gate_continuation_inner(
             // rides on the PROMPT — byte-for-byte how coord itself delivers a
             // registrant's `hint` (appended to `initial_prompt` after a blank
             // line), so the two halves of one brief arrive the same way.
-            let headless_prompt = append_sibling_notes(
-                compose_continuation_headless_prompt(
-                    &payload.initial_prompt,
-                    payload.brief.as_ref(),
-                ),
+            let headless_prompt = compose_continuation_headless_full_prompt(
+                &payload.initial_prompt,
+                payload.brief.as_ref(),
                 ctx.as_ref().map_or(&[][..], |c| c.sibling_notes.as_slice()),
+                &workdir,
+                no_worktree_cause.as_deref(),
             );
             // Known lag, accepted: the headless fn returns only after the child
             // EXITS, so on this presentation the `spawned` outcome — and the
@@ -6842,6 +6912,10 @@ async fn run_continuation_terminal(
     // `run_gate_continuation_inner`). A never-started retry pins a fresh id
     // instead; the id that actually started is returned.
     pinned_session_id: uuid::Uuid,
+    // Why the worktree acquire failed, when this continuation is running in the
+    // fallback cwd because of it; `None` when a worktree was acquired or none
+    // was intended. Becomes the runner's note in the system prompt.
+    no_worktree_cause: Option<&str>,
 ) -> anyhow::Result<TerminalStart> {
     use std::sync::Arc;
 
@@ -7105,16 +7179,16 @@ async fn run_continuation_terminal(
         // `2026-09-15-runner-policy-injection-off-sessionstart-hook-channel`), and
         // stays inline otherwise.
         let prompt_carrier = crate::session::spawn_prompt::resolve_system_prompt_carrier(Some(
-            append_sibling_notes(
-                compose_continuation_system_prompt(
-                    crate::terminal::runner_context(
-                        crate::terminal::spawn_seam_api_port(),
-                        coord_mcp,
-                        &served,
-                    ),
-                    payload.brief.as_ref(),
+            compose_continuation_terminal_system_prompt(
+                crate::terminal::runner_context(
+                    crate::terminal::spawn_seam_api_port(),
+                    coord_mcp,
+                    &served,
                 ),
+                payload.brief.as_ref(),
                 ctx.as_ref().map_or(&[][..], |c| c.sibling_notes.as_slice()),
+                workdir,
+                no_worktree_cause,
             ),
         ));
         // The marker the policy hook's route trusts as proof of delivery — taken
@@ -8248,19 +8322,20 @@ async fn run_condition_check_terminal(
 ///   order and its `workdir_not_a_checkout` / `no_isolated_worktree`
 ///   refusals), `None` context, and a fresh correlation UUID.
 /// - `Err` also when acquire succeeds but returns no worktrees.
+///
+/// `no_worktree_cause` is set only when a worktree was intended and the
+/// acquire FAILED, so the session can be told its cwd is the fallback.
 async fn acquire_continuation_workdir(
     repos: &[String],
     intent: &str,
     agent_session_id: Option<uuid::Uuid>,
-) -> anyhow::Result<(
-    String,
-    Option<crate::agent_worktree::isolated_edit::IsolatedEditContext>,
-    uuid::Uuid,
-)> {
+) -> anyhow::Result<ContinuationWorkdir> {
     use crate::agent_worktree::isolated_edit::{acquire, AcquireRequest};
 
     // Why no worktree came back, carried into a foreign repo's refusal.
     let mut no_worktree_because = String::new();
+    // Set only on a FAILED acquire: the cause the session's note carries.
+    let mut no_worktree_cause: Option<String> = None;
     if !repos.is_empty() {
         let acquired = acquire(AcquireRequest {
             repos,
@@ -8281,15 +8356,28 @@ async fn acquire_continuation_workdir(
             // "Not done here"); such a session uses the mid-session
             // `POST /agent-worktrees/edit-sibling` door.
             edit_siblings: &[],
+            // Unattended, no user waiting: retry through intermittent coord
+            // failures before taking the workspace-root fallback (plan
+            // 2026-10-31-continuation-worktree-acquire-failure-strands-the-allocation-and-tells-the-session-nothing
+            // D2/D3).
+            transport_retry: crate::agent_worktree::acquire_retry::CONTINUATION_TRANSPORT_RETRY,
         })
         .await;
-        let ctx = match settle_continuation_acquire(acquired) {
-            Ok(ctx) => Some(ctx),
-            Err(because) => {
-                no_worktree_because = because;
-                None
-            }
-        };
+        let settled = settle_continuation_acquire(acquired);
+        if let ContinuationAcquire::Failed(cause) = &settled {
+            // Names the continuation (its anchor rides on `intent`) and the
+            // pinned session id the allocate carried, so a session can join its
+            // own fallback to this line instead of inferring it from timing.
+            warn!(
+                intent = %intent,
+                agent_session_id = ?agent_session_id,
+                "agent_runtime: gate-continuation acquire failed ({cause}); \
+                 taking the fallback cwd"
+            );
+            no_worktree_cause = Some(cause.clone());
+        }
+        no_worktree_because = settled.because();
+        let ctx = settled.into_context();
         if let Some(ctx) = ctx {
             let workdir = ctx
                 .worktrees
@@ -8302,7 +8390,12 @@ async fn acquire_continuation_workdir(
             // to a fresh one for lifecycle correlation only.
             let agent_id =
                 uuid::Uuid::parse_str(&ctx.agent_id).unwrap_or_else(|_| uuid::Uuid::now_v7());
-            return Ok((workdir, Some(ctx), agent_id));
+            return Ok(ContinuationWorkdir {
+                workdir,
+                ctx: Some(ctx),
+                agent_id,
+                no_worktree_cause: None,
+            });
         }
     }
 
@@ -8367,7 +8460,58 @@ async fn acquire_continuation_workdir(
     )
     // Unprefixed: the refusal's detail must START with its stable token.
     .map_err(|e| anyhow::anyhow!(e))?;
-    Ok((workdir, None, uuid::Uuid::now_v7()))
+    Ok(ContinuationWorkdir {
+        workdir,
+        ctx: None,
+        agent_id: uuid::Uuid::now_v7(),
+        no_worktree_cause,
+    })
+}
+
+/// The working directory a gate continuation runs in, and what it knows about
+/// how it got there.
+struct ContinuationWorkdir {
+    workdir: String,
+    /// The held context when a worktree was materialized (keeps the claim
+    /// heartbeat alive).
+    ctx: Option<crate::agent_worktree::isolated_edit::IsolatedEditContext>,
+    /// coord's agent id, or a fresh one for lifecycle correlation only.
+    agent_id: uuid::Uuid,
+    /// `Some(cause)` only when a worktree was intended and the acquire
+    /// failed, so `workdir` is the fallback; the session is told so.
+    no_worktree_cause: Option<String>,
+}
+
+/// How a continuation's worktree acquire settled (plan 2026-10-31 Phase 2).
+/// Discriminated because the two no-worktree arms mean different things to the
+/// session: mode-off never intended a worktree, a failure did.
+#[derive(Debug, PartialEq, Eq)]
+enum ContinuationAcquire<C> {
+    Acquired(C),
+    /// `Ok(None)`: worktree mode is off or the acquire was declined.
+    WorktreeModeOff,
+    /// The acquire failed; the error's text.
+    Failed(String),
+}
+
+impl<C> ContinuationAcquire<C> {
+    /// The cause string carried into a foreign repo's refusal (unchanged).
+    fn because(&self) -> String {
+        match self {
+            ContinuationAcquire::Acquired(_) => String::new(),
+            ContinuationAcquire::WorktreeModeOff => {
+                "worktree mode is off or the acquire was declined".to_string()
+            }
+            ContinuationAcquire::Failed(e) => format!("worktree acquire failed: {e}"),
+        }
+    }
+
+    fn into_context(self) -> Option<C> {
+        match self {
+            ContinuationAcquire::Acquired(c) => Some(c),
+            _ => None,
+        }
+    }
 }
 
 /// The `spawn_failed` detail posted for a continuation whose cwd could not be
@@ -8402,20 +8546,14 @@ fn continuation_acquire_failure_detail(err: &str) -> String {
 /// root-first order and refuses a foreign repo with a typed reason.
 fn settle_continuation_acquire<C>(
     acquired: Result<Option<C>, crate::agent_worktree::AllocateError>,
-) -> Result<C, String> {
+) -> ContinuationAcquire<C> {
     match acquired {
-        Ok(Some(ctx)) => Ok(ctx),
+        Ok(Some(ctx)) => ContinuationAcquire::Acquired(ctx),
         Ok(None) => {
             debug!("agent_runtime: gate-continuation worktree mode off — using the fallback cwd");
-            Err("worktree mode is off or the acquire was declined".to_string())
+            ContinuationAcquire::WorktreeModeOff
         }
-        Err(e) => {
-            warn!(
-                "agent_runtime: gate-continuation acquire failed ({e}); \
-                 taking the fallback cwd"
-            );
-            Err(format!("worktree acquire failed: {e}"))
-        }
+        Err(e) => ContinuationAcquire::Failed(e.to_string()),
     }
 }
 
@@ -11174,6 +11312,85 @@ mod tests {
         assert!(
             out.ends_with("\n- qontinui/x: coord could not read .qontinui/ci.toml"),
             "{out}"
+        );
+    }
+
+    /// Plan 2026-10-31 Phase 2: a continuation that took the fallback because
+    /// its acquire FAILED says so in BOTH composed prompts — the system prompt
+    /// on the terminal presentation, the prompt on the headless one — and in
+    /// neither when a worktree was acquired or none was intended.
+    #[test]
+    fn a_fallback_session_is_told_its_cwd_in_both_presentations() {
+        let cause = "worktree acquire failed: POST https://coord/claims/acquire: \
+                     error sending request: connection refused [connect] (after 9 attempts)";
+        let term = super::compose_continuation_terminal_system_prompt(
+            "RUNNER-CTX".to_string(),
+            None,
+            &[],
+            "D:/qontinui-root",
+            Some(cause),
+        );
+        let head = super::compose_continuation_headless_full_prompt(
+            "do the follow-up",
+            None,
+            &[],
+            "D:/qontinui-root",
+            Some(cause),
+        );
+        for out in [&term, &head] {
+            assert!(out.contains("Workspace note from the runner"), "{out}");
+            assert!(out.contains("`D:/qontinui-root`"), "{out}");
+            assert!(out.contains("not an isolated worktree"), "{out}");
+            assert!(out.contains("connection refused"), "{out}");
+            assert!(out.contains("allocate-worktree.sh"), "{out}");
+        }
+        assert!(term.starts_with("RUNNER-CTX\n\n"), "{term}");
+        assert!(head.starts_with("do the follow-up\n\n"), "{head}");
+
+        // Acquired, or worktree mode off: no note on either carrier.
+        let term = super::compose_continuation_terminal_system_prompt(
+            "RUNNER-CTX".to_string(),
+            None,
+            &[],
+            "D:/w",
+            None,
+        );
+        let head =
+            super::compose_continuation_headless_full_prompt("do it", None, &[], "D:/w", None);
+        assert_eq!(term, "RUNNER-CTX");
+        assert_eq!(head, "do it");
+    }
+
+    /// The cause is forced onto one bounded line: a multi-line coord body can
+    /// neither forge extra prompt lines nor run unbounded.
+    #[test]
+    fn the_no_worktree_cause_is_one_bounded_line() {
+        let long = format!("first line\nsecond line\r\n{}", "x".repeat(5000));
+        let out = super::append_no_worktree_note("B".to_string(), "D:/r", Some(&long));
+        let note = out.strip_prefix("B\n\n").expect("blank-line separated");
+        assert!(!note.contains('\n') && !note.contains('\r'), "{note}");
+        assert!(note.contains("first line second line"), "{note}");
+        assert!(note.chars().count() < 1200, "{}", note.chars().count());
+        assert_eq!(
+            super::append_no_worktree_note("B".to_string(), "D:/r", None),
+            "B"
+        );
+    }
+
+    /// Only a FAILED acquire yields a cause; mode-off and acquired do not.
+    #[test]
+    fn only_a_failed_acquire_carries_a_note_cause() {
+        use crate::agent_worktree::AllocateError;
+        let failed =
+            super::settle_continuation_acquire::<u8>(Err(AllocateError::Other("boom".into())));
+        assert_eq!(failed, super::ContinuationAcquire::Failed("boom".into()));
+        assert_eq!(failed.because(), "worktree acquire failed: boom");
+        assert!(super::settle_continuation_acquire::<u8>(Ok(None))
+            .into_context()
+            .is_none());
+        assert_eq!(
+            super::settle_continuation_acquire(Ok(Some(3u8))).into_context(),
+            Some(3)
         );
     }
 
@@ -14479,10 +14696,22 @@ mod tests {
                 current_holder: "sibling-continuation".to_string(),
                 intent: None,
             }));
-        let because = settle_continuation_acquire(conflict).unwrap_err();
+        let settled = settle_continuation_acquire(conflict);
+        let because = settled.because();
         assert!(because.contains("claim already held"), "{because}");
-        assert!(settle_continuation_acquire::<u8>(Ok(None)).is_err());
-        assert_eq!(settle_continuation_acquire(Ok(Some(7u8))), Ok(7));
+        assert!(matches!(settled, ContinuationAcquire::Failed(_)));
+        assert_eq!(
+            settle_continuation_acquire::<u8>(Ok(None)),
+            ContinuationAcquire::WorktreeModeOff
+        );
+        assert_eq!(
+            settle_continuation_acquire::<u8>(Ok(None)).because(),
+            "worktree mode is off or the acquire was declined"
+        );
+        assert_eq!(
+            settle_continuation_acquire(Ok(Some(7u8))),
+            ContinuationAcquire::Acquired(7)
+        );
     }
 
     /// The terminal presentation's refusal arrives as text. A trust-gate

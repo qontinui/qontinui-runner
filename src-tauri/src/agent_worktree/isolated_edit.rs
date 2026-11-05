@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 
 use tracing::{info, warn};
 
+use super::acquire_retry::RetryDeadline;
 use super::{
     allocate_and_materialize_with_claim, release_claim_best_effort, spawn_heartbeat_task,
     worktree_mode_enabled, ActiveClaim, AllocateError, ClaimHeartbeatHandle, MaterializeOutcome,
@@ -255,6 +256,8 @@ impl IsolatedEditContext {
             // A grow call is a separate allocation whose primary is never
             // redirected: it declares no edit siblings.
             &[],
+            // A grow call has no transport-retry budget (plan 2026-10-31 D2).
+            RetryDeadline::none(),
         )
         .await?;
 
@@ -386,6 +389,15 @@ pub struct AcquireRequest<'a> {
     /// so its canonical checkout gets the lease and the branch switch. Empty
     /// for every caller that declares none.
     pub edit_siblings: &'a [String],
+    /// How long the acquire may keep retrying coord transport failures and
+    /// 5xx answers before it fails (plan
+    /// `2026-10-31-continuation-worktree-acquire-failure-strands-the-allocation-and-tells-the-session-nothing`
+    /// D2/D3). ONE deadline for the whole acquire, shared by the allocate and
+    /// every claim. `Duration::ZERO` makes exactly one attempt — today's
+    /// behaviour — and is what every site with a user waiting sets; only the
+    /// unattended continuation path sets
+    /// [`super::acquire_retry::CONTINUATION_TRANSPORT_RETRY`].
+    pub transport_retry: std::time::Duration,
 }
 
 /// Allocate isolated worktrees for the given repos.
@@ -418,6 +430,9 @@ pub async fn acquire(
     // Vet V1: every edit sibling is REQUESTED too, after the primary.
     let repos = super::edit_sibling::merge_edit_siblings_into_repos(req.repos, req.edit_siblings);
 
+    // One deadline for the whole acquire, computed before the allocate (D3).
+    let deadline = RetryDeadline::from_budget(req.transport_retry, tokio::time::Instant::now());
+
     let result = materialize_repos(
         &coord_http_base,
         device_id,
@@ -430,6 +445,7 @@ pub async fn acquire(
         req.spawn_tenant,
         req.shared_branch,
         req.edit_siblings,
+        deadline,
     )
     .await?;
 
@@ -511,6 +527,7 @@ async fn materialize_repos(
     spawn_tenant: Option<uuid::Uuid>,
     shared_branch: SharedBranchPolicy,
     edit_siblings: &[String],
+    deadline: RetryDeadline,
 ) -> Result<super::AllocateResult, AllocateError> {
     let mut canonical_paths: HashMap<String, PathBuf> = HashMap::with_capacity(repos.len());
     for repo in repos {
@@ -562,6 +579,7 @@ async fn materialize_repos(
         spawn_tenant,
         shared_branch,
         edit_siblings,
+        deadline,
     )
     .await
     {
@@ -606,6 +624,9 @@ async fn materialize_repos(
                 spawn_tenant,
                 shared_branch,
                 edit_siblings,
+                // The same deadline: the repo_not_registered retry does not
+                // get a second budget.
+                deadline,
             )
             .await?
         }
@@ -926,6 +947,8 @@ pub async fn acquire_for_terminal(
                 spawn_tenant,
                 shared_branch: SharedBranchPolicy::Honor,
                 edit_siblings,
+                // An interactive spawn has a user waiting: no retry budget.
+                transport_retry: std::time::Duration::ZERO,
             })
             .await;
             terminal_cwd_after_acquire(repo, acquired, working_dir, |ctx: &IsolatedEditContext| {
@@ -1030,6 +1053,7 @@ pub async fn acquire_for_worker(
         // "Not done here"); a worker that must edit one uses the mid-session
         // `POST /agent-worktrees/edit-sibling` door.
         edit_siblings: &[],
+        transport_retry: std::time::Duration::ZERO,
     })
     .await
     {
@@ -2026,6 +2050,7 @@ mod tests {
                 spawn_tenant: None,
                 shared_branch: SharedBranchPolicy::Honor,
                 edit_siblings: &[],
+                transport_retry: std::time::Duration::ZERO,
             })
             .await
             .expect("flag-off should return Ok(None), not Err");

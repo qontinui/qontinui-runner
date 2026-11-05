@@ -56,6 +56,9 @@ use tracing::{debug, info, warn};
 
 use crate::worktree::run_git_command;
 
+#[cfg(test)]
+mod acquire_flow_tests;
+pub mod acquire_retry;
 pub mod canonical_paths;
 pub mod cargo_locks;
 pub mod census;
@@ -74,8 +77,11 @@ pub mod maintenance_executor;
 pub mod on_demand;
 pub mod orphan_target_reaper;
 pub mod reclaim;
+pub(crate) mod retire_abandoned;
 pub mod session_env;
 pub(crate) mod sibling_store;
+#[cfg(test)]
+mod test_coord;
 
 /// Env var that controls the worktree-per-session spawn path. **Default ON**
 /// (Phase 2b); set to a falsy value (`0`/`false`/`no`) to opt a machine out.
@@ -278,12 +284,23 @@ fn claim_request_body(
     body
 }
 
+/// Why one `/claims/acquire` attempt produced no outcome: a transient coord
+/// failure the caller may retry within its budget (a transport error, a body
+/// read that failed, a 5xx), or a final one (any other non-success status, an
+/// unparseable fully read body, no shared client).
+#[derive(Debug)]
+enum ClaimCallError {
+    Transient(String),
+    Final(String),
+}
+
 async fn pre_allocate_claim(
     coord_http_base: &str,
     machine_id: &uuid::Uuid,
     agent_session_id: Option<uuid::Uuid>,
     ctx: &ClaimSpawnContext,
-) -> Result<AcquireOutcome, String> {
+    timeout: Duration,
+) -> Result<AcquireOutcome, ClaimCallError> {
     let url = format!("{}/claims/acquire", coord_http_base.trim_end_matches('/'));
     let mut metadata = serde_json::json!({});
     if let Some(intent) = &ctx.intent {
@@ -311,31 +328,41 @@ async fn pre_allocate_claim(
         metadata,
     );
 
-    let client =
-        crate::coord_http::coord_client().ok_or_else(|| "no shared coord client".to_string())?;
-    let resp = crate::auth::attach_device_auth_for(
-        client
-            .post(&url)
-            .timeout(Duration::from_secs(10))
-            .json(&body),
-        scope,
-    )
-    .send()
-    .await
-    .map_err(|e| format!("POST {url}: {e}"))?;
+    let client = crate::coord_http::coord_client()
+        .ok_or_else(|| ClaimCallError::Final("no shared coord client".to_string()))?;
+    let resp =
+        crate::auth::attach_device_auth_for(client.post(&url).timeout(timeout).json(&body), scope)
+            .send()
+            .await
+            .map_err(|e| {
+                ClaimCallError::Transient(format!(
+                    "POST {url}: {}",
+                    acquire_retry::describe_reqwest_error(&e)
+                ))
+            })?;
     let status = resp.status();
-    let body_text = resp
-        .text()
-        .await
-        .map_err(|e| format!("read /claims/acquire body: {e}"))?;
+    let body_text = resp.text().await.map_err(|e| {
+        ClaimCallError::Transient(format!(
+            "read /claims/acquire body: {}",
+            acquire_retry::describe_reqwest_error(&e)
+        ))
+    })?;
     if !status.is_success() && status != reqwest::StatusCode::CONFLICT {
-        return Err(format!(
+        let msg = format!(
             "POST /claims/acquire returned {} — body: {body_text}",
             status.as_u16()
-        ));
+        );
+        return Err(if acquire_retry::status_is_transient(status) {
+            ClaimCallError::Transient(msg)
+        } else {
+            ClaimCallError::Final(msg)
+        });
     }
-    let v: serde_json::Value = serde_json::from_str(&body_text)
-        .map_err(|e| format!("parse /claims/acquire body: {e} (raw: {body_text})"))?;
+    let v: serde_json::Value = serde_json::from_str(&body_text).map_err(|e| {
+        ClaimCallError::Final(format!(
+            "parse /claims/acquire body: {e} (raw: {body_text})"
+        ))
+    })?;
     match v.get("result").and_then(|r| r.as_str()) {
         Some("claimed") | Some("renewed") => {
             let ttl = v
@@ -366,18 +393,45 @@ async fn pre_allocate_claim(
     }
 }
 
+/// The per-attempt bound on `/claims/acquire` when no retry budget is set —
+/// today's 10 s.
+const CLAIM_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Acquire ONE claim from a [`ClaimSpawnContext`] and map the outcome into
 /// an [`ActiveClaim`] (on `Acquired`) or an [`AllocateError`] (on `Held` →
 /// `ClaimConflict`, on `Other`/transport → `Other`). Shared by both the
 /// pre-allocate phase/file_glob claim and the per-repo `kind=worktree`
 /// claims (Phase 1) so the acquire-and-map logic lives in one place.
+///
+/// A transient failure (transport, body read, 5xx) is retried while
+/// `deadline` has room — the ONE deadline of the whole acquire (plan
+/// `2026-10-31-continuation-worktree-acquire-failure-strands-the-allocation-and-tells-the-session-nothing`
+/// D3). With [`acquire_retry::RetryDeadline::none`] exactly one attempt is
+/// made, as before. A `held` is a real answer and is never retried.
 async fn acquire_one_claim(
     coord_http_base: &str,
     machine_id: &uuid::Uuid,
     agent_session_id: Option<uuid::Uuid>,
     ctx: &ClaimSpawnContext,
+    deadline: acquire_retry::RetryDeadline,
 ) -> Result<ActiveClaim, AllocateError> {
-    match pre_allocate_claim(coord_http_base, machine_id, agent_session_id, ctx).await {
+    let outcome = acquire_retry::retry_transient(
+        "claims/acquire",
+        deadline,
+        |timeout| async move {
+            let timeout = timeout.unwrap_or(CLAIM_ACQUIRE_TIMEOUT);
+            match pre_allocate_claim(coord_http_base, machine_id, agent_session_id, ctx, timeout)
+                .await
+            {
+                Ok(o) => acquire_retry::Attempt::Done(Ok(o)),
+                Err(ClaimCallError::Final(e)) => acquire_retry::Attempt::Done(Err(e)),
+                Err(ClaimCallError::Transient(e)) => acquire_retry::Attempt::Transient(e),
+            }
+        },
+        |e| e,
+    )
+    .await;
+    match outcome {
         Ok(AcquireOutcome::Acquired { ttl_seconds }) => {
             info!(
                 "claims/acquire ok kind={} key={} ttl={}s",
@@ -1281,7 +1335,7 @@ struct CoordAllocatedWorktree {
 /// every non-space whitespace (a newline, or U+2028/U+2029, would forge an
 /// extra apparent log line) and bidi overrides/isolates (which visually
 /// reorder a line) become spaces, and the line is bounded.
-fn sibling_note_log_line(note: &str) -> String {
+pub(crate) fn sibling_note_log_line(note: &str) -> String {
     const MAX_CHARS: usize = 600;
     let one_line: String = note
         .chars()
@@ -1679,10 +1733,16 @@ fn allocate_tenant_scope(
 ///
 /// On success returns `AllocateResult`. On any non-claim error,
 /// returns `Err(AllocateError::Other(String))`. Partial failure is
-/// handled at the boundary: if any `git worktree add` fails after coord
-/// has minted rows, the partial materialization stops; coord's sweeper
-/// will eventually reclaim the unused rows once they age into
-/// `abandoned`.
+/// handled at the boundary: if anything fails after coord has minted rows (a
+/// claim, a refused placement, a `git worktree add`), the materialization
+/// stops and every row coord returned is handed back through
+/// `POST /coord/worktree-done/:device_id` with `abandoned: true` in a detached
+/// retire ([`retire_abandoned`]); a row coord refuses to retire ages out
+/// through reclaim as before.
+///
+/// `deadline` is the acquire's ONE transport-retry deadline
+/// ([`acquire_retry`]), shared by the allocate and every claim.
+/// [`acquire_retry::RetryDeadline::none`] makes one attempt of each.
 pub async fn allocate_and_materialize_with_claim(
     coord_http_base: &str,
     machine_id: &uuid::Uuid,
@@ -1696,6 +1756,7 @@ pub async fn allocate_and_materialize_with_claim(
     spawn_tenant: Option<uuid::Uuid>,
     shared_branch: SharedBranchPolicy,
     edit_siblings: &[String],
+    deadline: acquire_retry::RetryDeadline,
 ) -> Result<MaterializeOutcome, AllocateError> {
     if !worktree_mode_enabled() {
         return Err(AllocateError::Other(format!(
@@ -1728,7 +1789,8 @@ pub async fn allocate_and_materialize_with_claim(
     let claim_ctx =
         ClaimSpawnContext::from_intent_and_paths(intent, plan_id, phase, declared_overlap_paths);
     if let Some(ref ctx) = claim_ctx {
-        match acquire_one_claim(coord_http_base, machine_id, agent_session_id, ctx).await {
+        match acquire_one_claim(coord_http_base, machine_id, agent_session_id, ctx, deadline).await
+        {
             Ok(claim) => active_claims.push(claim),
             Err(e) => {
                 release_all_claims_best_effort(coord_http_base, machine_id, &active_claims).await;
@@ -1752,51 +1814,13 @@ pub async fn allocate_and_materialize_with_claim(
     );
 
     let url = format!("{}/agents/allocate", coord_http_base.trim_end_matches('/'));
-    let resp = match crate::auth::attach_device_auth_for(
-        reqwest::Client::new().post(&url).json(&body),
-        scope,
-    )
-    .send()
-    .await
-    {
+    // Claims already held are released only once the allocate is FINAL: a
+    // retried attempt keeps them (plan 2026-10-31 Phase 1).
+    let coord_resp = match post_allocate(&url, &body, scope, deadline).await {
         Ok(r) => r,
         Err(e) => {
             release_all_claims_best_effort(coord_http_base, machine_id, &active_claims).await;
-            return Err(AllocateError::Other(format!("POST {url}: {e}")));
-        }
-    };
-    let status = resp.status();
-    if !status.is_success() {
-        release_all_claims_best_effort(coord_http_base, machine_id, &active_claims).await;
-        let body_text = resp.text().await.unwrap_or_default();
-        // Coord's `decide_parent_sha` → RepoNotRegistered surfaces as a
-        // 409 with body `{"error":"repo_not_registered","repo":<repo>}`.
-        // Surface it typed so the caller can retry once pinning the local
-        // `origin/<default>` base instead of failing the spawn.
-        if status == reqwest::StatusCode::CONFLICT {
-            if let Some(repo) = serde_json::from_str::<serde_json::Value>(&body_text)
-                .ok()
-                .filter(|v| v.get("error").and_then(|e| e.as_str()) == Some("repo_not_registered"))
-                .and_then(|v| {
-                    v.get("repo")
-                        .and_then(|r| r.as_str())
-                        .map(|s| s.to_string())
-                })
-            {
-                return Err(AllocateError::RepoNotRegistered(repo));
-            }
-        }
-        return Err(AllocateError::Other(format!(
-            "POST {url} returned {} — body: {}",
-            status.as_u16(),
-            body_text
-        )));
-    }
-    let coord_resp: CoordAllocateResponse = match resp.json().await {
-        Ok(r) => r,
-        Err(e) => {
-            release_all_claims_best_effort(coord_http_base, machine_id, &active_claims).await;
-            return Err(AllocateError::Other(format!("decode coord response: {e}")));
+            return Err(e);
         }
     };
 
@@ -1855,6 +1879,62 @@ pub async fn allocate_and_materialize_with_claim(
         }));
     }
 
+    // Plan 2026-10-31 Phase 3 — from here coord holds rows for this
+    // allocation, so every unwind below would strand them `allocated` with no
+    // directory. Capture coord's rows exactly as returned (`planned` is not
+    // "each row coord returned": `plan_worktree_rows` consumes the list and can
+    // skip a sibling), and on ANY error hand them back in a detached retire
+    // that never delays the caller or changes its error.
+    let retire_rows = retire_abandoned::rows_to_retire(&coord_resp.worktrees);
+    let agent_id = coord_resp.agent_id.clone();
+    let outcome = materialize_allocation(
+        coord_http_base,
+        machine_id,
+        agent_session_id,
+        repos,
+        intent,
+        repo_canonical_paths,
+        shared_branch,
+        edit_siblings,
+        deadline,
+        coord_resp,
+        isolation,
+        sibling_notes,
+        active_claims,
+    )
+    .await;
+    if let Err(e) = &outcome {
+        retire_abandoned::spawn_retire_abandoned(
+            coord_http_base,
+            *machine_id,
+            &agent_id,
+            retire_rows,
+            e,
+        );
+    }
+    outcome
+}
+
+/// Everything [`allocate_and_materialize_with_claim`] does after coord has
+/// answered a non-`wait` allocation: place the session (shared branch or
+/// worktree), take its directory claims and materialize. Split out so that
+/// every one of its unwinds reaches the single retire in the caller.
+#[allow(clippy::too_many_arguments)]
+async fn materialize_allocation(
+    coord_http_base: &str,
+    machine_id: &uuid::Uuid,
+    agent_session_id: Option<uuid::Uuid>,
+    repos: &[RepoRequest],
+    intent: Option<&str>,
+    repo_canonical_paths: &std::collections::HashMap<String, PathBuf>,
+    shared_branch: SharedBranchPolicy,
+    edit_siblings: &[String],
+    deadline: acquire_retry::RetryDeadline,
+    coord_resp: CoordAllocateResponse,
+    isolation: Isolation,
+    sibling_notes: Vec<String>,
+    mut active_claims: Vec<ActiveClaim>,
+) -> Result<MaterializeOutcome, AllocateError> {
     // `shared_branch` — do NOT create a worktree. Create / check out the
     // feature branch in the canonical checkout and return the canonical
     // path as the materialized cwd. A real branch, never a silent
@@ -1917,7 +1997,15 @@ pub async fn allocate_and_materialize_with_claim(
         // and the branch switch, and unwound with everything else on a `Held`.
         for (_, canonical) in &targets {
             let ctx = ClaimSpawnContext::worktree_for_path(canonical, intent);
-            match acquire_one_claim(coord_http_base, machine_id, agent_session_id, &ctx).await {
+            match acquire_one_claim(
+                coord_http_base,
+                machine_id,
+                agent_session_id,
+                &ctx,
+                deadline,
+            )
+            .await
+            {
                 Ok(claim) => active_claims.push(claim),
                 Err(e) => {
                     release_all_claims_best_effort(coord_http_base, machine_id, &active_claims)
@@ -1930,8 +2018,14 @@ pub async fn allocate_and_materialize_with_claim(
             Vec::with_capacity(targets.len());
         for (w, _) in &targets {
             let ctx = ClaimSpawnContext::canonical_checkout_for_repo(&w.repo, intent);
-            let outcome =
-                acquire_one_claim(coord_http_base, machine_id, agent_session_id, &ctx).await;
+            let outcome = acquire_one_claim(
+                coord_http_base,
+                machine_id,
+                agent_session_id,
+                &ctx,
+                deadline,
+            )
+            .await;
             // Stop at the first failure — never acquire a lease for a later repo
             // once an earlier one is Held (it would leak past the unwind, which
             // only releases up to the failing repo).
@@ -2005,7 +2099,15 @@ pub async fn allocate_and_materialize_with_claim(
     // given — never on the shared checkout it is cut from, which every
     // concurrent session of the repo would otherwise contend for.
     for ctx in worktree_claim_contexts(&planned, intent) {
-        match acquire_one_claim(coord_http_base, machine_id, agent_session_id, &ctx).await {
+        match acquire_one_claim(
+            coord_http_base,
+            machine_id,
+            agent_session_id,
+            &ctx,
+            deadline,
+        )
+        .await
+        {
             Ok(claim) => active_claims.push(claim),
             Err(e) => {
                 release_all_claims_best_effort(coord_http_base, machine_id, &active_claims).await;
@@ -2170,6 +2272,116 @@ pub async fn allocate_and_materialize_with_claim(
         active_claims,
         sibling_notes,
     }))
+}
+
+/// `POST /agents/allocate`, retried through transient coord failures while
+/// `deadline` has room (plan 2026-10-31 Phase 1). Releases nothing: the
+/// caller unwinds its claims only on the final answer.
+///
+/// A retry after a transport error may mint a second allocation when the
+/// first one committed and only its response was lost. That row names the
+/// session that goes on to run, so it lives as long as today's stranded row;
+/// the allocate has no idempotency key to prevent it (plan D3, accepted).
+async fn post_allocate(
+    url: &str,
+    body: &serde_json::Value,
+    scope: crate::auth::TenantScope,
+    deadline: acquire_retry::RetryDeadline,
+) -> Result<CoordAllocateResponse, AllocateError> {
+    acquire_retry::retry_transient(
+        "agents/allocate",
+        deadline,
+        |timeout| post_allocate_once(url, body, scope, timeout),
+        AllocateError::Other,
+    )
+    .await
+}
+
+/// One allocate attempt. Transient: a transport error, a body that could not
+/// be READ (distinct from one read in full that does not parse, which is
+/// final), and a 5xx. Final: a `repo_not_registered` 409, any other non-2xx,
+/// and an unparseable body.
+///
+/// With no budget (`timeout == None`) the request is exactly today's — a
+/// fresh client, no request timeout. With a budget it goes through the shared
+/// coord client bounded by the attempt's timeout, because a hung send never
+/// returns and would escape the deadline.
+async fn post_allocate_once(
+    url: &str,
+    body: &serde_json::Value,
+    scope: crate::auth::TenantScope,
+    timeout: Option<Duration>,
+) -> acquire_retry::Attempt<CoordAllocateResponse, AllocateError> {
+    use acquire_retry::Attempt;
+    let builder = match timeout {
+        None => reqwest::Client::new().post(url),
+        Some(t) => match crate::coord_http::coord_client() {
+            Some(c) => c.post(url).timeout(t),
+            None => reqwest::Client::new().post(url).timeout(t),
+        },
+    };
+    let resp = match crate::auth::attach_device_auth_for(builder.json(body), scope)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            return Attempt::Transient(format!(
+                "POST {url}: {}",
+                acquire_retry::describe_reqwest_error(&e)
+            ))
+        }
+    };
+    let status = resp.status();
+    let bytes = match resp.bytes().await {
+        Ok(b) => b.to_vec(),
+        // A success or a 5xx whose body could not be read is a transport
+        // failure. Any other status is already a final answer; its body is
+        // only detail, as before.
+        Err(e) if status.is_success() || acquire_retry::status_is_transient(status) => {
+            return Attempt::Transient(format!(
+                "read /agents/allocate body ({}): {}",
+                status.as_u16(),
+                acquire_retry::describe_reqwest_error(&e)
+            ))
+        }
+        Err(_) => Vec::new(),
+    };
+    if !status.is_success() {
+        let body_text = String::from_utf8_lossy(&bytes).to_string();
+        let msg = format!(
+            "POST {url} returned {} — body: {}",
+            status.as_u16(),
+            body_text
+        );
+        if acquire_retry::status_is_transient(status) {
+            return Attempt::Transient(msg);
+        }
+        // Coord's `decide_parent_sha` → RepoNotRegistered surfaces as a
+        // 409 with body `{"error":"repo_not_registered","repo":<repo>}`.
+        // Surface it typed so the caller can retry once pinning the local
+        // `origin/<default>` base instead of failing the spawn.
+        if status == reqwest::StatusCode::CONFLICT {
+            if let Some(repo) = serde_json::from_str::<serde_json::Value>(&body_text)
+                .ok()
+                .filter(|v| v.get("error").and_then(|e| e.as_str()) == Some("repo_not_registered"))
+                .and_then(|v| {
+                    v.get("repo")
+                        .and_then(|r| r.as_str())
+                        .map(|s| s.to_string())
+                })
+            {
+                return Attempt::Done(Err(AllocateError::RepoNotRegistered(repo)));
+            }
+        }
+        return Attempt::Done(Err(AllocateError::Other(msg)));
+    }
+    match serde_json::from_slice::<CoordAllocateResponse>(&bytes) {
+        Ok(r) => Attempt::Done(Ok(r)),
+        Err(e) => Attempt::Done(Err(AllocateError::Other(format!(
+            "decode coord response: {e}"
+        )))),
+    }
 }
 
 /// One row of a `worktree` allocation, resolved before anything touches disk.
