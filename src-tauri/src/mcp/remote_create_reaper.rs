@@ -265,6 +265,21 @@ impl RemoteCreateReaper {
             });
     }
 
+    /// May a create grant still close `terminal_id`? Only a row that is armed and
+    /// not yet attached says "never attached".
+    ///
+    /// Fails CLOSED on no row. Absence is also the correct answer rather than
+    /// only the safe one: an attached terminal loses its row, because
+    /// [`Self::take_due`] drops a `Keep` row and an unarmed marker ages out, so
+    /// "no row" covers attached-and-disarmed as well as local terminals this
+    /// table never armed. A reaped terminal is gone anyway.
+    pub fn was_ever_attached(&self, terminal_id: &str) -> bool {
+        !self
+            .table()
+            .get(terminal_id)
+            .is_some_and(|row| row.armed && !row.ever_attached)
+    }
+
     /// Apply [`decide`] to every armed terminal: `Reap` rows are removed and
     /// returned, `Keep` rows are removed (owned — nothing left to watch),
     /// `Wait` rows stay. Unarmed attach markers are kept until they age out.
@@ -491,6 +506,11 @@ pub fn mark_attached(terminal_id: &str) {
     reaper().mark_attached(terminal_id, Instant::now());
 }
 
+/// [`RemoteCreateReaper::was_ever_attached`] on the process-wide reaper.
+pub fn was_ever_attached(terminal_id: &str) -> bool {
+    reaper().was_ever_attached(terminal_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -693,6 +713,81 @@ mod tests {
         // So does a sweep.
         assert!(reaper.take_due(t0 + 3 * N).is_empty());
         assert!(!reaper.has_row("local-2"));
+    }
+
+    /// Every row state, including the one that matters most: mark_attached on
+    /// an armed row keeps the row until the sweep disarms it, and from then on
+    /// the attached terminal has NO row, which must still read as attached.
+    #[test]
+    fn ever_attached_reads_true_for_everything_but_an_armed_never_attached_row() {
+        let t0 = Instant::now();
+        let reaper = RemoteCreateReaper::new(N);
+
+        assert!(
+            reaper.was_ever_attached("never-armed"),
+            "no row fails closed"
+        );
+
+        reaper.arm("term", None, t0);
+        assert!(!reaper.was_ever_attached("term"));
+
+        reaper.mark_attached("term", t0);
+        assert!(reaper.has_row("term"), "the row survives the mark");
+        assert!(reaper.was_ever_attached("term"));
+
+        assert!(reaper.take_due(t0 + N).is_empty());
+        assert!(!reaper.has_row("term"), "the sweep disarms it");
+        assert!(
+            reaper.was_ever_attached("term"),
+            "disarmed is still attached"
+        );
+
+        reaper.mark_attached("marker", t0);
+        assert!(reaper.was_ever_attached("marker"));
+
+        reaper.arm("orphan", None, t0);
+        assert_eq!(reaper.take_due(t0 + 2 * N).len(), 1);
+        assert!(
+            reaper.was_ever_attached("orphan"),
+            "reaped: refused, not admitted"
+        );
+    }
+
+    /// A create grant's close leaves the terminal's armed row behind, by design:
+    /// at the deadline the sweep finds the terminal already gone and does nothing
+    /// worse than note it, once. Exercises the REAL manager's answer.
+    #[tokio::test]
+    async fn a_row_whose_terminal_a_create_grant_already_closed_sweeps_as_already_gone() {
+        let tm = Arc::new(crate::terminal::TerminalManager::new());
+        let session =
+            crate::terminal::session::tests::make_test_session(Arc::new(Mutex::new(Vec::new())));
+        tm.insert_for_test("term-closed", Arc::new(session));
+        let t0 = Instant::now();
+        let reaper = RemoteCreateReaper::new(N);
+        reaper.arm("term-closed", None, t0);
+
+        // The create grant's close is a forced end, whose driver lands on
+        // `TerminalManager::close` — not on `close_through`, whose probe would
+        // HOLD this pid-less test pane as unprovable.
+        tm.close("term-closed").expect("the create grant's forced close");
+        assert!(tm.get("term-closed").is_none(), "the pane is gone");
+
+        let outcomes = Arc::new(Mutex::new(Vec::new()));
+        let seen = outcomes.clone();
+        let close = move |id: String| {
+            let (target, seen) = (tm.clone(), seen.clone());
+            async move {
+                let outcome = close_through(target, id).await;
+                seen.lock().unwrap().push(outcome.clone());
+                outcome
+            }
+        };
+        assert_eq!(sweep(&reaper, t0 + N, &close).await.len(), 1);
+        assert!(sweep(&reaper, t0 + 2 * N, &close).await.is_empty());
+        assert_eq!(
+            *outcomes.lock().unwrap(),
+            vec![Ok(CloseOutcome::AlreadyGone)]
+        );
     }
 
     /// A test `ReapTarget` that behaves like a manager whose terminal carries

@@ -57,6 +57,7 @@
 //! truth about a column its database does not have yet. Recording it as
 //! agreement would be the same dishonesty the 503 exists to avoid.
 
+use std::future::Future;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -65,7 +66,13 @@ use serde_json::json;
 use tracing::{info, warn};
 
 use super::CommandResponse;
+use crate::mcp::remote_terminal::{EndGrant, EndOutcome, EndReply};
 use crate::settings::AcceptRemoteCreate;
+
+/// How long the attach-stage failure waits to hear whether its orphan closed. A
+/// forced close answers quickly, and the target's attach-deadline reaper is the
+/// backstop, so the operator's error is not held for the full `END_TIMEOUT`.
+const ORPHAN_CLOSE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// What one mirror+verify pass established about the two stores.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -480,9 +487,11 @@ pub struct RemoteCreateError {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<serde_json::Value>,
     /// Set only on a `stage: "attach"` failure: the terminal the target DID
-    /// spawn. Reported because the operator now has a PTY running on another
-    /// machine that this window is not showing them, and hiding that would be
-    /// the dishonest half of the failure.
+    /// spawn and this runner cannot say is gone. Reported because the operator
+    /// now has a PTY running on another machine that this window is not showing
+    /// them, and hiding that would be the dishonest half of the failure. Cleared
+    /// once the target reports the terminal gone; the picker renders this field
+    /// as "a terminal IS running on that machine".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_terminal_id: Option<String>,
 }
@@ -627,6 +636,10 @@ async fn mint_create_grant(
 /// own allowlist; the target answers both out of its own configuration and
 /// refuses anything else. A caller-chosen working directory is the hole this
 /// plan's D2 closed and this door does not re-open it.
+///
+/// An attach-stage failure leaves an orphan on the target, which this closes in
+/// one round trip under the same create grant
+/// ([`close_orphan_on_attach_failure`]).
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub async fn terminal_create_remote(
@@ -725,9 +738,53 @@ pub async fn terminal_create_remote(
         "remote create: the target spawned a terminal"
     );
 
-    // 4. Attach. A create grant bought ONE spawn and the relay dropped it the
-    //    moment it forwarded the reply, so driving the new PTY needs an attach
-    //    grant — minted against the session the TARGET registered.
+    // 4. Attach.
+    let attached = attach_created_terminal(
+        terminal_manager.inner(),
+        &app_handle,
+        &base,
+        target,
+        scope,
+        &created,
+        cols,
+        rows,
+        page_id,
+        device_label,
+    )
+    .await;
+    let grant = minted.grant.as_str();
+    close_orphan_on_attach_failure(attached, |terminal_id| async move {
+        crate::mcp::remote_terminal::client()
+            .end(
+                EndGrant::Create {
+                    grant,
+                    terminal_id: &terminal_id,
+                },
+                true,
+                ORPHAN_CLOSE_TIMEOUT,
+            )
+            .await
+    })
+    .await
+}
+
+/// A create grant bought ONE spawn and the relay dropped it the moment it
+/// forwarded the reply, so driving the new PTY needs an attach grant — minted
+/// against the session the TARGET registered. Every `Err` here carries
+/// `created_terminal_id`: the terminal exists.
+#[allow(clippy::too_many_arguments)]
+async fn attach_created_terminal(
+    terminal_manager: &Arc<crate::terminal::TerminalManager>,
+    app_handle: &tauri::AppHandle,
+    base: &str,
+    target: uuid::Uuid,
+    scope: crate::auth::TenantScope,
+    created: &crate::mcp::remote_terminal::CreatedReply,
+    cols: u16,
+    rows: u16,
+    page_id: Option<String>,
+    device_label: Option<String>,
+) -> Result<crate::terminal::types::RemoteTerminalInfo, RemoteCreateError> {
     let Some(session_id) = created.coord_session_id.as_deref() else {
         return Err(RemoteCreateError {
             stage: "attach",
@@ -762,7 +819,7 @@ pub async fn terminal_create_remote(
     // not have drained the row yet; this retries a `session_not_found` and
     // nothing else.
     let attach_grant =
-        super::remote_attach::mint_attach_grant_awaiting_session(&base, session_uuid, scope)
+        super::remote_attach::mint_attach_grant_awaiting_session(base, session_uuid, scope)
             .await
             .map_err(|e| RemoteCreateError {
                 stage: "attach",
@@ -832,8 +889,8 @@ pub async fn terminal_create_remote(
     }
 
     super::remote_attach::open_remote_tab(
-        terminal_manager.inner(),
-        &app_handle,
+        terminal_manager,
+        app_handle,
         super::remote_attach::OpenRemoteTab {
             minted: attach_grant,
             device_id: target.to_string(),
@@ -866,9 +923,295 @@ pub async fn terminal_create_remote(
     })
 }
 
+/// The attach stage's failure leaves a terminal no source can reach: close it
+/// through `send_close`, best-effort and once, then return the ORIGINAL error
+/// with what became of the terminal. A failure with no created terminal, and a
+/// success, send nothing. `send_close` is [`RemoteAttachClient::end`] under the
+/// create grant, injected so this is testable without a relay.
+///
+/// [`RemoteAttachClient::end`]: crate::mcp::remote_terminal::RemoteAttachClient::end
+async fn close_orphan_on_attach_failure<T, S, SF>(
+    attached: Result<T, RemoteCreateError>,
+    send_close: S,
+) -> Result<T, RemoteCreateError>
+where
+    S: FnOnce(String) -> SF,
+    SF: Future<Output = EndReply>,
+{
+    let error = match attached {
+        Ok(attached) => return Ok(attached),
+        Err(error) => error,
+    };
+    let Some(terminal_id) = error.created_terminal_id.clone() else {
+        return Err(error);
+    };
+    let reply = send_close(terminal_id.clone()).await;
+    info!(
+        remote_terminal_id = %terminal_id,
+        outcome = reply.outcome.as_str(),
+        via = ?reply.via,
+        reason = ?reply.reason,
+        "remote create: attach failed; asked the target to close the orphan terminal"
+    );
+    Err(annotate_orphan_close(error, &terminal_id, &reply))
+}
+
+/// Add what the close did to `error`: `detail.orphanClose` and one sentence on
+/// the message. Only `ended` and `not_found` say the terminal is gone, and only
+/// they clear `created_terminal_id`; `unknown` is never rendered as closed.
+fn annotate_orphan_close(
+    mut error: RemoteCreateError,
+    terminal_id: &str,
+    reply: &EndReply,
+) -> RemoteCreateError {
+    let orphan_close = json!({
+        "outcome": reply.outcome.as_str(),
+        "via": reply.via,
+        "reason": reply.reason,
+    });
+    match error.detail.as_mut().and_then(|d| d.as_object_mut()) {
+        Some(detail) => {
+            detail.insert("orphanClose".to_string(), orphan_close);
+        }
+        None => {
+            error.detail = Some(match error.detail.take() {
+                Some(original) => json!({ "original": original, "orphanClose": orphan_close }),
+                None => json!({ "orphanClose": orphan_close }),
+            });
+        }
+    }
+    error.message = format!(
+        "{} {}",
+        error.message,
+        orphan_close_sentence(terminal_id, reply)
+    );
+    if matches!(reply.outcome, EndOutcome::Ended | EndOutcome::NotFound) {
+        error.created_terminal_id = None;
+    }
+    error
+}
+
+fn orphan_close_sentence(terminal_id: &str, reply: &EndReply) -> String {
+    const BACKSTOP: &str =
+        "It may still be running there; if nothing attaches, that device closes it itself once \
+         its attach deadline passes.";
+    let reason = reply.reason.as_deref().unwrap_or("no reason given");
+    let attached_code = crate::mcp::remote_terminal::CreateRefusal::CloseAttached.code();
+    match reply.outcome {
+        EndOutcome::Ended => {
+            format!("This runner then closed that terminal ({terminal_id}) on the remote device.")
+        }
+        EndOutcome::NotFound => format!(
+            "The remote device reports that terminal ({terminal_id}) is already gone, so nothing \
+             is left running."
+        ),
+        EndOutcome::Refused if reason.starts_with(attached_code) => format!(
+            "The remote device refused to close that terminal ({terminal_id}) because something \
+             has attached to it, so it was left running."
+        ),
+        EndOutcome::Refused => format!(
+            "The remote device refused to close that terminal ({terminal_id}): {reason}. {BACKSTOP}"
+        ),
+        EndOutcome::StillRunning => format!(
+            "That terminal ({terminal_id}) is still running on the remote device: {reason}. \
+             {BACKSTOP}"
+        ),
+        EndOutcome::Unknown => {
+            format!("Whether that terminal ({terminal_id}) closed is UNKNOWN: {reason}. {BACKSTOP}")
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mcp::remote_terminal::RemoteAttachClient;
+
+    fn attach_stage_error(detail: Option<serde_json::Value>) -> RemoteCreateError {
+        RemoteCreateError {
+            stage: "attach",
+            code: "session_not_found".to_string(),
+            message: "no attach grant could be minted.".to_string(),
+            detail,
+            created_terminal_id: Some("term-orphan".to_string()),
+        }
+    }
+
+    async fn annotated_by(reply: EndReply) -> RemoteCreateError {
+        close_orphan_on_attach_failure::<(), _, _>(
+            Err(attach_stage_error(Some(
+                json!({ "remoteTerminalId": "term-orphan" }),
+            ))),
+            |_| async move { reply },
+        )
+        .await
+        .expect_err("the original failure is still the answer")
+    }
+
+    /// Through the REAL client: one frame, on the wire contract's shape, and the
+    /// original error comes back saying the orphan closed.
+    #[tokio::test]
+    async fn an_attach_failure_sends_exactly_one_close_and_annotates() {
+        let client = Arc::new(RemoteAttachClient::new());
+        let mut pump = client.lock_outbound().await;
+        let c = client.clone();
+        let task = tokio::spawn(async move {
+            close_orphan_on_attach_failure::<(), _, _>(
+                Err(attach_stage_error(None)),
+                |terminal_id| async move {
+                    c.end(
+                        EndGrant::Create {
+                            grant: "create-jwt",
+                            terminal_id: &terminal_id,
+                        },
+                        true,
+                        ORPHAN_CLOSE_TIMEOUT,
+                    )
+                    .await
+                },
+            )
+            .await
+        });
+        let sent = pump.recv().await.expect("the close frame");
+        assert_eq!(sent["type"], "remote_terminal_end");
+        assert_eq!(sent["create_grant"], "create-jwt");
+        assert_eq!(sent["terminal_id"], "term-orphan");
+        assert_eq!(sent["force"], true);
+        assert!(client.handle_inbound(
+            "remote_terminal_ended",
+            &json!({
+                "type": "remote_terminal_ended",
+                "request_id": sent["request_id"],
+                "terminal_id": "term-orphan",
+                "outcome": "ended",
+                "via": "force",
+            }),
+        ));
+        let error = task.await.unwrap().expect_err("the original failure");
+        assert!(pump.try_recv().is_err(), "exactly one close frame");
+
+        assert_eq!(error.stage, "attach");
+        assert_eq!(error.code, "session_not_found");
+        assert!(error
+            .message
+            .starts_with("no attach grant could be minted."));
+        assert!(error.message.contains("closed that terminal (term-orphan)"));
+        let close = &error.detail.as_ref().expect("detail created")["orphanClose"];
+        assert_eq!(close["outcome"], "ended");
+        assert_eq!(close["via"], "force");
+        assert_eq!(close["reason"], serde_json::Value::Null);
+        // The picker renders this field as "a terminal IS running".
+        assert_eq!(error.created_terminal_id, None);
+    }
+
+    #[tokio::test]
+    async fn a_failure_with_no_created_terminal_and_a_success_send_nothing() {
+        let create_stage = RemoteCreateError {
+            stage: "create",
+            code: "timeout".to_string(),
+            message: "the create timed out".to_string(),
+            detail: None,
+            created_terminal_id: None,
+        };
+        let error = close_orphan_on_attach_failure::<(), _, _>(Err(create_stage), |_| async {
+            panic!("a create-stage failure has nothing to close")
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(error.message, "the create timed out");
+        assert!(error.detail.is_none());
+
+        let ok = close_orphan_on_attach_failure(Ok(7), |_| async {
+            panic!("a successful attach closes nothing")
+        })
+        .await;
+        assert_eq!(ok.unwrap(), 7);
+    }
+
+    /// `unknown` is the outcome a timeout and a dead relay land on. It says so,
+    /// keeps the terminal reported as running, and never claims it closed.
+    #[tokio::test]
+    async fn an_unknown_reply_is_not_rendered_as_closed() {
+        let error = annotated_by(EndReply::local(
+            EndOutcome::Unknown,
+            "timeout: no remote_terminal_ended within 30s",
+        ))
+        .await;
+        assert!(error.message.contains("UNKNOWN"), "{}", error.message);
+        assert!(error.message.contains("may still be running"));
+        assert!(!error.message.contains("closed that terminal"));
+        assert_eq!(error.created_terminal_id.as_deref(), Some("term-orphan"));
+        let detail = error.detail.unwrap();
+        assert_eq!(detail["orphanClose"]["outcome"], "unknown");
+        assert_eq!(
+            detail["remoteTerminalId"], "term-orphan",
+            "original detail kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn each_refusal_and_gone_outcome_says_what_it_means() {
+        let attached = crate::mcp::remote_terminal::CreateRefusal::CloseAttached.code();
+        let error = annotated_by(EndReply::local(
+            EndOutcome::Refused,
+            format!("{attached}: this terminal has been attached"),
+        ))
+        .await;
+        assert!(error.message.contains("left running"), "{}", error.message);
+        assert!(
+            !error.message.contains("attach deadline"),
+            "no reaper will take it"
+        );
+        assert_eq!(error.created_terminal_id.as_deref(), Some("term-orphan"));
+
+        let error = annotated_by(EndReply::local(
+            EndOutcome::Refused,
+            "remote_create_grant_unknown",
+        ))
+        .await;
+        assert!(
+            error.message.contains("refused to close"),
+            "{}",
+            error.message
+        );
+        assert!(error.message.contains("remote_create_grant_unknown"));
+        assert_eq!(error.created_terminal_id.as_deref(), Some("term-orphan"));
+        assert_eq!(
+            error.detail.unwrap()["orphanClose"]["reason"],
+            "remote_create_grant_unknown"
+        );
+
+        let error = annotated_by(EndReply::local(EndOutcome::NotFound, "terminal_gone")).await;
+        assert!(error.message.contains("already gone"), "{}", error.message);
+        assert_eq!(error.created_terminal_id, None);
+    }
+
+    /// The command's own wiring is not reachable without Tauri state, so it is
+    /// pinned by shape: the attach stage runs through the close, under the
+    /// create grant, and the create stage returns before it.
+    #[test]
+    fn the_command_closes_the_orphan_under_the_create_grant_it_spent() {
+        const SRC: &str = include_str!("remote_create.rs");
+        let start = SRC
+            .find("pub async fn terminal_create_remote(")
+            .expect("the command");
+        let command = SRC.get(start..).expect("char boundary");
+        let end = command
+            .find("\nasync fn attach_created_terminal(")
+            .expect("attach_created_terminal follows the command");
+        let command = command.get(..end).expect("char boundary");
+        let create_stage = command.find("stage: \"create\",").expect("create stage");
+        let attach = command
+            .find("attach_created_terminal(")
+            .expect("attach stage");
+        let close = command
+            .find("close_orphan_on_attach_failure(attached,")
+            .expect("the close");
+        let grant = command
+            .find("EndGrant::Create {")
+            .expect("under the create grant");
+        assert!(create_stage < attach && attach < close && close < grant);
+    }
 
     #[test]
     fn create_grant_response_reads_target_runner_when_present_and_tolerates_absence() {
