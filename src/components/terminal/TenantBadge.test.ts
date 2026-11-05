@@ -8,7 +8,7 @@
 
 import { describe, expect, it } from "vitest";
 
-import { repoExpectedText, tenantBadgeLabel } from "./TenantBadge";
+import { repoExpectedText, tenantBadgeDisplayAttrs, tenantBadgeLabel } from "./TenantBadge";
 import type { SessionTenancy, TenancyRepoExpected, TenantDisplay } from "./useSessionInfo";
 import {
   explicitSpawnTenant,
@@ -502,6 +502,89 @@ function shownAs(overrides: Partial<TenantDisplay> = {}): TenantDisplay {
     ...overrides,
   };
 }
+
+describe("tenantBadgeDisplayAttrs — what a UI Bridge read sees", () => {
+  it("names the acting tenant, status and source on a no-stamp chip", () => {
+    expect(
+      tenantBadgeDisplayAttrs(
+        tenancy({ credential: A, dataPlane: A, diverged: false, display: shownAs() }),
+      ),
+    ).toEqual({
+      "data-tenant-acting": A,
+      "data-tenant-display-status": "resolved",
+      "data-tenant-display-source": "credential",
+    });
+  });
+
+  it("keeps the status of a display with no acting tenant, and sets no tenant", () => {
+    expect(
+      tenantBadgeDisplayAttrs(
+        tenancy({
+          credential: null,
+          dataPlane: null,
+          diverged: false,
+          display: shownAs({ status: "unknown", tenantId: null, source: null }),
+        }),
+      ),
+    ).toEqual({
+      "data-tenant-acting": undefined,
+      "data-tenant-display-status": "unknown",
+      "data-tenant-display-source": undefined,
+    });
+  });
+
+  it("never names a spawn stamp as the acting tenant", () => {
+    expect(
+      tenantBadgeDisplayAttrs(
+        tenancy({
+          row: A,
+          diverged: false,
+          display: shownAs({ status: "stamp_only", source: "row_stamp" }),
+        }),
+      ),
+    ).toEqual({
+      "data-tenant-acting": undefined,
+      "data-tenant-display-status": "stamp_only",
+      "data-tenant-display-source": "row_stamp",
+    });
+  });
+
+  it("withholds a stamp-sourced tenant under a mismatch too", () => {
+    expect(
+      tenantBadgeDisplayAttrs(
+        tenancy({
+          row: A,
+          diverged: true,
+          display: shownAs({ status: "mismatch", source: "row_stamp" }),
+        }),
+      ),
+    ).toEqual({
+      "data-tenant-acting": undefined,
+      "data-tenant-display-status": "mismatch",
+      "data-tenant-display-source": "row_stamp",
+    });
+  });
+
+  it("names the acting tenant of a mismatch, whose conflict is listed beside it", () => {
+    expect(
+      tenantBadgeDisplayAttrs(
+        tenancy({ credential: A, diverged: true, display: shownAs({ status: "mismatch" }) }),
+      )["data-tenant-acting"],
+    ).toBe(A);
+  });
+
+  it("claims nothing when the runner sent no display", () => {
+    const none = {
+      "data-tenant-acting": undefined,
+      "data-tenant-display-status": undefined,
+      "data-tenant-display-source": undefined,
+    };
+    expect(tenantBadgeDisplayAttrs(null)).toEqual(none);
+    expect(
+      tenantBadgeDisplayAttrs(tenancy({ credential: A, dataPlane: A, diverged: false })),
+    ).toEqual(none);
+  });
+});
 
 describe("tenantBadgeLabel — the acting tenant when no tenant was stamped (plan 2026-10-17)", () => {
   it("shows the ACTING tenant for a no-stamp session whose credential resolved", () => {
