@@ -1430,6 +1430,9 @@ describe("onHolderSessionReleased — a deferred holder died before adoption", (
     const schedule = vi.fn();
     await expect(onHolderSessionReleased(payload, schedule)).resolves.toBe(false);
     expect(schedule).not.toHaveBeenCalled();
+    // The registry WAS read: the refusal came from the strict oracle seeing a
+    // partial read, not from a read that never happened.
+    expect(mockInvoke).toHaveBeenCalledWith("terminal_claude_session_list_live");
   });
 });
 
