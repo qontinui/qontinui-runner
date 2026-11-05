@@ -4406,6 +4406,15 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                             s.mark_finish_synced(csid, finished_at);
                         }
                     });
+                    // Once per runner start: heal marks stamped synced over a
+                    // finish coord never applied (plan 2026-11-05-finish-
+                    // synced-is-stamped-on-a-2xx-that-did-not-move-session-
+                    // status, Phase 5). Delayed, bounded, and it only
+                    // re-sends a session's own finish.
+                    session::finish_heal::spawn_boot_sweep(
+                        std::sync::Arc::downgrade(&lifecycle_store),
+                        std::sync::Arc::downgrade(&ai_coord_registrar),
+                    );
                 }
                 // Append-only session-snapshot HISTORY (session-restore
                 // shim-fix plan, Phase 4): a durable JSONL audit of the full

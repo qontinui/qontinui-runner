@@ -336,7 +336,11 @@ pub fn drain(app_handle: &tauri::AppHandle, timeout: Duration) -> DrainSummary {
             // Advance the work-progress clock alongside the liveness heartbeat:
             // a session preserved across a planned restart was active up to the
             // drain, so it must not be mistaken for stalled when it resumes.
-            reg.progress_on_interaction(task_run_id);
+            // NOT `progress_on_interaction`: a drain is no revival, so a
+            // session whose local mark is finished gets no `working` row
+            // (plan 2026-11-05-finish-synced-is-stamped-on-a-2xx-that-did-not-
+            // move-session-status, D3).
+            reg.progress_on_drain(task_run_id);
             summary.claims_persisted += 1;
         }
     } else {

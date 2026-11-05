@@ -2490,6 +2490,12 @@ async fn health(
         // rows dropped unsent because a newer heartbeat was queued right
         // behind them. A stalled drain used to be invisible from here.
         "sessionOutbox": crate::session::coord_sync::session_outbox_health_json(),
+        // The finish heal (plan 2026-11-05-finish-synced-is-stamped-on-a-2xx-
+        // that-did-not-move-session-status, Phase 5): boot sweeps and finish
+        // read-backs run, and every synced finished mark they judged counted
+        // by outcome — `resent`, or the reason it was left alone
+        // (`coord_finished`, `revived_after_finish`, `coord_unreadable`, …).
+        "finishHeal": crate::session::finish_heal::heal_health_json(),
         // Session-message push evidence (plan
         // 2026-09-07-session-message-delivery-is-blind-and-park-collection-
         // resolves-on-a-guess, Phase 4): every tick the poller could not push

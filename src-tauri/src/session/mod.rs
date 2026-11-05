@@ -63,6 +63,7 @@ pub mod claude_session_registry;
 pub mod closeout_spool; // Producer for the two closeout outbox kinds — the loopback coord-write forwarders spool here when coord is UNREACHABLE (plan 2026-08-28-closeout-has-no-durable-store-when-the-runner-is-offline, Phase 3)
 pub mod coord_identity; // THE seam that re-keys a pane's coord row to the harness id pid-exact evidence names — hook, rung 2, R2 resume (plan 2026-10-23-a-hookless-resume-in-a-runner-pane-leaves-the-session-with-no-active-coord-row, D1)
 pub mod coord_sync;
+pub(crate) mod coord_sync_finish_ack; // What a coord answer to the runner's `finished` PATCH proves — finish_synced is stamped only on an observed `finished` row (plan 2026-11-05-finish-synced-is-stamped-on-a-2xx-that-did-not-move-session-status, Phase 4)
 pub mod coord_transport_rung; // WHICH transport rung carried a coord call — the producer for `coord-transport-rung` session events (plan 2026-09-07-no-per-session-record-of-which-transport-rung-carried-a-coord-read, Phase 1)
 pub mod create; // Remote-CREATE grants: the `create_request` directive arm + device-bound catch-up poll — the attach twin, so the target verifies a create grant itself instead of trusting the relay (plan 2026-09-11-headless-runner-parity-from-a-headed-runner, Phase 3b)
 pub mod dual_write;
@@ -95,6 +96,7 @@ pub mod spawn_prompt; // The spawn-time system-prompt carrier: ONE composed file
                       // can read the same pin the proxy does — see the lib declaration for why.
                       // Re-exported here so every `crate::session::tenant_pin::…` path is unchanged.
 pub use qontinui_runner_lib::tenant_pin;
+pub mod finish_heal; // Heal finished marks stamped synced over a write coord never applied; the finish read-back's coord.observed (plan 2026-11-05-finish-synced-is-stamped-on-a-2xx-that-did-not-move-session-status, Phase 5)
 pub mod finished_close; // The wind-down executor's `finished_close` arm: switch, cadence, candidates, published custody (plan 2026-10-03-finished-runner-sessions-close-their-window-without-a-drain)
 pub mod tracking_health;
 pub mod transcript_autobind; // The watcher binds EVERY transcript it sees to a coord session (plan 2026-10-06-closed-sessions-whose-work-is-unfinished-are-found-fleet-wide-and-resumed, Phase 1)
