@@ -19,6 +19,7 @@ import {
   findTerminalsOutsideProject,
   moveTerminalsToProject,
   readBareIdleShell,
+  summarizeLastMove,
   type ReconcilableTerminal,
 } from "./useProjectTerminalReconcile";
 
@@ -86,16 +87,20 @@ describe("findTerminalsOutsideProject", () => {
 /**
  * "Move them" replaces ONLY a pane that two readings agree is a bare idle shell:
  * the process table (its root a shell, nothing under it) AND the shell's own
- * last OSC 633 prompt-state mark (a prompt, not a command start). Everything
+ * prompt state — a prompt mark (633;A) this window parsed while the pane was
+ * live, from a shell that announced it marks every command start. Everything
  * else is kept — named, with its reason.
  *
- * Two cases each reading alone misses:
+ * Cases each reading alone misses:
  *  - `node … cli.js` (an npm-installed Claude Code) has no process NAMED
  *    claude, so the probe reads `absent`; only the shell's descendant count
  *    sees it.
  *  - PowerShell runs a cmdlet or script in-process (`Get-Content -Wait`, a
  *    `.ps1` loop): root = pwsh, ZERO descendants; only the prompt-state mark
  *    (633;C last) sees it.
+ *  - PowerShell without PSReadLine draws prompts (633;A) and never marks a
+ *    command start, so its prompt mark is no evidence; it announces no
+ *    capability and is kept.
  */
 describe("moveTerminalsToProject", () => {
   const ELSEWHERE = "D:\\projects\\book-notes";
@@ -122,8 +127,10 @@ describe("moveTerminalsToProject", () => {
     unreadable: { state: "unknown", sessionIds: [] },
     // `Get-Content -Wait` in pwsh: in-process, so no descendant at all.
     pwshBusy: shell(0, "pwsh.exe"),
-    // A bare shell whose output this window never rendered: no mark.
+    // A bare shell whose marks this window is not parsing (hidden, remounted).
     unmarked: shell(0),
+    // PowerShell without PSReadLine: prompts, but no command-start marks.
+    noReadline: shell(0, "pwsh.exe"),
   };
   const marks: Record<string, ShellPromptMark | undefined> = {
     bare: "prompt_start",
@@ -133,7 +140,9 @@ describe("moveTerminalsToProject", () => {
     unreadable: "prompt_start",
     pwshBusy: "command_execute",
     unmarked: undefined,
+    noReadline: "prompt_start",
   };
+  const announces = (id: string) => id !== "noReadline";
   const outside = Object.keys(probes).map((id) =>
     tab({ id, title: `T-${id}`, workingDir: ELSEWHERE }),
   );
@@ -147,6 +156,7 @@ describe("moveTerminalsToProject", () => {
     const outcome = moveTerminalsToProject(outside, ROOT, {
       probe: async (id) => probeOf(id),
       shellMark: markOf,
+      announcesCommandStarts: announces,
       createTerminal: async (title, workingDir) => {
         created.push(`${title}@${workingDir}`);
         return `replacement-of-${title}`;
@@ -169,8 +179,9 @@ describe("moveTerminalsToProject", () => {
       ["npm", "1 process is running in it"],
       ["other", "vim is running in it"],
       ["unreadable", "its processes could not be read"],
-      ["pwshBusy", "a command is running in its shell"],
+      ["pwshBusy", "its shell last reported a command start"],
       ["unmarked", "its shell reports no prompt state"],
+      ["noReadline", "its shell does not report command starts"],
     ]);
     expect(result.failed).toEqual([]);
   });
@@ -182,6 +193,7 @@ describe("moveTerminalsToProject", () => {
     const result = await moveTerminalsToProject(pane, ROOT, {
       probe: async () => shell(0, "pwsh.exe"),
       shellMark: () => "command_execute",
+      announcesCommandStarts: () => true,
       createTerminal: async (title) => {
         created.push(title);
         return "r";
@@ -194,7 +206,7 @@ describe("moveTerminalsToProject", () => {
     expect(created).toEqual([]);
     expect(closed).toEqual([]);
     expect(result.kept).toEqual([
-      { id: "pwsh", title: "T-pwsh", reason: "a command is running in its shell" },
+      { id: "pwsh", title: "T-pwsh", reason: "its shell last reported a command start" },
     ]);
   });
 
@@ -211,7 +223,7 @@ describe("moveTerminalsToProject", () => {
     expect(result.kept[0]).toEqual({
       id: "bare",
       title: "T-bare",
-      reason: "a command is running in its shell (it started during the move)",
+      reason: "its shell last reported a command start (it started during the move)",
     });
   });
 
@@ -239,6 +251,20 @@ describe("moveTerminalsToProject", () => {
     expect(result.kept[0].reason).toBe("its processes could not be read");
   });
 
+  it("keeps a bare shell whose marks went unparsed while its replacement opened", async () => {
+    // The replacement became the active tab, hiding the original; a chunk it
+    // printed was dropped unparsed, which clears its marks.
+    let reads = 0;
+    const { outcome, closed } = run(undefined, (id) => {
+      if (id !== "bare") return marks[id];
+      reads += 1;
+      return reads === 1 ? "prompt_start" : undefined;
+    });
+    const result = await outcome;
+    expect(closed).toEqual(["replacement-of-T-bare"]);
+    expect(result.kept[0].reason).toBe("its shell reports no prompt state");
+  });
+
   it("leaves a bare shell running when its replacement cannot be opened", async () => {
     const closed: string[] = [];
     const result = await moveTerminalsToProject(
@@ -247,6 +273,7 @@ describe("moveTerminalsToProject", () => {
       {
         probe: async () => shell(0),
         shellMark: () => "prompt_start",
+        announcesCommandStarts: () => true,
         createTerminal: async () => null,
         closeTerminal: (id) => {
           closed.push(id);
@@ -260,24 +287,39 @@ describe("moveTerminalsToProject", () => {
 
 describe("readBareIdleShell", () => {
   const bareRoot = { image: "bash", isShell: true, descendants: 0 };
+  const atPrompt = { mark: "prompt_start" as const, announcesCommandStarts: true };
 
   it("needs the root half of the answer — an older runner's bare `absent` is not enough", () => {
-    expect(readBareIdleShell({}, { state: "absent", sessionIds: [] }, "prompt_start")).toEqual({
+    expect(readBareIdleShell({}, { state: "absent", sessionIds: [] }, atPrompt)).toEqual({
       bare: false,
       reason: "its processes could not be read",
       busy: false,
     });
   });
 
-  it("needs a prompt mark: a pane that never emitted one is kept", () => {
+  it("needs a prompt mark: a pane with no current mark is kept", () => {
     expect(
-      readBareIdleShell({}, { state: "absent", sessionIds: [], root: bareRoot }, undefined),
+      readBareIdleShell(
+        {},
+        { state: "absent", sessionIds: [], root: bareRoot },
+        { mark: undefined, announcesCommandStarts: true },
+      ),
     ).toEqual({ bare: false, reason: "its shell reports no prompt state", busy: false });
   });
 
-  it("reads bare only with both halves: a shell with no descendant whose last mark is a prompt", () => {
+  it("keeps a pane at its prompt whose shell never announced command-start marks", () => {
     expect(
-      readBareIdleShell({}, { state: "absent", sessionIds: [], root: bareRoot }, "prompt_start"),
+      readBareIdleShell(
+        {},
+        { state: "absent", sessionIds: [], root: bareRoot },
+        { mark: "prompt_start", announcesCommandStarts: false },
+      ),
+    ).toEqual({ bare: false, reason: "its shell does not report command starts", busy: false });
+  });
+
+  it("reads bare only with both halves: a shell with no descendant, at a prompt it marks", () => {
+    expect(
+      readBareIdleShell({}, { state: "absent", sessionIds: [], root: bareRoot }, atPrompt),
     ).toEqual({ bare: true });
   });
 
@@ -286,12 +328,10 @@ describe("readBareIdleShell", () => {
       readBareIdleShell(
         { remote: { deviceId: "d" } },
         { state: "absent", sessionIds: [], root: bareRoot },
-        "prompt_start",
+        atPrompt,
       ).bare,
     ).toBe(false);
-    expect(readBareIdleShell({}, { state: "remote", sessionIds: [] }, "prompt_start").bare).toBe(
-      false,
-    );
+    expect(readBareIdleShell({}, { state: "remote", sessionIds: [] }, atPrompt).bare).toBe(false);
   });
 
   it("keeps a pane whose root process is gone from the table", () => {
@@ -299,8 +339,53 @@ describe("readBareIdleShell", () => {
       readBareIdleShell(
         {},
         { state: "absent", sessionIds: [], root: { image: null, isShell: false, descendants: 0 } },
-        "prompt_start",
+        atPrompt,
       ),
     ).toEqual({ bare: false, reason: "its process could not be found", busy: false });
+  });
+});
+
+describe("summarizeLastMove", () => {
+  const k = (id: string, reason = "claude is running in it") => ({ id, title: `T-${id}`, reason });
+  const here = "d:/projects/pizzeria";
+
+  it("says Check again only when every outside pane was kept — a failed replacement is not kept", () => {
+    const outside = [{ id: "a" }, { id: "b" }];
+    const allKept = summarizeLastMove(
+      { root: here, kept: [k("a"), k("b")], failed: [] },
+      here,
+      outside,
+    );
+    expect(allKept.allKept).toBe(true);
+    expect(allKept.error).toBeNull();
+
+    const oneFailed = summarizeLastMove(
+      { root: here, kept: [k("a")], failed: [k("b", "its replacement could not be opened")] },
+      here,
+      outside,
+    );
+    expect(oneFailed.allKept).toBe(false);
+    expect(oneFailed.kept.map((x) => x.id)).toEqual(["a", "b"]);
+    expect(oneFailed.error).toBe(
+      "1 terminal could not be reopened at the project folder and was left where it is.",
+    );
+  });
+
+  it("shows nothing from a move made for another project root", () => {
+    const outside = [{ id: "a" }];
+    const other = summarizeLastMove(
+      { root: "d:/projects/book-notes", kept: [k("a")], failed: [k("a")] },
+      here,
+      outside,
+    );
+    expect(other).toEqual({ kept: [], error: null, allKept: false });
+  });
+
+  it("names only panes still outside the root", () => {
+    const summary = summarizeLastMove({ root: here, kept: [k("a"), k("gone")], failed: [] }, here, [
+      { id: "a" },
+    ]);
+    expect(summary.kept.map((x) => x.id)).toEqual(["a"]);
+    expect(summary.allKept).toBe(true);
   });
 });

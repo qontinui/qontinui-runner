@@ -29,6 +29,9 @@ vi.mock("@/lib/instance-storage", () => ({
 
 import { useShellIntegration } from "./useShellIntegration";
 import type { TranscriptSession } from "./useTranscriptSessions";
+import { PaneOutputStream } from "./paneOutputStream";
+import { shellMarksSink } from "./shellIntegrationEvents";
+import { RunnerGate, chunk, paneWriter } from "./__fixtures__/runnerGateModel.testkit";
 
 const SESSION_ID = "0123abcd-4567-89ef-0123-456789abcdef";
 
@@ -101,5 +104,55 @@ describe("useShellIntegration lastPromptMark", () => {
 
     // Marks are per pane.
     expect(hook.lastPromptMark("b")).toBeUndefined();
+  });
+});
+
+/**
+ * The prompt-state readings go stale the moment this window stops parsing the
+ * pane, and must be forgotten then. Wired exactly as `TerminalInstance` wires
+ * it: the output stream's missed-output hook and the mount's cleanup both feed
+ * the pane's `shellMarksSink`, whose events reach the page's real handler.
+ */
+describe("useShellIntegration forgets marks it stopped parsing", () => {
+  function usePane() {
+    const hook = useShellIntegrationWith(vi.fn());
+    const marks = shellMarksSink(() => (event) => hook.handleShellIntegration("t", event));
+    const state = { paused: false };
+    const stream = new PaneOutputStream(paneWriter(new RunnerGate()).queue, {
+      isPaused: () => state.paused,
+      hasBackend: () => true,
+      noteMissedOutput: () => marks.outputMissed(),
+      requestResync: vi.fn(),
+      scheduleFlush: vi.fn(),
+    });
+    // The pane's shell announced command marks and drew its prompt.
+    marks.osc633("P;CommandMarks=1");
+    marks.osc633("A");
+    expect(hook.lastPromptMark("t")).toBe("prompt_start");
+    expect(hook.announcesCommandStarts("t")).toBe(true);
+    return { hook, marks, stream, state };
+  }
+
+  it("a chunk dropped while the pane is hidden clears its prompt mark and capability", () => {
+    const { hook, stream, state } = usePane();
+    // Hidden: e.g. `Get-Content -Wait` typed into it — echo and 633;C unparsed.
+    state.paused = true;
+    expect(stream.receive(chunk(0, 64))).toBe("drop");
+    expect(hook.lastPromptMark("t")).toBeUndefined();
+    expect(hook.announcesCommandStarts("t")).toBe(false);
+  });
+
+  it("an unmount clears its prompt mark and capability", () => {
+    const { hook, marks } = usePane();
+    marks.unmounted();
+    expect(hook.lastPromptMark("t")).toBeUndefined();
+    expect(hook.announcesCommandStarts("t")).toBe(false);
+  });
+
+  it("a live, parsed chunk keeps them", () => {
+    const { hook, stream } = usePane();
+    stream.receive(chunk(0, 64));
+    expect(hook.lastPromptMark("t")).toBe("prompt_start");
+    expect(hook.announcesCommandStarts("t")).toBe(true);
   });
 });

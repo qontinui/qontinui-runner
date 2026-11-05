@@ -8,12 +8,14 @@
  * soft, dismissible advisory with the two honest choices:
  *
  *   [Move them]  — replace a pane with one at the project root only when its
- *                  process table shows a shell with nothing under it AND its
- *                  shell's last prompt-state mark is a prompt, both read again
- *                  just before the original is closed (and only once its
- *                  replacement exists); every other pane is kept and named
- *                  below the prose with the reason. While every outside pane
- *                  was kept, the button reads [Check again];
+ *                  process table shows a shell with nothing under it AND the
+ *                  last mark this window parsed from it while it was live is a
+ *                  prompt, from a shell that announced it marks every command
+ *                  start — both read again just before the original is closed
+ *                  (and only once its replacement exists). Every other pane is
+ *                  kept and named below the prose with the reason. While every
+ *                  outside pane was kept for this project, the button reads
+ *                  [Check again];
  *   [Leave them] — dismiss for this project root.
  *
  * Renders nothing when no project is active, when every live terminal is

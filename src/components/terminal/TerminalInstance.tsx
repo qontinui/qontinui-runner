@@ -68,6 +68,7 @@ import {
 import { declarePaneTier } from "./terminalVisibilityTiers";
 import { PaneVisibilityService, mountBootstrapPlan } from "./paneVisibilityService";
 import { setWebglSlotVisible } from "./backends/webglContextLru";
+import { shellMarksSink, type ShellIntegrationEvent } from "./shellIntegrationEvents";
 import { describeThrown } from "@/lib/utils";
 
 export type { TerminalWriteResult } from "./terminalWriteResult";
@@ -95,13 +96,7 @@ export interface TerminalInstanceHandle {
   focus: () => void;
 }
 
-export type ShellIntegrationEvent =
-  | { type: "prompt_start" }
-  | { type: "command_ready" }
-  | { type: "command_execute" }
-  | { type: "command_done"; exitCode: number }
-  | { type: "command_line"; command: string }
-  | { type: "cwd"; path: string };
+export type { ShellIntegrationEvent } from "./shellIntegrationEvents";
 
 interface TerminalInstanceProps {
   terminalId: string;
@@ -573,13 +568,20 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
       // bytes it wrote: an unacked remainder above the runner's Low watermark
       // wedges a paused emission gate for good (see `ackedWriteQueue.ts`).
       const ackQueue = new AckedWriteQueue(renderAck, sendAck);
+      // Shell integration for this mount. A chunk dropped unparsed while the
+      // pane is hidden, and this mount's end, both tell the page's handler the
+      // pane's prompt-state marks are no longer current (`unobserved`).
+      const shellMarks = shellMarksSink(() => onShellIntegrationRef.current);
       // The hooks close over `paneService` (declared further down). They only
       // run once a chunk arrives, which is after the handler is registered,
       // and that is after `paneService` exists.
       const stream = new PaneOutputStream(ackQueue, {
         isPaused: () => paneService.paused,
         hasBackend: () => backendRef.current !== null,
-        noteMissedOutput: (end) => paneService.noteMissedOutput(end),
+        noteMissedOutput: (end) => {
+          paneService.noteMissedOutput(end);
+          shellMarks.outputMissed();
+        },
         requestResync: () => void resyncFromRing(),
         scheduleFlush: () => scheduleFlush(),
       });
@@ -1544,23 +1546,7 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
         setWebglSlotVisible(terminalId, visibleRef.current);
 
         // OSC 633 shell integration handler
-        disposables.push(
-          backend.onOsc633((data) => {
-            const cb = onShellIntegrationRef.current;
-            if (!cb) return;
-            if (data === "A") cb({ type: "prompt_start" });
-            else if (data === "B") cb({ type: "command_ready" });
-            else if (data === "C") cb({ type: "command_execute" });
-            else if (data.startsWith("D")) {
-              const code = parseInt(data.slice(2), 10);
-              cb({ type: "command_done", exitCode: isNaN(code) ? 0 : code });
-            } else if (data.startsWith("E;")) {
-              cb({ type: "command_line", command: data.slice(2).replace(/\\x3b/g, ";") });
-            } else if (data.startsWith("P;Cwd=")) {
-              cb({ type: "cwd", path: data.slice(6) });
-            }
-          }),
-        );
+        disposables.push(backend.onOsc633((data) => shellMarks.osc633(data)));
       })().catch((err) => {
         // The init IIFE used to be fire-and-forget. Anything it threw —
         // `createTerminalBackend` rejecting on WASM/WebGL, a link-provider or
@@ -1580,6 +1566,9 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
         // bytes reach the (about-to-be-disposed) backend rather than being
         // dropped. Harmless if nothing is staged.
         if (flushScheduled) flushCoalesced();
+        // This mount no longer parses the pane's output; a remount's scrollback
+        // replay is written before its OSC handler exists.
+        shellMarks.unmounted();
         // Stops the ack timer + observer and hands acking back to the page tap.
         paneService.dispose();
         if (paneServiceRef.current === paneService) paneServiceRef.current = null;

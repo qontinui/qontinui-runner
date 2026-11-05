@@ -25,11 +25,15 @@ autoload -Uz add-zsh-hook
 # OSC 633 helper — write directly to /dev/tty so it never pollutes stdout.
 __qontinui_osc633() { printf '\033]633;%s\007' "$1" > /dev/tty }
 
-# precmd: fires before each prompt. Emit D;<exit-code> and P;Cwd=<path>.
+# precmd: fires before each prompt. Emit D;<exit-code>, P;Cwd=<path> and
+# P;CommandMarks=1 — the last announces that this shell marks every command
+# start (preexec below emits C), on every prompt so a runner pane that stopped
+# parsing marks (remounted, or hidden) learns it again at the next prompt.
 __qontinui_precmd() {
     local code=$?
     __qontinui_osc633 "D;${code}"
     __qontinui_osc633 "P;Cwd=${PWD}"
+    __qontinui_osc633 "P;CommandMarks=1"
 }
 
 # preexec: fires before a user-typed command runs. Emit E;<cmd> and C.
