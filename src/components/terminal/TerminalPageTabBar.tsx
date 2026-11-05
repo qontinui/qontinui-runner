@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect } from "react";
 import { Plus, X, Shuffle, SquareArrowOutUpRight, BrushCleaning } from "lucide-react";
 import { keyboardReorderTarget, type TerminalPageConfig } from "./useTerminalPages";
+import { NAME_IN_USE } from "./pageNaming";
 
 /**
  * Sentinel `dragOverId` value for the drop zone AFTER the last tab (the
@@ -12,9 +13,18 @@ interface TerminalPageTabBarProps {
   pages: TerminalPageConfig[];
   activePageId: string;
   onSelectPage: (id: string) => void;
-  onAddPage: (name: string) => void;
+  /**
+   * Add a page. Called with NO name: the page hook names it against the full
+   * roster (detached pages included), which this strip cannot see.
+   */
+  onAddPage: () => void;
   onRemovePage: (id: string) => void;
-  onRenamePage: (id: string, name: string) => void;
+  /**
+   * Rename a page. Returning `false` means the name was refused (another page
+   * uses it, or it is the default page's reserved "Terminal"): the input stays
+   * open and shows {@link NAME_IN_USE}.
+   */
+  onRenamePage: (id: string, name: string) => boolean | void;
   /**
    * Drag-to-reorder (and its Alt+Arrow keyboard equivalent — WCAG 2.5.7
    * requires a non-dragging alternative to a drag-only gesture): move
@@ -55,6 +65,7 @@ export function TerminalPageTabBar({
 }: TerminalPageTabBarProps) {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editValue, setEditValue] = useState("");
+  const [renameError, setRenameError] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const [closingEmpty, setClosingEmpty] = useState(false);
   const [closeEmptyNote, setCloseEmptyNote] = useState<string | null>(null);
@@ -102,20 +113,29 @@ export function TerminalPageTabBar({
   const startRename = (id: string, currentName: string) => {
     setEditingId(id);
     setEditValue(currentName);
+    setRenameError(null);
+  };
+
+  const cancelRename = () => {
+    setEditingId(null);
+    setEditValue("");
+    setRenameError(null);
   };
 
   const commitRename = () => {
     if (editingId && editValue.trim()) {
-      onRenamePage(editingId, editValue.trim());
+      // A refused name keeps the input open with the reason, rather than
+      // silently committing a second tab with the same label.
+      if (onRenamePage(editingId, editValue.trim()) === false) {
+        setRenameError(NAME_IN_USE);
+        return;
+      }
     }
-    setEditingId(null);
-    setEditValue("");
+    cancelRename();
   };
 
-  const handleAdd = () => {
-    const name = `Page ${pages.length + 1}`;
-    onAddPage(name);
-  };
+  // No name: the page hook owns naming (see `onAddPage`).
+  const handleAdd = () => onAddPage();
 
   // Page-pinned pop-out window: one fixed page, no tab strip — just a label.
   if (isPinned) {
@@ -162,19 +182,28 @@ export function TerminalPageTabBar({
                 <input
                   ref={inputRef}
                   value={editValue}
-                  onChange={(e) => setEditValue(e.target.value)}
+                  onChange={(e) => {
+                    setEditValue(e.target.value);
+                    setRenameError(null);
+                  }}
                   onBlur={commitRename}
                   onKeyDown={(e) => {
                     e.stopPropagation();
                     if (e.key === "Enter") commitRename();
-                    if (e.key === "Escape") {
-                      setEditingId(null);
-                      setEditValue("");
-                    }
+                    if (e.key === "Escape") cancelRename();
                   }}
-                  className="bg-[#13141f] border border-[#7aa2f7] rounded px-1 py-0 text-[11px] text-[#c0caf5] outline-hidden w-24"
+                  aria-invalid={renameError !== null}
+                  aria-label="Page name"
+                  className={`bg-[#13141f] border rounded px-1 py-0 text-[11px] text-[#c0caf5] outline-hidden w-24 ${
+                    renameError ? "border-[#f7768e]" : "border-[#7aa2f7]"
+                  }`}
                   maxLength={30}
                 />
+                {renameError && (
+                  <span role="alert" className="text-[10px] text-[#f7768e] whitespace-nowrap">
+                    {renameError}
+                  </span>
+                )}
               </div>
             );
           }
