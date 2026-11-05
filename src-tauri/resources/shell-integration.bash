@@ -20,10 +20,15 @@ __osc633() {
 # Saved exit code for D marker (captured before PROMPT_COMMAND clobbers $?)
 __qontinui_last_exit=0
 
-# PROMPT_COMMAND: emit D;<code> and P;Cwd=<path>
+# PROMPT_COMMAND: emit D;<code>, P;Cwd=<path> and P;CommandMarks=1. The last
+# announces that this shell marks every command start (the DEBUG trap below
+# emits C), so the runner can read a prompt mark (A) as "nothing is running".
+# It rides every prompt, not just the first: a pane remounted or hidden in the
+# runner stops parsing marks, and the next prompt re-announces it.
 __qontinui_prompt_command() {
     __osc633 "D;${__qontinui_last_exit}"
     __osc633 "P;Cwd=$(pwd)"
+    __osc633 "P;CommandMarks=1"
 }
 
 # Prepend to any existing PROMPT_COMMAND

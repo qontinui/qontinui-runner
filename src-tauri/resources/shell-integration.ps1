@@ -39,6 +39,12 @@ function global:Prompt {
     # Build result with embedded OSC 633 sequences (zero-width in the terminal)
     $result = "${__q_esc}]633;D;${exitCode}${__q_bel}"
     $result += "${__q_esc}]633;P;Cwd=$(Get-Location)${__q_bel}"
+    # P;CommandMarks=1: this shell marks every command start (633;C). Only the
+    # PSReadLine hook below emits C, so only that branch arms the flag; without
+    # it a prompt mark says nothing about whether a command is running.
+    if ($global:__qontinui_command_marks) {
+        $result += "${__q_esc}]633;P;CommandMarks=1${__q_bel}"
+    }
     $result += "${__q_esc}]633;A${__q_bel}"
 
     # Invoke original prompt (or a simple default)
@@ -164,6 +170,8 @@ if ($env:QONTINUI_RUNNER_TERMINAL -eq "1") {
 # PSReadLine is available in PS 5.1+ and all PS 7.x
 if (Get-Module -Name PSReadLine -ErrorAction SilentlyContinue) {
     $__qontinui_original_readline = $function:PSConsoleHostReadLine
+    # Every command now gets a C mark, so every prompt may announce it.
+    $global:__qontinui_command_marks = $true
 
     function global:PSConsoleHostReadLine {
         $line = if ($__qontinui_original_readline) {

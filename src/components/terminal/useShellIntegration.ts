@@ -1,5 +1,5 @@
 import { useCallback, useRef, useState } from "react";
-import type { ShellIntegrationEvent } from "./TerminalInstance";
+import type { ShellIntegrationEvent } from "./shellIntegrationEvents";
 import type { TerminalInstanceHandle } from "./TerminalInstance";
 import type { TranscriptSession } from "./useTranscriptSessions";
 import type { SessionState } from "./useZoneLayout";
@@ -8,11 +8,20 @@ import { resumeInNewTab, type ResumeAttempt, type ResumeTarget } from "./resumeI
 
 /**
  * The prompt-state half of a pane's OSC 633 shell integration: which of the two
- * marks it emitted LAST — `prompt_start` (633;A, the shell drew its prompt) or
- * `command_execute` (633;C, the shell started running what was typed). Every
- * default pane's shell (bash, zsh, PowerShell) emits both; a pane that emitted
- * neither (a direct exec such as `bash ./job.sh`, `cmd`, a pane whose output
- * this window never rendered) has no reading at all.
+ * marks this window last PARSED from it while the pane was live —
+ * `prompt_start` (633;A, the shell drew its prompt) or `command_execute`
+ * (633;C, the shell started running what was typed).
+ *
+ * Not every shell emits 633;C: PowerShell without PSReadLine draws prompts
+ * (633;A) and never marks a command start, so a prompt mark alone cannot say
+ * "idle". A shell that does emit it announces so with `633;P;CommandMarks=1`
+ * (see {@link UseShellIntegrationResult.announcesCommandStarts}).
+ *
+ * There is no reading at all for a pane that emitted neither mark (a direct
+ * exec such as `bash ./job.sh`, `cmd`) or whose marks went unparsed: a chunk
+ * dropped while the pane was hidden, or a pane that unmounted, clears both
+ * readings (the synthetic `unobserved` event), and a remount's scrollback
+ * replay is never parsed for them.
  */
 export type ShellPromptMark = "prompt_start" | "command_execute";
 
@@ -80,6 +89,12 @@ interface UseShellIntegrationResult {
    * call time — it is a ref, not state, so a prompt redraw re-renders nothing.
    */
   lastPromptMark: (tabId: string) => ShellPromptMark | undefined;
+  /**
+   * Whether `tabId`'s shell announced (`633;P;CommandMarks=1`) that it emits a
+   * command-start mark for every command, since this window last stopped
+   * parsing it. Same lifetime as {@link lastPromptMark}.
+   */
+  announcesCommandStarts: (tabId: string) => boolean;
 }
 
 export function useShellIntegration({
@@ -100,8 +115,13 @@ export function useShellIntegration({
   );
   const pendingCommandRef = useRef<Record<string, string>>({});
   const lastPromptMarkRef = useRef<Record<string, ShellPromptMark>>({});
+  const commandMarksRef = useRef<Record<string, true>>({});
   const lastPromptMark = useCallback(
     (tabId: string): ShellPromptMark | undefined => lastPromptMarkRef.current[tabId],
+    [],
+  );
+  const announcesCommandStarts = useCallback(
+    (tabId: string): boolean => commandMarksRef.current[tabId] === true,
     [],
   );
 
@@ -109,6 +129,14 @@ export function useShellIntegration({
     (tabId: string, event: ShellIntegrationEvent) => {
       if (event.type === "prompt_start" || event.type === "command_execute") {
         lastPromptMarkRef.current[tabId] = event.type;
+      } else if (event.type === "command_marks") {
+        commandMarksRef.current[tabId] = true;
+      } else if (event.type === "unobserved") {
+        // This window stopped parsing the pane: what its shell reported before
+        // is no longer known to be current.
+        delete lastPromptMarkRef.current[tabId];
+        delete commandMarksRef.current[tabId];
+        return;
       }
       if (event.type === "prompt_start") {
         // Shell prompt appeared. A `prompt_start` only means "a shell prompt
@@ -219,5 +247,6 @@ export function useShellIntegration({
     resumeTarget,
     handleFirstInput,
     lastPromptMark,
+    announcesCommandStarts,
   };
 }

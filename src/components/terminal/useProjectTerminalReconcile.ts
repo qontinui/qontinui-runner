@@ -19,10 +19,14 @@
  *      a shell and nothing at all runs under it. Necessary, not sufficient —
  *      PowerShell runs cmdlets and scripts in-process (`Get-Content -Wait`, a
  *      `.ps1` loop, `Enter-PSSession`), so a busy pwsh can have no descendant;
- *   2. the SHELL'S OWN PROMPT STATE (OSC 633): the last mark the pane's shell
- *      emitted is a prompt (633;A), not a command start (633;C). A pane that
- *      never emitted either — a direct exec such as `bash ./job.sh`, `cmd`, a
- *      pane this window never rendered — has no such reading and is kept.
+ *   2. the SHELL'S OWN PROMPT STATE (OSC 633): the last mark this window
+ *      parsed from the pane while it was live is a prompt (633;A), and the
+ *      shell has announced (`633;P;CommandMarks=1`) that it marks every
+ *      command start (633;C) — PowerShell without PSReadLine draws prompts but
+ *      never marks a command, so its prompt mark says nothing. A pane with no
+ *      such reading is kept: one whose shell emits no marks (`bash ./job.sh`,
+ *      `cmd`), and one whose marks this window stopped parsing — output dropped
+ *      while it was hidden, or a remount (its scrollback replay is not parsed).
  *
  * Both are read before the replacement is opened and again just before the
  * original is closed, and the original closes **only after its replacement
@@ -99,12 +103,20 @@ export function findTerminalsOutsideProject<T extends ReconcilableTerminal>(
  */
 export type BareShellReading = { bare: true } | { bare: false; reason: string; busy: boolean };
 
+/** What a pane's shell last reported, as `useShellIntegration` parsed it. */
+export interface ShellPromptReading {
+  /** Its last prompt-state mark; `undefined` when none is current. */
+  mark: ShellPromptMark | undefined;
+  /** It announced that it marks every command start. */
+  announcesCommandStarts: boolean;
+}
+
 /**
  * Is this pane a bare idle shell? Both readings must say so (see the module
  * docs): the process table — its root a shell (never a `claude` of any install)
- * with no descendant at all — AND the shell's own last prompt-state mark, a
- * prompt rather than a command start. Anything short of that keeps the pane.
- * PURE.
+ * with no descendant at all — AND the shell's own prompt state: a parsed prompt
+ * mark from a shell that marks every command start. Anything short of that
+ * keeps the pane. PURE.
  *
  * `state: "absent"` alone is not the process half: it only says no process
  * NAMED `claude` is in the subtree, and an npm-installed Claude Code runs as
@@ -113,7 +125,7 @@ export type BareShellReading = { bare: true } | { bare: false; reason: string; b
 export function readBareIdleShell(
   tab: Pick<ReconcilableTerminal, "remote">,
   probe: PaneClaudeProbe,
-  mark: ShellPromptMark | undefined,
+  shell: ShellPromptReading,
 ): BareShellReading {
   if (tab.remote || probe.state === "remote") {
     return {
@@ -138,11 +150,16 @@ export function readBareIdleShell(
       busy: true,
     };
   }
-  if (mark === undefined) {
+  // The prompt half is a POSITIVE check: only a parsed prompt mark from a shell
+  // that marks command starts reads idle; anything else keeps the pane.
+  if (shell.mark === undefined) {
     return { bare: false, reason: "its shell reports no prompt state", busy: false };
   }
-  if (mark === "command_execute") {
-    return { bare: false, reason: "a command is running in its shell", busy: true };
+  if (!shell.announcesCommandStarts) {
+    return { bare: false, reason: "its shell does not report command starts", busy: false };
+  }
+  if (shell.mark !== "prompt_start") {
+    return { bare: false, reason: "its shell last reported a command start", busy: true };
   }
   return { bare: true };
 }
@@ -160,6 +177,8 @@ export interface ProjectMoveDeps {
   probe: (tabId: string) => Promise<PaneClaudeProbe>;
   /** The pane's last OSC 633 prompt-state mark (`useShellIntegration().lastPromptMark`). */
   shellMark: (tabId: string) => ShellPromptMark | undefined;
+  /** Its shell announced command-start marks (`useShellIntegration().announcesCommandStarts`). */
+  announcesCommandStarts: (tabId: string) => boolean;
   createTerminal: (
     title: string,
     workingDir: string,
@@ -186,6 +205,13 @@ export interface ProjectMoveOutcome {
  * instead). Serial, so a resource-guard refusal mid-move names the move and the
  * terminals still ahead.
  */
+function shellReading(deps: ProjectMoveDeps, tabId: string): ShellPromptReading {
+  return {
+    mark: deps.shellMark(tabId),
+    announcesCommandStarts: deps.announcesCommandStarts(tabId),
+  };
+}
+
 export async function moveTerminalsToProject(
   outside: readonly ReconcilableTerminal[],
   root: string,
@@ -193,7 +219,7 @@ export async function moveTerminalsToProject(
 ): Promise<ProjectMoveOutcome> {
   const outcome: ProjectMoveOutcome = { replaced: [], kept: [], failed: [] };
   for (const [index, tab] of outside.entries()) {
-    const before = readBareIdleShell(tab, await deps.probe(tab.id), deps.shellMark(tab.id));
+    const before = readBareIdleShell(tab, await deps.probe(tab.id), shellReading(deps, tab.id));
     if (!before.bare) {
       outcome.kept.push({ id: tab.id, title: tab.title, reason: before.reason });
       continue;
@@ -215,7 +241,7 @@ export async function moveTerminalsToProject(
       });
       continue;
     }
-    const after = readBareIdleShell(tab, await deps.probe(tab.id), deps.shellMark(tab.id));
+    const after = readBareIdleShell(tab, await deps.probe(tab.id), shellReading(deps, tab.id));
     if (!after.bare) {
       deps.closeTerminal(replacementId);
       outcome.kept.push({
@@ -231,6 +257,53 @@ export async function moveTerminalsToProject(
     outcome.replaced.push(tab.id);
   }
   return outcome;
+}
+
+/** The last "Move them" outcome, keyed by the NORMALIZED root it ran for. */
+export interface LastProjectMove {
+  root: string;
+  kept: KeptTerminal[];
+  failed: KeptTerminal[];
+}
+
+/** What the chip shows about the last move, for the root it is showing NOW. */
+export interface ProjectMoveSummary {
+  /** Every pane the last move left where it is, still outside: kept, then failed. */
+  kept: KeptTerminal[];
+  /** Panes whose replacement could not be opened, as a sentence; `null` when none. */
+  error: string | null;
+  /** Every outside pane was KEPT (not failed) — another press can only re-check. */
+  allKept: boolean;
+}
+
+/**
+ * Summarise `lastMove` for the chip showing `normalizedRoot`. PURE.
+ *
+ * A move made for another root says nothing about this one (a project switch
+ * shows no stale reasons, error or "Check again"); only panes still outside
+ * the root are named; and a pane whose replacement failed to open is not
+ * "kept" — another press may move it — so it never makes `allKept` true.
+ */
+export function summarizeLastMove(
+  lastMove: LastProjectMove | null,
+  normalizedRoot: string | null,
+  outside: readonly Pick<ReconcilableTerminal, "id">[],
+): ProjectMoveSummary {
+  const mine = lastMove !== null && lastMove.root === normalizedRoot ? lastMove : null;
+  const stillOutside = (k: KeptTerminal) => outside.some((t) => t.id === k.id);
+  const keptOnly = (mine?.kept ?? []).filter(stillOutside);
+  const failed = (mine?.failed ?? []).filter(stillOutside);
+  const n = failed.length;
+  return {
+    kept: [...keptOnly, ...failed],
+    error:
+      n > 0
+        ? `${n} terminal${n === 1 ? "" : "s"} could not be reopened at the project folder and ${
+            n === 1 ? "was" : "were"
+          } left where ${n === 1 ? "it is" : "they are"}.`
+        : null,
+    allKept: outside.length > 0 && keptOnly.length === outside.length,
+  };
 }
 
 export interface ProjectTerminalReconcile {
@@ -252,14 +325,16 @@ export interface ProjectTerminalReconcile {
   /** Set when one or more replacements could not be spawned. */
   error: string | null;
   /**
-   * The panes the last `moveThem()` left where they are because they are not
-   * bare idle shells, each with the reason. Empty before any move.
+   * The panes the last `moveThem()` for THIS root left where they are, each
+   * with the reason — not bare idle shells, or a replacement that could not be
+   * opened. Empty before any move, and after a switch to another root.
    */
   kept: KeptTerminal[];
   /**
-   * True when the last `moveThem()` kept EVERY pane still outside the root, so
-   * pressing the button again can only re-check them — the chip says
-   * "Check again" rather than promising a move.
+   * True when the last `moveThem()` FOR THIS ROOT kept every pane still outside
+   * it because it is not a bare idle shell (a pane whose replacement failed to
+   * open does not count), so pressing the button again can only re-check them
+   * — the chip says "Check again" rather than promising a move.
    */
   allKept: boolean;
   /**
@@ -280,23 +355,24 @@ export function useProjectTerminalReconcile(
   projectRoot: string | null | undefined,
 ): ProjectTerminalReconcile {
   const { tabs, createTerminal, closeTerminal, shellIntegration } = useTerminalSession();
-  const { lastPromptMark } = shellIntegration;
+  const { lastPromptMark, announcesCommandStarts } = shellIntegration;
   // Dismissal is keyed by the NORMALIZED root, so switching projects (or
   // correcting a root's spelling) re-arms the chip while re-activating the
   // same project keeps it dismissed.
   const [dismissedRoot, setDismissedRoot] = useState<string | null>(null);
   const [moving, setMoving] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [keptAll, setKeptAll] = useState<KeptTerminal[]>([]);
+  // The last move's outcome, keyed by the NORMALIZED root it ran for (as the
+  // dismissal is): a project switch shows no reasons, error or "Check again"
+  // from a root the operator never moved.
+  const [lastMove, setLastMove] = useState<LastProjectMove | null>(null);
 
   const root = projectRoot?.trim() || null;
   const normalizedRoot = root ? normalizePathForCompare(root) : null;
 
   const outside = useMemo(() => findTerminalsOutsideProject(tabs, root), [tabs, root]);
-  // Only name a kept pane while it is still outside the root.
-  const kept = useMemo(
-    () => keptAll.filter((k) => outside.some((t) => t.id === k.id)),
-    [keptAll, outside],
+  const summary = useMemo(
+    () => summarizeLastMove(lastMove, normalizedRoot, outside),
+    [lastMove, normalizedRoot, outside],
   );
 
   const dismissed = normalizedRoot !== null && dismissedRoot === normalizedRoot;
@@ -306,30 +382,31 @@ export function useProjectTerminalReconcile(
   }, [normalizedRoot]);
 
   const moveThem = useCallback(async () => {
-    if (!root || moving || outside.length === 0) return;
+    if (!root || !normalizedRoot || moving || outside.length === 0) return;
     setMoving(true);
-    setError(null);
     let outcome: ProjectMoveOutcome;
     try {
       outcome = await moveTerminalsToProject(outside, root, {
         probe: (tabId) => probeClaudeInPane(tabId),
         shellMark: lastPromptMark,
+        announcesCommandStarts,
         createTerminal,
         closeTerminal,
       });
     } finally {
       setMoving(false);
     }
-    setKeptAll([...outcome.kept, ...outcome.failed]);
-    const failed = outcome.failed.length;
-    if (failed > 0) {
-      setError(
-        `${failed} terminal${failed === 1 ? "" : "s"} could not be reopened at the project folder and ${
-          failed === 1 ? "was" : "were"
-        } left where ${failed === 1 ? "it is" : "they are"}.`,
-      );
-    }
-  }, [root, moving, outside, createTerminal, closeTerminal, lastPromptMark]);
+    setLastMove({ root: normalizedRoot, kept: outcome.kept, failed: outcome.failed });
+  }, [
+    root,
+    normalizedRoot,
+    moving,
+    outside,
+    createTerminal,
+    closeTerminal,
+    lastPromptMark,
+    announcesCommandStarts,
+  ]);
 
   return {
     projectRoot: root,
@@ -338,9 +415,9 @@ export function useProjectTerminalReconcile(
     moving,
     dismissed,
     shouldPrompt: root !== null && outside.length > 0 && !dismissed,
-    error,
-    kept,
-    allKept: outside.length > 0 && kept.length === outside.length,
+    error: summary.error,
+    kept: summary.kept,
+    allKept: summary.allKept,
     moveThem,
     dismiss,
   };
