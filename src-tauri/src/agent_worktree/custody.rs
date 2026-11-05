@@ -1356,6 +1356,11 @@ pub mod coord {
     #[serde(rename_all = "camelCase")]
     pub struct CoordSessionRow {
         pub session_id: String,
+        /// The Claude Code session id this row is filed under — the KEY of
+        /// the keyed read, by which a keyed answer is mapped back to the id it
+        /// was asked about. `None` from a coord that omits it.
+        #[serde(default)]
+        pub claude_code_session_id: Option<String>,
         /// `expected` | `active` | `pending_resolution` | `stale` | `closed`.
         #[serde(default)]
         pub owner_session_state: Option<String>,
@@ -1417,7 +1422,7 @@ pub mod coord {
     pub const MAX_PAGES: usize = 100;
 
     /// Wall-clock budget for the operator-facing survey's whole walk. The
-    /// per-request client timeout (15 s) bounds ONE page; this bounds the sum,
+    /// per-request timeout ([`REQUEST_TIMEOUT`]) bounds ONE page; this bounds the sum,
     /// so a slow ledger yields a partial index rather than an N x 15 s hang.
     pub const SURVEY_WALK_BUDGET: Duration = Duration::from_secs(20);
 
@@ -1497,26 +1502,8 @@ pub mod coord {
     pub async fn walk_pages<F, Fut>(
         max_pages: usize,
         budget: Duration,
-        fetch_page: F,
-    ) -> Result<(CoordSessionWorktrees, Option<String>), String>
-    where
-        F: FnMut(Option<String>) -> Fut,
-        Fut: std::future::Future<Output = Result<CoordSessionWorktrees, String>>,
-    {
-        let (merged, partial, _pages_read) =
-            walk_pages_counted(max_pages, budget, fetch_page).await?;
-        Ok((merged, partial))
-    }
-
-    /// [`walk_pages`], also returning how many pages the walk MERGED — the
-    /// number [`ownership_from_walks`] reads to tell a one-snapshot walk from a
-    /// multi-snapshot one, so it comes from the walk itself rather than from a
-    /// caller-side counter no test reaches.
-    pub async fn walk_pages_counted<F, Fut>(
-        max_pages: usize,
-        budget: Duration,
         mut fetch_page: F,
-    ) -> Result<(CoordSessionWorktrees, Option<String>, usize), String>
+    ) -> Result<(CoordSessionWorktrees, Option<String>), String>
     where
         F: FnMut(Option<String>) -> Fut,
         Fut: std::future::Future<Output = Result<CoordSessionWorktrees, String>>,
@@ -1584,8 +1571,7 @@ pub mod coord {
                 }
             }
         }
-        let pages_read = pages.len();
-        Ok((merge_pages(pages), partial, pages_read))
+        Ok((merge_pages(pages), partial))
     }
 
     /// Project coord's five-valued session state onto the tri-state
@@ -1629,20 +1615,16 @@ pub mod coord {
         /// `None` ⇒ the walk reached `nextCursor: null` (or an old coord's one
         /// and only page).
         pub partial: Option<String>,
-        /// `coord.sessions.id`s (lowercased) POSITIVELY known live for this
-        /// read: listed on a validated live page, or — holding no rows —
-        /// agreed live by both work-status reads around the pages. See
-        /// [`fetch_live_ownership`].
-        /// Empty for an index built by [`Self::from_response`] alone, which
-        /// asserts nothing about liveness.
-        live_sessions: std::collections::HashSet<String>,
-        /// Claude session id (lowercased) → the `coord.sessions.id` that BOTH
-        /// work-status reads around the pages named as answering for it. This
-        /// is the row the route attributes that Claude session's ledger rows
-        /// to, so it is the lookup key even when the pane itself carries no
-        /// coord id (a plain terminal the runner never bound). Empty for an
-        /// index built by [`Self::from_response`] alone.
+        /// Claude session id (lowercased) → the `coord.sessions.id` coord's
+        /// KEYED read answered it with (its own `sessions[]` entry, whatever
+        /// that session's state). The ONLY way the custody gate resolves a
+        /// Claude session to its ledger rows. Empty for an index built by
+        /// [`Self::from_response`] alone.
         coord_row_by_claude: std::collections::HashMap<String, String>,
+        /// Claude session id (lowercased) → why the keyed read did NOT answer
+        /// it (`unknown`, `invalid`, cut by `inputTruncated`, …). Such a
+        /// session's worktrees are UNKNOWN, never "none".
+        unanswered_by_claude: std::collections::HashMap<String, String>,
     }
 
     impl CoordOwnership {
@@ -1669,8 +1651,8 @@ pub mod coord {
                 by_path,
                 reachable: true,
                 partial: None,
-                live_sessions: std::collections::HashSet::new(),
                 coord_row_by_claude: std::collections::HashMap::new(),
+                unanswered_by_claude: std::collections::HashMap::new(),
             }
         }
 
@@ -1680,7 +1662,8 @@ pub mod coord {
             self
         }
 
-        /// Record which `coord.sessions.id` answers for each Claude session id.
+        /// Record which `coord.sessions.id` the keyed read answered each
+        /// Claude session id with.
         pub fn record_coord_rows(&mut self, rows: impl IntoIterator<Item = (String, String)>) {
             self.coord_row_by_claude.extend(
                 rows.into_iter()
@@ -1688,27 +1671,27 @@ pub mod coord {
             );
         }
 
-        /// The `coord.sessions.id` both work-status reads named for
-        /// `claude_session_id`, when they agreed on one.
+        /// Record why the keyed read did not answer each Claude session id.
+        pub fn record_unanswered(&mut self, ids: impl IntoIterator<Item = (String, String)>) {
+            self.unanswered_by_claude.extend(
+                ids.into_iter()
+                    .map(|(claude, why)| (claude.to_ascii_lowercase(), why)),
+            );
+        }
+
+        /// The `coord.sessions.id` the keyed read answered
+        /// `claude_session_id` with, if it did.
         pub fn coord_session_for_claude(&self, claude_session_id: &str) -> Option<&str> {
             self.coord_row_by_claude
                 .get(&claude_session_id.to_ascii_lowercase())
                 .map(String::as_str)
         }
 
-        /// Record `session_ids` as positively live when this index was read.
-        pub fn mark_live<'a>(&mut self, session_ids: impl IntoIterator<Item = &'a str>) {
-            self.live_sessions
-                .extend(session_ids.into_iter().map(str::to_ascii_lowercase));
-        }
-
-        /// Is `session_id` (a `coord.sessions.id`) positively known live? Only
-        /// then does an absence of its rows mean "no worktrees" — a session
-        /// coord has closed, or one that moved between states while the pages
-        /// were read, is on no live page although its rows may exist.
-        pub fn is_known_live(&self, session_id: &str) -> bool {
-            self.live_sessions
-                .contains(&session_id.to_ascii_lowercase())
+        /// Why the keyed read did not answer `claude_session_id`, if it said.
+        pub fn unanswered_reason(&self, claude_session_id: &str) -> Option<&str> {
+            self.unanswered_by_claude
+                .get(&claude_session_id.to_ascii_lowercase())
+                .map(String::as_str)
         }
 
         pub fn len(&self) -> usize {
@@ -1808,28 +1791,12 @@ pub mod coord {
             return Ok(None);
         };
         let base_url = format!("{}/coord/sessions/worktrees", base.trim_end_matches('/'));
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(15))
-            .build()
-            .map_err(|e| format!("build custody http client: {e}"))?;
+        let Some(client) = crate::coord_http::coord_client() else {
+            return Err("the shared coord HTTP client could not be built".to_string());
+        };
         let (merged, partial) = walk_pages(MAX_PAGES, budget, |cursor| {
             let url = page_url(&base_url, cursor.as_deref());
-            let client = client.clone();
-            async move {
-                let resp = crate::coord_http::coord_get(&client, &url)
-                    .send()
-                    .await
-                    .map_err(|e| format!("GET {url}: {e}"))?;
-                let status = resp.status();
-                if !status.is_success() {
-                    let body = resp.text().await.unwrap_or_default();
-                    let excerpt: String = body.chars().take(200).collect();
-                    return Err(format!("coord returned {status} for GET {url}: {excerpt}"));
-                }
-                resp.json::<CoordSessionWorktrees>()
-                    .await
-                    .map_err(|e| format!("decode session-worktrees: {e}"))
-            }
+            async move { get_json::<CoordSessionWorktrees>(client, &url).await }
         })
         .await?;
         Ok(Some(
@@ -1848,224 +1815,238 @@ pub mod coord {
         }
     }
 
-    /// `…/coord/sessions/worktrees?state=<state>&limit=500[&cursor=<urlencoded>]`.
-    fn state_page_url(base_url: &str, state: &str, cursor: Option<&str>) -> String {
-        let first = format!("{base_url}?state={state}&limit={PAGE_LIMIT}");
-        match cursor {
-            Some(c) => format!("{first}&cursor={}", urlencoding::encode(c)),
-            None => first,
-        }
+    /// coord's cap on the keyed read's key — `MAX_IDS` (500) on the coord
+    /// side (`qontinui-coord` `crates/coord/src/session_worktrees.rs`, via
+    /// `session_work_status::parse_ids`). Ids past it are cut and reported as
+    /// `inputTruncated`; the runner never sends more than
+    /// [`KEYED_CHUNK_IDS`] per request, so it never relies on that report.
+    pub const KEYED_MAX_IDS: usize = 500;
+
+    /// Ids per keyed request. Below [`KEYED_MAX_IDS`] on purpose: 500 UUIDs
+    /// make a ~18.5 KB request line, past the ~16 KB that common load
+    /// balancers accept, which would turn a large candidate set into a
+    /// permanent UNKNOWN. 200 keeps the URL near 7.5 KB.
+    pub const KEYED_CHUNK_IDS: usize = 200;
+    const _: () = assert!(KEYED_CHUNK_IDS <= KEYED_MAX_IDS);
+
+    /// Per-request deadline for one session-worktrees read — a keyed chunk or
+    /// one survey page — on the shared [`crate::coord_http::coord_client`],
+    /// which carries no global timeout of its own.
+    pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+
+    /// `"<what>: <error>: <source>: …"` — the error with its whole
+    /// `source()` chain. reqwest's own `Display` stops at `error sending
+    /// request for url (…)`; the cause a reader needs (`operation timed out`,
+    /// an OS error) is one or more `source()` hops down.
+    fn request_error(what: &str, e: &(dyn std::error::Error + 'static)) -> String {
+        format!("{what}: {}", crate::util::error_chain::error_chain(e))
     }
 
-    /// The coord session states a session that can still be running is in —
-    /// every state but `closed`. The wind-down executor's custody gate reads
-    /// the attributed worktrees of a LIVE session, so these are the pages it
-    /// needs.
-    pub const LIVE_SESSION_STATES: [&str; 4] =
-        ["active", "pending_resolution", "stale", "expected"];
-
-    /// The ledger-row limit sent per page — coord's own clamp ceiling, the
-    /// same [`PAGE_LIMIT`] the survey's walk sends.
-    pub const SESSION_WORKTREES_PAGE_LIMIT: usize = PAGE_LIMIT as usize;
-
-    /// PURE: a page is usable only when it is provably COMPLETE.
-    ///
-    /// * the session bridge column must be reported present — without it the
-    ///   join is inexpressible and `sessions: []` is unknown, not empty;
-    /// * a page from a coord that predates the keyset cursor (the
-    ///   `nextCursor` key ABSENT) must hold FEWER ledger rows than the limit
-    ///   sent: coord applies `LIMIT` to ledger rows tenant-wide, so a full
-    ///   page may have cut off the very session asked about — and a missing
-    ///   row would read as "nothing attributed". A cursor-walked index is
-    ///   bounded by [`walk_pages`] instead, whose `partial` the caller refuses;
-    ///   [`merge_pages`] always sets `nextCursor`, so on the live path this
-    ///   row-limit rule is a backstop that the walk's own `partial` arm
-    ///   already covers, kept for any caller that hands in an unmerged page.
-    pub fn validate_complete_page(
-        page: &CoordSessionWorktrees,
-        state: &str,
-        limit: usize,
-    ) -> Result<(), String> {
-        if page.session_bridge_column_present != Some(true) {
-            return Err(format!(
-                "coord's session-worktrees page for state={state} does not report the \
-                 claude_code_session_id bridge column present, so its rows cannot be trusted \
-                 as complete"
-            ));
-        }
-        let rows: usize = page.sessions.iter().map(|s| s.worktrees.len()).sum();
-        if page.next_cursor.is_none() && rows >= limit {
-            return Err(format!(
-                "coord's session-worktrees page for state={state} returned {rows} ledger rows at \
-                 limit={limit}, so it may be truncated"
-            ));
-        }
-        Ok(())
-    }
-
-    /// TEST HELPER: validate every `(state, page)` and union them into one
-    /// index, each page taken as ONE snapshot (see [`ownership_from_walks`]).
-    /// Test-only on purpose: it marks every listed session live, which is right
-    /// only for a one-page walk, so production goes through
-    /// [`ownership_from_walks`] with the walk's real page count.
-    #[cfg(test)]
-    pub fn ownership_from_pages(
-        pages: Vec<(&str, CoordSessionWorktrees)>,
-        limit: usize,
-    ) -> Result<CoordOwnership, String> {
-        let empty = std::collections::HashMap::new();
-        ownership_from_walks(
-            pages
-                .into_iter()
-                .map(|(state, page)| StateWalk {
-                    state,
-                    page,
-                    pages_read: 1,
-                })
-                .collect(),
-            limit,
-            &empty,
-            &empty,
+    /// GET `url` with the device bearer and [`REQUEST_TIMEOUT`], and decode a
+    /// 2xx body as `T`. Every failure is `Err` with its full cause chain.
+    async fn get_json<T: serde::de::DeserializeOwned>(
+        client: &reqwest::Client,
+        url: &str,
+    ) -> Result<T, String> {
+        send_json(
+            crate::coord_http::coord_get(client, url),
+            url,
+            REQUEST_TIMEOUT,
         )
+        .await
     }
 
-    /// One live state's cursor walk: the merged page and how many pages it
-    /// took.
-    #[derive(Debug, Clone)]
-    pub struct StateWalk<'a> {
-        pub state: &'a str,
-        pub page: CoordSessionWorktrees,
-        pub pages_read: usize,
+    /// [`get_json`]'s transport half, over an already-built request — the
+    /// seam the tests drive without a device bearer.
+    async fn send_json<T: serde::de::DeserializeOwned>(
+        req: reqwest::RequestBuilder,
+        url: &str,
+        timeout: Duration,
+    ) -> Result<T, String> {
+        let resp = req
+            .timeout(timeout)
+            .send()
+            .await
+            .map_err(|e| request_error(&format!("GET {url}"), &e))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            let excerpt: String = body.chars().take(200).collect();
+            return Err(format!("coord returned {status} for GET {url}: {excerpt}"));
+        }
+        resp.json::<T>()
+            .await
+            .map_err(|e| request_error(&format!("decode GET {url}"), &e))
     }
 
-    /// PURE: validate every state's walk and union them into one index, and
-    /// mark which sessions on them are positively live AND complete.
-    ///
-    /// A walk that came back on ONE page was one database snapshot, so every
-    /// session on it was live with ALL of its rows for that state — marked
-    /// live, as before the cursor existed. A walk that took SEVERAL pages is
-    /// several snapshots over up to [`SURVEY_WALK_BUDGET`], ordered by
-    /// `(agent_id, repo)` rather than by session, so a session that changed
-    /// state mid-walk can be on it with only SOME of its rows — and custody
-    /// over a partial row set can read `Clean` while an unread worktree is
-    /// dirty. A session on a multi-page walk is therefore marked live only
-    /// when both work-status reads (`before` / `after`, taken around every
-    /// walk) name that same coord row in THAT walk's state: it held the
-    /// state across the whole read, so the walk saw every row. Anything else
-    /// is left unmarked, which the custody gate reads as Unknown. The same
-    /// residual as [`agreeing_live_sessions`] remains: a session that leaves
-    /// a state and returns to it between the two reads still agrees.
-    pub fn ownership_from_walks(
-        walks: Vec<StateWalk<'_>>,
-        limit: usize,
-        before: &std::collections::HashMap<String, crate::mcp::session_work_status::CoordLiveness>,
-        after: &std::collections::HashMap<String, crate::mcp::session_work_status::CoordLiveness>,
-    ) -> Result<CoordOwnership, String> {
-        let held: std::collections::HashSet<(String, String)> = before
+    /// One `unknown` entry of the keyed read: an id coord resolved to no
+    /// `coord.sessions` row. Its `worktrees` (an allocate-only owner can have
+    /// some) are deliberately not read — the id is UNKNOWN, whatever it holds.
+    #[derive(Debug, Clone, Default, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct CoordKeyedUnknown {
+        #[serde(default)]
+        pub claude_code_session_id: String,
+    }
+
+    /// `GET /coord/sessions/worktrees?claude_code_session_ids=<csv>` — the
+    /// KEYED one-snapshot read. Every key is optional here so that a response
+    /// MISSING one is detectable rather than a decode error or a default.
+    #[derive(Debug, Clone, Default, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct CoordKeyedSessionWorktrees {
+        /// One entry per requested id that resolved to a `coord.sessions` row,
+        /// WHATEVER its state, including `worktrees: []`.
+        #[serde(default)]
+        pub sessions: Vec<CoordSessionRow>,
+        /// The accepted key, echoed. ABSENT ⇒ coord ignored the key (it
+        /// predates the keyed mode and served page one of the tenant walk).
+        #[serde(default)]
+        pub claude_code_session_ids: Option<Vec<String>>,
+        #[serde(default)]
+        pub unknown: Vec<CoordKeyedUnknown>,
+        #[serde(default)]
+        pub invalid: Vec<String>,
+        #[serde(default)]
+        pub input_truncated: bool,
+        #[serde(default)]
+        pub session_bridge_column_present: Option<bool>,
+    }
+
+    /// `…/coord/sessions/worktrees?claude_code_session_ids=<id>,<id>,…`, each
+    /// id URL-encoded.
+    pub fn keyed_url(base_url: &str, ids: &[String]) -> String {
+        let csv: Vec<String> = ids
             .iter()
-            .filter(|(claude_id, pre)| after.get(*claude_id) == Some(*pre))
-            .map(|(_, pre)| (pre.coord_session_id.to_ascii_lowercase(), pre.state.clone()))
+            .map(|id| urlencoding::encode(id).into_owned())
             .collect();
+        format!("{base_url}?claude_code_session_ids={}", csv.join(","))
+    }
+
+    /// The ids to ask about: trimmed, blanks dropped, deduplicated
+    /// case-insensitively in first-seen order, then cut into requests of at
+    /// most [`KEYED_CHUNK_IDS`].
+    pub fn keyed_chunks(claude_session_ids: &[String]) -> Vec<Vec<String>> {
+        let mut seen = std::collections::HashSet::new();
+        let ids: Vec<String> = claude_session_ids
+            .iter()
+            .map(|id| id.trim())
+            .filter(|id| !id.is_empty() && seen.insert(id.to_ascii_lowercase()))
+            .map(str::to_string)
+            .collect();
+        ids.chunks(KEYED_CHUNK_IDS)
+            .map(<[String]>::to_vec)
+            .collect()
+    }
+
+    /// PURE: the custody index from the keyed reads — `(ids sent, coord's
+    /// answer)` per request.
+    ///
+    /// A whole response that cannot be trusted is `Err` (UNKNOWN for every
+    /// session): no `claudeCodeSessionIds` echo (coord ignored the key), or a
+    /// `sessionBridgeColumnPresent` that is not `true`. Within a trusted
+    /// response, an id is answered ONLY by its own `sessions[]` entry
+    /// (`claudeCodeSessionId → sessionId`), whatever that session's state; an
+    /// id that is in `invalid`, missing from the echo (cut by
+    /// `inputTruncated`), in `unknown`, or without exactly one entry is
+    /// recorded UNKNOWN with the reason — never "no worktrees".
+    pub fn ownership_from_keyed(
+        chunks: Vec<(Vec<String>, CoordKeyedSessionWorktrees)>,
+    ) -> Result<CoordOwnership, String> {
+        fn key(id: &str) -> String {
+            id.trim().to_ascii_lowercase()
+        }
         let mut sessions: Vec<CoordSessionRow> = Vec::new();
-        let mut live: Vec<String> = Vec::new();
-        for walk in walks {
-            validate_complete_page(&walk.page, walk.state, limit)?;
-            for s in &walk.page.sessions {
-                let one_snapshot = walk.pages_read <= 1;
-                if one_snapshot
-                    || held.contains(&(s.session_id.to_ascii_lowercase(), walk.state.to_string()))
-                {
-                    live.push(s.session_id.clone());
+        let mut resolved: Vec<(String, String)> = Vec::new();
+        let mut unanswered: Vec<(String, String)> = Vec::new();
+        for (sent, resp) in chunks {
+            let Some(echo) = resp.claude_code_session_ids.as_ref() else {
+                return Err(
+                    "coord answered the keyed session-worktrees read without the \
+                     `claudeCodeSessionIds` echo, so it ignored the key (a coord predating the \
+                     keyed mode serves page one of the tenant-wide walk instead): the answer is \
+                     not about these sessions"
+                        .to_string(),
+                );
+            };
+            if resp.session_bridge_column_present != Some(true) {
+                return Err("coord's keyed session-worktrees read does not report the \
+                     claude_code_session_id bridge column present, so no session in it can be \
+                     resolved and an empty answer is UNKNOWN, not \"no worktrees\""
+                    .to_string());
+            }
+            let echoed: std::collections::HashSet<String> = echo.iter().map(|s| key(s)).collect();
+            let invalid: std::collections::HashSet<String> =
+                resp.invalid.iter().map(|s| key(s)).collect();
+            let unknown: std::collections::HashSet<String> = resp
+                .unknown
+                .iter()
+                .map(|u| key(&u.claude_code_session_id))
+                .collect();
+            let mut entries: std::collections::HashMap<String, Vec<&CoordSessionRow>> =
+                std::collections::HashMap::new();
+            for s in &resp.sessions {
+                if let Some(c) = s.claude_code_session_id.as_deref() {
+                    entries.entry(key(c)).or_default().push(s);
                 }
             }
-            sessions.extend(walk.page.sessions);
+            for id in &sent {
+                let k = key(id);
+                let why = if invalid.contains(&k) {
+                    "coord rejected it as not a session id (`invalid`)"
+                } else if !echoed.contains(&k) {
+                    if resp.input_truncated {
+                        "coord cut it from the request (`inputTruncated`)"
+                    } else {
+                        "coord did not echo it among the ids it answered for"
+                    }
+                } else if unknown.contains(&k) {
+                    "coord resolved it to no session row (`unknown`), and an allocate-only \
+                     owner can still hold worktrees under it"
+                } else {
+                    match entries.get(&k).map(Vec::as_slice) {
+                        Some([one]) if !one.session_id.trim().is_empty() => {
+                            resolved.push((k, one.session_id.clone()));
+                            sessions.push((*one).clone());
+                            continue;
+                        }
+                        Some([_, _, ..]) => "coord listed it under more than one session",
+                        _ => {
+                            "coord echoed it but answered it under neither `sessions` nor `unknown`"
+                        }
+                    }
+                };
+                unanswered.push((k, why.to_string()));
+            }
         }
         let mut index = CoordOwnership::from_response(CoordSessionWorktrees {
             sessions,
             session_bridge_column_present: Some(true),
             ..Default::default()
         });
-        index.mark_live(live.iter().map(String::as_str));
+        index.record_coord_rows(resolved);
+        index.record_unanswered(unanswered);
         Ok(index)
     }
 
-    /// PURE: the `coord.sessions.id`s that BOTH work-status reads — one made
-    /// before the worktree pages, one after — name as the row answering for
-    /// the same Claude session, in the SAME live state ([`LIVE_SESSION_STATES`]).
+    /// The attributed-worktree index for exactly `claude_session_ids`, read
+    /// through coord's KEYED door
+    /// (`GET /coord/sessions/worktrees?claude_code_session_ids=<csv>`), one
+    /// request — one SQL snapshot of the session pick and its rows — per
+    /// [`KEYED_CHUNK_IDS`] ids.
     ///
-    /// Only such a session may be taken as live-with-no-rows when it is on no
-    /// page. A read that failed carries no entries, so it agrees with nothing.
-    pub fn agreeing_live_sessions(
-        before: &std::collections::HashMap<String, crate::mcp::session_work_status::CoordLiveness>,
-        after: &std::collections::HashMap<String, crate::mcp::session_work_status::CoordLiveness>,
-    ) -> Vec<String> {
-        before
-            .iter()
-            .filter(|(_, pre)| LIVE_SESSION_STATES.contains(&pre.state.as_str()))
-            .filter(|(claude_id, pre)| after.get(*claude_id) == Some(*pre))
-            .map(|(_, pre)| pre.coord_session_id.clone())
-            .collect()
-    }
-
-    /// PURE: `(claude session id, coord.sessions.id)` for every Claude session
-    /// whose coord row BOTH work-status reads name identically, whatever its
-    /// state. A row that changed between the reads, or a read that failed,
-    /// yields no pair, so the caller cannot resolve a coord id from it.
-    pub fn agreeing_coord_rows(
-        before: &std::collections::HashMap<String, crate::mcp::session_work_status::CoordLiveness>,
-        after: &std::collections::HashMap<String, crate::mcp::session_work_status::CoordLiveness>,
-    ) -> Vec<(String, String)> {
-        before
-            .iter()
-            .filter(|(claude_id, pre)| {
-                after
-                    .get(*claude_id)
-                    .is_some_and(|post| post.coord_session_id == pre.coord_session_id)
-            })
-            .map(|(claude_id, pre)| (claude_id.clone(), pre.coord_session_id.clone()))
-            .collect()
-    }
-
-    /// Fetch the attributed-worktree index for every LIVE session, complete or
-    /// not at all.
+    /// For a custody gate a missing row reads as "nothing attributed", i.e.
+    /// clean, so this fails closed: `Err` (UNKNOWN at the gate) when no coord
+    /// base is configured, when the shared coord client is unavailable, on any
+    /// transport / non-2xx / decode error, and on a response
+    /// [`ownership_from_keyed`] refuses; per id, every answer but the id's own
+    /// `sessions[]` entry is recorded UNKNOWN.
     ///
-    /// For a custody gate a dropped session reads as "nothing attributed",
-    /// i.e. clean, so a partial index is worse than none. This walks the
-    /// keyset cursor ([`walk_pages`]) once per [`LIVE_SESSION_STATES`] at
-    /// [`SESSION_WORKTREES_PAGE_LIMIT`], all four walks sharing one
-    /// [`SURVEY_WALK_BUDGET`], and refuses (`Err`) a walk that stopped short
-    /// (`partial`), any page without the bridge column, any merged page that
-    /// is incomplete by [`validate_complete_page`], and any non-2xx or
-    /// undecodable answer. `Err` is `Unknown` at the gate.
-    ///
-    /// It is still a tenant-wide read to answer a one-session question.
-    ///
-    /// ## Liveness: why a session missing from every page is not "no rows"
-    ///
-    /// The route's ledger join is an INNER lateral off
-    /// `coord.agent_worktrees`, so a session with no worktree rows is OMITTED,
-    /// not listed with an empty array. And a session's state MOVES in both
-    /// directions: coord auto-closes an idle `stale` / `pending_resolution`
-    /// session, and an `UpdateSessionRequest { state: active }` — which the
-    /// runner's own `coord_sync` outbox sends — re-activates one and clears
-    /// its `closed_at`. The four state-filtered pages are four separate
-    /// snapshots, so a session can move from a state read LATER into one read
-    /// EARLIER between two of them and appear on no page while its rows exist.
-    /// Absence is therefore ambiguous, and no single liveness read settles it.
-    ///
-    /// So a session on a live state's walk is live when that walk was one
-    /// page (one snapshot, so its rows are all there) or, for a walk that took
-    /// several pages, when both work-status reads put it in that state (see
-    /// [`ownership_from_walks`]); and a session on NO page is taken as live-with-no-rows
-    /// only when `/coord/sessions/work-status` — read once BEFORE the pages and
-    /// once AFTER — names the same coord row in the same live state both times
-    /// ([`agreeing_live_sessions`]). Disagreement, an absent row, or a read
-    /// that failed leaves it Unknown. This NARROWS the window rather than
-    /// closing it: a session that leaves a state and returns to it between the
-    /// two reads still agrees. A coord read keyed on `claude_code_session_id`
-    /// with no state filter would answer in ONE snapshot and make this
-    /// complete by construction — a coord follow-up, as is a per-session
-    /// filter on this route.
+    /// This replaced a tenant-wide walk of four state-filtered pages bracketed
+    /// by two work-status reads, which on a large tenant timed out on every
+    /// pass (coord answered `state=active` in 17 to >60 s; the keyed read in
+    /// 0.35 s — coord finding a7ab41b6-deb8-4977-b6db-fa742e1a6649) and so
+    /// refused every finished close as `ownership_unreadable`.
     pub async fn fetch_live_ownership(
         claude_session_ids: &[String],
     ) -> Result<CoordOwnership, String> {
@@ -2075,77 +2056,24 @@ pub mod coord {
                     .to_string(),
             );
         };
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(15))
-            .build()
-            .map_err(|e| format!("build custody http client: {e}"))?;
-        let before = crate::mcp::session_work_status::fetch(claude_session_ids).await;
+        // Not unit-tested: `coord_client()` is a process-wide `OnceLock`
+        // whose `None` arm (a TLS backend that failed to initialise) a test
+        // cannot provoke. It is UNKNOWN like every other arm here.
+        let Some(client) = crate::coord_http::coord_client() else {
+            return Err(
+                "the shared coord HTTP client could not be built, so the session's worktree \
+                 allocations cannot be read"
+                    .to_string(),
+            );
+        };
         let base_url = format!("{}/coord/sessions/worktrees", base.trim_end_matches('/'));
-        // One wall-clock budget for all four state walks together, so a slow
-        // ledger costs one bounded wait rather than four.
-        let deadline = tokio::time::Instant::now() + SURVEY_WALK_BUDGET;
-        let mut pages = Vec::new();
-        for state in LIVE_SESSION_STATES {
-            let budget = deadline.saturating_duration_since(tokio::time::Instant::now());
-            let (merged, partial, pages_read) = walk_pages_counted(MAX_PAGES, budget, |cursor| {
-                let url = state_page_url(&base_url, state, cursor.as_deref());
-                let client = client.clone();
-                async move {
-                    let resp = crate::coord_http::coord_get(&client, &url)
-                        .send()
-                        .await
-                        .map_err(|e| format!("GET {url}: {e}"))?;
-                    let status = resp.status();
-                    if !status.is_success() {
-                        let body = resp.text().await.unwrap_or_default();
-                        let excerpt: String = body.chars().take(200).collect();
-                        return Err(format!("coord returned {status} for GET {url}: {excerpt}"));
-                    }
-                    let page: CoordSessionWorktrees = resp
-                        .json()
-                        .await
-                        .map_err(|e| format!("decode session-worktrees ({state}): {e}"))?;
-                    // Every page must carry the bridge column: one that does
-                    // not makes its rows untrustworthy as a complete answer.
-                    if page.session_bridge_column_present != Some(true) {
-                        return Err(format!(
-                            "coord's session-worktrees page for state={state} does not report \
-                             the claude_code_session_id bridge column present"
-                        ));
-                    }
-                    Ok(page)
-                }
-            })
-            .await?;
-            // A walk that stopped short is a PREFIX of the ledger: the session
-            // asked about may be past it, and for a custody gate a missing row
-            // reads as "nothing attributed" — so it is refused, never used.
-            if let Some(reason) = partial {
-                return Err(format!("state={state}: {reason}"));
-            }
-            pages.push(StateWalk {
-                state,
-                page: merged,
-                pages_read,
-            });
+        let mut answers = Vec::new();
+        for chunk in keyed_chunks(claude_session_ids) {
+            let resp: CoordKeyedSessionWorktrees =
+                get_json(client, &keyed_url(&base_url, &chunk)).await?;
+            answers.push((chunk, resp));
         }
-        let after = crate::mcp::session_work_status::fetch(claude_session_ids).await;
-        let mut index = ownership_from_walks(
-            pages,
-            SESSION_WORKTREES_PAGE_LIMIT,
-            &before.liveness_by_session_id,
-            &after.liveness_by_session_id,
-        )?;
-        let rowless = agreeing_live_sessions(
-            &before.liveness_by_session_id,
-            &after.liveness_by_session_id,
-        );
-        index.mark_live(rowless.iter().map(String::as_str));
-        index.record_coord_rows(agreeing_coord_rows(
-            &before.liveness_by_session_id,
-            &after.liveness_by_session_id,
-        ));
-        Ok(index)
+        ownership_from_keyed(answers)
     }
 
     #[cfg(test)]
@@ -2308,37 +2236,6 @@ pub mod coord {
             .await
             .unwrap();
             (merged, partial, seen.into_inner().unwrap())
-        }
-
-        /// The one-snapshot shortcut in `ownership_from_walks` trusts this
-        /// count, so it is the walk's own: the pages it merged.
-        #[tokio::test]
-        async fn the_walk_reports_how_many_pages_it_merged() {
-            let pages: Vec<CoordSessionWorktrees> = [
-                r#"{"sessions":[],"nextCursor":"p1"}"#,
-                r#"{"sessions":[],"nextCursor":"p2"}"#,
-                r#"{"sessions":[],"nextCursor":null}"#,
-            ]
-            .into_iter()
-            .map(page)
-            .collect();
-            let (_, partial, n) =
-                walk_pages_counted(MAX_PAGES, Duration::from_secs(30), |cursor| {
-                    let i = cursor
-                        .as_deref()
-                        .map_or(0, |c| c.trim_start_matches('p').parse::<usize>().unwrap());
-                    let p = pages[i].clone();
-                    async move { Ok(p) }
-                })
-                .await
-                .unwrap();
-            assert_eq!((partial, n), (None, 3));
-            let (_, _, one) = walk_pages_counted(MAX_PAGES, Duration::from_secs(30), |_| async {
-                Ok(page(r#"{"sessions":[],"nextCursor":null}"#))
-            })
-            .await
-            .unwrap();
-            assert_eq!(one, 1);
         }
 
         #[tokio::test]
@@ -2537,31 +2434,11 @@ pub mod coord {
             );
         }
 
+        /// A walk's pages merge by `sessionId` with every row kept, and the
+        /// merge keeps the bridge-column verdict honest: present only when
+        /// every page said so.
         #[test]
-        fn a_page_at_the_limit_may_be_truncated_and_is_refused() {
-            let full = page(
-                r#"{"sessionBridgeColumnPresent":true,"sessions":[
-                    {"sessionId":"a","worktrees":[{"worktreePath":"w1"},{"worktreePath":"w2"}]},
-                    {"sessionId":"b","worktrees":[{"worktreePath":"w3"}]}]}"#,
-            );
-            assert!(
-                validate_complete_page(&full, "active", 3).is_err(),
-                "3 rows at limit 3"
-            );
-            assert!(
-                validate_complete_page(&full, "active", 4).is_ok(),
-                "3 rows under limit 4"
-            );
-            assert!(ownership_from_pages(vec![("active", full)], 3).is_err());
-        }
-
-        /// A cursor-walked index is bounded by `walk_pages` (whose `partial`
-        /// the live-ownership read refuses), so a merged page at the row limit
-        /// is NOT a truncation signal — only a pre-cursor coord's single page
-        /// is. And the merge keeps the bridge-column verdict honest: present
-        /// only when every page said so.
-        #[test]
-        fn a_walked_index_at_the_limit_is_complete_and_the_bridge_survives_the_merge() {
+        fn a_walked_index_keeps_every_row_and_the_bridge_survives_the_merge() {
             let p1 = page(
                 r#"{"sessionBridgeColumnPresent":true,"limit":2,"nextCursor":"c1","sessions":[
                     {"sessionId":"a","worktrees":[{"worktreePath":"w1"},{"worktreePath":"w2"}]}]}"#,
@@ -2572,18 +2449,13 @@ pub mod coord {
             );
             let merged = merge_pages(vec![p1.clone(), p2.clone()]);
             assert_eq!(merged.session_bridge_column_present, Some(true));
-            assert!(
-                validate_complete_page(&merged, "active", 2).is_ok(),
-                "3 walked rows over a 2-row page limit are complete"
-            );
-            let idx = ownership_from_pages(vec![("active", merged)], 2).unwrap();
+            let idx = CoordOwnership::from_response(merged);
             assert_eq!(idx.worktrees_for_session("a").len(), 3);
 
             let mut no_bridge = p2.clone();
             no_bridge.session_bridge_column_present = None;
             let merged = merge_pages(vec![p1.clone(), no_bridge]);
             assert_eq!(merged.session_bridge_column_present, None);
-            assert!(validate_complete_page(&merged, "active", 500).is_err());
 
             let mut absent = p2;
             absent.session_bridge_column_present = Some(false);
@@ -2593,183 +2465,241 @@ pub mod coord {
             );
         }
 
+        // ---- the keyed read (plan 2026-11-04-runner-finished-close-…, Phase 1) --
+
+        fn keyed(json: &str) -> CoordKeyedSessionWorktrees {
+            serde_json::from_str(json).unwrap()
+        }
+
+        fn ids(v: &[&str]) -> Vec<String> {
+            v.iter().map(|s| s.to_string()).collect()
+        }
+
+        const A: &str = "aaaaaaaa-0000-0000-0000-000000000001";
+        const B: &str = "bbbbbbbb-0000-0000-0000-000000000002";
+
         #[test]
-        fn a_missing_or_false_bridge_column_is_refused() {
-            for json in [
-                r#"{"sessions":[]}"#,
-                r#"{"sessionBridgeColumnPresent":false,"sessions":[]}"#,
+        fn the_keyed_request_names_exactly_the_ids_asked_about() {
+            assert_eq!(
+                keyed_url("https://c/coord/sessions/worktrees", &ids(&[A, "x y"])),
+                format!("https://c/coord/sessions/worktrees?claude_code_session_ids={A},x%20y")
+            );
+        }
+
+        #[test]
+        fn the_key_is_deduplicated_and_chunked_at_coords_cap() {
+            let many: Vec<String> = (0..KEYED_CHUNK_IDS * 2 + 1)
+                .map(|i| format!("{i:08x}-0000-0000-0000-000000000000"))
+                .collect();
+            let chunks = keyed_chunks(&many);
+            assert_eq!(
+                chunks.iter().map(Vec::len).collect::<Vec<_>>(),
+                vec![KEYED_CHUNK_IDS, KEYED_CHUNK_IDS, 1]
+            );
+            assert_eq!(chunks.concat(), many, "every id once, in order");
+            assert_eq!(
+                keyed_chunks(&ids(&[A, " ", &A.to_ascii_uppercase(), B])),
+                vec![ids(&[A, B])],
+                "blanks dropped, duplicates (case-insensitive) sent once"
+            );
+            assert!(keyed_chunks(&[]).is_empty(), "no ids, no request");
+        }
+
+        #[test]
+        fn a_2xx_without_the_echo_is_a_coord_that_ignored_the_key() {
+            // What a coord predating the keyed mode serves: page one of the
+            // tenant walk, bridge column and all — but no echo.
+            let page_one = keyed(&format!(
+                r#"{{"sessionBridgeColumnPresent":true,"nextCursor":null,"sessions":[
+                    {{"sessionId":"c-1","claudeCodeSessionId":"{A}","worktrees":[]}}]}}"#
+            ));
+            let err = ownership_from_keyed(vec![(ids(&[A]), page_one)]).unwrap_err();
+            assert!(err.contains("claudeCodeSessionIds"), "{err}");
+        }
+
+        #[test]
+        fn a_missing_or_false_bridge_column_is_unknown() {
+            for bridge in ["", r#""sessionBridgeColumnPresent":false,"#] {
+                let resp = keyed(&format!(
+                    r#"{{{bridge}"claudeCodeSessionIds":["{A}"],"sessions":[
+                        {{"sessionId":"c-1","claudeCodeSessionId":"{A}","worktrees":[]}}]}}"#
+                ));
+                let err = ownership_from_keyed(vec![(ids(&[A]), resp)]).unwrap_err();
+                assert!(err.contains("bridge column"), "{bridge}: {err}");
+            }
+        }
+
+        #[test]
+        fn unknown_invalid_truncated_and_unechoed_ids_are_unknown_never_empty() {
+            let resp = keyed(&format!(
+                r#"{{"sessionBridgeColumnPresent":true,"inputTruncated":true,
+                    "claudeCodeSessionIds":["{A}","{B}"],
+                    "unknown":[{{"claudeCodeSessionId":"{A}",
+                        "worktrees":[{{"worktreePath":"/abs/allocate-only"}}]}}],
+                    "invalid":["not-a-uuid"],
+                    "sessions":[{{"sessionId":"c-b","claudeCodeSessionId":"{B}","worktrees":[]}}]}}"#
+            ));
+            let sent = ids(&[A, B, "not-a-uuid", "cccccccc-0000-0000-0000-000000000003"]);
+            let idx = ownership_from_keyed(vec![(sent, resp)]).unwrap();
+            assert_eq!(idx.coord_session_for_claude(B), Some("c-b"));
+            for (id, why) in [
+                (A, "`unknown`"),
+                ("not-a-uuid", "`invalid`"),
+                ("cccccccc-0000-0000-0000-000000000003", "`inputTruncated`"),
             ] {
-                let err = validate_complete_page(&page(json), "stale", 500).unwrap_err();
-                assert!(err.contains("bridge column"), "{err}");
+                assert_eq!(idx.coord_session_for_claude(id), None, "{id}");
+                let reason = idx.unanswered_reason(id).unwrap_or_default();
+                assert!(reason.contains(why), "{id}: {reason}");
             }
-            assert!(validate_complete_page(
-                &page(r#"{"sessionBridgeColumnPresent":true,"sessions":[]}"#),
-                "stale",
-                500
-            )
-            .is_ok());
-        }
-
-        #[test]
-        fn the_live_states_are_unioned_into_one_index() {
-            let active = page(
-                r#"{"sessionBridgeColumnPresent":true,"sessions":[
-                    {"sessionId":"s-act","worktrees":[{"worktreePath":"wt/act","ledgerStatus":"active"}]}]}"#,
-            );
-            let stale = page(
-                r#"{"sessionBridgeColumnPresent":true,"sessions":[
-                    {"sessionId":"s-old","worktrees":[{"worktreePath":"wt/old","ledgerStatus":"merged"}]}]}"#,
-            );
-            let idx =
-                ownership_from_pages(vec![("active", active), ("stale", stale)], 500).unwrap();
-            assert_eq!(
-                idx.worktrees_for_session("s-act")[0].worktree_path,
-                "wt/act"
-            );
-            let old = idx.worktrees_for_session("s-old");
-            assert_eq!(old[0].ledger_status.as_deref(), Some("merged"));
-            // One bad page poisons the whole read: a union that dropped it would
-            // be exactly the silent short read this exists to refuse.
-            let bad = page(r#"{"sessions":[]}"#);
-            let good = page(r#"{"sessionBridgeColumnPresent":true,"sessions":[]}"#);
-            assert!(ownership_from_pages(vec![("active", good), ("expected", bad)], 500).is_err());
-            assert!(LIVE_SESSION_STATES.iter().all(|s| *s != "closed"));
-        }
-
-        fn liveness(
-            rows: &[(&str, &str, &str)],
-        ) -> std::collections::HashMap<String, crate::mcp::session_work_status::CoordLiveness>
-        {
-            rows.iter()
-                .map(|(claude, coord, state)| {
-                    (
-                        claude.to_string(),
-                        crate::mcp::session_work_status::CoordLiveness {
-                            coord_session_id: coord.to_string(),
-                            state: state.to_string(),
-                        },
-                    )
-                })
-                .collect()
-        }
-
-        #[test]
-        fn a_session_on_a_live_page_is_live_without_any_work_status_agreement() {
-            let active = page(
-                r#"{"sessionBridgeColumnPresent":true,"sessions":[
-                    {"sessionId":"S-PAGE","worktrees":[{"worktreePath":"wt/a"}]}]}"#,
-            );
-            let idx = ownership_from_pages(vec![("active", active)], 500).unwrap();
-            assert!(idx.is_known_live("s-page"), "listed on a live page");
-            assert!(!idx.is_known_live("s-rowless"));
-            // An index built from a response alone asserts no liveness.
             assert!(
-                !CoordOwnership::from_response(page(r#"{"sessions":[]}"#)).is_known_live("s-page")
+                idx.worktrees_for_session("c-a").is_empty() && idx.is_empty(),
+                "an `unknown` id's allocate-only rows are never attributed"
+            );
+
+            // Not echoed, no truncation flag: still unanswered.
+            let resp = keyed(
+                r#"{"sessionBridgeColumnPresent":true,"claudeCodeSessionIds":[],"sessions":[]}"#,
+            );
+            let idx = ownership_from_keyed(vec![(ids(&[A]), resp)]).unwrap();
+            assert!(idx.unanswered_reason(A).unwrap().contains("did not echo"));
+        }
+
+        #[test]
+        fn an_echoed_id_with_no_entry_or_two_entries_is_unknown() {
+            let resp = keyed(&format!(
+                r#"{{"sessionBridgeColumnPresent":true,"claudeCodeSessionIds":["{A}","{B}"],
+                    "sessions":[
+                    {{"sessionId":"c-1","claudeCodeSessionId":"{B}","worktrees":[]}},
+                    {{"sessionId":"c-2","claudeCodeSessionId":"{B}","worktrees":[]}}]}}"#
+            ));
+            let idx = ownership_from_keyed(vec![(ids(&[A, B]), resp)]).unwrap();
+            assert!(idx.unanswered_reason(A).unwrap().contains("neither"));
+            assert!(idx.unanswered_reason(B).unwrap().contains("more than one"));
+            assert_eq!(idx.coord_session_for_claude(B), None);
+        }
+
+        /// `worktrees: []` on the id's own entry is a POSITIVE "holds nothing",
+        /// whatever the session's state; an entry's rows are attributed to it.
+        #[test]
+        fn an_entry_with_no_worktrees_is_positively_empty_whatever_its_state() {
+            let resp = keyed(&format!(
+                r#"{{"sessionBridgeColumnPresent":true,"inputTruncated":false,"invalid":[],
+                    "unknown":[],"claudeCodeSessionIds":["{A}","{B}"],"sessions":[
+                    {{"sessionId":"c-a","claudeCodeSessionId":"{A}","ownerSessionState":"closed",
+                      "worktrees":[]}},
+                    {{"sessionId":"c-b","claudeCodeSessionId":"{}","ownerSessionState":"stale",
+                      "worktrees":[{{"worktreePath":"agent-worktrees/b/r","repo":"r"}}]}}]}}"#,
+                B.to_ascii_uppercase()
+            ));
+            let idx = ownership_from_keyed(vec![(ids(&[A, B]), resp)]).unwrap();
+            assert_eq!(idx.coord_session_for_claude(A), Some("c-a"));
+            assert!(idx.unanswered_reason(A).is_none());
+            assert!(idx.worktrees_for_session("c-a").is_empty());
+            assert_eq!(idx.coord_session_for_claude(B), Some("c-b"));
+            assert_eq!(
+                idx.worktrees_for_session("c-b")[0].worktree_path,
+                "agent-worktrees/b/r"
             );
         }
 
-        /// A walk that took several pages is several snapshots, so a session
-        /// on it may carry only some of its rows (it changed state mid-walk).
-        /// It is live only when both work-status reads held it in THAT state;
-        /// a one-page walk is one snapshot and needs no agreement.
         #[test]
-        fn a_multi_page_walk_marks_a_session_live_only_when_both_reads_held_its_state() {
-            let walked = page(
-                r#"{"sessionBridgeColumnPresent":true,"sessions":[
-                    {"sessionId":"S-HELD","worktrees":[{"worktreePath":"wt/h"}]},
-                    {"sessionId":"s-moved","worktrees":[{"worktreePath":"wt/m1"}]},
-                    {"sessionId":"s-silent","worktrees":[{"worktreePath":"wt/s"}]}]}"#,
-            );
-            let before = liveness(&[
-                ("claude-h", "s-held", "stale"),
-                ("claude-m", "s-moved", "stale"),
-            ]);
-            let after = liveness(&[
-                ("claude-h", "s-held", "stale"),
-                ("claude-m", "s-moved", "active"),
-            ]);
-            let walk = |pages_read| StateWalk {
-                state: "stale",
-                page: walked.clone(),
-                pages_read,
+        fn chunks_are_merged_and_one_bad_chunk_fails_the_read() {
+            let good = |id: &str, sid: &str| {
+                keyed(&format!(
+                    r#"{{"sessionBridgeColumnPresent":true,"claudeCodeSessionIds":["{id}"],
+                        "sessions":[{{"sessionId":"{sid}","claudeCodeSessionId":"{id}","worktrees":[]}}]}}"#
+                ))
             };
-            let idx = ownership_from_walks(vec![walk(3)], 500, &before, &after).unwrap();
-            assert!(idx.is_known_live("s-held"), "held stale across the read");
-            assert!(!idx.is_known_live("s-moved"), "moved to active mid-walk");
-            assert!(!idx.is_known_live("s-silent"), "no work-status agreement");
-            // The rows are still indexed; only liveness is withheld.
-            assert_eq!(idx.worktrees_for_session("s-moved").len(), 1);
-
-            let one = ownership_from_walks(vec![walk(1)], 500, &before, &after).unwrap();
-            for sid in ["s-held", "s-moved", "s-silent"] {
-                assert!(one.is_known_live(sid), "{sid} on a one-page walk");
-            }
-        }
-
-        /// Both reads name the same coord row in the same live state: rowless.
-        #[test]
-        fn a_pageless_session_both_reads_agree_is_live() {
-            let before = liveness(&[("claude-a", "s-rowless", "active")]);
-            let after = liveness(&[("claude-a", "s-rowless", "active")]);
-            assert_eq!(
-                agreeing_live_sessions(&before, &after),
-                vec!["s-rowless".to_string()]
-            );
-        }
-
-        /// The coord row is resolved from the work-status reads only when
-        /// both named the SAME row, in any state; a row that changed between
-        /// them, or a failed read, resolves nothing.
-        #[test]
-        fn a_coord_row_resolves_only_when_both_reads_name_it() {
-            let before = liveness(&[("claude-a", "s-1", "stale"), ("claude-b", "s-2", "active")]);
-            let after = liveness(&[("claude-a", "s-1", "active"), ("claude-b", "s-3", "active")]);
-            assert_eq!(
-                agreeing_coord_rows(&before, &after),
-                vec![("claude-a".to_string(), "s-1".to_string())]
-            );
-            assert!(agreeing_coord_rows(&before, &std::collections::HashMap::new()).is_empty());
-        }
-
-        /// The reactivation race: `stale` before the pages, `active` after —
-        /// it may have been on neither page while its rows existed. Unknown.
-        #[test]
-        fn a_pageless_session_whose_reads_disagree_is_unknown() {
-            let stale = liveness(&[("claude-a", "s-moved", "stale")]);
-            let active = liveness(&[("claude-a", "s-moved", "active")]);
-            assert!(agreeing_live_sessions(&stale, &active).is_empty());
-            // A different coord row answering is disagreement too.
-            let other_row = liveness(&[("claude-a", "s-other", "stale")]);
-            assert!(agreeing_live_sessions(&stale, &other_row).is_empty());
-            // And agreeing on `closed` is never live.
-            let closed = liveness(&[("claude-a", "s-moved", "closed")]);
-            assert!(agreeing_live_sessions(&closed, &closed).is_empty());
-        }
-
-        /// A failed work-status read carries no rows, so it agrees with
-        /// nothing — whichever of the two it was.
-        #[test]
-        fn a_pageless_session_with_one_failed_read_is_unknown() {
-            let ok = liveness(&[("claude-a", "s-rowless", "active")]);
-            let failed = std::collections::HashMap::new();
-            assert!(agreeing_live_sessions(&ok, &failed).is_empty());
-            assert!(agreeing_live_sessions(&failed, &ok).is_empty());
-
-            // End to end on the index: only the agreeing session is marked.
-            let mut idx = ownership_from_pages(
-                vec![(
-                    "active",
-                    page(r#"{"sessionBridgeColumnPresent":true,"sessions":[]}"#),
-                )],
-                500,
-            )
+            let idx = ownership_from_keyed(vec![
+                (ids(&[A]), good(A, "c-a")),
+                (ids(&[B]), good(B, "c-b")),
+            ])
             .unwrap();
-            idx.mark_live(
-                agreeing_live_sessions(&ok, &failed)
-                    .iter()
-                    .map(String::as_str),
+            assert_eq!(idx.coord_session_for_claude(A), Some("c-a"));
+            assert_eq!(idx.coord_session_for_claude(B), Some("c-b"));
+            let echo_less = keyed(r#"{"sessionBridgeColumnPresent":true,"sessions":[]}"#);
+            assert!(ownership_from_keyed(vec![
+                (ids(&[A]), good(A, "c-a")),
+                (ids(&[B]), echo_less)
+            ])
+            .is_err());
+        }
+
+        /// A timeout reads as a timeout: the rendered error carries reqwest's
+        /// `source()` chain, not only its generic `error sending request` head.
+        #[tokio::test]
+        async fn a_request_error_carries_its_source_cause() {
+            // Bound and never accepted: the connect completes, no answer comes.
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!(
+                "http://127.0.0.1:{}/coord/sessions/worktrees",
+                listener.local_addr().unwrap().port()
             );
-            assert!(!idx.is_known_live("s-rowless"));
+            let err = send_json::<CoordKeyedSessionWorktrees>(
+                test_client().get(&url),
+                &url,
+                Duration::from_millis(200),
+            )
+            .await
+            .expect_err("nothing answers");
+            assert!(err.starts_with(&format!("GET {url}: ")), "{err}");
+            assert!(err.contains("timed out"), "the cause is rendered: {err}");
+            drop(listener);
+        }
+
+        /// A proxy-free client, so an ambient `HTTP_PROXY` cannot reroute
+        /// the loopback request these tests make.
+        fn test_client() -> reqwest::Client {
+            reqwest::Client::builder().no_proxy().build().unwrap()
+        }
+
+        /// Serve one canned HTTP response on a loopback port; return its URL.
+        async fn serve_once(response: &'static str) -> String {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!(
+                "http://127.0.0.1:{}/coord/sessions/worktrees",
+                listener.local_addr().unwrap().port()
+            );
+            tokio::spawn(async move {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock.write_all(response.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            });
+            url
+        }
+
+        /// A non-2xx and an undecodable 2xx are both `Err` — UNKNOWN at the
+        /// gate — never an empty index.
+        #[tokio::test]
+        async fn a_non_2xx_or_undecodable_answer_is_an_error() {
+            let url = serve_once(
+                "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 4\r\nconnection: close\r\n\r\nbusy",
+            )
+            .await;
+            let err = send_json::<CoordKeyedSessionWorktrees>(
+                test_client().get(&url),
+                &url,
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap_err();
+            assert!(err.contains("503") && err.contains("busy"), "{err}");
+
+            let url = serve_once(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 8\r\nconnection: close\r\n\r\nnot-json",
+            )
+            .await;
+            let err = send_json::<CoordKeyedSessionWorktrees>(
+                test_client().get(&url),
+                &url,
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap_err();
+            assert!(err.starts_with(&format!("decode GET {url}: ")), "{err}");
         }
 
         #[test]
