@@ -874,7 +874,7 @@ fn seam_reports(fp: &EnvFingerprinter, config_dir: Option<&str>) -> Vec<SeamEnvR
             // program is chosen per-platform by
             // `launch_spec::render_program_and_argv`; do not read this literal as
             // the report asserting what gets spawned.
-            &crate::claude_session::runner::build_inline_child_command("cmd.exe", &[], "."),
+            &crate::claude_session::runner::build_inline_child_command("cmd.exe", &[], ".", None),
         ),
         std_seam(
             fp,

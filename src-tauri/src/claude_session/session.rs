@@ -193,6 +193,11 @@ pub struct ClaudeSession {
     /// default is ON) or the coord session id / device id couldn't be
     /// resolved — a strict no-op.
     agent_log_emitter: Option<super::coord_register::AgentLogEmitter>,
+    /// The account config dir the child was spawned under, resolved once at
+    /// spawn (`None`: it inherited the ambient default). A worktree promotion
+    /// respawns on THIS account, and the waiter's rate-limit restart cools it —
+    /// never whatever the shared resolved dir holds by then.
+    config_dir: Option<String>,
 }
 
 // SAFETY: ClaudeSession contains a raw Windows handle (RawHandle = *mut c_void) for the stdout
@@ -241,27 +246,21 @@ impl ClaudeSession {
         // launch-command builder (the per-account operator template) and the
         // child's CLAUDE_CONFIG_DIR env set below.
         //
-        // A per-request `pinned_config_dir` on the session ctx (already
-        // validated by the spawn handler via `resolve_requested_account`)
-        // overrides the global account resolution; `None` reproduces the
-        // default behaviour byte-for-byte.
+        // The session ctx's `account` is the caller's choice — a per-request
+        // PIN (already validated by the spawn handler via
+        // `resolve_requested_account`), or the caller's own pick for this unit
+        // of work. With neither, this spawn takes a fresh pick of its OWN. It
+        // never reads the shared `RESOLVED_CONFIG_DIR`, which a concurrent
+        // sibling's pick may have rewritten (plan
+        // `2026-11-05-a-spawn-takes-its-own-account-pick-not-the-shared-resolved-dir`).
+        // `spawn` is blocking already, so the pick runs inline.
         let ai_settings = crate::settings::get_ai_settings();
-        let pinned_config_dir = session_ctx
-            .as_ref()
-            .and_then(|c| c.pinned_config_dir.as_deref());
-        // A pin resolves through the one per-spawn resolver as
-        // `AccountChoice::Pinned`; no pin still reads the shared
-        // `RESOLVED_CONFIG_DIR` through `get_effective_config_dir`, unchanged
-        // until plan
-        // `2026-11-05-a-spawn-takes-its-own-account-pick-not-the-shared-resolved-dir`
-        // Phase 2 carries the caller's own pick here as `AccountChoice::Picked`.
-        let (effective_config_dir, _config_dir_source) = match pinned_config_dir {
-            Some(pin) => crate::ai_provider::get_effective_config_dir_for(
-                &ai_settings.claude_cli,
-                Some(&crate::ai_provider::AccountChoice::Pinned(pin.to_string())),
-            ),
-            None => crate::ai_provider::get_effective_config_dir(&ai_settings.claude_cli),
-        };
+        let effective_config_dir = Self::resolve_account(
+            &ai_settings.claude_cli,
+            session_ctx.as_ref(),
+            crate::ai_provider::pick_best_account,
+        )
+        .dir;
 
         // Required trailing flags for the interactive stream-json chat. The
         // shared launch seam (below) layers the operator template + the
@@ -423,7 +422,9 @@ impl ClaudeSession {
         let federation_ctx = match super::federation::build_federation_ctx(
             session_id,
             working_dir,
-            &ai_settings.claude_cli,
+            // The account the child runs under, so federation's
+            // `account_name` cannot name a different one.
+            effective_config_dir.as_deref(),
             // Phase 8b (B2): thread the session's RECORDED tenant so the
             // federated pool agrees with the coord record + JWT slot: the
             // tenant `AiCoordRegistrar` stamped them with, looked up by this
@@ -1201,6 +1202,7 @@ impl ClaudeSession {
         // the waiter so reconcile fires when the subprocess actually exits
         // (NOT when `spawn()` returns, which is just after init).
         let federation_ctx_for_waiter = federation_ctx.clone();
+        let config_dir_for_waiter = effective_config_dir.clone();
         // Interactive-agent log emitter (Phase 1b) — the waiter emits the
         // terminal `session_closed` line + final flush when the CLI exits.
         let agent_log_emitter_for_waiter = agent_log_emitter.clone();
@@ -1275,6 +1277,7 @@ impl ClaudeSession {
                     &session_id_for_waiter,
                     session_ctx_for_waiter.as_ref(),
                     &working_dir_for_waiter,
+                    config_dir_for_waiter.as_deref(),
                 );
             }
 
@@ -1385,7 +1388,25 @@ impl ClaudeSession {
             federation_ctx,
             isolated_edit_ctx: Arc::new(Mutex::new(None)),
             agent_log_emitter,
+            config_dir: effective_config_dir,
         })
+    }
+
+    /// This spawn's account, resolved ONCE through the one resolver: the
+    /// session ctx's [`AccountChoice`](crate::ai_provider::AccountChoice) when
+    /// it carries one, else a fresh `pick()` of this spawn's own. `pick` is
+    /// `pick_best_account` in production; a parameter so a test can race a
+    /// sibling's draw against it.
+    pub(crate) fn resolve_account(
+        cli_settings: &crate::settings::ClaudeCliSettings,
+        session_ctx: Option<&AiSessionContext>,
+        pick: impl FnOnce() -> Option<String>,
+    ) -> crate::ai_provider::ResolvedSpawnAccount {
+        crate::ai_provider::resolve_spawn_account_choice(
+            cli_settings,
+            session_ctx.and_then(|c| c.account.clone()),
+            pick,
+        )
     }
 
     /// Bridge sync → async for the observable-bridge calls made from
@@ -1956,7 +1977,16 @@ impl ClaudeSession {
             );
         }
 
-        // 7. Spawn a fresh CLI with cwd = worktree.path and worktree metadata.
+        // 7. Spawn a fresh CLI with cwd = worktree.path and worktree metadata,
+        //    on the SAME account this session ran under: promotion moves the
+        //    process, not the conversation, so it must not take a fresh draw.
+        let session_ctx = match self.config_dir.clone() {
+            Some(dir) => session_ctx.map(|mut ctx| {
+                ctx.account = Some(crate::ai_provider::AccountChoice::Pinned(dir));
+                ctx
+            }),
+            None => session_ctx,
+        };
         let session_id = self.session_id.clone();
         let new_session = Self::spawn(
             &worktree_path_str,
@@ -2003,34 +2033,43 @@ impl ClaudeSession {
 
     /// Auto-restart the session on another account after a rate-limit exit.
     ///
-    /// Reads conversation history from the DB output_log, rotates the account,
-    /// spawns a new ClaudeSession with a replay prompt, and re-registers it
-    /// in the SessionManager.
+    /// Rotates away from `limited_config_dir` — the account THIS session ran
+    /// under — reads conversation history from the DB output_log, spawns a new
+    /// ClaudeSession pinned to the rotated-to account with a replay prompt,
+    /// and re-registers it in the SessionManager.
     fn auto_restart_on_rate_limit(
         app_handle: &tauri::AppHandle,
         session_id: &str,
         session_ctx: Option<&AiSessionContext>,
         working_dir: &str,
+        limited_config_dir: Option<&str>,
     ) {
-        use crate::ai_provider::{get_effective_config_dir, rotate_account_on_rate_limit};
+        use crate::ai_provider::rotate_account_on_rate_limit;
         use tauri::Manager;
 
-        // 1. Rotate to another account
-        if !rotate_account_on_rate_limit() {
+        // 1. Rotate away from the account this session ran under. A child that
+        //    inherited the ambient default ran under no roster account, so
+        //    there is nothing to cool and no account to rotate away from.
+        let Some(limited) = limited_config_dir else {
+            warn!(
+                "Session {}: ran under the ambient account (no CLAUDE_CONFIG_DIR), \
+                 so there is no roster account to rotate away from; not restarting",
+                session_id
+            );
+            return;
+        };
+        let Some(new_config_dir) = rotate_account_on_rate_limit(limited) else {
             warn!(
                 "Session {}: no alternative account available for restart",
                 session_id
             );
             return;
-        }
-
-        let (resolved_config_dir, _config_dir_source) =
-            get_effective_config_dir(&crate::settings::get_ai_settings().claude_cli);
-        let new_config_dir = resolved_config_dir.unwrap_or_else(|| "unknown".to_string());
+        };
         let label = std::path::Path::new(&new_config_dir)
             .file_name()
             .and_then(|n| n.to_str())
-            .unwrap_or(&new_config_dir);
+            .unwrap_or(&new_config_dir)
+            .to_string();
         info!(
             "Session {}: restarting on account '{}' after rate-limit",
             session_id, label
@@ -2055,8 +2094,18 @@ impl ClaudeSession {
             }
         };
 
-        // Clone session_ctx for the new session
-        let new_session_ctx = session_ctx.cloned();
+        // Clone session_ctx for the new session, PINNED to the account the
+        // rotation chose — never re-read from the shared resolved dir, which a
+        // sibling's pick may already have rewritten. With no session ctx there
+        // is no carrier for the pin; the restart then takes its own fresh pick,
+        // which cannot land on `limited` while it is cooled unless every
+        // account is.
+        let new_session_ctx = session_ctx.cloned().map(|mut ctx| {
+            ctx.account = Some(crate::ai_provider::AccountChoice::Pinned(
+                new_config_dir.clone(),
+            ));
+            ctx
+        });
 
         match Self::spawn(
             working_dir,
@@ -2359,5 +2408,59 @@ mod tests {
             "clearing the slot must drop the held context (releasing the claim) — \
              NOT leak it the way mem::forget did"
         );
+    }
+}
+
+#[cfg(test)]
+mod account_resolution_tests {
+    use crate::ai_provider::config::test_support::dir_with_live_credentials;
+    use crate::ai_provider::config::ResolvedConfigDirRestore;
+    use crate::ai_provider::{set_resolved_config_dir, AccountChoice, ClaudeConfigDirSource};
+    use crate::execution_context::AiSessionContext;
+    use crate::settings::{AccountSelectionMode, ClaudeCliSettings};
+
+    fn auto_mode_cli() -> ClaudeCliSettings {
+        ClaudeCliSettings {
+            account_selection_mode: AccountSelectionMode::WeightedRandom,
+            account_selection_pinned: false,
+            config_dir: None,
+            ..Default::default()
+        }
+    }
+
+    /// **`ClaudeSession::spawn` runs under its own account, not the global.**
+    /// With no choice on the ctx it takes a fresh pick of its own and holds it
+    /// even when a sibling's draw rewrites `RESOLVED_CONFIG_DIR` in between;
+    /// with the caller's pick on the ctx (a subtask dispatch's) it takes that,
+    /// takes no pick, and the global's sibling draw does not move it.
+    #[test]
+    fn claude_session_spawn_resolves_its_own_account_not_the_global() {
+        let _fleet = crate::mcp::fleet_policy_poller::pin_account_selection_for_test(Some(
+            AccountSelectionMode::WeightedRandom,
+        ));
+        let (_mine_guard, mine) = dir_with_live_credentials();
+        let (_sibling_guard, sibling) = dir_with_live_credentials();
+        let _restore = ResolvedConfigDirRestore::capture();
+
+        let ctx = AiSessionContext::setup("task-session", "Session");
+        let drawn = mine.clone();
+        let raced = sibling.clone();
+        let own = super::ClaudeSession::resolve_account(&auto_mode_cli(), Some(&ctx), move || {
+            set_resolved_config_dir(Some(drawn.clone()));
+            set_resolved_config_dir(Some(raced));
+            Some(drawn)
+        });
+        assert_eq!(own.dir.as_deref(), Some(mine.as_str()));
+        assert_eq!(own.source, ClaudeConfigDirSource::PickedForThisSpawn);
+
+        let mut picked = ctx.clone();
+        picked.account = Some(AccountChoice::Picked(mine.clone()));
+        set_resolved_config_dir(Some(sibling));
+        let carried =
+            super::ClaudeSession::resolve_account(&auto_mode_cli(), Some(&picked), || {
+                panic!("a ctx that carries a choice must not take another pick")
+            });
+        assert_eq!(carried.dir, Some(mine));
+        assert_eq!(carried.source, ClaudeConfigDirSource::PickedForThisSpawn);
     }
 }

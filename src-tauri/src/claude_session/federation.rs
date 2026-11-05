@@ -30,7 +30,6 @@ use anyhow::Result;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::settings::ClaudeCliSettings;
 use qontinui_runner_lib::observable_bridge::{ReconcileReport, SessionContext};
 
 /// Why federation was skipped for a session. Returned by
@@ -108,16 +107,20 @@ pub fn session_uuid(session_id: &str) -> Uuid {
 ///   tenant-scoped, so a session spawned for tenant B must federate B's
 ///   pool even when the machine default is A.
 /// - `device_id` → `~/.qontinui/machine.json::device_id`.
-/// - `account_name` → derived from `effective_config_dir` (trailing
-///   `.claude-<name>` component). Falls back to `"default"` for a
-///   single-account install where `config_dir` is `~/.claude`.
+/// - `account_name` → derived from `config_dir`, the account the spawn's child
+///   RUNS UNDER as the spawn resolved it (trailing `.claude-<name>`
+///   component). Falls back to `"default"` for a single-account install where
+///   `config_dir` is `~/.claude`. Taken from the caller rather than re-read
+///   from the shared resolved dir, which a concurrent sibling's pick may have
+///   rewritten — so federation can never name a different account than the
+///   child, even under an explicit pin.
 ///
 /// The home-dir identity PIN (`federation.rs` device identity) is
 /// deliberately untouched (plan §6).
 pub fn build_federation_ctx(
     session_id: &str,
     working_dir: &str,
-    cli_settings: &ClaudeCliSettings,
+    config_dir: Option<&str>,
     session_tenant: crate::session::NewSessionTenant,
 ) -> Result<SessionContext, FederationSkipReason> {
     let session_tenant = match session_tenant {
@@ -158,9 +161,7 @@ pub fn build_federation_ctx(
         }
     };
 
-    let (effective_config_dir, _config_dir_source) =
-        crate::ai_provider::get_effective_config_dir(cli_settings);
-    let config_dir_str = match effective_config_dir {
+    let config_dir_str = match config_dir {
         Some(s) => s,
         None => {
             warn!(
@@ -171,7 +172,7 @@ pub fn build_federation_ctx(
         }
     };
 
-    let account_name = derive_account_name(&config_dir_str);
+    let account_name = derive_account_name(config_dir_str);
 
     Ok(SessionContext {
         tenant_id,

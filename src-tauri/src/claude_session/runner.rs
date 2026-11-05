@@ -298,11 +298,35 @@ fn run_async_inline<F: std::future::Future>(fut: F) -> F::Output {
     }
 }
 
+/// The inline print-mode child's account config dir, resolved ONCE from the
+/// session ctx through the one resolver.
+///
+/// The inline runner takes no pick of its own: its unit of work is the
+/// workflow, whose pick (`loop_controller`) rides `session_ctx.account` as
+/// `AccountChoice::Picked`. With no choice it is the resolver's no-choice arm
+/// (the configured `config_dir`, else nothing) — never the shared
+/// `RESOLVED_CONFIG_DIR`, which a sibling spawn's pick rewrites. The launch
+/// template, the trust pre-accept, federation and the child's
+/// `CLAUDE_CONFIG_DIR` all take this one value.
+pub(crate) fn resolve_inline_config_dir(
+    cli_settings: &crate::settings::ClaudeCliSettings,
+    session_ctx: Option<&AiSessionContext>,
+) -> Option<String> {
+    crate::ai_provider::get_effective_config_dir_for(
+        cli_settings,
+        session_ctx.and_then(|c| c.account.as_ref()),
+    )
+    .0
+}
+
 /// Build the inline runner's `claude` child command, fully env-prepared.
 ///
 /// The env preamble is the crate-standard one for a Claude-CLI spawn seam: the
-/// two inherited-session markers, a fresh trace id, then the credential-value
-/// scrub. The scrub is LAST because nothing between here and
+/// two inherited-session markers, a fresh trace id, the account pin
+/// (`CLAUDE_CONFIG_DIR` = `config_dir`, when one resolved), then the
+/// credential-value scrub. The pin precedes the scrub exactly as in
+/// `ClaudeSession::finalize_child_env`, so a declared model gateway — applied
+/// inside the scrub — still wins over it. The scrub is LAST because nothing between here and
 /// [`run_claude_session_inline`]'s `cmd.spawn()` touches the env — the
 /// federation block in between does I/O only — so the strip is
 /// last-write-wins by construction. See
@@ -315,6 +339,7 @@ pub(crate) fn build_inline_child_command(
     program: &str,
     cli_args: &[String],
     working_dir: &str,
+    config_dir: Option<&str>,
 ) -> std::process::Command {
     // `program` comes from `launch_spec::render_program_and_argv`, which is the
     // one place that decides `cmd.exe` (Windows, for npm's `claude.cmd` shim)
@@ -333,6 +358,12 @@ pub(crate) fn build_inline_child_command(
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+
+    // The account pin. Without it the child ran under the runner process's
+    // ambient account whatever any mode picked.
+    if let Some(dir) = config_dir {
+        cmd.env("CLAUDE_CONFIG_DIR", dir);
+    }
 
     // Full non-interactive git credential posture — this seam spawns a
     // `claude` that can run `git push`, so without it a credential prompt
@@ -515,16 +546,13 @@ fn run_claude_session_inline(
         extra_required,
         ..Default::default()
     };
-    // ONE account resolution, so the launch template and the trust pre-accept
-    // below name the same account. The resolved dir is a process-global that
-    // every `pick_best_account` rewrites, and under `WeightedRandom` (the
-    // default) each pick is a fresh draw, so two reads could disagree when a
-    // sibling spawn picks in between. (This seam sets no `CLAUDE_CONFIG_DIR`
-    // on the child itself — see plan
-    // `2026-11-05-a-spawn-takes-its-own-account-pick-not-the-shared-resolved-dir`.)
+    // ONE account resolution, so the launch template, the trust pre-accept,
+    // federation and the child's `CLAUDE_CONFIG_DIR` name the same account —
+    // the session ctx's choice (the workflow's own pick), never the shared
+    // resolved dir (`resolve_inline_config_dir`).
     let config_dir = {
         let ai = crate::settings::get_ai_settings();
-        crate::ai_provider::get_effective_config_dir(&ai.claude_cli).0
+        resolve_inline_config_dir(&ai.claude_cli, session_ctx.as_ref())
     };
     let launch_cfg =
         crate::claude_session::launch_spec::LaunchConfig::from_settings(config_dir.as_deref());
@@ -553,7 +581,8 @@ fn run_claude_session_inline(
         }
     }
 
-    let mut cmd = build_inline_child_command(&program, &cli_args, working_dir);
+    let mut cmd =
+        build_inline_child_command(&program, &cli_args, working_dir, config_dir.as_deref());
 
     // ── Observable-bridge federation: spawn-time pull + watcher ───────
     //
@@ -562,49 +591,46 @@ fn run_claude_session_inline(
     // `session_id`), then run each registered bridge's pull + watcher.
     // All steps short-circuit silently on missing identity / no global
     // bridge — federation is best-effort and never blocks the spawn.
-    let federation_ctx_opt = {
-        let ai_settings = crate::settings::get_ai_settings();
-        match crate::claude_session::federation::build_federation_ctx(
-            session_id,
-            working_dir,
-            &ai_settings.claude_cli,
-            // Phase 8b (B2): thread the session's RECORDED tenant so the
-            // federated pool agrees with the coord record + JWT slot: the
-            // tenant `AiCoordRegistrar` stamped them with, looked up by this
-            // spawn's own id, then by the owning task run's id (a workflow
-            // phase session's id is suffixed; the run is what registered).
-            // Neither registered yet, or no tenant recorded: resolve it as
-            // a registration would, from the workspace and the repo in this
-            // spawn's working directory (plan 2026-09-20 Phase 5). A REFUSED
-            // decision skips federation rather than federating the default.
-            crate::claude_session::coord_register::federation_session_tenant(
-                tauri::Manager::try_state::<
-                    std::sync::Arc<crate::claude_session::coord_register::AiCoordRegistrar>,
-                >(app_handle)
-                .as_deref()
-                .map(|r| &**r),
-                &crate::claude_session::coord_register::federation_session_keys(
-                    session_id,
-                    task_run_id,
-                    session_ctx.as_ref(),
-                ),
-                || {
-                    run_async_inline(crate::session::resolve_new_session_tenant_in(Some(
-                        std::path::Path::new(working_dir),
-                    )))
-                },
+    let federation_ctx_opt = match crate::claude_session::federation::build_federation_ctx(
+        session_id,
+        working_dir,
+        config_dir.as_deref(),
+        // Phase 8b (B2): thread the session's RECORDED tenant so the
+        // federated pool agrees with the coord record + JWT slot: the
+        // tenant `AiCoordRegistrar` stamped them with, looked up by this
+        // spawn's own id, then by the owning task run's id (a workflow
+        // phase session's id is suffixed; the run is what registered).
+        // Neither registered yet, or no tenant recorded: resolve it as
+        // a registration would, from the workspace and the repo in this
+        // spawn's working directory (plan 2026-09-20 Phase 5). A REFUSED
+        // decision skips federation rather than federating the default.
+        crate::claude_session::coord_register::federation_session_tenant(
+            tauri::Manager::try_state::<
+                std::sync::Arc<crate::claude_session::coord_register::AiCoordRegistrar>,
+            >(app_handle)
+            .as_deref()
+            .map(|r| &**r),
+            &crate::claude_session::coord_register::federation_session_keys(
+                session_id,
+                task_run_id,
+                session_ctx.as_ref(),
             ),
-        ) {
-            Ok(ctx) => Some(ctx),
-            Err(reason) => {
-                // warn! already logged inside build_federation_ctx;
-                // proceed locally.
-                debug!(
-                    "federation skipped for session {} ({}); proceeding locally",
-                    session_id, reason
-                );
-                None
-            }
+            || {
+                run_async_inline(crate::session::resolve_new_session_tenant_in(Some(
+                    std::path::Path::new(working_dir),
+                )))
+            },
+        ),
+    ) {
+        Ok(ctx) => Some(ctx),
+        Err(reason) => {
+            // warn! already logged inside build_federation_ctx;
+            // proceed locally.
+            debug!(
+                "federation skipped for session {} ({}); proceeding locally",
+                session_id, reason
+            );
+            None
         }
     };
     let federation_ctx_opt = if let Some(mut ctx) = federation_ctx_opt {
@@ -2829,7 +2855,7 @@ mod spawn_env_tests {
     #[test]
     fn inline_child_command_scrubs_credential_values() {
         let args = vec!["/c".to_string(), "claude".to_string()];
-        let cmd = build_inline_child_command("cmd.exe", &args, ".");
+        let cmd = build_inline_child_command("cmd.exe", &args, ".", None);
 
         crate::terminal::assert_credentials_scrubbed_std(&cmd, "build_inline_child_command");
 
@@ -2857,10 +2883,120 @@ mod spawn_env_tests {
     #[test]
     fn inline_child_command_applies_non_interactive_git_posture() {
         let args = vec!["/c".to_string(), "claude".to_string()];
-        let cmd = build_inline_child_command("cmd.exe", &args, ".");
+        let cmd = build_inline_child_command("cmd.exe", &args, ".", None);
         crate::credential_helper::assert_non_interactive_git_posture_std(
             &cmd,
             "build_inline_child_command",
         );
+    }
+
+    /// The value the command sets for `name`: `None` when it does not touch
+    /// it, `Some(None)` when it removes it.
+    fn env_value(cmd: &std::process::Command, name: &str) -> Option<Option<String>> {
+        cmd.get_envs()
+            .find(|(k, _)| *k == name)
+            .map(|(_, v)| v.map(|v| v.to_string_lossy().to_string()))
+    }
+
+    /// **The inline child runs under the account it was given.** It used to
+    /// set no `CLAUDE_CONFIG_DIR` at all, so it ran under the runner's ambient
+    /// account whatever any mode picked. With no dir it sets none (the
+    /// ambient default, unchanged).
+    #[test]
+    fn inline_child_command_pins_the_given_config_dir() {
+        let _amb = crate::test_env::isolated_ambient();
+        let cmd =
+            build_inline_child_command("cmd.exe", &[], ".", Some("/qontinui-test/inline/acct"));
+        assert_eq!(
+            env_value(&cmd, "CLAUDE_CONFIG_DIR"),
+            Some(Some("/qontinui-test/inline/acct".to_string()))
+        );
+
+        let cmd = build_inline_child_command("cmd.exe", &[], ".", None);
+        assert_eq!(env_value(&cmd, "CLAUDE_CONFIG_DIR"), None);
+    }
+
+    /// A declared model gateway still wins over the account pin: the pin is
+    /// set BEFORE the scrub, and the gateway's child-env plan (applied inside
+    /// the scrub) re-pins `CLAUDE_CONFIG_DIR` to the gateway dir. Here the
+    /// gateway is unresolved (a recorded marker with no declaration), which
+    /// pins it to the unroutable dir — any gateway arm overrides the pin.
+    #[test]
+    fn a_declared_gateway_wins_over_the_inline_account_pin() {
+        let _amb = crate::test_env::isolated_ambient();
+        let g = crate::model_gateway::ModelGatewaySettings {
+            base_url: Some("https://inline-pin-gw.example.com".to_string()),
+            api_key_helper: Some("echo inline-pin-key".to_string()),
+            ..Default::default()
+        }
+        .resolve()
+        .unwrap()
+        .unwrap();
+        crate::model_gateway::write_marker_at(&crate::model_gateway::gateway_dir().unwrap(), &g)
+            .unwrap();
+        let plan = crate::model_gateway::live_child_env_plan();
+        let gateway_dir = plan
+            .set
+            .iter()
+            .find(|(k, _)| k == "CLAUDE_CONFIG_DIR")
+            .map(|(_, v)| v.clone())
+            .expect("a gateway child-env plan always pins CLAUDE_CONFIG_DIR");
+        assert_ne!(gateway_dir, "/qontinui-test/inline/acct");
+
+        let cmd =
+            build_inline_child_command("cmd.exe", &[], ".", Some("/qontinui-test/inline/acct"));
+        assert_eq!(
+            env_value(&cmd, "CLAUDE_CONFIG_DIR"),
+            Some(Some(gateway_dir))
+        );
+    }
+}
+
+#[cfg(test)]
+mod inline_account_tests {
+    use super::resolve_inline_config_dir;
+    use crate::ai_provider::config::test_support::dir_with_live_credentials;
+    use crate::ai_provider::config::ResolvedConfigDirRestore;
+    use crate::ai_provider::{set_resolved_config_dir, AccountChoice};
+    use crate::execution_context::AiSessionContext;
+    use crate::settings::{AccountSelectionMode, ClaudeCliSettings};
+
+    fn auto_mode_cli() -> ClaudeCliSettings {
+        ClaudeCliSettings {
+            account_selection_mode: AccountSelectionMode::WeightedRandom,
+            account_selection_pinned: false,
+            config_dir: None,
+            ..Default::default()
+        }
+    }
+
+    /// **The inline runner resolves the workflow's own pick, not the global.**
+    /// A sibling's draw rewrote `RESOLVED_CONFIG_DIR` after the workflow
+    /// picked; the session ctx still carries the workflow's pick and that is
+    /// what the child, the launch template and the trust pre-accept get. With
+    /// no choice the global is not read at all.
+    #[test]
+    fn the_inline_runner_resolves_the_session_ctx_pick_not_the_global() {
+        let _fleet = crate::mcp::fleet_policy_poller::pin_account_selection_for_test(Some(
+            AccountSelectionMode::WeightedRandom,
+        ));
+        let (_mine_guard, mine) = dir_with_live_credentials();
+        let (_sibling_guard, sibling) = dir_with_live_credentials();
+        let _restore = ResolvedConfigDirRestore::capture();
+        set_resolved_config_dir(Some(sibling));
+
+        let mut ctx = AiSessionContext::agentic("task-inline", "Inline", 1);
+        ctx.account = Some(AccountChoice::Picked(mine.clone()));
+        assert_eq!(
+            resolve_inline_config_dir(&auto_mode_cli(), Some(&ctx)),
+            Some(mine)
+        );
+
+        ctx.account = None;
+        assert_eq!(
+            resolve_inline_config_dir(&auto_mode_cli(), Some(&ctx)),
+            None
+        );
+        assert_eq!(resolve_inline_config_dir(&auto_mode_cli(), None), None);
     }
 }
