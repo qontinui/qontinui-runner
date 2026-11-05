@@ -104,8 +104,8 @@ pub fn lock_path(pane_dir: &Path, pane: &PaneId) -> PathBuf {
 /// bytes, so its panes silently fell back to in-process PTYs (plan
 /// `2026-11-04-identity-shim-foreign-shim-ping-pong-and-secondary-runner-pty-socket-overflow`,
 /// Phase 4). Here the length is bounded whatever the pane dir: at most
-/// `/run/user/<uid>/qontinui-pty/` plus 21 bytes (59 for a 10-digit uid), and
-/// its staged twin (`crate::transport::staged_socket_path`) four more.
+/// `/run/user/<uid>/qontinui-pty/` plus 21 bytes (55 for a 10-digit uid), and
+/// its staged twin (`crate::transport::staged_socket_path`) four more (59).
 ///
 /// The path is a function of `(pane_dir, pane, uid)` and the filesystem —
 /// never of the environment — because a holder outlives the runner that
@@ -126,12 +126,15 @@ pub fn socket_path(pane_dir: &Path, pane: &PaneId) -> io::Result<PathBuf> {
 }
 
 /// Every path a holder for this pane may be listening on, most likely first,
-/// WITHOUT creating anything: the socket under the preferred root, then under
-/// the other root, then the pre-Phase-4 `<pane-dir>/<pane-id>.sock` (a holder
-/// started by an older build keeps serving there until it ends — a runner
-/// restart onto this build must still reach it to adopt or upgrade it). A
-/// root that does not exist or fails the ownership/mode check
-/// ([`check_socket_root`]) contributes nothing. Used by `transport::connect`
+/// WITHOUT creating anything: the socket under the root a holder would bind in
+/// now, then under the other root, then the pre-Phase-4
+/// `<pane-dir>/<pane-id>.sock` (a holder started by an older build keeps
+/// serving there until it ends — a runner restart onto this build must still
+/// reach it to adopt or upgrade it; omitted when it is too long for any holder
+/// to have bound it). A root that does not exist or fails the ownership/mode
+/// check ([`check_socket_root`]) contributes nothing; the stricter runtime-dir
+/// test only decides where to BIND, so a holder bound under `/run/user` stays
+/// reachable if that dir's mode drifts later. Used by `transport::connect`
 /// and by the sweep, which removes a dead pane's socket wherever it lies; the
 /// entries are all derived from THIS pane, so no other pane's file is ever
 /// named.
@@ -155,12 +158,23 @@ fn socket_candidates_in(
     pane: &PaneId,
 ) -> Vec<PathBuf> {
     let name = socket_name(pane_dir, pane);
-    let mut out: Vec<PathBuf> = root_choices(run_user, tmp, uid)
+    let mut roots = root_choices(run_user, tmp, uid);
+    let runtime_root = run_user.join(uid.to_string()).join("qontinui-pty");
+    if !roots.contains(&runtime_root) {
+        roots.push(runtime_root);
+    }
+    let mut out: Vec<PathBuf> = roots
         .into_iter()
         .filter(|root| check_socket_root(root, uid).is_ok())
         .map(|root| root.join(&name))
         .collect();
-    out.push(pane_dir.join(format!("{}.sock", pane.as_str())));
+    let legacy = pane_dir.join(format!("{}.sock", pane.as_str()));
+    {
+        use std::os::unix::ffi::OsStrExt;
+        if legacy.as_os_str().as_bytes().len() <= crate::transport::max_path_len() {
+            out.push(legacy);
+        }
+    }
     out
 }
 
@@ -250,8 +264,8 @@ fn root_choices(run_user: &Path, tmp: &Path, uid: u32) -> Vec<PathBuf> {
 }
 
 /// Create `root` 0700 if missing (its parent must exist: `/run/user/<uid>` or
-/// `/tmp`), then refuse it unless [`check_socket_root`] passes; tighten a
-/// group/other-readable one to 0700.
+/// `/tmp`), then refuse it unless [`check_socket_root`] passes, and set it to
+/// exactly 0700.
 #[cfg(unix)]
 fn prepare_socket_root(root: &Path, uid: u32) -> io::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
@@ -262,7 +276,9 @@ fn prepare_socket_root(root: &Path, uid: u32) -> io::Result<()> {
     }
     check_socket_root(root, uid)?;
     let md = std::fs::symlink_metadata(root)?;
-    if md.mode() & 0o077 != 0 {
+    // Exactly 0700: tightens a readable one, and restores owner bits a
+    // restrictive umask stripped from the `mkdir` (bind needs `wx`).
+    if md.mode() & 0o777 != 0o700 {
         std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700))?;
     }
     Ok(())
@@ -683,6 +699,26 @@ mod tests {
             vec![run_root.join(&name), legacy.clone()]
         );
 
+        // The runtime dir's mode drifts after a holder bound under it: binding
+        // moves to /tmp, but the /run/user socket is still a candidate.
+        std::fs::set_permissions(&tmp_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&rt, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            socket_candidates_in(&run_user, &tmp, uid, &pane_dir, &p),
+            vec![tmp_root.join(&name), run_root.join(&name), legacy.clone()]
+        );
+
+        // A pane dir too long for any holder to have bound in: no legacy entry.
+        let long = base.join("x".repeat(120));
+        prepare_private_dir(&long).unwrap();
+        assert_eq!(
+            socket_candidates_in(&run_user, &tmp, uid, &long, &p),
+            vec![
+                tmp_root.join(socket_name(&long, &p)),
+                run_root.join(socket_name(&long, &p))
+            ]
+        );
+
         // Through a symlinked ancestor: the same socket name.
         let link = base.join("link");
         std::os::unix::fs::symlink(&base, &link).unwrap();
@@ -780,6 +816,13 @@ mod tests {
             let e = socket_root_in(&none, &tmp, uid).unwrap_err();
             assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{m:o}");
         }
+        // Missing owner bits (a restrictive umask at mkdir): restored.
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o500)).unwrap();
+        assert_eq!(socket_root_in(&none, &tmp, uid).unwrap(), root);
+        assert_eq!(
+            std::fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
         // Merely readable: tightened.
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(socket_root_in(&none, &tmp, uid).unwrap(), root);
