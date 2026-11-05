@@ -44,9 +44,11 @@ async fn finish_rig(
 }
 
 fn queue_finish(outbox: &OutboxWriter, session: Uuid, csid: &str, at: i64) {
+    // One machine id for every row, so the outbox's seq counter is shared and
+    // two rows of one session never collide on (session, seq).
     outbox
         .record(
-            Uuid::new_v4(),
+            Uuid::from_u128(0xeb2155ed_4152_4a91_be82_5d4346f717fc),
             session,
             SessionEventKind::Finished,
             json!({ "id": session, "claude_session_id": csid, "finished_at": at }),
@@ -80,12 +82,12 @@ async fn a_2xx_whose_row_reads_finished_stamps_the_mark() {
     )))
     .await;
     let s = Uuid::new_v4();
-    queue_finish(&outbox, s, "csid-observed", 1_762_344_342_000);
+    queue_finish(&outbox, s, "csid-observed", 1_793_880_342_000);
     let mut state = DrainState::default();
     drain_tick(&coord.inner, &mut state).await;
     assert_eq!(
         *acks.lock().unwrap(),
-        vec![("csid-observed".to_string(), Some(1_762_344_342_000))]
+        vec![("csid-observed".to_string(), Some(1_793_880_342_000))]
     );
     assert!(pending_of(&outbox, s).is_empty(), "the row left the outbox");
     assert!(!state.retry.contains_key(&s));
