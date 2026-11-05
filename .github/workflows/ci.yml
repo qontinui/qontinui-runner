@@ -258,27 +258,55 @@ jobs:
           --default-lane hosted
           --hosted-on-rerun
 
+  # ── One step list, two jobs: `test` (ubuntu) and `test-windows` ──────────
+  #
+  # The two legs used to be ONE matrix job, and a matrix job has one `needs:`.
+  # So the WINDOWS leg — the longest job in this workflow (68-106 min on
+  # hosted, measured on four green merge-candidate-batch runs of 2026-11-05) —
+  # waited for `route`, a 12-second router that only the UBUNTU leg reads, and
+  # `route` itself waits for a hosted slot. Measured on those four runs:
+  # `route` queued 18.6 / 26.1 / 52.4 / 170.7 min, and the windows leg started
+  # at +19.7 / +26.5 / +82.6 / +356.1 min. Plan
+  # 2026-11-05-runner-candidate-ci-hosted-queue-in-front-of-a-serial-windows-leg,
+  # Phase 1.
+  #
+  # So the windows leg is its own job, `test-windows`, with NO `needs:`; it
+  # enters the hosted queue the moment the run is created. Its `steps:` list is
+  # a VERBATIM COPY of this job's. Not a YAML anchor: ci-integrity.yml refuses
+  # to certify a gating file that uses anchors or aliases (its parser resolves
+  # them, so an anchored rewrite could digest as unchanged while Actions
+  # stopped running the gate). The copy cannot drift silently:
+  # `ci_rust_test_steps_split.rs` asserts the two `steps:` lists are EQUAL, so
+  # an edit to one leg's steps that is not made to the other reds CI.
+  # EDIT BOTH. Each job keeps a single-entry matrix so every `matrix.platform`
+  # gate in the shared steps still resolves, and
+  # `name: test (${{ matrix.platform }})` keeps both required contexts
+  # byte-identical: `test (ubuntu-22.04)` and `test (windows-latest)`.
+  #
+  # Swatinem/rust-cache keys on the job id by default, so its step pins
+  # `shared-key: test` (the old job id) and both legs keep their caches.
   test:
+    name: test (${{ matrix.platform }})
     # `route` decides the ubuntu leg's pool (see above). `!cancelled()` is
     # load-bearing: on a pull_request `route` is SKIPPED, and without it a job
-    # that needs a skipped job is skipped too, which would turn both required
-    # `test (…)` contexts into `skipped` (= passing to coord) on every PR.
+    # that needs a skipped job is skipped too, which would turn the required
+    # `test (ubuntu-22.04)` context into `skipped` (= passing to coord) on
+    # every PR.
     needs: route
     if: ${{ !cancelled() }}
     strategy:
-      # Surface platform-specific failures independently. Default fail-fast
-      # cancels ubuntu/windows the moment macos clippy trips, masking
-      # whether the linux/win build is actually OK. Now blocked only by
-      # genuine per-platform failures.
       fail-fast: false
       matrix:
         # macOS temporarily disabled — PR cycle time was bottlenecked at
         # ~90 min p90 by the mac leg (see step-level timeout discussion
         # below). Joshua does not develop on macOS; re-add `macos-latest`
-        # when cross-platform demos / mac users matter.
-        platform: [ubuntu-22.04, windows-latest]
+        # when cross-platform demos / mac users matter. The windows leg is
+        # the `test-windows` job below.
+        platform: [ubuntu-22.04]
 
-    # The windows leg always runs hosted. The ubuntu leg, on a FIRST attempt of
+    # This job is the ubuntu leg only (its windows arm below is kept so the
+    # expression stays shared with the routing PRs; it never fires here — the
+    # windows leg is `test-windows`, always hosted). The ubuntu leg, on a FIRST attempt of
     # a run that is not a pull_request, goes to the pool when the lane is
     # forced `self-hosted`, or where `route` said under `auto` (its `labels`
     # output). Everything else is the hosted floor: a pull_request, any
@@ -293,8 +321,8 @@ jobs:
     # Backstop cap for any step in this job that is not individually bounded.
     # This job previously had NO job-level timeout, so the 4h24m apt hang above
     # was burning toward GitHub's *default* 360-minute ceiling — a value this
-    # repo never chose. One cap covers both matrix legs, so it is sized off the
-    # slower one. 90 sampled successful job runs, 2026-08-08..08-20: ubuntu
+    # repo never chose. One cap value covers both legs (`test` and `test-windows`
+    # carry the same one), so it is sized off the slower one. 90 sampled successful job runs, 2026-08-08..08-20: ubuntu
     # p50 52.8m / p90 62.5m / max 112.0m; windows p50 73.8m / p90 87.2m /
     # p95 93.4m / max 110.6m. 150 min = windows p90 + ~60 min headroom, and
     # 1.34x the worst observed success across either leg — well clear of normal
@@ -791,6 +819,1674 @@ jobs:
         with:
           # Workspace root is the repo root: ./Cargo.toml -> ./target
           workspaces: ". -> target"
+          # The key `test` is the job id this step lived under before the
+          # windows leg moved to `test-windows`; pinning it keeps both legs on
+          # their existing caches and keeps published-parity.yml (which
+          # restores `shared-key: "test"` on windows) warm.
+          shared-key: test
+          # Candidate/PR runs often fail on steps after the Rust compiles
+          # succeeded; still save so the next run on the ref stays warm.
+          cache-on-failure: true
+          # Save ONLY from main. Observed 2026-07-17: every merge-candidate/*
+          # and PR run saved its own ~2.6 GB copy under a one-shot ref,
+          # blowing the repo's 10 GB cache cap and EVICTING main's cache —
+          # main runs then restored "No cache found." and went cold (1h39m
+          # vs 1h17m warm), defeating the cache fix entirely. Candidates and
+          # PRs still RESTORE main's cache (restore is unrestricted); their
+          # refs are one-shot, so a per-ref save buys nothing.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # The restore above can return a `postgresql_embedded` build unit whose
+      # OUT_DIR embeds a different PostgreSQL release than the pin in
+      # src-tauri/.cargo/config.toml. Cargo re-runs the build script when the pin
+      # changes, but the script keeps an archive that is already in OUT_DIR, so
+      # the stale release survives. Measured 2026-10-19: main's ubuntu-22.04
+      # cache held 18.6.1, whose initdb needs GLIBC 2.36. This drops such units
+      # so this run embeds the pin; a cache that already matches is untouched.
+      # embedded_pg::tests::bundled_postgres_is_the_pinned_release fails if a
+      # stale unit gets past this step.
+      - name: Purge cached bundled-PostgreSQL units that do not match the pin
+        run: node scripts/ci/purge-stale-bundled-postgres.mjs
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint frontend code
+        run: pnpm run lint
+
+      # Typecheck before the bundler runs. Fails fast on consumer-side
+      # camelCase / deny_unknown_fields drift from qontinui-schemas before
+      # paying for `vite build`. Closes Item 4 of the
+      # schemas-camelcase-cascade-2026-04-18 plan.
+      # Component-action `effect` boundary fixture (plan
+      # 2026-09-04-effect-calculus-joins-the-component-action-registry, Phase 1).
+      # Re-derives the /control/components body by running the REAL
+      # serializeComponent over the REAL Settings.tsx registration, and fails
+      # when it drifts from src-tauri/tests/fixtures/control-components-effect.json
+      # -- the fixture the Rust test `component_effect_fixture` reads. Node-only
+      # and sub-second, so it runs before the expensive steps.
+      - name: Verify component-action effect fixture
+        run: pnpm run effect:fixture:check
+
+      # Probe 2b's verdict logic (per-action `effect` round-trip), mutation-
+      # tested with no runner. Same placement rationale as the step above: ~1s,
+      # and a broken verdict should fail before a full exe boot. The verdict
+      # library was fixed for Windows PowerShell 5.1 in #1460, which landed
+      # after this branch was first cut -- this rebuild picks that up.
+      - name: Contract-smoke effect-probe verdict (PS 5.1)
+        if: matrix.platform == 'windows-latest'
+        run: powershell -File scripts/tests/test-effect-probe.ps1
+        shell: bash
+
+      - name: Typecheck frontend code
+        run: pnpm run typecheck
+
+      # Frontend unit tests (vitest). Until 2026-06-03 nothing in CI ran the
+      # vitest suite, so frontend-logic regressions (e.g. the
+      # ui-bridge-auto@0.1.6 regression-generator field drift that broke
+      # generateRegressionSuite for every IR, or the specs.compile guard
+      # silently walking an empty directory) merged green and rotted on main.
+      # Runs after typecheck (cheap fail-fast first) and before the vite
+      # build / cargo steps.
+      - name: Run frontend unit tests
+        run: pnpm test
+
+      # Build the frontend before any cargo step. tauri::generate_context!()
+      # in src-tauri/src/lib.rs reads tauri.conf.json at compile time and
+      # panics if frontendDist (../dist) is missing — which broke `Clippy
+      # check`, `Run Rust tests`, and `Build Tauri app` on every platform.
+      - name: Build frontend
+        run: pnpm run build
+
+      - name: Format Rust code check
+        run: |
+          cd src-tauri
+          cargo fmt -- --check
+
+      - name: Clippy check
+        # UBUNTU ONLY. Windows clippy moved to the parallel `clippy-windows`
+        # job (below) so it no longer sits on the windows `test` critical path
+        # (~12 min saved there). cfg(windows) lint coverage is preserved in that
+        # job — see plan 2026-07-22-runner-ci-sccache-workspace-crate-caching.md
+        # Phase 2. This ubuntu leg stays the in-job blocking clippy over the
+        # src-tauri package's default targets (`cd src-tauri` selects that one
+        # package; the holder crates get their own job). clippy-tiers.yml is
+        # diff-scoped/advisory, not a substitute.
+        if: matrix.platform == 'ubuntu-22.04'
+        # Plain `cargo clippy` (no `-D warnings`): lint levels come solely from
+        # src-tauri/Cargo.toml [lints.clippy]. T1 correctness/suspicious groups
+        # are `deny` there, so a correctness lint still exits non-zero and fails
+        # this required check; T3 style/complexity/perf stay `warn` (emitted,
+        # non-blocking). See plan 2026-07-05-lint-tiers-and-diff-scoped-gates.
+        # DEFAULT TARGET ON PURPOSE. `--all-targets` here was measured on
+        # qontinui-runner#2392 (2026-10-25, run 40209973488): 5.5 min into
+        # the step, at cargo's default parallelism and with the 12 GB swapfile
+        # on, the hosted runner got a shutdown signal (exit 143). That is the
+        # Ubuntu OOM shape the test step's CARGO_BUILD_JOBS note records. At
+        # CARGO_BUILD_JOBS=1 the nightly's all-targets step takes 14-29 min,
+        # which would land on this required job. So test code is linted per PR
+        # by the parallel `clippy-windows` job below (`--all-targets`, off the
+        # critical path); Linux-only (cfg(unix)) test code is linted only by
+        # the nightly clippy-tiers.yml job.
+        run: |
+          cd src-tauri
+          cargo clippy
+
+      # Run the suite under DELIBERATELY POISONED ambient state, on both legs.
+      #
+      # `cargo test` here has a history of tests whose assertions depend on
+      # machine state OUTSIDE their fixture — process env vars and real files
+      # under `~/.qontinui/`. On a configured operator box they fail
+      # deterministically; on this clean runner they pass, so CI has never been
+      # able to catch a new one. The ledger (four confirmed shapes: `machine.json`
+      # ::active_tenant_id via `tenant_pin`, `$COORD_HTTP_URL` via
+      # `agent_runtime`, `$QONTINUI_ROOT` via `canonical_paths`, plus the two
+      # `census` candidates) is in plan
+      # 2026-09-03-runner-tests-read-ambient-machine-state, and the fix for the
+      # CODE — the `qontinui_runner_lib::ambient` seam, the per-test
+      # `isolated_ambient()` fixture and the cfg(test) canary that PANICS naming
+      # the ambient source when a test reaches past the fixture — lands in the
+      # companion PR (Phases 0–3 of that plan). This step is Phase 4: it fills
+      # the home with values no correct test can want, so a NEW test that reads
+      # the machine instead of its fixture fails on the PR that introduces it
+      # rather than on the next operator box that runs the suite. Every value
+      # is PARSEABLE on purpose: a file the code rejects as malformed exercises
+      # the error arm, not the ambient read this is meant to catch (shapes from
+      # `bin/qontinui_profile.rs` `DeviceFile`, `profiles.rs` `ProfilesFile`,
+      # and the fleet scripts' `jwt_shaped` check).
+      #
+      # Windows writes into the REAL profile dir. `dirs::home_dir()` there is
+      # `SHGetKnownFolderPath(FOLDERID_Profile)` and ignores `$HOME`, so an
+      # un-seamed read hits `%USERPROFILE%\.qontinui`, not whatever bash calls
+      # `$HOME`. Under GitHub's bash the two are the same directory; the step
+      # prints both and poisons both when they are not.
+      #
+      # The env half goes through `$GITHUB_ENV` and is blanked again by the
+      # `Unpoison ambient state` step below, so the poison covers exactly the
+      # test step: `QONTINUI_SERVER_MODE=1` means "this runner has no webview
+      # and must never be given one" (`webview_recovery::is_server_mode`), which
+      # the windows contract smoke's exe boot must not inherit.
+      #
+      # Until the companion PR lands this step makes `Run Rust tests` RED —
+      # that red is the plan's Phase 0 inventory running on CI, and the merge
+      # train orders the two PRs by label. Separately, ANY edit under
+      # `.github/workflows/**` reds `ci-integrity` by design on a main-based PR
+      # (plan 2026-08-30-runner-ci-has-no-flake-detection-so-one-flaky-test-
+      # freezes-the-train); expected, not a workaround target. It does NOT need
+      # an operator's review — that arm was retired in favour of
+      # declare-and-verify. The author clears it: `ci:gate-change=declared` for
+      # a purely additive change — a whole new JOB, a new workflow FILE, or an
+      # edit that moves no surface at all, which includes a YAML-level
+      # comment-only edit like this one — or
+      # `ci:gate-change=alters-a-gate` plus a `Gate-Change: ci#<job-key>` line in
+      # the PR body when an existing job's surface moves — which includes adding
+      # or removing a STEP, and editing a shell comment inside a `run:` block.
+      # A deleted job takes `Gate-Removal:` instead. Then re-run the job.
+      - name: Poison ambient state
+        run: |
+          set -euo pipefail
+
+          # A v4-shaped UUID: `uuidgen` on ubuntu (util-linux), python where bash
+          # ships none (Git Bash on windows), and 16 bytes of /dev/urandom laid
+          # out 8-4-4-4-12 as the last resort — `Uuid::parse_str` accepts any hex
+          # in that layout, so the readers (`tenant_pin`, `agent_runtime`
+          # `load_local_device_id`) take every arm as a real id.
+          rand_uuid() {
+            if command -v uuidgen >/dev/null 2>&1; then uuidgen | tr 'A-Z' 'a-z'; return; fi
+            if command -v python3 >/dev/null 2>&1; then python3 -c 'import uuid; print(uuid.uuid4())'; return; fi
+            if command -v python >/dev/null 2>&1; then python -c 'import uuid; print(uuid.uuid4())'; return; fi
+            local hex
+            hex="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+            printf '%s-%s-%s-%s-%s\n' "${hex:0:8}" "${hex:8:4}" "${hex:12:4}" "${hex:16:4}" "${hex:20:12}"
+          }
+          DEVICE_ID="$(rand_uuid)"
+          TENANT_ID="$(rand_uuid)"
+          HOST="$(hostname 2>/dev/null || echo "${HOSTNAME:-ci-poison-host}")"
+
+          homes=("$HOME")
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            profile_dir="$(cygpath -u "$USERPROFILE")"
+            echo "HOME=$HOME"
+            echo "USERPROFILE=$USERPROFILE (bash: $profile_dir)"
+            if [ "${profile_dir%/}" != "${HOME%/}" ]; then
+              echo "::warning::HOME and USERPROFILE name different directories — poisoning both"
+              homes+=("$profile_dir")
+            fi
+          fi
+
+          for h in "${homes[@]}"; do
+            q="$h/.qontinui"
+            if [ -e "$q" ]; then
+              echo "::warning::$q already exists before poisoning — this runner's home is not the clean one this step assumes:"
+              ls -la "$q"
+            fi
+            mkdir -p "$q"
+            # `DeviceFile` (bin/qontinui_profile.rs): device_id + hostname; the
+            # tenant pin (`tenant_pin.rs`) reads the sibling `active_tenant_id`.
+            cat > "$q/machine.json" <<EOF
+          {
+            "device_id": "$DEVICE_ID",
+            "hostname": "$HOST",
+            "active_tenant_id": "$TENANT_ID"
+          }
+          EOF
+            # `ProfilesFile` (profiles.rs): `active` names the profile the loader
+            # picks when `QONTINUI_ENV` is unset; `dev` is the loader's own
+            # fallback name, so a reader that hard-codes it is poisoned too.
+            cat > "$q/profiles.json" <<EOF
+          {
+            "active": "poison",
+            "profiles": {
+              "poison": { "coord_url": "http://poison.invalid" },
+              "dev":    { "coord_url": "http://poison.invalid" }
+            }
+          }
+          EOF
+            # Three dot-separated base64url-charset parts, so the fleet's
+            # `jwt_shaped` check accepts it and it would be SENT — but NO part
+            # starts with `eyJ` (base64 of `{"`): gitleaks' `jwt` rule keys on
+            # two `ey…` segments, and a literal that matched it redded Secret
+            # Scan on this PR's first push. The reader only checks shape.
+            printf '%s\n' 'poison-header-not-a-jwt.poison-payload-ci-ambient-state.poison-not-a-signature' > "$q/coord-device-jwt"
+            echo "=== poisoned $q ==="
+            ls -la "$q"
+            cat "$q/machine.json" "$q/profiles.json"
+          done
+
+          # A workspace root that does not exist: `default_canonical_path` must
+          # fail closed naming `$QONTINUI_ROOT`, never resolve.
+          POISON_ROOT="$RUNNER_TEMP/qontinui-root-poison-does-not-exist"
+          rm -rf "$POISON_ROOT"
+          {
+            echo "COORD_HTTP_URL=http://poison.invalid"
+            echo "QONTINUI_ROOT=$POISON_ROOT"
+            echo "QONTINUI_SERVER_MODE=1"
+            echo "QONTINUI_RUNNER_TIER=local"
+          } >> "$GITHUB_ENV"
+          echo "=== exported via GITHUB_ENV ==="
+          echo "COORD_HTTP_URL=http://poison.invalid"
+          echo "QONTINUI_ROOT=$POISON_ROOT"
+          echo "QONTINUI_SERVER_MODE=1"
+          echo "QONTINUI_RUNNER_TIER=local"
+          echo "device_id=$DEVICE_ID active_tenant_id=$TENANT_ID"
+        shell: bash
+
+      # Plan 2026-10-27-coord-routes-ci-jobs-by-runner-capability, Phase 1:
+      # the cgroup `oom_kill` count BEFORE `Build Rust tests`, read by
+      # `Annotate an out-of-memory Rust test step`. `memory.events` is
+      # cumulative over the cgroup's lifetime (the runner service's, not this
+      # step's), so only a RISE over this baseline says a kill happened during
+      # the step. Linux only (no cgroup elsewhere); best-effort — an unreadable
+      # count writes an empty output, which the matcher reads as NO evidence.
+      #
+      # Phase 2 reuses this step rather than adding one: it also starts the
+      # detached anonymous-memory sampler (`resource-report.sh
+      # --start-anon-sampler`), which polls the cgroup's `memory.stat` `anon`
+      # every 2 s into $RUNNER_TEMP/qontinui-resource-report until
+      # `Report this job's resources` stops it and reports the peak as
+      # `peak_rss_mb`. Anonymous memory, NOT `memory.peak`: that is the
+      # cgroup's whole charge, page cache included, which a cargo build's
+      # target/ writes fill up to the cgroup's own memory limit. The
+      # sampler's first reading is the baseline a self-hosted runner's peak
+      # must rise past.
+      # Every failure is swallowed: no sampler means no `peak_rss_mb`.
+      - name: Record the cgroup oom_kill count before the build half
+        id: oom_kill_before_build
+        if: runner.os == 'Linux'
+        continue-on-error: true
+        shell: bash
+        run: |
+          cgroup="$(sed -n 's/^0:://p' /proc/self/cgroup 2>/dev/null || true)"
+          count="$(awk '$1 == "oom_kill" { print $2; exit }' "/sys/fs/cgroup${cgroup}/memory.events" 2>/dev/null || true)"
+          echo "oom_kill count before Build Rust tests: ${count:-<unreadable>}"
+          echo "count=$count" >>"$GITHUB_OUTPUT" || true
+          bash scripts/ci/resource-report.sh --start-anon-sampler \
+            --state-dir "$RUNNER_TEMP/qontinui-resource-report" || true
+
+      # ── BUILD half of the old single `Run Rust tests` step ─────────────
+      #
+      # The split is plan 2026-09-17-the-windows-test-gate-is-a-90-minute-build-
+      # wearing-a-test-shaped-bound, Phase 1. WHY: `cargo test` compiles AND
+      # executes, so one `timeout-minutes` bounded (dependency compile +
+      # workspace codegen + test-binary link + test execution) under a name and
+      # a rationale that talked almost entirely about TESTS. Measured across
+      # both attempts of run 35043646051 (windows leg): compilation is ~37 min
+      # of a ~43-minute step on a healthy run and ~86 min on a bad one, while
+      # the whole test RUN is 5m26s. The bound was named for the 5 minutes and
+      # spent on the 37-to-86.
+      #
+      # Attempt 1 expired at exactly 90 min MID-SUITE. Read the log carefully,
+      # because the obvious reading is wrong and this comment carried it until
+      # a review measured it: the `test result: ok. 1354 passed` line two
+      # minutes before the kill is ONE BINARY OF 29, not the suite. The largest
+      # binary — 9905 tests — started at 02:58:22 and was still emitting `ok`
+      # lines at 03:00:25 when the clock killed it, so it never produced a
+      # `test result:` line at all. The run was ~62% complete — the ingest
+      # recorded 7112 rows against a suite its own `test result:` lines count
+      # at 11,486. Nothing about that run says the tests passed.
+      #
+      # THE SPLIT WOULD HAVE SAVED IT, and that is the measurement that
+      # justifies this change: on the same attempt the build phase finished at
+      # 02:56:24 — 86m07s, UNDER a 90-minute build bound — and the run phase
+      # needs 5m26s, far inside a 20-minute run bound. Two bounds, both met; one
+      # composite bound, missed.
+      #
+      # ⚠️ SAY THE COUNTERFACTUAL'S OWN MARGIN, because the whole justification
+      # rests on the tighter half and it is the build half, not the run half:
+      # 86m07s under 90 is **3m53s of slack, 4.3%**. On that attempt the split
+      # would have held — but it would have held narrowly, and a build a few
+      # minutes slower expires the build bound instead. That is the correct
+      # outcome (a build expiry then NAMES itself as one, which is the point of
+      # Phases 1-2) and it is not the same as comfort. Phase 5 re-sizes both
+      # bounds against a re-measured window; this is the number it starts from.
+      #
+      # A bound sized against the wrong quantity cannot be tuned correctly and
+      # cannot attribute its own expiry; split, each bound is named for what it
+      # actually bounds.
+      #
+      # THE BOUNDS ARE NOT A TUNING CHANGE. 90 stays on the build half — the
+      # whole measured distribution already fits under it (44 windows samples
+      # after 2026-09-08: p50 50, p90 63, max(success) 82) and the plan ranks
+      # raising a bound LAST, after Phases 1-3 have moved the distribution
+      # (its Phase 5). What is new is only that the run half is bounded
+      # SEPARATELY and SMALL, which is the thing the old composite could not
+      # express.
+      #
+      # Accessibility integration tests that require a real desktop session are
+      # skipped in CI. Only pure unit tests (no system dependencies) run here.
+      #
+      # Historical rationale for the 90, preserved because it is still the
+      # build half's rationale: empirical durations from main-branch runs on
+      # 2026-05-11/12 (10-run sample) were Ubuntu p50 ~43 min, Windows p50
+      # ~70 min, macOS p50 ~58 min / p90 ~70 min / max(success) ~72 min. The
+      # earlier 75-min cap sat at p90+5 min; PR #104 and PR #105 (both
+      # content-trivial) blew it three times in 36 h at 75.2 / 75.4 / 75.5 min.
+      # Variance is dominated by hosted-runner load + cache state. 90 min =
+      # p90 + 20 min headroom covers the slow tail without hiding genuine
+      # regressions.
+      - name: Build Rust tests
+        id: build_rust_tests
+        timeout-minutes: 90
+        env:
+          # `auth::tests::test_device_id_*` and `test_token_storage` exercise
+          # `AuthManager::get_device_id` / `store_tokens`, which fall through
+          # to `keyring::Entry::{get,set}_password()` when file storage is
+          # empty (the test helper wipes the storage file). On macOS GitHub
+          # runners the Keychain blocks indefinitely waiting for a permission
+          # dialog (no TTY/desktop session), hanging the three tests past
+          # cargo's per-test heartbeat — the entire test step then eats the
+          # 90-min budget. Bumping the step timeout only delays the hang.
+          # The fix is to skip the keychain-backup path in CI entirely: see
+          # `keychain_enabled()` in `src-tauri/src/auth.rs`, which
+          # short-circuits all keychain ops when this var is set. File
+          # storage remains the source of truth, so auth tests stay real
+          # integration tests against the encrypted file backend.
+          QONTINUI_DISABLE_KEYCHAIN: "1"
+          # `CARGO_BUILD_JOBS` reduces the parallel-rustc memory peak.
+          # Empirically:
+          #   - Windows: was passing at JOBS=2 with a 16 GB pagefile (run
+          #     25336049561), but cumulative dep growth through PRs #59-#62
+          #     pushed peak past the threshold — runs 25612844640 +
+          #     75193978255 (PR #65) both OOM'd with `rustc-LLVM ERROR:
+          #     out of memory / Allocation failed`, exit `0xc000001d`
+          #     (STATUS_ILLEGAL_INSTRUCTION = the rustc allocator
+          #     aborting). Dropped to JOBS=1 for single-threaded compile,
+          #     matching Ubuntu's mitigation.
+          #     2026-07-08: back to JOBS=2 on Windows, paired with the
+          #     pagefile bump 16→24 GB above (the failed JOBS=2 runs were at
+          #     16 GB commit headroom; +8 GB targets exactly that failure
+          #     mode). Evidence JOBS=1 is far too conservative today: the
+          #     `Clippy check` and `Build Tauri app` steps in this same job
+          #     compile the SAME full dep graph at cargo's DEFAULT
+          #     parallelism (4 jobs) and have not OOM'd — only this step was
+          #     pinned. JOBS=1 also starves rustc's internal codegen
+          #     parallelism via the jobserver: the post-dep phase
+          #     (workspace-crate codegen + test-binary links) measured
+          #     ~38 min of the 50-min step (run 28948290993: last dep
+          #     compile 14:31, `Finished` 15:09). If 0xc000001d /
+          #     rustc-LLVM OOM recurs here, revert to JOBS=1 AND keep the
+          #     32 GB pagefile.
+          #     (Corrected 2026-09-19: this ladder said "24 GB" — the size the
+          #     pagefile step carried when the JOBS=2 restoration was written.
+          #     `Configure pagefile` above now sets 32GB/32GB, so the ladder
+          #     named a configuration nobody has measured. The OOM EVIDENCE
+          #     above is still correctly dated to a 16 GB pagefile; it is only
+          #     the trailing "keep" size that had gone stale.)
+          #   - Ubuntu OOM-killer is harsher: even with a 12 GB swapfile,
+          #     JOBS=2 still trips the runner-agent shutdown. Drop Ubuntu
+          #     to JOBS=1 for a single-threaded compile.
+          #   - macOS: GitHub-hosted M1/aarch64 runners ship with only
+          #     7 GB RAM (confirmed via `sysctl hw.memsize` in the
+          #     pre-test diagnostic) — NOT 16 GB like ubuntu/windows.
+          #     The older "fatter runner" comment was wrong. With
+          #     JOBS=4 the peak from two parallel large-crate rustc
+          #     invocations (qontinui_runner_lib + wrappers_mcp)
+          #     exceeds RAM and macOS swap-thrashes indefinitely (no
+          #     OOM-killer like Linux). PR #84's macOS leg hung 80+
+          #     min mid-compile before admin-cancel. PR #86 first
+          #     tried JOBS=2 — also still swap-pressured, hit the 45-
+          #     min timeout. JOBS=1 matches ubuntu/windows: one rustc
+          #     at a time, ~no swap pressure, slower wall-clock but
+          #     deterministic.
+          #   - 2026-10-27: the ladder's "revert" arm fired. JOBS=2 at the
+          #     32 GB pagefile OOM'd with the same `rustc-LLVM ERROR: out of
+          #     memory` compiling the qontinui_runner (bin) test binary on
+          #     BOTH attempts of main push run 40449994591 (sha 79aaafb7),
+          #     and on Windows legs of merge candidates through the morning
+          #     (PR runner#2242 at 2deb22a2a OOM'd on both attempts on
+          #     2026-10-28). Even green runs sat at the ceiling: the pagefile
+          #     sampler read peak_mb=32767 of 32768 on main 4a7431d29 and
+          #     32648 on runner#2311 at 181f30b0a. Per the ladder: JOBS=1,
+          #     keep the 32 GB pagefile, stop climbing. Budget check: JOBS=1
+          #     was ~1.3x JOBS=2 (37m47s vs the 50-min baseline above), so a
+          #     ~49-min JOBS=2 build lands near 64 min against the 90-min step
+          #     bound. Read the first JOBS=1 Windows build times against that.
+          #     Both arms are now '1', but the expression stays per-platform
+          #     on purpose. The legs are throttled for different reasons, and
+          #     ci_rust_test_steps_split.rs pins that each stays separately
+          #     tunable.
+          #   - 2026-11-03: a SELF-HOSTED ubuntu leg (the `route` job) is not
+          #     the 16 GB hosted VM this ladder was measured on. It takes the
+          #     memory-derived cap the "Self-hosted: system packages, compile
+          #     caps and the persistent target" step exported (cgroup budget /
+          #     5 GiB, clamped to nproc; that step says why 5); '1' remains its
+          #     fallback when that step exported nothing. The hosted arms are
+          #     unchanged.
+          CARGO_BUILD_JOBS: ${{ matrix.platform == 'windows-latest' && '1' || (runner.environment == 'self-hosted' && env.CARGO_BUILD_JOBS || '1') }}
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            echo "=== free / df before cargo test ==="
+            free -h
+            df -h
+          elif [ "$RUNNER_OS" = "Windows" ]; then
+            echo "=== Windows memory state before cargo test ==="
+            powershell -NoProfile -Command "Get-CimInstance Win32_PageFileUsage | Format-List *; Get-CimInstance Win32_OperatingSystem | Select-Object FreePhysicalMemory,TotalVisibleMemorySize,TotalVirtualMemorySize,FreeVirtualMemory | Format-List"
+          elif [ "$RUNNER_OS" = "macOS" ]; then
+            echo "=== macOS memory state before cargo test ==="
+            sysctl -n hw.memsize | awk '{print "physical RAM:", $1/1024/1024/1024, "GB"}'
+            vm_stat
+            df -h
+          fi
+          cd src-tauri
+          # `set -o pipefail` — DEFENCE IN DEPTH, not the load-bearing mechanism
+          # this line used to claim. GitHub already runs a `shell: bash` step as
+          # `bash --noprofile --norc -eo pipefail {0}`, so pipefail is on before
+          # this line executes. What it guards is the shell being respelled
+          # (`shell: sh`, an explicit `bash {0}`, a `bash -c` wrapper), after
+          # which `cargo test | tee` would report TEE's exit code — always 0 —
+          # and silently turn every red green. Kept on BOTH halves of the split
+          # for that reason, and pinned by the shape test.
+          #
+          # This log is the BUILD log and is deliberately NOT
+          # `cargo-test-output.log`. `hasCargoTestOutput`
+          # (scripts/ci-flake-analyze.mjs, consumed by `parseTestOutcomes`,
+          # consumed by scripts/ci-test-results-ingest.mjs) recognises a log
+          # ONLY by run-phase lines — `test result:`, `running N tests`,
+          # `test … ... ok|FAILED|ignored`. A `--no-run` log carries none of
+          # them, so it parses as `unparsed` and the ingest correctly sends
+          # nothing. Keeping the two logs distinct is what makes the split
+          # transparent to the ingest; the expiry summariser below reads both.
+          set -o pipefail
+          # The runner's `terminal::daemon_pane_io` end-to-end tests (plan
+          # 2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions,
+          # Phase 2; `cfg(target_os = "linux")`) drive the REAL holder binary,
+          # which is a bin of ANOTHER workspace package — `cargo test` from
+          # src-tauri never builds it, and those tests fail (never skip) when
+          # it is missing. Built here, in the compile half, so the run half
+          # still invokes no cargo. Linux only: the tests are Linux only.
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            cargo build -p qontinui-pty-holder
+          fi
+          cargo test --no-run --verbose 2>&1 | tee "$GITHUB_WORKSPACE/cargo-test-build.log"
+        shell: bash
+
+      # Plan 2026-10-27-coord-routes-ci-jobs-by-runner-capability, Phase 1:
+      # the cgroup `oom_kill` count BEFORE `Run Rust tests`, read by
+      # `Annotate an out-of-memory Rust test step`. `memory.events` is
+      # cumulative over the cgroup's lifetime (the runner service's, not this
+      # step's), so only a RISE over this baseline says a kill happened during
+      # the step. Linux only (no cgroup elsewhere); best-effort — an unreadable
+      # count writes an empty output, which the matcher reads as NO evidence.
+      - name: Record the cgroup oom_kill count before the run half
+        id: oom_kill_before_run
+        if: runner.os == 'Linux'
+        continue-on-error: true
+        shell: bash
+        run: |
+          cgroup="$(sed -n 's/^0:://p' /proc/self/cgroup 2>/dev/null || true)"
+          count="$(awk '$1 == "oom_kill" { print $2; exit }' "/sys/fs/cgroup${cgroup}/memory.events" 2>/dev/null || true)"
+          echo "oom_kill count before Run Rust tests: ${count:-<unreadable>}"
+          echo "count=$count" >>"$GITHUB_OUTPUT" || true
+
+      # ── RUN half ────────────────────────────────────────────
+      #
+      # ⚠️ THIS STEP DELIBERATELY DOES NOT INVOKE CARGO, and that is the whole
+      # correction. The first cut ran `cargo test` here and BOTH legs expired at
+      # 20 minutes on run 35477464051 — not running tests, but RECOMPILING.
+      # cargo's own words, from the run step's log:
+      #
+      #   Dirty qontinui-runner v1.0.11: the file
+      #   `target/debug/build/qontinui-runner-<hash>/out/tauri-codegen-assets/<sha>.html`
+      #   has changed (1789863156.702777538s, 4s AFTER last build at 1789863152.136709306s)
+      #
+      # `tauri::generate_context!()` writes its codegen assets into `OUT_DIR`
+      # DURING the compilation of the lib, and they land ~4 s after the
+      # fingerprint cargo recorded for that same compilation — so the package is
+      # an input to itself and every SUBSEQUENT cargo invocation sees it Dirty.
+      #
+      # ⚠️ THAT IS THE UBUNTU CAUSE. Windows fails the same way for a DIFFERENT
+      # file, and a fix aimed only at tauri-codegen would leave it Dirty. Job
+      # 105989072131 names a tauri `externalBin` SIDECAR instead:
+      #   Dirty qontinui-runner: the file
+      #   `src-tauri\binaries\qontinui_profile-x86_64-pc-windows-msvc.exe`
+      #   has changed (…, 24036100ns after last build at …)
+      # (`tauri.conf.json` `bundle.externalBin`, which this repo's build.rs
+      # used to self-provision as placeholder stubs). Same defect CLASS — the
+      # package is an input to itself — two different files. The conclusion
+      # is identical on both legs and is what this step acts on: never invoke
+      # cargo twice.
+      # A single `cargo test` never notices, because it only checks freshness
+      # once. Splitting into two invocations makes cargo check twice, and the
+      # second check always fails. Measured on the ubuntu leg: `Compiling
+      # qontinui-runner` at 00:39:30, the main-crate rustc still running when
+      # the step was killed 20 minutes later (`Terminate orphan process: pid
+      # (10329) (rustc)`), after 40 rustc invocations across 27 distinct crates
+      # and not one `running N tests` line.
+      #
+      # OWNERSHIP, scoped per leg, because the obvious one-line summary is
+      # wrong. THE UBUNTU DIRTY WE MEASURED is not our build script's —
+      # `src-tauri/build.rs` emits no `rerun-if-changed` into `OUT_DIR`, and the
+      # path cargo named there is an `OUT_DIR` codegen asset, so that observed
+      # failure is `tauri-build`/`tauri-codegen` (2.6.2) and is upstream. Scoped
+      # to the observation rather than to the leg, because the ours-half
+      # mechanism below existed on ubuntu too. **The WINDOWS half WAS ours, and
+      # is closed.** Its sidecar stub was written by our own
+      # `ensure_sidecar_placeholders()`, touch-if-absent into
+      # `src-tauri/binaries/` under its gitignored `qontinui_profile-*` glob,
+      # so on a fresh CI checkout invocation 1's build script created it
+      # inside the fingerprint window and invocation 2 saw it changed
+      # (one-shot, which is why a single `cargo test` never surfaced it). Plan
+      # `2026-09-27-qontinui-pr-zero-byte-sidecar-placeholder-published-as-session-cli`
+      # replaced that function with `hide_external_bin_from_tauri_build()`,
+      # which merges `bundle.externalBin: null` into tauri-build's
+      # `TAURI_CONFIG` and writes nothing into `binaries/`, so tauri-build no
+      # longer validates, copies or fingerprints the sidecars at all. The
+      # upstream half (the tauri-codegen `OUT_DIR` asset, observed on ubuntu
+      # but written on every target) is still open, which is why the run half
+      # below still never invokes cargo.
+      # (The build/run split itself exists for the separate bounds described
+      # above, not for this.)
+      #
+      # So the run half executes the binaries the build half ALREADY produced.
+      # cargo prints one `Executable \`<path>\`` line per test target under
+      # `--no-run`; this step recovers those paths from the build log and runs
+      # them. No cargo, no freshness check, no rebuild — ever. That is also what
+      # finally makes the bound below mean what it says.
+      #
+      # THE BOUND IS UNCHANGED AT 20 AND IT WAS NEVER THE DEFECT. It is sized
+      # against run 35043646051 **attempt 2** — the green re-run, which carried
+      # all 29 `test result:` lines totalling 11,368 passed + 118 ignored =
+      # 11,486 tests — whose run phase is 5m26s (21:51:04.68 → 21:56:30.56).
+      # Attempt 1 is the truncated one (7 `test result:` lines, 7112 ingested
+      # rows), and no figure here comes from it. 20 minutes is 3.7x a COMPLETE
+      # suite's execution, and now that nothing compiles here it is 3.7x of
+      # exactly what it bounds.
+      #
+      # What the bound still covers: per-test heartbeat stalls (the swap-thrash
+      # class from PR #84) and the macOS keychain hang, which
+      # QONTINUI_DISABLE_KEYCHAIN neutralises and which is a RUNTIME hang — so
+      # that env entry belongs here, where tests execute. `CARGO_BUILD_JOBS` no
+      # longer does: this step compiles nothing, so carrying a compile throttle
+      # would be cargo-cult.
+      #
+      # ⚠️ DOCTESTS ARE NOT RUN BY THIS STEP, and the cost is measured, not
+      # assumed. `cargo test --no-run` does not build them, so they have no
+      # `Executable` line to recover. On the last complete run the entire
+      # doctest target was: `Doc-tests qontinui_runner_lib` → `running 1 test` →
+      # `... ignored`. ONE doctest, and it does not execute — so today this
+      # loses exactly zero EXECUTED tests. Two consequences it does have, stated
+      # because "zero" is easy to over-read: coord stops receiving that one
+      # `skip` row (`qontinui_runner_lib::…QueryBuilder (line 141)`), and this
+      # step's log carries exactly ONE FEWER `test result:` line than an unsplit
+      # `cargo test` would produce. Stated as a delta on purpose: the absolute
+      # drifts with the target count — attempt 2 of 35043646051 built 28 test
+      # binaries, this branch builds 29 — and an absolute written here went
+      # stale inside a single PR. It will not stay true by itself:
+      # recovering doctests needs a second cargo invocation, which is precisely
+      # what pays the rebuild above. The day it stops being true is caught by
+      # `src-tauri/tests/lib_doctests_are_not_silently_skipped.rs`, which fails
+      # on any lib doctest this split would silently skip.
+      - name: Run Rust tests
+        id: run_rust_tests
+        timeout-minutes: 20
+        # ⚠️ `shell: bash` is NOT optional and is not inherited. This job's
+        # matrix includes windows-latest, where GitHub's default shell is
+        # PowerShell, and this workflow declares no `defaults:` block — so a
+        # missing `shell:` here dot-sources a bash script into pwsh and dies at
+        # parse. An earlier cut of this step dropped the line while rewriting
+        # the body, and a review caught it before it ever ran.
+        #
+        # It also carries the errexit/pipefail contract: GitHub spells
+        # `shell: bash` as `bash --noprofile --norc -eo pipefail {0}`. The
+        # explicit `set -o pipefail` below is still worth keeping (it survives
+        # the shell being respelled), but do not read it as the only mechanism.
+        shell: bash
+        env:
+          QONTINUI_DISABLE_KEYCHAIN: "1"
+        run: |
+          # KEEP THIS `cd`. It looks dead — every recovered path below is
+          # absolute — but it is now the ONLY thing reproducing cargo's own
+          # contract that a test binary runs with its cwd set to the package
+          # manifest directory. Delete it and any test reading a fixture by
+          # relative path fails in a way that reads as a test bug rather than a
+          # workflow one. Pinned by src-tauri/tests/ci_rust_test_steps_split.rs.
+          cd src-tauri
+          # `set -o pipefail` — see the build step. It carries the runner's exit
+          # status out of the `| tee` below, so a failing binary reds this step.
+          set -o pipefail
+
+          # Recover the test binaries the build step already produced. Strip
+          # ANSI first: CARGO_TERM_COLOR is `always`, so the tee'd log carries
+          # escapes and a naive match finds nothing — which would look exactly
+          # like "no binaries" and pass vacuously.
+          BUILD_LOG="$GITHUB_WORKSPACE/cargo-test-build.log"
+          ESC=$(printf '\033')
+          BINS=()
+          while IFS= read -r line; do BINS+=("$line"); done < <(
+            sed -e "s/${ESC}\[[0-9;]*m//g" "$BUILD_LOG" \
+              | sed -n 's/^[[:space:]]*Executable `\(.*\)`[[:space:]]*$/\1/p'
+          )
+
+          # A vacuous pass here would be the exact defect this whole change is
+          # about, so refuse rather than report green over zero binaries.
+          if [ "${#BINS[@]}" -eq 0 ]; then
+            echo "::error title=No test binaries::found no \`Executable\` lines in $BUILD_LOG. Either the build step produced no test targets, or cargo's output format changed. Refusing to report a pass over zero binaries."
+            exit 1
+          fi
+          echo "recovered ${#BINS[@]} test binaries from the build step"
+
+          # Emit cargo's own `Running \`<path>\`` announcement before each
+          # binary. That line is not cosmetic: `binaryIdFromAnnouncementLine`
+          # (scripts/ci-flake-analyze.mjs) uses it to attribute each `test … ok`
+          # to its binary, so the coord ingest's rows keep their binary
+          # attribution exactly as they had it under `cargo test`.
+          #
+          # Fail-fast on the first failing binary, matching `cargo test`'s own
+          # default (it stops at the first failing target unless
+          # `--no-fail-fast`). Keeping that identical means this step's red/green
+          # meaning is unchanged by the switch.
+          #
+          # ⚠️ The backslash normalisation is load-bearing on windows-latest.
+          # cargo prints Windows paths with backslashes and NO forward slash
+          # anywhere in the word:
+          #   Executable `D:\a\qontinui-runner\...\deps\foo-50d7fbf0.exe`
+          # bash decides direct-exec vs `$PATH` lookup on whether the command
+          # word contains a `/` (`absolute_program()`), so such a word is
+          # PATH-SEARCHED and dies `command not found` (127) instead of running.
+          # `D:/a/...` execs correctly under MSYS. The ANNOUNCEMENT keeps the
+          # path exactly as cargo printed it — that line is byte-identical to
+          # cargo's own, and `binaryIdFromAnnouncementLine` splits on `[\\/]`
+          # so it reads either spelling.
+          run_all() {
+            local b exe
+            for b in "${BINS[@]}"; do
+              printf '     Running `%s`\n' "$b"
+              exe="${b//\\//}"
+              "$exe" || return $?
+            done
+          }
+          run_all 2>&1 | tee "$GITHUB_WORKSPACE/cargo-test-output.log"
+
+      # Phase 2 of the same plan: make an expiry name its own phase.
+      #
+      # `The action 'Run Rust tests' has timed out after 90 minutes` was
+      # compatible with a slow build, a hung test and a wedged runner — three
+      # conditions wanting three different responses — and #1545 had every fact
+      # needed to tell them apart sitting in its log while no reader produced
+      # them; a steward reconstructed them by hand. The split above answers
+      # "which phase" structurally (WHICH step's clock expired); this step says
+      # it in the job summary, names the crate that was in flight, and says
+      # UNKNOWN when it cannot tell.
+      #
+      # Modelled on this repo's shipped in-band marker contract
+      # (.github/workflows/frontend-coverage-producer.yml +
+      # scripts/tests/test_ci_timeout_marker.py), but deliberately NOT a carrier
+      # of it and deliberately not named like one: that contract explains a
+      # JOB-level expiry, which GitHub concludes `cancelled` and which is
+      # indistinguishable from a `cancel-in-progress` supersede. This is a
+      # STEP-level expiry, which concludes `failure` and prints a literal
+      # `##[error]The action '<name>' has timed out after N minutes`. Different
+      # mechanism, same shape — so the roster in that Python file is
+      # deliberately left alone. Folding the two together would make one roster
+      # row assert two things and leave its lockstep check meaningless.
+      #
+      # `continue-on-error` with NO step-level `timeout-minutes`: the reverted
+      # nextest shadow (scripts/ci-test-results-ingest.mjs header) paired the
+      # two and its step recorded `cancelled` with every later step `skipped`
+      # (run 33545829387, 2026-09-01) -- but a controlled re-measurement, Phase
+      # 0 of plan 2026-08-31-published-build-parity-check's 2026-09-20
+      # follow-up, tripped the same pairing (run 35730892188, 2026-09-22) and
+      # the job did NOT cancel: the timed-out step failed at its bound, the
+      # next step ran immediately, a post-step ran, the job concluded
+      # `success`. The two observations disagree and the earlier run's logs
+      # have since aged out of retention, so this is UNRECONCILED, not
+      # corrected -- see the ingest script header for both citations. This
+      # step avoids the question rather than resolving it: no step-level
+      # `timeout-minutes` here, of either kind.
+      - name: Explain which Rust test phase the bound expired in
+        if: failure()
+        continue-on-error: true
+        shell: bash
+        run: |
+          node scripts/ci-expiry-phase-summary.mjs \
+            --build-log "$GITHUB_WORKSPACE/cargo-test-build.log" \
+            --run-log "$GITHUB_WORKSPACE/cargo-test-output.log" \
+            --build-outcome "${{ steps.build_rust_tests.outcome }}" \
+            --run-outcome "${{ steps.run_rust_tests.outcome }}"
+
+      # Phase 3 step 1 of the same plan: MEASURE the quantity
+      # `CARGO_BUILD_JOBS` is tuned against, before retuning it.
+      #
+      # The pre-`cargo test` diagnostic in the build step samples memory BEFORE
+      # the compile that would exhaust it, so the peak the throttle exists to
+      # avoid has never been measured anywhere. `if: always()` so an EXPIRED
+      # step still reports — the expired runs are the ones whose peak matters
+      # most, and a sampler that only ran on success would measure exactly the
+      # population that did not need measuring.
+      #
+      # Deliberately measurement-only. The retune (windows CARGO_BUILD_JOBS
+      # from 1 toward cargo's default; it was reverted from 2 to 1 on
+      # 2026-10-27 after OOMs at the 32 GB pagefile) is Phase 3 step 2 and waits on a soak
+      # window of these readings; tuning first against an unmeasured quantity
+      # is how the current value went stale.
+      #
+      # The reading goes to the job LOG as well as the summary (Phase 3 step
+      # 1b). A job summary is exposed by NO API — `gh api .../check-runs/<id>`
+      # returns `output.summary: ""`, the job log carries only the command
+      # text, and the web `summary_raw` URL 404s — so ~1,050 summary-only runs
+      # (2026-09-24..10-07) produced no peak anyone could collect, and the soak
+      # this step exists for could never complete. `tee -a` keeps the summary
+      # and puts every line in the log too; each pagefile also gets one
+      # greppable line,
+      #   MEMPEAK name=<path> alloc_mb=<n> peak_mb=<n> current_mb=<n> free_phys_kb=<n> build=<outcome> run=<outcome>
+      # so the soak is `gh api .../actions/jobs/<id>/logs | grep MEMPEAK`.
+      # A missing reading prints `MEMPEAK unknown=1 ...`, never a zero.
+      # `matrix.platform == 'windows-latest'` rather than `runner.os` — every
+      # other Windows gate in this file spells it that way (see `Configure
+      # pagefile`), and one idiom is one grep.
+      #
+      # Generalised (plan 2026-10-27-coord-routes-ci-jobs-by-runner-capability,
+      # Phase 2) by `Report this job's resources` below, which carries the same
+      # pagefile peak — plus RAM, commit limit and commit peak — on BOTH legs
+      # as one machine-readable annotation coord reads. This step and its
+      # `MEMPEAK` lines are kept only because the CARGO_BUILD_JOBS soak of plan
+      # 2026-09-17 Phase 3 step 2 (still open) greps them out of job logs;
+      # delete this step once that soak reads the report instead.
+      - name: Windows memory peak after the Rust test steps
+        if: always() && matrix.platform == 'windows-latest'
+        continue-on-error: true
+        shell: bash
+        run: |
+          # An outcome that did not resolve is UNKNOWN, never an empty field.
+          BUILD_OUTCOME="${{ steps.build_rust_tests.outcome }}"
+          RUN_OUTCOME="${{ steps.run_rust_tests.outcome }}"
+          BUILD_OUTCOME="${BUILD_OUTCOME:-unknown}"
+          RUN_OUTCOME="${RUN_OUTCOME:-unknown}"
+          {
+            echo "### Windows memory after the Rust test steps"
+            echo
+            echo '```'
+            # `|| echo` is not decoration: `shell: bash` runs with `-e`, so a
+            # non-zero powershell would abort this group BEFORE the closing
+            # fence and bleed an open code block into the rest of the job
+            # summary — silently, because the step is `continue-on-error`.
+            powershell -NoProfile -Command "Get-CimInstance Win32_PageFileUsage | Select-Object Name,AllocatedBaseSize,CurrentUsage,PeakUsage | Format-List; Get-CimInstance Win32_OperatingSystem | Select-Object FreePhysicalMemory,TotalVisibleMemorySize,TotalVirtualMemorySize,FreeVirtualMemory | Format-List" || echo "(sampler failed: powershell exited non-zero — this is UNKNOWN, not a zero peak)"
+            echo '```'
+            echo
+            echo "build step outcome: ${BUILD_OUTCOME} - run step outcome: ${RUN_OUTCOME}"
+            echo "PeakUsage is the pagefile high-water mark for this boot, so it covers the compile that just ran. Compare it against AllocatedBaseSize (the 32 GB the pagefile step configures) before changing CARGO_BUILD_JOBS."
+            echo
+            echo '```'
+            # One machine-greppable line per pagefile. `tr -d '\r'` because
+            # powershell emits CRLF; an empty capture (no pagefile rows, or
+            # powershell failed) is reported as UNKNOWN, never as a zero peak.
+            mem="$(powershell -NoProfile -Command '$os = Get-CimInstance Win32_OperatingSystem; Get-CimInstance Win32_PageFileUsage | ForEach-Object { $free = if ($os) { $os.FreePhysicalMemory } else { "unknown" }; "MEMPEAK name={0} alloc_mb={1} peak_mb={2} current_mb={3} free_phys_kb={4}" -f $_.Name,$_.AllocatedBaseSize,$_.PeakUsage,$_.CurrentUsage,$free }' | tr -d '\r')" || mem=""
+            if [ -n "$mem" ]; then
+              printf '%s\n' "$mem" | sed "s/\$/ build=${BUILD_OUTCOME} run=${RUN_OUTCOME}/"
+            else
+              echo "MEMPEAK unknown=1 reason=no-pagefile-reading build=${BUILD_OUTCOME} run=${RUN_OUTCOME}"
+            fi
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # Plan 2026-10-27-coord-routes-ci-jobs-by-runner-capability, Phase 1 (D4):
+      # say so when a Rust test step ran OUT OF MEMORY, so coord treats the red
+      # as CAPACITY rather than CODE. Job 122032841168 died in `Build Rust tests`
+      # with `rustc-LLVM ERROR: out of memory`; with no annotation coord read it
+      # as a compile error and sent a code fixer at a diff with nothing to fix.
+      #
+      # The matching lives in scripts/ci/oom-signature.sh (fixtures:
+      # scripts/tests/test_oom_signature.sh), which reads the two logs the Rust
+      # steps already `tee` and emits ONE `::error title=<step> OUT OF MEMORY
+      # (not a verdict on this PR)::<signature>` only on POSITIVE evidence. A
+      # `Build Rust tests` OOM — no test ran — also carries ` - killed IN THE
+      # BUILD`, which coord write-skips on main as `build_killed`; a run-phase
+      # OOM stays red and gets coord's one bounded same-commit re-run
+      # (`CiDeclaredInconclusive`). No match, or an unreadable log, prints
+      # nothing and the red stays an ordinary red.
+      #
+      # On Linux the cgroup `memory.events` is passed with the `oom_kill` count
+      # recorded before the failed half, so a kill (cargo's `SIGKILL`, or bash's
+      # `Killed` for a test binary the run half execs) counts only when that
+      # count ROSE during the step (job 111779867816's rustc was SIGKILLed by a
+      # runner shutdown, not an OOM; and the count is cumulative). Elsewhere the
+      # baseline is empty and a kill is no evidence. The MEMPEAK reading above
+      # is deliberately NOT a signature: Phase 0 measured hosted Windows
+      # pagefiles at 32767/32768 MB on jobs that failed in tests and 32551 on a
+      # green one, so saturation there is normal. `continue-on-error` and no
+      # `timeout-minutes`, like the two diagnostics above: it may never become
+      # a second way to fail the job.
+      - name: Annotate an out-of-memory Rust test step
+        if: failure() && (steps.build_rust_tests.outcome == 'failure' || steps.run_rust_tests.outcome == 'failure')
+        continue-on-error: true
+        shell: bash
+        run: |
+          memory_events=""
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            cgroup="$(sed -n 's/^0:://p' /proc/self/cgroup 2>/dev/null || true)"
+            memory_events="/sys/fs/cgroup${cgroup}/memory.events"
+          fi
+          if [ "${{ steps.build_rust_tests.outcome }}" = "failure" ]; then
+            bash scripts/ci/oom-signature.sh --step "Build Rust tests" --build-phase \
+              --log "$GITHUB_WORKSPACE/cargo-test-build.log" \
+              --memory-events "$memory_events" \
+              --oom-kill-baseline "${{ steps.oom_kill_before_build.outputs.count }}"
+          else
+            bash scripts/ci/oom-signature.sh --step "Run Rust tests" \
+              --log "$GITHUB_WORKSPACE/cargo-test-output.log" \
+              --memory-events "$memory_events" \
+              --oom-kill-baseline "${{ steps.oom_kill_before_run.outputs.count }}"
+          fi
+
+      # Best-effort, non-gating: pushes this job's per-test outcomes into
+      # coord.test_results so coord's already-shipped `flakiness_priors` has a
+      # history to score for this repo (it has never had one — Phase 0 of the
+      # plan above measured that gap over 655 CI runs). Parses the log the
+      # GATING step above just produced; runs NO extra `cargo test`, so this
+      # cannot repeat the ~74 job-min/PR cost that got the original nextest-based
+      # Phase 1 reverted (commit 7ff875ec4).
+      #
+      # if: always() — a failed suite is exactly the signal coord needs, and
+      # the log is written whether or not the gate passed.
+      # continue-on-error: true as defence in depth on top of the script's own
+      # internal exit-0-always contract (see the script's header for why this
+      # step intentionally carries NO `timeout-minutes`: pairing one with
+      # continue-on-error cancels the whole JOB on trip, not just the step —
+      # the mechanism that broke the reverted nextest shadow).
+      #
+      # `shard` = the matrix platform, closing the platform-attribution gap
+      # Phase 0 found (10 of its 12 same-SHA disagreements were windows-only,
+      # and coord's own `test_id` derivation elsewhere carries no platform
+      # component).
+      #
+      # `--gating-outcome` is Phase 4a of plan
+      # 2026-09-17-the-windows-test-gate-is-a-90-minute-build-wearing-a-test-
+      # shaped-bound. On run 35043646051 attempt 1 this step ran to completion
+      # AFTER the gating step's 90-minute expiry and recorded 7112 rows against
+      # a job GitHub calls `failure`.
+      #
+      # ⚠️ READ WHAT THOSE 7112 ROWS ACTUALLY ARE — this comment said "a fully
+      # passing suite" until a review counted them, and the count refutes it.
+      # The full suite is 11,486 tests across 29 binaries — 11,368 passed plus
+      # 118 ignored, as its own `test result:` lines count it, and the
+      # `ignored` half belongs in the denominator because the ingest emits a
+      # `skip` row for each. 7112 is **61.9%** of it. (That denominator is the
+      # `test result:` arithmetic, not literally the emitted row count: the
+      # parser de-duplicates ids across binaries, so a review measured the
+      # emitted sets at 11,485 and 7111 against the ingest's own `11486/11486`
+      # and `7112/7112` lines. ±1 changes none of the figures below.) Only 1409
+      # of those rows came from binaries that had reported a `test result:`;
+      # the other 5703 came from the 9905-test binary that was still running
+      # when the clock killed it. So coord did not receive a green suite — it
+      # received a **silently truncated** one, missing 4374 tests, in a shape
+      # byte-indistinguishable from a complete ingest.
+      #
+      # (Those two figures were 1403/5709 for one revision of this comment.
+      # 1403 is the PASSED sum of the reported binaries and drops the 6
+      # `ignored` tests, which do produce rows; the pair summed to 7112 only
+      # because the two errors cancelled. Recorded because a wrong measurement
+      # inside a correction is the thing this block exists to stop.)
+      #
+      # `--gating-outcome` is honest about what it does and does not fix. It
+      # makes the DISAGREEMENT loud (`::error` + job summary) when the gating
+      # step did not succeed. It does NOT detect truncation — nothing here
+      # knows how many tests the suite has — and the durable stamp is a
+      # three-repo change tracked as that plan's Phase 4b, recorded as
+      # follow-up edge `953d8210-b326-4628-884d-3040412538b8`. TRUNCATION
+      # ITSELF IS A SEPARATE, UNCLOSED GAP, recorded as follow-up edge
+      # `eff25606-d3e0-4307-9e9c-3ddbceb2b0aa`; do not read this flag as
+      # covering it.
+      #
+      # Both are EDGE ids on plan artifact `ae8b3f39-1bc6-47ab-adbf-2fe607462b3c`,
+      # NOT artifact ids — read them back at
+      # `GET /api/v1/plan-library/followups` (they key on `edge_id`; the feed
+      # carries no `to_id` column at all, which is consistent with it listing
+      # only OPEN follow-ups — an owned one has left it). A review of
+      # this change probed `GET /api/v1/plan-library/<edge id>` — the ARTIFACT
+      # route — got a 404 and reported the ids as unresolvable, so the door is
+      # named here to stop the next reader repeating it.
+      #
+      # ⚠️ THAT FEED IS PAGINATED AND UNFILTERED, so the bare URL above is not
+      # enough and a second review caught the same class of miss one level
+      # down. Measured 2026-09-19: `limit 50`, `total 134`,
+      # `ordering: oldest_first`, and these two rows sit at index 130-131 — so
+      # page 1 is a well-formed 200 carrying neither. The route REFUSES an
+      # unknown parameter rather than ignoring it — `?from_id=…`,
+      # `?artifact_id=…` and `?slug=…` each answer **HTTP 422
+      # `unknown_query_parameter`** naming the rejected key and
+      # `accepted: ["limit","offset"]` — so a guessed filter fails loudly
+      # instead of looking like an empty result, and `limit`/`offset` are the
+      # only knobs. (This comment first described that as a silent zero-item
+      # page; a review re-probed it and the door answers 422, with a message
+      # that reads as though the refusal landed for exactly this reason.
+      # Corrected rather than quietly dropped.) Page it and match client-side:
+      #   GET /api/v1/plan-library/followups?offset=100
+      # then select on `from_id == ae8b3f39-…`. Read `total` and keep paging;
+      # the index will drift as other plans record follow-ups.
+      #
+      # The flag does NOT change the payload — verified at source, coord's
+      # `ResultIngestRequest` has no field that could carry a gating outcome and
+      # no `deny_unknown_fields`, so an added key would be silently dropped.
+      #
+      # The split above narrows what is left for it to catch: a BUILD expiry now
+      # produces no run-phase lines at all, so `parseTestOutcomes` returns
+      # `unparsed` and this step correctly sends nothing. What survives is
+      # exactly #1545's tail — the RUN step expiring mid-suite.
+      - name: Report test results to coord (best-effort)
+        if: always()
+        continue-on-error: true
+        shell: bash
+        env:
+          COORD_INGEST_TOKEN: ${{ secrets.COORD_INGEST_TOKEN }}
+          # `Poison ambient state` sets COORD_HTTP_URL=http://poison.invalid via
+          # $GITHUB_ENV, and `Unpoison ambient state` — which blanks it — runs
+          # AFTER this step. So without this override the ingest POSTs to the
+          # poison host and records nothing: measured 2026-09-09 on job
+          # 102391645194, `0/10603 row(s) recorded across 11 chunk(s)`, every
+          # chunk FAILED, while the step still reported green because it is
+          # `continue-on-error`.
+          #
+          # Reordering does NOT fix it: `Unpoison` carries no `if: always()`, so
+          # a red suite skips it entirely — and a red suite is exactly the case
+          # this ingest exists to record. A step-level `env:` beats $GITHUB_ENV
+          # for this step only, so it is correct on both the green and red paths
+          # and independent of where the unpoison sits.
+          #
+          # Empty, not a literal host: the script reads
+          # `process.env.COORD_HTTP_URL || DEFAULT_COORD_URL` (in `main()` of
+          # scripts/ci-test-results-ingest.mjs), so "" falls back to its
+          # documented default — the same "empty means unset" contract
+          # `Unpoison` itself relies on.
+          COORD_HTTP_URL: ""
+          # Whole-invocation budget for the POSTs (see the script's
+          # DEFAULT_BUDGET_MS for the measurement behind it). Spelled here at
+          # its default so the bound is visible where the step is, and so an
+          # operator changes it in ONE place. This step's wall time is the
+          # merge train's wait: coord's predicate waits for every check run on
+          # the head, so the job is held until this step ends.
+          COORD_INGEST_BUDGET_MS: "180000"
+        run: |
+          node scripts/ci-test-results-ingest.mjs \
+            --log "$GITHUB_WORKSPACE/cargo-test-output.log" \
+            --repo "${{ github.repository }}" \
+            --head-sha "${{ github.event.pull_request.head.sha || github.sha }}" \
+            --shard "${{ matrix.platform }}" \
+            --gating-outcome "${{ steps.run_rust_tests.outcome }}"
+
+      # Undo `Poison ambient state` so the poison covers the test step and
+      # nothing after it. `$GITHUB_ENV` cannot unset, only assign — but every
+      # one of the four readers treats an EMPTY value as unset
+      # (`resolve_coord_base_with_source` trims and skips; `server_mode` matches
+      # "1"/"true" only; `parse_tier_value` finds no tier in ""; the workspace
+      # root resolver trims and skips). The three files are removed by name, not
+      # `rm -rf ~/.qontinui`, so a home that was NOT clean (the poison step warns
+      # when it sees one) keeps whatever else it held.
+      - name: Unpoison ambient state
+        run: |
+          set -u
+          homes=("$HOME")
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            homes+=("$(cygpath -u "$USERPROFILE")")
+          fi
+          for h in "${homes[@]}"; do
+            for f in machine.json profiles.json coord-device-jwt; do
+              rm -f "$h/.qontinui/$f"
+            done
+            rmdir "$h/.qontinui" 2>/dev/null || true
+          done
+          {
+            echo "COORD_HTTP_URL="
+            echo "QONTINUI_ROOT="
+            echo "QONTINUI_SERVER_MODE="
+            echo "QONTINUI_RUNNER_TIER="
+          } >> "$GITHUB_ENV"
+          echo "poison removed; COORD_HTTP_URL / QONTINUI_ROOT / QONTINUI_SERVER_MODE / QONTINUI_RUNNER_TIER blanked"
+        shell: bash
+
+      - name: Live AI extractor smoke
+        # Single live API call per PR — Haiku 4.5, ~$0.001 each. Ubuntu-only so the
+        # 3-platform matrix doesn't 3x the cost for no extra signal. continue-on-error
+        # is true because Haiku output is non-deterministic; we want the signal
+        # without flake-blocking PRs.
+        #
+        # The secret presence check runs INSIDE the shell, not in `if:` — the
+        # `secrets` context is not available to step-level `if:` (only job-level
+        # `if:` and step `env:`/`run:`/`with:`). Setting an empty env var is
+        # safe; we early-exit before running anything.
+        #
+        # ⚠️ NO CARGO HERE, for the same reason as `Run Rust tests`: the package
+        # is an input to itself, so a second cargo invocation finds it Dirty and
+        # recompiles the main crate. On this leg that would be an unthrottled
+        # (no CARGO_BUILD_JOBS) recompile inside a step with no bound of its
+        # own. The step used to run `cargo test --bin qontinui-runner …`. The
+        # secret is unset today, so it exits above before any of this runs, and
+        # the rebuild would land on whoever sets it. It runs the bin's
+        # unit-test binary the build step already produced instead. That
+        # binary's `Executable` line in the build log names
+        # `deps/qontinui_runner-<16 hex>`. The lib is `qontinui_runner_lib-…`,
+        # which the pattern below does not match.
+        if: matrix.platform == 'ubuntu-22.04'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        shell: bash
+        run: |
+          if [ -z "$ANTHROPIC_API_KEY" ]; then
+            echo "ANTHROPIC_API_KEY secret not set — skipping live AI smoke test."
+            exit 0
+          fi
+          # KEEP THIS `cd` — cargo runs a test binary from the package manifest
+          # directory, and so must we (see `Run Rust tests`).
+          cd src-tauri
+          BUILD_LOG="$GITHUB_WORKSPACE/cargo-test-build.log"
+          BIN=""
+          if [ -f "$BUILD_LOG" ]; then
+            ESC=$(printf '\033')
+            BIN=$(sed -e "s/${ESC}\[[0-9;]*m//g" "$BUILD_LOG" \
+              | sed -n 's/^[[:space:]]*Executable `\(.*[/\\]qontinui_runner-[0-9a-f]\{16\}\(\.exe\)\{0,1\}\)`[[:space:]]*$/\1/p' \
+              | head -n 1)
+          fi
+          if [ -z "$BIN" ]; then
+            echo "::warning title=Live AI smoke not run::found no qontinui_runner bin test binary in $BUILD_LOG. This is UNKNOWN, not a pass."
+            exit 1
+          fi
+          # `--exact` on a renamed test matches nothing, and libtest exits 0 on
+          # `0 passed`. A smoke that ran nothing would read as green, so it has
+          # to show the one pass.
+          "${BIN//\\//}" --ignored --exact \
+            util::path_extraction::tests::test_extract_paths_via_ai_real_call \
+            2>&1 | tee "$RUNNER_TEMP/live-ai-smoke.log"
+          if ! grep -q 'test result: ok\. 1 passed' "$RUNNER_TEMP/live-ai-smoke.log"; then
+            echo "::warning title=Live AI smoke ran no test::the smoke binary did not report exactly one passing test. The test was probably renamed. This is UNKNOWN, not a pass."
+            exit 1
+          fi
+        continue-on-error: true
+
+      - name: Build Tauri app (development)
+        id: tauri_build
+        # @tauri-apps/cli 2.11 changes that affect this step:
+        #   1. Args after `--` are forwarded straight to `cargo build`, which
+        #      rejects `--debug` (cargo's default profile, not a flag). So
+        #      `--debug` must be parsed by tauri CLI directly — no `--`.
+        #   2. `createUpdaterArtifacts: true` in tauri.conf.json now forces
+        #      updater signing at bundle time even when `pubkey: ""`, failing
+        #      the build with "A public key has been found, but no private
+        #      key." CI doesn't ship artifacts, so skip bundling entirely with
+        #      `--no-bundle` — compilation + link is the sanity gate we want.
+        run: pnpm run tauri build --debug --no-bundle
+
+      # SDK↔runner behavior-contract gate. Boots the just-built debug exe
+      # supervisor-free (`-DirectExe`), walks every UI_BRIDGE_ROUTES entry from
+      # the sibling ui-bridge clone, and asserts the shape contracts the offline
+      # manifest tests can't see. Windows-only: the runner is Windows-primary
+      # and the WebView2 render `uiBridgeIpcObserved:true` needs is a Windows
+      # surface.
+      # Reuses `target/debug/qontinui-runner.exe` from the step above
+      # (built from src-tauri, so `.cargo/config.toml`'s /STACK:8388608 applies
+      # — no separate cargo build, no 0xc00000fd stack-overflow). `-Profile ci`
+      # skips the two model-loading routes (extract/describe) that need
+      # llama-swap, absent in CI. This step doubles as the Phase-0 WebView2
+      # probe: if it fails at WebView2 init, the fallback is a parallel hosted
+      # windows job (per the plan), not a blocker for the script mode.
+      #
+      # DB-LESS BOOT (QONTINUI_ALLOW_NO_DB=1): the runner used to HARD-PANIC at
+      # main.rs:419 when it couldn't reach PostgreSQL, so this job previously
+      # compiled pgvector from source and stood up a local PG cluster (~highest-
+      # variance step in the gate) just to let the runner boot for a route-shape
+      # smoke that needs no DB *rows*. The runner now supports a flag-gated
+      # degraded boot: with QONTINUI_ALLOW_NO_DB=1 it builds an unverified PG
+      # pool, skips connectivity + self-provision, and serves a clean 503 on the
+      # known DB-backed routes (crate::mcp::pg_guard) while the control/vision/
+      # contract surfaces stay fully functional. The contract smoke walks those
+      # surfaces, so no database is provisioned here at all. Prod is unaffected:
+      # without the flag the runner still fail-fasts on an unreachable PG.
+      # See plans/2026-06-07-runner-degraded-no-db-boot-and-dbless-ci.md.
+      # Guards the smoke's own REPORTING before we trust a word of it. The
+      # summary once printed "193 pass / 193 total, 8 skip" + "fail=" on a run
+      # with a genuinely failing probe (runner#1008, job 92967302466): PS 5.1's
+      # scalar `Count` adapter does not cover PSCustomObject, so a Where-Object
+      # matching exactly ONE row yielded $null. Only the exit code told the
+      # truth, and the summary is the half a human reads.
+      #
+      # `powershell -File`, NOT `pwsh`, and deliberately so: the bug is specific
+      # to Windows PowerShell 5.1, which is the interpreter the smoke step below
+      # actually runs under. On pwsh 7 these assertions would pass against code
+      # that still breaks the real gate.
+      #
+      # Ordered BEFORE the smoke: it takes ~1s and needs no runner, so a broken
+      # harness fails here instead of after a full exe boot + 198 route probes.
+      - name: Contract-smoke summary invariants (PS 5.1)
+        if: matrix.platform == 'windows-latest'
+        run: powershell -File scripts/tests/test-smoke-summary.ps1
+        shell: bash
+
+      # The CI-integrity guard decides whether a gating-workflow change is
+      # honest, so a bug in it either reinstates the operator bottleneck it
+      # replaced or -- much worse -- lets a gate be removed silently. It needs
+      # no runner and no network: the run-block is extracted from the live
+      # workflow and driven against a stubbed `gh`. ubuntu only (the guard runs
+      # on ubuntu-latest); ~2s.
+      - name: CI-integrity guard policy
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          bash scripts/tests/ci-integrity/run-scenarios.sh
+          python3 scripts/tests/ci-integrity/test-surface.py
+        shell: bash
+
+      - name: SDK↔runner contract smoke (direct-exe)
+        if: matrix.platform == 'windows-latest'
+        env:
+          QONTINUI_ALLOW_NO_DB: "1"
+        run: powershell -File scripts/contract-smoke.ps1 -DirectExe target/debug/qontinui-runner.exe -Profile ci -SdkTypesPath ../ui-bridge/packages/ui-bridge/src/server/types.ts
+        shell: bash
+
+      # Plan 2026-10-27-coord-routes-ci-jobs-by-runner-capability, Phase 2:
+      # ONE `::notice title=qontinui-resource-report::{json}` per job saying
+      # what this runner HAD (RAM, commit limit, pagefile/swap) and what the
+      # job USED (commit peak on Windows, the job cgroup's anonymous-memory
+      # peak and oom_kills on Linux, disk free after the heavy steps). Coord
+      # reads it back through the check-run annotations API (Phase 3) to
+      # learn each runner class's capability and this job's requirement from
+      # measurement. Quantities
+      # the leg cannot measure are OMITTED, never zeroed — see the header of
+      # scripts/ci/resource-report.sh (fixtures:
+      # scripts/tests/test_resource_report.sh).
+      #
+      # Both legs (no platform gate). `if: always()` for the same reason as
+      # the MEMPEAK step: the expired and OOM'd runs are the ones whose
+      # numbers matter. The oom_kill baseline and the anon sampler are the
+      # ones the pre-build step above records/starts (absent on Windows,
+      # which the script reads as "nothing measured"). `build_outcome` is the
+      # outcome of the job's heavy compile+test work, so BOTH Rust halves AND
+      # the Tauri debug build (a third full compile+link on both legs) are
+      # passed and the script combines them (any failure wins).
+      #
+      # It is the LAST step of the job, deliberately: the anon sampler keeps
+      # running until this step stops it, so the peak covers every heavy step
+      # (the Tauri build included), and disk free is read when target/ is at
+      # its largest. Keep any new heavy step ABOVE it.
+      # `continue-on-error` and no `timeout-minutes`: a report must never
+      # become a way to fail the job.
+      - name: Report this job's resources
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          bash scripts/ci/resource-report.sh \
+            --build-outcome "${{ steps.build_rust_tests.outcome }}" \
+            --build-outcome "${{ steps.run_rust_tests.outcome }}" \
+            --build-outcome "${{ steps.tauri_build.outcome }}" \
+            --oom-kill-baseline "${{ steps.oom_kill_before_build.outputs.count }}" \
+            --anon-state-dir "$RUNNER_TEMP/qontinui-resource-report" \
+            --disk-path "$GITHUB_WORKSPACE"
+
+  # The windows leg of `test` (see the block above `test`). Same steps, same
+  # cap, same check context `test (windows-latest)`; NO `needs:`, so the hosted
+  # `route` job's queue wait is no longer in front of it.
+  test-windows:
+    name: test (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [windows-latest]
+    # coord-pools: [windows-latest]
+    runs-on: windows-latest
+    # Same cap and the same derivation as `test` (see the comment there);
+    # ci_rust_test_steps_split.rs pins both jobs to it.
+    timeout-minutes: 180
+
+    steps:
+      # Full history, blobless: workspace_assumptions_are_enumerated.rs takes its
+      # swap-rule base from `merge-base HEAD origin/main`, which a depth-1 clone
+      # cannot compute (it would print SWAP RULE UNKNOWN and enforce nothing).
+      # `filter: blob:none` keeps the fetch to commits and trees; the one roster
+      # blob it reads at the merge base is fetched lazily. Plan
+      # 2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists, A6.
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          filter: blob:none
+
+      # SELF-HOSTED ONLY (the `route` job above put the ubuntu leg on the
+      # pool). Two things a hosted VM gets for free and a persistent host does
+      # not:
+      #
+      #   1. A FRESH `_work`. A self-hosted runner keeps it between jobs, and
+      #      checkout-sibling REFUSES a destination that already exists
+      #      ("refusing to overwrite a checkout that is already there"), so the
+      #      second job on a registration would fail at the first sibling. The
+      #      previous job's three sibling trees are removed; they are this
+      #      registration's own scratch, at $GITHUB_WORKSPACE/.. exactly where
+      #      checkout-sibling writes them.
+      #   2. A HOME of its own. Every registration on the host runs as ONE
+      #      account with ONE home, and `Poison ambient state` / `Unpoison`
+      #      below write and delete `~/.qontinui/*` by name — two concurrent
+      #      jobs would delete each other's poison mid-suite, and a red suite
+      #      (Unpoison does not run then) would leave it for the next. So the
+      #      job gets HOME and TMPDIR under $RUNNER_TEMP, which the runner
+      #      empties per job, while CARGO_HOME / RUSTUP_HOME stay on the
+      #      account's persistent toolchain and registry. CI_POOL_HOME keeps
+      #      the persistent home for the target cache below.
+      - name: "Self-hosted: clear the previous job's sibling checkouts and give the job its own HOME"
+        if: runner.environment == 'self-hosted'
+        shell: bash
+        run: |
+          set -euo pipefail
+          parent="$(cd "$GITHUB_WORKSPACE/.." && pwd)"
+          for name in qontinui-schemas qontinui-web ui-bridge; do
+            if [ -e "$parent/$name" ]; then
+              rm -rf "${parent:?}/$name"
+              echo "removed the previous job's $parent/$name"
+            fi
+          done
+          job_home="$RUNNER_TEMP/home"
+          mkdir -p "$job_home" "$RUNNER_TEMP/tmp"
+          {
+            echo "CI_POOL_HOME=$HOME"
+            echo "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}"
+            echo "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}"
+            echo "HOME=$job_home"
+            echo "TMPDIR=$RUNNER_TEMP/tmp"
+          } >> "$GITHUB_ENV"
+          echo "HOME -> $job_home (persistent home $HOME kept for CARGO_HOME, RUSTUP_HOME and the target cache)"
+
+      # qontinui-runner's frontend cross-repo deps now resolve via npm
+      # (see package.json: @qontinui/* moved from link: to ^x.y.z ranges).
+      # The remaining sibling-checkouts are:
+      #   - qontinui-schemas: src-tauri/Cargo.toml's `qontinui-types = { path
+      #     = "../../qontinui-schemas/rust" }` — Rust publication is deferred
+      #     per the cross-repo dep redesign plan.
+      #   - qontinui-web: believed VESTIGIAL. This comment used to justify the
+      #     checkout with "src/lib/spec-registry.ts statically imports 14
+      #     .spec.uibridge.json files from qontinui-web/frontend/src/app at
+      #     typecheck/build time" — that file no longer exists in this repo, and
+      #     a tree-wide search finds no build-time, test-time or tsconfig
+      #     reference to a sibling qontinui-web checkout (every
+      #     *.spec.uibridge.json loaded here lives under this repo's own specs/
+      #     and src/specs/). It is pinned rather than deleted so that removing
+      #     it is a separate change with its own verification.
+      #   - ui-bridge: the SDK↔runner manifest diff test
+      #     (`sdk_manifest_routes_are_exposed_by_runner` in
+      #     `mcp/ui_bridge/mod.rs`) reads `UI_BRIDGE_ROUTES` from
+      #     `ui-bridge/packages/ui-bridge/src/server/types.ts`. Without this
+      #     checkout the test hits its "file unreadable, skip" branch and
+      #     silently passes, so SDK-vs-runner drift would not be flagged.
+      # qontinui-schemas, qontinui-web, and ui-bridge are public org-owned
+      # repos; the default github.token authenticates the fetch, no PAT needed.
+      #
+      # NONE of the three is `git clone`d here — the action below checks each
+      # one out itself. It resolves, in order: the DECLARED adaptation PR's head
+      # commit (a coord dep-edge label between this PR and the sibling's,
+      # either direction), then the commit recorded in
+      # .github/sibling-pins.conf, then the default branch. So a breaking
+      # cross-repo change still goes green as a DECLARED pair instead of
+      # deadlocking, while an UNdeclared land in a peer repo can no longer
+      # change what this repo's `main` builds against.
+      #
+      # Branch NAMES resolve nothing — a name is not an identity, and matching
+      # on one let an un-PR'd scratch branch satisfy the mirror gate in
+      # production on 2026-07-28. Floating on a peer's default branch is the
+      # same class of defect one step out: it let a ui-bridge land red this
+      # repo's main and hold the merge train for 5h+ on 2026-08-20, with no
+      # runner commit involved. See .github/sibling-pins.conf for that incident
+      # and .github/actions/checkout-sibling/action.yml for the full rationale.
+      - name: Check out sibling qontinui-schemas
+        uses: ./.github/actions/checkout-sibling
+
+      # qontinui-web and ui-bridge go through the SAME action, at a commit
+      # recorded in .github/sibling-pins.conf. A declared coord dep-edge label
+      # still outranks the pin, so a genuinely coordinated cross-repo change
+      # ships as a declared pair exactly as it does for qontinui-schemas.
+      - name: Check out sibling qontinui-web
+        uses: ./.github/actions/checkout-sibling
+        with:
+          repo: qontinui/qontinui-web
+
+      - name: Check out sibling ui-bridge
+        uses: ./.github/actions/checkout-sibling
+        with:
+          repo: qontinui/ui-bridge
+
+      # On the self-hosted pool `dest` is per-JOB ($RUNNER_TEMP), so two
+      # concurrent jobs never install into one tree. Hosted runs keep the
+      # action's default (~/setup-pnpm), which the pnpm cache entries below
+      # are keyed against.
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.2
+          dest: ${{ runner.environment == 'self-hosted' && format('{0}/setup-pnpm', runner.temp) || '~/setup-pnpm' }}
+
+      # The pnpm-store CACHE is hosted-only. On the pool the store lives under
+      # the per-job `dest` (action-setup points PNPM_HOME there), so a restore
+      # would only download a store nobody keeps, and a save would put a
+      # pool-built entry into this repo's 10 GB cache beside main's rust cache.
+      # BOTH inputs are needed: setup-node v5 also caches on its own whenever
+      # package.json names a `packageManager` and `cache` is empty.
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: "20"
+          cache: ${{ runner.environment == 'github-hosted' && 'pnpm' || '' }}
+          package-manager-cache: ${{ runner.environment == 'github-hosted' }}
+          cache-dependency-path: pnpm-lock.yaml
+
+      # Gates the pure-JS parsers that `Report test results to coord` below
+      # depends on — `parseTestOutcomes` builds every row that script POSTs to
+      # production coord, so a regression here shipping untested is exactly
+      # the risk a pre-PR review of this same plan's Phase 1 flagged. Needs no
+      # `pnpm install`: both files import only Node built-ins. Placed early
+      # (right after Node setup, before any frontend/Rust step) so a break is
+      # cheap and fast to see, not discovered 40 minutes later.
+      #
+      # Deliberately scoped to these two files, NOT the whole `__tests__/`
+      # directory — `coverage-diff.test.mjs` and `perf-harness-lib.test.mjs`
+      # predate this step and have not been verified against this job's exact
+      # environment; wiring them in is a separate, separately-verified change.
+      - name: Run CI-tooling unit tests (ci-flake-analyze, ci-test-results-ingest, ci-expiry-phase-summary)
+        run: node --test scripts/__tests__/ci-flake-analyze.test.mjs scripts/__tests__/ci-test-results-ingest.test.mjs scripts/__tests__/ci-expiry-phase-summary.test.mjs
+
+      # Pin matches rust-toolchain.toml (channel = "1.95.0"). The toolchain
+      # file overrides any other channel for every cargo invocation, so the
+      # rustfmt/clippy components must be installed for 1.95.0 specifically —
+      # otherwise `cargo fmt`/`cargo clippy` auto-switch to a component-less
+      # 1.95.0 and fail with "'cargo-fmt' is not installed".
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+          components: rustfmt, clippy
+
+      # SELF-HOSTED ONLY. Three things a hosted VM hands every job and a
+      # persistent host has to be told:
+      #
+      #   1. THE SYSTEM PACKAGES. `Install dependencies (Ubuntu)` below runs
+      #      `sudo apt-get`, and a pool job account has no sudo
+      #      (qontinui-claude-config volunteer-ci-runners.md section 2), so the
+      #      host is provisioned once and this step checks it. A missing package
+      #      fails HERE, naming the runner: that red is the host's, not the PR's.
+      #   2. COMPILE AND TEST CONCURRENCY CAPS. Every cargo step in this job
+      #      runs at cargo's default parallelism (= nproc), which on a 128-thread
+      #      host is
+      #      a memory spike no unit cap survives. CARGO_BUILD_JOBS is the
+      #      smallest of MemTotal and every cgroup memory.max/memory.high above
+      #      this job, / 5 GiB, clamped to nproc, and 1 at or below 8 GiB.
+      #      Why 5 and not qontinui-coord's 3: measured on nawa-runner-2
+      #      (2026-11-03, 60 GiB unit), the cold `Build Rust tests` at 3 GiB per
+      #      job (20 jobs) peaked at 54.1 GiB — two `qontinui_runner` rustc
+      #      processes alone held 17-24 GiB each, so the giant crates, not the
+      #      job count, set the floor, and 3 GiB per job left ~6 GiB of
+      #      headroom under MemoryHigh. RUST_TEST_THREADS is 4, the hosted
+      #      leg's own value (nproc of its 4-core VM), and VITEST_MAX_WORKERS
+      #      is 3, vitest's own default there (its worker count, maxWorkers, is
+      #      nproc - 1): the suites' concurrency regime does not change with the
+      #      machine they land on (and, for the Rust suite, coord's ingest keeps
+      #      recording both lanes under the one `ubuntu-22.04` shard). Uncapped,
+      #      vitest runs 127 workers here. On 2026-11-03 that passed `Run
+      #      frontend unit tests` in four pool runs (~27 s, vitest's own figure)
+      #      and failed it in both trial runs (41703593573 and 41709340100),
+      #      where a `Clippy (windows)` compile on nawa-winvm-3 overlapped the
+      #      step: 10 s beforeAll timeouts, import 2963 s / 4070 s summed across
+      #      workers.
+      #   3. A WARM, PERSISTENT TARGET. actions/checkout cleans with `git clean
+      #      -ffdx`, which deletes ./target on every job. So the target lives
+      #      outside the workspace, under the account's persistent home
+      #      (CI_POOL_HOME, set above), ONE per runner registration (two jobs
+      #      never share a cargo build lock), and ./target is a symlink to it:
+      #      the clean removes the link, never the tree behind it.
+      #      CARGO_TARGET_DIR is deliberately NOT set. The link is added to
+      #      .git/info/exclude, because `target/` in .gitignore does not match
+      #      a symlink, and build.rs's `git status --porcelain` would otherwise
+      #      stamp every pool build dirty. Bounded: a target over 150 GiB, under
+      #      60 GiB free on its filesystem, or unreadable, starts cold.
+      - name: "Self-hosted: system packages, compile caps and the persistent target"
+        if: runner.environment == 'self-hosted'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          missing=""
+          if command -v pkg-config >/dev/null; then
+            for pc in webkit2gtk-4.1 javascriptcoregtk-4.1 libsoup-3.0 gtk+-3.0 \
+                      ayatana-appindicator3-0.1 librsvg-2.0 dbus-1 atspi-2 openssl; do
+              pkg-config --exists "$pc" || missing="$missing $pc"
+            done
+          else
+            missing="$missing pkg-config"
+          fi
+          for tool in cc make curl wget file git python3; do
+            command -v "$tool" >/dev/null || missing="$missing $tool"
+          done
+          python3 -c 'import yaml' 2>/dev/null || missing="$missing python3-yaml"
+          if [ -n "$missing" ]; then
+            echo "::error title=self-hosted host not provisioned::runner '$RUNNER_NAME' lacks:$missing. The HOST is at fault, not this change: provision it. A re-run goes to the hosted floor; RUNNER_CI_LINUX_LANE=hosted keeps new runs off the pool."
+            exit 1
+          fi
+
+          budget_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
+          cg="/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/self/cgroup)"
+          while [ "$cg" != "/sys/fs/cgroup" ] && [ -n "$cg" ]; do
+            for f in memory.max memory.high; do
+              v=$(cat "$cg/$f" 2>/dev/null || echo max)
+              case "$v" in ''|*[!0-9]*) continue ;; esac
+              if [ $((v / 1024)) -lt "$budget_kb" ]; then budget_kb=$((v / 1024)); fi
+            done
+            cg="${cg%/*}"
+          done
+          cpus=$(nproc)
+          jobs=$(( budget_kb / 5242880 ))
+          [ "$budget_kb" -gt 8388608 ] || jobs=1
+          [ "$jobs" -ge 1 ] || jobs=1
+          [ "$jobs" -le "$cpus" ] || jobs=$cpus
+          threads=4
+          [ "$threads" -le "$cpus" ] || threads=$cpus
+          vitest_workers=3
+          [ "$vitest_workers" -le "$cpus" ] || vitest_workers=$cpus
+          echo "CARGO_BUILD_JOBS=$jobs" >> "$GITHUB_ENV"
+          echo "RUST_TEST_THREADS=$threads" >> "$GITHUB_ENV"
+          echo "VITEST_MAX_WORKERS=$vitest_workers" >> "$GITHUB_ENV"
+          echo "memory budget $((budget_kb / 1048576)) GiB, nproc $cpus -> CARGO_BUILD_JOBS=$jobs RUST_TEST_THREADS=$threads VITEST_MAX_WORKERS=$vitest_workers"
+
+          cache="$CI_POOL_HOME/.cache/qontinui-runner-ci/$RUNNER_NAME/target"
+          mkdir -p "$cache"
+          if ! used_kb=$(du -sk "$cache" 2>/dev/null | cut -f1) || [ -z "$used_kb" ]; then
+            echo "::notice title=persistent target reset::du could not read $cache: starting cold"
+            chmod -R u+rwX "${cache:?}" 2>/dev/null || true
+            rm -rf "${cache:?}"
+            mkdir -p "$cache"
+            used_kb=0
+          fi
+          free_kb=$(df -Pk "$cache" | awk 'NR == 2 {print $4}')
+          if [ "$used_kb" -gt $((150 * 1048576)) ] || [ "$free_kb" -lt $((60 * 1048576)) ]; then
+            echo "::notice title=persistent target reset::$((used_kb / 1048576)) GiB used, $((free_kb / 1048576)) GiB free on its filesystem: starting cold"
+            chmod -R u+rwX "${cache:?}" 2>/dev/null || true
+            rm -rf "${cache:?}"
+            mkdir -p "$cache"
+            used_kb=0
+          fi
+          if [ -e target ] && [ ! -L target ]; then rm -rf target; fi
+          ln -sfn "$cache" target
+          exclude="$(git rev-parse --git-path info/exclude)"
+          mkdir -p "$(dirname "$exclude")"
+          grep -qx '/target' "$exclude" 2>/dev/null || echo '/target' >> "$exclude"
+          echo "target -> $cache ($((used_kb / 1048576)) GiB already built)"
+
+      # Cargo.lock must match the PINNED qontinui-schemas tree (plan
+      # 2026-08-31-schemas-releases-strand-consumer-cargo-locks §7.4 Phase 3).
+      # Cargo.lock records a path crate's version but no commit. The commit comes
+      # from .github/sibling-pins.conf, and sibling-pin-bump.yml moves the pin and
+      # the lock in one commit.
+      # Without --locked, every cargo command below silently rewrites a stale lock
+      # and goes green on it, which is how this repo's lock sat stale across
+      # qontinui-types releases while coord's gated lock went red.
+      # Resolve-only (no compile). It runs before the first cargo build, so it
+      # cannot pass vacuously on a lock cargo has already rewritten.
+      - name: Cargo.lock is in sync with the pinned qontinui-schemas
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          if cargo metadata --locked --format-version 1 > /dev/null; then
+            exit 0
+          fi
+          echo "::error title=Cargo.lock is stale::Committed Cargo.lock does not match the graph resolved against the checked-out qontinui-schemas sibling."
+          cargo metadata --format-version 1 > /dev/null || true
+          git --no-pager diff -- Cargo.lock || true
+          echo "Fix: move the schemas pin (.github/sibling-pins.conf) and Cargo.lock in the SAME commit. With the pinned schemas checked out beside this repo, run: cargo metadata --format-version 1 > /dev/null"
+          echo "On a declared schemas pair, this sibling is the partner PR's head: commit the lock change it forces with your adaptation."
+          git checkout -- Cargo.lock || true
+          exit 1
+
+      # Bounded because an unbounded apt hang here stalls the whole REPO, not
+      # just this run. Run 32302655587 (2026-08-19, branch
+      # merge-candidate/01a01bdd-…) sat `in_progress` in this step for 4h24m
+      # while the sibling windows leg passed — steps 9-19 never reached. It
+      # pinned a coord merge slot; nothing landed in qontinui-runner for 3h45m
+      # with four CLEAN green PRs queued behind, and the PR itself showed
+      # OPEN/CLEAN/all-green the entire time. Cancelling it released the train
+      # in nine seconds, and the two candidates coord immediately re-proposed
+      # both cleared this same step normally.
+      #
+      # Sizing — same p90 + named-headroom method as `Run Rust tests` below.
+      # 88 successful samples, runs 2026-08-08..08-20. Outside the 08-18..08-20
+      # apt incident (n=60): p50 35s, p90 57s, max 115s. Inside it the tail is
+      # 201 / 344 / 442 / 532 / 564 / 624 / 1370 / 3634s. 10 min = ~10x the
+      # healthy p90 and ~5x the worst healthy sample: it still absorbs a
+      # degraded-but-progressing mirror (08-19 successes up to 564s; the three
+      # above it — 624s, 1370s, 3634s — are deliberately cut) while
+      # converting a hang into a fast, obvious failure and an immediate
+      # re-propose.
+      # Hosted only: a self-hosted job account has no sudo, and the pool host
+      # carries these packages already (checked by the "Self-hosted: system
+      # packages, ..." step above).
+      - name: Install dependencies (Ubuntu)
+        if: matrix.platform == 'ubuntu-22.04' && runner.environment == 'github-hosted'
+        timeout-minutes: 10
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libdbus-1-dev \
+            libatspi2.0-dev \
+            at-spi2-core
+
+      # Hosted ubuntu runners ship only ~14 GB free on /. This workspace's
+      # Rust dep tree (atspi/zbus, image codecs, tree-sitter, sentry) plus the
+      # 12 GB swapfile below and the cargo target cache exhaust it — the test
+      # compile died writing rmeta with "No space left on device" (2026-06-13,
+      # PR #572 first run). Reclaim the preinstalled toolchains we never use
+      # (~25-30 GB) BEFORE the swapfile + cache restore so both have headroom.
+      # tool-cache/swap-storage/large-packages left intact: setup-node/setup-rust
+      # use the tool cache; the swapfile step manages swap itself; and
+      # `large-packages: true` cascade-removes GTK/GDK apt libs that the runner's
+      # webkit build links against (observed: "system library gdk-3.0 required by
+      # crate gdk-sys was not found" — gdk-sys compile fails). android + dotnet +
+      # haskell + docker-images alone reclaim ~20 GB, which is ample headroom
+      # without touching the apt libs installed above.
+      # Hosted only: on a persistent self-hosted host this would `sudo rm -rf`
+      # toolchains and prune docker images that belong to the host.
+      - name: Free disk space (Ubuntu)
+        if: matrix.platform == 'ubuntu-22.04' && runner.environment == 'github-hosted'
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: false
+
+      # Hosted ubuntu-22.04 / windows-latest both ship with 16 GB RAM and a
+      # small default pagefile/swap. `cargo test` peak codegen memory on
+      # this workspace exceeds that and the rustc/LLVM allocator dies (on
+      # Linux the OOM-killer takes the runner agent down → "shutdown
+      # signal … exit code 143"; on Windows rustc-LLVM emits
+      # "out of memory" / "Allocation failed" then aborts, surfaced by the
+      # OS as exit code 0xc000001d / STATUS_ILLEGAL_INSTRUCTION). Capping
+      # CARGO_BUILD_JOBS alone wasn't enough — link is single-threaded.
+      # Pre-allocate paging space so the OS can absorb the spike instead
+      # of the runner agent dying.
+      # Hosted only: `sudo swapoff -a` on a shared self-hosted host would take
+      # the swap from every other tenant; the pool unit's memory is bounded by
+      # its own cgroup instead.
+      - name: Add swapfile (Ubuntu — guard against link-time OOM)
+        if: matrix.platform == 'ubuntu-22.04' && runner.environment == 'github-hosted'
+        run: |
+          sudo swapoff -a || true
+          sudo fallocate -l 12G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          echo "=== free / df after swap setup ==="
+          free -h
+          df -h
+
+      # 32 GB (was 16 → 24): sized as headroom for CARGO_BUILD_JOBS=2 in the test
+      # step. The test step runs JOBS=1 since 2026-10-27 (see below); the pagefile stays.
+      # The May 2026 windows OOMs (runs 25612844640 / 75193978255, PR #65)
+      # happened at JOBS=2 with a 16 GB pagefile — two concurrent large-crate
+      # rustc codegens exhausted the 16 GB RAM + 16 GB pagefile commit limit.
+      # 24 GB made JOBS=2 pass on 2026-07-08 (run 28977560427, test step
+      # 37m47s vs the 50-min JOBS=1 baseline), but a week of workspace
+      # growth (ci-node module et al.) re-tripped the same signature on
+      # 2026-07-16 (run 29531039112: rustc-LLVM OOM compiling the
+      # qontinui_runner test binary, exit 0xc000001d). Each failure sat
+      # just past the previous ceiling, so 32 GB buys the same +8 GB
+      # increment that fixed it last time. Observed pagefile usage right
+      # before cargo test is only ~330 MB (2026-07-08 run 28948290993) —
+      # the commit spike is transient peak, not steady-state; disk cost on
+      # D: is the only cost. If JOBS=2 OOMs again at 32 GB, stop climbing:
+      # revert the test step to JOBS=1 and keep this pagefile. (That happened
+      # on 2026-10-27, run 40449994591; the test step is now JOBS=1 on every
+      # leg.)
+      - name: Configure pagefile (Windows — guard against link-time OOM)
+        if: matrix.platform == 'windows-latest'
+        uses: al-cheb/configure-pagefile-action@v1.4
+        with:
+          minimum-size: 32GB
+          maximum-size: 32GB
+          disk-root: "D:"
+
+      # macOS: The accessibility (AX) adapter links against system CoreFoundation
+      # frameworks which are always available. No additional brew packages needed.
+      # Note: AX integration tests require accessibility permissions at runtime,
+      # which CI environments typically do not grant. Compilation is unaffected.
+
+      # Swatinem/rust-cache replaces the previous actions/cache stanza, which
+      # was broken two ways and never cached a single build artifact:
+      #   1. It cached `src-tauri/target/` — but the cargo workspace root is
+      #      the REPO root (./Cargo.toml → ./target; see the [workspace]
+      #      table), so the cached path never existed. Observed restore was
+      #      1-6 s and save ~38 s (registry only) on every 2026-07-08 run.
+      #   2. Exact-match key with no restore-keys: any Cargo.lock change was
+      #      a total miss even for the registry portion.
+      # Measured cost of running cache-less (windows leg, runs 28948290993 /
+      # 28947330992 / 28940758985): the full dependency graph compiles THREE
+      # times per run — Clippy ~755 check-compiles (~17 min), cargo test
+      # ~534 dep compiles (~12 min of the 50-min step), tauri build ~767
+      # compiles (~13 min of the 35-min step; its flag set differs from the
+      # test step's, so even host proc-macros rebuild). rust-cache keys on
+      # toolchain + Cargo.lock + cargo config + job/os, provides prefix
+      # restore-keys, and prunes workspace-member artifacts at save time, so
+      # dependency artifacts for ALL flag-sets are restored while the
+      # workspace's own crates always rebuild from real sources (no stale-
+      # artifact flake). NOTE on scoping: GitHub cache is branch-isolated —
+      # saves from merge-candidate/* refs are invisible to sibling
+      # candidates. The cache that matters is the one saved by `main` runs
+      # (every land), which all candidates and PRs can restore.
+      # Hosted only. A self-hosted job builds in its registration's persistent
+      # target (set up above), and must never SAVE into this repo's GitHub
+      # cache: the key carries the OS but not the distro, so a cache saved by a
+      # Debian 13 pool host on a main push would be restored by the next hosted
+      # ubuntu-22.04 run — build-script and proc-macro binaries linked against a
+      # newer glibc than ubuntu-22.04's 2.35.
+      - name: Cache Rust dependencies
+        if: runner.environment == 'github-hosted'
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Workspace root is the repo root: ./Cargo.toml -> ./target
+          workspaces: ". -> target"
+          # The key `test` is the job id this step lived under before the
+          # windows leg moved to `test-windows`; pinning it keeps both legs on
+          # their existing caches and keeps published-parity.yml (which
+          # restores `shared-key: "test"` on windows) warm.
+          shared-key: test
           # Candidate/PR runs often fail on steps after the Rust compiles
           # succeeded; still save so the next run on the ref stays warm.
           cache-on-failure: true

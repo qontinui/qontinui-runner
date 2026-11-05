@@ -276,7 +276,8 @@ fn rust_tests_are_built_and_run_in_separate_bounded_steps() {
     // HISTORY. A rewrite of the run step dropped its `shell: bash` line, and
     // nothing here noticed: five review rounds and a mutation-proof pass went
     // by, while this file's own comments REASONED FROM `shell: bash` being
-    // present. This job's matrix includes windows-latest, GitHub's default
+    // present. These steps also run as `test-windows` (asserted equal below),
+    // on windows-latest, where GitHub's default
     // shell there is PowerShell, and this workflow declares no `defaults:`
     // block — so a bash body with no `shell:` is dot-sourced into pwsh and dies
     // at parse, on a branch-protection-required check.
@@ -286,8 +287,8 @@ fn rust_tests_are_built_and_run_in_separate_bounded_steps() {
                 .get("shell")
                 .and_then(|v| v.as_str()),
             Some("bash"),
-            "step `{name}` must declare `shell: bash`. The `test` job's matrix \
-             includes windows-latest, where the default shell is PowerShell and \
+            "step `{name}` must declare `shell: bash`. The same steps run as \
+             `test-windows` on windows-latest, where the default shell is PowerShell and \
              this bash body would fail to parse; the workflow carries no \
              `defaults:` block to inherit from."
         );
@@ -1110,4 +1111,142 @@ fn the_pool_label_set_is_the_same_in_route_and_in_the_forced_lane() {
         "the pool label set differs between `route --self-hosted-labels` and \
          `test`'s forced `self-hosted` arm; change both together"
     );
+}
+
+/// Plan `2026-11-05-runner-candidate-ci-hosted-queue-in-front-of-a-serial-windows-leg`,
+/// Phase 1: the windows leg of `test` is its own job, `test-windows`, so it no
+/// longer waits for the hosted `route` job that only the ubuntu leg reads.
+/// Measured on four green merge-candidate-batch runs of 2026-11-05, `route`
+/// queued 18.6-170.7 min and the windows leg started at +19.7..+356.1 min.
+///
+/// What must hold, every one asserted on LITERALS:
+/// - `test-windows` has NO `needs:` (a `needs: route` puts the wait back);
+/// - its matrix is exactly `[windows-latest]` and `test`'s exactly
+///   `[ubuntu-22.04]` (a windows entry left in `test` runs the leg twice);
+/// - both render the required contexts `test (windows-latest)` /
+///   `test (ubuntu-22.04)` through `name: test (${{ matrix.platform }})`;
+/// - `test-windows` runs on hosted `windows-latest`;
+/// - both carry the same 180-min job cap the cap test above derives;
+/// - the two `steps:` lists are EQUAL. The copy is verbatim rather than a YAML
+///   anchor because ci-integrity.yml refuses anchors in a gating file, so this
+///   equality is what stops the legs drifting apart.
+#[test]
+fn the_windows_leg_is_its_own_job_with_the_same_steps_and_no_route_wait() {
+    let doc = ci_workflow();
+    let job = |name: &str| {
+        doc.get("jobs")
+            .and_then(|j| j.get(name))
+            .unwrap_or_else(|| panic!("ci.yml has no job `{name}`"))
+            .clone()
+    };
+    let test = job("test");
+    let windows = job("test-windows");
+
+    assert!(
+        windows.get("needs").is_none(),
+        "`test-windows` must have NO `needs:` — any dependency puts a hosted queue \
+         wait back in front of the longest leg: {:?}",
+        windows.get("needs")
+    );
+
+    let platforms = |spec: &serde_yaml::Value, name: &str| -> Vec<String> {
+        spec.get("strategy")
+            .and_then(|s| s.get("matrix"))
+            .and_then(|m| m.get("platform"))
+            .and_then(|p| p.as_sequence())
+            .unwrap_or_else(|| panic!("`{name}` must carry strategy.matrix.platform"))
+            .iter()
+            .map(|v| v.as_str().unwrap_or_default().to_string())
+            .collect()
+    };
+    assert_eq!(platforms(&test, "test"), vec!["ubuntu-22.04".to_string()]);
+    assert_eq!(
+        platforms(&windows, "test-windows"),
+        vec!["windows-latest".to_string()]
+    );
+
+    for (spec, name) in [(&test, "test"), (&windows, "test-windows")] {
+        assert_eq!(
+            spec.get("name").and_then(|n| n.as_str()),
+            Some("test (${{ matrix.platform }})"),
+            "`{name}` must be named `test (${{{{ matrix.platform }}}})` so the required \
+             context keeps its exact spelling"
+        );
+        assert_eq!(
+            spec.get("timeout-minutes").and_then(|v| v.as_u64()),
+            Some(180),
+            "`{name}` must carry the 180-min job cap"
+        );
+    }
+
+    assert_eq!(
+        windows.get("runs-on").and_then(|r| r.as_str()),
+        Some("windows-latest"),
+        "`test-windows` runs on hosted windows-latest"
+    );
+
+    // Every OTHER job-level key must be identical too: an `if:` or a
+    // `continue-on-error: true` on one job only would make its required
+    // context skipped or always-passing, and a one-sided `env:`/`defaults:`
+    // would change what the identical steps run. Only the keys that are the
+    // point of the split may differ.
+    const MAY_DIFFER: [&str; 4] = ["needs", "if", "runs-on", "strategy"];
+    let rest = |spec: &serde_yaml::Value| -> serde_yaml::Mapping {
+        let mut m = spec.as_mapping().cloned().unwrap_or_default();
+        for k in MAY_DIFFER {
+            m.remove(k);
+        }
+        m
+    };
+    assert_eq!(
+        rest(&test),
+        rest(&windows),
+        "`test` and `test-windows` may differ only in {MAY_DIFFER:?}"
+    );
+    for (spec, name) in [(&test, "test"), (&windows, "test-windows")] {
+        assert!(
+            spec.get("continue-on-error").is_none(),
+            "`{name}` must carry no job-level `continue-on-error` — it turns a red \
+             required context green"
+        );
+    }
+    // published-parity.yml restores the windows cache by `shared-key: "test"`;
+    // the key must stay pinned here or that nightly silently runs cold.
+    let test_job_steps = job_steps(&doc, "test");
+    let cache = find_step(&test_job_steps, "Cache Rust dependencies");
+    assert_eq!(
+        cache
+            .get("with")
+            .and_then(|w| w.get("shared-key"))
+            .and_then(|k| k.as_str()),
+        Some("test"),
+        "`Cache Rust dependencies` must pin `shared-key: test` (the old job id): \
+         published-parity.yml restores that key on windows"
+    );
+    assert!(
+        windows.get("if").is_none(),
+        "`test-windows` must carry no job-level `if:` — a false one SKIPS the \
+         required `test (windows-latest)` context, which coord counts as passing"
+    );
+
+    let test_steps = job_steps(&doc, "test");
+    let windows_steps = job_steps(&doc, "test-windows");
+    if test_steps != windows_steps {
+        let names = |s: &[serde_yaml::Value]| -> Vec<String> {
+            s.iter()
+                .map(|st| step_name(st).unwrap_or("<unnamed>").to_string())
+                .collect()
+        };
+        let first_diff = test_steps
+            .iter()
+            .zip(windows_steps.iter())
+            .position(|(a, b)| a != b)
+            .unwrap_or(test_steps.len().min(windows_steps.len()));
+        panic!(
+            "`test` and `test-windows` must have IDENTICAL `steps:` lists (edit both). \
+             First difference at index {first_diff}: test={:?} test-windows={:?}",
+            names(&test_steps).get(first_diff),
+            names(&windows_steps).get(first_diff)
+        );
+    }
 }

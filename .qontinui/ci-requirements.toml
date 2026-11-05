@@ -42,7 +42,7 @@
 # ===========================================================================
 
 # ---------------------------------------------------------------------------
-# test (windows-latest) — the Windows leg of ci.yml's `test` matrix.
+# test (windows-latest) — the Windows leg of ci.yml (job `test-windows`, the same steps as `test`).
 #
 # min_commit_mb = 18831 MiB: the HIGHEST Windows pagefile PeakUsage (the
 # MEMPEAK step's `peak_mb` on D:\pagefile.sys, AllocatedBaseSize 32768) across
