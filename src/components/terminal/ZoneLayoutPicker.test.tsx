@@ -108,7 +108,7 @@ describe("select-layout", () => {
       pageId: "page-2",
       tabCount: 5,
       leftTmux: false,
-      origin: "operator",
+      layoutOrigin: "operator",
     });
     expect(callRegistry).toHaveBeenCalledWith("terminal.layout", {
       preset: "2",
@@ -141,10 +141,10 @@ describe("select-layout", () => {
     });
   });
 
-  it("forwards origin auto to the registry and reports it", async () => {
+  it("forwards origin auto to the registry and reports the page as the runner's", async () => {
     await expect(
       select({ layoutId: "split", pageId: "page-2", origin: "auto" }),
-    ).resolves.toMatchObject({ origin: "auto" });
+    ).resolves.toMatchObject({ layoutOrigin: "auto" });
     expect(callRegistry).toHaveBeenCalledWith("terminal.layout", {
       preset: "split",
       page: "page-2",
@@ -154,9 +154,20 @@ describe("select-layout", () => {
 
   it("sends no origin for an explicit operator request", async () => {
     await expect(select({ layoutId: "quad", origin: "Operator" })).resolves.toMatchObject({
-      origin: "operator",
+      layoutOrigin: "operator",
     });
     expect(callRegistry).toHaveBeenCalledWith("terminal.layout", { preset: "quad" });
+  });
+
+  it("reports the origin kept when an auto request leaves the layout id unchanged", async () => {
+    // page-1 is a legacy quad: re-asserting quad hands nothing to the runner.
+    await expect(select({ layoutId: "quad", origin: "auto" })).resolves.toMatchObject({
+      layoutOrigin: "legacy",
+    });
+    expect(callRegistry).toHaveBeenCalledWith("terminal.layout", {
+      preset: "quad",
+      origin: "auto",
+    });
   });
 
   it.each([["restore"], [""], [{}], [7]])(
