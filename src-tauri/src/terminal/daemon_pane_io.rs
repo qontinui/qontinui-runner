@@ -81,14 +81,16 @@
 //! for `LocalPty` (the holder kills its own child and reports the exit).
 //! `release` WITHOUT a prior `kill` sends `detach` — the child keeps running in
 //! its holder and a later [`DaemonPaneIo::attach_existing`] can reattach.
-//! Runner SHUTDOWN still routes through `TerminalManager::close_all` →
-//! `kill`, so a holder pane does not yet outlive a GRACEFUL runner exit; it
-//! outlives a crash or SIGKILL of the runner, and the next start's boot sweep
-//! (`super::holder_boot_sweep`, Phase 3) adopts it back. Routing shutdown to a
-//! detach is now possible (the sweep is what makes a detached holder
-//! adoptable) but is not done here: it changes what quitting the runner does
-//! to every holder pane, which belongs with the census that makes those panes
-//! visible to `/restart-readiness` (plan Phase 5).
+//! An ordinary runner SHUTDOWN (the window X, a close-request with no
+//! intent) still routes through `TerminalManager::close_all(_, Kill)` →
+//! `kill`, so quitting ends every holder pane. A RESTART that asks for it
+//! (`close-request` body `{"handoff":"holders"}`) runs
+//! `close_all(_, Handoff)`, which releases a holder pane WITHOUT a kill —
+//! the detach above — and the next start's boot sweep
+//! (`super::holder_boot_sweep`) adopts it back, exactly as after a crash
+//! (plan `2026-10-21-graceful-runner-restart-detaches-holder-panes-instead-of-killing-them`).
+//! [`PaneIo::holder_handoff`] is what that close reads to tell a holder pane
+//! from an in-process one.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -503,6 +505,9 @@ impl<P: PaneIo> PaneIo for WithNotice<P> {
     }
     fn credential_scrub(&self) -> CredentialScrub {
         self.inner.credential_scrub()
+    }
+    fn holder_handoff(&self) -> Option<super::pane_io::HolderHandoff> {
+        self.inner.holder_handoff()
     }
     fn release(&self, budget: Duration) -> Result<(), String> {
         self.inner.release(budget)
@@ -992,6 +997,10 @@ pub struct DaemonPaneIo {
     /// reattaches.
     detached: Arc<AtomicBool>,
     detach: Arc<Mutex<DetachOutcome>>,
+    /// The holder TOOK the `detach` frame within its budget (rather than the
+    /// connection being ended under it) — what a handoff close reports as a
+    /// confirmed detach ([`PaneIo::holder_handoff`]).
+    detach_frame_taken: Arc<AtomicBool>,
     cols: Arc<AtomicU16>,
     rows: Arc<AtomicU16>,
     /// The pause state last asked for, re-sent on a reattach (a new
@@ -1315,6 +1324,7 @@ impl DaemonPaneIo {
             released: AtomicBool::new(false),
             detached,
             detach: Arc::new(Mutex::new(DetachOutcome::NotAttempted)),
+            detach_frame_taken: Arc::new(AtomicBool::new(false)),
             cols,
             rows,
             paused,
@@ -1385,6 +1395,7 @@ impl DaemonPaneIo {
         Detacher {
             key: self.pane_id.to_string(),
             slot: self.detach.clone(),
+            frame_taken: self.detach_frame_taken.clone(),
             detached: self.detached.clone(),
             control: self.control.clone(),
             link: self.link.clone(),
@@ -1432,6 +1443,7 @@ pub fn reattach_holder_pane(
 struct Detacher {
     key: String,
     slot: Arc<Mutex<DetachOutcome>>,
+    frame_taken: Arc<AtomicBool>,
     detached: Arc<AtomicBool>,
     control: Arc<ControlQueue>,
     link: Arc<dyn HolderLink>,
@@ -1456,8 +1468,11 @@ impl Detacher {
         let sent = self
             .link
             .control(HolderControl::Detach, budget.min(DETACH_FRAME_BUDGET));
-        if let Err(e) = &sent {
-            debug!(pane = %self.key, error = %e, "pty holder: detach frame not sent; ending the connection instead");
+        match &sent {
+            Ok(()) => self.frame_taken.store(true, Ordering::Release),
+            Err(e) => {
+                debug!(pane = %self.key, error = %e, "pty holder: detach frame not sent; ending the connection instead")
+            }
         }
         // Either way the connections end here: the frame makes the holder
         // close the attached one, a wedged writer is closed under it, and the
@@ -1906,6 +1921,24 @@ impl PaneIo for DaemonPaneIo {
         CredentialScrub::ScrubbedOutOfProcess
     }
 
+    /// `None` once a kill was asked for, or the pane's exit is settled by
+    /// anything but this pane's own detach (the child exited, the holder
+    /// died): there is no live process left to hand off.
+    fn holder_handoff(&self) -> Option<super::pane_io::HolderHandoff> {
+        if self.kill_requested.load(Ordering::Acquire) {
+            return None;
+        }
+        let detached = self.detach_outcome() == DetachOutcome::Queued;
+        if self.out.is_finished() && !detached {
+            return None;
+        }
+        Some(super::pane_io::HolderHandoff {
+            holder_pid: self.holder_pid(),
+            child_pid: self.child_pid,
+            detach_confirmed: self.detach_frame_taken.load(Ordering::Acquire),
+        })
+    }
+
     fn release(&self, budget: Duration) -> Result<(), String> {
         self.released.store(true, Ordering::Release);
         if self.out.is_finished() {
@@ -2102,6 +2135,7 @@ mod tests {
             released: AtomicBool::new(false),
             detached: Arc::new(AtomicBool::new(false)),
             detach: Arc::new(Mutex::new(DetachOutcome::NotAttempted)),
+            detach_frame_taken: Arc::new(AtomicBool::new(false)),
             cols: Arc::new(AtomicU16::new(80)),
             rows: Arc::new(AtomicU16::new(24)),
             paused: Arc::new(AtomicBool::new(false)),

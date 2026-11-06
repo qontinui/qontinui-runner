@@ -743,6 +743,14 @@ fn adopt_once(
             adoption.pinned_session_id.clone(),
         )
         .map(|_| ());
+    // D8 (plan `2026-10-21-graceful-runner-restart-detaches-holder-panes-instead-of-killing-them`):
+    // the adopted pane resumes the coord session its terminal had before the
+    // last runner let go of it, and gets the same close hook every create
+    // path installs — so a handed-off session's row stays `active`, and the
+    // pane's eventual real exit closes it.
+    if result.is_ok() {
+        crate::commands::terminal::rebind_adopted_terminal(app_handle, manager, &adoption.pane_id);
+    }
     if let Err(AdoptError::Attach(e)) = &result {
         if e.runner_bug {
             error!(

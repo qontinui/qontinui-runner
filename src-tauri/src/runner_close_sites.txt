@@ -9,7 +9,7 @@
 #   TerminalManager::close_all    `.close_all(`
 #   TerminalManager::graceful_exit   `.graceful_exit(` (and the session-level graceful_exit_then /
 #                                 graceful_exit_driven it drives)
-#   a session-level close         `.close_with_deadline(`, `.close_kill_only(`,
+#   a session-level close         `.close_with_deadline(`, `.close_kill_only(`, `.close_for_handoff(`,
 #                                 `.close_after_graceful_exit(`, and `session.close()` / `self.close()`
 #                                 under terminal/ — every one `pub(super)`, so callable from
 #                                 crate::terminal only (NC6-3)
@@ -85,7 +85,6 @@ mcp/backend_relay.rs | deliver_create_reply | exempt | a terminal never handed t
 mcp/backend_relay.rs | settle_remote_registration | exempt | a terminal never handed to a session: when a remote create's coord registration fails, it calls the `close_terminal` closure that `handle_terminal_create` passes it (a parameter that shares the reaper helper's `close_terminal(` token), and the create is refused before any reply
 mcp/remote_create_reaper.rs | close_terminal | helper | close_terminal(
 mcp/remote_create_reaper.rs | close_through | exempt | a terminal never handed to a session: a remote create no source attached to within the deadline, closed (through `ReapTarget::close_terminal`) ONLY after this fn's probe finds a bare shell; a live or unprovable claude is HELD, never closed (m5-2)
-mcp/backend_relay.rs | register_remote_created_session | exempt | the remote-create pane's on-exit hook closes its coord registry row once the PTY has exited; the row is External (`register_external_confirmed`), so `close_by_id` reaches no terminal
 mcp/backend_relay.rs | terminal_gone_after_confirm | exempt | closes the coord registry row of a remote-create terminal that already exited during confirmation; External row — reaches no terminal
 
 # ── the source side of a relay end (the `remote_terminal_end` frame)
@@ -109,8 +108,8 @@ session/transport/claude_cli.rs | close | helper | transport.close(
 session/mod.rs | close_by_id | helper | close_by_id(
 agent_runtime.rs | run_continuation_terminal | exempt | a never-started gate-continuation pane: closes its coord registry row after the start verdict saw no session start; an External row (terminal panes register external), so it reaches no terminal
 agent_runtime.rs | run_condition_check_terminal | exempt | a never-started condition-check pane: closes its coord registry row after the start verdict saw no session start; External row — reaches no terminal
-commands/terminal.rs | terminal_create | exempt | the operator tab's on-exit hook closes its coord registry row once the PTY has exited; External row — reaches no terminal
-commands/terminal.rs | create_terminal_session_backend | exempt | a backend-created pane's on-exit hook closes its coord registry row once the PTY has exited; External row — reaches no terminal
+commands/terminal.rs | close_session | exempt | `SessionRegistry`'s `CoordExitTarget` arm: the ONE coord exit hook every terminal create path installs (the operator tab, a backend-created pane, a relay remote-create pane, an adopted holder pane) closes its coord registry row once the PTY has really exited — never on a handoff detach; External row — reaches no terminal
+commands/terminal.rs | rebind_adopted_terminal | exempt | an adopted holder pane that really exited (its exit snapshot recorded) before its coord exit hook was installed: closes the coord registry row the adoption just resumed; External row — reaches no terminal
 
 # ── runner exit
 mcp/ai_session.rs | run_teardown | runner_exit | `TerminalManager::close_all` at shutdown, under the teardown budget (NC5-7)

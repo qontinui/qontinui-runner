@@ -886,6 +886,20 @@ const EVENT_LOOP_PROBE_CEILING: std::time::Duration = std::time::Duration::from_
 /// `get_main_window_label()` unconditionally, so **no supported door closed a
 /// pop-out** — `POST close-request` against a runner showing three pop-outs
 /// would close the main window instead.
+///
+/// # `{"handoff": "holders"}` — a restart that keeps holder panes alive
+///
+/// Plan `2026-10-21-graceful-runner-restart-detaches-holder-panes-instead-of-killing-them`,
+/// D1. The field asks for [`crate::terminal::CloseMode::Handoff`]: the
+/// teardown DETACHES every holder-backed terminal pane instead of killing it,
+/// so the next runner's boot sweep adopts it alive. An absent or unknown value
+/// is a normal close. The mode reaches `run_teardown` through the one-shot
+/// `AppState::pending_close_mode` slot, staged immediately before
+/// `window.close()` and cleared if that close fails, and taken by the
+/// `CloseRequested` worker. It only makes sense for the main window (`400`
+/// with any other `label`), and a runner with no main window refuses it with
+/// `409` / `HANDOFF_REQUIRES_MAIN_WINDOW` (use force-close, which accepts the
+/// same field).
 pub async fn ui_bridge_page_close_request_handler(
     State(state): State<Arc<ApiState>>,
     body: Option<Json<serde_json::Value>>,
@@ -898,6 +912,10 @@ pub async fn ui_bridge_page_close_request_handler(
         .and_then(|Json(v)| v.get("label"))
         .and_then(|l| l.as_str())
         .map(str::to_string);
+    let close_mode = crate::terminal::CloseMode::from_request_body(body.as_ref().map(|Json(v)| v));
+    if let Some(refusal) = handoff_label_refusal(close_mode, requested.as_deref(), main_label) {
+        return Err((StatusCode::BAD_REQUEST, Json(api_error(refusal))));
+    }
 
     // Route only labels that actually name something other than the main
     // window; `{"label": "main"}` is the documented no-op spelling of the
@@ -942,6 +960,28 @@ pub async fn ui_bridge_page_close_request_handler(
     info!("UI Bridge API: Close request (simulating X-button click)");
 
     let Some(window) = state.app_handle.get_webview_window(main_label) else {
+        // A handoff on a runner with no main window is refused with its OWN
+        // code: nothing here could carry the mode to a teardown (no window,
+        // no `CloseRequested`), and a generic 500 would read as a transient
+        // fault worth retrying.
+        if close_mode == crate::terminal::CloseMode::Handoff {
+            let detail = UiBridgeError {
+                code: UiBridgeErrorCode::WindowNotFound,
+                message: "A handoff close needs the main window: this runner has none \
+                          (headless), so no CloseRequested teardown can carry the handoff"
+                    .to_string(),
+                recovery: None,
+                context: Some(serde_json::json!({
+                    "code": "HANDOFF_REQUIRES_MAIN_WINDOW",
+                    "alternative": "POST /ui-bridge/control/page/force-close with \
+                                    {\"handoff\":\"holders\"} and the X-Qontinui-Force-Close header",
+                })),
+            };
+            return Err((
+                StatusCode::CONFLICT,
+                Json(api_error_detailed(detail.message.clone(), detail)),
+            ));
+        }
         // Checked BEFORE the liveness gate on purpose: with no main window
         // there is nothing to close and nothing to probe, and this route has
         // always answered 500 for it. A headless/server-mode runner must keep
@@ -964,16 +1004,49 @@ pub async fn ui_bridge_page_close_request_handler(
         ));
     }
 
+    // Staged immediately before the close and committed only once it was
+    // requested: a failed close drops the guard, which clears the slot, so a
+    // refused close leaves no mode behind for a later X click.
+    let armed = state.app_state.pending_close_mode.arm(close_mode);
     window.close().map_err(|e| {
         let msg = format!("Failed to close main window: {}", e);
         error!("{}", msg);
         (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(msg)))
     })?;
+    armed.commit();
+    info!(?close_mode, "Close requested with close mode");
     Ok(Json(ApiResponse::success(serde_json::json!({
         "success": true,
         "label": main_label,
+        "closeMode": close_mode_wire(close_mode),
         "message": "Close requested; Tauri WindowEvent::CloseRequested handler should now fire"
     }))))
+}
+
+/// The wire spelling of a [`crate::terminal::CloseMode`] in a close door's reply.
+fn close_mode_wire(mode: crate::terminal::CloseMode) -> &'static str {
+    match mode {
+        crate::terminal::CloseMode::Kill => "kill",
+        crate::terminal::CloseMode::Handoff => "handoff",
+    }
+}
+
+/// Why a close request must be refused for asking a handoff of the wrong
+/// window: a handoff is a RESTART of the runner, so only the main window's
+/// close carries it. `None` when the request is fine. Pure, so the rule is
+/// tested without an HTTP stack.
+fn handoff_label_refusal(
+    mode: crate::terminal::CloseMode,
+    requested_label: Option<&str>,
+    main_label: &str,
+) -> Option<String> {
+    match (mode, requested_label) {
+        (crate::terminal::CloseMode::Handoff, Some(label)) if label != main_label => Some(format!(
+            "\"handoff\" applies to the main window's close (a runner restart); it cannot be \
+             combined with label {label:?}"
+        )),
+        _ => None,
+    }
 }
 
 /// Request body for `POST /ui-bridge/control/page/force-close`.
@@ -992,6 +1065,21 @@ pub struct ForceCloseRequest {
     /// callers should set it.
     #[serde(default)]
     pub reason: Option<String>,
+    /// `"holders"` asks for a handoff teardown, as on `close-request` (plan
+    /// `2026-10-21-graceful-runner-restart-detaches-holder-panes-instead-of-killing-them`,
+    /// D1); anything else, or absent, is a normal close.
+    #[serde(default)]
+    pub handoff: Option<String>,
+}
+
+impl ForceCloseRequest {
+    /// The [`crate::terminal::CloseMode`] this request asks for.
+    pub fn close_mode(&self) -> crate::terminal::CloseMode {
+        match self.handoff.as_deref() {
+            Some("holders") => crate::terminal::CloseMode::Handoff,
+            _ => crate::terminal::CloseMode::Kill,
+        }
+    }
 }
 
 /// Mandatory header on `POST /ui-bridge/control/page/force-close`.
@@ -1114,6 +1202,7 @@ pub async fn ui_bridge_page_force_close_handler(
     }
 
     let request = parse_force_close_body(&body);
+    let close_mode = request.close_mode();
     let reason = request
         .reason
         .unwrap_or_else(|| "operator force-close via /ui-bridge/control/page/force-close".into());
@@ -1128,12 +1217,14 @@ pub async fn ui_bridge_page_force_close_handler(
         state.app_handle.clone(),
         state.app_state.clone(),
         reason.clone(),
+        close_mode,
     );
 
     Ok(Json(ApiResponse::success(serde_json::json!({
         "success": true,
         "accepted": accepted,
         "reason": reason,
+        "closeMode": close_mode_wire(close_mode),
         "eventLoop": match verdict {
             EventLoopVerdict::Pumping => "pumping",
             EventLoopVerdict::Wedged(_) => "wedged",
@@ -4322,5 +4413,36 @@ mod set_tab_readback_tests {
             parse_set_tab_readback(r#"{"pageIdChain":"x"}"#),
             SetTabReadback::default()
         );
+    }
+}
+
+#[cfg(test)]
+mod handoff_close_tests {
+    //! D1 of plan
+    //! `2026-10-21-graceful-runner-restart-detaches-holder-panes-instead-of-killing-them`.
+    use super::{close_mode_wire, handoff_label_refusal, parse_force_close_body};
+    use crate::terminal::CloseMode;
+
+    #[test]
+    fn a_handoff_naming_a_pop_out_window_is_refused() {
+        assert!(handoff_label_refusal(CloseMode::Handoff, Some("term-1"), "main").is_some());
+        assert!(handoff_label_refusal(CloseMode::Handoff, Some("main"), "main").is_none());
+        assert!(handoff_label_refusal(CloseMode::Handoff, None, "main").is_none());
+        assert!(handoff_label_refusal(CloseMode::Kill, Some("term-1"), "main").is_none());
+    }
+
+    #[test]
+    fn force_close_accepts_the_same_handoff_field() {
+        assert_eq!(
+            parse_force_close_body(r#"{"handoff":"holders","reason":"restart"}"#).close_mode(),
+            CloseMode::Handoff
+        );
+        assert_eq!(
+            parse_force_close_body(r#"{"handoff":"x"}"#).close_mode(),
+            CloseMode::Kill
+        );
+        assert_eq!(parse_force_close_body("").close_mode(), CloseMode::Kill);
+        assert_eq!(close_mode_wire(CloseMode::Handoff), "handoff");
+        assert_eq!(close_mode_wire(CloseMode::Kill), "kill");
     }
 }
