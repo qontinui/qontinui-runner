@@ -248,6 +248,8 @@ export interface OtherPageFixture {
   layoutId: string;
   tabCount: number;
   workMode?: "grid" | "tmux";
+  /** Who chose the layout; absent is a page that predates the field. */
+  layoutOrigin?: "auto" | "operator";
 }
 
 let cached: Promise<RealRegistryHarness> | null = null;
@@ -728,6 +730,7 @@ async function build(): Promise<RealRegistryHarness> {
           zoneLayout: {
             layoutId: page.layoutId,
             workMode: page.workMode ?? "grid",
+            layoutOrigin: page.layoutOrigin,
             setLayoutId: rec(`page.${id}.setLayoutId`, undefined),
           },
         });
