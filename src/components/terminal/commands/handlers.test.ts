@@ -470,6 +470,22 @@ describe("handlers — the no-ops that used to render as effects", () => {
       expect(reportOf(o.value).affected).toBe(1);
     });
 
+    it("names and counts an operator request taking back an auto page's own layout", async () => {
+      h.setOtherPages({ "page-2": { layoutId: "quad", tabCount: 3, layoutOrigin: "auto" } });
+      const o = await layout("/layout quad --page page-2");
+      expect(reportOf(o.value).detail).toBe(
+        "already quad; re-applied; origin operator (no longer auto-trims)",
+      );
+      expect(reportOf(o.value).affected).toBe(1);
+    });
+
+    it("keeps an already-auto page's verdict at zero when an auto request re-asserts it", async () => {
+      h.setOtherPages({ "page-2": { layoutId: "quad", tabCount: 3, layoutOrigin: "auto" } });
+      const o = await layout("/layout quad --page page-2 --origin auto");
+      expect(reportOf(o.value).detail).toBe("already quad; re-applied; runner-owned (auto-trims)");
+      expect(reportOf(o.value).affected).toBe(0);
+    });
+
     it("accepts the origin in any case and with surrounding space", async () => {
       h.reset();
       const result = await h

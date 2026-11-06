@@ -1151,20 +1151,28 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
           : wasAlready
             ? `already ${normalized}; re-applied`
             : normalized;
-      // An `auto` request that takes the page hands it to the runner, which
-      // trims it when tabs close; said, because it changes what the page does
-      // next. One that re-asserts the page's own layout takes nothing, and
-      // saying "runner-owned" there would be a success that did not happen.
-      const ownedDetail =
-        source !== "auto"
-          ? layoutDetail
-          : originAfter === "auto"
-            ? `${layoutDetail}; runner-owned (auto-trims)`
-            : `${layoutDetail}; origin kept (${originAfter}) — an auto request does not take a layout it leaves unchanged`;
+      // Whether the runner may trim the page is a change of its own, in either
+      // direction: an `auto` request that takes the page hands it to the
+      // runner, and an operator request re-asserting an `auto` page's own
+      // layout takes it back (it never trims again). Both are named, and both
+      // count, even when the grid kept its preset. An `auto` request that
+      // re-asserts a page's own layout takes nothing, and saying
+      // "runner-owned" there would be a success that did not happen. A
+      // `legacy` page already reads as `operator` to the trim, so an operator
+      // request over one changes nothing worth naming.
+      const trimmableBefore = originBefore === "auto";
+      const trimmableAfter = originAfter === "auto";
+      const ownership =
+        source === "auto"
+          ? trimmableAfter
+            ? "; runner-owned (auto-trims)"
+            : `; origin kept (${originAfter}) — an auto request does not take a layout it leaves unchanged`
+          : trimmableBefore
+            ? "; origin operator (no longer auto-trims)"
+            : "";
+      const ownedDetail = `${layoutDetail}${ownership}`;
       const detail = leftTmux ? `left tmux mode — ${ownedDetail}` : ownedDetail;
-      // A hand-over is a change of its own, even when the grid kept its preset
-      // (an auto request auto-grow re-grew to the layout the page already had).
-      const handedOver = source === "auto" && originAfter !== originBefore;
+      const handedOver = trimmableBefore !== trimmableAfter;
       return ok(effect("changed", "layout", wasAlready && !handedOver ? 0 : 1, { detail }));
     },
   });
