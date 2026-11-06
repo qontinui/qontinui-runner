@@ -28,6 +28,11 @@ vi.mock("./commands", async (orig) => ({
   ...(await orig<object>()),
   callRegistry,
 }));
+const { autoTrim } = vi.hoisted(() => ({ autoTrim: { enabled: true } }));
+vi.mock("./zoneAutoTrim", async (orig) => ({
+  ...(await orig<object>()),
+  readAutoTrimEnabled: () => autoTrim.enabled,
+}));
 vi.mock("./contexts", () => ({
   usePageSessionGetter: () => (id: string) => pages.get(id) ?? null,
   useTerminalSession: () => pages.get("page-1"),
@@ -41,6 +46,7 @@ function page(
   zones: number,
   tabCount: number,
   workMode: "grid" | "tmux" = "grid",
+  layoutOrigin?: "auto" | "operator",
 ) {
   return {
     pageId,
@@ -50,6 +56,7 @@ function page(
       layout: { zones: Array.from({ length: zones }, () => ({})) },
       maximizedZone: null,
       workMode,
+      layoutOrigin,
     },
   };
 }
@@ -68,9 +75,11 @@ const read = (params: unknown) => action("get-page-layout").handler(params);
 beforeEach(() => {
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
   callRegistry.mockClear();
+  autoTrim.enabled = true;
   pages.clear();
   pages.set("page-1", page("page-1", "quad", 4, 2));
-  pages.set("page-2", page("page-2", "six-pack", 6, 5));
+  pages.set("page-2", page("page-2", "six-pack", 6, 5, "grid", "auto"));
+  pages.set("page-op", page("page-op", "quad", 4, 2, "grid", "operator"));
   pages.set("page-tmux", page("page-tmux", "single", 1, 4, "tmux"));
   container = document.createElement("div");
   document.body.appendChild(container);
@@ -99,6 +108,7 @@ describe("select-layout", () => {
       pageId: "page-2",
       tabCount: 5,
       leftTmux: false,
+      origin: "operator",
     });
     expect(callRegistry).toHaveBeenCalledWith("terminal.layout", {
       preset: "2",
@@ -131,6 +141,34 @@ describe("select-layout", () => {
     });
   });
 
+  it("forwards origin auto to the registry and reports it", async () => {
+    await expect(
+      select({ layoutId: "split", pageId: "page-2", origin: "auto" }),
+    ).resolves.toMatchObject({ origin: "auto" });
+    expect(callRegistry).toHaveBeenCalledWith("terminal.layout", {
+      preset: "split",
+      page: "page-2",
+      origin: "auto",
+    });
+  });
+
+  it("sends no origin for an explicit operator request", async () => {
+    await expect(select({ layoutId: "quad", origin: "Operator" })).resolves.toMatchObject({
+      origin: "operator",
+    });
+    expect(callRegistry).toHaveBeenCalledWith("terminal.layout", { preset: "quad" });
+  });
+
+  it.each([["restore"], [""], [{}], [7]])(
+    "refuses an origin %j that names neither, before reaching the registry",
+    async (origin) => {
+      // The schema guard refuses a non-text value synchronously; the handler
+      // refuses a text one that names neither. Both must stop before the set.
+      await expect(async () => select({ layoutId: "quad", origin })).rejects.toThrow(/origin/);
+      expect(callRegistry).not.toHaveBeenCalled();
+    },
+  );
+
   it("passes the registry's refusal of an unknown page through", async () => {
     callRegistry.mockRejectedValueOnce(new Error("no terminal page with id nope"));
     await expect(select({ layoutId: "quad", pageId: "nope" })).rejects.toThrow(/nope/);
@@ -151,7 +189,22 @@ describe("get-page-layout", () => {
       tabCount: 5,
       maximizedZone: null,
       workMode: "grid",
+      layoutOrigin: "auto",
+      autoTrim: true,
     });
+  });
+
+  it("reports an operator page's origin", () => {
+    expect(read({ pageId: "page-op" })).toMatchObject({ layoutOrigin: "operator" });
+  });
+
+  it('reports a page with no stored origin as "legacy", not operator', () => {
+    expect(read({ pageId: "page-1" })).toMatchObject({ layoutOrigin: "legacy" });
+  });
+
+  it("reports the auto-trim preference as this instance holds it", () => {
+    autoTrim.enabled = false;
+    expect(read({ pageId: "page-2" })).toMatchObject({ autoTrim: false });
   });
 
   it("names the page on screen when given no pageId", () => {

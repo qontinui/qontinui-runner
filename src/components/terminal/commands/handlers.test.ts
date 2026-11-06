@@ -420,6 +420,53 @@ describe("handlers — the no-ops that used to render as effects", () => {
   });
 
   /**
+   * `--origin` decides the layout's origin (`zoneAutoTrim.ts`): absent is an
+   * operator choice auto-trim never undoes; `auto` hands the page to the
+   * runner. `/triage-sessions` sends `auto` when it trims a `legacy` page, so a
+   * dropped or mis-mapped origin either strands that page untrimmable or lets
+   * the runner shrink a grid the operator picked.
+   */
+  describe("`/layout --origin`", () => {
+    afterEach(() => h.setOtherPages());
+
+    const layout = async (input: string) => {
+      h.reset();
+      return run(input, (id) => h.byId(id));
+    };
+
+    it("maps auto to source auto and says the page is now the runner's", async () => {
+      h.setOtherPages({ "page-2": { layoutId: "six-pack", tabCount: 2 } });
+      const o = await layout("/layout split --page page-2 --origin auto");
+      expect(o.verdict).toBe("ok");
+      expect(h.calls.map((c) => [c.name, c.args])).toEqual([
+        ["page.page-2.setLayoutId", ["split", { source: "auto" }]],
+      ]);
+      expect(reportOf(o.value).detail).toBe("split; runner-owned (auto-trims)");
+    });
+
+    it("accepts an explicit operator origin", async () => {
+      const o = await layout("/layout quad --origin operator");
+      expect(o.verdict).toBe("ok");
+      expect(h.calls.map((c) => [c.name, c.args])).toEqual([
+        ["zone.setLayoutId", ["quad", { source: "operator" }]],
+      ]);
+    });
+
+    it("refuses an origin that names neither, and sets nothing", async () => {
+      const o = await layout("/layout quad --origin restore");
+      expect(o.verdict).toBe("error:invalid-origin");
+      expect(h.calls).toEqual([]);
+    });
+
+    it("refuses an auto request on a tmux page instead of reporting a move that cannot happen", async () => {
+      h.setOtherPages({ "page-2": { layoutId: "single", tabCount: 2, workMode: "tmux" } });
+      const o = await layout("/layout split --page page-2 --origin auto");
+      expect(o.verdict).toBe("error:tmux-mode");
+      expect(h.calls).toEqual([]);
+    });
+  });
+
+  /**
    * The typed form accepts what `/layout` accepts. `layout 3` already resolves
    * to `triptych`, so a `layout triptych` that fell through to the fuzzy tier
    * would be the command refusing its own answer. Walks `LAYOUT_IDS`, so a new
