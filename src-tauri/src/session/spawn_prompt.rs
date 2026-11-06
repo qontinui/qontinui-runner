@@ -2993,20 +2993,39 @@ mod script_tests {
     /// (`resources/shell-integration-marks-test.sh`): with a user
     /// `PROMPT_COMMAND` in every form, each typed command line gets its 633;C
     /// before its output and a 633;A after it, and the prompt announces
-    /// `633;P;CommandMarks=1`. The script SKIPs (exit 0) where util-linux
-    /// `script(1)` is missing or bash predates PS0.
+    /// `633;P;CommandMarks=1` — except where it cannot keep that promise (a
+    /// readonly PS0, stderr that is not the terminal), where it must not. The
+    /// script SKIPs (exit 0) where util-linux `script(1)` is missing or bash
+    /// predates PS0.
     #[test]
     fn bash_integration_marks_every_typed_command() {
+        const MARKS_TEST: &str = include_str!("../../resources/shell-integration-marks-test.sh");
+        // Each case is one interactive bash behind `script(1)`, bounded inside
+        // the script by `timeout -k 2 20` (20 s, then 2 s to the kill). The
+        // budget is sized from that bound and the script's own case count, so
+        // adding a case cannot outgrow it; this outer bound only catches a
+        // hang the per-case bound somehow missed.
+        const CASE_BOUND: &str = "timeout -k 2 20 script";
+        const CASE_WORST_SECS: u64 = 22;
+        assert!(
+            MARKS_TEST.contains(CASE_BOUND),
+            "the marks test bounds each case with `{CASE_BOUND}`; resize the budget with it"
+        );
+        let cases = MARKS_TEST
+            .lines()
+            .filter(|l| l.starts_with("run_case "))
+            .count();
+        assert!(cases > 0, "the marks test runs its cases with `run_case`");
+        let cases = u64::try_from(cases).expect("a handful of cases fits in u64");
+        let budget = Duration::from_secs(cases * CASE_WORST_SECS + 30);
+
         let _serial = exe_guard();
         let test = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("resources")
             .join("shell-integration-marks-test.sh");
         let mut cmd = Command::new("bash");
         cmd.arg(&test);
-        // Five interactive bash sessions behind `script(1)`, each bounded at
-        // 20 s inside the script; this outer bound only catches a hang.
-        let out = output_with_timeout(cmd, Duration::from_secs(150))
-            .expect("the marks test runs inside its budget");
+        let out = output_with_timeout(cmd, budget).expect("the marks test runs inside its budget");
         assert!(
             out.status.success(),
             "shell-integration-marks-test.sh failed:\n{}{}",
@@ -3061,7 +3080,8 @@ mod command_marks_scan_tests {
 
     /// bash announces the capability only on the PS0 path (bash >= 4.4), the
     /// one that marks every typed command line and never a PROMPT_COMMAND
-    /// entry, and only at a prompt where PS0 provably carries that C.
+    /// entry, and only at a prompt where PS0 provably carries that C to the
+    /// terminal.
     #[test]
     fn bash_announces_the_capability_only_where_ps0_emits_the_command_start() {
         let token = webview_token();
@@ -3073,10 +3093,11 @@ mod command_marks_scan_tests {
             1,
             "bash may announce the capability from exactly one place"
         );
-        // That one place sends it only while PS0 carries our C, after
-        // re-prefixing a PS0 something reassigned, on the PS0 path only.
+        // That one place sends it only while PS0 carries our C (after
+        // re-prefixing a PS0 something reassigned) and stderr, where bash
+        // writes PS0, is a terminal — on the PS0 path only.
         let gated = format!(
-            "    if [ \"${{__qontinui_ps0_path}}\" = \"1\" ]; then\n        case \"${{PS0-}}\" in\n            *'\\e]633;C\\a'*) ;;\n            *) __qontinui_is_readonly PS0 || PS0='\\e]633;C\\a'\"${{PS0-}}\" ;;\n        esac\n        case \"${{PS0-}}\" in\n            *'\\e]633;C\\a'*) {emit} ;;\n        esac\n    fi"
+            "    if [ \"${{__qontinui_ps0_path}}\" = \"1\" ]; then\n        case \"${{PS0-}}\" in\n            *'\\e]633;C\\a'*) ;;\n            *) __qontinui_is_readonly PS0 || PS0='\\e]633;C\\a'\"${{PS0-}}\" ;;\n        esac\n        case \"${{PS0-}}\" in\n            *'\\e]633;C\\a'*) if [ -t 2 ]; then {emit}; fi ;;\n        esac\n    fi"
         );
         assert!(
             BASH.contains(&gated),
@@ -3096,11 +3117,15 @@ mod command_marks_scan_tests {
     /// PowerShell emits 633;C only from its PSReadLine hook, so the flag that
     /// lets its prompt announce the capability is set TRUE only inside that
     /// block — initialized false at top level, before the Prompt function reads
-    /// it (StrictMode) — and never announced at a nested prompt.
+    /// it (StrictMode) — and never announced at a nested prompt, nor once
+    /// something replaced our `PSConsoleHostReadLine` (the identity saved right
+    /// after defining it, checked at every prompt).
     #[test]
     fn powershell_arms_the_capability_only_inside_the_psreadline_block() {
         const ARM: &str = "$global:__qontinui_command_marks = $true";
         const INIT: &str = "$global:__qontinui_command_marks = $false";
+        const SB_INIT: &str = "$global:__qontinui_readline_sb = $null";
+        const SB_SAVE: &str = "$global:__qontinui_readline_sb = $function:PSConsoleHostReadLine";
         let arms: Vec<usize> = PS1.match_indices(ARM).map(|(i, _)| i).collect();
         assert_eq!(arms.len(), 1, "exactly one place may arm the capability");
         let block = PS1
@@ -3123,9 +3148,61 @@ mod command_marks_scan_tests {
             init < prompt,
             "the flag must be initialized before the Prompt function reads it"
         );
+        let sb_init = PS1
+            .find(SB_INIT)
+            .expect("the saved readline identity is initialized");
         assert!(
-            PS1.contains("if ($global:__qontinui_command_marks -and $NestedPromptLevel -eq 0) {"),
-            "a nested prompt must not announce the capability"
+            sb_init < prompt,
+            "the saved readline identity must be initialized before the Prompt function reads it"
+        );
+        // Saved once, inside the PSReadLine block, AFTER our function is
+        // defined there — so it is our scriptblock, not PSReadLine's.
+        let saves: Vec<usize> = PS1.match_indices(SB_SAVE).map(|(i, _)| i).collect();
+        assert_eq!(
+            saves.len(),
+            1,
+            "exactly one place may save the readline identity"
+        );
+        let ours = PS1
+            .find("    function global:PSConsoleHostReadLine {")
+            .expect("our PSConsoleHostReadLine is defined");
+        assert!(
+            ours > block && saves[0] > ours && saves[0] < block_end,
+            "the readline identity must be saved inside the PSReadLine block, after our function"
+        );
+        assert!(
+            PS1.contains(
+                "    if ($global:__qontinui_command_marks -and $NestedPromptLevel -eq 0 -and\n        $null -ne $global:__qontinui_readline_sb -and\n        [object]::ReferenceEquals($function:PSConsoleHostReadLine, $global:__qontinui_readline_sb)) {\n        $result += \"${__q_esc}]633;P;CommandMarks=1${__q_bel}\""
+            ),
+            "the capability is announced only at a top-level prompt while PSConsoleHostReadLine is still ours"
+        );
+    }
+
+    /// zsh announces only while our preexec is registered and no user
+    /// `preexec` FUNCTION runs ahead of it, judged under `emulate -L zsh`; our
+    /// preexec is put first without dropping the user's hooks under their
+    /// array options (KSH_ARRAYS).
+    #[test]
+    fn zsh_announces_only_while_our_preexec_runs_first() {
+        let token = webview_token();
+        let emit = format!("__qontinui_osc633 \"{token}\"");
+        assert_eq!(
+            ZSH.matches(emit.as_str()).count(),
+            1,
+            "zsh may announce the capability from exactly one place"
+        );
+        let gated = format!(
+            "    emulate -L zsh\n    if (( ${{+preexec_functions}} )) && (( ${{preexec_functions[(Ie)__qontinui_preexec]}} )) &&\n        (( ! ${{+functions[preexec]}} )); then\n        {emit}\n    fi"
+        );
+        assert!(
+            ZSH.contains(&gated),
+            "the zsh announcement must be gated on our preexec running first"
+        );
+        assert!(
+            ZSH.contains(
+                "() {\n    emulate -L zsh\n    typeset -ga preexec_functions\n    preexec_functions=(__qontinui_preexec \"${(@)preexec_functions:#__qontinui_preexec}\")\n}"
+            ),
+            "our preexec goes first, keeping every user hook, under emulate -L zsh"
         );
     }
 }

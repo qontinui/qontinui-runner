@@ -34,8 +34,10 @@ __qontinui_precmd() {
 }
 
 # preexec: fires once per typed command line, before it runs, and never for a
-# hook. Emit E;<cmd> and C. Registered FIRST, so our C precedes any user
-# preexec hook that blocks or runs long before the command starts.
+# hook. Emit E;<cmd> and C. Registered FIRST in preexec_functions, so our C
+# precedes every hook in that array. A user `preexec` FUNCTION is not in it:
+# zsh runs that function before the array, so our C would wait for it — which
+# is why a prompt does not announce the capability while one is defined.
 __qontinui_preexec() {
     local cmd="$1"
     local escaped="${cmd//;/\\x3b}"
@@ -48,19 +50,29 @@ __qontinui_preexec() {
 # own precmd (or a hook added after this one) cannot drop A — and no hook can
 # emit a C after it. The capability tells the runner this prompt's A means
 # "nothing is running"; it is sent only while our preexec is still registered
-# (the C path is present at THIS prompt), and otherwise the pane is kept. The
+# and no user `preexec` function runs ahead of it (the C path is present, and
+# first, at THIS prompt); otherwise the pane is kept. `emulate -L zsh`: the
+# user's options (KSH_ARRAYS shifts every subscript) stay out of the check. The
 # literal is pinned against the webview's COMMAND_MARKS_CAPABILITY by a source
 # scan in src-tauri/src/session/spawn_prompt.rs.
 __qontinui_precmd_prompt_start() {
-    if (( ${+preexec_functions} )) && (( ${preexec_functions[(I)__qontinui_preexec]} )); then
+    emulate -L zsh
+    if (( ${+preexec_functions} )) && (( ${preexec_functions[(Ie)__qontinui_preexec]} )) &&
+        (( ! ${+functions[preexec]} )); then
         __qontinui_osc633 "P;CommandMarks=1"
     fi
     __qontinui_osc633 "A"
 }
 
 add-zsh-hook precmd __qontinui_precmd
-typeset -ga preexec_functions
-preexec_functions=(__qontinui_preexec ${preexec_functions:#__qontinui_preexec})
+# Ours first in preexec_functions, once, the user's hooks after it in their
+# order. Under `emulate -L zsh`, so a user's KSH_ARRAYS cannot make the
+# expansion keep only one element.
+() {
+    emulate -L zsh
+    typeset -ga preexec_functions
+    preexec_functions=(__qontinui_preexec "${(@)preexec_functions:#__qontinui_preexec}")
+}
 add-zsh-hook precmd __qontinui_precmd_prompt_start
 
 # B (command ready) at the end of PROMPT. %{...%} marks it zero-width so zsh
@@ -81,7 +93,7 @@ PROMPT="${PROMPT-}%{$(printf '\033]633;B\007')%}"
 # exists, it is passed via --append-system-prompt-file INSTEAD of the inline
 # flag; Claude Code refuses both together, and a missing file is a fatal start,
 # hence the existence check.
-if [ "${QONTINUI_RUNNER_TERMINAL}" = "1" ]; then
+if [ "${QONTINUI_RUNNER_TERMINAL-}" = "1" ]; then
     claude() {
         case "${1:-}" in
             mcp|config|update|doctor|api-key)
