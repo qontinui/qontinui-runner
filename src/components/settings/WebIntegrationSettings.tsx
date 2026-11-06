@@ -856,6 +856,7 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
         userId: string;
         tenantId: string;
         deviceId: string;
+        dmkStored: boolean;
       }>("redeem_pair_code", {
         code: trimmed,
         backendUrl: formUrl || undefined,
@@ -866,6 +867,16 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
         message: `Paired (device ${result.deviceId.slice(0, 8)}…).`,
       });
       onLog("info", `Paired via one-time code (user=${result.userId})`);
+      // No stored device machine key means this box cannot recover a device
+      // JWT on its own after an outage longer than the token's life — it
+      // would need a fresh pair code or a sign-in. Say so rather than leave
+      // it silent.
+      if (!result.dmkStored) {
+        onLog(
+          "warning",
+          "No device machine key was stored with this pairing — after an outage longer than the device token's life, this runner will need a new pair code or a sign-in to reconnect.",
+        );
+      }
 
       // A successful pair-code redeem persists a device JWT but, like Save,
       // leaves the runner in Tier Local — so the WS relay stays idle. Promote

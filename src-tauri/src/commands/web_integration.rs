@@ -792,6 +792,12 @@ pub struct RedeemPairCodeResponse {
     pub user_id: String,
     pub tenant_id: String,
     pub device_id: String,
+    /// `true` only when secure storage holds the device machine key (`dmk_`)
+    /// the redeem returned, confirmed by read-back
+    /// (`pair::PairingPersisted::dmk_stored`). `false` when the web backend
+    /// returned none or the store failed. The same value the CLI door
+    /// (`qontinui_profile device pair --pair-code`) prints as `dmk_stored=`.
+    pub dmk_stored: bool,
 }
 
 /// Redeem a 6-char single-use pair code against the active profile's web
@@ -887,7 +893,7 @@ pub async fn redeem_pair_code(
 
     // Blocking file + lock I/O (it may wait on a heartbeat reconcile): off the runtime.
     let resp_for_persist = resp.clone();
-    spawn_blocking_tracked(move || persist_pairing(&resp_for_persist, tenant_id))
+    let persisted = spawn_blocking_tracked(move || persist_pairing(&resp_for_persist, tenant_id))
         .await
         .map_err(|e| format!("persist pairing task panicked: {e}"))?
         .map_err(|e| format!("persist pairing: {}", e))?;
@@ -989,14 +995,15 @@ pub async fn redeem_pair_code(
     let response_device_id = resp.device_id.clone().unwrap_or_else(|| device_id.clone());
 
     info!(
-        "redeem_pair_code: device paired (user_id={}, tenant_id={}, device_id={})",
-        resp.user_id, tenant_id_str, response_device_id
+        "redeem_pair_code: device paired (user_id={}, tenant_id={}, device_id={}, dmk_stored={})",
+        resp.user_id, tenant_id_str, response_device_id, persisted.dmk_stored
     );
 
     Ok(RedeemPairCodeResponse {
         user_id: resp.user_id,
         tenant_id: tenant_id_str.to_string(),
         device_id: response_device_id,
+        dmk_stored: persisted.dmk_stored,
     })
 }
 
@@ -1039,7 +1046,10 @@ mod ipc_wire_contract_tests {
     // The probe's own constants/types. This module deliberately does NOT
     // `use super::*` — it mirrors the Tauri wire shapes rather than exercising
     // the module — so the few real items the probe tests touch are named.
-    use super::{is_bound_backend, IdentityFault, TestConnectionResponse, RUNNER_TOKEN_PREFIX};
+    use super::{
+        is_bound_backend, IdentityFault, RedeemPairCodeResponse, TestConnectionResponse,
+        RUNNER_TOKEN_PREFIX,
+    };
 
     /// Mirror of what Tauri generates for `save_web_integration_settings`
     /// argument extraction. Top-level args are renamed camelCase → snake_case.
@@ -1275,5 +1285,21 @@ mod ipc_wire_contract_tests {
         }
         assert!(health.ends_with("/api/v1/health/live"));
         assert!(me.ends_with("/api/v1/devices/me"));
+    }
+
+    /// `redeem_pair_code`'s result reaches the Settings form and the UI-Bridge
+    /// in-process arm through serde. `WebIntegrationSettings.tsx` reads
+    /// `dmkStored`; a rename here would silently read `undefined` (falsy) there.
+    #[test]
+    fn redeem_pair_code_response_serializes_dmk_stored_camel_case() {
+        let v = serde_json::to_value(RedeemPairCodeResponse {
+            user_id: "u".into(),
+            tenant_id: "t".into(),
+            device_id: "d".into(),
+            dmk_stored: true,
+        })
+        .unwrap();
+        assert_eq!(v["dmkStored"], serde_json::json!(true));
+        assert_eq!(v["deviceId"], serde_json::json!("d"));
     }
 }
