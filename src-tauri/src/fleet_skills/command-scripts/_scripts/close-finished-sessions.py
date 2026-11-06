@@ -34,6 +34,8 @@ import unicodedata
 import urllib.error
 import urllib.request
 
+# The helper runs from a provisioned skill directory, which must not collect a __pycache__.
+sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib"))
 from envelope import EnvelopeUnknown, load  # noqa: E402
 
@@ -868,7 +870,7 @@ def selftest():
     if two["t"]["claudeSessionId"] != "new":
         bad.append("a terminal with two open rows must resolve to the newest openedAt")
     finish_cases = finish_time_cases(bad)
-    stray_cases = stray_selftest(bad, empty) + end_strays_selftest(bad)
+    stray_cases = stray_selftest(bad, empty) + end_strays_selftest(bad) + zombie_live_selftest(bad)
     for line in bad:
         print("SELFTEST FAIL: " + line)
     print(f"selftest: {len(PHRASE_CASES)} phrase cases, {len(WIND_DOWN_CASES)} wind-down reason cases, "
@@ -1064,6 +1066,58 @@ def _tool_argv(cmd, acct="sales", cwd_file="/tmp/claude-1a2b-cwd"):
             + f"' < /dev/null && pwd -P >| {cwd_file}"]
 
 
+def zombie_live_selftest(bad):
+    """ProcFacts.zombie() on real /proc (Linux only; skipped elsewhere): an unreaped child
+    reads zombie; a child whose MAIN thread exited while a worker still runs reads state Z
+    with an empty cmdline too, and must NOT, because it is live work. Returns cases run."""
+    if WINDOWS or not os.path.isdir("/proc/self"):
+        return 0
+    import ctypes
+    import threading
+    kids = []
+    try:
+        dead = os.fork()
+        if dead == 0:
+            os._exit(0)
+        kids.append(dead)
+        r, w = os.pipe()
+        busy = os.fork()
+        if busy == 0:  # the main thread exits; the worker lives until the parent closes the pipe
+            os.close(w)
+            threading.Thread(target=lambda: (os.read(r, 1), os._exit(0))).start()
+            ctypes.CDLL(None).pthread_exit(None)
+            os._exit(1)  # pthread_exit does not return
+        os.close(r)
+        kids.append(busy)
+        deadline, got = time.time() + 5, None
+        while time.time() < deadline:
+            time.sleep(0.1)
+            t = proc_table() or {}
+            try:
+                st = open(f"/proc/{busy}/stat").read().rsplit(")", 1)[1].split()[0]
+            except (OSError, IndexError):
+                st = None
+            if t.get(dead, (0, ["x"]))[1] == [] and st == "Z" and t.get(busy, (0, ["x"]))[1] == []:
+                f = ProcFacts(t)
+                got = (f.zombie(dead), f.zombie(busy))
+                break
+        if got is None:
+            return 0  # this kernel never showed both shapes inside the window: nothing to judge
+        if got != (True, False):
+            bad.append(f"zombie(): unreaped child / main-thread-exited live child = {got}, want (True, False)")
+        return 2
+    finally:
+        try:
+            os.close(w)
+        except (OSError, UnboundLocalError):
+            pass
+        for k in kids:
+            try:
+                os.waitpid(k, 0)
+            except OSError:
+                pass
+
+
 def end_strays_selftest(bad):
     """close_one's signalling half, end_strays(), on wait loops this test starts
     itself (Linux only; skipped elsewhere). It signals nothing but its own children
@@ -1243,6 +1297,17 @@ def stray_selftest(bad, empty_prompt=EMPTY_PROMPT_SCREEN):
                 stray_verdict({7: (1, ["bash.exe", UNREADABLE_CMDLINE])}, 7, ProcFacts({}, start={}, uids={}, files={},
                                                                                   self_pids=set()), 15)[0]:
             bad.append("a Windows / unreadable command line must never read as stray")
+        # (7) an empty-argv child that is NOT a zombie (a live process that blanked its argv,
+        # or a threaded one whose main thread exited) is work; a zombie one runs nothing.
+        n += 1
+        zl = "while ps aux | grep cargo >/dev/null; do sleep 5; done"
+        zt = {1: (0, ["/sbin/init"]), 10: (1, ["/usr/bin/claude"]), 30: (1, ["python3", "cfs.py"]),
+              40: (10, _tool_argv(zl)), 41: (40, [])}
+        for zs, want in ((set(), False), ({41}, True)):
+            got = stray_verdict(zt, 40, ProcFacts(zt, start={}, uids={}, files={}, self_pids={30}, now=now,
+                                                  dirs=set(), zombies=zs), 15)
+            if got[0] is not want:
+                bad.append(f"an empty-argv child with zombies={zs}: {got}, want stray={want}")
         # The classifier, case by case: (want_stray, class or None, command, extra, files, start, kids).
         census = "/s/census/cargo.log"
         old, held = (now - 3 * 3600, set(), "Compiling x\n"), (now - 3 * 3600, {950}, "Compiling x\n")
@@ -1321,6 +1386,9 @@ def stray_selftest(bad, empty_prompt=EMPTY_PROMPT_SCREEN):
             (False, None, f'until ! pgrep -fA "{gp}" >/dev/null; do sleep 15; done', None, {}, None, ()),
             (False, None, "until ! pgrep cargo; do sleep 15; done", None, {}, None, ()),  # no -f: names, not argv
             (True, "a", "while ps aux | grep cargo >/dev/null; do sleep 5; done", None, {}, None, ()),
+            # a probe that exited and is not yet reaped (a zombie: empty cmdline) runs nothing
+            (True, "a", "while ps aux | grep cargo >/dev/null; do sleep 5; done", None, {}, None, ((),)),
+            (True, "b-file", twait, None, {task: old}, None, (("sleep", "20"), ())),
             (False, None, "while ps aux | grep cargo | grep -v grep >/dev/null; do sleep 5; done", None, {}, None,
              ()),  # -v grep drops the loop's own line too, so it ends with its target
             (False, None, "while ps -p 4242 | grep -q 4242; do sleep 5; done", None, {}, None, ()),  # ps -p: selective
@@ -2627,8 +2695,9 @@ class ProcFacts:
     (mtime, holder pids, text), and a path missing from it is gone; `dirs` is the
     set of directories that exist (by default, those holding a `files` path)."""
 
-    def __init__(self, table, start=None, uids=None, files=None, self_pids=None, now=None, dirs=None):
+    def __init__(self, table, start=None, uids=None, files=None, self_pids=None, now=None, dirs=None, zombies=None):
         self.table, self._start, self._uids, self._files = table, start, uids, files
+        self._zombies = None if zombies is None else set(zombies)
         self._dirs = set(dirs) if dirs is not None else (
             None if files is None else {f.rsplit("/", 1)[0] for f in files})
         self.now = time.time() if now is None else now
@@ -2638,6 +2707,32 @@ class ProcFacts:
     def start(self, pid):
         """The process's start time in clock ticks (/proc/<pid>/stat field 22), or None."""
         return self._start.get(pid) if self._start is not None else proc_start(pid)
+
+    def zombie(self, pid):
+        """True when `pid` has wholly exited and awaits its reap, or is gone. Linux only.
+        State Z alone is not enough: a process whose MAIN thread called pthread_exit()
+        while other threads still run also reads Z with an empty cmdline, and it is live
+        work. So a zombie must also have exactly one task left. Any read that fails is
+        False (work). A selftest (`start` passed) has no /proc: `zombies` names its
+        zombies there, and without it an empty argv in the table stands for one."""
+        if self._start is not None:
+            return pid in self._zombies if self._zombies is not None else True
+        if WINDOWS:
+            return False
+        try:
+            stat = open(f"/proc/{pid}/stat").read()
+        except FileNotFoundError:
+            return True  # already reaped: it runs nothing
+        except OSError:
+            return False
+        try:
+            if stat.rsplit(")", 1)[1].split()[0] not in ("Z", "X"):
+                return False
+            return len(os.listdir(f"/proc/{pid}/task")) <= 1
+        except FileNotFoundError:
+            return True  # reaped between the two reads
+        except (OSError, IndexError):
+            return False
 
     def isdir(self, path):
         return path in self._dirs if self._dirs is not None else os.path.isdir(path)
@@ -3053,6 +3148,13 @@ def _stray_verdict(table, pid, facts, idle_min):
     allowed = {"sleep"} | {exe_base(w[0]) for _, _, pipe in chain for w, _ in pipe}
     for d in subtree(table, pid):
         dv = table[d][1]
+        if not dv and facts.zombie(d):
+            # A child that has exited and is not yet reaped reads an EMPTY cmdline (the kernel
+            # frees its argv at exit): most often the loop's own probe, caught between its
+            # exit and bash's wait. It runs nothing. Read as work, it made a real stray miss
+            # one screen at random, and flaked the end_strays selftest on slower CI runners.
+            # A LIVE process with an empty cmdline (one that blanked its own argv) is still work.
+            continue
         if d != pid and dv != argv and not (dv and exe_base(dv[0]) in allowed
                                             and not (exe_base(dv[0]) == "tail" and any(
                                                 a.startswith(("-f", "-F", "--follow")) for a in dv[1:]))):
@@ -3176,22 +3278,30 @@ def fmt_age(msv):
     return f"{m:.0f}m" if m < 120 else f"{m / 60:.1f}h" if m < 2880 else f"{m / 1440:.1f}d"
 
 
+# What one JSONL line can raise while it is parsed and its time read: a cut line, a
+# bad time, a non-object line, deep nesting.
+BAD_RECORD = (ValueError, TypeError, KeyError, AttributeError, RecursionError)
+
+
 def newest_record(path):
-    """Timestamp (ms) of the newest user/assistant record in the last 64 KiB of a
-    JSONL file, or None."""
+    """Timestamp (ms) of the newest user/assistant record in a JSONL file, or
+    None. Reads the last 64 KiB, and the whole file only when that window holds
+    no such record: one record can be larger than the window."""
     try:
-        with open(path, "rb") as f:
-            f.seek(max(0, os.path.getsize(path) - 65536))
-            lines = f.read().decode(errors="replace").splitlines()
+        size = os.path.getsize(path)
+        for start in ([size - 65536, 0] if size > 65536 else [0]):
+            with open(path, "rb") as f:
+                f.seek(start)
+                lines = f.read().split(b"\n")  # never splitlines(): a raw U+2028 is legal inside a JSON string
+            for line in reversed(lines):
+                try:
+                    e = json.loads(line.decode(errors="replace"))
+                    if e.get("type") in ("user", "assistant") and e.get("timestamp"):
+                        return ms(e["timestamp"])
+                except BAD_RECORD:
+                    continue  # a line the window cut, a non-object line, an unreadable time
     except OSError:
         return None
-    for line in reversed(lines):
-        try:
-            e = json.loads(line)
-        except ValueError:
-            continue
-        if e.get("type") in ("user", "assistant") and e.get("timestamp"):
-            return ms(e["timestamp"])
     return None
 
 
@@ -3203,13 +3313,15 @@ NEXT_MOVE_PROMPT = re.compile(r"<command-name>/next-move</command-name>|^/next-m
 # classification, which reads files and coord and records an intervention.
 # Every mcp__coord* call is bookkeeping, so only file edits and git/gh writes count,
 # in the session's own transcript or in a subagent's (an `Agent` call itself is
-# not work: /next-move spawns its own fresh-context concurrence subagent).
+# not work: what the subagent then does is what counts). A PR write goes through
+# gh or the runner's own `qontinui-pr create`.
 WORK_TOOLS = ("Edit", "MultiEdit", "Write", "NotebookEdit")
 WORK_BASH = re.compile(r"\bgit(?:\s+(?:-[Cc]\s+\S+|--?[\w-]+(?:=\S+)?))*\s+(?:commit|push|commit-tree)\b"
-                       r"|\bgh\s+pr\s+(?:create|merge|edit|ready)\b")
+                       r"|\bgh\s+pr\s+(?:create|merge|edit|ready)\b"
+                       r"|\bqontinui-pr(?:\.exe)?\s+create\b")
 
 
-# Where /next-move writes its own scratch (the E1 row file, recheck evidence):
+# Where /next-move writes its own scratch (the E1 row file):
 # an edit there is classification, not work.
 SCRATCH_PATH = re.compile(r"(?:^|[\\/])(?:\.qontinui[\\/]scratch|scratchpad|\.agent-scratch)(?:[\\/]|$)"
                           r"|^(?:/tmp|/var/tmp)(?:/|$)|[\\/]AppData[\\/]Local[\\/]Temp(?:[\\/]|$)", re.I)
@@ -3249,6 +3361,23 @@ def nudge_facts(segments):
     return work, streak
 
 
+def nudge_replied(segments):
+    """True when the newest prompt is a /next-move the session really answered:
+    the model itself wrote text after it. A /next-move with no reply, or only
+    Claude Code's own notice (a limit, an expired login, an API error), never ran
+    its turn, so finding no work after it measures nothing."""
+    return bool(segments) and segments[-1]["nudge"] and bool(segments[-1].get("replied"))
+
+
+def model_wrote(e, text):
+    """False for assistant-shaped text Claude Code wrote itself. Those records
+    are flagged, or attributed to the <synthetic> model; LIMIT_RE covers a limit
+    notice from a transcript that predates the flag."""
+    if e.get("isApiErrorMessage") or e["message"].get("model") == "<synthetic>":
+        return False
+    return not LIMIT_RE.search(text[-300:])
+
+
 def subagent_work(path, segments):
     """Add a subagent transcript's work-class tool calls to the segment each
     falls in by time (the newest segment that started at or before it)."""
@@ -3261,7 +3390,7 @@ def subagent_work(path, segments):
             try:
                 e = json.loads(line)
                 at = ms(e["timestamp"]) if e.get("type") == "assistant" and e.get("timestamp") else None
-            except (ValueError, TypeError, KeyError, AttributeError):
+            except BAD_RECORD:
                 continue
             content = (e.get("message") or {}).get("content") if at and isinstance(e.get("message"), dict) else None
             for b in content if isinstance(content, list) else []:
@@ -3329,7 +3458,7 @@ def transcript_facts(row):
     # (turn_open), so a wake that `last_prompt` ignores can still be read.
     f = {"path": path, "last_activity": None, "last_prompt": None, "last_prompt_text": "",
          "last_asst": None, "final_text": "", "final_text_at": None, "pending_tool": False,
-         "task_prompts": 0, "work_tools_since_nudge": 0, "nudge_streak": 0, "cwd": None,
+         "task_prompts": 0, "work_tools_since_nudge": 0, "nudge_streak": 0, "nudge_replied": False, "cwd": None,
          "last_turn_open": None, "last_turn_open_text": ""}
     open_tools = set()
     turn = {"in": False, "before": None}
@@ -3338,14 +3467,15 @@ def transcript_facts(row):
     for line in open(path, encoding="utf-8", errors="replace"):  # never the locale codepage (cp1252 on Windows)
         try:
             e = json.loads(line)
-        except ValueError:
-            continue
-        ts = e.get("timestamp")
-        if not ts or not isinstance(e.get("message"), dict):
-            continue
+            ts = e.get("timestamp")
+            if not ts or not isinstance(e.get("message"), dict):
+                continue
+            at = ms(ts)
+        except BAD_RECORD:
+            continue  # a non-object line, an unreadable time or deep nesting
         content = e["message"].get("content")
         if e.get("type") in ("user", "assistant"):
-            f["last_activity"] = ms(ts)
+            f["last_activity"] = at
         if e.get("type") == "user":
             if e.get("cwd"):
                 f["cwd"] = e["cwd"]
@@ -3355,7 +3485,7 @@ def transcript_facts(row):
                         open_tools.discard(b.get("tool_use_id"))
             text = content if isinstance(content, str) else " ".join(
                 b.get("text", "") for b in content or [] if isinstance(b, dict) and b.get("type") == "text")
-            turn_open(f, turn, e, content, text, ms(ts))
+            turn_open(f, turn, e, content, text, at)
             if e.get("isMeta") or e.get("isCompactSummary"):
                 continue
             if text.lstrip().startswith(LOCAL_OUTPUT):
@@ -3366,34 +3496,42 @@ def transcript_facts(row):
                 before = None
             elif text.strip() and not text.lstrip().startswith(NON_PROMPT):
                 before = (f["last_prompt"], f["last_prompt_text"])
-                f["last_prompt"], f["last_prompt_text"] = ms(ts), text.strip()
+                f["last_prompt"], f["last_prompt_text"] = at, text.strip()
                 f["task_prompts"] += not text.lstrip().startswith(CLEAR)
                 segments.append({"nudge": bool(NEXT_MOVE_PROMPT.search(text.strip())), "work": 0, "final": "",
-                                 "at": ms(ts)})
+                                 "at": at})
         elif e.get("type") == "assistant":
             before = None
             turn["in"], turn["before"] = e["message"].get("stop_reason") == "tool_use", None
-            f["last_asst"] = ms(ts)
+            f["last_asst"] = at
             for b in content if isinstance(content, list) else []:
                 if not isinstance(b, dict):
                     continue
                 if b.get("type") == "text" and b.get("text", "").strip():
-                    f["final_text"], f["final_text_at"] = b["text"], ms(ts)
+                    f["final_text"], f["final_text_at"] = b["text"], at
                     if segments:
                         segments[-1]["final"] = b["text"]
+                        segments[-1]["replied"] = segments[-1].get("replied") or model_wrote(e, b["text"])
                 elif b.get("type") == "tool_use":
                     open_tools.add(b.get("id"))
                     if segments and is_work_tool(b):
                         segments[-1]["work"] += 1
     f["pending_tool"] = bool(open_tools)
+    # The streak walks back over the trailing run of /next-moves, so a subagent
+    # active at any point in that run can end it, not only one active since the newest.
+    run_from = None
+    for s in reversed(segments):
+        if not s["nudge"]:
+            break
+        run_from = s["at"]
     for sub in glob.glob(os.path.join(os.path.dirname(path), sid, "subagents", "*.jsonl")):
         t = newest_record(sub)
         if t and t > (f["last_activity"] or 0):
             f["last_activity"] = t
-        # Only a subagent active since the newest /next-move can add to its count.
-        if segments and segments[-1]["nudge"] and t and t >= segments[-1]["at"]:
+        if run_from is not None and t and t >= run_from:
             subagent_work(sub, segments)
     f["work_tools_since_nudge"], f["nudge_streak"] = nudge_facts(segments)
+    f["nudge_replied"] = nudge_replied(segments)
     return f
 
 

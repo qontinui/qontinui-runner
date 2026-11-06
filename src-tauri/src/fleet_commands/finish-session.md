@@ -162,9 +162,12 @@ is not this session's owed work.
 This step refuses a finish ONLY on a definite reason, because a definite reason
 means the work is not actually done. An UNKNOWN closeability does not block the
 finish: blocking on it would keep idle sessions alive, which is the opposite of
-what finishing is for. The closer (qontinui-runner#1987's close-time custody
-gate) is the one that refuses on UNKNOWN, so a finished-but-UNKNOWN session is
-simply never closed until its closeability is proven.
+what finishing is for. No closer reads this step's verdict. The runner's
+`finished_close` arm judges custody again at close time with its own gate and
+closes nothing that gate finds dirty or cannot read, while a missing custody
+slot or an unanswered obligations read, two of this step's UNKNOWN reasons, does
+not hold a session open there. `/close-finished-sessions` reads no closeability
+input at all.
 
 ```bash
 # SID: the same id step 0.5 used. Each --worktree: a tree this session
@@ -204,10 +207,17 @@ verdict). Read its exit code:
 | 0 | `CLOSEABLE ...` | proceed to step 1 |
 | 1, first line `NOT_CLOSEABLE ...`, and SID did NOT come from `$CLAUDE_CODE_SESSION_ID` (it came from `$QONTINUI_AGENT_SESSION_ID` or the box-global file, which step 1a treats as possibly a peer's) | `NOT_CLOSEABLE ...` | hold the verdict until step 1a has run. **If step 1a confirms the id is yours, the reasons are yours: apply the next row (do not finish).** If step 1a does not confirm the id (a peer's id, or an unproven one), step 1a's own refusal governs: the session is not finished, and these reasons are reported as UNKNOWN because they may be a peer's, not as your own not-closeable. A held claim was already refused by step 0.5 either way |
 | 1, first line `NOT_CLOSEABLE ...` | `NOT_CLOSEABLE ...` | **do not finish.** A definite reason: a dirty or untracked tree, a commit on no remote, a live claim (a ledger row still held -- `stolen` / `lapsed` / `owner_gone` rows are not), or an owed item that is `not_watched`, `owed` or `dropped`. Quote every `NOT_CLOSEABLE <reason> <detail>` line, fix it (commit and push, release the claim, get the item landed or watched), then re-run this step |
-| 3 | `UNKNOWN ...` | **proceed with the finish** and put in the report: `closeable: UNKNOWN (<the UNKNOWN reason lines>) — finished, but no closer will close this session until closeability is proven` |
+| 3 | `UNKNOWN ...` | **proceed with the finish** and put in the report: `closeable: UNKNOWN (<the UNKNOWN reason lines>) — finished` |
 | no `session-closeable exit` line at all: the shell printed `SID: no session id: step 0.6 did NOT run` or `CCFG: fill CCFG ...: step 0.6 did NOT run` | — | **the step did not run.** Never proceed past it: fill `CCFG` (or resolve the session id) and re-run this step |
 | 2 | usage | the call was malformed (an empty `--owed-items` / `--worktree` value, a non-uuid id): fix it and re-run; do not proceed on a usage error |
-| 127 / `No such file or directory`, an exit 1 whose first line is NOT `NOT_CLOSEABLE` (the script crashed), or any other exit | — | the same as 3: proceed, and report `closeable: UNKNOWN (<what failed>) — finished, but no closer will close this session until closeability is proven` |
+| 127 / `No such file or directory`, an exit 1 whose first line is NOT `NOT_CLOSEABLE` (the script crashed), or any other exit | — | the same as 3: proceed, and report `closeable: UNKNOWN (<what failed>) — finished` |
+
+Report the closeable axis in exactly those words and nothing else: no
+paraphrase, and no sentence of your own about whether the session can be
+closed. `/close-finished-sessions` reads any negated, conditional, hedged or
+questioned use of `/unattended` Step 4.9's verdict phrase, anywhere in the final
+message, as a veto of the whole message, and only that headline, when
+`/unattended` ran, states it.
 
 Report a refusal in these words: *"session NOT finished: not closeable"*,
 followed by the `NOT_CLOSEABLE` lines. `--force` overrides a refusal here as it
@@ -472,7 +482,9 @@ never with an env dump (the session environment carries plaintext passwords):
   an `--undo` sends `{"finished": false}`, never the finish snippet as written.
   That rung is path-addressed and reaches coord on the runner's own credential,
   without this ownership predicate, so it is the door this arm exists for. For a
-  FINISH, a `coord.queued: true` there, read back `finishSynced: true`, is done.
+  FINISH, a `coord.queued: true` there, read back `finishSynced: true`, means
+  the runner says coord ACKed — confirm with the coord bullet of *Read back
+  before you report* before reporting done (Step 1 says why, and when that ends).
   The `finishSynced` read-back applies to a finish only; after an `--undo` never
   re-POST (a POST without `finished` finishes the session again) — Step 1 says
   what to read instead. A `coord.queued: true` on the read-back is a write the
@@ -483,9 +495,9 @@ never with an env dump (the session environment carries plaintext passwords):
   (an older build's reasoned re-finish) with `finishSynced: false` and
   `coord.queued: false`, no `coord` key, any answer
   the table calls UNKNOWN, no runner answering `/health`, a `finishSynced` still
-  `false` after the prescribed wait, or an `--undo` coord still reads as
-  `finished`), **do NOT create a row.** The runner created your row at spawn and
-  binds it itself — the same rule `/unattended` Step 4.9's
+  `false` after the prescribed wait, a `true` the coord read-back does not
+  confirm, or an `--undo` coord still reads as `finished`), **do NOT create a
+  row.** The runner created your row at spawn and binds it itself — the same rule `/unattended` Step 4.9's
   `worktree-handoff.sh` follows (*"A runner-hosted session lets the runner bind
   its own row"*). A create here can fork you: the new row takes every status and
   `finished` write while your worktrees, claims and branch stay on the runner's
@@ -563,8 +575,8 @@ as a dead door.
 
 **Read back before you write.** `coord_orient` with the same
 `claude_code_session_id` must return `your_session.coord_session_id` non-null
-with no `reason`. Only then go on to Part B's finish write, and then the
-read-back at the end of this file.
+with no `reason`. Only then go on to Part B's finish write, and then
+the coord bullet of *Read back before you report*.
 
 **What this step is not.**
 
@@ -673,10 +685,10 @@ has ACKed it.
 | Answer | Meaning | Action |
 |---|---|---|
 | `404` | this runner holds no lifecycle record for that id. The session is not runner-hosted, is an SDK session spawned through `POST /sessions/spawn`, or belongs to a different runner instance. **On a build without the plan's Phase 1** a `404` also means "already in the requested state, and no reason was sent", and the body text says so | fall through to Step 2 |
-| `200`, `changed: "marker"`, `coord.queued: true` | resume set corrected AND the coord write is queued to `coord.coordSessionId`. On a restamping build this is also the answer to a reasoned re-finish: the mark was restamped and is re-sent | **done**. Report this rung and the `coordSessionId`, then (for a finish only — never after an `--undo`) do the read-back below |
+| `200`, `changed: "marker"`, `coord.queued: true` | resume set corrected AND the coord write is queued to `coord.coordSessionId`. On a restamping build this is also the answer to a reasoned re-finish: the mark was restamped and is re-sent | **queued** — not done until the read-back below and the coord read-back confirm. Report this rung and the `coordSessionId`, then (for a finish only — never after an `--undo`) do the read-back below |
 | `200`, `changed: "marker"`, `coord.queued: false` | the runner's resume set IS corrected, and coord is NOT told (`coord.reason`: `no_coord_session`, `outbox_write_failed` or `no_forwarder`) | say so in those words, quoting `coord.reason`, and **continue to Step 2** for the coord half. If Step 2 is then refused, Part A step 1b's runner-hosted arm applies — no create; terminal state `runner-hosted, own row unbound` |
-| `200`, `changed: "none"` or `"reason_only"`, `finishSynced: true` | already finished and coord has ACKed it. A `reason_only` (an older build's answer to a reasoned re-finish; it kept the old stamp) rewrote the reason **locally** only — the runner's finished row carries no reason text, so no reason from this rung ever reaches coord | **done** for the coord half. Do not report a new reason as having reached coord |
-| `200`, `changed: "none"` or `"reason_only"`, `finishSynced: false` or absent, `coord.queued: true` | the mark is finished but not yet ACKed, and the runner has just re-queued the owed write — this is the normal answer to the read-back below, taken before the outbox drained | wait ~15 s (the runner's outbox drains every 1–5 s; longer while coord is backing off), re-read once with the same no-reason POST. `true` then: done. Still `false`: continue to Step 2 |
+| `200`, `changed: "none"` or `"reason_only"`, `finishSynced: true` | already finished, and the runner says coord has ACKed it — which is not yet proof coord's row moved (see below the table). A `reason_only` (an older build's answer to a reasoned re-finish; it kept the old stamp) rewrote the reason **locally** only — the runner's finished row carries no reason text, so no reason from this rung ever reaches coord | the runner says coord ACKed — confirm with the coord bullet of *Read back before you report* before reporting done; on `session_status` null or not `finished`, run Step 2's write (or Step 3's, over the proxy) and re-read. If Step 2 is then refused, Part A step 1b's runner-hosted arm applies — no create; terminal state `runner-hosted, own row unbound`. Do not report a new reason as having reached coord |
+| `200`, `changed: "none"` or `"reason_only"`, `finishSynced: false` or absent, `coord.queued: true` | the mark is finished but not yet ACKed, and the runner has just re-queued the owed write — this is the normal answer to the read-back below, taken before the outbox drained | wait ~15 s (the runner's outbox drains every 1–5 s; longer while coord is backing off), re-read once with the same no-reason POST. `true` then: the `finishSynced: true` row above. Still `false`: continue to Step 2 |
 | `200`, `changed: "none"` or `"reason_only"`, `finishSynced: false` or absent, `coord.queued: false` | coord does not have the current state and nothing was re-queued (`coord.reason` names why; after an `--undo` this is the normal no-op answer) | quote `coord.reason` and continue to Step 2 |
 | any other status (`500` = the runner's lifecycle store lock is poisoned, so whether it knows the id is itself unknown; `503` = lifecycle store unavailable), `HTTP 000`, or an empty or non-JSON body | the runner died or could not act between the probe and the call. Nothing is established | **UNKNOWN** — say so, and continue to Step 2 |
 | `200` with **no `coord` key at all** | the running runner build predates Phase 1. Its mark may or may not ever reach coord | treat `queued` as **UNKNOWN** and continue to Step 2. To confirm: `gitSha` from `GET /health`, then `git -C qontinui-runner merge-base --is-ancestor <the plan's Phase 1 commit> <gitSha>` after a fetch. Exit 128 means the sha is absent from your clone, which is UNKNOWN too |
@@ -684,6 +696,22 @@ has ACKed it.
 **An absent `finishSynced` is not `true`.** A build carrying Phase 1 always
 returns the key in this response; only an older build (or an on-disk record)
 omits it, and a record with no `finishSynced` key reads as not synced.
+
+**A `finishSynced: true` is not yet proof coord recorded the finish.** The
+runner stamps it on any 2xx from coord's `PATCH /sessions/:id`, and coord can
+answer 2xx while its progress write did not land, leaving the row's
+`session_status` null — dossier `finish-synced-true-while-coord-unfinished`
+(head finding `6ffb1e1f-363f-4d9d-8944-a0d944baa94b`), plan
+`2026-11-05-finish-synced-is-stamped-on-a-2xx-that-did-not-move-session-status`.
+So a `true` sends you on to the coord bullet of *Read back before you report*,
+never straight to the report. The interim ends per box, by runner build: a
+runner whose finish read-back carries `coord.observed.sessionStatus` (that
+plan's Phase 5). There `coord.observed.sessionStatus: "finished"` is done by
+itself, and `coord.observed: null` is UNKNOWN for the coord half. On any other
+`coord.observed.sessionStatus`, or `coord.observed: null`: run the coord
+read-back, and Step 2's write on a null or non-`finished` status, as in the
+interim. No `coord.observed` key at all is an older build, and the interim
+applies.
 
 **Run this once.** A second finish POST that carries a reason restamps the mark
 on a restamping build (`changed: "marker"`: the finish time moves to now and
@@ -698,7 +726,12 @@ landed. A `PermanentFailure` at coord drops the outbox row and leaves
 `finishSynced` false for good. So, **for a finish only**, re-issue the same POST
 with `-d '{}'`, which carries no reason. Never send it after an `--undo`: an
 absent `finished` means `true`, so it would finish the session again. It answers `changed: "none"` and the current
-`session.finishSynced`. `true` means coord acknowledged the write. `false` with
+`session.finishSynced`. `true` means the runner says coord ACKed — confirm with
+the coord bullet of *Read back before you report* before reporting done, and on
+`session_status` null or not `finished` run Step 2's write (or Step 3's, over
+the proxy) and re-read (see the note under the table). If Step 2 is then
+refused, Part A step 1b's runner-hosted arm applies — no create; terminal state
+`runner-hosted, own row unbound`. `false` with
 `coord.queued: true` is the expected first answer (the runner re-queued the owed
 write): apply the table's wait-and-re-read row. `false` after that one re-read
 means not yet, or never: continue to Step 2 for the coord half rather than
@@ -706,8 +739,8 @@ reporting coord told. Do not send a reason on the read-back. On a restamping
 build that restamps the mark and clears `finishSynced` again, so the read-back
 could never observe coord's ACK. On an older build it is the reason rewrite
 above (`reason_only`, or `none` when the reason matches). **For `--undo` there is no
-runner read-back.** Confirm coord's half with the coord
-read-back at the end of this file (`session_status` no longer `finished`), and
+runner read-back.** Confirm coord's half with
+the coord bullet of *Read back before you report* (`session_status` no longer `finished`), and
 run Step 2's `working` transition when it still reads `finished`.
 
 ### Step 2 — Native MCP tool `coord_report_status` (probe: tool present)
@@ -834,8 +867,11 @@ different remedies:
   `briefing-mandated-door-that-answers-disabled` it "can only produce the same
   sentence more slowly". **For a runner-hosted session, Step 1 is the door that
   does not use this predicate.** If you have not run it, run it now. A
-  `coord.queued: true` there, read back `finishSynced: true`, settles the coord
-  half with no bind. **Otherwise the remedy is Part A step 1b, by host.** A
+  `coord.queued: true` there, read back `finishSynced: true` and confirmed by the
+  coord bullet of *Read back before you report* (`session_status: "finished"`)
+  (or, on a build carrying `coord.observed`, `coord.observed.sessionStatus:
+  "finished"` — see Step 1's note under the table), settles the coord half
+  with no bind. **Otherwise the remedy is Part A step 1b, by host.** A
   runner-hosted session does NOT create a row: its terminal state is
   `runner-hosted, own row unbound`, reported with the refusal's reason and Step
   1's answer quoted (step 1b's runner-hosted arm). An operator-launched session
@@ -858,8 +894,10 @@ A returned success is necessary, not sufficient. Confirm by read:
 
 - **runner — the local half, when Step 1 carried a FINISH.** The `-d '{}'`
   re-POST that Step 1's read-back describes. Never after an `--undo`, where it
-  would re-finish the session. Its `session.finishSynced` says whether coord
-  acknowledged, and its `changed: "none"` says the local mark holds.
+  would re-finish the session. Its `session.finishSynced` says whether the
+  runner counted coord's answer as an ACK — not that coord's row moved; the
+  coord bullet above decides that. Its `changed: "none"` says the local mark
+  holds.
 
 > **`GET http://127.0.0.1:9876/sessions/history` is not a read-back of coord.**
 > On a runner build carrying `44870ff25` its rows carry `finished`, `finishedAt`
@@ -888,7 +926,8 @@ One line, then the evidence:
 State: the session id you actually wrote to, the step that carried it (Step 1
 runner-local, Step 2 native tool, or Step 3 loopback proxy), and the reason
 recorded. For Step 1, also give `coord.queued`, `coordSessionId` and the
-read-back `finishSynced`. When Step 1 corrected the resume set but coord's half
+read-back `finishSynced`, and the coord read-back's `session_status` and
+`coord_session_id` (or `coord.observed.sessionStatus`). When Step 1 corrected the resume set but coord's half
 came from Step 2 or 3, name both. **Coord is the store other sessions read**,
 and its read-back is what verifies the coord half.
 
