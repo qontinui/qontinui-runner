@@ -320,7 +320,7 @@ pub(crate) use ipc_handler_post_bumps_mutation;
 
 // Per-family submodules host the rest of the macro-generated handlers:
 //   - state_machine.rs   (states/, state/, state-groups/, transitions/)
-//   - ai_analyze.rs      (ai/analyze/*, ai/semantic-search, ai/diff, media-compare, image-diff)
+//   - ai_analyze.rs      (ai/analyze/*, ai/semantic-search, ai/diff, image-diff)
 //   - design_eval.rs     (control/design/evaluate/*)
 //   - intents_registry.rs (control/intents/*)
 //   - misc.rs            (undo/redo, specs, component-state, scroll,
@@ -958,7 +958,6 @@ mod manifest_drift_tests {
             ("POST", "/ui-bridge/control/action-plan"),
             ("POST", "/ui-bridge/control/activate-tab/{}"),
             ("POST", "/ui-bridge/control/annotations"),
-            ("POST", "/ui-bridge/control/capture-element-images"),
             ("POST", "/ui-bridge/control/clear-storage"),
             ("POST", "/ui-bridge/control/design/evaluate"),
             ("POST", "/ui-bridge/control/design/evaluate/baseline"),

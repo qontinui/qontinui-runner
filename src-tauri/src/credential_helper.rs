@@ -1154,7 +1154,7 @@ fn git_local_config_file(dir: &Path) -> Option<PathBuf> {
 /// `session_id` is whatever key the matching `setup_credential_helper` call
 /// used. Two disjoint key spaces exist and BOTH must be torn down:
 /// - the coord **session** UUID (terminal / worker installs), drained by
-///   `SessionRegistry::close`;
+///   `SessionRegistry::close_by_id`;
 /// - the coord **agent** id (agent-worktree installs made inside
 ///   `allocate_and_materialize_with_claim`), drained by
 ///   `IsolatedEditContext::drop`.

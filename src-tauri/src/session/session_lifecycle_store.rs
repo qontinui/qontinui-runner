@@ -242,6 +242,16 @@ pub const WIND_DOWN_CLOSE_UNKNOWN: &str = "close_unknown";
 /// `terminal::graceful_exit::GracefulExitOutcome::Refused`), which is why this
 /// is recorded rather than treated as a non-event.
 pub const WIND_DOWN_NOT_ATTEMPTED: &str = "exit_not_submitted";
+/// [`TerminalSessionRecord::wind_down_outcome`] — a live `claude` was in the
+/// pane and the executor presented no close authority, so the primitive
+/// refused before typing anything (plan
+/// `2026-10-28-one-session-lifecycle-authority`, Phase 14 / R0a). Nothing was
+/// written and nothing was closed. The session is STILL RUNNING.
+///
+/// Until the lifecycle Closer mints authorities (Phase 93), this is what EVERY
+/// wind-down close of a live session records, whichever arm attempted it.
+/// It is the read-back that the gate is armed on a box that restarted into it.
+pub const WIND_DOWN_NO_CLOSE_AUTHORITY: &str = "no_close_authority";
 
 /// [`TerminalSessionRecord::wind_down_arm`] — the close was made by the
 /// executor's DRAIN arm: coord held this device drained.
@@ -549,7 +559,23 @@ pub struct TerminalSessionRecord {
     pub opened_at: i64,
     /// Unix millis of the most recent liveness/touch.
     pub last_seen_at: i64,
-    /// `"open"` | `"closed"`.
+    /// `"open"` | `"closed"` — the TERMINAL-HOSTING lifecycle of this session,
+    /// not its work and not its liveness.
+    ///
+    /// `open` means the registry last saw the session bound to a runner
+    /// terminal; it flips to `closed` (with `closed_at` / `close_reason`) on a
+    /// PTY exit, an explicit close, or the liveness poll (`poll-dead`,
+    /// `no-terminal`, …), which runs about every 45 s and debounces over
+    /// several ticks. Two consequences a reader must not miss:
+    ///
+    /// - **It is independent of `finished_at`.** `POST /sessions/{id}/finish`
+    ///   records the WORK axis only and never touches the process, so a row
+    ///   reading `"state":"open"` beside a set `finishedAt` is the expected
+    ///   shape right after a finish: the work is done, the pane is still up.
+    /// - **It is not a liveness probe.** An `open` row can outlive its process
+    ///   until the poll closes it (minutes), and a row from a dead runner stays
+    ///   `open` on disk. To ask "is anything running here?" use
+    ///   `GET /restart-readiness`, the live census.
     pub state: String,
     /// Unix millis when this session was closed, if closed.
     pub closed_at: Option<i64>,
@@ -761,7 +787,7 @@ pub struct TerminalSessionRecord {
     pub finished_at: Option<i64>,
     /// What the drained-runner wind-down executor did to this session (plan
     /// `2026-09-13-drained-runner-never-reaches-idle`, Phase 4). One of the
-    /// FIVE `WIND_DOWN_*` words, and they say different things:
+    /// SIX `WIND_DOWN_*` words, and they say different things:
     ///
     /// * [`WIND_DOWN_CLOSED`] — `claude` left and the pane was closed;
     /// * [`WIND_DOWN_EXIT_STUCK`] — `claude` outlived the deadline, nothing was
@@ -774,7 +800,10 @@ pub struct TerminalSessionRecord {
     ///   above;
     /// * [`WIND_DOWN_NOT_ATTEMPTED`] — `/exit` was never submitted (the pane was
     ///   not in a safe state, or the write failed). Nothing was closed, but the
-    ///   pane MAY have been written to.
+    ///   pane MAY have been written to;
+    /// * [`WIND_DOWN_NO_CLOSE_AUTHORITY`] — a live `claude` was found and no
+    ///   close authority was presented, so NOTHING was written and nothing was
+    ///   closed. The session is STILL RUNNING.
     ///
     /// It is the OUTCOME axis of an automatic close, and it is orthogonal to
     /// both `state` and `finished_at`: a session can be `closed` for a dozen

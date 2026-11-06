@@ -92,7 +92,7 @@ fn find_step<'a>(steps: &'a [serde_yaml::Value], name: &str) -> &'a serde_yaml::
         .find(|s| step_name(s) == Some(name))
         .unwrap_or_else(|| {
             let present: Vec<&str> = steps.iter().filter_map(step_name).collect();
-            panic!("job `test` has no step named `{name}`. Present: {present:?}")
+            panic!("ci.yml job has no step named `{name}`. Present: {present:?}")
         })
 }
 
@@ -888,4 +888,529 @@ fn an_out_of_memory_rust_test_step_is_annotated_as_capacity() {
         !body.contains("MEMPEAK") && !body.contains("mempeak"),
         "`{EMITTER}` must not read a MEMPEAK/pagefile reading as an OOM signature"
     );
+}
+
+/// Plan `2026-10-27-coord-routes-ci-jobs-by-runner-capability` Phase 2: every
+/// heavy Rust job emits ONE `qontinui-resource-report` annotation. The
+/// emitter's content is fixture-tested by `scripts/tests/test_resource_report.sh`;
+/// this pins the WIRING, whose failure modes are all silent — a report gated
+/// to one leg, skipped on the failed/expired runs that matter most, fed a
+/// baseline output nothing writes (GitHub expands an unknown output to ""),
+/// placed above a heavy step whose peak and disk floor it then misses, or
+/// able to fail the job.
+#[test]
+fn every_heavy_rust_job_emits_one_resource_report() {
+    const REPORT: &str = "Report this job's resources";
+    const EMITTER: &str = "bash scripts/ci/resource-report.sh";
+    let doc = ci_workflow();
+
+    // (job, the step whose outcome is `build_outcome`, that step's id)
+    for (job, build_step, build_id) in [
+        ("test", BUILD, "build_rust_tests"),
+        ("clippy-windows", "Clippy check", "clippy"),
+    ] {
+        let steps = job_steps(&doc, job);
+        let report = find_step(&steps, REPORT);
+
+        // Exactly one emitter per job: two reports would make the job's
+        // requirement ambiguous for coord's reader. A call that only STARTS
+        // the anon sampler (`--start-anon-sampler`) prints no report line.
+        let emitting: Vec<String> = steps
+            .iter()
+            .filter(|s| s.get("run").is_some())
+            .filter(|s| {
+                let label = step_name(s).unwrap_or("<unnamed>");
+                command_lines(s, label)
+                    .split(EMITTER)
+                    .skip(1)
+                    .any(|rest| !rest.trim_start().starts_with("--start-anon-sampler"))
+            })
+            .map(|s| step_name(s).unwrap_or("<unnamed>").to_string())
+            .collect();
+        assert_eq!(
+            emitting,
+            vec![REPORT.to_string()],
+            "job `{job}` must call `{EMITTER}` from exactly one step, `{REPORT}`"
+        );
+
+        // `always()` and NOTHING ELSE: a platform gate drops a whole leg's
+        // capability, and a default `success()` drops the failed and expired
+        // runs — the ones whose requirement is the point.
+        assert_eq!(
+            report.get("if").and_then(|v| v.as_str()),
+            Some("always()"),
+            "`{REPORT}` in job `{job}` must carry exactly `if: always()`"
+        );
+        assert_eq!(
+            report.get("continue-on-error").and_then(|v| v.as_bool()),
+            Some(true),
+            "`{REPORT}` in job `{job}` must carry `continue-on-error: true`"
+        );
+        assert!(
+            report.get("timeout-minutes").is_none(),
+            "`{REPORT}` in job `{job}` must NOT carry a step-level `timeout-minutes` \
+             (paired with `continue-on-error` a trip cancels the whole JOB)"
+        );
+        assert_eq!(
+            report.get("shell").and_then(|v| v.as_str()),
+            Some("bash"),
+            "`{REPORT}` in job `{job}` must run under bash (Git Bash on Windows; \
+             the default there is pwsh, which cannot run the script)"
+        );
+        assert!(
+            position(&steps, build_step) < position(&steps, REPORT),
+            "`{REPORT}` in job `{job}` must run after `{build_step}`, whose peak it reports"
+        );
+        // The LAST step: the anon sampler runs until this step stops it, and
+        // disk free is read now, so any heavy step after it (the `test` job's
+        // Tauri debug build once was) is missing from the peak and the floor.
+        assert_eq!(
+            steps.last().and_then(step_name),
+            Some(REPORT),
+            "`{REPORT}` must be the LAST step of job `{job}` so it covers every heavy step"
+        );
+        assert_eq!(
+            find_step(&steps, build_step)
+                .get("id")
+                .and_then(|v| v.as_str()),
+            Some(build_id),
+            "`{build_step}` in job `{job}` must carry `id: {build_id}`"
+        );
+        let body = command_lines(report, REPORT);
+        assert!(
+            body.contains(&format!(
+                "--build-outcome \"${{{{ steps.{build_id}.outcome }}}}\""
+            )),
+            "`{REPORT}` in job `{job}` must pass `--build-outcome` from `steps.{build_id}`: {body}"
+        );
+    }
+
+    // The `test` job reuses Phase 1's pre-build step rather than adding one:
+    // it writes the oom_kill baseline and starts the anon sampler, and the
+    // report must read exactly what that step writes (an unwritten output, or
+    // a different state dir, silently loses the reading).
+    let steps = job_steps(&doc, "test");
+    let body = command_lines(find_step(&steps, REPORT), REPORT);
+    let (baseline_at, baseline) = steps
+        .iter()
+        .enumerate()
+        .find(|(_, s)| s.get("id").and_then(|v| v.as_str()) == Some("oom_kill_before_build"))
+        .expect("no step carries `id: oom_kill_before_build`");
+    let baseline_body = command_lines(baseline, "oom_kill_before_build");
+    assert!(
+        body.contains(
+            "--oom-kill-baseline \"${{ steps.oom_kill_before_build.outputs.count }}\""
+        ),
+        "`{REPORT}` must pass `--oom-kill-baseline` from `oom_kill_before_build` output `count`: {body}"
+    );
+    assert!(
+        baseline_body.contains("echo \"count=$") && baseline_body.contains("GITHUB_OUTPUT"),
+        "`oom_kill_before_build` must write output `count`: {baseline_body}"
+    );
+    // build_outcome is the outcome of the job's heavy compile+test work, so
+    // the `test` job passes BOTH Rust halves (a run-half failure is a failed
+    // job even when the build half succeeded).
+    assert!(
+        body.contains("--build-outcome \"${{ steps.run_rust_tests.outcome }}\""),
+        "`{REPORT}` in job `test` must also pass the run half's outcome: {body}"
+    );
+    // ... and the Tauri debug build, a third full compile+link on both legs.
+    const TAURI_BUILD: &str = "Build Tauri app (development)";
+    assert_eq!(
+        find_step(&steps, TAURI_BUILD)
+            .get("id")
+            .and_then(|v| v.as_str()),
+        Some("tauri_build"),
+        "`{TAURI_BUILD}` must carry `id: tauri_build`"
+    );
+    assert!(
+        body.contains("--build-outcome \"${{ steps.tauri_build.outcome }}\""),
+        "`{REPORT}` in job `test` must also pass the Tauri build's outcome: {body}"
+    );
+    // peak_rss_mb is anonymous memory from the sampler the pre-build step
+    // starts; the report must stop/read the SAME state dir.
+    const STATE_DIR: &str = "\"$RUNNER_TEMP/qontinui-resource-report\"";
+    assert!(
+        baseline_body.contains("scripts/ci/resource-report.sh --start-anon-sampler")
+            && baseline_body.contains(&format!("--state-dir {STATE_DIR}")),
+        "`oom_kill_before_build` must start the anon sampler into {STATE_DIR}: {baseline_body}"
+    );
+    assert!(
+        body.contains(&format!("--anon-state-dir {STATE_DIR}")),
+        "`{REPORT}` must read the anon sampler's state from {STATE_DIR}: {body}"
+    );
+    // memory.peak is the cgroup's whole charge, page cache included: it must
+    // not be what either step hands the report.
+    assert!(
+        !body.contains("memory.peak") && !baseline_body.contains("memory.peak"),
+        "neither step may read `memory.peak` for the report (it carries page cache)"
+    );
+    assert!(
+        baseline_at < position(&steps, BUILD),
+        "the baselines the report reads must be taken BEFORE `{BUILD}`"
+    );
+    // MEMPEAK stays for the 2026-09-17 CARGO_BUILD_JOBS soak, but the report
+    // must not depend on it: it reads the pagefile itself.
+    assert!(
+        !body.contains("MEMPEAK"),
+        "`{REPORT}` must not parse the MEMPEAK lines; it reads the pagefile itself"
+    );
+}
+
+/// The self-hosted pool's label set is spelled TWICE: once in `route`'s
+/// `--self-hosted-labels` (where the `auto` lane routes the ubuntu leg) and
+/// once as the forced `self-hosted` arm of `test`'s `runs-on`. Both spellings
+/// stay valid label sets when one of them is edited alone, so nothing else
+/// notices the drift: the two lanes would simply send the leg to different
+/// pools. This pins them to one set (order-insensitive, as GitHub's label
+/// matching is).
+#[test]
+fn the_pool_label_set_is_the_same_in_route_and_in_the_forced_lane() {
+    let doc = ci_workflow();
+
+    let routed = routed_label_set(&doc, "route");
+
+    let runs_on = doc
+        .get("jobs")
+        .and_then(|j| j.get("test"))
+        .and_then(|j| j.get("runs-on"))
+        .and_then(|v| v.as_str())
+        .expect("job `test` must carry a `runs-on` expression string");
+    // The forced arm is the JSON array literal in `runs-on` that names
+    // `self-hosted` AND `Linux`: since the windows leg routes too, the windows
+    // arm also names `self-hosted` (pinned by the Windows twin below), and the
+    // hosted arms name `windows-latest` / `ubuntu-22.04`.
+    let forced = forced_label_set(runs_on, "Linux", "test");
+
+    assert_eq!(
+        routed, forced,
+        "the pool label set differs between `route --self-hosted-labels` and \
+         `test`'s forced `self-hosted` arm; change both together"
+    );
+}
+
+/// Every `'[... "self-hosted" ...]'` JSON array literal in a `runs-on`
+/// expression that also names `os_label`, as one sorted label set. Exactly one
+/// such literal must exist: a second would be a second, unpinned pool.
+fn forced_label_set(runs_on: &str, os_label: &str, job: &str) -> Vec<String> {
+    let literals: Vec<String> = regex::Regex::new(r#"'\[([^\]]*"self-hosted"[^\]]*)\]'"#)
+        .expect("the forced-arm pattern compiles")
+        .captures_iter(runs_on)
+        .map(|c| c[1].to_string())
+        .filter(|lit| lit.contains(&format!("\"{os_label}\"")))
+        .collect();
+    assert_eq!(
+        literals.len(),
+        1,
+        "`{job}`'s runs-on must carry exactly one forced '[\"self-hosted\", \"{os_label}\", …]' \
+         arm, found {}: {runs_on}",
+        literals.len()
+    );
+    let mut set: Vec<String> = literals[0]
+        .split(',')
+        .map(|label| label.trim().trim_matches('"').to_string())
+        .collect();
+    set.sort();
+    set
+}
+
+/// `--self-hosted-labels <set>` of the route-ci-lane.py call in `job`, sorted.
+fn routed_label_set(doc: &serde_yaml::Value, job: &str) -> Vec<String> {
+    let route_run = job_steps(doc, job)
+        .iter()
+        .filter_map(|s| s.get("run").and_then(|v| v.as_str()).map(str::to_string))
+        .find(|run| run.contains("route-ci-lane.py"))
+        .unwrap_or_else(|| panic!("job `{job}` must run .github/scripts/route-ci-lane.py"));
+    let mut set: Vec<String> = route_run
+        .split_whitespace()
+        .skip_while(|word| *word != "--self-hosted-labels")
+        .nth(1)
+        .unwrap_or_else(|| panic!("`{job}` must pass `--self-hosted-labels <set>`: {route_run}"))
+        .split(',')
+        .map(str::to_string)
+        .collect();
+    set.sort();
+    set
+}
+
+fn job_runs_on(doc: &serde_yaml::Value, job: &str) -> String {
+    doc.get("jobs")
+        .and_then(|j| j.get(job))
+        .and_then(|j| j.get("runs-on"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_else(|| panic!("job `{job}` must carry a `runs-on` expression string"))
+        .to_string()
+}
+
+/// The Windows twin of the test above (plan
+/// `2026-11-03-route-qontinui-runner-windows-ci-legs-to-dell-2020`). The
+/// Windows pool's label set is spelled in `route-windows`' `--self-hosted-labels`
+/// and in the forced arm of EVERY Windows leg's `runs-on` — `test`'s windows
+/// leg, `clippy-windows` and `holder-crates`. A leg edited alone would route
+/// its forced lane to a different pool than `auto` does.
+#[test]
+fn the_windows_pool_label_set_is_the_same_in_route_windows_and_every_forced_windows_arm() {
+    let doc = ci_workflow();
+    let routed = routed_label_set(&doc, "route-windows");
+    assert!(
+        routed.iter().any(|l| l == "Windows") && routed.iter().any(|l| l == "self-hosted"),
+        "`route-windows` must route to a self-hosted Windows pool: {routed:?}"
+    );
+    for job in ["test", "clippy-windows", "holder-crates"] {
+        let runs_on = job_runs_on(&doc, job);
+        assert!(
+            runs_on.contains("needs['route-windows'].outputs.labels"),
+            "`{job}`'s runs-on must take `route-windows`' labels under `auto`: {runs_on}"
+        );
+        assert_eq!(
+            routed,
+            forced_label_set(&runs_on, "Windows", job),
+            "the Windows pool label set differs between `route-windows \
+             --self-hosted-labels` and `{job}`'s forced arm; change them together"
+        );
+    }
+}
+
+/// A job that `needs` a SKIPPED job is skipped too, and coord counts a skipped
+/// required context as passing. `route-windows` is skipped on every pull_request
+/// and whenever the Windows lane is not `auto`, so each Windows leg must both wait
+/// on it (its `labels` output is read in `runs-on`) and carry `!cancelled()`.
+#[test]
+fn every_windows_leg_waits_on_route_windows_and_is_never_skipped() {
+    let doc = ci_workflow();
+    for job in ["test", "clippy-windows", "holder-crates"] {
+        let spec = doc
+            .get("jobs")
+            .and_then(|j| j.get(job))
+            .unwrap_or_else(|| panic!("ci.yml has no job `{job}`"));
+        let needs: Vec<String> = match spec.get("needs") {
+            Some(serde_yaml::Value::String(one)) => vec![one.clone()],
+            Some(serde_yaml::Value::Sequence(many)) => many
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect(),
+            _ => Vec::new(),
+        };
+        assert!(
+            needs.iter().any(|n| n == "route-windows"),
+            "`{job}` must `needs: route-windows` (its runs-on reads that job's labels), got {needs:?}"
+        );
+        // EXACTLY this condition: anything added to it (an event filter, say)
+        // can skip the job, and coord reads a skipped required check as passing.
+        let cond = spec.get("if").and_then(|v| v.as_str()).unwrap_or_default();
+        assert_eq!(
+            cond, "${{ !cancelled() }}",
+            "`{job}` must run under exactly `if: ${{{{ !cancelled() }}}}`, or a skipped \
+             route-windows (or an added filter) skips it and coord reads the skipped required \
+             check as passing"
+        );
+    }
+}
+
+/// The guards that keep the pool off pull requests and re-runs, pinned where
+/// they live: in front of every pool arm of every Windows leg, and on
+/// `route-windows` itself. Each arm stays a VALID expression with its guard
+/// removed, which is why nothing else would notice one going missing.
+#[test]
+fn every_windows_pool_arm_carries_its_pull_request_and_rerun_guards() {
+    let doc = ci_workflow();
+    let route_if = doc
+        .get("jobs")
+        .and_then(|j| j.get("route-windows"))
+        .and_then(|j| j.get("if"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    assert_eq!(
+        route_if,
+        "${{ github.event_name != 'pull_request' && vars.RUNNER_CI_WINDOWS_LANE == 'auto' }}",
+        "`route-windows` must run only for a non-pull_request run on the `auto` lane"
+    );
+    const FORCED_GUARD: &str = "github.run_attempt == 1 && github.event_name != 'pull_request' \
+                                && vars.RUNNER_CI_WINDOWS_LANE == 'self-hosted' && '[";
+    const ROUTED: &str = "needs['route-windows'].outputs.labels";
+    const ROUTED_GUARD: &str = "github.run_attempt == 1 && ";
+    for job in ["test", "clippy-windows", "holder-crates"] {
+        let runs_on = job_runs_on(&doc, job);
+        let forced_guard = FORCED_GUARD
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let windows_literals: Vec<usize> = runs_on
+            .match_indices("'[\"self-hosted\",\"Windows\"")
+            .map(|(at, _)| at)
+            .collect();
+        assert!(
+            !windows_literals.is_empty(),
+            "`{job}` has no forced Windows pool arm: {runs_on}"
+        );
+        for at in windows_literals {
+            assert!(
+                runs_on
+                    .get(..at + 2)
+                    .is_some_and(|before| before.ends_with(&forced_guard)),
+                "`{job}`'s forced Windows arm must be guarded by `{forced_guard}`: {runs_on}"
+            );
+        }
+        let routed: Vec<usize> = runs_on.match_indices(ROUTED).map(|(at, _)| at).collect();
+        assert!(
+            !routed.is_empty(),
+            "`{job}` never reads `{ROUTED}`: {runs_on}"
+        );
+        for at in routed {
+            assert!(
+                runs_on
+                    .get(..at)
+                    .is_some_and(|before| before.ends_with(ROUTED_GUARD)),
+                "`{job}`'s routed arm must be guarded by `{ROUTED_GUARD}`: {runs_on}"
+            );
+        }
+    }
+}
+
+/// Both leftover-process stops run one script, and it must exist where both call it.
+/// Neither call runs on a pull_request run or while the Windows lane is hosted, so no
+/// green check would show a wrong path until the lane flips; this pins it instead.
+#[test]
+fn both_leftover_process_stops_call_the_tracked_script() {
+    const SCRIPT: &str = "scripts/ci/stop-leftover-processes.ps1";
+    let root = repo_root();
+    assert!(
+        root.join(SCRIPT).is_file(),
+        "`{SCRIPT}` is missing, and both leftover-process stops call it"
+    );
+    let action_path = root
+        .join(".github")
+        .join("actions")
+        .join("self-hosted-windows-prep")
+        .join("action.yml");
+    let action_text = std::fs::read_to_string(&action_path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", action_path.display()));
+    let action: serde_yaml::Value = serde_yaml::from_str(&action_text)
+        .unwrap_or_else(|e| panic!("parse {}: {e}", action_path.display()));
+    // The CALL, not the path text: a comment, or a line that only names the path,
+    // must not satisfy this.
+    let prep_calls = action
+        .get("runs")
+        .and_then(|r| r.get("steps"))
+        .and_then(|s| s.as_sequence())
+        .unwrap_or_else(|| panic!("{} has no `runs.steps`", action_path.display()))
+        .iter()
+        .filter_map(|step| step.get("run").and_then(|r| r.as_str()))
+        .flat_map(str::lines)
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .any(|l| l.contains(&format!("& (Join-Path $env:GITHUB_WORKSPACE '{SCRIPT}')")));
+    assert!(
+        prep_calls,
+        "the prep action must call `{SCRIPT}` from the workspace root"
+    );
+    let doc = ci_workflow();
+    let steps = job_steps(&doc, "test");
+    const STOP: &str =
+        "Self-hosted Windows: stop the smoke's leftover runner and WebView2 processes";
+    let body = command_lines(find_step(&steps, STOP), STOP);
+    assert!(
+        body.contains(&format!("& ./{SCRIPT} ")),
+        "`{STOP}` must call `./{SCRIPT}`: {body}"
+    );
+}
+
+/// The two `always()` cleanups of `test` act only on what THIS job set up: Unpoison
+/// only when Poison ran, and the post-smoke process stop only when the Windows prep
+/// step accepted the account. Without the gates a job whose prep refused an account
+/// (a person's, or one another registration shares) would still delete files and
+/// stop processes on it.
+#[test]
+fn the_always_cleanups_act_only_on_what_this_job_set_up() {
+    let doc = ci_workflow();
+    let steps = job_steps(&doc, "test");
+    let cond = |name: &str| {
+        find_step(&steps, name)
+            .get("if")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let id = |name: &str| {
+        find_step(&steps, name)
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    assert_eq!(id("Poison ambient state"), "poison");
+    assert_eq!(
+        cond("Unpoison ambient state"),
+        "always() && (steps.poison.outcome == 'success' || steps.poison.outcome == 'failure')"
+    );
+    assert_eq!(
+        id("Self-hosted Windows: sibling cleanup, host preflight, compile caps and the persistent target"),
+        "windows_prep"
+    );
+    // The contract smoke renders through WebView2, so the prep must refuse a host
+    // without it rather than let the smoke fail as if the PR broke it.
+    assert_eq!(
+        find_step(
+            &steps,
+            "Self-hosted Windows: sibling cleanup, host preflight, compile caps and the persistent target"
+        )
+        .get("with")
+        .and_then(|w| w.get("require-webview2"))
+        .and_then(|v| v.as_str()),
+        Some("true"),
+        "`test`'s Windows prep must pass `require-webview2: \"true\"`"
+    );
+    assert_eq!(
+        cond("Self-hosted Windows: stop the smoke's leftover runner and WebView2 processes"),
+        "always() && steps.windows_prep.outcome == 'success'"
+    );
+}
+
+/// #2543's two self-hosted steps are linux bash (pkg-config webkit,
+/// /proc/meminfo, cgroups, `ln -s`), and `runner.environment == 'self-hosted'`
+/// is ALSO true on a self-hosted Windows runner — gated on that alone they
+/// would run linux-shaped scripts on the Windows pool and fail every leg there.
+/// So they carry `runner.os == 'Linux'`, and every job that can land on the
+/// Windows pool runs the Windows twin (the shared composite action) instead.
+#[test]
+fn the_self_hosted_steps_are_split_by_operating_system() {
+    let doc = ci_workflow();
+    let test_steps = job_steps(&doc, "test");
+    for name in [
+        "Self-hosted: clear the previous job's sibling checkouts and give the job its own HOME",
+        "Self-hosted: system packages, compile caps and the persistent target",
+    ] {
+        let cond = find_step(&test_steps, name)
+            .get("if")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        assert_eq!(
+            cond, "runner.environment == 'self-hosted' && runner.os == 'Linux'",
+            "`{name}` is linux bash and must be gated to exactly self-hosted LINUX"
+        );
+    }
+    const PREP: &str =
+        "Self-hosted Windows: sibling cleanup, host preflight, compile caps and the persistent target";
+    for job in ["test", "clippy-windows", "holder-crates"] {
+        let steps = job_steps(&doc, job);
+        let prep = find_step(&steps, PREP);
+        let cond = prep.get("if").and_then(|v| v.as_str()).unwrap_or_default();
+        assert_eq!(
+            cond, "runner.environment == 'self-hosted' && runner.os == 'Windows'",
+            "`{job}`'s `{PREP}` must be gated to exactly self-hosted WINDOWS"
+        );
+        assert_eq!(
+            prep.get("uses").and_then(|v| v.as_str()),
+            Some("./.github/actions/self-hosted-windows-prep"),
+            "`{job}`'s `{PREP}` must run the shared composite action"
+        );
+        // It must come before anything that compiles or checks out a sibling:
+        // it clears the previous job's sibling trees and junctions ./target.
+        let prep_at = position(&steps, PREP);
+        let first_sibling = position(&steps, "Check out sibling qontinui-schemas");
+        assert!(
+            prep_at < first_sibling,
+            "`{job}`: `{PREP}` must run before the sibling checkouts"
+        );
+    }
 }

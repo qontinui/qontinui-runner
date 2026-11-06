@@ -3547,6 +3547,19 @@ where
 /// the backend and gated by `relay_path_policy` — as a browser page, and
 /// refuse it (plan `2026-09-17-runner-loopback-api-accepts-any-origin`, F4).
 /// The self-call is a NonBrowser request and must look like one.
+///
+/// `cookie` and `authorization` are the END USER's ambient credentials to the
+/// web backend — the browser's session cookie (carrying `access_token`, a
+/// Cognito bearer) and the user's bearer. The runner trusts its own relay
+/// channel, never the end user's credentials, and neither it nor anything on
+/// its box that reads its logs may receive a replayable web credential. The web
+/// backend already drops them (qontinui-web `device_bridge_ws.py`
+/// `_AMBIENT_CREDENTIAL_REQUEST_HEADERS`); this is defense in depth against an
+/// older backend still forwarding them. No runner handler reads either header
+/// from a relayed caller: the routes that read `Authorization` want a session
+/// proxy nonce and none of them is on `RELAY_ALLOWED`, and no route reads a
+/// cookie at all (plan `2026-09-17-retire-the-runner-origin-guard-dev-grace`,
+/// F5 / Phase 5).
 const RELAY_SKIP_REQUEST_HEADERS: &[&str] = &[
     "host",
     "connection",
@@ -3554,6 +3567,8 @@ const RELAY_SKIP_REQUEST_HEADERS: &[&str] = &[
     "content-length",
     "origin",
     "sec-fetch-site",
+    "cookie",
+    "authorization",
 ];
 
 /// Hop-by-hop / framing response headers that must NOT be echoed back over
@@ -6217,17 +6232,19 @@ async fn handle_terminal_attach(api_state: &Arc<ApiState>, data: &Value) -> Opti
 ///
 /// Admission is `admit_terminal_end`: the terminal comes from the grant ROW's
 /// session, a named terminal is only compared, a missing `remote` block is
-/// refused, and the grant is never bound. `force: false` runs
-/// `TerminalManager::graceful_exit` (types `/exit` only at an empty prompt,
-/// never kills a `claude` that outlives the deadline); `force: true` is the
-/// hard `tm.close`. Either close funnels through `close_with_deadline` /
+/// refused, and the grant is never bound. The end itself is
+/// [`end_admitted_terminal`]. `force: false` runs
+/// `TerminalManager::graceful_exit` with no close authority, which is refused
+/// `no_close_authority` while a live `claude` is in the pane (R0a); a bare
+/// shell is closed as before. `force: true` is the hard `tm.close`. Either
+/// close funnels through `close_with_deadline` /
 /// `close_inner`, which emits the pane's ordinary `terminal-exit` — the path
 /// that retires an OPEN tab on the source (relay `terminal_exit` →
 /// `remote_terminal_exit`), and that this handler does not duplicate.
 async fn handle_terminal_end(api_state: &Arc<ApiState>, data: &Value) -> Option<Value> {
     use crate::mcp::remote_terminal::{
-        admit_terminal_end, end_slots, execute_terminal_end, grants, now_epoch_secs,
-        single_flight_end, terminal_ended_frame, AdmittedEnd, EndOutcome, EndVerdict,
+        admit_terminal_end, grants, now_epoch_secs, terminal_ended_frame, AdmittedEnd, EndOutcome,
+        EndVerdict,
     };
     let Some(tm) = api_state
         .app_handle
@@ -6323,33 +6340,7 @@ async fn handle_terminal_end(api_state: &Arc<ApiState>, data: &Value) -> Option<
         force,
         "remote end: admitted — ending the grant's session"
     );
-    let graceful_tm = tm.clone();
-    let graceful_id = terminal_id.clone();
-    let close_tm = tm.clone();
-    let close_id = terminal_id.clone();
-    // Single-flight per terminal: a second end while this one's driver runs is
-    // answered `refused` / `end_already_running` and starts nothing. The slot
-    // is guard-held, so it is freed on every path this leaves by, panic too.
-    let verdict = single_flight_end(end_slots(), &terminal_id, move || {
-        execute_terminal_end(
-            force,
-            move || async move {
-                graceful_tm
-                    .graceful_exit(
-                        &graceful_id,
-                        crate::terminal::graceful_exit::DEFAULT_DEADLINE,
-                    )
-                    .await
-            },
-            move || async move {
-                match spawn_blocking_tracked(move || close_tm.close(&close_id)).await {
-                    Ok(result) => result,
-                    Err(e) => Err(format!("close task failed: {e}")),
-                }
-            },
-        )
-    })
-    .await;
+    let verdict = end_admitted_terminal(tm, &terminal_id, force).await;
     info!(
         grant_jti = %grant.grant_jti,
         session = %grant.session_id,
@@ -6365,6 +6356,55 @@ async fn handle_terminal_end(api_state: &Arc<ApiState>, data: &Value) -> Option<
         Some(&terminal_id),
         &verdict,
     ))
+}
+
+/// TARGET role: end one ADMITTED remote end's terminal on `tm`. This is
+/// everything [`handle_terminal_end`] does after the grant admitted the frame.
+///
+/// * Single-flight per terminal. A second end while this one's driver runs is
+///   answered `refused` / `end_already_running` and starts nothing. The slot is
+///   guard-held, so it is freed on every path this leaves by, panic too.
+/// * `force: true` is the hard `tm.close`.
+/// * Otherwise it is `TerminalManager::graceful_exit`, presenting NO close
+///   authority. A relay end from another device is not the lifecycle Closer,
+///   and only the Closer will mint one (plan
+///   `2026-10-28-one-session-lifecycle-authority`, Phase 14 / R0a). So while a
+///   live `claude` is in the pane, the end is refused `no_close_authority`
+///   before a byte is typed (`refused`, with that reason, on the wire). A bare
+///   shell answers `NoLiveClaude` and is closed exactly as before.
+///
+/// Split out so the refusal is testable without an `AppHandle` or a grant.
+pub(crate) async fn end_admitted_terminal(
+    tm: Arc<crate::terminal::TerminalManager>,
+    terminal_id: &str,
+    force: bool,
+) -> crate::mcp::remote_terminal::EndVerdict {
+    use crate::mcp::remote_terminal::{end_slots, execute_terminal_end, single_flight_end};
+    let graceful_tm = tm.clone();
+    let graceful_id = terminal_id.to_string();
+    let close_tm = tm;
+    let close_id = terminal_id.to_string();
+    single_flight_end(end_slots(), terminal_id, move || {
+        execute_terminal_end(
+            force,
+            move || async move {
+                graceful_tm
+                    .graceful_exit(
+                        &graceful_id,
+                        crate::terminal::graceful_exit::DEFAULT_DEADLINE,
+                        None,
+                    )
+                    .await
+            },
+            move || async move {
+                match spawn_blocking_tracked(move || close_tm.close(&close_id)).await {
+                    Ok(result) => result,
+                    Err(e) => Err(format!("close task failed: {e}")),
+                }
+            },
+        )
+    })
+    .await
 }
 
 /// TARGET role, Phase 5: the SOURCE's `EmissionGate` (relayed as
@@ -7342,6 +7382,53 @@ mod tests {
             parsed["sec_fetch_site"],
             Value::Null,
             "sec-fetch-site must not reach it either"
+        );
+        assert_eq!(parsed["x_test"], "kept", "ordinary headers still forwarded");
+    }
+
+    /// Plan `2026-09-17-retire-the-runner-origin-guard-dev-grace` Phase 5
+    /// acceptance test 3: a relayed frame carrying the browser's ambient
+    /// credentials (`cookie`, `authorization`) must reach the loopback
+    /// self-call with neither, while an ordinary header still passes — so the
+    /// test cannot go green by stripping every header.
+    #[tokio::test]
+    async fn relay_strips_ambient_cookie_and_authorization() {
+        async fn handler(headers: HeaderMap) -> impl axum::response::IntoResponse {
+            let body = json!({
+                "cookie": headers.get("cookie").and_then(|v| v.to_str().ok()),
+                "authorization": headers.get("authorization").and_then(|v| v.to_str().ok()),
+                "x_test": headers.get("x-test").and_then(|v| v.to_str().ok()),
+            })
+            .to_string();
+            (AxumStatus::OK, [("content-type", "application/json")], body)
+        }
+        // `/status` is RELAY_ALLOWED (see the GET round trip above).
+        let base = spawn_test_server(Router::new().route("/status", get(handler))).await;
+        let env = json!({
+            "type": "http_request",
+            "request_id": "req-ambient-cred",
+            "method": "GET",
+            "path": "/status",
+            "headers": {
+                "Cookie": "access_token=x",
+                "Authorization": "Bearer y",
+                "x-test": "kept"
+            },
+            "body_b64": ""
+        });
+        let reply = relay_http_to_base(&base, &env).await;
+        assert_eq!(reply["status"], 200);
+        let body = String::from_utf8(b64_decode(reply["body_b64"].as_str().unwrap())).unwrap();
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            parsed["cookie"],
+            Value::Null,
+            "cookie must not reach the loopback call"
+        );
+        assert_eq!(
+            parsed["authorization"],
+            Value::Null,
+            "authorization must not reach the loopback call"
         );
         assert_eq!(parsed["x_test"], "kept", "ordinary headers still forwarded");
     }
@@ -11146,5 +11233,81 @@ mod egress_tests {
             .unwrap();
         let build = out.find("let relay_msg = match channel").unwrap();
         assert!(gate < build);
+    }
+}
+
+#[cfg(test)]
+mod remote_end_close_authority_tests {
+    //! R0a for the relay's remote end (plan
+    //! `2026-10-28-one-session-lifecycle-authority`, Phase 14), entered at the
+    //! end's own post-admission path, [`super::end_admitted_terminal`]. That is
+    //! the code [`super::handle_terminal_end`] runs once the grant has
+    //! admitted the frame.
+    use super::end_admitted_terminal;
+    use crate::mcp::remote_terminal::{end_slots, terminal_ended_frame, EndOutcome};
+    use crate::terminal::TerminalManager;
+    use std::sync::Arc;
+
+    /// A graceful end of a coord-finished session whose pane holds ONE live
+    /// `claude` with ZERO children, at an empty prompt that would accept
+    /// `/exit`, is refused `no_close_authority`. It is reported on the wire as
+    /// `refused` with that reason. Nothing is typed, nothing is killed, the
+    /// pane stays registered, and the single-flight slot is released.
+    #[tokio::test(start_paused = true)]
+    async fn a_graceful_remote_end_is_refused_no_close_authority_on_a_live_claude() {
+        let pane = crate::terminal::session::tests::live_claude_pane();
+        let tm = Arc::new(TerminalManager::new());
+        let id = "relay-end-r0a-live";
+        tm.insert_for_test(id, pane.session.clone());
+
+        let verdict = end_admitted_terminal(tm.clone(), id, false).await;
+
+        assert_eq!(verdict.outcome, EndOutcome::Refused, "{verdict:?}");
+        assert_eq!(verdict.via, None);
+        let reason = verdict.reason.clone().unwrap_or_default();
+        assert!(reason.starts_with("no_close_authority"), "{reason}");
+        assert!(pane.typed().is_empty(), "typed into a live claude");
+        assert_eq!(pane.kills(), 0);
+        assert!(
+            tm.get(id).is_some(),
+            "a refused end must leave the pane registered"
+        );
+        assert!(
+            !end_slots().is_running(id),
+            "the single-flight slot was not freed"
+        );
+
+        // ...and the reply the source receives says so.
+        let frame = terminal_ended_frame(
+            &serde_json::json!({ "request_id": "r-1" }),
+            None,
+            Some(id),
+            &verdict,
+        );
+        assert_eq!(frame["outcome"], "refused");
+        assert!(frame["reason"]
+            .as_str()
+            .is_some_and(|r| r.starts_with("no_close_authority")));
+    }
+
+    /// The other half of R0a's placement: a pane with NO live `claude` needs
+    /// no authority. The relay still answers `NoLiveClaude` by closing the bare
+    /// shell, exactly as before.
+    #[tokio::test]
+    async fn a_bare_shell_is_still_closed_by_a_graceful_remote_end() {
+        let pane = crate::terminal::session::tests::bare_shell_pane();
+        let tm = Arc::new(TerminalManager::new());
+        let id = "relay-end-r0a-bare";
+        tm.insert_for_test(id, pane.session.clone());
+
+        let verdict = end_admitted_terminal(tm.clone(), id, false).await;
+
+        assert_eq!(verdict.outcome, EndOutcome::Ended, "{verdict:?}");
+        assert_eq!(verdict.via.as_deref(), Some("no_live_claude"));
+        assert!(
+            pane.typed().is_empty(),
+            "typing into a bare shell is not a no-op"
+        );
+        assert!(tm.get(id).is_none(), "the bare shell was closed");
     }
 }

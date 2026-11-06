@@ -123,6 +123,8 @@ mod dom_capture;
 mod drain;
 mod egress; // Plan 2026-10-10-spec-front-end-phase-9-generic-boundary Phase 7 — per-tenant egress switches
 #[cfg(test)]
+mod runner_close_sites;
+#[cfg(test)]
 mod runner_spawn_sites;
 // `embedded_pg` lives in the LIB crate as of P4 (lib-side consumers need it).
 // Re-bound here as `pub(crate)` so every existing `crate::embedded_pg::...`
@@ -226,7 +228,7 @@ mod prompt_snippets;
 mod prompts;
 /// The `qontinui-provenance:` frontmatter key both fleet provisioners stamp.
 mod provenance;
-/// The shared tracked-destination guard both fleet provisioners consult.
+/// The shared tracked-destination guard every fleet provisioner consults.
 mod provision_guard;
 mod rag;
 mod recording;
@@ -2259,7 +2261,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // one-shot best-effort sweep of stale credential-helper
                 // config files (%TEMP%/qontinui-git-cred-*.json older than
                 // 24h). Sessions normally remove their own file via the
-                // SessionRegistry::close funnel; the sweep reaps files
+                // SessionRegistry::close_by_id funnel; the sweep reaps files
                 // orphaned by crashes/kills. Never fails or slows the boot.
                 credential_helper::spawn_startup_sweep();
                 // Scheduled-maintenance executor (Phase 1, plan
@@ -3464,6 +3466,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::setup_wizard::complete_setup,
             commands::setup_wizard::detect_project_framework_for_setup,
             commands::setup_wizard::discover_claude_config_dirs,
+            commands::setup_wizard::add_claude_config_dirs_from_setup,
             commands::setup_wizard::github_clone_repo,
             commands::setup_wizard::github_connect_url,
             commands::setup_wizard::github_list_repos,
@@ -3703,6 +3706,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::watchers::update_watcher,
             commands::web_integration::get_settings_health,
             commands::web_integration::get_web_integration_status,
+            commands::web_integration::get_web_frontend_origin,
             commands::web_integration::redeem_pair_code,
             commands::web_integration::save_web_integration_settings,
             commands::web_integration::test_web_integration_connection,
@@ -5381,10 +5385,11 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
                 // Tier-0 looping-agent supervisor (plan merge-shepherd-fixer,
                 // Phase 1): opens/seeds the durable looping-agents registry
-                // (built-in Merge Shepherd, DISABLED until the operator flips
-                // it), manages it for the control-surface commands, and starts
-                // the supervised tick loop (idle-nudge on cadence, context-low
-                // / K-cycle fresh relaunch, dead-tab respawn). Placed after the
+                // (built-in Merge Shepherd, ENABLED by default; spawning still
+                // needs a coord slot lease), manages it for the control-surface
+                // commands, and starts the supervised tick loop (idle-nudge on
+                // cadence, context-low / K-cycle fresh relaunch, dead-tab
+                // respawn). Placed after the
                 // lifecycle store manage so restart re-attach can resolve
                 // boot-restored tabs; the loop itself waits a boot-settle delay
                 // before its first tick.

@@ -28,8 +28,14 @@
 //! FIRST and then overlays any checkout copies on top. An operator editing
 //! `qontinui-claude-config/.claude/agents/*.md` keeps the live-edit workflow
 //! they have today, byte for byte; a device with no checkout gets the embedded
-//! set instead of nothing. The change is strictly additive — no configuration
-//! that worked before resolves differently now.
+//! set instead of nothing.
+//!
+//! **Both layers yield to the destination's own repository.** A definition the
+//! enclosing repo tracks is kept as it is, and so is an existing one when the
+//! tracked-file probe could not answer inside a repo. That is decided once,
+//! before either layer writes ([`crate::provision_guard::KeepDecisions`]). So in
+//! a `qontinui-claude-config` worktree the session resolves that worktree's own
+//! commit of a tracked definition, not the primary checkout's.
 //!
 //! ## The `.md` files in `fleet_agents/` are a RENDER, not the source of truth
 //!

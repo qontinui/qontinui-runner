@@ -132,6 +132,8 @@ export interface PastSessionsQuery {
 export interface UsePastSessionsResult {
   sessions: PastSession[];
   loading: boolean;
+  /** True once a read has SUCCEEDED — before that an empty `sessions` is UNKNOWN, not none. */
+  loaded: boolean;
   error: string | null;
   refresh: () => void;
 }
@@ -146,17 +148,17 @@ export interface UsePastSessionsResult {
  * `2026-08-29-no-single-answer-to-is-it-safe-to-restart-the-runner` Phase 2).
  * Reading `sessions` by name is exactly why that addition is non-breaking here.
  * The sibling `transcript_list_sessions` returns a bare array. Accept either,
- * and return
- * `[]` for anything unexpected: consumers iterate this value during render, so
- * a non-array here would throw and take the whole panel down with it.
+ * and return `null` for anything unexpected: the caller renders that as no rows,
+ * because consumers iterate the list during render and a non-array would take
+ * the whole panel down, and it records that the read did not succeed.
  */
-function extractSessions(data: unknown): PastSession[] {
+function extractSessions(data: unknown): PastSession[] | null {
   if (Array.isArray(data)) return data as PastSession[];
   if (data && typeof data === "object") {
     const inner = (data as { sessions?: unknown }).sessions;
     if (Array.isArray(inner)) return inner as PastSession[];
   }
-  return [];
+  return null;
 }
 
 /**
@@ -168,6 +170,7 @@ function extractSessions(data: unknown): PastSession[] {
 export function usePastSessions(opts?: PastSessionsQuery): UsePastSessionsResult {
   const [sessions, setSessions] = useState<PastSession[]>([]);
   const [loading, setLoading] = useState(false);
+  const [loaded, setLoaded] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const didLoad = useRef(false);
 
@@ -185,7 +188,10 @@ export function usePastSessions(opts?: PastSessionsQuery): UsePastSessionsResult
         // degrade to "no sessions", never throw into the render tree (an
         // earlier revision assigned the envelope object straight to state,
         // and `groupByCohort`'s `for...of` then crashed the whole panel).
-        setSessions(extractSessions(result.data));
+        // `loaded` stays false for it: that is a read we could not understand.
+        const extracted = extractSessions(result.data);
+        setSessions(extracted ?? []);
+        setLoaded(extracted !== null);
       } else {
         setError(result.message || "Failed to load previous sessions");
       }
@@ -206,6 +212,7 @@ export function usePastSessions(opts?: PastSessionsQuery): UsePastSessionsResult
   return {
     sessions,
     loading,
+    loaded,
     error,
     refresh: fetchSessions,
   };

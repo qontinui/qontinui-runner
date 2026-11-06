@@ -668,6 +668,11 @@ function Start-DirectRunner {
         "QONTINUI_SECURE_STORAGE_DIR" = $configDir
         "WEBVIEW2_USER_DATA_FOLDER"   = $webviewDir
         "QONTINUI_DISABLE_KEYCHAIN"   = "1"
+        # ~/.qontinui inside our temp tree as well: the runner writes its
+        # loopback key and breadcrumbs under qontinui_dir() (ambient.rs, which
+        # honours QONTINUI_HOME), and on a persistent self-hosted account those
+        # files would otherwise outlive this job in the real profile.
+        "QONTINUI_HOME"               = (Join-Path $tmpRoot "home")
         # Pin the runner's startup-panic log into our temp tree. The runner
         # writes <QONTINUI_RUNNER_LOG_DIR>/runner-panic.log on any early-init
         # panic (startup_panic.rs); an exit code 2 is *defined* as a panic

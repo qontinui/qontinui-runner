@@ -11,6 +11,7 @@ use super::compartments::BridgeCompartment;
 use super::CommandResponse;
 use crate::auth::AuthManager;
 use crate::error::AppError;
+use crate::executor::run_bridge_blocking;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
@@ -19,6 +20,12 @@ use tauri::State;
 use tracing::{error, info};
 
 // Migrated to BridgeCompartment (Workstream C).
+//
+// The extraction commands are `async` with their `*_impl` body on a blocking
+// thread: each locks the extraction executor and may start it or wait on its
+// Python process, and a sync command would do that on the main thread (plan
+// `2026-11-04-runner-wedge-detector-reads-a-boot-as-a-wedge-and-never-bound-is-silent`
+// Phase 3).
 
 /// Configuration for vision extraction
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,11 +78,13 @@ pub struct WebExtractionConfig {
 /// with the main PythonBridge, allowing extraction to run concurrently with
 /// GUI automation workflows.
 #[tauri::command]
-pub fn start_web_extraction(
-    state: State<BridgeCompartment>,
+pub async fn start_web_extraction(
+    state: State<'_, BridgeCompartment>,
     config: WebExtractionConfig,
 ) -> Result<CommandResponse, String> {
-    start_web_extraction_impl(&state, config).map_err(String::from)
+    let state = state.inner().clone();
+    run_bridge_blocking(move || start_web_extraction_impl(&state, config).map_err(String::from))
+        .await?
 }
 
 fn start_web_extraction_impl(
@@ -127,11 +136,13 @@ fn start_web_extraction_impl(
 /// This command runs vision-based element detection on a screenshot using
 /// edge detection, SAM3 segmentation, and OCR.
 #[tauri::command]
-pub fn start_vision_extraction(
-    state: State<BridgeCompartment>,
+pub async fn start_vision_extraction(
+    state: State<'_, BridgeCompartment>,
     config: VisionExtractionConfig,
 ) -> Result<CommandResponse, String> {
-    start_vision_extraction_impl(&state, config).map_err(String::from)
+    let state = state.inner().clone();
+    run_bridge_blocking(move || start_vision_extraction_impl(&state, config).map_err(String::from))
+        .await?
 }
 
 fn start_vision_extraction_impl(
@@ -184,8 +195,11 @@ fn start_vision_extraction_impl(
 
 /// Stop the current web extraction process
 #[tauri::command]
-pub fn stop_web_extraction(state: State<BridgeCompartment>) -> Result<CommandResponse, String> {
-    stop_web_extraction_impl(&state).map_err(String::from)
+pub async fn stop_web_extraction(
+    state: State<'_, BridgeCompartment>,
+) -> Result<CommandResponse, String> {
+    let state = state.inner().clone();
+    run_bridge_blocking(move || stop_web_extraction_impl(&state).map_err(String::from)).await?
 }
 
 fn stop_web_extraction_impl(state: &BridgeCompartment) -> Result<CommandResponse, AppError> {
@@ -218,8 +232,11 @@ fn stop_web_extraction_impl(state: &BridgeCompartment) -> Result<CommandResponse
 
 /// Get the current extraction status
 #[tauri::command]
-pub fn get_extraction_status(state: State<BridgeCompartment>) -> Result<CommandResponse, String> {
-    get_extraction_status_impl(&state).map_err(String::from)
+pub async fn get_extraction_status(
+    state: State<'_, BridgeCompartment>,
+) -> Result<CommandResponse, String> {
+    let state = state.inner().clone();
+    run_bridge_blocking(move || get_extraction_status_impl(&state).map_err(String::from)).await?
 }
 
 fn get_extraction_status_impl(state: &BridgeCompartment) -> Result<CommandResponse, AppError> {
@@ -261,11 +278,15 @@ pub struct ScreenshotRequest {
 }
 
 #[tauri::command]
-pub fn request_extraction_screenshot(
-    state: State<BridgeCompartment>,
+pub async fn request_extraction_screenshot(
+    state: State<'_, BridgeCompartment>,
     request: ScreenshotRequest,
 ) -> Result<CommandResponse, String> {
-    request_extraction_screenshot_impl(&state, request).map_err(String::from)
+    let state = state.inner().clone();
+    run_bridge_blocking(move || {
+        request_extraction_screenshot_impl(&state, request).map_err(String::from)
+    })
+    .await?
 }
 
 fn request_extraction_screenshot_impl(
@@ -319,11 +340,13 @@ pub struct TrainingDataExportConfig {
 
 /// Export extraction results as training data
 #[tauri::command]
-pub fn export_training_data(
-    state: State<BridgeCompartment>,
+pub async fn export_training_data(
+    state: State<'_, BridgeCompartment>,
     config: TrainingDataExportConfig,
 ) -> Result<CommandResponse, String> {
-    export_training_data_impl(&state, config).map_err(String::from)
+    let state = state.inner().clone();
+    run_bridge_blocking(move || export_training_data_impl(&state, config).map_err(String::from))
+        .await?
 }
 
 fn export_training_data_impl(
@@ -377,11 +400,13 @@ pub struct StateStructureExportConfig {
 }
 
 #[tauri::command]
-pub fn export_state_structure(
-    state: State<BridgeCompartment>,
+pub async fn export_state_structure(
+    state: State<'_, BridgeCompartment>,
     config: StateStructureExportConfig,
 ) -> Result<CommandResponse, String> {
-    export_state_structure_impl(&state, config).map_err(String::from)
+    let state = state.inner().clone();
+    run_bridge_blocking(move || export_state_structure_impl(&state, config).map_err(String::from))
+        .await?
 }
 
 fn export_state_structure_impl(
@@ -426,8 +451,11 @@ fn export_state_structure_impl(
 
 /// Get list of available extractions
 #[tauri::command]
-pub fn list_extractions(state: State<BridgeCompartment>) -> Result<CommandResponse, String> {
-    list_extractions_impl(&state).map_err(String::from)
+pub async fn list_extractions(
+    state: State<'_, BridgeCompartment>,
+) -> Result<CommandResponse, String> {
+    let state = state.inner().clone();
+    run_bridge_blocking(move || list_extractions_impl(&state).map_err(String::from)).await?
 }
 
 fn list_extractions_impl(state: &BridgeCompartment) -> Result<CommandResponse, AppError> {

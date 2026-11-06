@@ -72,7 +72,7 @@ export function repoExpectedText(repo: TenancyRepoExpected | null | undefined): 
       where = "no repo (the working directory is not a git checkout)";
       break;
     case "repo_unregistered":
-      where = `none (repo ${repo.repo ?? "?"} has no owning tenant in coord)`;
+      where = `none (repo ${repo.repo ?? "?"} is owned by no tenant this device is paired to)`;
       break;
     case "several":
       where = `ambiguous (repo ${repo.repo ?? "?"} is registered to ${repo.tenantIds.length} tenants: ${repo.tenantIds.join(", ")})`;
@@ -283,14 +283,17 @@ export function TenantBadge({ tenantId, claudeSessionId, className }: TenantBadg
       data-tenant-credential={info.body?.tenancy?.credential.tenantId ?? undefined}
       data-tenant-repo-expected={info.body?.tenancy?.repoExpected?.status ?? undefined}
       data-tenant-repo-verdict={info.body?.tenancy?.repoExpected?.verdict ?? undefined}
-      className={`flex items-center gap-0.5 shrink-0 text-[8px] px-1 py-0 rounded font-mono ${tone} ${
+      className={`flex items-center gap-0.5 min-w-[18px] overflow-hidden text-[8px] px-1 py-0 rounded font-mono ${tone} ${
         className ?? ""
       }`}
       title={label.title}
       aria-label={label.title}
     >
-      <Building2 className="w-2.5 h-2.5" aria-hidden />
-      {label.text}
+      {/* Truncates in a narrow zone header, keeping its icon; `title` and
+          `aria-label` carry the full text. Budgeted in
+          `HEADER_TRUNCATING_FLOORS_PX`. */}
+      <Building2 className="w-2.5 h-2.5 shrink-0" aria-hidden />
+      <span className="truncate">{label.text}</span>
     </span>
   );
 }

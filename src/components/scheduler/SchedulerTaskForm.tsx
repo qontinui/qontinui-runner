@@ -30,6 +30,7 @@ import type {
   McpConnectionRef,
 } from "../../types/scheduler";
 import type { UnifiedWorkflow } from "../../types/unified-workflow";
+import { buildRemoteAgentTask } from "./remoteAgentTaskHelpers";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 interface PromptOption {
@@ -460,8 +461,7 @@ export function SchedulerTaskForm({
             name: name.trim(),
             url: url && url.trim() !== "" ? url.trim() : null,
           }));
-        return {
-          task_type: "RemoteAgent",
+        return buildRemoteAgentTask(initRemoteAgent, {
           prompt: agentPrompt,
           working_directory: agentWorkingDirectory.trim() || null,
           allowed_tools: agentAllowedTools,
@@ -469,7 +469,7 @@ export function SchedulerTaskForm({
           mcp_connections: cleanedMcp,
           max_turns: Number.isFinite(parsedMaxTurns) ? parsedMaxTurns : null,
           timeout_seconds: Number.isFinite(parsedTimeout) ? parsedTimeout : null,
-        };
+        });
       }
     }
   };

@@ -17,6 +17,7 @@
  * cannot silently drift from what it stands in for.
  */
 
+import type { ZoneHeaderMenuActions } from "../ZoneHoverActions";
 import { act, createElement, forwardRef, useEffect, useRef, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { readFileSync } from "node:fs";
@@ -139,7 +140,15 @@ vi.mock("../WorkerSessionCell", () => ({
   },
 }));
 vi.mock("../suggestions", () => ({ SuggestionChip: () => null }));
-vi.mock("../ZoneHoverActions", () => ({ ZoneHoverActions: () => null }));
+const hover = vi.hoisted(() => ({
+  headerActions: undefined as ZoneHeaderMenuActions | undefined,
+}));
+vi.mock("../ZoneHoverActions", () => ({
+  ZoneHoverActions: (props: { headerActions?: ZoneHeaderMenuActions }) => {
+    hover.headerActions = props.headerActions;
+    return null;
+  },
+}));
 vi.mock("../SessionInfoDropdown", () => ({
   SessionInfoDropdown: ({ zoneIndex }: { zoneIndex: number }) =>
     createElement("span", { "data-session-info-zone": zoneIndex }),
@@ -535,6 +544,69 @@ describe("tmux cells — zone cosmetics follow the session's grid zone", () => {
     expect(pin).not.toBeNull();
     act(() => pin!.click());
     expect(togglePin.mock.calls).toEqual([[2]]);
+  });
+
+  it("hands the overflow menu the same toggles the row shows, on the same grid zone", () => {
+    const togglePin = vi.fn();
+    const toggleFilter = vi.fn();
+    const scrollToBottom = vi.fn();
+    renderViewport(tabs, "b", "b", {
+      cellProps: {
+        ...cosmetics,
+        onTogglePin: togglePin,
+        onToggleFilterInput: toggleFilter,
+        zoneFilters: { 2: "needle" },
+        terminalRefs: new Map([["b", { current: { scrollToBottom } }]]) as never,
+      },
+      cosmeticZoneFor: (zoneIdx) => (zoneIdx === 0 ? 2 : null),
+    });
+    const menu = hover.headerActions!;
+    expect(menu.isPinned).toBe(true);
+    expect(menu.filterActive).toBe(true);
+    act(() => menu.onTogglePin!());
+    expect(togglePin.mock.calls).toEqual([[2]]);
+    act(() => menu.onToggleFilter!());
+    expect(toggleFilter.mock.calls).toEqual([[2]]);
+    act(() => menu.onScrollToBottom!());
+    expect(scrollToBottom).toHaveBeenCalledTimes(1);
+    // This tab offers no prompts, so neither the row nor the menu does.
+    expect(menu.onTogglePrompts).toBeUndefined();
+    expect(container.querySelector("[title$='my prompts']")).toBeNull();
+    expect(menu.onToggleReview).toBeUndefined();
+  });
+
+  it("offers the menu nothing for a zone whose row is not showing", () => {
+    hover.headerActions = { isPinned: true };
+    act(() => {
+      root.render(
+        createElement(
+          "div",
+          { "data-terminal-work-mode": "grid" },
+          buildZoneCells({
+            workMode: "grid",
+            zones: [{ col: "1", row: "1" }],
+            cellProps: { ...cellPropsFor(tabs, "a"), showLabels: false },
+            shownTabId: null,
+            maximizedZone: null,
+            cosmeticZoneFor: () => 0,
+            promptTabs: new Set<string>(),
+            reviewTabs: new Set<string>(),
+            dropTargetZone: null,
+          }),
+        ),
+      );
+    });
+    expect(hover.headerActions).toBeUndefined();
+  });
+
+  it("offers the menu no pin or filter for a session with no grid zone", () => {
+    renderViewport(tabs, "b", "b", {
+      cellProps: { ...cosmetics, onTogglePin: vi.fn(), onToggleFilterInput: vi.fn() },
+      cosmeticZoneFor: () => null,
+    });
+    expect(hover.headerActions!.onTogglePin).toBeUndefined();
+    expect(hover.headerActions!.onToggleFilter).toBeUndefined();
+    expect(container.querySelector("[title='Filter output']")).toBeNull();
   });
 
   it("a session with no grid zone shows no cosmetics and offers no editor for them", () => {

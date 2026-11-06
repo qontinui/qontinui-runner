@@ -31,8 +31,10 @@
 # A row changing action or args is a semantic change and needs a reason in
 # the PR. A row changing only its verdict may be the stubbed context in
 # realRegistry.testkit.ts moving instead — check that first.
-# tier: golden   inputs: 3156
+# tier: golden   inputs: 3196
 
+/1-plus-4 layout	pattern	terminal.layout	[["preset","1-plus-4"]]	ok	ok /layout ✓ changed 1 layout — 1-plus-4
+/1-plus-4 layout --tenant	none	-	null	none	-
 /admin	literal	terminal.elevated	[]	ok	ok /elevated ✓ launched 1 elevated terminal
 /admin "1 gmail fix the bug"	literal	terminal.elevated	[]	unbound	-
 /admin "1 gmail fix the bug" --tenant	literal	terminal.elevated	[]	unbound	-
@@ -245,6 +247,8 @@
 /close 3 --tenant	literal	terminal.close	[["tabId","--tenant"],["zone",3]]	error:unknown-tab	error /close: "--tenant" is not an open tab id
 /close 3 best	literal	terminal.close	[["tabId","best"],["zone",3]]	error:unknown-tab	error /close: "best" is not an open tab id
 /close 3 best --tenant	literal	terminal.close	[["tabId","best --tenant"],["zone",3]]	error:unknown-tab	error /close: "best --tenant" is not an open tab id
+/command-center layout	pattern	terminal.layout	[["preset","command-center"]]	ok	ok /layout ✓ changed 1 layout — command-center
+/command-center layout --tenant	none	-	null	none	-
 /conduct	literal	terminal.orchestrate	[]	error:invalid-args	error /orchestrate: a goal (or recipe-id + args) is required
 /conduct "1 gmail fix the bug"	literal	terminal.orchestrate	[["goal","1 gmail fix the bug"]]	error:no-run-id	error /orchestrate: conductor did not return a run id
 /conduct "1 gmail fix the bug" --tenant	literal	terminal.orchestrate	[["goal","1 gmail fix the bug --tenant"]]	error:no-run-id	error /orchestrate: conductor did not return a run id
@@ -477,6 +481,10 @@
 /findings 1 gmail fix the bug --tenant	literal	terminal.toggle-findings	[]	unbound	-
 /findings 3 best	literal	terminal.toggle-findings	[]	unbound	-
 /findings 3 best --tenant	literal	terminal.toggle-findings	[]	unbound	-
+/flow-grid layout	pattern	terminal.layout	[["preset","flow-grid"]]	ok	ok /layout ✓ changed 1 layout — flow-grid
+/flow-grid layout --tenant	none	-	null	none	-
+/flowgrid layout	pattern	terminal.layout	[["preset","flowgrid"]]	ok	ok /layout ✓ changed 1 layout — flow-grid
+/flowgrid layout --tenant	none	-	null	none	-
 /focus	literal	terminal.focus	[]	error:invalid-args	error /focus: target is required (a zone number, next, prev or needs-input)
 /focus "1 gmail fix the bug"	literal	terminal.focus	[["target","1 gmail fix the bug"]]	error:invalid-zone	error /focus: "1 gmail fix the bug" is not a zone number
 /focus "1 gmail fix the bug" --tenant	literal	terminal.focus	[["target","1 gmail fix the bug --tenant"]]	error:invalid-zone	error /focus: "1 gmail fix the bug --tenant" is not a zone number
@@ -621,10 +629,18 @@
 /layout 1 --tenant	literal	terminal.layout	[["preset","1 --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
 /layout 1 gmail fix the bug	literal	terminal.layout	[["preset","1 gmail fix the bug"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
 /layout 1 gmail fix the bug --tenant	literal	terminal.layout	[["preset","1 gmail fix the bug --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
+/layout 1-plus-4	pattern	terminal.layout	[["preset","1-plus-4"]]	ok	ok /layout ✓ changed 1 layout — 1-plus-4
+/layout 1-plus-4 --tenant	literal	terminal.layout	[["preset","1-plus-4 --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
 /layout 13	pattern	terminal.layout	[["preset",13]]	ok	ok /layout ✓ changed 1 layout — flow-grid
 /layout 13 --tenant	literal	terminal.layout	[["preset","13 --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
 /layout 3 best	literal	terminal.layout	[["preset","3 best"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
 /layout 3 best --tenant	literal	terminal.layout	[["preset","3 best --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
+/layout command-center	pattern	terminal.layout	[["preset","command-center"]]	ok	ok /layout ✓ changed 1 layout — command-center
+/layout command-center --tenant	literal	terminal.layout	[["preset","command-center --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
+/layout flow-grid	pattern	terminal.layout	[["preset","flow-grid"]]	ok	ok /layout ✓ changed 1 layout — flow-grid
+/layout flow-grid --tenant	literal	terminal.layout	[["preset","flow-grid --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
+/layout flowgrid	pattern	terminal.layout	[["preset","flowgrid"]]	ok	ok /layout ✓ changed 1 layout — flow-grid
+/layout flowgrid --tenant	literal	terminal.layout	[["preset","flowgrid --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
 /layout full-grid	pattern	terminal.layout	[["preset","full-grid"]]	ok	ok /layout ✓ changed 1 layout — full-grid
 /layout full-grid --tenant	literal	terminal.layout	[["preset","full-grid --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
 /layout fullgrid	pattern	terminal.layout	[["preset","fullgrid"]]	ok	ok /layout ✓ changed 1 layout — full-grid
@@ -639,6 +655,8 @@
 /layout sixpack --tenant	literal	terminal.layout	[["preset","sixpack --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
 /layout split	pattern	terminal.layout	[["preset","split"]]	ok	ok /layout ✓ changed 1 layout — split
 /layout split --tenant	literal	terminal.layout	[["preset","split --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
+/layout triptych	pattern	terminal.layout	[["preset","triptych"]]	ok	ok /layout ✓ changed 1 layout — triptych
+/layout triptych --tenant	literal	terminal.layout	[["preset","triptych --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
 /maximize	pattern	terminal.maximize	[]	ok	ok /maximize ✓ maximized zone 1
 /maximize "1 gmail fix the bug"	literal	terminal.maximize	[["zone","1 gmail fix the bug"]]	error:invalid-zone	error /maximize: "1 gmail fix the bug" is not a zone number
 /maximize "1 gmail fix the bug" --tenant	literal	terminal.maximize	[["zone","1 gmail fix the bug --tenant"]]	error:invalid-zone	error /maximize: "1 gmail fix the bug --tenant" is not a zone number
@@ -1389,6 +1407,8 @@
 /toggle-sound 1 gmail fix the bug --tenant	literal	terminal.toggle-sound	[]	unbound	-
 /toggle-sound 3 best	literal	terminal.toggle-sound	[]	unbound	-
 /toggle-sound 3 best --tenant	literal	terminal.toggle-sound	[]	unbound	-
+/triptych layout	pattern	terminal.layout	[["preset","triptych"]]	ok	ok /layout ✓ changed 1 layout — triptych
+/triptych layout --tenant	none	-	null	none	-
 /unmute	pattern	terminal.unmute	[]	ok	ok /unmute ✓ unmuted sound
 /unmute "1 gmail fix the bug"	literal	terminal.unmute	[]	unbound	-
 /unmute "1 gmail fix the bug" --tenant	literal	terminal.unmute	[]	unbound	-
@@ -1443,6 +1463,8 @@
 /yes all 1 gmail fix the bug --tenant	none	-	null	none	-
 /yes all 3 best	none	-	null	none	-
 /yes all 3 best --tenant	none	-	null	none	-
+1-plus-4 layout	pattern	terminal.layout	[["preset","1-plus-4"]]	ok	ok /layout ✓ changed 1 layout — 1-plus-4
+1-plus-4 layout --tenant	none	-	null	none	-
 admin	literal	terminal.elevated	[]	ok	ok /elevated ✓ launched 1 elevated terminal
 admin "1 gmail fix the bug"	literal	terminal.elevated	[]	unbound	-
 admin "1 gmail fix the bug" --tenant	literal	terminal.elevated	[]	unbound	-
@@ -1655,6 +1677,8 @@ close 3	pattern	terminal.close	[["zone",3]]	error:no-target	error /close: zone 3
 close 3 --tenant	literal	terminal.close	[["tabId","--tenant"],["zone",3]]	error:unknown-tab	error /close: "--tenant" is not an open tab id
 close 3 best	literal	terminal.close	[["tabId","best"],["zone",3]]	error:unknown-tab	error /close: "best" is not an open tab id
 close 3 best --tenant	literal	terminal.close	[["tabId","best --tenant"],["zone",3]]	error:unknown-tab	error /close: "best --tenant" is not an open tab id
+command-center layout	pattern	terminal.layout	[["preset","command-center"]]	ok	ok /layout ✓ changed 1 layout — command-center
+command-center layout --tenant	none	-	null	none	-
 conduct	literal	terminal.orchestrate	[]	error:invalid-args	error /orchestrate: a goal (or recipe-id + args) is required
 conduct "1 gmail fix the bug"	literal	terminal.orchestrate	[["goal","1 gmail fix the bug"]]	error:no-run-id	error /orchestrate: conductor did not return a run id
 conduct "1 gmail fix the bug" --tenant	literal	terminal.orchestrate	[["goal","1 gmail fix the bug --tenant"]]	error:no-run-id	error /orchestrate: conductor did not return a run id
@@ -1887,6 +1911,10 @@ findings 1 gmail fix the bug	literal	terminal.toggle-findings	[]	unbound	-
 findings 1 gmail fix the bug --tenant	literal	terminal.toggle-findings	[]	unbound	-
 findings 3 best	literal	terminal.toggle-findings	[]	unbound	-
 findings 3 best --tenant	literal	terminal.toggle-findings	[]	unbound	-
+flow-grid layout	pattern	terminal.layout	[["preset","flow-grid"]]	ok	ok /layout ✓ changed 1 layout — flow-grid
+flow-grid layout --tenant	none	-	null	none	-
+flowgrid layout	pattern	terminal.layout	[["preset","flowgrid"]]	ok	ok /layout ✓ changed 1 layout — flow-grid
+flowgrid layout --tenant	none	-	null	none	-
 focus	literal	terminal.focus	[]	error:invalid-args	error /focus: target is required (a zone number, next, prev or needs-input)
 focus "1 gmail fix the bug"	literal	terminal.focus	[["target","1 gmail fix the bug"]]	error:invalid-zone	error /focus: "1 gmail fix the bug" is not a zone number
 focus "1 gmail fix the bug" --tenant	literal	terminal.focus	[["target","1 gmail fix the bug --tenant"]]	error:invalid-zone	error /focus: "1 gmail fix the bug --tenant" is not a zone number
@@ -2031,10 +2059,18 @@ layout 1	pattern	terminal.layout	[["preset",1]]	ok	ok /layout ✓ changed 1 layo
 layout 1 --tenant	literal	terminal.layout	[["preset","1 --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
 layout 1 gmail fix the bug	literal	terminal.layout	[["preset","1 gmail fix the bug"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
 layout 1 gmail fix the bug --tenant	literal	terminal.layout	[["preset","1 gmail fix the bug --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
+layout 1-plus-4	pattern	terminal.layout	[["preset","1-plus-4"]]	ok	ok /layout ✓ changed 1 layout — 1-plus-4
+layout 1-plus-4 --tenant	literal	terminal.layout	[["preset","1-plus-4 --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
 layout 13	pattern	terminal.layout	[["preset",13]]	ok	ok /layout ✓ changed 1 layout — flow-grid
 layout 13 --tenant	literal	terminal.layout	[["preset","13 --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
 layout 3 best	literal	terminal.layout	[["preset","3 best"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
 layout 3 best --tenant	literal	terminal.layout	[["preset","3 best --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
+layout command-center	pattern	terminal.layout	[["preset","command-center"]]	ok	ok /layout ✓ changed 1 layout — command-center
+layout command-center --tenant	literal	terminal.layout	[["preset","command-center --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
+layout flow-grid	pattern	terminal.layout	[["preset","flow-grid"]]	ok	ok /layout ✓ changed 1 layout — flow-grid
+layout flow-grid --tenant	literal	terminal.layout	[["preset","flow-grid --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
+layout flowgrid	pattern	terminal.layout	[["preset","flowgrid"]]	ok	ok /layout ✓ changed 1 layout — flow-grid
+layout flowgrid --tenant	literal	terminal.layout	[["preset","flowgrid --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
 layout full-grid	pattern	terminal.layout	[["preset","full-grid"]]	ok	ok /layout ✓ changed 1 layout — full-grid
 layout full-grid --tenant	literal	terminal.layout	[["preset","full-grid --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
 layout fullgrid	pattern	terminal.layout	[["preset","fullgrid"]]	ok	ok /layout ✓ changed 1 layout — full-grid
@@ -2049,6 +2085,8 @@ layout sixpack	pattern	terminal.layout	[["preset","sixpack"]]	ok	ok /layout ✓ 
 layout sixpack --tenant	literal	terminal.layout	[["preset","sixpack --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
 layout split	pattern	terminal.layout	[["preset","split"]]	ok	ok /layout ✓ changed 1 layout — split
 layout split --tenant	literal	terminal.layout	[["preset","split --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
+layout triptych	pattern	terminal.layout	[["preset","triptych"]]	ok	ok /layout ✓ changed 1 layout — triptych
+layout triptych --tenant	literal	terminal.layout	[["preset","triptych --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
 maximize	pattern	terminal.maximize	[]	ok	ok /maximize ✓ maximized zone 1
 maximize "1 gmail fix the bug"	literal	terminal.maximize	[["zone","1 gmail fix the bug"]]	error:invalid-zone	error /maximize: "1 gmail fix the bug" is not a zone number
 maximize "1 gmail fix the bug" --tenant	literal	terminal.maximize	[["zone","1 gmail fix the bug --tenant"]]	error:invalid-zone	error /maximize: "1 gmail fix the bug --tenant" is not a zone number
@@ -2799,6 +2837,8 @@ toggle-sound 1 gmail fix the bug	literal	terminal.toggle-sound	[]	unbound	-
 toggle-sound 1 gmail fix the bug --tenant	literal	terminal.toggle-sound	[]	unbound	-
 toggle-sound 3 best	literal	terminal.toggle-sound	[]	unbound	-
 toggle-sound 3 best --tenant	literal	terminal.toggle-sound	[]	unbound	-
+triptych layout	pattern	terminal.layout	[["preset","triptych"]]	ok	ok /layout ✓ changed 1 layout — triptych
+triptych layout --tenant	none	-	null	none	-
 unmute	pattern	terminal.unmute	[]	ok	ok /unmute ✓ unmuted sound
 unmute "1 gmail fix the bug"	literal	terminal.unmute	[]	unbound	-
 unmute "1 gmail fix the bug" --tenant	literal	terminal.unmute	[]	unbound	-

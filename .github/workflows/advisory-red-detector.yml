@@ -36,11 +36,10 @@ name: advisory-red detector selftest
 #
 # That is a statement about REQUIRED CONTEXTS and not about ci-integrity.yml,
 # which keeps no GATING list a file could be listed in or absent from: its scope
-# is its own trigger (`.github/workflows/**`, `.github/actions/**`) minus a
-# deliberately EMPTY NON_GATING list. So this file IS inside that scope on a PR
-# based on `main` (that guard is `pull_request_target: branches: [main]`, so a
-# STACKED PR editing it fires no ci-integrity run at all). A main-based PR
-# editing it needs at least `ci:gate-change=declared`; one that alters an
+# is its own trigger (`.github/workflows/**`, `.github/actions/**` and one exact
+# script) minus a deliberately EMPTY NON_GATING list. So this file IS inside that
+# scope, on a PR with any base: that guard has carried no base-branch filter since
+# qontinui-runner#1253. A PR editing it needs at least `ci:gate-change=declared`; one that alters an
 # existing surface needs `ci:gate-change=alters-a-gate` plus a `Gate-Change:`
 # line per altered item — `<stem>#<job-key>` for a job, and `<stem>#workflow`
 # for a change outside `jobs:`, which is what an edit to the `on:` block

@@ -472,6 +472,74 @@ pub fn update(mutate: impl FnOnce(&mut ClaudeAccountsFile)) -> Result<(), String
     save(&file)
 }
 
+/// `true` when the roster file at `path` EXISTS but cannot be read or parsed.
+///
+/// [`load`] reads such a file as absent (fail-open, so settings load always
+/// succeeds), and the roster copy in the per-instance `settings.json` then
+/// applies instead. That copy is a shadow that whole-`Settings` saves keep
+/// rewriting, so it may be stale or empty. A caller about to WRITE the roster
+/// from what it read must check this first, or it overwrites the real roster
+/// with that copy.
+pub fn is_unreadable(path: &Path) -> bool {
+    path.exists() && load_from(path).is_none()
+}
+
+/// Add `dirs` to the roster's `claude_config_dirs`, never removing one.
+///
+/// The first-run setup wizard writes through this instead of the
+/// replace-style [`update`]: finishing a wizard must not shrink a roster an
+/// operator configured (qontinui-runner#2544; the incident is coord finding
+/// `bc9fdc87`). A dir already in the roster, under any spelling of the same
+/// path, is skipped. Returns how many were added; nothing is written when that
+/// is zero. Refuses, writing nothing, when the file exists but cannot be read.
+pub fn append_config_dirs(dirs: &[String]) -> Result<usize, String> {
+    let path = claude_accounts_file_path()
+        .ok_or_else(|| "Failed to resolve config directory for claude-accounts.json".to_string())?;
+    append_config_dirs_at(&path, dirs, || {
+        load_with_migration().unwrap_or_else(roster_from_current_settings)
+    })
+}
+
+/// [`append_config_dirs`] against an explicit file. `start` supplies the
+/// roster when the file is absent (the same starting point [`update`] uses).
+fn append_config_dirs_at(
+    path: &Path,
+    dirs: &[String],
+    start: impl FnOnce() -> ClaudeAccountsFile,
+) -> Result<usize, String> {
+    if dirs.is_empty() {
+        return Ok(0);
+    }
+    let mut file = if path.exists() {
+        load_from(path).ok_or_else(|| {
+            format!(
+                "{} exists but cannot be read; refusing to write the Claude account roster",
+                path.display()
+            )
+        })?
+    } else {
+        start()
+    };
+    let same_dir = |a: &str, b: &str| {
+        a == b
+            || match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+                (Ok(ca), Ok(cb)) => ca == cb,
+                _ => false,
+            }
+    };
+    let mut added = 0;
+    for dir in dirs {
+        if !file.claude_config_dirs.iter().any(|d| same_dir(d, dir)) {
+            file.claude_config_dirs.push(dir.clone());
+            added += 1;
+        }
+    }
+    if added > 0 {
+        save_to(path, &file)?;
+    }
+    Ok(added)
+}
+
 /// Snapshot the roster fields from the current effective settings.
 fn roster_from_current_settings() -> ClaudeAccountsFile {
     let s = crate::settings::load_settings();
@@ -489,6 +557,121 @@ fn roster_from_current_settings() -> ClaudeAccountsFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── append_config_dirs: the wizard's add-only write ──────────────────
+
+    fn roster_at(path: &Path) -> ClaudeAccountsFile {
+        load_from(path).expect("roster readable")
+    }
+
+    fn mk_account(root: &Path, name: &str) -> String {
+        let d = root.join(name);
+        std::fs::create_dir_all(d.join("projects")).unwrap();
+        d.to_string_lossy().to_string()
+    }
+
+    #[test]
+    fn append_adds_new_dirs_and_never_removes_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(CLAUDE_ACCOUNTS_FILE);
+        let a = mk_account(tmp.path(), ".claude-a");
+        let b = mk_account(tmp.path(), ".claude-b");
+        let existing = ClaudeAccountsFile {
+            claude_config_dirs: vec![a.clone()],
+            account_selection_mode: AccountSelectionMode::LeastUsage,
+            ..Default::default()
+        };
+        save_to(&path, &existing).unwrap();
+
+        let added = append_config_dirs_at(&path, &[b.clone(), a.clone()], || {
+            panic!("the file exists; the absent-file start must not run")
+        })
+        .unwrap();
+
+        assert_eq!(added, 1);
+        let after = roster_at(&path);
+        assert_eq!(after.claude_config_dirs, vec![a, b]);
+        assert_eq!(
+            after.account_selection_mode,
+            AccountSelectionMode::LeastUsage,
+            "sibling roster fields survive the append"
+        );
+    }
+
+    #[test]
+    fn append_of_nothing_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(CLAUDE_ACCOUNTS_FILE);
+        let added = append_config_dirs_at(&path, &[], ClaudeAccountsFile::default).unwrap();
+        assert_eq!(added, 0);
+        assert!(!path.exists(), "an empty append must not create the file");
+    }
+
+    #[test]
+    fn append_skips_a_dir_already_present_under_another_spelling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(CLAUDE_ACCOUNTS_FILE);
+        let a = mk_account(tmp.path(), ".claude-a");
+        let existing = ClaudeAccountsFile {
+            claude_config_dirs: vec![format!("{a}/")],
+            ..Default::default()
+        };
+        save_to(&path, &existing).unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        let added =
+            append_config_dirs_at(&path, std::slice::from_ref(&a), || unreachable!()).unwrap();
+
+        assert_eq!(added, 0);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "nothing new, nothing written"
+        );
+    }
+
+    #[test]
+    fn append_refuses_an_unreadable_roster_and_leaves_it_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(CLAUDE_ACCOUNTS_FILE);
+        std::fs::write(&path, b"{ not json").unwrap();
+        let b = mk_account(tmp.path(), ".claude-b");
+
+        let err = append_config_dirs_at(&path, &[b], ClaudeAccountsFile::default).unwrap_err();
+
+        assert!(err.contains("cannot be read"), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"{ not json");
+        assert!(is_unreadable(&path));
+    }
+
+    #[test]
+    fn append_to_an_absent_file_starts_from_the_effective_roster() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(CLAUDE_ACCOUNTS_FILE);
+        let x = mk_account(tmp.path(), ".claude-x");
+        let b = mk_account(tmp.path(), ".claude-b");
+        let x_start = x.clone();
+
+        let added = append_config_dirs_at(&path, std::slice::from_ref(&b), move || {
+            ClaudeAccountsFile {
+                claude_config_dirs: vec![x_start],
+                ..Default::default()
+            }
+        })
+        .unwrap();
+
+        assert_eq!(added, 1);
+        assert_eq!(roster_at(&path).claude_config_dirs, vec![x, b]);
+    }
+
+    #[test]
+    fn readable_and_absent_rosters_are_not_unreadable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(CLAUDE_ACCOUNTS_FILE);
+        assert!(!is_unreadable(&path), "absent is not unreadable");
+        save_to(&path, &ClaudeAccountsFile::default()).unwrap();
+        assert!(!is_unreadable(&path), "a valid file is readable");
+    }
 
     #[test]
     fn path_builder_is_unscoped_canonical_shape() {

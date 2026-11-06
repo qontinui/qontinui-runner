@@ -25,6 +25,25 @@
 //! created for the remote source; someone typing into it in this runner's own
 //! UI does not bind a grant and does not keep it alive past the deadline.
 //!
+//! ## A live `claude` is never reaped (m5-2)
+//!
+//! Plan `2026-10-28-one-session-lifecycle-authority`, Phase 14 (architecture
+//! R0a, item m5-2). Before closing a due terminal, the reaper probes its pane
+//! with the graceful-exit primitive's own probe (`probe_claude_under`). This
+//! matters because the deadline is about the SOURCE never attaching, which says
+//! nothing about what runs in the pane. A remote create opens a bare shell. If
+//! someone has since started `claude` in it (say, typed into it in this
+//! runner's own UI), the pane is now a live session, and a close is a kill.
+//!
+//! * no `claude` in the pane → a bare shell, reaped exactly as before;
+//! * a live `claude` → [`CloseOutcome::Held`]: left running and reported,
+//!   never killed;
+//! * a pane whose processes cannot be read, or that has no local pid → also
+//!   held, because a `claude` cannot be ruled out ("unprovable").
+//!
+//! A held terminal is not re-armed. From architecture R6-4, such a pane goes
+//! through the lifecycle Closer's guard instead.
+//!
 //! Time is MONOTONIC (`tokio::time::Instant`) throughout, so a wall-clock step
 //! can neither reap early nor make the single scheduled sweep miss its row.
 //! The decision is the pure [`decide`]; the table and the sweep are thin
@@ -93,6 +112,69 @@ pub enum CloseOutcome {
     /// The terminal was already gone (it exited, or the create path closed an
     /// undeliverable reply's terminal) — nothing to reap.
     AlreadyGone,
+    /// NOT closed: the pane holds a live `claude`, or one the probe could not
+    /// rule out (m5-2). The terminal is left running, untouched, and reported.
+    Held(HeldReason),
+}
+
+/// Why a due terminal was held rather than reaped (m5-2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HeldReason {
+    /// A `claude` is running in the pane.
+    LiveClaude { claude_pids: Vec<u32> },
+    /// The pane's processes could not be read, so a `claude` cannot be ruled
+    /// out — the same fail-closed reading the graceful-exit primitive takes.
+    Unprovable { detail: String },
+}
+
+impl HeldReason {
+    /// The `reason` field of the hold's log line.
+    pub fn word(&self) -> &'static str {
+        match self {
+            Self::LiveClaude { .. } => "live_claude",
+            Self::Unprovable { .. } => "claude_unprovable",
+        }
+    }
+}
+
+impl std::fmt::Display for HeldReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LiveClaude { claude_pids } => {
+                write!(f, "a live claude (pids {claude_pids:?}) is in the pane")
+            }
+            Self::Unprovable { detail } => {
+                write!(f, "a claude cannot be ruled out in the pane: {detail}")
+            }
+        }
+    }
+}
+
+/// What the reaper does with one due terminal, given what its probe saw.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReapVerdict {
+    /// No such terminal any more — nothing to reap.
+    Gone,
+    /// A bare shell — close it, as before.
+    Reap,
+    /// A live or unprovable `claude` — leave it running (m5-2).
+    Hold(HeldReason),
+}
+
+/// PURE (m5-2): the reaper's verdict on a due terminal from its pane probe.
+/// `None` means the terminal is no longer registered.
+pub fn reap_verdict(probe: Option<crate::terminal::graceful_exit::ClaudeProbe>) -> ReapVerdict {
+    use crate::terminal::graceful_exit::ClaudeProbe;
+    match probe {
+        None => ReapVerdict::Gone,
+        Some(ClaudeProbe::Readable(view)) if view.subtree_claude.is_empty() => ReapVerdict::Reap,
+        Some(ClaudeProbe::Readable(view)) => ReapVerdict::Hold(HeldReason::LiveClaude {
+            claude_pids: view.subtree_claude.iter().map(|id| id.pid).collect(),
+        }),
+        Some(ClaudeProbe::Unreadable(detail)) => {
+            ReapVerdict::Hold(HeldReason::Unprovable { detail })
+        }
+    }
 }
 
 /// One row of the table: an armed remote create, or an attach that arrived
@@ -247,6 +329,15 @@ where
                 reason = "already_closed",
                 "remote create: attach deadline passed for a terminal that had already closed"
             ),
+            Ok(CloseOutcome::Held(held)) => warn!(
+                terminal_id = %reaped.terminal_id,
+                coord_session = %coord_session,
+                deadline_secs,
+                reason = held.word(),
+                "remote create: NOT reaped — {held}. The never-attached terminal is HELD: \
+                 left running and never killed (m5-2). The reaper will not retry it; \
+                 from R6-4 the lifecycle Closer's guard decides it"
+            ),
             Err(e) => warn!(
                 terminal_id = %reaped.terminal_id,
                 coord_session = %coord_session,
@@ -293,7 +384,15 @@ pub fn reaper() -> Arc<RemoteCreateReaper> {
 /// What the reaper closes a terminal through. The production implementor is
 /// [`crate::terminal::TerminalManager`]; the trait is the seam that lets the
 /// production close path be tested without a Tauri `AppHandle` or a PTY.
+#[async_trait::async_trait]
 pub trait ReapTarget: Send + Sync + 'static {
+    /// Probe what runs in `terminal_id`'s pane, BEFORE any close (m5-2).
+    /// `None` when there is no such terminal.
+    async fn probe_pane(
+        &self,
+        terminal_id: &str,
+    ) -> Option<crate::terminal::graceful_exit::ClaudeProbe>;
+
     /// Close `terminal_id`. `Ok(AlreadyGone)` when there was no such terminal —
     /// it exited, or another close got there first.
     fn close_terminal(&self, terminal_id: &str) -> Result<CloseOutcome, String>;
@@ -304,7 +403,19 @@ pub trait ReapTarget: Send + Sync + 'static {
 /// `a_real_manager_maps_an_unknown_terminal_to_already_gone`.
 const TERMINAL_NOT_FOUND: &str = "Terminal session not found";
 
+#[async_trait::async_trait]
 impl ReapTarget for crate::terminal::TerminalManager {
+    /// The graceful-exit primitive's own probe, over the pane's root process:
+    /// the one-line tightening m5-2 names. A pane with no local pid is
+    /// `Unreadable`, so it reads as "a `claude` cannot be ruled out".
+    async fn probe_pane(
+        &self,
+        terminal_id: &str,
+    ) -> Option<crate::terminal::graceful_exit::ClaudeProbe> {
+        let root_pid = self.get(terminal_id)?.child_pid();
+        Some(crate::terminal::graceful_exit::probe_claude_under(root_pid, Vec::new()).await)
+    }
+
     /// No `get`-then-`close` check: the close itself answers whether the
     /// terminal was there, so a terminal that exits between a check and the
     /// close cannot be misreported as a failed reap.
@@ -317,14 +428,34 @@ impl ReapTarget for crate::terminal::TerminalManager {
     }
 }
 
-/// Close `terminal_id` through `target` on the blocking pool — the same
-/// `TerminalManager::close` on the blocking pool that `deliver_create_reply`'s
-/// caller runs for an undeliverable reply. Killing the PTY child is what fires
-/// the terminal's exit hook, which closes its confirmed coord session.
+/// Reap `terminal_id` through `target`.
+///
+/// First the pane is probed, and the terminal is closed only when the probe
+/// finds a bare shell. A live `claude`, or one the probe cannot rule out, is
+/// answered [`CloseOutcome::Held`] and never closed (m5-2, [`reap_verdict`]).
+///
+/// A bare shell is closed through the same `TerminalManager::close`, run on the
+/// blocking pool, that `deliver_create_reply`'s caller runs for an
+/// undeliverable reply. Killing the PTY child is what fires the terminal's exit
+/// hook, which closes its confirmed coord session.
+///
+/// This fn holds the probe, so it carries the close's `exempt` row in the
+/// close-site roster; `ReapTarget::close_terminal` is the `helper` it reaches
+/// the close through.
+///
+/// The probe and the close are two steps. A `claude` started in the pane in
+/// the milliseconds between them would still be killed. The graceful-exit
+/// primitive's own close carries the same bounded window, and no process-table
+/// read can close it.
 pub async fn close_through<T: ReapTarget + ?Sized>(
     target: Arc<T>,
     terminal_id: String,
 ) -> Result<CloseOutcome, String> {
+    match reap_verdict(target.probe_pane(&terminal_id).await) {
+        ReapVerdict::Gone => return Ok(CloseOutcome::AlreadyGone),
+        ReapVerdict::Hold(reason) => return Ok(CloseOutcome::Held(reason)),
+        ReapVerdict::Reap => {}
+    }
     qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
         target.close_terminal(&terminal_id)
     })
@@ -570,9 +701,51 @@ mod tests {
         live: Mutex<HashMap<String, String>>,
         exit_hook_fired: Mutex<Vec<String>>,
         fail: bool,
+        /// What `probe_pane` finds in each live terminal. Absent = a bare shell.
+        panes: HashMap<String, crate::terminal::graceful_exit::ClaudeProbe>,
     }
 
+    fn bare_shell_probe() -> crate::terminal::graceful_exit::ClaudeProbe {
+        crate::terminal::graceful_exit::ClaudeProbe::Readable(
+            crate::terminal::graceful_exit::PaneProcesses {
+                subtree_claude: Vec::new(),
+                top_level_children: 0,
+                tracked_alive: Vec::new(),
+            },
+        )
+    }
+
+    fn live_claude_probe(pid: u32) -> crate::terminal::graceful_exit::ClaudeProbe {
+        crate::terminal::graceful_exit::ClaudeProbe::Readable(
+            crate::terminal::graceful_exit::PaneProcesses {
+                subtree_claude: vec![crate::terminal::graceful_exit::ProcIdentity {
+                    pid,
+                    started_at: 1_000,
+                }],
+                top_level_children: 0,
+                tracked_alive: Vec::new(),
+            },
+        )
+    }
+
+    #[async_trait::async_trait]
     impl ReapTarget for HookedTarget {
+        async fn probe_pane(
+            &self,
+            terminal_id: &str,
+        ) -> Option<crate::terminal::graceful_exit::ClaudeProbe> {
+            // A failing target still answers a probe, so its close is reached.
+            if !self.fail && !self.live.lock().unwrap().contains_key(terminal_id) {
+                return None;
+            }
+            Some(
+                self.panes
+                    .get(terminal_id)
+                    .cloned()
+                    .unwrap_or_else(bare_shell_probe),
+            )
+        }
+
         fn close_terminal(&self, terminal_id: &str) -> Result<CloseOutcome, String> {
             if self.fail {
                 return Err("pty close failed".into());
@@ -599,6 +772,7 @@ mod tests {
             )])),
             exit_hook_fired: Mutex::new(Vec::new()),
             fail: false,
+            panes: HashMap::new(),
         });
         let reaper = Arc::new(RemoteCreateReaper::new(N));
         let handle = arm_with_target(reaper, target.clone(), "term-p", Some("coord-p".into()));
@@ -611,12 +785,71 @@ mod tests {
         );
     }
 
+    /// m5-2 on the production arm path: a due terminal whose pane holds a
+    /// live `claude` is HELD. The sweep still takes it off the table (it is
+    /// not retried), but the target's close is never called. The terminal
+    /// stays live and its exit hook never fires.
+    #[tokio::test(start_paused = true)]
+    async fn the_production_arm_path_holds_a_pane_with_a_live_claude() {
+        let target = Arc::new(HookedTarget {
+            live: Mutex::new(HashMap::from([(
+                "term-claude".to_string(),
+                "coord-c".to_string(),
+            )])),
+            exit_hook_fired: Mutex::new(Vec::new()),
+            fail: false,
+            panes: HashMap::from([("term-claude".to_string(), live_claude_probe(77))]),
+        });
+        let reaper = Arc::new(RemoteCreateReaper::new(N));
+        let handle = arm_with_target(
+            reaper.clone(),
+            target.clone(),
+            "term-claude",
+            Some("coord-c".into()),
+        );
+        let due = handle.await.unwrap();
+        assert_eq!(due.len(), 1, "it was due");
+        assert!(
+            target.live.lock().unwrap().contains_key("term-claude"),
+            "a live claude was reaped"
+        );
+        assert!(target.exit_hook_fired.lock().unwrap().is_empty());
+        assert!(!reaper.is_armed("term-claude"), "held, not re-armed");
+        assert_eq!(
+            close_through(target, "term-claude".into()).await,
+            Ok(CloseOutcome::Held(HeldReason::LiveClaude {
+                claude_pids: vec![77]
+            }))
+        );
+    }
+
+    /// The pure verdict: only a READABLE pane with no `claude` is reaped.
+    #[test]
+    fn only_a_readable_bare_shell_is_reaped() {
+        use crate::terminal::graceful_exit::ClaudeProbe;
+        assert_eq!(reap_verdict(None), ReapVerdict::Gone);
+        assert_eq!(reap_verdict(Some(bare_shell_probe())), ReapVerdict::Reap);
+        assert_eq!(
+            reap_verdict(Some(live_claude_probe(5))),
+            ReapVerdict::Hold(HeldReason::LiveClaude {
+                claude_pids: vec![5]
+            })
+        );
+        assert_eq!(
+            reap_verdict(Some(ClaudeProbe::Unreadable("ps failed".into()))),
+            ReapVerdict::Hold(HeldReason::Unprovable {
+                detail: "ps failed".into()
+            })
+        );
+    }
+
     #[tokio::test]
     async fn close_through_passes_the_target_outcome_and_error_up() {
         let target = Arc::new(HookedTarget {
             live: Mutex::new(HashMap::new()),
             exit_hook_fired: Mutex::new(Vec::new()),
             fail: true,
+            panes: HashMap::new(),
         });
         assert_eq!(
             close_through(target, "t".into()).await,
@@ -626,24 +859,30 @@ mod tests {
 
     /// The REAL manager: an id it does not hold — a terminal that exited, or
     /// closed between any check and the reap — is `AlreadyGone`, not a failed
-    /// reap. This also pins `TERMINAL_NOT_FOUND` to the manager's wording.
+    /// reap. The probe answers that first; the close answers it too when the
+    /// terminal goes in the window between the two, which pins
+    /// `TERMINAL_NOT_FOUND` to the manager's wording.
     #[tokio::test]
     async fn a_real_manager_maps_an_unknown_terminal_to_already_gone() {
         let tm = Arc::new(crate::terminal::TerminalManager::new());
+        assert_eq!(
+            tm.close_terminal("no-such-terminal"),
+            Ok(CloseOutcome::AlreadyGone)
+        );
         assert_eq!(
             close_through(tm, "no-such-terminal".into()).await,
             Ok(CloseOutcome::AlreadyGone)
         );
     }
 
-    /// The REAL manager holding a (PTY-less) session: the reap removes it
-    /// through `TerminalManager::close`, and a second close is `AlreadyGone`.
+    /// The REAL manager holding a never-attached BARE SHELL (its probe reads
+    /// no `claude`): the reap removes it through `TerminalManager::close`,
+    /// exactly as before m5-2, and a second close is `AlreadyGone`.
     #[tokio::test]
-    async fn a_real_manager_closes_a_live_terminal_on_reap() {
+    async fn a_real_manager_closes_a_bare_shell_on_reap() {
+        let pane = crate::terminal::session::tests::bare_shell_pane();
         let tm = Arc::new(crate::terminal::TerminalManager::new());
-        let session =
-            crate::terminal::session::tests::make_test_session(Arc::new(Mutex::new(Vec::new())));
-        tm.insert_for_test("term-real", Arc::new(session));
+        tm.insert_for_test("term-real", pane.session.clone());
         assert!(tm.get("term-real").is_some());
 
         let reaper = RemoteCreateReaper::new(N);
@@ -657,9 +896,66 @@ mod tests {
             "the reap must close the terminal"
         );
         assert_eq!(
+            pane.kills(),
+            1,
+            "a bare shell is reaped with the ordinary close"
+        );
+        assert_eq!(
             close_through(tm, "term-real".into()).await,
             Ok(CloseOutcome::AlreadyGone)
         );
+    }
+
+    /// m5-2 on the REAL manager: a never-attached pane in which a live
+    /// `claude` runs (one, zero children) is HELD. It is not closed and not
+    /// killed, nothing is typed into it, and it stays registered.
+    #[tokio::test]
+    async fn a_real_manager_holds_a_never_attached_pane_with_a_live_claude() {
+        let pane = crate::terminal::session::tests::live_claude_pane();
+        let tm = Arc::new(crate::terminal::TerminalManager::new());
+        tm.insert_for_test("term-claude", pane.session.clone());
+
+        let reaper = RemoteCreateReaper::new(N);
+        let t0 = Instant::now();
+        reaper.arm("term-claude", None, t0);
+        let target = tm.clone();
+        let reaped = sweep(&reaper, t0 + N, move |id| close_through(target.clone(), id)).await;
+
+        assert_eq!(reaped.len(), 1, "it was due");
+        assert!(
+            tm.get("term-claude").is_some(),
+            "a live claude's pane was reaped"
+        );
+        assert_eq!(pane.kills(), 0);
+        assert!(pane.typed().is_empty());
+        assert_eq!(
+            close_through(tm, "term-claude".into()).await,
+            Ok(CloseOutcome::Held(HeldReason::LiveClaude {
+                claude_pids: pane.claude_pids.clone()
+            }))
+        );
+    }
+
+    /// m5-2's "unprovable" arm on the REAL manager: a pane the probe cannot
+    /// observe (here, one with no local pid) is held, because a `claude` in it
+    /// cannot be ruled out.
+    #[tokio::test]
+    async fn a_real_manager_holds_a_pane_it_cannot_probe() {
+        let tm = Arc::new(crate::terminal::TerminalManager::new());
+        let session =
+            crate::terminal::session::tests::make_test_session(Arc::new(Mutex::new(Vec::new())));
+        tm.insert_for_test("term-unprovable", Arc::new(session));
+
+        let outcome = close_through(tm.clone(), "term-unprovable".into()).await;
+
+        assert!(
+            matches!(
+                outcome,
+                Ok(CloseOutcome::Held(HeldReason::Unprovable { .. }))
+            ),
+            "{outcome:?}"
+        );
+        assert!(tm.get("term-unprovable").is_some());
     }
 
     /// Wiring guard: the reaper does nothing unless `backend_relay.rs` ARMS an

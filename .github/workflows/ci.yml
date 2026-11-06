@@ -163,7 +163,177 @@ env:
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 jobs:
+  # ── Where the Linux `test` leg runs ─────────────────────────────────────
+  #
+  # On every run that is NOT a pull_request (merge-candidate*/** and main
+  # pushes, workflow_dispatch) this job decides whether `test (ubuntu-22.04)`
+  # runs on the self-hosted pool `[self-hosted, Linux, X64, qontinui-runner-ci,
+  # ram-40g]` — on 2026-11-03 two registrations on nawa (`nawa-runner-1/2`,
+  # 64 GiB / 60 GiB-high units in the host's ci-runners.slice, a persistent
+  # per-runner cargo target) — or on the free GitHub-hosted `ubuntu-22.04`
+  # floor. pull_request runs never reach the pool and pay nothing for this job
+  # (it is skipped): the pool is sized for the train, and a PR backlog would
+  # saturate it and push candidates back to the floor.
+  #
+  # WHAT IT BUYS, measured rather than hoped. It does NOT shorten a candidate
+  # today: the windows leg is the slowest required job (98-148 min on recent
+  # green main pushes, ubuntu 52-86), and it stays hosted unless
+  # RUNNER_CI_WINDOWS_LANE sends it to the Windows pool (`route-windows`
+  # below). What moves is ~70
+  # min of hosted 4-core time per push run, off the org's shared hosted pool
+  # (14 runs of this repo sat queued for it on 2026-11-03), and a ubuntu leg
+  # that ran in 41 min COLD on the pool (52-86 hosted), so it is not the next
+  # bottleneck once the windows leg gets faster. The cost, under `auto` only:
+  # the windows leg waits for this job, which itself needs a hosted runner —
+  # ~13 s when hosted runners are free, but on 2026-11-03, with the org's
+  # hosted queue saturated, run 41646964958's `route` sat queued 10 m 40 s
+  # while the pool idled, and the windows leg then queued another 7 m 22 s,
+  # starting 18 min after the run was created. A forced lane skips this job
+  # entirely (below). `hosted` costs nothing. `self-hosted` adds no latency
+  # but gives up ALL of the router's overflow (pool down, stalled, saturated):
+  # `timeout-minutes` does not count time spent queued, so a dead or full pool
+  # holds the leg until a pool runner comes online or GitHub cancels a
+  # self-hosted job queued for 24 h. Setting the lane back only moves runs
+  # created afterwards; to free a stuck one, cancel the run and re-run it (a
+  # re-run goes hosted).
+  #
+  # The decision is the fleet's route-with-a-hosted-floor router: a VERBATIM
+  # copy of qontinui-claude-config `scripts/route-ci-lane.py` (blob c67b16e7,
+  # itself a parameterised copy of qontinui-coord
+  # `.github/scripts/route_rust_ci.py`; its hermetic test is
+  # `scripts/route-ci-lane-test.py` there). Re-sync by copying the file again
+  # and checking `git hash-object` against ccfg's blob — never by editing it
+  # here. With `actions: read` it reads THIS repo's queued jobs and routes to
+  # the floor when the pool is STALLED (a pool job queued >= 10 min), SATURATED
+  # (>= 4 queued) or its signal is unreadable. The repo variable picks the lane:
+  #
+  #   RUNNER_CI_LINUX_LANE = auto         this job runs and decides
+  #                        = self-hosted  this job is SKIPPED; `test` goes to
+  #                                       the pool unconditionally, with no
+  #                                       overflow (a dead pool queues it 24 h)
+  #                        = hosted | unset | anything else
+  #                                       this job is SKIPPED; `test` is hosted
+  #
+  # RE-RUNS GO TO THE FLOOR, and that is decided in `test`'s `runs-on`, not
+  # here. A pool that picks jobs up and then fails them reads healthy to the
+  # queue signal, so a retry must not land on it again. coord retries with
+  # "re-run failed jobs", which does not re-run a `route` that succeeded: the
+  # retried `test` would reuse attempt 1's labels, so the router's own
+  # `--hosted-on-rerun` alone never fires for coord's retries. `runs-on` reads
+  # `needs.route.outputs.labels` only on attempt 1.
+  #
+  # `hosted` is the kill switch for new runs; every re-run is hosted anyway.
+  # The router ALWAYS exits 0 with outputs written, and `test` runs under
+  # `!cancelled()` with a hosted fallback, so a route job that fails, times
+  # out or is skipped leaves the leg on the floor (or, forced, on the pool) —
+  # never SKIPPED, which coord's check classification would count as passing.
+  route:
+    if: ${{ github.event_name != 'pull_request' && vars.RUNNER_CI_LINUX_LANE == 'auto' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      labels: ${{ steps.route.outputs.labels }}
+      lane: ${{ steps.route.outputs.lane }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
+      - name: Route the Linux test leg
+        id: route
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUNNER_CI_LINUX_LANE: ${{ vars.RUNNER_CI_LINUX_LANE }}
+          RUNNER_CI_LINUX_LANE_SOURCE: repo variable RUNNER_CI_LINUX_LANE
+          RUNNER_CI_LINUX_HOSTED_LABEL: ubuntu-22.04
+          RUNNER_CI_LINUX_RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: >-
+          python3 -B .github/scripts/route-ci-lane.py
+          --self-hosted-labels self-hosted,Linux,X64,qontinui-runner-ci,ram-40g
+          --env-prefix RUNNER_CI_LINUX
+          --title "test (ubuntu-22.04)"
+          --default-lane hosted
+          --hosted-on-rerun
+
+  # ── Where the Windows legs run ──────────────────────────────────────────
+  #
+  # The Windows twin of `route`, for the three Windows legs: `test
+  # (windows-latest)`, `Clippy (windows)` and `Holder crates (windows-latest)`.
+  # The pool is `[self-hosted, Windows, X64, qontinui-runner-ci-windows, ram-40g]`, and
+  # membership IS the `qontinui-runner-ci-windows` label: a host joins by
+  # carrying it (with the size class, ram-40g: every self-hosted job declares
+  # one, qontinui-claude-config scripts/lint-runner-size-class.py; all three
+  # legs share the heaviest leg's class so the router sees them as one queue). On 2026-11-03 that is
+  # `nawa-winvm-1..3`, three registrations in a Windows Server 2025 VM on nawa
+  # (32 vCPU / 90 GiB in its own systemd slice under ci.slice, one non-admin
+  # account per registration, a persistent per-registration cargo target on the
+  # VM's data disk; host scripts in qontinui-claude-config scripts/winvm/). The
+  # VM is network-isolated from its host: it cannot reach the live runner, the
+  # supervisor or any private range. dell-2020-win-runner does NOT carry the
+  # label (finding ba454926 names the condition for it to rejoin).
+  #
+  # Same router, same verbatim script and the same rules as `route`:
+  # pull_request runs never reach the pool, re-runs go to the hosted floor
+  # (decided in each leg's `runs-on`, attempt 1 only), and the repo variable
+  # picks the lane:
+  #
+  #   RUNNER_CI_WINDOWS_LANE = auto         this job runs and decides
+  #                          = self-hosted  this job is SKIPPED; the three legs
+  #                                         go to the pool unconditionally, with
+  #                                         no overflow (a dead pool queues them)
+  #                          = hosted | unset | anything else
+  #                                         this job is SKIPPED; the legs are hosted
+  #
+  # The router reads this repo's queued jobs carrying exactly the pool label set
+  # (all three legs count); `--title` only names the summary row. The label set
+  # is spelled here and in the forced arm of every Windows leg's `runs-on`;
+  # src-tauri/tests/ci_rust_test_steps_split.rs pins them equal.
+  route-windows:
+    if: ${{ github.event_name != 'pull_request' && vars.RUNNER_CI_WINDOWS_LANE == 'auto' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      labels: ${{ steps.route.outputs.labels }}
+      lane: ${{ steps.route.outputs.lane }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
+      - name: Route the Windows legs
+        id: route
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUNNER_CI_WINDOWS_LANE: ${{ vars.RUNNER_CI_WINDOWS_LANE }}
+          RUNNER_CI_WINDOWS_LANE_SOURCE: repo variable RUNNER_CI_WINDOWS_LANE
+          RUNNER_CI_WINDOWS_HOSTED_LABEL: windows-latest
+          RUNNER_CI_WINDOWS_RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: >-
+          python3 -B .github/scripts/route-ci-lane.py
+          --self-hosted-labels self-hosted,Windows,X64,qontinui-runner-ci-windows,ram-40g
+          --env-prefix RUNNER_CI_WINDOWS
+          --title "the Windows legs (test / clippy-windows / holder-crates)"
+          --default-lane hosted
+          --hosted-on-rerun
+
   test:
+    # `route` decides the ubuntu leg's pool and `route-windows` the windows
+    # leg's (see above). `!cancelled()` is load-bearing: on a pull_request both
+    # are SKIPPED, and without it a job that needs a skipped job is skipped
+    # too, which would turn both required `test (…)` contexts into `skipped`
+    # (= passing to coord) on every PR.
+    needs: [route, route-windows]
+    if: ${{ !cancelled() }}
     strategy:
       # Surface platform-specific failures independently. Default fail-fast
       # cancels ubuntu/windows the moment macos clippy trips, masking
@@ -177,7 +347,19 @@ jobs:
         # when cross-platform demos / mac users matter.
         platform: [ubuntu-22.04, windows-latest]
 
-    runs-on: ${{ matrix.platform }}
+    # Each leg routes the same way through its own lane. On a FIRST attempt of
+    # a run that is not a pull_request it goes to its pool when the lane is
+    # forced `self-hosted`, or where its route job said under `auto` (the
+    # `labels` output): `route` / RUNNER_CI_LINUX_LANE for the ubuntu leg,
+    # `route-windows` / RUNNER_CI_WINDOWS_LANE for the windows leg. Everything
+    # else is the hosted floor: a pull_request, any re-run, the `hosted`/unset
+    # lane, and a route job that produced nothing. The check names stay `test
+    # (ubuntu-22.04)` / `test (windows-latest)`: they come from the matrix
+    # value, not from the pool, and both are required contexts. Each pool's
+    # label set is spelled twice (here and in its route job's
+    # --self-hosted-labels); change both together.
+    # coord-pools: [self-hosted, Linux, X64, qontinui-runner-ci, ram-40g] | [ubuntu-22.04] | [self-hosted, Windows, X64, qontinui-runner-ci-windows, ram-40g] | [windows-latest]
+    runs-on: ${{ fromJSON(matrix.platform == 'windows-latest' && ((github.run_attempt == 1 && github.event_name != 'pull_request' && vars.RUNNER_CI_WINDOWS_LANE == 'self-hosted' && '["self-hosted","Windows","X64","qontinui-runner-ci-windows","ram-40g"]') || (github.run_attempt == 1 && needs['route-windows'].outputs.labels) || '["windows-latest"]') || (github.run_attempt == 1 && github.event_name != 'pull_request' && vars.RUNNER_CI_LINUX_LANE == 'self-hosted' && '["self-hosted","Linux","X64","qontinui-runner-ci","ram-40g"]') || (github.run_attempt == 1 && needs.route.outputs.labels) || '["ubuntu-22.04"]') }}
 
     # Backstop cap for any step in this job that is not individually bounded.
     # This job previously had NO job-level timeout, so the 4h24m apt hang above
@@ -233,6 +415,73 @@ jobs:
         with:
           fetch-depth: 0
           filter: blob:none
+
+      # SELF-HOSTED ONLY (the `route` job above put the ubuntu leg on the
+      # pool). Two things a hosted VM gets for free and a persistent host does
+      # not:
+      #
+      #   1. A FRESH `_work`. A self-hosted runner keeps it between jobs, and
+      #      checkout-sibling REFUSES a destination that already exists
+      #      ("refusing to overwrite a checkout that is already there"), so the
+      #      second job on a registration would fail at the first sibling. The
+      #      previous job's three sibling trees are removed; they are this
+      #      registration's own scratch, at $GITHUB_WORKSPACE/.. exactly where
+      #      checkout-sibling writes them.
+      #   2. A HOME of its own. Every registration on the host runs as ONE
+      #      account with ONE home, and `Poison ambient state` / `Unpoison`
+      #      below write and delete `~/.qontinui/*` by name — two concurrent
+      #      jobs would delete each other's poison mid-suite, and a job that
+      #      dies before Unpoison would leave it for the next. So the
+      #      job gets HOME and TMPDIR under $RUNNER_TEMP, which the runner
+      #      empties per job, while CARGO_HOME / RUSTUP_HOME stay on the
+      #      account's persistent toolchain and registry. CI_POOL_HOME keeps
+      #      the persistent home for the target cache below.
+      - name: "Self-hosted: clear the previous job's sibling checkouts and give the job its own HOME"
+        if: runner.environment == 'self-hosted' && runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          parent="$(cd "$GITHUB_WORKSPACE/.." && pwd)"
+          for name in qontinui-schemas qontinui-web ui-bridge; do
+            if [ -e "$parent/$name" ]; then
+              rm -rf "${parent:?}/$name"
+              echo "removed the previous job's $parent/$name"
+            fi
+          done
+          job_home="$RUNNER_TEMP/home"
+          mkdir -p "$job_home" "$RUNNER_TEMP/tmp"
+          {
+            echo "CI_POOL_HOME=$HOME"
+            echo "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}"
+            echo "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}"
+            echo "HOME=$job_home"
+            echo "TMPDIR=$RUNNER_TEMP/tmp"
+          } >> "$GITHUB_ENV"
+          echo "HOME -> $job_home (persistent home $HOME kept for CARGO_HOME, RUSTUP_HOME and the target cache)"
+
+      # The Windows twin of the step above and of `Self-hosted: system packages,
+      # compile caps and the persistent target` below. Both of those are linux
+      # bash (pkg-config webkit, /proc/meminfo, cgroups, `ln -s`) and
+      # `runner.environment == 'self-hosted'` is ALSO true on a self-hosted
+      # Windows runner, so they are gated `runner.os == 'Linux'` and this ONE
+      # composite step (shared with `clippy-windows` and `holder-crates`) does
+      # the Windows half: clear the previous job's sibling checkouts and any
+      # runner/WebView2 process it left, fail NAMING THE RUNNER when the host
+      # lacks a tool, export CARGO_BUILD_JOBS / RUST_TEST_THREADS /
+      # VITEST_MAX_WORKERS and a TEMP of the job's own, and junction ./target to
+      # the registration's persistent target. There is no HOME redirect: each
+      # Windows registration runs as its OWN account (the step checks that
+      # before it deletes anything), so no two jobs share a profile at the
+      # same time, and what one job leaves in it the next one's prep removes;
+      # `Unpoison ambient state` runs whenever Poison ran. Its id gates the
+      # post-smoke process stop: nothing destructive runs on an account this
+      # step refused.
+      - name: "Self-hosted Windows: sibling cleanup, host preflight, compile caps and the persistent target"
+        id: windows_prep
+        if: runner.environment == 'self-hosted' && runner.os == 'Windows'
+        uses: ./.github/actions/self-hosted-windows-prep
+        with:
+          require-webview2: "true"
 
       # qontinui-runner's frontend cross-repo deps now resolve via npm
       # (see package.json: @qontinui/* moved from link: to ^x.y.z ranges).
@@ -291,16 +540,28 @@ jobs:
         with:
           repo: qontinui/ui-bridge
 
+      # On the self-hosted pool `dest` is per-JOB ($RUNNER_TEMP), so two
+      # concurrent jobs never install into one tree. Hosted runs keep the
+      # action's default (~/setup-pnpm), which the pnpm cache entries below
+      # are keyed against.
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
         with:
           version: 10.33.2
+          dest: ${{ runner.environment == 'self-hosted' && format('{0}/setup-pnpm', runner.temp) || '~/setup-pnpm' }}
 
+      # The pnpm-store CACHE is hosted-only. On the pool the store lives under
+      # the per-job `dest` (action-setup points PNPM_HOME there), so a restore
+      # would only download a store nobody keeps, and a save would put a
+      # pool-built entry into this repo's 10 GB cache beside main's rust cache.
+      # BOTH inputs are needed: setup-node v5 also caches on its own whenever
+      # package.json names a `packageManager` and `cache` is empty.
       - name: Setup Node.js
         uses: actions/setup-node@v5
         with:
           node-version: "20"
-          cache: "pnpm"
+          cache: ${{ runner.environment == 'github-hosted' && 'pnpm' || '' }}
+          package-manager-cache: ${{ runner.environment == 'github-hosted' }}
           cache-dependency-path: pnpm-lock.yaml
 
       # Gates the pure-JS parsers that `Report test results to coord` below
@@ -328,6 +589,120 @@ jobs:
         with:
           toolchain: "1.95.0"
           components: rustfmt, clippy
+
+      # SELF-HOSTED ONLY. Three things a hosted VM hands every job and a
+      # persistent host has to be told:
+      #
+      #   1. THE SYSTEM PACKAGES. `Install dependencies (Ubuntu)` below runs
+      #      `sudo apt-get`, and a pool job account has no sudo
+      #      (qontinui-claude-config volunteer-ci-runners.md section 2), so the
+      #      host is provisioned once and this step checks it. A missing package
+      #      fails HERE, naming the runner: that red is the host's, not the PR's.
+      #   2. COMPILE AND TEST CONCURRENCY CAPS. Every cargo step in this job
+      #      runs at cargo's default parallelism (= nproc), which on a 128-thread
+      #      host is
+      #      a memory spike no unit cap survives. CARGO_BUILD_JOBS is the
+      #      smallest of MemTotal and every cgroup memory.max/memory.high above
+      #      this job, / 5 GiB, clamped to nproc, and 1 at or below 8 GiB.
+      #      Why 5 and not qontinui-coord's 3: measured on nawa-runner-2
+      #      (2026-11-03, 60 GiB unit), the cold `Build Rust tests` at 3 GiB per
+      #      job (20 jobs) peaked at 54.1 GiB — two `qontinui_runner` rustc
+      #      processes alone held 17-24 GiB each, so the giant crates, not the
+      #      job count, set the floor, and 3 GiB per job left ~6 GiB of
+      #      headroom under MemoryHigh. RUST_TEST_THREADS is 4, the hosted
+      #      leg's own value (nproc of its 4-core VM), and VITEST_MAX_WORKERS
+      #      is 3, vitest's own default there (its worker count, maxWorkers, is
+      #      nproc - 1): the suites' concurrency regime does not change with the
+      #      machine they land on (and, for the Rust suite, coord's ingest keeps
+      #      recording both lanes under the one `ubuntu-22.04` shard). Uncapped,
+      #      vitest runs 127 workers here. On 2026-11-03 that passed `Run
+      #      frontend unit tests` in four pool runs (~27 s, vitest's own figure)
+      #      and failed it in both trial runs (41703593573 and 41709340100),
+      #      where a `Clippy (windows)` compile on nawa-winvm-3 overlapped the
+      #      step: 10 s beforeAll timeouts, import 2963 s / 4070 s summed across
+      #      workers.
+      #   3. A WARM, PERSISTENT TARGET. actions/checkout cleans with `git clean
+      #      -ffdx`, which deletes ./target on every job. So the target lives
+      #      outside the workspace, under the account's persistent home
+      #      (CI_POOL_HOME, set above), ONE per runner registration (two jobs
+      #      never share a cargo build lock), and ./target is a symlink to it:
+      #      the clean removes the link, never the tree behind it.
+      #      CARGO_TARGET_DIR is deliberately NOT set. The link is added to
+      #      .git/info/exclude, because `target/` in .gitignore does not match
+      #      a symlink, and build.rs's `git status --porcelain` would otherwise
+      #      stamp every pool build dirty. Bounded: a target over 150 GiB, under
+      #      60 GiB free on its filesystem, or unreadable, starts cold.
+      - name: "Self-hosted: system packages, compile caps and the persistent target"
+        if: runner.environment == 'self-hosted' && runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          missing=""
+          if command -v pkg-config >/dev/null; then
+            for pc in webkit2gtk-4.1 javascriptcoregtk-4.1 libsoup-3.0 gtk+-3.0 \
+                      ayatana-appindicator3-0.1 librsvg-2.0 dbus-1 atspi-2 openssl; do
+              pkg-config --exists "$pc" || missing="$missing $pc"
+            done
+          else
+            missing="$missing pkg-config"
+          fi
+          for tool in cc make curl wget file git python3; do
+            command -v "$tool" >/dev/null || missing="$missing $tool"
+          done
+          python3 -c 'import yaml' 2>/dev/null || missing="$missing python3-yaml"
+          if [ -n "$missing" ]; then
+            echo "::error title=self-hosted host not provisioned::runner '$RUNNER_NAME' lacks:$missing. The HOST is at fault, not this change: provision it. A re-run goes to the hosted floor; RUNNER_CI_LINUX_LANE=hosted keeps new runs off the pool."
+            exit 1
+          fi
+
+          budget_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
+          cg="/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/self/cgroup)"
+          while [ "$cg" != "/sys/fs/cgroup" ] && [ -n "$cg" ]; do
+            for f in memory.max memory.high; do
+              v=$(cat "$cg/$f" 2>/dev/null || echo max)
+              case "$v" in ''|*[!0-9]*) continue ;; esac
+              if [ $((v / 1024)) -lt "$budget_kb" ]; then budget_kb=$((v / 1024)); fi
+            done
+            cg="${cg%/*}"
+          done
+          cpus=$(nproc)
+          jobs=$(( budget_kb / 5242880 ))
+          [ "$budget_kb" -gt 8388608 ] || jobs=1
+          [ "$jobs" -ge 1 ] || jobs=1
+          [ "$jobs" -le "$cpus" ] || jobs=$cpus
+          threads=4
+          [ "$threads" -le "$cpus" ] || threads=$cpus
+          vitest_workers=3
+          [ "$vitest_workers" -le "$cpus" ] || vitest_workers=$cpus
+          echo "CARGO_BUILD_JOBS=$jobs" >> "$GITHUB_ENV"
+          echo "RUST_TEST_THREADS=$threads" >> "$GITHUB_ENV"
+          echo "VITEST_MAX_WORKERS=$vitest_workers" >> "$GITHUB_ENV"
+          echo "memory budget $((budget_kb / 1048576)) GiB, nproc $cpus -> CARGO_BUILD_JOBS=$jobs RUST_TEST_THREADS=$threads VITEST_MAX_WORKERS=$vitest_workers"
+
+          cache="$CI_POOL_HOME/.cache/qontinui-runner-ci/$RUNNER_NAME/target"
+          mkdir -p "$cache"
+          if ! used_kb=$(du -sk "$cache" 2>/dev/null | cut -f1) || [ -z "$used_kb" ]; then
+            echo "::notice title=persistent target reset::du could not read $cache: starting cold"
+            chmod -R u+rwX "${cache:?}" 2>/dev/null || true
+            rm -rf "${cache:?}"
+            mkdir -p "$cache"
+            used_kb=0
+          fi
+          free_kb=$(df -Pk "$cache" | awk 'NR == 2 {print $4}')
+          if [ "$used_kb" -gt $((150 * 1048576)) ] || [ "$free_kb" -lt $((60 * 1048576)) ]; then
+            echo "::notice title=persistent target reset::$((used_kb / 1048576)) GiB used, $((free_kb / 1048576)) GiB free on its filesystem: starting cold"
+            chmod -R u+rwX "${cache:?}" 2>/dev/null || true
+            rm -rf "${cache:?}"
+            mkdir -p "$cache"
+            used_kb=0
+          fi
+          if [ -e target ] && [ ! -L target ]; then rm -rf target; fi
+          ln -sfn "$cache" target
+          exclude="$(git rev-parse --git-path info/exclude)"
+          mkdir -p "$(dirname "$exclude")"
+          grep -qx '/target' "$exclude" 2>/dev/null || echo '/target' >> "$exclude"
+          echo "target -> $cache ($((used_kb / 1048576)) GiB already built)"
 
       # Cargo.lock must match the PINNED qontinui-schemas tree (plan
       # 2026-08-31-schemas-releases-strand-consumer-cargo-locks §7.4 Phase 3).
@@ -373,8 +748,11 @@ jobs:
       # above it — 624s, 1370s, 3634s — are deliberately cut) while
       # converting a hang into a fast, obvious failure and an immediate
       # re-propose.
+      # Hosted only: a self-hosted job account has no sudo, and the pool host
+      # carries these packages already (checked by the "Self-hosted: system
+      # packages, ..." step above).
       - name: Install dependencies (Ubuntu)
-        if: matrix.platform == 'ubuntu-22.04'
+        if: matrix.platform == 'ubuntu-22.04' && runner.environment == 'github-hosted'
         timeout-minutes: 10
         run: |
           sudo apt-get update
@@ -404,8 +782,10 @@ jobs:
       # crate gdk-sys was not found" — gdk-sys compile fails). android + dotnet +
       # haskell + docker-images alone reclaim ~20 GB, which is ample headroom
       # without touching the apt libs installed above.
+      # Hosted only: on a persistent self-hosted host this would `sudo rm -rf`
+      # toolchains and prune docker images that belong to the host.
       - name: Free disk space (Ubuntu)
-        if: matrix.platform == 'ubuntu-22.04'
+        if: matrix.platform == 'ubuntu-22.04' && runner.environment == 'github-hosted'
         uses: jlumbroso/free-disk-space@main
         with:
           tool-cache: false
@@ -426,8 +806,11 @@ jobs:
       # CARGO_BUILD_JOBS alone wasn't enough — link is single-threaded.
       # Pre-allocate paging space so the OS can absorb the spike instead
       # of the runner agent dying.
+      # Hosted only: `sudo swapoff -a` on a shared self-hosted host would take
+      # the swap from every other tenant; the pool unit's memory is bounded by
+      # its own cgroup instead.
       - name: Add swapfile (Ubuntu — guard against link-time OOM)
-        if: matrix.platform == 'ubuntu-22.04'
+        if: matrix.platform == 'ubuntu-22.04' && runner.environment == 'github-hosted'
         run: |
           sudo swapoff -a || true
           sudo fallocate -l 12G /swapfile
@@ -456,8 +839,11 @@ jobs:
       # revert the test step to JOBS=1 and keep this pagefile. (That happened
       # on 2026-10-27, run 40449994591; the test step is now JOBS=1 on every
       # leg.)
+      # Hosted only: the action needs admin, and a self-hosted Windows runner
+      # account is not one. The pool's host provisions its own pagefile (the
+      # nawa VM: 4 GiB on C: + 64 GiB on its data disk, scripts/winvm/).
       - name: Configure pagefile (Windows — guard against link-time OOM)
-        if: matrix.platform == 'windows-latest'
+        if: matrix.platform == 'windows-latest' && runner.environment == 'github-hosted'
         uses: al-cheb/configure-pagefile-action@v1.4
         with:
           minimum-size: 32GB
@@ -491,7 +877,14 @@ jobs:
       # saves from merge-candidate/* refs are invisible to sibling
       # candidates. The cache that matters is the one saved by `main` runs
       # (every land), which all candidates and PRs can restore.
+      # Hosted only. A self-hosted job builds in its registration's persistent
+      # target (set up above), and must never SAVE into this repo's GitHub
+      # cache: the key carries the OS but not the distro, so a cache saved by a
+      # Debian 13 pool host on a main push would be restored by the next hosted
+      # ubuntu-22.04 run — build-script and proc-macro binaries linked against a
+      # newer glibc than ubuntu-22.04's 2.35.
       - name: Cache Rust dependencies
+        if: runner.environment == 'github-hosted'
         uses: Swatinem/rust-cache@v2
         with:
           # Workspace root is the repo root: ./Cargo.toml -> ./target
@@ -547,7 +940,12 @@ jobs:
       # after this branch was first cut -- this rebuild picks that up.
       - name: Contract-smoke effect-probe verdict (PS 5.1)
         if: matrix.platform == 'windows-latest'
-        run: powershell -File scripts/tests/test-effect-probe.ps1
+        # `-NoProfile -ExecutionPolicy Bypass` (here and on the two smoke steps
+        # below). Bypass: a no-op on hosted and on Windows Server (RemoteSigned),
+        # but a Windows CLIENT host's default policy (Restricted) refuses `-File`.
+        # NoProfile: a self-hosted account persists between jobs, and a profile
+        # one job wrote must not run inside the next.
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/tests/test-effect-probe.ps1
         shell: bash
 
       - name: Typecheck frontend code
@@ -655,6 +1053,7 @@ jobs:
       # or removing a STEP, and editing a shell comment inside a `run:` block.
       # A deleted job takes `Gate-Removal:` instead. Then re-run the job.
       - name: Poison ambient state
+        id: poison
         run: |
           set -euo pipefail
 
@@ -750,6 +1149,18 @@ jobs:
       # step's), so only a RISE over this baseline says a kill happened during
       # the step. Linux only (no cgroup elsewhere); best-effort — an unreadable
       # count writes an empty output, which the matcher reads as NO evidence.
+      #
+      # Phase 2 reuses this step rather than adding one: it also starts the
+      # detached anonymous-memory sampler (`resource-report.sh
+      # --start-anon-sampler`), which polls the cgroup's `memory.stat` `anon`
+      # every 2 s into $RUNNER_TEMP/qontinui-resource-report until
+      # `Report this job's resources` stops it and reports the peak as
+      # `peak_rss_mb`. Anonymous memory, NOT `memory.peak`: that is the
+      # cgroup's whole charge, page cache included, which a cargo build's
+      # target/ writes fill up to the cgroup's own memory limit. The
+      # sampler's first reading is the baseline a self-hosted runner's peak
+      # must rise past.
+      # Every failure is swallowed: no sampler means no `peak_rss_mb`.
       - name: Record the cgroup oom_kill count before the build half
         id: oom_kill_before_build
         if: runner.os == 'Linux'
@@ -760,6 +1171,8 @@ jobs:
           count="$(awk '$1 == "oom_kill" { print $2; exit }' "/sys/fs/cgroup${cgroup}/memory.events" 2>/dev/null || true)"
           echo "oom_kill count before Build Rust tests: ${count:-<unreadable>}"
           echo "count=$count" >>"$GITHUB_OUTPUT" || true
+          bash scripts/ci/resource-report.sh --start-anon-sampler \
+            --state-dir "$RUNNER_TEMP/qontinui-resource-report" || true
 
       # ── BUILD half of the old single `Run Rust tests` step ─────────────
       #
@@ -903,7 +1316,20 @@ jobs:
           #     on purpose. The legs are throttled for different reasons, and
           #     ci_rust_test_steps_split.rs pins that each stays separately
           #     tunable.
-          CARGO_BUILD_JOBS: ${{ matrix.platform == 'windows-latest' && '1' || '1' }}
+          #   - 2026-11-03: a SELF-HOSTED ubuntu leg (the `route` job) is not
+          #     the 16 GB hosted VM this ladder was measured on. It takes the
+          #     memory-derived cap the "Self-hosted: system packages, compile
+          #     caps and the persistent target" step exported (cgroup budget /
+          #     5 GiB, clamped to nproc; that step says why 5); '1' remains its
+          #     fallback when that step exported nothing. The hosted arms are
+          #     unchanged.
+          #   - 2026-11-03: a SELF-HOSTED windows leg (the `route-windows` job,
+          #     the nawa Windows VM) is not the 16 GB hosted VM either. It takes
+          #     the cap the "Self-hosted Windows: sibling cleanup, host
+          #     preflight, compile caps and the persistent target" step exported
+          #     (the host's per-registration memory budget / 5 GiB, clamped to
+          #     nproc), with the same '1' fallback. Hosted windows stays '1'.
+          CARGO_BUILD_JOBS: ${{ matrix.platform == 'windows-latest' && (runner.environment == 'self-hosted' && env.CARGO_BUILD_JOBS || '1') || (runner.environment == 'self-hosted' && env.CARGO_BUILD_JOBS || '1') }}
         run: |
           if [ "$RUNNER_OS" = "Linux" ]; then
             echo "=== free / df before cargo test ==="
@@ -1225,6 +1651,14 @@ jobs:
       # `matrix.platform == 'windows-latest'` rather than `runner.os` — every
       # other Windows gate in this file spells it that way (see `Configure
       # pagefile`), and one idiom is one grep.
+      #
+      # Generalised (plan 2026-10-27-coord-routes-ci-jobs-by-runner-capability,
+      # Phase 2) by `Report this job's resources` below, which carries the same
+      # pagefile peak — plus RAM, commit limit and commit peak — on BOTH legs
+      # as one machine-readable annotation coord reads. This step and its
+      # `MEMPEAK` lines are kept only because the CARGO_BUILD_JOBS soak of plan
+      # 2026-09-17 Phase 3 step 2 (still open) greps them out of job logs;
+      # delete this step once that soak reads the report instead.
       - name: Windows memory peak after the Rust test steps
         if: always() && matrix.platform == 'windows-latest'
         continue-on-error: true
@@ -1247,7 +1681,7 @@ jobs:
             echo '```'
             echo
             echo "build step outcome: ${BUILD_OUTCOME} - run step outcome: ${RUN_OUTCOME}"
-            echo "PeakUsage is the pagefile high-water mark for this boot, so it covers the compile that just ran. Compare it against AllocatedBaseSize (the 32 GB the pagefile step configures) before changing CARGO_BUILD_JOBS."
+            echo "PeakUsage is the pagefile high-water mark for this boot, so it covers the compile that just ran. Compare it against AllocatedBaseSize (on a hosted runner, the 32 GB the pagefile step configures; a self-hosted host sizes its own) before changing CARGO_BUILD_JOBS; runner_env says which."
             echo
             echo '```'
             # One machine-greppable line per pagefile. `tr -d '\r'` because
@@ -1255,9 +1689,9 @@ jobs:
             # powershell failed) is reported as UNKNOWN, never as a zero peak.
             mem="$(powershell -NoProfile -Command '$os = Get-CimInstance Win32_OperatingSystem; Get-CimInstance Win32_PageFileUsage | ForEach-Object { $free = if ($os) { $os.FreePhysicalMemory } else { "unknown" }; "MEMPEAK name={0} alloc_mb={1} peak_mb={2} current_mb={3} free_phys_kb={4}" -f $_.Name,$_.AllocatedBaseSize,$_.PeakUsage,$_.CurrentUsage,$free }' | tr -d '\r')" || mem=""
             if [ -n "$mem" ]; then
-              printf '%s\n' "$mem" | sed "s/\$/ build=${BUILD_OUTCOME} run=${RUN_OUTCOME}/"
+              printf '%s\n' "$mem" | sed "s/\$/ build=${BUILD_OUTCOME} run=${RUN_OUTCOME} runner_env=${RUNNER_ENVIRONMENT:-unknown}/"
             else
-              echo "MEMPEAK unknown=1 reason=no-pagefile-reading build=${BUILD_OUTCOME} run=${RUN_OUTCOME}"
+              echo "MEMPEAK unknown=1 reason=no-pagefile-reading build=${BUILD_OUTCOME} run=${RUN_OUTCOME} runner_env=${RUNNER_ENVIRONMENT:-unknown}"
             fi
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
@@ -1419,9 +1853,9 @@ jobs:
           # chunk FAILED, while the step still reported green because it is
           # `continue-on-error`.
           #
-          # Reordering does NOT fix it: `Unpoison` carries no `if: always()`, so
-          # a red suite skips it entirely — and a red suite is exactly the case
-          # this ingest exists to record. A step-level `env:` beats $GITHUB_ENV
+          # Reordering does NOT fix it: `Unpoison` (which runs always() since
+          # the Windows lane) is ordered AFTER this step, and a red suite is
+          # exactly the case this ingest exists to record. A step-level `env:` beats $GITHUB_ENV
           # for this step only, so it is correct on both the green and red paths
           # and independent of where the unpoison sits.
           #
@@ -1454,7 +1888,13 @@ jobs:
       # root resolver trims and skips). The three files are removed by name, not
       # `rm -rf ~/.qontinui`, so a home that was NOT clean (the poison step warns
       # when it sees one) keeps whatever else it held.
+      # Whenever Poison ran, even after a red Rust step: on a self-hosted WINDOWS
+      # runner the poisoned ~/.qontinui is in the account's real, persistent
+      # profile (USERPROFILE), so it must not be left for the registration's next
+      # job. NOT when Poison never ran (a job that died earlier, or one whose
+      # prep step refused the account): then there is nothing of ours to remove.
       - name: Unpoison ambient state
+        if: always() && (steps.poison.outcome == 'success' || steps.poison.outcome == 'failure')
         run: |
           set -u
           homes=("$HOME")
@@ -1535,6 +1975,7 @@ jobs:
         continue-on-error: true
 
       - name: Build Tauri app (development)
+        id: tauri_build
         # @tauri-apps/cli 2.11 changes that affect this step:
         #   1. Args after `--` are forwarded straight to `cargo build`, which
         #      rejects `--debug` (cargo's default profile, not a flag). So
@@ -1588,7 +2029,7 @@ jobs:
       # harness fails here instead of after a full exe boot + 198 route probes.
       - name: Contract-smoke summary invariants (PS 5.1)
         if: matrix.platform == 'windows-latest'
-        run: powershell -File scripts/tests/test-smoke-summary.ps1
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/tests/test-smoke-summary.ps1
         shell: bash
 
       # The CI-integrity guard decides whether a gating-workflow change is
@@ -1608,8 +2049,67 @@ jobs:
         if: matrix.platform == 'windows-latest'
         env:
           QONTINUI_ALLOW_NO_DB: "1"
-        run: powershell -File scripts/contract-smoke.ps1 -DirectExe target/debug/qontinui-runner.exe -Profile ci -SdkTypesPath ../ui-bridge/packages/ui-bridge/src/server/types.ts
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/contract-smoke.ps1 -DirectExe target/debug/qontinui-runner.exe -Profile ci -SdkTypesPath ../ui-bridge/packages/ui-bridge/src/server/types.ts
         shell: bash
+
+      # Self-hosted Windows only, and always(): the smoke tears down its own
+      # process tree (Stop-ProcessTree walks Win32_Process.ParentProcessId down
+      # from the runner pid), but a WebView2 host whose parent has already exited
+      # is no longer reachable from that walk, and on a PERSISTENT runner account
+      # it would hold the next job's target/debug/qontinui-runner.exe open. The
+      # same matcher the prep action runs (one script, parse-checked by
+      # powershell-parse.yml): only processes of this job's account, a
+      # qontinui-runner.exe under this workspace or the target behind its
+      # junction, and the msedgewebview2.exe hosts whose command line names it.
+      # Non-fatal here: a survivor is the HOST's problem, annotated as an ::error,
+      # and the next job's prep step stops it again or fails naming the runner.
+      - name: "Self-hosted Windows: stop the smoke's leftover runner and WebView2 processes"
+        if: always() && steps.windows_prep.outcome == 'success'
+        continue-on-error: true
+        shell: pwsh -NoProfile -NonInteractive -Command ". '{0}'"
+        run: |
+          & ./scripts/ci/stop-leftover-processes.ps1 -Workspace $env:GITHUB_WORKSPACE -TargetRoot "$env:QONTINUI_CI_TARGET" -Why 'this job'
+          exit $LASTEXITCODE
+
+      # Plan 2026-10-27-coord-routes-ci-jobs-by-runner-capability, Phase 2:
+      # ONE `::notice title=qontinui-resource-report::{json}` per job saying
+      # what this runner HAD (RAM, commit limit, pagefile/swap) and what the
+      # job USED (commit peak on Windows, the job cgroup's anonymous-memory
+      # peak and oom_kills on Linux, disk free after the heavy steps). Coord
+      # reads it back through the check-run annotations API (Phase 3) to
+      # learn each runner class's capability and this job's requirement from
+      # measurement. Quantities
+      # the leg cannot measure are OMITTED, never zeroed — see the header of
+      # scripts/ci/resource-report.sh (fixtures:
+      # scripts/tests/test_resource_report.sh).
+      #
+      # Both legs (no platform gate). `if: always()` for the same reason as
+      # the MEMPEAK step: the expired and OOM'd runs are the ones whose
+      # numbers matter. The oom_kill baseline and the anon sampler are the
+      # ones the pre-build step above records/starts (absent on Windows,
+      # which the script reads as "nothing measured"). `build_outcome` is the
+      # outcome of the job's heavy compile+test work, so BOTH Rust halves AND
+      # the Tauri debug build (a third full compile+link on both legs) are
+      # passed and the script combines them (any failure wins).
+      #
+      # It is the LAST step of the job, deliberately: the anon sampler keeps
+      # running until this step stops it, so the peak covers every heavy step
+      # (the Tauri build included), and disk free is read when target/ is at
+      # its largest. Keep any new heavy step ABOVE it.
+      # `continue-on-error` and no `timeout-minutes`: a report must never
+      # become a way to fail the job.
+      - name: Report this job's resources
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          bash scripts/ci/resource-report.sh \
+            --build-outcome "${{ steps.build_rust_tests.outcome }}" \
+            --build-outcome "${{ steps.run_rust_tests.outcome }}" \
+            --build-outcome "${{ steps.tauri_build.outcome }}" \
+            --oom-kill-baseline "${{ steps.oom_kill_before_build.outputs.count }}" \
+            --anon-state-dir "$RUNNER_TEMP/qontinui-resource-report" \
+            --disk-path "$GITHUB_WORKSPACE"
 
   # Windows clippy, split OUT of the matrix `test` job so it no longer sits on
   # the windows `test` critical path (~12 min saved there — clippy was the 3rd
@@ -1632,7 +2132,12 @@ jobs:
   # GB saves against the 10 GB repo cache cap.
   clippy-windows:
     name: Clippy (windows)
-    runs-on: windows-latest
+    # Routed like `test`'s windows leg (see `route-windows`); `!cancelled()`
+    # keeps it from being SKIPPED on a pull_request, where route-windows is.
+    needs: route-windows
+    if: ${{ !cancelled() }}
+    # coord-pools: [self-hosted, Windows, X64, qontinui-runner-ci-windows, ram-40g] | [windows-latest]
+    runs-on: ${{ fromJSON((github.run_attempt == 1 && github.event_name != 'pull_request' && vars.RUNNER_CI_WINDOWS_LANE == 'self-hosted' && '["self-hosted","Windows","X64","qontinui-runner-ci-windows","ram-40g"]') || (github.run_attempt == 1 && needs['route-windows'].outputs.labels) || '["windows-latest"]') }}
     # Default-target clippy, 23 successful runs 2026-10-22..10-25 on commits now
     # on main (push and pull_request events; GraphQL check-run timings): job p50
     # 14.9m, p90 17.2m, max 17.8m (Clippy check step p50 11.9m, max 14.0m).
@@ -1647,6 +2152,13 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
+
+      # Self-hosted Windows pool only: the shared host preparation (sibling
+      # cleanup, preflight, compile caps, the persistent ./target junction);
+      # see the `test` job's step of the same name.
+      - name: "Self-hosted Windows: sibling cleanup, host preflight, compile caps and the persistent target"
+        if: runner.environment == 'self-hosted' && runner.os == 'Windows'
+        uses: ./.github/actions/self-hosted-windows-prep
 
       # Rust path-dep on ../../qontinui-schemas/rust + the SDK↔runner manifest
       # diff test read; same rationale as the `test` job's sibling checkout,
@@ -1672,12 +2184,16 @@ jobs:
         uses: pnpm/action-setup@v4
         with:
           version: 10.33.2
+          dest: ${{ runner.environment == 'self-hosted' && format('{0}/setup-pnpm', runner.temp) || '~/setup-pnpm' }}
 
+      # The pnpm-store CACHE is hosted-only, for the reasons the `test` job's
+      # Setup Node.js step gives (both inputs are needed).
       - name: Setup Node.js
         uses: actions/setup-node@v5
         with:
           node-version: "20"
-          cache: "pnpm"
+          cache: ${{ runner.environment == 'github-hosted' && 'pnpm' || '' }}
+          package-manager-cache: ${{ runner.environment == 'github-hosted' }}
           cache-dependency-path: pnpm-lock.yaml
 
       - name: Setup Rust
@@ -1686,7 +2202,11 @@ jobs:
           toolchain: "1.95.0"
           components: rustfmt, clippy
 
+      # Hosted only, as in `test`: the action needs admin; the pool's host
+      # provisions its own pagefile, and keeps a persistent target instead of
+      # restoring rust-cache.
       - name: Configure pagefile (Windows — guard against link-time OOM)
+        if: runner.environment == 'github-hosted'
         uses: al-cheb/configure-pagefile-action@v1.4
         with:
           minimum-size: 32GB
@@ -1694,6 +2214,7 @@ jobs:
           disk-root: "D:"
 
       - name: Cache Rust dependencies
+        if: runner.environment == 'github-hosted'
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
@@ -1714,6 +2235,7 @@ jobs:
         run: pnpm run build
 
       - name: Clippy check
+        id: clippy
         # Lint levels come from src-tauri/Cargo.toml [lints.clippy]; T1 groups
         # are `deny` so a correctness lint fails this check. Unlike the `test`
         # job's ubuntu clippy, this one runs `--all-targets`: it is the per-PR
@@ -1727,6 +2249,21 @@ jobs:
         run: |
           cd src-tauri
           cargo clippy --all-targets
+
+      # Plan 2026-10-27-coord-routes-ci-jobs-by-runner-capability, Phase 2:
+      # the same per-job resource report as the `test` job's (see
+      # `Report this job's resources` there). This job compiles the whole
+      # runner crate on a hosted Windows runner — the other heavy Windows
+      # Rust compile — so its commit peak is a requirement sample too.
+      # `build_outcome` is the clippy step's: this job's heavy work.
+      - name: Report this job's resources
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          bash scripts/ci/resource-report.sh \
+            --build-outcome "${{ steps.clippy.outcome }}" \
+            --disk-path "$GITHUB_WORKSPACE"
 
   # Tests + clippy for the standalone workspace crates that the `test` job
   # never reaches.
@@ -1761,7 +2298,13 @@ jobs:
       fail-fast: false
       matrix:
         platform: [ubuntu-latest, windows-latest]
-    runs-on: ${{ matrix.platform }}
+    # Only the windows arm routes (like `test`'s windows leg, see
+    # `route-windows`); ubuntu-latest stays hosted. `!cancelled()` keeps both
+    # arms from being SKIPPED on a pull_request, where route-windows is.
+    needs: route-windows
+    if: ${{ !cancelled() }}
+    # coord-pools: [ubuntu-latest] | [self-hosted, Windows, X64, qontinui-runner-ci-windows, ram-40g] | [windows-latest]
+    runs-on: ${{ fromJSON(matrix.platform == 'windows-latest' && ((github.run_attempt == 1 && github.event_name != 'pull_request' && vars.RUNNER_CI_WINDOWS_LANE == 'self-hosted' && '["self-hosted","Windows","X64","qontinui-runner-ci-windows","ram-40g"]') || (github.run_attempt == 1 && needs['route-windows'].outputs.labels) || '["windows-latest"]') || '["ubuntu-latest"]') }}
     # UNMEASURED at introduction: no run of this job exists yet. Both crates
     # are small with few dependencies, so the budget should be dominated by
     # checkout + toolchain + cache restore. 20
@@ -1770,6 +2313,13 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
+
+      # Self-hosted Windows pool only: the shared host preparation (sibling
+      # cleanup, preflight, compile caps, the persistent ./target junction);
+      # see the `test` job's step of the same name.
+      - name: "Self-hosted Windows: sibling cleanup, host preflight, compile caps and the persistent target"
+        if: runner.environment == 'self-hosted' && runner.os == 'Windows'
+        uses: ./.github/actions/self-hosted-windows-prep
 
       # Rust path-dep on ../../qontinui-schemas/rust — needed only so cargo can
       # load the workspace; same action (and declared-adaptation resolution)
@@ -1784,6 +2334,7 @@ jobs:
           components: clippy
 
       - name: Cache Rust dependencies
+        if: runner.environment == 'github-hosted'
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
@@ -1958,72 +2509,6 @@ jobs:
         # manifests/plists). These are the ONLY two quick-xml advisories in
         # the DB as of 2026-07-02. Revisit when tauri/gtk bump to >= 0.41.
         #
-        # --ignore RUSTSEC-2026-0118 + RUSTSEC-2026-0119: two hickory-proto
-        # 0.25.2 advisories, reached via reqwest's `hickory-dns` feature (the
-        # async resolver that keeps DNS off tokio's blocking pool). reqwest
-        # 0.13 pins hickory-resolver 0.25.2, so neither is upgradable from
-        # here. Neither is reachable in THIS build:
-        #
-        #   0118 (NSEC3 closest-encloser proof enters an unbounded loop on
-        #   cross-zone responses; "No fixed upgrade is available!") lives in
-        #   DNSSEC validation, which is NOT COMPILED IN. Verified with
-        #   `cargo tree -e features -i hickory-proto`: the enabled feature set
-        #   is exactly {futures-io, std, tokio} and contains no `dnssec*`
-        #   feature, so the validation path does not exist in the binary.
-        #
-        #   0119 (CPU exhaustion from O(n²) name compression) is in message
-        #   ENCODING — i.e. queries we construct for hostnames WE configure
-        #   (coord, localhost, api). Triggering it needs control of the names
-        #   being encoded, which already implies control of runner config.
-        #
-        # Re-check both if a `dnssec` feature is ever enabled on hickory-proto,
-        # or if the runner starts resolving attacker-supplied hostnames.
-        # Revisit when reqwest bumps hickory-resolver to >= 0.26.1.
-        #
-        # --ignore RUSTSEC-2026-0235: rkyv 0.7.46, out-of-bounds reads from
-        # insufficient archive validation on archives containing Rc/Arc.
-        # Disclosed 2026-05-13, published to the RustSec DB 2026-08-04, and it
-        # immediately red-ed the `security` check on EVERY open runner PR
-        # (e.g. #954, #955 — neither of which changes Cargo.lock). main only
-        # read green because its last `security` run predated the publication,
-        # and would have gone red on its next one.
-        #
-        # NOT UPGRADABLE FROM HERE. The advisory's fix is >= 0.8.17, a
-        # semver-MAJOR bump, so `cargo update -p rkyv` cannot reach it. rkyv
-        # enters the lock through exactly one edge:
-        #
-        #   qontinui-runner -> qontinui-db (src-tauri/clorinde)
-        #                   -> rust_decimal 1.42.0 -> rkyv 0.7.46
-        #
-        # rust_decimal declares `rkyv = { version = "0.7.46", optional = true }`,
-        # and no published rust_decimal — through the current latest, 1.42.1 —
-        # takes rkyv >= 0.8 as a NORMAL dependency: every release pins a
-        # `^0.7.x` range that resolves to 0.7.46, and 0.8.x appears there only
-        # as a dev-dependency (`rkyv-0_8`), which never enters our lock. So no
-        # reachable version of the intermediate crate moves us off the 0.7
-        # line, and the 0.7 line has no patched release (0.7.46 is its last).
-        #
-        # NOT REACHABLE — the crate is not merely unused at runtime, it is
-        # NEVER COMPILED. rkyv is gated behind rust_decimal's optional `rkyv`
-        # feature; qontinui-db enables only `db-postgres`, so the feature is
-        # never activated. Verified on this tree:
-        #
-        #   $ cargo tree -i rkyv --target all --all-features
-        #   warning: nothing to print.
-        #
-        # It is in Cargo.lock solely because Cargo resolves optional deps into
-        # the lockfile regardless of feature activation — the same reason
-        # `borsh` (rust_decimal's other unactivated optional dep) is pinned
-        # there and equally never built — and cargo-audit reads the lockfile
-        # without feature awareness. No rkyv code ships in any runner artifact,
-        # so no rkyv archive is ever deserialized by the runner.
-        #
-        # REVIEW BY 2026-11-04 (or sooner on either trigger): drop this ignore
-        # the moment rust_decimal ships a release depending on rkyv >= 0.8.17,
-        # and RE-ASSESS IMMEDIATELY if anything ever enables rust_decimal's
-        # `rkyv`/`rkyv-safe` feature — that would make the vulnerable code real
-        # and this justification void. Tracking: qontinui/qontinui-runner#956.
-        #
         # --ignore RUSTSEC-2026-0367 + RUSTSEC-2026-0368 + RUSTSEC-2026-0369
         # + RUSTSEC-2026-0429: four zip < 9.0.0 extraction advisories (SUID/SGID
         # bits preserved; symlink targets outside the destination; permissions
@@ -2114,7 +2599,7 @@ jobs:
           # and reds this job on every PR (an upstream ecosystem drift, not a
           # runner vulnerability). --locked pins to cargo-audit's tested deps.
           cargo install cargo-audit --locked
-          cargo audit --file Cargo.lock --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 --ignore RUSTSEC-2026-0118 --ignore RUSTSEC-2026-0119 --ignore RUSTSEC-2026-0235 --ignore RUSTSEC-2026-0367 --ignore RUSTSEC-2026-0368 --ignore RUSTSEC-2026-0369 --ignore RUSTSEC-2026-0429 --ignore RUSTSEC-2026-0387
+          cargo audit --file Cargo.lock --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 --ignore RUSTSEC-2026-0367 --ignore RUSTSEC-2026-0368 --ignore RUSTSEC-2026-0369 --ignore RUSTSEC-2026-0429 --ignore RUSTSEC-2026-0387
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
