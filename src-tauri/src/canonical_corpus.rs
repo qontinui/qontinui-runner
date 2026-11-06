@@ -1237,37 +1237,6 @@ pub(crate) mod test_support {
     pub(crate) fn mirror(root: &Path, url: &str) -> Mirror {
         Mirror::new(root.join("mirror.git"), url.to_string())
     }
-
-    /// Write an executable shell script at `path` and return only once it can
-    /// be exec'd. A concurrently forking test thread can briefly inherit the
-    /// script's write descriptor, and an exec in that window fails with
-    /// ETXTBSY — which would read as "git unavailable" rather than as the
-    /// behaviour under test.
-    #[cfg(unix)]
-    pub(crate) fn executable_script(path: &Path, body: &str) {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::write(path, body).unwrap();
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        for _ in 0..200 {
-            match Command::new(path)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-            {
-                Ok(mut c) => {
-                    let _ = c.kill();
-                    let _ = c.wait();
-                    return;
-                }
-                Err(e) if e.raw_os_error() == Some(26) => {
-                    std::thread::sleep(Duration::from_millis(10))
-                }
-                Err(e) => panic!("cannot exec the test script: {e}"),
-            }
-        }
-        panic!("the test script stayed ETXTBSY for 2 s");
-    }
 }
 
 #[cfg(test)]
@@ -1572,7 +1541,7 @@ mod tests {
         let url = remote_with(tmp.path(), &[(".claude/commands/vet-plan.md", "# one\n")]);
         let flag = tmp.path().join("fail-reads");
         let wrapper = tmp.path().join("flaky-git");
-        test_support::executable_script(
+        crate::test_exec_script::write_executable_script(
             &wrapper,
             &format!(
                 "#!/bin/sh\nfor a in \"$@\"; do\n  if [ \"$a\" = cat-file ] && [ -e '{}' ]; then \
@@ -1703,7 +1672,7 @@ mod tests {
         let url = remote_with(tmp.path(), &[(".claude/commands/vet-plan.md", "# canon\n")]);
         let log = tmp.path().join("argv.log");
         let wrapper = tmp.path().join("logging-git");
-        test_support::executable_script(
+        crate::test_exec_script::write_executable_script(
             &wrapper,
             &format!(
                 "#!/bin/sh\necho \"$*\" >> '{}'\nexec git \"$@\"\n",
@@ -1933,7 +1902,7 @@ mod tests {
     fn a_hanging_git_times_out() {
         let tmp = tempfile::tempdir().unwrap();
         let script = tmp.path().join("sleepy-git");
-        test_support::executable_script(&script, "#!/bin/sh\nexec sleep 30\n");
+        crate::test_exec_script::write_executable_script(&script, "#!/bin/sh\nexec sleep 30\n");
         let budget = Duration::from_millis(200);
         let m = mirror(tmp.path(), "unused")
             .with_program(&script)

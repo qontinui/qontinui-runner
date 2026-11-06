@@ -9199,64 +9199,9 @@ mod tests {",
             };
             let body =
                 format!("#!/bin/sh\necho {CRED_FAKE_SECRET}\necho {CRED_FAKE_SECRET} >&2\n{tail}");
-            write_executable_script(&path, &body);
+            crate::test_exec_script::write_executable_script(&path, &body);
             path
         }
-    }
-
-    /// Write `body` to `path` as a mode-755 script WITHOUT this process ever
-    /// holding a write descriptor on it, so an exec of it can never fail
-    /// ETXTBSY. Every shim this module's tests exec is written through here.
-    ///
-    /// Why the plain `fs::write` + `set_permissions` this replaced flaked (CI
-    /// job 123922633970, `cred_absent_aws_retracts_on_next_heartbeat_payload`):
-    /// while this thread's write fd is open, a sibling test thread that forks
-    /// copies it into its child, where it stays open until that child execs
-    /// (`O_CLOEXEC` closes it only then). The file's write count is held for
-    /// that window, and an exec of the shim inside it is refused ETXTBSY —
-    /// which `command_exit_within` reads as `SpawnFailed`, i.e. `Unknown`.
-    ///
-    /// Write-to-temp + `rename` does NOT close this: the leaked descriptor
-    /// pins the INODE, and `rename` moves that same inode into place. Handing
-    /// the write to a child `sh` does: the descriptor then exists only in that
-    /// child's fd table, which no fork of this process copies, and it is gone
-    /// once the child is reaped — before this returns.
-    #[cfg(not(windows))]
-    fn write_executable_script(path: &std::path::Path, body: &str) {
-        use std::io::Write;
-        use std::process::{Command, Stdio};
-        let mut writer = Command::new("/bin/sh")
-            .arg("-c")
-            .arg(r#"cat >"$1" && chmod 755 "$1""#)
-            .arg("sh")
-            .arg(path)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn /bin/sh to write the shim");
-        // A writer that died early (say, the directory is missing) closes the
-        // pipe: let the exit-status assert below report its stderr instead.
-        if let Err(e) = writer
-            .stdin
-            .take()
-            .expect("the writer's stdin is piped")
-            .write_all(body.as_bytes())
-        {
-            assert_eq!(
-                e.kind(),
-                std::io::ErrorKind::BrokenPipe,
-                "feed the shim body to its writer: {e}"
-            );
-        }
-        let out = writer.wait_with_output().expect("reap the shim writer");
-        assert!(
-            out.status.success(),
-            "writing the shim {} failed ({}): {}",
-            path.display(),
-            out.status,
-            String::from_utf8_lossy(&out.stderr)
-        );
     }
 
     /// Iterations of [`cred_shim_is_execable_while_other_threads_fork`].
@@ -9397,7 +9342,7 @@ Add-Content -LiteralPath $Out -Value $lines
                  echo {CRED_FAKE_SECRET} >&2\n\
                  exit 0\n"
             );
-            write_executable_script(&path, &body);
+            crate::test_exec_script::write_executable_script(&path, &body);
             path
         }
     }
@@ -10248,7 +10193,7 @@ Add-Content -LiteralPath $Out -Value $lines
         #[cfg(not(windows))]
         let (shim, budget) = {
             let path = tmp.path().join("aws");
-            write_executable_script(
+            crate::test_exec_script::write_executable_script(
                 &path,
                 &format!(
                     "#!/bin/sh\nsleep 120 &\necho $! >'{}'\nwait\n",
@@ -10357,7 +10302,7 @@ Add-Content -LiteralPath $Out -Value $lines
                  exit 0\n",
                 log = log.display(),
             );
-            write_executable_script(&path, &body);
+            crate::test_exec_script::write_executable_script(&path, &body);
             path
         }
     }

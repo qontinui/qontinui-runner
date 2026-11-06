@@ -14808,24 +14808,16 @@ mod tests {
         ]);
         let fake_dir = tempfile::tempdir().expect("tempdir for fake claude");
         let argv_file = fake_dir.path().join("argv");
-        let fake_bin = if cfg!(target_os = "windows") {
-            "cmd".to_string()
-        } else {
+        #[cfg(windows)]
+        let fake_bin = "cmd".to_string();
+        #[cfg(not(windows))]
+        let fake_bin = {
             let path = fake_dir.path().join("fake-claude");
-            std::fs::write(
-                &path,
-                format!(
-                    "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nexec sh\n",
-                    argv_file.display()
-                ),
-            )
-            .expect("write fake claude");
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-                    .expect("chmod fake claude");
-            }
+            let body = format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nexec sh\n",
+                argv_file.display()
+            );
+            crate::test_exec_script::write_executable_script(&path, &body);
             path.to_string_lossy().to_string()
         };
         std::env::set_var("QONTINUI_CLAUDE_BIN", &fake_bin);

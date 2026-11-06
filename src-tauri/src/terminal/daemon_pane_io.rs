@@ -2607,7 +2607,6 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn pty_holder_spawn_door_does_not_park_a_tokio_worker() {
-        use std::os::unix::fs::PermissionsExt;
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -2615,8 +2614,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ptyf5-{}-{nanos:x}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let fake = dir.join("slow-holder");
-        std::fs::write(&fake, "#!/bin/sh\nsleep 0.6\n").unwrap();
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_exec_script::write_executable_script(&fake, "#!/bin/sh\nsleep 0.6\n");
         let panes = dir.join("panes");
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
