@@ -4401,11 +4401,16 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     });
                     let store = std::sync::Arc::downgrade(&lifecycle_store);
-                    coord_sync_facade.attach_finished_ack_observer(move |csid, finished_at| {
-                        if let Some(s) = store.upgrade() {
-                            s.mark_finish_synced(csid, finished_at);
-                        }
-                    });
+                    coord_sync_facade.attach_finished_ack_observer_on(
+                        move |csid, finished_at, coord_row| {
+                            if let Some(s) = store.upgrade() {
+                                // The row whose answer read `finished` is kept
+                                // with the stamp, so the finish heal knows the
+                                // mark's own row after a restart.
+                                s.mark_finish_synced_on(csid, finished_at, Some(coord_row));
+                            }
+                        },
+                    );
                     // Once per runner start: heal marks stamped synced over a
                     // finish coord never applied (plan 2026-11-05-finish-
                     // synced-is-stamped-on-a-2xx-that-did-not-move-session-

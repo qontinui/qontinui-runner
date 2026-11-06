@@ -29,8 +29,14 @@
 //! ACK-drops it WITHOUT stamping and counts it in
 //! [`FINISHED_UNCONFIRMED_DROPPED`] (`GET /health`
 //! `sessionOutbox.finishedUnconfirmed`). The mark stays unsynced, which is the
-//! honest state; the read-back / heal sweep (`session::finish_heal`) re-offers
-//! it.
+//! honest state. Exactly three things re-offer it, none of them automatic
+//! within this process: a reason-less `POST /sessions/<id>/finish` (the
+//! read-back's retry door in `SessionLifecycleStore::set_finished`); the
+//! session's next coord registration or terminal bind (the registrar's late
+//! delivery, in-process only); and the NEXT runner start's boot sweep
+//! (`session::finish_heal`), which re-offers an unsynced mark only when the
+//! mark's own coord row then reads `session_status` NULL. A row reading
+//! `working` or anything else is never re-offered by the sweep.
 
 use std::sync::atomic::AtomicU64;
 

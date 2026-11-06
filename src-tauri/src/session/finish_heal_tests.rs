@@ -55,29 +55,43 @@ fn coord_null_on_the_marks_own_row_is_resent() {
     );
 }
 
+/// Review F1: `coord_report_status` can report `working` over a row the lost
+/// finish never moved WITHOUT advancing `state_started_at`, so a `since`
+/// before the finish proves nothing — `working` is never healed.
 #[test]
-fn coord_working_since_before_the_finish_is_resent() {
-    assert_eq!(
-        decide(&observed(Some("working"), Some(BEFORE), Some(ROW))),
-        HealDecision::Resend { row: row() }
-    );
+fn coord_working_is_never_resent_whatever_its_since() {
+    for since in [Some(BEFORE), Some(AFTER), None] {
+        assert_eq!(
+            decide(&observed(Some("working"), since, Some(ROW))),
+            HealDecision::Leave(HealSkip::WorkingRevivalUnprovable),
+            "working since {since:?}"
+        );
+    }
+    for word in ["blocked", "stalled", "waiting_human", "something_new"] {
+        assert_eq!(
+            decide(&observed(Some(word), Some(BEFORE), Some(ROW))),
+            HealDecision::Leave(HealSkip::StatusNotNull),
+            "{word}"
+        );
+    }
+    assert_eq!(HealSkip::WorkingRevivalUnprovable.as_str(), "working_revival_unprovable");
 }
 
 /// Mutation target: drop the `since` comparison and this goes red.
 #[test]
-fn coord_working_since_after_the_finish_is_a_revival_and_untouched() {
+fn coord_null_since_after_the_finish_is_a_revival_and_untouched() {
     assert_eq!(
-        decide(&observed(Some("working"), Some(AFTER), Some(ROW))),
+        decide(&observed(None, Some(AFTER), Some(ROW))),
         HealDecision::Leave(HealSkip::RevivedAfterFinish)
     );
     // `since` exactly at the finish is not EARLIER than it.
     assert_eq!(
-        decide(&observed(
-            Some("working"),
-            Some("2026-11-05T12:05:42Z"),
-            Some(ROW)
-        )),
+        decide(&observed(None, Some("2026-11-05T12:05:42Z"), Some(ROW))),
         HealDecision::Leave(HealSkip::RevivedAfterFinish)
+    );
+    assert_eq!(
+        decide(&observed(None, Some(BEFORE), Some(ROW))),
+        HealDecision::Resend { row: row() }
     );
 }
 
@@ -115,7 +129,7 @@ fn every_unknown_leaves_the_mark_alone() {
         heal_decision(FINISHED_AT, None, Observation::Row(Some(&obs)), FINISHED_AT),
         HealDecision::Leave(HealSkip::MarkRowUnknown)
     );
-    let mut garbled = observed(Some("working"), None, Some(ROW));
+    let mut garbled = observed(None, None, Some(ROW));
     garbled.since = Some("yesterday-ish".to_string());
     assert_eq!(
         decide(&garbled),
@@ -260,7 +274,7 @@ fn a_synced_mark_over_coord_null_is_unstamped_and_requeued_once() {
 }
 
 #[test]
-fn coord_working_since_before_the_finish_requeues_the_mark() {
+fn coord_working_since_before_the_finish_leaves_the_mark_synced() {
     let (_d, store, at) = synced_store("heal-working");
     let p = port(&store);
     let since = chrono::DateTime::<Utc>::from_timestamp_millis(at - 3_600_000)
@@ -269,19 +283,23 @@ fn coord_working_since_before_the_finish_requeues_the_mark() {
     let fetch =
         fetch_from_body_for_test(body("heal-working", json!("working"), json!(since), ROW), 1);
     let out = apply_heal(&store, Some(&p), &store.all_records(), &fetch, at + 1_000);
-    assert_eq!(out[0].1, HealOutcome::Resent { row: row() });
-    assert_eq!(p.sent.lock().unwrap().len(), 1);
+    assert_eq!(
+        out[0].1,
+        HealOutcome::Left(HealSkip::WorkingRevivalUnprovable)
+    );
+    assert!(store.get("heal-working").unwrap().finish_synced, "untouched");
+    assert!(p.sent.lock().unwrap().is_empty());
 }
 
 #[test]
-fn coord_working_since_after_the_finish_leaves_the_mark_synced() {
+fn coord_null_since_after_the_finish_leaves_the_mark_synced() {
     let (_d, store, at) = synced_store("heal-revived");
     let p = port(&store);
     let since = chrono::DateTime::<Utc>::from_timestamp_millis(at + 3_600_000)
         .unwrap()
         .to_rfc3339();
     let fetch =
-        fetch_from_body_for_test(body("heal-revived", json!("working"), json!(since), ROW), 1);
+        fetch_from_body_for_test(body("heal-revived", json!(null), json!(since), ROW), 1);
     let out = apply_heal(
         &store,
         Some(&p),
@@ -667,5 +685,161 @@ fn a_read_back_over_another_rows_finish_does_not_read_synced() {
     assert!(
         store.get("rb-other").unwrap().finish_synced,
         "the stamp itself is untouched"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Review round 2: the stored own row (F2), unsynced marks (F3), chunking
+// ---------------------------------------------------------------------------
+
+/// Null-status rows for every id, all answered by [`ROW`].
+fn null_rows(ids: &[String]) -> StatusFetch {
+    let statuses: serde_json::Map<String, serde_json::Value> = ids
+        .iter()
+        .map(|id| {
+            (
+                id.clone(),
+                json!({"session_status": null, "since": null,
+                       "coord_session_id": ROW, "state": "closed"}),
+            )
+        })
+        .collect();
+    fetch_from_body_for_test(
+        json!({"statuses": statuses, "unknown": [], "invalid": [],
+               "input_truncated": false, "sessionBridgeColumnPresent": true}),
+        ids.len(),
+    )
+}
+
+/// F2: with a REAL registrar that knows no session (a runner restart), the
+/// mark's own row is the one stored with its observed stamp; a mark stamped
+/// without one (a pre-F2 stamp) stays UNKNOWN.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_sweep_resolves_a_marks_stored_row_and_leaves_an_unstored_one_unknown() {
+    let dir = tempfile::tempdir().unwrap();
+    let outbox = Arc::new(OutboxWriter::open(dir.path().join("outbox.jsonl")).unwrap());
+    let reg = AiCoordRegistrar::with_tenant_resolver(outbox.clone(), Uuid::new_v4(), || None);
+    let store = Arc::new(SessionLifecycleStore::open(dir.path().join("lifecycle.json")).unwrap());
+    reg.attach_lifecycle_store(store.clone());
+    for id in ["stored-row", "legacy-row"] {
+        store.record_open(test_open_record(id));
+        store.set_finished(id, true, Some("done".into())).unwrap();
+    }
+    let stored_at = store.get("stored-row").unwrap().finished_at;
+    let legacy_at = store.get("legacy-row").unwrap().finished_at;
+    store.mark_finish_synced_on("stored-row", stored_at, Some(row()));
+    store.mark_finish_synced("legacy-row", legacy_at);
+    assert_eq!(store.get("stored-row").unwrap().finish_coord_session_id, Some(row()));
+    assert_eq!(store.get("legacy-row").unwrap().finish_coord_session_id, None);
+    drain_all(&outbox);
+
+    let mut out = heal_sweep_with(&store, Some(&reg), None, false, |ids| async move {
+        null_rows(&ids)
+    })
+    .await;
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        out,
+        vec![
+            ("legacy-row".to_string(), HealOutcome::Left(HealSkip::MarkRowUnknown)),
+            ("stored-row".to_string(), HealOutcome::Resent { row: row() }),
+        ]
+    );
+    assert_eq!(
+        rows(&outbox),
+        vec![("finished".to_string(), "stored-row".to_string())],
+        "only the stored-row mark is re-sent, to its own row"
+    );
+    assert!(outbox.pending().unwrap().iter().all(|r| r.session_id == row()));
+    assert!(store.get("legacy-row").unwrap().finish_synced, "untouched");
+}
+
+/// F2: an unmark forgets the stored row; a later stamp without one keeps it.
+#[test]
+fn the_stored_row_follows_the_mark() {
+    let (_d, store, at) = synced_store("stored");
+    assert_eq!(store.get("stored").unwrap().finish_coord_session_id, None);
+    assert!(store.clear_finish_synced("stored", at));
+    store.mark_finish_synced_on("stored", Some(at), Some(row()));
+    assert_eq!(store.get("stored").unwrap().finish_coord_session_id, Some(row()));
+    store.set_finished("stored", false, None).unwrap();
+    assert_eq!(store.get("stored").unwrap().finish_coord_session_id, None);
+}
+
+/// A store holding one finished mark for `csid`, NOT synced.
+fn unsynced_store(csid: &str) -> (tempfile::TempDir, Arc<SessionLifecycleStore>, i64) {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(SessionLifecycleStore::open(dir.path().join("lifecycle.json")).unwrap());
+    store.record_open(test_open_record(csid));
+    let at = store
+        .set_finished(csid, true, Some("done".into()))
+        .unwrap()
+        .record
+        .finished_at
+        .unwrap();
+    (dir, store, at)
+}
+
+/// F3: the boot sweep re-offers an UNSYNCED mark (e.g. one the drain dropped
+/// after the unconfirmed bound) only when its own row reads NULL; the
+/// read-back arm never takes unsynced marks.
+#[test]
+fn the_sweep_reoffers_an_unsynced_mark_only_over_a_null_row() {
+    let (_d, store, at) = unsynced_store("unsynced");
+    let p = port(&store);
+    let ids = vec!["unsynced".to_string()];
+
+    let working = Observations::from_fetch(
+        &ids,
+        &fetch_from_body_for_test(body("unsynced", json!("working"), json!(BEFORE), ROW), 1),
+    );
+    let out = apply_heal_observed(&store, Some(&p), &store.all_records(), &working, at + 1_000, true);
+    assert_eq!(out[0].1, HealOutcome::Left(HealSkip::WorkingRevivalUnprovable));
+    assert!(p.sent.lock().unwrap().is_empty());
+
+    let null = Observations::from_fetch(&ids, &null_rows(&ids));
+    let read_back_arm =
+        apply_heal_observed(&store, Some(&p), &store.all_records(), &null, at + 1_000, false);
+    assert!(read_back_arm.is_empty(), "the read-back arm skips unsynced marks");
+    let out = apply_heal_observed(&store, Some(&p), &store.all_records(), &null, at + 1_000, true);
+    assert_eq!(out, vec![("unsynced".to_string(), HealOutcome::Reoffered { row: row() })]);
+    assert_eq!(*p.sent.lock().unwrap(), vec![("unsynced".to_string(), at, row())]);
+    assert!(!store.get("unsynced").unwrap().finish_synced, "still owed, honestly");
+}
+
+/// Ids are read in chunks at coord's per-request cap, so the 501st mark is
+/// observed like the first instead of reading as `no_coord_row`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_sweep_reads_ids_in_chunks_at_the_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(SessionLifecycleStore::open(dir.path().join("lifecycle.json")).unwrap());
+    let n = MAX_IDS + 1;
+    for i in 0..n {
+        let id = format!("cap-{i:04}");
+        store.record_open(test_open_record(&id));
+        let at = store
+            .set_finished(&id, true, Some("done".into()))
+            .unwrap()
+            .record
+            .finished_at;
+        store.mark_finish_synced(&id, at);
+    }
+    let p = port(&store);
+    let chunks: Arc<std::sync::Mutex<Vec<usize>>> = Default::default();
+    let seen = chunks.clone();
+    let out = heal_sweep_with(&store, Some(&p), None, false, move |ids| {
+        let seen = seen.clone();
+        async move {
+            seen.lock().unwrap().push(ids.len());
+            // Coord answers only for the ids it was asked about.
+            null_rows(&ids)
+        }
+    })
+    .await;
+    assert_eq!(*chunks.lock().unwrap(), vec![MAX_IDS, 1]);
+    assert_eq!(out.len(), n);
+    assert!(
+        out.iter().all(|(_, o)| *o == HealOutcome::Resent { row: row() }),
+        "no id past the cap reads as no_coord_row"
     );
 }

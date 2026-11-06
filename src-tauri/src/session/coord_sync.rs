@@ -273,7 +273,7 @@ struct CoordSyncInner {
 }
 
 /// Boxed `finished`-ACK callback (see `CoordSyncInner::finished_ack_observer`).
-struct FinishedAckObserver(Box<dyn Fn(&str, Option<i64>) + Send + Sync>);
+struct FinishedAckObserver(Box<dyn Fn(&str, Option<i64>, Uuid) + Send + Sync>);
 
 impl std::fmt::Debug for CoordSync {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -474,6 +474,18 @@ impl CoordSync {
     pub fn attach_finished_ack_observer(
         &self,
         f: impl Fn(&str, Option<i64>) + Send + Sync + 'static,
+    ) {
+        self.attach_finished_ack_observer_on(move |csid, at, _row| f(csid, at));
+    }
+
+    /// [`Self::attach_finished_ack_observer`], also handing the observer the
+    /// coord row (`coord.sessions.id`) whose answer read `finished`, so the
+    /// stamp can record it durably (plan
+    /// `2026-11-05-finish-synced-is-stamped-on-a-2xx-that-did-not-move-session-status`,
+    /// F2).
+    pub fn attach_finished_ack_observer_on(
+        &self,
+        f: impl Fn(&str, Option<i64>, Uuid) + Send + Sync + 'static,
     ) {
         if self
             .inner
@@ -1920,7 +1932,9 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
                     last_error = %snippet(&err),
                     "coord_sync: coord answered this finished row {attempts} time(s) without \
                      its row reading finished — ACK-dropping it UNSTAMPED (finish_synced stays \
-                     false; the finish read-back / heal sweep re-offers it)"
+                     false; re-offered by a reason-less finish read-back, by the session's next \
+                     coord registration or terminal bind, and by the next runner start's heal \
+                     sweep only if coord's own row then reads session_status NULL)"
                 );
                 succeeded.push(row);
                 finished_unconfirmed_dropped += 1;
@@ -2052,6 +2066,7 @@ fn notify_finished_ack(inner: &CoordSyncInner, rec: &OutboxRecord) {
         Some(csid) => (obs.0)(
             csid,
             rec.payload.get("finished_at").and_then(|v| v.as_i64()),
+            rec.session_id,
         ),
         None => tracing::warn!(
             session = %rec.session_id,
