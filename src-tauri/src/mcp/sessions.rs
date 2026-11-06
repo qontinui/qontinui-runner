@@ -3375,7 +3375,7 @@ mod tests {
             body: &[u8],
         ) -> (StatusCode, serde_json::Value) {
             for _ in 0..200 {
-                let (status, v) = transcript_bind_route(
+                let (status, v) = crate::mcp::sessions::transcript_bind_route(
                     Some(tailer.clone()),
                     lifecycle.cloned(),
                     watched.to_vec(),
