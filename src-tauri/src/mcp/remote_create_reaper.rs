@@ -189,7 +189,18 @@ struct Armed {
     /// `false` for an attach marker whose `arm` has not arrived yet. Only
     /// armed rows are ever reaped.
     armed: bool,
+    /// The source's create grant was ADMITTED to close this terminal
+    /// ([`RemoteCreateReaper::claim_create_close`]). From then on no attach
+    /// grant may bind it ([`RemoteCreateReaper::bind_attach`]): the close is
+    /// already committed, and an attach that slipped in after the admission
+    /// would be killed by it.
+    closing_under_create: bool,
 }
+
+/// [`RemoteCreateReaper::bind_attach`] refused: the terminal's create grant has
+/// already been admitted to close it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClosingUnderCreateGrant;
 
 /// One terminal the sweep decided to close.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -203,6 +214,13 @@ pub struct Reaped {
 pub struct RemoteCreateReaper {
     deadline: Duration,
     armed: Mutex<HashMap<String, Armed>>,
+}
+
+impl Default for RemoteCreateReaper {
+    /// A table with the production deadline.
+    fn default() -> Self {
+        Self::new(REMOTE_CREATE_ATTACH_DEADLINE)
+    }
 }
 
 impl RemoteCreateReaper {
@@ -236,6 +254,7 @@ impl RemoteCreateReaper {
                 coord_session_id,
                 ever_attached: attached_already,
                 armed: true,
+                closing_under_create: false,
             },
         );
     }
@@ -250,8 +269,16 @@ impl RemoteCreateReaper {
     /// here: an arm that races its own attach arrives within seconds, not
     /// minutes.
     pub fn mark_attached(&self, terminal_id: &str, now: Instant) {
-        let deadline = self.deadline;
-        let mut table = self.table();
+        Self::mark_attached_in(&mut self.table(), self.deadline, terminal_id, now);
+    }
+
+    /// [`Self::mark_attached`] on a table the caller already holds.
+    fn mark_attached_in(
+        table: &mut HashMap<String, Armed>,
+        deadline: Duration,
+        terminal_id: &str,
+        now: Instant,
+    ) {
         table
             .retain(|_, row| row.armed || now.saturating_duration_since(row.created_at) < deadline);
         table
@@ -262,7 +289,93 @@ impl RemoteCreateReaper {
                 coord_session_id: None,
                 ever_attached: true,
                 armed: false,
+                closing_under_create: false,
             });
+    }
+
+    /// Bind an attach grant to `terminal_id` and record the attach, as ONE step
+    /// under this table's lock — the attach half of the create-grant close's
+    /// atomicity (review finding 1 on plan
+    /// `2026-09-23-remote-create-residuals-after-coord-registration-confirm`
+    /// Phase 2).
+    ///
+    /// `bind` is the attach table's own bind (`RemoteAttachGrants::bind`). It
+    /// runs only when no create-grant close has been admitted for the terminal,
+    /// and a successful bind marks the terminal attached before the lock is
+    /// released. [`Self::claim_create_close`] takes the same lock, so exactly one
+    /// order is observable: the close was admitted first, and this refuses
+    /// [`ClosingUnderCreateGrant`] without binding anything; or the bind came
+    /// first, and the close reads the terminal as attached and is refused.
+    ///
+    /// `Ok(false)` is `bind`'s own refusal (bound elsewhere); nothing is marked.
+    ///
+    /// Lock order: this table, then the attach table inside `bind`. The claim
+    /// takes them in the same order.
+    pub fn bind_attach<F>(
+        &self,
+        terminal_id: &str,
+        now: Instant,
+        bind: F,
+    ) -> Result<bool, ClosingUnderCreateGrant>
+    where
+        F: FnOnce() -> bool,
+    {
+        let mut table = self.table();
+        if table
+            .get(terminal_id)
+            .is_some_and(|row| row.closing_under_create)
+        {
+            return Err(ClosingUnderCreateGrant);
+        }
+        if !bind() {
+            return Ok(false);
+        }
+        Self::mark_attached_in(&mut table, self.deadline, terminal_id, now);
+        Ok(true)
+    }
+
+    /// Admit a create grant's close of `terminal_id`, and commit to it: check
+    /// that no attach grant ever bound the terminal and mark it closing, under
+    /// one lock, so no attach can bind it in between (see [`Self::bind_attach`]).
+    ///
+    /// `true` only when the row is armed, never attached, AND `bound_now` reads
+    /// the attach table and finds no live binding. `bound_now` answering `Err`
+    /// (the attach table could not be read) refuses — fail closed. Idempotent: a
+    /// retry of an admitted close is admitted again.
+    ///
+    /// No row refuses, for the reasons [`Self::was_ever_attached`] gives.
+    pub fn claim_create_close<F>(&self, terminal_id: &str, bound_now: F) -> bool
+    where
+        F: FnOnce() -> Result<bool, ()>,
+    {
+        let mut table = self.table();
+        let Some(row) = table.get_mut(terminal_id) else {
+            return false;
+        };
+        if !row.armed || row.ever_attached {
+            return false;
+        }
+        if bound_now() != Ok(false) {
+            return false;
+        }
+        row.closing_under_create = true;
+        true
+    }
+
+    /// Withdraw an admitted create-grant close whose end definitively did NOT
+    /// close the terminal (refused or still running), so the terminal is back to
+    /// where it was before the admission: attachable, and closable on a retry.
+    pub fn release_create_close(&self, terminal_id: &str) {
+        if let Some(row) = self.table().get_mut(terminal_id) {
+            row.closing_under_create = false;
+        }
+    }
+
+    /// Is a create-grant close admitted for `terminal_id`?
+    pub fn is_closing_under_create(&self, terminal_id: &str) -> bool {
+        self.table()
+            .get(terminal_id)
+            .is_some_and(|row| row.closing_under_create)
     }
 
     /// May a create grant still close `terminal_id`? Only a row that is armed and
@@ -501,14 +614,9 @@ pub fn arm_remote_created(
     arm_with_target(reaper(), tm, terminal_id, coord_session_id);
 }
 
-/// Record that an attach grant was bound to `terminal_id` (process-wide).
-pub fn mark_attached(terminal_id: &str) {
-    reaper().mark_attached(terminal_id, Instant::now());
-}
-
-/// [`RemoteCreateReaper::was_ever_attached`] on the process-wide reaper.
-pub fn was_ever_attached(terminal_id: &str) -> bool {
-    reaper().was_ever_attached(terminal_id)
+/// [`RemoteCreateReaper::release_create_close`] on the process-wide reaper.
+pub fn release_create_close(terminal_id: &str) {
+    reaper().release_create_close(terminal_id);
 }
 
 #[cfg(test)]
@@ -1085,16 +1193,32 @@ mod tests {
         let (_, attach) = src
             .split_once("async fn handle_terminal_attach(")
             .expect("handle_terminal_attach");
+        // The mark now rides the bind itself, under the reaper's lock
+        // (`RemoteCreateReaper::bind_attach`), so the handler must hand the
+        // process-wide reaper to the gate that binds.
+        let reaper = attach
+            .find("let reaper = crate::mcp::remote_create_reaper::reaper();")
+            .expect("handle_terminal_attach must take the process-wide reaper");
+        let passed = attach
+            .find("admit_terminal_attach(\n            grants(),\n            &reaper,")
+            .expect("handle_terminal_attach must bind through the reaper");
         let gate = attach.find("match gate()").expect("attach gate");
-        let mark = attach
-            .find("remote_create_reaper::mark_attached(&terminal_id)")
-            .expect("handle_terminal_attach must mark the bound terminal attached");
         let flow = attach
             .find("flow_gates().remove(&block.grant_jti)")
             .expect("flow gate reset");
+        assert!(reaper < passed && passed < gate && gate < flow);
+
+        const TERMINAL_SRC: &str = include_str!("remote_terminal.rs");
+        let (_, admit) = TERMINAL_SRC
+            .split_once("pub fn admit_terminal_attach<")
+            .expect("admit_terminal_attach");
+        let admit = admit
+            .split_once("\n}\n")
+            .expect("end of admit_terminal_attach")
+            .0;
         assert!(
-            gate < mark && mark < flow,
-            "mark after the bind, in the same handler"
+            admit.contains("reaper.bind_attach(") && !admit.contains("if !grants.bind("),
+            "the attach bind must go through the reaper, never around it"
         );
     }
 }
