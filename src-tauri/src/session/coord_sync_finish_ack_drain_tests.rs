@@ -270,3 +270,64 @@ fn an_unconfirmed_finish_is_classified_as_its_own_kind() {
         ("server_error", Some(503))
     );
 }
+
+/// Review: an unconfirmed finish blocks only ITS session's chain — another
+/// session's rows drain on the same tick, and the tick is not an outage.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unconfirmed_finish_on_one_session_does_not_stop_another_from_draining() {
+    let (_d, outbox, coord, rec, acks) =
+        finish_rig(Some((200, r#"{"session_status":"working"}"#))).await;
+    let a = Uuid::new_v4();
+    let b = Uuid::new_v4();
+    queue_finish(&outbox, a, "csid-a", 42);
+    record_started(&outbox, Uuid::new_v4(), b);
+    let mut state = DrainState::default();
+    let tick = drain_tick(&coord.inner, &mut state).await;
+    assert_eq!(kinds(&pending_of(&outbox, a)), vec!["finished"], "A is kept");
+    assert!(pending_of(&outbox, b).is_empty(), "B drained on the same tick");
+    assert!(
+        rec.lock().await.posts.iter().any(|p| p["id"] == json!(b)),
+        "B's started row reached coord"
+    );
+    assert!(!tick.outage, "coord answered A: not an outage");
+    assert!(state.retry.contains_key(&a));
+    assert!(!state.retry.contains_key(&b));
+    assert!(acks.lock().unwrap().is_empty());
+}
+
+/// Review F2: the observed ACK hands the observer the row that answered, and
+/// the stamp records it on the mark.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_observed_ack_records_the_answering_row_on_the_mark() {
+    use crate::session::session_lifecycle_store::{test_open_record, SessionLifecycleStore};
+    let dir = tempfile::tempdir().unwrap();
+    let outbox = build_outbox(dir.path());
+    let (base, _rec) = spawn_fake_coord().await;
+    let coord = CoordSync::new_for_test(
+        outbox.clone(),
+        base,
+        Duration::from_millis(100),
+        Duration::from_secs(60),
+    );
+    let store = Arc::new(SessionLifecycleStore::open(dir.path().join("lifecycle.json")).unwrap());
+    store.record_open(test_open_record("csid-row"));
+    let at = store
+        .set_finished("csid-row", true, Some("done".into()))
+        .unwrap()
+        .record
+        .finished_at
+        .unwrap();
+    {
+        let store = store.clone();
+        coord.attach_finished_ack_observer_on(move |csid, finished_at, row| {
+            store.mark_finish_synced_on(csid, finished_at, Some(row));
+        });
+    }
+    let s = Uuid::new_v4();
+    queue_finish(&outbox, s, "csid-row", at);
+    let mut state = DrainState::default();
+    drain_tick(&coord.inner, &mut state).await;
+    let rec = store.get("csid-row").unwrap();
+    assert!(rec.finish_synced);
+    assert_eq!(rec.finish_coord_session_id, Some(s), "the row the PATCH addressed");
+}
