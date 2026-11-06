@@ -421,21 +421,81 @@ fmt_fingerprint() {
   git -C "$ROOT" diff HEAD -- src-tauri | git hash-object --stdin || echo "unavailable"
 }
 fmt_before="$(fmt_fingerprint)"
-cargo fmt
-fmt_after="$(fmt_fingerprint)"
 
-# Re-stage any src-tauri files fmt rewrote. `git add -u` on the src-tauri tree
-# picks up tracked-file modifications only (no new/untracked files). Best-effort:
-# if nothing changed this is a no-op.
-git -C "$ROOT" add -u -- src-tauri || true
+# The files under src-tauri/ that ALREADY carry unstaged edits, recorded before
+# fmt runs. Under pre-commit's own pre-push invocation this set is empty — the
+# framework has stashed every unstaged edit and checked the tree out to the
+# index — so `git add -u` used to stage exactly fmt's output and nothing else.
+# Run WITHOUT that stash (the stash-free shim mechanism, or a hand run; see
+# prepush-stash-guard.sh and findings 690aaeec / d0958551), a bare
+# `git add -u -- src-tauri` would silently stage the caller's in-progress edits
+# into their next commit. So only files that were clean before fmt are staged;
+# a dirty file fmt also rewrote is left unstaged and named. Each dirty file's
+# content hash is kept too, so the note names only the ones fmt touched.
+dirty_before=()
+while IFS= read -r -d '' _path; do
+  dirty_before+=("$_path")
+done < <(git -C "$ROOT" diff --name-only -z -- src-tauri 2>/dev/null)
+dirty_hashes() {
+  [[ "${#dirty_before[@]}" -gt 0 ]] || return 0
+  printf '%s\n' "${dirty_before[@]}" | git -C "$ROOT" hash-object --stdin-paths 2>/dev/null || true
+}
+dirty_hashes_before="$(dirty_hashes)"
+
+fmt_rc=0
+cargo fmt || fmt_rc=$?
+if [[ "$fmt_rc" -ne 0 ]]; then
+  # Formatting never blocks (T2 above). A parse error fmt trips on is either in
+  # the pushed code — clippy below reports it as a compile error — or in an
+  # unstaged edit this push does not carry.
+  echo "[pre-push] NOTE — cargo fmt exited $fmt_rc; continuing (formatting never blocks)."
+fi
+fmt_after="$(fmt_fingerprint)"
+dirty_hashes_after="$(dirty_hashes)"
+
+# Re-stage the src-tauri files fmt rewrote that had no unstaged edits of their
+# own. Tracked-file modifications only (no new/untracked files), as `git add -u`
+# was. Best-effort: if nothing changed this is a no-op.
+declare -A _was_dirty=()
+for _path in ${dirty_before[@]+"${dirty_before[@]}"}; do
+  _was_dirty["$_path"]=1
+done
+to_stage=()
+while IFS= read -r -d '' _path; do
+  [[ -n "${_was_dirty[$_path]+x}" ]] || to_stage+=("$_path")
+done < <(git -C "$ROOT" diff --name-only -z -- src-tauri 2>/dev/null)
+# The caller's dirty files fmt rewrote: same order on both sides, so compare
+# line by line. An unreadable hash on either side names the file (over-report).
+left_dirty=()
+if [[ "${#dirty_before[@]}" -gt 0 ]]; then
+  mapfile -t _hb <<<"$dirty_hashes_before"
+  mapfile -t _ha <<<"$dirty_hashes_after"
+  for _i in "${!dirty_before[@]}"; do
+    if [[ -z "${_hb[$_i]:-}" || "${_hb[$_i]:-}" != "${_ha[$_i]:-}" ]]; then
+      left_dirty+=("${dirty_before[$_i]}")
+    fi
+  done
+fi
+if [[ "${#to_stage[@]}" -gt 0 ]]; then
+  git -C "$ROOT" --literal-pathspecs add -- "${to_stage[@]}" || true
+fi
 
 if [[ "$fmt_before" != "$fmt_after" ]]; then
   echo
-  echo "[pre-push] NOTE — cargo fmt rewrote files, and they are now STAGED."
+  if [[ "${#to_stage[@]}" -gt 0 ]]; then
+    echo "[pre-push] NOTE — cargo fmt rewrote files, and they are now STAGED."
+  else
+    echo "[pre-push] NOTE — cargo fmt rewrote files."
+  fi
   echo "          A pre-push hook cannot alter commits that are already being"
   echo "          pushed, so THIS push still carries the unformatted tree and"
   echo "          CI's required 'Format Rust code check' will red it. Commit"
   echo "          (or amend) the staged fmt fix and push again."
+  if [[ "${#left_dirty[@]}" -gt 0 ]]; then
+    echo "          fmt also reformatted these files IN PLACE, but they already held"
+    echo "          UNSTAGED edits of yours, so nothing in them was staged:"
+    printf '            %s\n' "${left_dirty[@]}"
+  fi
   echo
 fi
 
