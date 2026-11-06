@@ -29,7 +29,7 @@ __osc633() {
 # Per prompt, from PROMPT_COMMAND (so a PROMPT_COMMAND that rewrites PS1 —
 # starship, __git_ps1 — cannot drop them): the finished command's E and D and
 # the cwd from our FIRST entry; then, from our LAST entry (after every entry of
-# the user's), P;CommandMarks=1 when it is provably true and A. B stays in PS1:
+# the user's), P;CommandMarks=1 when its checks pass and A. B stays in PS1:
 # it is cosmetic. Per command line: C — from PS0 on bash >= 4.4, the DEBUG trap
 # before that.
 #
@@ -37,9 +37,11 @@ __osc633() {
 # the next typed command line will get a C first. It is sent ONLY when these
 # checks pass at this prompt: bash >= 4.4 (PS0 exists), PS0 holds our C right
 # now (re-prefixed if something reassigned PS0 — a `source ~/.bashrc` — unless
-# PS0 is readonly), and stderr, where bash writes PS0, is a terminal (not after
-# an `exec 2>/dev/null` or `exec 2>>log`; a stderr sent to ANOTHER terminal
-# still passes, the one case the checks miss). The DEBUG trap is never
+# PS0 is readonly), and stderr, where bash writes PS0, is the terminal the
+# shell reads from: a terminal (`[ -t 2 ]`, not after `exec 2>/dev/null` or
+# `exec 2>>log`) and the same file as stdin (`-ef`, not after `exec
+# 2>/dev/pts/N`, another terminal). `exec 2>/dev/tty` fails the second check
+# too, so it stops the announcement: the safe direction. The DEBUG trap is never
 # announced: a user PROMPT_COMMAND's entries can spend its once-per-line C.
 # Without the announcement the runner keeps the pane, which is always safe. It
 # rides every prompt, so a runner pane that stopped parsing marks (remounted,
@@ -97,8 +99,8 @@ __qontinui_prompt_start() {
 
 # Last PROMPT_COMMAND entry, after every entry of the user's: record HISTCMD,
 # then the capability (only if PS0 still carries our C, re-prefixing it where
-# something reassigned PS0, and stderr — where bash writes PS0 — is a terminal)
-# and A.
+# something reassigned PS0, and stderr — where bash writes PS0 — is the
+# terminal stdin is) and A.
 __qontinui_prompt_end() {
     local code=$?
     __qontinui_histcmd="${HISTCMD-}"
@@ -108,7 +110,7 @@ __qontinui_prompt_end() {
             *) __qontinui_is_readonly PS0 || PS0='\e]633;C\a'"${PS0-}" ;;
         esac
         case "${PS0-}" in
-            *'\e]633;C\a'*) if [ -t 2 ]; then __osc633 "P;CommandMarks=1"; fi ;;
+            *'\e]633;C\a'*) if [ -t 2 ] && [[ /dev/fd/2 -ef /dev/fd/0 ]]; then __osc633 "P;CommandMarks=1"; fi ;;
         esac
     fi
     __osc633 "A"

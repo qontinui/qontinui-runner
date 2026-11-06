@@ -31,12 +31,12 @@
  *      hidden, overrun out of the ring, spliced out of a resync, painted over
  *      by a reconnect). The shell side announces the capability only at a
  *      prompt where it can see its C path in place — bash: PS0 carries the C
- *      and stderr, where bash writes PS0, is a terminal; zsh: our preexec is
- *      registered and no user `preexec` function runs ahead of it; PowerShell:
- *      PSConsoleHostReadLine is still ours, at a top-level prompt. Anywhere
- *      those checks fail it stays silent, and the pane is kept. They are
- *      checks, not proof: a stderr redirected to ANOTHER terminal still passes
- *      bash's.
+ *      and stderr, where bash writes PS0, is the terminal stdin is; zsh: our
+ *      preexec is the first hook and no user `preexec` function runs ahead of
+ *      it; PowerShell: PSConsoleHostReadLine is still ours, at a top-level
+ *      prompt. Anywhere those checks fail it stays silent, and the pane is
+ *      kept. They are checks of what each shell can see at its prompt, not
+ *      proof of what the next line will do.
  *
  * What neither witness sees: work a shell runs in-process and in the
  * background without a command line — a PowerShell `Start-ThreadJob` (or
