@@ -1554,13 +1554,15 @@ about who is clearing or withdrawing a gate (plan
 `2026-09-23-anonymous-agent-credential-mint-can-act-as-any-registered-device`,
 decision finding `a777c0e6`). **That fence is THIS rung's rule today, not
 coord's:** the server-side refusal (`403 bootstrap_credential_scope`, from
-`crates/coord/src/auth_bootstrap_scope.rs`) ships with qontinui-coord#2437,
-which was OPEN on 2026-10-03 — neither the file nor the code is on coord
-`origin/main` `07a192bae`, so coord applies NO mint-provenance refusal to an
-attest over this bearer today — only the gate's own clearance authority stands
-between it and a clear — and the fence holds because this rung never sends
-one. Once #2437
-lands, a `403` with that code is the boundary, not an outage — do not retry it
+`crates/coord/src/auth_bootstrap_scope.rs`) ships with qontinui-coord#3146
+(the rebuild that supersedes #2948 and #2437), OPEN on 2026-10-12 — until it
+lands coord applies NO mint-provenance refusal to an attest over this bearer —
+only the gate's own clearance authority stands between it and a clear — and
+the fence holds because this rung never sends one. Once #3146 lands, a REST
+`403` with that code — or, over `/mcp`, a successful `result` with
+`isError: true` and `structuredContent.error ==
+"tool_not_available_to_principal"` for `coord_attest_gate` /
+`coord_withdraw_gate` — is the boundary, not an outage — do not retry it
 on another bootstrap mint; attest or withdraw over a door that carries a paired
 device JWT or the runner's proxy nonce (Steps 1–4a), or report the gate spec
 as unattested. **`POST $COORD_HTTP_URL/mcp` does accept this bearer**, as

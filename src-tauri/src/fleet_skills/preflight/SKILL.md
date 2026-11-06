@@ -545,8 +545,20 @@ Phase 4.)* `declare_intent` sees only sessions currently DECLARING, and its
 `prior_realizations_status != "ok"` — a prose `work_unit_id` returns
 `not_slug_shaped` and the lookup never runs. Neither sees an OPEN PR from a
 finished session. `coord_query_train_health` does: read its
-`candidates_in_flight[].branch` for each repo the work touches and scan the
-branch names against your intent. A branch such as
+`candidates_in_flight[].branch` AND its `queued_conflicting_head_details[].branch`
+for each repo the work touches and scan the branch names against your intent.
+Both lists, because a queued proposal whose PR GitHub reports conflicting at its
+own head is parked by the dequeue claim and is listed ONLY in the second one (plan
+`2026-10-31-conflicting-head-exclusion-is-invisible-to-the-reads-that-report-the-queue`);
+a parked PR is still open work by a peer. A coord build that serves no
+`queued_conflicting_head_details` key still lists parked rows in
+`candidates_in_flight`, so reading the one list there loses nothing. A key that
+is PRESENT but `null` is different: that build already dropped parked rows from
+`candidates_in_flight`, and the advisory read that lists them failed
+(`queued_conflicting_head_details_error` says why) — so the parked half of the
+scan is UNKNOWN, and an empty scan is not "no peer branch". The list is also
+bounded (50 rows): when `queued_conflicting_head` exceeds its length, a branch
+absent from it proves nothing. A branch such as
 `fix/untimed-subprocess-isolated-edit` beside an intent to fix that very
 function means the work is already in flight — stop and coordinate. On
 2026-09-02 a session wrote a duplicate fix to `claude_tree_is_repo_authored`
@@ -803,7 +815,7 @@ coord_claim_acquire(kind="file_glob", resource_key="<glob>", ttl_seconds=900)   
   while the loop
   keeps renewing the others; when no renewable row is left the loop ends, and
   `status` reads `STOLEN` if any row was stolen, `MAX_RUNTIME` if its runtime
-  bound ended it, `OWNER_GONE` if owner death ended it, otherwise `DEAD`.
+  bound ended it, `OWNER_GONE` if the loop released its rows because the owner was gone (its pid died, its transcript went idle or missing, or coord closed or finished the session), otherwise `DEAD`.
   **Only `LIVE` means the claims are held.** The other seven mean the claim is
   **UNKNOWN** (`STALE` usually self-heals on the next beat; re-acquiring
   anyway is harmless — a held claim answers `renewed`), which is a re-acquire and a line in the report, never a shrug — a
