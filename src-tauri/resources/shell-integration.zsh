@@ -34,10 +34,11 @@ __qontinui_precmd() {
 }
 
 # preexec: fires once per typed command line, before it runs, and never for a
-# hook. Emit E;<cmd> and C. Registered FIRST in preexec_functions, so our C
-# precedes every hook in that array. A user `preexec` FUNCTION is not in it:
-# zsh runs that function before the array, so our C would wait for it — which
-# is why a prompt does not announce the capability while one is defined.
+# hook. Emit E;<cmd> and C. Installed FIRST in preexec_functions, so our C
+# precedes every hook in that array for as long as it stays first, which each
+# prompt checks. A user `preexec` FUNCTION is not in the array: zsh runs that
+# function before it, so our C would wait for it — which is why a prompt does
+# not announce the capability while one is defined.
 __qontinui_preexec() {
     local cmd="$1"
     local escaped="${cmd//;/\\x3b}"
@@ -49,16 +50,18 @@ __qontinui_preexec() {
 # here rather than baked into PROMPT, so a theme that reassigns PROMPT in its
 # own precmd (or a hook added after this one) cannot drop A — and no hook can
 # emit a C after it. The capability tells the runner this prompt's A means
-# "nothing is running"; it is sent only while our preexec is still registered
-# and no user `preexec` function runs ahead of it (the C path is present, and
-# first, at THIS prompt); otherwise the pane is kept. `emulate -L zsh`: the
-# user's options (KSH_ARRAYS shifts every subscript) stay out of the check. The
-# literal is pinned against the webview's COMMAND_MARKS_CAPABILITY by a source
-# scan in src-tauri/src/session/spawn_prompt.rs.
+# "nothing is running"; it is sent only while our preexec is the FIRST entry of
+# preexec_functions — a hook prepended later (a deferred plugin's
+# `preexec_functions=(slow $preexec_functions)`) runs ahead of our C, and one
+# appended later does not — and no user `preexec` function runs ahead of the
+# array: the C path is present, and first, at THIS prompt. Otherwise the pane
+# is kept. `emulate -L zsh`: the user's options (KSH_ARRAYS shifts every
+# subscript to 0-based) stay out of the check. The literal is pinned against
+# the webview's COMMAND_MARKS_CAPABILITY by a source scan in
+# src-tauri/src/session/spawn_prompt.rs.
 __qontinui_precmd_prompt_start() {
     emulate -L zsh
-    if (( ${+preexec_functions} )) && (( ${preexec_functions[(Ie)__qontinui_preexec]} )) &&
-        (( ! ${+functions[preexec]} )); then
+    if [[ ${preexec_functions[1]-} == __qontinui_preexec ]] && (( ! ${+functions[preexec]} )); then
         __qontinui_osc633 "P;CommandMarks=1"
     fi
     __qontinui_osc633 "A"

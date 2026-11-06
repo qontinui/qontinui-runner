@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
-# shell-integration-marks-test.sh — the bash integration's prompt-state marks,
-# observed on a real pty.
+# shell-integration-marks-test.sh — the bash and zsh integrations' prompt-state
+# marks, observed on a real pty.
 #
 # The runner replaces a terminal pane ("Move them") only when its shell's last
 # OSC 633 mark is a prompt (A) AND that prompt announced `P;CommandMarks=1`,
 # i.e. that the next typed command line gets a command-start mark (C) first.
 # That promise must hold whatever the user's own shell setup does, the setup
 # itself must keep working, and a prompt that cannot keep the promise must not
-# make it. Each case installs a user rc, seeds ~/.bash_history with the very
-# command it will type, then types
+# make it. Each case installs a user rc, then types
 #
 #     [case-specific lines]  false && true  printf 'OUT%s\n' 42  <empty line>  exit
 #
@@ -16,32 +15,39 @@
 # E (any 633;E) and O (the command's OUTPUT, OUT42 — its text has `OUT%s`):
 #
 #   - the case's expected run of tokens appears in order. For a case whose
-#     prompts can keep the promise it is " M A C O E M A M A ": the capability
-#     before A at every prompt; the printf's C before its output; its E
-#     (history) after it; the empty line gets no C and no E; the next prompt
-#     again M then A;
-#   - at most the case's number of M tokens: a prompt that cannot prove its C
-#     (a readonly PS0, stderr that is not the terminal, no integration at all)
-#     must not announce;
+#     prompts can keep the promise it is, in bash, " M A C O E M A M A ": the
+#     capability before A at every prompt; the printf's C before its output;
+#     its E (from history, at the next prompt) after it; the empty line gets no
+#     C and no E; the next prompt again M then A. zsh sends E from preexec,
+#     before C, so there it is " M A E C O M A M A ";
+#   - at most the case's number of M tokens: a prompt whose checks cannot see
+#     its C path in place (a readonly PS0, stderr that is not the pane's
+#     terminal, a hook ahead of ours, no integration at all) must not announce;
 #   - no E is sent twice: a seeded history, an empty line, a PROMPT_COMMAND
 #     entry or a history file another shell appended to never re-sends one; the
 #     printf has its one E wherever the expected run has one;
 #   - the shell survived to `exit` (the output is there at all), and reported
 #     no error (`unbound variable` under `set -u`, a `readonly variable`, …).
 #
+# A bash case also seeds ~/.bash_history with the very command it will type, so
+# an E read from a stale history entry would show.
+#
 # Every shell runs in a pinned environment (`env -i`, plus what a runner pane
 # sets), so the caller's — a runner pane exports QONTINUI_INTEGRATION and
-# QONTINUI_RUNNER_TERMINAL — cannot change the result.
+# QONTINUI_RUNNER_TERMINAL — cannot change the result. The zsh cases SKIP
+# where zsh is not installed.
 #
 # Run: bash src-tauri/resources/shell-integration-marks-test.sh
 # Exit 0 = pass (or SKIP without util-linux script(1)), 1 = a case failed.
 # Driven from CI by src-tauri/src/session/spawn_prompt.rs
 # `script_tests::bash_integration_marks_every_typed_command`, whose budget is
-# sized from the number of `run_case` lines below and the per-case bound.
+# sized from the number of `run_case` / `run_zsh_case` lines below and the
+# per-case bound.
 set -u
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 integ="${SHELL_INTEGRATION_BASH:-${here}/shell-integration.bash}"
+zinteg="${SHELL_INTEGRATION_ZSH:-${here}/shell-integration.zsh}"
 
 # util-linux script(1) (`-c`, `-e`) and coreutils timeout(1): a BSD script(1)
 # (macOS) takes a different argv.
@@ -59,35 +65,57 @@ if ! (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4)
 fi
 
 tmp="$(mktemp -d)"
-trap 'rm -rf "${tmp}"' EXIT
+keep=0
+other_holder=""
+cleanup() {
+    if [ -n "${other_holder}" ]; then
+        kill "${other_holder}" 2>/dev/null
+        wait "${other_holder}" 2>/dev/null
+    fi
+    exec 9>&-
+    # A failed case's transcripts stay for the reader.
+    [ "${keep}" = 1 ] || rm -rf "${tmp}"
+}
+trap cleanup EXIT
 esc=$'\033'
 bel=$'\007'
 typed="printf 'OUT%s\\n' 42"
 failures=0
-# The run every prompt that can keep the promise produces.
+# The runs every prompt that can keep the promise produces.
 marks=" M A C O E M A M A "
+zmarks=" M A E C O M A M A "
 
-# run_case <name> <expected run> <most M tokens, or any> <bashrc body> [lines typed first...]
-run_case() {
-    local name="$1" want="$2" max_m="$3" rc="$4"
-    shift 4
-    local home="${tmp}/${name}"
-    mkdir -p "${home}"
-    printf '%s\n' "${rc}" >"${home}/.bashrc"
-    # The command this case types is already the newest history entry.
-    printf '%s\n' "${typed}" >"${home}/.bash_history"
-    # One line at a time, so each is read at its own prompt. The environment
-    # is a runner pane's, and nothing of the caller's.
-    local out
-    out="$(
-        {
-            for line in "$@" "false && true" "${typed}" "" "exit"; do
-                printf '%s\n' "${line}"
-                sleep 0.3
-            done
-        } | env -i PATH="${PATH}" HOME="${home}" TERM=dumb QONTINUI_RUNNER_TERMINAL=1 \
-            timeout -k 2 20 script -q -e -c "bash --rcfile '${integ}' -i" /dev/null 2>&1
-    )"
+fail() {
+    echo "FAIL $1"
+    failures=$((failures + 1))
+    keep=1
+}
+
+# A second terminal, held open for the whole run, for the case that points the
+# shell's stderr at a terminal that is not its pane. Its stdin never ends while
+# fd 9 holds the fifo open.
+other_tty=""
+start_other_terminal() {
+    local fifo="${tmp}/other-terminal-stdin" ttyfile="${tmp}/other-terminal" i
+    mkfifo "${fifo}" || return 1
+    exec 9<>"${fifo}"
+    SHELL=/bin/sh timeout -k 2 300 script -q -e -c "tty >'${ttyfile}'; exec sleep 290" /dev/null \
+        <"${fifo}" >/dev/null 2>&1 &
+    other_holder=$!
+    for i in {1..100}; do
+        [ -s "${ttyfile}" ] && break
+        sleep 0.1
+    done
+    other_tty="$(cat "${ttyfile}" 2>/dev/null)"
+    case "${other_tty}" in
+        /dev/*) return 0 ;;
+    esac
+    return 1
+}
+
+# check_case <name> <home> <output> <expected run> <most M tokens, or any> <printf E count>
+check_case() {
+    local name="$1" home="$2" out="$3" want="$4" max_m="$5" want_e="$6"
     printf '%s' "${out}" >"${home}/transcript"
 
     # The marks and the output token, in stream order, one letter each.
@@ -105,8 +133,11 @@ run_case() {
         *) why="${why} expected '${want}' in the mark stream, got '${seq}';" ;;
     esac
     if [ "${max_m}" != "any" ]; then
-        local m_count
-        m_count="$(printf '%s' " ${seq} " | grep -o ' M ' | wc -l)"
+        # One count per M token, however many sit side by side.
+        local token m_count=0
+        for token in ${seq}; do
+            if [ "${token}" = M ]; then m_count=$((m_count + 1)); fi
+        done
         if [ "${m_count}" -gt "${max_m}" ]; then
             why="${why} P;CommandMarks=1 was announced ${m_count} times, at most ${max_m} allowed;"
         fi
@@ -114,7 +145,8 @@ run_case() {
     # The user's shell must not see the integration fail: no shell error at
     # all (an unbound variable under `set -u` aborts the rest of the rc).
     case "${out}" in
-        *"unbound variable"* | *"readonly variable"* | *"syntax error"* | *"command not found"*)
+        *"unbound variable"* | *"readonly variable"* | *"read-only variable"* | *"syntax error"* | \
+            *"command not found"* | *"parameter not set"* | *"parse error"* | *"bad substitution"*)
             why="${why} the shell reported an error;"
             ;;
     esac
@@ -125,26 +157,82 @@ run_case() {
     if [ -n "${repeated}" ]; then
         why="${why} an E was sent more than once: ${repeated};"
     fi
-    local e_count want_e
+    local e_count
     e_count="$(printf '%s' "${out}" | grep -ao -e "${esc}]633;E;printf 'OUT%s" | wc -l)"
-    case "${want}" in
-        *"O E"*) want_e=1 ;;
-        *) want_e=0 ;;
-    esac
     if [ "${e_count}" -ne "${want_e}" ]; then
         why="${why} the printf's E was sent ${e_count} times, not ${want_e};"
     fi
 
     if [ -n "${why}" ]; then
-        echo "FAIL ${name}:${why} (transcript: ${home}/transcript)"
-        failures=$((failures + 1))
-        # Keep the transcripts for the reader.
-        trap - EXIT
+        fail "${name}:${why} (transcript: ${home}/transcript)"
     else
         echo "ok   ${name}"
     fi
 }
 
+# The lines a case types, one per prompt: its own first, then the common tail.
+type_lines() {
+    local line
+    for line in "$@" "false && true" "${typed}" "" "exit"; do
+        printf '%s\n' "${line}"
+        sleep 0.3
+    done
+}
+
+# run_case <name> <expected run> <most M tokens, or any> <bashrc body> [lines typed first...]
+run_case() {
+    local name="$1" want="$2" max_m="$3" rc="$4"
+    shift 4
+    local home="${tmp}/${name}"
+    mkdir -p "${home}"
+    printf '%s\n' "${rc}" >"${home}/.bashrc"
+    # The command this case types is already the newest history entry.
+    printf '%s\n' "${typed}" >"${home}/.bash_history"
+    # The environment is a runner pane's, and nothing of the caller's.
+    local out
+    out="$(type_lines "$@" |
+        env -i PATH="${PATH}" HOME="${home}" TERM=dumb QONTINUI_RUNNER_TERMINAL=1 \
+            timeout -k 2 20 script -q -e -c "bash --rcfile '${integ}' -i" /dev/null 2>&1)"
+    # bash sends the printf's E from history at the next prompt, after its output.
+    local want_e=0
+    case "${want}" in
+        *"O E"*) want_e=1 ;;
+    esac
+    check_case "${name}" "${home}" "${out}" "${want}" "${max_m}" "${want_e}"
+}
+
+# run_zsh_case <name> <expected run> <most M tokens, or any> <~/.zshrc body> [lines typed first...]
+# The runner points ZDOTDIR at a directory whose .zshrc is the integration, and
+# the integration sources the user's ~/.zshenv, ~/.zprofile and ~/.zshrc. The
+# case's ZDOTDIR also gets a .zshenv that turns GLOBAL_RCS off, so the host's
+# /etc/zsh/zshrc (compinit, keymaps) is not part of what is measured.
+run_zsh_case() {
+    local name="$1" want="$2" max_m="$3" rc="$4"
+    shift 4
+    if [ -z "${zsh_bin}" ]; then
+        echo "SKIP ${name}: zsh is not installed"
+        return 0
+    fi
+    local home="${tmp}/${name}"
+    mkdir -p "${home}/zdotdir"
+    printf '%s\n' "${rc}" >"${home}/.zshrc"
+    cp "${zinteg}" "${home}/zdotdir/.zshrc"
+    printf '%s\n' 'unsetopt GLOBAL_RCS' >"${home}/zdotdir/.zshenv"
+    local out
+    out="$(type_lines "$@" |
+        env -i PATH="${PATH}" HOME="${home}" ZDOTDIR="${home}/zdotdir" TERM=dumb \
+            QONTINUI_RUNNER_TERMINAL=1 \
+            timeout -k 2 20 script -q -e -c "'${zsh_bin}' -i" /dev/null 2>&1)"
+    # zsh sends the printf's E from preexec, before its C, whenever our hook runs.
+    local want_e=0
+    case "${want}" in
+        *"E C O"*) want_e=1 ;;
+    esac
+    check_case "${name}" "${home}" "${out}" "${want}" "${max_m}" "${want_e}"
+}
+zsh_bin="$(command -v zsh 2>/dev/null || true)"
+
+# ── bash ────────────────────────────────────────────────────────────────────
 # Every form of a user PROMPT_COMMAND, and one that rewrites PS1 every prompt.
 run_case no-prompt-command "${marks}" any 'PS1="$ "'
 run_case string-prompt-command "${marks}" any 'PS1="$ "; PROMPT_COMMAND="history -a"'
@@ -166,17 +254,35 @@ run_case ps0-reassigned "${marks}" any 'PS1="$ "; PROMPT_COMMAND="history -a"' '
 run_case readonly-ps1 "${marks}" any 'readonly PS1="$ "; PROMPT_COMMAND="history -a"'
 run_case readonly-ps0 " A E A O E A A " 0 'PS1="$ "; readonly PS0=""'
 run_case readonly-prompt-command " O " 0 'PS1="$ "; readonly PROMPT_COMMAND="history -a"'
-# bash writes PS0 to stderr: once stderr is not the terminal, the C never
-# reaches the pane, so only the prompt before the redirect announces.
+# bash writes PS0 to stderr: once stderr is not the pane's terminal — not a
+# terminal at all, or ANOTHER terminal (which `[ -t 2 ]` alone accepts) — the C
+# never reaches the pane, so only the prompt before the redirect announces.
 run_case stderr-not-a-terminal " A O E A A " 1 'PS1="$ "' 'exec 2>/dev/null'
+start_other_terminal || fail "stderr-on-another-terminal: could not hold a second terminal open"
+run_case stderr-on-another-terminal " A O E A A " 1 'PS1="$ "' "exec 2>${other_tty:-/dev/null/no-second-terminal}"
 # A shared history (`history -a; history -c; history -r` every prompt) that
 # another shell appended to: the reload renumbers the list, and the empty line
 # after it must not re-send the previous line's E.
 run_case shared-history "${marks}" any 'PS1="$ "; PROMPT_COMMAND="history -a; history -c; history -r"' \
     'echo from-other-session >> ~/.bash_history' ''
 
+# ── zsh ─────────────────────────────────────────────────────────────────────
+run_zsh_case zsh-no-user-hooks "${zmarks}" any 'PS1="$ "'
+# The user's options stay out of the integration's own checks.
+run_zsh_case zsh-ksh-arrays "${zmarks}" any 'PS1="$ "; setopt KSH_ARRAYS'
+run_zsh_case zsh-nounset "${zmarks}" any 'PS1="$ "; setopt NO_UNSET'
+# A hook added AFTER ours runs after our C: still announced.
+run_zsh_case zsh-hook-appended-later "${zmarks}" any 'PS1="$ "; h() { : }' 'add-zsh-hook preexec h'
+# A hook put AHEAD of ours later (a deferred plugin) runs before our C, and a
+# user `preexec` function always does: neither prompt may announce.
+run_zsh_case zsh-hook-prepended-later " E C O A A " 1 'PS1="$ "; slow() { : }' \
+    'preexec_functions=(slow $preexec_functions)'
+run_zsh_case zsh-preexec-function " E C O A A " 0 'PS1="$ "; preexec() { : }'
+# Our hook removed: no C at all, so no announcement.
+run_zsh_case zsh-our-hook-removed " O A A " 1 'PS1="$ "' 'add-zsh-hook -d preexec __qontinui_preexec'
+
 if [ "${failures}" -ne 0 ]; then
-    echo "${failures} case(s) failed"
+    echo "${failures} case(s) failed (transcripts kept under ${tmp})"
     exit 1
 fi
 echo "all cases passed"
