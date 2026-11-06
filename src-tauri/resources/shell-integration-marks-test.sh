@@ -100,9 +100,11 @@ fail() {
     keep=1
 }
 
-# A second terminal, held open for the whole run, for the case that points the
-# shell's stderr at a terminal that is not its pane. Its stdin never ends while
-# fd 9 holds the fifo open.
+# A second terminal, held open for the whole run, for the cases that point the
+# shell's stdin and/or stderr at a terminal that is not its pane. Its holder's
+# script(1) reads the fifo on fd 9 (opened here, read-write, so the holder's
+# stdin never ends) and types what arrives into that terminal: it is also the
+# input channel of a shell whose stdin has moved there (run_case_input_moves).
 other_tty=""
 start_other_terminal() {
     local fifo="${tmp}/other-terminal-stdin" ttyfile="${tmp}/other-terminal" i
@@ -155,7 +157,8 @@ check_case() {
     # all (an unbound variable under `set -u` aborts the rest of the rc).
     case "${out}" in
         *"unbound variable"* | *"readonly variable"* | *"read-only variable"* | *"syntax error"* | \
-            *"command not found"* | *"parameter not set"* | *"parse error"* | *"bad substitution"*)
+            *"command not found"* | *"parameter not set"* | *"parse error"* | *"bad substitution"* | \
+            *"fork failed"* | *"Resource temporarily unavailable"*)
             why="${why} the shell reported an error;"
             ;;
     esac
@@ -218,10 +221,10 @@ check_bash_case() {
     check_case "${name}" "${home}" "${out}" "${want}" "${max_m}" "${want_e}"
 }
 
-# run_case_input_moves <name> <expected run> <most M tokens> <bashrc body> <redirect line>
-# Like run_case, but the redirect line moves the shell's stdin to the second
-# terminal, so the common tail is typed THERE: into the fifo whose bytes the
-# holder's script(1) types into it.
+# run_case_input_moves <name> <expected run> <most M tokens> <bashrc body> <redirect line, or "">
+# Like run_case, but the shell's stdin moves to the second terminal — by the
+# redirect line typed into the pane, or (with "") by the rc itself — so the
+# common tail is typed THERE, through fd 9.
 run_case_input_moves() {
     local name="$1" want="$2" max_m="$3" rc="$4" redirect="$5"
     local home="${tmp}/${name}"
@@ -230,7 +233,9 @@ run_case_input_moves() {
     printf '%s\n' "${typed}" >"${home}/.bash_history"
     local out
     out="$({
-        printf '%s\n' "${redirect}"
+        if [ -n "${redirect}" ]; then
+            printf '%s\n' "${redirect}"
+        fi
         sleep 0.6
         type_lines >&9
         sleep 1
@@ -251,6 +256,15 @@ run_zsh_case() {
         echo "SKIP ${name}: zsh is not installed"
         return 0
     fi
+    # Root is exempt from `ulimit -u`, so a case that sets one needs a uid it binds.
+    case "${rc}" in
+        *"ulimit -u"*)
+            if [ "${EUID}" = 0 ]; then
+                echo "SKIP ${name}: root is exempt from ulimit -u"
+                return 0
+            fi
+            ;;
+    esac
     local home="${tmp}/${name}"
     mkdir -p "${home}/zdotdir"
     printf '%s\n' "${rc}" >"${home}/.zshrc"
@@ -296,7 +310,9 @@ run_case readonly-prompt-command " O " 0 'PS1="$ "; readonly PROMPT_COMMAND="his
 # pane — not a terminal at all, or ANOTHER terminal (which `[ -t 2 ]` alone
 # accepts), or both moved to another terminal together (which comparing them
 # with each other accepts) — only the prompt before the redirect announces.
-# stderr pointed back at the pane (`2>&1`, or its own path) still announces.
+# stderr re-opened on the pane by its own path still announces. (`exec 2>&1`
+# has no case: under script(1) fds 0, 1 and 2 already share one open file, so
+# it changes nothing a case could see.)
 run_case stderr-not-a-terminal " A O E A A " 1 'PS1="$ "' 'exec 2>/dev/null'
 start_other_terminal || fail "stderr-on-another-terminal: could not hold a second terminal open"
 run_case stderr-on-another-terminal " A O E A A " 1 'PS1="$ "' "exec 2>${other_tty:-/dev/null/no-second-terminal}"
@@ -306,7 +322,11 @@ run_case_input_moves stdin-and-stderr-on-another-terminal " A O E A A " 1 'PS1="
 # the pane's, so the prompt is not announced either (the safe direction).
 run_case_input_moves stdin-on-another-terminal " A C O E A A " 1 'PS1="$ "' \
     "exec 0<${other_tty:-/dev/null/no-second-terminal}"
-run_case stderr-to-stdout "${marks}" any 'PS1="$ "' 'exec 2>&1'
+# The same redirect made by the user's rc, before the first prompt: the pane is
+# the terminal the shell STARTED on, recorded before the rc runs, so no prompt
+# announces.
+run_case_input_moves rc-moves-stdin-and-stderr " A E A O E A A " 0 \
+    "PS1='\$ '; exec 0<${other_tty:-/dev/null/no-second-terminal} 2>${other_tty:-/dev/null/no-second-terminal}" ""
 run_case stderr-reopened-by-its-path "${marks}" any 'PS1="$ "' 'exec 2>"$(tty)"'
 # A shared history (`history -a; history -c; history -r` every prompt) that
 # another shell appended to: the reload renumbers the list, and the empty line
@@ -332,6 +352,11 @@ run_zsh_case zsh-addhistory-hook " E C O A A " 0 'PS1="$ "; autoload -Uz add-zsh
 run_zsh_case zsh-addhistory-function " E C O A A " 0 'PS1="$ "; zshaddhistory() { return 0 }'
 run_zsh_case zsh-debug-trap " E C O A A " 0 "PS1='\$ '; trap ':' DEBUG"
 run_zsh_case zsh-trapdebug-function " E C O A A " 0 'PS1="$ "; TRAPDEBUG() { : }'
+# A user function named `trap` must not hide the trap from the read.
+run_zsh_case zsh-trap-shadowed-by-a-function " E C O A A " 0 "PS1='\$ '; trap ':' DEBUG; trap() { : }"
+# At a process ceiling no fork succeeds, so the DEBUG trap cannot be read: the
+# prompt must stay silent (no error text), still send A, and not announce.
+run_zsh_case zsh-at-a-process-ceiling " E C O A A " 0 'PS1="$ "; ulimit -u 1'
 # Our hook removed: no C at all, so no announcement.
 run_zsh_case zsh-our-hook-removed " O A A " 1 'PS1="$ "' 'add-zsh-hook -d preexec __qontinui_preexec'
 

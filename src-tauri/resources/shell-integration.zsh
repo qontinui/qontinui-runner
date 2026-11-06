@@ -60,25 +60,41 @@ __qontinui_preexec() {
 # `preexec_functions=(slow $preexec_functions)`, runs ahead of our C; one
 # appended later does not), and there must be no `preexec` or `zshaddhistory`
 # function, no zshaddhistory_functions entry, and no DEBUG trap (a TRAPDEBUG
-# function, or `trap … DEBUG`, which zsh lists only as `trap` text — the one
-# fork, made last and only when everything else passed). Otherwise the pane
-# is kept. `emulate -L zsh`: the user's options (KSH_ARRAYS shifts every
-# subscript to 0-based, NO_UNSET) stay out of the check.
+# function, or `trap … DEBUG`, which zsh lists only as `builtin trap` text).
+# Otherwise the pane is kept. `emulate -L zsh`: the user's options
+# (KSH_ARRAYS shifts every subscript to 0-based, NO_UNSET) stay out of it.
+#
+# Reading that text is the one fork in these hooks, made last and only when
+# everything else passed. A fork that fails (EAGAIN at a task/PID ceiling) is
+# caught: nothing is printed, the trap is taken as possibly present (no
+# capability), and A is still sent.
 #
 # Residual, documented rather than gated: line-editor-time code. ZLE widgets
-# (`zle-line-finish`, a wrapped `accept-line`) and prompt expansion before the
-# line is accepted (PS2, a PROMPT_SUBST SPROMPT) run ahead of preexec and are
-# not checked; anything they fork shows in the runner's process read. Gating
-# them would switch the capability off for most p10k and
-# zsh-syntax-highlighting users. The literal is pinned against the webview's
-# COMMAND_MARKS_CAPABILITY by a source scan in
-# src-tauri/src/session/spawn_prompt.rs.
+# (`zle-line-finish`, a wrapped `accept-line`) and PS2 continuation prompts run
+# before the line is accepted, and a PROMPT_SUBST SPROMPT (spelling
+# correction) is expanded AFTER it is accepted, before our C; none is checked,
+# and anything they fork shows in the runner's process read. Gating them would
+# switch the capability off for most p10k and zsh-syntax-highlighting users.
+# The literal is pinned against the webview's COMMAND_MARKS_CAPABILITY by a
+# source scan in src-tauri/src/session/spawn_prompt.rs.
 __qontinui_precmd_prompt_start() {
     emulate -L zsh
+    local announce=0 traps=
     if [[ ${preexec_functions[1]-} == __qontinui_preexec ]] &&
         (( ! ${+functions[preexec]} && ! ${+functions[zshaddhistory]} &&
-            ${#zshaddhistory_functions} == 0 && ! ${+functions[TRAPDEBUG]} )) &&
-        [[ $'\n'"$(trap)"$'\n' != *' DEBUG'$'\n'* ]]; then
+            ${#zshaddhistory_functions} == 0 && ! ${+functions[TRAPDEBUG]} )); then
+        {
+            {
+                traps="$(builtin trap)" && announce=1
+            } always {
+                TRY_BLOCK_ERROR=0
+            }
+        } 2>/dev/null
+        if [[ $'\n'${traps}$'\n' == *' DEBUG'$'\n'* ]]; then
+            announce=0
+        fi
+    fi
+    if (( announce )); then
         __qontinui_osc633 "P;CommandMarks=1"
     fi
     __qontinui_osc633 "A"
@@ -97,8 +113,10 @@ add-zsh-hook precmd __qontinui_precmd_prompt_start
 
 # B (command ready) at the end of PROMPT. %{...%} marks it zero-width so zsh
 # doesn't miscount the prompt length. Cosmetic: a theme that rewrites PROMPT
-# drops it, and nothing reads it as state.
-PROMPT="${PROMPT-}%{$(printf '\033]633;B\007')%}"
+# drops it, and nothing reads it as state. `$'…'`, not a printf command
+# substitution: no fork, so a shell whose rc left it at a process ceiling
+# installs without an error.
+PROMPT="${PROMPT-}%{"$'\e]633;B\a'"%}"
 
 # ── Claude Code runner context ─────────────────────────────────────────────
 # Wrap `claude` so sessions launched from this terminal know they run inside

@@ -3115,11 +3115,19 @@ mod command_marks_scan_tests {
             BASH.contains(&gated),
             "the bash announcement must be gated on PS0 carrying the command start, and on stdin and stderr both still being the pane recorded at install"
         );
-        // The pane, by path, recorded once; a failed `tty` leaves it empty,
-        // and the gate above then announces nothing.
+        // The pane, by path, recorded once with `command tty` (no user
+        // function or alias stands in) BEFORE the user's rc can redirect
+        // stdin or stderr; a failed `tty` leaves it empty, and the gate above
+        // then announces nothing.
+        const PANE: &str = "if { __qontinui_pane_tty=\"$(command tty 2>/dev/null)\"; } 2>/dev/null; then\n    case \"${__qontinui_pane_tty}\" in\n        /*) ;;\n        *) __qontinui_pane_tty=\"\" ;;\n    esac\nelse\n    __qontinui_pane_tty=\"\"\nfi";
+        const USER_RC: &str = "\n# Source user's bashrc (skipped when used as --rcfile)\n[ -f ~/.bashrc ] && source ~/.bashrc\n";
+        let pane_at = BASH
+            .find(PANE)
+            .expect("bash must record the pane's path with `command tty`, empty when it fails");
+        let rc_at = BASH.find(USER_RC).expect("bash sources the user's rc");
         assert!(
-            BASH.contains("if __qontinui_pane_tty=\"$(tty 2>/dev/null)\"; then\n    case \"${__qontinui_pane_tty}\" in\n        /*) ;;\n        *) __qontinui_pane_tty=\"\" ;;\n    esac\nelse\n    __qontinui_pane_tty=\"\"\nfi"),
-            "bash must record the pane's path at install, empty when `tty` fails"
+            pane_at < rc_at,
+            "bash must record the pane before the user's rc runs, so an rc redirect cannot become the pane"
         );
         assert!(
             BASH.contains("            PS0='\\e]633;C\\a'\"${PS0-}\"\n"),
@@ -3212,11 +3220,19 @@ mod command_marks_scan_tests {
             "zsh may announce the capability from exactly one place"
         );
         let gated = format!(
-            "    emulate -L zsh\n    if [[ ${{preexec_functions[1]-}} == __qontinui_preexec ]] &&\n        (( ! ${{+functions[preexec]}} && ! ${{+functions[zshaddhistory]}} &&\n            ${{#zshaddhistory_functions}} == 0 && ! ${{+functions[TRAPDEBUG]}} )) &&\n        [[ $'\\n'\"$(trap)\"$'\\n' != *' DEBUG'$'\\n'* ]]; then\n        {emit}\n    fi"
+            "    emulate -L zsh\n    local announce=0 traps=\n    if [[ ${{preexec_functions[1]-}} == __qontinui_preexec ]] &&\n        (( ! ${{+functions[preexec]}} && ! ${{+functions[zshaddhistory]}} &&\n            ${{#zshaddhistory_functions}} == 0 && ! ${{+functions[TRAPDEBUG]}} )); then\n        {{\n            {{\n                traps=\"$(builtin trap)\" && announce=1\n            }} always {{\n                TRY_BLOCK_ERROR=0\n            }}\n        }} 2>/dev/null\n        if [[ $'\\n'${{traps}}$'\\n' == *' DEBUG'$'\\n'* ]]; then\n            announce=0\n        fi\n    fi\n    if (( announce )); then\n        {emit}\n    fi"
         );
         assert!(
             ZSH.contains(&gated),
-            "the zsh announcement must be gated on our preexec being the first hook, with no preexec or zshaddhistory function, no zshaddhistory hook and no DEBUG trap ahead of it"
+            "the zsh announcement must be gated on our preexec being the first hook, with no preexec or zshaddhistory function, no zshaddhistory hook and no DEBUG trap ahead of it, read by a `builtin trap` whose failed fork is caught"
+        );
+        // The DEBUG-trap read is the only fork anywhere in the file, and it
+        // is the caught one: a fork that fails at a process ceiling must not
+        // print an error or cost the prompt its A.
+        assert_eq!(
+            ZSH.matches("$(").count(),
+            1,
+            "the zsh integration may hold exactly one command substitution (a fork): the caught `builtin trap` read in its prompt hook"
         );
         assert!(
             ZSH.contains(
