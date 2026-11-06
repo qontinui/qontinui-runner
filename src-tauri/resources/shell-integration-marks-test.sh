@@ -21,8 +21,10 @@
 #     C and no E; the next prompt again M then A. zsh sends E from preexec,
 #     before C, so there it is " M A E C O M A M A ";
 #   - at most the case's number of M tokens: a prompt whose checks cannot see
-#     its C path in place (a readonly PS0, stderr that is not the pane's
-#     terminal, a hook ahead of ours, no integration at all) must not announce;
+#     its C path in place and reaching the pane (a readonly PS0, a stdin or
+#     stderr that is no longer the pane, no integration at all), or that sees a
+#     registered user hook ahead of it (a zsh hook before ours, a
+#     `zshaddhistory` hook, a DEBUG trap), must not announce;
 #   - no E is sent twice: a seeded history, an empty line, a PROMPT_COMMAND
 #     entry or a history file another shell appended to never re-sends one; the
 #     printf has its one E wherever the expected run has one;
@@ -30,7 +32,9 @@
 #     no error (`unbound variable` under `set -u`, a `readonly variable`, …).
 #
 # A bash case also seeds ~/.bash_history with the very command it will type, so
-# an E read from a stale history entry would show.
+# an E read from a stale history entry would show. On bash 4.4–5.0, HISTCMD
+# stays 1 inside PROMPT_COMMAND, so the integration sends no E at all there
+# (never a wrong one) and the bash cases expect their runs without E.
 #
 # Every shell runs in a pinned environment (`env -i`, plus what a runner pane
 # sets), so the caller's — a runner pane exports QONTINUI_INTEGRATION and
@@ -40,9 +44,9 @@
 # Run: bash src-tauri/resources/shell-integration-marks-test.sh
 # Exit 0 = pass (or SKIP without util-linux script(1)), 1 = a case failed.
 # Driven from CI by src-tauri/src/session/spawn_prompt.rs
-# `script_tests::bash_integration_marks_every_typed_command`, whose budget is
-# sized from the number of `run_case` / `run_zsh_case` lines below and the
-# per-case bound.
+# `script_tests::shell_integration_marks_every_typed_command`, whose budget is
+# sized from the number of `run_case` / `run_case_input_moves` / `run_zsh_case`
+# lines below and the per-case bound.
 set -u
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -84,6 +88,11 @@ failures=0
 # The runs every prompt that can keep the promise produces.
 marks=" M A C O E M A M A "
 zmarks=" M A E C O M A M A "
+# bash 4.4–5.0: no E (see the header).
+bash_sends_e=1
+if (( BASH_VERSINFO[0] == 4 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] == 0) )); then
+    bash_sends_e=0
+fi
 
 fail() {
     echo "FAIL $1"
@@ -193,12 +202,41 @@ run_case() {
     out="$(type_lines "$@" |
         env -i PATH="${PATH}" HOME="${home}" TERM=dumb QONTINUI_RUNNER_TERMINAL=1 \
             timeout -k 2 20 script -q -e -c "bash --rcfile '${integ}' -i" /dev/null 2>&1)"
-    # bash sends the printf's E from history at the next prompt, after its output.
-    local want_e=0
+    check_bash_case "${name}" "${home}" "${out}" "${want}" "${max_m}"
+}
+
+# bash sends the printf's E from history at the next prompt, after its output —
+# where it sends E at all.
+check_bash_case() {
+    local name="$1" home="$2" out="$3" want="$4" max_m="$5" want_e=0
+    if [ "${bash_sends_e}" = 0 ]; then
+        want="${want// E/}"
+    fi
     case "${want}" in
         *"O E"*) want_e=1 ;;
     esac
     check_case "${name}" "${home}" "${out}" "${want}" "${max_m}" "${want_e}"
+}
+
+# run_case_input_moves <name> <expected run> <most M tokens> <bashrc body> <redirect line>
+# Like run_case, but the redirect line moves the shell's stdin to the second
+# terminal, so the common tail is typed THERE: into the fifo whose bytes the
+# holder's script(1) types into it.
+run_case_input_moves() {
+    local name="$1" want="$2" max_m="$3" rc="$4" redirect="$5"
+    local home="${tmp}/${name}"
+    mkdir -p "${home}"
+    printf '%s\n' "${rc}" >"${home}/.bashrc"
+    printf '%s\n' "${typed}" >"${home}/.bash_history"
+    local out
+    out="$({
+        printf '%s\n' "${redirect}"
+        sleep 0.6
+        type_lines >&9
+        sleep 1
+    } | env -i PATH="${PATH}" HOME="${home}" TERM=dumb QONTINUI_RUNNER_TERMINAL=1 \
+        timeout -k 2 20 script -q -e -c "bash --rcfile '${integ}' -i" /dev/null 2>&1)"
+    check_bash_case "${name}" "${home}" "${out}" "${want}" "${max_m}"
 }
 
 # run_zsh_case <name> <expected run> <most M tokens, or any> <~/.zshrc body> [lines typed first...]
@@ -254,12 +292,22 @@ run_case ps0-reassigned "${marks}" any 'PS1="$ "; PROMPT_COMMAND="history -a"' '
 run_case readonly-ps1 "${marks}" any 'readonly PS1="$ "; PROMPT_COMMAND="history -a"'
 run_case readonly-ps0 " A E A O E A A " 0 'PS1="$ "; readonly PS0=""'
 run_case readonly-prompt-command " O " 0 'PS1="$ "; readonly PROMPT_COMMAND="history -a"'
-# bash writes PS0 to stderr: once stderr is not the pane's terminal — not a
-# terminal at all, or ANOTHER terminal (which `[ -t 2 ]` alone accepts) — the C
-# never reaches the pane, so only the prompt before the redirect announces.
+# bash writes PS0 to stderr and reads lines from stdin: once either is not the
+# pane — not a terminal at all, or ANOTHER terminal (which `[ -t 2 ]` alone
+# accepts), or both moved to another terminal together (which comparing them
+# with each other accepts) — only the prompt before the redirect announces.
+# stderr pointed back at the pane (`2>&1`, or its own path) still announces.
 run_case stderr-not-a-terminal " A O E A A " 1 'PS1="$ "' 'exec 2>/dev/null'
 start_other_terminal || fail "stderr-on-another-terminal: could not hold a second terminal open"
 run_case stderr-on-another-terminal " A O E A A " 1 'PS1="$ "' "exec 2>${other_tty:-/dev/null/no-second-terminal}"
+run_case_input_moves stdin-and-stderr-on-another-terminal " A O E A A " 1 'PS1="$ "' \
+    "exec 0<${other_tty:-/dev/null/no-second-terminal} 2>${other_tty:-/dev/null/no-second-terminal}"
+# stdin alone moved: the C still reaches the pane, but the lines are no longer
+# the pane's, so the prompt is not announced either (the safe direction).
+run_case_input_moves stdin-on-another-terminal " A C O E A A " 1 'PS1="$ "' \
+    "exec 0<${other_tty:-/dev/null/no-second-terminal}"
+run_case stderr-to-stdout "${marks}" any 'PS1="$ "' 'exec 2>&1'
+run_case stderr-reopened-by-its-path "${marks}" any 'PS1="$ "' 'exec 2>"$(tty)"'
 # A shared history (`history -a; history -c; history -r` every prompt) that
 # another shell appended to: the reload renumbers the list, and the empty line
 # after it must not re-send the previous line's E.
@@ -278,6 +326,12 @@ run_zsh_case zsh-hook-appended-later "${zmarks}" any 'PS1="$ "; h() { : }' 'add-
 run_zsh_case zsh-hook-prepended-later " E C O A A " 1 'PS1="$ "; slow() { : }' \
     'preexec_functions=(slow $preexec_functions)'
 run_zsh_case zsh-preexec-function " E C O A A " 0 'PS1="$ "; preexec() { : }'
+# zsh runs zshaddhistory hooks, and a DEBUG trap fires before every command
+# (our preexec's first one included), ahead of our C: never announced.
+run_zsh_case zsh-addhistory-hook " E C O A A " 0 'PS1="$ "; autoload -Uz add-zsh-hook; h() { return 0 }; add-zsh-hook zshaddhistory h'
+run_zsh_case zsh-addhistory-function " E C O A A " 0 'PS1="$ "; zshaddhistory() { return 0 }'
+run_zsh_case zsh-debug-trap " E C O A A " 0 "PS1='\$ '; trap ':' DEBUG"
+run_zsh_case zsh-trapdebug-function " E C O A A " 0 'PS1="$ "; TRAPDEBUG() { : }'
 # Our hook removed: no C at all, so no announcement.
 run_zsh_case zsh-our-hook-removed " O A A " 1 'PS1="$ "' 'add-zsh-hook -d preexec __qontinui_preexec'
 

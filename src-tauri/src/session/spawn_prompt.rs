@@ -2994,19 +2994,21 @@ mod script_tests {
     /// `PROMPT_COMMAND` in every form (and zsh hooks in every position), each
     /// typed command line gets its 633;C before its output and a 633;A after
     /// it, and the prompt announces `633;P;CommandMarks=1` — except where its
-    /// checks cannot see the C path in place (a readonly PS0, stderr that is
-    /// not the pane's terminal, a zsh hook ahead of ours), where it must not.
+    /// checks cannot see the C path in place and reaching the pane (a readonly
+    /// PS0, a stdin or stderr that is no longer the pane) or see a registered
+    /// user hook ahead of it (a zsh hook before ours, a `zshaddhistory` hook,
+    /// a DEBUG trap), where it must not.
     /// The script SKIPs (exit 0) where util-linux `script(1)` is missing or
     /// bash predates PS0, and skips its zsh cases where zsh is missing.
     #[test]
-    fn bash_integration_marks_every_typed_command() {
+    fn shell_integration_marks_every_typed_command() {
         const MARKS_TEST: &str = include_str!("../../resources/shell-integration-marks-test.sh");
         // Each case is one interactive bash or zsh behind `script(1)`, bounded
         // inside the script by `timeout -k 2 20` (20 s, then 2 s to the kill).
         // The budget is sized from that bound and the script's own case count
-        // (`run_case` and `run_zsh_case` lines), so adding a case cannot
-        // outgrow it; this outer bound only catches a hang the per-case bound
-        // somehow missed.
+        // (`run_case`, `run_case_input_moves` and `run_zsh_case` lines), so
+        // adding a case cannot outgrow it; this outer bound only catches a hang
+        // the per-case bound somehow missed.
         const CASE_BOUND: &str = "timeout -k 2 20 script";
         const CASE_WORST_SECS: u64 = 22;
         assert!(
@@ -3015,11 +3017,15 @@ mod script_tests {
         );
         let cases = MARKS_TEST
             .lines()
-            .filter(|l| l.starts_with("run_case ") || l.starts_with("run_zsh_case "))
+            .filter(|l| {
+                ["run_case ", "run_case_input_moves ", "run_zsh_case "]
+                    .iter()
+                    .any(|driver| l.starts_with(driver))
+            })
             .count();
         assert!(
             cases > 0,
-            "the marks test runs its cases with `run_case` / `run_zsh_case`"
+            "the marks test runs its cases with `run_case` / `run_case_input_moves` / `run_zsh_case`"
         );
         let cases = u64::try_from(cases).expect("a handful of cases fits in u64");
         let budget = Duration::from_secs(cases * CASE_WORST_SECS + 30);
@@ -3086,7 +3092,7 @@ mod command_marks_scan_tests {
     /// bash announces the capability only on the PS0 path (bash >= 4.4), the
     /// one that marks every typed command line and never a PROMPT_COMMAND
     /// entry, and only at a prompt whose checks pass: PS0 carries that C, and
-    /// stderr (where bash writes PS0) is the terminal stdin is.
+    /// stdin and stderr (where bash writes PS0) are still the pane.
     #[test]
     fn bash_announces_the_capability_only_where_ps0_emits_the_command_start() {
         let token = webview_token();
@@ -3099,15 +3105,21 @@ mod command_marks_scan_tests {
             "bash may announce the capability from exactly one place"
         );
         // That one place sends it only while PS0 carries our C (after
-        // re-prefixing a PS0 something reassigned) and stderr, where bash
-        // writes PS0, is a terminal AND the same file as stdin (not another
-        // terminal) — on the PS0 path only.
+        // re-prefixing a PS0 something reassigned) and both stdin (where the
+        // line is read) and stderr (where bash writes PS0) are still the pane
+        // recorded at install — on the PS0 path only.
         let gated = format!(
-            "    if [ \"${{__qontinui_ps0_path}}\" = \"1\" ]; then\n        case \"${{PS0-}}\" in\n            *'\\e]633;C\\a'*) ;;\n            *) __qontinui_is_readonly PS0 || PS0='\\e]633;C\\a'\"${{PS0-}}\" ;;\n        esac\n        case \"${{PS0-}}\" in\n            *'\\e]633;C\\a'*) if [ -t 2 ] && [[ /dev/fd/2 -ef /dev/fd/0 ]]; then {emit}; fi ;;\n        esac\n    fi"
+            "    if [ \"${{__qontinui_ps0_path}}\" = \"1\" ]; then\n        case \"${{PS0-}}\" in\n            *'\\e]633;C\\a'*) ;;\n            *) __qontinui_is_readonly PS0 || PS0='\\e]633;C\\a'\"${{PS0-}}\" ;;\n        esac\n        case \"${{PS0-}}\" in\n            *'\\e]633;C\\a'*)\n                if [[ -n ${{__qontinui_pane_tty-}} && /dev/fd/0 -ef ${{__qontinui_pane_tty-}} &&\n                    /dev/fd/2 -ef ${{__qontinui_pane_tty-}} ]]; then\n                    {emit}\n                fi\n                ;;\n        esac\n    fi"
         );
         assert!(
             BASH.contains(&gated),
-            "the bash announcement must be gated on PS0 carrying the command start"
+            "the bash announcement must be gated on PS0 carrying the command start, and on stdin and stderr both still being the pane recorded at install"
+        );
+        // The pane, by path, recorded once; a failed `tty` leaves it empty,
+        // and the gate above then announces nothing.
+        assert!(
+            BASH.contains("if __qontinui_pane_tty=\"$(tty 2>/dev/null)\"; then\n    case \"${__qontinui_pane_tty}\" in\n        /*) ;;\n        *) __qontinui_pane_tty=\"\" ;;\n    esac\nelse\n    __qontinui_pane_tty=\"\"\nfi"),
+            "bash must record the pane's path at install, empty when `tty` fails"
         );
         assert!(
             BASH.contains("            PS0='\\e]633;C\\a'\"${PS0-}\"\n"),
@@ -3185,9 +3197,11 @@ mod command_marks_scan_tests {
     }
 
     /// zsh announces only while our preexec is the FIRST entry of
-    /// `preexec_functions` and no user `preexec` FUNCTION runs ahead of the
-    /// array, judged under `emulate -L zsh`; our preexec is put first without
-    /// dropping the user's hooks under their array options (KSH_ARRAYS).
+    /// `preexec_functions` and no registered user hook runs ahead of it — no
+    /// `preexec` or `zshaddhistory` function, no `zshaddhistory_functions`
+    /// entry, no DEBUG trap — judged under `emulate -L zsh`; our preexec is
+    /// put first without dropping the user's hooks under their array options
+    /// (KSH_ARRAYS).
     #[test]
     fn zsh_announces_only_while_our_preexec_runs_first() {
         let token = webview_token();
@@ -3198,11 +3212,11 @@ mod command_marks_scan_tests {
             "zsh may announce the capability from exactly one place"
         );
         let gated = format!(
-            "    emulate -L zsh\n    if [[ ${{preexec_functions[1]-}} == __qontinui_preexec ]] && (( ! ${{+functions[preexec]}} )); then\n        {emit}\n    fi"
+            "    emulate -L zsh\n    if [[ ${{preexec_functions[1]-}} == __qontinui_preexec ]] &&\n        (( ! ${{+functions[preexec]}} && ! ${{+functions[zshaddhistory]}} &&\n            ${{#zshaddhistory_functions}} == 0 && ! ${{+functions[TRAPDEBUG]}} )) &&\n        [[ $'\\n'\"$(trap)\"$'\\n' != *' DEBUG'$'\\n'* ]]; then\n        {emit}\n    fi"
         );
         assert!(
             ZSH.contains(&gated),
-            "the zsh announcement must be gated on our preexec being the first hook, with no user preexec function ahead of it"
+            "the zsh announcement must be gated on our preexec being the first hook, with no preexec or zshaddhistory function, no zshaddhistory hook and no DEBUG trap ahead of it"
         );
         assert!(
             ZSH.contains(
