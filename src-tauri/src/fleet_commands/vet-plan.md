@@ -772,7 +772,7 @@ conclusive ones). **Arm 6 is the DEFAULT**: anything not positively matched by
 | 4 | the error `no work-unit with that slug` (the MCP tool appends ` in your tenant`; the HTTP twin's 404 body deliberately does not, so it cannot leak whether the slug belongs to another tenant — match on the short form) — **and** `recon-tenant.sh` answered `MATCH`, or `MULTI` with every listed tenant folded `clear` (below the table) | The unit does not exist **in any tenant this device is bound to**. **The COMMONEST case** — a first-time vet of a `DRAFT` plan has no work unit, because §5.4 upserts it at the *end* of this run. | **Proceed to vet, and SAY the read was not-found.** An absent unit and an uncited-but-present unit are different facts; do not fold one into the other. |
 | 3 | a top-level `merged_degraded_reason` is present | **UNKNOWN, whatever `delivery` says.** The field sits BESIDE `delivery` and is present even when the verdict could not be derived at all; while it is set, every citation's `merged: false` is UNKNOWN rather than an observation. | Treat as arm 2. |
 | 2 | `evidence_complete: false` — **regardless of `shipped`** | **UNKNOWN — never "undelivered".** `evidence_gaps` names each gap. | Fall through to the stamp arms and **say the read was inconclusive**, per `verification-and-evidence` `unknown-must-not-render-as-a-default`. |
-| 1 | `shipped: true` ∧ `evidence_complete: true` ∧ the phase axis CORROBORATES it (the three extra conjuncts below the table — do not apply this arm without them) | The plan is closed **in substance**. | **Do NOT vet** (see "Act here" below). Route to closeout. |
+| 1 | `shipped: true` ∧ `evidence_complete: true` ∧ the phase axis CORROBORATES it — every declared phase covered by `phases_delivered` or a resolved `phases_attested` entry, with at least one declared index in `phases_delivered` (the three extra conjuncts below the table — do not apply this arm without them) | The plan is closed **in substance**. | **Do NOT vet** (see "Act here" below). Route to closeout. |
 | 5 | `delivery` present ∧ no `merged_degraded_reason` ∧ `evidence_complete: true` ∧ `shipped: false` — **and** `recon-tenant.sh` answered `MATCH`, or `MULTI` with every listed tenant folded `clear` (below the table) | A clean, complete observation of *not delivered* **in every tenant this device is bound to** — including the zero-citation case. | Proceed to vet. |
 | 6 | **DEFAULT — anything not positively matched above.** Any error other than arm 4's, any unparseable or non-2xx body, a `citations_error` / `delivery_error` key, an absent `delivery`, or the tool masked / absent / on a dead transport (`"Command failed with no output"`) | **UNKNOWN.** Includes coord's `citation surface unavailable for work-unit …` (whose own text says it is NOT "this unit has no citations") and its generic `citation list failed: …`. | Treat as arm 2. On a dead transport run **`/coord-revive`** and re-issue over the live door before concluding anything. |
 
@@ -802,7 +802,7 @@ tenant's answer **by its RESPONSE SHAPE alone**, and fold with
 |---|---|
 | the error `no work-unit with that slug` (arm 4's body) | `clear` |
 | `delivery` present ∧ no `merged_degraded_reason` ∧ `evidence_complete: true` ∧ `shipped: false` (arm 5's body) | `clear` |
-| arm 1's body, all seven conjuncts — `shipped: true` ∧ `evidence_complete: true` ∧ no top-level `merged_degraded_reason` ∧ `phases_declared` not `null` ∧ `phases_remaining` the LITERAL `[]` ∧ that `[]` corroborated by the same response ∧ no `NO PHASE ATTRIBUTION` gap (the corroboration rule is arm 1's, below this table) | `found` |
+| arm 1's body, all seven conjuncts — `shipped: true` ∧ `evidence_complete: true` ∧ no top-level `merged_degraded_reason` ∧ `phases_declared` not `null` ∧ `phases_remaining` the LITERAL `[]` ∧ that `[]` corroborated by the same response (every declared index in `phases_delivered` or in a resolved `phases_attested` entry, with at least one declared index in `phases_delivered`) ∧ no `NO PHASE ATTRIBUTION` gap (the corroboration rule is arm 1's, below this table) | `found` |
 | **any** body carrying a top-level `merged_degraded_reason`, whatever else it says (arm 3's rule, which shape-classification would otherwise bypass) | `unknown` |
 | anything else, or no answer at all | `unknown` |
 
@@ -879,27 +879,85 @@ arm 1 additionally requires all three of:
   never collapse the two when serialising the read (a `jq` `// []` default or a
   Python `or []` does exactly that);
 - **that `[]` corroborated by the same response**: `phases_declared_indices` is
-  non-empty and every index in it also appears in `phases_delivered`. When
-  `phases_declared_indices` is non-empty and `phases_delivered` does not cover
-  it, `[]` contradicts its own neighbours — coord is claiming nothing remains
-  while not having attributed every declared phase — so read it as UNKNOWN and
-  fall through. An
+  non-empty, `phases_delivered` names at least one declared index, and every declared index is
+  **covered** — it appears in `phases_delivered`, **or** it appears in
+  `phases_attested` **and** `phase_attestations` carries an entry with that
+  `phase_index` whose `resolution` is `"resolved"`. When
+  `phases_declared_indices` is non-empty and that union does not cover it, `[]`
+  contradicts its own neighbours — coord is claiming nothing remains while
+  neither a landed attribution nor a live attestation covers every declared
+  phase — so read it as UNKNOWN and fall through. An
   EMPTY `phases_declared_indices` is not corroboration either, and neither is a
   `null` one — the spelling the nullable contract (plan
   `2026-09-18-coord-fabricates-a-phase-declaration-and-silences-its-own-gap`
   Phase 3) gives a declaration coord could not establish; and
 - no `NO PHASE ATTRIBUTION` entry in `evidence_gaps`.
 
+**A phase can be delivered by an ATTESTATION as well as a PR, and the
+corroboration counts both.** A phase whose correct output is not a PR — an
+evidence record, a measurement, a decision — is closed by
+`coord_work_unit_attest_phase`, pointing at the durable artifact that carries
+it. coord serves the result beside `phases_delivered`: `phases_attested` (the
+phases with a live, re-resolved attestation, never `null`) and
+`phase_attestations` (one row per attestation, `{phase_index, evidence_kind,
+evidence_ref, version, resolution}`, where only `resolution: "resolved"` rows
+reach `phases_attested`). coord unions that set into `phases_remaining` and
+`shipped` itself, so `phases_remaining: []` beside a `phases_delivered` short
+of the declaration, with the attested set covering the difference, is
+consistent, not a contradiction — and served policy `finished-criteria`
+`finished-is-per-element` says a phase is finished when its PRs merged *"or it
+is attested"*. Before this rule counted attestations, such a plan could never
+reach arm 1, `/verify-plan-status` §5 case 1 could never close it, and an
+`IN PROGRESS` stamp from a gone owner stayed forever (coord finding
+`426553fc`; read again 2026-10-31 with `coord_work_unit_list_citations` on unit
+`b9074f69`: declared `[0,1]`, `phases_delivered:
+[1]`, `phases_attested: [0]` with a resolved row, `phases_remaining: []`). What
+still holds, and why:
+
+- **Only a RESOLVED attestation covers.** An index in `phases_attested` with no
+  `phase_attestations` row for it whose `resolution` is `"resolved"` is not
+  counted. A `retracted`, `vanished` or `unreadable` row does not cover by
+  itself (one `resolved` row for that index suffices: a phase may carry one
+  attestation row per distinct `(evidence_kind, evidence_ref)`, so a retracted
+  or vanished row can sit beside a resolved one), and neither does an absent or
+  malformed `phase_attestations` or an attested index outside the declaration.
+  Each of those leaves the phase uncovered, which is UNKNOWN — never
+  permission.
+- **A coord that serves no `phases_attested`** (one predating plan
+  `2026-09-20-coord-delivery-has-no-verb-for-a-phase-that-ships-no-pr`
+  Phase 3) contributes nothing, and the test falls back to the PR-only reading.
+  That is the old, stricter answer, so an older build can only make arm 1
+  harder to reach, never easier.
+- **At least one DECLARED index must appear in `phases_delivered`** — at least
+  one declared phase PR-attributed, so a stop never rests on attestations
+  alone. "Non-empty" is not enough: coord does not clip `phases_delivered` to
+  the declaration (`delivery_view.rs`, *"Not clipped to the declaration"*), so a
+  landed PR scoped to an undeclared phase — an off-by-one between 0- and 1-based
+  numbering — leaves it non-empty while every declared phase is covered only by
+  attestation, and coord can then serve `shipped: true` with
+  `phases_remaining: []` and no `NO PHASE ATTRIBUTION` gap. Requiring a declared
+  index refuses that stop. A false negative here falls through to the stamp
+  arms, which still guard, while a false STOP has no guard after it.
+- **`PHASE ATTESTED WITHOUT A PR` is a disclosure, not a blocker.** coord
+  appends it whenever an attested phase sits under `shipped: true`, after
+  `evidence_complete` is computed. Arm 1 keys on the `NO PHASE ATTRIBUTION`
+  entry alone, never on an empty gap list, so this gap does not stop it.
+
 A response failing any of those **is not arm 1**: it falls to arm 6, the
 DEFAULT, whose action is arm 2's — fall through to the stamp
 arms and say the read was inconclusive on the phase axis. **One sub-case is not
 inconclusive:** a NON-EMPTY `phases_remaining` beside `shipped: true` is a clean
 reading of PARTIAL delivery — report it as *"partially delivered, phases <list>
-remain — proceed"*; the action is the same. The corroboration test
-is deliberately **build-independent**: `phases_declared_indices` and
-`phases_delivered` are already served beside `phases_remaining` by the coord
-build running today, so it needs no deployment tell and returns the same verdict
-before and after the nullable contract lands. Note the field names are close
+remain — proceed"*; the action is the same. The PR-only half of the
+corroboration test is deliberately **build-independent**:
+`phases_declared_indices` and `phases_delivered` are served beside
+`phases_remaining` by every coord build this test meets, so it needs no
+deployment tell and returns the same verdict before and after the nullable
+contract lands. The attested half is **additive**: only builds carrying plan
+`2026-09-20-coord-delivery-has-no-verb-for-a-phase-that-ships-no-pr` Phase 3
+serve `phases_attested`, and on a build that serves none the union is just
+`phases_delivered` — the old, stricter answer — so the test still needs no
+deployment tell. Note the field names are close
 enough to mislead — `phases_declared` is a **count** (`Option<usize>`, `null`
 when coord never knew the plan's phase shape); the declared INDICES are the
 separate field used above.
@@ -926,7 +984,9 @@ one contract read three times — the third reading is `/implement-plan`'s
 `IN PROGRESS` rule (Step 0.5), which defers to this arm's conjuncts.
 
 The cost is a **false negative**: a genuinely complete unit whose completeness
-was asserted some OTHER way falls through to the stamp arms. Two spellings, and the second is the larger population today. One: a citation
+was asserted some OTHER way falls through to the stamp arms. (A phase closed by
+a resolved attestation is no longer one of those ways — the corroboration above
+counts it.) Two spellings, and the second is the larger population today. One: a citation
 declaring `complete`, which satisfies coord's coverage gate for a plan of any
 length while attributing no index at all. Two: landed citations carrying **no
 phase scope at all**, which leaves `phases_delivered` empty the same way — for
@@ -963,7 +1023,10 @@ the declaration against the plan, so a declaration that is wrong *and* covered
 still corroborates. The same phantom `{1}` beside one landed citation whose
 marker carries `phases: 1` gives `phases_declared_indices: [1]` ⊆
 `phases_delivered: [1]`, `phases_remaining: []` and no gap — **corroborated, so
-arm 1 fires**, on a plan with phases outstanding. That residue is closed by no
+arm 1 fires**, on a plan with phases outstanding. An attestation widens the same
+residue: the attest door requires `phase_index` to be one of
+`phases_declared_indices`, so an attestation on a wrong-but-declared index
+corroborates exactly as a wrongly scoped citation does. That residue is closed by no
 single phase and not by this arm: plan
 `2026-09-18-coord-fabricates-a-phase-declaration-and-silences-its-own-gap`'s
 Phase 1 closes only the present-but-rejected-index arm of the positional
@@ -1815,8 +1878,10 @@ use, so the lifecycle reads cleanly:
 > Vetted-by: subagent (fresh context: plan path + `origin/main` body + repos
 > + rubric only; no authoring context). Plan: <plans repo> `origin/main`
 > <short-sha>. Read: <repo>@<short-sha>, <repo>@<short-sha>, ….
-> Checks: <the verdict's one-line checks — never containing `Depends-On:`
-> or `**Area:`, which the plan adapter parses off any stamp line>. Served
+> Checks: <the verdict's one-line checks — never containing `Depends-On:`,
+> `**Area:` or `**Initiative-Item:`, nor a wrapped line starting with a plain
+> `Area:` or `Initiative-Item:`, which the plan adapter parses off any stamp
+> line>. Served
 > policy <names>@<versions>.
 > Independence: context — the reviewer did not hold the author's reasoning.
 ```
@@ -1900,6 +1965,32 @@ and the body. Before writing your stamp:
    **one trailing line inside your new block**, prefixed `History:` or
    `Previously:`. Never as a sibling blockquote. A re-vet that lifts a hold
    keeps its trail here (§5.4 step 6, "And the converse").
+5. **Carry the `**Area:**`, `Initiative-Item:` and `Depends-On:`
+   declarations.** If any block you are replacing (item 2 deletes every
+   status-adjacent blockquote, not only the Status one) carries an
+   `Area:` declaration (`` > **Area:** `<area>` ``, or a line-leading plain
+   `Area:`), an `Initiative-Item:` line or a
+   `Depends-On:` declaration, carry each verbatim into your new block (a
+   `Depends-On:` stem this run corrected under the Depends-On verification
+   above is carried as corrected) —
+   `Depends-On:` as the suffix of your new `> **Status:` line, with its stems
+   on the same physical line as the key (the scanner reads only the rest of
+   that line, so a re-wrap that pushes them onto the next `>` line drops
+   them), and `**Area:**` / `Initiative-Item:` each as a `>` line
+   (conventionally directly under the Status line). Each must sit on or
+   below the `> **Status:` line inside that same blockquote, with no blank
+   line or non-`>` line in between — a `>` line above the Status line is not
+   read — and never in a sibling blockquote. The runner's plan scanner reads
+   all three only from this status blockquote, into `metadata.area`,
+   `metadata.initiative_item` and `metadata.depends_on`, and its next push
+   writes what it parsed (every active-directory push is a `metadata` merge
+   patch in which an undeclared `area` or `initiative_item` is sent as
+   `null`, a delete, and an undeclared `depends_on` as `[]`), so a stamp
+   that drops any of them erases it from the work unit's `metadata` on the
+   next scan. For `Depends-On:` that is worse than a clean erase: the runner
+   skips the dependency-edge write for an empty set, so edge rows written
+   earlier survive and coord goes on enforcing a dependency the plan no
+   longer shows.
 
 When `/vet-plan` and `/verify-plan-status` disagree on what the status
 should be (the plan is both VETTED *and* NOT STARTED — a vetted plan
@@ -2714,7 +2805,7 @@ Register exactly once per VETTED stamp (refresh, don't duplicate):
    your read and your write. On a plan-backed unit (`metadata.source_path`
    set) the keys in qontinui-runner
    `src-tauri/src/plan_workunit_adapter/metadata.rs` `SCANNER_OWNED_KEYS`
-   belong to the plan file, which the runner's plan adapter re-asserts from the plan per each key's absent-rule in that roster (read 2026-11-01: `source_path`, `depends_on`, `area`, `archive_path`, `phases`; a scan that detects no phases leaves `phases` alone), so edit those in the plan itself, its `Area:`
+   belong to the plan file, which the runner's plan adapter re-asserts from the plan per each key's absent-rule in that roster (read 2026-11-04 at qontinui-runner `86ea6da7f`: `source_path`, `depends_on`, `area`, `initiative_item`, `archive_path`, `phases`; a scan that detects no phases leaves `phases` alone), so edit those in the plan itself, its `Area:`, `Initiative-Item:`
    and `Depends-On:` lines, not on the unit. Every other key persists across
    scans on runner builds containing qontinui-runner `f0cb511f1`; a build containing `3a8408558` but not `f0cb511f1` still erases it on a plan with detected phases, and an older one on every plan. A patch merges an
    object-valued key recursively, so to replace one whole (e.g.

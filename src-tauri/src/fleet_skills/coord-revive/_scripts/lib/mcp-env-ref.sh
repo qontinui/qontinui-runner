@@ -88,6 +88,31 @@
 # ever reaches this box's loopback. Doors with no URL (a mint's answer, the
 # shim's --credential path) keep the plain expanders.
 #
+# -- The PORT gate: the terminal nonce goes to the HOSTING RUNNER only ----------
+# Loopback alone is not enough (finding e4c596d6; plan
+# 2026-11-06-a-walked-up-mcp-json-gets-the-sessions-nonce-on-any-loopback-port).
+# The doors find their .mcp.json by walking UP from a directory, so a file
+# planted where the walk reaches first could name `http://127.0.0.1:<any
+# port>/x` with this terminal's `${QONTINUI_COORD_MCP_NONCE_<K>}` and receive
+# it. The terminal nonce has ONE audience - the runner hosting this terminal,
+# whose API port (where its coord-mcp proxy is served) the runner exports as
+# $QONTINUI_RUNNER_API_PORT. So mcp_expand_env_ref_for_url reads the
+# environment only when mcp_url_port_is_hosting_runner holds: loopback, the
+# host EXACTLY 127.0.0.1 (the one host the runner writes and binds - a planted
+# listener can hold `localhost`, `[::1]` or 127.0.0.2 on the runner's port),
+# AND the URL's effective port (explicit, else 80 / 443 by scheme) equals that exported
+# variable (1-5 ASCII digits, 1..65535, integer compare). Any other URL resolves
+# on the DEFAULT arm - the file's own literal, never this process's secret. An
+# unset, unexported or malformed $QONTINUI_RUNNER_API_PORT reads the
+# environment for no URL. Same rule in python (url_port_is_hosting_runner) and
+# PowerShell (Test-CoordMcpHostingRunnerUrl), pinned by the same case table.
+# Two consequences, stated: only the `127.0.0.1` SPELLING gets the environment
+# value - a `localhost:<runner port>` door resolves on its default unless its
+# caller normalizes the host first (coord-mcp-shim.py does); and
+# $QONTINUI_RUNNER_API_PORT is trusted as the host's port, so an operator who
+# points it at another runner directs the terminal nonce there (a planted file
+# cannot set it).
+#
 # -- What it never does ---------------------------------------------------------
 # It never prints the value on stderr, and never the default either - the
 # default IS a nonce. A refusal names the VARIABLE only. The lookup is an
@@ -99,8 +124,11 @@
 #   mcp_expand_env_ref_to <var> <string>  -> sets <var>; 0, or 4 + stderr
 #   mcp_env_ref_default_to <var> <string> -> the same, DEFAULT arm only (a mint)
 #   mcp_url_is_loopback <url>             -> 0 iff the URL is strictly loopback
+#   mcp_url_port_is_hosting_runner <url>  -> 0 iff loopback AND the hosting
+#                                            runner's port
 #   mcp_expand_env_ref_for_url <var> <url> <string>
-#                                         -> env arm for a loopback URL, else
+#                                         -> env arm for the hosting runner's
+#                                            loopback port, else
 #                                            the DEFAULT arm; 0, or 4 + stderr
 #   mcp_expand_env_ref <string>           -> the expansion on stdout; 0, or 4
 #
@@ -163,10 +191,41 @@ mcp_url_is_loopback() {
   return 0
 }
 
-# mcp_expand_env_ref_for_url <outvar> <url> <string> - the environment arm for a
-# strictly-loopback URL, the DEFAULT arm for every other one.
+# mcp_url_port_is_hosting_runner <url> -> 0 iff the URL is strictly loopback
+# (above), its host is exactly 127.0.0.1, AND its effective port - the explicit one, else 80 for http / 443 for
+# https - equals the EXPORTED $QONTINUI_RUNNER_API_PORT (1-5 ASCII digits,
+# 1..65535, compared as integers). See "The PORT gate" in the header.
+mcp_url_port_is_hosting_runner() {
+  local __mer_api __mer_rest __mer_auth __mer_p __mer_def
+  mcp_url_is_loopback "$1" || return 1
+  __mer_exported QONTINUI_RUNNER_API_PORT || return 1
+  __mer_api="${QONTINUI_RUNNER_API_PORT-}"
+  case "$__mer_api" in ''|*[!0123456789]*) return 1 ;; esac
+  [ "${#__mer_api}" -le 5 ] || return 1
+  case "$1" in
+    [Hh][Tt][Tt][Pp]://*) __mer_rest="${1:7}"; __mer_def=80 ;;
+    *) __mer_rest="${1:8}"; __mer_def=443 ;;
+  esac
+  __mer_auth="${__mer_rest%%[/?#]*}"
+  # Exactly the host the runner writes and binds. `localhost`, `[::1]` and any
+  # other 127.x.y.z are loopback too, but a planted listener can hold them on
+  # the runner's port while the runner holds only 127.0.0.1.
+  case "$__mer_auth" in
+    127.0.0.1) __mer_p="$__mer_def" ;;
+    127.0.0.1:*) __mer_p="${__mer_auth#127.0.0.1:}" ;;
+    *) return 1 ;;
+  esac
+  # mcp_url_is_loopback held the port to ASCII digits; bound its length before
+  # the arithmetic so a 4000-digit port is a plain mismatch, not an overflow.
+  [ "${#__mer_p}" -le 5 ] || return 1
+  [ "$((10#$__mer_api))" -ge 1 ] && [ "$((10#$__mer_api))" -le 65535 ] || return 1
+  [ "$((10#$__mer_p))" -eq "$((10#$__mer_api))" ]
+}
+
+# mcp_expand_env_ref_for_url <outvar> <url> <string> - the environment arm for
+# the HOSTING RUNNER's loopback port, the DEFAULT arm for every other URL.
 mcp_expand_env_ref_for_url() {
-  if mcp_url_is_loopback "$2"; then
+  if mcp_url_port_is_hosting_runner "$2"; then
     __mer_expand env "$1" "$3"
   else
     __mer_expand default "$1" "$3"
