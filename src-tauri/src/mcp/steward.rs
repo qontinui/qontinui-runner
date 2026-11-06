@@ -1942,12 +1942,15 @@ mod tests {
     async fn a_steward_running_as_an_npm_claude_is_found_running() {
         use crate::process_capture::process_tree::ProcessSnapshot;
         use crate::terminal::graceful_exit::{PaneLook, RegistryWitness};
-        use crate::terminal::session::tests::{npm_claude_pane, NPM_CLAUDE_PID};
+        use crate::terminal::session::tests::{npm_claude_pane_as, NPM_CLAUDE_PID};
 
-        let pane = npm_claude_pane();
+        // The roster finds a pane through `TerminalManager::list`, which names
+        // it by its session's own id, so the session must carry the id it is
+        // registered and tracked under, as it does in production.
+        let id = "steward-r0c2-npm";
+        let pane = npm_claude_pane_as(id);
         let root = pane.session.child_pid().expect("a local pane");
         let tm = TerminalManager::new();
-        let id = "steward-r0c2-npm";
         tm.insert_for_test(id, pane.session.clone());
         let spec = steward_spec("merge-train").expect("a roster kind");
         steward_meta_store().lock().unwrap().insert(

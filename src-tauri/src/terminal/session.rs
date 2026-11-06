@@ -6099,6 +6099,16 @@ pub(crate) mod tests {
     /// Code registry record (`<config-dir>/sessions/7001.json`) names as the
     /// same process — an npm-installed `claude` — see [`ScriptedPane`].
     pub(crate) fn npm_claude_pane() -> ScriptedPane {
+        npm_claude_pane_as("test")
+    }
+
+    /// [`npm_claude_pane`] whose session reports `id` as its own id.
+    ///
+    /// `TerminalManager::list` names each pane by its SESSION's id, not by the
+    /// key `insert_for_test` stored it under. Production registers a session
+    /// under its own id, so the two never differ there; a test that goes
+    /// through `list` (the steward roster does) needs them equal too.
+    pub(crate) fn npm_claude_pane_as(id: &str) -> ScriptedPane {
         use crate::process_capture::process_tree::ProcessSnapshot;
 
         fn no_kernel(_: u32) -> Option<String> {
@@ -6134,7 +6144,9 @@ pub(crate) mod tests {
                 proc_start: no_kernel,
             }
         });
-        let (session, io, typed) = live_prompt_parts(EMPTY_PROMPT, true, Some(scripted.root_pid));
+        let (mut session, io, typed) =
+            live_prompt_parts(EMPTY_PROMPT, true, Some(scripted.root_pid));
+        session.id = id.to_string();
         ScriptedPane {
             session: Arc::new(session),
             claude_pids: vec![NPM_CLAUDE_PID],
