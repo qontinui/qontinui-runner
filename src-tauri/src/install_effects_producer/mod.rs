@@ -971,7 +971,7 @@ async fn get_sessions_restore_census(
         &store,
         boot,
         now,
-        live.as_ref(),
+        live.as_ref().map_err(|gap| *gap),
     )))
 }
 
@@ -1038,7 +1038,7 @@ async fn get_sessions_ledger(
     // async executor.
     let live = crate::session::session_ledger::live_view(&state.app_handle).await;
     let report = spawn_blocking_tracked(move || {
-        crate::session::session_ledger::report(store.as_deref(), live.as_ref())
+        crate::session::session_ledger::report(store.as_deref(), live.as_ref().ok())
     })
     .await;
     match report {

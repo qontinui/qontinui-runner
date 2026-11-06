@@ -1696,9 +1696,30 @@ pub struct LiveView {
     pub panes: HashMap<String, PaneRead>,
 }
 
+/// Why [`live_view`] has no view. Each is UNKNOWN, never "nothing is live",
+/// and each is reported under its own name so an operator can tell them apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiveViewGap {
+    /// The terminal manager is not in app state.
+    Unavailable,
+    /// The manager is present, but the wait behind another refill or the
+    /// process read itself ran past its bound.
+    TimedOut,
+}
+
+impl LiveViewGap {
+    /// The reason a surface reports for this gap.
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::Unavailable => "live_view_unavailable",
+            Self::TimedOut => "live_view_timeout",
+        }
+    }
+}
+
 /// [`LiveView`] of this process: the live PTYs, and the `claude` processes
-/// under each, from ONE process-table snapshot. `None` when the terminal
-/// manager is not in app state, which [`report`] reads as UNKNOWN, never as
+/// under each, from ONE process-table snapshot. Without one it says which
+/// [`LiveViewGap`] stopped it; [`report`] reads either as UNKNOWN, never as
 /// "nothing is live". An unreadable process table leaves every pane's read an
 /// `Err`, which [`observe_returns`] reads as [`Observed::Unknown`].
 ///
@@ -1712,25 +1733,29 @@ pub struct LiveView {
 /// Single flight: the memo's lock is held across the refill, so concurrent
 /// misses share one read and no slow older read can overwrite a newer one.
 /// The entry is stamped when its read COMPLETES. The wait for that lock is
-/// bounded by [`LIVE_VIEW_LOCK_WAIT`]: past it the answer is `None`, which
-/// [`report`] and the census read as UNKNOWN, never as an empty view.
-pub async fn live_view<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Option<LiveView> {
+/// bounded by [`LIVE_VIEW_LOCK_WAIT`], and the read by [`LIVE_VIEW_READ_WAIT`]:
+/// past either the answer is [`LiveViewGap::TimedOut`], which [`report`] and
+/// the census read as UNKNOWN, never as an empty view.
+pub async fn live_view<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+) -> Result<LiveView, LiveViewGap> {
     use tauri::Manager;
     let tm = app
-        .try_state::<std::sync::Arc<crate::terminal::TerminalManager>>()?
+        .try_state::<std::sync::Arc<crate::terminal::TerminalManager>>()
+        .ok_or(LiveViewGap::Unavailable)?
         .inner()
         .clone();
     let Some(mut memo) = within(LIVE_VIEW_LOCK_WAIT, live_view_memo().lock()).await else {
         warn!(
             wait_s = LIVE_VIEW_LOCK_WAIT.as_secs(),
             "session_ledger: live view TIMED OUT waiting behind another refill — \
-             reporting UNKNOWN (not live_view_unavailable: the terminal manager is present)"
+             reporting UNKNOWN as live_view_timeout (the terminal manager is present)"
         );
-        return None;
+        return Err(LiveViewGap::TimedOut);
     };
     let terminals = alive_terminal_ids(tm.list(), crate::process_capture::health::pid_alive);
     if let Some(view) = memo_reuse(memo.as_ref(), &terminals, std::time::Instant::now()) {
-        return Some(view);
+        return Ok(view);
     }
     let Some(panes) = within(
         LIVE_VIEW_READ_WAIT,
@@ -1741,17 +1766,17 @@ pub async fn live_view<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Option<L
         warn!(
             wait_s = LIVE_VIEW_READ_WAIT.as_secs(),
             panes = terminals.len(),
-            "session_ledger: live view process read TIMED OUT — reporting UNKNOWN \
-             (not live_view_unavailable: the terminal manager is present)"
+            "session_ledger: live view process read TIMED OUT — reporting UNKNOWN as \
+             live_view_timeout (the terminal manager is present)"
         );
-        return None;
+        return Err(LiveViewGap::TimedOut);
     };
     let view = LiveView { terminals, panes };
     *memo = Some(PaneMemo {
         read_at: std::time::Instant::now(),
         view: view.clone(),
     });
-    Some(view)
+    Ok(view)
 }
 
 /// How long one [`live_view`] pane read serves later requests.
@@ -3226,7 +3251,7 @@ mod tests {
             &expected,
             &observe_restored(&store, boot, Some(&live)),
             Some(true),
-            true,
+            None,
         );
         assert!(census.terminal_only.is_empty(), "{census:?}");
         assert_eq!(census.restored.len(), 1);
@@ -3464,7 +3489,7 @@ mod tests {
             restorable: true,
         }];
         let observed = observe_restored(&store, boot, Some(&live));
-        let census = diff_census(&expected, &observed, Some(true), true);
+        let census = diff_census(&expected, &observed, Some(true), None);
         assert_eq!(census.restored.len(), 1, "{census:?}");
         assert!(census.missing.is_empty());
         assert_eq!(census.verdict, RESTORE_VERDICT_MATCH);
@@ -3481,7 +3506,7 @@ mod tests {
         let observed = observe_restored(&store, boot, Some(&unread));
         assert_eq!(observed.len(), 1);
         assert_eq!(observed[0].observed, Some(Observed::Unknown));
-        let census = diff_census(&expected, &observed, Some(true), true);
+        let census = diff_census(&expected, &observed, Some(true), None);
         assert_eq!(
             census.verdict,
             crate::session::restore_census::RESTORE_VERDICT_UNKNOWN
@@ -3490,6 +3515,43 @@ mod tests {
         assert!(diff(Some(&prior), &seen, &none(), ledger(Vec::new()), true)
             .returned
             .is_empty());
+    }
+
+    /// Through the store: a row resumed this boot and then closed, and a new
+    /// open row for the same session (its id differs only in case) verified
+    /// back. The census sees one tile, not a duplicate, and reads `match`.
+    #[test]
+    fn a_closed_resumed_row_and_its_verified_successor_read_match_on_the_census() {
+        use crate::session::restore_census::{
+            diff_census, observe_restored, CensusExpected, RESTORE_VERDICT_MATCH,
+        };
+        let (_dir, store) = fresh_store();
+        let boot = boot_a_minute_ago();
+        store.record_open(store_rec(U1));
+        store.mark_restored_from_boot(U1, RESTORE_TIER_RESUMED);
+        store.record_close(U1, "pty-exit");
+        let upper = U1.to_ascii_uppercase();
+        let mut successor = store_rec(&upper);
+        successor.terminal_id = "term-successor".to_string();
+        store.record_open(successor);
+        let mut proc = resumed_proc(U1);
+        proc.cmdline = format!("/usr/bin/claude --resume {upper}");
+        let live = view(vec![("term-successor", Ok(vec![proc]))]);
+
+        let observed = observe_restored(&store, boot, Some(&live));
+        assert_eq!(observed.len(), 2, "{observed:?}");
+        let expected = [CensusExpected {
+            claude_session_id: U1.to_string(),
+            terminal_id: None,
+            page_id: "default".to_string(),
+            zone_index: 0,
+            account_label: None,
+            session_name: None,
+            restorable: true,
+        }];
+        let census = diff_census(&expected, &observed, Some(true), None);
+        assert!(census.unexpected.is_empty(), "{census:?}");
+        assert_eq!(census.verdict, RESTORE_VERDICT_MATCH);
     }
 
     /// The same session seen twice — on two registry rows, or listed twice in
