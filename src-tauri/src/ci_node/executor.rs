@@ -276,6 +276,12 @@ pub(crate) async fn run_dispatch(
         }
     };
 
+    // What this function runs itself, outside the job's containment, counts as
+    // an uncontained run (see `cgroup::OutsideCgroup`): the setup from here
+    // until the containment is settled, then what follows the steps. Declared
+    // before everything it covers, so it drops last.
+    let mut outside = super::cgroup::OutsideCgroup::setup(&payload.dispatch_id);
+
     let sink = ProgressSink::start(base.clone(), payload.dispatch_id.clone(), cancel.clone());
     sink.push(&format!(
         "[ci-node] dispatch {} repo={} sha={} check={}",
@@ -530,6 +536,7 @@ pub(crate) async fn run_dispatch(
     // Per-dispatch memory-backstop job (held across all steps; dropping it
     // at dispatch end kill-on-closes any stray build processes).
     let ci_job = CiJob::create(&payload.dispatch_id);
+    outside.settled();
     if let Some(line) = ci_job.describe() {
         sink.push(&line);
     }
@@ -569,6 +576,7 @@ pub(crate) async fn run_dispatch(
             break;
         }
     }
+    outside.after_steps();
 
     let conclusion = match overall {
         StepOutcome::Success => "success",

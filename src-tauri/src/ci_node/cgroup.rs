@@ -17,6 +17,25 @@
 //! backstop into an outage — but the state is logged and pushed to the
 //! dispatch log by the executor ([`Containment::describe`]).
 //!
+//! A dispatch cgroup that a step cannot be moved into degrades the same way,
+//! one step at a time. The kernel moves a process only for a writer that may
+//! write `cgroup.procs` in the nearest cgroup holding both the one the process
+//! leaves and the one it enters (`cgroup_procs_write_permission`), so a
+//! `QONTINUI_CI_CGROUP_ROOT` delegated to the runner's user outside its user
+//! manager (under `ci.slice`, say) passes every check
+//! [`CgroupDispatch::create_in`] makes and still has every move refused. Such a
+//! step runs in the runner's own cgroup: [`CgroupDispatch::adopt`] warns, and
+//! the dispatch counts as running uncontained ([`dispatch_counts`]) from then
+//! until it ends.
+//!
+//! `ci_node`'s own work for a dispatch runs in the runner's own cgroup as well,
+//! whatever the job's containment: the checkout, the canonical-configuration
+//! convergence and the provisioning before [`Containment::create`] settles it,
+//! and the report and the cleanup after the job's steps. [`OutsideCgroup`]
+//! counts that work as an uncontained run too. The runner's handling of the
+//! steps while they run (reading their output and posting it) is not counted:
+//! that would count every dispatch as uncontained from start to end.
+//!
 //! ## Layout requirement (the kernel's "no internal processes" rule)
 //!
 //! A cgroup cannot both hold processes and enable controllers for its
@@ -42,6 +61,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 use tracing::{info, warn};
 
 /// Env override for the parent cgroup directory (absolute path of a delegated,
@@ -53,6 +73,61 @@ const CGROUP_MOUNT: &str = "/sys/fs/cgroup";
 
 /// Longest sanitized dispatch id used in a cgroup directory name.
 const MAX_ID_LEN: usize = 64;
+
+/// How every dispatch cgroup's directory name starts ([`dispatch_dir_name`]).
+/// The slice telemetry finds the runner's dispatch cgroups by it, and charges
+/// their CPU to CI rather than to the runner's unit.
+pub(crate) const DISPATCH_DIR_PREFIX: &str = "dispatch-";
+
+/// Dispatches whose containment [`Containment::create`] settled, contained or
+/// not ([`dispatch_counts`]).
+static DISPATCHES_STARTED: AtomicU64 = AtomicU64::new(0);
+/// Uncontained runs alive now: one per live [`UncontainedRun`].
+static UNCONTAINED_RUNNING: AtomicU64 = AtomicU64::new(0);
+/// Uncontained runs begun so far: one per [`UncontainedRun`] made. Never falls.
+static UNCONTAINED_BEGUN: AtomicU64 = AtomicU64::new(0);
+
+/// What this process's CI dispatches had done at one moment. The slice
+/// telemetry compares two of these to learn that a dispatch ran between two
+/// of its reads without either read listing its cgroup: one that started and
+/// ended in between, or one whose steps ran uncontained in the runner's own
+/// cgroup.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct DispatchCounts {
+    /// Dispatches whose containment was settled. Each is counted once its
+    /// cgroup exists, or could not be made, so a reader that takes this before
+    /// it lists the cgroups either lists a new dispatch or sees this move. The
+    /// executor starts a dispatch's steps only after that, so a reader that
+    /// takes this again after reading the cgroups' counters sees any dispatch
+    /// whose steps those counters hold time of. Where the count is moved
+    /// ([`Containment::create`]) is argued here, not exercised: no test can
+    /// read between the cgroup's creation and the count.
+    pub(crate) started: u64,
+    /// Uncontained runs alive now ([`UncontainedRun`]): a dispatch running
+    /// uncontained, a contained one since a step of it could not be placed in
+    /// its cgroup, and `ci_node`'s own work for a dispatch ([`OutsideCgroup`]).
+    pub(crate) uncontained_running: u64,
+    /// Uncontained runs begun so far. A step that cannot be placed can begin
+    /// one after a read and its dispatch can end before the next, with
+    /// `started` unmoved, so only this count shows that one ran in between.
+    pub(crate) uncontained_begun: u64,
+}
+
+/// This process's [`DispatchCounts`] now. `uncontained_begun` is loaded before
+/// `uncontained_running`, the reverse of the order [`UncontainedRun`] moves
+/// them in, so counts that hold a run's start also hold it running, if it
+/// still is. Both orders are argued here, not exercised: no test can begin or
+/// end a run between two of these loads.
+pub(crate) fn dispatch_counts() -> DispatchCounts {
+    let started = DISPATCHES_STARTED.load(Ordering::SeqCst);
+    let uncontained_begun = UNCONTAINED_BEGUN.load(Ordering::SeqCst);
+    let uncontained_running = UNCONTAINED_RUNNING.load(Ordering::SeqCst);
+    DispatchCounts {
+        started,
+        uncontained_running,
+        uncontained_begun,
+    }
+}
 
 /// Directory name for a dispatch's cgroup: `dispatch-<sanitized id>-<hash>`.
 /// Only `[A-Za-z0-9_-]` survive (a `/` or `..` must never reach a path join);
@@ -78,7 +153,7 @@ pub(crate) fn dispatch_dir_name(dispatch_id: &str) -> String {
     for b in dispatch_id.bytes() {
         h = (h ^ u32::from(b)).wrapping_mul(0x0100_0193);
     }
-    format!("dispatch-{id}-{h:08x}")
+    format!("{DISPATCH_DIR_PREFIX}{id}-{h:08x}")
 }
 
 /// Extract the cgroup v2 path from `/proc/<pid>/cgroup` content (the
@@ -150,6 +225,9 @@ pub(crate) struct CgroupDispatch {
     limit_bytes: u64,
     /// `oom_kill` already reported, so each step reports only new kills.
     oom_reported: AtomicU64,
+    /// Made at the first step [`adopt`](Self::adopt) could not place here, and
+    /// held until the dispatch drops: that step ran in the runner's own cgroup.
+    stray: OnceLock<UncontainedRun>,
 }
 
 impl CgroupDispatch {
@@ -200,6 +278,7 @@ impl CgroupDispatch {
             dir,
             limit_bytes,
             oom_reported: AtomicU64::new(0),
+            stray: OnceLock::new(),
         };
         if let Err(e) = fs::write(this.dir.join("memory.max"), limit_bytes.to_string()) {
             let reason = format!("{}: memory.max write: {e}", this.dir.display());
@@ -295,7 +374,9 @@ impl CgroupDispatch {
 
     /// Bring a spawned child under the cgroup if [`prepare`](Self::prepare)
     /// did not (shape of `ci-exec`'s `StepContainment::adopt`). Warns, never
-    /// fails: an un-adopted child runs uncontained rather than not at all.
+    /// fails: an un-adopted child runs uncontained rather than not at all, and
+    /// from the first one the dispatch counts as running uncontained
+    /// ([`dispatch_counts`]) until it drops.
     pub(crate) fn adopt(&self, child: &tokio::process::Child) {
         let Some(pid) = child.id() else { return };
         let want = self
@@ -315,6 +396,12 @@ impl CgroupDispatch {
                 "ci_node: could not place step pid {pid} in {}: {e} — step runs UNCONTAINED",
                 self.dir.display()
             );
+            self.stray.get_or_init(|| {
+                UncontainedRun::new(format!(
+                    "step pid {pid} could not be placed in {}: {e}",
+                    self.dir.display()
+                ))
+            });
         }
     }
 
@@ -414,13 +501,93 @@ impl Drop for CgroupDispatch {
 #[derive(Debug)]
 pub(crate) enum Containment {
     Cgroup(CgroupDispatch),
-    /// No usable cgroup; the dispatch runs unbounded. Carries why.
-    Uncontained(String),
+    /// No usable cgroup; the dispatch runs unbounded, in the runner's own
+    /// cgroup. Carries why.
+    Uncontained(UncontainedRun),
+}
+
+/// Why a dispatch runs uncontained, wholly or from one of its steps on. It is
+/// counted in [`dispatch_counts`] for as long as it lives: as long as an
+/// uncontained dispatch holds its containment, for a contained one from its
+/// first step that could not be placed until it drops, and while
+/// [`OutsideCgroup`] counts `ci_node`'s own work for a dispatch.
+#[derive(Debug)]
+pub(crate) struct UncontainedRun {
+    reason: String,
+}
+
+impl UncontainedRun {
+    fn new(reason: String) -> Self {
+        // Running before begun: see `dispatch_counts`.
+        UNCONTAINED_RUNNING.fetch_add(1, Ordering::SeqCst);
+        UNCONTAINED_BEGUN.fetch_add(1, Ordering::SeqCst);
+        Self { reason }
+    }
+}
+
+impl Drop for UncontainedRun {
+    fn drop(&mut self) {
+        UNCONTAINED_RUNNING.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Kept for a test that names its reason as a literal. It makes a run,
+/// counted like any other, so production code calls [`UncontainedRun::new`],
+/// where that is plain to see.
+impl From<&str> for UncontainedRun {
+    fn from(reason: &str) -> Self {
+        Self::new(reason.to_string())
+    }
+}
+
+/// `ci_node`'s own work for one dispatch, counted as an uncontained run. It
+/// runs in the runner's own cgroup, beside session work, whatever the job's
+/// containment: the checkout, the canonical-configuration convergence and the
+/// provisioning before [`Containment::create`] settles the containment (and so
+/// all of a dispatch refused or failed before then), and the report and the
+/// cleanup after the job's steps. `executor::run_dispatch` makes one before
+/// the checkout and holds it until it returns.
+#[derive(Debug)]
+pub(crate) struct OutsideCgroup {
+    dispatch_id: String,
+    run: Option<UncontainedRun>,
+}
+
+impl OutsideCgroup {
+    /// Count the dispatch's setup, from now until [`OutsideCgroup::settled`].
+    pub(crate) fn setup(dispatch_id: &str) -> Self {
+        Self {
+            dispatch_id: dispatch_id.to_string(),
+            run: Some(UncontainedRun::new(format!(
+                "ci_node sets up dispatch {dispatch_id} in the runner's own cgroup"
+            ))),
+        }
+    }
+
+    /// The job's containment is settled, and counts the job from here: an
+    /// uncontained job by its own run, which began before this one ends, and a
+    /// contained one by its cgroup and by any step that could not be placed in
+    /// it. So the setup's run ends.
+    pub(crate) fn settled(&mut self) {
+        self.run = None;
+    }
+
+    /// The job's steps are over: count what `ci_node` runs from here until
+    /// this drops. One run at a time, so a setup still counted (no containment
+    /// was settled) goes on counting.
+    pub(crate) fn after_steps(&mut self) {
+        if self.run.is_none() {
+            self.run = Some(UncontainedRun::new(format!(
+                "ci_node winds down dispatch {} in the runner's own cgroup",
+                self.dispatch_id
+            )));
+        }
+    }
 }
 
 impl Containment {
     pub(crate) fn create(dispatch_id: &str, limit_bytes: u64) -> Self {
-        match CgroupDispatch::discover_and_create(dispatch_id, limit_bytes) {
+        let containment = match CgroupDispatch::discover_and_create(dispatch_id, limit_bytes) {
             Ok(c) => {
                 info!(
                     "ci_node: dispatch {dispatch_id} contained in {} (memory.max={limit_bytes})",
@@ -433,9 +600,12 @@ impl Containment {
                     "ci_node: dispatch {dispatch_id} runs UNCONTAINED (no cgroup memory \
                      backstop): {reason}"
                 );
-                Containment::Uncontained(reason)
+                Containment::Uncontained(UncontainedRun::new(reason))
             }
-        }
+        };
+        // Only now that the cgroup exists: see `DispatchCounts::started`.
+        DISPATCHES_STARTED.fetch_add(1, Ordering::SeqCst);
+        containment
     }
 
     /// One-line state for the dispatch log, so the operator sees it per dispatch.
@@ -447,7 +617,10 @@ impl Containment {
                 c.limit_bytes()
             ),
             Containment::Uncontained(why) => {
-                format!("[ci-node] containment: UNCONTAINED (no memory backstop): {why}")
+                format!(
+                    "[ci-node] containment: UNCONTAINED (no memory backstop): {}",
+                    why.reason
+                )
             }
         }
     }
@@ -649,6 +822,148 @@ mod tests {
         assert!(u.describe().contains("no delegation"));
     }
 
+    /// Every dispatch is counted once its containment is settled, and an
+    /// uncontained one counts as begun, and as running until it is dropped.
+    /// The slice telemetry reads these to find a dispatch none of its reads
+    /// listed. Exact counts hold because every test that makes an
+    /// `UncontainedRun` holds the env lock for as long as the run lives, and a
+    /// new one must too: one that makes a `Containment`, or that adopts a child
+    /// into a cgroup refusing it, as the real-kernel test below does under the
+    /// lock, ending any stray run before it lets go. The executor's
+    /// `CiJob::create`, and the [`OutsideCgroup`] its `run_dispatch` holds,
+    /// are reached only through `admission::submit`, which no test calls.
+    #[test]
+    fn dispatches_are_counted_and_an_uncontained_one_while_it_runs() {
+        let _g = crate::test_env::env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&[CGROUP_ROOT_ENV]);
+        let before = dispatch_counts();
+
+        let bare = fixture_parent("cpu io", "");
+        std::env::set_var(CGROUP_ROOT_ENV, bare.path());
+        let u = Containment::create("d8", 1 << 20);
+        assert!(
+            matches!(u, Containment::Uncontained(_)),
+            "no memory controller"
+        );
+        assert_eq!(
+            dispatch_counts(),
+            DispatchCounts {
+                started: before.started + 1,
+                uncontained_running: before.uncontained_running + 1,
+                uncontained_begun: before.uncontained_begun + 1,
+            }
+        );
+        drop(u);
+        assert_eq!(
+            dispatch_counts(),
+            DispatchCounts {
+                started: before.started + 1,
+                uncontained_running: before.uncontained_running,
+                uncontained_begun: before.uncontained_begun + 1,
+            },
+            "an ended dispatch no longer runs, and still began"
+        );
+
+        let delegated = fixture_parent("memory", "memory");
+        std::env::set_var(CGROUP_ROOT_ENV, delegated.path());
+        let c = Containment::create("d9", 1 << 20);
+        assert!(matches!(c, Containment::Cgroup(_)));
+        assert_eq!(
+            dispatch_counts(),
+            DispatchCounts {
+                started: before.started + 2,
+                uncontained_running: before.uncontained_running,
+                uncontained_begun: before.uncontained_begun + 1,
+            },
+            "a contained dispatch is started, not uncontained"
+        );
+    }
+
+    /// `ci_node`'s own work for a dispatch counts as an uncontained run while
+    /// the dispatch is set up and again once its steps are over, never as a
+    /// started dispatch, and one run at a time.
+    #[test]
+    fn ci_nodes_own_work_outside_the_dispatch_cgroup_counts_as_an_uncontained_run() {
+        let _g = crate::test_env::env_lock();
+        let before = dispatch_counts();
+        let counts = |running: u64, begun: u64| DispatchCounts {
+            started: before.started,
+            uncontained_running: before.uncontained_running + running,
+            uncontained_begun: before.uncontained_begun + begun,
+        };
+
+        let mut outside = OutsideCgroup::setup("d11");
+        assert_eq!(dispatch_counts(), counts(1, 1), "the setup runs");
+        outside.settled();
+        assert_eq!(dispatch_counts(), counts(0, 1), "the containment counts");
+        outside.after_steps();
+        assert_eq!(dispatch_counts(), counts(1, 2), "the wind-down runs");
+        outside.after_steps();
+        assert_eq!(dispatch_counts(), counts(1, 2), "one run at a time");
+        drop(outside);
+        assert_eq!(dispatch_counts(), counts(0, 2), "the dispatch ended");
+
+        let mut unsettled = OutsideCgroup::setup("d12");
+        unsettled.after_steps();
+        assert_eq!(
+            dispatch_counts(),
+            counts(1, 3),
+            "a setup never settled goes on counting"
+        );
+        drop(unsettled);
+        assert_eq!(dispatch_counts(), counts(0, 3), "and ends when it drops");
+    }
+
+    /// A contained dispatch whose step cannot be moved into its cgroup runs
+    /// that step in the runner's own cgroup, beside session work. It counts as
+    /// one uncontained run from that step until the dispatch drops, however
+    /// many of its steps fail to move.
+    #[cfg(unix)]
+    #[test]
+    fn a_dispatch_whose_steps_cannot_be_placed_runs_uncontained_until_it_drops() {
+        let _g = crate::test_env::env_lock();
+        let p = fixture_parent("memory", "memory");
+        let c = CgroupDispatch::create_in(p.path(), "d10", 1 << 20).unwrap();
+        // A directory where `cgroup.procs` would be refuses every write, as the
+        // kernel refuses a move the writer may not make.
+        fs::create_dir(c.dir().join("cgroup.procs")).unwrap();
+        let before = dispatch_counts();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let step = || {
+            rt.block_on(async {
+                let mut cmd = tokio::process::Command::new("true");
+                cmd.stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null());
+                c.prepare(&mut cmd);
+                let mut child = cmd.spawn().expect("spawn true");
+                c.adopt(&child);
+                child.wait().await.expect("wait for true");
+            })
+        };
+        step();
+        let running = DispatchCounts {
+            started: before.started,
+            uncontained_running: before.uncontained_running + 1,
+            uncontained_begun: before.uncontained_begun + 1,
+        };
+        assert_eq!(dispatch_counts(), running, "the first unplaced step");
+        step();
+        assert_eq!(dispatch_counts(), running, "counted once per dispatch");
+        drop(c);
+        assert_eq!(
+            dispatch_counts(),
+            DispatchCounts {
+                uncontained_running: before.uncontained_running,
+                ..running
+            },
+            "the dispatch ended"
+        );
+    }
+
     /// Real-kernel check: a process exceeding `memory.max` is killed by the
     /// kernel, reported as a non-success exit (the executor maps that to a
     /// FAILURE), and does not hang. Skips with a message when the box offers
@@ -682,15 +997,31 @@ mod tests {
             .stderr(std::process::Stdio::null());
         cg.prepare(&mut cmd);
         let mut child = cmd.spawn().expect("spawn sh");
-        cg.adopt(&child);
-        let pid = child.id().expect("pid");
-        let placed = fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap_or_default();
-        let want = cg.dir().file_name().unwrap().to_string_lossy().into_owned();
-        if !placed.contains(&want) {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-            panic!("child not placed in {want}: {placed:?}");
-        }
+        // Under the env lock: an adopt that could not place the child makes a
+        // stray run, which another test's dispatch counts would see. On a
+        // failed placement the run ends with `cg`, dropped at the end of this
+        // block before the lock is (the guard is declared first).
+        let placed = {
+            let _g = crate::test_env::env_lock();
+            let cg = cg;
+            cg.adopt(&child);
+            let pid = child.id().expect("pid");
+            let placed = fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap_or_default();
+            let want = cg.dir().file_name().unwrap().to_string_lossy().into_owned();
+            if placed.contains(&want) {
+                Ok(cg)
+            } else {
+                Err(format!("child not placed in {want}: {placed:?}"))
+            }
+        };
+        let cg = match placed {
+            Ok(cg) => cg,
+            Err(why) => {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                panic!("{why}");
+            }
+        };
         {
             use tokio::io::AsyncWriteExt;
             let mut stdin = child.stdin.take().expect("stdin");
