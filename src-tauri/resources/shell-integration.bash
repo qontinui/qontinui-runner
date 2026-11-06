@@ -3,7 +3,7 @@
 # Used as --rcfile so the shell sources it instead of ~/.bashrc.
 
 # Guard: only install once
-if [ "${QONTINUI_INTEGRATION}" = "1" ]; then
+if [ "${QONTINUI_INTEGRATION-}" = "1" ]; then
     [ -f ~/.bashrc ] && source ~/.bashrc
     return 0 2>/dev/null || exit 0
 fi
@@ -35,12 +35,14 @@ __osc633() {
 #
 # P;CommandMarks=1 tells the runner this prompt's A means "nothing is running":
 # the next typed command line will get a C first. It is sent ONLY when that is
-# proven at this prompt: bash >= 4.4 (PS0 exists) and PS0 holds our C right
-# now (re-prefixed if something reassigned PS0 — a `source ~/.bashrc` — unless
-# PS0 is readonly). The DEBUG trap is never announced: a user PROMPT_COMMAND's
-# entries can spend its once-per-line C. Without the announcement the runner
-# keeps the pane, which is always safe. It rides every prompt, so a runner pane
-# that stopped parsing marks (remounted, or hidden) learns it again.
+# proven at this prompt: bash >= 4.4 (PS0 exists), PS0 holds our C right now
+# (re-prefixed if something reassigned PS0 — a `source ~/.bashrc` — unless PS0
+# is readonly), and stderr, where bash writes PS0, is a terminal (not after an
+# `exec 2>/dev/null` or `exec 2>>log`). The DEBUG trap is never announced: a
+# user PROMPT_COMMAND's entries can spend its once-per-line C. Without the
+# announcement the runner keeps the pane, which is always safe. It rides every
+# prompt, so a runner pane that stopped parsing marks (remounted, or hidden)
+# learns it again.
 #
 # The shared literal: `P;CommandMarks=1` is pinned against the webview's
 # `COMMAND_MARKS_CAPABILITY` (src/components/terminal/shellIntegrationEvents.ts)
@@ -74,6 +76,10 @@ unset __qontinui_histcmd
 # never a wrong one.
 __qontinui_prompt_start() {
     local code=$?
+    # bash < 4.4: from here to the reset (our LAST entry), nothing that runs is
+    # the typed command line, so the DEBUG trap's once-per-line E/C stays spent
+    # — an empty line, or one that ran only a subshell, never armed it.
+    __qontinui_in_command=1
     if [ "${__qontinui_ps0_path}" = "1" ] && [ -n "${__qontinui_histcmd-}" ] &&
         [ -n "${HISTCMD-}" ] && [ "${HISTCMD-}" != "${__qontinui_histcmd-}" ]; then
         local line
@@ -90,7 +96,8 @@ __qontinui_prompt_start() {
 
 # Last PROMPT_COMMAND entry, after every entry of the user's: record HISTCMD,
 # then the capability (only if PS0 still carries our C, re-prefixing it where
-# something reassigned PS0) and A.
+# something reassigned PS0, and stderr — where bash writes PS0 — is a terminal)
+# and A.
 __qontinui_prompt_end() {
     local code=$?
     __qontinui_histcmd="${HISTCMD-}"
@@ -100,7 +107,7 @@ __qontinui_prompt_end() {
             *) __qontinui_is_readonly PS0 || PS0='\e]633;C\a'"${PS0-}" ;;
         esac
         case "${PS0-}" in
-            *'\e]633;C\a'*) __osc633 "P;CommandMarks=1" ;;
+            *'\e]633;C\a'*) if [ -t 2 ]; then __osc633 "P;CommandMarks=1"; fi ;;
         esac
     fi
     __osc633 "A"
@@ -143,8 +150,9 @@ if ! __qontinui_is_readonly PROMPT_COMMAND; then
         fi
     else
         # bash < 4.4 has no PS0: E/C from the DEBUG trap, best effort and never
-        # announced (see above). The reset runs LAST, after the user's entries,
-        # so their commands cannot spend the trap's once-per-line E/C.
+        # announced (see above). Our first entry marks the line spent and the
+        # reset runs LAST, after the user's entries, so neither their commands
+        # nor ours can take the trap's once-per-line E/C.
         __qontinui_in_command=1
         __qontinui_debug_trap() {
             local cmd="${BASH_COMMAND-}"
@@ -183,7 +191,7 @@ fi
 # exists, it is passed via --append-system-prompt-file INSTEAD of the inline
 # flag; Claude Code refuses both together, and a missing file is a fatal start,
 # hence the existence check.
-if [ "${QONTINUI_RUNNER_TERMINAL}" = "1" ]; then
+if [ "${QONTINUI_RUNNER_TERMINAL-}" = "1" ]; then
     claude() {
         case "${1:-}" in
             mcp|config|update|doctor|api-key)

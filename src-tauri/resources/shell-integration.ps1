@@ -34,6 +34,12 @@ $__qontinui_original_prompt = $function:Prompt
 # user's `Set-StrictMode -Version Latest`: an unset variable would throw on every
 # prompt and the user's prompt would fall back to `PS>`.
 $global:__qontinui_command_marks = $false
+# Our PSConsoleHostReadLine's scriptblock, saved by the PSReadLine branch below
+# right after it defines the function. Each prompt announces only while the
+# function is still that very scriptblock: a re-run `. $PROFILE` (Import-Module
+# PSReadLine -Force) or `atuin init powershell | iex` replaces it, and with it
+# the only place C is written. Initialized here for StrictMode, like the flag.
+$global:__qontinui_readline_sb = $null
 
 # Override Prompt to emit shell integration markers.
 # IMPORTANT: OSC sequences are embedded in the returned string so that ConPTY
@@ -51,13 +57,17 @@ function global:Prompt {
     $result += "${__q_esc}]633;P;Cwd=$(Get-Location)${__q_bel}"
     # P;CommandMarks=1: this shell marks every command start (633;C). Only the
     # PSReadLine hook below emits C, so only that branch arms the flag; without
-    # it a prompt mark says nothing about whether a command is running. Never
-    # at a NESTED prompt ($NestedPromptLevel > 0: a debugger breakpoint,
-    # $Host.EnterNestedPrompt()): the outer script is suspended there, not
-    # finished, so the pane must not read idle. The literal is pinned against
-    # the webview's COMMAND_MARKS_CAPABILITY by a source scan in
+    # it a prompt mark says nothing about whether a command is running. Only
+    # while PSConsoleHostReadLine is still OUR function (see
+    # $global:__qontinui_readline_sb): something that replaced it took the C
+    # with it. Never at a NESTED prompt ($NestedPromptLevel > 0: a debugger
+    # breakpoint, $Host.EnterNestedPrompt()): the outer script is suspended
+    # there, not finished, so the pane must not read idle. The literal is
+    # pinned against the webview's COMMAND_MARKS_CAPABILITY by a source scan in
     # src-tauri/src/session/spawn_prompt.rs.
-    if ($global:__qontinui_command_marks -and $NestedPromptLevel -eq 0) {
+    if ($global:__qontinui_command_marks -and $NestedPromptLevel -eq 0 -and
+        $null -ne $global:__qontinui_readline_sb -and
+        [object]::ReferenceEquals($function:PSConsoleHostReadLine, $global:__qontinui_readline_sb)) {
         $result += "${__q_esc}]633;P;CommandMarks=1${__q_bel}"
     }
     $result += "${__q_esc}]633;A${__q_bel}"
@@ -205,4 +215,7 @@ if (Get-Module -Name PSReadLine -ErrorAction SilentlyContinue) {
         }
         return $line
     }
+    # The identity each prompt checks before it announces (see the Prompt
+    # function): ours, as just defined.
+    $global:__qontinui_readline_sb = $function:PSConsoleHostReadLine
 }
