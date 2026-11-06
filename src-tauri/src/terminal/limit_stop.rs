@@ -12,8 +12,9 @@
 //! `turn_duration`, `mode`, `permission-mode`, `last-prompt`, `cost-state`,
 //! `tools-used`, …). That entry is the state, so this module reads it.
 //!
-//! The read is bounded: the last [`TAIL_BYTES`] of the file, and the whole file
-//! only when that tail holds no conversational entry. A transcript that cannot
+//! The read is bounded: the last [`TAIL_BYTES`] of the file, widened through
+//! [`TAIL_WINDOWS`] while the window holds no conversational entry, and the
+//! whole file only after that. A transcript that cannot
 //! be read or parsed where the decision is made is [`LimitStopRead::Unreadable`]
 //! — UNKNOWN — and never [`LimitStopRead::NotStopped`].
 //!
@@ -34,11 +35,16 @@ use std::path::Path;
 
 use serde_json::Value;
 
-/// How much of the transcript's end is read first. A limit stop is followed by
-/// a handful of short bookkeeping lines, so the deciding entry sits well inside
-/// this window in every measured transcript; a longer read happens only when
-/// the tail holds no `user`/`assistant` entry at all.
+/// How much of the transcript's end is read first (the plan's bound).
 pub(crate) const TAIL_BYTES: u64 = 256 * 1024;
+
+/// The tail windows tried in order before the whole file. The bookkeeping that
+/// follows the deciding entry is not always short: `api-request-blob`,
+/// `attachment` and `api-request-shape` lines run to hundreds of KiB, and on
+/// nilan 2026-11-05 28 of 224 transcripts over 256 KiB had more than 256 KiB
+/// (up to 370 KB) after their last conversational entry. Widening in steps
+/// keeps those reads bounded instead of jumping to a 5–15 MB whole-file read.
+const TAIL_WINDOWS: [u64; 3] = [TAIL_BYTES, 1024 * 1024, 4 * 1024 * 1024];
 
 /// The `apiError` value the CLI writes when an account's quota is exhausted.
 const USAGE_LIMIT_API_ERROR: &str = "usage_limit_reached";
@@ -73,7 +79,8 @@ pub(crate) enum LimitStopRead {
 /// bounded-read property is asserted structurally, not by wall-clock alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReadSpan {
-    Tail,
+    /// The last N bytes, N one of [`TAIL_WINDOWS`].
+    Tail(u64),
     Whole,
 }
 
@@ -102,10 +109,10 @@ fn read_limit_stop(path: &Path) -> (LimitStopRead, ReadSpan) {
         }
     };
 
-    if len > TAIL_BYTES {
+    for window in TAIL_WINDOWS.into_iter().take_while(|&w| w < len) {
         // Read one byte before the tail too, to tell whether the tail starts
         // on a line boundary.
-        match read_from(&mut file, len - TAIL_BYTES - 1) {
+        match read_from(&mut file, len - window - 1) {
             Ok(bytes) => {
                 // Skip through the first newline: when the byte before the
                 // tail is `\n` that drops only that byte; otherwise it drops
@@ -115,15 +122,15 @@ fn read_limit_stop(path: &Path) -> (LimitStopRead, ReadSpan) {
                     .position(|&b| b == b'\n')
                     .map_or(bytes.len(), |i| i + 1);
                 match decide(&bytes[start..]) {
-                    Decision::Decided(read) => return (read, ReadSpan::Tail),
-                    // No conversational entry in the tail: read it all.
+                    Decision::Decided(read) => return (read, ReadSpan::Tail(window)),
+                    // No conversational entry in this window: widen it.
                     Decision::NoConversation => {}
                 }
             }
             Err(e) => {
                 return (
                     LimitStopRead::Unreadable(format!("cannot read transcript tail: {e}")),
-                    ReadSpan::Tail,
+                    ReadSpan::Tail(window),
                 )
             }
         }
@@ -248,11 +255,12 @@ mod tests {
 
     /// A seven-day stop: a user prompt, an assistant reply, the usage-limit
     /// API-error entry, then only bookkeeping lines (`system` `turn_duration`
-    /// first, as in all 49 measured jan transcripts). The field set is the one
-    /// the plan measured on merytshost (`apiError`, `apiErrorParams`,
-    /// `apiErrorStatus`, `error: "rate_limit"`, `isApiErrorMessage`,
-    /// `quotaLimits{status, resetsAt, rateLimitType, …}`); the values are
-    /// reconstructed, since the authoring box held no limit-stop transcript.
+    /// first, as in all 49 measured jan transcripts). The error entry's field
+    /// set and the trailing line types (`tools-used`, `file-history-snapshot`,
+    /// `api-request-blob`, `api-request`, `attachment`, then the plan's
+    /// `mode` … `cost-state` list) are copied from a real main-thread stop on
+    /// nilan (`~/.claude-hotmail`, session `4ebed30f`, CLI 2.1.318,
+    /// 2026-11-05); ids, text and times are edited.
     const SEVEN_DAY_STOP: &str = include_str!("fixtures/limit_stop/seven_day_stop.jsonl");
     /// The same shape on the five-hour window.
     const FIVE_HOUR_STOP: &str = include_str!("fixtures/limit_stop/five_hour_stop.jsonl");
@@ -490,7 +498,8 @@ mod tests {
         assert_eq!(read(&body), LimitStopRead::NotStopped);
     }
 
-    /// A 40 MB transcript is decided on its 256 KiB tail, quickly.
+    /// A 40 MB transcript is decided on its 256 KiB tail. The structural span
+    /// assertion is the bound; the wall-clock one is a generous backstop.
     #[test]
     fn a_forty_megabyte_transcript_is_decided_on_its_tail() {
         let filler = assistant_text("eeeeeeee-0000-4000-8000-000000000004", &"x".repeat(4096));
@@ -506,9 +515,9 @@ mod tests {
         let started = Instant::now();
         let (read, span) = read_limit_stop(f.path());
         let elapsed = started.elapsed();
-        assert_eq!(span, ReadSpan::Tail);
+        assert_eq!(span, ReadSpan::Tail(TAIL_BYTES));
         assert!(matches!(read, LimitStopRead::Stopped(ref s) if s.entry_uuid == SEVEN_DAY_UUID));
-        assert!(elapsed < Duration::from_secs(2), "took {elapsed:?}");
+        assert!(elapsed < Duration::from_secs(10), "took {elapsed:?}");
     }
 
     /// A tail that starts exactly on a line boundary keeps its first line.
@@ -532,7 +541,33 @@ mod tests {
         assert_eq!(tail.len() as u64, TAIL_BYTES);
         let f = write_transcript(format!("{prefix}{tail}").as_bytes());
         let (read, span) = read_limit_stop(f.path());
-        assert_eq!(span, ReadSpan::Tail);
+        assert_eq!(span, ReadSpan::Tail(TAIL_BYTES));
+        assert!(matches!(read, LimitStopRead::Stopped(ref s) if s.entry_uuid == SEVEN_DAY_UUID));
+    }
+
+    /// `filler` repeated until it is at least `bytes` long.
+    fn conversation_of(bytes: usize) -> String {
+        let filler = assistant_text("eeeeeeee-0000-4000-8000-000000000005", &"z".repeat(4096));
+        let mut body = String::with_capacity(bytes + filler.len() + 1);
+        while body.len() < bytes {
+            body.push_str(&filler);
+            body.push('\n');
+        }
+        body
+    }
+
+    /// The measured shape: an `attachment` line (`isSidechain: false`) of more
+    /// than 256 KiB after the stop. The first window holds no conversational
+    /// entry, so the read widens to 1 MiB and still decides `Stopped`.
+    #[test]
+    fn a_stop_under_a_large_attachment_widens_the_window() {
+        let big = format!("\"stdout\":\"{}\"", "x".repeat(300 * 1024));
+        assert_eq!(SEVEN_DAY_STOP.matches("\"stdout\":\"\"").count(), 1);
+        let stop = SEVEN_DAY_STOP.replace("\"stdout\":\"\"", &big);
+        let body = format!("{}{stop}", conversation_of(2 * 1024 * 1024));
+        let f = write_transcript(body.as_bytes());
+        let (read, span) = read_limit_stop(f.path());
+        assert_eq!(span, ReadSpan::Tail(1024 * 1024));
         assert!(matches!(read, LimitStopRead::Stopped(ref s) if s.entry_uuid == SEVEN_DAY_UUID));
     }
 

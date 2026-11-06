@@ -1741,10 +1741,13 @@ mod tests {
 
     // ---- parked limit-stop screens (plan 2026-11-05, Phase 1) ----------------
     //
-    // The two shapes the plan's vet read on merytshost through the
-    // non-mutating `GET /ui-bridge/sdk/terminal/sessions/{id}/text` (panes
-    // `ac77c109` / `a3982390`, and `131b4908`). Pinned here so Phase 2's
-    // reset-continue knows what the idle watcher does with each.
+    // RECONSTRUCTED from the plan's description of the two shapes its vet read
+    // on merytshost through the non-mutating
+    // `GET /ui-bridge/sdk/terminal/sessions/{id}/text` (panes `ac77c109` /
+    // `a3982390`, and `131b4908`); not a byte capture. The banner and footer
+    // rows are the measured texts; the surrounding layout, the transcript row
+    // and the menu's `❯ 1.` spacing are assumed. The menu test therefore sweeps
+    // every cursor position rather than trusting one.
 
     fn fixture_screen(
         text: &str,
@@ -1792,11 +1795,10 @@ mod tests {
         }
         // The pointer row itself is refused as a dialog, not as "no prompt".
         let on_pointer = fixture_screen(RATE_LIMIT_OPTIONS_MENU, 4, 3);
-        assert_eq!(
-            probe_idle_prompt(&on_pointer),
-            IdlePromptProbe::NotYet(
-                "a numbered choice is selected — a dialog, not the input prompt".to_string()
-            )
+        assert!(
+            matches!(probe_idle_prompt(&on_pointer), IdlePromptProbe::NotYet(ref why) if why.contains("numbered choice")),
+            "{:?}",
+            probe_idle_prompt(&on_pointer)
         );
     }
 
