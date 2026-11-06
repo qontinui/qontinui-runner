@@ -68,7 +68,11 @@ import {
 import { declarePaneTier } from "./terminalVisibilityTiers";
 import { PaneVisibilityService, mountBootstrapPlan } from "./paneVisibilityService";
 import { setWebglSlotVisible } from "./backends/webglContextLru";
-import { shellMarksSink, type ShellIntegrationEvent } from "./shellIntegrationEvents";
+import {
+  shellMarksSink,
+  type ShellIntegrationEvent,
+  type ShellMarksSink,
+} from "./shellIntegrationEvents";
 import { describeThrown } from "@/lib/utils";
 
 export type { TerminalWriteResult } from "./terminalWriteResult";
@@ -327,6 +331,8 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
      * cost far more than the throttling saves.
      */
     const paneServiceRef = useRef<PaneVisibilityService | null>(null);
+    /** This mount's shell-marks sink, for the `visible`-prop effect (see `resumed`). */
+    const shellMarksRef = useRef<ShellMarksSink | null>(null);
     const visibleRef = useRef(visible);
     visibleRef.current = visible;
 
@@ -581,6 +587,7 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
           else cb();
         },
       );
+      shellMarksRef.current = shellMarks;
       // The hooks close over `paneService` (declared further down). They only
       // run once a chunk arrives, which is after the handler is registered,
       // and that is after `paneService` exists.
@@ -1594,6 +1601,7 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
         // This mount no longer parses the pane's output. The next mount
         // re-derives the marks from its ring replay (replay mode, above).
         shellMarks.unmounted();
+        if (shellMarksRef.current === shellMarks) shellMarksRef.current = null;
         // Stops the ack timer + observer and hands acking back to the page tap.
         paneService.dispose();
         if (paneServiceRef.current === paneService) paneServiceRef.current = null;
@@ -1963,6 +1971,10 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
      * WebGL context (ghostty is Canvas 2D).
      */
     useEffect(() => {
+      // Shown: writes resume here (the reveal resync first), so a drop clear
+      // queued while hidden no longer sits behind everything written. Told
+      // before the pane service starts them.
+      if (visible) shellMarksRef.current?.resumed();
       paneServiceRef.current?.setVisible(visible);
       setWebglSlotVisible(terminalId, visible);
     }, [visible, terminalId]);

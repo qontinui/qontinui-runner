@@ -29,9 +29,14 @@
  *      shell emits no marks (`bash ./job.sh`, `cmd`), and one whose output this
  *      window knows it did not parse since its last prompt (dropped while
  *      hidden, overrun out of the ring, spliced out of a resync, painted over
- *      by a reconnect). The shell side announces the capability only where
- *      its C path is proven present at that prompt; anywhere it cannot prove
- *      it, it stays silent and the pane is kept.
+ *      by a reconnect). The shell side announces the capability only at a
+ *      prompt where it can see its C path in place — bash: PS0 carries the C
+ *      and stderr, where bash writes PS0, is a terminal; zsh: our preexec is
+ *      registered and no user `preexec` function runs ahead of it; PowerShell:
+ *      PSConsoleHostReadLine is still ours, at a top-level prompt. Anywhere
+ *      those checks fail it stays silent, and the pane is kept. They are
+ *      checks, not proof: a stderr redirected to ANOTHER terminal still passes
+ *      bash's.
  *
  * What neither witness sees: work a shell runs in-process and in the
  * background without a command line — a PowerShell `Start-ThreadJob` (or
