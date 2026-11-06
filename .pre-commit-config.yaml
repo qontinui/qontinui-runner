@@ -1,4 +1,40 @@
+# The stage names used below (`pre-commit`, `pre-push`) need pre-commit 3.2.0,
+# and the stash guard's hook-level `fail_fast` needs 2.16.0 (checked against
+# the released wheels). Without hook-level fail_fast an older framework would
+# run every later hook over the reverted tree AND refuse the push — worse than
+# no guard — so the floor is stated rather than assumed.
+minimum_pre_commit_version: '3.2.0'
+
 repos:
+  # FIRST, deliberately: the pre-push stash guard. Under `pre-commit hook-impl
+  # --hook-type pre-push` the framework stashes every unstaged edit and runs
+  # `git checkout -- .` BEFORE any hook here runs (run.py: `stash = not
+  # args.all_files and not args.files`), and restores it only after the LAST
+  # hook — 13 minutes in the measured case, during which every cargo-guard /
+  # cargo-verify build in the worktree compiled the index instead of the
+  # caller's edits (coord findings 690aaeec, d0958551). No config key turns
+  # that stash off, so no hook can prevent it; this one bounds it. It detects
+  # the stash (a fresh patch in the framework's store that applies to this
+  # tree), fails, and `fail_fast: true` makes pre-commit skip every later hook,
+  # so the framework restores the edits within seconds. It must stay the first
+  # pre-push-stage hook in this file: hooks run in file order, and every hook
+  # before it runs with the tree reverted. Outside the framework (the
+  # stash-free shim mechanism) it exits 0 at once. Header of
+  # `.pre-commit-hooks/prepush-stash-guard.sh` for detection and overrides.
+  - repo: local
+    hooks:
+      - id: prepush-stash-guard
+        name: refuse to run the pre-push stage over reverted unstaged edits
+        entry: bash .pre-commit-hooks/prepush-stash-guard.sh
+        language: system
+        stages: [pre-push]
+        pass_filenames: false
+        always_run: true
+        fail_fast: true
+        # Its refusal is printed on failure anyway; verbose so the
+        # QONTINUI_PREPUSH_ALLOW_STASH=1 warning (a PASSING path) is shown too.
+        verbose: true
+
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v4.6.0
     hooks:
@@ -173,6 +209,21 @@ repos:
         # skips, which a bare "Passed" would hide).
         verbose: true
         files: '^\.pre-commit-hooks/(lib/(push-range|crate-inputs|shared-target)\.sh|push-range-test\.sh|cargo-prepush\.sh)$'
+        pass_filenames: false
+
+      # Tests for the pre-push stash guard (first hook in this file) and for
+      # cargo-prepush.sh's rule that a run WITHOUT the framework's stash never
+      # stages the caller's unstaged edits. One arm drives the real pre-commit
+      # framework end to end and is skipped with a stated reason when
+      # `pre_commit` is not importable. `stages: [pre-commit]` for the same
+      # reason as push-range-test: it must not enlarge the pre-push stage.
+      - id: prepush-stash-guard-test
+        name: pre-push stash guard + cargo-prepush staging — tests
+        entry: bash .pre-commit-hooks/prepush-stash-guard-test.sh
+        language: system
+        stages: [pre-commit]
+        verbose: true
+        files: '^\.pre-commit-hooks/(prepush-stash-guard(-test)?\.sh|cargo-prepush\.sh)$'
         pass_filenames: false
 
       # `lib/crate-inputs.sh` derives "which files outside src-tauri/ does the
