@@ -184,6 +184,10 @@ pub struct StatusFetch {
     /// `2026-11-05-finish-synced-is-stamped-on-a-2xx-that-did-not-move-session-status`,
     /// Phase 5). Empty on a degraded read.
     pub rows_by_session_id: HashMap<String, ObservedRow>,
+    /// Some ids were NOT asked about: coord cut the input list
+    /// (`input_truncated`), or the runner clamped it at [`MAX_IDS`]. An id
+    /// absent from the maps above is then UNKNOWN, not "no row".
+    pub input_truncated: bool,
     /// `"coord"` when the door answered, `"unavailable"` when it did not,
     /// `"not_needed"` when there was nothing to ask about.
     pub source: &'static str,
@@ -225,6 +229,7 @@ impl StatusFetch {
             since_by_session_id: HashMap::new(),
             finished_at_by_session_id: HashMap::new(),
             rows_by_session_id: HashMap::new(),
+            input_truncated: false,
             source: "unavailable",
             degraded: true,
             note: note.into(),
@@ -408,6 +413,7 @@ pub(crate) fn fetch_from_body_for_test(json: serde_json::Value, requested: usize
         since_by_session_id: since_from_body(&body),
         finished_at_by_session_id: finished_at_from_body(&body),
         rows_by_session_id: rows_from_body(&body),
+        input_truncated: body.input_truncated || requested > MAX_IDS,
         resolved: by_session_id.len(),
         by_session_id,
         source: "coord",
@@ -587,6 +593,7 @@ pub async fn fetch(ids: &[String]) -> StatusFetch {
             since_by_session_id: HashMap::new(),
             finished_at_by_session_id: HashMap::new(),
             rows_by_session_id: HashMap::new(),
+            input_truncated: false,
             source: "not_needed",
             degraded: false,
             note: String::new(),
@@ -627,6 +634,7 @@ pub async fn fetch(ids: &[String]) -> StatusFetch {
         since_by_session_id: since_from_body(&body),
         finished_at_by_session_id: finished_at_from_body(&body),
         rows_by_session_id: rows_from_body(&body),
+        input_truncated: body.input_truncated || requested > MAX_IDS,
         by_session_id,
         source: "coord",
         degraded: false,
