@@ -6085,6 +6085,18 @@ fn save_ai_settings_unlocked(ai_settings: AiSettings) -> Result<(), String> {
     let selection_mode = ai_settings.claude_cli.account_selection_mode;
     let selection_pinned = ai_settings.claude_cli.account_selection_pinned;
     crate::config_facade::save_setting(ai_settings)?;
+    // An unreadable roster file refuses every roster write (it is never
+    // rebuilt from this instance's shadow copy). That refusal must not fail an
+    // AI-settings save whose per-instance half already landed: while the file
+    // is unreadable the overlay is skipped, so this instance reads the values
+    // just saved. Only the copy to the other instances is skipped, and logged.
+    if crate::claude_accounts::roster_file_is_unreadable() {
+        warn!(
+            "AI settings saved for this instance only: claude-accounts.json exists but cannot \
+             be read, so account mode/pin/config_dir were not copied to it (repair or remove it)"
+        );
+        return Ok(());
+    }
     crate::claude_accounts::update(move |roster| {
         roster.config_dir = config_dir;
         roster.account_selection_mode = selection_mode;

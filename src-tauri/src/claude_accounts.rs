@@ -466,10 +466,52 @@ pub fn effective_selection_with_fleet() -> (
 /// starting point is the CURRENT effective roster from `load_settings()` —
 /// not `Default` — so the first single-field write doesn't drop sibling
 /// roster fields that so far only lived in a per-instance settings.json.
+///
+/// Refuses, writing nothing, when the file EXISTS but cannot be read or
+/// parsed. [`load`] reads such a file as absent, so starting from the
+/// effective roster there would rebuild it from the per-instance
+/// `settings.json` shadow and overwrite the operator's real roster with it —
+/// the clobber qontinui-runner#2544 closed for the setup wizard's
+/// [`append_config_dirs`]. Every replace-style writer (the Settings page's
+/// account list, launch commands, every AI-settings save's mode/pin mirror)
+/// goes through here, so the guard lives here once.
 pub fn update(mutate: impl FnOnce(&mut ClaudeAccountsFile)) -> Result<(), String> {
-    let mut file = load_with_migration().unwrap_or_else(roster_from_current_settings);
-    mutate(&mut file);
-    save(&file)
+    let path = claude_accounts_file_path()
+        .ok_or_else(|| "Failed to resolve config directory for claude-accounts.json".to_string())?;
+    // Run the one-shot migration first so an absent file can still be seeded.
+    let _ = load_with_migration();
+    update_at(&path, roster_from_current_settings, |file| {
+        mutate(file);
+        true
+    })
+}
+
+/// Read-modify-write the roster at an explicit `path`. `start` supplies the
+/// roster when the file is absent; an existing-but-unreadable file is refused
+/// (nothing written). `mutate` returns whether anything changed — `false`
+/// skips the write.
+fn update_at(
+    path: &Path,
+    start: impl FnOnce() -> ClaudeAccountsFile,
+    mutate: impl FnOnce(&mut ClaudeAccountsFile) -> bool,
+) -> Result<(), String> {
+    let mut file = if path.exists() {
+        load_from(path).ok_or_else(|| {
+            let msg = format!(
+                "{} exists but cannot be read; refusing to write the Claude account roster \
+                 (repair or remove it, then retry)",
+                path.display()
+            );
+            warn!("{msg}");
+            msg
+        })?
+    } else {
+        start()
+    };
+    if mutate(&mut file) {
+        save_to(path, &file)?;
+    }
+    Ok(())
 }
 
 /// `true` when the roster file at `path` EXISTS but cannot be read or parsed.
@@ -482,6 +524,12 @@ pub fn update(mutate: impl FnOnce(&mut ClaudeAccountsFile)) -> Result<(), String
 /// with that copy.
 pub fn is_unreadable(path: &Path) -> bool {
     path.exists() && load_from(path).is_none()
+}
+
+/// [`is_unreadable`] for the canonical machine-global roster file. `false`
+/// when the path cannot be resolved (there is then no file to protect).
+pub fn roster_file_is_unreadable() -> bool {
+    claude_accounts_file_path().is_some_and(|p| is_unreadable(&p))
 }
 
 /// Add `dirs` to the roster's `claude_config_dirs`, never removing one.
@@ -510,16 +558,6 @@ fn append_config_dirs_at(
     if dirs.is_empty() {
         return Ok(0);
     }
-    let mut file = if path.exists() {
-        load_from(path).ok_or_else(|| {
-            format!(
-                "{} exists but cannot be read; refusing to write the Claude account roster",
-                path.display()
-            )
-        })?
-    } else {
-        start()
-    };
     let same_dir = |a: &str, b: &str| {
         a == b
             || match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
@@ -528,15 +566,15 @@ fn append_config_dirs_at(
             }
     };
     let mut added = 0;
-    for dir in dirs {
-        if !file.claude_config_dirs.iter().any(|d| same_dir(d, dir)) {
-            file.claude_config_dirs.push(dir.clone());
-            added += 1;
+    update_at(path, start, |file| {
+        for dir in dirs {
+            if !file.claude_config_dirs.iter().any(|d| same_dir(d, dir)) {
+                file.claude_config_dirs.push(dir.clone());
+                added += 1;
+            }
         }
-    }
-    if added > 0 {
-        save_to(path, &file)?;
-    }
+        added > 0
+    })?;
     Ok(added)
 }
 
@@ -662,6 +700,103 @@ mod tests {
 
         assert_eq!(added, 1);
         assert_eq!(roster_at(&path).claude_config_dirs, vec![x, b]);
+    }
+
+    // ── update_at: the replace-style writers' read-modify-write ─────────
+
+    #[test]
+    fn update_refuses_an_unreadable_roster_and_leaves_it_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(CLAUDE_ACCOUNTS_FILE);
+        // Bad JSON, valid JSON of the wrong shape, and an empty file.
+        for body in [&b"{ not json"[..], b"[]", b""] {
+            std::fs::write(&path, body).unwrap();
+
+            let err = update_at(
+                &path,
+                || panic!("the file exists; the absent-file start must not run"),
+                |f| {
+                    f.claude_config_dirs.clear();
+                    true
+                },
+            )
+            .unwrap_err();
+
+            assert!(err.contains("cannot be read"), "{err}");
+            assert_eq!(std::fs::read(&path).unwrap(), body);
+        }
+    }
+
+    #[test]
+    fn update_mutates_a_readable_roster_keeping_sibling_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(CLAUDE_ACCOUNTS_FILE);
+        let a = mk_account(tmp.path(), ".claude-a");
+        let existing: ClaudeAccountsFile = serde_json::from_value(serde_json::json!({
+            "claude_config_dirs": [a.clone()],
+            "config_dir": a.clone(),
+            "claude_account_launch_commands": { a.clone(): "claude --x" },
+            "claude_default_launch_command": "claude --d",
+            "a_field_a_newer_build_wrote": 7
+        }))
+        .unwrap();
+        save_to(&path, &existing).unwrap();
+
+        update_at(
+            &path,
+            || unreachable!(),
+            |f| {
+                f.account_selection_mode = AccountSelectionMode::LeastUsage;
+                true
+            },
+        )
+        .unwrap();
+
+        let after = roster_at(&path);
+        assert_eq!(after.claude_config_dirs, vec![a.clone()]);
+        assert_eq!(after.config_dir.as_deref(), Some(a.as_str()));
+        assert_eq!(
+            after
+                .claude_account_launch_commands
+                .get(&a)
+                .map(String::as_str),
+            Some("claude --x")
+        );
+        assert_eq!(
+            after.claude_default_launch_command.as_deref(),
+            Some("claude --d")
+        );
+        assert_eq!(
+            after.account_selection_mode,
+            AccountSelectionMode::LeastUsage
+        );
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            raw["a_field_a_newer_build_wrote"], 7,
+            "unknown keys pass through"
+        );
+    }
+
+    #[test]
+    fn update_of_an_absent_file_starts_from_start_and_skips_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(CLAUDE_ACCOUNTS_FILE);
+        update_at(&path, ClaudeAccountsFile::default, |_| false).unwrap();
+        assert!(!path.exists(), "an unchanged roster is not written");
+
+        let x = mk_account(tmp.path(), ".claude-x");
+        let x_start = x.clone();
+        update_at(
+            &path,
+            move || ClaudeAccountsFile {
+                claude_config_dirs: vec![x_start],
+                ..Default::default()
+            },
+            |_| true,
+        )
+        .unwrap();
+        assert_eq!(roster_at(&path).claude_config_dirs, vec![x]);
     }
 
     #[test]
