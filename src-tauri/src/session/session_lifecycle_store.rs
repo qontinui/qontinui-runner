@@ -877,6 +877,16 @@ pub struct TerminalSessionRecord {
     /// reading.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub finish_synced: bool,
+    /// The coord row whose OBSERVED finish stamped [`Self::finish_synced`] —
+    /// the `coord.sessions.id` the drain's `finished` PATCH addressed and whose
+    /// answer read `finished` (plan
+    /// `2026-11-05-finish-synced-is-stamped-on-a-2xx-that-did-not-move-session-status`,
+    /// F2). Durable, so the finish heal knows the mark's OWN row after a runner
+    /// restart, when the in-process resolvers know nothing about a finished
+    /// session. `None` on a mark stamped before this field existed, or never
+    /// stamped; cleared on an unmark.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish_coord_session_id: Option<uuid::Uuid>,
     /// The machine's default tenant for new sessions AS READ WHEN THIS SESSION
     /// WAS SPAWNED (plan
     /// `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential`,
@@ -2994,6 +3004,7 @@ impl SessionLifecycleStore {
             rec.finished_at = None;
             rec.finish_reason = None;
             rec.finish_synced = false;
+            rec.finish_coord_session_id = None;
         }
 
         let changed = rec.clone();
@@ -3039,6 +3050,19 @@ impl SessionLifecycleStore {
     /// synced before its own write has drained. `None` stamps whatever mark is
     /// current (a row written without the field).
     pub fn mark_finish_synced(&self, claude_session_id: &str, acked_finished_at: Option<i64>) {
+        self.mark_finish_synced_on(claude_session_id, acked_finished_at, None);
+    }
+
+    /// [`Self::mark_finish_synced`], also recording the coord row whose
+    /// observed finish stamped the mark
+    /// ([`TerminalSessionRecord::finish_coord_session_id`]). `None` leaves any
+    /// stored row untouched.
+    pub fn mark_finish_synced_on(
+        &self,
+        claude_session_id: &str,
+        acked_finished_at: Option<i64>,
+        coord_session_id: Option<uuid::Uuid>,
+    ) {
         let mut m = match self.map.lock() {
             Ok(m) => m,
             Err(e) => {
@@ -3053,6 +3077,9 @@ impl SessionLifecycleStore {
                     && acked_finished_at.is_none_or(|at| rec.finished_at == Some(at)) =>
             {
                 rec.finish_synced = true;
+                if coord_session_id.is_some() {
+                    rec.finish_coord_session_id = coord_session_id;
+                }
                 rec.clone()
             }
             _ => return,
@@ -6073,6 +6100,7 @@ pub(crate) fn test_open_record(id: &str) -> TerminalSessionRecord {
         wind_down_arm: None,
         finish_reason: None,
         finish_synced: false,
+        finish_coord_session_id: None,
         spawn_device_default: None,
         adopted_from: None,
         last_session_start_at: None,
@@ -6307,6 +6335,7 @@ mod tests {
             wind_down_arm: None,
             finish_reason: None,
             finish_synced: false,
+            finish_coord_session_id: None,
             spawn_device_default: None,
             adopted_from: None,
             last_session_start_at: None,
@@ -10400,6 +10429,7 @@ mod tests {
             wind_down_arm: None,
             finish_reason: None,
             finish_synced: false,
+            finish_coord_session_id: None,
             spawn_device_default: None,
             adopted_from: None,
             last_session_start_at: None,
