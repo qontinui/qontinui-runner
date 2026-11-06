@@ -4411,6 +4411,17 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         },
                     );
+                    // A finish the drain gave up on (coord answered, its row
+                    // never read `finished`) keeps the row it was SENT to on
+                    // the mark, unstamped, for the boot heal sweep.
+                    let store = std::sync::Arc::downgrade(&lifecycle_store);
+                    coord_sync_facade.attach_finished_unconfirmed_observer(
+                        move |csid, finished_at, coord_row| {
+                            if let Some(s) = store.upgrade() {
+                                s.note_finish_sent_row(csid, finished_at, coord_row);
+                            }
+                        },
+                    );
                     // Once per runner start: heal marks stamped synced over a
                     // finish coord never applied (plan 2026-11-05-finish-
                     // synced-is-stamped-on-a-2xx-that-did-not-move-session-

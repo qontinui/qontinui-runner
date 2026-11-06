@@ -861,14 +861,16 @@ pub struct TerminalSessionRecord {
     /// reading.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub finish_synced: bool,
-    /// The coord row whose OBSERVED finish stamped [`Self::finish_synced`] —
-    /// the `coord.sessions.id` the drain's `finished` PATCH addressed and whose
-    /// answer read `finished` (plan
+    /// The last coord row (`coord.sessions.id`) a finish for this mark was SENT
+    /// to or CONFIRMED by — recorded when the drain's observed ACK stamps
+    /// [`Self::finish_synced`], and when the drain gives up on a finish coord
+    /// answered without moving the row (sent, never confirmed). Kept until an
+    /// unmark; a restamp keeps it (plan
     /// `2026-11-05-finish-synced-is-stamped-on-a-2xx-that-did-not-move-session-status`,
-    /// F2). Durable, so the finish heal knows the mark's OWN row after a runner
-    /// restart, when the in-process resolvers know nothing about a finished
-    /// session. `None` on a mark stamped before this field existed, or never
-    /// stamped; cleared on an unmark.
+    /// review F2/F3). Durable, so the finish heal knows the mark's OWN row after
+    /// a runner restart, when the in-process resolvers know nothing about a
+    /// finished session. `None` on a mark no finish was recorded for since this
+    /// field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finish_coord_session_id: Option<uuid::Uuid>,
     /// The machine's default tenant for new sessions AS READ WHEN THIS SESSION
@@ -2985,6 +2987,48 @@ impl SessionLifecycleStore {
                 if coord_session_id.is_some() {
                     rec.finish_coord_session_id = coord_session_id;
                 }
+                rec.clone()
+            }
+            _ => return,
+        };
+        self.persist(
+            m,
+            &[LifecycleDelta::Upsert {
+                rec: Box::new(changed),
+            }],
+        );
+    }
+
+    /// Record the coord row a finish for this mark was SENT to, WITHOUT
+    /// stamping `finish_synced` — the drain's unconfirmed-drop arm (coord
+    /// answered the PATCH but its row never read `finished`), so the boot heal
+    /// sweep can re-offer the finish to its own row after a restart (plan
+    /// `2026-11-05-finish-synced-is-stamped-on-a-2xx-that-did-not-move-session-status`,
+    /// review F3). Only a still-finished mark whose `finished_at` is
+    /// `finished_at` (when `Some`) is touched. Same lock discipline as
+    /// [`Self::mark_finish_synced`], the drain's other write here: the map lock
+    /// only, never `finish_forward` (the drain must not wait on a finish
+    /// observer), and no flag moves, so it cannot reorder against an unmark.
+    pub fn note_finish_sent_row(
+        &self,
+        claude_session_id: &str,
+        finished_at: Option<i64>,
+        coord_session_id: uuid::Uuid,
+    ) {
+        let mut m = match self.map.lock() {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(error = %e, "session_lifecycle_store: lock poisoned on note_finish_sent_row");
+                return;
+            }
+        };
+        let changed = match m.get_mut(claude_session_id) {
+            Some(rec)
+                if rec.finished_at.is_some()
+                    && finished_at.is_none_or(|at| rec.finished_at == Some(at))
+                    && rec.finish_coord_session_id != Some(coord_session_id) =>
+            {
+                rec.finish_coord_session_id = Some(coord_session_id);
                 rec.clone()
             }
             _ => return,

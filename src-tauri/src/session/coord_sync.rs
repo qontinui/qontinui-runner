@@ -244,6 +244,11 @@ struct CoordSyncInner {
     /// permanent failure is ACK-dropped from the outbox but NOT synced.
     /// Unattached (tests, pre-wiring) → the flag is never stamped.
     finished_ack_observer: OnceLock<FinishedAckObserver>,
+    /// Told `(claude_session_id, finished_at, coord row)` when the drain
+    /// ACK-drops a `finished` row coord answered without its row reading
+    /// `finished` (the unconfirmed bound) — so the row it was SENT to is kept
+    /// on the mark, unstamped (review F3).
+    finished_unconfirmed_observer: OnceLock<FinishedAckObserver>,
     /// The outside observer of coord's OWN liveness (plan
     /// `2026-09-12-merge-train-alerts-page-a-reader-and-act-on-nothing`
     /// Phase 3b). `Some` in production, `None` under
@@ -328,6 +333,7 @@ impl CoordSync {
                 registry: Mutex::new(None),
                 dual_write: DualWriteGate::new(),
                 finished_ack_observer: OnceLock::new(),
+                finished_unconfirmed_observer: OnceLock::new(),
                 outside_observer: Some(Arc::new(
                     crate::coord_outside_observer::CoordOutsideObserver::new(),
                 )),
@@ -362,6 +368,7 @@ impl CoordSync {
                 registry: Mutex::new(None),
                 dual_write: DualWriteGate::new_for_test(None, Duration::from_secs(60)),
                 finished_ack_observer: OnceLock::new(),
+                finished_unconfirmed_observer: OnceLock::new(),
                 // Inert by construction under test: the heartbeat harness
                 // drives this loop on a millisecond cadence against a fake
                 // coord that serves no `/mcp`, and an observer here would
@@ -476,6 +483,24 @@ impl CoordSync {
         f: impl Fn(&str, Option<i64>) + Send + Sync + 'static,
     ) {
         self.attach_finished_ack_observer_on(move |csid, at, _row| f(csid, at));
+    }
+
+    /// Attach the observer told about a `finished` row the drain ACK-drops
+    /// UNSTAMPED after the unconfirmed bound: `(claude_session_id,
+    /// finished_at, the coord row it was sent to)`. It records the sent row on
+    /// the mark without stamping it (review F3).
+    pub fn attach_finished_unconfirmed_observer(
+        &self,
+        f: impl Fn(&str, Option<i64>, Uuid) + Send + Sync + 'static,
+    ) {
+        if self
+            .inner
+            .finished_unconfirmed_observer
+            .set(FinishedAckObserver(Box::new(f)))
+            .is_err()
+        {
+            tracing::warn!("coord_sync: finished-unconfirmed observer already attached — ignoring");
+        }
     }
 
     /// [`Self::attach_finished_ack_observer`], also handing the observer the
@@ -1354,8 +1379,8 @@ struct ChainOutcome {
     /// `Some(error)` when a NON-best-effort row failed and stopped this chain:
     /// the session is blocked on its head row and goes on its own backoff.
     blocked_on: Option<String>,
-    /// The (session, seq) of the row `blocked_on` is about.
-    blocked_row: Option<(Uuid, i64)>,
+    /// The row `blocked_on` is about.
+    blocked_row: Option<OutboxRecord>,
     /// The chain stopped because ANOTHER chain tripped the abort flag, not
     /// because of anything about this session — its retry state is untouched.
     aborted: bool,
@@ -1524,7 +1549,7 @@ async fn push_chain(
                          this session's backoff"
                     );
                     out.blocked_on = Some(e);
-                    out.blocked_row = Some((rec.session_id, rec.seq));
+                    out.blocked_row = Some(rec.clone());
                     break;
                 }
                 tracing::warn!(
@@ -1538,7 +1563,7 @@ async fn push_chain(
                 );
                 out.had_transport_error = true;
                 out.blocked_on = Some(e);
-                out.blocked_row = Some((rec.session_id, rec.seq));
+                out.blocked_row = Some(rec.clone());
                 // Stop THIS chain — preserves (session, seq) order on retry.
                 // The unACKed tail stays in the file for a later tick.
                 if trip_abort {
@@ -1857,7 +1882,7 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
 
     let mut had_transport_error = false;
     let mut delivered = false;
-    let mut blocked: Vec<(Uuid, String, Option<(Uuid, i64)>)> = Vec::new();
+    let mut blocked: Vec<(Uuid, String, Option<OutboxRecord>)> = Vec::new();
     for outcome in outcomes {
         delivered |= outcome.acked_by_coord;
         succeeded.extend(outcome.succeeded);
@@ -1918,7 +1943,8 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
             entry.serving_failures += 1;
         }
         entry.next_attempt_at = now + SessionRetry::backoff(entry.failures);
-        if let (true, Some(row)) = (unconfirmed, blocked_row) {
+        if let (true, Some(blocked_rec)) = (unconfirmed, blocked_row) {
+            let row = (blocked_rec.session_id, blocked_rec.seq);
             let attempts = match entry.unconfirmed_finish {
                 Some((k, n)) if k == row => n + 1,
                 _ => 1,
@@ -1938,6 +1964,9 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
                 );
                 succeeded.push(row);
                 finished_unconfirmed_dropped += 1;
+                // Keep the row the finish was SENT to on the mark (unstamped),
+                // so the next runner start's heal sweep can re-offer it there.
+                notify_finished_unconfirmed(inner, &blocked_rec);
                 state.retry.remove(&sid);
                 continue;
             }
@@ -2073,6 +2102,26 @@ fn notify_finished_ack(inner: &CoordSyncInner, rec: &OutboxRecord) {
             seq = rec.seq,
             "coord_sync: finished record ACKed without a claude_session_id — cannot mark synced"
         ),
+    }
+}
+
+/// Hand a `finished` row the drain ACK-drops unstamped (the unconfirmed
+/// bound) to the finished-unconfirmed observer, with the coord row it was sent
+/// to.
+fn notify_finished_unconfirmed(inner: &CoordSyncInner, rec: &OutboxRecord) {
+    let Some(obs) = inner.finished_unconfirmed_observer.get() else {
+        return;
+    };
+    if let Some(csid) = rec
+        .payload
+        .get("claude_session_id")
+        .and_then(|v| v.as_str())
+    {
+        (obs.0)(
+            csid,
+            rec.payload.get("finished_at").and_then(|v| v.as_i64()),
+            rec.session_id,
+        );
     }
 }
 

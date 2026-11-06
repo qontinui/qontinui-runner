@@ -762,6 +762,15 @@ fn the_stored_row_follows_the_mark() {
     assert!(store.clear_finish_synced("stored", at));
     store.mark_finish_synced_on("stored", Some(at), Some(row()));
     assert_eq!(store.get("stored").unwrap().finish_coord_session_id, Some(row()));
+    // A later stamp WITHOUT a row keeps the stored one.
+    assert!(store.clear_finish_synced("stored", at));
+    store.mark_finish_synced("stored", Some(at));
+    let rec = store.get("stored").unwrap();
+    assert!(rec.finish_synced);
+    assert_eq!(rec.finish_coord_session_id, Some(row()));
+    // A restamp keeps it too; only an unmark forgets it.
+    store.set_finished("stored", true, Some("again".into())).unwrap();
+    assert_eq!(store.get("stored").unwrap().finish_coord_session_id, Some(row()));
     store.set_finished("stored", false, None).unwrap();
     assert_eq!(store.get("stored").unwrap().finish_coord_session_id, None);
 }
@@ -842,4 +851,94 @@ async fn the_sweep_reads_ids_in_chunks_at_the_cap() {
         out.iter().all(|(_, o)| *o == HealOutcome::Resent { row: row() }),
         "no id past the cap reads as no_coord_row"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Review round 3: the SENT row of a dropped unconfirmed finish; truncation
+// ---------------------------------------------------------------------------
+
+/// The sent row is recorded without stamping, only on the matching mark.
+#[test]
+fn a_sent_row_is_recorded_without_stamping() {
+    let (_d, store, at) = unsynced_store("sent");
+    store.note_finish_sent_row("sent", Some(at + 1), row());
+    assert_eq!(store.get("sent").unwrap().finish_coord_session_id, None, "another mark");
+    store.note_finish_sent_row("sent", Some(at), row());
+    let rec = store.get("sent").unwrap();
+    assert_eq!(rec.finish_coord_session_id, Some(row()));
+    assert!(!rec.finish_synced, "never stamped");
+    store.note_finish_sent_row("ghost", Some(at), row());
+}
+
+/// F3 after a restart: a REAL registrar that resolves nothing, an unsynced
+/// mark whose finish the drain dropped (its SENT row stored) — the boot sweep
+/// re-offers it to that row over a NULL coord row, and not over `working`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_sweep_reoffers_a_dropped_finish_to_its_sent_row_after_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let outbox = Arc::new(OutboxWriter::open(dir.path().join("outbox.jsonl")).unwrap());
+    let reg = AiCoordRegistrar::with_tenant_resolver(outbox.clone(), Uuid::new_v4(), || None);
+    let store = Arc::new(SessionLifecycleStore::open(dir.path().join("lifecycle.json")).unwrap());
+    reg.attach_lifecycle_store(store.clone());
+    store.record_open(test_open_record("dropped"));
+    let at = store
+        .set_finished("dropped", true, Some("done".into()))
+        .unwrap()
+        .record
+        .finished_at;
+    store.note_finish_sent_row("dropped", at, row());
+    let rec = store.get("dropped").unwrap();
+    assert!(!rec.finish_synced);
+    assert_eq!(reg.finish_row_for(&rec), None, "nothing resolves in-process");
+    drain_all(&outbox);
+
+    let working = heal_sweep_with(&store, Some(&reg), None, true, |ids| async move {
+        fetch_from_body_for_test(body(&ids[0], json!("working"), json!(BEFORE), ROW), 1)
+    })
+    .await;
+    assert_eq!(
+        working,
+        vec![(
+            "dropped".to_string(),
+            HealOutcome::Left(HealSkip::WorkingRevivalUnprovable)
+        )]
+    );
+    assert!(outbox.pending().unwrap().is_empty(), "nothing re-offered over working");
+
+    let null = heal_sweep_with(&store, Some(&reg), None, true, |ids| async move {
+        null_rows(&ids)
+    })
+    .await;
+    assert_eq!(
+        null,
+        vec![("dropped".to_string(), HealOutcome::Reoffered { row: row() })]
+    );
+    assert_eq!(
+        rows(&outbox),
+        vec![("finished".to_string(), "dropped".to_string())]
+    );
+    assert!(outbox.pending().unwrap().iter().all(|r| r.session_id == row()));
+}
+
+/// A read whose input coord truncated: an id it served no row for may not
+/// have been asked about, so it is unreadable, never `no_coord_row`.
+#[test]
+fn an_id_missing_from_a_truncated_read_is_unreadable() {
+    let (_d, store, at) = synced_store("trunc");
+    let p = port(&store);
+    let fetch = fetch_from_body_for_test(
+        json!({"statuses": {}, "unknown": [], "invalid": [],
+               "input_truncated": true, "sessionBridgeColumnPresent": true}),
+        1,
+    );
+    assert!(fetch.input_truncated);
+    let out = apply_heal(&store, Some(&p), &store.all_records(), &fetch, at + 1_000);
+    assert_eq!(out[0].1, HealOutcome::Left(HealSkip::CoordUnreadable));
+    let whole = fetch_from_body_for_test(
+        json!({"statuses": {}, "unknown": [], "invalid": [],
+               "input_truncated": false, "sessionBridgeColumnPresent": true}),
+        1,
+    );
+    let out = apply_heal(&store, Some(&p), &store.all_records(), &whole, at + 1_000);
+    assert_eq!(out[0].1, HealOutcome::Left(HealSkip::NoCoordRow));
 }

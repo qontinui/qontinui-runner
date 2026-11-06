@@ -139,6 +139,13 @@ async fn a_2xx_with_no_session_status_is_not_stamped_and_the_row_is_kept() {
 async fn five_unconfirmed_answers_drop_the_row_unstamped_and_count_it() {
     let (_d, outbox, coord, rec, acks) =
         finish_rig(Some((200, r#"{"session_status":"working"}"#))).await;
+    let sent: Arc<std::sync::Mutex<Vec<(String, Option<i64>, Uuid)>>> = Default::default();
+    {
+        let sent = sent.clone();
+        coord.attach_finished_unconfirmed_observer(move |csid, at, row| {
+            sent.lock().unwrap().push((csid.to_string(), at, row))
+        });
+    }
     let s = Uuid::new_v4();
     queue_finish(&outbox, s, "csid-bounded", 42);
     let before = FINISHED_UNCONFIRMED_DROPPED.load(Ordering::Relaxed);
@@ -160,6 +167,11 @@ async fn five_unconfirmed_answers_drop_the_row_unstamped_and_count_it() {
     );
     assert_eq!(finished_patches(&*rec.lock().await, s), 5);
     assert!(acks.lock().unwrap().is_empty(), "dropped UNSTAMPED");
+    assert_eq!(
+        *sent.lock().unwrap(),
+        vec![("csid-bounded".to_string(), Some(42), s)],
+        "the drop hands over the row the finish was SENT to, once"
+    );
     assert!(!state.quarantined.contains(&s), "the bound fired, not the quarantine");
     assert!(!state.retry.contains_key(&s));
     // Process-global: only this test drives a finish to its bound.
