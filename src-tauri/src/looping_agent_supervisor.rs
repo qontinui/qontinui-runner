@@ -1499,11 +1499,18 @@ pub(crate) struct LoopingAgentStatus {
     /// Rendered-grid idle read (`None` when there is no live tab). Single
     /// read, no quiescence debounce — status is observational.
     pub idle: Option<bool>,
-    /// The dialog marker that vetoed `idle`: says WHY a quiet-looking tab
-    /// reads `idle: false` — a Claude Code dialog is waiting to be answered.
-    /// `None` when there is no live tab, when no dialog is on screen, and
-    /// also when the grid already reads busy (the dialog check only runs on
-    /// a grid the idle predicate passed).
+    /// The dialog marker on screen, if any: says WHY a tab reads
+    /// `idle: false` when a Claude Code dialog is waiting to be answered.
+    /// Read together with `idle`, which says whether the grid was read at
+    /// all:
+    /// - `idle: None` (so `dialog: None`): no live tab, nothing was read.
+    /// - `idle: Some(_)`, `dialog: None`: the grid was checked and shows no
+    ///   dialog.
+    /// - `dialog: Some(m)`: dialog marker `m` is on screen, whether or not
+    ///   the grid also reads busy.
+    ///
+    /// `None` never means "not checked" on a live tab: the dialog check runs
+    /// on every grid this snapshot reads ([`status_read`]).
     pub dialog: Option<&'static str>,
 }
 
@@ -1515,7 +1522,10 @@ pub(crate) fn status_snapshot(
     let (liveness, live, _exited) = resolve_live_session(app, rec);
     let read = live.as_ref().map(|(_, session)| {
         let (lines, cursor_row) = session.grid_text();
-        nudge_safe_idle(snapshot_looks_idle(&lines, cursor_row), &lines)
+        // Through `status_read`, never `nudge_safe_idle`: the nudge read skips
+        // the dialog check on a busy grid, which would make `dialog: None`
+        // ambiguous again.
+        status_read(&lines, cursor_row)
     });
     LoopingAgentStatus {
         record: rec.clone(),
@@ -1523,6 +1533,20 @@ pub(crate) fn status_snapshot(
         idle: read.map(|(safe, _)| safe),
         dialog: read.and_then(|(_, dialog)| dialog),
     }
+}
+
+/// The status snapshot's per-grid read: the nudge-safe idle verdict, and the
+/// dialog marker on screen.
+///
+/// Unlike [`nudge_safe_idle`], which skips the dialog check on a busy grid
+/// (the nudge path needs only the veto), this checks for a dialog on EVERY
+/// grid. Status is observational, so a `None` marker must mean "checked, no
+/// dialog" and never "not checked"
+/// [policy: verification-and-evidence/unknown-must-not-render-as-a-default].
+fn status_read(lines: &[String], cursor_row: u16) -> (bool, Option<&'static str>) {
+    let dialog = snapshot_shows_dialog(lines);
+    let idle = snapshot_looks_idle(lines, cursor_row) && dialog.is_none();
+    (idle, dialog)
 }
 
 /// Coord finding `9089767f`: the supervisor's nudge-safe idle read and its
@@ -1533,6 +1557,37 @@ mod nudge_and_exit_tests {
 
     fn lines(rows: &[&str]) -> Vec<String> {
         rows.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The status read names a dialog even on a grid that already reads
+    /// busy, so `dialog: None` on a live tab always means "checked, none".
+    /// Here the cursor sits above the prompt row, so the shared predicate
+    /// reads busy, and the trust dialog is still on screen.
+    #[test]
+    fn the_status_read_names_a_dialog_on_a_busy_grid() {
+        let grid = lines(&[
+            " Accessing workspace:",
+            " Quick safety check: Is this a project you created or one you trust?",
+            " Claude Code'll be able to read, edit, and execute files here.",
+            " ❯ 1. Yes, I trust this folder",
+            "   2. No, exit",
+            " Enter to confirm · Esc to cancel",
+        ]);
+        assert!(
+            !snapshot_looks_idle(&grid, 0),
+            "fixture must read busy to the shared predicate"
+        );
+        let (idle, dialog) = status_read(&grid, 0);
+        assert!(!idle);
+        assert_eq!(dialog, Some("selected numbered choice on a `❯` row"));
+    }
+
+    /// A plain idle prompt reads idle with no dialog: the checked-and-clear
+    /// case of the tri-state.
+    #[test]
+    fn the_status_read_of_a_plain_prompt_is_idle_with_no_dialog() {
+        let grid = lines(&["some output", "", " ❯ "]);
+        assert_eq!(status_read(&grid, 2), (true, None));
     }
 
     /// The screen the Merge Shepherd sat on when the nudge's Enter answered
