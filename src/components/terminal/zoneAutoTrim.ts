@@ -128,6 +128,30 @@ export function autoTrimHold(inputs: AutoTrimHoldInputs): AutoTrimHold | null {
   return null;
 }
 
+/**
+ * A layout origin as the UI Bridge reports it (`get-page-layout`): the stored
+ * origin, or `legacy` when the page has none — it predates the field, and
+ * reads as `operator` to the trim. Reported apart from `operator` so an
+ * outside trimmer (`/triage-sessions`) can tell a page nobody may shrink from
+ * one it may shrink and hand to the runner.
+ */
+export type ReportedLayoutOrigin = LayoutOrigin | "legacy";
+
+export function reportLayoutOrigin(origin: LayoutOrigin | undefined): ReportedLayoutOrigin {
+  return origin ?? "legacy";
+}
+
+/**
+ * A caller-supplied origin for a layout REQUEST (`/layout --origin`,
+ * `select-layout` `origin`), or `null` when it names neither. Case and
+ * surrounding space are forgiven; `restore` is not accepted, because it is
+ * the mount path's own source, not a choice a caller makes.
+ */
+export function parseLayoutOriginArg(raw: string): LayoutOrigin | null {
+  const v = raw.trim().toLowerCase();
+  return v === "auto" || v === "operator" ? v : null;
+}
+
 /** Per-runner-instance preference: shrink the grid when tabs close. */
 export const AUTO_TRIM_STORAGE_KEY = "qontinui-zone-auto-trim";
 
