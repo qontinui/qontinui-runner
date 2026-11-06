@@ -406,25 +406,26 @@ pub fn diff_census(
     let attempted: HashSet<String> = observed.iter().map(|o| key(&o.claude_session_id)).collect();
     // One observation per session, merged by the ledger's own order (the
     // strongest `Observed` stands), so a session with a closed stamped row
-    // and an open adopted one reads as the ledger reads it. On a tie the
-    // OPEN row stands, so the restored entry names the live tile, never the
-    // dead terminal of a closed predecessor.
+    // and an open adopted one reads as the ledger reads it. Where the tile IS
+    // (terminal, zone) comes from the session's first OPEN tile, so the entry
+    // never names the dead terminal of a closed predecessor; the boot stamp
+    // (tier, boot time) comes from the first row carrying one, which may be
+    // that closed predecessor.
     let mut best: Vec<&RestoredObservation> = Vec::new();
     let mut slot: HashMap<String, usize> = HashMap::new();
     let mut tiles: HashMap<String, (usize, &RestoredObservation)> = HashMap::new();
+    let mut stamp: HashMap<String, &RestoredObservation> = HashMap::new();
     for obs in observed {
         let id = key(&obs.claude_session_id);
+        if obs.restore_tier.is_some() {
+            stamp.entry(id.clone()).or_insert(obs);
+        }
         if obs.open && matches!(obs.observed, Some(Observed::Back | Observed::TerminalOnly)) {
             tiles.entry(id.clone()).or_insert((0, obs)).0 += 1;
         }
         match slot.get(&id) {
-            Some(&i)
-                if obs.observed > best[i].observed
-                    || (obs.observed == best[i].observed && obs.open && !best[i].open) =>
-            {
-                best[i] = obs
-            }
-            Some(_) => {}
+            Some(&i) if best[i].observed >= obs.observed => {}
+            Some(&i) => best[i] = obs,
             None => {
                 slot.insert(id, best.len());
                 best.push(obs);
@@ -467,12 +468,14 @@ pub fn diff_census(
             });
             continue;
         }
+        let place = tiles.get(&id).map_or(obs, |(_, tile)| *tile);
+        let stamped = stamp.get(&id).copied().unwrap_or(obs);
         let row = CensusRestored {
             claude_session_id: obs.claude_session_id.clone(),
-            terminal_id: bound_terminal_id(&obs.terminal_id),
-            zone_index: obs.zone_index,
-            restore_tier: obs.restore_tier.clone(),
-            restored_from_boot_at: obs.restored_from_boot_at,
+            terminal_id: bound_terminal_id(&place.terminal_id),
+            zone_index: place.zone_index,
+            restore_tier: stamped.restore_tier.clone(),
+            restored_from_boot_at: stamped.restored_from_boot_at,
         };
         if verified {
             restored.push(row);
@@ -892,12 +895,18 @@ mod tests {
         successor.restore_tier = None;
         successor.restored_from_boot_at = None;
         successor.terminal_id = "term-live".to_string();
-        let d = diff_census(&exp, &[closed, successor], Some(true), None);
-        assert!(d.unexpected.is_empty(), "{d:?}");
-        assert_eq!(d.restored.len(), 1);
-        assert_eq!(d.verdict, RESTORE_VERDICT_MATCH);
-        // The restored entry names the live successor's tile, not the dead one.
-        assert_eq!(d.restored[0].terminal_id.as_deref(), Some("term-live"), "{d:?}");
+        // Whichever order the store yields the two rows in.
+        for rows in [[closed.clone(), successor.clone()], [successor, closed]] {
+            let d = diff_census(&exp, &rows, Some(true), None);
+            assert!(d.unexpected.is_empty(), "{d:?}");
+            assert_eq!(d.restored.len(), 1);
+            assert_eq!(d.verdict, RESTORE_VERDICT_MATCH);
+            // The restored entry names the live successor's tile, not the dead
+            // one, and keeps the boot stamp the closed predecessor carried.
+            assert_eq!(d.restored[0].terminal_id.as_deref(), Some("term-live"), "{d:?}");
+            assert_eq!(d.restored[0].restore_tier.as_deref(), Some(RESTORE_TIER_RESUMED), "{d:?}");
+            assert_eq!(d.restored[0].restored_from_boot_at, Some(9_000), "{d:?}");
+        }
     }
 
     /// A live view that TIMED OUT is reported as a timeout, not as an
