@@ -2459,11 +2459,14 @@ mod resolve_wait_tests {
     const BUDGET: Duration = Duration::from_secs(40);
 
     /// Write `body` as an executable at `path`. A concurrently scanning shim
-    /// never sees a half-written file: the helper's child `sh` sets the
-    /// execute bits only after the body is complete, and it is reaped before
-    /// this returns.
+    /// never sees a half-written file: the body is written to a sibling
+    /// `.partial` name the shim never scans, then renamed into place. The
+    /// rename is safe against ETXTBSY because the only write fd lived in the
+    /// helper's child `sh`, which is reaped before the rename.
     fn write_exe(path: &Path, body: &str) {
-        crate::test_exec_script::write_executable_script(path, body);
+        let tmp = path.with_extension("partial");
+        crate::test_exec_script::write_executable_script(&tmp, body);
+        std::fs::rename(&tmp, path).unwrap();
     }
 
     /// A real `claude` that records it ran.
