@@ -78,6 +78,7 @@ use qontinui_runner_lib::profiles::connected_coord_base;
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 use crate::capability_manifest::{self, ProvisionReport};
+use crate::continuation_spawn_readiness::{ClaimSent, DeferredStampPost};
 
 // =============================================================================
 // Wire shapes (mirror of qontinui-coord/src/agents_spawn.rs)
@@ -2246,8 +2247,14 @@ enum SpawnDecision {
     },
     /// Network failure / timeout / any other non-2xx → PROCEED to spawn anyway
     /// (availability over consistency; the in-process dedupe still guards).
-    /// Carries a human-readable cause for the WARN log.
-    SpawnDespiteClaimError { cause: String },
+    /// Carries a human-readable cause for the WARN log, and how far the claim
+    /// provably got ([`ClaimSent`]) — which decides whether a seam refusal
+    /// after this spawn may defer unclaimed
+    /// ([`crate::continuation_spawn_readiness::failed_spawn_disposition`]).
+    SpawnDespiteClaimError {
+        cause: String,
+        claim_sent: ClaimSent,
+    },
     /// A [`SpawnDecision::SpawnDespiteClaimError`] while autonomous spawns are
     /// paused by coord's device drain (drained, or drain state unknown): do NOT
     /// spawn; leave the row pending for the backstop poll, like a load deferral.
@@ -2257,6 +2264,19 @@ enum SpawnDecision {
         reason: String,
         class: crate::coord_drain_state::DeferClass,
     },
+}
+
+impl SpawnDecision {
+    /// How far an ERRORED claim got — `Some` only for
+    /// [`SpawnDecision::SpawnDespiteClaimError`], the one decision that spawns
+    /// without coord having accepted the claim. Every other decision is `None`
+    /// (an accepted claim, or one that spawns nothing).
+    fn errored_claim_sent(&self) -> Option<ClaimSent> {
+        match self {
+            SpawnDecision::SpawnDespiteClaimError { claim_sent, .. } => Some(*claim_sent),
+            _ => None,
+        }
+    }
 }
 
 /// PURE: fold the device drain into a claim decision. Only the "spawn anyway"
@@ -2269,13 +2289,13 @@ fn apply_drain_to_claim(
     drain: &crate::coord_drain_state::CoordDrainState,
 ) -> SpawnDecision {
     match decision {
-        SpawnDecision::SpawnDespiteClaimError { cause } => {
+        SpawnDecision::SpawnDespiteClaimError { cause, claim_sent } => {
             match crate::coord_drain_state::gate_for(
                 drain,
                 crate::coord_drain_state::SpawnOrigin::GateContinuation,
             ) {
                 crate::coord_drain_state::DrainGate::Allow => {
-                    SpawnDecision::SpawnDespiteClaimError { cause }
+                    SpawnDecision::SpawnDespiteClaimError { cause, claim_sent }
                 }
                 crate::coord_drain_state::DrainGate::Defer { reason, class } => {
                     SpawnDecision::DeferClaimErrorByDrain {
@@ -2376,14 +2396,18 @@ fn decide_spawn(status: u16, body: &str) -> SpawnDecision {
         // A 409 that is none of the cancelled / superseded / rerouted contracts
         // (e.g. some other conflict): proceed rather than silently drop the
         // continuation.
+        // coord answered, so the POST reached a server: `Unknown`, never
+        // `NotSent`.
         return SpawnDecision::SpawnDespiteClaimError {
             cause: format!(
                 "claim returned 409 without a cancelled, superseded or rerouted body: {body}"
             ),
+            claim_sent: ClaimSent::Unknown,
         };
     }
     SpawnDecision::SpawnDespiteClaimError {
         cause: format!("claim returned status {status}"),
+        claim_sent: ClaimSent::Unknown,
     }
 }
 
@@ -2710,7 +2734,7 @@ fn settle_claim_decision(
             }
             ClaimOutcome::Spawn
         }
-        SpawnDecision::SpawnDespiteClaimError { cause } => {
+        SpawnDecision::SpawnDespiteClaimError { cause, .. } => {
             warn!(
                 "agent_runtime: continuation claim error (proceeding, in-process dedupe \
                  guards): {cause} (gate_id={gate_id})"
@@ -4813,7 +4837,7 @@ fn focus_existing_continuation(terminal_id: &str) {
 ///   (at-least-once).
 /// - [`ConsumeTarget::None`] — legacy coord (neither id): spawn once, no ack.
 #[derive(Debug, Clone, Copy)]
-enum ConsumeTarget {
+pub(crate) enum ConsumeTarget {
     /// A gate continuation: the gate id and the re-delivery attempt this run
     /// claimed (0 = first delivery), so its release tombstones only its own
     /// claim.
@@ -4918,14 +4942,12 @@ async fn dispatch_gate_continuation(
         // without this stamp coord sees a pending row with a null reason — the
         // shape that stranded 51 continuations for two days.
         if let Some(gate_id) = payload.gate_id {
-            if should_post_deferred_stamp(gate_id, std::time::Instant::now()) {
-                post_continuation_deferred(
-                    gate_id,
-                    device_id,
-                    authorization_deferral_stamp_reason(&authz),
-                )
-                .await;
-            }
+            post_deferred_stamp_rate_limited(
+                gate_id,
+                device_id,
+                authorization_deferral_stamp_reason(&authz),
+            )
+            .await;
         }
         return DispatchOutcome::Denied;
     }
@@ -5409,16 +5431,39 @@ async fn claim_before_spawn(gate_id: uuid::Uuid, device_id: uuid::Uuid) -> Spawn
     let Some(client) = crate::coord_http::coord_client() else {
         return SpawnDecision::SpawnDespiteClaimError {
             cause: "no shared coord client".to_string(),
+            // Nothing was sent: there was nothing to send it with.
+            claim_sent: ClaimSent::NotSent,
         };
     };
     let body = ContinuationConsumedBody::claim(device_id);
-    // coord-tenant-scope(device): only gate_id and device_id are in scope (:2390); the continuation-consumed ack is keyed gate_id+device_id, with no auth extractor and no tenant.
-    match crate::auth::attach_device_auth(client.post(&url))
-        .timeout(Duration::from_secs(5))
-        .json(&body)
-        .send()
-        .await
-    {
+    send_continuation_claim(
+        // coord-tenant-scope(device): only gate_id and device_id are in scope (:2390); the continuation-consumed ack is keyed gate_id+device_id, with no auth extractor and no tenant.
+        crate::auth::attach_device_auth(client.post(&url))
+            .timeout(Duration::from_secs(5))
+            .json(&body),
+    )
+    .await
+}
+
+/// Send a built claim request and decode the answer. Split from
+/// [`claim_before_spawn`] so the send-error classification ([`ClaimSent`]) is
+/// driven by a test against a real local listener, not re-implemented.
+async fn send_continuation_claim(request: reqwest::RequestBuilder) -> SpawnDecision {
+    // Split so the URL this request was sent to is known when classifying a
+    // send error (see `classify_claim_send_error` on redirects).
+    let (client, built) = request.build_split();
+    let built = match built {
+        Ok(built) => built,
+        // The request could not even be built: nothing was sent.
+        Err(e) => {
+            return SpawnDecision::SpawnDespiteClaimError {
+                cause: format!("claim POST could not be built: {e:#}"),
+                claim_sent: ClaimSent::NotSent,
+            }
+        }
+    };
+    let requested_url = built.url().clone();
+    match client.execute(built).await {
         Ok(resp) => {
             let status = resp.status().as_u16();
             // Body is needed only to distinguish the 409 cancelled / superseded
@@ -5428,6 +5473,11 @@ async fn claim_before_spawn(gate_id: uuid::Uuid, device_id: uuid::Uuid) -> Spawn
         }
         Err(e) => SpawnDecision::SpawnDespiteClaimError {
             cause: format!("claim POST failed: {e:#}"),
+            claim_sent: crate::continuation_spawn_readiness::classify_claim_send_error(
+                e.is_connect(),
+                e.url(),
+                &requested_url,
+            ),
         },
     }
 }
@@ -5635,6 +5685,52 @@ fn should_post_deferred_stamp(gate_id: uuid::Uuid, now: std::time::Instant) -> b
     true
 }
 
+/// Hand back the PROVISIONAL record [`should_post_deferred_stamp`] took at
+/// `claimed_at` — only if it is still that record (a later attempt owns the
+/// entry otherwise). Removing rather than restoring the previous instant is
+/// exact: an earlier entry could only have been replaced if it was already
+/// outside the window, where it suppresses nothing.
+///
+/// Plan `2026-11-04-gate-continuation-defers-unclaimed-on-unlaunchable-claude-cli-and-unsent-claim`
+/// D3: a stamp lost to a coord outage used to hold the hourly window anyway, so
+/// coord saw a pending row with no reason for up to an hour.
+fn rollback_deferred_stamp(gate_id: uuid::Uuid, claimed_at: std::time::Instant) {
+    let mut map = lock_recover(deferred_stamp_last_post(), "deferred_stamp_last_post");
+    if map.get(&gate_id) == Some(&claimed_at) {
+        map.remove(&gate_id);
+    }
+}
+
+/// Settle the provisional rate-limit record after the POST answered: an
+/// attempt coord ANSWERED (accepted, or refused with a 4xx) holds the hour;
+/// a [`DeferredStampPost::Unreached`] one is rolled back so the next deferral
+/// may try again at once.
+fn settle_deferred_stamp_window(
+    gate_id: uuid::Uuid,
+    claimed_at: std::time::Instant,
+    post: DeferredStampPost,
+) {
+    if post == DeferredStampPost::Unreached {
+        rollback_deferred_stamp(gate_id, claimed_at);
+    }
+}
+
+/// The rate-limited deferred stamp, the ONE place both halves meet: record
+/// provisionally ([`should_post_deferred_stamp`] — recording before the POST
+/// keeps concurrent deferrals for one gate from all posting at once), post, and
+/// settle the record by what the POST achieved ([`settle_deferred_stamp_window`]).
+async fn post_deferred_stamp_rate_limited(
+    gate_id: uuid::Uuid,
+    device_id: uuid::Uuid,
+    reason: String,
+) {
+    let now = std::time::Instant::now();
+    if should_post_deferred_stamp(gate_id, now) {
+        let post = post_continuation_deferred(gate_id, device_id, reason).await;
+        settle_deferred_stamp_window(gate_id, now, post);
+    }
+}
+
 /// Wire body for `POST /coord/gates/{gate_id}/continuation-deferred`.
 #[derive(Debug, Clone, Serialize)]
 struct ContinuationDeferredBody {
@@ -5700,7 +5796,7 @@ fn commit_pressure_stamp_reason(
 /// [`thread_pressure_stamp_reason`] (a wire class coord and the web already
 /// group on), the memory lane stamps [`commit_pressure_stamp_reason`]. The lane
 /// is read off the observation's METRIC, never re-derived from the severity.
-fn load_pressure_stamp_reason(
+pub(crate) fn load_pressure_stamp_reason(
     severity: &str,
     observation: &crate::resource_guard::GateObservation,
 ) -> String {
@@ -5909,12 +6005,21 @@ fn spawn_authorization_stamp_reason(label: &str) -> String {
 /// rows that were merely deferred. The stamp leaves the gate's continuation
 /// lifecycle untouched (still pending, still re-deliverable) — it only gives
 /// coord an honest, queryable "a runner saw this and deferred it" signal.
-/// Rate-limited per gate via [`should_post_deferred_stamp`] (once per hour).
+/// Rate-limited per gate via [`post_deferred_stamp_rate_limited`] (once per
+/// hour, for an attempt coord answered).
 /// **Best-effort**: the route may 404 until coord's parallel phase deploys —
-/// ANY non-2xx or transport error is `debug!` and we move on.
-async fn post_continuation_deferred(gate_id: uuid::Uuid, device_id: uuid::Uuid, reason: String) {
+/// ANY non-2xx or transport error is `debug!` and we move on. Returns what the
+/// attempt achieved ([`DeferredStampPost`], classified by
+/// [`crate::continuation_spawn_readiness::classify_deferred_stamp_status`]), so
+/// the rate limit can hand back an attempt that never reached coord.
+async fn post_continuation_deferred(
+    gate_id: uuid::Uuid,
+    device_id: uuid::Uuid,
+    reason: String,
+) -> DeferredStampPost {
+    use crate::continuation_spawn_readiness::classify_deferred_stamp_status;
     let Some(base) = connected_coord_base() else {
-        return;
+        return classify_deferred_stamp_status(None);
     };
     let url = format!("{base}/coord/gates/{gate_id}/continuation-deferred");
     let Some(client) = crate::coord_http::coord_client() else {
@@ -5922,7 +6027,7 @@ async fn post_continuation_deferred(gate_id: uuid::Uuid, device_id: uuid::Uuid, 
             "agent_runtime: continuation-deferred: no shared coord client \
              gate_id={gate_id} (continuing)"
         );
-        return;
+        return classify_deferred_stamp_status(None);
     };
     let body = ContinuationDeferredBody { device_id, reason };
     // coord-tenant-scope(device): ContinuationDeferredBody{device_id, reason} (:2529); same unauthenticated device-keyed posture, no tenant column.
@@ -5937,6 +6042,7 @@ async fn post_continuation_deferred(gate_id: uuid::Uuid, device_id: uuid::Uuid, 
                 "agent_runtime: continuation-deferred posted gate_id={gate_id} reason={}",
                 body.reason
             );
+            classify_deferred_stamp_status(Some(resp.status().as_u16()))
         }
         Ok(resp) => {
             debug!(
@@ -5944,11 +6050,15 @@ async fn post_continuation_deferred(gate_id: uuid::Uuid, device_id: uuid::Uuid, 
                  (route may not be deployed yet; continuing)",
                 resp.status()
             );
+            classify_deferred_stamp_status(Some(resp.status().as_u16()))
         }
-        Err(e) => debug!(
-            "agent_runtime: continuation-deferred POST gate_id={gate_id} failed \
-             (continuing): {e:#}"
-        ),
+        Err(e) => {
+            debug!(
+                "agent_runtime: continuation-deferred POST gate_id={gate_id} failed \
+                 (continuing): {e:#}"
+            );
+            classify_deferred_stamp_status(None)
+        }
     }
 }
 
@@ -6012,7 +6122,7 @@ async fn post_unit_dispatch_consumed(dispatch_id: uuid::Uuid, device_id: uuid::U
 }
 
 /// First line of an error message (for the `spawn_failed` outcome `detail`).
-fn first_line(msg: &str) -> String {
+pub(crate) fn first_line(msg: &str) -> String {
     msg.lines().next().unwrap_or("").trim().to_string()
 }
 
@@ -6065,9 +6175,7 @@ async fn defer_continuation_unclaimed(
     reason: String,
 ) {
     if let ConsumeTarget::Gate(gate_id, _) = consume_target {
-        if should_post_deferred_stamp(gate_id, std::time::Instant::now()) {
-            post_continuation_deferred(gate_id, device_id, reason).await;
-        }
+        post_deferred_stamp_rate_limited(gate_id, device_id, reason).await;
     }
     release_local_dispatch_claim(consume_target);
 }
@@ -6104,6 +6212,11 @@ fn spawn_gate_continuation_task(payload: GateContinuationPayload, device_id: uui
 ///    — run FIRST so a locally-rejected dispatch never burns a coord-side claim
 ///    (contract item 4), and so a machine already short of memory or threads
 ///    never pays a `git worktree add` before being told to wait.
+///
+///    Then (1c) resolve `claude` ONCE and probe it with the exec seam's
+///    predicate; an unlaunchable CLI defers UNCLAIMED
+///    (`claude_cli_unavailable:<kind>`), and the same string is what the
+///    presentation execs ([`pre_claim_step`]).
 /// 2. **CLAIM** ([`ConsumeTarget::Gate`] only): POST the consume CLAIM and AWAIT
 ///    it. `409 cancelled` → log INFO + SKIP the spawn entirely; network/other
 ///    error → WARN + PROCEED. The work-unit path has no claim-before-spawn (the
@@ -6111,7 +6224,9 @@ fn spawn_gate_continuation_task(payload: GateContinuationPayload, device_id: uui
 /// 3. Acquire a device-local worktree (+ claim heartbeat) and dispatch on
 ///    `presentation` (terminal / headless) to produce the REAL spawn result.
 /// 4. **ACK** — [`ConsumeTarget::Gate`]: POST the typed `spawned`/`spawn_failed`
-///    OUTCOME. [`ConsumeTarget::Dispatch`]: POST the idempotent unit consume only
+///    OUTCOME, except that a seam refusal after a claim that never left the
+///    box defers UNCLAIMED instead ([`ack_gate_spawn_result`]).
+///    [`ConsumeTarget::Dispatch`]: POST the idempotent unit consume only
 ///    on a SUCCESSFUL handle (a failed spawn stays un-consumed → re-listed next
 ///    reconnect). Both best-effort, 5s timeout.
 ///
@@ -6341,34 +6456,56 @@ async fn run_gate_continuation_inner(
         return Ok(());
     }
 
-    // Step 2: CLAIM-before-spawn (only with a gate_id / coord configured). Posted
-    // AFTER the #469 guards pass and AWAITED — its result decides whether to
-    // spawn. This closes the poll→cancel→spawn race: if a cancel landed between
-    // the poll and now, coord returns 409 cancelled and we skip the spawn.
-    if let ConsumeTarget::Gate(gate_id, _) = consume_target {
-        // ONE wiring statement. Every per-decision behaviour — which skip
-        // releases the local claim, which decision proceeds, and what each
-        // logs — lives in `settle_claim_decision`, which the unit test drives
-        // for all variants. The old shape spread it across match arms
-        // here, where deleting the superseded arm's release call broke no test
-        // and stranded the loser's gate id for the process lifetime.
-        //
-        // The drain deferral is the one outcome whose side effect cannot live
-        // in that fn: `defer_continuation_unclaimed` is async and posts to
-        // coord, while `settle_claim_decision` is pure-sync and unit-driven.
-        // So the DECISION (log + whether the claim is settled here) stays
-        // there and only the await lands at this call site.
-        let decision = post_continuation_claim(gate_id, device_id).await;
-        match settle_claim_decision(&decision, consume_target, gate_id) {
-            ClaimOutcome::Spawn => {}
-            ClaimOutcome::Skip => return Ok(()),
-            ClaimOutcome::DeferUnclaimed(class) => {
-                defer_continuation_unclaimed(consume_target, device_id, drain_stamp_reason(class))
-                    .await;
-                return Ok(());
-            }
+    // Step 1c + Step 2: is the `claude` CLI launchable, and only then the
+    // CLAIM-before-spawn. Plan
+    // `2026-11-04-gate-continuation-defers-unclaimed-on-unlaunchable-claude-cli-and-unsent-claim`
+    // (D2/D4): `claude` is resolved ONCE, here, probed with the exec seam's own
+    // predicate, and that same string is what both presentations exec (D-B),
+    // so the probe and the spawn cannot disagree about which file they mean.
+    // An unlaunchable CLI defers UNCLAIMED like every local guard above: a
+    // claimed continuation whose spawn then fails is burned.
+    // The headless arm execs `launchable_or_bare(claude_bin)` (a non-executable
+    // file falls back to the bare name, which `execvp` resolves past), so the
+    // probe reads THAT string for headless; the terminal arm execs the
+    // resolved path itself.
+    let headless = matches!(payload.presentation, Presentation::Headless);
+    let probe_target = move |bin: &str| {
+        if headless {
+            launchable_or_bare(bin.to_string())
+        } else {
+            bin.to_string()
         }
-    }
+    };
+    let (claude_bin, cli_readiness) = spawn_blocking_tracked(move || {
+        let bin = resolve_claude_bin();
+        let readiness = crate::continuation_spawn_readiness::probe_claude_cli(&probe_target(&bin));
+        (bin, readiness)
+    })
+    .await
+    .unwrap_or_else(|_| {
+        let bin = claude_bin_path();
+        let readiness = crate::continuation_spawn_readiness::probe_claude_cli(&bin);
+        (bin, readiness)
+    });
+    // Posted AFTER the #469 guards pass and AWAITED — the claim's result
+    // decides whether to spawn. This closes the poll→cancel→spawn race: if a
+    // cancel landed between the poll and now, coord returns 409 cancelled and
+    // we skip the spawn. ONE wiring statement ([`pre_claim_step`]): every
+    // per-decision behaviour lives in fns the unit tests drive. A deferral or a
+    // skip drops `reservation` inside it, giving back the anchor and its counted
+    // `reserved_spawns` unit. `claim_sent` is how far an ERRORED claim provably
+    // got — step 4 reads it (D5).
+    let Some((claim_sent, reservation)) = pre_claim_step(
+        consume_target,
+        device_id,
+        &claude_bin,
+        &cli_readiness,
+        reservation,
+    )
+    .await
+    else {
+        return Ok(());
+    };
 
     // Step 3: acquire a device-local worktree (+ claim heartbeat). The `ctx`
     // owns the claim heartbeat task. For the HEADLESS path it stays bound here
@@ -6476,6 +6613,7 @@ async fn run_gate_continuation_inner(
                 ctx,
                 reservation,
                 pinned_session_id,
+                claude_bin.clone(),
             )
             .await;
             let res = res.map(|start| {
@@ -6513,6 +6651,7 @@ async fn run_gate_continuation_inner(
                 &headless_prompt,
                 reservation,
                 pinned_session_id,
+                claude_bin.clone(),
             )
             .await;
             drop(ctx);
@@ -6534,15 +6673,34 @@ async fn run_gate_continuation_inner(
     // Step 4: ack (best-effort) from the actual result, per consume target.
     match consume_target {
         ConsumeTarget::Gate(gate_id, _) => {
-            let resolution = spawn_resolution_outcome(&result);
-            post_spawn_outcome(
+            // ONE statement ([`ack_gate_spawn_result`], driven by the unit
+            // tests): a spawn whose claim never left this box and that the seam
+            // then refused for a retriable local reason defers UNCLAIMED (D5);
+            // anything else posts the outcome, a CLI refusal's detail led by
+            // `claude_cli_unavailable:<kind>: ` so coord re-drives it (Phase 4).
+            let ack = ack_gate_spawn_result(
                 gate_id,
-                device_id,
-                resolution.outcome,
-                resolution.detail,
-                resolution.claude_code_session_id,
+                &result,
+                claim_sent,
+                &crate::continuation_spawn_readiness::probe_claude_cli,
+                &crate::resource_guard::probe_for_spawn,
+                |resolution| {
+                    post_spawn_outcome(
+                        gate_id,
+                        device_id,
+                        resolution.outcome,
+                        resolution.detail,
+                        resolution.claude_code_session_id,
+                    )
+                },
+                |stamp| defer_continuation_unclaimed(consume_target, device_id, stamp),
             )
-            .await
+            .await;
+            if ack == GateAck::DeferredUnclaimed {
+                // Not a failure: the row is pending again and the local claim
+                // released. The presentation already cleaned up on its `Err`.
+                return Ok(());
+            }
         }
         // Work-unit dispatch: a single idempotent consume ack, ONLY on success.
         // A failed spawn is deliberately left un-consumed so coord re-lists the
@@ -6573,6 +6731,126 @@ async fn run_gate_continuation_inner(
         );
     }
     result.map(|_bindable_session| ())
+}
+
+/// Step 1c + step 2 of [`run_gate_continuation_inner`], composed from the
+/// production pieces: the pre-claim CLI check
+/// ([`crate::continuation_spawn_readiness::claim_if_spawn_ready`]) with
+/// [`post_continuation_claim`] and [`defer_continuation_unclaimed`] as its
+/// posters, then [`settle_claim_decision`] on coord's answer.
+///
+/// Takes the guard's `reservation` BY VALUE and hands it back only when the
+/// run proceeds, so every exit that does not spawn — the CLI deferral, a coord
+/// skip, the drain deferral — drops it here, which gives back both the anchor
+/// and its counted `reserved_spawns` unit (`AnchorReservation`'s drop).
+///
+/// `Some((claim_sent, reservation))` proceeds; `claim_sent` is
+/// [`SpawnDecision::errored_claim_sent`] of the claim's decision (`None` for an
+/// accepted claim, and for the targets that post none). `None` returns.
+async fn pre_claim_step(
+    consume_target: ConsumeTarget,
+    device_id: uuid::Uuid,
+    claude_bin: &str,
+    cli_readiness: &crate::continuation_spawn_readiness::CliReadiness,
+    reservation: AnchorReservation,
+) -> Option<(Option<ClaimSent>, AnchorReservation)> {
+    use crate::continuation_spawn_readiness::{claim_if_spawn_ready, PreClaim};
+    let pre_claim = claim_if_spawn_ready(
+        consume_target,
+        claude_bin,
+        cli_readiness,
+        |gate_id| post_continuation_claim(gate_id, device_id),
+        |stamp| defer_continuation_unclaimed(consume_target, device_id, stamp),
+    )
+    .await;
+    let decision = match pre_claim {
+        PreClaim::Deferred { .. } => return None,
+        PreClaim::Ready { decision: None } => return Some((None, reservation)),
+        PreClaim::Ready {
+            decision: Some(decision),
+        } => decision,
+    };
+    let ConsumeTarget::Gate(gate_id, _) = consume_target else {
+        // `claim_if_spawn_ready` posts a claim for a gate target only.
+        return Some((None, reservation));
+    };
+    // Every per-decision behaviour — which skip releases the local claim,
+    // which decision proceeds, and what each logs — lives in
+    // `settle_claim_decision`, which the unit test drives for all variants.
+    // The drain deferral is the one outcome whose side effect cannot live in
+    // that fn: `defer_continuation_unclaimed` is async and posts to coord, so
+    // only the await lands here.
+    match settle_claim_decision(&decision, consume_target, gate_id) {
+        ClaimOutcome::Spawn => Some((decision.errored_claim_sent(), reservation)),
+        ClaimOutcome::Skip => None,
+        ClaimOutcome::DeferUnclaimed(class) => {
+            defer_continuation_unclaimed(consume_target, device_id, drain_stamp_reason(class))
+                .await;
+            None
+        }
+    }
+}
+
+/// What step 4 did for a gate continuation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateAck {
+    /// The outcome (`spawned` / `spawn_failed`) was posted.
+    Posted,
+    /// The spawn failed after a claim that never left this box, at a retriable
+    /// seam refusal: deferred UNCLAIMED, no outcome posted.
+    DeferredUnclaimed,
+}
+
+/// Step 4 for [`ConsumeTarget::Gate`]: post the outcome a presentation result
+/// maps to, or — for a failed spawn — settle it through
+/// [`crate::continuation_spawn_readiness::settle_failed_gate_spawn`] (D5 +
+/// Phase 4). The probes and both posters are injected so the unit tests drive
+/// this exact wiring; production passes
+/// [`crate::continuation_spawn_readiness::probe_claude_cli`],
+/// [`crate::resource_guard::probe_for_spawn`], [`post_spawn_outcome`] and
+/// [`defer_continuation_unclaimed`].
+async fn ack_gate_spawn_result<P, PFut, D, DFut>(
+    gate_id: uuid::Uuid,
+    result: &anyhow::Result<Option<uuid::Uuid>>,
+    claim_sent: Option<ClaimSent>,
+    cli_probe: &(dyn Fn(&str) -> crate::continuation_spawn_readiness::CliReadiness + Sync),
+    critical_now: &(dyn Fn() -> crate::resource_guard::SpawnGate + Sync),
+    post: P,
+    defer_unclaimed: D,
+) -> GateAck
+where
+    P: FnOnce(SpawnResolution) -> PFut,
+    PFut: std::future::Future<Output = ()>,
+    D: FnOnce(String) -> DFut,
+    DFut: std::future::Future<Output = ()>,
+{
+    use crate::continuation_spawn_readiness::{
+        classify_seam_refusal, settle_failed_gate_spawn, FailedSpawnDisposition,
+    };
+    let Err(error) = result else {
+        post(spawn_resolution_outcome(result)).await;
+        return GateAck::Posted;
+    };
+    let refusal = classify_seam_refusal(error, cli_probe, critical_now);
+    let disposition = settle_failed_gate_spawn(
+        gate_id,
+        claim_sent,
+        refusal.as_ref(),
+        &error.to_string(),
+        |detail| {
+            post(SpawnResolution {
+                outcome: ContinuationOutcome::SpawnFailed,
+                detail: Some(detail),
+                claude_code_session_id: None,
+            })
+        },
+        defer_unclaimed,
+    )
+    .await;
+    match disposition {
+        FailedSpawnDisposition::DeferUnclaimed(_) => GateAck::DeferredUnclaimed,
+        FailedSpawnDisposition::PostOutcome => GateAck::Posted,
+    }
 }
 
 /// The Step-4 outcome post a presentation result maps to: which token, which
@@ -6842,6 +7120,11 @@ async fn run_continuation_terminal(
     // `run_gate_continuation_inner`). A never-started retry pins a fresh id
     // instead; the id that actually started is returned.
     pinned_session_id: uuid::Uuid,
+    // The `claude` the caller resolved ONCE and probed before the consume
+    // claim (D-B): the first attempt execs exactly this string. Only a
+    // never-started retry re-resolves (below) — a different event, after a
+    // session started and died, when the reinstall window may have closed.
+    claude_bin: String,
 ) -> anyhow::Result<TerminalStart> {
     use std::sync::Arc;
 
@@ -6919,10 +7202,9 @@ async fn run_continuation_terminal(
     // doc: interactivity is required). Inject `--dangerously-skip-permissions`
     // (same as the worker-tab spawn path) so the continuation /implement-plan
     // session does not stall on interactive Bash permission prompts — an
-    // unattended gate continuation has no operator to answer them.
-    let mut claude_bin = spawn_blocking_tracked(resolve_claude_bin)
-        .await
-        .unwrap_or_else(|_| claude_bin_path());
+    // unattended gate continuation has no operator to answer them. Resolved by
+    // the caller (see the `claude_bin` parameter), not here.
+    let mut claude_bin = claude_bin;
     // Phase 2c — `--add-dir=<sibling>` (attached form — see the
     // build_continuation_claude_command doc) for each non-cwd worktree of this
     // continuation's context so the launched `claude` can edit sibling repos
@@ -7191,7 +7473,16 @@ async fn run_continuation_terminal(
                 // failure.
                 let (reason, phase) = classify_pty_spawn_error(&e);
                 report_spawn_failed_in_phase(agent_id, &reason, None, 0, None, phase).await;
-                return Err(anyhow::anyhow!(e));
+                // Typed, with the seam's text verbatim as its `Display` (so the
+                // `spawn_failed` detail is unchanged) and the exact `claude`
+                // this attempt exec'd, which step 4 re-probes to tell a missing
+                // CLI from any other create failure (D-C).
+                return Err(anyhow::Error::new(
+                    crate::continuation_spawn_readiness::TerminalSeamFailure {
+                        claude_bin: claude_bin.clone(),
+                        message: e,
+                    },
+                ));
             }
         };
 
@@ -8522,6 +8813,11 @@ async fn run_continuation_headless(
     // The Claude session id to pin (`--session-id`), minted by the caller
     // before the worktree allocate. See `run_gate_continuation_inner`.
     pinned_session_id: uuid::Uuid,
+    // The `claude` the caller resolved ONCE and probed before the consume
+    // claim (D-B). Passed through `launchable_or_bare`, which returns a file
+    // the probe found executable unchanged — so on every path that reached
+    // here through a `Ready` probe the child execs exactly the probed string.
+    claude_bin: String,
 ) -> anyhow::Result<HeadlessExit> {
     let log_path = agent_log_path(agent_id);
     // Select the most-available account once before spawning (pins the resolved
@@ -8551,6 +8847,7 @@ async fn run_continuation_headless(
         &crate::settings::get_claude_session_permission(),
         pinned_session_args(pinned_session_id),
     );
+    let bin = launchable_or_bare(claude_bin);
     match spawn_claude_child(
         workdir,
         initial_prompt,
@@ -8558,6 +8855,7 @@ async fn run_continuation_headless(
         coord_mcp,
         &session_args,
         false,
+        Some(bin),
     )
     .await
     {
@@ -9463,6 +9761,7 @@ async fn run_agent_subprocess(
             coord_mcp,
             &session_args,
             false,
+            None,
         )
         .await
         {
@@ -10227,6 +10526,11 @@ pub(crate) async fn spawn_claude_child(
     // on a timer and a separate group would take them out of the runner's own
     // signal delivery.
     own_process_group: bool,
+    // `Some(bin)` execs exactly `bin` — the headless gate continuation passes
+    // the string it resolved and probed before its consume claim (plan
+    // `2026-11-04-gate-continuation-defers-unclaimed-on-unlaunchable-claude-cli-and-unsent-claim`,
+    // D-B). `None` resolves here, as every other caller does.
+    bin_override: Option<String>,
 ) -> anyhow::Result<(Child, SpawnPreconditions)> {
     // A model gateway that cannot be resolved (invalid, or its state unknown)
     // refuses the spawn outright rather than starting a session that can only
@@ -10238,9 +10542,12 @@ pub(crate) async fn spawn_claude_child(
     // use, so a failure names the real file. Falls back to the bare name when
     // nothing resolves; the spawn below retries either way (plan
     // `2026-10-03-runner-claude-spawn-fails-enoent-during-cli-auto-update`).
-    let bin = spawn_blocking_tracked(|| launchable_or_bare(resolve_claude_bin()))
-        .await
-        .unwrap_or_else(|_| claude_bin_path());
+    let bin = match bin_override {
+        Some(bin) => bin,
+        None => spawn_blocking_tracked(|| launchable_or_bare(resolve_claude_bin()))
+            .await
+            .unwrap_or_else(|_| claude_bin_path()),
+    };
 
     // ONE account resolution, feeding all three consumers below: the
     // precondition verdict, the trust pre-accept, and the `CLAUDE_CONFIG_DIR`
@@ -10377,7 +10684,17 @@ pub(crate) async fn spawn_claude_child(
     let mut child =
         crate::claude_cli_spawn::spawn_tokio_with_retry(&mut cmd, Some(Path::new(workdir)))
             .await
-            .map_err(|f| anyhow::anyhow!("{}", f.describe(&bin, workdir)))?;
+            // Typed underneath, text unchanged: `to_string()` is still the
+            // `describe` line, while step 4 of a gate continuation downcasts the
+            // `DescribedCliSpawnFailure` to read its `transient_kind` (plan
+            // `2026-11-04-gate-continuation-defers-unclaimed-on-unlaunchable-claude-cli-and-unsent-claim`, D-C).
+            .map_err(|f| {
+                let detail = f.describe(&bin, workdir);
+                anyhow::Error::new(crate::claude_cli_spawn::DescribedCliSpawnFailure {
+                    failure: f,
+                    detail,
+                })
+            })?;
     if let Some(mut stdin) = child.stdin.take() {
         let prompt = initial_prompt.to_string();
         tokio::spawn(async move {
@@ -14722,6 +15039,7 @@ mod tests {
             None,
             AnchorReservation::none(),
             uuid::Uuid::new_v4(),
+            "claude".to_string(),
         )
         .await;
         assert!(
@@ -14849,6 +15167,7 @@ mod tests {
             "echo gate-continuation-proof",
             AnchorReservation::none(),
             pinned,
+            fake_bin.clone(),
         )
         .await;
         assert!(
@@ -15365,6 +15684,7 @@ mod tests {
         assert!(!skip_leaves_row_pending(
             &SpawnDecision::SpawnDespiteClaimError {
                 cause: "network".into(),
+                claim_sent: ClaimSent::NotSent,
             }
         ));
 
@@ -15465,6 +15785,11 @@ mod tests {
             SpawnDecision::Spawn,
             SpawnDecision::SpawnDespiteClaimError {
                 cause: "network".into(),
+                claim_sent: ClaimSent::NotSent,
+            },
+            SpawnDecision::SpawnDespiteClaimError {
+                cause: "claim returned status 503".into(),
+                claim_sent: ClaimSent::Unknown,
             },
         ] {
             let claimed = uuid::Uuid::now_v7();
@@ -15578,6 +15903,376 @@ mod tests {
         assert!(
             should_post_deferred_stamp(gate_b, t0),
             "a different gate is independent"
+        );
+    }
+
+    // =========================================================================
+    // Plan `2026-11-04-gate-continuation-defers-unclaimed-on-unlaunchable-claude-cli-and-unsent-claim`
+    // — the agent_runtime half of Phase 5 (tests 3, 4, 5, 6 and 8). The pure
+    // pieces are tested in `continuation_spawn_readiness/tests.rs`.
+    // =========================================================================
+
+    /// Test 5 (D3): an attempt that never reached coord hands its provisional
+    /// record back, so the NEXT deferral may stamp at once; one coord answered
+    /// (accepted or refused) holds the hour.
+    #[test]
+    fn an_unreached_deferred_stamp_leaves_the_window_open() {
+        let t0 = std::time::Instant::now();
+
+        let unreached = uuid::Uuid::now_v7();
+        assert!(should_post_deferred_stamp(unreached, t0));
+        settle_deferred_stamp_window(unreached, t0, DeferredStampPost::Unreached);
+        assert!(
+            should_post_deferred_stamp(unreached, t0 + Duration::from_secs(1)),
+            "a stamp lost to a coord outage must not hold the hour"
+        );
+
+        for answered in [DeferredStampPost::Rejected, DeferredStampPost::Posted] {
+            let gate = uuid::Uuid::now_v7();
+            assert!(should_post_deferred_stamp(gate, t0));
+            settle_deferred_stamp_window(gate, t0, answered);
+            assert!(
+                !should_post_deferred_stamp(gate, t0 + Duration::from_secs(1)),
+                "{answered:?}: coord answered, so the hour is held"
+            );
+        }
+    }
+
+    /// Test 5 (D3): a rollback removes only ITS OWN record — a stale rollback
+    /// (an older attempt's instant) leaves a newer record in place.
+    #[test]
+    fn a_deferred_stamp_rollback_removes_only_its_own_record() {
+        let gate = uuid::Uuid::now_v7();
+        let t0 = std::time::Instant::now();
+        let t1 = t0 + CONTINUATION_DEFERRED_STAMP_INTERVAL;
+        assert!(should_post_deferred_stamp(gate, t0));
+        assert!(
+            should_post_deferred_stamp(gate, t1),
+            "a newer attempt owns it"
+        );
+        rollback_deferred_stamp(gate, t0);
+        assert!(
+            !should_post_deferred_stamp(gate, t1 + Duration::from_secs(1)),
+            "the stale rollback must not have removed the newer record"
+        );
+        rollback_deferred_stamp(gate, t1);
+        assert!(
+            should_post_deferred_stamp(gate, t1 + Duration::from_secs(1)),
+            "its own rollback removes it"
+        );
+    }
+
+    /// Test 3: a pre-claim CLI deferral, through the PRODUCTION composition
+    /// ([`pre_claim_step`] with `post_continuation_claim` and
+    /// `defer_continuation_unclaimed`), releases the local dispatch claim and
+    /// gives back the reservation's counted `reserved_spawns` unit, and posts
+    /// no claim (the claim would SEAL the attempt). A ready CLI proceeds with
+    /// both still held.
+    #[tokio::test]
+    async fn a_pre_claim_cli_deferral_releases_the_claim_and_the_reserved_unit() {
+        use crate::continuation_spawn_readiness::{CliKind, CliReadiness};
+        let _env_lock = env_lock();
+        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_continuation_registry();
+        let live_none = |_id: &str| false;
+        let reading = || thread_reading(Some(10));
+        let before = reserved_spawns_now();
+
+        // Deferred: claim released, unit returned.
+        let gate = uuid::Uuid::now_v7();
+        assert!(claim_gate_dispatch(gate), "the dispatcher's claim");
+        let (verdict, reservation) =
+            evaluate_continuation_guard(Some("cli-deferral-anchor"), &live_none, &reading);
+        assert_eq!(verdict, ContinuationGuard::Proceed);
+        assert_eq!(
+            reserved_spawns_now(),
+            before + 1,
+            "the guard charged a unit"
+        );
+        let proceed = pre_claim_step(
+            ConsumeTarget::Gate(gate, 0),
+            uuid::Uuid::now_v7(),
+            "/opt/claude",
+            &CliReadiness::Unlaunchable(CliKind::Known("enoent")),
+            reservation,
+        )
+        .await;
+        assert!(proceed.is_none(), "an unlaunchable CLI must not proceed");
+        assert!(
+            claim_gate_dispatch(gate),
+            "the local dispatch claim must be released so the re-listed row dispatches"
+        );
+        assert_eq!(
+            reserved_spawns_now(),
+            before,
+            "the deferral must give back the reserved unit"
+        );
+        release_gate_dispatch(gate);
+
+        // Ready: proceeds, the claim is SEALED (coord accepted — here, no coord
+        // is configured, which `claim_before_spawn` reads as `Spawn`), and the
+        // reservation is handed back to the caller still counted.
+        let gate = uuid::Uuid::now_v7();
+        assert!(claim_gate_dispatch(gate));
+        let (_, reservation) =
+            evaluate_continuation_guard(Some("cli-ready-anchor"), &live_none, &reading);
+        let proceed = pre_claim_step(
+            ConsumeTarget::Gate(gate, 0),
+            uuid::Uuid::now_v7(),
+            "/opt/claude",
+            &CliReadiness::Ready,
+            reservation,
+        )
+        .await;
+        let (claim_sent, reservation) = proceed.expect("a ready CLI proceeds");
+        assert_eq!(claim_sent, None, "an accepted claim carries no send state");
+        assert_eq!(reserved_spawns_now(), before + 1);
+        assert!(
+            !claim_gate_dispatch(gate),
+            "the claim is kept for the spawn"
+        );
+        drop(reservation);
+        assert_eq!(reserved_spawns_now(), before);
+        clear_continuation_registry();
+    }
+
+    /// Test 6: the claim's send state is classified STRUCTURALLY from a real
+    /// send — a refused connection is `NotSent`; any HTTP status (here a 503)
+    /// is `Unknown`, because the POST reached a server.
+    #[tokio::test]
+    async fn a_refused_claim_connection_is_not_sent_and_a_503_is_unknown() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // Refused: bind, take the port, close it.
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        // `.no_proxy()`: a system/registry proxy would otherwise take the
+        // 127.0.0.1 request and the refusal would never reach this client.
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let refused = send_continuation_claim(
+            client
+                .post(format!(
+                    "http://127.0.0.1:{port}/coord/gates/g/continuation-consumed"
+                ))
+                .timeout(Duration::from_secs(5)),
+        )
+        .await;
+        match refused {
+            SpawnDecision::SpawnDespiteClaimError { claim_sent, cause } => {
+                assert_eq!(claim_sent, ClaimSent::NotSent, "{cause}")
+            }
+            other => panic!("expected a claim error, got {other:?}"),
+        }
+
+        // 503: a listener that answers.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            sock.write_all(
+                b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        });
+        let answered = send_continuation_claim(
+            client
+                .post(format!("http://{addr}/coord/gates/g/continuation-consumed"))
+                .timeout(Duration::from_secs(5)),
+        )
+        .await;
+        server.await.unwrap();
+        assert_eq!(
+            answered,
+            SpawnDecision::SpawnDespiteClaimError {
+                cause: "claim returned status 503".into(),
+                claim_sent: ClaimSent::Unknown,
+            }
+        );
+    }
+
+    /// Test 4: the terminal argv's program is the exact string handed in — the
+    /// one value the pre-claim probe checked (D-B).
+    #[test]
+    fn the_continuation_argv_execs_the_probed_string() {
+        let probed = "/home/u/.nvm/versions/node/v24.19.0/bin/claude".to_string();
+        let argv = build_continuation_claude_command(
+            probed.clone(),
+            "00000000-0000-0000-0000-000000000000",
+            None,
+            Vec::new(),
+            "do the thing".to_string(),
+            None,
+            Vec::new(),
+            &crate::claude_session::launch_spec::LaunchConfig::default(),
+        );
+        assert_eq!(argv.first(), Some(&probed));
+    }
+
+    /// Test 8: step 4's COMPOSED wiring ([`ack_gate_spawn_result`]) for each
+    /// refusal class, asserting which side effect fired — so deleting the defer
+    /// branch at the call site reddens a test, not only the pure fn.
+    #[tokio::test]
+    async fn step_four_defers_or_posts_by_claim_state_and_refusal() {
+        use crate::continuation_spawn_readiness::{CliKind, CliReadiness, TerminalSeamFailure};
+        use crate::resource_guard::{GateObservation, LaneMetric, SpawnGate};
+
+        #[derive(Debug, PartialEq)]
+        enum Fired {
+            Posted(ContinuationOutcome, Option<String>),
+            Deferred(String),
+        }
+
+        async fn run(
+            result: anyhow::Result<Option<uuid::Uuid>>,
+            claim_sent: Option<ClaimSent>,
+            cli: CliReadiness,
+            now: SpawnGate,
+        ) -> (GateAck, Vec<Fired>) {
+            let fired = std::cell::RefCell::new(Vec::new());
+            let ack = ack_gate_spawn_result(
+                uuid::Uuid::now_v7(),
+                &result,
+                claim_sent,
+                &|_bin| cli.clone(),
+                &|| now.clone(),
+                |r: SpawnResolution| {
+                    fired.borrow_mut().push(Fired::Posted(r.outcome, r.detail));
+                    async {}
+                },
+                |stamp| {
+                    fired.borrow_mut().push(Fired::Deferred(stamp));
+                    async {}
+                },
+            )
+            .await;
+            (ack, fired.into_inner())
+        }
+
+        let thread_critical = || {
+            SpawnGate::Critical(GateObservation {
+                lane: "threads".to_string(),
+                metric: LaneMetric::ThreadCount,
+                observed: 900,
+                limit: 800,
+            })
+        };
+        let rg_err = || {
+            Err(anyhow::Error::new(TerminalSeamFailure {
+                claude_bin: "/opt/claude".to_string(),
+                message: "resource_guard:critical:thread_count: Not starting a new terminal \
+                          session"
+                    .to_string(),
+            }))
+        };
+        let cli_err = || {
+            Err(anyhow::Error::new(TerminalSeamFailure {
+                claude_bin: "/opt/claude".to_string(),
+                message: "PTY holder spawn failed: holder failed [exit_status: 5]".to_string(),
+            }))
+        };
+        let gone = || CliReadiness::Unlaunchable(CliKind::Known("enoent"));
+
+        // NotSent + resource guard → deferred with fresh numbers, nothing posted.
+        let (ack, fired) = run(
+            rg_err(),
+            Some(ClaimSent::NotSent),
+            CliReadiness::Ready,
+            thread_critical(),
+        )
+        .await;
+        assert_eq!(ack, GateAck::DeferredUnclaimed);
+        assert_eq!(
+            fired,
+            vec![Fired::Deferred(
+                "thread_pressure:critical:900_over_800".to_string()
+            )]
+        );
+
+        // NotSent + CLI → deferred.
+        let (ack, fired) = run(
+            cli_err(),
+            Some(ClaimSent::NotSent),
+            gone(),
+            SpawnGate::Proceed,
+        )
+        .await;
+        assert_eq!(ack, GateAck::DeferredUnclaimed);
+        assert_eq!(
+            fired,
+            vec![Fired::Deferred("claude_cli_unavailable:enoent".to_string())]
+        );
+
+        // Unknown or accepted + CLI → posted, detail led by the Phase 4 head.
+        for claim_sent in [Some(ClaimSent::Unknown), None] {
+            let (ack, fired) = run(cli_err(), claim_sent, gone(), SpawnGate::Proceed).await;
+            assert_eq!(ack, GateAck::Posted);
+            assert_eq!(
+                fired,
+                vec![Fired::Posted(
+                    ContinuationOutcome::SpawnFailed,
+                    Some(
+                        "claude_cli_unavailable:enoent: PTY holder spawn failed: holder failed \
+                         [exit_status: 5]"
+                            .to_string()
+                    )
+                )],
+                "{claim_sent:?}"
+            );
+        }
+
+        // Unknown + resource guard → posted, detail byte-identical.
+        let (ack, fired) = run(
+            rg_err(),
+            Some(ClaimSent::Unknown),
+            CliReadiness::Ready,
+            thread_critical(),
+        )
+        .await;
+        assert_eq!(ack, GateAck::Posted);
+        assert_eq!(
+            fired,
+            vec![Fired::Posted(
+                ContinuationOutcome::SpawnFailed,
+                Some(
+                    "resource_guard:critical:thread_count: Not starting a new terminal session"
+                        .to_string()
+                )
+            )]
+        );
+
+        // NotSent + an unrelated failure (the CLI is fine) → posted unchanged.
+        let (ack, fired) = run(
+            cli_err(),
+            Some(ClaimSent::NotSent),
+            CliReadiness::Ready,
+            SpawnGate::Proceed,
+        )
+        .await;
+        assert_eq!(ack, GateAck::Posted);
+        assert_eq!(
+            fired,
+            vec![Fired::Posted(
+                ContinuationOutcome::SpawnFailed,
+                Some("PTY holder spawn failed: holder failed [exit_status: 5]".to_string())
+            )]
+        );
+
+        // A spawn that worked is posted `spawned`, whatever the claim state.
+        let (ack, fired) = run(
+            Ok(Some(uuid::Uuid::nil())),
+            Some(ClaimSent::NotSent),
+            gone(),
+            thread_critical(),
+        )
+        .await;
+        assert_eq!(ack, GateAck::Posted);
+        assert_eq!(
+            fired,
+            vec![Fired::Posted(ContinuationOutcome::Spawned, None)]
         );
     }
 
@@ -18880,7 +19575,8 @@ mod drain_claim_tests {
             assert_eq!(
                 apply_drain_to_claim(decide_spawn(503, ""), &state),
                 SpawnDecision::SpawnDespiteClaimError {
-                    cause: "claim returned status 503".into()
+                    cause: "claim returned status 503".into(),
+                    claim_sent: ClaimSent::Unknown,
                 }
             );
         }
@@ -19085,11 +19781,66 @@ mod gateway_spawn_refusal_tests {
             crate::coord_mcp::CoordMcpDelivery::Provisioned,
             &[],
             false,
+            None,
         )
         .await;
         match outcome {
             Ok(_) => panic!("an unresolved gateway must refuse the spawn"),
             Err(err) => assert!(format!("{err:#}").contains("model gateway"), "{err:#}"),
         }
+    }
+}
+
+/// Plan `2026-11-04-gate-continuation-defers-unclaimed-on-unlaunchable-claude-cli-and-unsent-claim`,
+/// Phase 5 test 4 (D-B): `spawn_claude_child(.., Some(bin))` execs exactly
+/// `bin` rather than re-resolving. The program is one whose launch fails with a
+/// NON-transient error (one attempt, no retry back-off), so the failure's text
+/// — `describe`'s `spawn `<bin>` in <workdir>` — names the program that was
+/// actually exec'd. Deleting the `Some` arm makes it name the resolved
+/// `claude` instead.
+#[cfg(test)]
+mod bin_override_tests {
+    #[tokio::test]
+    async fn spawn_claude_child_execs_the_override() {
+        let _amb = crate::test_env::isolated_ambient();
+        let tmp = tempfile::tempdir().unwrap();
+        let account = tmp.path().join("account");
+        std::fs::create_dir(&account).unwrap();
+        let workdir = tmp.path().join("work");
+        std::fs::create_dir(&workdir).unwrap();
+        // A symlink loop (ELOOP) on unix, a non-PE `.exe` (os error 193) on
+        // Windows: both refused by the OS at once and neither transient.
+        #[cfg(unix)]
+        let bin = {
+            let a = tmp.path().join("claude-loop-a");
+            let b = tmp.path().join("claude-loop-b");
+            std::os::unix::fs::symlink(&b, &a).unwrap();
+            std::os::unix::fs::symlink(&a, &b).unwrap();
+            a.to_string_lossy().into_owned()
+        };
+        #[cfg(windows)]
+        let bin = {
+            let exe = tmp.path().join("claude-override.exe");
+            std::fs::write(&exe, b"not a PE image").unwrap();
+            exe.to_string_lossy().into_owned()
+        };
+        let outcome = super::spawn_claude_child(
+            &workdir.to_string_lossy(),
+            "hi",
+            Some(&account.to_string_lossy()),
+            crate::coord_mcp::CoordMcpDelivery::Provisioned,
+            &[],
+            false,
+            Some(bin.clone()),
+        )
+        .await;
+        let err = match outcome {
+            Ok(_) => panic!("the override is not launchable; the spawn must fail"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().starts_with(&format!("spawn `{bin}` in ")),
+            "the failure must name the override as the exec'd program: {err:#}"
+        );
     }
 }

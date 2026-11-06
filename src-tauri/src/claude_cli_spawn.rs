@@ -153,6 +153,31 @@ impl std::fmt::Display for CliSpawnFailure {
     }
 }
 
+impl std::error::Error for CliSpawnFailure {}
+
+/// A [`CliSpawnFailure`] whose `Display` is its whole `describe` line, so
+/// `spawn_claude_child` can carry the failure TYPED while its text stays
+/// byte-identical to the old `anyhow!("{}", describe)` — under `{:#}` too: it
+/// is one error with no `source()`, so the io error is never printed twice (a
+/// `.context(describe)` chain would print it again). A headless gate
+/// continuation's step 4 `downcast_ref`s it to read
+/// [`CliSpawnFailure::transient_kind`] instead of grepping the detail (plan
+/// `2026-11-04-gate-continuation-defers-unclaimed-on-unlaunchable-claude-cli-and-unsent-claim`,
+/// D-C).
+#[derive(Debug)]
+pub struct DescribedCliSpawnFailure {
+    pub failure: CliSpawnFailure,
+    pub detail: String,
+}
+
+impl std::fmt::Display for DescribedCliSpawnFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+
+impl std::error::Error for DescribedCliSpawnFailure {}
+
 /// Run `attempt` until it succeeds, fails with an error that is not
 /// transient, or `delays` is spent. `sleep` is injected so the policy is
 /// unit-testable without a clock.

@@ -88,6 +88,7 @@ mod config_storage;
 mod constraint_engine;
 mod container;
 mod context;
+mod continuation_spawn_readiness;
 mod coord_doctor_cmd;
 mod coord_drain_state;
 mod coord_http;
