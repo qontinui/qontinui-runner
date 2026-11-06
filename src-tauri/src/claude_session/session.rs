@@ -2007,15 +2007,8 @@ impl ClaudeSession {
         // 7. Spawn a fresh CLI with cwd = worktree.path and worktree metadata,
         //    on the SAME account this session ran under: promotion moves the
         //    process, not the conversation, so it must not take a fresh draw.
-        //    A caller pin stays a pin; the runner's own pick is re-carried as
-        //    `Picked`, so its credentials are re-checked.
-        let session_ctx = match self.account.clone() {
-            Some(account) => session_ctx.map(|mut ctx| {
-                ctx.account = Some(account);
-                ctx
-            }),
-            None => session_ctx,
-        };
+        //    See `promotion_session_ctx`.
+        let session_ctx = Self::promotion_session_ctx(self.account.clone(), session_ctx);
         let session_id = self.session_id.clone();
         let new_session = Self::spawn(
             &worktree_path_str,
@@ -2058,6 +2051,33 @@ impl ClaudeSession {
         );
 
         Ok(info)
+    }
+
+    /// The session ctx a worktree promotion respawns with, so it runs on the
+    /// SAME account the session ran under rather than a fresh draw. A caller
+    /// pin stays a pin; the runner's own pick is re-carried as `Picked`, so
+    /// its credentials are re-checked; and a session whose child inherited the
+    /// ambient default (`carried` is `None`) asks to inherit it again
+    /// (`inherit_ambient_account`), so the respawn takes no pick. With no ctx
+    /// at all there is nothing to carry the flag, and the respawn resolves as
+    /// any ctx-less spawn does. PURE.
+    pub(crate) fn promotion_session_ctx(
+        carried: Option<crate::ai_provider::AccountChoice>,
+        session_ctx: Option<AiSessionContext>,
+    ) -> Option<AiSessionContext> {
+        session_ctx.map(|mut ctx| {
+            match carried {
+                Some(account) => {
+                    ctx.account = Some(account);
+                    ctx.inherit_ambient_account = false;
+                }
+                None => {
+                    ctx.account = None;
+                    ctx.inherit_ambient_account = true;
+                }
+            }
+            ctx
+        })
     }
 
     /// Which account a rate-limit restart rotates away from, and to.
@@ -2543,6 +2563,38 @@ mod account_resolution_tests {
             panic!("a ctx that carries a choice must not take another pick")
         });
         assert_eq!(pinned.dir, Some(mine));
+    }
+
+    /// **A worktree promotion respawns on the account the session ran under.**
+    /// A carried pin or pick rides the ctx; a session whose child inherited
+    /// the ambient default asks to inherit it again, so the respawn takes no
+    /// fresh pick (`resolve_account` panics on a pick here if it does).
+    #[test]
+    fn a_worktree_promotion_keeps_the_account_including_the_ambient_default() {
+        let _fleet = crate::mcp::fleet_policy_poller::pin_account_selection_for_test(Some(
+            AccountSelectionMode::WeightedRandom,
+        ));
+        let (_mine_guard, mine) = dir_with_live_credentials();
+        let ctx = AiSessionContext::setup("task-promote", "Promote");
+
+        let ambient = super::ClaudeSession::promotion_session_ctx(None, Some(ctx.clone()))
+            .expect("a ctx stays a ctx");
+        assert!(ambient.inherit_ambient_account);
+        assert_eq!(ambient.account, None);
+        let resolved =
+            super::ClaudeSession::resolve_account(&auto_mode_cli(), Some(&ambient), || {
+                panic!("promoting an ambient session must not take a fresh pick")
+            });
+        assert_eq!(resolved.dir, None);
+
+        let picked = super::ClaudeSession::promotion_session_ctx(
+            Some(AccountChoice::Picked(mine.clone())),
+            Some(ctx),
+        )
+        .expect("a ctx stays a ctx");
+        assert!(!picked.inherit_ambient_account);
+        assert_eq!(picked.account, Some(AccountChoice::Picked(mine)));
+        assert!(super::ClaudeSession::promotion_session_ctx(None, None).is_none());
     }
 
     /// **A respawn re-carries a caller pin as a pin and the runner's own pick

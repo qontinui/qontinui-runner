@@ -3104,13 +3104,23 @@ mod inline_account_tests {
                 && err.contains("rejected_no_credentials"),
             "the refusal names why: {err}"
         );
-        // ...and is final: the retry wrapper gives up on it at once.
+        // ...and is final: the retry wrapper gives up on it at once, even one
+        // whose configured patterns WOULD retry this text — the marker, not a
+        // pattern miss, is what stops it.
+        let mut config = crate::orchestrator::RetryConfig::default();
+        config
+            .retryable_errors
+            .push("no authenticated claude account".to_string());
+        let service = crate::orchestrator::RetryService::new(config);
+        assert!(
+            service.is_retryable_error(&err),
+            "the patterns alone would retry the refusal: {err}"
+        );
         assert!(
             matches!(
-                crate::orchestrator::RetryService::with_defaults()
-                    .should_retry(&err, &crate::orchestrator::RetryState::new()),
+                service.should_retry(&err, &crate::orchestrator::RetryState::new()),
                 crate::orchestrator::RetryDecision::GiveUp { .. }
-            ) && err.contains(crate::orchestrator::retry::NON_RETRYABLE_MARKER),
+            ),
             "the no-account refusal must be non-retryable: {err}"
         );
     }

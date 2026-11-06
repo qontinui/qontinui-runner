@@ -533,11 +533,12 @@ pub(crate) enum ResumeAccount {
     /// whose `.credentials.json` is live. Carried as `AccountChoice::Pinned`.
     Pinned(String),
     /// The transcript is under the ambient default location (the dir a child
-    /// with no `CLAUDE_CONFIG_DIR` inherits), whose login only the
-    /// default-location check sees (no live `.credentials.json` in it). Resume
-    /// WITHOUT setting an account: pinning that dir explicitly would move a
-    /// macOS login off the Keychain item Claude Code reads for the default
-    /// location.
+    /// with no `CLAUDE_CONFIG_DIR` inherits), a spawn with no account resolves
+    /// there too, and that account is live. Resume WITHOUT setting an account:
+    /// pinning that dir explicitly would move the child's global config from
+    /// `~/.claude.json` to `$CLAUDE_CONFIG_DIR/.claude.json` (losing user-level
+    /// MCP servers, onboarding and project trust), and a macOS login off the
+    /// Keychain item Claude Code reads for the default location.
     Ambient,
     /// A `--resume` cannot find its conversation (or the account that holds it
     /// cannot authenticate): start fresh / fall back to a replay summary.
@@ -586,15 +587,24 @@ pub(crate) struct ResumeAccountProbe<'a> {
 ///
 /// The transcript's location is ground truth: the first of `search_dirs`
 /// holding `session_transcript_path(dir, project_path, session_id)` owns the
-/// conversation. Any holding dir — the ambient default included — that passes
-/// `has_valid_credentials` (the `<dir>/.credentials.json` check) is
-/// [`ResumeAccount::Pinned`] to it: a pin names the account explicitly, so the
-/// no-choice resolution cannot move it. Only a transcript under the ambient
-/// default whose credentials the file check cannot see but
-/// `ambient_has_valid_credentials` (`default_location_has_valid_credentials`,
-/// which also sees the macOS Keychain) passes is resumed as
-/// [`ResumeAccount::Ambient`] — and only while a spawn with no account resolves
-/// to that same dir. Anything else is [`ResumeAccount::NotResumable`].
+/// conversation.
+///
+/// - A transcript under the AMBIENT default, while a spawn with no account
+///   resolves to that same dir (or to nothing), is [`ResumeAccount::Ambient`]
+///   when that account is live by either check — `has_valid_credentials` (the
+///   `<dir>/.credentials.json` check) or `ambient_has_valid_credentials`
+///   (`default_location_has_valid_credentials`, which also sees the macOS
+///   Keychain). It is NOT pinned even with file credentials: setting
+///   `CLAUDE_CONFIG_DIR` explicitly — even to `~/.claude` — makes Claude Code
+///   read its global config from `$CLAUDE_CONFIG_DIR/.claude.json` instead of
+///   `~/.claude.json`, and the child loses the operator's user-level MCP
+///   servers, onboarding state and project trust.
+/// - Any other holding dir that passes `has_valid_credentials` is
+///   [`ResumeAccount::Pinned`] to it: a pin names the account explicitly, so
+///   the no-choice resolution cannot move it. That includes the ambient
+///   default when the no-choice resolution would land elsewhere — there the
+///   pin is the only way to keep the resume on the transcript's account.
+/// - Anything else is [`ResumeAccount::NotResumable`].
 pub(crate) fn decide_resume_account(
     probe: &ResumeAccountProbe<'_>,
     has_valid_credentials: impl Fn(&str) -> bool,
@@ -612,31 +622,33 @@ pub(crate) fn decide_resume_account(
         };
     };
     let dir_str = dir.to_string_lossy().to_string();
+    let under_ambient = probe
+        .ambient_dir
+        .is_some_and(|ambient| same_dir(ambient, &dir));
+    let no_choice_elsewhere = probe
+        .no_choice_dir
+        .filter(|d| !same_dir(Path::new(d), &dir));
+
+    if under_ambient && no_choice_elsewhere.is_none() {
+        if has_valid_credentials(&dir_str) || ambient_has_valid_credentials() {
+            return ResumeAccount::Ambient;
+        }
+        return ResumeAccount::NotResumable {
+            reason: format!(
+                "its transcript is under the ambient default {dir_str}, which has no valid credentials"
+            ),
+        };
+    }
     if has_valid_credentials(&dir_str) {
         return ResumeAccount::Pinned(dir_str);
     }
-    if probe
-        .ambient_dir
-        .is_some_and(|ambient| same_dir(ambient, &dir))
-    {
-        if !ambient_has_valid_credentials() {
-            return ResumeAccount::NotResumable {
-                reason: format!(
-                    "its transcript is under the ambient default {dir_str}, which has no valid credentials"
-                ),
-            };
-        }
-        if let Some(other) = probe
-            .no_choice_dir
-            .filter(|d| !same_dir(Path::new(d), &dir))
-        {
-            return ResumeAccount::NotResumable {
-                reason: format!(
-                    "its transcript is under the ambient default {dir_str}, but a spawn with no account resolves to {other}"
-                ),
-            };
-        }
-        return ResumeAccount::Ambient;
+    if let (true, Some(other)) = (under_ambient, no_choice_elsewhere) {
+        return ResumeAccount::NotResumable {
+            reason: format!(
+                "its transcript is under the ambient default {dir_str}, whose login only the \
+                 default-location check can see, but a spawn with no account resolves to {other}"
+            ),
+        };
     }
     ResumeAccount::NotResumable {
         reason: format!(
@@ -699,14 +711,28 @@ pub(crate) fn child_config_dir_with(
         .or_else(|| ambient.map(|p| p.to_string_lossy().to_string()))
 }
 
-/// Whether two config-dir spellings name the same dir: equal as paths, or
-/// equal once both canonicalize (a symlinked `~/.claude`, a `..` segment).
-fn same_dir(a: &Path, b: &Path) -> bool {
-    a == b
-        || matches!(
-            (fs::canonicalize(a), fs::canonicalize(b)),
-            (Ok(ca), Ok(cb)) if ca == cb
-        )
+/// Whether two config-dir spellings name the same dir: equal as paths, equal
+/// once both canonicalize (a symlinked `~/.claude`, a `..` segment), or — when
+/// either does not exist — equal once separators are unified and a trailing
+/// separator dropped (case-folded on Windows), so the ambient
+/// `C:\Users\x\.claude` and a roster `C:/Users/x/.claude` are one account.
+pub(crate) fn same_dir(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    if let (Ok(ca), Ok(cb)) = (fs::canonicalize(a), fs::canonicalize(b)) {
+        return ca == cb;
+    }
+    fn normalize(p: &Path) -> String {
+        let s = p.to_string_lossy().replace('\\', "/");
+        let s = s.trim_end_matches('/');
+        if cfg!(windows) {
+            s.to_lowercase()
+        } else {
+            s.to_string()
+        }
+    }
+    normalize(a) == normalize(b)
 }
 
 // ── Resume-name extraction (previous-sessions listing) ───────────────────────
@@ -2573,18 +2599,42 @@ mod tests {
         ));
     }
 
-    /// **A transcript under the ambient default whose dir passes the FILE
-    /// credential check is pinned to it** — even when a spawn with no account
-    /// would resolve elsewhere, which would otherwise make it not resumable,
-    /// and whatever the Keychain-style check says.
+    /// **A transcript under the ambient default with FILE credentials is not
+    /// pinned while a spawn with no account lands on that same dir** (or on
+    /// nothing): pinning `~/.claude` would move the child's global config to
+    /// `$CLAUDE_CONFIG_DIR/.claude.json`. It resumes as Ambient — on the file
+    /// check alone, whatever the Keychain-style check says, including when the
+    /// no-choice resolution spells the ambient dir differently. Only when the
+    /// no-choice resolution would land ELSEWHERE is it pinned, since the pin
+    /// is then the only way to keep the resume on the transcript's account.
     #[test]
-    fn a_transcript_under_the_ambient_default_with_file_credentials_is_pinned() {
+    fn a_transcript_under_the_ambient_default_with_file_credentials_is_pinned_only_when_no_choice_lands_elsewhere(
+    ) {
         let ambient = tempfile::tempdir().unwrap();
         let other = tempfile::tempdir().unwrap();
         write_transcript(ambient.path(), RESUME_CWD, RESUME_ID);
         let (ambient_s, other_s) = (dir_string(&ambient), dir_string(&other));
+        // The ambient dir spelled through a `..` segment: one dir, two spellings.
+        let ambient_respelled = format!(
+            "{ambient_s}/../{}",
+            ambient.path().file_name().unwrap().to_string_lossy()
+        );
         let dirs = vec![ambient.path().to_path_buf()];
 
+        assert_eq!(
+            decide(&dirs, Some(ambient.path()), None, &[&ambient_s], false),
+            ResumeAccount::Ambient
+        );
+        assert_eq!(
+            decide(
+                &dirs,
+                Some(ambient.path()),
+                Some(&ambient_respelled),
+                &[&ambient_s],
+                false
+            ),
+            ResumeAccount::Ambient
+        );
         assert_eq!(
             decide(
                 &dirs,
@@ -2596,9 +2646,33 @@ mod tests {
             ResumeAccount::Pinned(ambient_s.clone())
         );
         assert_eq!(
-            decide(&dirs, Some(ambient.path()), None, &[&ambient_s], false),
+            decide(
+                &dirs,
+                Some(ambient.path()),
+                Some(&other_s),
+                &[&ambient_s],
+                false
+            ),
             ResumeAccount::Pinned(ambient_s)
         );
+    }
+
+    /// Path equality across spellings: separators and a trailing separator do
+    /// not make two dirs of one account.
+    #[test]
+    fn same_dir_sees_through_separators_and_a_trailing_separator() {
+        assert!(same_dir(
+            Path::new(r"C:\Users\x\.claude"),
+            Path::new("C:/Users/x/.claude")
+        ));
+        assert!(same_dir(
+            Path::new("/home/x/.claude/"),
+            Path::new("/home/x/.claude")
+        ));
+        assert!(!same_dir(
+            Path::new("/home/x/.claude"),
+            Path::new("/home/x/.claude-work")
+        ));
     }
 
     /// An ambient child (no resolved dir) runs — and federates — under the

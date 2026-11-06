@@ -608,7 +608,12 @@ pub async fn dispatch_subtask(
     //    dispatch is the burst case, and reading the shared resolved dir back
     //    would hand this worker whichever sibling picked last. `None` (Manual
     //    mode, a gateway, no valid account) leaves the choice to the spawn.
-    let account = crate::ai_provider::account_usage::pick_best_account()
+    //    The pick reads settings and cooldown state, so it runs on the
+    //    blocking pool, as the workflow loop controller's pick does.
+    let account = spawn_blocking_tracked(crate::ai_provider::account_usage::pick_best_account)
+        .await
+        .ok()
+        .flatten()
         .map(crate::ai_provider::AccountChoice::Picked);
 
     // Resolve managed state up-front so a missing dependency fails loud before
