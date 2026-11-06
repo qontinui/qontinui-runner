@@ -1,6 +1,7 @@
 use crate::settings::{self, AccountSelectionMode};
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
@@ -381,6 +382,14 @@ pub(crate) fn refresh_cooled_pick<P: FnOnce() -> Option<String>>(
     match caller {
         None => Err(pick),
         Some(AccountChoice::Picked(dir)) if is_account_cooled_down(&dir) => match pick() {
+            Some(fresh) if fresh == dir => {
+                warn!(
+                    "Carried account pick '{}' is cooled down (rate-limited); \
+                     re-pick returned the same cooled account",
+                    short_label(&dir)
+                );
+                Ok(Some(AccountChoice::Picked(fresh)))
+            }
             Some(fresh) => {
                 info!(
                     "Carried account pick '{}' is cooled down (rate-limited); \
@@ -832,6 +841,19 @@ fn rotate_within(limited: Option<&str>, config_dirs: &[String]) -> Option<String
     if config_dirs.len() < 2 {
         return None;
     }
+
+    // The limited dir may be spelled differently from its roster entry (the
+    // ambient `C:\Users\x\.claude` against a roster `C:/Users/x/.claude`).
+    // Exclusion and the cooldown key are exact strings, and `pick_best_account`
+    // reads cooldowns by roster entry — so name the limited account by its
+    // roster spelling, or rotation could hand back the limited account itself
+    // and cool a key nothing reads.
+    let limited = limited.map(|l| {
+        config_dirs
+            .iter()
+            .find(|d| crate::terminal::transcript::same_dir(Path::new(d), Path::new(l)))
+            .map_or(l, String::as_str)
+    });
 
     let default_cooldown = Duration::from_secs(RATE_LIMIT_COOLDOWN_SECS);
 
@@ -1706,6 +1728,36 @@ mod tests {
         assert_eq!(rotated, Some(sibling.clone()));
         assert_eq!(get_resolved_config_dir(), Some(sibling.clone()));
         clear_dir(&limited);
+        clear_dir(&sibling);
+    }
+
+    /// **A limited dir spelled differently from its roster entry is that
+    /// entry.** The ambient `C:\Users\x\.claude` names the roster's
+    /// `C:/Users/x/.claude`: rotation must not hand it back, and must cool it
+    /// under the roster's spelling — the key `pick_best_account` reads.
+    #[test]
+    fn rotation_maps_a_respelled_limited_dir_onto_its_roster_entry() {
+        let _fleet = crate::mcp::fleet_policy_poller::pin_account_selection_for_test(None);
+        let _restore = ResolvedConfigDirRestore::capture();
+        let roster_spelling = "C:/qontinui-test/rotate-respelled/.claude".to_string();
+        let ambient_spelling = r"C:\qontinui-test\rotate-respelled\.claude".to_string();
+        let sibling = "C:/qontinui-test/rotate-respelled/.claude-sibling".to_string();
+        clear_dir(&roster_spelling);
+        clear_dir(&ambient_spelling);
+        clear_dir(&sibling);
+
+        let rotated = rotate_within(
+            Some(&ambient_spelling),
+            &[roster_spelling.clone(), sibling.clone()],
+        );
+
+        assert_eq!(rotated, Some(sibling.clone()), "never back to the limited account");
+        assert!(
+            is_account_cooled_down(&roster_spelling),
+            "the cooldown lands under the roster's spelling"
+        );
+        clear_dir(&roster_spelling);
+        clear_dir(&ambient_spelling);
         clear_dir(&sibling);
     }
 
