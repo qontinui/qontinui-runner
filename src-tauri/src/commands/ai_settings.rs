@@ -2931,9 +2931,16 @@ mod save_selection_mode_tests {
 
 #[cfg(test)]
 mod usage_report_scope_tests {
+    // Every test here that writes the machine-global roster is `cfg(unix)`.
+    // Windows resolves the known folders once per process and ignores a later
+    // `USERPROFILE`, so a roster write lands in an earlier fixture's temp dir
+    // (measured on CI: two different `.tmp*` dirs) — the reason
+    // `subject_isolation_harness` cannot write on Windows either. Their
+    // helpers are dead code there, not wrong.
+    #![cfg_attr(windows, allow(dead_code, unused_imports))]
     use super::{
-        plan_usage_refresh, refresh_account_usage_snapshot, refresh_fleet_usage_report,
-        AccountUsageInfo, UsageRefreshCaller, UsageRefreshPlan, USAGE_PROBE_CACHE,
+        refresh_account_usage_snapshot, refresh_fleet_usage_report, AccountUsageInfo,
+        USAGE_PROBE_CACHE,
     };
     use crate::settings::AccountSelectionMode;
     use crate::test_env::{EnvVarRestore, IsolatedAmbient};
@@ -3032,11 +3039,10 @@ mod usage_report_scope_tests {
     }
 
     /// Assert `path` lies under `root`, comparing the two as the filesystem
-    /// resolves them rather than as spelled: on Windows the same temp dir can
-    /// be spelled with the 8.3 short user dir (`RUNNER~1`) on one side and the
-    /// long one on the other. `path` may not exist yet, so its nearest existing
-    /// ancestor is resolved and the rest re-joined lexically. Nothing is
-    /// created, so a path that did escape is not touched.
+    /// resolves them rather than as spelled (macOS spells its temp dir through
+    /// the `/var` -> `/private/var` link). `path` may not exist yet, so its
+    /// nearest existing ancestor is resolved and the rest re-joined lexically.
+    /// Nothing is created, so a path that did escape is not touched.
     fn assert_inside(path: &std::path::Path, root: &std::path::Path, what: &str) {
         let root = std::fs::canonicalize(root).expect("canonicalize the fixture root");
         let mut existing = path;
@@ -3113,45 +3119,57 @@ mod usage_report_scope_tests {
         dir
     }
 
-    fn plan(probe_configured: bool, probe_spent: bool, record_snapshot: bool) -> UsageRefreshPlan {
-        UsageRefreshPlan {
-            probe_configured,
-            probe_spent,
-            record_snapshot,
-        }
-    }
+    /// The planner's table. Kept in its own module so the imports of the
+    /// planner (which this change adds) do not stop the report tests below
+    /// from building against a tree without it.
+    mod plan_tests {
+        use super::super::{plan_usage_refresh, UsageRefreshCaller, UsageRefreshPlan};
 
-    /// The picker path (startup, account migration) is unchanged by the fleet
-    /// report: it probes and records only from two configured accounts up, so
-    /// a single-account runner pays no probe in front of its first pick.
-    #[test]
-    fn the_selection_path_needs_two_accounts() {
-        let c = UsageRefreshCaller::SelectionSnapshot;
-        for lone in [true, false] {
-            assert_eq!(plan_usage_refresh(0, c, lone), plan(false, false, false));
-            assert_eq!(plan_usage_refresh(1, c, lone), plan(false, false, false));
-            assert_eq!(plan_usage_refresh(2, c, lone), plan(true, false, true));
+        fn plan(
+            probe_configured: bool,
+            probe_spent: bool,
+            record_snapshot: bool,
+        ) -> UsageRefreshPlan {
+            UsageRefreshPlan {
+                probe_configured,
+                probe_spent,
+                record_snapshot,
+            }
         }
-    }
 
-    /// The fleet report covers a runner with fewer than two accounts by
-    /// probing the account it spends, only when it reports lone accounts; from
-    /// two up it is the roster, exactly as the picker sees it.
-    #[test]
-    fn the_fleet_report_covers_single_and_unlisted_accounts() {
-        let c = UsageRefreshCaller::FleetReport;
-        assert_eq!(plan_usage_refresh(0, c, true), plan(false, true, false));
-        assert_eq!(plan_usage_refresh(1, c, true), plan(false, true, false));
-        assert_eq!(plan_usage_refresh(3, c, true), plan(true, false, true));
-        assert_eq!(plan_usage_refresh(0, c, false), plan(false, false, false));
-        assert_eq!(plan_usage_refresh(1, c, false), plan(false, false, false));
-        assert_eq!(plan_usage_refresh(3, c, false), plan(true, false, true));
+        /// The picker path (startup, account migration) is unchanged by the fleet
+        /// report: it probes and records only from two configured accounts up, so
+        /// a single-account runner pays no probe in front of its first pick.
+        #[test]
+        fn the_selection_path_needs_two_accounts() {
+            let c = UsageRefreshCaller::SelectionSnapshot;
+            for lone in [true, false] {
+                assert_eq!(plan_usage_refresh(0, c, lone), plan(false, false, false));
+                assert_eq!(plan_usage_refresh(1, c, lone), plan(false, false, false));
+                assert_eq!(plan_usage_refresh(2, c, lone), plan(true, false, true));
+            }
+        }
+
+        /// The fleet report covers a runner with fewer than two accounts by
+        /// probing the account it spends, only when it reports lone accounts; from
+        /// two up it is the roster, exactly as the picker sees it.
+        #[test]
+        fn the_fleet_report_covers_single_and_unlisted_accounts() {
+            let c = UsageRefreshCaller::FleetReport;
+            assert_eq!(plan_usage_refresh(0, c, true), plan(false, true, false));
+            assert_eq!(plan_usage_refresh(1, c, true), plan(false, true, false));
+            assert_eq!(plan_usage_refresh(3, c, true), plan(true, false, true));
+            assert_eq!(plan_usage_refresh(0, c, false), plan(false, false, false));
+            assert_eq!(plan_usage_refresh(1, c, false), plan(false, false, false));
+            assert_eq!(plan_usage_refresh(3, c, false), plan(true, false, true));
+        }
     }
 
     /// The population this phase exists for, entered where the 10-minute timer
     /// enters: a one-account runner's account reaches coord, marked in use, and
     /// the provider's status rides along. The picker path over the same roster
     /// stays silent, because that guard is the picker's.
+    #[cfg(unix)]
     #[tokio::test]
     async fn the_fleet_report_sends_a_single_configured_account_to_coord() {
         let amb = crate::test_env::isolated_ambient();
@@ -3186,6 +3204,7 @@ mod usage_report_scope_tests {
 
     /// A one-entry roster is not the account in use when `Manual` mode pins a
     /// different `config_dir`: spawns run on the pin, so the pin is reported.
+    #[cfg(unix)]
     #[tokio::test]
     async fn the_fleet_report_sends_the_pinned_account_not_the_lone_roster_entry() {
         let amb = crate::test_env::isolated_ambient();
@@ -3210,6 +3229,7 @@ mod usage_report_scope_tests {
     /// an inherited `CLAUDE_CONFIG_DIR` is the account in use, ahead of
     /// `~/.claude`. Its label is the dir's real name even when the path ends
     /// in `..`.
+    #[cfg(unix)]
     #[tokio::test]
     async fn the_fleet_report_sends_an_inherited_claude_config_dir_to_coord() {
         let amb = crate::test_env::isolated_ambient();
@@ -3235,6 +3255,7 @@ mod usage_report_scope_tests {
     /// primary's written twice. A subject reports the pin in the roster under
     /// its own instance root, and never its inherited `CLAUDE_CONFIG_DIR`,
     /// which is the harness's account.
+    #[cfg(unix)]
     #[tokio::test]
     async fn only_a_subject_secondary_reports_its_own_pinned_lone_account() {
         let amb = crate::test_env::isolated_ambient();
@@ -3286,6 +3307,7 @@ mod usage_report_scope_tests {
     /// A nameless secondary that only its ports give away (a primary to proxy
     /// to, or a non-default API port) is not the primary, so it does not
     /// report the inherited account the primary already reports.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_nameless_secondary_reports_no_lone_account() {
         let amb = crate::test_env::isolated_ambient();
@@ -3336,6 +3358,7 @@ mod usage_report_scope_tests {
 
     /// An isolated runner has nobody to report to, so a lone account is not
     /// probed: below two accounts the probe's only consumer is the report.
+    #[cfg(unix)]
     #[tokio::test]
     async fn an_isolated_runner_does_not_probe_a_lone_account() {
         let amb = crate::test_env::isolated_ambient();
@@ -3350,6 +3373,7 @@ mod usage_report_scope_tests {
 
     /// The kill switch silences a connected runner's report, and so its
     /// lone-account probe too.
+    #[cfg(unix)]
     #[tokio::test]
     async fn the_kill_switch_stops_the_lone_account_report() {
         let amb = crate::test_env::isolated_ambient();
