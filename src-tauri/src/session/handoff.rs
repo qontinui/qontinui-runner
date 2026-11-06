@@ -126,6 +126,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
 
+use super::coord_sync::drain_body;
 use super::intent::Intent;
 use super::provider_adapter::RestoreTier;
 use super::restore_record_emitter::{RESTORE_RECORD_EVENT, TIER_FULL, TIER_TERMINAL_ONLY};
@@ -336,6 +337,7 @@ pub async fn trigger_handoff(
             body.chars().take(500).collect(),
         ));
     }
+    drain_body(resp).await;
     Ok(())
 }
 
@@ -1190,9 +1192,12 @@ async fn fetch_latest_restore_record(
             session = %session_id,
             "session handoff: restore-record fetch rejected — proceeding without registry record"
         );
+        drain_body(resp).await;
         return None;
     }
 
+    // Deliberately NOT drained: the live-tail SSE never ends, so a drain would block to the
+    // deadline; dropping it resets the h2 stream instead.
     let mut resp = resp;
     let mut buf = String::new();
     let deadline = tokio::time::Instant::now() + RESTORE_RECORD_FETCH_DEADLINE;
@@ -1512,6 +1517,7 @@ pub(super) async fn reacquire_claim(
             text.chars().take(200).collect(),
         ));
     }
+    drain_body(resp).await;
     Ok(())
 }
 
@@ -1539,6 +1545,7 @@ async fn close_source(
             text.chars().take(200).collect(),
         ));
     }
+    drain_body(resp).await;
     Ok(())
 }
 
@@ -2227,5 +2234,71 @@ mod tests {
         assert!(!super::resumed_after_drain(true, true));
         assert!(!super::resumed_after_drain(true, false));
         assert!(!super::resumed_after_drain(false, false));
+    }
+}
+
+/// Every handoff response path on the shared coord client reads its body to
+/// the end (lifecycle plan Phase 85). `trigger_handoff` is the send for both
+/// `commands::session::session_handoff` and the context watcher.
+#[cfg(test)]
+mod drain_tests {
+    use super::*;
+    use crate::session::drain_probe::DrainProbe;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn trigger_handoff_2xx_reads_the_body() {
+        let _amb = crate::test_env::isolated_ambient();
+        let probe = DrainProbe::spawn(200).await;
+        let http = reqwest::Client::new();
+        trigger_handoff(
+            &http,
+            &probe.base,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            TenantScope::Unresolved,
+        )
+        .await
+        .unwrap();
+        probe.assert_all_drained().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reacquire_claim_2xx_reads_the_body() {
+        let _amb = crate::test_env::isolated_ambient();
+        let probe = DrainProbe::spawn(200).await;
+        let claim = HeldClaim {
+            kind: "file".into(),
+            resource_key: "k".into(),
+        };
+        reacquire_claim(
+            &reqwest::Client::new(),
+            &probe.base,
+            &claim,
+            Uuid::new_v4(),
+            TenantScope::Unresolved,
+        )
+        .await
+        .unwrap();
+        probe.assert_all_drained().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_source_2xx_reads_the_body() {
+        let _amb = crate::test_env::isolated_ambient();
+        let probe = DrainProbe::spawn(200).await;
+        close_source(&reqwest::Client::new(), &probe.base, Uuid::new_v4())
+            .await
+            .unwrap();
+        probe.assert_all_drained().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restore_record_fetch_rejection_reads_the_body() {
+        let _amb = crate::test_env::isolated_ambient();
+        let probe = DrainProbe::spawn(500).await;
+        let got =
+            fetch_latest_restore_record(&reqwest::Client::new(), &probe.base, Uuid::new_v4()).await;
+        assert!(got.is_none());
+        probe.assert_all_drained().await;
     }
 }

@@ -74,6 +74,7 @@ use uuid::Uuid;
 
 use crate::auth::TenantScope;
 
+use super::coord_sync::drain_body;
 use super::coord_sync::CoordSync;
 
 /// Flush the coalescing buffer at least this often, even if it hasn't hit
@@ -288,6 +289,7 @@ async fn flush(
                 // transient failure re-sends the same offset (idempotent
                 // on coord). On success, the bytes are durably in warm.
                 *next_offset += len;
+                drain_body(resp).await;
             } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
                 let reason = refusal_log_reason(&resp.text().await.unwrap_or_default());
                 tracing::info!(
@@ -299,6 +301,7 @@ async fn flush(
                 // resend; the bytes are gone for the shared tail). Clearing
                 // below handles it.
             } else {
+                drain_body(resp).await;
                 tracing::debug!(
                     session = %session_id,
                     %status,
@@ -409,5 +412,35 @@ pub(crate) mod egress_tests {
         let _amb = crate::test_env::isolated_ambient();
         let (connects, _) = flush_once(Level::On).await;
         assert!(connects >= 1, "with the switch on the chunk is posted");
+    }
+}
+
+/// `flush` reads coord's answer to the end on every status (lifecycle plan
+/// Phase 85) — fails if either drain in `flush` is removed.
+#[cfg(test)]
+mod drain_tests {
+    use super::*;
+    use crate::session::drain_probe::DrainProbe;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn flush_reads_the_body_on_2xx_and_on_rejection() {
+        let _amb = crate::test_env::isolated_ambient();
+        for status in [200, 500] {
+            let probe = DrainProbe::spawn(status).await;
+            let http = reqwest::Client::new();
+            let url = format!("{}/sessions/{}/output", probe.base, Uuid::new_v4());
+            let mut buffer = b"hello".to_vec();
+            let mut offset = 0;
+            flush(
+                &http,
+                &url,
+                Uuid::new_v4(),
+                &mut buffer,
+                &mut offset,
+                TenantScope::Unresolved,
+            )
+            .await;
+            probe.assert_all_drained().await;
+        }
     }
 }
