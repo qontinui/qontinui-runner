@@ -5750,6 +5750,18 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_check_install_safety",
     "coord_check_publish_safety",
     "coord_check_repo_name",
+    // Plan 2026-11-05-agent-github-reads-go-through-coord-not-the-shared-user-token
+    // Phases 2b/2c (qontinui-coord#3824, #3825): a run's jobs and a failed
+    // job's bounded log tail, read through coord's GitHub App installation
+    // instead of `gh run view` / `gh api` under the shared user token. Both are
+    // reads, forwarded AHEAD of coord serving them: both coord PRs were open
+    // on 2026-11-06, and until they land coord answers either name as an
+    // unknown tool (harmless, per the note above). Once landed, coord's
+    // `agent_tool_access::DEVICE_DEFAULT_TOOLS` is the grant authority and this
+    // list only forwards. No `coord_query_` prefix covers them, so without
+    // these entries a runner-proxied session is refused them.
+    "coord_ci_job_log_tail",
+    "coord_ci_run_jobs",
     "coord_citations_reenrich",
     "coord_claim_acquire",
     "coord_claim_check",
@@ -18666,6 +18678,32 @@ mod coord_mcp_body_gate_tests {
             assert!(
                 coord_mcp_withholding_is_deliberate(tool),
                 "{tool} must be recorded as a deliberate exclusion, not drift"
+            );
+        }
+    }
+
+    /// The two CI reads that replace `gh run view` / `gh api` under the shared
+    /// user token (plan
+    /// 2026-11-05-agent-github-reads-go-through-coord-not-the-shared-user-token
+    /// Phases 2b/2c) must be forwarded — no `coord_query_` prefix covers them,
+    /// so a missing entry answers a runner-proxied session METHOD_NOT_ALLOWED
+    /// and pushes it back onto the shared token. A literal enumeration, so
+    /// dropping either name reds this test by name.
+    #[test]
+    fn ci_run_jobs_and_job_log_tail_are_forwarded() {
+        for tool in ["coord_ci_run_jobs", "coord_ci_job_log_tail"] {
+            assert!(coord_mcp_tool_is_allowed(tool), "{tool} must be forwarded");
+            assert!(
+                !coord_mcp_withholding_is_deliberate(tool),
+                "{tool} must not be both allowed and listed as a deliberate exclusion"
+            );
+            assert!(
+                gate(serde_json::json!({
+                    "jsonrpc":"2.0","id":1,"method":"tools/call",
+                    "params":{"name":tool,"arguments":{}}
+                }))
+                .is_ok(),
+                "{tool} must be callable through the proxy"
             );
         }
     }
