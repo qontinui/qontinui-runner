@@ -6079,10 +6079,14 @@ async fn handle_terminal_attach(api_state: &Arc<ApiState>, data: &Value) -> Opti
     };
 
     // Parse → lookup (source device cross-checked) → resolve → bind, all in
-    // the pure seam so each refusal is unit-tested; `Err` is the frame.
+    // the pure seam so each refusal is unit-tested; `Err` is the frame. The
+    // bind runs under the remote-create reaper's lock and marks the terminal
+    // attached there, atomically against a create grant's close admission.
+    let reaper = crate::mcp::remote_create_reaper::reaper();
     let gate = || {
         admit_terminal_attach(
             grants(),
+            &reaper,
             crate::settings::get_remote_attach_preference,
             data,
             now_epoch_secs(),
@@ -6166,8 +6170,8 @@ async fn handle_terminal_attach(api_state: &Arc<ApiState>, data: &Value) -> Opti
         }
     };
 
-    // Bound: this terminal is owned, so the attach-deadline reaper spares it.
-    crate::mcp::remote_create_reaper::mark_attached(&terminal_id);
+    // Bound, and already marked ever-attached by the bind above: the
+    // attach-deadline reaper spares it and its create grant can no longer close it.
 
     // A fresh binding starts with an open gate: a stale pause from an earlier
     // attachment under the same grant must not silence the new one. (Phase 5.)
@@ -6385,12 +6389,14 @@ async fn end_under_create_grant(
         admit_create_grant_end, create_grants, grants, now_epoch_secs, terminal_ended_frame,
         EndOutcome, EndVerdict,
     };
+    // Admission MARKS the terminal closing under the reaper's lock, so from
+    // here no attach can bind it before the close below (review finding 1).
     let (block, terminal_id) = match admit_create_grant_end(
         grants(),
         create_grants(),
+        &crate::mcp::remote_create_reaper::reaper(),
         crate::settings::get_remote_create_preference,
         qontinui_runner_lib::pair::read_paired_user_id_from_disk,
-        crate::mcp::remote_create_reaper::was_ever_attached,
         data,
         now_epoch_secs(),
     ) {
@@ -6413,6 +6419,15 @@ async fn end_under_create_grant(
         "remote end: admitted under a create grant — closing the terminal it spawned"
     );
     let verdict = end_admitted_terminal(tm, &terminal_id, force).await;
+    // A definite "not closed" withdraws the closing mark, so the terminal is
+    // attachable again exactly as before the admission. Two answers keep it:
+    // `unknown` (the close may have landed, and refusing an attach to a terminal
+    // that may be dying is the safe side; the attach-deadline reaper still
+    // backstops it), and `end_already_running` (another admitted end is still
+    // driving this terminal and relies on the mark).
+    if create_close_definitely_failed(&verdict) {
+        crate::mcp::remote_create_reaper::release_create_close(&terminal_id);
+    }
     info!(
         grant_jti = %block.grant_jti,
         terminal_id = %terminal_id,
@@ -6422,6 +6437,22 @@ async fn end_under_create_grant(
         "remote end: answered"
     );
     terminal_ended_frame(data, None, Some(&terminal_id), &verdict)
+}
+
+/// Did a create-grant close's end definitively leave the terminal running, so
+/// its closing mark should be withdrawn? `still_running`, and `refused` for any
+/// reason but [`END_ALREADY_RUNNING`](crate::mcp::remote_terminal::END_ALREADY_RUNNING)
+/// — that one means a concurrent end owns the terminal and still needs the mark.
+fn create_close_definitely_failed(verdict: &crate::mcp::remote_terminal::EndVerdict) -> bool {
+    use crate::mcp::remote_terminal::{EndOutcome, END_ALREADY_RUNNING};
+    match verdict.outcome {
+        EndOutcome::StillRunning => true,
+        EndOutcome::Refused => !verdict
+            .reason
+            .as_deref()
+            .is_some_and(|r| r.starts_with(END_ALREADY_RUNNING)),
+        EndOutcome::Ended | EndOutcome::NotFound | EndOutcome::Unknown => false,
+    }
 }
 
 /// TARGET role: end one ADMITTED remote end's terminal on `tm`. This is
@@ -9154,10 +9185,11 @@ mod remote_admission_tests {
         let admit = create
             .find("admit_create_grant_end(")
             .expect("the create arm must admit through admit_create_grant_end");
-        // Retention guard: dropping the reaper read turns the refusal off.
+        // Retention guard: dropping the reaper turns the refusal and the
+        // closing mark off.
         assert!(
-            create.contains("remote_create_reaper::was_ever_attached"),
-            "the ever-attached refusal must read the reaper"
+            create.contains("&crate::mcp::remote_create_reaper::reaper(),"),
+            "the ever-attached refusal must claim through the reaper"
         );
         let driver = create
             .find("end_admitted_terminal(")

@@ -38,6 +38,7 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use crate::mcp::remote_create_reaper::{ClosingUnderCreateGrant, RemoteCreateReaper};
 use crate::settings::{AcceptRemoteAttach, AcceptRemoteCreate};
 use crate::terminal::remote_pane_io::{AttachedRing, RemoteFrameSink, RemotePaneIo};
 
@@ -74,6 +75,10 @@ pub enum AttachRefusal {
     /// The tenant's `egress_terminal_stream` switch is off (plan
     /// 2026-10-10-spec-front-end-phase-9-generic-boundary, Phase 7).
     EgressOff,
+    /// The terminal's own create grant has been admitted to close it
+    /// ([`admit_create_grant_end`]); binding an attach now would hand the
+    /// source a terminal that is about to be killed.
+    TerminalClosing,
 }
 
 impl AttachRefusal {
@@ -81,13 +86,14 @@ impl AttachRefusal {
     /// here too — `admit_terminal_attach`'s frame-shape invariant test walks
     /// this list, and the exhaustive match it drives each variant through
     /// will not compile until the new one is handled.
-    pub const ALL: [AttachRefusal; 6] = [
+    pub const ALL: [AttachRefusal; 7] = [
         AttachRefusal::GrantUnknown,
         AttachRefusal::GrantExpired,
         AttachRefusal::TerminalMismatch,
         AttachRefusal::Disabled,
         AttachRefusal::SessionNotLocal,
         AttachRefusal::EgressOff,
+        AttachRefusal::TerminalClosing,
     ];
 
     pub fn code(self) -> &'static str {
@@ -98,6 +104,7 @@ impl AttachRefusal {
             AttachRefusal::Disabled => "remote_attach_disabled",
             AttachRefusal::SessionNotLocal => "session_not_local",
             AttachRefusal::EgressOff => "egress_off",
+            AttachRefusal::TerminalClosing => "attach_terminal_closing",
         }
     }
 
@@ -111,6 +118,9 @@ impl AttachRefusal {
             AttachRefusal::Disabled => "this device does not accept remote attach",
             AttachRefusal::SessionNotLocal => "no local terminal hosts that coord session",
             AttachRefusal::EgressOff => "Terminal streaming is off for this project",
+            AttachRefusal::TerminalClosing => {
+                "the terminal is being closed by the create grant that spawned it"
+            }
         }
     }
 }
@@ -288,6 +298,16 @@ impl RemoteAttachGrants {
             .unwrap_or(false)
     }
 
+    /// [`Self::contains`] that FAILS CLOSED: `Err` when the table cannot be read
+    /// (a poisoned lock), instead of answering "not an attach grant". For
+    /// [`admit_create_grant_end`] only, which must refuse rather than guess.
+    pub fn try_contains(&self, grant_jti: &str) -> Result<bool, ()> {
+        self.inner
+            .lock()
+            .map(|map| map.contains_key(grant_jti))
+            .map_err(|_| ())
+    }
+
     /// Clear a grant's terminal binding, keeping the row until it expires.
     /// This is what `terminal_detach` does rather than [`Self::remove`]: the
     /// backend tears the attachment down on every SOURCE socket drop — a
@@ -345,6 +365,30 @@ impl RemoteAttachGrants {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Is any unexpired grant bound to `terminal_id`? [`Self::grants_bound_to`]
+    /// that FAILS CLOSED: `Err` when the table cannot be read, rather than the
+    /// empty answer that would read as "not bound". For
+    /// [`admit_create_grant_end`] only.
+    pub fn try_any_bound_to(&self, terminal_id: &str, now: u64) -> Result<bool, ()> {
+        self.inner
+            .lock()
+            .map(|map| {
+                map.values()
+                    .any(|g| g.expires_at > now && g.terminal_id.as_deref() == Some(terminal_id))
+            })
+            .map_err(|_| ())
+    }
+
+    /// Poison this table's lock — what a panic while holding it does. Tests
+    /// only: the fail-closed reads above need a way to meet a poisoned lock.
+    #[cfg(test)]
+    pub fn poison_for_test(&self) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = self.inner.lock();
+            panic!("poisoning the attach-grant table for a test");
+        }));
     }
 
     pub fn len(&self) -> usize {
@@ -1163,8 +1207,14 @@ where
 /// through `resolve_terminal`, and binds the grant to it. `Ok` carries the
 /// block, the grant, and whatever the resolver returned for the terminal;
 /// `Err` is the exact frame to send back.
+///
+/// The bind goes through `reaper` ([`RemoteCreateReaper::bind_attach`]), which
+/// binds and marks the terminal ever-attached under the lock a create grant's
+/// close admission takes. A terminal whose create grant was already admitted to
+/// close it is refused `attach_terminal_closing` and nothing is bound.
 pub fn admit_terminal_attach<T, P, R>(
     grants: &RemoteAttachGrants,
+    reaper: &RemoteCreateReaper,
     preference: P,
     data: &Value,
     now: u64,
@@ -1212,13 +1262,32 @@ where
         return Err(refusal_frame(AttachRefusal::EgressOff, data, None));
     }
 
-    // Bind at first use; a re-attach must land on the same terminal.
-    if !grants.bind(&block.grant_jti, &terminal_id) {
-        return Err(refusal_frame(
-            AttachRefusal::TerminalMismatch,
-            data,
-            Some(&terminal_id),
-        ));
+    // Bind at first use; a re-attach must land on the same terminal. Atomic
+    // with the reaper's ever-attached mark and against a create grant's close.
+    match reaper.bind_attach(&terminal_id, tokio::time::Instant::now(), || {
+        grants.bind(&block.grant_jti, &terminal_id)
+    }) {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(refusal_frame(
+                AttachRefusal::TerminalMismatch,
+                data,
+                Some(&terminal_id),
+            ))
+        }
+        Err(ClosingUnderCreateGrant) => {
+            warn!(
+                grant_jti = %block.grant_jti,
+                terminal_id = %terminal_id,
+                "remote attach: refused — the terminal's create grant was already admitted to \
+                 close it"
+            );
+            return Err(refusal_frame(
+                AttachRefusal::TerminalClosing,
+                data,
+                Some(&terminal_id),
+            ));
+        }
     }
     Ok((block, grant, terminal_id, terminal))
 }
@@ -1349,27 +1418,34 @@ where
 ///   terminal all answer `remote_create_grant_unknown`, the same answer as
 ///   [`RemoteCreateGrants::lookup`], so a wrong-source frame learns nothing about the jti;
 /// - a terminal anyone has EVER attached to is refused: it belongs to whoever
-///   attached, and a create grant is not an attach grant. `ever_attached` is
-///   the reaper's fail-closed read (no row reads as attached). The attach table
-///   is consulted too because `handle_terminal_attach` binds a grant before it
-///   marks the reaper, and this runs off the read loop, between the two.
+///   attached, and a create grant is not an attach grant. The check is
+///   [`RemoteCreateReaper::claim_create_close`]: the reaper's fail-closed
+///   ever-attached read (no row reads as attached) plus a live attach-table
+///   read, and on admission it MARKS the terminal closing, all under the
+///   reaper's lock. `admit_terminal_attach` binds under that same lock and
+///   refuses a closing terminal `attach_terminal_closing`, so an attach can
+///   never bind between this admission and the close that follows it — the
+///   loser of that race is refused cleanly whichever side it is;
+/// - an attach table that cannot be read (a poisoned lock) refuses: neither
+///   "not an attach jti" nor "not bound" can then be proven.
 ///
-/// Refusals touch nothing. An admission binds and consumes nothing, so a retry
-/// after an `unknown` reply is admitted again and answered `not_found` if the
-/// terminal has gone.
-pub fn admit_create_grant_end<P, U, E>(
+/// Refusals touch nothing. An admission binds and consumes nothing — its one
+/// effect is the closing mark, which is idempotent — so a retry after an
+/// `unknown` reply is admitted again and answered `not_found` if the terminal
+/// has gone. The caller withdraws the mark (`release_create_close`) when the
+/// end definitively did not close the terminal.
+pub fn admit_create_grant_end<P, U>(
     attach_grants: &RemoteAttachGrants,
     create_grants: &RemoteCreateGrants,
+    reaper: &RemoteCreateReaper,
     preference: P,
     local_user_id: U,
-    ever_attached: E,
     data: &Value,
     now: u64,
 ) -> Result<(RemoteBlock, String), Value>
 where
     P: FnOnce() -> AcceptRemoteCreate,
     U: FnOnce() -> Option<String>,
-    E: FnOnce(&str) -> bool,
 {
     let refuse = |refusal: CreateRefusal| {
         warn!(
@@ -1390,8 +1466,11 @@ where
     if preference == AcceptRemoteCreate::Off {
         return Err(refuse(CreateRefusal::Disabled));
     }
-    if attach_grants.contains(&block.grant_jti) {
-        return Err(refuse(CreateRefusal::GrantRequired));
+    match attach_grants.try_contains(&block.grant_jti) {
+        Ok(false) => {}
+        Ok(true) => return Err(refuse(CreateRefusal::GrantRequired)),
+        // Unreadable: whether this jti is an attach grant cannot be proven.
+        Err(()) => return Err(refuse(CreateRefusal::GrantUnknown)),
     }
     let tombstone = create_grants
         .spent_for_close(&block.grant_jti, block.source_device_id.as_deref(), now)
@@ -1415,7 +1494,9 @@ where
     {
         return Err(refuse(CreateRefusal::CloseTerminalMismatch));
     }
-    if ever_attached(&terminal_id) || !attach_grants.grants_bound_to(&terminal_id, now).is_empty() {
+    if !reaper.claim_create_close(&terminal_id, || {
+        attach_grants.try_any_bound_to(&terminal_id, now)
+    }) {
         return Err(refuse(CreateRefusal::CloseAttached));
     }
     Ok((block, terminal_id))
@@ -2885,6 +2966,8 @@ const FATAL_REMOTE_ERROR_CODES: &[&str] = &[
     "session_not_local",
     "remote_attach_disabled",
     "listener_lost",
+    // The target's create grant is closing the terminal: it will not come back.
+    "attach_terminal_closing",
 ];
 
 fn is_fatal_remote_error(code: &str) -> bool {
@@ -5267,6 +5350,7 @@ mod tests {
         // No remote block.
         let err = admit_terminal_attach(
             &table,
+            &RemoteCreateReaper::default(),
             || AcceptRemoteAttach::Tenant,
             &attach_frame(None),
             NOW,
@@ -5280,6 +5364,7 @@ mod tests {
         // Unknown grant.
         let err = admit_terminal_attach(
             &table,
+            &RemoteCreateReaper::default(),
             || AcceptRemoteAttach::Tenant,
             &attach_frame(Some(json!({"grant_jti": "ghost"}))),
             NOW,
@@ -5291,6 +5376,7 @@ mod tests {
         // Wrong source device: unknown, and the grant stays unbound.
         let err = admit_terminal_attach(
             &table,
+            &RemoteCreateReaper::default(),
             || AcceptRemoteAttach::Tenant,
             &attach_frame(Some(
                 json!({"grant_jti": "j1", "source_device_id": "intruder"}),
@@ -5305,6 +5391,7 @@ mod tests {
         // No local terminal hosts the session.
         let err = admit_terminal_attach(
             &table,
+            &RemoteCreateReaper::default(),
             || AcceptRemoteAttach::Tenant,
             &attach_frame(Some(
                 json!({"grant_jti": "j1", "source_device_id": "src-device"}),
@@ -5321,6 +5408,7 @@ mod tests {
         // Success binds to the resolved terminal.
         let (block, admitted, terminal_id, ()) = admit_terminal_attach(
             &table,
+            &RemoteCreateReaper::default(),
             || AcceptRemoteAttach::Tenant,
             &attach_frame(Some(
                 json!({"grant_jti": "j1", "source_device_id": "src-device"}),
@@ -5337,6 +5425,7 @@ mod tests {
         // Re-attach resolving to another terminal: bind mismatch.
         let err = admit_terminal_attach(
             &table,
+            &RemoteCreateReaper::default(),
             || AcceptRemoteAttach::Tenant,
             &attach_frame(Some(json!({"grant_jti": "j1"}))),
             NOW,
@@ -5348,6 +5437,7 @@ mod tests {
         // Same terminal is idempotent.
         assert!(admit_terminal_attach(
             &table,
+            &RemoteCreateReaper::default(),
             || AcceptRemoteAttach::Tenant,
             &attach_frame(Some(json!({"grant_jti": "j1"}))),
             NOW,
@@ -5357,6 +5447,7 @@ mod tests {
         // Preference off refuses before anything else.
         let err = admit_terminal_attach(
             &table,
+            &RemoteCreateReaper::default(),
             || AcceptRemoteAttach::Off,
             &attach_frame(Some(json!({"grant_jti": "j1"}))),
             NOW,
@@ -5397,6 +5488,7 @@ mod tests {
             match refusal {
                 AttachRefusal::GrantUnknown => admit_terminal_attach(
                     &table,
+                    &RemoteCreateReaper::default(),
                     || AcceptRemoteAttach::Tenant,
                     &attach_frame(Some(json!({"grant_jti": "ghost"}))),
                     NOW,
@@ -5406,6 +5498,7 @@ mod tests {
                     table.insert(grant("j-exp", None, NOW + 600), NOW);
                     admit_terminal_attach(
                         &table,
+                        &RemoteCreateReaper::default(),
                         || AcceptRemoteAttach::Tenant,
                         &attach_frame(Some(json!({"grant_jti": "j-exp"}))),
                         NOW + 601,
@@ -5416,6 +5509,7 @@ mod tests {
                     table.insert(grant("j-bound", Some("term-A"), NOW + 600), NOW);
                     admit_terminal_attach(
                         &table,
+                        &RemoteCreateReaper::default(),
                         || AcceptRemoteAttach::Tenant,
                         &attach_frame(Some(json!({"grant_jti": "j-bound"}))),
                         NOW,
@@ -5426,6 +5520,7 @@ mod tests {
                     table.insert(grant("j-off", None, NOW + 600), NOW);
                     admit_terminal_attach(
                         &table,
+                        &RemoteCreateReaper::default(),
                         || AcceptRemoteAttach::Off,
                         &attach_frame(Some(json!({"grant_jti": "j-off"}))),
                         NOW,
@@ -5436,10 +5531,25 @@ mod tests {
                     table.insert(grant("j-nolocal", None, NOW + 600), NOW);
                     admit_terminal_attach(
                         &table,
+                        &RemoteCreateReaper::default(),
                         || AcceptRemoteAttach::Tenant,
                         &attach_frame(Some(json!({"grant_jti": "j-nolocal"}))),
                         NOW,
                         none,
+                    )
+                }
+                AttachRefusal::TerminalClosing => {
+                    table.insert(grant("j-closing", None, NOW + 600), NOW);
+                    let reaper = RemoteCreateReaper::default();
+                    reaper.arm("term-A", None, tokio::time::Instant::now());
+                    assert!(reaper.claim_create_close("term-A", || Ok(false)));
+                    admit_terminal_attach(
+                        &table,
+                        &reaper,
+                        || AcceptRemoteAttach::Tenant,
+                        &attach_frame(Some(json!({"grant_jti": "j-closing"}))),
+                        NOW,
+                        resolves_to("term-A"),
                     )
                 }
                 AttachRefusal::EgressOff => {
@@ -5450,6 +5560,7 @@ mod tests {
                     );
                     admit_terminal_attach(
                         &table,
+                        &RemoteCreateReaper::default(),
                         || AcceptRemoteAttach::Tenant,
                         &attach_frame(Some(json!({"grant_jti": "j-egress"}))),
                         NOW,
@@ -5484,6 +5595,7 @@ mod tests {
         let empty = RemoteAttachGrants::new();
         let err = admit_terminal_attach(
             &empty,
+            &RemoteCreateReaper::default(),
             || AcceptRemoteAttach::Tenant,
             &attach_frame(None),
             NOW,
@@ -9207,6 +9319,7 @@ mod egress_tests {
         });
         let err = admit_terminal_attach(
             &table,
+            &RemoteCreateReaper::default(),
             || AcceptRemoteAttach::Tenant,
             &frame,
             1,
@@ -9296,6 +9409,14 @@ mod create_grant_end_tests {
         spent_table_for_user(USER, Some(TERMINAL))
     }
 
+    /// A reaper holding `TERMINAL` armed and never attached — the state a remote
+    /// create leaves behind until a source attaches.
+    fn armed() -> RemoteCreateReaper {
+        let reaper = RemoteCreateReaper::new(Duration::from_secs(1200));
+        reaper.arm(TERMINAL, None, tokio::time::Instant::now());
+        reaper
+    }
+
     fn frame() -> Value {
         json!({
             "type": "terminal_end",
@@ -9310,9 +9431,9 @@ mod create_grant_end_tests {
         admit_create_grant_end(
             &RemoteAttachGrants::new(),
             table,
+            &armed(),
             || AcceptRemoteCreate::Tenant,
             || Some(USER.to_string()),
-            |_| false,
             data,
             NOW,
         )
@@ -9359,9 +9480,9 @@ mod create_grant_end_tests {
         let result = admit_create_grant_end(
             &RemoteAttachGrants::new(),
             &table,
+            &armed(),
             || AcceptRemoteCreate::Tenant,
             || None,
-            |_| false,
             &frame(),
             NOW + 900,
         );
@@ -9494,9 +9615,9 @@ mod create_grant_end_tests {
             admit_create_grant_end(
                 &attach,
                 &table,
+                &armed(),
                 || AcceptRemoteCreate::Tenant,
                 || None,
-                |_| false,
                 data,
                 NOW,
             )
@@ -9546,19 +9667,22 @@ mod create_grant_end_tests {
     #[test]
     fn an_ever_attached_terminal_is_refused() {
         let table = spent_table();
+        let reaper = armed();
+        reaper.mark_attached(TERMINAL, tokio::time::Instant::now());
         let result = admit_create_grant_end(
             &RemoteAttachGrants::new(),
             &table,
+            &reaper,
             || AcceptRemoteCreate::Tenant,
             || None,
-            |terminal| {
-                assert_eq!(terminal, TERMINAL, "asked about the tombstone's terminal");
-                true
-            },
             &frame(),
             NOW,
         );
         assert_refused(result, "remote_create_close_attached", "ever attached");
+        assert!(
+            !reaper.is_closing_under_create(TERMINAL),
+            "refusal marks nothing"
+        );
     }
 
     /// The real reaper as the read: an armed never-attached terminal may close;
@@ -9572,9 +9696,9 @@ mod create_grant_end_tests {
             admit_create_grant_end(
                 &RemoteAttachGrants::new(),
                 &table,
+                reaper,
                 || AcceptRemoteCreate::Tenant,
                 || None,
-                |terminal| reaper.was_ever_attached(terminal),
                 &frame(),
                 NOW,
             )
@@ -9582,44 +9706,238 @@ mod create_grant_end_tests {
         assert_refused(run(&reaper), "remote_create_close_attached", "no row");
         reaper.arm(TERMINAL, None, t0);
         assert!(run(&reaper).is_ok(), "armed and never attached");
+        // Withdrawn (as after a `still_running` end), so a later attach may bind.
+        reaper.release_create_close(TERMINAL);
         reaper.mark_attached(TERMINAL, t0);
         assert_refused(run(&reaper), "remote_create_close_attached", "attached");
         assert!(reaper.take_due(t0 + Duration::from_secs(1300)).is_empty());
         assert_refused(run(&reaper), "remote_create_close_attached", "disarmed");
     }
 
-    /// The window `handle_terminal_attach` leaves between binding a grant and
-    /// marking the reaper: a live binding refuses even though the read says no.
+    /// Belt to the reaper's flag: a live binding that did not go through the
+    /// reaper (an armed, never-marked row) still refuses.
     #[test]
     fn a_grant_currently_bound_to_the_terminal_is_refused() {
         let attach = attach_table();
         assert!(attach.bind("jti-attach", TERMINAL));
         let table = spent_table();
+        let reaper = armed();
         let result = admit_create_grant_end(
             &attach,
             &table,
+            &reaper,
             || AcceptRemoteCreate::Tenant,
             || None,
-            |_| false,
             &frame(),
             NOW,
         );
         assert_refused(result, "remote_create_close_attached", "bound now");
+        assert!(!reaper.is_closing_under_create(TERMINAL));
+    }
+
+    // ---- review finding 1: admission and the close are atomic against an attach ----
+
+    fn attach_frame_for_session() -> Value {
+        json!({
+            "type": "terminal_attach",
+            "request_id": "att-1",
+            "remote": { "source_device_id": SOURCE, "grant_jti": "jti-attach" },
+        })
+    }
+
+    fn attach(
+        grants: &RemoteAttachGrants,
+        reaper: &RemoteCreateReaper,
+    ) -> Result<(RemoteBlock, AttachGrant, String, ()), Value> {
+        admit_terminal_attach(
+            grants,
+            reaper,
+            || AcceptRemoteAttach::Tenant,
+            &attach_frame_for_session(),
+            NOW,
+            |_session| Some((TERMINAL.to_string(), ())),
+        )
+    }
+
+    fn end(
+        grants: &RemoteAttachGrants,
+        table: &RemoteCreateGrants,
+        reaper: &RemoteCreateReaper,
+    ) -> Result<(RemoteBlock, String), Value> {
+        admit_create_grant_end(
+            grants,
+            table,
+            reaper,
+            || AcceptRemoteCreate::Tenant,
+            || None,
+            &frame(),
+            NOW,
+        )
+    }
+
+    /// End first: once the create grant's close is ADMITTED, the attach that
+    /// arrives before the close runs is refused `attach_terminal_closing`, binds
+    /// nothing, and marks nothing — so the close that follows kills no attached
+    /// terminal. The same real tables both handlers use.
+    #[test]
+    fn an_attach_after_the_close_is_admitted_is_refused_and_binds_nothing() {
+        let grants = attach_table();
+        let table = spent_table();
+        let reaper = armed();
+
+        let (_, closing) = end(&grants, &table, &reaper).expect("close admitted");
+        assert_eq!(closing, TERMINAL);
+        assert!(reaper.is_closing_under_create(TERMINAL));
+
+        let refused = attach(&grants, &reaper).expect_err("the attach loses");
+        assert_eq!(refused["type"], "error");
+        assert_eq!(refused["code"], "attach_terminal_closing");
+        assert_eq!(
+            grants.get("jti-attach").and_then(|g| g.terminal_id),
+            None,
+            "the losing attach bound nothing"
+        );
+        assert!(
+            !reaper.was_ever_attached(TERMINAL),
+            "the losing attach marked nothing"
+        );
+        // A retry of the admitted close is still admitted (idempotent).
+        assert!(end(&grants, &table, &reaper).is_ok());
+
+        // A close that definitively failed withdraws the mark: the terminal is
+        // attachable again, and from then on the create grant cannot close it.
+        reaper.release_create_close(TERMINAL);
+        attach(&grants, &reaper).expect("attachable after release");
+        assert_refused(
+            end(&grants, &table, &reaper),
+            "remote_create_close_attached",
+            "attached after release",
+        );
+    }
+
+    /// Attach first: the bind and the ever-attached mark land together, so the
+    /// create grant's close that follows is refused `remote_create_close_attached`
+    /// and leaves no closing mark behind.
+    #[test]
+    fn a_close_after_an_attach_bound_is_refused() {
+        let grants = attach_table();
+        let table = spent_table();
+        let reaper = armed();
+
+        let (_, _, bound, ()) = attach(&grants, &reaper).expect("attach admitted");
+        assert_eq!(bound, TERMINAL);
+        assert!(reaper.was_ever_attached(TERMINAL), "marked with the bind");
+        assert_eq!(
+            grants
+                .get("jti-attach")
+                .and_then(|g| g.terminal_id)
+                .as_deref(),
+            Some(TERMINAL)
+        );
+
+        assert_refused(
+            end(&grants, &table, &reaper),
+            "remote_create_close_attached",
+            "the end loses",
+        );
+        assert!(!reaper.is_closing_under_create(TERMINAL));
+        // And a re-attach of the owned terminal is unaffected.
+        assert!(attach(&grants, &reaper).is_ok());
+    }
+
+    /// The two sides really are serialised by ONE lock: the claim runs its
+    /// attach-table read while holding the reaper's lock, so a bind racing it
+    /// from another thread is decided strictly before or strictly after. Run
+    /// many rounds; every round must end in exactly one winner, never both.
+    #[test]
+    fn concurrent_close_and_attach_never_both_win() {
+        for round in 0..200 {
+            let grants = std::sync::Arc::new(attach_table());
+            let table = std::sync::Arc::new(spent_table());
+            let reaper = std::sync::Arc::new(armed());
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let closer = {
+                let (grants, table, reaper, barrier) = (
+                    grants.clone(),
+                    table.clone(),
+                    reaper.clone(),
+                    barrier.clone(),
+                );
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    end(&grants, &table, &reaper).is_ok()
+                })
+            };
+            let attacher = {
+                let (grants, reaper, barrier) = (grants.clone(), reaper.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    attach(&grants, &reaper).is_ok()
+                })
+            };
+            let closed = closer.join().unwrap();
+            let attached = attacher.join().unwrap();
+            assert!(
+                closed ^ attached,
+                "round {round}: closed={closed} attached={attached}"
+            );
+            assert_eq!(reaper.is_closing_under_create(TERMINAL), closed);
+            assert_eq!(reaper.was_ever_attached(TERMINAL), attached);
+        }
+    }
+
+    // ---- review finding 3: an unreadable attach table refuses the close ----
+
+    #[test]
+    fn a_poisoned_attach_table_refuses_the_close_and_marks_nothing() {
+        let grants = attach_table();
+        grants.poison_for_test();
+        assert!(grants.try_contains("jti-attach").is_err());
+        assert!(grants.try_any_bound_to(TERMINAL, NOW).is_err());
+        // The infallible reads still answer as before for their other callers.
+        assert!(!grants.contains("jti-attach"));
+        assert!(grants.grants_bound_to(TERMINAL, NOW).is_empty());
+
+        let table = spent_table();
+        let reaper = armed();
+        assert_refused(
+            end(&grants, &table, &reaper),
+            "remote_create_grant_unknown",
+            "poisoned attach table",
+        );
+        assert!(!reaper.is_closing_under_create(TERMINAL));
+    }
+
+    /// The bound-read half alone: an unreadable live-binding read refuses
+    /// `remote_create_close_attached` even with an armed, never-attached row.
+    #[test]
+    fn an_unreadable_binding_read_refuses_the_claim() {
+        let reaper = armed();
+        assert!(!reaper.claim_create_close(TERMINAL, || Err(())));
+        assert!(!reaper.claim_create_close(TERMINAL, || Ok(true)));
+        assert!(!reaper.is_closing_under_create(TERMINAL));
+        assert!(reaper.claim_create_close(TERMINAL, || Ok(false)));
+        assert!(reaper.is_closing_under_create(TERMINAL));
     }
 
     #[test]
     fn the_dial_off_refuses_before_any_table_is_read() {
         let table = spent_table();
+        let reaper = armed();
         let result = admit_create_grant_end(
             &RemoteAttachGrants::new(),
             &table,
+            &reaper,
             || AcceptRemoteCreate::Off,
             || panic!("the user is not read when the dial is off"),
-            |_| panic!("attachment is not read when the dial is off"),
             &frame(),
             NOW,
         );
         assert_refused(result, "remote_create_disabled", "dial off");
+        assert!(
+            !reaper.is_closing_under_create(TERMINAL),
+            "a refusal before the claim marks nothing"
+        );
     }
 
     #[test]
@@ -9630,9 +9948,9 @@ mod create_grant_end_tests {
             admit_create_grant_end(
                 &RemoteAttachGrants::new(),
                 &table,
+                &armed(),
                 || AcceptRemoteCreate::SameUser,
                 move || local,
-                |_| false,
                 &frame(),
                 NOW,
             )
@@ -9658,9 +9976,9 @@ mod create_grant_end_tests {
         let result = admit_create_grant_end(
             &RemoteAttachGrants::new(),
             &table,
+            &armed(),
             || AcceptRemoteCreate::Tenant,
             || None,
-            |_| false,
             &frame(),
             0,
         );
