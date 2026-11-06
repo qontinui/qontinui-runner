@@ -63,7 +63,7 @@ import { readTextArg, textArg } from "./parse";
 import { useCommandAction } from "./useCommandAction";
 import { getTerminalHotStore } from "../terminalHotStore";
 import { MAXIMIZE_IN_TMUX_ERROR } from "../zone-grid/maximizeActions";
-import { parseLayoutOriginArg } from "../zoneAutoTrim";
+import { parseLayoutOriginArg, predictLayoutOrigin, reportLayoutOrigin } from "../zoneAutoTrim";
 import { useOrchestrateCommand } from "./orchestrateCommand";
 import { deriveVerdict, effect, fail, ok, stateEffect, type EffectReport } from "./verdict";
 import { describeThrown } from "@/lib/utils";
@@ -1076,7 +1076,9 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       // The request source. Only `operator` and `auto` are a caller's to send:
       // `restore` is the mount path's, and keeps whatever origin is stored.
       const originArg = readTextArg(args, "origin");
-      if (originArg.kind === "invalid") return fail("invalid-origin", "--origin needs a value");
+      if (originArg.kind === "invalid") {
+        return fail("invalid-origin", '--origin needs "operator" or "auto"');
+      }
       const source =
         originArg.kind === "text" ? parseLayoutOriginArg(originArg.text) : ("operator" as const);
       if (source === null) {
@@ -1138,6 +1140,10 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       // for `ZoneLayoutPicker`, which routes its clicks through this handler.
       // What was dishonest was never the call; it was reporting the same `✓`
       // whether or not the PRESET moved.
+      // Read before the request, as the hook's rule is: an `auto` request
+      // takes the page only when it changes the layout id.
+      const originBefore = reportLayoutOrigin(targetLayout.layoutOrigin);
+      const originAfter = predictLayoutOrigin(targetLayout, normalized, source);
       targetLayout.setLayoutId(normalized, { source });
       const layoutDetail =
         grown !== null
@@ -1145,12 +1151,21 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
           : wasAlready
             ? `already ${normalized}; re-applied`
             : normalized;
-      // An `auto` request hands the page to the runner, which will trim it when
-      // tabs close; said, because it changes what the page does next.
+      // An `auto` request that takes the page hands it to the runner, which
+      // trims it when tabs close; said, because it changes what the page does
+      // next. One that re-asserts the page's own layout takes nothing, and
+      // saying "runner-owned" there would be a success that did not happen.
       const ownedDetail =
-        source === "auto" ? `${layoutDetail}; runner-owned (auto-trims)` : layoutDetail;
+        source !== "auto"
+          ? layoutDetail
+          : originAfter === "auto"
+            ? `${layoutDetail}; runner-owned (auto-trims)`
+            : `${layoutDetail}; origin kept (${originAfter}) — an auto request does not take a layout it leaves unchanged`;
       const detail = leftTmux ? `left tmux mode — ${ownedDetail}` : ownedDetail;
-      return ok(effect("changed", "layout", wasAlready ? 0 : 1, { detail }));
+      // A hand-over is a change of its own, even when the grid kept its preset
+      // (an auto request auto-grow re-grew to the layout the page already had).
+      const handedOver = source === "auto" && originAfter !== originBefore;
+      return ok(effect("changed", "layout", wasAlready && !handedOver ? 0 : 1, { detail }));
     },
   });
 

@@ -142,6 +142,23 @@ export function reportLayoutOrigin(origin: LayoutOrigin | undefined): ReportedLa
 }
 
 /**
+ * The origin a page reports after a layout REQUEST, predicted by the rule
+ * `useZoneLayout`'s `applyLayout` applies: an `operator` request always
+ * records `operator`; an `auto` one records `auto` only when it changes the
+ * layout id — re-asserting the layout a page already has must not hand an
+ * operator's (or a legacy) page to the trim. A request answer built from this
+ * says what the page now holds, not what the caller asked for.
+ */
+export function predictLayoutOrigin(
+  current: { layoutId: string; layoutOrigin?: LayoutOrigin },
+  requestedId: string,
+  source: LayoutOrigin,
+): ReportedLayoutOrigin {
+  if (source === "operator") return "operator";
+  return requestedId !== current.layoutId ? "auto" : reportLayoutOrigin(current.layoutOrigin);
+}
+
+/**
  * A caller-supplied origin for a layout REQUEST (`/layout --origin`,
  * `select-layout` `origin`), or `null` when it names neither. Case and
  * surrounding space are forgiven; `restore` is not accepted, because it is

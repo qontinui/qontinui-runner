@@ -11,7 +11,12 @@ import { useUIComponent, UIBridgeComponentScope } from "@qontinui/ui-bridge";
 import { callRegistry, readTextArg, textArg } from "./commands";
 import { guardedHandler } from "@/lib/ui-bridge/guardedHandler";
 import { usePageSessionGetter, useTerminalSession } from "./contexts";
-import { parseLayoutOriginArg, readAutoTrimEnabled, reportLayoutOrigin } from "./zoneAutoTrim";
+import {
+  parseLayoutOriginArg,
+  predictLayoutOrigin,
+  readAutoTrimEnabled,
+  reportLayoutOrigin,
+} from "./zoneAutoTrim";
 
 /** Hoisted so the registration and its guarded handler read one declaration. */
 const SELECT_LAYOUT_SCHEMA = {
@@ -158,8 +163,9 @@ export function ZoneLayoutPicker({
           "page holds more sessions than the preset has zones, and leftTmux: true when the " +
           "request took the page out of tmux work mode. origin (default operator) records who " +
           'chose the layout: "auto" hands the page to the runner, which then trims its grid ' +
-          "when tabs close; an auto request on a tmux-mode page is refused, because it would " +
-          "not leave tmux.",
+          "when tabs close, but only when the request changes the page's layout id; an auto " +
+          "request on a tmux-mode page is refused, because it would not leave tmux. Returns " +
+          "layoutOrigin, the origin the page holds afterwards (as get-page-layout reports it).",
         paramSchema: SELECT_LAYOUT_SCHEMA,
         // `write` — switches the grid preset and redistributes zone assignments. No
         // terminal is ended: `applyLayout` preserves in-range assignments and only
@@ -191,6 +197,12 @@ export function ZoneLayoutPicker({
           // the page no longer says it was in it.
           const target = getPageSession(pageId ?? activePageId);
           const leftTmux = target?.zoneLayout.workMode === "tmux";
+          // Who the page belongs to afterwards, by the hook's own rule, not the
+          // origin that was asked for: an auto request re-asserting the page's
+          // own layout takes nothing. Unknown when the page could not be read.
+          const layoutOrigin = target
+            ? predictLayoutOrigin(target.zoneLayout, requested, origin)
+            : null;
           // Phase 1c — delegates to registry `terminal.layout`. The
           // registry handler calls the same `zoneLayout.setLayoutId`
           // closure that `onSelectLayout` does (both source from
@@ -218,7 +230,7 @@ export function ZoneLayoutPicker({
             pageId: pageId ?? activePageId,
             tabCount: tabs,
             leftTmux,
-            origin,
+            layoutOrigin,
           };
         }),
       },

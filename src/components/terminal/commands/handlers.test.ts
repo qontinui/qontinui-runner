@@ -444,6 +444,41 @@ describe("handlers — the no-ops that used to render as effects", () => {
       expect(reportOf(o.value).detail).toBe("split; runner-owned (auto-trims)");
     });
 
+    /**
+     * The hook records an `auto` origin only for a layout id it CHANGES, so
+     * re-asserting a page's own layout cannot hand it to the trim. The verdict
+     * has to say so rather than claim a hand-over that did not happen.
+     */
+    it("says the origin was kept when an auto request leaves the layout id unchanged", async () => {
+      h.setOtherPages({ "page-2": { layoutId: "quad", tabCount: 3 } });
+      const o = await layout("/layout quad --page page-2 --origin auto");
+      expect(o.verdict).toBe("ok");
+      expect(reportOf(o.value).detail).toBe(
+        "already quad; re-applied; origin kept (legacy) — an auto request does not take a layout it leaves unchanged",
+      );
+      expect(reportOf(o.value).affected).toBe(0);
+    });
+
+    it("counts a hand-over as a change even when auto-grow keeps the page's preset", async () => {
+      h.setOtherPages({
+        "page-2": { layoutId: "full-grid", tabCount: 8, layoutOrigin: "operator" },
+      });
+      const o = await layout("/layout quad --page page-2 --origin auto");
+      expect(reportOf(o.value).detail).toBe(
+        "grew to full-grid — 8 sessions do not fit quad; runner-owned (auto-trims)",
+      );
+      expect(reportOf(o.value).affected).toBe(1);
+    });
+
+    it("accepts the origin in any case and with surrounding space", async () => {
+      h.reset();
+      const result = await h
+        .byId("terminal.layout")
+        .handler({ preset: "split", origin: " AUTO " }, { source: "direct" } as never);
+      expect(result).toMatchObject({ ok: true });
+      expect(h.calls.map((c) => c.args)).toEqual([["split", { source: "auto" }]]);
+    });
+
     it("accepts an explicit operator origin", async () => {
       const o = await layout("/layout quad --origin operator");
       expect(o.verdict).toBe("ok");
