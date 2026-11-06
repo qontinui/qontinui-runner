@@ -11,6 +11,12 @@ import { useUIComponent, UIBridgeComponentScope } from "@qontinui/ui-bridge";
 import { callRegistry, readTextArg, textArg } from "./commands";
 import { guardedHandler } from "@/lib/ui-bridge/guardedHandler";
 import { usePageSessionGetter, useTerminalSession } from "./contexts";
+import { useLiveRef } from "./useLiveRef";
+import {
+  GET_PAGE_LAYOUT_SIGNATURE,
+  LIST_LAYOUTS_SIGNATURE,
+  selectLayoutSignature,
+} from "./zonePickerSignatures";
 
 /** Hoisted so the registration and its guarded handler read one declaration. */
 const SELECT_LAYOUT_SCHEMA = {
@@ -98,6 +104,8 @@ export function ZoneLayoutPicker({
   const getPageSession = usePageSessionGetter();
   const { pageId: activePageId } = useTerminalSession();
   const dropdownRef = useRef<HTMLDivElement>(null);
+  // Read by `select-layout`'s signature when `predict` runs (see `useLiveRef`).
+  const tabCountRef = useLiveRef(tabCount);
 
   useEffect(() => {
     if (!open) return;
@@ -140,6 +148,7 @@ export function ZoneLayoutPicker({
         // terminal is ended: `applyLayout` preserves in-range assignments and only
         // compacts out-of-range ones, and auto-grow re-expands to fit live tabs.
         effect: "write",
+        signature: selectLayoutSignature(tabCountRef),
         // `{layoutId: {}}` is truthy, so it passed `if (!layoutId)` and was
         // stringified into the operator-facing sentence as
         // `Unknown layoutId: "[object Object]"`; `{layoutId: []}` rendered the
@@ -203,6 +212,7 @@ export function ZoneLayoutPicker({
         paramSchema: GET_PAGE_LAYOUT_SCHEMA,
         // `read` — reports one page's grid state; changes nothing.
         effect: "read",
+        signature: GET_PAGE_LAYOUT_SIGNATURE,
         handler: guardedHandler("get-page-layout", GET_PAGE_LAYOUT_SCHEMA, (args) => {
           const pageId = readPageIdArg("get-page-layout", args) ?? activePageId;
           const page = getPageSession(pageId);
@@ -223,6 +233,7 @@ export function ZoneLayoutPicker({
         description: "Return [{id, name, zones, shortcutKey}] for every built-in layout preset.",
         // `read` — enumerates the built-in presets. A query over constants.
         effect: "read",
+        signature: LIST_LAYOUTS_SIGNATURE,
         handler: () =>
           LAYOUT_PRESETS.map((l) => ({
             id: l.id,
