@@ -167,20 +167,12 @@ vite.config.js
 
 # Storybook build output
 storybook-static/
-target-new/
-target-test/
-target-test2/
-target-agent/
-target-pool/
-target-check/
-target-fix-test/
-target-validate/
-target-run/
-target-fixcheck/
+# Every per-purpose cargo target beside target/: target-agent/ (cargo-guard's
+# shared worktree target), target-pool/ (the supervisor build pool),
+# target-arming/ (the arming prove target, qontinui-claude-config
+# scripts/lib/arming_runs.py) and the ad-hoc ones.
+target-*/
 .build-state/
-target-rebuild/
-target-types-task/
-target-wt/
 *.log.err
 
 # MSYS/Cygwin crash dumps (bash.exe.stackdump, du.exe.stackdump, ...).
