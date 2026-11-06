@@ -45,7 +45,7 @@
 //! through the lifecycle Closer's guard instead.
 //!
 //! Time is MONOTONIC (`tokio::time::Instant`) throughout, so a wall-clock step
-//! can neither reap early nor make the single scheduled sweep miss its row.
+//! can neither reap early nor make the scheduled sweep miss its row.
 //! The decision is the pure [`decide`]; the table and the sweep are thin
 //! wrappers so the whole rule is testable without a `TerminalManager`.
 
@@ -253,10 +253,13 @@ impl Drop for CreateCloseClaim<'_> {
         // claim exists. A missing row here would be a broken invariant; it has
         // nothing to decrement either way.
         if let Some(row) = self.reaper.table().get_mut(&self.terminal_id) {
-            debug_assert!(
-                row.create_closes_in_flight > 0,
-                "a live CreateCloseClaim implies a counted close"
-            );
+            // Not while unwinding: a second panic in a destructor aborts.
+            if !std::thread::panicking() {
+                debug_assert!(
+                    row.create_closes_in_flight > 0,
+                    "a live CreateCloseClaim implies a counted close"
+                );
+            }
             row.create_closes_in_flight = row.create_closes_in_flight.saturating_sub(1);
             if self.closed {
                 row.closed_under_create = true;
@@ -537,15 +540,6 @@ impl RemoteCreateReaper {
         due
     }
 
-    /// Is `terminal_id` an armed, never-attached row that the sweep is holding
-    /// only because a create close is still in flight? The scheduled sweep
-    /// re-runs while this holds.
-    fn held_by_create_close(&self, terminal_id: &str) -> bool {
-        self.table()
-            .get(terminal_id)
-            .is_some_and(|row| row.armed && !row.ever_attached && row.create_closes_in_flight > 0)
-    }
-
     #[cfg(test)]
     fn is_armed(&self, terminal_id: &str) -> bool {
         self.table().get(terminal_id).is_some_and(|row| row.armed)
@@ -607,8 +601,10 @@ where
     due
 }
 
-/// Arm `terminal_id` on `reaper` now and schedule the sweep that runs once its
-/// deadline has passed.
+/// Arm `terminal_id` on `reaper` now and schedule its sweep: first once the
+/// deadline has passed, then again every [`CREATE_CLOSE_RESWEEP`] for as long as
+/// the row is still in the table, armed and never attached — which after the
+/// deadline means `take_due` kept it for an in-flight create close.
 pub fn arm_and_schedule<F, Fut>(
     reaper: Arc<RemoteCreateReaper>,
     terminal_id: &str,
@@ -629,10 +625,16 @@ where
         loop {
             tokio::time::sleep_until(wake_at).await;
             reaped.extend(sweep(&reaper, Instant::now(), &close).await);
-            // `take_due` keeps a row with a create close in flight; look again
-            // once that close has had time to finish. Bounded by the close's own
-            // drive (an end's timeouts), after which its claim is dropped.
-            if !reaper.held_by_create_close(&terminal_id) {
+            // Decide on the TABLE, not on why the row was kept: `sweep` awaits
+            // other rows' closes after `take_due`, and a claim on this row can
+            // drop in that window, so "is a close still in flight?" read here
+            // may already say no for a row `take_due` kept (final review). Stop
+            // only once the row is gone (reaped, or never armed) or attached
+            // (owned) — `was_ever_attached` answers true for both. Anything still
+            // armed and unattached is looked at again. Bounded: `take_due` keeps
+            // a due row only while a close's claim lives, and a claim ends with
+            // its close's own drive.
+            if reaper.was_ever_attached(&terminal_id) {
                 break reaped;
             }
             wake_at = Instant::now() + CREATE_CLOSE_RESWEEP;
@@ -641,7 +643,8 @@ where
 }
 
 /// How soon the scheduled sweep looks again at a due terminal it kept because
-/// a create close was still in flight.
+/// a create close was still in flight. Must be non-zero: the re-sweep loop
+/// would otherwise spin without ever letting the clock advance.
 pub const CREATE_CLOSE_RESWEEP: Duration = Duration::from_secs(30);
 
 static REAPER: OnceLock<Arc<RemoteCreateReaper>> = OnceLock::new();
@@ -921,10 +924,9 @@ mod tests {
             "the attach is refused"
         );
         assert!(!bound, "and never reaches the attach table");
-        assert!(reaper.held_by_create_close("term"));
 
         drop(claim);
-        assert!(!reaper.held_by_create_close("term"));
+        assert!(!reaper.is_closing_under_create("term"));
         assert_eq!(reaper.take_due(t0 + N).len(), 1, "due once the close ended");
     }
 
@@ -946,25 +948,94 @@ mod tests {
     }
 
     /// The scheduled path holds the due row while a close is in flight and
-    /// sweeps again `CREATE_CLOSE_RESWEEP` later; it reaps once the claim ends.
+    /// sweeps again exactly [`CREATE_CLOSE_RESWEEP`] later, reaping once the claim
+    /// has ended: not finished at +29 s, finished by +31 s.
     #[tokio::test(start_paused = true)]
     async fn the_scheduled_sweep_looks_again_after_a_held_row() {
+        // Fails fast rather than hanging: at zero the loop would spin and the
+        // paused clock would never advance.
+        assert!(CREATE_CLOSE_RESWEEP >= Duration::from_secs(1));
+        assert_eq!(CREATE_CLOSE_RESWEEP, Duration::from_secs(30));
+        let start = Instant::now();
         let reaper = Arc::new(RemoteCreateReaper::new(N));
         let (closed, close) = recorder();
-        let handle = arm_and_schedule(reaper.clone(), "term-held", None, close);
+        let mut handle = arm_and_schedule(reaper.clone(), "term-held", None, close);
         let claim = reaper
             .claim_create_close("term-held", || Ok(false))
             .expect("admitted");
 
-        tokio::time::sleep(N + SEC).await;
+        tokio::time::sleep_until(start + N + SEC).await;
         assert!(closed.lock().unwrap().is_empty(), "held at the deadline");
         assert!(reaper.has_row("term-held"));
         assert!(!handle.is_finished(), "the sweep will look again");
 
         drop(claim);
-        let reaped = handle.await.unwrap();
+        tokio::time::sleep_until(start + N + 29 * SEC).await;
+        assert!(!handle.is_finished(), "no re-sweep before the cadence");
+        assert!(closed.lock().unwrap().is_empty());
+
+        let reaped = tokio::time::timeout(2 * SEC, &mut handle)
+            .await
+            .expect("re-swept by +30 s")
+            .unwrap();
         assert_eq!(reaped.len(), 1);
         assert_eq!(*closed.lock().unwrap(), vec!["term-held".to_string()]);
+        assert!(start.elapsed() >= N + CREATE_CLOSE_RESWEEP);
+    }
+
+    /// Final review: the claim on the held row drops WHILE the sweep is still
+    /// awaiting another row's close, i.e. between `take_due` keeping the row and
+    /// the loop deciding whether to look again. The loop must still look again
+    /// (it decides on the table: armed and unattached), and reap the row on its
+    /// next pass instead of abandoning it past its deadline.
+    #[tokio::test(start_paused = true)]
+    async fn a_claim_dropped_during_the_sweep_still_gets_its_row_reaped() {
+        let start = Instant::now();
+        let reaper = Arc::new(RemoteCreateReaper::new(N));
+        // A 'static view of the same reaper, so the claim can live in the
+        // close callback (a test-only leak).
+        let leaked: &'static RemoteCreateReaper = Box::leak(Box::new(reaper.clone()));
+        // Another due row, armed with no task of its own, so the held row's task
+        // is the one that sweeps it — and its close is where the claim drops.
+        reaper.arm("term-other", None, start);
+        let claim = Arc::new(Mutex::new(None::<CreateCloseClaim<'static>>));
+        let closed = Arc::new(Mutex::new(Vec::new()));
+        let (seen, slot) = (closed.clone(), claim.clone());
+        let close = move |id: String| {
+            if id == "term-other" {
+                drop(slot.lock().unwrap().take());
+            }
+            seen.lock().unwrap().push(id);
+            std::future::ready(Ok(CloseOutcome::Closed))
+        };
+        let handle = arm_and_schedule(reaper.clone(), "term-held", None, close);
+        *claim.lock().unwrap() = Some(
+            leaked
+                .claim_create_close("term-held", || Ok(false))
+                .expect("admitted"),
+        );
+
+        tokio::time::sleep_until(start + N + SEC).await;
+        assert_eq!(*closed.lock().unwrap(), vec!["term-other".to_string()]);
+        assert!(claim.lock().unwrap().is_none(), "dropped during the sweep");
+        assert!(reaper.has_row("term-held"), "kept by take_due");
+        assert!(
+            !handle.is_finished(),
+            "the loop must not abandon an armed, unattached row"
+        );
+
+        let reaped = tokio::time::timeout(CREATE_CLOSE_RESWEEP + SEC, handle)
+            .await
+            .expect("reaped on the next pass")
+            .unwrap();
+        assert_eq!(
+            reaped
+                .iter()
+                .map(|r| r.terminal_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["term-other", "term-held"]
+        );
+        assert!(!reaper.has_row("term-held"));
     }
 
     /// Nit 3: a driver that PANICS unwinds through `run_create_close` and the
