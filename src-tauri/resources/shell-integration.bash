@@ -34,15 +34,16 @@ __osc633() {
 # before that.
 #
 # P;CommandMarks=1 tells the runner this prompt's A means "nothing is running":
-# the next typed command line will get a C first. It is sent ONLY when that is
-# proven at this prompt: bash >= 4.4 (PS0 exists), PS0 holds our C right now
-# (re-prefixed if something reassigned PS0 — a `source ~/.bashrc` — unless PS0
-# is readonly), and stderr, where bash writes PS0, is a terminal (not after an
-# `exec 2>/dev/null` or `exec 2>>log`). The DEBUG trap is never announced: a
-# user PROMPT_COMMAND's entries can spend its once-per-line C. Without the
-# announcement the runner keeps the pane, which is always safe. It rides every
-# prompt, so a runner pane that stopped parsing marks (remounted, or hidden)
-# learns it again.
+# the next typed command line will get a C first. It is sent ONLY when these
+# checks pass at this prompt: bash >= 4.4 (PS0 exists), PS0 holds our C right
+# now (re-prefixed if something reassigned PS0 — a `source ~/.bashrc` — unless
+# PS0 is readonly), and stderr, where bash writes PS0, is a terminal (not after
+# an `exec 2>/dev/null` or `exec 2>>log`; a stderr sent to ANOTHER terminal
+# still passes, the one case the checks miss). The DEBUG trap is never
+# announced: a user PROMPT_COMMAND's entries can spend its once-per-line C.
+# Without the announcement the runner keeps the pane, which is always safe. It
+# rides every prompt, so a runner pane that stopped parsing marks (remounted,
+# or hidden) learns it again.
 #
 # The shared literal: `P;CommandMarks=1` is pinned against the webview's
 # `COMMAND_MARKS_CAPABILITY` (src/components/terminal/shellIntegrationEvents.ts)
