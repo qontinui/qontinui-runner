@@ -3031,6 +3031,31 @@ mod usage_report_scope_tests {
         restore
     }
 
+    /// Assert `path` lies under `root`, comparing the two as the filesystem
+    /// resolves them rather than as spelled: on Windows the same temp dir can
+    /// be spelled with the 8.3 short user dir (`RUNNER~1`) on one side and the
+    /// long one on the other. `path` may not exist yet, so its nearest existing
+    /// ancestor is resolved and the rest re-joined lexically. Nothing is
+    /// created, so a path that did escape is not touched.
+    fn assert_inside(path: &std::path::Path, root: &std::path::Path, what: &str) {
+        let root = std::fs::canonicalize(root).expect("canonicalize the fixture root");
+        let mut existing = path;
+        let mut rest = Vec::new();
+        while !existing.exists() {
+            rest.push(existing.file_name().expect("a path under a root has names"));
+            existing = existing.parent().expect("a path under a root has a parent");
+        }
+        let mut resolved = std::fs::canonicalize(existing).expect("canonicalize the ancestor");
+        resolved.extend(rest.into_iter().rev());
+        assert!(
+            resolved.starts_with(&root),
+            "{what}: {} (resolved {}) is not under {}",
+            path.display(),
+            resolved.display(),
+            root.display()
+        );
+    }
+
     /// Write the machine-global roster inside the fixture: `dirs` in `mode`,
     /// with `config_dir` as the manual pin. The path is checked before the
     /// write.
@@ -3042,11 +3067,7 @@ mod usage_report_scope_tests {
     ) {
         std::env::set_var("XDG_CONFIG_HOME", amb.dir().join("xdg-config"));
         let path = crate::claude_accounts::claude_accounts_file_path().expect("roster path");
-        assert!(
-            path.starts_with(amb.dir()),
-            "the roster escaped the fixture: {}",
-            path.display()
-        );
+        assert_inside(&path, amb.dir(), "the roster escaped the fixture");
         crate::claude_accounts::update(move |r| {
             r.claude_config_dirs = dirs;
             r.account_selection_mode = mode;
@@ -3232,10 +3253,10 @@ mod usage_report_scope_tests {
 
         std::env::set_var("QONTINUI_INSTANCE_ROOT", amb.root());
         let roster = crate::claude_accounts::claude_accounts_file_path().expect("roster path");
-        assert!(
-            roster.starts_with(amb.root()),
-            "a subject's roster must sit under its instance root: {}",
-            roster.display()
+        assert_inside(
+            &roster,
+            &amb.root(),
+            "a subject's roster must sit under its instance root",
         );
         write_roster(&amb, Vec::new(), AccountSelectionMode::Manual, None);
         let unpinned = refresh_fleet_usage_report().await;
