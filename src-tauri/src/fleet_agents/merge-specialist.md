@@ -278,7 +278,7 @@ one of them is about the door.** Measured with the same request otherwise
 | `403` | no usable bearer reached coord. That is the **door**: UNKNOWN about the data. |
 | `200` | a baseline exists for that exact `(repo, workflow_name)`; read `failure_pattern`. |
 | `404` `code: no_baseline` | `{"code":"no_baseline","error":"no baseline recorded for this (repo, workflow_name)","repo":…,"workflow_name":…}` — a **data** answer, not a broken door. Do not report it as a failed read; fall back to the author's commits and say you did. A coord build that predates the `code` field sends that body with no `code`. Read a code-less 404 as `no_baseline` **only if you sent the full `owner%2Frepo` form**: a build older than qontinui-coord#3302 never resolves a bare name, so a bare-name miss there comes back as this same code-less body and is UNKNOWN. |
-| `404` `code: repo_unresolved` | the **identifier** did not resolve: a bare repo name (no `owner/`) that matched none, or more than one, of the repos your tenant owns (qontinui-coord#3302). That is UNKNOWN about the data, **not** "no baseline". Re-send the full `<owner%2Frepo>` form. |
+| `404` `code: repo_unresolved` | the **identifier** did not resolve: a bare repo name (no `owner/`) that matched none, or more than one, of the repos your tenant owns (qontinui-coord#3302) — or, on a coord build carrying qontinui-coord#3832, a full `owner/name` your tenant does not own (or one misspelled — matching is exact, case included), because that PR made this route tenant-private. That is UNKNOWN about the data, **not** "no baseline". For a bare name, re-send the full `<owner%2Frepo>` form; for a full name, check the spelling first; if it is right, the repo is not one your tenant owns, and nothing on this door will read it for you. |
 
 The `403`, `200` and code-less `404` rows were measured on 2026-09-01: the `200`
 and code-less `404` with an agent JWT, the `403` without a usable bearer. The two `code` rows were measured on 2026-10-20, after
@@ -289,8 +289,10 @@ that device JWT the same day. An unknown `workflow_name` under
 `repo_unresolved`. A bare name that resolved answered `no_baseline`, and its
 `repo` field echoed the resolved `owner/name`. The ambiguous-bare-name arm
 (more than one owned repo matches) is still read from the handler
-(`crates/coord/src/ci_baseline.rs` `handler`), not measured. Always sending
-`owner%2Frepo` sidesteps every identifier arm.
+(`crates/coord/src/ci_baseline.rs` `handler`), not measured, and so is the
+full-name ownership arm qontinui-coord#3832 added. Always sending
+`owner%2Frepo` sidesteps every bare-name arm; it does not sidestep the
+ownership one.
 
 Tell the two 404s apart by `code`, never by matching the `error` prose. The `no_baseline` 404 does **not** discriminate "coord has no baseline yet" from "your
 `workflow_name` is spelled differently from what coord ingested" — both return
