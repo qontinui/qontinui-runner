@@ -90,9 +90,8 @@ rem ---- nested call: pure passthrough, never re-pin -------------------------
 rem The recursion guard, or a Claude Code session marker inherited from a
 rem claude ancestor: Claude Code sets both markers in its tool environment,
 rem and every runner spawn site strips both, so a top-level launch carries
-rem neither. cmd cannot hold an EMPTY variable, so an empty-valued marker
-rem reads absent here (the bash shim and the exe count it) -- accepted,
-rem because nothing sets a marker to empty.
+rem neither. This .cmd does not count an empty-valued marker (the bash shim
+rem and the exe do); that is accepted.
 if "%QONTINUI_INSTALL_INTERCEPT_GUARD%"=="1" goto :nested
 if defined CLAUDECODE goto :nested
 if defined CLAUDE_CODE_CHILD_SESSION goto :nested
