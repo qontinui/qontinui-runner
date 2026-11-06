@@ -406,20 +406,17 @@ pub fn diff_census(
     let attempted: HashSet<String> = observed.iter().map(|o| key(&o.claude_session_id)).collect();
     // One observation per session, merged by the ledger's own order (the
     // strongest `Observed` stands), so a session with a closed stamped row
-    // and an open adopted one reads as the ledger reads it. Where the tile IS
-    // (terminal, zone) comes from the session's first OPEN tile, so the entry
-    // never names the dead terminal of a closed predecessor; the boot stamp
-    // (tier, boot time) comes from the first row carrying one, which may be
-    // that closed predecessor.
+    // and an open adopted one reads as the ledger reads it. The entry's
+    // place (terminal, zone) and boot stamp (tier, boot time) come only from
+    // rows observed EXACTLY as the merged verdict, so neither can contradict
+    // it: the place from the first such OPEN row (never the dead terminal of a
+    // closed predecessor), the stamp from the merged row itself when it has
+    // one, else from the first such row that does.
     let mut best: Vec<&RestoredObservation> = Vec::new();
     let mut slot: HashMap<String, usize> = HashMap::new();
     let mut tiles: HashMap<String, (usize, &RestoredObservation)> = HashMap::new();
-    let mut stamp: HashMap<String, &RestoredObservation> = HashMap::new();
     for obs in observed {
         let id = key(&obs.claude_session_id);
-        if obs.restore_tier.is_some() {
-            stamp.entry(id.clone()).or_insert(obs);
-        }
         if obs.open && matches!(obs.observed, Some(Observed::Back | Observed::TerminalOnly)) {
             tiles.entry(id.clone()).or_insert((0, obs)).0 += 1;
         }
@@ -468,8 +465,17 @@ pub fn diff_census(
             });
             continue;
         }
-        let place = tiles.get(&id).map_or(obs, |(_, tile)| *tile);
-        let stamped = stamp.get(&id).copied().unwrap_or(obs);
+        let same_verdict = || {
+            observed
+                .iter()
+                .filter(|o| key(&o.claude_session_id) == id && o.observed == obs.observed)
+        };
+        let place = same_verdict().find(|o| o.open).unwrap_or(obs);
+        let stamped = if obs.restore_tier.is_some() {
+            obs
+        } else {
+            same_verdict().find(|o| o.restore_tier.is_some()).unwrap_or(obs)
+        };
         let row = CensusRestored {
             claude_session_id: obs.claude_session_id.clone(),
             terminal_id: bound_terminal_id(&place.terminal_id),
@@ -906,6 +912,35 @@ mod tests {
             assert_eq!(d.restored[0].terminal_id.as_deref(), Some("term-live"), "{d:?}");
             assert_eq!(d.restored[0].restore_tier.as_deref(), Some(RESTORE_TIER_RESUMED), "{d:?}");
             assert_eq!(d.restored[0].restored_from_boot_at, Some(9_000), "{d:?}");
+        }
+    }
+
+    /// The entry's place and stamp come only from rows observed as its
+    /// verdict: a bare open tile beside a verified one never lends the
+    /// verified entry its terminal, and the merged row's own stamp is never
+    /// overridden by a predecessor's.
+    #[test]
+    fn a_restored_entry_takes_place_and_stamp_only_from_rows_of_its_verdict() {
+        let exp = [expected("a", true)];
+        let mut bare = observed("a", RESTORE_TIER_TERMINAL_ONLY);
+        bare.terminal_id = "term-bare".to_string();
+        bare.restored_from_boot_at = Some(1);
+        let mut verified = observed("a", RESTORE_TIER_RESUMED);
+        verified.terminal_id = "term-verified".to_string();
+        verified.restored_from_boot_at = Some(2);
+        let mut failed = observed("a", RESTORE_TIER_FAILED);
+        failed.open = false;
+        failed.restored_from_boot_at = Some(3);
+        for rows in [
+            vec![bare.clone(), verified.clone(), failed.clone()],
+            vec![failed.clone(), verified.clone(), bare.clone()],
+        ] {
+            let d = diff_census(&exp, &rows, Some(true), None);
+            assert_eq!(d.restored.len(), 1, "{d:?}");
+            let r = &d.restored[0];
+            assert_eq!(r.terminal_id.as_deref(), Some("term-verified"), "{d:?}");
+            assert_eq!(r.restore_tier.as_deref(), Some(RESTORE_TIER_RESUMED), "{d:?}");
+            assert_eq!(r.restored_from_boot_at, Some(2), "{d:?}");
         }
     }
 
