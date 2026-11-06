@@ -78,15 +78,101 @@ else
     __qontinui_ps0_path=0
 fi
 
-# Whether the variable named $1 is readonly (a fork; install time and the rare
-# PS0 re-prefix only).
-__qontinui_is_readonly() {
-    local decl attrs
-    decl="$(declare -p "$1" 2>/dev/null)" || return 1
-    attrs="${decl#declare -}"
-    attrs="${attrs%% *}"
-    [[ "${attrs}" == *r* ]]
-}
+# ── Forks ───────────────────────────────────────────────────────────────────
+# No prompt may print what plain bash would not, even where no fork succeeds (a
+# task/PID ceiling). So every read below is either fork-free, or a command
+# substitution inside `{ …; } 2>/dev/null`: bash's own `fork: retry` /
+# `fork: Resource temporarily unavailable` text goes to that redirect.
+#
+# A fork that still fails, after bash's retries (about 15 s), throws bash back
+# to its top level: it abandons PROMPT_COMMAND there and runs it again from its
+# first entry, with `$?` now the failed fork's. Unguarded, the rerun forks
+# again, and the shell never reaches its prompt (measured: base's `$(pwd)`
+# loops the same way). So every fork made at a prompt sets __qontinui_forking
+# while it runs. Still set when __qontinui_prompt_start comes round means the
+# last round was abandoned: this round takes the finished command's status as
+# that round saw it, makes no fork at all (__qontinui_no_fork), and sends
+# only the marks it can read without one — each failed fork costs one stall,
+# and nothing wrong is sent. bash >= 5.0 and 5.3 make most reads fork-free.
+#
+# Residual, where a fork is left (the E read on bash 5.1–5.2, the cwd under
+# `set -o physical` or a PWD that does not name it, 4.4's readonly check of an
+# unset PS0): after an abandoned round, bash's own `$?` — what PS1 and a bare
+# `exit` see — is its fork-failure status (measured: 254) until the next
+# command runs. The user's PROMPT_COMMAND entries and our D for the command get
+# the real one; an empty line typed next reports bash's 254 in its D, as
+# `echo $?` would.
+__qontinui_forking=0
+__qontinui_no_fork=0
+
+# A variable's attributes (`r` readonly, `a` array) without a fork, bash >= 4.4.
+# nounset is off for the read only (`local -`): bash >= 5.2 calls an unset name
+# unbound there. In eval strings, so bash < 4.4 never parses them.
+if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4) )); then
+    eval '__qontinui_attrs() {
+        local -
+        set +u
+        eval "__qontinui_attrs_of=\${$1@a}"
+    }'
+fi
+
+# Whether the variable named $1 is readonly. Fork-free on bash >= 5.0. bash
+# 4.4's ${…@a} reads no attributes for a readonly name that has no value, so
+# there an unset name, like every name below 4.4, is asked of `declare -p`.
+if (( BASH_VERSINFO[0] >= 5 )); then
+    __qontinui_is_readonly() {
+        __qontinui_attrs "$1"
+        [[ "${__qontinui_attrs_of}" == *r* ]]
+    }
+else
+    __qontinui_is_readonly() {
+        local decl attrs status
+        if (( BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4 )) && eval '[[ -v $1 ]]'; then
+            __qontinui_attrs "$1"
+            attrs="${__qontinui_attrs_of}"
+        else
+            # A round that may not fork takes the name as readonly: nothing is
+            # assigned, the safe direction.
+            [ "${__qontinui_no_fork}" = 0 ] || return 0
+            __qontinui_forking=1
+            { decl="$(declare -p "$1" 2>/dev/null)"; } 2>/dev/null
+            status=$?
+            __qontinui_forking=0
+            [ "${status}" = 0 ] || return 1
+            attrs="${decl#declare -}"
+            attrs="${attrs%% *}"
+        fi
+        [[ "${attrs}" == *r* ]]
+    }
+fi
+
+# The newest history line and `pwd`, captured into __qontinui_history /
+# __qontinui_pwd. bash >= 5.3 runs `${ …; }` in this shell: no fork (an eval
+# string, so an older bash never parses it). Below 5.3 they are the silent
+# command substitutions described above.
+if (( BASH_VERSINFO[0] > 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 3) )); then
+    eval '__qontinui_read_history() { { __qontinui_history=${ HISTTIMEFORMAT= builtin history 1; }; } 2>/dev/null; }
+          __qontinui_read_pwd() { { __qontinui_pwd=${ builtin pwd; }; } 2>/dev/null; }'
+else
+    __qontinui_read_history() {
+        [ "${__qontinui_no_fork}" = 0 ] || return 1
+        local status
+        __qontinui_forking=1
+        { __qontinui_history="$(HISTTIMEFORMAT= builtin history 1)"; } 2>/dev/null
+        status=$?
+        __qontinui_forking=0
+        return "${status}"
+    }
+    __qontinui_read_pwd() {
+        [ "${__qontinui_no_fork}" = 0 ] || return 1
+        local status
+        __qontinui_forking=1
+        { __qontinui_pwd="$(builtin pwd)"; } 2>/dev/null
+        status=$?
+        __qontinui_forking=0
+        return "${status}"
+    }
+fi
 
 # HISTCMD as our LAST entry left it: the number the next history entry will
 # get, read after the user's entries ran (a `history -a; history -c; history -r`
@@ -100,21 +186,42 @@ unset __qontinui_histcmd
 # never a wrong one.
 __qontinui_prompt_start() {
     local code=$?
+    # The last round abandoned at a failed fork (see "Forks" above): its `$?`
+    # was the finished command's; this one's is the fork's. No fork this round.
+    if [ "${__qontinui_forking-0}" = 1 ]; then
+        code="${__qontinui_code-${code}}"
+        __qontinui_forking=0
+        __qontinui_no_fork=1
+    else
+        __qontinui_no_fork=0
+    fi
+    __qontinui_code="${code}"
     # bash < 4.4: from here to the reset (our LAST entry), nothing that runs is
     # the typed command line, so the DEBUG trap's once-per-line E/C stays spent
     # — an empty line, or one that ran only a subshell, never armed it.
     __qontinui_in_command=1
     if [ "${__qontinui_ps0_path}" = "1" ] && [ -n "${__qontinui_histcmd-}" ] &&
         [ -n "${HISTCMD-}" ] && [ "${HISTCMD-}" != "${__qontinui_histcmd-}" ]; then
-        local line
-        line="$(HISTTIMEFORMAT= builtin history 1)"
-        if [[ "${line}" =~ ^[[:space:]]*[0-9]+[*[:space:]]+(.*)$ ]]; then
+        __qontinui_history=""
+        if __qontinui_read_history &&
+            [[ "${__qontinui_history}" =~ ^[[:space:]]*[0-9]+[*[:space:]]+(.*)$ ]]; then
             local cmd="${BASH_REMATCH[1]//$'\n'/ }"
             __osc633 "E;${cmd//;/\\x3b}"
         fi
     fi
     __osc633 "D;${code}"
-    __osc633 "P;Cwd=$(pwd)"
+    # The cwd: $PWD while it still names this directory (`-ef .`) and `set -o
+    # physical` is off, which is then what `pwd` prints — no fork. Otherwise
+    # (physical; a PWD the user reassigned or unset) `pwd` itself. A PWD
+    # reassigned to ANOTHER name of this directory is sent as the user set it.
+    if [[ ! -o physical && "${PWD-}" == /* && "${PWD-}" -ef . ]]; then
+        __osc633 "P;Cwd=${PWD}"
+    else
+        __qontinui_pwd=""
+        if __qontinui_read_pwd && [ -n "${__qontinui_pwd}" ]; then
+            __osc633 "P;Cwd=${__qontinui_pwd}"
+        fi
+    fi
     return "${code}"
 }
 
@@ -154,8 +261,8 @@ __qontinui_prompt_end() {
 if ! __qontinui_is_readonly PROMPT_COMMAND; then
     __qontinui_pc_start='__qontinui_prompt_start && :'
     __qontinui_pc_end='__qontinui_prompt_end || :'
-    if [[ "$(declare -p PROMPT_COMMAND 2>/dev/null)" == "declare -a"* ]] &&
-        (( BASH_VERSINFO[0] > 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 1) )); then
+    if (( BASH_VERSINFO[0] > 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 1) )) &&
+        __qontinui_attrs PROMPT_COMMAND && [[ "${__qontinui_attrs_of}" == *a* ]]; then
         PROMPT_COMMAND=("${__qontinui_pc_start}" "${PROMPT_COMMAND[@]}" "${__qontinui_pc_end}")
     elif [ -n "${PROMPT_COMMAND-}" ]; then
         PROMPT_COMMAND="${__qontinui_pc_start}"$'\n'"${PROMPT_COMMAND-}"$'\n'"${__qontinui_pc_end}"
@@ -206,12 +313,17 @@ if ! __qontinui_is_readonly PROMPT_COMMAND; then
             __qontinui_in_command=0
         }
         PROMPT_COMMAND="${PROMPT_COMMAND-}"$'\n__qontinui_reset_command'
-        # Never over a DEBUG trap of the user's own (bash-preexec and the like).
-        if [ -z "$(trap -p DEBUG)" ]; then
+        # Never over a DEBUG trap of the user's own (bash-preexec and the like),
+        # nor where `trap -p` could not be read (a silent fork, once).
+        if { __qontinui_user_debug_trap="$(trap -p DEBUG)"; } 2>/dev/null &&
+            [ -z "${__qontinui_user_debug_trap}" ]; then
             trap '__qontinui_debug_trap' DEBUG
         fi
     fi
 fi
+# An install-time fork that failed (bash abandoned the install above) leaves
+# the flag set; the first prompt is a fresh round, not an abandoned one.
+__qontinui_forking=0
 
 # ── Claude Code runner context ─────────────────────────────────────────────
 # Wrap the `claude` command so sessions launched from this terminal

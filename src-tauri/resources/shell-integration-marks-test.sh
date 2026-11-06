@@ -93,6 +93,19 @@ bash_sends_e=1
 if (( BASH_VERSINFO[0] == 4 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] == 0) )); then
     bash_sends_e=0
 fi
+# What bash can still send with no fork at all (bash-at-a-process-ceiling):
+# 4.4 cannot install (its readonly check of an unset PROMPT_COMMAND forks), so
+# nothing; 5.0 installs fork-free and sends no E anyway; 5.1–5.2 install
+# fork-free, but the E read forks, fails and is skipped (bash abandons that
+# round and the guarded rerun sends the rest); 5.3 reads E in-process, so
+# everything.
+if (( BASH_VERSINFO[0] == 4 )); then
+    ceiling_run=" O " ceiling_max_m=0
+elif (( BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] <= 2 )); then
+    ceiling_run=" M A C O M A M A " ceiling_max_m=any
+else
+    ceiling_run="${marks}" ceiling_max_m=any
+fi
 
 fail() {
     echo "FAIL $1"
@@ -205,6 +218,31 @@ run_case() {
     out="$(type_lines "$@" |
         env -i PATH="${PATH}" HOME="${home}" TERM=dumb QONTINUI_RUNNER_TERMINAL=1 \
             timeout -k 2 20 script -q -e -c "bash --rcfile '${integ}' -i" /dev/null 2>&1)"
+    check_bash_case "${name}" "${home}" "${out}" "${want}" "${max_m}"
+}
+
+# run_slow_case — run_case for a case that waits in bash's own fork retries
+# (about 15 s per failed fork), so it gets a longer bound. Root is exempt from
+# `ulimit -u`, so a case that sets one needs a uid it binds.
+run_slow_case() {
+    local name="$1" want="$2" max_m="$3" rc="$4"
+    shift 4
+    case "${rc}" in
+        *"ulimit -u"*)
+            if [ "${EUID}" = 0 ]; then
+                echo "SKIP ${name}: root is exempt from ulimit -u"
+                return 0
+            fi
+            ;;
+    esac
+    local home="${tmp}/${name}"
+    mkdir -p "${home}"
+    printf '%s\n' "${rc}" >"${home}/.bashrc"
+    printf '%s\n' "${typed}" >"${home}/.bash_history"
+    local out
+    out="$(type_lines "$@" |
+        env -i PATH="${PATH}" HOME="${home}" TERM=dumb QONTINUI_RUNNER_TERMINAL=1 \
+            timeout -k 2 60 script -q -e -c "bash --rcfile '${integ}' -i" /dev/null 2>&1)"
     check_bash_case "${name}" "${home}" "${out}" "${want}" "${max_m}"
 }
 
@@ -328,6 +366,10 @@ run_case_input_moves stdin-on-another-terminal " A C O E A A " 1 'PS1="$ "' \
 run_case_input_moves rc-moves-stdin-and-stderr " A E A O E A A " 0 \
     "PS1='\$ '; exec 0<${other_tty:-/dev/null/no-second-terminal} 2>${other_tty:-/dev/null/no-second-terminal}" ""
 run_case stderr-reopened-by-its-path "${marks}" any 'PS1="$ "' 'exec 2>"$(tty)"'
+# At a process ceiling no fork succeeds: the prompt must stay silent (no error
+# text), the typed command must run, and no M or E may be sent that the checks
+# cannot back. What each bash still sends is set above (ceiling_run).
+run_slow_case bash-at-a-process-ceiling "${ceiling_run}" "${ceiling_max_m}" 'PS1="$ "; ulimit -u 1'
 # A shared history (`history -a; history -c; history -r` every prompt) that
 # another shell appended to: the reload renumbers the list, and the empty line
 # after it must not re-send the previous line's E.

@@ -3006,29 +3006,36 @@ mod script_tests {
         // Each case is one interactive bash or zsh behind `script(1)`, bounded
         // inside the script by `timeout -k 2 20` (20 s, then 2 s to the kill).
         // The budget is sized from that bound and the script's own case count
-        // (`run_case`, `run_case_input_moves` and `run_zsh_case` lines), so
-        // adding a case cannot outgrow it; this outer bound only catches a hang
-        // the per-case bound somehow missed.
+        // (`run_case`, `run_case_input_moves`, `run_zsh_case` and
+        // `run_slow_case` lines), so adding a case cannot outgrow it; this
+        // outer bound only catches a hang the per-case bound somehow missed.
+        // A `run_slow_case` waits in bash's own fork retries (about 15 s per
+        // failed fork), so it has its own, longer bound: 60 s, then 2 s.
         const CASE_BOUND: &str = "timeout -k 2 20 script";
         const CASE_WORST_SECS: u64 = 22;
-        assert!(
-            MARKS_TEST.contains(CASE_BOUND),
-            "the marks test bounds each case with `{CASE_BOUND}`; resize the budget with it"
-        );
-        let cases = MARKS_TEST
-            .lines()
-            .filter(|l| {
-                ["run_case ", "run_case_input_moves ", "run_zsh_case "]
-                    .iter()
-                    .any(|driver| l.starts_with(driver))
-            })
-            .count();
+        const SLOW_CASE_BOUND: &str = "timeout -k 2 60 script";
+        const SLOW_CASE_WORST_SECS: u64 = 62;
+        for bound in [CASE_BOUND, SLOW_CASE_BOUND] {
+            assert!(
+                MARKS_TEST.contains(bound),
+                "the marks test bounds its cases with `{bound}`; resize the budget with it"
+            );
+        }
+        let count = |drivers: &[&str]| {
+            let n = MARKS_TEST
+                .lines()
+                .filter(|l| drivers.iter().any(|driver| l.starts_with(driver)))
+                .count();
+            u64::try_from(n).expect("a handful of cases fits in u64")
+        };
+        let cases = count(&["run_case ", "run_case_input_moves ", "run_zsh_case "]);
+        let slow_cases = count(&["run_slow_case "]);
         assert!(
             cases > 0,
             "the marks test runs its cases with `run_case` / `run_case_input_moves` / `run_zsh_case`"
         );
-        let cases = u64::try_from(cases).expect("a handful of cases fits in u64");
-        let budget = Duration::from_secs(cases * CASE_WORST_SECS + 30);
+        let budget =
+            Duration::from_secs(cases * CASE_WORST_SECS + slow_cases * SLOW_CASE_WORST_SECS + 30);
 
         let _serial = exe_guard();
         let test = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -3138,6 +3145,36 @@ mod command_marks_scan_tests {
             BASH.contains(gate),
             "the PS0 path must be gated on bash >= 4.4"
         );
+    }
+
+    /// No bash read may print, or wedge the prompt, at a task/PID ceiling.
+    /// Every command substitution in the script (`$(…)`, and the 5.3
+    /// `${ …; }`) sits inside a `{ …; } 2>/dev/null` group, where bash's own
+    /// fork-retry text goes. A fork that still fails makes bash abandon
+    /// PROMPT_COMMAND and run it again, so every prompt-time fork is made
+    /// under `__qontinui_forking`, and a round that finds it still set takes
+    /// the abandoned round's status and makes no fork.
+    #[test]
+    fn bash_forks_only_inside_a_silent_group() {
+        let code_lines = BASH.lines().filter(|l| !l.trim_start().starts_with('#'));
+        for line in code_lines {
+            if line.contains("$(") || line.contains("${ ") {
+                assert!(
+                    line.contains("} 2>/dev/null"),
+                    "a bash command substitution outside a silent group: {line}"
+                );
+            }
+        }
+        const HISTORY_READ: &str = "    __qontinui_read_history() {\n        [ \"${__qontinui_no_fork}\" = 0 ] || return 1\n        local status\n        __qontinui_forking=1\n        { __qontinui_history=\"$(HISTTIMEFORMAT= builtin history 1)\"; } 2>/dev/null\n        status=$?\n        __qontinui_forking=0\n        return \"${status}\"\n    }";
+        const ABANDONED_ROUND: &str = "    if [ \"${__qontinui_forking-0}\" = 1 ]; then\n        code=\"${__qontinui_code-${code}}\"\n        __qontinui_forking=0\n        __qontinui_no_fork=1\n    else\n        __qontinui_no_fork=0\n    fi\n    __qontinui_code=\"${code}\"";
+        for (read, what) in [
+            (HISTORY_READ, "the E read forks only under __qontinui_forking, and not in a round that may not fork"),
+            (ABANDONED_ROUND, "a round after an abandoned one takes that round's status and makes no fork"),
+            ("        if __qontinui_read_history &&", "E is sent only when its read succeeded"),
+            ("    if [[ ! -o physical && \"${PWD-}\" == /* && \"${PWD-}\" -ef . ]]; then", "Cwd is $PWD, no fork, while it names the cwd"),
+        ] {
+            assert!(BASH.contains(read), "{what}: {read}");
+        }
     }
 
     /// PowerShell emits 633;C only from its PSReadLine hook, so the flag that
