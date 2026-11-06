@@ -6389,12 +6389,16 @@ async fn end_under_create_grant(
         admit_create_grant_end, create_grants, grants, now_epoch_secs, terminal_ended_frame,
         EndOutcome, EndVerdict,
     };
-    // Admission MARKS the terminal closing under the reaper's lock, so from
-    // here no attach can bind it before the close below (review finding 1).
-    let (block, terminal_id) = match admit_create_grant_end(
+    // Admission COUNTS this close in under the reaper's lock, so from here no
+    // attach can bind the terminal before the close below (review finding 1).
+    // The claim is dropped on every way out of this fn — a refusal, any
+    // outcome, a panic or a cancelled task — so it can never strand the
+    // terminal unattachable (re-review finding 1a).
+    let reaper = crate::mcp::remote_create_reaper::reaper();
+    let (block, claim) = match admit_create_grant_end(
         grants(),
         create_grants(),
-        &crate::mcp::remote_create_reaper::reaper(),
+        &reaper,
         crate::settings::get_remote_create_preference,
         qontinui_runner_lib::pair::read_paired_user_id_from_disk,
         data,
@@ -6403,7 +6407,9 @@ async fn end_under_create_grant(
         Ok(admitted) => admitted,
         Err(frame) => return frame,
     };
+    let terminal_id = claim.terminal_id().to_string();
     if tm.get(&terminal_id).is_none() {
+        claim.settle(true);
         let verdict = EndVerdict {
             outcome: EndOutcome::NotFound,
             via: None,
@@ -6418,16 +6424,14 @@ async fn end_under_create_grant(
         force,
         "remote end: admitted under a create grant — closing the terminal it spawned"
     );
-    let verdict = end_admitted_terminal(tm, &terminal_id, force).await;
-    // A definite "not closed" withdraws the closing mark, so the terminal is
-    // attachable again exactly as before the admission. Two answers keep it:
-    // `unknown` (the close may have landed, and refusing an attach to a terminal
-    // that may be dying is the safe side; the attach-deadline reaper still
-    // backstops it), and `end_already_running` (another admitted end is still
-    // driving this terminal and relies on the mark).
-    if create_close_definitely_failed(&verdict) {
-        crate::mcp::remote_create_reaper::release_create_close(&terminal_id);
-    }
+    // `ended` / `not_found` make the terminal unattachable for good; any other
+    // outcome — `end_already_running` included — only ends this claim, and the
+    // terminal stays unattachable exactly while another admitted close is in
+    // flight (re-review findings 1a/1b).
+    let verdict = crate::mcp::remote_create_reaper::run_create_close(claim, || {
+        end_admitted_terminal(tm, &terminal_id, force)
+    })
+    .await;
     info!(
         grant_jti = %block.grant_jti,
         terminal_id = %terminal_id,
@@ -6437,22 +6441,6 @@ async fn end_under_create_grant(
         "remote end: answered"
     );
     terminal_ended_frame(data, None, Some(&terminal_id), &verdict)
-}
-
-/// Did a create-grant close's end definitively leave the terminal running, so
-/// its closing mark should be withdrawn? `still_running`, and `refused` for any
-/// reason but [`END_ALREADY_RUNNING`](crate::mcp::remote_terminal::END_ALREADY_RUNNING)
-/// — that one means a concurrent end owns the terminal and still needs the mark.
-fn create_close_definitely_failed(verdict: &crate::mcp::remote_terminal::EndVerdict) -> bool {
-    use crate::mcp::remote_terminal::{EndOutcome, END_ALREADY_RUNNING};
-    match verdict.outcome {
-        EndOutcome::StillRunning => true,
-        EndOutcome::Refused => !verdict
-            .reason
-            .as_deref()
-            .is_some_and(|r| r.starts_with(END_ALREADY_RUNNING)),
-        EndOutcome::Ended | EndOutcome::NotFound | EndOutcome::Unknown => false,
-    }
 }
 
 /// TARGET role: end one ADMITTED remote end's terminal on `tm`. This is
@@ -9188,9 +9176,15 @@ mod remote_admission_tests {
         // Retention guard: dropping the reaper turns the refusal and the
         // closing mark off.
         assert!(
-            create.contains("&crate::mcp::remote_create_reaper::reaper(),"),
+            create.contains("let reaper = crate::mcp::remote_create_reaper::reaper();")
+                && create.contains("        &reaper,\n"),
             "the ever-attached refusal must claim through the reaper"
         );
+        // The claim is settled by the driver's verdict, never left behind.
+        let run = create
+            .find("remote_create_reaper::run_create_close(claim,")
+            .expect("the close runs under its claim");
+        assert!(admit < run, "admission before the claimed close");
         let driver = create
             .find("end_admitted_terminal(")
             .expect("the one driver");

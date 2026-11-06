@@ -189,18 +189,95 @@ struct Armed {
     /// `false` for an attach marker whose `arm` has not arrived yet. Only
     /// armed rows are ever reaped.
     armed: bool,
-    /// The source's create grant was ADMITTED to close this terminal
-    /// ([`RemoteCreateReaper::claim_create_close`]). From then on no attach
-    /// grant may bind it ([`RemoteCreateReaper::bind_attach`]): the close is
-    /// already committed, and an attach that slipped in after the admission
-    /// would be killed by it.
-    closing_under_create: bool,
+    /// How many create-grant closes are ADMITTED and not yet finished
+    /// ([`RemoteCreateReaper::claim_create_close`] increments it; dropping the
+    /// [`CreateCloseClaim`] decrements it, whatever the close did — including a
+    /// cancelled task). While it is non-zero no attach grant may bind the
+    /// terminal ([`RemoteCreateReaper::bind_attach`]): a close is committed, and
+    /// an attach that slipped in would be killed by it.
+    ///
+    /// A COUNT, not a flag (re-review findings 1a/1b): with a flag, one close's
+    /// outcome had to decide whether to clear a mark another in-flight close
+    /// still relied on — and whichever rule it picked either stranded the mark
+    /// (nobody left to clear it) or cleared it under a close about to run.
+    create_closes_in_flight: u32,
+    /// Sticky: some create-grant close reported the terminal `ended` or
+    /// `not_found`. Nothing may attach to it afterwards.
+    closed_under_create: bool,
 }
 
 /// [`RemoteCreateReaper::bind_attach`] refused: the terminal's create grant has
 /// already been admitted to close it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClosingUnderCreateGrant;
+
+impl Armed {
+    /// An admitted create-grant close is in flight, or one closed the terminal.
+    fn closing_under_create(&self) -> bool {
+        self.create_closes_in_flight > 0 || self.closed_under_create
+    }
+}
+
+/// One admitted create-grant close of one terminal: the claim
+/// [`RemoteCreateReaper::claim_create_close`] hands back, and the ONLY thing
+/// that ends it. Dropping it — on every return path, on a panic, and when the
+/// task running the close is cancelled — decrements the in-flight count, so an
+/// admitted close can never leave the terminal unattachable with nobody left
+/// to clear it. [`Self::settle`] also records the close's outcome.
+#[derive(Debug)]
+pub struct CreateCloseClaim<'a> {
+    reaper: &'a RemoteCreateReaper,
+    terminal_id: String,
+    closed: bool,
+}
+
+impl CreateCloseClaim<'_> {
+    /// The terminal this claim is for.
+    pub fn terminal_id(&self) -> &str {
+        &self.terminal_id
+    }
+
+    /// End the claim with the close's outcome: `closed` when the close reported
+    /// the terminal `ended` or `not_found`, which makes the terminal
+    /// unattachable for good. Any other outcome only ends this claim.
+    pub fn settle(mut self, closed: bool) {
+        self.closed = closed;
+    }
+}
+
+impl Drop for CreateCloseClaim<'_> {
+    fn drop(&mut self) {
+        // A missing row (the deadline sweep took it) has nothing to decrement:
+        // with no row, `bind_attach` blocks nothing either.
+        if let Some(row) = self.reaper.table().get_mut(&self.terminal_id) {
+            row.create_closes_in_flight = row.create_closes_in_flight.saturating_sub(1);
+            if self.closed {
+                row.closed_under_create = true;
+            }
+        }
+    }
+}
+
+/// Run one admitted create-grant close: `end` is the close's driver, and its
+/// verdict settles `claim` — `ended` / `not_found` mark the terminal closed,
+/// anything else only ends the claim. The claim is dropped however this future
+/// ends, cancellation included.
+pub async fn run_create_close<F, Fut>(
+    claim: CreateCloseClaim<'_>,
+    end: F,
+) -> crate::mcp::remote_terminal::EndVerdict
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = crate::mcp::remote_terminal::EndVerdict>,
+{
+    use crate::mcp::remote_terminal::EndOutcome;
+    let verdict = end().await;
+    claim.settle(matches!(
+        verdict.outcome,
+        EndOutcome::Ended | EndOutcome::NotFound
+    ));
+    verdict
+}
 
 /// One terminal the sweep decided to close.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -254,7 +331,8 @@ impl RemoteCreateReaper {
                 coord_session_id,
                 ever_attached: attached_already,
                 armed: true,
-                closing_under_create: false,
+                create_closes_in_flight: 0,
+                closed_under_create: false,
             },
         );
     }
@@ -289,7 +367,8 @@ impl RemoteCreateReaper {
                 coord_session_id: None,
                 ever_attached: true,
                 armed: false,
-                closing_under_create: false,
+                create_closes_in_flight: 0,
+                closed_under_create: false,
             });
     }
 
@@ -323,7 +402,7 @@ impl RemoteCreateReaper {
         let mut table = self.table();
         if table
             .get(terminal_id)
-            .is_some_and(|row| row.closing_under_create)
+            .is_some_and(Armed::closing_under_create)
         {
             return Err(ClosingUnderCreateGrant);
         }
@@ -335,47 +414,47 @@ impl RemoteCreateReaper {
     }
 
     /// Admit a create grant's close of `terminal_id`, and commit to it: check
-    /// that no attach grant ever bound the terminal and mark it closing, under
+    /// that no attach grant ever bound the terminal and count the close in, under
     /// one lock, so no attach can bind it in between (see [`Self::bind_attach`]).
     ///
-    /// `true` only when the row is armed, never attached, AND `bound_now` reads
+    /// `Some` only when the row is armed, never attached, AND `bound_now` reads
     /// the attach table and finds no live binding. `bound_now` answering `Err`
-    /// (the attach table could not be read) refuses — fail closed. Idempotent: a
-    /// retry of an admitted close is admitted again.
+    /// (the attach table could not be read) refuses — fail closed. A retry of an
+    /// admitted close is admitted again and counted separately.
     ///
-    /// No row refuses, for the reasons [`Self::was_ever_attached`] gives.
-    pub fn claim_create_close<F>(&self, terminal_id: &str, bound_now: F) -> bool
+    /// The returned [`CreateCloseClaim`] keeps the terminal unattachable until
+    /// it is dropped. No row refuses, for the reasons [`Self::was_ever_attached`]
+    /// gives.
+    pub fn claim_create_close<F>(
+        &self,
+        terminal_id: &str,
+        bound_now: F,
+    ) -> Option<CreateCloseClaim<'_>>
     where
         F: FnOnce() -> Result<bool, ()>,
     {
         let mut table = self.table();
-        let Some(row) = table.get_mut(terminal_id) else {
-            return false;
-        };
+        let row = table.get_mut(terminal_id)?;
         if !row.armed || row.ever_attached {
-            return false;
+            return None;
         }
         if bound_now() != Ok(false) {
-            return false;
+            return None;
         }
-        row.closing_under_create = true;
-        true
+        row.create_closes_in_flight = row.create_closes_in_flight.saturating_add(1);
+        Some(CreateCloseClaim {
+            reaper: self,
+            terminal_id: terminal_id.to_string(),
+            closed: false,
+        })
     }
 
-    /// Withdraw an admitted create-grant close whose end definitively did NOT
-    /// close the terminal (refused or still running), so the terminal is back to
-    /// where it was before the admission: attachable, and closable on a retry.
-    pub fn release_create_close(&self, terminal_id: &str) {
-        if let Some(row) = self.table().get_mut(terminal_id) {
-            row.closing_under_create = false;
-        }
-    }
-
-    /// Is a create-grant close admitted for `terminal_id`?
+    /// Is `terminal_id` closing (or closed) under a create grant, so an attach
+    /// would be refused?
     pub fn is_closing_under_create(&self, terminal_id: &str) -> bool {
         self.table()
             .get(terminal_id)
-            .is_some_and(|row| row.closing_under_create)
+            .is_some_and(Armed::closing_under_create)
     }
 
     /// May a create grant still close `terminal_id`? Only a row that is armed and
@@ -391,6 +470,14 @@ impl RemoteCreateReaper {
             .table()
             .get(terminal_id)
             .is_some_and(|row| row.armed && !row.ever_attached)
+    }
+
+    /// How many admitted create-grant closes of `terminal_id` are in flight.
+    #[cfg(test)]
+    pub fn create_closes_in_flight(&self, terminal_id: &str) -> u32 {
+        self.table()
+            .get(terminal_id)
+            .map_or(0, |row| row.create_closes_in_flight)
     }
 
     /// Apply [`decide`] to every armed terminal: `Reap` rows are removed and
@@ -612,11 +699,6 @@ pub fn arm_remote_created(
     coord_session_id: Option<String>,
 ) {
     arm_with_target(reaper(), tm, terminal_id, coord_session_id);
-}
-
-/// [`RemoteCreateReaper::release_create_close`] on the process-wide reaper.
-pub fn release_create_close(terminal_id: &str) {
-    reaper().release_create_close(terminal_id);
 }
 
 #[cfg(test)]
