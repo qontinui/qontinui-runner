@@ -409,9 +409,10 @@ pub fn diff_census(
     // and an open adopted one reads as the ledger reads it. The entry's
     // place (terminal, zone) and boot stamp (tier, boot time) come only from
     // rows observed EXACTLY as the merged verdict, so neither can contradict
-    // it: the place from the first such OPEN row (never the dead terminal of a
-    // closed predecessor), the stamp from the merged row itself when it has
-    // one, else from the first such row that does.
+    // it: the place from the first such OPEN row (a closed row only when every
+    // such row is closed), the stamp from the merged row itself when it has
+    // one, else from the first such row that does. `observe_restored` carries
+    // only THIS boot's stamps, so no fallback can reach a previous boot's.
     let mut best: Vec<&RestoredObservation> = Vec::new();
     let mut slot: HashMap<String, usize> = HashMap::new();
     let mut tiles: HashMap<String, (usize, &RestoredObservation)> = HashMap::new();
@@ -595,12 +596,14 @@ pub fn observe_restored(
             // An unstamped row counts only when the predicate has something
             // to say of THIS boot's pane: it is back, or it cannot be read.
             let adopted = matches!(observed, Some(Observed::Back | Observed::Unknown));
+            // A sticky stamp from a PREVIOUS boot is not this boot's
+            // evidence, so an adopted row carries none rather than an old one.
             (stamped || adopted).then(|| RestoredObservation {
                 claude_session_id: r.claude_session_id,
                 terminal_id: r.terminal_id,
                 zone_index: r.zone_index,
-                restore_tier: r.restore_tier,
-                restored_from_boot_at: r.restored_from_boot_at,
+                restore_tier: r.restore_tier.filter(|_| stamped),
+                restored_from_boot_at: r.restored_from_boot_at.filter(|_| stamped),
                 observed,
                 open: r.state == "open",
             })

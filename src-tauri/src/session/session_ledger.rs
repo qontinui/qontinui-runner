@@ -3554,6 +3554,26 @@ mod tests {
         assert_eq!(census.verdict, RESTORE_VERDICT_MATCH);
     }
 
+    /// An ADOPTED row still carrying a PREVIOUS boot's sticky stamp is observed
+    /// without it, so no census entry can report an old boot's tier as this
+    /// boot's restore.
+    #[test]
+    fn an_adopted_row_drops_a_previous_boots_stamp() {
+        use crate::session::restore_census::observe_restored;
+        let (_dir, store) = fresh_store();
+        let boot = boot_a_minute_ago();
+        let mut rec = store_rec(U1);
+        rec.restore_tier = Some(RESTORE_TIER_RESUMED.to_string());
+        rec.restored_from_boot_at = Some(boot - 3_600_000);
+        store.record_open(rec);
+        let live = view(vec![(format!("term-{U1}").as_str(), Ok(vec![resumed_proc(U1)]))]);
+        let observed = observe_restored(&store, boot, Some(&live));
+        assert_eq!(observed.len(), 1, "{observed:?}");
+        assert_eq!(observed[0].observed, Some(Observed::Back), "{observed:?}");
+        assert_eq!(observed[0].restore_tier, None, "{observed:?}");
+        assert_eq!(observed[0].restored_from_boot_at, None, "{observed:?}");
+    }
+
     /// The same session seen twice — on two registry rows, or listed twice in
     /// the prior ledger — counts once, with its strongest observation.
     #[test]
