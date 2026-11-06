@@ -236,6 +236,37 @@ jobs:
   # PR (head repo != this repo): an optional free guard the record allows on
   # top of the fork-approval gate, which stays at all_external_contributors.
   #
+  # PERSISTENT STATE IS SHARED ACROSS PR AND TRUSTED RUNS, DELIBERATELY. A
+  # same-repo PR job on the pool writes the same persistent per-registration
+  # cargo target and CARGO_HOME (and, on the light lane, the per-runner
+  # CARGO_HOME, e.g. the installed cargo-audit) that later main and
+  # merge-candidate runs reuse. The record accepts that: its 2026-11-04
+  # amendment holds that every PR here comes from a same-repo branch pushed by
+  # the operator or a fleet agent, so it runs the same code a push run would,
+  # and its 2026-10-04 amendment (item 2) forbids re-imposing a per-trust
+  # split of the pool. So the caches are NOT keyed by trust level. If outside
+  # PRs are ever accepted, that premise falls and this sharing must be
+  # revisited together with the record.
+  #
+  # A PR BACKLOG CAN SLOW A CANDIDATE, BUT NOT HOLD IT INDEFINITELY. The old
+  # reason PRs stayed hosted was that a PR backlog would saturate the pool and
+  # push merge candidates to the floor. What bounds it now:
+  #   - the workflow `concurrency` group (top of file) keeps ONE live
+  #     first-attempt run per PR and cancels the older one on every push;
+  #   - under `auto`, this router sends a leg to the hosted floor once the
+  #     pool is SATURATED (>= 4 queued) or STALLED (a job queued >= 10 min).
+  #     It reads the queue ONCE, when it decides, and never re-routes a leg
+  #     already sent to the pool: a candidate routed while up to 3 PR legs
+  #     are queued (none for 10 min) still waits behind them. So this bounds
+  #     how many PR legs a candidate can land behind, not how long they run.
+  #     On this public repo hosted is free (record, 2026-10-05 amendment), so
+  #     overflow costs a slower leg, never a stuck one;
+  #   - the light-lane jobs run on nawa's org pool (56 registrations on
+  #     2026-11-06), not the two-runner `qontinui-runner-ci` pool.
+  # The forced `self-hosted` lane has none of the router's overflow, so with
+  # PRs on the pool it is the setting under which a PR burst can delay a
+  # candidate: prefer `auto` while PR traffic is high.
+  #
   # This job stays HOSTED although it queued 10 m 40 s on 2026-11-03: both
   # required `test (…)` legs need it, and `timeout-minutes` does not count
   # queue time, so on a self-hosted label a down or saturated nawa would hold
@@ -2385,7 +2416,11 @@ jobs:
     name: Frontend unit tests (vitest)
     # Light self-hosted lane (RUNNER_CI_LIGHT_LANE, override RUNNER_CI_LANE_CI);
     # hosted for a fork PR or when the lane is not `self-hosted`.
-    runs-on: ${{ fromJSON(((vars.RUNNER_CI_LANE_CI || vars.RUNNER_CI_LIGHT_LANE) == 'self-hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && '["self-hosted","Linux","X64","qontinui-host-nawa","qontinui"]' || '"ubuntu-latest"') }}
+    # ram-16g: peak unmeasured, so the class is the 16 GiB hosted VM this job ran
+    # on until 2026-11-04, its one known-good bound. Every nawa org runner
+    # carries ram-2g..ram-40g (60 GiB units).
+    # coord-pools: [self-hosted, Linux, X64, qontinui-host-nawa, qontinui, ram-16g] | [ubuntu-latest]
+    runs-on: ${{ fromJSON(((vars.RUNNER_CI_LANE_CI || vars.RUNNER_CI_LIGHT_LANE) == 'self-hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && '["self-hosted","Linux","X64","qontinui-host-nawa","qontinui","ram-16g"]' || '"ubuntu-latest"') }}
     timeout-minutes: 15
     env:
       # vitest defaults to nproc - 1 workers: 3 on the hosted 4-core VM, 127 on
@@ -2435,7 +2470,10 @@ jobs:
   # test_fixtures.rs) asserts the same anchors from inside the debug test leg;
   # this job additionally holds if the whole module is ever removed.
   seam-gate:
-    runs-on: ${{ fromJSON(((vars.RUNNER_CI_LANE_CI || vars.RUNNER_CI_LIGHT_LANE) == 'self-hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && '["self-hosted","Linux","X64","qontinui-host-nawa","qontinui"]' || '"ubuntu-latest"') }}
+    # Light self-hosted lane, as frontend-tests. ram-2g: a checkout and three
+    # greps.
+    # coord-pools: [self-hosted, Linux, X64, qontinui-host-nawa, qontinui, ram-2g] | [ubuntu-latest]
+    runs-on: ${{ fromJSON(((vars.RUNNER_CI_LANE_CI || vars.RUNNER_CI_LIGHT_LANE) == 'self-hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && '["self-hosted","Linux","X64","qontinui-host-nawa","qontinui","ram-2g"]' || '"ubuntu-latest"') }}
 
     # 90 successful runs, 2026-08-08..08-20: p50 0.1m, p90 0.2m, max 0.4m —
     # a checkout plus three greps. 10 min is a floor rather than a multiple:
@@ -2495,7 +2533,11 @@ jobs:
     # setup-runner-per-runner-caches.sh), not the ~/.cargo every runner on the
     # box shares, so concurrent jobs do not race and a later job on the same
     # runner finds it installed.
-    runs-on: ${{ fromJSON(((vars.RUNNER_CI_LANE_CI || vars.RUNNER_CI_LIGHT_LANE) == 'self-hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && '["self-hosted","Linux","X64","qontinui-host-nawa","qontinui"]' || '"ubuntu-latest"') }}
+    # ram-16g: peak unmeasured, so the class is the 16 GiB hosted VM this job ran
+    # on until 2026-11-04, its one known-good bound. Every nawa org runner
+    # carries ram-2g..ram-40g (60 GiB units).
+    # coord-pools: [self-hosted, Linux, X64, qontinui-host-nawa, qontinui, ram-16g] | [ubuntu-latest]
+    runs-on: ${{ fromJSON(((vars.RUNNER_CI_LANE_CI || vars.RUNNER_CI_LIGHT_LANE) == 'self-hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && '["self-hosted","Linux","X64","qontinui-host-nawa","qontinui","ram-16g"]' || '"ubuntu-latest"') }}
 
     # 63 successful runs, 2026-08-08..08-20: p50 3.3m, p90 3.5m, max 4.3m.
     # 20 min = ~5.7x p90 / 4.6x the worst observed success, leaving room for a
@@ -2649,6 +2691,15 @@ jobs:
           # runner vulnerability). --locked pins to cargo-audit's tested deps.
           cargo install cargo-audit --locked
           cargo audit --file Cargo.lock --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 --ignore RUSTSEC-2026-0367 --ignore RUSTSEC-2026-0368 --ignore RUSTSEC-2026-0369 --ignore RUSTSEC-2026-0429 --ignore RUSTSEC-2026-0387
+
+      # A hosted image ships node; a nawa org runner is not known to, and pnpm
+      # needs it, so without this the audit below could run nothing behind its
+      # `|| true`. Caches off: this job installs no dependencies.
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: "20"
+          package-manager-cache: false
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
