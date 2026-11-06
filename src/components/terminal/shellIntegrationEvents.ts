@@ -97,11 +97,20 @@ export interface ShellMarksSink {
   outputLost(): void;
   /**
    * A chunk dropped unparsed while the pane is hidden: {@link outputLost}, but
-   * the clear behind the write queue is queued only when none is pending — a
-   * hidden pane drops a chunk per event, and nothing it drops is written, so
-   * one pending clear already sits behind everything written before the drops.
+   * the clear behind the write queue is queued only when one queued during the
+   * SAME hidden spell is pending — a hidden pane drops a chunk per event, and
+   * nothing it drops is written, so that clear already sits behind everything
+   * written before the drops. A pane shown in between ({@link resumed}) has
+   * written since (its resync replays the drops), so the next drop queues its
+   * own.
    */
   outputDropped(): void;
+  /**
+   * The pane is shown again: writes resume (the reveal resync first), so a
+   * clear queued before them no longer sits behind everything written, and the
+   * next {@link outputDropped} must queue a new one.
+   */
+  resumed(): void;
   /** The pane's `TerminalInstance` unmounted. */
   unmounted(): void;
   /**
@@ -138,7 +147,11 @@ export function shellMarksSink(
   const unobserved = () => emit({ type: "unobserved" });
   // Hidden drops coalesce their clear behind the write queue (see
   // `outputDropped`); an explicit loss always queues its own, at its position.
-  let dropClearQueued = false;
+  // The pending coalesced clear, by number (0: none). `resumed` forgets it, so
+  // a clear queued before the pane was shown stands for no later drop — and,
+  // when it runs, it cannot release a newer one's slot.
+  let pendingDropClear = 0;
+  let dropClears = 0;
   const lost = () => {
     if (replay !== null) replay.lost = true;
     unobserved();
@@ -169,13 +182,17 @@ export function shellMarksSink(
     },
     outputDropped: () => {
       lost();
-      if (!dropClearQueued) {
-        dropClearQueued = true;
+      if (pendingDropClear === 0) {
+        const clear = ++dropClears;
+        pendingDropClear = clear;
         queueBehindWrites(() => {
-          dropClearQueued = false;
+          if (pendingDropClear === clear) pendingDropClear = 0;
           unobserved();
         });
       }
+    },
+    resumed: () => {
+      pendingDropClear = 0;
     },
     unmounted: () => {
       replay = null;

@@ -501,8 +501,11 @@ describe("the stand-in pane matches the code it stands in for", () => {
   const backend = readFileSync(resolve(__dirname, "../backends/XtermBackend.ts"), "utf8");
 
   it("TerminalInstance drives the service and the LRU from its visible prop", () => {
+    // The effect also tells the pane's shell-marks sink it was shown
+    // (`shellIntegrationEvents.ts`); no zone-grid test parses marks, so the
+    // stand-in leaves that call out.
     expect(instance).toMatch(
-      /useEffect\(\(\) => \{\s*paneServiceRef\.current\?\.setVisible\(visible\);\s*setWebglSlotVisible\(terminalId, visible\);\s*\}, \[visible, terminalId\]\);/,
+      /useEffect\(\(\) => \{(?:\s*\/\/[^\n]*)*\s*if \(visible\) shellMarksRef\.current\?\.resumed\(\);\s*paneServiceRef\.current\?\.setVisible\(visible\);\s*setWebglSlotVisible\(terminalId, visible\);\s*\}, \[visible, terminalId\]\);/,
     );
     expect(instance).toContain("setWebglSlotVisible(terminalId, visibleRef.current);");
   });

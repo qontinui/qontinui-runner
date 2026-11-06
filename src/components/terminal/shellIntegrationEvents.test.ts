@@ -137,6 +137,42 @@ describe("shellMarksSink — hidden drops", () => {
     ]);
   });
 
+  it("queues a new clear for a drop after the pane was shown and its resync wrote", () => {
+    // Hidden, a drop: its clear (Q1) queues behind W0. Shown: the resync
+    // writes the dropped window back, ending at a prompt. Hidden again, a
+    // second drop: Q1 sits BEFORE the resync's prompt, so it cannot stand for
+    // this drop.
+    for (const second of ["outputDropped", "outputLost"] as const) {
+      const p = pane();
+      p.write(COMMAND_MARKS_CAPABILITY, "A"); // W0, before the pane hid
+      p.sink.outputDropped();
+      p.sink.resumed();
+      p.write("C", "D;0", COMMAND_MARKS_CAPABILITY, "A"); // the reveal resync
+      p.sink[second]();
+      p.parse();
+      expect(p.events.at(-1), second).toEqual({ type: "unobserved" });
+    }
+  });
+
+  it("never lets a clear queued before the pane was shown release a newer one's slot", () => {
+    const events: ShellIntegrationEvent[] = [];
+    const held: Array<() => void> = [];
+    const sink = shellMarksSink(
+      () => (e) => events.push(e),
+      (cb) => held.push(cb),
+    );
+    sink.outputDropped(); // Q1
+    sink.resumed();
+    sink.outputDropped(); // Q2: Q1 no longer stands for it
+    expect(held).toHaveLength(2);
+    held.shift()!(); // Q1 runs while Q2 is still pending
+    sink.outputDropped(); // still hidden, nothing written since Q2: coalesced
+    expect(held).toHaveLength(1);
+    held.shift()!(); // Q2 runs
+    sink.outputDropped(); // nothing pending: its own clear
+    expect(held).toHaveLength(1);
+  });
+
   it("queues an explicit loss's clear even while a drop's clear is pending", () => {
     const p = pane();
     p.sink.outputDropped();
@@ -292,6 +328,16 @@ describe("TerminalInstance wiring onto the sink (source scan)", () => {
 
   it("reports a resync's lost output through the ring-resync host", () => {
     expect(source).toContain("outputLost: () => shellMarks.outputLost(),");
+  });
+
+  it("tells the sink the pane was shown before the pane service resumes its writes", () => {
+    expect(source).toContain("shellMarksRef.current = shellMarks;");
+    const told = source.indexOf("if (visible) shellMarksRef.current?.resumed();");
+    expect(told).toBeGreaterThan(-1);
+    // The very next statement starts the writes.
+    const after = source.slice(told).indexOf("paneServiceRef.current?.setVisible(visible);");
+    expect(after).toBeGreaterThan(0);
+    expect(after).toBeLessThan(80);
   });
 
   it("reports the unmount from the mount effect's cleanup", () => {
