@@ -1414,3 +1414,47 @@ fn the_self_hosted_steps_are_split_by_operating_system() {
         );
     }
 }
+
+/// The Linux twin of the Windows guard test above. Same-repo pull requests may
+/// use the Linux pool (decision record self-hosted-runners-on-public-repos,
+/// 2026-11-04 amendment), but a FORK pull request and every re-run stay on the
+/// hosted floor. Both guards sit where removing them still leaves a valid
+/// expression, so only a pin like this notices one going missing.
+#[test]
+fn the_linux_pool_arms_keep_fork_prs_and_reruns_on_the_floor() {
+    let doc = ci_workflow();
+    const SAME_REPO: &str = "(github.event_name != 'pull_request' || \
+                             github.event.pull_request.head.repo.full_name == github.repository)";
+    let route_if = doc
+        .get("jobs")
+        .and_then(|j| j.get("route"))
+        .and_then(|j| j.get("if"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    assert_eq!(
+        route_if,
+        format!("${{{{ vars.RUNNER_CI_LINUX_LANE == 'auto' && {SAME_REPO} }}}}"),
+        "`route` must skip a fork pull_request and run only on the `auto` lane"
+    );
+    let runs_on = job_runs_on(&doc, "test");
+    let forced = format!(
+        "github.run_attempt == 1 && {SAME_REPO} && vars.RUNNER_CI_LINUX_LANE == 'self-hosted' && '[\"self-hosted\",\"Linux\""
+    );
+    assert!(
+        runs_on.contains(&forced),
+        "`test`'s forced Linux arm lost a guard: {runs_on}"
+    );
+    const ROUTED: &str = "needs.route.outputs.labels";
+    let reads: Vec<usize> = runs_on.match_indices(ROUTED).map(|(at, _)| at).collect();
+    assert!(
+        !reads.is_empty(),
+        "`test` never reads `{ROUTED}`: {runs_on}"
+    );
+    for at in reads {
+        assert!(
+            runs_on[..at].ends_with("github.run_attempt == 1 && "),
+            "`test` must read `{ROUTED}` on attempt 1 only: {runs_on}"
+        );
+    }
+}
