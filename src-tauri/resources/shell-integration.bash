@@ -9,6 +9,20 @@ if [ "${QONTINUI_INTEGRATION-}" = "1" ]; then
 fi
 export QONTINUI_INTEGRATION=1
 
+# The pane, by path: the terminal on stdin when this shell started, read
+# BEFORE the user's rc can redirect anything (one fork; `command`, so no
+# function or alias named `tty` stands in; silent if the fork itself fails).
+# Empty when `tty` fails or prints no path, and then no prompt announces the
+# capability (see "Prompt-state marks" below).
+if { __qontinui_pane_tty="$(command tty 2>/dev/null)"; } 2>/dev/null; then
+    case "${__qontinui_pane_tty}" in
+        /*) ;;
+        *) __qontinui_pane_tty="" ;;
+    esac
+else
+    __qontinui_pane_tty=""
+fi
+
 # Source user's bashrc (skipped when used as --rcfile)
 [ -f ~/.bashrc ] && source ~/.bashrc
 
@@ -39,9 +53,10 @@ __osc633() {
 # now (re-prefixed if something reassigned PS0 — a `source ~/.bashrc` — unless
 # PS0 is readonly), and both stdin (where the line is read) and stderr (where
 # bash writes PS0) are still the pane: the terminal this shell started on, by
-# its path, recorded once at install (`-ef`; not after `exec 2>/dev/null`,
-# `exec 2>>log`, `exec 2>/dev/pts/N` or `exec 0</dev/pts/N`; an `exec 2>&1`
-# or the pane re-opened by its own path still passes). `exec 2>/dev/tty`
+# its path, recorded once before the user's rc runs (`-ef`; not after an
+# `exec 2>/dev/null`, `exec 2>>log`, `exec 2>/dev/pts/N` or `exec
+# 0</dev/pts/N`, typed or in the rc; an `exec 2>&1` or the pane re-opened by
+# its own path still passes). `exec 2>/dev/tty`
 # fails it too, so it stops the announcement: the safe direction. With no
 # recorded pane (`tty` failed) nothing is announced. The DEBUG trap is never
 # announced: a user PROMPT_COMMAND's entries can spend its once-per-line C.
@@ -61,17 +76,6 @@ if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4) )
     __qontinui_ps0_path=1
 else
     __qontinui_ps0_path=0
-fi
-
-# The pane, by path: the terminal on stdin while this rc runs (one fork). Empty
-# when `tty` fails or prints no path, and then no prompt announces.
-if __qontinui_pane_tty="$(tty 2>/dev/null)"; then
-    case "${__qontinui_pane_tty}" in
-        /*) ;;
-        *) __qontinui_pane_tty="" ;;
-    esac
-else
-    __qontinui_pane_tty=""
 fi
 
 # Whether the variable named $1 is readonly (a fork; install time and the rare
