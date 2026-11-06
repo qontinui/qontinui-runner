@@ -622,6 +622,33 @@
     },
     {
       "class": "os_bound_tooling",
+      "file": "src/fleet/top_consumers.rs",
+      "symbol": "read_process",
+      "excerpt": "cfg(windows)-only fn `read_process` has no cfg(not(windows)) sibling in this file",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "Windows per-process reader for the top_consumers sample. Its Linux sibling is read_proc_dir under cfg(target_os = \"linux\"), and on every other OS collect_top returns None, so the field is omitted (UNKNOWN), never fabricated."
+    },
+    {
+      "class": "os_bound_tooling",
+      "file": "src/fleet/top_consumers.rs",
+      "symbol": "windows_creation_time",
+      "excerpt": "cfg(windows)-only fn `windows_creation_time` has no cfg(not(windows)) sibling in this file",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "Leaf of the Windows read_process (GetProcessTimes). Off Windows, started_at comes from /proc stat starttime + btime on Linux, and other OSes omit the field."
+    },
+    {
+      "class": "os_bound_tooling",
+      "file": "src/fleet/top_consumers.rs",
+      "symbol": "windows_image_name",
+      "excerpt": "cfg(windows)-only fn `windows_image_name` has no cfg(not(windows)) sibling in this file",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "Leaf of the Windows read_process (QueryFullProcessImageNameW on the opened handle). Its only caller is cfg(windows); off Windows the Linux /proc reader names processes from comm, and other OSes omit the field."
+    },
+    {
+      "class": "os_bound_tooling",
       "file": "src/fs_atomic.rs",
       "symbol": "is_transient_rename_denial",
       "excerpt": "cfg(windows)-only fn `is_transient_rename_denial` has no cfg(not(windows)) sibling in this file",
@@ -651,6 +678,15 @@
       "excerpt": "cfg(windows)-only fn `probe_ui_thread_blocking` has no cfg(not(windows)) sibling in this file",
       "count": 1,
       "disposition": "unreviewed"
+    },
+    {
+      "class": "os_bound_tooling",
+      "file": "src/health_monitor.rs",
+      "symbol": "process_memory_counters",
+      "excerpt": "cfg(windows)-only fn `process_memory_counters` has no cfg(not(windows)) sibling in this file",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "Windows PROCESS_MEMORY_COUNTERS_EX reader shared by the working-set probe and top_consumers. Its callers are themselves cfg(windows), and each has a non-Windows arm (the /proc reader, or an UNKNOWN reading), so no non-Windows box calls it."
     },
     {
       "class": "os_bound_tooling",
