@@ -96,6 +96,7 @@ pub mod spawn_prompt; // The spawn-time system-prompt carrier: ONE composed file
                       // Re-exported here so every `crate::session::tenant_pin::…` path is unchanged.
 pub use qontinui_runner_lib::tenant_pin;
 pub mod finished_close; // The wind-down executor's `finished_close` arm: switch, cadence, candidates, published custody (plan 2026-10-03-finished-runner-sessions-close-their-window-without-a-drain)
+pub mod terminal_door_key; // Door-scoped keys derived from a terminal's per-spawn secret (beside permission_accept's grant registry): how a loopback request proves WHICH terminal it comes from (plan 2026-11-05-transcript-bind-refuses-a-hosted-session-whose-only-key-is-the-workdir-nonce, Phase 2)
 pub mod tracking_health;
 pub mod transcript_autobind; // The watcher binds EVERY transcript it sees to a coord session (plan 2026-10-06-closed-sessions-whose-work-is-unfinished-are-found-fleet-wide-and-resumed, Phase 1)
 pub mod transcript_emitter;

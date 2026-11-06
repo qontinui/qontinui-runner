@@ -909,9 +909,50 @@ fn bind_error(
 type AdoptionCheck =
     std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>;
 
+/// The request header that carries a terminal's door-scoped proof for this
+/// door (lowercase, as `http::HeaderMap` stores names): the
+/// [`crate::session::terminal_door_key`] derivation of the hosting terminal's
+/// per-spawn secret for [`TRANSCRIPT_BIND_DOOR`]. Read only for a key that
+/// names no terminal (step 6, arm 3).
+pub(crate) const TERMINAL_PROOF_HEADER: &str = "x-qontinui-terminal-proof";
+
+/// This door's name in the door-key derivation. Hashed into the proof, so a
+/// proof for this door opens no other — the permission pad's included.
+pub(crate) const TRANSCRIPT_BIND_DOOR: &str = "transcript-bind";
+
+/// What the OPEN lifecycle record hosting a session says about it — the
+/// deterministic ownership leg of step 6.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SessionHost {
+    /// The runner terminal hosting the session.
+    pub terminal_id: String,
+    /// The session's working directory, when the record knows it: where the
+    /// terminal's credential lives when its cwd declares coord-mcp.
+    pub working_dir: Option<String>,
+    /// How the record's session id was bound — `authoritative` (the runner
+    /// knows it exactly), `reconciled` (a backstop recovered it, and it "may
+    /// name a foreign session"), `observed`; `None` on a legacy record, which
+    /// consumers read as reconciled.
+    pub origin: Option<String>,
+    /// When a provider hook confirmed a real session started in the terminal;
+    /// `None` is provisional.
+    pub confirmed_at: Option<i64>,
+}
+
+impl SessionHost {
+    /// Whether the record vouches that the session it names IS the one in its
+    /// terminal: bound authoritatively AND confirmed by a provider hook.
+    fn vouches_for_its_session(&self) -> bool {
+        self.origin.as_deref()
+            == Some(crate::session::session_lifecycle_store::ORIGIN_AUTHORITATIVE)
+            && self.confirmed_at.is_some()
+    }
+}
+
 /// Everything `transcript_bind_core` reads from the machine, injected so the
 /// tests drive every arm without the machine's settings, credential store,
-/// lifecycle store, coord, or a Tauri app.
+/// lifecycle store, coord, or a Tauri app. [`transcript_bind_env`] builds the
+/// production closures.
 pub(crate) struct TranscriptBindEnv {
     /// Transcript sync's gate for the caller's tenant: the tenant's
     /// `egress_transcript_sync` switch AND the user's own toggle
@@ -925,9 +966,18 @@ pub(crate) struct TranscriptBindEnv {
     /// or the refusal body.
     pub session_tenant:
         Box<dyn Fn(&str) -> Result<Option<uuid::Uuid>, serde_json::Value> + Send + Sync>,
-    /// claude session id → the runner terminal an OPEN lifecycle record hosts
-    /// it in, if any (the deterministic ownership leg).
-    pub session_terminal: Box<dyn Fn(&str) -> Option<String> + Send + Sync>,
+    /// claude session id → what the OPEN lifecycle record hosting it says, if
+    /// any record does (the deterministic ownership leg).
+    pub session_host: Box<dyn Fn(&str) -> Option<SessionHost> + Send + Sync>,
+    /// `(terminal, its session's workdir)` → the key that IS that terminal's
+    /// session credential ([`crate::coord_mcp::terminal_session_credential`]),
+    /// or the reason it cannot be named.
+    pub session_credential:
+        Box<dyn Fn(&str, Option<&str>) -> Result<String, &'static str> + Send + Sync>,
+    /// `(terminal, presented proof)` → does the proof prove that terminal
+    /// ([`crate::session::terminal_door_key::terminal_door_key_matches`] for
+    /// [`TRANSCRIPT_BIND_DOOR`])?
+    pub terminal_proven: Box<dyn Fn(&str, Option<&str>) -> bool + Send + Sync>,
     /// `(tenant, claude session, coord session)` → does coord say that coord
     /// row belongs to that Claude session in that tenant? `Err` carries why it
     /// could not be confirmed.
@@ -955,13 +1005,34 @@ pub(crate) struct TranscriptBindEnv {
 /// 2. **Tenant** — the nonce's session tenant from `session_tenant_or_refuse`,
 ///    the resolver the forwarder uses for its bearer; an unresolvable one is
 ///    refused, and the resolved tenant is what a fresh registration stamps.
-/// 3. **Ownership** — the session must belong to the nonce: an open lifecycle
-///    record hosting it in the nonce's own terminal is accepted, one hosting it
-///    in any other terminal is refused; an UNHOSTED session is accepted when
-///    its JSONL `cwd` is exactly the nonce's workdir (so any session of that
-///    workdir — not strictly the calling one — can be bound by a nonce for
-///    it), and no `cwd` record yet is refused. A nonce cannot bind another
-///    workdir's session.
+/// 3. **Ownership** — the session must be the caller's own. Exactly three
+///    paths admit it:
+///    - **hosted, per-terminal key** — an open lifecycle record hosts the
+///      session in the very terminal the nonce was minted for;
+///    - **hosted, shared key** — the nonce names NO terminal (the key in the
+///      cwd's `.mcp.json`, which every session started there shares), and all
+///      three hold: the hosting record is `authoritative` AND confirmed; the
+///      nonce IS the hosting terminal's session credential
+///      ([`crate::coord_mcp::terminal_session_credential`], so a fresh bind
+///      registers under the session's own tenant); and the request carries
+///      `X-Qontinui-Terminal-Proof` ([`TERMINAL_PROOF_HEADER`]), that
+///      terminal's door key ([`crate::session::terminal_door_key`]), which
+///      only a holder of the terminal's per-spawn secret can derive — a
+///      sibling sharing the key holds its own terminal's secret, never this
+///      one's;
+///    - **unhosted** — no open record hosts it, and its JSONL `cwd` is exactly
+///      the nonce's workdir (so any UNHOSTED session of that workdir — not
+///      strictly the calling one — can be bound by a nonce for it).
+///
+///    Everything else is refused `not_caller_session`, each with its own
+///    `detail` and none naming a path: a nonce naming another terminal; a
+///    shared key whose hosting record is not authoritative and confirmed, that
+///    is not the terminal's credential, or that comes without the terminal's
+///    proof (or with another's); a terminal whose credential this process
+///    cannot name (an adopted holder pane holds no recorded delivery and no
+///    grant); an unhosted session whose `cwd` differs or is not recorded yet.
+///    A nonce cannot bind another workdir's session, and a hosted session
+///    cannot be bound by a peer sharing its directory's key.
 /// 4. **Adoption** — a supplied `coord_session_id` is adopted only after coord
 ///    confirms (over the runner's device credential for that tenant) that the
 ///    row belongs to this Claude session; an unconfirmed id is refused and
@@ -976,7 +1047,7 @@ pub(crate) struct TranscriptBindEnv {
 /// - `401 {"error":"nonce_required"}` — no registered proxy nonce
 /// - `400 {"error":"malformed_request"|"malformed_id"}`
 /// - `403 {"error":"tenant_unresolvable"}` — the nonce's tenant is not knowable
-/// - `403 {"error":"not_caller_session"}` — the session is not the caller's
+/// - `403 {"error":"not_caller_session","detail":…}` — the session is not the caller's; the `detail` names the evidence that is missing (step 3)
 /// - `409 {"error":"sync_disabled"}` — the user's own transcript-sync toggle is off; nothing written
 /// - `409 {"error":"egress_off","flow":"transcript_sync"}` — the tenant's `egress_transcript_sync` switch is off; nothing written
 /// - `409 {"error":"registration_disabled"}` — the registrar declined the binding
@@ -1002,26 +1073,52 @@ async fn transcript_bind(
         .app_handle
         .try_state::<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>()
         .map(|s| s.inner().clone());
-    let env = TranscriptBindEnv {
+    let env = transcript_bind_env(tailer, lifecycle);
+    let (status, body) = transcript_bind_core(&headers, &body, env).await;
+    (status, Json(body))
+}
+
+/// The production [`TranscriptBindEnv`] over this runner's transcript tailer
+/// and lifecycle store — factored out of [`transcript_bind`] so a test builds
+/// the very closures the route runs.
+fn transcript_bind_env(
+    tailer: Option<Arc<crate::session::session_transcript_tailer::SessionTranscriptTailer>>,
+    lifecycle: Option<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>,
+) -> TranscriptBindEnv {
+    TranscriptBindEnv {
         transcript_gate: Box::new(crate::egress::transcript_sync_gate_for),
         tailer,
         watched_config_dirs: crate::terminal::transcript_watcher::watched_config_dirs(),
         session_tenant: Box::new(|nonce| {
             crate::coord_mcp::session_tenant_or_refuse(Some(nonce)).map_err(|r| r.json_body())
         }),
-        session_terminal: Box::new(move |csid| {
+        // Only an OPEN record with a real terminal hosts a session. A blank
+        // workdir is no workdir: it must never resolve `.mcp.json` against the
+        // runner's own cwd.
+        session_host: Box::new(move |csid| {
             lifecycle
                 .as_ref()
                 .and_then(|store| store.get(csid))
                 .filter(|rec| rec.state == "open" && !rec.terminal_id.trim().is_empty())
-                .map(|rec| rec.terminal_id)
+                .map(|rec| SessionHost {
+                    terminal_id: rec.terminal_id,
+                    working_dir: rec.working_dir.filter(|wd| !wd.trim().is_empty()),
+                    origin: rec.origin,
+                    confirmed_at: rec.confirmed_at,
+                })
+        }),
+        session_credential: Box::new(crate::coord_mcp::terminal_session_credential),
+        terminal_proven: Box::new(|terminal, proof| {
+            crate::session::terminal_door_key::terminal_door_key_matches(
+                terminal,
+                TRANSCRIPT_BIND_DOOR,
+                proof,
+            )
         }),
         confirm_adoption: Box::new(|tenant, csid, coord| {
             Box::pin(confirm_adoption_with_coord(tenant, csid, coord))
         }),
-    };
-    let (status, body) = transcript_bind_core(&headers, &body, env).await;
-    (status, Json(body))
+    }
 }
 
 /// Ask coord which row it resolves this Claude session to, in this tenant,
@@ -1064,6 +1161,77 @@ async fn confirm_adoption_with_coord(
             "coord resolves this claude session to row {id}, not {coord_session}"
         )),
         None => Err("coord's answer names no session_id".to_string()),
+    }
+}
+
+/// Step 6, arm 3: a session hosted in terminal T, presented with a key that
+/// names NO terminal. Such a key — the one in the cwd's `.mcp.json` — is
+/// shared by every session started in that directory, so on its own it cannot
+/// say which of them is calling, and the unhosted arm's workdir-wide authority
+/// must never reach a hosted session. The session is the caller's only when
+/// all three hold, checked in this order:
+///
+/// 1. T's lifecycle record vouches for the session it names: bound
+///    `authoritative` AND confirmed. A `reconciled` record may name a
+///    sibling's session, and a proof of T would then bind the sibling.
+/// 2. The key IS T's session credential (compared in constant time), so the
+///    tenant a fresh bind registers under is the session's own.
+/// 3. The request proves T: [`TERMINAL_PROOF_HEADER`] carries T's door key,
+///    derived from the per-spawn secret only T's environment holds — a
+///    sibling sharing the key holds its own terminal's secret, never T's.
+///
+/// `Err` is the refusal's reason, naming the evidence that is missing. Every
+/// arm that cannot read its evidence refuses: an adopted holder pane, or a
+/// terminal a previous runner process spawned, has no recorded delivery and
+/// no grant here. No reason carries a path.
+fn shared_key_owns_hosted_session(
+    host: &SessionHost,
+    nonce: &str,
+    proof: Option<&str>,
+    session_credential: &dyn Fn(&str, Option<&str>) -> Result<String, &'static str>,
+    terminal_proven: &dyn Fn(&str, Option<&str>) -> bool,
+) -> Result<(), String> {
+    if !host.vouches_for_its_session() {
+        // A legacy record with no origin reads as reconciled, as every
+        // consumer of the field reads it.
+        let origin = host
+            .origin
+            .as_deref()
+            .unwrap_or(crate::session::session_lifecycle_store::ORIGIN_RECONCILED);
+        let confirmation = if host.confirmed_at.is_some() {
+            ""
+        } else {
+            " and unconfirmed"
+        };
+        return Err(format!(
+            "its hosting terminal's lifecycle record is {origin}{confirmation}, not \
+             authoritative and confirmed, so it cannot prove whose session it is"
+        ));
+    }
+    match session_credential(&host.terminal_id, host.working_dir.as_deref()) {
+        Err(reason) => {
+            return Err(format!(
+                "its hosting terminal's credential is UNKNOWN to this runner process \
+                 ({reason}), so ownership is UNKNOWN and the bind is refused"
+            ));
+        }
+        Ok(credential) if !crate::session::terminal_door_key::secret_eq(&credential, nonce) => {
+            return Err("this key is not the credential of the session's terminal".to_string());
+        }
+        Ok(_) => {}
+    }
+    match proof {
+        None => Err(
+            "this key is shared by every session started in its directory, and the request \
+             carries no X-Qontinui-Terminal-Proof"
+                .to_string(),
+        ),
+        Some(proof) if !terminal_proven(&host.terminal_id, Some(proof)) => Err(
+            "the X-Qontinui-Terminal-Proof does not prove the hosting terminal: a wrong key, or \
+             a terminal this runner process did not spawn (an adopted pane holds no grant)"
+                .to_string(),
+        ),
+        Some(_) => Ok(()),
     }
 }
 
@@ -1199,11 +1367,14 @@ pub(crate) async fn transcript_bind_core(
         }
     };
 
-    // 6. Ownership: the caller's own session only. Hosting decides first —
-    // it is the stronger evidence: hosted in the nonce's own terminal is
-    // owned; hosted in ANY OTHER terminal is refused even when the cwd
-    // matches. Unhosted, the JSONL's own `cwd` must equal the nonce's workdir,
-    // and a file with no `cwd` record yet is refused rather than guessed.
+    // 6. Ownership: the caller's own session only (the route doc's step 3).
+    // Hosting decides first — it is the stronger evidence. Hosted in terminal
+    // T: (1) a key minted for T is owned; (2) a key minted for ANY OTHER
+    // terminal is refused, even when the cwd matches; (3) a key that names NO
+    // terminal is shared by every session of its directory, so it is owned
+    // only on T's own evidence ([`shared_key_owns_hosted_session`]). (4)
+    // Unhosted, the JSONL's own `cwd` must equal the nonce's workdir, and a
+    // file with no `cwd` record yet is refused rather than guessed.
     let nonce_terminal = crate::coord_mcp::terminal_id_for_nonce(&nonce);
     let nonce_workdir = crate::coord_mcp::workdir_for_nonce(&nonce);
     let not_caller = |why: &str| {
@@ -1213,10 +1384,27 @@ pub(crate) async fn transcript_bind_core(
             Some(format!("session {session_key} is not this caller's: {why}")),
         )
     };
-    match (env.session_terminal)(&session_key) {
-        Some(host) if nonce_terminal.as_deref() == Some(host.as_str()) => {}
-        Some(_) => {
-            return not_caller("it is hosted in a different runner terminal than this nonce's");
+    match (env.session_host)(&session_key) {
+        Some(host) if nonce_terminal.as_deref() == Some(host.terminal_id.as_str()) => {}
+        Some(_) if nonce_terminal.is_some() => {
+            return not_caller(
+                "this key belongs to another runner terminal than the one hosting it",
+            );
+        }
+        Some(host) => {
+            let proof = headers
+                .get(TERMINAL_PROOF_HEADER)
+                .and_then(|v| v.to_str().ok())
+                .filter(|v| !v.is_empty());
+            if let Err(why) = shared_key_owns_hosted_session(
+                &host,
+                &nonce,
+                proof,
+                &*env.session_credential,
+                &*env.terminal_proven,
+            ) {
+                return not_caller(&why);
+            }
         }
         None => {
             let (p, wd) = (path.clone(), nonce_workdir.clone());
@@ -2191,7 +2379,9 @@ mod tests {
         }
 
         /// A permissive environment: sync on, tenant resolvable, no hosting
-        /// terminal, adoption confirmed iff `confirm`.
+        /// terminal, adoption confirmed iff `confirm`. The hosted-arm evidence
+        /// fails closed: no terminal's credential can be named and no proof
+        /// proves anything.
         fn env(
             t: Option<Arc<SessionTranscriptTailer>>,
             cfg: Vec<PathBuf>,
@@ -2202,7 +2392,9 @@ mod tests {
                 tailer: t,
                 watched_config_dirs: cfg,
                 session_tenant: Box::new(|_| Ok(None)),
-                session_terminal: Box::new(|_| None),
+                session_host: Box::new(|_| None),
+                session_credential: Box::new(|_, _| Err("coord_mcp_delivery_unrecorded")),
+                terminal_proven: Box::new(|_, _| false),
                 confirm_adoption: Box::new(move |_, _, _| {
                     Box::pin(async move {
                         if confirm {
@@ -2278,22 +2470,30 @@ mod tests {
             assert!(outbox.pending().unwrap().is_empty());
         }
 
-        /// Hosting is stronger evidence than cwd: a session hosted in ANOTHER
-        /// runner terminal is refused even though its cwd is the nonce's
-        /// workdir.
+        /// Hosting is stronger evidence than cwd: a session hosted in one
+        /// runner terminal is refused for a key minted for ANOTHER terminal,
+        /// even though its cwd is that key's workdir. The key is a real
+        /// per-terminal device key from the seam — the case the name states.
+        /// (This test used to present a terminal-less agent key, which is the
+        /// shared-key arm, now T9.)
         #[tokio::test]
         async fn a_session_hosted_in_another_terminal_is_refused() {
+            let amb = crate::test_env::isolated_ambient();
             let dir = tempfile::tempdir().unwrap();
             let (t, outbox) = tailer(dir.path());
-            let (nonce, wd) = registered_nonce();
+            let key = per_terminal_key(&amb, &terminal());
+            let wd = crate::coord_mcp::workdir_for_nonce(&key).expect("workdir");
             let csid = uuid::Uuid::new_v4().to_string();
             let cfg = config_with(dir.path(), &csid, &wd);
             let mut e = env(Some(t), vec![cfg], true);
-            e.session_terminal = Box::new(|_| Some("some-other-terminal".to_string()));
-            let (status, v) = transcript_bind_core(&bearer(&nonce), &body(&csid), e).await;
-            assert_eq!(status, StatusCode::FORBIDDEN, "{v}");
-            assert_eq!(v["error"], "not_caller_session");
-            assert!(outbox.pending().unwrap().is_empty());
+            let hosting = host(&terminal(), &wd);
+            e.session_host = Box::new(move |_| Some(hosting.clone()));
+            let (status, v) = transcript_bind_core(&bearer(&key), &body(&csid), e).await;
+            let detail = refused(status, &v, &outbox, &[wd.as_str()]);
+            assert!(
+                detail.contains("belongs to another runner terminal"),
+                "{detail}"
+            );
         }
 
         /// No `cwd` record yet: refused, never guessed from the directory name.
@@ -2495,6 +2695,701 @@ mod tests {
             let (status, v) = call(&bearer(&nonce), &body_adopting(&b, requested), mk).await;
             assert_eq!(status, StatusCode::CONFLICT, "{v}");
             assert_eq!(v["error"], "coord_session_in_use");
+        }
+
+        // =====================================================================
+        // Step 6 — a HOSTED session presented with a key that names no
+        // terminal (plan
+        // 2026-11-05-transcript-bind-refuses-a-hosted-session-whose-only-key-is-the-workdir-nonce,
+        // Phase 2). T1-T11 enumerate every arm of the ownership step, the
+        // failure arms included. Each refusal asserts the outbox is empty and
+        // that its detail names no path.
+        // =====================================================================
+
+        /// The port the real config writers record; nothing listens on it.
+        const PORT: u16 = 23_917;
+
+        fn terminal() -> String {
+            format!("term-{}", uuid::Uuid::new_v4())
+        }
+
+        /// A fresh directory under `dir`, so no other test's keys share it.
+        fn fresh_workdir(dir: &std::path::Path) -> String {
+            let wd = dir.join(format!("wd-{}", uuid::Uuid::new_v4().simple()));
+            std::fs::create_dir_all(&wd).unwrap();
+            wd.to_string_lossy().to_string()
+        }
+
+        /// The coord-mcp key `<wd>/.mcp.json` carries, read the way the runner
+        /// reads it (through the stdio credential file when there is one).
+        fn cwd_key(wd: &str) -> String {
+            let raw = std::fs::read_to_string(std::path::Path::new(wd).join(".mcp.json"))
+                .expect("the writer wrote .mcp.json");
+            let doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            crate::coord_mcp_config::proxy_nonce_from_config_doc(&doc).expect("a runner key")
+        }
+
+        /// The SHARED key: what the cwd `.mcp.json` writer mints — a DEVICE
+        /// key that names no terminal, read by every session started in that
+        /// directory. Written by the real writer into a fresh directory under
+        /// `dir`; returns `(key, the workdir it is bound to)`.
+        fn shared_cwd_key(dir: &std::path::Path) -> (String, String) {
+            let wd = fresh_workdir(dir);
+            crate::coord_mcp::write_coord_mcp_proxy_config(&wd, PORT, None);
+            let key = cwd_key(&wd);
+            assert_eq!(crate::coord_mcp::terminal_id_for_nonce(&key), None);
+            assert_eq!(
+                crate::coord_mcp::proxy_principal_for_nonce(&key),
+                Some(crate::coord_mcp::ProxyPrincipal::Device)
+            );
+            let bound = crate::coord_mcp::workdir_for_nonce(&key).expect("workdir");
+            (key, bound)
+        }
+
+        /// A PER-TERMINAL key: what the seam mints for `terminal` when its cwd
+        /// declares no coord-mcp. Its config file lands in app data, hence the
+        /// ambient fixture.
+        fn per_terminal_key(amb: &crate::test_env::IsolatedAmbient, terminal: &str) -> String {
+            let wd = fresh_workdir(amb.dir());
+            let delivered =
+                crate::coord_mcp::deliver_terminal_coord_mcp(&wd, terminal, None, Some(PORT))
+                    .expect("an unpinned spawn is admitted");
+            assert_eq!(
+                delivered.delivery,
+                crate::coord_mcp::CoordMcpDelivery::Provisioned
+            );
+            let path = delivered
+                .config_path
+                .expect("a bound port provisions a file");
+            let doc: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+            let key = crate::coord_mcp_config::proxy_nonce_from_config_doc(&doc).unwrap();
+            assert_eq!(
+                crate::coord_mcp::terminal_id_for_nonce(&key).as_deref(),
+                Some(terminal)
+            );
+            key
+        }
+
+        /// Record `terminal` as spawned by this process — the grant the spawn
+        /// path registers — and return its per-spawn secret.
+        fn grant(terminal: &str) -> String {
+            let secret = crate::session::permission_accept::new_nonce();
+            crate::session::permission_accept::register_terminal_grant(
+                terminal,
+                secret.clone(),
+                None,
+            );
+            secret
+        }
+
+        fn forget(terminal: &str, secret: &str) {
+            crate::session::permission_accept::forget_terminal_grant(terminal, secret);
+        }
+
+        /// `headers` plus this door's proof, derived from `secret` exactly as
+        /// the client derives it from `$QONTINUI_PERMREQ_NONCE`.
+        fn with_proof(mut headers: HeaderMap, secret: &str) -> HeaderMap {
+            let proof = crate::session::terminal_door_key::terminal_door_key_for(
+                TRANSCRIPT_BIND_DOOR,
+                secret,
+            );
+            headers.insert(TERMINAL_PROOF_HEADER, proof.parse().unwrap());
+            headers
+        }
+
+        /// What an `authoritative`, confirmed open record says about a session
+        /// hosted in `terminal` — the shape all 33 open records had on nilan.
+        fn host(terminal: &str, working_dir: &str) -> SessionHost {
+            SessionHost {
+                terminal_id: terminal.to_string(),
+                working_dir: Some(working_dir.to_string()),
+                origin: Some(
+                    crate::session::session_lifecycle_store::ORIGIN_AUTHORITATIVE.to_string(),
+                ),
+                confirmed_at: Some(1),
+            }
+        }
+
+        /// [`env`] for a session hosted per `host`, whose terminal's
+        /// credential is `credential` (every other terminal's is UNKNOWN), and
+        /// with the REAL door-key check over this process's grants.
+        fn hosted_env(
+            t: Option<Arc<SessionTranscriptTailer>>,
+            cfg: Vec<PathBuf>,
+            host: SessionHost,
+            credential: Result<String, &'static str>,
+        ) -> TranscriptBindEnv {
+            let mut e = env(t, cfg, true);
+            let host_terminal = host.terminal_id.clone();
+            e.session_host = Box::new(move |_| Some(host.clone()));
+            e.session_credential = Box::new(move |terminal, _| {
+                if terminal == host_terminal {
+                    credential.clone()
+                } else {
+                    Err("coord_mcp_delivery_unrecorded")
+                }
+            });
+            e.terminal_proven = Box::new(|terminal, proof| {
+                crate::session::terminal_door_key::terminal_door_key_matches(
+                    terminal,
+                    TRANSCRIPT_BIND_DOOR,
+                    proof,
+                )
+            });
+            e
+        }
+
+        /// A `not_caller_session` refusal that wrote nothing and whose detail
+        /// names none of `paths`; returns the detail.
+        fn refused(
+            status: StatusCode,
+            v: &serde_json::Value,
+            outbox: &OutboxWriter,
+            paths: &[&str],
+        ) -> String {
+            assert_eq!(status, StatusCode::FORBIDDEN, "{v}");
+            assert_eq!(v["error"], "not_caller_session", "{v}");
+            let detail = v["detail"].as_str().expect("every refusal has a detail");
+            for path in paths {
+                assert!(!detail.contains(path), "a detail named a path: {detail}");
+            }
+            assert!(
+                outbox.pending().unwrap().is_empty(),
+                "a refusal wrote: {detail}"
+            );
+            detail.to_string()
+        }
+
+        /// T1, the live shape: a hosted session whose only key is its cwd's
+        /// shared key — its terminal's credential — with its terminal's proof
+        /// binds and replays; a second call is `already_bound` and replays
+        /// nothing.
+        #[tokio::test]
+        async fn t1_a_hosted_sessions_shared_key_with_its_terminals_proof_binds() {
+            let dir = tempfile::tempdir().unwrap();
+            let (t, _outbox) = tailer(dir.path());
+            let (key, wd) = shared_cwd_key(dir.path());
+            let csid = uuid::Uuid::new_v4().to_string();
+            let cfg = config_with(dir.path(), &csid, &wd);
+            let file_len =
+                std::fs::metadata(cfg.join("projects").join("p").join(format!("{csid}.jsonl")))
+                    .unwrap()
+                    .len();
+            let term = terminal();
+            let secret = grant(&term);
+            let mk = || {
+                hosted_env(
+                    Some(t.clone()),
+                    vec![cfg.clone()],
+                    host(&term, &wd),
+                    Ok(key.clone()),
+                )
+            };
+            let headers = with_proof(bearer(&key), &secret);
+
+            let (status, v) = call(&headers, &body(&csid), mk).await;
+            assert_eq!(status, StatusCode::OK, "{v}");
+            assert_eq!(v["bound"], true);
+            assert_eq!(v["already_bound"], false);
+            assert_eq!(v["replayed_bytes"], file_len);
+            assert_eq!(v["replayed_chunks"], 1);
+            assert!(v["replay_stopped_at"].is_null());
+            let first_row = v["coord_session_id"].clone();
+
+            let (status, v) = call(&headers, &body(&csid), mk).await;
+            assert_eq!(status, StatusCode::OK, "{v}");
+            assert_eq!(v["already_bound"], true);
+            assert_eq!(v["coord_session_id"], first_row, "no second row");
+            assert_eq!(v["replayed_bytes"], 0);
+            assert_eq!(v["replayed_chunks"], 0);
+            forget(&term, &secret);
+        }
+
+        /// T2: T1 without the proof — today's refusal, now honest about what
+        /// is missing. An empty header is no proof, and the terminal's own
+        /// permission-pad request key is not this door's proof either.
+        #[tokio::test]
+        async fn t2_a_hosted_sessions_shared_key_without_its_terminals_proof_is_refused() {
+            let dir = tempfile::tempdir().unwrap();
+            let (t, outbox) = tailer(dir.path());
+            let (key, wd) = shared_cwd_key(dir.path());
+            let csid = uuid::Uuid::new_v4().to_string();
+            let cfg = config_with(dir.path(), &csid, &wd);
+            let term = terminal();
+            let secret = grant(&term);
+            let mk = || {
+                hosted_env(
+                    Some(t.clone()),
+                    vec![cfg.clone()],
+                    host(&term, &wd),
+                    Ok(key.clone()),
+                )
+            };
+            let dir_path = dir.path().to_string_lossy().to_string();
+            let paths = [wd.as_str(), dir_path.as_str()];
+
+            let (status, v) = transcript_bind_core(&bearer(&key), &body(&csid), mk()).await;
+            let detail = refused(status, &v, &outbox, &paths);
+            assert!(
+                detail.contains("carries no X-Qontinui-Terminal-Proof"),
+                "{detail}"
+            );
+
+            let mut empty = bearer(&key);
+            empty.insert(TERMINAL_PROOF_HEADER, "".parse().unwrap());
+            let (status, v) = transcript_bind_core(&empty, &body(&csid), mk()).await;
+            let detail = refused(status, &v, &outbox, &paths);
+            assert!(detail.contains("carries no"), "{detail}");
+
+            let mut pad_key = bearer(&key);
+            pad_key.insert(
+                TERMINAL_PROOF_HEADER,
+                crate::session::permission_accept::request_key_for(&secret)
+                    .parse()
+                    .unwrap(),
+            );
+            let (status, v) = transcript_bind_core(&pad_key, &body(&csid), mk()).await;
+            let detail = refused(status, &v, &outbox, &paths);
+            assert!(
+                detail.contains("does not prove the hosting terminal"),
+                "{detail}"
+            );
+            forget(&term, &secret);
+        }
+
+        /// T3, a sibling: B's session is hosted in terminal B, in the same
+        /// directory, so the shared key IS terminal B's credential too — and
+        /// the request carries terminal A's proof. Refused, nothing written:
+        /// the peer-binding case the proof exists for.
+        #[tokio::test]
+        async fn t3_a_sibling_presenting_another_terminals_proof_is_refused() {
+            let dir = tempfile::tempdir().unwrap();
+            let (t, outbox) = tailer(dir.path());
+            let (key, wd) = shared_cwd_key(dir.path());
+            let sibling = uuid::Uuid::new_v4().to_string();
+            let cfg = config_with(dir.path(), &sibling, &wd);
+            let (a, b) = (terminal(), terminal());
+            let (secret_a, secret_b) = (grant(&a), grant(&b));
+
+            let e = hosted_env(Some(t), vec![cfg], host(&b, &wd), Ok(key.clone()));
+            let (status, v) =
+                transcript_bind_core(&with_proof(bearer(&key), &secret_a), &body(&sibling), e)
+                    .await;
+            let detail = refused(status, &v, &outbox, &[wd.as_str()]);
+            assert!(
+                detail.contains("does not prove the hosting terminal"),
+                "{detail}"
+            );
+            forget(&a, &secret_a);
+            forget(&b, &secret_b);
+        }
+
+        /// T4: a key that is not the hosting terminal's credential (the
+        /// terminal's credential is ANOTHER key), with a valid proof of that
+        /// terminal — refused.
+        #[tokio::test]
+        async fn t4_a_shared_key_that_is_not_the_terminals_credential_is_refused() {
+            let dir = tempfile::tempdir().unwrap();
+            let (t, outbox) = tailer(dir.path());
+            let (key, wd) = shared_cwd_key(dir.path());
+            let (credential, _) = shared_cwd_key(dir.path());
+            assert_ne!(key, credential);
+            let csid = uuid::Uuid::new_v4().to_string();
+            let cfg = config_with(dir.path(), &csid, &wd);
+            let term = terminal();
+            let secret = grant(&term);
+
+            let e = hosted_env(Some(t), vec![cfg], host(&term, &wd), Ok(credential));
+            let (status, v) =
+                transcript_bind_core(&with_proof(bearer(&key), &secret), &body(&csid), e).await;
+            let detail = refused(status, &v, &outbox, &[wd.as_str()]);
+            assert!(
+                detail.contains("not the credential of the session's terminal"),
+                "{detail}"
+            );
+            forget(&term, &secret);
+        }
+
+        /// T5: a key minted for ANOTHER terminal, presented with a valid proof
+        /// of the host — and built so every OTHER condition of the shared-key
+        /// arm holds (the record vouches, and the host's credential IS the
+        /// presented key), so only the another-terminal arm can refuse it. A
+        /// peer's per-terminal key stays refused.
+        #[tokio::test]
+        async fn t5_another_terminals_key_is_refused_even_when_all_else_holds() {
+            let amb = crate::test_env::isolated_ambient();
+            let dir = tempfile::tempdir().unwrap();
+            let (t, outbox) = tailer(dir.path());
+            let other = terminal();
+            let key = per_terminal_key(&amb, &other);
+            let wd = crate::coord_mcp::workdir_for_nonce(&key).expect("workdir");
+            let csid = uuid::Uuid::new_v4().to_string();
+            let cfg = config_with(dir.path(), &csid, &wd);
+            let term = terminal();
+            let secret = grant(&term);
+
+            let e = hosted_env(Some(t), vec![cfg], host(&term, &wd), Ok(key.clone()));
+            let (status, v) =
+                transcript_bind_core(&with_proof(bearer(&key), &secret), &body(&csid), e).await;
+            let detail = refused(status, &v, &outbox, &[wd.as_str()]);
+            assert!(
+                detail.contains("belongs to another runner terminal"),
+                "{detail}"
+            );
+            forget(&term, &secret);
+        }
+
+        /// T6: the hosting terminal's credential cannot be named — every
+        /// reason the resolver gives — with a valid proof. Refused, and the
+        /// detail carries the reason: ownership is UNKNOWN, never assumed.
+        #[tokio::test]
+        async fn t6_an_unknown_terminal_credential_is_refused_with_its_reason() {
+            let dir = tempfile::tempdir().unwrap();
+            let (t, outbox) = tailer(dir.path());
+            let (key, wd) = shared_cwd_key(dir.path());
+            let csid = uuid::Uuid::new_v4().to_string();
+            let cfg = config_with(dir.path(), &csid, &wd);
+            let term = terminal();
+            let secret = grant(&term);
+
+            for reason in [
+                "coord_mcp_delivery_unrecorded",
+                "no_session_nonce",
+                "no_runner_nonce_in_cwd_file",
+            ] {
+                let e = hosted_env(
+                    Some(t.clone()),
+                    vec![cfg.clone()],
+                    host(&term, &wd),
+                    Err(reason),
+                );
+                let (status, v) =
+                    transcript_bind_core(&with_proof(bearer(&key), &secret), &body(&csid), e).await;
+                let detail = refused(status, &v, &outbox, &[wd.as_str()]);
+                assert!(detail.contains(reason), "{detail}");
+                assert!(detail.contains("UNKNOWN"), "{detail}");
+            }
+            forget(&term, &secret);
+        }
+
+        /// T7: the host's OWN per-terminal key needs no proof — the first arm
+        /// is unchanged. It consults none of the shared-key evidence: the
+        /// record here is reconciled and unconfirmed, no credential can be
+        /// named and the terminal holds no grant, and it still binds.
+        #[tokio::test]
+        async fn t7_the_hosts_own_per_terminal_key_binds_without_a_proof() {
+            let amb = crate::test_env::isolated_ambient();
+            let dir = tempfile::tempdir().unwrap();
+            let (t, _outbox) = tailer(dir.path());
+            let term = terminal();
+            let key = per_terminal_key(&amb, &term);
+            let wd = crate::coord_mcp::workdir_for_nonce(&key).expect("workdir");
+            let csid = uuid::Uuid::new_v4().to_string();
+            let cfg = config_with(dir.path(), &csid, &wd);
+            let mut record = host(&term, &wd);
+            record.origin =
+                Some(crate::session::session_lifecycle_store::ORIGIN_RECONCILED.to_string());
+            record.confirmed_at = None;
+
+            let (status, v) = call(&bearer(&key), &body(&csid), || {
+                hosted_env(
+                    Some(t.clone()),
+                    vec![cfg.clone()],
+                    record.clone(),
+                    Err("coord_mcp_delivery_unrecorded"),
+                )
+            })
+            .await;
+            assert_eq!(status, StatusCode::OK, "{v}");
+            assert_eq!(v["bound"], true);
+        }
+
+        /// T8, the resume shapes: a session id no open lifecycle record holds
+        /// (an in-process `/resume` the store does not know) takes the cwd
+        /// arm, unchanged — the shared key binds it when its JSONL `cwd` is
+        /// the key's workdir, and is refused when it is not.
+        #[tokio::test]
+        async fn t8_an_unhosted_session_keeps_the_cwd_arm() {
+            let dir = tempfile::tempdir().unwrap();
+            let (t, outbox) = tailer(dir.path());
+            let (key, wd) = shared_cwd_key(dir.path());
+
+            let elsewhere = uuid::Uuid::new_v4().to_string();
+            let cfg = config_with(dir.path(), &elsewhere, "/some/other/workdir");
+            let (status, v) = transcript_bind_core(
+                &bearer(&key),
+                &body(&elsewhere),
+                env(Some(t.clone()), vec![cfg.clone()], true),
+            )
+            .await;
+            let detail = refused(status, &v, &outbox, &[wd.as_str()]);
+            assert!(
+                detail.contains("its JSONL's cwd is not this nonce's workdir"),
+                "{detail}"
+            );
+
+            let resumed = uuid::Uuid::new_v4().to_string();
+            config_with(dir.path(), &resumed, &wd);
+            let (status, v) = call(&bearer(&key), &body(&resumed), || {
+                env(Some(t.clone()), vec![cfg.clone()], true)
+            })
+            .await;
+            assert_eq!(status, StatusCode::OK, "{v}");
+            assert_eq!(v["bound"], true);
+        }
+
+        /// T9: a terminal-less AGENT key that is NOT the hosting terminal's
+        /// credential (that is the cwd's device key), with a valid proof of
+        /// the host — refused. (An agent key that IS the credential is
+        /// admitted; T10's agent-worktree variant pins that through the
+        /// production seam.)
+        #[tokio::test]
+        async fn t9_an_agent_key_that_is_not_the_terminals_credential_is_refused() {
+            let dir = tempfile::tempdir().unwrap();
+            let (t, outbox) = tailer(dir.path());
+            let (agent_key, agent_wd) = registered_nonce();
+            let (device_key, _) = shared_cwd_key(dir.path());
+            let csid = uuid::Uuid::new_v4().to_string();
+            let cfg = config_with(dir.path(), &csid, &agent_wd);
+            let term = terminal();
+            let secret = grant(&term);
+
+            let e = hosted_env(Some(t), vec![cfg], host(&term, &agent_wd), Ok(device_key));
+            let (status, v) =
+                transcript_bind_core(&with_proof(bearer(&agent_key), &secret), &body(&csid), e)
+                    .await;
+            let detail = refused(status, &v, &outbox, &[agent_wd.as_str()]);
+            assert!(
+                detail.contains("not the credential of the session's terminal"),
+                "{detail}"
+            );
+            forget(&term, &secret);
+        }
+
+        /// T11: T1's inputs, but the hosting record cannot vouch for the
+        /// session it names — `reconciled` (it "may name a foreign session"),
+        /// a legacy record with no origin, `observed`, or `authoritative` but
+        /// never confirmed. Refused, and the detail says which.
+        #[tokio::test]
+        async fn t11_a_host_record_that_is_not_authoritative_and_confirmed_is_refused() {
+            use crate::session::session_lifecycle_store::{
+                ORIGIN_AUTHORITATIVE, ORIGIN_OBSERVED, ORIGIN_RECONCILED,
+            };
+            let dir = tempfile::tempdir().unwrap();
+            let (t, outbox) = tailer(dir.path());
+            let (key, wd) = shared_cwd_key(dir.path());
+            let csid = uuid::Uuid::new_v4().to_string();
+            let cfg = config_with(dir.path(), &csid, &wd);
+            let term = terminal();
+            let secret = grant(&term);
+
+            for (origin, confirmed_at, says) in [
+                (Some(ORIGIN_RECONCILED), Some(1), "is reconciled,"),
+                (None, Some(1), "is reconciled,"),
+                (Some(ORIGIN_OBSERVED), Some(1), "is observed,"),
+                (
+                    Some(ORIGIN_AUTHORITATIVE),
+                    None,
+                    "is authoritative and unconfirmed,",
+                ),
+                (
+                    Some(ORIGIN_RECONCILED),
+                    None,
+                    "is reconciled and unconfirmed,",
+                ),
+            ] {
+                let mut record = host(&term, &wd);
+                record.origin = origin.map(str::to_string);
+                record.confirmed_at = confirmed_at;
+                let e = hosted_env(Some(t.clone()), vec![cfg.clone()], record, Ok(key.clone()));
+                let (status, v) =
+                    transcript_bind_core(&with_proof(bearer(&key), &secret), &body(&csid), e).await;
+                let detail = refused(status, &v, &outbox, &[wd.as_str()]);
+                assert!(
+                    detail.contains(says),
+                    "{origin:?}/{confirmed_at:?}: {detail}"
+                );
+                assert!(
+                    detail.contains("cannot prove whose session it is"),
+                    "{detail}"
+                );
+            }
+            forget(&term, &secret);
+        }
+
+        /// The terminal proof is evidence of a LOCAL terminal, so the door
+        /// must stay loopback-only: on the origin guard's credential-door list
+        /// (no browser caller reaches it) and off the backend relay's
+        /// allowlist, whose header filter (`RELAY_SKIP_REQUEST_HEADERS`) does
+        /// not strip `X-Qontinui-Terminal-Proof`. A relay that ever admits this
+        /// door must strip that header first; this is the tripwire.
+        #[test]
+        fn the_door_stays_loopback_only_so_no_relayed_caller_presents_a_proof() {
+            assert!(crate::mcp::origin_guard::is_credential_door(
+                "POST",
+                "/sessions/transcript-bind"
+            ));
+            assert_eq!(
+                crate::mcp::relay_path_policy::relay_path_verdict(
+                    "POST",
+                    "/sessions/transcript-bind"
+                ),
+                crate::mcp::relay_path_policy::RelayPathVerdict::NotAllowed
+            );
+        }
+
+        /// Which writer put the cwd's key in place.
+        #[derive(Debug, Clone, Copy)]
+        enum CwdWriter {
+            /// `write_coord_mcp_proxy_config` — the operator's root, a gate
+            /// continuation's cwd: a terminal-less DEVICE key.
+            Device,
+            /// `write_coord_mcp_agent_proxy_config` — an agent worktree's
+            /// in-cwd key: a terminal-less AGENT key.
+            Agent,
+        }
+
+        /// T10, production wiring: two terminals spawned in ONE directory that
+        /// declares coord-mcp, through the real seam (`deliver_terminal_coord_mcp`
+        /// records the declared delivery for both), with real grants and a
+        /// real tempdir `SessionLifecycleStore` holding both sessions as open,
+        /// authoritative, confirmed records — and `transcript_bind_env`'s own
+        /// ownership closures. Only the closures that read machine state this
+        /// change does not touch (the transcript gate, the watched dirs, the
+        /// tenant) are pinned. B's session with A's proof is refused and
+        /// writes nothing (T3); A's session with A's proof binds (T1).
+        async fn production_wiring(
+            amb: &crate::test_env::IsolatedAmbient,
+            writer: CwdWriter,
+            stdio: bool,
+        ) {
+            use crate::session::session_lifecycle_store::{
+                test_open_record, SessionLifecycleStore, ORIGIN_AUTHORITATIVE,
+            };
+            let wd = fresh_workdir(amb.dir());
+            match writer {
+                CwdWriter::Device => {
+                    crate::coord_mcp::write_coord_mcp_proxy_config(&wd, PORT, None)
+                }
+                CwdWriter::Agent => crate::coord_mcp::write_coord_mcp_agent_proxy_config(
+                    &wd,
+                    PORT,
+                    uuid::Uuid::new_v4(),
+                ),
+            }
+            let doc: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(std::path::Path::new(&wd).join(".mcp.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                crate::coord_mcp_config::config_doc_is_stdio_shim(&doc),
+                stdio,
+                "the document this test reads is not the shape it names: {doc}"
+            );
+            let key = cwd_key(&wd);
+            assert_eq!(crate::coord_mcp::terminal_id_for_nonce(&key), None);
+            let (a, b) = (terminal(), terminal());
+            for term in [&a, &b] {
+                let delivered =
+                    crate::coord_mcp::deliver_terminal_coord_mcp(&wd, term, None, Some(PORT))
+                        .expect("a tenant-less spawn into a declared cwd is admitted");
+                assert_eq!(
+                    delivered.delivery,
+                    crate::coord_mcp::CoordMcpDelivery::WorkdirDeclared
+                );
+            }
+            let (secret_a, secret_b) = (grant(&a), grant(&b));
+
+            let state_dir = amb
+                .dir()
+                .join(format!("state-{}", uuid::Uuid::new_v4().simple()));
+            let store = Arc::new(
+                SessionLifecycleStore::open(state_dir.join("terminal-sessions.json")).unwrap(),
+            );
+            let (csid_a, csid_b) = (
+                uuid::Uuid::new_v4().to_string(),
+                uuid::Uuid::new_v4().to_string(),
+            );
+            for (csid, term) in [(&csid_a, &a), (&csid_b, &b)] {
+                let mut rec = test_open_record(csid);
+                rec.terminal_id = term.clone();
+                rec.working_dir = Some(wd.clone());
+                rec.origin = Some(ORIGIN_AUTHORITATIVE.to_string());
+                rec.confirmed_at = Some(1);
+                store.record_open(rec);
+            }
+            let cfg = config_with(&state_dir, &csid_a, &wd);
+            config_with(&state_dir, &csid_b, &wd);
+            let (t, outbox) = tailer(&state_dir);
+            let mk = || {
+                let mut e = transcript_bind_env(Some(t.clone()), Some(store.clone()));
+                e.transcript_gate = Box::new(|_| crate::egress::TranscriptGate::Open);
+                e.watched_config_dirs = vec![cfg.clone()];
+                e.session_tenant = Box::new(|_| Ok(None));
+                e
+            };
+            let proof_a = with_proof(bearer(&key), &secret_a);
+
+            let (status, v) = transcript_bind_core(&proof_a, &body(&csid_b), mk()).await;
+            let detail = refused(status, &v, &outbox, &[wd.as_str()]);
+            assert!(
+                detail.contains("does not prove the hosting terminal"),
+                "{writer:?}: {detail}"
+            );
+
+            let (status, v) = call(&proof_a, &body(&csid_a), mk).await;
+            assert_eq!(status, StatusCode::OK, "{writer:?}: {v}");
+            assert_eq!(v["bound"], true);
+            forget(&a, &secret_a);
+            forget(&b, &secret_b);
+        }
+
+        /// Force the stdio document every observed case presents (a
+        /// `coord-mcp-shim.py --credential <abs>` entry). `production_wiring`
+        /// asserts the shape of the very `.mcp.json` it reads, so the stdio
+        /// variants cannot pass on the http arm `cfg(test)` defaults to.
+        fn open_stdio_gate(
+            amb: &crate::test_env::IsolatedAmbient,
+        ) -> crate::coord_mcp::StdioShimGateGuard {
+            use crate::coord_mcp::{StdioShimGate, StdioShimGateGuard, StdioShimGateOverride};
+            StdioShimGateGuard::install(StdioShimGateOverride::Fixed(StdioShimGate::Open {
+                interpreter: amb.dir().join("fake-python"),
+                shim: amb
+                    .dir()
+                    .join("fake-scripts")
+                    .join(crate::coord_mcp_config::COORD_MCP_STDIO_SHIM_FILE),
+            }))
+        }
+
+        #[tokio::test]
+        async fn t10_production_wiring_http_shape() {
+            let amb = crate::test_env::isolated_ambient();
+            production_wiring(&amb, CwdWriter::Device, false).await;
+        }
+
+        #[tokio::test]
+        async fn t10_production_wiring_stdio_shape() {
+            let amb = crate::test_env::isolated_ambient();
+            let _gate = open_stdio_gate(&amb);
+            production_wiring(&amb, CwdWriter::Device, true).await;
+        }
+
+        /// An agent worktree: the agent writer's in-cwd key IS the hosting
+        /// terminal's credential (`session_nonce` reads the declared file with
+        /// no principal filter), so a hosted session there hands off its own
+        /// transcript — and its sibling still cannot.
+        #[tokio::test]
+        async fn t10_production_wiring_agent_worktree() {
+            let amb = crate::test_env::isolated_ambient();
+            production_wiring(&amb, CwdWriter::Agent, false).await;
+        }
+
+        #[tokio::test]
+        async fn t10_production_wiring_agent_worktree_stdio_shape() {
+            let amb = crate::test_env::isolated_ambient();
+            let _gate = open_stdio_gate(&amb);
+            production_wiring(&amb, CwdWriter::Agent, true).await;
         }
     }
 

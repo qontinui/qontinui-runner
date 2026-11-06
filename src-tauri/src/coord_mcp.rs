@@ -6105,8 +6105,14 @@ pub(crate) fn workdir_for_nonce(nonce: &str) -> Option<String> {
 /// The runner TERMINAL a registered proxy nonce was provisioned for
 /// ([`NonceBinding::terminal_id`]). `None` for an empty, unregistered, or
 /// no-longer-valid nonce ([`live_binding`]) — and also for a live binding that
-/// legitimately has no terminal (restored, adopted, mint-route, in-cwd
-/// `.mcp.json`, agent).
+/// legitimately has no terminal (adopted, mint-route, in-cwd `.mcp.json`,
+/// agent).
+///
+/// A RESTORED binding is NOT terminal-less: the persisted store carries the
+/// terminal, so a key restored at boot names the terminal it was minted for —
+/// a PTY that died with the previous runner process. That `Some` is an
+/// eviction-key fact, not evidence that the terminal hosts anything in this
+/// process: matched against a live host it misses, never answers wrongly.
 ///
 /// This is the **deterministic** leg of session-fabric Phase 0 caller
 /// self-identification: `nonce → terminal_id → the OPEN lifecycle record with
@@ -10010,9 +10016,11 @@ pub(crate) enum StdioShimGate {
 /// and a config checkout. `Probe` runs the REAL selftest path against a
 /// caller-supplied script, uncached — that is how the refused-selftest arms
 /// (missing interpreter, non-zero exit, timeout) are exercised for real.
+/// Crate-visible so a door's tests elsewhere (`mcp::sessions`) can drive the
+/// stdio document every observed session presents.
 #[cfg(test)]
 #[derive(Debug, Clone)]
-enum StdioShimGateOverride {
+pub(crate) enum StdioShimGateOverride {
     Fixed(StdioShimGate),
     Probe {
         shim: std::path::PathBuf,
@@ -10031,11 +10039,11 @@ thread_local! {
 /// tests never see each other's gate, and cleared on drop (panic path
 /// included).
 #[cfg(test)]
-struct StdioShimGateGuard;
+pub(crate) struct StdioShimGateGuard;
 
 #[cfg(test)]
 impl StdioShimGateGuard {
-    fn install(gate: StdioShimGateOverride) -> Self {
+    pub(crate) fn install(gate: StdioShimGateOverride) -> Self {
         STDIO_SHIM_GATE_OVERRIDE.with(|c| *c.borrow_mut() = Some(gate));
         StdioShimGateGuard
     }
@@ -12566,6 +12574,36 @@ fn session_nonce(terminal_id: &str, workdir: Option<&str>) -> SessionNonce {
         }
         (Some(_), _) => SessionNonce::NoNonce,
         (None, _) => SessionNonce::DeliveryUnrecorded,
+    }
+}
+
+/// The key that IS the credential of the session in `terminal_id`, as a string —
+/// a thin view over the one resolver the tenancy census reads ([`session_nonce`]):
+/// the newest live per-terminal DEVICE key minted for the terminal, else, ONLY
+/// when the seam recorded that the terminal's cwd declares coord-mcp
+/// ([`CoordMcpDelivery::WorkdirDeclared`]), the key in `<workdir>/.mcp.json`
+/// (stdio shape included), whatever its principal. Read by the
+/// `POST /sessions/transcript-bind` ownership check (plan
+/// `2026-11-05-transcript-bind-refuses-a-hosted-session-whose-only-key-is-the-workdir-nonce`).
+///
+/// `Err` names why no key can be named, in the census's words where they
+/// overlap ([`repo_expectation_from_session_nonce`]); each is UNKNOWN, never
+/// "no credential":
+/// - `coord_mcp_delivery_unrecorded` — this process never recorded a delivery
+///   for the terminal (an adopted holder pane, a previous process's terminal);
+/// - `no_session_nonce` — the seam delivered the terminal no key, or delivered
+///   the cwd's file but no `workdir` was given to read it from;
+/// - `no_runner_nonce_in_cwd_file` — the cwd's `.mcp.json` holds no runner key
+///   now.
+pub(crate) fn terminal_session_credential(
+    terminal_id: &str,
+    workdir: Option<&str>,
+) -> Result<String, &'static str> {
+    match session_nonce(terminal_id, workdir) {
+        SessionNonce::Nonce(Some(nonce)) => Ok(nonce),
+        SessionNonce::Nonce(None) => Err("no_runner_nonce_in_cwd_file"),
+        SessionNonce::NoNonce => Err("no_session_nonce"),
+        SessionNonce::DeliveryUnrecorded => Err("coord_mcp_delivery_unrecorded"),
     }
 }
 
@@ -26560,6 +26598,147 @@ mod spawn_tenant_credential_tests {
             session_credential_tenant(&unprovisioned, Some(&wd)),
             CredentialTenantRead::NoNonce,
             "a terminal the seam did not hand the cwd file must not report that file's key"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // `terminal_session_credential` — the key the transcript-bind door compares
+    // a presented shared key against (plan
+    // 2026-11-05-transcript-bind-refuses-a-hosted-session-whose-only-key-is-the-workdir-nonce,
+    // Phase 2 item 2). Every case goes through the real seam:
+    // `write_coord_mcp_proxy_config` + `deliver_terminal_coord_mcp`.
+    // -----------------------------------------------------------------------
+
+    /// A cwd that declares coord-mcp: the seam injects nothing, and the
+    /// terminal's credential is the key in the cwd's `.mcp.json` — a
+    /// terminal-less key every session of that cwd shares.
+    fn declared_cwd_credential_is_the_files_key(
+        amb: &crate::test_env::IsolatedAmbient,
+        stdio: bool,
+    ) {
+        let (wd, term) = (workdir(amb, "cred-declared"), terminal());
+        write_coord_mcp_proxy_config(&wd, PORT, None);
+        let mcp = Path::new(&wd).join(".mcp.json");
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&mcp).unwrap()).unwrap();
+        assert_eq!(
+            crate::coord_mcp_config::config_doc_is_stdio_shim(&doc),
+            stdio,
+            "the document this test reads is not the shape it names: {doc}"
+        );
+        let file_key = read_proxy_nonce(&mcp).expect("a cwd key");
+
+        let delivered = deliver_terminal_coord_mcp(&wd, &term, None, Some(PORT)).unwrap();
+        assert_eq!(delivered.delivery, CoordMcpDelivery::WorkdirDeclared);
+        assert_eq!(
+            terminal_session_credential(&term, Some(&wd)),
+            Ok(file_key.clone())
+        );
+        assert_eq!(
+            terminal_id_for_nonce(&file_key),
+            None,
+            "the cwd key names no terminal — the shape the door's third arm admits"
+        );
+    }
+
+    #[test]
+    fn a_declared_cwds_terminal_credential_is_the_files_key() {
+        let amb = crate::test_env::isolated_ambient();
+        amb.write_active_tenant_id(tenant_a());
+        declared_cwd_credential_is_the_files_key(&amb, false);
+    }
+
+    /// The same through the STDIO document — the shape of every observed case
+    /// (a `coord-mcp-shim.py --credential <abs>` entry), whose key the runner
+    /// reads only through the credential file the entry names. The gate is
+    /// forced open and the document asserted stdio, so this cannot pass on the
+    /// http arm `cfg(test)` defaults to.
+    #[test]
+    fn a_declared_cwds_terminal_credential_is_the_files_key_in_the_stdio_shape() {
+        let amb = crate::test_env::isolated_ambient();
+        amb.write_active_tenant_id(tenant_a());
+        let _gate =
+            StdioShimGateGuard::install(StdioShimGateOverride::Fixed(StdioShimGate::Open {
+                interpreter: amb.dir().join("fake-python"),
+                shim: amb
+                    .dir()
+                    .join("fake-scripts")
+                    .join(COORD_MCP_STDIO_SHIM_FILE),
+            }));
+        declared_cwd_credential_is_the_files_key(&amb, true);
+    }
+
+    /// A cwd that declares nothing: the seam mints a per-terminal key, and that
+    /// key — not any cwd file — is the terminal's credential.
+    #[test]
+    fn an_undeclared_cwds_terminal_credential_is_the_per_terminal_key() {
+        let amb = crate::test_env::isolated_ambient();
+        amb.write_active_tenant_id(tenant_a());
+        let (wd, term) = (workdir(&amb, "cred-undeclared"), terminal());
+
+        let delivered = deliver_terminal_coord_mcp(&wd, &term, None, Some(PORT)).unwrap();
+        assert_eq!(delivered.delivery, CoordMcpDelivery::Provisioned);
+        let path = delivered
+            .config_path
+            .expect("a bound port provisions a file");
+        let terminal_key = read_proxy_nonce(&path).expect("the per-terminal key");
+        assert_eq!(
+            terminal_session_credential(&term, Some(&wd)),
+            Ok(terminal_key.clone())
+        );
+        assert_eq!(
+            terminal_id_for_nonce(&terminal_key).as_deref(),
+            Some(term.as_str())
+        );
+    }
+
+    /// Every arm that cannot name a key says why, and none of them falls back
+    /// to "some key": a terminal this process never recorded, one the seam
+    /// gave nothing, a declared cwd read with no workdir, and a declared cwd
+    /// whose file holds no runner key.
+    #[test]
+    fn a_terminal_credential_that_cannot_be_named_is_a_typed_unknown() {
+        let amb = crate::test_env::isolated_ambient();
+        amb.write_active_tenant_id(tenant_a());
+        let wd = workdir(&amb, "cred-unknown");
+        write_coord_mcp_proxy_config(&wd, PORT, None);
+
+        assert_eq!(
+            terminal_session_credential(&terminal(), Some(&wd)),
+            Err("coord_mcp_delivery_unrecorded")
+        );
+
+        let unprovisioned = terminal();
+        let plain = workdir(&amb, "cred-unknown-plain");
+        let delivered = deliver_terminal_coord_mcp(&plain, &unprovisioned, None, None).unwrap();
+        assert_eq!(delivered.delivery, CoordMcpDelivery::Unprovisioned);
+        assert_eq!(
+            terminal_session_credential(&unprovisioned, Some(&wd)),
+            Err("no_session_nonce")
+        );
+
+        let declared = terminal();
+        deliver_terminal_coord_mcp(&wd, &declared, None, Some(PORT)).unwrap();
+        assert_eq!(
+            terminal_session_credential(&declared, None),
+            Err("no_session_nonce"),
+            "a declared delivery with no workdir to read cannot name the file's key"
+        );
+
+        // A coord-mcp entry that is not the runner's proxy: declared, keyless.
+        let foreign = workdir(&amb, "cred-unknown-foreign");
+        std::fs::write(
+            Path::new(&foreign).join(".mcp.json"),
+            r#"{"mcpServers":{"coord-mcp":{"type":"http","url":"https://coord.example/mcp"}}}"#,
+        )
+        .unwrap();
+        let foreign_term = terminal();
+        let delivered =
+            deliver_terminal_coord_mcp(&foreign, &foreign_term, None, Some(PORT)).unwrap();
+        assert_eq!(delivered.delivery, CoordMcpDelivery::WorkdirDeclared);
+        assert_eq!(
+            terminal_session_credential(&foreign_term, Some(&foreign)),
+            Err("no_runner_nonce_in_cwd_file")
         );
     }
 
