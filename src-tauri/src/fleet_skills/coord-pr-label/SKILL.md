@@ -91,30 +91,32 @@ fires, so invalid labels never make it to GitHub or coord.
   `coord:clears-red=<repo>` is **GitHub-applied only** — this skill refuses it
   and names the route: `gh api -X POST repos/<owner>/<repo>/issues/<n>/labels -f 'labels[]=coord:clears-red=<repo>'`. See
   [`coord:clears-red`](#coordclears-red--github-applied-only-a-declared-cross-repo-red-main-fix-edge).
+- **Attesting a destructive migration for coord's alembic re-point**:
+  `coord:destructive-attested=<digest12>` is **GitHub-applied only** too — this
+  skill refuses it and names the route. See the Validation Rules table below.
 
 > **No label holds a PR** (holds retired 2026-06-20). To hold a PR:
-> **place a coord hold** once coord serves it — `coord_set_pr_hold {repo,
-> pr_number, held: true, reason}`; to release it on a condition, give the hold a
-> `gate_id`. It is served once coord's own `tools/list` offers
-> `coord_set_pr_hold` — read through a door that does not filter it, because a
-> runner proxy's allowlist can hide a served tool from your session (place it
-> then through coord's own door or the HTTP twin
-> `POST /coord/repos/:owner/:repo/pull-requests/:number/hold` — the tool and its
-> twin are PLANNED, and exist only once coord ships the hold); until then, convert the PR to draft (`gh pr ready --undo`), which works on
-> public repos, and on private repos until the GitHub Free downgrade takes
-> effect. **`coord:blocked` and `coord:experimental` are RETIRED
+> **place a coord hold** — `coord_set_pr_hold {repo, pr_number, held: true,
+> reason}`; to release it on a condition, give the hold a `gate_id`. A runner
+> proxy's allowlist can hide the tool from your session; place it then through
+> coord's own `POST /mcp` door or the HTTP twin
+> `POST /coord/repos/:owner/:repo/pull-requests/:number/hold`. **On a repo
+> whose own `auto-merge.yml` lands PRs, ignores a coord hold and honours an
+> `auto-merge:hold` label (check its header), a coord hold holds nothing**:
+> label the PR `auto-merge:hold` instead. To release that,
+> remove the label and re-fire the PR's lint (push, or `gh run rerun <the head's
+> lint run id>`); removing it alone does not land the PR.
+> **`coord:blocked` and `coord:experimental` are RETIRED
 > hold labels and this skill REFUSES them**, the same way it refuses
 > `coord:operator-review` and `coord:version-bump=*`. coord treats all four
 > as inert hold-shaped labels: `data/repo_branches.rs` `inert_hold_labels`
 > matches them, and `render_inert_hold_label_comment` posts a one-time PR
 > comment saying they do **not** hold the PR. The PR still auto-merges once
 > green. `blocked` and `experimental` only downgrade dequeue routing
-> (Contending, no fast-land), which is not what an author reaching for them
-> wants. A PR that must not land yet gets a **coord hold** once coord serves
-> it: `coord_set_pr_hold {repo, pr_number, held: true, reason}` (read it back
-> as the `hold` object on `coord_pr_status`). Until then it gets a draft
-> (`gh pr ready --undo`) — which after the GitHub Free downgrade no longer
-> exists on a private repo, so it is a stopgap, not an agent's lasting hold. Detail:
+> (Contending, no fast-land) and drop the PR out of topological-merge
+> readiness, which is not what an author reaching for them wants. A PR that must not land yet gets a **coord hold**:
+> `coord_set_pr_hold {repo, pr_number, held: true, reason}` (read it back
+> as the `hold` object on `coord_pr_status`). Detail:
 > `knowledge-base/qontinui-specific/coord-merge-train.md` → "Holding a PR".
 
 > **Do NOT use `coord:stacked-on` / `coord:upstream-of` /
@@ -233,7 +235,9 @@ would be rejected or would point somewhere else.
 The skill enforces the namespace before sending. This table follows
 `labels_routes.rs::validate_label`, with one known divergence (as of
 2026-11-02): it is STRICTER than coord on the retired hold labels
-(`coord:blocked` / `coord:experimental`, which coord still accepts as inert):
+(`coord:blocked` / `coord:experimental`, which coord still accepts: inert as a
+hold, though they still force Contending routing and drop the PR out of
+topological-merge readiness):
 
 | Label                                              | Validation                                                 |
 |----------------------------------------------------|------------------------------------------------------------|
@@ -242,15 +246,15 @@ The skill enforces the namespace before sending. This table follows
 | `coord:stacked-on=#<n>` or `=[<owner>/]<repo>#<n>` | Contains `#`; `<n>` parses as a Rust **`i32`** (same domain as upstream-of — `#2147483648` is rejected); empty repo part = same repo, a **non-empty** one gets the same both-segments check. **Code stacks only — never for migration ordering (coord derives that from `down_revision`).** |
 | `coord:requires-tag=<pattern>`                     | Any non-empty value                                         |
 | `coord:merge-strategy=squash\|rebase\|merge`       | One of the three exact strings                              |
-| `coord:blocked` / `coord:experimental`             | REJECTED — retired hold labels (2026-06-20); coord treats them as inert (`inert_hold_labels`). To hold a PR, place a coord hold (`coord_set_pr_hold {repo, pr_number, held: true, reason}`) once served, else a draft (`gh pr ready --undo`) while drafts exist |
+| `coord:blocked` / `coord:experimental`             | REJECTED — retired hold labels (2026-06-20); coord treats them as inert as holds (`inert_hold_labels`). To hold a PR, place a coord hold (`coord_set_pr_hold {repo, pr_number, held: true, reason}`), or, on a repo whose `auto-merge.yml` honours an `auto-merge:hold` label instead of a coord hold, that label |
 | `coord:credibility-override`                       | Flag — per-PR escape hatch for the Tier-7 credibility-weighted-pass gate. **Releases a block, unbounded where it is consumed**: with the label on the PR, Tier 7 is skipped outright (`predicate.rs`), not relaxed. That gate is a **deployment-wide opt-in, default OFF** — env `QONTINUI_CREDIBILITY_GATE_ENABLED`, no per-tenant setting yet — so where the deployment has not enabled it the label is accepted but changes nothing |
 | `coord:blast-radius-override`                      | Flag — per-PR escape hatch for the Tier-8b blast-radius gate, the twin of `credibility-override`: with it on the PR, Tier 8b does not block on `removes-referenced-export`. That gate is default OFF, enabled per tenant or per repo (`blast_radius_gate_enabled`, falling back to env `QONTINUI_BLAST_RADIUS_GATE_ENABLED`). **Releases a block, unbounded where it is consumed** — unlike `migrate-repair`, Tier 8b skips the block whatever the removal. Setting it notifies the operator (coord's gate-override notice, `GATE_OVERRIDE_LABELS`), which is the only control on it |
 | `coord:migrate-repair`                             | Flag — accepted. **Releases a hold**, like the two overrides above — it can make a land happen that otherwise would not — but it is the **only one of the three that is bounded where it is consumed**. coord bounds it at the *consuming* end, not the validator — `merge_scheduler::migrate_self_blocking` refuses to honour it unless the land is genuinely self-blocking, **and is further scoped to `EXPECTED_WEB_REPO` and the `PendingHead` escalation arm only**. Setting it is cheap and auditable; acting on it is not, and coord keeps those two decisions apart |
-| `coord:priority` / `coord:priority=*`              | REJECTED — set it on the PR itself with `gh api -X POST repos/<owner>/<repo>/issues/<n>/labels -f 'labels[]=coord:priority'`. A skill-set row writes `source='coord_skill'` and the merge scheduler only honours `source='github'`, so it would be inert (and invisible on GitHub). **Both spellings hit a bespoke error that names that fix** (coord's `PRIORITY_LABEL_ERR`); the parameterised form is caught deliberately, because the lever is ONE BIT and an author writing `=1` is reaching for numeric levels that do not exist. **Any holder of repo write — agent or operator — applies it on its own authority**: merge-queue ordering is operational work (`decision_record/operational-work-is-autonomous`), not an escalation, and the `source='github'` gate is provenance, not authority. It reorders the queue only while the lane is armed (`COORD_MERGE_PRIORITY=on` in the DEPLOYED task definition), and only for a single-repo proposal inside `COORD_MERGE_PRIORITY_TTL_SECS`. Read the label back (`gh api repos/<owner>/<repo>/issues/<n>/labels`), then read its effect on the queued row's `priority_reason` (`coord_query_train_health` → `candidates_in_flight`); `deploy/taskdef.json` reading `on` is not proof the lane is deployed, this is. `label` = honoured; `label_expired` / `label_ignored_multi_repo` / `label_not_github` = lane on but this label does not count; `aged` = lane on and the row was promoted by AGE, so your label did not count (the label arm is tested first); `red_main_fix` = promoted by the red-main rule, which fires with the lane off too, so it says nothing about your label; `none` = lane off OR coord has not yet mirrored the label. It cannot help a PR that never became a proposal (conflicted, or CI abandoned by GitHub) |
+| `coord:priority` / `coord:priority=*`              | REJECTED — set it on the PR itself with `gh api -X POST repos/<owner>/<repo>/issues/<n>/labels -f 'labels[]=coord:priority'`. A skill-set row writes `source='coord_skill'` and the merge scheduler only honours `source='github'`, so it would be inert (and invisible on GitHub). **Both spellings hit a bespoke error that names that fix** (coord's `PRIORITY_LABEL_ERR`); the parameterised form is caught deliberately, because the lever is ONE BIT and an author writing `=1` is reaching for numeric levels that do not exist. **Any holder of repo write — agent or operator — applies it on its own authority**: merge-queue ordering is operational work (`decision_record/operational-work-is-autonomous`), not an escalation, and the `source='github'` gate is provenance, not authority. It reorders the queue only while the lane is armed (`COORD_MERGE_PRIORITY=on` in the DEPLOYED task definition), and only for a single-repo proposal inside `COORD_MERGE_PRIORITY_TTL_SECS`. Read the label back (`gh api repos/<owner>/<repo>/issues/<n>/labels`), then read its effect on the queued row's `priority_reason` (`coord_query_train_health` → `candidates_in_flight`); `deploy/taskdef.json` reading `on` is not proof the lane is deployed, this is. `label` = honoured; `label_expired` / `label_ignored_multi_repo` / `label_not_github` = lane on but this label does not count; `aged` = lane on and the row was promoted by AGE, so your label did not count (the label arm is tested first); `red_main_fix` = promoted by the red-main rule, which fires with the lane off too, so it says nothing about your label; `attested_destructive_migration` = lane on and the row was promoted by a `coord:destructive-attested` label, so your label did not count (the label arm is tested first); `none` = lane off OR coord has not yet mirrored the label. It cannot help a PR that never became a proposal (conflicted, or CI abandoned by GitHub) |
 | `coord:clears-red` / `coord:clears-red=*`          | REJECTED — GitHub-applied only, exactly like `coord:priority`: set it on the PR itself with `gh api -X POST repos/<owner>/<repo>/issues/<n>/labels -f 'labels[]=coord:clears-red=<repo>'`. coord honours it only from `source='github'` (a holder of repo write applied it on GitHub) and its own label door refuses the key, so a skill-set row would be inert. While the named repo's main is red it promotes the PR to tier 0, recorded with reason `red_main_fix`; **inert** for the PR's own repo, for a repo not owned by EVERY owner tenant of the PR's repo, or a green main. Kill switch `COORD_MERGE_CLEARS_RED_DISABLED=1` (this arm only) |
-| `coord:destructive-attested` / `coord:destructive-attested=*` | REJECTED — GitHub-applied only: set `coord:destructive-attested=<digest12>` on the PR itself with `gh api -X POST repos/<owner>/<repo>/issues/<n>/labels -f 'labels[]=coord:destructive-attested=<digest12>'`, then read it back with `gh api repos/<owner>/<repo>/issues/<n>/labels`. coord honours only `source='github'` rows of this label and its own door refuses every value (`DESTRUCTIVE_ATTESTED_LABEL_ERR`), because a skill-set row would be inert and could shadow the honoured one |
+| `coord:destructive-attested` / `coord:destructive-attested=*` | REJECTED — GitHub-applied only: set it on the PR itself with `gh api -X POST repos/<owner>/<repo>/issues/<n>/labels -f 'labels[]=coord:destructive-attested=<digest12>'`, then read it back with `gh api repos/<owner>/<repo>/issues/<n>/labels`. coord's alembic re-point and the merge scheduler honour only `source='github'` rows, its own label door refuses every spelling, and a skill-set row would be inert. `<digest12>` is exactly 12 lowercase hex characters: the destructive-content digest coord's E6 re-point refusal comment names for each destructive revision (one label per revision). While the priority lane is on, the label also promotes the PR in the queue on its presence and shape alone: coord does not check the digest against the PR's migration content, so a wrong or stale digest still promotes. A gate override: for a well-formed digest, the operator notice comes from the webhook ingest when the label first appears on GitHub |
 | `coord:red-main-fix`                               | REJECTED — a flag with no `=`, so it lands on the generic `parameterised labels need "=value"`. coord has **no bespoke arm for it and this mirror must not invent one.** If you want it on the PR anyway, `gh api -X POST repos/<owner>/<repo>/issues/<n>/labels -f 'labels[]=coord:red-main-fix'` — but understand it buys nothing: see below |
-| `coord:operator-review`                            | REJECTED — retired label; labels no longer hold PRs (place a coord hold with `coord_set_pr_hold` once served — to release it on a condition, give the hold a `gate_id` — else a draft while drafts exist) |
+| `coord:operator-review`                            | REJECTED — retired label; labels no longer hold PRs (place a coord hold with `coord_set_pr_hold`; to release it on a condition, give the hold a `gate_id`; on a repo whose `auto-merge.yml` honours an `auto-merge:hold` label instead of a coord hold, that label) |
 | `coord:version-bump` / `coord:version-bump=*`      | REJECTED — same retirement as operator-review (coord rejects the bare flag too) |
 | `coord:state=*`, `coord:blocked-by=*`, `coord:specialist-decision=*` | REJECTED — coord-SET labels, read-only through this surface; change them at the state-mutation surface, not here |
 
@@ -343,9 +347,7 @@ The standing user is the fleet's skill-bundle sync bot, which puts
 same GitHub route: that carry is what turns the source repo's bundle-parity
 check green, and without the edge it waited the runner train's full latency
 (plan `2026-09-28-ccfg-bundle-parity-bound-outruns-runner-train-latency`
-Phase 5). A hand carry of the bundle may carry it too. A coord build that
-predates that phase's coord half does not read the label at all — read the
-deployed coord before relying on the lift.
+Phase 5). A hand carry of the bundle may carry it too.
 
 ### `coord:red-main-fix` — rejected here, and it buys nothing anywhere
 

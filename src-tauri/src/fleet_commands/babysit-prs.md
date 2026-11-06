@@ -329,6 +329,16 @@ Only once the classification says “real” do you read the failing run log
   `gh run rerun <id> --failed`. At most 2 reruns per head before treating as
   real.
 
+  ⚠️ **`--failed`, never `--job`.** A run's check rows are its LATEST attempt's,
+  so re-running one job of a run that also carries a required check can delete
+  that check's green row: measured once, on `qontinui-coord#3551`, and it held
+  the PR about 4 h. A `--failed` re-run also makes a new attempt; no case of one
+  deleting a green row is recorded, which is not proof it cannot. An orphaned
+  advisory job beside a green required one is left alone, or handled by a fresh
+  head. Read the run's job list before any re-run. Diagnosis and recovery:
+  `/merge-train-steward` (where your deployment provides it), its *A required
+  check VANISHED* row.
+
   ⚠️ **Identify this class from the job's STEPS — `cancelled` is the minority
   shape.** Most infra kills on this fleet arrive as `conclusion: failure`, which
   is indistinguishable from a genuine regression at the RUN level, so the run
@@ -578,9 +588,14 @@ the gap either — `mergeable: MERGEABLE` reports the absence of a textual
 conflict, never the satisfaction of a required-check ruleset. Treat "required
 context missing/never reported" as its own stuck class here, distinct from
 both **red CI** (Step 3) and **green but stuck for some other reason** (queue,
-stacked dependency, coord itself wedged — the rest of 4d's table): it is 4d's
-`required-checks-missing` row, and it is a **Legitimate hold**, never a lesser
-severity than a visible red — a PR can carry zero failing checks and still be
+stacked dependency, coord itself wedged — the rest of 4d's table). The block
+code alone does not settle the row. `required-checks-missing` is that row of 4d,
+a **Legitimate hold**. `merge-state-unsettled` is Transient while young; past the
+dwell it is the phantom arm of 4d's **Coord defect** row, except that a context
+whose workflow died at `startup_failure` or never triggered on this head is a
+**Legitimate hold**, by the two causes named below. Any other code, such as
+`ci-pending`, is not settled by this split. Whatever the code, it is never a
+lesser severity than a visible red — a PR can carry zero failing checks and still be
 unmergeable. Where coord's PR-status surface (`coord_pr_status` / `/pr-status`)
 is available, a `blockers` entry naming an unestablished required-check state
 is the actionable signal here (a companion coord change is adding this
@@ -588,9 +603,23 @@ wording); treat it with the same urgency as a red check, not lower, since
 `gh pr checks` alone will never surface it. Once the missing context is
 identified, `startup_failure` (the workflow started and died) and "never
 triggered" (the trigger/path filter excludes this branch) are different,
-actionable causes — re-run the workflow for the former, fix the
-trigger/path filter for the latter — name which one you found rather than
-treating them as interchangeable.
+actionable causes — name which one you found rather than treating them as
+interchangeable. Fix the trigger/path filter for the latter. For the former,
+**do not re-run, `--failed` included**: the default is to move the head. The one
+exception is a single full re-run (`gh run rerun <id> -R <repo>`, outside Step
+3's 2-rerun bound) of a PR-head run whose latest attempt is `startup_failure`
+with zero jobs, after an earlier attempt of that same run dispatched jobs that
+ran steps. Read each attempt's jobs
+(`GET repos/<r>/actions/runs/<id>/attempts/<n>/jobs`) to test that. Every other
+shape stays un-re-run: the re-run is one-way on an undispatched run, and whether
+`startup_failure` behaves the same is deliberately unmeasured
+(`/merge-train-steward`, where your deployment provides it: the NEVER DISPATCHED
+section and the *A required check VANISHED* and *Runs EXIST but none of them can
+ever conclude* rows). Move the head only on a branch this session owns, otherwise
+hand back to the author; run the carries-the-push check under **Real failure**
+first, and Step 4a.5 if the push is a rebase. If the new head also ends in
+`startup_failure`, treat the cause as not per-run: stop pushing, read the workflow file
+and the run's annotations, and report the PR `blocked-legitimate`.
 
 **4a. GitHub-side sanity** — `gh pr view --json isDraft,mergeable,mergeStateStatus,labels`:
 draft, DIRTY (textual conflict → rebase it yourself), or a `coord:blocked` /
@@ -674,7 +703,7 @@ error, not a missing door.
 |---|---|---|
 | **Transient — wait** | `ci-pending` (**only once you have PROVEN CI actually fired — see the note under this table**), `below-green-dwell`, `merge-state-unsettled` (young), in-flight proposal in `/merge/queue` | Nothing. Reset no clocks; check again next poll. |
 | **Legitimate hold — fix the cause, NEVER bypass** | `ci-not-green`, `main-red` (except on the red-main fix PR itself, labelled `coord:red-main-fix`: it is the one PR that cannot pass a red main, so ask coord's expedited door for it first (Step 5a). Where the door did not serve it, in parallel with the door and unchanged, `scripts/agent-direct-merge.sh` may merge it as before, under `direct-merge-with-notification`. Where it did serve it, the script may merge it only under Step 5a's recovery condition), `main-status-unknown`, `not-open`, `required-checks-missing`, `behind-main-or-unstable` (DIRTY), `auto-merge-disabled`, `dry-run-mode`, `escalate-path-matched`, `has-cross-repo-dependency` via `stacked-on` with parent still open | Fix in-session (rebase, fix CI). For `escalate-path-matched`, read what coord is actually waiting on and fix THAT — see the note under this table; never route around it (no recovery merge, no override you arrange yourself). ⚠️ For `ci-not-green` **and `main-red` alike, run Step 3's step-level classifier on the failed job FIRST**: a Tier-1/2/T kill is not a cause to fix, it is a re-run — of main's own run in the `main-red` case — and it will **never** self-heal on its own. A `main-red` hold is a legitimate hold either way, but the remedy is not the same one. |
-| **Coord defect — recover + remediate** | `has-cross-repo-dependency` where the labeled PR is the UPSTREAM of the edge (`coord:upstream-of=` deadlock — engine parent-resolution inverted); `unlandable_cycle` spinning (cycles > ~5) with all members green; `merge-state-unsettled` dwell > 2× threshold on a fully-green head (phantom required-context wedge, coord#638); latest hydration `head_sha` ≠ current head for > 1h (stale ingest); predicate `result: pass` with no landing and no queue entry for > 1h; `has-blocking-label` on a live PR (retired code — should be extinct) | Step 5 → 6. |
+| **Coord defect — recover + remediate** | `has-cross-repo-dependency` where the labeled PR is the UPSTREAM of the edge (`coord:upstream-of=` deadlock — engine parent-resolution inverted); `unlandable_cycle` spinning (cycles > ~5) with all members green; `merge-state-unsettled` dwell > 2× threshold on a fully-green head (phantom required-context wedge, coord#638 — **unless the missing required context's workflow DID run on this head and that run's latest attempt is a 0-job `startup_failure`, or the workflow never triggered on this head because its own `on:` filter excludes it: that is no coord defect but a Legitimate hold, so follow the matching arm of Step 4's preamble**); latest hydration `head_sha` ≠ current head for > 1h (stale ingest); predicate `result: pass` with no landing and no queue entry for > 1h; `has-blocking-label` on a live PR (retired code — should be extinct) | Step 5 → 6. |
 | **Coord down** | no leader across 4–8 health samples, **and** `bash <session-workdir>/.claude/skills/coord-revive/coord-revive.sh --floor-claim` printed a `FLOOR-CLAIM:` block reading `verdict=FLOOR` — paste it into the report. `verdict=UNKNOWN` (exit 5: sampled under this box's own load) is NOT this class; wait for the builds to finish and sample again | Step 6 directly — the merge through `scripts/agent-direct-merge.sh`; expect exit 5 (merged, notify later) while coord is down. |
 
 **`escalate-path-matched` is a hold with a named pending gate — read it before
@@ -795,25 +824,91 @@ at the land seam** is the same case seen from the train. One PR can carry hits w
   was written; whether a retry helps is decided by its cause, never assumed —
   the HTTP twin's JSON body carries `cause` and `retryable`, while over MCP
   the refusal is the one line `<code>: <message>`, whose message says
-  `retryable` or `not retryable` and names the cause in prose). Of its
-  causes, only `fetch_failed` whose last read failed transiently answers
-  `retryable: true`: resubmit, and on a cool-down (the body's
-  `cooldown_until`) resubmit the SAME bundle unchanged when the message says.
+  `retryable` or `not retryable` and names the cause in prose). Two of its
+  causes, `patch_unavailable` and `not_in_listing`, read differently on a
+  coord build that serves the mirror change (the coord PR citing plan
+  `2026-11-03-escalate-evidence-mirror-grounds-patchless-files`; see the
+  next paragraph). On a build without it, only `fetch_failed` whose last read
+  failed transiently answers `retryable: true`: resubmit, and on a cool-down
+  (the body's `cooldown_until`) resubmit the SAME bundle unchanged when the
+  message says.
   Every other cause comes back unchanged on resubmission. A file refused
   `no_quotable_lines` whose changed lines are all short, at least one holding
   a letter or digit, grounds only by step 3's whole-line quote once a build
   serving qontinui-coord#3435 is live; until then no bundle clears it, so the
   PR is `blocked-legitimate` (the coord fix is in flight), or, if it cannot
-  wait, ask the operator as below. `not_in_listing` is GitHub's 3,000-file
-  listing cap — split the PR.
+  wait, ask the operator as below. On a build without the mirror change,
+  `not_in_listing` is GitHub's 3,000-file listing cap — split the PR.
   A non-retryable `fetch_failed` means coord could not read the diff at all
   (`unified_cause` / `files_api_cause`, or the message, name the failed read;
-  nothing in your bundle caused it). That, `patch_unavailable`
-  (binary, or the file's own diff too large), `not_in_diff`,
-  `ambiguous_section`, and a `no_quotable_lines` file with nothing to quote
-  (binary, rename, mode change, punctuation only) leave no disclosure that can
-  ground the hit — ask the operator for the override with a recommendation
-  (closed-list item 2), naming the failed read where that is the cause.
+  nothing in your bundle caused it). That, `patch_unavailable` on a build
+  without the mirror change (binary, or the file's own diff too large),
+  `not_in_diff`, `ambiguous_section`, and a `no_quotable_lines` file with
+  nothing to quote (binary, rename, mode change, punctuation only) leave no
+  disclosure that can ground the hit — ask the operator for the override with
+  a recommendation (closed-list item 2), naming the failed read where that is
+  the cause.
+
+  **On a coord build that serves the mirror change, a file GitHub serves no
+  patch for is grounded on coord's own mirror: `patch_unavailable` or
+  `not_in_listing` alone sends it to neither the operator nor a split.**
+  GitHub serves no `patch` for a file whose own diff is too large or that
+  falls past the PR's cumulative diff limit, and its listing stops at 3,000
+  files. A build serving the coord PR citing plan
+  `2026-11-03-escalate-evidence-mirror-grounds-patchless-files` reads such a
+  file's section from coord's bare mirror instead — the PR's pinned head
+  against its merge base, in GitHub's patch format — and grounds the
+  disclosure on it by step 3's rules, unchanged. On such a build:
+
+  - Quote the file from its section of the whole read
+    `git fetch origin <base> && git diff --unified=3 --inter-hunk-context=1 --find-renames -l1000 origin/<base>...<head>`
+    (`git fetch origin pull/<n>/head` first when your clone lacks `<head>`).
+    For a file whose changed lines are all short, name the `@@` range THAT
+    command prints: git's default `--inter-hunk-context=0` splits hunks
+    GitHub fuses, so a range copied from it can differ, and a range that
+    differs is refused. The exception is a section coord grounded during
+    its own GitHub cool-down: it reads at `--inter-hunk-context=0`, so a
+    refusal there names that command, and you quote from it. Read the PR
+    whole; never narrow a renamed file to
+    `-- <path>` alone, which turns it into a whole-file add — use
+    `-- <previous path> <path>`. `coord_submit_escalate_evidence`'s own
+    description says the same on such a build.
+  - Read `patch_unavailable` / `not_in_listing` together with their `mirror`
+    field, the code naming why coord's mirror could not stand in for that
+    file: the HTTP twin's body carries it beside `cause`, and the MCP line's
+    message names it. `retryable` is derived from that code, so resubmit on
+    `retryable: true` — the transient codes `no_mirror` (coord has begun a
+    background clone, which can take minutes), `fetch_failed`,
+    `fetch_timed_out` and `diff_failed` (coord's own git against its mirror,
+    not a GitHub read), and `busy` (another grounding holds coord's permit).
+    `head_absent` is `retryable: true` as well, but resubmit only after
+    re-reading the head, as the next bullet says; if `head_sha` is unchanged,
+    the same bundle is the right resubmission.
+  - On `mirror: head_absent`, coord's fresh fetch lacks the head you named:
+    GitHub's pull ref lags, or the head moved. Re-read `coord_pr_status` and
+    resubmit at its `head_sha` (a head that moved needs steps 1-3 again).
+    Never ask the operator for it.
+  - Ask the operator only when `mirror` names a non-retryable miss (for
+    example `too_large`, `disagrees_with_github` or `not_in_mirror_diff`), and
+    name that code in the ask — closed-list item 2, with a recommendation.
+  - A `disclosure_not_grounded` or `no_quotable_lines` refusal carrying
+    `section_source: "mirror"` was judged against the mirror's section; its
+    message names the command and the `merge_base` coord read, so re-quote
+    from that output. A binary file's mirror section still offers nothing to
+    quote, so it stays the operator's, as above.
+
+  Whether the serving build has the mirror change: that coord PR's land
+  commit — or that of a PR adopting it (`coord_pr_status` `merge_commit`, once
+  `land_stamp` reads `terminal` or `current_head`;
+  `coord_work_unit_list_citations` on that plan stem lists the PR) — must be
+  an ancestor of the `build_sha` that `GET https://coord.qontinui.io/health`
+  serves, read with `git merge-base --is-ancestor <merge_commit> <build_sha>`
+  exactly as for #3435 above (exit 0 it is, 1 it is not, 128 UNKNOWN). No
+  build has it until that PR, or a PR adopting it, lands. The refusal tells
+  too, one way only: a `patch_unavailable` / `not_in_listing` refusal that
+  carries a `mirror` code came from a build with it. One without the code
+  settles nothing — read the build as above.
+
   Verify by read — re-read `coord_pr_merge_verdict` — never by the call's own
   success.
 - **A migration the classifier rejected** — two remedies, and the choice is
@@ -1463,7 +1558,7 @@ an admin-merge happened — produces a plan so the defect class dies:
   and exit 0, 5 or 6) or `handed-to-operator` (exit 4, GitHub refused). Exit 5 is
   a merge whose notification is still owed. Both the PR audit comment (Step 6
   item 1) and the exit report say which.
-- **Bounded loops.** Max 3 CI-fix rounds per PR, 2 infra reruns per head,
+- **Bounded loops.** Max 3 CI-fix rounds per PR, 2 infra reruns per head (plus the one recovery re-run in Step 4's preamble),
   one remediation plan per defect class per run (dedupe: if `$QONTINUI_PLANS_DIR`
   already has a plan for this defect class, reference it instead of writing a
   twin; check before writing). **The directory is not the surface of record** — discovery
