@@ -21,6 +21,35 @@ name: qontinui-types drift
 #
 # A red signal here means: regenerate qontinui-schemas's artifacts and
 # coordinate the merge (qontinui-schemas PR before/with this runner PR).
+#
+# A runner-leads pair reds runner main for the partner's whole land latency —
+# so a main-side drift red is RE-CHECKED against that partner before it stands.
+#
+# When the type is registered HERE and qontinui-schemas carries only the
+# regenerated bindings, the pair is declared runner-leads (on the schemas PR:
+# `coord:downstream-of=qontinui-runner#N`). The pull_request run verifies the
+# pair against the schemas PR's head and goes green. Then the two halves land
+# minutes-to-hours apart, and every push run in between compares runner main
+# against schemas MAIN, which does not have the bindings yet. Red by
+# construction, for exactly the partner's land latency, and every runner PR is
+# held meanwhile. On 2026-11-05 this held runner main red for ~5.8 h
+# (runner#2546 with schemas#285), the fourth recurrence. The timeline and the
+# reads it was measured from are in the plan named below.
+#
+# So, off pull_request only, a drift red here is re-checked by the last three
+# steps of the job: find the ONE schemas PR whose runner-leads declaration coord
+# STRIPPED on landing its runner half within the last 72 h and that is still
+# open, apply its binding changes to schemas main (three-way, from its merge
+# base), regenerate, and run the same shared checker against that tree.
+# Only a full green there absorbs the red (with a warning naming the pair);
+# anything else — no such pair, two of them, an unread feed, a red re-check —
+# leaves it standing. This is the runner-side twin of qontinui-schemas'
+# codegen/pending-registration.toml, and like it the wait is AUDITED from a
+# separate workflow (qontinui-types-drift-wait-audit.yml, daily): coord keeps an
+# absorbed push run green until the next push run, so the audit is what reds
+# when the 72 h bound passes or the partner closes unlanded. It is separate, and
+# this workflow has no `schedule`, because coord scores main per workflow name.
+# Plan: qontinui-dev-notes plans/2026-11-05-runner-leads-schemas-pair-reds-runner-main-for-the-partners-land-latency.md
 
 on:
   # Manual trigger: both triggers below are path-filtered to the four runner
@@ -65,7 +94,10 @@ on:
   # THE ONLY THING THAT RE-BASELINES IS A `push` RUN, i.e. a commit landing on
   # main that touches one of the paths below — which now includes this file, so
   # editing this comment is itself a valid thaw. Use the dispatch to learn
-  # whether the drift is really fixed; use a push to tell coord.
+  # whether the drift is really fixed; use a push to tell coord. NOTE: a
+  # dispatch, like a push, can ABSORB a runner-leads wait (see "Find a waiting
+  # runner-leads partner" below) — its green then means "consistent once the
+  # named partner lands", and only the step's warning annotation says so.
   #
   # Safe by construction — STILL TRUE, now for a stronger reason.
   # `checkout-sibling` keys on `github.event.pull_request.number`, which is
@@ -340,6 +372,334 @@ jobs:
       # vacuously green from then until qontinui-schemas#108. So the script
       # also asserts the baseline exists (arm 0) and looks for untracked
       # regenerated output (arm 1), not just a diff (arm 2).
+      #
+      # Off pull_request its red is decided by "Decide the drift verdict" below,
+      # which re-raises it unless the waiting-partner re-check went green. "Off
+      # pull_request" is a push to main or a workflow_dispatch on any ref; a
+      # dispatch can absorb too, and baselines nothing either way.
       - name: Check for drift
+        id: drift
+        continue-on-error: ${{ github.event_name != 'pull_request' }}
         working-directory: qontinui-schemas
         run: bash scripts/check-generated-drift.sh --verify
+
+      # A drift red on main (or a dispatch): is it a runner-leads pair whose
+      # runner half has landed and whose schemas half is still waiting? Only a
+      # coord App strip of `coord:downstream-of=qontinui-runner#N` counts as
+      # "landed" (the same signal schemas-pair-follow.yml acts on); a human
+      # withdrawing the label is not. Reads only; an unread feed fails this step,
+      # which leaves the red standing.
+      # timeout-minutes on this step and the re-check: a step that exceeds its
+      # own limit is killed and fails, per GitHub's documented step timeout (not
+      # measured here), so the decide step still runs and reds. Without it a
+      # hang runs into the job's limit, which may end the run cancelled or in
+      # another no-verdict shape coord skips (unmeasured; see ci_baseline.rs),
+      # keeping the last green over a genuine red. The wait itself adds up to
+      # 55 minutes to a red run, and a cancel or a lost runner inside them is a
+      # new way for that red to read as no verdict; the daily audit
+      # (qontinui-types-drift-wait-audit.yml) alarms on that shape.
+      - name: Find a waiting runner-leads partner
+        id: partner
+        if: ${{ github.event_name != 'pull_request' && steps.drift.outcome == 'failure' }}
+        timeout-minutes: 10
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DRIFT_WAIT_TEST_NOW: ""
+          DRIFT_WAIT_TEST_FIXTURE_DIR: ""
+          DRIFT_WAIT_TEST_MAX_PAGES: ""
+        run: |
+          set -euo pipefail
+          # Inputs (env): GH_TOKEN, GITHUB_OUTPUT, RUNNER_TEMP (the partner's file
+          # list is written there). Test-only seams, set empty by the workflow:
+          # DRIFT_WAIT_TEST_MAX_PAGES (events pages; default 10),
+          # DRIFT_WAIT_TEST_NOW (epoch seconds; default now) and
+          # DRIFT_WAIT_TEST_FIXTURE_DIR=<dir>, which answers each API path from
+          # "$DRIFT_WAIT_TEST_FIXTURE_DIR/<path with / and ? and = and & replaced by _>", whose LAST line is
+          # the HTTP status (the shape curl -w produces below).
+          SCHEMAS=qontinui/qontinui-schemas
+          RUNNER=qontinui/qontinui-runner
+          BOT='qontinui-merge-orchestrator[bot]'
+          BOUND_SECS=$((72 * 3600))
+          MAX_PAGES="${DRIFT_WAIT_TEST_MAX_PAGES:-10}"
+          now="${DRIFT_WAIT_TEST_NOW:-$(date -u +%s)}"
+          cutoff=$((now - BOUND_SECS))
+
+          api() {
+            local path="$1" raw rc=0
+            if [ -n "${DRIFT_WAIT_TEST_FIXTURE_DIR:-}" ]; then
+              local f
+              f="${DRIFT_WAIT_TEST_FIXTURE_DIR}/$(printf '%s' "${path}" | tr '/?=&' '____')"
+              if [ -f "${f}" ]; then raw="$(cat "${f}")"; else raw=$'\n404'; fi
+            else
+              set +e
+              raw="$(curl -sS --connect-timeout 10 --max-time 60 --retry 2 --retry-connrefused \
+                       -H "Authorization: Bearer ${GH_TOKEN}" \
+                       -H "Accept: application/vnd.github+json" \
+                       -H "X-GitHub-Api-Version: 2022-11-28" \
+                       -w $'\n%{http_code}' \
+                       "https://api.github.com/${path}")"
+              rc=$?
+              set -e
+            fi
+            [ "${rc}" -eq 0 ] || { API_STATUS=000; API_BODY=""; return 0; }
+            case "${raw}" in *$'\n'[0-9][0-9][0-9]) : ;; *) API_STATUS=000; API_BODY=""; return 0 ;; esac
+            API_STATUS="${raw##*$'\n'}"; API_BODY="${raw%$'\n'*}"
+          }
+
+          unknown() {
+            echo "::error title=runner-leads wait: UNKNOWN::${1}. An unread feed is not 'no partner', so this run does not absorb the drift red; it stands."
+            exit 1
+          }
+          out() { printf '%s=%s\n' "$1" "$2" >> "${GITHUB_OUTPUT}"; }
+
+          # 1. Bot strips of a runner-leads declaration, newest first, within the bound.
+          # Each page is reduced to the six fields used, one JSON object per line, in a
+          # file: an events page carries whole issue bodies and would overflow argv.
+          events_file="$(mktemp)"
+          reached=false
+          prev_oldest=""
+          for page in $(seq 1 "${MAX_PAGES}"); do
+            api "repos/${SCHEMAS}/issues/events?per_page=100&page=${page}"
+            [ "${API_STATUS}" = 200 ] || unknown "reading ${SCHEMAS} issue events page ${page} answered HTTP ${API_STATUS}"
+            printf '%s' "${API_BODY}" | jq -e 'type == "array"' >/dev/null 2>&1 || unknown "${SCHEMAS} issue events page ${page} is not a JSON array"
+            printf '%s' "${API_BODY}" | jq -c '.[] | {event, actor: (.actor.login // ""), label: (.label.name // ""), at: .created_at, m: .issue.number, ispr: (.issue.pull_request != null)}' >> "${events_file}" \
+              || unknown "${SCHEMAS} issue events page ${page} has an unexpected shape"
+            n="$(printf '%s' "${API_BODY}" | jq 'length')"
+            # The bound is reached once this page's OLDEST event predates the cutoff, or the feed ended.
+            oldest="$(printf '%s' "${API_BODY}" | jq -r 'if length == 0 then "" else (map(.created_at | fromdateiso8601) | min | tostring) end')" \
+              || unknown "${SCHEMAS} issue events page ${page} carries an unparseable created_at"
+            # The bound below assumes newest-first. A feed in any other order
+            # would make "reached" a lie, so check it rather than assume it.
+            printf '%s' "${API_BODY}" | jq -e --arg prev "${prev_oldest}" '
+              [.[].created_at | fromdateiso8601] as $t
+              | all(range(1; $t | length); $t[.] <= $t[. - 1])
+                and ($prev == "" or ($t | length) == 0 or $t[0] <= ($prev | tonumber))' >/dev/null \
+              || unknown "${SCHEMAS} issue events page ${page} is not newest-first"
+            prev_oldest="${oldest:-${prev_oldest}}"
+            if [ "${n}" -lt 100 ] || { [ -n "${oldest}" ] && [ "${oldest}" -lt "${cutoff}" ]; }; then reached=true; break; fi
+          done
+          [ "${reached}" = true ] || unknown "${MAX_PAGES} pages of ${SCHEMAS} issue events did not reach back 72 h"
+
+          cands="$(jq -sc --arg bot "${BOT}" --argjson cutoff "${cutoff}" '
+            [ .[]
+              | select(.event == "unlabeled" and .actor == $bot and .ispr)
+              | select((.at | fromdateiso8601) >= $cutoff)
+              | . as $e
+              | (.label | capture("^coord:downstream-of=(qontinui/)?qontinui-runner#(?<n>[0-9]+)$")?) as $c
+              | select($c != null)
+              | {m: $e.m, n: ($c.n | tonumber), at: $e.at} ]
+            | group_by([.m, .n]) | map(max_by(.at))' "${events_file}")"
+          echo "Coord-stripped runner-leads declarations on ${SCHEMAS} in the last 72 h: $(jq -c . <<<"${cands}")"
+
+          # 2. Keep the ones whose runner half LANDED and whose schemas half is still
+          #    WAITING: open, against main, not itself landed, and touching nothing
+          #    but bindings. Predicates mirror scripts/schemas-pair-follow.sh. (A
+          #    coord land can leave the PR open with no label and no comment —
+          #    schemas#285 did, landed by rebase. A head that is itself on main
+          #    compares behind/identical and is skipped below; one landed by
+          #    rebase compares diverged and passes, and the re-check then applies
+          #    changes main already has — a no-op, or a patch that no longer
+          #    applies — so the red stands either way.)
+          valid='[]'
+          while IFS= read -r c; do
+            [ -n "${c}" ] || continue
+            m="$(jq -r .m <<<"${c}")"; n="$(jq -r .n <<<"${c}")"; at="$(jq -r .at <<<"${c}")"
+            # Runner half landed: `landed_state` in schemas-pair-follow.sh — base main
+            # and (merged_at or coord:landed). Not `closed`: coord closes it minutes
+            # after the land, and a run can start in between.
+            api "repos/${RUNNER}/pulls/${n}"
+            [ "${API_STATUS}" = 200 ] || unknown "reading ${RUNNER}#${n} answered HTTP ${API_STATUS}"
+            landed="$(printf '%s' "${API_BODY}" | jq -r 'if (.base.ref // "") == "main" and ((.merged_at != null) or any(.labels[]?; .name == "coord:landed")) then "yes" else "no" end' 2>/dev/null)" || unknown "${RUNNER}#${n} is not a pull request object"
+            if [ "${landed}" != yes ]; then echo "  ${SCHEMAS}#${m} -> ${RUNNER}#${n}: runner half not landed — skipped"; continue; fi
+            api "repos/${SCHEMAS}/pulls/${m}"
+            [ "${API_STATUS}" = 200 ] || unknown "reading ${SCHEMAS}#${m} answered HTTP ${API_STATUS}"
+            info="$(printf '%s' "${API_BODY}" | jq -c '{state, base: .base.ref, sha: .head.sha, landed: ((.merged_at != null) or any(.labels[]?; .name == "coord:landed"))}' 2>/dev/null)" || unknown "${SCHEMAS}#${m} is not a pull request object"
+            if [ "$(jq -r '.state + " " + .base' <<<"${info}")" != "open main" ]; then echo "  ${SCHEMAS}#${m}: not an open PR against main — skipped"; continue; fi
+            if [ "$(jq -r .landed <<<"${info}")" = true ]; then echo "  ${SCHEMAS}#${m}: already landed — skipped"; continue; fi
+            sha="$(jq -r .sha <<<"${info}")"
+            [[ "${sha}" =~ ^[0-9a-f]{40}$ ]] || unknown "${SCHEMAS}#${m} head sha '${sha}' is not a commit id"
+            # Bindings only. The re-check runs the partner's tree on main's verdict,
+            # so it must carry no code: confined to the generated dirs and the
+            # declared-wait file, every script and the Rust it compiles are main's
+            # history, not the PR's (schemas-pair-follow.yml: a main-scoped job
+            # "must not run PR code").
+            api "repos/${SCHEMAS}/compare/main...${sha}"
+            [ "${API_STATUS}" = 200 ] || unknown "comparing ${SCHEMAS} main...${sha} answered HTTP ${API_STATUS}"
+            # A head that is itself ON schemas main (a sha-preserving land GitHub
+            # has not closed yet) compares behind/identical with no files: it is
+            # not waiting, and absorbing nothing is the right answer. (A rebase
+            # land, like schemas#285's, compares diverged — see above.)
+            cst="$(printf '%s' "${API_BODY}" | jq -er '.status' 2>/dev/null)" || unknown "the ${SCHEMAS} main...${sha} compare has no status"
+            case "${cst}" in
+              behind|identical) echo "  ${SCHEMAS}#${m}: head ${sha:0:12} is already on schemas main (${cst}) — not waiting, skipped"; continue ;;
+              ahead|diverged) : ;;
+              *) unknown "the ${SCHEMAS} main...${sha} compare has status '${cst}'" ;;
+            esac
+            nf="$(printf '%s' "${API_BODY}" | jq -er '.files | if type == "array" then length else error("no files") end' 2>/dev/null)" || unknown "the ${SCHEMAS} main...${sha} compare has no files array"
+            [ "${nf}" -lt 300 ] || unknown "the ${SCHEMAS} main...${sha} compare lists ${nf} files, the API ceiling, so it may be truncated"
+            # Paths are printed as JSON: a raw filename could carry a newline and
+            # with it a forged workflow command. A path with a segment starting
+            # with '.' ('.', '..', a dotfile) counts as more than bindings.
+            other="$(printf '%s' "${API_BODY}" | jq -c '[.files[] | .filename, (.previous_filename // empty) | select(((startswith("ts/src/generated/") or startswith("src/qontinui_schemas/generated/") or . == "codegen/pending-registration.toml") and (test("(^|/)\\.") | not)) | not)] | .[:5]' 2>/dev/null)" \
+              || unknown "the ${SCHEMAS} main...${sha} compare has a file entry this step cannot read"
+            if [ "${other}" != "[]" ]; then echo "  ${SCHEMAS}#${m}: changes more than bindings (${other}) — not absorbable"; continue; fi
+            ngen="$(printf '%s' "${API_BODY}" | jq '[.files[] | .filename, (.previous_filename // empty) | select(startswith("ts/src/generated/") or startswith("src/qontinui_schemas/generated/"))] | length' 2>/dev/null)" \
+              || unknown "the ${SCHEMAS} main...${sha} compare has a file entry this step cannot read"
+            if [ "${ngen}" -eq 0 ]; then echo "  ${SCHEMAS}#${m}: changes no generated binding — not absorbable"; continue; fi
+            # The re-check applies the partner's DIFF from this merge base.
+            mb="$(printf '%s' "${API_BODY}" | jq -er '.merge_base_commit.sha' 2>/dev/null)" || unknown "the ${SCHEMAS} main...${sha} compare has no merge base"
+            [[ "${mb}" =~ ^[0-9a-f]{40}$ ]] || unknown "the ${SCHEMAS} main...${sha} compare's merge base is not a commit id"
+            # The re-check applies these paths' changes.
+            printf '%s' "${API_BODY}" | jq -r '.files[] | [.status, .filename, (.previous_filename // "")] | @tsv' >"${RUNNER_TEMP}/drift-wait-files-${m}.tsv" 2>/dev/null \
+              || unknown "the ${SCHEMAS} main...${sha} compare has a file entry this step cannot read"
+            echo "  ${SCHEMAS}#${m} -> ${RUNNER}#${n}: runner half landed; schemas half waiting at ${sha}, bindings only (stripped ${at})"
+            valid="$(jq -c --argjson m "${m}" --argjson n "${n}" --arg sha "${sha}" --arg mb "${mb}" --arg at "${at}" '. + [{m: $m, n: $n, sha: $sha, mb: $mb, at: $at}]' <<<"${valid}")"
+          done < <(jq -c '.[]' <<<"${cands}")
+
+          distinct="$(jq '[.[].m] | unique | length' <<<"${valid}")"
+          if [ "${distinct}" -eq 0 ]; then
+            echo "No landed runner-leads pair is waiting on an open schemas PR — nothing can absorb this red."
+            out found false
+            exit 0
+          fi
+          if [ "${distinct}" -gt 1 ]; then
+            echo "::error title=runner-leads wait: ambiguous::$(jq -r '[.[] | "\(.m)<-\(.n)"] | join(", ")' <<<"${valid}") — more than one schemas PR is waiting on a landed runner PR. One re-check can verify only one tree, and choosing would be a guess, so this red stands."
+            exit 1
+          fi
+          # One schemas PR named by several runner PRs is read once per name; a
+          # push between those reads would mix two heads.
+          [ "$(jq '[.[] | [.sha, .mb]] | unique | length' <<<"${valid}")" -eq 1 ] \
+            || unknown "${SCHEMAS}#$(jq -r '.[0].m' <<<"${valid}") read as more than one head while this step ran"
+          out found true
+          out pr "$(jq -r '.[0].m' <<<"${valid}")"
+          out sha "$(jq -r '.[0].sha' <<<"${valid}")"
+          out merge_base "$(jq -r '.[0].mb' <<<"${valid}")"
+          out runner_pr "$(jq -r '[.[].n] | unique | join(",")' <<<"${valid}")"
+          # The NEWEST strip for this partner: the audit's 72 h bound runs from it.
+          out stripped_at "$(jq -r 'max_by(.at) | .at' <<<"${valid}")"
+          out files "${RUNNER_TEMP}/drift-wait-files-$(jq -r '.[0].m' <<<"${valid}").tsv"
+
+      # The same pair question the pull_request run answered, asked from runner
+      # MAIN against what schemas main WILL be once the waiting partner lands:
+      # current schemas main with the partner's CHANGES (its diff from its merge
+      # base with main, bindings only — the partner step refuses anything else)
+      # applied three-way and committed locally, so the checker's HEAD is that
+      # state. A diff, not the partner's whole files: schemas main may have
+      # moved since the partner branched (another binding landing on a shared
+      # barrel), and laying the partner's files over it would revert those
+      # edits. A conflict fails this step, so the red stands. Every script, the
+      # generator inputs and the Rust compiled are schemas MAIN's, never the
+      # PR's. A partner whose head is on schemas main is skipped by the partner
+      # step (behind/identical); one landed by rebase applies as a no-op (its
+      # re-check is the original red again) or not at all (fails). Then the
+      # SAME generator and the SAME shared checker, every arm.
+      - name: Re-check against the waiting partner
+        id: recheck
+        if: ${{ !cancelled() && steps.partner.outcome == 'success' && steps.partner.outputs.found == 'true' }}
+        # The same regeneration the job already ran once, over a warm target.
+        timeout-minutes: 45
+        env:
+          PARTNER_SHA: ${{ steps.partner.outputs.sha }}
+          PARTNER_BASE: ${{ steps.partner.outputs.merge_base }}
+          PARTNER_PR: ${{ steps.partner.outputs.pr }}
+          PARTNER_FILES: ${{ steps.partner.outputs.files }}
+          RUNNER_PR: ${{ steps.partner.outputs.runner_pr }}
+          STRIPPED_AT: ${{ steps.partner.outputs.stripped_at }}
+          CARGO_TARGET_DIR: ${{ github.workspace }}/qontinui-runner/src-tauri/target
+        run: |
+          set -euo pipefail
+          [[ "${PARTNER_SHA}" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::partner sha '${PARTNER_SHA}' is not a commit id"; exit 1; }
+          [[ "${PARTNER_BASE}" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::partner merge base '${PARTNER_BASE}' is not a commit id"; exit 1; }
+          [ -s "${PARTNER_FILES}" ] || { echo "::error::the partner's file list '${PARTNER_FILES}' is missing or empty"; exit 1; }
+          s=qontinui-schemas
+          base="$(git -C "${s}" rev-parse HEAD)"
+          # Back to schemas main exactly: drop the first regeneration's edits and
+          # its untracked output, ignored files included (the checker's arm 1
+          # does not honour ignores). The clean is confined to the generated
+          # dirs, so node_modules and the like stay.
+          git -C "${s}" reset -q --hard HEAD
+          git -C "${s}" clean -fdxq -- ts/src/generated src/qontinui_schemas/generated
+          for c in "${PARTNER_SHA}" "${PARTNER_BASE}"; do
+            git -C "${s}" fetch -q --depth 1 --no-tags origin "${c}"
+            [ "$(git -C "${s}" rev-parse FETCH_HEAD)" = "${c}" ] || { echo "::error::fetched $(git -C "${s}" rev-parse FETCH_HEAD), not ${c}"; exit 1; }
+          done
+          # codegen/pending-registration.toml is NOT applied: main's rows decide.
+          # An unlanded PR's rows would excuse deletions no one has merged, and
+          # no audit reads a PR's rows. A row a runner-leads partner drops
+          # names the runner PR that just landed, which on main already excuses
+          # nothing. (Its binding removals and renames ARE applied, below.)
+          # Only generated bindings are applied: any other listed path (a script,
+          # a workflow) is refused rather than skipped, so a partner's code never
+          # reaches the tree whose scripts this step runs.
+          paths=()
+          while IFS=$'\t' read -r st file prev; do
+            # A plain toml change is skipped; the toml as either side of a rename
+            # or copy would change a binding path's content unverified, so it is refused.
+            if [ "${file}" = codegen/pending-registration.toml ] && [ -z "${prev}" ]; then continue; fi
+            if [ "${file}" = codegen/pending-registration.toml ] || [ "${prev}" = codegen/pending-registration.toml ]; then
+              echo "::error::the partner renames or copies codegen/pending-registration.toml (${file@Q} <- ${prev@Q}) — refusing to re-check against it"; exit 1
+            fi
+            for p in "${file}" ${prev:+"${prev}"}; do
+              case "${p}" in
+                ts/src/generated/?*|src/qontinui_schemas/generated/?*) : ;;
+                *) echo "::error::the partner lists ${p@Q}, outside the generated bindings — refusing to re-check against it"; exit 1 ;;
+              esac
+              # No segment may start with '.': that covers '.' and '..' (git resolves
+              # them in a pathspec) and dotfiles such as .gitattributes, which would
+              # change how the checker reads the tree. The generator writes none.
+              case "/${p}" in */.*) echo "::error::the partner lists ${p@Q}, a path with a dot segment or dotfile — refusing to re-check against it"; exit 1 ;; esac
+              paths+=("${p}")
+            done
+            # Plain files only: a symlink or gitlink in a generated dir would let
+            # the generator write through it.
+            if [ "${st}" != removed ]; then
+              mode="$(git -C "${s}" --literal-pathspecs ls-tree "${PARTNER_SHA}" -- "${file}" | awk '{print $1}')"
+              case "${mode}" in
+                100644|100755) : ;;
+                *) echo "::error::the partner's ${file@Q} has git mode '${mode}', not a plain file — refusing to re-check against it"; exit 1 ;;
+              esac
+            fi
+          done <"${PARTNER_FILES}"
+          # An empty pathspec would diff the WHOLE tree, scripts included.
+          [ "${#paths[@]}" -gt 0 ] || { echo "::error::the partner lists no binding file to apply — no tree to re-check, so the red stands"; exit 1; }
+          patch="$(mktemp)"
+          git -C "${s}" --literal-pathspecs diff --binary --no-renames "${PARTNER_BASE}" "${PARTNER_SHA}" -- "${paths[@]}" >"${patch}"
+          [ -s "${patch}" ] || { echo "::error::the partner changes none of its listed files relative to its merge base ${PARTNER_BASE:0:12}"; exit 1; }
+          git -C "${s}" apply --3way --index "${patch}" \
+            || { echo "::error::the partner's changes do not apply to schemas main ${base:0:12} (a conflict with what main changed since the partner branched, or changes main already carries) — no tree to re-check, so the red stands"; exit 1; }
+          git -C "${s}" -c user.name=qontinui-types-drift -c user.email=ci@invalid \
+            commit -q --allow-empty -m "schemas main ${base:0:12} + #${PARTNER_PR} binding changes (CI-local, never pushed)"
+          echo "Re-checking runner main against schemas main ${base:0:12} + qontinui/qontinui-schemas#${PARTNER_PR} (${PARTNER_SHA:0:12}): $(git -C "${s}" diff --stat HEAD~1 HEAD | tail -1)"
+          bash qontinui-runner/src-tauri/scripts/generate_types.sh
+          (cd "${s}" && bash scripts/check-generated-drift.sh --verify)
+          echo "::warning title=runner main is ahead of schemas main (declared wait)::Drift against qontinui-schemas main ABSORBED: runner main regenerates exactly schemas main plus the binding changes of qontinui/qontinui-schemas#${PARTNER_PR} at ${PARTNER_SHA}, the open partner of landed qontinui-runner#${RUNNER_PR} (coord stripped the declaration ${STRIPPED_AT}). Runner main is consistent with schemas main once that PR lands. This absorption is valid for 72 h after the strip; coord keeps this green until the next push run, which re-asks."
+
+      # THE GATE off pull_request. It runs whenever the drift check failed and
+      # passes only on a green re-check, so a skipped or failed partner search
+      # or re-check leaves the red standing. A CANCELLED run never reaches this
+      # step and reads as no verdict (see the step-timeout note above).
+      - name: Decide the drift verdict
+        if: ${{ !cancelled() && github.event_name != 'pull_request' && steps.drift.outcome == 'failure' }}
+        env:
+          RECHECK: ${{ steps.recheck.outcome }}
+          PARTNER: ${{ steps.partner.outcome }}
+          FOUND: ${{ steps.partner.outputs.found }}
+        run: |
+          if [ "${RECHECK}" = "success" ]; then
+            echo "Drift red absorbed by the waiting-partner re-check (see its warning)."
+            exit 0
+          fi
+          cat <<'EOF'
+          This drift red stands. If it is a runner-leads pair whose schemas half has not
+          landed yet, RE-RUNNING CANNOT HELP until that half lands: the verdict compares
+          runner main against schemas main, and neither has moved.
+            - The partner is the qontinui-schemas PR named by the culprit's coord dep label,
+              or one coord stripped `coord:downstream-of=qontinui-runner#<n>` from.
+            - Apply `coord:clears-red=qontinui-runner` to that partner NOW (GitHub-applied
+              only; it promotes only while this main is red) so it takes the red-main-fix tier.
+            - It was not absorbed because: no such pair waiting within 72 h, more than one,
+              an unreadable feed, or its re-check also red — the steps above say which.
+          Otherwise this is genuine drift: regenerate and land the qontinui-schemas side.
+          EOF
+          echo "::error title=qontinui-types drift::Regenerated bindings differ from qontinui-schemas main and no waiting runner-leads partner absorbs it (partner search: '${PARTNER:-not run}', partner found: '${FOUND:-none}', re-check: '${RECHECK:-not run}')."
+          exit 1
