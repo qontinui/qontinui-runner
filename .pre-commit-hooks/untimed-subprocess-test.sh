@@ -15,7 +15,8 @@ WRAPPER="$HERE/untimed-subprocess.sh"
 # and friends) pointing at THIS repo; left set, they hijack the git calls this
 # test makes inside its scratch repos. The test's own location is a fine root
 # for the TEST — only the wrapper is forbidden from deriving it that way.
-unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_PREFIX GIT_COMMON_DIR     GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES QONTINUI_HOOK_REPO_ROOT
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_PREFIX GIT_COMMON_DIR \
+    GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES QONTINUI_HOOK_REPO_ROOT
 REPO_ROOT="$(cd "$HERE/.." && pwd)"
 
 pass=0; failn=0
@@ -58,6 +59,12 @@ else
     bad "arguments not passed through: $(tr '\n' '|' <"$OUT")"
 fi
 
+# 1b. A RELATIVE root still resolves (the wrapper cd's before running).
+: >"$OUT"
+( cd "$TMP" && STUB_OUT="$OUT" STUB_RC=0 QONTINUI_HOOK_REPO_ROOT="fake-repo"     bash "$WRAPPER" >/dev/null 2>&1 )
+rc=$?
+[ "$rc" -eq 0 ] && [ -s "$OUT" ] && ok "relative QONTINUI_HOOK_REPO_ROOT resolved"     || bad "relative root: rc=$rc ran=$([ -s "$OUT" ] && echo yes || echo no)"
+
 # 2. No arguments -> the checker receives none.
 STUB_OUT="$OUT" STUB_RC=0 QONTINUI_HOOK_REPO_ROOT="$FAKE" bash "$WRAPPER" >/dev/null 2>&1
 rc=$?
@@ -93,7 +100,7 @@ rc=$?
 #    to python.
 REAL_PY=""
 for c in python3 python; do
-    if command -v "$c" >/dev/null 2>&1 && "$c" -c 'import sys' >/dev/null 2>&1; then
+    if command -v "$c" >/dev/null 2>&1 && "$c" -c 'import sys; sys.exit(sys.version_info < (3, 11))' >/dev/null 2>&1; then
         REAL_PY="$(command -v "$c")"; break
     fi
 done
