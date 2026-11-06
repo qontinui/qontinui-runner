@@ -81,7 +81,9 @@
 //! ## The mark's own row (review F2)
 //!
 //! When the drain's observed ACK stamps a mark it also records the row that
-//! answered (`TerminalSessionRecord::finish_coord_session_id`), which is what
+//! answered, and when it ACK-drops an unconfirmed finish it records the row
+//! that finish was SENT to, unstamped
+//! (`TerminalSessionRecord::finish_coord_session_id`). That is what
 //! [`HealPort::own_row`] prefers; it falls back to the in-process resolvers
 //! (the registrar's index, the live terminal plane). A mark with neither — one
 //! stamped before the field existed whose session no live plane knows — is
@@ -277,15 +279,25 @@ pub struct Observations {
 }
 
 impl Observations {
-    /// Fold in one read made for `ids`.
+    /// Fold in one read made for `ids`. A degraded read makes every id
+    /// unreadable; a read whose input was truncated (coord's cap, or the
+    /// runner's own clamp) makes every id it served no row for unreadable —
+    /// such an id may simply not have been asked about, so it is never read
+    /// as `no_coord_row`.
     pub fn absorb(&mut self, ids: &[String], fetch: &StatusFetch) {
         if fetch.degraded {
             self.unreadable.extend(ids.iter().cloned());
             return;
         }
         for id in ids {
-            if let Some(row) = fetch.rows_by_session_id.get(id) {
-                self.rows.insert(id.clone(), row.clone());
+            match fetch.rows_by_session_id.get(id) {
+                Some(row) => {
+                    self.rows.insert(id.clone(), row.clone());
+                }
+                None if fetch.input_truncated => {
+                    self.unreadable.insert(id.clone());
+                }
+                None => {}
             }
         }
     }
@@ -504,7 +516,9 @@ pub struct ReadBack {
     pub observed_at: DateTime<Utc>,
     /// Why `observed` is `None`.
     pub unobserved_reason: Option<String>,
-    /// The mark's own coord row, resolved in-process.
+    /// The mark's own coord row: the stored sent/confirmed row
+    /// (`finish_coord_session_id`) first, then the in-process resolution
+    /// ([`HealPort::own_row`]).
     pub own_row: Option<Uuid>,
     /// The heal's outcome, for a finished synced mark.
     pub heal: Option<HealOutcome>,
@@ -564,8 +578,9 @@ pub fn read_back_from(
 /// `session.finishSynced` observe coord:
 ///
 /// - coord readable: `true` only when the stored stamp is `true` AND coord's
-///   row reads `finished` AND that row is the mark's own (or the own row does
-///   not resolve in-process, when only the status can be checked);
+///   row reads `finished` AND that row is the mark's own — the stored
+///   sent/confirmed row first, then the in-process resolution — (or, when
+///   neither knows the own row, only the status can be checked);
 /// - coord unreadable: the stored value, unchanged — itself an observed
 ///   signal since Phase 4 — with `coord.observed: null` and
 ///   `coord.observedReason` naming why.
