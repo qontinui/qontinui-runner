@@ -30,18 +30,24 @@
  *      window knows it did not parse since its last prompt (dropped while
  *      hidden, overrun out of the ring, spliced out of a resync, painted over
  *      by a reconnect). The shell side announces the capability only at a
- *      prompt where it can see its C path in place — bash: PS0 carries the C
- *      and stderr, where bash writes PS0, is the terminal stdin is; zsh: our
- *      preexec is the first hook and no user `preexec` function runs ahead of
- *      it; PowerShell: PSConsoleHostReadLine is still ours, at a top-level
- *      prompt. Anywhere those checks fail it stays silent, and the pane is
- *      kept. They are checks of what each shell can see at its prompt, not
- *      proof of what the next line will do.
+ *      prompt where it can see its C path in place and reaching the pane,
+ *      with no registered user hook ahead of it — bash: PS0 carries the C,
+ *      and stdin and stderr (where bash writes PS0) are still the pane; zsh:
+ *      our preexec is the first hook, with no `preexec` or `zshaddhistory`
+ *      function, `zshaddhistory` hook or DEBUG trap; PowerShell:
+ *      PSConsoleHostReadLine is still ours, at a top-level prompt. Anywhere
+ *      those checks fail it stays silent, and the pane is kept. They are
+ *      checks of what each shell can see at its prompt, not proof of what the
+ *      next line will do: line-editor-time code (zsh widgets, a user bash
+ *      PS0's own expansion) runs ahead of the C unchecked, and what it forks
+ *      shows in witness 1.
  *
  * What neither witness sees: work a shell runs in-process and in the
  * background without a command line — a PowerShell `Start-ThreadJob` (or
  * `Register-ObjectEvent` action) keeps running at an idle prompt, with no
- * descendant and no 633;C. Replacing such a pane ends that work.
+ * descendant and no 633;C. Replacing such a pane ends that work. So does a
+ * bash 5.3 user PS0 whose `${ …; }` runs builtins only: it runs in-process
+ * after the line is accepted and before the C, with no descendant (measured).
  *
  * Both are read before the replacement is opened and again just before the
  * original is closed, and the original closes **only after its replacement

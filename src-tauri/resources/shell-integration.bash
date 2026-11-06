@@ -37,15 +37,21 @@ __osc633() {
 # the next typed command line will get a C first. It is sent ONLY when these
 # checks pass at this prompt: bash >= 4.4 (PS0 exists), PS0 holds our C right
 # now (re-prefixed if something reassigned PS0 — a `source ~/.bashrc` — unless
-# PS0 is readonly), and stderr, where bash writes PS0, is the terminal the
-# shell reads from: a terminal (`[ -t 2 ]`, not after `exec 2>/dev/null` or
-# `exec 2>>log`) and the same file as stdin (`-ef`, not after `exec
-# 2>/dev/pts/N`, another terminal). `exec 2>/dev/tty` fails the second check
-# too, so it stops the announcement: the safe direction. The DEBUG trap is never
+# PS0 is readonly), and both stdin (where the line is read) and stderr (where
+# bash writes PS0) are still the pane: the terminal this shell started on, by
+# its path, recorded once at install (`-ef`; not after `exec 2>/dev/null`,
+# `exec 2>>log`, `exec 2>/dev/pts/N` or `exec 0</dev/pts/N`; an `exec 2>&1`
+# or the pane re-opened by its own path still passes). `exec 2>/dev/tty`
+# fails it too, so it stops the announcement: the safe direction. With no
+# recorded pane (`tty` failed) nothing is announced. The DEBUG trap is never
 # announced: a user PROMPT_COMMAND's entries can spend its once-per-line C.
 # Without the announcement the runner keeps the pane, which is always safe. It
 # rides every prompt, so a runner pane that stopped parsing marks (remounted,
 # or hidden) learns it again.
+#
+# Residual, documented rather than gated: a user PS0 is expanded with ours, and
+# bash expands the WHOLE of PS0 before it writes any of it, so code in the
+# user's part runs before our C reaches the pane (see the PS0 install below).
 #
 # The shared literal: `P;CommandMarks=1` is pinned against the webview's
 # `COMMAND_MARKS_CAPABILITY` (src/components/terminal/shellIntegrationEvents.ts)
@@ -55,6 +61,17 @@ if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4) )
     __qontinui_ps0_path=1
 else
     __qontinui_ps0_path=0
+fi
+
+# The pane, by path: the terminal on stdin while this rc runs (one fork). Empty
+# when `tty` fails or prints no path, and then no prompt announces.
+if __qontinui_pane_tty="$(tty 2>/dev/null)"; then
+    case "${__qontinui_pane_tty}" in
+        /*) ;;
+        *) __qontinui_pane_tty="" ;;
+    esac
+else
+    __qontinui_pane_tty=""
 fi
 
 # Whether the variable named $1 is readonly (a fork; install time and the rare
@@ -99,8 +116,8 @@ __qontinui_prompt_start() {
 
 # Last PROMPT_COMMAND entry, after every entry of the user's: record HISTCMD,
 # then the capability (only if PS0 still carries our C, re-prefixing it where
-# something reassigned PS0, and stderr — where bash writes PS0 — is the
-# terminal stdin is) and A.
+# something reassigned PS0, and stdin and stderr — where bash writes PS0 — are
+# still the pane) and A.
 __qontinui_prompt_end() {
     local code=$?
     __qontinui_histcmd="${HISTCMD-}"
@@ -110,7 +127,12 @@ __qontinui_prompt_end() {
             *) __qontinui_is_readonly PS0 || PS0='\e]633;C\a'"${PS0-}" ;;
         esac
         case "${PS0-}" in
-            *'\e]633;C\a'*) if [ -t 2 ] && [[ /dev/fd/2 -ef /dev/fd/0 ]]; then __osc633 "P;CommandMarks=1"; fi ;;
+            *'\e]633;C\a'*)
+                if [[ -n ${__qontinui_pane_tty-} && /dev/fd/0 -ef ${__qontinui_pane_tty-} &&
+                    /dev/fd/2 -ef ${__qontinui_pane_tty-} ]]; then
+                    __osc633 "P;CommandMarks=1"
+                fi
+                ;;
         esac
     fi
     __osc633 "A"
@@ -146,8 +168,15 @@ if ! __qontinui_is_readonly PROMPT_COMMAND; then
     if [ "${__qontinui_ps0_path}" = "1" ]; then
         # PS0 is expanded once per command line read, after it is read and
         # before it runs — never for PROMPT_COMMAND's entries. `\e`/`\a` are
-        # prompt escapes, so this needs no command substitution (and no
-        # promptvars). A user PS0 is kept, after ours.
+        # prompt escapes, so ours needs no command substitution (and no
+        # promptvars). A user PS0 is kept, and its text follows our C — but
+        # bash expands the WHOLE of PS0 before writing any of it, so the user's
+        # part RUNS first, and a slow one delays our C. Measured with a 2 s
+        # PS0: `$(sleep 2)` (bash 5.1, 5.3) and `${ sleep 2; }` (5.3) sent no C
+        # for those 2 s while the shell had a `sleep` child, which the
+        # runner's process read sees; a 5.3 function substitution of builtins
+        # only (`${ while …; do :; done; }`) ran in-process, with no C and no
+        # child — a residual neither witness sees. Not gated.
         if ! __qontinui_is_readonly PS0; then
             PS0='\e]633;C\a'"${PS0-}"
         fi

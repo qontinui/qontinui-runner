@@ -50,18 +50,35 @@ __qontinui_preexec() {
 # here rather than baked into PROMPT, so a theme that reassigns PROMPT in its
 # own precmd (or a hook added after this one) cannot drop A — and no hook can
 # emit a C after it. The capability tells the runner this prompt's A means
-# "nothing is running"; it is sent only while our preexec is the FIRST entry of
-# preexec_functions — a hook prepended later (a deferred plugin's
-# `preexec_functions=(slow $preexec_functions)`) runs ahead of our C, and one
-# appended later does not — and no user `preexec` function runs ahead of the
-# array: the C path is present, and first, at THIS prompt. Otherwise the pane
+# "nothing is running"; it is sent only while our C path is present, and no
+# REGISTERED user hook runs ahead of it. Between an accepted line and our C,
+# zsh runs (Src/init.c loop(), Src/hist.c hend()): the `zshaddhistory`
+# function and zshaddhistory_functions, then the `preexec` function, then
+# preexec_functions in order — and a DEBUG trap fires before every command,
+# our preexec's first one included. So: our preexec must be the FIRST entry of
+# preexec_functions (a hook prepended later, like a deferred plugin's
+# `preexec_functions=(slow $preexec_functions)`, runs ahead of our C; one
+# appended later does not), and there must be no `preexec` or `zshaddhistory`
+# function, no zshaddhistory_functions entry, and no DEBUG trap (a TRAPDEBUG
+# function, or `trap … DEBUG`, which zsh lists only as `trap` text — the one
+# fork, made last and only when everything else passed). Otherwise the pane
 # is kept. `emulate -L zsh`: the user's options (KSH_ARRAYS shifts every
-# subscript to 0-based) stay out of the check. The literal is pinned against
-# the webview's COMMAND_MARKS_CAPABILITY by a source scan in
+# subscript to 0-based, NO_UNSET) stay out of the check.
+#
+# Residual, documented rather than gated: line-editor-time code. ZLE widgets
+# (`zle-line-finish`, a wrapped `accept-line`) and prompt expansion before the
+# line is accepted (PS2, a PROMPT_SUBST SPROMPT) run ahead of preexec and are
+# not checked; anything they fork shows in the runner's process read. Gating
+# them would switch the capability off for most p10k and
+# zsh-syntax-highlighting users. The literal is pinned against the webview's
+# COMMAND_MARKS_CAPABILITY by a source scan in
 # src-tauri/src/session/spawn_prompt.rs.
 __qontinui_precmd_prompt_start() {
     emulate -L zsh
-    if [[ ${preexec_functions[1]-} == __qontinui_preexec ]] && (( ! ${+functions[preexec]} )); then
+    if [[ ${preexec_functions[1]-} == __qontinui_preexec ]] &&
+        (( ! ${+functions[preexec]} && ! ${+functions[zshaddhistory]} &&
+            ${#zshaddhistory_functions} == 0 && ! ${+functions[TRAPDEBUG]} )) &&
+        [[ $'\n'"$(trap)"$'\n' != *' DEBUG'$'\n'* ]]; then
         __qontinui_osc633 "P;CommandMarks=1"
     fi
     __qontinui_osc633 "A"
