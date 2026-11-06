@@ -406,7 +406,9 @@ pub fn diff_census(
     let attempted: HashSet<String> = observed.iter().map(|o| key(&o.claude_session_id)).collect();
     // One observation per session, merged by the ledger's own order (the
     // strongest `Observed` stands), so a session with a closed stamped row
-    // and an open adopted one reads as the ledger reads it.
+    // and an open adopted one reads as the ledger reads it. On a tie the
+    // OPEN row stands, so the restored entry names the live tile, never the
+    // dead terminal of a closed predecessor.
     let mut best: Vec<&RestoredObservation> = Vec::new();
     let mut slot: HashMap<String, usize> = HashMap::new();
     let mut tiles: HashMap<String, (usize, &RestoredObservation)> = HashMap::new();
@@ -416,8 +418,13 @@ pub fn diff_census(
             tiles.entry(id.clone()).or_insert((0, obs)).0 += 1;
         }
         match slot.get(&id) {
-            Some(&i) if best[i].observed >= obs.observed => {}
-            Some(&i) => best[i] = obs,
+            Some(&i)
+                if obs.observed > best[i].observed
+                    || (obs.observed == best[i].observed && obs.open && !best[i].open) =>
+            {
+                best[i] = obs
+            }
+            Some(_) => {}
             None => {
                 slot.insert(id, best.len());
                 best.push(obs);
@@ -880,13 +887,17 @@ mod tests {
         let exp = [expected("a", true)];
         let mut closed = observed("a", RESTORE_TIER_RESUMED);
         closed.open = false;
+        closed.terminal_id = "term-dead".to_string();
         let mut successor = observed("a", RESTORE_TIER_RESUMED);
         successor.restore_tier = None;
         successor.restored_from_boot_at = None;
+        successor.terminal_id = "term-live".to_string();
         let d = diff_census(&exp, &[closed, successor], Some(true), None);
         assert!(d.unexpected.is_empty(), "{d:?}");
         assert_eq!(d.restored.len(), 1);
         assert_eq!(d.verdict, RESTORE_VERDICT_MATCH);
+        // The restored entry names the live successor's tile, not the dead one.
+        assert_eq!(d.restored[0].terminal_id.as_deref(), Some("term-live"), "{d:?}");
     }
 
     /// A live view that TIMED OUT is reported as a timeout, not as an
