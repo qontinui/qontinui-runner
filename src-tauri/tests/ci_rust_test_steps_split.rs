@@ -1453,7 +1453,9 @@ fn the_linux_pool_arms_keep_fork_prs_and_reruns_on_the_floor() {
     );
     for at in reads {
         assert!(
-            runs_on[..at].ends_with("github.run_attempt == 1 && "),
+            runs_on
+                .get(..at)
+                .is_some_and(|before| before.ends_with("github.run_attempt == 1 && ")),
             "`test` must read `{ROUTED}` on attempt 1 only: {runs_on}"
         );
     }
