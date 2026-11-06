@@ -9174,10 +9174,17 @@ mod remote_admission_tests {
             .find("admit_create_grant_end(")
             .expect("the create arm must admit through admit_create_grant_end");
         // Retention guard: dropping the reaper turns the refusal and the
-        // closing mark off.
+        // closing mark off. Read with whitespace removed, so a reformat cannot
+        // break it, and `&reaper` must sit INSIDE the admission call's arguments.
+        let compact =
+            |text: &str| -> String { text.chars().filter(|c| !c.is_whitespace()).collect() };
+        let call = create
+            .get(admit..)
+            .and_then(|rest| rest.find(") {").and_then(|end| rest.get(..end)))
+            .expect("the admission call's argument span");
         assert!(
-            create.contains("let reaper = crate::mcp::remote_create_reaper::reaper();")
-                && create.contains("        &reaper,\n"),
+            compact(create).contains("letreaper=crate::mcp::remote_create_reaper::reaper();")
+                && compact(call).contains(",&reaper,"),
             "the ever-attached refusal must claim through the reaper"
         );
         // The claim is settled by the driver's verdict, never left behind.
