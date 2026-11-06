@@ -13,6 +13,9 @@
 //! | `frontier` | `node`? + filter | `JourneyFrontier` |
 //! | `edge-timing` | `from`, `to` + filter | [`JourneyEdgeTimingAnswer`] |
 //!
+//! Plan Phase 3 adds two POSTs, mounted here and documented in their modules:
+//! `explore` ([`super::explorer`]) and `observe` ([`super::observe`]).
+//!
 //! "filter" is `?since=<RFC 3339>&app_version=<v>&run_kind=<agent_action|explorer|passive_session>`;
 //! any other parameter is a 400, so a misspelt filter can never be silently
 //! dropped. Every applied filter is echoed (`filterEcho`).
@@ -1013,7 +1016,7 @@ pub async fn get_journey_edge_timing(
 /// Every journey route, merged into the main router beside
 /// `spec_api::routes()`.
 pub fn router() -> axum::Router<Arc<ApiState>> {
-    use axum::routing::get;
+    use axum::routing::{get, post};
     axum::Router::new()
         .route(
             "/apps/{app_id}/journey/health",
@@ -1037,6 +1040,14 @@ pub fn router() -> axum::Router<Arc<ApiState>> {
         .route(
             "/apps/{app_id}/journey/edge-timing",
             get(get_journey_edge_timing),
+        )
+        .route(
+            "/apps/{app_id}/journey/explore",
+            post(super::explorer::post_explore),
+        )
+        .route(
+            "/apps/{app_id}/journey/observe",
+            post(super::observe::post_observe),
         )
 }
 

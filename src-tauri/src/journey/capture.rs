@@ -178,6 +178,7 @@ pub(crate) fn record_sdk_result(
         Provenance {
             app_version,
             run_id: None,
+            ..Default::default()
         },
         response.get("success") == Some(&serde_json::Value::Bool(false)),
     );
@@ -257,7 +258,11 @@ pub(crate) const SDK_REFUSAL_CODES: [&str; 2] = ["TAB_NOT_FOUND", "TAB_STALE"];
 /// `data` — or a TRANSPORT-origin dispatch refusal (`failure_origin:
 /// "transport"`, from `ipc_fallback_refusal`): neither reached any UI, so,
 /// like the control surface's 4xx rule, neither records. An APP-origin
-/// failure (`failure_origin: "app"`) did reach the app and is an `error` edge.
+/// failure (`failure_origin: "app"`) did reach the app and is an `error` edge;
+/// so is an UNKNOWN-origin one (`"unknown"`: the request may have reached the
+/// app but its answer could not be read) — recorded as a failed attempt, which
+/// keeps its frontier row open (`activation_failed`) rather than claiming
+/// either that nothing was touched or that the affordance was explored.
 /// A RUNNER-side request rejection on an IPC-fallback route
 /// (`failure_origin: "runner"`, see [`tag_runner_rejection`]) never touched
 /// the UI either and records nothing — the control routes' 4xx rule (e1).
@@ -302,7 +307,7 @@ pub(crate) fn finalize(draft: EdgeDraft) -> JourneyEdgeObservation {
         runner_build_id: RUNNER_BUILD_ID.to_string(),
         runner_instance: draft.key.runner_instance,
         run_id: draft.provenance.run_id,
-        run_kind: RunKind::AgentAction,
+        run_kind: draft.provenance.run_kind,
         from_node: draft.from_node,
         to_node: draft.to_node,
         trigger: draft.trigger,
@@ -648,6 +653,32 @@ pub(crate) enum JourneyEvent {
     },
     /// Close every pending edge older than the TTL (the retention tick).
     Sweep,
+    /// Answer once every event queued before this one has been processed —
+    /// its edges and frontier written — with the node the cursor last
+    /// resolved (plan Phase 3: the explorer learns where it is from the
+    /// producer itself, and reads the ledger only after its own edges are in).
+    Barrier {
+        key: CursorKey,
+        reply: tokio::sync::oneshot::Sender<NodeReading>,
+    },
+    /// The cursor's position is no longer known (the explorer, starting a
+    /// run): forget its last node and affordances, close any pending edge as
+    /// unobserved, and answer once done. Its snapshot count is kept.
+    Forget {
+        key: CursorKey,
+        reply: tokio::sync::oneshot::Sender<()>,
+    },
+}
+
+/// The worker's answer to a [`JourneyEvent::Barrier`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NodeReading {
+    /// The node the cursor last resolved; `None` = none yet.
+    pub node: Option<JourneyNode>,
+    /// Snapshots resolved for the cursor so far (monotonic): a reader that
+    /// just sent a snapshot and sees no increase knows that snapshot was
+    /// dropped, and that `node` is a STALE answer.
+    pub snapshots: u64,
 }
 
 /// Events buffered between the handlers and the worker. A snapshot can be
@@ -657,20 +688,204 @@ const EVENT_QUEUE_CAPACITY: usize = 64;
 
 static EVENT_TX: OnceLock<mpsc::Sender<JourneyEvent>> = OnceLock::new();
 
-/// Hand one event to the journey worker, spawning it on first use.
-/// Fire-and-forget: never blocks, never fails the caller.
-pub(crate) fn enqueue_edge_observation(pg_db: Arc<PgDb>, event: JourneyEvent) {
-    let tx = EVENT_TX.get_or_init(|| {
+fn event_tx(pg_db: Arc<PgDb>) -> &'static mpsc::Sender<JourneyEvent> {
+    EVENT_TX.get_or_init(|| {
         let (tx, rx) = mpsc::channel(EVENT_QUEUE_CAPACITY);
         tokio::spawn(run_worker(pg_db, rx));
         tx
+    })
+}
+
+/// One explorer run's identity and its enqueue accounting (plan Phase 3).
+/// Cloning shares the counters.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ExplorerRun {
+    pub run_id: String,
+    /// Action events attributed to the run that reached the worker's queue —
+    /// each closes into exactly one ledger row with this `run_id` (unless
+    /// that row's write fails, which `/journey/health` counts).
+    pub enqueued: Arc<std::sync::atomic::AtomicU64>,
+    /// Action events attributed to the run that the queue could not hold.
+    pub dropped: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl ExplorerRun {
+    pub(crate) fn new(run_id: impl Into<String>) -> Self {
+        Self {
+            run_id: run_id.into(),
+            ..Default::default()
+        }
+    }
+
+    pub(crate) fn enqueued(&self) -> u64 {
+        self.enqueued.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn dropped(&self) -> u64 {
+        self.dropped.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+tokio::task_local! {
+    /// The explorer run the current task acts for (plan Phase 3). Set only by
+    /// [`as_explorer`]; read by [`attribute_action`].
+    static EXPLORER_RUN: ExplorerRun;
+}
+
+/// Run `fut` as part of explorer `run`: every action a choke point records
+/// inside it is attributed `run_kind = explorer`, `run_id = run.run_id`, and
+/// counted on the run.
+///
+/// This is how the explorer has NO private write path — it calls the same
+/// handlers agents call, and the attribution travels with the task, not
+/// through a parameter a handler could forget to pass.
+pub(crate) async fn as_explorer<F: std::future::Future>(run: ExplorerRun, fut: F) -> F::Output {
+    EXPLORER_RUN.scope(run, fut).await
+}
+
+/// Is the current task acting for an explorer run? The SDK action routes
+/// refuse their runner-webview fallback when it is.
+pub(crate) fn in_explorer_run() -> bool {
+    EXPLORER_RUN.try_with(|_| ()).is_ok()
+}
+
+/// An action's provenance as recorded: an action taken inside [`as_explorer`]
+/// is the explorer's, whatever the handler passed; every other action keeps
+/// its own provenance.
+pub(crate) fn attribute_action(mut provenance: Provenance) -> Provenance {
+    if let Ok(run_id) = EXPLORER_RUN.try_with(|r| r.run_id.clone()) {
+        provenance.run_kind = RunKind::Explorer;
+        provenance.run_id = Some(run_id);
+    }
+    provenance
+}
+
+/// Count one explorer-attributed action event as enqueued or dropped.
+fn count_explorer_event(enqueued: bool) {
+    let _ = EXPLORER_RUN.try_with(|r| {
+        let c = if enqueued { &r.enqueued } else { &r.dropped };
+        c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     });
-    if let Err(e) = tx.try_send(event) {
-        let reason = match e {
-            mpsc::error::TrySendError::Full(_) => "journey event queue full — event dropped",
-            mpsc::error::TrySendError::Closed(_) => "journey worker is not running — event dropped",
-        };
-        health::record_write_failure(reason.to_string());
+}
+
+/// The cursor an event recorded inside [`as_explorer`] belongs to: the
+/// explorer's own ([`CursorKey::for_explorer`]), whatever scope the handler
+/// derived. Outside an explorer run the key is unchanged.
+pub(crate) fn explorer_cursor(key: CursorKey) -> CursorKey {
+    if in_explorer_run() {
+        CursorKey::for_explorer(key.app_id)
+    } else {
+        key
+    }
+}
+
+/// Why an event did not reach the worker's queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NotQueued {
+    /// The queue had no slot.
+    Full,
+    /// The worker is gone.
+    Closed,
+    /// A passive event would have taken one of the last
+    /// [`PASSIVE_QUEUE_RESERVE`] slots (or none was free at all).
+    Reserve,
+}
+
+/// Put one event on the queue. A `passive` event goes through
+/// [`reserve_passive_slot`] and never takes the reserve; every other event
+/// takes any free slot.
+fn try_enqueue(
+    tx: &'static mpsc::Sender<JourneyEvent>,
+    event: JourneyEvent,
+    passive: bool,
+) -> Result<(), NotQueued> {
+    if passive {
+        let permit = reserve_passive_slot(tx)?;
+        permit.send(event);
+        return Ok(());
+    }
+    tx.try_send(event).map_err(|e| match e {
+        mpsc::error::TrySendError::Full(_) => NotQueued::Full,
+        mpsc::error::TrySendError::Closed(_) => NotQueued::Closed,
+    })
+}
+
+/// Rewrite an event for the scope it was recorded in: an action inside
+/// [`as_explorer`] is attributed to the run, and an action or snapshot there
+/// lands on the explorer's cursor.
+fn scoped(event: JourneyEvent) -> JourneyEvent {
+    match event {
+        JourneyEvent::Action {
+            key,
+            provenance,
+            action,
+            hint,
+            timeline,
+        } => JourneyEvent::Action {
+            key: explorer_cursor(key),
+            provenance: attribute_action(provenance),
+            action,
+            hint,
+            timeline,
+        },
+        JourneyEvent::Snapshot {
+            key,
+            app_version,
+            snapshot,
+        } => JourneyEvent::Snapshot {
+            key: explorer_cursor(key),
+            app_version,
+            snapshot,
+        },
+        other => other,
+    }
+}
+
+/// Hand one event to the journey worker, spawning it on first use.
+/// Fire-and-forget: never blocks, never fails the caller. Inside
+/// [`as_passive`] it is a passive event: it never takes the queue's reserve,
+/// and a refusal is counted against passive capture for the app — as a
+/// refused CLOSING SNAPSHOT (`closingSnapshotsRefusedTotal`), not a refused
+/// relay: `as_passive` wraps only the snapshot an observe relay takes after
+/// the route ACCEPTED the relay (the relay itself is queued by
+/// [`record_passive`], whose refusal the route counts).
+pub(crate) fn enqueue_edge_observation(pg_db: Arc<PgDb>, event: JourneyEvent) {
+    let tx = event_tx(pg_db);
+    let is_action = matches!(event, JourneyEvent::Action { .. });
+    let app_id = match &event {
+        JourneyEvent::Action { key, .. } | JourneyEvent::Snapshot { key, .. } => {
+            Some(key.app_id.clone())
+        }
+        _ => None,
+    };
+    let sent = try_enqueue(tx, scoped(event), in_passive_scope());
+    if is_action {
+        count_explorer_event(sent.is_ok());
+    }
+    match sent {
+        Ok(()) => {}
+        Err(NotQueued::Reserve) => match app_id.as_deref() {
+            Some(app) => health::record_passive_snapshot_refused(
+                app,
+                "the journey queue was down to its reserve for agent and explorer events, so \
+                 this closing snapshot was not queued; its relay's edge closes \
+                 to_node_unobserved",
+            ),
+            // DELIBERATELY not `record_passive_refused` with no app: that is
+            // `unattributedRefusals`, relays the ROUTE refused for a bad app
+            // id, and this is no relay. No app-less event reaches
+            // `as_passive` today; should one, it is a dropped journey event,
+            // counted as a write failure (see `PassiveCaptureHealth::unattributed_refusals`).
+            None => health::record_write_failure(
+                "a passive journey event with no app was not queued (reserve)".to_string(),
+            ),
+        },
+        Err(NotQueued::Full) => {
+            health::record_write_failure("journey event queue full — event dropped".to_string())
+        }
+        Err(NotQueued::Closed) => health::record_write_failure(
+            "journey worker is not running — event dropped".to_string(),
+        ),
     }
 }
 
@@ -692,6 +907,140 @@ pub(crate) fn record_action(
             timeline: None,
         },
     );
+}
+
+/// The longest [`barrier`] ever waits for the worker; callers pass a
+/// shorter deadline when they have less time left.
+pub(crate) const BARRIER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Why a [`barrier`] got no answer. Either way where the cursor is is NOT
+/// KNOWN; the caller decides what the miss means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BarrierMiss {
+    /// No answer within the deadline (capped at [`BARRIER_TIMEOUT`]). A
+    /// caller that shortened the deadline to the time it had left can tell
+    /// "my time ran out" from "the worker is stuck".
+    TimedOut,
+    /// The worker is not running, or dropped the request.
+    WorkerGone,
+}
+
+/// Wait until the worker has processed every event queued so far, then
+/// return what it last resolved for `key`.
+///
+/// - `Ok(reading)` — the worker answered (`reading.node` may be `None`: no
+///   node resolved yet; compare `reading.snapshots` to detect a stale one);
+/// - `Err(miss)` — the worker could not be asked ([`BarrierMiss`]).
+///
+/// Unlike [`enqueue_edge_observation`] this WAITS for queue capacity: a
+/// barrier dropped on a full queue would read as "no node".
+pub(crate) async fn barrier(
+    pg_db: Arc<PgDb>,
+    key: CursorKey,
+    deadline: std::time::Duration,
+) -> Result<NodeReading, BarrierMiss> {
+    let (reply, rx) = tokio::sync::oneshot::channel();
+    let tx = event_tx(pg_db);
+    tokio::time::timeout(deadline.min(BARRIER_TIMEOUT), async {
+        tx.send(JourneyEvent::Barrier { key, reply })
+            .await
+            .map_err(|_| BarrierMiss::WorkerGone)?;
+        rx.await.map_err(|_| BarrierMiss::WorkerGone)
+    })
+    .await
+    .map_err(|_| BarrierMiss::TimedOut)?
+}
+
+/// Make the producer forget where `key`'s cursor is ([`JourneyEvent::Forget`])
+/// and wait until it has — so an action enqueued after this opens its edge
+/// from the unknown node. Waits for queue capacity, like [`barrier`].
+pub(crate) async fn forget_position(
+    pg_db: Arc<PgDb>,
+    key: CursorKey,
+    deadline: std::time::Duration,
+) -> Result<(), BarrierMiss> {
+    let (reply, rx) = tokio::sync::oneshot::channel();
+    let tx = event_tx(pg_db);
+    tokio::time::timeout(deadline.min(BARRIER_TIMEOUT), async {
+        tx.send(JourneyEvent::Forget { key, reply })
+            .await
+            .map_err(|_| BarrierMiss::WorkerGone)?;
+        rx.await.map_err(|_| BarrierMiss::WorkerGone)
+    })
+    .await
+    .map_err(|_| BarrierMiss::TimedOut)?
+}
+
+/// Queue slots passive capture never takes: when no more than this many are
+/// free, a relayed interaction — and the snapshot taken to close it — is
+/// refused rather than queued, so a busy page cannot starve agent and
+/// explorer events of the shared queue.
+pub(crate) const PASSIVE_QUEUE_RESERVE: usize = EVENT_QUEUE_CAPACITY / 4;
+
+/// Take one queue slot for a passive event, never one of the last
+/// [`PASSIVE_QUEUE_RESERVE`]. Race-safe: the slot is RESERVED first and the
+/// free count read after, so concurrent senders (each holding its permit)
+/// are all counted. A permit whose taking left fewer than the reserve free is
+/// dropped — its slot goes back — and the event is refused. Two passive
+/// senders racing may both refuse when one could have gone; neither can take
+/// the reserve.
+pub(crate) fn reserve_passive_slot<T>(
+    tx: &mpsc::Sender<T>,
+) -> Result<mpsc::Permit<'_, T>, NotQueued> {
+    let permit = tx.try_reserve().map_err(|e| match e {
+        mpsc::error::TrySendError::Full(()) => NotQueued::Reserve,
+        mpsc::error::TrySendError::Closed(()) => NotQueued::Closed,
+    })?;
+    if tx.capacity() < PASSIVE_QUEUE_RESERVE {
+        drop(permit);
+        return Err(NotQueued::Reserve);
+    }
+    Ok(permit)
+}
+
+tokio::task_local! {
+    /// Set by [`as_passive`]: events recorded inside are passive capture's.
+    static PASSIVE: ();
+}
+
+/// Run `fut` as passive capture: every event it records (the closing
+/// snapshot of a relayed interaction) is held off the queue's reserve, as
+/// the relayed action itself is ([`record_passive`]).
+pub(crate) async fn as_passive<F: std::future::Future>(fut: F) -> F::Output {
+    PASSIVE.scope((), fut).await
+}
+
+/// Is the current task recording passive capture's events?
+pub(crate) fn in_passive_scope() -> bool {
+    PASSIVE.try_with(|_| ()).is_ok()
+}
+
+/// An action a HUMAN took in a connected app, relayed by the page (plan
+/// Phase 3 passive capture): a pending edge like every other action,
+/// attributed `run_kind = passive_session`, closed by the next snapshot of
+/// its cursor. `Err` = nothing was queued: [`NotQueued::Reserve`] when the
+/// queue is down to its reserve ([`PASSIVE_QUEUE_RESERVE`]),
+/// [`NotQueued::Closed`] when the worker is gone. The caller counts the
+/// refusal and answers each differently.
+pub(crate) fn record_passive(
+    pg_db: Arc<PgDb>,
+    key: CursorKey,
+    action: ActionSpec,
+    app_version: Option<String>,
+    run_id: Option<String>,
+) -> Result<(), NotQueued> {
+    let event = JourneyEvent::Action {
+        key,
+        provenance: Provenance {
+            app_version,
+            run_id,
+            run_kind: RunKind::PassiveSession,
+        },
+        action,
+        hint: None,
+        timeline: None,
+    };
+    try_enqueue(event_tx(pg_db), event, true)
 }
 
 /// A successful, unfiltered snapshot.
@@ -853,6 +1202,23 @@ async fn process_event(pg: &PgDb, cursors: &mut Cursors, event: JourneyEvent) {
                 write_edge(pg, draft).await;
             }
         }
+        JourneyEvent::Forget { key, reply } => {
+            if let Some(draft) = cursors.forget(&key) {
+                write_edge(pg, draft).await;
+            }
+            let _ = reply.send(());
+        }
+        JourneyEvent::Barrier { key, reply } => {
+            // Every earlier event has been fully processed (writes awaited)
+            // by the time this one is dequeued. A dropped receiver is fine.
+            let _ = reply.send(NodeReading {
+                node: cursors.last_node(&key),
+                snapshots: cursors.snapshots_seen(&key),
+            });
+        }
+    }
+    for draft in cursors.evict_over_cap() {
+        write_edge(pg, draft).await;
     }
 }
 
@@ -1039,6 +1405,32 @@ async fn write_frontier(
 mod tests {
     use super::*;
     use crate::journey::cursor::resolve_trigger;
+
+    #[test]
+    fn a_passive_event_refused_at_the_reserve_is_a_closing_snapshot_never_a_refused_relay() {
+        // `refusedTotal` counts relays the observe ROUTE refused. A passive
+        // event refused here is the closing snapshot of a relay the route
+        // already ACCEPTED, so it is counted on its own counter.
+        let src = include_str!("capture.rs");
+        let body = src
+            .split("pub(crate) fn enqueue_edge_observation(")
+            .nth(1)
+            .and_then(|b| b.split("\n}\n").next())
+            .expect("enqueue_edge_observation's body");
+        let reserve = body
+            .split("Err(NotQueued::Reserve)")
+            .nth(1)
+            .and_then(|b| b.split("Err(NotQueued::Full)").next())
+            .expect("the reserve arm");
+        assert!(
+            reserve.contains("health::record_passive_snapshot_refused("),
+            "{reserve}"
+        );
+        assert!(
+            !reserve.contains("record_passive_refused("),
+            "a refused closing snapshot must not count as a refused relay: {reserve}"
+        );
+    }
     use crate::journey::node::{Affordance, ElementAffordance};
     use qontinui_types::ir::IrEffect;
     use qontinui_types::journey::ChokePoint;
@@ -1050,6 +1442,7 @@ mod tests {
             app_id: "qontinui-web".into(),
             runner_instance: "primary".into(),
             scope: None,
+            explorer: false,
         }
     }
 
@@ -1085,6 +1478,7 @@ mod tests {
                     navigation: false,
                 },
                 action_effects: BTreeMap::new(),
+                offers_click: true,
             },
         );
         idx
@@ -1131,6 +1525,32 @@ mod tests {
         assert_eq!(binds.runner_build_id, RUNNER_BUILD_ID);
         assert!(chrono::DateTime::parse_from_rfc3339(&binds.observed_at).is_ok());
         assert!(uuid::Uuid::parse_str(&binds.id).is_ok());
+    }
+
+    #[test]
+    fn the_rows_run_kind_is_the_provenances() {
+        // Phase 3: an explorer or passive edge is not an agent action.
+        for (kind, wire) in [
+            (RunKind::AgentAction, "agent_action"),
+            (RunKind::Explorer, "explorer"),
+            (RunKind::PassiveSession, "passive_session"),
+        ] {
+            let now = Instant::now();
+            let mut c = Cursors::default();
+            c.observe(&key(), seen("a", &["1"]), AffordanceIndex::default(), now);
+            let provenance = Provenance {
+                run_id: Some("run-9".into()),
+                run_kind: kind,
+                ..Default::default()
+            };
+            c.open(&key(), &click("x"), provenance, None, now);
+            let edge = c
+                .observe(&key(), seen("b", &["2"]), AffordanceIndex::default(), now)
+                .unwrap();
+            let binds = edge_insert(&finalize(edge), None).unwrap();
+            assert_eq!(binds.run_kind, wire);
+            assert_eq!(binds.run_id.as_deref(), Some("run-9"));
+        }
     }
 
     #[test]
@@ -1642,5 +2062,98 @@ mod tests {
         assert!(edge.timeline.is_none());
         let binds = edge_insert(&finalize(edge), None).unwrap();
         assert!(binds.timeline.is_none(), "SQL NULL, never a JSON null");
+    }
+
+    /// The worker enforces the cursor cap itself, whatever the event: a stream
+    /// of made-up `tabId`s cannot grow its map for the life of the process.
+    #[tokio::test]
+    async fn the_worker_holds_the_cursor_map_to_its_cap() {
+        use crate::journey::cursor::{Cursors, Observed, MAX_CURSORS};
+        let pg = crate::database::pg::PgDb::new_noop_for_test();
+        let mut cursors = Cursors::default();
+        let now = std::time::Instant::now();
+        let tab = |i: usize| CursorKey::new("worker-cap-app", Some(&format!("tab-{i}")));
+        for i in 0..=MAX_CURSORS {
+            cursors.observe(
+                &tab(i),
+                Observed {
+                    node: crate::journey::test_fixtures::node("home"),
+                    digest: "d".into(),
+                },
+                crate::journey::node::AffordanceIndex::default(),
+                now + std::time::Duration::from_millis(i as u64),
+            );
+        }
+        assert!(cursors.last_node(&tab(0)).is_some(), "one over the cap");
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        process_event(
+            &pg,
+            &mut cursors,
+            JourneyEvent::Barrier {
+                key: tab(MAX_CURSORS),
+                reply,
+            },
+        )
+        .await;
+        rx.await.expect("the Barrier arm answers");
+        assert!(cursors.last_node(&tab(0)).is_none(), "the oldest went");
+        assert!(cursors.last_node(&tab(1)).is_some());
+    }
+
+    /// The worker's REAL Forget and Barrier arms: after a Forget, a Barrier
+    /// reports no node and the unchanged snapshot count; a Forget of a cursor
+    /// it never saw answers too.
+    #[tokio::test]
+    async fn the_workers_forget_and_barrier_arms_forget_the_position() {
+        use crate::journey::cursor::{Cursors, Observed};
+        let pg = crate::database::pg::PgDb::new_noop_for_test();
+        let mut cursors = Cursors::default();
+        cursors.observe(
+            &key(),
+            Observed {
+                node: crate::journey::test_fixtures::node("home"),
+                digest: "d".into(),
+            },
+            crate::journey::node::AffordanceIndex::default(),
+            std::time::Instant::now(),
+        );
+        let barrier = |c: &mut Cursors| {
+            let (reply, rx) = tokio::sync::oneshot::channel();
+            (
+                JourneyEvent::Barrier { key: key(), reply },
+                rx,
+                c.pending_count(),
+            )
+        };
+        let (ev, rx, _) = barrier(&mut cursors);
+        process_event(&pg, &mut cursors, ev).await;
+        let before = rx.await.unwrap();
+        assert!(before.node.is_some());
+        assert_eq!(before.snapshots, 1);
+
+        let (reply, done) = tokio::sync::oneshot::channel();
+        process_event(
+            &pg,
+            &mut cursors,
+            JourneyEvent::Forget { key: key(), reply },
+        )
+        .await;
+        done.await.expect("the Forget arm answers");
+
+        let (ev, rx, _) = barrier(&mut cursors);
+        process_event(&pg, &mut cursors, ev).await;
+        let after = rx.await.unwrap();
+        assert_eq!(after.node, None, "the position is forgotten");
+        assert_eq!(after.snapshots, 1, "the count is monotonic");
+
+        let other = CursorKey::new("never-seen", None);
+        let (reply, done) = tokio::sync::oneshot::channel();
+        process_event(
+            &pg,
+            &mut cursors,
+            JourneyEvent::Forget { key: other, reply },
+        )
+        .await;
+        done.await.expect("answers for an unknown cursor too");
     }
 }
