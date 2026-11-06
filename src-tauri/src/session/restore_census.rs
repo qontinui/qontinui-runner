@@ -376,8 +376,13 @@ pub fn latched() -> Option<&'static BootCensus> {
 /// - any other unverified stamp (a `failed` tier: attempted, not landed) is
 ///   NOT a restore either — the tile may exist but the session did not come
 ///   back, so it is `missing` / [`MISSING_RESUME_FAILED`];
-/// - a second observation of an already-seen id is
-///   `unexpected` / [`UNEXPECTED_DUPLICATE`] (2026-07-23 restore duplication);
+/// - a session's rows are merged first, by the ledger's [`Observed`] order,
+///   and ids compare case-insensitively, as on the ledger;
+/// - a session on more than one TILE — rows observed back or as a bare
+///   terminal — is `unexpected` / [`UNEXPECTED_DUPLICATE`] once per extra
+///   tile (the 2026-07-23 restore duplication: a respawn beside a live
+///   session, whose second tile may verify or may sit bare). A closed or
+///   unverified row is history, not a second tile;
 /// - an observation of an id not in `expected` is
 ///   `unexpected` / [`UNEXPECTED_FOREIGN`] (2026-07-19 ghost re-admission,
 ///   2026-08-10 temp-runner inheritance).
@@ -387,30 +392,25 @@ pub fn diff_census(
     clean_shutdown: Option<bool>,
     live_read: bool,
 ) -> CensusDiff {
-    let expected_ids: HashSet<&str> = expected
-        .iter()
-        .map(|e| e.claude_session_id.as_str())
-        .collect();
+    // Every id compares lowercased, as the ledger keys its observations.
+    let key = |id: &str| id.to_ascii_lowercase();
+    let expected_ids: HashSet<String> =
+        expected.iter().map(|e| key(&e.claude_session_id)).collect();
     // Ids this boot attempted — consulted when an expected session did NOT
     // come back, to say WHY.
-    let attempted: HashSet<&str> = observed
-        .iter()
-        .map(|o| o.claude_session_id.as_str())
-        .collect();
+    let attempted: HashSet<String> = observed.iter().map(|o| key(&o.claude_session_id)).collect();
     // One observation per session, merged by the ledger's own order (the
     // strongest `Observed` stands), so a session with a closed stamped row
-    // and an open adopted one reads as the ledger reads it. A DUPLICATE is a
-    // session verified back on more than one row — the restore-duplication
-    // class — not one that merely has history.
+    // and an open adopted one reads as the ledger reads it.
     let mut best: Vec<&RestoredObservation> = Vec::new();
-    let mut slot: HashMap<&str, usize> = HashMap::new();
-    let mut back_rows: HashMap<&str, usize> = HashMap::new();
+    let mut slot: HashMap<String, usize> = HashMap::new();
+    let mut tiles: HashMap<String, (usize, &RestoredObservation)> = HashMap::new();
     for obs in observed {
-        let id = obs.claude_session_id.as_str();
-        if obs.observed == Some(Observed::Back) {
-            *back_rows.entry(id).or_default() += 1;
+        let id = key(&obs.claude_session_id);
+        if matches!(obs.observed, Some(Observed::Back | Observed::TerminalOnly)) {
+            tiles.entry(id.clone()).or_insert((0, obs)).0 += 1;
         }
-        match slot.get(id) {
+        match slot.get(&id) {
             Some(&i) if best[i].observed >= obs.observed => {}
             Some(&i) => best[i] = obs,
             None => {
@@ -419,26 +419,26 @@ pub fn diff_census(
             }
         }
     }
-    let unreadable: HashSet<&str> = best
+    let unreadable: HashSet<String> = best
         .iter()
         .filter(|o| o.observed == Some(Observed::Unknown))
-        .map(|o| o.claude_session_id.as_str())
+        .map(|o| key(&o.claude_session_id))
         .collect();
 
     let mut restored: Vec<CensusRestored> = Vec::new();
     let mut terminal_only: Vec<CensusRestored> = Vec::new();
-    let mut unexpected: Vec<CensusUnexpected> = back_rows
-        .iter()
-        .flat_map(|(id, n)| {
+    let mut unexpected: Vec<CensusUnexpected> = tiles
+        .values()
+        .flat_map(|(n, first)| {
             (1..*n).map(|_| CensusUnexpected {
-                claude_session_id: id.to_string(),
+                claude_session_id: first.claude_session_id.clone(),
                 reason: UNEXPECTED_DUPLICATE.to_string(),
             })
         })
         .collect();
 
     for obs in best {
-        let id = obs.claude_session_id.as_str();
+        let id = key(&obs.claude_session_id);
         let verified = obs.observed == Some(Observed::Back);
         // The ledger's own verdict, so a CLOSED terminal-only stamp (missing
         // there) is not a bare terminal here either.
@@ -448,7 +448,7 @@ pub fn diff_census(
             // never as a restore.
             continue;
         }
-        if !expected_ids.contains(id) {
+        if !expected_ids.contains(&id) {
             unexpected.push(CensusUnexpected {
                 claude_session_id: obs.claude_session_id.clone(),
                 reason: UNEXPECTED_FOREIGN.to_string(),
@@ -473,21 +473,21 @@ pub fn diff_census(
     // before the sort below takes it mutably — the intent, spelled, rather than
     // left to NLL inference.
     let mut missing: Vec<CensusMissing> = {
-        let restored_ids: HashSet<&str> = restored
+        let restored_ids: HashSet<String> = restored
             .iter()
             .chain(&terminal_only)
-            .map(|r| r.claude_session_id.as_str())
+            .map(|r| key(&r.claude_session_id))
             .collect();
         expected
             .iter()
-            .filter(|e| !restored_ids.contains(e.claude_session_id.as_str()))
+            .filter(|e| !restored_ids.contains(&key(&e.claude_session_id)))
             .map(|e| CensusMissing {
                 claude_session_id: e.claude_session_id.clone(),
-                reason: if unreadable.contains(e.claude_session_id.as_str()) {
+                reason: if unreadable.contains(&key(&e.claude_session_id)) {
                     MISSING_PROCESS_READ_UNAVAILABLE.to_string()
                 } else if !e.restorable {
                     MISSING_NOT_RESTORABLE.to_string()
-                } else if attempted.contains(e.claude_session_id.as_str()) {
+                } else if attempted.contains(&key(&e.claude_session_id)) {
                     MISSING_RESUME_FAILED.to_string()
                 } else {
                     MISSING_NO_ATTEMPT.to_string()
@@ -843,6 +843,25 @@ mod tests {
         assert_eq!(d.restored.len(), 1, "{d:?}");
         assert!(d.missing.is_empty());
         assert!(d.unexpected.is_empty());
+        assert_eq!(d.verdict, RESTORE_VERDICT_MATCH);
+    }
+
+    /// A respawn beside a live session whose second tile sat bare is still
+    /// a duplicate; ids compare case-insensitively, as on the ledger.
+    #[test]
+    fn a_second_tile_and_a_case_variant_id_are_judged_like_the_ledger() {
+        let exp = [expected("abc", true)];
+        let live = observed("abc", RESTORE_TIER_RESUMED);
+        let bare = observed("ABC", RESTORE_TIER_TERMINAL_ONLY);
+        let d = diff_census(&exp, &[live, bare], Some(true), true);
+        assert_eq!(d.restored.len(), 1, "{d:?}");
+        assert_eq!(d.unexpected.len(), 1, "{d:?}");
+        assert_eq!(d.unexpected[0].reason, UNEXPECTED_DUPLICATE);
+        // A case-variant id alone is the expected session, not a foreigner.
+        let upper = observed("ABC", RESTORE_TIER_RESUMED);
+        let d = diff_census(&exp, &[upper], Some(true), true);
+        assert_eq!(d.restored.len(), 1, "{d:?}");
+        assert!(d.unexpected.is_empty() && d.missing.is_empty(), "{d:?}");
         assert_eq!(d.verdict, RESTORE_VERDICT_MATCH);
     }
 

@@ -1720,12 +1720,32 @@ pub async fn live_view<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Option<L
         .try_state::<std::sync::Arc<crate::terminal::TerminalManager>>()?
         .inner()
         .clone();
-    let mut memo = lock_within(live_view_memo(), LIVE_VIEW_LOCK_WAIT).await?;
+    let Some(mut memo) = within(LIVE_VIEW_LOCK_WAIT, live_view_memo().lock()).await else {
+        warn!(
+            wait_s = LIVE_VIEW_LOCK_WAIT.as_secs(),
+            "session_ledger: live view TIMED OUT waiting behind another refill — \
+             reporting UNKNOWN (not live_view_unavailable: the terminal manager is present)"
+        );
+        return None;
+    };
     let terminals = alive_terminal_ids(tm.list(), crate::process_capture::health::pid_alive);
     if let Some(view) = memo_reuse(memo.as_ref(), &terminals, std::time::Instant::now()) {
         return Some(view);
     }
-    let panes = proc_read::read_panes(&tm, terminals.iter().cloned()).await;
+    let Some(panes) = within(
+        LIVE_VIEW_READ_WAIT,
+        proc_read::read_panes(&tm, terminals.iter().cloned()),
+    )
+    .await
+    else {
+        warn!(
+            wait_s = LIVE_VIEW_READ_WAIT.as_secs(),
+            panes = terminals.len(),
+            "session_ledger: live view process read TIMED OUT — reporting UNKNOWN \
+             (not live_view_unavailable: the terminal manager is present)"
+        );
+        return None;
+    };
     let view = LiveView { terminals, panes };
     *memo = Some(PaneMemo {
         read_at: std::time::Instant::now(),
@@ -1740,12 +1760,12 @@ pub const LIVE_VIEW_TTL: std::time::Duration = std::time::Duration::from_secs(5)
 /// How long a [`live_view`] request waits behind another's refill.
 pub const LIVE_VIEW_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
 
-/// `mutex`'s guard, or `None` once `wait` has passed without it.
-async fn lock_within<T>(
-    mutex: &tokio::sync::Mutex<T>,
-    wait: std::time::Duration,
-) -> Option<tokio::sync::MutexGuard<'_, T>> {
-    tokio::time::timeout(wait, mutex.lock()).await.ok()
+/// How long one [`live_view`] process read may take before it is abandoned.
+pub const LIVE_VIEW_READ_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// `fut`'s output, or `None` once `wait` has passed without it.
+async fn within<F: std::future::Future>(wait: std::time::Duration, fut: F) -> Option<F::Output> {
+    tokio::time::timeout(wait, fut).await.ok()
 }
 
 /// One completed [`live_view`] read and when it completed.
@@ -3237,19 +3257,29 @@ mod tests {
     }
 
     /// A refill that holds the memo lock past the wait bounds every queued
-    /// request: it gets `None` (UNKNOWN), not a hang.
+    /// request, and a process read that never finishes bounds the refill:
+    /// each gets `None` (UNKNOWN), not a hang.
     #[tokio::test]
     async fn a_request_queued_behind_a_stuck_refill_gives_up_unknown() {
+        let wait = std::time::Duration::from_millis(20);
+        let stuck_read = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            within(wait, std::future::pending::<()>()),
+        )
+        .await
+        .expect("within must give up on a read that never finishes");
+        assert!(stuck_read.is_none());
         let mutex = tokio::sync::Mutex::new(());
         let held = mutex.lock().await;
-        let wait = std::time::Duration::from_millis(20);
-        let gave_up =
-            tokio::time::timeout(std::time::Duration::from_secs(5), lock_within(&mutex, wait))
-                .await
-                .expect("lock_within must give up on its own, not wait for the holder");
+        let gave_up = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            within(wait, mutex.lock()),
+        )
+        .await
+        .expect("within must give up on its own, not wait for the holder");
         assert!(gave_up.is_none());
         drop(held);
-        assert!(lock_within(&mutex, wait).await.is_some());
+        assert!(within(wait, mutex.lock()).await.is_some());
     }
 
     /// D2: an unreadable process table is UNKNOWN, never back — and the

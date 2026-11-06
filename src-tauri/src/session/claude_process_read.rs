@@ -243,14 +243,24 @@ pub(crate) fn pane_read_of(
     Ok(out)
 }
 
-/// PURE (Linux): [`PidPresence`] from `/proc/<pid>/status`. `None` (no such
-/// file) is gone; `State: Z` (a zombie) is gone; a real uid other than
-/// `our_uid` is foreign. A status that exists but does not parse is ours —
-/// UNKNOWN never reads as gone.
-#[cfg(any(target_os = "linux", test))]
-fn presence_from_status(status: Option<&str>, our_uid: u32) -> PidPresence {
-    let Some(status) = status else {
-        return PidPresence::Gone;
+/// PURE (Linux): [`PidPresence`] from the read of `/proc/<pid>/status`.
+/// Only "no such process" (`NotFound`, `ESRCH`) is gone; `EACCES` (a
+/// `hidepid` mount hides other users' processes) is foreign; any other read
+/// error is ours — UNKNOWN never reads as gone. Of a status that was read,
+/// `State: Z` (a zombie) is gone and a real uid other than `our_uid` is
+/// foreign; one that does not parse is ours.
+#[cfg(target_os = "linux")]
+fn presence_from_status(status: Result<&str, &std::io::Error>, our_uid: u32) -> PidPresence {
+    const ESRCH: i32 = 3;
+    let status = match status {
+        Ok(status) => status,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound || e.raw_os_error() == Some(ESRCH) => {
+            return PidPresence::Gone;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            return PidPresence::Foreign;
+        }
+        Err(_) => return PidPresence::Ours,
     };
     let field = |name: &str| {
         status
@@ -273,7 +283,7 @@ fn presence_from_status(status: Option<&str>, our_uid: u32) -> PidPresence {
 /// Linux: `/proc/<pid>/status` against this process's real uid.
 #[cfg(target_os = "linux")]
 pub(crate) fn pid_presence(pid: u32) -> PidPresence {
-    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok();
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status"));
     // SAFETY: `getuid` takes no arguments, cannot fail and touches no memory.
     let our_uid = unsafe { libc::getuid() };
     presence_from_status(status.as_deref(), our_uid)
@@ -505,28 +515,28 @@ mod tests {
 
     /// `/proc/<pid>/status`: absent or a zombie is gone, another real uid is
     /// foreign, ours or unparseable is ours.
+    #[cfg(target_os = "linux")]
     #[test]
     fn presence_reads_zombies_as_gone_and_other_users_as_foreign() {
+        use std::io::{Error, ErrorKind};
         let st = |state: &str, uid: &str| {
             format!("Name:\tclaude\nState:\t{state}\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n")
         };
-        assert_eq!(presence_from_status(None, 1000), PidPresence::Gone);
+        let ok = |s: &str| presence_from_status(Ok(s), 1000);
+        assert_eq!(ok(&st("Z (zombie)", "1000")), PidPresence::Gone);
+        assert_eq!(ok(&st("S (sleeping)", "0")), PidPresence::Foreign);
+        assert_eq!(ok(&st("S (sleeping)", "1000")), PidPresence::Ours);
+        assert_eq!(ok("garbage"), PidPresence::Ours);
+        // The read itself: only "no such process" is gone.
+        let err = |e: Error| presence_from_status(Err(&e), 1000);
+        assert_eq!(err(Error::from(ErrorKind::NotFound)), PidPresence::Gone);
+        assert_eq!(err(Error::from_raw_os_error(3)), PidPresence::Gone);
         assert_eq!(
-            presence_from_status(Some(&st("Z (zombie)", "1000")), 1000),
-            PidPresence::Gone
-        );
-        assert_eq!(
-            presence_from_status(Some(&st("S (sleeping)", "0")), 1000),
+            err(Error::from(ErrorKind::PermissionDenied)),
             PidPresence::Foreign
         );
-        assert_eq!(
-            presence_from_status(Some(&st("S (sleeping)", "1000")), 1000),
-            PidPresence::Ours
-        );
-        assert_eq!(
-            presence_from_status(Some("garbage"), 1000),
-            PidPresence::Ours
-        );
+        assert_eq!(err(Error::from_raw_os_error(5)), PidPresence::Ours);
+        assert_eq!(err(Error::from(ErrorKind::Other)), PidPresence::Ours);
     }
 
     /// Linux marks the cwd of a removed directory ` (deleted)`; the path it
