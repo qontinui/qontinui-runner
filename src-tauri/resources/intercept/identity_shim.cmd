@@ -14,12 +14,26 @@ rem
 rem Hard invariants (mirrored from the install shim, plan SECTION 6):
 rem   * FAIL-OPEN: any failure -> run the REAL provider unchanged.
 rem   * TRANSPARENT: stdio inherited; the user sees the real exit code.
-rem   * RECURSION-GUARD: QONTINUI_INSTALL_INTERCEPT_GUARD=1 -> pure passthrough.
+rem   * NESTED-CALL PASSTHROUGH: the recursion guard
+rem     (QONTINUI_INSTALL_INTERCEPT_GUARD=1) or an inherited Claude Code
+rem     session marker (CLAUDECODE / CLAUDE_CODE_CHILD_SESSION) -> the
+rem     original argv only: no pin, no --settings, no --mcp-config, no
+rem     beacon, no session-open. The guard alone misses a pane whose claude
+rem     the runner started directly (session/claude_hook.rs
+rem     direct_spawn_settings_args); identity_shim.bash states the full rule.
 rem   * DON'T DOUBLE-PIN: user already passed --session-id/--resume -> passthrough.
 rem
 rem Placeholders:
 rem   @@TOOL@@      the wrapped provider program name (claude/gemini)
 rem   @@SHIM_DIR@@  absolute path of this shim's own bin dir
+
+rem ---- start clean: a parent shim's carrier never rides along -------------
+rem A `set` inside setlocal is still in the environment of a child this shim
+rem `call`s, so the claude a parent .cmd shim launched -- and every nested
+rem claude its tool calls start -- inherits that shim's SETTINGS_ARGS and
+rem MCPCFG_ARGS. Clear both before anything reads them.
+set "SETTINGS_ARGS="
+set "MCPCFG_ARGS="
 
 set "TOOL=@@TOOL@@"
 set "SHIM_DIR=@@SHIM_DIR@@"
@@ -72,8 +86,16 @@ if "%QONTINUI_INSTALL_INTERCEPT_GUARD%"=="1" (
 )
 :resolved
 
-rem ---- recursion guard: a nested invocation never re-pins -------------------
-if "%QONTINUI_INSTALL_INTERCEPT_GUARD%"=="1" goto :passthrough
+rem ---- nested call: pure passthrough, never re-pin -------------------------
+rem The recursion guard, or a Claude Code session marker inherited from a
+rem claude ancestor: Claude Code sets both markers in its tool environment,
+rem and every runner spawn site strips both, so a top-level launch carries
+rem neither. cmd cannot hold an EMPTY variable, so an empty-valued marker
+rem reads absent here (the bash shim and the exe count it) -- accepted,
+rem because nothing sets a marker to empty.
+if "%QONTINUI_INSTALL_INTERCEPT_GUARD%"=="1" goto :nested
+if defined CLAUDECODE goto :nested
+if defined CLAUDE_CODE_CHILD_SESSION goto :nested
 
 set "PINNED=%QONTINUI_PINNED_SESSION_ID%"
 
@@ -120,9 +142,11 @@ rem ---- spawn-time policy delivery marker -------------------------------------
 rem QONTINUI_POLICY_DELIVERED_SHA says THIS claude received the policy body in
 rem its system prompt, and QONTINUI_POLICY_DELIVERED_FILE names the composed
 rem file it rode in. Only a claude whose argv passes THAT file to
-rem --append-system-prompt-file did; an inherited marker on a nested claude
-rem (bare, or with its own --append-system-prompt-file) would make the policy
-rem hook skip a body that session never got. (The `for` above splits
+rem --append-system-prompt-file did; an inherited marker on any other claude
+rem this shim delivers the hook to (bare, or with its own
+rem --append-system-prompt-file) would make the policy hook skip a body that
+rem session never got. A NESTED claude never gets here: it took the :nested
+rem passthrough above and gets no hook from this shim. (The `for` above splits
 rem `--append-system-prompt-file=x` on `=`, so the file is the token after the
 rem flag in both spellings.) A REPLACEMENT prompt (--system-prompt[-file])
 rem withholds it as well: whether Claude Code still applies the append file
@@ -183,5 +207,17 @@ if defined REAL (
   call "%REAL%" %* %SETTINGS_ARGS% %MCPCFG_ARGS%
 ) else (
   call %TOOL% %* %SETTINGS_ARGS% %MCPCFG_ARGS%
+)
+endlocal & exit /b %ERRORLEVEL%
+
+:nested
+rem A nested call runs with its own argv ONLY -- never SETTINGS_ARGS or
+rem MCPCFG_ARGS, which are the pane's hook carrier and coord key. The guard
+rem is set so whatever the real tool starts is a nested call too.
+set "QONTINUI_INSTALL_INTERCEPT_GUARD=1"
+if defined REAL (
+  call "%REAL%" %*
+) else (
+  call %TOOL% %*
 )
 endlocal & exit /b %ERRORLEVEL%

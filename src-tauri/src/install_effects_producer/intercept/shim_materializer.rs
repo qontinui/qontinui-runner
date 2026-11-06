@@ -42,7 +42,9 @@ const SHIM_CMD: &str = include_str!("../../../resources/intercept/shim.cmd");
 /// Wraps `claude`/`gemini` to append `--session-id $QONTINUI_PINNED_SESSION_ID`.
 const IDENTITY_SHIM_BASH: &str = include_str!("../../../resources/intercept/identity_shim.bash");
 /// Always-on identity shim template (`.cmd` Windows cmd/PowerShell shadow).
-#[cfg(target_os = "windows")]
+/// Compiled into every TEST build as well, so the template parity test holds
+/// it to `claude_env::INHERITED_SESSION_MARKERS` on every platform.
+#[cfg(any(target_os = "windows", test))]
 const IDENTITY_SHIM_CMD: &str = include_str!("../../../resources/intercept/identity_shim.cmd");
 
 /// The always-on identity tool family (plan §3b). These shims are ALWAYS
@@ -1962,6 +1964,65 @@ mod tests {
         assert!(out.contains("/tmp/qontinui-identity-x"));
     }
 
+    /// The nested-call passthrough is spelled three times. The exe reads
+    /// `claude_env::INHERITED_SESSION_MARKERS` itself; the two script templates
+    /// cannot, so this holds them to that list. A marker added to
+    /// `claude_env.rs` alone fails here instead of leaving a script surface
+    /// blind to it.
+    #[test]
+    fn identity_shim_templates_pass_every_session_marker_through() {
+        let markers = qontinui_runner_lib::claude_env::INHERITED_SESSION_MARKERS;
+        assert!(!markers.is_empty());
+
+        // bash: the condition of the one `if` whose body is the passthrough.
+        let bash = IDENTITY_SHIM_BASH;
+        let end = bash
+            .find("; then\n  exec_real \"$@\"\nfi\n")
+            .expect("the bash template has a nested-call passthrough");
+        let head = bash.get(..end).expect("char boundary");
+        let condition = head
+            .rfind("\nif ")
+            .and_then(|start| head.get(start..))
+            .expect("the passthrough is guarded by an `if`");
+        assert!(
+            condition.contains("\"${QONTINUI_INSTALL_INTERCEPT_GUARD:-}\" = \"1\""),
+            "bash: the recursion guard shares the condition:\n{condition}"
+        );
+        for name in markers {
+            assert!(
+                condition.contains(&format!("[ -n \"${{{name}+x}}\" ]")),
+                "bash: {name} is missing from the nested-call condition:\n{condition}"
+            );
+        }
+
+        // cmd: the guard and every marker route to `:nested`, and `:nested`
+        // hands the real tool its own argv and nothing else.
+        let cmd = IDENTITY_SHIM_CMD.replace("\r\n", "\n");
+        assert!(
+            cmd.contains("\nif \"%QONTINUI_INSTALL_INTERCEPT_GUARD%\"==\"1\" goto :nested\n"),
+            "cmd: the recursion guard routes to :nested"
+        );
+        for name in markers {
+            assert!(
+                cmd.contains(&format!("\nif defined {name} goto :nested\n")),
+                "cmd: {name} does not route to :nested"
+            );
+        }
+        let nested = cmd
+            .split("\n:nested\n")
+            .nth(1)
+            .and_then(|rest| rest.split("endlocal").next())
+            .expect("cmd: the :nested label");
+        assert!(
+            nested.contains("call \"%REAL%\" %*\n") && nested.contains("call %TOOL% %*\n"),
+            "cmd: :nested calls the real tool with %* only:\n{nested}"
+        );
+        assert!(
+            !nested.contains("SETTINGS_ARGS%") && !nested.contains("MCPCFG_ARGS%"),
+            "cmd: :nested must never append the carrier:\n{nested}"
+        );
+    }
+
     /// Q5(a). The identity dir is SHARED across every terminal of this runner
     /// build, so a terminal exiting must NOT delete it — that would rip the
     /// PATH shims out from under every other live pane. `cleanup` therefore
@@ -2445,6 +2506,135 @@ mod tests {
     }
 }
 
+/// A stand-in for the runner's install-effects port: a `127.0.0.1:0` listener
+/// that records every request a shim sends it (`POST /control/shim-beacon`,
+/// `POST /control/session-open`) and answers `200` at once, so the shim's
+/// `curl` returns immediately. It lets a shim test assert what the shim said
+/// to the runner — including that it said nothing at all.
+#[cfg(test)]
+mod loopback_recorder {
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::thread::JoinHandle;
+    use std::time::Duration;
+
+    /// One request, as the recorder received it.
+    #[derive(Debug, Clone)]
+    pub struct Request {
+        /// Method and path, without the HTTP version: `POST /control/session-open`.
+        pub line: String,
+        pub body: String,
+    }
+
+    pub struct LoopbackRecorder {
+        port: u16,
+        seen: Arc<Mutex<Vec<Request>>>,
+        stop: Arc<AtomicBool>,
+        worker: Option<JoinHandle<()>>,
+    }
+
+    impl LoopbackRecorder {
+        pub fn start() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1:0");
+            let port = listener.local_addr().expect("listener address").port();
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let stop = Arc::new(AtomicBool::new(false));
+            let worker = {
+                let (seen, stop) = (Arc::clone(&seen), Arc::clone(&stop));
+                std::thread::spawn(move || {
+                    for conn in listener.incoming() {
+                        if stop.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        let Ok(mut conn) = conn else { continue };
+                        // Recorded BEFORE the reply: the shim's `curl` waits
+                        // for the reply, so once the shim has exited every
+                        // request it made is already in `seen`.
+                        if let Some(request) = read_request(&mut conn) {
+                            seen.lock().unwrap_or_else(|e| e.into_inner()).push(request);
+                        }
+                        let _ = conn.write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        );
+                    }
+                })
+            };
+            Self {
+                port,
+                seen,
+                stop,
+                worker: Some(worker),
+            }
+        }
+
+        pub fn port(&self) -> u16 {
+            self.port
+        }
+
+        /// Every request received since the previous call, oldest first.
+        pub fn take(&self) -> Vec<Request> {
+            std::mem::take(&mut *self.seen.lock().unwrap_or_else(|e| e.into_inner()))
+        }
+    }
+
+    impl Drop for LoopbackRecorder {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            // Wake the blocking `accept` so the worker sees the flag.
+            let _ = TcpStream::connect(("127.0.0.1", self.port));
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+        }
+    }
+
+    /// Read one HTTP/1.1 request: the head up to its blank line, then
+    /// `Content-Length` bytes of body. `None` for a connection that sent no
+    /// request (the shutdown wake-up) or stalled past the read timeout.
+    fn read_request(conn: &mut TcpStream) -> Option<Request> {
+        conn.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+        let mut raw: Vec<u8> = Vec::new();
+        let mut buf = [0u8; 4096];
+        let head_end = loop {
+            if let Some(i) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                break i + 4;
+            }
+            let n = conn.read(&mut buf).ok()?;
+            if n == 0 {
+                return None;
+            }
+            raw.extend_from_slice(buf.get(..n)?);
+        };
+        let head = String::from_utf8_lossy(raw.get(..head_end)?).into_owned();
+        let body_len = head
+            .lines()
+            .find_map(|l| {
+                let (name, value) = l.split_once(':')?;
+                name.trim()
+                    .eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        while raw.len() < head_end + body_len {
+            let n = conn.read(&mut buf).ok()?;
+            if n == 0 {
+                break;
+            }
+            raw.extend_from_slice(buf.get(..n)?);
+        }
+        let request_line = head.lines().next()?;
+        let line = request_line
+            .rsplit_once(' ')
+            .map_or(request_line, |(method_and_path, _version)| method_and_path)
+            .to_string();
+        let body = String::from_utf8_lossy(raw.get(head_end..)?).into_owned();
+        Some(Request { line, body })
+    }
+}
+
 /// The bash shim templates' bounded real-tool resolve wait, exercised by
 /// RUNNING the rendered templates (2026-10-01: a runner-spawned gate
 /// continuation's `claude` was on no PATH entry for the ~2 s of an npm reify,
@@ -2452,6 +2642,7 @@ mod tests {
 /// continuation was lost 73 ms after spawn).
 #[cfg(all(test, unix))]
 mod resolve_wait_tests {
+    use super::loopback_recorder::LoopbackRecorder;
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
@@ -2676,21 +2867,54 @@ mod resolve_wait_tests {
     /// The argv the real tool receives when the shim is launched with `args`
     /// and the pin set, and with the settings and mcp-config env when `hook_env`.
     fn identity_argv_seen_by_real_tool(args: &[&str], hook_env: bool) -> Vec<String> {
+        identity_shim_run("claude", args, hook_env, &[], None)
+    }
+
+    /// `curl` on THIS process's PATH. The shim posts to the runner with it, so
+    /// a test asserting what the runner's port did or did not receive needs it
+    /// — and FAILS without it rather than skip, because "no request" with no
+    /// `curl` to send one would pass vacuously.
+    fn find_curl() -> Option<PathBuf> {
+        let path = std::env::var_os("PATH")?;
+        std::env::split_paths(&path)
+            .map(|dir| dir.join("curl"))
+            .find(|cand| cand.is_file())
+    }
+
+    /// Run the rendered identity shim once as `<tool> <args>`, wired the way a
+    /// runner pane wires it: the env cleared (so the caller's own Claude Code
+    /// session markers cannot leak in), the pin set, the hook carrier and the
+    /// mcp-config set when `hook_env`, and `extra_env` on top. With `port`, the
+    /// runner's loopback port (`QONTINUI_INSTALL_INTERCEPT_PORT`) and terminal
+    /// id are set too, with `curl` on PATH. Returns the argv the real tool
+    /// received, the carrier and mcp-config paths read back as `S` and `M`.
+    fn identity_shim_run(
+        tool: &str,
+        args: &[&str],
+        hook_env: bool,
+        extra_env: &[(&str, &str)],
+        port: Option<u16>,
+    ) -> Vec<String> {
         let _serial = EXE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
-        let (shim_dir, real_dir) = (tmp.path().join("shim"), tmp.path().join("real"));
-        std::fs::create_dir_all(&shim_dir).unwrap();
-        std::fs::create_dir_all(&real_dir).unwrap();
+        let (shim_dir, real_dir, tools_dir) = (
+            tmp.path().join("shim"),
+            tmp.path().join("real"),
+            tmp.path().join("tools"),
+        );
+        for dir in [&shim_dir, &real_dir, &tools_dir] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
         let seen = tmp.path().join("argv");
         write_exe(
-            &real_dir.join("claude"),
+            &real_dir.join(tool),
             &format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n", seen.display()),
         );
         let (settings, mcp) = (tmp.path().join("s.json"), tmp.path().join("m.json"));
         std::fs::write(&settings, "{}").unwrap();
         std::fs::write(&mcp, "{}").unwrap();
-        let shim = shim_dir.join("claude");
-        write_exe(&shim, &render_identity_for_test("claude", &shim_dir));
+        let shim = shim_dir.join(tool);
+        write_exe(&shim, &render_identity_for_test(tool, &shim_dir));
         let mut cmd = Command::new(bash());
         cmd.arg(&shim)
             .args(args)
@@ -2698,9 +2922,10 @@ mod resolve_wait_tests {
             .env(
                 "PATH",
                 format!(
-                    "{}:{}:/usr/bin:/bin",
+                    "{}:{}:{}:/usr/bin:/bin",
                     shim_dir.display(),
-                    real_dir.display()
+                    real_dir.display(),
+                    tools_dir.display()
                 ),
             )
             .env("QONTINUI_PINNED_SESSION_ID", "pin-1");
@@ -2708,6 +2933,16 @@ mod resolve_wait_tests {
             cmd.env("QONTINUI_CLAUDE_HOOK_SETTINGS", &settings)
                 .env("QONTINUI_MCP_CONFIG", &mcp);
         }
+        if let Some(port) = port {
+            let curl = find_curl().expect(
+                "curl must be on PATH: the shim reaches the runner with it, and a test of \
+                 what the runner receives cannot run without it",
+            );
+            std::os::unix::fs::symlink(curl, tools_dir.join("curl")).unwrap();
+            cmd.env("QONTINUI_INSTALL_INTERCEPT_PORT", port.to_string())
+                .env("QONTINUI_TERMINAL_ID", "term-pane");
+        }
+        cmd.envs(extra_env.iter().copied());
         let out = crate::process_helpers::output_with_timeout(cmd, BUDGET).unwrap();
         assert!(
             out.status.success(),
@@ -2784,6 +3019,125 @@ mod resolve_wait_tests {
             identity_argv_seen_by_real_tool(&[], false),
             ["--session-id", "pin-1"]
         );
+    }
+
+    /// The method-and-path line of each recorded request.
+    fn request_lines(recorder: &LoopbackRecorder) -> Vec<String> {
+        recorder.take().into_iter().map(|r| r.line).collect()
+    }
+
+    /// THE incident (plan `2026-11-06-nested-claude-rebinds-its-parent-pane`;
+    /// coord findings `b3cda6ee`, `18892045`): a subagent's probe ran
+    /// `claude -p …` from a runner-pane session's Bash tool. It reached this
+    /// shim with the pane's pin, hook carrier, mcp-config and port in its
+    /// environment, took all of them, and told the runner so — rebinding the
+    /// pane and its coord row to a child that exited seconds later; a bare
+    /// call ran AS the parent, under the parent's own pinned id. Claude Code
+    /// sets CLAUDECODE and CLAUDE_CODE_CHILD_SESSION in its tool environment
+    /// and the runner strips both at every spawn site, so a marker PRESENT
+    /// means nested: the real tool must get the original argv only, and the
+    /// runner's port must hear nothing — no beacon, no session-open.
+    #[test]
+    fn nested_claude_cannot_rebind_its_pane_via_the_identity_shim() {
+        let recorder = LoopbackRecorder::start();
+        let port = Some(recorder.port());
+
+        // Controls first, on the same port: the pane's OWN launches carry the
+        // pane's identity and speak to the runner, so this listener and this
+        // `curl` demonstrably see what the nested runs below must not produce.
+        assert_eq!(
+            identity_shim_run("claude", &["-p", "x"], true, &[], port),
+            [
+                "-p",
+                "x",
+                "--settings",
+                "S",
+                "--mcp-config",
+                "M",
+                "--session-id",
+                "pin-1"
+            ]
+        );
+        let heard = recorder.take();
+        assert_eq!(
+            heard.iter().map(|r| r.line.as_str()).collect::<Vec<_>>(),
+            ["POST /control/shim-beacon", "POST /control/session-open"],
+            "{heard:?}"
+        );
+        assert!(
+            heard
+                .iter()
+                .any(|r| r.body.contains("\"session_id\":\"pin-1\"")),
+            "the session-open names the pane's pinned id: {heard:?}"
+        );
+        // The 6bd5637f shape: a call with its OWN --session-id is not pinned,
+        // but still gets the pane's hook carrier — which alone rebinds the
+        // pane, through the SessionStart hook it delivers.
+        assert_eq!(
+            identity_shim_run(
+                "claude",
+                &["--session-id", "chosen-1", "-p", "x"],
+                true,
+                &[],
+                port
+            ),
+            [
+                "--session-id",
+                "chosen-1",
+                "-p",
+                "x",
+                "--settings",
+                "S",
+                "--mcp-config",
+                "M"
+            ]
+        );
+        assert_eq!(request_lines(&recorder), ["POST /control/shim-beacon"]);
+        // gemini shares the template and is pinned the same way.
+        assert_eq!(
+            identity_shim_run("gemini", &["-p", "x"], true, &[], port),
+            ["-p", "x", "--session-id", "pin-1"]
+        );
+        assert_eq!(
+            request_lines(&recorder),
+            ["POST /control/shim-beacon", "POST /control/session-open"]
+        );
+
+        let markers: [&[(&str, &str)]; 4] = [
+            &[("CLAUDECODE", "1")],
+            &[("CLAUDE_CODE_CHILD_SESSION", "1")],
+            &[("CLAUDECODE", "1"), ("CLAUDE_CODE_CHILD_SESSION", "1")],
+            // PRESENT but empty is still nested — `claude_env`'s own reading.
+            &[("CLAUDECODE", "")],
+        ];
+        let argvs: [&[&str]; 2] = [&["-p", "x"], &["--session-id", "chosen-1", "-p", "x"]];
+        // The marker describes the CALLER, so the rule covers gemini too.
+        for tool in ["claude", "gemini"] {
+            for marker_env in markers {
+                for args in argvs {
+                    assert_eq!(
+                        identity_shim_run(tool, args, true, marker_env, port),
+                        args,
+                        "{tool} {args:?} under {marker_env:?}: the original argv only"
+                    );
+                    let heard = recorder.take();
+                    assert!(
+                        heard.is_empty(),
+                        "{tool} {args:?} under {marker_env:?}: a nested call must say \
+                         nothing to the runner, but it sent {heard:?}"
+                    );
+                }
+            }
+        }
+
+        // Repetition: nested calls in a row stay silent; nothing latches.
+        for _ in 0..2 {
+            assert_eq!(
+                identity_shim_run("claude", &["-p", "x"], true, &[("CLAUDECODE", "1")], port),
+                ["-p", "x"]
+            );
+        }
+        assert!(request_lines(&recorder).is_empty());
     }
 
     #[test]
@@ -2876,6 +3230,155 @@ mod resolve_wait_tests {
                 "0 disables the wait: {stderr}"
             );
         }
+    }
+}
+
+/// The `.cmd` identity template's nested-call passthrough, exercised by
+/// RUNNING it under cmd.exe. The `#[test]`s exist on Windows only (the Windows
+/// CI leg runs them); the helper compiles on every platform so the Linux legs
+/// type-check and lint it too.
+#[cfg(test)]
+mod identity_cmd_tests {
+    use super::loopback_recorder::LoopbackRecorder;
+    use super::*;
+    use std::process::Command;
+    use std::time::Duration;
+
+    const BUDGET: Duration = Duration::from_secs(60);
+
+    /// Run the rendered `.cmd` identity shim as `claude <args>`, wired the way
+    /// a runner pane wires it — pin, hook carrier, mcp-config, the runner's
+    /// loopback `port`, terminal id — with `extra_env` on top, against a fake
+    /// real `claude.cmd` that writes its `%*` to a file. Returns that line.
+    fn cmd_shim_argv(args: &[&str], extra_env: &[(&str, &str)], port: u16) -> String {
+        let tmp = tempfile::tempdir().unwrap();
+        let (shim_dir, real_dir) = (tmp.path().join("shim"), tmp.path().join("real"));
+        std::fs::create_dir_all(&shim_dir).unwrap();
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let seen = tmp.path().join("argv.txt");
+        std::fs::write(
+            real_dir.join("claude.cmd"),
+            format!("@echo off\r\n>\"{}\" echo(%*\r\n", seen.display()),
+        )
+        .unwrap();
+        let (settings, mcp) = (tmp.path().join("s.json"), tmp.path().join("m.json"));
+        std::fs::write(&settings, "{}").unwrap();
+        std::fs::write(&mcp, "{}").unwrap();
+        let shim = shim_dir.join("claude.cmd");
+        std::fs::write(
+            &shim,
+            render_identity(IDENTITY_SHIM_CMD, "claude", &shim_dir),
+        )
+        .unwrap();
+
+        let mut cmd = Command::new(&shim);
+        cmd.args(args);
+        // Nothing the test process inherited may decide the run: not an
+        // agent's Claude Code session markers, not a QONTINUI_* seam, not a
+        // carrier variable a parent shim left behind.
+        for (key, _) in std::env::vars_os() {
+            let upper = key.to_string_lossy().to_ascii_uppercase();
+            if upper.starts_with("QONTINUI_") || upper == "SETTINGS_ARGS" || upper == "MCPCFG_ARGS"
+            {
+                cmd.env_remove(&key);
+            }
+        }
+        for marker in qontinui_runner_lib::claude_env::INHERITED_SESSION_MARKERS {
+            cmd.env_remove(marker);
+        }
+        let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+        cmd.env(
+            "PATH",
+            format!(
+                "{};{};{system_root}\\System32;{system_root}",
+                shim_dir.display(),
+                real_dir.display()
+            ),
+        )
+        .env("QONTINUI_PINNED_SESSION_ID", "pin-1")
+        .env("QONTINUI_CLAUDE_HOOK_SETTINGS", &settings)
+        .env("QONTINUI_MCP_CONFIG", &mcp)
+        .env("QONTINUI_INSTALL_INTERCEPT_PORT", port.to_string())
+        .env("QONTINUI_TERMINAL_ID", "term-pane")
+        .env("QONTINUI_SHIM_RESOLVE_WAIT_SECS", "0")
+        .envs(extra_env.iter().copied());
+        let out = crate::process_helpers::output_with_timeout(cmd, BUDGET).unwrap();
+        assert!(
+            out.status.success(),
+            "cmd identity shim failed: {}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        std::fs::read_to_string(&seen)
+            .expect("the real claude ran")
+            .trim()
+            .to_string()
+    }
+
+    /// The `.cmd` twin of `nested_claude_cannot_rebind_its_pane_via_the_identity_shim`
+    /// (plan `2026-11-06-nested-claude-rebinds-its-parent-pane`). cmd cannot
+    /// hold an empty variable, so there is no empty-marker case here.
+    #[cfg(windows)]
+    #[test]
+    fn nested_claude_cannot_rebind_its_pane_via_the_cmd_identity_shim() {
+        let recorder = LoopbackRecorder::start();
+        let port = recorder.port();
+
+        // Control: the pane's own launch carries the pane's identity and
+        // speaks to the runner, so the listener and `curl` demonstrably see
+        // what the nested runs below must not produce.
+        let control = cmd_shim_argv(&["-p", "x"], &[], port);
+        assert!(
+            control.starts_with("-p x --settings ")
+                && control.contains(" --mcp-config ")
+                && control.ends_with(" --session-id pin-1"),
+            "{control}"
+        );
+        let mut heard: Vec<String> = recorder.take().into_iter().map(|r| r.line).collect();
+        heard.sort();
+        assert_eq!(
+            heard,
+            ["POST /control/session-open", "POST /control/shim-beacon"]
+        );
+
+        for &marker in qontinui_runner_lib::claude_env::INHERITED_SESSION_MARKERS {
+            for args in [
+                &["-p", "x"][..],
+                &["--session-id", "chosen-1", "-p", "x"][..],
+            ] {
+                assert_eq!(
+                    cmd_shim_argv(args, &[(marker, "1")], port),
+                    args.join(" "),
+                    "{marker} {args:?}: the original argv only"
+                );
+                let heard = recorder.take();
+                assert!(
+                    heard.is_empty(),
+                    "{marker} {args:?}: a nested call must say nothing to the runner, \
+                     but it sent {heard:?}"
+                );
+            }
+        }
+    }
+
+    /// The template before this fix routed the recursion guard to
+    /// `:passthrough`, which appends whatever SETTINGS_ARGS / MCPCFG_ARGS a
+    /// parent `.cmd` shim left in the environment of the claude it launched (a
+    /// `set` inside setlocal reaches a `call`ed child). Red on that template.
+    #[cfg(windows)]
+    #[test]
+    fn cmd_identity_shim_guard_never_appends_a_parent_shims_carrier() {
+        let recorder = LoopbackRecorder::start();
+        let leftovers = [
+            ("QONTINUI_INSTALL_INTERCEPT_GUARD", "1"),
+            ("SETTINGS_ARGS", "--settings LEFTOVER"),
+            ("MCPCFG_ARGS", "--mcp-config LEFTOVER"),
+        ];
+        assert_eq!(
+            cmd_shim_argv(&["-p", "x"], &leftovers, recorder.port()),
+            "-p x"
+        );
+        assert!(recorder.take().is_empty());
     }
 }
 
