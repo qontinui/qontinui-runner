@@ -63,7 +63,10 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use super::relay::tabs_response_body;
-use super::screenshots::{build_visibility_report, VisibilityRequest};
+use super::screenshots::{
+    build_visibility_report, modal_ids_from_context, ModalIdentities, VisibilityRequest,
+};
+use super::visibility_canvas::CanvasCoverage;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -224,6 +227,7 @@ fn occlusion_entry_pins_the_sdk_entry_field_names() {
         0.02,
         false,
         None,
+        Some(&CanvasCoverage::measured_empty()),
     );
     let entry = &report["occlusions"][0];
 
@@ -256,6 +260,13 @@ fn occlusion_entry_pins_the_sdk_entry_field_names() {
          above blank ones"
     );
     assert_eq!(
+        entry["textSource"], "dom",
+        "`textSource` is the SDK union 'dom' | 'painted' (plan \
+         2026-10-22-occlusion-sweep-is-blind-to-canvas-painted-text). No \
+         `paintsText` on the state, so the text came from the DOM; the painted \
+         arm is pinned below"
+    );
+    assert_eq!(
         entry["source"], "hit-test",
         "`source` is the SDK union 'geometry' | 'hit-test'; this arm is always \
          hit-test because the geometric probe lives in ui-bridge-auto and is \
@@ -277,6 +288,7 @@ fn occlusion_entry_pins_the_sdk_entry_field_names() {
         "occluded_by",
         "is_expected_overlay",
         "hides_text",
+        "text_source",
         "elementId",
     ] {
         assert!(
@@ -285,6 +297,50 @@ fn occlusion_entry_pins_the_sdk_entry_field_names() {
              quantity under two spellings is the drift this file exists to stop"
         );
     }
+}
+
+/// The painted arm of the entry: a `paintsText` surface has no DOM text, yet
+/// its occlusion hides text. The SDK reads `hidesText: true, textSource:
+/// 'painted'` from the same element state.
+#[test]
+fn occlusion_entry_pins_the_painted_text_source() {
+    let report = build_visibility_report(
+        &[serde_json::json!({
+            "id": "terminal-surface-abc",
+            "state": { "occludedBy": "div.minimap", "occludedPct": 30.0, "paintsText": true },
+        })],
+        0.02,
+        false,
+        None,
+        Some(&CanvasCoverage::measured_empty()),
+    );
+    let entry = &report["occlusions"][0];
+    assert_eq!(entry["hidesText"], true, "painted text is text");
+    assert_eq!(entry["textSource"], "painted");
+}
+
+/// The blank arm: no DOM text and no `paintsText`. The SDK spreads
+/// `textSource` in only when it is defined (`visibility-report.ts`), so the
+/// key is ABSENT — not `"dom"` — and `hidesText` is false. A consumer keying on
+/// `textSource` presence would otherwise read every blank box as DOM text.
+#[test]
+fn occlusion_entry_omits_text_source_when_nothing_is_hidden() {
+    let report = build_visibility_report(
+        &[serde_json::json!({
+            "id": "spacer",
+            "state": { "occludedBy": "div.toast", "occludedPct": 30.0 },
+        })],
+        0.02,
+        false,
+        None,
+        Some(&CanvasCoverage::measured_empty()),
+    );
+    let entry = &report["occlusions"][0];
+    assert_eq!(entry["hidesText"], false);
+    assert!(
+        entry.get("textSource").is_none(),
+        "`textSource` is present exactly when `hidesText` is true: {entry}"
+    );
 }
 
 /// The report-level keys, against the SDK's `VisibilityReport` interface.
@@ -299,6 +355,7 @@ fn visibility_report_pins_the_sdk_report_level_keys() {
         0.02,
         true,
         None,
+        Some(&CanvasCoverage::measured_empty()),
     );
 
     assert!(
@@ -322,7 +379,19 @@ fn visibility_report_pins_the_sdk_report_level_keys() {
     );
     assert_eq!(
         report["verdict"], "occlusions_found",
-        "`verdict` is the SDK's three-variant union — see the verdict test"
+        "`verdict` is the SDK's four-variant union — see the verdict test"
+    );
+    assert_eq!(
+        report["canvasCoverage"],
+        serde_json::json!({
+            "state": "measured",
+            "canvases": 0,
+            "attributed": 0,
+            "unattributed": [],
+        }),
+        "`canvasCoverage` is the SDK's census field: `state` 'measured' with \
+         `canvases` / `attributed` / `unattributed[]`, or 'unavailable' with a \
+         `reason` (pinned in the verdict test)"
     );
 
     // Runner-only, and deliberately OUTSIDE the verdict union so no SDK
@@ -366,6 +435,7 @@ fn visibility_report_pins_the_sdk_report_level_keys() {
         "min_ratio",
         "include_expected",
         "occlusion_data_observed",
+        "canvas_coverage",
     ] {
         assert!(
             report.get(absent).is_none(),
@@ -374,47 +444,116 @@ fn visibility_report_pins_the_sdk_report_level_keys() {
     }
 }
 
-/// The verdict vocabulary is a CLOSED three-variant union shared with the SDK.
-/// A fourth value, or a renamed one, is an unhandled case in every consumer's
-/// switch — which is why all three arms are exercised here rather than one.
+/// The verdict vocabulary is a CLOSED four-variant union shared with the SDK:
+/// `unknown_empty_registry`, `occlusions_found`, `unknown_canvas`, `clear`,
+/// decided in that order (plan
+/// `2026-10-22-occlusion-sweep-is-blind-to-canvas-painted-text`, D3). A fifth
+/// value, or a renamed one, is an unhandled case in every consumer's switch —
+/// which is why every arm is exercised here rather than one.
+///
+/// # Why this pins the RUNNER's vocabulary, not the installed SDK's
+///
+/// `unknown_canvas` ships in `@qontinui/ui-bridge` 0.36.0. This test landed
+/// against the `^0.31.0` pin, whose `VisibilityReport.verdict` is still the
+/// old three, so a scrape of the installed SDK would either fail here or have
+/// to accept both unions — and a pin that accepts both pins nothing. The
+/// literals below are the contract the SDK side is being built to; the bump
+/// to 0.36.0 adds the installed-SDK comparison.
 #[test]
-fn visibility_verdict_union_is_exactly_the_sdk_three() {
-    // Empty registry: UNKNOWN, never "clear". This is the absence-is-not-zero
-    // distinction, and collapsing it into `clear` is the exact misreading the
-    // variant exists to prevent.
-    let empty = build_visibility_report(&[], 0.02, false, None);
+fn visibility_verdict_union_is_exactly_the_sdk_four() {
+    use super::visibility_canvas::CoverageUnavailableReason;
+    let measured_empty = CanvasCoverage::measured_empty();
+    let stray = CanvasCoverage::from_ipc(Ok(&serde_json::json!({
+        "canvases": 1,
+        "attributed": 0,
+        "unattributed": [{
+            "descriptor": "canvas.xterm-link-layer",
+            "rect": { "x": 0, "y": 0, "width": 640, "height": 480 },
+        }],
+    })));
+    let quiet = [serde_json::json!({ "id": "btn-save", "state": {} })];
+    let covered = [occluded_element("btn-save", "modal-1", 40.0, "Save")];
+    let mut seen = std::collections::BTreeSet::new();
+
+    // 1. Empty registry: UNKNOWN, never "clear" — even when the canvas census
+    //    has something to say. This is the absence-is-not-zero distinction.
+    let empty = build_visibility_report(&[], 0.02, false, None, Some(&stray));
     assert_eq!(
         empty["verdict"], "unknown_empty_registry",
         "an empty element list is UNKNOWN — nothing was swept, so nothing can \
          be declared clear"
     );
     assert_eq!(empty["elementCount"], 0);
+    seen.insert(empty["verdict"].to_string());
 
-    // Swept, nothing covered.
-    let clear = build_visibility_report(
-        &[serde_json::json!({ "id": "btn-save", "state": {} })],
-        0.02,
-        false,
-        None,
+    // 2. Swept, something covered: `occlusions_found` outranks an
+    //    unattributed canvas, and the census is still reported.
+    let found = build_visibility_report(&covered, 0.02, false, None, Some(&stray));
+    assert_eq!(found["verdict"], "occlusions_found");
+    assert_eq!(found["canvasCoverage"]["state"], "measured");
+    seen.insert(found["verdict"].to_string());
+
+    // 3. Swept, nothing covered, but a canvas nobody attributed, or a census
+    //    that could not be read under ANY of the SDK's four reasons: never
+    //    `clear`. The exhaustive match below (no wildcard) makes a fifth Rust
+    //    variant a compile error here, so the list cannot silently fall behind.
+    let stray_report = build_visibility_report(&quiet, 0.02, false, None, Some(&stray));
+    assert_eq!(
+        stray_report["verdict"], "unknown_canvas",
+        "an unattributed canvas may be painting text the sweep cannot see"
     );
+    seen.insert(stray_report["verdict"].to_string());
+    for (reason, wire) in [
+        (
+            CoverageUnavailableReason::PageSdkLacksCoverage,
+            "page-sdk-lacks-coverage",
+        ),
+        (CoverageUnavailableReason::AccessorThrew, "accessor-threw"),
+        (CoverageUnavailableReason::NoDocument, "no-document"),
+        (CoverageUnavailableReason::IpcFailed, "ipc-failed"),
+    ] {
+        match reason {
+            CoverageUnavailableReason::PageSdkLacksCoverage
+            | CoverageUnavailableReason::AccessorThrew
+            | CoverageUnavailableReason::NoDocument
+            | CoverageUnavailableReason::IpcFailed => {}
+        }
+        let cov = CanvasCoverage::Unavailable { reason };
+        let r = build_visibility_report(&quiet, 0.02, false, None, Some(&cov));
+        assert_eq!(
+            r["verdict"], "unknown_canvas",
+            "unavailable ({wire}) withholds clear"
+        );
+        assert_eq!(
+            r["canvasCoverage"],
+            serde_json::json!({ "state": "unavailable", "reason": wire }),
+            "the reason union is the SDK's, letter for letter"
+        );
+    }
+
+    // 4. Swept, nothing covered, every canvas accounted for: `clear`.
+    let clear = build_visibility_report(&quiet, 0.02, false, None, Some(&measured_empty));
     assert_eq!(
         clear["verdict"], "clear",
-        "a non-empty sweep with no entries is `clear`"
+        "a non-empty sweep with no entries and no unattributed canvas is `clear`"
     );
     assert_eq!(
         clear["occlusionDataObserved"], false,
         "no element carried any occlusion field, so `clear` here is 'not \
          observed' — the advisory field is what says so"
     );
+    seen.insert(clear["verdict"].to_string());
 
-    // Swept, something covered.
-    let found = build_visibility_report(
-        &[occluded_element("btn-save", "modal-1", 40.0, "Save")],
-        0.02,
-        false,
-        None,
+    assert_eq!(
+        seen.into_iter().collect::<Vec<_>>(),
+        vec![
+            "\"clear\"",
+            "\"occlusions_found\"",
+            "\"unknown_canvas\"",
+            "\"unknown_empty_registry\"",
+        ],
+        "exactly four verdicts, every one reached"
     );
-    assert_eq!(found["verdict"], "occlusions_found");
 }
 
 /// `minRatio` is a `<` filter, and its boundary is shared with the SDK
@@ -426,7 +565,13 @@ fn visibility_min_ratio_is_a_strict_below_filter() {
     let elements = [occluded_element("btn-save", "modal-1", 40.0, "Save")];
 
     // ratio == minRatio: KEPT.
-    let at = build_visibility_report(&elements, 0.4, false, None);
+    let at = build_visibility_report(
+        &elements,
+        0.4,
+        false,
+        None,
+        Some(&CanvasCoverage::measured_empty()),
+    );
     assert_eq!(
         at["occlusions"].as_array().map(Vec::len),
         Some(1),
@@ -438,7 +583,13 @@ fn visibility_min_ratio_is_a_strict_below_filter() {
     // element is now just BELOW threshold: DROPPED. (The second parameter is
     // minRatio, not ratio — the element's ratio is pinned at 40.0/100.0 by the
     // fixture and never moves.)
-    let below_threshold = build_visibility_report(&elements, 0.400_001, false, None);
+    let below_threshold = build_visibility_report(
+        &elements,
+        0.400_001,
+        false,
+        None,
+        Some(&CanvasCoverage::measured_empty()),
+    );
     assert_eq!(
         below_threshold["occlusions"].as_array().map(Vec::len),
         Some(0),
@@ -466,12 +617,26 @@ fn visibility_min_ratio_is_a_strict_below_filter() {
 /// to make a divergence go green.
 #[test]
 fn include_expected_filters_tracked_modal_overlays_as_the_sdk_does() {
-    use std::collections::HashSet;
-    let modal_ids: HashSet<String> = ["modal-1".to_string()].into_iter().collect();
+    // One admitted `<div>` modal whose registry id and DOM id are both
+    // `modal-1`, so the bare form matches through `bridgeId` and `div#modal-1`
+    // through its DOM-form name (SDK `964a5b0`).
+    let modal_ids: ModalIdentities = modal_ids_from_context(&serde_json::json!({
+        "modals": [{
+            "id": "modal-1", "tagName": "div", "bridgeId": "modal-1", "domId": "modal-1",
+            "blocking": true, "blockingSource": "element",
+        }]
+    }))
+    .expect("modals array present");
     let elements = [occluded_element("btn-save", "modal-1", 40.0, "Save")];
 
     // Default (`includeExpected: false`): the modal overlay is DROPPED and COUNTED.
-    let excluded = build_visibility_report(&elements, 0.02, false, Some(&modal_ids));
+    let excluded = build_visibility_report(
+        &elements,
+        0.02,
+        false,
+        Some(&modal_ids),
+        Some(&CanvasCoverage::measured_empty()),
+    );
     assert_eq!(
         excluded["occlusions"].as_array().map(Vec::len),
         Some(0),
@@ -488,7 +653,13 @@ fn include_expected_filters_tracked_modal_overlays_as_the_sdk_does() {
     assert_eq!(excluded["includeExpected"], false, "echoed verbatim");
 
     // `includeExpected: true`: KEPT, flagged, not counted.
-    let included = build_visibility_report(&elements, 0.02, true, Some(&modal_ids));
+    let included = build_visibility_report(
+        &elements,
+        0.02,
+        true,
+        Some(&modal_ids),
+        Some(&CanvasCoverage::measured_empty()),
+    );
     assert_eq!(included["occlusions"].as_array().map(Vec::len), Some(1));
     assert_eq!(included["occlusions"][0]["isExpectedOverlay"], true);
     assert_eq!(
@@ -498,12 +669,13 @@ fn include_expected_filters_tracked_modal_overlays_as_the_sdk_does() {
     assert_eq!(included["expectedOverlayDetection"], "modal-stack");
     assert_eq!(included["includeExpected"], true, "echoed verbatim");
 
-    // The unregistered-occluder DOM-id form `<tag>#<modal.id>` matches too.
+    // The unregistered-occluder DOM-id form `<tag>#<modal.domId>` matches too.
     let dom_id = build_visibility_report(
         &[occluded_element("btn-save", "div#modal-1", 40.0, "Save")],
         0.02,
         false,
         Some(&modal_ids),
+        Some(&CanvasCoverage::measured_empty()),
     );
     assert_eq!(dom_id["occlusions"].as_array().map(Vec::len), Some(0));
     assert_eq!(dom_id["expectedOverlaysFiltered"], 1);
@@ -516,6 +688,7 @@ fn include_expected_filters_tracked_modal_overlays_as_the_sdk_does() {
             0.02,
             false,
             Some(&modal_ids),
+            Some(&CanvasCoverage::measured_empty()),
         );
         assert_eq!(
             report["occlusions"].as_array().map(Vec::len),
@@ -528,7 +701,13 @@ fn include_expected_filters_tracked_modal_overlays_as_the_sdk_does() {
 
     // No modal stack (`None`): nothing can be classified, so nothing is
     // filtered, and the report SAYS so rather than looking clean.
-    let unavailable = build_visibility_report(&elements, 0.02, false, None);
+    let unavailable = build_visibility_report(
+        &elements,
+        0.02,
+        false,
+        None,
+        Some(&CanvasCoverage::measured_empty()),
+    );
     assert_eq!(unavailable["expectedOverlayDetection"], "unavailable");
     assert_eq!(unavailable["expectedOverlaysFiltered"], 0);
     assert_eq!(unavailable["occlusions"].as_array().map(Vec::len), Some(1));
@@ -541,6 +720,7 @@ fn include_expected_filters_tracked_modal_overlays_as_the_sdk_does() {
         0.02,
         false,
         Some(&modal_ids),
+        Some(&CanvasCoverage::measured_empty()),
     );
     assert_eq!(hairline["occlusions"].as_array().map(Vec::len), Some(0));
     assert_eq!(
@@ -656,6 +836,39 @@ fn visibility_handler_pins_its_status_and_default_commitments() {
          never an early return — a misbehaving tracker degrades the field, never \
          the caller (SDK registry.ts). Arm was:\n{modal_arm}"
     );
+    // The canvas census, same shape: issued, matched, never `?`-propagated,
+    // and its failure yields `Unavailable` (which withholds `clear`) rather
+    // than an early return.
+    let coverage_at = body
+        .find("\"get_canvas_coverage\"")
+        .expect("the handler must ask the webview for its canvas census");
+    assert!(
+        validate_at < coverage_at,
+        "minRatio is validated BEFORE the coverage IPC too"
+    );
+    assert!(
+        !body.contains("\"get_canvas_coverage\", serde_json::json!({})).await?")
+            && !body.contains("\"get_canvas_coverage\", serde_json::json!({}))?"),
+        "the coverage IPC result must not be `?`-propagated"
+    );
+    let coverage_match_at = body
+        .find("let canvas_coverage = match &coverage_result")
+        .expect("the coverage result must be matched explicitly");
+    let coverage_arm = body
+        .get(coverage_match_at..)
+        .and_then(|rest| rest.find("let modal_ids").and_then(|end| rest.get(..end)))
+        .expect("the coverage match precedes the modal match");
+    assert!(
+        !coverage_arm.contains("return") && coverage_arm.contains("CanvasCoverage::from_ipc(Err("),
+        "a get_canvas_coverage failure must become `Unavailable` (ipc-failed), \
+         never an early return — a missing census withholds `clear`, it does \
+         not fail the sweep. Arm was:\n{coverage_arm}"
+    );
+    assert!(
+        body.contains("Some(&canvas_coverage)"),
+        "the parsed census must reach build_visibility_report; `None` there \
+         would always read page-sdk-lacks-coverage"
+    );
     assert_eq!(
         body.matches("StatusCode::UNPROCESSABLE_ENTITY").count(),
         1,
@@ -685,6 +898,173 @@ fn visibility_handler_pins_its_status_and_default_commitments() {
              a fault it did not cause"
         );
     }
+}
+
+/// The expected-overlay ADMISSION rule, against the SDK's `modalIdentities`
+/// (`visibility-report.ts`, ui-bridge `4846771`):
+/// `if (modal?.blockingSource !== 'element') continue`. Only a modal whose
+/// `blockingSource` is exactly `"element"` contributes its `id` / `bridgeId`.
+/// `"backdrop"`, an absent field (a non-blocking modal, or a page SDK older
+/// than the field — even one saying `blocking: true`), and any other value are
+/// NOT admitted, so a detector that cannot vouch for a modal never hides an
+/// occlusion. Admission lives in one predicate
+/// (`screenshots.rs::admits_as_expected_overlay`), and this pin is where a
+/// change to the SDK rule has to show up.
+#[test]
+fn expected_overlay_admission_is_blocking_source_element_exactly() {
+    let ctx = serde_json::json!({
+        "modals": [
+            { "id": "dialog", "tagName": "div", "bridgeId": "bridge-dialog", "domId": "dialog", "blocking": true, "blockingSource": "element" },
+            { "id": "backdrop", "tagName": "div", "bridgeId": "bridge-backdrop", "domId": "backdrop", "blocking": true, "blockingSource": "backdrop" },
+            { "id": "legacy", "tagName": "div", "bridgeId": "bridge-legacy", "domId": "legacy", "blocking": true },
+            { "id": "drawer", "tagName": "div", "bridgeId": "bridge-drawer", "domId": "drawer", "blocking": false },
+            { "id": "menu", "tagName": "div", "bridgeId": "bridge-menu", "domId": "menu" },
+        ]
+    });
+    let ids = modal_ids_from_context(&ctx).expect("modals array present");
+    assert_eq!(
+        ids.dom_names,
+        std::collections::HashSet::from(["div#dialog".to_string()]),
+        "only the element-declared modal's DOM-form name is admitted"
+    );
+    assert_eq!(
+        ids.bridge_ids,
+        std::collections::HashSet::from(["bridge-dialog".to_string()]),
+        "the bridgeId match honours the same rule"
+    );
+
+    // Absent field = not admitted, end to end: the occlusion stays reported.
+    for modal in [
+        serde_json::json!({ "id": "menu", "bridgeId": "menu", "blocking": true }),
+        serde_json::json!({ "id": "menu", "bridgeId": "menu", "blocking": true, "blockingSource": "backdrop" }),
+    ] {
+        let none = modal_ids_from_context(&serde_json::json!({ "modals": [modal.clone()] }))
+            .expect("a stack that admits nothing is still an answer");
+        assert!(none.is_empty(), "{modal} must not be admitted");
+        let report = build_visibility_report(
+            &[occluded_element("btn-save", "menu", 40.0, "Save")],
+            0.02,
+            false,
+            Some(&none),
+            Some(&CanvasCoverage::measured_empty()),
+        );
+        assert_eq!(report["verdict"], "occlusions_found", "{modal}");
+        assert_eq!(report["expectedOverlaysFiltered"], 0, "{modal}");
+        assert_eq!(report["expectedOverlayDetection"], "modal-stack", "{modal}");
+    }
+}
+
+/// The expected-overlay MATCHER, against the SDK's `isTrackedOverlay` and
+/// `modalIdentities` (`visibility-report.ts`, ui-bridge `964a5b0`).
+/// `ModalInfo.id` is not read. Two identity sets: `bridgeIds` (exact) and
+/// `domNames` (`<tagName>#<domId>`, `<tagName>[data-testid="<testId>"]`,
+/// built with the dialog's OWN tag; an absent `tagName` contributes none). An
+/// occluder that is itself a REGISTERED element id matches only a `bridgeId`,
+/// never a DOM-form name. P8 is the case that forced it: an `aside#sidebar`
+/// beside an admitted dialog whose testid is `sidebar` is NOT expected.
+#[test]
+fn expected_overlay_matcher_keys_each_identity_kind_to_its_own_form() {
+    let ctx = serde_json::json!({
+        "modals": [
+            {
+                "id": "sidebar", "tagName": "div", "testId": "sidebar", "type": "dialog",
+                "blocking": true, "blockingSource": "element",
+            },
+            { "id": "modal-2", "tagName": "div", "blocking": true, "blockingSource": "element" },
+            {
+                "id": "dlg", "tagName": "dialog", "domId": "dlg", "bridgeId": "bridge-dlg",
+                "blocking": true, "blockingSource": "element",
+            },
+            {
+                "id": "untagged", "domId": "untagged", "bridgeId": "bridge-untagged",
+                "blocking": true, "blockingSource": "element",
+            },
+        ]
+    });
+    let ids = modal_ids_from_context(&ctx).expect("modals array present");
+    let expected_with = |occluder: &str, registered: Option<&str>| {
+        let mut elements = vec![occluded_element("btn-save", occluder, 40.0, "Save")];
+        if let Some(reg) = registered {
+            elements.push(serde_json::json!({ "id": reg, "label": reg }));
+        }
+        let r = build_visibility_report(
+            &elements,
+            0.02,
+            true,
+            Some(&ids),
+            Some(&CanvasCoverage::measured_empty()),
+        );
+        r["occlusions"][0]["isExpectedOverlay"] == true
+    };
+    let expected = |occluder: &str| expected_with(occluder, None);
+
+    for (occluder, want) in [
+        // P8.
+        ("aside#sidebar", false),
+        ("aside[data-testid=\"sidebar\"]", false),
+        ("sidebar", false),
+        ("div[data-testid=\"sidebar\"]", true),
+        // A generated id is no identity.
+        ("modal-2", false),
+        ("div#modal-2", false),
+        // Duplicate DOM id on a different tag.
+        ("dialog#dlg", true),
+        ("div#dlg", false),
+        ("dlg", false),
+        ("bridge-dlg", true),
+        ("dialog#bridge-dlg", false),
+        ("dialog[data-testid=\"dlg\"]", false),
+        // Absent tagName: no DOM-form name, bridgeId still matches.
+        ("bridge-untagged", true),
+        ("div#untagged", false),
+        ("undefined#untagged", false),
+    ] {
+        assert_eq!(expected(occluder), want, "occludedBy `{occluder}`");
+    }
+
+    // A registered id shaped like a DOM-form name never matches one...
+    assert!(
+        !expected_with("dialog#dlg", Some("dialog#dlg")),
+        "`dialog#dlg` is a registered element id here, so it may only match a bridgeId"
+    );
+    // ...while a registry id that IS a bridgeId still matches, exactly.
+    assert!(expected_with("bridge-dlg", Some("bridge-dlg")));
+    assert!(!expected_with("bridge-dlg-2", Some("bridge-dlg-2")));
+}
+
+/// The TS responder for the census IPC. Same boundary as
+/// `USE_CONTROL_EVENTS_TS`: a move reddens the build, not a test.
+const USE_DISCOVERY_EVENTS_TS: &str =
+    include_str!("../../../../src/hooks/ui-bridge-events/useDiscoveryEvents.ts");
+const UI_BRIDGE_EVENT_TYPES_TS: &str =
+    include_str!("../../../../src/hooks/ui-bridge-events/types.ts");
+
+/// The Rust handler asks for `get_canvas_coverage`; the frontend must answer
+/// it. A frontend without the arm replies "Unknown request type", which the
+/// Rust side reads as `ipc-failed` — so a renamed arm would silently pin every
+/// sweep at `unknown_canvas` instead of failing anything.
+#[test]
+fn the_canvas_coverage_ipc_has_a_frontend_arm_under_the_same_name() {
+    let discovery = lf(USE_DISCOVERY_EVENTS_TS);
+    assert!(
+        discovery.contains("case \"get_canvas_coverage\":"),
+        "useDiscoveryEvents.ts must handle the `get_canvas_coverage` request \
+         screenshots.rs::ui_bridge_visibility_handler issues"
+    );
+    assert!(
+        discovery.contains("reason: \"accessor-threw\""),
+        "a throwing census accessor must answer the accessor-threw marker \
+         visibility_canvas.rs parses, not a bare null (which reads as \
+         page-sdk-lacks-coverage)"
+    );
+    assert_eq!(
+        lf(UI_BRIDGE_EVENT_TYPES_TS)
+            .matches("| \"get_canvas_coverage\"")
+            .count(),
+        2,
+        "both request-type unions (UIBridgeRequestType and DiscoveryEventTypes) \
+         must name the request"
+    );
 }
 
 // ---------------------------------------------------------------------------
