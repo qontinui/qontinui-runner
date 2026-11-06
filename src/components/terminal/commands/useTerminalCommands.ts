@@ -63,6 +63,7 @@ import { readTextArg, textArg } from "./parse";
 import { useCommandAction } from "./useCommandAction";
 import { getTerminalHotStore } from "../terminalHotStore";
 import { MAXIMIZE_IN_TMUX_ERROR } from "../zone-grid/maximizeActions";
+import { parseLayoutOriginArg } from "../zoneAutoTrim";
 import { useOrchestrateCommand } from "./orchestrateCommand";
 import { deriveVerdict, effect, fail, ok, stateEffect, type EffectReport } from "./verdict";
 import { describeThrown } from "@/lib/utils";
@@ -240,6 +241,11 @@ const SCHEMA = {
     // Declared as a FLAG so it never shifts `preset`. Absent → the page the
     // operator is viewing; present → that page, which need not be on screen.
     "--page": "string (optional terminal page id; defaults to the active page)",
+    // Who is choosing (`zoneAutoTrim.ts` `LayoutOrigin`). Absent → `operator`,
+    // a layout auto-trim never shrinks. `auto` hands the page to the runner,
+    // which then trims it when tabs close — what `/triage-sessions` sends when
+    // it trims a page that predates the origin field (`legacy`).
+    "--origin": 'string (optional; "operator" (default) or "auto")',
   },
   mode: { mode: `string (optional) — one of ${WORK_MODE_NAMES.join(", ")}; omitted toggles` },
   restart: { zone: "number (1-based; defaults to the currently focused zone)" },
@@ -1067,6 +1073,29 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
         );
       }
       const { zoneLayout: targetLayout, tabs: targetTabs } = target;
+      // The request source. Only `operator` and `auto` are a caller's to send:
+      // `restore` is the mount path's, and keeps whatever origin is stored.
+      const originArg = readTextArg(args, "origin");
+      if (originArg.kind === "invalid") return fail("invalid-origin", "--origin needs a value");
+      const source =
+        originArg.kind === "text" ? parseLayoutOriginArg(originArg.text) : ("operator" as const);
+      if (source === null) {
+        return fail(
+          "invalid-origin",
+          `origin must be "operator" or "auto" (got "${originArg.kind === "text" ? originArg.text : ""}")`,
+        );
+      }
+      // An `auto` request is a no-op in tmux mode (`useZoneLayout::setLayoutId`:
+      // only an operator request means "give me a grid"). Reporting `✓` over a
+      // page that did not move is the dishonest verdict this handler exists to
+      // avoid, so it is refused, naming the request that would work.
+      if (source === "auto" && targetLayout.workMode === "tmux") {
+        return fail(
+          "tmux-mode",
+          "the page is in tmux work mode, which an auto-origin layout request does not leave; " +
+            "send origin operator to take it back to a grid",
+        );
+      }
       // Observed pre-state, read off `layoutId` (the STATE `setLayoutId`
       // writes) rather than `layout.id` (derived, and synthesized for the
       // past-9 flow grid).
@@ -1109,14 +1138,18 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       // for `ZoneLayoutPicker`, which routes its clicks through this handler.
       // What was dishonest was never the call; it was reporting the same `✓`
       // whether or not the PRESET moved.
-      targetLayout.setLayoutId(normalized, { source: "operator" });
+      targetLayout.setLayoutId(normalized, { source });
       const layoutDetail =
         grown !== null
           ? `grew to ${grown} — ${targetTabs.length} sessions do not fit ${normalized}`
           : wasAlready
             ? `already ${normalized}; re-applied`
             : normalized;
-      const detail = leftTmux ? `left tmux mode — ${layoutDetail}` : layoutDetail;
+      // An `auto` request hands the page to the runner, which will trim it when
+      // tabs close; said, because it changes what the page does next.
+      const ownedDetail =
+        source === "auto" ? `${layoutDetail}; runner-owned (auto-trims)` : layoutDetail;
+      const detail = leftTmux ? `left tmux mode — ${ownedDetail}` : ownedDetail;
       return ok(effect("changed", "layout", wasAlready ? 0 : 1, { detail }));
     },
   });
