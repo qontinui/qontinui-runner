@@ -1751,7 +1751,11 @@ mod tests {
             &[roster_spelling.clone(), sibling.clone()],
         );
 
-        assert_eq!(rotated, Some(sibling.clone()), "never back to the limited account");
+        assert_eq!(
+            rotated,
+            Some(sibling.clone()),
+            "never back to the limited account"
+        );
         assert!(
             is_account_cooled_down(&roster_spelling),
             "the cooldown lands under the roster's spelling"
