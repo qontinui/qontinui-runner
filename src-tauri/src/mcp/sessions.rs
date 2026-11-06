@@ -967,8 +967,10 @@ pub(crate) struct TranscriptBindEnv {
     pub session_tenant:
         Box<dyn Fn(&str) -> Result<Option<uuid::Uuid>, serde_json::Value> + Send + Sync>,
     /// claude session id → what the OPEN lifecycle record hosting it says, if
-    /// any record does (the deterministic ownership leg).
-    pub session_host: Box<dyn Fn(&str) -> Option<SessionHost> + Send + Sync>,
+    /// any record does (the deterministic ownership leg). `Err` names why the
+    /// lifecycle store could not be read — UNKNOWN, which refuses, and never
+    /// "not hosted", which would hand the session to the cwd arm.
+    pub session_host: Box<dyn Fn(&str) -> Result<Option<SessionHost>, &'static str> + Send + Sync>,
     /// `(terminal, its session's workdir)` → the key that IS that terminal's
     /// session credential ([`crate::coord_mcp::terminal_session_credential`]),
     /// or the reason it cannot be named.
@@ -1030,7 +1032,9 @@ pub(crate) struct TranscriptBindEnv {
 ///    is not the terminal's credential, or that comes without the terminal's
 ///    proof (or with another's); a terminal whose credential this process
 ///    cannot name (an adopted holder pane holds no recorded delivery and no
-///    grant); an unhosted session whose `cwd` differs or is not recorded yet.
+///    grant); a session whose hosting cannot be read (no lifecycle store, or an
+///    unreadable one — UNKNOWN, never "unhosted"); an unhosted session whose
+///    `cwd` differs or is not recorded yet.
 ///    A nonce cannot bind another workdir's session, and a hosted session
 ///    cannot be bound by a peer sharing its directory's key.
 /// 4. **Adoption** — a supplied `coord_session_id` is adopted only after coord
@@ -1073,39 +1077,66 @@ async fn transcript_bind(
         .app_handle
         .try_state::<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>()
         .map(|s| s.inner().clone());
-    let env = transcript_bind_env(tailer, lifecycle);
-    let (status, body) = transcript_bind_core(&headers, &body, env).await;
+    let (status, body) = transcript_bind_route(
+        tailer,
+        lifecycle,
+        crate::terminal::transcript_watcher::watched_config_dirs(),
+        &headers,
+        &body,
+    )
+    .await;
     (status, Json(body))
 }
 
-/// The production [`TranscriptBindEnv`] over this runner's transcript tailer
-/// and lifecycle store — factored out of [`transcript_bind`] so a test builds
-/// the very closures the route runs.
+/// The door below the axum extraction: what [`transcript_bind`] runs once it
+/// has read this runner's state — its transcript tailer, its lifecycle store,
+/// and the config dirs its transcript watcher watches (each may be absent). It
+/// builds the production [`TranscriptBindEnv`] and decides with
+/// [`transcript_bind_core`], so a caller that enters here runs every
+/// production closure the route runs.
+pub(crate) async fn transcript_bind_route(
+    tailer: Option<Arc<crate::session::session_transcript_tailer::SessionTranscriptTailer>>,
+    lifecycle: Option<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>,
+    watched_config_dirs: Vec<std::path::PathBuf>,
+    headers: &axum::http::HeaderMap,
+    body: &[u8],
+) -> (StatusCode, serde_json::Value) {
+    let env = transcript_bind_env(tailer, lifecycle, watched_config_dirs);
+    transcript_bind_core(headers, body, env).await
+}
+
+/// The production [`TranscriptBindEnv`] over this runner's transcript tailer,
+/// lifecycle store and watched config dirs.
 fn transcript_bind_env(
     tailer: Option<Arc<crate::session::session_transcript_tailer::SessionTranscriptTailer>>,
     lifecycle: Option<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>,
+    watched_config_dirs: Vec<std::path::PathBuf>,
 ) -> TranscriptBindEnv {
     TranscriptBindEnv {
         transcript_gate: Box::new(crate::egress::transcript_sync_gate_for),
         tailer,
-        watched_config_dirs: crate::terminal::transcript_watcher::watched_config_dirs(),
+        watched_config_dirs,
         session_tenant: Box::new(|nonce| {
             crate::coord_mcp::session_tenant_or_refuse(Some(nonce)).map_err(|r| r.json_body())
         }),
+        // A runner with no lifecycle store, or one whose store cannot be read,
+        // does not know whether a terminal hosts the session: UNKNOWN, which
+        // refuses. Reading it as "not hosted" would hand every session to the
+        // cwd arm, the one arm a key shared by a whole directory satisfies.
         // Only an OPEN record with a real terminal hosts a session. A blank
         // workdir is no workdir: it must never resolve `.mcp.json` against the
         // runner's own cwd.
         session_host: Box::new(move |csid| {
-            lifecycle
-                .as_ref()
-                .and_then(|store| store.get(csid))
+            let store = lifecycle.as_ref().ok_or("lifecycle_store_unavailable")?;
+            Ok(store
+                .try_get(csid)?
                 .filter(|rec| rec.state == "open" && !rec.terminal_id.trim().is_empty())
                 .map(|rec| SessionHost {
                     terminal_id: rec.terminal_id,
                     working_dir: rec.working_dir.filter(|wd| !wd.trim().is_empty()),
                     origin: rec.origin,
                     confirmed_at: rec.confirmed_at,
-                })
+                }))
         }),
         session_credential: Box::new(crate::coord_mcp::terminal_session_credential),
         terminal_proven: Box::new(|terminal, proof| {
@@ -1215,7 +1246,7 @@ fn shared_key_owns_hosted_session(
                  ({reason}), so ownership is UNKNOWN and the bind is refused"
             ));
         }
-        Ok(credential) if !crate::session::terminal_door_key::secret_eq(&credential, nonce) => {
+        Ok(credential) if !crate::coord_mcp::secret_eq(credential.as_bytes(), nonce.as_bytes()) => {
             return Err("this key is not the credential of the session's terminal".to_string());
         }
         Ok(_) => {}
@@ -1368,11 +1399,12 @@ pub(crate) async fn transcript_bind_core(
     };
 
     // 6. Ownership: the caller's own session only (the route doc's step 3).
-    // Hosting decides first — it is the stronger evidence. Hosted in terminal
-    // T: (1) a key minted for T is owned; (2) a key minted for ANY OTHER
-    // terminal is refused, even when the cwd matches; (3) a key that names NO
-    // terminal is shared by every session of its directory, so it is owned
-    // only on T's own evidence ([`shared_key_owns_hosted_session`]). (4)
+    // Hosting decides first — it is the stronger evidence, and a host lookup
+    // that cannot be read refuses rather than reading as "not hosted". Hosted
+    // in terminal T: (1) a key minted for T is owned; (2) a key minted for ANY
+    // OTHER terminal is refused, even when the cwd matches; (3) a key that
+    // names NO terminal is shared by every session of its directory, so it is
+    // owned only on T's own evidence ([`shared_key_owns_hosted_session`]). (4)
     // Unhosted, the JSONL's own `cwd` must equal the nonce's workdir, and a
     // file with no `cwd` record yet is refused rather than guessed.
     let nonce_terminal = crate::coord_mcp::terminal_id_for_nonce(&nonce);
@@ -1384,7 +1416,16 @@ pub(crate) async fn transcript_bind_core(
             Some(format!("session {session_key} is not this caller's: {why}")),
         )
     };
-    match (env.session_host)(&session_key) {
+    let host = match (env.session_host)(&session_key) {
+        Ok(host) => host,
+        Err(reason) => {
+            return not_caller(&format!(
+                "whether a runner terminal hosts it is UNKNOWN to this runner process \
+                 ({reason}), so ownership is UNKNOWN and the bind is refused"
+            ));
+        }
+    };
+    match host {
         Some(host) if nonce_terminal.as_deref() == Some(host.terminal_id.as_str()) => {}
         Some(_) if nonce_terminal.is_some() => {
             return not_caller(
@@ -1392,17 +1433,35 @@ pub(crate) async fn transcript_bind_core(
             );
         }
         Some(host) => {
+            // Reading the credential reads the cwd's `.mcp.json` (and, for the
+            // stdio shape, the credential file it names): file I/O, so off
+            // the async runtime, as the cwd arm's JSONL read is.
             let proof = headers
                 .get(TERMINAL_PROOF_HEADER)
                 .and_then(|v| v.to_str().ok())
-                .filter(|v| !v.is_empty());
-            if let Err(why) = shared_key_owns_hosted_session(
-                &host,
-                &nonce,
-                proof,
-                &*env.session_credential,
-                &*env.terminal_proven,
-            ) {
+                .filter(|v| !v.is_empty())
+                .map(str::to_string);
+            let (session_credential, terminal_proven) =
+                (env.session_credential, env.terminal_proven);
+            let presented = nonce.clone();
+            let verdict = spawn_blocking_tracked(move || {
+                shared_key_owns_hosted_session(
+                    &host,
+                    &presented,
+                    proof.as_deref(),
+                    &*session_credential,
+                    &*terminal_proven,
+                )
+            })
+            .await
+            .unwrap_or_else(|_| {
+                Err(
+                    "the shared-key check did not complete, so ownership is UNKNOWN and the \
+                     bind is refused"
+                        .to_string(),
+                )
+            });
+            if let Err(why) = verdict {
                 return not_caller(&why);
             }
         }
@@ -2392,7 +2451,7 @@ mod tests {
                 tailer: t,
                 watched_config_dirs: cfg,
                 session_tenant: Box::new(|_| Ok(None)),
-                session_host: Box::new(|_| None),
+                session_host: Box::new(|_| Ok(None)),
                 session_credential: Box::new(|_, _| Err("coord_mcp_delivery_unrecorded")),
                 terminal_proven: Box::new(|_, _| false),
                 confirm_adoption: Box::new(move |_, _, _| {
@@ -2487,7 +2546,7 @@ mod tests {
             let cfg = config_with(dir.path(), &csid, &wd);
             let mut e = env(Some(t), vec![cfg], true);
             let hosting = host(&terminal(), &wd);
-            e.session_host = Box::new(move |_| Some(hosting.clone()));
+            e.session_host = Box::new(move |_| Ok(Some(hosting.clone())));
             let (status, v) = transcript_bind_core(&bearer(&key), &body(&csid), e).await;
             let detail = refused(status, &v, &outbox, &[wd.as_str()]);
             assert!(
@@ -2771,35 +2830,62 @@ mod tests {
             key
         }
 
-        /// Record `terminal` as spawned by this process — the grant the spawn
-        /// path registers — and return its per-spawn secret.
-        fn grant(terminal: &str) -> String {
+        /// A grant this test registered — the record the spawn path makes for
+        /// a terminal it spawned, carrying its per-spawn `secret` — forgotten
+        /// when the guard drops, on a failing assertion's unwind too, so a red
+        /// test never leaves a slot behind in the process-wide grant registry.
+        struct Granted {
+            terminal: String,
+            secret: String,
+        }
+
+        impl Drop for Granted {
+            fn drop(&mut self) {
+                crate::session::permission_accept::forget_terminal_grant(
+                    &self.terminal,
+                    &self.secret,
+                );
+            }
+        }
+
+        /// Record `terminal` as spawned by this process.
+        fn grant(terminal: &str) -> Granted {
             let secret = crate::session::permission_accept::new_nonce();
             crate::session::permission_accept::register_terminal_grant(
                 terminal,
                 secret.clone(),
                 None,
             );
-            secret
-        }
-
-        fn forget(terminal: &str, secret: &str) {
-            crate::session::permission_accept::forget_terminal_grant(terminal, secret);
-        }
-
-        /// `headers` plus this door's proof, derived from `secret` exactly as
-        /// the client derives it from `$QONTINUI_PERMREQ_NONCE`.
-        fn with_proof(mut headers: HeaderMap, secret: &str) -> HeaderMap {
-            let proof = crate::session::terminal_door_key::terminal_door_key_for(
-                TRANSCRIPT_BIND_DOOR,
+            Granted {
+                terminal: terminal.to_string(),
                 secret,
+            }
+        }
+
+        /// `headers` plus this door's proof for `secret`, derived the way the
+        /// CLIENT derives it from `$QONTINUI_PERMREQ_NONCE`: the literal label,
+        /// door and header, not the runner's own derivation, so these tests
+        /// present what a client presents. The door-key unit tests pin the
+        /// runner's derivation to the same shared vector.
+        fn with_proof(mut headers: HeaderMap, secret: &str) -> HeaderMap {
+            use sha2::Digest as _;
+            let mut h = sha2::Sha256::new();
+            h.update(b"qontinui-terminal-door-key\0");
+            h.update(b"transcript-bind");
+            h.update(b"\0");
+            h.update(secret.as_bytes());
+            headers.insert(
+                "x-qontinui-terminal-proof",
+                hex::encode(h.finalize()).parse().unwrap(),
             );
-            headers.insert(TERMINAL_PROOF_HEADER, proof.parse().unwrap());
             headers
         }
 
         /// What an `authoritative`, confirmed open record says about a session
-        /// hosted in `terminal` — the shape all 33 open records had on nilan.
+        /// hosted in `terminal` — the shape every open lifecycle record had on
+        /// nilan when plan
+        /// 2026-11-05-transcript-bind-refuses-a-hosted-session-whose-only-key-is-the-workdir-nonce
+        /// measured them on 2026-11-05.
         fn host(terminal: &str, working_dir: &str) -> SessionHost {
             SessionHost {
                 terminal_id: terminal.to_string(),
@@ -2822,7 +2908,7 @@ mod tests {
         ) -> TranscriptBindEnv {
             let mut e = env(t, cfg, true);
             let host_terminal = host.terminal_id.clone();
-            e.session_host = Box::new(move |_| Some(host.clone()));
+            e.session_host = Box::new(move |_| Ok(Some(host.clone())));
             e.session_credential = Box::new(move |terminal, _| {
                 if terminal == host_terminal {
                     credential.clone()
@@ -2877,7 +2963,7 @@ mod tests {
                     .unwrap()
                     .len();
             let term = terminal();
-            let secret = grant(&term);
+            let granted = grant(&term);
             let mk = || {
                 hosted_env(
                     Some(t.clone()),
@@ -2886,7 +2972,7 @@ mod tests {
                     Ok(key.clone()),
                 )
             };
-            let headers = with_proof(bearer(&key), &secret);
+            let headers = with_proof(bearer(&key), &granted.secret);
 
             let (status, v) = call(&headers, &body(&csid), mk).await;
             assert_eq!(status, StatusCode::OK, "{v}");
@@ -2903,7 +2989,6 @@ mod tests {
             assert_eq!(v["coord_session_id"], first_row, "no second row");
             assert_eq!(v["replayed_bytes"], 0);
             assert_eq!(v["replayed_chunks"], 0);
-            forget(&term, &secret);
         }
 
         /// T2: T1 without the proof — today's refusal, now honest about what
@@ -2917,7 +3002,7 @@ mod tests {
             let csid = uuid::Uuid::new_v4().to_string();
             let cfg = config_with(dir.path(), &csid, &wd);
             let term = terminal();
-            let secret = grant(&term);
+            let granted = grant(&term);
             let mk = || {
                 hosted_env(
                     Some(t.clone()),
@@ -2945,7 +3030,7 @@ mod tests {
             let mut pad_key = bearer(&key);
             pad_key.insert(
                 TERMINAL_PROOF_HEADER,
-                crate::session::permission_accept::request_key_for(&secret)
+                crate::session::permission_accept::request_key_for(&granted.secret)
                     .parse()
                     .unwrap(),
             );
@@ -2955,7 +3040,6 @@ mod tests {
                 detail.contains("does not prove the hosting terminal"),
                 "{detail}"
             );
-            forget(&term, &secret);
         }
 
         /// T3, a sibling: B's session is hosted in terminal B, in the same
@@ -2970,19 +3054,20 @@ mod tests {
             let sibling = uuid::Uuid::new_v4().to_string();
             let cfg = config_with(dir.path(), &sibling, &wd);
             let (a, b) = (terminal(), terminal());
-            let (secret_a, secret_b) = (grant(&a), grant(&b));
+            let (granted_a, _granted_b) = (grant(&a), grant(&b));
 
             let e = hosted_env(Some(t), vec![cfg], host(&b, &wd), Ok(key.clone()));
-            let (status, v) =
-                transcript_bind_core(&with_proof(bearer(&key), &secret_a), &body(&sibling), e)
-                    .await;
+            let (status, v) = transcript_bind_core(
+                &with_proof(bearer(&key), &granted_a.secret),
+                &body(&sibling),
+                e,
+            )
+            .await;
             let detail = refused(status, &v, &outbox, &[wd.as_str()]);
             assert!(
                 detail.contains("does not prove the hosting terminal"),
                 "{detail}"
             );
-            forget(&a, &secret_a);
-            forget(&b, &secret_b);
         }
 
         /// T4: a key that is not the hosting terminal's credential (the
@@ -2998,17 +3083,17 @@ mod tests {
             let csid = uuid::Uuid::new_v4().to_string();
             let cfg = config_with(dir.path(), &csid, &wd);
             let term = terminal();
-            let secret = grant(&term);
+            let granted = grant(&term);
 
             let e = hosted_env(Some(t), vec![cfg], host(&term, &wd), Ok(credential));
             let (status, v) =
-                transcript_bind_core(&with_proof(bearer(&key), &secret), &body(&csid), e).await;
+                transcript_bind_core(&with_proof(bearer(&key), &granted.secret), &body(&csid), e)
+                    .await;
             let detail = refused(status, &v, &outbox, &[wd.as_str()]);
             assert!(
                 detail.contains("not the credential of the session's terminal"),
                 "{detail}"
             );
-            forget(&term, &secret);
         }
 
         /// T5: a key minted for ANOTHER terminal, presented with a valid proof
@@ -3027,17 +3112,17 @@ mod tests {
             let csid = uuid::Uuid::new_v4().to_string();
             let cfg = config_with(dir.path(), &csid, &wd);
             let term = terminal();
-            let secret = grant(&term);
+            let granted = grant(&term);
 
             let e = hosted_env(Some(t), vec![cfg], host(&term, &wd), Ok(key.clone()));
             let (status, v) =
-                transcript_bind_core(&with_proof(bearer(&key), &secret), &body(&csid), e).await;
+                transcript_bind_core(&with_proof(bearer(&key), &granted.secret), &body(&csid), e)
+                    .await;
             let detail = refused(status, &v, &outbox, &[wd.as_str()]);
             assert!(
                 detail.contains("belongs to another runner terminal"),
                 "{detail}"
             );
-            forget(&term, &secret);
         }
 
         /// T6: the hosting terminal's credential cannot be named — every
@@ -3051,7 +3136,7 @@ mod tests {
             let csid = uuid::Uuid::new_v4().to_string();
             let cfg = config_with(dir.path(), &csid, &wd);
             let term = terminal();
-            let secret = grant(&term);
+            let granted = grant(&term);
 
             for reason in [
                 "coord_mcp_delivery_unrecorded",
@@ -3064,13 +3149,16 @@ mod tests {
                     host(&term, &wd),
                     Err(reason),
                 );
-                let (status, v) =
-                    transcript_bind_core(&with_proof(bearer(&key), &secret), &body(&csid), e).await;
+                let (status, v) = transcript_bind_core(
+                    &with_proof(bearer(&key), &granted.secret),
+                    &body(&csid),
+                    e,
+                )
+                .await;
                 let detail = refused(status, &v, &outbox, &[wd.as_str()]);
                 assert!(detail.contains(reason), "{detail}");
                 assert!(detail.contains("UNKNOWN"), "{detail}");
             }
-            forget(&term, &secret);
         }
 
         /// T7: the host's OWN per-terminal key needs no proof — the first arm
@@ -3153,18 +3241,20 @@ mod tests {
             let csid = uuid::Uuid::new_v4().to_string();
             let cfg = config_with(dir.path(), &csid, &agent_wd);
             let term = terminal();
-            let secret = grant(&term);
+            let granted = grant(&term);
 
             let e = hosted_env(Some(t), vec![cfg], host(&term, &agent_wd), Ok(device_key));
-            let (status, v) =
-                transcript_bind_core(&with_proof(bearer(&agent_key), &secret), &body(&csid), e)
-                    .await;
+            let (status, v) = transcript_bind_core(
+                &with_proof(bearer(&agent_key), &granted.secret),
+                &body(&csid),
+                e,
+            )
+            .await;
             let detail = refused(status, &v, &outbox, &[agent_wd.as_str()]);
             assert!(
                 detail.contains("not the credential of the session's terminal"),
                 "{detail}"
             );
-            forget(&term, &secret);
         }
 
         /// T11: T1's inputs, but the hosting record cannot vouch for the
@@ -3182,7 +3272,7 @@ mod tests {
             let csid = uuid::Uuid::new_v4().to_string();
             let cfg = config_with(dir.path(), &csid, &wd);
             let term = terminal();
-            let secret = grant(&term);
+            let granted = grant(&term);
 
             for (origin, confirmed_at, says) in [
                 (Some(ORIGIN_RECONCILED), Some(1), "is reconciled,"),
@@ -3203,8 +3293,12 @@ mod tests {
                 record.origin = origin.map(str::to_string);
                 record.confirmed_at = confirmed_at;
                 let e = hosted_env(Some(t.clone()), vec![cfg.clone()], record, Ok(key.clone()));
-                let (status, v) =
-                    transcript_bind_core(&with_proof(bearer(&key), &secret), &body(&csid), e).await;
+                let (status, v) = transcript_bind_core(
+                    &with_proof(bearer(&key), &granted.secret),
+                    &body(&csid),
+                    e,
+                )
+                .await;
                 let detail = refused(status, &v, &outbox, &[wd.as_str()]);
                 assert!(
                     detail.contains(says),
@@ -3215,7 +3309,6 @@ mod tests {
                     "{detail}"
                 );
             }
-            forget(&term, &secret);
         }
 
         /// The terminal proof is evidence of a LOCAL terminal, so the door
@@ -3250,15 +3343,63 @@ mod tests {
             Agent,
         }
 
-        /// T10, production wiring: two terminals spawned in ONE directory that
-        /// declares coord-mcp, through the real seam (`deliver_terminal_coord_mcp`
-        /// records the declared delivery for both), with real grants and a
-        /// real tempdir `SessionLifecycleStore` holding both sessions as open,
-        /// authoritative, confirmed records — and `transcript_bind_env`'s own
-        /// ownership closures. Only the closures that read machine state this
-        /// change does not touch (the transcript gate, the watched dirs, the
-        /// tenant) are pinned. B's session with A's proof is refused and
-        /// writes nothing (T3); A's session with A's proof binds (T1).
+        /// The device's active tenant in the route tests' machine fixture.
+        const ROUTE_TENANT: uuid::Uuid =
+            uuid::Uuid::from_u128(0x7b1d_0000_0000_4000_8000_0000_0000_0001);
+
+        /// The machine state the production route reads besides this door's
+        /// own closures, set the way the machine sets it: the device's active
+        /// tenant in `machine.json`, and coord's answer that transcript sync is
+        /// on for it (an egress pin reads as that answer, on this thread, which
+        /// is where the route asks). The user's own sync toggle stays at its
+        /// shipped default, on.
+        fn route_machine(
+            amb: &crate::test_env::IsolatedAmbient,
+        ) -> crate::egress::test_support::EgressPin {
+            amb.write_active_tenant_id(ROUTE_TENANT);
+            crate::egress::test_support::pin(
+                crate::egress::Flow::TranscriptSync,
+                crate::egress::Level::On,
+            )
+        }
+
+        /// POST through [`transcript_bind_route`] — the door's production entry
+        /// below the axum extraction, every production closure included —
+        /// retrying across the process-global registration kill switch the
+        /// coord_register suite toggles, as [`call`] does for the core.
+        async fn call_route(
+            tailer: &Arc<SessionTranscriptTailer>,
+            lifecycle: Option<&Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>,
+            watched: &[PathBuf],
+            headers: &HeaderMap,
+            body: &[u8],
+        ) -> (StatusCode, serde_json::Value) {
+            for _ in 0..200 {
+                let (status, v) = transcript_bind_route(
+                    Some(tailer.clone()),
+                    lifecycle.cloned(),
+                    watched.to_vec(),
+                    headers,
+                    body,
+                )
+                .await;
+                if status == StatusCode::CONFLICT && v["error"] == "registration_disabled" {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    continue;
+                }
+                return (status, v);
+            }
+            panic!("registration stayed disabled")
+        }
+
+        /// T10, production wiring, entered ONLY through [`transcript_bind_route`]:
+        /// two terminals spawned in ONE directory that declares coord-mcp,
+        /// through the real seam (`deliver_terminal_coord_mcp` records the
+        /// declared delivery for both), with real grants and a real tempdir
+        /// `SessionLifecycleStore` holding both sessions as open, authoritative,
+        /// confirmed records. The request carries the cwd's key and terminal
+        /// A's proof, derived as a client derives it. B's session is refused
+        /// and nothing is written (T3); A's session binds (T1).
         async fn production_wiring(
             amb: &crate::test_env::IsolatedAmbient,
             writer: CwdWriter,
@@ -3267,6 +3408,7 @@ mod tests {
             use crate::session::session_lifecycle_store::{
                 test_open_record, SessionLifecycleStore, ORIGIN_AUTHORITATIVE,
             };
+            let _sync_on = route_machine(amb);
             let wd = fresh_workdir(amb.dir());
             match writer {
                 CwdWriter::Device => {
@@ -3288,7 +3430,6 @@ mod tests {
                 "the document this test reads is not the shape it names: {doc}"
             );
             let key = cwd_key(&wd);
-            assert_eq!(crate::coord_mcp::terminal_id_for_nonce(&key), None);
             let (a, b) = (terminal(), terminal());
             for term in [&a, &b] {
                 let delivered =
@@ -3299,7 +3440,7 @@ mod tests {
                     crate::coord_mcp::CoordMcpDelivery::WorkdirDeclared
                 );
             }
-            let (secret_a, secret_b) = (grant(&a), grant(&b));
+            let (granted_a, _granted_b) = (grant(&a), grant(&b));
 
             let state_dir = amb
                 .dir()
@@ -3319,30 +3460,23 @@ mod tests {
                 rec.confirmed_at = Some(1);
                 store.record_open(rec);
             }
-            let cfg = config_with(&state_dir, &csid_a, &wd);
+            let watched = vec![config_with(&state_dir, &csid_a, &wd)];
             config_with(&state_dir, &csid_b, &wd);
             let (t, outbox) = tailer(&state_dir);
-            let mk = || {
-                let mut e = transcript_bind_env(Some(t.clone()), Some(store.clone()));
-                e.transcript_gate = Box::new(|_| crate::egress::TranscriptGate::Open);
-                e.watched_config_dirs = vec![cfg.clone()];
-                e.session_tenant = Box::new(|_| Ok(None));
-                e
-            };
-            let proof_a = with_proof(bearer(&key), &secret_a);
+            let proof_a = with_proof(bearer(&key), &granted_a.secret);
 
-            let (status, v) = transcript_bind_core(&proof_a, &body(&csid_b), mk()).await;
+            let (status, v) =
+                call_route(&t, Some(&store), &watched, &proof_a, &body(&csid_b)).await;
             let detail = refused(status, &v, &outbox, &[wd.as_str()]);
             assert!(
                 detail.contains("does not prove the hosting terminal"),
                 "{writer:?}: {detail}"
             );
 
-            let (status, v) = call(&proof_a, &body(&csid_a), mk).await;
+            let (status, v) =
+                call_route(&t, Some(&store), &watched, &proof_a, &body(&csid_a)).await;
             assert_eq!(status, StatusCode::OK, "{writer:?}: {v}");
             assert_eq!(v["bound"], true);
-            forget(&a, &secret_a);
-            forget(&b, &secret_b);
         }
 
         /// Force the stdio document every observed case presents (a
@@ -3390,6 +3524,67 @@ mod tests {
             let amb = crate::test_env::isolated_ambient();
             let _gate = open_stdio_gate(&amb);
             production_wiring(&amb, CwdWriter::Agent, true).await;
+        }
+
+        /// T12: a host lookup that cannot be read is UNKNOWN and refuses — even
+        /// where the cwd arm WOULD admit (the session's JSONL `cwd` is the
+        /// key's workdir) — for each reason the production lookup gives.
+        #[tokio::test]
+        async fn t12_an_unreadable_host_lookup_refuses_instead_of_taking_the_cwd_arm() {
+            let dir = tempfile::tempdir().unwrap();
+            let (t, outbox) = tailer(dir.path());
+            let (key, wd) = shared_cwd_key(dir.path());
+            let csid = uuid::Uuid::new_v4().to_string();
+            let cfg = config_with(dir.path(), &csid, &wd);
+            for reason in ["lifecycle_store_unavailable", "lifecycle_store_unreadable"] {
+                let mut e = env(Some(t.clone()), vec![cfg.clone()], true);
+                e.session_host = Box::new(move |_| Err(reason));
+                let (status, v) = transcript_bind_core(&bearer(&key), &body(&csid), e).await;
+                let detail = refused(status, &v, &outbox, &[wd.as_str()]);
+                assert!(detail.contains(reason), "{detail}");
+                assert!(detail.contains("UNKNOWN"), "{detail}");
+            }
+            // The control: the same request, with a lookup that answers "not
+            // hosted", IS the cwd arm's, and binds.
+            let (status, v) = call(&bearer(&key), &body(&csid), || {
+                env(Some(t.clone()), vec![cfg.clone()], true)
+            })
+            .await;
+            assert_eq!(status, StatusCode::OK, "{v}");
+        }
+
+        /// T12 through the production route: a runner with NO lifecycle store
+        /// refuses with the UNKNOWN detail rather than reading every session as
+        /// unhosted. The control: with a store that holds no record for the
+        /// session, the same request is the cwd arm's and binds.
+        #[tokio::test]
+        async fn t12_a_runner_with_no_lifecycle_store_refuses_through_the_route() {
+            use crate::session::session_lifecycle_store::SessionLifecycleStore;
+            let amb = crate::test_env::isolated_ambient();
+            let _sync_on = route_machine(&amb);
+            let wd = fresh_workdir(amb.dir());
+            crate::coord_mcp::write_coord_mcp_proxy_config(&wd, PORT, None);
+            let key = cwd_key(&wd);
+            let bound = crate::coord_mcp::workdir_for_nonce(&key).expect("workdir");
+            let state_dir = amb
+                .dir()
+                .join(format!("state-{}", uuid::Uuid::new_v4().simple()));
+            let csid = uuid::Uuid::new_v4().to_string();
+            let watched = vec![config_with(&state_dir, &csid, &bound)];
+            let (t, outbox) = tailer(&state_dir);
+
+            let (status, v) = call_route(&t, None, &watched, &bearer(&key), &body(&csid)).await;
+            let detail = refused(status, &v, &outbox, &[wd.as_str(), bound.as_str()]);
+            assert!(detail.contains("lifecycle_store_unavailable"), "{detail}");
+            assert!(detail.contains("UNKNOWN"), "{detail}");
+
+            let store = Arc::new(
+                SessionLifecycleStore::open(state_dir.join("terminal-sessions.json")).unwrap(),
+            );
+            let (status, v) =
+                call_route(&t, Some(&store), &watched, &bearer(&key), &body(&csid)).await;
+            assert_eq!(status, StatusCode::OK, "{v}");
+            assert_eq!(v["bound"], true);
         }
     }
 

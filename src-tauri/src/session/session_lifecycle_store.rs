@@ -3725,6 +3725,24 @@ impl SessionLifecycleStore {
         }
     }
 
+    /// [`Self::get`] for a caller that must tell "no record" from "the store
+    /// could not be read": `Err` when the lock is poisoned, where `get` answers
+    /// `None`. An authorization decision reads this one (`POST
+    /// /sessions/transcript-bind`'s hosting check), so an unreadable store
+    /// refuses instead of reading as "no terminal hosts this session".
+    pub fn try_get(
+        &self,
+        claude_session_id: &str,
+    ) -> Result<Option<TerminalSessionRecord>, &'static str> {
+        match self.map.lock() {
+            Ok(m) => Ok(m.get(claude_session_id).cloned()),
+            Err(e) => {
+                warn!(error = %e, "session_lifecycle_store: lock poisoned on try_get");
+                Err("lifecycle_store_unreadable")
+            }
+        }
+    }
+
     /// Clone of every record whose `state == "open"`.
     pub fn open_records(&self) -> Vec<TerminalSessionRecord> {
         match self.map.lock() {
@@ -6185,6 +6203,42 @@ mod tests {
         let mut m: HashMap<String, TerminalSessionRecord> = serde_json::from_slice(&raw).unwrap();
         edit(&mut m);
         std::fs::write(path, serde_json::to_vec_pretty(&m).unwrap()).unwrap();
+    }
+
+    /// `try_get` keeps apart what `get` collapses: a record, no record, and a
+    /// store that cannot be read (a poisoned lock). The third is never
+    /// `Ok(None)`, so the transcript-bind door refuses on it rather than
+    /// reading the session as unhosted.
+    #[test]
+    fn try_get_tells_an_unreadable_store_from_a_missing_record() {
+        let dir = tempdir().unwrap();
+        let store = std::sync::Arc::new(
+            SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap(),
+        );
+        store.record_open(rec("present"));
+        assert_eq!(
+            store
+                .try_get("present")
+                .unwrap()
+                .map(|r| r.claude_session_id),
+            Some("present".to_string())
+        );
+        assert!(store.try_get("absent").unwrap().is_none());
+
+        let poisoner = store.clone();
+        let _ = std::thread::spawn(move || {
+            let _held = poisoner.map.lock().unwrap();
+            panic!("poison the lifecycle map (test)");
+        })
+        .join();
+        assert_eq!(
+            store.try_get("present").unwrap_err(),
+            "lifecycle_store_unreadable"
+        );
+        assert!(
+            store.get("present").is_none(),
+            "get still collapses an unreadable store to None"
+        );
     }
 
     // ── Write-ahead log (Phase 6, B1) ───────────────────────────────────────

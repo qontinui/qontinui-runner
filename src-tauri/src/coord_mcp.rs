@@ -684,8 +684,9 @@ fn loopback_handshake_key() -> Option<&'static str> {
 /// Constant-time byte equality. Deliberately NOT `==`: a short-circuiting
 /// comparison on a secret leaks its prefix through timing, and this route is
 /// reachable by any local process, so the oracle is genuinely available.
-/// Backed by `subtle`, already a dependency.
-fn secret_eq(a: &[u8], b: &[u8]) -> bool {
+/// Backed by `subtle`, already a dependency. Shared: the transcript-bind door's
+/// key and terminal-proof checks use it too.
+pub(crate) fn secret_eq(a: &[u8], b: &[u8]) -> bool {
     use subtle::ConstantTimeEq;
     // `ct_eq` requires equal lengths; the length itself is not a secret (the
     // key is a fixed-width hex string), so comparing it first is safe and is

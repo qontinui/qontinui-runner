@@ -18,6 +18,16 @@
 //! terminal a previous runner process spawned) holds none: every proof for it
 //! fails closed.
 //!
+//! ## What it does not stop
+//!
+//! The proof is only as strong as same-user process isolation, exactly like
+//! the permission pad's request key it sits beside. The secret lives in the
+//! terminal's environment, and a process of the same OS user can read another
+//! process's environment (`/proc/<pid>/environ` on Linux). So a door key
+//! separates one runner terminal from its siblings and from other users; it
+//! does not stand against a hostile process running as the same user, which
+//! could read the secret and derive the key itself.
+//!
 //! ## The derivation
 //!
 //! ```text
@@ -42,7 +52,9 @@
 //! (the plan's Phase 3): it derives the same key from `$QONTINUI_PERMREQ_NONCE`
 //! in its own environment and sends it as `X-Qontinui-Terminal-Proof`. The
 //! variable name ([`NONCE_ENV`]), [`LABEL`] and the separator are therefore a
-//! cross-repo contract, and both suites pin the SAME vector:
+//! cross-repo contract. This module's tests pin the vector below as a literal,
+//! and that client's suite pins the same vector in qontinui-claude-config PR
+//! #2399, not yet on its main:
 //! nonce `0123456789abcdef0123456789abcdef`, door `transcript-bind` →
 //! `300c88aed1868f359db36f35beb3b1cec8bd0a32494f57ad8cb28bf38f55b3f7`.
 //! A change to any of the three must land in both repos.
@@ -67,7 +79,7 @@ pub fn terminal_door_key_for(door: &str, nonce: &str) -> String {
 }
 
 /// Whether `presented` is `terminal_id`'s door key for `door`, compared in
-/// constant time.
+/// constant time ([`crate::coord_mcp::secret_eq`]).
 ///
 /// `false` when nothing was presented, and `false` for a terminal this runner
 /// process holds no grant for — never registered (it did not spawn the
@@ -81,23 +93,17 @@ pub fn terminal_door_key_matches(terminal_id: &str, door: &str, presented: Optio
     let Some(nonce) = crate::session::permission_accept::terminal_grant_nonce(terminal_id) else {
         return false;
     };
-    secret_eq(presented, &terminal_door_key_for(door, &nonce))
-}
-
-/// Constant-time equality of two secrets. Deliberately NOT `==`: a
-/// short-circuiting compare leaks the matching prefix through timing to any
-/// local caller of the door. The length is compared first and is not a secret
-/// (every secret compared here is fixed-width).
-pub(crate) fn secret_eq(a: &str, b: &str) -> bool {
-    use subtle::ConstantTimeEq as _;
-    a.len() == b.len() && bool::from(a.as_bytes().ct_eq(b.as_bytes()))
+    crate::coord_mcp::secret_eq(
+        presented.as_bytes(),
+        terminal_door_key_for(door, &nonce).as_bytes(),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::session::permission_accept::{
-        forget_terminal_grant, register_terminal_grant, request_key_for,
+        forget_terminal_grant, new_nonce, register_terminal_grant, request_key_for,
     };
 
     /// The shared vector's nonce — also the one the client suite pins.
@@ -112,6 +118,28 @@ mod tests {
     /// A terminal id no other test (or test run) shares.
     fn terminal() -> String {
         format!("door-key-test-{}", uuid::Uuid::new_v4())
+    }
+
+    /// A grant this test registered for a fresh terminal, forgotten when the
+    /// guard drops — on a failing assertion's unwind too, so a red test never
+    /// leaves a slot behind in the process-wide grant registry.
+    struct Granted {
+        terminal: String,
+        nonce: String,
+    }
+
+    impl Granted {
+        fn new() -> Self {
+            let (terminal, nonce) = (terminal(), new_nonce());
+            register_terminal_grant(&terminal, nonce.clone(), None);
+            Granted { terminal, nonce }
+        }
+    }
+
+    impl Drop for Granted {
+        fn drop(&mut self) {
+            forget_terminal_grant(&self.terminal, &self.nonce);
+        }
     }
 
     #[test]
@@ -145,25 +173,31 @@ mod tests {
     /// only while presented.
     #[test]
     fn the_terminals_own_door_key_matches() {
-        let (term, nonce) = (terminal(), crate::session::permission_accept::new_nonce());
-        register_terminal_grant(&term, nonce.clone(), None);
-        let key = terminal_door_key_for(VECTOR_DOOR, &nonce);
-        assert!(terminal_door_key_matches(&term, VECTOR_DOOR, Some(&key)));
+        let g = Granted::new();
+        let key = terminal_door_key_for(VECTOR_DOOR, &g.nonce);
+        assert!(terminal_door_key_matches(
+            &g.terminal,
+            VECTOR_DOOR,
+            Some(&key)
+        ));
         assert!(!terminal_door_key_matches(
-            &term,
+            &g.terminal,
             "another-door",
             Some(&key)
         ));
-        assert!(!terminal_door_key_matches(&term, VECTOR_DOOR, None));
+        assert!(!terminal_door_key_matches(&g.terminal, VECTOR_DOOR, None));
         // The pad's request key is not a door key.
         assert!(!terminal_door_key_matches(
-            &term,
+            &g.terminal,
             VECTOR_DOOR,
-            Some(&request_key_for(&nonce))
+            Some(&request_key_for(&g.nonce))
         ));
         // The raw secret is not a door key either.
-        assert!(!terminal_door_key_matches(&term, VECTOR_DOOR, Some(&nonce)));
-        forget_terminal_grant(&term, &nonce);
+        assert!(!terminal_door_key_matches(
+            &g.terminal,
+            VECTOR_DOOR,
+            Some(&g.nonce)
+        ));
     }
 
     /// A terminal this process never spawned, or one whose grant was
@@ -171,24 +205,21 @@ mod tests {
     /// nonce WOULD derive.
     #[test]
     fn a_forgotten_or_never_registered_terminal_is_not_proven() {
-        let nonce = crate::session::permission_accept::new_nonce();
-        let key = terminal_door_key_for(VECTOR_DOOR, &nonce);
-
         let never = terminal();
+        let key = terminal_door_key_for(VECTOR_DOOR, &new_nonce());
         assert!(!terminal_door_key_matches(&never, VECTOR_DOOR, Some(&key)));
 
-        let forgotten = terminal();
-        register_terminal_grant(&forgotten, nonce.clone(), None);
+        let forgotten = Granted::new();
+        let (term, key) = (
+            forgotten.terminal.clone(),
+            terminal_door_key_for(VECTOR_DOOR, &forgotten.nonce),
+        );
         assert!(
-            terminal_door_key_matches(&forgotten, VECTOR_DOOR, Some(&key)),
+            terminal_door_key_matches(&term, VECTOR_DOOR, Some(&key)),
             "the control: registered, it matches"
         );
-        forget_terminal_grant(&forgotten, &nonce);
-        assert!(!terminal_door_key_matches(
-            &forgotten,
-            VECTOR_DOOR,
-            Some(&key)
-        ));
+        drop(forgotten);
+        assert!(!terminal_door_key_matches(&term, VECTOR_DOOR, Some(&key)));
     }
 
     /// Terminal B's door key does not prove terminal A, though both are live
@@ -196,29 +227,16 @@ mod tests {
     /// on.
     #[test]
     fn another_terminals_key_does_not_match() {
-        let (a, b) = (terminal(), terminal());
-        let (nonce_a, nonce_b) = (
-            crate::session::permission_accept::new_nonce(),
-            crate::session::permission_accept::new_nonce(),
-        );
-        register_terminal_grant(&a, nonce_a.clone(), None);
-        register_terminal_grant(&b, nonce_b.clone(), None);
-        let key_b = terminal_door_key_for(VECTOR_DOOR, &nonce_b);
-        assert!(!terminal_door_key_matches(&a, VECTOR_DOOR, Some(&key_b)));
+        let (a, b) = (Granted::new(), Granted::new());
+        let key_b = terminal_door_key_for(VECTOR_DOOR, &b.nonce);
+        assert!(!terminal_door_key_matches(
+            &a.terminal,
+            VECTOR_DOOR,
+            Some(&key_b)
+        ));
         assert!(
-            terminal_door_key_matches(&b, VECTOR_DOOR, Some(&key_b)),
+            terminal_door_key_matches(&b.terminal, VECTOR_DOOR, Some(&key_b)),
             "the control: it does prove its own terminal"
         );
-        forget_terminal_grant(&a, &nonce_a);
-        forget_terminal_grant(&b, &nonce_b);
-    }
-
-    #[test]
-    fn secret_eq_compares_whole_values() {
-        assert!(secret_eq("abc", "abc"));
-        assert!(!secret_eq("abc", "abd"));
-        assert!(!secret_eq("abc", "abcd"));
-        assert!(!secret_eq("", "a"));
-        assert!(secret_eq("", ""));
     }
 }
