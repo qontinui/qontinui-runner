@@ -54,7 +54,9 @@ use serde::Serialize;
 use tracing::{info, warn};
 
 use crate::session::session_ledger::{observe_row, LiveView, LiveViewGap, Observed};
-use crate::session::session_lifecycle_store::{SessionLifecycleStore, TerminalSessionRecord};
+use crate::session::session_lifecycle_store::{
+    SessionLifecycleStore, TerminalSessionRecord, RESTORE_TIER_RESUMED, RESTORE_TIER_TERMINAL_ONLY,
+};
 use crate::session::shutdown_marker::BootClassification;
 use crate::session::snapshot_history::{is_restorable_identity, TranscriptProbe};
 
@@ -410,8 +412,9 @@ pub fn diff_census(
     // place (terminal, zone) and boot stamp (tier, boot time) come only from
     // rows observed EXACTLY as the merged verdict, so neither can contradict
     // it: the place from the first such OPEN row (a closed row only when every
-    // such row is closed), the stamp from the merged row itself when it has
-    // one, else from the first such row that does. `observe_restored` carries
+    // such row is closed), the stamp from the merged row itself when its tier
+    // names the entry's bucket, else from the first such row whose tier does,
+    // else none. `observe_restored` carries
     // only THIS boot's stamps, so no fallback can reach a previous boot's.
     let mut best: Vec<&RestoredObservation> = Vec::new();
     let mut slot: HashMap<String, usize> = HashMap::new();
@@ -472,17 +475,18 @@ pub fn diff_census(
                 .filter(|o| key(&o.claude_session_id) == id && o.observed == obs.observed)
         };
         let place = same_verdict().find(|o| o.open).unwrap_or(obs);
-        let stamped = if obs.restore_tier.is_some() {
-            obs
-        } else {
-            same_verdict().find(|o| o.restore_tier.is_some()).unwrap_or(obs)
-        };
+        // Only a stamp whose tier NAMES this entry's bucket labels it — a
+        // `failed` row whose `claude` later came back reads Back, but its tier
+        // says the restore did not land, so it labels nothing here.
+        let bucket_tier = if verified { RESTORE_TIER_RESUMED } else { RESTORE_TIER_TERMINAL_ONLY };
+        let names_bucket = |o: &&RestoredObservation| o.restore_tier.as_deref() == Some(bucket_tier);
+        let stamped = std::iter::once(obs).chain(same_verdict()).find(names_bucket);
         let row = CensusRestored {
             claude_session_id: obs.claude_session_id.clone(),
             terminal_id: bound_terminal_id(&place.terminal_id),
             zone_index: place.zone_index,
-            restore_tier: stamped.restore_tier.clone(),
-            restored_from_boot_at: stamped.restored_from_boot_at,
+            restore_tier: stamped.and_then(|o| o.restore_tier.clone()),
+            restored_from_boot_at: stamped.and_then(|o| o.restored_from_boot_at),
         };
         if verified {
             restored.push(row);
@@ -944,6 +948,24 @@ mod tests {
             assert_eq!(r.terminal_id.as_deref(), Some("term-verified"), "{d:?}");
             assert_eq!(r.restore_tier.as_deref(), Some(RESTORE_TIER_RESUMED), "{d:?}");
             assert_eq!(r.restored_from_boot_at, Some(2), "{d:?}");
+        }
+    }
+
+    /// A `failed` stamp on a row whose `claude` later came back (it reads Back)
+    /// never labels a restored entry: the label is only ever `resumed`.
+    #[test]
+    fn a_restored_entry_is_never_labelled_with_a_failed_tier() {
+        let exp = [expected("a", true)];
+        let mut failed_back = observed("a", RESTORE_TIER_FAILED);
+        failed_back.observed = Some(Observed::Back);
+        let mut adopted = observed("a", RESTORE_TIER_RESUMED);
+        adopted.restore_tier = None;
+        adopted.restored_from_boot_at = None;
+        for rows in [vec![adopted.clone(), failed_back.clone()], vec![failed_back, adopted]] {
+            let d = diff_census(&exp, &rows, Some(true), None);
+            assert_eq!(d.restored.len(), 1, "{d:?}");
+            assert_eq!(d.restored[0].restore_tier, None, "{d:?}");
+            assert_eq!(d.restored[0].restored_from_boot_at, None, "{d:?}");
         }
     }
 
