@@ -9093,7 +9093,9 @@ mod tests {
             json!({"finish_reason": "   "}),
         ] {
             assert!(
-                finished_body(&payload)["progress"].get("finish_reason").is_none(),
+                finished_body(&payload)["progress"]
+                    .get("finish_reason")
+                    .is_none(),
                 "{payload}"
             );
         }
