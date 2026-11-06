@@ -18,6 +18,11 @@
 //! | `GET /plan-library/artifacts/{id}/export` | `GET {web}/api/v1/plan-library/{id}/export` (**raw**) | no |
 //! | `GET /plan-library/divergent` | `GET {web}/api/v1/plan-library/divergent` | no |
 //! | `GET /plan-library/scan-roots` | `GET {web}/api/v1/plan-library/scan-roots` | no |
+//! | `GET /plan-library/followups` | `GET {web}/api/v1/plan-library/followups?…` (query verbatim) | no |
+//! | `POST /plan-library/followups/match` | `POST {web}/api/v1/plan-library/followups/match` (a read) | no |
+//! | `PUT /plan-library/edges/{id}/anchors` | `PUT {web}/api/v1/plan-library/edges/{id}/anchors` | **yes** |
+//! | `POST /plan-library/edges/{id}/resolution` | `POST {web}/api/v1/plan-library/edges/{id}/resolution` | **yes** |
+//! | `POST /plan-library/followups/reconcile` | `POST {web}/api/v1/plan-library/followups/reconcile` | **yes** |
 //!
 //! **This table is the doc-of-record for this door.** One row per forwarded
 //! route, its upstream `{web}` path, and whether it is a write; a forward
@@ -40,6 +45,17 @@
 //! contract it serves is precisely "these bytes hash to that digest", and an
 //! envelope would re-encode the only thing being attested. See
 //! [`upstream_get_raw`].
+//!
+//! The five follow-up rows land plan
+//! `2026-10-10-small-followups-are-recorded-but-nothing-burns-them-down`
+//! Phase 4. Their handlers live in the child module [`followups`] — this file
+//! is past the size where a new family belongs in it — and are composed into
+//! [`route_entries`] and [`routes`] here. Unlike the reads above they forward
+//! path, query, body and status VERBATIM, query included: every upstream
+//! plan-library route refuses an unknown query key with a loud 422, and an
+//! allowlist here would turn that refusal back into a silently widened read.
+//! `POST /plan-library/followups/match` is a read carried as a POST (its path
+//! set rides in the body), so it is the one open row that is not a GET.
 //!
 //! The by-id read closes the loop the two list reads left open (plan
 //! `2026-08-27-plan-corpus-read-path-is-dark` Phase 2): `search → id → body`
@@ -86,7 +102,7 @@
 //! `2026-09-03-plan-library-write-door-nonce-authorized-and-body-sync-on-by-default`)
 //!
 //! ```text
-//! POST /plan-library/artifacts  |  POST /plan-library/links
+//! every row of the table above whose last column is **yes**
 //!   ├─ Authorization: Bearer <nonce> / X-Coord-Mcp-Proxy-Key resolves a principal?  ──no──> 401 COORD_MCP_PROXY_UNAUTHORIZED
 //!   ├─ QONTINUI_PLAN_LIBRARY_WRITE != "0"  (absent ⇒ enabled)                        ──no──> 403 PLAN_LIBRARY_WRITE_KILLED
 //!   ├─ coord has answered this process's plan_capture poll                           ──no──> 403 PLAN_LIBRARY_DIAL_UNANSWERED
@@ -122,6 +138,12 @@ use std::sync::{Arc, OnceLock};
 
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 use qontinui_runner_lib::plan_workunit_adapter::body_push::ArtifactUpsert;
+
+/// The follow-up family (plan
+/// `2026-10-10-small-followups-are-recorded-but-nothing-burns-them-down`
+/// Phase 4): five verbatim forwards, composed into [`route_entries`],
+/// [`routes`], `writeVocabulary` and `writeCorrection` below.
+mod followups;
 
 type ApiResult = Result<Json<ApiResponse<Value>>, (StatusCode, Json<ApiResponse<()>>)>;
 
@@ -310,6 +332,18 @@ fn nonce_unauthorized_error(nonce: Option<&str>) -> (StatusCode, Json<ApiRespons
     coded_error(StatusCode::UNAUTHORIZED, CODE_PROXY_UNAUTHORIZED, error)
 }
 
+/// Every nonce-authorized route on this door as `METHOD /path`, rendered from
+/// [`route_entries`] — so a refusal or an instruction that names "the writes"
+/// cannot omit one the table gained (the follow-up family added three).
+fn write_routes_phrase() -> String {
+    route_entries()
+        .iter()
+        .filter(|(_, _, requires_a_nonce)| *requires_a_nonce)
+        .map(|(method, path, _)| format!("{method} {path}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Layer 2 refused: the machine's kill switch is engaged. Names the variable
 /// and the one spelling that engages it.
 fn write_killed_error() -> (StatusCode, Json<ApiResponse<()>>) {
@@ -318,12 +352,12 @@ fn write_killed_error() -> (StatusCode, Json<ApiResponse<()>>) {
         CODE_WRITE_KILLED,
         format!(
             "the plan-library write door is KILLED on this machine: {PLAN_LIBRARY_WRITE_FLAG}=0 \
-             is set in the runner's environment. POST /plan-library/artifacts, \
-             POST /plan-library/links, and DELETE / PUT /plan-library/links/{{id}} refuse \
-             until it is unset (absent means on; only the \
+             is set in the runner's environment. Every nonce-authorized write ({writes}) \
+             refuses until it is unset (absent means on; only the \
              exact value \"0\" kills) — the switch is read per request, so no restart is \
              needed. GET /plan-library/search and GET /plan-library/candidates work \
-             regardless and advertise this switch."
+             regardless and advertise this switch.",
+            writes = write_routes_phrase()
         ),
     )
 }
@@ -436,9 +470,12 @@ fn write_capability() -> serde_json::Map<String, Value> {
     let level = dial_level();
     let scope = crate::mcp::fleet_policy_poller::effective_plan_capture_scope();
     let enabled = flag_on && dial;
+    // Rendered from the route table, so the instruction names every write the
+    // door has — it named two of four before the follow-up family added three.
+    let writes = write_routes_phrase();
     let instruction = if enabled {
         format!(
-            "POST /plan-library/artifacts and POST /plan-library/links are ENABLED: the \
+            "The nonce-authorized writes ({writes}) are ENABLED: the \
              machine kill switch ({PLAN_LIBRARY_WRITE_FLAG}) is not engaged and the tenant's \
              plan_capture dial is `{level}`. Send the coord-mcp proxy nonce from this \
              session's .mcp.json as `Authorization: Bearer <nonce>` — a request without a \
@@ -446,14 +483,14 @@ fn write_capability() -> serde_json::Map<String, Value> {
         )
     } else if !flag_on {
         format!(
-            "POST /plan-library/artifacts and POST /plan-library/links are DISABLED and will \
+            "The nonce-authorized writes ({writes}) are DISABLED and will \
              403 {CODE_WRITE_KILLED}: {PLAN_LIBRARY_WRITE_FLAG}=0 is set in the runner's \
              environment (the machine kill switch; absent means on). Unset it — it is read per \
              request, no restart needed. These read routes work regardless."
         )
     } else if !answered {
         format!(
-            "POST /plan-library/artifacts and POST /plan-library/links are HELD and will 403 \
+            "The nonce-authorized writes ({writes}) are HELD and will 403 \
              {CODE_DIAL_UNANSWERED}: coord has not yet answered this runner's plan_capture \
              poll (the dial defaults to `{level}`, but writes wait for coord so an explicit \
              `off` can win). It clears on the first successful poll. These read routes work \
@@ -461,7 +498,7 @@ fn write_capability() -> serde_json::Map<String, Value> {
         )
     } else {
         format!(
-            "POST /plan-library/artifacts and POST /plan-library/links are DISABLED and will \
+            "The nonce-authorized writes ({writes}) are DISABLED and will \
              403 {CODE_DIAL_OFF}: the tenant's plan_capture fleet dial reads `{level}`, not \
              `record`. Set it at /admin/coord/plan-library; it is re-polled every 45s. These \
              read routes work regardless."
@@ -529,14 +566,21 @@ fn write_capability() -> serde_json::Map<String, Value> {
 /// [`EdgeRelation`], `kind` from
 /// [`qontinui_runner_lib::plan_workunit_adapter::body_push::ArtifactKind`]
 /// (rendered through its `as_str()`; the adapter owns that enum and it carries
-/// no serde derives). One object rather than one sibling key per field, so a
-/// further closed field is one more entry here, not a second key describing the
-/// same concept.
+/// no serde derives), and the follow-up family's `size_class` and
+/// `resolution` from its own two enums ([`followups`]). One object rather than
+/// one sibling key per field, so a further closed field is one more entry
+/// here, not a second key describing the same concept.
 fn write_vocabulary() -> Value {
     use qontinui_runner_lib::plan_workunit_adapter::body_push::ArtifactKind;
     let relation: Vec<&str> = EdgeRelation::ALL.iter().map(|r| r.as_str()).collect();
     let kind: Vec<&str> = ArtifactKind::ALL.iter().map(|k| k.as_str()).collect();
-    serde_json::json!({ "relation": relation, "kind": kind })
+    let mut vocabulary = serde_json::Map::new();
+    vocabulary.insert("relation".to_string(), Value::from(relation));
+    vocabulary.insert("kind".to_string(), Value::from(kind));
+    for (field, values) in followups::write_vocabulary_entries() {
+        vocabulary.insert(field.to_string(), values);
+    }
+    Value::Object(vocabulary)
 }
 
 /// The qontinui-web PR that adds the upstream route the loopback
@@ -571,10 +615,17 @@ fn write_correction() -> Value {
          Until both exist, a wrong `kind` is PERMANENT through this door. `writeVocabulary.kind` \
          only rules out an INVALID kind; a valid-but-wrong kind is the permanent case, so choose \
          it deliberately.";
-    serde_json::json!({
-        "/plan-library/links": links,
-        "/plan-library/artifacts": artifacts,
-    })
+    let mut correction = serde_json::Map::new();
+    correction.insert("/plan-library/links".to_string(), Value::from(links));
+    correction.insert(
+        "/plan-library/artifacts".to_string(),
+        Value::from(artifacts),
+    );
+    // The follow-up family's three write doors, one entry each.
+    for (door, posture) in followups::write_correction_entries() {
+        correction.insert(door.to_string(), posture);
+    }
+    Value::Object(correction)
 }
 
 /// The advertised write contract: the rules a driver cannot infer from the
@@ -627,6 +678,18 @@ stored values — send `\"\"` / `[]` explicitly to mean empty. \
 `work_unit_slug`, `authored_at` and `source_path` are replaced the same way (null clears). \
 `source_path` is read only from the runner's configured plans/prompts/workspace \
 directories; anything else must be sent inline as `body`. \
+The follow-up routes forward path, query, body and status VERBATIM, so their request shapes \
+are the web routes' own: `PUT /plan-library/edges/{id}/anchors`, \
+`POST /plan-library/edges/{id}/resolution` and `POST /plan-library/followups/reconcile` are \
+writes behind the same three layers; `GET /plan-library/followups` and \
+`POST /plan-library/followups/match` are reads and take no nonce. \
+`writeVocabulary.size_class` and `writeVocabulary.resolution` are the closed sets of a \
+follow-up's `size_class` and stored closure state (an open follow-up has none); this door \
+does not refuse other values itself — the web route answers 422 outside its request model \
+and 409 outside its legal-transition table. A follow-up route the deployed web backend does \
+not serve yet answers 404 or 405, forwarded unchanged. Any failure of the match read means \
+the match is UNKNOWN — a web backend that does not answer is 502 \
+PLAN_LIBRARY_WEB_UNREACHABLE, never an empty match. \
 `bodySyncEnabled` reports this device's plan-library BODY SYNC — the loop that captures \
 plan bodies from disk, a different switch from the write door above — as \
 `bodySyncFlag` was \"read once at spawn (unlike the write-door kill switch, which is \
@@ -2005,25 +2068,33 @@ pub async fn scan_roots_handler() -> ReadResult {
     Ok(Json(ApiResponse::success(with_write_capability(upstream))))
 }
 
-/// The door's route table, as data: `(method, path, requires_a_nonce)`.
+/// The door's route table, as data: `(method, path, requires_a_nonce)` — this
+/// file's rows, then the follow-up family's ([`followups`]).
 ///
 /// `Router` has no public introspection, so the gating split — writes
 /// nonce-authorized (and behind the kill switch and the dial), reads open —
 /// would otherwise be untestable. Keep in lockstep with the `.route(` calls in
-/// [`routes`]; the test below pins the count.
+/// [`routes`] and in the family's own registration; the tests below pin the
+/// count against both.
 pub fn route_entries() -> &'static [(&'static str, &'static str, bool)] {
-    &[
-        ("POST", "/plan-library/artifacts", true),
-        ("POST", "/plan-library/links", true),
-        ("DELETE", "/plan-library/links/{id}", true),
-        ("PUT", "/plan-library/links/{id}", true),
-        ("GET", "/plan-library/search", false),
-        ("GET", "/plan-library/candidates", false),
-        ("GET", "/plan-library/artifacts/{id}", false),
-        ("GET", "/plan-library/artifacts/{id}/export", false),
-        ("GET", "/plan-library/divergent", false),
-        ("GET", "/plan-library/scan-roots", false),
-    ]
+    static ENTRIES: OnceLock<Vec<(&'static str, &'static str, bool)>> = OnceLock::new();
+    ENTRIES.get_or_init(|| {
+        [
+            ("POST", "/plan-library/artifacts", true),
+            ("POST", "/plan-library/links", true),
+            ("DELETE", "/plan-library/links/{id}", true),
+            ("PUT", "/plan-library/links/{id}", true),
+            ("GET", "/plan-library/search", false),
+            ("GET", "/plan-library/candidates", false),
+            ("GET", "/plan-library/artifacts/{id}", false),
+            ("GET", "/plan-library/artifacts/{id}/export", false),
+            ("GET", "/plan-library/divergent", false),
+            ("GET", "/plan-library/scan-roots", false),
+        ]
+        .into_iter()
+        .chain(followups::ROUTE_ENTRIES)
+        .collect()
+    })
 }
 
 pub fn routes() -> Router<Arc<ApiState>> {
@@ -2043,6 +2114,7 @@ pub fn routes() -> Router<Arc<ApiState>> {
         )
         .route("/plan-library/divergent", get(divergent_handler))
         .route("/plan-library/scan-roots", get(scan_roots_handler))
+        .merge(followups::routes())
 }
 
 // ===========================================================================
@@ -3079,7 +3151,9 @@ mod tests {
                 .expect("writeVocabulary is an object keyed by field");
             let mut fields: Vec<&str> = vocab.keys().map(String::as_str).collect();
             fields.sort_unstable();
-            assert_eq!(fields, ["kind", "relation"]);
+            // `size_class` and `resolution` are the follow-up family's
+            // (`followups::write_vocabulary_entries`).
+            assert_eq!(fields, ["kind", "relation", "resolution", "size_class"]);
             for (field, values) in vocab {
                 let values = values
                     .as_array()
@@ -3325,20 +3399,23 @@ mod tests {
 
     // ---- routes ------------------------------------------------------------
 
-    /// All ten routes are registered, and the split is exactly the
-    /// three-layer model: the four WRITES require a nonce (and sit behind the
-    /// kill switch and the dial), the six READS do not. `gated_flow.rs` makes
+    /// All fifteen routes are registered, and the split is exactly the
+    /// three-layer model: the seven WRITES require a nonce (and sit behind the
+    /// kill switch and the dial), the eight READS do not. `gated_flow.rs` makes
     /// the same distinction — "knowing a view exists is inert; opening it is
     /// the privileged act" — and Phase 6's whole value is an agent being able
     /// to ask the candidate question. The two edge-correction writes added by
     /// Phase 5 of
     /// `2026-09-20-a-recorded-delivery-scope-is-permanent-so-a-mis-declared-phase-is-uncorrectable`
     /// are DELETE and PUT rather than POST — the first departure from
-    /// "every write is a POST" this door has had.
+    /// "every write is a POST" this door has had. The follow-up family
+    /// (`2026-10-10-small-followups-are-recorded-but-nothing-burns-them-down`
+    /// Phase 4) adds three writes and two reads, one of which — the match — is
+    /// the first READ carried as a POST.
     #[test]
     fn the_write_routes_require_a_nonce_and_the_read_routes_do_not() {
         let entries = route_entries();
-        assert_eq!(entries.len(), 10, "keep in lockstep with routes()");
+        assert_eq!(entries.len(), 15, "keep in lockstep with routes()");
         for (method, path, _) in entries {
             assert!(path.starts_with("/plan-library/"), "{path}");
             assert!(matches!(*method, "GET" | "POST" | "PUT" | "DELETE"));
@@ -3355,6 +3432,9 @@ mod tests {
                 "/plan-library/links",
                 "/plan-library/links/{id}",
                 "/plan-library/links/{id}",
+                "/plan-library/edges/{id}/anchors",
+                "/plan-library/edges/{id}/resolution",
+                "/plan-library/followups/reconcile",
             ]
         );
         let ungated: Vec<&str> = entries
@@ -3370,23 +3450,39 @@ mod tests {
                 "/plan-library/artifacts/{id}",
                 "/plan-library/artifacts/{id}/export",
                 "/plan-library/divergent",
-                "/plan-library/scan-roots"
+                "/plan-library/scan-roots",
+                "/plan-library/followups",
+                "/plan-library/followups/match",
             ]
         );
-        // Every nonce-requiring route is a write verb (POST / PUT / DELETE)
-        // and every open one a GET — a write that ever became open would
-        // break this too.
+        // Every nonce-requiring route is a write verb (POST / PUT / DELETE) —
+        // a write that ever became open would break this.
         assert!(entries
             .iter()
-            .all(|(m, _, g)| *g == matches!(*m, "POST" | "PUT" | "DELETE")));
+            .filter(|(_, _, g)| *g)
+            .all(|(m, _, _)| matches!(*m, "POST" | "PUT" | "DELETE")));
+        // And every open route is a GET except the ONE read carried as a POST,
+        // pinned by identity: a second open POST/PUT/DELETE must be argued
+        // for here, not slip in under the match's precedent.
+        let open_non_get: Vec<(&str, &str)> = entries
+            .iter()
+            .filter(|(m, _, g)| !*g && *m != "GET")
+            .map(|(m, p, _)| (*m, *p))
+            .collect();
+        assert_eq!(
+            open_non_get,
+            vec![("POST", "/plan-library/followups/match")],
+            "the only open non-GET is the follow-up match, which mutates nothing"
+        );
 
         let _r: Router<Arc<ApiState>> = routes();
     }
 
-    /// The authorized surface is EXACTLY the three write paths (four route
+    /// The authorized surface is EXACTLY the six write paths (seven route
     /// entries — DELETE and PUT share one path), and adding the export and
-    /// divergent reads (nor, later, the edge-correction pair) widened it by
-    /// nothing beyond what each phase explicitly added.
+    /// divergent reads (nor, later, the edge-correction pair, nor the
+    /// follow-up family's three writes) widened it by nothing beyond what each
+    /// phase explicitly added.
     ///
     /// The count assert above would still pass if a new row arrived with
     /// `requires_a_nonce = true`; this one is the standing invariant — the set
@@ -3406,10 +3502,13 @@ mod tests {
                 "/plan-library/artifacts",
                 "/plan-library/links",
                 "/plan-library/links/{id}",
+                "/plan-library/edges/{id}/anchors",
+                "/plan-library/edges/{id}/resolution",
+                "/plan-library/followups/reconcile",
             ]
             .into_iter()
             .collect::<std::collections::BTreeSet<_>>(),
-            "the nonce-authorized surface must stay exactly these three write paths"
+            "the nonce-authorized surface must stay exactly these six write paths"
         );
 
         // …and both original new routes are on the open side, by name.
@@ -3517,13 +3616,17 @@ mod tests {
     /// Scoped to the function body deliberately: counting the whole file would
     /// be defeated by prose in a doc comment (including this one), which is a
     /// test that fails for a reason unrelated to what it claims.
+    ///
+    /// `route_entries()` composes the follow-up family's rows, and `routes()`
+    /// merges that family's router, so its registrations are counted too —
+    /// off ITS registration function's body, by the same technique.
     #[test]
     #[expect(
         clippy::string_slice,
         reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
     )]
     fn route_entries_covers_every_route_registration_in_this_file() {
-        // Both built at runtime so this test's own source cannot match itself.
+        // All built at runtime so this test's own source cannot match itself.
         let needle = format!(".{}(", "route");
         let fn_header = format!("pub fn {}() -> Router<Arc<ApiState>> {{", "routes");
         let src = include_str!("plan_library.rs");
@@ -3536,7 +3639,24 @@ mod tests {
         let end = body
             .find("\n}")
             .expect("routes() must be closed by a brace at column 0");
-        let registered = body[..end].matches(needle.as_str()).count();
+        let own = body[..end].matches(needle.as_str()).count();
+        // The merge that mounts the family must be in that same body: the
+        // family's rows below are only reachable through it.
+        assert!(
+            body[..end].contains(&format!("{}::routes()", "followups")),
+            "routes() must merge the follow-up family's router"
+        );
+
+        let family_header = format!("fn {}<S>() -> Router<S>", "router");
+        let family = include_str!("plan_library/followups.rs");
+        let family_start = family
+            .find(family_header.as_str())
+            .expect("followups::router() signature — update this test if it changes");
+        let family_body = &family[family_start..];
+        let family_end = family_body
+            .find("\n}")
+            .expect("followups::router() must be closed by a brace at column 0");
+        let registered = own + family_body[..family_end].matches(needle.as_str()).count();
 
         let mut paths: Vec<&str> = route_entries().iter().map(|(_, p, _)| *p).collect();
         paths.sort_unstable();
@@ -3545,8 +3665,9 @@ mod tests {
         assert_eq!(
             paths.len(),
             registered,
-            "route_entries() lists {} distinct paths but routes() registers {} — a new \
-             route must be added to route_entries() so the nonce-gating tests classify it",
+            "route_entries() lists {} distinct paths but routes() and the follow-up family \
+             register {} — a new route must be added to route_entries() so the nonce-gating \
+             tests classify it",
             paths.len(),
             registered
         );
