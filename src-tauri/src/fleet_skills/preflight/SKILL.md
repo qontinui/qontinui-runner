@@ -803,7 +803,7 @@ coord_claim_acquire(kind="file_glob", resource_key="<glob>", ttl_seconds=900)   
   while the loop
   keeps renewing the others; when no renewable row is left the loop ends, and
   `status` reads `STOLEN` if any row was stolen, `MAX_RUNTIME` if its runtime
-  bound ended it, `OWNER_GONE` if owner death ended it, otherwise `DEAD`.
+  bound ended it, `OWNER_GONE` if the loop released its rows because the owner was gone (its pid died, its transcript went idle or missing, or coord closed or finished the session), otherwise `DEAD`.
   **Only `LIVE` means the claims are held.** The other seven mean the claim is
   **UNKNOWN** (`STALE` usually self-heals on the next beat; re-acquiring
   anyway is harmless — a held claim answers `renewed`), which is a re-acquire and a line in the report, never a shrug — a

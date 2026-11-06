@@ -36,12 +36,15 @@ page list for the runner on --port is UNKNOWN (exit 3). With --only as well, a t
   layout  runner-layout.py fit --trim-only over every page (under --only or
           --tab, the pages holding those terminals): shrinks each grid to fit its
           remaining tabs, since the runner grows a grid by itself but never
-          shrinks one.
+          shrinks one. A page in tmux work mode is skipped, not re-gridded.
   nudge   nudge-stopped-sessions.py --send: types /next-move into each STOPPED
           row. A session named in this run just finished a turn, so it reads
           BUSY to the idle floor; it is nudged in a second pass limited to the
           named rows with the idle floor off (every other check still runs).
           STUCK and CONTRADICTED rows are listed and never nudged.
+
+While an operator restart prepare is `preparing` or `ready`, limit, name and
+nudge are held (typing_steps_held) and an unreadable restart_prep refuses --act.
 
 After typing into a pane (/name, /next-move) the script watches it. A prompt
 that reaches an exhausted account makes the runner move the session to another
@@ -141,6 +144,11 @@ def ready_to_type(tid, idle_min, cooldown_h, own, want="STOPPED"):
     moving = cfs.output_moving(tid)
     if moving is not False:
         return False, "terminal output still moving" if moving else "terminal output could not be sampled", tx
+    # A prepare can start after the pass's own read. This read can take seconds,
+    # so it comes before the prompt look below, which must stay the last thing here.
+    prep, prep_text = cfs.prepare_status()
+    if prep != "clear":
+        return False, f"re-screen: {prep_text}", tx
     # submit-prompt pastes onto whatever the input box holds, so a draft typed
     # during the re-screen must not ride along.
     raw = cfs.raw_tail(tid)
@@ -249,6 +257,9 @@ def await_handoff(tid, sid, wait_s=30):
             return (True, f"the runner resumed the session in pane {new[:8]} under another account") if new else \
                 (False, "the pane closed, but no other pane holds its session")
     if limit_menu_open(screen_text(tid) or ""):
+        # Same guard as hand_off_limited: under a prepare, leave the pane alone.
+        if cfs.prepare_status()[0] != "clear":
+            return False, "the runner did not move the session; its usage-limit menu was left open because a restart prepare is in force"
         write_keys(tid, b"\x1b")
         return False, "the runner did not move the session; its usage-limit menu was dismissed with Esc, no option chosen"
     return False, "the runner did not move the session"
@@ -265,7 +276,9 @@ def hand_off_limited(targets, a, own, outcomes=None):
     outcomes = {} if outcomes is None else outcomes
     for r in targets:
         tid = r["terminalId"]
-        if limit_menu_open(screen_text(tid) or ""):  # a menu left open holds the prompt
+        # A menu left open holds the prompt. Under a prepare, leave the pane
+        # alone: ready_to_type refuses the row just below.
+        if limit_menu_open(screen_text(tid) or "") and cfs.prepare_status()[0] == "clear":
             write_keys(tid, b"\x1b")
             time.sleep(1)
         ok, msg, _ = ready_to_type(tid, a.idle_min, a.cooldown_hours, own, want="LIMITED")
@@ -345,7 +358,11 @@ def ready_for_redirect(tid):
     "Unknown command" ends no turn, so the spinner line above it still reads as
     a running turn. Instead the reply must be the last thing on screen, the
     output still, and the prompt empty. Claude's optional session survey can
-    print after the reply; it is dismissed with 0 first."""
+    print after the reply; it is dismissed with 0 first. A prepare that started
+    since the prompt this follows stops it before any key reaches the pane."""
+    prep, prep_text = cfs.prepare_status()
+    if prep != "clear":
+        return False, prep_text
     text = screen_text(tid) or ""
     if SURVEY in text[text.rfind(UNKNOWN_NEXT_MOVE):]:
         write_keys(tid, b"0")
@@ -358,6 +375,9 @@ def ready_for_redirect(tid):
     moving = cfs.output_moving(tid)
     if moving is not False:
         return False, "terminal output still moving" if moving else "terminal output could not be sampled"
+    prep, prep_text = cfs.prepare_status()  # the survey wait and the sample above took seconds
+    if prep != "clear":
+        return False, prep_text
     raw = cfs.raw_tail(tid)
     state, typed = cfs.prompt_state(raw) if raw is not None else ("unknown", "screen unreadable")
     if state != "empty":
@@ -713,12 +733,127 @@ def common(a):
 # first --act run.
 USES_NSS = ("judge", "row_facts", "screen", "external_signals", "STOPPED_FROM")
 USES_CFS = ("API", "ANSI_RE", "EnvelopeUnknown", "READ_ERRORS", "classify", "load", "open_rows", "output_moving",
-            "page_names", "proc_table", "prompt_state", "raw_tail", "read", "readiness", "running_turn", "terminals",
-            "transcript_facts")
+            "page_names", "prepare_status", "proc_table", "prompt_state", "raw_tail", "read", "readiness",
+            "running_turn", "terminals", "transcript_facts")
+
+
+def selftest_prepare_hold():
+    """main() --act under each prepare verdict, every door stubbed and nothing
+    able to type; then ready_to_type under a prepare that started mid-run.
+    Returns the number of failures."""
+    import contextlib
+    import io
+    g = globals()
+    failures = 0
+    limited = {"terminalId": "l1", "verdict": "LIMITED", "tab": "x", "name": "n", "reasons": []}
+    stopped = {"terminalId": "s1", "verdict": "STOPPED", "tab": "x", "name": "n", "reasons": []}
+    class Recorder:
+        def __getattr__(self, _name):
+            return lambda *a, **k: []
+    keys_g = ("PASS", "run_helper", "hand_off_limited", "name_sessions", "aftercare", "custom_title", "screen_text",
+              "write_keys", "ready_to_type", "limit_menu_open")
+    keys_cfs = ("prepare_status", "terminals", "open_rows", "transcript_facts", "readiness", "classify", "proc_table",
+                "output_moving", "raw_tail")
+    keys_nss = ("screen", "external_signals", "judge", "row_facts")
+    saved_g = {k: g[k] for k in keys_g}
+    saved_cfs = {k: getattr(cfs, k) for k in keys_cfs}
+    saved_nss = {k: getattr(nss, k) for k in keys_nss}
+    saved_argv = sys.argv
+    acted = []
+    try:
+        g["PASS"] = Recorder()
+        g["run_helper"] = lambda script, args: (acted.append(script.split("-")[0]) or (0, ""))
+        g["hand_off_limited"] = lambda *a, **k: (acted.append("limit") or 0)
+        g["name_sessions"] = lambda *a, **k: (acted.append("name") or ([], 0))
+        g["aftercare"] = lambda *a, **k: 0
+        g["custom_title"] = lambda path: None
+        cfs.terminals = lambda: []
+        cfs.open_rows = lambda: {"s1": {}}
+        cfs.transcript_facts = lambda row: {"path": "p"}
+        nss.screen = lambda *a, **k: ([limited, stopped], [], None)
+        for prep, want_rc, want in ((("held", "held text"), 0, ["close"]),
+                                    (("unknown", "unknown text"), 3, []),
+                                    (("clear", ""), 0, ["close", "limit", "name", "nudge"])):
+            acted.clear()
+            cfs.prepare_status = lambda prep=prep: prep
+            sys.argv = ["triage-sessions.py", "--act", "--skip", "layout"]
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                rc = main()
+            if rc != want_rc or acted != want:
+                print(f"FAIL main --act under prepare {prep[0]}: rc {rc}, acted {acted}; want rc {want_rc}, {want}")
+                failures += 1
+        # ready_to_type: a prepare that started after the pass's read stops it
+        # before the final prompt look, whichever verdict the row is wanted in.
+        cfs.terminals = lambda: [{"id": "t1"}]
+        cfs.readiness = lambda: ({}, None)
+        cfs.open_rows = lambda: {"t1": {}}
+        cfs.classify = lambda *a: ("ACTIVE", [])
+        cfs.proc_table = lambda: {}
+        cfs.transcript_facts = lambda row: None
+        nss.external_signals = lambda *a: None
+        nss.row_facts = lambda *a: {}
+        cfs.prepare_status = lambda: ("held", "held text")
+        cfs.output_moving = lambda tid: False
+        def tail(tid):
+            raise AssertionError("the final prompt look reached under a held prepare")
+        cfs.raw_tail = tail
+        for want in ("STOPPED", "LIMITED"):
+            nss.judge = lambda *a, want=want: (want, [])
+            ok, msg, _ = ready_to_type("t1", 0, 48, "", want=want)
+            if ok or "held text" not in msg:
+                print(f"FAIL ready_to_type({want}) under a mid-run prepare: {ok} {msg!r}")
+                failures += 1
+        # No key reaches a pane under a prepare: not the redirect's survey key,
+        # and not the Esc the limit step sends to an open menu.
+        keys = []
+        g["write_keys"] = lambda tid, data: keys.append(data)
+        g["screen_text"] = lambda tid: UNKNOWN_NEXT_MOVE + " " + SURVEY
+        ok, msg = ready_for_redirect("t1")
+        if ok or "held text" not in msg or keys:
+            print(f"FAIL ready_for_redirect under a prepare: {ok} {msg!r}, keys {keys}")
+            failures += 1
+        # A prepare that starts between the redirect's two reads stops it too.
+        reads = iter([("clear", ""), ("held", "held text")])
+        cfs.prepare_status = lambda: next(reads)
+        g["screen_text"] = lambda tid: UNKNOWN_NEXT_MOVE
+        ok, msg = ready_for_redirect("t1")
+        if ok or "held text" not in msg:
+            print(f"FAIL ready_for_redirect under a prepare started mid-check: {ok} {msg!r}")
+            failures += 1
+        cfs.prepare_status = lambda: ("held", "held text")
+        g["screen_text"] = lambda tid: UNKNOWN_NEXT_MOVE + " " + SURVEY
+        g["limit_menu_open"] = lambda text: True
+        g["ready_to_type"] = lambda *a, **k: (False, "held text", None)
+        with contextlib.redirect_stdout(io.StringIO()):
+            saved_g["hand_off_limited"]([limited], argparse.Namespace(idle_min=0, cooldown_hours=48), "")
+        if keys:
+            print(f"FAIL hand_off_limited sent keys under a prepare: {keys}")
+            failures += 1
+    finally:
+        sys.argv = saved_argv
+        g.update(saved_g)
+        for k, v in saved_cfs.items():
+            setattr(cfs, k, v)
+        for k, v in saved_nss.items():
+            setattr(nss, k, v)
+    return failures
+
+
+def typing_steps_held(prep, skip):
+    """The steps a restart prepare holds, in run order. Pure. These three type
+    into a pane: /next-move would end a paused session's pause, and on a LIMITED
+    row it would hand the session to another account, which the prepare promises
+    not to do. Closing finished tabs and trimming grids type nothing."""
+    return [s for s in ("limit", "name", "nudge") if s not in skip] if prep == "held" else []
 
 
 def selftest():
     failures = 0
+    for prep, skip, want in (("held", set(), ["limit", "name", "nudge"]), ("held", {"name"}, ["limit", "nudge"]),
+                             ("clear", set(), []), ("unknown", set(), [])):
+        if typing_steps_held(prep, skip) != want:
+            print(f"FAIL typing_steps_held({prep!r}, {skip!r}) = {typing_steps_held(prep, skip)}, want {want}")
+            failures += 1
     for mod, names in ((nss, USES_NSS), (cfs, USES_CFS)):
         for missing in [n for n in names if not hasattr(mod, n)]:
             print(f"FAIL {mod.__name__}.{missing} no longer exists")
@@ -839,6 +974,7 @@ def selftest():
     if any(p != "/health" for p in paths):
         print(f"FAIL auto_accept_dial read {sorted(set(paths))}, want only /health")
         failures += 1
+    failures += selftest_prepare_hold()
     step_failures, steps = selftest_name_sessions()
     failures += step_failures
     cases = [
@@ -1048,6 +1184,7 @@ def main():
                   "nothing to triage")
             return 0
         a.only = ",".join(ids)
+    PASS.screening()
     try:
         terms = [t for t in cfs.terminals() if any(t["id"].startswith(o) for o in a.only.split(",") if o)]
         res, warnings, ready_err = nss.screen(a.idle_min, [o for o in a.only.split(",") if o], a.cooldown_hours,
@@ -1066,6 +1203,16 @@ def main():
     if a.act and ready_err:
         print("UNKNOWN: --act refused - GET /restart-readiness could not be read", file=sys.stderr)
         return 3
+    prep, prep_text = cfs.prepare_status()
+    if prep != "clear":
+        print("WARNING: " + prep_text)
+    if a.act and prep == "unknown":
+        print(f"UNKNOWN: --act refused - {prep_text}", file=sys.stderr)
+        return 3
+    for step in typing_steps_held(prep, skip):
+        print(f"\n== {step} (held: a restart prepare is in force, so this step types into nothing)")
+        PASS.step(step, held="restart prepare in force")
+        skip.add(step)
 
     failed = 0
     closable = {"FINISHED", "EXITED-FINISHED"} | ({"CLOSEOUT"} if a.include_closeout else set())
@@ -1254,6 +1401,7 @@ def pass_row(r, observed_at):
     if verdict in SINCE_FINISHED and isinstance(fin, (int, float)) and not isinstance(fin, bool) and fin > 0:
         since = int(fin)
     screen = r.get("screen")
+    progress = r.get("progress_since_nudge")
     return {
         "terminal_id": r["terminalId"],
         "observed_at": observed_at,
@@ -1265,7 +1413,7 @@ def pass_row(r, observed_at):
         "verdict": verdict,
         "reason_codes": [],
         "state_since_ms": since,
-        "progress_since_nudge": None,
+        "progress_since_nudge": progress if isinstance(progress, bool) else None,
         "action": "none",
         "action_outcome": None,
         "detail": {"reasons": [str(x)[:REASON_CHARS] for x in (r.get("reasons") or [])[:REASONS_MAX]]},
@@ -1362,10 +1510,11 @@ def overlord_versions(runner_sha):
 
 
 def runner_build():
-    """The runner's gitSha from /health, or None when it cannot be read."""
+    """The runner's gitSha from /health, or None when it cannot be read. Never
+    raises: the ledger must not take the run down with it."""
     try:
         sha = cfs.read("/health", "data.gitSha", timeout=20)
-    except cfs.READ_ERRORS:
+    except Exception:  # noqa: BLE001 - READ_ERRORS leaves out a response cut mid-read
         return None
     return sha if isinstance(sha, str) and sha else None
 
@@ -1579,6 +1728,7 @@ class PassRecorder:
     def __init__(self):
         self.doc = None
         self.res = None
+        self.build_before = self.screened_build = None
         self.events = []  # ("rows", step, [acted rows]) or ("file", step, path), in the order the steps ran
         self.steps = {}
         self.lock = None
@@ -1615,8 +1765,18 @@ class PassRecorder:
             return LOCK_BUSY
         return None
 
+    def screening(self):
+        """Call before the screen: see screened()."""
+        self.build_before = runner_build()
+
     def screened(self, res):
+        """The flow metrics compare a pass's build across passes to tell a close
+        from a restart, so the build recorded is the one the rows were screened
+        on: read on both sides of the screen, and None (unknown) when a restart
+        moved it during the screen or a read failed."""
         self.res = res
+        after = runner_build()
+        self.screened_build = after if after == self.build_before else None
 
     def step(self, name, **facts):
         self.steps.setdefault(name, {}).update(facts)
@@ -1670,7 +1830,7 @@ class PassRecorder:
         counts = step_tallies(self.steps, events)
         if dropped:
             counts["ledger"] = {"rows_dropped": dropped}
-        build = runner_build() if build is None else build
+        build = self.screened_build if build is None else build
         return dict(self.doc, runner_build=build,
                     ended_at=rfc3339(now or dt.datetime.now(dt.timezone.utc)), exit_code=code,
                     step_counts=counts, verdict_histogram=histogram,
@@ -1754,6 +1914,7 @@ def ledger_selftest():
     fallback. Reads nothing live and types nothing."""
     import contextlib
     import io
+    globals()["runner_build"] = lambda: None  # the process exits after this selftest
     bad = []
     sid = "0f2a1b3c-4d5e-4f60-8a7b-9c0d1e2f3a4b"
     res = [
@@ -1772,6 +1933,10 @@ def ledger_selftest():
             "detail": {"reasons": ["a", "b", "c"]}, "observed_at": "2026-10-24T00:00:00.000Z"}
     if row != want:
         bad.append(f"pass_row(STOPPED) = {row}")
+    for given, want_progress in [(True, True), (False, False), (None, None), ("yes", None)]:
+        got = pass_row(dict(res[0], progress_since_nudge=given), "x")["progress_since_nudge"]
+        if got is not want_progress:
+            bad.append(f"pass_row(progress_since_nudge={given!r}) = {got!r}")
     fin, held = pass_row(res[1], "x"), pass_row(res[2], "x")
     if (fin["claude_session_id"], fin["account"], fin["state_since_ms"]) != (None, None, 1761270000000):
         bad.append(f"pass_row(FINISHED) = {fin}")
@@ -1819,6 +1984,20 @@ def ledger_selftest():
             (doc["step_counts"]["ledger"], {"rows_dropped": 3}),  # the bad line, t-gone, the unknown action
             (len(doc["rows"]), 3),
         ]
+        # The build recorded is the one the rows were screened on, even when a
+        # restart moved the runner before the pass was written; a restart during
+        # the screen, or a failed read, leaves it unknown.
+        real_build = runner_build
+        try:
+            for before, after, want_build in [("a", "a", "a"), ("a", "b", None), (None, "a", None), ("a", None, None)]:
+                globals()["runner_build"] = lambda v=before: v
+                rec.screening()
+                globals()["runner_build"] = lambda v=after: v
+                rec.screened(res)
+                globals()["runner_build"] = lambda: "at-end"
+                checks.append((rec.build(1, now=when, versions={})["runner_build"], want_build))
+        finally:
+            globals()["runner_build"] = real_build
         for got, exp in checks:
             if got != exp:
                 bad.append(f"build(): {got!r}, want {exp!r}")

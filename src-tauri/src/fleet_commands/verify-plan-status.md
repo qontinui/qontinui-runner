@@ -335,7 +335,8 @@ in the current branch's history with `git merge-base --is-ancestor 879c36bb4 HEA
 >   `GET /coord/agent-work-units/<stem>/citations`, device or agent JWT). It is
 >   coord's own delivery reduction over the plan's PR citations: `shipped`,
 >   `evidence_complete`, `evidence_gaps`, `phases_declared_indices`,
->   `phases_delivered` and `phases_remaining`, with each citation's merged-state
+>   `phases_delivered`, `phases_attested`, `phase_attestations` and
+>   `phases_remaining`, with each citation's merged-state
 >   observed against **origin**. Read it through `/vet-plan` §0.25's arm table,
 >   in that table's order (4, 3, 2, 1, 5, then 6). §5 "Settling case 1" below
 >   says which arm lets this skill write. When it reads arm 2 because
@@ -484,6 +485,30 @@ and the body. Before writing your stamp:
    `NOT STARTED`), include that in **one trailing line inside your
    new block**, prefixed `History:` or `Previously:`. Never as a
    sibling blockquote.
+5. **Carry the `**Area:**`, `Initiative-Item:` and `Depends-On:`
+   declarations.** If any block you are replacing (item 2 deletes every
+   status-adjacent blockquote, not only the Status one) carries an
+   `Area:` declaration (`` > **Area:** `<area>` ``, or a line-leading plain
+   `Area:`), an `Initiative-Item:` line or a
+   `Depends-On:` declaration, carry each verbatim into your new block —
+   `Depends-On:` as the suffix of your new `> **Status:` line, with its stems
+   on the same physical line as the key (the scanner reads only the rest of
+   that line, so a re-wrap that pushes them onto the next `>` line drops
+   them), and `**Area:**` / `Initiative-Item:` each as a `>` line
+   (conventionally directly under the Status line). Each must sit on or
+   below the `> **Status:` line inside that same blockquote, with no blank
+   line or non-`>` line in between — a `>` line above the Status line is not
+   read — and never in a sibling blockquote. The runner's plan scanner reads
+   all three only from this status blockquote, into `metadata.area`,
+   `metadata.initiative_item` and `metadata.depends_on`, and its next push
+   writes what it parsed (every active-directory push is a `metadata` merge
+   patch in which an undeclared `area` or `initiative_item` is sent as
+   `null`, a delete, and an undeclared `depends_on` as `[]`), so a stamp
+   that drops any of them erases it from the work unit's `metadata` on the
+   next scan. For `Depends-On:` that is worse than a clean erase: the runner
+   skips the dependency-edge write for an empty set, so edge rows written
+   earlier survive and coord goes on enforcing a dependency the plan no
+   longer shows.
 
 When `/verify-plan-status` finds existing stamps that disagree with
 what you'd verify (e.g. a plan stamped `VETTED` whose acceptance
@@ -646,7 +671,11 @@ branches, not three**:
 **Name the arm in the `History:` line when you write `SHIPPED` over an
 `IN PROGRESS` stamp**, for example `case 1: list_citations arm 1, tenant <id>
 (shipped, evidence_complete, phases_remaining [] corroborated by non-empty
-phases_declared_indices ⊆ phases_delivered, no NO PHASE ATTRIBUTION gap)`.
+phases_declared_indices covered by phases_delivered, no NO PHASE ATTRIBUTION gap)`;
+when a declared phase was covered by a resolved attestation instead, name it:
+`… covered by phases_delivered [1] + phases_attested [0] (attestation phase 0 →
+<evidence_kind> <evidence_ref>, resolution resolved), …` — the fields a
+`phase_attestations` row carries; the delivery read serves no attestation id.
 Then a later reader can check the verdict without re-deriving it.
 
 **UNKNOWN lands on the unidentified default (do not overwrite), never on "not
