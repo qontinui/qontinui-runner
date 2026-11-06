@@ -870,6 +870,20 @@ fn a_sent_row_is_recorded_without_stamping() {
     store.note_finish_sent_row("ghost", Some(at), row());
 }
 
+/// Review r4: a sent row never replaces the row that CONFIRMED a synced mark
+/// (two chains for one mark: A confirmed and stamped, B dropped unconfirmed).
+#[test]
+fn a_sent_row_never_replaces_a_confirmed_one() {
+    let (_d, store, at) = unsynced_store("confirmed");
+    let confirmed = row();
+    let sent = Uuid::parse_str(OTHER_ROW).unwrap();
+    store.mark_finish_synced_on("confirmed", Some(at), Some(confirmed));
+    store.note_finish_sent_row("confirmed", Some(at), sent);
+    let rec = store.get("confirmed").unwrap();
+    assert_eq!(rec.finish_coord_session_id, Some(confirmed), "still A");
+    assert!(rec.finish_synced, "still synced");
+}
+
 /// F3 after a restart: a REAL registrar that resolves nothing, an unsynced
 /// mark whose finish the drain dropped (its SENT row stored) — the boot sweep
 /// re-offers it to that row over a NULL coord row, and not over `working`.

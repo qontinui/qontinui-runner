@@ -861,11 +861,13 @@ pub struct TerminalSessionRecord {
     /// reading.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub finish_synced: bool,
-    /// The last coord row (`coord.sessions.id`) a finish for this mark was SENT
-    /// to or CONFIRMED by — recorded when the drain's observed ACK stamps
-    /// [`Self::finish_synced`], and when the drain gives up on a finish coord
-    /// answered without moving the row (sent, never confirmed). Kept until an
-    /// unmark; a restamp keeps it (plan
+    /// The coord row (`coord.sessions.id`) that CONFIRMED this mark, else the
+    /// last row a finish for it was SENT to — recorded when the drain's
+    /// observed ACK stamps [`Self::finish_synced`] (confirmed), and when the
+    /// drain gives up on a finish coord answered without moving the row (sent,
+    /// never confirmed; recorded only while the mark is unsynced, so a sent row
+    /// never replaces a confirmed one). Kept until an unmark; a restamp keeps
+    /// it (plan
     /// `2026-11-05-finish-synced-is-stamped-on-a-2xx-that-did-not-move-session-status`,
     /// review F2/F3). Durable, so the finish heal knows the mark's OWN row after
     /// a runner restart, when the in-process resolvers know nothing about a
@@ -3004,8 +3006,9 @@ impl SessionLifecycleStore {
     /// answered the PATCH but its row never read `finished`), so the boot heal
     /// sweep can re-offer the finish to its own row after a restart (plan
     /// `2026-11-05-finish-synced-is-stamped-on-a-2xx-that-did-not-move-session-status`,
-    /// review F3). Only a still-finished mark whose `finished_at` is
-    /// `finished_at` (when `Some`) is touched. Same lock discipline as
+    /// review F3). Only a still-finished, UNSYNCED mark whose `finished_at` is
+    /// `finished_at` (when `Some`) is touched: a synced mark's row is the one
+    /// that CONFIRMED it, and a sent row never replaces a confirmed one. Same lock discipline as
     /// [`Self::mark_finish_synced`], the drain's other write here: the map lock
     /// only, never `finish_forward` (the drain must not wait on a finish
     /// observer), and no flag moves, so it cannot reorder against an unmark.
@@ -3025,6 +3028,7 @@ impl SessionLifecycleStore {
         let changed = match m.get_mut(claude_session_id) {
             Some(rec)
                 if rec.finished_at.is_some()
+                    && !rec.finish_synced
                     && finished_at.is_none_or(|at| rec.finished_at == Some(at))
                     && rec.finish_coord_session_id != Some(coord_session_id) =>
             {
