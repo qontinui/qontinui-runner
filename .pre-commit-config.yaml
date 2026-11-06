@@ -376,9 +376,16 @@ repos:
       # (`SKIP=untimed-subprocess git push`) as every local hook is. It also
       # cannot catch a violation introduced by a MERGE it never saw — CI is
       # still the authority on the merged result.
+      #
+      # ENTRY IS A BASH WRAPPER so the qontinui-claude-config git-hooks shim,
+      # which runs only `language: system` + `entry: bash <script>` hooks, can
+      # run it too (ccfg#2448). The wrapper resolves the repo root, picks
+      # python3 or python, passes arguments through and keeps the exit code;
+      # with no arguments (both here and under the shim) the checker scans the
+      # whole discovered scope, exactly as the direct entry did.
       - id: untimed-subprocess
         name: forbid untimed subprocess waits (pre-push)
-        entry: python3 scripts/check_untimed_subprocess.py
+        entry: bash .pre-commit-hooks/untimed-subprocess.sh
         language: system
         # Same load-bearing reason as every hook above: pre-commit prints a
         # hook's output ONLY when it fails, and this checker's passing line
@@ -387,6 +394,17 @@ repos:
         verbose: true
         stages: [pre-push]
         files: '(\.rs$|(^|/)Cargo\.toml$)'
+        pass_filenames: false
+
+      # Tests for the wrapper above. Pre-commit stage only, so the pre-push set
+      # a shim installer mirrors does not grow.
+      - id: untimed-subprocess-test
+        name: untimed-subprocess wrapper — tests
+        entry: bash .pre-commit-hooks/untimed-subprocess-test.sh
+        language: system
+        stages: [pre-commit]
+        verbose: true
+        files: '^(\.pre-commit-hooks/untimed-subprocess(-test)?\.sh|scripts/check_untimed_subprocess\.py)$'
         pass_filenames: false
 
 ci:
