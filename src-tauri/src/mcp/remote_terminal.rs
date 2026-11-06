@@ -38,7 +38,9 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use crate::mcp::remote_create_reaper::{ClosingUnderCreateGrant, RemoteCreateReaper};
+use crate::mcp::remote_create_reaper::{
+    ClosingUnderCreateGrant, CreateCloseClaim, RemoteCreateReaper,
+};
 use crate::settings::{AcceptRemoteAttach, AcceptRemoteCreate};
 use crate::terminal::remote_pane_io::{AttachedRing, RemoteFrameSink, RemotePaneIo};
 
@@ -1421,28 +1423,30 @@ where
 ///   attached, and a create grant is not an attach grant. The check is
 ///   [`RemoteCreateReaper::claim_create_close`]: the reaper's fail-closed
 ///   ever-attached read (no row reads as attached) plus a live attach-table
-///   read, and on admission it MARKS the terminal closing, all under the
-///   reaper's lock. `admit_terminal_attach` binds under that same lock and
-///   refuses a closing terminal `attach_terminal_closing`, so an attach can
-///   never bind between this admission and the close that follows it — the
-///   loser of that race is refused cleanly whichever side it is;
+///   read, and on admission it COUNTS the close in, all under the reaper's
+///   lock. `admit_terminal_attach` binds under that same lock and refuses a
+///   terminal with any admitted close in flight (or one a close already ended)
+///   `attach_terminal_closing`, so an attach can never bind between this
+///   admission and the close that follows it — the loser of that race is
+///   refused cleanly whichever side it is;
 /// - an attach table that cannot be read (a poisoned lock) refuses: neither
 ///   "not an attach jti" nor "not bound" can then be proven.
 ///
-/// Refusals touch nothing. An admission binds and consumes nothing — its one
-/// effect is the closing mark, which is idempotent — so a retry after an
-/// `unknown` reply is admitted again and answered `not_found` if the terminal
-/// has gone. The caller withdraws the mark (`release_create_close`) when the
-/// end definitively did not close the terminal.
-pub fn admit_create_grant_end<P, U>(
+/// Refusals touch nothing. An admission binds and consumes nothing; its one
+/// effect is the returned [`CreateCloseClaim`], which keeps the terminal
+/// unattachable until the caller drops it (settled through
+/// [`run_create_close`](crate::mcp::remote_create_reaper::run_create_close)),
+/// so a retry after an `unknown` reply is admitted again and answered
+/// `not_found` if the terminal has gone.
+pub fn admit_create_grant_end<'r, P, U>(
     attach_grants: &RemoteAttachGrants,
     create_grants: &RemoteCreateGrants,
-    reaper: &RemoteCreateReaper,
+    reaper: &'r RemoteCreateReaper,
     preference: P,
     local_user_id: U,
     data: &Value,
     now: u64,
-) -> Result<(RemoteBlock, String), Value>
+) -> Result<(RemoteBlock, CreateCloseClaim<'r>), Value>
 where
     P: FnOnce() -> AcceptRemoteCreate,
     U: FnOnce() -> Option<String>,
@@ -1494,12 +1498,12 @@ where
     {
         return Err(refuse(CreateRefusal::CloseTerminalMismatch));
     }
-    if !reaper.claim_create_close(&terminal_id, || {
+    let Some(claim) = reaper.claim_create_close(&terminal_id, || {
         attach_grants.try_any_bound_to(&terminal_id, now)
-    }) {
+    }) else {
         return Err(refuse(CreateRefusal::CloseAttached));
-    }
-    Ok((block, terminal_id))
+    };
+    Ok((block, claim))
 }
 
 /// The outcome vocabulary of a remote end — the wire spelling on
@@ -5542,7 +5546,9 @@ mod tests {
                     table.insert(grant("j-closing", None, NOW + 600), NOW);
                     let reaper = RemoteCreateReaper::default();
                     reaper.arm("term-A", None, tokio::time::Instant::now());
-                    assert!(reaper.claim_create_close("term-A", || Ok(false)));
+                    let _closing = reaper
+                        .claim_create_close("term-A", || Ok(false))
+                        .expect("an admitted close is in flight");
                     admit_terminal_attach(
                         &table,
                         &reaper,
@@ -9427,8 +9433,37 @@ mod create_grant_end_tests {
         })
     }
 
-    fn admit(table: &RemoteCreateGrants, data: &Value) -> Result<(RemoteBlock, String), Value> {
+    /// [`admit_create_grant_end`] with the claim dropped on the spot, answering
+    /// the admitted terminal: for the tests about WHETHER a close is admitted.
+    /// The tests about what an admitted close holds use [`end`] below.
+    #[allow(clippy::too_many_arguments)]
+    fn admit_with<P, U>(
+        attach_grants: &RemoteAttachGrants,
+        create_grants: &RemoteCreateGrants,
+        reaper: &RemoteCreateReaper,
+        preference: P,
+        local_user_id: U,
+        data: &Value,
+        now: u64,
+    ) -> Result<(RemoteBlock, String), Value>
+    where
+        P: FnOnce() -> AcceptRemoteCreate,
+        U: FnOnce() -> Option<String>,
+    {
         admit_create_grant_end(
+            attach_grants,
+            create_grants,
+            reaper,
+            preference,
+            local_user_id,
+            data,
+            now,
+        )
+        .map(|(block, claim)| (block, claim.terminal_id().to_string()))
+    }
+
+    fn admit(table: &RemoteCreateGrants, data: &Value) -> Result<(RemoteBlock, String), Value> {
+        admit_with(
             &RemoteAttachGrants::new(),
             table,
             &armed(),
@@ -9439,7 +9474,7 @@ mod create_grant_end_tests {
         )
     }
 
-    fn assert_refused(result: Result<(RemoteBlock, String), Value>, code: &str, why: &str) {
+    fn assert_refused<T: std::fmt::Debug>(result: Result<T, Value>, code: &str, why: &str) {
         let frame = result.expect_err(why);
         assert_eq!(frame["type"], "error", "{why}");
         assert_eq!(frame["code"], code, "{why}");
@@ -9477,7 +9512,7 @@ mod create_grant_end_tests {
     #[test]
     fn an_expired_tombstone_is_refused() {
         let table = spent_table();
-        let result = admit_create_grant_end(
+        let result = admit_with(
             &RemoteAttachGrants::new(),
             &table,
             &armed(),
@@ -9612,7 +9647,7 @@ mod create_grant_end_tests {
         let attach = attach_table();
         let table = spent_table();
         let run = |data: &Value| {
-            admit_create_grant_end(
+            admit_with(
                 &attach,
                 &table,
                 &armed(),
@@ -9669,7 +9704,7 @@ mod create_grant_end_tests {
         let table = spent_table();
         let reaper = armed();
         reaper.mark_attached(TERMINAL, tokio::time::Instant::now());
-        let result = admit_create_grant_end(
+        let result = admit_with(
             &RemoteAttachGrants::new(),
             &table,
             &reaper,
@@ -9693,7 +9728,7 @@ mod create_grant_end_tests {
         let t0 = tokio::time::Instant::now();
         let table = spent_table();
         let run = |reaper: &RemoteCreateReaper| {
-            admit_create_grant_end(
+            admit_with(
                 &RemoteAttachGrants::new(),
                 &table,
                 reaper,
@@ -9706,8 +9741,8 @@ mod create_grant_end_tests {
         assert_refused(run(&reaper), "remote_create_close_attached", "no row");
         reaper.arm(TERMINAL, None, t0);
         assert!(run(&reaper).is_ok(), "armed and never attached");
-        // Withdrawn (as after a `still_running` end), so a later attach may bind.
-        reaper.release_create_close(TERMINAL);
+        // That claim was dropped with the result, so an attach may now bind.
+        assert!(!reaper.is_closing_under_create(TERMINAL));
         reaper.mark_attached(TERMINAL, t0);
         assert_refused(run(&reaper), "remote_create_close_attached", "attached");
         assert!(reaper.take_due(t0 + Duration::from_secs(1300)).is_empty());
@@ -9722,7 +9757,7 @@ mod create_grant_end_tests {
         assert!(attach.bind("jti-attach", TERMINAL));
         let table = spent_table();
         let reaper = armed();
-        let result = admit_create_grant_end(
+        let result = admit_with(
             &attach,
             &table,
             &reaper,
@@ -9759,11 +9794,11 @@ mod create_grant_end_tests {
         )
     }
 
-    fn end(
+    fn end<'r>(
         grants: &RemoteAttachGrants,
         table: &RemoteCreateGrants,
-        reaper: &RemoteCreateReaper,
-    ) -> Result<(RemoteBlock, String), Value> {
+        reaper: &'r RemoteCreateReaper,
+    ) -> Result<(RemoteBlock, CreateCloseClaim<'r>), Value> {
         admit_create_grant_end(
             grants,
             table,
@@ -9785,8 +9820,8 @@ mod create_grant_end_tests {
         let table = spent_table();
         let reaper = armed();
 
-        let (_, closing) = end(&grants, &table, &reaper).expect("close admitted");
-        assert_eq!(closing, TERMINAL);
+        let (_, claim) = end(&grants, &table, &reaper).expect("close admitted");
+        assert_eq!(claim.terminal_id(), TERMINAL);
         assert!(reaper.is_closing_under_create(TERMINAL));
 
         let refused = attach(&grants, &reaper).expect_err("the attach loses");
@@ -9801,13 +9836,21 @@ mod create_grant_end_tests {
             !reaper.was_ever_attached(TERMINAL),
             "the losing attach marked nothing"
         );
-        // A retry of the admitted close is still admitted (idempotent).
-        assert!(end(&grants, &table, &reaper).is_ok());
+        // A retry of the admitted close is still admitted, and counted apart.
+        let retry = end(&grants, &table, &reaper).expect("retry admitted");
+        assert_eq!(reaper.create_closes_in_flight(TERMINAL), 2);
+        drop(retry);
+        assert!(
+            reaper.is_closing_under_create(TERMINAL),
+            "the first is still in flight"
+        );
 
-        // A close that definitively failed withdraws the mark: the terminal is
-        // attachable again, and from then on the create grant cannot close it.
-        reaper.release_create_close(TERMINAL);
-        attach(&grants, &reaper).expect("attachable after release");
+        // The close ending without closing it (dropped unsettled) ends the
+        // claim: the terminal is attachable again, and from then on the create
+        // grant cannot close it.
+        drop(claim);
+        assert_eq!(reaper.create_closes_in_flight(TERMINAL), 0);
+        attach(&grants, &reaper).expect("attachable once no close is in flight");
         assert_refused(
             end(&grants, &table, &reaper),
             "remote_create_close_attached",
@@ -9865,7 +9908,14 @@ mod create_grant_end_tests {
                 );
                 std::thread::spawn(move || {
                     barrier.wait();
-                    end(&grants, &table, &reaper).is_ok()
+                    match end(&grants, &table, &reaper) {
+                        // As if the close then ended the terminal: sticky.
+                        Ok((_, claim)) => {
+                            claim.settle(true);
+                            true
+                        }
+                        Err(_) => false,
+                    }
                 })
             };
             let attacher = {
@@ -9913,18 +9963,146 @@ mod create_grant_end_tests {
     #[test]
     fn an_unreadable_binding_read_refuses_the_claim() {
         let reaper = armed();
-        assert!(!reaper.claim_create_close(TERMINAL, || Err(())));
-        assert!(!reaper.claim_create_close(TERMINAL, || Ok(true)));
+        assert!(reaper.claim_create_close(TERMINAL, || Err(())).is_none());
+        assert!(reaper.claim_create_close(TERMINAL, || Ok(true)).is_none());
         assert!(!reaper.is_closing_under_create(TERMINAL));
-        assert!(reaper.claim_create_close(TERMINAL, || Ok(false)));
+        let claim = reaper.claim_create_close(TERMINAL, || Ok(false));
+        assert!(claim.is_some());
         assert!(reaper.is_closing_under_create(TERMINAL));
+    }
+
+    // ---- re-review findings 1a/1b/1c: the in-flight count ----
+
+    fn verdict(outcome: EndOutcome, reason: &str) -> EndVerdict {
+        EndVerdict::new(outcome, None, Some(reason.to_string()))
+    }
+
+    /// 1a. An attach-grant end E holds the terminal's single-flight slot. A
+    /// create close C is admitted, is refused `end_already_running` by the REAL
+    /// single-flight, and E then fails. Nothing is left to clear a mark, so the
+    /// count must already be back to zero: a later attach is admitted.
+    #[tokio::test]
+    async fn a_create_close_refused_already_running_strands_nothing() {
+        let grants = attach_table();
+        let table = spent_table();
+        let reaper = armed();
+        let slots = EndSlots::default();
+
+        let e_slot = slots.try_acquire(TERMINAL).expect("E holds the slot");
+        let (_, claim) = end(&grants, &table, &reaper).expect("C admitted");
+        assert!(reaper.is_closing_under_create(TERMINAL));
+        let c = crate::mcp::remote_create_reaper::run_create_close(claim, || {
+            // Were C's driver to run, it would answer `ended`: the `refused`
+            // below is the proof it did not.
+            single_flight_end(&slots, TERMINAL, || async {
+                verdict(EndOutcome::Ended, "C drove while E held the slot")
+            })
+        })
+        .await;
+        assert_eq!(c.outcome, EndOutcome::Refused);
+        assert!(c
+            .reason
+            .as_deref()
+            .unwrap()
+            .starts_with(END_ALREADY_RUNNING));
+        assert_eq!(reaper.create_closes_in_flight(TERMINAL), 0);
+
+        // E fails (e.g. no_close_authority) and frees its slot without ever
+        // touching the reaper.
+        drop(e_slot);
+        assert!(!reaper.is_closing_under_create(TERMINAL));
+        attach(&grants, &reaper).expect("a later attach is admitted");
+    }
+
+    /// 1b. Two admitted create closes: A answers `still_running` while B has
+    /// not run yet. A's outcome must not reopen the terminal under B: an attach
+    /// is still refused until B finishes, and B's `ended` makes it permanent.
+    #[tokio::test]
+    async fn one_closes_outcome_does_not_reopen_the_terminal_under_another() {
+        use crate::mcp::remote_create_reaper::run_create_close;
+        let grants = attach_table();
+        let table = spent_table();
+        let reaper = armed();
+
+        let (_, a) = end(&grants, &table, &reaper).expect("A admitted");
+        let (_, b) = end(&grants, &table, &reaper).expect("B admitted");
+        assert_eq!(reaper.create_closes_in_flight(TERMINAL), 2);
+
+        let a = run_create_close(a, || async {
+            verdict(EndOutcome::StillRunning, "exit_stuck")
+        })
+        .await;
+        assert_eq!(a.outcome, EndOutcome::StillRunning);
+        assert_eq!(reaper.create_closes_in_flight(TERMINAL), 1);
+        let refused = attach(&grants, &reaper).expect_err("B is still in flight");
+        assert_eq!(refused["code"], "attach_terminal_closing");
+        assert_eq!(grants.get("jti-attach").and_then(|g| g.terminal_id), None);
+
+        let b = run_create_close(b, || async { verdict(EndOutcome::Ended, "force") }).await;
+        assert_eq!(b.outcome, EndOutcome::Ended);
+        assert_eq!(reaper.create_closes_in_flight(TERMINAL), 0);
+        assert!(reaper.is_closing_under_create(TERMINAL), "closed is sticky");
+        let refused = attach(&grants, &reaper).expect_err("closed for good");
+        assert_eq!(refused["code"], "attach_terminal_closing");
+    }
+
+    /// Only `ended` and `not_found` are sticky; every other outcome just ends
+    /// the claim, `unknown` and a non-already-running refusal included.
+    #[tokio::test]
+    async fn only_ended_and_not_found_close_the_terminal_for_good() {
+        use crate::mcp::remote_create_reaper::run_create_close;
+        for (outcome, sticky) in [
+            (EndOutcome::Ended, true),
+            (EndOutcome::NotFound, true),
+            (EndOutcome::Unknown, false),
+            (EndOutcome::Refused, false),
+            (EndOutcome::StillRunning, false),
+        ] {
+            let grants = attach_table();
+            let table = spent_table();
+            let reaper = armed();
+            let (_, claim) = end(&grants, &table, &reaper).expect("admitted");
+            run_create_close(claim, || async { verdict(outcome, "x") }).await;
+            assert_eq!(reaper.create_closes_in_flight(TERMINAL), 0, "{outcome:?}");
+            assert_eq!(
+                reaper.is_closing_under_create(TERMINAL),
+                sticky,
+                "{outcome:?}"
+            );
+            assert_eq!(attach(&grants, &reaper).is_ok(), !sticky, "{outcome:?}");
+        }
+    }
+
+    /// 1c. A close whose task is cancelled mid-drive (its future dropped while
+    /// the driver is still pending) still decrements the count.
+    #[tokio::test]
+    async fn a_cancelled_close_decrements_the_count() {
+        use crate::mcp::remote_create_reaper::run_create_close;
+        let grants = attach_table();
+        let table = spent_table();
+        let reaper = armed();
+
+        let (_, claim) = end(&grants, &table, &reaper).expect("admitted");
+        let drive = run_create_close(claim, std::future::pending::<EndVerdict>);
+        let cancelled = tokio::time::timeout(Duration::from_millis(20), drive).await;
+        assert!(cancelled.is_err(), "the driver never answered");
+        assert_eq!(reaper.create_closes_in_flight(TERMINAL), 0);
+        assert!(!reaper.is_closing_under_create(TERMINAL));
+        attach(&grants, &reaper).expect("attachable after the cancelled close");
+
+        // And a claim dropped with no close at all (a panic before the driver).
+        let grants = attach_table();
+        let reaper = armed();
+        let (_, claim) = end(&grants, &table, &reaper).expect("admitted");
+        drop(claim);
+        assert_eq!(reaper.create_closes_in_flight(TERMINAL), 0);
     }
 
     #[test]
     fn the_dial_off_refuses_before_any_table_is_read() {
         let table = spent_table();
         let reaper = armed();
-        let result = admit_create_grant_end(
+        let result = admit_with(
             &RemoteAttachGrants::new(),
             &table,
             &reaper,
@@ -9945,7 +10123,7 @@ mod create_grant_end_tests {
         let run = |granted: &str, local: Option<&str>| {
             let table = spent_table_for_user(granted, Some(TERMINAL));
             let local = local.map(str::to_string);
-            admit_create_grant_end(
+            admit_with(
                 &RemoteAttachGrants::new(),
                 &table,
                 &armed(),
@@ -9973,7 +10151,7 @@ mod create_grant_end_tests {
     #[test]
     fn a_zero_clock_is_refused() {
         let table = spent_table();
-        let result = admit_create_grant_end(
+        let result = admit_with(
             &RemoteAttachGrants::new(),
             &table,
             &armed(),
