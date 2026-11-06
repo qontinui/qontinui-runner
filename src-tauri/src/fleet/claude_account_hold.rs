@@ -828,7 +828,7 @@ pub(crate) async fn account_hold_tick(mem: &mut HoldMemory, env: &HoldEnv) -> Ho
     if !inputs.owns_shared_root_state {
         return decide_hold_action(mem, &inputs);
     }
-    let cached = crate::coord_drain_state::current();
+    let (cached, reason_read) = crate::coord_drain_state::current_with_reason_read();
     match &cached {
         CoordDrainState::NotEnrolled { .. } => {
             inputs.drain = DrainView::NotEnrolled;
@@ -862,14 +862,17 @@ pub(crate) async fn account_hold_tick(mem: &mut HoldMemory, env: &HoldEnv) -> Ho
     mem.observe_readiness(ready);
     // Ready and the cached drain shows no own hold: there is nothing to
     // release, so the table can only say "nothing" — skip the read.
-    // A cached drain whose reason was never read (the boot read and the
-    // heartbeat's one refresh both failed) may be the own hold, and so may a
-    // hold this process recorded: read in both cases rather than leave the
-    // hold to its 24 h deadline.
+    // A cached drain whose reason was never read (no me/drain read has landed
+    // for it: the boot read and the heartbeat's one refresh both failed) may be
+    // the own hold, and so may a hold this process recorded: read in both cases
+    // rather than leave the hold to its 24 h deadline. A reason READ as absent
+    // does not force a read: the own hold always carries `OWN_REASON_PREFIX`, so
+    // a read that found no reason has proved this drain is not the own hold, and
+    // a reason-less operator drain costs one read for its life, not one per tick.
     let cached_maybe_own = matches!(
         &cached,
         CoordDrainState::Drained { reason, .. }
-            if reason.is_none() || is_own_reason(reason.as_deref())
+            if (reason.is_none() && !reason_read) || is_own_reason(reason.as_deref())
     );
     if ready && !cached_maybe_own && mem.recorded.is_none() {
         return HoldAction::Nothing(Idle::Ready);

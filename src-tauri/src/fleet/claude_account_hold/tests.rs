@@ -4,8 +4,10 @@
 //! [`run_account_hold_loop`] (boot-read wait, ticker, per-tick timeout); the
 //! other over_http tests call its tick body [`account_hold_tick`] directly. The
 //! `main.rs` spawn is not run here; it is pinned by `worker_supervisor`'s
-//! source-text test. The fake coord does not check `Authorization`, so the
-//! bearer choice is not covered.
+//! source-text test. The fake coord does not check `Authorization`; the bearer
+//! choice is covered in `coord_drain_state`'s tests instead (the pure
+//! `heartbeat_bearer_scope_with` arms, and a source-text pin that the
+//! `me/drain` read and the hold's writes both present it).
 
 use super::*;
 use chrono::TimeZone;
@@ -717,11 +719,15 @@ mod over_http {
     /// coord's self-hold door and drain read, as far as the tick can see them.
     #[derive(Debug, Default)]
     struct FakeCoord {
-        /// The agent lane's record: `(stored reason, until)`.
-        lane: Option<(String, DateTime<Utc>)>,
+        /// The agent lane's record: `(stored reason, until)`. An operator drain
+        /// may carry no reason, which coord then omits from the wire.
+        lane: Option<(Option<String>, DateTime<Utc>)>,
         holds: Vec<serde_json::Value>,
         releases: Vec<serde_json::Value>,
         drain_reads: usize,
+        /// `me/drain` reads to answer 503 before serving the lane (each still
+        /// counts in `drain_reads`).
+        drain_read_failures: usize,
         /// Scripted release answers, served before the door's own logic.
         release_script: VecDeque<serde_json::Value>,
         tenant: Uuid,
@@ -735,10 +741,15 @@ mod over_http {
 
     fn drain_wire(c: &FakeCoord) -> serde_json::Value {
         match &c.lane {
-            Some((reason, until)) => serde_json::json!({
-                "state": "drained", "until": until, "reason": reason,
-                "dispatch_role": "workhorse",
-            }),
+            Some((reason, until)) => {
+                let mut wire = serde_json::json!({
+                    "state": "drained", "until": until, "dispatch_role": "workhorse",
+                });
+                if let Some(reason) = reason {
+                    wire["reason"] = serde_json::json!(reason);
+                }
+                wire
+            }
             None => serde_json::json!({"state": "clear", "dispatch_role": "workhorse"}),
         }
     }
@@ -756,6 +767,10 @@ mod over_http {
         match (method.as_str(), uri.path()) {
             ("GET", "/coord/devices/me/drain") => {
                 c.drain_reads += 1;
+                if c.drain_read_failures > 0 {
+                    c.drain_read_failures -= 1;
+                    return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+                }
                 let mut wire = drain_wire(&c);
                 wire["device_id"] = serde_json::json!(Uuid::nil());
                 axum::Json(wire).into_response()
@@ -772,11 +787,11 @@ mod over_http {
                 let changed = match &c.lane {
                     // The door's repeat rule: keep the reason, move the until
                     // only past its 60 s tolerance.
-                    Some((reason, old))
+                    Some((Some(reason), old))
                         if reason.starts_with(&format!("restart-hold:{prepare}:")) =>
                     {
                         if (until - *old).num_seconds().abs() > 60 {
-                            c.lane = Some((reason.clone(), until));
+                            c.lane = Some((Some(reason.clone()), until));
                             true
                         } else {
                             false
@@ -790,7 +805,7 @@ mod over_http {
                             .into_response()
                     }
                     None => {
-                        c.lane = Some((stored, until));
+                        c.lane = Some((Some(stored), until));
                         true
                     }
                 };
@@ -1003,6 +1018,7 @@ mod over_http {
             assert_eq!(c.holds.len(), 1, "the second not-ready tick holds: {c:?}");
             assert_eq!(c.holds[0]["prepare_id"], PREPARE_ID);
             let (reason, until) = c.lane.clone().expect("coord holds the lane");
+            let reason = reason.expect("the own hold carries a reason");
             assert!(
                 reason.starts_with("restart-hold:no-claude-account:"),
                 "{reason}"
@@ -1079,7 +1095,12 @@ mod over_http {
                 ticks.load(Ordering::SeqCst) >= NOT_READY_TICKS_TO_HOLD,
                 "held before two not-ready ticks"
             );
-            let reason = lock(&coord).lane.clone().expect("coord holds the lane").0;
+            let reason = lock(&coord)
+                .lane
+                .clone()
+                .expect("coord holds the lane")
+                .0
+                .expect("the own hold carries a reason");
             assert!(
                 reason.starts_with("restart-hold:no-claude-account:"),
                 "{reason}"
@@ -1143,7 +1164,7 @@ mod over_http {
         let until = Utc::now() + chrono::Duration::hours(20);
         // The heartbeat sees the lane go drained and reads its reason from coord,
         // which holds the own hold.
-        lock(&coord).lane = Some((own_reason(), until));
+        lock(&coord).lane = Some((Some(own_reason()), until));
         crate::coord_drain_state::note_heartbeat(
             crate::coord_drain_state::HeartbeatOutcome::Registered {
                 drain: DrainObservation::Drained {
@@ -1221,7 +1242,7 @@ mod over_http {
     async fn an_operator_undrain_of_a_hold_left_by_the_previous_run_is_respected() {
         let (base, coord) = start_fake_coord().await;
         let _runner = NoAccountRunner::arrange(&base).await;
-        lock(&coord).lane = Some((own_reason(), Utc::now() + chrono::Duration::hours(20)));
+        lock(&coord).lane = Some((Some(own_reason()), Utc::now() + chrono::Duration::hours(20)));
         let env = primary_env();
         let mut mem = HoldMemory::default();
 
@@ -1268,7 +1289,7 @@ mod over_http {
         });
         {
             let mut c = lock(&coord);
-            c.lane = Some((own_reason(), until));
+            c.lane = Some((Some(own_reason()), until));
             let absent = serde_json::json!({
                 "tenant_id": c.tenant, "outcome": "absent", "read_back": still_own,
             });
@@ -1300,7 +1321,7 @@ mod over_http {
         let until = Utc::now() + chrono::Duration::hours(20);
         {
             let mut c = lock(&coord);
-            c.lane = Some((own_reason(), until));
+            c.lane = Some((Some(own_reason()), until));
             c.releases.clear();
             let still_own = serde_json::json!({
                 "state": "drained", "until": until, "reason": own_reason(),
@@ -1324,6 +1345,125 @@ mod over_http {
             HoldAction::Nothing(Idle::ReleaseLeftToDeadline)
         );
         assert_eq!(lock(&coord).releases.len(), 3, "not retried every tick");
+    }
+
+    /// A reason-less operator drain costs ONE me/drain read for its life, not
+    /// one per tick: the heartbeat cached it with its reason unread (its one
+    /// refresh failed), so the first ready tick reads it — and that read, which
+    /// found no reason, proves it is not the own hold, so later ticks skip.
+    #[tokio::test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "the default-location check reads the real login Keychain on macOS"
+    )]
+    async fn a_ready_runner_reads_a_reasonless_operator_drain_once() {
+        let (base, coord) = start_fake_coord().await;
+        let runner = NoAccountRunner::arrange(&base).await;
+        runner.log_in();
+        let until = Utc::now() + chrono::Duration::hours(20);
+        {
+            let mut c = lock(&coord);
+            c.lane = Some((None, until));
+            // The heartbeat's reason refresh fails, so the reason stays unread.
+            c.drain_read_failures = 1;
+        }
+        crate::coord_drain_state::note_heartbeat(
+            crate::coord_drain_state::HeartbeatOutcome::Registered {
+                drain: DrainObservation::Drained {
+                    until: Some(until),
+                    reason: None,
+                },
+            },
+        )
+        .await;
+        assert_eq!(
+            crate::coord_drain_state::current_with_reason_read(),
+            (
+                CoordDrainState::Drained {
+                    until: Some(until),
+                    reason: None
+                },
+                false
+            ),
+            "the premise: a cached drain whose reason was never read"
+        );
+        lock(&coord).drain_reads = 0;
+
+        let env = primary_env();
+        let mut mem = HoldMemory::default();
+        for _ in 0..3 {
+            account_hold_tick(&mut mem, &env).await;
+        }
+        let c = lock(&coord);
+        assert_eq!(
+            c.drain_reads, 1,
+            "one read settles a reason-less drain: {c:?}"
+        );
+        assert!(c.holds.is_empty() && c.releases.is_empty(), "{c:?}");
+    }
+
+    /// A release whose `read_back` is a drain with no reason (an operator drain
+    /// left on the lane once the own hold is gone) settles that drain: the next
+    /// ready tick makes no me/drain read.
+    #[tokio::test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "the default-location check reads the real login Keychain on macOS"
+    )]
+    async fn a_release_read_back_with_no_reason_settles_that_drain() {
+        let (base, coord) = start_fake_coord().await;
+        let runner = NoAccountRunner::arrange(&base).await;
+        let own_until = Utc::now() + chrono::Duration::hours(20);
+        let operator_until = Utc::now() + chrono::Duration::hours(30);
+        {
+            let mut c = lock(&coord);
+            c.lane = Some((Some(own_reason()), own_until));
+            let tenant = c.tenant;
+            c.release_script.push_back(serde_json::json!({
+                "tenant_id": tenant, "outcome": "released",
+                "read_back": {
+                    "state": "drained", "until": operator_until,
+                    "dispatch_role": "workhorse",
+                },
+            }));
+        }
+        crate::coord_drain_state::observe_me_drain(DrainObservation::Drained {
+            until: Some(own_until),
+            reason: Some(own_reason()),
+        });
+        runner.log_in();
+        let env = primary_env();
+        let mut mem = HoldMemory::default();
+
+        account_hold_tick(&mut mem, &env).await;
+        let reads = {
+            let mut c = lock(&coord);
+            assert_eq!(c.releases.len(), 1, "released: {c:?}");
+            // The operator's drain is what is left on the lane.
+            c.lane = Some((None, operator_until));
+            c.drain_reads
+        };
+        assert_eq!(
+            crate::coord_drain_state::current_with_reason_read(),
+            (
+                CoordDrainState::Drained {
+                    until: Some(operator_until),
+                    reason: None
+                },
+                true
+            ),
+            "the read-back is folded as a read"
+        );
+
+        assert_eq!(
+            account_hold_tick(&mut mem, &env).await,
+            HoldAction::Nothing(Idle::Ready)
+        );
+        assert_eq!(
+            lock(&coord).drain_reads,
+            reads,
+            "the read-back already settled the drain"
+        );
     }
 
     /// A secondary reads nothing and writes nothing, whatever its accounts say.

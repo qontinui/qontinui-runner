@@ -854,12 +854,6 @@ const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
     ("claude_session/trust_gate.rs", "device", 1),
     ("commands/ai_settings.rs", "device", 1),
     ("commands/claims.rs", "session-noop", 1),
-    // `GET /coord/devices/me/drain` (plan
-    // `2026-09-13-drained-runner-never-reaches-idle`): `me` resolves to the
-    // device the JWT is for, the drain row is keyed by device_id, and the
-    // request carries no tenant field — `device` by construction, and it stays
-    // correct however many tenants this device is paired with.
-    ("coord_drain_state.rs", "device", 1),
     ("coord_http.rs", "device", 1),
     ("coord_http.rs", "escalated", 1),
     ("coord_http.rs", "session-noop", 1),
@@ -973,8 +967,15 @@ const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
 /// `GET /coord/repos/tenants` read. It is `device` by the route's contract:
 /// coord answers it over the caller DEVICE's own `tenant_devices` bindings and
 /// refuses any principal that does not prove a device. So `device` 21 -> 22.
+///
+/// Plan `2026-11-05-account-hold-me-drain-read-uses-the-dead-default-binding-and-re-reads-a-reasonless-drain`
+/// then moved `coord_drain_state.rs`'s `GET /coord/devices/me/drain` read onto
+/// the stating seam: it presents `LocalBindingSet::bearer_scope`, the register
+/// heartbeat's bearer (`heartbeat_bearer_scope`, shared with the account hold's
+/// `me/hold` / `me/release` writes), so a device whose legacy slot is dead no
+/// longer sends the read unauthenticated. So `device` 22 -> 21.
 const EXPECTED_TENANT_SCOPE_TOTALS: &[(&str, usize)] = &[
-    ("device", 22),
+    ("device", 21),
     ("session-noop", 11),
     ("session-owed", 0),
     ("work-owed", 8),
@@ -1136,8 +1137,8 @@ fn every_defaulting_call_site_declares_its_tenant_scope() {
         "every scanned defaulting call site should have been classified"
     );
     assert_eq!(
-        sites, 43,
-        "expected 43 defaulting call sites — the Phase-2 census's 52 at ebbd3c70 minus the 12 \
+        sites, 42,
+        "expected 42 defaulting call sites — the Phase-2 census's 52 at ebbd3c70 minus the 12 \
          session-scoped ones Phase 5 moved onto the tenant-STATING seam (52 - 12 = 40), plus 1 \
          new work-owed defaulting call site (mcp/plan_library.rs's upstream_get_raw, the \
          body-export forward, which shares upstream_get's qontinui-web base and its \
@@ -1189,7 +1190,11 @@ fn every_defaulting_call_site_declares_its_tenant_scope() {
          bindings and refuses any principal that does not prove a device): 41 + 1 = 42. Plan \
          2026-09-30-session-attribution-is-too-sparse-to-derive-a-terminal-state Phase 4 then \
          added agent_runtime's report_session_launched (POST /agents/{{agent_id}}/session, \
-         session-noop): 42 to 43. Found {sites}. A change here \
+         session-noop): 42 to 43. Plan \
+         2026-11-05-account-hold-me-drain-read-uses-the-dead-default-binding-and-re-reads-a-reasonless-drain \
+         then moved coord_drain_state.rs's `GET /coord/devices/me/drain` read onto the stating \
+         seam (it presents LocalBindingSet::bearer_scope, the register heartbeat's bearer): \
+         43 - 1 = 42. Found {sites}. A change here \
          is fine — it just has \
          to be deliberate. It goes DOWN when a site adopts \
          `attach_device_auth_for(.., TenantScope)`, and UP only when someone adds a new \
