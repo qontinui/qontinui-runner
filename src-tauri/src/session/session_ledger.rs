@@ -3566,7 +3566,10 @@ mod tests {
         rec.restore_tier = Some(RESTORE_TIER_RESUMED.to_string());
         rec.restored_from_boot_at = Some(boot - 3_600_000);
         store.record_open(rec);
-        let live = view(vec![(format!("term-{U1}").as_str(), Ok(vec![resumed_proc(U1)]))]);
+        let live = view(vec![(
+            format!("term-{U1}").as_str(),
+            Ok(vec![resumed_proc(U1)]),
+        )]);
         let observed = observe_restored(&store, boot, Some(&live));
         assert_eq!(observed.len(), 1, "{observed:?}");
         assert_eq!(observed[0].observed, Some(Observed::Back), "{observed:?}");

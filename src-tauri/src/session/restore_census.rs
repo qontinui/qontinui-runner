@@ -478,9 +478,16 @@ pub fn diff_census(
         // Only a stamp whose tier NAMES this entry's bucket labels it — a
         // `failed` row whose `claude` later came back reads Back, but its tier
         // says the restore did not land, so it labels nothing here.
-        let bucket_tier = if verified { RESTORE_TIER_RESUMED } else { RESTORE_TIER_TERMINAL_ONLY };
-        let names_bucket = |o: &&RestoredObservation| o.restore_tier.as_deref() == Some(bucket_tier);
-        let stamped = std::iter::once(obs).chain(same_verdict()).find(names_bucket);
+        let bucket_tier = if verified {
+            RESTORE_TIER_RESUMED
+        } else {
+            RESTORE_TIER_TERMINAL_ONLY
+        };
+        let names_bucket =
+            |o: &&RestoredObservation| o.restore_tier.as_deref() == Some(bucket_tier);
+        let stamped = std::iter::once(obs)
+            .chain(same_verdict())
+            .find(names_bucket);
         let row = CensusRestored {
             claude_session_id: obs.claude_session_id.clone(),
             terminal_id: bound_terminal_id(&place.terminal_id),
@@ -916,8 +923,16 @@ mod tests {
             assert_eq!(d.verdict, RESTORE_VERDICT_MATCH);
             // The restored entry names the live successor's tile, not the dead
             // one, and keeps the boot stamp the closed predecessor carried.
-            assert_eq!(d.restored[0].terminal_id.as_deref(), Some("term-live"), "{d:?}");
-            assert_eq!(d.restored[0].restore_tier.as_deref(), Some(RESTORE_TIER_RESUMED), "{d:?}");
+            assert_eq!(
+                d.restored[0].terminal_id.as_deref(),
+                Some("term-live"),
+                "{d:?}"
+            );
+            assert_eq!(
+                d.restored[0].restore_tier.as_deref(),
+                Some(RESTORE_TIER_RESUMED),
+                "{d:?}"
+            );
             assert_eq!(d.restored[0].restored_from_boot_at, Some(9_000), "{d:?}");
         }
     }
@@ -946,7 +961,11 @@ mod tests {
             assert_eq!(d.restored.len(), 1, "{d:?}");
             let r = &d.restored[0];
             assert_eq!(r.terminal_id.as_deref(), Some("term-verified"), "{d:?}");
-            assert_eq!(r.restore_tier.as_deref(), Some(RESTORE_TIER_RESUMED), "{d:?}");
+            assert_eq!(
+                r.restore_tier.as_deref(),
+                Some(RESTORE_TIER_RESUMED),
+                "{d:?}"
+            );
             assert_eq!(r.restored_from_boot_at, Some(2), "{d:?}");
         }
     }
@@ -961,7 +980,10 @@ mod tests {
         let mut adopted = observed("a", RESTORE_TIER_RESUMED);
         adopted.restore_tier = None;
         adopted.restored_from_boot_at = None;
-        for rows in [vec![adopted.clone(), failed_back.clone()], vec![failed_back, adopted]] {
+        for rows in [
+            vec![adopted.clone(), failed_back.clone()],
+            vec![failed_back, adopted],
+        ] {
             let d = diff_census(&exp, &rows, Some(true), None);
             assert_eq!(d.restored.len(), 1, "{d:?}");
             assert_eq!(d.restored[0].restore_tier, None, "{d:?}");
