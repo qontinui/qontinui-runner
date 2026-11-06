@@ -868,7 +868,7 @@ def selftest():
     if two["t"]["claudeSessionId"] != "new":
         bad.append("a terminal with two open rows must resolve to the newest openedAt")
     finish_cases = finish_time_cases(bad)
-    stray_cases = stray_selftest(bad, empty) + end_strays_selftest(bad)
+    stray_cases = stray_selftest(bad, empty) + end_strays_selftest(bad) + zombie_live_selftest(bad)
     for line in bad:
         print("SELFTEST FAIL: " + line)
     print(f"selftest: {len(PHRASE_CASES)} phrase cases, {len(WIND_DOWN_CASES)} wind-down reason cases, "
@@ -1064,6 +1064,58 @@ def _tool_argv(cmd, acct="sales", cwd_file="/tmp/claude-1a2b-cwd"):
             + f"' < /dev/null && pwd -P >| {cwd_file}"]
 
 
+def zombie_live_selftest(bad):
+    """ProcFacts.zombie() on real /proc (Linux only; skipped elsewhere): an unreaped child
+    reads zombie; a child whose MAIN thread exited while a worker still runs reads state Z
+    with an empty cmdline too, and must NOT, because it is live work. Returns cases run."""
+    if WINDOWS or not os.path.isdir("/proc/self"):
+        return 0
+    import ctypes
+    import threading
+    kids = []
+    try:
+        dead = os.fork()
+        if dead == 0:
+            os._exit(0)
+        kids.append(dead)
+        r, w = os.pipe()
+        busy = os.fork()
+        if busy == 0:  # the main thread exits; the worker lives until the parent closes the pipe
+            os.close(w)
+            threading.Thread(target=lambda: (os.read(r, 1), os._exit(0))).start()
+            ctypes.CDLL(None).pthread_exit(None)
+            os._exit(1)  # pthread_exit does not return
+        os.close(r)
+        kids.append(busy)
+        deadline, got = time.time() + 5, None
+        while time.time() < deadline:
+            time.sleep(0.1)
+            t = proc_table() or {}
+            try:
+                st = open(f"/proc/{busy}/stat").read().rsplit(")", 1)[1].split()[0]
+            except (OSError, IndexError):
+                st = None
+            if t.get(dead, (0, ["x"]))[1] == [] and st == "Z" and t.get(busy, (0, ["x"]))[1] == []:
+                f = ProcFacts(t)
+                got = (f.zombie(dead), f.zombie(busy))
+                break
+        if got is None:
+            return 0  # this kernel never showed both shapes inside the window: nothing to judge
+        if got != (True, False):
+            bad.append(f"zombie(): unreaped child / main-thread-exited live child = {got}, want (True, False)")
+        return 2
+    finally:
+        try:
+            os.close(w)
+        except (OSError, UnboundLocalError):
+            pass
+        for k in kids:
+            try:
+                os.waitpid(k, 0)
+            except OSError:
+                pass
+
+
 def end_strays_selftest(bad):
     """close_one's signalling half, end_strays(), on wait loops this test starts
     itself (Linux only; skipped elsewhere). It signals nothing but its own children
@@ -1243,6 +1295,17 @@ def stray_selftest(bad, empty_prompt=EMPTY_PROMPT_SCREEN):
                 stray_verdict({7: (1, ["bash.exe", UNREADABLE_CMDLINE])}, 7, ProcFacts({}, start={}, uids={}, files={},
                                                                                   self_pids=set()), 15)[0]:
             bad.append("a Windows / unreadable command line must never read as stray")
+        # (7) an empty-argv child that is NOT a zombie (a live process that blanked its argv,
+        # or a threaded one whose main thread exited) is work; a zombie one runs nothing.
+        n += 1
+        zl = "while ps aux | grep cargo >/dev/null; do sleep 5; done"
+        zt = {1: (0, ["/sbin/init"]), 10: (1, ["/usr/bin/claude"]), 30: (1, ["python3", "cfs.py"]),
+              40: (10, _tool_argv(zl)), 41: (40, [])}
+        for zs, want in ((set(), False), ({41}, True)):
+            got = stray_verdict(zt, 40, ProcFacts(zt, start={}, uids={}, files={}, self_pids={30}, now=now,
+                                                  dirs=set(), zombies=zs), 15)
+            if got[0] is not want:
+                bad.append(f"an empty-argv child with zombies={zs}: {got}, want stray={want}")
         # The classifier, case by case: (want_stray, class or None, command, extra, files, start, kids).
         census = "/s/census/cargo.log"
         old, held = (now - 3 * 3600, set(), "Compiling x\n"), (now - 3 * 3600, {950}, "Compiling x\n")
@@ -1321,6 +1384,9 @@ def stray_selftest(bad, empty_prompt=EMPTY_PROMPT_SCREEN):
             (False, None, f'until ! pgrep -fA "{gp}" >/dev/null; do sleep 15; done', None, {}, None, ()),
             (False, None, "until ! pgrep cargo; do sleep 15; done", None, {}, None, ()),  # no -f: names, not argv
             (True, "a", "while ps aux | grep cargo >/dev/null; do sleep 5; done", None, {}, None, ()),
+            # a probe that exited and is not yet reaped (a zombie: empty cmdline) runs nothing
+            (True, "a", "while ps aux | grep cargo >/dev/null; do sleep 5; done", None, {}, None, ((),)),
+            (True, "b-file", twait, None, {task: old}, None, (("sleep", "20"), ())),
             (False, None, "while ps aux | grep cargo | grep -v grep >/dev/null; do sleep 5; done", None, {}, None,
              ()),  # -v grep drops the loop's own line too, so it ends with its target
             (False, None, "while ps -p 4242 | grep -q 4242; do sleep 5; done", None, {}, None, ()),  # ps -p: selective
@@ -2627,8 +2693,9 @@ class ProcFacts:
     (mtime, holder pids, text), and a path missing from it is gone; `dirs` is the
     set of directories that exist (by default, those holding a `files` path)."""
 
-    def __init__(self, table, start=None, uids=None, files=None, self_pids=None, now=None, dirs=None):
+    def __init__(self, table, start=None, uids=None, files=None, self_pids=None, now=None, dirs=None, zombies=None):
         self.table, self._start, self._uids, self._files = table, start, uids, files
+        self._zombies = None if zombies is None else set(zombies)
         self._dirs = set(dirs) if dirs is not None else (
             None if files is None else {f.rsplit("/", 1)[0] for f in files})
         self.now = time.time() if now is None else now
@@ -2638,6 +2705,32 @@ class ProcFacts:
     def start(self, pid):
         """The process's start time in clock ticks (/proc/<pid>/stat field 22), or None."""
         return self._start.get(pid) if self._start is not None else proc_start(pid)
+
+    def zombie(self, pid):
+        """True when `pid` has wholly exited and awaits its reap, or is gone. Linux only.
+        State Z alone is not enough: a process whose MAIN thread called pthread_exit()
+        while other threads still run also reads Z with an empty cmdline, and it is live
+        work. So a zombie must also have exactly one task left. Any read that fails is
+        False (work). A selftest (`start` passed) has no /proc: `zombies` names its
+        zombies there, and without it an empty argv in the table stands for one."""
+        if self._start is not None:
+            return pid in self._zombies if self._zombies is not None else True
+        if WINDOWS:
+            return False
+        try:
+            stat = open(f"/proc/{pid}/stat").read()
+        except FileNotFoundError:
+            return True  # already reaped: it runs nothing
+        except OSError:
+            return False
+        try:
+            if stat.rsplit(")", 1)[1].split()[0] not in ("Z", "X"):
+                return False
+            return len(os.listdir(f"/proc/{pid}/task")) <= 1
+        except FileNotFoundError:
+            return True  # reaped between the two reads
+        except (OSError, IndexError):
+            return False
 
     def isdir(self, path):
         return path in self._dirs if self._dirs is not None else os.path.isdir(path)
@@ -3053,6 +3146,13 @@ def _stray_verdict(table, pid, facts, idle_min):
     allowed = {"sleep"} | {exe_base(w[0]) for _, _, pipe in chain for w, _ in pipe}
     for d in subtree(table, pid):
         dv = table[d][1]
+        if not dv and facts.zombie(d):
+            # A child that has exited and is not yet reaped reads an EMPTY cmdline (the kernel
+            # frees its argv at exit): most often the loop's own probe, caught between its
+            # exit and bash's wait. It runs nothing. Read as work, it made a real stray miss
+            # one screen at random, and flaked the end_strays selftest on slower CI runners.
+            # A LIVE process with an empty cmdline (one that blanked its own argv) is still work.
+            continue
         if d != pid and dv != argv and not (dv and exe_base(dv[0]) in allowed
                                             and not (exe_base(dv[0]) == "tail" and any(
                                                 a.startswith(("-f", "-F", "--follow")) for a in dv[1:]))):
@@ -3249,6 +3349,23 @@ def nudge_facts(segments):
     return work, streak
 
 
+def nudge_replied(segments):
+    """True when the newest prompt is a /next-move the session really answered:
+    the model itself wrote text after it. A /next-move with no reply, or only
+    Claude Code's own notice (a limit, an expired login, an API error), never ran
+    its turn, so finding no work after it measures nothing."""
+    return bool(segments) and segments[-1]["nudge"] and bool(segments[-1].get("replied"))
+
+
+def model_wrote(e, text):
+    """False for assistant-shaped text Claude Code wrote itself. Those records
+    are flagged, or attributed to the <synthetic> model; LIMIT_RE covers a limit
+    notice from a transcript that predates the flag."""
+    if e.get("isApiErrorMessage") or e["message"].get("model") == "<synthetic>":
+        return False
+    return not LIMIT_RE.search(text[-300:])
+
+
 def subagent_work(path, segments):
     """Add a subagent transcript's work-class tool calls to the segment each
     falls in by time (the newest segment that started at or before it)."""
@@ -3329,7 +3446,7 @@ def transcript_facts(row):
     # (turn_open), so a wake that `last_prompt` ignores can still be read.
     f = {"path": path, "last_activity": None, "last_prompt": None, "last_prompt_text": "",
          "last_asst": None, "final_text": "", "final_text_at": None, "pending_tool": False,
-         "task_prompts": 0, "work_tools_since_nudge": 0, "nudge_streak": 0, "cwd": None,
+         "task_prompts": 0, "work_tools_since_nudge": 0, "nudge_streak": 0, "nudge_replied": False, "cwd": None,
          "last_turn_open": None, "last_turn_open_text": ""}
     open_tools = set()
     turn = {"in": False, "before": None}
@@ -3381,6 +3498,7 @@ def transcript_facts(row):
                     f["final_text"], f["final_text_at"] = b["text"], ms(ts)
                     if segments:
                         segments[-1]["final"] = b["text"]
+                        segments[-1]["replied"] = segments[-1].get("replied") or model_wrote(e, b["text"])
                 elif b.get("type") == "tool_use":
                     open_tools.add(b.get("id"))
                     if segments and is_work_tool(b):
@@ -3394,6 +3512,7 @@ def transcript_facts(row):
         if segments and segments[-1]["nudge"] and t and t >= segments[-1]["at"]:
             subagent_work(sub, segments)
     f["work_tools_since_nudge"], f["nudge_streak"] = nudge_facts(segments)
+    f["nudge_replied"] = nudge_replied(segments)
     return f
 
 

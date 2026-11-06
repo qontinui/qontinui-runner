@@ -132,8 +132,34 @@ Implement the described phase fully:
 > **3. Post-edit verify (after the phase commit):** call verify with
 > `{repo, paths: <files actually touched>, head_sha: "<the new commit
 > sha>", tests_predicted: <the predict response's `detail.affected_tests`,
-> when present>}` — MCP `coord_edit_verify(<JSON>)` or HTTP `curl -fsS -X
-> POST "$COORD_HTTP_URL/coord/edits/verify" …`. Record the composed
+> when present>}` — MCP `coord_edit_verify(<JSON>)`, or the HTTP door,
+> which **requires a credential** once coord takes the tenant and machine
+> from the verified principal (plan
+> `2026-10-31-edit-verify-claim-overlap-reads-a-truncated-scan-as-no-overlap`
+> Phase 2; until that lands an anonymous POST still answers, but use the
+> credentialed form either way). Present a device JWT staged in a private
+> tempfile, never on argv:
+>
+> ```bash
+> JWT="${COORD_DEVICE_JWT:-}"
+> [ -n "$JWT" ] || JWT=$(cat "$HOME/.qontinui/coord-device-jwt" 2>/dev/null)
+> if [ -n "$JWT" ]; then
+>   ( HDR=$(mktemp); trap 'rm -f "$HDR"' EXIT
+>     printf 'Authorization: Bearer %s\n' "$JWT" > "$HDR"
+>     curl -fsS -X POST "${COORD_HTTP_URL:-https://coord.qontinui.io}/coord/edits/verify" \
+>       -H @"$HDR" -H 'Content-Type: application/json' -d '<same JSON>' )
+> else
+>   echo "edit-verify SKIPPED: no device credential"
+> fi
+> ```
+>
+> The file token lives about 4 h, so refresh it first with your deployment's
+> device-credential refresher where one exists. `$COORD_DEVICE_JWT` is read
+> first and the file is the fallback; nothing here checks either token's
+> expiry. A `401`/`403` (an expired token, or a credential coord does not
+> admit as a fleet principal, such as an `/agents/allocate` token) or no
+> credential at all means verify was **skipped**: say so in your Part 3 report,
+> never read it as a clean verify. The predict door stays anonymous. Record the composed
 > outcome (`composed_outcome` + the per-subspace summary) in your Part 3
 > report. A `Contradiction`/`Failure` composed outcome is a report **red
 > flag**, NOT an automatic revert.

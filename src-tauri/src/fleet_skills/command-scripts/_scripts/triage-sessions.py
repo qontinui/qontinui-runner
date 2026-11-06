@@ -36,7 +36,7 @@ page list for the runner on --port is UNKNOWN (exit 3). With --only as well, a t
   layout  runner-layout.py fit --trim-only over every page (under --only or
           --tab, the pages holding those terminals): shrinks each grid to fit its
           remaining tabs, since the runner grows a grid by itself but never
-          shrinks one.
+          shrinks one. A page in tmux work mode is skipped, not re-gridded.
   nudge   nudge-stopped-sessions.py --send: types /next-move into each STOPPED
           row. A session named in this run just finished a turn, so it reads
           BUSY to the idle floor; it is nudged in a second pass limited to the
@@ -1048,6 +1048,7 @@ def main():
                   "nothing to triage")
             return 0
         a.only = ",".join(ids)
+    PASS.screening()
     try:
         terms = [t for t in cfs.terminals() if any(t["id"].startswith(o) for o in a.only.split(",") if o)]
         res, warnings, ready_err = nss.screen(a.idle_min, [o for o in a.only.split(",") if o], a.cooldown_hours,
@@ -1254,6 +1255,7 @@ def pass_row(r, observed_at):
     if verdict in SINCE_FINISHED and isinstance(fin, (int, float)) and not isinstance(fin, bool) and fin > 0:
         since = int(fin)
     screen = r.get("screen")
+    progress = r.get("progress_since_nudge")
     return {
         "terminal_id": r["terminalId"],
         "observed_at": observed_at,
@@ -1265,7 +1267,7 @@ def pass_row(r, observed_at):
         "verdict": verdict,
         "reason_codes": [],
         "state_since_ms": since,
-        "progress_since_nudge": None,
+        "progress_since_nudge": progress if isinstance(progress, bool) else None,
         "action": "none",
         "action_outcome": None,
         "detail": {"reasons": [str(x)[:REASON_CHARS] for x in (r.get("reasons") or [])[:REASONS_MAX]]},
@@ -1362,10 +1364,11 @@ def overlord_versions(runner_sha):
 
 
 def runner_build():
-    """The runner's gitSha from /health, or None when it cannot be read."""
+    """The runner's gitSha from /health, or None when it cannot be read. Never
+    raises: the ledger must not take the run down with it."""
     try:
         sha = cfs.read("/health", "data.gitSha", timeout=20)
-    except cfs.READ_ERRORS:
+    except Exception:  # noqa: BLE001 - READ_ERRORS leaves out a response cut mid-read
         return None
     return sha if isinstance(sha, str) and sha else None
 
@@ -1579,6 +1582,7 @@ class PassRecorder:
     def __init__(self):
         self.doc = None
         self.res = None
+        self.build_before = self.screened_build = None
         self.events = []  # ("rows", step, [acted rows]) or ("file", step, path), in the order the steps ran
         self.steps = {}
         self.lock = None
@@ -1615,8 +1619,18 @@ class PassRecorder:
             return LOCK_BUSY
         return None
 
+    def screening(self):
+        """Call before the screen: see screened()."""
+        self.build_before = runner_build()
+
     def screened(self, res):
+        """The flow metrics compare a pass's build across passes to tell a close
+        from a restart, so the build recorded is the one the rows were screened
+        on: read on both sides of the screen, and None (unknown) when a restart
+        moved it during the screen or a read failed."""
         self.res = res
+        after = runner_build()
+        self.screened_build = after if after == self.build_before else None
 
     def step(self, name, **facts):
         self.steps.setdefault(name, {}).update(facts)
@@ -1670,7 +1684,7 @@ class PassRecorder:
         counts = step_tallies(self.steps, events)
         if dropped:
             counts["ledger"] = {"rows_dropped": dropped}
-        build = runner_build() if build is None else build
+        build = self.screened_build if build is None else build
         return dict(self.doc, runner_build=build,
                     ended_at=rfc3339(now or dt.datetime.now(dt.timezone.utc)), exit_code=code,
                     step_counts=counts, verdict_histogram=histogram,
@@ -1754,6 +1768,7 @@ def ledger_selftest():
     fallback. Reads nothing live and types nothing."""
     import contextlib
     import io
+    globals()["runner_build"] = lambda: None  # the process exits after this selftest
     bad = []
     sid = "0f2a1b3c-4d5e-4f60-8a7b-9c0d1e2f3a4b"
     res = [
@@ -1772,6 +1787,10 @@ def ledger_selftest():
             "detail": {"reasons": ["a", "b", "c"]}, "observed_at": "2026-10-24T00:00:00.000Z"}
     if row != want:
         bad.append(f"pass_row(STOPPED) = {row}")
+    for given, want_progress in [(True, True), (False, False), (None, None), ("yes", None)]:
+        got = pass_row(dict(res[0], progress_since_nudge=given), "x")["progress_since_nudge"]
+        if got is not want_progress:
+            bad.append(f"pass_row(progress_since_nudge={given!r}) = {got!r}")
     fin, held = pass_row(res[1], "x"), pass_row(res[2], "x")
     if (fin["claude_session_id"], fin["account"], fin["state_since_ms"]) != (None, None, 1761270000000):
         bad.append(f"pass_row(FINISHED) = {fin}")
@@ -1819,6 +1838,20 @@ def ledger_selftest():
             (doc["step_counts"]["ledger"], {"rows_dropped": 3}),  # the bad line, t-gone, the unknown action
             (len(doc["rows"]), 3),
         ]
+        # The build recorded is the one the rows were screened on, even when a
+        # restart moved the runner before the pass was written; a restart during
+        # the screen, or a failed read, leaves it unknown.
+        real_build = runner_build
+        try:
+            for before, after, want_build in [("a", "a", "a"), ("a", "b", None), (None, "a", None), ("a", None, None)]:
+                globals()["runner_build"] = lambda v=before: v
+                rec.screening()
+                globals()["runner_build"] = lambda v=after: v
+                rec.screened(res)
+                globals()["runner_build"] = lambda: "at-end"
+                checks.append((rec.build(1, now=when, versions={})["runner_build"], want_build))
+        finally:
+            globals()["runner_build"] = real_build
         for got, exp in checks:
             if got != exp:
                 bad.append(f"build(): {got!r}, want {exp!r}")
