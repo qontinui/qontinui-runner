@@ -202,6 +202,41 @@ jobs:
           # before the pin.
           pin-file: ''
 
+      # Declare WHICH schemas commit this run measured, as a check-run
+      # annotation titled `sibling-measured <owner>/<repo>@<40-hex sha>`.
+      # Because the sibling FLOATS (above), a red here on runner main is often
+      # the runner-leads pair waiting on schemas' half, and re-running it
+      # against the SAME schemas commit can only reproduce the red. coord's
+      # red-main self-heal (paired change: qontinui-coord `sibling_measured.rs`)
+      # reads this title off the failing job and holds its re-run until schemas
+      # main has moved off the measured sha. On 2026-11-05 coord re-ran run
+      # 41993095082 while schemas main still sat at a994ba67: attempt 2
+      # reproduced the red after ~3h queued plus ~25 min of job time, and only
+      # attempt 3, whose job started after the partner (6ccdfeb5) landed,
+      # passed (coord finding bef53e4d).
+      #
+      # Emitted right after the sibling checkout, regardless of what later
+      # steps do, so a later flood of annotations cannot push it past GitHub's
+      # per-job annotation cap. It is a notice, never a failure; a rev-parse
+      # failure emits nothing, which coord reads as "no declaration" and
+      # re-runs as before (the hold fails open).
+      #
+      # SIBLING_REPO must name the repo the checkout step above fetched. That
+      # step passes no `repo:`, so it is checkout-sibling's default; if the
+      # step ever passes one, change this value with it.
+      - name: Declare the measured qontinui-schemas commit
+        shell: bash
+        continue-on-error: true
+        env:
+          SIBLING_REPO: qontinui/qontinui-schemas
+        run: |
+          sha="$(git -C "$GITHUB_WORKSPACE/qontinui-schemas" rev-parse HEAD 2>/dev/null || true)"
+          if [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::notice title=sibling-measured ${SIBLING_REPO}@${sha}::This run compared against ${SIBLING_REPO} ${sha}."
+          else
+            echo "could not resolve the sibling checkout's HEAD; emitting no sibling-measured declaration"
+          fi
+
       # generate_types.sh runs `cargo build --bin export_schemas` which
       # links the runner lib (Tauri-dependent). Tauri 2.x on Linux probes
       # for libwebkit2gtk-4.1, libsoup, libgtk etc. via pkg-config in
