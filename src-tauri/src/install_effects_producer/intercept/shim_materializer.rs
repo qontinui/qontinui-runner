@@ -3316,9 +3316,9 @@ mod identity_cmd_tests {
     }
 
     /// The `.cmd` twin of `nested_claude_cannot_rebind_its_pane_via_the_identity_shim`
-    /// (plan `2026-11-06-nested-claude-rebinds-its-parent-pane`). The `.cmd`
-    /// does not count an empty-valued marker (see its nested-call comment), so
-    /// there is no empty-marker case here.
+    /// (plan `2026-11-06-nested-claude-rebinds-its-parent-pane`). How the `.cmd`
+    /// treats an EMPTY-valued marker is untested (see its nested-call comment),
+    /// so this test asserts no empty-marker case either way.
     #[cfg(windows)]
     #[test]
     fn nested_claude_cannot_rebind_its_pane_via_the_cmd_identity_shim() {
