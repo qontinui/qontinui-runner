@@ -101,7 +101,7 @@ From Windows PowerShell spell it `curl.exe` (bare `curl` there is an alias of `I
 - GET /health - Check if supervisor is running
 - POST /runner/restart - Restart runner (body: force, rebuild, from_working_tree, use_lkg; query: ?wait=)
 
-**About `"rebuild": true`:** it compiles a fresh `origin/main`, NOT your unmerged change; the runner is down for the whole build (it can take ~40 minutes); and the request returns 202 and runs detached, so a refusal shows up in `GET {{supervisor_base}}/builds`, not as a synchronous 409. To exercise an unmerged runner change, use a temporary runner from `POST {{supervisor_base}}/runners/spawn-test` instead of restarting the runner hosting you.
+**About `"rebuild": true`:** it compiles a fresh `origin/main`, NOT your unmerged change; the runner is down for the whole build (about 10 minutes on a warm build slot, longer cold or on a loaded box; the supervisor's `GET {{supervisor_base}}/builds` reports `avg_build_duration_secs`); and the request returns 202 and runs detached, so a refusal shows up in `GET {{supervisor_base}}/builds`, not as a synchronous 409. To exercise an unmerged runner change, use a temporary runner from `POST {{supervisor_base}}/runners/spawn-test` instead of restarting the runner hosting you.
 
 ---
 
