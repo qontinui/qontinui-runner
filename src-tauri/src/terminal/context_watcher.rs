@@ -666,7 +666,7 @@ async fn spawn_continuation(
     // nothing here reporting anything wrong. It also routes straight past the
     // headless-provisioning fix in `agent_runtime::run_continuation_headless`,
     // since that fix runs in whichever process actually handles the POST.
-    let port = crate::install_effects_producer::intercept::bound_port();
+    let port = crate::mcp::types::bound_port();
     let url = format!("http://127.0.0.1:{port}/sessions/spawn");
     let inherited = inherited_context(terminal_id);
     let body = spawn_body(terminal_id, title, coord_session_id, &inherited);
