@@ -209,11 +209,13 @@ pub struct FreshPass {
 /// record statuses whose transcript tail is read:
 /// [`claude_activity::WIND_DOWN_TRANSCRIPT_STATUSES`] for a caller that only
 /// needs the verdict, [`claude_activity::ALL_TRANSCRIPT_STATUSES`] for one
-/// that will also report activity from the same read.
+/// that will also report activity from the same read. `lane` picks the
+/// one-at-a-time flag the record read takes — see [`RecordReadLane`].
 pub async fn fresh_pass(
     app: &tauri::AppHandle,
     grace: Duration,
     tails: &'static [&'static str],
+    lane: RecordReadLane,
 ) -> FreshPass {
     use tauri::Manager;
 
@@ -297,7 +299,7 @@ pub async fn fresh_pass(
     let mut records = HashMap::new();
     let observed = match pass.as_mut() {
         Some(p) => {
-            records = read_wind_down_records(wind_down_pids(&p.report), tails).await;
+            records = read_wind_down_records(wind_down_pids(&p.report), tails, lane).await;
             let now_ms = chrono::Utc::now().timestamp_millis();
             observe_and_apply(
                 app,
@@ -353,7 +355,13 @@ pub async fn recheck(
     claude_session_id: &str,
     terminal_id: &str,
 ) -> Option<WindDownView> {
-    let fresh = fresh_pass(app, grace, claude_activity::WIND_DOWN_TRANSCRIPT_STATUSES).await;
+    let fresh = fresh_pass(
+        app,
+        grace,
+        claude_activity::WIND_DOWN_TRANSCRIPT_STATUSES,
+        RecordReadLane::Executor,
+    )
+    .await;
     if !fresh.observed.looping_registry_resolved {
         return None;
     }
@@ -379,9 +387,37 @@ pub async fn recheck(
 /// never closable — never the verdict's availability.
 pub const RECORD_READ_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// Set while a wind-down record read is running; see
-/// [`claude_activity::InFlightRead`].
-static RECORD_READ_IN_FLIGHT: std::sync::atomic::AtomicBool =
+/// Which caller a pass's record read belongs to. Each lane has its OWN
+/// one-at-a-time flag, so a reporting caller (`GET /restart-readiness`, which
+/// may be polled every Stop turn and reads transcript tails for every status)
+/// can never hold the flag the wind-down executor needs: a contended executor
+/// read makes every session `record_unknown`, and nothing closes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordReadLane {
+    /// The wind-down executor: its pass, its pre-close `recheck`, and the
+    /// finished-close census.
+    Executor,
+    /// A read-only report (`GET /restart-readiness`).
+    Report,
+}
+
+impl RecordReadLane {
+    fn flag(self) -> &'static std::sync::atomic::AtomicBool {
+        match self {
+            RecordReadLane::Executor => &EXECUTOR_RECORD_READ_IN_FLIGHT,
+            RecordReadLane::Report => &REPORT_RECORD_READ_IN_FLIGHT,
+        }
+    }
+}
+
+/// Set while an executor-lane wind-down record read is running; see
+/// [`claude_activity::InFlightRead`] and [`RecordReadLane`].
+static EXECUTOR_RECORD_READ_IN_FLIGHT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Set while a report-lane wind-down record read is running; see
+/// [`RecordReadLane`].
+static REPORT_RECORD_READ_IN_FLIGHT: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 /// The top-level terminal-hosted processes of `report` — the ones a verdict
@@ -407,20 +443,16 @@ fn wind_down_pids(report: &TrackingHealthReport) -> Vec<claude_activity::LivePid
 async fn read_wind_down_records(
     pids: Vec<claude_activity::LivePid>,
     tails: &'static [&'static str],
+    lane: RecordReadLane,
 ) -> HashMap<u32, claude_activity::RecordReading> {
-    read_wind_down_records_with(
-        &RECORD_READ_IN_FLIGHT,
-        RECORD_READ_TIMEOUT,
-        pids,
-        move |pids| {
-            claude_activity::read_records_with(
-                &crate::terminal::transcript::find_claude_config_dirs(),
-                &pids,
-                &claude_activity::proc_start_ticks,
-                tails,
-            )
-        },
-    )
+    read_wind_down_records_with(lane.flag(), RECORD_READ_TIMEOUT, pids, move |pids| {
+        claude_activity::read_records_with(
+            &crate::terminal::transcript::find_claude_config_dirs(),
+            &pids,
+            &claude_activity::proc_start_ticks,
+            tails,
+        )
+    })
     .await
 }
 

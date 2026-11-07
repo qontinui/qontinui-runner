@@ -1341,6 +1341,7 @@ pub async fn restart_readiness_handler(
         app,
         wind_down::grace_from_env(),
         claude_activity::ALL_TRANSCRIPT_STATUSES,
+        wind_down_observer::RecordReadLane::Report,
     )
     .await;
     let wind_down_observer::FreshPass {
@@ -3679,18 +3680,56 @@ mod tests {
         let prior: HashMap<u32, claude_activity::RecordReading> = (1..=9)
             .map(|pid| (pid, claude_activity::RecordReading::Missing))
             .collect();
+        // A panic inside the reader would be swallowed as a `JoinError` by
+        // `read_records_bounded`, so the probe records the consult in a flag
+        // instead — and a control proves the probe can fire.
         static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+        static CONSULTED: AtomicBool = AtomicBool::new(false);
         let evidence = gather_activity_evidence(
             &report,
             &ObservedInputs::default(),
             prior.clone(),
-            || -> Vec<PathBuf> { panic!("no second read when the pass's read covers it") },
+            || -> Vec<PathBuf> {
+                CONSULTED.store(true, Ordering::SeqCst);
+                Vec::new()
+            },
             kernel_agrees,
             RECORD_READ_TIMEOUT,
             &IN_FLIGHT,
         )
         .await;
+        assert!(
+            !CONSULTED.load(Ordering::SeqCst),
+            "no second read when the pass's read covers every undecided process"
+        );
         assert_eq!(evidence.records, prior);
+
+        // Control: drop one undecided pid from the prior read, and the config
+        // dirs ARE consulted for it.
+        static CONTROL_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+        static CONTROL_CONSULTED: AtomicBool = AtomicBool::new(false);
+        let partial: HashMap<u32, claude_activity::RecordReading> = prior
+            .iter()
+            .filter(|(pid, _)| **pid != 9)
+            .map(|(pid, r)| (*pid, r.clone()))
+            .collect();
+        gather_activity_evidence(
+            &report,
+            &ObservedInputs::default(),
+            partial,
+            || -> Vec<PathBuf> {
+                CONTROL_CONSULTED.store(true, Ordering::SeqCst);
+                Vec::new()
+            },
+            kernel_agrees,
+            RECORD_READ_TIMEOUT,
+            &CONTROL_IN_FLIGHT,
+        )
+        .await;
+        assert!(
+            CONTROL_CONSULTED.load(Ordering::SeqCst),
+            "the probe must be able to observe a consult"
+        );
     }
 
     /// L1: the handler's evidence assembly, end to end against a temp config

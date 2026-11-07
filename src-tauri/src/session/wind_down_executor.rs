@@ -821,6 +821,7 @@ async fn wind_down_once(app: &tauri::AppHandle, grace: Duration) {
         app,
         grace,
         crate::session::claude_activity::WIND_DOWN_TRANSCRIPT_STATUSES,
+        wind_down_observer::RecordReadLane::Executor,
     )
     .await;
     let Some(pass) = fresh.pass.as_ref() else {
@@ -1111,6 +1112,7 @@ impl FinishedCloseWorld for LiveFinishedCloseWorld<'_> {
             self.app,
             self.grace,
             crate::session::claude_activity::WIND_DOWN_TRANSCRIPT_STATUSES,
+            wind_down_observer::RecordReadLane::Executor,
         )
         .await;
         if fresh.pass.is_none() {
