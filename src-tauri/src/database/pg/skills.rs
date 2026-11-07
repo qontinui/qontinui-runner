@@ -1,7 +1,8 @@
 //! PostgreSQL user skill operations via Clorinde-generated queries.
 
 use super::PgDb;
-use crate::skills::SkillDefinition;
+use crate::skills::{SkillDefinition, SkillTemplate};
+use tracing::warn;
 
 fn non_empty(s: String) -> Option<String> {
     if s.is_empty() {
@@ -19,9 +20,66 @@ fn json_or_default<T: serde::de::DeserializeOwned + Default>(s: &str) -> T {
     }
 }
 
+/// Parse a row's stored `template` column.
+fn parse_stored_template(raw: &str) -> Result<SkillTemplate, serde_json::Error> {
+    serde_json::from_str(raw)
+}
+
+/// The template a READ serves for a stored row.
+///
+/// A stored template that does not parse (a `playbook` kind stored before that
+/// variant was deleted, or any malformed value) is served as an empty
+/// `single_step`, so one bad row never fails a whole list. That fallback used
+/// to be silent; it now WARNs with the skill id and the parse error, because a
+/// served template that is not the stored one has to say so.
+fn stored_template_or_fallback(skill_id: &str, raw: &str) -> SkillTemplate {
+    parse_stored_template(raw).unwrap_or_else(|e| {
+        warn!(
+            skill_id,
+            error = %e,
+            "user skill: stored template does not parse; serving an empty single_step template in its place"
+        );
+        SkillTemplate::SingleStep {
+            step: std::collections::HashMap::new(),
+        }
+    })
+}
+
+/// Why [`PgDb::update_user_skill`] or [`PgDb::fork_skill`] wrote nothing.
+#[derive(Debug, thiserror::Error)]
+pub enum SkillRewriteError {
+    /// No user skill has the id.
+    #[error("user skill not found: {0}")]
+    NotFound(String),
+    /// The row's stored template does not parse. A read serves it as the empty
+    /// `single_step` fallback ([`stored_template_or_fallback`]), so a rewrite
+    /// built from that read would store the fallback in place of the original.
+    #[error(
+        "user skill {skill_id}: its stored template does not parse ({error}); refusing to \
+         rewrite it, because it is served as an empty single_step template and a rewrite \
+         would store that in place of the original. Delete the skill and create it again."
+    )]
+    UnparseableStoredTemplate { skill_id: String, error: String },
+    /// A pool, query or serialization failure.
+    #[error("{0}")]
+    Failed(String),
+}
+
+/// Refuse to rewrite a row whose stored template does not parse.
+fn require_parseable_stored_template(skill_id: &str, raw: &str) -> Result<(), SkillRewriteError> {
+    parse_stored_template(raw).map(|_| ()).map_err(|e| {
+        SkillRewriteError::UnparseableStoredTemplate {
+            skill_id: skill_id.to_string(),
+            error: e.to_string(),
+        }
+    })
+}
+
 /// Map a Clorinde row to SkillDefinition.
 macro_rules! row_to_skill {
     ($r:expr) => {{
+        // Before the struct literal: `id: $r.id` below moves the id.
+        let template = stored_template_or_fallback(&$r.id, &$r.template);
         SkillDefinition {
             id: $r.id,
             name: $r.name,
@@ -52,11 +110,7 @@ macro_rules! row_to_skill {
                 }
             },
             parameters: json_or_default(&$r.parameters),
-            template: serde_json::from_str(&$r.template).unwrap_or(
-                crate::skills::SkillTemplate::SingleStep {
-                    step: std::collections::HashMap::new(),
-                },
-            ),
+            template,
             // Typed at the boundary (`crate::skills::SkillSource`): an empty
             // column keeps its historical "user" default, and any other value
             // — including one written by a newer schema — is preserved
@@ -124,6 +178,34 @@ impl PgDb {
             .await
             .map_err(|e| crate::database::pg::pg_err("PG get_user_skill", &e))?;
         Ok(row.map(|r| row_to_skill!(r)))
+    }
+
+    /// Read one user skill for a REWRITE ([`Self::update_user_skill`],
+    /// [`Self::fork_skill`]): `Ok(None)` when no row has the id, and
+    /// [`SkillRewriteError::UnparseableStoredTemplate`] when the row's stored
+    /// template does not parse, because the definition [`Self::get_user_skill`]
+    /// would hand back carries the fallback rather than what is stored.
+    async fn get_user_skill_for_rewrite(
+        &self,
+        id: &str,
+    ) -> Result<Option<SkillDefinition>, SkillRewriteError> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| SkillRewriteError::Failed(format!("PG pool error: {}", e)))?;
+        let row = qontinui_db::queries::skills::get_user_skill()
+            .bind(&conn, &id)
+            .opt()
+            .await
+            .map_err(|e| {
+                SkillRewriteError::Failed(crate::database::pg::pg_err("PG get_user_skill", &e))
+            })?;
+        let Some(r) = row else {
+            return Ok(None);
+        };
+        require_parseable_stored_template(&r.id, &r.template)?;
+        Ok(Some(row_to_skill!(r)))
     }
 
     /// Delete a user skill by ID.
@@ -358,22 +440,28 @@ impl PgDb {
     }
 
     /// Update a user skill (COALESCE pattern for optional fields).
+    ///
+    /// Refused ([`SkillRewriteError::UnparseableStoredTemplate`]) when the
+    /// row's stored template does not parse, whether or not the request carries
+    /// a template: the merge below would write the served fallback back over
+    /// the stored one, and a client that round-trips the template it was served
+    /// would send that same fallback.
     pub async fn update_user_skill(
         &self,
         id: &str,
         request: &crate::mcp::skills::UpdateSkillRequest,
-    ) -> Result<SkillDefinition, String> {
+    ) -> Result<SkillDefinition, SkillRewriteError> {
         let conn = self
             .pool
             .get()
             .await
-            .map_err(|e| format!("PG pool error: {}", e))?;
+            .map_err(|e| SkillRewriteError::Failed(format!("PG pool error: {}", e)))?;
 
         // Read existing skill to merge optional fields
         let current = self
-            .get_user_skill(id)
+            .get_user_skill_for_rewrite(id)
             .await?
-            .ok_or_else(|| format!("User skill not found: {}", id))?;
+            .ok_or_else(|| SkillRewriteError::NotFound(id.to_string()))?;
 
         let name = request.name.as_ref().unwrap_or(&current.name);
         let slug = request.slug.as_ref().unwrap_or(&current.slug);
@@ -393,8 +481,9 @@ impl PgDb {
         let phases_json =
             serde_json::to_string(allowed_phases).unwrap_or_else(|_| "[]".to_string());
         let params_json = serde_json::to_string(parameters).unwrap_or_else(|_| "[]".to_string());
-        let template_json = serde_json::to_string(template)
-            .map_err(|e| format!("Failed to serialize template: {}", e))?;
+        let template_json = serde_json::to_string(template).map_err(|e| {
+            SkillRewriteError::Failed(format!("Failed to serialize template: {}", e))
+        })?;
 
         let new_id = format!("user:{}", slug);
 
@@ -420,11 +509,16 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| crate::database::pg::pg_err("PG update_user_skill", &e))?;
+        .map_err(|e| {
+            SkillRewriteError::Failed(crate::database::pg::pg_err("PG update_user_skill", &e))
+        })?;
 
         self.get_user_skill(&new_id)
-            .await?
-            .ok_or_else(|| "Failed to retrieve updated skill".to_string())
+            .await
+            .map_err(SkillRewriteError::Failed)?
+            .ok_or_else(|| {
+                SkillRewriteError::Failed("Failed to retrieve updated skill".to_string())
+            })
     }
 
     /// Export user skills. If `ids` is empty, exports all.
@@ -463,6 +557,10 @@ impl PgDb {
     }
 
     /// Fork a skill by creating a copy with a new ID.
+    ///
+    /// Refused ([`SkillRewriteError::UnparseableStoredTemplate`]) when the
+    /// original's stored template does not parse: the copy would carry the
+    /// served fallback as if it were the original's template.
     #[expect(
         clippy::string_slice,
         reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
@@ -471,11 +569,11 @@ impl PgDb {
         &self,
         skill_id: &str,
         new_name: Option<&str>,
-    ) -> Result<SkillDefinition, String> {
+    ) -> Result<SkillDefinition, SkillRewriteError> {
         let original = self
-            .get_user_skill(skill_id)
+            .get_user_skill_for_rewrite(skill_id)
             .await?
-            .ok_or_else(|| format!("Skill not found: {}", skill_id))?;
+            .ok_or_else(|| SkillRewriteError::NotFound(skill_id.to_string()))?;
 
         let fork_name = new_name
             .map(|n| n.to_string())
@@ -492,8 +590,9 @@ impl PgDb {
             serde_json::to_string(&original.allowed_phases).unwrap_or_else(|_| "[]".to_string());
         let params_json =
             serde_json::to_string(&original.parameters).unwrap_or_else(|_| "[]".to_string());
-        let template_json = serde_json::to_string(&original.template)
-            .map_err(|e| format!("Failed to serialize template: {}", e))?;
+        let template_json = serde_json::to_string(&original.template).map_err(|e| {
+            SkillRewriteError::Failed(format!("Failed to serialize template: {}", e))
+        })?;
         let author_json: Option<String> = original
             .author
             .as_ref()
@@ -507,7 +606,7 @@ impl PgDb {
             .pool
             .get()
             .await
-            .map_err(|e| format!("PG pool error: {}", e))?;
+            .map_err(|e| SkillRewriteError::Failed(format!("PG pool error: {}", e)))?;
         conn.execute(
             "INSERT INTO user_skills (id, name, slug, description, category, tags, icon, color,
                 allowed_phases, parameters, template, source, version, author, checksum,
@@ -529,11 +628,12 @@ impl PgDb {
                 &depends_json as &(dyn tokio_postgres::types::ToSql + Sync),
                 &skill_id as &(dyn tokio_postgres::types::ToSql + Sync),
             ],
-        ).await.map_err(|e| crate::database::pg::pg_err("PG fork_skill", &e))?;
+        ).await.map_err(|e| SkillRewriteError::Failed(crate::database::pg::pg_err("PG fork_skill", &e)))?;
 
         self.get_user_skill(&fork_id)
-            .await?
-            .ok_or_else(|| "Failed to retrieve forked skill".to_string())
+            .await
+            .map_err(SkillRewriteError::Failed)?
+            .ok_or_else(|| SkillRewriteError::Failed("Failed to retrieve forked skill".to_string()))
     }
 
     /// Update the version and checksum of a skill.
@@ -616,5 +716,166 @@ impl PgDb {
         self.get_user_skill(&id)
             .await?
             .ok_or_else(|| "Failed to retrieve created skill".to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A stored row as Clorinde returns it, with `template` as stored.
+    fn stored_row(id: &str, template: &str) -> qontinui_db::queries::skills::ListUserSkills {
+        let at = chrono::DateTime::parse_from_rfc3339("2026-11-07T00:00:00Z")
+            .expect("fixed timestamp parses");
+        qontinui_db::queries::skills::ListUserSkills {
+            id: id.to_string(),
+            name: "Salesforce login".to_string(),
+            slug: "sf-login".to_string(),
+            description: String::new(),
+            category: String::new(),
+            tags: String::new(),
+            icon: String::new(),
+            color: String::new(),
+            allowed_phases: String::new(),
+            parameters: String::new(),
+            template: template.to_string(),
+            source: String::new(),
+            version: String::new(),
+            author: String::new(),
+            checksum: String::new(),
+            depends_on: String::new(),
+            usage_count: 0,
+            approval_status: String::new(),
+            forked_from: String::new(),
+            created_at: at,
+            updated_at: at,
+        }
+    }
+
+    /// Run `f` under a WARN-level capture scoped to this thread; return its
+    /// result and the text it logged. Scoped, not global: tests run in parallel.
+    fn warns_of<R>(f: impl FnOnce() -> R) -> (R, String) {
+        #[derive(Clone, Default)]
+        struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+            type Writer = Captured;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+        let sink = Captured::default();
+        let buf = sink.0.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink)
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        let out = tracing::subscriber::with_default(subscriber, f);
+        let logged =
+            String::from_utf8_lossy(&buf.lock().unwrap_or_else(|e| e.into_inner())).to_string();
+        (out, logged)
+    }
+
+    /// The plan's case: a stored `{"kind":"playbook","content":"x"}` row is
+    /// served as the empty `single_step` fallback, and the read WARNs naming
+    /// the skill and the parse error. Control, through the same capture: a
+    /// parseable row is served as stored and logs nothing, so the warning is
+    /// the unparseable template's and not the capture's.
+    #[test]
+    fn a_stored_playbook_row_is_served_as_the_fallback_with_a_warning_naming_the_skill() {
+        let (skill, logged) = warns_of(|| {
+            row_to_skill!(stored_row(
+                "user:sf-login",
+                r#"{"kind":"playbook","content":"x"}"#
+            ))
+        });
+        assert_eq!(
+            serde_json::to_value(&skill.template).expect("a served template serializes"),
+            serde_json::json!({"kind": "single_step", "step": {}}),
+            "served as the empty single_step fallback"
+        );
+        assert!(
+            logged.contains("stored template does not parse"),
+            "{logged}"
+        );
+        assert!(
+            logged.contains("user:sf-login"),
+            "names the skill: {logged}"
+        );
+        assert!(
+            logged.contains("unknown variant `playbook`"),
+            "carries the parse error: {logged}"
+        );
+
+        let (skill, logged) = warns_of(|| {
+            row_to_skill!(stored_row(
+                "user:lint",
+                r#"{"kind":"single_step","step":{"type":"command"}}"#
+            ))
+        });
+        assert_eq!(
+            serde_json::to_value(&skill.template).expect("a served template serializes"),
+            serde_json::json!({"kind": "single_step", "step": {"type": "command"}}),
+            "a parseable row is served as stored"
+        );
+        assert!(logged.is_empty(), "a parseable row warns nothing: {logged}");
+    }
+
+    /// Every arm of the rewrite gate that update and fork read through. A
+    /// stored template that does not parse (the retired kind, a template
+    /// missing its required field, empty, not JSON) is refused with the skill
+    /// id; every live kind passes.
+    #[test]
+    fn a_rewrite_refuses_a_stored_template_that_does_not_parse() {
+        for raw in [
+            r#"{"kind":"playbook","content":"x"}"#,
+            r#"{"kind":"single_step"}"#,
+            "",
+            "not json",
+        ] {
+            match require_parseable_stored_template("user:sf-login", raw) {
+                Err(SkillRewriteError::UnparseableStoredTemplate { skill_id, error }) => {
+                    assert_eq!(skill_id, "user:sf-login", "{raw:?}");
+                    assert!(!error.is_empty(), "{raw:?}");
+                }
+                other => panic!("{raw:?} must be refused, got {other:?}"),
+            }
+        }
+        for raw in [
+            r#"{"kind":"single_step","step":{}}"#,
+            r#"{"kind":"multi_step","steps":[]}"#,
+            r#"{"kind":"composition","skill_refs":[]}"#,
+        ] {
+            assert!(
+                require_parseable_stored_template("user:x", raw).is_ok(),
+                "{raw} must pass"
+            );
+        }
+    }
+
+    /// The refusal's message names the skill, the cause and the remedy.
+    #[test]
+    fn the_rewrite_refusal_names_the_skill_the_cause_and_the_remedy() {
+        let refusal = require_parseable_stored_template(
+            "user:sf-login",
+            r#"{"kind":"playbook","content":"x"}"#,
+        )
+        .expect_err("a playbook template is refused");
+        let message = refusal.to_string();
+        assert!(message.contains("user:sf-login"), "{message}");
+        assert!(message.contains("unknown variant `playbook`"), "{message}");
+        assert!(message.contains("Delete the skill"), "{message}");
     }
 }
