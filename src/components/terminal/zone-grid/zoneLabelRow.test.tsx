@@ -50,6 +50,7 @@ vi.mock("../useTerminalWindowActions", () => ({
 }));
 vi.mock("../displayTitle", () => ({
   useDisplayTitle: () => "Session name",
+  usePaneLabel: () => ({ primary: "Session name" }),
   TabTitle: () => null,
 }));
 vi.mock("../sessionDurability", async (orig) => ({
