@@ -42,7 +42,10 @@ use super::helpers::{
     filter_element_fields, parse_eval_result, read_window_label, snapshot_signature,
 };
 use super::recovery_executor::attempt_recovery;
-use super::request::{ui_bridge_request_sync, ui_bridge_request_sync_in_window, wrap_ipc_result};
+use super::request::{
+    ui_bridge_request_sync, ui_bridge_request_sync_in_window, wrap_ipc_result,
+    wrap_ipc_result_keeping_failure_data,
+};
 use super::screenshots::capture_runner_window_base64;
 use super::types::{
     classify_transport_error, UIBridgeActionRequest, UIBridgeComponentActionRequest,
@@ -951,9 +954,51 @@ pub(crate) fn recovery_is_genuine(recovery: &super::recovery_executor::RecoveryO
 }
 
 /// Alias for the `execute_action` handler's own return type — the value that
-/// travels from `wrap_ipc_result` through the retry/recovery ladder.
-type ActionResult =
-    Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)>;
+/// travels from [`wrap_element_action_ipc`] through the retry/recovery ladder.
+///
+/// Its error arm is `ApiResponse<serde_json::Value>`, not the flat
+/// `ApiResponse<()>` most handlers answer with, so a failure can carry the
+/// SDK's own payload as `data`.
+type ActionResult = Result<
+    Json<ApiResponse<serde_json::Value>>,
+    (StatusCode, Json<ApiResponse<serde_json::Value>>),
+>;
+
+/// The wrap every SDK `execute_action` reply on the element-action routes goes
+/// through: the element route's first dispatch, its stale-registry retry and
+/// its stable-ref retry, and `type-into`'s mutation step.
+///
+/// It keeps the failure payload ([`wrap_ipc_result_keeping_failure_data`]).
+/// An SDK `{success: false}` carries its whole diagnosis there:
+/// `failureDetails` (the canonical `errorCode`, the covering element
+/// `occludedBy` / `occludedPct` of a refused click, the recovery suggestions)
+/// and a failed `hoverClick`'s `forcedHover`. The flat [`wrap_ipc_result`]
+/// these routes used to call dropped all of it, so the caller got only the
+/// code the runner re-derives from the message. That code is unchanged: both
+/// wraps classify the same verdict, and only the `data` sibling differs.
+fn wrap_element_action_ipc(result: Result<serde_json::Value, String>) -> ActionResult {
+    wrap_ipc_result_keeping_failure_data(result)
+}
+
+/// Widen a flat `ApiResponse<()>` error (what [`parse_eval_result`] and
+/// [`wrap_ipc_result`] return) to the payload-carrying error a route answering
+/// in an [`ActionResult`] needs. Nothing is lost: a flat body has no `data`.
+fn widen_flat_error(
+    (status, Json(flat)): (StatusCode, Json<ApiResponse<()>>),
+) -> (StatusCode, Json<ApiResponse<serde_json::Value>>) {
+    (
+        status,
+        Json(ApiResponse {
+            success: flat.success,
+            data: None,
+            error: flat.error,
+            error_detail: flat.error_detail,
+            hint: flat.hint,
+            code: flat.code,
+            suggestions: flat.suggestions,
+        }),
+    )
+}
 
 /// Re-code a POST-DISPATCH failure as `ACTION_FAILED`, preserving the
 /// handler's own error text verbatim and attaching the recovery audit trail.
@@ -1129,7 +1174,7 @@ pub async fn ui_bridge_execute_action_handler(
     Query(query): Query<ActionQueryParams>,
     headers: HeaderMap,
     body_bytes: axum::body::Bytes,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+) -> ActionResult {
     // Journey ledger choke point (plan 2026-09-20-ui-bridge-represents-the-
     // users-path-and-the-passage-of-time, D3): parse the body ONCE (the same
     // lossy fallback the dispatch applies) and read only the action NAME and
@@ -1190,7 +1235,7 @@ async fn execute_action_dispatch(
     Query(query): Query<ActionQueryParams>,
     headers: HeaderMap,
     body_bytes: axum::body::Bytes,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+) -> ActionResult {
     // Custom body extraction so JSON-parse errors come back with an actionable
     // hint instead of the raw serde_json message. We sidestep axum's
     // `Json<UIBridgeActionRequest>` extractor and parse the bytes ourselves
@@ -1295,7 +1340,7 @@ async fn execute_action_dispatch(
         if state.app_handle.get_webview_window(target).is_none() {
             return Err((
                 StatusCode::NOT_FOUND,
-                Json(api_error(format!(
+                Json(ApiResponse::error(format!(
                     "No runner window labeled '{target}'. Discover live windows via \
                      GET /ui-bridge/control/runner-windows."
                 ))),
@@ -1383,7 +1428,7 @@ async fn execute_action_dispatch(
                         let message = detail.message.clone();
                         return Err((
                             StatusCode::NOT_FOUND,
-                            Json(api_error_detailed(message, detail)),
+                            Json(ApiResponse::error_detailed(message, detail)),
                         ));
                     }
                 }
@@ -1449,7 +1494,7 @@ async fn execute_action_dispatch(
         let msg = detail.message.clone();
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(api_error_detailed(msg, detail)),
+            Json(ApiResponse::error_detailed(msg, detail)),
         ));
     }
 
@@ -1685,7 +1730,7 @@ async fn execute_action_dispatch(
         let msg = detail.message.clone();
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(api_error_detailed(msg, detail)),
+            Json(ApiResponse::error_detailed(msg, detail)),
         ));
     }
 
@@ -1731,10 +1776,9 @@ async fn execute_action_dispatch(
         );
         // Use a structured UiBridgeError so `error_detail.code` is
         // `ACTION_NOT_SUPPORTED` and `error_detail.context` carries the
-        // supported-action list. The Err arm here can't carry a free-form
-        // `data` payload (the handler's Err type is
-        // `Json<ApiResponse<()>>`); the structured detail is the canonical
-        // machine-readable surface in that envelope shape.
+        // supported-action list. Nothing was dispatched, so there is no SDK
+        // payload to carry as `data`: the structured detail is the canonical
+        // machine-readable surface of this pre-IPC body.
         //
         // No later stage re-emits this body. `as_action_failure` is what
         // shapes every post-dispatch failure, and it codes them
@@ -1753,13 +1797,14 @@ async fn execute_action_dispatch(
         let msg = detail.message.clone();
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(api_error_detailed(msg, detail)),
+            Json(ApiResponse::error_detailed(msg, detail)),
         ));
     }
 
     // ── Execute the action ─────────────────────────────────────────────
-    let mut result =
-        wrap_ipc_result(ui_bridge_request_sync(&state, "execute_action", payload.clone()).await);
+    let mut result = wrap_element_action_ipc(
+        ui_bridge_request_sync(&state, "execute_action", payload.clone()).await,
+    );
 
     // ── Issue 1: Stale registry retry ──────────────────────────────────
     // When React unmount/remount creates a new DOM node the old registry
@@ -1804,7 +1849,7 @@ async fn execute_action_dispatch(
 
             // Retry the original action once. Clone so `payload` stays
             // available for the Phase 5 RecoveryExecutor downstream.
-            let retry_result = wrap_ipc_result(
+            let retry_result = wrap_element_action_ipc(
                 ui_bridge_request_sync(&state, "execute_action", payload.clone()).await,
             );
 
@@ -1880,7 +1925,7 @@ async fn execute_action_dispatch(
                                     }),
                                     window_label,
                                 );
-                                let retry_result = wrap_ipc_result(
+                                let retry_result = wrap_element_action_ipc(
                                     ui_bridge_request_sync(&state, "execute_action", retry_payload)
                                         .await,
                                 );
@@ -1935,7 +1980,7 @@ async fn execute_action_dispatch(
     // "not found"), surface it as a distinct HTTP 404 with a structured
     // `error_detail.code == ElementNotFound` — the same envelope the
     // `get_element` DOM-tree / `assert` handlers already return for a typoed
-    // id. Without this, `wrap_ipc_result` routes the prose through
+    // id. Without this, `wrap_element_action_ipc` routes the prose through
     // `classify_transport_error`, which only maps the literal "No element
     // found" string and otherwise falls through to a generic
     // `INTERNAL_SERVER_ERROR` — making a missing-id miss indistinguishable
@@ -1943,8 +1988,10 @@ async fn execute_action_dispatch(
     //
     // This fires ONLY on a true, unrecoverable registry miss: an element
     // that exists but whose action fails carries a different error and
-    // keeps its existing `wrap_ipc_result` envelope untouched. We reuse the
-    // file's own canonical miss predicate (the exact substrings the
+    // keeps the envelope `wrap_element_action_ipc` built, the SDK's failure
+    // payload included. This 404 is the runner's own canonical body (`hint`
+    // forwarded), the one the other element routes answer a miss with. We
+    // reuse the file's own canonical miss predicate (the exact substrings the
     // stale-registry retry above keys on) so behavior stays consistent.
     {
         let is_registry_miss = |err: Option<&str>| -> bool {
@@ -1967,7 +2014,7 @@ async fn execute_action_dispatch(
                  stable-ref fallback; returning ELEMENT_NOT_FOUND",
                 id
             );
-            let mut body = api_error_detailed(
+            let mut body = ApiResponse::error_detailed(
                 format!("Element '{}' not found", id),
                 UiBridgeError::element_not_found(&id),
             );
@@ -2009,6 +2056,11 @@ async fn execute_action_dispatch(
                     .and_then(|d| d.get("code"))
                     .cloned(),
             })),
+            // `body.data` carries the SDK's `failureDetails` now (the route
+            // forwards it to the caller), but it is deliberately NOT fed in
+            // here: its `suggestedActions` would start the executor's
+            // automatic retries on every SDK failure of this arm, which no
+            // measurement covers yet.
             Err((_, body)) => Some(serde_json::json!({
                 "success": false,
                 "error": body.error,
@@ -3805,19 +3857,7 @@ fn apply_strict_timeout_reshape(
             }
             Ok(Json(resp))
         }
-        Err((status, Json(err))) => {
-            // Widen the error type from ApiResponse<()> -> ApiResponse<serde_json::Value>.
-            let widened = ApiResponse {
-                success: err.success,
-                data: None,
-                error: err.error,
-                error_detail: err.error_detail,
-                hint: err.hint,
-                code: err.code,
-                suggestions: err.suggestions,
-            };
-            Err((status, Json(widened)))
-        }
+        Err(flat) => Err(widen_flat_error(flat)),
     }
 }
 
@@ -4419,7 +4459,7 @@ fn type_into_action_payload(element_id: &str, text: &str, clear: bool) -> serde_
 pub async fn ui_bridge_type_into_handler(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+) -> ActionResult {
     let action = crate::journey::cursor::ActionSpec::untargeted_element("type_into");
     let result = ui_bridge_type_into_handler_dispatch(State(Arc::clone(&state)), Json(body)).await;
     crate::journey::capture::record_control_result(&state, &result, action);
@@ -4464,7 +4504,7 @@ pub async fn ui_bridge_type_into_handler(
 async fn ui_bridge_type_into_handler_dispatch(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+) -> ActionResult {
     let selector = body.get("selector").and_then(|v| v.as_str());
     let label = body.get("label").and_then(|v| v.as_str());
     let clear = body.get("clear").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -4478,7 +4518,7 @@ async fn ui_bridge_type_into_handler_dispatch(
         Some(other) => {
             return Err((
                 StatusCode::BAD_REQUEST,
-                Json(api_error(format!(
+                Json(ApiResponse::error(format!(
                     "'text' must be a string (the characters to type); got {other}"
                 ))),
             ));
@@ -4486,7 +4526,7 @@ async fn ui_bridge_type_into_handler_dispatch(
         None => {
             return Err((
                 StatusCode::BAD_REQUEST,
-                Json(api_error(
+                Json(ApiResponse::error(
                     "'text' field is required (the characters to type). To blank a \
                      field, send 'clear': true with 'text': \"\".",
                 )),
@@ -4510,7 +4550,9 @@ async fn ui_bridge_type_into_handler_dispatch(
     } else {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(api_error("'selector' or 'label' field is required")),
+            Json(ApiResponse::error(
+                "'selector' or 'label' field is required",
+            )),
         ));
     };
 
@@ -4522,14 +4564,20 @@ async fn ui_bridge_type_into_handler_dispatch(
     let resolve_js = type_into_resolve_js(&find_expr, index);
     let raw = evaluate_js_expression_in_window(&state, &resolve_js, window_label)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::<serde_json::Value>::error(e)),
+            )
+        })?;
     // An unparseable eval result used to become
     // `ApiResponse::success({"typed": false, "error": "Parse error"})` — an
     // HTTP 200 for a call that demonstrably never ran. Report the runner-side
     // failure it actually is. `parse_eval_result` is the shared form of that
     // rule, so the four sibling routes that kept the laundering arm answer the
     // same way.
-    let resolved = parse_eval_result("type-into", "element-resolution result", &raw)?;
+    let resolved = parse_eval_result("type-into", "element-resolution result", &raw)
+        .map_err(widen_flat_error)?;
 
     if resolved.get("found").and_then(|v| v.as_bool()) != Some(true) {
         let message = resolved
@@ -4537,7 +4585,7 @@ async fn ui_bridge_type_into_handler_dispatch(
             .and_then(|v| v.as_str())
             .unwrap_or("No elements found")
             .to_string();
-        return Err((StatusCode::BAD_REQUEST, Json(api_error(message))));
+        return Err((StatusCode::BAD_REQUEST, Json(ApiResponse::error(message))));
     }
     let element_path = resolved
         .get("path")
@@ -4545,7 +4593,7 @@ async fn ui_bridge_type_into_handler_dispatch(
         .ok_or_else(|| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(
+                Json(ApiResponse::<serde_json::Value>::error(
                     "type-into: element resolution returned no addressable path",
                 )),
             )
@@ -4559,9 +4607,10 @@ async fn ui_bridge_type_into_handler_dispatch(
         window_label,
     )
     .await;
-    // `wrap_ipc_result` flattens the SDK's own refusals (non-input element,
-    // element vanished between the two steps) into an honest HTTP 400.
-    let Json(action) = wrap_ipc_result(action_result)?;
+    // `wrap_element_action_ipc` turns the SDK's own refusals (non-input
+    // element, element vanished between the two steps) into an honest HTTP
+    // 400 that keeps the SDK's failure payload (`failureDetails`) as `data`.
+    let Json(action) = wrap_element_action_ipc(action_result)?;
     let action_data = action.data.unwrap_or(serde_json::Value::Null);
 
     Ok(Json(ApiResponse::success(serde_json::json!({
@@ -6588,7 +6637,7 @@ mod action_not_supported_tests {
     //! change in lockstep, which is exactly the regression guard we want.
     use super::{
         advertise_custom_actions_in_element_response, advertise_custom_actions_in_payload,
-        api_error_detailed, as_action_failure, classify_transport_error, extract_custom_actions,
+        as_action_failure, classify_transport_error, extract_custom_actions,
         extract_supported_actions, fold_custom_actions_into_element, is_action_advertised,
         recovery_is_genuine, ActionResult, Json, StatusCode, UiBridgeError,
     };
@@ -7051,7 +7100,10 @@ mod action_not_supported_tests {
                    exited with code 0. Restart the session before writing to it.";
         let failure: ActionResult = Err((
             StatusCode::BAD_REQUEST,
-            Json(api_error_detailed(msg, classify_transport_error(msg))),
+            Json(ApiResponse::error_detailed(
+                msg,
+                classify_transport_error(msg),
+            )),
         ));
         let recovery = serde_json::to_value(RecoveryOutcome {
             recovered: false,
@@ -7103,7 +7155,10 @@ mod action_not_supported_tests {
         let msg = "No element found matching '#ghost'";
         let failure: ActionResult = Err((
             StatusCode::BAD_REQUEST,
-            Json(api_error_detailed(msg, classify_transport_error(msg))),
+            Json(ApiResponse::error_detailed(
+                msg,
+                classify_transport_error(msg),
+            )),
         ));
         let (_, Json(body)) =
             as_action_failure(failure, "click", "ghost", serde_json::Value::Null).unwrap_err();
@@ -7137,7 +7192,7 @@ mod action_not_supported_tests {
             let msg = format!("{code}: the handler's own diagnosis, verbatim");
             let failure: ActionResult = Err((
                 StatusCode::BAD_REQUEST,
-                Json(api_error_detailed(
+                Json(ApiResponse::error_detailed(
                     msg.clone(),
                     classify_transport_error(&msg),
                 )),
@@ -7171,7 +7226,10 @@ mod action_not_supported_tests {
         let msg = "UI Bridge frontend did not become ready";
         let failure: ActionResult = Err((
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(api_error_detailed(msg, classify_transport_error(msg))),
+            Json(ApiResponse::error_detailed(
+                msg,
+                classify_transport_error(msg),
+            )),
         ));
         let (status, Json(body)) =
             as_action_failure(failure, "click", "btn-1", serde_json::Value::Null).unwrap_err();
@@ -7258,6 +7316,204 @@ mod action_not_supported_tests {
             ctx.get("requested_action").and_then(|v| v.as_str()),
             Some("scrollIntoView"),
             "contract: context.requested_action echoes the rejected action"
+        );
+    }
+}
+
+#[cfg(test)]
+mod element_action_failure_payload_tests {
+    //! Plan
+    //! `2026-11-06-a-ui-action-counts-as-user-evidence-only-when-a-user-could-have-performed-it`,
+    //! Phase 6: an SDK action failure on `POST /ui-bridge/control/element/:id/action`
+    //! answers 4xx with the SDK's own failure payload under `data`, and so does
+    //! `POST /ui-bridge/control/page/type-into`, whose mutation step dispatches
+    //! the same `execute_action` IPC.
+    //!
+    //! Both routes used to flatten that reply through `wrap_ipc_result`, which
+    //! drops it: `failureDetails` (the SDK's canonical `errorCode`, the element
+    //! covering a refused click, the recovery suggestions) never reached the
+    //! caller, and the only code left was the one the runner re-derives from
+    //! the message.
+    //!
+    //! The routes need an `ApiState` (a live Tauri `AppHandle`) that no unit
+    //! test can build, so these tests enter at the seam both routes send every
+    //! `execute_action` reply through, `wrap_element_action_ipc`, fed what
+    //! `ui_bridge_request_sync` hands the route (`extract_response_data` over
+    //! the frontend's envelope), and follow the failure the rest of the way
+    //! each route takes it.
+    use super::{
+        as_action_failure, widen_flat_error, wrap_element_action_ipc, wrap_ipc_result, Json,
+        StatusCode,
+    };
+    use crate::mcp::ui_bridge::request::extract_response_data;
+    use serde_json::json;
+
+    /// The envelope `useControlEvents.ts` (`case "execute_action"`) sends when
+    /// the SDK's `executeAction` answers `success: false`: the SDK's response
+    /// whole under `data`, its `error` mirrored onto the envelope.
+    fn ipc_envelope(response: serde_json::Value) -> serde_json::Value {
+        let error = response["error"].clone();
+        json!({
+            "requestId": "req-7",
+            "type": "execute_action",
+            "success": false,
+            "data": response,
+            "error": error,
+            "timestamp": 1_762_473_600_001_u64,
+        })
+    }
+
+    /// The SDK executor's response to a click it refused because another
+    /// element covers every sampled point of the target (Phase 4:
+    /// `buildActionFailureDetails('UB-ELEM-BLOCKED', …)` with `occludedBy` and
+    /// `occludedPct`). Shaped like the executor's failure return and the SDK's
+    /// `ActionFailureDetails` (`core/types.ts`), with the catalog's recovery
+    /// template for the code (`diagnostics/codes.json`, its "Close the modal or
+    /// popup" entry without the `command` the plan's B-D10 drops).
+    fn blocked_click_response() -> serde_json::Value {
+        let message = "Element 'btn-save' is blocked: div#modal-overlay covers every sampled point";
+        json!({
+            "success": false,
+            "error": message,
+            "failureDetails": {
+                "errorCode": "UB-ELEM-BLOCKED",
+                "message": message,
+                "elementId": "btn-save",
+                "suggestedActions": [
+                    {
+                        "suggestion": "Close the modal or popup",
+                        "confidence": 0.9, "retryable": true, "priority": 1,
+                    },
+                    {
+                        "suggestion": "Dismiss the overlay",
+                        "confidence": 0.8, "retryable": true, "priority": 2,
+                    },
+                    {
+                        "suggestion": "Wait for the blocking element to disappear",
+                        "confidence": 0.6, "retryable": true, "priority": 3,
+                    },
+                ],
+                "retryRecommended": true,
+                "occludedBy": "div#modal-overlay",
+                "occludedPct": 100,
+                "durationMs": 14,
+            },
+            "durationMs": 14,
+            "timestamp": 1_762_473_600_000_u64,
+        })
+    }
+
+    #[test]
+    fn element_action_failure_keeps_the_sdk_failure_details() {
+        let reply = || extract_response_data(&ipc_envelope(blocked_click_response()));
+        let recovery = json!({ "recovered": false, "via": "none", "commandChosen": null });
+
+        // The element route's path: the dispatch's wrap, then the
+        // post-recovery re-coder every unrecovered failure passes through.
+        let (status, Json(body)) = as_action_failure(
+            wrap_element_action_ipc(Ok(reply())),
+            "click",
+            "btn-save",
+            recovery.clone(),
+        )
+        .expect_err("an SDK failure stays a failure");
+        assert!(status.is_client_error(), "got {status}");
+        let wire = serde_json::to_value(&body).unwrap();
+
+        // The SDK's diagnosis reaches the caller under `data`.
+        assert_eq!(
+            wire.pointer("/data/failureDetails/errorCode"),
+            Some(&json!("UB-ELEM-BLOCKED")),
+            "the SDK's failureDetails must survive the route: {wire}"
+        );
+        assert_eq!(
+            wire.pointer("/data/failureDetails/occludedBy"),
+            Some(&json!("div#modal-overlay")),
+            "{wire}"
+        );
+        assert_eq!(
+            wire.pointer("/data/failureDetails/occludedPct"),
+            Some(&json!(100)),
+            "{wire}"
+        );
+        assert_eq!(
+            wire.pointer("/data/failureDetails/suggestedActions/0/suggestion"),
+            Some(&json!("Close the modal or popup")),
+            "{wire}"
+        );
+        // The verdict fields stay siblings of `data`, never duplicated into it.
+        assert!(
+            wire["data"].get("success").is_none() && wire["data"].get("error").is_none(),
+            "{wire}"
+        );
+
+        // Everything else is what the flat wrap answered: the same status, the
+        // same message and the same `error_detail` (its code still classified
+        // from the message, its recovery audit trail still attached).
+        let (flat_status, Json(flat_body)) = as_action_failure(
+            wrap_ipc_result(Ok(reply())).map_err(widen_flat_error),
+            "click",
+            "btn-save",
+            recovery,
+        )
+        .expect_err("the flat wrap fails it too");
+        let flat = serde_json::to_value(&flat_body).unwrap();
+        assert_eq!(status, flat_status);
+        assert_eq!(wire["error"], flat["error"], "{wire}");
+        assert_eq!(wire["error_detail"], flat["error_detail"], "{wire}");
+        assert!(
+            flat.get("data").is_none(),
+            "the flat wrap drops the payload: {flat}"
+        );
+    }
+
+    /// `type-into`'s mutation step answers the seam's failure as is (`?`), with
+    /// no recovery ladder after it. A `type` aimed at a non-input element is
+    /// the SDK's own refusal (`performType`'s `ActionValidationError`, which the
+    /// executor's generic catch arm reports as `UB-ACTION-FAILED`).
+    #[test]
+    fn type_into_element_action_failure_keeps_the_sdk_failure_details() {
+        let message = "Type action requires an input or textarea element";
+        let response = json!({
+            "success": false,
+            "error": message,
+            "failureDetails": {
+                "errorCode": "UB-ACTION-FAILED",
+                "message": message,
+                "elementId": "div.editor",
+                "suggestedActions": [
+                    {
+                        "suggestion": "Check if the element is interactable",
+                        "confidence": 0.7, "retryable": false, "priority": 1,
+                    },
+                    {
+                        "suggestion": "Wait and retry the action",
+                        "command": "wait 1 second then retry",
+                        "confidence": 0.6, "retryable": true, "priority": 2,
+                    },
+                ],
+                "retryRecommended": true,
+                "context": { "action": "type" },
+                "durationMs": 2,
+            },
+            "durationMs": 2,
+            "timestamp": 1_762_473_600_000_u64,
+        });
+        let (status, Json(body)) =
+            wrap_element_action_ipc(Ok(extract_response_data(&ipc_envelope(response))))
+                .expect_err("a refused type stays a failure");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let wire = serde_json::to_value(&body).unwrap();
+        assert_eq!(wire["error"], json!(message), "{wire}");
+        assert_eq!(
+            wire.pointer("/data/failureDetails/errorCode"),
+            Some(&json!("UB-ACTION-FAILED")),
+            "the SDK's failureDetails must survive type-into: {wire}"
+        );
+        assert_eq!(
+            wire.pointer("/data/failureDetails/context/action"),
+            Some(&json!("type")),
+            "{wire}"
         );
     }
 }
