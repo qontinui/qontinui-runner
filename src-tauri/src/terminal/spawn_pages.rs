@@ -53,7 +53,23 @@ pub(crate) enum SpawnGroup {
 }
 
 impl SpawnGroup {
-    /// The page-id prefix; pages are `<prefix>-<n>`.
+    /// Every group, for the frontend-parity test.
+    #[cfg(test)]
+    const ALL: [Self; 8] = [
+        Self::PostMerge,
+        Self::Pr,
+        Self::Impl,
+        Self::Fixer,
+        Self::Steward,
+        Self::Check,
+        Self::Resume,
+        Self::Spawned,
+    ];
+
+    /// The page-id prefix; pages are `<prefix>-<n>`. The frontend titles a page
+    /// by its id only when the prefix is in `SPAWN_GROUP_PAGE_PREFIXES`
+    /// (`src/components/terminal/useTerminalPages.ts`); a test below keeps the
+    /// two lists equal.
     pub(crate) fn page_prefix(self) -> &'static str {
         match self {
             Self::PostMerge => "post-merge",
@@ -308,5 +324,21 @@ mod tests {
         second.release();
         let third = place(SpawnGroup::Check, live());
         assert_eq!(third.page_id(), "checks-1", "releasing frees the slot");
+    }
+
+    #[test]
+    fn the_frontend_titles_exactly_these_page_prefixes() {
+        let ts_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../src/components/terminal/useTerminalPages.ts");
+        let ts = std::fs::read_to_string(&ts_path).expect("read useTerminalPages.ts");
+        let start = ts
+            .find("SPAWN_GROUP_PAGE_PREFIXES = [")
+            .expect("SPAWN_GROUP_PAGE_PREFIXES declared");
+        let list = &ts[start..start + ts[start..].find(']').expect("list closes")];
+        let mut ts_prefixes: Vec<&str> = list.split('"').skip(1).step_by(2).collect();
+        let mut rust_prefixes: Vec<&str> = SpawnGroup::ALL.iter().map(|g| g.page_prefix()).collect();
+        ts_prefixes.sort_unstable();
+        rust_prefixes.sort_unstable();
+        assert_eq!(ts_prefixes, rust_prefixes);
     }
 }
