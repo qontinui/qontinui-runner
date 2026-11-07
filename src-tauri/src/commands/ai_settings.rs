@@ -1278,8 +1278,16 @@ async fn probe_account_usage_uncached(config_dir: String) -> AccountUsageInfo {
     // at `claude_api_warm.rs:174-188`. Refresh failure is non-fatal — we still
     // try the probe with whatever token we have so the caller sees a real auth
     // error rather than a swallowed "couldn't refresh."
+    //
+    // Skipped when the dir holds a long-lived `claude setup-token` token: that
+    // is the token `read_oauth_token` returns and the probe sends, so
+    // refreshing a stale `.credentials.json` beside it would be a token-endpoint
+    // round-trip (and a refresh-token rotation) for a credential nothing uses.
     let creds_path = std::path::PathBuf::from(&config_dir).join(".credentials.json");
-    if is_oauth_token_expired(&creds_path) {
+    let has_long_lived_token =
+        qontinui_runner_lib::claude_oauth_token::from_config_dir(std::path::Path::new(&config_dir))
+            .is_some();
+    if !has_long_lived_token && is_oauth_token_expired(&creds_path) {
         // refresh_credentials_blocking uses reqwest::blocking::Client internally.
         // Calling it directly from async context panics ("Cannot drop a runtime
         // in a context where blocking is not allowed"), so offload to a blocking
