@@ -150,10 +150,12 @@ def test_command_table_matches_snapshot():
     )
 
 
-def test_snapshot_has_116_commands():
+def test_snapshot_has_114_commands():
     # 118 at the move; the two GUI element-capture commands were deleted after
-    # qontinui-runner#2242 removed the html2canvas capture they depended on.
-    assert len(SNAPSHOT.read_text(encoding="utf-8").splitlines()) == 116
+    # qontinui-runner#2242 removed the html2canvas capture they depended on, and
+    # test_results_configure / test_results_status went with the QA-results handler
+    # they drove (see test_no_executor_file_touches_the_deleted_qa_results_handler).
+    assert len(SNAPSHOT.read_text(encoding="utf-8").splitlines()) == 114
 
 
 # 2 ---------------------------------------------------------------------------
@@ -414,8 +416,9 @@ def test_build_command_table_rejects_a_mixin_that_is_not_a_base():
 # ``_host.py`` declares ``ExecutorHost`` under ``if TYPE_CHECKING`` only (``object`` at
 # run time), so its method stubs are not runtime definitions and are not counted.
 # 165 at the move, less the five GUI element-capture methods deleted after
-# qontinui-runner#2242 removed the html2canvas capture they depended on.
-PRE_MOVE_METHOD_COUNT = 160
+# qontinui-runner#2242 removed the html2canvas capture they depended on, and the two
+# ``_cmd_test_results_*`` handlers deleted with the QA-results handler.
+PRE_MOVE_METHOD_COUNT = 158
 QONTINUI_EXECUTOR_MAX_LINES = 1700
 MIXIN_MAX_LINES = 1000
 
@@ -650,3 +653,79 @@ def test_sm_execute_transition_never_reports_an_unstated_success(result):
     response = _sm_handler(result)({"transition_id": "t1"})
     assert response["success"] is False
     assert response["error"]
+
+
+# 7 ---------------------------------------------------------------------------
+# The QA-results handler is deleted, and nothing in the executor may reach for it
+# again. Its module (``test_results_handler.py``) never existed in this repo, so the
+# guarded import always left ``self.test_results_handler = None``, and
+# ``_run_workflow`` called ``self.test_results_handler.is_enabled()`` with no None
+# guard (formerly ``qontinui_executor.py:956``): every python-bridge ``start`` raised
+# AttributeError inside the workflow's ``try``. Plan
+# 2026-11-06-verification-stores-nothing-writes-are-deleted-and-their-open-write-doors-close
+# (Phase 8) deleted the handler, its two commands and the service it would have driven.
+
+_DELETED_HANDLER = "test_results_handler"
+
+
+def handler_accesses(source: str) -> list[int]:
+    """Line numbers at which ``source`` touches the deleted QA-results handler.
+
+    Counted: the attribute (``self.test_results_handler``), a bare name, an import of
+    its module, and a string naming it exactly (``getattr(self, "test_results_handler")``).
+    A comment or prose that merely mentions it is not code, and is not counted.
+    """
+    hits = []
+    for node in ast.walk(ast.parse(source)):
+        if (
+            (isinstance(node, ast.Attribute) and node.attr == _DELETED_HANDLER)
+            or (isinstance(node, ast.Name) and node.id == _DELETED_HANDLER)
+            or (isinstance(node, ast.ImportFrom) and node.module == _DELETED_HANDLER)
+            or (
+                isinstance(node, ast.Import)
+                and any(alias.name == _DELETED_HANDLER for alias in node.names)
+            )
+            or (isinstance(node, ast.Constant) and node.value == _DELETED_HANDLER)
+        ):
+            hits.append(node.lineno)
+    return sorted(hits)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "self.test_results_handler.is_enabled()\n",  # the unguarded :956 read
+        "if self.test_results_handler and x:\n    pass\n",  # a guarded read is still a read
+        "self.test_results_handler = None\n",  # assigning it re-creates the attribute
+        "test_results_handler.configure()\n",  # a bare name
+        "getattr(self, 'test_results_handler', None)\n",  # by string
+        "from test_results_handler import TestResultsHandler\n",  # its module, from-import
+        "import test_results_handler\n",  # its module, plain import
+    ],
+)
+def test_handler_access_scanner_sees_each_shape(source):
+    assert handler_accesses(source) == [1]
+
+
+def test_handler_access_scanner_ignores_prose_and_lookalikes():
+    source = (
+        "# self.test_results_handler was deleted\n"
+        'note = "the test_results_handler is gone"\n'
+        "self.test_results = 1\n"
+        "self.results_handler = 2\n"
+    )
+    assert handler_accesses(source) == []
+
+
+@pytest.mark.parametrize(
+    "path",
+    [EXECUTOR, *sorted(PACKAGE_DIR.glob("*.py"))],
+    ids=lambda p: p.name,
+)
+def test_no_executor_file_touches_the_deleted_qa_results_handler(path):
+    hits = handler_accesses(path.read_text(encoding="utf-8"))
+    assert not hits, (
+        f"{path.name} touches `{_DELETED_HANDLER}` at line(s) {hits}. That handler is "
+        "deleted; its module never existed, so the attribute was always None and the "
+        "unguarded read in _run_workflow failed every `start` with AttributeError."
+    )

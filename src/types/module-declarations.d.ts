@@ -105,7 +105,6 @@ declare module "@qontinui/ui-bridge/artifacts" {
   export interface ArtifactSource {
     specId?: string;
     contractId?: string;
-    matrixId?: string;
     runId?: string;
     triggeredBy: "manual" | "ci" | "scheduled" | "workflow-step";
   }
@@ -135,7 +134,6 @@ declare module "@qontinui/ui-bridge/artifacts" {
   export interface ArtifactQuery {
     specId?: string;
     contractId?: string;
-    matrixId?: string;
     runId?: string;
     dateRange?: { from: string; to: string };
     passedOnly?: boolean;
