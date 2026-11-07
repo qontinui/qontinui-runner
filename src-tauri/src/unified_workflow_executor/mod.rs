@@ -66,6 +66,7 @@ pub mod compensation;
 pub mod conditional_routing;
 pub mod convergence;
 pub mod deferred_feedback;
+mod evaluate_verification;
 mod health_monitor;
 mod loop_controller;
 mod loop_handlers;

@@ -149,6 +149,11 @@ pub fn decide_preconditions(snap: &PreconditionsSnapshot) -> PreconditionDecisio
 pub struct VerificationEvalSnapshot {
     /// All verification steps passed.
     pub all_passed: bool,
+    /// How many step results are required, counted by `required_step_count`.
+    /// Zero means nothing was checked: an empty step list, every step
+    /// filtered out, or only `required: false` steps. Nothing checked is never
+    /// a pass.
+    pub required_steps: usize,
     /// One of the verification steps flagged a critical (infra) failure.
     pub critical_failure: bool,
     /// Current iteration's passed step count (used for fix-progress tracking).
@@ -472,6 +477,7 @@ mod tests {
     fn eval_snap() -> VerificationEvalSnapshot {
         VerificationEvalSnapshot {
             all_passed: false,
+            required_steps: 3,
             critical_failure: false,
             passed_steps: 3,
             best_passed_checks: 3,
