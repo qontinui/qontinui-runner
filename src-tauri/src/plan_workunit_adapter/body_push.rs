@@ -278,14 +278,29 @@ const REPO_STOPWORDS: [&str; 18] = [
     "various", "multiple", "unknown", "all", "any", "several", "same",
 ];
 
-/// The whole-plan declaration marker, anchored at line start (after optional
-/// whitespace and one `>`), so a prose mention such as "the `**Repo(s):**`
-/// line" is not a declaration. `**Repos:**` is the same declaration spelled
-/// differently. `**Repo:**` is NOT accepted: in the corpus it is usually a
-/// per-phase label (`**Repo:** X. **Files:** …`), not the plan's list.
+/// The whole-plan declaration marker. It counts ANYWHERE on a line — after a
+/// list bullet, or mid-line after a status sentence or `**Area:** … ·` —
+/// unless it sits inside a backtick code span (see [`marker_outside_code`]),
+/// which is how prose quotes it ("the `> **Repo(s):**` line").
+/// `**Repos:**` is the same declaration spelled differently. `**Repo:**` is
+/// NOT accepted: in the corpus it is usually a per-phase label
+/// (`**Repo:** X. **Files:** …`), not the plan's list.
 static REPO_DECL_MARKER: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
-    regex::Regex::new(r"^\s*(?:>\s*)?\*\*Repo(?:\(s\)|s):\*\*").expect("valid regex")
+    regex::Regex::new(r"\*\*Repo(?:\(s\)|s):\*\*").expect("valid regex")
 });
+
+/// The first [`REPO_DECL_MARKER`] on `line` that is not inside a backtick code
+/// span (an odd number of backticks before it on the line), as the text after
+/// it.
+fn marker_outside_code(line: &str) -> Option<&str> {
+    REPO_DECL_MARKER
+        .find_iter(line)
+        .find(|m| {
+            line.get(..m.start())
+                .is_some_and(|before| before.matches('`').count() % 2 == 0)
+        })
+        .map(|m| line.get(m.end()..).unwrap_or(""))
+}
 
 /// A continuation line opening with a plain label (`Source: …`, `Area: …`)
 /// starts a new field, so it ends the declaration.
@@ -325,8 +340,9 @@ static REPO_NAME: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::n
 /// `2026-11-02-plan-backed-work-units-carry-no-repos-so-coords-repo-readers-read-empty`
 /// D2):
 ///
-/// 1. Take the first line STARTING with the marker (see `REPO_DECL_MARKER`)
-///    plus its blockquote continuation lines (a `>` line carrying no new
+/// 1. Take the text after the first marker outside a code span (see
+///    `REPO_DECL_MARKER`); when the marker's line is a blockquote, add its
+///    blockquote continuation lines (a `>` line carrying no new
 ///    `**bold**` marker and not opening with a plain `Label:`); each line join
 ///    is a chunk boundary.
 /// 2. Strip parentheticals, cut at a same-line bold label, strip `**`, then cut
@@ -344,7 +360,7 @@ static REPO_NAME: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::n
 ///
 /// How it was checked: a Python port of this function run over every
 /// `plans/*.md` on qontinui-dev-notes `origin/main` `a539cc02d` (2026-11-07,
-/// 3,067 files): 1,534 carry a marker, 1,517 yield at least one repo, and 9
+/// 3,067 files): 1,643 carry a marker, 1,619 yield at least one repo, and 9
 /// emitted tokens are not in `gh repo list qontinui` (51 names) — 5 are
 /// new or out-of-org repos, 4 are prose (`coord`, `decision`, and `skill`/`an`
 /// from a bullet-list declaration, which this parse does not model).
@@ -363,9 +379,9 @@ pub fn extract_repos(body: &str) -> Vec<String> {
     let mut in_blockquote = false;
 
     for line in lines.by_ref() {
-        if let Some(m) = REPO_DECL_MARKER.find(line) {
+        if let Some(tail) = marker_outside_code(line) {
             in_blockquote = line.trim_start().starts_with('>');
-            segments.push(line.get(m.end()..).unwrap_or(""));
+            segments.push(tail);
             break;
         }
     }
@@ -4211,10 +4227,12 @@ mod tests {
         );
     }
 
-    /// Fix 1. The marker is anchored at line start: a prose mention of it
-    /// (corpus, 2026-08-10-plan-and-prompt-library-in-web) is not a
-    /// declaration — it used to yield `line`, `body` and `sha` — and the real
-    /// declaration below it is the one read.
+    /// A marker inside a backtick code span is a prose MENTION, not a
+    /// declaration (corpus, 2026-08-10-plan-and-prompt-library-in-web: it
+    /// used to yield `line`, `body` and `sha`; and
+    /// 2026-07-27-supervisor-restart-reaps-primary-runner, where the backtick
+    /// sits directly before the marker). The real declaration below a
+    /// mention is the one read.
     #[test]
     fn a_prose_mention_of_the_marker_is_not_a_declaration() {
         let mention = "  `> **Repo(s):**` line), body, and sha. Skip on unchanged sha.\n";
@@ -4223,8 +4241,39 @@ mod tests {
             "{:?}",
             extract_repos(mention)
         );
-        let body = format!("{mention}\n> **Repo(s):** qontinui-web\n");
+        let quoted =
+            "`is_temp()` / `is_primary()` accessors. The `**Repo(s):** qontinui-supervisor`\n";
+        assert!(
+            extract_repos(quoted).is_empty(),
+            "{:?}",
+            extract_repos(quoted)
+        );
+        let body = format!("{mention}{quoted}\n> **Repo(s):** qontinui-web\n");
         assert_eq!(extract_repos(&body), vec!["qontinui-web"]);
+    }
+
+    /// A marker after a list bullet is a declaration (corpus,
+    /// 2026-08-05-coord-vacuous-authority-comparisons-sweep). A line-start
+    /// anchor lost this whole population (29 files).
+    #[test]
+    fn a_bullet_prefixed_marker_is_a_declaration() {
+        assert_eq!(
+            extract_repos(
+                "- **Repo(s):** `qontinui-coord` only. No schema change, no qontinui-web change.\n"
+            ),
+            vec!["qontinui-coord"]
+        );
+    }
+
+    /// A marker mid-line, after another field and a `·`, is a declaration
+    /// (corpus, 2026-10-16-no-read-says-which-term-bounds-a-merge-lane).
+    #[test]
+    fn a_mid_line_marker_after_a_middot_is_a_declaration() {
+        let body = "**Area:** `merge-train-throughput` · **Repo(s):** qontinui-web (alembic migrations, first), qontinui-coord (writers, ledger, economics read, count query), qontinui-dev-notes (plan)\n";
+        assert_eq!(
+            extract_repos(body),
+            vec!["qontinui-web", "qontinui-coord", "qontinui-dev-notes"]
+        );
     }
 
     /// Fix 2. A continuation line opening with a plain `Label:` starts a new
