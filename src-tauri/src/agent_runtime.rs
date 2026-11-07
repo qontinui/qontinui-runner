@@ -7122,54 +7122,6 @@ fn headless_bindable_session(exit: HeadlessExit, pinned: uuid::Uuid) -> Option<u
     }
 }
 
-/// Zone ceiling for a continuation page before it is considered "full".
-///
-/// Mirrors the frontend `useZoneLayout.ts` `full-grid` layout, which lays out
-/// at most 9 zones (a 3×3 grid) per page; beyond that, extra sessions spill
-/// into the page's Unassigned list. The backend picker uses this to spread
-/// continuations across non-full pages instead of overflowing one page.
-pub(crate) const CONTINUATION_PAGE_ZONE_CEILING: usize = 9;
-
-/// Choose the page_id a new continuation terminal should land on.
-/// Prefers, in order: the "default" page if under the ceiling, then any other
-/// existing page under the ceiling (fewest terminals first, tie-break by page_id
-/// for determinism), else a freshly-minted uuid.
-///
-/// `counts` is the live `(page_id, terminal count)` map. A page absent from
-/// `counts` is treated as count 0; in particular an absent `"default"` is
-/// treated as empty (so it is chosen when no continuations exist yet). The
-/// picker decides only among the pages PRESENT in `counts` plus the implicit
-/// `"default"`.
-pub(crate) fn pick_continuation_page(
-    counts: &[(String, usize)],
-    ceiling: usize,
-    mint: impl FnOnce() -> String,
-) -> String {
-    // Default page count (absent → 0).
-    let default_count = counts
-        .iter()
-        .find(|(p, _)| p == "default")
-        .map(|(_, c)| *c)
-        .unwrap_or(0);
-    if default_count < ceiling {
-        return "default".to_string();
-    }
-
-    // Among the OTHER existing pages under the ceiling, pick the one with the
-    // fewest terminals; tie-break by lexicographically-smallest page_id for
-    // determinism.
-    let best = counts
-        .iter()
-        .filter(|(p, c)| p != "default" && *c < ceiling)
-        .min_by(|(pa, ca), (pb, cb)| ca.cmp(cb).then_with(|| pa.cmp(pb)));
-    if let Some((page, _)) = best {
-        return page.clone();
-    }
-
-    // Everything full → mint a fresh page.
-    mint()
-}
-
 /// Build the gate-continuation `claude` spawn argv. Pure for unit-testing:
 /// every flag — including the pre-pinned `--session-id` — MUST precede the
 /// trailing positional prompt arg, or the CLI eats it as prompt text.
@@ -7485,22 +7437,20 @@ async fn run_continuation_terminal(
         // Manual default) keeps the prior behavior. RISK note: the id resolver
         // scans config dirs first-hit-wins, but worktree paths are
         // per-continuation-unique, so cross-account binding stays low-probability.
-        // Page distribution: backend continuations historically all landed on the
-        // "default" page, overflowing its 9-zone grid into the Unassigned list. Pick
-        // a non-full page at create-time so continuations spread across pages, and
-        // persist it in the durable record so a restart re-lands on the same page.
-        // Count live terminals per page from the manager's current session list.
-        let counts: Vec<(String, usize)> = {
-            let mut per_page: std::collections::HashMap<String, usize> =
-                std::collections::HashMap::new();
-            for info in terminal_manager.list() {
-                *per_page.entry(info.page_id).or_insert(0) += 1;
-            }
-            per_page.into_iter().collect()
-        };
-        let target_page = pick_continuation_page(&counts, CONTINUATION_PAGE_ZONE_CEILING, || {
-            uuid::Uuid::new_v4().to_string()
-        });
+        // Page placement: the continuation lands on its KIND's page
+        // (`post-merge-<n>`, `impl-<n>`, `fixer-<n>`, …; see
+        // `terminal::spawn_pages`), opening the next page of that kind when the
+        // current one is full. The page id is persisted in the durable record, so
+        // a restart re-lands the session on the same page. The placement is a
+        // reservation until the create below returns.
+        let placement = crate::terminal::spawn_pages::place(
+            crate::terminal::spawn_pages::SpawnGroup::classify(
+                spawn_name.as_deref(),
+                Some(payload.initial_prompt.as_str()),
+            ),
+            || terminal_manager.list().into_iter().map(|info| info.page_id),
+        );
+        let target_page = placement.page_id().to_string();
 
         let mut capture_hint = crate::commands::terminal::SessionCaptureHint {
             config_dir: selected_config_dir.clone(),
@@ -7646,6 +7596,9 @@ async fn run_continuation_terminal(
             // `ci_node::admission` takes for CI work.
             false,
         );
+        // The terminal is listed by the manager now (or the create failed), so the
+        // reservation would only double-count it.
+        placement.release();
 
         let (terminal_id, coord_session_id) = match result {
             Ok(created) => created,
@@ -8581,18 +8534,12 @@ async fn run_condition_check_terminal(
         return Err(anyhow::anyhow!(reason));
     }
 
-    // Spread across non-full pages (same picker + ceiling as the gate path).
-    let counts: Vec<(String, usize)> = {
-        let mut per_page: std::collections::HashMap<String, usize> =
-            std::collections::HashMap::new();
-        for info in terminal_manager.list() {
-            *per_page.entry(info.page_id).or_insert(0) += 1;
-        }
-        per_page.into_iter().collect()
-    };
-    let target_page = pick_continuation_page(&counts, CONTINUATION_PAGE_ZONE_CEILING, || {
-        uuid::Uuid::new_v4().to_string()
-    });
+    // Condition checks share the `checks-<n>` pages (see `terminal::spawn_pages`).
+    let placement = crate::terminal::spawn_pages::place(
+        crate::terminal::spawn_pages::SpawnGroup::Check,
+        || terminal_manager.list().into_iter().map(|info| info.page_id),
+    );
+    let target_page = placement.page_id().to_string();
 
     // Kept for the start verdict below: the transcript probe looks in the
     // selected account's config dir first.
@@ -8644,6 +8591,9 @@ async fn run_condition_check_terminal(
         // session.
         false,
     );
+    // The terminal is listed by the manager now (or the create failed), so the
+    // reservation would only double-count it.
+    placement.release();
 
     match result {
         Ok((terminal_id, coord_session_id)) => {
@@ -12324,10 +12274,6 @@ mod tests {
         );
     }
 
-    /// Sentinel returned by the test mint closure so a mint outcome is
-    /// unambiguous and deterministic (no uuid in tests).
-    const MINTED: &str = "MINTED";
-
     fn s(v: &str) -> Option<String> {
         Some(v.to_string())
     }
@@ -12487,77 +12433,6 @@ mod tests {
         );
         assert!(!fobj.contains_key("phase"));
         assert!(!fobj.contains_key("push_ref"));
-    }
-
-    fn page(id: &str, n: usize) -> (String, usize) {
-        (id.to_string(), n)
-    }
-
-    #[test]
-    fn pick_continuation_page_default_under_ceiling_picks_default() {
-        let counts = [page("default", 3), page("p1", 9)];
-        assert_eq!(
-            pick_continuation_page(&counts, 9, || MINTED.to_string()),
-            "default"
-        );
-    }
-
-    #[test]
-    fn pick_continuation_page_default_full_picks_nonfull_other() {
-        // default at the ceiling, p1 under it → p1.
-        let counts = [page("default", 9), page("p1", 4)];
-        assert_eq!(
-            pick_continuation_page(&counts, 9, || MINTED.to_string()),
-            "p1"
-        );
-        // default over the ceiling behaves the same.
-        let counts = [page("default", 12), page("p1", 4)];
-        assert_eq!(
-            pick_continuation_page(&counts, 9, || MINTED.to_string()),
-            "p1"
-        );
-    }
-
-    #[test]
-    fn pick_continuation_page_default_full_picks_fewest_terminals() {
-        let counts = [
-            page("default", 9),
-            page("p1", 7),
-            page("p2", 2),
-            page("p3", 5),
-        ];
-        assert_eq!(
-            pick_continuation_page(&counts, 9, || MINTED.to_string()),
-            "p2"
-        );
-    }
-
-    #[test]
-    fn pick_continuation_page_tie_breaks_lexicographically() {
-        // p_b and p_a tie at count 3 → smallest page_id wins (p_a).
-        let counts = [page("default", 9), page("p_b", 3), page("p_a", 3)];
-        assert_eq!(
-            pick_continuation_page(&counts, 9, || MINTED.to_string()),
-            "p_a"
-        );
-    }
-
-    #[test]
-    fn pick_continuation_page_everything_full_mints() {
-        let counts = [page("default", 9), page("p1", 9), page("p2", 11)];
-        assert_eq!(
-            pick_continuation_page(&counts, 9, || MINTED.to_string()),
-            MINTED
-        );
-    }
-
-    #[test]
-    fn pick_continuation_page_empty_counts_picks_default() {
-        let counts: [(String, usize); 0] = [];
-        assert_eq!(
-            pick_continuation_page(&counts, 9, || MINTED.to_string()),
-            "default"
-        );
     }
 
     /// The pinned `--session-id <uuid>` pair sits among the flags, BEFORE

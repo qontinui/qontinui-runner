@@ -90,6 +90,32 @@ function savePages(pages: TerminalPageConfig[]) {
 }
 
 /**
+ * The page-id prefixes of the runner's typed spawn pages. MUST equal
+ * `SpawnGroup::page_prefix` in `src-tauri/src/terminal/spawn_pages.rs`, which
+ * places every autonomous spawn on a `<prefix>-<n>` page.
+ */
+export const SPAWN_GROUP_PAGE_PREFIXES = [
+  "post-merge",
+  "pr",
+  "impl",
+  "fixer",
+  "stewards",
+  "checks",
+  "resume",
+  "spawned",
+] as const;
+
+const SPAWN_GROUP_PAGE_RE = new RegExp(`^(?:${SPAWN_GROUP_PAGE_PREFIXES.join("|")})-[1-9][0-9]*$`);
+
+/**
+ * Is `id` a typed spawn page — `post-merge-2`, `impl-1`, `stewards-1`? The
+ * runner stores no label for such a page because its id IS its title.
+ */
+export function isSpawnGroupPageId(id: string): boolean {
+  return SPAWN_GROUP_PAGE_RE.test(id);
+}
+
+/**
  * Pure reconciliation: union the persisted page tabs with the distinct backend
  * page_ids, synthesizing a tab for any backend id NOT already persisted so a
  * minted page (and continuations restored onto it) get a visible, selectable
@@ -394,9 +420,11 @@ export function reconcilePages(
   const now = Date.now();
   const synthesized = missing.map((id) => ({
     id,
-    // "default" keeps its canonical name (matches `loadPages`); any other
-    // minted id gets a sequential "Page N".
-    name: id === "default" ? "Terminal" : `Page ${nextN++}`,
+    // "default" keeps its canonical name (matches `loadPages`); a typed spawn
+    // page (`post-merge-2`, `stewards-1`) is titled by its id, which IS its
+    // name; any other minted id (a uuid) gets a sequential "Page N".
+    name:
+      id === "default" ? "Terminal" : isSpawnGroupPageId(id) ? id : `Page ${nextN++}`,
     createdAt: now,
   }));
   return [...persisted, ...synthesized];

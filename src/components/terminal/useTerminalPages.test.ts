@@ -21,6 +21,7 @@ import { setPageBindings } from "@/lib/pageBindings";
 import { resolveSpawnWorkingDir } from "./useTerminalManager";
 import {
   reconcilePages,
+  isSpawnGroupPageId,
   reorderPagesArray,
   keyboardReorderTarget,
   computeVisiblePages,
@@ -62,6 +63,11 @@ describe("pageIdsFromSessions (wire-field contract)", () => {
 });
 
 describe("reconcilePages", () => {
+  it("titles a typed spawn page by its id and numbers only the minted ones", () => {
+    const out = reconcilePages([DEFAULT], ["post-merge-1", "minted-x", "stewards-2"]);
+    expect(out.map((p) => p.name)).toEqual(["Terminal", "post-merge-1", "Page 1", "stewards-2"]);
+  });
+
   it("appends a synthesized tab for a backend id absent from persisted (terminal_list source)", () => {
     // terminal_list yields a live terminal's page_id not in the tab list.
     const out = reconcilePages([DEFAULT], ["default", "minted-1"]);
@@ -515,5 +521,26 @@ describe("useTerminalPages allPages vs pages (the list-pages roster)", () => {
     expect(hook.allPages.map((p) => p.name)).toEqual(["docked work", "popped work"]);
     expect(hook.pages.map((p) => p.id)).toEqual(["p-docked"]);
     expect(hook.boundPages).toEqual({ "p-popped": "terminal-popout-3" });
+  });
+});
+
+describe("isSpawnGroupPageId", () => {
+  it("accepts every runner group prefix with a positive page number", () => {
+    for (const id of ["post-merge-1", "pr-3", "impl-12", "fixer-1", "stewards-1", "checks-2", "resume-1", "spawned-9"]) {
+      expect(isSpawnGroupPageId(id)).toBe(true);
+    }
+  });
+
+  it("rejects uuids, the default page, unknown prefixes and page 0", () => {
+    for (const id of [
+      "default",
+      "3f2b8c1e-9a4d-4e2f-b1c7-123456789012",
+      "minted-1",
+      "post-merge-0",
+      "post-merge-",
+      "post-merge-runner#1863",
+    ]) {
+      expect(isSpawnGroupPageId(id)).toBe(false);
+    }
   });
 });
