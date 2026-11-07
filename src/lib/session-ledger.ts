@@ -19,19 +19,42 @@ import { invoke } from "@tauri-apps/api/core";
 export type LedgerVerdict = "match" | "partial" | "mismatch" | "unknown";
 
 /**
- * What became of one prior session: it is open (or was restored) again, it
- * did not come back and was unfinished, or it was marked finished and is not
- * expected back (never counted as missing).
+ * What became of one prior session (plan
+ * `2026-11-04-unplanned-restart-restore-is-page-gated-and-counts-unverified-resumes`, D2):
+ * - `back` — a process read shows its `claude` running again this boot (or
+ *   its restore verified, tier `resumed`);
+ * - `attempted-unverified` — a resume was attempted this boot and no process
+ *   read has shown it running;
+ * - `terminal-only` — a terminal is bound to it and no `claude` runs in it;
+ * - `failed` — a resume was attempted this boot and ended without landing;
+ * - `unknown` — whether it runs could not be read (the process table, or its
+ *   pane's, was unreadable) — never counted back;
+ * - `missing` — unfinished, and nothing brought it back;
+ * - `finished` / `closed-by-user` — not expected back.
  */
-export type LedgerOutcomeClass = "back" | "missing" | "finished" | "closed-by-user";
+export type LedgerOutcomeClass =
+  | "back"
+  | "attempted-unverified"
+  | "terminal-only"
+  | "failed"
+  | "unknown"
+  | "missing"
+  | "finished"
+  | "closed-by-user";
 
 /**
  * Why a `missing` session is missing:
  * - `no-attempt` — it was resumable and nothing brought it back;
+ * - `resume-failed` — this boot tried to restore it and it did not land (its
+ *   row is closed now, so it can be resumed);
  * - `not-restorable` — it was never identity-restorable;
  * - `restorability-unknown` — could not be determined; NOT evidence either way.
  */
-export type LedgerMissingReason = "no-attempt" | "not-restorable" | "restorability-unknown";
+export type LedgerMissingReason =
+  | "no-attempt"
+  | "resume-failed"
+  | "not-restorable"
+  | "restorability-unknown";
 
 /** One session on the roster, as it stood when a ledger was captured. */
 export interface LedgerEntry {
@@ -166,6 +189,14 @@ export interface LedgerGeneration {
   sessionCount: number;
   verdict: LedgerVerdict;
   returned: LedgerOutcome[];
+  /** Resumes attempted this boot that no process read has verified — never "back". */
+  attemptedUnverified: LedgerOutcome[];
+  /** Bound to a terminal in which no `claude` runs — never "back". */
+  terminalOnly: LedgerOutcome[];
+  /** Resumes attempted this boot that ended without landing. */
+  failed: LedgerOutcome[];
+  /** Could not be judged: the process read was unavailable. Never "back". */
+  unknown: LedgerOutcome[];
   missing: LedgerOutcome[];
   finished: LedgerOutcome[];
   /** Unfinished sessions the operator has since closed on purpose — not expected back. */
@@ -182,7 +213,16 @@ export interface LedgerReport {
   priorReason: string | null;
   /** The prior boot's roster (the newest generation). */
   expected: LedgerEntry[];
+  /** Verified back: a process read shows the session's `claude` running (D2). */
   returned: LedgerOutcome[];
+  /** Resumes attempted this boot that no process read has verified — never "back". */
+  attemptedUnverified: LedgerOutcome[];
+  /** Bound to a terminal in which no `claude` runs — never "back". */
+  terminalOnly: LedgerOutcome[];
+  /** Resumes attempted this boot that ended without landing. */
+  failed: LedgerOutcome[];
+  /** Could not be judged: the process read was unavailable. Never "back". */
+  unknown: LedgerOutcome[];
   /** Unfinished sessions that did not come back. */
   missing: LedgerOutcome[];
   /** Finished sessions that did not come back — not expected back. */

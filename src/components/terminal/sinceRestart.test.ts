@@ -81,6 +81,10 @@ const back = (id: string, over: Partial<LedgerOutcome> = {}) =>
   outcome(id, { outcome: "back", reason: null, ...over });
 const finished = (id: string) => outcome(id, { outcome: "finished", reason: null, finished: true });
 const closedByUser = (id: string) => outcome(id, { outcome: "closed-by-user", reason: null });
+const unverified = (id: string) => outcome(id, { outcome: "attempted-unverified", reason: null });
+const bareShell = (id: string) => outcome(id, { outcome: "terminal-only", reason: null });
+const failedResume = (id: string) => outcome(id, { outcome: "failed", reason: null });
+const unreadable = (id: string) => outcome(id, { outcome: "unknown", reason: null });
 
 /**
  * The serde field name of a generation's size. Spelled through a constant
@@ -96,6 +100,10 @@ function generation(
     missing?: LedgerOutcome[];
     finished?: LedgerOutcome[];
     closedByUser?: LedgerOutcome[];
+    attemptedUnverified?: LedgerOutcome[];
+    terminalOnly?: LedgerOutcome[];
+    failed?: LedgerOutcome[];
+    unknown?: LedgerOutcome[];
   },
   verdict: LedgerGeneration["verdict"] = "partial",
 ): LedgerGeneration {
@@ -103,6 +111,11 @@ function generation(
   const missing = parts.missing ?? [];
   const fin = parts.finished ?? [];
   const closed = parts.closedByUser ?? [];
+  const attemptedUnverified = parts.attemptedUnverified ?? [];
+  const terminalOnly = parts.terminalOnly ?? [];
+  const failed = parts.failed ?? [];
+  const unknown = parts.unknown ?? [];
+  const unreturned = [...attemptedUnverified, ...terminalOnly, ...failed, ...unknown];
   return {
     file,
     rotatedAtMs: 5_000,
@@ -112,9 +125,14 @@ function generation(
     capturedAt: "x",
     reason: "poll",
     cleanShutdown: true,
-    [SESSION_COUNT]: returned.length + missing.length + fin.length + closed.length,
+    [SESSION_COUNT]:
+      returned.length + unreturned.length + missing.length + fin.length + closed.length,
     verdict,
     returned,
+    attemptedUnverified,
+    terminalOnly,
+    failed,
+    unknown,
     missing,
     finished: fin,
     closedByUser: closed,
@@ -164,6 +182,10 @@ function report(
     priorReason: null,
     expected: [],
     returned: [],
+    attemptedUnverified: [],
+    terminalOnly: [],
+    failed: [],
+    unknown: [],
     missing: [],
     finished: [],
     closedByUser: [],
@@ -290,6 +312,65 @@ describe("rows", () => {
     );
     expect(unknown.selectable).toBe(false);
     expect(unknown.blockedReason).toBe("the account it ran under is unknown");
+  });
+});
+
+describe("rows the backend did not verify back", () => {
+  it("labels each one by its own name, never back, and never pre-selects it", () => {
+    const rows = buildRows(
+      generation("g", {
+        returned: [back("b")],
+        attemptedUnverified: [unverified("u")],
+        terminalOnly: [bareShell("t")],
+        failed: [failedResume("f")],
+        unknown: [unreadable("x")],
+      }),
+      ctx(),
+    );
+    const byId = new Map(rows.map((r) => [r.outcome.claudeSessionId, r]));
+    expect(byId.get("u")).toMatchObject({
+      state: "attempted-unverified",
+      label: "resume not verified",
+    });
+    expect(byId.get("t")).toMatchObject({ state: "terminal-only", label: "terminal only" });
+    expect(byId.get("f")).toMatchObject({ state: "failed", label: "resume failed" });
+    expect(byId.get("x")).toMatchObject({
+      state: "unknown",
+      label: "unknown: process read unavailable",
+    });
+    for (const id of ["u", "t", "f", "x"]) {
+      expect(byId.get(id)?.label).not.toContain("back");
+      expect(byId.get(id)?.selectable).toBe(false);
+    }
+    // Plain about why: these rows are still open, and the door takes closed ones.
+    for (const id of ["u", "t", "f"]) {
+      expect(byId.get(id)?.blockedReason).toBe(
+        "can't resume yet: the session is still recorded as open, and only closed sessions can be resumed from here",
+      );
+    }
+    expect(byId.get("x")?.blockedReason).toBe(
+      "can't resume yet: whether it is still running could not be read",
+    );
+    expect(rows.map((r) => r.outcome.claudeSessionId)).toEqual(["f", "u", "t", "x", "b"]);
+  });
+
+  it("a closed row whose resume failed is a resumable miss that says why", () => {
+    const row = buildRow(outcome("r", { reason: "resume-failed" }), ctx());
+    expect(row).toMatchObject({ state: "missing", selectable: true });
+    expect(row.label).toBe("missing: resume-failed");
+    expect(row.detail).toBe("this boot tried to restore it and the resume did not land");
+  });
+
+  it("an attempted resume on a page not opened is still the attempt, not a page wait", () => {
+    const row = buildRow(unverified("u"), ctx({ complete: [] }));
+    expect(row.state).toBe("attempted-unverified");
+  });
+
+  it("opens the review on a generation whose only gaps are unverified resumes", () => {
+    const r = report([generation("g", { attemptedUnverified: [unverified("u")] })]);
+    expect(defaultGenerationFile(r, new Set())).toBe("g");
+    const ok = report([generation("g", { returned: [back("a")] })]);
+    expect(defaultGenerationFile(ok, new Set())).toBeNull();
   });
 });
 
@@ -462,6 +543,52 @@ describe("strip copy", () => {
       missing: 1,
       waiting: 0,
       text: "1 of 2 sessions from before the restart are back · 1 didn't come back",
+    });
+  });
+
+  // Plan 2026-11-04-unplanned-restart-restore-is-page-gated-and-counts-unverified-resumes, D2.
+  it("never says back for an attempted but unverified resume", () => {
+    const r = report([
+      generation("g", { returned: [back("a")], attemptedUnverified: [unverified("u")] }),
+    ]);
+    expect(stripModel(r, ctx())).toMatchObject({
+      kind: "some-missing",
+      back: 1,
+      total: 2,
+      unverified: 1,
+      text: "1 of 2 sessions from before the restart are back · 1 resume not verified",
+    });
+    const all = report([
+      generation("g", { attemptedUnverified: [unverified("u"), unverified("v")] }),
+    ]);
+    expect(stripModel(all, ctx())).toMatchObject({
+      kind: "some-missing",
+      back: 0,
+      total: 2,
+      text: "0 of 2 sessions from before the restart are back · 2 resumes not verified",
+    });
+  });
+
+  it("names a bare terminal, a failed resume and an unreadable row, each apart from back", () => {
+    const r = report([
+      generation("g", {
+        returned: [back("a")],
+        terminalOnly: [bareShell("t")],
+        failed: [failedResume("f")],
+        unknown: [unreadable("x"), unreadable("y")],
+      }),
+    ]);
+    expect(stripModel(r, ctx())).toMatchObject({
+      kind: "some-missing",
+      back: 1,
+      total: 5,
+      missing: 0,
+      terminalOnly: 1,
+      failed: 1,
+      unknown: 2,
+      text:
+        "1 of 5 sessions from before the restart are back · 1 only a terminal · " +
+        "1 resume failed · 2 could not be checked",
     });
   });
 

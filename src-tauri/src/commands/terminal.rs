@@ -2018,9 +2018,9 @@ pub async fn session_ledger_report(
     let store = app
         .try_state::<Arc<SessionLifecycleStore>>()
         .map(|s| s.inner().clone());
-    let live = crate::session::session_ledger::live_terminal_ids(&app);
+    let live = crate::session::session_ledger::live_view(&app).await;
     spawn_blocking_tracked(move || {
-        crate::session::session_ledger::report(store.as_deref(), live.as_ref())
+        crate::session::session_ledger::report(store.as_deref(), live.as_ref().ok())
     })
     .await
     .map_err(|e| format!("session ledger report failed: {e}"))

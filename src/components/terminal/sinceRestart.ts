@@ -120,8 +120,16 @@ export function pageRestoreSettled(pageId: string, progress: RestoreProgress): b
 
 /** What a row says happened to its session. */
 export type RowState =
-  /** It is open (or was restored) again. */
+  /** A process read shows its `claude` running again (or its restore verified). */
   | "back"
+  /** A resume was attempted this boot and no process read has verified it. Never "back". */
+  | "attempted-unverified"
+  /** A terminal is bound to it and no `claude` runs in it. Never "back". */
+  | "terminal-only"
+  /** A resume was attempted this boot and ended without landing. */
+  | "failed"
+  /** Whether it runs could not be read (the process read was unavailable). Never "back". */
+  | "unknown"
   /** Unfinished, its page restored, and it did not come back. */
   | "missing"
   /** It did not come back, and its account is unknown — the operator must choose one. */
@@ -177,20 +185,57 @@ const SESSION_ID_RE = /^[a-zA-Z0-9_-]+$/;
 
 const MISSING_DETAIL: Record<string, string> = {
   "no-attempt": "it was resumable and nothing brought it back",
+  "resume-failed": "this boot tried to restore it and the resume did not land",
   "not-restorable":
     "it was never identity-restorable (unconfirmed, or no transcript), so a resume cannot bring its conversation back",
   "restorability-unknown": "whether it can be resumed could not be determined",
 };
 
+/**
+ * The chip and tooltip of each backend outcome that is neither back nor a
+ * miss (plan `2026-11-04-unplanned-restart-restore-is-page-gated-and-counts-unverified-resumes`,
+ * D2). None of them says "back": only a process read showing the session's
+ * `claude` running earns that word.
+ */
+type UnreturnedOutcome = "attempted-unverified" | "terminal-only" | "failed" | "unknown";
+
+const UNRETURNED: Record<UnreturnedOutcome, { label: string; detail: string }> = {
+  "attempted-unverified": {
+    label: "resume not verified",
+    detail:
+      "a resume was attempted this boot, or a claude runs in its terminal, and no process read has verified it running as this session",
+  },
+  "terminal-only": {
+    label: "terminal only",
+    detail: "a terminal is bound to it, and no claude runs in that terminal",
+  },
+  failed: {
+    label: "resume failed",
+    detail: "a resume was attempted this boot and ended without landing",
+  },
+  unknown: {
+    label: "unknown: process read unavailable",
+    detail: "the process table could not be read, so whether its claude runs is unknown",
+  },
+};
+
+function isUnreturned(value: string): value is UnreturnedOutcome {
+  return Object.hasOwn(UNRETURNED, value);
+}
+
 /** Sort order: what needs the operator first. */
 const STATE_ORDER: Record<RowState, number> = {
   missing: 0,
   "needs-account": 1,
-  "waiting-page": 2,
-  "waiting-drain": 3,
-  back: 4,
-  "closed-by-user": 5,
-  finished: 6,
+  failed: 2,
+  "attempted-unverified": 3,
+  "terminal-only": 4,
+  unknown: 5,
+  "waiting-page": 6,
+  "waiting-drain": 7,
+  back: 8,
+  "closed-by-user": 9,
+  finished: 10,
 };
 
 export interface RowContext {
@@ -221,6 +266,11 @@ export function buildRow(outcome: LedgerOutcome, ctx: RowContext): SinceRestartR
   if (outcome.outcome === "back") {
     state = "back";
     label = "back";
+  } else if (isUnreturned(outcome.outcome)) {
+    // The backend's own evidence about THIS boot's attempt or pane outranks
+    // the page-restore inference below: the attempt has happened.
+    state = outcome.outcome;
+    ({ label, detail } = UNRETURNED[outcome.outcome]);
   } else if (outcome.outcome === "finished") {
     state = "finished";
     label = "finished";
@@ -250,9 +300,19 @@ export function buildRow(outcome: LedgerOutcome, ctx: RowContext): SinceRestartR
   let blockedReason: string | null = null;
   // A row closed on purpose can still be ticked by hand; it is just never
   // pre-checked (see `preCheckedIds`).
-  if (state !== "missing" && state !== "closed-by-user") {
+  if (state === "needs-account") {
+    blockedReason = "choose an account first";
+  } else if (state === "unknown") {
+    // Still open on its terminal, and whether its claude runs is unreadable.
+    blockedReason = "can't resume yet: whether it is still running could not be read";
+  } else if (isUnreturned(state)) {
+    // Every such row is recorded OPEN (the backend reports a closed
+    // unverified row as `missing`), and the resume door takes closed rows
+    // only. Whether its bound terminal is still alive is not claimed.
     blockedReason =
-      state === "needs-account" ? "choose an account first" : `nothing to resume: ${label}`;
+      "can't resume yet: the session is still recorded as open, and only closed sessions can be resumed from here";
+  } else if (state !== "missing" && state !== "closed-by-user") {
+    blockedReason = `nothing to resume: ${label}`;
   } else if (!account.known) {
     blockedReason = "the account it ran under is unknown";
   } else if (outcome.reason === "not-restorable") {
@@ -276,9 +336,24 @@ export function buildRow(outcome: LedgerOutcome, ctx: RowContext): SinceRestartR
   };
 }
 
+/**
+ * The rows the backend did not verify back and did not call missing: a resume
+ * attempted but unverified, a bare terminal, a failed resume, an unreadable
+ * process read. Expected back, and not back.
+ */
+export function unreturnedOf(gen: LedgerGeneration): LedgerOutcome[] {
+  return [...gen.attemptedUnverified, ...gen.terminalOnly, ...gen.failed, ...gen.unknown];
+}
+
 /** Every row of a generation, the ones needing attention first. */
 export function buildRows(gen: LedgerGeneration, ctx: RowContext): SinceRestartRow[] {
-  return [...gen.missing, ...gen.returned, ...gen.closedByUser, ...gen.finished]
+  return [
+    ...gen.missing,
+    ...unreturnedOf(gen),
+    ...gen.returned,
+    ...gen.closedByUser,
+    ...gen.finished,
+  ]
     .map((o) => buildRow(o, ctx))
     .sort(
       (a, b) =>
@@ -394,8 +469,9 @@ export function selectedResumable(
 
 /**
  * The generation the panel opens on: the NEWEST retained generation (the
- * restart that just happened), when it has at least one unfinished miss the
- * operator has not marked reviewed. `null` — the normal running state — means
+ * restart that just happened), when it has at least one unfinished session
+ * that is not verified back (a miss, an unverified or failed resume, a bare
+ * terminal, an unreadable one) the operator has not marked reviewed. `null` — the normal running state — means
  * the panel shows the current roster (the pre-rebuild preview) instead.
  *
  * Never an OLDER generation: its sessions may have been closed or finished in
@@ -408,7 +484,8 @@ export function defaultGenerationFile(
   reviewed: ReadonlySet<string>,
 ): string | null {
   const newest = thisBootGeneration(report);
-  return newest && newest.missing.length > 0 && !reviewed.has(newest.file) ? newest.file : null;
+  const notBack = newest ? newest.missing.length + unreturnedOf(newest).length : 0;
+  return newest && notBack > 0 && !reviewed.has(newest.file) ? newest.file : null;
 }
 
 /**
@@ -438,6 +515,14 @@ export type StripModel =
       missing: number;
       /** Rows whose page has not restored yet — not counted as missing. */
       waiting: number;
+      /** Resumes attempted this boot that no process read has verified. */
+      unverified: number;
+      /** Bound to a terminal in which no `claude` runs. */
+      terminalOnly: number;
+      /** Resumes attempted this boot that ended without landing. */
+      failed: number;
+      /** Rows whose process read was unavailable. */
+      unknown: number;
       text: string;
     };
 
@@ -454,11 +539,16 @@ const plural = (n: number, one: string, many: string) => (n === 1 ? one : many);
  *   operator leaves one page unopened — exactly when it is needed. Rows whose
  *   page has not restored yet are counted as WAITING, never as missing, and the
  *   strip names them (honesty about uncertainty).
- * - K = 0, W = 0: "All M sessions from before the restart are back".
- * - Otherwise: "N of M sessions from before the restart are back", then
- *   "· K didn't come back" when K > 0 and "· W waiting on pages not opened
- *   yet" when W > 0. With an `unknown` verdict (no restore census this boot)
- *   K is an upper bound and says so.
+ * - Every expected session verified back: "All M sessions from before the
+ *   restart are back". N counts only `returned` — a process read showed the
+ *   session's `claude` running — so an attempted but unverified resume is
+ *   never "back" (plan
+ *   `2026-11-04-unplanned-restart-restore-is-page-gated-and-counts-unverified-resumes`, D2).
+ * - Otherwise: "N of M sessions from before the restart are back", then one
+ *   clause per non-zero count: "· K didn't come back", "· A resumes not
+ *   verified", "· T only a terminal", "· F resumes failed", "· U could not be
+ *   checked", "· W waiting on pages not opened yet". With an `unknown`
+ *   verdict K is an upper bound and says so.
  */
 export function stripModel(report: LedgerReport | null, ctx: RowContext): StripModel | null {
   const gen = thisBootGeneration(report);
@@ -476,16 +566,20 @@ export function stripModel(report: LedgerReport | null, ctx: RowContext): StripM
       text: `Restore deferred by drain — ${waiting} ${plural(waiting, "session", "sessions")} waiting`,
     };
   }
-  const expected = [...gen.returned, ...gen.missing];
+  const expected = [...gen.returned, ...unreturnedOf(gen), ...gen.missing];
   if (expected.length === 0) return null;
   if (ctx.progress.completePages.size === 0) return null;
 
   const missingRows = gen.missing.map((o) => buildRow(o, ctx));
   const k = missingRows.filter((r) => !r.state.startsWith("waiting")).length;
   const waiting = missingRows.length - k;
+  const unverified = gen.attemptedUnverified.length;
+  const terminalOnly = gen.terminalOnly.length;
+  const failed = gen.failed.length;
+  const unknown = gen.unknown.length;
   const back = gen.returned.length;
   const total = expected.length;
-  if (k === 0 && waiting === 0) {
+  if (back === total) {
     return {
       kind: "all-back",
       generationFile,
@@ -501,6 +595,11 @@ export function stripModel(report: LedgerReport | null, ctx: RowContext): StripM
     `${back} of ${total} ${plural(total, "session", "sessions")} from before the restart are back`,
   ];
   if (k > 0) parts.push(`${upperBound}${k} didn't come back`);
+  if (unverified > 0)
+    parts.push(`${unverified} ${plural(unverified, "resume", "resumes")} not verified`);
+  if (terminalOnly > 0) parts.push(`${terminalOnly} only a terminal`);
+  if (failed > 0) parts.push(`${failed} ${plural(failed, "resume", "resumes")} failed`);
+  if (unknown > 0) parts.push(`${unknown} could not be checked`);
   if (waiting > 0)
     parts.push(`${waiting} waiting on ${plural(waiting, "a page", "pages")} not opened yet`);
   return {
@@ -510,6 +609,10 @@ export function stripModel(report: LedgerReport | null, ctx: RowContext): StripM
     total,
     missing: k,
     waiting,
+    unverified,
+    terminalOnly,
+    failed,
+    unknown,
     text: parts.join(" · "),
   };
 }
