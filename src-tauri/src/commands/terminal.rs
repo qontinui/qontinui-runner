@@ -2364,7 +2364,7 @@ pub(crate) struct SessionCaptureHint {
     pub policy_delivery: Option<crate::session::spawn_prompt::PolicyDelivery>,
     /// Why this backend spawn happens. Decides whether its tab is selected on
     /// `terminal-created` (unattended origins are coalesced to at most one
-    /// named surface plus one `Unknown` surface per minute,
+    /// view-switching surface plus one tab-only surface per minute,
     /// [`crate::terminal::focus_coalescer`]); no default, so every caller
     /// states it.
     pub spawn_origin: crate::coord_drain_state::SpawnOrigin,

@@ -116,6 +116,13 @@ export interface TerminalTab {
    */
   restoreTerminalOnly?: boolean;
   /**
+   * True when the runner's focus coalescer suppressed this tab
+   * (`terminal-created` `surface: false`): one of a burst of unattended spawns.
+   * The tab lands without taking the selection or moving the flow grid
+   * (`newestSurfacedTabId`).
+   */
+  coalesced?: boolean;
+  /**
    * F1/F2 — the tenant this session was spawned under, as sent to
    * `terminal_create` (and therefore exactly what the Rust registry stamped
    * onto `Intent.tenant_id`). Immortal for the tab's life: switching the
@@ -285,7 +292,7 @@ export function shouldIngestCreatedTerminal(
  */
 export function reduceCreatedTerminal(
   tabs: TerminalTab[],
-  info: TerminalInfo,
+  info: TerminalCreatedPayload,
   pendingBypass = false,
   pendingRemote?: RemoteTabIdentity,
 ): TerminalTab[] {
@@ -303,6 +310,7 @@ export function reduceCreatedTerminal(
       createdAt: info.createdAt,
       bypassPermissions: pendingBypass || undefined,
       remote: pendingRemote,
+      coalesced: info.surface === false || undefined,
     },
   ];
 }
@@ -312,7 +320,8 @@ export function reduceCreatedTerminal(
  * runner-local `surface` hint (Rust `TerminalCreatedEvent`, flattened beside
  * the info because `TerminalInfo` is the cross-repo wire schema). `surface` is
  * the runner's focus-coalescer verdict: always `true` for an operator-created
- * tab, at most once per minute across unattended spawns (plan
+ * tab; for unattended spawns, at most one view-switching surface plus one
+ * tab-only surface per minute (plan
  * `2026-10-28-runner-spawn-bursts-overwhelm-the-box-beyond-the-continuation-cap`,
  * D3).
  */
@@ -337,6 +346,20 @@ export function nextActiveIdAfterIngest(
   isNewTab: boolean,
 ): string | null {
   return isNewTab && info.surface === true ? info.id : null;
+}
+
+/**
+ * Pure helper: the listener's ingest decision. Records `info.id` in `ingested`
+ * and returns whether this delivery was new and which id, if any, to select. A
+ * re-delivery of the same id selects nothing, whatever its `surface` says.
+ */
+export function noteTerminalCreated(
+  ingested: Set<string>,
+  info: TerminalCreatedPayload,
+): { wasNew: boolean; selectId: string | null } {
+  const wasNew = !ingested.has(info.id);
+  ingested.add(info.id);
+  return { wasNew, selectId: nextActiveIdAfterIngest(info, wasNew) };
 }
 
 /**
@@ -1071,13 +1094,10 @@ export function useTerminalManager(
       // ref-backed dedup set so a re-delivered `terminal-created` is a no-op
       // here just as `reduceCreatedTerminal` dedups it in the updater — only a
       // genuinely-new tab triggers selection, so a re-delivery never steals
-      // focus. The pure decision lives in `nextActiveIdAfterIngest`, fed a
-      // synthetic prev/next pair reflecting whether this id is new.
-      const wasNew = !ingestedIds.current.has(info.id);
-      const selectId = nextActiveIdAfterIngest(info, wasNew);
+      // focus. The pure decision lives in `noteTerminalCreated`.
+      const { wasNew, selectId } = noteTerminalCreated(ingestedIds.current, info);
       setTabs((prev) => reduceCreatedTerminal(prev, info, pendingBypass, pendingRemote));
       if (wasNew) {
-        ingestedIds.current.add(info.id);
         logger.info(
           `External terminal created: ${info.id} (${info.title}) [page ${pageId}] surface=${info.surface === true}`,
         );

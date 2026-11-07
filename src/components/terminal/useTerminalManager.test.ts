@@ -15,6 +15,7 @@ import {
   reduceCreatedTerminal,
   shouldIngestCreatedTerminal,
   nextActiveIdAfterIngest,
+  noteTerminalCreated,
   backfillClaudeSessionIds,
   resolveSpawnWorkingDir,
   reconcileTabsWithBackend,
@@ -196,6 +197,21 @@ describe("nextActiveIdAfterIngest (auto-select on ingest)", () => {
     }
     expect(tabs.map((t) => t.id)).toEqual(["b-1", "b-2", "b-3"]);
     expect(selected).toEqual(["b-1"]);
+    expect(tabs.map((t) => t.coalesced === true)).toEqual([false, true, true]);
+  });
+
+  it("noteTerminalCreated selects a surfaced tab once, and never on a re-delivery", () => {
+    const ingested = new Set<string>();
+    const surfaced = createdEvent("n-1", "default", { surface: true });
+    expect(noteTerminalCreated(ingested, surfaced)).toEqual({ wasNew: true, selectId: "n-1" });
+    expect(ingested.has("n-1")).toBe(true);
+    expect(noteTerminalCreated(ingested, surfaced)).toEqual({ wasNew: false, selectId: null });
+
+    const suppressed = createdEvent("n-2", "default", { surface: false });
+    expect(noteTerminalCreated(ingested, suppressed)).toEqual({ wasNew: true, selectId: null });
+    // A later delivery of a suppressed tab cannot turn into a selection.
+    const late = createdEvent("n-2", "default", { surface: true });
+    expect(noteTerminalCreated(ingested, late)).toEqual({ wasNew: false, selectId: null });
   });
 
   it("end-to-end: a fresh continuation ingest both appends AND selects the tab", () => {
