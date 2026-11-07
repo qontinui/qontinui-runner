@@ -754,8 +754,9 @@ pub const CAPABILITY_SPECS: &[CapabilitySpec] = &[
                       `<workspace-root>/qontinui-claude-config/.claude/agents/*.md` off \
                       the operator's disk. It outranks the embedded floor, so on a box \
                       that has that sibling repo this row — not `fleet_agents` — decides \
-                      what a session actually gets. Two sources for one asset, with \
-                      nothing asserting they agree; when the root does not resolve the \
+                      what a session actually gets. Two sources for one asset; \
+                      qontinui-claude-config's hourly `fleet-agents-parity` gate \
+                      (`agent-bundle-parity.sh`) checks that they agree. When the root does not resolve the \
                       copy is a no-op that logs \"no qontinui-root resolved; skipping \
                       .claude/agents\" and continues.",
         expected_rungs: &[Rung::OperatorCheckout, Rung::Unresolved],
@@ -1093,6 +1094,62 @@ pub struct RemovedUnit {
     pub blob: String,
 }
 
+/// Why a retired unit a pass found on disk is still there.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "reason", content = "detail", rename_all = "snake_case")]
+pub enum RetainedReason {
+    /// Its blob is not one the definition shipped as, so somebody edited it and
+    /// it is kept deliberately (the own-files-only rule). The blob is the copy's.
+    LocallyModified(String),
+    /// The copy could not be read, so its blob could not be compared.
+    ReadFailed(String),
+    /// The copy is a shipped blob, but removing it failed.
+    RemoveFailed(String),
+    /// The agents directory resolves (through a symlink) outside the workdir,
+    /// so nothing in it is removed. The detail is where it resolves to.
+    OutsideWorkdir(String),
+}
+
+impl RetainedReason {
+    /// True for the arms where the pass meant to remove the copy and could not.
+    #[must_use]
+    pub fn is_failure(&self) -> bool {
+        !matches!(self, RetainedReason::LocallyModified(_))
+    }
+
+    /// One line naming the reason, for the log summary and the manifest.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        match self {
+            RetainedReason::LocallyModified(blob) => {
+                format!("locally modified (blob {blob} is not one it shipped as), kept")
+            }
+            RetainedReason::ReadFailed(why) => {
+                format!("could not be read to compare its blob: {why}")
+            }
+            RetainedReason::RemoveFailed(why) => format!("removal failed: {why}"),
+            RetainedReason::OutsideWorkdir(at) => {
+                format!("not removed: the agents directory resolves outside the workdir, to {at}")
+            }
+        }
+    }
+}
+
+/// A RETIRED unit a pass found on disk and left there, so the retired
+/// definition still resolves in that workdir.
+///
+/// Kept apart from [`SkippedUnit`] on purpose: a skip says the session did not
+/// get something it should have, while this says the session still HAS
+/// something it should not. Reporting a failed removal as a "write failed" skip
+/// would state the opposite of what is on disk.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RetainedRetiredUnit {
+    /// The unit's name as the provisioner addresses it (a file name).
+    pub unit: String,
+    /// Why it is still there.
+    pub reason: RetainedReason,
+}
+
 /// What one `provision_*` pass actually delivered.
 ///
 /// **This type does not change fail-soft behaviour and must never be made to.**
@@ -1118,6 +1175,10 @@ pub struct ProvisionReport {
     /// skip, because the session lost nothing it should have, so it moves
     /// neither `written` nor [`Self::is_complete`].
     pub removed: Vec<RemovedUnit>,
+    /// Every RETIRED unit the pass found and left on disk, with why. A failed
+    /// removal or read degrades the pass ([`Self::is_complete`]); a locally
+    /// modified copy kept on purpose does not, but is still named.
+    pub retained_retired: Vec<RetainedRetiredUnit>,
     /// Which rung supplied what was written. [`Rung::Unresolved`] when the pass
     /// delivered nothing at all.
     pub rung: Rung,
@@ -1143,6 +1204,7 @@ impl ProvisionReport {
             written: 0,
             skipped: Vec::new(),
             removed: Vec::new(),
+            retained_retired: Vec::new(),
             rung,
             destination: None,
             detail: None,
@@ -1204,16 +1266,27 @@ impl ProvisionReport {
         });
     }
 
+    /// Record one retired unit this pass found and left on disk, with why.
+    pub fn record_retained_retired(&mut self, unit: impl Into<String>, reason: RetainedReason) {
+        self.retained_retired.push(RetainedRetiredUnit {
+            unit: unit.into(),
+            reason,
+        });
+    }
+
     /// Pin the rung after the fact — used where the rung is only knowable once
     /// the pass has run (nothing written at all is [`Rung::Unresolved`]).
     pub fn set_rung(&mut self, rung: Rung) {
         self.rung = rung;
     }
 
-    /// True when every expected unit was written and nothing was skipped.
+    /// True when every expected unit was written, nothing was skipped, and no
+    /// retired unit the pass meant to remove is still on disk.
     #[must_use]
     pub fn is_complete(&self) -> bool {
-        self.skipped.is_empty() && self.written == self.expected
+        self.skipped.is_empty()
+            && self.written == self.expected
+            && !self.retained_retired.iter().any(|r| r.reason.is_failure())
     }
 
     /// True when this pass delivered less than its roster — the state that used
@@ -1248,6 +1321,15 @@ impl ProvisionReport {
                 out.push_str(&format!(" [{} — blob {}]", removed.unit, removed.blob));
             }
         }
+        if !self.retained_retired.is_empty() {
+            out.push_str(&format!(
+                "; {} retired unit(s) still present:",
+                self.retained_retired.len()
+            ));
+            for kept in &self.retained_retired {
+                out.push_str(&format!(" [{} — {}]", kept.unit, kept.reason.describe()));
+            }
+        }
         if self.skipped.is_empty() {
             return out;
         }
@@ -1279,10 +1361,23 @@ impl ProvisionReport {
                 .join(", ");
             detail.push_str(&format!("; removed {names}"));
         }
+        let kept_on_purpose = self
+            .retained_retired
+            .iter()
+            .filter(|r| !r.reason.is_failure())
+            .map(|r| format!("{} ({})", r.unit, r.reason.describe()))
+            .collect::<Vec<_>>();
+        if !kept_on_purpose.is_empty() {
+            detail.push_str(&format!(
+                "; retired but kept: {}",
+                kept_on_purpose.join(", ")
+            ));
+        }
         let mut obs = CapabilityObservation::new(self.rung).with_detail(detail);
         if let Some(dest) = &self.destination {
             obs = obs.with_resolved_path(dest.clone());
         }
+        let mut notes = Vec::new();
         if !self.skipped.is_empty() {
             let reasons = self
                 .skipped
@@ -1290,11 +1385,28 @@ impl ProvisionReport {
                 .map(|s| format!("{} ({})", s.unit, s.reason.describe()))
                 .collect::<Vec<_>>()
                 .join("; ");
-            obs = obs.with_note(format!(
+            notes.push(format!(
                 "{} unit(s) not provisioned — the spawn continued regardless (fail-soft \
                  by contract): {reasons}",
                 self.skipped.len()
             ));
+        }
+        let stuck = self
+            .retained_retired
+            .iter()
+            .filter(|r| r.reason.is_failure())
+            .map(|r| format!("{} ({})", r.unit, r.reason.describe()))
+            .collect::<Vec<_>>();
+        if !stuck.is_empty() {
+            notes.push(format!(
+                "{} retired unit(s) still present and still resolvable — the spawn \
+                 continued regardless (fail-soft by contract): {}",
+                stuck.len(),
+                stuck.join("; ")
+            ));
+        }
+        if !notes.is_empty() {
+            obs = obs.with_note(notes.join(". "));
         }
         obs
     }

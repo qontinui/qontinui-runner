@@ -78,7 +78,7 @@ use std::path::Path;
 
 use include_dir::{include_dir, Dir};
 
-use crate::capability_manifest::{self, ProvisionReport, SkipReason};
+use crate::capability_manifest::{self, ProvisionReport, RetainedReason, SkipReason};
 use crate::provision_guard::KeepDecisions;
 
 /// The embedded subagent definitions. A flat directory of `*.md`, matching what
@@ -145,7 +145,7 @@ pub(crate) fn provision_fleet_agents_into(
             continue;
         }
         // Per-file rather than `?`: one unwritable definition must not cost the
-        // session the other four, and it must be NAMED rather than aborting the
+        // session the others, and it must be NAMED rather than aborting the
         // pass at whatever point it happened to reach.
         match std::fs::write(dst_dir.join(name), file.contents()) {
             Ok(()) => out.record_written(),
@@ -180,13 +180,15 @@ pub(crate) fn embedded_agent_count() -> usize {
 
 /// Every subagent definition this binary has RETIRED. One line per file: the
 /// file name with its `.md`, then every git blob id the file ever shipped as,
-/// separated by single spaces. That is the shape of the `RETIRED_AGENTS` table
-/// in `qontinui-claude-config/scripts/install-agents.sh`, the installer's half
-/// of the same retirement, and a file's line is identical in both.
+/// separated by single spaces. The installer's half of the same retirement, the
+/// qontinui-claude-config PR that deletes the source file, will give
+/// `scripts/install-agents.sh` a `RETIRED_AGENTS` table of the same shape, with
+/// a file's line byte-identical to the one here.
 ///
 /// A line lists the blobs of the SOURCE's whole history, not only the ones this
 /// directory bundled, because the checkout overlay copies from the source and a
-/// workdir can hold any of them. A line only grows: the bundle sync never
+/// workdir can hold any of them, including a blob that only ever sat on an
+/// open PR's branch a checkout was standing on. A line only grows: the bundle sync never
 /// re-adds a deleted file, so a blob that ships after the line is written is
 /// never learned here.
 pub(crate) const RETIRED_AGENTS: &[&str] = &[
@@ -195,11 +197,12 @@ pub(crate) const RETIRED_AGENTS: &[&str] = &[
     // Phase 6: nothing dispatched it, and its body contradicted served policy
     // (`testing` coverage-is-enumerated-not-salient and a-test-must-be-able-to-fail;
     // `escalation-bar` escalation-closed-list).
-    // The first five blobs are its whole history in qontinui-claude-config, of
-    // which this directory shipped 8c23f14a, d80c5d1d and 3908f6b9. The sixth is
-    // its blob at the head (4a60b2d4f3d4) of qontinui-claude-config#2413, which
-    // was open and editing it when it was retired.
-    "test-generator.md 3908f6b9811fea0b8f7bc68f7d0bf9022015a537 d80c5d1d620bb8f9e2acdd756eadc22b624794a0 8c23f14a7cbaaf04d35f68ad13745242f91012b6 d8d6673b504bb9f37155ec0acecb8fc02859ae95 7b5318b48ebfaaeaba1aaff7d86f99c0bbb07535 7b6360157dc99a9c86919343a0cc3a65b8ee6091",
+    // The first five blobs are its whole history on qontinui-claude-config main,
+    // of which this directory shipped 8c23f14a, d80c5d1d and 3908f6b9. The last
+    // two are its blobs at the two commits (c0648db7, 4a60b2d4f3d4) of
+    // qontinui-claude-config#2413, which was open and editing it when it was
+    // retired.
+    "test-generator.md 3908f6b9811fea0b8f7bc68f7d0bf9022015a537 d80c5d1d620bb8f9e2acdd756eadc22b624794a0 8c23f14a7cbaaf04d35f68ad13745242f91012b6 d8d6673b504bb9f37155ec0acecb8fc02859ae95 7b5318b48ebfaaeaba1aaff7d86f99c0bbb07535 0bb59a9cea7f0a8c598f648e40f27300bcda9dde 7b6360157dc99a9c86919343a0cc3a65b8ee6091",
 ];
 
 /// `line` split into its file name and the blob ids after it.
@@ -219,8 +222,15 @@ pub(crate) fn retired_agent_names(retired: &[&str]) -> Vec<String> {
         .collect()
 }
 
-/// Remove from `dst_dir` every definition `retired` lists whose copy on disk is
-/// a blob it shipped as, and record each removal on `report`.
+/// Remove from `<workdir>/.claude/agents` every definition `retired` lists
+/// whose copy on disk is a blob it shipped as, and record each removal on
+/// `report`.
+///
+/// Nothing outside the workdir is ever removed: when `.claude` or
+/// `.claude/agents` resolves (through a symlink) to a directory that is not
+/// under `workdir`, every retired copy there is kept and recorded as
+/// [`RetainedReason::OutsideWorkdir`]. The workspace root's `.claude` is such a
+/// link into qontinui-claude-config, whose copies are that repository's own.
 ///
 /// What stays, by arm:
 /// - **absent**: nothing to do;
@@ -228,12 +238,12 @@ pub(crate) fn retired_agent_names(retired: &[&str]) -> Vec<String> {
 ///   existed when the tracked-file probe could not answer inside a repository,
 ///   stays exactly as both provisioning layers keep it (`keep` was decided
 ///   before either layer wrote);
-/// - **any other blob**: somebody edited it, so it is kept and logged as
-///   locally modified. That is the own-files-only rule `install-agents.sh
-///   --uninstall` applies;
-/// - **unreadable or unremovable**: kept, and recorded on `report` as a
-///   [`SkipReason::WriteFailed`] skip, so the pass reads degraded instead of
-///   clean.
+/// - **any other blob**: somebody edited it, so it is kept, logged and
+///   recorded as [`RetainedReason::LocallyModified`]. That is the
+///   own-files-only rule `install-agents.sh --uninstall` applies;
+/// - **unreadable or unremovable**: kept, and recorded as
+///   [`RetainedReason::ReadFailed`] / [`RetainedReason::RemoveFailed`], so the
+///   pass reads degraded and names a retired definition that still resolves.
 ///
 /// A blob is matched on the bytes as they are and on the same bytes with CRLF
 /// folded to LF. A checkout with `core.autocrlf=true` holds a CRLF copy of a
@@ -243,11 +253,17 @@ pub(crate) fn retired_agent_names(retired: &[&str]) -> Vec<String> {
 /// It never fails and never panics: a pass that could not finish still leaves
 /// the spawn running, as with both layers before it.
 pub(crate) fn remove_retired_agents(
-    dst_dir: &Path,
+    workdir: &Path,
     keep: &KeepDecisions,
     retired: &[&str],
     report: &mut ProvisionReport,
 ) {
+    let dst_dir = workdir.join(".claude").join("agents");
+    let outside = match (dst_dir.canonicalize(), workdir.canonicalize()) {
+        (Ok(dst), Ok(root)) => (!dst.starts_with(&root)).then(|| dst.display().to_string()),
+        // No agents directory: nothing retired can be on disk.
+        _ => return,
+    };
     for line in retired {
         let (name, shipped) = parse_retired_line(line);
         let path = dst_dir.join(name);
@@ -267,22 +283,30 @@ pub(crate) fn remove_retired_agents(
                     "fleet_agents: could not read retired {}, so it is kept: {e}",
                     path.display()
                 );
-                report.skip(
-                    name,
-                    SkipReason::WriteFailed(format!(
-                        "read retired definition to compare its blob: {e}"
-                    )),
-                );
+                report.record_retained_retired(name, RetainedReason::ReadFailed(e.to_string()));
                 continue;
             }
         };
-        let Some(blob) = shipped_blob(&bytes, &shipped) else {
+        if let Some(resolved) = &outside {
             tracing::warn!(
-                "fleet_agents: keeping retired {} — locally modified (blob {} is not one it shipped as)",
-                path.display(),
-                crate::provenance::git_blob_id(&bytes)
+                "fleet_agents: keeping retired {} — the agents directory resolves to {resolved}, \
+                 outside the workdir",
+                path.display()
             );
+            report.record_retained_retired(name, RetainedReason::OutsideWorkdir(resolved.clone()));
             continue;
+        }
+        let blob = match shipped_blob(&bytes, &shipped) {
+            Ok(blob) => blob,
+            Err(own) => {
+                tracing::warn!(
+                    "fleet_agents: keeping retired {} — locally modified (blob {own} is not \
+                     one it shipped as)",
+                    path.display()
+                );
+                report.record_retained_retired(name, RetainedReason::LocallyModified(own));
+                continue;
+            }
         };
         match std::fs::remove_file(&path) {
             Ok(()) => {
@@ -297,26 +321,26 @@ pub(crate) fn remove_retired_agents(
                     "fleet_agents: could not remove retired {}: {e}",
                     path.display()
                 );
-                report.skip(
-                    name,
-                    SkipReason::WriteFailed(format!("remove retired definition: {e}")),
-                );
+                report.record_retained_retired(name, RetainedReason::RemoveFailed(e.to_string()));
             }
         }
     }
 }
 
-/// The blob in `shipped` that `bytes` is, as they are or with CRLF folded to LF.
-fn shipped_blob(bytes: &[u8], shipped: &[&str]) -> Option<String> {
+/// The blob in `shipped` that `bytes` is, as they are or with CRLF folded to
+/// LF; otherwise `Err` carrying the bytes' own blob id, for the record.
+fn shipped_blob(bytes: &[u8], shipped: &[&str]) -> Result<String, String> {
     let raw = crate::provenance::git_blob_id(bytes);
     if shipped.contains(&raw.as_str()) {
-        return Some(raw);
+        return Ok(raw);
     }
-    if !bytes.windows(2).any(|pair| pair == b"\r\n") {
-        return None;
+    if bytes.windows(2).any(|pair| pair == b"\r\n") {
+        let folded = crate::provenance::git_blob_id(&fold_crlf(bytes));
+        if shipped.contains(&folded.as_str()) {
+            return Ok(folded);
+        }
     }
-    let folded = crate::provenance::git_blob_id(&fold_crlf(bytes));
-    shipped.contains(&folded.as_str()).then_some(folded)
+    Err(raw)
 }
 
 /// `bytes` with every CRLF pair folded to LF. A lone CR is kept.
@@ -468,9 +492,10 @@ mod tests {
         );
     }
 
-    /// The `test-generator.md` line is pinned byte for byte: it must equal the
-    /// line `qontinui-claude-config/scripts/install-agents.sh` carries, and a
-    /// blob dropped from it would leave that version's copies on disk forever.
+    /// The `test-generator.md` line is pinned byte for byte, because a blob
+    /// dropped from it would leave that version's copies on disk forever. The
+    /// qontinui-claude-config PR that deletes the source gives
+    /// `scripts/install-agents.sh` the same line.
     #[test]
     fn the_retired_table_carries_every_blob_test_generator_shipped_as() {
         assert_eq!(
@@ -481,6 +506,7 @@ mod tests {
                8c23f14a7cbaaf04d35f68ad13745242f91012b6 \
                d8d6673b504bb9f37155ec0acecb8fc02859ae95 \
                7b5318b48ebfaaeaba1aaff7d86f99c0bbb07535 \
+               0bb59a9cea7f0a8c598f648e40f27300bcda9dde \
                7b6360157dc99a9c86919343a0cc3a65b8ee6091"
             ]
         );
@@ -531,14 +557,24 @@ mod tests {
         let lf = b"---\nname: x\n---\nbody\n".as_slice();
         let lf_blob = crate::provenance::git_blob_id(lf);
         let shipped = [lf_blob.as_str()];
-        assert_eq!(shipped_blob(lf, &shipped), Some(lf_blob.clone()));
+        assert_eq!(shipped_blob(lf, &shipped), Ok(lf_blob.clone()));
+        let crlf = b"---\r\nname: x\r\n---\r\nbody\r\n".as_slice();
         assert_eq!(
-            shipped_blob(b"---\r\nname: x\r\n---\r\nbody\r\n", &shipped),
-            Some(lf_blob.clone()),
+            shipped_blob(crlf, &shipped),
+            Ok(lf_blob.clone()),
             "an autocrlf copy of a shipped LF blob is the shipped content"
         );
-        assert_eq!(shipped_blob(b"---\nname: x\n---\nedited\n", &shipped), None);
-        assert_eq!(shipped_blob(lf, &[]), None);
+        let edited = b"---\nname: x\n---\nedited\n".as_slice();
+        assert_eq!(
+            shipped_blob(edited, &shipped),
+            Err(crate::provenance::git_blob_id(edited)),
+            "an edited copy reports its own blob"
+        );
+        assert_eq!(
+            shipped_blob(crlf, &[]),
+            Err(crate::provenance::git_blob_id(crlf)),
+            "an unmatched CRLF copy reports its raw blob, not the folded one"
+        );
         assert_eq!(fold_crlf(b"a\r\nb\rc\r\n"), b"a\nb\rc\n".to_vec());
     }
 }
