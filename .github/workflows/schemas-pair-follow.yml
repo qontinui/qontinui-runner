@@ -286,7 +286,15 @@ jobs:
       - name: No bundle for this PR
         if: steps.dl.outcome != 'success'
         shell: bash
-        run: echo "No pair-follow bundle for #${{ matrix.item.pr }} — see the compute leg."
+        # A block scalar, not a plain one: in a plain YAML scalar ` #` opens a
+        # COMMENT, so the old one-liner reached bash as `echo "No pair-follow
+        # bundle for` -- an unterminated quote that failed this step (and so the
+        # push leg and the verdict) instead of printing the note. The PR number
+        # comes through env rather than being spliced into the script.
+        env:
+          PR_NUMBER: ${{ matrix.item.pr }}
+        run: |
+          echo "No pair-follow bundle for #${PR_NUMBER} — see the compute leg."
 
   verdict:
     name: Pair-follow verdict
