@@ -363,6 +363,11 @@ const READ_TOOLS: &[&str] = &[
     "coord_build_info",
     "coord_can",
     "coord_change_conflict",
+    // A run's jobs and a job's bounded log tail (coord's GitHub App reads;
+    // a retry is idempotent but each call may spend one accounted App read);
+    // no prefix below covers the `coord_ci_` pair.
+    "coord_ci_job_log_tail",
+    "coord_ci_run_jobs",
     "coord_conflict_check",
     "coord_diagnose",
     "coord_diff_impact",
@@ -974,6 +979,11 @@ mod tests {
             operation_for_call("tools/call", Some("coord_memory_record")),
             OPERATION_WRITE
         );
+        // The App-backed CI reads match no read prefix, so only their exact
+        // `READ_TOOLS` entries keep them from defaulting to writes.
+        for tool in ["coord_ci_run_jobs", "coord_ci_job_log_tail"] {
+            assert_eq!(operation_for_call("tools/call", Some(tool)), OPERATION_READ);
+        }
         // The overlord's proof reads and ledger reads are reads; the ledger
         // appends (`coord_overlord_record`, and the triage-pass ledger's
         // `coord_overlord_pass_record`) stay writes. The pass ledger's two reads
