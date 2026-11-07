@@ -966,7 +966,8 @@ type ActionResult = Result<
 
 /// The wrap every SDK `execute_action` reply on the element-action routes goes
 /// through: the element route's first dispatch, its stale-registry retry and
-/// its stable-ref retry, and `type-into`'s mutation step.
+/// its stable-ref retry, `type-into`'s mutation step, and the click of
+/// `click-by-text` / `click-by-selector`.
 ///
 /// It keeps the failure payload ([`wrap_ipc_result_keeping_failure_data`]).
 /// An SDK `{success: false}` carries its whole diagnosis there:
@@ -4117,7 +4118,7 @@ pub async fn ui_bridge_find_by_text_handler(
 pub async fn ui_bridge_click_by_text_handler(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+) -> ActionResult {
     let action = crate::journey::cursor::ActionSpec::untargeted_element("click_by_text");
     let result =
         ui_bridge_click_by_text_handler_dispatch(State(Arc::clone(&state)), Json(body)).await;
@@ -4128,10 +4129,15 @@ pub async fn ui_bridge_click_by_text_handler(
 /// Click an element by its visible text content.
 /// POST /ui-bridge/control/page/click-by-text
 /// Body: { "text": "Submit", "tag": "button", "exact": true, "index": 0 }
-async fn ui_bridge_click_by_text_handler_dispatch(
+///
+/// Resolves the `index`-th visible match and clicks it through the SDK
+/// executor ([`click_resolved_element`]). It is also the runner's own answer
+/// for `POST /ui-bridge/sdk/page/click-by-text` when no SDK app is connected
+/// (`sdk_client.rs`).
+pub(crate) async fn ui_bridge_click_by_text_handler_dispatch(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+) -> ActionResult {
     let text = body.get("text").and_then(|v| v.as_str()).unwrap_or("");
     let tag = body.get("tag").and_then(|v| v.as_str()).unwrap_or("*");
     let exact = body.get("exact").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -4140,57 +4146,24 @@ async fn ui_bridge_click_by_text_handler_dispatch(
     if text.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(api_error("'text' field is required")),
+            Json(ApiResponse::error("'text' field is required")),
         ));
     }
 
     // Bust the vision cache: a click can change rendered pixels.
     crate::mcp::ui_bridge::vision_routes::bump_mutation_id(&state);
 
-    let escaped_text = text.replace('\\', "\\\\").replace('\'', "\\'");
-    let match_expr = if exact {
-        format!("el.textContent.trim() === '{}'", escaped_text)
-    } else {
-        format!(
-            "el.textContent.trim().toLowerCase().includes('{}')",
-            escaped_text.to_lowercase()
-        )
-    };
-
-    let js = format!(
-        r#"(() => {{
-            const matches = Array.from(document.querySelectorAll('{tag}'))
-                .filter(el => el.offsetParent !== null && {match_expr});
-            if (matches.length === 0) return JSON.stringify({{ clicked: false, error: 'No matching elements found' }});
-            const idx = {index};
-            if (idx >= matches.length) return JSON.stringify({{ clicked: false, error: 'Index ' + idx + ' out of range (found ' + matches.length + ')' }});
-            const el = matches[idx];
-            el.scrollIntoView({{ block: 'center' }});
-            el.click();
-            return JSON.stringify({{
-                clicked: true,
-                tag: el.tagName,
-                text: el.textContent.trim().slice(0, 100),
-                index: idx,
-                totalMatches: matches.length
-            }});
-        }})()"#,
-        tag = tag,
-        match_expr = match_expr,
-        index = index
-    );
-
-    // Optional `windowLabel` scopes the read to a pop-out window (Phase 4 of
+    // Optional `windowLabel` scopes both steps to a pop-out window (Phase 4 of
     // plan 2026-06-07-multi-window-sdk-automation); omit -> main window.
-    let window_label = read_window_label(&body);
-    match evaluate_js_expression_in_window(&state, &js, window_label).await {
-        Ok(result) => Ok(Json(ApiResponse::success(parse_eval_result(
-            "click-by-text",
-            "click result",
-            &result,
-        )?))),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
-    }
+    click_resolved_element(
+        &state,
+        "click-by-text",
+        &click_by_text_find_expr(text, tag, exact),
+        index,
+        "No matching elements found",
+        read_window_label(&body),
+    )
+    .await
 }
 
 /// Journey ledger choke point (plan
@@ -4199,7 +4172,7 @@ async fn ui_bridge_click_by_text_handler_dispatch(
 pub async fn ui_bridge_click_by_selector_handler(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+) -> ActionResult {
     let action = crate::journey::cursor::ActionSpec::untargeted_element("click_by_selector");
     let result =
         ui_bridge_click_by_selector_handler_dispatch(State(Arc::clone(&state)), Json(body)).await;
@@ -4210,58 +4183,165 @@ pub async fn ui_bridge_click_by_selector_handler(
 /// Click an element by CSS selector.
 /// POST /ui-bridge/control/page/click-by-selector
 /// Body: { "selector": "button[type='submit']", "index": 0 }
-async fn ui_bridge_click_by_selector_handler_dispatch(
+///
+/// Resolves the `index`-th visible match and clicks it through the SDK
+/// executor ([`click_resolved_element`]). It is also the runner's own answer
+/// for `POST /ui-bridge/sdk/page/click-by-selector` when no SDK app is
+/// connected (`sdk_client.rs`).
+pub(crate) async fn ui_bridge_click_by_selector_handler_dispatch(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+) -> ActionResult {
     let selector = body.get("selector").and_then(|v| v.as_str()).unwrap_or("");
     let index = body.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
 
     if selector.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(api_error("'selector' field is required")),
+            Json(ApiResponse::error("'selector' field is required")),
         ));
     }
 
     // Bust the vision cache: a click can change rendered pixels.
     crate::mcp::ui_bridge::vision_routes::bump_mutation_id(&state);
 
-    let escaped_selector = selector.replace('\\', "\\\\").replace('\'', "\\'");
+    click_resolved_element(
+        &state,
+        "click-by-selector",
+        &click_by_selector_find_expr(selector),
+        index,
+        "No elements match selector",
+        read_window_label(&body),
+    )
+    .await
+}
 
-    let js = format!(
-        r#"(() => {{
-            const matches = Array.from(document.querySelectorAll('{selector}'))
-                .filter(el => el.offsetParent !== null);
-            if (matches.length === 0) return JSON.stringify({{ clicked: false, error: 'No elements match selector' }});
-            const idx = {index};
-            if (idx >= matches.length) return JSON.stringify({{ clicked: false, error: 'Index ' + idx + ' out of range (found ' + matches.length + ')' }});
-            const el = matches[idx];
-            el.scrollIntoView({{ block: 'center' }});
-            el.click();
-            return JSON.stringify({{
-                clicked: true,
-                tag: el.tagName,
-                text: el.textContent.trim().slice(0, 100),
-                index: idx,
-                totalMatches: matches.length
-            }});
-        }})()"#,
-        selector = escaped_selector,
-        index = index
-    );
+/// The candidates `click-by-text` resolves among, in document order: the
+/// visible `tag` elements whose trimmed text equals `text` (`exact`) or
+/// contains it, case-insensitively.
+fn click_by_text_find_expr(text: &str, tag: &str, exact: bool) -> String {
+    let escaped_text = text.replace('\\', "\\\\").replace('\'', "\\'");
+    let escaped_tag = tag.replace('\\', "\\\\").replace('\'', "\\'");
+    let match_expr = if exact {
+        format!("el.textContent.trim() === '{escaped_text}'")
+    } else {
+        format!(
+            "el.textContent.trim().toLowerCase().includes('{}')",
+            escaped_text.to_lowercase()
+        )
+    };
+    format!(
+        "Array.from(document.querySelectorAll('{escaped_tag}'))\
+         .filter(el => el.offsetParent !== null && {match_expr})"
+    )
+}
 
-    // Optional `windowLabel` scopes the read to a pop-out window (Phase 4 of
-    // plan 2026-06-07-multi-window-sdk-automation); omit -> main window.
-    let window_label = read_window_label(&body);
-    match evaluate_js_expression_in_window(&state, &js, window_label).await {
-        Ok(result) => Ok(Json(ApiResponse::success(parse_eval_result(
-            "click-by-selector",
-            "click result",
-            &result,
-        )?))),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
+/// The candidates `click-by-selector` resolves among, in document order: the
+/// visible elements `selector` matches.
+fn click_by_selector_find_expr(selector: &str) -> String {
+    let escaped = selector.replace('\\', "\\\\").replace('\'', "\\'");
+    format!(
+        "Array.from(document.querySelectorAll('{escaped}')).filter(el => el.offsetParent !== null)"
+    )
+}
+
+/// The `execute_action` IPC payload that asks the SDK executor to click the
+/// element a click-by route resolved. It is the envelope the element route
+/// sends, so the executor's gates (a disabled target, one that is not visible,
+/// one another element covers) apply exactly as they do there.
+fn click_action_payload(element_path: &str) -> serde_json::Value {
+    serde_json::json!({
+        "elementId": element_path,
+        "action": { "action": "click" },
+    })
+}
+
+/// The click-by routes' common tail, once a route has built the candidates it
+/// matches (`find_expr`): resolve the `index`-th one to a uniquely-addressable
+/// path ([`element_path_resolve_js`]), then click it through the SDK executor
+/// ([`click_action_payload`]), the same split `type-into` makes.
+///
+/// The routes used to click inside the evaluated script itself (`el.click()`),
+/// where no executor gate ever ran: a click on an element under a modal
+/// answered `clicked: true`. A resolved miss is still the documented HTTP 200
+/// carrying `clicked: false` (CONTRACT.md, "Still open"); an SDK refusal is a
+/// 4xx that keeps the SDK's `failureDetails` ([`click_by_response`]).
+async fn click_resolved_element(
+    state: &Arc<ApiState>,
+    route: &str,
+    find_expr: &str,
+    index: u64,
+    no_match: &str,
+    window_label: &str,
+) -> ActionResult {
+    let resolve_js = element_path_resolve_js(find_expr, index);
+    let raw = evaluate_js_expression_in_window(state, &resolve_js, window_label)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::<serde_json::Value>::error(e)),
+            )
+        })?;
+    let resolved =
+        parse_eval_result(route, "element-resolution result", &raw).map_err(widen_flat_error)?;
+    if resolved.get("found").and_then(|v| v.as_bool()) != Some(true) {
+        return Ok(Json(ApiResponse::success(click_by_miss(
+            &resolved, no_match, index,
+        ))));
     }
+    let Some(element_path) = resolved.get("path").and_then(|v| v.as_str()) else {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse::error(format!(
+                "{route}: element resolution returned no addressable path"
+            ))),
+        ));
+    };
+    let reply = ui_bridge_request_sync_in_window(
+        state,
+        "execute_action",
+        click_action_payload(element_path),
+        window_label,
+    )
+    .await;
+    click_by_response(&resolved, reply)
+}
+
+/// The documented HTTP 200 answer to a resolved miss: `clicked: false`, with
+/// the route's own message, or the out-of-range index and the match count.
+fn click_by_miss(resolved: &serde_json::Value, no_match: &str, index: u64) -> serde_json::Value {
+    match resolved.get("matchCount").and_then(|v| v.as_u64()) {
+        Some(found) => serde_json::json!({
+            "clicked": false,
+            "error": format!("Index {index} out of range (found {found})"),
+        }),
+        None => serde_json::json!({ "clicked": false, "error": no_match }),
+    }
+}
+
+/// Turn the SDK's reply to a click-by route's click into the route's answer.
+///
+/// The reply goes through [`wrap_element_action_ipc`], so an SDK refusal is a
+/// 4xx that keeps the SDK's `failureDetails` and never says `clicked: true`.
+/// Only a click the executor performed answers `clicked: true`, with what the
+/// resolution step found and the SDK's own timing.
+fn click_by_response(
+    resolved: &serde_json::Value,
+    reply: Result<serde_json::Value, String>,
+) -> ActionResult {
+    let Json(action) = wrap_element_action_ipc(reply)?;
+    let action_data = action.data.unwrap_or(serde_json::Value::Null);
+    Ok(Json(ApiResponse::success(serde_json::json!({
+        "clicked": true,
+        "tag": resolved.get("tag"),
+        "text": resolved.get("text"),
+        "index": resolved.get("index"),
+        "totalMatches": resolved.get("totalMatches"),
+        "selector": resolved.get("path"),
+        "durationMs": action_data.get("durationMs"),
+        "consoleErrors": action_data.get("consoleErrors"),
+    }))))
 }
 
 /// Validate the `all` parameter of `read-value`.
@@ -4390,12 +4470,14 @@ pub async fn ui_bridge_read_value_handler(
     }
 }
 
-/// Build the element-RESOLUTION expression for `type-into`.
+/// Build the element-RESOLUTION expression of the two-step page routes
+/// (`type-into`, `click-by-text`, `click-by-selector`): this step finds the
+/// target, and the second hands it to the SDK executor through `execute_action`.
 ///
 /// The returned JS answers a JSON object and mutates nothing beyond scrolling
 /// the hit into view:
 ///
-///   - hit  → `{found: true, path, tag, id, testId, index}`
+///   - hit  → `{found: true, path, tag, id, testId, text, index, totalMatches}`
 ///   - miss → `{found: false, error, matchCount?}`
 ///
 /// `path` is a selector that resolves to **exactly** this element (a unique
@@ -4407,7 +4489,7 @@ pub async fn ui_bridge_read_value_handler(
 /// because `findElementByIdentifier` tries `[data-testid=…]` and `#id` BEFORE
 /// `querySelector`, so a bare selector like `email` could silently address a
 /// different element than the one this step resolved.
-fn type_into_resolve_js(find_expr: &str, index: u64) -> String {
+fn element_path_resolve_js(find_expr: &str, index: u64) -> String {
     format!(
         r#"(() => {{
             const matches = Array.from({find_expr}).filter(el => el);
@@ -4450,7 +4532,9 @@ fn type_into_resolve_js(find_expr: &str, index: u64) -> String {
                 tag: el.tagName,
                 id: el.id || null,
                 testId: el.getAttribute('data-testid'),
-                index: idx
+                text: (el.textContent || '').trim().slice(0, 100),
+                index: idx,
+                totalMatches: matches.length
             }});
         }})()"#
     )
@@ -4514,7 +4598,7 @@ pub async fn ui_bridge_type_into_handler(
 ///
 /// So the mutation is gone and the endpoint is now two steps: resolve the
 /// selector/label/index to a uniquely-addressable path
-/// ([`type_into_resolve_js`]), then dispatch `execute_action` `type`
+/// ([`element_path_resolve_js`]), then dispatch `execute_action` `type`
 /// ([`type_into_action_payload`]). All addressing modes survive — `index` and
 /// `label` are resolved here because `findElementByIdentifier` only ever
 /// returns the FIRST `querySelector` hit.
@@ -4584,7 +4668,7 @@ async fn ui_bridge_type_into_handler_dispatch(
     let window_label = read_window_label(&body);
 
     // ── Step 1: resolve ──────────────────────────────────────────────────
-    let resolve_js = type_into_resolve_js(&find_expr, index);
+    let resolve_js = element_path_resolve_js(&find_expr, index);
     let raw = evaluate_js_expression_in_window(&state, &resolve_js, window_label)
         .await
         .map_err(|e| {
@@ -5444,7 +5528,7 @@ mod wait_for_element_dual_emit_tests {
 /// hand-written JS string literal.
 #[cfg(test)]
 mod type_into_tests {
-    use super::{type_into_action_payload, type_into_resolve_js};
+    use super::{element_path_resolve_js, type_into_action_payload};
     use serde_json::json;
 
     // ── Item C: UTF-8 passthrough ───────────────────────────────────────
@@ -5526,7 +5610,7 @@ mod type_into_tests {
         // The whole point of the split: this step reads and scrolls, it does
         // not type. Any value assignment here would be the duplicate coming
         // back.
-        let js = type_into_resolve_js("document.querySelectorAll('input')", 0);
+        let js = element_path_resolve_js("document.querySelectorAll('input')", 0);
         assert!(
             !js.contains(".value ="),
             "resolution step must not assign a value: {js}"
@@ -5543,7 +5627,7 @@ mod type_into_tests {
 
     #[test]
     fn resolve_js_reports_a_miss_rather_than_a_typed_success() {
-        let js = type_into_resolve_js("document.querySelectorAll('input')", 3);
+        let js = element_path_resolve_js("document.querySelectorAll('input')", 3);
         assert!(js.contains("found: false"));
         assert!(js.contains("'No elements found'"));
         assert!(js.contains("'Index out of range'"));
@@ -5557,7 +5641,7 @@ mod type_into_tests {
 
     #[test]
     fn resolve_js_honours_the_requested_index_and_find_expression() {
-        let js = type_into_resolve_js("document.querySelectorAll('textarea')", 2);
+        let js = element_path_resolve_js("document.querySelectorAll('textarea')", 2);
         assert!(js.contains("document.querySelectorAll('textarea')"));
         assert!(js.contains("const idx = 2;"));
     }
@@ -5568,7 +5652,7 @@ mod type_into_tests {
         // pattern set (`utils.ts::PAGE_EVALUATE_STRUCTURAL_PATTERNS` /
         // `..._NETWORK_PATTERNS`). A resolution step that cannot be evaluated
         // is a dead endpoint.
-        let js = type_into_resolve_js("document.querySelectorAll('input')", 0);
+        let js = element_path_resolve_js("document.querySelectorAll('input')", 0);
         for banned in [
             "import(",
             "require(",
@@ -7546,6 +7630,242 @@ mod element_action_failure_payload_tests {
             wire.pointer("/data/failureDetails/context/action"),
             Some(&json!("type")),
             "{wire}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod click_by_routes_tests {
+    //! `POST /ui-bridge/control/page/click-by-text` and `/click-by-selector`
+    //! click THROUGH THE SDK EXECUTOR (plan
+    //! `2026-11-06-a-ui-action-counts-as-user-evidence-only-when-a-user-could-have-performed-it`).
+    //! They used to click inside the evaluated script (`el.click()`), where no
+    //! executor gate ran, so a click on a disabled button or on one under a
+    //! modal answered `clicked: true`: user evidence no user could produce.
+    //!
+    //! The routes need an `ApiState` (a live Tauri `AppHandle`) that no unit
+    //! test can build, so these tests pin the two halves each route is made of:
+    //! the script it evaluates (it resolves a target and never clicks) and the
+    //! answer it builds from the SDK's reply to the click (`click_by_response`).
+    use super::{
+        click_action_payload, click_by_miss, click_by_response, click_by_selector_find_expr,
+        click_by_text_find_expr, element_path_resolve_js, Json,
+    };
+    use crate::mcp::ui_bridge::request::extract_response_data;
+    use serde_json::json;
+
+    /// What the resolution step answered for the button these tests click.
+    fn resolved_save_button() -> serde_json::Value {
+        json!({
+            "found": true,
+            "path": "#save",
+            "tag": "BUTTON",
+            "id": "save",
+            "testId": null,
+            "text": "Save",
+            "index": 0,
+            "totalMatches": 1,
+        })
+    }
+
+    /// The envelope `useControlEvents.ts` (`case "execute_action"`) sends for
+    /// the SDK's answer to the click: the SDK's response whole under `data`.
+    fn ipc_envelope(response: serde_json::Value) -> serde_json::Value {
+        let mut envelope = json!({
+            "requestId": "req-9",
+            "type": "execute_action",
+            "success": response["success"].clone(),
+            "timestamp": 1_762_473_600_001_u64,
+        });
+        if let Some(error) = response.get("error") {
+            envelope["error"] = error.clone();
+        }
+        envelope["data"] = response;
+        envelope
+    }
+
+    /// The executor's click-gate refusal of a disabled button
+    /// (`ElementDisabledError`, reported as `UB-ELEM-DISABLED`).
+    fn disabled_refusal() -> serde_json::Value {
+        let message = "element is disabled (disabled attribute); click was not dispatched";
+        json!({
+            "success": false,
+            "error": message,
+            "failureDetails": {
+                "errorCode": "UB-ELEM-DISABLED",
+                "message": message,
+                "elementId": "#save",
+                "suggestedActions": [
+                    {
+                        "suggestion": "Fill in required fields first",
+                        "confidence": 0.8, "retryable": false, "priority": 1,
+                    },
+                    {
+                        "suggestion": "Wait for '#save' to become enabled",
+                        "command": "wait for element to be enabled",
+                        "confidence": 0.6, "retryable": true, "priority": 3,
+                    },
+                ],
+                "retryRecommended": true,
+                "disabledReason": "native",
+                "context": { "ariaDisabled": false, "nativeDisabled": true, "pointerEvents": "auto" },
+                "durationMs": 3,
+            },
+            "durationMs": 3,
+            "timestamp": 1_762_473_600_000_u64,
+        })
+    }
+
+    /// The executor's refusal of a click on a button another element covers at
+    /// every sampled point (`UB-ELEM-BLOCKED`, the plan's Phase 4).
+    fn covered_refusal() -> serde_json::Value {
+        let message = "Element '#save' is blocked: div#modal-overlay covers every sampled point";
+        json!({
+            "success": false,
+            "error": message,
+            "failureDetails": {
+                "errorCode": "UB-ELEM-BLOCKED",
+                "message": message,
+                "elementId": "#save",
+                "suggestedActions": [
+                    {
+                        "suggestion": "Close the modal or popup",
+                        "confidence": 0.9, "retryable": true, "priority": 1,
+                    },
+                ],
+                "retryRecommended": true,
+                "occludedBy": "div#modal-overlay",
+                "occludedPct": 100,
+                "durationMs": 9,
+            },
+            "durationMs": 9,
+            "timestamp": 1_762_473_600_000_u64,
+        })
+    }
+
+    #[test]
+    fn click_by_route_answers_an_sdk_refusal_never_clicked_true() {
+        for (refusal, code) in [
+            (disabled_refusal(), "UB-ELEM-DISABLED"),
+            (covered_refusal(), "UB-ELEM-BLOCKED"),
+        ] {
+            let (status, Json(body)) = click_by_response(
+                &resolved_save_button(),
+                Ok(extract_response_data(&ipc_envelope(refusal))),
+            )
+            .expect_err("a click the SDK refused is a failure");
+            assert!(status.is_client_error(), "{code}: got {status}");
+            let wire = serde_json::to_value(&body).unwrap();
+            assert_eq!(
+                wire.pointer("/data/failureDetails/errorCode"),
+                Some(&json!(code)),
+                "the SDK's refusal must reach the caller: {wire}"
+            );
+            assert!(
+                !wire.to_string().contains("\"clicked\":true"),
+                "a refused click must never answer clicked: true: {wire}"
+            );
+        }
+        // A transport failure (the webview never answered) is no click either.
+        let (status, Json(body)) = click_by_response(
+            &resolved_save_button(),
+            Err("UI Bridge frontend did not become ready".to_string()),
+        )
+        .expect_err("no answer is no click");
+        assert!(status.is_server_error(), "got {status}");
+        assert!(!serde_json::to_value(&body)
+            .unwrap()
+            .to_string()
+            .contains("\"clicked\":true"));
+    }
+
+    #[test]
+    fn click_by_route_reports_the_click_the_sdk_performed() {
+        let performed = json!({ "success": true, "durationMs": 7, "timestamp": 1 });
+        let Json(resp) = click_by_response(
+            &resolved_save_button(),
+            Ok(extract_response_data(&ipc_envelope(performed))),
+        )
+        .expect("a click the executor performed is a success");
+        assert!(resp.success);
+        assert_eq!(
+            resp.data,
+            Some(json!({
+                "clicked": true,
+                "tag": "BUTTON",
+                "text": "Save",
+                "index": 0,
+                "totalMatches": 1,
+                "selector": "#save",
+                "durationMs": 7,
+                "consoleErrors": null,
+            }))
+        );
+    }
+
+    #[test]
+    fn click_by_routes_evaluate_a_resolution_that_never_clicks() {
+        for js in [
+            element_path_resolve_js(&click_by_text_find_expr("Save", "button", true), 0),
+            element_path_resolve_js(&click_by_text_find_expr("save", "*", false), 1),
+            element_path_resolve_js(&click_by_selector_find_expr("button.primary"), 0),
+        ] {
+            assert!(
+                !js.contains(".click("),
+                "the evaluated script must not click: {js}"
+            );
+            assert!(!js.contains("dispatchEvent"), "nor dispatch events: {js}");
+            assert!(!js.contains("clicked:"), "nor claim a click verdict: {js}");
+            assert!(
+                js.contains("el.offsetParent !== null"),
+                "the visible-match filter survives: {js}"
+            );
+        }
+    }
+
+    #[test]
+    fn click_by_route_find_expressions_match_and_escape_as_before() {
+        let exact = click_by_text_find_expr("it's \\ here", "button", true);
+        assert!(
+            exact.contains("document.querySelectorAll('button')"),
+            "{exact}"
+        );
+        assert!(
+            exact.contains(r"el.textContent.trim() === 'it\'s \\ here'"),
+            "{exact}"
+        );
+        let loose = click_by_text_find_expr("Save Draft", "*", false);
+        assert!(
+            loose.contains("el.textContent.trim().toLowerCase().includes('save draft')"),
+            "{loose}"
+        );
+        let by_selector = click_by_selector_find_expr("a[title='x']");
+        assert!(
+            by_selector.contains(r"document.querySelectorAll('a[title=\'x\']')"),
+            "{by_selector}"
+        );
+    }
+
+    #[test]
+    fn click_by_route_asks_the_sdk_executor_to_click() {
+        assert_eq!(
+            click_action_payload("#save"),
+            json!({ "elementId": "#save", "action": { "action": "click" } })
+        );
+    }
+
+    #[test]
+    fn click_by_route_keeps_the_documented_miss_shape() {
+        let none = json!({ "found": false, "error": "No elements found" });
+        assert_eq!(
+            click_by_miss(&none, "No matching elements found", 0),
+            json!({ "clicked": false, "error": "No matching elements found" })
+        );
+        let out_of_range =
+            json!({ "found": false, "error": "Index out of range", "matchCount": 2 });
+        assert_eq!(
+            click_by_miss(&out_of_range, "No elements match selector", 5),
+            json!({ "clicked": false, "error": "Index 5 out of range (found 2)" })
         );
     }
 }

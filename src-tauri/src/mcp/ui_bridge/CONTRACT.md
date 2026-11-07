@@ -452,9 +452,18 @@ Two thread-through styles, mirroring the `tabId` split:
   to that window (no main-window direct-eval fallback for pop-outs — that path is
   main-coupled). Omitting `windowLabel` is byte-identical to the single-window
   default. (Phase 4, plan 2026-06-07-multi-window-sdk-automation.)
-  `type-into` is the one two-step member: it evaluates only a RESOLUTION
-  expression, then dispatches the value mutation as `execute_action` `type`
-  through `ui_bridge_request_sync_in_window` with the same label, so the SDK's
+  `type-into`, `click-by-text` and `click-by-selector` are the two-step members:
+  each evaluates only a RESOLUTION expression (`element_path_resolve_js`), then
+  dispatches the mutation through `execute_action` (`type`, `click`) via
+  `ui_bridge_request_sync_in_window` with the same label, so the SDK executor
+  performs it and every executor gate applies. The click-by routes used to
+  click inside the evaluated script (`el.click()`), which no gate saw, so a click
+  on an element under a modal answered `clicked: true`. Now an SDK refusal (a
+  disabled target, one that is not visible, one another element covers) is a
+  4xx that keeps the SDK's `failureDetails` under `data`. A click the executor
+  performed answers `{clicked: true, tag, text, index, totalMatches, selector}`
+  plus the SDK's `durationMs`. Their `/ui-bridge/sdk/…` twins fall back to these
+  same handlers when no SDK app is connected. For `type-into`, the SDK's
   `applyValueMutation` stays the single implementation of typing. `text` is
   required and must be a string (no `""` default), a miss is HTTP 400 rather
   than a 200 carrying `typed: false`, and the success payload is the SDK's
