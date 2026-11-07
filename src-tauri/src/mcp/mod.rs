@@ -101,6 +101,7 @@ pub mod mcp_servers;
 pub mod memory_consolidation_api;
 pub mod meta_optimizer_api;
 pub mod misc;
+pub mod model_gateway_read;
 pub mod models;
 pub mod monitors;
 pub mod observations_api;
