@@ -74,7 +74,10 @@ fn coord_working_is_never_resent_whatever_its_since() {
             "{word}"
         );
     }
-    assert_eq!(HealSkip::WorkingRevivalUnprovable.as_str(), "working_revival_unprovable");
+    assert_eq!(
+        HealSkip::WorkingRevivalUnprovable.as_str(),
+        "working_revival_unprovable"
+    );
 }
 
 /// Mutation target: drop the `since` comparison and this goes red.
@@ -287,7 +290,10 @@ fn coord_working_since_before_the_finish_leaves_the_mark_synced() {
         out[0].1,
         HealOutcome::Left(HealSkip::WorkingRevivalUnprovable)
     );
-    assert!(store.get("heal-working").unwrap().finish_synced, "untouched");
+    assert!(
+        store.get("heal-working").unwrap().finish_synced,
+        "untouched"
+    );
     assert!(p.sent.lock().unwrap().is_empty());
 }
 
@@ -298,8 +304,7 @@ fn coord_null_since_after_the_finish_leaves_the_mark_synced() {
     let since = chrono::DateTime::<Utc>::from_timestamp_millis(at + 3_600_000)
         .unwrap()
         .to_rfc3339();
-    let fetch =
-        fetch_from_body_for_test(body("heal-revived", json!(null), json!(since), ROW), 1);
+    let fetch = fetch_from_body_for_test(body("heal-revived", json!(null), json!(since), ROW), 1);
     let out = apply_heal(
         &store,
         Some(&p),
@@ -729,8 +734,14 @@ async fn the_sweep_resolves_a_marks_stored_row_and_leaves_an_unstored_one_unknow
     let legacy_at = store.get("legacy-row").unwrap().finished_at;
     store.mark_finish_synced_on("stored-row", stored_at, Some(row()));
     store.mark_finish_synced("legacy-row", legacy_at);
-    assert_eq!(store.get("stored-row").unwrap().finish_coord_session_id, Some(row()));
-    assert_eq!(store.get("legacy-row").unwrap().finish_coord_session_id, None);
+    assert_eq!(
+        store.get("stored-row").unwrap().finish_coord_session_id,
+        Some(row())
+    );
+    assert_eq!(
+        store.get("legacy-row").unwrap().finish_coord_session_id,
+        None
+    );
     drain_all(&outbox);
 
     let mut out = heal_sweep_with(&store, Some(&reg), None, false, |ids| async move {
@@ -741,7 +752,10 @@ async fn the_sweep_resolves_a_marks_stored_row_and_leaves_an_unstored_one_unknow
     assert_eq!(
         out,
         vec![
-            ("legacy-row".to_string(), HealOutcome::Left(HealSkip::MarkRowUnknown)),
+            (
+                "legacy-row".to_string(),
+                HealOutcome::Left(HealSkip::MarkRowUnknown)
+            ),
             ("stored-row".to_string(), HealOutcome::Resent { row: row() }),
         ]
     );
@@ -750,7 +764,11 @@ async fn the_sweep_resolves_a_marks_stored_row_and_leaves_an_unstored_one_unknow
         vec![("finished".to_string(), "stored-row".to_string())],
         "only the stored-row mark is re-sent, to its own row"
     );
-    assert!(outbox.pending().unwrap().iter().all(|r| r.session_id == row()));
+    assert!(outbox
+        .pending()
+        .unwrap()
+        .iter()
+        .all(|r| r.session_id == row()));
     assert!(store.get("legacy-row").unwrap().finish_synced, "untouched");
 }
 
@@ -761,7 +779,10 @@ fn the_stored_row_follows_the_mark() {
     assert_eq!(store.get("stored").unwrap().finish_coord_session_id, None);
     assert!(store.clear_finish_synced("stored", at));
     store.mark_finish_synced_on("stored", Some(at), Some(row()));
-    assert_eq!(store.get("stored").unwrap().finish_coord_session_id, Some(row()));
+    assert_eq!(
+        store.get("stored").unwrap().finish_coord_session_id,
+        Some(row())
+    );
     // A later stamp WITHOUT a row keeps the stored one.
     assert!(store.clear_finish_synced("stored", at));
     store.mark_finish_synced("stored", Some(at));
@@ -769,8 +790,13 @@ fn the_stored_row_follows_the_mark() {
     assert!(rec.finish_synced);
     assert_eq!(rec.finish_coord_session_id, Some(row()));
     // A restamp keeps it too; only an unmark forgets it.
-    store.set_finished("stored", true, Some("again".into())).unwrap();
-    assert_eq!(store.get("stored").unwrap().finish_coord_session_id, Some(row()));
+    store
+        .set_finished("stored", true, Some("again".into()))
+        .unwrap();
+    assert_eq!(
+        store.get("stored").unwrap().finish_coord_session_id,
+        Some(row())
+    );
     store.set_finished("stored", false, None).unwrap();
     assert_eq!(store.get("stored").unwrap().finish_coord_session_id, None);
 }
@@ -802,18 +828,56 @@ fn the_sweep_reoffers_an_unsynced_mark_only_over_a_null_row() {
         &ids,
         &fetch_from_body_for_test(body("unsynced", json!("working"), json!(BEFORE), ROW), 1),
     );
-    let out = apply_heal_observed(&store, Some(&p), &store.all_records(), &working, at + 1_000, true);
-    assert_eq!(out[0].1, HealOutcome::Left(HealSkip::WorkingRevivalUnprovable));
+    let out = apply_heal_observed(
+        &store,
+        Some(&p),
+        &store.all_records(),
+        &working,
+        at + 1_000,
+        true,
+    );
+    assert_eq!(
+        out[0].1,
+        HealOutcome::Left(HealSkip::WorkingRevivalUnprovable)
+    );
     assert!(p.sent.lock().unwrap().is_empty());
 
     let null = Observations::from_fetch(&ids, &null_rows(&ids));
-    let read_back_arm =
-        apply_heal_observed(&store, Some(&p), &store.all_records(), &null, at + 1_000, false);
-    assert!(read_back_arm.is_empty(), "the read-back arm skips unsynced marks");
-    let out = apply_heal_observed(&store, Some(&p), &store.all_records(), &null, at + 1_000, true);
-    assert_eq!(out, vec![("unsynced".to_string(), HealOutcome::Reoffered { row: row() })]);
-    assert_eq!(*p.sent.lock().unwrap(), vec![("unsynced".to_string(), at, row())]);
-    assert!(!store.get("unsynced").unwrap().finish_synced, "still owed, honestly");
+    let read_back_arm = apply_heal_observed(
+        &store,
+        Some(&p),
+        &store.all_records(),
+        &null,
+        at + 1_000,
+        false,
+    );
+    assert!(
+        read_back_arm.is_empty(),
+        "the read-back arm skips unsynced marks"
+    );
+    let out = apply_heal_observed(
+        &store,
+        Some(&p),
+        &store.all_records(),
+        &null,
+        at + 1_000,
+        true,
+    );
+    assert_eq!(
+        out,
+        vec![(
+            "unsynced".to_string(),
+            HealOutcome::Reoffered { row: row() }
+        )]
+    );
+    assert_eq!(
+        *p.sent.lock().unwrap(),
+        vec![("unsynced".to_string(), at, row())]
+    );
+    assert!(
+        !store.get("unsynced").unwrap().finish_synced,
+        "still owed, honestly"
+    );
 }
 
 /// Ids are read in chunks at coord's per-request cap, so the 501st mark is
@@ -848,7 +912,8 @@ async fn the_sweep_reads_ids_in_chunks_at_the_cap() {
     assert_eq!(*chunks.lock().unwrap(), vec![MAX_IDS, 1]);
     assert_eq!(out.len(), n);
     assert!(
-        out.iter().all(|(_, o)| *o == HealOutcome::Resent { row: row() }),
+        out.iter()
+            .all(|(_, o)| *o == HealOutcome::Resent { row: row() }),
         "no id past the cap reads as no_coord_row"
     );
 }
@@ -862,7 +927,11 @@ async fn the_sweep_reads_ids_in_chunks_at_the_cap() {
 fn a_sent_row_is_recorded_without_stamping() {
     let (_d, store, at) = unsynced_store("sent");
     store.note_finish_sent_row("sent", Some(at + 1), row());
-    assert_eq!(store.get("sent").unwrap().finish_coord_session_id, None, "another mark");
+    assert_eq!(
+        store.get("sent").unwrap().finish_coord_session_id,
+        None,
+        "another mark"
+    );
     store.note_finish_sent_row("sent", Some(at), row());
     let rec = store.get("sent").unwrap();
     assert_eq!(rec.finish_coord_session_id, Some(row()));
@@ -903,7 +972,11 @@ async fn the_sweep_reoffers_a_dropped_finish_to_its_sent_row_after_a_restart() {
     store.note_finish_sent_row("dropped", at, row());
     let rec = store.get("dropped").unwrap();
     assert!(!rec.finish_synced);
-    assert_eq!(reg.finish_row_for(&rec), None, "nothing resolves in-process");
+    assert_eq!(
+        reg.finish_row_for(&rec),
+        None,
+        "nothing resolves in-process"
+    );
     drain_all(&outbox);
 
     let working = heal_sweep_with(&store, Some(&reg), None, true, |ids| async move {
@@ -917,7 +990,10 @@ async fn the_sweep_reoffers_a_dropped_finish_to_its_sent_row_after_a_restart() {
             HealOutcome::Left(HealSkip::WorkingRevivalUnprovable)
         )]
     );
-    assert!(outbox.pending().unwrap().is_empty(), "nothing re-offered over working");
+    assert!(
+        outbox.pending().unwrap().is_empty(),
+        "nothing re-offered over working"
+    );
 
     let null = heal_sweep_with(&store, Some(&reg), None, true, |ids| async move {
         null_rows(&ids)
@@ -931,7 +1007,11 @@ async fn the_sweep_reoffers_a_dropped_finish_to_its_sent_row_after_a_restart() {
         rows(&outbox),
         vec![("finished".to_string(), "dropped".to_string())]
     );
-    assert!(outbox.pending().unwrap().iter().all(|r| r.session_id == row()));
+    assert!(outbox
+        .pending()
+        .unwrap()
+        .iter()
+        .all(|r| r.session_id == row()));
 }
 
 /// A read whose input coord truncated: an id it served no row for may not
