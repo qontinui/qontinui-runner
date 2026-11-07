@@ -22,9 +22,17 @@ import type { SaveSessionLayoutParams } from "./useSessionPersistence";
 import { noteRecordedZone, recordedZoneLedgerFor, type SessionOpenArgs } from "./sessionRecordArgs";
 import { rememberSessionId } from "./lastKnownSessionIds";
 import { loadKnownPageIds, readPinnedPageId } from "./useTerminalPages";
+import { subscribeTerminalPageRemoved } from "./terminalPageRemoval";
 import { getPageBindings, type PageBindings } from "@/lib/pageBindings";
 import { fetchLiveClaudeSessionIds } from "./liveClaudeSessions";
-import type { ResourceGuardSource } from "@/lib/resourceGuard";
+import {
+  guardWaitMs,
+  parseResourceGuardReading,
+  publishResourceGuardWait,
+  withdrawResourceGuardWait,
+  ResourceGuardDeferral,
+  type ResourceGuardSource,
+} from "@/lib/resourceGuard";
 import {
   loadDefaultConfigHome,
   resolveAccountDir,
@@ -282,6 +290,19 @@ export class RestoreRerunQueue {
     return (this.pending.get(pageId)?.size ?? 0) > 0;
   }
 
+  /**
+   * `pageId` was removed: forget it, so a page that exists under that id again
+   * is a page this window has not restored. A run of the removed page still in
+   * flight never reports its end here.
+   */
+  forget(pageId: string): void {
+    this.inFlight.delete(pageId);
+    this.restored.delete(pageId);
+    this.aborted.delete(pageId);
+    this.pending.delete(pageId);
+    this.taken.delete(pageId);
+  }
+
   /** Whether a restore of `pageId` has completed — a re-run of it merges. */
   restoredOnce(pageId: string): boolean {
     return this.restored.has(pageId);
@@ -384,6 +405,11 @@ export class RerunTimers {
     this.timers.set(pageId, timer);
   }
 
+  /** Whether a timer is pending under `key`. */
+  has(key: string): boolean {
+    return this.timers.has(key);
+  }
+
   cancel(pageId: string): void {
     const timer = this.timers.get(pageId);
     if (timer === undefined) return;
@@ -451,6 +477,497 @@ export function settleRestoreRun(
   });
 }
 
+/** The key a page's restore publishes its resource-guard wait under. */
+export function restoreGuardWaitKey(pageId: string): string {
+  return `session-restore:${pageId}`;
+}
+
+/**
+ * How long a page's auto-save gate may stay closed while a guard retry is owed,
+ * from the page's FIRST deferral: 10 minutes. Past it the gate opens even
+ * though the retry has not restored the rest — the operator's live edits on the
+ * page outweigh the cosmetics (labels, notes, pins) of rows not yet restored,
+ * which a save may then drop. The coord drain deferral already chose that
+ * direction (it opens the gate at once, since a drain can last hours).
+ */
+export const GUARD_GATE_HOLD_MS = 10 * 60_000;
+
+/**
+ * A page's restore that the resource guard refused, retried later instead of
+ * waited on (plan
+ * `2026-11-04-unplanned-restart-restore-is-page-gated-and-counts-unverified-resumes`
+ * Phase 5).
+ *
+ * ## Why the retry is a new run and not a wait inside this one
+ *
+ * The restore loop awaits each `createTerminal` in turn, and the run's
+ * `finally` releases its cold-resume claims and clears the page's loading
+ * spinner. A wait for room held open inside the loop (a promise retrying the
+ * spawn) would hold both for as long as the box stays full, and an unmount or
+ * a superseding run mid-wait would leave that promise alive to call
+ * `terminal_create` later — a duplicate PTY. So a refusal ENDS the run: the
+ * loop stops at the refused record, the run settles as `"deferred"` (like a
+ * coord drain deferral: its owed ids are dropped because the retry restores the
+ * page in full), and the retry is a fresh MERGING run of the page after
+ * {@link guardWaitMs}. A merging run skips every session a live tab already
+ * shows, so the records restored before the refusal are not restored twice.
+ *
+ * The retry rides {@link RerunTimers}, so a run of the page beginning
+ * ({@link beginRestoreRun}) cancels it and unmounting clears it — nothing is
+ * left to fire into a page that is gone. A run that begins while the page is
+ * still owed ({@link owes}) — a recheck-only re-run included — becomes the
+ * retry itself: the init effect runs it merging and in full, so cancelling the
+ * timer loses nothing. A retry run that ABORTS (an indeterminate reconnect)
+ * leaves the page owed, so it is re-armed ({@link rearm}).
+ *
+ * The wait is published for the guard banner and the restore strip and stays
+ * up until a run of the page actually begins, or the hook unmounts
+ * ({@link withdrawAll}). When the timer fires it is republished with no
+ * `retryAt`: for a page off screen the trigger only arms its next activation,
+ * so the honest line is "retries when the page is opened".
+ *
+ * While a retry is owed the page's auto-save gate stays CLOSED — a save would
+ * write a layout missing the unreached records' cosmetics — but for at most
+ * {@link GUARD_GATE_HOLD_MS} from the first deferral, after which `onGateRelease`
+ * opens it ({@link gateReleased}). The scrollback files are kept until the
+ * retry restores, since the cleanup would delete the unreached records'.
+ *
+ * The backoff counts consecutive deferrals per page and resets when a run of
+ * the page restores without one. Exported for tests.
+ */
+export class RestoreGuardRetry {
+  private readonly refusals = new Map<string, number>();
+  /** The latest deferral per owed page, for re-arming its wait. */
+  private readonly latest = new Map<string, { deferral: ResourceGuardDeferral; label: string }>();
+  /** Gate-hold timers per owed page, from its first deferral. */
+  private readonly gateTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  /** Owed pages whose gate-hold ran out. */
+  private readonly released = new Set<string>();
+  /** Epoch ms of each owed page's FIRST deferral, which the gate-hold is measured from. */
+  private readonly firstDeferredAt = new Map<string, number>();
+  /** The last run token issued ({@link begin}); tokens only grow. */
+  private runSeq = 0;
+  /**
+   * Per removed page, the last run token issued when it was removed
+   * ({@link forget}): every run of it begun up to then belongs to the page that
+   * is gone. A run of it in flight at the removal settles afterwards, and its
+   * refusal must not bring the retry, the wait or the hold back.
+   *
+   * Scoped to RUN TOKENS, not to the bare page id, because a page id can exist
+   * again in the same mount — "default" is re-created by the page reconcile
+   * the moment a terminal lands on it, and `openPage` re-opens any id — and a
+   * mark on the id would then stop every restore of the new page before its
+   * first record, for good. A run begun after the removal has a newer token and
+   * is untouched, whatever path brought its page back; nothing has to notice
+   * that the page came back for that to hold.
+   */
+  private readonly removedThrough = new Map<string, number>();
+  /** Opens a page's auto-save gate when its hold runs out ({@link setGateRelease}). */
+  private onGateRelease: (pageId: string) => void = () => {};
+
+  /** Install what opens a page's auto-save gate when its gate-hold runs out. */
+  setGateRelease(release: (pageId: string) => void): void {
+    this.onGateRelease = release;
+  }
+
+  /**
+   * The run of `pageId` was refused by the guard: publish the wait and
+   * schedule the merging retry. Nothing is scheduled once unmounted.
+   */
+  defer(
+    w: RestoreRerunWiring,
+    pageId: string,
+    deferral: ResourceGuardDeferral,
+    label: string,
+    run: number,
+  ) {
+    if (!w.timers.isActive || this.removed(pageId, run)) return;
+    const refusals = (this.refusals.get(pageId) ?? 0) + 1;
+    this.refusals.set(pageId, refusals);
+    this.latest.set(pageId, { deferral, label });
+    if (!this.firstDeferredAt.has(pageId)) this.firstDeferredAt.set(pageId, Date.now());
+    this.arm(w, pageId, run);
+  }
+
+  /**
+   * A retry run of `pageId` aborted (an indeterminate reconnect) while the page
+   * is still owed: publish its wait again and re-schedule the retry, at the
+   * current backoff.
+   */
+  rearm(w: RestoreRerunWiring, pageId: string, run: number): void {
+    if (!w.timers.isActive || this.removed(pageId, run) || !this.latest.has(pageId)) return;
+    this.arm(w, pageId, run);
+  }
+
+  /**
+   * `pageId` is gone (closed or deleted) while it may still be owed: drop
+   * everything about it — its retry timer, its wait, its gate-hold — for good,
+   * and mark every run of it begun so far as removed, so one still in flight
+   * cannot bring them back ({@link removed}).
+   */
+  forget(w: RestoreRerunWiring, pageId: string): void {
+    this.removedThrough.set(pageId, this.runSeq);
+    w.timers.cancel(pageId);
+    withdrawResourceGuardWait(restoreGuardWaitKey(pageId));
+    this.refusals.delete(pageId);
+    this.latest.delete(pageId);
+    this.released.delete(pageId);
+    this.firstDeferredAt.delete(pageId);
+    this.clearGateTimer(pageId);
+  }
+
+  /**
+   * Whether run `run` of `pageId` belongs to a page that was removed after it
+   * began: such a run is STOPPED — see the hook's `restoreRuns`.
+   */
+  removed(pageId: string, run: number): boolean {
+    return run <= (this.removedThrough.get(pageId) ?? 0);
+  }
+
+  /**
+   * Whether `pageId` is owed a retry: a run of it was refused and none has
+   * restored since. Its next run, however triggered, is that retry.
+   */
+  owes(pageId: string): boolean {
+    return this.refusals.has(pageId);
+  }
+
+  /** Whether the owed page's gate-hold ran out, so its auto-save gate is open again. */
+  gateReleased(pageId: string): boolean {
+    return this.released.has(pageId);
+  }
+
+  /** Whether a save of `pageId` must wait: a retry is owed and its gate-hold has not run out. */
+  holdsSave(pageId: string): boolean {
+    return this.owes(pageId) && !this.gateReleased(pageId);
+  }
+
+  /**
+   * A run of `pageId` begins — the retry, if one was owed: its wait is over.
+   * Returns the run's token, which {@link defer}, {@link rearm} and
+   * {@link removed} take.
+   */
+  begin(pageId: string): number {
+    withdrawResourceGuardWait(restoreGuardWaitKey(pageId));
+    this.runSeq += 1;
+    return this.runSeq;
+  }
+
+  /** A run of `pageId` restored without a guard refusal: the backoff starts over. */
+  restored(pageId: string): void {
+    this.refusals.delete(pageId);
+    this.latest.delete(pageId);
+    this.released.delete(pageId);
+    this.firstDeferredAt.delete(pageId);
+    this.clearGateTimer(pageId);
+  }
+
+  /**
+   * The hook unmounts: every published wait and gate-hold timer goes with it.
+   * What is OWED is kept — it is this instance's record, read by the unmount
+   * save ({@link holdsSave}) and by a StrictMode re-mount's next run — and so
+   * is each page's first-deferral time, from which the next {@link defer} or
+   * {@link rearm} re-arms the hold for whatever of it is left.
+   */
+  withdrawAll(): void {
+    for (const pageId of this.refusals.keys()) {
+      withdrawResourceGuardWait(restoreGuardWaitKey(pageId));
+      this.clearGateTimer(pageId);
+    }
+  }
+
+  private arm(w: RestoreRerunWiring, pageId: string, run: number): void {
+    this.holdGate(pageId);
+    const refusals = this.refusals.get(pageId) ?? 1;
+    const delay = guardWaitMs(refusals);
+    this.publish(pageId, Date.now() + delay);
+    w.timers.set(pageId, delay, () => {
+      if (this.removed(pageId, run)) return;
+      // The trigger runs the page at once when it is on screen (whose run's
+      // `begin` withdraws this), and otherwise only arms its next activation.
+      this.publish(pageId, null);
+      w.trigger(pageId, true);
+    });
+  }
+
+  private publish(pageId: string, retryAt: number | null): void {
+    const latest = this.latest.get(pageId);
+    if (!latest) return;
+    publishResourceGuardWait({
+      key: restoreGuardWaitKey(pageId),
+      sourceLabel: latest.label,
+      metric: latest.deferral.refusal.metric,
+      reading: parseResourceGuardReading(latest.deferral.refusal),
+      refusals: this.refusals.get(pageId) ?? 1,
+      retryAt,
+    });
+  }
+
+  /**
+   * Arm the owed page's gate-hold unless one is pending or it already ran
+   * out, for what is LEFT of {@link GUARD_GATE_HOLD_MS} since the first
+   * deferral — so a hold whose timer an unmount cleared (a StrictMode
+   * re-mount) still opens at the bound, and opens at once when the bound has
+   * already passed.
+   */
+  private holdGate(pageId: string): void {
+    if (!this.owes(pageId) || this.gateTimers.has(pageId) || this.released.has(pageId)) return;
+    const first = this.firstDeferredAt.get(pageId) ?? Date.now();
+    const left = first + GUARD_GATE_HOLD_MS - Date.now();
+    if (left <= 0) {
+      this.releaseGate(pageId);
+      return;
+    }
+    this.gateTimers.set(
+      pageId,
+      setTimeout(() => {
+        this.gateTimers.delete(pageId);
+        if (this.owes(pageId)) this.releaseGate(pageId);
+      }, left),
+    );
+  }
+
+  private releaseGate(pageId: string): void {
+    this.released.add(pageId);
+    this.onGateRelease(pageId);
+  }
+
+  private clearGateTimer(pageId: string): void {
+    const timer = this.gateTimers.get(pageId);
+    if (timer === undefined) return;
+    clearTimeout(timer);
+    this.gateTimers.delete(pageId);
+  }
+}
+
+/**
+ * What the orphan-adoption pass found to adopt onto `pageId`, after the page
+ * that owned the orphan-adoption claim was removed (`removedPageIds`: every
+ * page this window has removed): the records of its restore set
+ * with adoption on that were ALREADY orphans and that the removed pages' runs
+ * had not reached: none that closed with a removed page
+ * ({@link closedWithRemovedPage}). A drain-withheld set finds nothing to adopt:
+ * the drain lift re-runs the page in full.
+ *
+ * `unreadable` when the registry or the terminal list could not be read: the
+ * pass adopted nothing and is still owed. `candidates` names the orphans it
+ * would have weighed, when the registry was read. Exported for tests.
+ */
+export async function readOrphanAdoption(
+  pageId: string,
+  removedPageIds: ReadonlySet<string>,
+  handledByRemoved: ReadonlySet<string>,
+): Promise<OrphanAdoptionRead> {
+  const restoreSet = await fetchRestoreSet(pageId, {
+    knownPageIds: loadKnownPageIds(),
+    adoptOrphans: true,
+  });
+  if (restoreSet.readFailed) return { kind: "unreadable", candidates: null };
+  if (restoreSet.deferredByDrain !== null) return { kind: "read", ids: [] };
+  const orphans = restoreSet.records.filter((rec) => (rec.pageId ?? "default") !== pageId);
+  // Known to have closed before the terminal list is read: for the notice.
+  const candidates = orphans.filter(
+    (rec) => !closedWithRemovedPage(rec, pageId, removedPageIds, handledByRemoved, new Set()),
+  );
+  // No candidate: nothing to adopt, whatever the terminal list would say.
+  if (candidates.length === 0) return { kind: "read", ids: [] };
+  const onRemovedPages = await liveTerminalIdsOnPages(removedPageIds);
+  if (onRemovedPages === null) {
+    return { kind: "unreadable", candidates: candidates.map((rec) => rec.claudeSessionId) };
+  }
+  return {
+    kind: "read",
+    ids: candidates
+      .filter(
+        (rec) =>
+          !closedWithRemovedPage(rec, pageId, removedPageIds, handledByRemoved, onRemovedPages),
+      )
+      .map((rec) => rec.claudeSessionId),
+  };
+}
+
+/**
+ * Whether `rec`, read by an adopting restore of `pageId` (the orphan-adoption
+ * pass's or a run holding the claim), closed with a page this window removed
+ * — the ONE test both apply, so closing a page never resurrects its sessions
+ * however the claim moved on. A record of `pageId` itself never did: a page
+ * that exists under a removed id again owns its records. Otherwise it did
+ * when it is a removed page's own record (whether or not the backend has
+ * closed it yet — `terminal_close` is fire-and-forget), an orphan a removed
+ * page's runs had restored or held (`closedSessions`), or a record whose live
+ * tab is still bound to a removed page (`liveOnRemovedPages`).
+ * Exported for tests.
+ */
+export function closedWithRemovedPage(
+  rec: TerminalSessionRecord,
+  pageId: string,
+  removedPageIds: ReadonlySet<string>,
+  closedSessions: ReadonlySet<string>,
+  liveOnRemovedPages: ReadonlySet<string>,
+): boolean {
+  const recPage = rec.pageId ?? "default";
+  if (recPage === pageId) return false;
+  return (
+    removedPageIds.has(recPage) ||
+    closedSessions.has(rec.claudeSessionId) ||
+    liveOnRemovedPages.has(rec.terminalId)
+  );
+}
+
+/** What {@link readOrphanAdoption} found. */
+export type OrphanAdoptionRead =
+  | { kind: "read"; ids: string[] }
+  | { kind: "unreadable"; candidates: string[] | null };
+
+/**
+ * How many times in a row a removal's orphan-adoption pass may fail to read
+ * before it stops and says so: 7 — with the guard's backoff (15 s doubling to
+ * the 120 s cap) the last attempt falls 585 s after the first failure, inside
+ * the 10-minute horizon the guard holds a page's auto-save gate for
+ * (`GUARD_GATE_HOLD_MS`). A registry or terminal list unreadable for that long
+ * is not a blip; retrying beyond it would only hide the loss.
+ */
+export const ORPHAN_PASS_MAX_ATTEMPTS = 7;
+
+/** A removal's orphans that its adoption pass gave up on, shown to the operator. */
+export interface UnadoptedOrphans {
+  removedPageIds: readonly string[];
+  /** The orphans' session ids, or `null` when the registry was never read. */
+  sessionIds: readonly string[] | null;
+}
+
+/**
+ * What an ADOPTING restore run (one holding the orphan-adoption claim) leaves
+ * of the unadopted-orphans notice: it read `read` from a readable registry and
+ * restored or held the orphans in `handled`. A run that reached every record
+ * (`complete`) adopted every orphan there was, so nothing is left unadopted.
+ * Otherwise an orphan it handled is adopted, and one it no longer read has
+ * closed. Returns `list` itself when nothing changed. Exported for tests.
+ */
+export function pruneUnadoptedOrphans(
+  list: readonly UnadoptedOrphans[],
+  read: ReadonlySet<string>,
+  handled: ReadonlySet<string>,
+  complete: boolean,
+): readonly UnadoptedOrphans[] {
+  if (list.length === 0) return list;
+  if (complete) return [];
+  let changed = false;
+  const next = list.flatMap((u) => {
+    if (u.sessionIds === null) return [u];
+    const left = u.sessionIds.filter((id) => read.has(id) && !handled.has(id));
+    if (left.length === u.sessionIds.length) return [u];
+    changed = true;
+    return left.length > 0 ? [{ ...u, sessionIds: left }] : [];
+  });
+  return changed ? next : list;
+}
+
+/** `pageId` when it exists in the page list, else the list's first page. */
+function existingPageFor(pageId: string): string {
+  const known = loadKnownPageIds();
+  return known.includes(pageId) ? pageId : known[0];
+}
+
+/** The operator's notice for {@link UnadoptedOrphans}. */
+export function unadoptedOrphansNotice(u: UnadoptedOrphans): string {
+  const which =
+    u.sessionIds === null
+      ? "orphaned sessions it could not name (the session registry could not be read)"
+      : `orphaned session${u.sessionIds.length === 1 ? "" : "s"} ${u.sessionIds.join(", ")}`;
+  return (
+    `Closing ${u.removedPageIds.length === 1 ? "page" : "pages"} ${u.removedPageIds.join(", ")} ` +
+    `left ${which}, and no page could adopt them. ` +
+    `They are not restored; resume them from Previous Sessions.`
+  );
+}
+
+/**
+ * The orphan-adoption claim while a removal's adoption pass is owed: held by
+ * no page, so no run that starts meanwhile adopts an orphan the pass is about
+ * to. The pass hands it to the page it adopts onto. No page has this id.
+ */
+export const ORPHAN_CLAIM_IN_PASS = "\u0000orphan-adoption-pass";
+
+/** One restore run of a page, by its run token (`RestoreGuardRetry.begin`). */
+export interface RestoreRunEntry {
+  pageId: string;
+  /** Its `finally` ran. */
+  ended: boolean;
+  /** The orphans it restored or held: they close with its page. */
+  orphansHandled: Set<string>;
+}
+
+/** The runs of `pageId` that its removal stopped, with their tokens. */
+function stoppedRunsOf(
+  runs: ReadonlyMap<number, RestoreRunEntry>,
+  pageId: string,
+  retry: RestoreGuardRetry,
+): Array<[number, RestoreRunEntry]> {
+  return [...runs].filter(([token, run]) => run.pageId === pageId && retry.removed(pageId, token));
+}
+
+/** The `RerunTimers` key of the orphan-adoption pass's retry; no page has this id. */
+const ORPHAN_PASS_TIMER_KEY = "\u0000orphan-adoption-retry";
+
+/** Close the pane a stopped restore run spawned. */
+function closeLateSpawnPane(tabId: string): void {
+  invoke("terminal_close", { terminalId: tabId }).catch((err) => {
+    console.warn(`[TerminalPage] closing ${tabId}, spawned for a removed page, failed:`, err);
+  });
+}
+
+/**
+ * Where a session goes whose pane a STOPPED restore run (its page,
+ * `stoppedPageId`, was removed mid-spawn) had just spawned — decided by the
+ * record's page AS IT IS NOW, never by the run that spawned it:
+ * - `restore`: the page exists (it may have been re-created) — that page
+ *   restores it, through its re-run queue (or its own first restore);
+ * - `adopt`: the page is gone and the record was an ORPHAN the run had
+ *   adopted — the removal's orphan-adoption pass adopts it onto the page on
+ *   screen;
+ * - `close`: the page is gone and the record was the removed page's own — it
+ *   closed with its page.
+ * The pane itself is closed in every case: it is bound to the removed page.
+ * Exported for tests.
+ */
+export function routeLateSpawn(
+  rec: TerminalSessionRecord,
+  stoppedPageId: string,
+  knownPageIds: readonly string[],
+  w: RestoreRerunWiring,
+): "restore" | "adopt" | "close" {
+  const recPage = rec.pageId ?? "default";
+  if (knownPageIds.includes(recPage)) {
+    scheduleRestoreRerun(w, recPage, [rec.claudeSessionId]);
+    return "restore";
+  }
+  return recPage === stoppedPageId ? "close" : "adopt";
+}
+
+/**
+ * The ids of the live terminals bound to `pageId`, or `null` when the terminal
+ * list cannot be read — UNKNOWN, on which the adoption pass adopts nothing
+ * rather than risk taking over a closed page's pane, and tries again later.
+ */
+async function liveTerminalIdsOnPages(pageIds: ReadonlySet<string>): Promise<Set<string> | null> {
+  try {
+    const result = await invoke<{
+      success: boolean;
+      data?: { terminals: Array<{ id: string; pageId?: string; page_id?: string }> };
+    }>("terminal_list");
+    if (!result?.success || !result.data) return null;
+    return new Set(
+      result.data.terminals
+        .filter((t) => pageIds.has(t.pageId || t.page_id || "default"))
+        .map((t) => t.id),
+    );
+  } catch (err) {
+    console.warn("[TerminalPage] terminal_list unreadable for the orphan-adoption pass:", err);
+    return null;
+  }
+}
+
 /** The restore set for a page, or the coord device drain's deferral of it. */
 export interface RestoreSet {
   records: TerminalSessionRecord[];
@@ -462,11 +979,17 @@ export interface RestoreSet {
    * once autonomous spawns are allowed again.
    */
   deferredByDrain: string | null;
+  /**
+   * True when the registry could not be read (the command failed, or answered
+   * without a session list): `records` is then empty because NOTHING is known,
+   * not because there are no sessions.
+   */
+  readFailed: boolean;
 }
 
 /**
- * {@link fetchOpenRecords}, keeping the drain deferral distinguishable from an
- * empty restore set. Exported for unit tests.
+ * {@link fetchOpenRecords}, keeping the drain deferral and a failed read
+ * distinguishable from an empty restore set. Exported for unit tests.
  */
 export async function fetchRestoreSet(
   pageId: string,
@@ -481,7 +1004,7 @@ export async function fetchRestoreSet(
     resp = await invoke<CommandResponse>("terminal_session_list_open", { purpose: "restore" });
   } catch (err) {
     console.warn("[TerminalPage] terminal_session_list_open failed:", err);
-    return { records: [], deferredByDrain: null };
+    return { records: [], deferredByDrain: null, readFailed: true };
   }
   const data = resp?.data as
     | { sessions?: TerminalSessionRecord[]; deferredByDrain?: { reason?: unknown } | null }
@@ -494,10 +1017,13 @@ export async function fetchRestoreSet(
         typeof reason === "string" && reason.length > 0
           ? reason
           : "deferred by the coord device drain",
+      readFailed: false,
     };
   }
   const sessions = data?.sessions;
-  if (!Array.isArray(sessions)) return { records: [], deferredByDrain: null };
+  if (!resp?.success || !Array.isArray(sessions)) {
+    return { records: [], deferredByDrain: null, readFailed: true };
+  }
   const byId = new Map<string, TerminalSessionRecord>();
   for (const rec of sessions) {
     if (!rec || typeof rec.claudeSessionId !== "string") continue;
@@ -508,7 +1034,7 @@ export async function fetchRestoreSet(
     }
     if (!byId.has(rec.claudeSessionId)) byId.set(rec.claudeSessionId, rec);
   }
-  return { records: [...byId.values()], deferredByDrain: null };
+  return { records: [...byId.values()], deferredByDrain: null, readFailed: false };
 }
 
 /**
@@ -1587,10 +2113,25 @@ export function useTerminalInitialization({
   // becomes active — rather than once per mount.
   const didInitPages = useRef<Set<string>>(new Set());
 
-  // Orphan-record adoption is claimed by the FIRST page to restore after
-  // mount (one adopter per boot — two pages both adopting would double-restore
-  // the same orphan). See `recordBelongsToRestore`.
-  const didClaimOrphanAdoption = useRef(false);
+  // Orphan-record adoption is OWNED by the first page to restore after mount
+  // (one adopter per boot — two pages both adopting would double-restore the
+  // same orphan: a duplicate PTY, or a forked `--resume`). See
+  // `recordBelongsToRestore`. `null` = unclaimed. The owner keeps adopting on
+  // its own later runs — a guard retry must still reach the orphans its
+  // refused run never did — and no other page ever does while it lives. It is
+  // handed back in exactly two cases:
+  // - the run that TOOK it was deferred by a coord drain before restoring
+  //   anything (a later drain-deferred run of the owner restored orphans
+  //   earlier, so it keeps the claim — handing it back would let another page
+  //   adopt those again);
+  // - the owner page is removed, whatever it still owed: its unreached
+  //   orphans would otherwise sit on no page until the no-terminal sweep
+  //   closed them. Only this window's `removePage` removes one
+  //   (`terminalPageRemoval`; windows do not sync page lists): the removal's
+  //   adoption pass holds the claim (`ORPHAN_CLAIM_IN_PASS`) until it has
+  //   adopted what is left onto the page on screen, which then takes it. The
+  //   records the owner restored are on live tabs and are no longer orphans.
+  const orphanAdoptionOwner = useRef<string | null>(null);
 
   // Gate for the debounced auto-save effect. The restore path recreates
   // plain shells and only *asynchronously* types `claude --resume <id>` /
@@ -1689,12 +2230,180 @@ export function useTerminalInitialization({
     markMerging: (forPage) => drainDeferredPages.current.add(forPage),
     trigger: triggerRerun,
   }));
+  // A restore the resource guard refused, retried as a later merging run
+  // (see `RestoreGuardRetry`). Stable for the hook's lifetime.
+  // When a page's gate-hold runs out, its auto-save gate opens.
+  // The one door that opens a page's restore gates — auto-save AND the trim
+  // hold — for its newest run (`openRestoreGate`), so the gate-hold's expiry
+  // opens both, as a run's own end does.
+  const restoreGateDoors = useRef(new Map<string, () => void>());
+  const releaseRestoreGate = useCallback(
+    (page: string) => {
+      const door = restoreGateDoors.current.get(page);
+      if (door) door();
+      else restoreCompletePages.current.add(page);
+      publishRestorePages();
+    },
+    [publishRestorePages],
+  );
+  const [guardRetry] = useState(() => new RestoreGuardRetry());
+  useEffect(() => {
+    guardRetry.setGateRelease(releaseRestoreGate);
+  }, [guardRetry, releaseRestoreGate]);
   // Active while mounted (re-armed on a StrictMode re-mount); unmounting
-  // clears the timers and stops a run that ends later from scheduling one.
+  // clears the timers — a guard retry's among them — and stops a run that
+  // ends later from scheduling one.
   useEffect(() => {
     rerun.timers.setActive(true);
-    return () => rerun.timers.setActive(false);
-  }, [rerun]);
+    return () => {
+      rerun.timers.setActive(false);
+      guardRetry.withdrawAll();
+    };
+  }, [rerun, guardRetry]);
+  // A page removed in this window (`terminalPageRemoval`) takes everything
+  // this hook holds for it: its guard retry (timer, wait, auto-save hold), its
+  // restore bookkeeping — so a page that exists under that id again restores
+  // like any page — and, when it owned the orphan-adoption claim, the claim.
+  // Its unreached orphans are then adopted by the page on screen
+  // (`scheduleOrphanAdoption`) rather than left for the no-terminal sweep: no
+  // other page's first restore may ever run to pick them up. The pass waits
+  // for an effect, after the removal has rendered, so the persisted page list
+  // no longer names the removed page.
+  //
+  // ONE rule for a run of the removed page still in flight — a STOPPED run
+  // (`guardRetry.removed`): it restores nothing more, touches no page state
+  // when it ends, and hands every session it was spawning when the page went
+  // to whoever owns that session NOW (`routeLateSpawn`). The pass waits for
+  // every stopped run of the page to end (`restoreRuns`), because only then
+  // are its notes complete — the orphans its runs restored or held, which
+  // closed with the page — and its `ColdResumeGuard` claims released. It stays
+  // owed until it completes with a readable registry and terminal list onto a
+  // page that still exists, retrying with the guard's backoff (`guardWaitMs`)
+  // — a read that fails or throws alike — and gives up, visibly
+  // (`unadoptedOrphans`), after `ORPHAN_PASS_MAX_ATTEMPTS`. One pass runs at a
+  // time.
+  const orphanPassesOwed = useRef(new Set<string>());
+  const orphanPassAttempts = useRef(0);
+  const orphanPassBusy = useRef(false);
+  const [orphanPassTick, setOrphanPassTick] = useState(0);
+  const [unadoptedOrphans, setUnadoptedOrphans] = useState<readonly UnadoptedOrphans[]>([]);
+  // What closed with a removed page, for good: its id (its own records are
+  // never adopted — unless a page of that id exists again, whose records they
+  // then are) and the orphans its runs had restored or held. Every adopting
+  // run excludes them, the pass's or not, so a claim handed on — or released
+  // by a pass that gave up — never brings a closed page's sessions back.
+  const closedPages = useRef(new Set<string>());
+  const closedSessions = useRef(new Set<string>());
+  // Every restore run by its token (`RestoreGuardRetry.begin`), until it ends,
+  // and after it while it holds orphans its page would take with it.
+  const restoreRuns = useRef(new Map<number, RestoreRunEntry>());
+  useEffect(
+    () =>
+      subscribeTerminalPageRemoved((removed) => {
+        guardRetry.forget(rerun, removed);
+        rerun.queue.forget(removed);
+        didInitPages.current.delete(removed);
+        restoreCompletePages.current.delete(removed);
+        drainDeferredPages.current.delete(removed);
+        deferredRetryPages.current.delete(removed);
+        restoreGateDoors.current.delete(removed);
+        publishRestorePages();
+        closedPages.current.add(removed);
+        // Only the claim's owner leaves orphans to adopt: a page removed while
+        // a pass holds the claim never adopted any, and its own records are
+        // excluded by `closedPages` like every removed page's.
+        if (orphanAdoptionOwner.current !== removed) return;
+        orphanAdoptionOwner.current = ORPHAN_CLAIM_IN_PASS;
+        orphanPassesOwed.current.add(removed);
+        setOrphanPassTick((n) => n + 1);
+      }),
+    [guardRetry, rerun, publishRestorePages],
+  );
+  useEffect(() => {
+    if (orphanPassBusy.current || rerun.timers.has(ORPHAN_PASS_TIMER_KEY)) return;
+    const removed = new Set(orphanPassesOwed.current);
+    if (removed.size === 0) return;
+    const stopped = [...removed].flatMap((r) => stoppedRunsOf(restoreRuns.current, r, guardRetry));
+    if (stopped.some(([, run]) => !run.ended)) return;
+    const handled = new Set(stopped.flatMap(([, run]) => [...run.orphansHandled]));
+    // Everything that closed with a removed page, then.
+    const closeWithStopped = () => {
+      for (const id of handled) closedSessions.current.add(id);
+      for (const [token] of stopped) restoreRuns.current.delete(token);
+    };
+    orphanPassBusy.current = true;
+    void (async () => {
+      // Every outcome but `done` is a failed attempt: retried after the
+      // guard's backoff, and bounded.
+      let outcome: "done" | "failed" = "failed";
+      let candidates: string[] | null = null;
+      try {
+        // Onto the page that holds the claim, or — while the pass holds it —
+        // a page that EXISTS: the one on screen, else the first one (the page
+        // on screen can be the unsaved "default" fallback right after the
+        // page on screen was removed). That page takes the claim once the
+        // pass completes.
+        const owner = orphanAdoptionOwner.current;
+        const target =
+          owner === null || owner === ORPHAN_CLAIM_IN_PASS ? existingPageFor(pageId) : owner;
+        const read = await readOrphanAdoption(
+          target,
+          new Set([...closedPages.current, ...removed]),
+          new Set([...closedSessions.current, ...handled]),
+        );
+        if (read.kind === "unreadable") {
+          candidates = read.candidates;
+        } else if (!loadKnownPageIds().includes(target)) {
+          // The target was removed during the reads: its queue is gone, and
+          // so is any page to hand the claim to. The next attempt picks again.
+          candidates = read.ids;
+        } else {
+          scheduleRestoreRerun(rerun, target, read.ids);
+          const now = orphanAdoptionOwner.current;
+          if (now === null || now === ORPHAN_CLAIM_IN_PASS) orphanAdoptionOwner.current = target;
+          outcome = "done";
+        }
+      } catch (err) {
+        console.warn("[TerminalPage] the orphan-adoption pass failed:", err);
+      } finally {
+        orphanPassBusy.current = false;
+        if (outcome === "done") {
+          // A page removed during the pass stays owed: the next pass covers it.
+          for (const r of removed) orphanPassesOwed.current.delete(r);
+          orphanPassAttempts.current = 0;
+          closeWithStopped();
+        } else {
+          orphanPassAttempts.current += 1;
+          const attempt = orphanPassAttempts.current;
+          if (attempt >= ORPHAN_PASS_MAX_ATTEMPTS) {
+            // Given up: the claim is released, so the next restore of any page
+            // adopts the orphans (never what closed with a removed page), and
+            // the operator is told which sessions no page adopted meanwhile.
+            for (const r of removed) orphanPassesOwed.current.delete(r);
+            orphanPassAttempts.current = 0;
+            closeWithStopped();
+            if (orphanAdoptionOwner.current === ORPHAN_CLAIM_IN_PASS) {
+              orphanAdoptionOwner.current = null;
+            }
+            console.error(
+              `[TerminalPage] gave up adopting the orphans of removed page(s) ` +
+                `${[...removed].join(", ")} after ${attempt} failed attempts: ` +
+                `${candidates?.join(", ") ?? "the registry was never read"}`,
+            );
+            setUnadoptedOrphans((prev) => [
+              ...prev,
+              { removedPageIds: [...removed], sessionIds: candidates },
+            ]);
+          } else {
+            rerun.timers.set(ORPHAN_PASS_TIMER_KEY, guardWaitMs(attempt), () =>
+              setOrphanPassTick((n) => n + 1),
+            );
+          }
+        }
+        setOrphanPassTick((n) => n + 1);
+      }
+    })();
+  }, [pageId, orphanPassTick, rerun, guardRetry]);
   // Re-run the restore of `forPage` (merging, like a drain re-run) for
   // exactly `sessionIds` — after a late sweep settle, or a session a dead
   // holder handed back. The active page re-runs now (or when its run in
@@ -1748,7 +2457,14 @@ export function useTerminalInitialization({
     // meanwhile (see `drainDeferredPages`). Its auto-save gate is closed for the
     // duration of the restore, exactly like a first restore, and reopened by the
     // same finally / drain timer.
-    const isDrainRerun = drainDeferredPages.current.delete(initPageId);
+    //
+    // A page the resource guard still owes a retry (`RestoreGuardRetry`) runs
+    // as that retry — merging and IN FULL — whatever started it: the run that
+    // was refused stopped part-way, so the records after the refusal are owed
+    // too, and a recheck-only run (a released holder, a late sweep settle)
+    // that cancelled the retry and restored only its own ids would strand them.
+    const guardOwed = guardRetry.owes(initPageId);
+    const isDrainRerun = drainDeferredPages.current.delete(initPageId) || guardOwed;
     if (isDrainRerun) restoreCompletePages.current.delete(initPageId);
     // The page's auto-trim waits for this run exactly as auto-save does: both
     // are released together by `openRestoreGate`. The setter is the page's
@@ -1763,6 +2479,7 @@ export function useTerminalInitialization({
       restoreCompletePages.current.add(initPageId);
       if (newestRestoreRun.current.get(initPageId) === thisRun) setRestoreSettled(true);
     };
+    restoreGateDoors.current.set(initPageId, openRestoreGate);
     // What a merging run may place into: its own page's grid as it is now. The
     // captured `zoneLayout` is the page's own, so this holds through a page
     // switch, and it reads live because a deferred retry starts with the hold
@@ -1777,8 +2494,35 @@ export function useTerminalInitialization({
         : resolveLayout(layoutId, 0).zones.length;
     };
     // A re-run for the holder sweep's late settle restores only these. Ids
-    // scheduled while this run is in flight wait for its end.
-    const recheckOnly = beginRestoreRun(rerun, initPageId);
+    // scheduled while this run is in flight wait for its end. A full run
+    // covers them, so they are not restricted to while the guard is owed.
+    const recheckIds = beginRestoreRun(rerun, initPageId);
+    const recheckOnly = guardOwed ? undefined : recheckIds;
+    const runToken = guardRetry.begin(initPageId);
+    // Stopped once its page is removed (see `restoreRuns`).
+    const stopped = () => guardRetry.removed(initPageId, runToken);
+    const runEntry: RestoreRunEntry = {
+      pageId: initPageId,
+      ended: false,
+      orphansHandled: new Set(),
+    };
+    restoreRuns.current.set(runToken, runEntry);
+    // An ORPHAN this run restored or held (a record of another page it
+    // adopted): if this page is removed, that session closed with it and the
+    // removal's adoption pass must not bring it back.
+    const noteOrphanHandled = (rec: TerminalSessionRecord) => {
+      if ((rec.pageId ?? "default") !== initPageId)
+        runEntry.orphansHandled.add(rec.claudeSessionId);
+    };
+    // Sessions this run had spawned a pane for when it was stopped: routed by
+    // `routeLateSpawn` once its claims are released.
+    const lateSpawns: TerminalSessionRecord[] = [];
+    // The sessions an ADOPTING run read from a readable registry: what it
+    // tells the unadopted-orphans notice (`pruneUnadoptedOrphans`).
+    let adoptingRead: ReadonlySet<string> | null = null;
+    // Set when the resource guard refused a cold restore: this run stops there
+    // and settles as deferred; its `finally` schedules the merging retry.
+    let guardDeferral: ResourceGuardDeferral | null = null;
     // Sessions this run claimed for a cold resume; released when it ends.
     const coldClaims: string[] = [];
     // The drain withheld the restore set: this run restored nothing.
@@ -1866,10 +2610,16 @@ export function useTerminalInitialization({
         //    which Claude sessions exist and their zones. The localStorage
         //    snapshot is demoted to cosmetics only (layout / labels / notes /
         //    pins / focusedZone / scrollback) — matched by zoneIndex.
-        const adoptOrphans = !didClaimOrphanAdoption.current;
-        didClaimOrphanAdoption.current = true;
+        const knownPageIds = loadKnownPageIds();
+        // The claim's owner is a page this window holds: its own page state is
+        // the authority, and only this window's `removePage` removes one.
+        // Windows do not sync page lists, so a page another window removed —
+        // or left out of the persisted list it wrote — still exists here.
+        const tookOrphanOwnership = orphanAdoptionOwner.current === null;
+        const adoptOrphans = tookOrphanOwnership || orphanAdoptionOwner.current === initPageId;
+        if (adoptOrphans) orphanAdoptionOwner.current = initPageId;
         const restoreSet = await fetchRestoreSet(pageId, {
-          knownPageIds: loadKnownPageIds(),
+          knownPageIds,
           adoptOrphans,
         });
         if (restoreSet.deferredByDrain !== null) {
@@ -1886,7 +2636,7 @@ export function useTerminalInitialization({
           deferredRetryPages.current.add(initPageId);
           drainDeferredPages.current.add(initPageId);
           didInitPages.current.delete(initPageId);
-          if (adoptOrphans) didClaimOrphanAdoption.current = false;
+          if (tookOrphanOwnership) orphanAdoptionOwner.current = null;
           console.warn(
             `[TerminalPage] restore for page "${initPageId}" deferred by the coord device ` +
               `drain: ${restoreSet.deferredByDrain} — it re-runs when the drain lifts.`,
@@ -1895,7 +2645,38 @@ export function useTerminalInitialization({
         }
         // Not deferred after all, so this retry is a real restore: hold the trim.
         setRestoreSettled(false);
-        const openRecords = restoreSet.records;
+        // An adopting run never takes what closed with a removed page — the
+        // same test as the adoption pass's. A terminal list it cannot read
+        // leaves it adopting no orphan, rather than guess, and hands them back
+        // to the adoption pass, which holds the claim and retries with its
+        // bounded backoff until it reads (or gives up, visibly).
+        let liveOnRemoved: ReadonlySet<string> | null = new Set<string>();
+        if (adoptOrphans && closedPages.current.size > 0) {
+          liveOnRemoved = await liveTerminalIdsOnPages(closedPages.current);
+          if (liveOnRemoved === null && !stopped()) {
+            if (orphanAdoptionOwner.current === initPageId) {
+              orphanAdoptionOwner.current = ORPHAN_CLAIM_IN_PASS;
+            }
+            for (const page of closedPages.current) orphanPassesOwed.current.add(page);
+            setOrphanPassTick((n) => n + 1);
+          }
+        }
+        const openRecords = adoptOrphans
+          ? restoreSet.records.filter((rec) =>
+              liveOnRemoved === null
+                ? (rec.pageId ?? "default") === initPageId
+                : !closedWithRemovedPage(
+                    rec,
+                    initPageId,
+                    closedPages.current,
+                    closedSessions.current,
+                    liveOnRemoved,
+                  ),
+            )
+          : restoreSet.records;
+        if (adoptOrphans && !restoreSet.readFailed && liveOnRemoved !== null) {
+          adoptingRead = new Set(openRecords.map((rec) => rec.claudeSessionId));
+        }
         // The default Claude home, for the account rule (`resolveAccountDir`):
         // `null` = unreadable, which makes a dir that may be it needs-account.
         const defaultHome = await loadDefaultConfigHome();
@@ -1974,6 +2755,10 @@ export function useTerminalInitialization({
         const heldBackIds = new Set(heldBack.map((r) => r.terminalId));
         for (const r of heldBack) heldBackWhileSweeping.push(r.claudeSessionId);
         for (const [recIndex, rec] of openRecords.entries()) {
+          // The page was removed while this run was in flight: restore nothing
+          // more onto a page that no longer exists, and adopt no orphan the
+          // page on screen is about to adopt (`subscribeTerminalPageRemoved`).
+          if (stopped()) break;
           // A re-run for the holder sweep's late settle restores ONLY the
           // sessions that settle showed resumable.
           if (recheckOnly && !recheckOnly.has(rec.claudeSessionId)) continue;
@@ -1988,6 +2773,7 @@ export function useTerminalInitialization({
           // come from the SessionManager through `WorkerSessionCell`.
           if (isWorkerRecord(rec)) {
             adoptWorkerTab(rec);
+            noteOrphanHandled(rec);
             continue;
           }
           const account = resolveRestoreAccount(rec, defaultHome);
@@ -2023,6 +2809,7 @@ export function useTerminalInitialization({
               claudeRecordConfigDir: recordDir,
             });
             rememberSessionId(tabId, rec.claudeSessionId, typedDir);
+            noteOrphanHandled(rec);
             continue;
           }
 
@@ -2070,6 +2857,7 @@ export function useTerminalInitialization({
                 getLiveSessionIds,
                 noteNeedsAccount,
               });
+              noteOrphanHandled(rec);
             }
             continue;
           }
@@ -2088,18 +2876,51 @@ export function useTerminalInitialization({
           //    is re-asserted under the new ephemeral terminal id ONLY after
           //    the resume handshake VERIFIES (item 3 — re-asserting here
           //    refreshed `lastSeenAt` on ghost rows, making them immortal).
-          // The source names this restore in the resource-guard dialog. `queued`
+          // The source names this restore to the resource guard. `queued`
           // counts the records still ahead, this one included — an upper bound,
           // since reconnected and live records ahead will be skipped.
+          // `onRefusal: "defer"`: a restore has nobody to answer the guard's
+          // dialog (on a headless box it would block this loop for ever), so a
+          // refusal ends this run here and the page is restored again, merging,
+          // after a capped backoff (`RestoreGuardRetry`), shown as
+          // "waiting: <lane> ceiling" — no dialog, no override, no grant spent.
+          // This is the shared cold-restore call, so it covers `auto-resume`
+          // rows as well as `terminal-only` ones. That is deliberate until
+          // plan D5 deletes this path's typed boot restore of `auto-resume`
+          // rows in favour of the backend queue; until then both kinds wait
+          // the same way rather than one of them asking a human.
           // Another run in flight is already creating this session's tab.
           if (!coldResumeGuard.current.tryClaim(rec.claudeSessionId)) continue;
           coldClaims.push(rec.claudeSessionId);
           const tabName = restoreTabName(rec);
-          const tabId = await createTerminal(tabName, rec.workingDir, undefined, {
-            label: "session restore",
-            queued: openRecords.length - recIndex,
-          });
+          let tabId: string | null;
+          try {
+            tabId = await createTerminal(tabName, rec.workingDir, undefined, {
+              label: "session restore",
+              queued: openRecords.length - recIndex,
+              onRefusal: "defer",
+            });
+          } catch (err) {
+            if (!(err instanceof ResourceGuardDeferral)) throw err;
+            guardDeferral = err;
+            restoreDeferred = true;
+            // The orphan-adoption claim stays with this page (it is page-owned,
+            // see `orphanAdoptionOwner`): its retry still adopts the orphans
+            // this run never reached, and no other page can adopt the ones it
+            // already restored.
+            break;
+          }
           if (!tabId) continue;
+          if (stopped()) {
+            // The page was removed while this spawn was in flight. The pane is
+            // bound to the removed page, and nothing of the session is in it
+            // yet (no resume typed, no record re-pointed at it): close it, and
+            // let the session's owner NOW restore it (`routeLateSpawn`).
+            closeLateSpawnPane(tabId);
+            lateSpawns.push(rec);
+            break;
+          }
+          noteOrphanHandled(rec);
           // A record with no recorded zone (`UNZONED_INDEX`) is NOT force-placed
           // here, and is deliberately not clamped to zone 0: zone 0 belongs to
           // whichever tab actually holds it, and `assignTabToZone` RESERVES the
@@ -2245,6 +3066,11 @@ export function useTerminalInitialization({
           }
         }
 
+        // A stopped run lays out nothing more: no plan tab, and no resume
+        // drain, whose cleanup would delete the saved scrollback of the
+        // sessions it never reached, which another page restores now.
+        if (stopped()) return;
+
         // 4) Plan tabs are cosmetic-only state held in the snapshot (no PTY, no
         //    registry record) — recreate them so the markdown viewers survive a
         //    cold restart. Skip on a React remount: live plan tabs are gone with
@@ -2369,17 +3195,27 @@ export function useTerminalInitialization({
                 }
               }
 
-              try {
-                await invoke("terminal_cleanup_scrollback");
-              } catch (err) {
-                console.warn("[TerminalPage] Failed to cleanup scrollback files:", err);
+              // Not after a guard deferral: the cleanup deletes EVERY saved
+              // scrollback file, and the records this run did not reach still
+              // need theirs when the retry restores them.
+              if (!guardDeferral) {
+                try {
+                  await invoke("terminal_cleanup_scrollback");
+                } catch (err) {
+                  console.warn("[TerminalPage] Failed to cleanup scrollback files:", err);
+                }
               }
 
               pendingRestores.length = 0;
             } finally {
               // Restored tabs now carry their claudeSessionId / scrollback —
               // safe to let the debounced auto-save persist this page's layout.
-              openRestoreGate();
+              // Not after a guard deferral, for the same reason as the cleanup:
+              // a save now would write a layout missing the unreached records'
+              // labels, notes and pins. The retry run opens the gate.
+              if (!guardDeferral || guardRetry.gateReleased(initPageId)) {
+                openRestoreGate();
+              }
               publishRestorePages();
             }
           }, 1500);
@@ -2396,60 +3232,108 @@ export function useTerminalInitialization({
         // the page renders in whatever state it reached (see the `finally`).
         console.error(`[TerminalPage] restore failed for page ${initPageId}:`, err);
       } finally {
-        // Always open the auto-save gate. If a drain timer was scheduled it
-        // owns the flip (after resume commands are issued); otherwise — no
-        // saved sessions, nothing to restore, or restore threw — open it now
-        // so brand-new sessions still persist. Never leave it permanently
-        // closed (that would silently disable persistence).
-        //
-        // Exception (P1 abort-restore): when the reconnect was indeterminate
-        // the whole restore was aborted for a retry on the next activation —
-        // the gate must stay CLOSED so the retried restore still runs with
-        // auto-save suppressed. Not permanent: the retry flips it via this
-        // same finally / its drain timer.
-        if (!drainScheduled && !restoreAborted) {
-          openRestoreGate();
-        }
-        // Publishes the deferral too (set before the early return above).
-        publishRestorePages();
-        // ALWAYS leave the loading state, even if restore threw. `initialized`
-        // gates the whole page behind a "Loading terminals..." spinner, and the
-        // once-per-pageId guard above has already consumed `initPageId` — so a
-        // throw anywhere in the block above used to strand the page on that
-        // spinner for the lifetime of the window, with no retry and no visible
-        // error. Flipping it here degrades a failed restore to "a page with
-        // fewer tabs than expected" (recoverable, and the console carries the
-        // cause) instead of a permanently blank window.
-        setInitialized(true);
-        // The PTY-holder boot sweep had not settled, and this run refused
-        // some sessions as live or held some back for an adoption in flight:
-        // once it settles, re-run the restore (merging, like a drain re-run)
-        // for the held-back ones and the refused ones no longer hosted live.
-        if (refusedWhileSweeping.length > 0 || heldBackWhileSweeping.length > 0) {
-          void recheckRefusedAfterSweep(
-            refusedWhileSweeping,
-            fetchLiveClaudeSessionIds,
-            heldBackWhileSweeping,
-          ).then((resumable) => {
-            if (resumable.length === 0) return;
-            console.warn(
-              `[TerminalPage] the holder sweep settled late; resuming ${resumable.length} ` +
-                `session(s) it had kept from a cold resume`,
-            );
-            scheduleRecheckRerun(initPageId, resumable);
-          });
-        }
+        // The run's own bookkeeping first, so nothing below can skip it: its
+        // claims are released and it is no longer in flight.
         for (const id of coldClaims) coldResumeGuard.current.release(id);
-        // Re-runs scheduled while this run was in flight: one, now — or,
-        // after an abort, a bounded retry for the ids it still owes.
-        settleRestoreRun(
-          rerun,
-          initPageId,
-          restoreAborted ? "aborted" : restoreDeferred ? "deferred" : "restored",
-          isDrainRerun,
-        );
+        runEntry.ended = true;
+        if (runEntry.orphansHandled.size === 0) restoreRuns.current.delete(runToken);
+        if (stopped()) {
+          // A stopped run touches no page state: the page it ran for is gone,
+          // and one that exists under its id again is another page's run's.
+          setInitialized(true);
+          for (const rec of lateSpawns) {
+            if (routeLateSpawn(rec, initPageId, loadKnownPageIds(), rerun) === "adopt") {
+              orphanPassesOwed.current.add(initPageId);
+            }
+          }
+          // A removal's orphan-adoption pass waited for this run to end.
+          setOrphanPassTick((n) => n + 1);
+        } else {
+          // Always open the auto-save gate. If a drain timer was scheduled it
+          // owns the flip (after resume commands are issued); otherwise — no
+          // saved sessions, nothing to restore, or restore threw — open it now
+          // so brand-new sessions still persist. Never leave it permanently
+          // closed (that would silently disable persistence).
+          //
+          // Exception (P1 abort-restore): when the reconnect was indeterminate
+          // the whole restore was aborted for a retry on the next activation —
+          // the gate must stay CLOSED so the retried restore still runs with
+          // auto-save suppressed. Not permanent: the retry flips it via this
+          // same finally / its drain timer.
+          // A guard deferral keeps it closed too, until its retry run restores
+          // the records this run did not reach (see the drain timer above).
+          // …unless its gate-hold already ran out (`GUARD_GATE_HOLD_MS`).
+          if (
+            !drainScheduled &&
+            ((!restoreAborted && !guardDeferral) || guardRetry.gateReleased(initPageId))
+          ) {
+            openRestoreGate();
+          }
+          // Publishes the deferral too (set before the early return above).
+          publishRestorePages();
+          // ALWAYS leave the loading state, even if restore threw. `initialized`
+          // gates the whole page behind a "Loading terminals..." spinner, and the
+          // once-per-pageId guard above has already consumed `initPageId` — so a
+          // throw anywhere in the block above used to strand the page on that
+          // spinner for the lifetime of the window, with no retry and no visible
+          // error. Flipping it here degrades a failed restore to "a page with
+          // fewer tabs than expected" (recoverable, and the console carries the
+          // cause) instead of a permanently blank window.
+          setInitialized(true);
+          // The PTY-holder boot sweep had not settled, and this run refused
+          // some sessions as live or held some back for an adoption in flight:
+          // once it settles, re-run the restore (merging, like a drain re-run)
+          // for the held-back ones and the refused ones no longer hosted live.
+          if (refusedWhileSweeping.length > 0 || heldBackWhileSweeping.length > 0) {
+            void recheckRefusedAfterSweep(
+              refusedWhileSweeping,
+              fetchLiveClaudeSessionIds,
+              heldBackWhileSweeping,
+            ).then((resumable) => {
+              if (resumable.length === 0) return;
+              console.warn(
+                `[TerminalPage] the holder sweep settled late; resuming ${resumable.length} ` +
+                  `session(s) it had kept from a cold resume`,
+              );
+              scheduleRecheckRerun(initPageId, resumable);
+            });
+          }
+          // An adopting run settles the unadopted-orphans notice for what it
+          // restored, held, or no longer found.
+          if (adoptingRead !== null) {
+            const read = adoptingRead;
+            const complete = !restoreAborted && !restoreDeferred && recheckOnly === undefined;
+            const handledNow = runEntry.orphansHandled;
+            setUnadoptedOrphans((prev) => pruneUnadoptedOrphans(prev, read, handledNow, complete));
+          }
+          // Re-runs scheduled while this run was in flight: one, now — or,
+          // after an abort, a bounded retry for the ids it still owes.
+          settleRestoreRun(
+            rerun,
+            initPageId,
+            restoreAborted ? "aborted" : restoreDeferred ? "deferred" : "restored",
+            isDrainRerun,
+          );
+          // After the settle, so the guard retry is the page's one timer: a
+          // deferred run schedules none of its own.
+          if (guardDeferral) {
+            console.warn(
+              `[TerminalPage] the resource guard refused a restore on page ${initPageId}; ` +
+                `retrying the page after a backoff: ${guardDeferral.refusal.message}`,
+            );
+            guardRetry.defer(rerun, initPageId, guardDeferral, "session restore", runToken);
+          } else if (restoreAborted && guardRetry.owes(initPageId)) {
+            // A retry run that aborted restored nothing: the page is still owed.
+            guardRetry.rearm(rerun, initPageId, runToken);
+          } else if (!restoreAborted && !restoreDeferred) {
+            guardRetry.restored(initPageId);
+          }
+        }
       }
-    })();
+    })().catch((err) => {
+      // A throw in the `finally` above: the run's bookkeeping ran before it.
+      console.error(`[TerminalPage] settling the restore of page ${initPageId} failed:`, err);
+    });
   }, [
     pageId,
     drainResumeEpoch,
@@ -2467,6 +3351,7 @@ export function useTerminalInitialization({
     terminalRefs,
     noteNeedsAccount,
     publishRestorePages,
+    guardRetry,
   ]);
 
   // Auto-save session layout for persistence across app restarts
@@ -2511,12 +3396,19 @@ export function useTerminalInitialization({
   }, [layoutState]);
 
   // Immediate save on unmount (page switch) — the debounced auto-save may not
-  // have flushed, so we save synchronously to avoid losing state.
+  // have flushed, so we save synchronously to avoid losing state. Not while a
+  // guard retry is owed inside its gate-hold, for the reason the auto-save gate
+  // is closed then: the layout is missing the records the retry will restore,
+  // and saving it would drop their cosmetics (`RestoreGuardRetry`).
+  const pageIdRef = useRef(pageId);
+  useEffect(() => {
+    pageIdRef.current = pageId;
+  }, [pageId]);
   useEffect(() => {
     return () => {
       const ls = layoutStateRef.current;
       const currentTabs = tabsRef.current;
-      if (currentTabs.length > 0) {
+      if (currentTabs.length > 0 && !guardRetry.holdsSave(pageIdRef.current)) {
         sessionPersistence.saveSessionLayout({
           layoutId: ls.layoutId,
           tabs: currentTabs,
@@ -2528,7 +3420,7 @@ export function useTerminalInitialization({
         });
       }
     };
-  }, [sessionPersistence]);
+  }, [sessionPersistence, guardRetry]);
 
   // Save scrollback buffers to disk when the window is about to close.
   //
@@ -2584,6 +3476,12 @@ export function useTerminalInitialization({
   }, [handleWindowClose]);
 
   return {
+    /**
+     * Orphans a removed page left that no page has adopted: the adoption pass
+     * failed for its whole bound and gave up. Empty again once an adopting
+     * restore has dealt with them.
+     */
+    unadoptedOrphans,
     /**
      * Boot-restore candidates NOT resumed because their account is unknown
      * (`needs-account`), each with why. The record is left in the registry;

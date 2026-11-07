@@ -4,6 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { COORD_DRAIN_STATE_EVENT } from "@/hooks/useCoordDrainState";
 import { instanceStorage } from "@/lib/instance-storage";
 import { getPageBindings, subscribePageBindings } from "@/lib/pageBindings";
+import { notifyTerminalPageRemoved } from "./terminalPageRemoval";
 
 export interface TerminalPageConfig {
   id: string;
@@ -606,12 +607,20 @@ export function useTerminalPages() {
       instanceStorage.removeByPrefix(prefix);
     }
 
+    // Removed only when another page remains — the same rule the updater
+    // below applies, read here (not inside the updater, which React may run
+    // twice) so the removal is announced exactly once.
+    const removed = allPagesRef.current.length > 1 && allPagesRef.current.some((p) => p.id === id);
     setPages((prev) => {
       if (prev.length <= 1) return prev; // Can't remove last page
       const updated = prev.filter((p) => p.id !== id);
       savePages(updated);
       return updated;
     });
+    // Whatever the session restore still holds for this page (a guard retry,
+    // its wait, the orphan-adoption claim) goes with it — see
+    // `terminalPageRemoval`.
+    if (removed) notifyTerminalPageRemoved(id);
 
     // Switch to another page if active was deleted
     setActivePageIdState((currentActive) => {

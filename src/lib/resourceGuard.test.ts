@@ -5,9 +5,17 @@ import {
   GRANT_IDLE_MS,
   GRANT_MAX_MS,
   GRANT_SPAWN_LIMIT,
+  GUARD_WAIT_INITIAL_MS,
+  GUARD_WAIT_MAX_MS,
+  ResourceGuardDeferral,
   getGrantsSnapshot,
   getSnapshot,
+  getWaitsSnapshot,
+  guardWaitMs,
+  parseResourceGuardReading,
   parseResourceGuardRefusal,
+  publishResourceGuardWait,
+  withdrawResourceGuardWait,
   resolvePendingResourceBlock,
   revokeResourceGuardGrant,
   spawnWithResourceGuard,
@@ -44,10 +52,12 @@ const LEGACY_REFUSAL =
   `${CRITICAL_REFUSAL_PREFIX} Not starting a new terminal session: the host lane has ` +
   `1.00 GiB of free commit, below the 1.50 GiB critical floor.`;
 
-// The queue and the grants are module-level singletons — drain both between tests.
+// The queue, the grants and the waits are module-level singletons — drain all
+// three between tests.
 afterEach(() => {
   while (getSnapshot() !== null) resolvePendingResourceBlock(false);
   for (const g of getGrantsSnapshot()) revokeResourceGuardGrant(g.metric);
+  for (const w of getWaitsSnapshot()) withdrawResourceGuardWait(w.key);
   vi.useRealTimers();
 });
 
@@ -422,5 +432,128 @@ describe("one decision per burst", () => {
     await vi.waitFor(() => expect(getSnapshot()).not.toBeNull());
     resolvePendingResourceBlock(false);
     await expect(asked).rejects.toBe(THREAD_REFUSAL);
+  });
+});
+
+/**
+ * The unattended arm (`onRefusal: "defer"`, plan
+ * `2026-11-04-unplanned-restart-restore-is-page-gated-and-counts-unverified-resumes`
+ * Phase 5): a session restore has nobody to answer the dialog, so a refusal
+ * rejects at once as a deferral its caller retries — never a promise left
+ * retrying `terminal_create` on its own. Every test here watches the dialog's
+ * only source, the pending-decision snapshot.
+ */
+describe("onRefusal: defer (session restore)", () => {
+  const RESTORE = { label: "session restore", queued: 3, onRefusal: "defer" as const };
+
+  /** Counts every moment the dialog would have been on screen. */
+  function watchDialog(): { opened: () => number; stop: () => void } {
+    let opened = 0;
+    const stop = subscribe(() => {
+      if (getSnapshot() !== null) opened += 1;
+    });
+    return { opened: () => opened, stop };
+  }
+
+  it("parses the reading out of both lanes' fixture refusals, and none out of a lane it cannot name", () => {
+    expect(parseResourceGuardReading(parseResourceGuardRefusal(THREAD_REFUSAL)!)).toEqual({
+      lane: null,
+      observed: "540",
+      limit: "400",
+    });
+    expect(parseResourceGuardReading(parseResourceGuardRefusal(REFUSAL)!)).toEqual({
+      lane: "host",
+      observed: "1.00 GiB",
+      limit: "1.50 GiB",
+    });
+    expect(parseResourceGuardReading(parseResourceGuardRefusal(LEGACY_REFUSAL)!)).toBeNull();
+  });
+
+  it("a refusal rejects with a deferral at once: no dialog, no override, no retry", async () => {
+    vi.useFakeTimers();
+    const dialog = watchDialog();
+    const attempt = vi.fn().mockRejectedValue(THREAD_REFUSAL);
+
+    const p = spawnWithResourceGuard(attempt, RESTORE);
+    const rejected = await p.then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(rejected).toBeInstanceOf(ResourceGuardDeferral);
+    expect((rejected as ResourceGuardDeferral).refusal.metric).toBe("thread_count");
+    expect((rejected as ResourceGuardDeferral).original).toBe(THREAD_REFUSAL);
+
+    // However long nothing answers, the spawn is attempted once and never
+    // again by this module: the caller owns the retry.
+    await vi.advanceTimersByTimeAsync(10 * GUARD_WAIT_MAX_MS);
+    expect(attempt.mock.calls).toEqual([[false]]);
+    expect(vi.getTimerCount()).toBe(0);
+    expect(dialog.opened()).toBe(0);
+    expect(getGrantsSnapshot()).toEqual([]);
+    dialog.stop();
+  });
+
+  it("a non-refusal error is not a deferral", async () => {
+    const attempt = vi.fn().mockRejectedValue("Failed to open PTY: os error 5");
+    await expect(spawnWithResourceGuard(attempt, RESTORE)).rejects.toBe(
+      "Failed to open PTY: os error 5",
+    );
+  });
+
+  it("the wait backoff doubles from 15 s and is capped at 120 s", () => {
+    expect([1, 2, 3, 4, 5, 9].map(guardWaitMs)).toEqual([
+      GUARD_WAIT_INITIAL_MS,
+      2 * GUARD_WAIT_INITIAL_MS,
+      4 * GUARD_WAIT_INITIAL_MS,
+      GUARD_WAIT_MAX_MS,
+      GUARD_WAIT_MAX_MS,
+      GUARD_WAIT_MAX_MS,
+    ]);
+  });
+
+  it("a published wait is one per key and withdrawn by its key", () => {
+    const wait = {
+      key: "session-restore:default",
+      sourceLabel: "session restore",
+      metric: "thread_count" as const,
+      reading: { lane: null, observed: "540", limit: "400" },
+      refusals: 1,
+      retryAt: 0,
+    };
+    publishResourceGuardWait(wait);
+    publishResourceGuardWait({ ...wait, refusals: 2 });
+    expect(getWaitsSnapshot()).toEqual([{ ...wait, refusals: 2 }]);
+    withdrawResourceGuardWait(wait.key);
+    expect(getWaitsSnapshot()).toEqual([]);
+  });
+
+  it("an operator spawn beside a deferred restore still gets the dialog and the K=10 grant, which the restore never spends", async () => {
+    expect(GRANT_SPAWN_LIMIT).toBe(10);
+    // The operator's own start is the attended path, unchanged.
+    const operator = vi.fn().mockRejectedValueOnce(THREAD_REFUSAL).mockResolvedValueOnce("opened");
+    const opened = spawnWithResourceGuard(operator, { label: "new terminal" });
+    await vi.waitFor(() =>
+      expect(getSnapshot()).toMatchObject({
+        metric: "thread_count",
+        pending: 1,
+        source: { label: "new terminal" },
+      }),
+    );
+    resolvePendingResourceBlock(true);
+    await expect(opened).resolves.toBe("opened");
+    expect(operator.mock.calls).toEqual([[false], [true]]);
+    expect(getGrantsSnapshot()).toMatchObject([
+      { metric: "thread_count", remaining: GRANT_SPAWN_LIMIT, sourceLabel: "new terminal" },
+    ]);
+
+    // A restore refused while that grant is live defers: the grant is the
+    // operator's answer to their own start, not a pass for the restore.
+    const restore = vi.fn().mockRejectedValue(THREAD_REFUSAL);
+    await expect(spawnWithResourceGuard(restore, RESTORE)).rejects.toBeInstanceOf(
+      ResourceGuardDeferral,
+    );
+    expect(restore.mock.calls).toEqual([[false]]);
+    expect(getGrantsSnapshot()[0].remaining).toBe(GRANT_SPAWN_LIMIT);
+    expect(getSnapshot()).toBeNull();
   });
 });

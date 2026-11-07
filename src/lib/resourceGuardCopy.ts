@@ -18,6 +18,7 @@ import {
   type PendingResourceBlock,
   type ResourceGuardGrant,
   type ResourceGuardMetric,
+  type ResourceGuardWait,
 } from "./resourceGuard";
 
 /**
@@ -177,4 +178,36 @@ export function grantBannerText(grant: ResourceGuardGrant, now: number): string 
     `Resource guard overridden for ${LANE_NOUN[grant.metric]} — ` +
     `${starts}, ${seconds} s left${source}`
   );
+}
+
+/** What an unattended wait is waiting under, by lane: a ceiling or a floor. */
+const WAIT_LIMIT: Record<ResourceGuardMetric, string> = {
+  thread_count: "thread ceiling",
+  free_commit_bytes: "memory floor",
+  unknown: "resource limit",
+};
+
+/**
+ * Where the limits a restore waits under can be raised. The plan's copy names
+ * "Settings → Session guard"; the tab is labelled "Resource Guard"
+ * (`settings-tabs.ts`, and the Rust refusal's own "Settings > Resource Guard"),
+ * so the line names the tab the operator can actually find.
+ */
+const WAIT_REMEDY = "Raise in Settings → Resource Guard";
+
+/**
+ * The line for an unattended spawn waiting for room — with ", retries when the
+ * page is opened" when no retry is scheduled (`retryAt: null`):
+ * "waiting: thread ceiling (observed 540 / limit 400). Raise in Settings →
+ * Resource Guard", or the same with "host memory floor (observed 1.00 GiB /
+ * limit 1.50 GiB)". A refusal whose text carried no reading says so —
+ * "(reading not stated)" — rather than showing a number nobody measured.
+ */
+export function resourceGuardWaitText(wait: ResourceGuardWait): string {
+  const lane = wait.reading?.lane ? `${wait.reading.lane} ` : "";
+  const reading = wait.reading
+    ? `observed ${wait.reading.observed} / limit ${wait.reading.limit}`
+    : "reading not stated";
+  const when = wait.retryAt === null ? ", retries when the page is opened" : "";
+  return `waiting: ${lane}${WAIT_LIMIT[wait.metric]} (${reading})${when}. ${WAIT_REMEDY}`;
 }

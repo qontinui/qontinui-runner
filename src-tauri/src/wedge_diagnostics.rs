@@ -542,7 +542,8 @@ pub struct ThreadNameCensus {
     pub total: usize,
     /// Top rows by count, then by name — capped, so the sum is ≤ `total`.
     pub by_name: Vec<ThreadNameCount>,
-    /// Threads belonging to a PER-SESSION family ([`SESSION_THREAD_FAMILIES`]),
+    /// Threads belonging to a PER-PANE family — [`TERMINAL_THREAD_FAMILIES`]
+    /// (every pane) or [`HOLDER_THREAD_FAMILIES`] (a holder-backed pane) —
     /// tallied over the RAW names before any collapsing or truncation.
     ///
     /// **Read this, never `by_name`, to attribute threads to sessions.**
@@ -563,6 +564,12 @@ pub struct ThreadNameCensus {
     /// count (`resource_guard::session_thread_attribution` treats that shape as
     /// a mis-read, i.e. UNKNOWN).
     pub session_threads: usize,
+    /// The [`HOLDER_THREAD_FAMILIES`] part of [`Self::session_threads`]: the
+    /// two threads (`pty-holder-ctl`, `pty-holder-pump`) the runner holds for
+    /// each holder-backed pane on top of its `terminal-*` pair. Kept apart so a
+    /// consumer can tell the pane mix — and so these threads can never stand in
+    /// for a missing `terminal-*` thread in a coherence check.
+    pub holder_threads: usize,
     /// When the walk ran. Wall-clock, because the consumer is a `/health`
     /// reader comparing it against its own clock.
     pub sampled_at: std::time::SystemTime,
@@ -584,12 +591,13 @@ pub const MAX_THREAD_NAME_ROWS: usize = 12;
 /// The bucket a thread with no description lands in.
 pub const UNNAMED_THREAD: &str = "<unnamed>";
 
-/// The thread-name prefixes of the PER-SESSION families: the two threads every
-/// live terminal holds for its whole life (`terminal/session.rs` names them
-/// `terminal-reader-<id>` and `terminal-waiter-<id>`, the id a
-/// `uuid::Uuid::new_v4()` from `terminal/manager.rs`).
+/// The thread-name prefixes of the per-pane families EVERY live terminal holds
+/// for its whole life (`terminal/session.rs` names them `terminal-reader-<id>`
+/// and `terminal-waiter-<id>`, the id a `uuid::Uuid::new_v4()` from
+/// `terminal/manager.rs`).
 ///
-/// Exactly these two and nothing else, deliberately. `pipe-drain` is one
+/// Exactly these two and the [`HOLDER_THREAD_FAMILIES`], and nothing else,
+/// deliberately. `pipe-drain` is one
 /// TRANSIENT thread per piped child process and `transcript-scan` is a
 /// dispatcher singleton — neither scales with the number of terminals.
 /// Counting them as session load would inflate the measured threads-per-session
@@ -602,7 +610,26 @@ pub const UNNAMED_THREAD: &str = "<unnamed>";
 /// platforms: on Linux `comm`'s 15-byte truncation yields exactly
 /// `terminal-reader` / `terminal-waiter`, and on Windows the full
 /// `terminal-reader-<uuid>` description survives.
-pub const SESSION_THREAD_FAMILIES: &[&str] = &["terminal-reader", "terminal-waiter"];
+pub const TERMINAL_THREAD_FAMILIES: &[&str] = &["terminal-reader", "terminal-waiter"];
+
+/// The thread-name prefixes of the per-pane families a HOLDER-BACKED pane holds
+/// in the runner process on top of its [`TERMINAL_THREAD_FAMILIES`] pair:
+/// `terminal/daemon_pane_io.rs` names them `pty-holder-ctl-<key>` (the control
+/// link) and `pty-holder-pump-<key>` (the output pump), one each per attached
+/// pane, for the pane's whole life.
+///
+/// Measured on main `3421ccd34` (plan
+/// `2026-11-04-unplanned-restart-restore-is-page-gated-and-counts-unverified-resumes`
+/// Phase 0): a holder-backed pane costs 4.1-4.3 runner threads against 2.0 for
+/// an in-process one, and these two families are the difference. Before they
+/// were counted, 224 holder panes carried 448 threads the guard attributed to
+/// nobody.
+///
+/// On Linux `comm` keeps 15 bytes, so the threads read `pty-holder-ctl-` and
+/// `pty-holder-pump` (exactly 15 bytes, so the family name survives whole);
+/// on Windows the full `pty-holder-*-<key>` description survives. Matched by
+/// these prefixes with `starts_with`, which holds for both.
+pub const HOLDER_THREAD_FAMILIES: &[&str] = &["pty-holder-ctl", "pty-holder-pump"];
 
 /// One direct child process.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -1101,22 +1128,27 @@ pub fn finish_thread_name_census(names: Vec<String>) -> Option<ThreadNameCensus>
     if names.is_empty() {
         return None;
     }
-    let session_threads = names.iter().filter(|name| is_session_thread(name)).count();
+    let terminal_threads = names
+        .iter()
+        .filter(|name| in_family(name, TERMINAL_THREAD_FAMILIES))
+        .count();
+    let holder_threads = names
+        .iter()
+        .filter(|name| in_family(name, HOLDER_THREAD_FAMILIES))
+        .count();
     Some(ThreadNameCensus {
         total: names.len(),
         by_name: collapse_thread_names(names.iter().map(String::as_str)),
-        session_threads,
+        session_threads: terminal_threads + holder_threads,
+        holder_threads,
         sampled_at: std::time::SystemTime::now(),
     })
 }
 
-/// `true` when a raw thread name belongs to one of the
-/// [`SESSION_THREAD_FAMILIES`].
-fn is_session_thread(name: &str) -> bool {
+/// `true` when a raw thread name belongs to one of `families`.
+fn in_family(name: &str, families: &[&str]) -> bool {
     let name = name.trim();
-    SESSION_THREAD_FAMILIES
-        .iter()
-        .any(|family| name.starts_with(family))
+    families.iter().any(|family| name.starts_with(family))
 }
 
 /// Collapse a list of thread names into the top [`MAX_THREAD_NAME_ROWS`] rows.
@@ -3231,6 +3263,145 @@ mod tests {
         ])
         .expect("census");
         assert_eq!(c.session_threads, 0);
+    }
+
+    /// A holder-backed pane's two runner-side threads are per-pane threads too,
+    /// and are tallied apart so the pane mix can be read back. The Phase 0
+    /// shape (12 holder panes on Linux, `comm`-truncated) and the Windows one
+    /// (full `pty-holder-*-<key>` descriptions) both read 24 holder threads
+    /// beside the 24 `terminal-*` ones, so `session_threads` is the measured 4
+    /// per pane, not the 2 the guard used to see.
+    #[test]
+    fn holder_pane_threads_are_session_threads_and_tallied_apart() {
+        let mut linux: Vec<String> = Vec::new();
+        for _ in 0..12 {
+            linux.push("terminal-reader".to_string());
+            linux.push("terminal-waiter".to_string());
+            linux.push("pty-holder-ctl-".to_string());
+            linux.push("pty-holder-pump".to_string());
+        }
+        linux.extend(vec!["tokio-rt-worker".to_string(); 128]);
+        let mut windows: Vec<String> = Vec::new();
+        for i in 0..12u32 {
+            let id = format!("{i:08x}-0000-4000-8000-000000000000");
+            windows.push(format!("terminal-reader-{id}"));
+            windows.push(format!("terminal-waiter-{id}"));
+            windows.push(format!("pty-holder-ctl-{id}"));
+            windows.push(format!("pty-holder-pump-{id}"));
+        }
+        windows.extend(vec!["tokio-rt-worker".to_string(); 128]);
+        for (platform, names) in [("linux", linux), ("windows", windows)] {
+            let c = finish_thread_name_census(names).expect("census");
+            assert_eq!(c.total, 176, "{platform}");
+            assert_eq!(c.session_threads, 48, "{platform}");
+            assert_eq!(c.holder_threads, 24, "{platform}");
+        }
+        // The holder PROCESS's own name, and other `pty-*` threads, are not
+        // per-pane runner threads.
+        let c = finish_thread_name_census(vec![
+            "qontinui-pty-ho".to_string(),
+            "pty-holder".to_string(),
+        ])
+        .expect("census");
+        assert_eq!((c.session_threads, c.holder_threads), (0, 0));
+    }
+
+    /// Phase 0's measured holder-backed census (plan
+    /// `2026-11-04-unplanned-restart-restore-is-page-gated-and-counts-unverified-resumes`):
+    /// 12 panes, each holding `terminal-reader`, `terminal-waiter`,
+    /// `pty-holder-ctl` and `pty-holder-pump` in the runner, beside 128 other
+    /// threads. The census every reader takes it from — `/health`'s
+    /// `sessionThreads` and the resource guard's session-load input — must
+    /// count all 48 per-pane threads, on Linux's 15-byte `comm` spelling and
+    /// Windows's full one alike. It used to count 24: the holder pair of every
+    /// pane was charged to nobody.
+    #[test]
+    fn the_phase0_holder_census_counts_every_per_pane_thread() {
+        let mut linux: Vec<String> = Vec::new();
+        let mut windows: Vec<String> = Vec::new();
+        for i in 0..12u32 {
+            linux.extend(
+                [
+                    "terminal-reader",
+                    "terminal-waiter",
+                    "pty-holder-ctl-",
+                    "pty-holder-pump",
+                ]
+                .map(String::from),
+            );
+            let key = format!("{i:08x}-0000-4000-8000-000000000000");
+            windows.extend(
+                [
+                    "terminal-reader",
+                    "terminal-waiter",
+                    "pty-holder-ctl",
+                    "pty-holder-pump",
+                ]
+                .map(|family| format!("{family}-{key}")),
+            );
+        }
+        for names in [&mut linux, &mut windows] {
+            names.extend((0..128).map(|i| format!("worker{}-x", i % 30)));
+        }
+        for (platform, names) in [("linux", linux), ("windows", windows)] {
+            let census = finish_thread_name_census(names).expect("census");
+            assert_eq!(census.total, 176, "{platform}");
+            assert_eq!(census.session_threads, 48, "{platform}");
+        }
+    }
+
+    /// The census the resource guard reads (`capture_thread_name_census`, the
+    /// live walk behind `health_monitor::thread_name_census_memoized`) counts a
+    /// holder-backed pane's runner-side threads as per-pane session threads.
+    /// Real threads named the way `terminal/daemon_pane_io.rs` names them —
+    /// `pty-holder-ctl-<key>` and `pty-holder-pump-<key>` — are spawned in this
+    /// process and the live census must attribute every one of them. Before
+    /// plan `2026-11-04-unplanned-restart-restore-is-page-gated-and-counts-unverified-resumes`
+    /// Phase 5a it counted none, so 224 holder panes carried 448 threads the
+    /// guard attributed to nobody.
+    #[test]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "windows")),
+        ignore = "no per-thread enumeration on this platform"
+    )]
+    fn the_live_census_counts_holder_pane_threads_as_session_threads() {
+        const PANES: usize = 6;
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+        let mut handles = Vec::new();
+        for i in 0..PANES {
+            for family in ["pty-holder-ctl", "pty-holder-pump"] {
+                let ready_tx = ready_tx.clone();
+                let rx = std::sync::Arc::clone(&rx);
+                handles.push(
+                    std::thread::Builder::new()
+                        .name(format!("{family}-arming{i}"))
+                        .spawn(move || {
+                            ready_tx.send(()).ok();
+                            let guard = rx.lock().unwrap_or_else(|e| e.into_inner());
+                            let _ = guard.recv();
+                        })
+                        .expect("spawn a named thread"),
+                );
+            }
+        }
+        for _ in 0..2 * PANES {
+            ready_rx.recv().expect("a holder thread started");
+        }
+
+        let c = capture_thread_name_census().expect("a native thread-name census");
+        assert!(
+            c.session_threads >= 2 * PANES,
+            "the {} live pty-holder threads are session threads, census counted {}",
+            2 * PANES,
+            c.session_threads
+        );
+
+        drop(tx);
+        for h in handles {
+            h.join().expect("a holder thread ended");
+        }
     }
 
     /// The live census sees this test process and, on it, the thread this

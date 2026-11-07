@@ -157,6 +157,16 @@ pub trait PaneIo: Send + Sync {
         true
     }
 
+    /// Whether this pane's child is owned by an out-of-process PTY holder, so
+    /// the runner carries the holder's control and pump threads for it
+    /// (`pty-holder-ctl` / `pty-holder-pump`). False by default; only
+    /// `DaemonPaneIo` answers true. The resource guard counts panes by this —
+    /// not by thread names — to bound how many holder threads it charges as
+    /// session load, so a leaked thread cannot pass for a pane.
+    fn holder_backed(&self) -> bool {
+        false
+    }
+
     /// How this implementation discharged the credential-scrub obligation.
     fn credential_scrub(&self) -> CredentialScrub;
 
@@ -516,6 +526,45 @@ impl PaneIo for InertPaneIo {
     }
     fn release(&self, _budget: Duration) -> Result<(), String> {
         Ok(())
+    }
+}
+
+/// [`InertPaneIo`] that answers [`PaneIo::holder_backed`] as a holder pane
+/// does — for the guard's holder-pane count, which reads only that.
+#[cfg(test)]
+pub(crate) struct InertHolderPaneIo;
+
+#[cfg(test)]
+impl PaneIo for InertHolderPaneIo {
+    fn reader(&self) -> Result<Box<dyn Read + Send>, String> {
+        InertPaneIo.reader()
+    }
+    fn writer(&self) -> Result<Box<dyn Write + Send>, String> {
+        InertPaneIo.writer()
+    }
+    fn resize(&self, cols: u16, rows: u16) -> Result<(), String> {
+        InertPaneIo.resize(cols, rows)
+    }
+    fn wait(&self) -> Result<i32, String> {
+        InertPaneIo.wait()
+    }
+    fn kill(&self, budget: Duration) -> Result<(), String> {
+        InertPaneIo.kill(budget)
+    }
+    fn set_paused(&self, paused: bool) -> Result<(), String> {
+        InertPaneIo.set_paused(paused)
+    }
+    fn pid(&self) -> Option<u32> {
+        None
+    }
+    fn holder_backed(&self) -> bool {
+        true
+    }
+    fn credential_scrub(&self) -> CredentialScrub {
+        CredentialScrub::NoChildEnv
+    }
+    fn release(&self, budget: Duration) -> Result<(), String> {
+        InertPaneIo.release(budget)
     }
 }
 

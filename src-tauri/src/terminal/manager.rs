@@ -144,6 +144,56 @@ fn trust_scope_for(
     None
 }
 
+/// Why [`TerminalManager::create`] did not create a terminal.
+///
+/// Two arms because a caller answering a machine has to tell them apart without
+/// reading prose: a [`ResourceGuard`](Self::ResourceGuard) refusal is a verdict
+/// on the box's headroom that clears by itself as sessions finish, so it is
+/// worth retrying, and every other failure (no PTY, a refused tenant, a trust
+/// gate refusal) is not. `POST /terminals` answers the first with a `503` and
+/// `Retry-After`, the second with a `500`.
+///
+/// The [`Display`](std::fmt::Display) text and `From<TerminalCreateError> for
+/// String` are exactly the string `create` returned before it had this type, so
+/// a caller that propagates with `?` into a `String` error — or matches the
+/// [`crate::resource_guard::CRITICAL_REFUSAL_PREFIX`] — sees the same bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerminalCreateError {
+    /// The spawn-time resource gate refused at its CRITICAL limit.
+    ResourceGuard(crate::resource_guard::CriticalRefusal),
+    /// Any other failure, as the text that describes it.
+    Failed(String),
+}
+
+impl std::fmt::Display for TerminalCreateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ResourceGuard(refusal) => std::fmt::Display::fmt(refusal, f),
+            Self::Failed(message) => f.write_str(message),
+        }
+    }
+}
+
+impl From<String> for TerminalCreateError {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
+}
+
+impl From<TerminalCreateError> for String {
+    fn from(error: TerminalCreateError) -> Self {
+        error.to_string()
+    }
+}
+
+/// The holder-backed panes among `sessions` ([`TerminalSession::holder_backed`]).
+fn count_holder_backed(sessions: &HashMap<TerminalId, Arc<TerminalSession>>) -> usize {
+    sessions
+        .values()
+        .filter(|session| session.holder_backed())
+        .count()
+}
+
 /// How [`TerminalManager::create`] establishes Claude workspace trust for the
 /// PTY's directory — STATED by the caller, never inferred.
 ///
@@ -396,7 +446,7 @@ impl TerminalManager {
         resource_override: bool,
         trust: TrustArm,
         spawn_tenant: Option<uuid::Uuid>,
-    ) -> Result<TerminalInfo, String> {
+    ) -> Result<TerminalInfo, TerminalCreateError> {
         let id = uuid::Uuid::new_v4().to_string();
         // Claimed until the session is inserted (the claim drops at return):
         // the boot sweep never probes or adopts this pane meanwhile.
@@ -1157,6 +1207,37 @@ impl TerminalManager {
         }
     }
 
+    /// How many active sessions are backed by an out-of-process PTY holder
+    /// ([`TerminalSession::holder_backed`]), or `None` when the registry could
+    /// not be read — the same `None`-never-zero contract as
+    /// [`Self::count_checked`]. The resource guard bounds the holder threads
+    /// it charges as session load by this count.
+    pub fn holder_backed_count_checked(&self) -> Option<usize> {
+        match self.sessions.lock() {
+            Ok(s) => Some(count_holder_backed(&s)),
+            Err(e) => {
+                error!("Sessions lock poisoned: {}", e);
+                None
+            }
+        }
+    }
+
+    /// [`Self::holder_backed_count_checked`] without waiting for the lock:
+    /// `None` when the registry is held right now (or poisoned).
+    ///
+    /// For the resource guard's SPAWN-time read. The spawn gate runs on the way
+    /// to a PTY, from callers this module does not control; a blocking `lock()`
+    /// there would deadlock any caller that reached the gate while holding
+    /// this (non-reentrant) mutex, and stall every spawn behind a slow holder
+    /// of it. `try_lock` can do neither. On `None` the guard charges no holder
+    /// threads for that spawn (`resource_guard::holder_panes_for_load`).
+    pub fn holder_backed_count_try(&self) -> Option<usize> {
+        self.sessions
+            .try_lock()
+            .ok()
+            .map(|s| count_holder_backed(&s))
+    }
+
     /// Snapshot of `(session_id, Arc<TerminalSession>)` pairs for
     /// callers that need to iterate every active session — e.g. the
     /// cross-session grid search endpoint. Sorted by creation time
@@ -1276,6 +1357,47 @@ pub(crate) fn command_implies_bypass_permissions(argv: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{apply_trust_arm, command_implies_bypass_permissions, TerminalManager, TrustArm};
+
+    /// The guard's holder-pane count reads each pane's backend, not thread
+    /// names: one holder-backed pane beside two in-process ones is 1, from the
+    /// blocking read and the non-blocking one alike — and the non-blocking one
+    /// answers `None` (never a guess, never a deadlock) while the registry is
+    /// held.
+    #[test]
+    fn the_holder_backed_count_reads_each_panes_backend() {
+        use std::sync::{Arc, Mutex};
+        let tm = TerminalManager::new();
+        let with = |io: Arc<dyn crate::terminal::pane_io::PaneIo>| {
+            Arc::new(crate::terminal::session::tests::make_test_session_with_io(
+                Arc::new(Mutex::new(Vec::new())),
+                io,
+            ))
+        };
+        assert_eq!(tm.holder_backed_count_checked(), Some(0));
+        tm.insert_for_test(
+            "in-a",
+            with(Arc::new(crate::terminal::pane_io::InertPaneIo)),
+        );
+        tm.insert_for_test(
+            "in-b",
+            with(Arc::new(crate::terminal::pane_io::InertPaneIo)),
+        );
+        tm.insert_for_test(
+            "holder",
+            with(Arc::new(crate::terminal::pane_io::InertHolderPaneIo)),
+        );
+        assert_eq!(tm.count_checked(), Some(3));
+        assert_eq!(tm.holder_backed_count_checked(), Some(1));
+        assert_eq!(tm.holder_backed_count_try(), Some(1));
+        let held = tm.sessions.lock().unwrap();
+        assert_eq!(
+            tm.holder_backed_count_try(),
+            None,
+            "a held registry is UNKNOWN"
+        );
+        drop(held);
+        assert_eq!(tm.holder_backed_count_try(), Some(1));
+    }
 
     /// Review (adoption) M1: the late-delivery wiring end to end on a REAL
     /// manager. `bind_coord_session` must fire the observer with the

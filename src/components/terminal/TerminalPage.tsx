@@ -66,6 +66,7 @@ import { callRegistry, textArg, useTerminalCommands } from "./commands";
 import { guardedHandler } from "@/lib/ui-bridge/guardedHandler";
 import { buildTerminalLaunchMenuActions } from "./terminalLaunchMenuActions";
 import { useTerminalInitialization, runVerifiedResume } from "./useTerminalInitialization";
+import { UnadoptedOrphansBanner } from "./UnadoptedOrphansBanner";
 import { ResumeFailedBanner } from "./ResumeFailedBanner";
 import { RemoteRestoreBanner } from "./RemoteRestoreBanner";
 import { useZoneActions } from "./useZoneActions";
@@ -1028,7 +1029,7 @@ function TerminalPageInner({
     // useKeyboardShortcuts.
   } = useUIStateCx();
 
-  const { needsAccountRecords, restoreCompletePages, restoreDeferredPages } =
+  const { needsAccountRecords, restoreCompletePages, restoreDeferredPages, unadoptedOrphans } =
     useTerminalInitialization({
       pageId,
       authenticated: authStatus?.authenticated,
@@ -1558,6 +1559,7 @@ function TerminalPageInner({
               onClose={() => setShowPrompt(false)}
             />
           )}
+          <UnadoptedOrphansBanner entries={unadoptedOrphans} />
           <TerminalNotification
             message={workflowGen.notification?.message ?? null}
             type={workflowGen.notification?.type ?? "success"}

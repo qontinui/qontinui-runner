@@ -9,7 +9,11 @@ import {
   type SessionCloseArgs,
 } from "./sessionRecordArgs";
 import { createLogger } from "@/lib/logger";
-import { spawnWithResourceGuard, type ResourceGuardSource } from "@/lib/resourceGuard";
+import {
+  ResourceGuardDeferral,
+  spawnWithResourceGuard,
+  type ResourceGuardSource,
+} from "@/lib/resourceGuard";
 import { applyRemoteMark, type RemoteTabIdentity } from "./remoteTabs";
 import {
   EMPTY_HIDDEN_WORKER_STATE,
@@ -47,10 +51,7 @@ export function renameTabIn(tabs: TerminalTab[], id: string, title: string): Ter
  * name is immutable — and returns the SAME array when nothing changed so
  * callers do not churn renders.
  */
-export function applySpawnNames(
-  tabs: TerminalTab[],
-  names: Record<string, string>,
-): TerminalTab[] {
+export function applySpawnNames(tabs: TerminalTab[], names: Record<string, string>): TerminalTab[] {
   let changed = false;
   const next = tabs.map((t) => {
     if (t.spawnName) return t;
@@ -746,6 +747,19 @@ export function parseRemoteDetach(data: unknown): RemoteDetachReport | null {
     targetDeviceId: typeof r.targetDeviceId === "string" ? r.targetDeviceId : "",
     remoteTerminalId: typeof r.remoteTerminalId === "string" ? r.remoteTerminalId : "",
   };
+}
+
+/**
+ * What `createTerminal` answers for a spawn that threw: `null` (logged) — except
+ * a {@link ResourceGuardDeferral}, which is re-thrown. A deferring caller
+ * (`onRefusal: "defer"`, the session restore) owns the retry of a guard
+ * refusal, so it must see it as one rather than as an ordinary failure; read as
+ * `null` it would skip the record and never retry it. Exported for tests.
+ */
+export function createTerminalFailure(err: unknown): null {
+  if (err instanceof ResourceGuardDeferral) throw err;
+  console.error("Failed to create terminal:", err);
+  return null;
 }
 
 export function useTerminalManager(
@@ -1502,8 +1516,7 @@ export function useTerminalManager(
         setActiveId(info.id);
         return info.id;
       } catch (err) {
-        console.error("Failed to create terminal:", err);
-        return null;
+        return createTerminalFailure(err);
       }
     },
     [pageId, windowLabel, defaultWorkingDir],

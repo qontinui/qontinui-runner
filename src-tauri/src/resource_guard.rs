@@ -407,8 +407,8 @@ pub(crate) const AT_REST_BASELINE_MAX: usize = 512;
 /// minus the threads the census NAMES as per-session
 /// ([`session_thread_attribution`]). This constant survives in two places
 /// only: the subtrahend on a platform with no name census (macOS, or a walk
-/// that failed), and — through `min(3, MAX_THREADS_PER_SESSION)` — the input
-/// to [`PER_SESSION_THREADS_FALLBACK`], where it LOSES to the family count,
+/// that failed), and — through `min(3, IN_PROCESS_THREADS_PER_SESSION)` — the
+/// input to [`PER_SESSION_THREADS_FALLBACK`], where it LOSES to the family count,
 /// because there it is a multiplier and the larger number would loosen.
 ///
 /// **3, from the 2026-08-29 wedge's own arithmetic**, not from the thread-name
@@ -605,7 +605,16 @@ static AT_REST_WINDOW: Mutex<Option<AtRestWindow>> = Mutex::new(None);
 /// is broken — an UNKNOWN rendering as a permissive default, which is the shape
 /// served policy `unknown-must-not-render-as-a-default` forbids. An unusable
 /// tick contributes nothing and the previous window stands.
-pub(crate) fn record_at_rest_sample(total_threads: Option<usize>, live_sessions: Option<usize>) {
+///
+/// `live_holder_panes` is the registry's own count of HOLDER-BACKED panes
+/// (`TerminalManager::holder_backed_count_checked`), `None` when it could not
+/// be read. It is the independent bound on how many `pty-holder-*` threads the
+/// census may count as session load — see [`SessionThreadTally::load`].
+pub(crate) fn record_at_rest_sample(
+    total_threads: Option<usize>,
+    live_sessions: Option<usize>,
+    live_holder_panes: Option<usize>,
+) {
     // The window is fed the GRADED reading — the raw count minus the idle
     // blocking pool the census attributes to the runtime (plan
     // `2026-09-21-runner-blocking-pool-ratchets-to-peak-because-transcript-
@@ -639,9 +648,10 @@ pub(crate) fn record_at_rest_sample(total_threads: Option<usize>, live_sessions:
     // The session subtraction is taken from the SAME census the idle pool was
     // graded out of, so the two subtractions are over one snapshot of names
     // and are disjoint by construction: the pool rows are `app-rt` /
-    // `tokio-rt-worker`, the session families are `terminal-*`.
-    let census_session_threads = census.as_ref().map(|c| c.session_threads);
-    note_session_thread_sample(census_session_threads, live_sessions);
+    // `tokio-rt-worker`, the per-pane families are `terminal-*` and
+    // `pty-holder-*`.
+    let census_session_threads = census.as_ref().map(SessionThreadTally::from_census);
+    note_session_thread_sample(census_session_threads, live_sessions, live_holder_panes);
     let attributed = session_thread_attribution(census_session_threads, live_sessions);
     let Some(at_rest) = at_rest_estimate(total_threads, attributed) else {
         return;
@@ -650,6 +660,63 @@ pub(crate) fn record_at_rest_sample(total_threads: Option<usize>, live_sessions:
         guard
             .get_or_insert_with(AtRestWindow::default)
             .record(at_rest);
+    }
+}
+
+/// One census's per-pane thread tally, split by family: what
+/// [`session_thread_attribution`], [`per_session_threads_from`] and
+/// [`census_misread`] judge an observation by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SessionThreadTally {
+    /// Every per-pane thread the census named
+    /// ([`ThreadNameCensus::session_threads`]): the `terminal-*` pair of every
+    /// pane plus the `pty-holder-*` pair of every holder-backed one.
+    pub(crate) named: usize,
+    /// The `pty-holder-*` part of `named` ([`ThreadNameCensus::holder_threads`]).
+    pub(crate) holder: usize,
+}
+
+impl SessionThreadTally {
+    pub(crate) fn from_census(census: &ThreadNameCensus) -> Self {
+        Self {
+            named: census.session_threads,
+            holder: census.holder_threads,
+        }
+    }
+
+    /// Named threads of the `terminal-*` families — one pair per live pane of
+    /// either kind.
+    fn terminal(self) -> usize {
+        self.named.saturating_sub(self.holder)
+    }
+
+    /// Holder-backed panes the census shows: one `pty-holder-*` pair each.
+    fn holder_panes(self) -> usize {
+        self.holder / HOLDER_THREADS_PER_PANE
+    }
+
+    /// Holder-backed panes this tally may CHARGE as session load: the census's
+    /// pairs, bounded by the registry's own count of holder-backed panes
+    /// (`live_holder_panes`). An UNKNOWN registry count charges none.
+    ///
+    /// The bound is what keeps a leak from loosening the guard. Every
+    /// `pty-holder-*` thread the census names raises two things that LOOSEN
+    /// the ceiling — the per-session multiplier and the pool arm's
+    /// `session_threads_now` — so a leaked holder thread on a box with no
+    /// holder-backed pane at all must not count. The registry is independent of
+    /// the thread names (it asks each pane's `PaneIo::holder_backed`), so a
+    /// leak in the names cannot move it. Attribution (the at-rest SUBTRACTION)
+    /// still subtracts every named thread, which is the strict side there.
+    fn charged_holder_panes(self, live_holder_panes: Option<usize>) -> usize {
+        self.holder_panes().min(live_holder_panes.unwrap_or(0))
+    }
+
+    /// The per-pane threads this tally charges as live session load — the
+    /// pool arm's `session_threads_now`: every `terminal-*` thread, plus the
+    /// `pty-holder-*` pair of each holder-backed pane the registry confirms
+    /// ([`Self::charged_holder_panes`]).
+    pub(crate) fn load(self, live_holder_panes: Option<usize>) -> usize {
+        self.terminal() + HOLDER_THREADS_PER_PANE * self.charged_holder_panes(live_holder_panes)
     }
 }
 
@@ -679,71 +746,107 @@ pub(crate) fn record_at_rest_sample(total_threads: Option<usize>, live_sessions:
 ///   `unknown-must-not-render-as-a-default`. Same rule as
 ///   [`per_session_threads_from`]'s zero arm, so the two never disagree about
 ///   which observations are coherent.
-/// - **Census present otherwise**: the named tally, as read. (Named session
-///   threads with a registry reading of zero sessions is a teardown race; the
-///   threads are still session threads by name, and subtracting them is the
-///   strict direction.)
+/// - **Census present otherwise**: the named tally, as read — the `pty-holder-*`
+///   threads of holder-backed panes included (plan
+///   `2026-11-04-unplanned-restart-restore-is-page-gated-and-counts-unverified-resumes`
+///   Phase 5a). Left out, a holder pane's two extra threads were folded into
+///   the at-rest floor as if the runner idled on them. (Named session threads
+///   with a registry reading of zero sessions is a teardown race; the threads
+///   are still session threads by name, and subtracting them is the strict
+///   direction.)
 /// - **No census** — a platform without per-thread names (macOS), or a walk
 ///   that failed: the constant path, `sessions × THREADS_PER_SESSION`. 3 is
 ///   above the census's measured 2, so this over-subtracts, which lowers the
 ///   floor and is the strict direction; it is today's behaviour on those
 ///   platforms, unchanged.
 pub(crate) fn session_thread_attribution(
-    census_session_threads: Option<usize>,
+    census_session_threads: Option<SessionThreadTally>,
     live_sessions: Option<usize>,
 ) -> Option<usize> {
     let sessions = live_sessions?;
     match census_session_threads {
-        Some(named) if census_misread(named, sessions) => None,
-        Some(named) => Some(named),
+        Some(tally) if census_misread(tally, sessions) => None,
+        Some(tally) => Some(tally.named),
         None => Some(sessions.saturating_mul(THREADS_PER_SESSION)),
     }
 }
 
-/// `true` when a census names fewer per-session threads than there are live
+/// `true` when a census names fewer `terminal-*` threads than there are live
 /// terminals — an observation no live runner can produce, i.e. a mis-read.
 /// The one predicate [`session_thread_attribution`],
 /// [`per_session_threads_from`] and the census-misread provenance share.
-fn census_misread(named: usize, sessions: usize) -> bool {
-    named < sessions
+///
+/// Judged on the `terminal-*` part of the tally, not on `named`: every pane of
+/// either kind holds that pair, and a holder pane's `pty-holder-*` threads must
+/// not be able to stand in for a missing one. Counted into `named`, 12 holder
+/// panes' 24 holder threads would let a census that lost 24 terminal threads
+/// read as coherent.
+fn census_misread(tally: SessionThreadTally, sessions: usize) -> bool {
+    tally.terminal() < sessions
 }
 
-/// The most threads one terminal can legitimately hold: the number of
-/// per-session families (`terminal-reader`, `terminal-waiter`) — **2**.
+/// Threads an IN-PROCESS pane holds for its whole life: one per
+/// [`TERMINAL_THREAD_FAMILIES`](qontinui_runner_lib::wedge_diagnostics::TERMINAL_THREAD_FAMILIES)
+/// family (`terminal-reader`, `terminal-waiter`) — **2**, as Phase 0 of plan
+/// `2026-11-04-unplanned-restart-restore-is-page-gated-and-counts-unverified-resumes`
+/// measured (2.0 per pane).
+pub(crate) const IN_PROCESS_THREADS_PER_SESSION: usize =
+    qontinui_runner_lib::wedge_diagnostics::TERMINAL_THREAD_FAMILIES.len();
+
+/// Threads a HOLDER-BACKED pane holds on top of the in-process pair: one per
+/// [`HOLDER_THREAD_FAMILIES`](qontinui_runner_lib::wedge_diagnostics::HOLDER_THREAD_FAMILIES)
+/// family (`pty-holder-ctl`, `pty-holder-pump`) — **2**, so a holder pane costs
+/// 4 (Phase 0 measured 4.1-4.3).
+pub(crate) const HOLDER_THREADS_PER_PANE: usize =
+    qontinui_runner_lib::wedge_diagnostics::HOLDER_THREAD_FAMILIES.len();
+
+/// The most threads one terminal can legitimately hold: a holder-backed pane's
+/// [`IN_PROCESS_THREADS_PER_SESSION`] + [`HOLDER_THREADS_PER_PANE`] — **4**.
 ///
 /// A measured ratio above it is not a fatter terminal; it is a teardown race
 /// (threads of terminals the registry already dropped) or a leak in a
-/// `terminal-*` family. Both are exactly the conditions under which the guard
+/// per-pane family. Both are exactly the conditions under which the guard
 /// must NOT loosen, and threads-per-session is a MULTIPLIER on the
 /// session-capacity arm of [`scaled_thread_ceilings`] — so it is capped here.
-/// A ratio BELOW it is a count skew too, not a thinner terminal, which is why
-/// [`per_session_threads_from`] answers this value for any coherent
-/// observation rather than a quotient.
+/// [`per_session_threads_from`] answers the structural cost of the live pane
+/// mix for any coherent observation rather than a quotient, and that is at most
+/// this.
 pub(crate) const MAX_THREADS_PER_SESSION: usize =
-    qontinui_runner_lib::wedge_diagnostics::SESSION_THREAD_FAMILIES.len();
+    IN_PROCESS_THREADS_PER_SESSION + HOLDER_THREADS_PER_PANE;
 
 /// The threads-per-session [`scaled_thread_ceilings`] multiplies by when no
-/// fresh tick measured one: `min(THREADS_PER_SESSION, MAX_THREADS_PER_SESSION)`
-/// = **2**.
+/// fresh tick measured one: `min(THREADS_PER_SESSION,
+/// IN_PROCESS_THREADS_PER_SESSION)` = **2**.
 ///
 /// Not [`THREADS_PER_SESSION`]'s 3. "3 is strict" holds for the at-rest
 /// baseline, where the figure is SUBTRACTED (over-subtracting lowers the
 /// floor). Here it is MULTIPLIED into a ceiling, where the larger number is
-/// the looser one — so the fallback takes the smaller of the two.
+/// the looser one — so the fallback takes the smaller of the two. And it is the
+/// in-process cost, not [`MAX_THREADS_PER_SESSION`]: with no census there is no
+/// pane mix, and assuming holder panes nobody counted would loosen the guard.
 pub(crate) const PER_SESSION_THREADS_FALLBACK: usize =
-    if THREADS_PER_SESSION < MAX_THREADS_PER_SESSION {
+    if THREADS_PER_SESSION < IN_PROCESS_THREADS_PER_SESSION {
         THREADS_PER_SESSION
     } else {
-        MAX_THREADS_PER_SESSION
+        IN_PROCESS_THREADS_PER_SESSION
     };
 
 /// Threads per live terminal one observation SUPPORTS, or `None` when it
 /// cannot support any. PURE.
 ///
 /// **The answer is structural, not a quotient.** Every terminal whose child is
-/// alive holds exactly the [`MAX_THREADS_PER_SESSION`] family threads (both are
-/// spawned NAMED in `terminal/session.rs` — this relies on that staying true),
-/// so `named / sessions` can only disagree with 2 through a count skew:
+/// alive holds exactly its kind's family threads — [`IN_PROCESS_THREADS_PER_SESSION`]
+/// (spawned NAMED in `terminal/session.rs`), plus [`HOLDER_THREADS_PER_PANE`]
+/// for a holder-backed pane (named in `terminal/daemon_pane_io.rs`) — so the
+/// answer is the per-kind cost weighted by the live mix the census shows:
+/// `2 + 2 × holder panes / thread-holding panes`, rounded DOWN (the strict side
+/// of a multiplier), where a thread-holding pane is one `terminal-*` pair and a
+/// holder pane one `pty-holder-*` pair (capped at the thread-holding count). An
+/// all-in-process box reads 2, an all-holder one 4 (Phase 0 of plan
+/// `2026-11-04-unplanned-restart-restore-is-page-gated-and-counts-unverified-resumes`
+/// measured 2.0 and 4.1-4.3). The in-process figure is what `named / sessions`
+/// is otherwise judged against, and it can only disagree with 2 through a
+/// count skew:
 ///
 /// - **above 2** — a teardown race (threads of terminals the registry already
 ///   dropped) or a leaked `terminal-*` thread. Not a fatter terminal; the
@@ -762,9 +865,10 @@ pub(crate) const PER_SESSION_THREADS_FALLBACK: usize =
 /// whenever a few panes were exited-but-open, halved the session-capacity arm
 /// of [`scaled_thread_ceilings`] (523 instead of 811 on a 48-core box) and
 /// read `thread_pressure:critical` at 594 threads. So a coherent observation
-/// reads the structural value — never above it, and equal to
-/// [`PER_SESSION_THREADS_FALLBACK`], so it cannot loosen past what a box with
-/// no census already gets.
+/// reads the structural value of its mix — never above it, and on an
+/// all-in-process box equal to [`PER_SESSION_THREADS_FALLBACK`], so it cannot
+/// loosen past what a box with no census already gets. Only holder threads the
+/// census actually NAMED raise it.
 ///
 /// The measurement still decides WHETHER there is an answer: fewer named
 /// threads than terminals ([`census_misread`]) reads `None`, as does any
@@ -772,22 +876,37 @@ pub(crate) const PER_SESSION_THREADS_FALLBACK: usize =
 /// [`PER_SESSION_THREADS_FALLBACK`] downstream, and the mis-read itself makes
 /// the scaled term UNKNOWN through [`SESSION_CENSUS_MISREAD`].
 ///
-/// Consequence, stated so nobody re-derives it as a bug: every path now yields
-/// 2 (a coherent tick, and the fallback alike), so the `Some`/`None` this
-/// returns — and `/health` `inputs.perSessionThreads` beside it — is
-/// PROVENANCE ("a fresh coherent tick confirmed the structural value" vs
-/// "no fresh tick could"), not a varying number.
+/// Consequence, stated so nobody re-derives it as a bug: with no holder panes
+/// every path yields 2 (a coherent tick, and the fallback alike), so there the
+/// `Some`/`None` this returns — and `/health` `inputs.perSessionThreads`
+/// beside it — is PROVENANCE ("a fresh coherent tick confirmed the structural
+/// value" vs "no fresh tick could"). Only the pane mix moves the number.
 pub(crate) fn per_session_threads_from(
-    census_session_threads: Option<usize>,
+    census_session_threads: Option<SessionThreadTally>,
     live_sessions: Option<usize>,
+    live_holder_panes: Option<usize>,
 ) -> Option<usize> {
-    let (Some(named), Some(sessions)) = (census_session_threads, live_sessions) else {
+    let (Some(tally), Some(sessions)) = (census_session_threads, live_sessions) else {
         return None;
     };
-    if sessions == 0 || census_misread(named, sessions) {
+    if sessions == 0 || census_misread(tally, sessions) {
         return None;
     }
-    Some(MAX_THREADS_PER_SESSION)
+    // The mix is read among the panes the census shows HOLDING threads (one
+    // `terminal-*` pair each), not among the registry's count, which runs a few
+    // above it with exited-but-open panes: dividing by the registry would let
+    // those panes deflate the answer — the 2026-10-15 regression class below.
+    // Holder panes are charged only as far as the registry confirms them
+    // ([`SessionThreadTally::charged_holder_panes`]): leaked `pty-holder-*`
+    // threads on a box with no holder-backed pane read 2, not 4.
+    let thread_panes = (tally.terminal() / IN_PROCESS_THREADS_PER_SESSION).max(1);
+    let holder_panes = tally
+        .charged_holder_panes(live_holder_panes)
+        .min(thread_panes);
+    Some(
+        IN_PROCESS_THREADS_PER_SESSION
+            + HOLDER_THREADS_PER_PANE.saturating_mul(holder_panes) / thread_panes,
+    )
 }
 
 /// The most recent tick's threads-per-session ([`per_session_threads_from`]:
@@ -803,19 +922,109 @@ pub(crate) fn per_session_threads_from(
 /// [`PER_SESSION_THREADS_FALLBACK`] rather than freezing a stale reading.
 static SESSION_THREAD_SAMPLE: Mutex<Option<(std::time::Instant, usize)>> = Mutex::new(None);
 
-/// Fold one tick's `(named session threads, live sessions)` into
-/// [`SESSION_THREAD_SAMPLE`]. An observation that measures nothing leaves the
-/// previous sample to age out on its own rather than overwriting it.
-fn note_session_thread_sample(census_session_threads: Option<usize>, live_sessions: Option<usize>) {
+/// The registry's count of holder-backed panes on the most recent 30 s tick,
+/// stamped with when it was read: the bound [`SessionThreadTally::load`] puts
+/// on the census's `pty-holder-*` threads when there is no registry to read
+/// live at all ([`holder_panes_for_load`]; a registry that is merely busy
+/// charges none instead). Aged by [`AT_REST_SAMPLE_MAX_AGE`]
+/// (20 minutes) on read; a stale or absent count charges no holder threads
+/// (the strict side).
+static HOLDER_PANE_SAMPLE: Mutex<Option<(std::time::Instant, usize)>> = Mutex::new(None);
+
+/// What the spawn-time read of the terminal registry's holder-backed pane count
+/// found ([`live_holder_panes`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiveHolderPanes {
+    /// The registry answered.
+    Count(usize),
+    /// The registry exists but is held right now (`try_lock` missed) or is
+    /// poisoned: UNKNOWN at this instant.
+    Busy,
+    /// There is no registry to ask — no Tauri runtime, or no `TerminalManager`
+    /// state managed on it (a headless or test process, or the first moments of
+    /// startup before the state is managed).
+    NoRegistry,
+}
+
+/// The holder-backed pane count the spawn-time ceilings charge holder threads
+/// against. PURE over its two readings.
+///
+/// - **The registry answered**: its count. Live first because the sample is
+///   filled only by the 30 s resource tick, which does not run before the first
+///   tick after boot — exactly the post-restart restore — nor on a box that
+///   publishes no fleet telemetry. With the sample alone, holder threads went
+///   uncharged there and the pool arm was over-strict when the restore needed
+///   its headroom.
+/// - **The registry is busy**: `None`, charging NO holder threads — never the
+///   sample, which may be up to [`AT_REST_SAMPLE_MAX_AGE`] old and name panes
+///   that have since closed. Over-charging loosens the guard, so the honest
+///   answer to "how many holder panes right now?" with the registry held is
+///   none, the strict side. A miss costs at most one spawn's worth of
+///   strictness; the next spawn reads again.
+/// - **There is no registry at all**: the sample, the only reading there is.
+///   No `TerminalManager` state means no live pane to read, and a sample can
+///   exist then only from a tick that read one, so it is not standing in for a
+///   fresher answer that was available.
+///
+/// The live read is `TerminalManager::holder_backed_count_try`, which never
+/// blocks (see its doc for the lock-order reason).
+fn holder_panes_for_load(live: LiveHolderPanes, sample: Option<usize>) -> Option<usize> {
+    match live {
+        LiveHolderPanes::Count(panes) => Some(panes),
+        LiveHolderPanes::Busy => None,
+        LiveHolderPanes::NoRegistry => sample,
+    }
+}
+
+/// The registry's holder-backed pane count, read now without blocking.
+fn live_holder_panes() -> LiveHolderPanes {
+    use std::sync::Arc;
+    let Some(app) = crate::tauri_app_handle::current() else {
+        return LiveHolderPanes::NoRegistry;
+    };
+    let Some(manager) = tauri::Manager::try_state::<Arc<crate::terminal::TerminalManager>>(&app)
+    else {
+        return LiveHolderPanes::NoRegistry;
+    };
+    match manager.holder_backed_count_try() {
+        Some(panes) => LiveHolderPanes::Count(panes),
+        None => LiveHolderPanes::Busy,
+    }
+}
+
+/// The holder-backed pane count a fresh tick read, or `None` (UNKNOWN).
+fn measured_holder_panes() -> Option<usize> {
+    let slot = HOLDER_PANE_SAMPLE.lock().ok()?;
+    let (at, panes) = (*slot)?;
+    (std::time::Instant::now().saturating_duration_since(at) <= AT_REST_SAMPLE_MAX_AGE)
+        .then_some(panes)
+}
+
+/// Fold one tick's `(named session threads, live sessions, holder-backed
+/// panes)` into [`SESSION_THREAD_SAMPLE`] and [`HOLDER_PANE_SAMPLE`]. An
+/// observation that measures nothing leaves the previous sample to age out on
+/// its own rather than overwriting it.
+fn note_session_thread_sample(
+    census_session_threads: Option<SessionThreadTally>,
+    live_sessions: Option<usize>,
+    live_holder_panes: Option<usize>,
+) {
+    if let Some(panes) = live_holder_panes {
+        if let Ok(mut slot) = HOLDER_PANE_SAMPLE.lock() {
+            *slot = Some((std::time::Instant::now(), panes));
+        }
+    }
     // The mis-read flag is set by an incoherent tick and cleared by any tick
     // that can judge coherence and finds it, so `/health` names the state the
     // census is in NOW rather than one it was in once.
-    if let (Some(named), Some(sessions)) = (census_session_threads, live_sessions) {
+    if let (Some(tally), Some(sessions)) = (census_session_threads, live_sessions) {
         if let Ok(mut flag) = SESSION_CENSUS_MISREAD.lock() {
-            *flag = census_misread(named, sessions).then(std::time::Instant::now);
+            *flag = census_misread(tally, sessions).then(std::time::Instant::now);
         }
     }
-    let Some(per_session) = per_session_threads_from(census_session_threads, live_sessions) else {
+    let Some(per_session) =
+        per_session_threads_from(census_session_threads, live_sessions, live_holder_panes)
+    else {
         return;
     };
     if let Ok(mut slot) = SESSION_THREAD_SAMPLE.lock() {
@@ -1433,8 +1642,9 @@ pub(crate) struct ThreadCapacityInputs {
     /// Threads per live terminal a fresh coherent tick confirmed
     /// ([`measured_per_session_threads`]).
     pub(crate) per_session_threads: Option<usize>,
-    /// Named per-session threads in the census right now
-    /// ([`ThreadNameCensus::session_threads`]).
+    /// Per-pane threads in the census right now charged as session load
+    /// ([`SessionThreadTally::load`]): every `terminal-*` thread, plus the
+    /// `pty-holder-*` threads of the holder-backed panes the registry confirms.
     pub(crate) session_threads_now: Option<usize>,
     /// The latest tick found the census naming fewer session threads than
     /// there are live terminals ([`census_misread`]). Its session tally is not
@@ -1504,7 +1714,8 @@ pub(crate) struct ScaledThreadCeilings {
 /// dialog-says-low-memory`, §3 "Session capacity". The runner's thread count
 /// measures two different things and this keeps them apart:
 ///
-/// 1. **Session threads** (2 per terminal) are a stand-in for session LOAD,
+/// 1. **Session threads** (2 per in-process terminal, 4 per holder-backed one)
+///    are a stand-in for session LOAD,
 ///    whose real limits are CPU and memory — properties of the machine. So the
 ///    session-capacity arm scales:
 ///    `baseline + per_session × min(SESSIONS_PER_CORE × cores, (MemTotal − reserve) / PER_SESSION_RSS)`.
@@ -2045,7 +2256,12 @@ fn live_thread_capacity_inputs(census: Option<&ThreadNameCensus>) -> ThreadCapac
         mem_total_bytes: host.mem_bytes,
         baseline: at_rest_thread_baseline(),
         per_session_threads: measured_per_session_threads(),
-        session_threads_now: census.map(|c| c.session_threads),
+        session_threads_now: census.map(|c| {
+            SessionThreadTally::from_census(c).load(holder_panes_for_load(
+                live_holder_panes(),
+                measured_holder_panes(),
+            ))
+        }),
         session_census_misread: session_census_misread_now(),
     }
 }
@@ -2753,6 +2969,49 @@ fn critical_refusal(what: &str, observation: &GateObservation) -> String {
     )
 }
 
+/// A CRITICAL verdict, as the typed value the spawn gates return.
+///
+/// Its [`Display`](std::fmt::Display) is the [`critical_refusal`] wire, byte
+/// for byte, and `From<CriticalRefusal> for String` is that same text, so every
+/// caller that propagates a gate refusal with `?` into a `String` error — the
+/// Tauri commands, the looping-agent supervisor's prefix match, the webview's
+/// parser — sees exactly the string it always saw. What the type adds is the
+/// [`GateObservation`] itself, for a door that answers a machine rather than a
+/// person: `POST /terminals` turns it into a 503 whose body names the lane, the
+/// reading and the limit as fields, which nobody should have to scrape out of
+/// prose that is free to be reworded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CriticalRefusal {
+    what: String,
+    observation: GateObservation,
+}
+
+impl CriticalRefusal {
+    pub(crate) fn new(what: &str, observation: GateObservation) -> Self {
+        Self {
+            what: what.to_string(),
+            observation,
+        }
+    }
+
+    /// The reading that was refused, beside the limit it was judged against.
+    pub(crate) fn observation(&self) -> &GateObservation {
+        &self.observation
+    }
+}
+
+impl std::fmt::Display for CriticalRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&critical_refusal(&self.what, &self.observation))
+    }
+}
+
+impl From<CriticalRefusal> for String {
+    fn from(refusal: CriticalRefusal) -> Self {
+        refusal.to_string()
+    }
+}
+
 /// Apply the gate to a spawn that is about to happen.
 ///
 /// `what` is a short noun phrase for the thing being created ("terminal
@@ -2769,7 +3028,8 @@ fn critical_refusal(what: &str, observation: &GateObservation) -> String {
 /// downgrades to the log line and never changes the verdict.
 ///
 /// Returns `Err(refusal)` **only** for an un-overridden CRITICAL verdict. Every
-/// other path returns `Ok(())` — including every probe failure.
+/// other path returns `Ok(())` — including every probe failure. The refusal is a
+/// [`CriticalRefusal`], whose text is the [`CRITICAL_REFUSAL_PREFIX`] wire.
 ///
 /// **Lane-agnostic by construction.** Adding the thread lane added no logic
 /// here: the verdict carries its own metric, unit and phrasing
@@ -2782,7 +3042,7 @@ pub(crate) fn admit_spawn(
     what: &str,
     resource_override: bool,
     app: Option<&AppHandle>,
-) -> Result<(), String> {
+) -> Result<(), CriticalRefusal> {
     match probe_for_spawn() {
         SpawnGate::Proceed => Ok(()),
         SpawnGate::Warn(observation) => {
@@ -2827,7 +3087,7 @@ pub(crate) fn admit_spawn(
                 what = %what,
                 "resource_guard: refusing to spawn past the session critical limit"
             );
-            Err(critical_refusal(what, &observation))
+            Err(CriticalRefusal::new(what, observation))
         }
     }
 }
@@ -2858,8 +3118,8 @@ pub(crate) fn admit_spawn(
 /// coord claim. The memo is what makes paying for both lanes here free; dropping
 /// a lane is not.
 ///
-/// Returns exactly what [`admit_spawn`] would: the same
-/// [`CRITICAL_REFUSAL_PREFIX`]-tagged string, so the frontend's dialog and the
+/// Returns exactly what [`admit_spawn`] would: the same [`CriticalRefusal`],
+/// whose text is the same [`CRITICAL_REFUSAL_PREFIX`]-tagged string, so the frontend's dialog and the
 /// unattended callers' error handling cannot tell which of the two gates
 /// answered.
 ///
@@ -2869,7 +3129,7 @@ pub(crate) fn admit_spawn(
 /// mean a caller that never reaches this pre-check gets no notice at all.
 /// Deciding twice is fine — the verdict is a pure function of a reading either
 /// way — but *telling the operator* twice is not.
-pub(crate) fn precheck_spawn(what: &str, resource_override: bool) -> Result<(), String> {
+pub(crate) fn precheck_spawn(what: &str, resource_override: bool) -> Result<(), CriticalRefusal> {
     if resource_override {
         return Ok(());
     }
@@ -2884,7 +3144,7 @@ pub(crate) fn precheck_spawn(what: &str, resource_override: bool) -> Result<(), 
                 "resource_guard: refusing a {what} before its worktree/claim acquisition \
                  (pre-check; the spawn seam would refuse it too)"
             );
-            Err(critical_refusal(what, &observation))
+            Err(CriticalRefusal::new(what, observation))
         }
         SpawnGate::Proceed | SpawnGate::Warn(_) => Ok(()),
     }
@@ -3413,6 +3673,12 @@ mod tests {
 
     const GIB_U64: u64 = 1024 * 1024 * 1024;
 
+    /// A census tally of `named` in-process (`terminal-*`) threads and no
+    /// holder-backed panes.
+    fn inproc(named: usize) -> Option<SessionThreadTally> {
+        Some(SessionThreadTally { named, holder: 0 })
+    }
+
     /// The shipped defaults: 3 GiB warn, 1.5 GiB critical, 256/400 threads,
     /// enabled.
     fn defaults() -> SessionGuardSettings {
@@ -3823,7 +4089,14 @@ mod tests {
                 .collect(),
             session_threads: rows
                 .iter()
-                .filter(|(name, _)| name.starts_with("terminal-"))
+                .filter(|(name, _)| {
+                    name.starts_with("terminal-") || name.starts_with("pty-holder-")
+                })
+                .map(|(_, n)| n)
+                .sum(),
+            holder_threads: rows
+                .iter()
+                .filter(|(name, _)| name.starts_with("pty-holder-"))
                 .map(|(_, n)| n)
                 .sum(),
             sampled_at: std::time::SystemTime::UNIX_EPOCH,
@@ -4611,10 +4884,10 @@ mod tests {
         assert_eq!(at_rest_estimate(None, Some(3)), None);
         assert_eq!(at_rest_estimate(Some(400), None), None);
         assert_eq!(at_rest_estimate(None, None), None);
-        assert_eq!(session_thread_attribution(Some(328), None), None);
+        assert_eq!(session_thread_attribution(inproc(328), None), None);
         assert_eq!(session_thread_attribution(None, None), None);
         assert_eq!(
-            at_rest_estimate(Some(400), session_thread_attribution(Some(0), Some(0))),
+            at_rest_estimate(Some(400), session_thread_attribution(inproc(0), Some(0))),
             Some(400),
             "zero sessions is a READING, not an absence — it must still sample"
         );
@@ -4673,7 +4946,10 @@ mod tests {
             // No idle pool in this census, so the graded reading is the raw one.
             let graded = graded_thread_reading(499, Some(&census), 0, RUNTIME_NAMES, 16);
             assert_eq!(graded.graded, 499, "{platform}");
-            let attributed = session_thread_attribution(Some(census.session_threads), Some(164));
+            let attributed = session_thread_attribution(
+                Some(SessionThreadTally::from_census(&census)),
+                Some(164),
+            );
             assert_eq!(attributed, Some(328), "{platform}");
             assert_eq!(
                 at_rest_estimate(Some(graded.graded), attributed),
@@ -4681,7 +4957,11 @@ mod tests {
                 "{platform}"
             );
             assert_eq!(
-                per_session_threads_from(Some(census.session_threads), Some(164)),
+                per_session_threads_from(
+                    Some(SessionThreadTally::from_census(&census)),
+                    Some(164),
+                    None
+                ),
                 Some(2),
                 "{platform}"
             );
@@ -4704,14 +4984,61 @@ mod tests {
 
     /// **A leak cannot loosen the ceiling.** 20 live sessions and 300 leaked
     /// `terminal-reader` threads (340 named): the quotient would be 17 per
-    /// session, but no terminal holds more than the two family threads, so it
-    /// reads [`MAX_THREADS_PER_SESSION`] — and even a raw 17 handed
-    /// straight to the scaled term is capped there. The ceiling stays at the
-    /// 2-per-session value.
+    /// session, but an in-process terminal holds only its two family threads,
+    /// so it reads 2 — a leak in a `terminal-*` family never moves the answer.
+    /// Leaked `pty-holder-*` threads cannot push it past a holder pane's 4
+    /// either, and a raw 17 handed straight to the scaled term is capped at
+    /// [`MAX_THREADS_PER_SESSION`].
     #[test]
-    fn leaked_session_threads_do_not_raise_the_ceiling_past_two_per_session() {
-        assert_eq!(MAX_THREADS_PER_SESSION, 2);
-        assert_eq!(per_session_threads_from(Some(340), Some(20)), Some(2));
+    fn leaked_session_threads_do_not_raise_the_ceiling_past_the_structural_cost() {
+        assert_eq!(IN_PROCESS_THREADS_PER_SESSION, 2);
+        assert_eq!(MAX_THREADS_PER_SESSION, 4);
+        assert_eq!(
+            per_session_threads_from(inproc(340), Some(20), None),
+            Some(2)
+        );
+        // 20 holder panes (40 terminal + 40 holder threads) plus 300 leaked
+        // holder threads: still 4, never 19 — the registry confirms 20.
+        let leaked_holders = Some(SessionThreadTally {
+            named: 40 + 340,
+            holder: 340,
+        });
+        assert_eq!(
+            per_session_threads_from(leaked_holders, Some(20), Some(20)),
+            Some(4)
+        );
+        // The same leaked holder threads on an ALL-IN-PROCESS box (the
+        // registry has no holder-backed pane): they raise neither the
+        // multiplier nor the pool arm's load — 2 per session and the 40
+        // terminal threads, as if they were not there. With the registry
+        // UNKNOWN they are not charged either.
+        assert_eq!(
+            per_session_threads_from(leaked_holders, Some(20), Some(0)),
+            Some(2)
+        );
+        assert_eq!(
+            per_session_threads_from(leaked_holders, Some(20), None),
+            Some(2)
+        );
+        let tally = leaked_holders.unwrap();
+        assert_eq!(tally.load(Some(0)), 40);
+        assert_eq!(tally.load(None), 40);
+        assert_eq!(tally.load(Some(20)), 80);
+        let in_process = ThreadCapacityInputs {
+            per_session_threads: per_session_threads_from(leaked_holders, Some(20), Some(0)),
+            session_threads_now: Some(tally.load(Some(0))),
+            ..merytshost_loaded()
+        };
+        let clean = ThreadCapacityInputs {
+            per_session_threads: Some(2),
+            session_threads_now: Some(40),
+            ..merytshost_loaded()
+        };
+        assert_eq!(
+            scaled_thread_ceilings(&in_process).unwrap().ceilings,
+            scaled_thread_ceilings(&clean).unwrap().ceilings,
+            "leaked holder threads with no holder-backed pane do not raise the ceiling"
+        );
 
         let honest = ThreadCapacityInputs {
             per_session_threads: Some(2),
@@ -4724,14 +5051,17 @@ mod tests {
         };
         let honest_scaled = scaled_thread_ceilings(&honest).unwrap();
         let leaked_scaled = scaled_thread_ceilings(&leaked).unwrap();
-        assert_eq!(leaked_scaled.per_session_threads_used, 2);
-        assert_eq!(leaked_scaled.ceilings, honest_scaled.ceilings);
-        // …and that value is the 2-per-session session-capacity arm: 171 + 2 ×
-        // (192 warn | 288 critical).
-        assert!(leaked_scaled.ceilings.warn <= 171 + 2 * 192);
-        assert!(leaked_scaled.ceilings.critical <= 171 + 2 * 288);
-        let merged = merge_thread_ceilings(&defaults(), SessionFloors::default(), &leaked);
-        assert!(merged.ceilings.warn <= 171 + 2 * 192, "{merged:?}");
+        assert_eq!(honest_scaled.per_session_threads_used, 2);
+        assert_eq!(leaked_scaled.per_session_threads_used, 4);
+        // …so the session-capacity arm is at most 171 + 4 × 288 critical, and
+        // the pool arm (171 + 340 live session threads + 249) still bounds the
+        // ceiling: the leak cannot carry it past what the live threads allow.
+        assert_eq!(honest_scaled.ceilings.critical, 171 + 2 * 288);
+        assert_eq!(leaked_scaled.session_arm.critical, 171 + 4 * 288);
+        assert_eq!(
+            leaked_scaled.ceilings.critical,
+            171 + 340 + POOL_HEADROOM_CRITICAL
+        );
     }
 
     /// When the census contradicts the session count, the scaled term is
@@ -4777,32 +5107,35 @@ mod tests {
     /// raise the baseline to the whole graded count and LOOSEN the guard.
     #[test]
     fn a_census_naming_no_session_threads_beside_live_terminals_is_unknown() {
-        assert_eq!(session_thread_attribution(Some(0), Some(164)), None);
+        assert_eq!(session_thread_attribution(inproc(0), Some(164)), None);
         // FEWER named threads than terminals is the same mis-read — typically
         // the 30 s memoized census lagging a fresh count after a spawn burst.
-        assert_eq!(session_thread_attribution(Some(100), Some(164)), None);
-        assert_eq!(session_thread_attribution(Some(164), Some(164)), Some(164));
+        assert_eq!(session_thread_attribution(inproc(100), Some(164)), None);
         assert_eq!(
-            at_rest_estimate(Some(499), session_thread_attribution(Some(0), Some(164))),
+            session_thread_attribution(inproc(164), Some(164)),
+            Some(164)
+        );
+        assert_eq!(
+            at_rest_estimate(Some(499), session_thread_attribution(inproc(0), Some(164))),
             None
         );
         // …but zero named threads with zero terminals is simply an idle box.
-        assert_eq!(session_thread_attribution(Some(0), Some(0)), Some(0));
+        assert_eq!(session_thread_attribution(inproc(0), Some(0)), Some(0));
         // Named threads beside a registry reading of zero (a teardown race) are
         // still session threads by name; subtracting them is the strict side.
-        assert_eq!(session_thread_attribution(Some(4), Some(0)), Some(4));
+        assert_eq!(session_thread_attribution(inproc(4), Some(0)), Some(4));
 
         // The per-session ratio has no UNKNOWN-as-zero arm either.
-        assert_eq!(per_session_threads_from(Some(0), Some(164)), None);
+        assert_eq!(per_session_threads_from(inproc(0), Some(164), None), None);
         assert_eq!(
-            per_session_threads_from(Some(100), Some(164)),
+            per_session_threads_from(inproc(100), Some(164), None),
             None,
             "a mis-read"
         );
-        assert_eq!(per_session_threads_from(Some(328), Some(0)), None);
-        assert_eq!(per_session_threads_from(None, Some(164)), None);
+        assert_eq!(per_session_threads_from(inproc(328), Some(0), None), None);
+        assert_eq!(per_session_threads_from(None, Some(164), None), None);
         assert_eq!(
-            per_session_threads_from(Some(329), Some(164)),
+            per_session_threads_from(inproc(329), Some(164), None),
             Some(2),
             "a coherent observation reads the structural 2"
         );
@@ -4818,16 +5151,25 @@ mod tests {
     /// 368 GB box.
     #[test]
     fn a_registry_a_few_above_the_thread_pairs_does_not_halve_the_session_arm() {
-        assert_eq!(per_session_threads_from(Some(298), Some(153)), Some(2));
+        assert_eq!(
+            per_session_threads_from(inproc(298), Some(153), None),
+            Some(2)
+        );
         // The coherence boundary — exactly one named thread per registered
         // terminal — is still 2; a ceiling division would have read 1 here.
-        assert_eq!(per_session_threads_from(Some(153), Some(153)), Some(2));
+        assert_eq!(
+            per_session_threads_from(inproc(153), Some(153), None),
+            Some(2)
+        );
         // …and nothing reads above the structural value, however skewed.
-        assert_eq!(per_session_threads_from(Some(10_000), Some(1)), Some(2));
+        assert_eq!(
+            per_session_threads_from(inproc(10_000), Some(1), None),
+            Some(2)
+        );
 
         let inputs = ThreadCapacityInputs {
             baseline: Some(235),
-            per_session_threads: per_session_threads_from(Some(298), Some(153)),
+            per_session_threads: per_session_threads_from(inproc(298), Some(153), None),
             session_threads_now: Some(298),
             ..merytshost_loaded()
         };
@@ -4847,6 +5189,180 @@ mod tests {
         let merged = merge_thread_ceilings(&defaults(), SessionFloors::default(), &inputs);
         assert_eq!(merged.critical_source, CeilingSource::Scaled, "{merged:?}");
         assert!(merged.ceilings.critical > 594, "{merged:?}");
+
+        // The same box with HOLDER-backed panes, at the cost Phase 0 measured
+        // (plan `2026-11-04-unplanned-restart-restore-is-page-gated-and-counts-
+        // unverified-resumes`: 4 threads per holder pane): 149 thread-holding
+        // panes are 298 `terminal-*` + 298 `pty-holder-*` threads, against the
+        // same registry count of 153. The four exited-but-open panes must not
+        // deflate the per-kind cost either — divided by the registry it would
+        // read (306 + 298) / 153 = 3 — so it reads 4.
+        let holder = Some(SessionThreadTally {
+            named: 596,
+            holder: 298,
+        });
+        assert_eq!(
+            per_session_threads_from(holder, Some(153), Some(149)),
+            Some(4)
+        );
+        let holder_inputs = ThreadCapacityInputs {
+            baseline: Some(235),
+            per_session_threads: per_session_threads_from(holder, Some(153), Some(149)),
+            session_threads_now: Some(596),
+            ..merytshost_loaded()
+        };
+        let scaled = scaled_thread_ceilings(&holder_inputs).unwrap();
+        assert_eq!(scaled.per_session_threads_used, 4);
+        assert_eq!(scaled.session_arm.critical, 1387, "235 + 4 × 288");
+        assert_eq!(scaled.pool_arm.critical, 1080, "235 + 596 + 249");
+        assert_eq!(scaled.ceilings.critical, 1080);
+    }
+
+    /// **Plan `2026-11-04-unplanned-restart-restore-is-page-gated-and-counts-
+    /// unverified-resumes`, Phase 5a — the Phase 0 census.** nilan (128 cores,
+    /// 503 GiB), run6: 12 holder-backed panes, 176 threads, and each pane
+    /// holding `terminal-reader`, `terminal-waiter`, `pty-holder-ctl` and
+    /// `pty-holder-pump`. The guard used to count 2 of those 4 (`sessionThreads`
+    /// 24), so its pool arm read 151 + 24 + 105 | 249 = **280 | 424** and its
+    /// session arm 151 + 2 × (512 | 768) = **1175 | 1687** — the numbers
+    /// `/health` reported. Counting the holder families moves both arms by the
+    /// measured amount: the pool arm by the 24 holder threads, the session arm
+    /// to 4 per session, and the at-rest floor down by the same 24 threads the
+    /// runner never idled on.
+    #[test]
+    fn the_phase0_holder_census_moves_both_scaled_arms_by_the_measured_amount() {
+        use qontinui_runner_lib::wedge_diagnostics::finish_thread_name_census;
+        let mut names: Vec<String> = Vec::new();
+        for _ in 0..12 {
+            names.push("terminal-reader".to_string());
+            names.push("terminal-waiter".to_string());
+            names.push("pty-holder-ctl-".to_string());
+            names.push("pty-holder-pump".to_string());
+        }
+        for i in 0..128 {
+            names.push(format!("worker{}-x", i % 30));
+        }
+        let census = finish_thread_name_census(names).expect("census");
+        assert_eq!(census.total, 176);
+        assert_eq!(census.session_threads, 48);
+        assert_eq!(census.holder_threads, 24);
+
+        let tally = Some(SessionThreadTally::from_census(&census));
+        assert_eq!(per_session_threads_from(tally, Some(12), Some(12)), Some(4));
+        assert_eq!(session_thread_attribution(tally, Some(12)), Some(48));
+        assert_eq!(
+            at_rest_estimate(Some(176), session_thread_attribution(tally, Some(12))),
+            Some(128),
+            "the floor the box idles at (124-128 measured at 0 panes), not 152"
+        );
+
+        let nilan = ThreadCapacityInputs {
+            cores: Some(128),
+            mem_total_bytes: Some(503 * GIB_U64),
+            baseline: None,
+            per_session_threads: per_session_threads_from(tally, Some(12), Some(12)),
+            session_threads_now: Some(SessionThreadTally::from_census(&census).load(Some(12))),
+            session_census_misread: false,
+        };
+        let scaled = scaled_thread_ceilings(&nilan).unwrap();
+        assert_eq!(scaled.baseline_used, 151);
+        assert_eq!(
+            scaled.session_capacity,
+            ThreadCeilings {
+                warn: 512,
+                critical: 768
+            }
+        );
+        assert_eq!(scaled.per_session_threads_used, 4);
+        assert_eq!(
+            scaled.session_arm,
+            ThreadCeilings {
+                warn: 2199,
+                critical: 3223
+            },
+            "151 + 4 × (512 | 768), was 1175 | 1687"
+        );
+        assert_eq!(
+            scaled.pool_arm,
+            ThreadCeilings {
+                warn: 304,
+                critical: 448
+            },
+            "151 + 48 + (105 | 249), was 280 | 424"
+        );
+        assert_eq!(scaled.ceilings, scaled.pool_arm);
+    }
+
+    /// The spawn-time holder-pane bound is the registry read live, falling back
+    /// to the tick's sample only when the live read cannot be had — so at boot,
+    /// before any tick, a holder box's holder threads are still charged.
+    #[test]
+    fn the_spawn_time_holder_bound_prefers_the_live_registry_read() {
+        use LiveHolderPanes::{Busy, Count, NoRegistry};
+        assert_eq!(
+            holder_panes_for_load(Count(12), None),
+            Some(12),
+            "before any tick"
+        );
+        assert_eq!(
+            holder_panes_for_load(Count(12), Some(3)),
+            Some(12),
+            "a stale sample loses"
+        );
+        assert_eq!(
+            holder_panes_for_load(Busy, Some(3)),
+            None,
+            "a held registry charges none — never the possibly stale sample"
+        );
+        assert_eq!(
+            holder_panes_for_load(NoRegistry, Some(3)),
+            Some(3),
+            "no registry at all: the sample is the only reading"
+        );
+        assert_eq!(holder_panes_for_load(NoRegistry, None), None);
+        // …and what each answer charges for the Phase 0 tally (24 + 24 named).
+        let tally = SessionThreadTally {
+            named: 48,
+            holder: 24,
+        };
+        assert_eq!(tally.load(holder_panes_for_load(Count(12), None)), 48);
+        assert_eq!(tally.load(holder_panes_for_load(Busy, Some(12))), 24);
+    }
+
+    /// A holder pane's `pty-holder-*` threads never stand in for a missing
+    /// `terminal-*` thread: a census that names the 24 holder threads of 12
+    /// panes but none of their terminal threads is a mis-read — UNKNOWN for
+    /// the attribution and the per-session cost alike — exactly as it would be
+    /// with no holder threads at all.
+    #[test]
+    fn holder_threads_cannot_cover_a_missing_terminal_thread_in_the_coherence_check() {
+        let only_holders = Some(SessionThreadTally {
+            named: 24,
+            holder: 24,
+        });
+        assert_eq!(session_thread_attribution(only_holders, Some(12)), None);
+        assert_eq!(
+            per_session_threads_from(only_holders, Some(12), Some(12)),
+            None
+        );
+        // One terminal thread short of one per pane is still a mis-read…
+        let short = Some(SessionThreadTally {
+            named: 11 + 24,
+            holder: 24,
+        });
+        assert_eq!(session_thread_attribution(short, Some(12)), None);
+        // …and one per pane is coherent, with the holder threads attributed.
+        let coherent = Some(SessionThreadTally {
+            named: 12 + 24,
+            holder: 24,
+        });
+        assert_eq!(session_thread_attribution(coherent, Some(12)), Some(36));
+        // A mixed box reads the weighted cost: 6 holder panes of 12 is 3.
+        let mixed = Some(SessionThreadTally {
+            named: 24 + 12,
+            holder: 12,
+        });
+        assert_eq!(per_session_threads_from(mixed, Some(12), Some(6)), Some(3));
     }
 
     /// **The window must be able to RISE, and no single sample may pin it.**

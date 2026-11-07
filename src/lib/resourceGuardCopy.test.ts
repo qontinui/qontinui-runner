@@ -1,11 +1,16 @@
 import { describe, expect, it } from "vitest";
 
-import { GRANT_SPAWN_LIMIT, type PendingResourceBlock } from "./resourceGuard";
+import {
+  GRANT_SPAWN_LIMIT,
+  type PendingResourceBlock,
+  type ResourceGuardWait,
+} from "./resourceGuard";
 import {
   RESOURCE_GUARD_HEADLINES,
   grantAnnouncement,
   grantBannerText,
   resourceGuardDialogCopy,
+  resourceGuardWaitText,
   type GuardOs,
 } from "./resourceGuardCopy";
 import wire from "./resourceGuardWire.fixture.json";
@@ -148,5 +153,52 @@ describe("grantBannerText", () => {
     expect(
       grantBannerText({ ...grant, metric: "free_commit_bytes", sourceLabel: null }, 90_000),
     ).toBe("Resource guard overridden for memory — 7 starts, 10 s left");
+  });
+});
+
+describe("resourceGuardWaitText", () => {
+  function wait(overrides: Partial<ResourceGuardWait> = {}): ResourceGuardWait {
+    return {
+      key: "session-restore:default",
+      sourceLabel: "session restore",
+      metric: "thread_count",
+      reading: { lane: null, observed: "540", limit: "400" },
+      refusals: 1,
+      retryAt: 0,
+      ...overrides,
+    };
+  }
+
+  it("names the thread ceiling with the observed reading and the limit", () => {
+    expect(resourceGuardWaitText(wait())).toBe(
+      "waiting: thread ceiling (observed 540 / limit 400). Raise in Settings → Resource Guard",
+    );
+  });
+
+  it("names the memory lane and calls its limit a floor", () => {
+    expect(
+      resourceGuardWaitText(
+        wait({
+          metric: "free_commit_bytes",
+          reading: { lane: "host", observed: "1.00 GiB", limit: "1.50 GiB" },
+        }),
+      ),
+    ).toBe(
+      "waiting: host memory floor (observed 1.00 GiB / limit 1.50 GiB). " +
+        "Raise in Settings → Resource Guard",
+    );
+  });
+
+  it("says it retries when the page is opened when no retry is scheduled", () => {
+    expect(resourceGuardWaitText(wait({ retryAt: null }))).toBe(
+      "waiting: thread ceiling (observed 540 / limit 400), retries when the page is opened. " +
+        "Raise in Settings → Resource Guard",
+    );
+  });
+
+  it("says the reading was not stated rather than inventing one", () => {
+    expect(resourceGuardWaitText(wait({ metric: "unknown", reading: null }))).toBe(
+      "waiting: resource limit (reading not stated). Raise in Settings → Resource Guard",
+    );
   });
 });
