@@ -3050,6 +3050,31 @@ mod script_tests {
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );
+        // A green run with every zsh case skipped proves nothing about the zsh
+        // integration. Where CI installs zsh it sets QONTINUI_REQUIRE_ZSH_MARKS=1,
+        // and there a skip is a failure; elsewhere it is reported, never hidden.
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let zsh_skips = stdout
+            .lines()
+            .filter(|l| l.starts_with("SKIP ") && l.ends_with(": zsh is not installed"))
+            .count();
+        if std::env::var("QONTINUI_REQUIRE_ZSH_MARKS").as_deref() == Ok("1") {
+            // Required means RAN, not merely "not skipped by name": a whole-run
+            // `SKIP:` (no script(1), no timeout(1), bash < 4.4) runs no case at
+            // all, so it must fail here too, and at least one zsh case must pass.
+            let run_skip = stdout.lines().find(|l| l.starts_with("SKIP:"));
+            let zsh_ran = stdout
+                .lines()
+                .filter(|l| l.starts_with("ok   zsh-"))
+                .count();
+            assert!(
+                zsh_skips == 0 && run_skip.is_none() && zsh_ran > 0,
+                "QONTINUI_REQUIRE_ZSH_MARKS=1 but the zsh cases did not run: {zsh_skips} skipped, {zsh_ran} passed, whole-run skip {run_skip:?}"
+            );
+        }
+        if zsh_skips > 0 {
+            eprintln!("shell-integration marks: {zsh_skips} zsh case(s) SKIPPED (zsh is not installed); the zsh integration is unexercised on this host");
+        }
     }
 }
 

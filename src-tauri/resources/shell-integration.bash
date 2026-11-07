@@ -67,6 +67,14 @@ __osc633() {
 # Residual, documented rather than gated: a user PS0 is expanded with ours, and
 # bash expands the WHOLE of PS0 before it writes any of it, so code in the
 # user's part runs before our C reaches the pane (see the PS0 install below).
+# Two more, the bash twins of the zsh widget gap the zsh integration names: a
+# `bind -x` key binding runs shell code at the prompt with no command line, so
+# no C; and a PROMPT_COMMAND entry appended AFTER this script installs runs
+# after our A, so work it does reads as idle. Work either does in-process
+# (builtins and shell functions) is invisible; anything it forks shows in the
+# runner's process read. Neither is gated: both are user setup, and gating the
+# appended entry would mean withholding the announcement whenever our entry is
+# no longer PROMPT_COMMAND's last.
 #
 # The shared literal: `P;CommandMarks=1` is pinned against the webview's
 # `COMMAND_MARKS_CAPABILITY` (src/components/terminal/shellIntegrationEvents.ts)
