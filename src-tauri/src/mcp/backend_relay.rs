@@ -6165,11 +6165,13 @@ fn relay_session_maps(
 /// 2. `coord_session_id` → its Claude session id through the registrar's R4
 ///    index (`claude_session_for`, i.e. `AiCoordRegistrar::task_run_id_for`),
 ///    then the terminal hosting that Claude session:
-///    a. its own `open`, bound lifecycle record
-///       ([`crate::mcp::session_message_poller::bound_open_terminal_id`])
-///       naming a live terminal — where the session runs now;
-///    b. else the live terminal PINNED to it (the spawn-time pin, in-process),
-///       which can be stale once the session was resumed elsewhere;
+///    a. its own `open` lifecycle record — where the session runs now. When
+///       one exists it alone decides: the answer is the live terminal it binds
+///       ([`crate::mcp::session_message_poller::bound_open_terminal_id`]), or
+///       `None` when it names a pane that is gone or may not be acted on;
+///    b. else (no own open record) the live terminal PINNED to it (the
+///       spawn-time pin, in-process), which can be stale once the session was
+///       resumed elsewhere;
 ///    c. else a record whose `adopted_from` chain reaches it (a `/clear`
 ///       successor; walked with
 ///       [`crate::claude_session::coord_register::resolve_adoption_chain`])
@@ -6194,17 +6196,8 @@ pub(crate) fn resolve_coord_terminal_id<'a>(
     coord_session_id: Uuid,
 ) -> Option<String> {
     let terminals: Vec<(&str, &str, Option<Uuid>)> = terminals.collect();
-    // (1) The shell mirror id.
-    if let Some((id, _, _)) = terminals
-        .iter()
-        .find(|(_, _, coord)| *coord == Some(coord_session_id))
-    {
-        return Some((*id).to_string());
-    }
-    // (2) coord id → Claude session id.
-    let claude_session_id = claude_session_for(&coord_session_id)?;
-    // Every arm below must name exactly ONE live terminal: a remote end closes
-    // what it resolves, so two candidates are refused, never picked between.
+    // Every arm must name exactly ONE live terminal: a remote end closes what
+    // it resolves, so two candidates are refused, never picked between.
     let only = |mut tids: Vec<String>| -> Result<Option<String>, ()> {
         tids.sort();
         tids.dedup();
@@ -6214,6 +6207,24 @@ pub(crate) fn resolve_coord_terminal_id<'a>(
             _ => Err(()),
         }
     };
+    // (1) The shell mirror id.
+    match only(
+        terminals
+            .iter()
+            .filter(|(_, _, coord)| *coord == Some(coord_session_id))
+            .map(|(id, _, _)| (*id).to_string())
+            .collect(),
+    ) {
+        Ok(Some(tid)) => return Some(tid),
+        Err(()) => return None,
+        Ok(None) => {}
+    }
+    // (2) coord id → Claude session id. An empty id names nothing (unpinned
+    // panes carry the empty pin).
+    let claude_session_id = claude_session_for(&coord_session_id)?;
+    if claude_session_id.is_empty() {
+        return None;
+    }
     let is_live = |tid: &str| terminals.iter().any(|(id, _, _)| *id == tid);
     let records = open_records();
     let bound_live = |rec: &crate::session::session_lifecycle_store::TerminalSessionRecord| {
@@ -6221,22 +6232,23 @@ pub(crate) fn resolve_coord_terminal_id<'a>(
             .filter(|tid| is_live(tid))
             .map(str::to_string)
     };
-    // (2a) Its own open, bound lifecycle record — where the session RUNS now.
-    // This outranks the pin: the pin is fixed at spawn, so a pane whose Claude
+    // (2a) Its own open lifecycle record — where the session RUNS now. This
+    // outranks the pin: the pin is fixed at spawn, so a pane whose Claude
     // exited (shell still live) keeps a pin to a session that has since been
-    // resumed in another pane.
-    match only(
-        records
-            .iter()
-            .filter(|rec| rec.claude_session_id == claude_session_id)
-            .filter_map(bound_live)
-            .collect(),
-    ) {
-        Ok(Some(tid)) => return Some(tid),
-        Err(()) => return None,
-        Ok(None) => {}
+    // resumed in another pane. ANY own open record decides the question, even
+    // one naming a pane that is gone or a binding that may not be acted on:
+    // it is positive evidence the session is not (only) where the pin says,
+    // so the pin is consulted only when no own open record exists at all.
+    let own: Vec<_> = records
+        .iter()
+        .filter(|rec| rec.claude_session_id == claude_session_id)
+        .collect();
+    if !own.is_empty() {
+        return only(own.into_iter().filter_map(bound_live).collect())
+            .ok()
+            .flatten();
     }
-    // (2b) No record names it: the live terminal pinned to it.
+    // (2b) No own open record: the live terminal pinned to it.
     match only(
         terminals
             .iter()
@@ -6463,7 +6475,6 @@ async fn handle_terminal_attach(api_state: &Arc<ApiState>, data: &Value) -> Opti
 /// ([`resolve_local_terminal`] over the registrar and lifecycle store). This is
 /// the whole admission half of [`handle_terminal_end`], split out so it can be
 /// exercised without an `AppHandle`.
-#[allow(clippy::too_many_arguments)]
 fn admit_relay_terminal_end<P>(
     grants: &crate::mcp::remote_terminal::RemoteAttachGrants,
     preference: P,
@@ -6502,8 +6513,7 @@ where
 /// `remote_terminal_exit`), and that this handler does not duplicate.
 async fn handle_terminal_end(api_state: &Arc<ApiState>, data: &Value) -> Option<Value> {
     use crate::mcp::remote_terminal::{
-        admit_terminal_end, grants, now_epoch_secs, terminal_ended_frame, AdmittedEnd, EndOutcome,
-        EndVerdict,
+        grants, now_epoch_secs, terminal_ended_frame, AdmittedEnd, EndOutcome, EndVerdict,
     };
     let Some(tm) = api_state
         .app_handle
@@ -11981,6 +11991,12 @@ mod resolve_local_terminal_tests {
             resolve_two_panes(&index, &[bound("C", "B")], CLAUDE_ROW).as_deref(),
             Some("B")
         );
+        // An own open record naming a pane that is gone still outranks the
+        // pin: it says the session is not in `A`.
+        assert_eq!(
+            resolve_two_panes(&index, &[bound("C", "gone")], CLAUDE_ROW),
+            None
+        );
         // With no record, the pin is still the answer.
         assert_eq!(
             resolve_two_panes(&index, &[], CLAUDE_ROW).as_deref(),
@@ -12017,6 +12033,36 @@ mod resolve_local_terminal_tests {
             ),
             None
         );
+    }
+
+    /// Two live panes sharing one shell mirror row (two same-titled tabs in one
+    /// cwd resume one pane-store row) resolve nothing, rather than whichever
+    /// pane the snapshot lists first.
+    #[test]
+    fn a_shell_row_shared_by_two_live_panes_resolves_nothing() {
+        let shared = resolve_coord_terminal_id(
+            [("A", "", Some(SHELL_ROW)), ("B", "", Some(SHELL_ROW))].into_iter(),
+            |_| None,
+            Vec::new,
+            |_| None,
+            SHELL_ROW,
+        );
+        assert_eq!(shared, None);
+    }
+
+    /// An empty Claude id from the registrar names no pane — not every
+    /// unpinned one.
+    #[test]
+    fn an_empty_claude_id_resolves_nothing() {
+        let index = HashMap::from([(CLAUDE_ROW, String::new())]);
+        let resolved = resolve_coord_terminal_id(
+            [("B", "", None)].into_iter(),
+            |c| index.get(c).cloned(),
+            Vec::new,
+            |_| None,
+            CLAUDE_ROW,
+        );
+        assert_eq!(resolved, None);
     }
 
     /// After `/clear` the pane runs a successor `D` adopted from `C`; `C`'s
