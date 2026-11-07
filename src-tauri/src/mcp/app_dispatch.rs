@@ -15,8 +15,11 @@
 //!   `dispatch_active` for proxy handlers that target a raw URL path the
 //!   wrapper SDK does not relay (`/health`, `/capabilities`, `/auto/...`).
 //!
-//! All three return a normalized `serde_json::Value` on success. Errors map
-//! to `DispatchError` variants suitable for embedding into an
+//! `dispatch` and `dispatch_active` return a [`Dispatched`], which keeps the
+//! transport that answered, because the two transports answer in different
+//! shapes; each consumer picks its normalization. `dispatch_active_http` is
+//! HTTP-only and returns the body as a plain `serde_json::Value`. Errors map to
+//! `DispatchError` variants suitable for embedding into an
 //! `{success:false, error}` response.
 
 use std::sync::Arc;
@@ -143,6 +146,129 @@ impl DispatchError {
 /// Matches the legacy `sdk_request` cache window.
 const RESPONSIVENESS_CACHE_MS: i64 = 10_000;
 
+/// A dispatch's answer, tagged with the transport that produced it.
+///
+/// The two arms answer in DIFFERENT SHAPES, and that difference is why the
+/// tag exists. The HTTP arm returns the SDK server's body verbatim: its
+/// `{success, data, …}` API envelope. The WebSocket arm returns the wrapper's
+/// bare `result`, with no envelope at all. A proxy that forwards "the answer"
+/// without knowing which arm produced it therefore hands a WS-transport app's
+/// caller a body with no `success` key, which a strict reader (`success ===
+/// true`) must, correctly, read as a failure. [`Self::into_envelope`] is the
+/// one normalization for a read, [`Self::into_action_envelope`] the one for an
+/// action, and [`Self::into_raw`] is for internal consumers that parse the
+/// payload themselves.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Dispatched {
+    /// The wrapper's bare `result` from the relay.
+    Websocket(serde_json::Value),
+    /// The SDK server's HTTP response body, verbatim.
+    Http(serde_json::Value),
+}
+
+impl Dispatched {
+    /// The answer in the HTTP arm's `{success, data}` envelope shape.
+    pub fn into_envelope(self) -> serde_json::Value {
+        match self {
+            Self::Http(body) => body,
+            Self::Websocket(result) => ws_result_envelope(result),
+        }
+    }
+
+    /// The answer to an ACTION in the `{success, data}` envelope shape.
+    ///
+    /// Same as [`Self::into_envelope`], except that the WebSocket arm's bare
+    /// result is read with the strict action reader first
+    /// ([`ws_action_result_envelope`]): a result with no boolean `success`
+    /// (or no result at all) is an INDETERMINATE failure, never the
+    /// `success: true` [`ws_result_envelope`] defaults a READ to.
+    pub fn into_action_envelope(self) -> serde_json::Value {
+        match self {
+            Self::Http(body) => body,
+            Self::Websocket(result) => ws_action_result_envelope(result),
+        }
+    }
+
+    /// The body as the transport delivered it, unnormalized.
+    pub fn into_raw(self) -> serde_json::Value {
+        match self {
+            Self::Http(body) | Self::Websocket(body) => body,
+        }
+    }
+}
+
+/// Wrap a WebSocket wrapper's bare `result` in the `{success, data}` envelope
+/// the HTTP arm answers with.
+///
+/// The relay only resolves `Ok` when the wrapper's frame said `success:
+/// true`, so the COMMAND succeeded. But some commands return an outcome object
+/// of their own (an element action's `{success: false, error}`); its
+/// `success` is the answer's, so it is lifted, never overwritten by the
+/// command-level `true`. `data` is the handler's whole result.
+///
+/// Two shapes are not the bare result this assumes:
+/// - a result that is ALREADY an envelope (a boolean `success` beside a
+///   `data` key — wrappers may answer either way) passes through as it is,
+///   so it is never nested a second time;
+/// - a result that is NOTHING BUT an error report — no boolean `success`, a
+///   non-empty string `error`, and no keys beyond `error`, `timestamp`,
+///   `code` and `errorCode` (an in-page read handler's
+///   `{error: "Clipboard access denied", timestamp}`) — is a failed read,
+///   answered `success: false`. A payload that merely CARRIES an `error`
+///   beside its data (a tracked network request whose fetch failed) is a
+///   successful read of that data and is wrapped like any other.
+pub fn ws_result_envelope(result: serde_json::Value) -> serde_json::Value {
+    let explicit = result.get("success").and_then(serde_json::Value::as_bool);
+    if explicit.is_some() && result.get("data").is_some() {
+        return result;
+    }
+    const ERROR_REPORT_KEYS: [&str; 4] = ["error", "timestamp", "code", "errorCode"];
+    let bare_error = explicit.is_none()
+        && result.as_object().is_some_and(|obj| {
+            obj.keys().all(|k| ERROR_REPORT_KEYS.contains(&k.as_str()))
+                && obj
+                    .get("error")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|e| !e.trim().is_empty())
+        });
+    let inner_success = if bare_error { Some(false) } else { explicit };
+    // On a failed outcome, the keys a caller branches on travel to the top
+    // level, where the HTTP arm carries them: the prose `error` and the
+    // machine-readable `code` / `errorCode`.
+    let lifted: Vec<(String, serde_json::Value)> = if inner_success == Some(false) {
+        ["error", "code", "errorCode"]
+            .into_iter()
+            .filter_map(|k| result.get(k).map(|v| (k.to_string(), v.clone())))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let mut env = serde_json::json!({
+        "success": inner_success.unwrap_or(true),
+        "data": result,
+    });
+    if let Some(obj) = env.as_object_mut() {
+        for (k, v) in lifted {
+            obj.insert(k, v);
+        }
+    }
+    env
+}
+
+/// [`ws_result_envelope`] for an ACTION's result.
+///
+/// A read's bare result (an element list, a snapshot) carries no `success`
+/// of its own, so the envelope defaults it to the command-level `true`. An
+/// action's result is an OUTCOME, and an outcome that does not say it
+/// succeeded did not demonstrably succeed: it is normalized by the one strict
+/// action reader ([`crate::mcp::ui_bridge::request::normalize_action_result`])
+/// first, so a `null` result or one with no boolean `success` arrives as
+/// `success: false` with the `INDETERMINATE:` error, never as success.
+pub fn ws_action_result_envelope(result: serde_json::Value) -> serde_json::Value {
+    let (normalized, _) = crate::mcp::ui_bridge::request::normalize_action_result(result);
+    ws_result_envelope(normalized)
+}
+
 /// A reusable wrapper bundling the registry + relay + http client so handlers
 /// can inject one `Arc<AppDispatcher>` via `ApiState`.
 pub struct AppDispatcher {
@@ -182,7 +308,7 @@ impl AppDispatcher {
         http_method: Method,
         http_path: &str,
         payload: serde_json::Value,
-    ) -> Result<serde_json::Value, DispatchError> {
+    ) -> Result<Dispatched, DispatchError> {
         // `get_live`, not `get`: the registry retains an expired row for its
         // reservation window so the id stays held for its owner, and routing
         // must not follow a row that stopped heartbeating.
@@ -242,7 +368,9 @@ impl AppDispatcher {
                     .touch(app_id, entry.websocket_conn_id, &entry.principal)
                     .await;
                 let response = self.command_relay.dispatch(app_id, action, payload).await?;
-                Ok(response.result.unwrap_or(serde_json::Value::Null))
+                Ok(Dispatched::Websocket(
+                    response.result.unwrap_or(serde_json::Value::Null),
+                ))
             }
             AppTransport::Http => {
                 let base = entry.app.url.trim_end_matches('/');
@@ -289,7 +417,8 @@ impl AppDispatcher {
                         body,
                     });
                 }
-                json.ok_or_else(|| DispatchError::InvalidJson(body))
+                json.map(Dispatched::Http)
+                    .ok_or_else(|| DispatchError::InvalidJson(body))
             }
         }
     }
@@ -473,7 +602,7 @@ impl AppDispatcher {
         http_method: Method,
         http_path: &str,
         payload: serde_json::Value,
-    ) -> Result<serde_json::Value, DispatchError> {
+    ) -> Result<Dispatched, DispatchError> {
         // 1. Snapshot the active connection. Drop the lock before any await
         //    on a remote — responsiveness probe + HTTP request must not pin
         //    the manager Mutex.
@@ -503,7 +632,9 @@ impl AppDispatcher {
                     .command_relay
                     .dispatch(&app_id, action, payload)
                     .await?;
-                return Ok(response.result.unwrap_or(serde_json::Value::Null));
+                return Ok(Dispatched::Websocket(
+                    response.result.unwrap_or(serde_json::Value::Null),
+                ));
             }
         }
 
@@ -519,6 +650,7 @@ impl AppDispatcher {
             payload,
         )
         .await
+        .map(Dispatched::Http)
     }
 }
 
@@ -609,7 +741,13 @@ mod tests {
             .await;
 
         let out = handle.await.unwrap().unwrap();
-        assert_eq!(out, json!({"ok": true}));
+        assert_eq!(out, Dispatched::Websocket(json!({"ok": true})));
+        // The WS arm's bare result is normalized to the HTTP arm's envelope.
+        assert_eq!(
+            out.clone().into_envelope(),
+            json!({"success": true, "data": {"ok": true}})
+        );
+        assert_eq!(out.into_raw(), json!({"ok": true}));
     }
 
     fn manager_with_active(
@@ -703,7 +841,13 @@ mod tests {
             .await;
 
         let out = handle.await.unwrap().unwrap();
-        assert_eq!(out, json!({"ok": true}));
+        assert_eq!(out, Dispatched::Websocket(json!({"ok": true})));
+        // The WS arm's bare result is normalized to the HTTP arm's envelope.
+        assert_eq!(
+            out.clone().into_envelope(),
+            json!({"success": true, "data": {"ok": true}})
+        );
+        assert_eq!(out.into_raw(), json!({"ok": true}));
     }
 
     #[tokio::test]
@@ -835,5 +979,172 @@ mod tests {
     fn app_answered_failure_ignores_non_failures() {
         assert!(answered(json!({"success": true, "code": "X"})).is_none());
         assert!(answered(json!({"error": "no success field"})).is_none());
+    }
+
+    #[test]
+    fn ws_result_envelope_wraps_a_bare_object() {
+        assert_eq!(
+            ws_result_envelope(json!({"elements": []})),
+            json!({"success": true, "data": {"elements": []}})
+        );
+    }
+
+    #[test]
+    fn ws_result_envelope_of_null_is_a_success_with_null_data() {
+        assert_eq!(
+            ws_result_envelope(serde_json::Value::Null),
+            json!({"success": true, "data": null})
+        );
+    }
+
+    /// An outcome object's own `success: false` is lifted with its error and
+    /// codes, and the object stays as `data`; it is never overwritten by the
+    /// command-level success.
+    #[test]
+    fn ws_result_envelope_lifts_a_failed_outcome() {
+        assert_eq!(
+            ws_result_envelope(json!({
+                "success": false, "error": "gone", "code": "ELEMENT_NOT_FOUND", "errorCode": "E404"
+            })),
+            json!({
+                "success": false,
+                "error": "gone",
+                "code": "ELEMENT_NOT_FOUND",
+                "errorCode": "E404",
+                "data": {
+                    "success": false, "error": "gone", "code": "ELEMENT_NOT_FOUND", "errorCode": "E404"
+                }
+            })
+        );
+    }
+
+    /// A body with its own `success: true` is still wrapped, so `data` is the
+    /// handler's result on every path, and a `code` on a success is payload.
+    #[test]
+    fn ws_result_envelope_wraps_an_explicit_success_and_lifts_nothing() {
+        assert_eq!(
+            ws_result_envelope(json!({"success": true, "code": "x", "error": "stale"})),
+            json!({
+                "success": true,
+                "data": {"success": true, "code": "x", "error": "stale"}
+            })
+        );
+    }
+
+    /// A non-boolean `success` is not an outcome: a READ defaults to the
+    /// command-level `true` and lifts nothing.
+    #[test]
+    fn ws_result_envelope_ignores_a_non_boolean_success() {
+        let out = ws_result_envelope(json!({"success": "no", "code": "x"}));
+        assert_eq!(out["success"], json!(true));
+        assert!(out.get("code").is_none(), "{out}");
+    }
+
+    /// An in-page read handler that fails answers a bare `{error}` with no
+    /// `success` (ui-bridge `commandHandlers.ts` `getClipboard`,
+    /// `getElementStyles`): that is a failed read, not a successful one.
+    #[test]
+    fn ws_result_envelope_reads_a_bare_error_as_a_failure() {
+        let out = ws_result_envelope(json!({"error": "Clipboard access denied", "timestamp": 1}));
+        assert_eq!(out["success"], json!(false), "{out}");
+        assert_eq!(out["error"], json!("Clipboard access denied"));
+        assert_eq!(out["data"]["timestamp"], json!(1));
+        // A payload that carries an `error` beside real data is a successful
+        // read of that data: in-page `getNetworkRequest` answers a
+        // `TrackedRequest` whose `error` is the tracked fetch's failure.
+        let tracked = json!({
+            "id": "req-1", "url": "/api/x", "method": "GET",
+            "error": "Failed to fetch", "inFlight": false
+        });
+        let out = ws_result_envelope(tracked.clone());
+        assert_eq!(out["success"], json!(true), "{out}");
+        assert!(out.get("error").is_none(), "{out}");
+        assert_eq!(out["data"], tracked);
+        // `code` / `errorCode` belong to an error report and are lifted.
+        let out = ws_result_envelope(json!({"error": "denied", "code": "E_PERM", "errorCode": 7}));
+        assert_eq!(out["success"], json!(false), "{out}");
+        assert_eq!(out["code"], json!("E_PERM"));
+        assert_eq!(out["errorCode"], json!(7));
+        // A non-boolean `success` beside an `error` is not an error report.
+        let out = ws_result_envelope(json!({"success": "no", "error": "x"}));
+        assert_eq!(out["success"], json!(true), "{out}");
+        // A whitespace-only `error` is blank.
+        assert_eq!(
+            ws_result_envelope(json!({"error": "  "}))["success"],
+            json!(true)
+        );
+        // A blank or non-string `error` is payload, not a failure.
+        assert_eq!(
+            ws_result_envelope(json!({"error": ""}))["success"],
+            json!(true)
+        );
+        assert_eq!(
+            ws_result_envelope(json!({"error": null}))["success"],
+            json!(true)
+        );
+    }
+
+    /// A wrapper that already answers `{success, data}` is passed through,
+    /// never nested a second time (`ws_collect_components` documents that
+    /// wrappers may answer either way).
+    #[test]
+    fn ws_result_envelope_passes_an_existing_envelope_through() {
+        let env = json!({"success": true, "data": {"elements": [1]}});
+        assert_eq!(ws_result_envelope(env.clone()), env);
+        let failed = json!({"success": false, "error": "no", "data": null});
+        assert_eq!(ws_result_envelope(failed.clone()), failed);
+    }
+
+    #[test]
+    fn ws_action_result_envelope_of_null_is_indeterminate() {
+        use crate::mcp::ui_bridge::request::INDETERMINATE_ACTION_ERROR;
+        let env = ws_action_result_envelope(serde_json::Value::Null);
+        assert_eq!(env["success"], json!(false), "{env}");
+        assert_eq!(env["error"], json!(INDETERMINATE_ACTION_ERROR), "{env}");
+    }
+
+    #[test]
+    fn ws_action_result_envelope_without_a_boolean_success_is_indeterminate() {
+        use crate::mcp::ui_bridge::request::INDETERMINATE_ACTION_ERROR;
+        for bare in [json!({"elementId": "x"}), json!({"success": "yes"})] {
+            for env in [
+                ws_action_result_envelope(bare.clone()),
+                Dispatched::Websocket(bare.clone()).into_action_envelope(),
+            ] {
+                assert_eq!(env["success"], json!(false), "{bare} -> {env}");
+                assert_eq!(
+                    env["error"],
+                    json!(INDETERMINATE_ACTION_ERROR),
+                    "{bare} -> {env}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ws_action_result_envelope_keeps_an_explicit_outcome() {
+        assert_eq!(
+            ws_action_result_envelope(json!({"success": true, "elementId": "x"})),
+            json!({"success": true, "data": {"success": true, "elementId": "x"}})
+        );
+        let failed = ws_action_result_envelope(json!({"success": false, "error": "nope"}));
+        assert_eq!(failed["success"], json!(false));
+        assert_eq!(failed["error"], json!("nope"));
+    }
+
+    /// The HTTP arm's body is the SDK's own envelope, forwarded verbatim by
+    /// every normalization, even one with no `success` of its own.
+    #[test]
+    fn the_http_arm_is_verbatim_through_every_normalization() {
+        for body in [
+            json!({"success": true, "data": {"success": true}}),
+            json!({"elements": []}),
+            serde_json::Value::Null,
+        ] {
+            let d = Dispatched::Http(body.clone());
+            assert_eq!(d.clone().into_envelope(), body);
+            assert_eq!(d.clone().into_action_envelope(), body);
+            assert_eq!(d.into_raw(), body);
+        }
     }
 }

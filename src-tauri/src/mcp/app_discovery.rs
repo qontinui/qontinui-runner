@@ -1182,7 +1182,7 @@ async fn dispatch_to_app_inner(
         .dispatch(app_id, &req.action, Method::POST, "/dispatch", payload)
         .await
     {
-        Ok(data) => (StatusCode::OK, ApiResponse::success(data)),
+        Ok(data) => (StatusCode::OK, ApiResponse::success(data.into_raw())),
         Err(DispatchError::NotRegistered(_)) => (
             StatusCode::NOT_FOUND,
             ApiResponse::error("app not registered"),
