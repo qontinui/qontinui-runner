@@ -1120,8 +1120,10 @@ pub enum RetainedReason {
 }
 
 impl RetainedReason {
-    /// True for the arms where the pass meant to remove a shipped copy and did
-    /// not; a deliberate keep is not one.
+    /// True for the arms that degrade the pass: the copy could not be read, a
+    /// shipped copy could not be removed or sits behind a symlink, or the
+    /// tracked-file probe could not answer. A deliberate keep (locally modified,
+    /// or tracked) is not one.
     #[must_use]
     pub fn is_failure(&self) -> bool {
         match self {
@@ -1167,7 +1169,7 @@ impl RetainedReason {
 }
 
 /// A RETIRED unit a pass found on disk and left there, so the retired
-/// definition still resolves in that workdir.
+/// definition may still resolve in that workdir.
 ///
 /// Kept apart from [`SkippedUnit`] on purpose: a skip says the session did not
 /// get something it should have, while this says the session still HAS
@@ -1437,8 +1439,8 @@ impl ProvisionReport {
             .collect::<Vec<_>>();
         if !stuck.is_empty() {
             notes.push(format!(
-                "{} retired unit(s) still present and still resolvable — the spawn \
-                 continued regardless (fail-soft by contract): {}",
+                "{} retired unit(s) the pass could not remove, which may still resolve — \
+                 the spawn continued regardless (fail-soft by contract): {}",
                 stuck.len(),
                 stuck.join("; ")
             ));
@@ -2690,9 +2692,9 @@ mod tests {
         assert_eq!(
             report.observation().note.as_deref(),
             Some(
-                "1 retired unit(s) still present and still resolvable — the spawn continued \
-                 regardless (fail-soft by contract): stuck.md (removal failed: permission \
-                 denied)"
+                "1 retired unit(s) the pass could not remove, which may still resolve — the \
+                 spawn continued regardless (fail-soft by contract): stuck.md (removal \
+                 failed: permission denied)"
             )
         );
         let summary = report.summary();
@@ -3315,8 +3317,9 @@ mod tests {
 
         // The four session-provisioning rows are conditional for the same
         // reason: other modules' tests record them without this module's store
-        // lock (`agent_runtime`'s subagent tests, `mcp_api`'s provision probe,
-        // `agent_worktree::isolated_edit`'s command and skill tests), so a
+        // lock (e.g. `agent_runtime`'s subagent tests, `mcp_api`'s provision
+        // probe, `agent_worktree::isolated_edit`'s and `served_corpus`'s command
+        // and skill tests; the list is not exhaustive), so a
         // parallel run can leave a real arm. Either way unknown NAMES the anchor
         // and anything else is a rung the provisioner can emit.
         for id in [

@@ -10446,7 +10446,8 @@ fn provision_agent_definitions_retiring(
     capability_manifest::record_provision(worktree_cwd, embedded_report);
 
     // CHECKOUT WINS: the operator's live copies are overlaid on top, so editing
-    // qontinui-claude-config/.claude/agents behaves exactly as before.
+    // qontinui-claude-config/.claude/agents behaves as before, except that a
+    // retired definition is never overlaid.
     // An overlay that errored still gets the retirement pass below, so its
     // error becomes an errored report rather than an early return.
     let mut report =
@@ -10471,9 +10472,10 @@ fn provision_agent_definitions_retiring(
     // RETIRED LAST. A definition this binary retired stopped shipping when its
     // file left the bundle, but a copy an older binary or a checkout overlay
     // wrote is still on disk, so it is removed here when its blob is one the
-    // definition shipped as. Running after BOTH layers also removes a copy a
-    // stale checkout overlay rewrote a moment ago, and it runs whether the
-    // checkout answered, was absent or errored, because a device with no
+    // definition shipped as. Neither layer writes a retired name (none is
+    // bundled, and the overlay skips them), so the pass judges only copies that
+    // were already on disk. It runs whether the checkout answered, was absent
+    // or errored, because a device with no
     // checkout is exactly where an older binary's embedded copy sits (the
     // no-root arm of `provision_agent_definitions` runs it as well). `keep`
     // was decided before either layer wrote, so a tracked copy stays.
@@ -10488,9 +10490,11 @@ fn provision_agent_definitions_retiring(
 
 /// The checkout overlay of [`provision_agent_definitions_retiring`]: copy every
 /// `*.md` from `src_dir` (the operator's qontinui-claude-config agents) into
-/// `dst_dir` over the embedded floor, except the definitions `keep` keeps.
-/// `embedded` is how many defaults the floor wrote, for the log line and the
-/// report's detail. No checkout dir is the `unresolved` report naming the
+/// `dst_dir` over the embedded floor, except the definitions `keep` keeps and
+/// every name `retired` lists: a checkout that still holds a retired definition
+/// (stale, or on a branch that edited it) must not hand it to a session, so it is
+/// skipped and named in the report's detail. `embedded` is how many defaults the
+/// floor wrote, for the log line and the report's detail. No checkout dir is the `unresolved` report naming the
 /// embedded defaults that stand in, not an error.
 fn overlay_checkout_agent_definitions(
     src_dir: &Path,
@@ -10500,6 +10504,7 @@ fn overlay_checkout_agent_definitions(
     retired: &[&str],
 ) -> anyhow::Result<ProvisionReport> {
     let retired_names = crate::fleet_agents::retired_agent_names(retired);
+    let mut not_overlaid = Vec::new();
     if !src_dir.is_dir() {
         warn!(
             "agent_runtime: no claude-config agents dir at {}; keeping the \
@@ -10565,6 +10570,7 @@ fn overlay_checkout_agent_definitions(
                 "agent_runtime: not overlaying retired {} from the checkout",
                 path.display()
             );
+            not_overlaid.push(unit);
             continue;
         }
         let dst = dst_dir.join(name);
@@ -10598,10 +10604,18 @@ fn overlay_checkout_agent_definitions(
         "agent_runtime: overlaid {copied} checkout subagent def(s) onto {embedded} embedded default(s) in {}",
         dst_dir.display()
     );
-    report = report.with_detail(format!(
+    let mut detail = format!(
         "overlaid onto {embedded} embedded default(s) from {}",
         src_dir.display()
-    ));
+    );
+    if !not_overlaid.is_empty() {
+        not_overlaid.sort();
+        detail.push_str(&format!(
+            "; not overlaid (retired): {}",
+            not_overlaid.join(", ")
+        ));
+    }
+    report = report.with_detail(detail);
     if report.written == 0 {
         // The checkout was present but supplied nothing usable — `unresolved`
         // rather than `operator_checkout`, which would claim it answered.
@@ -14926,6 +14940,14 @@ mod tests {
                 "nothing retired was on disk, so nothing is removed or kept: {}",
                 report.summary()
             );
+            assert!(
+                report
+                    .detail
+                    .as_deref()
+                    .is_some_and(|d| d.ends_with("; not overlaid (retired): retired-agent.md")),
+                "the skipped checkout copy is named: {:?}",
+                report.detail
+            );
             assert!(dst.join("merge-specialist.md").is_file());
         }
 
@@ -15037,7 +15059,53 @@ mod tests {
         assert!(report.removed.is_empty() && report.retained_retired.is_empty());
     }
 
-    /// A copy that cannot be read is kept, named as still present, and the
+    /// The delete path trusts no name: a retired entry that is not exactly one
+    /// plain file name is ignored, so a shipped copy it would reach outside the
+    /// agents directory survives and nothing is recorded.
+    #[test]
+    fn retire_agent_definitions_ignore_a_name_that_is_not_a_plain_file_name() {
+        let (body, line) = retired_fixture();
+        let blob = crate::provenance::git_blob_id(body.as_bytes());
+        let (wt, _dst) = workdir_with(&[]);
+        let outside = wt.path().join(".claude").join("retired-agent.md");
+        std::fs::write(&outside, body).unwrap();
+        let escaping = format!("../retired-agent.md {blob}");
+        let nested = format!("sub/retired-agent.md {blob}");
+        let mut report = ProvisionReport::new(
+            "agent_definitions",
+            0,
+            crate::capability_manifest::Rung::OperatorCheckout,
+        );
+
+        retire_agent_definitions(
+            &wt.path().to_string_lossy(),
+            &[escaping.as_str(), nested.as_str()],
+            &mut report,
+        );
+
+        assert!(
+            outside.is_file(),
+            "a copy outside the agents directory must survive"
+        );
+        assert!(
+            report.removed.is_empty() && report.retained_retired.is_empty(),
+            "{}",
+            report.summary()
+        );
+        // The well-formed line still works in the same pass shape.
+        std::fs::write(
+            wt.path()
+                .join(".claude")
+                .join("agents")
+                .join("retired-agent.md"),
+            body,
+        )
+        .unwrap();
+        retire_agent_definitions(&wt.path().to_string_lossy(), &[line.as_str()], &mut report);
+        assert_eq!(report.removed.len(), 1, "{:?}", report.removed);
+    }
+
+    /// A copy that cannot be read is kept, named as not removed, and the
     /// pass reads degraded. A directory in the file's place is unreadable as a
     /// file on every platform and for every user.
     #[test]
@@ -15070,7 +15138,8 @@ mod tests {
         );
         let note = report.observation().note.unwrap_or_default();
         assert!(
-            note.contains("retired unit(s) still present") && !note.contains("write failed"),
+            note.contains("retired unit(s) the pass could not remove")
+                && !note.contains("write failed"),
             "the note must say the retired file is still there, not that a write failed: {note}"
         );
     }
