@@ -9194,9 +9194,9 @@ mod tests {
     fn env_u64_falls_back_on_unparseable() {
         let _env_lock = env_lock();
         let var = "__COORD_SYNC_TEST_ENV_U64";
+        let _restore = crate::test_env::EnvVarRestore::capture(&[var]);
         std::env::set_var(var, "not-a-number");
         assert_eq!(env_u64(var, 42), 42);
-        std::env::remove_var(var);
     }
 
     // -----------------------------------------------------------------
