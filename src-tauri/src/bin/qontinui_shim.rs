@@ -23,6 +23,9 @@
 //! - **Recursion guard.** `QONTINUI_INSTALL_INTERCEPT_GUARD=1` already set ⇒
 //!   pure passthrough (no runner contact); the guard is set on the real-tool
 //!   child so an install script that re-invokes the tool does not re-enter.
+//!   IDENTITY mode widens this to every nested call (see below); the install
+//!   straddle deliberately does not, because an install an agent runs from
+//!   its own tool environment is exactly what the install gate exists for.
 //! - **Short connect timeout.** The pre-call uses a 3s connect timeout (plan §4
 //!   Phase 4) via a dependency-free `std::net` HTTP/1.1 POST — no `reqwest`
 //!   (heavy/async, wrong for a tiny synchronous stub) and no extra crates.
@@ -43,8 +46,10 @@
 //! When `argv[0]`'s stem is `claude` or `gemini` this binary runs the always-on
 //! session-restore IDENTITY straddle instead of the install straddle, mirroring
 //! `resources/intercept/identity_shim.cmd`: resolve the REAL provider outside
-//! our own dir(s), honor the recursion guard, deliver the claude `--settings`
-//! hook, best-effort POST `/control/session-open`, and append
+//! our own dir(s), pass a NESTED call through untouched (the recursion guard,
+//! or a Claude Code session marker inherited from a `claude` ancestor — see
+//! [`run_identity`]), deliver the claude `--settings` hook, best-effort POST
+//! `/control/session-open`, and append
 //! `--session-id $QONTINUI_PINNED_SESSION_ID` unless the user already chose a
 //! session. It exists as a NATIVE exe because a `.cmd` batch shim is launched
 //! via cmd.exe, which CANNOT accept multi-line (or cmd-metachar) arguments —
@@ -321,12 +326,17 @@ pub fn identity_settings_args(tool: IdentityTool, settings_path: Option<&str>) -
 /// carrier the policy body rode. The marker tells the runner's SessionStart
 /// policy hook that the body is already in this session's system prompt, so the
 /// hook sends a short confirmation instead of the body. It is inherited by
-/// every descendant process, and this shim is exactly what delivers the hook
-/// (`--settings`) to a NESTED `claude` typed inside a session; keeping the
-/// marker there would tell that nested session it holds a body it was never
-/// given — including a nested `claude --append-system-prompt-file ./eval.md`,
-/// whose file is not the composed one. So everything else drops it. No
-/// inherited file, or Gemini (no such flag), never keeps it.
+/// every descendant process, and this shim delivers the hook (`--settings`)
+/// to every launch that reaches the straddle; keeping the marker there would
+/// tell that session it holds a body it was never given — including a
+/// `claude --append-system-prompt-file ./eval.md` typed into the pane, whose
+/// file is not the composed one. So everything else drops it. No inherited
+/// file, or Gemini (no such flag), never keeps it.
+///
+/// A NESTED call never reaches this: [`run_identity`] passes it through
+/// untouched before any flag is computed, so it receives no hook from this
+/// shim and the pair it inherits is read by nothing the runner delivers to it
+/// (a caller that passes the carrier itself passes the pair along with it).
 ///
 /// A launch whose argv also carries a REPLACEMENT prompt (`--system-prompt` /
 /// `--system-prompt-file`, either spelling, ahead of `--`) never keeps it
@@ -580,14 +590,34 @@ pub fn identity_argv(
 
 /// The identity straddle, fail-open at every step. Returns the exit code to
 /// propagate. Mirrors `identity_shim.cmd`:
-/// resolve real → guard passthrough → settings/user-chose scan → best-effort
-/// confirmation POST → exec real with the composed argv.
+/// resolve real → nested-call passthrough → settings/user-chose scan →
+/// best-effort confirmation POST → exec real with the composed argv.
+///
+/// A NESTED call — a `claude`/`gemini` run from inside another session's tool
+/// call — is passed through with its original argv and nothing else: no pin,
+/// no `--settings`, no `--mcp-config`, no self-provision mint, no beacon, no
+/// session-open. Everything the straddle adds is the PANE's identity, and a
+/// nested call that received it rebound the pane and its coord row to itself
+/// (plan `2026-11-06-nested-claude-rebinds-its-parent-pane`). Nested means the
+/// recursion guard is set, OR a Claude Code session marker is PRESENT (empty
+/// included) — the runner's one reading of them,
+/// [`qontinui_runner_lib::claude_env::inherited_session_markers`]. The guard
+/// alone misses most panes: the runner launches a pane's `claude` directly
+/// with its own `--settings` (`session/claude_hook.rs`
+/// `direct_spawn_settings_args`), so no shim set the guard there, while Claude
+/// Code sets both markers in its tool environment. Every runner spawn site
+/// strips them, so a top-level launch carries neither. The rule covers gemini
+/// too: the marker describes the caller, not the tool.
 fn run_identity(tool: IdentityTool, args: &[String]) -> Option<i32> {
     let own_dirs = own_shim_dirs();
     let real = resolve_real_waiting(tool.program(), &own_dirs, IDENTITY_RESOLVE_WAIT);
 
-    // Recursion guard: a nested invocation never re-pins — pure passthrough.
-    if env::var(GUARD_ENV).ok().as_deref() == Some("1") {
+    // Nested-call passthrough: the recursion guard, or an inherited session
+    // marker. `exec_real` sets the guard on the child, so every descendant of
+    // a nested call is guarded too.
+    if env::var(GUARD_ENV).ok().as_deref() == Some("1")
+        || !qontinui_runner_lib::claude_env::inherited_session_markers().is_empty()
+    {
         return exec_real(&real, tool.program(), args);
     }
 
@@ -605,8 +635,8 @@ fn run_identity(tool: IdentityTool, args: &[String]) -> Option<i32> {
     // above and this is skipped. That idempotence is STRUCTURAL, which is why
     // there is deliberately no out-of-process `workdir_declares_coord_mcp`
     // re-check here: one mint per launch, no nonce race, no double coord-mcp
-    // entry. The recursion guard already returned above, so a nested invocation
-    // never reaches this either.
+    // entry. The nested-call passthrough already returned above, so a nested
+    // invocation (guard or session marker) never reaches this either.
     //
     // Bind the TempPath to a local that outlives `exec_real` below: it deletes
     // on drop, and dropping it early would yank a live credential file out from
@@ -1844,10 +1874,11 @@ mod tests {
 
     /// The policy marker survives ONLY on a claude launch that passes the
     /// COMPOSED file (the inherited `QONTINUI_POLICY_DELIVERED_FILE`) to the
-    /// file carrier, in either spelling. A nested `claude` typed inside a
-    /// session inherits the marker but not the body — bare, inline, or with a
-    /// file of its own — so it must lose it, or the policy hook would skip a
-    /// body that session never received.
+    /// file carrier, in either spelling. Any other launch the straddle hands
+    /// the hook to inherits the marker but not the body — bare, inline, or
+    /// with a file of its own — so it must lose it, or the policy hook would
+    /// skip a body that session never received. (A nested call never gets
+    /// here: `run_identity` passes it through before any flag.)
     #[test]
     fn policy_delivered_sha_is_kept_only_for_the_exact_composed_file() {
         let composed = Some("/x/spawn-1.md");
@@ -1877,7 +1908,7 @@ mod tests {
             ));
         }
 
-        // A nested claude with its OWN file, either spelling: dropped.
+        // A launch with its OWN file, either spelling: dropped.
         let own = strs(&["-p", "--append-system-prompt-file", "./eval.md"]);
         let own_attached = strs(&["--append-system-prompt-file=./eval.md"]);
         assert!(!keeps_policy_delivered_sha(
@@ -2443,17 +2474,23 @@ mod tests {
             realbin.display(),
             env::var("PATH").unwrap_or_default()
         );
-        let status = Command::new(shim_dir.join("claude.exe"))
-            .args(["--append-system-prompt", multiline, "--version"])
+        let mut shim = Command::new(shim_dir.join("claude.exe"));
+        shim.args(["--append-system-prompt", multiline, "--version"])
             .env("PATH", &path)
             .env("QONTINUI_E2E_ARGS_OUT", &args_out)
             .env("QONTINUI_PINNED_SESSION_ID", "e2e-pin-1")
             .env_remove("QONTINUI_INSTALL_INTERCEPT_GUARD")
             .env_remove("QONTINUI_INSTALL_INTERCEPT_PORT")
             .env_remove("QONTINUI_INSTALL_INTERCEPT_SHIM_DIR")
-            .env_remove("QONTINUI_CLAUDE_HOOK_SETTINGS")
-            .status()
-            .expect("shim exe must spawn");
+            .env_remove("QONTINUI_CLAUDE_HOOK_SETTINGS");
+        // Run by an agent, this test inherits its Bash tool's Claude Code
+        // session markers, and either one makes the shim a nested-call
+        // passthrough that appends no pin. Strip every one, from the runner's
+        // single list of them.
+        for marker in qontinui_runner_lib::claude_env::INHERITED_SESSION_MARKERS {
+            shim.env_remove(marker);
+        }
+        let status = shim.status().expect("shim exe must spawn");
         assert!(status.success(), "shim must propagate the fake's exit 0");
 
         let recorded = std::fs::read_to_string(&args_out).expect("fake provider must have run");

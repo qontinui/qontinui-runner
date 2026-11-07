@@ -21,8 +21,22 @@
 #     shell must NEVER be bricked by session-restore being unavailable.
 #   * TRANSPARENT: stdio is inherited (exec), so the provider sees its TTY and
 #     the user sees byte-identical output + exit code.
-#   * RECURSION-GUARD: QONTINUI_INSTALL_INTERCEPT_GUARD=1 already set -> pure
-#     passthrough (a nested invocation, e.g. a subagent, must not re-pin).
+#   * NESTED-CALL PASSTHROUGH: a nested invocation -- a `claude` run from
+#     inside another session's tool call, e.g. a subagent's probe -- is a pure
+#     passthrough: its own argv only, no --session-id, no --settings, no
+#     --mcp-config, no beacon, no session-open. Everything this shim adds is
+#     the PANE's identity, and a nested call that received it rebound the pane
+#     and its coord row to itself (plan
+#     2026-11-06-nested-claude-rebinds-its-parent-pane). Nested means EITHER
+#     the recursion guard QONTINUI_INSTALL_INTERCEPT_GUARD=1 (set by a shim on
+#     the tool it launched) OR a Claude Code session marker -- CLAUDECODE or
+#     CLAUDE_CODE_CHILD_SESSION, present even when empty -- inherited from a
+#     claude ancestor. The guard alone misses most panes: the runner launches
+#     a pane's claude DIRECTLY, with its own --settings
+#     (`session/claude_hook.rs` `direct_spawn_settings_args`), so no shim ever
+#     set the guard there, while Claude Code sets both markers in its own tool
+#     environment. Every runner spawn site strips both markers
+#     (`claude_env.rs`), so a top-level launch carries neither.
 #   * DON'T DOUBLE-PIN: if the user already passed --session-id/--resume (or the
 #     resume subcommand), do NOT append our id — their explicit choice wins.
 #   * BOUNDED RESOLVE WAIT: a real tool that is momentarily ABSENT, or is
@@ -202,8 +216,14 @@ exec_real() {
   QONTINUI_INSTALL_INTERCEPT_GUARD=1 PATH="$newpath" exec "$TOOL" "$@"
 }
 
-# Recursion guard: a nested invocation is a pure passthrough — never re-pin.
-if [ "${QONTINUI_INSTALL_INTERCEPT_GUARD:-}" = "1" ]; then
+# Nested-call passthrough (the NESTED-CALL invariant above): the recursion
+# guard, or an inherited Claude Code session marker. `${NAME+x}` is non-empty
+# whenever NAME is PRESENT, empty included -- the same reading as the runner's
+# `claude_env::inherited_session_markers`, whose INHERITED_SESSION_MARKERS list
+# a parity test holds this condition to. exec_real sets the guard on the tool
+# it execs, so every descendant of a nested call is guarded as well.
+if [ "${QONTINUI_INSTALL_INTERCEPT_GUARD:-}" = "1" ] \
+    || [ -n "${CLAUDECODE+x}" ] || [ -n "${CLAUDE_CODE_CHILD_SESSION+x}" ]; then
   exec_real "$@"
 fi
 
@@ -259,13 +279,17 @@ done
 # re-sending it; QONTINUI_POLICY_DELIVERED_FILE names the composed file that
 # body rode in. Both are inherited by every descendant, but only a `claude`
 # whose argv passes THAT file to --append-system-prompt-file (either spelling)
-# actually received the body — a nested `claude --append-system-prompt-file
-# ./eval.md` did not. This shim is what delivers the hook (--settings) to a
-# nested `claude` typed inside a session, so it is where an inherited marker
-# must be dropped — otherwise that nested session would be told it has a body
-# it was never given. A REPLACEMENT prompt (--system-prompt[-file], ahead of
-# `--`) drops it too: whether Claude Code still applies the append file beside
-# one is not behaviourally verified, so the rule every path shares withholds it.
+# actually received the body — a `claude --append-system-prompt-file ./eval.md`
+# typed into the pane did not. This shim delivers the hook (--settings) to
+# every launch that gets this far, so it is where an inherited marker must be
+# dropped — otherwise that session would be told it has a body it was never
+# given. A NESTED call never gets this far: it took the passthrough above and
+# receives no hook from this shim, so the pair it keeps is read by nothing the
+# runner delivers to it (a caller that passes the carrier itself passes the
+# inherited pair along with it). A REPLACEMENT prompt (--system-prompt[-file],
+# ahead of `--`) drops it too: whether Claude Code still applies the append
+# file beside one is not behaviourally verified, so the rule every path shares
+# withholds it.
 if [ "$TOOL" = "claude" ]; then
   keep_policy_sha=0
   replacement_prompt=0
@@ -318,8 +342,9 @@ notify_session_open() {
       -d "$body" >/dev/null 2>&1 || true
 }
 
-# Fire-and-forget DIAGNOSTIC beacon on EVERY real shim invocation (even the
-# don't-double-pin passthrough that sends no session-open). Log-only on the
+# Fire-and-forget DIAGNOSTIC beacon on EVERY invocation that gets this far (a
+# nested call has already passed through, silently, above) — even the
+# don't-double-pin passthrough that sends no session-open. Log-only on the
 # runner side — makes "did the shim run for this terminal, and will it deliver
 # --session-id/--settings?" observable in the logs. Never blocks the exec.
 notify_shim_beacon() {

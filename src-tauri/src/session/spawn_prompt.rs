@@ -63,9 +63,11 @@
 //!
 //! The marker travels with [`POLICY_DELIVERED_FILE_ENV`], the composed file's
 //! path, so the identity shims and shell wrappers can keep it ONLY for a
-//! `claude` whose argv passes exactly that file. A nested `claude` inheriting
-//! both — bare, inline, or with an `--append-system-prompt-file` of its own —
-//! loses both.
+//! `claude` whose argv passes exactly that file. Any other `claude` they hand
+//! the runner's hook to — bare, inline, or with an `--append-system-prompt-file`
+//! of its own — loses both. A NESTED `claude` (one started from inside a
+//! session's own tool call) keeps both and needs no drop: the identity shims
+//! pass it through untouched, so it is handed no runner hook to read them.
 //!
 //! ## Spawn-file lifetime
 //!
@@ -103,17 +105,20 @@ pub const RUNNER_CONTEXT_FILE_ENV: &str = "QONTINUI_RUNNER_CONTEXT_FILE";
 /// Env var carrying [`policy_body_sha`] of the policy body a `claude` process
 /// received in its system prompt. Set ONLY on a child that was actually given
 /// the file carrier; the shell wrappers and identity shims blank it for any
-/// child that was not. Forwarded by `claude_policy_hook.sh` to the
-/// policy-context route, which trusts it only when it equals the hash of the
-/// body it just fetched.
+/// child they hand the runner's hook to that was not (a nested call, which the
+/// identity shims pass through untouched, is handed no hook). Forwarded by
+/// `claude_policy_hook.sh` to the policy-context route, which trusts it only
+/// when it equals the hash of the body it just fetched.
 pub const POLICY_DELIVERED_SHA_ENV: &str = "QONTINUI_POLICY_DELIVERED_SHA";
 
 /// Env var carrying the absolute path of the composed file whose policy body
 /// [`POLICY_DELIVERED_SHA_ENV`] names. Set and blanked together with the SHA.
 /// The identity shims and shell wrappers keep the pair for a `claude` only when
 /// its `--append-system-prompt-file` argument (`--flag path` or `--flag=path`)
-/// equals this path; any other launch drops both, so a nested `claude` with a
-/// prompt file of its own is never vouched for.
+/// equals this path; any other launch they hand the runner's hook to drops
+/// both, so a `claude` with a prompt file of its own is never vouched for. A
+/// nested call keeps the pair but is handed no hook at all: the identity shims
+/// pass it through untouched.
 pub const POLICY_DELIVERED_FILE_ENV: &str = "QONTINUI_POLICY_DELIVERED_FILE";
 
 /// Subdirectory of [`claude_hook::session_restore_dir`] holding the composed
@@ -1401,8 +1406,10 @@ mod script_tests {
     }
 
     /// The bash identity shim keeps the marker pair ONLY for a launch that
-    /// passes the composed file itself (either spelling). A nested `claude`
-    /// with its own prompt file, a bare one, or an inline one loses both.
+    /// passes the composed file itself (either spelling). Any other launch it
+    /// straddles — with its own prompt file, a bare one, or an inline one —
+    /// loses both. (The env is cleared, so no session marker makes these runs
+    /// a nested-call passthrough, which keeps the pair and hands over no hook.)
     #[test]
     fn bash_identity_shim_keeps_the_marker_only_for_the_exact_composed_file() {
         let composed = "/rt/spawn-prompts/spawn-0123456789abcdef.md";
