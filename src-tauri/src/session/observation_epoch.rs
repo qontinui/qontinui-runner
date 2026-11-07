@@ -384,9 +384,15 @@ mod tests {
         assert!(fail(&mut st, T + GRACE, T).is_some());
         assert!(matches!(
             starvation_notice(&mut st, true, T + GRACE + 45_000, T),
-            Some(StarvationNotice::Recovered { ticks_skipped: 1, .. })
+            Some(StarvationNotice::Recovered {
+                ticks_skipped: 1,
+                ..
+            })
         ));
-        assert_eq!(starvation_notice(&mut st, true, T + GRACE + 90_000, T), None);
+        assert_eq!(
+            starvation_notice(&mut st, true, T + GRACE + 90_000, T),
+            None
+        );
     }
 
     #[test]
