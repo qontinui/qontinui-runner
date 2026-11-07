@@ -15,9 +15,8 @@ const CONTEXTS_FILE: &str = "contexts.json";
 /// Per-runner for secondary instances — the instance subdirectory is
 /// inserted between `com.qontinui.runner` and `contexts`.
 fn get_contexts_dir() -> Result<PathBuf, String> {
-    let base = dirs::config_dir()
-        .ok_or("Failed to get config directory")?
-        .join("com.qontinui.runner");
+    let base = qontinui_runner_lib::instance_env::runner_config_base()
+        .ok_or("Failed to get config directory")?;
     let app_data_dir = crate::instance::scope_path(&base).join("contexts");
 
     // Create directory if it doesn't exist

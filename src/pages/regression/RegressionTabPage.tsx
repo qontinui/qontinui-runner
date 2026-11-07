@@ -22,6 +22,7 @@ import type { IRDocument } from "@qontinui/shared-types/ui-bridge-ir";
 import { CoveragePanel } from "./CoveragePanel";
 import { RegressionRunPage } from "./RegressionRunPage";
 import { describeThrown } from "@/lib/utils";
+import { getApiBase } from "@/lib/runner-api";
 
 type SubTab = "run" | "coverage";
 
@@ -235,7 +236,7 @@ function SuiteCoverageLoader({ suiteId }: { suiteId: string }): React.JSX.Elemen
     enabled: typeof full?.ir_doc_id === "string" && full.ir_doc_id.length > 0,
     queryFn: async () => {
       const irDocId = full!.ir_doc_id;
-      const resp = await fetch(`http://localhost:9876/spec/page/${encodeURIComponent(irDocId)}`);
+      const resp = await fetch(`${getApiBase()}/spec/page/${encodeURIComponent(irDocId)}`);
       if (!resp.ok) {
         throw new Error(`spec/page returned ${resp.status}`);
       }

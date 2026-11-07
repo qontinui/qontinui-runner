@@ -326,7 +326,12 @@ fn package_dataset_impl(
             .by_index(i)
             .map_err(|e| AppError::ParseError(format!("Failed to read ZIP entry {}: {}", i, e)))?;
 
-        let filename = file.name().to_string();
+        let filename = file
+            .name()
+            .map_err(|e| {
+                AppError::ParseError(format!("Failed to read ZIP entry {} name: {}", i, e))
+            })?
+            .to_string();
         if filename.ends_with(".txt") && filename.contains("labels/") {
             let mut content = String::new();
             file.read_to_string(&mut content)?;

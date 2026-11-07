@@ -132,7 +132,7 @@ describe("applyLayoutAssignments — recorded zones survive restore gaps (item 1
   it("grow path keeps gapped bindings: split → quad after a third tab lands", () => {
     // Auto-grow applies a bigger layout while records own z0/z3; growing
     // must not reshuffle them.
-    expect(computeAutoGrowLayoutId("split", 3)).toBe("quad");
+    expect(computeAutoGrowLayoutId("split", 3, "grid")).toBe("quad");
     const prev = { 0: "claudeA", 3: "claudeB" };
     const next = applyLayoutAssignments(
       prev,
@@ -156,7 +156,7 @@ describe("Phase 1 auto-grow — layout grows to fit live tabs across ALL ingest 
     // Fixed-point iteration (the effect re-keys on layoutId; <= presets.length
     // iterations is plenty and guards against any loop bug).
     for (let i = 0; i < LAYOUT_PRESETS.length; i++) {
-      const next = computeAutoGrowLayoutId(layoutId, tabIds.length);
+      const next = computeAutoGrowLayoutId(layoutId, tabIds.length, "grid");
       if (!next) break;
       layoutId = next;
     }
@@ -167,9 +167,9 @@ describe("Phase 1 auto-grow — layout grows to fit live tabs across ALL ingest 
   it("converges in ONE step (grow-only target = pickLayout, no ping-pong)", () => {
     // The grow target is always `pickLayout(N)` directly, so the first
     // application already reaches the fixed point — a SECOND call returns null.
-    const first = computeAutoGrowLayoutId("single", 9);
+    const first = computeAutoGrowLayoutId("single", 9, "grid");
     expect(first).toBe("full-grid");
-    const second = computeAutoGrowLayoutId(first!, 9);
+    const second = computeAutoGrowLayoutId(first!, 9, "grid");
     expect(second).toBeNull();
   });
 
@@ -188,7 +188,7 @@ describe("Phase 1 auto-grow — layout grows to fit live tabs across ALL ingest 
 
   it("grows into flow-grid past the 9th tab, then self-sizes (no unassigned tabs)", () => {
     // full-grid (9 zones) is full; the 10th tab grows into flow-grid.
-    expect(computeAutoGrowLayoutId("full-grid", 10)).toBe(FLOW_GRID_ID);
+    expect(computeAutoGrowLayoutId("full-grid", 10, "grid")).toBe(FLOW_GRID_ID);
     // In flow-grid the layout carries exactly one zone per live tab.
     for (const n of [10, 13, 20]) {
       const tabIds = Array.from({ length: n }, (_, i) => `t${i}`);
@@ -203,7 +203,7 @@ describe("Phase 1 auto-grow — layout grows to fit live tabs across ALL ingest 
     // Operator chose `split` (2 zones) but 6 tabs are live — the removed
     // `pinned` latch used to leave 4 sessions invisible here; now the layout
     // grows so every live session gets a zone.
-    expect(computeAutoGrowLayoutId("split", 6)).toBe("six-pack");
+    expect(computeAutoGrowLayoutId("split", 6, "grid")).toBe("six-pack");
     const tabIds = ["a", "b", "c", "d", "e", "f"];
     const assignments = reconcileAssignments({}, tabIds, zoneCount("six-pack"));
     expect(unassignedCount(assignments, tabIds)).toBe(0);
@@ -212,6 +212,6 @@ describe("Phase 1 auto-grow — layout grows to fit live tabs across ALL ingest 
   it("never shrinks: closing tabs below capacity does NOT reduce the layout", () => {
     // Grew to full-grid for 9 tabs; now only 2 remain. Auto-grow returns null
     // (shrinking is out of scope — grow only).
-    expect(computeAutoGrowLayoutId("full-grid", 2)).toBeNull();
+    expect(computeAutoGrowLayoutId("full-grid", 2, "grid")).toBeNull();
   });
 });

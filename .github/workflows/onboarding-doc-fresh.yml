@@ -90,7 +90,7 @@ concurrency:
 
 jobs:
   detect:
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(((vars.RUNNER_CI_LANE_ONBOARDING_DOC_FRESH || vars.RUNNER_CI_LIGHT_LANE) == 'self-hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && '["self-hosted","Linux","X64","qontinui-host-nawa","qontinui"]' || '"ubuntu-latest"') }}
     outputs:
       doc_relevant: ${{ steps.changes.outputs.doc_relevant }}
     steps:
@@ -254,7 +254,7 @@ jobs:
   onboarding-doc-fresh:
     needs: [detect, onboarding-doc-verify]
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(((vars.RUNNER_CI_LANE_ONBOARDING_DOC_FRESH || vars.RUNNER_CI_LIGHT_LANE) == 'self-hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && '["self-hosted","Linux","X64","qontinui-host-nawa","qontinui"]' || '"ubuntu-latest"') }}
     steps:
       - name: Aggregate verification result
         shell: bash

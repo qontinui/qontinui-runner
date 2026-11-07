@@ -215,24 +215,82 @@ pub(crate) fn get_terminal_manager(state: &ApiState) -> Arc<TerminalManager> {
 // Handlers
 // ============================================================================
 
+/// One row of `GET /terminals`: the shared-schema [`TerminalInfo`] flattened,
+/// plus the runner-local `permissionRequestHook` (`"registered"` | `"absent"`,
+/// plan `2026-10-23-runner-sessions-stop-at-permission-dialogs-so-accept-them-by-default-with-a-tenant-switch`
+/// D7). The extra key rides BESIDE the schema type, exactly as
+/// `RemoteTerminalInfo` does, because `TerminalInfo` is the cross-repo wire
+/// schema; every reader of the old keys keeps working unchanged.
+///
+/// The field NAME is a contract: `qontinui-claude-config`'s
+/// `/triage-sessions` reads it to decide whether a non-bypass session can be
+/// typed into without answering a dialog.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TerminalListEntry {
+    #[serde(flatten)]
+    pub info: crate::terminal::types::TerminalInfo,
+    pub permission_request_hook: &'static str,
+}
+
+/// Build the listing rows. PURE.
+pub(crate) fn terminal_list_entries(
+    rows: Vec<(
+        crate::terminal::types::TerminalInfo,
+        crate::session::claude_hook::PermissionRequestHook,
+    )>,
+) -> Vec<TerminalListEntry> {
+    rows.into_iter()
+        .map(|(info, hook)| TerminalListEntry {
+            info,
+            permission_request_hook: hook.as_str(),
+        })
+        .collect()
+}
+
 /// List all terminal sessions.
 pub async fn list_terminals_handler(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let terminal_manager = get_terminal_manager(&state);
-    let terminals = terminal_manager.list();
+    let terminals = terminal_list_entries(terminal_manager.list_with_permission_request_hooks());
 
     Ok(Json(ApiResponse::success(serde_json::json!({
         "terminals": terminals
     }))))
 }
 
-/// `POST /terminals`' answer to a refused spawn tenant: a 400 naming the
-/// refusal, since a malformed or unpaired tenant is the caller's to fix. The
-/// refusal itself is the shared [`crate::commands::terminal::admit_spawn_tenant`].
+/// `POST /terminals`' answer to a refused spawn tenant. The refusal itself is
+/// the shared [`crate::commands::terminal::admit_spawn_tenant`], whose text
+/// always opens with a stable `terminal:tenant_<kind>:` prefix.
+///
+/// That prefix is lifted into the envelope's top-level `code`
+/// (`TERMINAL_TENANT_<KIND>`) so a client can branch on it. Without one, the
+/// envelope derived the code from the status and a live refusal read
+/// `"code": "INVALID_JSON"` (coord finding `9f2a0a0d`), which is a lie about
+/// what failed. The status follows the kind: an unreadable credential store is
+/// UNKNOWN and not the caller's to fix, so it is a 503 — as the
+/// provision-session door answers it — and every other kind (malformed,
+/// unpaired, a cwd declaring another tenant) is a 400.
 fn spawn_tenant_bad_request(refusal: String) -> (StatusCode, Json<ApiResponse<()>>) {
     warn!("HTTP: rejecting terminal create — {refusal}");
-    (StatusCode::BAD_REQUEST, Json(api_error(refusal)))
+    let kind = refusal
+        .strip_prefix("terminal:tenant_")
+        .and_then(|rest| rest.split_once(':'))
+        .map(|(kind, _)| kind)
+        .filter(|k| !k.is_empty() && k.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'));
+    let Some(kind) = kind else {
+        // Not a spawn-tenant refusal text; keep the untyped 400 rather than
+        // inventing a code for it.
+        return (StatusCode::BAD_REQUEST, Json(api_error(refusal)));
+    };
+    let status = if kind == "credential_store_unreadable" {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+    let code = format!("TERMINAL_TENANT_{}", kind.to_ascii_uppercase());
+    (status, Json(ApiResponse::error_with_code(refusal, code)))
 }
 
 /// A refused `editSiblings` input → the typed 400 `invalid_edit_sibling`,
@@ -301,7 +359,8 @@ pub async fn create_terminal_handler(
 
     // The spawn tenant is judged BEFORE the worktree allocation below, which a
     // refusal would otherwise leak. A malformed or unpaired tenant is the
-    // caller's to fix, so both are a 400 naming the heal.
+    // caller's to fix (a typed 400 naming the heal); an unreadable credential
+    // store is UNKNOWN, so a 503 — see `spawn_tenant_bad_request`.
     let spawn_tenant = crate::commands::terminal::admit_spawn_tenant(request.tenant_id.as_deref())
         .map_err(spawn_tenant_bad_request)?;
 
@@ -1154,6 +1213,62 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
 mod tests {
     use super::*;
 
+    /// `GET /terminals` rows: every `TerminalInfo` key unchanged, plus the
+    /// camelCase `permissionRequestHook` — the contract
+    /// `qontinui-claude-config` reads.
+    #[test]
+    fn terminal_list_rows_carry_permission_request_hook_beside_the_schema_keys() {
+        use crate::session::claude_hook::PermissionRequestHook;
+        let info = |id: &str, created_at: u64| crate::terminal::types::TerminalInfo {
+            id: id.to_string(),
+            title: "Terminal 1".to_string(),
+            pid: Some(42),
+            cols: 80,
+            rows: 24,
+            working_dir: "/w".to_string(),
+            is_alive: true,
+            exit_code: None,
+            created_at,
+            total_bytes_produced: 7,
+            page_id: "default".to_string(),
+        };
+        let rows = terminal_list_entries(vec![
+            (info("t-reg", 1), PermissionRequestHook::Registered),
+            (info("t-abs", 2), PermissionRequestHook::Absent),
+        ]);
+        let v = serde_json::to_value(&rows).unwrap();
+        assert_eq!(v[0]["permissionRequestHook"], "registered");
+        assert_eq!(v[1]["permissionRequestHook"], "absent");
+        // The shared schema's own keys are flattened in, unchanged.
+        let plain = serde_json::to_value(info("t-reg", 1)).unwrap();
+        for (key, value) in plain.as_object().unwrap() {
+            assert_eq!(&v[0][key], value, "{key}");
+        }
+        assert_eq!(
+            v[0].as_object().unwrap().len(),
+            plain.as_object().unwrap().len() + 1,
+            "exactly one key added"
+        );
+    }
+
+    /// The handler serves the rows from the hook-aware listing, not the bare
+    /// `list()` (which a rename could silently revert to).
+    #[test]
+    fn the_list_handler_serves_the_hook_aware_rows() {
+        let src = include_str!("terminals.rs");
+        let body = src
+            .split_once("pub async fn list_terminals_handler(")
+            .unwrap()
+            .1
+            .split_once("\n}\n")
+            .unwrap()
+            .0;
+        assert!(
+            body.contains("list_with_permission_request_hooks()"),
+            "{body}"
+        );
+    }
+
     /// N4 (review of plan 2026-09-10). `POST /terminals` answers a tenant this
     /// runner holds no credential for with a 400 naming the pairing command —
     /// before any allocation — and a malformed one with a 400 too.
@@ -1171,6 +1286,8 @@ mod tests {
         };
         let (status, Json(body)) = admit(Some(&b.to_string())).expect_err("unpaired → refused");
         assert_eq!(status, StatusCode::BAD_REQUEST);
+        // Finding 9f2a0a0d: the code is the refusal's own, not status-derived.
+        assert_eq!(body.code.as_deref(), Some("TERMINAL_TENANT_NOT_PAIRED"));
         let text = serde_json::to_string(&body).unwrap();
         assert!(text.contains("terminal:tenant_not_paired"), "{text}");
         assert!(
@@ -1178,8 +1295,9 @@ mod tests {
             "{text}"
         );
 
-        let (status, _) = admit(Some("not-a-uuid")).unwrap_err();
+        let (status, Json(body)) = admit(Some("not-a-uuid")).unwrap_err();
         assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.code.as_deref(), Some("TERMINAL_TENANT_INVALID"));
         assert_eq!(admit(Some(&a.to_string())).ok(), Some(Some(a)));
         assert_eq!(admit(None).ok(), Some(None));
     }
@@ -1229,6 +1347,34 @@ mod tests {
         let (status, Json(body)) = edit_sibling_bad_request(refusal);
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body.code.as_deref(), Some("invalid_edit_sibling"));
+    }
+
+    /// Finding 9f2a0a0d, the other arms: an unreadable credential store is
+    /// UNKNOWN, so 503 with its own code, and a text outside the
+    /// `terminal:tenant_` family keeps the untyped 400 rather than a made-up code.
+    #[test]
+    fn spawn_tenant_refusal_code_and_status_follow_the_refusal_kind() {
+        let (status, Json(body)) = spawn_tenant_bad_request(
+            "terminal:tenant_credential_store_unreadable: tenant x: io error".to_string(),
+        );
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            body.code.as_deref(),
+            Some("TERMINAL_TENANT_CREDENTIAL_STORE_UNREADABLE")
+        );
+
+        let (status, Json(body)) = spawn_tenant_bad_request(
+            "terminal:tenant_workdir_declares_other_tenant: /w/.mcp.json".to_string(),
+        );
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body.code.as_deref(),
+            Some("TERMINAL_TENANT_WORKDIR_DECLARES_OTHER_TENANT")
+        );
+
+        let (status, Json(body)) = spawn_tenant_bad_request("something else".to_string());
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.code, None);
     }
 
     #[test]

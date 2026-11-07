@@ -5,11 +5,14 @@
  * `TerminalInstance` — which transitively pulls `@xterm/addon-canvas`
  * (touches `self` at module init and crashes under Node).
  *
- * Mirrors VS Code's `FlowControlConstants` (microsoft/vscode terminal):
- * the frontend acks bytes the renderer has actually drained — not bytes
- * merely received off the wire — and the Rust reader pauses/resumes around
+ * Mirrors VS Code's `FlowControlConstants` (microsoft/vscode terminal): an
+ * ack waits until the renderer has actually drained a write, not merely
+ * received it off the wire, and the Rust reader pauses/resumes around
  * char-count watermarks so a burst can't outrun xterm's input buffer
  * (~50MB cap, which silently drops overflow) before backpressure engages.
+ * What is acked, though, is every byte the runner SENT for that write,
+ * including a prefix a ring replay already covered and nothing rewrote
+ * (`AckedWriteQueue`); acking only the written bytes wedged the gate.
  */
 
 /**
@@ -30,17 +33,20 @@ export const ACK_SIZE = 5000;
 export const ACK_FLOOR_INTERVAL_MS = 250;
 
 /**
- * Render-based ack accumulator. Tracks bytes that have been rendered by the
- * backend (the `onRendered` callback fired) but not yet acked to the Rust
- * reader, and decides when to flush an ack.
+ * Render-based ack accumulator. Tracks bytes whose write has rendered (the
+ * `onRendered` callback fired), or that settled with nothing to write, but
+ * that are not yet acked to the Rust reader, and decides when to flush an ack.
+ * `n` below is the bytes the runner sent for the write, not its length.
  *
  * Lifecycle per coalesced write:
  *   1. `onWriteIssued(n)` when a write is dispatched to the backend — bumps
  *      the in-flight (issued-but-not-yet-rendered) counter.
  *   2. `onRendered(n)` inside the backend's render-completion callback —
- *      moves those `n` bytes from in-flight into the pending-ack accumulator.
- *   3. `takeAck()` returns the bytes to ack (and zeroes the accumulator) once
- *      it has crossed {@link ACK_SIZE}, or when forced by the floor timer.
+ *      moves those `n` bytes from in-flight into the pending-ack accumulator
+ *      and returns the ack to send once it has crossed {@link ACK_SIZE}.
+ *   3. `flush()` on the floor timer returns the sub-AckSize remainder.
+ *
+ * A chunk with nothing left to write skips 1 and 2: `onSettledWithoutWrite`.
  */
 export class RenderAckAccumulator {
   /** Bytes written to the backend whose render callback hasn't fired yet. */
@@ -50,9 +56,27 @@ export class RenderAckAccumulator {
 
   constructor(private readonly ackSize: number = ACK_SIZE) {}
 
-  /** A write of `bytes` length was dispatched to the backend. */
+  /** A write the runner sent `bytes` for was dispatched to the backend. */
   onWriteIssued(bytes: number): void {
     if (bytes > 0) this.inFlight += bytes;
+  }
+
+  /**
+   * `bytes` the runner sent were settled WITHOUT a render: the pane received
+   * them, but they were already in its buffer via a scrollback-ring replay, so
+   * nothing was written. They still count toward the runner's unacked gap
+   * (`bytes_sent − bytes_acked`), so they must be acked like rendered bytes —
+   * an unacked remainder above the runner's Low watermark keeps a paused
+   * emission gate shut forever, because nothing else is ever sent to ack.
+   * Returns the ack amount to send now, exactly like {@link onRendered}.
+   */
+  onSettledWithoutWrite(bytes: number): number {
+    if (bytes <= 0) return 0;
+    this.pendingAck += bytes;
+    if (this.pendingAck >= this.ackSize) {
+      return this.flush();
+    }
+    return 0;
   }
 
   /**

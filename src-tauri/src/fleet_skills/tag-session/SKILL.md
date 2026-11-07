@@ -24,9 +24,9 @@ up; in an unhooked one nothing happens, silently.
 > Writing the marker file does nothing on a clone whose `.git/hooks/` has no
 > `prepare-commit-msg`, and that is the default state of every fresh clone.
 > Between 2026-06-07 and 2026-08-06 it was the state of *every* clone, because
-> the hook had been deleted from qontinui-dev-notes while its CI gate and its
-> three consumers stayed live (see
-> `qontinui-dev-notes/plans/2026-08-06-session-id-trailer-hook-delivery.md`).
+> the hook had been deleted from the repository that then carried it while its
+> CI gate and its three consumers stayed live (Qontinui's plan
+> `2026-08-06-session-id-trailer-hook-delivery`).
 >
 > Run this **from inside the clone you are asking about** — it reports what git
 > would do in the current repo, and says so rather than guessing when there is
@@ -255,7 +255,7 @@ cat ~/.qontinui/session-names/<uuid>
   source of the hook that reads the marker file. This is the
   template, not an installed hook: it does nothing until the
   installer copies it into a clone. It **moved here from
-  `qontinui-dev-notes` on 2026-09-03** (plan
+  Qontinui's notes repository on 2026-09-03** (plan
   `2026-09-03-session-id-gate-rejects-the-provenance-the-fleet-actually-writes`,
   Phase 2), because its standalone installer over there was wired into
   no installer script anywhere and therefore reached almost no machine.
@@ -268,7 +268,5 @@ cat ~/.qontinui/session-names/<uuid>
   `--check` reports `absent` / `stale` / `stamped` / `foreign` per
   target; a foreign `prepare-commit-msg` is never clobbered without
   `--force`.
-- `qontinui-dev-notes/memory/current_session_id.md` — long-form
-  session log; the trailers make it easier to keep up to date.
 - `/rename <name>` — Claude Code built-in; sets the UI label.
   `/tag-session <name>` mirrors it into the commit trailers.

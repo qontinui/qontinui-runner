@@ -28,11 +28,13 @@ const LAUNCHER_BIN: &str = if cfg!(windows) {
 
 /// Stable per-user path that AI client configs reference.
 pub fn launcher_path() -> PathBuf {
-    dirs::data_local_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("qontinui-runner")
-        .join("bin")
-        .join(LAUNCHER_BIN)
+    qontinui_runner_lib::instance_env::platform_dir(
+        qontinui_runner_lib::instance_env::PlatformDir::DataLocal,
+    )
+    .unwrap_or_else(|| PathBuf::from("."))
+    .join("qontinui-runner")
+    .join("bin")
+    .join(LAUNCHER_BIN)
 }
 
 /// Copy the bundled launcher into the stable path if missing or stale.
@@ -163,6 +165,9 @@ mod tests {
 
     #[test]
     fn launcher_path_is_under_local_data() {
+        // `launcher_path` reads `QONTINUI_INSTANCE_ROOT`; a sibling test's
+        // subject launch must not race it.
+        let _lock = crate::test_env::env_lock();
         let p = launcher_path();
         let expected_parent = dirs::data_local_dir()
             .unwrap()

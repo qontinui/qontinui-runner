@@ -1,7 +1,7 @@
 """HTTP-based UIBridgeClientProtocol adapter for the Python bridge.
 
 Makes synchronous HTTP calls to the runner's UI Bridge endpoints
-(localhost:9876/ui-bridge/control/*) to interact with the target app's
+(``runner_api.runner_api_base()`` + /ui-bridge/control/*) to interact with the target app's
 UI Bridge SDK.
 
 Since the Python bridge runs as a subprocess, synchronous HTTP calls
@@ -12,6 +12,8 @@ import logging
 from typing import Any
 
 import requests
+
+from runner_api import runner_api_base
 
 logger = logging.getLogger(__name__)
 
@@ -49,8 +51,10 @@ class UIBridgeHTTPClient:
     requests against the runner's UI Bridge control endpoints.
     """
 
-    def __init__(self, base_url: str = "http://localhost:9876") -> None:
-        self.base_url = base_url.rstrip("/")
+    def __init__(self, base_url: str | None = None) -> None:
+        # Resolved at call time so QONTINUI_PORT (a secondary/temp runner) is
+        # honoured, and on 127.0.0.1: the runner binds the IPv4 loopback only.
+        self.base_url = (base_url if base_url is not None else runner_api_base()).rstrip("/")
         self._session = requests.Session()
 
     def _request(

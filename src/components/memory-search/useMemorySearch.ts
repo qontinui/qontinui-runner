@@ -1,8 +1,7 @@
 import { useState, useCallback, useRef } from "react";
 import type { MemoryResult, MemorySearchResponse, MemorySourceFilter } from "./types";
 import { describeThrown } from "@/lib/utils";
-
-const API_BASE = "http://localhost:9876";
+import { getApiBase } from "@/lib/runner-api";
 
 interface SearchParams {
   query: string;
@@ -46,7 +45,7 @@ export function useMemorySearch() {
     if (params.minScore !== undefined) searchParams.set("min_score", String(params.minScore));
 
     try {
-      const res = await fetch(`${API_BASE}/memory/search?${searchParams}`, {
+      const res = await fetch(`${getApiBase()}/memory/search?${searchParams}`, {
         signal: controller.signal,
       });
       const json: MemorySearchResponse = await res.json();

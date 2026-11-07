@@ -20,6 +20,7 @@ export {
   ok,
   pluralize,
   renderCommandStatus,
+  statusTtlMs,
   stateEffect,
   statusKindOf,
 } from "./verdict";
@@ -50,6 +51,7 @@ export {
   coerceToken,
   extractFlags,
   parseArgs,
+  readTextArg,
   tokenize,
   textArg,
   tokenizeRich,

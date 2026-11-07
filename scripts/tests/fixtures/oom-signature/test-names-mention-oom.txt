@@ -1,0 +1,10 @@
+     Running `/home/runner/work/qontinui-runner/qontinui-runner/src-tauri/target/debug/deps/qontinui_runner_lib-0c1d2e3f`
+
+running 4 tests
+test ci::an_unconfirmed_sigkill_run_does_not_say_oom_kill ... ok
+test util::resource_exhaustion::tests::rustc_llvm_error_out_of_memory_is_capacity ... ok
+test util::resource_exhaustion::tests::os_error_1455_paging_file_is_too_small ... ok
+test alloc_breadcrumb::tests::memory_allocation_of_bytes_failed_is_recorded ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+##[error]Process completed with exit code 139.

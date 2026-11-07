@@ -238,10 +238,11 @@ async fn run_pipe(
 /// POST the buffered bytes as one coalesced chunk + advance the offset.
 /// Best-effort: a coord-side failure (network, 429 quota, 5xx) is logged
 /// and the buffer is cleared — output streaming is a courtesy mirror, so
-/// we never block the operator's session or retry-storm coord. A 429
-/// (tenant warm quota exceeded) is logged at info and treated as
-/// "stop trying for now"; the next flush simply tries again on fresh
-/// output (coord re-checks the quota each call).
+/// we never block the operator's session or retry-storm coord. A 429 is
+/// logged at info naming coord's parsed reason (`warm_quota_exceeded`,
+/// `transcript_sync_disabled`, … — see [`refusal_log_reason`]) and treated
+/// as "stop trying for now"; the next flush simply tries again on fresh
+/// output (coord re-checks its policy each call).
 async fn flush(
     http: &reqwest::Client,
     url: &str,
@@ -251,6 +252,21 @@ async fn flush(
     tenant: TenantScope,
 ) {
     if buffer.is_empty() {
+        return;
+    }
+    // The tenant's `egress_terminal_stream` switch, checked on EVERY flush so a
+    // flip takes effect on the next coalesced chunk (plan
+    // 2026-10-10-spec-front-end-phase-9-generic-boundary, Phase 7), in the
+    // owning session's tenant scope. A refused
+    // chunk is dropped and counted, never held: the offset does not advance,
+    // exactly like a quota drop, and nothing is released by a later flip.
+    if !crate::egress::permit_or_count_session(crate::egress::Flow::TerminalStream, tenant.into()) {
+        tracing::debug!(
+            session = %session_id,
+            bytes = buffer.len(),
+            "session output_pipe: terminal streaming is off for this tenant — dropping chunk"
+        );
+        buffer.clear();
         return;
     }
     let payload_b64 = crate::terminal::transport_stats::pipe_reencode(&buffer[..]);
@@ -273,9 +289,11 @@ async fn flush(
                 // on coord). On success, the bytes are durably in warm.
                 *next_offset += len;
             } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                let reason = refusal_log_reason(&resp.text().await.unwrap_or_default());
                 tracing::info!(
                     session = %session_id,
-                    "session output_pipe: coord warm quota exceeded — dropping chunk"
+                    reason = %reason,
+                    "session output_pipe: coord refused chunk (429 {reason}) — dropping chunk"
                 );
                 // Drop the chunk (don't advance offset — but also don't
                 // resend; the bytes are gone for the shared tail). Clearing
@@ -297,4 +315,99 @@ async fn flush(
         }
     }
     buffer.clear();
+}
+
+/// The reason a 429 on `POST /sessions/:id/output` is logged under: coord's
+/// parsed `error` code through the same parser `coord_sync`'s outbox drain
+/// uses, or a generic "rate limited" when the body carries none (an edge or
+/// proxy limit). Every 429 is dropped here either way — this only names it.
+fn refusal_log_reason(body: &str) -> String {
+    crate::session::coord_sync::output_chunk_429_log_reason(body)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::refusal_log_reason;
+
+    #[test]
+    fn a_429_is_logged_under_coords_parsed_reason() {
+        assert_eq!(
+            refusal_log_reason(r#"{"error":"warm_quota_exceeded","quota":5}"#),
+            "warm_quota_exceeded"
+        );
+        assert_eq!(
+            refusal_log_reason(r#"{"error":"transcript_sync_disabled","column_missing":false}"#),
+            "transcript_sync_disabled"
+        );
+        assert_eq!(
+            refusal_log_reason(r#"{"error":"transcript_sync_disabled","column_missing":true}"#),
+            "transcript_sync_disabled (coord column not provisioned yet)"
+        );
+    }
+
+    #[test]
+    fn a_429_without_a_parsed_reason_is_logged_as_rate_limited() {
+        assert_eq!(refusal_log_reason(""), "rate limited");
+        assert_eq!(
+            refusal_log_reason("upstream says warm_quota_exceeded"),
+            "rate limited"
+        );
+        assert_eq!(
+            refusal_log_reason(r#"{"detail":"slow down"}"#),
+            "rate limited"
+        );
+    }
+}
+
+/// The registered flow test for terminal streaming
+/// (`crate::egress::FLOW_TESTS`): [`flush`] against a counting loopback
+/// listener, with the switch pinned each way.
+#[cfg(test)]
+pub(crate) mod egress_tests {
+    use super::*;
+    use crate::egress::test_support::{pin, ConnCounter};
+    use crate::egress::{Flow, Level};
+
+    async fn flush_once(level: Level) -> (usize, bool) {
+        let counter = ConnCounter::start();
+        let url = format!("{}/sessions/{}/output", counter.http_base(), Uuid::nil());
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .no_proxy()
+            .build()
+            .unwrap();
+        let mut buffer = b"terminal bytes".to_vec();
+        let mut offset = 0i64;
+        let _pin = pin(Flow::TerminalStream, level);
+        flush(
+            &http,
+            &url,
+            Uuid::nil(),
+            &mut buffer,
+            &mut offset,
+            TenantScope::Unresolved,
+        )
+        .await;
+        (
+            counter.wait_for(1, Duration::from_millis(300)),
+            buffer.is_empty(),
+        )
+    }
+
+    #[tokio::test]
+    pub(crate) async fn terminal_stream_pinned_off_makes_zero_connections() {
+        let (connects, cleared) = flush_once(Level::Off).await;
+        assert_eq!(
+            connects, 0,
+            "no byte of terminal output may leave with the switch off"
+        );
+        assert!(cleared, "a refused chunk is dropped, never held");
+    }
+
+    #[tokio::test]
+    pub(crate) async fn terminal_stream_pinned_on_makes_a_connection() {
+        let _amb = crate::test_env::isolated_ambient();
+        let (connects, _) = flush_once(Level::On).await;
+        assert!(connects >= 1, "with the switch on the chunk is posted");
+    }
 }

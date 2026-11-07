@@ -87,13 +87,10 @@ impl PgDb {
         let task_type: Option<String> =
             Some(input.task_type.as_deref().unwrap_or("task").to_string());
         let auto_continue = input.auto_continue.unwrap_or(true);
-        let effective_root: Option<String> = Some(
-            input
-                .root_task_run_id
-                .clone()
-                .unwrap_or_else(|| input.id.clone()),
-        );
-        let depth = input.depth as i32;
+        // Nothing passes a root or depth, so every row stores itself as root at
+        // depth 0, even one with a parent.
+        let effective_root: Option<String> = Some(input.id.clone());
+        let depth = 0_i32;
         let max_sessions: Option<i32> = input.max_sessions.map(|v| v as i32);
         let runner_port: Option<i32> = input.runner_port.map(|v| v as i32);
         let is_meta_optimizer = input.is_meta_optimizer;
@@ -2052,34 +2049,8 @@ impl PgDb {
     }
 
     // ========================================================================
-    // Review Subtask Operations (raw SQL — columns not yet in Clorinde)
+    // Parent/Child Task Operations (raw SQL)
     // ========================================================================
-
-    /// Set the is_review and blocks_parent flags on a task run.
-    /// Used after Clorinde-based create_task_run to set review-specific columns.
-    pub async fn set_review_flags(
-        &self,
-        task_run_id: &str,
-        is_review: bool,
-        blocks_parent: bool,
-    ) -> Result<(), String> {
-        let conn = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| format!("PG pool error: {}", e))?;
-        conn.execute(
-            "UPDATE task_runs SET is_review = $1, blocks_parent = $2 WHERE id = $3",
-            &[
-                &is_review as &(dyn tokio_postgres::types::ToSql + Sync),
-                &blocks_parent as &(dyn tokio_postgres::types::ToSql + Sync),
-                &task_run_id as &(dyn tokio_postgres::types::ToSql + Sync),
-            ],
-        )
-        .await
-        .map_err(|e| crate::database::pg::pg_err("PG set_review_flags", &e))?;
-        Ok(())
-    }
 
     /// Check if a task has any incomplete blocking children.
     #[expect(
@@ -2109,43 +2080,6 @@ impl PgDb {
         Ok(count > 0)
     }
 
-    /// Check if a review subtask already exists for a given parent + PR number.
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
-    )]
-    pub async fn has_review_subtask_for_pr(
-        &self,
-        parent_task_run_id: &str,
-        pr_number: u64,
-    ) -> Result<bool, String> {
-        let conn = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| format!("PG pool error: {}", e))?;
-        // Use "PR #N (" pattern to avoid false matches (e.g. PR #12 matching PR #123)
-        let pr_pattern = format!("%PR #{} (%", pr_number);
-        let row = conn
-            .query_one(
-                "SELECT EXISTS(\
-                    SELECT 1 FROM task_runs \
-                    WHERE parent_task_run_id = $1 \
-                      AND is_review = true \
-                      AND task_name LIKE $2 \
-                      AND status NOT IN ('failed', 'stopped')\
-                 )",
-                &[
-                    &parent_task_run_id as &(dyn tokio_postgres::types::ToSql + Sync),
-                    &pr_pattern as &(dyn tokio_postgres::types::ToSql + Sync),
-                ],
-            )
-            .await
-            .map_err(|e| crate::database::pg::pg_err("PG has_review_subtask_for_pr", &e))?;
-        let exists: bool = row.get(0);
-        Ok(exists)
-    }
-
     /// Set the result_data JSON column on a task run.
     pub async fn set_task_run_result_data(
         &self,
@@ -2169,40 +2103,8 @@ impl PgDb {
         Ok(())
     }
 
-    /// Merge JSON into result_data without overwriting existing keys.
-    /// If result_data is NULL or empty, sets it to the provided JSON.
-    /// Otherwise merges via jsonb `||` (new keys win on conflict).
-    pub async fn merge_task_run_result_data(
-        &self,
-        task_run_id: &str,
-        json_str: &str,
-    ) -> Result<(), String> {
-        let conn = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| format!("PG pool error: {}", e))?;
-        conn.execute(
-            r#"UPDATE task_runs
-               SET result_data = CASE
-                   WHEN result_data IS NULL OR result_data = '' THEN $1
-                   ELSE (result_data::jsonb || $1::jsonb)::text
-               END,
-               updated_at = NOW()
-               WHERE id = $2"#,
-            &[
-                &json_str as &(dyn tokio_postgres::types::ToSql + Sync),
-                &task_run_id as &(dyn tokio_postgres::types::ToSql + Sync),
-            ],
-        )
-        .await
-        .map_err(|e| crate::database::pg::pg_err("PG merge_task_run_result_data", &e))?;
-        Ok(())
-    }
-
     /// Get the parent_task_run_id and blocks_parent flag for a task.
     /// Returns Some((parent_id, blocks_parent)) if the task has a parent, None otherwise.
-    /// Uses raw SQL since blocks_parent is not in the Clorinde-generated struct.
     #[expect(
         clippy::disallowed_methods,
         reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"

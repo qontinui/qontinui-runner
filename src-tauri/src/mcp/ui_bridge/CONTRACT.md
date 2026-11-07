@@ -9,7 +9,7 @@ The two authoritative route registries — *do not duplicate these here, link
 and diff against them*:
 
 - **Runner manifest** — `route_manifest()` at `mod.rs:312`, exposed live at
-  `GET http://localhost:9876/ui-bridge/_routes`. Concatenates per-family
+  `GET http://127.0.0.1:9876/ui-bridge/_routes`. Concatenates per-family
   `route_entries()` from ~22 submodules.
 - **SDK contract** — `UI_BRIDGE_ROUTES: RouteDefinition[]` at
   `ui-bridge/packages/ui-bridge/src/server/types.ts:1182` (190 entries).
@@ -492,17 +492,36 @@ map timeout → 422 itself; the framework will not derive this from the body
 shape. Any new SDK endpoint with a non-200 success status needs the same
 explicit `(StatusCode, Json<...>)` return tuple.
 
-### Vision capture `path` is relative
-`CaptureResponse.path` (returned by `/vision/capture`, `/vision/annotate`, and
-the other vision endpoints) is the **relative** form
-`tmp_vision_cache/<sha256>.<ext>`, not an absolute host path. The on-disk
-`VisionCache` root is built absolute in `mcp_api::api_state_init`
-(`current_runner_path().join("tmp_vision_cache")`) so file IO is CWD-independent,
-but the response strips that prefix at serialization time
-(`vision_routes::relative_cache_path`). `path` is **diagnostic-only**: every
-consumer fetches the actual bytes by `sha256` via `/vision/raw`
-(`fetchVisionCacheBytes(meta.sha256)`), never by `path`. Emitting a relative
-path keeps the response host-agnostic for cross-machine relay consumers.
+### Vision capture bytes: `url`, or `inline: true`
+`CaptureResponse` (returned by `/vision/capture`, `/vision/annotate`,
+`/vision/raw`, and inside `/vision/diff`) carries **`url`**, the relative HTTP
+path `/ui-bridge/vision/cache/<sha256>` that serves the encoded bytes
+(`vision_capture_access::cache_url`). It is relative so it works through every
+door — loopback, relay, remote; resolve it against the runner origin. There is
+no host file path in the response.
+
+`capture`, `annotate` and `raw` accept **`inline: true`**, which adds `base64`
+(standard alphabet) to the same response. Inline is capped at 5 MiB
+(`vision_capture_access::INLINE_MAX_BYTES`, the Claude vision input ceiling the
+default `claude_vision_v1` contract keeps under). Over the cap the request
+gets **413** with `code: "INLINE_TOO_LARGE"` and `hint: {url, bytes, maxBytes}`
+— never a truncated string; the capture is still cached, so follow `url`.
+`inline` is taken off the request before the cache key is composed, so it never
+splits a cache entry.
+
+`sha256` is the hash of the cache **key** (`v=1|mut=<mutation_id>|req=<request>`),
+**not** of the image bytes: two identical images captured under different keys
+have different values. Do not use it as a content hash.
+
+The cache lives in the runner's instance-scoped DataLocal directory —
+`<data_local>/com.qontinui.runner/vision_cache`, under the instance root for a
+subject runner and at `<data_local>/com.qontinui.runner/instance-<name>/vision_cache`
+for a named secondary (`instance::scope_path` applied to
+`instance_env::runner_data_local_base`, then `vision_cache` joined). It is never
+the source checkout or the process CWD. An unresolvable base panics while the
+API router is built: the panic is logged and the HTTP API never comes up, but
+the runner process itself keeps running. `tmp_vision_cache/` is only ever written by runner builds that
+predate this.
 
 ### 404 discriminator: empty body vs structured envelope
 A 404 from a route with a `:param`/`{name}` segment is ambiguous on its own, so
@@ -526,7 +545,7 @@ not aspirational names.
 **Discovery recipe:**
 
 ```bash
-curl http://localhost:9876/ui-bridge/control/elements | jq '.data[] | .id'
+curl http://127.0.0.1:9876/ui-bridge/control/elements | jq '.data[] | .id'
 ```
 
 Run against the page in question (or a temp runner spawned via the
@@ -604,6 +623,6 @@ The direct-eval fallback emits the same shape plus `source: "direct_eval"`.
   Spawns a temp runner, hits each route, asserts response shape and status
   code. Catches the deeper field-stripping / query-param-drop bugs the
   manifest diff can't see.
-- **Live manifest endpoint** — `GET http://localhost:9876/ui-bridge/_routes`
+- **Live manifest endpoint** — `GET http://127.0.0.1:9876/ui-bridge/_routes`
   returns the runner's actual registered route list. Useful for
   spot-checking what a running build exposes versus what this doc claims.

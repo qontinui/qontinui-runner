@@ -7,7 +7,7 @@
  */
 
 import { createContext, useContext, useState, useCallback, useEffect, type ReactNode } from "react";
-import { getApiPort } from "@/lib/runner-api";
+import { getApiPort, runnerBaseForPort } from "@/lib/runner-api";
 
 interface AutoContinueContextValue {
   /** Whether auto-continue on restart is enabled */
@@ -67,7 +67,7 @@ async function fetchWithFallbackPorts(
   if (cachedPort !== null) {
     try {
       const response = await fetchWithTimeout(
-        `http://localhost:${cachedPort}${path}`,
+        `${runnerBaseForPort(cachedPort)}${path}`,
         options,
         timeoutMs,
       );
@@ -82,7 +82,7 @@ async function fetchWithFallbackPorts(
   for (const port of getMcpApiPorts()) {
     try {
       const response = await fetchWithTimeout(
-        `http://localhost:${port}${path}`,
+        `${runnerBaseForPort(port)}${path}`,
         options,
         timeoutMs,
       );

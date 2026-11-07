@@ -317,6 +317,23 @@ fn admit(gate: DrainGate, cap_permits: impl FnOnce() -> bool) -> Result<(), Stri
     Ok(())
 }
 
+/// The skip reason for a resume while a model gateway is declared (or its
+/// state is unknown), `None` otherwise. PURE over `gateway_declared`.
+fn gateway_refusal(gateway_declared: bool) -> Option<String> {
+    gateway_declared.then(|| {
+        format!(
+            "model_gateway: {}; a resumed pane would run under the gateway's \
+             CLAUDE_CONFIG_DIR, where this session's transcript does not exist",
+            crate::model_gateway::SUBSCRIPTION_OFF_REASON
+        )
+    })
+}
+
+/// [`gateway_refusal`] over the live gateway state.
+fn live_gateway_refusal() -> Option<String> {
+    gateway_refusal(crate::model_gateway::gateway_declared())
+}
+
 /// One live `claude` process as read from the process table.
 #[derive(Debug, Clone)]
 struct ClaudeProc {
@@ -537,12 +554,20 @@ async fn resume_one(
     app: &tauri::AppHandle,
     tm: &Arc<TerminalManager>,
     registry: &Arc<SessionRegistry>,
+    store: &SessionLifecycleStore,
     cand: Candidate,
 ) -> ResumeRow {
     // One call per id at a time, held through spawn AND verify.
     let Some(_in_flight) = InFlight::claim(&cand.id) else {
         return ResumeRow::skipped(&cand.id, "in_flight");
     };
+    // Under a model gateway the resumed pane runs with the gateway's
+    // CLAUDE_CONFIG_DIR (finalize_child_env pins it), where this session's
+    // transcript does not exist, so `--resume` would find nothing. Refuse the
+    // same way account migration does.
+    if let Some(why) = live_gateway_refusal() {
+        return ResumeRow::skipped(&cand.id, why);
+    }
     // A live claude already running this id: resuming would be a second
     // process on one transcript.
     match live_holder(&cand.id).await {
@@ -577,6 +602,19 @@ async fn resume_one(
         return ResumeRow::skipped(&cand.id, why);
     }
 
+    // An operator resume is not a continuation. Drop the closed row's gate
+    // identity when its outcome is already owned: bound by this process, or
+    // past D2's decision (reported by the close observer, or owned by the
+    // process that bound it). Otherwise `record_open`'s sticky merge carries it
+    // into the reopened row, and the next non-restorable close posts a
+    // duplicate `runner_restart` report. An unreported gate is kept, so a
+    // spawn that fails below loses nothing.
+    if store.release_gate_identity(
+        &cand.id,
+        crate::session::tracking_health::primary_boot_unix_millis_or_init(),
+    ) {
+        info!(id = %cand.id, "resume_door: released the closed row's settled gate identity");
+    }
     let spawn = {
         let (app, tm, registry, cand) = (app.clone(), tm.clone(), registry.clone(), cand.clone());
         tokio::task::spawn_blocking(move || {
@@ -607,8 +645,12 @@ async fn resume_one(
                     // Creates a new process: respect the spawn-time resource
                     // floor like every other autonomous spawn.
                     resource_override: false,
-                    // The source's continuation registration, if any, is not
-                    // re-claimed from a closed row.
+                    // The door passes no gate. A settled gate was released
+                    // above. A prior-generation gate that nothing has reported
+                    // yet stays on the row. D2 reports it when the reopened row
+                    // next closes non-restorably, or this process's exit hook
+                    // reports it if `record_pinned_session_open` adopts the
+                    // reopen under D3.
                     gate_identity: None,
                 },
             )
@@ -662,7 +704,7 @@ async fn run_batch(
     for id in &ids {
         let row = match classify(id, store.get(id).as_ref()) {
             Err(why) => ResumeRow::skipped(id, why),
-            Ok(cand) => resume_one(&app, &tm, &registry, cand).await,
+            Ok(cand) => resume_one(&app, &tm, &registry, &store, cand).await,
         };
         info!(id = %row.id, verdict = %row.verdict, "resume_door: verdict");
         results.push(row);
@@ -812,6 +854,7 @@ mod tests {
             provider: super::super::session_lifecycle_store::DEFAULT_PROVIDER.to_string(),
             origin: None,
             restore_pending_at: None,
+            awaiting_account_since: None,
             confirmed_at: None,
             handle: None,
             account_label: None,
@@ -826,15 +869,47 @@ mod tests {
             finished_at: None,
             wind_down_outcome: None,
             wind_down_at: None,
+            wind_down_arm: None,
             finish_reason: None,
             finish_synced: false,
             spawn_device_default: None,
             adopted_from: None,
+            last_session_start_at: None,
+            gate_id: None,
+            gate_consuming_device_id: None,
+            gate_bound_boot_ms: None,
         }
     }
 
     fn reason(r: Result<Candidate, String>) -> String {
         r.expect_err("must be skipped")
+    }
+
+    #[test]
+    fn a_declared_gateway_refuses_the_resume_with_a_reason() {
+        assert_eq!(gateway_refusal(false), None);
+        let why = gateway_refusal(true).expect("refused");
+        assert!(why.starts_with("model_gateway: "), "{why}");
+        assert!(why.contains("transcript does not exist"), "{why}");
+    }
+
+    /// Wiring: the live reader follows the gateway state (a recorded gateway
+    /// with no declaration reads UNKNOWN, which also refuses).
+    #[test]
+    fn the_live_gateway_state_reaches_the_resume_refusal() {
+        let _amb = crate::test_env::isolated_ambient();
+        assert_eq!(live_gateway_refusal(), None);
+        let g = crate::model_gateway::ModelGatewaySettings {
+            base_url: Some("https://resume-gw.example.com".to_string()),
+            api_key_helper: Some("echo resume-key".to_string()),
+            ..Default::default()
+        }
+        .resolve()
+        .unwrap()
+        .unwrap();
+        crate::model_gateway::write_marker_at(&crate::model_gateway::gateway_dir().unwrap(), &g)
+            .unwrap();
+        assert!(live_gateway_refusal().is_some());
     }
 
     #[test]

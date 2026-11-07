@@ -357,7 +357,12 @@ async fn list_credentials(
         .env_vars
         .iter()
         .map(|spec| CredentialDescriptor {
-            name: spec.name.clone(),
+            // Wrapper-supplied: a persisted index can predate scan-time
+            // validation, so an invalid name is shown by its length only.
+            name: super::manifest::label_if(
+                &spec.name,
+                super::manifest::env_var_name_ok(&spec.name),
+            ),
             has_value: CredentialStore::has(&id, &spec.name),
             description: spec.description.clone(),
             required: spec.required,

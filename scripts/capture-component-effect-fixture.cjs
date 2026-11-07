@@ -14,19 +14,22 @@
 // dropped on the way out. The Rust type declaring the field is therefore NOT
 // evidence that any value ever reaches it.
 //
-// This script captures the actual `/control/components` response body the
-// runner would emit for the `settings-panel` fixture, by:
+// This script captures the component list of the `/control/components`
+// response body the runner would emit for the registrations `FIXTURE_SOURCES`
+// names, by:
 //
-//   1. parsing the REAL `useUIComponent({...})` registration out of
-//      `src/components/settings/Settings.tsx` (TS AST — no hand-typed mirror of
-//      the annotations), then
+//   1. parsing the REAL `useUIComponent({...})` registrations out of the files
+//      `FIXTURE_SOURCES` names (TS AST — no hand-typed mirror of the
+//      annotations), then
 //   2. running the REAL `serializeComponent` from
-//      `src/hooks/ui-bridge-events/utils.ts` over it (transpiled in-process, so
-//      the allow-list under test is the shipped one), then
-//   3. wrapping the result in the envelope
-//      `ui_bridge_get_components_handler` emits (`{success, data:{components}}`
-//      — see `src-tauri/src/mcp/ui_bridge/elements.rs`,
-//      `components_envelope_tests`).
+//      `src/hooks/ui-bridge-events/utils.ts` over them (transpiled in-process,
+//      so the allow-list under test is the shipped one), then
+//   3. wrapping the result in the `{success, data:{components}}` part of the
+//      envelope `ui_bridge_get_components_handler` emits (see
+//      `src-tauri/src/mcp/ui_bridge/elements.rs`, `components_envelope`). The
+//      envelope's other field, `data.wrapperComponents` (whether the
+//      WebSocket-registered apps were asked), is left out: Rust sets it, not
+//      the serializer under test, and `components_envelope_tests` pins it.
 //
 // The captured body is committed at
 // `src-tauri/tests/fixtures/control-components-effect.json` and deserialized by

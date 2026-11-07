@@ -574,21 +574,50 @@ impl UiBridgeError {
 
     /// Reject an unknown action name BEFORE any IPC / RecoveryExecutor flow
     /// can synthesize a misleading success. Mirrors the `tab/activate` ->
-    /// `knownTabs` prior art: hint carries the full supported-action list so
+    /// `knownTabs` prior art: the context carries the accepted-action list so
     /// callers can self-correct without an extra round-trip.
-    pub fn invalid_action(unknown: &str, supported: &[&str]) -> Self {
+    ///
+    /// `accepted` is `element_id`'s own list (built-ins it advertises plus its
+    /// registered custom actions), not the global one. The context gains
+    /// `didYouMean` and `paramsHint` when a synonym or a spelling-only fix the
+    /// element accepts exists (see [`super::action_vocabulary`]), following
+    /// `type_param_invalid`'s `didYouMean` shape.
+    pub fn invalid_action<S: AsRef<str>>(
+        unknown: &str,
+        element_id: &str,
+        accepted: &[S],
+        requested_params: Option<&serde_json::Value>,
+    ) -> Self {
+        let names: Vec<&str> = accepted.iter().map(AsRef::as_ref).collect();
+        let mut message = if names.is_empty() {
+            format!(
+                "Unknown action '{}' for element '{}'. This element advertises no actions.",
+                unknown, element_id
+            )
+        } else {
+            format!(
+                "Unknown action '{}' for element '{}'. This element accepts: {}.",
+                unknown,
+                element_id,
+                names.join(", ")
+            )
+        };
+        let mut context = serde_json::json!({
+            "action": unknown,
+            "elementId": element_id,
+            "supportedActions": names,
+        });
+        if let Some(suggestion) =
+            super::action_vocabulary::ActionSuggestion::resolve(unknown, accepted, requested_params)
+        {
+            message.push_str(&suggestion.message_suffix());
+            suggestion.attach_to(&mut context);
+        }
         Self {
             code: UiBridgeErrorCode::InvalidRequest,
-            message: format!(
-                "Unknown action '{}'. Supported actions: {}",
-                unknown,
-                supported.join(", ")
-            ),
+            message,
             recovery: Some(RecoveryHint::Unrecoverable),
-            context: Some(serde_json::json!({
-                "action": unknown,
-                "supportedActions": supported,
-            })),
+            context: Some(context),
         }
     }
 

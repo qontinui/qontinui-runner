@@ -30,10 +30,11 @@
 //!   never recurses), preferring `<name>.exe` then `<name>.cmd` then bare.
 //! - **Bounded resolve wait.** A real tool momentarily ABSENT from `PATH` (a
 //!   package manager mid-reinstall — npm's reify renames `bin/<tool>` aside for
-//!   ~2 s) is re-scanned for at most `QONTINUI_SHIM_RESOLVE_WAIT_SECS` (default
-//!   10 s for claude/gemini, 3 s for install tools) before the fail-open
-//!   fall-through, which then names the tool and the `PATH` searched on stderr.
-//!   A resolved tool never waits; see [`resolve_real_waiting`].
+//!   ~2 s), or still npm's placeholder stub, is re-scanned for at most
+//!   `QONTINUI_SHIM_RESOLVE_WAIT_SECS` (default 10 s for claude/gemini, 3 s for
+//!   install tools) before the fail-open fall-through, which then names the
+//!   tool and the `PATH` searched on stderr. A resolved tool never waits; see
+//!   [`resolve_real_waiting`].
 //!
 //! Registry creds: like the rest of interception, the stub injects NO registry
 //! secrets — the agent's shell already carries the operator's registry config.
@@ -62,6 +63,7 @@ use std::time::Duration;
 
 use qontinui_runner_lib::intercept_core::classify::{self, Classification, ShimTool};
 use qontinui_runner_lib::intercept_core::gate::{should_block, InterceptMode};
+use qontinui_runner_lib::intercept_core::npm_placeholder::is_npm_placeholder;
 use qontinui_runner_lib::intercept_core::types::PackageSpecInput;
 
 const GUARD_ENV: &str = "QONTINUI_INSTALL_INTERCEPT_GUARD";
@@ -283,9 +285,10 @@ pub fn detect_identity_tool(argv0: Option<&str>) -> Option<IdentityTool> {
 /// double-pin. Exact token match, case-insensitive, mirroring
 /// `identity_shim.cmd`; plus the `--session-id=…`/`--resume=…` inline forms the
 /// bash identity shim also honors. A merely-prefixed token
-/// (`--session-id-ish`) does NOT match.
+/// (`--session-id-ish`) does NOT match, and neither does anything after a `--`,
+/// which is positional.
 pub fn user_chose_session(args: &[String]) -> bool {
-    args.iter().any(|a| {
+    args.iter().take_while(|a| *a != "--").any(|a| {
         let t = a.to_ascii_lowercase();
         matches!(
             t.as_str(),
@@ -340,15 +343,18 @@ pub fn keeps_policy_delivered_sha(
     let Some(file) = delivered_file.filter(|f| !f.is_empty()) else {
         return false;
     };
-    let replacement = args
+    // Everything after a `--` is positional, so it delivers no prompt file and
+    // replaces no prompt.
+    let terminator = args.iter().position(|a| a == "--").unwrap_or(args.len());
+    let (flags, _) = args.split_at(terminator);
+    let replacement = flags
         .iter()
-        .take_while(|a| a.as_str() != "--")
         .map(|a| a.split_once('=').map_or(a.as_str(), |(name, _)| name))
         .any(|name| name == "--system-prompt" || name == "--system-prompt-file");
     tool == IdentityTool::Claude
         && !replacement
-        && args.iter().enumerate().any(|(i, a)| {
-            (a == FLAG && args.get(i + 1).is_some_and(|v| v == file))
+        && flags.iter().enumerate().any(|(i, a)| {
+            (a == FLAG && flags.get(i + 1).is_some_and(|v| v == file))
                 || a.strip_prefix(FLAG)
                     .and_then(|rest| rest.strip_prefix('='))
                     .is_some_and(|v| v == file)
@@ -542,8 +548,9 @@ fn write_temp_mcp_config(document: &str) -> Option<tempfile::TempPath> {
 /// `--mcp-config` pair (coord-mcp delivery), then `--session-id <pinned>` ONLY
 /// when the user did not choose a session and a pinned id exists. `--mcp-config`
 /// sits BEFORE `--session-id` on purpose: it is variadic, so a following
-/// `--`-flag must terminate it. Pure, so passthrough purity (incl. multi-line
-/// args) is unit-testable.
+/// `--`-flag must terminate it. All of ours go ahead of the first `--` in the
+/// original args, because after it they would be positional and deliver
+/// nothing. Pure, so passthrough purity (incl. multi-line args) is unit-testable.
 pub fn identity_argv(
     original: &[String],
     settings_args: &[String],
@@ -551,7 +558,12 @@ pub fn identity_argv(
     pinned: Option<&str>,
     user_chose: bool,
 ) -> Vec<String> {
-    let mut out: Vec<String> = original.to_vec();
+    let terminator = original
+        .iter()
+        .position(|a| a == "--")
+        .unwrap_or(original.len());
+    let (head, tail) = original.split_at(terminator);
+    let mut out: Vec<String> = head.to_vec();
     out.extend(settings_args.iter().cloned());
     out.extend(mcp_config_args.iter().cloned());
     if !user_chose {
@@ -562,6 +574,7 @@ pub fn identity_argv(
             }
         }
     }
+    out.extend_from_slice(tail);
     out
 }
 
@@ -1078,7 +1091,8 @@ fn resolve_real_waiting(
                 let _ = writeln!(
                     std::io::stderr(),
                     "qontinui-shim: {name} not found on PATH (excluding the shim dirs); waiting up \
-                     to {}s for it to reappear (a package-manager reinstall briefly removes it)",
+                     to {}s for it to reappear (a package-manager reinstall briefly removes it, or \
+                     leaves the npm placeholder stub in its place)",
                     wait.as_secs()
                 );
             }
@@ -1086,20 +1100,46 @@ fn resolve_real_waiting(
         },
     );
     if found.is_none() {
+        let path_var = env::var_os("PATH").unwrap_or_default();
         let _ = writeln!(
             std::io::stderr(),
-            "qontinui-shim: the real {name} was not found on PATH after waiting {}s; falling back \
-             to PATH dispatch. PATH searched (excluding {}): {}",
-            wait.as_secs(),
-            own_dirs
-                .iter()
-                .map(|d| d.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", "),
-            env::var("PATH").unwrap_or_default()
+            "{}",
+            unresolved_message(name, own_dirs, wait, &path_var)
         );
     }
     found
+}
+
+/// The give-up line [`resolve_real_waiting`] prints. When what IS on `PATH` is
+/// npm's placeholder stub it says so, because "not found" alone would hide
+/// that the reinstall's postinstall never replaced the stub.
+fn unresolved_message(
+    name: &str,
+    own_dirs: &[PathBuf],
+    wait: Duration,
+    path_var: &OsStr,
+) -> String {
+    let excluded = own_dirs
+        .iter()
+        .map(|d| d.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let searched = path_var.to_string_lossy();
+    match scan_path_in(name, own_dirs, path_var, Want::Placeholder) {
+        Some(stub) => format!(
+            "qontinui-shim: the real {name} was not found on PATH after waiting {}s; only the npm \
+             placeholder stub is there ({}), which the reinstall has not replaced. Falling back \
+             to PATH dispatch. PATH searched (excluding {excluded}): \
+             {searched}",
+            wait.as_secs(),
+            stub.display()
+        ),
+        None => format!(
+            "qontinui-shim: the real {name} was not found on PATH after waiting {}s; falling back \
+             to PATH dispatch. PATH searched (excluding {excluded}): {searched}",
+            wait.as_secs()
+        ),
+    }
 }
 
 /// Parse [`RESOLVE_WAIT_ENV`]: whole seconds, `0` disables; absent or garbled
@@ -1146,6 +1186,20 @@ where
 /// that blocked merges on 2026-07-11). The binary's callers pass the live env
 /// `PATH` via `resolve_real`.
 fn resolve_real_in(name: &str, own_dirs: &[PathBuf], path_var: &OsStr) -> Option<PathBuf> {
+    scan_path_in(name, own_dirs, path_var, Want::Real)
+}
+
+/// Which kind of candidate [`scan_path_in`] returns.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Want {
+    /// The real tool: anything that is not npm's placeholder stub.
+    Real,
+    /// npm's placeholder stub itself (only for the give-up message).
+    Placeholder,
+}
+
+/// First candidate of kind `want` on `path_var`, skipping `own_dirs`.
+fn scan_path_in(name: &str, own_dirs: &[PathBuf], path_var: &OsStr, want: Want) -> Option<PathBuf> {
     let own: Vec<PathBuf> = own_dirs.iter().map(|d| normalize_dir(d)).collect();
     for dir in env::split_paths(path_var) {
         if dir.as_os_str().is_empty() {
@@ -1157,8 +1211,15 @@ fn resolve_real_in(name: &str, own_dirs: &[PathBuf], path_var: &OsStr) -> Option
         // Windows real tools: cargo/pip = .exe; npm-family = .cmd. Prefer .exe.
         for cand_name in candidate_names(name) {
             let cand = dir.join(&cand_name);
-            if cand.is_file() {
-                return Some(cand);
+            if !cand.is_file() {
+                continue;
+            }
+            match (is_npm_placeholder(&cand), want) {
+                (false, Want::Real) | (true, Want::Placeholder) => return Some(cand),
+                // A real tool ahead of any stub: dispatch would reach it, so
+                // there is no stub to report.
+                (false, Want::Placeholder) => return None,
+                (true, Want::Real) => {}
             }
         }
     }
@@ -1580,6 +1641,59 @@ mod tests {
         );
     }
 
+    /// The 2026-10-21 shape: mid-reinstall, `claude` is present but is npm's
+    /// placeholder stub. It must read as a miss, and the real binary once
+    /// postinstall has linked it over the stub must read as a hit.
+    #[test]
+    fn resolve_real_treats_the_npm_placeholder_as_a_miss() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let exe = if cfg!(windows) {
+            "claude.exe"
+        } else {
+            "claude"
+        };
+        let stub = bin.join(exe);
+        std::fs::write(
+            &stub,
+            b"echo \"Error: claude native binary not installed.\" >&2\nexit 1\n",
+        )
+        .unwrap();
+        let path = bin.display().to_string();
+        assert!(is_npm_placeholder(&stub));
+        assert_eq!(resolve_real_in("claude", &[], OsStr::new(&path)), None);
+        let msg = unresolved_message("claude", &[], Duration::from_secs(3), OsStr::new(&path));
+        assert!(
+            msg.contains("after waiting 3s; only the npm placeholder stub is there")
+                && msg.contains(&stub.display().to_string()),
+            "the give-up line must name the stub rather than say only 'not found': {msg}"
+        );
+
+        std::fs::write(&stub, b"\x7fELF\x02\x01\x01 native code").unwrap();
+        assert!(!is_npm_placeholder(&stub));
+        assert_eq!(
+            resolve_real_in("claude", &[], OsStr::new(&path)),
+            Some(stub.clone())
+        );
+        let empty = tmp.path().join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        let msg = unresolved_message(
+            "claude",
+            &[],
+            Duration::from_secs(3),
+            OsStr::new(&empty.display().to_string()),
+        );
+        assert!(
+            !msg.contains("placeholder"),
+            "no stub, no stub wording: {msg}"
+        );
+        assert!(
+            !is_npm_placeholder(&tmp.path().join("absent")),
+            "a file that cannot be opened is not a placeholder"
+        );
+    }
+
     #[test]
     fn resolve_real_skips_all_own_dirs() {
         // The identity seam can put TWO of our dirs on PATH (identity + install)
@@ -1749,6 +1863,19 @@ mod tests {
             &attached,
             composed
         ));
+
+        // The composed file as a prompt word after `--`, either spelling, is
+        // not delivered: dropped.
+        for positional in [
+            strs(&["--", "--append-system-prompt-file", "/x/spawn-1.md"]),
+            strs(&["--", "--append-system-prompt-file=/x/spawn-1.md"]),
+        ] {
+            assert!(!keeps_policy_delivered_sha(
+                IdentityTool::Claude,
+                &positional,
+                composed
+            ));
+        }
 
         // A nested claude with its OWN file, either spelling: dropped.
         let own = strs(&["-p", "--append-system-prompt-file", "./eval.md"]);
@@ -2125,6 +2252,29 @@ mod tests {
         let mcp_pos = got.iter().position(|a| a == "--mcp-config").unwrap();
         let sid_pos = got.iter().position(|a| a == "--session-id").unwrap();
         assert!(mcp_pos < sid_pos, "--mcp-config must precede --session-id");
+
+        // A `--` in the original args keeps everything of ours ahead of it, and
+        // what follows it byte-exact, flag-shaped or not.
+        let with_terminator = strs(&["--verbose", "--", "the prompt", "--settings", "--"]);
+        assert_eq!(
+            identity_argv(&with_terminator, &settings, &mcp, Some("pin-123"), false),
+            strs(&[
+                "--verbose",
+                "--settings",
+                "C:\\hooks\\s.json",
+                "--mcp-config",
+                "C:\\cfg\\coord.json",
+                "--session-id",
+                "pin-123",
+                "--",
+                "the prompt",
+                "--settings",
+                "--",
+            ])
+        );
+        // ...and a session-looking prompt after `--` is not the user's choice.
+        assert!(!user_chose_session(&strs(&["--", "resume"])));
+        assert!(user_chose_session(&strs(&["resume", "--", "the prompt"])));
 
         // User chose ⇒ no pin appended, settings + mcp-config still delivered.
         assert_eq!(

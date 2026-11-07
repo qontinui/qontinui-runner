@@ -61,26 +61,32 @@ use super::manifest::{CiManifest, CiStep};
 use super::reporting::{self, LinePusher, ProgressSink, StepSummary};
 use super::CiDispatchPayload;
 
-/// Job-wide committed-memory ceiling for one dispatch's process tree
-/// (Windows). Deliberately generous — rustc at `CARGO_BUILD_JOBS=1` on this
-/// workspace legitimately commits >10 GiB — because this is a runaway
-/// backstop, not a tuning knob; the real throttle is the jobs cap.
-#[cfg(windows)]
-const CI_JOB_MEMORY_LIMIT_BYTES: usize = 32 * 1024 * 1024 * 1024;
+/// Job-wide memory ceiling for one dispatch's process tree. Deliberately
+/// generous — rustc at `CARGO_BUILD_JOBS=1` on this workspace legitimately
+/// commits >10 GiB — because this is a runaway backstop, not a tuning knob;
+/// the real throttle is the jobs cap. Windows enforces it with a Job Object,
+/// Linux with a cgroup v2 `memory.max` ([`super::cgroup`]): one number, both
+/// arms.
+#[cfg_attr(not(any(windows, target_os = "linux", test)), allow(dead_code))]
+pub(crate) const CI_JOB_MEMORY_LIMIT_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 
-/// Per-dispatch Job Object carrying the memory backstop. A no-op unit on
-/// non-Windows so call sites stay platform-uniform.
+/// Per-dispatch containment carrying the memory backstop: a Job Object on
+/// Windows, a cgroup v2 child on Linux (degrading explicitly, see
+/// [`super::cgroup`]), a no-op elsewhere so call sites stay platform-uniform.
 struct CiJob {
     #[cfg(windows)]
     inner: Option<qontinui_runner_win32::ScopedKillOnCloseJob>,
+    #[cfg(target_os = "linux")]
+    cgroup: super::cgroup::Containment,
 }
 
 impl CiJob {
-    fn create() -> Self {
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+    fn create(dispatch_id: &str) -> Self {
         #[cfg(windows)]
         {
             let inner = qontinui_runner_win32::ScopedKillOnCloseJob::create(Some(
-                CI_JOB_MEMORY_LIMIT_BYTES,
+                CI_JOB_MEMORY_LIMIT_BYTES as usize,
             ));
             if inner.is_none() {
                 warn!(
@@ -90,21 +96,84 @@ impl CiJob {
             }
             Self { inner }
         }
-        #[cfg(not(windows))]
+        #[cfg(target_os = "linux")]
+        {
+            Self {
+                cgroup: super::cgroup::Containment::create(dispatch_id, CI_JOB_MEMORY_LIMIT_BYTES),
+            }
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
         {
             Self {}
         }
     }
 
+    /// One line naming the containment state for the dispatch log (Linux
+    /// only; the Windows arm already warns when its job is unavailable).
+    fn describe(&self) -> Option<String> {
+        #[cfg(target_os = "linux")]
+        {
+            Some(self.cgroup.describe())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
+    }
+
+    /// Make the step command start inside the dispatch containment (before
+    /// spawn, so no descendant can run outside it).
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+    fn prepare(&self, cmd: &mut tokio::process::Command) {
+        #[cfg(target_os = "linux")]
+        if let super::cgroup::Containment::Cgroup(c) = &self.cgroup {
+            c.prepare(cmd);
+        }
+    }
+
     /// Assign a spawned step child to the dispatch job (in addition to the
     /// global job the caller already assigned it to).
-    #[cfg_attr(not(windows), allow(unused_variables))]
+    #[cfg_attr(not(any(windows, target_os = "linux")), allow(unused_variables))]
     fn assign(&self, child: &tokio::process::Child) {
         #[cfg(windows)]
         if let (Some(job), Some(raw)) = (self.inner.as_ref(), child.raw_handle()) {
             // SAFETY: `raw` came from the live `child` the caller still owns.
             unsafe { job.assign(raw as windows_sys::Win32::Foundation::HANDLE) };
         }
+        #[cfg(target_os = "linux")]
+        if let super::cgroup::Containment::Cgroup(c) = &self.cgroup {
+            c.adopt(child);
+        }
+    }
+
+    /// Kill every process of the dispatch (cancel / lease loss / timeout).
+    /// Windows kills the tree by pid elsewhere; this is the Linux subtree kill.
+    fn kill_all(&self) {
+        #[cfg(target_os = "linux")]
+        if let super::cgroup::Containment::Cgroup(c) = &self.cgroup {
+            let path = c.kill();
+            tracing::debug!("ci_node: dispatch cgroup killed via {path:?}");
+        }
+    }
+
+    /// The dispatch cgroup's cumulative kernel `oom_kill` count. `None` off
+    /// Linux, when uncontained, or when `memory.events` is unreadable.
+    fn oom_kill_count(&self) -> Option<u64> {
+        #[cfg(target_os = "linux")]
+        if let super::cgroup::Containment::Cgroup(c) = &self.cgroup {
+            return c.oom_kill_count();
+        }
+        None
+    }
+
+    /// A log line when the kernel OOM-killed part of the dispatch since the
+    /// last call, so a memory kill reads as one rather than as a bare signal.
+    fn memory_kill_note(&self) -> Option<String> {
+        #[cfg(target_os = "linux")]
+        if let super::cgroup::Containment::Cgroup(c) = &self.cgroup {
+            return c.take_oom_note();
+        }
+        None
     }
 }
 
@@ -460,10 +529,14 @@ pub(crate) async fn run_dispatch(
 
     // Per-dispatch memory-backstop job (held across all steps; dropping it
     // at dispatch end kill-on-closes any stray build processes).
-    let ci_job = CiJob::create();
+    let ci_job = CiJob::create(&payload.dispatch_id);
+    if let Some(line) = ci_job.describe() {
+        sink.push(&line);
+    }
 
     // ── Steps (sequential; first failure short-circuits) ──
     let mut overall = StepOutcome::Success;
+    let mut result_reason: Option<&'static str> = None;
     for step in &manifest.steps {
         if cancel.is_cancelled() {
             overall = StepOutcome::Cancelled;
@@ -476,7 +549,9 @@ pub(crate) async fn run_dispatch(
             step.effective_timeout_secs()
         ));
         let step_started = Instant::now();
+        let oom_before = ci_job.oom_kill_count();
         let outcome = run_step(step, &dispatch_env, &worktree, &ci_job, &sink, &cancel).await;
+        let oom_after = ci_job.oom_kill_count();
         let duration = step_started.elapsed().as_secs();
         sink.push(&format!(
             "[ci-node] step {} → {} in {duration}s",
@@ -489,6 +564,7 @@ pub(crate) async fn run_dispatch(
             duration_secs: duration,
         });
         if outcome != StepOutcome::Success {
+            result_reason = step_failure_reason(&outcome, oom_before, oom_after);
             overall = outcome;
             break;
         }
@@ -525,7 +601,7 @@ pub(crate) async fn run_dispatch(
         &payload.dispatch_id,
         conclusion,
         &steps_summary,
-        None,
+        result_reason,
         &tail,
         capture.artifact(),
         Some(&canonical_outcome),
@@ -533,6 +609,31 @@ pub(crate) async fn run_dispatch(
     .await;
     // The receipt is the only key to cleanup; the artifact is already sent.
     workspace.cleanup(reported).await;
+}
+
+/// `summary.reason` for a dispatch whose failing step the kernel OOM-killed
+/// inside the dispatch cgroup. Same vocabulary as the Actions lane's
+/// `out_of_memory` no-verdict marker (coord `main_baseline_no_verdict`). Coord
+/// stores a dispatch `summary` as opaque JSON today and acts on no reason, so
+/// this is an operator-readable label until coord's dispatch-result ingest
+/// reads it. The conclusion stays `failure`; this only names why.
+const OUT_OF_MEMORY_REASON: &str = "out_of_memory";
+
+/// The result reason for a non-success step: `out_of_memory` only when the
+/// cgroup's `oom_kill` counter PROVABLY rose across the step. An unreadable
+/// counter on either side is UNKNOWN and claims nothing.
+fn step_failure_reason(
+    outcome: &StepOutcome,
+    oom_before: Option<u64>,
+    oom_after: Option<u64>,
+) -> Option<&'static str> {
+    if matches!(outcome, StepOutcome::Success | StepOutcome::Cancelled) {
+        return None;
+    }
+    match (oom_before, oom_after) {
+        (Some(b), Some(a)) if a > b => Some(OUT_OF_MEMORY_REASON),
+        _ => None,
+    }
 }
 
 /// Provision what the manifest declares. Returns the tool directories to
@@ -671,6 +772,7 @@ fn spawn_step_child(
     step: &CiStep,
     cwd: &Path,
     envs: &[(String, String)],
+    ci_job: &CiJob,
 ) -> Result<tokio::process::Child, String> {
     let apply = |cmd: &mut tokio::process::Command| {
         cmd.current_dir(cwd)
@@ -680,6 +782,7 @@ fn spawn_step_child(
         for (k, v) in envs {
             cmd.env(k, v);
         }
+        ci_job.prepare(cmd);
     };
     let mut direct = build_step_command(&step.command[0], &step.command[1..]);
     apply(&mut direct);
@@ -697,17 +800,23 @@ fn spawn_step_child(
     }
 }
 
-/// Kill a step's process tree. On Windows `taskkill /T` takes the whole
-/// tree (killing only the direct child would orphan cargo/node under a
-/// `cmd.exe` shim until Job-Object close); elsewhere `start_kill` suffices.
-async fn kill_step_tree(child: &mut tokio::process::Child) {
+/// Kill a step's process tree. On Windows the in-process tree kill takes the
+/// whole tree (killing only the direct child would orphan cargo/node under a
+/// `cmd.exe` shim until Job-Object close) without spawning a process;
+/// elsewhere `start_kill` suffices.
+async fn kill_step_tree(child: &mut tokio::process::Child, ci_job: &CiJob) {
+    // Linux: the whole dispatch cgroup, which also takes daemonised
+    // grandchildren a pid-tree walk would miss.
+    ci_job.kill_all();
     #[cfg(target_os = "windows")]
     {
         if let Some(pid) = child.id() {
-            let _ = crate::process_helpers::tokio_no_window("taskkill")
-                .args(["/F", "/T", "/PID", &pid.to_string()])
-                .output()
-                .await;
+            if let Err(e) =
+                crate::tree_kill::kill_tree_by_pid_async(pid, std::time::Duration::from_secs(5))
+                    .await
+            {
+                tracing::debug!("ci step tree kill of pid {pid}: {e}");
+            }
         }
     }
     let _ = child.start_kill();
@@ -813,7 +922,7 @@ async fn run_step(
         .collect();
     envs.extend(dispatch_env.exports.iter().cloned());
 
-    let mut child = match spawn_step_child(step, &cwd, &envs) {
+    let mut child = match spawn_step_child(step, &cwd, &envs, ci_job) {
         Ok(c) => c,
         Err(e) => {
             sink.push(&format!("[ci-node] step {}: {e}", step.name));
@@ -867,7 +976,7 @@ async fn run_step(
                 step.name,
                 timeout.as_secs()
             ));
-            kill_step_tree(&mut child).await;
+            kill_step_tree(&mut child, ci_job).await;
             StepOutcome::Timeout
         }
         _ = cancel.cancelled() => {
@@ -875,10 +984,14 @@ async fn run_step(
                 "[ci-node] step {} cancelled — killing process tree",
                 step.name
             ));
-            kill_step_tree(&mut child).await;
+            kill_step_tree(&mut child, ci_job).await;
             StepOutcome::Cancelled
         }
     };
+
+    if let Some(note) = ci_job.memory_kill_note() {
+        sink.push(&note);
+    }
 
     // The pumps end when the pipes close (child exit or kill).
     if let Some(t) = out_task {
@@ -927,6 +1040,125 @@ mod tests {
                 "a git CI step must not inherit {var}; removed: {removed:?}"
             );
         }
+    }
+
+    /// Where the runner's CI node actually enters sibling provisioning:
+    /// [`provision`], called by `run_dispatch` with the dispatch root under
+    /// `<root>/.ci-worktrees/<id>`. The runner's CI root is the workspace
+    /// root, itself a git repository, so that dispatch root sits INSIDE an
+    /// enclosing repo whose own `.git/config` carries an `insteadOf` routing
+    /// the sibling's GitHub URL to a local repository. The sibling's git must
+    /// not read it: isolated, the GitHub URL is asked as-is (a repository that
+    /// does not exist, so the resolve fails offline or not); unisolated, the
+    /// rewrite answers the resolve with the local repository's tip, so
+    /// provisioning gets past `resolving …` (and fails later, at the fetch,
+    /// which runs in the sibling's own repo) — the `resolving` error is what
+    /// tells the two apart.
+    #[tokio::test]
+    async fn a_dispatch_provision_ignores_an_enclosing_repos_url_rewrite() {
+        let git = |cwd: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(cwd)
+                .args(args)
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .output()
+                .expect("git runs");
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        };
+        let dir = tempfile::tempdir().unwrap();
+        // A local "remote" with one commit on `main`, at `<dir>/remote.git`.
+        let remote = dir.path().join("remote.git");
+        std::fs::create_dir_all(&remote).unwrap();
+        git(&remote, &["init", "-q", "-b", "main"]);
+        git(
+            &remote,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "local",
+            ],
+        );
+        // The CI root: a git repository whose local config rewrites the
+        // sibling's GitHub URL (`https://github.com/qontinui-arming-probe/
+        // remote.git`) to the local repository above.
+        let root = dir.path().join("ws");
+        std::fs::create_dir_all(&root).unwrap();
+        git(&root, &["init", "-q"]);
+        git(
+            &root,
+            &[
+                "config",
+                &format!("url.{}/.insteadOf", dir.path().display()),
+                "https://github.com/qontinui-arming-probe/",
+            ],
+        );
+        let payload: CiDispatchPayload = serde_json::from_value(serde_json::json!({
+            "dispatch_id": "d-1",
+            "repo": "qontinui/qontinui-runner",
+            "head_sha": "s",
+            "fetch_url": "u",
+            "candidate_ref": "refs/heads/merge-candidate/1",
+        }))
+        .unwrap();
+        let worktree = super::super::checkout::ci_worktree_path(&root, "d-1", &payload.repo);
+        std::fs::create_dir_all(&worktree).unwrap();
+        let manifest = super::super::manifest::parse_and_validate(
+            "version = 1\n[[siblings]]\nrepo = \"qontinui-arming-probe/remote\"\n\
+             pin = \"default-branch\"\nbranch = \"main\"\n\
+             [[steps]]\nname = \"x\"\ncommand = [\"true\"]\n",
+        )
+        .unwrap();
+        let cancel = CancellationToken::new();
+        // A coord base nothing listens on: the sink's flusher fails and drops.
+        let sink = ProgressSink::start(
+            "http://127.0.0.1:9".to_string(),
+            "d-1".to_string(),
+            cancel.clone(),
+        );
+        let mut services = super::super::services::ServiceStack::new("d-1");
+
+        let res = provision(
+            &payload,
+            &root,
+            &worktree,
+            &manifest,
+            &sink,
+            &cancel,
+            &mut services,
+        )
+        .await;
+        let err = res.expect_err("the enclosing repo's rewrite reached sibling git");
+        assert!(
+            err.contains("resolving qontinui-arming-probe/remote@main"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn oom_reason_only_when_the_counter_provably_rose() {
+        use StepOutcome::*;
+        assert_eq!(
+            step_failure_reason(&Failure, Some(0), Some(1)),
+            Some("out_of_memory")
+        );
+        assert_eq!(
+            step_failure_reason(&Timeout, Some(2), Some(3)),
+            Some("out_of_memory")
+        );
+        // No rise, or an unreadable counter on either side: claims nothing.
+        assert_eq!(step_failure_reason(&Failure, Some(1), Some(1)), None);
+        assert_eq!(step_failure_reason(&Failure, None, Some(1)), None);
+        assert_eq!(step_failure_reason(&Failure, Some(0), None), None);
+        // A cancelled or successful step is never relabelled.
+        assert_eq!(step_failure_reason(&Cancelled, Some(0), Some(1)), None);
+        assert_eq!(step_failure_reason(&Success, Some(0), Some(1)), None);
     }
 
     #[test]

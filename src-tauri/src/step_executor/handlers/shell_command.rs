@@ -603,7 +603,7 @@ impl ShellCommandHandler {
         None
     }
 
-    /// Probe `GET http://localhost:<port>/state-machine/status` and return whether
+    /// Probe `GET http://127.0.0.1:<port>/state-machine/status` and return whether
     /// a state machine is currently loaded in the Python bridge.
     ///
     /// Timeout is 3s so a hung or unreachable bridge doesn't block the step for
@@ -611,7 +611,10 @@ impl ShellCommandHandler {
     /// Err so the caller can log and fall through to curl (which will produce
     /// its own error).
     async fn check_state_machine_loaded(port: u16) -> Result<bool, String> {
-        let url = format!("http://localhost:{}/state-machine/status", port);
+        let url = format!(
+            "{}/state-machine/status",
+            crate::mcp::types::runner_loopback_base(port)
+        );
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(3))
             .build()

@@ -61,6 +61,9 @@ mod tests {
 
     #[test]
     fn without_a_root_the_candidates_are_unchanged() {
+        // The bare default reads `HOME` / the XDG dirs, which a sibling
+        // test's `isolated_ambient()` repoints mid-test without this lock.
+        let _lock = crate::test_env::env_lock();
         let dir = std::env::temp_dir().join("subject-isolation-override");
         let over = Some(dir.to_string_lossy().into_owned());
         assert_eq!(
@@ -81,6 +84,9 @@ mod tests {
 
     #[test]
     fn under_a_root_the_override_is_the_only_candidate() {
+        // The bare default reads `HOME` / the XDG dirs, which a sibling
+        // test's `isolated_ambient()` repoints mid-test without this lock.
+        let _lock = crate::test_env::env_lock();
         let root = std::env::temp_dir().join("subject-root");
         let secure = root.join("secure");
         let got = binding_store_candidate_paths_for(

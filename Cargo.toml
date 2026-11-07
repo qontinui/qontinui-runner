@@ -163,3 +163,8 @@ lto = false
 # match) -- without that guard the crash would silently return.
 [patch.crates-io]
 tao = { path = "vendor/tao-0.35.0" }
+# portable-pty's pre_exec closed std's exec-error pipe, so a failed exec aborted
+# the child onto the pane instead of returning Err. Delta and removal condition:
+# `vendor/portable-pty-0.8.1/QONTINUI-PATCH.md`; guarded by
+# `src-tauri/tests/portable_pty_exec_failure_reports.rs`.
+portable-pty = { path = "vendor/portable-pty-0.8.1" }

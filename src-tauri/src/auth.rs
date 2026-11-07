@@ -14,7 +14,7 @@ use keyring::Entry;
 use serde::Deserialize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
 /// Service name used for keychain entries (legacy)
@@ -726,10 +726,14 @@ impl AuthManager {
         //     `.enc` file — doing so would mask the corruption (no forensics)
         //     and resurrect potentially-stale keychain tokens over a present
         //     store. So we suppress the migrate-write in this case.
+        //
+        // The per-read lines below are TRACE, not DEBUG: every periodic loop
+        // reads the token through here, so at DEBUG they flooded the log.
+        // Every `warn!` branch is unchanged.
         let store_present = self.secure_storage.store_file_exists();
         match self.secure_storage.get_access_token() {
             Ok(token) => {
-                debug!("Retrieved access token from secure storage");
+                trace!("Retrieved access token from secure storage");
                 return Ok(token);
             }
             Err(e) => {
@@ -741,7 +745,7 @@ impl AuthManager {
                         e
                     );
                 } else {
-                    debug!("Access token not in secure storage (no store file): {}", e);
+                    trace!("Access token not in secure storage (no store file): {}", e);
                 }
             }
         }
@@ -768,7 +772,7 @@ impl AuthManager {
                 Ok(token)
             }
             Err(e) => {
-                debug!("Access token not in keychain: {}", e);
+                trace!("Access token not in keychain: {}", e);
                 Err(anyhow::anyhow!("Access token not found in any storage"))
             }
         }
@@ -833,11 +837,14 @@ impl AuthManager {
         // Try file storage first (primary)
         match self.secure_storage.get_refresh_token() {
             Ok(token) => {
-                debug!("Retrieved refresh token from secure storage");
+                // TRACE, like the access-token lines above: every refresh read
+                // lands here, on a paired store or (the two arms below) an
+                // unpaired one.
+                trace!("Retrieved refresh token from secure storage");
                 return Ok(token);
             }
             Err(e) => {
-                debug!("Refresh token not in secure storage: {}", e);
+                trace!("Refresh token not in secure storage: {}", e);
             }
         }
 
@@ -848,7 +855,7 @@ impl AuthManager {
                 Ok(token)
             }
             Err(e) => {
-                debug!("Refresh token not in keychain: {}", e);
+                trace!("Refresh token not in keychain: {}", e);
                 Err(anyhow::anyhow!("Refresh token not found in any storage"))
             }
         }
@@ -1449,6 +1456,33 @@ impl AuthManager {
         self.secure_storage
             .store_tenant_device_jwt(tenant_id, jwt)
             .context("Failed to store per-tenant device JWT in secure storage")
+    }
+
+    /// [`Self::store_tenant_device_jwt`], refusing to persist unless the
+    /// token's own `tenant_id` claim is EXACTLY `tenant_id`.
+    ///
+    /// Stricter than [`Self::store_tokens_expecting`] on purpose: that guard
+    /// lets a claimless token through, because the legacy slot also holds
+    /// opaque bearers. A per-tenant slot is a credential SELECTED BY ITS
+    /// KEY, so a token with no claim, or another tenant's, filed under
+    /// `tenant_id` is the cross-tenant substitution `select_device_bearer`
+    /// exists to prevent. The only caller is the Phase 7 seed arm, whose
+    /// token comes from coord's per-binding door and always carries the
+    /// requested tenant. A refusal downcasts to [`TenantMismatch`].
+    ///
+    /// Plan `2026-09-20-per-tenant-coord-credentials-and-a-workspace-tenant-pin`
+    /// Phase 7.
+    #[track_caller]
+    pub fn store_tenant_device_jwt_expecting(&self, tenant_id: &Uuid, jwt: &str) -> Result<()> {
+        let returned = jwt_tenant_claim(jwt);
+        if returned != Some(*tenant_id) {
+            return Err(TenantMismatch {
+                expected: *tenant_id,
+                returned,
+            }
+            .into());
+        }
+        self.store_tenant_device_jwt(tenant_id, jwt)
     }
 
     /// Explicit-acquisition variant of [`Self::store_tenant_device_jwt`]:
@@ -2341,17 +2375,89 @@ pub(crate) fn default_binding_tenant() -> Option<Uuid> {
 
 /// [`default_binding_tenant`] without the collapse.
 pub(crate) fn default_binding_tenant_probe() -> BindingTenantRead {
-    let base = std::env::var("QONTINUI_SECURE_STORAGE_DIR")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(std::path::PathBuf::from)
-        .or_else(|| dirs::data_local_dir().map(|d| d.join("com.qontinui.runner")));
+    let base = qontinui_runner_lib::instance_env::secure_storage_dir();
     // No storage dir resolvable at all — a machine that cannot say where its
     // own state lives has not established anything.
     let Some(base) = base else {
         return BindingTenantRead::Unknown;
     };
     default_binding_tenant_in(&base)
+}
+
+/// The SET of tenants this device is bound to, per `paired_user.json`, with an
+/// unreadable store kept distinct from an empty set (plan
+/// `2026-10-17-session-info-tenant-row-renders-unknown-for-a-resolved-tenant`
+/// Phase 2). The display-only twin of [`BindingTenantRead`] for the whole set:
+/// it decides nothing about credentials, it only lets a surface say "1 of 4
+/// bound" — or say it cannot.
+///
+/// `pair::read_paired_binding_tenant_ids` answers the same question but
+/// collapses an unreadable file to `[]`, and `pair` is lib-only besides.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BindingSetRead {
+    /// The file was read and states these bindings, in file order (each the
+    /// entry's `tenant_id`, trimmed). Empty ONLY when the file is genuinely
+    /// absent — an unpaired device, measured.
+    Measured(Vec<String>),
+    /// Nothing was established; the reason says why: `no_storage_dir`,
+    /// `paired_user_unreadable`, `paired_user_unparseable`, `bindings_unstated`,
+    /// `bindings_blank_tenant_id`.
+    Unknown(&'static str),
+}
+
+/// Read the device's bound tenant set — see [`BindingSetRead`].
+pub(crate) fn binding_set_probe() -> BindingSetRead {
+    let Some(base) = qontinui_runner_lib::instance_env::secure_storage_dir() else {
+        return BindingSetRead::Unknown("no_storage_dir");
+    };
+    binding_set_in(&base)
+}
+
+/// Pure-over-a-path core of [`binding_set_probe`], with the same NotFound /
+/// other-error split as [`default_binding_tenant_in`].
+pub(crate) fn binding_set_in(base: &std::path::Path) -> BindingSetRead {
+    let bytes = match std::fs::read(base.join("paired_user.json")) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return BindingSetRead::Measured(Vec::new())
+        }
+        Err(_) => return BindingSetRead::Unknown("paired_user_unreadable"),
+    };
+    match serde_json::from_slice::<serde_json::Value>(&bytes) {
+        Ok(value) => binding_set_from_value(&value),
+        Err(_) => BindingSetRead::Unknown("paired_user_unparseable"),
+    }
+}
+
+/// The parse half of [`binding_set_probe`]. It does not re-implement the shape
+/// rules: [`measured_binding_count_from_value`] decides whether the file states
+/// a set at all, and this only lifts the ids out of the shape it accepted — so
+/// a MEASURED set's length can never disagree with [`MeasuredBindingCount`].
+///
+/// The one place this reader is stricter: an entry whose `tenant_id` trims to
+/// empty. The count accepts it (any string), but a blank id names no tenant, so
+/// rather than list it, or drop it and report a set one shorter than the count,
+/// the set is `Unknown("bindings_blank_tenant_id")`. Display-only; the count
+/// and every decision made from it are unchanged.
+pub(crate) fn binding_set_from_value(value: &serde_json::Value) -> BindingSetRead {
+    let tenant_of = |e: &serde_json::Value| {
+        e.get("tenant_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+    };
+    match measured_binding_count_from_value(value) {
+        MeasuredBindingCount::Unknown => BindingSetRead::Unknown("bindings_unstated"),
+        MeasuredBindingCount::Measured(_) => {
+            let ids: Vec<String> = match value.get("bindings").and_then(|b| b.as_array()) {
+                Some(arr) => arr.iter().filter_map(tenant_of).collect(),
+                None => tenant_of(value).into_iter().collect(),
+            };
+            if ids.iter().any(|id| id.is_empty()) {
+                return BindingSetRead::Unknown("bindings_blank_tenant_id");
+            }
+            BindingSetRead::Measured(ids)
+        }
+    }
 }
 
 /// Pure-over-a-path core of [`default_binding_tenant_probe`], so the
@@ -2422,11 +2528,7 @@ pub(crate) fn device_binding_count() -> usize {
 /// or the file does not parse. The one file read both binding-count parsers
 /// share; each classifies the absence its own way.
 fn read_paired_user_value() -> Option<serde_json::Value> {
-    let base = std::env::var("QONTINUI_SECURE_STORAGE_DIR")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(std::path::PathBuf::from)
-        .or_else(|| dirs::data_local_dir().map(|d| d.join("com.qontinui.runner")))?;
+    let base = qontinui_runner_lib::instance_env::secure_storage_dir()?;
     let bytes = std::fs::read(base.join("paired_user.json")).ok()?;
     serde_json::from_slice::<serde_json::Value>(&bytes).ok()
 }
@@ -5649,6 +5751,44 @@ mod bearer_selection_tests {
         assert_eq!(mgr.get_tenant_device_jwt(&returned).unwrap(), None);
     }
 
+    /// Phase 7: the per-tenant write refuses another tenant's token AND a
+    /// claimless one (a slot is selected by key, so there is no "regardless"
+    /// arm), and stores a matching one in that tenant's slot only.
+    #[test]
+    fn store_tenant_device_jwt_expecting_refuses_a_cross_tenant_or_claimless_token() {
+        let mgr = create_test_auth_manager("tenant_slot_expecting");
+        let want = Uuid::parse_str("11111111-2222-4333-8444-55555555556a").unwrap();
+        let other = Uuid::parse_str("22222222-3333-4444-5555-66666666667a").unwrap();
+        let exp = chrono::Utc::now().timestamp() + 600;
+
+        let wrong = jwt_with_tenant(&other, exp);
+        let err = mgr
+            .store_tenant_device_jwt_expecting(&want, &wrong)
+            .expect_err("another tenant's token must be refused");
+        let mismatch = err.downcast_ref::<TenantMismatch>().expect("typed");
+        assert_eq!((mismatch.expected, mismatch.returned), (want, Some(other)));
+
+        let err = mgr
+            .store_tenant_device_jwt_expecting(&want, "opaque-bearer")
+            .expect_err("a claimless token must be refused");
+        assert_eq!(err.downcast_ref::<TenantMismatch>().unwrap().returned, None);
+        assert_eq!(mgr.get_tenant_device_jwt(&want).unwrap(), None);
+        assert_eq!(mgr.get_tenant_device_jwt(&other).unwrap(), None);
+
+        let right = jwt_with_tenant(&want, exp);
+        mgr.store_tenant_device_jwt_expecting(&want, &right)
+            .expect("a matching claim stores");
+        assert_eq!(
+            mgr.get_tenant_device_jwt(&want).unwrap().as_deref(),
+            Some(right.as_str())
+        );
+        assert_eq!(mgr.get_tenant_device_jwt(&other).unwrap(), None);
+        assert!(
+            mgr.get_access_token().is_err() || mgr.get_access_token().unwrap().is_empty(),
+            "the legacy slot is never touched"
+        );
+    }
+
     /// A token with NO decodable `tenant_id` claim has nothing to compare
     /// against, so it stores as today even when a tenant was expected.
     #[test]
@@ -5856,5 +5996,136 @@ mod device_jwt_tests {
             mgr.cognito_token_needs_refresh(),
             "an already-expired token must report stale"
         );
+    }
+}
+
+#[cfg(test)]
+mod binding_set_tests {
+    use super::{
+        binding_set_from_value, binding_set_in, measured_binding_count_from_value, BindingSetRead,
+        MeasuredBindingCount,
+    };
+    use serde_json::json;
+
+    const A: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+    const B: &str = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+    const C: &str = "cccccccc-cccc-cccc-cccc-cccccccccccc";
+    const D: &str = "dddddddd-dddd-dddd-dddd-dddddddddddd";
+
+    #[test]
+    fn an_absent_pairing_file_is_the_measured_empty_set() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(binding_set_in(dir.path()), BindingSetRead::Measured(vec![]));
+    }
+
+    #[test]
+    fn an_unreadable_pairing_file_is_unknown_not_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        // A DIRECTORY where the file should be: the read fails with an error
+        // that is not NotFound.
+        std::fs::create_dir(dir.path().join("paired_user.json")).unwrap();
+        assert_eq!(
+            binding_set_in(dir.path()),
+            BindingSetRead::Unknown("paired_user_unreadable")
+        );
+    }
+
+    #[test]
+    fn an_unparseable_pairing_file_is_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("paired_user.json"), b"{not json").unwrap();
+        assert_eq!(
+            binding_set_in(dir.path()),
+            BindingSetRead::Unknown("paired_user_unparseable")
+        );
+    }
+
+    #[test]
+    fn four_v2_bindings_read_as_four_ids_in_file_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let v = json!({
+            "default_tenant_id": B,
+            "bindings": [{"tenant_id": A}, {"tenant_id": B}, {"tenant_id": C}, {"tenant_id": format!(" {D} ")}],
+        });
+        std::fs::write(dir.path().join("paired_user.json"), v.to_string()).unwrap();
+        assert_eq!(
+            binding_set_in(dir.path()),
+            BindingSetRead::Measured(vec![A.into(), B.into(), C.into(), D.into()])
+        );
+    }
+
+    #[test]
+    fn the_legacy_v1_shape_is_one_binding() {
+        assert_eq!(
+            binding_set_from_value(&json!({"tenant_id": A})),
+            BindingSetRead::Measured(vec![A.into()])
+        );
+    }
+
+    #[test]
+    fn a_shape_that_states_no_set_is_unknown() {
+        for v in [
+            json!({"bindings": []}),
+            json!({"bindings": "x"}),
+            json!({"bindings": [{}]}),
+            json!({"bindings": [{"tenant_id": A}, {"tenant_id": 7}]}),
+            json!({"user_id": "u"}),
+        ] {
+            assert_eq!(
+                binding_set_from_value(&v),
+                BindingSetRead::Unknown("bindings_unstated"),
+                "{v}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_blank_tenant_id_makes_the_set_unknown_rather_than_shorter_or_blank() {
+        for v in [
+            json!({"bindings": [{"tenant_id": A}, {"tenant_id": "  "}]}),
+            json!({"bindings": [{"tenant_id": ""}]}),
+            json!({"tenant_id": " "}),
+        ] {
+            // The count still measures it (unchanged, decision-bearing)...
+            assert!(
+                matches!(
+                    measured_binding_count_from_value(&v),
+                    MeasuredBindingCount::Measured(_)
+                ),
+                "{v}"
+            );
+            // ...the display set refuses to list a blank or under-count.
+            assert_eq!(
+                binding_set_from_value(&v),
+                BindingSetRead::Unknown("bindings_blank_tenant_id"),
+                "{v}"
+            );
+        }
+    }
+
+    /// The set can never disagree with the strict count: same Measured/Unknown
+    /// verdict, and the same length.
+    #[test]
+    fn the_set_agrees_with_the_measured_binding_count_on_every_shape() {
+        for v in [
+            json!({"bindings": [{"tenant_id": A}]}),
+            json!({"bindings": [{"tenant_id": A}, {"tenant_id": B}]}),
+            json!({"bindings": [], "tenant_id": A}),
+            json!({"tenant_id": A}),
+            json!({"tenant_id": 7}),
+            json!({"bindings": [7]}),
+            json!({}),
+        ] {
+            match (
+                measured_binding_count_from_value(&v),
+                binding_set_from_value(&v),
+            ) {
+                (MeasuredBindingCount::Measured(n), BindingSetRead::Measured(ids)) => {
+                    assert_eq!(ids.len(), n, "{v}")
+                }
+                (MeasuredBindingCount::Unknown, BindingSetRead::Unknown(_)) => {}
+                (m, s) => panic!("{v}: count {m:?} vs set {s:?}"),
+            }
+        }
     }
 }

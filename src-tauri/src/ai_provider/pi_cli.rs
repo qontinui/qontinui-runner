@@ -380,8 +380,8 @@ fn execute_argv(
         // TIMED OUT — return NOW, without joining the reader threads.
         //
         // `Timeout` carries no output, so joining buys nothing here, and it
-        // can cost everything: `kill_child_tree` is best-effort (taskkill can
-        // fail or be slow under load, and then only `cmd.exe`/`node` dies).
+        // can cost everything: `kill_child_tree` is best-effort (the tree kill
+        // can fail, and then only `cmd.exe`/`node` dies).
         // A surviving grandchild still holds the pipe write-ends, so the
         // readers would never see EOF and the join would block for the
         // child's full natural lifetime — defeating the very timeout that
@@ -409,37 +409,26 @@ fn execute_argv(
     }
 }
 
+/// Wall-clock cap on [`kill_child_tree`]'s in-process tree walk.
+#[cfg(target_os = "windows")]
+const PI_TREE_KILL_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Kill the child and — on Windows — its whole process tree.
 ///
 /// Killing only the direct child (`cmd.exe` for the shim path, `node` for
 /// the fallback) orphans grandchildren (pi's actual node process), which
 /// keep running AND keep the stdout/stderr pipe write-ends open, wedging
-/// the reader threads until the orphan exits on its own. `taskkill /T`
-/// takes the whole tree down (same pattern as `doctor/commands.rs`).
+/// the reader threads until the orphan exits on its own. The in-process tree
+/// kill takes the whole tree down without spawning a process.
 fn kill_child_tree(child: &mut std::process::Child) {
     #[cfg(target_os = "windows")]
     {
-        let pid = child.id();
-        match crate::process_helpers::no_window("taskkill")
-            .args(["/F", "/T", "/PID", &pid.to_string()])
-            .output()
-        {
-            Ok(o) if o.status.success() => {}
-            Ok(o) => {
-                warn!(
-                    "taskkill /T for pi pid {} failed ({}); falling back to plain kill",
-                    pid,
-                    String::from_utf8_lossy(&o.stderr).trim()
-                );
-                let _ = child.kill();
-            }
-            Err(e) => {
-                warn!(
-                    "taskkill spawn failed for pi pid {} ({}); falling back to plain kill",
-                    pid, e
-                );
-                let _ = child.kill();
-            }
+        if let Err(e) = crate::tree_kill::kill_child_tree(child, PI_TREE_KILL_BUDGET) {
+            warn!(
+                "tree kill of pi pid {} failed ({e}); falling back to plain kill",
+                child.id()
+            );
+            let _ = child.kill();
         }
     }
     #[cfg(not(target_os = "windows"))]
@@ -542,7 +531,7 @@ mod tests {
     ///
     /// REGRESSION: this path originally joined the reader threads before
     /// returning `Timeout`. Those joins only finish once every pipe
-    /// write-end closes — so whenever the best-effort `taskkill /T` missed
+    /// write-end closes — so whenever the best-effort tree kill missed
     /// the grandchild (it can fail or lag under parallel-suite load), the
     /// call blocked for the child's FULL natural lifetime instead of the
     /// deadline. It showed up as a load-dependent flake, but the real defect
@@ -563,8 +552,8 @@ mod tests {
             ExecOutcome::Timeout => {}
             other => panic!("expected timeout, got {}", outcome_name(&other)),
         }
-        // Generous vs the 1s deadline (CI is slow, and taskkill spawns a
-        // process) but far below the grandchild's ~29s lifetime — so this
+        // Generous vs the 1s deadline (CI is slow) but far below the
+        // grandchild's ~29s lifetime — so this
         // fails if the return ever waits on a surviving grandchild again.
         assert!(
             started.elapsed() < Duration::from_secs(15),

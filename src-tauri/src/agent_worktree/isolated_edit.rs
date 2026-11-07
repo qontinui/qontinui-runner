@@ -42,6 +42,10 @@ pub struct IsolatedEditContext {
     /// mode off path never reaches here). Drop releases EVERY entry.
     /// Phase 1 of plan 2026-06-06-session-scoped-multi-repo-workspace.
     pub active_claims: Vec<ActiveClaim>,
+    /// coord's one-line notes about build siblings it could not expand for this
+    /// allocation (see [`super::AllocateResult::sibling_notes`]). Empty on
+    /// every path that did not run the runner-side allocate.
+    pub sibling_notes: Vec<String>,
 
     // One heartbeat handle per claim in `active_claims` — each task lives
     // as long as the context; the handle's own Drop notifies its cancel
@@ -144,7 +148,7 @@ impl Drop for IsolatedEditContext {
         // Tear down the per-agent git credential material installed by
         // `allocate_and_materialize_with_claim` (one
         // `setup_credential_helper_for_worktree` per materialized worktree,
-        // keyed on the AGENT id — a key space `SessionRegistry::close` never
+        // keyed on the AGENT id — a key space `SessionRegistry::close_by_id` never
         // reaches, because it drains the coord SESSION uuid).
         //
         // Without this the install leaks three ways for the whole runner
@@ -466,6 +470,7 @@ pub async fn acquire(
         agent_id: result.agent_id,
         worktrees: result.worktrees,
         active_claims: result.active_claims,
+        sibling_notes: result.sibling_notes,
         _heartbeats: heartbeats,
         coord_http_base,
         device_id,
@@ -627,6 +632,7 @@ async fn materialize_repos(
             token_jti: sb.token_jti,
             token_exp: sb.token_exp,
             active_claims: sb.active_claims,
+            sibling_notes: sb.sibling_notes,
         }),
         MaterializeOutcome::Wait(w) => Err(AllocateError::Wait(w)),
     }
@@ -1407,6 +1413,7 @@ impl IsolatedEditContext {
             agent_id,
             worktrees,
             active_claims,
+            sibling_notes: Vec::new(),
             _heartbeats: Vec::new(),
             // 127.0.0.1:1 refuses instantly — release POSTs fail fast, the
             // bookkeeping under test runs regardless.
@@ -1718,7 +1725,7 @@ mod tests {
     #[test]
     fn drop_tears_down_the_per_agent_credential_config() {
         // The gap this closes: agent-worktree credential installs are keyed on
-        // the AGENT id, which `SessionRegistry::close` never sees — so nothing
+        // the AGENT id, which `SessionRegistry::close_by_id` never sees — so nothing
         // removed the `%TEMP%` token config, and the refresh loop (which exits
         // only when that file disappears) ran for the runner's whole lifetime.
         // Drop is the funnel that matches the agent-id key space.

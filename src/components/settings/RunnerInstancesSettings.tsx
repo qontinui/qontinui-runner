@@ -15,7 +15,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { Monitor, Plus, Trash2, Play, Square, ChevronDown, ChevronRight, Info } from "lucide-react";
 import { SectionHeader } from "./SectionHeader";
-import { getApiPort } from "@/lib/runner-api";
+import { getApiPort, runnerBaseForPort } from "@/lib/runner-api";
 import { spawnWithResourceGuard } from "@/lib/resourceGuard";
 import type { LogFunction } from "./types";
 import { HandoffPanel } from "@/components/session/HandoffPanel";
@@ -847,7 +847,7 @@ export function RunnerInstancesSettings({ onLog }: RunnerInstancesSettingsProps)
 
       try {
         const port = getApiPort();
-        const resp = await fetch(`http://localhost:${port}/runners`);
+        const resp = await fetch(`${runnerBaseForPort(port)}/runners`);
         if (resp.ok) {
           const runners: Array<{
             id: string;
@@ -1021,7 +1021,7 @@ export function RunnerInstancesSettings({ onLog }: RunnerInstancesSettingsProps)
     try {
       const port = getApiPort();
       const resp = await fetch(
-        `http://localhost:${port}/instances/${encodeURIComponent(instance.id)}`,
+        `${runnerBaseForPort(port)}/instances/${encodeURIComponent(instance.id)}`,
         { method: "DELETE" },
       );
       if (!resp.ok) {
@@ -1078,9 +1078,9 @@ export function RunnerInstancesSettings({ onLog }: RunnerInstancesSettingsProps)
         <Info className="mt-0.5 h-3.5 w-3.5 shrink-0" />
         <span>
           Want another terminal window? Use{" "}
-          <span className="font-medium text-foreground">pop-out windows</span> from the
-          Terminal tab — same process, no extra port. The multi-process instance launcher
-          below is for advanced / testing scenarios.
+          <span className="font-medium text-foreground">pop-out windows</span> from the Terminal tab
+          — same process, no extra port. The multi-process instance launcher below is for advanced /
+          testing scenarios.
         </span>
       </div>
 

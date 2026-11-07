@@ -220,6 +220,8 @@ impl ScheduledTaskExt for ScheduledTask {
             catch_up_grace_seconds: 300,
             consecutive_launch_failures: 0,
             launch_failure_backoff_seconds: 60,
+            timezone: None,
+            managed: None,
         }
     }
 
@@ -406,18 +408,167 @@ impl ScheduleZone {
     pub fn from_settings(settings: &SchedulerSettings) -> Self {
         Self::from_setting(settings.timezone.as_deref())
     }
+
+    /// The zone ONE task's schedule is evaluated in: the task's own
+    /// `timezone` when it carries one, else `scheduler_zone` (the global
+    /// `SchedulerSettings::timezone`, already resolved).
+    ///
+    /// Plan `2026-10-29-recurring-agents-declared-in-coord-reconciled-by-runner`
+    /// D5: a per-task zone lets one fleet-wide declaration mean either "local
+    /// night on every device" (no zone) or a fixed instant (a named zone).
+    ///
+    /// Unlike [`Self::from_setting`], an unparseable per-task zone is an
+    /// `Err`, never a silent fall-back to the scheduler's zone: a task
+    /// declared for `Europe/Berlin` firing at a different zone's 04:20 is a
+    /// wrong-instant run nobody asked for. Every write path validates the zone
+    /// with [`Self::parse`] first, so an `Err` here means a row written around
+    /// them; callers surface it (an ERROR log and no next run) rather than
+    /// guess.
+    pub fn for_task(task_timezone: Option<&str>, scheduler_zone: Self) -> Result<Self, String> {
+        match task_timezone {
+            None => Ok(scheduler_zone),
+            Some(name) => Self::parse(name).map_err(|e| format!("task timezone: {e}")),
+        }
+    }
 }
 
-/// Normalize a standard 5-field cron (min hr dom mon dow) to the crate's
-/// 6-field form by prepending `0` for seconds; 6- and 7-field expressions pass
-/// through. Shared by [`compute_next_run`] and the reconciler's slot walk so
-/// the two cannot disagree about what a slot is.
-pub fn normalize_cron(cron_expr: &str) -> String {
-    if cron_expr.split_whitespace().count() == 5 {
-        format!("0 {cron_expr}")
-    } else {
-        cron_expr.to_string()
+/// The next run of `task` after `now`, evaluated in the task's own zone (see
+/// [`ScheduleZone::for_task`]) ahead of `scheduler_zone`.
+///
+/// `Err` when the task's stored `timezone` does not parse. Callers log it
+/// against the task and store no `next_run`, so the task does not fire at an
+/// instant computed in a zone it was not declared in — and the API shows the
+/// missing `nextRun` beside the bad `timezone`.
+pub fn compute_task_next_run(
+    task: &ScheduledTask,
+    now: chrono::DateTime<chrono::Utc>,
+    scheduler_zone: ScheduleZone,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, String> {
+    let zone = ScheduleZone::for_task(task.timezone.as_deref(), scheduler_zone)?;
+    Ok(compute_next_run(&task.schedule, now, zone))
+}
+
+/// [`compute_task_next_run`] for the many call sites that store the result as
+/// an RFC 3339 string: an unusable task zone is logged at ERROR against the
+/// task and yields `None` (no next run), never a run in another zone.
+pub fn task_next_run_rfc3339(
+    task: &ScheduledTask,
+    now: chrono::DateTime<chrono::Utc>,
+    scheduler_zone: ScheduleZone,
+) -> Option<String> {
+    match compute_task_next_run(task, now, scheduler_zone) {
+        Ok(next) => next.map(|dt| dt.to_rfc3339()),
+        Err(e) => {
+            error!(
+                "scheduler: task '{}' ({}) has an unusable {e}; no next run is computed until it is corrected",
+                task.name, task.id
+            );
+            None
+        }
     }
+}
+
+/// Normalize a cron expression to the `cron` crate's grammar.
+///
+/// Two translations, both needed because the crate is Quartz-shaped while the
+/// runner's contract is standard (POSIX / Vixie) cron:
+///
+/// 1. A 5-field expression (min hr dom mon dow) gets `0` prepended for the
+///    seconds field; 6- and 7-field expressions keep their field count.
+/// 2. A NUMERIC day-of-week is remapped from standard numbering (0 and 7 =
+///    Sunday, 1 = Monday … 6 = Saturday) to the crate's (1 = Sunday …
+///    7 = Saturday) — see [`remap_day_of_week`]. Without it `30 6 * * 1`
+///    fired on SUNDAY, and `0 0 * * 0` did not parse at all (coord finding
+///    35750774-bb98-4e3a-bc5e-8979b58759d8). Named days (`Mon`, `Mon-Fri`)
+///    already mean the same thing in both grammars and pass through.
+///
+/// Any other field count (an `@weekly` shorthand, a malformed expression) is
+/// returned as-is for the crate to accept or refuse. `Err` names a
+/// day-of-week the remap refuses (out of 0..=7, a reversed range, a zero
+/// step) — refusing, rather than handing the crate a field it would read in
+/// its own numbering, is what keeps the old meaning from leaking back.
+///
+/// Shared by [`compute_next_run`], the reconciler's slot walk and the trigger
+/// system's schedule watcher, so none of them can disagree about a slot.
+pub fn normalize_cron(cron_expr: &str) -> Result<String, String> {
+    let mut fields: Vec<String> = cron_expr.split_whitespace().map(str::to_string).collect();
+    let dow_index = match fields.len() {
+        5 => {
+            fields.insert(0, "0".to_string());
+            5
+        }
+        6 | 7 => 5,
+        _ => return Ok(cron_expr.to_string()),
+    };
+    fields[dow_index] = remap_day_of_week(&fields[dow_index])?;
+    Ok(fields.join(" "))
+}
+
+/// Translate one standard-cron day-of-week field into the `cron` crate's
+/// numbering (`cron` 0.15 `DaysOfWeek`: 1 = Sunday … 7 = Saturday).
+///
+/// The field is a comma list. `*` / `?` pass through (every day in both
+/// grammars). An element containing a letter is a NAMED day or range and
+/// passes through verbatim, since the crate reads names correctly. A numeric
+/// element — `N`, `A-B`, `*/S`, `N/S`, `A-B/S` — is expanded to its set of
+/// standard days, where `*` means `0-7` and `N/S` means `N-7/S` (cronie's
+/// reading); each day `d` maps to `d % 7 + 1`, so both 0 and 7 land on
+/// Sunday. The result is an explicit, sorted, de-duplicated list, so `1-5`
+/// becomes `2,3,4,5,6`.
+pub fn remap_day_of_week(field: &str) -> Result<String, String> {
+    if field == "*" || field == "?" {
+        return Ok(field.to_string());
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut days = std::collections::BTreeSet::new();
+    for element in field.split(',') {
+        if element.chars().any(|c| c.is_ascii_alphabetic()) {
+            out.push(element.to_string());
+            continue;
+        }
+        let bad = || {
+            format!("invalid day-of-week '{element}' in '{field}' (standard cron: 0-7, 0 and 7 = Sunday)")
+        };
+        // Digits and the cron operators only: `u32::from_str` would also take
+        // a leading `+`, which the crate itself refuses.
+        if !element
+            .chars()
+            .all(|c| c.is_ascii_digit() || "-/*?".contains(c))
+        {
+            return Err(bad());
+        }
+        let day = |s: &str| -> Result<u32, String> {
+            match s.parse::<u32>() {
+                Ok(d) if d <= 7 => Ok(d),
+                _ => Err(bad()),
+            }
+        };
+        let (base, step) = match element.split_once('/') {
+            Some((b, s)) => match s.parse::<u32>() {
+                Ok(s) if s >= 1 => (b, s),
+                _ => return Err(bad()),
+            },
+            None => (element, 1),
+        };
+        let (start, end) = if base == "*" || base == "?" {
+            (0, 7)
+        } else if let Some((a, b)) = base.split_once('-') {
+            (day(a)?, day(b)?)
+        } else {
+            let d = day(base)?;
+            // A bare point is one day; a point with a step runs to the end.
+            (d, if element.contains('/') { 7 } else { d })
+        };
+        if start > end {
+            return Err(bad());
+        }
+        days.extend((start..=end).step_by(step as usize).map(|d| d % 7 + 1));
+    }
+    out.extend(days.iter().map(u32::to_string));
+    if out.is_empty() {
+        return Err(format!("empty day-of-week field '{field}'"));
+    }
+    Ok(out.join(","))
 }
 
 /// Every cron instant strictly after `from`, in `zone`, as UTC. The iterator
@@ -430,7 +581,7 @@ pub fn cron_after(
     use cron::Schedule;
     use std::str::FromStr;
 
-    let schedule = Schedule::from_str(&normalize_cron(cron_expr)).ok()?;
+    let schedule = Schedule::from_str(&normalize_cron(cron_expr).ok()?).ok()?;
     // `after` excludes `from` itself, in every zone.
     let iter: Box<dyn Iterator<Item = chrono::DateTime<chrono::Utc>>> = match zone {
         ScheduleZone::Utc => Box::new(schedule.after_owned(from)),
@@ -626,11 +777,193 @@ mod tests {
         assert_eq!(ScheduleZone::from_setting(Some("Europe/Berlin")), BERLIN);
     }
 
+    fn nightly_task(timezone: Option<&str>) -> ScheduledTask {
+        let mut task = ScheduledTask::new(
+            "nightly".to_string(),
+            None,
+            nightly(),
+            scheduled_task_type_default(),
+        );
+        task.timezone = timezone.map(str::to_string);
+        task
+    }
+
+    /// Plan 2026-10-29 D5: a task's own `timezone` wins over the scheduler's
+    /// zone; with none, the scheduler's zone applies unchanged.
+    #[test]
+    fn a_task_timezone_takes_precedence_over_the_scheduler_zone() {
+        let from = utc("2026-07-01T12:00:00Z");
+        // Scheduler zone UTC, task in New York (EDT, UTC-4): 04:20 local = 08:20Z.
+        assert_eq!(
+            compute_task_next_run(
+                &nightly_task(Some("America/New_York")),
+                from,
+                ScheduleZone::Utc
+            ),
+            Ok(Some(utc("2026-07-02T08:20:00Z")))
+        );
+        // Scheduler zone Berlin (CEST, UTC+2), task pinned to UTC: 04:20Z.
+        assert_eq!(
+            compute_task_next_run(&nightly_task(Some("UTC")), from, BERLIN),
+            Ok(Some(utc("2026-07-02T04:20:00Z")))
+        );
+        // No task zone: the scheduler's zone decides (Berlin 04:20 = 02:20Z).
+        assert_eq!(
+            compute_task_next_run(&nightly_task(None), from, BERLIN),
+            Ok(Some(utc("2026-07-02T02:20:00Z")))
+        );
+        assert_eq!(
+            ScheduleZone::for_task(None, BERLIN),
+            Ok(BERLIN),
+            "None defers to the scheduler zone"
+        );
+    }
+
+    /// An unparseable per-task zone is an error, never the scheduler's zone
+    /// (from_setting's fall-back is for the global setting only).
+    #[test]
+    fn an_unusable_task_timezone_is_an_error_not_a_fallback() {
+        let err = ScheduleZone::for_task(Some("Mars/Olympus"), BERLIN).unwrap_err();
+        assert!(err.contains("Mars/Olympus"), "{err}");
+        assert!(ScheduleZone::for_task(Some("  "), ScheduleZone::Utc).is_err());
+        let from = utc("2026-07-01T12:00:00Z");
+        assert!(compute_task_next_run(&nightly_task(Some("Mars/Olympus")), from, BERLIN).is_err());
+        assert_eq!(
+            task_next_run_rfc3339(&nightly_task(Some("Mars/Olympus")), from, BERLIN),
+            None,
+            "no next run rather than one in another zone"
+        );
+        assert_eq!(
+            task_next_run_rfc3339(&nightly_task(Some("America/New_York")), from, BERLIN),
+            Some(utc("2026-07-02T08:20:00Z").to_rfc3339())
+        );
+    }
+
     #[test]
     fn normalize_cron_prepends_seconds_only_to_five_fields() {
-        assert_eq!(normalize_cron("20 4 * * *"), "0 20 4 * * *");
-        assert_eq!(normalize_cron("0 20 4 * * *"), "0 20 4 * * *");
-        assert_eq!(normalize_cron("0 20 4 * * * 2026"), "0 20 4 * * * 2026");
+        assert_eq!(normalize_cron("20 4 * * *").as_deref(), Ok("0 20 4 * * *"));
+        assert_eq!(
+            normalize_cron("0 20 4 * * *").as_deref(),
+            Ok("0 20 4 * * *")
+        );
+        assert_eq!(
+            normalize_cron("0 20 4 * * * 2026").as_deref(),
+            Ok("0 20 4 * * * 2026")
+        );
+    }
+
+    // ---- day-of-week: standard cron numbering (finding 35750774) ----------
+
+    /// The weekday (chrono) of every fire in the next fortnight from a fixed
+    /// Saturday, sorted Monday-first and de-duplicated.
+    fn weekdays_of(cron: &str) -> Vec<chrono::Weekday> {
+        use chrono::Datelike;
+        let from = utc("2026-10-17T00:00:00Z"); // a Saturday
+        let mut days: Vec<chrono::Weekday> = cron_after(cron, from, ScheduleZone::Utc)
+            .expect("cron parses")
+            .take_while(|t| *t < from + chrono::Duration::days(14))
+            .map(|t| t.weekday())
+            .collect();
+        days.sort_by_key(|d| d.num_days_from_monday());
+        days.dedup();
+        days
+    }
+
+    use chrono::Weekday::{Fri, Mon, Sat, Sun, Thu, Tue, Wed};
+
+    /// The measured defect: on runner build 200538ff8 a task registered as
+    /// `30 6 * * 1` got nextRun 2026-10-18T04:30Z, a SUNDAY. Standard cron's
+    /// 1 is Monday; from Saturday 2026-10-17 the next 06:30 Monday is the 19th.
+    #[test]
+    fn regression_30_6_star_star_1_lands_on_a_monday() {
+        let s = ScheduleExpression::Cron("30 6 * * 1".to_string());
+        assert_eq!(
+            compute_next_run(&s, utc("2026-10-17T00:00:00Z"), ScheduleZone::Utc),
+            Some(utc("2026-10-19T06:30:00Z"))
+        );
+        assert_eq!(weekdays_of("30 6 * * 1"), vec![Mon]);
+    }
+
+    #[test]
+    fn dow_single_numbers_follow_standard_cron() {
+        assert_eq!(weekdays_of("0 9 * * 0"), vec![Sun]);
+        assert_eq!(weekdays_of("0 9 * * 1"), vec![Mon]);
+        assert_eq!(weekdays_of("0 9 * * 2"), vec![Tue]);
+        assert_eq!(weekdays_of("0 9 * * 3"), vec![Wed]);
+        assert_eq!(weekdays_of("0 9 * * 4"), vec![Thu]);
+        assert_eq!(weekdays_of("0 9 * * 5"), vec![Fri]);
+        assert_eq!(weekdays_of("0 9 * * 6"), vec![Sat]);
+        assert_eq!(weekdays_of("0 9 * * 7"), vec![Sun], "7 is Sunday too");
+    }
+
+    #[test]
+    fn dow_ranges_remap() {
+        assert_eq!(weekdays_of("0 9 * * 1-5"), vec![Mon, Tue, Wed, Thu, Fri]);
+        assert_eq!(weekdays_of("0 9 * * 0-2"), vec![Mon, Tue, Sun]);
+        assert_eq!(weekdays_of("0 9 * * 5-7"), vec![Fri, Sat, Sun]);
+        assert_eq!(remap_day_of_week("1-5").as_deref(), Ok("2,3,4,5,6"));
+    }
+
+    #[test]
+    fn dow_lists_remap() {
+        assert_eq!(weekdays_of("0 9 * * 1,3,5"), vec![Mon, Wed, Fri]);
+        assert_eq!(weekdays_of("0 9 * * 0,6"), vec![Sat, Sun]);
+        assert_eq!(weekdays_of("0 9 * * 0,7"), vec![Sun], "0 and 7 collapse");
+        assert_eq!(remap_day_of_week("1,3,5").as_deref(), Ok("2,4,6"));
+    }
+
+    #[test]
+    fn dow_steps_remap() {
+        // `*` is 0-7: */2 = 0,2,4,6 = Sun,Tue,Thu,Sat.
+        assert_eq!(weekdays_of("0 9 * * */2"), vec![Tue, Thu, Sat, Sun]);
+        assert_eq!(weekdays_of("0 9 * * 1-5/2"), vec![Mon, Wed, Fri]);
+        // A point with a step runs to 7 (cronie): 1/3 = 1,4,7 = Mon,Thu,Sun.
+        assert_eq!(weekdays_of("0 9 * * 1/3"), vec![Mon, Thu, Sun]);
+        assert_eq!(remap_day_of_week("*/2").as_deref(), Ok("1,3,5,7"));
+    }
+
+    #[test]
+    fn dow_names_and_wildcards_pass_through_unchanged() {
+        assert_eq!(remap_day_of_week("*").as_deref(), Ok("*"));
+        assert_eq!(remap_day_of_week("?").as_deref(), Ok("?"));
+        assert_eq!(remap_day_of_week("Mon").as_deref(), Ok("Mon"));
+        assert_eq!(remap_day_of_week("Mon-Fri").as_deref(), Ok("Mon-Fri"));
+        assert_eq!(weekdays_of("30 6 * * Mon"), vec![Mon]);
+        assert_eq!(
+            weekdays_of("0 9 * * Mon-Fri"),
+            vec![Mon, Tue, Wed, Thu, Fri]
+        );
+        assert_eq!(weekdays_of("0 9 * * Sun"), vec![Sun]);
+        // A list mixing a name and a number: each element in its own grammar.
+        assert_eq!(remap_day_of_week("Mon,3").as_deref(), Ok("Mon,4"));
+        assert_eq!(weekdays_of("0 9 * * Mon,3"), vec![Mon, Wed]);
+    }
+
+    #[test]
+    fn dow_remap_applies_to_six_and_seven_field_forms() {
+        assert_eq!(
+            normalize_cron("0 30 6 * * 1").as_deref(),
+            Ok("0 30 6 * * 2")
+        );
+        assert_eq!(
+            normalize_cron("0 30 6 * * 1 2026").as_deref(),
+            Ok("0 30 6 * * 2 2026")
+        );
+        assert_eq!(weekdays_of("0 30 6 * * 1"), vec![Mon]);
+    }
+
+    #[test]
+    fn dow_out_of_range_is_refused_not_read_in_crate_numbering() {
+        for bad in [
+            "8", "1-8", "5-1", "*/0", "-1", "1-", "", "1,,2", "1#2", "+1", "*/+2",
+        ] {
+            assert!(remap_day_of_week(bad).is_err(), "'{bad}' should be refused");
+        }
+        let s = ScheduleExpression::Cron("0 9 * * 8".to_string());
+        assert_eq!(
+            compute_next_run(&s, chrono::Utc::now(), ScheduleZone::Utc),
+            None
+        );
     }
 
     /// Build a default ScheduledTask suitable for backoff tests.

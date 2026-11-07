@@ -59,14 +59,32 @@ to stop one session. Instead:
    will never be sent. Only a runner build predating Phase 1 omits
    `session.finishSynced`; treat an absent `session.finishSynced` as false.
    - `changed: "marker"` with `coord.queued: true`: the mark is new and the
-     coord write is queued to `coord.coordSessionId`. Report both.
+     coord write is queued to `coord.coordSessionId`. Report both. On the
+     runner build carrying plan
+     `2026-10-23-coord-records-a-session-finished-but-not-when-so-a-revival-cannot-be-told-from-a-re-finish`
+     Phase 3, a second rewind of an already-finished session lands here too:
+     its reason makes it a new declaration, so the mark is RESTAMPED
+     (`finishedAt` moves later) and re-sent, and `session.finishSynced` is
+     false until coord ACKs it.
    - `changed: "marker"` with `coord.queued: false`: the resume set is
      corrected and coord is **not** told. Quote `coord.reason`
      (`no_coord_session`, `outbox_write_failed` or `no_forwarder`) and
      say so in those words.
-   - `changed: "reason_only"`: the session was already finished, and only its
-     `finish_reason` was rewritten. This call always sends a reason, so a second
-     rewind of the same session lands here. `coord.queued: false`
+   - `changed: "none"` (only from a runner build predating that Phase 3):
+     the session was already finished with this same reason, so nothing was
+     rewritten and the old `finishedAt` stands. This call always sends the
+     same fixed reason, so on such a build a second rewind of the same
+     session lands here. `session.finishSynced` says whether coord has the
+     mark (absent means no). `coord.queued: true` means the owed finished
+     MARKER was re-queued (the mark was not yet synced), and `coord.queued:
+     false` with `not_requeued` means nothing was owed. With
+     `session.finishSynced` false and `coord.queued: false`, coord does not
+     have the mark: quote `coord.reason` and say so. Nothing about the rewind
+     reaches coord from this answer.
+   - `changed: "reason_only"` (only from a runner build predating that Phase
+     3): the session was already finished with a DIFFERENT reason (by
+     `/finish-session`, say), and only its `finish_reason` was rewritten; the
+     old `finishedAt` stands. `coord.queued: false`
      (`not_requeued`) is not a verdict here. `session.finishSynced` says whether
      coord has the mark (absent means no). The rewind reason never reaches
      coord from this door on either arm: on a mark not yet synced

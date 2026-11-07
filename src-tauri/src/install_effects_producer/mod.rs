@@ -441,62 +441,18 @@ fn spawn_phantom_turn_watch(
 /// `PATCH /sessions/:id`, which retries on reconnect. Coord owns the ownership
 /// and uniqueness rules (`session_not_owned_by_caller`,
 /// `harness_session_already_bound`), so nothing here second-guesses them.
+///
+/// The body is the shared seam [`crate::session::coord_identity`] (plan
+/// `2026-10-23-a-hookless-resume-in-a-runner-pane-leaves-the-session-with-no-active-coord-row`
+/// D1), which the reconcile tick's rung-2 binds and the R2 resume also call;
+/// this route is its `hook` source.
 fn confirm_coord_harness_session_id(state: &ApiState, req: &SessionOpenRequest) {
-    use crate::session::SessionRegistry;
-    use crate::terminal::TerminalManager;
-    use tauri::Manager;
-
-    let (Some(terminals), Some(registry)) = (
-        state
-            .app_handle
-            .try_state::<Arc<TerminalManager>>()
-            .map(|s| s.inner().clone()),
-        state
-            .app_handle
-            .try_state::<Arc<SessionRegistry>>()
-            .map(|s| s.inner().clone()),
-    ) else {
-        warn!(
-            terminal_id = %req.terminal_id,
-            session_id = %req.session_id,
-            "control/session-open: terminal manager or session registry not in Tauri state —              coord harness-id confirmation skipped (best-effort)"
-        );
-        return;
-    };
-
-    let Some(coord_session_id) = terminals
-        .get(&req.terminal_id)
-        .and_then(|s| s.coord_session_id())
-    else {
-        // Normal and transient: the coord mirror is registered after the pane
-        // exists. Not a warn.
-        info!(
-            terminal_id = %req.terminal_id,
-            session_id = %req.session_id,
-            "control/session-open: no coord session bound to this terminal yet —              harness-id confirmation skipped"
-        );
-        return;
-    };
-
-    match registry.confirm_claude_code_session_id(coord_session_id, &req.session_id) {
-        Ok(true) => info!(
-            terminal_id = %req.terminal_id,
-            session_id = %req.session_id,
-            coord_session_id = %coord_session_id,
-            "control/session-open: coord row re-keyed to the CONFIRMED harness session id"
-        ),
-        Ok(false) => info!(
-            terminal_id = %req.terminal_id,
-            coord_session_id = %coord_session_id,
-            "control/session-open: coord row already carries the confirmed harness session id"
-        ),
-        Err(e) => warn!(
-            terminal_id = %req.terminal_id,
-            session_id = %req.session_id,
-            coord_session_id = %coord_session_id,
-            "control/session-open: harness-id confirmation not queued: {e}"
-        ),
-    }
+    crate::session::coord_identity::confirm_for_terminal_in_app(
+        &state.app_handle,
+        &req.terminal_id,
+        &req.session_id,
+        crate::session::coord_identity::RekeySource::Hook,
+    );
 }
 
 /// Emit the `session-bound` tab-stamp event for a `/control/session-open`.
@@ -1026,11 +982,18 @@ async fn get_sessions_restore_census(
 ///       { "claudeSessionId": "aaaa…", "sessionName": "amber-otter",
 ///         "worktreePath": "D:/qontinui-root/_wt/foo",
 ///         "planSlug": "2026-08-22-wip-custody", "wipState": "captured",
+///         "displayName": "amber-otter", "accountLabel": "gmail",
+///         "configDirKnown": true, "outcome": "missing",
 ///         "reason": "no-attempt",
 ///         "resumeCommand": "cd \"D:/…/foo\" && CLAUDE_CONFIG_DIR=\"C:/claude/.claude-gmail\" claude --resume aaaa…" }
 ///     ],
-///     "current": { /* what is open right now */ } } }
+///     "finished": [ /* marked finished — never counted as missing */ ],
+///     "current": { /* the roster right now */ },
+///     "generations": [ /* every retained prior boot, newest first */ ] } }
 /// ```
+///
+/// The body is [`crate::session::session_ledger::report`] — the one builder
+/// the Tauri `session_ledger_report` also calls.
 ///
 /// ### The honesty contract
 ///
@@ -1041,66 +1004,33 @@ async fn get_sessions_restore_census(
 /// * **A missing session with an unknown account root gets NO resume line**
 ///   rather than a guessed one, and the `note` counts how many were omitted
 ///   for that reason.
+/// * **A finished session is never `missing`** — it has its own bucket.
 /// * Read-only: it stats disk and touches no registry state.
 async fn get_sessions_ledger(
     State(state): State<Arc<ApiState>>,
 ) -> Json<ApiResponse<crate::session::session_ledger::LedgerReport>> {
-    use crate::session::reconcile::DiskTranscriptIndex;
-    use crate::session::session_ledger as ledger;
     use crate::session::session_lifecycle_store::SessionLifecycleStore;
     use tauri::Manager;
-
-    let now = chrono::Utc::now().timestamp_millis();
-    let boot = crate::session::shutdown_marker::boot_classification();
-    // Latch the PRIOR ledger before anything in this process can overwrite it.
-    // Idempotent, so calling it here as well as at boot is safe — and doing it
-    // here means the route still answers on a build whose boot path did not
-    // run the latch.
-    let prior = ledger::load_prior_once();
 
     let store = state
         .app_handle
         .try_state::<Arc<SessionLifecycleStore>>()
         .map(|s| s.inner().clone());
-    let Some(store) = store else {
-        warn!(
-            "control/sessions/ledger: lifecycle store not in Tauri state — reporting \
-             unavailable WITH a reason (never a bare empty ledger)"
-        );
-        let empty = ledger::SessionLedger {
-            ledger_version: ledger::LEDGER_VERSION,
-            captured_at_ms: now,
-            captured_at: chrono::Utc::now().to_rfc3339(),
-            reason: "unavailable".to_string(),
-            shutdown_at: boot.and_then(|b| b.prior_marker_at),
-            clean_shutdown: boot.map(|b| !b.crash_recovery),
-            sessions: Vec::new(),
-        };
-        let mut report = ledger::diff(prior, &[], empty, false);
-        report.status = "unavailable".to_string();
-        report.reason = Some("lifecycle_store_unavailable".to_string());
-        report.verdict = ledger::VERDICT_UNKNOWN.to_string();
-        return Json(ApiResponse::success(report));
-    };
-
-    let index = DiskTranscriptIndex::discover();
-    let current = ledger::capture(&store, &index, "read", now, boot);
-    // "Came back" = open now, UNION anything stamped restored by THIS boot —
-    // a session that returned and was then closed did in fact return.
-    // `None` when the boot census never latched — see `observed_back`: an
-    // absent boot instant SKIPS the sticky-restore-stamp arm rather than
-    // admitting it with a `0` floor.
-    let boot_at = crate::session::restore_census::latched().map(|c| c.boot_at_ms);
-    let back = ledger::observed_back(&store, boot_at);
-    // `boot_at == None` means the sticky-restore-stamp arm was SKIPPED, so a
-    // session that returned and was then closed cannot be told from one that
-    // never came back. That is reported, not laundered into a miss count.
-    Json(ApiResponse::success(ledger::diff(
-        prior,
-        &back,
-        current,
-        boot_at.is_some(),
-    )))
+    // The ONE report builder, shared with the Tauri `session_ledger_report`.
+    // It stats disk (transcripts, custody records), so it runs off the
+    // async executor.
+    let live = crate::session::session_ledger::live_terminal_ids(&state.app_handle);
+    let report = spawn_blocking_tracked(move || {
+        crate::session::session_ledger::report(store.as_deref(), live.as_ref())
+    })
+    .await;
+    match report {
+        Ok(report) => Json(ApiResponse::success(report)),
+        Err(e) => {
+            warn!(error = %e, "control/sessions/ledger: report task failed");
+            Json(ApiResponse::error(format!("ledger report failed: {e}")))
+        }
+    }
 }
 
 /// Query for `POST /control/sessions/ledger/capture`.
@@ -1131,8 +1061,10 @@ pub struct LedgerCaptureQuery {
 async fn post_sessions_ledger_capture(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<LedgerCaptureQuery>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    use crate::session::reconcile::DiskTranscriptIndex;
+) -> Result<
+    Json<ApiResponse<crate::session::session_ledger::LedgerCapture>>,
+    (StatusCode, Json<ApiResponse<()>>),
+> {
     use crate::session::session_ledger as ledger;
     use crate::session::session_lifecycle_store::SessionLifecycleStore;
     use tauri::Manager;
@@ -1155,30 +1087,27 @@ async fn post_sessions_ledger_capture(
         ));
     };
 
-    // Latch the prior ledger first, so a capture taken before any read cannot
-    // destroy the previous boot's record of what was open.
-    let _ = ledger::load_prior_once();
-
-    let now = chrono::Utc::now().timestamp_millis();
-    let boot = crate::session::shutdown_marker::boot_classification();
-    let index = DiskTranscriptIndex::discover();
     let reason = query
         .reason
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .unwrap_or(ledger::REASON_PRE_REBUILD);
-    let captured = ledger::capture(&store, &index, reason, now, boot);
-    // `persist_capture`, not `persist_if_changed`: an empty capture must never
-    // erase a non-empty prior ledger — that is how a later boot manufactures a
-    // vacuous `match`.
-    let persisted = ledger::persist_capture(&captured);
-    let path = ledger::ledger_path().to_string_lossy().replace('\\', "/");
-    Ok(Json(ApiResponse::success(serde_json::json!({
-        "persisted": persisted,
-        "path": path,
-        "ledger": captured,
-    }))))
+        .unwrap_or(ledger::REASON_PRE_REBUILD)
+        .to_string();
+    // The ONE capture, shared with the Tauri `session_ledger_capture`. It
+    // persists through `persist_capture`, so an empty capture can never erase
+    // a non-empty prior ledger.
+    let captured = spawn_blocking_tracked(move || ledger::capture_now(&store, &reason))
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!(
+                    "ledger capture task failed — NOTHING may have been captured: {e}"
+                ))),
+            )
+        })?;
+    Ok(Json(ApiResponse::success(captured)))
 }
 
 /// Body of `POST /control/shim-beacon` — a fire-and-forget diagnostic the
@@ -1336,6 +1265,7 @@ fn record_session_open_into(
         page_id,
         zone_index,
         provider.to_string(),
+        None,
     );
     // CONFIRM the record (session-restore-redesign Phase 2 coordinator
     // refinement). This route is hit ONLY by a provider's SessionStart hook,
@@ -2325,6 +2255,65 @@ mod tests {
     // Plan `2026-08-23-single-source-derived-facts`, item 1 step 1.
     // -------------------------------------------------------------------
 
+    /// Review r1 item 4(i): a continuation from an EARLIER boot, marked by this
+    /// boot's restore pass, re-confirmed by the provider's session-open hook on
+    /// its NEW terminal is adopted: the continuation registry holds its gate
+    /// (and stored claimer) for the new terminal, and the generation stamp is
+    /// renewed to this boot.
+    #[test]
+    fn session_open_hook_adopts_a_restored_gate_continuation() {
+        use crate::session::session_lifecycle_store::{
+            SessionLifecycleStore, TerminalSessionRecord,
+        };
+        let _g = crate::agent_runtime::CONTINUATION_REGISTRY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            SessionLifecycleStore::open(&dir.path().join("terminal-sessions.json")).unwrap();
+        let boot = crate::session::tracking_health::primary_boot_unix_millis_or_init();
+        let csid = "5a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
+        let gate = uuid::Uuid::now_v7();
+        let device = uuid::Uuid::now_v7();
+        let rec: TerminalSessionRecord = serde_json::from_value(serde_json::json!({
+            "claudeSessionId": csid,
+            "pageId": "default",
+            "zoneIndex": 0,
+            "terminalId": "term-before-crash",
+            "openedAt": 0,
+            "lastSeenAt": 0,
+            "state": "open",
+            "origin": "authoritative",
+            "gateId": gate.to_string(),
+            "gateConsumingDeviceId": device.to_string(),
+            "gateBoundBootMs": boot - 1,
+        }))
+        .unwrap();
+        store.record_open(rec);
+        store.mark_restore_pending(csid, true);
+
+        let req = SessionOpenRequest {
+            source: Some("resume".to_string()),
+            ..session_open_req("term-after-restore", csid)
+        };
+        assert!(session_open_rejection(&req).is_none());
+        record_session_open_into(&store, &req, "claude");
+
+        let after = store.get(csid).unwrap();
+        assert_eq!(after.terminal_id, "term-after-restore");
+        assert_eq!(
+            after.gate_bound_boot_ms,
+            Some(boot),
+            "stamp renewed to this boot"
+        );
+        assert_eq!(after.gate_id, Some(gate.to_string()), "gate kept (sticky)");
+        assert_eq!(
+            crate::agent_runtime::registered_continuation_gate("term-after-restore"),
+            Some((Some(gate), Some(device)))
+        );
+        crate::agent_runtime::deregister_continuation_for_test("term-after-restore");
+    }
+
     fn session_open_req(terminal_id: &str, session_id: &str) -> SessionOpenRequest {
         SessionOpenRequest {
             terminal_id: terminal_id.to_string(),
@@ -2468,6 +2457,7 @@ mod tests {
             provider: "claude".to_string(),
             origin: Some("authoritative".to_string()),
             restore_pending_at: None,
+            awaiting_account_since: None,
             confirmed_at: confirmed.then_some(3),
             handle: None,
             account_label: None,
@@ -2482,10 +2472,15 @@ mod tests {
             finished_at: None,
             wind_down_outcome: None,
             wind_down_at: None,
+            wind_down_arm: None,
             finish_reason: None,
             finish_synced: false,
             spawn_device_default: None,
             adopted_from: None,
+            last_session_start_at: None,
+            gate_id: None,
+            gate_consuming_device_id: None,
+            gate_bound_boot_ms: None,
         }
     }
 
@@ -2646,7 +2641,7 @@ mod tests {
 
         let seed = health_rec("mid-restore", "term-1", true);
         store.record_open(seed);
-        store.mark_restore_pending("mid-restore");
+        store.mark_restore_pending("mid-restore", true);
         assert_eq!(
             store.get("mid-restore").unwrap().restore_tier.as_deref(),
             Some(RESTORE_TIER_FAILED),
@@ -2986,6 +2981,7 @@ mod tests {
             provider: "claude".to_string(),
             origin: Some(ORIGIN_OBSERVED.to_string()),
             restore_pending_at: None,
+            awaiting_account_since: None,
             confirmed_at: None,
             handle: None,
             account_label: None,
@@ -3000,10 +2996,15 @@ mod tests {
             finished_at: None,
             wind_down_outcome: None,
             wind_down_at: None,
+            wind_down_arm: None,
             finish_reason: None,
             finish_synced: false,
             spawn_device_default: None,
             adopted_from: None,
+            last_session_start_at: None,
+            gate_id: None,
+            gate_consuming_device_id: None,
+            gate_bound_boot_ms: None,
         });
 
         // The confirming hook fires with bash-flavored context.
@@ -3188,6 +3189,7 @@ mod tests {
                     provider: "claude".to_string(),
                     origin: Some(ORIGIN_AUTHORITATIVE.to_string()),
                     restore_pending_at: None,
+                    awaiting_account_since: None,
                     confirmed_at: Some(confirmed_at),
                     handle: None,
                     account_label: None,
@@ -3202,10 +3204,15 @@ mod tests {
                     finished_at: None,
                     wind_down_outcome: None,
                     wind_down_at: None,
+                    wind_down_arm: None,
                     finish_reason: None,
                     finish_synced: false,
                     spawn_device_default: None,
                     adopted_from: None,
+                    last_session_start_at: None,
+                    gate_id: None,
+                    gate_consuming_device_id: None,
+                    gate_bound_boot_ms: None,
                 });
             };
             let hook = |id: &str, source: &str| {
@@ -3283,6 +3290,7 @@ mod tests {
             provider: "claude".to_string(),
             origin: Some(ORIGIN_AUTHORITATIVE.to_string()),
             restore_pending_at: None,
+            awaiting_account_since: None,
             confirmed_at: None,
             handle: None,
             account_label: None,
@@ -3297,10 +3305,15 @@ mod tests {
             finished_at: None,
             wind_down_outcome: None,
             wind_down_at: None,
+            wind_down_arm: None,
             finish_reason: None,
             finish_synced: false,
             spawn_device_default: None,
             adopted_from: None,
+            last_session_start_at: None,
+            gate_id: None,
+            gate_consuming_device_id: None,
+            gate_bound_boot_ms: None,
         });
 
         // The provider reports a DIFFERENT id about itself, from bash.
@@ -3369,6 +3382,7 @@ mod tests {
             provider: "claude".to_string(),
             origin: Some(ORIGIN_AUTHORITATIVE.to_string()),
             restore_pending_at: None,
+            awaiting_account_since: None,
             confirmed_at: None,
             handle: None,
             account_label: None,
@@ -3383,10 +3397,15 @@ mod tests {
             finished_at: None,
             wind_down_outcome: None,
             wind_down_at: None,
+            wind_down_arm: None,
             finish_reason: None,
             finish_synced: false,
             spawn_device_default: None,
             adopted_from: None,
+            last_session_start_at: None,
+            gate_id: None,
+            gate_consuming_device_id: None,
+            gate_bound_boot_ms: None,
         });
 
         let req = SessionOpenRequest {

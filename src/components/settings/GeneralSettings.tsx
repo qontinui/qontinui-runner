@@ -2,6 +2,7 @@ import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Settings as SettingsIcon, FileText, Layers } from "lucide-react";
 import { SectionHeader } from "./SectionHeader";
+import { FinishedSessionCloseSettings } from "./FinishedSessionCloseSettings";
 import {
   DISCLOSURE_LABELS,
   useFeatureDisclosure,
@@ -245,6 +246,15 @@ export function GeneralSettings({ onLog }: GeneralSettingsProps) {
           </div>
         </div>
       </div>
+
+      {/*
+        Sessions — the runner closing a finished session's window by itself
+        (plan 2026-10-03-finished-runner-sessions-close-their-window-without-a-drain,
+        D3). On by default and acting on the user's behalf, so its off switch
+        sits on the first page a Terminal-first user opens, not behind a
+        disclosure.
+      */}
+      <FinishedSessionCloseSettings onLog={onLog} />
 
       {/*
         Optional feature sets. The runner ships two large paradigms alongside

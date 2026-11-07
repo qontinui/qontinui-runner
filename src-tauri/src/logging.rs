@@ -446,6 +446,86 @@ fn default_env_filter(level: Level) -> String {
     format!("qontinui_runner={level},tauri=info,tao=warn,wry=warn")
 }
 
+/// Where the runner's effective log filter came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FilterSource {
+    /// `RUST_LOG` was set and is the filter in effect; the persisted level
+    /// steers nothing.
+    RustLogEnv,
+    /// `RUST_LOG` was unset; the filter is built from the persisted level.
+    PersistedLevel,
+    /// `RUST_LOG` was set but not valid unicode, so it was ignored and the
+    /// persisted-level filter applies (the same fallback as before; only the
+    /// naming is new).
+    RustLogNotUnicodeIgnored,
+}
+
+/// The filter directives in effect, and their source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedFilter {
+    directives: String,
+    source: FilterSource,
+}
+
+/// Decide the effective filter from a `RUST_LOG` read and the persisted
+/// level. Pure: the caller passes `std::env::var("RUST_LOG")`, so no test
+/// touches the process environment.
+fn resolve_env_filter(
+    rust_log: Result<String, std::env::VarError>,
+    level: Level,
+) -> ResolvedFilter {
+    match rust_log {
+        Ok(directives) => ResolvedFilter {
+            directives,
+            source: FilterSource::RustLogEnv,
+        },
+        Err(std::env::VarError::NotPresent) => ResolvedFilter {
+            directives: default_env_filter(level),
+            source: FilterSource::PersistedLevel,
+        },
+        Err(std::env::VarError::NotUnicode(_)) => ResolvedFilter {
+            directives: default_env_filter(level),
+            source: FilterSource::RustLogNotUnicodeIgnored,
+        },
+    }
+}
+
+/// The level the startup filter line is emitted at: INFO, unless the
+/// constructed filter's `max_level_hint` says INFO would not get through, in
+/// which case ERROR. No hint (dynamic directives) means INFO — today's level.
+fn startup_line_level(max_level_hint: Option<tracing_subscriber::filter::LevelFilter>) -> Level {
+    use tracing_subscriber::filter::LevelFilter;
+    match max_level_hint {
+        Some(hint) if hint < LevelFilter::INFO => Level::ERROR,
+        _ => Level::INFO,
+    }
+}
+
+/// The startup line naming the filter ACTUALLY in effect. It used to print
+/// only the persisted level, so a primary launched by dev-start.ps1 with
+/// `RUST_LOG=info,qontinui_runner=debug` logged `Level(Info)` while DEBUG was
+/// in effect — a status line that did not observe the state it named.
+///
+/// `effective` is the CONSTRUCTED filter rendered back (`EnvFilter`'s
+/// `Display`, after any dev-only widening), not the input string, so the line
+/// reports the filter the subscriber actually runs.
+fn startup_filter_line(resolved: &ResolvedFilter, effective: &str, level: Level) -> String {
+    let source = match resolved.source {
+        FilterSource::RustLogEnv if resolved.directives.trim().is_empty() => format!(
+            "RUST_LOG environment variable, empty — EnvFilter's default `error` applies; \
+             persisted level {level} is not in effect"
+        ),
+        FilterSource::RustLogEnv => {
+            format!("RUST_LOG environment variable; persisted level {level} is not in effect")
+        }
+        FilterSource::PersistedLevel => format!("persisted log level {level}"),
+        FilterSource::RustLogNotUnicodeIgnored => format!(
+            "persisted log level {level}; RUST_LOG was set but is not valid unicode and was ignored"
+        ),
+    };
+    format!("Logging initialized: effective filter \"{effective}\" (source: {source})")
+}
+
 pub fn init_logging(config: LoggingConfig) -> anyhow::Result<LoggingInitResult> {
     std::fs::create_dir_all(&config.log_dir)?;
 
@@ -458,9 +538,8 @@ pub fn init_logging(config: LoggingConfig) -> anyhow::Result<LoggingInitResult> 
     // treats `Option<Layer>` as a no-op in that case.
     let (otel_guard, otel_layer) = crate::otel::init_otel(&config.otel);
 
-    let env_filter = EnvFilter::new(
-        std::env::var("RUST_LOG").unwrap_or_else(|_| default_env_filter(config.level)),
-    );
+    let resolved_filter = resolve_env_filter(std::env::var("RUST_LOG"), config.level);
+    let env_filter = EnvFilter::new(&resolved_filter.directives);
 
     // Dev-only (`debug-tokio-console`): `EnvFilter` is installed below as a
     // GLOBAL filter, which gates every layer including per-layer-filtered ones,
@@ -468,6 +547,10 @@ pub fn init_logging(config: LoggingConfig) -> anyhow::Result<LoggingInitResult> 
     // here. See `tokio_console::widen_env_filter`.
     #[cfg(feature = "debug-tokio-console")]
     let env_filter = tokio_console::widen_env_filter(env_filter);
+    // Rendered from the constructed filter, after any widening, for the
+    // startup line below.
+    let effective_filter = env_filter.to_string();
+    let startup_line_level = startup_line_level(env_filter.max_level_hint());
 
     // Create span layer config
     let span_config = SpanLayerConfig {
@@ -592,7 +675,18 @@ pub fn init_logging(config: LoggingConfig) -> anyhow::Result<LoggingInitResult> 
         registry.with(jsonl_layer).init();
     }
 
-    tracing::info!("Logging initialized at level: {:?}", config.level);
+    let filter_line = startup_filter_line(&resolved_filter, &effective_filter, config.level);
+    // A filter that admits nothing below ERROR (an empty RUST_LOG, or one whose
+    // every directive failed to parse, leaves only EnvFilter's default `error`)
+    // would swallow an `info!` line — and this line is the explanation for
+    // that silence. Raising it to ERROR also sends it to OTel as an error
+    // event when OTel is enabled, deliberately: such a filter is a
+    // misconfiguration worth surfacing.
+    if startup_line_level == Level::ERROR {
+        tracing::error!("{}", filter_line);
+    } else {
+        tracing::info!("{}", filter_line);
+    }
     tracing::info!("Log directory: {:?}", log_dir_path);
     tracing::info!("JSONL span layer enabled: {}", config.enable_span_jsonl);
     tracing::info!("Application started at {}", Local::now());
@@ -682,16 +776,23 @@ fn find_dev_logs_ancestor(exe_path: &std::path::Path) -> Option<PathBuf> {
 ///
 /// Scoped per-runner for secondary instances so the `latest_crash.txt` file
 /// from one runner doesn't overwrite another's.
+///
+/// A SUBJECT runner (`QONTINUI_INSTANCE_ROOT`) never takes the
+/// workspace `.dev-logs` beside its executable — that directory belongs to the
+/// harness's checkout — and resolves through the instance-root seam instead.
 pub fn get_crash_dump_dir() -> PathBuf {
     let base = std::env::current_exe()
         .ok()
+        .filter(|_| crate::instance::instance_root().is_none())
         .and_then(|exe_path| find_dev_logs_ancestor(&exe_path))
         .unwrap_or_else(|| {
             // Fallback to local app data
-            dirs::data_local_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join("qontinui-runner")
-                .join("crash-dumps")
+            qontinui_runner_lib::instance_env::platform_dir(
+                qontinui_runner_lib::instance_env::PlatformDir::DataLocal,
+            )
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("qontinui-runner")
+            .join("crash-dumps")
         });
 
     crate::instance::scope_path(&base)
@@ -1340,6 +1441,113 @@ mod default_filter_tests {
             seen.load(Ordering::SeqCst),
             0,
             "tao=warn must not widen to info/debug even when qontinui_runner is at debug"
+        );
+    }
+}
+
+/// Plan `2026-10-19-runner-transcript-scan-stats-and-logs-every-missing-project-dir`
+/// Phase 3: the startup line names the filter that is ACTUALLY in effect and
+/// where it came from. Every expectation is a literal string, never a call to
+/// `default_env_filter`, so the test pins the required text rather than the
+/// implementation.
+#[cfg(test)]
+mod startup_filter_line_tests {
+    use super::*;
+
+    /// Resolve, construct the filter the way `init_logging` does, and render
+    /// the startup line from the CONSTRUCTED filter.
+    fn line_for(
+        rust_log: Result<String, std::env::VarError>,
+        level: Level,
+    ) -> (ResolvedFilter, String) {
+        let resolved = resolve_env_filter(rust_log, level);
+        let effective = EnvFilter::new(&resolved.directives).to_string();
+        let line = startup_filter_line(&resolved, &effective, level);
+        (resolved, line)
+    }
+
+    /// Mutation: print the persisted level again (the pre-fix line) and the
+    /// `effective filter` text naming `qontinui_runner=debug` is gone — red.
+    /// Make `resolve_env_filter` ignore an `Ok` value and the source assert
+    /// fails — red.
+    #[test]
+    fn rust_log_set_names_the_env_filter_and_says_the_persisted_level_is_not_in_effect() {
+        let (resolved, line) = line_for(Ok("info,qontinui_runner=debug".to_string()), Level::INFO);
+        assert_eq!(resolved.directives, "info,qontinui_runner=debug");
+        assert_eq!(resolved.source, FilterSource::RustLogEnv);
+        assert_eq!(
+            line,
+            "Logging initialized: effective filter \"qontinui_runner=debug,info\" \
+             (source: RUST_LOG environment variable; persisted level INFO is not in effect)"
+        );
+    }
+
+    #[test]
+    fn rust_log_unset_uses_the_persisted_level_filter() {
+        let (resolved, line) = line_for(Err(std::env::VarError::NotPresent), Level::WARN);
+        assert_eq!(
+            resolved.directives,
+            "qontinui_runner=WARN,tauri=info,tao=warn,wry=warn"
+        );
+        assert_eq!(resolved.source, FilterSource::PersistedLevel);
+        assert_eq!(
+            line,
+            "Logging initialized: effective filter \
+             \"qontinui_runner=warn,tauri=info,wry=warn,tao=warn\" \
+             (source: persisted log level WARN)"
+        );
+    }
+
+    /// `RUST_LOG=""` is `Ok("")`: it IS the source, and `EnvFilter::new`
+    /// then adds its default `error` directive, so the effective filter is
+    /// `error` — the line must say so rather than read like a real
+    /// directive set (and `init_logging` emits it at ERROR so it survives).
+    #[test]
+    fn an_empty_rust_log_is_named_as_empty() {
+        let (resolved, line) = line_for(Ok(String::new()), Level::INFO);
+        assert_eq!(resolved.source, FilterSource::RustLogEnv);
+        assert_eq!(
+            line,
+            "Logging initialized: effective filter \"error\" \
+             (source: RUST_LOG environment variable, empty — EnvFilter's default `error` applies; \
+             persisted level INFO is not in effect)"
+        );
+    }
+
+    /// The startup line is raised to ERROR exactly when the constructed
+    /// filter would drop INFO, read off the filter itself rather than the
+    /// input text (so `RUST_LOG=","` or an all-invalid value is covered too).
+    ///
+    /// Mutation: invert the comparison in `startup_line_level` and the ERROR
+    /// and DEBUG cases go red.
+    #[test]
+    fn the_startup_line_is_raised_to_error_only_when_info_would_be_dropped() {
+        let level_for =
+            |rust_log: &str| startup_line_level(EnvFilter::new(rust_log).max_level_hint());
+        assert_eq!(level_for(""), Level::ERROR);
+        assert_eq!(level_for(","), Level::ERROR);
+        assert_eq!(level_for("warn"), Level::ERROR);
+        assert_eq!(level_for("info"), Level::INFO);
+        assert_eq!(level_for("info,qontinui_runner=debug"), Level::INFO);
+        assert_eq!(startup_line_level(None), Level::INFO);
+    }
+
+    /// Same fallback as before (a non-unicode `RUST_LOG` is ignored), but the
+    /// line now SAYS it was ignored instead of reading like an unset variable.
+    #[test]
+    fn a_non_unicode_rust_log_is_named_as_ignored() {
+        let not_unicode = std::env::VarError::NotUnicode(std::ffi::OsString::from("x"));
+        let (resolved, line) = line_for(Err(not_unicode), Level::INFO);
+        assert_eq!(
+            resolved.directives,
+            "qontinui_runner=INFO,tauri=info,tao=warn,wry=warn"
+        );
+        assert_eq!(resolved.source, FilterSource::RustLogNotUnicodeIgnored);
+        assert_eq!(
+            line,
+            "Logging initialized: effective filter \
+             \"qontinui_runner=info,tauri=info,wry=warn,tao=warn\" \
+             (source: persisted log level INFO; RUST_LOG was set but is not valid unicode and was ignored)"
         );
     }
 }

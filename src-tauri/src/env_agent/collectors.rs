@@ -1452,12 +1452,14 @@ fn workspace_root() -> qontinui_types::paths::WorkspaceRoot {
     // Standalone `qontinui_profile env capture`: no bin crate booted, so no
     // door. This arm provably CANNOT read `paths.workspace_root` (the setting
     // lives behind the bin-crate settings facade), which is why it passes
-    // `configured: None` rather than pretending to have looked.
+    // `configured: None` rather than pretending to have looked. It is a
+    // process-level capture with no agent session, so `session_repo` is `None`.
     let exe = std::env::current_exe().ok();
     qontinui_types::paths::qontinui_workspace_root(
         None,
         exe.as_deref()
             .map(|e| qontinui_types::paths::WorkspaceAnchor::new(e, RUNNER_REPO_DIR)),
+        None,
     )
 }
 
@@ -3188,6 +3190,13 @@ pub fn collect_env_contract() -> Section {
 // call it. We re-implement the tiny roster read inline against the same
 // on-disk shape.
 
+/// The wire spelling of the bin crate's `AccountSelectionMode::default()`
+/// (settings.rs) — the mode a roster/settings file with no explicit field
+/// resolves to. A string because this crate cannot name that enum; the bin
+/// crate's `collector_default_spelling_matches_the_enum_default` test keeps
+/// the two in step.
+pub const DEFAULT_LOCAL_SELECTION_MODE: &str = "weighted_random";
+
 /// On-disk probe of `claude-accounts.json` — only the fields this collector
 /// needs. Selection mode is read as a raw string (snake_case on disk) to avoid
 /// depending on the bin-crate `AccountSelectionMode` enum.
@@ -3272,18 +3281,61 @@ fn read_shell_profiles() -> Option<String> {
     }
 }
 
+/// The bin crate's effective account-selection door: returns
+/// `(effective_mode, source)` as wire strings — the mode from
+/// `claude_accounts::effective_selection()` and its source
+/// (`fleet` | `local` | `pinned`). Published as a FUNCTION (like
+/// [`WorkspaceRootFn`] / [`PlansDirFn`]) because both halves move at runtime —
+/// the fleet-policy poller refreshes the fleet term, the operator edits the
+/// pin — so each capture must ask afresh.
+///
+/// The resolver lives in the BIN crate (see the CRATE-BOUNDARY NOTE above)
+/// and reads the fleet-policy cache this lib crate cannot reach; re-deriving
+/// it here would be a second rule for which mode governs.
+pub type AccountSelectionFn = fn() -> (&'static str, &'static str);
+
+static ACCOUNT_SELECTION_DOOR: std::sync::OnceLock<AccountSelectionFn> = std::sync::OnceLock::new();
+
+/// Publish the runner's effective account-selection reader so
+/// [`collect_claude_accounts`] can report the mode that actually governs and
+/// its source. Called by the binary at boot next to [`publish_plans_dir`].
+/// Idempotent — a second call is ignored.
+///
+/// Until it is published the section reports only `local_selection_mode`
+/// and `selection_source=unknown` — never the file value under the
+/// `selection_mode` key, which would claim a fleet-overridable value governs.
+/// The door itself may also answer `unknown` as the source (the binary does
+/// until coord's fleet-policy domain has answered in this process).
+pub fn publish_account_selection(door: AccountSelectionFn) {
+    let _ = ACCOUNT_SELECTION_DOOR.set(door);
+}
+
+/// `selection_source` value emitted before [`publish_account_selection`] has
+/// run (or in a process that never publishes it).
+const SELECTION_SOURCE_UNKNOWN: &str = "unknown";
+
 /// Collect the `claude_accounts` section. Resolves the roster from
-/// `dirs::config_dir()` and the user's shell profiles, then delegates to the
-/// injectable core. Returns `None` when neither the accounts file nor any
-/// config dir is found (so the isolation driver omits the section).
+/// `dirs::config_dir()` and the user's shell profiles, asks the published
+/// account-selection door (if any) for the effective mode and its source,
+/// then delegates to the injectable core. Returns `None` when neither the
+/// accounts file nor any config dir is found (so the isolation driver omits
+/// the section).
 pub fn collect_claude_accounts() -> Option<Section> {
     let config_root = dirs::config_dir()?;
     let profiles = read_shell_profiles();
-    collect_claude_accounts_from(&config_root, profiles.as_deref())
+    let effective = ACCOUNT_SELECTION_DOOR.get().map(|door| door());
+    collect_claude_accounts_from(&config_root, profiles.as_deref(), effective)
 }
 
 /// Injectable core so tests can drive a temp config root (and control the
 /// shell-profile text) without touching the real environment.
+///
+/// `effective` is the published door's answer — `(effective_mode, source)` —
+/// passed in rather than read from the static so tests control it. Keys:
+/// `local_selection_mode` is always the file value; with `Some` the section
+/// also carries `selection_mode` (the EFFECTIVE mode) and `selection_source`
+/// (`fleet` | `local` | `pinned`); with `None` it carries
+/// `selection_source=unknown` and NO `selection_mode`.
 ///
 /// SECRET-SAFETY INVARIANT (pinned by `secret_safety_claude_accounts_*`): this
 /// function NEVER opens `.credentials.json` (or `.claude.json`) — it emits only
@@ -3291,15 +3343,14 @@ pub fn collect_claude_accounts() -> Option<Section> {
 fn collect_claude_accounts_from(
     config_root: &Path,
     profiles_text: Option<&str>,
+    effective: Option<(&str, &str)>,
 ) -> Option<Section> {
     let runner_dir = config_root.join("com.qontinui.runner");
     let accounts_file = runner_dir.join("claude-accounts.json");
     let settings_file = runner_dir.join("settings.json");
 
     let mut config_dirs: Vec<String> = Vec::new();
-    // Mirrors `AccountSelectionMode::default()` (settings.rs) — the mode a
-    // roster/settings file with no explicit field resolves to.
-    let mut selection_mode = String::from("highest_expected_usage");
+    let mut local_selection_mode = String::from(DEFAULT_LOCAL_SELECTION_MODE);
     let mut launch_commands: HashMap<String, String> = HashMap::new();
     let mut accounts_file_found = false;
 
@@ -3309,7 +3360,7 @@ fn collect_claude_accounts_from(
         if let Ok(p) = serde_json::from_str::<AccountsFileProbe>(&contents) {
             config_dirs = p.claude_config_dirs;
             if let Some(m) = p.account_selection_mode.filter(|m| !m.is_empty()) {
-                selection_mode = m;
+                local_selection_mode = m;
             }
             launch_commands = p.claude_account_launch_commands;
         }
@@ -3322,7 +3373,7 @@ fn collect_claude_accounts_from(
                     .account_selection_mode
                     .filter(|m| !m.is_empty())
             {
-                selection_mode = m;
+                local_selection_mode = m;
             }
             launch_commands = p.claude_account_launch_commands;
         }
@@ -3341,7 +3392,14 @@ fn collect_claude_accounts_from(
     pairs.sort_by(|a, b| a.0.cmp(&b.0));
 
     let mut section = Section::new();
-    put(&mut section, "selection_mode", selection_mode);
+    match effective {
+        Some((mode, source)) => {
+            put(&mut section, "selection_mode", mode);
+            put(&mut section, "selection_source", source);
+        }
+        None => put(&mut section, "selection_source", SELECTION_SOURCE_UNKNOWN),
+    }
+    put(&mut section, "local_selection_mode", local_selection_mode);
     let names: Vec<&str> = pairs.iter().map(|(n, _)| n.as_str()).collect();
     put(&mut section, "accounts", names.join(","));
 
@@ -3419,6 +3477,24 @@ fn collect_claude_accounts_from(
 // `outside-workspace` when it resolves somewhere else. A setting spelled
 // relative is published normalized and verbatim — defensive only, since the
 // setting is documented as absolute.
+//
+// **`harness_scope_kind` says which rung resolved the root.** Relative
+// renderings make two roots comparable only when both were resolved as the
+// same concept, so — like `repos_scope_kind` — the section publishes the
+// resolution kind beside its readings. qontinui-web classifies it `derived`:
+// reported, excluded from `in_sync`, never an apply line.
+
+/// The provenance key: WHICH KIND of workspace-root resolution the harness
+/// observations were taken under. The value is `WorkspaceRootKind::wire()`:
+/// `declared` / `discovered` / `home_default` in practice. `session_repo_parent`
+/// is in the enum but unreachable here, because the process-wide resolver
+/// [`collect_harness`] uses passes no session repo; `unresolved` is in the enum
+/// but never published, because an unresolved root yields no section at all. NOT
+/// `ProbeScopeKind`, which is what `versions.probe_scope_kind` carries.
+/// qontinui-web registers it as a derived key
+/// (`devenv_section_policy._DERIVED_KEYS["harness"]`), so a pure provenance
+/// difference never reads as drift; renaming it breaks that registration.
+pub(crate) const HARNESS_SCOPE_KEY: &str = "harness_scope_kind";
 
 /// The bin crate's `paths.plans_dir` door, published as a FUNCTION for the
 /// same reason [`WorkspaceRootFn`] is: the setting is operator-editable and
@@ -4319,6 +4395,7 @@ pub fn collect_harness() -> Option<Section> {
             rejected.describe()
         );
     }
+    let kind = resolved.kind;
     let root = resolved.into_root()?;
     let plans_dir = match PLANS_DIR_DOOR.get() {
         Some(door) => PlansDirReading::Read(door()),
@@ -4331,19 +4408,22 @@ pub fn collect_harness() -> Option<Section> {
         &plans_dir,
         config_root.as_deref(),
         home.as_deref(),
+        kind,
     ))
 }
 
 /// Injectable core of [`collect_harness`]: `root` is the workspace root,
 /// `plans_dir` the settings door's answer, `config_root` the platform config
 /// dir the accounts roster lives under, `home` the user's home dir (the
-/// agent-skills install root and the global git config live under it). Every
+/// agent-skills install root and the global git config live under it), `kind`
+/// the rung that resolved `root` — published as [`HARNESS_SCOPE_KEY`]. Every
 /// value is a `Value::String`.
 fn collect_harness_under(
     root: &Path,
     plans_dir: &PlansDirReading,
     config_root: Option<&Path>,
     home: Option<&Path>,
+    kind: qontinui_types::paths::WorkspaceRootKind,
 ) -> Section {
     let config_repo = root.join(HARNESS_CONFIG_REPO_DIR);
     let mut section = Section::new();
@@ -4457,6 +4537,12 @@ fn collect_harness_under(
         "invariant_class",
         invariant_class(&shape, &tracked),
     );
+    // Every key above is a probe under `root` or a rendering relative to it,
+    // so the section carries WHICH rung resolved that root — exactly as
+    // `repos` does with `REPOS_SCOPE_KEY`. Without it, two boxes whose roots
+    // were resolved by different rungs compare these readings with nothing
+    // saying they did not measure the same concept.
+    put(&mut section, HARNESS_SCOPE_KEY, kind.wire());
 
     section
 }
@@ -4466,6 +4552,7 @@ mod tests {
     use super::*;
 
     use crate::test_env::env_lock;
+    use qontinui_types::paths::WorkspaceRootKind;
 
     #[test]
     fn sanitize_url_strips_password() {
@@ -6707,7 +6794,7 @@ dependencies = [
             ),
         );
 
-        let section = collect_claude_accounts_from(root, None).expect("section present");
+        let section = collect_claude_accounts_from(root, None, None).expect("section present");
         let json = serde_json::to_string(&section).unwrap();
 
         assert_eq!(
@@ -6748,7 +6835,9 @@ dependencies = [
             ),
         );
 
-        let section = collect_claude_accounts_from(root, None).unwrap();
+        // The door says the fleet overrides the file's `manual`.
+        let section =
+            collect_claude_accounts_from(root, None, Some(("least_usage", "fleet"))).unwrap();
         assert_eq!(
             section.get("accounts").and_then(|v| v.as_str()),
             Some("gmail,work"),
@@ -6756,6 +6845,31 @@ dependencies = [
         );
         assert_eq!(
             section.get("selection_mode").and_then(|v| v.as_str()),
+            Some("least_usage"),
+            "selection_mode is the EFFECTIVE mode, not the file value"
+        );
+        assert_eq!(
+            section.get("selection_source").and_then(|v| v.as_str()),
+            Some("fleet")
+        );
+        assert_eq!(
+            section.get("local_selection_mode").and_then(|v| v.as_str()),
+            Some("manual"),
+            "the file value is reported under its own key"
+        );
+
+        // Before the door is published: only the local mode and an UNKNOWN
+        // source — never the file value dressed up as the effective mode.
+        let unpublished = collect_claude_accounts_from(root, None, None).unwrap();
+        assert!(unpublished.get("selection_mode").is_none());
+        assert_eq!(
+            unpublished.get("selection_source").and_then(|v| v.as_str()),
+            Some("unknown")
+        );
+        assert_eq!(
+            unpublished
+                .get("local_selection_mode")
+                .and_then(|v| v.as_str()),
             Some("manual")
         );
         assert_eq!(
@@ -6769,7 +6883,7 @@ dependencies = [
 
         // None when neither the accounts file nor any config dir is found.
         let empty = tempfile::tempdir().unwrap();
-        assert!(collect_claude_accounts_from(empty.path(), None).is_none());
+        assert!(collect_claude_accounts_from(empty.path(), None, None).is_none());
     }
 
     /// Vet caveat: with no `claude-accounts.json`, the mode must be read from
@@ -6796,15 +6910,41 @@ dependencies = [
         )
         .unwrap();
 
-        let section = collect_claude_accounts_from(root, None).unwrap();
+        let section = collect_claude_accounts_from(root, None, Some(("manual", "pinned"))).unwrap();
         assert_eq!(
-            section.get("selection_mode").and_then(|v| v.as_str()),
+            section.get("local_selection_mode").and_then(|v| v.as_str()),
             Some("manual"),
             "mode must come from nested ai.claude_cli, not a flat lookup"
         );
         assert_eq!(
+            section.get("selection_source").and_then(|v| v.as_str()),
+            Some("pinned")
+        );
+        assert_eq!(
             section.get("accounts").and_then(|v| v.as_str()),
             Some("personal")
+        );
+    }
+
+    /// A roster that stores no mode reports the runner's default as the local
+    /// mode — spelled as a LITERAL here, so changing the constant reddens this
+    /// test as well as the bin crate's enum-agreement test.
+    #[test]
+    fn claude_accounts_roster_without_a_mode_reports_weighted_random() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let runner = root.join("com.qontinui.runner");
+        let acct = root.join(".claude-personal");
+        std::fs::create_dir_all(&acct).unwrap();
+        write_roster(
+            &runner,
+            &format!("{{\"claude_config_dirs\":[{:?}]}}", acct.to_string_lossy()),
+        );
+
+        let section = collect_claude_accounts_from(root, None, None).unwrap();
+        assert_eq!(
+            section.get("local_selection_mode").and_then(|v| v.as_str()),
+            Some("weighted_random")
         );
     }
 
@@ -6838,7 +6978,7 @@ dependencies = [
             gmail.to_string_lossy()
         );
 
-        let section = collect_claude_accounts_from(root, Some(&profile)).unwrap();
+        let section = collect_claude_accounts_from(root, Some(&profile), None).unwrap();
         assert_eq!(
             section.get("shortcut_gmail").and_then(|v| v.as_str()),
             Some("present"),
@@ -6851,7 +6991,7 @@ dependencies = [
         );
 
         // No profile text → shortcut keys omitted.
-        let no_profile = collect_claude_accounts_from(root, None).unwrap();
+        let no_profile = collect_claude_accounts_from(root, None, None).unwrap();
         assert!(no_profile.get("shortcut_gmail").is_none());
         assert!(no_profile.get("shortcut_work").is_none());
     }
@@ -7038,6 +7178,7 @@ dependencies = [
             &PlansDirReading::Read(Some(plans)),
             None,
             Some(&home),
+            WorkspaceRootKind::Declared,
         );
 
         for (k, v) in &section {
@@ -7077,7 +7218,13 @@ dependencies = [
     #[test]
     fn harness_bare_root_reads_absent_everywhere() {
         let root = harness_root("bare");
-        let section = collect_harness_under(&root, &PlansDirReading::Read(None), None, None);
+        let section = collect_harness_under(
+            &root,
+            &PlansDirReading::Read(None),
+            None,
+            None,
+            WorkspaceRootKind::Declared,
+        );
         for key in [
             "link_claude_dir",
             "link_claude_md",
@@ -7096,6 +7243,43 @@ dependencies = [
         );
         assert_eq!(harness_value(&section, "plans_dir_relative"), "unset");
         assert_eq!(harness_value(&section, "invariant_class"), "(a)");
+        assert_eq!(harness_value(&section, HARNESS_SCOPE_KEY), "declared");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The section publishes WHICH rung resolved the root it probed, verbatim
+    /// from `WorkspaceRootKind::wire()` — the value set qontinui-web's
+    /// `_DERIVED_KEYS["harness"]` registration documents. Every variant: the
+    /// table is built through an exhaustive `match` with no wildcard, so a new
+    /// rung fails to COMPILE here until it is given an expected wire value.
+    /// The key name itself is pinned because the web registration is keyed on
+    /// it.
+    #[test]
+    fn harness_publishes_the_workspace_root_kind() {
+        fn expected_wire(kind: WorkspaceRootKind) -> &'static str {
+            match kind {
+                WorkspaceRootKind::Declared => "declared",
+                WorkspaceRootKind::Discovered => "discovered",
+                WorkspaceRootKind::SessionRepoParent => "session_repo_parent",
+                WorkspaceRootKind::HomeDefault => "home_default",
+                WorkspaceRootKind::Unresolved => "unresolved",
+            }
+        }
+        assert_eq!(HARNESS_SCOPE_KEY, "harness_scope_kind");
+        let root = harness_root("scope");
+        for kind in [
+            WorkspaceRootKind::Declared,
+            WorkspaceRootKind::Discovered,
+            WorkspaceRootKind::SessionRepoParent,
+            WorkspaceRootKind::HomeDefault,
+            WorkspaceRootKind::Unresolved,
+        ] {
+            let wire = expected_wire(kind);
+            let section =
+                collect_harness_under(&root, &PlansDirReading::Read(None), None, None, kind);
+            assert_eq!(harness_value(&section, HARNESS_SCOPE_KEY), wire);
+            assert!(section[HARNESS_SCOPE_KEY].is_string(), "envelope contract");
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -7110,7 +7294,13 @@ dependencies = [
         std::fs::create_dir_all(&tracked).unwrap();
 
         if make_link(&root.join("plans"), &tracked, true) {
-            let section = collect_harness_under(&root, &PlansDirReading::Read(None), None, None);
+            let section = collect_harness_under(
+                &root,
+                &PlansDirReading::Read(None),
+                None,
+                None,
+                WorkspaceRootKind::Declared,
+            );
             assert_eq!(harness_value(&section, "invariant_class"), "(b)");
             // Remove the link only (never the target). On Windows a directory
             // symlink/junction is removed as a directory.
@@ -7124,7 +7314,13 @@ dependencies = [
 
         std::fs::create_dir_all(root.join("plans")).unwrap();
         std::fs::write(root.join("plans").join("stray.md"), "# a second corpus\n").unwrap();
-        let section = collect_harness_under(&root, &PlansDirReading::Read(None), None, None);
+        let section = collect_harness_under(
+            &root,
+            &PlansDirReading::Read(None),
+            None,
+            None,
+            WorkspaceRootKind::Declared,
+        );
         assert_eq!(harness_value(&section, "invariant_class"), "(c)");
         assert!(
             root.join("plans").join("stray.md").is_file(),
@@ -7147,7 +7343,13 @@ dependencies = [
             let _ = std::fs::remove_dir_all(&root);
             return;
         }
-        let section = collect_harness_under(&root, &PlansDirReading::Read(None), None, None);
+        let section = collect_harness_under(
+            &root,
+            &PlansDirReading::Read(None),
+            None,
+            None,
+            WorkspaceRootKind::Declared,
+        );
         assert_eq!(harness_value(&section, "link_claude_dir"), "foreign");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -7169,13 +7371,25 @@ dependencies = [
         )
         .unwrap();
         std::fs::create_dir_all(root.join(".claude")).unwrap();
-        let section = collect_harness_under(&root, &PlansDirReading::Read(None), None, None);
+        let section = collect_harness_under(
+            &root,
+            &PlansDirReading::Read(None),
+            None,
+            None,
+            WorkspaceRootKind::Declared,
+        );
         assert_eq!(harness_value(&section, "link_claude_md"), "present");
         assert_eq!(harness_value(&section, "link_dev_start"), "present");
         assert_eq!(harness_value(&section, "link_claude_dir"), "foreign");
 
         std::fs::write(root.join("CLAUDE.md"), "# my own guidelines\n").unwrap();
-        let section = collect_harness_under(&root, &PlansDirReading::Read(None), None, None);
+        let section = collect_harness_under(
+            &root,
+            &PlansDirReading::Read(None),
+            None,
+            None,
+            WorkspaceRootKind::Declared,
+        );
         assert_eq!(harness_value(&section, "link_claude_md"), "foreign");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -7270,7 +7484,13 @@ dependencies = [
             matches!(shape, PathShape::Link { resolved: None, .. }),
             "expected a dangling link shape, got {shape:?}"
         );
-        let section = collect_harness_under(&root, &PlansDirReading::Read(None), None, None);
+        let section = collect_harness_under(
+            &root,
+            &PlansDirReading::Read(None),
+            None,
+            None,
+            WorkspaceRootKind::Declared,
+        );
         assert_eq!(harness_value(&section, "link_claude_dir"), "foreign");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -7748,7 +7968,13 @@ dependencies = [
             "#!/bin/sh\n",
         )
         .unwrap();
-        let section = collect_harness_under(&root, &PlansDirReading::Read(None), None, None);
+        let section = collect_harness_under(
+            &root,
+            &PlansDirReading::Read(None),
+            None,
+            None,
+            WorkspaceRootKind::Declared,
+        );
         assert_eq!(harness_value(&section, "installer_git_hooks"), "present");
 
         std::fs::write(
@@ -7756,7 +7982,13 @@ dependencies = [
             "[core]\n\thooksPath = .githooks\n",
         )
         .unwrap();
-        let section = collect_harness_under(&root, &PlansDirReading::Read(None), None, None);
+        let section = collect_harness_under(
+            &root,
+            &PlansDirReading::Read(None),
+            None,
+            None,
+            WorkspaceRootKind::Declared,
+        );
         assert_eq!(
             harness_value(&section, "installer_git_hooks"),
             "absent",
@@ -7768,7 +8000,13 @@ dependencies = [
             "#!/bin/sh\n",
         )
         .unwrap();
-        let section = collect_harness_under(&root, &PlansDirReading::Read(None), None, None);
+        let section = collect_harness_under(
+            &root,
+            &PlansDirReading::Read(None),
+            None,
+            None,
+            WorkspaceRootKind::Declared,
+        );
         assert_eq!(harness_value(&section, "installer_git_hooks"), "present");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -8216,6 +8454,7 @@ dependencies = [
             &PlansDirReading::Read(None),
             Some(&config_root),
             None,
+            WorkspaceRootKind::Declared,
         );
         assert_eq!(
             harness_value(&section, "installer_claude_accounts"),
@@ -8234,6 +8473,7 @@ dependencies = [
             &PlansDirReading::Read(None),
             Some(&config_root),
             None,
+            WorkspaceRootKind::Declared,
         );
         assert_eq!(
             harness_value(&section, "installer_claude_accounts"),

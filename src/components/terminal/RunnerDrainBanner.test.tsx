@@ -9,6 +9,7 @@ import { describe, it, expect } from "vitest";
 import {
   drainBannerModel,
   deferredLabel,
+  liveDismissal,
   RESTORE_NOTE,
   UNKNOWN_HEADING,
 } from "./RunnerDrainBanner";
@@ -71,6 +72,42 @@ describe("drainBannerModel", () => {
     expect(m?.heading).toBe(UNKNOWN_HEADING);
     expect(m?.detail).toBe("3 consecutive failed drain read(s)");
     expect(m?.deferredLabel).toBe("1 deferred work item");
+  });
+
+  it("keys dismissal on the episode, not on the per-read cause", () => {
+    const unknown = (cause: string) =>
+      drainBannerModel(
+        snap({
+          state: "unknown",
+          autonomousSpawnsAllowed: false,
+          since: "2026-09-14T09:00:00Z",
+          cause,
+        }),
+      )?.episodeKey;
+    // The backend rewrites the cause on every read; one episode keeps one key.
+    expect(unknown("3 consecutive failed drain read(s)")).toBe(
+      unknown("4 consecutive failed drain read(s)"),
+    );
+    const drained = (until: string | null, reason: string | null) =>
+      drainBannerModel(
+        snap({
+          state: "drained",
+          autonomousSpawnsAllowed: false,
+          until,
+          reason,
+        }),
+      )?.episodeKey;
+    // The heartbeat enters `drained` with no reason; the follow-up me/drain
+    // read fills it in for the same `until`. That is one episode, as the
+    // backend's `entered_drained` counts it.
+    expect(drained("2026-09-14T12:00:00Z", null)).toBe(drained("2026-09-14T12:00:00Z", "rebuild"));
+    // A new `until` is a new episode.
+    expect(drained("2026-09-14T12:00:00Z", "rebuild")).not.toBe(
+      drained("2026-09-14T13:00:00Z", "rebuild"),
+    );
+    expect(drained("2026-09-14T12:00:00Z", "rebuild")).not.toBe(
+      unknown("3 consecutive failed drain read(s)"),
+    );
   });
 
   it("omits the detail line for a drain with no until or reason", () => {
@@ -186,5 +223,24 @@ describe("drainBannerModel — boot", () => {
         snap({ state: "unknown", autonomousSpawnsAllowed: false, bootReadPending: false }),
       )?.heading,
     ).toBe(UNKNOWN_HEADING);
+  });
+});
+
+describe("liveDismissal", () => {
+  it("keeps a dismissal only while its own episode is current", () => {
+    expect(liveDismissal("drained|X", "drained|X")).toBe("drained|X");
+    expect(liveDismissal(null, "drained|X")).toBeNull();
+  });
+
+  it("spends a dismissal on any other episode, so drained → unknown → drained re-shows", () => {
+    // drained(X) dismissed, then the state goes unknown: the dismissal is spent…
+    const afterUnknown = liveDismissal("drained|X", "unknown|2026-09-14T09:00:00Z");
+    expect(afterUnknown).toBeNull();
+    // …so the same drained(X) returning shows the banner again.
+    expect(liveDismissal(afterUnknown, "drained|X")).toBeNull();
+  });
+
+  it("spends a dismissal when no banner shows (the drain cleared)", () => {
+    expect(liveDismissal("drained|X", null)).toBeNull();
   });
 });

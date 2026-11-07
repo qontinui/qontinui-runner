@@ -1,6 +1,7 @@
 import { useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { ask } from "@tauri-apps/plugin-dialog";
+import { isUpdateEgressOff } from "./settings/egressPrivacyHelpers";
 
 /**
  * Launch-time auto-update check.
@@ -25,8 +26,13 @@ export function AutoUpdateChecker(): null {
         try {
           const result = (await invoke("check_for_updates")) as {
             success: boolean;
-            data?: { available?: boolean; version?: string };
+            data?: { available?: boolean; version?: string; status?: string };
           };
+          // The project turned update checks off (`egress_update_check`): the
+          // runner made no request. Nothing to prompt, and nothing to report
+          // as an error: Settings → Updates renders the
+          // `UPDATE_EGRESS_OFF_MESSAGE` text in place of one.
+          if (isUpdateEgressOff(result.data)) return;
           if (cancelled || !result.success || !result.data?.available) return;
 
           const version = result.data.version

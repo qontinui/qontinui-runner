@@ -28,7 +28,7 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { TerminalOutputCoalescer, base64ToBytes } from "./terminalOutputTap";
+import { TerminalOutputCoalescer, base64ToBytes, chunkEndOffset } from "./terminalOutputTap";
 import { detectSessionState } from "./sessionStateDetector";
 import type { SessionState } from "./useZoneLayout";
 
@@ -197,3 +197,17 @@ describe("TerminalOutputCoalescer — routing, ordering, pruning", () => {
     expect(drained.has("drop")).toBe(false);
   });
 });
+
+describe("chunkEndOffset", () => {
+  it("is the chunk's absolute offset plus its length", () => {
+    expect(chunkEndOffset(376_000, 950)).toBe(376_950);
+    expect(chunkEndOffset(0, 12)).toBe(12);
+  });
+
+  it("is undefined when the event carries no usable offset", () => {
+    expect(chunkEndOffset(undefined, 12)).toBeUndefined();
+    expect(chunkEndOffset(-1, 12)).toBeUndefined();
+    expect(chunkEndOffset(Number.NaN, 12)).toBeUndefined();
+  });
+});
+

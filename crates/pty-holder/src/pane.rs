@@ -16,7 +16,16 @@
 //!   (`crate::spec`);
 //! - `<pane-id>.log` — the holder's own, size-capped diagnostic log. A holder
 //!   has no stderr once it is detached, so this is where it says why an
-//!   endpoint failed without ending the pane.
+//!   endpoint failed without ending the pane;
+//! - `<pane-id>.scrollback` — the pane's durable output tail, 0600, replaced
+//!   atomically via `<pane-id>.scrollback.tmp` (`crate::scrollback`, plan D7).
+//!   Like the lock file it outlives the holder; that is its purpose;
+//! - `<pane-id>.upgrade` — a holder upgrade's snapshot (plan Phase 8, Unix),
+//!   alive only between the predecessor writing it and the successor
+//!   consuming it (or the predecessor's rollback unlinking it);
+//! - `<pane-id>.report` — the holder's one-line ready/error report, written
+//!   (atomically, 0600) only when it was started with `--report`: the Windows
+//!   WMI spawn route gives the holder no stdout pipe to print it on (Phase 3).
 //!
 //! On Windows the endpoint is a named pipe, whose namespace is global rather
 //! than a directory, so [`pipe_name`] folds the pane directory into the name.
@@ -90,6 +99,48 @@ pub fn socket_path(pane_dir: &Path, pane: &PaneId) -> PathBuf {
 /// `<pane-dir>/<pane-id>.spec` — the child spec (`crate::spec`).
 pub fn spec_path(pane_dir: &Path, pane: &PaneId) -> PathBuf {
     pane_dir.join(format!("{}.spec", pane.as_str()))
+}
+
+/// `<pane-dir>/<pane-id>.scrollback` — the durable output tail
+/// (`crate::scrollback`).
+pub fn scrollback_path(pane_dir: &Path, pane: &PaneId) -> PathBuf {
+    pane_dir.join(format!("{}.scrollback", pane.as_str()))
+}
+
+/// `<pane-dir>/<pane-id>.scrollback.tmp` — where a tail rewrite is written
+/// before it is renamed over [`scrollback_path`].
+pub fn scrollback_tmp_path(pane_dir: &Path, pane: &PaneId) -> PathBuf {
+    pane_dir.join(format!("{}.scrollback.tmp", pane.as_str()))
+}
+
+/// `<pane-dir>/<pane-id>.report` — the holder's ready/error report file.
+pub fn report_path(pane_dir: &Path, pane: &PaneId) -> PathBuf {
+    pane_dir.join(format!("{}.report", pane.as_str()))
+}
+
+/// `<pane-dir>/<pane-id>.report-tmp` — where a report is written before it is
+/// renamed over [`report_path`].
+pub fn report_tmp_path(pane_dir: &Path, pane: &PaneId) -> PathBuf {
+    pane_dir.join(format!("{}.report-tmp", pane.as_str()))
+}
+
+/// `<pane-dir>/<pane-id>.orphan` — the orphan ledger's entry for a dead
+/// holder whose leftovers could not be attributed (`crate::sweep`).
+pub fn orphan_path(pane_dir: &Path, pane: &PaneId) -> PathBuf {
+    pane_dir.join(format!("{}.orphan", pane.as_str()))
+}
+
+/// `<pane-dir>/<pane-id>.upgrade` — a holder upgrade's snapshot (plan Phase
+/// 8): written 0600 by the predecessor, consumed (unlinked on open) by the
+/// successor, and unlinked by the predecessor on every rollback.
+pub fn snapshot_path(pane_dir: &Path, pane: &PaneId) -> PathBuf {
+    pane_dir.join(format!("{}.upgrade", pane.as_str()))
+}
+
+/// `<pane-dir>/<pane-id>.upgrade-tmp` — where a snapshot is written before it
+/// is renamed over [`snapshot_path`].
+pub fn snapshot_tmp_path(pane_dir: &Path, pane: &PaneId) -> PathBuf {
+    pane_dir.join(format!("{}.upgrade-tmp", pane.as_str()))
 }
 
 /// `<pane-dir>/<pane-id>.log` — the holder's diagnostic log.
@@ -334,6 +385,8 @@ mod tests {
         assert_eq!(socket_path(dir, &p), dir.join("p1.sock"));
         assert_eq!(spec_path(dir, &p), dir.join("p1.spec"));
         assert_eq!(log_path(dir, &p), dir.join("p1.log"));
+        assert_eq!(scrollback_path(dir, &p), dir.join("p1.scrollback"));
+        assert_eq!(report_path(dir, &p), dir.join("p1.report"));
 
         let name = pipe_name(dir, &p);
         assert!(name.starts_with(r"\\.\pipe\qontinui-pty-holder-"), "{name}");

@@ -1,0 +1,202 @@
+name: Prepare a self-hosted Windows CI host
+description: >-
+  The Windows twin of the `test` job's two self-hosted Linux steps, for every job
+  that can land on the self-hosted Windows pool `[self-hosted, Windows, X64,
+  qontinui-runner-ci-windows, ram-40g]`. Run it right after actions/checkout, gated
+  `runner.environment == 'self-hosted' && runner.os == 'Windows'`. It (1) proves the
+  job runs under a dedicated CI account of this registration BEFORE it deletes or
+  stops anything, (2) removes what the previous job on this registration left behind:
+  PowerShell profiles, sibling checkouts, the CI state under ~/.qontinui, a
+  qontinui-runner / WebView2 process, (3) fails NAMING THE RUNNER when the host is not
+  provisioned for this pool, so a host fault is the host's red and not the PR's, (4)
+  exports a memory-derived CARGO_BUILD_JOBS, the hosted leg's RUST_TEST_THREADS and
+  vitest worker count, and a TEMP of the job's own, and (5) points ./target at a
+  persistent per-registration cargo target through a directory junction.
+
+  The pool contract (what a host provisioner must give each registration): its own
+  non-admin account, and a runner `.env` setting QONTINUI_CI_HOST,
+  QONTINUI_CI_MEMORY_BUDGET_GIB and, optionally, QONTINUI_CI_CARGO_TARGET_ROOT
+  (qontinui-claude-config scripts/winvm/provision-runners.ps1 does this for the
+  nawa VM).
+
+inputs:
+  require-webview2:
+    description: >-
+      "true" fails the job when the WebView2 runtime is absent. The `test` job's
+      contract smoke renders through it (`uiBridgeIpcObserved:true`).
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - name: Prepare the self-hosted Windows host
+      # -NoProfile: this step deletes the account's PowerShell profiles before any
+      # later pwsh/powershell step can load one, so it must not load one itself.
+      shell: pwsh -NoProfile -NonInteractive -Command ". '{0}'"
+      env:
+        REQUIRE_WEBVIEW2: ${{ inputs.require-webview2 }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $me = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+        function Fail($why) {
+          "::error title=self-hosted host not provisioned::runner '$env:RUNNER_NAME' $why. The HOST is at fault, not this change. A re-run goes to the hosted floor; RUNNER_CI_WINDOWS_LANE=hosted keeps new runs off the pool."
+          exit 1
+        }
+
+        # 1. A provisioned pool account, checked before anything below deletes or
+        #    stops a thing: the provisioner's .env declared the host
+        #    (QONTINUI_CI_HOST), and exactly one Runner.Worker -- this job's -- runs
+        #    under this account, so no other job is running under it right now.
+        if (-not $env:RUNNER_NAME) { Fail 'has an empty RUNNER_NAME' }
+        if (-not $env:QONTINUI_CI_HOST) { Fail 'declares no QONTINUI_CI_HOST in its .env, so this is not a provisioned pool account' }
+        $workers = @(Get-CimInstance Win32_Process -Filter "Name='Runner.Worker.exe'" | Where-Object {
+          $o = Invoke-CimMethod -InputObject $_ -MethodName GetOwner -ErrorAction SilentlyContinue
+          $o -and "$($o.Domain)\$($o.User)" -eq $me
+        })
+        if ($workers.Count -ne 1) { Fail "runs $($workers.Count) Runner.Worker processes under $me (want exactly this job's 1): the account is shared" }
+
+        #    ...and no REAL identity in ~/.qontinui, also checked before anything is
+        #    stopped or deleted. A job can leave Poison's files there (they carry
+        #    its literal markers) and whatever a runner exe writes when started
+        #    without QONTINUI_HOME (runner\, the loopback key, rag\, ...; the list
+        #    grows with the runner). A profiles.json without Poison's
+        #    poison.invalid, or a coord-device-jwt that is not Poison's literal, is
+        #    a real identity: the job refuses rather than delete it.
+        $q = Join-Path $env:USERPROFILE '.qontinui'
+        $real = @()
+        $pj = Join-Path $q 'profiles.json'
+        if ((Test-Path -LiteralPath $pj) -and -not (Select-String -LiteralPath $pj -SimpleMatch 'poison.invalid' -Quiet)) { $real += 'profiles.json' }
+        $jwt = Join-Path $q 'coord-device-jwt'
+        if (Test-Path -LiteralPath $jwt) {
+          # An empty file (a Poison write cut short) is not an identity; "$null".Trim() is ''.
+          $t = "$(Get-Content -LiteralPath $jwt -Raw)".Trim()
+          if ($t -and $t -ne 'poison-header-not-a-jwt.poison-payload-ci-ambient-state.poison-not-a-signature') { $real += 'coord-device-jwt' }
+        }
+        if ($real.Count) { Fail "has a $q holding a real identity ($($real -join ', ')): not a CI-only profile" }
+
+        # 2. What an earlier job on this registration left behind.
+        #    0. A qontinui-runner exe started from this workspace or the target
+        #       behind it, or a WebView2 host serving one, still alive under this
+        #       account: stopped first, before the deletions it could block.
+        $root = $env:QONTINUI_CI_CARGO_TARGET_ROOT
+        if (-not $root) { $root = Join-Path (Split-Path -Parent $env:RUNNER_WORKSPACE) '_qontinui-cargo-target' }
+        $target = Join-Path $root $env:RUNNER_NAME
+        & (Join-Path $env:GITHUB_WORKSPACE 'scripts/ci/stop-leftover-processes.ps1') -Workspace $env:GITHUB_WORKSPACE -TargetRoot $target -Why 'an earlier job'
+        if ($LASTEXITCODE -ne 0) { exit 1 }
+        #    a. PowerShell profiles: a pwsh / Windows PowerShell step loads the
+        #       account's profile, and the account persists between jobs, so a
+        #       profile one job wrote would run inside every later job.
+        $docs = [Environment]::GetFolderPath('MyDocuments')
+        foreach ($dir in 'PowerShell', 'WindowsPowerShell') {
+          Get-ChildItem -LiteralPath (Join-Path $docs $dir) -Filter '*profile*.ps1' -File -ErrorAction SilentlyContinue |
+            ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force; "removed a persisted PowerShell profile: $($_.FullName)" }
+        }
+        #    b. Sibling checkouts live at $GITHUB_WORKSPACE/.. (checkout-sibling
+        #       writes them there and refuses an existing tree).
+        $parent = Split-Path -Parent $env:GITHUB_WORKSPACE
+        foreach ($name in 'qontinui-schemas', 'qontinui-web', 'ui-bridge') {
+          $p = Join-Path $parent $name
+          if (Test-Path -LiteralPath $p) {
+            Remove-Item -LiteralPath $p -Recurse -Force
+            "removed the previous job's $p"
+          }
+        }
+        #    c. ~/.qontinui: checked above, before anything was stopped; what is
+        #       left there is a CI job's, and is removed.
+        if (Test-Path -LiteralPath $q) {
+          "removing the previous job's leftovers in ${q}: $(@(Get-ChildItem -LiteralPath $q -Force).Name -join ', ')"
+          Remove-Item -LiteralPath $q -Recurse -Force
+        }
+
+        # 3. Host preflight. git and bash (Git for Windows, not the System32 WSL
+        #    launcher) are the host's; the MSVC toolchain and WebView2 cannot be
+        #    installed by a non-admin job; QONTINUI_CI_MEMORY_BUDGET_GIB is the
+        #    host's declaration of this registration's share of its RAM (Windows has
+        #    no cgroup to read).
+        $missing = @()
+        if (-not (Get-Command git -ErrorAction SilentlyContinue)) { $missing += 'git' }
+        $bash = Get-Command bash -ErrorAction SilentlyContinue
+        if (-not $bash -or $bash.Source -like "$env:WINDIR\System32\*") { $missing += 'bash from Git for Windows (not the System32 WSL launcher)' }
+        $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+        $vc = if (Test-Path -LiteralPath $vswhere) {
+          & $vswhere -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+        }
+        if (-not $vc) { $missing += 'MSVC x64 build tools (VC.Tools.x86.x64)' }
+        if ($env:REQUIRE_WEBVIEW2 -eq 'true') {
+          $wv = (Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}' -ErrorAction SilentlyContinue).pv
+          if (-not $wv -or $wv -eq '0.0.0.0') { $missing += 'WebView2 runtime' }
+        }
+        if ($env:QONTINUI_CI_MEMORY_BUDGET_GIB -notmatch '^[1-9][0-9]*$') { $missing += 'QONTINUI_CI_MEMORY_BUDGET_GIB (the registration''s RAM share, in its .env)' }
+        if ($env:QONTINUI_CI_CARGO_TARGET_ROOT -and -not (Test-Path -LiteralPath $root -PathType Container)) { $missing += "the declared QONTINUI_CI_CARGO_TARGET_ROOT $root" }
+        if ($missing.Count) { Fail "lacks: $($missing -join '; ')" }
+
+        # 4. Compile and test caps, and a TEMP of the job's own.
+        #    CARGO_BUILD_JOBS: the registration's budget / 5 GiB per job, the Linux
+        #    pool's measured divisor, clamped to [1, nproc] and never above the
+        #    machine's RAM; 1 at or below 8 GiB. The budgets of a host's
+        #    registrations may add up to more than its RAM (a pagefile absorbs an
+        #    overlap), so this clamp is per job only.
+        #    RUST_TEST_THREADS=4 and VITEST_MAX_WORKERS=3 are what the hosted 4-core
+        #    leg runs (vitest's own default there is nproc - 1): a suite's
+        #    concurrency regime does not change with the machine it lands on.
+        #    Measured 2026-11-03 on the nawa VM (32 vCPU) with vitest's default
+        #    worker count: rank.registry.test.ts's beforeAll timed out at 10 s
+        #    (import 402 s summed across workers) while a sibling registration
+        #    compiled on the same VM.
+        #    TEMP/TMP: the registration's .env points them at a persistent
+        #    directory; a job gets its own under RUNNER_TEMP, which the runner
+        #    empties when the job ends, so no job reads another's temp files.
+        $budgetKb = [math]::Min([int64]$env:QONTINUI_CI_MEMORY_BUDGET_GIB * 1048576, [int64](Get-CimInstance Win32_OperatingSystem).TotalVisibleMemorySize)
+        $cpus = [Environment]::ProcessorCount
+        $jobs = [int][math]::Floor($budgetKb / 5242880)
+        if ($budgetKb -le 8388608) { $jobs = 1 }
+        $jobs = [math]::Max(1, [math]::Min($jobs, $cpus))
+        $tmp = Join-Path $env:RUNNER_TEMP 'tmp'
+        New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+        "CARGO_BUILD_JOBS=$jobs", "RUST_TEST_THREADS=4", "VITEST_MAX_WORKERS=3", "TEMP=$tmp", "TMP=$tmp" |
+          Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+        "memory budget $([math]::Round($budgetKb / 1048576)) GiB, nproc $cpus -> CARGO_BUILD_JOBS=$jobs RUST_TEST_THREADS=4 VITEST_MAX_WORKERS=3, TEMP=$tmp"
+
+        # 5. A warm, persistent target, ONE per registration (two jobs never share
+        #    a cargo build lock): <root>\<RUNNER_NAME>, the root from the host's
+        #    QONTINUI_CI_CARGO_TARGET_ROOT or else under this registration's _work.
+        #    actions/checkout's `git clean -ffdx` removes the junction, never the
+        #    tree behind it (measured on Git for Windows 2.56); CARGO_TARGET_DIR
+        #    stays unset so in-tree paths (the contract smoke's
+        #    target/debug/qontinui-runner.exe) keep working, as on the Linux pool.
+        #    The persistent tree is only ever emptied when it carries this action's
+        #    marker (and its drive has under 60 GiB free); a ./target DIRECTORY in
+        #    the workspace itself is the job's own and is replaced by the junction.
+        $marker = Join-Path $target '.qontinui-ci-target'
+        New-Item -ItemType Directory -Force -Path $target | Out-Null
+        if (-not (Test-Path -LiteralPath $marker)) {
+          if (@(Get-ChildItem -LiteralPath $target -Force).Count) {
+            Fail "has a non-empty $target that carries no $([IO.Path]::GetFileName($marker)): refusing to adopt a directory this pool did not create"
+          }
+          Set-Content -LiteralPath $marker -Value $env:RUNNER_NAME
+        }
+        $free = ([IO.DriveInfo]::new([IO.Path]::GetPathRoot((Resolve-Path -LiteralPath $target).Path))).AvailableFreeSpace
+        if ($free -lt 60GB) {
+          "::notice title=persistent target reset::$([math]::Round($free / 1GB)) GiB free on the drive of $target`: starting cold"
+          Get-ChildItem -LiteralPath $target -Force | Where-Object { $_.Name -ne '.qontinui-ci-target' } | Remove-Item -Recurse -Force
+        }
+        # The post-smoke step matches leftover processes under this target too.
+        "QONTINUI_CI_TARGET=$target" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+
+        $link = Join-Path $env:GITHUB_WORKSPACE 'target'
+        $existing = Get-Item -LiteralPath $link -Force -ErrorAction SilentlyContinue
+        if ($existing) {
+          if ($existing.LinkType) { $existing.Delete() } else { Remove-Item -LiteralPath $link -Recurse -Force }
+        }
+        New-Item -ItemType Junction -Path $link -Target $target | Out-Null
+        Push-Location $env:GITHUB_WORKSPACE
+        try {
+          $exclude = git rev-parse --git-path info/exclude
+          New-Item -ItemType Directory -Force -Path (Split-Path -Parent $exclude) | Out-Null
+          if (-not ((Get-Content -LiteralPath $exclude -ErrorAction SilentlyContinue) -contains '/target')) {
+            Add-Content -LiteralPath $exclude -Value '/target'
+          }
+        } finally { Pop-Location }
+        "target -> $target (junction)"

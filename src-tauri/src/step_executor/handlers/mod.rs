@@ -1015,40 +1015,40 @@ You are NOT an implementer. Do NOT fix anything, make code changes, or modify fi
 
 ## Available APIs (use curl to query)
 
-### Runner API (localhost:9876)
+### Runner API (127.0.0.1:9876)
 
 Query workflow execution data:
 
 ```bash
 # Get step checkpoints for this task run (shows pass/fail of each step)
-curl -s http://localhost:9876/task-runs/{task_run_id}/checkpoints
+curl -s http://127.0.0.1:9876/task-runs/{task_run_id}/checkpoints
 
 # Get verification phase results for this iteration
-curl -s http://localhost:9876/task-runs/{task_run_id}/verification-phase-results
+curl -s http://127.0.0.1:9876/task-runs/{task_run_id}/verification-phase-results
 
 # Get current workflow state (phase, iteration, status)
-curl -s http://localhost:9876/task-runs/{task_run_id}/workflow-state
+curl -s http://127.0.0.1:9876/task-runs/{task_run_id}/workflow-state
 
 # Get accumulated AI output
-curl -s "http://localhost:9876/task-runs/{task_run_id}/output?tail_chars=5000"
+curl -s "http://127.0.0.1:9876/task-runs/{task_run_id}/output?tail_chars=5000"
 ```
 
-### UI Bridge SDK (localhost:9876)
+### UI Bridge SDK (127.0.0.1:9876)
 
 Inspect the connected application's UI state:
 
 ```bash
 # Get all visible elements (text content only — lightweight)
-curl -s "http://localhost:9876/ui-bridge/sdk/elements?contentOnly=true"
+curl -s "http://127.0.0.1:9876/ui-bridge/sdk/elements?contentOnly=true"
 
 # Search for specific elements by text or attribute
-curl -s "http://localhost:9876/ui-bridge/sdk/ai/search?q=<search_term>"
+curl -s "http://127.0.0.1:9876/ui-bridge/sdk/ai/search?q=<search_term>"
 
 # Get full element tree (more detailed, larger response)
-curl -s "http://localhost:9876/ui-bridge/sdk/elements"
+curl -s "http://127.0.0.1:9876/ui-bridge/sdk/elements"
 
 # Take a snapshot of the current page state
-curl -s "http://localhost:9876/ui-bridge/sdk/snapshot"
+curl -s "http://127.0.0.1:9876/ui-bridge/sdk/snapshot"
 ```
 
 ## Tool Usage Guidelines
@@ -1090,7 +1090,10 @@ async fn try_gather_ui_context() -> Option<String> {
         .ok()?;
 
     let response = client
-        .get("http://localhost:9876/ui-bridge/sdk/elements?contentOnly=true")
+        .get(format!(
+            "{}/ui-bridge/sdk/elements?contentOnly=true",
+            crate::mcp::types::get_self_base_url_from_env()
+        ))
         .send()
         .await
         .ok()?;

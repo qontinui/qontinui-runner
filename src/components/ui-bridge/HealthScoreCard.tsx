@@ -28,6 +28,7 @@
 import { Activity, AlertTriangle, HelpCircle, RefreshCw } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { withTimeout } from "@/lib/withTimeout";
+import { getApiBase } from "@/lib/runner-api";
 
 interface AutomationHealthScore {
   /** null unless all three rates below are known. */
@@ -147,7 +148,7 @@ export function HealthScoreCard({ days = 7 }: HealthScoreCardProps) {
       // error+retry instead of an eternal "Loading health score…" spinner.
       // The AbortSignal cancels the in-flight request when the timeout wins.
       const res = await withTimeout(
-        fetch(`http://localhost:9876/ui-bridge/analytics/health-score?days=${days}`, {
+        fetch(`${getApiBase()}/ui-bridge/analytics/health-score?days=${days}`, {
           signal,
         }),
         10_000,

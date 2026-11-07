@@ -3,7 +3,7 @@
  * `2026-07-28-runner-many-sessions-performance` Phase 2, root cause A4).
  *
  * Before: `visible` toggled a CSS class and triggered a re-fit — nothing else.
- * A hidden pane (an unassigned tab parked by `HiddenTerminal`, a non-maximized
+ * A hidden pane (an unassigned tab's parked cell, a non-maximized
  * zone under single-view, a compact zone card) kept a 250 ms ack timer, a
  * `ResizeObserver` and a full xterm parse+render pipeline running for every
  * chunk the operator could not see. With 20-40 sessions that is the dominant
@@ -69,6 +69,44 @@ export function routeOutputChunk(state: OutputRouteState): OutputRoute {
   if (!state.backendReady) return "buffer";
   if (state.gapDetected || state.resyncInFlight) return "hold";
   return "write";
+}
+
+/** What a freshly mounted pane's one-shot bootstrap may do once its ring replay is written. */
+export interface MountBootstrapPlan {
+  /** Fit to the container and `terminal_resize` the PTY to the result. */
+  resize: boolean;
+  /** Fetch the Rust `GridSnapshot` and `paintGrid` it over the screen. */
+  paint: boolean;
+}
+
+/**
+ * The bootstrap a pane may run after mounting (fit + PTY resize, then the
+ * grid paint), given what it knows at that point.
+ *
+ *  - `hasLayout` — the container has a non-zero box. Without one the fit
+ *    measures nothing and the resize would SIGWINCH the PTY to the backend's
+ *    default size — the resize `fitTerminal` already refuses for a hidden
+ *    container. A pane mounted hidden (`display: none`) has no box until it is
+ *    revealed, and its reveal re-fits.
+ *  - `visible` / `behind` — the paint overwrites the screen with the grid as it
+ *    stands NOW, so it is only correct over a buffer that is caught up with the
+ *    stream. A hidden pane drops its live chunks (`routeOutputChunk`), so its
+ *    buffer stops at the ring replay while the grid moves on; painting the
+ *    newer grid over it and then replaying the dropped window from the
+ *    paint's cursor on reveal splices history — output after the replay shows
+ *    up missing, and the grid's older rows show up twice. A hidden pane needs
+ *    no paint at all: the ring replay is its history, and the reveal resync
+ *    writes the dropped window in stream order.
+ */
+export function mountBootstrapPlan(state: {
+  hasLayout: boolean;
+  visible: boolean;
+  behind: boolean;
+}): MountBootstrapPlan {
+  return {
+    resize: state.hasLayout,
+    paint: state.visible && !state.behind,
+  };
 }
 
 /**

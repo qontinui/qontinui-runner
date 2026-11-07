@@ -12,7 +12,7 @@ paths = [
 ]
 regexes = [
   '''(?i)(dummy|example|sample|test|placeholder|changeme|your[-_]?)[-_]?(secret|token|key|password)''',
-  '''AKIAIOSFODNN7EXAMPLE''',
+  '''^AKIAIOSFODNN7EXAMPLE$''',
   # Synthetic fixtures in src-tauri/src/session_archive/secret_detector.rs's own
   # unit tests. A secret DETECTOR has to contain secret-shaped strings to prove
   # it fires on them -- and, for the JWT, to prove it deliberately does NOT.
@@ -23,9 +23,18 @@ regexes = [
   # AKIAIOSFODNN7EXAMPLE above (already exempted for this same file). A path
   # exemption would stop scanning the detector's REAL code too, which is the one
   # place in this repo most likely to grow a copy-pasted live credential.
-  # Widening either literal by one character re-arms the rule.
-  '''ghp_1234567890abcdefABCDEF1234567890abcd''',
-  '''eyJhbGciOiJSUzI1NiIsImtpZCI6ImFiYyJ9\.eyJzdWIiOiIxMjM0NTY3ODkwIiwiZXhwIjoxNzg3NzM1MjMzfQ\.c2lnbmF0dXJl''',
+  # Every literal entry below is ANCHORED (^…$): an allowlist regex is matched
+  # against the finding's secret, so an unanchored entry also excused any
+  # longer token that merely contains it. Changing any one of them by one
+  # character re-arms the rule.
+  # The token fixture is the 42-character `ghp_…abcdef` the test feeds its
+  # detector, and two rules fire on it with different secrets: `github-pat`
+  # takes `ghp_` plus 36 (the 40-character prefix) and `generic-api-key` the
+  # whole 42-character token. One exact entry for each. The unanchored
+  # 40-character entry used to excuse both, the second only as a substring.
+  '''^ghp_1234567890abcdefABCDEF1234567890abcd$''',
+  '''^ghp_1234567890abcdefABCDEF1234567890abcdef$''',
+  '''^eyJhbGciOiJSUzI1NiIsImtpZCI6ImFiYyJ9\.eyJzdWIiOiIxMjM0NTY3ODkwIiwiZXhwIjoxNzg3NzM1MjMzfQ\.c2lnbmF0dXJl$''',
   # Synthetic report-token fixtures in src-tauri/src/agent_runtime.rs's own unit
   # tests (all inside `#[cfg(test)]`, which begins well above every use). The
   # code under test VALIDATES a report token's shape -- exactly 32 lowercase hex
@@ -39,15 +48,15 @@ regexes = [
   # for a pasted live credential than its test module. Widening either literal
   # by one character re-arms the rule, so the 31- and 33-char boundary fixtures
   # on the neighbouring lines stay scanned.
-  '''9f1c4b2ad0e34f7a8b6c5d4e3f2a1b09''',
-  '''0123456789abcdef0123456789abcdef''',
+  '''^9f1c4b2ad0e34f7a8b6c5d4e3f2a1b09$''',
+  '''^0123456789abcdef0123456789abcdef$''',
   # The RFC 6455 section 1.3 example `Sec-WebSocket-Key` -- base64 of the ASCII
   # "the sample nonce" -- sent by the origin guard's WebSocket handshake test in
   # src-tauri/src/mcp/origin_guard/tests.rs to prove a refused Origin never gets
   # a 101. A handshake key is a per-connection nonce the client makes up, never
   # a credential; `generic-api-key` fires on it only because of the header name.
   # Exact literal, matching the entries above: any other key value stays scanned.
-  '''dGhlIHNhbXBsZSBub25jZQ==''',
+  '''^dGhlIHNhbXBsZSBub25jZQ==$''',
   # The fake agent JWT the bundled return-to-main skill's own suite hands its
   # curl stub (src-tauri/src/fleet_skills/return-to-main/recovery-ref-census-test.sh,
   # the `/agents/credential` arm): header `{"alg":"none"}`, payload
@@ -57,5 +66,16 @@ regexes = [
   # `.claude/skills/return-to-main/` (the fleet-skills parity check compares
   # them), so the fixture cannot be respelled here without forking the bundle.
   # Exact literal, as above: any other token value in that tree stays scanned.
-  '''eyJhbGciOiJub25lIn0\.eyJleHAiOjk5OTk5OTk5OTl9\.c2ln''',
+  '''^eyJhbGciOiJub25lIn0\.eyJleHAiOjk5OTk5OTk5OTl9\.c2ln$''',
+  # Synthetic JWT fixture in src-tauri/src/wrappers/manager.rs's own unit tests
+  # (inside `#[cfg(test)]`): the wrapper-output redaction/allowlist tests need a
+  # JWT-shaped string to prove it never reaches a log. It is not a credential:
+  # header {"alg":"HS256"}, payload {"sub":"1"}, signature the literal "sig".
+  # It sits in earlier commits of qontinui-runner#2268, which the PR-range scan
+  # reads; the current test builds it from pieces so no new literal is added.
+  # Exact literal, not a path exemption, for the reasons the entries above give,
+  # and ANCHORED (^…$): the allowlist regex is matched against the finding's
+  # secret, so an unanchored entry would also excuse any longer token that
+  # merely contains this one (a real JWT whose signature began with "sig").
+  '''^eyJhbGciOiJIUzI1NiJ9\.eyJzdWIiOiIxIn0\.sig$''',
 ]

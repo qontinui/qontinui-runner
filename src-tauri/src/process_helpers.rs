@@ -394,12 +394,12 @@ impl Drop for ChildTreeGuard {
 /// ends (a `cmd /c` shim, a corepack/volta background update check, a git
 /// credential helper). A join there blocks forever *on the success path*,
 /// inside a blocking-pool thread — the very leak this module exists to close.
-const COMPLETED_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+pub(crate) const COMPLETED_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// How long the timeout path waits for the readers after the tree has been
 /// killed. Purely thread hygiene — the output is discarded on that path — and
 /// bounded for the same reason as [`COMPLETED_DRAIN_GRACE`].
-const KILLED_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+pub(crate) const KILLED_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Hard cap on how many bytes ONE pipe will buffer on the caller's behalf.
 ///
@@ -606,7 +606,7 @@ impl<T: std::io::Read + std::os::windows::io::AsRawHandle + Send + 'static> Wait
 ///   by at most one poll no matter what still holds the write ends.
 /// - **Honesty** — a buffer that is missing bytes says so, so the caller can
 ///   refuse to present a partial read as a complete one.
-struct PipeDrain {
+pub(crate) struct PipeDrain {
     buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
     done: std::sync::Arc<std::sync::atomic::AtomicBool>,
     truncated: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -721,6 +721,15 @@ impl PipeDrain {
         }
     }
 
+    /// Start draining both of `child`'s captured streams — the stdout drain
+    /// first, then the stderr one — exactly as [`run_with_timeout`] does.
+    pub(crate) fn for_child(child: &mut std::process::Child) -> (Self, Self) {
+        (
+            Self::spawn(child.stdout.take()),
+            Self::spawn(child.stderr.take()),
+        )
+    }
+
     fn is_done(&self) -> bool {
         self.done.load(std::sync::atomic::Ordering::Acquire)
     }
@@ -733,7 +742,7 @@ impl PipeDrain {
         self.reader_unavailable
     }
 
-    fn snapshot(&self) -> Vec<u8> {
+    pub(crate) fn snapshot(&self) -> Vec<u8> {
         self.buf.lock().map(|g| g.clone()).unwrap_or_default()
     }
 }
@@ -750,7 +759,7 @@ impl Drop for PipeDrain {
 
 /// Wait — on a HARD clock — for both readers to reach EOF. Returns whether
 /// they did. Never a `join()`: see [`COMPLETED_DRAIN_GRACE`].
-fn wait_for_drain(a: &PipeDrain, b: &PipeDrain, grace: std::time::Duration) -> bool {
+pub(crate) fn wait_for_drain(a: &PipeDrain, b: &PipeDrain, grace: std::time::Duration) -> bool {
     use std::time::{Duration, Instant};
     let deadline = Instant::now() + grace;
     let mut poll = Duration::from_millis(1);
@@ -764,6 +773,23 @@ fn wait_for_drain(a: &PipeDrain, b: &PipeDrain, grace: std::time::Duration) -> b
         }
         std::thread::sleep(poll.min(deadline - now));
         poll = (poll * 2).min(Duration::from_millis(25));
+    }
+}
+
+/// Which [`Truncation`] (if any) two drained streams carry, ordered strongest
+/// claim first because more than one can be true at once and the caller only
+/// gets to hear one: "nobody read this stream at all" beats "we read it and
+/// threw bytes away", which beats "we stopped waiting for the rest".
+pub(crate) fn truncation_of(a: &PipeDrain, b: &PipeDrain, drained: bool) -> Option<Truncation> {
+    if a.reader_unavailable() || b.reader_unavailable() {
+        // The strongest claim of all: a stream nobody read.
+        Some(Truncation::ReaderUnavailable)
+    } else if a.was_truncated() || b.was_truncated() {
+        Some(Truncation::ByteCap)
+    } else if drained {
+        None
+    } else {
+        Some(Truncation::DrainGraceExpired)
     }
 }
 
@@ -854,8 +880,11 @@ pub struct TimedRun {
 // not become a permanent zombie. Explicitly NOT `mem::forget` on a pipe:
 // auto-fresh runs every 300s, which is thousands of leaked fds a week.
 
-/// Children that were left running past their budget, kept ONLY so their exit
-/// can be reaped. Never signalled, never read from.
+/// Children this module will not wait on, kept ONLY so their exit can be
+/// reaped: those [`start_detached`] left running past their budget (never
+/// signalled), and those [`crate::process_deadline`] killed but did not see
+/// exit inside its grace, or that started after their caller had given up
+/// (signalled once, by that module, before being parked). Never read from.
 static DETACHED_CHILDREN: std::sync::Mutex<Vec<std::process::Child>> =
     std::sync::Mutex::new(Vec::new());
 
@@ -887,6 +916,18 @@ pub fn pending_detached_children() -> usize {
         .lock()
         .map(|g| g.len())
         .unwrap_or_else(|poisoned| poisoned.into_inner().len())
+}
+
+/// Park a child this module will no longer wait on, so its eventual exit is
+/// reaped by [`reap_detached_children`] instead of leaving a zombie. Used by
+/// [`crate::process_deadline`] for a child it killed but did not see exit
+/// inside its grace, and for a child whose spawn returned after its caller had
+/// already given up on it.
+pub(crate) fn park_detached(child: std::process::Child) {
+    DETACHED_CHILDREN
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(child);
 }
 
 /// What happened to a child started with [`start_detached`].
@@ -1215,21 +1256,7 @@ fn run_bounded(
                 let drained = wait_for_drain(&stdout_reader, &stderr_reader, COMPLETED_DRAIN_GRACE);
                 let stdout = stdout_reader.snapshot();
                 let stderr = stderr_reader.snapshot();
-                // Ordered strongest claim first, because more than one can
-                // be true at once and the caller only gets to hear one:
-                // "nobody read this stream at all" beats "we read it and threw
-                // bytes away", which beats "we stopped waiting for the rest".
-                let truncation =
-                    if stdout_reader.reader_unavailable() || stderr_reader.reader_unavailable() {
-                        // The strongest claim of all: a stream nobody read.
-                        Some(Truncation::ReaderUnavailable)
-                    } else if stdout_reader.was_truncated() || stderr_reader.was_truncated() {
-                        Some(Truncation::ByteCap)
-                    } else if drained {
-                        None
-                    } else {
-                        Some(Truncation::DrainGraceExpired)
-                    };
+                let truncation = truncation_of(&stdout_reader, &stderr_reader, drained);
                 if let Some(reason) = truncation {
                     // WARN, not debug: this is the difference between "here is
                     // the output" and "here is SOME of the output", and a
@@ -1299,7 +1326,7 @@ fn run_bounded(
 /// forgetting to scrub. A caller that wants more context passes its OWN label
 /// to [`output_with_timeout_labeled`] or [`run_probe`] — text it authored,
 /// which therefore cannot contain a secret it did not choose to put there.
-fn program_label(cmd: &std::process::Command) -> String {
+pub(crate) fn program_label(cmd: &std::process::Command) -> String {
     let program = cmd.get_program();
     std::path::Path::new(program)
         .file_name()
@@ -1459,7 +1486,7 @@ pub enum ProbeOutcome {
 /// nothing derived from a token or a URL.
 ///
 /// Use [`run_probe_quiet`] where a non-zero exit is an EXPECTED, routine answer
-/// (`lsof` on an unowned port, `taskkill` on an already-dead pid) — WARNing on
+/// (`lsof` on an unowned port, `netstat | findstr` on a closed one) — WARNing on
 /// those buries the timeout WARN that actually matters.
 pub fn run_probe(
     cmd: std::process::Command,
@@ -1474,9 +1501,8 @@ pub fn run_probe(
 ///
 /// For probes whose negative answer is ordinary and frequent: `lsof -t -i:<port>`
 /// exits 1 whenever nothing owns the port, `ss -ltnp` is simply absent on macOS
-/// and on minimal images, `netstat | findstr` exits 1 when not listening, and
-/// `taskkill /F /T /PID` exits 128 for a pid that already went away. All four
-/// leave the caller's verdict unchanged, and all four fire on a per-process
+/// and on minimal images, and `netstat | findstr` exits 1 when not listening.
+/// All three leave the caller's verdict unchanged, and all three fire on a per-process
 /// timer — so WARNing on them is pure log volume that hides the one line this
 /// PR exists to add.
 ///
@@ -1595,6 +1621,22 @@ fn run_probe_inner(
         }
     }
 }
+
+/// Serialises the tests that read, or disturb, this module's process-global
+/// gauges: [`live_pipe_readers`] and the detached-child ledger
+/// ([`pending_detached_children`]).
+///
+/// `cargo test` runs tests on parallel threads. The completed-path test
+/// DELIBERATELY leaves two readers alive for its grandchild's lifetime (that
+/// is the documented trade-off), which would otherwise read as a leak in the
+/// timeout-path test; and [`crate::process_deadline`]'s tests park and reap
+/// children in the same ledger the detached-child tests count. Every test that
+/// parks children, holds readers past its own return, or counts either, holds
+/// this lock. (A bounded run's entry sweep, `reap_detached_children`, may still
+/// reap from an unlocked test; that removes only children that have exited,
+/// which a locked test never leaves in the ledger.)
+#[cfg(test)]
+pub(crate) static GAUGE_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 mod timeout_tests {
@@ -1972,15 +2014,8 @@ mod timeout_tests {
 
     // ── Surviving-grandchild regression (2026-08-30 review, CRITICAL 3) ──────
 
-    /// Serialises the two reader-thread-gauge tests.
-    ///
-    /// [`live_pipe_readers`] is process-global and `cargo test` runs these in
-    /// parallel threads. The completed-path test DELIBERATELY leaves two
-    /// readers alive for its grandchild's lifetime (that is the documented
-    /// trade-off), which would otherwise read as a leak in the timeout-path
-    /// test. Every other test in this module holds readers for well under a
-    /// second, so the lock only has to keep these two apart.
-    static GAUGE_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // `GAUGE_TESTS` (module level, just above `mod timeout_tests`) serialises
+    // the tests that read or disturb the process-global gauges.
 
     /// Poll — bounded — for the module's live reader-thread gauge to fall back
     /// to `target`. Returns the final reading either way, so the assertion can
@@ -2821,28 +2856,59 @@ mod timeout_tests {
 // release builds are users.
 //
 // So the rule needs a test rather than a reviewer.
+//
+// Two scans, because there are two ways to ship a console. `creation_flags`
+// REPLACES the flags, which both scans turn on:
+// 1. a `Command::new(` whose flags never carry `CREATE_NO_WINDOW` — none
+//    set, or a `creation_flags(..)` that sets others (a process group alone);
+// 2. `CREATE_NEW_CONSOLE` handed to a command, wherever the command came
+//    from. A command built through `no_window(..)` and then given
+//    `CREATE_NEW_CONSOLE` opens a window, and scan 1 never looks at it: no
+//    `Command::new(` is written there. `mcp/shared.rs`'s
+//    `spawn_python_with_console` was exactly that shape until 2026-10-28.
+//    Scan 2 reports every production line that NAMES the flag, and every
+//    `creation_flags(..)` whose argument carries its bit as a literal.
+//
+// Known limits, each a way to stay SILENT, so each is named here:
+// - Scan 1 credits any `no_window(` in code (not in a comment) or any
+//   `CREATE_NO_WINDOW`-carrying `creation_flags` within `FLAG_WINDOW` lines
+//   below a `Command::new(`, even one that belongs to a different command
+//   in the same stretch.
+// - One `console-ok:` marker covers every site in the `MARKER_WINDOW` lines
+//   below it, not only the site it was written for.
+// - Both scans read each production line's code on its own
+//   (`source_scan::code_only`), which misreads a string literal or block
+//   comment that spans lines in both directions. Its inside is read as
+//   code, which can credit a `no_window(` written there as a suppression.
+//   And the code after its closing quote is read as a string and blanked:
+//   `second line").creation_flags(CREATE_NEW_CONSOLE);` reads as
+//   `second line"`, which can hide a site. A reviewer counted 0 of the
+//   second shape today.
+// - A console bit that travels as a bare LITERAL through another module, a
+//   computed value (`1 << 4`) or a multi-line binding is not followed. The
+//   flag's NAME is caught on any production line, so only a literal can
+//   travel unseen.
+// - A `console-ok:` marker on an alias definition
+//   (`const VISIBLE: u32 = CREATE_NEW_CONSOLE;`) covers every use of that
+//   alias in the file: the uses never name the flag, so nothing reports them.
+// - Only `src-tauri/src` is walked; `crates/` is not.
+// - The test-code skipper is a layout heuristic, not a lexer
+//   (`source_scan::end_of_test_item`). It is biased to end a skip early,
+//   which only reads test code as production (loud). It still ends LATE,
+//   hiding the production item after the test item, on a layout rustfmt
+//   does not write, and on a test item whose multi-line string or block
+//   comment holds a column-0 `{` line with no column-0 `}` after it.
 
+/// Source-scanning helpers shared by the guards below: the `.rs` walk and
+/// the ONE test-code skipper. Every guard in this file reads production text
+/// through [`source_scan::production_lines`]; a guard with a skipper of its
+/// own is how the console guard came to stop reading a file at its first
+/// `#[cfg(test)]` while the git guard read on.
 #[cfg(test)]
-mod console_window_guard {
+mod source_scan {
     use std::path::{Path, PathBuf};
 
-    /// How far below a `Command::new(` line a suppression (`creation_flags`,
-    /// or a `no_window(&mut cmd)`-style call) still counts as covering that
-    /// spawn. Generous on purpose: the builders in this crate set the flag
-    /// after a run of `.arg()` calls.
-    const FLAG_WINDOW: usize = 25;
-
-    /// Files the rule does not apply to.
-    ///
-    /// `src/bin/` holds standalone CONSOLE-subsystem binaries (`qontinui_cli`,
-    /// `qontinui_shim`). They already own a console, their children inherit it,
-    /// and nothing flashes — the defect is specific to the GUI binary.
-    fn exempt(rel: &Path) -> bool {
-        let s = rel.to_string_lossy().replace('\\', "/");
-        s.starts_with("bin/") || s == "process_helpers.rs"
-    }
-
-    fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    pub(super) fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
         };
@@ -2856,11 +2922,1152 @@ mod console_window_guard {
         }
     }
 
+    /// Is `line` a column-0 attribute that compiles the next item ONLY under
+    /// test? `#[cfg(test)]`, or an `all(..)` with a top-level `test` term
+    /// (`all(test, unix)`, `all(feature = "e2e", test)`). The whole line must
+    /// be the attribute. `any(test, ..)` and `not(test)` are not test-only,
+    /// and an indented attribute is not column 0: those are scanned as
+    /// production, which can only fail loudly, never hide a site.
+    pub(super) fn is_test_only_cfg(line: &str) -> bool {
+        if !line.starts_with("#[cfg(") {
+            return false;
+        }
+        let compact: String = line.chars().filter(|c| !c.is_whitespace()).collect();
+        let Some(pred) = compact
+            .strip_prefix("#[cfg(")
+            .and_then(|rest| rest.strip_suffix(")]"))
+        else {
+            return false;
+        };
+        if pred == "test" {
+            return true;
+        }
+        let Some(terms) = pred
+            .strip_prefix("all(")
+            .and_then(|rest| rest.strip_suffix(')'))
+        else {
+            return false;
+        };
+        let mut depth = 0_i32;
+        let mut term = String::new();
+        let mut has_test = false;
+        for c in terms.chars().chain(std::iter::once(',')) {
+            if c == ',' && depth == 0 {
+                has_test |= term == "test";
+                term.clear();
+                continue;
+            }
+            match c {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                _ => {}
+            }
+            term.push(c);
+        }
+        has_test
+    }
+
+    /// The production lines of `src`, as `(1-based line number, line)`.
+    ///
+    /// Skips exactly the item each column-0 test-only cfg
+    /// ([`is_test_only_cfg`]) applies to — a `mod` of any visibility, a
+    /// helper fn, a `use`, a `static` — then keeps scanning, so a test item in
+    /// the middle of a file hides neither the production code before it nor
+    /// after it. Where the item ends is [`end_of_test_item`]'s call.
+    pub(super) fn production_lines(src: &str) -> Vec<(usize, &str)> {
+        let lines: Vec<&str> = src.lines().collect();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < lines.len() {
+            if is_test_only_cfg(lines[i]) {
+                i = end_of_test_item(&lines, i + 1);
+                continue;
+            }
+            out.push((i + 1, lines[i]));
+            i += 1;
+        }
+        out
+    }
+
+    /// The index just past the item that starts at or after `start` (the
+    /// line after a test-only cfg).
+    ///
+    /// Biased to end EARLY: that only scans test code as production, which
+    /// can fail loudly, while running LONG hides shipped code silently. The
+    /// rules work by layout, with brackets, braces and `;` counted on CODE
+    /// only ([`code_only`]: string, raw-string and char literals emptied,
+    /// comments removed):
+    /// - Attributes between the cfg and the item are skipped by bracket
+    ///   depth (`#[should_panic(expected = "index [")]` opens nothing,
+    ///   `#[doc = r"C:\"]` closes), and comment lines like blank ones. This
+    ///   phase carries lexical state from line to line ([`code_only_from`]),
+    ///   so a `/* … */` (nested or not) or an attribute string that spans
+    ///   lines is read whole.
+    /// - A head line ending in `;`, or opening and closing its braces on that
+    ///   line, is the whole item (`const OPEN: char = '{';` is one line).
+    /// - A head that opens a brace ends at the first column-0 line starting
+    ///   with `}` (`}`, `};`, `});`, `} // mod tests`).
+    /// - A head with no brace (a multi-line `static`, `const` array or
+    ///   signature) ends at its first indented line ending in `;`, or at a
+    ///   column-0 line starting with `]` or `)` (`];`, `);`). It becomes
+    ///   braced only on a line ending in `{`, and then ends at the first line
+    ///   starting with `}` indented no deeper than that line — so a wrapped
+    ///   `LazyLock::new(|| {` closes at its own `});`. A column-0 line that
+    ///   opens nothing it can be part of starts the NEXT item and is kept.
+    ///
+    /// After the head line, each line is read on its own, so this is not a
+    /// lexer. Ending early reads some test code as production: a column-0
+    /// line inside a multi-line string literal ends a skip. That happens in
+    /// many files today; a reviewer's port counted 21, among them
+    /// `fleet.rs`, `check_executor/analyzers/*`, `env_write_lock_guard.rs`
+    /// and `orchestrator/planning.rs`, and the rules above newly made it
+    /// happen in `pair.rs` and `playwright/executor.rs`. Nothing in those
+    /// spans trips a guard. Two shapes still end LATE and hide the
+    /// production item after the test item:
+    /// - a layout rustfmt does not write, such as a head-opened brace closed
+    ///   by an indented `}`;
+    /// - a multi-line string or block comment in the item whose content
+    ///   holds a column-0 `{` line (read as a brace that opens) and no
+    ///   column-0 `}` after it. Carrying lexical state through the item body
+    ///   would close this, but a lexer slip there would run every later skip
+    ///   long, silently, which is the failure this function is biased
+    ///   against.
+    ///
+    /// Before the head, a `/* … */`, string or attribute that never closes —
+    /// or a run of more than [`PRE_ITEM_LINES`] lines with no head — ends
+    /// the skip at `start`, so it reads the rest of the file as production
+    /// instead of hiding it.
+    fn end_of_test_item(lines: &[&str], start: usize) -> usize {
+        let mut i = start;
+        let mut attr_depth = 0_i64;
+        // Carried from line to line until the head: a `/* … */` or an
+        // attribute string may span lines.
+        let mut lex = Lex::Code;
+        let code = loop {
+            let Some(line) = lines.get(i) else {
+                // The end of the file before any item: an unclosed comment,
+                // string or attribute must not hide what follows the cfg.
+                return if lex == Lex::Code && attr_depth == 0 {
+                    i
+                } else {
+                    start
+                };
+            };
+            if i >= start + PRE_ITEM_LINES {
+                return start;
+            }
+            let code = code_only_from(line, &mut lex);
+            let t = code.trim();
+            if attr_depth > 0 || t.starts_with("#[") {
+                attr_depth += t.matches('[').count() as i64 - t.matches(']').count() as i64;
+                i += 1;
+                continue;
+            }
+            // Blank, a comment, or the inside of a block comment.
+            if t.is_empty() {
+                i += 1;
+                continue;
+            }
+            break code;
+        };
+        let head = lines[i];
+        let t = code.trim();
+        let opens = t.matches('{').count();
+        let closes = t.matches('}').count();
+        if (opens == 0 && t.ends_with(';')) || (opens > 0 && opens == closes) {
+            return i + 1;
+        }
+        // `Some(n)`: braced, ending at a `}` line indented at most `n`.
+        let mut close_indent = (opens > closes).then(|| indent_of(head));
+        i += 1;
+        while let Some(line) = lines.get(i) {
+            let t = line.trim();
+            let indent = indent_of(line);
+            match close_indent {
+                Some(limit) => {
+                    if t.starts_with('}') && indent <= limit {
+                        return i + 1;
+                    }
+                    // Braced from an indented line, a column-0 line that is
+                    // not its closer means the item already ended.
+                    if limit > 0 && indent == 0 && !t.is_empty() {
+                        return i;
+                    }
+                }
+                None if indent == 0 && !t.is_empty() => {
+                    if t.starts_with(')') || t.starts_with(']') {
+                        if !t.ends_with('{') {
+                            return i + 1;
+                        }
+                        close_indent = Some(0);
+                    } else if t == "{" {
+                        close_indent = Some(0);
+                    } else if !t.starts_with("where") {
+                        return i;
+                    }
+                }
+                None => {
+                    if t.ends_with('{') {
+                        close_indent = Some(indent);
+                    } else if t.ends_with(';') {
+                        return i + 1;
+                    }
+                }
+            }
+            i += 1;
+        }
+        i
+    }
+
+    /// How many lines of attributes and comments may stand between a
+    /// test-only cfg and its item before the skip gives up and ends at the
+    /// cfg ([`end_of_test_item`]). Far above any real attribute stack, so it
+    /// only ever bounds an unclosed one.
+    const PRE_ITEM_LINES: usize = 200;
+
+    /// The width of `line`'s leading whitespace.
+    fn indent_of(line: &str) -> usize {
+        line.len() - line.trim_start().len()
+    }
+
+    /// Where a line starts, lexically, for [`code_only_from`].
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Lex {
+        /// In code.
+        Code,
+        /// Inside this many nested `/* … */` comments (Rust nests them).
+        Comment(usize),
+        /// Inside a `"…"` string, `b"…"` or `c"…"` (escapes apply).
+        Str,
+        /// Inside a raw string closed by `"` and this many `#`s.
+        RawStr(usize),
+    }
+
+    /// `line`'s code, read on its own: [`code_only_from`] starting in code,
+    /// so a literal or block comment still open at the end of the line is
+    /// taken to end there.
+    pub(super) fn code_only(line: &str) -> String {
+        code_only_from(line, &mut Lex::Code)
+    }
+
+    /// `line` with every string, raw-string and char literal emptied and its
+    /// comments removed, so the braces, brackets and `;` left are CODE.
+    /// `lex` is where the line starts (in code, a block comment or a string)
+    /// and is left where it ends, so a caller can carry a multi-line
+    /// `/* … */` or string literal from one line into the next. Raw strings
+    /// (`r"…"`, `r#"…"#`, `br"…"`, `cr"…"`) take no escapes, so `r"C:\"`
+    /// ends at its second quote.
+    fn code_only_from(line: &str, lex: &mut Lex) -> String {
+        let chars: Vec<char> = line.chars().collect();
+        let ident = |k: usize| {
+            chars
+                .get(k)
+                .is_some_and(|c| c.is_alphanumeric() || *c == '_')
+        };
+        let mut out = String::new();
+        let mut i = 0;
+        while let Some(&c) = chars.get(i) {
+            let next = chars.get(i + 1).copied();
+            match *lex {
+                Lex::Comment(depth) => {
+                    if c == '/' && next == Some('*') {
+                        *lex = Lex::Comment(depth + 1);
+                        i += 2;
+                    } else if c == '*' && next == Some('/') {
+                        *lex = if depth > 1 {
+                            Lex::Comment(depth - 1)
+                        } else {
+                            out.push(' ');
+                            Lex::Code
+                        };
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                    continue;
+                }
+                Lex::Str => {
+                    match c {
+                        '\\' => i += 2,
+                        '"' => {
+                            *lex = Lex::Code;
+                            out.push('"');
+                            i += 1;
+                        }
+                        _ => i += 1,
+                    }
+                    continue;
+                }
+                Lex::RawStr(hashes) => {
+                    if c == '"' && (1..=hashes).all(|k| chars.get(i + k) == Some(&'#')) {
+                        *lex = Lex::Code;
+                        out.push('"');
+                        i += 1 + hashes;
+                    } else {
+                        i += 1;
+                    }
+                    continue;
+                }
+                Lex::Code => {}
+            }
+            if c == '/' && next == Some('/') {
+                break;
+            }
+            if c == '/' && next == Some('*') {
+                *lex = Lex::Comment(1);
+                i += 2;
+                continue;
+            }
+            // A raw string: an `r` (or `br` / `cr`) that does not end an
+            // identifier, then any `#`s, then `"`.
+            let raw_start = c == 'r'
+                && (i == 0
+                    || !ident(i - 1)
+                    || (matches!(chars[i - 1], 'b' | 'c') && (i == 1 || !ident(i - 2))));
+            if raw_start {
+                let hashes = chars[i + 1..].iter().take_while(|&&h| h == '#').count();
+                if chars.get(i + 1 + hashes) == Some(&'"') {
+                    *lex = Lex::RawStr(hashes);
+                    out.push('"');
+                    i += 2 + hashes;
+                    continue;
+                }
+            }
+            if c == '"' {
+                *lex = Lex::Str;
+                out.push('"');
+                i += 1;
+                continue;
+            }
+            if c == '\'' {
+                // A char literal (`'{'`, `'\''`, `'\u{7b}'`), or else a
+                // lifetime, which is code.
+                let close = if next == Some('\\') {
+                    (i + 3..chars.len()).find(|&j| chars[j] == '\'')
+                } else if chars.get(i + 2) == Some(&'\'') {
+                    Some(i + 2)
+                } else {
+                    None
+                };
+                if let Some(j) = close {
+                    i = j + 1;
+                    out.push_str("''");
+                    continue;
+                }
+            }
+            out.push(c);
+            i += 1;
+        }
+        out
+    }
+
+    /// The skip triggers on exactly the test-only cfgs. A cfg that can be
+    /// production must not start a skip, or it would hide a shipped site.
+    #[test]
+    fn only_a_test_only_cfg_starts_a_skip() {
+        for test_only in [
+            "#[cfg(test)]",
+            "#[cfg(all(test, unix))]",
+            "#[cfg(all(test, windows))]",
+            "#[cfg(all(feature = \"e2e\", test))]",
+            "#[cfg(all(test, not(windows)))]",
+        ] {
+            assert!(is_test_only_cfg(test_only), "{test_only} is test-only");
+        }
+        for production in [
+            "#[cfg(not(test))]",
+            "#[cfg(any(test, debug_assertions))]",
+            "#[cfg(any(windows, test))]",
+            "#[cfg(all(not(test), unix))]",
+            "#[cfg(all(testing, unix))]",
+            "#[cfg(target_os = \"windows\")]",
+            "    #[cfg(test)]",
+            "#[cfg(test)] mod tests;",
+        ] {
+            assert!(
+                !is_test_only_cfg(production),
+                "{production} can be production"
+            );
+        }
+        // The production code after an `all(test, ..)` module is scanned,
+        // and the module itself is not.
+        let src = "fn a() {}\n#[cfg(all(test, unix))]\nmod t {\n    fn g() {}\n}\nfn b() {}\n";
+        assert_eq!(
+            production_lines(src),
+            vec![(1, "fn a() {}"), (6, "fn b() {}")]
+        );
+    }
+
+    /// Each of these test-only items once made the skip run PAST its end and
+    /// swallow the production fn after it. Each source is the cfg, the item,
+    /// then `fn prod() {}`; the production text must be exactly that last
+    /// line. Every failing shape is named in one red run.
+    #[test]
+    fn a_test_item_never_hides_the_production_item_after_it() {
+        let cases = [
+            (
+                "H1 LazyLock static closed by a column-0 `});`",
+                "#[cfg(test)]\nstatic X: LazyLock<Vec<u8>> = LazyLock::new(|| {\n    vec![1]\n});\nfn prod() {}\n",
+                5,
+            ),
+            (
+                "H1 wrapped: the closer is indented under a wrapped head",
+                "#[cfg(test)]\nstatic X: LazyLock<u8> =\n    LazyLock::new(|| {\n        1\n    });\nfn prod() {}\n",
+                6,
+            ),
+            (
+                "H2 const array whose elements carry braces",
+                "#[cfg(test)]\nconst CASES: &[Case] = &[\n    Case { a: 1 },\n    Case { a: 2 },\n];\nfn prod() {}\n",
+                6,
+            ),
+            (
+                "H3 module closed by `} // mod tests`",
+                "#[cfg(test)]\nmod tests {\n    fn t() {}\n} // mod tests\nfn prod() {}\n",
+                5,
+            ),
+            (
+                "H4 thread_local!( .. = { .. });",
+                "#[cfg(test)]\nthread_local!(static X: Cell<u8> = {\n    Cell::new(0)\n});\nfn prod() {}\n",
+                5,
+            ),
+            (
+                "N5 a `[` inside an attribute's string literal",
+                "#[cfg(test)]\n#[should_panic(expected = \"index [\")]\nfn t() {}\nfn prod() {}\n",
+                4,
+            ),
+            (
+                "L1 a `{` in a char literal on the head line",
+                "#[cfg(test)]\nconst OPEN: char = '{';\nfn prod() {}\n",
+                3,
+            ),
+            (
+                "L2 a `{` in a string literal on the head line",
+                "#[cfg(test)]\nconst OPEN: &str = \"{\";\nfn prod() {}\n",
+                3,
+            ),
+            (
+                "L8 a balanced head whose string holds a `{`",
+                "#[cfg(test)]\nfn helper() -> &'static str { \"{\" }\nfn prod() {}\n",
+                3,
+            ),
+            (
+                "L3 a `{` in a trailing comment on the head line",
+                "#[cfg(test)]\nconst X: u8 = 1; // {\nfn prod() {}\n",
+                3,
+            ),
+            (
+                "L3b a `{` in a block comment on the head line",
+                "#[cfg(test)]\nconst X: u8 = 1; /* { */\nfn prod() {}\n",
+                3,
+            ),
+            (
+                "L4 a comment line holding `{` between the cfg and the item",
+                "#[cfg(test)]\n// fixture {\nconst X: u8 = 1;\nfn prod() {}\n",
+                4,
+            ),
+            (
+                "L5 a multi-line raw string opened with `{`, closed indented",
+                "#[cfg(test)]\nconst FIXTURE: &str = r#\"{\n    \"a\": 1\n    }\"#;\nfn prod() {}\n",
+                5,
+            ),
+            (
+                "L7 a raw-string attribute ending in a backslash",
+                "#[cfg(test)]\n#[doc = r\"C:\\\"]\nfn t() {}\nfn prod() {}\n",
+                4,
+            ),
+            (
+                "L6 an attribute string literal that spans lines",
+                "#[cfg(test)]\n#[doc = \"line one [\nline two\"]\nfn t() {}\nfn prod() {}\n",
+                5,
+            ),
+            (
+                "N2a a nested block comment holding `{` on the head line",
+                "#[cfg(test)]\nconst X: u8 = 1; /* a /* { */ still a comment { */\nfn prod() {}\n",
+                3,
+            ),
+            (
+                "N2b raw and plain C strings, `cr\"\\\"` then `c\"{\"`",
+                "#[cfg(test)]\nconst C: [&CStr; 2] = [cr\"\\\", c\"{\"];\nfn prod() {}\n",
+                3,
+            ),
+            (
+                "N2c a multi-line block comment holding `{` before the item",
+                "#[cfg(test)]\n/* a {\n   b {\n*/\nconst X: u8 = 1;\nfn prod() {}\n",
+                6,
+            ),
+            (
+                "N4 a multi-line block comment before a module",
+                "#[cfg(test)]\n/* note\n*/\nmod tests {\n    fn t() {}\n}\nfn prod() {}\n",
+                7,
+            ),
+        ];
+        let failures: Vec<String> = cases
+            .iter()
+            .filter_map(|(case, src, prod_line)| {
+                let got = production_lines(src);
+                (got != vec![(*prod_line, "fn prod() {}")]).then(|| format!("{case}: got {got:?}"))
+            })
+            .collect();
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// A `/* … */`, string or attribute that opens before the item and
+    /// never closes must not hide the rest of the file: the skip ends at
+    /// the cfg, and every following line is production.
+    #[test]
+    fn an_unclosed_comment_string_or_attribute_hides_nothing() {
+        let cases = [
+            (
+                "U1 a block comment never closed",
+                "#[cfg(test)]\n/* never closed\nfn prod() {}\n",
+                "/* never closed",
+            ),
+            (
+                "U2 an attribute string never closed",
+                "#[cfg(test)]\n#[doc = \"never closed\nfn prod() {}\n",
+                "#[doc = \"never closed",
+            ),
+            (
+                "U3 an attribute raw string never closed",
+                "#[cfg(test)]\n#[doc = r#\"never closed\nfn prod() {}\n",
+                "#[doc = r#\"never closed",
+            ),
+        ];
+        let failures: Vec<String> = cases
+            .iter()
+            .filter_map(|(case, src, opener)| {
+                let got = production_lines(src);
+                (got != vec![(2, *opener), (3, "fn prod() {}")])
+                    .then(|| format!("{case}: got {got:?}"))
+            })
+            .collect();
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+}
+
+#[cfg(test)]
+mod console_window_guard {
+    use super::source_scan::{code_only, production_lines, rs_files};
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+
+    /// How far below a `Command::new(` line a suppression (a
+    /// `creation_flags(..)` carrying `CREATE_NO_WINDOW`, or a
+    /// `no_window(&mut cmd)`-style call) still counts as covering that spawn.
+    /// Generous on purpose: the builders in this crate set the flag after a
+    /// run of `.arg()` calls.
+    const FLAG_WINDOW: usize = 25;
+
+    /// How far above a site a `console-ok:` marker still covers it.
+    const MARKER_WINDOW: usize = 3;
+
+    /// How many lines below a `creation_flags(` line its argument may run.
+    const ARG_WINDOW: usize = 10;
+
+    /// `CREATE_NEW_CONSOLE`: its name, and its bit.
+    const CREATE_NEW_CONSOLE: &str = "CREATE_NEW_CONSOLE";
+    const CREATE_NEW_CONSOLE_BIT: u64 = 0x0000_0010;
+
+    /// `CREATE_NO_WINDOW`: its name, and its bit.
+    const CREATE_NO_WINDOW: &str = "CREATE_NO_WINDOW";
+    const CREATE_NO_WINDOW_BIT: u64 = 0x0800_0000;
+
+    /// Files scan 1 (`Command::new(`) does not apply to.
+    ///
+    /// `src/bin/` holds standalone CONSOLE-subsystem binaries (`qontinui_cli`,
+    /// `qontinui_shim`). They already own a console, their children inherit it,
+    /// and nothing flashes — the defect is specific to the GUI binary.
+    /// `process_helpers.rs` is where `no_window` itself calls `Command::new`.
+    ///
+    /// Scan 2 (`CREATE_NEW_CONSOLE`) applies to every file: that flag opens a
+    /// new window for a console binary's child as surely as for the GUI's.
+    fn exempt_from_command_new_scan(rel: &str) -> bool {
+        rel.starts_with("bin/") || rel == "process_helpers.rs"
+    }
+
+    /// A `console-ok:` marker on line `idx` or up to [`MARKER_WINDOW`] lines
+    /// above it.
+    fn marked(lines: &[(usize, &str)], idx: usize) -> bool {
+        let start = idx.saturating_sub(MARKER_WINDOW);
+        lines[start..=idx]
+            .iter()
+            .any(|(_, l)| l.contains("console-ok:"))
+    }
+
+    /// The identifier and literal tokens of `code`.
+    fn tokens(code: &str) -> impl Iterator<Item = &str> {
+        code.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .filter(|tok| !tok.is_empty())
+    }
+
+    /// The value of an integer literal token (`0x10`, `0x0000_0010`, `16u32`,
+    /// `0b1_0000`, `0o20`), or `None` when `tok` is not one.
+    fn integer_literal(tok: &str) -> Option<u64> {
+        if !tok.starts_with(|c: char| c.is_ascii_digit()) {
+            return None;
+        }
+        let tok = tok.replace('_', "");
+        let (digits, radix) = [
+            ("0x", 16),
+            ("0X", 16),
+            ("0b", 2),
+            ("0B", 2),
+            ("0o", 8),
+            ("0O", 8),
+        ]
+        .iter()
+        .find_map(|(prefix, radix)| tok.strip_prefix(prefix).map(|rest| (rest, *radix)))
+        .unwrap_or((tok.as_str(), 10));
+        // Drop a type suffix (`u32`): the digits are the leading run.
+        let run: String = digits.chars().take_while(|c| c.is_digit(radix)).collect();
+        u64::from_str_radix(&run, radix).ok()
+    }
+
+    /// Does `expr` carry the flag `bit` — an identifier in `names`, or an
+    /// integer literal with the bit set?
+    fn carries(expr: &str, names: &HashSet<String>, bit: u64) -> bool {
+        tokens(expr)
+            .any(|tok| names.contains(tok) || integer_literal(tok).is_some_and(|v| v & bit != 0))
+    }
+
+    /// A one-line binding in `code` — `const NAME: T = EXPR;`,
+    /// `let [mut] NAME = EXPR;`, or `NAME |= EXPR;` — as `(NAME, EXPR)`.
+    fn binding(code: &str) -> Option<(&str, &str)> {
+        let body = code.trim().strip_suffix(';')?;
+        if let Some((name, expr)) = body.split_once("|=") {
+            return Some((name.trim(), expr));
+        }
+        let decl = [
+            "pub(crate) const ",
+            "pub(super) const ",
+            "pub const ",
+            "const ",
+            "static ",
+            "let mut ",
+            "let ",
+        ]
+        .iter()
+        .find_map(|prefix| body.strip_prefix(prefix))?;
+        let (lhs, expr) = decl.split_once('=')?;
+        Some((lhs.split(':').next()?.trim(), expr))
+    }
+
+    /// `seed` (the flag's own name, when given) plus every file-local
+    /// one-line binding whose value carries `bit`, followed through aliases
+    /// of aliases. File-local and scope-blind.
+    fn flag_names(codes: &[String], seed: Option<&str>, bit: u64) -> HashSet<String> {
+        let bindings: Vec<(&str, &str)> = codes.iter().filter_map(|c| binding(c)).collect();
+        let mut names: HashSet<String> = seed.map(str::to_string).into_iter().collect();
+        loop {
+            let before = names.len();
+            for (name, expr) in &bindings {
+                if !names.contains(*name) && carries(expr, &names, bit) {
+                    names.insert((*name).to_string());
+                }
+            }
+            if names.len() == before {
+                return names;
+            }
+        }
+    }
+
+    /// The argument text of each `creation_flags(` call that starts on line
+    /// `idx`, read across the following lines' code until its parentheses
+    /// balance.
+    fn creation_flags_args(codes: &[String], idx: usize) -> Vec<String> {
+        const NEEDLE: &str = "creation_flags(";
+        let line = codes[idx].as_str();
+        let mut args = Vec::new();
+        for (pos, _) in line.match_indices(NEEDLE) {
+            let first = line.get(pos + NEEDLE.len()..).unwrap_or("");
+            let rest = codes
+                .iter()
+                .skip(idx + 1)
+                .take(ARG_WINDOW)
+                .map(String::as_str);
+            let mut arg = String::new();
+            let mut depth = 1_usize;
+            'call: for text in std::iter::once(first).chain(rest) {
+                for c in text.chars() {
+                    match c {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break 'call;
+                            }
+                        }
+                        _ => {}
+                    }
+                    arg.push(c);
+                }
+                arg.push('\n');
+            }
+            args.push(arg);
+        }
+        args
+    }
+
+    /// Scan 1: the indices of unmarked `Command::new(` lines with no
+    /// suppression in the next [`FLAG_WINDOW`] lines. A suppression is a
+    /// `no_window(` helper call in CODE (not a comment or a string), or a
+    /// `creation_flags(..)` whose argument carries `CREATE_NO_WINDOW` — by
+    /// name, by a file-local alias, or as a literal with its bit set. Any
+    /// other `creation_flags` (a process group alone) REPLACES the flags
+    /// without hiding the window.
+    fn unsuppressed_command_new(lines: &[(usize, &str)], codes: &[String]) -> Vec<usize> {
+        let no_window = flag_names(codes, Some(CREATE_NO_WINDOW), CREATE_NO_WINDOW_BIT);
+        (0..codes.len())
+            .filter(|&i| {
+                if !codes[i].contains("Command::new(") {
+                    return false;
+                }
+                let end = (i + FLAG_WINDOW).min(codes.len());
+                let suppressed = (i..end).any(|j| {
+                    codes[j].contains("no_window(")
+                        || creation_flags_args(codes, j)
+                            .iter()
+                            .any(|arg| carries(arg, &no_window, CREATE_NO_WINDOW_BIT))
+                });
+                !suppressed && !marked(lines, i)
+            })
+            .collect()
+    }
+
+    /// Scan 2: the indices of unmarked production lines that hand a command
+    /// `CREATE_NEW_CONSOLE`, whatever built it:
+    /// - any line whose code NAMES `CREATE_NEW_CONSOLE` (a call, a multi-line
+    ///   `if` or `const`, a re-assignment, a renaming `use`), and
+    /// - any `creation_flags(..)` whose argument carries the bit as a
+    ///   literal (`0x10`, `0b1_0000`), directly or through a file-local
+    ///   one-line alias.
+    fn new_console_sites(lines: &[(usize, &str)], codes: &[String]) -> Vec<usize> {
+        let literal_aliases = flag_names(codes, None, CREATE_NEW_CONSOLE_BIT);
+        (0..codes.len())
+            .filter(|&idx| {
+                let named = tokens(&codes[idx]).any(|t| t == CREATE_NEW_CONSOLE);
+                let by_value = creation_flags_args(codes, idx)
+                    .iter()
+                    .any(|arg| carries(arg, &literal_aliases, CREATE_NEW_CONSOLE_BIT));
+                (named || by_value) && !marked(lines, idx)
+            })
+            .collect()
+    }
+
+    /// The unsuppressed, unmarked console spawn sites in one file's
+    /// PRODUCTION text, as `rel:line: code`. Production text only: a spawn
+    /// written inside a test item is not shipped, so it cannot flash anything
+    /// on a user's machine. Both scans read each line's CODE
+    /// ([`code_only`]), so a string or a comment never triggers or
+    /// suppresses a site; the `console-ok:` marker is read from the raw line,
+    /// because it is a comment.
+    fn file_violations(rel: &str, src: &str) -> Vec<String> {
+        let lines = production_lines(src);
+        let codes: Vec<String> = lines.iter().map(|(_, l)| code_only(l)).collect();
+        let mut hits = new_console_sites(&lines, &codes);
+        if !exempt_from_command_new_scan(rel) {
+            hits.extend(unsuppressed_command_new(&lines, &codes));
+        }
+        hits.sort_unstable();
+        hits.dedup();
+        hits.into_iter()
+            .map(|idx| {
+                let (n, line) = lines[idx];
+                format!("{rel}:{n}: {}", line.trim_start())
+            })
+            .collect()
+    }
+
+    /// Runs each `(case, rel, src, expected)` through [`file_violations`] and
+    /// returns one line per case whose report differs, so a red run names
+    /// every failing case at once instead of stopping at the first.
+    fn mismatched(cases: &[(&str, &str, &str, &[&str])]) -> Vec<String> {
+        cases
+            .iter()
+            .filter_map(|(case, rel, src, expected)| {
+                let got = file_violations(rel, src);
+                (got != *expected).then(|| format!("{case}: expected {expected:?}, got {got:?}"))
+            })
+            .collect()
+    }
+
+    /// The `spawn_python_with_console` shape (`mcp/shared.rs`; the override was
+    /// deleted in the change that added this test, and the function renamed
+    /// `spawn_python_script`): a command built through
+    /// `no_window(..)` and then handed `CREATE_NEW_CONSOLE`, which REPLACES
+    /// the `CREATE_NO_WINDOW` the helper set. The `Command::new(` scan never
+    /// looked at it, so the override shipped a visible console window.
+    #[test]
+    fn a_new_console_override_is_a_violation_unless_marked() {
+        let overridden = "fn spawn() -> std::io::Result<std::process::Child> {\n\
+                          \x20   let mut cmd = crate::process_helpers::no_window(\"python\");\n\
+                          \x20   #[cfg(target_os = \"windows\")]\n\
+                          \x20   {\n\
+                          \x20       cmd.creation_flags(CREATE_NEW_CONSOLE);\n\
+                          \x20   }\n\
+                          \x20   cmd.spawn()\n\
+                          }\n";
+        // A raw `Command::new(` whose flags open the console: both the spawn
+        // (no `CREATE_NO_WINDOW`) and the flag line are reported.
+        let raw = "fn f() {\n    let mut c = std::process::Command::new(\"x\");\n    \
+                   c.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NEW_CONSOLE);\n}\n";
+        // An argument that spans lines is reported where the flag is named.
+        let multi_line = "fn f(c: &mut C) {\n    c.creation_flags(\n        CREATE_NEW_PROCESS_GROUP\n            \
+                          | CREATE_NEW_CONSOLE,\n    );\n}\n";
+        let alias =
+            "const VISIBLE: u32 = 0x0000_0010;\nfn f(c: &mut C) { c.creation_flags(VISIBLE); }\n";
+        let hits = [
+            (
+                "no_window then override",
+                "mcp/shared.rs",
+                overridden,
+                &["mcp/shared.rs:5: cmd.creation_flags(CREATE_NEW_CONSOLE);"][..],
+            ),
+            (
+                "raw Command::new given the console",
+                "a.rs",
+                raw,
+                &[
+                    "a.rs:2: let mut c = std::process::Command::new(\"x\");",
+                    "a.rs:3: c.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NEW_CONSOLE);",
+                ][..],
+            ),
+            (
+                "hex 0x10",
+                "a.rs",
+                "fn f(c: &mut C) { c.creation_flags(0x10); }\n",
+                &["a.rs:1: fn f(c: &mut C) { c.creation_flags(0x10); }"][..],
+            ),
+            (
+                "hex 0x00000010",
+                "a.rs",
+                "fn f(c: &mut C) { c.creation_flags(0x00000010); }\n",
+                &["a.rs:1: fn f(c: &mut C) { c.creation_flags(0x00000010); }"][..],
+            ),
+            (
+                "underscored 0x0000_0010",
+                "a.rs",
+                "fn f(c: &mut C) { c.creation_flags(0x0000_0010); }\n",
+                &["a.rs:1: fn f(c: &mut C) { c.creation_flags(0x0000_0010); }"][..],
+            ),
+            (
+                "masked 0x0800_0010",
+                "a.rs",
+                "fn f(c: &mut C) { c.creation_flags(0x0800_0010); }\n",
+                &["a.rs:1: fn f(c: &mut C) { c.creation_flags(0x0800_0010); }"][..],
+            ),
+            (
+                "decimal 16",
+                "a.rs",
+                "fn f(c: &mut C) { c.creation_flags(16u32); }\n",
+                &["a.rs:1: fn f(c: &mut C) { c.creation_flags(16u32); }"][..],
+            ),
+            (
+                "binary 0b1_0000",
+                "a.rs",
+                "fn f(c: &mut C) { c.creation_flags(0b1_0000); }\n",
+                &["a.rs:1: fn f(c: &mut C) { c.creation_flags(0b1_0000); }"][..],
+            ),
+            (
+                "octal 0o20",
+                "a.rs",
+                "fn f(c: &mut C) { c.creation_flags(0o20); }\n",
+                &["a.rs:1: fn f(c: &mut C) { c.creation_flags(0o20); }"][..],
+            ),
+            (
+                "path-qualified const",
+                "a.rs",
+                "fn f(c: &mut C) { c.creation_flags(Threading::CREATE_NEW_CONSOLE.0); }\n",
+                &["a.rs:1: fn f(c: &mut C) { c.creation_flags(Threading::CREATE_NEW_CONSOLE.0); }"][..],
+            ),
+            (
+                "file-local literal alias",
+                "a.rs",
+                alias,
+                &["a.rs:2: fn f(c: &mut C) { c.creation_flags(VISIBLE); }"][..],
+            ),
+            (
+                "multi-line argument",
+                "a.rs",
+                multi_line,
+                &["a.rs:4: | CREATE_NEW_CONSOLE,"][..],
+            ),
+        ];
+        let failures = mismatched(&hits);
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+
+        // Not the console flag: CREATE_NO_WINDOW, a process group, wider
+        // literals that merely START with `0x10`, a const named like it but
+        // distinct as a token, and the name in a trailing comment. Then a
+        // marked console, prose, and test code.
+        let none: &[&str] = &[];
+        let misses = [
+            (
+                "CREATE_NO_WINDOW",
+                "a.rs",
+                "fn f(c: &mut C) { c.creation_flags(0x0800_0000); }\n",
+                none,
+            ),
+            (
+                "process group",
+                "a.rs",
+                "fn f(c: &mut C) { c.creation_flags(0x0000_0200 | CREATE_NO_WINDOW); }\n",
+                none,
+            ),
+            (
+                "0x100",
+                "a.rs",
+                "fn f(c: &mut C) { c.creation_flags(0x100); }\n",
+                none,
+            ),
+            (
+                "0x1000",
+                "a.rs",
+                "fn f(c: &mut C) { c.creation_flags(0x1000); }\n",
+                none,
+            ),
+            (
+                "decimal 512",
+                "a.rs",
+                "fn f(c: &mut C) { c.creation_flags(512); }\n",
+                none,
+            ),
+            (
+                "binary 0b10_0000_0000",
+                "a.rs",
+                "fn f(c: &mut C) { c.creation_flags(0b10_0000_0000); }\n",
+                none,
+            ),
+            (
+                "trailing comment",
+                "a.rs",
+                "fn f(c: &mut C) { c.creation_flags(0x0800_0000); } // not CREATE_NEW_CONSOLE\n",
+                none,
+            ),
+            (
+                "longer identifier",
+                "a.rs",
+                "fn f(c: &mut C) { c.creation_flags(NOT_CREATE_NEW_CONSOLE_X); }\n",
+                none,
+            ),
+            (
+                "marked",
+                "a.rs",
+                "fn f(c: &mut C) {\n    // console-ok: the operator asked for this window.\n    \
+                 c.creation_flags(CREATE_NEW_CONSOLE);\n}\n",
+                none,
+            ),
+            (
+                "prose",
+                "a.rs",
+                "fn f() {\n    // was: c.creation_flags(CREATE_NEW_CONSOLE);\n}\n",
+                none,
+            ),
+            (
+                "test code",
+                "a.rs",
+                "fn f() {}\n#[cfg(test)]\nmod t {\n    fn g(c: &mut C) {\n        \
+                 c.creation_flags(CREATE_NEW_CONSOLE);\n    }\n}\n",
+                none,
+            ),
+        ];
+        let failures = mismatched(&misses);
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// A production line that NAMES `CREATE_NEW_CONSOLE` is a site, however
+    /// the value then reaches `creation_flags`: the multi-line `if` and
+    /// `const` rustfmt writes, a bare re-assignment, and a renaming `use` all
+    /// slip past a one-line binding follower.
+    #[test]
+    fn a_console_flag_named_anywhere_in_production_is_a_violation() {
+        let none: &[&str] = &[];
+        let cases = [
+            (
+                "multi-line if",
+                "a.rs",
+                "fn f(c: &mut C, v: bool) {\n    let flags = if v {\n        CREATE_NEW_CONSOLE\n    \
+                 } else {\n        CREATE_NO_WINDOW\n    };\n    c.creation_flags(flags);\n}\n",
+                &["a.rs:3: CREATE_NEW_CONSOLE"][..],
+            ),
+            (
+                "multi-line const",
+                "a.rs",
+                "const FLAGS: u32 =\n    CREATE_NEW_PROCESS_GROUP | CREATE_NEW_CONSOLE;\n\
+                 fn f(c: &mut C) { c.creation_flags(FLAGS); }\n",
+                &["a.rs:2: CREATE_NEW_PROCESS_GROUP | CREATE_NEW_CONSOLE;"][..],
+            ),
+            (
+                "bare assignment",
+                "a.rs",
+                "fn f(c: &mut C) {\n    let mut flags = 0;\n    flags = CREATE_NEW_CONSOLE;\n    \
+                 c.creation_flags(flags);\n}\n",
+                &["a.rs:3: flags = CREATE_NEW_CONSOLE;"][..],
+            ),
+            (
+                "renaming use",
+                "a.rs",
+                "use windows_sys::Win32::System::Threading::CREATE_NEW_CONSOLE as VISIBLE;\n\
+                 fn f(c: &mut C) { c.creation_flags(VISIBLE); }\n",
+                &["a.rs:1: use windows_sys::Win32::System::Threading::CREATE_NEW_CONSOLE as VISIBLE;"]
+                    [..],
+            ),
+            (
+                "marked renaming use",
+                "a.rs",
+                "// console-ok: the operator's visible terminal.\n\
+                 use windows_sys::Win32::System::Threading::CREATE_NEW_CONSOLE as VISIBLE;\n\
+                 fn f(c: &mut C) { c.creation_flags(VISIBLE); }\n",
+                none,
+            ),
+        ];
+        let failures = mismatched(&cases);
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// `creation_flags` REPLACES the flags, so only one that carries
+    /// `CREATE_NO_WINDOW` suppresses a `Command::new(` spawn. A process group
+    /// alone still opens a console from the GUI runner.
+    #[test]
+    fn a_spawn_whose_flags_lack_create_no_window_is_a_violation() {
+        let none: &[&str] = &[];
+        let spawn = |flags: &str| {
+            format!("fn f() {{\n    let mut c = std::process::Command::new(\"python\");\n    {flags}\n}}\n")
+        };
+        let group_only = spawn("c.creation_flags(0x0000_0200);");
+        let by_name = spawn("c.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);");
+        let by_literal = spawn("c.creation_flags(0x0800_0000 | 0x0000_0200);");
+        let by_binary = spawn("c.creation_flags(0b1000_0000_0000_0000_0000_0000_0000);");
+        let by_alias = format!(
+            "const NW: u32 = 0x0800_0000;\n{}",
+            spawn("c.creation_flags(NW | GROUP);")
+        );
+        let by_helper = spawn("pm_detect::no_window(&mut c);");
+        // A `no_window(` that appears only in a comment suppresses nothing.
+        let commented = spawn(
+            "// TODO: build this with process_helpers::no_window(..) instead\n    c.spawn();",
+        );
+        // Nor does one inside a block comment or a string.
+        let block_commented = spawn("/* TODO: no_window(&mut c) */ c.spawn();");
+        let in_string = spawn("let _note = \"use no_window(..)\"; c.spawn();");
+        let cases = [
+            (
+                "process group only",
+                "a.rs",
+                group_only.as_str(),
+                &["a.rs:2: let mut c = std::process::Command::new(\"python\");"][..],
+            ),
+            ("CREATE_NO_WINDOW by name", "a.rs", by_name.as_str(), none),
+            (
+                "CREATE_NO_WINDOW as a literal",
+                "a.rs",
+                by_literal.as_str(),
+                none,
+            ),
+            (
+                "CREATE_NO_WINDOW in binary",
+                "a.rs",
+                by_binary.as_str(),
+                none,
+            ),
+            (
+                "CREATE_NO_WINDOW through an alias",
+                "a.rs",
+                by_alias.as_str(),
+                none,
+            ),
+            (
+                "C1 no_window( only in a comment",
+                "a.rs",
+                commented.as_str(),
+                &["a.rs:2: let mut c = std::process::Command::new(\"python\");"][..],
+            ),
+            (
+                "C2 no_window( only in a block comment",
+                "a.rs",
+                block_commented.as_str(),
+                &["a.rs:2: let mut c = std::process::Command::new(\"python\");"][..],
+            ),
+            (
+                "C3 no_window( only in a string",
+                "a.rs",
+                in_string.as_str(),
+                &["a.rs:2: let mut c = std::process::Command::new(\"python\");"][..],
+            ),
+            (
+                "a no_window(&mut cmd) helper",
+                "a.rs",
+                by_helper.as_str(),
+                none,
+            ),
+        ];
+        let failures = mismatched(&cases);
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// The `Command::new(` scan exempts `bin/` and this file; the console
+    /// scan does not, because `CREATE_NEW_CONSOLE` opens a window from a
+    /// console binary too.
+    #[test]
+    fn the_new_console_scan_applies_to_binaries_and_this_file() {
+        let none: &[&str] = &[];
+        let flag = "fn f(c: &mut C) { c.creation_flags(CREATE_NEW_CONSOLE); }\n";
+        let raw = "fn f() { let _ = std::process::Command::new(\"x\"); }\n";
+        let cases = [
+            (
+                "bin/ console flag",
+                "bin/tool.rs",
+                flag,
+                &["bin/tool.rs:1: fn f(c: &mut C) { c.creation_flags(CREATE_NEW_CONSOLE); }"][..],
+            ),
+            (
+                "process_helpers.rs console flag",
+                "process_helpers.rs",
+                flag,
+                &["process_helpers.rs:1: fn f(c: &mut C) { c.creation_flags(CREATE_NEW_CONSOLE); }"]
+                    [..],
+            ),
+            ("bin/ raw Command::new", "bin/tool.rs", raw, none),
+        ];
+        let failures = mismatched(&cases);
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// A test item in the middle of a file must hide neither the production
+    /// code before it nor the code after it. The `split_once` skipper this
+    /// guard used until this test was added threw away everything after the
+    /// FIRST column-0 `#[cfg(test)]`, so a `#[cfg(test)]` helper fn halfway
+    /// down `ai_provider/oauth_refresh.rs` hid the raw spawn below it.
+    #[test]
+    fn a_spawn_after_a_mid_file_test_item_is_still_scanned() {
+        let src = "fn a() {}\n\
+                   #[cfg(test)]\n\
+                   fn helper() { let _ = std::process::Command::new(\"t\"); }\n\
+                   fn prod() { let _ = std::process::Command::new(\"x\"); }\n\
+                   #[cfg(all(test, unix))]\n\
+                   mod unix_tests {\n\
+                   \x20   fn g() { let _ = std::process::Command::new(\"u\"); }\n\
+                   }\n\
+                   fn prod_after() { let _ = std::process::Command::new(\"y\"); }\n";
+        assert_eq!(
+            file_violations("a.rs", src),
+            vec![
+                "a.rs:4: fn prod() { let _ = std::process::Command::new(\"x\"); }".to_string(),
+                "a.rs:9: fn prod_after() { let _ = std::process::Command::new(\"y\"); }"
+                    .to_string(),
+            ],
+            "only the two production spawns are sites; the test helper and the \
+             all(test, unix) module are not"
+        );
+    }
+
     /// Every `Command::new(` in production code must either be suppressed
     /// (`process_helpers::{no_window, tokio_no_window, …}`, or an inline
     /// `creation_flags`) or carry a `console-ok:` marker saying why a console
     /// there is fine — a non-Windows-only arm, a deliberately visible terminal,
-    /// or a builder that is never spawned.
+    /// or a builder that is never spawned. And no production
+    /// `creation_flags(..)` may hand a command `CREATE_NEW_CONSOLE` without
+    /// the same marker, however the command was built.
     #[test]
     fn every_spawn_site_is_suppressed_or_marked_console_ok() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -2876,52 +4083,15 @@ mod console_window_guard {
         let mut violations: Vec<String> = Vec::new();
 
         for file in files {
-            let rel = file.strip_prefix(&root).unwrap_or(&file).to_path_buf();
-            if exempt(&rel) {
-                continue;
-            }
             let Ok(src) = std::fs::read_to_string(&file) else {
                 continue;
             };
-            // Production text only: a spawn written inside a test module is
-            // not shipped, so it cannot flash anything on a user's machine.
-            let prod = src
-                .split_once("\n#[cfg(test)]")
-                .map(|(before, _)| before)
-                .unwrap_or(&src);
-            let lines: Vec<&str> = prod.lines().collect();
-
-            for (i, line) in lines.iter().enumerate() {
-                if !line.contains("Command::new(") {
-                    continue;
-                }
-                let trimmed = line.trim_start();
-                // Prose, not code.
-                if trimmed.starts_with("//") {
-                    continue;
-                }
-                // Suppressed inline, a few lines down — either the raw flag
-                // or a helper that sets it on an already-built command
-                // (`pm_detect::no_window(&mut cmd)`).
-                let end = (i + FLAG_WINDOW).min(lines.len());
-                if lines[i..end]
-                    .iter()
-                    .any(|l| l.contains("creation_flags") || l.contains("no_window("))
-                {
-                    continue;
-                }
-                // Explicitly marked, on the line or just above it.
-                let start = i.saturating_sub(3);
-                if lines[start..=i].iter().any(|l| l.contains("console-ok:")) {
-                    continue;
-                }
-                violations.push(format!(
-                    "{}:{}: {}",
-                    rel.to_string_lossy().replace('\\', "/"),
-                    i + 1,
-                    trimmed
-                ));
-            }
+            let rel = file
+                .strip_prefix(&root)
+                .unwrap_or(&file)
+                .to_string_lossy()
+                .replace('\\', "/");
+            violations.extend(file_violations(&rel, &src));
         }
 
         assert!(
@@ -2929,10 +4099,10 @@ mod console_window_guard {
             "un-suppressed console spawn site(s) — on Windows each of these pops a \
              console window on every call in a release build.\n\n{}\n\nFix: build the \
              command with `crate::process_helpers::no_window(..)` / `tokio_no_window(..)` \
-             instead of `Command::new(..)`. If a console there is CORRECT (a \
-             non-Windows-only arm, a deliberately visible terminal, a builder that is \
-             never spawned), say so with a `// console-ok: <reason>` comment on the line \
-             or just above it.",
+             instead of `Command::new(..)`, and do not override its flags with \
+             `CREATE_NEW_CONSOLE`. If a console there is CORRECT (a non-Windows-only \
+             arm, a deliberately visible terminal, a builder that is never spawned), say \
+             so with a `// console-ok: <reason>` comment on the line or just above it.",
             violations.join("\n")
         );
     }
@@ -2951,21 +4121,8 @@ mod console_window_guard {
 /// environment is what the user means.
 #[cfg(test)]
 mod raw_git_guard {
-    use std::path::{Path, PathBuf};
-
-    fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for e in entries.flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                rs_files(&p, out);
-            } else if p.extension().is_some_and(|x| x == "rs") {
-                out.push(p);
-            }
-        }
-    }
+    use super::source_scan::{production_lines, rs_files};
+    use std::path::PathBuf;
 
     /// How far above a raw spawn a `git-env-ok:` marker still covers it — a
     /// marker comment may run to several lines.
@@ -2991,82 +4148,6 @@ mod raw_git_guard {
                     || rest.starts_with(".exe\"#")
             })
         })
-    }
-
-    /// The production lines of `src`, as `(1-based line number, line)`.
-    ///
-    /// Skips exactly the item each column-0 `#[cfg(test)]` applies to — a
-    /// `mod` of any visibility, a helper fn, a `use` — then keeps scanning, so
-    /// a test module in the middle of a file hides neither the production
-    /// code before it nor after it. The item is the first non-attribute line
-    /// after the cfg: one ending in `;`, or opening and closing its braces on
-    /// that line, is the whole item; otherwise it runs to the next line that
-    /// is exactly `}` — rustfmt closes every top-level item that way, and
-    /// unlike brace counting this is not fooled by braces inside the string
-    /// literals source-scanning tests are full of. A head line with no brace
-    /// (a multi-line `static`, `use a::{..};`) ends at its first `;` line, and
-    /// a multi-line attribute is skipped by bracket depth. Only a column-0
-    /// `#[cfg(test)]` starts a skip: an indented one, or `cfg(all(test, ..))`,
-    /// is scanned as production — which can only fail loudly, never hide a
-    /// spawn.
-    fn production_lines(src: &str) -> Vec<(usize, &str)> {
-        let mut out = Vec::new();
-        let mut lines = src.lines().enumerate();
-        while let Some((i, line)) = lines.next() {
-            if !line.starts_with("#[cfg(test)]") {
-                out.push((i + 1, line));
-                continue;
-            }
-            // `attr_depth` > 0 while inside a multi-line attribute; `braced`
-            // once the item's head line opened a brace (it then ends at the
-            // next column-0 `}` / `};`), else the item ends at its first
-            // line ending in `;` (a multi-line `static`, `use a::{..};`).
-            let mut attr_depth: i64 = 0;
-            let mut head_seen = false;
-            let mut braced = false;
-            for (_, item) in lines.by_ref() {
-                let t = item.trim();
-                if !head_seen {
-                    if attr_depth > 0 || t.starts_with("#[") {
-                        attr_depth += t.matches('[').count() as i64;
-                        attr_depth -= t.matches(']').count() as i64;
-                        continue;
-                    }
-                    if t.is_empty() {
-                        continue;
-                    }
-                    head_seen = true;
-                    let opens = t.matches('{').count();
-                    let closes = t.matches('}').count();
-                    if opens == 0 {
-                        if t.ends_with(';') {
-                            break;
-                        }
-                        continue;
-                    }
-                    if opens == closes {
-                        break;
-                    }
-                    braced = true;
-                    continue;
-                }
-                if braced {
-                    if item == "}" || item == "};" {
-                        break;
-                    }
-                } else if t.contains('{')
-                    && !(t.ends_with(';') && t.matches('{').count() == t.matches('}').count())
-                {
-                    // A head that spans lines (a multi-line fn signature)
-                    // opens its body here — unless this line is a balanced,
-                    // `;`-terminated initializer, which ends the item below.
-                    braced = true;
-                } else if t.ends_with(';') {
-                    break;
-                }
-            }
-        }
-        out
     }
 
     /// Returns `(unmarked, marked)`: the 1-based lines of raw git spawns in

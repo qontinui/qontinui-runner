@@ -7,21 +7,28 @@ UI Bridge enables AI-driven control of applications through a unified HTTP API. 
 ```python
 from ui_bridge import UIBridgeClient
 
-# Default connection (localhost:9876)
+# Default connection (127.0.0.1:9876)
 client = UIBridgeClient()
 
 # Custom connection
 client = UIBridgeClient(
-    base_url="http://localhost:9876",
+    base_url="http://127.0.0.1:9876",
     timeout=30.0,
     api_path="/ui-bridge"
 )
 
 # Common connection targets:
-# - Local runner:        http://localhost:9876
-# - Android emulator:    http://10.0.2.2:8087
+# - Local runner:        http://127.0.0.1:9876
+# - Android device or emulator: http://localhost:8087, after
+#   `adb forward tcp:8087 tcp:8087` on this host (on ui-bridge-native
+#   >= 0.11.0, only if the app's server adapter passes the socket's
+#   `remoteAddress`)
 # - iOS simulator:       http://localhost:8087
-# - Physical device:     http://<device-ip>:8087
+# - A phone's LAN IP (http://<device-ip>:8087): from @qontinui/ui-bridge-native
+#   0.11.0, an unsigned off-device caller reaches only GET /ui-bridge/health
+#   (and POST /ui-bridge/pair with an armed code); control routes answer
+#   401 PAIRING_REQUIRED or PAIRING_UNCONFIGURED. Nothing here signs yet, and
+#   the runner's /ui-bridge/devices LAN transport is refused the same way.
 # - Web app (dev):       http://localhost:3001 (check app's configured port)
 ```
 

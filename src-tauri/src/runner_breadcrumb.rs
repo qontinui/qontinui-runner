@@ -493,7 +493,8 @@ mod tests {
     /// mutators already take. The pin is needed because the documented default
     /// only holds when nothing else names a primary: an ambient
     /// `QONTINUI_PRIMARY_PORT` in a developer's shell would fail this test for the
-    /// same reason, as would a sibling that panicked before restoring.
+    /// same reason. (The siblings restore through [`EnvVarRestore`], so one that
+    /// panics mid-test still puts the variable back when it unwinds.)
     ///
     /// `_restore` is declared AFTER `_env_lock` on purpose — locals drop in
     /// reverse declaration order, so the env is restored while the lock is still
@@ -560,8 +561,9 @@ mod tests {
     #[test]
     fn public_writer_honors_primary_port_env() {
         let _env_lock = env_lock();
-        // Save/restore so this never leaks into a sibling test.
-        let prev = std::env::var(PRIMARY_PORT_ENV).ok();
+        // Restored on drop, so a failed assertion cannot leak 9878 into a
+        // sibling test.
+        let _restore = EnvVarRestore::capture(&[PRIMARY_PORT_ENV]);
         std::env::set_var(PRIMARY_PORT_ENV, "9878");
 
         assert_eq!(breadcrumb_file_name(9878), "api-port.json");
@@ -569,11 +571,6 @@ mod tests {
         // The hardcoded default port is NOT primary once the env names a different one.
         assert_eq!(breadcrumb_file_name(PRIMARY_PORT), "api-port-9876.json");
         assert!(!breadcrumb_for(PRIMARY_PORT, None).primary);
-
-        match prev {
-            Some(v) => std::env::set_var(PRIMARY_PORT_ENV, v),
-            None => std::env::remove_var(PRIMARY_PORT_ENV),
-        }
     }
 
     /// Round-trip through the atomic writer + reader, and reject a record whose
@@ -657,7 +654,7 @@ mod tests {
         let newer = rec(9878, 2, 999); // newer, primary=false
         let all = vec![newer, primary.clone()];
 
-        let prev = std::env::var(PRIMARY_PORT_ENV).ok();
+        let _restore = EnvVarRestore::capture(&[PRIMARY_PORT_ENV]);
         // Reader env names a DIFFERENT "primary" — must be ignored by selection.
         std::env::set_var(PRIMARY_PORT_ENV, "9878");
         assert_eq!(
@@ -668,11 +665,6 @@ mod tests {
         // Env unset → same answer; selection is flag-driven, full stop.
         std::env::remove_var(PRIMARY_PORT_ENV);
         assert_eq!(select_live(&all, |_| true), Some(primary));
-
-        match prev {
-            Some(v) => std::env::set_var(PRIMARY_PORT_ENV, v),
-            None => std::env::remove_var(PRIMARY_PORT_ENV),
-        }
     }
 
     /// Our own pid is live; pid 0 is not a live user process on any supported
@@ -782,8 +774,6 @@ mod tests {
     #[test]
     fn publish_with_key_then_remove_published_deletes_both_files() {
         let amb = isolated_ambient();
-        let _restore = EnvVarRestore::capture(&[PRIMARY_PORT_ENV]);
-        std::env::remove_var(PRIMARY_PORT_ENV);
         remove_published(); // a clean slate whatever a sibling left behind
 
         let port = 9891;
@@ -836,8 +826,6 @@ mod tests {
     #[test]
     fn publish_records_the_key_even_when_the_breadcrumb_write_fails() {
         let amb = isolated_ambient();
-        let _restore = EnvVarRestore::capture(&[PRIMARY_PORT_ENV]);
-        std::env::remove_var(PRIMARY_PORT_ENV);
         remove_published();
 
         let port = 9892;

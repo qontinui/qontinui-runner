@@ -158,7 +158,8 @@ cargo_build_jobs = 1
 #   anyway — extra coverage (it is the only cfg(windows) lint pass a Windows
 #   CI node gets), not a parity break, but it is a third full compile that
 #   `test (windows-latest)` does not pay, so wall-clock comparisons against
-#   that leg must subtract it.
+#   that leg must subtract it. It also runs DEFAULT TARGETS ONLY, while
+#   ci.yml's `clippy-windows` runs `--all-targets` -- see the step comment.
 #
 # - The separate `holder-crates` job (ci.yml, matrix ubuntu + windows) runs
 #   `cargo test -p qontinui-pty-holder -p qontinui-runner-win32` and
@@ -282,6 +283,18 @@ command = [
 ]
 
 [[steps]]
+# ci.yml "Purge cached bundled-PostgreSQL units that do not match the pin",
+# in ci.yml's position (right after its rust-cache restore, before the
+# frontend install). This lane's persistent target dir is the case it exists
+# for: a postgresql_embedded OUT_DIR keeps whatever release was newest when it
+# was first built, even after the pin in src-tauri/.cargo/config.toml changes.
+# The script reads the CARGO_TARGET_DIR the executor exports. Node, not bash:
+# on Windows `bash` resolves to System32's WSL launcher, which sees neither
+# that variable nor the Windows paths.
+name = "purge-stale-bundled-postgres"
+command = ["node", "scripts/ci/purge-stale-bundled-postgres.mjs"]
+
+[[steps]]
 name = "frontend-install"
 command = ["pnpm", "install", "--frozen-lockfile"]
 
@@ -314,7 +327,13 @@ working_dir = "src-tauri"
 
 [[steps]]
 name = "rust-clippy"
-# PLAIN clippy, exactly like ci.yml: lint levels come solely from
+# PLAIN clippy, DEFAULT TARGETS ONLY, like ci.yml's ubuntu leg -- and a
+# declared divergence from ci.yml's `clippy-windows`, which runs
+# `--all-targets` (GitHub-hosted minutes are free on this public repo). This
+# lane runs on fleet hosts, where CI ranks below session spawns (served
+# production-and-cost spawns-outrank-ci-and-builds), so it does not pay the
+# test-target check pass. On a Windows node its lint coverage is a subset of
+# ci.yml's. Lint levels come solely from
 # src-tauri/Cargo.toml [lints.clippy] (T1 correctness/suspicious = deny,
 # T3 style/perf = warn). Adding `-D warnings` here would fail every
 # dispatch on the ~200 pre-existing warn-tier lints CI deliberately
@@ -324,6 +343,12 @@ working_dir = "src-tauri"
 timeout_secs = 7200
 
 [[steps]]
+# Also carries the harness/subject isolation test (src-tauri/src/
+# subject_isolation_harness.rs, plan 2026-10-04-a-subject-runner-must-be-
+# fully-isolated-from-the-harness-runner Phase 3) on whatever OS the CI node
+# runs — the byte-identical drive on Linux/macOS, the resolve-only half on
+# Windows — so it needs no step of its own and stays in parity with ci.yml's
+# `cargo test` on both matrix legs. It touches nothing outside a temp fixture.
 name = "rust-test"
 command = ["cargo", "test"]
 working_dir = "src-tauri"
@@ -340,8 +365,9 @@ command = ["cargo", "test", "-p", "qontinui-pty-holder", "-p", "qontinui-runner-
 timeout_secs = 1800
 
 [[steps]]
-# ci.yml `holder-crates` job, "Clippy holder crates" — PLAIN clippy, levels
-# from the crate's own [lints] table, exactly like `rust-clippy`.
+# ci.yml `holder-crates` job, "Clippy holder crates" — PLAIN clippy (no
+# `-D warnings`), like `rust-clippy`, but over all targets; levels from the
+# crate's own [lints] table.
 name = "holder-crates-clippy"
 command = ["cargo", "clippy", "-p", "qontinui-pty-holder", "--all-targets"]
 timeout_secs = 1800

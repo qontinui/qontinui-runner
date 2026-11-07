@@ -243,12 +243,11 @@ The regular \`page/evaluate\` endpoint also gained a **direct WebView fallback**
     {
       id: "builtin-skill",
       title: "The First Builtin Skill",
-      content: `The system ships with one builtin skill: **UI Bridge Health Verify**. It's a 4-step verification template:
+      content: `The system ships with one builtin skill: **UI Bridge Health Verify**. It's a 3-step verification template, all DOM reads over IPC (no screen capture, so the window does not need focus):
 
-1. **Focus Window** — calls \`/gui-config/focus-window\` to bring the Tauri window to front
-2. **Discover Elements** — forces UI Bridge element discovery
-3. **Snapshot & Count** — verifies element count meets a minimum threshold
-4. **Console Errors** — checks for JavaScript errors
+1. **Discover Elements** — forces UI Bridge element discovery
+2. **Snapshot & Count** — verifies element count meets a minimum threshold
+3. **Console Errors** — checks for JavaScript errors
 
 This skill demonstrates how procedural skills work as composable workflow steps. It can be added to any workflow's verification phase via the skill library picker.`,
       estimatedDuration: 1,

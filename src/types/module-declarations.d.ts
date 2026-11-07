@@ -463,10 +463,6 @@ declare module "@qontinui/ui-bridge-auto" {
 // =============================================================================
 
 // =============================================================================
-// html2canvas (missing type declarations)
-// =============================================================================
-
-// =============================================================================
 // @testing-library/react — used only via dynamic import in vdom-renderer.ts
 // (test-only dep, not installed in production)
 // =============================================================================
@@ -482,41 +478,4 @@ declare module "@testing-library/react" {
 
   export function render(element: ReactElement): RenderResult;
   export const screen: Record<string, unknown>;
-}
-
-// =============================================================================
-// html2canvas (missing type declarations)
-// =============================================================================
-
-declare module "html2canvas" {
-  interface Html2CanvasOptions {
-    allowTaint?: boolean;
-    backgroundColor?: string | null;
-    canvas?: HTMLCanvasElement;
-    foreignObjectRendering?: boolean;
-    imageTimeout?: number;
-    ignoreElements?: (element: Element) => boolean;
-    logging?: boolean;
-    onclone?: (document: Document, element: HTMLElement) => void;
-    proxy?: string | null;
-    removeContainer?: boolean;
-    scale?: number;
-    useCORS?: boolean;
-    width?: number;
-    height?: number;
-    x?: number;
-    y?: number;
-    scrollX?: number;
-    scrollY?: number;
-    windowWidth?: number;
-    windowHeight?: number;
-    [key: string]: unknown;
-  }
-
-  function html2canvas(
-    element: HTMLElement,
-    options?: Partial<Html2CanvasOptions>,
-  ): Promise<HTMLCanvasElement>;
-
-  export default html2canvas;
 }

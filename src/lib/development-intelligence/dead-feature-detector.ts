@@ -5,7 +5,7 @@
  * that may be abandoned, deprecated, or have drifted from their specs.
  */
 
-const API_BASE = "http://localhost:9876";
+import { getApiBase } from "@/lib/runner-api";
 
 export interface FeatureHealth {
   page: string;
@@ -42,7 +42,7 @@ export interface FeatureHealthResult {
 }
 
 export async function analyzeFeatureHealth(projectPath: string): Promise<FeatureHealthResult> {
-  const response = await fetch(`${API_BASE}/development-intelligence/feature-health`, {
+  const response = await fetch(`${getApiBase()}/development-intelligence/feature-health`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ project_path: projectPath }),

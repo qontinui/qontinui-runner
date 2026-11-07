@@ -7,6 +7,7 @@
 
 import { Tag } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
+import { getApiBase } from "@/lib/runner-api";
 
 interface AnnotationGap {
   element_id: string;
@@ -29,7 +30,7 @@ export function AnnotationGapTable({ minInteractions = 10 }: AnnotationGapTableP
     queryKey: ["graph-analytics", "annotation-gaps", minInteractions],
     queryFn: async () => {
       const res = await fetch(
-        `http://localhost:9876/ui-bridge/analytics/annotation-gaps?min_interactions=${minInteractions}`,
+        `${getApiBase()}/ui-bridge/analytics/annotation-gaps?min_interactions=${minInteractions}`,
       );
       if (!res.ok) return [];
       const json = await res.json();

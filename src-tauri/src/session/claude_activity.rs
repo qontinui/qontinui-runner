@@ -25,9 +25,13 @@
 //!    `claude` routinely holds long-lived children — measured 2026-09-29 on
 //!    merytshost: 15 idle processes each holding a ~3-day-old
 //!    `coord-mcp-shim.py` stdio child, `shell` sessions holding 10-day
-//!    background `bash` loops. So `has_live_children == Some(true)` is only a
-//!    VETO on a pane-idle verdict, and `None` (uncomputable) cannot vouch for
-//!    one either.
+//!    background `bash` loops. Since 2026-10-04 `has_live_children` counts
+//!    only WORK children (`tracking_health::child_signals_work`): a stdio MCP
+//!    server started with the session no longer counts, so a pane holding
+//!    only that is decided `idle` here rather than falling through to the
+//!    record, while a background `bash` loop still does. `Some(true)` remains
+//!    only a VETO on a pane-idle verdict, and `None` (uncomputable) cannot
+//!    vouch for one either.
 //! 2. **Claude Code's own per-process record**
 //!    `<config-dir>/sessions/<pid>.json` (`status`, `statusUpdatedAt`,
 //!    `sessionId`, `cwd`, `procStart`, `startedAt`) — for every process the

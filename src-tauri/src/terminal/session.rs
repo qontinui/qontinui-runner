@@ -20,7 +20,7 @@ use crate::terminal::agent_status_sideband::ObservedAgentState;
 use tracing::{debug, info, warn};
 
 use super::exit_notice::{ExitNoticeSink, TauriExitSink};
-use super::grid::{Grid, GridPerformer};
+use super::grid::{Grid, GridPerformer, GridSnapshot};
 use super::interceptor::OutputInterceptor;
 use super::pane_io::{LocalPty, PaneIo, ScrubbedCommand};
 use super::types::{TerminalId, TerminalInfo};
@@ -172,16 +172,24 @@ fn tee_into_scrollback(
 /// The counter is bumped even when the grid lock is poisoned: an extra scan is
 /// always safe, a missed one is not.
 ///
+/// `stream_start` is the absolute stream offset of `data`'s first byte. The
+/// grid records how far it has absorbed the stream under the same lock as the
+/// parse, at the last point no escape sequence or UTF-8 character was open
+/// ([`Grid::absorb_stream`]), so a snapshot's `stream_offset` names bytes its
+/// cells fully reflect and a clean place for a fresh parser to resume.
+///
 /// Shared with the scan-gate regression test so both drive the identical path.
 fn advance_grid(
     grid: &Arc<Mutex<Grid>>,
     grid_generation: &Arc<AtomicU64>,
     parser: &mut vte::Parser,
     data: &[u8],
+    stream_start: u64,
 ) {
     if let Ok(mut g) = grid.lock() {
         let mut perf = GridPerformer::new(&mut g);
         parser.advance(&mut perf, data);
+        g.absorb_stream(stream_start, data);
     }
     // Release: pairs with the Acquire load in `TerminalSession::grid_generation`
     // so observing this value implies the grid mutation above is visible.
@@ -467,11 +475,19 @@ fn digest_is_owed(tier: VisibilityTier, unwatched_interval: Option<Duration>) ->
 /// accumulated frame once it reaches this size even if `?2026l` hasn't
 /// arrived, so a runaway/never-closed `?2026h` block can't buffer unbounded.
 const SYNC_FLUSH_BYTE_CAP: usize = 256 * 1024;
+/// Size of one PTY read on the reader thread. A coalesced frame can overshoot
+/// [`SYNC_FLUSH_BYTE_CAP`] by up to one read, so this sets the largest chunk the
+/// emission gate admits, and with it how far past [`FLOW_HIGH_WATERMARK`] the
+/// gap can be when the gate pauses.
+const PTY_READ_BYTES: usize = 8192;
 /// Time cap for a held sync frame: flush once the block has been open this
 /// long, so a slow producer mid-frame can't stall output past ~one frame.
-const SYNC_FLUSH_TIME_CAP: std::time::Duration = std::time::Duration::from_millis(50);
+pub(super) const SYNC_FLUSH_TIME_CAP: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// Synchronized-output (DEC 2026) frame coalescer for the reader thread.
+///
+/// `pub(super)` (with [`SYNC_FLUSH_TIME_CAP`]) so `daemon_pane_io`'s Phase 2b
+/// test can drive a restored holder stream through this exact pipeline.
 ///
 /// Full-screen TUIs (Claude Code) bracket each whole-frame redraw in
 /// `?2026h … ?2026l`. Emitting per-PTY-read would split a frame across
@@ -489,14 +505,14 @@ const SYNC_FLUSH_TIME_CAP: std::time::Duration = std::time::Duration::from_milli
 /// receives `(payload, offset)` to broadcast as one event; `offset` is the
 /// absolute stream offset of the payload's first byte (a correct replay
 /// boundary — the first held byte's offset for a coalesced frame).
-struct SyncFrameCoalescer {
+pub(super) struct SyncFrameCoalescer {
     pending: Vec<u8>,
     pending_offset: u64,
     started_at: Option<std::time::Instant>,
 }
 
 impl SyncFrameCoalescer {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             pending: Vec::new(),
             pending_offset: 0,
@@ -507,7 +523,13 @@ impl SyncFrameCoalescer {
     /// Feed one read's processed `data` (stamped at `offset`) plus the live
     /// `in_sync` parser state observed right after advancing it into the grid.
     /// Emits zero or one coalesced event via `emit`.
-    fn feed<F: FnMut(&[u8], u64)>(&mut self, data: &[u8], offset: u64, in_sync: bool, mut emit: F) {
+    pub(super) fn feed<F: FnMut(&[u8], u64)>(
+        &mut self,
+        data: &[u8],
+        offset: u64,
+        in_sync: bool,
+        mut emit: F,
+    ) {
         if in_sync {
             // Mid-frame: hold this chunk. Stamp the held frame's offset on the
             // FIRST held byte (a correct replay boundary).
@@ -539,7 +561,7 @@ impl SyncFrameCoalescer {
     /// Flush a held frame if it has been open at least [`SYNC_FLUSH_TIME_CAP`].
     /// Called before each (blocking) read so a slow producer mid-frame still
     /// flushes within ~one frame rather than waiting for the next byte.
-    fn flush_if_timed_out<F: FnMut(&[u8], u64)>(&mut self, mut emit: F) {
+    pub(super) fn flush_if_timed_out<F: FnMut(&[u8], u64)>(&mut self, mut emit: F) {
         if let Some(started) = self.started_at {
             if started.elapsed() >= SYNC_FLUSH_TIME_CAP && !self.pending.is_empty() {
                 emit(&self.pending, self.pending_offset);
@@ -585,7 +607,7 @@ pub(super) struct TerminalOutputWire<'a> {
 /// every webview emission for a session goes through one place with one wire
 /// shape. `encoded` is already base64; `offset` is the absolute stream offset
 /// of its first byte.
-fn emit_terminal_output(app: &AppHandle, terminal_id: &str, encoded: &str, offset: u64) {
+fn emit_terminal_output(app: &AppHandle, terminal_id: &str, encoded: &str, offset: u64) -> bool {
     let event = TerminalOutputWire {
         terminal_id,
         data: encoded,
@@ -594,13 +616,50 @@ fn emit_terminal_output(app: &AppHandle, terminal_id: &str, encoded: &str, offse
     let started = Instant::now();
     let emitted = app.emit("terminal-output", &event);
     transport_stats::record_webview_emit(encoded, started.elapsed());
-    if let Err(e) = emitted {
-        warn!(
-            terminal_id = %terminal_id,
-            error = %e,
-            "Failed to emit terminal output event"
-        );
+    match emitted {
+        Ok(()) => true,
+        Err(e) => {
+            warn!(
+                terminal_id = %terminal_id,
+                error = %e,
+                "Failed to emit terminal output event"
+            );
+            false
+        }
     }
+}
+
+/// Count `len` bytes into `bytes_sent`, THEN emit them.
+///
+/// The order is load-bearing. [`TerminalSession::ack`] clamps acked at sent,
+/// so an ack for these bytes that landed before the count would be discarded:
+/// an under-ack, which can keep a paused gate shut. Counting first means every
+/// byte a frontend can ack is counted by the time its ack lands. (Release
+/// pairs with the Acquire loads in `ack`.)
+///
+/// An emit that fails delivered nothing, so nothing will ever ack it: the
+/// bytes are un-counted ([`uncount`]).
+fn count_then_emit(
+    bytes_sent: &AtomicU64,
+    bytes_acked: &AtomicU64,
+    len: u64,
+    emit: impl FnOnce() -> bool,
+) {
+    bytes_sent.fetch_add(len, Ordering::Release);
+    if !emit() {
+        uncount(bytes_sent, bytes_acked, len);
+    }
+}
+
+/// Take back `len` bytes counted for an emit that failed. acked is pulled down
+/// to the new sent in case a reset already covered them, so no surplus is
+/// left. The reader thread is the only writer of `bytes_sent`, so the value it
+/// reads back is current. A reset or an ack that straddles this (it read
+/// `sent` before the subtraction, and raises acked after) re-clamps on its own
+/// side: [`TerminalSession::reset_flow_control`], [`TerminalSession::ack`].
+fn uncount(bytes_sent: &AtomicU64, bytes_acked: &AtomicU64, len: u64) {
+    let sent = bytes_sent.fetch_sub(len, Ordering::AcqRel) - len;
+    bytes_acked.fetch_min(sent, Ordering::AcqRel);
 }
 
 /// ANSI bracketed-paste begin marker.
@@ -1356,6 +1415,10 @@ struct IdentitySeamOutcome {
     /// bounded [`crate::served_corpus::probe`] so the zero-I/O briefing render
     /// right after the seam can carry its `[served-corpus: …]` header line.
     served: crate::served_corpus::ServedCorpus,
+    /// The `--settings` carrier the seam materialized and exported as
+    /// `QONTINUI_CLAUDE_HOOK_SETTINGS`, or `None` when materialization failed.
+    /// Feeds [`TerminalSession::permission_request_hook`] for the shim path.
+    hook_carrier: Option<std::path::PathBuf>,
 }
 
 /// What the waiter thread knows when a pane's process exits, handed to the
@@ -1500,6 +1563,19 @@ pub struct TerminalSession {
     /// tab's `spawnName` (shared `TerminalInfo` is schema-owned and carries no
     /// such field, so it travels beside it like `sessionIdsByTerminal`).
     spawn_name: std::sync::OnceLock<String>,
+    /// Whether this terminal was handed a carrier that registers the
+    /// `PermissionRequest` hook (plan
+    /// `2026-10-23-runner-sessions-stop-at-permission-dialogs-so-accept-them-by-default-with-a-tenant-switch`
+    /// D7), served beside `TerminalInfo` on `GET /terminals` as
+    /// `permissionRequestHook`. Set once, by [`Self::spawn`]; unset (an adopted
+    /// holder pane, a remote mirror, a test fixture) reads `absent`.
+    permission_request_hook:
+        std::sync::OnceLock<crate::session::claude_hook::PermissionRequestHook>,
+    /// The per-spawn nonce this terminal's child carries as
+    /// `QONTINUI_PERMREQ_NONCE`, once [`Self::spawn`] registered it as the
+    /// terminal's grant (`session::permission_accept`). `Drop` forgets the
+    /// grant only while it is still this nonce's.
+    permission_request_nonce: std::sync::OnceLock<String>,
     /// R1 (session-lifecycle-cleanup) — best-effort hook invoked by the
     /// waiter thread the instant the backing PTY process exits. Wired by
     /// `terminal_create` alongside [`Self::set_coord_session_id`]: it
@@ -1511,7 +1587,7 @@ pub struct TerminalSession {
     /// slot so the already-spawned waiter thread can read it once the
     /// registration completes; cloned into the waiter at spawn time.
     /// Idempotent against the frontend `terminal_close` path because
-    /// `SessionRegistry::close` is itself idempotent.
+    /// `SessionRegistry::close_by_id` is itself idempotent.
     /// Widened from `Fn(uuid::Uuid)` to also carry the exit code (plan
     /// `2026-08-27-operator-touch-observation-runner-emitter` §2b/§2c,
     /// Phase B2): the coord-close callback still receives the coord session
@@ -1631,14 +1707,14 @@ impl TerminalSession {
         )?;
 
         // The pane's backend: in-process `LocalPty`, or — behind
-        // `terminal.pty_holder`, default OFF — an out-of-process PTY holder
+        // `terminal.pty_holder`, default ON on Linux since Phase 5 — an out-of-process PTY holder
         // (plan `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`
         // Phase 2). Read once per spawn. A local PTY is opened HERE, before the
         // environment is assembled, so an `openpty` failure leaves none of
         // that side-effecting work behind; a holder pane has no PTY in this
         // process to open.
         //
-        // Cost on the OFF path (review round 2, N10): `get_terminal_settings`
+        // Cost of the read (review round 2, N10): `get_terminal_settings`
         // is `read_settings_from_disk`, the mtime-keyed in-process settings
         // cache — one `stat` and a clone on a hit, no file read or parse. That
         // is the same per-spawn price this function already pays for
@@ -1659,6 +1735,10 @@ impl TerminalSession {
         // IS the shell is kept: only a shell pane gets a composed spawn-prompt
         // file below — a direct exec's argv already settled its own carrier.
         let is_shell_pane = command.as_ref().is_none_or(|parts| parts.is_empty());
+        // The argv's own `--settings`, if any, is half of what this terminal
+        // reports as `permissionRequestHook` (plan 2026-10-23 D7); the seam's
+        // carrier below is the other half. Kept before `command` is consumed.
+        let spawn_argv: Vec<String> = command.clone().unwrap_or_default();
         let mut cmd = Self::build_command_from(command);
 
         // Set working directory
@@ -1670,6 +1750,12 @@ impl TerminalSession {
             working_dir.clone()
         };
         cmd.cwd(&cwd);
+        // Start the served-corpus measurement NOW and join it inside the
+        // identity seam, so it overlaps the seam's other work (plan
+        // `2026-10-19-served-corpus-probe-budget-excludes-process-creation`,
+        // Phase 5). Nothing between here and the join writes `<cwd>/.claude/`
+        // or the provision ledger the probe reads.
+        let served_probe = crate::served_corpus::probe_start(std::path::Path::new(&cwd), Some(&id));
 
         // The terminal-invariant half of the child env: markers, TERM, the
         // runner port + briefing, and the non-interactive git posture. Extracted
@@ -1700,6 +1786,21 @@ impl TerminalSession {
                 cmd.env(k, v);
             }
         }
+        // Permission auto-accept (plan
+        // `2026-10-23-runner-sessions-stop-at-permission-dialogs-so-accept-them-by-default-with-a-tenant-switch`):
+        // two per-spawn secrets for the carrier's PermissionRequest hook: the
+        // request key it SENDS to the runner's pad, and the nonce the pad must
+        // ECHO before the hook answers a dialog (the key is derived one-way
+        // from the nonce, so whoever receives a request cannot forge the echo).
+        // Set AFTER the caller's env so neither a caller nor an inherited copy
+        // (a runner started inside a runner session) can plant a known value.
+        // Recorded as this terminal's grant once the child is up, below.
+        let permreq_nonce = crate::session::permission_accept::new_nonce();
+        cmd.env(crate::session::permission_accept::NONCE_ENV, &permreq_nonce);
+        cmd.env(
+            crate::session::permission_accept::REQUEST_KEY_ENV,
+            crate::session::permission_accept::request_key_for(&permreq_nonce),
+        );
 
         // Resolve the EFFECTIVE Claude config dir that is (or is about to be)
         // placed into the PTY env — the caller pin wins, else the credential-
@@ -1751,9 +1852,14 @@ impl TerminalSession {
                 &page_id,
                 effective_claude_config_dir.clone(),
                 spawn_tenant,
+                served_probe,
             )
         }?;
         let pinned_session_id = seam.pinned_session_id;
+        let permission_request_hook = crate::session::claude_hook::permission_request_hook_for(
+            Some(&spawn_argv),
+            seam.hook_carrier.as_deref(),
+        );
 
         // ---- The canonical runner-context briefing --------------------------
         // Rendered HERE, immediately after the identity seam, and NOT in
@@ -1833,7 +1939,7 @@ impl TerminalSession {
             )?,
         };
 
-        Self::spawn_with_io(
+        let session = Self::spawn_with_io(
             id,
             title,
             cwd,
@@ -1844,7 +1950,13 @@ impl TerminalSession {
             interceptor,
             io,
             pinned_session_id,
-        )
+        )?;
+        // Only THIS path records it: an adopted holder pane or a remote mirror
+        // is built by `spawn_with_io` alone and reads `absent` — and holds no
+        // grant, so the pad never answers its prompts.
+        session.set_permission_request_hook(permission_request_hook);
+        session.record_permission_request_grant(permreq_nonce, spawn_tenant);
+        Ok(session)
     }
 
     /// Build a live session around an already-constructed [`PaneIo`].
@@ -1899,7 +2011,15 @@ impl TerminalSession {
         }
 
         // Get the input writer from the pane
-        let writer = Arc::new(Mutex::new(io.writer()?));
+        // A failure from here on would leave the spawned child behind a pane
+        // nothing owns, so every early return ends it (`abandon_pane`).
+        let writer = Arc::new(Mutex::new(io.writer().map_err(|e| {
+            abandon_pane(
+                io.as_ref(),
+                &id,
+                format!("Failed to open the pane's writer: {e}"),
+            )
+        })?));
 
         let is_alive = Arc::new(AtomicBool::new(true));
         let exit_code: Arc<Mutex<Option<i32>>> = Arc::new(Mutex::new(None));
@@ -1929,7 +2049,13 @@ impl TerminalSession {
             .unwrap_or_default()
             .as_millis() as u64;
         // Get an output reader from the pane
-        let mut reader = io.reader()?;
+        let mut reader = io.reader().map_err(|e| {
+            abandon_pane(
+                io.as_ref(),
+                &id,
+                format!("Failed to open the pane's reader: {e}"),
+            )
+        })?;
 
         // Coord mirror identity, populated by `terminal_create` after
         // `register_external` returns. Declared HERE (ahead of the reader
@@ -1972,7 +2098,7 @@ impl TerminalSession {
             .name(format!("terminal-reader-{}", &id))
             .spawn(move || {
                 let mut parser = vte::Parser::new();
-                let mut buf = [0u8; 8192];
+                let mut buf = [0u8; PTY_READ_BYTES];
                 // Phase 4 — sync-output (DEC 2026) frame coalescing. While the
                 // VT parser is inside a `?2026h … ?2026l` block (Claude's TUI
                 // brackets each full-frame redraw this way), accumulate the
@@ -2142,14 +2268,19 @@ impl TerminalSession {
                                 );
                             }
                             let encoded = encoded.expect("Now always encodes");
-                            emit_terminal_output(&reader_app, &reader_id, &encoded, offset);
                             // Flow control accounts only for bytes delivered
                             // under the gate — i.e. the `focused` tier and the
                             // exit flush. Counting held/hidden bytes would let
                             // the gap balloon while nobody can ack, so the pane
                             // would find the gate already paused on its way
                             // back to `focused`.
-                            reader_bytes_sent.fetch_add(payload.len() as u64, Ordering::Relaxed);
+                            // Counted BEFORE the emit; see `count_then_emit`.
+                            count_then_emit(
+                                &reader_bytes_sent,
+                                &reader_bytes_acked,
+                                payload.len() as u64,
+                                || emit_terminal_output(&reader_app, &reader_id, &encoded, offset),
+                            );
                         }
                         WebviewAdmission::Skip => unreachable!("returned above"),
                     }
@@ -2211,6 +2342,7 @@ impl TerminalSession {
                                 &reader_grid_generation,
                                 &mut parser,
                                 &data,
+                                chunk_offset,
                             );
 
                             // Sync-output-aware emit (Phase 4). Read the live
@@ -2304,7 +2436,7 @@ impl TerminalSession {
                 }
                 debug!(terminal_id = %reader_id, "Reader thread exiting");
             })
-            .map_err(|e| format!("Failed to spawn reader thread: {}", e))?;
+            .map_err(|e| abandon_pane(io.as_ref(), &id, format!("Failed to spawn reader thread: {e}")))?;
 
         // R1 — shared slots the waiter thread reads on PTY exit so it can
         // close the coord session mirror immediately (vs. leaving it for
@@ -2433,7 +2565,7 @@ impl TerminalSession {
                     );
                 }
             })
-            .map_err(|e| format!("Failed to spawn waiter thread: {}", e))?;
+            .map_err(|e| abandon_pane(io.as_ref(), &id, format!("Failed to spawn waiter thread: {e}")))?;
 
         Ok(Self {
             id,
@@ -2465,6 +2597,8 @@ impl TerminalSession {
             grid,
             coord_session_id,
             spawn_name: std::sync::OnceLock::new(),
+            permission_request_hook: std::sync::OnceLock::new(),
+            permission_request_nonce: std::sync::OnceLock::new(),
             agent_status_last,
             grid_idle_tracker: Mutex::new(qontinui_runner_lib::wind_down::GridIdleTracker::new()),
             on_exit,
@@ -3249,6 +3383,9 @@ impl TerminalSession {
         config_dir: Option<String>,
         // The caller's chosen tenant, BEFORE the kill switch — resolved below.
         spawn_tenant: Option<uuid::Uuid>,
+        // The served-corpus measurement, started before this seam so it runs
+        // alongside it; joined below.
+        served_probe: crate::served_corpus::ProbeHandle,
     ) -> Result<IdentitySeamOutcome, String> {
         use crate::install_effects_producer::intercept::shim_materializer;
         use tauri::Manager;
@@ -3280,7 +3417,7 @@ impl TerminalSession {
                 .entered();
         let hook_result = crate::session::claude_hook::materialize(&hook_dir);
         drop(hook_span);
-        match hook_result {
+        match &hook_result {
             Some(settings_path) => {
                 cmd.env(
                     crate::session::claude_hook::CLAUDE_SETTINGS_ENV,
@@ -3427,6 +3564,7 @@ impl TerminalSession {
                 page_id.to_string(),
                 0,
                 crate::session::session_lifecycle_store::DEFAULT_PROVIDER.to_string(),
+                None,
             );
             info!(
                 terminal_id = %terminal_id,
@@ -3435,20 +3573,25 @@ impl TerminalSession {
             );
         }
 
-        // The served-corpus measurement for the briefing's header line. Bounded
-        // (`served_corpus::PROBE_BUDGET` for the whole probe, however many git spawns)
-        // and fail-soft: every failure is an `UNKNOWN (<reason>)` token.
+        // The served-corpus measurement for the briefing's header line,
+        // started before this seam and joined here. The join returns within
+        // `PROBE_BUDGET + PROBE_COLLECT_GRACE` of the START whatever process
+        // creation costs (a git that could not start in time reads
+        // `UNKNOWN(timed-out)`; one that started late is killed, never waited
+        // on), and is fail-soft: every failure is an `UNKNOWN (<reason>)` token.
+        // The span covers the JOIN: what the operator still waits for.
         let served = {
             let _span =
                 tracing::debug_span!("terminal_spawn.served_corpus_probe", terminal_id = %terminal_id)
                     .entered();
-            crate::served_corpus::probe(std::path::Path::new(cwd))
+            served_probe.join()
         };
 
         Ok(IdentitySeamOutcome {
             pinned_session_id: pinned,
             coord_mcp,
             served,
+            hook_carrier: hook_result,
         })
     }
 
@@ -3927,7 +4070,42 @@ impl TerminalSession {
     /// offset-gap detection treats it like any other jump and resyncs from
     /// the scrollback ring.
     pub fn ack(&self, bytes: u64) {
-        self.bytes_acked.fetch_add(bytes, Ordering::Relaxed);
+        self.ack_around(bytes, || {});
+    }
+
+    /// [`Self::ack`], running `between` once, after the clamp has read `sent`
+    /// and before the CAS that raises acked. Production passes a no-op; the
+    /// test passes the un-count this has to survive.
+    fn ack_around(&self, bytes: u64, between: impl FnOnce()) {
+        // Clamped: acked never passes sent. Bytes sent before a reset are
+        // covered by it (`reset_flow_control` sets acked = sent), so their late
+        // acks, and acks for a background window that was never counted, are
+        // excess. Dropping the excess here is what keeps a surplus from ever
+        // existing, so it cannot carry into the next burst or the next reset.
+        //
+        // It never drops an ack the gate needs: the reader counts a chunk into
+        // `bytes_sent` before emitting it, so every byte a frontend can ack is
+        // already counted when its ack lands. See `reset_flow_control`.
+        let mut between = Some(between);
+        let _ = self
+            .bytes_acked
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |acked| {
+                let sent = self.bytes_sent.load(Ordering::Acquire);
+                if let Some(between) = between.take() {
+                    between();
+                }
+                Some(acked.saturating_add(bytes).min(sent).max(acked))
+            });
+        // Then re-clamp to the CURRENT sent, as `reset_flow_control` does: a
+        // failed emit can be un-counted (`uncount`) after the clamp above read
+        // `sent` and before its CAS landed. `uncount`'s own `fetch_min` ran
+        // before that CAS, so without this acked could end up past sent by up
+        // to one frame.
+        let _ = self
+            .bytes_acked
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |acked| {
+                Some(acked.min(self.bytes_sent.load(Ordering::Acquire)))
+            });
         let sent = self.bytes_sent.load(Ordering::Relaxed);
         let acked = self.bytes_acked.load(Ordering::Relaxed);
         if sent.saturating_sub(acked) <= FLOW_LOW_WATERMARK {
@@ -4244,17 +4422,113 @@ impl TerminalSession {
         (data, start_offset)
     }
 
+    /// Snapshot the cell grid; with `reset_flow`, reset flow control first
+    /// (`terminal_get_grid`'s `resetFlowControl`).
+    ///
+    /// The reconnect path asks for this only once its `terminal-output`
+    /// listener exists in the runner (it awaits the Tauri `listen()` before the
+    /// call). That is the condition that matters: every byte counted after this
+    /// reset is emitted after it (the reader counts before it emits), so it
+    /// reaches that listener and is acked; every byte counted before it is
+    /// covered by it. The reset at the reconnect's mount ring read could not
+    /// promise that, because no listener existed yet: a frame tee'd into the
+    /// ring before that reset but counted after it went to nobody, and nothing
+    /// acked it.
+    ///
+    /// The reset needs no grid lock (only the listener ordering above), so it
+    /// runs before the lock is taken: it can reach a remote pane's source
+    /// (`set_gate_paused`), which must not happen under the grid lock.
+    ///
+    /// Known limitations of a painted reconnect: the paint restores the SCREEN
+    /// as of the snapshot. Lines that scrolled off it between the mount ring
+    /// read and the snapshot are in neither the ring the pane replayed nor the
+    /// paint, so the pane's scrollback has a hole there until it remounts. And
+    /// when the snapshot offset S is behind the mount ring's end E, the pane
+    /// replays [S, E) after the paint, so those bytes may appear twice in its
+    /// scrollback (once from the ring, once from the replay).
+    pub fn grid_snapshot(&self, reset_flow: bool) -> Result<GridSnapshot, String> {
+        if reset_flow {
+            self.reset_flow_control();
+        }
+        let g = self
+            .grid
+            .lock()
+            .map_err(|e| format!("Grid lock poisoned: {}", e))?;
+        Ok(g.snapshot())
+    }
+
     /// Reset flow control counters so a reconnecting frontend doesn't hit backpressure.
     ///
-    /// Over-ack tolerance: render callbacks for writes issued BEFORE this
-    /// reset may still ack afterwards, briefly pushing `bytes_acked` above
-    /// `bytes_sent`. The gate computes the gap with `saturating_sub`, so the
-    /// skew reads as gap 0 — a bounded, one-shot blind margin (at most the
-    /// pre-reset in-flight bytes) before backpressure re-engages. This is
-    /// intentional; do not "fix" the saturating_sub.
+    /// # Acks that arrive after a reset
+    ///
+    /// The frontend acks every byte it RECEIVES, once (`ackedWriteQueue.ts`).
+    /// Some of those acks are for bytes the runner has already written off, and
+    /// are excess:
+    ///
+    /// - bytes sent before a reset and acked after it: a write whose render
+    ///   callback was still pending, a chunk the pane buffered during mount or
+    ///   held during a resync;
+    /// - an uncounted background hold window, drained on the tier edge ahead of
+    ///   a counted send (`WebviewAdmission::Now`) or flushed by the visibility
+    ///   sweeper, which a now-visible pane writes and acks;
+    /// - settled-without-write acks for any of the above, and the reconnect
+    ///   path's held chunks that its grid paint already shows.
+    ///
+    /// [`Self::ack`] clamps `bytes_acked` at `bytes_sent`, which discards the
+    /// excess as it lands, so a surplus (acked > sent) never exists. It cannot
+    /// weaken backpressure for the next burst, and it cannot carry across
+    /// resets and compound. What excess can still do is land on bytes sent
+    /// AFTER the reset that the pane has not acked yet, so the gap reads low
+    /// for a while. That is bounded by the excess the pane can send for one
+    /// reset: what it held unacked when the reset ran (at most the gap then,
+    /// `FLOW_HIGH_WATERMARK` plus one emitted chunk, since the gate stops
+    /// counting above High) plus at most one background hold window
+    /// (`BACKGROUND_HOLD_BYTE_CAP` plus the chunk that tripped it) per tier
+    /// edge. It ends at the next reset (acked = sent) or once the pane's own
+    /// acks for those bytes are clamped away. That costs a delay before
+    /// backpressure engages, never a frozen pane, PROVIDED every counted byte
+    /// is acked once after it is counted. An under-ack is the dangerous
+    /// direction: an unacked remainder above [`FLOW_LOW_WATERMARK`] keeps a
+    /// paused gate shut forever. Four ways to break that proviso are closed:
+    ///
+    /// - an ack landing before its bytes are counted: the reader counts first
+    ///   (`count_then_emit`), and un-counts an emit that failed;
+    /// - a reset erasing a concurrent ack: this raises acked with `fetch_max`
+    ///   rather than storing over it;
+    /// - bytes counted after a reset and emitted to no handler: the reconnect
+    ///   path resets at the grid snapshot, once its `terminal-output` listener
+    ///   exists in the runner, not at its earlier ring read
+    ///   ([`Self::grid_snapshot`]);
+    /// - a reset or an ack straddling a failed emit's un-count, which could
+    ///   leave acked above sent: each re-clamps acked to the current sent.
+    ///
+    /// `flow_reset_and_ack_clamp_keep_acked_at_or_under_sent` pins this
+    /// against the real gate and coalescer.
     pub fn reset_flow_control(&self) {
-        let sent = self.bytes_sent.load(Ordering::Relaxed);
-        self.bytes_acked.store(sent, Ordering::Relaxed);
+        self.reset_flow_control_around(|| {});
+    }
+
+    /// [`Self::reset_flow_control`], running `between` after `sent` is read and
+    /// before acked is raised to it. Production passes a no-op; the test passes
+    /// the concurrent send and ack this has to survive.
+    fn reset_flow_control_around(&self, between: impl FnOnce()) {
+        let sent = self.bytes_sent.load(Ordering::Acquire);
+        between();
+        // `fetch_max`, not `store`: an ack that landed after the load can have
+        // raised acked past this `sent` (for bytes counted since), and a store
+        // would erase it, an under-ack of up to one frame.
+        self.bytes_acked.fetch_max(sent, Ordering::AcqRel);
+        // Then re-clamp to the CURRENT sent: a failed emit un-counted since the
+        // load (`uncount`) can have dropped sent below the value just raised
+        // to, which would leave a surplus. `fetch_update` retries if an ack
+        // moves acked meanwhile, and it reads sent after acked, so a byte an
+        // ack already covered is counted in the sent it reads (the reader
+        // counts before it emits): it never lowers acked below a real ack.
+        let _ = self
+            .bytes_acked
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |acked| {
+                Some(acked.min(self.bytes_sent.load(Ordering::Acquire)))
+            });
         // A reset supersedes any pending resume-marker: the resetting
         // consumer refetches the ring, which already covers the skipped
         // bytes.
@@ -4285,6 +4559,36 @@ impl TerminalSession {
     /// The `claude --name` this session was spawned with, if any.
     pub fn spawn_name(&self) -> Option<String> {
         self.spawn_name.get().cloned()
+    }
+
+    /// Record what [`Self::spawn`] handed this terminal (first write wins).
+    pub fn set_permission_request_hook(
+        &self,
+        hook: crate::session::claude_hook::PermissionRequestHook,
+    ) {
+        let _ = self.permission_request_hook.set(hook);
+    }
+
+    /// Register this terminal's permission auto-accept grant: the nonce its
+    /// child env carries and the tenant it was spawned for (`None` when the
+    /// caller named none). First write wins.
+    fn record_permission_request_grant(&self, nonce: String, spawn_tenant: Option<uuid::Uuid>) {
+        if self.permission_request_nonce.set(nonce.clone()).is_ok() {
+            crate::session::permission_accept::register_terminal_grant(
+                &self.id,
+                nonce,
+                spawn_tenant,
+            );
+        }
+    }
+
+    /// `GET /terminals` `permissionRequestHook`: `Absent` unless
+    /// [`Self::spawn`] recorded a current carrier.
+    pub fn permission_request_hook(&self) -> crate::session::claude_hook::PermissionRequestHook {
+        self.permission_request_hook
+            .get()
+            .copied()
+            .unwrap_or(crate::session::claude_hook::PermissionRequestHook::Absent)
     }
 
     /// Read the coord-native session id, if one has been wired.
@@ -4380,6 +4684,29 @@ impl TerminalSession {
             .lock()
             .ok()
             .and_then(|mut slot| slot.take())
+    }
+
+    /// Every worktree the parked `IsolatedEditContext` materialized — empty
+    /// when none is parked. Read by the wind-down executor's custody gate,
+    /// which must judge every worktree this session could have edited.
+    ///
+    /// `Err` on a poisoned slot: "could not read the context" must stay
+    /// distinguishable from "no context is parked", because the custody gate
+    /// reads the second as "nothing more to check".
+    pub fn isolated_edit_worktree_paths(&self) -> Result<Vec<std::path::PathBuf>, String> {
+        let slot = self
+            .isolated_edit_ctx
+            .lock()
+            .map_err(|e| format!("isolated-edit context lock poisoned: {e}"))?;
+        Ok(slot
+            .as_ref()
+            .map(|ctx| {
+                ctx.worktrees
+                    .iter()
+                    .map(|w| w.worktree_path.clone())
+                    .collect()
+            })
+            .unwrap_or_default())
     }
 
     /// Every owner-token session id a worktree claim held BY this terminal can
@@ -4541,10 +4868,15 @@ impl TerminalSession {
     /// protocol. Crate code reaches this through `TerminalManager::graceful_exit`,
     /// the one public entry point, whose close also drops the pane from the
     /// manager and skips the kill when the pane's process already exited.
+    ///
+    /// `authority` is the caller's close authority, checked once the probe has
+    /// found a live `claude` and before any byte is typed. See
+    /// [`crate::terminal::close_authority`].
     pub(super) async fn graceful_exit_then<C, CF>(
         &self,
         deadline: std::time::Duration,
         close_tab: C,
+        authority: Option<crate::terminal::close_authority::CloseAuthority>,
     ) -> crate::terminal::graceful_exit::GracefulExitOutcome
     where
         C: FnOnce() -> CF,
@@ -4555,6 +4887,7 @@ impl TerminalSession {
             crate::terminal::graceful_exit::ExitTiming::with_deadline(deadline),
             move |tracked| crate::terminal::graceful_exit::probe_claude_under(root, tracked),
             close_tab,
+            authority,
         )
         .await
     }
@@ -4566,6 +4899,7 @@ impl TerminalSession {
         timing: crate::terminal::graceful_exit::ExitTiming,
         probe: P,
         close_tab: C,
+        authority: Option<crate::terminal::close_authority::CloseAuthority>,
     ) -> crate::terminal::graceful_exit::GracefulExitOutcome
     where
         P: FnMut(Vec<crate::terminal::graceful_exit::ProcIdentity>) -> PF,
@@ -4573,22 +4907,32 @@ impl TerminalSession {
         C: FnOnce() -> CF,
         CF: std::future::Future<Output = crate::terminal::graceful_exit::CloseTabResult>,
     {
-        use crate::terminal::graceful_exit::{drive, GracefulExitOutcome};
+        use crate::terminal::graceful_exit::{drive_graceful_exit, GracefulExitOutcome};
 
         info!(
             terminal_id = %self.id,
             deadline_s = timing.deadline.as_secs(),
+            authority = authority.is_some(),
             "graceful_exit: starting"
         );
-        let outcome = drive(
+        let outcome = drive_graceful_exit(
             |bytes| self.write(bytes, PtyWriteCaller::GracefulExit),
             || self.grid_screen(),
             probe,
             close_tab,
             timing,
+            authority,
         )
         .await;
         match &outcome {
+            GracefulExitOutcome::NoCloseAuthority { claude_pids } => warn!(
+                terminal_id = %self.id,
+                pids = ?claude_pids,
+                outcome = outcome.word(),
+                "graceful_exit: refused no_close_authority — a live claude is in the pane and \
+                 the caller presented no CloseAuthority (none can be minted before the \
+                 lifecycle Closer); nothing typed, nothing closed"
+            ),
             GracefulExitOutcome::ExitStuck { claude_pids, .. } => warn!(
                 terminal_id = %self.id,
                 pids = ?claude_pids,
@@ -4643,6 +4987,13 @@ impl TerminalSession {
         self.exit_snapshot.lock().ok().and_then(|s| *s)
     }
 
+    /// Test seam: flip the liveness flag of a PTY-less fixture. Set it back to
+    /// `false` before the session drops, or `Drop` runs `close()`.
+    #[cfg(test)]
+    pub(crate) fn set_alive_for_test(&self, alive: bool) {
+        self.is_alive.store(alive, Ordering::Relaxed);
+    }
+
     /// The shell process's exit code, once the waiter thread has recorded one.
     ///
     /// `None` means either "still running" or "exited but the wait itself
@@ -4657,7 +5008,14 @@ impl TerminalSession {
     /// closing one pane): the joins are already individually capped at 2 s each
     /// and there is no competing work. The app-shutdown path uses
     /// [`Self::close_with_deadline`] instead.
-    pub fn close(&self) {
+    ///
+    /// `pub(super)`, like every session-level close entry point: only
+    /// `crate::terminal` may call one. Everything else closes a pane through
+    /// `TerminalManager`, which is where the close-site roster
+    /// (`runner_close_sites.txt`) finds and classes every caller. A
+    /// session-level call from outside `terminal/` would be a close the
+    /// roster's scan of `terminal/` cannot see, so it does not compile.
+    pub(super) fn close(&self) {
         self.close_with_deadline(None);
     }
 
@@ -4673,7 +5031,9 @@ impl TerminalSession {
     /// - each thread join gets `min(2s, remaining)`;
     /// - once nothing is left, the joins and the shim-dir sweep are skipped
     ///   (the PTY child is already dead by then — that part always runs).
-    pub fn close_with_deadline(&self, deadline: Option<std::time::Instant>) {
+    ///
+    /// `pub(super)` — see [`Self::close`].
+    pub(super) fn close_with_deadline(&self, deadline: Option<std::time::Instant>) {
         self.close_inner(deadline, true);
     }
 
@@ -4854,7 +5214,9 @@ impl TerminalSession {
     /// past process exit, so it is the only step kept; the thread joins, the
     /// PTY-handle drop and the shim sweep are all reclaimed by the imminent
     /// `process::exit` or by the next boot's stale sweep.
-    pub fn close_kill_only(&self) {
+    ///
+    /// `pub(super)` — see [`Self::close`].
+    pub(super) fn close_kill_only(&self) {
         warn!(
             terminal_id = %self.id,
             "Shutdown deadline exhausted — kill-only terminal teardown"
@@ -4866,6 +5228,28 @@ impl TerminalSession {
             warn!(terminal_id = %self.id, pid = ?self.child_pid, "kill-only {e}");
         }
     }
+}
+
+/// `spawn_with_io` failed after the pane was built (pty_holder review
+/// follow-up L2): its writer or reader could not be opened, or a thread could
+/// not be spawned. When the WAITER thread fails to spawn, the already-running
+/// reader thread holds the pane — through the `WireFlow` and its reader — and
+/// blocks until the pane's output ends, so the pane is never dropped and no
+/// `Drop` ever runs: the child would outlive a spawn that reported failure,
+/// with no session to close it. When the READER thread fails to spawn the pane
+/// is dropped on return, but a `LocalPty` has no kill on drop. Either way, end
+/// it here — kill, then release, which ends the reader's stream so a running
+/// reader thread exits — and return `reason` as the spawn's error. (A holder
+/// pane's own `Drop` then sees it released and does not kill again.)
+fn abandon_pane(io: &dyn PaneIo, id: &TerminalId, reason: String) -> String {
+    warn!(terminal_id = %id, pid = ?io.pid(), "{reason} — ending the pane rather than orphaning it");
+    if let Err(e) = io.kill(TASKKILL_TIMEOUT) {
+        warn!(terminal_id = %id, error = %e, "abandoned pane: kill failed");
+    }
+    if let Err(e) = io.release(lock_acquire_budget(None)) {
+        warn!(terminal_id = %id, error = %e, "abandoned pane: release reported an error");
+    }
+    reason
 }
 
 /// Called by the waiter once the child has exited: clears `is_alive` and
@@ -4895,10 +5279,12 @@ fn on_exit_hook_code(code: Option<i32>, runner_initiated: bool) -> Option<i32> {
 /// Default per-thread join cap on the interactive close path.
 const JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Default cap on the shutdown `taskkill` subprocess.
+/// Default cap on the pane-tree kill. On Windows that is an in-process walk
+/// (`qontinui_runner_win32::process_tree`), not a `taskkill` subprocess; the
+/// constant's name predates that change.
 const TASKKILL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Floor under the `taskkill` cap. Every other step may be squeezed to nothing
+/// Floor under the kill cap. Every other step may be squeezed to nothing
 /// by an exhausted shutdown budget; the kill may not, because skipping it leaks
 /// a process tree that outlives the runner.
 const KILL_FLOOR: std::time::Duration = std::time::Duration::from_millis(500);
@@ -4998,6 +5384,9 @@ impl Drop for TerminalSession {
     fn drop(&mut self) {
         if self.is_alive.load(Ordering::Relaxed) {
             self.close();
+        }
+        if let Some(nonce) = self.permission_request_nonce.get() {
+            crate::session::permission_accept::forget_terminal_grant(&self.id, nonce);
         }
     }
 }
@@ -5109,6 +5498,13 @@ pub(crate) mod tests {
     /// `Environment` read).
     #[test]
     fn pty_finalize_child_env_scrubs_credential_values() {
+        // The scrub applies the LIVE model-gateway plan, which reads the
+        // runner config dir. A sibling test's `IsolatedAmbient` rewrites the
+        // process env (on Windows, `USERPROFILE` too, which can make the
+        // platform config dir unresolvable mid-test); an unresolvable dir is
+        // an unresolved gateway that pins `CLAUDE_CONFIG_DIR` away. Hold the
+        // fixture so this test reads a known, gateway-free config dir.
+        let _amb = crate::test_env::isolated_ambient();
         let mut cmd = CommandBuilder::new("dummy");
         for name in crate::terminal::CREDENTIAL_VALUE_ENV_VARS {
             cmd.env(name, "hunter2");
@@ -5153,6 +5549,13 @@ pub(crate) mod tests {
     /// running the same tail `spawn` runs.
     #[test]
     fn pty_finalize_child_env_scrub_beats_a_caller_supplied_credential() {
+        // The scrub applies the LIVE model-gateway plan, which reads the
+        // runner config dir. A sibling test's `IsolatedAmbient` rewrites the
+        // process env (on Windows, `USERPROFILE` too, which can make the
+        // platform config dir unresolvable mid-test); an unresolvable dir is
+        // an unresolved gateway that pins `CLAUDE_CONFIG_DIR` away. Hold the
+        // fixture so this test reads a known, gateway-free config dir.
+        let _amb = crate::test_env::isolated_ambient();
         let mut cmd = CommandBuilder::new("dummy");
         // As if `extra_env` had carried both a legitimate pin and a credential.
         cmd.env("CLAUDE_CONFIG_DIR", "/caller/pinned");
@@ -5474,6 +5877,8 @@ pub(crate) mod tests {
             grid: Arc::new(Mutex::new(Grid::new(80, 24))),
             coord_session_id: Arc::new(Mutex::new(None)),
             spawn_name: std::sync::OnceLock::new(),
+            permission_request_hook: std::sync::OnceLock::new(),
+            permission_request_nonce: std::sync::OnceLock::new(),
             agent_status_last: Arc::new(Mutex::new(None)),
             grid_idle_tracker: Mutex::new(qontinui_runner_lib::wind_down::GridIdleTracker::new()),
             on_exit: Arc::new(Mutex::new(None)),
@@ -5566,6 +5971,55 @@ pub(crate) mod tests {
         }
     }
 
+    /// A pane that records the order of `kill` and `release`.
+    #[derive(Default)]
+    struct TeardownRecordingPaneIo(Mutex<Vec<&'static str>>);
+
+    impl crate::terminal::pane_io::PaneIo for TeardownRecordingPaneIo {
+        fn reader(&self) -> Result<Box<dyn Read + Send>, String> {
+            Ok(Box::new(std::io::empty()))
+        }
+        fn writer(&self) -> Result<Box<dyn Write + Send>, String> {
+            Ok(Box::new(std::io::sink()))
+        }
+        fn resize(&self, _cols: u16, _rows: u16) -> Result<(), String> {
+            Ok(())
+        }
+        fn wait(&self) -> Result<i32, String> {
+            Ok(0)
+        }
+        fn kill(&self, _budget: Duration) -> Result<(), String> {
+            self.0.lock().unwrap().push("kill");
+            Ok(())
+        }
+        fn set_paused(&self, _paused: bool) -> Result<(), String> {
+            Ok(())
+        }
+        fn pid(&self) -> Option<u32> {
+            None
+        }
+        fn credential_scrub(&self) -> crate::terminal::pane_io::CredentialScrub {
+            crate::terminal::pane_io::CredentialScrub::NoChildEnv
+        }
+        fn release(&self, _budget: Duration) -> Result<(), String> {
+            self.0.lock().unwrap().push("release");
+            Ok(())
+        }
+    }
+
+    /// pty_holder review follow-up L2: a spawn that fails after its reader
+    /// thread started ends the pane — kill, then release (which ends the
+    /// reader's stream) — and returns the failure as the spawn's error, rather
+    /// than leaving the child running behind a pane nothing will ever drop.
+    #[test]
+    fn abandoned_pane_is_killed_then_released() {
+        let io = TeardownRecordingPaneIo::default();
+        let id: TerminalId = "t-abandon".into();
+        let err = abandon_pane(&io, &id, "Failed to spawn waiter thread: boom".into());
+        assert_eq!(err, "Failed to spawn waiter thread: boom");
+        assert_eq!(*io.0.lock().unwrap(), vec!["kill", "release"]);
+    }
+
     /// A writer that records what was typed and, like a TUI input line, echoes
     /// it onto the grid.
     struct EchoingWriter {
@@ -5601,14 +6055,25 @@ pub(crate) mod tests {
         }
     }
 
-    /// A LIVE pane showing `screen` (bytes fed to its grid), whose writer
-    /// echoes onto the grid when `echo`, and whose pane counts kills.
-    fn prompt_pane(screen: &str, echo: bool) -> PromptPane {
+    /// The parts of a LIVE pane showing `screen` (bytes fed to its grid), whose
+    /// writer echoes onto the grid when `echo`, whose pane counts kills, and
+    /// whose process probe is rooted at `root_pid`. Returned bare, so each
+    /// fixture wrapper owns the one `Drop` that marks the session dead again.
+    fn live_prompt_parts(
+        screen: &str,
+        echo: bool,
+        root_pid: Option<u32>,
+    ) -> (
+        TerminalSession,
+        Arc<KillCountingPaneIo>,
+        Arc<Mutex<Vec<u8>>>,
+    ) {
         let io = Arc::new(KillCountingPaneIo::default());
         let typed = Arc::new(Mutex::new(Vec::new()));
         let mut session = make_test_session(Arc::new(Mutex::new(Vec::new())));
         let pane: Arc<dyn crate::terminal::pane_io::PaneIo> = io.clone();
         session.io = pane;
+        session.child_pid = root_pid;
         {
             let mut parser = vte::Parser::new();
             session
@@ -5624,11 +6089,96 @@ pub(crate) mod tests {
         });
         session.writer = Arc::new(Mutex::new(writer));
         session.is_alive.store(true, Ordering::Relaxed);
+        (session, io, typed)
+    }
+
+    /// A LIVE pane showing `screen` (bytes fed to its grid), whose writer
+    /// echoes onto the grid when `echo`, and whose pane counts kills.
+    fn prompt_pane(screen: &str, echo: bool) -> PromptPane {
+        let (session, io, typed) = live_prompt_parts(screen, echo, None);
         PromptPane {
             session: Arc::new(session),
             io,
             typed,
         }
+    }
+
+    /// A LIVE, PTY-less pane at an empty prompt that echoes whatever is typed
+    /// into it, and whose process probe reads a SCRIPTED subtree:
+    ///
+    /// * [`live_claude_pane`] — ONE live `claude` with ZERO children. This is
+    ///   the pane every caller of the graceful-exit primitive must be refused
+    ///   on when it presents no `CloseAuthority` (plan
+    ///   `2026-10-28-one-session-lifecycle-authority`, Phase 14). Given an
+    ///   authority, the primitive WOULD type `/exit` here. That is what makes a
+    ///   refusal observable: nothing typed, nothing killed.
+    /// * [`bare_shell_pane`] — no `claude` at all, which every caller must still
+    ///   be able to handle exactly as before.
+    ///
+    /// The probe is the production `probe_claude_under`, answering from the
+    /// scripted table (`graceful_exit::fake_process_table`) under a root pid no
+    /// real process can hold. A test can therefore enter through a CALLER of
+    /// `TerminalManager::graceful_exit` with no OS process behind the pane.
+    pub(crate) struct ScriptedPane {
+        pub(crate) session: Arc<TerminalSession>,
+        /// The scripted `claude` pids, top-level first (empty: a bare shell).
+        pub(crate) claude_pids: Vec<u32>,
+        io: Arc<KillCountingPaneIo>,
+        typed: Arc<Mutex<Vec<u8>>>,
+        _scripted: crate::terminal::graceful_exit::fake_process_table::FakePane,
+    }
+
+    impl ScriptedPane {
+        /// Every byte written into the pane, in order.
+        pub(crate) fn typed(&self) -> Vec<u8> {
+            self.typed.lock().unwrap().clone()
+        }
+
+        /// How many times the pane's process was killed.
+        pub(crate) fn kills(&self) -> usize {
+            self.io.kills()
+        }
+    }
+
+    impl Drop for ScriptedPane {
+        fn drop(&mut self) {
+            // Let the fixture drop without its Drop-time close.
+            self.session.is_alive.store(false, Ordering::Relaxed);
+        }
+    }
+
+    fn scripted_pane(
+        subtree_claude: Vec<crate::terminal::graceful_exit::ProcIdentity>,
+    ) -> ScriptedPane {
+        let claude_pids = subtree_claude.iter().map(|id| id.pid).collect();
+        let scripted = crate::terminal::graceful_exit::fake_process_table::register(
+            crate::terminal::graceful_exit::PaneProcesses {
+                subtree_claude,
+                top_level_children: 0,
+                tracked_alive: Vec::new(),
+            },
+        );
+        let (session, io, typed) = live_prompt_parts(EMPTY_PROMPT, true, Some(scripted.root_pid));
+        ScriptedPane {
+            session: Arc::new(session),
+            claude_pids,
+            io,
+            typed,
+            _scripted: scripted,
+        }
+    }
+
+    /// One live `claude`, ZERO children — see [`ScriptedPane`].
+    pub(crate) fn live_claude_pane() -> ScriptedPane {
+        scripted_pane(vec![crate::terminal::graceful_exit::ProcIdentity {
+            pid: 4242,
+            started_at: 1_000,
+        }])
+    }
+
+    /// No `claude` in the pane: a bare shell — see [`ScriptedPane`].
+    pub(crate) fn bare_shell_pane() -> ScriptedPane {
+        scripted_pane(Vec::new())
     }
 
     const EMPTY_PROMPT: &str = "done.\r\n\u{276f} ";
@@ -5703,6 +6253,7 @@ pub(crate) mod tests {
                     closer.close_after_graceful_exit();
                     crate::terminal::graceful_exit::CloseTabResult::Closed
                 },
+                Some(crate::terminal::close_authority::CloseAuthority::for_test()),
             )
             .await;
 
@@ -5713,6 +6264,41 @@ pub(crate) mod tests {
         assert_eq!(pane.io.kills(), 0, "a live claude's pane was killed");
         assert!(pane.session.is_alive(), "the pane must be left running");
         assert_eq!(pane.typed.lock().unwrap().as_slice(), b"/exit\r");
+    }
+
+    /// R0a at the session seam, through the PRODUCTION probe: the real writer
+    /// and grid, a pane at an empty prompt that echoes, one live `claude` with
+    /// zero children, and no authority. Refused before a byte is written;
+    /// nothing killed, nothing closed, the pane left live.
+    #[tokio::test(start_paused = true)]
+    async fn graceful_exit_without_an_authority_types_nothing_into_a_live_claude() {
+        use crate::terminal::graceful_exit::GracefulExitOutcome;
+
+        let pane = live_claude_pane();
+        let closed = Arc::new(AtomicBool::new(false));
+        let closed_flag = Arc::clone(&closed);
+        let outcome = pane
+            .session
+            .graceful_exit_then(
+                Duration::from_secs(60),
+                move || async move {
+                    closed_flag.store(true, Ordering::SeqCst);
+                    crate::terminal::graceful_exit::CloseTabResult::Closed
+                },
+                None,
+            )
+            .await;
+
+        assert_eq!(
+            outcome,
+            GracefulExitOutcome::NoCloseAuthority {
+                claude_pids: pane.claude_pids.clone()
+            }
+        );
+        assert!(pane.typed().is_empty(), "typed into a live claude");
+        assert!(!closed.load(Ordering::SeqCst), "the close was reached");
+        assert_eq!(pane.kills(), 0);
+        assert!(pane.session.is_alive());
     }
 
     #[tokio::test(start_paused = true)]
@@ -5740,6 +6326,7 @@ pub(crate) mod tests {
                     closer.close_after_graceful_exit();
                     crate::terminal::graceful_exit::CloseTabResult::Closed
                 },
+                Some(crate::terminal::close_authority::CloseAuthority::for_test()),
             )
             .await;
         assert!(
@@ -5775,6 +6362,7 @@ pub(crate) mod tests {
                     closer.close_after_graceful_exit();
                     crate::terminal::graceful_exit::CloseTabResult::Closed
                 },
+                Some(crate::terminal::close_authority::CloseAuthority::for_test()),
             )
             .await;
         assert!(
@@ -5816,6 +6404,7 @@ pub(crate) mod tests {
                     closer.close_after_graceful_exit();
                     crate::terminal::graceful_exit::CloseTabResult::Closed
                 },
+                Some(crate::terminal::close_authority::CloseAuthority::for_test()),
             )
             .await;
         assert!(
@@ -5844,6 +6433,7 @@ pub(crate) mod tests {
                     closer.close_after_graceful_exit();
                     crate::terminal::graceful_exit::CloseTabResult::Closed
                 },
+                Some(crate::terminal::close_authority::CloseAuthority::for_test()),
             )
             .await;
         assert!(
@@ -5876,6 +6466,7 @@ pub(crate) mod tests {
                     closer.close_after_graceful_exit();
                     crate::terminal::graceful_exit::CloseTabResult::Closed
                 },
+                Some(crate::terminal::close_authority::CloseAuthority::for_test()),
             )
             .await;
         match &outcome {
@@ -5906,6 +6497,7 @@ pub(crate) mod tests {
                     closer.close_after_graceful_exit();
                     crate::terminal::graceful_exit::CloseTabResult::Closed
                 },
+                Some(crate::terminal::close_authority::CloseAuthority::for_test()),
             )
             .await;
         assert!(
@@ -6074,7 +6666,7 @@ pub(crate) mod tests {
         let mut coalescer = SyncFrameCoalescer::new();
         let emitted = Arc::new(Mutex::new(Vec::<(Vec<u8>, u64)>::new()));
         let mut read = |data: &[u8], offset: u64, coalescer: &mut SyncFrameCoalescer| {
-            advance_grid(&grid, &generation, &mut parser, data);
+            advance_grid(&grid, &generation, &mut parser, data, offset);
             let in_sync = grid.lock().unwrap().sync_output();
             let sink = emitted.clone();
             coalescer.feed(data, offset, in_sync, move |p, o| {
@@ -8553,6 +9145,238 @@ pub(crate) mod tests {
         assert!(!gate.should_emit(FLOW_HIGH_WATERMARK + 1));
     }
 
+    /// Pins the ack clamp documented on [`TerminalSession::reset_flow_control`]:
+    ///
+    /// - excess acks arriving after a reset leave acked == sent, never more;
+    /// - an ack for a byte sent after the reset still counts, in full, and one
+    ///   ack can never be split so part of it is lost;
+    /// - across many burst / reset / excess-ack cycles, with the coalescer's
+    ///   largest frame (`SYNC_FLUSH_BYTE_CAP - 1 + PTY_READ_BYTES`) as the
+    ///   chunk, the gate pauses at High plus one chunk every cycle (a surplus
+    ///   would let a burst run further each time) and reopens once the pane
+    ///   acks down to Low.
+    #[test]
+    fn flow_reset_and_ack_clamp_keep_acked_at_or_under_sent() {
+        // The largest frame the coalescer can emit from PTY reads: a held frame
+        // one byte under the cap, tipped over by one full read.
+        let mut coalescer = SyncFrameCoalescer::new();
+        let mut frames: Vec<usize> = Vec::new();
+        coalescer.feed(&vec![b'x'; PTY_READ_BYTES - 1], 0, true, |p, _| {
+            frames.push(p.len())
+        });
+        for _ in 0..SYNC_FLUSH_BYTE_CAP / PTY_READ_BYTES {
+            if !frames.is_empty() {
+                break;
+            }
+            coalescer.feed(&vec![b'x'; PTY_READ_BYTES], 0, true, |p, _| {
+                frames.push(p.len())
+            });
+        }
+        let max_frame = (SYNC_FLUSH_BYTE_CAP - 1 + PTY_READ_BYTES) as u64;
+        assert_eq!(frames, vec![max_frame as usize]);
+
+        let session = make_test_session(Arc::new(Mutex::new(Vec::new())));
+        let sent = |s: &TerminalSession| s.bytes_sent.load(Ordering::Relaxed);
+        let acked = |s: &TerminalSession| s.bytes_acked.load(Ordering::Relaxed);
+        let gap = |s: &TerminalSession| sent(s).saturating_sub(acked(s));
+        let send = |s: &TerminalSession, n: u64| {
+            s.bytes_sent.fetch_add(n, Ordering::Relaxed);
+        };
+
+        // Excess acks after a reset are discarded, not banked.
+        send(&session, 50_000);
+        session.reset_flow_control();
+        session.ack(50_000); // a write in flight at the reset renders now
+        assert_eq!(
+            acked(&session),
+            sent(&session),
+            "excess ack must clamp at sent"
+        );
+
+        // A post-reset ack still counts, in full.
+        send(&session, 30_000);
+        session.ack(10_000);
+        assert_eq!(gap(&session), 20_000, "a post-reset ack must count");
+        session.ack(20_000);
+        assert_eq!(gap(&session), 0);
+        // An ack that is partly excess keeps its in-range part.
+        send(&session, 7_000);
+        session.ack(9_000);
+        assert_eq!(acked(&session), sent(&session));
+
+        // Many cycles. Each: the pane renders nothing until the gate pauses; a
+        // ring read resets; the pane then acks the whole pre-reset backlog plus
+        // an uncounted background window, all of it excess.
+        let mut gate = EmissionGate::new();
+        for cycle in 0..20 {
+            let mut admitted = 0u64;
+            for _ in 0..1_000 {
+                if !gate.should_emit(gap(&session)) {
+                    break;
+                }
+                send(&session, max_frame);
+                admitted += max_frame;
+            }
+            assert!(gate.is_paused(), "cycle {cycle}: backpressure must engage");
+            assert!(
+                admitted > FLOW_HIGH_WATERMARK && admitted <= FLOW_HIGH_WATERMARK + max_frame,
+                "cycle {cycle}: the burst admitted {admitted}, not High plus one frame"
+            );
+            let backlog = gap(&session);
+            session.reset_flow_control();
+            session.ack(backlog);
+            session.ack(256 * 1024); // an uncounted background window
+            assert_eq!(acked(&session), sent(&session), "cycle {cycle}: no surplus");
+
+            // The gate reopens only once the gap is back at or under Low.
+            send(&session, 40_000);
+            assert!(
+                !gate.should_emit(gap(&session)),
+                "cycle {cycle}: still paused"
+            );
+            session.ack(40_000 - FLOW_LOW_WATERMARK);
+            assert!(
+                gate.should_emit(gap(&session)),
+                "cycle {cycle}: must reopen at Low"
+            );
+            session.ack(FLOW_LOW_WATERMARK);
+            assert_eq!(gap(&session), 0);
+        }
+
+        // The pause threshold is High plus ONE chunk whatever the chunk size, not
+        // just for a max frame (which alone overshoots High by enough to hide a
+        // gate that pauses late).
+        for chunk in [PTY_READ_BYTES as u64, 40_000, max_frame] {
+            let mut gate = EmissionGate::new();
+            let mut sent = 0u64;
+            for _ in 0..1_000 {
+                if !gate.should_emit(sent) {
+                    break;
+                }
+                sent += chunk;
+            }
+            assert!(gate.is_paused(), "chunk {chunk}: the gate must pause");
+            assert!(
+                sent > FLOW_HIGH_WATERMARK && sent <= FLOW_HIGH_WATERMARK + chunk,
+                "chunk {chunk}: pre-reset gap {sent} exceeds High plus one chunk"
+            );
+        }
+    }
+
+    /// A reset raises acked to the `sent` it read; it must not store over an
+    /// ack that landed in between (for bytes counted after that read), or the
+    /// pane's acks for those bytes are lost: an under-ack.
+    #[test]
+    fn reset_flow_control_never_erases_a_concurrent_ack() {
+        let session = make_test_session(Arc::new(Mutex::new(Vec::new())));
+        session.bytes_sent.fetch_add(50_000, Ordering::Relaxed);
+        session.reset_flow_control_around(|| {
+            // After the reset read `sent`: one more frame is counted, and the
+            // pane acks everything it has received, that frame included.
+            session.bytes_sent.fetch_add(8_192, Ordering::Relaxed);
+            session.ack(50_000 + 8_192);
+        });
+        assert_eq!(
+            session.bytes_acked.load(Ordering::Relaxed),
+            session.bytes_sent.load(Ordering::Relaxed),
+            "the reset erased an ack that landed while it ran"
+        );
+    }
+
+    /// A reset that reads `sent` before a failed emit's un-count and raises
+    /// acked after it must not leave acked above sent: that is a surplus, the
+    /// thing the ack clamp exists to rule out.
+    #[test]
+    fn reset_flow_control_straddling_an_uncount_leaves_no_surplus() {
+        let session = make_test_session(Arc::new(Mutex::new(Vec::new())));
+        session.bytes_sent.fetch_add(50_000, Ordering::Relaxed);
+        session.ack(50_000);
+        // The reader counts a frame; its emit fails.
+        session.bytes_sent.fetch_add(8_192, Ordering::Relaxed);
+        // A reset reads sent (58 192), then the un-count lands, then the reset
+        // raises acked.
+        session.reset_flow_control_around(|| {
+            uncount(&session.bytes_sent, &session.bytes_acked, 8_192);
+        });
+        assert_eq!(session.bytes_sent.load(Ordering::Relaxed), 50_000);
+        assert_eq!(
+            session.bytes_acked.load(Ordering::Relaxed),
+            50_000,
+            "the reset left a surplus over the un-counted bytes"
+        );
+    }
+
+    /// An ack whose clamp read `sent` before a failed emit's un-count, and
+    /// whose CAS landed after it, must not leave acked above sent.
+    #[test]
+    fn ack_straddling_an_uncount_leaves_no_surplus() {
+        let session = make_test_session(Arc::new(Mutex::new(Vec::new())));
+        session.bytes_sent.fetch_add(50_000, Ordering::Relaxed);
+        session.ack(40_000);
+        // The reader counts a frame; its emit fails.
+        session.bytes_sent.fetch_add(8_192, Ordering::Relaxed);
+        // The pane acks the rest of what it had (and some excess): the clamp
+        // reads sent = 58 192, then the un-count lands, then the CAS.
+        session.ack_around(18_192, || {
+            uncount(&session.bytes_sent, &session.bytes_acked, 8_192);
+        });
+        assert_eq!(session.bytes_sent.load(Ordering::Relaxed), 50_000);
+        assert_eq!(
+            session.bytes_acked.load(Ordering::Relaxed),
+            50_000,
+            "the ack left a surplus over the un-counted bytes"
+        );
+    }
+
+    /// `count_then_emit` counts before it emits (an ack can follow the emit at
+    /// once, and `ack` clamps at sent), and un-counts an emit that failed.
+    #[test]
+    fn count_then_emit_counts_first_and_uncounts_a_failed_emit() {
+        let sent = AtomicU64::new(100);
+        let acked = AtomicU64::new(100);
+        count_then_emit(&sent, &acked, 40, || {
+            assert_eq!(
+                sent.load(Ordering::Relaxed),
+                140,
+                "emitted before it was counted"
+            );
+            true
+        });
+        assert_eq!(sent.load(Ordering::Relaxed), 140);
+
+        // A failed emit, while a reset ran (acked = sent, these bytes included):
+        // nothing was delivered, so nothing is left counted, and no surplus.
+        count_then_emit(&sent, &acked, 60, || {
+            acked.store(sent.load(Ordering::Relaxed), Ordering::Relaxed);
+            false
+        });
+        assert_eq!(sent.load(Ordering::Relaxed), 140);
+        assert_eq!(acked.load(Ordering::Relaxed), 140);
+    }
+
+    /// The reconnect path's reset happens at the grid snapshot, after its
+    /// handler exists: a frame counted after the ring read's reset and emitted
+    /// to no handler is covered here, or nothing would ever ack it.
+    #[test]
+    fn grid_snapshot_resets_flow_control_only_when_asked() {
+        let session = make_test_session(Arc::new(Mutex::new(Vec::new())));
+        let gap = |s: &TerminalSession| {
+            s.bytes_sent
+                .load(Ordering::Relaxed)
+                .saturating_sub(s.bytes_acked.load(Ordering::Relaxed))
+        };
+        session.reset_flow_control(); // the mount ring read
+        session.bytes_sent.fetch_add(60_000, Ordering::Relaxed); // a held frame, emitted to nobody
+        session.emission_skipped.store(true, Ordering::Relaxed);
+
+        session.grid_snapshot(false).unwrap();
+        assert_eq!(gap(&session), 60_000, "a plain snapshot must not reset");
+
+        session.grid_snapshot(true).unwrap();
+        assert_eq!(gap(&session), 0, "the reconnect snapshot must reset");
+        assert!(!session.emission_skipped.load(Ordering::Relaxed));
+    }
+
     /// REGRESSION (scan-gate watermark, PR #961 review F1).
     ///
     /// Replays the exact reader-loop interleaving that permanently wedged the
@@ -8617,7 +9441,13 @@ pub(crate) mod tests {
         );
 
         // Reader step 2: the preempted advance completes.
-        advance_grid(&session.grid, &session.grid_generation, &mut parser, prompt);
+        advance_grid(
+            &session.grid,
+            &session.grid_generation,
+            &mut parser,
+            prompt,
+            0,
+        );
         assert!(
             {
                 let g = session.grid.lock().unwrap();

@@ -8,8 +8,9 @@
  * `resolveCount` had a floor but no ceiling. A fixture registry cannot see
  * either, because a fixture declares whatever the test needs.
  *
- * So this file registers the ACTUAL 40 actions. `useTerminalCommands` is a
- * hook only in the sense that it calls context hooks and `useCommandAction`;
+ * So this file registers the ACTUAL actions (the count is pinned once, in
+ * "registers the whole set" below). `useTerminalCommands` is a hook only
+ * in the sense that it calls context hooks and `useCommandAction`;
  * with those mocked it is an ordinary function, which is why this runs under
  * vitest's `environment: "node"` with no React renderer.
  */
@@ -18,6 +19,9 @@ import { beforeAll, describe, expect, it, vi } from "vitest";
 
 import { getAll, getById } from "./registry";
 import type { CommandAction, CommandResult } from "./types";
+
+/** Every `zoneLayout.setLayoutId` call, arguments and all. */
+const layoutRequests = vi.hoisted(() => [] as unknown[][]);
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: async () => ({}) }));
 vi.mock("@/lib/instance-storage", () => ({
@@ -34,12 +38,8 @@ vi.mock("../result-card", () => ({
   buildMetricsCardSpec: () => ({ title: "m", sections: [] }),
   buildHistoryCardSpec: () => ({ title: "h", sections: [] }),
 }));
-vi.mock("../liveClaudeSessions", () => ({
-  extractLiveSessions: () => [],
-  groupByAccount: () => new Map(),
-  sharedSessionIds: () => new Set(),
-}));
 vi.mock("../contexts", () => ({
+  usePageSessionGetter: () => () => null,
   useTerminalSession: () => ({
     tabs: [{ id: "tab-a" }],
     activeId: "tab-a",
@@ -65,8 +65,13 @@ vi.mock("../contexts", () => ({
       focusNextNeedsInput: () => true,
       setFocusedZone: () => {},
       toggleMaximize: () => {},
-      setLayoutId: () => {},
+      setLayoutId: (...args: unknown[]) => {
+        layoutRequests.push(args);
+      },
       assignTabToZone: () => {},
+      workMode: "grid",
+      enterTmuxMode: () => {},
+      exitTmuxMode: () => {},
     },
     workflowGen: {
       generatedWorkflow: null,
@@ -164,7 +169,7 @@ const err = (r: CommandResult): string => (r.ok ? "OK" : `${r.code}: ${r.message
 
 describe("registered actions — the cost/destruction declarations are not empty", () => {
   it("registers the whole set", () => {
-    expect(getAll().length).toBe(41);
+    expect(getAll().length).toBe(42);
   });
 
   /**
@@ -181,6 +186,7 @@ describe("registered actions — the cost/destruction declarations are not empty
         .sort(),
     ).toEqual([
       "terminal.analyze",
+      "terminal.elevated",
       "terminal.generate-workflow",
       "terminal.orchestrate",
       "terminal.plan-implement",
@@ -205,6 +211,7 @@ describe("registered actions — the cost/destruction declarations are not empty
       "terminal.toggle-focus-mode",
       "terminal.maximize",
       "terminal.layout",
+      "terminal.mode",
       "terminal.swap",
       "terminal.tag-toggle",
       "terminal.plan-verify",
@@ -282,5 +289,20 @@ describe("registered actions — /auto-approve names its missing argument", () =
     expect(err(await run("terminal.auto-approve", { action: "add", pattern: "" }))).toBe(
       "invalid-args: pattern required for add",
     );
+  });
+});
+
+describe("registered actions — /layout is an operator's choice", () => {
+  /**
+   * The request's `source` decides the layout's origin (`zoneAutoTrim.ts`):
+   * an `operator` layout is never auto-trimmed when tabs close. `/layout` and
+   * the UI Bridge `select-layout` both go through this handler, so a source
+   * other than `operator` here would let the runner shrink a grid the
+   * operator just picked.
+   */
+  it("passes source operator", async () => {
+    layoutRequests.length = 0;
+    expect((await run("terminal.layout", { preset: "split" })).ok).toBe(true);
+    expect(layoutRequests).toStrictEqual([["split", { source: "operator" }]]);
   });
 });

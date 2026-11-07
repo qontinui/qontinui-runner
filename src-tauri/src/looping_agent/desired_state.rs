@@ -16,12 +16,19 @@
 //! ## Fail-safe contract (the important part)
 //!
 //! Coord `armed = false`, no rule for the role, or coord UNREACHABLE all fall
-//! back to the local registry posture — whose seed is `enabled = false`
-//! (`registry.rs:161-162`). The direction of that fallback is deliberate and
-//! load-bearing: an unreachable coord must NEVER be read as permission to
-//! spawn. The failure mode we accept (a coord outage stops new shepherds from
-//! being spawned) is strictly safer than the one we refuse (a coord outage, or
-//! a half-parsed response, spawns agents nobody asked for).
+//! back to the local registry posture. Since the operator decision of
+//! 2026-10-30 that posture is seeded `enabled = true` (see
+//! `registry::builtin_merge_shepherd`), so this resolver alone no longer keeps
+//! an unreachable coord from being read as permission to spawn. What does is
+//! the claim-first slot lease (`super::lease`, and `reconcile_slot_lease` in
+//! the bin's `looping_agent_supervisor.rs`): `running` here is only the wish,
+//! a spawn additionally needs a lease coord granted, and an UNREACHABLE coord
+//! answers `Unavailable` — never a free slot — so nothing spawns. The failure
+//! mode we accept (a coord outage stops new shepherds from being spawned) is
+//! strictly safer than the one we refuse (a coord outage, or a half-parsed
+//! response, spawns agents nobody asked for). A local-registry actor still
+//! races for slot 0 only, so the fallback can never yield more than one
+//! shepherd per tenant.
 
 /// One coord-declared desired-state rule, as served by
 /// `GET /coord/agent-desired-state`.
@@ -99,9 +106,10 @@ pub fn resolve(
                 source: DesiredSource::Coord,
             }
         }
-        // Disarmed / absent / unreachable → the local registry decides, and its
-        // seed posture is `enabled = false`. One slot: a runner acting on its
-        // own local flag is a single-machine actor by definition.
+        // Disarmed / absent / unreachable → the local registry decides (its
+        // seed posture is `enabled = true`; the slot lease, not this flag, is
+        // what stops an unreachable coord from spawning). One slot: a runner
+        // acting on its own local flag is a single-machine actor by definition.
         _ => EffectiveDesired {
             running: local_enabled && local_running,
             slots: 1,
@@ -146,13 +154,14 @@ mod tests {
 
     #[test]
     fn coord_unreachable_falls_back_to_the_local_registry() {
-        // THE fail-safe: coord is unreachable (None) and the local seed posture
-        // is disabled → nothing runs. An unreachable coord is never permission
-        // to spawn.
+        // Coord is unreachable (None) and the operator has locally disabled the
+        // agent → nothing runs. (With a locally-enabled agent the resolver says
+        // run; the slot lease is what then refuses to spawn while coord is
+        // unreachable.)
         let r = resolve(false, false, None);
         assert!(
             !r.running,
-            "an unreachable coord must NEVER be read as permission to spawn"
+            "a locally-disabled agent must not run while coord is unreachable"
         );
         assert_eq!(r.source, DesiredSource::LocalRegistry);
 

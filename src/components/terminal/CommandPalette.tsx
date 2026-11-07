@@ -76,10 +76,21 @@ interface CommandPaletteProps {
   zoneLabels: Record<number, string>;
   onSetZoneLabel: (zoneIndex: number, label: string) => void;
   zoneCount: number;
+  /**
+   * The zone whose label and pin a listed zone shows and edits
+   * (`useZoneLayout().cosmeticZoneFor`): the zone itself in grid mode, the
+   * shown session's grid zone in tmux mode, `null` when the session has none —
+   * then no pin or label entry is offered for it. Default: the zone itself.
+   */
+  cosmeticZoneFor?: (zoneIndex: number) => number | null;
   onCompareZones?: (z1: number, z2: number) => void;
   onSnapshotZone?: (tabId: string) => void;
   onCompareSnapshot?: (tabId: string) => void;
   snapshotZones?: Set<string>;
+}
+
+function identityZone(zoneIndex: number): number | null {
+  return zoneIndex;
 }
 
 export function CommandPalette({
@@ -106,6 +117,7 @@ export function CommandPalette({
   zoneLabels,
   onSetZoneLabel,
   zoneCount,
+  cosmeticZoneFor = identityZone,
   onCompareZones,
   onSnapshotZone,
   onCompareSnapshot,
@@ -148,9 +160,10 @@ export function CommandPalette({
       const tabId = assignments[z];
       const tab = tabs.find((t) => t.id === tabId);
       const state = tabId ? (sessionStates[tabId] ?? "idle") : "idle";
-      const label = zoneLabels[z];
+      const cz = cosmeticZoneFor(z);
+      const label = cz === null ? undefined : zoneLabels[cz];
       const name = tab ? resolveTitle(tab) : `Zone ${z + 1}`;
-      const isPinned = pinnedZones.has(z);
+      const isPinned = cz !== null && pinnedZones.has(cz);
 
       list.push({
         id: `focus-${z}`,
@@ -189,16 +202,18 @@ export function CommandPalette({
         });
       }
 
-      list.push({
-        id: `pin-${z}`,
-        label: `${isPinned ? "Unpin" : "Pin"} zone ${z + 1}: ${name}`,
-        shortcut: "Ctrl+Shift+P",
-        category: "View",
-        priority: 8,
-        action: () => onTogglePin(z),
-      });
+      if (cz !== null) {
+        list.push({
+          id: `pin-${z}`,
+          label: `${isPinned ? "Unpin" : "Pin"} zone ${z + 1}: ${name}`,
+          shortcut: "Ctrl+Shift+P",
+          category: "View",
+          priority: 8,
+          action: () => onTogglePin(cz),
+        });
+      }
 
-      if (tab) {
+      if (tab && cz !== null) {
         list.push({
           id: `label-${z}`,
           label: `Label zone ${z + 1}${label ? ` (${label})` : ""}`,
@@ -206,7 +221,7 @@ export function CommandPalette({
           priority: 9,
           action: () => {
             const newLabel = prompt(`Label for zone ${z + 1}:`, label ?? "");
-            if (newLabel !== null) onSetZoneLabel(z, newLabel);
+            if (newLabel !== null) onSetZoneLabel(cz, newLabel);
           },
         });
       }
@@ -304,7 +319,8 @@ export function CommandPalette({
       action: () => {
         for (let z = 0; z < zoneCount; z++) {
           const tabId = assignments[z];
-          if (!tabId) continue;
+          const cz = cosmeticZoneFor(z);
+          if (!tabId || cz === null) continue;
           const tab = tabs.find((t) => t.id === tabId);
           if (!tab) continue;
 
@@ -326,14 +342,14 @@ export function CommandPalette({
           }
 
           // Get current tags and add directory tag if not present
-          const currentLabel = zoneLabels[z] ?? "";
+          const currentLabel = zoneLabels[cz] ?? "";
           const currentTags = currentLabel
             .split(",")
             .map((t) => t.trim())
             .filter(Boolean);
           if (!currentTags.includes(dir)) {
             const newLabel = [...currentTags, dir].join(", ");
-            onSetZoneLabel(z, newLabel);
+            onSetZoneLabel(cz, newLabel);
           }
         }
       },
@@ -369,6 +385,7 @@ export function CommandPalette({
     sessionStates,
     focusedZone,
     zoneCount,
+    cosmeticZoneFor,
     pinnedZones,
     zoneLabels,
     focusMode,

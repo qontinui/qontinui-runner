@@ -25,6 +25,7 @@ import * as dagre from "@dagrejs/dagre";
 import "@xyflow/react/dist/style.css";
 import { Navigation, Loader2 } from "lucide-react";
 import { copyMermaidToClipboard } from "@/lib/development-intelligence/mermaid-export";
+import { getApiBase } from "@/lib/runner-api";
 
 interface PageSpec {
   metadata: {
@@ -225,7 +226,7 @@ export function NavigationFlowGraph() {
 
   const loadSpecs = useCallback(async (signal: AbortSignal) => {
     try {
-      const resp = await fetch("http://localhost:9876/specs", { signal });
+      const resp = await fetch(`${getApiBase()}/specs`, { signal });
       const json = await resp.json();
       if (!signal.aborted && json.data) {
         setSpecs(json.data);

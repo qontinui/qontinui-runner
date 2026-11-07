@@ -53,7 +53,7 @@ use qontinui_runner_lib::looping_agent::turn_ending::{
 };
 
 use crate::terminal::transcript::{
-    find_claude_config_dirs, parse_assistant_record, read_tail_bytes, session_transcript_path,
+    find_transcript_by_session_id, parse_assistant_record, read_tail_bytes, session_transcript_path,
 };
 
 /// How much of the transcript tail to read when classifying a turn ending.
@@ -294,36 +294,6 @@ pub fn append_shadow_record(journal_path: &str, record: &ShadowRecord) {
     }
 }
 
-/// Locate the on-disk transcript for `session_id` WITHOUT knowing its project
-/// path.
-///
-/// `session_transcript_path` needs `(config_dir, project_path, session_id)`, but
-/// the looping-agent registry records only the pinned `claude_session_id`. The
-/// session id is unique, so sweep every Claude config dir on this machine
-/// (`find_claude_config_dirs` is MACHINE-scoped — it enumerates every account's
-/// tree, not just this session's) and look for `<session_id>.jsonl` under any
-/// `projects/<encoded>/`. Returns the config dir, the encoded project directory
-/// name, and the transcript path.
-pub fn resolve_transcript(session_id: &str) -> Option<(PathBuf, String)> {
-    let file = format!("{session_id}.jsonl");
-    for config_dir in find_claude_config_dirs() {
-        let projects = config_dir.join("projects");
-        let Ok(entries) = std::fs::read_dir(&projects) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            if !entry.path().is_dir() {
-                continue;
-            }
-            if entry.path().join(&file).is_file() {
-                let encoded = entry.file_name().to_string_lossy().to_string();
-                return Some((config_dir, encoded));
-            }
-        }
-    }
-    None
-}
-
 /// The whole shadow observation for one idle tick: read, classify, record.
 ///
 /// Returns the verdict when one was newly recorded, or `None` when this tick
@@ -344,7 +314,9 @@ pub fn observe_turn_ending(
     claude_session_id: &str,
     observed_at_ms: i64,
 ) -> Option<TurnEnding> {
-    let Some((config_dir, encoded_project)) = resolve_transcript(claude_session_id) else {
+    // The registry records only the pinned `claude_session_id`, not its project
+    // path, so locate the transcript by id across every config dir.
+    let Some(path) = find_transcript_by_session_id(None, claude_session_id) else {
         return record_if_new(
             agent_id,
             journal_path,
@@ -358,14 +330,6 @@ pub fn observe_turn_ending(
             &format!("unread:{}", UnreadReason::TranscriptMissing.label()),
         );
     };
-
-    // `resolve_transcript` returns the ALREADY-ENCODED project directory name,
-    // and `session_transcript_path` encodes what it is given — so re-encoding
-    // would mangle it. Build the path directly here instead.
-    let path = config_dir
-        .join("projects")
-        .join(&encoded_project)
-        .join(format!("{claude_session_id}.jsonl"));
 
     match read_turn_final_text_at(&path, DEFAULT_READ_CAP_BYTES) {
         Ok(ft) => {

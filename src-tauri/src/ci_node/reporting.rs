@@ -392,8 +392,8 @@ impl ResultReported {
 }
 
 /// POST the final result, retrying on the [`RESULT_RETRY_SECS`] schedule.
-/// `reason` adds a `reason` key next to `steps` (used for admission
-/// rejections).
+/// `reason` adds a `reason` key next to `steps` (admission rejections,
+/// checkout non-verdicts, and `out_of_memory` for a cgroup OOM-killed step).
 ///
 /// `test_results` is this dispatch's captured JUnit artifact
 /// ([`super::junit::capture`]). It is a REQUIRED parameter — `None` is

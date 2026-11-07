@@ -119,7 +119,7 @@ Do this first, regardless of which transport ends up carrying it.
 | A deploy going healthy | `deploy_healthy` | `{service, expected_rev}` — BOTH required; clears only when the service is healthy AND the deployed rev includes `expected_rev` (fail-closed if the deployed rev is unknown). `service` is an EXACT vocabulary, not free text — **`coord` or `web`, no variants**: not `qontinui-web`, not `qontinui-staging/web` (the target coord's own `coord_query_release_state` prints). The predicate conjoins three independently-implemented lookups that normalize differently, and the health one does raw `==` on an alert key's final `:`-segment, so a near-miss spelling names an observation but no alert and the health half is SILENTLY SKIPPED. Coord refuses an unresolvable `service`, and a blank `expected_rev`, at the door — **once the coord that answers you is SERVING qontinui-coord#2315**, which landed on coord `main` 2026-09-21 (`72c50b3f`) but whose deployment is a separate fact this file cannot state; read `coord_query_release_state` for `coord`. Until it does, a near-miss spelling is accepted and silently half-evaluates. Canonical: `_gate-registration` → "Merged is not deployed" |
 | **Repo A must not ship until repo B's change is LIVE on the serving backend** | `deploy_healthy` | **not `pr_merged`** — merged is not deployed. `pr_merged` is a fact about a pull request and has no unknown arm; a rollback leaves it cleared TERMINALLY while the backend no longer carries the code. Set `expected_rev` to the landed commit of the upstream half. Where coord does not observe the service at all, `deploy_healthy` cannot see it — use `commit_live` or `runner_served_sha` and say in the phase text which weaker thing you are gating on. Canonical: `_gate-registration` → "Merged is not deployed" |
 | A claim going terminal | `claim_terminal` | claim-anchored (`claim_kind`+`resource_key`) |
-| A human decision / judgment | `operator_approval` | `{prompt}` — notify-only; the human escape hatch |
+| A human decision / judgment | `operator_approval` | `{prompt}` — cleared by an operator decision; closed-list decisions and on-page verification only (see `_gate-registration` → "Sensitive-work rule"); the human escape hatch |
 | CI going green | `ci_green` | `{repo, head_sha}` — a FIXED head SHA, not a branch name: the evaluator matches `coord.pr_check_runs_latest` rows BY head SHA, so a branch name matches nothing and the gate stays open forever |
 | A **PR's** CI going green across pushes | `pr_ci_green` | `{repo, pr_number}` — the HEAD-FOLLOWING sibling of `ci_green`: it re-resolves the PR's head from `coord.repo_branches` on every sweep, so ONE `gate_id` (and any continuation on it) survives a rebase, a fix commit or a regenerated artifact, clearing when CI is green on whatever the head then is. **A red head is `Open` with a loud reason, never `Failed`** — the only terminal arms come from the PR lifecycle: merged/ff-landed clears it, closed without a land record fails it. Choose it over `ci_green` whenever the PR may need a NEW head before it goes green — `ci_green` pins one `head_sha` and goes terminally `Failed` on a red check, so a `ci_green` gate on a head that gets replaced can never clear and wakes nobody. The field is `pr_number`, not `pr` (one spelling with `pr_merged`). Declared by qontinui-coord `GatePredicate`; missing from this table until 2026-09-25. |
 | A published GitHub Release catching up with its `v*` tag | `release_in_sync` | `{repo?}` — a repo's published GitHub Release is in sync with its latest `v*` tag; `repo` defaults to `qontinui/qontinui-runner`, so a bare `{}` gates the runner installer, and when present it must be `owner/name` (a bare slug is refused). It reads the release observer's PERSISTED observation, not a live probe: `in_sync` clears; `in_flight` (building / inside grace) and `unknown` stay `Open` quietly; `stale` (tag pushed, nothing published past grace) and `failed_deploy` (a stuck DRAFT) stay `Open` with a LOUD reason and self-heal when the release is fixed; only `rolled_back` (a published release un-published or deleted) is `Failed`. Declared by qontinui-coord `GatePredicate`; missing from this table until 2026-09-25. |
@@ -128,14 +128,14 @@ Do this first, regardless of which transport ends up carrying it.
 | A metric crossing a threshold | `metric_threshold` | `{metric, labels, op, value, window_secs?}` — name `labels` explicitly |
 | A time window / burn-in elapsing | `time_elapsed` | `{since (default now), duration_secs}` |
 | **A vetted plan that is ready, dispatchable work** | `unit_ready` | `{work_unit_id, ready_status}` — auto-clears when the unit reaches `ready_status` + sibling gates cleared; **NOT** `operator_approval` |
-| A schema/alembic reaching head | `migration_at_head` | `{schema}` — live schema observer |
+| The WHOLE alembic chain applied to the serving database (database-wide) | `migration_at_head` | `{schema: "coord"}` — reads coord's PERSISTED schema observation, not a live probe. `schema` is a constant guard (any value but `"coord"` sits `Open` forever), and a gate registered before coord's observation reflects the new chain head is born cleared (canonical: `_gate-registration` → the SCHEMA-change traps; *What "born cleared" means*). For ONE table/column, use `schema_object_exists` below |
 | A specific **schema object** (table or column) existing on the database coord itself is connected to | `schema_object_exists` | `{schema, object, column?}` — `information_schema` tables/columns only; no `constraint`/`index` arity (a name there silently probes a nonexistent table and sits `Open` forever), a **view** reachable via the table arm. found → `Cleared`; definitive empty → `Open`; failed read → `Indeterminate{reason}`, stored as the `open` tag — read `verdict_reason`, not the tag. `schema` is not pinned to one value; name it. |
 | Infra drift / active-negation clearing | `infra_drift_clear` | `{}` — live infra observer |
 | A repo file / workflow / migration file existing | `file_exists` — **usable again.** The 2026-08-05 fleet-wide 403 was root-caused and FIXED by coord `e6f486b8` (2026-08-15), which is deployed; a live re-probe on 2026-08-31 registered `201` and cleared. Residual: that probe was one PUBLIC repo — re-probe before relying on it against a private one. | `{repo, path, on_ref?}` — file contents/presence |
 | A coord data count crossing a bound | `sql_count` | `{query_id, op, n}` — whitelisted `query_id` only (`devices_null_tenant`\|`open_gates`\|`draft_plans`), never raw SQL |
 | An umbrella plan (work unit) reaching a status | `unit_status` | `{work_unit_id, status}` — reads the work unit's `status` |
 | Another, cross-anchor gate clearing | `gate_cleared` | `{gate_id}` — composition |
-| Sensitive / security / billing / strategy | `operator_approval` + notify | see "Sensitive" below |
+| Sensitive / security / credential / billing | **not a predicate choice** — pick by what you wait on; proceed + notify | `_gate-registration` → "Sensitive-work rule" |
 
 **`unit_ready` vs `operator_approval` — do not mismodel a work queue as a human
 decision.** Ready, dispatchable, vetted work is `unit_ready`
@@ -229,14 +229,136 @@ Every gate needs exactly ONE anchor:
 `$COORD_HTTP_URL` defaults to `https://coord.qontinui.io`. Tenant **always**
 derives server-side from the JWT — never pass a tenant argument.
 
+### A2b. Which tenant: the one that OWNS the repo the gate is about
+
+"Tenant derives from the JWT" means **the credential you send IS the tenant you
+write under**. On a device bound to several tenants, that tenant is often the
+wrong one.
+
+Measured on 2020Dell on 2026-10-18 (the device is bound to `meryts-2-0` and
+`qontinui`):
+
+- A session started at the workspace root had a native coord-mcp whose runner
+  reported `tenant_source: unpinned-default`.
+- That runner held one credential slot, for `meryts-2-0`.
+- So every gate the session registered about a `qontinui/*` repo landed under
+  `meryts-2-0`.
+- The owner tenant's readers could not see those gates. They had to be
+  withdrawn and re-registered by hand.
+
+The fix is plan
+`2026-10-18-a-dispatched-continuation-strands-on-a-role-closed-target-and-a-multi-bound-device-writes-gates-under-the-wrong-tenant`.
+
+**When this section applies.** It applies to any gate that names an
+`owner/name` repo, either as a predicate `repo` or as an `owner/name#N`
+`resource_key`.
+
+**Known gap.** A plan-anchored gate whose predicate names no repo, such as
+`deploy_healthy`, is not covered. It still writes under the session's default
+tenant.
+
+**A2b.1: prove the owner** before Part B:
+
+```bash
+bash <workspace-root>/qontinui-claude-config/scripts/coord-owner-call.sh --repo "<owner/name>" --prove
+```
+
+The script prints its verdict on stdout as five fields (with `--call`, the
+response body follows them):
+
+- `owner_state`
+- `owner_tenant`
+- `bearer_src`
+- `bindings_count`, which is a number or `UNKNOWN`
+- `multi_bound`, which is `0`, `1` or `UNKNOWN`
+
+It is stateless. Each run proves the owner again, stages that tenant's bearer in
+a private temp dir, and deletes it on exit. Run it from the real cwd, with the
+real workspace root substituted for `<workspace-root>`.
+
+**A2b.2: act on its exit code.**
+
+- **Exit 0 (proven, and a device-JWT bearer is in hand).**
+  1. Read the tenant the native door acts as with the **`coord_query_identity`**
+     tool (`tenant_id`), when that tool is visible.
+  2. If it equals `owner_tenant`, register with Part B **Step 1 only**. If
+     Step 1 fails, do **not** fall to Steps 2-4b. Those rungs pick credentials
+     that are never checked against the owner. Use the script instead, as in
+     step 3.
+  3. If it differs, or there is no native door to ask, **skip Part B
+     entirely**. Register through the script, in this order. Each step is an
+     independent call under the same owner:
+     - **Plan-anchored gate only, first:** run `coord_work_unit_upsert` through
+       the script, so the unit is created in the owner's tenant.
+     - **Register:** run `--call coord_register_gate` with the arguments object
+       Step 1 would take.
+     - **Read back:** run `--call coord_gate_inspect '{"gate_id":"<id>"}'`. A
+       read made under the session's own credential cannot see a gate in
+       another tenant: coord answers "not found".
+
+     ```bash
+     bash <workspace-root>/qontinui-claude-config/scripts/coord-owner-call.sh --repo "<owner/name>" \
+       --call coord_register_gate '<the coord_register_gate arguments object>'
+     ```
+
+     Report the carrying rung as **"A2b (coord-owner-call over Step 4's
+     door)"**. On `--call`, three exit codes mean something other than success:
+     - **Exit 5:** coord reported an error or a refusal. The body is on
+       stdout; read it, and verify by read if the body does not settle whether
+       anything was written.
+     - **Exit 6:** the door failed, so the write is UNKNOWN. Verify by read
+       before you re-issue.
+     - **Exit 2:** the arguments were invalid, and nothing was sent.
+- **Exit 3 (not proven: refuted or unknown).**
+  - **`multi_bound=0`:** register over Part B, and say in your report that the
+    owner was `refuted` or `unknown` (quote `owner_state`). The device has one
+    tenant, so there is no other tenant the gate could have belonged to.
+  - **`multi_bound=1` or `UNKNOWN`:** **do not write.** The library's contract
+    is that a caller with no proven owner acts under no tenant. Part B's
+    default credential is exactly the wrong-tenant write this section exists to
+    stop. Report Step 5's honest failure, and quote the script's stderr.
+- **Exit 4 (proven, but the only credential this box could get for the owner
+  is a bootstrap mint).** The owner is known; only the script's own door is
+  closed (it never spends a bootstrap credential on `/mcp`).
+  1. Read the native door's tenant with `coord_query_identity`, exactly as for
+     exit 0. **If it equals `owner_tenant`, register with Part B Step 1 only**
+     — the session's own credential is already the owner's.
+  2. Otherwise **do not write.** Report Step 5's honest failure, naming the
+     proven owner (`owner_tenant`) and the missing credential slot. This is
+     today's state on 2020Dell for `qontinui/*` repos; the lasting fix is a
+     runner credential slot for every bound tenant (plan
+     `2026-10-17-runner-credential-for-every-account-tenant`).
+- **Exit 2 (usage error, invalid arguments, missing library, or insecure coord
+  URL).** A LOCAL fault, not a coord verdict, and nothing was sent. Fix the
+  call and re-run; if the fault is the environment, **stop and report** — do
+  not register over Part B with the owner unproven.
+
+**After qontinui-coord's repo-tenant guard deploys**, coord runs this check for
+claim-anchored gates itself.
+
+- The guard is unshipped as of 2026-10-18 (Phase 2 of the plan above). Until it
+  ships, no refusal comes back from coord, and A2b.1 / A2b.2 are the only
+  guard.
+- Once it ships, coord refuses a Part B Step 1 registration when both of these
+  hold:
+  - the gate's repo is owned by a tenant bound to your device;
+  - you are acting as a different tenant.
+- The refusal is a tool error that opens `repo_owned_by_other_tenant:`, or an
+  HTTP 409. **Nothing was written.**
+- That refusal is not a dead door. Do not fall to Part B Steps 2-4b. Run A2b.1
+  and A2b.2 for the refused repo.
+
 ### A3. `clearance_audience`
 
 - **`agent`** — an agent-verifiable fact a later session can attest
   (`coord_attest_gate`). Set this explicitly for agent-fact gates.
-- **`operator`** — needs business/judgment/strategy or on-page human verification,
-  or anything **security / credential / billing / strategy-sensitive**. **Default
-  when omitted.** Sensitive work ALWAYS `operator` + notify-only, never
-  auto-resuming — even under auto mode. When in doubt, treat as sensitive.
+- **`operator`** — a genuine closed-list operator decision (product/strategy, an
+  item-2 resource only a human can grant) or on-page human verification.
+  **Default when omitted.** Sensitivity alone (security / credential / billing)
+  never makes a gate `operator` or `operator_approval`: when the wait is
+  observable, gate on the observable; otherwise proceed (subject to the served
+  tier) and post a durable notification. Canonical: `_gate-registration` →
+  "Sensitive-work rule".
 
 ### A4. `gate_class` (optional — LIVE, send it)
 
@@ -290,12 +412,13 @@ you deliberately want an explicit typed no-op.
 
 Under charter rule 10 ("Finish to zero") a session finishes its own follow-ups
 in-session, so a redundant continuation queues a duplicate, parallel run of the
-same work. Attach one only for: a wait longer than rule 10's ≲2h monitor window;
-a session closing WITHOUT dispatching the follow-up (`/blocked`); an
+same work. Attach one only for: a follow-up that can only run after the
+watched event (a session never stays alive to wait — operator decision
+2026-10-17 — so every such follow-up outlives it); a session closing WITHOUT
+dispatching the follow-up (`/blocked`); an
 `operator_approval` / human-decision gate (unbounded in time); or a cross-session
-chain owned by another work unit or device. **Sensitive** gates (security /
-credential / billing / strategy) stay notify-only unconditionally.
-(Canonical: `_gate-registration` → "Continuation policy".)
+chain owned by another work unit or device. Sensitive subject matter changes
+none of this. (Canonical: `_gate-registration` → "Continuation policy".)
 
 **When you do attach one, all three spellings are that same knob — pick ONE.**
 Prefer the typed `continuation` on MCP (e.g.
@@ -346,6 +469,10 @@ with no `hint` is a fresh agent with no context" — keep copies in sync.)
 which step carried the gate and the returned `gate_id`.
 
 ### Step 1 — Native MCP tool `coord_register_gate` (probe: tool present)
+
+> **A gate that names an `owner/name` repo runs A2b first.** A2b decides
+> whether this cascade runs at all, and when it allows Step 1 it allows Step 1
+> ONLY — its "fall to Step 2" below does not apply.
 
 If `coord_register_gate` is in this session's tool set, call it with the anchor,
 typed predicate, `clearance_audience`, optional `gate_class`, and optional
@@ -558,8 +685,14 @@ for f in "${CANDIDATES[@]}"; do
   [ -s "$HDR" ] || { echo "cannot stage the nonce header (LOCAL fault, not a coord verdict)" >&2; break; }
   # AFTER the -s guard: the session line alone must never make it pass.
   caller_session_line >> "$HDR"
+  # The x-qontinui-* headers DECLARE the rung (plan
+  # 2026-09-20-first-rung-coord-reachability-is-unmeasured-then-unfixed);
+  # reporter-step `probe` keeps a diagnostic sweep out of the reads coord's
+  # fold counts once that plan's Phase 3 coord half (the probe filter) lands.
   code=$(curl -s --connect-timeout 5 -m 20 -o /dev/null -w '%{http_code}' -X POST "$url" \
     -H "Content-Type: application/json" \
+    -H 'x-qontinui-transport: loopback_proxy' -H 'x-qontinui-reporter: gate' \
+    -H 'x-qontinui-reporter-step: probe' \
     -H @"$(hdrp)" -d "$COORD_RPC")
   if [ "$code" = "200" ]; then LIVE_URL="$url"; LIVE_KEY="$key"; LIVE_HDR="$(mcp_keyhdr)"; echo "live proxy: $f ($url)"; break; fi
   echo "skip stale: $f -> HTTP $code"
@@ -595,7 +728,9 @@ captured `work_unit_id`):
 #   printf '%s: %s\n' "$LIVE_HDR" "$LIVE_KEY" > "$HDR"   # $LIVE_HDR = the header name the sweep found the nonce under
 #   caller_session_line >> "$HDR"   # define caller_session_line as in the Step-2 sweep first
 #   hdrp() { command -v cygpath >/dev/null 2>&1 && cygpath -w "$HDR" || printf '%s' "$HDR"; }
+# The rung is DECLARED: the loopback proxy, reporter `gate`.
 curl -fsS -X POST "$LIVE_URL" -H "Content-Type: application/json" \
+  -H 'x-qontinui-transport: loopback_proxy' -H 'x-qontinui-reporter: gate' \
   -H @"$(hdrp)" \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
         "name":"coord_register_gate",
@@ -661,12 +796,19 @@ Then POST the forwarder routes (`$LIVE_URL` ends in `/coord-mcp`):
 ```bash
 # $HDR/hdrp() carry the nonce off argv — staged by the Step-2 sweep above, in
 # the SAME shell. Starting fresh? Re-stage per the comment in the block above.
+# Every call DECLARES the rung: the runner's REST write forwarder, reporter
+# `gate` (plan 2026-09-20-first-rung-coord-reachability-is-unmeasured-then-unfixed).
+# KNOWN GAP: the forwarder (`coord_write_proxy_handler`) does not call
+# `record_coord_transport_rung` today, so these headers are sent but NO rung
+# row is written for this door yet. They are sent now so the rows are correct
+# from the day the forwarder records them (a tracked follow-up).
+DECL_W=(-H 'x-qontinui-transport: write_forwarder' -H 'x-qontinui-reporter: gate')
 # 1. plan-anchored: upsert the work unit (capture work_unit_id), then register:
 WU=$(curl -fsS -X POST "$LIVE_URL/work-units/upsert" \
-  -H @"$(hdrp)" -H "Content-Type: application/json" \
+  -H @"$(hdrp)" "${DECL_W[@]}" -H "Content-Type: application/json" \
   -d '{"slug":"<stem>","title":"<plan H1>"}')   # work_unit_id is in $WU
 curl -fsS -X POST "$LIVE_URL/work-units/<stem>/register-gate" \
-  -H @"$(hdrp)" -H "Content-Type: application/json" \
+  -H @"$(hdrp)" "${DECL_W[@]}" -H "Content-Type: application/json" \
   -d '{ "phase_name":"deploy confirmation",
         "predicate":{"kind":"deploy_healthy","service":"coord",
                      "expected_rev":"<sha the deploy must INCLUDE>"},
@@ -674,7 +816,7 @@ curl -fsS -X POST "$LIVE_URL/work-units/<stem>/register-gate" \
         "gate_class":"ops-confirm" }'
 # 2. claim-anchored (no slug) — the NEW forwarder route:
 curl -fsS -X POST "$LIVE_URL/gates/register" \
-  -H @"$(hdrp)" -H "Content-Type: application/json" \
+  -H @"$(hdrp)" "${DECL_W[@]}" -H "Content-Type: application/json" \
   -d '{ "claim_kind":"file_glob", "resource_key":"qontinui-coord/crates/coord/src/gates.rs",
         "predicate":{"kind":"ci_green","repo":"qontinui/qontinui-coord",
                      "head_sha":"<the sha CI must be green for>"},
@@ -684,7 +826,7 @@ curl -fsS -X POST "$LIVE_URL/gates/register" \
 #   ci_green takes a FIXED head_sha — never a branch name.
 # attest (unchanged — keyed by gate_id):
 curl -fsS -X POST "$LIVE_URL/gates/<gate_id>/attest" \
-  -H @"$(hdrp)"
+  -H @"$(hdrp)" "${DECL_W[@]}"
 ```
 
 A successful register returns **`201` with `{ "gate_id": "<uuid>" }`**.
@@ -834,16 +976,39 @@ write:
 $jwt = ''; $mintSource = ''
 # Two names for one access_token slot: get_coord_device_token first (no tier
 # gate; `data: null` means this device is unpaired), then the older spelling.
+# THE TENANT this session acts for: $QONTINUI_TENANT_ID, else the runner session
+# census row for $QONTINUI_TERMINAL_ID (coord-revive.sh resolve_session_tenant's
+# rule). It rides ONLY in the runner's real envelope, {"args":{"tenantId":...}} -
+# a top-level key is dropped, which on a multi-slot runner is a 409
+# tenant_required. With a tenant named, the older name and the eval mint (the
+# DEFAULT slot, which cannot be asked for one) are never consulted, and the
+# token's tenant_id claim is checked below.
+$tenant = $env:QONTINUI_TENANT_ID
+if (-not $tenant -and $env:QONTINUI_TERMINAL_ID) {
+  try {
+    $census = Invoke-RestMethod -Uri 'http://127.0.0.1:9876/control/sessions/info' -TimeoutSec 10
+    $row = @($census.data.sessions) | Where-Object { $_.identity.terminalId -eq $env:QONTINUI_TERMINAL_ID } | Select-Object -First 1  # envelope-ok: a predicate search over the census rows; no row leaves $tenant unset, never a default
+    if ($row -and $row.tenancy.row.tenantId) { $tenant = [string]$row.tenancy.row.tenantId }
+    elseif ($row -and $row.tenancy.credential.status -eq 'resolved') { $tenant = [string]$row.tenancy.credential.tenantId }
+  } catch { }
+}
+if ($tenant -and $tenant -notmatch '^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$') { throw "QONTINUI_TENANT_ID '$tenant' is not a uuid - refusing to mint rather than ignore it" }
+$mintBody = if ($tenant) { '{"args":{"tenantId":"' + $tenant.ToLower() + '"}}' } else { '{}' }
 $absentNames = 0
 foreach ($route in 'ui-bridge/invoke/get_coord_device_token', 'ui-bridge/invoke/get_access_token_for_websocket') {
+  if ($tenant -and $route -like '*websocket') { break }   # the default slot cannot be asked for a tenant
   try {
     $r = Invoke-RestMethod -Uri "http://127.0.0.1:9876/$route" `
-         -Method Post -ContentType 'application/json' -Body '{}' -TimeoutSec 20
+         -Method Post -ContentType 'application/json' -Body $mintBody -TimeoutSec 20
     $jwt = [string]$r.data; $mintSource = 'runner-invoke'  # envelope-ok: PowerShell has no envelope arm; the invoke door answers data as the bare token
     break
   } catch {
     $status = 0; try { $status = [int]$_.Exception.Response.StatusCode } catch { }
     $said = ''; try { $said = [string]$_.ErrorDetails.Message } catch { }
+    # The runner's typed 401: its OWN coord credential has expired. Its own
+    # outcome - never "pair this device", never a reason to retry the mint
+    # (both names read the same credential). Fall through to (c) / Step 4b.
+    if ($said -match 'DEVICE_TOKEN_EXPIRED:') { throw "RUNNER_MINT_EXPIRED: the runner's coord credential has expired - sign in to the runner. Do not retry the mint; use (c) or Step 4b. Runner said: $said" }
     # ONLY the allowlist 400 (or a 404 for the route) moves to the next name:
     # this build predates the entry. Anything else is the runner's verdict.
     if (-not (($status -eq 400 -and $said -match 'not in UI Bridge allowlist') -or $status -eq 404)) { throw }
@@ -877,16 +1042,37 @@ if ($absentNames -eq 2) {
   $mintSource = 'runner-eval'
 }
 $jwt = $jwt.Trim()
+if (-not $jwt -and $tenant) {
+  # Named, so neither default-slot door was asked: say which of the two it was.
+  if ($absentNames -ge 1) { throw "this runner build has no get_coord_device_token entry - the only door that can be ASKED for tenant $tenant; export a COORD_DEVICE_JWT that claims it (never restart a running runner over this)" }
+  throw "the runner holds no token for tenant $tenant (get_coord_device_token answered null) - not a sign-in problem"
+}
 # Shape-check before trusting it: a SIGNED-OUT runner answers 200 with an empty
 # or non-token value, and sending that as a bearer turns a missing credential
 # into a 401 the caller then has to decode. Reaching this with an EMPTY $jwt now
 # means the runner really did answer without a token, not that the read missed.
 if ($jwt.Split('.').Count -ne 3) { throw 'runner returned a non-JWT (signed out?)' }
+# CLAIM CHECK: a token for ANOTHER tenant is discarded, never sent - its claim
+# is named, the token never is. (No tenant resolved: unchanged, and on a runner
+# holding several slots the tenant-less ask above already threw its 409.)
+if ($tenant) {
+  $p = $jwt.Split('.')[1].Replace('-', '+').Replace('_', '/'); switch ($p.Length % 4) { 2 { $p += '==' } 3 { $p += '=' } }
+  $claim = ''; try { $claim = [string]([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($p)) | ConvertFrom-Json).tenant_id } catch { }
+  if ($claim -ne $tenant.ToLower()) { $jwt = ''; throw "the runner minted a token claiming tenant '$claim', not this session's $tenant - DISCARDED, never sent" }
+}
+# An OLDER runner build hands back an EXPIRED token as a success instead of the
+# typed 401 above: decode `exp` (expired = exp <= now - 30, the runner's own
+# 30 s post-expiry grace, EXPIRY_LEEWAY_SECS)
+# and name it the same way rather than send it. Judged AFTER the claim check:
+# a wrong-tenant token is discarded as such whatever its exp.
+$p = $jwt.Split('.')[1].Replace('-', '+').Replace('_', '/'); $p += '=' * ((4 - $p.Length % 4) % 4)
+$exp = $null; try { $exp = [int64](([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($p)) | ConvertFrom-Json).exp) } catch { }
+if ($exp -and $exp -le ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - 30)) { throw "RUNNER_MINT_EXPIRED: the runner's coord credential has expired - sign in to the runner. Do not retry the mint; use (c) or Step 4b." }
 # This session's own id beside the bearer, so coord stamps the gate with the
 # session that registered it - the same validate-then-fall-through rule as the
 # bash `caller_session_line` (plan
 # 2026-09-30-session-attribution-is-too-sparse-to-derive-a-terminal-state).
-$hdrs = @{ Authorization = "Bearer $jwt" }
+$hdrs = @{ Authorization = "Bearer $jwt"; 'x-qontinui-transport' = 'http_agent_door'; 'x-qontinui-reporter' = 'gate' }
 $cs = @($env:QONTINUI_AGENT_SESSION_ID, $env:CLAUDE_CODE_SESSION_ID) |
   Where-Object { $_ -cmatch '\A[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}\z' } |
   Select-Object -First 1
@@ -925,8 +1111,16 @@ fi
 # STOP on a failed or empty mint — do not fall through. An empty $BEARER stages
 # "Authorization: Bearer " and coord answers 401, which reads as "coord rejected
 # the bearer" when the truth is "there was no bearer".
-BEARER=$(bash "$ROOT/qontinui-claude-config/scripts/coord-acting-bearer.sh") || \
-  { echo "no acting bearer (no agent JWT / coord down) — see Step 4, then Step 5"; exit 1; }
+# Exit 4 is coord refusing the PRESENTER (not a paired device JWT or an
+# allocated-authenticated agent token): to REGISTER, go to Step 4b.
+# A missing helper is said here, before the call: `bash <missing-file>` exits
+# 127, which collides with the helper's OWN exit 127.
+AB_HELPER="$ROOT/qontinui-claude-config/scripts/coord-acting-bearer.sh"
+[ -f "$AB_HELPER" ] && [ -r "$AB_HELPER" ] || { echo "helper not found under $ROOT"; exit 1; }
+BEARER=$(bash "$AB_HELPER"); AB_RC=$?
+[ "$AB_RC" = 4 ] && { echo "acting bearer refused: \$COORD_AGENT_JWT is not a proven presenter — to register, see Step 4b; to attest/withdraw, Steps 1-4"; exit 1; }
+[ "$AB_RC" = 0 ] || \
+  { echo "no acting bearer (exit $AB_RC: 127 = curl or JSON reader missing; otherwise no agent JWT / coord down) — see Step 4, then Step 5"; exit 1; }
 [ -n "$BEARER" ] || { echo "acting-bearer mint returned empty — see Step 4, then Step 5"; exit 1; }
 # Stage the bearer off argv, exactly as the mint itself does (PR #160): process
 # cmdlines are world-readable on this multi-session machine. If you carried
@@ -956,6 +1150,12 @@ AUTH=$(mktemp) || { echo "mktemp failed — cannot stage the bearer off argv" >&
 printf 'Authorization: Bearer %s\n' "$BEARER" > "$AUTH"
 caller_session_line >> "$AUTH"
 AUTHP=$AUTH; command -v cygpath >/dev/null 2>&1 && AUTHP=$(cygpath -w "$AUTH")
+# DECLARE the rung, in the staged header file every call below already sends:
+# coord's hand-written agent routes, reached directly (edit the attempted list
+# to what you actually tried).
+printf '%s\n' 'x-qontinui-transport: http_agent_door' \
+  'x-qontinui-transport-attempted: native_mcp,loopback_proxy,write_forwarder' \
+  'x-qontinui-reporter: gate' >> "$AUTH"
 # 1. upsert the work unit (capture work_unit_id):
 WU=$(curl -fsS -X POST "$COORD_HTTP_URL/coord/work-units/upsert" \
   -H @"$AUTHP" -H "Content-Type: application/json" \
@@ -978,10 +1178,19 @@ curl -fsS -X POST "$COORD_HTTP_URL/coord/gates/<gate_id>/attest" \
 ```
 
 The bearer is **agent-scoped** (work-unit writes + `register` only — never
-approve/reject). `coord-acting-bearer.sh` reads `$COORD_AGENT_JWT` — its ONLY
+approve/reject, and never withdraw). So a session whose only working rung is this
+one can register a safety net it can never withdraw: `/vet-plan` §5.4 step 6's
+no-withdraw-door skip (under `/vet-imp`) and `/implement-plan` Step 0.5's
+`NO implement→ship net (no withdraw door: …)` arm register NO such net from it. `coord-acting-bearer.sh` reads `$COORD_AGENT_JWT` — its ONLY
 source; there is no file sweep — and always prints `credential from <source>` to
 stderr (the source name, never the token). Exit codes: `0` ok; `2` no
-`$COORD_AGENT_JWT`; `3` mint failed; `127` missing jq/curl. Same claim-anchor
+`$COORD_AGENT_JWT`; `3` mint failed; `4` coord refused the presenter (only a
+paired device JWT or an allocated-authenticated agent token may act for the
+operator) — to REGISTER, fall through to Step 4b, which mints its own bootstrap
+credential for the two registration routes (register only; never spend an
+`/agents/allocate` token there); to attest or withdraw, use a door carrying a
+paired device JWT or the proxy nonce (Steps 1–4); `127` curl missing or no
+working JSON reader (jq / python). Same claim-anchor
 fallback applies (A2).
 
 > **Step 3 is NOT independent of Step 2 — know what its failure means.** Both
@@ -1040,6 +1249,11 @@ cascade here — residual (b) above is the bash/PowerShell form, and
 'bearer'`) is the shipped implementation, which additionally reports a headless
 runner as a **dead transport** rather than a missing credential.
 
+> The file token expires (~4 h). When it has, refresh it with the tracked, eval-free refresher
+> `bash <workspace-root>/qontinui-claude-config/scripts/refresh-coord-device-jwt.sh --if-stale`
+> (`--tenant <uuid>` on a device bound to several tenants; it never prints the token, and exits 2 when
+> the runner is unreachable) before treating the file source as missing.
+
 > ⚠️ **NEVER carry this rung on a JWT minted from `POST /agents/allocate`.**
 > That route is genuinely unauthenticated and mints a **4-hour full-scope agent
 > JWT** to anyone who knows a registered device UUID. It is an open security
@@ -1094,6 +1308,12 @@ AUTHP=$AUTH; command -v cygpath >/dev/null 2>&1 && AUTHP=$(cygpath -w "$AUTH")
 # below carry no bound on purpose: once the probe has said the door is live, a
 # slow write is still a write, and killing one at 15s would leave a coord-side
 # effect nobody read back.
+# DECLARE the rung, in the staged header file every call below already sends:
+# coord's remote MCP door, reached directly (edit the attempted list to what you
+# actually tried).
+printf '%s\n' 'x-qontinui-transport: remote_mcp' \
+  'x-qontinui-transport-attempted: native_mcp,loopback_proxy' \
+  'x-qontinui-reporter: gate' >> "$AUTH"
 curl -fsS --connect-timeout 5 -m 15 -X POST "$COORD_HTTP_URL/mcp" \
   -H "Content-Type: application/json" \
   -H @"$AUTHP" -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
@@ -1306,7 +1526,15 @@ caller_session_line() {
   done
   return 0
 }
+# DECLARE the rung in the same staged file (plan
+# 2026-09-20-first-rung-coord-reachability-is-unmeasured-then-unfixed), with the
+# rungs that refused you in cascade order (edit the attempted list to what you
+# actually tried); the caller-session line goes LAST, after every write it must
+# follow.
+ATTEMPTED_HDR='x-qontinui-transport-attempted: native_mcp,loopback_proxy,write_forwarder,remote_mcp,http_agent_door'
 printf 'Authorization: Bearer %s\n' "$TOK" > "$HDR"
+[ -s "$HDR" ] || { echo "cannot stage the bootstrap bearer header (LOCAL fault, not a coord verdict)" >&2; exit 1; }
+printf '%s\n' 'x-qontinui-transport: bootstrap_credential' "$ATTEMPTED_HDR" 'x-qontinui-reporter: gate' >> "$HDR"
 caller_session_line >> "$HDR"
 # VERIFY BEFORE USE — a mint is not an authentication.
 curl -sS -o /dev/null -w '%{http_code}\n' -m 20 -H @"$(hdrp)" \
@@ -1316,7 +1544,11 @@ curl -sS -o /dev/null -w '%{http_code}\n' -m 20 -H @"$(hdrp)" \
 **Then spend the bearer ONLY on the REGISTRATION routes Step 3 already spells
 out** — `POST $COORD_HTTP_URL/coord/work-units/upsert` and
 `POST $COORD_HTTP_URL/coord/work-units/<stem>/register-gate` — with the header
-FILE, never the token on argv. **ATTEST and WITHDRAW are not on this rung.**
+FILE (`-H @"$(hdrp)"` in place of that block's `-H @"$AUTHP"`), never the token
+on argv. That file already DECLARES this rung — the
+`bootstrap_credential` transport, the `x-qontinui-transport-attempted` list of
+the rungs that refused you, and reporter `gate` — so it replaces that block's
+`http_agent_door` lines rather than adding to them. **ATTEST and WITHDRAW are not on this rung.**
 Anyone can mint this bearer for any registered device, so it proves nothing
 about who is clearing or withdrawing a gate (plan
 `2026-09-23-anonymous-agent-credential-mint-can-act-as-any-registered-device`,
@@ -1344,7 +1576,11 @@ mint it for any registered device, so it proves nothing about who is clearing a
 gate. This rung spends it on the two registration routes above and nothing else. `coord-revive.sh`'s
 `PARTIAL_BOOTSTRAP` block states the same `/mcp` acceptance; this rung and that
 one are the same door and must report it in one spelling. The attest/withdraw
-fence is this rung's rule, not that block's.
+fence is this rung's rule, not that block's. **Its consequence for a
+continuation-bearing gate:** a session whose only working rung is this one can
+register a safety net it can never withdraw, so `/vet-plan` §5.4 step 6's
+no-withdraw-door skip (under `/vet-imp`) and `/implement-plan` Step 0.5's
+`NO implement→ship net (no withdraw door: …)` arm register NO such net from it.
 
 **What the bearer is, measured.** EdDSA, `iss=qontinui-coord`,
 `sub=device:<device_id>`, `sub_type=agent`, tenant resolved server-side from
@@ -1412,7 +1648,8 @@ and point at the self-check:
 > TYPED CODE (see residual (a) — name which one); **runner UI Bridge mint
 > unavailable** (`127.0.0.1:9876` unreachable, or the runner is signed out and
 > returned a non-JWT); acting-bearer mint failed (exit N: `$COORD_AGENT_JWT`
-> unset / coord down); **generic remote MCP** `POST $COORD_HTTP_URL/mcp` → HTTP
+> unset (2) / mint refused or coord down (3) / presenter refused (4) / curl or
+> JSON reader missing (127)); **generic remote MCP** `POST $COORD_HTTP_URL/mcp` → HTTP
 > CODE, or NO DEVICE JWT RESOLVABLE (say which — and never reach for an
 > `/agents/allocate` token to make this line go away);
 > **bootstrap credential** `POST $COORD_HTTP_URL/agents/credential` → HTTP CODE
@@ -1469,28 +1706,66 @@ route is not mounted, that the door does not exist, that agents cannot register
 a gate here — a seven-line probe report is still a sample, not a search:
 
 <!-- detector-reach-fence:start -->
-> **A capability negative cites a CENSUS, never a probe.** Before recording
-> "no door", "agents cannot", "this route does not exist" or any other claim
-> that a capability is ABSENT, run the route census,
-> `coord-route-census.sh <fragment>`, from wherever your deployment installs
-> it — spelled by its absolute path, because a bare relative path resolves
-> only from the checkout that ships it, and a session standing anywhere else
-> gets exit 127
-> (it reads `origin/main` of BOTH `qontinui-coord` and `qontinui-web`, never
-> a working tree and never a live host) — and paste its trailer verbatim
-> beside the claim:
-> `census: fragment=<f> hosts_read=coord.qontinui.io,api.qontinui.io ref=<sha>,<sha> routes=<n> unextracted=<n> unmounted=<n> generated=<ISO time>`
-> — the line that parses under the census tool's own `CENSUS_TRAILER_RE`.
-> Where no census tool is reachable at all, the negative cannot be settled and
-> is UNVERIFIED.
-> A 401, 404 or 405 on ONE spelling of
+> **A capability negative cites EMITTED EVIDENCE, never a probe.** Before
+> recording "no door", "agents cannot", "this route does not exist" or any
+> other claim that a capability is ABSENT, paste beside it, verbatim, ONE of
+> the two lines that can evidence one (items 1 and 2; item 3 can only refute
+> one) — each from a tool run from wherever your deployment installs it,
+> spelled by its absolute path, because a bare relative path resolves only
+> from the checkout that ships it, and a session standing anywhere else gets
+> exit 127:
+>
+> 1. **A census trailer** from the route census,
+>    `coord-route-census.sh <fragment>` (it reads `origin/main` of BOTH
+>    `qontinui-coord` and `qontinui-web`, never a working tree and never a
+>    live host):
+>    `census: fragment=<f> hosts_read=coord.qontinui.io,api.qontinui.io ref=<sha>,<sha> routes=<n> unextracted=<n> unmounted=<n> generated=<ISO time>`
+>    — the line that parses under the census tool's own `CENSUS_TRAILER_RE`.
+>    `routes=UNKNOWN` (exit 2) settles nothing; `routes=0` with both refs
+>    resolved is the only honest negative; `routes=` above 0 contradicts it;
+>    `admits=unknown` on a listed row means unmeasured, never "operator-only".
+> 2. **A `FLOOR-CLAIM:` line** from
+>    `coord-revive.sh --floor-claim` (the coord-revive skill's resolver)
+>    whose verdict is `FLOOR` — `verdict=LIVE` contradicts the negative, and
+>    `verdict=UNKNOWN` settles nothing.
+> 3. **A `refusal-read:` line is NOT evidence FOR a negative.** It comes from
+>    `refusal-remedy.sh`:
+>    `refusal-read: code=<code> tool=<tool> state=<REMEDY_WORKS|REMEDY_PRECONDITION_UNMET|REMEDY_FAILED|NO_REMEDY_PROBE|UNKNOWN> detail=<token> measured=<ISO>`
+>    — and a typed refusal shows coord ANSWERED and named a precondition, so
+>    it never stamps a negative. Any state that shows coord answered
+>    CONTRADICTS the negative whose code (or the tool the probe called) it
+>    matches: `state=REMEDY_WORKS`, `REMEDY_PRECONDITION_UNMET` with
+>    `detail=` `session_not_owned_by_caller`, `caller_owns_no_active_session`,
+>    `harness_session_id_required_measured`, `header_not_honored` or
+>    `stale_build`, and `REMEDY_FAILED detail=build_current`. Publish the
+>    precondition and its remedy instead of the negative. Every other line
+>    shows nothing either way: `UNKNOWN`, `NO_REMEDY_PROBE` (no probe ran),
+>    `REMEDY_FAILED detail=orient_refused` (the probe's own call was
+>    refused), a detail this list does not name.
+>
+> Where no census tool is reachable at all, a route negative cannot be
+> settled and is UNVERIFIED.
+>
+> A stamp counts only when the tool EMITTED it on this box; a line you typed,
+> however well-formed, is not evidence. It counts only beside the negative it
+> is offered for: a census only for a negative about the route it names —
+> never a refusal, never one in a sentence naming a coord tool — and only
+> when censuses cover every route that negative names; a `FLOOR-CLAIM:` for
+> a door or credential negative with no refusal in it — and every negative
+> in the text, clause by clause, needs its own. A 401, 404 or 405 on ONE spelling of
 > ONE host is a sample, not a search: `/api/v1/memory` refuses on
-> `coord.qontinui.io` and answers on `api.qontinui.io`. A claim without the
-> trailer is **UNVERIFIED and is not recorded** — not as a finding, not as a
-> memory, not as a plan premise. `routes=UNKNOWN` (exit 2) means the census
-> could not read a source and settles nothing; `routes=0` with both refs
-> resolved is the only honest negative, and `admits=unknown` on a listed row
-> means unmeasured, never "operator-only".
+> `coord.qontinui.io` and answers on `api.qontinui.io`. `_routes` is not a
+> census either — of the five `user_id`-bearing credential doors (roster in
+> `knowledge-base/qontinui-specific/coord-gates-and-access.md`), "three of
+> them are not routes at all, and one of them (door 5) is a file on local disk
+> that no route census, `_routes` enumeration or allowlist read can surface."
+> So **a credential-door class-negative is settled by probing the roster,
+> never by enumerating a surface**, and a report that could not probe a
+> member says `UNKNOWN (door N unprobed)` for it rather than folding the miss
+> into a class verdict. A claim without accepted evidence is **UNVERIFIED and
+> is not recorded** — not as a finding, not as a memory, not as a plan
+> premise. The publication-time capability-negative gate quotes this very
+> block as its deny message.
 <!-- detector-reach-fence:end -->
 
 **And there is a FURTHER verdict that is not a failure of the credential at all.**
@@ -1632,8 +1907,12 @@ success.
   on a coord-orchestrated repo carries one; so does
   `continuation_dropped_born_cleared:`, which drops only the continuation and
   leaves a healthy gate (on ANY predicate kind — it branches on the verdict, not
-  the predicate); and so does `deploy_order_predicate_weaker:`, which says a
-  `pr_merged` gate whose `phase_name` declares deploy intent clears EARLIER
+  the predicate); so does `registered_as_record_not_watch:`, which says a gate
+  registered with no continuation was already satisfied at the door (a record,
+  not a watch — the ordinary shape of a `unit_ready` gate whose predicate is
+  already true when `/vet-plan` registers it); and so does
+  `deploy_order_predicate_weaker:`, which says a `pr_merged` gate whose `phase_name`
+  declares deploy intent clears EARLIER
   than the condition it describes — the gate itself is fine (see the
   deploy-order row in A1). That last one fires on the same predicate kind as
   the orchestrated-repo steer, so the two co-occur and a healthy gate comes

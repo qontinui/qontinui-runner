@@ -1,0 +1,8 @@
+   Compiling qontinui-runner v1.0.11 (/home/runner/work/qontinui-runner/qontinui-runner/src-tauri)
+error: expected one of `,`, `:`, or `}`, found `.`
+  --> src-tauri/src/fleet.rs:211:18
+   |
+211 |     let x = Foo { a.b };
+   |                  ^ expected one of `,`, `:`, or `}`
+memory allocation of 4096 bytes failed
+error: could not compile `qontinui-runner` (lib test) due to 1 previous error

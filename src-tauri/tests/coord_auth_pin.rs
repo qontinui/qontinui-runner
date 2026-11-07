@@ -171,7 +171,11 @@ const EXPECTED_EXEMPTIONS: &[(&str, &str, usize)] = &[
     ("agent_token/mod.rs", "agent-jwt", 1),
     ("bin/qontinui_cli.rs", "not-coord", 1),
     ("ci_node/reporting.rs", "device-jwt-required", 2),
-    ("commands/ai_settings.rs", "not-coord", 3),
+    // Shrank 3 -> 1 (plan 2026-10-09-spec-front-end-of-the-software-factory
+    // Phase 9): the Claude connection test and the usage probe now build their
+    // requests through `model_gateway::ModelCall`, which has no `.post(` here and
+    // never attaches a coord credential. The remaining site is the Gemini call.
+    ("commands/ai_settings.rs", "not-coord", 1),
     ("coord_doctor.rs", "diagnostic", 1),
     ("coord_mcp.rs", "not-coord", 1),
     ("credential_helper.rs", "device-jwt-required", 1),
@@ -184,6 +188,12 @@ const EXPECTED_EXEMPTIONS: &[(&str, &str, usize)] = &[
     // implementation off the native UI thread. Kind and count are unchanged,
     // so the coverage readout has no new hole.
     ("mcp/ai_session.rs", "not-coord", 1),
+    // The Phase 7 seed arm's POST to coord's per-binding door
+    // (`/coord/devices/{id}/tenant-token`, plan
+    // `2026-09-20-per-tenant-coord-credentials-and-a-workspace-tenant-pin`):
+    // it mints the requested tenant's first credential, presenting another
+    // bound tenant's device JWT.
+    ("mcp/device_jwt_refresher.rs", "bootstrap", 1),
     ("mcp/device_jwt_refresher.rs", "not-coord", 1),
     ("mcp/device_jwt_refresher.rs", "self-refresh", 2),
     ("mcp/session_compliance.rs", "device-jwt-required", 1),
@@ -213,6 +223,14 @@ const EXPECTED_EXEMPTIONS: &[(&str, &str, usize)] = &[
     ("orchestration_loop/coord_gate.rs", "device-jwt-required", 1),
     ("pair.rs", "bootstrap", 1),
     ("pair.rs", "not-coord", 2),
+    // The session-identity reporter's POST to coord's
+    // /coord/session-identity/:device_id (plan
+    // `2026-10-19-session-lookup-by-name-shows-claude-account-in-web` Phase 2).
+    // It presents the paired-device JWT it resolved itself via
+    // `device_bearer_scoped(TenantScope::Device)` and returns before the POST
+    // when there is none: the door refuses any other credential, so the
+    // fail-soft defaulting helper (which would send anonymously) is wrong here.
+    ("session/identity_stamp.rs", "device-jwt-required", 1),
     ("session_bus.rs", "device-jwt-required", 1),
     ("session_bus.rs", "not-coord", 1),
     ("terminal/context_watcher.rs", "not-coord", 1),
@@ -826,7 +844,11 @@ const TENANT_SCOPE_KINDS: &[(&str, &str)] = &[
 /// gone from this table.
 const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
     ("agent_runtime.rs", "device", 5),
-    ("agent_runtime.rs", "session-noop", 6),
+    // 7th: `report_session_launched` (plan 2026-09-30-session-attribution-is-too-
+    // sparse-to-derive-a-terminal-state Phase 4) — POST /agents/{agent_id}/session;
+    // coord resolves the tenant from the allocation's own rows (like post_log); route
+    // and its reporter_owns_allocation check land in qontinui-coord#2746.
+    ("agent_runtime.rs", "session-noop", 7),
     ("agent_worktree/edit_effect_loop.rs", "session-noop", 1),
     ("claude_session/spawn_preconditions.rs", "device", 1),
     ("claude_session/trust_gate.rs", "device", 1),
@@ -848,7 +870,6 @@ const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
     ("mcp/probe_executor.rs", "device", 1),
     ("repo_tenant.rs", "device", 2),
     ("plan_workunit_adapter/body_push.rs", "work-owed", 3),
-    ("session/handoff.rs", "escalated", 1),
 ];
 
 /// Totals across the whole table, asserted independently of the per-file rows
@@ -951,12 +972,20 @@ const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
 /// `GET /coord/repos/tenants` read. It is `device` by the route's contract:
 /// coord answers it over the caller DEVICE's own `tenant_devices` bindings and
 /// refuses any principal that does not prove a device. So `device` 21 -> 22.
+///
+/// Plan `2026-10-10-remote-create-residuals-followups` Phase 4 then retired
+/// `session/handoff.rs`'s `escalated` site: `close_source` no longer sends the
+/// operator-admin `DELETE /sessions/:id` but coord's device-authed
+/// `POST /sessions/:id/handoff/complete`, presenting the SOURCE session's
+/// tenant slot through `attach_device_auth_for` — the call was what was wrong,
+/// so it moved onto the stating seam and is no longer scanned. So `escalated`
+/// 2 -> 1.
 const EXPECTED_TENANT_SCOPE_TOTALS: &[(&str, usize)] = &[
     ("device", 22),
-    ("session-noop", 10),
+    ("session-noop", 11),
     ("session-owed", 0),
     ("work-owed", 8),
-    ("escalated", 2),
+    ("escalated", 1),
 ];
 
 /// Extract the kind from `coord-tenant-scope(<kind>):`.
@@ -1164,8 +1193,14 @@ fn every_defaulting_call_site_declares_its_tenant_scope() {
          2026-09-20-a-sessions-tenant-follows-its-repo-and-every-coord-answer-names-its-tenant \
          Phase 4 then added repo_tenant.rs's fetch_repo_tenants, the cwd resolver's \
          `GET /coord/repos/tenants` read (device: coord answers it over the caller DEVICE's own \
-         bindings and refuses any principal that does not prove a device): 41 + 1 = 42. \
-         Found {sites}. A change here \
+         bindings and refuses any principal that does not prove a device): 41 + 1 = 42. Plan \
+         2026-09-30-session-attribution-is-too-sparse-to-derive-a-terminal-state Phase 4 then \
+         added agent_runtime's report_session_launched (POST /agents/{{agent_id}}/session, \
+         session-noop): 42 to 43. Plan \
+         2026-10-10-remote-create-residuals-followups Phase 4 then moved session/handoff.rs's \
+         escalated close_source onto the stating seam (coord's device-authed handoff-complete \
+         door under the source session's tenant slot, replacing the operator-admin DELETE): \
+         43 - 1 = 42. Found {sites}. A change here \
          is fine — it just has \
          to be deliberate. It goes DOWN when a site adopts \
          `attach_device_auth_for(.., TenantScope)`, and UP only when someone adds a new \

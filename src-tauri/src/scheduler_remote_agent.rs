@@ -121,7 +121,7 @@ pub(crate) struct RemoteAgentLaunch {
 }
 
 /// Where a scheduled run's transcript lands: `~/.qontinui/scheduler-runs/`.
-fn scheduler_logs_root() -> Option<PathBuf> {
+pub(crate) fn scheduler_logs_root() -> Option<PathBuf> {
     qontinui_runner_lib::ambient::qontinui_dir().map(|d| d.join("scheduler-runs"))
 }
 
@@ -183,34 +183,65 @@ pub(crate) fn compose_prompt(prompt: &str, mcp_connections: &[McpConnectionRef])
 /// child EXIT when the task is done — an interactive session would idle at its
 /// prompt forever. `--dangerously-skip-permissions` for the same reason every
 /// autonomous spawn carries it: nobody is at the keyboard to click Allow.
+///
+/// When the operator selected the allow-list session posture
+/// (`settings.claude_session_permission`, plan
+/// `2026-10-09-spec-front-end-of-the-software-factory` D7), bypass is replaced by
+/// `--permission-mode dontAsk` and a tool list that can only NARROW the
+/// operator's: the INTERSECTION of the task's `allowed_tools` and the
+/// operator's list (review M1), or the operator's list when the task declares
+/// none. A task whose tools share nothing with the operator's list is refused —
+/// running it with the task's wider list, or with none, would both be wrong.
+/// `--allowedTools` is rendered by the shared
+/// [`allowed_tools_args`](crate::claude_session::launch_spec::allowed_tools_args).
 pub(crate) fn claude_args(
     session_id: &str,
     model: Option<&str>,
     allowed_tools: &[String],
     max_turns: u32,
-) -> Vec<String> {
-    let mut args = vec![
-        "-p".to_string(),
-        "--dangerously-skip-permissions".to_string(),
+    session_permission: &crate::claude_session::launch_spec::SessionPermissionSetting,
+) -> Result<Vec<String>, String> {
+    use crate::claude_session::launch_spec::{
+        allowed_tools_args, intersect_tool_lists, PermissionMode,
+    };
+
+    let task_tools = allowed_tools_args(allowed_tools);
+    let (permission, tools_tail) = match session_permission.apply(PermissionMode::DangerouslySkip) {
+        PermissionMode::AllowList { tools } => {
+            let effective = if task_tools.is_empty() {
+                tools.clone()
+            } else {
+                let kept = intersect_tool_lists(&tools, allowed_tools);
+                if kept.is_empty() {
+                    return Err(format!(
+                        "scheduled task refused: none of its allowed_tools {allowed_tools:?} is on \
+                         the operator's session allow-list {tools:?}"
+                    ));
+                }
+                kept
+            };
+            (
+                PermissionMode::AllowList { tools: Vec::new() }.render(),
+                allowed_tools_args(&effective),
+            )
+        }
+        other => (other.render(), task_tools),
+    };
+
+    let mut args = vec!["-p".to_string()];
+    args.extend(permission);
+    args.extend([
         "--session-id".to_string(),
         session_id.to_string(),
         "--max-turns".to_string(),
         max_turns.to_string(),
-    ];
+    ]);
     if let Some(m) = model.map(str::trim).filter(|m| !m.is_empty()) {
         args.push("--model".to_string());
         args.push(m.to_string());
     }
-    let tools: Vec<&str> = allowed_tools
-        .iter()
-        .map(|t| t.trim())
-        .filter(|t| !t.is_empty())
-        .collect();
-    if !tools.is_empty() {
-        args.push("--allowedTools".to_string());
-        args.extend(tools.into_iter().map(str::to_string));
-    }
-    args
+    args.extend(tools_tail);
+    Ok(args)
 }
 
 /// Classify a child's end into the scheduler's `(success, error)` pair.
@@ -296,7 +327,8 @@ pub(crate) async fn launch(
         spec.model.as_deref(),
         &spec.allowed_tools,
         spec.max_turns,
-    );
+        &crate::settings::get_claude_session_permission(),
+    )?;
 
     let (mut child, _preconditions) =
         crate::agent_runtime::spawn_claude_child(&workdir_s, &prompt, None, coord_mcp, &args, true)
@@ -377,9 +409,38 @@ pub(crate) async fn launch(
     })
 }
 
+/// Forward `reader`'s lines to `tx`, decoding lossily. Byte-wise (`read_until`)
+/// rather than `lines()`, which errors on non-UTF-8 and would end the loop,
+/// close the pipe and let the child die on SIGPIPE/EPIPE. Keeps draining until
+/// EOF or a real read error; stops early only when the receiver is gone.
+async fn read_lossy_lines<R: tokio::io::AsyncRead + Unpin>(
+    reader: R,
+    prefix: &str,
+    tx: tokio::sync::mpsc::Sender<String>,
+) {
+    use tokio::io::AsyncBufReadExt;
+    let mut reader = BufReader::new(reader);
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                while matches!(buf.last(), Some(b'\n' | b'\r')) {
+                    buf.pop();
+                }
+                let line = format!("{prefix}{}", String::from_utf8_lossy(&buf));
+                if tx.send(line).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
 /// Copy the child's stdout and stderr, line by line, into the run's log file.
 /// Fail-soft: a log that cannot be opened costs the transcript, not the run.
-async fn pump_to_log(
+pub(crate) async fn pump_to_log(
     stdout: Option<tokio::process::ChildStdout>,
     stderr: Option<tokio::process::ChildStderr>,
     log_path: Option<PathBuf>,
@@ -409,23 +470,13 @@ async fn pump_to_log(
     if let Some(out) = stdout {
         let tx = tx.clone();
         readers.push(tokio::spawn(async move {
-            let mut lines = BufReader::new(out).lines();
-            while let Ok(Some(l)) = lines.next_line().await {
-                if tx.send(l).await.is_err() {
-                    break;
-                }
-            }
+            read_lossy_lines(out, "", tx).await;
         }));
     }
     if let Some(err) = stderr {
         let tx = tx.clone();
         readers.push(tokio::spawn(async move {
-            let mut lines = BufReader::new(err).lines();
-            while let Ok(Some(l)) = lines.next_line().await {
-                if tx.send(format!("[stderr] {l}")).await.is_err() {
-                    break;
-                }
-            }
+            read_lossy_lines(err, "[stderr] ", tx).await;
         }));
     }
     drop(tx);
@@ -446,6 +497,18 @@ async fn pump_to_log(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn read_lossy_lines_survives_non_utf8_and_keeps_draining() {
+        let data: &[u8] = b"ok\n\xff\xfe bad\r\nafter\n";
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        read_lossy_lines(data, "p:", tx).await;
+        let mut got = Vec::new();
+        while let Some(l) = rx.recv().await {
+            got.push(l);
+        }
+        assert_eq!(got, vec!["p:ok", "p:\u{fffd}\u{fffd} bad", "p:after"]);
+    }
 
     #[test]
     fn prompt_is_first_and_verbatim_when_no_mcp_refs() {
@@ -475,7 +538,7 @@ mod tests {
 
     #[test]
     fn args_are_print_mode_bounded_and_pinned() {
-        let args = claude_args("sid-1", None, &[], 200);
+        let args = claude_args("sid-1", None, &[], 200, &Default::default()).unwrap();
         assert_eq!(
             args,
             vec![
@@ -492,7 +555,8 @@ mod tests {
     #[test]
     fn args_carry_model_and_one_token_per_allowed_tool() {
         let tools = vec!["Bash".to_string(), " Read ".to_string(), "".to_string()];
-        let args = claude_args("sid", Some("claude-opus-5"), &tools, 5);
+        let args =
+            claude_args("sid", Some("claude-opus-5"), &tools, 5, &Default::default()).unwrap();
         assert_eq!(
             args,
             vec![
@@ -509,6 +573,54 @@ mod tests {
                 "Read"
             ]
         );
+    }
+
+    /// Review M1: under the allow-list posture the task's tools are
+    /// INTERSECTED with the operator's list — a task can narrow, never widen.
+    #[test]
+    fn allow_list_posture_intersects_task_and_operator_tools() {
+        use crate::claude_session::launch_spec::SessionPermissionSetting;
+        let op = SessionPermissionSetting::AllowList {
+            tools: vec!["Read".to_string(), "Grep".to_string()],
+        };
+        let task = vec!["Bash(git status)".to_string(), "Read".to_string()];
+        let args = claude_args("sid", None, &task, 3, &op).expect("non-empty intersection");
+        assert_eq!(
+            args,
+            vec![
+                "-p",
+                "--permission-mode",
+                "dontAsk",
+                "--session-id",
+                "sid",
+                "--max-turns",
+                "3",
+                "--allowedTools",
+                "Read"
+            ]
+        );
+        assert!(!args
+            .iter()
+            .any(|a| a.contains("dangerously") || a.contains("Bash")));
+
+        // No task tools: the operator's list applies.
+        let args = claude_args("sid", None, &[], 3, &op).unwrap();
+        assert_eq!(
+            args[args.len() - 3..].to_vec(),
+            vec!["--allowedTools", "Read", "Grep"]
+        );
+    }
+
+    /// Review M1: a task whose tools share nothing with the operator's list is
+    /// refused rather than run with the task's (wider) list or with none.
+    #[test]
+    fn allow_list_posture_refuses_an_empty_intersection() {
+        use crate::claude_session::launch_spec::SessionPermissionSetting;
+        let op = SessionPermissionSetting::AllowList {
+            tools: vec!["Read".to_string()],
+        };
+        let err = claude_args("sid", None, &["Bash".to_string()], 3, &op).unwrap_err();
+        assert!(err.contains("allow-list"), "{err}");
     }
 
     #[test]

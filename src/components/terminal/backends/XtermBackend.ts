@@ -117,22 +117,21 @@ export class XtermBackend implements ITerminalBackend {
       // Load rendering addons BEFORE WebLinksAddon so the renderer's
       // onShowLinkUnderline / onHideLinkUnderline are available when
       // the link decorator initialises.
-      try {
-        const webgl = new WebglAddon();
-        webgl.onContextLoss(() => {
-          console.warn("[XtermBackend] WebGL context lost, falling back to Canvas");
-          this.loadCanvasRenderer(webgl);
-        });
-        this.term.loadAddon(webgl);
-        this.gpuRenderer = webgl;
+      if (this.loadWebglRenderer()) {
         // Claim an LRU slot AFTER the context exists, so a failed WebGL init
         // never evicts a healthy pane. Claiming may downgrade the least
         // valuable holder — the browser would otherwise kill one of ours at
-        // random, mid-frame.
+        // random, mid-frame. An eviction parks the registration rather than
+        // ending it, so revealing this pane later restores WebGL.
         if (this.instanceKey) {
-          this.webglSlot = acquireWebglSlot(this.instanceKey, () => this.loadCanvasRenderer(webgl));
+          this.webglSlot = acquireWebglSlot(
+            this.instanceKey,
+            () => this.evictWebglRenderer(),
+            true,
+            () => this.restoreWebglRenderer(),
+          );
         }
-      } catch {
+      } else {
         // WebGL not available, try canvas
         this.loadCanvasRenderer(null);
       }
@@ -167,37 +166,97 @@ export class XtermBackend implements ITerminalBackend {
   }
 
   /**
+   * Load a fresh WebGL renderer. Returns `false` (leaving the renderer as it
+   * was) when WebGL cannot be constructed here. A driver context loss later
+   * falls back to Canvas for good — see {@link loadCanvasRenderer}.
+   */
+  private loadWebglRenderer(): boolean {
+    try {
+      const webgl = new WebglAddon();
+      webgl.onContextLoss(() => {
+        console.warn("[XtermBackend] WebGL context lost, falling back to Canvas");
+        this.loadCanvasRenderer(webgl);
+      });
+      this.term.loadAddon(webgl);
+      this.gpuRenderer = webgl;
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Dispose a WebGL addon and force its GL context closed. Returns `false`
+   * when `webgl` is no longer the active renderer (already downgraded).
+   */
+  private dropWebglRenderer(webgl: WebglAddon): boolean {
+    if (this.gpuRenderer !== webgl) return false;
+    // `WebglAddon.dispose()` drops the canvas but never calls
+    // `WEBGL_lose_context.loseContext()`, so the GL context lives until the
+    // canvas is garbage-collected — which browsers do lazily, exactly when
+    // the cap matters most. Force the release so the LRU is a real cap and
+    // not an advisory one.
+    const canvases = this.container ? Array.from(this.container.querySelectorAll("canvas")) : [];
+    webgl.dispose();
+    for (const el of canvases) {
+      try {
+        const gl = (el.getContext("webgl2") ?? el.getContext("webgl")) as {
+          getExtension(name: string): { loseContext(): void } | null;
+        } | null;
+        gl?.getExtension("WEBGL_lose_context")?.loseContext();
+      } catch {
+        // Not a GL canvas (the 2D fallback layer), or the context is gone.
+      }
+    }
+    this.gpuRenderer = null;
+    return true;
+  }
+
+  /**
+   * LRU eviction (`webglContextLru.ts`): give the GL context up and render on
+   * Canvas. The LRU keeps the registration dormant, so the slot handle stays —
+   * the next reveal calls {@link restoreWebglRenderer}.
+   */
+  private evictWebglRenderer(): void {
+    const webgl = this.gpuRenderer;
+    if (!(webgl instanceof WebglAddon) || !this.dropWebglRenderer(webgl)) return;
+    this.loadCanvasAddon();
+  }
+
+  /**
+   * The LRU re-seated this pane on reveal: swap Canvas back for WebGL. When
+   * WebGL cannot be rebuilt the pane returns to Canvas and gives its seat up.
+   */
+  private restoreWebglRenderer(): void {
+    if (this.gpuRenderer instanceof WebglAddon) return;
+    try {
+      this.gpuRenderer?.dispose();
+    } catch {
+      // Already torn down.
+    }
+    this.gpuRenderer = null;
+    if (this.loadWebglRenderer()) return;
+    this.webglSlot?.release();
+    this.webglSlot = null;
+    this.loadCanvasAddon();
+  }
+
+  /**
    * Switch this terminal to the Canvas renderer, disposing the WebGL addon
-   * (and releasing its GL context) when one is active. Shared by all three
-   * downgrade triggers: a real driver context loss, an LRU eviction, and a
-   * WebGL construction failure. Canvas failing leaves the DOM renderer, which
-   * is always already active underneath.
+   * (and releasing its GL context) when one is active. Used by the two FINAL
+   * downgrades: a real driver context loss and a WebGL construction failure
+   * (an LRU eviction goes through {@link evictWebglRenderer}, which keeps the
+   * way back). Canvas failing leaves the DOM renderer, which is always already
+   * active underneath.
    *
    * Idempotent: an eviction and a driver context loss can both fire for the
    * same addon, and the second one must not stack a second CanvasAddon on top.
    */
   private loadCanvasRenderer(webgl: WebglAddon | null): void {
     if (webgl) {
-      if (this.gpuRenderer !== webgl) return; // already downgraded
-      // `WebglAddon.dispose()` drops the canvas but never calls
-      // `WEBGL_lose_context.loseContext()`, so the GL context lives until the
-      // canvas is garbage-collected — which browsers do lazily, exactly when
-      // the cap matters most. Force the release so the LRU is a real cap and
-      // not an advisory one.
-      const canvases = this.container ? Array.from(this.container.querySelectorAll("canvas")) : [];
-      webgl.dispose();
-      for (const el of canvases) {
-        try {
-          const gl = (el.getContext("webgl2") ?? el.getContext("webgl")) as {
-            getExtension(name: string): { loseContext(): void } | null;
-          } | null;
-          gl?.getExtension("WEBGL_lose_context")?.loseContext();
-        } catch {
-          // Not a GL canvas (the 2D fallback layer), or the context is gone.
-        }
-      }
-      // The slot is gone either way: on eviction the LRU already dropped it,
-      // and on a driver context loss keeping it would hold a phantom context.
+      if (!this.dropWebglRenderer(webgl)) return; // already downgraded
+      // A driver context loss is final: keeping the slot would hold a
+      // phantom context.
       this.webglSlot?.release();
       this.webglSlot = null;
     } else if (this.gpuRenderer) {
@@ -209,6 +268,11 @@ export class XtermBackend implements ITerminalBackend {
       }
     }
     this.gpuRenderer = null;
+    this.loadCanvasAddon();
+  }
+
+  /** Load the Canvas renderer; on failure the DOM renderer stays active. */
+  private loadCanvasAddon(): void {
     try {
       const canvas = new CanvasAddon();
       this.term.loadAddon(canvas);

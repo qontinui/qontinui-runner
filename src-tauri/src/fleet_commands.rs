@@ -198,6 +198,14 @@ const CREATE_PLAN: &str = include_str!("fleet_commands/create-plan.md");
 /// there, then re-vendor.
 const FIND_DEBT: &str = include_str!("fleet_commands/find-debt.md");
 
+/// `/finish-session` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/finish-session.md` (canonical) — edit it
+/// there, then re-vendor. Bundled because the bundled `/unattended` closes every
+/// session with it: a dispatched session on a device with no fleet `.claude`
+/// tree otherwise has no way to record `session_status=finished` (plan
+/// `2026-10-29-bundle-finish-session-so-every-dispatched-session-can-record-finished`).
+const FINISH_SESSION: &str = include_str!("fleet_commands/finish-session.md");
+
 /// `/fix` procedure, bundled into the binary. Vendored from
 /// qontinui-claude-config `.claude/commands/fix.md` (canonical) — edit it
 /// there, then re-vendor.
@@ -364,6 +372,7 @@ pub(crate) const FLEET_COMMANDS: &[(&str, &str)] = &[
     ("code-fix", CODE_FIX),
     ("create-plan", CREATE_PLAN),
     ("find-debt", FIND_DEBT),
+    ("finish-session", FINISH_SESSION),
     ("fix", FIX),
     ("implement-phase", IMPLEMENT_PHASE),
     ("improve-all", IMPROVE_ALL),
@@ -487,9 +496,9 @@ fn classify_existing(dst: &Path) -> Option<Existing> {
 /// broken cache each degrade one step and warn, never propagate.
 ///
 /// Idempotent, and existing files are overwritten — EXCEPT where the
-/// destination is already tracked by the enclosing git repository, which is
-/// skipped (see [`provision_fleet_commands_into`] and
-/// [`crate::provision_guard`]).
+/// destination is already tracked by the enclosing git repository, or the
+/// tracked-file probe could not answer inside one; both are skipped (see
+/// [`provision_fleet_commands_into`] and [`crate::provision_guard`]).
 pub(crate) fn provision_fleet_commands_for_session(workdir: &str) {
     let registry = crate::agent_commands::resolve_registry();
     let commands_dir = Path::new(workdir).join(".claude").join("commands");
@@ -550,19 +559,21 @@ pub(crate) fn provision_fleet_commands_for_session(workdir: &str) {
 /// used to replace the repo's own content with the binary's embedded copy and
 /// leave the tree dirty.
 ///
-/// **This is not only the narrow two-file case.** `qontinui-dev-notes` tracks
-/// exactly `vet-plan.md` + `implement-plan.md`, but `qontinui-claude-config`
-/// tracks all seven — so a session spawned there provisions ZERO commands, and
-/// a tracked file outranks an account override. The measured table, and why
-/// that is the intended outcome, are in [`crate::provision_guard`]'s module doc.
+/// **This is not a narrow case.** `qontinui-claude-config` tracks all of them —
+/// so a session spawned there provisions ZERO commands, and a tracked file
+/// outranks an account override. Why that is the intended outcome is in
+/// [`crate::provision_guard`]'s module doc.
 ///
 /// **Fail-soft, and this is a hard requirement.** The tracked probe
 /// ([`crate::provision_guard::TrackedPaths::probe`]) resolves EVERY failure — an
 /// unreadable or absent git dir, no `git` binary, any non-zero exit, and a `git`
-/// that hangs — to "nothing tracked", i.e. to writing exactly as before. A
-/// skipped write must never become an aborted spawn, and a failed or slow probe
-/// must never become one either. The probe runs ONCE per pass, not once per
-/// file, so this costs one process spawn rather than seven.
+/// that hangs — to "nothing tracked", i.e. to writing exactly as before, with ONE
+/// narrowing: when that failure happens inside a repository (a `.git` at or
+/// above the dir), only ABSENT files are written and existing ones are kept
+/// (see that module's "UNKNOWN inside a repository" section). A skipped write
+/// must never become an aborted spawn, and a failed or slow probe must never
+/// become one either. The probe runs ONCE per pass, not once per
+/// file, so this costs one process spawn rather than one per command.
 pub(crate) fn provision_fleet_commands_into(
     commands_dir: &Path,
     registry: &AgentCommandRegistry,
@@ -583,14 +594,14 @@ pub(crate) fn provision_fleet_commands_into(
     for command in &resolved {
         let file_name = command.file_name();
         let dst = commands_dir.join(&file_name);
-        if tracked.should_skip(&dst, Path::new(&file_name)) {
+        if let Some(reason) = tracked.skip_reason(&dst, Path::new(&file_name)) {
             info!(
-                "fleet_commands: skipping {} — it is tracked by the enclosing git \
-                 repository, and overwriting it would silently replace that repo's \
-                 own content and dirty its tree",
-                dst.display()
+                "fleet_commands: skipping {} — {}; overwriting it could silently \
+                 replace the enclosing repo's own content and dirty its tree",
+                dst.display(),
+                reason.describe()
             );
-            out.skip(file_name, capability_manifest::SkipReason::GitTracked);
+            out.skip(file_name, reason);
             continue;
         }
         // The write below is still unconditional — this reads the OUTGOING file
@@ -808,6 +819,51 @@ mod tests {
             std::fs::read_to_string(&tracked).unwrap(),
             "# the repo's own body\n",
             "a tracked destination must keep the repo's content, not the embedded copy"
+        );
+    }
+
+    /// Entering where a spawn enters: inside a repository whose git cannot be
+    /// asked (a linked-worktree `.git` FILE pointing at a gitdir that does not
+    /// exist), an EXISTING command file is kept with
+    /// [`SkipReason::ProbeUnknownInRepo`] and every absent one is still written.
+    /// Before plan `2026-10-04-shared-checkouts-pull-deterministically` Phase 2
+    /// the failed probe read "nothing tracked" and the existing file was
+    /// overwritten.
+    ///
+    /// [`SkipReason::ProbeUnknownInRepo`]: crate::capability_manifest::SkipReason::ProbeUnknownInRepo
+    #[test]
+    fn an_unanswered_probe_inside_a_repo_keeps_existing_commands() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        crate::provision_guard::test_support::assert_not_in_any_repo(tmp.path());
+        std::fs::write(
+            tmp.path().join(".git"),
+            b"gitdir: /nonexistent/qontinui-fleet-commands-test\n",
+        )
+        .unwrap();
+        let commands_dir = tmp.path().join(".claude").join("commands");
+        std::fs::create_dir_all(&commands_dir).unwrap();
+
+        let (existing_name, _) = FLEET_COMMANDS[0];
+        let existing = commands_dir.join(format!("{existing_name}.md"));
+        std::fs::write(&existing, b"# a body git could not vouch for\n").unwrap();
+
+        let registry = AgentCommandRegistry::new();
+        let out = provision_fleet_commands_into(&commands_dir, &registry).expect("provision");
+
+        assert_eq!(out.skipped.len(), 1, "only the existing file is kept");
+        assert_eq!(
+            out.skipped[0].reason,
+            crate::capability_manifest::SkipReason::ProbeUnknownInRepo
+        );
+        assert_eq!(
+            std::fs::read_to_string(&existing).unwrap(),
+            "# a body git could not vouch for\n",
+            "an existing file must not be overwritten when git could not be asked"
+        );
+        assert_eq!(
+            out.written,
+            FLEET_COMMANDS.len() - 1,
+            "every absent command is still written"
         );
     }
 
@@ -1597,28 +1653,65 @@ mod tests {
         }
     }
 
-    /// Gate verbs coord serves in operator/agent PAIRS: each has a
-    /// device-authed twin one path segment away, under an `/agent/` INFIX —
-    /// `POST /coord/gates/:gate_id/agent/<verb>`. The unprefixed
-    /// `POST /coord/gates/:gate_id/<verb>` is the OPERATOR door and answers a
-    /// device or agent JWT `401 operator context missing; SSO required`.
+    /// What the UNPREFIXED `POST /coord/gates/:gate_id/<verb>` is, for a verb
+    /// whose device-authed twin sits under the `/agent/` INFIX
+    /// (`POST /coord/gates/:gate_id/agent/<verb>`). Either way an agent sent to
+    /// the bare path fails; only the status it gets differs.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum BareRoute {
+        /// The OPERATOR door: a device or agent JWT gets
+        /// `401 operator context missing; SSO required`.
+        Operator401,
+        /// No such route at all. coord built only the `/agent/` form, so the
+        /// bare path falls through to `doors::no_such_route` and answers 404.
+        Absent404,
+    }
+
+    /// Every gate verb with an `/agent/` twin, each with the class of its bare
+    /// route. One table, so a verb cannot be added without a class, and the
+    /// violation message cannot default a 404 verb to the 401 text.
     ///
     /// Ported from `qontinui-claude-config`'s `scripts/lint-gate-route-tier.py`
-    /// (check #21), which cannot hold the line here: it needs a
+    /// (check #21, its `TWIN_VERBS`), which cannot hold the line here: it needs a
     /// `qontinui-claude-config` checkout to exist and be current, and no job in
     /// this repo's CI runs it. Same reasoning as
     /// [`bundled_gate_registration_commands_teach_the_mechanics`] — these bodies
     /// are what actually ship, so the invariant is asserted where the files
     /// live.
-    const OPERATOR_TIER_TWIN_VERBS: &[&str] = &[
-        "reject",
-        "reopen",
-        "mute",
-        "unmute",
-        "snooze",
-        "continuation-cancel",
-        "force-clear",
-        "audience",
+    ///
+    /// **Nothing here checks this table against `TWIN_VERBS`.** Check #32
+    /// (`lint-coord-door-parity.py`) holds `TWIN_VERBS` against its own door
+    /// table, but no check reads this file, so a verb check #21 gains has to be
+    /// added here by hand. That is how `repoint` and `correct` were missing.
+    const GATE_TWIN_VERBS: &[(&str, BareRoute)] = &[
+        ("reject", BareRoute::Operator401),
+        ("reopen", BareRoute::Operator401),
+        ("mute", BareRoute::Operator401),
+        ("unmute", BareRoute::Operator401),
+        ("snooze", BareRoute::Operator401),
+        ("continuation-cancel", BareRoute::Operator401),
+        ("force-clear", BareRoute::Operator401),
+        ("audience", BareRoute::Operator401),
+        // No operator half: the registrant rule fails closed for an operator
+        // bearer, so only `/agent/repoint` exists (qontinui-coord#2056).
+        ("repoint", BareRoute::Absent404),
+        // No operator half: an insert-only annotation of a CLEARED gate, built
+        // at `/agent/correct` only (qontinui-coord#3047).
+        ("correct", BareRoute::Absent404),
+    ];
+
+    /// Gate verbs with NO `/agent/` twin, whose bare path is legitimately what
+    /// an agent (or nobody) uses: `approve` is operator-only; `attest` and
+    /// `withdraw` are device-authed on the bare path; the two continuation acks
+    /// are unauthenticated runner data-plane routes. The union of check #21's
+    /// `OPERATOR_ONLY_VERBS`, `BARE_PATH_DEVICE_AUTHED` and
+    /// `UNAUTHENTICATED_RUNNER_ACK`. None may ever be flagged.
+    const GATE_VERBS_WITHOUT_TWIN: &[&str] = &[
+        "approve",
+        "attest",
+        "withdraw",
+        "continuation-consumed",
+        "continuation-deferred",
     ];
 
     /// Same-line exemption marker, spelled exactly as the Python linter spells
@@ -1651,8 +1744,10 @@ mod tests {
         })
     }
 
-    /// No bundled command may instruct an agent to POST an operator-tier gate
-    /// verb that HAS a device-authed twin.
+    /// No bundled command may instruct an agent to POST the bare route of a gate
+    /// verb that HAS a device-authed `/agent/` twin — the operator's door (401)
+    /// for most of them, a route that does not exist (404) for the rest. The
+    /// name predates the 404 class.
     ///
     /// On 2026-08-20 gate `7902e457` spawned a redundant terminal against a plan
     /// already stamped SHIPPED, because the shipped bodies told agents to POST
@@ -1685,9 +1780,9 @@ mod tests {
     /// matching reports clean forever.
     #[test]
     fn bundled_commands_never_send_agents_to_operator_tier_gate_routes() {
-        let verb_alt = OPERATOR_TIER_TWIN_VERBS
+        let verb_alt = GATE_TWIN_VERBS
             .iter()
-            .map(|v| regex::escape(v))
+            .map(|(v, _)| regex::escape(v))
             .collect::<Vec<_>>()
             .join("|");
         // `/coord/gates/<anchor>/<twin verb>`.
@@ -1720,7 +1815,21 @@ mod tests {
             !candidate.is_match("POST $COORD_HTTP_URL/coord/gates/<gate_id>/agent/mute"),
             "route-tier pattern flags the CORRECT twin form"
         );
-        for verb in ["approve", "attest", "withdraw", "continuation-consumed"] {
+        for (verb, _) in GATE_TWIN_VERBS {
+            assert!(
+                candidate.is_match(&format!("POST /coord/gates/<id>/{verb}")),
+                "route-tier pattern misses the bare {verb:?} route"
+            );
+            assert!(
+                !candidate.is_match(&format!("POST /coord/gates/<id>/agent/{verb}")),
+                "route-tier pattern flags the CORRECT twin form of {verb:?}"
+            );
+            assert!(
+                !GATE_VERBS_WITHOUT_TWIN.contains(verb),
+                "{verb:?} is listed both as a twin verb and as a verb with no twin"
+            );
+        }
+        for verb in GATE_VERBS_WITHOUT_TWIN {
             assert!(
                 !candidate.is_match(&format!("POST /coord/gates/<id>/{verb}")),
                 "route-tier pattern flags {verb:?}, a verb with no `/agent/` twin"
@@ -1771,14 +1880,33 @@ mod tests {
                         continue;
                     }
                     let verb = &caps["verb"];
+                    let bare = GATE_TWIN_VERBS
+                        .iter()
+                        .find(|(v, _)| *v == verb)
+                        .map(|(_, bare)| *bare)
+                        .expect("the candidate pattern is built from GATE_TWIN_VERBS");
+                    // A 404 verb has no operator door, so the `operator`
+                    // exemption is never the fix for it: that would silence a
+                    // real defect. Only the explicit marker is offered; the
+                    // exemption itself still fires for every class, in parity
+                    // with check #21.
+                    let tail = match bare {
+                        BareRoute::Operator401 => format!(
+                            "the unprefixed route is the operator's and answers an agent \
+                             401. If this line IS documenting the operator door, say \
+                             'operator' on it (or add '{ROUTE_TIER_ALLOW_MARKER}')."
+                        ),
+                        BareRoute::Absent404 => format!(
+                            "the unprefixed route does not exist and answers 404; there is \
+                             no operator door to document. If this line deliberately names \
+                             the missing bare path, add '{ROUTE_TIER_ALLOW_MARKER}'."
+                        ),
+                    };
                     violations.push(format!(
                         "  qontinui-claude-config/.claude/commands/{name}.md (bundled here as \
                          src-tauri/src/fleet_commands/{name}.md):{}: `{}` — `{verb}` has a \
                          device-authed twin. An agent must POST \
-                         /coord/gates/<id>/agent/{verb}; the unprefixed route is the \
-                         operator's and answers an agent 401. If this line IS documenting \
-                         the operator door, say 'operator' on it (or add \
-                         '{ROUTE_TIER_ALLOW_MARKER}').",
+                         /coord/gates/<id>/agent/{verb}; {tail}",
                         idx + 1,
                         &caps[0],
                     ));
@@ -1788,9 +1916,10 @@ mod tests {
 
         assert!(
             violations.is_empty(),
-            "bundled agent command(s) send AGENTS to operator-tier gate routes — the agent \
-             twin sits one path segment away, and the 401 it avoids has already cost a real \
-             session (gate 7902e457, 2026-08-20). {} violation(s):\n{}",
+            "bundled agent command(s) send AGENTS to the bare route of a gate verb that has an \
+             `/agent/` twin — the twin sits one path segment away, and the bare route's 401 \
+             has already cost a real session (gate 7902e457, 2026-08-20); a 404 verb fails \
+             the same way. {} violation(s):\n{}",
             violations.len(),
             violations.join("\n")
         );
@@ -2567,6 +2696,62 @@ mod tests {
              2026-09-17-findings-carry-a-triage-stamp-and-the-steward-reads-since-last-run \
              Phase 5) or this guard's content probe went stale. Both are findings; \
              neither is a pass"
+        );
+    }
+
+    /// The bundled `/unattended` closes every session by running
+    /// `/finish-session`, so the bundle must carry `/finish-session` too.
+    ///
+    /// Before plan
+    /// `2026-10-29-bundle-finish-session-so-every-dispatched-session-can-record-finished`
+    /// (Phase 3) it did not: a runner-dispatched session on a device with no
+    /// fleet `.claude` tree was told to run a command its workdir never had, so
+    /// it could not record `session_status=finished` and a rebuilt runner kept
+    /// offering it for resume. Literals are spelled here on purpose — this test
+    /// must fail if the roster line is dropped, not follow it.
+    #[test]
+    fn bundle_carries_finish_session_beside_unattended() {
+        let roster: Vec<&str> = FLEET_COMMANDS.iter().map(|(n, _)| *n).collect();
+        assert!(
+            roster.contains(&"finish-session"),
+            "FLEET_COMMANDS has no \"finish-session\" entry, but the bundled \
+             /unattended ends every session with /finish-session — a dispatched \
+             session on a device without a fleet .claude tree cannot record \
+             finished. Restore (\"finish-session\", FINISH_SESSION) in FLEET_COMMANDS"
+        );
+        let unattended = FLEET_COMMANDS
+            .iter()
+            .find(|(n, _)| *n == "unattended")
+            .map(|(_, b)| *b)
+            .expect("the bundle carries \"unattended\"");
+
+        // Every `/finish-session` reference, read as the whole slash-command
+        // token it starts (so `/finish-session-foo` would be read as
+        // `finish-session-foo`, not as a hit on the roster name).
+        // Split on `/` rather than byte-slicing after a match, so no index can
+        // land inside a UTF-8 character (the bodies are full of em dashes).
+        let mut references = 0usize;
+        for after_slash in unattended.split('/').skip(1) {
+            let token: String = after_slash
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+                .collect();
+            if !token.starts_with("finish-session") {
+                continue;
+            }
+            assert!(
+                roster.contains(&token.as_str()),
+                "the bundled /unattended references /{token}, which is not a bundled \
+                 command name — the reference dangles on any device whose workdir \
+                 only has the bundle. Bundled names: {roster:?}"
+            );
+            references += 1;
+        }
+        assert!(
+            references > 0,
+            "the bundled /unattended no longer references /finish-session, so this \
+             guard watches an edge that no longer exists. Re-read the plan before \
+             dropping finish-session from the bundle"
         );
     }
 }

@@ -20,9 +20,11 @@ Multiple Claude sessions share the same runner infrastructure.
 > isn't there. Do not try to acquire it, and do not treat its absence as
 > permission to proceed.
 
-**Temp runners (default — and effectively mandatory):** Temp runners are
-isolated by design and need no lock. Since no primary-runner lock exists, a
-temp runner is the ONLY way to test safely while other sessions may be active.
+**Temp runners (default — and effectively mandatory):** Temp runners need no
+lock, and each loads and saves its own settings. A few paths still reach the
+primary, though; "Runner Coordination Rules" at the end of this command lists
+them. Since no primary-runner lock exists, a temp runner is the ONLY way to
+test safely while other sessions may be active.
 
 **Primary runner (last resort):** If you genuinely cannot use a temp runner
 (supervisor or build pool down), you cannot serialize against other sessions —
@@ -418,11 +420,15 @@ Notes that matter, all of them measured:
   `coverageNotes` saying what the spec did not cover, because a fresh route has
   no committed baseline and a green result there checked nothing about layout
   shift.
-- **Colour is reported but never gated.** Only the `color` analyzer reads pixels;
-  this arm ships no screenshot capability and feeds an obviously named 1×1
-  placeholder frame. Layout, typography and elements are pure geometry over the
-  snapshot. The parent plan's burn-in measured pixel-sampled contrast producing
-  false 1.01:1 criticals — do not gate on colour.
+- **Colour is reported but never gated.** Only the `color` analyzer reads pixels,
+  and it now reads a REAL frame captured in lockstep with each snapshot, at the
+  device pixel ratio the page reports (`--dpr`; the verdict stamps `frame`
+  real|none beside that `dpr`, and with no frame the pixel analyzers report
+  BLOCKED — once `style-gate.lock` pins an analyzer whose `--frame` is optional;
+  with one that requires a frame, a run that cannot capture one exits 4).
+  Layout, typography and elements are pure geometry over the snapshot. The parent plan's burn-in measured pixel-sampled contrast producing
+  false 1.01:1 criticals — do not gate on colour until a check is promoted under
+  decision record `only-deterministic-visual-checks-gate-a-merge`.
 - **The verdict is only as pinned as the analyzer.** The output stamps
   `analyzer.pinnedSha` and `analyzer.shaVerified`; quote them. A build from
   `qontinui-schemas` HEAD answers a different question than the Style Gate does.
@@ -972,17 +978,31 @@ print('  commit_provenance: lkg_sha=', cp.get('lkg_sha'),
       ' contains(', cp.get('contains_query'), ')=', cp.get('contains'), sep='')"
 
 # 2. Decide spawn mode based on coverage.
+# RUNNER_TREE is the runner checkout that holds the change under test, as an
+# absolute path the supervisor's OS can read (`cygpath -m` turns a Git Bash
+# /c/... path into C:/...). Leave it empty only when the change is already on
+# origin/main. An LKG is built only from origin/main or the supervisor's own
+# shared checkout, never from your checkout, so it cannot hold your
+# uncommitted edits. A set RUNNER_TREE therefore always takes the rebuild
+# branch.
+RUNNER_TREE="${RUNNER_TREE:-}"
+if [ -n "$RUNNER_TREE" ]; then RUNNER_TREE=$(cygpath -m "$RUNNER_TREE" 2>/dev/null || printf '%s' "$RUNNER_TREE"); fi
 REQUESTER="manual-test-$(date +%s)"
-if [ "$ALL_COVERED" = "True" ]; then
+if [ "$ALL_COVERED" = "True" ] && [ -z "$RUNNER_TREE" ]; then
   echo "All changes covered by LKG — spawning from cached binary (~5s)"
   SPAWN_BODY="{\"rebuild\": false, \"use_lkg\": true, \"wait\": true, \"wait_timeout_secs\": 90, \"requester_id\": \"${REQUESTER}\"}"
+elif [ -n "$RUNNER_TREE" ]; then
+  # 2a. Rebuild the tree under test. The supervisor builds the frontend
+  #     itself, inside the tree it compiles, so this recipe runs no
+  #     `npm run build` of its own: one run here would build a different tree
+  #     from the binary.
+  echo "Rebuilding the tree under test: $RUNNER_TREE"
+  SPAWN_BODY="{\"rebuild\": true, \"worktree_path\": \"${RUNNER_TREE}\", \"requester_id\": \"${REQUESTER}\", \"queue_timeout_secs\": 600}"
 else
-  # 2a. LKG misses some files — build the runner frontend first (Tauri embeds it
-  #     at cargo build time), then trigger a rebuild via the build pool.
-  echo "LKG missing some changes — frontend build + cargo rebuild required"
-  WS="${WS:?set WS to your workspace root, the directory holding your checkouts}"
-  cd "$WS/ui-bridge-auto" && npm run build 2>&1 | tail -3 || true
-  cd "$WS/qontinui-runner" && npm run build 2>&1 | tail -3
+  # 2b. No RUNNER_TREE: with no selector, rebuild:true compiles a fresh
+  #     origin/main worktree, frontend included. That tests origin/main and
+  #     none of your uncommitted edits.
+  echo "LKG missing some changes — rebuilding origin/main (RUNNER_TREE is empty)"
   SPAWN_BODY="{\"rebuild\": true, \"requester_id\": \"${REQUESTER}\", \"queue_timeout_secs\": 600}"
 fi
 
@@ -1038,6 +1058,13 @@ echo "$SPAWN_RESULT"
 TEST_PORT=$(echo "$SPAWN_RESULT" | python -c "import sys,json; print(json.load(sys.stdin)['port'])")
 TEST_ID=$(echo "$SPAWN_RESULT" | python -c "import sys,json; print(json.load(sys.stdin)['id'])")
 USED_LKG=$(echo "$SPAWN_RESULT" | python -c "import sys,json; print(json.load(sys.stdin).get('used_lkg', False))")
+# `source` names the tree that was compiled. With RUNNER_TREE set, anything but
+# worktree_path means the binary is not your tree, so stop before testing it.
+SPAWN_SOURCE=$(echo "$SPAWN_RESULT" | python -c "import sys,json; print(json.load(sys.stdin).get('source'))")
+if [ -n "$RUNNER_TREE" ] && [ "$SPAWN_SOURCE" != "worktree_path" ]; then
+  echo "ERROR: asked for $RUNNER_TREE but the supervisor answered source=$SPAWN_SOURCE" >&2
+  exit 1
+fi
 RUNNER_BASE="http://localhost:${TEST_PORT}/ui-bridge"
 # Bind $BASE HERE, after RUNNER_BASE has been re-pointed at the TEMP runner.
 # Taken any earlier it would snapshot the primary runner's :9876, which this
@@ -1482,8 +1509,10 @@ python3 -c 'import json;print(json.dumps({"analyzer":"layout","snapshot":json.lo
 ```
 
 Read the `--stats` line on stderr. `0 with geometry` means every geometric
-check reported nothing, which is **not** the same as no problems; `0 with
-stacking order` means occlusion is UNKNOWN. An `occlusion_unknown` finding in
+check reported nothing, which is **not** the same as no problems. The
+projection never turns CSS `zIndex` into a paint rank, so occlusion rests on
+the SDK's own hit-test alone — the line's `with a hit-tested occluder` count —
+and every other intersecting pair is UNKNOWN. An `occlusion_unknown` finding in
 the output is likewise a statement of ignorance, never a pass.
 
 ```bash
@@ -1519,6 +1548,63 @@ If both Runner and Web are available:
   [ "${SPAWNER_NONE:-}" = 1 ] && { echo "own-runner arm: sdk/connect SKIPPED -- record UNVERIFIED"; exit 0; }
   curl -s -X POST "${BASE:?BASE unbound -- bind it in your arm first}/sdk/connect" -H "Content-Type: application/json" -d '{"url": "https://qontinui.io/api/ui-bridge"}'  # envelope-ok: the reply is printed, never parsed into a verdict; no step observes the connection, so under Phase 5 it stays UNVERIFIED unless the tester sees it on the UI surface
   ```
+
+## Phase 4.5: Cross-Page Journey (run once per app under test)
+
+Phase 3.5 covers each page on its own. This phase covers the paths BETWEEN
+pages: is there a page the user cannot leave, and is there a page that can be
+reached only by typing its URL. Read `journey_dead_ends` and
+`journey_requires_prior_knowledge` (ui-bridge-mcp tools) for the app under
+test, after `journey_health`. Without the MCP tools, use the runner routes
+they wrap. Those routes live on the runner API root, not under `/ui-bridge`,
+on the runner whose action handler carried your clicks: `$TEST_PORT` on the
+temp-runner arm, `9876` on the own-runner arm. All three reads are GETs, so
+they are fine on the READ-ONLY own-runner arm.
+
+The ui-bridge-mcp tools always ask the runner at `QONTINUI_RUNNER_HOST` on
+`QONTINUI_RUNNER_PORT`, and take no per-call host or port. They default to
+`127.0.0.1:9876`. The ledger is per-runner, so on the temp-runner arm
+default-configured tools silently read the `9876` runner's ledger, or none.
+Either launch the MCP server with `QONTINUI_RUNNER_PORT=<that runner's port>`,
+or use the guarded GETs below. An install with no `journey_*` tools predates
+ui-bridge-mcp `63cfddf`; use the GETs there too.
+
+Shell state does not carry between calls, so set the port explicitly. An
+unset one stops the block instead of asking a different runner's ledger:
+
+```bash
+: "${JOURNEY_PORT:?set to \$TEST_PORT on the temp-runner arm, 9876 on the own-runner arm}"
+APP_ID=qontinui-web   # the app under test, as in GET /apps
+for q in health dead-ends prior-knowledge; do
+  curl -fsS --max-time 30 "http://127.0.0.1:${JOURNEY_PORT}/apps/$APP_ID/journey/$q" \
+    || echo "journey/$q: no answer -- record UNKNOWN (a 404 from dead-ends/prior-knowledge = a build predating the query routes; a 503 DATABASE_UNAVAILABLE = that runner's database is unavailable right now)"
+done
+```
+
+`knowledge-base/qontinui-specific/ui-bridge.md` → "Journey queries" says how
+to read an answer, and whether the door is on your build yet. Read
+`journey_health`'s `LEDGER:` line, then each query answer's `COVERAGE:` line,
+before its `ANSWER:`.
+
+- A `measured` listing goes into Phase 5's Cross-Page Journey section: each node key, with `backOnly`
+  for a dead end. A `[DEGRADED]` listing is still a finding, and it may be
+  incomplete.
+- `absent` is the only answer that supports "none found", and only under the
+  echoed filter.
+- **`unknown`, a ledger that is not `writing`, or a read gap is reported as
+  UNKNOWN with its code and the open frontier it names. It is never "no
+  defects" and never a PASS.** The one exception is a qualified
+  prior-knowledge finding: every open frontier entry is `effect_write` /
+  `effect_destructive`, and the node lists no other cause. It is reported only
+  by the exact recipe in ui-bridge.md → "A qualified prior-knowledge
+  finding", naming every such affordance. There is no qualified dead end. A qualified finding needs the tools' rendering: on the GET arm, report such a node as UNKNOWN.
+  `health` answers on older builds too, so a 200 from it proves nothing about
+  the query routes. A 404 from `dead-ends` or `prior-knowledge` is a build
+  that predates them, and a 503 `DATABASE_UNAVAILABLE` is a runner whose
+  database is unavailable right now. Both are recorded UNKNOWN.
+
+A drive that went through no runner (the web relay or an injected tab) left
+no ledger on that runner to ask, so its result is UNKNOWN too.
 
 ## Phase 5: Report & Evaluate
 
@@ -1561,6 +1647,21 @@ For each task attempted, report:
 - **Steps taken:** [numbered list of UI Bridge interactions]
 - **Result:** PASS / FAIL / PARTIAL / BLOCKED
 - **Notes:** [what happened, any unexpected behavior]
+```
+
+### Cross-Page Journey
+
+Report Phase 4.5 once per app under test. A phase that could not run still gets
+an entry here, written UNKNOWN with the reason.
+
+```
+## Cross-Page Journey
+
+### App: [app id] (runner port asked: [port])
+- **Ledger:** [the state journey_health reports]
+- **Dead ends:** measured [node keys, with backOnly] / DEGRADED [node keys, with backOnly + the unmeasured dimensions] / absent [the echoed filter] / UNKNOWN [code + the open frontier]
+- **Reached only by URL:** measured [node keys] / DEGRADED [node keys + the unmeasured dimensions] / qualified [node keys + every affordance named] / absent [the echoed filter] / UNKNOWN [code + the open frontier]
+- **Coverage:** [the COVERAGE line each answer was computed over]
 ```
 
 ### UI Bridge Evaluation
@@ -1635,6 +1736,7 @@ Draw from everything surfaced in Phases 1–5:
 - **Pain points & friction** (Phase 5: Pain Points & Friction) — workarounds, multi-step sequences that should be one call, discoverability gaps
 - **Missing functionality** (Phase 5: Missing Functionality) — capabilities the UI Bridge lacks that would make testing easier
 - **Task failures** (Phase 5: Test Results) — any task that came back FAIL / PARTIAL / BLOCKED
+- **Cross-page defects** (Phase 5: Cross-Page Journey) — every measured or `[DEGRADED]` dead end or URL-only page, and every qualified prior-knowledge finding. An UNKNOWN answer stays UNKNOWN in the report; it is not evidence of a defect in the app
 
 If Phase 5 turned up no deficiencies, say so explicitly and skip to the "No deficiencies" note below.
 
@@ -1746,6 +1848,8 @@ After the per-repo sections, add an **Execution order** section — a numbered l
 - **ALWAYS run Phase 3.5 on every page you visit** — an element being in the
   `discover` payload is not evidence a human can read it, and no functional
   check in Phase 2 or 3 looks at legibility
+- **ALWAYS run Phase 4.5 once per app under test** and report it in Phase 5,
+  even when the answer is UNKNOWN — no per-page phase can see a defect between pages
 - **ALWAYS call discover** if snapshot returns empty or stale data
 - **ALWAYS wait 2 seconds after navigation/clicks** that change the view, then re-discover
 - **ALWAYS use scrollIntoView** before interacting with off-screen elements
@@ -1761,7 +1865,13 @@ After the per-repo sections, add an **Execution order** section — a numbered l
 - **Default to a temp runner.** With no lock available it is the only way to test without racing other sessions.
 - **If you must touch the primary:** confirm idle via `GET /restart-readiness` (`safe_to_restart` must be `true`) plus, where a spawner exists, `GET $SPAWNER/runners`, and declare scope with `coord_declare_intent` / coord claims so peers can see you. Not `/task-runs/running` — it returned `[]` with 25 sessions live (2026-08-29).
 - **NEVER restart the primary runner yourself** — see CLAUDE.md "Runner Lifecycle". Only the operator may restart an active runner.
-- **Temp runners do not need coordination** — they are isolated by design, but note `settings.json` is machine-shared (see CLAUDE.md), so avoid gratuitous temp runners while the primary is live.
+- **Temp runners need no lock, but they are not sealed off from the primary.** `spawn-test` gives each temp runner its own per-instance config directory, so it loads and saves its own `settings.json`. Four things still reach the primary, and `knowledge-base/qontinui-specific/dev-supervisor.md`, "Key facts about temp runners", items 8 and 9, has the detail:
+  - Backup and restore resolve the primary's `settings.json` from any runner, so never `POST /restore` against a temp runner.
+  - Pairing a temp runner in place (`POST /runners/pair-with-token` with `target_runner_id`) can promote the primary's persisted tier.
+  - The Claude account roster is machine-global, so a roster edit on a temp runner is a machine-wide edit.
+  - A temp runner built from the wrong runner source renames the primary's `paired_user.json`. Step 1's LKG branch (`use_lkg: true`, `rebuild: false`) runs an existing exe of any age, so it can spawn one.
+
+  So avoid temp runners you do not need while the primary is live, and after a run check the primary's pairing as item 9 says.
 
 ## Test Focus
 

@@ -40,6 +40,9 @@ pub mod observable_bridge;
 // gauges (`LIVE_PIPE_READERS`, `DETACHED_CHILDREN`) exist once per process.
 pub mod git_posture;
 pub mod process_helpers;
+// Deadline-honest bounded run (process creation INCLUDED) for read-only
+// probes; reuses `process_helpers` internals, so it lives beside it.
+pub mod process_deadline;
 pub mod profile_cli;
 // Out-of-process PTY holder (plan
 // `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`): the
@@ -54,6 +57,10 @@ pub mod pty_holder;
 // a second bin cannot import from the runner bin's module tree. One module ⇒
 // one schema ⇒ writer and reader cannot drift. See the module doc.
 pub mod profiles;
+// Journey query answer values (plan 2026-09-20-ui-bridge-represents-the-
+// users-path-and-the-passage-of-time): registered by `schema_export`, built by
+// the bin's `journey::routes`.
+pub mod journey_wire;
 pub mod relay_envelopes;
 pub mod runner_breadcrumb;
 pub mod schema_export;
@@ -128,6 +135,14 @@ pub mod mcp_spill;
 pub mod embedded_pg;
 pub mod env_agent;
 
+// The runner's one circuit-breaker state machine, and the PostgreSQL checkout
+// point built on it (plan
+// `2026-10-19-runner-pg-unreachable-costs-every-caller-a-pool-timeout`). Lib,
+// not bin, because `env_agent` above holds a clone of the boot pool: a
+// bin-side breaker could not cover it.
+pub mod circuit;
+pub mod pg_circuit;
+
 // THE `source()`-chain renderer, shared by the lib and the bin.
 //
 // Declared INLINE so the nested `error_chain` resolves to `src/util/error_chain.rs`.
@@ -174,6 +189,10 @@ pub mod peer_user_guard;
 // share one code path. See `pair.rs` for the canonical wire shapes.
 pub mod pair;
 
+// The qontinui-web FRONTEND origin (pages like /connect-runner), distinct from
+// its API origin. Shared by the runner's `api_config` and `pair`.
+pub mod web_origin;
+
 // Cognito Hosted-UI sign-in (RFC 8252 PKCE). Phase 5 of the
 // unified-Cognito-identity plan. Tauri-free (loopback + system browser); the
 // `cognito_sign_in` Tauri command in `commands::auth` drives it.
@@ -184,6 +203,10 @@ pub mod cognito;
 // the marker names so the spawn-site strips, the startup warning and the
 // `coord doctor` check can never disagree on the spelling.
 pub mod claude_env;
+/// Long-lived Claude OAuth tokens (`claude setup-token`) stored per account in
+/// `<config dir>/settings.json` — the one reader account selection, the usage
+/// probe, the warm path and the doctor share.
+pub mod claude_oauth_token;
 
 // `coord doctor` self-check (plan 2026-06-13 Phase 4). Lifted into the lib so
 // BOTH the standalone `coord_doctor` bin and the in-app Tauri command

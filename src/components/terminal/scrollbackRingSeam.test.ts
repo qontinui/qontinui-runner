@@ -68,9 +68,12 @@ describe("scrollback ring seam — consumers", () => {
     // new site is fine — bump this and say which site it is.
     expect(calls.length).toBe(3);
     expect(source).not.toMatch(/invoke[^;]*terminal_get_scrollback/s);
-    // The pure offset math is still what consumes the window.
-    expect(source).toMatch(/resyncSliceStart\(ringWindow, writtenThrough\)/);
-    expect(source).toMatch(/lostWindowBytes\(ringWindow, writtenThrough\)/);
+    // The pure offset math is still what consumes the window, in the resync
+    // `TerminalInstance` delegates to.
+    expect(source).toMatch(/new RingResync\(/);
+    const resync = read("ringResync.ts");
+    expect(resync).toMatch(/resyncSliceStart\(ringWindow, stream\.writtenThrough\)/);
+    expect(resync).toMatch(/lostWindowBytes\(ringWindow, stream\.writtenThrough\)/);
   });
 
   it("both shipped backends implement readScrollbackRing by delegating to the local reader", () => {
