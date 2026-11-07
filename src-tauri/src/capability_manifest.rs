@@ -756,7 +756,9 @@ pub const CAPABILITY_SPECS: &[CapabilitySpec] = &[
                       that has that sibling repo this row — not `fleet_agents` — decides \
                       what a session actually gets. Two sources for one asset; \
                       qontinui-claude-config's hourly `fleet-agents-parity` gate \
-                      (`agent-bundle-parity.sh`) checks that they agree. When the root does not resolve the \
+                      (`agent-bundle-parity.sh`) checks that the two repositories' \
+                      default branches agree, not this disk against this binary. When \
+                      the root does not resolve the \
                       copy is a no-op that logs \"no qontinui-root resolved; skipping \
                       .claude/agents\" and continues.",
         expected_rungs: &[Rung::OperatorCheckout, Rung::Unresolved],
@@ -1101,20 +1103,42 @@ pub enum RetainedReason {
     /// Its blob is not one the definition shipped as, so somebody edited it and
     /// it is kept deliberately (the own-files-only rule). The blob is the copy's.
     LocallyModified(String),
+    /// The enclosing repository keeps it: the detail is the
+    /// [`SkipReason::wire`] the tracked-file guard decided
+    /// (`git_tracked` or `probe_unknown_in_repo`). Deliberate, like the keeps of
+    /// both provisioning layers.
+    KeptByRepository(String),
     /// The copy could not be read, so its blob could not be compared.
     ReadFailed(String),
     /// The copy is a shipped blob, but removing it failed.
     RemoveFailed(String),
-    /// The agents directory resolves (through a symlink) outside the workdir,
-    /// so nothing in it is removed. The detail is where it resolves to.
-    OutsideWorkdir(String),
+    /// The copy is a shipped blob, but `.claude/agents` is reached through a
+    /// symlink, so the file is not this workdir's own and is not removed. The
+    /// detail is where the directory resolves to.
+    LinkedElsewhere(String),
 }
 
 impl RetainedReason {
-    /// True for the arms where the pass meant to remove the copy and could not.
+    /// True for the arms where the pass meant to remove a shipped copy and did
+    /// not; a deliberate keep is not one.
     #[must_use]
     pub fn is_failure(&self) -> bool {
-        !matches!(self, RetainedReason::LocallyModified(_))
+        !matches!(
+            self,
+            RetainedReason::LocallyModified(_) | RetainedReason::KeptByRepository(_)
+        )
+    }
+
+    /// Stable snake_case wire string, matching the `serde` tag.
+    #[must_use]
+    pub fn wire(&self) -> &'static str {
+        match self {
+            RetainedReason::LocallyModified(_) => "locally_modified",
+            RetainedReason::KeptByRepository(_) => "kept_by_repository",
+            RetainedReason::ReadFailed(_) => "read_failed",
+            RetainedReason::RemoveFailed(_) => "remove_failed",
+            RetainedReason::LinkedElsewhere(_) => "linked_elsewhere",
+        }
     }
 
     /// One line naming the reason, for the log summary and the manifest.
@@ -1124,12 +1148,15 @@ impl RetainedReason {
             RetainedReason::LocallyModified(blob) => {
                 format!("locally modified (blob {blob} is not one it shipped as), kept")
             }
+            RetainedReason::KeptByRepository(why) => {
+                format!("kept: the enclosing repository keeps it ({why})")
+            }
             RetainedReason::ReadFailed(why) => {
                 format!("could not be read to compare its blob: {why}")
             }
             RetainedReason::RemoveFailed(why) => format!("removal failed: {why}"),
-            RetainedReason::OutsideWorkdir(at) => {
-                format!("not removed: the agents directory resolves outside the workdir, to {at}")
+            RetainedReason::LinkedElsewhere(at) => {
+                format!("not removed: .claude/agents is reached through a symlink, to {at}")
             }
         }
     }
@@ -1146,7 +1173,9 @@ impl RetainedReason {
 pub struct RetainedRetiredUnit {
     /// The unit's name as the provisioner addresses it (a file name).
     pub unit: String,
-    /// Why it is still there.
+    /// Why it is still there. Flattened, as [`SkippedUnit::reason`] is, so both
+    /// lists serialize as `{unit, reason, detail}`.
+    #[serde(flatten)]
     pub reason: RetainedReason,
 }
 
@@ -1176,8 +1205,9 @@ pub struct ProvisionReport {
     /// neither `written` nor [`Self::is_complete`].
     pub removed: Vec<RemovedUnit>,
     /// Every RETIRED unit the pass found and left on disk, with why. A failed
-    /// removal or read degrades the pass ([`Self::is_complete`]); a locally
-    /// modified copy kept on purpose does not, but is still named.
+    /// removal or read degrades the pass ([`Self::is_complete`]); a copy kept
+    /// on purpose (locally modified, or kept by the repository) does not, but
+    /// is still named.
     pub retained_retired: Vec<RetainedRetiredUnit>,
     /// Which rung supplied what was written. [`Rung::Unresolved`] when the pass
     /// delivered nothing at all.
@@ -1289,14 +1319,16 @@ impl ProvisionReport {
             && !self.retained_retired.iter().any(|r| r.reason.is_failure())
     }
 
-    /// True when this pass delivered less than its roster — the state that used
-    /// to be invisible.
+    /// True when this pass delivered less than its roster, or left a retired
+    /// unit on disk that it meant to remove — the states that used to be
+    /// invisible.
     #[must_use]
     pub fn is_degraded(&self) -> bool {
         !self.is_complete()
     }
 
-    /// One log line: counts first, then every skipped unit with its reason.
+    /// One log line: counts first, then every removed unit, every retired unit
+    /// left on disk, and every skipped unit, each with its reason.
     ///
     /// Deliberately states the reasons rather than a count of them — a "3
     /// skipped" line is the same unreadable signal this type replaces.
@@ -1345,7 +1377,8 @@ impl ProvisionReport {
     /// The skipped units land in [`CapabilityObservation::note`] WITH their
     /// reasons, so a manifest read on an operator's machine states what the
     /// session did not get and why — which is the entire deliverable of this
-    /// phase.
+    /// phase. A retired unit the pass meant to remove and could not lands in the
+    /// note too; removed units and deliberate keeps land in the detail.
     #[must_use]
     pub fn observation(&self) -> CapabilityObservation {
         let mut detail = format!("wrote {}/{} unit(s)", self.written, self.expected);
@@ -2623,6 +2656,69 @@ mod tests {
         );
     }
 
+    /// A retired unit left on disk serializes in the skip shape (`{unit,
+    /// reason, detail}`), is named in the summary, puts a deliberate keep in the
+    /// detail and a failed removal in the note, and only the failure degrades.
+    #[test]
+    fn a_retained_retired_unit_is_named_and_only_a_failure_degrades() {
+        let mut report = ProvisionReport::new("agent_definitions", 0, Rung::OperatorCheckout);
+        report.record_retained_retired(
+            "edited.md",
+            RetainedReason::LocallyModified("aaaa".to_string()),
+        );
+        assert!(report.is_complete(), "a deliberate keep does not degrade");
+        let obs = report.observation();
+        assert_eq!(
+            obs.detail.as_deref(),
+            Some(
+                "wrote 0/0 unit(s); retired but kept: edited.md (locally modified (blob \
+                 aaaa is not one it shipped as), kept)"
+            )
+        );
+        assert!(obs.note.is_none(), "{:?}", obs.note);
+
+        report.record_retained_retired(
+            "stuck.md",
+            RetainedReason::RemoveFailed("permission denied".to_string()),
+        );
+        assert!(!report.is_complete(), "a failed removal degrades");
+        assert_eq!(
+            report.observation().note.as_deref(),
+            Some(
+                "1 retired unit(s) still present and still resolvable — the spawn continued \
+                 regardless (fail-soft by contract): stuck.md (removal failed: permission \
+                 denied)"
+            )
+        );
+        let summary = report.summary();
+        assert!(
+            summary.contains(
+                "; 2 retired unit(s) still present: [edited.md — locally modified (blob aaaa \
+                 is not one it shipped as), kept] [stuck.md — removal failed: permission \
+                 denied]"
+            ),
+            "{summary}"
+        );
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            json["retained_retired"],
+            serde_json::json!([
+                {"unit": "edited.md", "reason": "locally_modified", "detail": "aaaa"},
+                {"unit": "stuck.md", "reason": "remove_failed", "detail": "permission denied"}
+            ])
+        );
+        for r in &report.retained_retired {
+            assert_eq!(json_reason(&r.reason), r.reason.wire());
+        }
+    }
+
+    fn json_reason(reason: &RetainedReason) -> String {
+        serde_json::to_value(reason).unwrap()["reason"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
     /// The `unresolved` constructor is the shape that replaces a lone `warn!` on
     /// a resolver that found no source at all — `agent_runtime`'s "no
     /// qontinui-root resolved; skipping .claude/agents" and `slash_commands`'
@@ -3204,14 +3300,33 @@ mod tests {
             );
         }
 
+        // `fleet_agents` is conditional for the same reason: `agent_runtime`'s
+        // subagent-provisioning tests record the embedded floor's report from
+        // inside `provision_agent_definitions_retiring` without this module's
+        // store lock, so a parallel run can leave a real arm here.
+        let floor = manifest.row("fleet_agents").expect("row present");
+        if floor.rung == Rung::Unknown {
+            assert!(floor
+                .note
+                .as_deref()
+                .is_some_and(|n| n.contains(capability("fleet_agents").anchor)));
+        } else {
+            assert!(
+                capability("fleet_agents")
+                    .expected_rungs
+                    .contains(&floor.rung),
+                "fleet_agents reported {:?}, a rung its provisioner cannot emit",
+                floor.rung.wire()
+            );
+        }
+
         // Everything the driver cannot observe from here stays `unknown` AND
-        // names its anchor. With an empty ledger that is the other seven rows;
+        // names its anchor. With an empty ledger that is the other six rows;
         // nothing outside this module's own tests records them, so they are
         // deterministic.
         for id in [
             "fleet_commands",
             "fleet_skills",
-            "fleet_agents",
             "agent_definitions",
             "agent_commands_registry",
             "agent_skills_registry",

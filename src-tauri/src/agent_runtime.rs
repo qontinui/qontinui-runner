@@ -10202,8 +10202,17 @@ async fn materialize_worktrees(payload: &LaunchPayload) -> anyhow::Result<()> {
 /// [`capability_manifest::Rung::Unresolved`] row naming what was skipped and
 /// why. The control flow is unchanged: it still returns `Ok` and the spawn
 /// still proceeds.
-fn provision_agent_definitions(worktree_cwd: &str) -> anyhow::Result<ProvisionReport> {
-    let Some(root) = qontinui_root_dir() else {
+fn provision_agent_definitions(worktree_cwd: &str) -> ProvisionReport {
+    provision_agent_definitions_with_root(qontinui_root_dir().as_deref(), worktree_cwd)
+}
+
+/// [`provision_agent_definitions`] with the root it resolved passed in, so a
+/// test can drive the no-root arm without touching the process-wide resolver.
+fn provision_agent_definitions_with_root(
+    root: Option<&Path>,
+    worktree_cwd: &str,
+) -> ProvisionReport {
+    let Some(root) = root else {
         warn!(
             "agent_runtime: no qontinui-root resolved; skipping .claude/agents \
              provisioning for {worktree_cwd} (auto-spawned subagents will not resolve)"
@@ -10226,9 +10235,9 @@ fn provision_agent_definitions(worktree_cwd: &str) -> anyhow::Result<ProvisionRe
             crate::fleet_agents::RETIRED_AGENTS,
             &mut report,
         );
-        return Ok(report);
+        return report;
     };
-    provision_agent_definitions_from_root(&root, worktree_cwd)
+    provision_agent_definitions_from_root(root, worktree_cwd)
 }
 
 /// The retirement pass on its own, for a spawn with no checkout root: the
@@ -10273,23 +10282,7 @@ fn retire_agent_definitions(worktree_cwd: &str, retired: &[&str], report: &mut P
 /// is observable on the next manifest read rather than in this value. The spawn
 /// path ignores the return entirely.
 pub(crate) fn provision_agent_definitions_recorded(workdir: &str) -> Vec<ProvisionReport> {
-    let report = match provision_agent_definitions(workdir) {
-        Ok(report) => report,
-        Err(e) => {
-            warn!("agent_runtime: agent-def provisioning errored (continuing): {e:#}");
-            let mut report = ProvisionReport::new(
-                "agent_definitions",
-                0,
-                capability_manifest::Rung::Unresolved,
-            )
-            .with_destination(workdir.to_string());
-            report.skip(
-                workdir.to_string(),
-                capability_manifest::SkipReason::WriteFailed(format!("{e:#}")),
-            );
-            report
-        }
-    };
+    let report = provision_agent_definitions(workdir);
     let echo = report.clone();
     capability_manifest::record_provision(workdir, report);
     vec![echo]
@@ -10304,10 +10297,7 @@ pub(crate) fn provision_agent_definitions_recorded(workdir: &str) -> Vec<Provisi
 /// is recorded into the session ledger from here, because this is the only
 /// caller that can see it. The retirement pass runs last and records its
 /// removals on the returned report.
-fn provision_agent_definitions_from_root(
-    root: &Path,
-    worktree_cwd: &str,
-) -> anyhow::Result<ProvisionReport> {
+fn provision_agent_definitions_from_root(root: &Path, worktree_cwd: &str) -> ProvisionReport {
     provision_agent_definitions_retiring(root, worktree_cwd, crate::fleet_agents::RETIRED_AGENTS)
 }
 
@@ -10318,7 +10308,7 @@ fn provision_agent_definitions_retiring(
     root: &Path,
     worktree_cwd: &str,
     retired: &[&str],
-) -> anyhow::Result<ProvisionReport> {
+) -> ProvisionReport {
     let src_dir = root
         .join("qontinui-claude-config")
         .join(".claude")
@@ -10387,7 +10377,7 @@ fn provision_agent_definitions_retiring(
     // CHECKOUT WINS: the operator's live copies are overlaid on top, so editing
     // qontinui-claude-config/.claude/agents behaves exactly as before.
     // An overlay that errored still gets the retirement pass below, so its
-    // error is turned into the same errored report the recorder would build.
+    // error becomes an errored report rather than an early return.
     let mut report = match overlay_checkout_agent_definitions(&src_dir, &dst_dir, &keep, embedded) {
         Ok(report) => report,
         Err(e) => {
@@ -10421,7 +10411,7 @@ fn provision_agent_definitions_retiring(
         retired,
         &mut report,
     );
-    Ok(report)
+    report
 }
 
 /// The checkout overlay of [`provision_agent_definitions_retiring`]: copy every
@@ -14370,7 +14360,7 @@ mod tests {
         let wt = tempfile::tempdir().unwrap();
         let wt_cwd = wt.path().to_string_lossy().into_owned();
 
-        let report = provision_agent_definitions_from_root(root.path(), &wt_cwd).unwrap();
+        let report = provision_agent_definitions_from_root(root.path(), &wt_cwd);
         // The checkout answered, and the report says so — two `*.md` copied,
         // `settings.json` not counted (it is not a definition).
         assert_eq!(
@@ -14403,7 +14393,7 @@ mod tests {
         );
 
         // Idempotent: a second run over the same dst overwrites cleanly.
-        provision_agent_definitions_from_root(root.path(), &wt_cwd).unwrap();
+        provision_agent_definitions_from_root(root.path(), &wt_cwd);
         assert!(dst.join("merge-specialist.md").is_file());
     }
 
@@ -14449,7 +14439,7 @@ mod tests {
         );
 
         let wt_cwd = wt.path().to_string_lossy().into_owned();
-        let report = provision_agent_definitions_from_root(root.path(), &wt_cwd).unwrap();
+        let report = provision_agent_definitions_from_root(root.path(), &wt_cwd);
 
         assert_eq!(
             std::fs::read_to_string(&tracked_overlay).unwrap(),
@@ -14516,7 +14506,7 @@ mod tests {
         std::fs::write(dst.join("code-reviewer.md"), "# WORKTREE's own reviewer").unwrap();
 
         let wt_cwd = wt.path().to_string_lossy().into_owned();
-        let report = provision_agent_definitions_from_root(root.path(), &wt_cwd).unwrap();
+        let report = provision_agent_definitions_from_root(root.path(), &wt_cwd);
 
         assert_eq!(
             std::fs::read_to_string(dst.join("code-reviewer.md")).unwrap(),
@@ -14556,13 +14546,13 @@ mod tests {
         let wt = tempfile::tempdir().unwrap();
         let wt_cwd = wt.path().to_string_lossy().into_owned();
 
-        let res = provision_agent_definitions_from_root(root.path(), &wt_cwd);
-        assert!(res.is_ok(), "missing source dir must still fail soft (Ok)");
+        // A missing source dir is fail-soft: the pass returns a report, never
+        // an error, and the spawn proceeds.
+        let report = provision_agent_definitions_from_root(root.path(), &wt_cwd);
 
         // Phase 3: the degradation is now a VALUE, not only a `warn!`. The
         // CHECKOUT layer is `unresolved` and says why; the embedded floor that
         // stood in for it is asserted below, exactly as before.
-        let report = res.expect("fail-soft Ok");
         assert_eq!(report.capability, "agent_definitions");
         assert_eq!(report.rung, crate::capability_manifest::Rung::Unresolved);
         assert_eq!(report.written, 0);
@@ -14595,7 +14585,9 @@ mod tests {
     }
 
     /// The retirement as the population meets it, entered where every spawn
-    /// enters: a session this build provisions gets no `test-generator.md`.
+    /// with a resolved root enters: a session this build provisions gets no
+    /// `test-generator.md` (the no-root arm is
+    /// `provision_agent_defs_no_root_arm_hands_the_production_table_to_the_pass`).
     /// The name is a literal rather than a read of the retired table, so the
     /// test keeps naming the file this build stopped shipping.
     #[test]
@@ -14604,7 +14596,7 @@ mod tests {
         let wt = tempfile::tempdir().unwrap();
         let wt_cwd = wt.path().to_string_lossy().into_owned();
 
-        provision_agent_definitions_from_root(root.path(), &wt_cwd).unwrap();
+        provision_agent_definitions_from_root(root.path(), &wt_cwd);
 
         let dst = wt.path().join(".claude").join("agents");
         assert!(
@@ -14665,8 +14657,7 @@ mod tests {
         let (wt, dst) = workdir_with(&[("retired-agent.md", body)]);
 
         let wt_cwd = wt.path().to_string_lossy().into_owned();
-        let report =
-            provision_agent_definitions_retiring(root.path(), &wt_cwd, &[line.as_str()]).unwrap();
+        let report = provision_agent_definitions_retiring(root.path(), &wt_cwd, &[line.as_str()]);
 
         assert!(
             !dst.join("retired-agent.md").exists(),
@@ -14698,8 +14689,7 @@ mod tests {
         let (wt, dst) = workdir_with(&[("retired-agent.md", edited)]);
 
         let wt_cwd = wt.path().to_string_lossy().into_owned();
-        let report =
-            provision_agent_definitions_retiring(root.path(), &wt_cwd, &[line.as_str()]).unwrap();
+        let report = provision_agent_definitions_retiring(root.path(), &wt_cwd, &[line.as_str()]);
 
         assert_eq!(
             std::fs::read_to_string(dst.join("retired-agent.md")).unwrap(),
@@ -14739,14 +14729,23 @@ mod tests {
         git_init(wt.path());
         git_add(wt.path(), &dst.join("retired-agent.md"));
         let wt_cwd = wt.path().to_string_lossy().into_owned();
-        let report =
-            provision_agent_definitions_retiring(root.path(), &wt_cwd, &[line.as_str()]).unwrap();
+        let report = provision_agent_definitions_retiring(root.path(), &wt_cwd, &[line.as_str()]);
         assert_eq!(
             std::fs::read_to_string(dst.join("retired-agent.md")).unwrap(),
             body,
             "a retired definition the repository tracks must stay, as both layers keep it"
         );
         assert!(report.removed.is_empty(), "{:?}", report.removed);
+        assert_eq!(
+            report.retained_retired,
+            vec![crate::capability_manifest::RetainedRetiredUnit {
+                unit: "retired-agent.md".to_string(),
+                reason: crate::capability_manifest::RetainedReason::KeptByRepository(
+                    "git_tracked".to_string()
+                ),
+            }],
+            "a tracked retired copy still resolves, so it is named"
+        );
 
         // Arm 2: the probe could not answer, inside a repository.
         let (wt, dst) = workdir_with(&[("retired-agent.md", body)]);
@@ -14756,14 +14755,26 @@ mod tests {
         )
         .unwrap();
         let wt_cwd = wt.path().to_string_lossy().into_owned();
-        let report =
-            provision_agent_definitions_retiring(root.path(), &wt_cwd, &[line.as_str()]).unwrap();
+        let report = provision_agent_definitions_retiring(root.path(), &wt_cwd, &[line.as_str()]);
         assert_eq!(
             std::fs::read_to_string(dst.join("retired-agent.md")).unwrap(),
             body,
             "an existing retired copy stays when the probe cannot answer in a repository"
         );
         assert!(report.removed.is_empty(), "{:?}", report.removed);
+        assert_eq!(
+            report.retained_retired,
+            vec![crate::capability_manifest::RetainedRetiredUnit {
+                unit: "retired-agent.md".to_string(),
+                reason: crate::capability_manifest::RetainedReason::KeptByRepository(
+                    "probe_unknown_in_repo".to_string()
+                ),
+            }]
+        );
+        assert!(
+            report.is_complete(),
+            "a repository keep does not degrade the pass"
+        );
     }
 
     /// Only a retired NAME is ever removed: a current definition whose bytes
@@ -14776,8 +14787,7 @@ mod tests {
         let dst = wt.path().join(".claude").join("agents");
 
         let wt_cwd = wt.path().to_string_lossy().into_owned();
-        let report =
-            provision_agent_definitions_retiring(root.path(), &wt_cwd, &[line.as_str()]).unwrap();
+        let report = provision_agent_definitions_retiring(root.path(), &wt_cwd, &[line.as_str()]);
 
         assert_eq!(
             std::fs::read_to_string(dst.join("current-agent.md")).unwrap(),
@@ -14806,8 +14816,7 @@ mod tests {
         let dst = wt.path().join(".claude").join("agents");
 
         let wt_cwd = wt.path().to_string_lossy().into_owned();
-        let report =
-            provision_agent_definitions_retiring(root.path(), &wt_cwd, &[line.as_str()]).unwrap();
+        let report = provision_agent_definitions_retiring(root.path(), &wt_cwd, &[line.as_str()]);
 
         assert_eq!(
             report.written, 2,
@@ -14837,8 +14846,7 @@ mod tests {
         let (wt, dst) = workdir_with(&[("retired-agent.md", body)]);
 
         let wt_cwd = wt.path().to_string_lossy().into_owned();
-        let report =
-            provision_agent_definitions_retiring(root.path(), &wt_cwd, &[line.as_str()]).unwrap();
+        let report = provision_agent_definitions_retiring(root.path(), &wt_cwd, &[line.as_str()]);
 
         assert_eq!(report.rung, crate::capability_manifest::Rung::Unresolved);
         assert!(
@@ -14858,8 +14866,7 @@ mod tests {
         let (wt, dst) = workdir_with(&[("retired-agent.md", crlf.as_str())]);
 
         let wt_cwd = wt.path().to_string_lossy().into_owned();
-        let report =
-            provision_agent_definitions_retiring(root.path(), &wt_cwd, &[line.as_str()]).unwrap();
+        let report = provision_agent_definitions_retiring(root.path(), &wt_cwd, &[line.as_str()]);
 
         assert!(
             !dst.join("retired-agent.md").exists(),
@@ -14872,8 +14879,8 @@ mod tests {
         );
     }
 
-    /// The PRODUCTION table reaches the retirement pass where every spawn
-    /// enters. A test-generator copy no table blob matches is recorded as a
+    /// The PRODUCTION table reaches the retirement pass where every spawn with
+    /// a resolved root enters. A test-generator copy no table blob matches is recorded as a
     /// retired definition kept on disk, which only happens if
     /// `provision_agent_definitions_from_root` hands the pass a table naming
     /// `test-generator.md`. The literal name is deliberate, as above.
@@ -14884,7 +14891,7 @@ mod tests {
         let (wt, dst) = workdir_with(&[("test-generator.md", edited)]);
 
         let wt_cwd = wt.path().to_string_lossy().into_owned();
-        let report = provision_agent_definitions_from_root(root.path(), &wt_cwd).unwrap();
+        let report = provision_agent_definitions_from_root(root.path(), &wt_cwd);
 
         assert_eq!(
             std::fs::read_to_string(dst.join("test-generator.md")).unwrap(),
@@ -15006,11 +15013,11 @@ mod tests {
         assert!(!report.is_complete());
     }
 
-    /// Nothing outside the workdir is removed: an agents directory reached
-    /// through a symlink that leaves the workdir keeps its shipped copy.
+    /// Only the workdir's own files are removed: an agents directory reached
+    /// through a symlink keeps its shipped copy, wherever the link points.
     #[cfg(unix)]
     #[test]
-    fn retire_agent_definitions_never_remove_outside_the_workdir() {
+    fn retire_agent_definitions_never_remove_through_a_symlink() {
         let (body, line) = retired_fixture();
         let elsewhere = tempfile::tempdir().unwrap();
         let foreign = elsewhere.path().join(".claude").join("agents");
@@ -15034,10 +15041,72 @@ mod tests {
         assert!(report.removed.is_empty());
         assert!(matches!(
             report.retained_retired.first().map(|r| &r.reason),
-            Some(crate::capability_manifest::RetainedReason::OutsideWorkdir(
+            Some(crate::capability_manifest::RetainedReason::LinkedElsewhere(
                 _
             ))
         ));
+
+        // A link whose target sits INSIDE the workdir is still a link: the file
+        // is not `<workdir>/.claude/agents/<name>`, so it stays too.
+        let wt = tempfile::tempdir().unwrap();
+        let inner = wt.path().join("elsewhere").join("agents");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::write(inner.join("retired-agent.md"), body).unwrap();
+        std::fs::create_dir(wt.path().join(".claude")).unwrap();
+        std::os::unix::fs::symlink(&inner, wt.path().join(".claude").join("agents")).unwrap();
+        let mut report = ProvisionReport::new(
+            "agent_definitions",
+            0,
+            crate::capability_manifest::Rung::OperatorCheckout,
+        );
+        retire_agent_definitions(&wt.path().to_string_lossy(), &[line.as_str()], &mut report);
+        assert!(inner.join("retired-agent.md").is_file());
+        assert!(report.removed.is_empty());
+        assert!(matches!(
+            report.retained_retired.first().map(|r| &r.reason),
+            Some(crate::capability_manifest::RetainedReason::LinkedElsewhere(
+                _
+            ))
+        ));
+
+        // An edited copy behind a link is a deliberate keep, not a failure.
+        std::fs::write(inner.join("retired-agent.md"), "# edited\n").unwrap();
+        let mut report = ProvisionReport::new(
+            "agent_definitions",
+            0,
+            crate::capability_manifest::Rung::OperatorCheckout,
+        );
+        retire_agent_definitions(&wt.path().to_string_lossy(), &[line.as_str()], &mut report);
+        assert!(matches!(
+            report.retained_retired.first().map(|r| &r.reason),
+            Some(crate::capability_manifest::RetainedReason::LocallyModified(
+                _
+            ))
+        ));
+        assert!(report.is_complete());
+    }
+
+    /// The no-root arm (a published install's normal state) hands the
+    /// PRODUCTION table to the pass: an edited test-generator copy is recorded
+    /// as a retired unit kept on disk.
+    #[test]
+    fn provision_agent_defs_no_root_arm_hands_the_production_table_to_the_pass() {
+        let edited = "---\nname: test-generator\n---\n# edited in this workdir\n";
+        let (wt, _dst) = workdir_with(&[("test-generator.md", edited)]);
+
+        let report = provision_agent_definitions_with_root(None, &wt.path().to_string_lossy());
+
+        assert_eq!(report.rung, crate::capability_manifest::Rung::Unresolved);
+        assert_eq!(
+            report
+                .retained_retired
+                .iter()
+                .map(|r| (r.unit.as_str(), r.reason.wire()))
+                .collect::<Vec<_>>(),
+            vec![("test-generator.md", "locally_modified")],
+            "the no-root arm must retire with the production table: {}",
+            report.summary()
+        );
     }
 
     /// A checkout overlay that ERRORS still gets the retirement pass: an
@@ -15064,7 +15133,6 @@ mod tests {
         let report = provision_agent_definitions_retiring(root.path(), &wt_cwd, &[line.as_str()]);
         std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let report = report.expect("an errored overlay is still fail-soft");
         assert_eq!(report.rung, crate::capability_manifest::Rung::Unresolved);
         assert_eq!(report.skipped.len(), 1, "{:?}", report.skipped);
         assert!(
