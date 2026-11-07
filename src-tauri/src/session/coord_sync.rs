@@ -132,19 +132,22 @@
 //! gateway 502/504s quarantined 12 sessions on merytshost, diverting their
 //! heartbeats to the sidecar until coord's staleness watcher closed the rows.
 //!
-//! Nor does quarantine divert a session's heartbeats once some OTHER row put it
-//! there. A session quarantined on its `state_change` or `progress` row still
-//! sends its newest pending heartbeat each tick, as a one-row chain (a
-//! heartbeat PATCH carries no state, so pushing it ahead of lifecycle rows
-//! reorders nothing coord reads), and ACK-drops the older ones; only its
-//! non-heartbeat rows go to the sidecar. Otherwise the session's coord row
-//! lapses to `stale` and then `closed` while the session is alive, with no
-//! heartbeat ever arriving to revive it. The bypass stops once the session's
-//! `started` or `closed` row is bound for the sidecar: from then on its
-//! heartbeats are ACK-dropped unsent. Without a `started`, coord holds no row
-//! and a heartbeat PATCH would 404 every interval. After a `closed` coord never
-//! saw, a heartbeat the loop snapshotted before the close would revive the
-//! reaped row of an ended session.
+//! Nor does quarantine divert a session's heartbeats or LIFECYCLE rows once some
+//! OTHER row put it there. Quarantine exists for a poisoned row, and a lifecycle
+//! row is not disposable: losing a `started` leaves coord with no row, losing a
+//! `finished` leaves it counting a finished session as work in flight (plan
+//! `2026-10-29-session-outbox-drops-the-finish-of-a-session-coord-never-registered`
+//! D3). So a quarantined session's `started` / `state_change` / `closed` /
+//! `finished` rows stay in the outbox and retry at [`MAX_BACKOFF`], one request
+//! a minute per quarantined session; only its other rows (progress, output
+//! chunks, ...) go to the sidecar. Its heartbeats stay in the same per-session
+//! chain, in seq order, so a heartbeat can never 404 ahead of its own `started`,
+//! and they collapse like any other run of consecutive heartbeats. Otherwise the
+//! session's coord row would lapse to `stale` and then `closed` while the
+//! session is alive. When the sidecar reaches [`QUARANTINE_MAX_BYTES`] it
+//! rotates to `<outbox>.quarantine.1.jsonl` (replacing any earlier generation)
+//! and starts afresh rather than dropping rows; the outbox's own cap trim skips
+//! lifecycle rows for the same reason (`local_store`).
 //!
 //! ## Conflict-on-acquire
 //!
@@ -900,24 +903,24 @@ pub(crate) struct SessionOutboxHealth {
     pub quarantined_sessions: u64,
     /// [`HEARTBEATS_SUPERSEDED`] as of this snapshot.
     pub heartbeats_superseded: u64,
-    /// [`HEARTBEATS_MUTED`] as of this snapshot.
-    pub heartbeats_muted: u64,
     /// [`HEARTBEATS_DROPPED_ON_FAILURE`] as of this snapshot.
     pub heartbeats_dropped_on_failure: u64,
     /// [`HEARTBEATS_DROPPED_ON_FAILURE_BY_KIND`] as of this snapshot: only the
     /// kinds with a non-zero total, so its values sum to
     /// `heartbeats_dropped_on_failure`.
     pub heartbeats_dropped_on_failure_by_kind: BTreeMap<&'static str, u64>,
+    /// [`QUARANTINE_ROTATIONS`] as of this snapshot.
+    pub quarantine_rotations: u64,
 }
 
-/// Copy the three heartbeat-drop totals into a health snapshot. Both snapshot
+/// Copy the heartbeat-drop totals and the sidecar rotation count into a health snapshot. Both snapshot
 /// writes in `drain_tick` go through this, so the block never reports one
 /// counter fresh and another stale.
 fn snapshot_heartbeat_drops(h: &mut SessionOutboxHealth) {
     h.heartbeats_superseded = HEARTBEATS_SUPERSEDED.load(Ordering::Relaxed);
-    h.heartbeats_muted = HEARTBEATS_MUTED.load(Ordering::Relaxed);
     h.heartbeats_dropped_on_failure = HEARTBEATS_DROPPED_ON_FAILURE.load(Ordering::Relaxed);
     h.heartbeats_dropped_on_failure_by_kind = heartbeats_dropped_on_failure_by_kind();
+    h.quarantine_rotations = QUARANTINE_ROTATIONS.load(Ordering::Relaxed);
 }
 
 fn session_outbox_health_cell() -> &'static Mutex<SessionOutboxHealth> {
@@ -973,18 +976,19 @@ pub(crate) fn render_session_outbox_health(h: &SessionOutboxHealth) -> JsonValue
         "quarantinedSessions": counted(h.quarantined_sessions),
         // Heartbeat rows the drain ACK-dropped without coord taking them, one
         // counter per cause, all process lifetime: superseded by a newer
-        // pending heartbeat of the same session; muted because the session is
-        // quarantined and its `started`/`closed` row went to the sidecar; and
-        // dropped after a push that failed (no answer, a 5xx, a 4xx other
-        // than 409, or another non-2xx answer), broken down by failure kind.
+        // pending heartbeat of the same session; and dropped after a push that
+        // failed (no answer, a 5xx, a 4xx other than 409, or another non-2xx
+        // answer), broken down by failure kind.
         "heartbeatsSuperseded": counted(h.heartbeats_superseded),
-        "heartbeatsMuted": counted(h.heartbeats_muted),
         "heartbeatsDroppedOnFailure": counted(h.heartbeats_dropped_on_failure),
         "heartbeatsDroppedOnFailureByKind": if observed {
             json!(h.heartbeats_dropped_on_failure_by_kind)
         } else {
             JsonValue::Null
         },
+        // Times the quarantine sidecar hit its cap and rotated to `.1`
+        // (process lifetime). Rotation discards the previous `.1` generation.
+        "quarantineRotations": counted(h.quarantine_rotations),
         "observedAt": h.observed_at,
     })
 }
@@ -1102,6 +1106,19 @@ fn quarantine_path(outbox: &OutboxWriter) -> std::path::PathBuf {
     p.with_file_name(format!("{name}.quarantine.jsonl"))
 }
 
+/// `<outbox>.quarantine.jsonl` -> `<outbox>.quarantine.1.jsonl`.
+fn quarantine_rotated_path(sidecar: &std::path::Path) -> std::path::PathBuf {
+    let name = sidecar
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let rotated = match name.strip_suffix(".jsonl") {
+        Some(stem) => format!("{stem}.1.jsonl"),
+        None => format!("{name}.1"),
+    };
+    sidecar.with_file_name(rotated)
+}
+
 /// Append rows to the quarantine sidecar. Only an `Ok` lets the caller ACK
 /// them out of the outbox — a row is never dropped without landing somewhere.
 fn append_quarantine(outbox: &OutboxWriter, rows: &[OutboxRecord]) -> std::io::Result<()> {
@@ -1186,18 +1203,9 @@ pub(crate) fn transport_rung_drain_dropped() -> TransportRungDrainDropped {
 /// Pending heartbeat rows the drain ACK-dropped unsent because a newer pending
 /// heartbeat of the same session replaces them: the next pending row is also a
 /// heartbeat, or the session is quarantined and has a newer pending heartbeat.
-/// A muted session's heartbeats are NOT counted here ([`HEARTBEATS_MUTED`]).
 /// Process-lifetime total, bumped only once the ACK has landed;
 /// `GET /health` `sessionOutbox.heartbeatsSuperseded`.
 pub(crate) static HEARTBEATS_SUPERSEDED: AtomicU64 = AtomicU64::new(0);
-
-/// Pending heartbeat rows the drain ACK-dropped unsent because their session is
-/// quarantined and its `started` or `closed` row went to the sidecar (module
-/// header, "One session's failure is that session's problem"): coord holds no
-/// row to keep alive, or the session has ended, so no heartbeat of it will
-/// ever be sent. Same lifetime and ACK-landed rule as
-/// [`HEARTBEATS_SUPERSEDED`]; `GET /health` `sessionOutbox.heartbeatsMuted`.
-pub(crate) static HEARTBEATS_MUTED: AtomicU64 = AtomicU64::new(0);
 
 /// Heartbeat rows the drain ACK-dropped after a push that did not deliver
 /// them: a transport failure (no HTTP answer, a 5xx, or another non-2xx
@@ -1261,6 +1269,11 @@ fn heartbeats_dropped_on_failure_by_kind() -> BTreeMap<&'static str, u64> {
         .collect()
 }
 
+/// Times the quarantine sidecar reached [`QUARANTINE_MAX_BYTES`] and was
+/// rotated to `.quarantine.1.jsonl`. Process-lifetime total;
+/// `GET /health` `sessionOutbox.quarantineRotations`.
+pub(crate) static QUARANTINE_ROTATIONS: AtomicU64 = AtomicU64::new(0);
+
 /// Session LIFECYCLE kinds — the rows that define coord's session row itself:
 /// its creation (`started` → `POST /sessions`), its state (`state_change` →
 /// `PATCH`), its end (`closed` → `PATCH {state:"closed"}`) and its work axis
@@ -1273,7 +1286,7 @@ fn heartbeats_dropped_on_failure_by_kind() -> BTreeMap<&'static str, u64> {
 /// fact no later row repeats. `heartbeat` is deliberately NOT
 /// here: the next heartbeat supersedes a dropped one within a tick, and
 /// retrying it would only hold the session's chain behind a stale stamp.
-fn is_lifecycle_kind(kind: &str) -> bool {
+pub(crate) fn is_lifecycle_kind(kind: &str) -> bool {
     kind == SessionEventKind::Started.as_str()
         || kind == SessionEventKind::StateChange.as_str()
         || kind == SessionEventKind::Closed.as_str()
@@ -1431,6 +1444,9 @@ struct ChainOutcome {
     /// ACK-dropped after a failed push (one entry per row, also in
     /// `succeeded`). Counted by the tick once the ACK lands.
     heartbeat_failure_drops: Vec<&'static str>,
+    /// A quarantined session's keep-alive heartbeat chain: it never touches the
+    /// session's retry/quarantine state (set by the caller).
+    keepalive: bool,
 }
 
 /// Push one session's records in seq order.
@@ -1460,6 +1476,7 @@ async fn push_chain(
         blocked_on: None,
         aborted: false,
         heartbeat_failure_drops: Vec::new(),
+        keepalive: false,
     };
 
     for rec in records {
@@ -1631,8 +1648,9 @@ async fn push_chain(
     out
 }
 
-/// Past this size the quarantine sidecar stops growing: further quarantined
-/// rows are dropped with a `warn!` rather than filling the disk.
+/// Past this size the quarantine sidecar rotates to `.quarantine.1.jsonl`
+/// (replacing any earlier generation) and starts afresh, so it never fills the
+/// disk and never discards the newest rows.
 const QUARANTINE_MAX_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Per-session drain state carried across ticks by [`run_drain_loop`].
@@ -1652,11 +1670,6 @@ struct DrainState {
     /// earlier ones instead of re-earning a retry budget; bounded by the
     /// number of poisoned sessions this process has seen.
     quarantined: HashSet<Uuid>,
-    /// Quarantined sessions whose `started` or `closed` row went to the
-    /// sidecar: coord holds no row to keep alive (`started`), or the session
-    /// has ended (`closed`), so their heartbeats are ACK-dropped unsent rather
-    /// than bypassing the sidecar. Same lifetime as `quarantined`.
-    heartbeats_muted: HashSet<Uuid>,
     /// Quarantined rows already written to the sidecar whose outbox ACK has
     /// not landed yet — so a failed ACK never appends the same row twice.
     in_sidecar: HashSet<(Uuid, i64)>,
@@ -1680,8 +1693,6 @@ struct TickResult {
     /// replaces them, counted only once the ACK landed — this tick's share of
     /// [`HEARTBEATS_SUPERSEDED`].
     heartbeats_superseded: u64,
-    /// This tick's share of [`HEARTBEATS_MUTED`], same ACK-landed rule.
-    heartbeats_muted: u64,
     /// This tick's share of [`HEARTBEATS_DROPPED_ON_FAILURE`], same rule.
     heartbeats_dropped_on_failure: u64,
     /// `heartbeats_dropped_on_failure` split by failure kind (non-zero kinds
@@ -1696,7 +1707,6 @@ impl TickResult {
             idle: true,
             ran_any: false,
             heartbeats_superseded: 0,
-            heartbeats_muted: 0,
             heartbeats_dropped_on_failure: 0,
             heartbeats_dropped_on_failure_by_kind: BTreeMap::new(),
         }
@@ -1730,13 +1740,25 @@ fn quarantine_rows(
     let path = quarantine_path(&inner.outbox);
     let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
     if size >= QUARANTINE_MAX_BYTES {
+        // Rotate instead of dropping the newest rows: the oldest generation is
+        // what is discarded. A failed rename leaves the sidecar as it is and
+        // the rows in the outbox (retried next tick) — never ACKed unwritten.
+        let rotated = quarantine_rotated_path(&path);
+        if let Err(e) = std::fs::rename(&path, &rotated) {
+            tracing::warn!(
+                error = %e,
+                path = %path.display(),
+                "coord_sync: quarantine sidecar is at its cap and could not be rotated — rows stay in the outbox"
+            );
+            return done;
+        }
+        let total = QUARANTINE_ROTATIONS.fetch_add(1, Ordering::Relaxed) + 1;
         tracing::warn!(
-            rows = fresh.len(),
             path = %path.display(),
-            "coord_sync: quarantine sidecar is at its cap — dropping quarantined rows"
+            rotated = %rotated.display(),
+            total,
+            "coord_sync: quarantine sidecar reached its cap — rotated (the previous rotated generation was replaced)"
         );
-        done.extend(fresh.iter().map(|r| (r.session_id, r.seq)));
-        return done;
     }
     match append_quarantine(&inner.outbox, &fresh) {
         Ok(()) => {
@@ -1822,32 +1844,40 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
         .map(|w| (w[0].session_id, w[0].seq))
         .collect();
     let mut superseded: Vec<(Uuid, i64)> = Vec::new();
-    // Heartbeats of a muted quarantined session (below): dropped like the
-    // superseded ones, but counted apart, because no newer heartbeat of the
-    // session will ever be sent.
-    let mut muted: Vec<(Uuid, i64)> = Vec::new();
 
-    // A quarantined session's heartbeats bypass the sidecar: only its newest
-    // pending heartbeat goes out, and every older one is superseded by it —
-    // across lifecycle rows too, since those go to the sidecar, not to coord.
-    // Unless its `started` or `closed` row is sidecarred: then the session is
-    // muted and every heartbeat is dropped (a heartbeat PATCH on a row coord
-    // never created 404s forever; one after a close coord never saw would
-    // revive a reaped row of an ended session).
+    // A quarantined session's lifecycle rows stay in its chain (below), so its
+    // heartbeats need a placement:
+    //  * a `started` or `closed` row is pending — the heartbeat must keep its
+    //    seq place: before the `started` it would 404 on a row coord never
+    //    created, after a `closed` coord never saw it would revive a reaped row;
+    //  * otherwise the newest pending heartbeat is moved to the FRONT of the
+    //    session's chain and the older ones are superseded. A heartbeat PATCH
+    //    carries no state, so sending it ahead of a stuck `state_change`
+    //    reorders nothing coord reads — and the live session's coord row keeps
+    //    its keep-alive while that row is retried.
     let started_kind = SessionEventKind::Started.as_str();
     let closed_kind = SessionEventKind::Closed.as_str();
-    let mut newest_quarantined_heartbeat: HashMap<Uuid, i64> = HashMap::new();
+    let seq_ordered_heartbeats: HashSet<Uuid> = pending
+        .iter()
+        .filter(|r| {
+            state.quarantined.contains(&r.session_id)
+                && (r.event_kind == started_kind || r.event_kind == closed_kind)
+        })
+        .map(|r| r.session_id)
+        .collect();
+    let mut front_heartbeat: HashMap<Uuid, OutboxRecord> = HashMap::new();
+    let is_front_candidate = |state: &DrainState, r: &OutboxRecord| {
+        r.event_kind == heartbeat_kind
+            && state.quarantined.contains(&r.session_id)
+            && !seq_ordered_heartbeats.contains(&r.session_id)
+    };
     for rec in &pending {
-        if !state.quarantined.contains(&rec.session_id) {
+        if !is_front_candidate(state, rec) || held.contains(&rec.session_id) {
             continue;
         }
-        if rec.event_kind == heartbeat_kind {
-            let newest = newest_quarantined_heartbeat
-                .entry(rec.session_id)
-                .or_insert(rec.seq);
-            *newest = (*newest).max(rec.seq);
-        } else if rec.event_kind == started_kind || rec.event_kind == closed_kind {
-            state.heartbeats_muted.insert(rec.session_id);
+        // `pending` is in seq order, so the last one seen is the newest.
+        if let Some(older) = front_heartbeat.insert(rec.session_id, rec.clone()) {
+            superseded.push((older.session_id, older.seq));
         }
     }
 
@@ -1859,22 +1889,17 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
         if held.contains(&rec.session_id) {
             continue;
         }
+        // A quarantined session's lifecycle rows stay in its chain (a
+        // lifecycle row is never disposable); only its other rows go to the
+        // sidecar. Its heartbeats are placed above.
         if state.quarantined.contains(&rec.session_id) {
-            if rec.event_kind != heartbeat_kind {
+            if is_front_candidate(state, &rec) {
+                continue; // in `front_heartbeat` (newest) or superseded
+            }
+            if rec.event_kind != heartbeat_kind && !is_lifecycle_kind(&rec.event_kind) {
                 to_quarantine.push(rec);
                 continue;
             }
-            // Muted wins: a muted session's newest heartbeat is dropped too.
-            if state.heartbeats_muted.contains(&rec.session_id) {
-                muted.push((rec.session_id, rec.seq));
-                continue;
-            }
-            if newest_quarantined_heartbeat.get(&rec.session_id) != Some(&rec.seq) {
-                superseded.push((rec.session_id, rec.seq));
-                continue;
-            }
-            // The newest heartbeat falls through and becomes a one-row chain:
-            // every other row of this session was routed away above.
         }
         if superseded_keys.contains(&(rec.session_id, rec.seq)) {
             superseded.push((rec.session_id, rec.seq));
@@ -1892,9 +1917,7 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
     // no row is counted twice. (`ack` marks the keys before its scan and
     // compaction, so a failure in either can still drop rows uncounted.)
     let superseded_count = superseded.len() as u64;
-    let muted_count = muted.len() as u64;
     succeeded.extend(superseded);
-    succeeded.extend(muted);
 
     // A session still inside its own backoff sits this tick out.
     chains.retain(|chain| {
@@ -1903,32 +1926,42 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
             .get(&chain[0].session_id)
             .is_none_or(|r| r.next_attempt_at <= now)
     });
-    let ran_any = !chains.is_empty();
+    // A quarantined session's keep-alive heartbeat is its OWN one-row chain,
+    // outside the lifecycle backoff above: that backoff is pinned at
+    // MAX_BACKOFF, and coord's stale threshold is shorter, so gating the
+    // heartbeat behind it would let the live session's coord row lapse.
+    let ran_any = !chains.is_empty() || !front_heartbeat.is_empty();
+    let chains: Vec<(bool, Vec<OutboxRecord>)> = chains
+        .into_iter()
+        .map(|c| (false, c))
+        .chain(front_heartbeat.into_values().map(|hb| (true, vec![hb])))
+        .collect();
 
     let abort = Arc::new(AtomicBool::new(false));
-    let outcomes: Vec<ChainOutcome> = futures::stream::iter(chains.into_iter().map(|chain| {
-        let sid = chain[0].session_id;
-        let session_attempts: HashMap<(Uuid, i64), u32> = state
-            .best_effort_attempts
-            .iter()
-            .filter(|((s, _), _)| *s == sid)
-            .map(|(k, v)| (*k, *v))
-            .collect();
-        let trip_abort = !state
-            .retry
-            .get(&sid)
-            .is_some_and(|r| state.ack_ticks > r.failed_at_ack_tick);
-        push_chain(
-            inner.clone(),
-            chain,
-            session_attempts,
-            abort.clone(),
-            trip_abort,
-        )
-    }))
-    .buffer_unordered(MAX_CONCURRENT_PUSH_CHAINS)
-    .collect()
-    .await;
+    let outcomes: Vec<ChainOutcome> =
+        futures::stream::iter(chains.into_iter().map(|(keepalive, chain)| {
+            let sid = chain[0].session_id;
+            let session_attempts: HashMap<(Uuid, i64), u32> = state
+                .best_effort_attempts
+                .iter()
+                .filter(|((s, _), _)| *s == sid)
+                .map(|(k, v)| (*k, *v))
+                .collect();
+            let trip_abort = !state
+                .retry
+                .get(&sid)
+                .is_some_and(|r| state.ack_ticks > r.failed_at_ack_tick);
+            let inner = inner.clone();
+            let abort = abort.clone();
+            async move {
+                let mut out = push_chain(inner, chain, session_attempts, abort, trip_abort).await;
+                out.keepalive = keepalive;
+                out
+            }
+        }))
+        .buffer_unordered(MAX_CONCURRENT_PUSH_CHAINS)
+        .collect()
+        .await;
 
     let mut had_transport_error = false;
     let mut delivered = false;
@@ -1946,6 +1979,11 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
         // (or spent its budget) forgets its retry count, as before.
         for key in outcome.cleared {
             state.best_effort_attempts.remove(&key);
+        }
+        if outcome.keepalive {
+            // The keep-alive chain says nothing about the session's lifecycle
+            // rows: their backoff and quarantine bookkeeping stay as they are.
+            continue;
         }
         match outcome.blocked_on {
             Some(err) => blocked.push((outcome.session_id, err)),
@@ -1987,6 +2025,13 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
             entry.serving_failures += 1;
         }
         entry.next_attempt_at = now + SessionRetry::backoff(entry.failures);
+        if state.quarantined.contains(&sid) {
+            // Already quarantined: this is one of its lifecycle rows (the only
+            // rows left in its chain). It retries once a minute, forever, and
+            // never re-quarantines.
+            entry.next_attempt_at = now + MAX_BACKOFF;
+            continue;
+        }
         if entry.serving_failures >= QUARANTINE_AFTER_SERVING_FAILURES {
             tracing::warn!(
                 session = %sid,
@@ -2003,7 +2048,6 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
     }
 
     let mut heartbeats_superseded = 0;
-    let mut heartbeats_muted = 0;
     let mut heartbeats_dropped_on_failure = 0;
     let mut heartbeats_dropped_on_failure_by_kind: BTreeMap<&'static str, u64> = BTreeMap::new();
     if !succeeded.is_empty() {
@@ -2021,16 +2065,6 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
                         rows = superseded_count,
                         total,
                         "coord_sync: dropped heartbeat rows unsent (superseded by a newer one)"
-                    );
-                }
-                heartbeats_muted = muted_count;
-                if muted_count > 0 {
-                    let total =
-                        HEARTBEATS_MUTED.fetch_add(muted_count, Ordering::Relaxed) + muted_count;
-                    tracing::debug!(
-                        rows = muted_count,
-                        total,
-                        "coord_sync: dropped heartbeat rows unsent (their quarantined session is muted)"
                     );
                 }
                 heartbeats_dropped_on_failure = heartbeat_failure_drops.len() as u64;
@@ -2089,7 +2123,6 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
         idle: false,
         ran_any,
         heartbeats_superseded,
-        heartbeats_muted,
         heartbeats_dropped_on_failure,
         heartbeats_dropped_on_failure_by_kind,
     }
@@ -7003,7 +7036,6 @@ mod tests {
             BTreeMap::from([("server_error", 3)])
         );
         assert_eq!(tick.heartbeats_superseded, 0);
-        assert_eq!(tick.heartbeats_muted, 0);
         // The tick's counts reached the process totals `/health` serves.
         assert_static_floor(
             &HEARTBEATS_DROPPED_ON_FAILURE,
@@ -7123,7 +7155,6 @@ mod tests {
             BTreeMap::from([("network", 1)])
         );
         assert_eq!(tick.heartbeats_superseded, 0);
-        assert_eq!(tick.heartbeats_muted, 0);
     }
 
     /// A heartbeat answered 403 is ACK-dropped by the `PermanentFailure` arm
@@ -7267,10 +7298,6 @@ mod tests {
         assert_eq!(
             tick.heartbeats_superseded, 5,
             "the five superseded rows are counted once their ACK landed"
-        );
-        assert_eq!(
-            tick.heartbeats_muted, 0,
-            "an unquarantined session is never muted"
         );
         assert_eq!(
             tick.heartbeats_dropped_on_failure, 0,
@@ -7515,10 +7542,43 @@ mod tests {
         );
     }
 
+    /// Quarantine a session on its `state_change` row (every state PATCH 502s
+    /// while coord serves another session). Returns the drain state.
+    async fn quarantined_on_state_change(
+        coord: &CoordSync,
+        outbox: &OutboxWriter,
+        rec: &Arc<TokMutex<CoordRecorder>>,
+        machine: Uuid,
+        failing: Uuid,
+    ) -> DrainState {
+        rec.lock().await.poison_state_patch_ids.push(failing);
+        let state = drive_502s_while_coord_serves_others(
+            coord,
+            outbox,
+            machine,
+            failing,
+            SessionEventKind::StateChange,
+            json!({ "state": "active" }),
+        )
+        .await;
+        assert!(
+            state.quarantined.contains(&failing),
+            "precondition: quarantined"
+        );
+        state
+    }
+
+    fn make_due(state: &mut DrainState, session: Uuid) {
+        if let Some(r) = state.retry.get_mut(&session) {
+            r.next_attempt_at = Instant::now();
+        }
+    }
+
     /// A session quarantined by its `state_change` row still delivers its
-    /// heartbeats: its newest pending heartbeat goes out as a one-row chain,
-    /// the older ones are superseded, and only the lifecycle row goes to the
-    /// sidecar — so the live session's coord row cannot lapse beyond revive.
+    /// heartbeats: the newest pending one goes out at the FRONT of the
+    /// session's chain (ahead of the stuck row — a heartbeat PATCH carries no
+    /// state), the older ones are superseded, and the lifecycle rows stay in
+    /// the outbox rather than going to the sidecar.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_quarantined_session_still_delivers_its_newest_heartbeat() {
         let _amb = crate::test_env::isolated_ambient();
@@ -7533,21 +7593,14 @@ mod tests {
         );
         let machine = Uuid::new_v4();
         let failing = Uuid::new_v4();
-        // Only state-carrying PATCHes 502, so heartbeats would go through.
-        rec.lock().await.poison_state_patch_ids.push(failing);
-
-        let mut state = drive_502s_while_coord_serves_others(
-            &coord,
-            &outbox,
-            machine,
-            failing,
-            SessionEventKind::StateChange,
-            json!({ "state": "active" }),
-        )
-        .await;
+        let mut state = quarantined_on_state_change(&coord, &outbox, &rec, machine, failing).await;
+        // One more attempt at the stuck row pins its retry at MAX_BACKOFF; the
+        // heartbeat below must go out INSIDE that window.
+        drain_tick(&coord.inner, &mut state).await;
         assert!(
-            state.quarantined.contains(&failing),
-            "precondition: quarantined"
+            state.retry.get(&failing).expect("retrying").next_attempt_at
+                > Instant::now() + MAX_BACKOFF - Duration::from_secs(5),
+            "precondition: the lifecycle retry is pinned"
         );
         let patches_before = rec
             .lock()
@@ -7590,23 +7643,23 @@ mod tests {
             "exactly the newest heartbeat reached coord"
         );
         drop(g);
+        let pending = pending_of(&outbox, failing);
         assert!(
-            pending_of(&outbox, failing).is_empty(),
-            "the older heartbeats were superseded and the state_change sidecarred"
+            pending.iter().all(|(_, k)| k == "state_change"),
+            "only the stuck lifecycle rows remain: {pending:?}"
+        );
+        assert!(
+            pending.len() > 1,
+            "the lifecycle rows were held, not sidecarred"
         );
         assert_eq!(
             tick.heartbeats_superseded, 2,
             "the two older heartbeats are counted as superseded"
         );
-        assert_eq!(
-            tick.heartbeats_muted, 0,
-            "a quarantined session with no sidecarred started/closed is not muted"
-        );
         assert_eq!(tick.heartbeats_dropped_on_failure, 0);
-        let sidecar = std::fs::read_to_string(quarantine_path(&outbox)).unwrap();
         assert!(
-            sidecar.contains("pending_resolution"),
-            "the lifecycle row still went to the sidecar"
+            !quarantine_path(&outbox).exists(),
+            "no lifecycle row went to the sidecar"
         );
         assert!(
             state.quarantined.contains(&failing),
@@ -7614,13 +7667,11 @@ mod tests {
         );
     }
 
-    /// A quarantined session whose `closed` row goes to the sidecar sends no
-    /// more heartbeats: not the one queued before the close, not one the
-    /// heartbeat loop snapshotted before it and appended after, and not one in
-    /// a later tick. coord never saw the close, so any of them would revive a
-    /// reaped row of an ended session.
+    /// D3: a quarantined session's `finished` row stays in the outbox and is
+    /// retried once a minute, then delivered when coord takes it; its
+    /// non-lifecycle rows still go to the sidecar.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_sidecarred_close_mutes_its_sessions_heartbeats() {
+    async fn a_quarantined_sessions_finished_row_is_held_not_sidecarred() {
         let _amb = crate::test_env::isolated_ambient();
         let dir = tempfile::tempdir().unwrap();
         let outbox = build_outbox(dir.path());
@@ -7633,88 +7684,74 @@ mod tests {
         );
         let machine = Uuid::new_v4();
         let failing = Uuid::new_v4();
-        rec.lock().await.poison_state_patch_ids.push(failing);
+        let mut state = quarantined_on_state_change(&coord, &outbox, &rec, machine, failing).await;
 
-        let mut state = drive_502s_while_coord_serves_others(
-            &coord,
-            &outbox,
-            machine,
-            failing,
-            SessionEventKind::StateChange,
-            json!({ "state": "active" }),
-        )
-        .await;
-        assert!(
-            state.quarantined.contains(&failing),
-            "precondition: quarantined"
-        );
-        let patches_before = rec
-            .lock()
-            .await
-            .patches
-            .iter()
-            .filter(|(id, _)| *id == failing)
-            .count();
-
-        let hb = |outbox: &OutboxWriter| {
-            outbox
-                .record(machine, failing, SessionEventKind::Heartbeat, json!({}))
-                .unwrap()
-        };
-        hb(&outbox);
         outbox
-            .record(machine, failing, SessionEventKind::Closed, json!({}))
+            .record(
+                machine,
+                failing,
+                SessionEventKind::Finished,
+                json!({ "claude_session_id": "csid", "finished_at": 1 }),
+            )
             .unwrap();
-        hb(&outbox);
-        let tick = drain_tick(&coord.inner, &mut state).await;
-        assert_eq!(
-            tick.heartbeats_muted, 2,
-            "both heartbeats were dropped as MUTED"
-        );
-        assert_eq!(
-            tick.heartbeats_superseded, 0,
-            "a muted drop is not counted as superseded"
-        );
-        assert_eq!(tick.heartbeats_dropped_on_failure, 0);
-        assert!(pending_of(&outbox, failing).is_empty());
-        assert_static_floor(&HEARTBEATS_MUTED, 2, "heartbeatsMuted");
+        outbox
+            .record(machine, failing, SessionEventKind::Progress, json!({}))
+            .unwrap();
+        make_due(&mut state, failing);
+        drain_tick(&coord.inner, &mut state).await;
+
+        let pending = pending_of(&outbox, failing);
         assert!(
-            session_outbox_health_json()["heartbeatsMuted"]
-                .as_u64()
-                .is_some_and(|n| n >= 2),
-            "the /health cell carries the muted total"
+            pending.iter().any(|(_, k)| k == "finished"),
+            "the finished row is still in the outbox: {pending:?}"
         );
-
-        // A heartbeat appended in a LATER tick is dropped too.
-        hb(&outbox);
-        let tick = drain_tick(&coord.inner, &mut state).await;
-        assert_eq!(tick.heartbeats_muted, 1);
-        assert_eq!(tick.heartbeats_superseded, 0);
-        assert!(pending_of(&outbox, failing).is_empty());
-
-        let sent = rec
-            .lock()
-            .await
-            .patches
-            .iter()
-            .filter(|(id, _)| *id == failing)
-            .count();
-        assert_eq!(
-            sent, patches_before,
-            "no heartbeat reached coord after the close"
+        assert!(
+            pending.iter().all(|(_, k)| k != "progress"),
+            "the non-lifecycle row left the outbox for the sidecar: {pending:?}"
         );
         let sidecar = std::fs::read_to_string(quarantine_path(&outbox)).unwrap();
         assert!(
-            sidecar.contains("\"closed\""),
-            "the close went to the sidecar"
+            sidecar.contains("progress"),
+            "the progress row is sidecarred"
+        );
+        assert!(
+            !sidecar.contains("finished") && !sidecar.contains("state_change"),
+            "no lifecycle row is in the sidecar: {sidecar}"
+        );
+        let wait = state
+            .retry
+            .get(&failing)
+            .expect("still retrying")
+            .next_attempt_at;
+        assert!(
+            wait > Instant::now() + MAX_BACKOFF - Duration::from_secs(5),
+            "a quarantined session's lifecycle retry is pinned at MAX_BACKOFF"
+        );
+
+        // Coord takes the row again: the whole held chain, `finished` included.
+        rec.lock().await.poison_state_patch_ids.clear();
+        make_due(&mut state, failing);
+        drain_tick(&coord.inner, &mut state).await;
+        assert!(
+            pending_of(&outbox, failing).is_empty(),
+            "the held rows were delivered once coord took them"
+        );
+        assert!(
+            rec.lock()
+                .await
+                .patches
+                .iter()
+                .any(|(id, b)| *id == failing && b.to_string().contains("finished")),
+            "the finish reached coord"
         );
     }
 
-    /// A session quarantined on its own `started` row has no coord row, so
-    /// its heartbeats are dropped rather than PATCHed into a 404 every
-    /// interval.
+    /// A quarantined session whose `started` row coord keeps refusing has no
+    /// coord row. Its heartbeats stay in seq order BEHIND the `started` — never
+    /// PATCHed into a 404, and not dropped: both go out, in order, once coord
+    /// takes the `started`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_sidecarred_start_mutes_its_sessions_heartbeats() {
+    async fn a_quarantined_start_keeps_its_heartbeats_behind_it() {
         let _amb = crate::test_env::isolated_ambient();
         let dir = tempfile::tempdir().unwrap();
         let outbox = build_outbox(dir.path());
@@ -7738,9 +7775,7 @@ mod tests {
             outbox
                 .record(machine, other, SessionEventKind::Heartbeat, json!({}))
                 .unwrap();
-            if let Some(r) = state.retry.get_mut(&stuck) {
-                r.next_attempt_at = Instant::now();
-            }
+            make_due(&mut state, stuck);
             drain_tick(&coord.inner, &mut state).await;
         }
         assert!(
@@ -7751,20 +7786,107 @@ mod tests {
         outbox
             .record(machine, stuck, SessionEventKind::Heartbeat, json!({}))
             .unwrap();
-        let tick = drain_tick(&coord.inner, &mut state).await;
-        assert_eq!(
-            tick.heartbeats_muted, 1,
-            "the heartbeat was dropped as MUTED"
-        );
-        assert_eq!(
-            tick.heartbeats_superseded, 0,
-            "a muted drop is not counted as superseded"
-        );
-        assert!(pending_of(&outbox, stuck).is_empty());
+        make_due(&mut state, stuck);
+        drain_tick(&coord.inner, &mut state).await;
         assert!(
             rec.lock().await.patches.iter().all(|(id, _)| *id != stuck),
             "no heartbeat PATCH for a session coord never created"
         );
+        let pending = pending_of(&outbox, stuck);
+        assert_eq!(
+            pending.iter().map(|(_, k)| k.as_str()).collect::<Vec<_>>(),
+            vec!["started", "heartbeat"],
+            "the started row and its heartbeat are both held, in order"
+        );
+        assert!(
+            !quarantine_path(&outbox).exists(),
+            "the started row is not sidecarred"
+        );
+
+        rec.lock().await.poison_post_ids.clear();
+        make_due(&mut state, stuck);
+        drain_tick(&coord.inner, &mut state).await;
+        assert!(pending_of(&outbox, stuck).is_empty());
+        assert!(
+            rec.lock().await.patches.iter().any(|(id, _)| *id == stuck),
+            "the heartbeat followed the started row"
+        );
+    }
+
+    /// At the cap the sidecar rotates to `.1` and the new row is written, not
+    /// dropped; a second rotation replaces the `.1` generation.
+    #[test]
+    fn the_quarantine_sidecar_rotates_at_its_cap_instead_of_dropping() {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let machine = Uuid::new_v4();
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            "http://127.0.0.1:1".to_string(),
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let mut state = DrainState::default();
+        let sidecar = quarantine_path(&outbox);
+        let rotated = quarantine_rotated_path(&sidecar);
+        assert!(rotated.to_string_lossy().ends_with(".quarantine.1.jsonl"));
+        let before = QUARANTINE_ROTATIONS.load(Ordering::Relaxed);
+
+        let row = || {
+            let s = Uuid::new_v4();
+            let r = outbox
+                .record(machine, s, SessionEventKind::Progress, json!({}))
+                .unwrap();
+            (s, r)
+        };
+        // Fill the sidecar to its cap, then quarantine a row.
+        std::fs::File::create(&sidecar)
+            .unwrap()
+            .set_len(QUARANTINE_MAX_BYTES)
+            .unwrap();
+        let (s1, r1) = row();
+        let done = quarantine_rows(&coord.inner, &mut state, vec![r1]);
+        assert_eq!(done.len(), 1, "the row was written, so it may be ACKed");
+        assert_eq!(
+            std::fs::metadata(&rotated).unwrap().len(),
+            QUARANTINE_MAX_BYTES,
+            "the full sidecar became the .1 generation"
+        );
+        assert!(std::fs::read_to_string(&sidecar)
+            .unwrap()
+            .contains(&s1.to_string()));
+
+        // A second rotation replaces `.1`, and leaves only one generation.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&sidecar)
+            .unwrap()
+            .set_len(QUARANTINE_MAX_BYTES)
+            .unwrap();
+        let (s2, r2) = row();
+        quarantine_rows(&coord.inner, &mut state, vec![r2]);
+        assert!(
+            std::fs::read(&rotated)
+                .unwrap()
+                .windows(36)
+                .any(|w| w == s1.to_string().as_bytes()),
+            ".1 now holds the first generation's row"
+        );
+        assert!(std::fs::read_to_string(&sidecar)
+            .unwrap()
+            .contains(&s2.to_string()));
+        let generations = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".quarantine")
+            })
+            .count();
+        assert_eq!(generations, 2, "the live sidecar and one .1 generation");
+        assert!(QUARANTINE_ROTATIONS.load(Ordering::Relaxed) >= before + 2);
     }
 
     /// Record a `started` row for `session` straight into the outbox.
@@ -7874,16 +7996,16 @@ mod tests {
             state.quarantined.contains(&stuck),
             "the stuck session is quarantined"
         );
-        // The row moves on the tick after the quarantine decision.
+        // Phase 3 (D3): a quarantined session's `started` is a lifecycle row,
+        // so it is HELD for a once-a-minute retry — never sidecarred — and it
+        // no longer blocks anyone else's queue.
         drain_tick(&coord.inner, &mut state).await;
+        let pending = outbox.pending().unwrap();
+        assert_eq!(pending.len(), 1, "the stuck started row is held");
+        assert!(pending.iter().all(|r| r.session_id == stuck));
         assert!(
-            outbox.pending().unwrap().is_empty(),
-            "nothing left blocking the queue"
-        );
-        let sidecar = std::fs::read_to_string(quarantine_path(&outbox)).unwrap();
-        assert!(
-            sidecar.contains(&stuck.to_string()),
-            "the quarantined row landed in the sidecar, not nowhere"
+            !quarantine_path(&outbox).exists(),
+            "a lifecycle row never goes to the sidecar"
         );
     }
 
@@ -8075,12 +8197,12 @@ mod tests {
             retrying_sessions: 1,
             quarantined_sessions: 0,
             heartbeats_superseded: 2,
-            heartbeats_muted: 4,
             heartbeats_dropped_on_failure: 3,
             heartbeats_dropped_on_failure_by_kind: BTreeMap::from([
                 ("server_error", 2),
                 ("not_found", 1),
             ]),
+            quarantine_rotations: 1,
         });
         for key in [
             "pending",
@@ -8090,9 +8212,9 @@ mod tests {
             "retryingSessions",
             "quarantinedSessions",
             "heartbeatsSuperseded",
-            "heartbeatsMuted",
             "heartbeatsDroppedOnFailure",
             "heartbeatsDroppedOnFailureByKind",
+            "quarantineRotations",
             "observedAt",
         ] {
             assert!(
@@ -8102,7 +8224,7 @@ mod tests {
         }
         assert_eq!(observed["pending"], 3);
         assert_eq!(observed["heartbeatsSuperseded"], 2);
-        assert_eq!(observed["heartbeatsMuted"], 4);
+        assert_eq!(observed["quarantineRotations"], 1);
         assert_eq!(observed["heartbeatsDroppedOnFailure"], 3);
         assert_eq!(
             observed["heartbeatsDroppedOnFailureByKind"],
