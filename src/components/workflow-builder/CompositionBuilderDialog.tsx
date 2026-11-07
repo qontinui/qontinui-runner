@@ -6,7 +6,7 @@
 
 import React from "react";
 import { CompositionSkillBuilder } from "@qontinui/workflow-ui/components";
-import { registerUserSkills } from "@qontinui/workflow-utils";
+import { registerRunnableUserSkills } from "./runnableUserSkills";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 interface CompositionBuilderDialogProps {
@@ -58,7 +58,7 @@ export function CompositionBuilderDialog({
               const nonBuiltin = allSkills.filter(
                 (s: { source: string }) => s.source !== "builtin",
               );
-              registerUserSkills(nonBuiltin);
+              registerRunnableUserSkills(nonBuiltin);
             } catch (error) {
               console.error("Failed to create composition skill:", error);
             }

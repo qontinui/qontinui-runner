@@ -412,12 +412,18 @@ pub struct SkillExport {
 /// A stored skill an outbound door (export, sync push) left out, with why.
 ///
 /// Serializes as `{"skill_id": "...", "code": "STORED_SKILL_TEMPLATE_UNPARSEABLE",
-/// "error": "<the parse error>"}`.
+/// "error": "<the parse error>", "stored_template": "<the stored column>"}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WithheldSkill {
     pub skill_id: String,
     pub code: String,
     pub error: String,
+    /// The stored `template` column, verbatim. No other door returns it: a
+    /// read serves the empty `single_step` fallback and a rewrite is refused,
+    /// so an export is how the stored text (a retired `playbook` body, say) is
+    /// recovered before the skill is deleted.
+    #[serde(default)]
+    pub stored_template: String,
 }
 
 /// The code on a [`WithheldSkill`], and on the refusal of a rewrite, of a
@@ -425,12 +431,14 @@ pub struct WithheldSkill {
 pub const STORED_SKILL_TEMPLATE_UNPARSEABLE: &str = "STORED_SKILL_TEMPLATE_UNPARSEABLE";
 
 impl WithheldSkill {
-    /// A stored skill withheld because its stored template does not parse.
-    pub fn unparseable(skill_id: &str, error: impl ToString) -> Self {
+    /// A stored skill withheld because its stored template does not parse,
+    /// carrying that stored template as it is.
+    pub fn unparseable(skill_id: &str, stored_template: &str, error: impl ToString) -> Self {
         Self {
             skill_id: skill_id.to_string(),
             code: STORED_SKILL_TEMPLATE_UNPARSEABLE.to_string(),
             error: error.to_string(),
+            stored_template: stored_template.to_string(),
         }
     }
 }
@@ -480,6 +488,25 @@ pub fn compute_export_checksum(skills: &[SkillDefinition]) -> String {
         hasher.update(compute_skill_checksum(skill).as_bytes());
     }
     format!("{:x}", hasher.finalize())
+}
+
+/// The semver a version bump writes: `major` and `minor` reset the lower
+/// parts, anything else bumps the patch. A version that does not parse is
+/// read as `1.0.0`.
+pub fn bump_semver(version: &str, bump_type: &str) -> String {
+    let parts: Vec<u32> = version.split('.').filter_map(|p| p.parse().ok()).collect();
+    let (major, minor, patch) = match parts.as_slice() {
+        [ma, mi, pa, ..] => (*ma, *mi, *pa),
+        [ma, mi] => (*ma, *mi, 0),
+        [ma] => (*ma, 0, 0),
+        _ => (1, 0, 0),
+    };
+
+    match bump_type {
+        "major" => format!("{}.0.0", major + 1),
+        "minor" => format!("{}.{}.0", major, minor + 1),
+        _ => format!("{}.{}.{}", major, minor, patch + 1),
+    }
 }
 
 // =============================================================================
@@ -870,7 +897,8 @@ pub fn instantiate_skill(
         return Err(format!(
             "Skill \"{}\" ({}) has a template step with no `type` (step {} of {}), so there is \
              nothing to instantiate. A stored template that does not parse is served as an \
-             empty single_step; delete the skill and create it again.",
+             empty single_step: export the skill to recover the stored template (the export \
+             lists it under `withheld`), then delete it.",
             skill.name,
             skill.id,
             i + 1,

@@ -500,6 +500,36 @@ fn import_request_from_body(
     Ok((request, refused))
 }
 
+/// The warnings an import's manifest checksum gives. The checksum covers every
+/// skill the export carried, so once `refused` skills were dropped before
+/// import the rest cannot match it: that is reported as not verified, never as
+/// a mismatch that blames the file for the runner's own refusal.
+fn export_checksum_warnings(request: &ImportSkillsRequest, refused: usize) -> Vec<String> {
+    let Some(manifest_checksum) = request.manifest.as_ref().and_then(|m| m.checksum.as_ref())
+    else {
+        return Vec::new();
+    };
+    if refused > 0 {
+        return vec![format!(
+            "Export checksum not verified: {refused} skill(s) were refused before import, and the \
+             checksum covers them too"
+        )];
+    }
+    let computed = crate::skills::compute_export_checksum(&request.skills);
+    if &computed == manifest_checksum {
+        return Vec::new();
+    }
+    tracing::warn!(
+        "Export checksum mismatch: manifest has {}, computed {}",
+        manifest_checksum,
+        computed
+    );
+    vec![format!(
+        "Export checksum mismatch: data may have been modified since export (expected {}, got {})",
+        manifest_checksum, computed
+    )]
+}
+
 /// Import skills from a shared export
 pub async fn import_skills(
     State(state): State<Arc<ApiState>>,
@@ -514,25 +544,7 @@ pub async fn import_skills(
             "skills import: refused a skill: {refusal}"
         );
     }
-    let mut checksum_warnings: Vec<String> = Vec::new();
-
-    // Verify export checksum if manifest is present
-    if let Some(ref manifest) = request.manifest {
-        if let Some(ref manifest_checksum) = manifest.checksum {
-            let computed = crate::skills::compute_export_checksum(&request.skills);
-            if &computed != manifest_checksum {
-                tracing::warn!(
-                    "Export checksum mismatch: manifest has {}, computed {}",
-                    manifest_checksum,
-                    computed
-                );
-                checksum_warnings.push(format!(
-                    "Export checksum mismatch: data may have been modified since export (expected {}, got {})",
-                    manifest_checksum, computed
-                ));
-            }
-        }
-    }
+    let checksum_warnings = export_checksum_warnings(&request, refused.len());
 
     match state
         .app_state
@@ -869,22 +881,6 @@ pub async fn sync_pull(
 // Version Bumping
 // ============================================================================
 
-fn bump_semver(version: &str, bump_type: &str) -> String {
-    let parts: Vec<u32> = version.split('.').filter_map(|p| p.parse().ok()).collect();
-    let (major, minor, patch) = match parts.as_slice() {
-        [ma, mi, pa, ..] => (*ma, *mi, *pa),
-        [ma, mi] => (*ma, *mi, 0),
-        [ma] => (*ma, 0, 0),
-        _ => (1, 0, 0),
-    };
-
-    match bump_type {
-        "major" => format!("{}.0.0", major + 1),
-        "minor" => format!("{}.{}.0", major, minor + 1),
-        _ => format!("{}.{}.{}", major, minor, patch + 1),
-    }
-}
-
 /// POST /skills/{id}/bump-version — Bump the skill version and recompute checksum
 pub async fn bump_version(
     State(state): State<Arc<ApiState>>,
@@ -909,45 +905,22 @@ pub async fn bump_version(
         ));
     }
 
-    // Get the current skill. Read through the rewrite gate: the checksum is
-    // computed over the template, and over the served fallback it would be
-    // the checksum of a skill that is not the stored one.
-    let skill = match state.app_state.pg_db.get_user_skill_for_rewrite(&id).await {
-        Ok(Some(s)) => s,
-        Ok(None) => {
-            return Err((
-                StatusCode::NOT_FOUND,
-                Json(api_error(format!("Skill not found: {}", id))),
-            ))
-        }
-        Err(e) => return Err(skill_rewrite_failure("bump the version of", e)),
-    };
-
-    let current_version = skill.version.as_deref().unwrap_or("1.0.0");
-    let new_version = bump_semver(current_version, &req.bump_type);
-
-    // Recompute checksum with the new version
-    let mut updated = skill.clone();
-    updated.version = Some(new_version.clone());
-    let checksum = crate::skills::compute_skill_checksum(&updated);
-
-    // Update in DB
+    // The read, the recomputed checksum and the write are one PgDb call, which
+    // reads through the rewrite gate (a stored template that does not parse is
+    // a typed 409, not a checksum over the served fallback).
     match state
         .app_state
         .pg_db
-        .update_skill_version(&id, &new_version, &checksum)
+        .bump_user_skill_version(&id, &req.bump_type)
         .await
     {
-        Ok(_) => Ok(Json(ApiResponse::success(serde_json::json!({
+        Ok(bump) => Ok(Json(ApiResponse::success(serde_json::json!({
             "id": id,
-            "previous_version": current_version,
-            "version": new_version,
-            "checksum": checksum,
+            "previous_version": bump.previous_version,
+            "version": bump.version,
+            "checksum": bump.checksum,
         })))),
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("Failed to update skill version: {}", e))),
-        )),
+        Err(e) => Err(skill_rewrite_failure("bump the version of", e)),
     }
 }
 
@@ -1162,6 +1135,62 @@ mod tests {
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         let json = serde_json::to_value(&json.0).unwrap();
         assert_eq!(json["code"], "INVALID_REQUEST");
+    }
+
+    /// The manifest checksum covers every skill the export carried. Once one
+    /// was refused, the import says the checksum was not verified rather than
+    /// reporting a mismatch; with nothing refused it still compares, both ways.
+    #[test]
+    fn an_import_does_not_blame_the_file_for_its_own_refusal() {
+        let manifest = |checksum: &str| {
+            serde_json::json!({
+                "version": "1.0.0",
+                "exported_at": "2026-11-07T00:00:00Z",
+                "app_version": "0.0.0",
+                "content_type": "skills",
+                "skill_count": 2,
+                "checksum": checksum
+            })
+        };
+
+        let (request, refused) = super::import_request_from_body(serde_json::json!({
+            "skills": [skill_item("lint", single_step()), skill_item("sf-login", playbook())],
+            "manifest": manifest("covers-both-skills")
+        }))
+        .expect("the live skill imports");
+        assert_eq!(refused.len(), 1);
+        let warnings = super::export_checksum_warnings(&request, refused.len());
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].starts_with("Export checksum not verified: 1 skill(s) were refused"),
+            "{warnings:?}"
+        );
+        assert!(!warnings[0].contains("mismatch"), "{warnings:?}");
+
+        // Nothing refused: the comparison runs, and a wrong checksum is still a mismatch.
+        let only_lint = |checksum: &str| {
+            super::import_request_from_body(serde_json::json!({
+                "skills": [skill_item("lint", single_step())],
+                "manifest": manifest(checksum)
+            }))
+            .expect("imports")
+            .0
+        };
+        let warnings = super::export_checksum_warnings(&only_lint("not-the-checksum"), 0);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].starts_with("Export checksum mismatch"),
+            "{warnings:?}"
+        );
+        let matching = crate::skills::compute_export_checksum(&only_lint("x").skills);
+        assert!(super::export_checksum_warnings(&only_lint(&matching), 0).is_empty());
+
+        // No manifest: nothing to verify.
+        let (request, _) = super::import_request_from_body(serde_json::json!({
+            "skills": [skill_item("lint", single_step())]
+        }))
+        .expect("imports");
+        assert!(super::export_checksum_warnings(&request, 0).is_empty());
     }
 
     /// Sync pull refuses a `playbook` item with its typed reason, imports the

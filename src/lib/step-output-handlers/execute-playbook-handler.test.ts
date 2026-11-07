@@ -9,6 +9,8 @@
 
 import { describe, it, expect } from "vitest";
 import { executePlaybookHandler } from "./execute-playbook-handler";
+// From the index, which registers the built-in handlers on load.
+import { summarizeOutputsForAI } from "./index";
 
 const BODY = "## Login\n### Step 1: open the page\n### Step 2: sign in";
 const UNREAD_PATH = "/home/user/.qontinui/playbooks/never-read.md";
@@ -66,6 +68,19 @@ describe("ExecutePlaybookHandler", () => {
 
       expect(summary).not.toContain("- **Playbook:**");
       expect(summary).not.toContain("**Playbook Content:**");
+      expect(summary).not.toContain(UNREAD_PATH);
+    });
+  });
+
+  describe("through the step-output registry", () => {
+    // The population's entry: the AI test-generation prompt summarizes
+    // collected step outputs through this registry function.
+    it("the registry AI summary of a stale step names the inline body, never the unread path", () => {
+      const out = executePlaybookHandler.parseOutput(RAW, STALE_CONFIG, { success: true });
+      const summary = summarizeOutputsForAI([out]);
+
+      expect(summary).toContain("- **Playbook:** inline (3 lines)");
+      expect(summary).toContain(BODY);
       expect(summary).not.toContain(UNREAD_PATH);
     });
   });
