@@ -5,8 +5,8 @@
 //! `prompt_documents` rows with `kind = "prompt_template"`), authored and
 //! versioned on the web exactly like policies. Each document's `body` is
 //! markdown with YAML frontmatter carrying the typed argument schema
-//! (reusing [`crate::skills::SkillParameter`] verbatim — the same shape the
-//! skills playbook parser consumes).
+//! (reusing [`crate::skills::SkillParameter`] verbatim — the same parameter
+//! shape a skill declares).
 //!
 //! ## The agent door, not the operator door
 //!
@@ -44,7 +44,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::{debug, warn};
 
-use crate::skills::playbook_parser::split_frontmatter;
 use crate::skills::SkillParameter;
 
 /// The coord `prompt_documents.kind` this library serves.
@@ -165,6 +164,38 @@ fn document_url(base: &str, name: &str) -> String {
 // ===========================================================================
 // Frontmatter parsing (pure — unit-tested)
 // ===========================================================================
+
+/// Split markdown content into YAML frontmatter and body.
+///
+/// Expects the content to start with `---\n`, followed by YAML, followed by
+/// `---\n`, followed by the markdown body. `None` when there is no opening
+/// `---` or no `\n---` closer after it.
+///
+/// It lived in the skills playbook parser until that loader was deleted
+/// (plan `2026-11-06-what-the-fleet-records-and-advertises-matches-what-actually-ran`
+/// Phase 7); this module was its only caller.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
+fn split_frontmatter(content: &str) -> Option<(&str, &str)> {
+    let content = content.trim_start();
+
+    if !content.starts_with("---") {
+        return None;
+    }
+
+    // Find the closing `---`
+    let after_first = &content[3..];
+    let after_first = after_first.trim_start_matches(['\r', '\n']);
+
+    let close_pos = after_first.find("\n---")?;
+    let frontmatter = &after_first[..close_pos];
+    let body = &after_first[close_pos + 4..]; // skip "\n---"
+    let body = body.trim_start_matches(['\r', '\n']);
+
+    Some((frontmatter, body))
+}
 
 /// The YAML frontmatter schema at the top of a prompt document's body.
 /// `parameters` entries are the EXISTING [`SkillParameter`] shape.
@@ -864,6 +895,20 @@ Goal: {{goal}}
         assert!(p.parameters.is_empty());
         // The delimiters must not leak into what gets typed into a session.
         assert_eq!(p.body, "Just the body.\n");
+    }
+
+    #[test]
+    fn test_split_frontmatter() {
+        // Moved here with the function from the deleted skills playbook
+        // parser. Exact slices, not `contains`: the opener's newline, the
+        // closer and the blank line after it all belong to neither half.
+        let raw =
+            "---\ntitle: Test & fix loop\ncategory: Testing\n---\n\n## Steps\nDrive the app.\n";
+        let (fm, body) = split_frontmatter(raw).expect("a delimited block splits");
+        assert_eq!(fm, "title: Test & fix loop\ncategory: Testing");
+        assert_eq!(body, "## Steps\nDrive the app.\n");
+        // No opening `---` at all: not frontmatter, whatever follows.
+        assert_eq!(split_frontmatter("title: x\n---\nbody\n"), None);
     }
 
     #[test]
