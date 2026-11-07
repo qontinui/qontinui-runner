@@ -149,7 +149,7 @@ const RESTORABLE_POLL_DEAD_MS: i64 = 600_000;
 /// when the previous process last looked, while a multi-day ghost row (one
 /// successful ticks kept NOT finding alive) stays excluded on EVERY boot
 /// kind. 10 minutes in millis (matches the close-grace windows).
-const RESTORABLE_OPEN_ANCHOR_GRACE_MS: i64 = 600_000;
+pub(crate) const RESTORABLE_OPEN_ANCHOR_GRACE_MS: i64 = 600_000;
 /// Number of consecutive claude-absent ticks a *live* shell (`Some(true)` with
 /// no Claude in its inclusive subtree) must accumulate before the poll closes
 /// it `poll-dead`. A live Claude in the subtree is KeepAlive immediately and
@@ -5051,7 +5051,7 @@ pub struct BootRestoreHold {
 /// epoch's `held_unjudged` set, so that the next boot admits it by that hold
 /// ([`awaiting_prior_boot_restore`])? Only a boot-census row
 /// (`awaiting_boot_restore`) whose restore this process has not attempted, or
-/// attempted less than [`RESTORE_PENDING_TTL_MS`] before `now_ms`. A
+/// attempted at most [`RESTORE_PENDING_TTL_MS`] before `now_ms`. A
 /// `restore_pending_at` at or after this boot means the restore ran here:
 /// while it is inside the TTL the resume may still be verifying on a loaded
 /// box, so it is still carried; past the TTL it is a resume that did not
@@ -12441,7 +12441,7 @@ mod tests {
 
     /// Same plan, Phase 4 (pre-PR review rounds 3-4): the poll carries a held
     /// census row while its restore has not been attempted in this process,
-    /// or was attempted less than `RESTORE_PENDING_TTL_MS` ago (a resume may
+    /// or was attempted at most `RESTORE_PENDING_TTL_MS` ago (a resume may
     /// still be verifying on a loaded box). Past the TTL (e.g. a failed resume
     /// whose tab the operator closed) it is not re-offered on every restart.
     #[test]

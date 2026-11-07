@@ -67,6 +67,8 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
+use crate::session::session_lifecycle_store::RESTORABLE_OPEN_ANCHOR_GRACE_MS;
+
 /// The sidecar's file name (the directory is instance-scoped).
 pub const EPOCH_FILE_NAME: &str = "observation-epoch.json";
 
@@ -116,6 +118,58 @@ pub struct ObservationEpoch {
     prior: Option<EpochRecord>,
     /// This process's last successful, fully-classified tick.
     current: Mutex<Option<i64>>,
+    /// The failed-snapshot episode in progress (see [`starvation_notice`]).
+    starvation: Mutex<StarvationState>,
+}
+
+/// One snapshot-failure episode: the run of failed ticks since the last
+/// successful one.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct StarvationState {
+    /// Failed ticks in this episode.
+    ticks_skipped: u32,
+    /// Whether this episode has already logged its warning.
+    warned: bool,
+}
+
+/// What a tick asks the poll to log about snapshot starvation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StarvationNotice {
+    /// The episode first reached [`RESTORABLE_OPEN_ANCHOR_GRACE_MS`] starved.
+    Warn { starved_ms: i64, ticks_skipped: u32 },
+    /// The first successful tick after a warned episode.
+    Recovered { starved_ms: i64, ticks_skipped: u32 },
+}
+
+/// Decide what, if anything, this tick should log about snapshot starvation.
+/// `since_ms` is the last instant this process observed successfully (its
+/// boot instant when it never has). A failed tick extends the episode; the
+/// warning fires once, on the first failed tick starved for at least the
+/// restore-admission grace. The next successful tick ends the episode, and
+/// reports recovery only if the episode warned.
+pub(crate) fn starvation_notice(
+    state: &mut StarvationState,
+    snapshot_ok: bool,
+    captured_at_ms: i64,
+    since_ms: i64,
+) -> Option<StarvationNotice> {
+    let starved_ms = captured_at_ms.saturating_sub(since_ms);
+    if snapshot_ok {
+        let ended = std::mem::take(state);
+        return ended.warned.then_some(StarvationNotice::Recovered {
+            starved_ms,
+            ticks_skipped: ended.ticks_skipped,
+        });
+    }
+    state.ticks_skipped = state.ticks_skipped.saturating_add(1);
+    if state.warned || starved_ms < RESTORABLE_OPEN_ANCHOR_GRACE_MS {
+        return None;
+    }
+    state.warned = true;
+    Some(StarvationNotice::Warn {
+        starved_ms,
+        ticks_skipped: state.ticks_skipped,
+    })
 }
 
 impl ObservationEpoch {
@@ -128,6 +182,7 @@ impl ObservationEpoch {
             boot_ms,
             prior: read_epoch(path),
             current: Mutex::new(None),
+            starvation: Mutex::new(StarvationState::default()),
         };
         match &epoch.prior {
             None => info!(path = %path.display(), "{NO_EPOCH_NOTICE}"),
@@ -190,6 +245,31 @@ impl ObservationEpoch {
         captured_at_ms: i64,
         held_unjudged: &[String],
     ) -> bool {
+        let since_ms = self.current_observed().unwrap_or(self.boot_ms);
+        let notice = {
+            let mut st = self.starvation.lock().unwrap_or_else(|e| e.into_inner());
+            starvation_notice(&mut st, snapshot_ok, captured_at_ms, since_ms)
+        };
+        match notice {
+            Some(StarvationNotice::Warn {
+                starved_ms,
+                ticks_skipped,
+            }) => warn!(
+                starved_min = starved_ms / 60_000,
+                ticks_skipped,
+                since_ms,
+                "restore admission: process snapshots have failed — rows are not being touched and admission stays anchored to the last successful tick"
+            ),
+            Some(StarvationNotice::Recovered {
+                starved_ms,
+                ticks_skipped,
+            }) => info!(
+                starved_min = starved_ms / 60_000,
+                ticks_skipped,
+                "restore admission: process snapshots recovered"
+            ),
+            None => {}
+        }
         if !snapshot_ok {
             return false;
         }
@@ -258,6 +338,80 @@ mod tests {
     use tempfile::tempdir;
 
     const T: i64 = 1_700_000_000_000;
+
+    const GRACE: i64 = RESTORABLE_OPEN_ANCHOR_GRACE_MS;
+
+    fn fail(st: &mut StarvationState, at: i64, since: i64) -> Option<StarvationNotice> {
+        starvation_notice(st, false, at, since)
+    }
+
+    #[test]
+    fn no_failed_ticks_is_silent() {
+        let mut st = StarvationState::default();
+        assert_eq!(starvation_notice(&mut st, true, T, T - 45_000), None);
+        assert_eq!(st, StarvationState::default());
+    }
+
+    #[test]
+    fn warns_at_the_grace_boundary_inclusive() {
+        let mut st = StarvationState::default();
+        assert_eq!(fail(&mut st, T + GRACE - 1_000, T), None);
+        assert!(matches!(
+            fail(&mut st, T + GRACE, T),
+            Some(StarvationNotice::Warn { .. })
+        ));
+        let mut st = StarvationState::default();
+        assert!(matches!(
+            fail(&mut st, T + GRACE + 1_000, T),
+            Some(StarvationNotice::Warn { .. })
+        ));
+    }
+
+    #[test]
+    fn warns_once_per_episode() {
+        let mut st = StarvationState::default();
+        assert!(fail(&mut st, T + GRACE, T).is_some());
+        assert_eq!(fail(&mut st, T + GRACE + 45_000, T), None);
+        assert_eq!(fail(&mut st, T + GRACE + 90_000, T), None);
+    }
+
+    #[test]
+    fn recovery_is_reported_once_and_only_after_a_warning() {
+        let mut st = StarvationState::default();
+        assert_eq!(fail(&mut st, T + 45_000, T), None);
+        assert_eq!(starvation_notice(&mut st, true, T + 90_000, T), None);
+
+        assert!(fail(&mut st, T + GRACE, T).is_some());
+        assert!(matches!(
+            starvation_notice(&mut st, true, T + GRACE + 45_000, T),
+            Some(StarvationNotice::Recovered { ticks_skipped: 1, .. })
+        ));
+        assert_eq!(starvation_notice(&mut st, true, T + GRACE + 90_000, T), None);
+    }
+
+    #[test]
+    fn a_second_episode_warns_again() {
+        let mut st = StarvationState::default();
+        assert!(fail(&mut st, T + GRACE, T).is_some());
+        assert!(starvation_notice(&mut st, true, T + GRACE + 45_000, T).is_some());
+        let t2 = T + GRACE + 45_000;
+        assert_eq!(fail(&mut st, t2 + 45_000, t2), None);
+        assert!(fail(&mut st, t2 + GRACE, t2).is_some());
+    }
+
+    #[test]
+    fn never_observed_measures_from_boot() {
+        let dir = tempdir().unwrap();
+        let e = ObservationEpoch::open(&dir.path().join(EPOCH_FILE_NAME), T);
+        assert_eq!(e.current_observed(), None);
+        assert!(!e.record_tick(false, T + GRACE - 1, &[]));
+        assert!(!e.record_tick(false, T + GRACE, &[]));
+        let st = e.starvation.lock().unwrap().clone();
+        assert!(st.warned);
+        assert_eq!(st.ticks_skipped, 2);
+        assert!(e.record_tick(true, T + GRACE + 45_000, &[]));
+        assert_eq!(*e.starvation.lock().unwrap(), StarvationState::default());
+    }
 
     #[test]
     fn absent_epoch_is_none_and_says_so_once() {
