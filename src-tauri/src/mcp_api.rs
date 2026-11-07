@@ -5260,20 +5260,23 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 /// operator: "agents should have all drain tools"; evidence finding
 /// `f802311d-aef5-40e8-a5f8-4bd3a554b37e`) makes handing them to every agent
 /// the intent, so that rationale no longer holds. coord's half of the decision
-/// puts all five on `DEVICE_DEFAULT_TOOLS`; it is NOT on coord `origin/main` as
-/// of this change (`DEVICE_FLOOR_PRIVILEGED_EXCLUSIONS` still fences the four
-/// writes off the device floor). coord stays the gate on who may call them; what bounds
+/// puts all five on `DEVICE_DEFAULT_TOOLS` and takes the four writes out of
+/// `DEVICE_FLOOR_PRIVILEGED_EXCLUSIONS`; it landed on coord `main` as
+/// qontinui-coord#3729 (`b0b01bc1d`), after this list's change. Landed is not
+/// served: a coord deployment predating it still fences the four writes off the
+/// device floor. coord stays the gate on who may call them; what bounds
 /// a call is coord's, unchanged from `decision_record/fleet-drain-agent-authority`:
 /// the ownership floor (the device is in the caller's tenant), the redacted
 /// `drained_by`, an unreadable drain set never reading `Clear`, and the mandatory
 /// `until`, so every drain is reversible and self-expiring. Prefer a lane-scoped
 /// drain (`lanes: ["agent"]`) when only spawns need holding, so CI keeps running.
-/// Forwarding ahead of coord's floor change: until it lands, coord itself
-/// refuses a device principal and an agent curated by a role template, while a
-/// row-less (un-curated) agent, whose catalog is coord's whole surface, gains
-/// the levers at once. That is the outcome the decision intends, not a leak.
-/// Until then a device's `tools/list` will not advertise the four writes, so
-/// they show in `coordMcpForwardedUnadvertised`; that is expected, not drift.
+/// Against such a pre-#3729 coord, coord itself refuses a device principal and
+/// an agent curated by a role template, while a row-less (un-curated) agent,
+/// whose catalog is coord's whole surface, holds the levers regardless. That is
+/// the outcome the decision intends, not a leak. On that coord a device's
+/// `tools/list` does not advertise the four writes, so they show in
+/// `coordMcpForwardedUnadvertised`; that is a coord-deployment lag, not drift
+/// here, and it should clear once the serving coord contains `b0b01bc1d`.
 ///
 /// LOAD-BEARING, do not strip as "reads nobody uses": `coord_list_prompt_documents`
 /// and `coord_get_prompt_document` are how the fleet reads served POLICY, and the
