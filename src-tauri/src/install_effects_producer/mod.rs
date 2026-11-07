@@ -1283,6 +1283,12 @@ fn record_session_open_into(
         provider.to_string(),
         None,
     );
+    // Every OTHER open row on this pane follows it too (a session resumed into
+    // a pane pinned to another id keeps both rows open) — the same move the
+    // boot-restore rebind makes, so no row on the pane names a stale page.
+    if let Some(live_page) = live_page {
+        store.update_page_by_terminal(&req.terminal_id, live_page);
+    }
     // CONFIRM the record (session-restore-redesign Phase 2 coordinator
     // refinement). This route is hit ONLY by a provider's SessionStart hook,
     // which fires only when a REAL provider session actually started in this
@@ -4715,7 +4721,6 @@ mod tests {
         );
     }
 
-
     // -------------------------------------------------------------------
     // The hook's page follows the LIVE pane (plan
     // 2026-11-07-triage-sessions-ten-gaps-from-an-every-page-act-run, N10)
@@ -4744,7 +4749,11 @@ mod tests {
         LivePane { tm, session }
     }
 
-    fn open_record_on(terminal_id: &str, csid: &str, page: &str) -> crate::session::session_lifecycle_store::TerminalSessionRecord {
+    fn open_record_on(
+        terminal_id: &str,
+        csid: &str,
+        page: &str,
+    ) -> crate::session::session_lifecycle_store::TerminalSessionRecord {
         serde_json::from_value(serde_json::json!({
             "claudeSessionId": csid,
             "pageId": page,
@@ -4763,8 +4772,10 @@ mod tests {
     #[test]
     fn hook_open_on_a_live_pane_takes_the_panes_page_over_a_prior_records() {
         let dir = tempfile::tempdir().unwrap();
-        let store =
-            crate::session::session_lifecycle_store::SessionLifecycleStore::open(&dir.path().join("terminal-sessions.json")).unwrap();
+        let store = crate::session::session_lifecycle_store::SessionLifecycleStore::open(
+            &dir.path().join("terminal-sessions.json"),
+        )
+        .unwrap();
         let prior = "1a2b3c4d-0000-4000-8000-000000000001";
         let adopted = "1a2b3c4d-0000-4000-8000-000000000002";
         store.record_open(open_record_on("term-p", prior, "default"));
@@ -4784,14 +4795,51 @@ mod tests {
         assert_eq!(rec.zone_index, 2, "the zone is still inherited by terminal");
     }
 
+    /// A hook open on a live pane on page P moves every OTHER open row on that
+    /// terminal to P as well, as the rebind does — not only the row it writes.
+    #[test]
+    fn hook_open_on_a_live_pane_moves_every_open_row_on_the_pane() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::session::session_lifecycle_store::SessionLifecycleStore::open(
+            &dir.path().join("terminal-sessions.json"),
+        )
+        .unwrap();
+        let pinned = "1a2b3c4d-0000-4000-8000-000000000004";
+        let resumed = "1a2b3c4d-0000-4000-8000-000000000005";
+        store.record_open(open_record_on("term-r", pinned, "default"));
+        // Confirmed, as a pane's own pinned session is once its hook fired: an
+        // unconfirmed sibling would be evicted as a phantom by the open below.
+        store.confirm_session(pinned);
+        let pane = live_pane("term-r", "page-P");
+
+        let mut req = session_open_req("term-r", resumed);
+        req.source = Some("resume".to_string());
+        record_session_open_into(
+            &store,
+            &req,
+            "claude",
+            pane.tm.live_page_of("term-r").as_deref(),
+        );
+
+        assert_eq!(store.get(resumed).unwrap().page_id, "page-P");
+        let other = store.get(pinned).unwrap();
+        assert_eq!(other.state, "open", "the pinned row stays open");
+        assert_eq!(
+            other.page_id, "page-P",
+            "the other open row follows the pane"
+        );
+    }
+
     /// The same, for a hook naming a session that ALREADY has a record on
     /// `"default"` (a resume onto a pane that was moved): the pane's page wins
     /// over the record's own.
     #[test]
     fn hook_open_for_an_existing_record_takes_the_live_panes_page() {
         let dir = tempfile::tempdir().unwrap();
-        let store =
-            crate::session::session_lifecycle_store::SessionLifecycleStore::open(&dir.path().join("terminal-sessions.json")).unwrap();
+        let store = crate::session::session_lifecycle_store::SessionLifecycleStore::open(
+            &dir.path().join("terminal-sessions.json"),
+        )
+        .unwrap();
         let csid = "1a2b3c4d-0000-4000-8000-000000000003";
         store.record_open(open_record_on("term-q", csid, "default"));
         let pane = live_pane("term-q", "page-P");
