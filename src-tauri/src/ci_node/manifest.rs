@@ -162,6 +162,15 @@ const EXECUTOR_OWNED_ENV: &[(&str, &str)] = &[
         "CARGO_TARGET_DIR",
         "the executor's per-repo CI target dir (not settable)",
     ),
+    // The executor SETS this for every step to an empty per-dispatch
+    // directory (`step_env::fresh_empty_config_dir`), so a `claude` inside a
+    // step starts with no login instead of falling back to the owner's
+    // default config dir. ci-exec's row, without its `[model]` pointer: this
+    // copy of the executor has no model broker.
+    (
+        "CLAUDE_CONFIG_DIR",
+        "nothing: the executor sets it to an empty per-dispatch directory for every step",
+    ),
     // NOTE: the SERVICE connection variables (`DATABASE_URL`, the libpq `PG*`
     // family, `REDIS_URL`/`REDIS_HOST`/`REDIS_PORT`) are executor-owned too,
     // but they are not restated here — they are derived from
@@ -1679,6 +1688,25 @@ required = true
                 "{key}: got {err}"
             );
         }
+    }
+
+    /// The executor pins `CLAUDE_CONFIG_DIR` to an empty per-dispatch directory
+    /// for every step, so a manifest value could only ever be overridden. It is
+    /// refused as executor-exported, with that reason, and no longer falls
+    /// through to "not allowlisted".
+    #[test]
+    fn claude_config_dir_is_refused_as_executor_exported() {
+        let err = parse_and_validate(
+            "version = 1\n[[steps]]\nname = \"x\"\ncommand = [\"true\"]\n\
+             env = { CLAUDE_CONFIG_DIR = \"/home/owner/.claude\" }\n",
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("exported by the executor")
+                && err.contains("empty per-dispatch directory for every step"),
+            "got: {err}"
+        );
+        assert!(!err.contains("not allowlisted"), "got: {err}");
     }
 
     #[test]
