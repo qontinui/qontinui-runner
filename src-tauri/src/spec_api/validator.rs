@@ -240,20 +240,28 @@ pub(crate) fn gate_b_execution_green_with_snapshot(
     Ok(result)
 }
 
-/// Locate the first assertion with a `Fail` outcome in result-iteration
-/// order. Returns `Some((state_id, assertion_id))` or `None` if every
-/// assertion passed (the red came from policy `Indeterminate` rather than
-/// a structural failure).
+/// Locate the assertion that made gate B red, in result-iteration order:
+/// the first `Fail`, else the first `Unknown` (a red that came from an
+/// assertion that could not be evaluated still names it). Returns
+/// `Some((state_id, assertion_id))`, or `None` when every assertion passed
+/// (the red came from a policy `Indeterminate` such as an empty scope).
 fn first_failing_assertion(result: &SpecCheckResult) -> Option<(String, String)> {
-    use qontinui_types::spec_check::AssertionOutcome;
+    use qontinui_types::spec_check::SpecAssertionVerdict;
+    let mut first_unknown = None;
     for state in &result.state_results {
         for assertion in &state.assertions {
-            if matches!(assertion.outcome, AssertionOutcome::Fail { .. }) {
-                return Some((state.state_id.clone(), assertion.assertion_id.clone()));
+            match assertion.outcome {
+                SpecAssertionVerdict::Fail { .. } => {
+                    return Some((state.state_id.clone(), assertion.assertion_id.clone()));
+                }
+                SpecAssertionVerdict::Unknown { .. } if first_unknown.is_none() => {
+                    first_unknown = Some((state.state_id.clone(), assertion.assertion_id.clone()));
+                }
+                _ => {}
             }
         }
     }
-    None
+    first_unknown
 }
 
 /// Pull a fresh UI Bridge snapshot for the active app via the WS dispatch
@@ -743,6 +751,56 @@ mod tests {
                 panic!("expected Indeterminate→BExecutionRed for empty-assertion IR");
             }
             Err(other) => panic!("unexpected variant: {:?}", other),
+        }
+    }
+
+    /// Plan 2026-11-06-no-verification-instrument-reads-an-absence-as-a-pass
+    /// D4: a gate-B red that came from an assertion that could not be
+    /// evaluated still names that assertion. s0's criteria do not parse
+    /// (`Unknown`), s1's match — so the red is `Indeterminate`, with no
+    /// `Fail` anywhere. Mutation: the `Fail`-only scan returns `None`.
+    #[test]
+    fn gate_b_red_from_unknown_names_the_unknown_assertion() {
+        let mut ir = chain_ir("b-unknown", 2, true);
+        ir.states[0].assertions[0].target.criteria = json!({ "tagName": 42 });
+        let snapshot = body_snapshot();
+        match gate_b_execution_green_with_snapshot(&snapshot, &ir) {
+            Err(ValidatorError::BExecutionRed {
+                policy_eval,
+                failing_assertion,
+                ..
+            }) => {
+                assert_eq!(policy_eval.overall_status, PolicyStatus::Indeterminate);
+                assert_eq!(
+                    failing_assertion,
+                    Some(("s0".to_string(), "a-s0".to_string()))
+                );
+            }
+            other => panic!("expected BExecutionRed, got {:?}", other),
+        }
+    }
+
+    /// When both exist, the decided `Fail` is named ahead of an earlier
+    /// `Unknown`. Mutation: returning the first non-`Pass` names s0.
+    #[test]
+    fn gate_b_red_names_a_fail_ahead_of_an_earlier_unknown() {
+        let mut ir = chain_ir("b-mixed", 2, true);
+        ir.states[0].assertions[0].target.criteria = json!({ "tagName": 42 });
+        ir.states[1].assertions[0].target.criteria = json!({ "tagName": "no-such-tag" });
+        let snapshot = body_snapshot();
+        match gate_b_execution_green_with_snapshot(&snapshot, &ir) {
+            Err(ValidatorError::BExecutionRed {
+                policy_eval,
+                failing_assertion,
+                ..
+            }) => {
+                assert_eq!(policy_eval.overall_status, PolicyStatus::Fail);
+                assert_eq!(
+                    failing_assertion,
+                    Some(("s1".to_string(), "a-s1".to_string()))
+                );
+            }
+            other => panic!("expected BExecutionRed, got {:?}", other),
         }
     }
 

@@ -33,11 +33,13 @@ pub use snapshot::IndexedSnapshot;
 pub use qontinui_types::ir::{
     IrAssertion, IrAssertionTarget, IrElementCriteria, IrPageSpec, IrState,
 };
+/// The shared code an `SpecAssertionVerdict::Unknown` carries.
+pub use qontinui_types::outcome::UnknownCode;
 pub use qontinui_types::spec_check::{
-    AssertionMiss, AssertionOutcome, AssertionResult, AssertionScope, AssertionSeverityCounts,
-    BridgeFingerprint, CandidateMiss, ClassificationStatus, Confidence, ConjunctEvaluation,
-    ConjunctRule, FieldDiff, MatchOutcome, MatchedElement, MissReason, PolicyConjunct,
-    PolicyEvaluation, PolicyStatus, RecommendedState, SpecCheckPolicy, SpecCheckResult,
-    SpecCheckStepConfig, SpecCheckSummary, SpecValidation, StateMatchResult, ThresholdConfig,
+    AssertionMiss, AssertionResult, AssertionScope, AssertionSeverityCounts, BridgeFingerprint,
+    CandidateMiss, ClassificationStatus, Confidence, ConjunctEvaluation, ConjunctRule, FieldDiff,
+    MatchOutcome, MatchedElement, MissReason, PolicyConjunct, PolicyEvaluation, PolicyStatus,
+    RecommendedState, SpecAssertionVerdict, SpecCheckPolicy, SpecCheckResult, SpecCheckStepConfig,
+    SpecCheckSummary, SpecValidation, StateMatchResult, ThresholdConfig,
 };
 pub use qontinui_types::ui_bridge::{UIBridgeElement, UIBridgeSnapshot};

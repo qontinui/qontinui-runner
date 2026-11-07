@@ -5,7 +5,9 @@
 //! and three matching assertions — so the test stays a fast canary rather
 //! than a coverage instrument.
 
-use qontinui_spec_check::{evaluate, AssertionOutcome, IrPageSpec, MatchOutcome, UIBridgeSnapshot};
+use qontinui_spec_check::{
+    evaluate, IrPageSpec, MatchOutcome, SpecAssertionVerdict, UIBridgeSnapshot,
+};
 
 #[test]
 fn smoke_evaluate_returns_full_match_on_matching_fixture() {
@@ -32,7 +34,7 @@ fn smoke_evaluate_returns_full_match_on_matching_fixture() {
     assert_eq!(state.assertions.len(), 3);
     for ar in &state.assertions {
         assert!(
-            matches!(ar.outcome, AssertionOutcome::Pass { .. }),
+            matches!(ar.outcome, SpecAssertionVerdict::Pass { .. }),
             "assertion {} expected to pass, got {:?}",
             ar.assertion_id,
             ar.outcome
