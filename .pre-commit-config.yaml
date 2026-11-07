@@ -210,6 +210,20 @@ repos:
         files: '^\.pre-commit-hooks/(lib/scratch-cleanup\.sh|scratch-cleanup-test\.sh|gen-events-drift\.sh)$'
         pass_filenames: false
 
+      # `lib/cargo-remedy.sh` names the remedy when cargo-prepush finds cargo
+      # cannot run at all. On a box where Rust is installed but ~/.cargo/bin is
+      # missing from a non-login agent shell's PATH, the old "install Rust via
+      # rustup" sent three sessions after the wrong fix (memories 6edb2fb5 and
+      # 1d9aa03e).
+      - id: cargo-remedy-test
+        name: cargo-could-not-run remedy — tests
+        entry: bash .pre-commit-hooks/cargo-remedy-test.sh
+        language: system
+        stages: [pre-commit]
+        verbose: true
+        files: '^\.pre-commit-hooks/(lib/cargo-remedy\.sh|cargo-remedy-test\.sh|cargo-prepush\.sh)$'
+        pass_filenames: false
+
       # `lib/shared-target.sh` is what makes BOTH pre-push hooks build into the
       # shared cargo target instead of a cold per-worktree one. It also covers
       # `generate_types.sh`'s QONTINUI_SCHEMAS_JSON override, which is what keeps
