@@ -1939,9 +1939,9 @@ fn classify_direct_eval_value(result: serde_json::Value) -> (serde_json::Value, 
 }
 
 /// Map a frontend "Expression rejected: contains prohibited pattern (...)"
-/// error to a human-readable workaround `hint` string. The hint is emitted
+/// error to a human-readable recovery `hint` string. The hint is emitted
 /// as a sibling of the error message in the HTTP response so callers can
-/// recover from `fetch(`-style guards without parsing the regex source.
+/// recover from a guard rejection without parsing the regex source.
 ///
 /// Returns `None` when the message isn't a static-guard rejection — leaves
 /// the response un-hinted in that case.
@@ -1949,23 +1949,47 @@ fn static_guard_hint(error_msg: &str) -> Option<String> {
     if !error_msg.contains("Expression rejected: contains prohibited pattern") {
         return None;
     }
-    // The fetch() rejection is the most-frequently-tripped guard for AI
-    // agents (they reach for it as the simplest "make a request"
-    // primitive). Give it a targeted hint that points at the
-    // `window['fet'+'ch']` workaround AND the preferred alternatives so
-    // agents don't keep rediscovering them by trial and error.
-    if error_msg.contains("\\bfetch") {
+    // The `.source` of every pattern in the frontend gate's
+    // `PAGE_EVALUATE_NETWORK_PATTERNS` (`src/hooks/ui-bridge-events/utils.ts`):
+    // the patterns `allowNetworkRequests: true` lifts. The gate puts the
+    // matched source between parentheses in its message. The tests read both
+    // of the gate's pattern lists, so a pattern added there without a route
+    // here goes red.
+    const NETWORK_PATTERN_SOURCES: [&str; 4] = [
+        "\\bfetch\\s*\\(",
+        "\\bXMLHttpRequest\\b",
+        "\\bnavigator\\.sendBeacon\\b",
+        "\\bWebSocket\\b",
+    ];
+    // A network rejection is the most-frequently-tripped guard for AI agents
+    // (they reach for fetch() as the simplest "make a request" primitive), so
+    // every network pattern gets one targeted hint. The hint names only the
+    // sanctioned routes — the `allowNetworkRequests: true` opt-in, the
+    // network-stub routes and the UI itself — and never a way around the
+    // guard. The guard is a static pattern match, so any spelling it does not
+    // match gets past it: a hint that names one turns the refusal into the
+    // instructions for defeating it. And a request an agent issues through
+    // page/evaluate is not the user's path, so a pass earned that way is
+    // never user evidence (plan
+    // 2026-11-06-a-ui-action-counts-as-user-evidence-only-when-a-user-could-have-performed-it,
+    // B-D4). ui-bridge `docs-site/docs/api/runner-features.md` quotes this
+    // text verbatim; change both together.
+    if NETWORK_PATTERN_SOURCES
+        .iter()
+        .any(|source| error_msg.contains(&format!("({source})")))
+    {
         return Some(
-            "Use window['fet'+'ch'] to bypass the static guard if you need raw fetch \
-             — but prefer /control/network/stubs for stubbing or evaluate-with-await \
-             for one-shot calls."
+            "Network calls are blocked in page/evaluate unless the request sets \
+             allowNetworkRequests: true. To stub a response, POST /control/network/stubs \
+             and confirm it with verify-stub; to exercise a real request, trigger it \
+             through the UI. An agent-issued page/evaluate is never user evidence."
                 .to_string(),
         );
     }
-    // Generic catch-all for the other prohibited patterns
-    // (XMLHttpRequest, sendBeacon, WebSocket, eval, new Function,
+    // Generic catch-all for the structural patterns, which no request flag
+    // lifts (`PAGE_EVALUATE_STRUCTURAL_PATTERNS`: eval, new Function,
     // import(), require(), __proto__, document.cookie, window.open,
-    // location.assign / replace, crypto.subtle, ...).
+    // location.assign / replace / reload, crypto.subtle, ...).
     Some(
         "Static-guard match. If this is necessary, see /control/network/stubs \
          or open an issue to widen the allowlist."
@@ -1977,18 +2001,137 @@ fn static_guard_hint(error_msg: &str) -> Option<String> {
 mod static_guard_hint_tests {
     use super::static_guard_hint;
 
+    /// The frontend gate whose rejections `static_guard_hint` answers. It is
+    /// the other side of this boundary, so it is read at compile time rather
+    /// than copied, and the routing test below runs the gate's own lists.
+    const EVALUATE_GATE_TS: &str = include_str!("../../../../src/hooks/ui-bridge-events/utils.ts");
+
+    /// Every spelling of the dodge: string-built or bracket lookups of
+    /// `fetch` that the static pattern does not match.
+    const DODGES: [&str; 4] = ["fet'+'ch", "fet\"+\"ch", "window['fet", "window[\"fet"];
+
+    /// The message the frontend gate throws for the pattern whose `.source`
+    /// is `source` (`rejectIfDangerous` in `src/hooks/useUIBridgeEvaluateHandler.ts`).
+    fn rejection(source: &str) -> String {
+        format!("Expression rejected: contains prohibited pattern ({source})")
+    }
+
+    /// The `.source` of every regex literal in the gate's exported `RegExp[]`
+    /// array `name`, which holds one `/<source>/, // comment` per line.
+    fn gate_pattern_sources(name: &str) -> Vec<String> {
+        let (_, after) = EVALUATE_GATE_TS
+            .split_once(&format!("export const {name}: readonly RegExp[] = ["))
+            .unwrap_or_else(|| panic!("utils.ts no longer declares {name}"));
+        let (body, _) = after
+            .split_once("];")
+            .unwrap_or_else(|| panic!("{name} is not closed by `];`"));
+        body.lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with('/') && !line.starts_with("//"))
+            .map(|line| {
+                let literal = line.split_once(", //").map_or(line, |(literal, _)| literal);
+                literal
+                    .trim_end_matches(',')
+                    .strip_prefix('/')
+                    .and_then(|rest| rest.strip_suffix('/'))
+                    .unwrap_or_else(|| {
+                        panic!("{name} entry is not a flag-free regex literal: {line}")
+                    })
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// The fetch rejection's hint names the sanctioned routes — the
+    /// `allowNetworkRequests: true` opt-in and the network-stub routes — and
+    /// no way around the guard. The message is the exact one the frontend
+    /// gate throws (`rejectIfDangerous` in `src/hooks/useUIBridgeEvaluateHandler.ts`
+    /// interpolates the matched pattern's `.source`). Putting back the old
+    /// hint, which taught a string-built lookup of `fetch`, turns this red.
     #[test]
-    fn fetch_rejection_emits_targeted_hint() {
+    fn fetch_rejection_never_teaches_a_bypass() {
         let msg = "Expression rejected: contains prohibited pattern (\\bfetch\\s*\\()";
         let hint = static_guard_hint(msg).expect("fetch rejection must produce a hint");
         assert!(
-            hint.contains("window['fet'+'ch']"),
-            "fetch hint must point at the bracket-access workaround, got: {hint}"
+            hint.contains("allowNetworkRequests: true"),
+            "fetch hint must name the allowNetworkRequests opt-in, got: {hint}"
         );
         assert!(
             hint.contains("/control/network/stubs"),
-            "fetch hint must mention stubs as the preferred alternative, got: {hint}"
+            "fetch hint must name the network-stub routes, got: {hint}"
         );
+        for dodge in DODGES {
+            assert!(
+                !hint.contains(dodge),
+                "fetch hint must never teach a way around the static guard \
+                 (found {dodge:?}), got: {hint}"
+            );
+        }
+    }
+
+    /// `allowNetworkRequests: true` lifts every network pattern, so each
+    /// network rejection gets the hint the fetch rejection gets, byte for
+    /// byte (the ui-bridge docs quote one text). The sources are spelled out
+    /// as the gate's `PAGE_EVALUATE_NETWORK_PATTERNS` writes them.
+    #[test]
+    fn every_network_rejection_gets_the_network_hint() {
+        let fetch_hint = static_guard_hint(&rejection("\\bfetch\\s*\\("))
+            .expect("fetch rejection must produce a hint");
+        for source in [
+            "\\bXMLHttpRequest\\b",
+            "\\bnavigator\\.sendBeacon\\b",
+            "\\bWebSocket\\b",
+        ] {
+            let hint = static_guard_hint(&rejection(source))
+                .expect("network rejection must produce a hint");
+            assert!(
+                hint.contains("allowNetworkRequests: true"),
+                "a {source} rejection must name the opt-in that lifts it, got: {hint}"
+            );
+            assert_eq!(
+                hint, fetch_hint,
+                "a {source} rejection must get the same network hint as fetch"
+            );
+        }
+    }
+
+    /// The routing follows the gate's two lists as the shipped file declares
+    /// them: every network pattern gets the network hint, and every
+    /// structural pattern gets the generic hint and is never offered the
+    /// opt-in, which does not lift it. A pattern added to either list
+    /// without a route here turns this red, and the non-empty checks stop a
+    /// parse that found nothing from passing vacuously.
+    #[test]
+    fn hint_routing_follows_the_gates_pattern_lists() {
+        let network = gate_pattern_sources("PAGE_EVALUATE_NETWORK_PATTERNS");
+        let structural = gate_pattern_sources("PAGE_EVALUATE_STRUCTURAL_PATTERNS");
+        assert!(
+            !network.is_empty(),
+            "no network pattern parsed from utils.ts"
+        );
+        assert!(
+            !structural.is_empty(),
+            "no structural pattern parsed from utils.ts"
+        );
+        let fetch_hint = static_guard_hint(&rejection("\\bfetch\\s*\\("))
+            .expect("fetch rejection must produce a hint");
+        for source in &network {
+            let hint = static_guard_hint(&rejection(source))
+                .expect("network rejection must produce a hint");
+            assert_eq!(
+                hint, fetch_hint,
+                "network pattern {source} must get the network hint"
+            );
+        }
+        for source in &structural {
+            let hint = static_guard_hint(&rejection(source))
+                .expect("structural rejection must produce a hint");
+            assert!(
+                hint.contains("Static-guard match") && !hint.contains("allowNetworkRequests"),
+                "structural pattern {source} must get the generic hint, without the \
+                 network opt-in, got: {hint}"
+            );
+        }
     }
 
     #[test]
@@ -1997,13 +2140,24 @@ mod static_guard_hint_tests {
         let hint = static_guard_hint(msg).expect("eval rejection must produce a hint");
         assert!(
             hint.contains("Static-guard match"),
-            "non-fetch rejection must use the generic hint, got: {hint}"
+            "non-network rejection must use the generic hint, got: {hint}"
         );
-        // The generic hint must NOT leak the fetch-specific guidance.
+        // The generic hint must NOT leak the network guidance: `eval(` is a
+        // structural pattern that `allowNetworkRequests` never lifts
+        // (`PAGE_EVALUATE_STRUCTURAL_PATTERNS` in
+        // `src/hooks/ui-bridge-events/utils.ts`), so offering the opt-in here
+        // would send the caller down a path that cannot work.
         assert!(
-            !hint.contains("window['fet'+'ch']"),
-            "generic hint must not include the fetch-specific workaround, got: {hint}"
+            !hint.contains("allowNetworkRequests"),
+            "generic hint must not offer the network opt-in for a structural pattern, got: {hint}"
         );
+        for dodge in DODGES {
+            assert!(
+                !hint.contains(dodge),
+                "generic hint must never teach a way around the static guard \
+                 (found {dodge:?}), got: {hint}"
+            );
+        }
     }
 
     #[test]
