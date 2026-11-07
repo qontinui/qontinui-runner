@@ -119,7 +119,8 @@ export interface TerminalTab {
    * True when the runner's focus coalescer suppressed this tab
    * (`terminal-created` `surface: false`): one of a burst of unattended spawns.
    * The tab lands without taking the selection or moving the flow grid
-   * (`newestSurfacedTabId`).
+   * (`newestSurfacedTabId`), unless it auto-fills the empty zone the operator
+   * has focused, where there is no session to take the selection from.
    */
   coalesced?: boolean;
   /**

@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, it, expect, vi } from "vitest";
 import {
   scrollCellIntoView,
@@ -80,6 +81,14 @@ describe("newestSurfacedTabId", () => {
 
   it("treats a tab with no verdict as allowed: an operator's own new tab still focuses", () => {
     expect(newestSurfacedTabId(new Set(["a"]), [{ id: "a" }, { id: "b" }])).toBe("b");
+  });
+
+  // No test here drives ZoneGrid's effect, so this pin is what stops it going
+  // back to a routing that ignores the verdict.
+  it("is what ZoneGrid routes new-tab focus through", () => {
+    const zoneGrid = readFileSync(new URL("./ZoneGrid.tsx", import.meta.url), "utf8");
+    expect(zoneGrid).toContain("newestSurfacedTabId(prev, tabs)");
+    expect(zoneGrid).not.toContain("newestAddedTabId(");
   });
 });
 

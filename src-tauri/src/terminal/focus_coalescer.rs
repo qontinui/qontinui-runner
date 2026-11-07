@@ -9,19 +9,22 @@
 //! Terminal panel. On 2026-10-27 that was 46 view switches in 20 minutes, 19 of
 //! them inside 17 seconds.
 //!
-//! The rule here: across the origins that switch the operator's view
-//! ([`switches_the_view`]: continuations, condition checks, looping agents) at
-//! most ONE decision surfaces per [`FOCUS_COALESCE_WINDOW`]. The first spawn of
-//! a burst still surfaces (the reason the focus request exists — plan
+//! The rule here: across the origins whose spawns always switch the operator's
+//! view ([`switches_the_view`]: continuations and condition checks) at most ONE
+//! decision surfaces per [`FOCUS_COALESCE_WINDOW`]. The first spawn of a burst
+//! still surfaces (the reason the focus request exists — plan
 //! `2026-06-07-gate-continuation-auto-surface-and-focus`); the rest appear as
 //! tabs without stealing the view. Operator origins always surface and open no
-//! window.
+//! window. A retried continuation is a new request: if its first attempt never
+//! started but took the window, the retry's create is suppressed. Its tab is
+//! still there, but it does not surface later.
 //!
-//! Every other unattended origin only ever selects a tab: a boot resume, a
+//! Every other unattended origin normally only selects a tab: a boot resume, a
 //! respawn or usage-limit migration, a steward, a scheduled task, orchestration
-//! fan-out, and [`SpawnOrigin::Unknown`] (a caller this runner cannot name, such
-//! as an agent's HTTP `POST /terminals` or a UI-Bridge or relay create). These
-//! have a TAB-ONLY window of their own. Such a request surfaces only when
+//! fan-out, a looping agent (only its first spawn sends a focus request, and its
+//! relaunches must not hold the window), and [`SpawnOrigin::Unknown`] (a caller
+//! this runner cannot name, such as an agent's HTTP `POST /terminals` or a
+//! UI-Bridge or relay create). These have a TAB-ONLY window of their own. Such a request surfaces only when
 //! neither window is open, and its surface opens only the tab-only window. So a
 //! burst of them is still held to one surface per window, while none of them
 //! can suppress the next real gate continuation's view switch: that switch is
@@ -89,18 +92,19 @@ pub fn should_surface(
     }
 }
 
-/// Whether a spawn from `origin` ever emits a `terminal-focus-request`, the
-/// request that moves the operator's main view. The callers of
-/// `agent_runtime::emit_terminal_focus_request` are continuations, condition
-/// checks (`CoordDispatch`) and a looping agent's first spawn. Exhaustive, so a
-/// new origin has to say which it is.
+/// Whether every spawn from `origin` emits a `terminal-focus-request`, the
+/// request that moves the operator's main view: continuations and condition
+/// checks (`CoordDispatch`). A looping agent sends one only on its first spawn,
+/// so it is not one of these: its relaunches would otherwise hold the window a
+/// continuation's only view switch needs. Exhaustive, so a new origin has to say
+/// which it is.
 fn switches_the_view(origin: SpawnOrigin) -> bool {
     match origin {
         SpawnOrigin::GateContinuation
         | SpawnOrigin::UnitContinuation
-        | SpawnOrigin::CoordDispatch
-        | SpawnOrigin::LoopingAgent => true,
-        SpawnOrigin::Steward
+        | SpawnOrigin::CoordDispatch => true,
+        SpawnOrigin::LoopingAgent
+        | SpawnOrigin::Steward
         | SpawnOrigin::Respawn
         | SpawnOrigin::Scheduler
         | SpawnOrigin::Orchestration
@@ -790,6 +794,7 @@ mod tests {
         for origin in [
             SpawnOrigin::BootResume,
             SpawnOrigin::Respawn,
+            SpawnOrigin::LoopingAgent,
             SpawnOrigin::Steward,
             SpawnOrigin::Scheduler,
             SpawnOrigin::Orchestration,
@@ -810,19 +815,19 @@ mod tests {
         }
     }
 
-    /// The table `decide` splits on, as literals: which origins send a
-    /// `terminal-focus-request` at all.
+    /// The table `decide` splits on, as literals: which origins' spawns always
+    /// send a `terminal-focus-request`.
     #[test]
-    fn only_continuations_condition_checks_and_looping_agents_switch_the_view() {
+    fn only_continuations_and_condition_checks_always_switch_the_view() {
         for origin in [
             SpawnOrigin::GateContinuation,
             SpawnOrigin::UnitContinuation,
             SpawnOrigin::CoordDispatch,
-            SpawnOrigin::LoopingAgent,
         ] {
             assert!(switches_the_view(origin), "{origin:?}");
         }
         for origin in [
+            SpawnOrigin::LoopingAgent,
             SpawnOrigin::Steward,
             SpawnOrigin::Respawn,
             SpawnOrigin::Scheduler,
