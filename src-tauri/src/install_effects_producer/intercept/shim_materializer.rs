@@ -2424,6 +2424,13 @@ mod tests {
     }
 }
 
+/// The dir holding the REAL tool in the stacked-shim cases (the bash ones in
+/// `resolve_wait_tests`, the `.cmd` ones in `cmd_resolve_tests`). It CONTAINS
+/// both qontinui shim-dir prefixes and starts with neither, so a template that
+/// matched them as substrings would skip the real tool.
+#[cfg(test)]
+const REAL_DIR_NAME: &str = "the-real-qontinui-identity-qontinui-shim-tool";
+
 /// The bash shim templates' bounded real-tool resolve wait, exercised by
 /// RUNNING the rendered templates (2026-10-01: a runner-spawned gate
 /// continuation's `claude` was on no PATH entry for the ~2 s of an npm reify,
@@ -2874,6 +2881,17 @@ mod resolve_wait_tests {
     /// Phase 1 each shim skipped only its OWN dir, so each resolved the other
     /// shim as the "real" tool and `exec`ed it: an exec ping-pong that keeps
     /// the pid and never returns (exit 124 here).
+    ///
+    /// Between the shims and the real tool sit two DECOY dirs, each holding a
+    /// `<tool>` that prints `DECOY` and exits 3, so every arm of the template's
+    /// `is_qontinui_shim_dir` is RUN, not only the name-prefix one: a dir named
+    /// otherwise but sealed by the identity marker, and the family's prefix
+    /// upper-cased (the bracket-class case fold) with two trailing `/` (the
+    /// trim loop). `dir_b` also rides with one trailing `/`, and an empty entry
+    /// sits among them. A template that misses either decoy resolves it as the
+    /// real tool and fails the asserts. The real tool's dir CONTAINS both
+    /// prefixes without starting with either, so a template that skips by
+    /// substring rather than by prefix skips the real tool and fails too.
     fn assert_stacked_shims_reach_the_real_tool(
         family_prefix: &str,
         tool: &str,
@@ -2883,20 +2901,30 @@ mod resolve_wait_tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir_a = tmp.path().join(format!("{family_prefix}a"));
         let dir_b = tmp.path().join(format!("{family_prefix}b"));
-        let real_dir = tmp.path().join("real");
-        for d in [&dir_a, &dir_b, &real_dir] {
+        let marked = tmp.path().join("renamed-shim-dir");
+        let upper = tmp
+            .path()
+            .join(format!("{}c", family_prefix.to_ascii_uppercase()));
+        let real_dir = tmp.path().join(REAL_DIR_NAME);
+        for d in [&dir_a, &dir_b, &marked, &upper, &real_dir] {
             std::fs::create_dir_all(d).unwrap();
         }
         write_exe(&dir_a.join(tool), &render_into(&dir_a));
         write_exe(&dir_b.join(tool), &render_into(&dir_b));
+        std::fs::write(marked.join(IDENTITY_MARKER), b"tag").unwrap();
+        for decoy in [&marked, &upper] {
+            write_exe(&decoy.join(tool), "#!/bin/sh\necho DECOY\nexit 3\n");
+        }
         write_exe(
             &real_dir.join(tool),
             "#!/bin/sh\necho REAL-TOOL-SENTINEL\nexit 0\n",
         );
         let path = format!(
-            "{}:{}:{}:/usr/bin:/bin",
+            "{}:{}/:{}::{}//:{}:/usr/bin:/bin",
             dir_a.display(),
             dir_b.display(),
+            marked.display(),
+            upper.display(),
             real_dir.display()
         );
         for shim_dir in [&dir_a, &dir_b] {
@@ -2920,6 +2948,12 @@ mod resolve_wait_tests {
             let out = crate::process_helpers::output_with_timeout(cmd, BUDGET).unwrap();
             let stdout = String::from_utf8_lossy(&out.stdout);
             let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                !stdout.contains("DECOY"),
+                "{tool} via {} dispatched to a qontinui shim dir (marker or upper-cased \
+                 name): stdout: {stdout} stderr: {stderr}",
+                shim_dir.display()
+            );
             assert_eq!(
                 out.status.code(),
                 Some(0),
@@ -2957,6 +2991,218 @@ mod resolve_wait_tests {
         assert_stacked_shims_reach_the_real_tool(SHIM_DIR_PREFIX, "npm", |dir| {
             render_for_test(SHIM_BASH, ShimTool::Npm, dir)
         });
+    }
+}
+
+/// The `.cmd` shim templates' PATH walk, exercised by RUNNING them under
+/// cmd.exe on a Windows host. This is the `.cmd` twin of the stacked-shim
+/// cases in `resolve_wait_tests` (plan
+/// `2026-11-04-identity-shim-foreign-shim-ping-pong-and-secondary-runner-pty-socket-overflow`,
+/// Phase 1).
+///
+/// `shim.cmd` is the PRIMARY cmd/PowerShell surface for the npm family, which
+/// ships as `<name>.cmd` and so gets no native stub to outrank it
+/// ([`exe_shadow_needed`]). `identity_shim.cmd` is the fallback when the native
+/// stub is absent. Until this module, no test ran either template, so their
+/// `:is_qontinui_shim_dir` subroutine had been read but never executed.
+///
+/// No Linux box can run cmd.exe, so the module carries its own negative
+/// control: the same harness over each template with one arm of the
+/// subroutine removed must land on a decoy. Every Windows run therefore shows
+/// both that the templates pass and that the harness can fail.
+#[cfg(all(test, windows))]
+mod cmd_resolve_tests {
+    use super::*;
+    use std::process::{Command, Output};
+    use std::time::Duration;
+
+    const BUDGET: Duration = Duration::from_secs(60);
+
+    /// Every env var the two `.cmd` templates read that would change the
+    /// dispatch under test: a recursion guard, a runner port (a curl
+    /// round-trip), a pin, delivered settings. A Windows dev box running this
+    /// suite inside a runner pane carries all of them. Keep this list in step
+    /// with the `%QONTINUI_…%` names in `identity_shim.cmd` and `shim.cmd`
+    /// (`QONTINUI_SHIM_RESOLVE_WAIT_SECS` is set explicitly below instead).
+    const AMBIENT_SHIM_ENV: &[&str] = &[
+        "QONTINUI_INSTALL_INTERCEPT_GUARD",
+        "QONTINUI_INSTALL_INTERCEPT_PORT",
+        "QONTINUI_INSTALL_INTERCEPT_MODE",
+        "QONTINUI_INSTALL_OVERRIDE",
+        "QONTINUI_PINNED_SESSION_ID",
+        "QONTINUI_CLAUDE_HOOK_SETTINGS",
+        "QONTINUI_MCP_CONFIG",
+        "QONTINUI_POLICY_DELIVERED_SHA",
+        "QONTINUI_POLICY_DELIVERED_FILE",
+        "QONTINUI_TERMINAL_ID",
+    ];
+
+    /// One template under test: its family prefix, its tool, its renderer.
+    type Template = (&'static str, &'static str, fn(&Path) -> String);
+
+    /// The two `.cmd` templates under test.
+    fn templates() -> [Template; 2] {
+        [
+            (IDENTITY_DIR_PREFIX, "claude", |dir: &Path| {
+                render_identity(IDENTITY_SHIM_CMD, "claude", dir)
+            }),
+            (SHIM_DIR_PREFIX, "npm", |dir: &Path| {
+                render(SHIM_CMD, ShimTool::Npm, dir)
+            }),
+        ]
+    }
+
+    /// Two rendered `.cmd` shims of one family stacked on PATH ahead of the
+    /// real tool, with the same decoys as the bash case: a dir sealed by the
+    /// identity marker, and the family prefix upper-cased. `dir_b` rides with
+    /// a trailing `\/` (both separators, so the trim loop runs twice), and an
+    /// empty entry sits among them. The decoys carry no trailing separator, so
+    /// a mutant that dispatches to one `call`s a plain path. Runs `<tool>
+    /// --version` through EACH shim and returns each run's output.
+    ///
+    /// A shim that resolves the other shim as the real tool `call`s it, and
+    /// the two recurse until cmd.exe's batch stack gives out or
+    /// `output_with_timeout` kills the tree; either way no sentinel.
+    fn run_through_stacked_cmd_shims(
+        family_prefix: &str,
+        tool: &str,
+        render_into: impl Fn(&Path) -> String,
+    ) -> Vec<(String, Output)> {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir_a = tmp.path().join(format!("{family_prefix}a"));
+        let dir_b = tmp.path().join(format!("{family_prefix}b"));
+        let marked = tmp.path().join("renamed-shim-dir");
+        let upper = tmp
+            .path()
+            .join(format!("{}c", family_prefix.to_ascii_uppercase()));
+        let real_dir = tmp.path().join(REAL_DIR_NAME);
+        for d in [&dir_a, &dir_b, &marked, &upper, &real_dir] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let script = format!("{tool}.cmd");
+        std::fs::write(dir_a.join(&script), render_into(&dir_a)).unwrap();
+        std::fs::write(dir_b.join(&script), render_into(&dir_b)).unwrap();
+        std::fs::write(marked.join(IDENTITY_MARKER), b"tag").unwrap();
+        for decoy in [&marked, &upper] {
+            std::fs::write(decoy.join(&script), "@echo DECOY\r\n@exit /b 3\r\n").unwrap();
+        }
+        std::fs::write(
+            real_dir.join(&script),
+            "@echo REAL-TOOL-SENTINEL\r\n@exit /b 0\r\n",
+        )
+        .unwrap();
+        let system32 = std::env::var("SystemRoot")
+            .map(|root| format!("{root}\\System32"))
+            .unwrap_or_else(|_| r"C:\Windows\System32".to_string());
+        let path = format!(
+            "{};{}\\/;{};;{};{};{system32}",
+            dir_a.display(),
+            dir_b.display(),
+            marked.display(),
+            upper.display(),
+            real_dir.display()
+        );
+        let mut runs = Vec::with_capacity(2);
+        for shim_dir in [&dir_a, &dir_b] {
+            // std launches a `.cmd` through cmd.exe with its own argument
+            // escaping, so the template runs as a pane's cmd.exe would run it.
+            let mut cmd = Command::new(shim_dir.join(&script));
+            cmd.arg("--version")
+                .current_dir(tmp.path())
+                // Case-insensitive on Windows: this replaces the inherited `Path`.
+                .env("PATH", &path)
+                .env("QONTINUI_SHIM_RESOLVE_WAIT_SECS", "0");
+            for var in AMBIENT_SHIM_ENV {
+                cmd.env_remove(var);
+            }
+            let label = format!("{script} via {}", shim_dir.display());
+            let out =
+                crate::process_helpers::output_with_timeout(cmd, BUDGET).unwrap_or_else(|e| {
+                    panic!("{label} never returned (a shim-to-shim `call` loop?): {e}")
+                });
+            runs.push((label, out));
+        }
+        runs
+    }
+
+    fn assert_each_reached_the_real_tool(runs: &[(String, Output)]) {
+        for (label, out) in runs {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                !stdout.contains("DECOY"),
+                "{label} dispatched to a qontinui shim dir (marker or upper-cased name): \
+                 stdout: {stdout} stderr: {stderr}"
+            );
+            assert_eq!(
+                out.status.code(),
+                Some(0),
+                "{label} must reach the real tool, not another qontinui shim; \
+                 stdout: {stdout} stderr: {stderr}"
+            );
+            assert!(
+                stdout.contains("REAL-TOOL-SENTINEL"),
+                "{label}: the real tool never ran; stdout: {stdout} stderr: {stderr}"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_cmd_shim_skips_foreign_qontinui_shim_dir() {
+        let [(prefix, tool, render_into), _] = templates();
+        assert_each_reached_the_real_tool(&run_through_stacked_cmd_shims(
+            prefix,
+            tool,
+            render_into,
+        ));
+    }
+
+    #[test]
+    fn install_cmd_shim_skips_foreign_qontinui_shim_dir() {
+        let [_, (prefix, tool, render_into)] = templates();
+        assert_each_reached_the_real_tool(&run_through_stacked_cmd_shims(
+            prefix,
+            tool,
+            render_into,
+        ));
+    }
+
+    /// The negative control. Each template, with its marker arm or its case
+    /// fold removed, must send both runs to a decoy, so a green run of the two
+    /// tests above is evidence that the harness can tell.
+    #[test]
+    fn cmd_shim_harness_catches_a_template_missing_an_arm() {
+        const MUTANTS: [(&str, &str, &str); 2] = [
+            (
+                "marker arm removed",
+                r#"if exist "!DTRIM!\.qontinui-identity-build" set "DSKIP=1""#,
+                "rem marker arm removed",
+            ),
+            ("case fold removed", r#"if /I "!DNAME:"#, r#"if "!DNAME:"#),
+        ];
+        for (prefix, tool, render_into) in templates() {
+            for (mutant, needle, replacement) in MUTANTS {
+                let runs = run_through_stacked_cmd_shims(prefix, tool, |dir| {
+                    let body = render_into(dir);
+                    assert!(
+                        body.contains(needle),
+                        "the {tool} .cmd template no longer contains `{needle}`; update \
+                         the `{mutant}` mutant to its current spelling"
+                    );
+                    body.replace(needle, replacement)
+                });
+                for (label, out) in &runs {
+                    let stdout = String::from_utf8_lossy(&out.stdout);
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    assert!(
+                        stdout.contains("DECOY"),
+                        "{label} with the {mutant} still avoided every decoy, so the \
+                         harness cannot detect that arm missing; stdout: {stdout} \
+                         stderr: {stderr}"
+                    );
+                }
+            }
+        }
     }
 }
 

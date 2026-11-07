@@ -197,10 +197,15 @@ rem for ever (plan 2026-11-04-identity-shim-foreign-shim-ping-pong-and-
 rem secondary-runner-pty-socket-overflow, Phase 1). The same predicate as
 rem intercept_core::shim_dir::is_qontinui_shim_dir: the dir's final name starts
 rem with qontinui-identity- or qontinui-shim-, or it holds the identity-build
-rem marker. Trailing separators are ignored.
+rem marker. Trailing separators are ignored. An EMPTY entry (a doubled or
+rem trailing `;`) is skipped, as the bash templates and the native stub skip
+rem it: probing it would test `\<tool>.cmd` at the root of the current drive.
 :is_qontinui_shim_dir
 set "DSKIP=0"
-if not defined DENTRY exit /b 0
+if not defined DENTRY (
+  set "DSKIP=1"
+  exit /b 0
+)
 if /I "!DENTRY!"=="%SHIM_DIR%" set "DSKIP=1"
 set "DTRIM=!DENTRY!"
 :is_qontinui_shim_dir_trim
