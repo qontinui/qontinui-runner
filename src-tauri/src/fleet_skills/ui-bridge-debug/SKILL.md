@@ -26,6 +26,12 @@ checkable examples:
 `qontinui-claude-config/knowledge-base/qontinui-specific/ui-bridge.md` →
 "The UI Bridge Is the Only Frontend-Inspection Tool".
 
+**Comparing the runner against the web frontend?** Each surface resolves its own
+`@qontinui/ui-bridge` minor, and a skew between them has already produced a
+false finding. Before you attribute a difference to either app, confirm that
+both resolve the same minor. The check and its exit codes are in `ui-bridge.md`
+→ "Version agreement between the two mandated surfaces".
+
 ## Endpoints
 
 | Application | UI Bridge Base URL |

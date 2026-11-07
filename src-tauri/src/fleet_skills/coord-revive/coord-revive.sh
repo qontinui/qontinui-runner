@@ -2063,9 +2063,11 @@ read_cfg() {
   # twin carry the same key into probe_door AND into seen_endpoint's (url, key)
   # dedup. An unset no-default reference is refused with its typed reason in
   # $CFG_ENVREF_ERR - cfg_shape reports it - and nothing is sent.
-  # The URL gate lives in the helper (mcp_expand_env_ref_for_url): only a
-  # strictly-loopback CFG_URL reads the environment; any other URL resolves on
-  # the reference's DEFAULT arm, so no environment value is sent off-box.
+  # The URL gate lives in the helper (mcp_expand_env_ref_for_url): only the
+  # HOSTING runner's door (127.0.0.1 on $QONTINUI_RUNNER_API_PORT) reads the
+  # environment; any other URL - off-box, or a walked-up / sibling file naming
+  # another loopback door (finding e4c596d6) - resolves on the reference's
+  # DEFAULT arm, so this session's nonce reaches no door but its own runner.
   CFG_ENVREF_ERR=""
   if ! mcp_expand_env_ref_for_url CFG_KEY "$CFG_URL" "$CFG_KEY" 2>"$TMPD/envref.err"; then
     CFG_ENVREF_ERR="$(head -n 1 "$TMPD/envref.err" 2>/dev/null)"
