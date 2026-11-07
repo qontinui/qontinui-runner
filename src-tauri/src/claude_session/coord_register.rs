@@ -1646,7 +1646,15 @@ impl AiCoordRegistrar {
                          to coord session {} — delivering the owed write",
                         rec.claude_session_id, target
                     );
-                    self.enqueue_finished(&rec.claude_session_id, target, rec.finished_at)
+                    let sync =
+                        self.enqueue_finished(&rec.claude_session_id, target, rec.finished_at);
+                    // A re-queue supersedes any recorded drop of this mark's
+                    // write (`coord.delivery` reads `pending` again). Map lock
+                    // only, so safe under `finish_forward`.
+                    if matches!(sync, FinishSync::Queued { .. }) {
+                        store.clear_finish_delivery(&rec.claude_session_id, rec.finished_at);
+                    }
+                    sync
                 })
                 .collect()
         })
@@ -1681,7 +1689,14 @@ impl AiCoordRegistrar {
                          re-sending its finished mark to coord session {}",
                         r.claude_session_id, target
                     );
-                    self.enqueue_finished(&r.claude_session_id, target, r.finished_at)
+                    let sync = self.enqueue_finished(&r.claude_session_id, target, r.finished_at);
+                    // A re-queue supersedes any recorded drop (or unconfirmed
+                    // give-up) of this mark's write, exactly as in
+                    // `deliver_owed_to`: `coord.delivery` reads `pending` again.
+                    if matches!(sync, FinishSync::Queued { .. }) {
+                        store.clear_finish_delivery(&r.claude_session_id, r.finished_at);
+                    }
+                    sync
                 })
         })
     }
@@ -3941,6 +3956,7 @@ mod tests {
                 finish_reason: None,
                 finish_synced: false,
                 finish_coord_session_id: None,
+                finish_delivery: None,
                 spawn_device_default: None,
                 adopted_from: None,
                 last_session_start_at: None,
@@ -4049,6 +4065,7 @@ mod tests {
                 finish_reason: None,
                 finish_synced: false,
                 finish_coord_session_id: None,
+                finish_delivery: None,
                 spawn_device_default: None,
                 adopted_from: None,
                 last_session_start_at: None,

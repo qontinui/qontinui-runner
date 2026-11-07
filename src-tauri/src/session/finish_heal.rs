@@ -644,6 +644,18 @@ pub fn decorate_read_back(
             .map(|o| json!({ "outcome": o.reason() }))
             .unwrap_or(JsonValue::Null),
     );
+    // `delivery` was decided from the stamp BEFORE the read; once the response
+    // says `finishSynced: false` (coord's own row contradicts it, or the heal
+    // withdrew the stamp without re-queuing) it cannot keep claiming `acked`.
+    if !finish_synced
+        && coord.get("delivery").and_then(JsonValue::as_str) == Some("acked")
+        && !matches!(rb.heal, Some(HealOutcome::Resent { .. }))
+    {
+        coord.insert(
+            "delivery".to_string(),
+            JsonValue::String("unknown".to_string()),
+        );
+    }
     if let Some(HealOutcome::Resent { row }) = &rb.heal {
         // The heal re-queued the finish: the read-back now reports that write.
         coord.insert("queued".to_string(), JsonValue::Bool(true));
@@ -652,6 +664,14 @@ pub fn decorate_read_back(
             JsonValue::String(row.to_string()),
         );
         coord.insert("reason".to_string(), JsonValue::Null);
+        // The stamp was withdrawn and a fresh row queued, so the write this
+        // response reports is in flight (plan
+        // `2026-10-29-session-outbox-drops-the-finish-of-a-session-coord-never-registered`
+        // Phase 4's `coord.delivery`), not the `acked` the stored stamp gave.
+        coord.insert(
+            "delivery".to_string(),
+            JsonValue::String("pending".to_string()),
+        );
     }
 }
 

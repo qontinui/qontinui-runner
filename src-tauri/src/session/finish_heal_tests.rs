@@ -631,6 +631,7 @@ fn a_read_back_over_coord_finished_reports_it_observed_and_synced() {
     assert_eq!(resp["coord"]["observed"]["observedAt"], json!(now));
     assert_eq!(resp["coord"]["observedReason"], json!(null));
     assert_eq!(resp["coord"]["heal"]["outcome"], "coord_finished");
+    assert_eq!(resp["coord"]["delivery"], "acked");
 }
 
 #[test]
@@ -651,6 +652,7 @@ fn a_read_back_over_coord_null_heals_and_stops_reading_synced() {
     assert_eq!(resp["coord"]["heal"]["outcome"], "resent");
     assert_eq!(resp["coord"]["queued"], true);
     assert_eq!(resp["coord"]["coordSessionId"], ROW);
+    assert_eq!(resp["coord"]["delivery"], "pending", "the re-sent write");
     assert_eq!(p.sent.lock().unwrap().len(), 1);
 }
 
@@ -670,6 +672,7 @@ fn a_read_back_with_coord_unreadable_keeps_the_stored_value_and_names_why() {
     );
     assert_eq!(resp["session"]["finishSynced"], true, "the stored value");
     assert_eq!(resp["coord"]["heal"]["outcome"], "coord_unreadable");
+    assert_eq!(resp["coord"]["delivery"], "acked", "the stored value");
     assert!(p.sent.lock().unwrap().is_empty());
 }
 
@@ -687,10 +690,42 @@ fn a_read_back_over_another_rows_finish_does_not_read_synced() {
     decorate_read_back(&mut resp, &rb, store.get("rb-other").as_ref());
     assert_eq!(resp["session"]["finishSynced"], false);
     assert_eq!(resp["coord"]["heal"]["outcome"], "different_row");
+    assert_eq!(
+        resp["coord"]["delivery"], "unknown",
+        "coord contradicts the stamp and nothing was re-queued: never `acked`"
+    );
     assert!(
         store.get("rb-other").unwrap().finish_synced,
         "the stamp itself is untouched"
     );
+}
+
+/// A heal that withdrew the stamp but could not re-queue (`NotQueued`) leaves
+/// nothing in flight: `delivery` must not keep the pre-read `acked` beside
+/// `finishSynced: false`.
+#[test]
+fn a_read_back_whose_heal_did_not_requeue_never_reads_acked() {
+    let (_d, store, at) = synced_store("rb-notq");
+    let mut resp = read_back_response(&store, "rb-notq");
+    assert_eq!(
+        resp["coord"]["delivery"], "acked",
+        "decided before the read"
+    );
+    // The heal withdrew the stamp; the store now reads unsynced.
+    assert!(store.clear_finish_synced("rb-notq", at));
+    let rb = ReadBack {
+        observed: None,
+        observed_at: chrono::DateTime::<Utc>::from_timestamp_millis(at + 5_000).unwrap(),
+        unobserved_reason: None,
+        own_row: None,
+        heal: Some(HealOutcome::NotQueued {
+            row: Uuid::parse_str(ROW).unwrap(),
+            reason: "no_coord_session",
+        }),
+    };
+    decorate_read_back(&mut resp, &rb, store.get("rb-notq").as_ref());
+    assert_eq!(resp["session"]["finishSynced"], false);
+    assert_eq!(resp["coord"]["delivery"], "unknown");
 }
 
 // ---------------------------------------------------------------------------
