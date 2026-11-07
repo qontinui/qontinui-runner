@@ -11873,6 +11873,14 @@ async fn vcs_create_pull_request_handler(
     let req: VcsPullRequestBody = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(e) => {
+            // A body that is not UTF-8 is an ENCODING problem, not a shape
+            // one — the same diagnosis the `Json<T>` extractor paths and the
+            // plan-library write door give (`envelope::invalid_utf8_message`).
+            // PR bodies are full of em dashes, which Git Bash curl sends as
+            // the single ANSI byte `0x97`.
+            if let Some(msg) = crate::mcp::envelope::invalid_utf8_message(&e.to_string()) {
+                return crate::mcp::envelope::envelope_400_invalid_utf8(msg).into_response();
+            }
             return (
                 axum::http::StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({
@@ -23106,6 +23114,39 @@ mod vcs_pr_proxy_tests {
         assert_eq!(resp.status(), 401);
         let v = body_json(resp).await;
         assert_eq!(v["code"], "VCS_PR_PROXY_UNAUTHORIZED");
+    }
+
+    /// A PR body that is not UTF-8 (the `0x97` em dash Git Bash curl sends)
+    /// answers `INVALID_UTF8` with the encoding remedy, not the generic
+    /// `VCS_PR_PROXY_BAD_REQUEST` deserialize text.
+    #[tokio::test]
+    async fn non_utf8_pr_body_answers_invalid_utf8() {
+        let _amb = crate::test_env::isolated_ambient();
+        let nonce = crate::coord_mcp::register_agent_proxy_nonce(
+            "/tmp/vcs-pr-proxy-invalid-utf8-test",
+            uuid::Uuid::new_v4(),
+        );
+        let resp = vcs_router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/vcs/pull-requests")
+                    .header("X-Coord-Mcp-Proxy-Key", &nonce)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        &b"{\"repo\":\"a/b\",\"head\":\"h\",\"title\":\"a \x97 b\"}"[..],
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        let v = body_json(resp).await;
+        assert_eq!(v["code"], "INVALID_UTF8");
+        assert!(v["error"]
+            .as_str()
+            .unwrap()
+            .contains("request body is not valid UTF-8"));
     }
 
     /// An AGENT-bound nonce is ACCEPTED by the principal gate (coord-spawned
