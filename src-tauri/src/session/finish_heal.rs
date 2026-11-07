@@ -652,6 +652,14 @@ pub fn decorate_read_back(
             JsonValue::String(row.to_string()),
         );
         coord.insert("reason".to_string(), JsonValue::Null);
+        // The stamp was withdrawn and a fresh row queued, so the write this
+        // response reports is in flight (plan
+        // `2026-10-29-session-outbox-drops-the-finish-of-a-session-coord-never-registered`
+        // Phase 4's `coord.delivery`), not the `acked` the stored stamp gave.
+        coord.insert(
+            "delivery".to_string(),
+            JsonValue::String("pending".to_string()),
+        );
     }
 }
 

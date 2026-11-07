@@ -2517,6 +2517,7 @@ mod tests {
             finish_reason: None,
             finish_synced: false,
             finish_coord_session_id: None,
+            finish_delivery: None,
             spawn_device_default: None,
             adopted_from: None,
             last_session_start_at: None,

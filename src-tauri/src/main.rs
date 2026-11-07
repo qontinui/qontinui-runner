@@ -3974,6 +3974,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // CoordSync drain loop drains (registration reuses the existing
                 // drain → auth → retry → 409-idempotency machinery).
                 let registrar_outbox = outbox.clone();
+                // Read-only handle for the finish route's `coord.delivery`
+                // probe (`SessionLifecycleStore::attach_finish_pending_probe`).
+                let finish_probe_outbox = outbox.clone();
                 let coord_sync_facade = session::coord_sync::CoordSync::new(outbox);
                 let pty_transport: session::DynTransport =
                     std::sync::Arc::new(session::transport::pty::PtyTransport::new(
@@ -4415,12 +4418,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     );
                     // A finish the drain gave up on (coord answered, its row
                     // never read `finished`) keeps the row it was SENT to on
-                    // the mark, unstamped, for the boot heal sweep.
+                    // the mark, unstamped, for the boot heal sweep — and the
+                    // finish route answers `coord.delivery: "unconfirmed"`.
                     let store = std::sync::Arc::downgrade(&lifecycle_store);
                     coord_sync_facade.attach_finished_unconfirmed_observer(
                         move |csid, finished_at, coord_row| {
                             if let Some(s) = store.upgrade() {
                                 s.note_finish_sent_row(csid, finished_at, coord_row);
+                                s.mark_finish_unconfirmed(csid, finished_at);
                             }
                         },
                     );
@@ -4433,6 +4438,21 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         std::sync::Arc::downgrade(&lifecycle_store),
                         std::sync::Arc::downgrade(&ai_coord_registrar),
                     );
+                    // The drop twin: a `finished` row the drain drops without
+                    // coord taking it stamps `finish_delivery`, so the finish
+                    // route answers `coord.delivery: "dropped:<reason>"`.
+                    let store = std::sync::Arc::downgrade(&lifecycle_store);
+                    coord_sync_facade.attach_finished_drop_observer(
+                        move |csid, finished_at, reason| {
+                            if let Some(s) = store.upgrade() {
+                                s.mark_finish_dropped(csid, finished_at, reason);
+                            }
+                        },
+                    );
+                    lifecycle_store.attach_finish_pending_probe(move |rec| {
+                        finish_probe_outbox
+                            .has_pending_finished(&rec.claude_session_id, rec.finished_at)
+                    });
                 }
                 // Append-only session-snapshot HISTORY (session-restore
                 // shim-fix plan, Phase 4): a durable JSONL audit of the full
