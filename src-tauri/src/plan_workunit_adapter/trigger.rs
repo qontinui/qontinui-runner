@@ -10895,6 +10895,7 @@ Body.
             initiative_item: None,
             initiative_item_rejected: None,
             phases: vec![],
+            repos: vec![],
             source_path: format!("plans/{slug}.md"),
             content: String::new(),
         }

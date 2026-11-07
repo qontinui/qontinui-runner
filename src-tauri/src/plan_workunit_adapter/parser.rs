@@ -110,6 +110,11 @@ pub struct ParsedWorkUnit {
     pub initiative_item_rejected: Option<HeaderRejection>,
     /// Phase structure -> sub-units, in document order, deduped by index.
     pub phases: Vec<ParsedPhase>,
+    /// The repos the plan's `**Repo(s):**` line declares, bare names, deduped
+    /// in first-seen order — pushed as work-unit `metadata.repos` when
+    /// non-empty. Parsed by [`super::body_push::extract_repos`], the ONE
+    /// parser of that line (it also feeds the plan-library `repos` facet).
+    pub repos: Vec<String>,
     /// Provenance back-link: the source file path the caller supplied.
     pub source_path: String,
     /// Raw body, retained like coord's `ParsedPlan.content`.
@@ -1219,6 +1224,7 @@ pub fn parse_work_unit(
         initiative_item,
         initiative_item_rejected,
         phases: detect_phases(body),
+        repos: super::body_push::extract_repos(body),
         source_path: source_path.to_string(),
         content: body.to_string(),
     }
