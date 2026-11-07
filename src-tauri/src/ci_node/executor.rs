@@ -27,6 +27,19 @@
 //! something RUNNING: there is no reason to start a database before finding out
 //! a declared tool does not exist for this platform.
 //!
+//! ## What a step inherits
+//!
+//! A step inherits the runner's process environment MINUS the scrub in
+//! [`super::step_env`]: the model-credential class, every inherited
+//! `*_MODEL_CMD` key and the runner's own credential values are removed before
+//! the step's `env` and the executor's exports are applied, and every step gets
+//! `CLAUDE_CONFIG_DIR` pointed at an empty per-dispatch directory, so a
+//! `claude` inside a step starts with no login. Provisioning children (tools,
+//! siblings, services) are handled differently: they do not pass through that
+//! scrub, and plan
+//! `2026-11-06-ci-node-provisioning-children-inherit-only-an-allowlisted-environment`
+//! owns their environment.
+//!
 //! ## Capture-before-cleanup (type-enforced, not conventional)
 //!
 //! The steps' JUnit report lives INSIDE the dispatch worktree that
@@ -49,6 +62,7 @@
 //! no way to report without having been handed the capture slot. Re-breaking
 //! this requires deleting a type, not reordering two lines.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -534,6 +548,10 @@ pub(crate) async fn run_dispatch(
         sink.push(&line);
     }
 
+    // The directory cleanup removes whole. Each step's empty
+    // `CLAUDE_CONFIG_DIR` is made under it (see `run_step`).
+    let dispatch_root = super::checkout::ci_dispatch_root(&root, &payload.dispatch_id);
+
     // ── Steps (sequential; first failure short-circuits) ──
     let mut overall = StepOutcome::Success;
     let mut result_reason: Option<&'static str> = None;
@@ -550,7 +568,16 @@ pub(crate) async fn run_dispatch(
         ));
         let step_started = Instant::now();
         let oom_before = ci_job.oom_kill_count();
-        let outcome = run_step(step, &dispatch_env, &worktree, &ci_job, &sink, &cancel).await;
+        let outcome = run_step(
+            step,
+            &dispatch_env,
+            &dispatch_root,
+            &worktree,
+            &ci_job,
+            &sink,
+            &cancel,
+        )
+        .await;
         let oom_after = ci_job.oom_kill_count();
         let duration = step_started.elapsed().as_secs();
         sink.push(&format!(
@@ -764,35 +791,58 @@ fn build_step_command(program: &str, args: &[String]) -> tokio::process::Command
     cmd
 }
 
+/// Everything a step command is given before it spawns: its cwd and pipes,
+/// then the step env scrub's `removals` taken out of the inherited
+/// environment, THEN `envs`, then the dispatch containment. Removals come
+/// first so an executor-owned value such as `CLAUDE_CONFIG_DIR` is set, not
+/// removed.
+///
+/// A named fn rather than a closure in `spawn_step_child`, so a test observes
+/// the code the direct command and the Windows `cmd.exe /C` shim both run, not
+/// a copy of it.
+fn apply_step_env(
+    cmd: &mut tokio::process::Command,
+    cwd: &Path,
+    removals: &[OsString],
+    envs: &[(String, String)],
+    ci_job: &CiJob,
+) {
+    cmd.current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for k in removals {
+        cmd.env_remove(k);
+    }
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    ci_job.prepare(cmd);
+}
+
 /// Spawn a step child, falling back to a `cmd.exe /C` respawn on Windows
 /// when the program is a `.cmd`/`.bat` shim (pnpm) that `CreateProcess`
 /// cannot launch directly. Argv tokens are metacharacter-validated by the
 /// manifest, so the shim path cannot smuggle shell syntax.
+///
+/// Both commands get the same [`apply_step_env`]: the `removals` (the step
+/// env scrub, see [`super::step_env`]) and then the `envs`.
 fn spawn_step_child(
     step: &CiStep,
     cwd: &Path,
+    removals: &[OsString],
     envs: &[(String, String)],
     ci_job: &CiJob,
 ) -> Result<tokio::process::Child, String> {
-    let apply = |cmd: &mut tokio::process::Command| {
-        cmd.current_dir(cwd)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        for (k, v) in envs {
-            cmd.env(k, v);
-        }
-        ci_job.prepare(cmd);
-    };
     let mut direct = build_step_command(&step.command[0], &step.command[1..]);
-    apply(&mut direct);
+    apply_step_env(&mut direct, cwd, removals, envs, ci_job);
     match direct.spawn() {
         Ok(child) => Ok(child),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound && cfg!(target_os = "windows") => {
             let mut argv: Vec<String> = vec!["/C".to_string()];
             argv.extend(step.command.iter().cloned());
             let mut shim = build_step_command("cmd.exe", &argv);
-            apply(&mut shim);
+            apply_step_env(&mut shim, cwd, removals, envs, ci_job);
             shim.spawn()
                 .map_err(|e2| format!("spawn {:?} (direct: {e}; cmd /C: {e2})", step.command))
         }
@@ -897,9 +947,13 @@ fn tool_path(tool_dirs: &[PathBuf]) -> Option<String> {
 }
 
 /// Run one step: spawn, pump output, enforce timeout + cancellation.
+///
+/// `dispatch_root` is the directory the dispatch's cleanup removes whole; the
+/// step's empty `CLAUDE_CONFIG_DIR` is made under it (see [`super::step_env`]).
 async fn run_step(
     step: &CiStep,
     dispatch_env: &DispatchEnv,
+    dispatch_root: &Path,
     worktree: &Path,
     ci_job: &CiJob,
     sink: &ProgressSink,
@@ -913,16 +967,34 @@ async fn run_step(
         }
     };
 
+    // Emptied again before EVERY step, so one step cannot plant a login for
+    // the next. No empty directory, no step: it never runs pointed at one that
+    // is not empty.
+    let config_dir = match super::step_env::fresh_empty_config_dir(dispatch_root) {
+        Ok(d) => d,
+        Err(e) => {
+            sink.push(&format!("[ci-node] step {}: {e}", step.name));
+            return StepOutcome::Failure;
+        }
+    };
+
     // Env: allowlisted step env first, then the executor's exports, which WIN
-    // over the step.
+    // over the step, then the pinned config dir.
     let mut envs: Vec<(String, String)> = step
         .env
         .iter()
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     envs.extend(dispatch_env.exports.iter().cloned());
+    envs.push((
+        super::step_env::CLAUDE_CONFIG_DIR_ENV.to_string(),
+        config_dir.to_string_lossy().to_string(),
+    ));
 
-    let mut child = match spawn_step_child(step, &cwd, &envs, ci_job) {
+    // The scrub: no step inherits a model credential, a model command or the
+    // runner's credential values. Computed per step from this process's env.
+    let removals = super::step_env::current_step_env_removals();
+    let mut child = match spawn_step_child(step, &cwd, &removals, &envs, ci_job) {
         Ok(c) => c,
         Err(e) => {
             sink.push(&format!("[ci-node] step {}: {e}", step.name));
@@ -1410,5 +1482,429 @@ mod tests {
                 "{bad}: got {err}"
             );
         }
+    }
+
+    // ── The step env scrub, end to end ──────────────────────────────────────
+
+    /// One planted canary per scrub class, plus a positive control outside
+    /// every class. Each is a name no non-test runner code reads (`git grep`
+    /// at `a5161f4da`): the class canary and the two `QONTINUI_STEP_ENV_*`
+    /// names occur nowhere else in the tree, and `QONTINUI_OPERATOR2_PASSWORD`
+    /// is only NAMED, by the removal list `terminal::CREDENTIAL_VALUE_ENV_VARS`
+    /// and by test code.
+    const CLASS_CANARY: &str = "CLAUDE_CODE_SKIP_MANTLE_AUTH";
+    const HOST_LIST_CANARY: &str = "QONTINUI_OPERATOR2_PASSWORD";
+    const MODEL_CMD_CANARY: &str = "QONTINUI_STEP_ENV_PROBE_MODEL_CMD";
+    const KEEP_CANARY: &str = "QONTINUI_STEP_ENV_KEEP_CANARY";
+    const CANARIES: [&str; 4] = [
+        CLASS_CANARY,
+        HOST_LIST_CANARY,
+        MODEL_CMD_CANARY,
+        KEEP_CANARY,
+    ];
+
+    /// A step as the manifest would hand it over. Built directly: the probes
+    /// below quote their program text, which the manifest's argv check (a
+    /// separate, upstream gate) is not under test here.
+    fn probe_step(name: &str, command: Vec<String>) -> CiStep {
+        CiStep {
+            name: name.to_string(),
+            command,
+            env: Default::default(),
+            timeout_secs: Some(120),
+            working_dir: None,
+        }
+    }
+
+    #[cfg(windows)]
+    fn powershell(script: String) -> Vec<String> {
+        ["powershell", "-NoProfile", "-NonInteractive", "-Command"]
+            .iter()
+            .map(|s| s.to_string())
+            .chain([script])
+            .collect()
+    }
+
+    /// The probe: `seen=<NAME>` for each canary that is SET in the step's
+    /// environment, then `cfg=<CLAUDE_CONFIG_DIR>` and `done`. It prints names,
+    /// never a dump: whenever the scrub is broken the box's real environment
+    /// reaches the child, and the sink keeps only `LOG_TAIL_CAP_BYTES` of
+    /// tail, which a dump could fill.
+    fn env_probe_command() -> Vec<String> {
+        #[cfg(not(windows))]
+        {
+            let program = format!(
+                r#"BEGIN {{ n = split("{}", k, " "); for (i = 1; i <= n; i++) if (k[i] in ENVIRON) print "seen=" k[i]; print "cfg=" ENVIRON["CLAUDE_CONFIG_DIR"]; print "done" }}"#,
+                CANARIES.join(" ")
+            );
+            vec!["awk".to_string(), program]
+        }
+        #[cfg(windows)]
+        {
+            let names = CANARIES
+                .iter()
+                .map(|n| format!("'{n}'"))
+                .collect::<Vec<_>>()
+                .join(",");
+            powershell(format!(
+                "foreach ($n in {names}) {{ if (Test-Path ('Env:' + $n)) {{ 'seen=' + $n }} }}; \
+                 'cfg=' + $env:CLAUDE_CONFIG_DIR; 'done'"
+            ))
+        }
+    }
+
+    /// The stdout lines one step printed, in order, without the
+    /// `[<step>:out] ` prefix `pump_lines` adds.
+    fn step_out(tail: &str, step: &str) -> Vec<String> {
+        let prefix = format!("[{step}:out] ");
+        tail.lines()
+            .filter_map(|l| l.strip_prefix(prefix.as_str()))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Step 2: list `CLAUDE_CONFIG_DIR` (`entry=<name>` per entry), plant a
+    /// file `planted` in it, print `S2-PLANTED`, list it again, print
+    /// `S2-DONE`. With the variable unset it touches nothing (never `/planted`)
+    /// and prints only `S2-DONE`.
+    fn plant_command() -> Vec<String> {
+        #[cfg(not(windows))]
+        {
+            let list = r#"ls -A "$D" | while IFS= read -r e; do echo "entry=$e"; done"#;
+            vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                format!(
+                    r#"D=${{CLAUDE_CONFIG_DIR:-}}; if [ -n "$D" ]; then {list}; touch "$D/planted"; echo S2-PLANTED; {list}; fi; echo S2-DONE"#
+                ),
+            ]
+        }
+        #[cfg(windows)]
+        {
+            let list =
+                "Get-ChildItem -Force -LiteralPath $d | ForEach-Object { 'entry=' + $_.Name }";
+            powershell(format!(
+                "$d = $env:CLAUDE_CONFIG_DIR; if ($d) {{ {list}; \
+                 New-Item -ItemType File -Path (Join-Path $d 'planted') | Out-Null; \
+                 'S2-PLANTED'; {list} }}; 'S2-DONE'"
+            ))
+        }
+    }
+
+    /// Step 3: list `CLAUDE_CONFIG_DIR` again (`entry=<name>` per entry), then
+    /// print `S3-DONE`.
+    fn list_command() -> Vec<String> {
+        #[cfg(not(windows))]
+        {
+            vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                r#"D=${CLAUDE_CONFIG_DIR:-}; if [ -n "$D" ]; then ls -A "$D" | while IFS= read -r e; do echo "entry=$e"; done; fi; echo S3-DONE"#
+                    .to_string(),
+            ]
+        }
+        #[cfg(windows)]
+        {
+            powershell(
+                "$d = $env:CLAUDE_CONFIG_DIR; if ($d) { Get-ChildItem -Force -LiteralPath $d | \
+                 ForEach-Object { 'entry=' + $_.Name } }; 'S3-DONE'"
+                    .to_string(),
+            )
+        }
+    }
+
+    /// THE POPULATION'S PATH, end to end, entering at `run_step` (which the
+    /// convention test below pins as `run_dispatch`'s only step path): a
+    /// credential the RUNNER process holds never reaches a CI step, whichever
+    /// class it belongs to, and every step gets `CLAUDE_CONFIG_DIR` pointed at
+    /// an empty per-dispatch directory, emptied again before each step. A step
+    /// whose empty directory cannot be made does not run at all.
+    #[tokio::test]
+    async fn a_ci_step_inherits_no_scrubbed_credential_and_gets_an_empty_config_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let dispatch_id = "step-env-e2e";
+        let dispatch_root = super::super::checkout::ci_dispatch_root(root, dispatch_id);
+        let worktree =
+            super::super::checkout::ci_worktree_path(root, dispatch_id, "qontinui/qontinui-runner");
+        std::fs::create_dir_all(&worktree).unwrap();
+        // Step 4's dispatch root is a regular file, so no empty config dir can
+        // be made under it.
+        let file_root = root.join("dispatch-root-is-a-file");
+        std::fs::write(&file_root, "x").unwrap();
+        let dispatch_env = DispatchEnv::build(
+            1,
+            1,
+            &root.join(".ci-target").join("qontinui-runner"),
+            &[],
+            &[],
+        );
+        let cancel = CancellationToken::new();
+        // A coord base nothing listens on: the sink's flusher fails and drops,
+        // and the tail ring still records every line.
+        let sink = ProgressSink::start(
+            "http://127.0.0.1:9".to_string(),
+            dispatch_id.to_string(),
+            cancel.clone(),
+        );
+
+        let env_guard = crate::test_env::env_lock();
+        let restore = crate::test_env::EnvVarRestore::capture(&CANARIES);
+        for name in CANARIES {
+            std::env::set_var(name, "planted-dummy-value");
+        }
+        // Inside the lock: cgroup discovery reads `QONTINUI_CI_CGROUP_ROOT`.
+        let ci_job = CiJob::create(dispatch_id);
+        let steps = [
+            (
+                probe_step("s1", env_probe_command()),
+                dispatch_root.as_path(),
+            ),
+            (probe_step("s2", plant_command()), dispatch_root.as_path()),
+            (probe_step("s3", list_command()), dispatch_root.as_path()),
+            (probe_step("s4", env_probe_command()), file_root.as_path()),
+        ];
+        let mut outcomes = Vec::new();
+        for (step, step_dispatch_root) in &steps {
+            outcomes.push(
+                run_step(
+                    step,
+                    &dispatch_env,
+                    step_dispatch_root,
+                    &worktree,
+                    &ci_job,
+                    &sink,
+                    &cancel,
+                )
+                .await,
+            );
+        }
+        // Restore, then release, BEFORE `finish()`: on a dead-port sink with
+        // no device JWT it takes seconds, and every env-touching test in the
+        // binary would queue behind this lock for them.
+        drop(restore);
+        drop(env_guard);
+
+        let tail = sink.finish().await;
+        let [out1, out2, out3, out4] = ["s1", "s2", "s3", "s4"].map(|s| step_out(&tail, s));
+        assert_eq!(
+            outcomes,
+            [
+                StepOutcome::Success,
+                StepOutcome::Success,
+                StepOutcome::Success,
+                StepOutcome::Failure
+            ],
+            "steps 1-3 must run and step 4 must not: s1 {out1:?}, s2 {out2:?}, s3 {out3:?}, s4 {out4:?}"
+        );
+        // A missing sentinel means that step never ran to its end: UNKNOWN,
+        // never "nothing leaked".
+        assert!(
+            out1.iter().any(|l| l == "done"),
+            "step 1 printed no `done`: {out1:?}"
+        );
+        assert_eq!(
+            out2.last().map(String::as_str),
+            Some("S2-DONE"),
+            "step 2 did not finish: {out2:?}"
+        );
+        assert_eq!(
+            out3.last().map(String::as_str),
+            Some("S3-DONE"),
+            "step 3 did not finish: {out3:?}"
+        );
+
+        let seen: Vec<&str> = out1
+            .iter()
+            .filter_map(|l| l.strip_prefix("seen="))
+            .collect();
+        assert!(
+            seen.contains(&KEEP_CANARY),
+            "the positive control did not reach the step, so the probe proves nothing: {seen:?}"
+        );
+        let leaked: Vec<&str> = seen.into_iter().filter(|n| *n != KEEP_CANARY).collect();
+        assert!(
+            leaked.is_empty(),
+            "a scrubbed name reached a CI step: {leaked:?}"
+        );
+
+        // Whatever this test process's own CLAUDE_CONFIG_DIR is.
+        let pinned = dispatch_root
+            .join(".ci-claude-config")
+            .to_string_lossy()
+            .into_owned();
+        let cfg: Vec<&str> = out1.iter().filter_map(|l| l.strip_prefix("cfg=")).collect();
+        assert_eq!(
+            cfg,
+            [pinned.as_str()],
+            "the step did not get the pinned empty CLAUDE_CONFIG_DIR"
+        );
+
+        assert_eq!(
+            out2,
+            ["S2-PLANTED", "entry=planted", "S2-DONE"],
+            "step 2 must find the dir empty, then see only the file it planted"
+        );
+        assert_eq!(
+            out3,
+            ["S3-DONE"],
+            "step 3 inherited step 2's planted file: the dir was not emptied between steps"
+        );
+
+        assert!(
+            tail.lines()
+                .any(|l| l.starts_with("[ci-node] step s4: ") && l.contains(".ci-claude-config")),
+            "step 4 failed without saying it could not make its empty config dir"
+        );
+        assert!(
+            out4.is_empty(),
+            "step 4 ran although no empty config dir could be made: {out4:?}"
+        );
+    }
+
+    /// The scrub's order, observed on the built command through the production
+    /// fn both spawn paths call: every removal reads `None`, except
+    /// `CLAUDE_CONFIG_DIR`, which `envs` sets AFTER the removals, so the step
+    /// gets the pinned directory rather than nothing.
+    #[test]
+    fn apply_step_env_removes_before_it_sets_so_the_pinned_config_dir_survives() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pinned = tmp
+            .path()
+            .join(".ci-claude-config")
+            .to_string_lossy()
+            .into_owned();
+        let removals = [
+            "ANTHROPIC_API_KEY",
+            "CLAUDE_CONFIG_DIR",
+            "QONTINUI_OPERATOR2_PASSWORD",
+            "DOCS_EVAL_MODEL_CMD",
+        ]
+        .map(OsString::from);
+        let envs = vec![
+            ("CI".to_string(), "true".to_string()),
+            ("CLAUDE_CONFIG_DIR".to_string(), pinned.clone()),
+        ];
+        // Inside the lock: cgroup discovery reads `QONTINUI_CI_CGROUP_ROOT`.
+        let ci_job = {
+            let _env = crate::test_env::env_lock();
+            CiJob::create("apply-step-env-test")
+        };
+        let mut cmd = build_step_command("probe", &[]);
+        apply_step_env(&mut cmd, tmp.path(), &removals, &envs, &ci_job);
+
+        let set: std::collections::HashMap<String, Option<String>> = cmd
+            .as_std()
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        for name in [
+            "ANTHROPIC_API_KEY",
+            "QONTINUI_OPERATOR2_PASSWORD",
+            "DOCS_EVAL_MODEL_CMD",
+        ] {
+            assert_eq!(
+                set.get(name),
+                Some(&None),
+                "{name} must be removed: {set:?}"
+            );
+        }
+        assert_eq!(
+            set.get("CLAUDE_CONFIG_DIR"),
+            Some(&Some(pinned)),
+            "the pinned config dir must be SET after the removals"
+        );
+        assert_eq!(set.get("CI"), Some(&Some("true".to_string())));
+    }
+
+    /// The fn a line of `executor.rs` defines, if it defines one:
+    /// `[pub(crate) ][async ]fn <ident>`. Anything else in front of `fn` (an
+    /// expression, a string, an attribute) is not a definition.
+    fn fn_defined_on(code: &str) -> Option<String> {
+        let mut words = code.split_whitespace().skip_while(|word| {
+            matches!(
+                *word,
+                "pub" | "pub(crate)" | "pub(super)" | "async" | "const" | "unsafe"
+            )
+        });
+        if words.next()? != "fn" {
+            return None;
+        }
+        let ident: String = words
+            .next()?
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        (!ident.is_empty()).then_some(ident)
+    }
+
+    /// The enclosing fn of every CALL of `name` in `src`, in order. A call is
+    /// `name(` not preceded by an identifier character or by `fn`; whole-line
+    /// comments (docs included) are skipped. The enclosing fn is the nearest
+    /// `fn` defined above the call, which holds in this file: it defines no fn
+    /// inside another.
+    fn calls_of(src: &str, name: &str) -> Vec<String> {
+        let needle = format!("{name}(");
+        let mut current = String::new();
+        let mut out = Vec::new();
+        for line in src.lines() {
+            let code = line.trim_start();
+            if code.starts_with("//") {
+                continue;
+            }
+            if let Some(defined) = fn_defined_on(code) {
+                current = defined;
+            }
+            let mut from = 0;
+            while let Some(at) = code
+                .get(from..)
+                .and_then(|rest| rest.find(&needle))
+                .map(|i| from + i)
+            {
+                let before = code.get(..at).unwrap_or("");
+                let after_ident = before
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c.is_alphanumeric() || c == '_');
+                if !after_ident && !before.trim_end().ends_with("fn") {
+                    out.push(current.clone());
+                }
+                from = at + needle.len();
+            }
+        }
+        out
+    }
+
+    /// THE STEP PATH IS ONE PATH. The end-to-end test enters at `run_step`;
+    /// this pins that `run_dispatch` reaches a step only through it, that
+    /// `run_step` spawns only through `spawn_step_child`, and that both of
+    /// `spawn_step_child`'s commands get the scrub through `apply_step_env`.
+    /// A new caller, a wrapper or a second spawn path turns it red. Scans this
+    /// file only: `env_agent/apply_versions.rs` has an unrelated `run_step`.
+    #[test]
+    fn the_step_path_is_run_dispatch_then_run_step_then_spawn_step_child() {
+        let (production, _) = include_str!("executor.rs")
+            .split_once("mod tests {")
+            .expect("executor.rs has a `mod tests {`");
+        assert_eq!(
+            calls_of(production, "run_step"),
+            ["run_dispatch"],
+            "run_step must be called exactly once, by run_dispatch"
+        );
+        assert_eq!(
+            calls_of(production, "spawn_step_child"),
+            ["run_step"],
+            "spawn_step_child must be called exactly once, by run_step"
+        );
+        assert_eq!(
+            calls_of(production, "apply_step_env"),
+            ["spawn_step_child", "spawn_step_child"],
+            "apply_step_env must be called exactly twice, both by spawn_step_child"
+        );
     }
 }
