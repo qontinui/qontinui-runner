@@ -319,6 +319,17 @@ impl TerminalManager {
         )
     }
 
+    /// The process root of terminal `terminal_id` while its pane is alive and
+    /// local (a remote pane has no local process to probe). `None` otherwise.
+    pub fn live_pane_root(&self, terminal_id: &str) -> Option<u32> {
+        let session = self.get(terminal_id)?;
+        if session.is_alive() {
+            session.child_pid()
+        } else {
+            None
+        }
+    }
+
     /// Record the pane behind a remote tab (see `remote_panes`).
     pub fn set_remote_pane(&self, id: &str, pane: Arc<super::remote_pane_io::RemotePaneIo>) {
         if let Ok(mut map) = self.remote_panes.lock() {

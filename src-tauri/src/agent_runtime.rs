@@ -349,6 +349,33 @@ pub struct GateContinuationPayload {
     /// and never fails the frame.
     #[serde(default, deserialize_with = "deserialize_lenient_allocation")]
     pub allocation: Option<ContinuationAllocation>,
+    /// The Claude Code session that last held the claim behind a
+    /// `claim_terminal` gate, read by coord from the newest held
+    /// `coord.claims_audit` row inside the gate's bound. Coord omits it for any
+    /// other gate, and when it does not know the holder. Read with
+    /// [`Self::holder_device_id`] through [`Self::holder_ref`], and only ever to
+    /// hold the spawn ([`ContinuationGuard::HolderSessionLive`]).
+    ///
+    /// Lenient like `brief`: a value this build cannot read is `None` and never
+    /// fails the frame. Losing the holder costs a duplicate; losing the frame
+    /// costs the resume the net exists to deliver.
+    #[serde(default, deserialize_with = "deserialize_lenient_opt_string")]
+    pub holder_session_id: Option<String>,
+    /// The device that holder ran on, as a uuid string. See
+    /// [`Self::holder_session_id`].
+    #[serde(default, deserialize_with = "deserialize_lenient_opt_string")]
+    pub holder_device_id: Option<String>,
+}
+
+/// The claim holder a `claim_terminal` continuation names: the session whose
+/// liveness holds the spawn, and the device that session ran on. Both halves or
+/// nothing ([`GateContinuationPayload::holder_ref`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HolderRef {
+    /// Verbatim from the frame: the stamp echoes it, and coord compares the
+    /// stamp's id with the holder it recorded on this dispatch.
+    session_id: String,
+    device_id: uuid::Uuid,
 }
 
 /// The typed half of coord's re-delivery annotation. See
@@ -415,6 +442,40 @@ impl GateContinuationPayload {
     fn retry_attempt(&self) -> u32 {
         self.retry.as_ref().map_or(0, |r| r.attempt)
     }
+
+    /// The holder this frame names, or `None` when it names no usable one: a key
+    /// absent or empty, or a device id that is not a uuid. `None` is UNKNOWN,
+    /// and an unknown holder dispatches as it always has.
+    fn holder_ref(&self) -> Option<HolderRef> {
+        let session_id = self.holder_session_id.as_deref()?;
+        if session_id.is_empty() {
+            return None;
+        }
+        let device_id = self.holder_device_id.as_deref()?;
+        Some(HolderRef {
+            session_id: session_id.to_string(),
+            device_id: uuid::Uuid::parse_str(device_id).ok()?,
+        })
+    }
+}
+
+/// A string-valued frame key that a wrong type degrades to `None` instead of
+/// failing the whole continuation.
+fn deserialize_lenient_opt_string<'de, D>(d: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match serde_json::Value::deserialize(d)? {
+        serde_json::Value::String(text) => Some(text),
+        serde_json::Value::Null => None,
+        other => {
+            tracing::warn!(
+                "gate continuation: a holder key is not a string ({other}) — treating the \
+                 holder as unknown"
+            );
+            None
+        }
+    })
 }
 
 /// The part of coord's dispatch-time continuation `allocation` this runner
@@ -3703,6 +3764,12 @@ enum ContinuationGuard {
     /// (a dispatch still between the guard and its spawn, or a session
     /// mid-account-migration; see [`AnchorHolder::Reserved`]).
     DuplicateAnchor(AnchorHolder),
+    /// The session that held this `claim_terminal` gate's claim is still running
+    /// on this device, so the net has nothing to recover yet: hold the spawn.
+    /// The row stays pending, so the net still fires when that session dies.
+    /// Carries the holder's session id, the `<id>` of
+    /// [`holder_session_live_stamp_reason`].
+    HolderSessionLive(String),
     /// The machine is short of a measured resource: the spawn seam's own
     /// composed verdict ([`crate::resource_guard::probe_for_spawn`] — the free
     /// memory lane and the thread lane, heavier wins) returned something other
@@ -3722,14 +3789,28 @@ enum ContinuationGuard {
     },
 }
 
-/// Pre-spawn guard: prune dead sessions, then enforce P3 (anchor_key dedup) and
-/// machine load. Pure over (`anchor_key`, `is_live`, the injected load verdict)
-/// so it is unit-testable without a live `TerminalManager` and without a live
-/// reading.
+/// Pre-spawn guard: prune dead sessions, then enforce P3 (anchor_key dedup), the
+/// claim holder's liveness and machine load. Pure over (`anchor_key`, `holder`,
+/// `is_live`, `holder_is_live`, the injected load verdict) so it is unit-testable
+/// without a live `TerminalManager` and without a live reading.
 ///
 /// Order matters:
 ///
-/// 1. **Dedup first.** A duplicate of an already-running anchor is reported as a
+/// 1. **The claim holder first** (plan
+///    `2026-10-27-the-claim-heartbeat-cap-clears-the-nets-of-a-live-session` D4).
+///    A claim also lapses under a live session (its heartbeat loop was killed, a
+///    provider pause outlived the TTL), and spawning then would start a second
+///    session on work the first is still doing. Live is a POSITIVE signal only;
+///    see [`holder_session_liveness`], whose answer arrives through
+///    `holder_is_live` (read before this guard, as an async probe). Any other answer is UNKNOWN and dispatches,
+///    because a missed resume costs more than a duplicate, which `/implement-plan`
+///    Step 0.45 stops on the owner's IN PROGRESS marker. Ahead of EVERY
+///    other verdict, dedup included: coord keys its hold on the gate's latest
+///    deferred reason, so any other stamp posted while the holder lives would end
+///    the hold and free coord to re-route the net to another device. The
+///    dispatch seam's authorization refusal, the one stamp that precedes this
+///    guard, defers to the holder the same way ([`held_or`]).
+/// 2. **Dedup next.** A duplicate of an already-running anchor is reported as a
 ///    dedup (the honest reason) rather than "loaded" — and it is also the one
 ///    verdict that is true regardless of machine state: spawning it would be
 ///    wrong on an idle box too.
@@ -3744,7 +3825,7 @@ enum ContinuationGuard {
 ///    `CreateToolhelp32Snapshot` per row (plus a `settings.json` stat/parse and
 ///    a `GlobalMemoryStatusEx`), landing at the exact instant the machine is
 ///    starved. Taken lazily, a deduped row pays nothing.
-/// 2. **Machine load next** — the heavier of the memory and thread lanes, the
+/// 3. **Machine load last** — the heavier of the memory and thread lanes, the
 ///    same composed verdict the PTY seam enforces. The pre-check used to read
 ///    the thread lane only, so a CRITICAL memory reading was first seen AFTER
 ///    coord's consume claim, at the PTY seam, where it is a terminal
@@ -3831,13 +3912,29 @@ enum ContinuationGuard {
 /// different trip points, chosen by the caller that bears the cost.
 fn evaluate_continuation_guard(
     anchor_key: Option<&str>,
+    holder: Option<&HolderRef>,
     is_live: &dyn Fn(&str) -> bool,
+    holder_is_live: &dyn Fn(&HolderRef) -> bool,
     load_reading: &dyn Fn() -> crate::resource_guard::AdmissionReading,
 ) -> (ContinuationGuard, AnchorReservation) {
     warn_if_retired_cap_env_set();
     // Prune runs `is_live` OUTSIDE the registry lock (see its doc); the P3
     // scan below then runs under a freshly-acquired lock.
     prune_dead_continuations(is_live);
+    // The hold outranks EVERY other verdict, the anchor dedup included. Coord
+    // keys its hold on the gate's latest deferred reason, so any other stamp
+    // posted while the holder lives would end the hold, and coord could then
+    // re-route the net to another device beside the live holder. Decided before
+    // any permit is taken, so a held row reserves no anchor and charges no
+    // spawn, and the later genuine dispatch finds both free.
+    if let Some(holder) = holder {
+        if holder_is_live(holder) {
+            return (
+                ContinuationGuard::HolderSessionLive(holder.session_id.clone()),
+                AnchorReservation::none(),
+            );
+        }
+    }
     // The permit this evaluation takes, if it takes one, RETURNED OUT of the
     // critical section that mints it — never assigned over a placeholder
     // declared above the lock.
@@ -4052,13 +4149,237 @@ fn admit_launch(
 /// [`crate::health_monitor::THREAD_READING_TTL`].
 fn evaluate_continuation_guard_live(
     anchor_key: Option<&str>,
+    holder: Option<&HolderRef>,
     is_live: &dyn Fn(&str) -> bool,
+    holder_is_live: &dyn Fn(&HolderRef) -> bool,
 ) -> (ContinuationGuard, AnchorReservation) {
     evaluate_continuation_guard(
         anchor_key,
+        holder,
         is_live,
+        holder_is_live,
         &crate::resource_guard::AdmissionReading::live,
     )
+}
+
+/// The holder this dispatch may be held on. Only a gate row: it alone has both
+/// the deferred stamp coord reads and a re-delivery that fires the net later. A
+/// hold on [`ConsumeTarget::None`] would be a silent drop, since nothing
+/// re-delivers that path.
+fn holder_for_dispatch(
+    payload: &GateContinuationPayload,
+    consume_target: ConsumeTarget,
+) -> Option<HolderRef> {
+    match consume_target {
+        ConsumeTarget::Gate(..) => payload.holder_ref(),
+        ConsumeTarget::Dispatch(_) | ConsumeTarget::None => None,
+    }
+}
+
+/// The bound on the one process-table read a holder check takes. Above the
+/// Windows snapshot's own `WMI_SNAPSHOT_TIMEOUT` (8 s) so that bound fires
+/// first; a read that outlives this one counts as not live.
+const HOLDER_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// The holder-liveness rule: live ONLY when the holder is on `local_device`, the
+/// holder is the session CURRENTLY running in a live pane here, AND a `claude`
+/// process runs inside that pane. Every other answer is UNKNOWN, and UNKNOWN
+/// dispatches:
+///
+/// - a holder on another device cannot be seen from here;
+/// - a holder that is not the current session of any live pane here may be
+///   anywhere. The pane's pin is NOT the test: it is fixed at spawn, so after a
+///   `/clear`, a `claude --resume X` or a fresh `claude` typed into the pane's
+///   shell, a `claude` still runs under a pane pinned to the old holder while
+///   the session in it is another one. "Current" is the lifecycle store's ranking
+///   of the provider SessionStart hooks on that terminal
+///   ([`crate::session::session_lifecycle_store::SessionLifecycleStore::terminal_running`]),
+///   so a session that adopted the pane by `/clear` reads live and the one it
+///   replaced does not;
+/// - a pane whose `claude` has exited is a shell, not the holder;
+/// - a `claude` in the pane that started AFTER the holder's latest SessionStart
+///   hook (beyond [`CLAUDE_START_SKEW_SECS`]) is a successor that fired no hook
+///   of its own, not the holder. A holder with no recorded SessionStart time has
+///   nothing to compare against, so it reads as not live and the net
+///   dispatches; so does a `claude` whose start time the table does not carry;
+/// - a probe that errors or outlives [`HOLDER_PROBE_TIMEOUT`].
+///
+/// Cost: the two cheap checks run first, so the process-table read happens only
+/// for a holder that is the current session of a live pane here, and every row
+/// of one poll shares one snapshot ([`shared_process_snapshot`]).
+/// `holder_pane_roots` and `claude_under_any` are injected, so the rule is
+/// testable without a terminal manager, a store or a process table.
+///
+/// Pid reuse of the pane root is not checked, deliberately: while the manager
+/// reads the pane alive, a local PTY root is our own unreaped child, so its pid
+/// cannot be recycled; for a PTY-holder pane the window is the gap between the
+/// holder reaping the child and its exit frame reaching us, and a recycled pid
+/// would further need a `claude` under it to read live.
+async fn holder_session_liveness<P, PF>(
+    holder: &HolderRef,
+    local_device: uuid::Uuid,
+    holder_pane_roots: impl FnOnce(&str) -> Vec<HolderPane>,
+    claude_under_any: P,
+) -> bool
+where
+    P: FnOnce(Vec<HolderPane>) -> PF,
+    PF: std::future::Future<Output = Result<bool, String>>,
+{
+    if holder.device_id != local_device {
+        return false;
+    }
+    let roots = holder_pane_roots(&holder.session_id);
+    if roots.is_empty() {
+        return false;
+    }
+    match tokio::time::timeout(HOLDER_PROBE_TIMEOUT, claude_under_any(roots)).await {
+        Ok(Ok(live)) => live,
+        Ok(Err(reason)) => {
+            warn!(
+                "agent_runtime: claim holder {} could not be probed ({reason}) — treating it \
+                 as not live, so the continuation dispatches",
+                holder.session_id
+            );
+            false
+        }
+        Err(_) => {
+            warn!(
+                "agent_runtime: claim holder {} probe outlived {}s — treating it as not \
+                 live, so the continuation dispatches",
+                holder.session_id,
+                HOLDER_PROBE_TIMEOUT.as_secs()
+            );
+            false
+        }
+    }
+}
+
+/// Production `claude_under_any`: ONE snapshot of the process table, read
+/// through [`claude_under_any_root`].
+async fn claude_under_any_pane(panes: Vec<HolderPane>) -> Result<bool, String> {
+    let snapshot = shared_process_snapshot().await;
+    claude_under_any_root(&panes, &snapshot)
+}
+
+/// A pane the holder currently runs in: the pane's process root, and when the
+/// holder's latest provider SessionStart hook fired there (unix millis,
+/// `TerminalSessionRecord::last_session_start_at`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HolderPane {
+    root: u32,
+    session_started_at_ms: i64,
+}
+
+/// How much later than the holder's SessionStart hook a `claude` may have
+/// started and still count as the holder. The process starts before its hook
+/// fires, so the margin only absorbs the table's whole-second start times and
+/// clock rounding; a successor started by hand comes seconds or minutes later.
+const CLAUDE_START_SKEW_SECS: i64 = 5;
+
+/// The holder's pane, from what the store and the terminal manager answered:
+/// `None` unless the holder is the current session of a terminal, that pane is
+/// alive and local, AND the holder has a recorded SessionStart time. Without
+/// that time no `claude` could be told apart from a successor, so the safe
+/// answer is no pane, and the net dispatches.
+fn holder_pane(
+    running_on: Option<String>,
+    session_started_at_ms: Option<i64>,
+    live_root: impl FnOnce(&str) -> Option<u32>,
+) -> Option<HolderPane> {
+    let session_started_at_ms = session_started_at_ms?;
+    let root = live_root(&running_on?)?;
+    Some(HolderPane {
+        root,
+        session_started_at_ms,
+    })
+}
+
+/// How long one holder-probe snapshot of the process table is reused. One poll
+/// spawns every held row's task at once, so they all land inside this window
+/// and share a single read instead of taking one each.
+const HOLDER_SNAPSHOT_TTL: Duration = Duration::from_secs(10);
+
+/// A memoized value, when it was taken, and whether `keep` accepted it (a
+/// rejected value is held only for the short negative window).
+type Memo<T> = tokio::sync::Mutex<Option<(std::time::Instant, std::sync::Arc<T>, bool)>>;
+
+/// How long an UNREADABLE snapshot is reused before the next try, so a queue of
+/// held rows does not launch one failing table read (a PowerShell CIM call on
+/// Windows) after another. Each still reads as not live and dispatches.
+const HOLDER_SNAPSHOT_NEGATIVE_TTL: Duration = Duration::from_secs(2);
+
+/// The process-table snapshot holder probes read, shared for
+/// [`HOLDER_SNAPSHOT_TTL`] (see [`memoized`]).
+async fn shared_process_snapshot(
+) -> std::sync::Arc<crate::process_capture::process_tree::ProcessSnapshot> {
+    static SLOT: std::sync::OnceLock<Memo<crate::process_capture::process_tree::ProcessSnapshot>> =
+        std::sync::OnceLock::new();
+    memoized(
+        SLOT.get_or_init(|| tokio::sync::Mutex::new(None)),
+        HOLDER_SNAPSHOT_TTL,
+        HOLDER_SNAPSHOT_NEGATIVE_TTL,
+        crate::process_capture::process_tree::snapshot_process_table_public,
+        |snapshot| !snapshot.parent_map.is_empty(),
+    )
+    .await
+}
+
+/// `fetch`'s value, reused from `slot` while younger than `ttl`. Concurrent
+/// callers queue on the slot's lock, so a burst pays for ONE fetch. A value
+/// `keep` rejects (an unreadable table) is reused only for `negative_ttl`, so a
+/// queue of callers behind a failing fetch makes one attempt, not one each, and
+/// the next caller after that window tries again.
+async fn memoized<T, F, Fut>(
+    slot: &Memo<T>,
+    ttl: Duration,
+    negative_ttl: Duration,
+    fetch: F,
+    keep: impl FnOnce(&T) -> bool,
+) -> std::sync::Arc<T>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    let mut held = slot.lock().await;
+    if let Some((at, value, kept)) = held.as_ref() {
+        let window = if *kept { ttl } else { negative_ttl };
+        if at.elapsed() < window {
+            return value.clone();
+        }
+    }
+    let value = std::sync::Arc::new(fetch().await);
+    let kept = keep(&value);
+    *held = Some((std::time::Instant::now(), value.clone(), kept));
+    value
+}
+
+/// Does any pane root's subtree in `snapshot` hold a countable `claude` (the
+/// shim excluded, [`crate::terminal::graceful_exit::probe_from_snapshot`])? An
+/// unreadable table is an `Err`, which the holder rule reads as not live.
+fn claude_under_any_root(
+    panes: &[HolderPane],
+    snapshot: &crate::process_capture::process_tree::ProcessSnapshot,
+) -> Result<bool, String> {
+    use crate::terminal::graceful_exit::{probe_from_snapshot, ClaudeProbe};
+    let mut unreadable = None;
+    for holder in panes {
+        let latest = holder.session_started_at_ms.div_euclid(1000) + CLAUDE_START_SKEW_SECS;
+        match probe_from_snapshot(holder.root, snapshot, &[]) {
+            ClaudeProbe::Readable(pane) => {
+                // A start time of 0 is unknown: it cannot be told from a
+                // successor, so it does not count.
+                if pane
+                    .subtree_claude
+                    .iter()
+                    .any(|c| c.started_at > 0 && c.started_at <= latest)
+                {
+                    return Ok(true);
+                }
+            }
+            ClaudeProbe::Unreadable(reason) => unreadable = Some(reason),
+        }
+    }
+    unreadable.map_or(Ok(false), Err)
 }
 
 /// The `/health` `spawnAdmission` block: what unattended admission would decide
@@ -5003,17 +5324,30 @@ const CONTINUATION_BACKSTOP_POLL_SECS_DEFAULT: u64 = 300;
 /// turn the safety net into a coord hammer.
 const CONTINUATION_BACKSTOP_POLL_SECS_FLOOR: u64 = 30;
 
+/// Ceiling for the backstop-poll cadence. A held continuation is restamped only
+/// when the poll re-delivers it, at most once per [`HOLD_RESTAMP_INTERVAL`], so
+/// the gap between its stamps is under that interval plus one poll, plus one
+/// more poll when a POST is lost and retried; coord honours a
+/// `holder_session_live` stamp for 7800 s. 1800 s keeps the worst gap at
+/// 5400 s, with room for a late tick.
+const CONTINUATION_BACKSTOP_POLL_SECS_CEILING: u64 = 1800;
+
 /// Env var overriding the backstop-poll cadence (seconds). Default
-/// [`CONTINUATION_BACKSTOP_POLL_SECS_DEFAULT`], floored at
-/// [`CONTINUATION_BACKSTOP_POLL_SECS_FLOOR`].
+/// [`CONTINUATION_BACKSTOP_POLL_SECS_DEFAULT`], clamped to
+/// [`CONTINUATION_BACKSTOP_POLL_SECS_FLOOR`] ..= [`CONTINUATION_BACKSTOP_POLL_SECS_CEILING`].
 const CONTINUATION_BACKSTOP_POLL_SECS_ENV: &str = "RUNNER_CONTINUATION_BACKSTOP_POLL_SECS";
 
 /// Resolve the backstop-poll cadence from a raw env value. Pure over the input
 /// so the default / floor / garbage-fallback policy is unit-testable without
-/// env mutation: unset or non-numeric → default; numeric → floored.
+/// env mutation: unset or non-numeric → default; numeric → clamped.
 fn resolve_backstop_poll_secs(raw: Option<&str>) -> u64 {
     raw.and_then(|v| v.trim().parse::<u64>().ok())
-        .map(|v| v.max(CONTINUATION_BACKSTOP_POLL_SECS_FLOOR))
+        .map(|v| {
+            v.clamp(
+                CONTINUATION_BACKSTOP_POLL_SECS_FLOOR,
+                CONTINUATION_BACKSTOP_POLL_SECS_CEILING,
+            )
+        })
         .unwrap_or(CONTINUATION_BACKSTOP_POLL_SECS_DEFAULT)
 }
 
@@ -5096,6 +5430,52 @@ fn live_terminal_predicate() -> impl Fn(&str) -> bool {
             .map(|sess| sess.is_alive())
             .unwrap_or(false)
     }
+}
+
+/// The process root of the live pane in this runner whose CURRENT session is
+/// the given Claude session, if there is one: the lifecycle store names the
+/// terminal ([`crate::session::session_lifecycle_store::SessionLifecycleStore::terminal_running`]),
+/// the terminal manager says whether that pane is alive and local. With no
+/// runtime there is neither, and the list is empty, which the holder rule reads
+/// as UNKNOWN. Same resolution as [`live_terminal_predicate`].
+fn holder_pane_roots() -> impl FnOnce(&str) -> Vec<HolderPane> {
+    use crate::session::session_lifecycle_store::SessionLifecycleStore;
+    use std::sync::Arc;
+    let app = crate::tauri_app_handle::current();
+    let manager: Option<Arc<crate::terminal::TerminalManager>> = app.as_ref().and_then(|app| {
+        tauri::Manager::try_state::<Arc<crate::terminal::TerminalManager>>(app)
+            .map(|s| s.inner().clone())
+    });
+    let store: Option<Arc<SessionLifecycleStore>> = app.as_ref().and_then(|app| {
+        tauri::Manager::try_state::<Arc<SessionLifecycleStore>>(app).map(|s| s.inner().clone())
+    });
+    move |claude_session_id: &str| {
+        let (Some(manager), Some(store)) = (manager, store) else {
+            return Vec::new();
+        };
+        holder_panes_from(&store, claude_session_id, |terminal_id| {
+            manager.live_pane_root(terminal_id)
+        })
+    }
+}
+
+/// [`holder_pane`] composed over a real lifecycle store: the terminal the
+/// session currently runs in, and its latest SessionStart time. `live_root` is
+/// the terminal manager's half, injected so the composition is testable.
+fn holder_panes_from(
+    store: &crate::session::session_lifecycle_store::SessionLifecycleStore,
+    claude_session_id: &str,
+    live_root: impl FnOnce(&str) -> Option<u32>,
+) -> Vec<HolderPane> {
+    holder_pane(
+        store.terminal_running(claude_session_id),
+        store
+            .get(claude_session_id)
+            .and_then(|r| r.last_session_start_at),
+        live_root,
+    )
+    .into_iter()
+    .collect()
 }
 
 /// Tauri event the frontend listens for to surface a continuation terminal:
@@ -5277,15 +5657,33 @@ async fn dispatch_gate_continuation(
         // row stays pending and re-listable (no consume claim is taken), but
         // without this stamp coord sees a pending row with a null reason — the
         // shape that stranded 51 continuations for two days.
+        //
+        // A live claim holder outranks the refusal: coord keys its hold on the
+        // latest stamp, so a refusal stamp would end the hold (see `held_or`).
         if let Some(gate_id) = payload.gate_id {
-            if should_post_deferred_stamp(gate_id, std::time::Instant::now()) {
-                post_continuation_deferred(
-                    gate_id,
-                    device_id,
-                    authorization_deferral_stamp_reason(&authz),
-                )
-                .await;
-            }
+            let holder = reportable_gate_id(&payload).and_then(|_| payload.holder_ref());
+            let fallback = authorization_deferral_stamp_reason(&authz);
+            let now = std::time::Instant::now();
+            // The probe only chooses WHICH stamp to post, so it is skipped when
+            // the limiter would refuse both candidates anyway.
+            let held = match &holder {
+                Some(h) if seam_needs_holder_probe(gate_id, &h.session_id, &fallback, now) => {
+                    holder_session_liveness(
+                        h,
+                        device_id,
+                        holder_pane_roots(),
+                        claude_under_any_pane,
+                    )
+                    .await
+                    .then_some(h.session_id.as_str())
+                }
+                _ => None,
+            };
+            let reason = held_or(held, fallback);
+            post_deferred_stamp_limited(gate_id, reason, now, |r| {
+                post_continuation_deferred(gate_id, device_id, r)
+            })
+            .await;
         }
         return DispatchOutcome::Denied;
     }
@@ -6067,33 +6465,164 @@ async fn post_spawn_outcome(
 /// load stall would post ~576 stamps per gate.
 const CONTINUATION_DEFERRED_STAMP_INTERVAL: Duration = Duration::from_secs(3600);
 
-/// Per-gate last-posted times for the deferred stamp (in-process rate limit).
+/// One gate's last posted deferred stamp: when, and under which
+/// [`deferred_stamp_rate_key`].
+type DeferredStampPost = (std::time::Instant, String);
+
+/// Per-gate last posts of the deferred stamp (in-process rate limit).
 fn deferred_stamp_last_post(
-) -> &'static std::sync::Mutex<std::collections::HashMap<uuid::Uuid, std::time::Instant>> {
+) -> &'static std::sync::Mutex<std::collections::HashMap<uuid::Uuid, DeferredStampPost>> {
     static LAST: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<uuid::Uuid, std::time::Instant>>,
+        std::sync::Mutex<std::collections::HashMap<uuid::Uuid, DeferredStampPost>>,
     > = std::sync::OnceLock::new();
     LAST.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-/// Decide-and-record: should a deferred stamp be posted for `gate_id` at
-/// `now`? `true` at most once per [`CONTINUATION_DEFERRED_STAMP_INTERVAL`] per
-/// gate (and records `now` as the last post when it says `true`). Takes `now`
-/// as a parameter so the rate-limit window is unit-testable.
-fn should_post_deferred_stamp(gate_id: uuid::Uuid, now: std::time::Instant) -> bool {
-    let mut map = lock_recover(deferred_stamp_last_post(), "deferred_stamp_last_post");
-    if let Some(last) = map.get(&gate_id) {
-        if now.saturating_duration_since(*last) < CONTINUATION_DEFERRED_STAMP_INTERVAL {
-            return false;
-        }
+/// Is this a hold's stamp? What the rate limit keys a post by is
+/// [`deferred_stamp_rate_key`]: the class (the text before the first colon),
+/// because a load stamp's detail carries live numbers that change every poll,
+/// except that a `holder_session_live` stamp keeps its id, since coord honours
+/// the stamp only for the holder it recorded and a new holder is a new hold.
+fn is_holder_stamp(reason: &str) -> bool {
+    reason.split(':').next() == Some("holder_session_live")
+}
+
+/// See [`should_post_deferred_stamp`].
+fn deferred_stamp_rate_key(reason: &str) -> &str {
+    let class = reason.split(':').next().unwrap_or(reason);
+    if class == "holder_session_live" {
+        reason
+    } else {
+        class
     }
-    // Opportunistic bound: entries older than the window can never suppress
-    // again — drop them once the map is large so it can't grow unboundedly.
-    if map.len() > 1024 {
-        map.retain(|_, t| now.saturating_duration_since(*t) < CONTINUATION_DEFERRED_STAMP_INTERVAL);
+}
+
+/// The shortest gap between two posts for one gate, even when a hold begins.
+/// Bounds a hold that flaps (live, then a probe timeout, then live) to one post
+/// a minute rather than one per evaluation.
+const DEFERRED_STAMP_MIN_GAP: Duration = Duration::from_secs(60);
+
+/// Decide-and-record: should a deferred stamp with `reason` be posted for
+/// `gate_id` at `now`? Records `now` and the reason's key when it says `true`.
+/// Takes `now` as a parameter so the window is unit-testable.
+///
+/// `true` at most once per [`CONTINUATION_DEFERRED_STAMP_INTERVAL`] per gate,
+/// whatever the reason, with ONE exception: a stamp that enters a hold, leaves
+/// one, or passes it to another holder posts at once, given
+/// [`DEFERRED_STAMP_MIN_GAP`] since the last post. Coord reads only the LATEST
+/// stamp: a hold that followed a `commit_pressure` deferral would otherwise sit
+/// unexempted (and page) for up to an hour, and after the holder dies a stale
+/// hold stamp would keep coord exempting a dead holder just as long. Every
+/// other change of reason waits out the window, so a row flipping between load
+/// classes, or between dedup and load, cannot post on every flip.
+///
+/// While a hold persists it is restamped about once per interval, at the first
+/// backstop poll after the window, and the poll is capped at
+/// [`CONTINUATION_BACKSTOP_POLL_SECS_CEILING`], so the gap stays under coord's
+/// freshness window of two restamp intervals.
+/// `the_held_restamp_gap_stays_inside_coords_freshness_window` pins that.
+#[cfg(test)]
+fn should_post_deferred_stamp(gate_id: uuid::Uuid, reason: &str, now: std::time::Instant) -> bool {
+    // Test model of a post that lands: peek, then charge.
+    if !deferred_stamp_would_post(gate_id, reason, now) {
+        return false;
     }
-    map.insert(gate_id, now);
+    record_deferred_stamp(gate_id, reason, now);
     true
+}
+
+/// The limiter's rule over the gate's last post (see
+/// [`should_post_deferred_stamp`]). Pure: decides, records nothing.
+fn deferred_stamp_allowed(
+    last: Option<&DeferredStampPost>,
+    reason: &str,
+    now: std::time::Instant,
+) -> bool {
+    let Some((at, last_key)) = last else {
+        return true;
+    };
+    let since = now.saturating_duration_since(*at);
+    let hold_changes = (is_holder_stamp(reason) || is_holder_stamp(last_key))
+        && last_key != deferred_stamp_rate_key(reason);
+    let window = if is_holder_stamp(reason) {
+        HOLD_RESTAMP_INTERVAL
+    } else {
+        CONTINUATION_DEFERRED_STAMP_INTERVAL
+    };
+    since >= window || (hold_changes && since >= DEFERRED_STAMP_MIN_GAP)
+}
+
+/// How often a persisting hold is restamped. Shorter than
+/// [`CONTINUATION_DEFERRED_STAMP_INTERVAL`] because coord honours a
+/// `holder_session_live` stamp only while it is fresh (`COORD_HOLD_STAMP_FRESHNESS`
+/// in the tests, 7800 s): with the poll capped at
+/// [`CONTINUATION_BACKSTOP_POLL_SECS_CEILING`] a restamp lands within
+/// 1800 + 1800 s, and one lost POST (retried on the next poll, see
+/// [`post_deferred_stamp_limited`]) adds one more poll, 5400 s in all.
+const HOLD_RESTAMP_INTERVAL: Duration = Duration::from_secs(1800);
+
+/// Charge the limiter for a stamp that coord ACCEPTED: the gate's last post is
+/// now `reason` at `now`. See [`post_deferred_stamp_limited`].
+fn record_deferred_stamp(gate_id: uuid::Uuid, reason: &str, now: std::time::Instant) {
+    let mut map = lock_recover(deferred_stamp_last_post(), "deferred_stamp_last_post");
+    // Opportunistic bound: entries older than the window can never suppress
+    // again, so drop them once the map is large so it cannot grow unboundedly.
+    if map.len() > 1024 {
+        map.retain(|_, (t, _)| {
+            now.saturating_duration_since(*t) < CONTINUATION_DEFERRED_STAMP_INTERVAL
+        });
+    }
+    map.insert(gate_id, (now, deferred_stamp_rate_key(reason).to_string()));
+}
+
+/// Post `reason` for `gate_id` through the limiter, with `post` doing the
+/// network call (true on a 2xx). The limiter is charged only after `post`
+/// reports success: a POST that fails or never goes out leaves the window open,
+/// so the next poll retries it instead of coord seeing the previous reason for
+/// up to a whole window. True when the stamp landed.
+async fn post_deferred_stamp_limited<F, Fut>(
+    gate_id: uuid::Uuid,
+    reason: String,
+    now: std::time::Instant,
+    post: F,
+) -> bool
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    if !deferred_stamp_would_post(gate_id, &reason, now) {
+        return false;
+    }
+    let key = reason.clone();
+    if post(reason).await {
+        record_deferred_stamp(gate_id, &key, now);
+        true
+    } else {
+        false
+    }
+}
+
+/// Would [`should_post_deferred_stamp`] post `reason` for `gate_id` now? A peek
+/// that records nothing.
+fn deferred_stamp_would_post(gate_id: uuid::Uuid, reason: &str, now: std::time::Instant) -> bool {
+    let map = lock_recover(deferred_stamp_last_post(), "deferred_stamp_last_post");
+    deferred_stamp_allowed(map.get(&gate_id), reason, now)
+}
+
+/// Does the dispatch seam's authorization refusal need the holder probe? Only
+/// when one of the two stamps it could post, the hold's or `fallback`, would get
+/// past the limiter; otherwise nothing is posted whatever the probe says.
+fn seam_needs_holder_probe(
+    gate_id: uuid::Uuid,
+    holder_session_id: &str,
+    fallback: &str,
+    now: std::time::Instant,
+) -> bool {
+    deferred_stamp_would_post(
+        gate_id,
+        &holder_session_live_stamp_reason(holder_session_id),
+        now,
+    ) || deferred_stamp_would_post(gate_id, fallback, now)
 }
 
 /// Wire body for `POST /coord/gates/{gate_id}/continuation-deferred`.
@@ -6109,7 +6638,7 @@ struct ContinuationDeferredBody {
 
 /// The `reason` a `duplicate_anchor` deferral stamps.
 ///
-/// These four constructors exist so the stamp strings have exactly one author.
+/// These constructors exist so the stamp strings have exactly one author.
 /// They are wire values: coord groups pending continuations by the `<class>`
 /// prefix, so a reword here is a schema change at the far end, and a test that
 /// merely *mirrored* the `format!` at each arm would pin nothing (the previous
@@ -6125,6 +6654,22 @@ fn duplicate_anchor_stamp_reason(holder: &AnchorHolder) -> String {
         // kind instead so the class parser still finds a non-empty detail.
         AnchorHolder::Reserved => "duplicate_anchor:reserved".to_string(),
     }
+}
+
+/// The `reason` a claim-holder hold stamps: `holder_session_live:<id>`, with the
+/// holder's Claude session id exactly as coord put it on the frame. Coord keys its
+/// stall and deferral-pressure exemptions and its one message to the holder on
+/// `<id>` equalling the holder it recorded, so this is a wire contract.
+fn holder_session_live_stamp_reason(holder_session_id: &str) -> String {
+    format!("holder_session_live:{holder_session_id}")
+}
+
+/// The stamp for a gate row the runner is not spawning: the hold's
+/// [`holder_session_live_stamp_reason`] while its claim holder lives, else
+/// `reason`. Coord keys its hold on the LATEST stamp, so while the holder lives
+/// no other reason may be posted for that gate.
+fn held_or(live_holder_session_id: Option<&str>, reason: String) -> String {
+    live_holder_session_id.map_or(reason, holder_session_live_stamp_reason)
 }
 
 /// The `reason` a thread-pressure deferral stamps: the severity word and the
@@ -6351,6 +6896,7 @@ fn spawn_authorization_stamp_reason(label: &str) -> String {
 /// | reason | stamped by | constructor |
 /// |---|---|---|
 /// | `duplicate_anchor:<terminal_id>` \| `duplicate_anchor:reserved` | a live session already owns the anchor \| a permit holder has reserved it (an in-flight dispatch, or a session mid-account-migration) | [`duplicate_anchor_stamp_reason`] |
+/// | `holder_session_live:<holder_session_id>` | the `claim_terminal` gate's claim holder is still running in a live terminal on this device | [`holder_session_live_stamp_reason`] |
 /// | `thread_pressure:<severity>:<observed>_over_<limit>` | the machine is out of OS threads (`severity` = `warn` \| `critical`) | [`thread_pressure_stamp_reason`] |
 /// | `commit_pressure:<severity>:<observed>_under_<limit>` | the machine is short of free memory (bytes of free commit; `MemAvailable` off Windows) | [`commit_pressure_stamp_reason`] |
 /// | `device_drain:<class>` | coord holds this device drained | [`drain_stamp_reason`] |
@@ -6370,16 +6916,23 @@ fn spawn_authorization_stamp_reason(label: &str) -> String {
 /// rows that were merely deferred. The stamp leaves the gate's continuation
 /// lifecycle untouched (still pending, still re-deliverable) — it only gives
 /// coord an honest, queryable "a runner saw this and deferred it" signal.
-/// Rate-limited per gate via [`should_post_deferred_stamp`] (once per hour).
+/// Rate-limited per gate via [`should_post_deferred_stamp`] (once per hour while
+/// the reason holds; at once when it changes). Returns `true` only on a 2xx, so
+/// [`post_deferred_stamp_limited`] charges the limiter only for a stamp that
+/// landed.
 /// **Best-effort, but loud on loss**: a non-2xx or transport error is one
 /// `warn!` and we move on. A lost stamp is not cosmetic — coord's deferral
 /// escalation reads these stamps, so a silently failing post makes a stuck row
 /// look like one that was deferred once and is quietly waiting (plan
 /// `2026-10-09-a-re-listed-gate-continuation-is-silently-dropped-and-a-deferral-streak-has-no-clock`
 /// Phase 2). The success path stays `debug!`.
-async fn post_continuation_deferred(gate_id: uuid::Uuid, device_id: uuid::Uuid, reason: String) {
+async fn post_continuation_deferred(
+    gate_id: uuid::Uuid,
+    device_id: uuid::Uuid,
+    reason: String,
+) -> bool {
     let Some(base) = connected_coord_base() else {
-        return;
+        return false;
     };
     let url = format!("{base}/coord/gates/{gate_id}/continuation-deferred");
     let Some(client) = crate::coord_http::coord_client() else {
@@ -6387,7 +6940,7 @@ async fn post_continuation_deferred(gate_id: uuid::Uuid, device_id: uuid::Uuid, 
             "agent_runtime: continuation-deferred: no shared coord client \
              gate_id={gate_id} — the deferral stamp did NOT land (continuing)"
         );
-        return;
+        return false;
     };
     let body = ContinuationDeferredBody { device_id, reason };
     // coord-tenant-scope(device): ContinuationDeferredBody{device_id, reason} (:2529); same unauthenticated device-keyed posture, no tenant column.
@@ -6402,6 +6955,7 @@ async fn post_continuation_deferred(gate_id: uuid::Uuid, device_id: uuid::Uuid, 
                 "agent_runtime: continuation-deferred posted gate_id={gate_id} reason={}",
                 body.reason
             );
+            true
         }
         Ok(resp) => {
             warn!(
@@ -6410,12 +6964,16 @@ async fn post_continuation_deferred(gate_id: uuid::Uuid, device_id: uuid::Uuid, 
                 resp.status(),
                 body.reason
             );
+            false
         }
-        Err(e) => warn!(
-            "agent_runtime: continuation-deferred POST gate_id={gate_id} failed — the \
-             deferral stamp did NOT land (reason={}; continuing): {e:#}",
-            body.reason
-        ),
+        Err(e) => {
+            warn!(
+                "agent_runtime: continuation-deferred POST gate_id={gate_id} failed — the \
+                 deferral stamp did NOT land (reason={}; continuing): {e:#}",
+                body.reason
+            );
+            false
+        }
     }
 }
 
@@ -6532,9 +7090,10 @@ async fn defer_continuation_unclaimed(
     reason: String,
 ) {
     if let ConsumeTarget::Gate(gate_id, _) = consume_target {
-        if should_post_deferred_stamp(gate_id, std::time::Instant::now()) {
-            post_continuation_deferred(gate_id, device_id, reason).await;
-        }
+        post_deferred_stamp_limited(gate_id, reason, std::time::Instant::now(), |r| {
+            post_continuation_deferred(gate_id, device_id, r)
+        })
+        .await;
     }
     release_local_dispatch_claim(consume_target);
 }
@@ -6671,8 +7230,24 @@ async fn run_gate_continuation_inner(
     // worktree failure, a presentation fn's early return — gives the anchor
     // back. The
     // two spawn successes disarm it explicitly inside the presentation fns.
-    let (guard_verdict, reservation) =
-        evaluate_continuation_guard_live(payload.anchor_key.as_deref(), &live_terminal_predicate());
+    //
+    // The holder's liveness is read HERE, before the guard, because it is an
+    // async process-table read and the guard is synchronous. It is the one
+    // input not taken lazily after the dedup arm; the rule's cheap checks keep
+    // the read to a holder on this device that is the current session of a live pane here.
+    let holder = holder_for_dispatch(&payload, consume_target);
+    let holder_live = match &holder {
+        Some(h) => {
+            holder_session_liveness(h, device_id, holder_pane_roots(), claude_under_any_pane).await
+        }
+        None => false,
+    };
+    let (guard_verdict, reservation) = evaluate_continuation_guard_live(
+        payload.anchor_key.as_deref(),
+        holder.as_ref(),
+        &live_terminal_predicate(),
+        &|_| holder_live,
+    );
     match guard_verdict {
         ContinuationGuard::Proceed => {}
         ContinuationGuard::DuplicateAnchor(holder) => {
@@ -6716,6 +7291,24 @@ async fn run_gate_continuation_inner(
                 consume_target,
                 device_id,
                 duplicate_anchor_stamp_reason(&holder),
+            )
+            .await;
+            return Ok(());
+        }
+        ContinuationGuard::HolderSessionLive(holder_session_id) => {
+            info!(
+                "agent_runtime: gate-continuation held by anchor_key={:?} — its claim holder \
+                 session {holder_session_id} is still live in a terminal on this device; the row \
+                 stays pending and re-delivers until that session is gone",
+                payload.anchor_key
+            );
+            // The release inside `defer_continuation_unclaimed` is what lets the
+            // next listing of this gate reach this guard again. Without it the
+            // first hold would strand the net for the process lifetime.
+            defer_continuation_unclaimed(
+                consume_target,
+                device_id,
+                holder_session_live_stamp_reason(&holder_session_id),
             )
             .await;
             return Ok(());
@@ -15179,6 +15772,8 @@ mod tests {
             brief: None,
             retry: None,
             allocation: None,
+            holder_session_id: None,
+            holder_device_id: None,
         };
         let workdir = std::env::temp_dir().to_string_lossy().to_string();
         let res = run_continuation_terminal(
@@ -16648,31 +17243,185 @@ mod tests {
         let gate_a = uuid::Uuid::now_v7();
         let gate_b = uuid::Uuid::now_v7();
         let t0 = std::time::Instant::now();
+        const R: &str = "thread_pressure:warn:300_over_256";
 
         assert!(
-            should_post_deferred_stamp(gate_a, t0),
+            should_post_deferred_stamp(gate_a, R, t0),
             "first stamp for a gate posts"
         );
         assert!(
-            !should_post_deferred_stamp(gate_a, t0),
+            !should_post_deferred_stamp(gate_a, R, t0),
             "an immediate second stamp for the SAME gate is suppressed"
         );
         assert!(
             !should_post_deferred_stamp(
                 gate_a,
+                R,
                 t0 + CONTINUATION_DEFERRED_STAMP_INTERVAL - Duration::from_secs(1)
             ),
             "still suppressed just inside the window"
         );
         assert!(
-            should_post_deferred_stamp(gate_a, t0 + CONTINUATION_DEFERRED_STAMP_INTERVAL),
+            should_post_deferred_stamp(gate_a, R, t0 + CONTINUATION_DEFERRED_STAMP_INTERVAL),
             "posts again once the window has elapsed"
         );
         assert!(
-            should_post_deferred_stamp(gate_b, t0),
+            should_post_deferred_stamp(gate_b, R, t0),
             "a different gate is independent"
         );
     }
+
+    /// Only entering a hold, leaving one, or passing it to another holder skips
+    /// the window, and even then not within the minimum gap. Every other flip
+    /// waits.
+    #[test]
+    fn only_entering_or_leaving_a_hold_bypasses_the_window() {
+        let gate = uuid::Uuid::now_v7();
+        let t0 = std::time::Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let hold = holder_session_live_stamp_reason("s-1");
+        let load = "commit_pressure:warn:1_under_2";
+
+        assert!(should_post_deferred_stamp(gate, load, t0));
+        assert!(
+            !should_post_deferred_stamp(gate, "commit_pressure:warn:3_under_4", at(300)),
+            "new numbers are the same class"
+        );
+        assert!(
+            !should_post_deferred_stamp(gate, "thread_pressure:warn:300_over_256", at(600)),
+            "a flip between load classes waits out the window"
+        );
+        assert!(
+            !should_post_deferred_stamp(gate, "duplicate_anchor:t1", at(900)),
+            "a flip to dedup waits out the window"
+        );
+        assert!(
+            !should_post_deferred_stamp(gate, &hold, at(30)),
+            "entering a hold still respects the minimum gap"
+        );
+        assert!(
+            should_post_deferred_stamp(gate, &hold, at(1200)),
+            "a hold after a load stamp must not wait out the hour"
+        );
+        assert!(
+            !should_post_deferred_stamp(gate, &hold, at(1260)),
+            "the same hold is limited"
+        );
+        assert!(
+            should_post_deferred_stamp(gate, load, at(1320)),
+            "leaving a hold must not wait out the hour either"
+        );
+        assert!(
+            !should_post_deferred_stamp(gate, load, at(1500)),
+            "the load is limited again"
+        );
+        assert!(
+            should_post_deferred_stamp(gate, &holder_session_live_stamp_reason("s-2"), at(1600)),
+            "a new hold enters"
+        );
+        assert!(
+            !should_post_deferred_stamp(gate, "spawn_authorization_deny", at(1650)),
+            "leaving inside the minimum gap waits"
+        );
+        assert!(
+            should_post_deferred_stamp(gate, "spawn_authorization_deny", at(1700)),
+            "an authorization stamp leaving the hold posts"
+        );
+        assert!(
+            should_post_deferred_stamp(gate, "thread_pressure:warn:300_over_256", at(1700 + 3600)),
+            "any reason posts once the window has passed"
+        );
+    }
+
+    /// The seam's holder probe runs only when a stamp could get past the
+    /// limiter: inside the minimum gap nothing can, so it is skipped; after a
+    /// hold the authorization stamp can leave it, so it runs.
+    #[test]
+    fn the_seam_probes_the_holder_only_when_a_stamp_could_post() {
+        let gate = uuid::Uuid::now_v7();
+        let t0 = std::time::Instant::now();
+        let deny = "spawn_authorization_deny";
+        assert!(
+            seam_needs_holder_probe(gate, "s-1", deny, t0),
+            "nothing posted yet"
+        );
+        assert!(should_post_deferred_stamp(
+            gate,
+            &holder_session_live_stamp_reason("s-1"),
+            t0
+        ));
+        assert!(
+            !seam_needs_holder_probe(gate, "s-1", deny, t0 + Duration::from_secs(30)),
+            "inside the minimum gap no stamp can post"
+        );
+        assert!(
+            seam_needs_holder_probe(gate, "s-1", deny, t0 + Duration::from_secs(120)),
+            "the refusal could leave the hold, so the probe must decide"
+        );
+        assert!(
+            seam_needs_holder_probe(gate, "s-1", deny, t0 + Duration::from_secs(120)),
+            "the peek records nothing"
+        );
+    }
+
+    /// While a hold persists, the restamp lands at the first backstop poll after
+    /// the window, so the gap is under one interval plus one poll. That must stay
+    /// inside coord's freshness window of two intervals for EVERY cadence the
+    /// env can configure, which the clamp guarantees.
+    #[tokio::test]
+    async fn the_held_restamp_gap_stays_inside_coords_freshness_window() {
+        assert_eq!(
+            resolve_backstop_poll_secs(Some("999999")),
+            CONTINUATION_BACKSTOP_POLL_SECS_CEILING,
+            "a configured cadence is capped"
+        );
+        for raw in [
+            None,
+            Some("0"),
+            Some("300"),
+            Some("1799"),
+            Some("1800"),
+            Some("999999"),
+        ] {
+            let poll = Duration::from_secs(resolve_backstop_poll_secs(raw));
+            let gate = uuid::Uuid::now_v7();
+            let hold = holder_session_live_stamp_reason("s-held");
+            let t0 = std::time::Instant::now();
+            let mut landed = Vec::new();
+            let mut attempts = 0u32;
+            let mut t = Duration::ZERO;
+            while landed.len() < 4 {
+                // The second attempt that gets past the limiter is lost.
+                let lose = attempts == 1;
+                let post = |_r: String| async move { !lose };
+                let tried = deferred_stamp_would_post(gate, &hold, t0 + t);
+                if post_deferred_stamp_limited(gate, hold.clone(), t0 + t, post).await {
+                    landed.push(t);
+                }
+                if tried {
+                    attempts += 1;
+                }
+                t += poll;
+            }
+            for pair in landed.windows(2) {
+                let gap = pair[1] - pair[0];
+                assert!(
+                    gap <= HOLD_RESTAMP_INTERVAL + 2 * poll,
+                    "poll {poll:?}: restamp gap {gap:?} exceeds the restamp interval plus \
+                     one retried poll"
+                );
+                assert!(
+                    gap + poll < COORD_HOLD_STAMP_FRESHNESS,
+                    "poll {poll:?}: restamp gap {gap:?} plus a late tick would let coord's \
+                     exemption lapse"
+                );
+            }
+        }
+    }
+
+    /// How long coord honours a `holder_session_live` stamp (its exemption
+    /// window, set coord-side).
+    const COORD_HOLD_STAMP_FRESHNESS: Duration = Duration::from_secs(7800);
 
     /// The poll self-report body serializes to the locked wire shape:
     /// `{device_id, listed_n, dispatched_n, skipped_n, skip_reasons:{…}}` with
@@ -17131,6 +17880,23 @@ mod tests {
         crate::resource_guard::SpawnGate::Proceed
     }
 
+    /// [`evaluate_continuation_guard`] for a frame naming no claim holder, which
+    /// is every continuation but a `claim_terminal` one. The holder read panics:
+    /// with no holder it must not be reached.
+    fn guard_anchor_only(
+        anchor_key: Option<&str>,
+        is_live: &dyn Fn(&str) -> bool,
+        load_reading: &dyn Fn() -> crate::resource_guard::AdmissionReading,
+    ) -> (ContinuationGuard, AnchorReservation) {
+        evaluate_continuation_guard(
+            anchor_key,
+            None,
+            is_live,
+            &|_| panic!("no holder, so no holder read"),
+            load_reading,
+        )
+    }
+
     /// Verdict-only wrapper over [`evaluate_continuation_guard`] for the tests
     /// that do not need the permit. Dropping the [`AnchorReservation`] the
     /// instant it is returned is exactly what a dispatch that gives up does, so
@@ -17141,7 +17907,7 @@ mod tests {
         is_live: &dyn Fn(&str) -> bool,
         load_reading: &dyn Fn() -> crate::resource_guard::AdmissionReading,
     ) -> ContinuationGuard {
-        evaluate_continuation_guard(anchor_key, is_live, load_reading).0
+        guard_anchor_only(anchor_key, is_live, load_reading).0
     }
 
     /// The REAL thread verdict for an injected reading, folded through the same
@@ -17336,6 +18102,739 @@ mod tests {
 
     /// Phase 4 of plan
     /// `2026-09-13-one-landed-pr-dispatches-its-follow-up-to-two-sessions-through-two-gate-anchors`:
+    /// A `claim_terminal` frame's holder, on `device`.
+    fn holder_on(device: uuid::Uuid) -> HolderRef {
+        HolderRef {
+            session_id: HOLDER_SESSION.to_string(),
+            device_id: device,
+        }
+    }
+
+    const HOLDER_SESSION: &str = "0190aaaa-1111-7222-8333-444455556666";
+
+    /// One guard pass with the holder read as `live` (the answer
+    /// [`holder_session_liveness`] gave before the guard ran).
+    fn holder_guard(
+        anchor: Option<&str>,
+        holder: Option<&HolderRef>,
+        live: bool,
+    ) -> (ContinuationGuard, AnchorReservation) {
+        let live_all = |_id: &str| true;
+        evaluate_continuation_guard(anchor, holder, &live_all, &|_| live, &calm_reading)
+    }
+
+    fn pane_at(root: u32) -> HolderPane {
+        HolderPane {
+            root,
+            session_started_at_ms: 1_000_000,
+        }
+    }
+
+    /// [`holder_session_liveness`] for `holder` on a runner on `local`, whose
+    /// panes are `(current session, root pid)` and whose process table
+    /// shows a `claude` under the roots in `claude_roots`, or cannot be read.
+    async fn holder_live(
+        holder: &HolderRef,
+        local: uuid::Uuid,
+        panes: &[(&str, u32)],
+        probe: Result<&[u32], &str>,
+    ) -> bool {
+        let probe = probe.map(<[u32]>::to_vec).map_err(str::to_string);
+        holder_session_liveness(
+            holder,
+            local,
+            |id| {
+                panes
+                    .iter()
+                    .filter(|(pin, _)| *pin == id)
+                    .map(|(_, root)| pane_at(*root))
+                    .collect()
+            },
+            move |panes: Vec<HolderPane>| async move {
+                probe.map(|claude_roots| panes.iter().any(|p| claude_roots.contains(&p.root)))
+            },
+        )
+        .await
+    }
+
+    #[test]
+    fn holder_live_on_this_device_holds_with_the_wire_stamp() {
+        let _env_lock = env_lock();
+        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_continuation_registry();
+        let device = uuid::Uuid::now_v7();
+
+        let (verdict, permit) = holder_guard(Some("claim:phase-3"), Some(&holder_on(device)), true);
+        assert_eq!(
+            verdict,
+            ContinuationGuard::HolderSessionLive(HOLDER_SESSION.to_string())
+        );
+        assert!(permit.held.is_none() && !permit.counted);
+        assert_eq!(
+            holder_session_live_stamp_reason(HOLDER_SESSION),
+            "holder_session_live:0190aaaa-1111-7222-8333-444455556666",
+            "the exact wire value coord's exemptions key on"
+        );
+        clear_continuation_registry();
+    }
+
+    /// No holder, or a holder read as not live, dispatches.
+    #[test]
+    fn a_holder_not_read_as_live_dispatches_as_today() {
+        let _env_lock = env_lock();
+        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_continuation_registry();
+        let device = uuid::Uuid::now_v7();
+        assert_eq!(
+            holder_guard(None, Some(&holder_on(device)), false).0,
+            ContinuationGuard::Proceed
+        );
+        assert_eq!(holder_guard(None, None, true).0, ContinuationGuard::Proceed);
+        clear_continuation_registry();
+    }
+
+    /// Live only with a `claude` inside the pane the holder currently runs in.
+    #[tokio::test]
+    async fn a_holders_pane_holds_only_with_a_live_claude_in_it() {
+        let device = uuid::Uuid::now_v7();
+        let holder = holder_on(device);
+        let pane = [(HOLDER_SESSION, 4242u32)];
+        assert!(
+            holder_live(&holder, device, &pane, Ok(&[4242])).await,
+            "claude running in the holder's pane holds"
+        );
+        assert!(
+            !holder_live(&holder, device, &pane, Ok(&[])).await,
+            "a pane with only its shell left must dispatch"
+        );
+        assert!(
+            !holder_live(
+                &holder,
+                device,
+                &pane,
+                Err("the process table is unreadable")
+            )
+            .await,
+            "an unreadable probe must dispatch"
+        );
+        assert!(
+            holder_live(
+                &holder,
+                device,
+                &[(HOLDER_SESSION, 1), (HOLDER_SESSION, 2)],
+                Ok(&[2])
+            )
+            .await,
+            "any one pane carrying the pin is enough"
+        );
+    }
+
+    /// The cheap checks gate the probe: a holder elsewhere, or not current in any
+    /// pane here, is UNKNOWN without the process table ever being read.
+    #[tokio::test]
+    async fn an_unseen_holder_is_unknown_and_never_probed() {
+        let device = uuid::Uuid::now_v7();
+        let never = |_: Vec<HolderPane>| async { panic!("the process table must not be read") };
+        let pane = |id: &str| {
+            if id == HOLDER_SESSION {
+                vec![pane_at(7)]
+            } else {
+                vec![]
+            }
+        };
+        assert!(
+            !holder_session_liveness(&holder_on(uuid::Uuid::now_v7()), device, pane, never).await,
+            "a holder on another device"
+        );
+        assert!(
+            !holder_session_liveness(&holder_on(device), device, |_| Vec::new(), never).await,
+            "no pane here carries the pin"
+        );
+    }
+
+    /// A process table of `(pid, parent, name, start secs)`.
+    fn probe_snapshot(
+        procs: &[(u32, u32, &str, i64)],
+    ) -> crate::process_capture::process_tree::ProcessSnapshot {
+        let mut snap = crate::process_capture::process_tree::ProcessSnapshot::default();
+        for &(pid, parent, name, started) in procs {
+            snap.parent_map.entry(parent).or_default().push(pid);
+            snap.parent_map.entry(pid).or_default();
+            snap.names.insert(pid, name.to_string());
+            snap.creation_times.insert(pid, started);
+        }
+        snap
+    }
+
+    /// The holder's pane at `root`, whose SessionStart hook fired at 1000 s.
+    fn probe_pane(root: u32) -> HolderPane {
+        HolderPane {
+            root,
+            session_started_at_ms: 1_000_000,
+        }
+    }
+
+    /// The production probe over a real snapshot shape: a bare shell, or a
+    /// `claude` elsewhere on the box, is not live; an empty table is unreadable.
+    #[test]
+    fn the_pane_probe_ignores_a_bare_shell() {
+        let shell_only = probe_snapshot(&[
+            (100, 1, "bash", 900),
+            (102, 100, "vim", 950),
+            (200, 1, "claude", 950),
+        ]);
+        assert_eq!(
+            claude_under_any_root(&[probe_pane(100)], &shell_only),
+            Ok(false),
+            "a claude elsewhere on the box is not in this pane"
+        );
+        assert!(claude_under_any_root(
+            &[probe_pane(100)],
+            &crate::process_capture::process_tree::ProcessSnapshot::default()
+        )
+        .is_err());
+    }
+
+    /// A `claude` in the pane counts only if it started no later than the
+    /// holder's SessionStart hook (plus the skew): a later one is a successor
+    /// that fired no hook, and one with no start time cannot be told apart
+    /// from it.
+    #[test]
+    fn the_pane_probe_counts_only_the_holders_own_claude() {
+        let pane = probe_pane;
+        let snapshot = |procs: &[(u32, u32, &str, i64)]| probe_snapshot(procs);
+        let claude_at = |started| snapshot(&[(100, 1, "bash", 900), (101, 100, "claude", started)]);
+        assert_eq!(
+            claude_under_any_root(&[pane(100)], &claude_at(999)),
+            Ok(true)
+        );
+        assert_eq!(
+            claude_under_any_root(&[pane(100)], &claude_at(1000 + CLAUDE_START_SKEW_SECS)),
+            Ok(true),
+            "inside the skew"
+        );
+        assert_eq!(
+            claude_under_any_root(&[pane(100)], &claude_at(1000 + CLAUDE_START_SKEW_SECS + 1)),
+            Ok(false),
+            "a claude started after the holder's hook is a successor"
+        );
+        assert_eq!(
+            claude_under_any_root(&[pane(100)], &claude_at(0)),
+            Ok(false),
+            "an unknown start time does not count"
+        );
+        assert_eq!(
+            claude_under_any_root(&[pane(300), pane(100)], &claude_at(999)),
+            Ok(true)
+        );
+    }
+
+    /// No SessionStart time, no current terminal, or no live local pane: no
+    /// holder pane, so the net dispatches.
+    #[test]
+    fn a_holder_pane_needs_a_session_start_time() {
+        let live = |t: &str| (t == "term-1").then_some(42);
+        assert_eq!(
+            holder_pane(Some("term-1".into()), Some(5_000), live),
+            Some(HolderPane {
+                root: 42,
+                session_started_at_ms: 5_000
+            })
+        );
+        assert_eq!(
+            holder_pane(Some("term-1".into()), None, live),
+            None,
+            "no SessionStart time: the safe side is dispatch"
+        );
+        assert_eq!(holder_pane(None, Some(5_000), live), None);
+        assert_eq!(
+            holder_pane(Some("term-dead".into()), Some(5_000), live),
+            None
+        );
+    }
+
+    /// A probe that never answers is cut off and reads as not live.
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_probe_times_out_as_not_live() {
+        let device = uuid::Uuid::now_v7();
+        let hung = |_: Vec<HolderPane>| std::future::pending::<Result<bool, String>>();
+        assert!(
+            !holder_session_liveness(&holder_on(device), device, |_| vec![pane_at(7)], hung).await
+        );
+    }
+
+    /// The hold outranks the anchor dedup too: a `duplicate_anchor` stamp would
+    /// end coord's hold while the holder lives. And it takes no permit.
+    #[test]
+    fn a_live_holder_outranks_duplicate_anchor() {
+        let _env_lock = env_lock();
+        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_continuation_registry();
+        let device = uuid::Uuid::now_v7();
+        let holder = holder_on(device);
+        let anchor = "claim:ordered";
+        register_continuation_session("term-ordered".to_string(), Some(anchor.into()), None);
+        let live_all = |_id: &str| true;
+
+        let (verdict, permit) = evaluate_continuation_guard(
+            Some(anchor),
+            Some(&holder),
+            &live_all,
+            &|_| true,
+            &calm_reading,
+        );
+        assert_eq!(
+            verdict,
+            ContinuationGuard::HolderSessionLive(HOLDER_SESSION.to_string())
+        );
+        assert!(permit.held.is_none() && !permit.counted);
+        // Once the holder is gone, the dedup applies as before.
+        let (verdict, _none) = evaluate_continuation_guard(
+            Some(anchor),
+            Some(&holder),
+            &live_all,
+            &|_| false,
+            &calm_reading,
+        );
+        assert_eq!(
+            verdict,
+            ContinuationGuard::DuplicateAnchor(AnchorHolder::Live("term-ordered".to_string()))
+        );
+        clear_continuation_registry();
+    }
+
+    /// Holder live AND the load lanes would defer: the hold wins.
+    #[test]
+    fn a_live_holder_outranks_a_load_deferral() {
+        let _env_lock = env_lock();
+        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_continuation_registry();
+        let device = uuid::Uuid::now_v7();
+        let holder = holder_on(device);
+        let live_all = |_id: &str| true;
+        let loaded = || commit_reading(0);
+        assert!(
+            matches!(
+                guard_anchor_only(None, &live_all, &loaded).0,
+                ContinuationGuard::LoadPressure { .. }
+            ),
+            "precondition: this reading defers a row with no holder"
+        );
+        let (verdict, _none) =
+            evaluate_continuation_guard(None, Some(&holder), &live_all, &|_| true, &loaded);
+        assert_eq!(
+            verdict,
+            ContinuationGuard::HolderSessionLive(HOLDER_SESSION.to_string())
+        );
+        clear_continuation_registry();
+    }
+
+    /// While the holder lives, nothing but the hold's own stamp is ever posted
+    /// for the gate: every poll under load and a live dedup still yields the
+    /// hold, the seam's refusal yields it too, and so the reason-change bypass
+    /// has no other reason to let through.
+    #[test]
+    fn no_other_reason_displaces_a_live_holders_stamp() {
+        let _env_lock = env_lock();
+        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_continuation_registry();
+        let device = uuid::Uuid::now_v7();
+        let holder = holder_on(device);
+        let anchor = "claim:displace";
+        register_continuation_session("term-displace".to_string(), Some(anchor.into()), None);
+        let live_all = |_id: &str| true;
+        let loaded = || commit_reading(0);
+        let hold = holder_session_live_stamp_reason(HOLDER_SESSION);
+
+        let gate = uuid::Uuid::now_v7();
+        let t0 = std::time::Instant::now();
+        let mut posted = Vec::new();
+        let mut computed = Vec::new();
+        for tick in 0..30u64 {
+            let (verdict, _permit) = evaluate_continuation_guard(
+                Some(anchor),
+                Some(&holder),
+                &live_all,
+                &|_| true,
+                &loaded,
+            );
+            let reason = match verdict {
+                ContinuationGuard::HolderSessionLive(id) => holder_session_live_stamp_reason(&id),
+                ContinuationGuard::DuplicateAnchor(h) => duplicate_anchor_stamp_reason(&h),
+                ContinuationGuard::LoadPressure {
+                    severity,
+                    observation,
+                } => load_pressure_stamp_reason(severity, &observation),
+                ContinuationGuard::Proceed => panic!("a held row must not proceed"),
+            };
+            // Every third tick the seam's authorization refusal fires instead.
+            let reason = if tick % 3 == 0 {
+                held_or(Some(HOLDER_SESSION), "spawn_authorization_deny".to_string())
+            } else {
+                reason
+            };
+            computed.push(reason.clone());
+            if should_post_deferred_stamp(gate, &reason, t0 + Duration::from_secs(tick * 300)) {
+                posted.push(reason);
+            }
+        }
+        // Every reason the runner would stamp, not only what the limiter let
+        // through: the limiter alone suppresses most non-hold reasons, so a
+        // regression in `held_or` or in the guard's order shows only here.
+        assert!(computed.iter().all(|r| *r == hold), "{computed:?}");
+        assert!(!posted.is_empty());
+        assert!(posted.iter().all(|r| *r == hold), "{posted:?}");
+        assert_eq!(
+            held_or(None, "spawn_authorization_deny".to_string()),
+            "spawn_authorization_deny"
+        );
+        clear_continuation_registry();
+    }
+
+    /// The hold outranks the load lanes, and a held row pays for no reading.
+    #[test]
+    fn a_live_holder_is_decided_before_the_load_reading() {
+        let _env_lock = env_lock();
+        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_continuation_registry();
+        let device = uuid::Uuid::now_v7();
+        let holder = holder_on(device);
+
+        let live_all = |_id: &str| true;
+        let (verdict, _none) =
+            evaluate_continuation_guard(None, Some(&holder), &live_all, &|_| true, &|| {
+                panic!("a held row must not read the machine")
+            });
+        assert_eq!(
+            verdict,
+            ContinuationGuard::HolderSessionLive(HOLDER_SESSION.to_string())
+        );
+        clear_continuation_registry();
+    }
+
+    /// The whole re-delivery: a hold takes nothing that outlives it, so when the
+    /// holder dies the SAME gate, delivered again, claims and dispatches. Driven
+    /// through the real [`defer_continuation_unclaimed`], whose POST the spent
+    /// rate-limit window suppresses. Removing that fn's release, or moving the
+    /// arm after the load charge (which leaks a projected spawn), fails here.
+    #[tokio::test]
+    async fn a_hold_leaks_nothing_and_redelivery_after_holder_death_dispatches() {
+        let _env_lock = env_lock();
+        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_continuation_registry();
+        let device = uuid::Uuid::now_v7();
+        let holder = holder_on(device);
+        let gate = uuid::Uuid::now_v7();
+        let anchor = "claim:redelivered";
+        let target = ConsumeTarget::Gate(gate, 0);
+        assert!(should_post_deferred_stamp(
+            gate,
+            &holder_session_live_stamp_reason(HOLDER_SESSION),
+            std::time::Instant::now()
+        ));
+
+        // First delivery: claimed, then held.
+        assert!(claim_gate_dispatch(gate));
+        let (verdict, permit) = holder_guard(Some(anchor), Some(&holder), true);
+        assert_eq!(
+            verdict,
+            ContinuationGuard::HolderSessionLive(HOLDER_SESSION.to_string())
+        );
+        drop(permit);
+        assert!(!anchor_is_reserved(anchor), "a hold must free the anchor");
+        assert_eq!(reserved_spawns_now(), 0, "a hold must charge no spawn");
+        defer_continuation_unclaimed(
+            target,
+            device,
+            holder_session_live_stamp_reason(HOLDER_SESSION),
+        )
+        .await;
+
+        // Still live on the next listing: the row reaches the guard and holds
+        // again rather than being dropped as a duplicate delivery.
+        assert!(claim_gate_dispatch(gate), "a hold must release the gate id");
+        let (verdict, permit) = holder_guard(Some(anchor), Some(&holder), true);
+        assert!(matches!(verdict, ContinuationGuard::HolderSessionLive(_)));
+        drop(permit);
+        defer_continuation_unclaimed(
+            target,
+            device,
+            holder_session_live_stamp_reason(HOLDER_SESSION),
+        )
+        .await;
+
+        // The holder's terminal is gone: the same gate now dispatches, owning
+        // the anchor and one projected spawn like any other `Proceed`.
+        assert!(claim_gate_dispatch(gate));
+        let (verdict, permit) = holder_guard(Some(anchor), Some(&holder), false);
+        assert_eq!(verdict, ContinuationGuard::Proceed);
+        assert!(anchor_is_reserved(anchor));
+        assert_eq!(reserved_spawns_now(), 1);
+        drop(permit);
+        clear_continuation_registry();
+    }
+
+    /// The run path must defer the hold through the path that releases the gate
+    /// id and posts the stamp. The live terminal read needs a Tauri runtime, so
+    /// no test can drive that arm; this pins its wiring.
+    #[test]
+    fn the_hold_arm_defers_through_the_shared_path() {
+        let source = include_str!("agent_runtime.rs");
+        let (prod, _) = source
+            .split_once("#[cfg(test)]\nmod tests")
+            .expect("the test module marker");
+        let (_, rest) = prod
+            .split_once("ContinuationGuard::HolderSessionLive(holder_session_id) => {")
+            .expect("the run path matches the hold arm");
+        let (arm, _) = rest
+            .split_once("ContinuationGuard::LoadPressure {")
+            .expect("the load arm follows");
+        assert!(arm.contains("defer_continuation_unclaimed("));
+        assert!(arm.contains("holder_session_live_stamp_reason(&holder_session_id)"));
+    }
+
+    #[test]
+    fn no_runtime_means_no_holder_pane() {
+        assert!(holder_pane_roots()(HOLDER_SESSION).is_empty());
+    }
+
+    /// One burst of held rows pays for ONE process-table read; a stale or
+    /// rejected value is fetched again.
+    #[tokio::test]
+    async fn held_rows_in_one_poll_share_one_snapshot() {
+        let slot: Memo<u32> = tokio::sync::Mutex::new(None);
+        let fetches = std::sync::atomic::AtomicU32::new(0);
+        let fetch = || async {
+            fetches.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            7u32
+        };
+        let ttl = Duration::from_secs(60);
+        let neg = Duration::ZERO;
+        let (a, b, c) = tokio::join!(
+            memoized(&slot, ttl, neg, fetch, |_| true),
+            memoized(&slot, ttl, neg, fetch, |_| true),
+            memoized(&slot, ttl, neg, fetch, |_| true),
+        );
+        assert_eq!((*a, *b, *c), (7, 7, 7));
+        assert_eq!(fetches.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        memoized(&slot, Duration::ZERO, neg, fetch, |_| true).await;
+        assert_eq!(
+            fetches.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "stale refetches"
+        );
+
+        let rejected: Memo<u32> = tokio::sync::Mutex::new(None);
+        memoized(&rejected, ttl, neg, fetch, |_| false).await;
+        memoized(&rejected, ttl, neg, fetch, |_| false).await;
+        assert_eq!(
+            fetches.load(std::sync::atomic::Ordering::SeqCst),
+            4,
+            "an unreadable table is not reused past the negative window"
+        );
+    }
+
+    /// Callers queued behind a FAILED read share it for the negative window, so
+    /// N held rows make one attempt, not N back to back.
+    #[tokio::test]
+    async fn a_failed_snapshot_is_shared_for_the_negative_window() {
+        let slot: Memo<u32> = tokio::sync::Mutex::new(None);
+        let fetches = std::sync::atomic::AtomicU32::new(0);
+        let fetch = || async {
+            fetches.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            0u32
+        };
+        let ttl = Duration::from_secs(60);
+        let neg = Duration::from_secs(60);
+        let (a, b) = tokio::join!(
+            memoized(&slot, ttl, neg, fetch, |_| false),
+            memoized(&slot, ttl, neg, fetch, |_| false),
+        );
+        assert_eq!((*a, *b), (0, 0));
+        assert_eq!(
+            fetches.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "two calls inside the window make one attempt"
+        );
+    }
+
+    /// A failed or absent POST leaves the limiter uncharged, so the next poll
+    /// retries the stamp; one that lands charges it.
+    #[tokio::test]
+    async fn only_a_landed_post_charges_the_limiter() {
+        let gate = uuid::Uuid::now_v7();
+        let t0 = std::time::Instant::now();
+        let hold = holder_session_live_stamp_reason("s-post");
+        let attempts = std::sync::atomic::AtomicU32::new(0);
+        let fail = |_r: String| async {
+            attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            false
+        };
+        assert!(!post_deferred_stamp_limited(gate, hold.clone(), t0, fail).await);
+        assert!(
+            deferred_stamp_would_post(gate, &hold, t0 + Duration::from_secs(1)),
+            "a failed POST must not charge the limiter"
+        );
+        let ok = |_r: String| async {
+            attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            true
+        };
+        assert!(post_deferred_stamp_limited(gate, hold.clone(), t0, ok).await);
+        assert!(
+            !deferred_stamp_would_post(gate, &hold, t0 + Duration::from_secs(1)),
+            "a landed POST charges the limiter"
+        );
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let never = |_r: String| async { panic!("a refused stamp must not be posted") };
+        assert!(
+            !post_deferred_stamp_limited(gate, hold, t0 + Duration::from_secs(1), never).await,
+            "the limiter refuses before posting"
+        );
+    }
+
+    /// The seam posts the stamp `held_or` chose, through the limited post, never
+    /// the refusal's own reason directly. No test can drive the seam (it needs an
+    /// authorization refusal and a Tauri runtime), so this pins its wiring.
+    #[test]
+    fn the_seam_posts_the_held_or_reason() {
+        let source = include_str!("agent_runtime.rs");
+        let (prod, _) = source
+            .split_once("#[cfg(test)]\nmod tests")
+            .expect("the test module marker");
+        let (_, seam) = prod
+            .split_once("async fn dispatch_gate_continuation(")
+            .expect("the dispatch seam");
+        let (seam, _) = seam.split_once("\n}\n").expect("the seam body");
+        let (_, after) = seam
+            .split_once("let reason = held_or(held, fallback);")
+            .expect("the seam picks its stamp through held_or");
+        let (call, _) = after.split_once(".await;").expect("the post that follows");
+        assert!(
+            call.contains("post_deferred_stamp_limited(gate_id, reason,"),
+            "the seam must post the held_or reason through the limiter: {call}"
+        );
+        assert!(!seam.contains("post_deferred_stamp_limited(gate_id, fallback"));
+        assert!(!seam.contains("post_continuation_deferred(gate_id, device_id, fallback"));
+    }
+
+    /// The holder's pane through a REAL lifecycle store: the pinned session P
+    /// holds until a `/clear` successor Q fires its SessionStart hook on the
+    /// same terminal, after which only Q resolves, carrying its own start time.
+    #[test]
+    fn holder_panes_resolve_through_a_real_store() {
+        use crate::session::session_lifecycle_store::SessionLifecycleStore;
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        let open_on_term = |id: &str| {
+            crate::commands::terminal::record_pinned_session_open(
+                &store,
+                id.to_string(),
+                "term-real".to_string(),
+                None,
+                "/tmp".to_string(),
+                "t".to_string(),
+                "default".to_string(),
+                0,
+                "claude".to_string(),
+                None,
+            );
+            store.confirm_session(id);
+            store.note_session_start_hook(id);
+        };
+        let live = |t: &str| (t == "term-real").then_some(77u32);
+
+        open_on_term("pin-p");
+        let p = holder_panes_from(&store, "pin-p", live);
+        assert_eq!(p.len(), 1);
+        assert_eq!(p[0].root, 77);
+        assert_eq!(
+            Some(p[0].session_started_at_ms),
+            store.get("pin-p").and_then(|r| r.last_session_start_at)
+        );
+
+        open_on_term("clear-q");
+        store.mark_adopted_from("clear-q", "pin-p");
+        assert!(
+            holder_panes_from(&store, "pin-p", live).is_empty(),
+            "the /clear successor replaced P"
+        );
+        assert_eq!(holder_panes_from(&store, "clear-q", live).len(), 1);
+        assert!(holder_panes_from(&store, "never-seen", live).is_empty());
+        assert!(
+            holder_panes_from(&store, "clear-q", |_| None).is_empty(),
+            "no live local pane"
+        );
+    }
+
+    fn holder_frame(extra: serde_json::Value) -> GateContinuationPayload {
+        let mut frame = serde_json::json!({
+            "target_device_id": uuid::Uuid::now_v7(),
+            "initial_prompt": "run /implement-plan x",
+            "source": GATE_CONTINUATION_SOURCE,
+        });
+        frame
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        serde_json::from_value(frame).expect("the frame parses")
+    }
+
+    #[test]
+    fn the_holder_keys_parse_from_the_frame_and_default_to_absent() {
+        let device = uuid::Uuid::now_v7();
+
+        let bare = holder_frame(serde_json::json!({}));
+        assert_eq!(bare.holder_session_id, None);
+        assert_eq!(bare.holder_device_id, None);
+        assert_eq!(bare.holder_ref(), None);
+
+        let both = holder_frame(serde_json::json!({
+            "holder_session_id": HOLDER_SESSION,
+            "holder_device_id": device.to_string(),
+        }));
+        assert_eq!(both.holder_ref(), Some(holder_on(device)));
+    }
+
+    /// Half a holder, or an unreadable one, is no holder, and never costs the
+    /// frame.
+    #[test]
+    fn an_unusable_holder_is_unknown_and_never_fails_the_frame() {
+        let device = uuid::Uuid::now_v7().to_string();
+        for extra in [
+            serde_json::json!({"holder_session_id": HOLDER_SESSION}),
+            serde_json::json!({"holder_device_id": device}),
+            serde_json::json!({"holder_session_id": "", "holder_device_id": device}),
+            serde_json::json!({"holder_session_id": HOLDER_SESSION, "holder_device_id": "merytshost"}),
+            serde_json::json!({"holder_session_id": 7, "holder_device_id": device}),
+            serde_json::json!({"holder_session_id": HOLDER_SESSION, "holder_device_id": {"id": 1}}),
+            serde_json::json!({"holder_session_id": null, "holder_device_id": null}),
+        ] {
+            assert_eq!(holder_frame(extra.clone()).holder_ref(), None, "{extra}");
+        }
+    }
+
+    /// Only a gate row can be held. A unit dispatch has no stamp and the legacy
+    /// path has no re-delivery, where a hold would be a silent drop.
+    #[test]
+    fn only_a_gate_dispatch_can_be_held() {
+        let device = uuid::Uuid::now_v7();
+        let frame = holder_frame(serde_json::json!({
+            "holder_session_id": HOLDER_SESSION,
+            "holder_device_id": device.to_string(),
+        }));
+        let id = uuid::Uuid::now_v7();
+        assert_eq!(
+            holder_for_dispatch(&frame, ConsumeTarget::Gate(id, 0)),
+            Some(holder_on(device))
+        );
+        assert_eq!(
+            holder_for_dispatch(&frame, ConsumeTarget::Dispatch(id)),
+            None
+        );
+        assert_eq!(holder_for_dispatch(&frame, ConsumeTarget::None), None);
+    }
+
     /// P3 reserves the anchor INSIDE its critical section, so two evaluations
     /// for one anchor with no registration between them — the burst window,
     /// where every task of one poll iteration used to see the pre-burst
@@ -17350,8 +18849,7 @@ mod tests {
         clear_continuation_registry();
         let live_all = |_id: &str| true;
 
-        let (verdict, _held) =
-            evaluate_continuation_guard(Some("unit:u1:phase-2"), &live_all, &calm_reading);
+        let (verdict, _held) = guard_anchor_only(Some("unit:u1:phase-2"), &live_all, &calm_reading);
         assert_eq!(verdict, ContinuationGuard::Proceed);
         assert!(
             anchor_is_reserved("unit:u1:phase-2"),
@@ -17393,8 +18891,7 @@ mod tests {
 
         // 1. Proceed reserves; the twin is deduped; the dispatch gives up
         //    (worktree failure, claim refused, …) → its reservation drops.
-        let (verdict, reservation) =
-            evaluate_continuation_guard(Some(anchor), &live_all, &calm_reading);
+        let (verdict, reservation) = guard_anchor_only(Some(anchor), &live_all, &calm_reading);
         assert_eq!(verdict, ContinuationGuard::Proceed);
         assert!(
             anchor_is_reserved(anchor),
@@ -17411,8 +18908,7 @@ mod tests {
         );
 
         // 2. The third evaluation — a re-delivery — proceeds again.
-        let (verdict, reservation) =
-            evaluate_continuation_guard(Some(anchor), &live_all, &calm_reading);
+        let (verdict, reservation) = guard_anchor_only(Some(anchor), &live_all, &calm_reading);
         assert_eq!(
             verdict,
             ContinuationGuard::Proceed,
@@ -17438,7 +18934,7 @@ mod tests {
         //    remove this entry anyway — see
         //    `stale_reservation_drop_cannot_steal_a_foreign_reservation`).
         let x1_dead = |id: &str| id != "term-x1";
-        let (verdict, later) = evaluate_continuation_guard(Some(anchor), &x1_dead, &calm_reading);
+        let (verdict, later) = guard_anchor_only(Some(anchor), &x1_dead, &calm_reading);
         assert_eq!(verdict, ContinuationGuard::Proceed);
         assert!(
             anchor_is_reserved(anchor),
@@ -17474,8 +18970,7 @@ mod tests {
         let gate = uuid::Uuid::now_v7();
 
         // A continuation is live on the anchor — the session about to migrate.
-        let (verdict, reservation) =
-            evaluate_continuation_guard(Some(anchor), &live_all, &calm_reading);
+        let (verdict, reservation) = guard_anchor_only(Some(anchor), &live_all, &calm_reading);
         assert_eq!(verdict, ContinuationGuard::Proceed);
         reservation.handed_to_registry("term-old".to_string(), Some(gate), None);
 
@@ -17749,7 +19244,7 @@ mod tests {
         let live_all = |_id: &str| true;
         let anchor = "unit:u9:phase-1";
 
-        let (verdict, stale) = evaluate_continuation_guard(Some(anchor), &live_all, &calm_reading);
+        let (verdict, stale) = guard_anchor_only(Some(anchor), &live_all, &calm_reading);
         assert_eq!(verdict, ContinuationGuard::Proceed);
 
         // Force the state the token exists for: this anchor's entry now belongs
@@ -17805,7 +19300,7 @@ mod tests {
                 // registry is read with the permit still alive, which is exactly
                 // the state `run_gate_continuation_inner`'s load arm is in while
                 // it awaits `defer_continuation_unclaimed`'s network POST.
-                let (verdict, held) = evaluate_continuation_guard(Some(anchor), &live_all, loaded);
+                let (verdict, held) = guard_anchor_only(Some(anchor), &live_all, loaded);
                 assert!(
                     matches!(verdict, ContinuationGuard::LoadPressure { .. }),
                     "a loaded machine must defer on every evaluation, got {verdict:?}"
@@ -18121,7 +19616,7 @@ mod tests {
         let mut deferred = 0;
         for i in 0..20 {
             let anchor = format!("burst-{i}");
-            let (verdict, permit) = evaluate_continuation_guard(Some(&anchor), &live_all, &reading);
+            let (verdict, permit) = guard_anchor_only(Some(&anchor), &live_all, &reading);
             match verdict {
                 ContinuationGuard::Proceed => held.push(permit),
                 ContinuationGuard::LoadPressure { observation, .. } => {
@@ -18162,7 +19657,7 @@ mod tests {
         // 200 graded threads, 256 warn ceiling, 10 threads per projected
         // session: pending 0..=5 project <= 250; pending 6 projects 260 > 256.
         let held: Vec<_> = (0..20)
-            .map(|_| evaluate_continuation_guard(None, &live_all, &reading))
+            .map(|_| guard_anchor_only(None, &live_all, &reading))
             .filter(|(v, _)| *v == ContinuationGuard::Proceed)
             .map(|(_, permit)| permit)
             .collect();
@@ -18192,7 +19687,7 @@ mod tests {
                     let reading = || commit_reading(free_with_headroom_for(3));
                     barrier.wait();
                     let anchor = format!("concurrent-{i}");
-                    evaluate_continuation_guard(Some(&anchor), &live_all, &reading)
+                    guard_anchor_only(Some(&anchor), &live_all, &reading)
                 })
             })
             .collect();
@@ -18225,10 +19720,9 @@ mod tests {
         clear_continuation_registry();
         let live_all = |_id: &str| true;
 
-        let (v1, terminal) =
-            evaluate_continuation_guard(Some("settle-a"), &live_all, &calm_reading);
-        let (v2, headless) = evaluate_continuation_guard(None, &live_all, &calm_reading);
-        let (v3, dropped) = evaluate_continuation_guard(Some("settle-c"), &live_all, &calm_reading);
+        let (v1, terminal) = guard_anchor_only(Some("settle-a"), &live_all, &calm_reading);
+        let (v2, headless) = guard_anchor_only(None, &live_all, &calm_reading);
+        let (v3, dropped) = guard_anchor_only(Some("settle-c"), &live_all, &calm_reading);
         assert_eq!(
             (v1, v2, v3),
             (
@@ -18264,7 +19758,7 @@ mod tests {
         );
 
         let (refused, permit) =
-            evaluate_continuation_guard(Some("settle-d"), &live_all, &|| commit_reading(GIB));
+            guard_anchor_only(Some("settle-d"), &live_all, &|| commit_reading(GIB));
         assert!(matches!(refused, ContinuationGuard::LoadPressure { .. }));
         assert_eq!(
             reserved_spawns_now(),
@@ -18297,9 +19791,7 @@ mod tests {
             "nothing pending: admitted"
         );
         let held: Vec<_> = (0..2)
-            .map(|i| {
-                evaluate_continuation_guard(Some(&format!("launch-{i}")), &live_all, &reading).1
-            })
+            .map(|i| guard_anchor_only(Some(&format!("launch-{i}")), &live_all, &reading).1)
             .collect();
         assert_eq!(reserved_spawns_now(), 2);
         let reason =
@@ -18963,6 +20455,8 @@ mod tests {
                 brief: None,
                 retry: None,
                 allocation: None,
+                holder_session_id: None,
+                holder_device_id: None,
             }
         }
         let gate = uuid::Uuid::now_v7();
@@ -19876,6 +21370,7 @@ mod tests {
         for reason in [
             duplicate_anchor_stamp_reason(&AnchorHolder::Live("t1".to_string())),
             duplicate_anchor_stamp_reason(&AnchorHolder::Reserved),
+            holder_session_live_stamp_reason("s1"),
             thread_pressure_stamp_reason(severity, observation),
             commit_pressure_stamp_reason(mem_severity, mem_observation),
         ] {
