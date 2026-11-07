@@ -11,6 +11,33 @@ use tracing::{debug, error, info, warn};
 use super::interceptor::OutputInterceptor;
 use super::session::TerminalSession;
 use super::types::{TerminalId, TerminalInfo};
+use crate::coord_drain_state::SpawnOrigin;
+
+/// The `terminal-created` event payload: the session's [`TerminalInfo`] plus
+/// the runner-local `surface` hint (plan
+/// `2026-10-28-runner-spawn-bursts-overwhelm-the-box-beyond-the-continuation-cap`,
+/// D3). `surface` says whether the frontend should SELECT the new tab; it is
+/// [`super::focus_coalescer::decide_for_create`]'s verdict for the spawn's
+/// origin — always `true` for an operator-created tab; for unattended ones
+/// coalesced per window (one window shared by the view-switching origins, a
+/// separate one for the tab-only origins). Flattened beside the info rather than added to
+/// `TerminalInfo`, which is the cross-repo wire schema (`qontinui-schemas`,
+/// `deny_unknown_fields`) — the same reasoning that keeps the bypass hint a
+/// separate event.
+#[derive(serde::Serialize)]
+pub(crate) struct TerminalCreatedEvent<'a> {
+    #[serde(flatten)]
+    pub(crate) info: &'a TerminalInfo,
+    pub(crate) surface: bool,
+}
+
+/// Emit `terminal-created` for `info`, deciding its `surface` for `origin`.
+fn emit_terminal_created(emitter: &AppHandle, info: &TerminalInfo, origin: SpawnOrigin) {
+    let surface = super::focus_coalescer::decide_for_create(origin, &info.id);
+    if let Err(e) = emitter.emit("terminal-created", &TerminalCreatedEvent { info, surface }) {
+        error!("Failed to emit terminal-created: {}", e);
+    }
+}
 use crate::claude_session::SessionManager;
 
 /// Manages all active terminal sessions.
@@ -382,6 +409,13 @@ impl TerminalManager {
     /// to [`TerminalSession::spawn`], whose identity seam issues the session's
     /// coord-mcp credential for it or refuses the spawn. `None` — every surface
     /// that does not offer a tenant choice — keeps the machine pin.
+    ///
+    /// `origin` is why this terminal is being spawned. It decides whether the
+    /// frontend selects the new tab (`terminal-created` `surface`): operator
+    /// origins always do, unattended ones are coalesced
+    /// ([`super::focus_coalescer`]). Required for the same reason
+    /// `resource_override` is: a default would answer for a surface nobody
+    /// asked.
     #[allow(clippy::too_many_arguments)]
     pub fn create(
         &self,
@@ -396,6 +430,7 @@ impl TerminalManager {
         resource_override: bool,
         trust: TrustArm,
         spawn_tenant: Option<uuid::Uuid>,
+        origin: SpawnOrigin,
     ) -> Result<TerminalInfo, String> {
         let id = uuid::Uuid::new_v4().to_string();
         // Claimed until the session is inserted (the claim drops at return):
@@ -517,9 +552,7 @@ impl TerminalManager {
         sessions.insert(id, session);
 
         // Notify frontend so externally-created terminals get a UI tab
-        if let Err(e) = emitter.emit("terminal-created", &info) {
-            error!("Failed to emit terminal-created: {}", e);
-        }
+        emit_terminal_created(&emitter, &info, origin);
 
         // D1: the same bypass fact, made DURABLE on the session's lifecycle
         // record. The event below is process-lifetime UI state; the record has
@@ -625,6 +658,7 @@ impl TerminalManager {
         app_handle: AppHandle,
         io: Arc<dyn super::pane_io::PaneIo>,
         pinned_session_id: String,
+        origin: SpawnOrigin,
     ) -> Result<TerminalInfo, String> {
         self.insert_with_io(
             uuid::Uuid::new_v4().to_string(),
@@ -636,6 +670,7 @@ impl TerminalManager {
             app_handle,
             io,
             pinned_session_id,
+            origin,
         )
     }
 
@@ -689,6 +724,9 @@ impl TerminalManager {
             app_handle,
             io,
             pinned_session_id,
+            // A holder pane re-adopted at boot: coalesced like any other
+            // boot-time resume, so a sweep of N panes selects at most one.
+            SpawnOrigin::BootResume,
         )
         .map_err(|e| {
             // The session could not be built around the attached pane. DETACH
@@ -762,6 +800,7 @@ impl TerminalManager {
         app_handle: AppHandle,
         io: Arc<dyn super::pane_io::PaneIo>,
         pinned_session_id: String,
+        origin: SpawnOrigin,
     ) -> Result<TerminalInfo, String> {
         let page_id = page_id.unwrap_or_else(|| "default".to_string());
 
@@ -789,9 +828,7 @@ impl TerminalManager {
         sessions.insert(id, session);
         drop(sessions);
 
-        if let Err(e) = emitter.emit("terminal-created", &info) {
-            error!("Failed to emit terminal-created: {}", e);
-        }
+        emit_terminal_created(&emitter, &info, origin);
 
         Ok(info)
     }
@@ -1275,6 +1312,36 @@ pub(crate) fn command_implies_bypass_permissions(argv: &[String]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// The `terminal-created` wire shape the frontend reads: `surface` sits
+    /// beside the flattened `TerminalInfo` fields, never nested under an `info`
+    /// key. Losing the flatten or renaming `surface` would stay green elsewhere
+    /// and silently end auto-select for every tab.
+    #[test]
+    fn terminal_created_event_flattens_the_info_beside_surface() {
+        let info = crate::terminal::types::TerminalInfo {
+            id: "t-1".to_string(),
+            title: "Terminal 1".to_string(),
+            pid: Some(42),
+            cols: 80,
+            rows: 24,
+            working_dir: "/w".to_string(),
+            is_alive: true,
+            exit_code: None,
+            created_at: 1,
+            total_bytes_produced: 7,
+            page_id: "default".to_string(),
+        };
+        let v = serde_json::to_value(super::TerminalCreatedEvent {
+            info: &info,
+            surface: false,
+        })
+        .unwrap();
+        assert_eq!(v["surface"], serde_json::json!(false));
+        assert_eq!(v["id"], serde_json::json!("t-1"));
+        assert_eq!(v["isAlive"], serde_json::json!(true));
+        assert!(v.get("info").is_none(), "{v}");
+    }
+
     use super::{apply_trust_arm, command_implies_bypass_permissions, TerminalManager, TrustArm};
 
     /// Review (adoption) M1: the late-delivery wiring end to end on a REAL

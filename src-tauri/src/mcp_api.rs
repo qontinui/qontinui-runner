@@ -2592,6 +2592,14 @@ async fn health(
         // inside 250 ms), which is the log line Evidence 5 of that plan was
         // missing. `lastCohortWake: null` means none observed since boot.
         "transcriptWatcher": crate::terminal::transcript_watcher::health_snapshot(),
+        // Coalesced view-switching (plan 2026-10-28-runner-spawn-bursts-
+        // overwhelm-the-box-beyond-the-continuation-cap, D3): unattended
+        // spawns switch the operator's view at most once per `windowSecs`
+        // (one window for continuations and condition checks, one for the
+        // origins that only select a tab); `suppressedTotal` counts the rest
+        // since boot. `lastSurfaceAt` / `lastTabOnlySurfaceAt: null` = no such
+        // surface since boot.
+        "focusCoalescer": crate::terminal::focus_coalescer::health_json(),
         "ai": {
             "configured": ai_configured,
             "running": ai_running,
@@ -21173,6 +21181,22 @@ mod coord_provision_session_gate_tests {
             region.contains(
                 "\"threadCeilings\": crate::resource_guard::thread_ceilings_health_json()"
             ),
+            "{region}"
+        );
+    }
+
+    /// Plan `2026-10-28-runner-spawn-bursts-overwhelm-the-box-beyond-the-
+    /// continuation-cap` Phase 4: `/health` serves the focus coalescer's
+    /// counters (same source-scan pin as above).
+    #[test]
+    fn the_health_handler_emits_the_focus_coalescer() {
+        let region = crate::mcp_api::mcp_api_item_source("async fn health(")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            region.contains("\"focusCoalescer\": crate::terminal::focus_coalescer::health_json()"),
             "{region}"
         );
     }

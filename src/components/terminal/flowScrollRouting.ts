@@ -73,6 +73,25 @@ export function newestAddedTabId(
 }
 
 /**
+ * `newestAddedTabId` over the tabs allowed to take the focus. A tab the runner's
+ * focus coalescer suppressed (`coalesced`) still lands in the grid, but this
+ * does not route the focus to it: otherwise a burst of unattended spawns in flow
+ * mode would move the focus to each one in turn, and whatever the operator next
+ * typed or inserted would go to the wrong session. A tab that auto-fills the
+ * empty zone the operator has focused still becomes that zone's tab, through the
+ * zone assignment rather than this routing; no session is displaced there.
+ */
+export function newestSurfacedTabId(
+  prevTabIds: ReadonlySet<string>,
+  tabs: readonly { id: string; coalesced?: boolean }[],
+): string | null {
+  return newestAddedTabId(
+    prevTabIds,
+    tabs.filter((t) => !t.coalesced).map((t) => t.id),
+  );
+}
+
+/**
  * The zone index a tab is assigned to, or `null` when it holds no zone yet
  * (e.g. a just-ingested tab whose creation-order auto-fill / auto-grow
  * reconcile hasn't run). Callers wait for a non-null result before routing

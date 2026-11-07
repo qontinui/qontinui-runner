@@ -373,6 +373,8 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
                 // mint applies.
                 crate::terminal::TrustArm::AccountChosenLater,
                 spawn_tenant,
+                // External tooling through the HTTP proxy: reason unnamed.
+                crate::coord_drain_state::SpawnOrigin::Unknown,
             ) {
                 Ok(info) => {
                     if let Some(ctx) = isolated_ctx {
