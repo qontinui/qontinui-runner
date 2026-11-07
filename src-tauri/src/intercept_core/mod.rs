@@ -15,6 +15,9 @@
 //! - [`classify`] — install-verb tables + argv → `(packages, dev, lockfile_sync)`.
 //! - [`gate`] — the `should_block` truth table + `InterceptMode` parse.
 //!
+//! [`claude_subcommands`] is the non-session `claude` subcommand list the
+//! identity shim passes through untouched, shared with the shim binary.
+//!
 //! [`npm_placeholder`] is here for the same reason, though it is not pure: it
 //! reads the first bytes of a candidate file.
 //!
@@ -35,6 +38,7 @@
 //! is nothing here that reads or forwards a secret.
 
 pub mod classify;
+pub mod claude_subcommands;
 pub mod gate;
 pub mod npm_placeholder;
 pub mod types;

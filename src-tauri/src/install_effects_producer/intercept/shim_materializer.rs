@@ -2786,6 +2786,111 @@ mod resolve_wait_tests {
         );
     }
 
+    /// A non-session claude subcommand reaches the real tool with its argv
+    /// untouched: `claude plugin eval` failed `unknown option '--settings'`
+    /// (coord finding 877edd19). A session launch is still injected.
+    #[test]
+    fn identity_shim_passes_non_session_subcommands_through_untouched() {
+        for args in [
+            &["plugin", "eval", "suite.json"][..],
+            &["mcp", "list"][..],
+            &["--verbose", "doctor"][..],
+            &["update"][..],
+            &["--model", "opus", "mcp", "list"][..],
+        ] {
+            assert_eq!(
+                identity_argv_seen_by_real_tool(args, true),
+                args,
+                "{args:?}"
+            );
+        }
+        // Bare, a prompt that merely contains a subcommand word, and a
+        // subcommand word after `--` (a prompt): all still injected.
+        assert_eq!(
+            identity_argv_seen_by_real_tool(&[], true),
+            [
+                "--settings",
+                "S",
+                "--mcp-config",
+                "M",
+                "--session-id",
+                "pin-1"
+            ]
+        );
+        assert_eq!(
+            identity_argv_seen_by_real_tool(&["-p", "fix the plugin"], true),
+            [
+                "-p",
+                "fix the plugin",
+                "--settings",
+                "S",
+                "--mcp-config",
+                "M",
+                "--session-id",
+                "pin-1"
+            ]
+        );
+        // An option VALUE that looks like a subcommand is a session.
+        assert_eq!(
+            identity_argv_seen_by_real_tool(&["--add-dir", "config"], true),
+            [
+                "--add-dir",
+                "config",
+                "--settings",
+                "S",
+                "--mcp-config",
+                "M",
+                "--session-id",
+                "pin-1"
+            ]
+        );
+        assert_eq!(
+            identity_argv_seen_by_real_tool(&["--", "mcp"], true),
+            [
+                "--settings",
+                "S",
+                "--mcp-config",
+                "M",
+                "--session-id",
+                "pin-1",
+                "--",
+                "mcp"
+            ]
+        );
+    }
+
+    /// The bash and cmd identity shims carry the passthrough subcommand list
+    /// as a literal; hold both equal to the Rust list the exe shim uses.
+    #[test]
+    fn identity_shim_subcommand_lists_match_the_shared_list() {
+        use qontinui_runner_lib::intercept_core::claude_subcommands::{
+            CLAUDE_NON_SESSION_SUBCOMMANDS, CLAUDE_VALUE_OPTIONS,
+        };
+        // The module's const is Windows-only; these tests run on unix.
+        const IDENTITY_SHIM_CMD: &str =
+            include_str!("../../../resources/intercept/identity_shim.cmd");
+        let want = CLAUDE_NON_SESSION_SUBCOMMANDS.join("|");
+        assert!(
+            IDENTITY_SHIM_BASH.contains(&format!("    {want})\n")),
+            "identity_shim.bash's subcommand case pattern must be exactly: {want}"
+        );
+        let want_cmd = CLAUDE_NON_SESSION_SUBCOMMANDS.join(" ");
+        assert!(
+            IDENTITY_SHIM_CMD.contains(&format!("for %%S in ({want_cmd}) do")),
+            "identity_shim.cmd's subcommand list must be exactly: {want_cmd}"
+        );
+        let opts = CLAUDE_VALUE_OPTIONS.join("|");
+        assert!(
+            IDENTITY_SHIM_BASH.contains(&format!("          {opts})\n")),
+            "identity_shim.bash's value-option case pattern must be exactly: {opts}"
+        );
+        let opts_cmd = CLAUDE_VALUE_OPTIONS.join(" ");
+        assert!(
+            IDENTITY_SHIM_CMD.contains(&format!("for %%V in ({opts_cmd}) do")),
+            "identity_shim.cmd's value-option list must be exactly: {opts_cmd}"
+        );
+    }
+
     #[test]
     fn identity_shim_resolved_tool_never_waits_or_writes_stderr() {
         if system_claude_present() {

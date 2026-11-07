@@ -16,6 +16,8 @@ rem   * FAIL-OPEN: any failure -> run the REAL provider unchanged.
 rem   * TRANSPARENT: stdio inherited; the user sees the real exit code.
 rem   * RECURSION-GUARD: QONTINUI_INSTALL_INTERCEPT_GUARD=1 -> pure passthrough.
 rem   * DON'T DOUBLE-PIN: user already passed --session-id/--resume -> passthrough.
+rem   * SUBCOMMAND PASSTHROUGH: a non-session claude subcommand (plugin, mcp,
+rem     doctor, ...) runs with its argv untouched.
 rem
 rem Placeholders:
 rem   @@TOOL@@      the wrapped provider program name (claude/gemini)
@@ -74,6 +76,46 @@ if "%QONTINUI_INSTALL_INTERCEPT_GUARD%"=="1" (
 
 rem ---- recursion guard: a nested invocation never re-pins -------------------
 if "%QONTINUI_INSTALL_INTERCEPT_GUARD%"=="1" goto :passthrough
+
+rem ---- non-session subcommand passthrough (coord finding 877edd19) ---------
+rem --settings, --mcp-config and --session-id are ROOT command options. A claude
+rem subcommand (plugin eval, mcp list, doctor, ...) is parsed by its own option
+rem table and fails "unknown option '--settings'", or is handed a live coord-mcp
+rem config it has no use for. So when the first positional ahead of `--` is one
+rem of claude's subcommands, run the real tool with the ORIGINAL argv and append
+rem nothing. The list is CLAUDE_NON_SESSION_SUBCOMMANDS in
+rem src/intercept_core/claude_subcommands.rs (a test holds this one equal to
+rem it); it lists passthrough subcommands because a prompt is a positional too.
+rem Case-sensitive, as claude is. gemini is untouched. The token after a
+rem value-taking root option (--add-dir config, --agent doctor) is that
+rem option's value, so it is skipped unless it is itself a flag; that table is
+rem CLAUDE_VALUE_OPTIONS in the same file. Known edges, all from cmd's `for`
+rem tokenizer (shared with the USER_CHOSE scan below): an unquoted = , ; splits
+rem a token, an empty "" argument is dropped, and * ? globs against the cwd.
+set "FIRSTPOS="
+set "SAW_TERM=0"
+set "SKIPV=0"
+for %%A in (%*) do (
+  set "TOK=%%~A"
+  if defined TOK if "!TOK!"=="--" set "SAW_TERM=1"
+  if defined TOK if "!SAW_TERM!"=="0" if not defined FIRSTPOS (
+    if "!TOK:~0,1!"=="-" (
+      set "SKIPV=0"
+      for %%V in (--add-dir --agent --agents --allowedTools --allowed-tools --append-system-prompt --append-system-prompt-file --autocompact --betas --cloud -d --debug --debug-file --disallowedTools --disallowed-tools --effort --environment --fallback-model --file --from-pr --input-format --json-schema --max-budget-usd --mcp-config --model -n --name --output-format --permission-mode --permission-prompts --plugin-dir --plugin-url --prompt-suggestions --remote-control --remote-control-session-name-prefix -r --resume --session-id --setting-sources --settings --system-prompt --system-prompt-file --system-prompt-snapshot --teleport --tools -w --worktree) do if "!TOK!"=="%%V" set "SKIPV=1"
+    ) else (
+      if "!SKIPV!"=="1" (
+        set "SKIPV=0"
+      ) else (
+        set "FIRSTPOS=!TOK!"
+      )
+    )
+  )
+)
+if /I "%TOOL%"=="claude" if defined FIRSTPOS (
+  for %%S in (agents attach auth auto-mode config doctor gateway help import install kill logs mcp migrate-installer plugin plugins purge respawn rm setup-token stop ultrareview update upgrade) do (
+    if "!FIRSTPOS!"=="%%S" goto :rawpassthrough
+  )
+)
 
 set "PINNED=%QONTINUI_PINNED_SESSION_ID%"
 
@@ -144,7 +186,7 @@ if not "%USER_CHOSE%"=="1" if defined PINNED if defined QONTINUI_INSTALL_INTERCE
   )
 )
 
-rem ---- diagnostic beacon: fires on EVERY real invocation (log-only runner) ---
+rem ---- diagnostic beacon: every real invocation but a subcommand (log-only) -
 rem Makes "did the shim run for this terminal, will it deliver --session-id /
 rem --settings?" observable in the runner logs — including the passthrough path
 rem that sends no session-open. Never blocks.
@@ -183,5 +225,15 @@ if defined REAL (
   call "%REAL%" %* %SETTINGS_ARGS% %MCPCFG_ARGS%
 ) else (
   call %TOOL% %* %SETTINGS_ARGS% %MCPCFG_ARGS%
+)
+endlocal & exit /b %ERRORLEVEL%
+
+:rawpassthrough
+rem A non-session subcommand: the original argv, nothing appended.
+set "QONTINUI_INSTALL_INTERCEPT_GUARD=1"
+if defined REAL (
+  call "%REAL%" %*
+) else (
+  call %TOOL% %*
 )
 endlocal & exit /b %ERRORLEVEL%
