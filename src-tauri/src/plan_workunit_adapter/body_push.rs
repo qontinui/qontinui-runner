@@ -271,28 +271,45 @@ pub fn has_status_stamp(body: &str) -> bool {
 }
 
 /// Tokens that survive `Repo(s):` chunking but are English, not repositories.
-const REPO_STOPWORDS: [&str; 10] = [
-    "and", "plus", "the", "for", "only", "none", "n/a", "primary", "also", "with",
+const REPO_STOPWORDS: [&str; 13] = [
+    "and", "plus", "the", "for", "only", "none", "n/a", "primary", "also", "with", "a", "an", "no",
 ];
 
 /// Extract the repos a plan/prompt declares from its `> **Repo(s):**` line.
 ///
 /// The corpus writes this line half a dozen ways — inside a blockquote or not,
-/// backticked or bare, comma- or `+`-separated, with parenthetical roles, with a
-/// trailing period, and sometimes wrapped onto a continuation line:
+/// backticked or bare, comma- `+`- `/`- or `·`-separated, with parenthetical
+/// roles, one repo per sentence, and sometimes wrapped onto a continuation line:
 ///
 /// ```text
 /// > **Repo(s):** qontinui-coord (primary), qontinui-web (Phase 4 alembic migration).
 /// **Repo(s):** `ui-bridge`
 /// > **Repo(s):** qontinui-coord (progress PATCH added by #749) + qontinui-runner (progress
 /// > outbox).
+/// **Repo(s):** qontinui-runner (both changes). qontinui-dev-notes (this plan).
 /// ```
 ///
 /// So: take the first marker line, plus its blockquote continuation lines (a
-/// `>` line carrying no new `**bold**` marker), strip parenthetical spans, split
-/// on `,` `+` `;`, and keep the first bare token of each chunk. Order-preserving
-/// and deduped. Returns empty when the line is absent — most of the corpus has
-/// no `Repo(s):` line at all, which is a real empty, not a parse failure.
+/// `>` line carrying no new `**bold**` marker), strip parenthetical spans, end
+/// the list at a bold label or a punctuation dash ([`end_of_repo_list`]), then
+/// split it into sentences and each sentence into chunks
+/// ([`split_repo_chunks`]) and keep the first token of each chunk, reading
+/// `owner/name` as `name`. Order-preserving and deduped. Returns empty when the
+/// line is absent — most of the corpus has no `Repo(s):` line at all, which is a
+/// real empty, not a parse failure.
+///
+/// The first sentence is the list and every chunk of it counts. A LATER
+/// sentence is usually prose about a role — `` `qontinui/qontinui-dev-notes` is
+/// a read-only evidence population — its PRs and git history are read, never
+/// written, beyond this plan file.`` — so a chunk there counts only when its
+/// first token names a repo unmistakably (backticked, `owner/name`, or a lone
+/// hyphenated word); the far side of an ` and ` is held to the same rule.
+/// Before this, every comma of that prose yielded a "repo" (`no`, `so`,
+/// `never`, `beyond`): 386 non-repo tokens across 211 of the 928 plans carrying
+/// the line, measured 2026-10-17; 57 across 37 after. Splitting tokens on `/`
+/// was the second leak: `qontinui/qontinui-coord` produced a `qontinui` repo (59
+/// plans), which is also the name of the core library and so passes any name
+/// check.
 #[expect(
     clippy::string_slice,
     reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
@@ -330,23 +347,144 @@ pub fn extract_repos(body: &str) -> Vec<String> {
         }
     }
 
-    let cleaned = strip_parenthetical(&joined);
+    let list = end_of_repo_list(&strip_parenthetical(&joined));
     let mut out: Vec<String> = Vec::new();
-    for chunk in cleaned.split([',', '+', ';', '/']) {
-        let token = chunk
-            .split_whitespace()
-            .next()
-            .unwrap_or("")
-            .trim_matches(|c: char| !(c.is_alphanumeric() || c == '-' || c == '_' || c == '.'));
-        if token.is_empty() || token.len() > 64 {
+    // The slash group of the last chunk that was accepted: a hyphenated
+    // sibling across ` / ` or `·` (`qontinui-web / qontinui-runner are read …`)
+    // inherits the acceptance even when prose follows it. `+` and ` and ` are
+    // never inheritance edges — prose is joined to a list by them.
+    let mut accepted_group: Option<usize> = None;
+    for (strict, group, may_inherit, chunk) in split_repo_chunks(&list) {
+        let mut words = chunk.split_whitespace();
+        let raw = words.next().unwrap_or("");
+        let rest: Vec<String> = words.map(str::to_lowercase).collect();
+        let lowered = raw
+            .trim_matches(|c: char| !(c.is_alphanumeric() || c == '-' || c == '_' || c == '/'))
+            .trim_matches('/')
+            .to_lowercase();
+        if !lowered.chars().any(char::is_alphanumeric) || REPO_STOPWORDS.contains(&lowered.as_str())
+        {
             continue;
         }
-        let lowered = token.to_lowercase();
-        if REPO_STOPWORDS.contains(&lowered.as_str()) {
+        // A strict chunk (a later sentence, or the far side of ` and `) is
+        // usually prose, so it counts only when it names a repo unmistakably:
+        // backticked, `owner/name`, a lone hyphenated word, or a hyphenated
+        // ` / ` / `·` sibling of a chunk already accepted.
+        let lone = rest.is_empty() || rest == ["only"];
+        let hyphenated = lowered.contains('-');
+        if strict
+            && !(raw.starts_with('`')
+                || lowered.contains('/')
+                || (lone && hyphenated)
+                || (may_inherit && accepted_group == Some(group) && hyphenated))
+        {
             continue;
         }
-        if !out.iter().any(|e| e == &lowered) {
-            out.push(lowered);
+        // `owner/name` names the repo `name`. An "owner" carrying a `-` is a
+        // repo itself, and the second segment is then a sibling repo only when
+        // it shares the first one's family prefix: `qontinui-web/qontinui-runner`
+        // lists two, while `qontinui-coord/README.md` and
+        // `qontinui-runner/src-tauri` are paths inside one. Anything with more
+        // segments is a path, not a repo.
+        let family = |s: &str| s.split('-').next().unwrap_or("").to_string();
+        let names: Vec<&str> = match lowered.split('/').collect::<Vec<_>>().as_slice() {
+            [single] => vec![*single],
+            [owner, name] if !owner.is_empty() && !name.is_empty() => {
+                if !owner.contains('-') {
+                    vec![*name]
+                } else if name.contains('-') && !name.contains('.') && family(owner) == family(name)
+                {
+                    vec![*owner, *name]
+                } else {
+                    vec![*owner]
+                }
+            }
+            _ => continue,
+        };
+        accepted_group = Some(group);
+        for name in names {
+            if name.is_empty() || name.len() > 64 || REPO_STOPWORDS.contains(&name) {
+                continue;
+            }
+            if !out.iter().any(|e| e == name) {
+                out.push(name.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// The part of a parenthetical-stripped `Repo(s):` tail that can still hold
+/// repos: everything before the first bold LABEL (`**Topic:**`,
+/// `**Resource-keys**:`) or dash used as punctuation (` — `, ` – `, ` -- `),
+/// with any other `**emphasis**` unwrapped — `**`qontinui-web` for Phase 3
+/// only**` still names a repo. Run AFTER [`strip_parenthetical`], so a dash
+/// inside a role cannot end the list.
+fn end_of_repo_list(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(open) = rest.find("**") {
+        let before = rest.get(..open).unwrap_or("");
+        let after_open = rest.get(open + 2..).unwrap_or("");
+        let Some(close) = after_open.find("**") else {
+            out.push_str(before);
+            out.push_str(after_open);
+            rest = "";
+            break;
+        };
+        let inner = after_open.get(..close).unwrap_or("");
+        let tail = after_open.get(close + 2..).unwrap_or("");
+        out.push_str(before);
+        if inner.trim_end().ends_with(':') || tail.starts_with(':') {
+            rest = "";
+            break;
+        }
+        out.push_str(inner);
+        rest = tail;
+    }
+    out.push_str(rest);
+    let end = [" — ", " – ", " -- "]
+        .iter()
+        .filter_map(|pat| out.find(pat))
+        .min()
+        .unwrap_or(out.len());
+    out.get(..end).unwrap_or(&out).to_string()
+}
+
+/// Split a repo list into `(strict, group, may_inherit, chunk)`. Sentences end
+/// at a `.` followed by whitespace or the end (so `qontinui.io` and
+/// `cargo-guard.sh` stay whole). Each sentence splits on `,` `;` `+` into
+/// SLASH GROUPS — `group` is numbered across the whole list — each group into
+/// siblings on `·` or a spaced ` / `, and each sibling on ` and `. A chunk is
+/// `strict` when it comes from a sentence after the first or from the far side
+/// of an ` and ` — the two places prose lives; `may_inherit` is false on the far
+/// side of an ` and `.
+fn split_repo_chunks(list: &str) -> Vec<(bool, usize, bool, String)> {
+    let mut sentences: Vec<&str> = Vec::new();
+    let mut start = 0;
+    let mut chars = list.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        if c == '.' && chars.peek().is_none_or(|(_, n)| n.is_whitespace()) {
+            sentences.push(list.get(start..i).unwrap_or(""));
+            start = i + 1;
+        }
+    }
+    sentences.push(list.get(start..).unwrap_or(""));
+    let mut out = Vec::new();
+    let mut group = 0;
+    for (sentence_idx, sentence) in sentences.into_iter().enumerate() {
+        for slash_group in sentence.split([',', ';', '+']) {
+            for sibling in slash_group.replace(" / ", "·").split('·') {
+                for (and_idx, chunk) in sibling.split(" and ").enumerate() {
+                    out.push((
+                        sentence_idx > 0 || and_idx > 0,
+                        group,
+                        and_idx == 0,
+                        chunk.to_string(),
+                    ));
+                }
+            }
+            group += 1;
         }
     }
     out
@@ -3920,6 +4058,144 @@ mod tests {
     fn repos_are_deduped_and_lowercased() {
         let body = "**Repo(s):** Qontinui-Web, qontinui-web, qontinui-runner\n";
         assert_eq!(extract_repos(body), vec!["qontinui-web", "qontinui-runner"]);
+    }
+
+    /// The 2026-09-03 back-merge plan's own head, verbatim. It used to yield
+    /// `qontinui`, `qontinui-coord`, `qontinui-dev-notes`, `never`, `beyond`:
+    /// the `/` split invented the owner as a repo, and the continuation line's
+    /// prose leaked one word per comma.
+    #[test]
+    fn later_sentences_keep_only_repo_shaped_tokens_and_owner_slash_name_is_name() {
+        let body = "> **Repo(s):** `qontinui/qontinui-coord` (the only repo any phase changes).\n\
+                    > `qontinui/qontinui-dev-notes` is a read-only evidence population — its PRs\n\
+                    > and git history are read, never written, beyond this plan file.\n";
+        assert_eq!(
+            extract_repos(body),
+            vec!["qontinui-coord", "qontinui-dev-notes"]
+        );
+    }
+
+    #[test]
+    fn repos_stop_at_a_dash_clause() {
+        let body = "**Repo(s):** qontinui-coord only — no web migration, no schema change\n";
+        assert_eq!(extract_repos(body), vec!["qontinui-coord"]);
+    }
+
+    #[test]
+    fn repos_stop_at_a_backticked_sentence_end() {
+        let body = "> **Repo(s):** `qontinui-runner` only. CI-only change: no Rust, no TypeScript, no migration.\n";
+        assert_eq!(extract_repos(body), vec!["qontinui-runner"]);
+    }
+
+    #[test]
+    fn one_repo_per_sentence() {
+        let body = "**Repo(s):** qontinui-runner (both changes). qontinui-dev-notes (this plan).\n";
+        assert_eq!(
+            extract_repos(body),
+            vec!["qontinui-runner", "qontinui-dev-notes"]
+        );
+    }
+
+    #[test]
+    fn emphasis_is_unwrapped_but_a_bold_label_ends_the_list() {
+        let body = "> **Repo(s):** `qontinui-runner`; **`qontinui-web` for Phase 3 only** **Topic:** `merge-engine`\n";
+        assert_eq!(extract_repos(body), vec!["qontinui-runner", "qontinui-web"]);
+    }
+
+    #[test]
+    fn spaced_slash_middot_and_and_separate_repos() {
+        assert_eq!(
+            extract_repos(
+                "**Repo(s):** qontinui-coord. qontinui-web / qontinui-runner are read for a census only.\n"
+            ),
+            vec!["qontinui-coord", "qontinui-web", "qontinui-runner"]
+        );
+        assert_eq!(
+            extract_repos("> **Repo(s):** `qontinui/qontinui-runner` · `qontinui/qontinui-web`\n"),
+            vec!["qontinui-runner", "qontinui-web"]
+        );
+        assert_eq!(
+            extract_repos("> **Repo(s):** `qontinui/qontinui-web` and `qontinui/qontinui-coord`. Two repos, two PRs.\n"),
+            vec!["qontinui-web", "qontinui-coord"]
+        );
+    }
+
+    #[test]
+    fn and_does_not_leak_a_prose_word() {
+        assert_eq!(
+            extract_repos("**Repo(s):** qontinui-coord for reads and writes\n"),
+            vec!["qontinui-coord"]
+        );
+    }
+
+    #[test]
+    fn unspaced_slash_between_two_repos_lists_both() {
+        assert_eq!(
+            extract_repos("**Repo(s):** qontinui-web/qontinui-runner\n"),
+            vec!["qontinui-web", "qontinui-runner"]
+        );
+        assert_eq!(
+            extract_repos("**Repo(s):** `qontinui-web/`\n"),
+            vec!["qontinui-web"]
+        );
+    }
+
+    #[test]
+    fn a_path_inside_a_repo_is_that_repo_not_two() {
+        assert_eq!(
+            extract_repos("**Repo(s):** qontinui-coord/README.md\n"),
+            vec!["qontinui-coord"]
+        );
+        assert_eq!(
+            extract_repos("**Repo(s):** qontinui-runner/src-tauri\n"),
+            vec!["qontinui-runner"]
+        );
+    }
+
+    /// A sibling's acceptance carries across ` / ` only — hyphenated prose
+    /// joined by ` and ` or `+` stays out.
+    #[test]
+    fn group_acceptance_does_not_admit_hyphenated_prose() {
+        assert_eq!(
+            extract_repos(
+                "**Repo(s):** qontinui-coord. `qontinui-web` is read and follow-up work lands later.\n"
+            ),
+            vec!["qontinui-coord", "qontinui-web"]
+        );
+        assert_eq!(
+            extract_repos("**Repo(s):** qontinui-coord. `qontinui-web` + read-only fixtures.\n"),
+            vec!["qontinui-coord", "qontinui-web"]
+        );
+    }
+
+    #[test]
+    fn repos_stop_at_a_bold_marker_on_the_same_line() {
+        let body = "> **Repo(s):** qontinui-coord  **Resource-keys:** `qontinui-coord:crates/coord/src/a.rs`, `b`\n";
+        assert_eq!(extract_repos(body), vec!["qontinui-coord"]);
+    }
+
+    /// A role containing a full stop must not end the list early: parentheticals
+    /// are stripped before the clause cut.
+    #[test]
+    fn a_period_inside_a_role_does_not_end_the_list() {
+        let body = "> **Repo(s):** qontinui-web (the migration. and its test), qontinui-claude-config\n> (one knowledge-base paragraph). No change is needed in coord\n";
+        assert_eq!(
+            extract_repos(body),
+            vec!["qontinui-web", "qontinui-claude-config"]
+        );
+    }
+
+    #[test]
+    fn a_dotted_repo_name_and_a_path_token() {
+        assert_eq!(
+            extract_repos("**Repo(s):** qontinui.io, qontinui-coord\n"),
+            vec!["qontinui.io", "qontinui-coord"]
+        );
+        // a multi-segment path is not a repo; n/a stays a stopword rather than becoming `a`
+        assert_eq!(
+            extract_repos("**Repo(s):** crates/coord/src, n/a, ui-bridge\n"),
+            vec!["ui-bridge"]
+        );
     }
 
     #[test]
