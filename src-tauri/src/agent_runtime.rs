@@ -1111,6 +1111,11 @@ fn launchable_or_bare(resolved: String) -> String {
 /// before PATH, so a workdir holding one takes it instead. (On Windows npm never
 /// puts the stub on PATH as an `.exe`; its cmd-shim wrapper sits there instead.)
 ///
+/// The walk skips every qontinui shim dir, and also the PERSISTENT identity
+/// dir (`profile_cli::identity_shim_dir()`, resolved once from the ambient
+/// home), whose `claude.exe` is the qontinui-shim stub and which the Settings
+/// opt-in prepends to the user PATH.
+///
 /// Falls back to [`claude_bin_path`] when nothing resolves, so behavior is
 /// never worse than the bare name. Does blocking filesystem stats and reads the
 /// head of each candidate — callers on an async task must run this via
@@ -1129,13 +1134,21 @@ pub(crate) fn resolve_claude_bin() -> String {
     // Skip every qontinui shim/identity dir — ours or one inherited from
     // another session. They hold the extensionless script that triggers os
     // error 193 under a direct `CreateProcessW`, and a shim is never the real
-    // tool.
+    // tool. The PERSISTENT identity dir is skipped by path, because nothing in
+    // its name or contents marks it: its `claude.exe` is the qontinui-shim
+    // stub, and the Settings opt-in prepends it to the user PATH, so without
+    // this skip the walk would resolve the stub as "the real claude". The
+    // spawn would then exec the stub with no recursion guard set. Its path is
+    // read from the ambient home ONCE, so the whole walk gets one answer.
     use crate::install_effects_producer::intercept::shim_materializer::is_qontinui_shim_dir;
+    use qontinui_runner_lib::intercept_core::shim_dir::is_persistent_identity_dir_in;
+    let persistent = qontinui_runner_lib::profile_cli::identity_shim_dir();
     // Only extensions CreateProcessW can natively launch — see doc comment.
     #[cfg(windows)]
     let exts: &[&str] = &[".exe", ".com"];
     for dir in std::env::split_paths(&path) {
-        if is_qontinui_shim_dir(&dir) {
+        if is_qontinui_shim_dir(&dir) || is_persistent_identity_dir_in(&dir, persistent.as_deref())
+        {
             continue;
         }
         #[cfg(windows)]
@@ -14599,6 +14612,39 @@ mod tests {
         let _env = ClaudeBinEnv::prepend(&[empty.clone(), bin_dir.clone()]);
         let found = resolve_claude_bin();
         assert_eq!(found, bin.to_string_lossy());
+    }
+
+    /// The PERSISTENT identity dir (`profile_cli::identity_shim_dir()`) is
+    /// never taken for the real `claude`, although nothing in its name or
+    /// contents marks it as a shim dir. The Settings opt-in prepends it to the
+    /// user PATH, so it sits AHEAD of the real tool. Before this skip the walk
+    /// returned its stub.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_claude_bin_skips_the_persistent_identity_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        // Reentrant with the fixture's own hold, which gives the ambient home.
+        let _env_lock = env_lock();
+        let _amb = crate::test_env::isolated_ambient();
+        let persistent = qontinui_runner_lib::profile_cli::identity_shim_dir()
+            .expect("the fixture provides a home");
+        let tmp = tempfile::tempdir().unwrap();
+        let real_dir = tmp.path().join("real");
+        std::fs::create_dir_all(&persistent).unwrap();
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let stub = persistent.join("claude");
+        let real = real_dir.join("claude");
+        for f in [&stub, &real] {
+            std::fs::write(f, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(f, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let _env = ClaudeBinEnv::prepend(&[persistent.clone(), real_dir.clone()]);
+        assert_eq!(
+            resolve_claude_bin(),
+            real.to_string_lossy(),
+            "the persistent identity dir's stub was taken for the real claude"
+        );
     }
 
     /// npm's placeholder stub is a miss: the walk moves past it to a real binary

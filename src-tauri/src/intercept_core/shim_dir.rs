@@ -21,6 +21,11 @@
 //! second binary and cannot import the runner bin's modules (see
 //! [`super`]). The bash and `.cmd` shim templates carry a shell
 //! transliteration of it; keep the three in step.
+//!
+//! One qontinui shim dir carries neither a prefixed name nor the marker: the
+//! PERSISTENT identity dir (`~/.qontinui/runner/identity-shim`) that the
+//! Settings opt-in prepends to the user PATH. [`is_persistent_identity_dir`]
+//! recognises it by path, which means reading the ambient home.
 
 use std::path::Path;
 
@@ -61,9 +66,112 @@ pub fn is_qontinui_shim_dir(dir: &Path) -> bool {
     has_shim_dir_name(&spelled) || dir.join(IDENTITY_MARKER).exists()
 }
 
+/// Whether `dir` is the PERSISTENT identity-shim dir,
+/// [`crate::profile_cli::identity_shim_dir`] (`~/.qontinui/runner/identity-shim`).
+///
+/// That dir is the one qontinui shim dir [`is_qontinui_shim_dir`] cannot
+/// recognise. Its name carries no shim-dir prefix and it holds no
+/// [`IDENTITY_MARKER`], because the Settings opt-in materializes only the
+/// `qontinui-shim` stub into it as `claude.exe`. The opt-in also PREPENDS it to
+/// the user PATH, so a walker that wants the REAL `claude` must skip it too, or
+/// it takes the stub. The native stub's `own_shim_dirs` and `process_tree`'s
+/// `is_shim_dir_exe_path` exclude it by path with comparisons of their own.
+///
+/// This reads the ambient home (`$QONTINUI_HOME`, else the user's home), so a
+/// walker over many entries resolves it once and calls
+/// [`is_persistent_identity_dir_in`] instead. Trailing `/` and `\` are
+/// ignored. On Windows the two spellings also compare with `/` and `\` alike
+/// and ASCII-case-insensitively. `false` when no home resolves (then no
+/// persistent dir exists to match).
+pub fn is_persistent_identity_dir(dir: &Path) -> bool {
+    is_persistent_identity_dir_in(dir, crate::profile_cli::identity_shim_dir().as_deref())
+}
+
+/// [`is_persistent_identity_dir`] against an already-resolved persistent dir,
+/// so a PATH walk reads the ambient home once and gives one answer for the
+/// whole walk. `None` (no home) matches nothing.
+pub fn is_persistent_identity_dir_in(dir: &Path, persistent: Option<&Path>) -> bool {
+    persistent.is_some_and(|persistent| same_dir_spelling(dir, persistent, cfg!(windows)))
+}
+
+/// Pure core of [`is_persistent_identity_dir`]: whether `a` and `b` spell the
+/// same directory, ignoring trailing separators. `windows` folds `/` into `\`
+/// and compares ASCII-case-insensitively, as that filesystem does. An empty
+/// spelling never matches.
+fn same_dir_spelling(a: &Path, b: &Path, windows: bool) -> bool {
+    let norm = |p: &Path| {
+        let s = p.to_string_lossy();
+        let s = if windows {
+            s.replace('/', "\\")
+        } else {
+            s.into_owned()
+        };
+        s.trim_end_matches(['/', '\\']).to_string()
+    };
+    let (a, b) = (norm(a), norm(b));
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    if windows {
+        a.eq_ignore_ascii_case(&b)
+    } else {
+        a == b
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn same_dir_spelling_ignores_trailing_separators_and_folds_windows_spelling() {
+        let p = |s: &str| std::path::PathBuf::from(s);
+        assert!(same_dir_spelling(
+            &p("/home/u/.qontinui/runner/identity-shim/"),
+            &p("/home/u/.qontinui/runner/identity-shim"),
+            false
+        ));
+        // Unix paths are case-sensitive, and `\` is an ordinary character there.
+        assert!(!same_dir_spelling(
+            &p("/home/u/.qontinui/runner/Identity-Shim"),
+            &p("/home/u/.qontinui/runner/identity-shim"),
+            false
+        ));
+        assert!(same_dir_spelling(
+            &p(r"C:/Users/X/.qontinui/runner/identity-shim\"),
+            &p(r"c:\users\x\.qontinui\runner\IDENTITY-SHIM"),
+            true
+        ));
+        // A different dir, a parent, and the empty spelling never match.
+        assert!(!same_dir_spelling(
+            &p(r"C:\Users\x\.qontinui\runner"),
+            &p(r"C:\Users\x\.qontinui\runner\identity-shim"),
+            true
+        ));
+        assert!(!same_dir_spelling(&p(""), &p(""), false));
+        assert!(!same_dir_spelling(&p("/"), &p("/"), false));
+    }
+
+    #[test]
+    fn the_persistent_identity_dir_is_recognised_and_its_siblings_are_not() {
+        let _amb = crate::test_env::isolated_ambient();
+        let persistent =
+            crate::profile_cli::identity_shim_dir().expect("the fixture provides a home");
+        assert!(is_persistent_identity_dir(&persistent));
+        let trailing = format!("{}/", persistent.display());
+        assert!(is_persistent_identity_dir(Path::new(&trailing)));
+        // Its parent, a sibling, and a qontinui shim dir by name are not it.
+        assert!(!is_persistent_identity_dir(persistent.parent().unwrap()));
+        assert!(!is_persistent_identity_dir(
+            &persistent.with_file_name("identity-shim-old")
+        ));
+        assert!(!is_persistent_identity_dir(Path::new(
+            "/tmp/qontinui-identity-abc"
+        )));
+        // The name-and-marker predicate still does not recognise it, which is
+        // why this second predicate exists.
+        assert!(!is_qontinui_shim_dir(&persistent));
+    }
 
     #[test]
     fn a_shim_dir_name_prefix_is_a_shim_dir() {
