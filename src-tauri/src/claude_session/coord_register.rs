@@ -178,6 +178,52 @@ pub enum TranscriptBindRefusal {
     CoordSessionInUse,
 }
 
+/// What [`AiCoordRegistrar::rebind`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RebindOutcome {
+    /// This registrar has no binding for the key: nothing to move (a first
+    /// bind of a terminal-plane session the registrar never saw).
+    Unbound,
+    /// The key is already bound to that row.
+    Unchanged,
+    /// The key's binding and its row-keyed state moved from `from`.
+    Moved { from: Uuid },
+}
+
+/// How many times a row resolution found the registrar's binding and the live
+/// terminal's binding for one harness id DIFFERENT (and took the terminal's).
+/// Served on `/health` as `registrarTerminalRowDisagreements`. A count that
+/// keeps climbing means a pane was re-bound without
+/// [`AiCoordRegistrar::rebind`] following it.
+static REGISTRAR_TERMINAL_ROW_DISAGREEMENTS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// See [`REGISTRAR_TERMINAL_ROW_DISAGREEMENTS`].
+pub(crate) fn registrar_terminal_row_disagreements() -> u64 {
+    REGISTRAR_TERMINAL_ROW_DISAGREEMENTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The tie-break behind [`AiCoordRegistrar::live_coord_row`]: when the
+/// registrar's map and the live terminal both name a row for one harness id
+/// and the two differ, the TERMINAL's wins — every pane spawn mints a fresh
+/// row and binds the new terminal to it, while the map keeps whatever it bound
+/// first — and the disagreement is counted. Otherwise whichever answered.
+fn prefer_terminal_row(registrar: Option<Uuid>, terminal: Option<Uuid>) -> Option<Uuid> {
+    match (registrar, terminal) {
+        (Some(r), Some(t)) if r != t => {
+            REGISTRAR_TERMINAL_ROW_DISAGREEMENTS
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            debug!(
+                "ai_coord_register: registrar row {} and live terminal row {} disagree — \
+                 taking the terminal's",
+                r, t
+            );
+            Some(t)
+        }
+        (r, t) => r.or(t),
+    }
+}
+
 /// Registers authenticated `ClaudeSession`s into `coord.sessions` and owns the
 /// runner-local `coord session_id (UUIDv7) ↔ task_run_id (UUIDv4)` index (R4).
 ///
@@ -391,14 +437,41 @@ impl AiCoordRegistrar {
     ///    terminal whose pinned harness id is `claude_session_id`.
     ///
     /// `None` when neither arm knows the id. One LINK of
-    /// [`Self::resolve_record`]'s adoption chain.
+    /// [`Self::resolve_record`]'s adoption chain. See [`Self::live_coord_row`].
     fn resolve_coord_session_id(&self, claude_session_id: &str) -> Option<Uuid> {
-        self.session_id_for(claude_session_id).or_else(|| {
-            self.inner
-                .terminal_coord_lookup
-                .get()
-                .and_then(|lookup| lookup(claude_session_id))
-        })
+        self.live_coord_row(claude_session_id)
+    }
+
+    /// THE live-row resolver for one harness id — every row resolver here
+    /// goes through it, so a finish and an unmark land on the same row (plan
+    /// `2026-11-07-a-runner-finish-is-addressed-to-a-stale-coord-row-after-a-pane-respawn`).
+    /// Both arms are asked: this registrar's map ([`Self::session_id_for`])
+    /// and the live terminal pinned to the id ([`Inner::terminal_coord_lookup`]).
+    /// When both answer and differ, the terminal's row wins
+    /// ([`prefer_terminal_row`]): the map is first-binding-wins for the
+    /// process lifetime, and a respawned pane is bound to a NEW row.
+    pub(crate) fn live_coord_row(&self, claude_session_id: &str) -> Option<Uuid> {
+        self.live_coord_row_bound(claude_session_id, None)
+    }
+
+    /// [`Self::live_coord_row`] with `bound` — a terminal bind in flight,
+    /// `(pinned harness id, coord row)` — answering the terminal arm for that
+    /// pinned id ahead of the lookup (see [`Self::resolve_record`]).
+    fn live_coord_row_bound(
+        &self,
+        claude_session_id: &str,
+        bound: Option<(&str, Uuid)>,
+    ) -> Option<Uuid> {
+        let terminal = bound
+            .filter(|(pinned, _)| *pinned == claude_session_id)
+            .map(|(_, c)| c)
+            .or_else(|| {
+                self.inner
+                    .terminal_coord_lookup
+                    .get()
+                    .and_then(|lookup| lookup(claude_session_id))
+            });
+        prefer_terminal_row(self.session_id_for(claude_session_id), terminal)
     }
 
     /// Resolve the coord row a lifecycle record's finished marker addresses:
@@ -409,9 +482,11 @@ impl AiCoordRegistrar {
     /// store attached only the record's own `adopted_from` is followed.
     ///
     /// `bound` is a late bind in flight — `(pinned harness id, coord row)` of
-    /// a terminal just wired to coord — consulted after the registrar arm and
-    /// before the terminal lookup, so the bind observer resolves that pinned
+    /// a terminal just wired to coord — answering the terminal arm for that
+    /// pinned id ahead of the lookup, so the bind observer resolves that pinned
     /// id without relying on the terminal already being visible to the lookup.
+    /// Each link is [`Self::live_coord_row_bound`], so the terminal's row wins
+    /// over a different registrar row.
     fn resolve_record(
         &self,
         claude_session_id: &str,
@@ -422,16 +497,7 @@ impl AiCoordRegistrar {
         resolve_adoption_chain(
             claude_session_id,
             adopted_from,
-            |id| {
-                self.session_id_for(id)
-                    .or_else(|| bound.filter(|(pinned, _)| *pinned == id).map(|(_, c)| c))
-                    .or_else(|| {
-                        self.inner
-                            .terminal_coord_lookup
-                            .get()
-                            .and_then(|lookup| lookup(id))
-                    })
-            },
+            |id| self.live_coord_row_bound(id, bound),
             |id| store.and_then(|s| s.get(id)).and_then(|r| r.adopted_from),
         )
     }
@@ -1317,16 +1383,24 @@ impl AiCoordRegistrar {
                 if pin == Some(id.trim()) {
                     pinned_link = true;
                 }
-                self.recorded_row(id).or_else(|| {
-                    self.inner
-                        .terminal_coord_lookup
-                        .get()
-                        .and_then(|lookup| lookup(id))
-                        .map(|coord_session_id| RecordedCoordRow {
-                            coord_session_id,
-                            origin: RecordedRowOrigin::TerminalPinned,
-                        })
-                })
+                // The same tie-break as `live_coord_row` (the live terminal's
+                // row wins over a DIFFERENT registrar row), so this reports
+                // the row a finish is addressed to. Not counted: this is a
+                // read-only display path, polled.
+                let own = self.recorded_row(id);
+                let terminal = self
+                    .inner
+                    .terminal_coord_lookup
+                    .get()
+                    .and_then(|lookup| lookup(id));
+                match (own, terminal) {
+                    (Some(own), Some(t)) if own.coord_session_id == t => Some(own),
+                    (_, Some(coord_session_id)) => Some(RecordedCoordRow {
+                        coord_session_id,
+                        origin: RecordedRowOrigin::TerminalPinned,
+                    }),
+                    (own, None) => own,
+                }
             },
             |id| store.and_then(|s| s.get(id)).and_then(|r| r.adopted_from),
         );
@@ -1548,6 +1622,165 @@ impl AiCoordRegistrar {
             coord_session_id,
             Some((pinned_session_id, coord_session_id)),
         )
+    }
+
+    /// The coord-bind observer's body (main.rs): terminal `terminal_id`,
+    /// pinned to harness id `pinned_session_id`, has just been bound to coord
+    /// row `coord_session_id`. FIRST re-points this registrar's binding for
+    /// that harness id at the new row ([`Self::rebind`]) — a respawned or
+    /// migrated pane is bound to a freshly minted row, and every heartbeat,
+    /// progress, transcript and finish write must follow it — THEN delivers
+    /// the finished marks owed to that row ([`Self::deliver_owed_finish`]), so
+    /// an owed mark resolves to the new row, never the dead one.
+    ///
+    /// Same lock rules as [`Self::deliver_owed_finish`].
+    pub fn on_terminal_coord_bind(
+        &self,
+        pinned_session_id: &str,
+        terminal_id: &str,
+        coord_session_id: Uuid,
+    ) -> Vec<FinishSync> {
+        if let Err(refusal) = self.rebind(pinned_session_id, coord_session_id) {
+            warn!(
+                "ai_coord_register: terminal {} (pinned {}) bound to coord session {} but \
+                 the registrar could not follow it ({:?}) — its writes stay on the old row",
+                terminal_id, pinned_session_id, coord_session_id, refusal
+            );
+        }
+        self.deliver_owed_finish(pinned_session_id, terminal_id, coord_session_id)
+    }
+
+    /// Re-point `claude_session_id`'s binding at coord row `new_coord_id`,
+    /// moving every row-keyed piece of state with it: the `reverse` entry, the
+    /// `forward` (task_run_id inject) entry, the stamped tenant (`tenants`, so
+    /// [`Self::stamp_tenant`] keeps presenting the session's credential slot
+    /// rather than sending unauthenticated PATCHes), a tenant-less decision
+    /// (`undecided`) and the adopted mark.
+    ///
+    /// The new row is always recorded as ADOPTED: it was minted elsewhere
+    /// (`SessionRegistry` for a pane), so this process never wrote its create
+    /// body and [`Self::recorded_row`] must not report it as minted here. An
+    /// old row this registrar MINTED (not adopted) is closed (`Closed` outbox
+    /// row): nothing else would ever close it.
+    ///
+    /// - No binding for the key: [`RebindOutcome::Unbound`], nothing to move.
+    /// - Already bound to `new_coord_id`: [`RebindOutcome::Unchanged`].
+    /// - `new_coord_id` held by ANOTHER key: refused with
+    ///   [`TranscriptBindRefusal::CoordSessionInUse`], nothing moves —
+    ///   taking it would route that key's writes to this session's row.
+    /// - A poisoned `reverse` lock: [`TranscriptBindRefusal::RegistrationDisabled`].
+    ///
+    /// Lock order: `reverse`, then (inside it) `tenants`, `undecided`,
+    /// `adopted` and `forward` — never `reverse` while holding `forward`.
+    ///
+    /// **Known gap — transcript history is NOT replayed onto the new row.**
+    /// Chunks emitted after the rebind address the new row (the emitter
+    /// resolves the row per write), but those emitted before it stay on the
+    /// old one, so the session's history is split across two rows. A replay
+    /// (`SessionTranscriptTailer::bind_and_replay`) cannot express it today:
+    /// the lane offset and the unsent-prefix floor are keyed by HARNESS id, not
+    /// by row, so the new row would need a re-based lane from offset 0, and
+    /// coord's idempotency for such a re-based lane on a second row is not
+    /// established. Plan
+    /// `2026-11-07-a-runner-finish-is-addressed-to-a-stale-coord-row-after-a-pane-respawn`
+    /// Phase 1 (vet D6) chose recording this over replaying.
+    pub fn rebind(
+        &self,
+        claude_session_id: &str,
+        new_coord_id: Uuid,
+    ) -> Result<RebindOutcome, TranscriptBindRefusal> {
+        let (old, old_was_minted_here) = {
+            let Ok(mut rev) = self.inner.reverse.lock() else {
+                warn!(
+                    "ai_coord_register: reverse-index lock poisoned — not re-binding {}",
+                    claude_session_id
+                );
+                return Err(TranscriptBindRefusal::RegistrationDisabled);
+            };
+            let Some(old) = rev.get(claude_session_id).copied() else {
+                return Ok(RebindOutcome::Unbound);
+            };
+            if old == new_coord_id {
+                return Ok(RebindOutcome::Unchanged);
+            }
+            if rev
+                .iter()
+                .any(|(k, v)| *v == new_coord_id && k != claude_session_id)
+            {
+                return Err(TranscriptBindRefusal::CoordSessionInUse);
+            }
+            rev.insert(claude_session_id.to_string(), new_coord_id);
+            // Per-row state moves in the SAME critical section, as
+            // `register_inner` records it: from here on `session_id_for`
+            // answers the new row, so a concurrent row must already find its
+            // tenant there. Through a poisoned lock, as `evict_tenant` does.
+            {
+                let mut tenants = self
+                    .inner
+                    .tenants
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                if let Some(t) = tenants.remove(&old) {
+                    tenants.insert(new_coord_id, t);
+                }
+            }
+            {
+                let mut undecided = self
+                    .inner
+                    .undecided
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                if let Some(d) = undecided.remove(&old) {
+                    undecided.insert(new_coord_id, d);
+                }
+            }
+            let old_was_minted_here = {
+                let mut adopted = self
+                    .inner
+                    .adopted
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                let was_adopted = adopted.remove(&old);
+                adopted.insert(new_coord_id);
+                !was_adopted
+            };
+            // `forward` inside the `reverse` section (reverse -> forward, the
+            // order every path here takes), so a `close_session` racing this
+            // cannot evict `reverse` between the two and strand a `forward`
+            // entry for the new row.
+            if let Ok(mut fwd) = self.inner.forward.lock() {
+                let key = fwd
+                    .remove(&old)
+                    .unwrap_or_else(|| claude_session_id.to_string());
+                fwd.insert(new_coord_id, key);
+            }
+            (old, old_was_minted_here)
+        };
+        info!(
+            "registrar re-bound {}: {} -> {}",
+            claude_session_id, old, new_coord_id
+        );
+        if old_was_minted_here {
+            // This registrar MINTED the old row, so nothing else in the runner
+            // will ever close it (a pane's own row is closed by its pane):
+            // close it now, or it stays `active` beside the live row until
+            // coord's stale reaper — the very "older active row" shape that
+            // misleads coord's resolvers. The tenant moved with the binding,
+            // so stamp it from the new row.
+            let payload = self.stamp_tenant(new_coord_id, json!({ "id": old }));
+            if let Err(e) = self.inner.outbox.record(
+                self.inner.machine_id,
+                old,
+                SessionEventKind::Closed,
+                payload,
+            ) {
+                warn!(
+                    "ai_coord_register: outbox Closed write failed for the superseded row {} of {} (best-effort): {}",
+                    old, claude_session_id, e
+                );
+            }
+        }
+        Ok(RebindOutcome::Moved { from: old })
     }
 
     /// Deliver every unsynced finished mark whose record resolves
@@ -2986,6 +3219,301 @@ mod tests {
         );
     }
 
+    /// Plan `2026-11-07-a-runner-finish-is-addressed-to-a-stale-coord-row-after-a-pane-respawn`
+    /// Phase 1 falsifier: autobind adopted the pane's FIRST row into the
+    /// registrar map; the pane was then respawned (account migration, resume
+    /// door) onto a freshly minted row. The finish must address the row the
+    /// live terminal is bound to, not the dead one the map still holds.
+    #[test]
+    fn a_finish_after_a_pane_rebind_goes_to_the_live_row() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+        let csid = Uuid::new_v4().to_string();
+        let old = Uuid::new_v4();
+        let new = Uuid::new_v4();
+        assert_eq!(
+            reg.bind_transcript_session(
+                &csid,
+                Some(old),
+                Some(OWNING_TENANT),
+                ResumeParams::default()
+            ),
+            Ok(old)
+        );
+        {
+            let csid = csid.clone();
+            reg.attach_terminal_coord_lookup(move |c| (c == csid).then_some(new));
+        }
+
+        assert_eq!(
+            reg.finish_session(&csid, Some(7)),
+            FinishSync::Queued {
+                coord_session_id: new
+            },
+            "the live terminal's row wins over the registrar's stale binding"
+        );
+    }
+
+    /// The observer path with NO terminal lookup attached: the coord-bind
+    /// observer alone must move every row-keyed write (heartbeat, progress,
+    /// finish, the inject resolver) and the stamped tenant to the new row.
+    #[test]
+    fn a_rebind_observer_moves_heartbeat_progress_and_tenant_to_the_new_row() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+        let csid = Uuid::new_v4().to_string();
+        let (old, new) = (Uuid::new_v4(), Uuid::new_v4());
+        reg.bind_transcript_session(
+            &csid,
+            Some(old),
+            Some(OWNING_TENANT),
+            ResumeParams::default(),
+        )
+        .unwrap();
+
+        reg.on_terminal_coord_bind(&csid, "term-new", new);
+
+        assert_eq!(reg.session_id_for(&csid), Some(new));
+        assert_eq!(reg.task_run_id_for(&new), Some(csid.clone()));
+        assert_eq!(reg.task_run_id_for(&old), None);
+        assert_eq!(reg.recorded_tenant(&csid), Some(OWNING_TENANT));
+        assert_eq!(
+            reg.recorded_row(&csid).map(|r| r.origin),
+            Some(RecordedRowOrigin::Adopted),
+            "the new row was minted elsewhere, never reported as minted here"
+        );
+
+        reg.heartbeat_on_interaction(&csid);
+        reg.progress_on_interaction(&csid);
+        assert_eq!(
+            reg.finish_session(&csid, Some(9)),
+            FinishSync::Queued {
+                coord_session_id: new
+            }
+        );
+        let pending = reg.inner.outbox.pending().unwrap();
+        assert_eq!(pending.len(), 3, "{pending:?}");
+        for row in &pending {
+            assert_eq!(
+                row.session_id, new,
+                "{} row addressed the old row",
+                row.event_kind
+            );
+            assert_eq!(row.payload["id"], json!(new));
+            assert_eq!(
+                row.payload["tenant_id"],
+                json!(OWNING_TENANT),
+                "{} row lost its tenant stamp (an unauthenticated PATCH)",
+                row.event_kind
+            );
+        }
+    }
+
+    /// An old row this registrar MINTED has no other closer: the rebind closes
+    /// it, stamped with the session's tenant. An ADOPTED old row (a pane's)
+    /// is left to its pane.
+    #[test]
+    fn a_rebind_closes_an_old_row_this_registrar_minted() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+        let csid = Uuid::new_v4().to_string();
+        let minted = reg
+            .bind_transcript_session(&csid, None, Some(OWNING_TENANT), ResumeParams::default())
+            .unwrap();
+        let new = Uuid::new_v4();
+        assert_eq!(
+            reg.rebind(&csid, new),
+            Ok(RebindOutcome::Moved { from: minted })
+        );
+        let pending = reg.inner.outbox.pending().unwrap();
+        let closed: Vec<_> = pending
+            .iter()
+            .filter(|r| r.event_kind == SessionEventKind::Closed.as_str())
+            .collect();
+        assert_eq!(closed.len(), 1, "{pending:?}");
+        assert_eq!(closed[0].session_id, minted);
+        assert_eq!(closed[0].payload["id"], json!(minted));
+        assert_eq!(closed[0].payload["tenant_id"], json!(OWNING_TENANT));
+        assert_eq!(reg.session_id_for(&csid), Some(new));
+    }
+
+    /// The tie-break is counted, and it also covers the typed-resume plane:
+    /// a sniffed registration of X loses to a LIVE pane pinned to X.
+    #[test]
+    fn a_registrar_terminal_disagreement_takes_the_terminal_row_and_is_counted() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+        let csid = Uuid::new_v4().to_string();
+        let sniffed = reg
+            .register_sniffed_session(&csid, "typed resume", None)
+            .unwrap();
+        let pane = Uuid::new_v4();
+        {
+            let csid = csid.clone();
+            reg.attach_terminal_coord_lookup(move |c| (c == csid).then_some(pane));
+        }
+        let before = registrar_terminal_row_disagreements();
+        assert_ne!(sniffed, pane);
+        assert_eq!(reg.live_coord_row(&csid), Some(pane));
+        // A process-wide counter: other tests may move it too, so a delta.
+        assert!(registrar_terminal_row_disagreements() > before);
+        assert_eq!(
+            reg.recorded_row_for_record(&csid, None),
+            Some(RecordedCoordRow {
+                coord_session_id: pane,
+                origin: RecordedRowOrigin::TerminalPinned,
+            }),
+            "session-info reports the row a finish is addressed to"
+        );
+    }
+
+    /// main.rs's coord-bind observer must call `on_terminal_coord_bind` (which
+    /// re-binds, then delivers owed marks), not `deliver_owed_finish` alone —
+    /// the observer closure is not reachable from a unit test, so this pins
+    /// the wiring by source scan.
+    #[test]
+    fn the_coord_bind_observer_rebinds_the_registrar() {
+        let main = include_str!("../main.rs");
+        let (_, after) = main
+            .split_once("term_for_session.attach_coord_bind_observer(")
+            .expect("main.rs attaches the coord-bind observer");
+        let region: String = after.chars().take(400).collect();
+        assert!(
+            region.contains("r.on_terminal_coord_bind(pinned, terminal_id, coord_id)"),
+            "{region}"
+        );
+        assert!(!region.contains("r.deliver_owed_finish("), "{region}");
+    }
+
+    #[test]
+    fn rebind_to_the_same_row_is_a_no_op() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+        let csid = Uuid::new_v4().to_string();
+        let row = Uuid::new_v4();
+        assert_eq!(
+            reg.rebind(&csid, row),
+            Ok(RebindOutcome::Unbound),
+            "a first bind has nothing to move"
+        );
+        assert_eq!(reg.session_id_for(&csid), None, "and binds nothing");
+
+        reg.bind_transcript_session(
+            &csid,
+            Some(row),
+            Some(OWNING_TENANT),
+            ResumeParams::default(),
+        )
+        .unwrap();
+        assert_eq!(reg.rebind(&csid, row), Ok(RebindOutcome::Unchanged));
+        assert_eq!(reg.session_id_for(&csid), Some(row));
+        assert_eq!(reg.task_run_id_for(&row), Some(csid.clone()));
+        assert_eq!(reg.recorded_tenant(&csid), Some(OWNING_TENANT));
+        assert!(reg.inner.outbox.pending().unwrap().is_empty());
+    }
+
+    #[test]
+    fn rebind_refuses_a_row_held_by_another_session() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+        let (mine, theirs) = (Uuid::new_v4().to_string(), Uuid::new_v4().to_string());
+        let (my_row, their_row) = (Uuid::new_v4(), Uuid::new_v4());
+        reg.bind_transcript_session(
+            &mine,
+            Some(my_row),
+            Some(OWNING_TENANT),
+            ResumeParams::default(),
+        )
+        .unwrap();
+        reg.bind_transcript_session(&theirs, Some(their_row), None, ResumeParams::default())
+            .unwrap();
+
+        assert_eq!(
+            reg.rebind(&mine, their_row),
+            Err(TranscriptBindRefusal::CoordSessionInUse)
+        );
+        assert_eq!(reg.session_id_for(&mine), Some(my_row), "nothing moved");
+        assert_eq!(reg.session_id_for(&theirs), Some(their_row));
+        assert_eq!(reg.task_run_id_for(&my_row), Some(mine.clone()));
+        assert_eq!(reg.task_run_id_for(&their_row), Some(theirs.clone()));
+        assert_eq!(reg.recorded_tenant(&mine), Some(OWNING_TENANT));
+    }
+
+    /// Vet D5: after the registrar follows a migrated pane to its new row, the
+    /// OLD pane's exit close must not close the live row through the store's
+    /// close observer (main.rs: `close_session(csid)`). The migration marks the
+    /// old terminal superseded, so the store answers `TerminalSuperseded` and
+    /// fires nothing; a close that races ahead of the mark is a mis-bound
+    /// `NotFound` (the record already belongs to the new terminal), which fires
+    /// nothing either.
+    #[test]
+    fn closing_the_superseded_pane_after_a_rebind_leaves_the_live_row_open() {
+        use crate::session::session_lifecycle_store::{test_open_record, CloseOutcome};
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+        let reg = Arc::new(reg);
+        let (store, _store_dir) = attach_store(&reg);
+        {
+            let reg = Arc::downgrade(&reg);
+            store.attach_close_observer(move |csid| {
+                if let Some(r) = reg.upgrade() {
+                    r.close_session(csid);
+                }
+            });
+        }
+        let csid = Uuid::new_v4().to_string();
+        let (old, new) = (Uuid::new_v4(), Uuid::new_v4());
+        let on = |terminal: &str| {
+            let mut rec = test_open_record(&csid);
+            rec.terminal_id = terminal.to_string();
+            rec.origin = Some(
+                crate::session::session_lifecycle_store::ORIGIN_AUTHORITATIVE.to_string(),
+            );
+            rec
+        };
+        store.record_open(on("term-old"));
+        reg.bind_transcript_session(&csid, Some(old), None, ResumeParams::default())
+            .unwrap();
+
+        // The migration: the record re-keys onto the new pane, which is bound
+        // to its freshly minted row; then the old pane is marked and closed.
+        store.record_open(on("term-new"));
+        reg.on_terminal_coord_bind(&csid, "term-new", new);
+        store.mark_terminal_superseded("term-old", "term-new");
+        assert!(matches!(
+            store.record_close_checked(&csid, Some("term-old"), "pty-exit"),
+            CloseOutcome::TerminalSuperseded { .. }
+        ));
+        // A second (raced) close of the old pane, with no mark left.
+        assert!(matches!(
+            store.record_close_checked(&csid, Some("term-old"), "pty-exit"),
+            CloseOutcome::NotFound { .. }
+        ));
+
+        assert_eq!(
+            reg.session_id_for(&csid),
+            Some(new),
+            "the live row stays bound"
+        );
+        assert_eq!(store.get(&csid).unwrap().state, "open");
+        assert!(
+            reg.inner
+                .outbox
+                .pending()
+                .unwrap()
+                .iter()
+                .all(|r| r.event_kind != SessionEventKind::Closed.as_str()),
+            "no coord Closed for either row of a live session"
+        );
+    }
+
     /// A terminal-hosted `claude` registers through `SessionRegistry`, never
     /// through this registrar, so `reverse` never holds its coord id. The
     /// terminal-plane resolver arm must still address the `Finished` row to
@@ -3143,7 +3671,7 @@ mod tests {
     fn attach_one_terminal(reg: &AiCoordRegistrar, pinned: &'static str, coord: Uuid) {
         reg.attach_terminal_coord_lookup(move |csid| {
             crate::terminal::manager::resolve_pinned_coord(
-                std::iter::once((pinned, Some(coord))),
+                std::iter::once((pinned, Some((coord, 1)))),
                 csid,
             )
         });

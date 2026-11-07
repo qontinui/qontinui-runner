@@ -1406,8 +1406,11 @@ fn migrate_session(
             title: title.clone(),
             page_id: record.page_id.clone(),
             zone_index: record.zone_index,
-            // The migration keeps the coord row it already had — it claims no
-            // new work-unit / topic / repo, and no lineage.
+            // The migration claims no new work-unit / topic / repo, and no
+            // lineage. It does NOT keep the coord row: `spawn_resumed_pane`
+            // registers the new pane and mints a fresh row, and the
+            // coord-bind observer re-points the registrar at it
+            // (`AiCoordRegistrar::on_terminal_coord_bind`).
             work_unit_slug: None,
             correlation_topic: None,
             intent_repo: None,

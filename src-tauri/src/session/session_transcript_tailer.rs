@@ -599,6 +599,9 @@ struct Coverage {
     autobind_adopted: u64,
     autobind_minted: u64,
     autobind_deferred: u64,
+    /// Adoptions where coord served a non-`active` row and the live pane's own
+    /// row was adopted instead (`transcript_autobind::settle`).
+    autobind_closed_row_declined: u64,
     /// Transcript sync's gate (the user's toggle AND the tenant's
     /// `egress_transcript_sync`) as observed at the last append. `None` until
     /// an append is seen —
@@ -646,6 +649,10 @@ pub struct CoverageReport {
     /// Auto-bind attempts that did not bind (coord unreadable / unresolved,
     /// Gate 1 off, registrar refusal). Retried on the next throttle window.
     pub autobind_deferred: u64,
+    /// Of the adoptions, those where coord served a row that was not `active`
+    /// and the live pane pinned to the harness id was bound to another row,
+    /// which was adopted instead.
+    pub autobind_closed_row_declined: u64,
 }
 
 /// How an auto-bind attempt ended, for the coverage counters.
@@ -666,6 +673,19 @@ impl SessionTranscriptTailer {
     /// (see [`AiCoordRegistrar::pending_started_session_for`]). Blocking.
     pub fn pending_started_row(&self, session_key: &str) -> Option<Uuid> {
         self.registrar.pending_started_session_for(session_key)
+    }
+
+    /// The live row for `session_key` by the registrar's one live-row
+    /// resolver ([`AiCoordRegistrar::live_coord_row`]) — for an unbound key,
+    /// the row of the live terminal pinned to it.
+    pub fn live_coord_row(&self, session_key: &str) -> Option<Uuid> {
+        self.registrar.live_coord_row(session_key)
+    }
+
+    /// Count one auto-bind that declined a non-`active` served row for the
+    /// live pane's row (see `CoverageReport::autobind_closed_row_declined`).
+    pub fn note_autobind_closed_row_declined(&self) {
+        self.lock_coverage().autobind_closed_row_declined += 1;
     }
 
     /// Record that the watcher SAW `session_key` and it has no binding, so the
@@ -1576,6 +1596,7 @@ impl SessionTranscriptTailer {
             autobind_adopted: cov.autobind_adopted,
             autobind_minted: cov.autobind_minted,
             autobind_deferred: cov.autobind_deferred,
+            autobind_closed_row_declined: cov.autobind_closed_row_declined,
         }
     }
 
