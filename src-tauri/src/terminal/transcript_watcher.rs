@@ -38,8 +38,8 @@ use tokio::sync::{mpsc, Mutex as TokioMutex, Notify};
 use tracing::{debug, info, warn};
 
 use super::transcript::{
-    find_claude_config_dirs, is_workflow_session_marker, list_sessions, parse_line_for_agent_log,
-    parse_line_for_touched_files, AgentLogObs,
+    find_claude_config_dirs, first_command_of_line, is_workflow_session_marker, list_sessions,
+    parse_line_for_agent_log, parse_line_for_touched_files, AgentLogObs, FirstCommandObservation,
 };
 use crate::claude_session::coord_register::{AgentLogEmitter, AiCoordRegistrar};
 use crate::session::session_transcript_tailer::SessionTranscriptTailer;
@@ -1360,6 +1360,18 @@ async fn tail_session(
     )
     .await?;
 
+    // ── First slash command (run ledger, plan
+    // `2026-10-23-session-duration-by-work-type-and-per-device-session-load`
+    // D3) ────────────────────────────────────────────────────────────────────
+    //
+    // The session's first operator prompt, when it is a `<command-name>/x`
+    // block, names its work type (`/vet-imp`, `/implement-phase`, …). Only a
+    // tail that reads the file FROM ITS START can know which prompt was first,
+    // so a tail opened mid-file (a pre-existing transcript after a runner
+    // restart) never decides. Decided once per tail; the store keeps the first
+    // value it is given (set-once), so a re-opened tail cannot change it.
+    let mut first_command_decided = reader.cursor() != 0;
+
     // Buffered prefix used for the workflow-session re-check on first wake.
     let mut workflow_check_buf = String::new();
     let mut did_workflow_recheck = false;
@@ -1445,6 +1457,24 @@ async fn tail_session(
             // Buffer the first 5 lines for the workflow re-check.
             if !did_workflow_recheck && workflow_check_buf.lines().count() < 5 {
                 workflow_check_buf.push_str(line);
+            }
+
+            if !first_command_decided {
+                match first_command_of_line(line) {
+                    FirstCommandObservation::NotAPrompt => {}
+                    FirstCommandObservation::NotACommand => first_command_decided = true,
+                    FirstCommandObservation::Command(raw) => {
+                        first_command_decided = true;
+                        use tauri::Manager;
+                        if let Some(store) = app_handle.try_state::<
+                            Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>,
+                        >() {
+                            // Validates (`^[a-z0-9:_-]{1,64}$`), drops anything
+                            // else, and mirrors a `merge` on a counted run.
+                            store.note_first_command(&session_id, &raw);
+                        }
+                    }
+                }
             }
 
             match parse_line_for_touched_files(&session_id, line) {

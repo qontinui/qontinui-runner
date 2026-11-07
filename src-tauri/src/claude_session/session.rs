@@ -1277,6 +1277,22 @@ impl ClaudeSession {
                 session_id_for_waiter, is_rate_limited
             );
 
+            // Run ledger (plan 2026-10-23-session-duration-by-work-type-and-
+            // per-device-session-load, Phase 4): the process exit is the
+            // agentic run's observed end — unless a rate-limit restart above
+            // registered a live successor under the same id, which carries
+            // the SAME run on (its own exit ends it).
+            let successor_live = is_rate_limited && {
+                use tauri::Manager;
+                app_handle_for_waiter
+                    .try_state::<Arc<crate::claude_session::SessionManager>>()
+                    .and_then(|sm| sm.get(&session_id_for_waiter))
+                    .is_some_and(|s| s.state().is_active())
+            };
+            if !successor_live {
+                crate::session::run_record_emitter::agentic_process_exited(&session_id_for_waiter);
+            }
+
             // Review notes sent into this worker are never confirmed from a
             // transcript (worker transcripts are not tailed); with the process
             // gone they can no longer arrive, so settle them `unknown` — unless
