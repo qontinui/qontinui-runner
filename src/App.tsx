@@ -320,6 +320,9 @@ function AppContent() {
       const pageNameToId = new Map(terminalPages.pages.map((p) => [p.name, p.id]));
       for (const group of plan.pages) {
         if (!pageNameToId.has(group.name)) {
+          // `addPage` makes the name unique against the FULL roster (a
+          // detached page may already carry it), so the page may be called
+          // "<name> 2"; routing below is by the id, not the name.
           const newId = terminalPages.addPage(group.name);
           pageNameToId.set(group.name, newId);
         }
@@ -368,14 +371,6 @@ function AppContent() {
           } catch {
             console.warn(`Failed to create terminal on page ${group.name}`);
           }
-        }
-      }
-
-      // Rename existing pages to match the proposal
-      for (const group of plan.pages) {
-        const pageId = pageNameToId.get(group.name);
-        if (pageId) {
-          terminalPages.renamePage(pageId, group.name);
         }
       }
 
