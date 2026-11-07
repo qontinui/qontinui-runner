@@ -4,7 +4,6 @@ import {
   Tag,
   FolderKanban,
   Globe,
-  Bot,
   Cloud,
   Play,
 } from "lucide-react";
@@ -45,8 +44,6 @@ const getActivityIcon = (type: ActivityType) => {
   switch (type) {
     case "extraction":
       return Globe;
-    case "ai":
-      return Bot;
     case "sync":
       return Cloud;
     default:
@@ -58,7 +55,6 @@ const getActivityIcon = (type: ActivityType) => {
 const getActivityColor = (type: ActivityType) => {
   const colorMap: Record<ActivityType, string> = {
     extraction: "blue",
-    ai: "amber",
     sync: "green",
   };
   return getAccentColors(colorMap[type] || "slate").text;
