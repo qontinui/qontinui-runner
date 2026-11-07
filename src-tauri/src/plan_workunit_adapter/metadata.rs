@@ -104,8 +104,9 @@ const SCANNER_OWNED_KEYS: &[ScannerKey] = &[
         absent_rule: AbsentRule::OmitWhenAbsent,
     },
     // `repos` has OTHER writers: sessions hand-write `metadata.repos` with
-    // `coord_work_unit_upsert` (measured 2026-11-02 and 2026-11-05 on stored
-    // plan-backed units, in both `qontinui/<repo>` and bare spellings). So it
+    // `coord_work_unit_upsert`, in both `qontinui/<repo>` and bare spellings
+    // (measured on stored plan-backed units by plan
+    // `2026-11-02-plan-backed-work-units-carry-no-repos-so-coords-repo-readers-read-empty`). So it
     // is OmitWhenAbsent, never DeleteWhenAbsent: a plan with no `Repo(s):`
     // line (most of the corpus) leaves a hand-written list alone, while a plan
     // that declares one overwrites it — the roster's documented precedence.
