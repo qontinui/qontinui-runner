@@ -1884,6 +1884,7 @@ mod tests {
                 session_status_since: None,
                 blocks_restart: true,
                 wind_down: None,
+                stray_wait_shells: 0,
             }],
             tracked_dead: vec![TrackedDeadRecord {
                 claude_session_id: "ghost".to_string(),
@@ -3132,6 +3133,7 @@ mod tests {
             session_status_since: None,
             blocks_restart: status != Some("finished"),
             wind_down: None,
+            stray_wait_shells: 0,
         }
     }
 
