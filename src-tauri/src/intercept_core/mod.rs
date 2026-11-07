@@ -18,7 +18,8 @@
 //! [`npm_placeholder`] is here for the same reason, though it is not pure: it
 //! reads the first bytes of a candidate file. So is [`shim_dir`] — the one
 //! "is this a qontinui shim dir" predicate every PATH walker shares — which
-//! probes for the identity marker.
+//! probes for the identity marker, and whose persistent-dir arm reads the
+//! ambient home through `profile_cli::identity_shim_dir`.
 //!
 //! What stayed in the bin (`install_effects_producer`): everything that touches
 //! the coord HTTP client, the keyring, the producer route handlers, the
