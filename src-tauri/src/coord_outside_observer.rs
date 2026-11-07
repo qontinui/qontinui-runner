@@ -3273,10 +3273,8 @@ mod tests {
     #[test]
     fn a_truncated_read_naming_a_new_death_pages_it_without_clearing_the_old_one() {
         let a_dead = ledger_body(1, json!([dead_dispatch()]));
-        let b_only = truncated_ledger_body(
-            2,
-            json!([dead_row("gate_evaluation_sweep", true, false)]),
-        );
+        let b_only =
+            truncated_ledger_body(2, json!([dead_row("gate_evaluation_sweep", true, false)]));
         let mut state = ObserverState::default();
         state.observe(&classify_ledger(&a_dead));
         state.take_cleared();
