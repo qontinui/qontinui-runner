@@ -6634,7 +6634,7 @@ mod action_not_supported_tests {
         recovery_is_genuine, ActionResult, Json, StatusCode, UiBridgeError,
     };
     use crate::mcp::types::ApiResponse;
-    use crate::mcp::ui_bridge::recovery_executor::{RecoveryOutcome, RecoveryVia};
+    use crate::mcp::ui_bridge::recovery_executor::{RecoveryOutcome, RecoveryVia, RetryOutcome};
     use serde_json::json;
 
     #[test]
@@ -7066,6 +7066,11 @@ mod action_not_supported_tests {
     fn only_a_command_backed_recovery_counts_as_recovered() {
         let mk = |recovered: bool, cmd: Option<&str>| RecoveryOutcome {
             recovered,
+            retry_outcome: if recovered {
+                RetryOutcome::Succeeded
+            } else {
+                RetryOutcome::Failed
+            },
             via: RecoveryVia::LlmFallback,
             command_chosen: cmd.map(str::to_string),
             error_code: None,
@@ -7096,6 +7101,7 @@ mod action_not_supported_tests {
         ));
         let recovery = serde_json::to_value(RecoveryOutcome {
             recovered: false,
+            retry_outcome: RetryOutcome::NotRetried,
             via: RecoveryVia::None,
             command_chosen: None,
             error_code: None,
