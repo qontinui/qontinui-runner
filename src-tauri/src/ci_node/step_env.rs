@@ -18,10 +18,11 @@
 //! Removing `CLAUDE_CONFIG_DIR` alone would let a `claude` run inside a step
 //! fall back to the default config dir under the inherited `HOME`: the owner's
 //! login. So the executor then SETS it, for every step, to a directory of that
-//! step's own, `<dispatch root>/.ci-claude-config/<step index>`, recreated
-//! empty just before the step runs ([`fresh_empty_config_dir`]). A `claude` in
-//! a step therefore starts with no login, and a process an earlier step left
-//! running writes where ITS `CLAUDE_CONFIG_DIR` points: that step's directory,
+//! step's own, `<dispatch root>/.ci-claude-config/<step index>`, made just
+//! before the step runs and real and empty at the moment it is made
+//! ([`fresh_empty_config_dir`]). A `claude` in a step therefore starts with no
+//! login, and a process an earlier step left running, writing where ITS
+//! `CLAUDE_CONFIG_DIR` points, writes into that earlier step's directory,
 //! which no later step is pointed at. The parent sits inside the dispatch root,
 //! which the dispatch's cleanup removes whole. Removals are applied before any
 //! variable is set, so that executor-owned value is set rather than removed.
@@ -30,7 +31,10 @@
 //!
 //! `HOME` is still inherited. The scrub stops a `claude` in a step from picking
 //! up the owner's login BY DEFAULT; it does not stop repo code from finding
-//! `~/.claude*`, or any other file the node owner can read, by path. A step
+//! `~/.claude*`, or any other file the node owner can read, by path. Nor does
+//! it stop a process an earlier step left running from replacing a later
+//! step's directory with a link after that directory is made (see
+//! [`fresh_empty_config_dir`]). A step
 //! runs as the node owner's OS user, and this module is not a sandbox. Its
 //! scope is parity with ci-exec's step scrub (plan
 //! `2026-10-13-ci-node-runs-model-dependent-eval-steps` D11), plus the
@@ -195,8 +199,9 @@ pub(crate) fn current_step_env_removals() -> Vec<OsString> {
 
 /// (Re)create the empty `CLAUDE_CONFIG_DIR` of the step at `step_index`:
 /// `<dispatch_root>/.ci-claude-config/<step_index>`, a directory of that step's
-/// own, so a process an earlier step left running writes into the earlier
-/// step's directory and never into this one.
+/// own, so a process an earlier step left running, writing where ITS
+/// `CLAUDE_CONFIG_DIR` points, writes into the earlier step's directory and
+/// not into this one.
 ///
 /// Nothing found at either path is followed. The parent `.ci-claude-config` is
 /// kept if it is a real directory (it holds the earlier steps' directories);
@@ -205,14 +210,19 @@ pub(crate) fn current_step_env_removals() -> Vec<OsString> {
 /// is removed whole and anything else is unlinked. Both are then made with
 /// `create_dir`, never `create_dir_all`: if anything appears at the path in
 /// between, a link planted after the removal included, the creation fails, and
-/// with it the step, rather than the link being followed.
+/// with it the step, rather than the link being followed. What is guaranteed is
+/// that the step's directory is real and empty at the moment it is made.
 ///
-/// Not closed here: a parent swapped for a link AFTER its check and before the
-/// step's directory is made; closing that needs directory-fd-relative calls.
-/// That swap can only relocate the step's newly made, empty directory. It
-/// cannot hand the step an existing one, since `create_dir` refuses an existing
-/// path. (Code running as the node owner can read the owner's login anyway;
-/// see the module docs.)
+/// Not closed here (each would need directory-fd-relative calls, or a directory
+/// the node owner cannot write):
+/// - the parent swapped for a link after its check and before the step's
+///   directory is made, which then makes that directory behind the link;
+/// - the parent or the step's directory removed and replaced by a link AFTER
+///   the step's directory is made and before the step runs, by a process an
+///   earlier step left running: the step is then pointed through that link.
+///
+/// Both need a process running as the node owner, which can read the owner's
+/// login directly anyway (see the module docs).
 ///
 /// `Err` means no empty directory could be guaranteed: the caller fails the
 /// step rather than run it with the variable pointing somewhere that is not
@@ -579,7 +589,9 @@ mod tests {
     /// THE RACE: a link planted at the step's path AFTER its removal and before
     /// its creation (the seam runs in exactly that window). `create_dir` finds
     /// the path taken and fails, so the step fails instead of being pointed
-    /// through the link; `create_dir_all` would have followed it and said Ok.
+    /// through the link, and the link is left as planted: refused, not removed
+    /// or replaced. This is the test that catches a `create_dir_all` there,
+    /// which returns Ok through the link and turns it red.
     #[cfg(unix)]
     #[test]
     fn a_link_planted_after_the_removal_fails_the_call_and_is_never_followed() {
@@ -595,6 +607,14 @@ mod tests {
         assert!(
             err.contains("could not create") && err.contains(".ci-claude-config"),
             "got: {err}"
+        );
+        let leaf = tmp.path().join(".ci-claude-config").join("0");
+        assert!(
+            std::fs::symlink_metadata(&leaf)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the planted link is no longer a link: it was removed or replaced, not refused"
         );
         assert_eq!(
             entries(&login),
@@ -663,9 +683,32 @@ mod tests {
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
     }
 
+    /// Make `link` a junction to `target` with `cmd /C mklink /J`, and check
+    /// that Rust sees it as a link: a fixture that made something else would
+    /// let the tests below pass without exercising the link arm at all.
+    #[cfg(windows)]
+    fn mklink_junction(link: &Path, target: &Path) {
+        let status = std::process::Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(link)
+            .arg(target)
+            .status()
+            .expect("cmd runs");
+        assert!(status.success(), "mklink /J failed: {status}");
+        assert!(
+            std::fs::symlink_metadata(link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "mklink /J made something Rust does not see as a link"
+        );
+    }
+
     /// Windows: a JUNCTION at the step's path (which `remove_file` refuses) is
     /// removed as a link and replaced by a real empty directory; the junction's
-    /// target keeps its file. Junctions need no elevation, unlike symlinks.
+    /// target keeps its file.
     #[cfg(windows)]
     #[test]
     fn a_junction_at_the_config_dir_path_is_unlinked_never_followed() {
@@ -676,15 +719,7 @@ mod tests {
         std::fs::create_dir_all(&login).unwrap();
         std::fs::write(login.join(".credentials.json"), "x").unwrap();
         let leaf = parent.join("0");
-        let status = std::process::Command::new("cmd")
-            .arg("/C")
-            .arg("mklink")
-            .arg("/J")
-            .arg(&leaf)
-            .arg(&login)
-            .status()
-            .expect("cmd runs");
-        assert!(status.success(), "mklink /J failed: {status}");
+        mklink_junction(&leaf, &login);
 
         let dir = fresh_empty_config_dir(tmp.path(), 0).unwrap();
         assert_eq!(dir, leaf);
@@ -698,6 +733,35 @@ mod tests {
             entries(&login),
             [OsString::from(".credentials.json")],
             "the junction's target was touched"
+        );
+    }
+
+    /// Windows: a parent `.ci-claude-config` that is a JUNCTION to a directory
+    /// holding a login is removed as a link and made anew as a real directory.
+    /// The step's directory is made inside that real parent, never behind the
+    /// junction, and the login directory keeps exactly its file.
+    #[cfg(windows)]
+    #[test]
+    fn a_parent_that_is_a_junction_is_unlinked_and_made_anew_never_followed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let login = tmp.path().join("owner-claude");
+        std::fs::create_dir_all(&login).unwrap();
+        std::fs::write(login.join(".credentials.json"), "x").unwrap();
+        let parent = tmp.path().join(".ci-claude-config");
+        mklink_junction(&parent, &login);
+
+        let dir = fresh_empty_config_dir(tmp.path(), 0).unwrap();
+        assert_eq!(dir, parent.join("0"));
+        let meta = std::fs::symlink_metadata(&parent).unwrap();
+        assert!(
+            meta.is_dir() && !meta.file_type().is_symlink(),
+            "the parent junction was not replaced by a real directory"
+        );
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        assert_eq!(
+            entries(&login),
+            [OsString::from(".credentials.json")],
+            "the directory behind the parent junction was touched"
         );
     }
 

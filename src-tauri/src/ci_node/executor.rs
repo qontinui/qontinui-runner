@@ -974,13 +974,15 @@ async fn run_step(
         }
     };
 
-    // A config dir of this step's own, recreated empty just before it runs. A
-    // `claude` here finds no login, and a process an EARLIER step left running
-    // writes where ITS `CLAUDE_CONFIG_DIR` points, which is that step's
-    // directory, never this one. It does not stop a step from writing anywhere
-    // else the node owner can. No empty directory, no step: it never runs
-    // pointed at one that is not empty. Filesystem work, so on the blocking
-    // pool, like the dispatch-root delete in `checkout`.
+    // A config dir of this step's own, made just before it runs and real and
+    // empty at the moment it is made. A `claude` here finds no login, and a
+    // process an EARLIER step left running, writing where ITS
+    // `CLAUDE_CONFIG_DIR` points, writes into that step's directory, not this
+    // one. It does not stop a process running as the node owner from writing
+    // wherever it can, this step's directory included (see `super::step_env`).
+    // No empty directory, no step: it never runs pointed at one that was not
+    // empty when made. Filesystem work, so on the blocking pool, like the
+    // dispatch-root delete in `checkout`.
     let config_dir = {
         let root = dispatch_root.to_path_buf();
         match tokio::task::spawn_blocking(move || {
@@ -1896,52 +1898,123 @@ mod tests {
         (!ident.is_empty()).then_some(ident)
     }
 
-    /// The enclosing fn of every CALL of `name` in `src`, in order. A call is
-    /// `name(` not preceded by an identifier character or by `fn`; whole-line
-    /// comments (docs included) are skipped. The enclosing fn is the nearest
-    /// `fn` defined above the call, which holds in this file: it defines no fn
-    /// inside another.
-    fn calls_of(src: &str, name: &str) -> Vec<String> {
-        let needle = format!("{name}(");
-        let mut current = String::new();
+    /// The callee path of every call on one line of CODE (comments removed,
+    /// literals emptied): the run of identifier characters and `::` just before
+    /// each `(`, such as `crate::process_helpers::tokio_no_window`. A `(` after
+    /// anything else (a space, `)`, `!`, `>`) names no callee, and a definition
+    /// (`fn x(`) is not a call.
+    fn callees(code: &str) -> Vec<String> {
         let mut out = Vec::new();
-        for line in src.lines() {
-            let code = line.trim_start();
-            if code.starts_with("//") {
+        for (at, c) in code.char_indices() {
+            if c != '(' {
                 continue;
             }
-            if let Some(defined) = fn_defined_on(code) {
-                current = defined;
-            }
-            let mut from = 0;
-            while let Some(at) = code
-                .get(from..)
-                .and_then(|rest| rest.find(&needle))
-                .map(|i| from + i)
-            {
-                let before = code.get(..at).unwrap_or("");
-                let after_ident = before
-                    .chars()
-                    .next_back()
-                    .is_some_and(|c| c.is_alphanumeric() || c == '_');
-                if !after_ident && !before.trim_end().ends_with("fn") {
-                    out.push(current.clone());
-                }
-                from = at + needle.len();
+            let before = code.get(..at).unwrap_or("");
+            let Some(start) = before
+                .char_indices()
+                .rev()
+                .take_while(|(_, ch)| ch.is_alphanumeric() || *ch == '_' || *ch == ':')
+                .last()
+                .map(|(i, _)| i)
+            else {
+                continue;
+            };
+            let path = before.get(start..).unwrap_or("").trim_start_matches(':');
+            let lead = before.get(..start).unwrap_or("").trim_end();
+            let is_definition = lead
+                .strip_suffix("fn")
+                .is_some_and(|rest| !rest.ends_with(|ch: char| ch.is_alphanumeric() || ch == '_'));
+            if !path.is_empty() && !is_definition {
+                out.push(path.to_string());
             }
         }
         out
     }
 
-    /// THE STEP PATH IS ONE PATH. The end-to-end test enters at `run_step`;
-    /// this pins that `run_dispatch` reaches a step only through it, that
-    /// `run_step` spawns only through `spawn_step_child`, that both of
-    /// `spawn_step_child`'s commands get the scrub through `apply_step_env`,
-    /// and that `build_step_command` has no other caller in this file. It also
-    /// pins that this file builds a process nowhere else: no `Command::new`,
-    /// and `tokio_no_window` only inside `build_step_command`. A new caller, a
-    /// wrapper or a second spawn path in this file turns it red. It scans this
-    /// file only, so a step spawned from ANOTHER module is outside its reach
+    /// Every call in `src`, as `(enclosing fn, callee path)`, in order. The
+    /// text is read as CODE only, through the lexer the lib's own source
+    /// guards use (`process_helpers::code_lexer`): comments are removed and
+    /// string and char literals emptied, with a block comment or a string
+    /// carried from one line into the next, so a mention in a comment or a
+    /// literal is never a call. The enclosing fn is the nearest `fn` defined
+    /// above the call, which holds in this file: it defines no fn inside
+    /// another.
+    fn calls_in(src: &str) -> Vec<(String, String)> {
+        use crate::process_helpers::code_lexer::{code_only_from, Lex};
+        let mut lex = Lex::Code;
+        let mut current = String::new();
+        let mut out = Vec::new();
+        for line in src.lines() {
+            let code = code_only_from(line, &mut lex);
+            if let Some(defined) = fn_defined_on(code.trim_start()) {
+                current = defined;
+            }
+            out.extend(
+                callees(&code)
+                    .into_iter()
+                    .map(|callee| (current.clone(), callee)),
+            );
+        }
+        out
+    }
+
+    /// Whether `path` names `tail`, by whole segments: `run_step` and
+    /// `super::run_step` do, `run_step_unpinned` does not.
+    fn path_is(path: &str, tail: &str) -> bool {
+        path == tail || path.ends_with(&format!("::{tail}"))
+    }
+
+    /// The enclosing fn of every call of `tail` in `src`'s code, in order.
+    fn calls_of(src: &str, tail: &str) -> Vec<String> {
+        calls_in(src)
+            .into_iter()
+            .filter(|(_, callee)| path_is(callee, tail))
+            .map(|(enclosing, _)| enclosing)
+            .collect()
+    }
+
+    /// The process builders and runners `process_helpers` exports, by name, so
+    /// an unqualified call after a `use` is caught too. A trailing `*` is a
+    /// prefix.
+    const PROCESS_HELPERS_BUILDERS: [&str; 9] = [
+        "no_window",
+        "tokio_no_window",
+        "cmd_no_window",
+        "tokio_cmd_no_window",
+        "scrubbed_git",
+        "start_detached",
+        "run_with_timeout*",
+        "output_with_timeout*",
+        "run_probe*",
+    ];
+
+    /// Whether a call builds or runs a process: `Command::new`, any call
+    /// through `process_helpers::`, or a `process_helpers` builder by name.
+    fn builds_a_process(callee: &str) -> bool {
+        let name = callee.rsplit("::").next().unwrap_or(callee);
+        path_is(callee, "Command::new")
+            || callee.contains("process_helpers::")
+            || PROCESS_HELPERS_BUILDERS
+                .iter()
+                .any(|builder| match builder.strip_suffix('*') {
+                    Some(prefix) => name.starts_with(prefix),
+                    None => name == *builder,
+                })
+    }
+
+    /// THE STEP PATH IS ONE PATH, in this file. The end-to-end test enters at
+    /// `run_step`; this pins, for the production code of this file only, that
+    /// `run_dispatch` reaches a step only through it, that `run_step` spawns
+    /// only through `spawn_step_child`, that both of `spawn_step_child`'s
+    /// commands get the scrub through `apply_step_env`, that
+    /// `build_step_command` has no other caller in this file, and that this
+    /// file builds or runs a process in exactly one place:
+    /// `build_step_command`'s `process_helpers::tokio_no_window`. No
+    /// `Command::new`, no other `process_helpers::` call and no other
+    /// `process_helpers` builder by name ([`PROCESS_HELPERS_BUILDERS`]). Calls
+    /// are found in code only, never in a comment or a literal. A new caller,
+    /// a wrapper or a second spawn path in this file turns it red; a step
+    /// spawned from ANOTHER module is outside its reach
     /// (`env_agent/apply_versions.rs` has an unrelated `run_step`).
     #[test]
     fn the_step_path_is_run_dispatch_then_run_step_then_spawn_step_child() {
@@ -1970,15 +2043,15 @@ mod tests {
             ["spawn_step_child", "spawn_step_child"],
             "build_step_command must be called exactly twice, both by spawn_step_child"
         );
+        let process_calls: Vec<String> = calls_in(production)
+            .into_iter()
+            .filter(|(_, callee)| builds_a_process(callee))
+            .map(|(enclosing, callee)| format!("{enclosing} -> {callee}"))
+            .collect();
         assert_eq!(
-            calls_of(production, "Command::new"),
-            Vec::<String>::new(),
-            "this file must not build a process directly: go through build_step_command"
-        );
-        assert_eq!(
-            calls_of(production, "tokio_no_window"),
-            ["build_step_command"],
-            "tokio_no_window must be called only by build_step_command"
+            process_calls,
+            ["build_step_command -> crate::process_helpers::tokio_no_window"],
+            "this file must build or run a process only in build_step_command"
         );
     }
 }

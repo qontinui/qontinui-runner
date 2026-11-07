@@ -2877,7 +2877,7 @@ mod timeout_tests {
 // - One `console-ok:` marker covers every site in the `MARKER_WINDOW` lines
 //   below it, not only the site it was written for.
 // - Both scans read each production line's code on its own
-//   (`source_scan::code_only`), which misreads a string literal or block
+//   (`code_lexer::code_only`), which misreads a string literal or block
 //   comment that spans lines in both directions. Its inside is read as
 //   code, which can credit a `no_window(` written there as a suppression.
 //   And the code after its closing quote is read as a string and blanked:
@@ -2899,6 +2899,147 @@ mod timeout_tests {
 //   does not write, and on a test item whose multi-line string or block
 //   comment holds a column-0 `{` line with no column-0 `}` after it.
 
+/// The ONE code-only line lexer: comments removed, and string, raw-string and
+/// char literals emptied. Read by this file's source guards (through
+/// `source_scan`) and by the runner binary's own source-scan tests
+/// (`ci_node::executor`), which is why it is gated like
+/// `ambient::test_support`: `cargo test` builds this rlib for the binary's
+/// tests WITH `debug_assertions` but without `cfg(test)`. A release build has
+/// neither and compiles none of this.
+#[cfg(any(test, debug_assertions))]
+pub mod code_lexer {
+    /// Where a line starts, lexically, for [`code_only_from`].
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Lex {
+        /// In code.
+        Code,
+        /// Inside this many nested `/* … */` comments (Rust nests them).
+        Comment(usize),
+        /// Inside a `"…"` string, `b"…"` or `c"…"` (escapes apply).
+        Str,
+        /// Inside a raw string closed by `"` and this many `#`s.
+        RawStr(usize),
+    }
+
+    /// `line`'s code, read on its own: [`code_only_from`] starting in code,
+    /// so a literal or block comment still open at the end of the line is
+    /// taken to end there.
+    pub fn code_only(line: &str) -> String {
+        code_only_from(line, &mut Lex::Code)
+    }
+
+    /// `line` with every string, raw-string and char literal emptied and its
+    /// comments removed, so the braces, brackets and `;` left are CODE.
+    /// `lex` is where the line starts (in code, a block comment or a string)
+    /// and is left where it ends, so a caller can carry a multi-line
+    /// `/* … */` or string literal from one line into the next. Raw strings
+    /// (`r"…"`, `r#"…"#`, `br"…"`, `cr"…"`) take no escapes, so `r"C:\"`
+    /// ends at its second quote.
+    pub fn code_only_from(line: &str, lex: &mut Lex) -> String {
+        let chars: Vec<char> = line.chars().collect();
+        let ident = |k: usize| {
+            chars
+                .get(k)
+                .is_some_and(|c| c.is_alphanumeric() || *c == '_')
+        };
+        let mut out = String::new();
+        let mut i = 0;
+        while let Some(&c) = chars.get(i) {
+            let next = chars.get(i + 1).copied();
+            match *lex {
+                Lex::Comment(depth) => {
+                    if c == '/' && next == Some('*') {
+                        *lex = Lex::Comment(depth + 1);
+                        i += 2;
+                    } else if c == '*' && next == Some('/') {
+                        *lex = if depth > 1 {
+                            Lex::Comment(depth - 1)
+                        } else {
+                            out.push(' ');
+                            Lex::Code
+                        };
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                    continue;
+                }
+                Lex::Str => {
+                    match c {
+                        '\\' => i += 2,
+                        '"' => {
+                            *lex = Lex::Code;
+                            out.push('"');
+                            i += 1;
+                        }
+                        _ => i += 1,
+                    }
+                    continue;
+                }
+                Lex::RawStr(hashes) => {
+                    if c == '"' && (1..=hashes).all(|k| chars.get(i + k) == Some(&'#')) {
+                        *lex = Lex::Code;
+                        out.push('"');
+                        i += 1 + hashes;
+                    } else {
+                        i += 1;
+                    }
+                    continue;
+                }
+                Lex::Code => {}
+            }
+            if c == '/' && next == Some('/') {
+                break;
+            }
+            if c == '/' && next == Some('*') {
+                *lex = Lex::Comment(1);
+                i += 2;
+                continue;
+            }
+            // A raw string: an `r` (or `br` / `cr`) that does not end an
+            // identifier, then any `#`s, then `"`.
+            let raw_start = c == 'r'
+                && (i == 0
+                    || !ident(i - 1)
+                    || (matches!(chars[i - 1], 'b' | 'c') && (i == 1 || !ident(i - 2))));
+            if raw_start {
+                let hashes = chars[i + 1..].iter().take_while(|&&h| h == '#').count();
+                if chars.get(i + 1 + hashes) == Some(&'"') {
+                    *lex = Lex::RawStr(hashes);
+                    out.push('"');
+                    i += 2 + hashes;
+                    continue;
+                }
+            }
+            if c == '"' {
+                *lex = Lex::Str;
+                out.push('"');
+                i += 1;
+                continue;
+            }
+            if c == '\'' {
+                // A char literal (`'{'`, `'\''`, `'\u{7b}'`), or else a
+                // lifetime, which is code.
+                let close = if next == Some('\\') {
+                    (i + 3..chars.len()).find(|&j| chars[j] == '\'')
+                } else if chars.get(i + 2) == Some(&'\'') {
+                    Some(i + 2)
+                } else {
+                    None
+                };
+                if let Some(j) = close {
+                    i = j + 1;
+                    out.push_str("''");
+                    continue;
+                }
+            }
+            out.push(c);
+            i += 1;
+        }
+        out
+    }
+}
+
 /// Source-scanning helpers shared by the guards below: the `.rs` walk and
 /// the ONE test-code skipper. Every guard in this file reads production text
 /// through [`source_scan::production_lines`]; a guard with a skipper of its
@@ -2906,6 +3047,7 @@ mod timeout_tests {
 /// `#[cfg(test)]` while the git guard read on.
 #[cfg(test)]
 mod source_scan {
+    pub(super) use super::code_lexer::{code_only, code_only_from, Lex};
     use std::path::{Path, PathBuf};
 
     pub(super) fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -3128,137 +3270,6 @@ mod source_scan {
     /// The width of `line`'s leading whitespace.
     fn indent_of(line: &str) -> usize {
         line.len() - line.trim_start().len()
-    }
-
-    /// Where a line starts, lexically, for [`code_only_from`].
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    enum Lex {
-        /// In code.
-        Code,
-        /// Inside this many nested `/* … */` comments (Rust nests them).
-        Comment(usize),
-        /// Inside a `"…"` string, `b"…"` or `c"…"` (escapes apply).
-        Str,
-        /// Inside a raw string closed by `"` and this many `#`s.
-        RawStr(usize),
-    }
-
-    /// `line`'s code, read on its own: [`code_only_from`] starting in code,
-    /// so a literal or block comment still open at the end of the line is
-    /// taken to end there.
-    pub(super) fn code_only(line: &str) -> String {
-        code_only_from(line, &mut Lex::Code)
-    }
-
-    /// `line` with every string, raw-string and char literal emptied and its
-    /// comments removed, so the braces, brackets and `;` left are CODE.
-    /// `lex` is where the line starts (in code, a block comment or a string)
-    /// and is left where it ends, so a caller can carry a multi-line
-    /// `/* … */` or string literal from one line into the next. Raw strings
-    /// (`r"…"`, `r#"…"#`, `br"…"`, `cr"…"`) take no escapes, so `r"C:\"`
-    /// ends at its second quote.
-    fn code_only_from(line: &str, lex: &mut Lex) -> String {
-        let chars: Vec<char> = line.chars().collect();
-        let ident = |k: usize| {
-            chars
-                .get(k)
-                .is_some_and(|c| c.is_alphanumeric() || *c == '_')
-        };
-        let mut out = String::new();
-        let mut i = 0;
-        while let Some(&c) = chars.get(i) {
-            let next = chars.get(i + 1).copied();
-            match *lex {
-                Lex::Comment(depth) => {
-                    if c == '/' && next == Some('*') {
-                        *lex = Lex::Comment(depth + 1);
-                        i += 2;
-                    } else if c == '*' && next == Some('/') {
-                        *lex = if depth > 1 {
-                            Lex::Comment(depth - 1)
-                        } else {
-                            out.push(' ');
-                            Lex::Code
-                        };
-                        i += 2;
-                    } else {
-                        i += 1;
-                    }
-                    continue;
-                }
-                Lex::Str => {
-                    match c {
-                        '\\' => i += 2,
-                        '"' => {
-                            *lex = Lex::Code;
-                            out.push('"');
-                            i += 1;
-                        }
-                        _ => i += 1,
-                    }
-                    continue;
-                }
-                Lex::RawStr(hashes) => {
-                    if c == '"' && (1..=hashes).all(|k| chars.get(i + k) == Some(&'#')) {
-                        *lex = Lex::Code;
-                        out.push('"');
-                        i += 1 + hashes;
-                    } else {
-                        i += 1;
-                    }
-                    continue;
-                }
-                Lex::Code => {}
-            }
-            if c == '/' && next == Some('/') {
-                break;
-            }
-            if c == '/' && next == Some('*') {
-                *lex = Lex::Comment(1);
-                i += 2;
-                continue;
-            }
-            // A raw string: an `r` (or `br` / `cr`) that does not end an
-            // identifier, then any `#`s, then `"`.
-            let raw_start = c == 'r'
-                && (i == 0
-                    || !ident(i - 1)
-                    || (matches!(chars[i - 1], 'b' | 'c') && (i == 1 || !ident(i - 2))));
-            if raw_start {
-                let hashes = chars[i + 1..].iter().take_while(|&&h| h == '#').count();
-                if chars.get(i + 1 + hashes) == Some(&'"') {
-                    *lex = Lex::RawStr(hashes);
-                    out.push('"');
-                    i += 2 + hashes;
-                    continue;
-                }
-            }
-            if c == '"' {
-                *lex = Lex::Str;
-                out.push('"');
-                i += 1;
-                continue;
-            }
-            if c == '\'' {
-                // A char literal (`'{'`, `'\''`, `'\u{7b}'`), or else a
-                // lifetime, which is code.
-                let close = if next == Some('\\') {
-                    (i + 3..chars.len()).find(|&j| chars[j] == '\'')
-                } else if chars.get(i + 2) == Some(&'\'') {
-                    Some(i + 2)
-                } else {
-                    None
-                };
-                if let Some(j) = close {
-                    i = j + 1;
-                    out.push_str("''");
-                    continue;
-                }
-            }
-            out.push(c);
-            i += 1;
-        }
-        out
     }
 
     /// The skip triggers on exactly the test-only cfgs. A cfg that can be
