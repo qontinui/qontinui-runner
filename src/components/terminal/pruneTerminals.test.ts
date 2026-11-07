@@ -31,6 +31,36 @@ describe("hasAiSession", () => {
     expect(hasAiSession(shell("s"), { sessionStates: { s: "idle" } })).toBe(false);
   });
 
+  it("with a process-table probe, closes a signal-less tab only when it reads absent", () => {
+    // 2026-10-25: an idle Claude whose pinned id never confirmed carried no
+    // tab signal and was closed as a shell. The probe is what keeps it.
+    const tab = shell("s");
+    expect(hasAiSession(tab, { claudePresence: { s: "live" } })).toBe(true);
+    expect(hasAiSession(tab, { claudePresence: { s: "unknown" } })).toBe(true);
+    expect(hasAiSession(tab, { claudePresence: { s: "remote" } })).toBe(true);
+    expect(hasAiSession(tab, { claudePresence: {} })).toBe(true);
+    expect(hasAiSession(tab, { claudePresence: { s: "absent" } })).toBe(false);
+  });
+
+  it("an absent probe never overrides a tab-side AI signal", () => {
+    expect(hasAiSession(ai("a"), { claudePresence: { a: "absent" } })).toBe(true);
+  });
+
+  it("a plan viewer still closes under a probe map (it has no process to probe)", () => {
+    const plan = { id: "plan-1-x", title: "plan", type: "plan" as const };
+    expect(hasAiSession(plan, { claudePresence: {} })).toBe(false);
+    expect(hasAiSession({ id: "plan-2-y", title: "p" }, { claudePresence: {} })).toBe(false);
+  });
+
+  it("keeps a pane an earlier probe read live, with or without a probe map", () => {
+    const known = new Set(["s"]);
+    expect(hasAiSession(shell("s"), { knownClaudePanes: known })).toBe(true);
+    expect(
+      hasAiSession(shell("s"), { knownClaudePanes: known, claudePresence: { s: "absent" } }),
+    ).toBe(true);
+    expect(hasAiSession(shell("other"), { knownClaudePanes: known })).toBe(false);
+  });
+
   it("keeps a tab inside the launch grace window, closes it after", () => {
     const now = 1_000_000;
     const young = { ...shell("s"), createdAt: now - RECENT_TAB_GRACE_MS + 1 };
@@ -53,6 +83,25 @@ describe("planPrune", () => {
     expect(plan.layoutId).toBe("quad");
     expect(resolveLayout(plan.layoutId, 3).zones.length).toBe(4);
     expect(compactAssignments(plan.keepIds)).toEqual({ 0: "a1", 1: "a2", 2: "a3" });
+  });
+
+  it("a probed plan keeps the unbound Claude pane and closes only the proven shell", () => {
+    const tabs = [ai("a1"), shell("unbound-claude"), shell("bare-shell")];
+    const assignments = { 0: "a1", 1: "unbound-claude", 2: "bare-shell" };
+    const plan = planPrune(tabs, assignments, {
+      claudePresence: { "unbound-claude": "live", "bare-shell": "absent" },
+    });
+    expect(plan.closeIds).toEqual(["bare-shell"]);
+    expect(plan.keepIds).toEqual(["a1", "unbound-claude"]);
+  });
+
+  it("a rescued pane stops being a candidate, so the button is no longer offered", () => {
+    const tabs = [ai("a1"), shell("unbound-claude")];
+    const assignments = { 0: "a1", 1: "unbound-claude" };
+    const plan = planPrune(tabs, assignments, { knownClaudePanes: new Set(["unbound-claude"]) });
+    expect(plan.closeIds).toEqual([]);
+    const zones = resolveLayout(plan.layoutId, plan.keepIds.length).zones.length;
+    expect(isPruneActionable(plan, zones, zones, assignments)).toBe(false);
   });
 
   it("orders kept tabs by zone, then appends hidden AI tabs in tab order", () => {
