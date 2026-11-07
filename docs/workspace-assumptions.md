@@ -8,7 +8,7 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 
 | class | rows | hits | unreviewed | fallback_correct | dev_only_surface | defect |
 |---|---:|---:|---:|---:|---:|---:|
-| `repo_layout` | 79 | 93 | 73 | 6 | 0 | 0 |
+| `repo_layout` | 80 | 94 | 71 | 9 | 0 | 0 |
 | `dev_ports` | 28 | 28 | 26 | 0 | 2 | 0 |
 | `supervisor_dependency` | 57 | 57 | 0 | 47 | 4 | 6 |
 | `tenant_literal` | 0 | 0 | 0 | 0 | 0 | 0 |
@@ -18,14 +18,14 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `plans_dir` | 34 | 35 | 34 | 0 | 0 | 0 |
 | `os_bound_tooling` | 100 | 101 | 96 | 4 | 0 | 0 |
 
-## `repo_layout` (79 rows)
+## `repo_layout` (80 rows)
 
 | file | symbol | excerpt | n | disposition | capability |
 |---|---|---|---:|---|---|
 | `src/agent_runtime.rs` | `continuation_fallback_workdir` | `.ok_or_else(\|\| "no QONTINUI_ROOT or canonical checkout resolved".to_string());` | 2 | unreviewed | — (no CAPABILITY_SPECS row) |
-| `src/agent_runtime.rs` | `provision_agent_definitions` | `"agent_runtime: no qontinui-root resolved; skipping .claude/agents \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
-| `src/agent_runtime.rs` | `provision_agent_definitions` | `"no qontinui-root resolved, so <root>/qontinui-claude-config/.claude/agents \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
-| `src/agent_runtime.rs` | `provision_agent_definitions_from_root` | `.join("qontinui-claude-config")` | 1 | unreviewed | `agent_definitions` |
+| `src/agent_runtime.rs` | `provision_agent_definitions_retiring` | `.join("qontinui-claude-config")` | 1 | fallback_correct — The checkout OVERLAY of agent definitions, read from <root>/qontinui-claude-config/.claude/agents only after a root resolved. A missing dir makes read_dir fail and the overlay contributes nothing; the embedded fleet_agents floor beneath it still provisions, and both layers report rows to the capability manifest. Reviewed when this row moved off the provision_agent_definitions_from_root key (same plan, Phase 6). | — (no CAPABILITY_SPECS row) |
+| `src/agent_runtime.rs` | `provision_agent_definitions_with_root` | `"agent_runtime: no qontinui-root resolved; skipping .claude/agents \` | 1 | fallback_correct — The no-root arm of agent-definition provisioning: with no qontinui-root it warns, records a capability_manifest Rung::Unresolved 'agent_definitions' row naming what was skipped (the normal state on a published install), still runs the retirement pass, and lets the spawn proceed. The embedded fleet_agents floor supplies the definitions there. Reviewed when these rows moved off the provision_agent_definitions key (plan 2026-11-06-what-the-fleet-records-and-advertises-matches-what-actually-ran Phase 6). | — (no CAPABILITY_SPECS row) |
+| `src/agent_runtime.rs` | `provision_agent_definitions_with_root` | `"no qontinui-root resolved, so <root>/qontinui-claude-config/.claude/agents \` | 1 | fallback_correct — The no-root arm of agent-definition provisioning: with no qontinui-root it warns, records a capability_manifest Rung::Unresolved 'agent_definitions' row naming what was skipped (the normal state on a published install), still runs the retirement pass, and lets the spawn proceed. The embedded fleet_agents floor supplies the definitions there. Reviewed when these rows moved off the provision_agent_definitions key (plan 2026-11-06-what-the-fleet-records-and-advertises-matches-what-actually-ran Phase 6). | — (no CAPABILITY_SPECS row) |
 | `src/agent_runtime.rs` | `run_condition_check_terminal` | `let reason = "no QONTINUI_ROOT resolved — nowhere to run the check from";` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/agent_skills/self_path.rs` | `self_path_hit` | `"reaches its own tree through a 'qontinui-claude-config' checkout".to_string(),` | 1 | unreviewed — Surfaced by fleet-nouns.toml (A6); not yet triaged. | — (no CAPABILITY_SPECS row) |
 | `src/agent_skills/self_path.rs` | `static CONFIG_REPO_CLAUDE_RE` | `Lazy::new(\|\| Regex::new(r"qontinui-claude-config[/\\]+\.claude\b").expect("arm A regex"));` | 1 | unreviewed — Surfaced by fleet-nouns.toml (A6); not yet triaged. | — (no CAPABILITY_SPECS row) |
@@ -48,6 +48,7 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `src/capability_manifest.rs` | `const CAPABILITY_SPECS` | `'<workspace-root>/qontinui-claude-config/.claude/agents/*.md' off \` | 2 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/capability_manifest.rs` | `const CAPABILITY_SPECS` | `copy is a no-op that logs \"no qontinui-root resolved; skipping \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/capability_manifest.rs` | `const CAPABILITY_SPECS` | `description: "Import of '<workspace-root>/qontinui-claude-config/.claude/commands/*.md' \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
+| `src/capability_manifest.rs` | `const CAPABILITY_SPECS` | `qontinui-claude-config's hourly 'fleet-agents-parity' gate \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/check_executor/command_builder.rs` | `build_devtools_command` | `Ok(("qontinui-devtools".to_string(), args))` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/ci_node/admission.rs` | `start_build` | `"QONTINUI_ROOT not resolvable on this device".to_string(),` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/commands/config.rs` | `get_workspace_paths_impl` | `.join("qontinui-claude-config")` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |

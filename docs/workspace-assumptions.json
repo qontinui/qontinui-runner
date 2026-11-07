@@ -1363,27 +1363,29 @@
     {
       "class": "repo_layout",
       "file": "src/agent_runtime.rs",
-      "symbol": "provision_agent_definitions",
-      "excerpt": "\"agent_runtime: no qontinui-root resolved; skipping .claude/agents \\",
-      "count": 1,
-      "disposition": "unreviewed"
-    },
-    {
-      "class": "repo_layout",
-      "file": "src/agent_runtime.rs",
-      "symbol": "provision_agent_definitions",
-      "excerpt": "\"no qontinui-root resolved, so <root>/qontinui-claude-config/.claude/agents \\",
-      "count": 1,
-      "disposition": "unreviewed"
-    },
-    {
-      "class": "repo_layout",
-      "file": "src/agent_runtime.rs",
-      "symbol": "provision_agent_definitions_from_root",
+      "symbol": "provision_agent_definitions_retiring",
       "excerpt": ".join(\"qontinui-claude-config\")",
       "count": 1,
-      "disposition": "unreviewed",
-      "capability": "agent_definitions"
+      "disposition": "fallback_correct",
+      "note": "The checkout OVERLAY of agent definitions, read from <root>/qontinui-claude-config/.claude/agents only after a root resolved. A missing dir makes read_dir fail and the overlay contributes nothing; the embedded fleet_agents floor beneath it still provisions, and both layers report rows to the capability manifest. Reviewed when this row moved off the provision_agent_definitions_from_root key (same plan, Phase 6)."
+    },
+    {
+      "class": "repo_layout",
+      "file": "src/agent_runtime.rs",
+      "symbol": "provision_agent_definitions_with_root",
+      "excerpt": "\"agent_runtime: no qontinui-root resolved; skipping .claude/agents \\",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "The no-root arm of agent-definition provisioning: with no qontinui-root it warns, records a capability_manifest Rung::Unresolved `agent_definitions` row naming what was skipped (the normal state on a published install), still runs the retirement pass, and lets the spawn proceed. The embedded fleet_agents floor supplies the definitions there. Reviewed when these rows moved off the provision_agent_definitions key (plan 2026-11-06-what-the-fleet-records-and-advertises-matches-what-actually-ran Phase 6)."
+    },
+    {
+      "class": "repo_layout",
+      "file": "src/agent_runtime.rs",
+      "symbol": "provision_agent_definitions_with_root",
+      "excerpt": "\"no qontinui-root resolved, so <root>/qontinui-claude-config/.claude/agents \\",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "The no-root arm of agent-definition provisioning: with no qontinui-root it warns, records a capability_manifest Rung::Unresolved `agent_definitions` row naming what was skipped (the normal state on a published install), still runs the retirement pass, and lets the spawn proceed. The embedded fleet_agents floor supplies the definitions there. Reviewed when these rows moved off the provision_agent_definitions key (plan 2026-11-06-what-the-fleet-records-and-advertises-matches-what-actually-ran Phase 6)."
     },
     {
       "class": "repo_layout",
@@ -1570,6 +1572,14 @@
       "file": "src/capability_manifest.rs",
       "symbol": "const CAPABILITY_SPECS",
       "excerpt": "description: \"Import of `<workspace-root>/qontinui-claude-config/.claude/commands/*.md` \\",
+      "count": 1,
+      "disposition": "unreviewed"
+    },
+    {
+      "class": "repo_layout",
+      "file": "src/capability_manifest.rs",
+      "symbol": "const CAPABILITY_SPECS",
+      "excerpt": "qontinui-claude-config's hourly `fleet-agents-parity` gate \\",
       "count": 1,
       "disposition": "unreviewed"
     },
