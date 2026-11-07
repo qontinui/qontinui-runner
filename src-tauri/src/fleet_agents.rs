@@ -27,8 +27,9 @@
 //! [`provision_agent_definitions_from_root`] now writes these embedded defaults
 //! FIRST and then overlays any checkout copies on top. An operator editing
 //! `qontinui-claude-config/.claude/agents/*.md` keeps the live-edit workflow
-//! they have today, byte for byte; a device with no checkout gets the embedded
-//! set instead of nothing.
+//! they have today, byte for byte (a RETIRED definition excepted: the overlay
+//! never delivers one); a device with no checkout gets the embedded set instead
+//! of nothing.
 //!
 //! **Both layers yield to the destination's own repository.** A definition the
 //! enclosing repo tracks is kept as it is, and so is an existing one when the
@@ -104,9 +105,10 @@ static FLEET_AGENTS: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/src/fleet_agent
 /// Only `*.md` at the top level is written — the same filter the checkout copy
 /// applies, so the two layers cannot disagree about what counts as a definition.
 ///
-/// It removes nothing. Removing a RETIRED definition is
-/// [`remove_retired_agents`]'s job, which the caller runs after the checkout
-/// overlay, so a copy a stale overlay rewrites is removed too.
+/// It removes nothing, and neither layer writes a RETIRED name: none is
+/// bundled, and the checkout overlay skips them. Removing a copy an older binary
+/// left is [`remove_retired_agents`]'s job, which the caller runs after both
+/// layers.
 ///
 /// **The report changes no behaviour.** This function was fail-soft from its
 /// caller's side already (`agent_runtime` catches the `Err`, warns, and
@@ -186,8 +188,8 @@ pub(crate) fn embedded_agent_count() -> usize {
 /// a file's line byte-identical to the one here.
 ///
 /// A line lists the blobs of the SOURCE's whole history, not only the ones this
-/// directory bundled, because the checkout overlay copies from the source and a
-/// workdir can hold any of them, including a blob that only ever sat on an
+/// directory bundled, because an older binary's checkout overlay copied from the
+/// source and a workdir can hold any of them, including a blob that only ever sat on an
 /// open PR's branch a checkout was standing on. A line only grows: the bundle sync never
 /// re-adds a deleted file, so a blob that ships after the line is written is
 /// never learned here.
@@ -245,7 +247,7 @@ pub(crate) fn retired_agent_names(retired: &[&str]) -> Vec<String> {
 ///   own-files-only rule `install-agents.sh --uninstall` applies;
 /// - **unreadable or unremovable**: kept, and recorded as
 ///   [`RetainedReason::ReadFailed`] / [`RetainedReason::RemoveFailed`], so the
-///   pass reads degraded and names a retired definition that still resolves. A
+///   pass reads degraded and names a retired definition that may still resolve. A
 ///   copy that vanishes between the read and the removal (a concurrent pass
 ///   into the same workdir) is already gone and is not recorded.
 ///
