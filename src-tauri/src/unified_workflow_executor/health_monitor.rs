@@ -789,9 +789,16 @@ pub(crate) fn narrate_verification_checkpoints(
     }
 
     let total = terminal.len();
+    // A `Skipped` row is replayable (its journalled outcome is reused on
+    // resume) but it is NOT a pass: the step checked nothing. So the counts
+    // name it separately and never fold it into "passed".
     let passed = terminal
         .iter()
-        .filter(|cp| cp.status.is_replayable())
+        .filter(|cp| cp.status == crate::workflow_state::StepCheckpointStatus::Success)
+        .count();
+    let skipped = terminal
+        .iter()
+        .filter(|cp| cp.status == crate::workflow_state::StepCheckpointStatus::Skipped)
         .count();
     let failed: Vec<&&crate::workflow_state::StepCheckpoint> = terminal
         .iter()
@@ -799,23 +806,42 @@ pub(crate) fn narrate_verification_checkpoints(
         .collect();
 
     if failed.is_empty() {
+        if skipped == 0 {
+            info!(
+                "RESUME: All {} verification steps passed, no failures to fix",
+                total
+            );
+            return Some(format!(
+                "All {} verification steps passed. No failures to investigate. \
+                 Proceed with any analysis or improvements based on the workflow context provided.",
+                total
+            ));
+        }
         info!(
-            "RESUME: All {} verification steps passed, no failures to fix",
-            total
+            "RESUME: {} of {} verification steps passed and {} skipped, no failures to fix",
+            passed, total, skipped
         );
         return Some(format!(
-            "All {} verification steps passed. No failures to investigate. \
+            "{} of {} verification steps passed and {} skipped (a skipped step checked nothing). \
+             No failures to investigate. \
              Proceed with any analysis or improvements based on the workflow context provided.",
-            total
+            passed, total, skipped
         ));
     }
 
     let mut context = String::new();
     context.push_str("## Verification Results (Resumed)\n\n");
-    context.push_str(&format!(
-        "**Status:** {} of {} verification steps passed\n\n",
-        passed, total
-    ));
+    if skipped == 0 {
+        context.push_str(&format!(
+            "**Status:** {} of {} verification steps passed\n\n",
+            passed, total
+        ));
+    } else {
+        context.push_str(&format!(
+            "**Status:** {} of {} verification steps passed, {} skipped\n\n",
+            passed, total, skipped
+        ));
+    }
     context.push_str("### Failed Steps\n\n");
 
     for cp in &failed {
@@ -955,16 +981,69 @@ mod resume_context_tests {
         );
     }
 
-    /// A fully-passing iteration says so rather than inventing failures.
+    /// An iteration of passed and skipped rows has no failure, but a skipped
+    /// row is not a pass. The resumed agent is told the skipped count, never
+    /// "All N verification steps passed".
     #[test]
-    fn all_passed_reports_no_failures() {
+    fn a_skipped_row_is_named_not_counted_as_passed() {
         let rows = vec![
             cp(0, "a", StepCheckpointStatus::Success, None, None),
             cp(1, "b", StepCheckpointStatus::Skipped, None, None),
         ];
         let context = narrate_verification_checkpoints(&rows).expect("has terminal rows");
         assert!(
+            context.starts_with(
+                "1 of 2 verification steps passed and 1 skipped (a skipped step checked nothing). No failures to investigate."
+            ),
+            "{}",
+            context
+        );
+        assert!(!context.starts_with("All "), "{}", context);
+    }
+
+    /// Only skipped rows: zero passed, said as such.
+    #[test]
+    fn only_skipped_rows_report_zero_passed() {
+        let rows = vec![
+            cp(0, "a", StepCheckpointStatus::Skipped, None, None),
+            cp(1, "b", StepCheckpointStatus::Skipped, None, None),
+        ];
+        let context = narrate_verification_checkpoints(&rows).expect("has terminal rows");
+        assert!(
+            context.starts_with("0 of 2 verification steps passed and 2 skipped"),
+            "{}",
+            context
+        );
+    }
+
+    /// A fully-passing iteration (every row `Success`) says so rather than
+    /// inventing failures.
+    #[test]
+    fn all_passed_reports_no_failures() {
+        let rows = vec![
+            cp(0, "a", StepCheckpointStatus::Success, None, None),
+            cp(1, "b", StepCheckpointStatus::Success, None, None),
+        ];
+        let context = narrate_verification_checkpoints(&rows).expect("has terminal rows");
+        assert!(
             context.starts_with("All 2 verification steps passed"),
+            "{}",
+            context
+        );
+    }
+
+    /// With a failure, the header counts `Success` rows as passed and names
+    /// the skipped rows apart.
+    #[test]
+    fn the_failure_header_names_skipped_rows_apart() {
+        let rows = vec![
+            cp(0, "a", StepCheckpointStatus::Success, None, None),
+            cp(1, "b", StepCheckpointStatus::Failed, Some("boom"), None),
+            cp(2, "c", StepCheckpointStatus::Skipped, None, None),
+        ];
+        let context = narrate_verification_checkpoints(&rows).expect("has a failure");
+        assert!(
+            context.contains("**Status:** 1 of 3 verification steps passed, 1 skipped"),
             "{}",
             context
         );

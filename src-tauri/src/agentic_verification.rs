@@ -371,6 +371,7 @@ impl AgenticVerificationResult {
                 })
                 .collect(),
             fix_attempts_exhausted: false,
+            no_verification_steps: false,
             total_tokens: self.total_tokens,
             total_cost_usd: self.total_cost_usd,
             files_modified: Vec::new(),
@@ -1223,6 +1224,7 @@ impl MultiAgentPipelineResult {
                 .into_iter()
                 .collect(),
             fix_attempts_exhausted: false,
+            no_verification_steps: false,
             fix_attempts: 0,
             ci_auto_resumes: 0,
             node_rollups: Vec::new(),

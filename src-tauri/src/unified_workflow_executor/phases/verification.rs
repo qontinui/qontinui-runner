@@ -27,6 +27,34 @@ use super::super::phase_helpers::{
 // Verification Phase Executor
 // =============================================================================
 
+/// The result of a verification with no step to run: nothing was checked.
+///
+/// `all_passed` is `false`. Nothing passed, so the result must not say that
+/// everything did. Both empty arms return it: an empty step list,
+/// including one emptied by the `dev_mode_only` filter of a build without
+/// debug assertions, which is how the published runner is built, and a
+/// targeted run whose step indices selected nothing. The verdict on such a
+/// result is `NoVerificationSteps`, which `decide_evaluate_verification`
+/// reaches from its zero `required_steps` whatever `all_passed` says. This
+/// keeps the producer from asserting a pass it never observed.
+fn nothing_to_verify(iteration: u32) -> VerificationPhaseResult {
+    VerificationPhaseResult {
+        iteration,
+        all_passed: false,
+        critical_failure: false,
+        total_steps: 0,
+        passed_steps: 0,
+        failed_steps: 0,
+        skipped_steps: 0,
+        total_duration_ms: 0,
+        step_results: Vec::new(),
+        console_errors: None,
+        app_health: None,
+        browser_events: None,
+        network_failures: None,
+    }
+}
+
 /// Executes verification steps and determines if they all pass.
 pub struct VerificationExecutor {
     pub(crate) app_state: Arc<AppState>,
@@ -112,28 +140,10 @@ impl VerificationExecutor {
 
         if steps.is_empty() {
             info!(
-                "VERIFICATION-PHASE: No verification steps defined (iteration {})",
+                "VERIFICATION-PHASE: No verification steps to run (iteration {}) - nothing is checked",
                 iteration
             );
-            // No verification steps = verification passes
-            return (
-                VerificationPhaseResult {
-                    iteration,
-                    all_passed: true,
-                    critical_failure: false,
-                    total_steps: 0,
-                    passed_steps: 0,
-                    failed_steps: 0,
-                    skipped_steps: 0,
-                    total_duration_ms: 0,
-                    step_results: Vec::new(),
-                    console_errors: None,
-                    app_health: None,
-                    browser_events: None,
-                    network_failures: None,
-                },
-                Vec::new(),
-            );
+            return (nothing_to_verify(iteration), Vec::new());
         }
 
         // Pre-verification health check: detect if the SDK app is already broken
@@ -399,21 +409,7 @@ impl VerificationExecutor {
             .collect();
 
         if targeted_steps.is_empty() {
-            return VerificationPhaseResult {
-                iteration,
-                all_passed: true,
-                total_steps: 0,
-                passed_steps: 0,
-                failed_steps: 0,
-                skipped_steps: 0,
-                total_duration_ms: 0,
-                step_results: vec![],
-                critical_failure: false,
-                console_errors: None,
-                app_health: None,
-                browser_events: None,
-                network_failures: None,
-            };
+            return nothing_to_verify(iteration);
         }
 
         info!(
@@ -438,5 +434,27 @@ impl VerificationExecutor {
         );
 
         result
+    }
+}
+
+#[cfg(test)]
+mod nothing_to_verify_tests {
+    use super::nothing_to_verify;
+
+    /// Both empty arms return this result. Before plan
+    /// 2026-11-06-a-product-workflow-verification-with-nothing-to-check-never-reports-passed
+    /// they returned `all_passed: true`, which is a pass that nothing observed.
+    #[test]
+    fn an_empty_verification_does_not_report_all_passed() {
+        let result = nothing_to_verify(4);
+        assert!(
+            !result.all_passed,
+            "nothing checked must not report all_passed"
+        );
+        assert_eq!(result.iteration, 4);
+        assert_eq!(result.total_steps, 0);
+        assert_eq!(result.passed_steps, 0);
+        assert!(result.step_results.is_empty());
+        assert!(!result.critical_failure);
     }
 }
