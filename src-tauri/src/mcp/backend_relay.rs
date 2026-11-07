@@ -6167,8 +6167,10 @@ fn relay_session_maps(
 ///    then the terminal hosting that Claude session:
 ///    a. its own `open` lifecycle record — where the session runs now. When
 ///       one exists it alone decides: the answer is the live terminal it binds
-///       ([`crate::mcp::session_message_poller::bound_open_terminal_id`]), or
-///       `None` when it names a pane that is gone or may not be acted on;
+///       ([`crate::mcp::session_message_poller::bound_open_terminal_id`]); if
+///       it binds none, the single pinned live pane when every own record
+///       names that pane (an unconfirmed or hookless record agreeing with the
+///       pin); else `None`;
 ///    b. else (no own open record) the live terminal PINNED to it (the
 ///       spawn-time pin, in-process), which can be stale once the session was
 ///       resumed elsewhere;
@@ -6243,19 +6245,28 @@ pub(crate) fn resolve_coord_terminal_id<'a>(
         .iter()
         .filter(|rec| rec.claude_session_id == claude_session_id)
         .collect();
+    let pinned: Vec<String> = terminals
+        .iter()
+        .filter(|(_, pinned, _)| *pinned == claude_session_id)
+        .map(|(id, _, _)| (*id).to_string())
+        .collect();
     if !own.is_empty() {
-        return only(own.into_iter().filter_map(bound_live).collect())
-            .ok()
-            .flatten();
+        match only(own.iter().copied().filter_map(bound_live).collect()) {
+            Ok(Some(tid)) => return Some(tid),
+            Err(()) => return None,
+            Ok(None) => {}
+        }
+        // None of them binds a live pane. They still agree with the pin when
+        // every one names the single pinned live pane (a record whose hook
+        // has not confirmed it yet, or a hookless session): that pane, and
+        // only then.
+        return match only(pinned) {
+            Ok(Some(pane)) if own.iter().all(|rec| rec.terminal_id == pane) => Some(pane),
+            _ => None,
+        };
     }
     // (2b) No own open record: the live terminal pinned to it.
-    match only(
-        terminals
-            .iter()
-            .filter(|(_, pinned, _)| *pinned == claude_session_id)
-            .map(|(id, _, _)| (*id).to_string())
-            .collect(),
-    ) {
+    match only(pinned) {
         Ok(Some(tid)) => return Some(tid),
         Err(()) => return None,
         Ok(None) => {}
@@ -11997,6 +12008,16 @@ mod resolve_local_terminal_tests {
             resolve_two_panes(&index, &[bound("C", "gone")], CLAUDE_ROW),
             None
         );
+        // An own record not confirmed yet, on the pinned pane, agrees with the
+        // pin; the same record on another pane still vetoes it.
+        let mut unconfirmed = bound("C", "A");
+        unconfirmed.confirmed_at = None;
+        assert_eq!(
+            resolve_two_panes(&index, &[unconfirmed.clone()], CLAUDE_ROW).as_deref(),
+            Some("A")
+        );
+        unconfirmed.terminal_id = "B".to_string();
+        assert_eq!(resolve_two_panes(&index, &[unconfirmed], CLAUDE_ROW), None);
         // With no record, the pin is still the answer.
         assert_eq!(
             resolve_two_panes(&index, &[], CLAUDE_ROW).as_deref(),
