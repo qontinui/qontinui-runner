@@ -1078,6 +1078,21 @@ pub struct SkippedUnit {
     pub reason: SkipReason,
 }
 
+/// One unit a provisioning pass REMOVED from its destination, with the blob that
+/// made the removal safe.
+///
+/// Only the subagent provisioner removes anything: a definition this binary
+/// retired (`fleet_agents::RETIRED_AGENTS`) whose copy on disk is a blob that
+/// definition shipped as. Recording the blob lets a reader confirm the file was
+/// the binary's own copy and not somebody's edit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RemovedUnit {
+    /// The unit's name as the provisioner addresses it (a file name).
+    pub unit: String,
+    /// The git blob id the removed copy matched.
+    pub blob: String,
+}
+
 /// What one `provision_*` pass actually delivered.
 ///
 /// **This type does not change fail-soft behaviour and must never be made to.**
@@ -1099,6 +1114,10 @@ pub struct ProvisionReport {
     pub written: usize,
     /// Every unit that was not written, WITH its reason.
     pub skipped: Vec<SkippedUnit>,
+    /// Every unit the pass REMOVED, with the blob it matched. A removal is not a
+    /// skip, because the session lost nothing it should have, so it moves
+    /// neither `written` nor [`Self::is_complete`].
+    pub removed: Vec<RemovedUnit>,
     /// Which rung supplied what was written. [`Rung::Unresolved`] when the pass
     /// delivered nothing at all.
     pub rung: Rung,
@@ -1123,6 +1142,7 @@ impl ProvisionReport {
             expected,
             written: 0,
             skipped: Vec::new(),
+            removed: Vec::new(),
             rung,
             destination: None,
             detail: None,
@@ -1176,6 +1196,14 @@ impl ProvisionReport {
         });
     }
 
+    /// Record one unit this pass removed, with the blob it matched.
+    pub fn record_removed(&mut self, unit: impl Into<String>, blob: impl Into<String>) {
+        self.removed.push(RemovedUnit {
+            unit: unit.into(),
+            blob: blob.into(),
+        });
+    }
+
     /// Pin the rung after the fact — used where the rung is only knowable once
     /// the pass has run (nothing written at all is [`Rung::Unresolved`]).
     pub fn set_rung(&mut self, rung: Rung) {
@@ -1214,6 +1242,12 @@ impl ProvisionReport {
         if let Some(detail) = &self.detail {
             out.push_str(&format!(" ({detail})"));
         }
+        if !self.removed.is_empty() {
+            out.push_str(&format!("; {} removed:", self.removed.len()));
+            for removed in &self.removed {
+                out.push_str(&format!(" [{} — blob {}]", removed.unit, removed.blob));
+            }
+        }
         if self.skipped.is_empty() {
             return out;
         }
@@ -1235,6 +1269,15 @@ impl ProvisionReport {
         let mut detail = format!("wrote {}/{} unit(s)", self.written, self.expected);
         if let Some(extra) = &self.detail {
             detail.push_str(&format!("; {extra}"));
+        }
+        if !self.removed.is_empty() {
+            let names = self
+                .removed
+                .iter()
+                .map(|r| r.unit.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            detail.push_str(&format!("; removed {names}"));
         }
         let mut obs = CapabilityObservation::new(self.rung).with_detail(detail);
         if let Some(dest) = &self.destination {
@@ -2424,6 +2467,48 @@ mod tests {
         let obs = report.observation();
         assert!(obs.note.is_none());
         assert_eq!(obs.detail.as_deref(), Some("wrote 3/3 unit(s)"));
+    }
+
+    /// A removal is recorded with its blob, named in the log line, the manifest
+    /// detail and the serialized report, and does not degrade the pass: the
+    /// session lost nothing it should have had.
+    #[test]
+    fn a_removal_is_recorded_with_its_blob_and_does_not_degrade_the_pass() {
+        let mut report = ProvisionReport::new("agent_definitions", 1, Rung::OperatorCheckout);
+        report.record_written();
+        report.record_removed("retired.md", "3908f6b9811fea0b8f7bc68f7d0bf9022015a537");
+
+        assert!(report.is_complete(), "a removal is not a skip");
+        assert_eq!(report.written, 1, "a removal moves no write count");
+        assert_eq!(
+            report.removed,
+            vec![RemovedUnit {
+                unit: "retired.md".to_string(),
+                blob: "3908f6b9811fea0b8f7bc68f7d0bf9022015a537".to_string(),
+            }]
+        );
+        let summary = report.summary();
+        assert!(
+            summary.contains(
+                "1 removed: [retired.md — blob 3908f6b9811fea0b8f7bc68f7d0bf9022015a537]"
+            ),
+            "{summary}"
+        );
+        let obs = report.observation();
+        assert!(
+            obs.note.is_none(),
+            "a clean pass with a removal is still clean"
+        );
+        assert_eq!(
+            obs.detail.as_deref(),
+            Some("wrote 1/1 unit(s); removed retired.md")
+        );
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["removed"][0]["unit"], "retired.md");
+        assert_eq!(
+            json["removed"][0]["blob"],
+            "3908f6b9811fea0b8f7bc68f7d0bf9022015a537"
+        );
     }
 
     /// The `unresolved` constructor is the shape that replaces a lone `warn!` on
