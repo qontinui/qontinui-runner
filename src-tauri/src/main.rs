@@ -303,6 +303,9 @@ mod summary_generator;
 mod tauri_app_handle;
 mod tauri_command_audit;
 mod terminal;
+// The one ETXTBSY-safe writer for every test shim this binary execs.
+#[cfg(test)]
+mod test_exec_script;
 mod test_executor;
 mod test_orchestrator;
 mod ticket_system;
