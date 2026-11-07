@@ -78,6 +78,11 @@ mod claude_session;
 mod click_overlay;
 mod commands;
 mod comparison;
+// The secrets a condition-check frame carries: held per session, typed only
+// by the SDK `type` action, scrubbed from every `/ui-bridge/sdk/*` response
+// (plan 2026-11-06-a-regression-test-run-is-judged-by-what-it-covered-and-a-silent-run-reads-unknown,
+// Phase 13). Its own module so `agent_runtime` gains only the calls.
+mod condition_secrets;
 mod config;
 mod config_facade;
 /// In-app layered configuration report. The driver + formatter live in the lib

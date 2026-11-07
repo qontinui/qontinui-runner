@@ -1772,6 +1772,26 @@ fn record_journey_snapshot(
     );
 }
 
+/// The WebSocket payload and HTTP body the APP receives for an element action.
+/// For a `type` action they carry the values of its `{{secret:<ref>}}`
+/// placeholders (`crate::condition_secrets`, plan
+/// 2026-11-06-a-regression-test-run-is-judged-by-what-it-covered-and-a-silent-run-reads-unknown
+/// Phase 13). `body` stays unsubstituted: the IPC fallback, the journey ledger
+/// and the event row read that one.
+fn element_action_app_payloads(
+    id: &str,
+    body: &serde_json::Value,
+    tab_id: Option<&str>,
+) -> Result<(serde_json::Value, serde_json::Value), crate::condition_secrets::SubstitutionError> {
+    let app_body =
+        crate::condition_secrets::app_bound_type_body(body)?.unwrap_or_else(|| body.clone());
+    let ws_payload = match tab_id {
+        Some(t) => serde_json::json!({ "id": id, "request": app_body.clone(), "targetTabId": t }),
+        None => serde_json::json!({ "id": id, "request": app_body.clone() }),
+    };
+    Ok((ws_payload, app_body))
+}
+
 /// POST /ui-bridge/sdk/element/:id/action — Execute an action on an element
 async fn handle_element_action(
     State(state): State<Arc<ApiState>>,
@@ -1799,93 +1819,109 @@ async fn handle_element_action(
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
-    let ws_payload = match tab_id {
-        Some(t) => serde_json::json!({ "id": id, "request": body.clone(), "targetTabId": t }),
-        None => serde_json::json!({ "id": id, "request": body.clone() }),
-    };
     let path = append_tab_id_query(&format!("/control/element/{}/action", id), tab_id);
     // The app this action lands on, for the journey ledger: the active SDK
     // connection (read here, before dispatch, exactly as dispatch reads it),
     // or the runner's own webview when the IPC fallback below runs instead.
     let active_app = active_app_identity(&state).await;
     let mut acted_via_ipc = false;
-    let result = match dispatch_app_request_typed(
-        &state,
-        "executeElementAction",
-        ws_payload,
-        Method::POST,
-        &path,
-        Some(body.clone()),
-    )
-    .await
-    {
-        Ok(data) => {
-            // Normalised at THIS boundary: the app's JSON is forwarded to the
-            // caller and logged below, so a body with no boolean `success` (a
-            // relay frame whose `result` was absent arrives as `null`) is
-            // rewritten to an explicit `success: false` + `INDETERMINATE:`
-            // error instead of reading as success here and at every
-            // permissive consumer downstream.
-            let (data, success, err) = ws_element_action_result(data);
-            (Json(data), success, err)
+    let result = match element_action_app_payloads(&id, &body, tab_id) {
+        // A placeholder no live condition session can substitute: nothing is
+        // dispatched, and the literal is never typed.
+        Err(refused) => {
+            crate::condition_secrets::refused_action(&refused, "the action was not dispatched")
         }
-        Err(e) => {
-            // An SDK app is connected: its dispatch error IS the answer. Never
-            // retarget the action onto the runner's own UI (Case 1).
-            if let Some(refusal) = ipc_fallback_refusal(&e, "element action") {
-                let err = refusal
-                    .get("error")
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
-                // Recorded as a FAILED action_executed event below. The
-                // journey ledger decides on the refusal's `failure_origin`
-                // (N3): a TRANSPORT refusal reached no UI and records nothing
-                // (the control twin's 4xx rule); an APP-origin failure
-                // reached the app and is an `error` edge.
-                (Json(refusal), false, err)
-            } else {
-                acted_via_ipc = true;
-                // Fall back to IPC — wrap action in an object to match the format
-                // expected by the TypeScript handler (action.action, action.params, etc.)
-                let params = body
-                    .get("params")
-                    .cloned()
-                    .unwrap_or(serde_json::json!(null));
-                let wait_options = body
-                    .get("waitOptions")
-                    .cloned()
-                    .unwrap_or(serde_json::json!(null));
-                // Forward the D3 effect-calculus per-request opt-in so the IPC path
-                // matches the WS/HTTP path (which forwards the body verbatim). Without
-                // this, `effect_check` would never receive `effectVerification` when
-                // the executor falls back to IPC.
-                let verify_effect = body
-                    .get("verifyEffect")
-                    .cloned()
-                    .unwrap_or(serde_json::json!(null));
-                let payload = serde_json::json!({
-                    "elementId": id,
-                    "action": {
-                        "action": action_name,
-                        "params": params,
-                        "waitOptions": wait_options,
-                        "verifyEffect": verify_effect
+        Ok((ws_payload, app_body)) => match dispatch_app_request_typed(
+            &state,
+            "executeElementAction",
+            ws_payload,
+            Method::POST,
+            &path,
+            Some(app_body),
+        )
+        .await
+        {
+            Ok(data) => {
+                // Normalised at THIS boundary: the app's JSON is forwarded to the
+                // caller and logged below, so a body with no boolean `success` (a
+                // relay frame whose `result` was absent arrives as `null`) is
+                // rewritten to an explicit `success: false` + `INDETERMINATE:`
+                // error instead of reading as success here and at every
+                // permissive consumer downstream.
+                let (data, success, err) = ws_element_action_result(data);
+                (Json(data), success, err)
+            }
+            Err(e) => {
+                // An SDK app is connected: its dispatch error IS the answer. Never
+                // retarget the action onto the runner's own UI (Case 1).
+                if let Some(refusal) = ipc_fallback_refusal(&e, "element action") {
+                    let err = refusal
+                        .get("error")
+                        .and_then(|v| v.as_str())
+                        .map(String::from);
+                    // Recorded as a FAILED action_executed event below. The
+                    // journey ledger decides on the refusal's `failure_origin`
+                    // (N3): a TRANSPORT refusal reached no UI and records nothing
+                    // (the control twin's 4xx rule); an APP-origin failure
+                    // reached the app and is an `error` edge.
+                    (Json(refusal), false, err)
+                } else if let Some(refused) = crate::condition_secrets::ipc_refusal(&body) {
+                    // No SDK app is connected, so the fallback would act on the
+                    // runner's own webview, which never substitutes: a
+                    // placeholder bound there is refused, never typed.
+                    crate::condition_secrets::refused_action(
+                        &refused,
+                        "no SDK app is connected, so the action would land on the runner's own UI, \
+                         which never receives a secret",
+                    )
+                } else {
+                    acted_via_ipc = true;
+                    // Fall back to IPC — wrap action in an object to match the format
+                    // expected by the TypeScript handler (action.action, action.params, etc.)
+                    let params = body
+                        .get("params")
+                        .cloned()
+                        .unwrap_or(serde_json::json!(null));
+                    let wait_options = body
+                        .get("waitOptions")
+                        .cloned()
+                        .unwrap_or(serde_json::json!(null));
+                    // Forward the D3 effect-calculus per-request opt-in so the IPC path
+                    // matches the WS/HTTP path (which forwards the body verbatim). Without
+                    // this, `effect_check` would never receive `effectVerification` when
+                    // the executor falls back to IPC.
+                    let verify_effect = body
+                        .get("verifyEffect")
+                        .cloned()
+                        .unwrap_or(serde_json::json!(null));
+                    let payload = serde_json::json!({
+                        "elementId": id,
+                        "action": {
+                            "action": action_name,
+                            "params": params,
+                            "waitOptions": wait_options,
+                            "verifyEffect": verify_effect
+                        }
+                    });
+                    match ui_bridge_request_sync(&state, "execute_action", payload).await {
+                        Ok(data) => {
+                            let (data, success, err) = ipc_element_action_result(data);
+                            (Json(data), success, err)
+                        }
+                        Err(e) => (
+                            Json(serde_json::json!({ "success": false, "error": e })),
+                            false,
+                            Some(e),
+                        ),
                     }
-                });
-                match ui_bridge_request_sync(&state, "execute_action", payload).await {
-                    Ok(data) => {
-                        let (data, success, err) = ipc_element_action_result(data);
-                        (Json(data), success, err)
-                    }
-                    Err(e) => (
-                        Json(serde_json::json!({ "success": false, "error": e })),
-                        false,
-                        Some(e),
-                    ),
                 }
             }
-        }
+        },
     };
+    // An app may echo what was typed (a field's new value, an error naming
+    // the text it refused): scrub every held condition-check secret BEFORE
+    // the journey ledger and the event row below read the result.
+    let result = crate::condition_secrets::scrub_action_result(result);
 
     // Journey ledger choke point (plan 2026-09-20-ui-bridge-represents-the-
     // users-path-and-the-passage-of-time, D3): open a pending edge for the app
@@ -7527,6 +7563,14 @@ pub fn routes() -> Router<Arc<ApiState>> {
             "/ui-bridge/sdk/control/wait-for-route-change",
             post(handle_wait_for_route_change),
         )
+        // While a condition-check session holds a secret, no response here
+        // carries its value (plan
+        // 2026-11-06-a-regression-test-run-is-judged-by-what-it-covered-and-a-silent-run-reads-unknown
+        // Phase 13). LAST, deliberately: `Router::layer` wraps only the routes
+        // registered before it.
+        .layer(axum::middleware::from_fn(
+            crate::condition_secrets::scrub_sdk_responses,
+        ))
 }
 
 // =============================================================================
@@ -10006,5 +10050,251 @@ mod media_override_dispatch_tests {
         })
         .await;
         assert_eq!(frame, json!({}));
+    }
+}
+
+#[cfg(test)]
+mod condition_secrets_dispatch_tests {
+    //! Plan
+    //! `2026-11-06-a-regression-test-run-is-judged-by-what-it-covered-and-a-silent-run-reads-unknown`
+    //! Phase 13 over the REAL transports: a `type` action's placeholder
+    //! reaches the app with its value, and the value comes back in no
+    //! response, log line or ledger string. A handler needs an `ApiState`,
+    //! which no test builds, so these run the handler's own pieces in its
+    //! order (`element_action_app_payloads`, `AppDispatcher::dispatch_active`,
+    //! `ws_element_action_result` / `ipc_fallback_refusal`, then
+    //! `condition_secrets::scrub_action_result`). Their composition in the
+    //! handler is pinned from source by `condition_secrets`' own tests.
+    use super::{
+        element_action_app_payloads, ipc_fallback_refusal, split_arm_payloads,
+        ws_element_action_result, SdkConnectionManager,
+    };
+    use crate::condition_secrets::test_support::LogCapture;
+    use crate::condition_secrets::{
+        register, scrub_action_result, FrameSecrets, Registration, UNKNOWN_REF_CODE,
+    };
+    use crate::mcp::app_dispatch::test_support::{
+        json_echo_app, manager_with_active, next_frame, responsive_active, sample_app,
+    };
+    use crate::mcp::app_dispatch::AppDispatcher;
+    use crate::mcp::app_registry::{AppRegistry, AppTransport};
+    use crate::mcp::command_relay::CommandRelay;
+    use crate::mcp::ws_relay::WsConnectionManager;
+    use axum::Json;
+    use reqwest::Method;
+    use serde_json::{json, Value};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::Mutex;
+
+    const ACTION_PATH: &str = "/control/element/password-field/action";
+
+    fn hold(run_id: &str, reference: &str, value: &str) -> Registration {
+        let mut map = serde_json::Map::new();
+        map.insert(reference.to_string(), json!(value));
+        let secrets: FrameSecrets =
+            serde_json::from_value(Value::Object(map)).expect("a secrets map");
+        register(run_id, &secrets).expect("held")
+    }
+
+    /// The app at `url`, HTTP-registered and active.
+    async fn http_target(url: &str) -> (Arc<AppDispatcher>, Arc<Mutex<SdkConnectionManager>>) {
+        let registry = AppRegistry::new();
+        registry
+            .upsert(
+                sample_app("happ", url),
+                None,
+                AppTransport::Http,
+                None,
+                None,
+            )
+            .await;
+        let relay = CommandRelay::new(WsConnectionManager::new());
+        (
+            AppDispatcher::new(registry, relay),
+            responsive_active("happ", url).await,
+        )
+    }
+
+    /// A loopback app refusing every request with an error that names the
+    /// text it was sent, as an app's error message may.
+    async fn refusing_app() -> String {
+        let app = axum::Router::new().fallback(|bytes: axum::body::Bytes| async move {
+            let got: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+            Json(json!({
+                "success": false,
+                "error": format!(
+                    "cannot type {} here",
+                    got["params"]["text"].as_str().unwrap_or_default()
+                ),
+            }))
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        url
+    }
+
+    #[tokio::test]
+    async fn condition_secrets_a_type_value_reaches_the_http_app_and_no_response_log_or_ledger() {
+        const SECRET: &str = "http-dispatch-secret-Ht1";
+        let _held = hold("run-sdk-http", "cs-sdk-http-pw", SECRET);
+        let logs = LogCapture::start();
+        let body = json!({"action": "type", "params": {"text": "{{secret:cs-sdk-http-pw}}"}});
+        let (ws_payload, http_body) =
+            element_action_app_payloads("password-field", &body, None).expect("a held ref");
+        assert_eq!(
+            ws_payload["request"]["params"]["text"],
+            json!(SECRET),
+            "the WebSocket copy carries the value"
+        );
+        assert_eq!(
+            body["params"]["text"],
+            json!("{{secret:cs-sdk-http-pw}}"),
+            "the handler's own copy is never substituted"
+        );
+
+        // The app echoes what it was sent, as one reporting a field's new
+        // value may.
+        let (dispatcher, connections) = http_target(&json_echo_app().await).await;
+        let answered = dispatcher
+            .dispatch_active(
+                &connections,
+                "executeElementAction",
+                Method::POST,
+                ACTION_PATH,
+                split_arm_payloads(ws_payload.clone(), Some(http_body.clone())),
+            )
+            .await
+            .expect("dispatched");
+        assert_eq!(
+            answered["got"]["params"]["text"],
+            json!(SECRET),
+            "the dispatched payload carried the value to the app"
+        );
+        let (data, success, error) = ws_element_action_result(answered);
+        let (response, success, ledger_error) = scrub_action_result((Json(data), success, error));
+        assert!(success);
+        assert_eq!(ledger_error, None);
+        assert!(
+            !response.0.to_string().contains(SECRET),
+            "the response carries the value: {}",
+            response.0
+        );
+        assert_eq!(
+            response.0["got"]["params"]["text"],
+            json!("{{secret:cs-sdk-http-pw}}")
+        );
+
+        // The app refuses and names the text it was given: that error rides
+        // into the ledger string.
+        let (dispatcher, connections) = http_target(&refusing_app().await).await;
+        let failed = dispatcher
+            .dispatch_active(
+                &connections,
+                "executeElementAction",
+                Method::POST,
+                ACTION_PATH,
+                split_arm_payloads(ws_payload, Some(http_body)),
+            )
+            .await
+            .expect_err("the app answered a failure");
+        let refusal = ipc_fallback_refusal(&failed, "element action")
+            .expect("an app failure never falls back");
+        let message = refusal
+            .get("error")
+            .and_then(Value::as_str)
+            .map(String::from);
+        assert!(
+            message.as_deref().is_some_and(|m| m.contains(SECRET)),
+            "anti-vacuity: the app's error names the value before the scrub"
+        );
+        let (response, success, ledger_error) =
+            scrub_action_result((Json(refusal), false, message));
+        assert!(!success);
+        let ledger_error = ledger_error.expect("a failure records its error");
+        assert!(
+            !ledger_error.contains(SECRET) && ledger_error.contains("{{secret:cs-sdk-http-pw}}"),
+            "{ledger_error}"
+        );
+        assert!(!response.0.to_string().contains(SECRET));
+
+        let lines = logs.text();
+        assert!(
+            lines.contains("[app-dispatch]"),
+            "anti-vacuity: the dispatch path logs: {lines}"
+        );
+        assert!(
+            !lines.contains(SECRET),
+            "a log line carries the value: {lines}"
+        );
+    }
+
+    #[tokio::test]
+    async fn condition_secrets_a_top_level_text_value_reaches_the_websocket_app() {
+        const SECRET: &str = "ws-dispatch-secret-Ws1";
+        let _held = hold("run-sdk-ws", "cs-sdk-ws-pw", SECRET);
+        let body = json!({"action": "type", "text": "{{secret:cs-sdk-ws-pw}}"});
+        let (ws_payload, http_body) =
+            element_action_app_payloads("password-field", &body, Some("tab-7"))
+                .expect("a held ref");
+        assert_eq!(
+            http_body["text"],
+            json!(SECRET),
+            "the HTTP copy carries the value"
+        );
+        assert_eq!(ws_payload["targetTabId"], json!("tab-7"));
+
+        let registry = AppRegistry::new();
+        let ws = WsConnectionManager::new();
+        let (_conn_id, mut outbound_rx) = ws.test_register("wapp").await;
+        registry
+            .upsert(
+                sample_app("wapp", "ws-app://wapp"),
+                None,
+                AppTransport::Websocket,
+                Some(1),
+                None,
+            )
+            .await;
+        let relay = CommandRelay::with_timeout(ws.clone(), Duration::from_secs(2));
+        let dispatcher = AppDispatcher::new(registry, relay);
+        let connections = manager_with_active("wapp", "ws-app://wapp", "");
+        let pending = tokio::spawn(async move {
+            dispatcher
+                .dispatch_active(
+                    &connections,
+                    "executeElementAction",
+                    Method::POST,
+                    ACTION_PATH,
+                    split_arm_payloads(ws_payload, Some(http_body)),
+                )
+                .await
+        });
+        let frame = next_frame(&mut outbound_rx).await;
+        pending.abort();
+        let frame: Value = serde_json::from_str(&frame).expect("a JSON command frame");
+        assert_eq!(frame["action"], json!("executeElementAction"));
+        assert_eq!(
+            frame["payload"]["request"]["text"],
+            json!(SECRET),
+            "the command frame carries the value to the app"
+        );
+        assert_eq!(
+            body["text"],
+            json!("{{secret:cs-sdk-ws-pw}}"),
+            "the handler's own copy is never substituted"
+        );
+    }
+
+    #[test]
+    fn condition_secrets_an_unknown_ref_yields_no_app_payload() {
+        let body = json!({"action": "type", "params": {"text": "{{secret:cs-sdk-never-held}}"}});
+        let refused =
+            element_action_app_payloads("password-field", &body, None).expect_err("an unknown ref");
+        assert_eq!(refused.code(), UNKNOWN_REF_CODE);
+        assert_eq!(refused.reference(), "cs-sdk-never-held");
     }
 }

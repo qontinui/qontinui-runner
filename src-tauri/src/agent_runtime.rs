@@ -805,6 +805,13 @@ pub struct ConditionCheckPayload {
     /// label and no `--name`.
     #[serde(default)]
     pub condition_name: Option<String>,
+    /// The frame's `secrets` key: `ref -> value` for each `{{secret:<ref>}}`
+    /// placeholder coord rendered into [`Self::initial_prompt`] in place of a
+    /// credential. Held for this session and typed only by the SDK `type`
+    /// action ([`crate::condition_secrets`]); empty from a coord that renders
+    /// no placeholders.
+    #[serde(default)]
+    pub secrets: crate::condition_secrets::FrameSecrets,
 }
 
 /// Redacting `Debug`, deliberately not derived.
@@ -815,7 +822,8 @@ pub struct ConditionCheckPayload {
 /// `auth_setup` recipe, i.e. whatever login secret the tenant stored for the
 /// target app. Nothing formats this struct today; a derive would make the next
 /// `{:?}` in a log line leak both without anyone noticing. `initial_prompt` is
-/// reported as a LENGTH so it stays diagnosable without being quotable.
+/// reported as a LENGTH so it stays diagnosable without being quotable, and
+/// `secrets` (the values coord moves OUT of the prompt) as counts only.
 impl std::fmt::Debug for ConditionCheckPayload {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ConditionCheckPayload")
@@ -839,6 +847,7 @@ impl std::fmt::Debug for ConditionCheckPayload {
                     }
                 ),
             )
+            .field("secrets", &self.secrets)
             .finish()
     }
 }
@@ -1133,7 +1142,7 @@ pub(crate) fn claude_bin_path() -> String {
 /// such a file would trade that for an `EACCES` on every attempt. On
 /// Windows, and for anything that is not an absolute path, `resolved` is
 /// returned as is.
-fn launchable_or_bare(resolved: String) -> String {
+pub(crate) fn launchable_or_bare(resolved: String) -> String {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -8850,6 +8859,14 @@ async fn run_condition_check_terminal(
     // sync trust gate decides on the tenant's word, not a cold cache.
     crate::claude_session::trust_gate::warm_dial().await;
 
+    // The frame's secrets, held from before the PTY exists so the session's
+    // first `type` action can substitute. Every return below drops the
+    // registration and releases them; a started session hands it to the
+    // PTY-exit watcher (`crate::condition_secrets`, plan
+    // 2026-11-06-a-regression-test-run-is-judged-by-what-it-covered-and-a-silent-run-reads-unknown
+    // Phase 13).
+    let held_secrets = crate::condition_secrets::register(&payload.run_id, &payload.secrets);
+
     let result = crate::commands::terminal::create_tracked_terminal_session_backend(
         &terminal_manager,
         &session_registry,
@@ -8892,7 +8909,14 @@ async fn run_condition_check_terminal(
             let started =
                 await_continuation_start(&terminal_manager, &terminal_id, &transcript_paths).await;
             match condition_check_never_started_reason(&started) {
-                None => Ok(()),
+                None => {
+                    crate::condition_secrets::release_at_pty_exit(
+                        held_secrets,
+                        &terminal_manager,
+                        &terminal_id,
+                    );
+                    Ok(())
+                }
                 Some(reason) => {
                     // A pane that died within ~100 ms can exit before its coord
                     // session id was set, so its exit hook never closed the
@@ -12573,6 +12597,7 @@ mod tests {
             source: CONDITION_CHECK_SOURCE.to_string(),
             report_token: report_token.map(|s| s.to_string()),
             condition_name: None,
+            secrets: Default::default(),
         }
     }
 
