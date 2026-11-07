@@ -174,8 +174,6 @@ export type UIBridgeRequestType =
   | "get_element_dom_tree"
   | "highlight_element"
   // App-agnostic convenience
-  | "click_by_text"
-  | "click_by_selector"
   | "type_into"
   | "read_value"
   | "find_by_text"
@@ -308,8 +306,6 @@ export type PageEventTypes =
   | "scroll_page"
   | "query_selector"
   | "page_evaluate"
-  | "click_by_text"
-  | "click_by_selector"
   | "type_into"
   | "read_value"
   | "find_by_text"

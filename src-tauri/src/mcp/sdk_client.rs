@@ -7431,6 +7431,26 @@ async fn handle_page_evaluate(
 // App-Agnostic Convenience Endpoints
 // =============================================================================
 
+/// An SDK route's IPC fallback answered by the runner's canonical `/control/…`
+/// handler, in the SDK route's JSON envelope: the handler's body on success,
+/// and on an error its body with a 4xx tagged as a runner rejection
+/// (`failure_origin: "runner"`), so the journey ledger records nothing for it
+/// (e1), the control routes' own 4xx rule.
+fn runner_route_answer<E: Serialize>(
+    result: Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<E>>)>,
+) -> Json<serde_json::Value> {
+    let as_json = |value: Result<serde_json::Value, serde_json::Error>| {
+        value.unwrap_or_else(|e| serde_json::json!({ "success": false, "error": e.to_string() }))
+    };
+    match result {
+        Ok(Json(resp)) => Json(as_json(serde_json::to_value(resp))),
+        Err((status, Json(err))) => Json(crate::journey::capture::tag_runner_rejection(
+            as_json(serde_json::to_value(err)),
+            status,
+        )),
+    }
+}
+
 /// Journey ledger choke point (plan
 /// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
 /// `/sdk/page/click-by-text` is an `element_action` with no element id.
@@ -7478,11 +7498,17 @@ async fn handle_click_by_text_dispatch(
             if let Some(refusal) = ipc_fallback_refusal(&e, "page/click-by-text") {
                 return Json(refusal);
             }
-            let payload = serde_json::json!({ "params": body });
-            match ui_bridge_request_sync(&state, "click_by_text", payload).await {
-                Ok(data) => Json(serde_json::json!({ "success": true, "data": data })),
-                Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
-            }
+            // The runner's own webview: DELEGATE to the canonical
+            // `/control/page/click-by-text` handler, which clicks through the
+            // SDK executor. The bridge message this used to emit ran a raw
+            // `el.click()` that no executor gate ever saw.
+            runner_route_answer(
+                crate::mcp::ui_bridge::elements::ui_bridge_click_by_text_handler_dispatch(
+                    State(state.clone()),
+                    Json(body),
+                )
+                .await,
+            )
         }
     }
 }
@@ -7534,11 +7560,16 @@ async fn handle_click_by_selector_dispatch(
             if let Some(refusal) = ipc_fallback_refusal(&e, "page/click-by-selector") {
                 return Json(refusal);
             }
-            let payload = serde_json::json!({ "params": body });
-            match ui_bridge_request_sync(&state, "click_by_selector", payload).await {
-                Ok(data) => Json(serde_json::json!({ "success": true, "data": data })),
-                Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
-            }
+            // The runner's own webview: DELEGATE to the canonical
+            // `/control/page/click-by-selector` handler, which clicks through
+            // the SDK executor (see `handle_click_by_text_dispatch`).
+            runner_route_answer(
+                crate::mcp::ui_bridge::elements::ui_bridge_click_by_selector_handler_dispatch(
+                    State(state.clone()),
+                    Json(body),
+                )
+                .await,
+            )
         }
     }
 }
@@ -7699,24 +7730,13 @@ async fn handle_send_keys_to_page_dispatch(
             // message type the webview relay actually handles. Re-emitting a
             // `send_keys_to_page` message here would be silently dropped.
             // Same delegation pattern as `handle_list_windows` above.
-            match crate::mcp::ui_bridge::keyboard::ui_bridge_send_keys_to_page_handler_dispatch(
-                State(state.clone()),
-                Json(body),
+            runner_route_answer(
+                crate::mcp::ui_bridge::keyboard::ui_bridge_send_keys_to_page_handler_dispatch(
+                    State(state.clone()),
+                    Json(body),
+                )
+                .await,
             )
-            .await
-            {
-                Ok(Json(resp)) => Json(serde_json::to_value(resp).unwrap_or_else(
-                    |e| serde_json::json!({ "success": false, "error": e.to_string() }),
-                )),
-                // A 4xx is the runner rejecting the request before any key
-                // was sent: tagged so the journey ledger records nothing (e1).
-                Err((status, Json(err))) => Json(crate::journey::capture::tag_runner_rejection(
-                    serde_json::to_value(err).unwrap_or_else(
-                        |e| serde_json::json!({ "success": false, "error": e.to_string() }),
-                    ),
-                    status,
-                )),
-            }
         }
     }
 }
@@ -8566,15 +8586,55 @@ mod tests {
             let gate = body
                 .find("ipc_fallback_refusal(&")
                 .unwrap_or_else(|| panic!("{handler} never asks the IPC-fallback gate"));
-            // `handle_send_keys_to_page` falls back by delegating to the
-            // canonical `/control/page/send-keys` handler instead.
+            // `handle_send_keys_to_page`, `handle_click_by_text` and
+            // `handle_click_by_selector` fall back by delegating to their
+            // canonical `/control/page/…` handler (`…_handler_dispatch(`).
             let fallback = body
                 .find("ui_bridge_request_sync(")
-                .or_else(|| body.find("ui_bridge_send_keys_to_page_handler_dispatch("))
+                .or_else(|| body.find("_handler_dispatch("))
                 .unwrap_or_else(|| panic!("{handler} has no IPC fallback any more"));
             assert!(
                 gate < fallback,
                 "{handler} must ask the gate BEFORE falling back to IPC"
+            );
+        }
+    }
+
+    /// The click-by SDK routes' IPC fallback clicks THROUGH THE SDK EXECUTOR:
+    /// it delegates to the canonical `/control/page/click-by-*` handler and
+    /// never emits the `click_by_text` / `click_by_selector` bridge messages,
+    /// whose webview handlers ran a raw `el.click()` that no executor gate saw
+    /// (a click under a modal answered `clicked: true`). Proved from source,
+    /// like `gated_handlers_ask_before_falling_back_to_ipc`.
+    #[test]
+    fn click_by_fallbacks_click_through_the_sdk_executor() {
+        let src = include_str!("sdk_client.rs");
+        for (handler, canonical, raw_message) in [
+            (
+                "handle_click_by_text_dispatch",
+                "ui_bridge_click_by_text_handler_dispatch(",
+                "\"click_by_text\"",
+            ),
+            (
+                "handle_click_by_selector_dispatch",
+                "ui_bridge_click_by_selector_handler_dispatch(",
+                "\"click_by_selector\"",
+            ),
+        ] {
+            let body = src
+                .split(format!("\nasync fn {handler}(").as_str())
+                .nth(1)
+                .unwrap_or_else(|| panic!("{handler} not found"))
+                .split("\nasync fn ")
+                .next()
+                .unwrap_or_default();
+            assert!(
+                body.contains(canonical),
+                "{handler} must fall back to the canonical executor-backed route"
+            );
+            assert!(
+                !body.contains(raw_message),
+                "{handler} must not emit the raw-click bridge message {raw_message}"
             );
         }
     }

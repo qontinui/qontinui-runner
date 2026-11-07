@@ -2564,7 +2564,12 @@ mod legacy_evaluate_budget_tests {
     fn leaves_every_other_request_type_byte_identical() {
         // Only `page_evaluate` runs a timer of its own. Stamping a budget onto
         // anything else would be noise on the wire.
-        for request_type in ["get_elements", "get_snapshot", "click_by_text", "type_into"] {
+        for request_type in [
+            "get_elements",
+            "get_snapshot",
+            "execute_action",
+            "type_into",
+        ] {
             let payload = serde_json::json!({ "selector": "#a" });
             assert_eq!(
                 stamp_legacy_evaluate_budget(request_type, payload.clone()),
