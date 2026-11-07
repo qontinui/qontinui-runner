@@ -844,8 +844,9 @@ mod tests {
     }
 
     /// An unknown that could not break the limit leaves `Pass`: it is never
-    /// treated worse than a failure would be. Mutation: counting the unknown
-    /// as a failure past `count` turns this `Fail`.
+    /// treated worse than a failure would be. 1-at-worst sits exactly on
+    /// `count`, so this is the boundary of the Pass arm. Mutation: weakening
+    /// `failed_at_worst() <= max` to `<` turns this `Indeterminate`.
     #[test]
     fn max_failures_passes_when_unknown_cannot_break_limit() {
         let eval = eval_rule(
@@ -917,6 +918,55 @@ mod tests {
             ConjunctRule::FailureRateBelow { rate: 0.3 },
         );
         assert_eq!(eval.overall_status, PolicyStatus::Indeterminate);
+    }
+
+    /// No failure is allowed, so a single unknown could be the one that
+    /// breaks the limit. Mutation: ignoring unknowns (Pass on
+    /// `failed <= max`) turns this `Pass`.
+    #[test]
+    fn max_failures_zero_indeterminate_on_one_unknown() {
+        let eval = eval_rule(
+            vec![
+                pass_assertion("p", "error", "c"),
+                unknown_assertion("u", "error", "c"),
+            ],
+            ConjunctRule::MaxFailures { count: 0 },
+        );
+        assert_eq!(eval.overall_status, PolicyStatus::Indeterminate);
+    }
+
+    /// 1-at-worst of 4 is exactly 0.25, which is not BELOW 0.25, so the
+    /// unknown could cross the threshold. Mutation: weakening `worst < rate`
+    /// to `<=` turns this `Pass`.
+    #[test]
+    fn failure_rate_below_indeterminate_when_worst_equals_rate() {
+        let eval = eval_rule(
+            vec![
+                pass_assertion("p1", "error", "c"),
+                pass_assertion("p2", "error", "c"),
+                pass_assertion("p3", "error", "c"),
+                unknown_assertion("u", "error", "c"),
+            ],
+            ConjunctRule::FailureRateBelow { rate: 0.25 },
+        );
+        assert_eq!(eval.overall_status, PolicyStatus::Indeterminate);
+    }
+
+    /// 1 decided of 4 is exactly 0.25, already at the threshold, so the rule
+    /// is broken whatever the unknown turns out to be. Mutation: tightening
+    /// `decided >= rate` to `>` turns this `Indeterminate`.
+    #[test]
+    fn failure_rate_below_fails_when_decided_equals_rate_beside_unknown() {
+        let eval = eval_rule(
+            vec![
+                fail_assertion("f", "error", "c"),
+                pass_assertion("p1", "error", "c"),
+                pass_assertion("p2", "error", "c"),
+                unknown_assertion("u", "error", "c"),
+            ],
+            ConjunctRule::FailureRateBelow { rate: 0.25 },
+        );
+        assert_eq!(eval.overall_status, PolicyStatus::Fail);
     }
 
     // ------------- ConjunctRule::StateMatchRateAtLeast -------------
