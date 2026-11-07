@@ -220,7 +220,7 @@ autoInclude:
 **Frontmatter:** \`name\` overrides the file-stem name; \`category\`, \`tags\` and \`autoInclude\` (\`taskMentions\`, \`actionTypes\`, \`errorPatterns\`, \`filePatterns\`) are all optional.`,
       tips: [
         "Workflow generation reads the runner's working directory, so start the runner from your project to have its contexts included",
-        "A context with no autoInclude is still included in workflow generation; agentic verification includes it only through a taskMentions match",
+        "A context with no autoInclude is still included in workflow generation, but never in agentic verification, which includes a context only when its taskMentions appear in the goal",
         "Nothing reads the old ~/.qontinui/playbooks/ directory: move those files into .qontinui/contexts/",
       ],
       estimatedDuration: 1,
