@@ -1367,9 +1367,10 @@ door to re-issue a write over.** This rung hands back a *bearer*; spend it on
 `$COORD_HTTP_URL/mcp` (coord tools by name) or on the device-authed hand-written
 `/coord/…` REST routes, which `/gate`'s **write-forwarder REST** rung spells
 out. `$COORD_HTTP_URL/mcp` **does** accept it — as `principal_kind: agent`,
-not `device` (measured 2026-09-26 with `coord_work_unit_refresh_citations`, and
-2026-10-02 with `coord_query_identity` and `coord_work_unit_list_citations`, each
-HTTP 200 `isError:false`). This section used to say the opposite ("not carried
+not `device` (measured 2026-10-02 with `coord_query_identity` and
+`coord_work_unit_list_citations`, each HTTP 200 `isError:false`; a 2026-09-26
+measurement used `coord_work_unit_refresh_citations`, which a coord carrying
+qontinui-coord#3146 refuses to this principal). This section used to say the opposite ("not carried
 onto `/mcp`: that door's device-JWT-only constraint is unchanged"); no such
 constraint answers today. Which tools that principal may call is `tools/list`'s
 answer over the same bearer, never this page's. The bootstrap token is an **agent** principal minted against

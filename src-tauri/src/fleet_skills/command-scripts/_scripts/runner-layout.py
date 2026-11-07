@@ -15,7 +15,9 @@ are closed: the runner grows a grid by itself but never shrinks one.
 With no --page the active page (the one on screen) is set. --trim-only skips a
 page unless the target has FEWER zones than the page's current grid, so it
 never grows a page or re-applies its current layout; re-applying clears a
-maximized zone, which is why a no-op is skipped rather than sent.
+maximized zone, which is why a no-op is skipped rather than sent. It also skips
+a page in tmux work mode (`workMode`), which has no grid to trim; a set without
+--trim-only takes such a page back to a grid and the row says so.
 
 Drives the runner's UI Bridge component `zone-layout-picker`
 (`select-layout`, `get-page-layout`) over its HTTP API, and reads every set
@@ -270,6 +272,11 @@ def selftest():
 
 
 def main():
+    for stream in (sys.stdout, sys.stderr):  # a piped Windows console is cp1252
+        try:
+            stream.reconfigure(encoding="utf-8", errors="backslashreplace")
+        except (AttributeError, ValueError, OSError):
+            pass
     if "--selftest" in sys.argv[1:]:
         return selftest()
     ap = argparse.ArgumentParser()
