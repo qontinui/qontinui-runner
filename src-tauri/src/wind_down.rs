@@ -38,7 +38,11 @@
 //!    `2026-10-23-wind-down-idle-check-mistakes-the-completed-turn-line-for-a-spinner`,
 //!    D3): the typed signal outranks the screen. The rendered grid's
 //!    turn-complete heuristic no longer decides it — a grid that reads busy
-//!    (reported as `idleEvidence`) does not block a close by itself.
+//!    (reported as `idleEvidence`) does not block ELIGIBILITY by itself. It
+//!    still blocks the ACT: `graceful_exit::exit_prompt_ready`, checked
+//!    immediately before `/exit` is typed, includes `snapshot_looks_idle`, so
+//!    a pane the heuristic reads busy is refused at action time. That check
+//!    is not redundant with this verdict — do not remove it.
 //! 4. **The input area is not an empty prompt → `Ineligible`
 //!    (`prompt_not_ready`).** The grid's one remaining job: a VETO on positive
 //!    evidence the record cannot see — an unsent draft, an open dialog, or no

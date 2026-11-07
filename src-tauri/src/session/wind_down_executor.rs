@@ -933,6 +933,7 @@ async fn wind_down_once(app: &tauri::AppHandle, grace: Duration) {
         app,
         grace,
         crate::session::claude_activity::RecordDepth::WindDown,
+        wind_down_observer::RecordReadLane::Executor,
     )
     .await;
     let Some(pass) = fresh.pass.as_ref() else {
@@ -1231,6 +1232,7 @@ impl FinishedCloseWorld for LiveFinishedCloseWorld<'_> {
             self.app,
             self.grace,
             crate::session::claude_activity::RecordDepth::WindDown,
+            wind_down_observer::RecordReadLane::Executor,
         )
         .await;
         // Incomplete — no table, or a process the session registry could not
