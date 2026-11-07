@@ -900,8 +900,14 @@ async fn handle_inbound_text(
         }
         Ok(InboundFrame::ChangeEvent { event }) => {
             // Phase 1: log and discard. Phase 2 will wire this into the
-            // existing change-event subscriber machinery.
-            debug!("[ws-relay] changeEvent from '{}': {:?}", app_id, event);
+            // existing change-event subscriber machinery. The event is app
+            // content, so it can carry what a condition check just typed: a
+            // held condition-check secret is scrubbed from the line.
+            debug!(
+                "[ws-relay] changeEvent from '{}': {}",
+                app_id,
+                crate::condition_secrets::debug_scrubbed(&event)
+            );
         }
         Ok(InboundFrame::Other) => {
             debug!("[ws-relay] ignoring unknown frame type from '{}'", app_id);
@@ -1296,5 +1302,51 @@ mod tests {
         ] {
             assert_eq!(unreadable_response_command_id(text), None, "{text}");
         }
+    }
+
+    /// A change event is app content, so it can carry what a condition check
+    /// just typed (plan
+    /// 2026-11-06-a-regression-test-run-is-judged-by-what-it-covered-and-a-silent-run-reads-unknown
+    /// Phase 13). Fed through the REAL inbound parser while a session holds a
+    /// secret, its debug line carries the placeholder, never the value.
+    #[tokio::test]
+    async fn condition_secrets_a_change_event_debug_line_never_carries_a_held_value() {
+        const SECRET: &str = "relay-change-event-secret-Rl1";
+        let held = serde_json::from_value(serde_json::json!({ "cs-relay-pw": SECRET }))
+            .expect("a secrets map");
+        let _held =
+            crate::condition_secrets::register("run-relay-change-event", &held).expect("held");
+        let logs = crate::condition_secrets::test_support::LogCapture::start();
+        let ws = WsConnectionManager::new();
+        let (conn_id, _outbound_rx) = ws.test_register("wrapper").await;
+        let relay = CommandRelay::with_timeout(ws.clone(), RELAY_TIMEOUT);
+        let frame = serde_json::json!({
+            "type": "changeEvent",
+            "event": {"kind": "input", "elementId": "password-field", "value": SECRET},
+        });
+
+        handle_inbound_text(
+            "wrapper",
+            conn_id,
+            BindingMode::Enforce,
+            &Principal::OperatorTrust {
+                class: crate::mcp::origin_guard::OriginClass::NonBrowser,
+            },
+            &RelayBinding::new(BindingConfig::default()),
+            &relay,
+            &frame.to_string(),
+        )
+        .await;
+
+        let lines = logs.text();
+        assert!(
+            lines.contains("changeEvent from 'wrapper'"),
+            "anti-vacuity: the change event was logged: {lines}"
+        );
+        assert!(lines.contains("{{secret:cs-relay-pw}}"), "{lines}");
+        assert!(
+            !lines.contains(SECRET),
+            "a log line carries the held value: {lines}"
+        );
     }
 }

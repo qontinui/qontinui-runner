@@ -1705,6 +1705,8 @@ fn parse_node_major(raw: &str) -> Option<u32> {
 struct SlowHostProbes {
     powershell: bool,
     docker: bool,
+    /// `claude` resolves to a launchable executable ([`claude_launchable`]).
+    claude: bool,
 }
 
 static SLOW_HOST_PROBE_CACHE: Mutex<Option<(SlowHostProbes, std::time::Instant)>> =
@@ -1729,6 +1731,7 @@ fn slow_host_probes() -> SlowHostProbes {
     let probes = SlowHostProbes {
         powershell: powershell_on_path(),
         docker: docker_daemon_answers(),
+        claude: claude_launchable(),
     };
     if let Ok(mut g) = SLOW_HOST_PROBE_CACHE.lock() {
         *g = Some((probes, std::time::Instant::now()));
@@ -1749,13 +1752,18 @@ fn slow_host_probes() -> SlowHostProbes {
 /// ([`heartbeat_device_capabilities`], which reaches this) on the blocking pool.
 fn host_capabilities() -> Vec<String> {
     let slow = slow_host_probes();
+    let webview = webview_runtime_available();
     let mut caps = build_host_capabilities(
         current_os_label(),
         slow.powershell,
         slow.docker,
-        webview_runtime_available(),
+        webview,
         host_mem_total_bytes(),
     );
+    caps.extend(condition_secret_substitution_capability(
+        webview,
+        slow.claude,
+    ));
     caps.extend(imagegen_probe::capability_tokens());
     caps
 }
@@ -1965,6 +1973,47 @@ fn build_host_capabilities(
     }
     caps.extend(memory_tier_capabilities(mem_total_bytes));
     caps
+}
+
+/// The capability token asserting this runner substitutes a condition check's
+/// `{{secret:<ref>}}` placeholders inside its SDK `type` action
+/// ([`crate::condition_secrets`]), and can launch the session that types them.
+///
+/// Plan
+/// `2026-11-06-a-regression-test-run-is-judged-by-what-it-covered-and-a-silent-run-reads-unknown`
+/// Phase 13, D-D7a: coord places a condition group whose `auth_setup` carries
+/// a credential only on a device advertising this token, and otherwise reads
+/// the run `unknown`, never a plaintext prompt. Coord's placement verdict reads
+/// the token and NOT `claude_code_available`, so the token itself carries the
+/// launch precondition ([`condition_secret_substitution_capability`]).
+///
+/// The spelling is frozen for the same reason as
+/// [`WEBVIEW_RUNTIME_CAPABILITY`]: a respelling silently un-targets every
+/// secret-bearing condition group, with nothing red on either side.
+pub const CONDITION_SECRET_SUBSTITUTION_CAPABILITY: &str = "condition:secret_substitution";
+
+/// `Some(token)` exactly when this runner can launch a condition-check
+/// session: a webview runtime to host its visible terminal (the first thing
+/// `agent_runtime::run_condition_check_terminal` needs) AND a `claude` that
+/// resolves to a launchable executable. Fail-closed like
+/// [`webview_runtime_available`]: advertising falsely sends a run carrying
+/// secrets to a device that then cannot spawn its session; not advertising
+/// only moves the run elsewhere, or reads it `unknown`. Pure.
+fn condition_secret_substitution_capability(webview: bool, claude: bool) -> Option<String> {
+    (webview && claude).then(|| CONDITION_SECRET_SUBSTITUTION_CAPABILITY.to_string())
+}
+
+/// True when `claude` resolves to the absolute path of an existing,
+/// launchable executable: what a condition-check spawn execs
+/// (`agent_runtime::resolve_claude_bin`, then the execute-bit check of
+/// `agent_runtime::launchable_or_bare`). A miss falls back to the bare name
+/// there, which is not a launch this runner can vouch for. Stats PATH, so it
+/// is cached behind `HOST_PROBE_TTL` with the other slow probes.
+fn claude_launchable() -> bool {
+    let resolved =
+        crate::agent_runtime::launchable_or_bare(crate::agent_runtime::resolve_claude_bin());
+    let path = std::path::Path::new(&resolved);
+    path.is_absolute() && path.is_file()
 }
 
 /// Prefix of the per-repo CI allowlist token: one `ci_repo:<entry>` per
@@ -9360,6 +9409,41 @@ mod tests {",
                 .iter()
                 .any(|c| c == WEBVIEW_RUNTIME_CAPABILITY),
             "and the assembled set must not carry the token either"
+        );
+    }
+
+    /// Plan
+    /// `2026-11-06-a-regression-test-run-is-judged-by-what-it-covered-and-a-silent-run-reads-unknown`
+    /// Phase 13 (D-D7a): `condition:secret_substitution` is advertised only
+    /// when this runner can launch a condition-check session, a webview
+    /// runtime AND a launchable `claude`, because coord's placement verdict
+    /// reads the token and not `claude_code_available`.
+    #[test]
+    fn condition_secrets_capability_is_advertised_only_when_a_condition_check_can_launch() {
+        assert_eq!(
+            CONDITION_SECRET_SUBSTITUTION_CAPABILITY,
+            "condition:secret_substitution"
+        );
+        assert_eq!(
+            condition_secret_substitution_capability(true, true).as_deref(),
+            Some("condition:secret_substitution")
+        );
+        for (webview, claude) in [(true, false), (false, true), (false, false)] {
+            assert_eq!(
+                condition_secret_substitution_capability(webview, claude),
+                None,
+                "webview={webview} claude={claude}: no condition-check session can launch"
+            );
+        }
+        // A unit-test process holds no Tauri runtime, so the precondition
+        // fails here whatever PATH holds, and the assembled set must not
+        // carry the token.
+        assert!(!webview_runtime_available());
+        assert!(
+            !host_capabilities()
+                .iter()
+                .any(|c| c == CONDITION_SECRET_SUBSTITUTION_CAPABILITY),
+            "the token was advertised by a runner that cannot launch a condition check"
         );
     }
 
