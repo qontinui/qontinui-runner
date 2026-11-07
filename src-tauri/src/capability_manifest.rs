@@ -1103,10 +1103,11 @@ pub enum RetainedReason {
     /// Its blob is not one the definition shipped as, so somebody edited it and
     /// it is kept deliberately (the own-files-only rule). The blob is the copy's.
     LocallyModified(String),
-    /// The enclosing repository keeps it: the detail is the
-    /// [`SkipReason::wire`] the tracked-file guard decided
-    /// (`git_tracked` or `probe_unknown_in_repo`). Deliberate, like the keeps of
-    /// both provisioning layers.
+    /// The tracked-file guard kept it: the detail is the [`SkipReason::wire`]
+    /// it decided. `git_tracked` (the repository tracks it) is deliberate;
+    /// `probe_unknown_in_repo` (inside a repository whose probe could not
+    /// answer) is a fail-safe keep that degrades the pass, as it degrades both
+    /// provisioning layers.
     KeptByRepository(String),
     /// The copy could not be read, so its blob could not be compared.
     ReadFailed(String),
@@ -1123,10 +1124,13 @@ impl RetainedReason {
     /// not; a deliberate keep is not one.
     #[must_use]
     pub fn is_failure(&self) -> bool {
-        !matches!(
-            self,
-            RetainedReason::LocallyModified(_) | RetainedReason::KeptByRepository(_)
-        )
+        match self {
+            RetainedReason::LocallyModified(_) => false,
+            RetainedReason::KeptByRepository(why) => why != SkipReason::GitTracked.wire(),
+            RetainedReason::ReadFailed(_)
+            | RetainedReason::RemoveFailed(_)
+            | RetainedReason::LinkedElsewhere(_) => true,
+        }
     }
 
     /// Stable snake_case wire string, matching the `serde` tag.
@@ -1149,7 +1153,7 @@ impl RetainedReason {
                 format!("locally modified (blob {blob} is not one it shipped as), kept")
             }
             RetainedReason::KeptByRepository(why) => {
-                format!("kept: the enclosing repository keeps it ({why})")
+                format!("kept by the tracked-file guard ({why})")
             }
             RetainedReason::ReadFailed(why) => {
                 format!("could not be read to compare its blob: {why}")
@@ -1205,9 +1209,10 @@ pub struct ProvisionReport {
     /// neither `written` nor [`Self::is_complete`].
     pub removed: Vec<RemovedUnit>,
     /// Every RETIRED unit the pass found and left on disk, with why. A failed
-    /// removal or read degrades the pass ([`Self::is_complete`]); a copy kept
-    /// on purpose (locally modified, or kept by the repository) does not, but
-    /// is still named.
+    /// read or removal, a shipped copy behind a symlink, and a copy kept because
+    /// the tracked-file probe could not answer degrade the pass
+    /// ([`Self::is_complete`], [`RetainedReason::is_failure`]); a copy kept on
+    /// purpose (locally modified, or tracked) does not, but is still named.
     pub retained_retired: Vec<RetainedRetiredUnit>,
     /// Which rung supplied what was written. [`Rung::Unresolved`] when the pass
     /// delivered nothing at all.
@@ -2707,9 +2712,17 @@ mod tests {
                 {"unit": "stuck.md", "reason": "remove_failed", "detail": "permission denied"}
             ])
         );
-        for r in &report.retained_retired {
-            assert_eq!(json_reason(&r.reason), r.reason.wire());
+        for reason in [
+            RetainedReason::LocallyModified("a".to_string()),
+            RetainedReason::KeptByRepository("git_tracked".to_string()),
+            RetainedReason::ReadFailed("b".to_string()),
+            RetainedReason::RemoveFailed("c".to_string()),
+            RetainedReason::LinkedElsewhere("d".to_string()),
+        ] {
+            assert_eq!(json_reason(&reason), reason.wire());
         }
+        assert!(!RetainedReason::KeptByRepository("git_tracked".to_string()).is_failure());
+        assert!(RetainedReason::KeptByRepository("probe_unknown_in_repo".to_string()).is_failure());
     }
 
     fn json_reason(reason: &RetainedReason) -> String {
@@ -3300,34 +3313,38 @@ mod tests {
             );
         }
 
-        // `fleet_agents` is conditional for the same reason: `agent_runtime`'s
-        // subagent-provisioning tests record the embedded floor's report from
-        // inside `provision_agent_definitions_retiring` without this module's
-        // store lock, so a parallel run can leave a real arm here.
-        let floor = manifest.row("fleet_agents").expect("row present");
-        if floor.rung == Rung::Unknown {
-            assert!(floor
-                .note
-                .as_deref()
-                .is_some_and(|n| n.contains(capability("fleet_agents").anchor)));
-        } else {
-            assert!(
-                capability("fleet_agents")
-                    .expected_rungs
-                    .contains(&floor.rung),
-                "fleet_agents reported {:?}, a rung its provisioner cannot emit",
-                floor.rung.wire()
-            );
-        }
-
-        // Everything the driver cannot observe from here stays `unknown` AND
-        // names its anchor. With an empty ledger that is the other six rows;
-        // nothing outside this module's own tests records them, so they are
-        // deterministic.
+        // The four session-provisioning rows are conditional for the same
+        // reason: other modules' tests record them without this module's store
+        // lock (`agent_runtime`'s subagent tests, `mcp_api`'s provision probe,
+        // `agent_worktree::isolated_edit`'s command and skill tests), so a
+        // parallel run can leave a real arm. Either way unknown NAMES the anchor
+        // and anything else is a rung the provisioner can emit.
         for id in [
             "fleet_commands",
             "fleet_skills",
+            "fleet_agents",
             "agent_definitions",
+        ] {
+            let row = manifest.row(id).expect("row present");
+            if row.rung == Rung::Unknown {
+                assert!(
+                    row.note
+                        .as_deref()
+                        .is_some_and(|n| n.contains(capability(id).anchor)),
+                    "{id}'s unknown note must name its owning symbol"
+                );
+            } else {
+                assert!(
+                    capability(id).expected_rungs.contains(&row.rung),
+                    "{id} reported {:?}, a rung its provisioner cannot emit",
+                    row.rung.wire()
+                );
+            }
+        }
+
+        // Everything else the driver cannot observe from here stays `unknown`
+        // AND names its anchor.
+        for id in [
             "agent_commands_registry",
             "agent_skills_registry",
             "slash_commands",

@@ -10260,8 +10260,8 @@ async fn materialize_worktrees(payload: &LaunchPayload) -> anyhow::Result<()> {
 /// `*.md` defs, NOT the whole `.claude` tree (avoid pulling in settings/hooks/
 /// mcp that could alter spawn behavior).
 ///
-/// Fail-soft: if the source dir is missing we `warn` and return Ok — the agent
-/// then simply lacks subagents (same as before this fix; no regression). The
+/// Fail-soft: if the source dir is missing we `warn` and return a report — the
+/// agent then simply lacks subagents (same as before this fix; no regression). The
 /// fleet-portability follow-up is to BUNDLE these defs into the runner binary
 /// (`include_str!`) so non-operator devices without a `qontinui-claude-config`
 /// checkout still get them; this copy-from-checkout path unblocks the current
@@ -10271,8 +10271,8 @@ async fn materialize_worktrees(payload: &LaunchPayload) -> anyhow::Result<()> {
 /// The no-root arm below used to be a bare `warn!` and an `Ok(())` — an
 /// unresolved checkout stated only in a log file — and is now a
 /// [`capability_manifest::Rung::Unresolved`] row naming what was skipped and
-/// why. The control flow is unchanged: it still returns `Ok` and the spawn
-/// still proceeds.
+/// why. The control flow is unchanged: it returns a report, never an error, and
+/// the spawn still proceeds.
 fn provision_agent_definitions(worktree_cwd: &str) -> ProvisionReport {
     provision_agent_definitions_with_root(qontinui_root_dir().as_deref(), worktree_cwd)
 }
@@ -10449,23 +10449,24 @@ fn provision_agent_definitions_retiring(
     // qontinui-claude-config/.claude/agents behaves exactly as before.
     // An overlay that errored still gets the retirement pass below, so its
     // error becomes an errored report rather than an early return.
-    let mut report = match overlay_checkout_agent_definitions(&src_dir, &dst_dir, &keep, embedded) {
-        Ok(report) => report,
-        Err(e) => {
-            warn!("agent_runtime: agent-def checkout overlay errored (continuing): {e:#}");
-            let mut report = ProvisionReport::new(
-                "agent_definitions",
-                0,
-                capability_manifest::Rung::Unresolved,
-            )
-            .with_destination(dst_dir.display().to_string());
-            report.skip(
-                dst_dir.display().to_string(),
-                capability_manifest::SkipReason::WriteFailed(format!("{e:#}")),
-            );
-            report
-        }
-    };
+    let mut report =
+        match overlay_checkout_agent_definitions(&src_dir, &dst_dir, &keep, embedded, retired) {
+            Ok(report) => report,
+            Err(e) => {
+                warn!("agent_runtime: agent-def checkout overlay errored (continuing): {e:#}");
+                let mut report = ProvisionReport::new(
+                    "agent_definitions",
+                    0,
+                    capability_manifest::Rung::Unresolved,
+                )
+                .with_destination(dst_dir.display().to_string());
+                report.skip(
+                    dst_dir.display().to_string(),
+                    capability_manifest::SkipReason::WriteFailed(format!("{e:#}")),
+                );
+                report
+            }
+        };
 
     // RETIRED LAST. A definition this binary retired stopped shipping when its
     // file left the bundle, but a copy an older binary or a checkout overlay
@@ -10496,7 +10497,9 @@ fn overlay_checkout_agent_definitions(
     dst_dir: &Path,
     keep: &crate::provision_guard::KeepDecisions,
     embedded: usize,
+    retired: &[&str],
 ) -> anyhow::Result<ProvisionReport> {
+    let retired_names = crate::fleet_agents::retired_agent_names(retired);
     if !src_dir.is_dir() {
         warn!(
             "agent_runtime: no claude-config agents dir at {}; keeping the \
@@ -10553,9 +10556,19 @@ fn overlay_checkout_agent_definitions(
         let Some(name) = path.file_name() else {
             continue;
         };
+        let unit = name.to_string_lossy().into_owned();
+        // A RETIRED definition is never delivered, even by a checkout that still
+        // holds it (a stale primary, or one standing on a branch that edited it):
+        // the retirement pass then judges only copies that were already there.
+        if retired_names.contains(&unit) {
+            info!(
+                "agent_runtime: not overlaying retired {} from the checkout",
+                path.display()
+            );
+            continue;
+        }
         let dst = dst_dir.join(name);
         report.expected += 1;
-        let unit = name.to_string_lossy().into_owned();
         if let Some(reason) = keep.reason(&unit) {
             info!(
                 "agent_runtime: keeping {} as it is on disk — {}",
@@ -14847,8 +14860,8 @@ mod tests {
             }]
         );
         assert!(
-            report.is_complete(),
-            "a repository keep does not degrade the pass"
+            !report.is_complete(),
+            "an UNKNOWN probe degrades the pass, as it does both provisioning layers"
         );
     }
 
@@ -14878,38 +14891,54 @@ mod tests {
         assert!(report.removed.is_empty(), "{:?}", report.removed);
     }
 
-    /// The retirement pass runs AFTER the checkout overlay, so a stale checkout
-    /// that still holds a retired definition cannot re-deliver it.
+    /// A stale checkout that still holds a retired definition, in ANY version
+    /// (shipped or edited), cannot re-deliver it: the overlay skips retired
+    /// names, and the pass removes the shipped copy that was already on disk.
     #[test]
-    fn provision_agent_defs_remove_a_retired_copy_a_stale_overlay_just_wrote() {
+    fn provision_agent_defs_never_overlay_a_retired_definition() {
         let (body, line) = retired_fixture();
-        let root = checkout_root_with(&[
-            ("retired-agent.md", body),
-            ("merge-specialist.md", "# PRIMARY copy"),
-        ]);
-        let wt = tempfile::tempdir().unwrap();
-        let dst = wt.path().join(".claude").join("agents");
+        for checkout_copy in [
+            body,
+            "---\nname: retired-agent\n---\n# edited on a branch\n",
+        ] {
+            let root = checkout_root_with(&[
+                ("retired-agent.md", checkout_copy),
+                ("merge-specialist.md", "# PRIMARY copy"),
+            ]);
+            let wt = tempfile::tempdir().unwrap();
+            let dst = wt.path().join(".claude").join("agents");
 
-        let wt_cwd = wt.path().to_string_lossy().into_owned();
-        let report = provision_agent_definitions_retiring(root.path(), &wt_cwd, &[line.as_str()]);
+            let wt_cwd = wt.path().to_string_lossy().into_owned();
+            let report =
+                provision_agent_definitions_retiring(root.path(), &wt_cwd, &[line.as_str()]);
 
-        assert_eq!(
-            report.written, 2,
-            "the overlay copied both definitions first"
+            assert_eq!(
+                (report.expected, report.written),
+                (1, 1),
+                "the overlay copies the current definition and not the retired one"
+            );
+            assert!(
+                !dst.join("retired-agent.md").exists(),
+                "a checkout's retired copy must never reach the session"
+            );
+            assert!(
+                report.removed.is_empty() && report.retained_retired.is_empty(),
+                "nothing retired was on disk, so nothing is removed or kept: {}",
+                report.summary()
+            );
+            assert!(dst.join("merge-specialist.md").is_file());
+        }
+
+        // A shipped copy already in the workdir is still removed.
+        let root = checkout_root_with(&[("retired-agent.md", body)]);
+        let (wt, dst) = workdir_with(&[("retired-agent.md", body)]);
+        let report = provision_agent_definitions_retiring(
+            root.path(),
+            &wt.path().to_string_lossy(),
+            &[line.as_str()],
         );
-        assert!(
-            !dst.join("retired-agent.md").exists(),
-            "the retired copy the stale overlay wrote must be removed after it"
-        );
-        assert_eq!(
-            report
-                .removed
-                .iter()
-                .map(|r| r.unit.as_str())
-                .collect::<Vec<_>>(),
-            vec!["retired-agent.md"]
-        );
-        assert!(dst.join("merge-specialist.md").is_file());
+        assert!(!dst.join("retired-agent.md").exists());
+        assert_eq!(report.removed.len(), 1, "{:?}", report.removed);
     }
 
     /// A device with no checkout is where an older binary's embedded copy sits,
@@ -14966,7 +14995,7 @@ mod tests {
         let (wt, dst) = workdir_with(&[("test-generator.md", edited)]);
 
         let wt_cwd = wt.path().to_string_lossy().into_owned();
-        let report = provision_agent_definitions_from_root(root.path(), &wt_cwd);
+        let report = provision_agent_definitions_with_root(Some(root.path()), &wt_cwd);
 
         assert_eq!(
             std::fs::read_to_string(dst.join("test-generator.md")).unwrap(),
@@ -15058,6 +15087,11 @@ mod tests {
         // A user who can still write here (root) cannot exercise this arm.
         if std::fs::write(dst.join("probe"), b"").is_ok() {
             std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755)).unwrap();
+            eprintln!(
+                "retire_agent_definitions_report_a_failed_removal_as_one: SKIPPED — a 0o555 \
+                 directory is still writable by this user (root?), so the failed-removal arm \
+                 cannot be exercised"
+            );
             return;
         }
         let mut report = ProvisionReport::new(
@@ -15200,6 +15234,10 @@ mod tests {
         std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o000)).unwrap();
         if std::fs::read_dir(&src).is_ok() {
             std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o755)).unwrap();
+            eprintln!(
+                "provision_agent_defs_retire_even_when_the_overlay_errors: SKIPPED — a 0o000 \
+                 directory is still listable by this user (root?), so the overlay cannot error"
+            );
             return;
         }
         let (wt, dst) = workdir_with(&[("retired-agent.md", body)]);
