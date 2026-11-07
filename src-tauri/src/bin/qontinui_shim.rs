@@ -62,6 +62,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use qontinui_runner_lib::intercept_core::classify::{self, Classification, ShimTool};
+use qontinui_runner_lib::intercept_core::claude_subcommands;
 use qontinui_runner_lib::intercept_core::gate::{should_block, InterceptMode};
 use qontinui_runner_lib::intercept_core::npm_placeholder::is_npm_placeholder;
 use qontinui_runner_lib::intercept_core::types::PackageSpecInput;
@@ -296,6 +297,14 @@ pub fn user_chose_session(args: &[String]) -> bool {
         ) || t.starts_with("--session-id=")
             || t.starts_with("--resume=")
     })
+}
+
+/// Does this identity invocation pass through with its argv untouched? Only
+/// claude's non-session subcommands do (see
+/// [`claude_subcommands`](qontinui_runner_lib::intercept_core::claude_subcommands)).
+/// gemini keeps its current behaviour: its subcommand table is not verified.
+pub fn is_identity_passthrough(tool: IdentityTool, args: &[String]) -> bool {
+    tool == IdentityTool::Claude && claude_subcommands::is_non_session_subcommand(args)
 }
 
 /// The claude SessionStart-hook `--settings` args: tool==claude AND the env
@@ -580,7 +589,8 @@ pub fn identity_argv(
 
 /// The identity straddle, fail-open at every step. Returns the exit code to
 /// propagate. Mirrors `identity_shim.cmd`:
-/// resolve real → guard passthrough → settings/user-chose scan → best-effort
+/// resolve real → guard passthrough → subcommand passthrough →
+/// settings/user-chose scan → best-effort
 /// confirmation POST → exec real with the composed argv.
 fn run_identity(tool: IdentityTool, args: &[String]) -> Option<i32> {
     let own_dirs = own_shim_dirs();
@@ -588,6 +598,15 @@ fn run_identity(tool: IdentityTool, args: &[String]) -> Option<i32> {
 
     // Recursion guard: a nested invocation never re-pins — pure passthrough.
     if env::var(GUARD_ENV).ok().as_deref() == Some("1") {
+        return exec_real(&real, tool.program(), args);
+    }
+
+    // A non-session subcommand (`claude plugin eval …`, `claude mcp list`, …)
+    // is parsed by its own option table, which rejects the root-command flags
+    // we append (`unknown option '--settings'`, coord finding 877edd19). Exec it
+    // with its argv untouched — no flags, no self-provisioned coord-mcp config,
+    // no session-open POST. Same exec as the recursion guard above.
+    if is_identity_passthrough(tool, args) {
         return exec_real(&real, tool.program(), args);
     }
 
@@ -621,7 +640,8 @@ fn run_identity(tool: IdentityTool, args: &[String]) -> Option<i32> {
         mcp_config = identity_mcp_config_args(tool, path.to_str());
     }
 
-    // Fire-and-forget DIAGNOSTIC beacon on EVERY (non-nested) invocation —
+    // Fire-and-forget DIAGNOSTIC beacon on every non-nested, non-subcommand
+    // invocation —
     // INCLUDING the don't-double-pin passthrough that sends no session-open —
     // mirroring the `.bash`/`.cmd` shim beacons, with `"surface":"exe"` so the
     // runner logs reveal WHICH shim surface actually ran (post-#696 this exe is
@@ -1779,6 +1799,29 @@ mod tests {
 
     fn strs(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Claude's non-session subcommands pass through untouched; a session
+    /// launch, and every gemini invocation, does not (coord finding 877edd19).
+    #[test]
+    fn identity_passthrough_is_claude_subcommands_only() {
+        let c = IdentityTool::Claude;
+        assert!(is_identity_passthrough(
+            c,
+            &strs(&["plugin", "eval", "s.json"])
+        ));
+        assert!(is_identity_passthrough(c, &strs(&["mcp", "list"])));
+        assert!(is_identity_passthrough(c, &strs(&["--verbose", "doctor"])));
+        assert!(!is_identity_passthrough(c, &strs(&[])));
+        assert!(!is_identity_passthrough(
+            c,
+            &strs(&["-p", "fix the plugin"])
+        ));
+        assert!(!is_identity_passthrough(c, &strs(&["--", "mcp"])));
+        assert!(!is_identity_passthrough(
+            IdentityTool::Gemini,
+            &strs(&["mcp", "list"])
+        ));
     }
 
     #[test]

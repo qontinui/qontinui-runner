@@ -25,6 +25,8 @@
 #     passthrough (a nested invocation, e.g. a subagent, must not re-pin).
 #   * DON'T DOUBLE-PIN: if the user already passed --session-id/--resume (or the
 #     resume subcommand), do NOT append our id — their explicit choice wins.
+#   * SUBCOMMAND PASSTHROUGH: a non-session claude subcommand (plugin, mcp,
+#     doctor, …) gets its argv untouched — none of our flags apply to it.
 #   * BOUNDED RESOLVE WAIT: a real tool that is momentarily ABSENT, or is
 #     npm's placeholder stub (mid-reinstall), is re-scanned for at most QONTINUI_SHIM_RESOLVE_WAIT_SECS
 #     (default 10) before the fail-open fall-through; a resolved tool never
@@ -207,6 +209,47 @@ if [ "${QONTINUI_INSTALL_INTERCEPT_GUARD:-}" = "1" ]; then
   exec_real "$@"
 fi
 
+# ---------------------------------------------------------------------------
+# Non-session subcommand passthrough (coord finding 877edd19).
+# The flags appended below (--settings, --mcp-config, --session-id) are ROOT
+# command options. A subcommand — `claude plugin eval …`, `claude mcp list`,
+# `claude doctor` — is parsed by its own option table and fails
+# `error: unknown option '--settings'`, or is handed a live coord-mcp config it
+# has no use for. So when the first positional ahead of `--` is one of claude's
+# subcommands, exec the real tool with the ORIGINAL argv and append nothing.
+# The list is of passthrough subcommands, not of injected invocations, because
+# a prompt is a positional too (`claude "fix the bug"`): only a known command
+# name tells the two apart, as it does for claude's own parser. The list is
+# `CLAUDE_NON_SESSION_SUBCOMMANDS` in src/intercept_core/claude_subcommands.rs,
+# which a test holds this case pattern equal to. Case-sensitive, as claude is.
+# The token after a value-taking root option (`--add-dir config`, `--agent
+# doctor`) is that option's value, not a subcommand, so it is skipped unless it
+# is itself a flag; that table is `CLAUDE_VALUE_OPTIONS` in the same file.
+# gemini is untouched: its subcommand table is not verified.
+# ---------------------------------------------------------------------------
+if [ "$TOOL" = "claude" ]; then
+  first_positional=""
+  skip_value=0
+  for a in "$@"; do
+    case "$a" in
+      --) break ;;
+      -*)
+        skip_value=0
+        case "$a" in
+          --add-dir|--agent|--agents|--allowedTools|--allowed-tools|--append-system-prompt|--append-system-prompt-file|--autocompact|--betas|--cloud|-d|--debug|--debug-file|--disallowedTools|--disallowed-tools|--effort|--environment|--fallback-model|--file|--from-pr|--input-format|--json-schema|--max-budget-usd|--mcp-config|--model|-n|--name|--output-format|--permission-mode|--permission-prompts|--plugin-dir|--plugin-url|--prompt-suggestions|--remote-control|--remote-control-session-name-prefix|-r|--resume|--session-id|--setting-sources|--settings|--system-prompt|--system-prompt-file|--system-prompt-snapshot|--teleport|--tools|-w|--worktree)
+            skip_value=1 ;;
+        esac
+        continue ;;
+    esac
+    if [ "$skip_value" = "1" ]; then skip_value=0; continue; fi
+    first_positional="$a"; break
+  done
+  case "$first_positional" in
+    agents|attach|auth|auto-mode|config|doctor|gateway|help|import|install|kill|logs|mcp|migrate-installer|plugin|plugins|purge|respawn|rm|setup-token|stop|ultrareview|update|upgrade)
+      exec_real "$@" ;;
+  esac
+fi
+
 PINNED="${QONTINUI_PINNED_SESSION_ID:-}"
 
 # ---------------------------------------------------------------------------
@@ -318,8 +361,9 @@ notify_session_open() {
       -d "$body" >/dev/null 2>&1 || true
 }
 
-# Fire-and-forget DIAGNOSTIC beacon on EVERY real shim invocation (even the
-# don't-double-pin passthrough that sends no session-open). Log-only on the
+# Fire-and-forget DIAGNOSTIC beacon on every real shim invocation (even the
+# don't-double-pin passthrough that sends no session-open) EXCEPT a non-session
+# subcommand, which exec'd above untouched. Log-only on the
 # runner side — makes "did the shim run for this terminal, and will it deliver
 # --session-id/--settings?" observable in the logs. Never blocks the exec.
 notify_shim_beacon() {
