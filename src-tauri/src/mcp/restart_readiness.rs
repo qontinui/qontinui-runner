@@ -1363,6 +1363,9 @@ pub async fn restart_readiness_handler(
     // Phase 4 the wind-down executor reads the same one and does act on it,
     // while drained. Do not restore the old "DRY RUN" wording: it described the
     // verdict, and stopped being true of it.
+    // Stamp for the systemd watchdog gate's snapshot: when this census pass
+    // was observed, not when its verdict is published (plan 2026-10-19 Phase 2b).
+    let observed_at = std::time::Instant::now();
     let fresh = wind_down_observer::fresh_pass(app, wind_down::grace_from_env()).await;
     let wind_down_observer::FreshPass {
         mut pass,
@@ -1445,7 +1448,7 @@ pub async fn restart_readiness_handler(
 
     let census = census_info(tracking_health::latest().as_ref(), now_ms);
 
-    Json(build_verdict(
+    let verdict = build_verdict(
         terminal,
         headless,
         holder,
@@ -1455,7 +1458,11 @@ pub async fn restart_readiness_handler(
         drain,
         census,
         status_source,
-    ))
+    );
+    // Fresher than the 600 s background census: the systemd watchdog gate
+    // reads the newest published verdict (plan 2026-10-19 Phase 2b).
+    crate::sd_notify::publish_readiness_verdict(&verdict, observed_at);
+    Json(verdict)
 }
 
 // ---------------------------------------------------------------------------
