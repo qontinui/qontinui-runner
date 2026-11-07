@@ -1603,6 +1603,11 @@ fn mark_awaiting_account_unless_live(
 /// directory cannot be resolved. A resume under it must type NO
 /// `CLAUDE_CONFIG_DIR` (see `discovery::is_default_config_home`), so every
 /// frontend resume normalises against THIS path rather than guessing `$HOME`.
+///
+/// Its second caller is the graceful-exit probe's registry read
+/// (`terminal::graceful_exit`'s `default_config_home`), which reads this home's
+/// `sessions/` dir even before discovery counts it (no `projects/` yet), so a
+/// first npm-installed session there is seen.
 #[tauri::command]
 pub fn claude_default_config_home() -> Option<String> {
     dirs::home_dir().and_then(|h| h.join(".claude").to_str().map(|p| p.replace('\\', "/")))
@@ -2172,6 +2177,18 @@ pub fn terminal_report_bridge_registration_failure(
 /// Returns one row per live PROCESS. Several live processes may report the
 /// same `sessionId` (22 of 80 did), each with its own name; collapsing that is
 /// the caller's decision.
+///
+/// `data` is `{ sessions, unlistable, unreadableRecords }`. The two trailing
+/// lists name what the read could NOT see: `sessions/` dirs that exist and
+/// cannot be listed, and unreadable or unparseable records named for live pids
+/// whose image could host Claude Code. While either is non-empty, a session
+/// MISSING from `sessions` may still be live. The read still succeeds then,
+/// because its two kinds of caller need different things from it: the
+/// unattended restore paths treat an incomplete read as indeterminate
+/// (`fetchLiveClaudeSessionIds` returns `null`, and nothing is respawned),
+/// while an operator's click refuses a session the partial read DOES show
+/// live, and the window-name hook keeps updating. Failing the whole read would
+/// hand the click paths `null`, which they read as "go ahead".
 #[tauri::command]
 pub async fn terminal_claude_session_list_live() -> Result<CommandResponse, String> {
     let config_dirs = crate::terminal::transcript::find_claude_config_dirs();
@@ -2186,12 +2203,33 @@ pub async fn terminal_claude_session_list_live() -> Result<CommandResponse, Stri
     // restore path respawn — fork — every session.
     let snapshot = crate::process_capture::process_tree::snapshot_process_table_public().await;
     let live_pids = crate::session::claude_session_registry::live_pids_from_snapshot(&snapshot)?;
-    let sessions =
-        crate::session::claude_session_registry::read_live_sessions(&config_dirs, &live_pids);
+    let read = crate::session::claude_session_registry::read_live_sessions(
+        &config_dirs,
+        &live_pids,
+        &crate::session::claude_session_registry::may_host_claude(&snapshot),
+    );
     Ok(CommandResponse {
         success: true,
         message: None,
-        data: Some(serde_json::json!({ "sessions": sessions })),
+        data: Some(live_sessions_payload(read)),
+    })
+}
+
+/// The `data` of [`terminal_claude_session_list_live`]: the rows, plus what
+/// the read could not see (see that command's docs for why both travel).
+fn live_sessions_payload(
+    read: crate::session::claude_session_registry::LiveSessions,
+) -> serde_json::Value {
+    let unlistable: Vec<String> = read.unlistable.iter().map(ToString::to_string).collect();
+    let unreadable_records: Vec<String> = read
+        .unreadable_records
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    serde_json::json!({
+        "sessions": read.sessions,
+        "unlistable": unlistable,
+        "unreadableRecords": unreadable_records,
     })
 }
 
@@ -3241,6 +3279,42 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+
+    /// The live-session payload carries what the read could not see beside
+    /// the rows — the keys `fetchLiveClaudeSessionRead`
+    /// (`src/components/terminal/liveClaudeSessions.ts`) reads to tell a
+    /// partial read from a complete one.
+    #[test]
+    fn the_live_session_payload_names_what_the_read_could_not_see() {
+        use crate::session::claude_activity::UnlistableSessionsDir;
+        use crate::session::claude_session_registry::{LiveSessions, UnreadableRecord};
+
+        let complete = live_sessions_payload(LiveSessions::default());
+        assert_eq!(
+            complete,
+            serde_json::json!({ "sessions": [], "unlistable": [], "unreadableRecords": [] })
+        );
+
+        let partial = live_sessions_payload(LiveSessions {
+            sessions: Vec::new(),
+            unlistable: vec![UnlistableSessionsDir {
+                sessions_dir: std::path::PathBuf::from("/h/.claude-a/sessions"),
+                error: "Permission denied".to_string(),
+            }],
+            unreadable_records: vec![UnreadableRecord {
+                path: std::path::PathBuf::from("/h/.claude/sessions/7.json"),
+                error: "does not parse".to_string(),
+            }],
+        });
+        assert_eq!(
+            partial["unlistable"],
+            serde_json::json!(["/h/.claude-a/sessions (Permission denied)"])
+        );
+        assert_eq!(
+            partial["unreadableRecords"],
+            serde_json::json!(["/h/.claude/sessions/7.json (does not parse)"])
+        );
+    }
 
     /// The close envelope carries the outcome as a TYPED value in `data`, never
     /// as prose in `message` — `message` is for humans, `data` is for callers.

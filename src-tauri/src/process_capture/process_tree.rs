@@ -135,6 +135,27 @@ pub fn claude_pids_in_inclusive_subtree(root_pid: u32, snapshot: &ProcessSnapsho
     out
 }
 
+/// Every PID in the **inclusive** subtree rooted at `root_pid`, in the order
+/// [`claude_pids_in_inclusive_subtree`] reports: the root first — only when
+/// the table holds it, so a root that has already exited is not reported as a
+/// live process — then its descendants breadth-first. The walk the
+/// graceful-exit probe classifies pid by pid
+/// (`crate::terminal::graceful_exit::probe_from_snapshot`), where an image
+/// name is one witness of a `claude` and Claude Code's own registry record is
+/// the other.
+pub fn inclusive_subtree_pids(root_pid: u32, snapshot: &ProcessSnapshot) -> Vec<u32> {
+    let mut out = Vec::new();
+    if snapshot.names.contains_key(&root_pid) || snapshot.creation_times.contains_key(&root_pid) {
+        out.push(root_pid);
+    }
+    out.extend(
+        bfs_descendants_from(root_pid, &snapshot.parent_map, &snapshot.creation_times)
+            .iter()
+            .map(|d| d.pid),
+    );
+    out
+}
+
 /// The claude-image PID in the **inclusive** subtree rooted at `root_pid` with
 /// the EARLIEST KNOWN creation time, returned as `(pid, creation_secs)`.
 ///
@@ -268,16 +289,62 @@ fn is_uuid_shaped(s: &str) -> bool {
 /// Case-insensitive basename match on `claude` / `claude.exe`. Tolerates a
 /// path-qualified name (takes the basename) and a trailing `.exe`.
 fn is_claude_image(name: Option<&String>) -> bool {
-    let Some(name) = name else {
-        return false;
-    };
+    name.is_some_and(|name| image_stem(name) == "claude")
+}
+
+/// An image name as both image checks compare it: the last path component,
+/// lowercased, `.exe` stripped.
+fn image_stem(name: &str) -> String {
     let base = name
         .rsplit(['/', '\\'])
         .next()
         .unwrap_or(name)
         .to_ascii_lowercase();
-    let stem = base.strip_suffix(".exe").unwrap_or(&base);
-    stem == "claude"
+    match base.strip_suffix(".exe") {
+        Some(stem) => stem.to_string(),
+        None => base,
+    }
+}
+
+/// `CLAUDE_CONFIG_DIR` of a live process. Linux only (`/proc/<pid>/environ`);
+/// elsewhere `None`, which is "could not say", never a match. Read by the resume
+/// door (`session::resume_door`) and by the graceful-exit probe's registry
+/// witness, which adds each candidate's own config dir to the discovered ones.
+#[cfg(target_os = "linux")]
+pub(crate) fn config_dir_of_pid(pid: u32) -> Option<String> {
+    let bytes = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
+    bytes
+        .split(|b| *b == 0)
+        .filter_map(|kv| std::str::from_utf8(kv).ok())
+        .find_map(|kv| kv.strip_prefix("CLAUDE_CONFIG_DIR=").map(str::to_string))
+        .filter(|s| !s.is_empty())
+}
+
+/// See the Linux twin: no portable way to read another process's environment.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn config_dir_of_pid(_pid: u32) -> Option<String> {
+    None
+}
+
+/// The images a JS-runtime Claude Code is known to run as: the npm install is
+/// `node … cli.js` (`nodejs` where the distro names the binary so), and a build
+/// run under Bun is `bun`. These are the known images [`is_claude_image`] can
+/// miss a live `claude` behind — not the only possible ones: `deno`, or a
+/// version-suffixed `node22`, would escape this list too — and they are the
+/// ones the graceful-exit probe leaves UNDECIDED when Claude Code's session
+/// registry cannot answer (`crate::terminal::graceful_exit::RegistryWitness`);
+/// every other image is judged by itself, and a shell is never a `claude`.
+/// Compared after [`image_stem`], so `node.exe` and `/usr/bin/node` match too.
+const JS_RUNTIME_IMAGES: &[&str] = &["node", "nodejs", "bun"];
+
+/// Could `pid` be a JS-runtime Claude Code that its image alone cannot
+/// recognise? `true` for a [`JS_RUNTIME_IMAGES`] image, and for a pid whose
+/// image the snapshot could not read — an unknown image cannot rule it out.
+pub(crate) fn may_be_js_runtime_claude(pid: u32, snapshot: &ProcessSnapshot) -> bool {
+    snapshot
+        .names
+        .get(&pid)
+        .is_none_or(|name| JS_RUNTIME_IMAGES.contains(&image_stem(name).as_str()))
 }
 
 /// A pid counts as a live claude iff its image name matches `claude*` AND its
