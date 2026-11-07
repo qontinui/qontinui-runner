@@ -15628,10 +15628,12 @@ mod self_id_chain_tests {
             finish_synced: false,
             spawn_device_default: None,
             adopted_from: None,
+            adopted_from_matched: false,
             last_session_start_at: None,
             gate_id: None,
             gate_consuming_device_id: None,
             gate_bound_boot_ms: None,
+            binding_state: None,
         }
     }
 

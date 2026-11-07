@@ -11,7 +11,7 @@ use crate::commands::CommandResponse;
 use crate::error::AppError;
 use crate::session::pane_store::{PaneKey, PaneSessionStore};
 use crate::session::session_lifecycle_store::{
-    CloseOutcome, SessionLifecycleStore, TerminalSessionRecord,
+    CloseOutcome, RecordOpenOutcome, SessionLifecycleStore, TerminalSessionRecord,
 };
 use crate::session::{Intent, SessionKind, SessionRegistry};
 use crate::terminal::visibility::VisibilityTier;
@@ -1296,7 +1296,7 @@ pub fn terminal_collect_session_metadata(
 /// existing record in place (structural dedup), which is what prevents the
 /// duplicate-session bug.
 ///
-/// Synchronous + fast: [`SessionLifecycleStore::record_open`] fsyncs the
+/// Synchronous + fast: [`SessionLifecycleStore::record_open_checked`] fsyncs the
 /// atomic write before returning, so the frontend can rely on durability the
 /// instant this resolves.
 ///
@@ -1379,20 +1379,30 @@ pub fn terminal_session_record_open(
         finish_synced: false,
         spawn_device_default: None,
         adopted_from: None,
+        adopted_from_matched: false,
         last_session_start_at: None,
         gate_id: None,
         gate_consuming_device_id: None,
         gate_bound_boot_ms: None,
+        binding_state: None,
     };
     let session_id = record.claude_session_id.clone();
-    store.record_open(record);
+    let outcome = store.record_open_checked(record);
     // The verified-resume re-assert of a boot restore lands here: adopt a
-    // resumed gate continuation into this generation (plan 2026-10-03 D3).
-    adopt_restored_continuation(&store, &session_id);
+    // resumed gate continuation into this generation (plan 2026-10-03 D3) —
+    // only when the record landed. A refused bind wrote nothing on this
+    // terminal; the report below names the pane that holds the session.
+    if outcome.is_recorded() {
+        adopt_restored_continuation(&store, &session_id);
+    }
     Ok(CommandResponse {
         success: true,
         message: None,
-        data: Some(record_open_confirmation_report(&store, &session_id)),
+        data: Some(record_open_confirmation_report(
+            &store,
+            &session_id,
+            &outcome,
+        )),
     })
 }
 
@@ -1410,7 +1420,7 @@ pub fn terminal_session_record_open(
 ///
 /// `config_dir` is deliberately not checked. The seed path writes its record
 /// straight to the file, but this one goes through
-/// [`SessionLifecycleStore::record_open`], whose `non_empty` normalization
+/// [`SessionLifecycleStore::record_open_checked`], whose `non_empty` normalization
 /// already folds a blank config dir to `None`. A blank there is handled
 /// correctly today, and erroring on it would reject callers for a problem they
 /// do not have.
@@ -1453,11 +1463,22 @@ const CONFIRM_DOOR: &str = "POST /control/session-open";
 /// it". That sends a reader to confirm a row that does not exist, in precisely
 /// the failure this payload was added to make legible. One lookup now answers
 /// both bits, so they cannot disagree about whether the row is there.
+///
+/// A write the store REFUSED (`outcome` is
+/// [`RecordOpenOutcome::MoveRefused`]) reads `recorded: false` even though the
+/// session's row exists — it exists on `heldBy`, the live pane that still runs
+/// the session, not on the terminal this call named. `heldBy` is `null` for
+/// every other outcome.
 fn record_open_confirmation_report(
     store: &SessionLifecycleStore,
     claude_session_id: &str,
+    outcome: &RecordOpenOutcome,
 ) -> serde_json::Value {
-    let row = store.get(claude_session_id);
+    let held_by = match outcome {
+        RecordOpenOutcome::MoveRefused { held_by } => Some(held_by.clone()),
+        RecordOpenOutcome::Recorded | RecordOpenOutcome::Unavailable => None,
+    };
+    let row = store.get(claude_session_id).filter(|_| held_by.is_none());
     let recorded = row.is_some();
     let confirmed = row.and_then(|r| r.confirmed_at).is_some();
     // `confirmBy` is emitted unconditionally so the payload has one stable
@@ -1467,6 +1488,7 @@ fn record_open_confirmation_report(
         "recorded": recorded,
         "confirmed": confirmed,
         "confirmBy": CONFIRM_DOOR,
+        "heldBy": held_by,
     })
 }
 
@@ -1480,7 +1502,7 @@ fn record_open_confirmation_report(
 ///
 /// Deliberately NOT `terminal_session_record_open`: that refreshes
 /// `last_seen_at` and would make ghost rows immortal. See
-/// [`SessionLifecycleStore::rebind_terminal`].
+/// [`SessionLifecycleStore::rebind_terminal_checked`].
 ///
 /// ## Also stamps the TERMINAL-ONLY restore tier (restore census, plan D6/P5)
 ///
@@ -1505,16 +1527,53 @@ pub fn terminal_session_rebind_terminal(
     terminal_id: String,
     zone_index: i32,
 ) -> Result<CommandResponse, String> {
-    store.rebind_terminal(&claude_session_id, &terminal_id, zone_index);
-    store.mark_restored_from_boot(
+    Ok(rebind_terminal_response(
+        &store,
         &claude_session_id,
-        crate::session::session_lifecycle_store::RESTORE_TIER_TERMINAL_ONLY,
-    );
-    Ok(CommandResponse {
-        success: true,
-        message: None,
-        data: None,
-    })
+        &terminal_id,
+        zone_index,
+    ))
+}
+
+/// [`terminal_session_rebind_terminal`]'s body, testable without Tauri state.
+///
+/// A rebind the store REFUSED (plan
+/// `2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session`: the row's
+/// current pane is live and still runs the session) re-pointed nothing, so it
+/// stamps no restore tier — the tile it would describe does not host the
+/// session — and answers `success: false` with `heldBy`, the pane that does.
+/// The frontend's restore path treats the call as fire-and-forget either way.
+fn rebind_terminal_response(
+    store: &SessionLifecycleStore,
+    claude_session_id: &str,
+    terminal_id: &str,
+    zone_index: i32,
+) -> CommandResponse {
+    match store.rebind_terminal_checked(claude_session_id, terminal_id, zone_index) {
+        RecordOpenOutcome::Recorded => {
+            store.mark_restored_from_boot(
+                claude_session_id,
+                crate::session::session_lifecycle_store::RESTORE_TIER_TERMINAL_ONLY,
+            );
+            CommandResponse {
+                success: true,
+                message: None,
+                data: None,
+            }
+        }
+        RecordOpenOutcome::MoveRefused { held_by } => CommandResponse {
+            success: false,
+            message: Some(format!(
+                "not rebound: terminal {held_by} is live and still runs session {claude_session_id}"
+            )),
+            data: Some(serde_json::json!({ "rebound": false, "heldBy": held_by })),
+        },
+        RecordOpenOutcome::Unavailable => CommandResponse {
+            success: false,
+            message: Some("not rebound: the session registry is unavailable".to_string()),
+            data: Some(serde_json::json!({ "rebound": false, "heldBy": null })),
+        },
+    }
 }
 
 /// Mark a session restore-pending in the lifecycle registry: a resume is
@@ -2801,8 +2860,13 @@ pub(crate) fn create_terminal_session_backend(
             let record_zone_index = hint_zone_index.unwrap_or(0);
             if let Some(pinned) = pinned_session_id {
                 // Pre-pinned id: record synchronously, then verify async that
-                // the transcript appears. NEVER rebinds from transcripts.
-                record_pinned_session_open(
+                // the transcript appears. NEVER rebinds from transcripts. The
+                // record is authoritative, which the binding guard never
+                // refuses; a write the store could not make (`Unavailable`, a
+                // poisoned registry lock) is logged by
+                // `record_pinned_session_open`, and the verify below only
+                // stamps a row that exists.
+                let _ = record_pinned_session_open(
                     &store,
                     pinned.clone(),
                     terminal_id.clone(),
@@ -2896,7 +2960,7 @@ fn resolve_latest_claude_session_id(
 }
 
 /// Poll `resolve` until it yields a Claude session id (or `timeout` elapses),
-/// then durably record the session via [`SessionLifecycleStore::record_open`].
+/// then durably record the session via [`SessionLifecycleStore::record_open_checked`].
 ///
 /// LAST-RESORT BACKSTOP (session-restore redesign Phase 4/5): this is the
 /// DEMOTED mtime-race recorder, no longer the primary identity path. The
@@ -2977,17 +3041,26 @@ async fn poll_and_record_session<F>(
                 finish_synced: false,
                 spawn_device_default: None,
                 adopted_from: None,
+                adopted_from_matched: false,
                 last_session_start_at: None,
                 gate_id: gate_id.clone(),
                 gate_consuming_device_id: gate_consuming_device_id.clone(),
                 gate_bound_boot_ms,
+                binding_state: None,
             };
-            store.record_open(record);
-            info!(
-                terminal_id = %terminal_id,
-                claude_session = %claude_session_id,
-                "create_terminal_session_backend: continuation session durably recorded"
-            );
+            match store.record_open_checked(record) {
+                RecordOpenOutcome::Recorded => info!(
+                    terminal_id = %terminal_id,
+                    claude_session = %claude_session_id,
+                    "create_terminal_session_backend: continuation session durably recorded"
+                ),
+                outcome => warn!(
+                    terminal_id = %terminal_id,
+                    claude_session = %claude_session_id,
+                    outcome = ?outcome,
+                    "create_terminal_session_backend: continuation session NOT recorded"
+                ),
+            }
             return;
         }
         if std::time::Instant::now() >= deadline {
@@ -3006,6 +3079,11 @@ async fn poll_and_record_session<F>(
 /// Durably record a PRE-PINNED session (`--session-id <id>` /
 /// account-migration `--resume <id>` in the spawn argv) the instant the PTY
 /// exists — no transcript mtime race to lose.
+///
+/// Returns what the store did ([`SessionLifecycleStore::record_open_checked`]).
+/// A pinned record is authoritative — a strong bind — so the binding guard
+/// never refuses it: it lands even off a live pane still running the session,
+/// which is the move an account migration's respawn makes.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn record_pinned_session_open(
     store: &SessionLifecycleStore,
@@ -3018,7 +3096,7 @@ pub(crate) fn record_pinned_session_open(
     zone_index: i32,
     provider: String,
     gate: Option<GateIdentity>,
-) {
+) -> RecordOpenOutcome {
     let (gate_id, gate_consuming_device_id, gate_bound_boot_ms) = gate_record_fields(gate);
     // D1 account stamp at spawn. The runner genuinely knows the ACCOUNT here —
     // it just placed `config_dir` into the PTY env — so derive the label +
@@ -3038,7 +3116,7 @@ pub(crate) fn record_pinned_session_open(
     let account = config_dir
         .as_deref()
         .map(|d| crate::session::past_sessions::account_from_config_dir(Some(d)));
-    store.record_open(TerminalSessionRecord {
+    let outcome = store.record_open_checked(TerminalSessionRecord {
         claude_session_id: claude_session_id.clone(),
         config_dir,
         working_dir: Some(working_dir),
@@ -3078,11 +3156,22 @@ pub(crate) fn record_pinned_session_open(
         finish_synced: false,
         spawn_device_default: None,
         adopted_from: None,
+        adopted_from_matched: false,
         last_session_start_at: None,
         gate_id,
         gate_consuming_device_id,
         gate_bound_boot_ms,
+        binding_state: None,
     });
+    if outcome != RecordOpenOutcome::Recorded {
+        warn!(
+            terminal_id = %terminal_id,
+            claude_session = %claude_session_id,
+            outcome = ?outcome,
+            "create_terminal_session_backend: pinned session NOT recorded"
+        );
+        return outcome;
+    }
     info!(
         terminal_id = %terminal_id,
         claude_session = %claude_session_id,
@@ -3094,6 +3183,7 @@ pub(crate) fn record_pinned_session_open(
     if gate.is_none() {
         adopt_restored_continuation(store, &claude_session_id);
     }
+    outcome
 }
 
 /// The three durable gate fields for a record written by THIS process (plan
@@ -3390,10 +3480,12 @@ mod tests {
             finish_synced: false,
             spawn_device_default: None,
             adopted_from: None,
+            adopted_from_matched: false,
             last_session_start_at: None,
             gate_id: None,
             gate_consuming_device_id: None,
             gate_bound_boot_ms: None,
+            binding_state: None,
         }
     }
 
@@ -3898,7 +3990,7 @@ mod tests {
                 g,
             )
         };
-        record(Some(gate));
+        assert!(record(Some(gate)).is_recorded());
         let boot = crate::session::tracking_health::primary_boot_unix_millis_or_init();
         let check = |what: &str| {
             let rec = store.get(csid).unwrap();
@@ -3911,7 +4003,8 @@ mod tests {
             assert_eq!(rec.gate_bound_boot_ms, Some(boot), "{what}");
         };
         check("spawn record");
-        record(None); // the session-open hook's write
+        // The session-open hook's write.
+        assert!(record(None).is_recorded());
         check("after the gate-less hook re-record");
     }
 
@@ -3944,7 +4037,7 @@ mod tests {
         let store = Arc::new(
             SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap(),
         );
-        record_pinned_session_open(
+        let recorded = record_pinned_session_open(
             &store,
             pinned_id.to_string(),
             "term-pin".to_string(),
@@ -3956,6 +4049,7 @@ mod tests {
             crate::session::session_lifecycle_store::DEFAULT_PROVIDER.to_string(),
             None,
         );
+        assert!(recorded.is_recorded());
         let verify_cfg = cfg.path().to_path_buf();
         poll_and_verify_pinned_session(
             move || session_transcript_path(&verify_cfg, project_path, pinned_id).exists(),
@@ -4024,7 +4118,8 @@ mod tests {
         record.confirmed_at = None;
         store.record_open(record);
 
-        let report = record_open_confirmation_report(&store, "sess-1");
+        let report =
+            record_open_confirmation_report(&store, "sess-1", &RecordOpenOutcome::Recorded);
         assert_eq!(report["recorded"], serde_json::Value::Bool(true));
         assert_eq!(
             report["confirmed"],
@@ -4045,6 +4140,92 @@ mod tests {
         );
     }
 
+    /// A store whose pane `term-live` is a live pane whose own `claude` runs
+    /// `sess-held` (plan
+    /// `2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session`), with
+    /// that session's row open there.
+    fn store_with_a_held_session(dir: &std::path::Path) -> SessionLifecycleStore {
+        let store =
+            SessionLifecycleStore::open(dir.join("terminal-sessions.json")).expect("store opens");
+        store.attach_pane_evidence(crate::session::pane_binding::FixedPanes::of(&[(
+            "term-live",
+            crate::session::pane_binding::PaneEvidence::Names("sess-held".to_string()),
+        )]));
+        let mut held = restore_candidate_record("sess-held");
+        held.terminal_id = "term-live".to_string();
+        store.record_open(held);
+        store
+    }
+
+    /// The MoveRefused arm: a WEAK record (not authoritative) the store
+    /// refused reads `recorded: false` with `heldBy` naming the live pane that
+    /// still runs the session — even though the session's row exists (it
+    /// exists THERE, not on the terminal the call named).
+    #[test]
+    fn record_open_report_names_the_pane_that_holds_a_refused_session() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = store_with_a_held_session(dir.path());
+        let mut moving = restore_candidate_record("sess-held");
+        moving.terminal_id = "term-other".to_string();
+        moving.origin =
+            Some(crate::session::session_lifecycle_store::ORIGIN_RECONCILED.to_string());
+        let outcome = store.record_open_checked(moving);
+        assert_eq!(
+            outcome,
+            RecordOpenOutcome::MoveRefused {
+                held_by: "term-live".to_string()
+            }
+        );
+
+        let report = record_open_confirmation_report(&store, "sess-held", &outcome);
+        assert_eq!(report["recorded"], false, "{report}");
+        assert_eq!(report["confirmed"], false, "{report}");
+        assert_eq!(report["heldBy"], "term-live", "{report}");
+        assert_eq!(report["confirmBy"], CONFIRM_DOOR, "{report}");
+        assert_eq!(
+            store.get("sess-held").unwrap().terminal_id,
+            "term-live",
+            "nothing moved"
+        );
+        let landed =
+            record_open_confirmation_report(&store, "sess-held", &RecordOpenOutcome::Recorded);
+        assert!(landed["heldBy"].is_null(), "{landed}");
+    }
+
+    /// The restore rebind the store refuses re-points nothing, stamps no
+    /// restore tier, and says which pane holds the session; one it allows
+    /// stamps the tier as before.
+    #[test]
+    fn a_refused_rebind_stamps_no_restore_tier_and_names_the_holder() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = store_with_a_held_session(dir.path());
+
+        let refused = rebind_terminal_response(&store, "sess-held", "term-restored", 2);
+        assert!(!refused.success);
+        assert_eq!(
+            refused.data,
+            Some(serde_json::json!({ "rebound": false, "heldBy": "term-live" }))
+        );
+        let row = store.get("sess-held").unwrap();
+        assert_eq!(row.terminal_id, "term-live");
+        assert_eq!(
+            row.restore_tier, None,
+            "no tier stamped for a tile that does not host it"
+        );
+
+        let mut gone = restore_candidate_record("sess-gone");
+        gone.terminal_id = "term-dead".to_string();
+        store.record_open(gone);
+        let rebound = rebind_terminal_response(&store, "sess-gone", "term-restored", 2);
+        assert!(rebound.success);
+        let row = store.get("sess-gone").unwrap();
+        assert_eq!(row.terminal_id, "term-restored");
+        assert_eq!(
+            row.restore_tier.as_deref(),
+            Some(crate::session::session_lifecycle_store::RESTORE_TIER_TERMINAL_ONLY)
+        );
+    }
+
     /// Read back, not assumed: this command always passes `confirmed_at: None`,
     /// but `record_open` never clears an existing confirmation — so
     /// re-recording an already-confirmed session reports `confirmed: true`.
@@ -4062,7 +4243,8 @@ mod tests {
         // A re-record (the frontend re-asserting the tab) passes no
         // confirmation of its own…
         store.record_open(record);
-        let report = record_open_confirmation_report(&store, "sess-2");
+        let report =
+            record_open_confirmation_report(&store, "sess-2", &RecordOpenOutcome::Recorded);
         assert_eq!(
             report["confirmed"],
             serde_json::Value::Bool(true),
@@ -4082,7 +4264,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json"))
             .expect("store opens");
-        let report = record_open_confirmation_report(&store, "never-recorded");
+        let report =
+            record_open_confirmation_report(&store, "never-recorded", &RecordOpenOutcome::Recorded);
         assert_eq!(report["confirmed"], serde_json::Value::Bool(false));
         assert_eq!(
             report["recorded"],
@@ -4101,14 +4284,15 @@ mod tests {
         let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json"))
             .expect("store opens");
 
-        let before = record_open_confirmation_report(&store, "sess-3");
+        let before =
+            record_open_confirmation_report(&store, "sess-3", &RecordOpenOutcome::Recorded);
         assert_eq!(before["recorded"], serde_json::Value::Bool(false));
 
         let mut record = restore_candidate_record("sess-3");
         record.confirmed_at = None;
         store.record_open(record);
 
-        let after = record_open_confirmation_report(&store, "sess-3");
+        let after = record_open_confirmation_report(&store, "sess-3", &RecordOpenOutcome::Recorded);
         assert_eq!(
             after["recorded"],
             serde_json::Value::Bool(true),

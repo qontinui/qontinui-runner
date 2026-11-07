@@ -16,7 +16,7 @@
 //! |---------------------|-----------------------------------------------------|
 //! | `hook`              | the SessionStart hook (`/control/session-open`)     |
 //! | `rung2`             | the anchor's own argv (`--session-id` / `--resume`) |
-//! | `provider_registry` | `<config>/sessions/<pid>.json` (Phase 1b)           |
+//! | `provider_registry` | `<config>/sessions/<pid>.json` — a reconcile rung-2b bind |
 //! | `r2_resume`         | an R2 pane resume re-keyed to the pane's pin        |
 //!
 //! Only pid-exact evidence may re-key a row (D5): a rung-3 transcript
@@ -35,10 +35,11 @@
 //! `confirm_claude_code_session_id` moves the local record before coord answers,
 //! and the idempotence check reads that record. So a declined re-key is RESTORED
 //! here (the record goes back to what coord last accepted), and then RETRIED,
-//! because evidence is not generally re-supplied: `run_reconcile` answers
-//! `LeaveAlone` for a confirmed record, so a confirmed rung-2 bind, like a hook
-//! or an R2 resume, happens once. Only `provider_registry` is read afresh every
-//! tick. A `refused` re-key retries every tick until the competing row lapses; a
+//! because evidence is not re-supplied: `run_reconcile` answers `LeaveAlone`
+//! for a bound pane, so a reconcile bind — rung 2 or the provider-registry rung
+//! 2b (plan `2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session`) —
+//! like a hook or an R2 resume, happens once. A `refused` re-key retries every
+//! tick until the competing row lapses; a
 //! `rejected` one retries [`REJECTED_RETRY_LIMIT`] times and then only after
 //! [`REJECTED_COOLDOWN`], so a row coord will never accept costs one PATCH an
 //! hour rather than one a tick. Evidence that arrives before the pane has a coord
@@ -82,8 +83,8 @@ pub enum RekeySource {
     Hook,
     /// Rung 2: the id the anchor claude's own argv names.
     Rung2,
-    /// The provider's `<config>/sessions/<pid>.json` for the anchor pid
-    /// (Phase 1b; no caller on this build).
+    /// The provider's `<config>/sessions/<pid>.json` for the pane's top-level
+    /// `claude`: a reconcile rung-2b bind ([`rekey_provider_registry_binds`]).
     ProviderRegistry,
     /// An R2 pane resume, re-keyed to the pane's current pin (Phase 2).
     R2Resume,
@@ -124,13 +125,6 @@ impl RekeySource {
             RekeySource::ProviderRegistry => 2,
             RekeySource::R2Resume => 3,
         }
-    }
-
-    /// Whether a declined re-key from this source has to be retried here.
-    /// Everything but `provider_registry`, which reads its id afresh every tick:
-    /// a rung-2 bind stops being emitted once its record is confirmed.
-    fn retried_after_decline(self) -> bool {
-        !matches!(self, RekeySource::ProviderRegistry)
     }
 }
 
@@ -568,14 +562,11 @@ fn restore_declines(registry: &SessionRegistry) -> Vec<Restored> {
         .collect()
 }
 
-/// Re-queue each restored re-key whose evidence will not be re-supplied, unless
-/// this tick's newer evidence already moved the record: that supersedes the
-/// retry, and a row gets at most one re-key per tick.
+/// Re-queue each restored re-key — no source re-supplies its evidence (see the
+/// module docs) — unless this tick's newer evidence already moved the record:
+/// that supersedes the retry, and a row gets at most one re-key per tick.
 fn retry_restored(registry: &SessionRegistry, restored: Vec<Restored>) {
     for r in restored {
-        if !r.decline.source.retried_after_decline() {
-            continue;
-        }
         let Ok(desc) = registry.describe_by_id(r.session) else {
             continue;
         };
@@ -776,10 +767,10 @@ pub fn confirm_for_terminal(
 /// Feed one reconcile pass's rung-2 binds through the seam (D5): only a
 /// `Bind` graded [`BindOrigin::Authoritative`] (the anchor's own argv) — never
 /// a rung-3 `Observed` or rung-4 `Reconciled` correlation. At most one seam
-/// call per terminal, and none for a terminal whose anchor has a valid
-/// provider row this tick (`has_valid_provider_row`; the provider-registry
-/// source is the stronger, current evidence). Until Phase 1b lands that
-/// predicate is always `false`.
+/// call per terminal, and none for a terminal whose pane has a valid provider
+/// row this tick (`has_valid_provider_row`; the provider-registry source is
+/// the stronger, current evidence — [`apply_reconcile_tick`] answers it from
+/// the tick's provider-registry binds).
 pub fn rekey_rung2_binds(
     registry: &SessionRegistry,
     actions: &[ReconcileAction],
@@ -807,6 +798,44 @@ pub fn rekey_rung2_binds(
             coord_row_for(terminal_id),
             session_id,
             RekeySource::Rung2,
+        );
+        out.push((terminal_id.clone(), outcome));
+    }
+    out
+}
+
+/// Feed one reconcile pass's provider-registry (rung 2b) binds through the
+/// seam as [`RekeySource::ProviderRegistry`]: the pane's own `claude` names the
+/// session it runs, so the pane's coord row is re-keyed to it — the evidence
+/// that pre-empts a differing argv id ([`rekey_rung2_binds`]). At most one seam
+/// call per terminal. A bind the store refused never reaches here: the pass
+/// reports it as `BindRefused`, not `Bind`.
+pub fn rekey_provider_registry_binds(
+    registry: &SessionRegistry,
+    actions: &[ReconcileAction],
+    coord_row_for: impl Fn(&str) -> Option<Uuid>,
+) -> Vec<(String, RekeyOutcome)> {
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut out = Vec::new();
+    for action in actions {
+        let ReconcileAction::Bind {
+            terminal_id,
+            session_id,
+            origin: BindOrigin::ProviderRegistry,
+            ..
+        } = action
+        else {
+            continue;
+        };
+        if !seen.insert(terminal_id.as_str()) {
+            continue;
+        }
+        let outcome = confirm_for_terminal(
+            registry,
+            terminal_id,
+            coord_row_for(terminal_id),
+            session_id,
+            RekeySource::ProviderRegistry,
         );
         out.push((terminal_id.clone(), outcome));
     }
@@ -875,24 +904,40 @@ pub fn confirm_for_terminal_in_app(
 }
 
 /// One reconcile tick's coord-identity work, in order: restore the declines the
-/// drain recorded since the last tick; feed the pass's rung-2 binds through the
-/// seam; then retry what no pass will re-supply, skipping a row this tick
-/// already moved. Pure over its inputs (the terminal → coord-row lookup is
-/// injected), so the whole tick composition is testable against a fake coord.
+/// drain recorded since the last tick; feed the pass's provider-registry binds,
+/// then its rung-2 binds, through the seam; then retry what no pass will
+/// re-supply, skipping a row this tick already moved. Pure over its inputs (the
+/// terminal → coord-row lookup is injected), so the whole tick composition is
+/// testable against a fake coord.
+///
+/// A terminal with a provider-registry bind this tick has a valid provider row,
+/// so no rung-2 bind for it is fed. The reconcile pass ranks the registry
+/// before the argv and binds a pane once per pass, so it never emits both; the
+/// predicate keeps that true at this seam whatever the pass does.
 pub fn apply_reconcile_tick(
     registry: &SessionRegistry,
     actions: &[ReconcileAction],
     coord_row_for: impl Fn(&str) -> Option<Uuid>,
 ) -> Vec<(String, RekeyOutcome)> {
     let restored = restore_declines(registry);
-    let out = rekey_rung2_binds(
+    let provider_rows: HashSet<&str> = actions
+        .iter()
+        .filter_map(|a| match a {
+            ReconcileAction::Bind {
+                terminal_id,
+                origin: BindOrigin::ProviderRegistry,
+                ..
+            } => Some(terminal_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    let mut out = rekey_provider_registry_binds(registry, actions, &coord_row_for);
+    out.extend(rekey_rung2_binds(
         registry,
         actions,
         &coord_row_for,
-        // Phase 1b (the provider-registry source) is not on this build: no
-        // terminal has a valid provider row yet, so rung 2 is never pre-empted.
-        |_| false,
-    );
+        |terminal| provider_rows.contains(terminal),
+    ));
     retry_parked(registry, &coord_row_for);
     retry_restored(registry, restored);
     retry_deferred(registry);
@@ -1046,8 +1091,7 @@ mod tests {
         );
     }
 
-    /// A terminal with a valid provider row is not re-keyed from rung 2
-    /// (the precedence hook Phase 1b fills in).
+    /// A terminal with a valid provider row is not re-keyed from rung 2.
     #[test]
     fn a_valid_provider_row_pre_empts_rung2() {
         let _amb = crate::test_env::isolated_ambient();
@@ -1064,6 +1108,66 @@ mod tests {
         );
         assert!(out.is_empty());
         assert!(rekeys_for(&outbox, row).is_empty());
+    }
+
+    /// Plan `2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session`
+    /// (M5): a provider-registry (rung 2b) bind reaches coord as
+    /// `provider_registry`, and in the tick it pre-empts a rung-2 bind for the
+    /// same terminal — the pane's own record outranks its argv.
+    #[test]
+    fn a_provider_registry_bind_rekeys_and_pre_empts_rung2_in_the_tick() {
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = tempfile::tempdir().unwrap();
+        let (reg, outbox) = registry(dir.path());
+        let row = reg
+            .register_external_with_lineage(intent(), None, Some(PIN.into()))
+            .unwrap();
+        let other = reg
+            .register_external_with_lineage(
+                intent(),
+                None,
+                Some("2711c738-0000-4000-8000-000000000009".into()),
+            )
+            .unwrap();
+        const ARGV: &str = "99999999-0000-4000-8000-000000000003";
+        let lookup = |t: &str| match t {
+            "t1" => Some(row),
+            "t2" => Some(other),
+            _ => None,
+        };
+        let out = apply_reconcile_tick(
+            &reg,
+            &[
+                bind("t1", LIVE, BindOrigin::ProviderRegistry),
+                // A rung-2 bind for the SAME terminal never reaches the seam.
+                bind("t1", ARGV, BindOrigin::Authoritative),
+                // One for a terminal with no provider bind still does.
+                bind("t2", ARGV, BindOrigin::Authoritative),
+            ],
+            lookup,
+        );
+        assert_eq!(
+            out,
+            vec![
+                ("t1".to_string(), RekeyOutcome::Queued),
+                ("t2".to_string(), RekeyOutcome::Queued),
+            ]
+        );
+        let rows = rekeys_for(&outbox, row);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].payload["claude_code_session_id"], json!(LIVE));
+        assert_eq!(rows[0].payload["rekey_source"], json!("provider_registry"));
+        assert_eq!(
+            reg.coord_sync()
+                .rekeys()
+                .counts(RekeySource::ProviderRegistry)
+                .queued,
+            1
+        );
+        assert_eq!(
+            rekeys_for(&outbox, other)[0].payload["rekey_source"],
+            json!("rung2")
+        );
     }
 
     /// Rung-3 (`Observed`) and rung-4 (`Reconciled`) binds never re-key.

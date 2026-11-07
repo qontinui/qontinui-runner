@@ -1623,15 +1623,32 @@ async fn materialize_restore_registry(
         .get("restore_tier")
         .and_then(|v| v.as_str())
         .unwrap_or("<absent>");
-    lifecycle_store.record_open(record);
-    tracing::info!(
-        source = %source_session_id,
-        child = %child_id,
-        session = %session_key,
-        tier = materialized_tier,
-        mirrored_tier = %mirrored_tier,
-        "session handoff: materialized restore-registry record"
-    );
+    match lifecycle_store.record_open_checked(record) {
+        crate::session::session_lifecycle_store::RecordOpenOutcome::Recorded => {
+            tracing::info!(
+                source = %source_session_id,
+                child = %child_id,
+                session = %session_key,
+                tier = materialized_tier,
+                mirrored_tier = %mirrored_tier,
+                "session handoff: materialized restore-registry record"
+            );
+        }
+        outcome => {
+            // Not written: the registry was unavailable. (The record is
+            // authoritative, which the binding guard never refuses — plan
+            // `2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session`.)
+            // Nothing was materialized here.
+            tracing::warn!(
+                source = %source_session_id,
+                child = %child_id,
+                session = %session_key,
+                tier = materialized_tier,
+                outcome = ?outcome,
+                "session handoff: restore-registry record NOT materialized"
+            );
+        }
+    }
 }
 
 /// Read the durable-replay window of `GET /sessions/:id/events` (SSE) and
@@ -1829,10 +1846,12 @@ fn registry_record_from_restore_payload(
         finish_synced: false,
         spawn_device_default: None,
         adopted_from: None,
+        adopted_from_matched: false,
         last_session_start_at: None,
         gate_id: None,
         gate_consuming_device_id: None,
         gate_bound_boot_ms: None,
+        binding_state: None,
     }
 }
 
