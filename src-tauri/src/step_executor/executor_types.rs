@@ -786,6 +786,43 @@ impl ExecutionStepConfig {
         self.phase = Some(phase.as_str().to_string());
     }
 
+    /// Whether this step runs in a build whose `debug_assertions` setting is
+    /// the one given: a `dev_mode_only` step runs only in a build with debug
+    /// assertions, so the published runner never executes it. Callers pass
+    /// `cfg!(debug_assertions)`; tests pass either value. The ONE spelling of
+    /// that rule, shared by the verification phase (which drops such steps
+    /// before running) and the multi-agent pipeline (which derives its
+    /// acceptance criteria from the steps that will actually run).
+    pub fn runs_in_build(&self, debug_assertions: bool) -> bool {
+        debug_assertions || !self.dev_mode_only.unwrap_or(false)
+    }
+
+    /// Whether running this step checks anything. A `gate` step is an
+    /// aggregation marker that always succeeds, and a `prompt` step with no
+    /// prompt content has nothing to evaluate (its verification handler
+    /// returns success without asking anything), so neither is evidence that
+    /// anything passed.
+    pub fn checks_something(&self) -> bool {
+        match self.step_type.as_str() {
+            "gate" => false,
+            "prompt" => self
+                .prompt_content
+                .as_deref()
+                .is_some_and(|content| !content.is_empty()),
+            _ => true,
+        }
+    }
+
+    /// Whether this step's outcome counts toward a verification verdict: it is
+    /// required (`required` absent counts as required) AND it checks something.
+    /// The ONE rule for "a required step": the verification phase stamps it on
+    /// every step result's `required` flag, so the shared fold, the loop's
+    /// decision and every stored result read the same answer, and the
+    /// multi-agent pipeline derives its acceptance criteria from it.
+    pub fn counts_toward_verdict(&self) -> bool {
+        self.required != Some(false) && self.checks_something()
+    }
+
     /// Create the default pre-flight environment check step.
     ///
     /// This creates a step that runs inline commands to verify:

@@ -25,11 +25,12 @@ use crate::str_utils::truncate_str;
 use super::compensation;
 use super::convergence::{ConvergenceAction, ConvergenceReport};
 use super::evaluate_verification::handle_evaluate_verification;
+use super::loop_handlers_decisions::compensation_applies;
 use super::loop_state_machine::{CompletionReason, LoopContext, LoopState};
 use super::states::UnifiedWorkflowState;
 use super::types::{
     get_parent_task_id, step_execution_to_record, AgenticOutcome, IterationResult, LoopConfig,
-    LoopResult, NodeTelemetry, PhaseResult, RollbackPolicy, StepResultRecord,
+    LoopResult, NodeTelemetry, PhaseResult, StepResultRecord,
 };
 
 use super::loop_controller::{emit_and_persist_phase_result, LoopController};
@@ -205,12 +206,13 @@ impl LoopController {
         // =====================================================================
 
         // Conductor-inspired compensation: execute rollback if the workflow failed
-        // and a rollback policy is configured. Only runs for non-success exits
-        // (critical failure, max iterations, unfixable errors).
-        if !loop_result.verification_passed
-            && !loop_result.was_stopped
-            && !matches!(config.rollback_policy, RollbackPolicy::None)
-        {
+        // and a rollback policy is configured. Only runs for REFUTED exits
+        // (critical failure, max iterations, unfixable errors) — never for a
+        // pass, a stop, or a `no_verification_steps` exit, which checked nothing
+        // and so refuted nothing. One predicate gates the rollback and the
+        // worktree finalizer below.
+        let compensate = compensation_applies(&loop_result, &config.rollback_policy);
+        if compensate {
             if let Some(wd) = config.project_path.as_deref().map(std::path::Path::new) {
                 let source_commit = ctx.initial_source_commit.as_deref();
                 match ctx
@@ -275,10 +277,7 @@ impl LoopController {
         // avoids two failure modes: (1) LastGood leaking the worktree by only
         // running the per-iteration resets, and (2) crash-resume trying to
         // git-reset a path that was already removed.
-        if !matches!(config.rollback_policy, RollbackPolicy::None)
-            && !loop_result.verification_passed
-            && !loop_result.was_stopped
-        {
+        if compensate {
             if let Some(finalizer) = ctx.worktree_finalizer.take() {
                 let worktree_path = finalizer.worktree_path.to_string_lossy().to_string();
                 if let Err(e) = compensation::execute_worktree_remove(

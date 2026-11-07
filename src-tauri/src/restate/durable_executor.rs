@@ -31,6 +31,79 @@ fn parse_batch_steps(steps_json: &str) -> Result<Vec<ExecutionStepConfig>, Strin
         .map_err(|e| format!("Step deserialization failed: {e}"))
 }
 
+/// The result of a batch with no step to execute.
+///
+/// A setup or completion phase with nothing to do has succeeded: no step
+/// failed. A VERIFICATION phase with nothing to run checked nothing, so it is
+/// not `all_passed`. The phase still ran (`success`), and the durable loop ends
+/// it `NoVerificationSteps` (`durable_verification_verdict`).
+fn empty_batch_result(phase_name: &str, iteration: Option<u32>) -> PhaseResult {
+    PhaseResult {
+        phase: phase_name.to_string(),
+        iteration,
+        stage_index: None,
+        success: true,
+        all_passed: phase_name != "verification",
+        step_results: vec![],
+        failure_context: None,
+        duration_ms: 0,
+        variables_set: Some(vec![]),
+        commit_hash: None,
+    }
+}
+
+/// How many of a verification batch's steps count toward the verdict, by
+/// `ExecutionStepConfig::counts_toward_verdict`: required (`required` absent
+/// counts as required) and checking something (not a `gate`, not a prompt with
+/// no content). It is the one rule the unified loop's verification phase stamps
+/// on its step results. This batch folds its own results and stamps nothing,
+/// so it applies the rule to the configs.
+fn required_verification_steps(steps: &[ExecutionStepConfig]) -> usize {
+    steps.iter().filter(|s| s.counts_toward_verdict()).count()
+}
+
+/// Whether a durable workflow's verification batch checks nothing: no step
+/// counts toward the verdict (an empty list included). That is a property of
+/// the workflow's input, so the durable loop reads it once, before the loop and
+/// outside any journalled side effect, and replay sees the same answer.
+///
+/// A batch that does not parse is NOT "nothing to check". It fails as a
+/// batch, naming the step (`parse_batch_steps`), and takes the failure path.
+pub(crate) fn verification_batch_checks_nothing(steps_json: &str) -> bool {
+    matches!(
+        parse_batch_steps(steps_json),
+        Ok(ref steps) if required_verification_steps(steps) == 0
+    )
+}
+
+/// What the durable loop does with one verification batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DurableVerificationVerdict {
+    /// Every required step passed: run completion.
+    Passed,
+    /// No required step: nothing was checked. End the run, not passed, with no
+    /// agentic iteration, because no fix can add a check.
+    NoVerificationSteps,
+    /// A required step failed: run the agentic phase and verify again.
+    Failed,
+}
+
+/// The durable loop's verdict on one verification batch. "Nothing checked" is
+/// tested first. A batch that reports `all_passed` over no required step was a
+/// pass from nothing.
+pub(crate) fn durable_verification_verdict(
+    checks_nothing: bool,
+    all_passed: bool,
+) -> DurableVerificationVerdict {
+    if checks_nothing {
+        DurableVerificationVerdict::NoVerificationSteps
+    } else if all_passed {
+        DurableVerificationVerdict::Passed
+    } else {
+        DurableVerificationVerdict::Failed
+    }
+}
+
 /// Executes a batch of steps, returning a serializable `PhaseResult`.
 ///
 /// This function is designed to be called inside a Restate `ctx.run()` side effect.
@@ -78,18 +151,7 @@ pub async fn execute_steps_batch(
 
     if steps.is_empty() {
         debug!("No {} steps to execute for {}", phase_name, execution_id);
-        return PhaseResult {
-            phase: phase_name.to_string(),
-            iteration,
-            stage_index: None,
-            success: true,
-            all_passed: true,
-            step_results: vec![],
-            failure_context: None,
-            duration_ms: 0,
-            variables_set: Some(vec![]),
-            commit_hash: None,
-        };
+        return empty_batch_result(phase_name, iteration);
     }
 
     // Create a step executor
@@ -169,6 +231,12 @@ pub async fn execute_steps_batch(
             warn!("Stopping {} phase at step {} due to failure", phase_name, i);
             break;
         }
+    }
+
+    // A verification batch with no required step checked nothing, so it is
+    // not `all_passed` however its informational steps went.
+    if phase_name == "verification" && required_verification_steps(&steps) == 0 {
+        all_passed = false;
     }
 
     // Get current git commit hash for compensation tracking
@@ -621,5 +689,97 @@ mod tests {
             parse_batch_steps(r#"[{"type":"ui_bridge","action":"navigate","url":"http://x"}]"#)
                 .unwrap();
         assert_eq!(ok[0].ui_bridge_url.as_deref(), Some("http://x"));
+    }
+}
+
+#[cfg(test)]
+mod nothing_checked_tests {
+    use super::{
+        durable_verification_verdict, empty_batch_result, verification_batch_checks_nothing,
+        DurableVerificationVerdict,
+    };
+
+    /// An empty VERIFICATION batch is not `all_passed`. Before plan
+    /// 2026-11-06-a-product-workflow-verification-with-nothing-to-check-never-reports-passed
+    /// it was, and the durable run stored `complete`.
+    #[test]
+    fn an_empty_verification_batch_is_not_all_passed() {
+        let result = empty_batch_result("verification", Some(1));
+        assert!(!result.all_passed);
+        assert!(result.success, "the phase ran; it checked nothing");
+        assert!(result.step_results.is_empty());
+    }
+
+    /// The control: a setup or completion phase with nothing to do succeeded.
+    #[test]
+    fn an_empty_setup_or_completion_batch_still_succeeds() {
+        assert!(empty_batch_result("setup", None).all_passed);
+        assert!(empty_batch_result("completion", None).all_passed);
+    }
+
+    #[test]
+    fn a_batch_with_no_required_step_checks_nothing() {
+        assert!(verification_batch_checks_nothing("[]"));
+        assert!(verification_batch_checks_nothing(
+            r#"[{"type":"command","name":"lint","command":"true","required":false}]"#
+        ));
+        assert!(verification_batch_checks_nothing(
+            r#"[{"type":"command","name":"lint","command":"true","required":false},
+                {"type":"command","name":"fmt","command":"true","required":false}]"#
+        ));
+    }
+
+    /// One required step (absent `required` counts as required) is a check.
+    #[test]
+    fn a_batch_with_a_required_step_checks_something() {
+        assert!(!verification_batch_checks_nothing(
+            r#"[{"type":"command","name":"tests","command":"true"}]"#
+        ));
+        assert!(!verification_batch_checks_nothing(
+            r#"[{"type":"command","name":"lint","command":"true","required":false},
+                {"type":"command","name":"tests","command":"true","required":true}]"#
+        ));
+    }
+
+    /// The shared rule (`counts_toward_verdict`) applies to the configs: a
+    /// `gate` step and a prompt with no content check nothing, and a prompt
+    /// with content checks something.
+    #[test]
+    fn gates_and_contentless_prompts_check_nothing() {
+        assert!(verification_batch_checks_nothing(
+            r#"[{"type":"gate","name":"all"}]"#
+        ));
+        assert!(verification_batch_checks_nothing(
+            r#"[{"type":"prompt","name":"review","content":""},{"type":"gate","name":"all"}]"#
+        ));
+        assert!(!verification_batch_checks_nothing(
+            r#"[{"type":"prompt","name":"review","content":"Does the page render?"}]"#
+        ));
+    }
+
+    /// A batch that does not parse fails as a batch; it is not "nothing to check".
+    #[test]
+    fn an_unparseable_batch_is_not_nothing_to_check() {
+        assert!(!verification_batch_checks_nothing("not json"));
+    }
+
+    #[test]
+    fn the_durable_verdict_tests_nothing_checked_first() {
+        assert_eq!(
+            durable_verification_verdict(true, true),
+            DurableVerificationVerdict::NoVerificationSteps
+        );
+        assert_eq!(
+            durable_verification_verdict(true, false),
+            DurableVerificationVerdict::NoVerificationSteps
+        );
+        assert_eq!(
+            durable_verification_verdict(false, true),
+            DurableVerificationVerdict::Passed
+        );
+        assert_eq!(
+            durable_verification_verdict(false, false),
+            DurableVerificationVerdict::Failed
+        );
     }
 }

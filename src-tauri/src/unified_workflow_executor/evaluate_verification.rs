@@ -20,6 +20,10 @@ use crate::str_utils::truncate_str;
 
 use super::convergence::{ConvergenceAction, ConvergencePattern};
 use super::loop_controller::LoopController;
+use super::loop_handlers_decisions::{
+    decide_evaluate_verification, required_step_count, FixProgressUpdate, VerificationEvalDecision,
+    VerificationEvalSnapshot,
+};
 use super::loop_state_machine::{CompletionReason, LoopContext, LoopState};
 use super::states::UnifiedWorkflowState;
 use super::types::{get_parent_task_id, IterationResult, LoopConfig};
@@ -198,32 +202,92 @@ impl EvaluationEffects for LoopController {
 // Handler: EvaluateVerification
 // =========================================================================
 
-/// Convergence analysis, resource limits, handle verification_passed / critical_failure,
-/// record knowledge.
+/// The iteration-result context recorded when nothing was checked.
+const NOTHING_CHECKED_CONTEXT: &str = "No required verification step produced a result, so \
+nothing was checked and the run is not verified. The verification step list was empty, \
+every step was filtered out of this build, or every step was `required: false`.";
+
+/// The verdict word the output log, the replay snapshot and the logs use.
+fn verdict_label(decision: &VerificationEvalDecision) -> &'static str {
+    match decision {
+        VerificationEvalDecision::NoVerificationSteps => {
+            "NOTHING CHECKED (no required verification step)"
+        }
+        VerificationEvalDecision::VerificationPassed => "PASSED",
+        VerificationEvalDecision::CriticalFailure => "CRITICAL FAILURE",
+        VerificationEvalDecision::FixEscalation { .. }
+        | VerificationEvalDecision::ContinueToFix { .. } => "FAILED",
+    }
+}
+
+/// Apply the decision's fix-progress bookkeeping to the loop context.
+fn apply_fix_progress(
+    ctx: &mut LoopContext,
+    config: &LoopConfig,
+    progress: &FixProgressUpdate,
+    passed_steps: usize,
+) {
+    match progress {
+        FixProgressUpdate::Reset { new_best } => {
+            ctx.best_passed_checks = *new_best;
+            ctx.fix_attempts = 0;
+            ctx.last_progress_iteration = ctx.iteration;
+            info!(
+                "Fix loop: progress detected (passed {} > previous best), reset fix_attempts",
+                new_best,
+            );
+        }
+        FixProgressUpdate::Increment => {
+            ctx.fix_attempts = ctx.fix_attempts.saturating_add(1);
+            info!(
+                "Fix loop: no progress (passed {} <= best {}), fix_attempts = {}/{}",
+                passed_steps, ctx.best_passed_checks, ctx.fix_attempts, config.max_fix_attempts
+            );
+        }
+    }
+}
+
+/// Convergence analysis, resource limits, then the verdict:
+/// `decide_evaluate_verification` picks the next state, and this handler
+/// carries it out (knowledge resolution on a pass, fix-progress bookkeeping on
+/// a failure).
 ///
-/// Original lines: 2557-2852
+/// The decision is made FIRST, from a snapshot. Every field it reads
+/// (`best_passed_checks`, `fix_attempts`, `max_fix_attempts` and the result's
+/// counts) stays fixed until the arm it picks writes it, so every effect below
+/// reports the verdict the loop acts on. A verification with no required step
+/// reports `NOTHING CHECKED` rather than `FAILED` or, as the inline branching
+/// that preceded this did, `PASSED`.
 pub(crate) async fn handle_evaluate_verification(
     effects: &dyn EvaluationEffects,
     ctx: &mut LoopContext,
     config: &mut LoopConfig,
     verification_result: VerificationPhaseResult,
 ) -> LoopState {
+    // ---- Decide -------------------------------------------------------------
+    let required_steps = required_step_count(&verification_result.step_results);
+    let decision = decide_evaluate_verification(&VerificationEvalSnapshot {
+        all_passed: verification_result.all_passed,
+        required_steps,
+        critical_failure: verification_result.critical_failure,
+        passed_steps: verification_result.passed_steps,
+        best_passed_checks: ctx.best_passed_checks,
+        fix_attempts: ctx.fix_attempts,
+        max_fix_attempts: config.max_fix_attempts,
+    });
+    let passed = decision == VerificationEvalDecision::VerificationPassed;
+    let status = verdict_label(&decision);
+
     // Log verification results to output_log so the summary AI has context
     {
-        let status = if verification_result.all_passed {
-            "PASSED"
-        } else if verification_result.critical_failure {
-            "CRITICAL FAILURE"
-        } else {
-            "FAILED"
-        };
         let summary_line = format!(
-            "\n--- Verification (Iteration {}): {} ({} passed, {} failed, {} total) ---\n",
+            "\n--- Verification (Iteration {}): {} ({} passed, {} failed, {} total, {} required) ---\n",
             ctx.iteration,
             status,
             verification_result.passed_steps,
             verification_result.failed_steps,
             verification_result.total_steps,
+            required_steps,
         );
 
         // Include brief details of failed steps
@@ -259,11 +323,7 @@ pub(crate) async fn handle_evaluate_verification(
         let snapshot_summary = format!(
             "Verification iteration {} {}: {}/{} passed",
             ctx.iteration,
-            if verification_result.all_passed {
-                "PASSED"
-            } else {
-                "FAILED"
-            },
+            status,
             verification_result.passed_steps,
             verification_result.total_steps,
         );
@@ -274,6 +334,7 @@ pub(crate) async fn handle_evaluate_verification(
             "passed_steps": verification_result.passed_steps,
             "failed_steps": verification_result.failed_steps,
             "total_steps": verification_result.total_steps,
+            "required_steps": required_steps,
             "critical_failure": verification_result.critical_failure,
         });
         effects
@@ -295,12 +356,14 @@ pub(crate) async fn handle_evaluate_verification(
         )
         .await;
 
-    // Persist workflow state: VerificationComplete
+    // Persist workflow state: VerificationComplete. `passed` is the decision's,
+    // not the producer's `all_passed`, which is vacuously true over a set with
+    // no required step.
     effects.persist_state(
         &config.execution_id,
         &UnifiedWorkflowState::verification_complete(
             ctx.iteration,
-            verification_result.all_passed,
+            passed,
             config.stage_index,
             ctx.prior_stages_passed,
         ),
@@ -388,7 +451,7 @@ pub(crate) async fn handle_evaluate_verification(
         }
 
         // Increment cumulative verification failures for routing context
-        if !verification_result.all_passed {
+        if !passed {
             ctx.verification_failures += 1;
         }
 
@@ -436,99 +499,542 @@ pub(crate) async fn handle_evaluate_verification(
     ctx.current_passed_checks = verification_result.passed_steps;
     ctx.current_failed_checks = verification_result.failed_steps;
 
-    // Check verification outcome
-    if verification_result.all_passed {
-        info!("*** VERIFICATION PASSED on iteration {} ***", ctx.iteration);
+    // ---- Act on the decision ------------------------------------------------
+    match decision {
+        VerificationEvalDecision::NoVerificationSteps => {
+            warn!(
+                "*** NOTHING CHECKED on iteration {}: {} step result(s), none required - the run is not verified ***",
+                ctx.iteration,
+                verification_result.step_results.len()
+            );
+            // No knowledge is resolved here: a run that checked nothing has
+            // shown nothing fixed.
+            ctx.iteration_results.push(IterationResult {
+                iteration: ctx.iteration,
+                verification_passed: false,
+                critical_failure: false,
+                passed_checks: verification_result.passed_steps,
+                failed_checks: verification_result.failed_steps,
+                failure_context: NOTHING_CHECKED_CONTEXT.to_string(),
+                agentic_phase_ran: false,
+                agentic_phase_success: None,
+                blame_json: None,
+                contingent_on: Vec::new(),
+                node_rollups: Vec::new(),
+            });
 
-        // Resolve all unresolved knowledge entries — the issues they describe
-        // have been addressed since verification now passes.
-        effects
-            .resolve_open_knowledge(&get_parent_task_id(&config.execution_id))
-            .await;
+            LoopState::Complete {
+                reason: CompletionReason::NoVerificationSteps,
+            }
+        }
 
-        let iter_result = IterationResult {
-            iteration: ctx.iteration,
-            verification_passed: true,
-            critical_failure: false,
-            passed_checks: verification_result.passed_steps,
-            failed_checks: verification_result.failed_steps,
-            failure_context: String::new(),
-            agentic_phase_ran: false,
-            agentic_phase_success: None,
-            blame_json: None,
-            contingent_on: Vec::new(),
-            node_rollups: Vec::new(),
-        };
-        ctx.iteration_results.push(iter_result);
+        VerificationEvalDecision::VerificationPassed => {
+            info!("*** VERIFICATION PASSED on iteration {} ***", ctx.iteration);
 
-        return LoopState::Complete {
-            reason: CompletionReason::VerificationPassed,
-        };
+            // Resolve all unresolved knowledge entries — the issues they describe
+            // have been addressed since verification now passes. On this arm
+            // ONLY: every other verdict has shown nothing resolved.
+            effects
+                .resolve_open_knowledge(&get_parent_task_id(&config.execution_id))
+                .await;
+
+            ctx.iteration_results.push(IterationResult {
+                iteration: ctx.iteration,
+                verification_passed: true,
+                critical_failure: false,
+                passed_checks: verification_result.passed_steps,
+                failed_checks: verification_result.failed_steps,
+                failure_context: String::new(),
+                agentic_phase_ran: false,
+                agentic_phase_success: None,
+                blame_json: None,
+                contingent_on: Vec::new(),
+                node_rollups: Vec::new(),
+            });
+
+            LoopState::Complete {
+                reason: CompletionReason::VerificationPassed,
+            }
+        }
+
+        VerificationEvalDecision::CriticalFailure => {
+            error!(
+                "*** CRITICAL FAILURE on iteration {} - stopping loop ***",
+                ctx.iteration
+            );
+
+            ctx.iteration_results.push(IterationResult {
+                iteration: ctx.iteration,
+                verification_passed: false,
+                critical_failure: true,
+                passed_checks: verification_result.passed_steps,
+                failed_checks: verification_result.failed_steps,
+                failure_context: verification_result.build_failure_context(),
+                agentic_phase_ran: false,
+                agentic_phase_success: None,
+                blame_json: None,
+                contingent_on: Vec::new(),
+                node_rollups: Vec::new(),
+            });
+
+            LoopState::Complete {
+                reason: CompletionReason::CriticalFailure {
+                    error: verification_result.build_failure_context(),
+                },
+            }
+        }
+
+        // --- Fix attempt tracking (Phase 1: Bounded Fix Loop) ---
+        VerificationEvalDecision::FixEscalation { progress } => {
+            apply_fix_progress(ctx, config, &progress, verification_result.passed_steps);
+            warn!(
+                "Fix loop: {} consecutive non-improving iterations (max {}), escalating",
+                ctx.fix_attempts, config.max_fix_attempts
+            );
+            LoopState::FixEscalation {
+                verification_result,
+                convergence_report,
+            }
+        }
+
+        VerificationEvalDecision::ContinueToFix { progress } => {
+            apply_fix_progress(ctx, config, &progress, verification_result.passed_steps);
+            // Verification failed (non-critical) — continue to build failure context
+            LoopState::BuildFailureContext {
+                verification_result,
+                convergence_report,
+            }
+        }
+    }
+}
+
+/// Fixtures that drive [`handle_evaluate_verification`] itself, and its arming test.
+///
+/// Everything here names only what existed before plan
+/// 2026-11-06-a-product-workflow-verification-with-nothing-to-check-never-reports-passed
+/// Phase 1 changed the verdict. So the arming test compiles against the
+/// handler as it was, and it fails there by assertion.
+#[cfg(test)]
+pub(super) mod evaluate_verification_arming {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    use super::*;
+    use crate::step_executor::StepExecutionResult;
+
+    /// Records the effects the verdict is read from, and performs none.
+    #[derive(Default)]
+    pub(in super::super) struct RecordingEffects {
+        pub outputs: Mutex<Vec<String>>,
+        pub states: Mutex<Vec<UnifiedWorkflowState>>,
+        pub knowledge_resolutions: Mutex<Vec<String>>,
     }
 
-    // Check for critical failure
-    if verification_result.critical_failure {
-        error!(
-            "*** CRITICAL FAILURE on iteration {} - stopping loop ***",
-            ctx.iteration
-        );
+    #[async_trait::async_trait]
+    impl EvaluationEffects for RecordingEffects {
+        async fn append_output(&self, _execution_id: &str, text: &str) {
+            self.outputs.lock().unwrap().push(text.to_string());
+        }
 
-        let iter_result = IterationResult {
-            iteration: ctx.iteration,
-            verification_passed: false,
-            critical_failure: true,
-            passed_checks: verification_result.passed_steps,
-            failed_checks: verification_result.failed_steps,
-            failure_context: verification_result.build_failure_context(),
-            agentic_phase_ran: false,
-            agentic_phase_success: None,
-            blame_json: None,
-            contingent_on: Vec::new(),
-            node_rollups: Vec::new(),
-        };
-        ctx.iteration_results.push(iter_result);
+        async fn store_verification_result(
+            &self,
+            _parent_id: &str,
+            _iteration: u32,
+            _result_json: &serde_json::Value,
+        ) {
+        }
 
-        return LoopState::Complete {
-            reason: CompletionReason::CriticalFailure {
-                error: verification_result.build_failure_context(),
+        async fn record_state_snapshot(
+            &self,
+            _execution_id: &str,
+            _kind: &str,
+            _summary: &str,
+            _context: Option<&str>,
+        ) {
+        }
+
+        async fn on_verification_complete(
+            &self,
+            _iteration: u32,
+            _result: &VerificationPhaseResult,
+            _history: &HashMap<String, Vec<bool>>,
+        ) {
+        }
+
+        fn persist_state(&self, _execution_id: &str, state: &UnifiedWorkflowState) {
+            self.states.lock().unwrap().push(state.clone());
+        }
+
+        fn emit_iteration_metrics(
+            &self,
+            _execution_id: &str,
+            _iteration: u32,
+            _metrics: IterationMetrics,
+        ) {
+        }
+
+        async fn resolve_open_knowledge(&self, parent_id: &str) {
+            self.knowledge_resolutions
+                .lock()
+                .unwrap()
+                .push(parent_id.to_string());
+        }
+    }
+
+    /// One step result. `required: None` is required: the shared fold's default.
+    pub(in super::super) fn step(
+        name: &str,
+        success: bool,
+        required: Option<bool>,
+    ) -> StepExecutionResult {
+        StepExecutionResult {
+            step_index: 0,
+            step_type: "command".to_string(),
+            step_name: name.to_string(),
+            step_id: None,
+            success,
+            error: if success {
+                None
+            } else {
+                Some(format!("{} failed", name))
             },
-        };
+            screenshot_path: None,
+            started_at: None,
+            ended_at: None,
+            duration_ms: 0,
+            config: Default::default(),
+            verification_details: None,
+            output_data: None,
+            required,
+            resolved_inputs: None,
+            extracted_values: None,
+            failure_category: None,
+            interrupted: None,
+        }
     }
 
-    // --- Fix attempt tracking (Phase 1: Bounded Fix Loop) ---
-    let current_passed = verification_result.passed_steps;
-    if current_passed > ctx.best_passed_checks {
-        // Progress detected — reset fix counter
-        ctx.best_passed_checks = current_passed;
-        ctx.fix_attempts = 0;
-        ctx.last_progress_iteration = ctx.iteration;
-        info!(
-            "Fix loop: progress detected (passed {} > previous best), reset fix_attempts",
-            current_passed,
+    /// A verification result over `step_results`, reporting `all_passed` as given:
+    /// the producer's word, which the handler must not take on trust.
+    pub(in super::super) fn phase_result(
+        step_results: Vec<StepExecutionResult>,
+        all_passed: bool,
+        critical_failure: bool,
+    ) -> VerificationPhaseResult {
+        VerificationPhaseResult {
+            iteration: 1,
+            all_passed,
+            total_steps: step_results.len(),
+            passed_steps: step_results.iter().filter(|s| s.success).count(),
+            failed_steps: step_results.iter().filter(|s| !s.success).count(),
+            skipped_steps: 0,
+            total_duration_ms: 0,
+            step_results,
+            critical_failure,
+            console_errors: None,
+            app_health: None,
+            browser_events: None,
+            network_failures: None,
+        }
+    }
+
+    pub(in super::super) fn loop_config() -> LoopConfig {
+        let mut config = crate::follow_up::workflow::build_follow_up_config(
+            "exec-evaluate",
+            "Evaluate",
+            "Source",
         );
-    } else {
-        ctx.fix_attempts += 1;
-        info!(
-            "Fix loop: no progress (passed {} <= best {}), fix_attempts = {}/{}",
-            current_passed, ctx.best_passed_checks, ctx.fix_attempts, config.max_fix_attempts
+        // No constraint config is read from disk, and a fixed fix-attempt ceiling.
+        config.project_path = None;
+        config.max_fix_attempts = 3;
+        config
+    }
+
+    pub(in super::super) fn loop_context(config: &LoopConfig) -> LoopContext {
+        let mut ctx = LoopContext::new(
+            config,
+            crate::database::pg::PgDb::new_noop_for_test(),
+            Vec::new(),
+            false,
+        );
+        ctx.iteration = 1;
+        ctx
+    }
+
+    /// The next state's name, for assertion messages (`LoopState` is not `Debug`).
+    pub(in super::super) fn describe(state: &LoopState) -> String {
+        match state {
+            LoopState::Complete { reason } => format!("Complete({:?})", reason),
+            LoopState::BuildFailureContext { .. } => "BuildFailureContext".to_string(),
+            LoopState::FixEscalation { .. } => "FixEscalation".to_string(),
+            _ => "another state".to_string(),
+        }
+    }
+
+    /// ARMING (plan Phase 1, seam class `gate`). A unified-workflow verification
+    /// that checked nothing does not complete the loop as a pass. The input is
+    /// an empty step list fed the `all_passed: true` that both empty producer
+    /// arms returned. An all-`dev_mode_only` verification reaches the handler in
+    /// exactly this shape in a build without debug assertions, because
+    /// `run_verification` filters every step out first.
+    ///
+    /// It enters through the handler that every unified workflow run calls
+    /// (`run_loop_state_machine` → `handle_evaluate_verification`). Before
+    /// Phase 1 that handler ended the loop `VerificationPassed` and resolved the
+    /// run's knowledge.
+    #[tokio::test]
+    async fn an_empty_verification_fed_all_passed_does_not_complete_as_a_pass() {
+        let effects = RecordingEffects::default();
+        let mut config = loop_config();
+        let mut ctx = loop_context(&config);
+
+        let state = handle_evaluate_verification(
+            &effects,
+            &mut ctx,
+            &mut config,
+            phase_result(Vec::new(), true, false),
+        )
+        .await;
+
+        assert!(
+            !matches!(
+                state,
+                LoopState::Complete {
+                    reason: CompletionReason::VerificationPassed
+                }
+            ),
+            "a verification that checked nothing completed as a pass: {}",
+            describe(&state)
+        );
+        assert!(
+            matches!(state, LoopState::Complete { .. }),
+            "nothing checked must end the loop, since no fix iteration can change it: {}",
+            describe(&state)
+        );
+        assert!(
+            effects.knowledge_resolutions.lock().unwrap().is_empty(),
+            "a verification that checked nothing must not resolve knowledge"
+        );
+        assert_eq!(ctx.iteration_results.len(), 1);
+        assert!(!ctx.iteration_results[0].verification_passed);
+        let states = effects.states.lock().unwrap();
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].verification_passed(), Some(false));
+    }
+}
+
+// The handler's verdicts, driven through it with the arming module's fixtures.
+#[cfg(test)]
+mod evaluate_verification_tests {
+    use super::evaluate_verification_arming::{
+        describe, loop_config, loop_context, phase_result, step, RecordingEffects,
+    };
+    use super::*;
+
+    #[tokio::test]
+    async fn an_empty_verification_ends_no_verification_steps() {
+        let effects = RecordingEffects::default();
+        let mut config = loop_config();
+        let mut ctx = loop_context(&config);
+
+        let state = handle_evaluate_verification(
+            &effects,
+            &mut ctx,
+            &mut config,
+            phase_result(Vec::new(), true, false),
+        )
+        .await;
+
+        assert!(
+            matches!(
+                state,
+                LoopState::Complete {
+                    reason: CompletionReason::NoVerificationSteps
+                }
+            ),
+            "{}",
+            describe(&state)
+        );
+        assert_eq!(
+            ctx.iteration_results[0].failure_context,
+            NOTHING_CHECKED_CONTEXT
+        );
+        let outputs = effects.outputs.lock().unwrap();
+        assert_eq!(
+            outputs[0],
+            "\n--- Verification (Iteration 1): NOTHING CHECKED (no required verification step) (0 passed, 0 failed, 0 total, 0 required) ---\n"
         );
     }
 
-    // Check if fix attempts exhausted
-    if config.max_fix_attempts > 0 && ctx.fix_attempts >= config.max_fix_attempts {
-        warn!(
-            "Fix loop: {} consecutive non-improving iterations (max {}), escalating",
-            ctx.fix_attempts, config.max_fix_attempts
+    /// Two informational steps that both passed: the fold says `all_passed`,
+    /// but no required step ran.
+    #[tokio::test]
+    async fn an_all_informational_verification_fed_all_passed_ends_no_verification_steps() {
+        let effects = RecordingEffects::default();
+        let mut config = loop_config();
+        let mut ctx = loop_context(&config);
+
+        let state = handle_evaluate_verification(
+            &effects,
+            &mut ctx,
+            &mut config,
+            phase_result(
+                vec![
+                    step("lint", true, Some(false)),
+                    step("format", true, Some(false)),
+                ],
+                true,
+                false,
+            ),
+        )
+        .await;
+
+        assert!(
+            matches!(
+                state,
+                LoopState::Complete {
+                    reason: CompletionReason::NoVerificationSteps
+                }
+            ),
+            "{}",
+            describe(&state)
         );
-        return LoopState::FixEscalation {
-            verification_result,
-            convergence_report,
-        };
+        assert!(effects.knowledge_resolutions.lock().unwrap().is_empty());
+        assert_eq!(
+            effects.states.lock().unwrap()[0].verification_passed(),
+            Some(false)
+        );
     }
 
-    // Verification failed (non-critical) — continue to build failure context
-    LoopState::BuildFailureContext {
-        verification_result,
-        convergence_report,
+    /// One required step that passed is a pass, and the pass arm is the only
+    /// one that resolves the run's knowledge.
+    #[tokio::test]
+    async fn one_required_step_passing_completes_verification_passed() {
+        let effects = RecordingEffects::default();
+        let mut config = loop_config();
+        let mut ctx = loop_context(&config);
+
+        let state = handle_evaluate_verification(
+            &effects,
+            &mut ctx,
+            &mut config,
+            phase_result(vec![step("tests", true, None)], true, false),
+        )
+        .await;
+
+        assert!(
+            matches!(
+                state,
+                LoopState::Complete {
+                    reason: CompletionReason::VerificationPassed
+                }
+            ),
+            "{}",
+            describe(&state)
+        );
+        assert_eq!(
+            *effects.knowledge_resolutions.lock().unwrap(),
+            vec!["exec-evaluate".to_string()]
+        );
+        assert!(ctx.iteration_results[0].verification_passed);
+        assert_eq!(
+            effects.states.lock().unwrap()[0].verification_passed(),
+            Some(true)
+        );
+        assert!(effects.outputs.lock().unwrap()[0].contains("): PASSED ("));
+    }
+
+    /// Many steps with a required failure keep fixing. The informational
+    /// failure does not count. Progress over the best-so-far (0) resets the
+    /// fix counter, and no knowledge is resolved.
+    #[tokio::test]
+    async fn many_steps_with_a_required_failure_continue_to_fix() {
+        let effects = RecordingEffects::default();
+        let mut config = loop_config();
+        let mut ctx = loop_context(&config);
+
+        let state = handle_evaluate_verification(
+            &effects,
+            &mut ctx,
+            &mut config,
+            phase_result(
+                vec![
+                    step("build", true, None),
+                    step("tests", false, Some(true)),
+                    step("lint", false, Some(false)),
+                ],
+                false,
+                false,
+            ),
+        )
+        .await;
+
+        assert!(
+            matches!(state, LoopState::BuildFailureContext { .. }),
+            "{}",
+            describe(&state)
+        );
+        assert_eq!(ctx.best_passed_checks, 1);
+        assert_eq!(ctx.fix_attempts, 0);
+        assert_eq!(ctx.last_progress_iteration, 1);
+        assert!(ctx.iteration_results.is_empty());
+        assert!(effects.knowledge_resolutions.lock().unwrap().is_empty());
+        assert!(effects.outputs.lock().unwrap()[0].contains("): FAILED ("));
+    }
+
+    /// No progress at the ceiling escalates, after counting the attempt.
+    #[tokio::test]
+    async fn a_failure_without_progress_at_the_ceiling_escalates() {
+        let effects = RecordingEffects::default();
+        let mut config = loop_config();
+        let mut ctx = loop_context(&config);
+        ctx.best_passed_checks = 1;
+        ctx.fix_attempts = 2;
+
+        let state = handle_evaluate_verification(
+            &effects,
+            &mut ctx,
+            &mut config,
+            phase_result(
+                vec![step("build", true, None), step("tests", false, None)],
+                false,
+                false,
+            ),
+        )
+        .await;
+
+        assert!(
+            matches!(state, LoopState::FixEscalation { .. }),
+            "{}",
+            describe(&state)
+        );
+        assert_eq!(ctx.fix_attempts, 3);
+    }
+
+    #[tokio::test]
+    async fn a_critical_failure_completes_critical() {
+        let effects = RecordingEffects::default();
+        let mut config = loop_config();
+        let mut ctx = loop_context(&config);
+
+        let state = handle_evaluate_verification(
+            &effects,
+            &mut ctx,
+            &mut config,
+            phase_result(vec![step("health", false, None)], false, true),
+        )
+        .await;
+
+        assert!(
+            matches!(
+                state,
+                LoopState::Complete {
+                    reason: CompletionReason::CriticalFailure { .. }
+                }
+            ),
+            "{}",
+            describe(&state)
+        );
+        assert!(ctx.iteration_results[0].critical_failure);
+        assert!(effects.knowledge_resolutions.lock().unwrap().is_empty());
     }
 }

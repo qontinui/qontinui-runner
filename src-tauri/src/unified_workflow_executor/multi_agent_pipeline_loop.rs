@@ -823,6 +823,7 @@ impl LoopController {
                 was_stopped: false,
                 unfixable_errors: false,
                 fix_attempts_exhausted: false,
+                no_verification_steps: false,
                 iteration_results: vec![],
                 total_tokens: None,
                 total_cost_usd: None,

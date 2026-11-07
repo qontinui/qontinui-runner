@@ -101,8 +101,19 @@ pub(crate) enum LoopState {
 /// Why the loop exited.
 #[derive(Debug, Clone)]
 pub(crate) enum CompletionReason {
-    /// All verification steps passed
+    /// Every required verification step passed, and at least one ran
     VerificationPassed,
+    /// No required verification step produced a result, so nothing was
+    /// checked. The cause is an empty step list, every step filtered out (a
+    /// build without debug assertions drops `dev_mode_only` steps), or only
+    /// `required: false` steps.
+    ///
+    /// The result is unknown, not passed. It is also not a failure that an
+    /// agentic fix could change, so the loop ends here. All five runtime flags
+    /// stay false, as for `FixAttemptsExhausted`. `MaxIterationsReached` is not
+    /// the model: it sets `unfixable_errors`, which runs the completion phase
+    /// (`LoopResult::should_run_completion`), and nothing checked has earned that.
+    NoVerificationSteps,
     /// Hit the configured max iterations
     MaxIterationsReached,
     /// Hit the global session budget
@@ -321,6 +332,7 @@ impl CompletionReason {
             unfixable_errors,
         ) = match &self {
             CompletionReason::VerificationPassed => (true, false, false, false, false),
+            CompletionReason::NoVerificationSteps => (false, false, false, false, false),
             CompletionReason::MaxIterationsReached => (false, false, true, false, true),
             CompletionReason::MaxSessionsReached => (false, false, true, false, true),
             CompletionReason::CriticalFailure { .. } => (false, false, false, true, false),
@@ -332,6 +344,7 @@ impl CompletionReason {
         };
 
         let fix_attempts_exhausted = matches!(&self, CompletionReason::FixAttemptsExhausted { .. });
+        let no_verification_steps = matches!(&self, CompletionReason::NoVerificationSteps);
 
         // Blueprint telemetry (Phase 4): the loop-level union is the
         // concatenation of every iteration's per-node rollups. Dedup is not
@@ -351,6 +364,7 @@ impl CompletionReason {
             critical_failure,
             unfixable_errors,
             fix_attempts_exhausted,
+            no_verification_steps,
             total_tokens: None,
             total_cost_usd: None,
             files_modified: ctx.resource_tracker.files_modified(),
@@ -379,6 +393,41 @@ mod tests {
         assert!(!result.critical_failure);
         assert!(!result.unfixable_errors);
         assert_eq!(result.iterations_run, 3);
+    }
+
+    /// Nothing checked maps to all five runtime flags false, with
+    /// `no_verification_steps` naming the cause. It is not a pass, and it does
+    /// not reach the completion phase through `unfixable_errors` the way
+    /// `MaxIterationsReached` does.
+    #[test]
+    fn test_completion_reason_no_verification_steps() {
+        let ctx = make_test_context(1);
+        let result = CompletionReason::NoVerificationSteps.into_loop_result(&ctx);
+        assert!(!result.verification_passed);
+        assert!(!result.was_stopped);
+        assert!(!result.max_iterations_reached);
+        assert!(!result.critical_failure);
+        assert!(!result.unfixable_errors);
+        assert!(!result.fix_attempts_exhausted);
+        assert!(result.no_verification_steps);
+        assert!(!result.should_run_completion());
+        assert_eq!(result.iterations_run, 1);
+    }
+
+    /// Only `NoVerificationSteps` sets the flag; a pass and a failure do not.
+    #[test]
+    fn test_only_no_verification_steps_sets_its_flag() {
+        let ctx = make_test_context(2);
+        assert!(
+            !CompletionReason::VerificationPassed
+                .into_loop_result(&ctx)
+                .no_verification_steps
+        );
+        assert!(
+            !CompletionReason::FixAttemptsExhausted { fix_attempts: 3 }
+                .into_loop_result(&ctx)
+                .no_verification_steps
+        );
     }
 
     #[test]
@@ -846,7 +895,8 @@ mod tests {
         // CheckPreconditions → CheckEnvironment | Complete(Stopped/MaxIter/MaxSessions)
         // CheckEnvironment → RunVerification
         // RunVerification → EvaluateVerification
-        // EvaluateVerification → Complete(Passed/Critical) | BuildFailureContext
+        // EvaluateVerification → Complete(NoVerificationSteps/Passed/Critical)
+        //                        | BuildFailureContext | FixEscalation
         // BuildFailureContext → RunAgentic
         // RunAgentic → PostAgentic
         // PostAgentic → CheckPostAgenticSignals
@@ -854,7 +904,8 @@ mod tests {
         // ApprovalGate → Complete(ApprovalAborted) | AdvanceIteration
         // AdvanceIteration → CheckPreconditions (loop back)
         //
-        // Total: 10 states, 14 transitions, 6 completion reasons
+        // Total: 12 states and 10 completion reasons. The tenth, the
+        // nothing-checked exit, is covered by its own tests above.
         // This test verifies the enum variants match.
 
         let completion_variants = [
