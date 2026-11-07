@@ -80,12 +80,16 @@ pub const STEP_ORDER: [&str; 8] = [
 // Wire types
 // ============================================================================
 
-/// Result of a project-name check (local rules; plus the GitHub-side check
-/// through the web proxy when `owner` is provided).
+/// Result of a project-name check (local rules; plus coord's availability
+/// verdict, relayed through the web proxy, when `owner` is provided).
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NameCheckResult {
-    /// "available" | "taken" | "invalid" | "owner_unbound"
+    /// "available" | "taken" | "invalid" | "owner_unbound" | "repo_bound_to_another_tenant".
+    /// With an owner: coord's `NameStatus` (qontinui-coord `crates/coord/src/repo_provision.rs`),
+    /// relayed verbatim by `check_name_remote` (absent or non-string → "invalid").
+    /// Without one, or when local validation fails, `check_project_name` answers
+    /// "available" / "invalid" itself.
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
