@@ -6165,13 +6165,18 @@ fn relay_session_maps(
 /// 2. `coord_session_id` → its Claude session id through the registrar's R4
 ///    index (`claude_session_for`, i.e. `AiCoordRegistrar::task_run_id_for`),
 ///    then the terminal hosting that Claude session:
-///    a. the live terminal PINNED to it (the spawn-time pin, in-process);
-///    b. else an `open`, bound lifecycle record
-///       ([`crate::mcp::session_message_poller::bound_open_terminal_id`]) for
-///       it — its own record first, then a record whose `adopted_from` chain
-///       reaches it (a `/clear` successor on the same pane; walked with
-///       [`crate::claude_session::coord_register::resolve_adoption_chain`]) —
-///       whose terminal is live.
+///    a. its own `open`, bound lifecycle record
+///       ([`crate::mcp::session_message_poller::bound_open_terminal_id`])
+///       naming a live terminal — where the session runs now;
+///    b. else the live terminal PINNED to it (the spawn-time pin, in-process),
+///       which can be stale once the session was resumed elsewhere;
+///    c. else a record whose `adopted_from` chain reaches it (a `/clear`
+///       successor; walked with
+///       [`crate::claude_session::coord_register::resolve_adoption_chain`])
+///       naming a live terminal.
+///
+///    Each arm must name exactly one live terminal; two candidates resolve to
+///    `None` rather than a pick, because a remote end closes what it resolves.
 ///
 /// There is deliberately no arm matching a pinned id against the coord id:
 /// the pinned id is the PROVIDER's session id and every `coord.sessions.id`
@@ -6198,15 +6203,17 @@ pub(crate) fn resolve_coord_terminal_id<'a>(
     }
     // (2) coord id → Claude session id.
     let claude_session_id = claude_session_for(&coord_session_id)?;
-    // (2a) The live terminal pinned to it.
-    if let Some((id, _, _)) = terminals
-        .iter()
-        .find(|(_, pinned, _)| *pinned == claude_session_id)
-    {
-        return Some((*id).to_string());
-    }
-    // (2b) Its open lifecycle record, else a `/clear` successor's — bound,
-    // and naming a terminal that is live here.
+    // Every arm below must name exactly ONE live terminal: a remote end closes
+    // what it resolves, so two candidates are refused, never picked between.
+    let only = |mut tids: Vec<String>| -> Result<Option<String>, ()> {
+        tids.sort();
+        tids.dedup();
+        match tids.len() {
+            0 => Ok(None),
+            1 => Ok(tids.pop()),
+            _ => Err(()),
+        }
+    };
     let is_live = |tid: &str| terminals.iter().any(|(id, _, _)| *id == tid);
     let records = open_records();
     let bound_live = |rec: &crate::session::session_lifecycle_store::TerminalSessionRecord| {
@@ -6214,26 +6221,53 @@ pub(crate) fn resolve_coord_terminal_id<'a>(
             .filter(|tid| is_live(tid))
             .map(str::to_string)
     };
-    if let Some(tid) = records
-        .iter()
-        .filter(|rec| rec.claude_session_id == claude_session_id)
-        .find_map(bound_live)
-    {
-        return Some(tid);
+    // (2a) Its own open, bound lifecycle record — where the session RUNS now.
+    // This outranks the pin: the pin is fixed at spawn, so a pane whose Claude
+    // exited (shell still live) keeps a pin to a session that has since been
+    // resumed in another pane.
+    match only(
+        records
+            .iter()
+            .filter(|rec| rec.claude_session_id == claude_session_id)
+            .filter_map(bound_live)
+            .collect(),
+    ) {
+        Ok(Some(tid)) => return Some(tid),
+        Err(()) => return None,
+        Ok(None) => {}
     }
-    records
-        .iter()
-        .filter(|rec| rec.claude_session_id != claude_session_id)
-        .filter(|rec| {
-            crate::claude_session::coord_register::resolve_adoption_chain(
-                &rec.claude_session_id,
-                rec.adopted_from.as_deref(),
-                |link| (link == claude_session_id).then_some(()),
-                &mut predecessor_of,
-            )
-            .is_some()
-        })
-        .find_map(bound_live)
+    // (2b) No record names it: the live terminal pinned to it.
+    match only(
+        terminals
+            .iter()
+            .filter(|(_, pinned, _)| *pinned == claude_session_id)
+            .map(|(id, _, _)| (*id).to_string())
+            .collect(),
+    ) {
+        Ok(Some(tid)) => return Some(tid),
+        Err(()) => return None,
+        Ok(None) => {}
+    }
+    // (2c) A `/clear` successor's record — bound, naming a live terminal, and
+    // the only such terminal.
+    only(
+        records
+            .iter()
+            .filter(|rec| rec.claude_session_id != claude_session_id)
+            .filter(|rec| {
+                crate::claude_session::coord_register::resolve_adoption_chain(
+                    &rec.claude_session_id,
+                    rec.adopted_from.as_deref(),
+                    |link| (link == claude_session_id).then_some(()),
+                    &mut predecessor_of,
+                )
+                .is_some()
+            })
+            .filter_map(bound_live)
+            .collect(),
+    )
+    .ok()
+    .flatten()
 }
 
 /// TARGET role: a SOURCE device presents a coord-minted grant for one of our
@@ -6424,6 +6458,32 @@ async fn handle_terminal_attach(api_state: &Arc<ApiState>, data: &Value) -> Opti
     }))
 }
 
+/// TARGET role: admit a `terminal_end` frame against this runner's live
+/// panes — `admit_terminal_end` with the relay's own resolver
+/// ([`resolve_local_terminal`] over the registrar and lifecycle store). This is
+/// the whole admission half of [`handle_terminal_end`], split out so it can be
+/// exercised without an `AppHandle`.
+#[allow(clippy::too_many_arguments)]
+fn admit_relay_terminal_end<P>(
+    grants: &crate::mcp::remote_terminal::RemoteAttachGrants,
+    preference: P,
+    data: &Value,
+    now: u64,
+    tm: &crate::terminal::TerminalManager,
+    registrar: Option<&crate::claude_session::coord_register::AiCoordRegistrar>,
+    store: Option<&crate::session::session_lifecycle_store::SessionLifecycleStore>,
+) -> Result<
+    crate::mcp::remote_terminal::AdmittedEnd<Arc<crate::terminal::session::TerminalSession>>,
+    Value,
+>
+where
+    P: FnOnce() -> crate::settings::AcceptRemoteAttach,
+{
+    crate::mcp::remote_terminal::admit_terminal_end(grants, preference, data, now, |session_id| {
+        resolve_local_terminal(tm, registrar, store, session_id)
+    })
+}
+
 /// TARGET role: a SOURCE device asks to END one of our sessions under its
 /// attach grant (plan `2026-09-30-close-remote-sessions-from-the-local-runner`,
 /// Phase 1), or to close the terminal its create grant just spawned
@@ -6467,19 +6527,14 @@ async fn handle_terminal_end(api_state: &Arc<ApiState>, data: &Value) -> Option<
     }
 
     let gate = || {
-        admit_terminal_end(
+        admit_relay_terminal_end(
             grants(),
             crate::settings::get_remote_attach_preference,
             data,
             now_epoch_secs(),
-            |session_id| {
-                resolve_local_terminal(
-                    tm.as_ref(),
-                    registrar.as_deref(),
-                    store.as_deref(),
-                    session_id,
-                )
-            },
+            tm.as_ref(),
+            registrar.as_deref(),
+            store.as_deref(),
         )
     };
     let admitted = match gate() {
@@ -11817,11 +11872,9 @@ mod resolve_local_terminal_tests {
     //! Phase 2: the target resolves EVERY coord row bound to a terminal — the
     //! pane's `terminal_shell` mirror id and the `terminal_claude` row the
     //! registrar holds for the Claude session inside it.
-    use super::{resolve_coord_terminal_id, resolve_local_terminal};
+    use super::{admit_relay_terminal_end, resolve_coord_terminal_id};
     use crate::claude_session::coord_register::AiCoordRegistrar;
-    use crate::mcp::remote_terminal::{
-        admit_terminal_end, AdmittedEnd, AttachGrant, RemoteAttachGrants,
-    };
+    use crate::mcp::remote_terminal::{AdmittedEnd, AttachGrant, RemoteAttachGrants};
     use crate::session::local_store::OutboxWriter;
     use crate::session::session_lifecycle_store::{
         test_open_record, SessionLifecycleStore, TerminalSessionRecord, ORIGIN_AUTHORITATIVE,
@@ -11899,6 +11952,71 @@ mod resolve_local_terminal_tests {
     fn a_claude_row_for_the_panes_pinned_session_resolves_through_the_pin() {
         let index = HashMap::from([(CLAUDE_ROW, "P".to_string())]);
         assert_eq!(resolve(&index, &[], CLAUDE_ROW).as_deref(), Some("pane"));
+    }
+
+    /// Two live panes and the registrar index `index`, over `records`: pane
+    /// `A` pinned `C` (Claude exited there, the shell lives on) and pane `B`
+    /// with no pin.
+    fn resolve_two_panes(
+        index: &HashMap<Uuid, String>,
+        records: &[TerminalSessionRecord],
+        coord: Uuid,
+    ) -> Option<String> {
+        resolve_coord_terminal_id(
+            [("A", "C", None), ("B", "", None)].into_iter(),
+            |c| index.get(c).cloned(),
+            || records.to_vec(),
+            |_| None,
+            coord,
+        )
+    }
+
+    /// `C` was resumed in pane `B` while `A` still carries the spawn-time pin
+    /// to `C`: the open record — where the session runs now — wins, so a
+    /// remote end never closes the stale pane.
+    #[test]
+    fn an_open_record_outranks_a_stale_pin_on_another_pane() {
+        let index = HashMap::from([(CLAUDE_ROW, "C".to_string())]);
+        assert_eq!(
+            resolve_two_panes(&index, &[bound("C", "B")], CLAUDE_ROW).as_deref(),
+            Some("B")
+        );
+        // With no record, the pin is still the answer.
+        assert_eq!(
+            resolve_two_panes(&index, &[], CLAUDE_ROW).as_deref(),
+            Some("A")
+        );
+    }
+
+    /// Two live panes claimed by one session's records (its own, or two
+    /// `/clear` successors) are refused rather than picked between.
+    #[test]
+    fn two_live_candidates_resolve_nothing() {
+        let index = HashMap::from([(CLAUDE_ROW, "C".to_string())]);
+        assert_eq!(
+            resolve_two_panes(&index, &[bound("C", "A"), bound("C", "B")], CLAUDE_ROW),
+            None
+        );
+        // Successors only: the index maps to `X`, which no record or pin
+        // names directly, so only the `adopted_from` arm is reached.
+        let index_x = HashMap::from([(CLAUDE_ROW, "X".to_string())]);
+        let successor = |csid: &str, pane: &str| {
+            let mut rec = bound(csid, pane);
+            rec.adopted_from = Some("X".to_string());
+            rec
+        };
+        assert_eq!(
+            resolve_two_panes(&index_x, &[successor("D", "A")], CLAUDE_ROW).as_deref(),
+            Some("A")
+        );
+        assert_eq!(
+            resolve_two_panes(
+                &index_x,
+                &[successor("D", "A"), successor("E", "B")],
+                CLAUDE_ROW
+            ),
+            None
+        );
     }
 
     /// After `/clear` the pane runs a successor `D` adopted from `C`; `C`'s
@@ -11987,22 +12105,15 @@ mod resolve_local_terminal_tests {
         let store = SessionLifecycleStore::open(dir.path().join("lifecycle.json")).unwrap();
         store.record_open(bound(&csid, "pane-b4dd"));
 
-        let resolve = |sid| resolve_local_terminal(&tm, Some(&registrar), Some(&store), sid);
-        for (row, what) in [
-            (SHELL_ROW, "terminal_shell"),
-            (claude_row, "terminal_claude"),
-        ] {
-            let (id, session) =
-                resolve(row).unwrap_or_else(|| panic!("{what} row did not resolve"));
-            assert_eq!(id, "pane-b4dd", "{what}");
-            assert!(Arc::ptr_eq(&session, &pane.session), "{what}");
-        }
-        assert!(resolve(UNKNOWN_ROW).is_none());
-
-        // The end handler's own admission seam, with that resolver.
+        // Enter where `handle_terminal_end` enters: its admission half, with
+        // the relay's production resolver over the real registrar and store.
         const NOW: u64 = 1_700_000_000;
         let grants = RemoteAttachGrants::new();
-        for (jti, row) in [("j-claude", claude_row), ("j-unknown", UNKNOWN_ROW)] {
+        for (jti, row) in [
+            ("j-shell", SHELL_ROW),
+            ("j-claude", claude_row),
+            ("j-unknown", UNKNOWN_ROW),
+        ] {
             grants.insert(
                 AttachGrant {
                     grant_jti: jti.to_string(),
@@ -12015,7 +12126,7 @@ mod resolve_local_terminal_tests {
             );
         }
         let end = |jti: &str| {
-            admit_terminal_end(
+            admit_relay_terminal_end(
                 &grants,
                 || AcceptRemoteAttach::Tenant,
                 &serde_json::json!({
@@ -12025,13 +12136,22 @@ mod resolve_local_terminal_tests {
                     "remote": {"grant_jti": jti, "source_device_id": "src-device"},
                 }),
                 NOW,
-                resolve,
+                &tm,
+                Some(&registrar),
+                Some(&store),
             )
         };
-        match end("j-claude").expect("admitted") {
-            AdmittedEnd::Terminal { terminal_id, .. } => assert_eq!(terminal_id, "pane-b4dd"),
-            AdmittedEnd::NotLocal { .. } => {
-                panic!("terminal_claude row answered session_not_local")
+        for (jti, what) in [
+            ("j-shell", "terminal_shell"),
+            ("j-claude", "terminal_claude"),
+        ] {
+            match end(jti).expect("admitted") {
+                AdmittedEnd::Terminal { terminal_id, .. } => {
+                    assert_eq!(terminal_id, "pane-b4dd", "{what}")
+                }
+                AdmittedEnd::NotLocal { .. } => {
+                    panic!("{what} row answered session_not_local")
+                }
             }
         }
         assert!(matches!(
