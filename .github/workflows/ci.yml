@@ -767,7 +767,8 @@ jobs:
             librsvg2-dev \
             libdbus-1-dev \
             libatspi2.0-dev \
-            at-spi2-core
+            at-spi2-core \
+            zsh
 
       # Hosted ubuntu runners ship only ~14 GB free on /. This workspace's
       # Rust dep tree (atspi/zbus, image codecs, tree-sitter, sentry) plus the
@@ -1510,6 +1511,13 @@ jobs:
         shell: bash
         env:
           QONTINUI_DISABLE_KEYCHAIN: "1"
+          # The hosted Ubuntu leg installs zsh (`Install dependencies (Ubuntu)`),
+          # so there the shell-integration marks test must run its zsh cases
+          # rather than skip them; a skip on that leg fails the test
+          # (`spawn_prompt.rs` `shell_integration_marks_every_typed_command`).
+          # Elsewhere (self-hosted, macOS, Windows) zsh may be absent and a skip
+          # stays a skip.
+          QONTINUI_REQUIRE_ZSH_MARKS: ${{ (matrix.platform == 'ubuntu-22.04' && runner.environment == 'github-hosted') && '1' || '' }}
         run: |
           # KEEP THIS `cd`. It looks dead — every recovered path below is
           # absolute — but it is now the ONLY thing reproducing cargo's own

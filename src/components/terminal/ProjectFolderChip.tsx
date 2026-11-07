@@ -7,8 +7,15 @@
  * anything, this renders the state `useProjectTerminalReconcile` computes as a
  * soft, dismissible advisory with the two honest choices:
  *
- *   [Move them]  — open replacements at the project root, close the originals
- *                  only once their replacement exists;
+ *   [Move them]  — replace a pane with one at the project root only when its
+ *                  process table shows a shell with nothing under it AND the
+ *                  last mark this window parsed from it while it was live is a
+ *                  prompt, from a shell that announced it marks every command
+ *                  start — both read again just before the original is closed
+ *                  (and only once its replacement exists). Every other pane is
+ *                  kept and named below the prose with the reason. While every
+ *                  outside pane was kept for this project, the button reads
+ *                  [Check again];
  *   [Leave them] — dismiss for this project root.
  *
  * Renders nothing when no project is active, when every live terminal is
@@ -38,7 +45,7 @@ export function ProjectFolderChip({ projectRoot, projectName }: ProjectFolderChi
   const root = projectRoot ?? hint?.path ?? null;
   const name = projectName ?? hint?.name ?? null;
 
-  const { count, moving, error, moveThem, dismiss, shouldPrompt } =
+  const { count, moving, error, kept, allKept, moveThem, dismiss, shouldPrompt } =
     useProjectTerminalReconcile(root);
 
   if (!shouldPrompt) return null;
@@ -59,6 +66,18 @@ export function ProjectFolderChip({ projectRoot, projectName }: ProjectFolderChi
               <span className="font-semibold">{name ?? "the project folder"}</span>.
             </div>
             {error && <div className="mt-1 text-[10px] text-[#f7768e]">{error}</div>}
+            {kept.length > 0 && (
+              <ul
+                data-ui-bridge-id="terminal.project-folder-chip-kept"
+                className="mt-1 space-y-0.5 text-[10px] text-[#a9b1d6]"
+              >
+                {kept.map((k) => (
+                  <li key={k.id} title={k.id}>
+                    Left in place: <span className="text-[#c0caf5]">{k.title}</span> — {k.reason}
+                  </li>
+                ))}
+              </ul>
+            )}
             <div className="mt-1.5 flex items-center gap-2">
               <button
                 type="button"
@@ -67,7 +86,7 @@ export function ProjectFolderChip({ projectRoot, projectName }: ProjectFolderChi
                 onClick={() => void moveThem()}
                 className="px-1.5 py-0.5 rounded text-[10px] text-[#e0af68] bg-[#e0af68]/10 hover:bg-[#e0af68]/20 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
               >
-                {moving ? "Moving…" : "Move them"}
+                {moving ? "Moving…" : allKept ? "Check again" : "Move them"}
               </button>
               <button
                 type="button"

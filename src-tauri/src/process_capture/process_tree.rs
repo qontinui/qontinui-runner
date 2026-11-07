@@ -532,6 +532,13 @@ fn collect_descendants_from_snapshot(
     bfs_descendants_from(root, &snapshot.parent_map, &snapshot.creation_times)
 }
 
+/// How many processes descend from `root_pid` in `snapshot`, at any depth
+/// (`root_pid` itself excluded). The same walk every subtree reading here
+/// uses, so a count and a `claude` enumeration over one snapshot agree. PURE.
+pub fn descendant_count(root_pid: u32, snapshot: &ProcessSnapshot) -> usize {
+    collect_descendants_from_snapshot(root_pid, snapshot).len()
+}
+
 // ============================================================================
 // Bounded external-probe seam (platform-independent)
 // ============================================================================

@@ -94,7 +94,12 @@ import { TerminalPageProvider } from "./components/terminal/TerminalPageContext"
 import { TerminalSessionProvider } from "./components/terminal/contexts";
 import { WindowAssignmentsProvider } from "./components/terminal/contexts/WindowAssignmentsContext";
 import { Now1HzProvider } from "./components/terminal/useNow1Hz";
-import { ReorganizeDialog, type ReorganizePlan } from "./components/terminal/ReorganizeDialog";
+import { ReorganizeDialog } from "./components/terminal/ReorganizeDialog";
+import {
+  applyReorganizePlan,
+  type ReorganizePlan,
+} from "./components/terminal/applyReorganizePlan";
+import { waitForPageMoveListener } from "./components/terminal/pageMoveListeners";
 import { PerformanceOverlay, GiantSCCFixture } from "./components/dev";
 import { CommandPalette } from "./components/unified-search/CommandPalette";
 import {
@@ -306,94 +311,20 @@ function AppContent() {
   const { popOutPage } = useTerminalWindowActions();
   const [showReorganize, setShowReorganize] = useState(false);
 
+  // "Reorganize pages by topic" MOVES each pane onto its planned page and
+  // removes only the pages that are empty at removal time — nothing it does
+  // closes a terminal or re-creates one (see `applyReorganizePlan`).
+  const { pages: rosterPages, addPage, removeEmptyPage } = terminalPages;
   const handleReorganize = useCallback(
-    async (plan: ReorganizePlan) => {
-      // Build a map of session ID → current page_id from terminal_list
-      const listResult = await invoke<{
-        success: boolean;
-        data?: { terminals: Array<{ id: string; page_id: string; title: string }> };
-      }>("terminal_list");
-      const terminals = listResult?.data?.terminals ?? [];
-      const terminalPageMap = new Map(terminals.map((t) => [t.id, t.page_id]));
-
-      // Ensure all target pages exist
-      const pageNameToId = new Map(terminalPages.pages.map((p) => [p.name, p.id]));
-      for (const group of plan.pages) {
-        if (!pageNameToId.has(group.name)) {
-          const newId = terminalPages.addPage(group.name);
-          pageNameToId.set(group.name, newId);
-        }
-      }
-
-      // For each group, move terminals that aren't already on the target page.
-      // Moving a terminal: save scrollback → close → create on target page → restore scrollback
-      for (const group of plan.pages) {
-        const targetPageId = pageNameToId.get(group.name);
-        if (!targetPageId) continue;
-
-        for (const sessionId of group.sessionIds) {
-          const currentPage = terminalPageMap.get(sessionId);
-          if (currentPage === targetPageId) continue; // Already on the right page
-
-          // Save scrollback before closing
-          try {
-            await invoke("terminal_save_scrollback", { terminalId: sessionId });
-          } catch {
-            // Non-fatal — terminal may not have scrollback
-          }
-
-          // Close on old page
-          try {
-            await invoke("terminal_close", { terminalId: sessionId });
-          } catch {
-            console.warn(`Failed to close terminal ${sessionId} during reorganization`);
-            continue;
-          }
-
-          // Create on target page (new terminal — scrollback not restored for simplicity)
-          try {
-            const terminal = terminals.find((t) => t.id === sessionId);
-            await invoke("terminal_create", {
-              title: terminal?.title ?? "Terminal",
-              workingDir: null,
-              pageId: targetPageId,
-              // OVERRIDE the spawn-time resource gate. This is a MOVE, not a
-              // new session: the terminal was closed two statements above and
-              // this recreates it on the target page. A refusal here would not
-              // protect a live session, it would finish destroying one — the
-              // same reasoning as the account-migration respawn in
-              // `terminal/account_migration.rs`. Net commit is unchanged.
-              resourceOverride: true,
-            });
-          } catch {
-            console.warn(`Failed to create terminal on page ${group.name}`);
-          }
-        }
-      }
-
-      // Rename existing pages to match the proposal
-      for (const group of plan.pages) {
-        const pageId = pageNameToId.get(group.name);
-        if (pageId) {
-          terminalPages.renamePage(pageId, group.name);
-        }
-      }
-
-      // Remove pages that are now empty (no sessions assigned to them)
-      const assignedPageIds = new Set(
-        plan.pages.map((g) => pageNameToId.get(g.name)).filter(Boolean),
-      );
-      for (const page of terminalPages.pages) {
-        if (!assignedPageIds.has(page.id) && page.id !== "default") {
-          try {
-            await terminalPages.removePage(page.id);
-          } catch {
-            // Non-fatal
-          }
-        }
-      }
-    },
-    [terminalPages],
+    (plan: ReorganizePlan) =>
+      applyReorganizePlan(plan, {
+        invoke,
+        pages: rosterPages,
+        addPage,
+        removeEmptyPage,
+        waitForPage: (pageId) => waitForPageMoveListener(pageId),
+      }),
+    [rosterPages, addPage, removeEmptyPage],
   );
 
   const {
@@ -902,10 +833,7 @@ function AppContent() {
                       <ReorganizeDialog
                         pages={terminalPages.pages}
                         onClose={() => setShowReorganize(false)}
-                        onApply={async (plan) => {
-                          await handleReorganize(plan);
-                          setShowReorganize(false);
-                        }}
+                        onApply={handleReorganize}
                       />
                     )}
                     <div className="flex-1 min-h-0">

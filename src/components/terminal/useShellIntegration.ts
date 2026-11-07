@@ -1,10 +1,34 @@
 import { useCallback, useRef, useState } from "react";
-import type { ShellIntegrationEvent } from "./TerminalInstance";
+import type { ShellIntegrationEvent, ShellPromptMark } from "./shellIntegrationEvents";
 import type { TerminalInstanceHandle } from "./TerminalInstance";
 import type { TranscriptSession } from "./useTranscriptSessions";
 import type { SessionState } from "./useZoneLayout";
 import type { ResourceGuardSource } from "@/lib/resourceGuard";
 import { resumeInNewTab, type ResumeAttempt, type ResumeTarget } from "./resumeInNewTab";
+
+/**
+ * The prompt-state half of a pane's OSC 633 shell integration
+ * ({@link ShellPromptMark}): which of 633;A / 633;C this window last PARSED
+ * from the pane's live stream, or derived from a mount's ring replay (which is
+ * contiguous with it).
+ *
+ * Not every prompt promises a 633;C for the next command: PowerShell without
+ * PSReadLine, bash < 4.4 and a PowerShell nested prompt draw 633;A but cannot
+ * (or must not) vouch for it. A prompt that can sends `633;P;CommandMarks=1`
+ * before its 633;A, and the capability is judged PER PROMPT (see
+ * {@link UseShellIntegrationResult.announcesCommandStarts}).
+ *
+ * There is no reading at all for a pane that emitted neither mark (a direct
+ * exec such as `bash ./job.sh`, `cmd`) or whose output this window KNOWS it
+ * did not parse: dropped while the pane was hidden, overrun out of the ring,
+ * spliced out of a resync, painted over by a reconnect, and its unmount each
+ * clear both readings (the synthetic `unobserved` event). Those are the loss
+ * paths the window can see; the clear is only as complete as that list. A
+ * remount's ring replay is parsed in replay mode, its marks summarised once
+ * (`replayed_marks`) rather than reported as live — and not at all when output
+ * was lost while it was in flight.
+ */
+export type { ShellPromptMark };
 
 export interface CommandHistoryEntry {
   command: string;
@@ -64,6 +88,20 @@ interface UseShellIntegrationResult {
   /** THE resume path — see `resumeInNewTab`. */
   resumeTarget: (target: ResumeTarget, spawnSource?: ResourceGuardSource) => Promise<ResumeAttempt>;
   handleFirstInput: (tabId: string, input: string) => void;
+  /**
+   * The last prompt-state mark `tabId`'s shell emitted (see
+   * {@link ShellPromptMark}); `undefined` when it has emitted none. Read at
+   * call time — it is a ref, not state, so a prompt redraw re-renders nothing.
+   */
+  lastPromptMark: (tabId: string) => ShellPromptMark | undefined;
+  /**
+   * Whether `tabId`'s LAST PROMPT carried `633;P;CommandMarks=1` — i.e. that
+   * prompt's shell marks the next typed command line with 633;C, so its 633;A
+   * can be read as "nothing is running". Judged per prompt: a later prompt
+   * without it (a PowerShell nested prompt) withdraws it. Same lifetime as
+   * {@link lastPromptMark}.
+   */
+  announcesCommandStarts: (tabId: string) => boolean;
 }
 
 export function useShellIntegration({
@@ -83,9 +121,51 @@ export function useShellIntegration({
     {},
   );
   const pendingCommandRef = useRef<Record<string, string>>({});
+  const lastPromptMarkRef = useRef<Record<string, ShellPromptMark>>({});
+  /** Tabs whose last prompt carried the capability. */
+  const commandMarksRef = useRef<Record<string, true>>({});
+  /** Tabs whose capability arrived for a prompt whose 633;A has not yet. */
+  const pendingCommandMarksRef = useRef<Record<string, true>>({});
+  const lastPromptMark = useCallback(
+    (tabId: string): ShellPromptMark | undefined => lastPromptMarkRef.current[tabId],
+    [],
+  );
+  const announcesCommandStarts = useCallback(
+    (tabId: string): boolean => commandMarksRef.current[tabId] === true,
+    [],
+  );
 
   const handleShellIntegration = useCallback(
     (tabId: string, event: ShellIntegrationEvent) => {
+      if (event.type === "prompt_start") {
+        lastPromptMarkRef.current[tabId] = "prompt_start";
+        // The capability belongs to THIS prompt: carried only if it was sent
+        // with it.
+        if (pendingCommandMarksRef.current[tabId]) commandMarksRef.current[tabId] = true;
+        else delete commandMarksRef.current[tabId];
+        delete pendingCommandMarksRef.current[tabId];
+      } else if (event.type === "command_execute") {
+        lastPromptMarkRef.current[tabId] = "command_execute";
+        delete pendingCommandMarksRef.current[tabId];
+      } else if (event.type === "command_marks") {
+        pendingCommandMarksRef.current[tabId] = true;
+      } else if (event.type === "unobserved") {
+        // This window lost track of the pane: what its shell reported before
+        // is no longer known to be current.
+        delete lastPromptMarkRef.current[tabId];
+        delete commandMarksRef.current[tabId];
+        delete pendingCommandMarksRef.current[tabId];
+        return;
+      } else if (event.type === "replayed_marks") {
+        // A remount's ring replay, summarised: only the marks, never history.
+        if (event.mark) lastPromptMarkRef.current[tabId] = event.mark;
+        else delete lastPromptMarkRef.current[tabId];
+        if (event.announcesCommandStarts) commandMarksRef.current[tabId] = true;
+        else delete commandMarksRef.current[tabId];
+        if (event.pendingAnnounce) pendingCommandMarksRef.current[tabId] = true;
+        else delete pendingCommandMarksRef.current[tabId];
+        return;
+      }
       if (event.type === "prompt_start") {
         // Shell prompt appeared. A `prompt_start` only means "a shell prompt
         // is being drawn" — NOT that a Claude session is awaiting the user.
@@ -194,5 +274,7 @@ export function useShellIntegration({
     handleResumeSession,
     resumeTarget,
     handleFirstInput,
+    lastPromptMark,
+    announcesCommandStarts,
   };
 }

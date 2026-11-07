@@ -2988,4 +2988,319 @@ mod script_tests {
         });
         assert_eq!(parsed["terminal_id"], HOSTILE, "under {locale}: {body}");
     }
+
+    /// The bash and zsh integrations' prompt-state marks on a real pty
+    /// (`resources/shell-integration-marks-test.sh`): with a user
+    /// `PROMPT_COMMAND` in every form (and zsh hooks in every position), each
+    /// typed command line gets its 633;C before its output and a 633;A after
+    /// it, and the prompt announces `633;P;CommandMarks=1` — except where its
+    /// checks cannot see the C path in place and reaching the pane (a readonly
+    /// PS0, a stdin or stderr that is no longer the pane) or see a registered
+    /// user hook ahead of it (a zsh hook before ours, a `zshaddhistory` hook,
+    /// a DEBUG trap), where it must not.
+    /// The script SKIPs (exit 0) where util-linux `script(1)` is missing or
+    /// bash predates PS0, and skips its zsh cases where zsh is missing.
+    #[test]
+    fn shell_integration_marks_every_typed_command() {
+        const MARKS_TEST: &str = include_str!("../../resources/shell-integration-marks-test.sh");
+        // Each case is one interactive bash or zsh behind `script(1)`, bounded
+        // inside the script by `timeout -k 2 20` (20 s, then 2 s to the kill).
+        // The budget is sized from that bound and the script's own case count
+        // (`run_case`, `run_case_input_moves`, `run_zsh_case` and
+        // `run_slow_case` lines), so adding a case cannot outgrow it; this
+        // outer bound only catches a hang the per-case bound somehow missed.
+        // A `run_slow_case` waits in bash's own fork retries (about 15 s per
+        // failed fork), so it has its own, longer bound: 60 s, then 2 s.
+        const CASE_BOUND: &str = "timeout -k 2 20 script";
+        const CASE_WORST_SECS: u64 = 22;
+        const SLOW_CASE_BOUND: &str = "timeout -k 2 60 script";
+        const SLOW_CASE_WORST_SECS: u64 = 62;
+        for bound in [CASE_BOUND, SLOW_CASE_BOUND] {
+            assert!(
+                MARKS_TEST.contains(bound),
+                "the marks test bounds its cases with `{bound}`; resize the budget with it"
+            );
+        }
+        let count = |drivers: &[&str]| {
+            let n = MARKS_TEST
+                .lines()
+                .filter(|l| drivers.iter().any(|driver| l.starts_with(driver)))
+                .count();
+            u64::try_from(n).expect("a handful of cases fits in u64")
+        };
+        let cases = count(&["run_case ", "run_case_input_moves ", "run_zsh_case "]);
+        let slow_cases = count(&["run_slow_case "]);
+        assert!(
+            cases > 0,
+            "the marks test runs its cases with `run_case` / `run_case_input_moves` / `run_zsh_case`"
+        );
+        let budget =
+            Duration::from_secs(cases * CASE_WORST_SECS + slow_cases * SLOW_CASE_WORST_SECS + 30);
+
+        let _serial = exe_guard();
+        let test = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("resources")
+            .join("shell-integration-marks-test.sh");
+        let mut cmd = Command::new("bash");
+        cmd.arg(&test);
+        let out = output_with_timeout(cmd, budget).expect("the marks test runs inside its budget");
+        assert!(
+            out.status.success(),
+            "shell-integration-marks-test.sh failed:\n{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // A green run with every zsh case skipped proves nothing about the zsh
+        // integration. Where CI installs zsh it sets QONTINUI_REQUIRE_ZSH_MARKS=1,
+        // and there a skip is a failure; elsewhere it is reported, never hidden.
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let zsh_skips = stdout
+            .lines()
+            .filter(|l| l.starts_with("SKIP ") && l.ends_with(": zsh is not installed"))
+            .count();
+        if std::env::var("QONTINUI_REQUIRE_ZSH_MARKS").as_deref() == Ok("1") {
+            // Required means RAN, not merely "not skipped by name": a whole-run
+            // `SKIP:` (no script(1), no timeout(1), bash < 4.4) runs no case at
+            // all, so it must fail here too, and at least one zsh case must pass.
+            let run_skip = stdout.lines().find(|l| l.starts_with("SKIP:"));
+            let zsh_ran = stdout
+                .lines()
+                .filter(|l| l.starts_with("ok   zsh-"))
+                .count();
+            assert!(
+                zsh_skips == 0 && run_skip.is_none() && zsh_ran > 0,
+                "QONTINUI_REQUIRE_ZSH_MARKS=1 but the zsh cases did not run: {zsh_skips} skipped, {zsh_ran} passed, whole-run skip {run_skip:?}"
+            );
+        }
+        if zsh_skips > 0 {
+            eprintln!("shell-integration marks: {zsh_skips} zsh case(s) SKIPPED (zsh is not installed); the zsh integration is unexercised on this host");
+        }
+    }
+}
+
+/// The shell producer half of the webview's prompt-state witness (the project
+/// move's "bare idle shell" reading, `useProjectTerminalReconcile.ts`): every
+/// integration script sends the SAME capability token the webview parses, and
+/// PowerShell arms it only where its 633;C exists. A source scan, so it runs on
+/// every platform without a shell.
+#[cfg(test)]
+mod command_marks_scan_tests {
+    const BASH: &str = include_str!("../../resources/shell-integration.bash");
+    const ZSH: &str = include_str!("../../resources/shell-integration.zsh");
+    const PS1: &str = include_str!("../../resources/shell-integration.ps1");
+    /// The webview constant's source, so the token cannot drift on either side.
+    const WEBVIEW: &str =
+        include_str!("../../../src/components/terminal/shellIntegrationEvents.ts");
+
+    /// `COMMAND_MARKS_CAPABILITY` as the webview declares it.
+    fn webview_token() -> &'static str {
+        let (_, rest) = WEBVIEW
+            .split_once("export const COMMAND_MARKS_CAPABILITY = \"")
+            .expect("shellIntegrationEvents.ts declares COMMAND_MARKS_CAPABILITY");
+        let (token, _) = rest
+            .split_once('"')
+            .expect("the constant is a string literal");
+        token
+    }
+
+    #[test]
+    fn every_integration_script_sends_the_webviews_capability_token() {
+        let token = webview_token();
+        assert_eq!(token, "P;CommandMarks=1");
+        assert!(
+            BASH.contains(&format!("__osc633 \"{token}\"")),
+            "shell-integration.bash must send {token}"
+        );
+        assert!(
+            ZSH.contains(&format!("__qontinui_osc633 \"{token}\"")),
+            "shell-integration.zsh must send {token}"
+        );
+        assert!(
+            PS1.contains(&format!("]633;{token}${{__q_bel}}")),
+            "shell-integration.ps1 must send {token}"
+        );
+    }
+
+    /// bash announces the capability only on the PS0 path (bash >= 4.4), the
+    /// one that marks every typed command line and never a PROMPT_COMMAND
+    /// entry, and only at a prompt whose checks pass: PS0 carries that C, and
+    /// stdin and stderr (where bash writes PS0) are still the pane.
+    #[test]
+    fn bash_announces_the_capability_only_where_ps0_emits_the_command_start() {
+        let token = webview_token();
+        // Exactly one emission site, as the PowerShell ARM check counts its arm:
+        // an extra ungated `__osc633 "P;CommandMarks=1"` must fail here.
+        let emit = format!("__osc633 \"{token}\"");
+        assert_eq!(
+            BASH.matches(emit.as_str()).count(),
+            1,
+            "bash may announce the capability from exactly one place"
+        );
+        // That one place sends it only while PS0 carries our C (after
+        // re-prefixing a PS0 something reassigned) and both stdin (where the
+        // line is read) and stderr (where bash writes PS0) are still the pane
+        // recorded at install — on the PS0 path only.
+        let gated = format!(
+            "    if [ \"${{__qontinui_ps0_path}}\" = \"1\" ]; then\n        case \"${{PS0-}}\" in\n            *'\\e]633;C\\a'*) ;;\n            *) __qontinui_is_readonly PS0 || PS0='\\e]633;C\\a'\"${{PS0-}}\" ;;\n        esac\n        case \"${{PS0-}}\" in\n            *'\\e]633;C\\a'*)\n                if [[ -n ${{__qontinui_pane_tty-}} && /dev/fd/0 -ef ${{__qontinui_pane_tty-}} &&\n                    /dev/fd/2 -ef ${{__qontinui_pane_tty-}} ]]; then\n                    {emit}\n                fi\n                ;;\n        esac\n    fi"
+        );
+        assert!(
+            BASH.contains(&gated),
+            "the bash announcement must be gated on PS0 carrying the command start, and on stdin and stderr both still being the pane recorded at install"
+        );
+        // The pane, by path, recorded once with `command tty` (no user
+        // function or alias stands in) BEFORE the user's rc can redirect
+        // stdin or stderr; a failed `tty` leaves it empty, and the gate above
+        // then announces nothing.
+        const PANE: &str = "if { __qontinui_pane_tty=\"$(command tty 2>/dev/null)\"; } 2>/dev/null; then\n    case \"${__qontinui_pane_tty}\" in\n        /*) ;;\n        *) __qontinui_pane_tty=\"\" ;;\n    esac\nelse\n    __qontinui_pane_tty=\"\"\nfi";
+        const USER_RC: &str = "\n# Source user's bashrc (skipped when used as --rcfile)\n[ -f ~/.bashrc ] && source ~/.bashrc\n";
+        let pane_at = BASH
+            .find(PANE)
+            .expect("bash must record the pane's path with `command tty`, empty when it fails");
+        let rc_at = BASH.find(USER_RC).expect("bash sources the user's rc");
+        assert!(
+            pane_at < rc_at,
+            "bash must record the pane before the user's rc runs, so an rc redirect cannot become the pane"
+        );
+        assert!(
+            BASH.contains("            PS0='\\e]633;C\\a'\"${PS0-}\"\n"),
+            "bash must emit its command start from PS0 (with a `set -u`-safe default)"
+        );
+        let gate = "if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4) )); then\n    __qontinui_ps0_path=1\nelse\n    __qontinui_ps0_path=0\nfi";
+        assert!(
+            BASH.contains(gate),
+            "the PS0 path must be gated on bash >= 4.4"
+        );
+    }
+
+    /// No bash read may print, or wedge the prompt, at a task/PID ceiling.
+    /// Every command substitution in the script (`$(…)`, and the 5.3
+    /// `${ …; }`) sits inside a `{ …; } 2>/dev/null` group, where bash's own
+    /// fork-retry text goes. A fork that still fails makes bash abandon
+    /// PROMPT_COMMAND and run it again, so every prompt-time fork is made
+    /// under `__qontinui_forking`, and a round that finds it still set takes
+    /// the abandoned round's status and makes no fork.
+    #[test]
+    fn bash_forks_only_inside_a_silent_group() {
+        let code_lines = BASH.lines().filter(|l| !l.trim_start().starts_with('#'));
+        for line in code_lines {
+            if line.contains("$(") || line.contains("${ ") {
+                assert!(
+                    line.contains("} 2>/dev/null"),
+                    "a bash command substitution outside a silent group: {line}"
+                );
+            }
+        }
+        const HISTORY_READ: &str = "    __qontinui_read_history() {\n        [ \"${__qontinui_no_fork}\" = 0 ] || return 1\n        local status\n        __qontinui_forking=1\n        { __qontinui_history=\"$(HISTTIMEFORMAT= builtin history 1)\"; } 2>/dev/null\n        status=$?\n        __qontinui_forking=0\n        return \"${status}\"\n    }";
+        const ABANDONED_ROUND: &str = "    if [ \"${__qontinui_forking-0}\" = 1 ]; then\n        code=\"${__qontinui_code-${code}}\"\n        __qontinui_forking=0\n        __qontinui_no_fork=1\n    else\n        __qontinui_no_fork=0\n    fi\n    __qontinui_code=\"${code}\"";
+        for (read, what) in [
+            (HISTORY_READ, "the E read forks only under __qontinui_forking, and not in a round that may not fork"),
+            (ABANDONED_ROUND, "a round after an abandoned one takes that round's status and makes no fork"),
+            ("        if __qontinui_read_history &&", "E is sent only when its read succeeded"),
+            ("    if [[ ! -o physical && \"${PWD-}\" == /* && \"${PWD-}\" -ef . ]]; then", "Cwd is $PWD, no fork, while it names the cwd"),
+        ] {
+            assert!(BASH.contains(read), "{what}: {read}");
+        }
+    }
+
+    /// PowerShell emits 633;C only from its PSReadLine hook, so the flag that
+    /// lets its prompt announce the capability is set TRUE only inside that
+    /// block — initialized false at top level, before the Prompt function reads
+    /// it (StrictMode) — and never announced at a nested prompt, nor once
+    /// something replaced our `PSConsoleHostReadLine` (the identity saved right
+    /// after defining it, checked at every prompt).
+    #[test]
+    fn powershell_arms_the_capability_only_inside_the_psreadline_block() {
+        const ARM: &str = "$global:__qontinui_command_marks = $true";
+        const INIT: &str = "$global:__qontinui_command_marks = $false";
+        const SB_INIT: &str = "$global:__qontinui_readline_sb = $null";
+        const SB_SAVE: &str = "$global:__qontinui_readline_sb = $function:PSConsoleHostReadLine";
+        let arms: Vec<usize> = PS1.match_indices(ARM).map(|(i, _)| i).collect();
+        assert_eq!(arms.len(), 1, "exactly one place may arm the capability");
+        let block = PS1
+            .find("if (Get-Module -Name PSReadLine -ErrorAction SilentlyContinue) {")
+            .expect("the PSReadLine block is present");
+        let block_end = PS1
+            .match_indices("\n}\n")
+            .map(|(i, _)| i)
+            .find(|&i| i > block)
+            .expect("the PSReadLine block closes");
+        assert!(
+            arms[0] > block && arms[0] < block_end,
+            "the capability must be armed inside the PSReadLine block"
+        );
+        let init = PS1.find(INIT).expect("the flag is initialized false");
+        let prompt = PS1
+            .find("function global:Prompt {")
+            .expect("the Prompt function is present");
+        assert!(
+            init < prompt,
+            "the flag must be initialized before the Prompt function reads it"
+        );
+        let sb_init = PS1
+            .find(SB_INIT)
+            .expect("the saved readline identity is initialized");
+        assert!(
+            sb_init < prompt,
+            "the saved readline identity must be initialized before the Prompt function reads it"
+        );
+        // Saved once, inside the PSReadLine block, AFTER our function is
+        // defined there — so it is our scriptblock, not PSReadLine's.
+        let saves: Vec<usize> = PS1.match_indices(SB_SAVE).map(|(i, _)| i).collect();
+        assert_eq!(
+            saves.len(),
+            1,
+            "exactly one place may save the readline identity"
+        );
+        let ours = PS1
+            .find("    function global:PSConsoleHostReadLine {")
+            .expect("our PSConsoleHostReadLine is defined");
+        assert!(
+            ours > block && saves[0] > ours && saves[0] < block_end,
+            "the readline identity must be saved inside the PSReadLine block, after our function"
+        );
+        assert!(
+            PS1.contains(
+                "    if ($global:__qontinui_command_marks -and $NestedPromptLevel -eq 0 -and\n        $null -ne $global:__qontinui_readline_sb -and\n        [object]::ReferenceEquals($function:PSConsoleHostReadLine, $global:__qontinui_readline_sb)) {\n        $result += \"${__q_esc}]633;P;CommandMarks=1${__q_bel}\""
+            ),
+            "the capability is announced only at a top-level prompt while PSConsoleHostReadLine is still ours"
+        );
+    }
+
+    /// zsh announces only while our preexec is the FIRST entry of
+    /// `preexec_functions` and no registered user hook runs ahead of it — no
+    /// `preexec` or `zshaddhistory` function, no `zshaddhistory_functions`
+    /// entry, no DEBUG trap — judged under `emulate -L zsh`; our preexec is
+    /// put first without dropping the user's hooks under their array options
+    /// (KSH_ARRAYS).
+    #[test]
+    fn zsh_announces_only_while_our_preexec_runs_first() {
+        let token = webview_token();
+        let emit = format!("__qontinui_osc633 \"{token}\"");
+        assert_eq!(
+            ZSH.matches(emit.as_str()).count(),
+            1,
+            "zsh may announce the capability from exactly one place"
+        );
+        let gated = format!(
+            "    emulate -L zsh\n    local announce=0 traps=\n    if [[ ${{preexec_functions[1]-}} == __qontinui_preexec ]] &&\n        (( ! ${{+functions[preexec]}} && ! ${{+functions[zshaddhistory]}} &&\n            ${{#zshaddhistory_functions}} == 0 && ! ${{+functions[TRAPDEBUG]}} )); then\n        {{\n            {{\n                traps=\"$(builtin trap)\" && announce=1\n            }} always {{\n                TRY_BLOCK_ERROR=0\n            }}\n        }} 2>/dev/null\n        if [[ $'\\n'${{traps}}$'\\n' == *' DEBUG'$'\\n'* ]]; then\n            announce=0\n        fi\n    fi\n    if (( announce )); then\n        {emit}\n    fi"
+        );
+        assert!(
+            ZSH.contains(&gated),
+            "the zsh announcement must be gated on our preexec being the first hook, with no preexec or zshaddhistory function, no zshaddhistory hook and no DEBUG trap ahead of it, read by a `builtin trap` whose failed fork is caught"
+        );
+        // The DEBUG-trap read is the only fork anywhere in the file, and it
+        // is the caught one: a fork that fails at a process ceiling must not
+        // print an error or cost the prompt its A.
+        assert_eq!(
+            ZSH.matches("$(").count(),
+            1,
+            "the zsh integration may hold exactly one command substitution (a fork): the caught `builtin trap` read in its prompt hook"
+        );
+        assert!(
+            ZSH.contains(
+                "() {\n    emulate -L zsh\n    typeset -ga preexec_functions\n    preexec_functions=(__qontinui_preexec \"${(@)preexec_functions:#__qontinui_preexec}\")\n}"
+            ),
+            "our preexec goes first, keeping every user hook, under emulate -L zsh"
+        );
+    }
 }

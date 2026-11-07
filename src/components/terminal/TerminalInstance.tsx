@@ -68,6 +68,11 @@ import {
 import { declarePaneTier } from "./terminalVisibilityTiers";
 import { PaneVisibilityService, mountBootstrapPlan } from "./paneVisibilityService";
 import { setWebglSlotVisible } from "./backends/webglContextLru";
+import {
+  shellMarksSink,
+  type ShellIntegrationEvent,
+  type ShellMarksSink,
+} from "./shellIntegrationEvents";
 import { describeThrown } from "@/lib/utils";
 
 export type { TerminalWriteResult } from "./terminalWriteResult";
@@ -95,13 +100,7 @@ export interface TerminalInstanceHandle {
   focus: () => void;
 }
 
-export type ShellIntegrationEvent =
-  | { type: "prompt_start" }
-  | { type: "command_ready" }
-  | { type: "command_execute" }
-  | { type: "command_done"; exitCode: number }
-  | { type: "command_line"; command: string }
-  | { type: "cwd"; path: string };
+export type { ShellIntegrationEvent } from "./shellIntegrationEvents";
 
 interface TerminalInstanceProps {
   terminalId: string;
@@ -332,6 +331,8 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
      * cost far more than the throttling saves.
      */
     const paneServiceRef = useRef<PaneVisibilityService | null>(null);
+    /** This mount's shell-marks sink, for the `visible`-prop effect (see `resumed`). */
+    const shellMarksRef = useRef<ShellMarksSink | null>(null);
     const visibleRef = useRef(visible);
     visibleRef.current = visible;
 
@@ -573,13 +574,30 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
       // bytes it wrote: an unacked remainder above the runner's Low watermark
       // wedges a paused emission gate for good (see `ackedWriteQueue.ts`).
       const ackQueue = new AckedWriteQueue(renderAck, sendAck);
+      // Shell integration for this mount (`shellIntegrationEvents.ts`). Output
+      // this window loses (a chunk dropped while hidden, a ring overrun, a
+      // spliced resync) and this mount's end each tell the page's handler the
+      // pane's prompt-state marks are no longer current; a loss is reported a
+      // second time behind xterm's write queue, which parses asynchronously.
+      const shellMarks = shellMarksSink(
+        () => onShellIntegrationRef.current,
+        (cb) => {
+          const b = backendRef.current;
+          if (b) b.write(new Uint8Array(0), cb);
+          else cb();
+        },
+      );
+      shellMarksRef.current = shellMarks;
       // The hooks close over `paneService` (declared further down). They only
       // run once a chunk arrives, which is after the handler is registered,
       // and that is after `paneService` exists.
       const stream = new PaneOutputStream(ackQueue, {
         isPaused: () => paneService.paused,
         hasBackend: () => backendRef.current !== null,
-        noteMissedOutput: (end) => paneService.noteMissedOutput(end),
+        noteMissedOutput: (end) => {
+          paneService.noteMissedOutput(end);
+          shellMarks.outputDropped();
+        },
         requestResync: () => void resyncFromRing(),
         scheduleFlush: () => scheduleFlush(),
       });
@@ -714,6 +732,7 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
         noteRingReplay,
         noteResynced: (through) => paneService.noteResynced(through),
         noteResyncFailed: () => paneService.noteResyncFailed(),
+        outputLost: () => shellMarks.outputLost(),
         flushStaged: () => flushCoalesced(),
         flowReset,
         warn: (message, error) =>
@@ -964,6 +983,15 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
         }
 
         backendRef.current = backend;
+
+        // OSC 633 shell integration. Registered BEFORE anything is written, in
+        // replay mode: the mount's ring replay (and the chunks drained behind
+        // it) are parsed only for their prompt-state marks, summarised once
+        // that parse is done (`endReplay`, below) — the ring is contiguous with
+        // the live stream, so its last 633;A/C is current. Its E/D/cwd are
+        // history and are not re-reported.
+        disposables.push(backend.onOsc633((data) => shellMarks.osc633(data)));
+        shellMarks.beginReplay();
 
         // Register file path link provider (backend-agnostic)
         disposables.push(
@@ -1318,6 +1346,9 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
         // of any live chunk.
         bytesReceivedRef.current += stream.drainPending();
         flushCoalesced();
+        // Everything written so far is the replay; once xterm has parsed it,
+        // report the marks it ends in and go live.
+        backend.write(new Uint8Array(0), () => shellMarks.endReplay());
 
         // Wait for the container to have non-zero dimensions before
         // fitting. On fast initial mount the layout is already done; on
@@ -1476,7 +1507,13 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
           // the paint shows them, they are skipped; if not, they are replayed
           // from the ring (a resync), unless the snapshot proves there were
           // none.
-          const behind = stream.lateAttachSettled(lateAttachPaint.painted, lateAttachPaint.offset);
+          const { behind, skipped } = stream.lateAttachSettled(
+            lateAttachPaint.painted,
+            lateAttachPaint.offset,
+          );
+          // Bytes the paint showed but this pane never parsed: their marks
+          // (a 633;C among them) are lost, so the replay's are not current.
+          if (skipped > 0) shellMarks.outputLost();
           if (behind > 0) {
             console.warn(
               `[Terminal ${terminalId}] reconnect paint is ${behind} bytes behind the mount ring; replaying them from the paint`,
@@ -1542,25 +1579,6 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
         // `visible` effect below ran before the backend existed, so a pane
         // that mounted hidden would otherwise outrank a watched one.
         setWebglSlotVisible(terminalId, visibleRef.current);
-
-        // OSC 633 shell integration handler
-        disposables.push(
-          backend.onOsc633((data) => {
-            const cb = onShellIntegrationRef.current;
-            if (!cb) return;
-            if (data === "A") cb({ type: "prompt_start" });
-            else if (data === "B") cb({ type: "command_ready" });
-            else if (data === "C") cb({ type: "command_execute" });
-            else if (data.startsWith("D")) {
-              const code = parseInt(data.slice(2), 10);
-              cb({ type: "command_done", exitCode: isNaN(code) ? 0 : code });
-            } else if (data.startsWith("E;")) {
-              cb({ type: "command_line", command: data.slice(2).replace(/\\x3b/g, ";") });
-            } else if (data.startsWith("P;Cwd=")) {
-              cb({ type: "cwd", path: data.slice(6) });
-            }
-          }),
-        );
       })().catch((err) => {
         // The init IIFE used to be fire-and-forget. Anything it threw —
         // `createTerminalBackend` rejecting on WASM/WebGL, a link-provider or
@@ -1580,6 +1598,10 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
         // bytes reach the (about-to-be-disposed) backend rather than being
         // dropped. Harmless if nothing is staged.
         if (flushScheduled) flushCoalesced();
+        // This mount no longer parses the pane's output. The next mount
+        // re-derives the marks from its ring replay (replay mode, above).
+        shellMarks.unmounted();
+        if (shellMarksRef.current === shellMarks) shellMarksRef.current = null;
         // Stops the ack timer + observer and hands acking back to the page tap.
         paneService.dispose();
         if (paneServiceRef.current === paneService) paneServiceRef.current = null;
@@ -1949,6 +1971,10 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
      * WebGL context (ghostty is Canvas 2D).
      */
     useEffect(() => {
+      // Shown: writes resume here (the reveal resync first), so a drop clear
+      // queued while hidden no longer sits behind everything written. Told
+      // before the pane service starts them.
+      if (visible) shellMarksRef.current?.resumed();
       paneServiceRef.current?.setVisible(visible);
       setWebglSlotVisible(terminalId, visible);
     }, [visible, terminalId]);

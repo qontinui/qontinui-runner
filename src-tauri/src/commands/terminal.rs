@@ -542,6 +542,48 @@ pub fn terminal_set_title(
     })
 }
 
+/// Move a terminal onto a different terminal page, keeping its PTY alive.
+///
+/// The IPC twin of `POST /terminals/{id}/move` (`mcp/terminals.rs`), routed to
+/// [`TerminalManager::set_page`] as [`terminal_set_title`] is to `set_title`:
+/// the manager mutates the session, flushes the move into the durable lifecycle
+/// registry and emits `terminal-page-changed`, which the webview answers by
+/// adopting the tab on its new page and evicting it from the old one WITHOUT a
+/// `terminal_close` — so the process in the PTY (an AI session included) runs
+/// on. The page reorganize moves panes through this instead of the
+/// close-and-recreate that ended every session it touched.
+///
+/// Refuses an empty `page_id`, as the HTTP twin answers 400 for one.
+#[tauri::command]
+pub fn terminal_set_page(
+    terminal_manager: tauri::State<'_, Arc<TerminalManager>>,
+    app_handle: tauri::AppHandle,
+    terminal_id: String,
+    page_id: String,
+) -> Result<CommandResponse, String> {
+    route_set_page(page_id, |page_id| {
+        terminal_manager.set_page(&terminal_id, page_id, &app_handle)
+    })?;
+    Ok(CommandResponse {
+        success: true,
+        message: None,
+        data: None,
+    })
+}
+
+/// [`terminal_set_page`]'s routing: refuse an empty page id — it names no page,
+/// and a terminal parked there renders on no tab — and otherwise hand the id to
+/// `set`. `set` is never called for a refused id.
+fn route_set_page(
+    page_id: String,
+    set: impl FnOnce(String) -> Result<(), String>,
+) -> Result<(), String> {
+    if page_id.is_empty() {
+        return Err("pageId is required and must be non-empty".to_string());
+    }
+    set(page_id)
+}
+
 /// Resize a terminal's PTY dimensions.
 #[tauri::command]
 pub fn terminal_resize(
@@ -778,6 +820,17 @@ pub fn terminal_get_bracketed_paste(
 /// - `remote` — the pane has no local pid; the subtree cannot be observed.
 /// - `unknown` — a LOCAL pane whose process table could not be read. Says
 ///   nothing either way, and the caller must not treat it as `absent`.
+///
+/// On `live` / `absent` the answer also carries the pane's ROOT process, read
+/// from the same single process-table snapshot as the claude half:
+/// `rootImage` (the root's image name, `null` when the table does not hold
+/// the root pid), `rootIsShell` (that image is a shell — the runner's one
+/// shell list, `claude_hook::is_shell_program`, so never a `claude` of any
+/// install) and `rootDescendants` (processes under the root at any depth).
+/// A bare idle shell is `rootIsShell && rootDescendants == 0`, which the
+/// project move ("Move them") requires before it replaces a pane: an
+/// npm-installed claude runs as `node … cli.js`, reads `absent` here, and is
+/// still a descendant. On `remote` / `unknown` the three are `null`.
 #[tauri::command]
 pub async fn terminal_probe_claude(
     terminal_manager: tauri::State<'_, Arc<TerminalManager>>,
@@ -792,11 +845,7 @@ pub async fn terminal_probe_claude(
         return Ok(CommandResponse {
             success: true,
             message: None,
-            data: Some(serde_json::json!({
-                "state": "remote",
-                "claudePids": [],
-                "sessionIds": [],
-            })),
+            data: Some(probe_unobservable_answer("remote", None)),
         });
     };
     let data = match probe_claude_under(Some(root_pid), Vec::new()).await {
@@ -813,24 +862,55 @@ pub async fn terminal_probe_claude(
                     })
                     .collect()
             };
-            serde_json::json!({
-                "state": if pids.is_empty() { "absent" } else { "live" },
-                "claudePids": pids,
-                "sessionIds": session_ids,
-            })
+            probe_readable_answer(&p, session_ids)
         }
-        ClaudeProbe::Unreadable(detail) => serde_json::json!({
-            "state": "unknown",
-            "claudePids": [],
-            "sessionIds": [],
-            "detail": detail,
-        }),
+        ClaudeProbe::Unreadable(detail) => probe_unobservable_answer("unknown", Some(detail)),
     };
     Ok(CommandResponse {
         success: true,
         message: None,
         data: Some(data),
     })
+}
+
+/// [`terminal_probe_claude`]'s answer for a readable pane: the claude half and
+/// the root half of ONE snapshot. PURE.
+fn probe_readable_answer(
+    p: &crate::terminal::graceful_exit::PaneProcesses,
+    session_ids: Vec<String>,
+) -> serde_json::Value {
+    let pids: Vec<u32> = p.subtree_claude.iter().map(|id| id.pid).collect();
+    let root_is_shell = p
+        .root
+        .image
+        .as_deref()
+        .is_some_and(crate::session::claude_hook::is_shell_program);
+    serde_json::json!({
+        "state": if pids.is_empty() { "absent" } else { "live" },
+        "claudePids": pids,
+        "sessionIds": session_ids,
+        "rootImage": p.root.image,
+        "rootIsShell": root_is_shell,
+        "rootDescendants": p.root.descendants,
+    })
+}
+
+/// [`terminal_probe_claude`]'s answer when the pane's subtree was not read
+/// (`remote`: no local pid; `unknown`: the table could not be read). The root
+/// fields are `null` — UNKNOWN, never a bare shell. PURE.
+fn probe_unobservable_answer(state: &str, detail: Option<String>) -> serde_json::Value {
+    let mut answer = serde_json::json!({
+        "state": state,
+        "claudePids": [],
+        "sessionIds": [],
+        "rootImage": null,
+        "rootIsShell": null,
+        "rootDescendants": null,
+    });
+    if let Some(detail) = detail {
+        answer["detail"] = serde_json::Value::String(detail);
+    }
+    answer
 }
 
 /// Compact text-only snapshot for verifiers and external tools.
@@ -3210,6 +3290,7 @@ pub fn plugin() -> TauriPlugin<tauri::Wry> {
             terminal_write,
             terminal_resize,
             terminal_set_title,
+            terminal_set_page,
             terminal_close,
             terminal_list,
             terminal_ack,
@@ -3239,8 +3320,103 @@ pub fn plugin() -> TauriPlugin<tauri::Wry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::terminal::graceful_exit::PaneProcesses;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+
+    /// `terminal_set_page` refuses an empty page id before it reaches the
+    /// manager, as its HTTP twin answers 400 for one; a real id is handed on.
+    #[test]
+    fn set_page_refuses_an_empty_page_id() {
+        let mut reached = Vec::new();
+        let refused = route_set_page(String::new(), |id| {
+            reached.push(id);
+            Ok(())
+        })
+        .expect_err("an empty page id must be refused");
+        assert!(refused.contains("pageId"), "{refused}");
+        assert!(reached.is_empty(), "the manager must not see a refused id");
+
+        route_set_page("default".to_string(), |id| {
+            reached.push(id);
+            Ok(())
+        })
+        .expect("a real page id is routed");
+        assert_eq!(reached, vec!["default".to_string()]);
+
+        // The manager's own refusal (an unknown terminal) comes back as is.
+        let unknown = route_set_page("p".to_string(), |_| {
+            Err("Terminal session not found: t".into())
+        });
+        assert_eq!(unknown, Err("Terminal session not found: t".to_string()));
+    }
+
+    fn pane(image: Option<&str>, descendants: usize, claude: &[u32]) -> PaneProcesses {
+        use crate::terminal::graceful_exit::{PaneRoot, ProcIdentity};
+        PaneProcesses {
+            subtree_claude: claude
+                .iter()
+                .map(|&pid| ProcIdentity { pid, started_at: 1 })
+                .collect(),
+            top_level_children: 0,
+            tracked_alive: Vec::new(),
+            root: PaneRoot {
+                image: image.map(str::to_string),
+                descendants,
+            },
+        }
+    }
+
+    /// The widened probe answer: the root's image, whether that image is a
+    /// shell, and its descendant count — the three facts the project move reads
+    /// to tell a bare idle shell from a pane with anything running in it.
+    #[test]
+    fn probe_answer_carries_the_root_image_shellness_and_descendants() {
+        let idle = probe_readable_answer(&pane(Some("pwsh.exe"), 0, &[]), Vec::new());
+        assert_eq!(idle["state"], "absent");
+        assert_eq!(idle["rootImage"], "pwsh.exe");
+        assert_eq!(idle["rootIsShell"], true);
+        assert_eq!(idle["rootDescendants"], 0);
+
+        // `node … cli.js` (an npm-installed claude) under the shell: `absent`
+        // to the image test, but the shell has a descendant.
+        let npm = probe_readable_answer(&pane(Some("bash"), 1, &[]), Vec::new());
+        assert_eq!(npm["state"], "absent");
+        assert_eq!(npm["rootIsShell"], true);
+        assert_eq!(npm["rootDescendants"], 1);
+
+        // A pane spawned as `claude` directly: its root is no shell.
+        let direct = probe_readable_answer(
+            &pane(Some("claude"), 0, &[42]),
+            vec!["0d9f8e7c-6b5a-4f3e-9d2c-1b0a9f8e7d6c".to_string()],
+        );
+        assert_eq!(direct["state"], "live");
+        assert_eq!(direct["claudePids"], serde_json::json!([42]));
+        assert_eq!(direct["rootIsShell"], false);
+
+        // A root the table does not hold has no image and is no shell.
+        let gone = probe_readable_answer(&pane(None, 0, &[]), Vec::new());
+        assert_eq!(gone["rootImage"], serde_json::Value::Null);
+        assert_eq!(gone["rootIsShell"], false);
+    }
+
+    /// A pane whose subtree was not read reports its root as UNKNOWN (`null`),
+    /// never as a bare shell.
+    #[test]
+    fn an_unobserved_pane_reports_no_root() {
+        for answer in [
+            probe_unobservable_answer("remote", None),
+            probe_unobservable_answer("unknown", Some("table unreadable".to_string())),
+        ] {
+            assert_eq!(answer["rootImage"], serde_json::Value::Null);
+            assert_eq!(answer["rootIsShell"], serde_json::Value::Null);
+            assert_eq!(answer["rootDescendants"], serde_json::Value::Null);
+        }
+        assert_eq!(
+            probe_unobservable_answer("unknown", Some("table unreadable".to_string()))["detail"],
+            "table unreadable"
+        );
+    }
 
     /// The close envelope carries the outcome as a TYPED value in `data`, never
     /// as prose in `message` — `message` is for humans, `data` is for callers.
