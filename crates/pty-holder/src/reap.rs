@@ -82,6 +82,15 @@ impl ReapReport {
         self.notes.push(line.into());
     }
 
+    /// Whether the reap may have left something of the pane running: a
+    /// process nothing proved was the pane's, or a snapshot that could not be
+    /// read (UNKNOWN, never "nothing left"). The sweep keeps the pane's
+    /// orphan-ledger entry exactly when this holds, so a later sweep re-checks
+    /// it instead of forgetting it.
+    pub fn may_have_left_survivors(&self) -> bool {
+        !self.unattributed.is_empty() || self.snapshot_unreadable
+    }
+
     /// One line for a log.
     pub fn summary(&self) -> String {
         format!(
@@ -709,5 +718,42 @@ mod windows_reap_tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         drop(job);
+    }
+}
+
+#[cfg(test)]
+mod report_tests {
+    use super::ReapReport;
+
+    /// The orphan-ledger keep decision: an unreadable snapshot keeps the
+    /// entry even with nothing listed as unattributed; kills alone do not.
+    #[test]
+    fn reap_report_survivor_decision_treats_an_unreadable_snapshot_as_unknown() {
+        let clean = ReapReport::default();
+        assert!(
+            !clean.may_have_left_survivors(),
+            "nothing found, snapshot read"
+        );
+        let killed_only = ReapReport {
+            killed: vec![7],
+            ..ReapReport::default()
+        };
+        assert!(
+            !killed_only.may_have_left_survivors(),
+            "all verified and killed"
+        );
+        let unattributed = ReapReport {
+            unattributed: vec![8],
+            ..ReapReport::default()
+        };
+        assert!(unattributed.may_have_left_survivors());
+        let unreadable = ReapReport {
+            snapshot_unreadable: true,
+            ..ReapReport::default()
+        };
+        assert!(
+            unreadable.may_have_left_survivors(),
+            "an empty `unattributed` from an unread snapshot is UNKNOWN"
+        );
     }
 }
