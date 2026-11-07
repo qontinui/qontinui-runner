@@ -3714,6 +3714,31 @@ impl SessionLifecycleStore {
             .map(|r| r.claude_session_id.clone())
     }
 
+    /// The terminal `claude_session_id` is CURRENTLY running in: its record is
+    /// open and it is the session [`Self::latest_open_on_terminal`]'s ranking
+    /// puts on top of that terminal. `None` for a closed or unknown session, or
+    /// one another session has since replaced on its terminal — a `/clear`
+    /// successor, a typed `claude --resume X`, a fresh `claude` in the shell,
+    /// each of which fires its own SessionStart hook and so outranks it. The
+    /// pane's spawn-time pin plays no part, so a session that adopted a pane
+    /// pinned to another id resolves to that pane.
+    pub fn terminal_running(&self, claude_session_id: &str) -> Option<String> {
+        let m = match self.map.lock() {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(error = %e, "session_lifecycle_store: lock poisoned on terminal_running");
+                return None;
+            }
+        };
+        let rec = m.get(claude_session_id)?;
+        if rec.state != "open" {
+            return None;
+        }
+        let terminal_id = rec.terminal_id.clone();
+        let current = self.ranked_open_id(&m, &terminal_id, |_| true)?;
+        (current == claude_session_id).then_some(terminal_id)
+    }
+
     /// Clone of the record for `claude_session_id`, open or closed.
     pub fn get(&self, claude_session_id: &str) -> Option<TerminalSessionRecord> {
         match self.map.lock() {
@@ -7812,6 +7837,54 @@ mod tests {
             "open",
             "the foreign record the stale id named must NOT be closed"
         );
+    }
+
+    /// A pane's CURRENT session is the one whose SessionStart hook came last,
+    /// whatever the pane was pinned to: a `/clear` successor or a fresh
+    /// `claude` replaces the pinned session, and an adopted session resolves to
+    /// the pane it adopted.
+    #[test]
+    fn terminal_running_names_only_the_current_session_of_a_pane() {
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        let hook = |id: &str| {
+            let mut r = rec(id);
+            r.terminal_id = "term-p".to_string();
+            r.origin = Some(ORIGIN_OBSERVED.to_string());
+            store.record_open(r);
+            store.confirm_session(id);
+            store.note_session_start_hook(id);
+        };
+
+        // The pane's own pinned session P starts.
+        store.record_open(auth_on("pin-p", "term-p"));
+        store.confirm_session("pin-p");
+        store.note_session_start_hook("pin-p");
+        assert_eq!(store.terminal_running("pin-p").as_deref(), Some("term-p"));
+
+        // `/clear` mints Q in the same process: Q is current, P is not.
+        hook("clear-q");
+        store.mark_adopted_from("clear-q", "pin-p");
+        assert_eq!(store.terminal_running("clear-q").as_deref(), Some("term-p"));
+        assert_eq!(
+            store.terminal_running("pin-p"),
+            None,
+            "a /clear successor replaced P"
+        );
+
+        // A fresh `claude` typed into the shell: R is current, Q is not.
+        hook("fresh-r");
+        assert_eq!(store.terminal_running("fresh-r").as_deref(), Some("term-p"));
+        assert_eq!(
+            store.terminal_running("clear-q"),
+            None,
+            "a fresh claude replaced Q"
+        );
+
+        // Closed and unknown sessions run nowhere.
+        store.record_close("fresh-r", "test");
+        assert_eq!(store.terminal_running("fresh-r"), None);
+        assert_eq!(store.terminal_running("never-seen"), None);
     }
 
     /// `latest_open_on_terminal` ranks hook order, then `confirmed_at`, then
