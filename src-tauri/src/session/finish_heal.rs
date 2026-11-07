@@ -200,9 +200,7 @@ pub fn heal_decision(
         return HealDecision::Leave(HealSkip::DifferentRow);
     }
     match row.session_status.as_deref().map(SessionWorkStatus::parse) {
-        Some(SessionWorkStatus::Finished) => {
-            return HealDecision::Leave(HealSkip::CoordFinished)
-        }
+        Some(SessionWorkStatus::Finished) => return HealDecision::Leave(HealSkip::CoordFinished),
         Some(SessionWorkStatus::Working) => {
             return HealDecision::Leave(HealSkip::WorkingRevivalUnprovable)
         }
@@ -327,7 +325,10 @@ pub fn apply_heal(
     fetch: &StatusFetch,
     now_ms: i64,
 ) -> Vec<(String, HealOutcome)> {
-    let ids: Vec<String> = records.iter().map(|r| r.claude_session_id.clone()).collect();
+    let ids: Vec<String> = records
+        .iter()
+        .map(|r| r.claude_session_id.clone())
+        .collect();
     apply_heal_observed(
         store,
         port,
@@ -487,13 +488,15 @@ pub fn spawn_boot_sweep(
         let (Some(store), Some(reg)) = (store.upgrade(), registrar.upgrade()) else {
             return;
         };
-        let outcomes =
-            heal_sweep(&store, Some(reg.as_ref() as &dyn HealPort), None, true).await;
+        let outcomes = heal_sweep(&store, Some(reg.as_ref() as &dyn HealPort), None, true).await;
         note_sweep();
         let resent = outcomes
             .iter()
             .filter(|(_, o)| {
-                matches!(o, HealOutcome::Resent { .. } | HealOutcome::Reoffered { .. })
+                matches!(
+                    o,
+                    HealOutcome::Resent { .. } | HealOutcome::Reoffered { .. }
+                )
             })
             .count();
         info!(
