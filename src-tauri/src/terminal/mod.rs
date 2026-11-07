@@ -27,6 +27,8 @@ pub mod grid;
 pub mod holder_boot_sweep;
 pub mod holder_census;
 #[cfg(test)]
+mod idle_census; // #[ignore]d replay census for the turn-complete recognizer
+#[cfg(test)]
 mod idle_chrome_replay;
 pub mod interceptor;
 pub mod launch_failure; // The identity shim's launch-failure reports (plan 2026-11-10-migration-holds-for-missing-claude-cli)
