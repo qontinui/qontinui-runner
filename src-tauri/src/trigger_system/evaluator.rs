@@ -238,40 +238,17 @@ impl TriggerEvaluator {
         }
     }
 
-    /// Check if the runner is idle (no workflows running).
+    /// Check if the runner is idle (no workflows running), through the shared
+    /// typed `/status` reader (`crate::runner_idle`): idle only on a `data`
+    /// that reads `Ready` with no AI analysis running; anything unreadable
+    /// fails the condition.
     async fn check_idle_condition(&self) -> bool {
-        let client = reqwest::Client::new();
-        let base = match &self.app_state {
-            Some(state) => crate::mcp::types::get_self_base_url(state),
-            None => crate::mcp::types::get_self_base_url_from_env(),
-        };
-        let status_url = format!("{}/status", base);
-        match client
-            .get(&status_url)
-            .timeout(std::time::Duration::from_secs(5))
-            .send()
-            .await
-        {
-            Ok(resp) => {
-                if let Ok(json) = resp.json::<serde_json::Value>().await {
-                    let executor_state = json
-                        .get("executor_state")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("Unknown");
-                    let ai_running = json
-                        .get("ai_analysis_running")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
-                    executor_state == "Ready" && !ai_running
-                } else {
-                    false
-                }
-            }
-            Err(e) => {
-                debug!("Idle condition check failed: {}", e);
-                false
-            }
-        }
+        let base = crate::runner_idle::self_status_base_url(self.app_state.as_deref());
+        let verdict =
+            crate::runner_idle::check_runner_idle(&base, crate::runner_idle::STATUS_PROBE_TIMEOUT)
+                .await;
+        crate::runner_idle::log_verdict("trigger require_idle", &verdict);
+        verdict.is_idle()
     }
 
     /// Check a time window condition.
@@ -444,5 +421,161 @@ mod tests {
         // Record execution end
         eval.record_execution_end("t1").await;
         assert_eq!(eval.get_active_count("t1").await, 0);
+    }
+
+    // ---- `require_idle`, entered through `evaluate` against a stub /status ----
+    //
+    // The condition used to read `/status` at the top level, outside its `data`
+    // envelope, so it never saw `Ready` and an idle-gated trigger never executed
+    // (coord finding `89c8c10e`; plan
+    // `2026-10-24-runner-idle-gate-reads-status-outside-its-envelope` Phase 2).
+    // With no `AppState` the evaluator reaches its own API through
+    // `QONTINUI_PORT`, which the test points at the stub.
+
+    /// The `/status` writer's idle answer.
+    const READY_AND_IDLE: &str =
+        r#"{"success":true,"data":{"executor_state":"Ready","ai_analysis_running":false}}"#;
+
+    /// Every answer that must fail the condition: (case, HTTP status, body).
+    const NOT_IDLE: [(&str, u16, &str); 8] = [
+        (
+            "Ready with AI analysis running",
+            200,
+            r#"{"success":true,"data":{"executor_state":"Ready","ai_analysis_running":true}}"#,
+        ),
+        (
+            "executor Running",
+            200,
+            r#"{"success":true,"data":{"executor_state":"Running","ai_analysis_running":false}}"#,
+        ),
+        (
+            "executor not_started (no bridge)",
+            200,
+            r#"{"success":true,"data":{"executor_state":"not_started","ai_analysis_running":false}}"#,
+        ),
+        (
+            "ai_analysis_running null",
+            200,
+            r#"{"success":true,"data":{"executor_state":"Ready","ai_analysis_running":null}}"#,
+        ),
+        (
+            "ai_analysis_running absent",
+            200,
+            r#"{"success":true,"data":{"executor_state":"Ready"}}"#,
+        ),
+        (
+            "success: false",
+            200,
+            r#"{"success":false,"error":"Internal error"}"#,
+        ),
+        ("HTTP 500 with an idle body", 500, READY_AND_IDLE),
+        (
+            "the old un-enveloped idle shape",
+            200,
+            r#"{"executor_state":"Ready","ai_analysis_running":false}"#,
+        ),
+    ];
+
+    /// What the stub `/status` answers: (HTTP status, body). Swapped per case.
+    type StubReply = Arc<std::sync::Mutex<(u16, &'static str)>>;
+
+    /// A `/status` stub on an ephemeral loopback port. Returns its port and
+    /// the handle that sets its answer.
+    async fn spawn_status_stub() -> (u16, StubReply) {
+        use axum::{extract::State, http::StatusCode, routing::get, Router};
+
+        async fn status(State(reply): State<StubReply>) -> (StatusCode, &'static str) {
+            let (code, body) = *reply.lock().unwrap();
+            (StatusCode::from_u16(code).unwrap(), body)
+        }
+
+        let reply: StubReply = Arc::new(std::sync::Mutex::new((200, "")));
+        let app = Router::new()
+            .route("/status", get(status))
+            .with_state(reply.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (port, reply)
+    }
+
+    /// A loopback port that refuses connections for as long as the returned
+    /// socket lives: bound, never listening, so no parallel test can take it.
+    fn closed_port() -> (u16, tokio::net::TcpSocket) {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let port = socket.local_addr().unwrap().port();
+        (port, socket)
+    }
+
+    /// An enabled webhook trigger with no debounce and no cooldown whose
+    /// conditions are `require_idle` followed by `extra`.
+    fn idle_gated_trigger(extra: Option<TriggerCondition>) -> WorkflowTrigger {
+        let mut trigger = make_trigger("idle-gated", 0, 0, 10);
+        trigger.conditions = vec![TriggerCondition {
+            condition_type: "require_idle".to_string(),
+            config: serde_json::json!({}),
+        }];
+        trigger.conditions.extend(extra);
+        trigger
+    }
+
+    /// One test walks the whole matrix so `QONTINUI_PORT` is mutated, under
+    /// the env lock, for one short window. The idle case is FIRST: it is the
+    /// one the envelope defect starved. Each evaluation uses a fresh evaluator,
+    /// so no debounce or cooldown state carries between cases.
+    #[tokio::test]
+    async fn trigger_idle_gate_fires_only_when_status_data_reads_ready_and_idle() {
+        let _lock = crate::test_env::env_lock();
+        let _env = crate::test_env::EnvVarRestore::capture(&["QONTINUI_PORT"]);
+        let (port, reply) = spawn_status_stub().await;
+        std::env::set_var("QONTINUI_PORT", port.to_string());
+
+        let trigger = idle_gated_trigger(None);
+        let event = make_event(&trigger.id);
+        let not_met = "Condition 'require_idle' not met";
+
+        // Idle executes — twice, so the verdict is stable rather than a first-read fluke.
+        *reply.lock().unwrap() = (200, READY_AND_IDLE);
+        for round in 1..=2 {
+            let result =
+                TriggerEvaluator::evaluate(&TriggerEvaluator::new(), &trigger, &event).await;
+            assert!(
+                matches!(result, EvalResult::Execute),
+                "round {round}: /status data reads Ready with no AI analysis, so the event must execute; got {result:?}"
+            );
+        }
+
+        for (case, code, body) in NOT_IDLE {
+            *reply.lock().unwrap() = (code, body);
+            match TriggerEvaluator::evaluate(&TriggerEvaluator::new(), &trigger, &event).await {
+                EvalResult::ConditionFailed { reason } => assert_eq!(reason, not_met, "{case}"),
+                other => panic!("{case}: the event must not execute, got {other:?}"),
+            }
+        }
+
+        // The conditions stay a conjunction: idle, but outside a time window
+        // that admits no hour, does not execute — and it is the window that fails.
+        *reply.lock().unwrap() = (200, READY_AND_IDLE);
+        let windowed = idle_gated_trigger(Some(TriggerCondition {
+            condition_type: "time_window".to_string(),
+            config: serde_json::json!({"timezone": "UTC", "start_hour": 0, "end_hour": 0}),
+        }));
+        match TriggerEvaluator::evaluate(&TriggerEvaluator::new(), &windowed, &event).await {
+            EvalResult::ConditionFailed { reason } => {
+                assert_eq!(reason, "Condition 'time_window' not met")
+            }
+            other => panic!("idle but outside the time window must not execute, got {other:?}"),
+        }
+
+        // Nothing listening: an unreachable /status is not idle either.
+        let (closed, _held) = closed_port();
+        std::env::set_var("QONTINUI_PORT", closed.to_string());
+        match TriggerEvaluator::evaluate(&TriggerEvaluator::new(), &trigger, &event).await {
+            EvalResult::ConditionFailed { reason } => assert_eq!(reason, not_met, "closed port"),
+            other => panic!("closed port: the event must not execute, got {other:?}"),
+        }
     }
 }
