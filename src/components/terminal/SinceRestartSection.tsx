@@ -53,6 +53,10 @@ const DEFAULT_ACCOUNT = "__default__";
 
 const CHIP: Record<RowState, string> = {
   back: "bg-[#9ece6a]/15 text-[#9ece6a]",
+  "attempted-unverified": "bg-[#e0af68]/15 text-[#e0af68]",
+  "terminal-only": "bg-[#e0af68]/15 text-[#e0af68]",
+  failed: "bg-[#f7768e]/15 text-[#f7768e]",
+  unknown: "bg-[#565f89]/15 text-[#a9b1d6]",
   missing: "bg-[#e0af68]/15 text-[#e0af68]",
   "needs-account": "bg-[#f7768e]/15 text-[#f7768e]",
   finished: "bg-[#565f89]/15 text-[#565f89]",
@@ -92,8 +96,9 @@ function accountText(label: string | null, account: ResumeAccount): string {
 }
 
 /**
- * "2 back · 3 did not come back · 1 waiting · 1 finished" — waiting rows (a
- * page not opened yet, or a drain) are not counted as misses.
+ * "2 back · 3 did not come back · 1 not verified · 1 waiting · 1 finished" —
+ * waiting rows (a page not opened yet, or a drain) are not counted as misses,
+ * and an unverified, bare-terminal, failed or unreadable row is never "back".
  */
 function rowSummary(rows: readonly SinceRestartRow[]): string {
   const count = (pred: (r: SinceRestartRow) => boolean) => rows.filter(pred).length;
@@ -101,6 +106,14 @@ function rowSummary(rows: readonly SinceRestartRow[]): string {
     `${count((r) => r.state === "back")} back`,
     `${count((r) => r.state === "missing" || r.state === "needs-account")} did not come back`,
   ];
+  const unverified = count((r) => r.state === "attempted-unverified");
+  if (unverified > 0) parts.push(`${unverified} not verified`);
+  const terminalOnly = count((r) => r.state === "terminal-only");
+  if (terminalOnly > 0) parts.push(`${terminalOnly} only a terminal`);
+  const failed = count((r) => r.state === "failed");
+  if (failed > 0) parts.push(`${failed} resume failed`);
+  const unknown = count((r) => r.state === "unknown");
+  if (unknown > 0) parts.push(`${unknown} could not be checked`);
   const waiting = count((r) => r.state === "waiting-page" || r.state === "waiting-drain");
   if (waiting > 0) parts.push(`${waiting} waiting`);
   const closedByUser = count((r) => r.state === "closed-by-user");

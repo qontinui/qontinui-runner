@@ -65,11 +65,13 @@
   ],
   "ResumeAccount": ["configDir", "known"],
   "LedgerGeneration": [
+    "attemptedUnverified",
     "bootAtMs",
     "capturedAt",
     "capturedAtMs",
     "cleanShutdown",
     "closedByUser",
+    "failed",
     "file",
     "finished",
     "missing",
@@ -77,13 +79,17 @@
     "returned",
     "rotatedAtMs",
     "sessionCount",
+    "terminalOnly",
     "thisBoot",
+    "unknown",
     "verdict"
   ],
   "LedgerReport": [
+    "attemptedUnverified",
     "closedByUser",
     "current",
     "expected",
+    "failed",
     "finished",
     "generatedAt",
     "generations",
@@ -96,6 +102,8 @@
     "savedAtMs",
     "savedMatchesCurrent",
     "status",
+    "terminalOnly",
+    "unknown",
     "verdict"
   ],
   "LedgerCapture": ["ledger", "path", "persisted"]

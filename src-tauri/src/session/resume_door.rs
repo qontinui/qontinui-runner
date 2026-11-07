@@ -77,6 +77,7 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
+use super::claude_process_read::{self as proc_read, ProcessEvidence, ResumeExpectation};
 use super::session_lifecycle_store::{SessionLifecycleStore, TerminalSessionRecord};
 use super::SessionRegistry;
 use crate::coord_drain_state::{DrainGate, SpawnOrigin};
@@ -168,18 +169,6 @@ impl ResumeRow {
     }
 }
 
-/// What reading the process table showed about the resumed session.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct ProcessEvidence {
-    pub terminal_id: String,
-    pub pid: Option<u32>,
-    pub cmdline: Option<String>,
-    /// `null` = this platform could not say (never a guess).
-    pub cwd: Option<String>,
-    /// `null` = this platform could not say (never a guess).
-    pub claude_config_dir: Option<String>,
-}
-
 #[derive(Debug, Serialize)]
 pub struct ResumeReport {
     pub generation: Option<String>,
@@ -205,6 +194,17 @@ struct Candidate {
     title: String,
     page_id: String,
     zone_index: i32,
+}
+
+impl Candidate {
+    /// What the resumed `claude` must look like for [`proc_read::judge`].
+    fn expectation(&self) -> ResumeExpectation<'_> {
+        ResumeExpectation {
+            session_id: &self.id,
+            working_dir: Some(&self.working_dir),
+            config_dir: Some(&self.config_dir),
+        }
+    }
 }
 
 /// Why a lifecycle row cannot be resumed, or the candidate it yields.
@@ -334,101 +334,6 @@ fn live_gateway_refusal() -> Option<String> {
     gateway_refusal(crate::model_gateway::gateway_declared())
 }
 
-/// One live `claude` process as read from the process table.
-#[derive(Debug, Clone)]
-struct ClaudeProc {
-    pid: u32,
-    cmdline: String,
-    cwd: Option<String>,
-    config_dir: Option<String>,
-}
-
-/// `Ok` only when exactly one `claude --resume <id>` is present and every
-/// fact the platform could read agrees with the row. `Err(None)` = not there
-/// YET (keep polling); `Err(Some(reason))` = wrong, stop.
-fn judge(
-    procs: &[ClaudeProc],
-    cand: &Candidate,
-    terminal_id: &str,
-) -> Result<ProcessEvidence, Option<String>> {
-    let matching: Vec<&ClaudeProc> = procs
-        .iter()
-        .filter(|p| {
-            crate::process_capture::process_tree::parse_session_id_from_cmdline(&p.cmdline)
-                .as_deref()
-                == Some(cand.id.as_str())
-        })
-        .collect();
-    let p = match matching.as_slice() {
-        [] => return Err(None),
-        [one] => *one,
-        many => return Err(Some(format!("multiple_resume_processes({})", many.len()))),
-    };
-    if let Some(cwd) = &p.cwd {
-        if !same_path(cwd, &cand.working_dir) {
-            return Err(Some(format!(
-                "cwd_mismatch(want {}, got {cwd})",
-                cand.working_dir
-            )));
-        }
-    }
-    if let Some(dir) = &p.config_dir {
-        if !same_path(dir, &cand.config_dir) {
-            return Err(Some(format!(
-                "config_dir_mismatch(want {}, got {dir})",
-                cand.config_dir
-            )));
-        }
-    }
-    Ok(ProcessEvidence {
-        terminal_id: terminal_id.to_string(),
-        pid: Some(p.pid),
-        cmdline: Some(p.cmdline.clone()),
-        cwd: p.cwd.clone(),
-        claude_config_dir: p.config_dir.clone(),
-    })
-}
-
-/// Path equality tolerant of trailing separators, `\` vs `/`, and symlinks
-/// where both sides resolve. Case-insensitive only where the filesystem is
-/// (Windows, macOS): on Linux `/Work` and `/work` are different directories,
-/// and calling them equal would pass a resume pinned to the wrong tree.
-fn same_path(a: &str, b: &str) -> bool {
-    same_path_with(a, b, cfg!(any(windows, target_os = "macos")))
-}
-
-fn same_path_with(a: &str, b: &str, case_insensitive: bool) -> bool {
-    let norm = |s: &str| {
-        let canon = std::fs::canonicalize(s)
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|_| s.to_string());
-        let canon = canon.replace('\\', "/").trim_end_matches('/').to_string();
-        if case_insensitive {
-            canon.to_lowercase()
-        } else {
-            canon
-        }
-    };
-    norm(a) == norm(b)
-}
-
-/// `CLAUDE_CONFIG_DIR` of a live process. Linux only (`/proc/<pid>/environ`);
-/// elsewhere `None`, which is "could not say", never a match.
-#[cfg(target_os = "linux")]
-fn config_dir_of_pid(pid: u32) -> Option<String> {
-    let bytes = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
-    bytes
-        .split(|b| *b == 0)
-        .filter_map(|kv| std::str::from_utf8(kv).ok())
-        .find_map(|kv| kv.strip_prefix("CLAUDE_CONFIG_DIR=").map(str::to_string))
-        .filter(|s| !s.is_empty())
-}
-
-#[cfg(not(target_os = "linux"))]
-fn config_dir_of_pid(_pid: u32) -> Option<String> {
-    None
-}
-
 // ---------------------------------------------------------------------------
 // Double-spawn guards
 // ---------------------------------------------------------------------------
@@ -462,14 +367,38 @@ impl Drop for InFlight {
     }
 }
 
-/// Pure: the pid of a `claude` among `procs` (`(pid, cmdline)`) that is
-/// already running session `id`.
-fn holder_of(procs: &[(u32, String)], id: &str) -> Option<u32> {
-    procs.iter().find_map(|(pid, cmd)| {
-        (crate::process_capture::process_tree::parse_session_id_from_cmdline(cmd).as_deref()
+/// Pure: the pid of a `claude` among `procs` that is already running session
+/// `id`.
+fn holder_of(procs: &[proc_read::ClaudeProc], id: &str) -> Option<u32> {
+    procs.iter().find_map(|p| {
+        (crate::process_capture::process_tree::parse_session_id_from_cmdline(&p.cmdline).as_deref()
             == Some(id))
-        .then_some(*pid)
+        .then_some(p.pid)
     })
+}
+
+/// Pure: [`holder_of`] over the machine's `claude` pids and their command
+/// lines. A pid that may be ours with no readable command line (a WMI
+/// timeout, an unreadable `/proc/<pid>/cmdline`) could be the holder, so the
+/// answer is `Err` — a refusal of this one door call — never "nobody holds
+/// it". A pid that is gone (exited, a zombie) or another user's cannot be
+/// this user's claude on this transcript, and does not refuse
+/// ([`proc_read::pid_presence`]).
+fn holder_among(
+    pids: &[u32],
+    cmdlines: &std::collections::HashMap<u32, String>,
+    presence: impl Fn(u32) -> proc_read::PidPresence,
+    id: &str,
+) -> Result<Option<u32>, String> {
+    let procs = proc_read::pane_read_of(
+        pids,
+        cmdlines,
+        &std::collections::HashMap::new(),
+        |_| None,
+        presence,
+    )
+    .map_err(|_| "process_cmdline_unreadable".to_string())?;
+    Ok(holder_of(&procs, id))
 }
 
 /// Is any live `claude` on this machine already running session `id`
@@ -478,10 +407,9 @@ fn holder_of(procs: &[(u32, String)], id: &str) -> Option<u32> {
 /// live session is a second process writing one transcript.
 async fn live_holder(id: &str) -> Result<Option<u32>, String> {
     use crate::process_capture::process_tree as pt;
-    let snap = pt::snapshot_process_table_public().await;
-    if snap.names.is_empty() {
-        return Err("process_table_unreadable".to_string());
-    }
+    let snap = proc_read::snapshot()
+        .await
+        .map_err(|_| "process_table_unreadable".to_string())?;
     let pids: Vec<u32> = snap
         .names
         .keys()
@@ -489,38 +417,12 @@ async fn live_holder(id: &str) -> Result<Option<u32>, String> {
         .filter(|p| pt::is_countable_claude(*p, &snap))
         .collect();
     let cmdlines = pt::command_lines_for_pids(&pids).await;
-    let procs: Vec<(u32, String)> = cmdlines.into_iter().collect();
-    Ok(holder_of(&procs, id))
+    holder_among(&pids, &cmdlines, proc_read::pid_presence, id)
 }
 
 // ---------------------------------------------------------------------------
 // I/O: the spawn site
 // ---------------------------------------------------------------------------
-
-/// Read the claude processes under `terminal_id`'s pane.
-async fn read_claude_procs(
-    tm: &Arc<TerminalManager>,
-    terminal_id: &str,
-) -> Option<Vec<ClaudeProc>> {
-    use crate::process_capture::process_tree as pt;
-    let root = tm.get(terminal_id)?.child_pid()?;
-    let snap = pt::snapshot_process_table_public().await;
-    let pids = pt::claude_pids_in_inclusive_subtree(root, &snap);
-    let cmdlines = pt::command_lines_for_pids(&pids).await;
-    let cwds = pt::working_directories_for_pids(&pids).await;
-    Some(
-        pids.into_iter()
-            .filter_map(|pid| {
-                Some(ClaudeProc {
-                    pid,
-                    cmdline: cmdlines.get(&pid)?.clone(),
-                    cwd: cwds.get(&pid).cloned(),
-                    config_dir: config_dir_of_pid(pid),
-                })
-            })
-            .collect(),
-    )
-}
 
 /// Poll the process table until the resumed claude is proven (or disproven).
 async fn verify(
@@ -533,8 +435,9 @@ async fn verify(
         if tm.get(terminal_id).is_none() {
             return Err("pane_vanished_before_claude_appeared".to_string());
         }
-        if let Some(procs) = read_claude_procs(tm, terminal_id).await {
-            match judge(&procs, cand, terminal_id) {
+        // An unreadable pane is not an answer either way: keep polling.
+        if let Ok(procs) = proc_read::read_claude_procs(tm, terminal_id).await {
+            match proc_read::judge(&procs, &cand.expectation(), terminal_id) {
                 Ok(ev) => return Ok(ev),
                 Err(Some(reason)) => return Err(reason),
                 Err(None) => {}
@@ -936,6 +839,21 @@ mod tests {
         assert_eq!((ok.config_dir.as_str(), ok.zone_index), ("/cfg", 2));
     }
 
+    /// CHARACTERISATION — documents CURRENT behaviour, not the target (plan
+    /// `2026-11-04-unplanned-restart-restore-is-page-gated-and-counts-unverified-resumes`,
+    /// Phase 0 (i)). After an unplanned restart an `open` row stays bound to a
+    /// terminal id that no longer exists in this process, and the door refuses
+    /// it `not_closed` — the 29 rows of 2026-11-04. `classify` reads only the
+    /// row, so the absent terminal changes nothing. Phase 2 (D3) widens
+    /// `classify` for this boot's dead-bound rows and flips this assertion.
+    #[test]
+    fn classify_refuses_an_open_row_whose_bound_terminal_is_absent_not_closed() {
+        let mut dead_bound = rec("open");
+        dead_bound.closed_at = None;
+        dead_bound.terminal_id = "term-from-the-previous-process".to_string();
+        assert_eq!(reason(classify(ID, Some(&dead_bound))), "not_closed");
+    }
+
     #[test]
     fn select_ids_defaults_to_closed_unfinished_newest_first_and_dedups_explicit() {
         let mut a = rec("closed");
@@ -1020,26 +938,40 @@ mod tests {
 
     #[test]
     fn a_live_claude_on_the_id_is_found_by_its_cmdline() {
-        let procs = vec![
+        use proc_read::PidPresence::Ours;
+        let cmdlines: std::collections::HashMap<u32, String> = [
             (
                 7,
                 "/bin/claude --resume 11111111-1111-4111-8111-111111111111".to_string(),
             ),
             (9, format!("/bin/claude --session-id {ID}")),
-        ];
-        assert_eq!(holder_of(&procs, ID), Some(9));
-        assert_eq!(holder_of(&procs[..1], ID), None);
-        assert_eq!(holder_of(&[], ID), None);
+        ]
+        .into();
+        assert_eq!(holder_among(&[7, 9], &cmdlines, |_| Ours, ID), Ok(Some(9)));
+        assert_eq!(holder_among(&[7], &cmdlines, |_| Ours, ID), Ok(None));
+        assert_eq!(holder_among(&[], &cmdlines, |_| Ours, ID), Ok(None));
     }
 
+    /// A claude whose command line cannot be read might be the holder: the
+    /// door refuses rather than conclude "nobody holds it" and fork the
+    /// transcript. A pid that exited (or a zombie) is gone, and another
+    /// user's claude cannot be the holder, so neither refuses.
     #[test]
-    fn path_case_folds_only_where_the_filesystem_does() {
-        assert!(same_path_with("/Work/Proj", "/work/proj", true));
-        assert!(!same_path_with("/Work/Proj", "/work/proj", false));
-        assert!(same_path_with("/work/proj/", "/work/proj", false));
+    fn an_unreadable_cmdline_refuses_rather_than_reads_as_no_holder() {
+        use proc_read::PidPresence::{Foreign, Gone, Ours};
+        let none = std::collections::HashMap::new();
         assert_eq!(
-            same_path("/Work/Proj", "/work/proj"),
-            cfg!(any(windows, target_os = "macos"))
+            holder_among(&[7], &none, |_| Ours, ID),
+            Err("process_cmdline_unreadable".to_string())
+        );
+        assert_eq!(holder_among(&[7], &none, |_| Gone, ID), Ok(None));
+        assert_eq!(holder_among(&[7], &none, |_| Foreign, ID), Ok(None));
+        // One foreign unreadable claude does not hide a readable holder.
+        let cmd: std::collections::HashMap<u32, String> =
+            [(9, format!("/bin/claude --resume {ID}"))].into();
+        assert_eq!(
+            holder_among(&[7, 9], &cmd, |p| if p == 7 { Foreign } else { Ours }, ID),
+            Ok(Some(9))
         );
     }
 
@@ -1070,56 +1002,6 @@ mod tests {
             admit(DrainGate::Allow, permits),
             Err("cap_reached".to_string())
         );
-    }
-
-    fn cand() -> Candidate {
-        classify(ID, Some(&rec("closed"))).unwrap()
-    }
-
-    fn proc(cmd: &str, cwd: Option<&str>, cfg: Option<&str>) -> ClaudeProc {
-        ClaudeProc {
-            pid: 42,
-            cmdline: cmd.to_string(),
-            cwd: cwd.map(String::from),
-            config_dir: cfg.map(String::from),
-        }
-    }
-
-    #[test]
-    fn judge_requires_exactly_one_matching_resume_process() {
-        let good = format!("/bin/claude --permission-mode bypassPermissions --resume {ID}");
-        // Not there yet: keep polling.
-        assert_eq!(judge(&[], &cand(), "t").unwrap_err(), None);
-        let other = "/bin/claude --resume 11111111-1111-4111-8111-111111111111";
-        assert_eq!(
-            judge(&[proc(other, None, None)], &cand(), "t").unwrap_err(),
-            None
-        );
-        // One match, unreadable cwd/config: accepted, fields stay null.
-        let ev = judge(&[proc(&good, None, None)], &cand(), "t").unwrap();
-        assert_eq!(
-            (ev.pid, ev.cwd, ev.claude_config_dir),
-            (Some(42), None, None)
-        );
-        // Two matches: a double spawn is a failure, not a success.
-        let two = [proc(&good, None, None), proc(&good, None, None)];
-        assert_eq!(
-            judge(&two, &cand(), "t").unwrap_err(),
-            Some("multiple_resume_processes(2)".to_string())
-        );
-    }
-
-    #[test]
-    fn judge_fails_on_a_wrong_cwd_or_config_dir_but_not_on_unknown() {
-        let good = format!("claude --resume {ID}");
-        let bad_cwd = judge(&[proc(&good, Some("/elsewhere"), None)], &cand(), "t");
-        assert!(bad_cwd.unwrap_err().unwrap().starts_with("cwd_mismatch"));
-        let bad_cfg = judge(&[proc(&good, Some("/work"), Some("/other"))], &cand(), "t");
-        assert!(bad_cfg
-            .unwrap_err()
-            .unwrap()
-            .starts_with("config_dir_mismatch"));
-        assert!(judge(&[proc(&good, Some("/work/"), Some("/cfg"))], &cand(), "t").is_ok());
     }
 
     #[test]
