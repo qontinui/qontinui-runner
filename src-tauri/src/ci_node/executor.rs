@@ -33,8 +33,10 @@
 //! [`super::step_env`]: the model-credential class, every inherited
 //! `*_MODEL_CMD` key and the runner's own credential values are removed before
 //! the step's `env` and the executor's exports are applied, and every step gets
-//! `CLAUDE_CONFIG_DIR` pointed at an empty per-dispatch directory, so a
-//! `claude` inside a step starts with no login. Provisioning children (tools,
+//! `CLAUDE_CONFIG_DIR` pointed at an empty directory of its own under the
+//! dispatch root, so a `claude` inside a step starts with no login. `HOME` is
+//! still inherited, so this is not a sandbox: see the module docs of
+//! [`super::step_env`] for what it does not stop. Provisioning children (tools,
 //! siblings, services) are handled differently: they do not pass through that
 //! scrub, and plan
 //! `2026-11-06-ci-node-provisioning-children-inherit-only-an-allowlisted-environment`
@@ -548,14 +550,15 @@ pub(crate) async fn run_dispatch(
         sink.push(&line);
     }
 
-    // The directory cleanup removes whole. Each step's empty
-    // `CLAUDE_CONFIG_DIR` is made under it (see `run_step`).
+    // The directory cleanup removes whole. Each step's own empty
+    // `CLAUDE_CONFIG_DIR` is made under it, keyed by the step's index (see
+    // `run_step`).
     let dispatch_root = super::checkout::ci_dispatch_root(&root, &payload.dispatch_id);
 
     // ── Steps (sequential; first failure short-circuits) ──
     let mut overall = StepOutcome::Success;
     let mut result_reason: Option<&'static str> = None;
-    for step in &manifest.steps {
+    for (step_index, step) in manifest.steps.iter().enumerate() {
         if cancel.is_cancelled() {
             overall = StepOutcome::Cancelled;
             break;
@@ -572,6 +575,7 @@ pub(crate) async fn run_dispatch(
             step,
             &dispatch_env,
             &dispatch_root,
+            step_index,
             &worktree,
             &ci_job,
             &sink,
@@ -948,12 +952,15 @@ fn tool_path(tool_dirs: &[PathBuf]) -> Option<String> {
 
 /// Run one step: spawn, pump output, enforce timeout + cancellation.
 ///
-/// `dispatch_root` is the directory the dispatch's cleanup removes whole; the
-/// step's empty `CLAUDE_CONFIG_DIR` is made under it (see [`super::step_env`]).
+/// `dispatch_root` is the directory the dispatch's cleanup removes whole, and
+/// `step_index` keys the step's own empty `CLAUDE_CONFIG_DIR` under it (see
+/// [`super::step_env`]).
+#[allow(clippy::too_many_arguments)]
 async fn run_step(
     step: &CiStep,
     dispatch_env: &DispatchEnv,
     dispatch_root: &Path,
+    step_index: usize,
     worktree: &Path,
     ci_job: &CiJob,
     sink: &ProgressSink,
@@ -967,14 +974,32 @@ async fn run_step(
         }
     };
 
-    // Emptied again before EVERY step, so one step cannot plant a login for
-    // the next. No empty directory, no step: it never runs pointed at one that
-    // is not empty.
-    let config_dir = match super::step_env::fresh_empty_config_dir(dispatch_root) {
-        Ok(d) => d,
-        Err(e) => {
-            sink.push(&format!("[ci-node] step {}: {e}", step.name));
-            return StepOutcome::Failure;
+    // A config dir of this step's own, recreated empty just before it runs. A
+    // `claude` here finds no login, and a process an EARLIER step left running
+    // writes where ITS `CLAUDE_CONFIG_DIR` points, which is that step's
+    // directory, never this one. It does not stop a step from writing anywhere
+    // else the node owner can. No empty directory, no step: it never runs
+    // pointed at one that is not empty. Filesystem work, so on the blocking
+    // pool, like the dispatch-root delete in `checkout`.
+    let config_dir = {
+        let root = dispatch_root.to_path_buf();
+        match tokio::task::spawn_blocking(move || {
+            super::step_env::fresh_empty_config_dir(&root, step_index)
+        })
+        .await
+        {
+            Ok(Ok(dir)) => dir,
+            Ok(Err(e)) => {
+                sink.push(&format!("[ci-node] step {}: {e}", step.name));
+                return StepOutcome::Failure;
+            }
+            Err(e) => {
+                sink.push(&format!(
+                    "[ci-node] step {}: preparing its empty CLAUDE_CONFIG_DIR did not complete: {e}",
+                    step.name
+                ));
+                return StepOutcome::Failure;
+            }
         }
     };
 
@@ -1563,10 +1588,10 @@ mod tests {
             .collect()
     }
 
-    /// Step 2: list `CLAUDE_CONFIG_DIR` (`entry=<name>` per entry), plant a
-    /// file `planted` in it, print `S2-PLANTED`, list it again, print
-    /// `S2-DONE`. With the variable unset it touches nothing (never `/planted`)
-    /// and prints only `S2-DONE`.
+    /// Step 2: print `cfg=<CLAUDE_CONFIG_DIR>`, list it (`entry=<name>` per
+    /// entry), plant a file `planted` in it, print `S2-PLANTED`, list it again,
+    /// print `S2-DONE`. With the variable unset it touches nothing (never
+    /// `/planted`).
     fn plant_command() -> Vec<String> {
         #[cfg(not(windows))]
         {
@@ -1575,7 +1600,7 @@ mod tests {
                 "sh".to_string(),
                 "-c".to_string(),
                 format!(
-                    r#"D=${{CLAUDE_CONFIG_DIR:-}}; if [ -n "$D" ]; then {list}; touch "$D/planted"; echo S2-PLANTED; {list}; fi; echo S2-DONE"#
+                    r#"D=${{CLAUDE_CONFIG_DIR:-}}; echo "cfg=$D"; if [ -n "$D" ]; then {list}; touch "$D/planted"; echo S2-PLANTED; {list}; fi; echo S2-DONE"#
                 ),
             ]
         }
@@ -1584,29 +1609,32 @@ mod tests {
             let list =
                 "Get-ChildItem -Force -LiteralPath $d | ForEach-Object { 'entry=' + $_.Name }";
             powershell(format!(
-                "$d = $env:CLAUDE_CONFIG_DIR; if ($d) {{ {list}; \
+                "$d = $env:CLAUDE_CONFIG_DIR; 'cfg=' + $d; if ($d) {{ {list}; \
                  New-Item -ItemType File -Path (Join-Path $d 'planted') | Out-Null; \
                  'S2-PLANTED'; {list} }}; 'S2-DONE'"
             ))
         }
     }
 
-    /// Step 3: list `CLAUDE_CONFIG_DIR` again (`entry=<name>` per entry), then
-    /// print `S3-DONE`.
+    /// Step 3: print `cfg=<CLAUDE_CONFIG_DIR>`, then `dir-ok` when that is an
+    /// existing directory, then list it (`entry=<name>` per entry), then print
+    /// `S3-DONE`.
     fn list_command() -> Vec<String> {
         #[cfg(not(windows))]
         {
             vec![
                 "sh".to_string(),
                 "-c".to_string(),
-                r#"D=${CLAUDE_CONFIG_DIR:-}; if [ -n "$D" ]; then ls -A "$D" | while IFS= read -r e; do echo "entry=$e"; done; fi; echo S3-DONE"#
+                r#"D=${CLAUDE_CONFIG_DIR:-}; echo "cfg=$D"; if [ -d "$D" ]; then echo dir-ok; fi; if [ -n "$D" ]; then ls -A "$D" | while IFS= read -r e; do echo "entry=$e"; done; fi; echo S3-DONE"#
                     .to_string(),
             ]
         }
         #[cfg(windows)]
         {
             powershell(
-                "$d = $env:CLAUDE_CONFIG_DIR; if ($d) { Get-ChildItem -Force -LiteralPath $d | \
+                "$d = $env:CLAUDE_CONFIG_DIR; 'cfg=' + $d; \
+                 if ($d -and (Test-Path -LiteralPath $d -PathType Container)) { 'dir-ok' }; \
+                 if ($d) { Get-ChildItem -Force -LiteralPath $d | \
                  ForEach-Object { 'entry=' + $_.Name } }; 'S3-DONE'"
                     .to_string(),
             )
@@ -1617,8 +1645,9 @@ mod tests {
     /// convention test below pins as `run_dispatch`'s only step path): a
     /// credential the RUNNER process holds never reaches a CI step, whichever
     /// class it belongs to, and every step gets `CLAUDE_CONFIG_DIR` pointed at
-    /// an empty per-dispatch directory, emptied again before each step. A step
-    /// whose empty directory cannot be made does not run at all.
+    /// an empty directory of its own under the dispatch root, so what step 2
+    /// plants is not where step 3 is pointed. A step whose empty directory
+    /// cannot be made does not run at all.
     #[tokio::test]
     async fn a_ci_step_inherits_no_scrubbed_credential_and_gets_an_empty_config_dir() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1665,12 +1694,13 @@ mod tests {
             (probe_step("s4", env_probe_command()), file_root.as_path()),
         ];
         let mut outcomes = Vec::new();
-        for (step, step_dispatch_root) in &steps {
+        for (step_index, (step, step_dispatch_root)) in steps.iter().enumerate() {
             outcomes.push(
                 run_step(
                     step,
                     &dispatch_env,
                     step_dispatch_root,
+                    step_index,
                     &worktree,
                     &ci_job,
                     &sink,
@@ -1728,27 +1758,54 @@ mod tests {
             "a scrubbed name reached a CI step: {leaked:?}"
         );
 
-        // Whatever this test process's own CLAUDE_CONFIG_DIR is.
-        let pinned = dispatch_root
-            .join(".ci-claude-config")
-            .to_string_lossy()
-            .into_owned();
-        let cfg: Vec<&str> = out1.iter().filter_map(|l| l.strip_prefix("cfg=")).collect();
-        assert_eq!(
-            cfg,
-            [pinned.as_str()],
-            "the step did not get the pinned empty CLAUDE_CONFIG_DIR"
+        // Every step got a pinned CLAUDE_CONFIG_DIR inside the dispatch unit
+        // cleanup deletes, whatever this test process's own value is.
+        let parent = dispatch_root.join(".ci-claude-config");
+        let cfg_of = |out: &[String]| -> Vec<String> {
+            out.iter()
+                .filter_map(|l| l.strip_prefix("cfg="))
+                .map(str::to_string)
+                .collect()
+        };
+        let cfgs = [cfg_of(&out1), cfg_of(&out2), cfg_of(&out3)];
+        for (step_index, cfg) in cfgs.iter().enumerate() {
+            assert!(
+                cfg.len() == 1 && !cfg[0].is_empty() && Path::new(&cfg[0]).starts_with(&parent),
+                "step {} did not get a pinned CLAUDE_CONFIG_DIR under {}: {cfg:?}",
+                step_index + 1,
+                parent.display()
+            );
+        }
+        // Each step's own: a process step 2 left running would write into a
+        // directory step 3 is not pointed at.
+        assert_ne!(
+            cfgs[1], cfgs[2],
+            "steps 2 and 3 were pointed at the same CLAUDE_CONFIG_DIR"
         );
+        for (step_index, cfg) in cfgs.iter().enumerate() {
+            assert_eq!(
+                cfg[0],
+                parent.join(step_index.to_string()).to_string_lossy(),
+                "step {} is not in its own per-step config dir",
+                step_index + 1
+            );
+        }
 
+        let without_cfg = |out: &[String]| -> Vec<String> {
+            out.iter()
+                .filter(|l| !l.starts_with("cfg="))
+                .cloned()
+                .collect()
+        };
         assert_eq!(
-            out2,
+            without_cfg(&out2),
             ["S2-PLANTED", "entry=planted", "S2-DONE"],
-            "step 2 must find the dir empty, then see only the file it planted"
+            "step 2 must find its dir empty, then see only the file it planted"
         );
         assert_eq!(
-            out3,
-            ["S3-DONE"],
-            "step 3 inherited step 2's planted file: the dir was not emptied between steps"
+            without_cfg(&out3),
+            ["dir-ok", "S3-DONE"],
+            "step 3's dir must exist and be empty: it is not step 2's"
         );
 
         assert!(
@@ -1882,9 +1939,11 @@ mod tests {
 
     /// THE STEP PATH IS ONE PATH. The end-to-end test enters at `run_step`;
     /// this pins that `run_dispatch` reaches a step only through it, that
-    /// `run_step` spawns only through `spawn_step_child`, and that both of
-    /// `spawn_step_child`'s commands get the scrub through `apply_step_env`.
-    /// A new caller, a wrapper or a second spawn path turns it red. Scans this
+    /// `run_step` spawns only through `spawn_step_child`, that both of
+    /// `spawn_step_child`'s commands get the scrub through `apply_step_env`,
+    /// and that `build_step_command` is called nowhere else, so no step command
+    /// is built off this path. A new caller, a wrapper or a second spawn path
+    /// turns it red. Scans this
     /// file only: `env_agent/apply_versions.rs` has an unrelated `run_step`.
     #[test]
     fn the_step_path_is_run_dispatch_then_run_step_then_spawn_step_child() {
@@ -1905,6 +1964,13 @@ mod tests {
             calls_of(production, "apply_step_env"),
             ["spawn_step_child", "spawn_step_child"],
             "apply_step_env must be called exactly twice, both by spawn_step_child"
+        );
+        // And no step command is built anywhere else, so none can bypass the
+        // scrub on its way to a spawn.
+        assert_eq!(
+            calls_of(production, "build_step_command"),
+            ["spawn_step_child", "spawn_step_child"],
+            "build_step_command must be called exactly twice, both by spawn_step_child"
         );
     }
 }

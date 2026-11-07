@@ -17,10 +17,25 @@
 //!
 //! Removing `CLAUDE_CONFIG_DIR` alone would let a `claude` run inside a step
 //! fall back to the default config dir under the inherited `HOME`: the owner's
-//! login. So the executor then SETS it, for every step, to an empty
-//! per-dispatch directory ([`fresh_empty_config_dir`]), and a `claude` in a
-//! step starts with no login. Removals are applied before any variable is set,
-//! so that executor-owned value is set rather than removed.
+//! login. So the executor then SETS it, for every step, to a directory of that
+//! step's own, `<dispatch root>/.ci-claude-config/<step index>`, recreated
+//! empty just before the step runs ([`fresh_empty_config_dir`]). A `claude` in
+//! a step therefore starts with no login, and a process an earlier step left
+//! running writes where ITS `CLAUDE_CONFIG_DIR` points: that step's directory,
+//! which no later step is pointed at. The parent sits inside the dispatch root,
+//! which the dispatch's cleanup removes whole. Removals are applied before any
+//! variable is set, so that executor-owned value is set rather than removed.
+//!
+//! ## What this does not do
+//!
+//! `HOME` is still inherited. The scrub stops a `claude` in a step from picking
+//! up the owner's login BY DEFAULT; it does not stop repo code from finding
+//! `~/.claude*`, or any other file the node owner can read, by path. A step
+//! runs as the node owner's OS user, and this module is not a sandbox. Its
+//! scope is parity with ci-exec's step scrub (plan
+//! `2026-10-13-ci-node-runs-model-dependent-eval-steps` D11), plus the
+//! per-step directory above, which is stricter than ci-exec's one directory
+//! per dispatch.
 //!
 //! ## A port, with a known end
 //!
@@ -106,8 +121,8 @@ const MODEL_COMMAND_SUFFIX: &str = "_MODEL_CMD";
 /// The variable the executor pins, for every step, to an empty directory.
 pub(crate) const CLAUDE_CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
 
-/// The name of the per-dispatch empty config directory, under the dispatch
-/// root (which cleanup removes whole).
+/// The per-dispatch parent of every step's empty config directory, under the
+/// dispatch root (which cleanup removes whole).
 const EMPTY_CONFIG_DIR_NAME: &str = ".ci-claude-config";
 
 /// Whether `key` names a model command. On Windows, where environment names
@@ -178,20 +193,51 @@ pub(crate) fn current_step_env_removals() -> Vec<OsString> {
     )
 }
 
-/// (Re)create the empty `CLAUDE_CONFIG_DIR` a step gets, under the dispatch
-/// root. Called before EVERY step, so a step that wrote into it cannot hand its
-/// files to the next one. `Err` means no empty directory could be guaranteed:
-/// the caller fails the step rather than run it with the variable pointing
-/// somewhere that is not empty.
-pub(crate) fn fresh_empty_config_dir(dispatch_root: &Path) -> Result<PathBuf, String> {
-    let dir = dispatch_root.join(EMPTY_CONFIG_DIR_NAME);
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir)
-            .map_err(|e| format!("could not empty {}: {e}", dir.display()))?;
+/// (Re)create the empty `CLAUDE_CONFIG_DIR` of the step at `step_index`:
+/// `<dispatch_root>/.ci-claude-config/<step_index>`, a directory of that step's
+/// own, so a process an earlier step left running writes into the earlier
+/// step's directory and never into this one. Whatever already sits at the path
+/// is replaced, never followed: a real directory is removed whole, and anything
+/// else (a regular file, or a symlink, broken or not) is unlinked, so a link
+/// planted there cannot empty, or hand the step, the directory it points at.
+///
+/// `Err` means no empty directory could be guaranteed: the caller fails the
+/// step rather than run it with the variable pointing somewhere that is not
+/// empty.
+pub(crate) fn fresh_empty_config_dir(
+    dispatch_root: &Path,
+    step_index: usize,
+) -> Result<PathBuf, String> {
+    let dir = dispatch_root
+        .join(EMPTY_CONFIG_DIR_NAME)
+        .join(step_index.to_string());
+    match std::fs::symlink_metadata(&dir) {
+        Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(&dir)
+            .map_err(|e| format!("could not empty {}: {e}", dir.display()))?,
+        Ok(meta) => remove_non_directory(&dir, &meta)
+            .map_err(|e| format!("could not remove {}: {e}", dir.display()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("could not inspect {}: {e}", dir.display())),
     }
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("could not create {}: {e}", dir.display()))?;
     Ok(dir)
+}
+
+/// Remove an entry `symlink_metadata` says is not a real directory: a regular
+/// file or a symlink, unlinked itself and never followed. Windows refuses
+/// `remove_file` on a directory symlink or junction, which `remove_dir` removes
+/// (again without following it).
+#[cfg_attr(not(windows), allow(unused_variables))]
+fn remove_non_directory(path: &Path, meta: &std::fs::Metadata) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileTypeExt;
+        if meta.file_type().is_symlink_dir() {
+            return std::fs::remove_dir(path);
+        }
+    }
+    std::fs::remove_file(path)
 }
 
 #[cfg(test)]
@@ -388,25 +434,86 @@ mod tests {
     }
 
     #[test]
-    fn the_config_dir_is_recreated_empty_and_a_file_root_is_refused() {
+    fn each_step_gets_its_own_config_dir_recreated_empty() {
         let tmp = tempfile::tempdir().unwrap();
-        let dir = fresh_empty_config_dir(tmp.path()).unwrap();
-        assert_eq!(dir, tmp.path().join(".ci-claude-config"));
-        assert!(dir.is_dir(), "the config dir was not created");
+        let first = fresh_empty_config_dir(tmp.path(), 0).unwrap();
+        assert_eq!(first, tmp.path().join(".ci-claude-config").join("0"));
+        assert!(first.is_dir(), "the config dir was not created");
 
-        std::fs::write(dir.join(".credentials.json"), "x").unwrap();
-        let again = fresh_empty_config_dir(tmp.path()).unwrap();
-        assert_eq!(again, dir);
+        std::fs::write(first.join(".credentials.json"), "x").unwrap();
+        let again = fresh_empty_config_dir(tmp.path(), 0).unwrap();
+        assert_eq!(again, first);
         assert_eq!(
             std::fs::read_dir(&again).unwrap().count(),
             0,
-            "a file planted by one step survived into the next step's config dir"
+            "a file planted in a step's config dir survived its recreation"
         );
 
+        let second = fresh_empty_config_dir(tmp.path(), 1).unwrap();
+        assert_eq!(second, tmp.path().join(".ci-claude-config").join("1"));
+        assert_ne!(second, first, "two steps must never share a config dir");
+    }
+
+    #[test]
+    fn a_dispatch_root_that_is_a_file_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
         let file_root = tmp.path().join("not-a-directory");
         std::fs::write(&file_root, "x").unwrap();
-        let err = fresh_empty_config_dir(&file_root).unwrap_err();
-        assert!(err.contains("could not create"), "got: {err}");
+        let err = fresh_empty_config_dir(&file_root, 0).unwrap_err();
+        assert!(err.contains(".ci-claude-config"), "got: {err}");
+    }
+
+    /// A regular file where the step's config dir goes is replaced by an empty
+    /// directory, rather than failing the step.
+    #[test]
+    fn a_regular_file_at_the_config_dir_path_is_replaced_by_an_empty_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(".ci-claude-config").join("0");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "planted").unwrap();
+
+        let dir = fresh_empty_config_dir(tmp.path(), 0).unwrap();
+        assert_eq!(dir, path);
+        assert!(
+            std::fs::symlink_metadata(&dir).unwrap().is_dir(),
+            "the planted file was not replaced by a directory"
+        );
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+    }
+
+    /// A symlink where the step's config dir goes is UNLINKED and replaced by a
+    /// real empty directory, whether it is broken or points at a directory: the
+    /// directory behind the link (an owner's `~/.claude`, say) is never
+    /// emptied through it, and the step is never pointed into it.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_at_the_config_dir_path_is_unlinked_never_followed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path().join(".ci-claude-config");
+        std::fs::create_dir_all(&parent).unwrap();
+
+        std::os::unix::fs::symlink(tmp.path().join("nowhere"), parent.join("0")).unwrap();
+        let dir = fresh_empty_config_dir(tmp.path(), 0).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&dir).unwrap().is_dir(),
+            "the broken link was not replaced by a real directory"
+        );
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+
+        let login = tmp.path().join("owner-claude");
+        std::fs::create_dir_all(&login).unwrap();
+        std::fs::write(login.join(".credentials.json"), "x").unwrap();
+        std::os::unix::fs::symlink(&login, parent.join("1")).unwrap();
+        let dir = fresh_empty_config_dir(tmp.path(), 1).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&dir).unwrap().is_dir(),
+            "the link to a directory was not replaced by a real directory"
+        );
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        assert!(
+            login.join(".credentials.json").exists(),
+            "the directory behind the link was emptied through it"
+        );
     }
 
     /// Every credential or route the runner's model gateway knows about is in

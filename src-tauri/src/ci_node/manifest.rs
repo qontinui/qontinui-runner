@@ -150,26 +150,27 @@ const ENV_ALLOWLIST: &[&str] = &[
 
 /// Env vars the EXECUTOR owns and exports itself. A step setting one of
 /// these would be silently overridden (the executor's value wins — see
-/// `executor::run_step`), so they are rejected at validation with a message
-/// naming the manifest key that actually controls them. Rejecting is
+/// `executor::run_step`), so they are rejected at validation. The second
+/// column is the remedy the refusal ends with: the manifest key that actually
+/// controls the variable, or why no manifest key does. Rejecting is
 /// strictly better than allowlisting-then-ignoring: a cap that looks set but
 /// is not is how `--test-threads 4` ended up smuggled through argv.
 const EXECUTOR_OWNED_ENV: &[(&str, &str)] = &[
-    ("CARGO_BUILD_JOBS", "[limits].cargo_build_jobs"),
-    ("RUST_TEST_THREADS", "[limits].test_threads"),
-    ("NEXTEST_TEST_THREADS", "[limits].test_threads"),
+    ("CARGO_BUILD_JOBS", "set [limits].cargo_build_jobs instead"),
+    ("RUST_TEST_THREADS", "set [limits].test_threads instead"),
+    ("NEXTEST_TEST_THREADS", "set [limits].test_threads instead"),
     (
         "CARGO_TARGET_DIR",
-        "the executor's per-repo CI target dir (not settable)",
+        "it is the executor's per-repo CI target dir and cannot be set",
     ),
-    // The executor SETS this for every step to an empty per-dispatch
-    // directory (`step_env::fresh_empty_config_dir`), so a `claude` inside a
+    // The executor SETS this for every step to an empty directory of the
+    // step's own (`step_env::fresh_empty_config_dir`), so a `claude` inside a
     // step starts with no login instead of falling back to the owner's
     // default config dir. ci-exec's row, without its `[model]` pointer: this
-    // copy of the executor has no model broker.
+    // copy of the executor has no model broker, so no manifest key controls it.
     (
         "CLAUDE_CONFIG_DIR",
-        "nothing: the executor sets it to an empty per-dispatch directory for every step",
+        "it cannot be set: the executor points it at an empty directory of each step's own",
     ),
     // NOTE: the SERVICE connection variables (`DATABASE_URL`, the libpq `PG*`
     // family, `REDIS_URL`/`REDIS_HOST`/`REDIS_PORT`) are executor-owned too,
@@ -612,13 +613,13 @@ pub(crate) fn parse_and_validate(text: &str) -> Result<CiManifest, String> {
         }
         validate_argv(&label, "command", &step.command)?;
         for key in step.env.keys() {
-            if let Some((_, owner)) = EXECUTOR_OWNED_ENV
+            if let Some((_, remedy)) = EXECUTOR_OWNED_ENV
                 .iter()
                 .find(|(owned, _)| *owned == key.as_str())
             {
                 return Err(format!(
                     "{label}: env var {key:?} is exported by the executor and would be \
-                     overridden — set {owner} instead"
+                     overridden — {remedy}"
                 ));
             }
             if let Some(kind) = super::services::kind_exporting(key.as_str()) {
@@ -1690,10 +1691,11 @@ required = true
         }
     }
 
-    /// The executor pins `CLAUDE_CONFIG_DIR` to an empty per-dispatch directory
-    /// for every step, so a manifest value could only ever be overridden. It is
-    /// refused as executor-exported, with that reason, and no longer falls
-    /// through to "not allowlisted".
+    /// The executor pins `CLAUDE_CONFIG_DIR` to an empty directory of each
+    /// step's own, so a manifest value could only ever be overridden. It is
+    /// refused as executor-exported, with a reason that reads as a sentence
+    /// (no "set … instead" pointing at a key that does not exist), and no
+    /// longer falls through to "not allowlisted".
     #[test]
     fn claude_config_dir_is_refused_as_executor_exported() {
         let err = parse_and_validate(
@@ -1702,10 +1704,10 @@ required = true
         )
         .unwrap_err();
         assert!(
-            err.contains("exported by the executor")
-                && err.contains("empty per-dispatch directory for every step"),
+            err.contains("exported by the executor and would be overridden — it cannot be set: the executor points it at an empty directory of each step's own"),
             "got: {err}"
         );
+        assert!(!err.contains("instead"), "got: {err}");
         assert!(!err.contains("not allowlisted"), "got: {err}");
     }
 
