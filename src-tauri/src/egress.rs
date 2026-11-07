@@ -1063,8 +1063,10 @@ pub(crate) fn install_session_tenant_lookup(app: tauri::AppHandle) {
 /// The scope of the open session on terminal `terminal_id`: its spawn tenant
 /// (the lifecycle store's `tenant_id`), [`SessionScope::DeviceDefault`] for a
 /// session spawned without a tenant choice, and [`SessionScope::Unresolved`]
-/// when no open session is there, the stamp is not a UUID (logged — it names
-/// no scope coord could have answered for), or the lookup is not installed.
+/// when no open session is there, the pane's own `claude` records a different
+/// session than that row (`binding_state` unknown), the stamp is not a UUID
+/// (logged — it names no scope coord could have answered for), or the lookup is
+/// not installed.
 pub(crate) fn terminal_session_tenant(terminal_id: &str) -> SessionScope {
     #[cfg(test)]
     if let Some(faked) = test_support::faked_session_tenant(terminal_id) {
@@ -1082,6 +1084,13 @@ pub(crate) fn terminal_session_tenant(terminal_id: &str) -> SessionScope {
     let Some(record) = store.find_open_by_terminal(terminal_id) else {
         return SessionScope::Unresolved;
     };
+    // A row the pane's own `claude` contradicts (it runs a different session)
+    // does not establish whose session — or tenant — this is (plan
+    // `2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session`).
+    if record.binding_state == Some(crate::session::session_lifecycle_store::BindingState::Unknown)
+    {
+        return SessionScope::Unresolved;
+    }
     match record.tenant_id {
         None => SessionScope::DeviceDefault,
         Some(stamped) => match Uuid::parse_str(&stamped) {

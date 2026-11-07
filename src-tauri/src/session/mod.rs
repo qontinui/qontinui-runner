@@ -73,12 +73,15 @@ pub mod local_store;
 pub mod observation_epoch; // The last instant the liveness poll could SEE the process table — bounds open-row restore admission (plan 2026-10-28-force-exited-runner-strands-open-sessions-out-of-the-restore-set, Phase 2)
 pub mod operator_touch; // Operator-touch idempotency-key + payload builder, shared by every B2 trigger (plan 2026-08-27-operator-touch-observation-runner-emitter, Phase B2)
 pub mod output_pipe;
+pub mod pane_binding; // Does a pane run the session its lifecycle row names? Its own `claude`'s `<config>/sessions/<pid>.json` decides (plan 2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session)
 pub mod pane_store;
 pub mod past_sessions;
 pub mod permission_accept; // The ONE decision on whether the runner pad answers a PermissionRequest dialog, behind the permission_auto_accept dial (plan 2026-10-23-runner-sessions-stop-at-permission-dialogs-so-accept-them-by-default-with-a-tenant-switch, Phase 2)
 pub mod permission_prompt_capture; // Classify every permission prompt the Notification intake hears into a per-class hourly aggregator (plan 2026-10-14-permission-prompts-are-never-recorded-so-guard-rules-grow-on-anecdote, Phase 2)
 pub mod provider_adapter;
 pub mod reconcile;
+#[cfg(test)]
+mod reconcile_population_tests; // The reconcile pass entered where the runner enters it — the arming test of plan 2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session
 pub mod redact;
 pub mod respawn;
 pub mod restore_census; // Pre/post-restart session census — the G6 outcome check behind GET /control/sessions/restore-census

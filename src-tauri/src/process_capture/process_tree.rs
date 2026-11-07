@@ -54,6 +54,26 @@ pub struct ProcessSnapshot {
     /// absent here (access denied, protected process) is treated as a real
     /// image — never as a shim.
     pub exe_paths: HashMap<u32, String>,
+    /// When the enumeration BEGAN ([`snapshot_process_table_public`]) — no
+    /// process in the snapshot was read before it — or earlier, once a caller
+    /// dated the snapshot from other evidence it read first
+    /// ([`ProcessSnapshot::date_from`]). A consumer that compares the snapshot
+    /// with something that happened since (the session binder, against a row
+    /// placed after it) dates the snapshot from here. `None`: a snapshot built
+    /// by hand.
+    pub taken_at: Option<std::time::Instant>,
+}
+
+impl ProcessSnapshot {
+    /// Date this snapshot from `read_at` — when its caller read other evidence
+    /// it judges together with the snapshot — if that came first: the pair is
+    /// as old as its oldest part. The session binder's callers read the live
+    /// pane list before enumerating the process table, so a tab spawned
+    /// between the two is newer than the evidence
+    /// ([`crate::session::reconcile::run_reconcile_pass`]).
+    pub fn date_from(&mut self, read_at: std::time::Instant) {
+        self.taken_at = Some(self.taken_at.map_or(read_at, |taken| taken.min(read_at)));
+    }
 }
 
 /// Skew tolerance (millis) for the PID-reuse creation-time vs the reference
@@ -99,11 +119,8 @@ pub fn claude_present_in_inclusive_subtree(
     snapshot: &ProcessSnapshot,
     reference_unix_millis: i64,
 ) -> bool {
-    // PID-reuse guard on the tracked root (seconds → millis before comparing).
-    if let Some(&created_secs) = snapshot.creation_times.get(&root_pid) {
-        if created_secs > 0 && created_secs * 1000 + PID_REUSE_SKEW_MS < reference_unix_millis {
-            return false;
-        }
+    if root_predates(root_pid, snapshot, reference_unix_millis) {
+        return false;
     }
     if is_countable_claude(root_pid, snapshot) {
         return true;
@@ -111,6 +128,25 @@ pub fn claude_present_in_inclusive_subtree(
     bfs_descendants_from(root_pid, &snapshot.parent_map, &snapshot.creation_times)
         .iter()
         .any(|d| is_countable_claude(d.pid, snapshot))
+}
+
+/// The PID-reuse guard of [`claude_present_in_inclusive_subtree`] on its own:
+/// whether `root_pid` was created before `reference_unix_millis` (beyond
+/// [`PID_REUSE_SKEW_MS`]), so it cannot be a process the reference instant's
+/// tree spawned and its subtree is not trusted. An unknown (absent or zero)
+/// creation time is not "before". `creation_times` is epoch SECONDS; the
+/// reference is epoch MILLIS.
+pub fn root_predates(
+    root_pid: u32,
+    snapshot: &ProcessSnapshot,
+    reference_unix_millis: i64,
+) -> bool {
+    snapshot
+        .creation_times
+        .get(&root_pid)
+        .is_some_and(|&created_secs| {
+            created_secs > 0 && created_secs * 1000 + PID_REUSE_SKEW_MS < reference_unix_millis
+        })
 }
 
 /// Every claude-image PID in the **inclusive** subtree rooted at `root_pid`
@@ -389,9 +425,20 @@ pub async fn discover_descendants_with_parent_map(
 }
 
 /// Take a fresh process-table snapshot — exposed for `orphan_state` so the
-/// startup reclaim pass can do its PID-reuse check without re-querying.
+/// startup reclaim pass can do its PID-reuse check without re-querying —
+/// stamped with when its enumeration began ([`ProcessSnapshot::taken_at`]).
 pub async fn snapshot_process_table_public() -> ProcessSnapshot {
-    snapshot_process_table().await
+    stamped(snapshot_process_table()).await
+}
+
+/// `enumerate`'s snapshot, stamped with an instant taken BEFORE it starts to
+/// run: a future does nothing until it is awaited, so nothing it reads can
+/// predate the stamp ([`ProcessSnapshot::taken_at`]).
+async fn stamped(enumerate: impl std::future::Future<Output = ProcessSnapshot>) -> ProcessSnapshot {
+    let taken_at = std::time::Instant::now();
+    let mut snapshot = enumerate.await;
+    snapshot.taken_at = Some(taken_at);
+    snapshot
 }
 
 /// Convenience wrapper: discover descendants only.
@@ -1220,6 +1267,86 @@ mod bounded_probe_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The session binder dates a pass's evidence from `taken_at` (plan
+    /// `2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session`): every
+    /// production snapshot must carry it, taken before the enumeration
+    /// returned — never left `None`, which the binder would date from a later
+    /// "now".
+    #[tokio::test]
+    async fn a_public_snapshot_is_stamped_with_when_its_enumeration_began() {
+        let before = std::time::Instant::now();
+        let snapshot = snapshot_process_table_public().await;
+        let after = std::time::Instant::now();
+        let taken_at = snapshot.taken_at.expect("a public snapshot is stamped");
+        assert!(before <= taken_at && taken_at <= after);
+        assert_eq!(
+            ProcessSnapshot::default().taken_at,
+            None,
+            "a hand-built snapshot is not"
+        );
+    }
+
+    /// The stamp is taken BEFORE the enumeration starts to run, not when it
+    /// returns: an enumeration that starts, waits and then returns is stamped
+    /// no later than its own start.
+    #[tokio::test]
+    async fn a_snapshot_is_stamped_before_its_enumeration_starts() {
+        let started = std::sync::Mutex::new(None);
+        let snapshot = stamped(async {
+            *started.lock().unwrap() = Some(std::time::Instant::now());
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            ProcessSnapshot::default()
+        })
+        .await;
+        let started = started.into_inner().unwrap().expect("the enumeration ran");
+        assert!(snapshot.taken_at.expect("stamped") <= started);
+    }
+
+    /// A snapshot dated from evidence read before it takes that earlier
+    /// instant; dated from a later read it keeps its own; an unstamped one
+    /// takes the read.
+    #[test]
+    fn a_snapshot_is_dated_from_the_earlier_of_its_stamp_and_a_prior_read() {
+        let earlier = std::time::Instant::now();
+        let later = earlier + std::time::Duration::from_millis(5);
+        let mut stamped_later = ProcessSnapshot {
+            taken_at: Some(later),
+            ..ProcessSnapshot::default()
+        };
+        stamped_later.date_from(earlier);
+        assert_eq!(stamped_later.taken_at, Some(earlier));
+        let mut stamped_earlier = ProcessSnapshot {
+            taken_at: Some(earlier),
+            ..ProcessSnapshot::default()
+        };
+        stamped_earlier.date_from(later);
+        assert_eq!(stamped_earlier.taken_at, Some(earlier));
+        let mut unstamped = ProcessSnapshot::default();
+        unstamped.date_from(later);
+        assert_eq!(unstamped.taken_at, Some(later));
+    }
+
+    /// The PID-reuse guard alone: a root created before the reference
+    /// (beyond the skew) predates it; one created within the skew, after it,
+    /// or at an unknown time does not.
+    #[test]
+    fn root_predates_only_a_root_created_before_the_reference_beyond_the_skew() {
+        let mut snapshot = ProcessSnapshot::default();
+        for (pid, created_secs) in [(1, 1_000), (2, 1_998), (3, 2_000), (4, 0)] {
+            snapshot.creation_times.insert(pid, created_secs);
+        }
+        let reference = 2_000_000; // 2 000 s, in millis
+        assert!(root_predates(1, &snapshot, reference));
+        assert!(!root_predates(2, &snapshot, reference), "within the skew");
+        assert!(!root_predates(3, &snapshot, reference));
+        assert!(!root_predates(4, &snapshot, reference), "unknown time");
+        assert!(!root_predates(5, &snapshot, reference), "not in the table");
+        assert!(
+            !root_predates(1, &snapshot, i64::MIN),
+            "a holder-proven root"
+        );
+    }
 
     fn pids(items: &[(u32, i64)]) -> Vec<PidWithSpawnedAt> {
         items

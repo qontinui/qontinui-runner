@@ -3551,7 +3551,7 @@ impl TerminalSession {
             let _span =
                 tracing::debug_span!("terminal_spawn.record_open", terminal_id = %terminal_id)
                     .entered();
-            crate::commands::terminal::record_pinned_session_open(
+            let outcome = crate::commands::terminal::record_pinned_session_open(
                 store.inner(),
                 pinned.clone(),
                 terminal_id.to_string(),
@@ -3566,11 +3566,17 @@ impl TerminalSession {
                 crate::session::session_lifecycle_store::DEFAULT_PROVIDER.to_string(),
                 None,
             );
-            info!(
-                terminal_id = %terminal_id,
-                session_id = %pinned,
-                "session-restore: session recorded authoritatively at spawn"
-            );
+            // A pinned record is authoritative, which the binding guard never
+            // refuses; a write the store could not make (`Unavailable`, a
+            // poisoned registry lock) is logged at warn by
+            // `record_pinned_session_open`. The pane spawns regardless.
+            if outcome.is_recorded() {
+                info!(
+                    terminal_id = %terminal_id,
+                    session_id = %pinned,
+                    "session-restore: session recorded authoritatively at spawn"
+                );
+            }
         }
 
         // The served-corpus measurement for the briefing's header line,
@@ -3820,6 +3826,11 @@ impl TerminalSession {
                     self.page_id(),
                     title,
                     parsed,
+                    // Who read the line is decided against the pane's
+                    // processes and the instant it completed (plan
+                    // 2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session).
+                    self.child_pid(),
+                    chrono::Utc::now().timestamp_millis(),
                 );
             }
             if super::coord_warn::is_branch_mutating_git(&line) {

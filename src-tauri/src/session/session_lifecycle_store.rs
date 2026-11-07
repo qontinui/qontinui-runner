@@ -52,13 +52,18 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::time::Instant;
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use crate::session::observation_epoch::{ObservationEpoch, Observed};
+use crate::session::pane_binding::{
+    BindingCounters, ObserveOutcome, PaneEvidence, PaneEvidenceOracle, PaneObservation,
+    PidReuseGuard,
+};
 use crate::session::restore_record_emitter::RestoreRecordEmitter;
 use crate::session::snapshot_history::{SnapshotHistory, SnapshotSession, TranscriptProbe};
 
@@ -194,6 +199,73 @@ pub const ORIGIN_RECONCILED: &str = "reconciled";
 /// treats a CONFIRMED observed row the same as confirmed authoritative
 /// (auto-resume-eligible), unlike the conservative `reconciled`/mtime guess.
 pub const ORIGIN_OBSERVED: &str = "observed";
+
+/// Does the pane at a row's `terminal_id` bear the binding out? Its own
+/// top-level `claude` records the session it runs in
+/// `<config_dir>/sessions/<pid>.json` ([`crate::session::pane_binding`]).
+/// It sits beside [`TerminalSessionRecord::origin`] / `confirmed_at`, which say
+/// how the id was BOUND; this says whether the pane still runs it.
+///
+/// Served as `bindingState: "matched" | "unknown"` on `GET /sessions/history`
+/// rows and in the `/restart-readiness` census, and absent from both while
+/// unchecked. Plan `2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BindingState {
+    /// The pane's own `claude` records this session.
+    Matched,
+    /// The session runs in ANOTHER live pane, whose own `claude` records it,
+    /// while this row sits on a pane that does not — the 2026-10-25 shape. The
+    /// row's `terminal_id` is not evidenced: no surface may label, nudge or
+    /// close that terminal by this row.
+    Unknown,
+}
+
+/// A binding verdict a reader may serve now
+/// ([`SessionLifecycleStore::current_binding_verdicts`]): the state, and the
+/// terminal the row sat on when it was judged. A surface serves it only for a
+/// row or process on that same terminal — a heal between its own read of the
+/// rows and its read of the verdicts must not pair a session with a pane it
+/// has left.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CurrentVerdict {
+    pub terminal_id: String,
+    pub state: BindingState,
+}
+
+/// What [`SessionLifecycleStore::record_open_checked`] (or
+/// [`SessionLifecycleStore::rebind_terminal_checked`]) did with a bind.
+///
+/// `#[must_use]`: a caller that goes on to confirm, stamp, emit or re-key as if
+/// the bind landed after a refusal reports a binding the store does not hold.
+#[must_use = "a refused bind wrote nothing; act on the outcome before confirming, stamping, emitting or re-keying"]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecordOpenOutcome {
+    /// Written: the row was created, refreshed in place, or moved onto the
+    /// record's terminal. (For a rebind: also a row already current, absent or
+    /// closed — nothing to move, nothing refused.)
+    Recorded,
+    /// NOT written. The record is a WEAK bind (not authoritative), and moving
+    /// the session's row onto its terminal would have taken it off `held_by`,
+    /// a live pane whose own `claude` record names the session. Nothing else
+    /// changes: no row on either pane is marked.
+    MoveRefused { held_by: String },
+    /// NOT written: the registry lock is poisoned.
+    Unavailable,
+}
+
+impl RecordOpenOutcome {
+    /// Whether the bind was written.
+    pub fn is_recorded(&self) -> bool {
+        matches!(self, RecordOpenOutcome::Recorded)
+    }
+}
+
+/// A refusal of the same move (session, refused pane) that recurs within this
+/// gap of the previous one is the SAME episode: logged at debug, not counted.
+/// Several liveness ticks (45 s), so a refusal re-proposed every pass is one
+/// episode for as long as it recurs.
+pub const REFUSAL_EPISODE_GAP: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// The `zone_index` sentinel for "this session sits in no zone".
 ///
@@ -392,6 +464,10 @@ fn reap_restore_marker_on_close(rec: &mut TerminalSessionRecord) {
     // stamp behind for a later re-open to mistake for a running hold.
     rec.awaiting_account_since = None;
     rec.restore_pending_at = None;
+    // A binding verdict is about a LIVE pane: a closed row has none, so
+    // `/sessions/history` never serves a stale `matched` with its terminal, nor
+    // withholds the terminal of a session that has ended.
+    rec.binding_state = None;
     if rec.restore_tier.as_deref() == Some(RESTORE_TIER_FAILED) {
         rec.restore_tier = Some(RESTORE_TIER_TERMINAL_ONLY.to_string());
     }
@@ -434,7 +510,7 @@ pub fn durable_name_source(registry_value: Option<&str>) -> String {
 /// keep what is stored". An empty/whitespace-only string is the same statement
 /// spelled differently, so it must normalize to `None` BEFORE the merge, or a
 /// blank would clobber a known-good value (exactly the trap `config_dir`
-/// already normalizes away at the top of [`SessionLifecycleStore::record_open`]).
+/// already normalizes away at the top of [`SessionLifecycleStore::record_open_checked`]).
 fn non_empty(value: Option<String>) -> Option<String> {
     value.filter(|s| !s.trim().is_empty())
 }
@@ -624,7 +700,7 @@ pub struct TerminalSessionRecord {
     /// never closes it `no-terminal`. The hold never refreshes `last_seen_at`,
     /// so a held row can never move the restore anchor. Durable, so the hold
     /// survives any number of restarts without a re-mark. Cleared by
-    /// [`SessionLifecycleStore::record_open`] (a verified resume is new life),
+    /// [`SessionLifecycleStore::record_open_checked`] (a verified resume is new life),
     /// a close, Finish, and the poll once the hold has expired.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub awaiting_account_since: Option<i64>,
@@ -652,6 +728,28 @@ pub struct TerminalSessionRecord {
     /// additive.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confirmed_at: Option<i64>,
+    /// Whether the pane at [`Self::terminal_id`] was last seen running THIS
+    /// session ([`BindingState`]), by the rules of
+    /// [`crate::session::pane_binding::binding_verdicts`]: `matched` when the
+    /// pane's own `claude` record names it, `unknown` when another live pane's
+    /// record names it. The store owns it: the reconcile pass writes the
+    /// verdict ([`SessionLifecycleStore::set_binding_state`]) and withdraws a
+    /// `matched` its pane no longer evidences
+    /// ([`SessionLifecycleStore::withdraw_matched`]),
+    /// [`SessionLifecycleStore::record_open_checked`] sets `matched` when the
+    /// bound pane names the session, and a row that MOVES to another terminal
+    /// drops it — a verdict is about one pane. So do a close
+    /// (`reap_restore_marker_on_close`, which every close path calls) and an
+    /// account hold's detach. Nothing else writes it: a refused move marks no
+    /// row, and an incoming record's value is never taken. Which observation a
+    /// verdict came from is held beside it, in memory
+    /// ([`SessionLifecycleStore::current_binding_verdicts`]).
+    ///
+    /// `None` = not checked: no verdict from the latest evidence, or the row
+    /// moved since its last check. Not a verdict, and never read as agreement.
+    /// `#[serde(default)]`: rows written before the field load as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding_state: Option<BindingState>,
     /// Coord-minted stable fleet session handle (`fsh_…`) for this session
     /// (session-identity fabric Phase 1, plan
     /// `2026-07-05-session-identity-messaging-restore-fabric.md` §4). Persisted
@@ -686,7 +784,7 @@ pub struct TerminalSessionRecord {
     /// confirmation, and every liveness-poll tick that finds the session in the
     /// live registry. Last write wins, but a read that does NOT see the session
     /// must never blank a stored value: **absent ⇒ keep**. Enforced in
-    /// [`SessionLifecycleStore::record_open`] and
+    /// [`SessionLifecycleStore::record_open_checked`] and
     /// [`SessionLifecycleStore::update_identity`], both of which take an
     /// incoming value only when it is `Some` and non-blank. This is exactly the
     /// `config_dir` rule.
@@ -908,6 +1006,18 @@ pub struct TerminalSessionRecord {
     /// field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adopted_from: Option<String>,
+    /// Whether [`Self::adopted_from`] was the pane's CURRENT `matched` row when
+    /// the `clear` hook recorded it ([`SessionLifecycleStore::mark_adopted_from`]):
+    /// the session the pane's own `claude` was last observed running there.
+    /// Only such a link makes that predecessor a `/clear` leftover whose
+    /// `unknown` goes uncounted
+    /// ([`crate::session::pane_binding::BindingVerdict::leftover`]). An
+    /// unconfirmed link — a quick switch made since the last observation, or a
+    /// row a strong write put on the pane — keeps the lineage the hook
+    /// recorded, and its predecessor's mismatch counts. `false` for a row
+    /// written before the field existed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub adopted_from_matched: bool,
     /// Unix millis of the most recent provider SessionStart hook that reported
     /// this id ([`SessionLifecycleStore::note_session_start_hook`]) — when its
     /// process last started (or resumed into) its terminal. The durable half of
@@ -930,7 +1040,7 @@ pub struct TerminalSessionRecord {
     /// poll closing THIS record — and without the gate identity here it could
     /// not say which gate died, so the gate stayed `spawned` forever.
     ///
-    /// STICKY in [`SessionLifecycleStore::record_open`]: the session-open hook
+    /// STICKY in [`SessionLifecycleStore::record_open_checked`]: the session-open hook
     /// and the boot-restore re-record write this record again carrying no gate,
     /// and must not blank it. `#[serde(default)]`: older rows read `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1134,7 +1244,7 @@ pub struct SessionLifecycleStore {
     /// Terminal ids whose session has MOVED to another terminal while the
     /// old PTY was still alive — the account-migration order is spawn the
     /// replacement first, then close the source, so for a moment two PTYs
-    /// carry one session. [`Self::record_open`] re-keys the row onto the new
+    /// carry one session. [`Self::record_open_checked`] re-keys the row onto the new
     /// terminal; the old PTY's later exit-close names `(session id, old
     /// terminal)`, which no open row owns any more, and would otherwise read
     /// as a MIS-BOUND close (`NotFound`, a `warn!`) on the fleet's most
@@ -1180,7 +1290,7 @@ pub struct SessionLifecycleStore {
     prior_teardown_complete: OnceLock<bool>,
     /// Optional restore-registry → coord mirror (plan
     /// `2026-07-09-runner-session-history-cloud-sync` §3.4, Phase 4). When
-    /// attached, every open-record write/refresh ([`record_open`](Self::record_open))
+    /// attached, every open-record write/refresh ([`record_open_checked`](Self::record_open_checked))
     /// and every confirmation flip ([`confirm_session`](Self::confirm_session)
     /// — confirmation changes the record's honest `restore_tier`) hands the
     /// merged record to the emitter, which gates (`session_metadata_sync_enabled`),
@@ -1233,6 +1343,61 @@ pub struct SessionLifecycleStore {
     /// `i64::MAX` (every fixture row is the prior life) unless a test sets it
     /// with [`Self::set_boot_ms_for_test`].
     boot_ms: AtomicI64,
+    /// What each pane's own `claude` records — asked before a row is moved off
+    /// another terminal, for the bind-time binding verdict and for the
+    /// supersede scan ([`Self::attach_pane_evidence`]). It answers from memory,
+    /// so it is asked while the registry lock is held. Unattached (tests that
+    /// do not care, ephemeral fallbacks) → no evidence: no move is refused and
+    /// no verdict is written, the pre-guard behaviour.
+    pane_evidence: OnceLock<Arc<dyn PaneEvidenceOracle>>,
+    /// The refusal episodes already reported: (session, refused terminal) →
+    /// when last refused ([`REFUSAL_EPISODE_GAP`]). Process-local.
+    refused_episodes: Mutex<HashMap<(String, String), std::time::Instant>>,
+    /// Where this store counts binding mismatches and refused moves. Unset →
+    /// [`BindingCounters::global`], the counters `/health` serves; a test
+    /// attaches its own ([`Self::attach_binding_counters`]).
+    binding_counters: OnceLock<Arc<BindingCounters>>,
+    /// The pane-observation epoch each stored binding verdict was taken in, by
+    /// session id ([`Self::current_binding_verdicts`]). Process-local: an
+    /// epoch means nothing to another process, so a verdict loaded from disk
+    /// carries none and is never current. Lock order: `map` →
+    /// `verdict_epochs`.
+    verdict_epochs: Mutex<HashMap<String, u64>>,
+    /// The oldest observation epoch whose verdicts are served
+    /// ([`Self::current_binding_verdicts`]); raised by the reconcile pass once
+    /// its FIRST judgement of an observation is stored
+    /// ([`Self::serve_verdicts_from`]). Until then the previous observation's
+    /// verdicts stay served. `None`: no pass has judged in this process.
+    /// Lock order: `map` → `servable_epoch` (only [`Self::reload_from_disk`]
+    /// nests them).
+    servable_epoch: Mutex<Option<u64>>,
+    /// When a write last PLACED each open row — created it, moved it onto
+    /// another terminal or re-opened it, weak or strong — by session id
+    /// ([`Self::placed_after`]). Pane evidence enumerated before that instant
+    /// is older than the placement: the reconcile pass neither moves the row
+    /// nor reads it `unknown` on such evidence, and waits for its next pass.
+    /// Monotonic, so a wall-clock step cannot reorder it; process-local, so a
+    /// restart starts it empty — "no recent placement" — which is the truth
+    /// for a store just loaded (and [`Self::reload_from_disk`] empties it for
+    /// the same reason). A close forgets the row's entry
+    /// ([`Self::note_closed`]). Lock order: `map` → `last_placed`.
+    last_placed: Mutex<HashMap<String, Instant>>,
+    /// When each CLOSED row closed, by session id ([`Self::closed_after`]) —
+    /// the counterpart of [`Self::last_placed`]: pane evidence enumerated
+    /// before that instant is older than the close, so a reconcile bind does
+    /// not re-open the row on it ([`Self::record_bind_checked`]). Monotonic and
+    /// process-local like `last_placed`; a row placed again, or gone from the
+    /// map, forgets its entry. Lock order: `map` → `last_closed`.
+    last_closed: Mutex<HashMap<String, Instant>>,
+    /// The liveness poll's PID-reuse guard, which the reconcile pass applies to
+    /// every pane it reads ([`Self::set_pid_reuse_guard`]). Unset: the
+    /// default, which calls no pane root recycled.
+    pid_reuse_guard: Mutex<PidReuseGuard>,
+    /// Held by a reconcile pass from the hand-over of its pane observation to
+    /// the oracle through its last verdict and bind
+    /// ([`Self::reconcile_pass_lock`]), so overlapping passes judge one at a
+    /// time. It guards no data.
+    reconcile_pass: Mutex<()>,
     /// Serializes [`Self::set_finished`] END TO END — the map mutation AND the
     /// finish-observer hand-off — so the order coord's outbox receives
     /// finished / working rows in is the order the local marker changed in.
@@ -1449,6 +1614,15 @@ impl SessionLifecycleStore {
             close_observer: OnceLock::new(),
             finish_observer: OnceLock::new(),
             boot_ms: AtomicI64::new(default_boot_ms()),
+            pane_evidence: OnceLock::new(),
+            refused_episodes: Mutex::new(HashMap::new()),
+            binding_counters: OnceLock::new(),
+            verdict_epochs: Mutex::new(HashMap::new()),
+            servable_epoch: Mutex::new(None),
+            last_placed: Mutex::new(HashMap::new()),
+            last_closed: Mutex::new(HashMap::new()),
+            pid_reuse_guard: Mutex::new(PidReuseGuard::default()),
+            reconcile_pass: Mutex::new(()),
             finish_forward: Mutex::new(()),
         };
         if replay.applied > 0 || replay.damaged {
@@ -1546,6 +1720,265 @@ impl SessionLifecycleStore {
     pub fn attach_transcript_probe(&self, probe: Arc<dyn TranscriptProbe>) {
         if self.transcript_probe.set(probe).is_err() {
             warn!("session_lifecycle_store: transcript probe already attached — ignoring");
+        }
+    }
+
+    /// Attach the pane-evidence oracle (once, at startup): what each pane's own
+    /// `claude` records ([`crate::session::pane_binding`]). Production attaches
+    /// a [`crate::session::pane_binding::LivePaneRegistry`], which the
+    /// reconcile pass keeps current through [`Self::observe_panes`].
+    pub fn attach_pane_evidence(&self, oracle: Arc<dyn PaneEvidenceOracle>) {
+        if self.pane_evidence.set(oracle).is_err() {
+            warn!("session_lifecycle_store: pane evidence oracle already attached — ignoring");
+        }
+    }
+
+    /// Hand the attached oracle a reconcile pass's observation of the live
+    /// panes, and learn what became of it: the epoch it was stored under (what
+    /// the verdicts taken from it are tagged with), or that the oracle already
+    /// holds a LATER read, in which case the pass judges and binds nothing from
+    /// it. [`ObserveOutcome::Unnumbered`] without an oracle.
+    pub fn observe_panes(&self, observation: PaneObservation) -> ObserveOutcome {
+        match self.pane_evidence.get() {
+            Some(oracle) => oracle.observe(observation),
+            None => ObserveOutcome::Unnumbered,
+        }
+    }
+
+    /// Record that a write just PLACED `claude_session_id`'s row: created it,
+    /// moved it onto another terminal or re-opened it ([`Self::last_placed`]).
+    /// A placement ends any close it re-opened ([`Self::last_closed`]). The
+    /// caller holds `map`: lock order `map` → `last_placed`, `map` →
+    /// `last_closed`.
+    fn note_placed(&self, claude_session_id: &str) {
+        self.last_placed
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(claude_session_id.to_string(), Instant::now());
+        self.last_closed
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(claude_session_id);
+    }
+
+    /// Whether a write placed `claude_session_id`'s row AFTER `enumerated_at`
+    /// — later than anything pane evidence enumerated then can know about
+    /// ([`Self::last_placed`]). Takes the placement lock, so a caller holding
+    /// `map` keeps the order `map` → `last_placed`.
+    pub(crate) fn placed_after(&self, claude_session_id: &str, enumerated_at: Instant) -> bool {
+        self.last_placed
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(claude_session_id)
+            .is_some_and(|placed| *placed > enumerated_at)
+    }
+
+    /// Whether `claude_session_id`'s row CLOSED after `enumerated_at` and has
+    /// stayed closed since ([`Self::last_closed`]) — later than anything pane
+    /// evidence enumerated then can know about. Takes the close lock, so a
+    /// caller holding `map` keeps the order `map` → `last_closed`.
+    pub(crate) fn closed_after(&self, claude_session_id: &str, enumerated_at: Instant) -> bool {
+        self.last_closed
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(claude_session_id)
+            .is_some_and(|closed| *closed > enumerated_at)
+    }
+
+    /// Set the liveness poll's PID-reuse guard the next reconcile pass applies
+    /// ([`PidReuseGuard`]). Each caller of the pass sets it from the inputs the
+    /// poll's own guard uses — this runner's boot instant and the live panes'
+    /// holder proof — as the pane oracle is attached at startup: state the pass
+    /// reads, not a parameter of it. The latest setting wins.
+    pub fn set_pid_reuse_guard(&self, guard: PidReuseGuard) {
+        *self
+            .pid_reuse_guard
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = guard;
+    }
+
+    /// The PID-reuse guard last set ([`Self::set_pid_reuse_guard`]).
+    pub(crate) fn pid_reuse_guard(&self) -> PidReuseGuard {
+        self.pid_reuse_guard
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    /// The lock a reconcile pass holds from handing its observation to the
+    /// oracle through its last verdict and bind, so overlapping passes (the
+    /// boot pass and a periodic tick) judge one at a time: none can tag
+    /// verdicts from an observation older than the one another pass already
+    /// judged. Nothing awaits under it. A poisoned lock is recovered: it
+    /// guards no data.
+    pub(crate) fn reconcile_pass_lock(&self) -> MutexGuard<'_, ()> {
+        self.reconcile_pass
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// What `terminal_id`'s pane records, per the attached oracle.
+    /// [`PaneEvidence::Unknown`] for a blank id and when no oracle is attached
+    /// — no evidence is never evidence of anything.
+    pub(crate) fn pane_evidence_of(&self, terminal_id: &str) -> PaneEvidence {
+        self.pane_evidence_with_epoch(terminal_id).0
+    }
+
+    /// [`Self::pane_evidence_of`] and the epoch of the observation it came
+    /// from, in ONE read of the oracle
+    /// ([`PaneEvidenceOracle::pane_evidence_at`]): what a verdict stored from
+    /// the evidence is tagged with.
+    pub(crate) fn pane_evidence_with_epoch(
+        &self,
+        terminal_id: &str,
+    ) -> (PaneEvidence, Option<u64>) {
+        if terminal_id.trim().is_empty() {
+            return (PaneEvidence::Unknown, None);
+        }
+        match self.pane_evidence.get() {
+            Some(oracle) => oracle.pane_evidence_at(terminal_id),
+            None => (PaneEvidence::Unknown, None),
+        }
+    }
+
+    /// Every live pane whose own `claude` records `session_id`, per the
+    /// attached oracle. Empty without one.
+    pub(crate) fn panes_naming(&self, session_id: &str) -> Vec<String> {
+        self.pane_evidence
+            .get()
+            .map(|oracle| oracle.panes_naming(session_id))
+            .unwrap_or_default()
+    }
+
+    /// The epoch of the attached oracle's latest observation while it is
+    /// fresh — the one a verdict must carry to be current. `None` without an
+    /// oracle or a fresh observation.
+    pub(crate) fn pane_epoch(&self) -> Option<u64> {
+        self.pane_evidence.get()?.current_epoch()
+    }
+
+    /// Serve the verdicts taken from observation `epoch` (and any newer one)
+    /// from now on: the reconcile pass calls this once its FIRST judgement of
+    /// that observation is stored, so a reader never sees the new observation
+    /// before a single verdict was taken from it. Only ever raised.
+    pub(crate) fn serve_verdicts_from(&self, epoch: u64) {
+        if let Ok(mut servable) = self.servable_epoch.lock() {
+            *servable = Some(servable.map_or(epoch, |current| current.max(epoch)));
+        }
+    }
+
+    /// The verdict of every open row whose verdict is CURRENT, by session id:
+    /// taken from an observation at or after the servable epoch
+    /// ([`Self::serve_verdicts_from`]), while the oracle's latest observation is
+    /// still fresh ([`Self::pane_epoch`]). Each carries the terminal the row
+    /// sat on when judged ([`CurrentVerdict`]). A verdict from an older
+    /// observation (a stalled pass, a previous process, an `unknown` rule 3
+    /// kept) is not in it: its reader serves it as unchecked. Empty without a
+    /// fresh observation or before any pass has judged.
+    pub fn current_binding_verdicts(&self) -> HashMap<String, CurrentVerdict> {
+        if self.pane_epoch().is_none() {
+            return HashMap::new();
+        }
+        let Some(floor) = self.servable_epoch.lock().ok().and_then(|s| *s) else {
+            return HashMap::new();
+        };
+        let m = match self.map.lock() {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(error = %e, "session_lifecycle_store: lock poisoned on current_binding_verdicts");
+                return HashMap::new();
+            }
+        };
+        let Ok(epochs) = self.verdict_epochs.lock() else {
+            return HashMap::new();
+        };
+        m.values()
+            .filter(|r| r.state == "open")
+            .filter_map(|r| {
+                let state = r.binding_state?;
+                epochs
+                    .get(&r.claude_session_id)
+                    .is_some_and(|epoch| *epoch >= floor)
+                    .then(|| {
+                        (
+                            r.claude_session_id.clone(),
+                            CurrentVerdict {
+                                terminal_id: r.terminal_id.clone(),
+                                state,
+                            },
+                        )
+                    })
+            })
+            .collect()
+    }
+
+    /// Rows that just CLOSED: drop what this process remembers of them
+    /// ([`Self::forget_removed`]), then remember when they closed
+    /// ([`Self::last_closed`]), so pane evidence enumerated before the close
+    /// cannot re-open them. The caller holds `map`: lock order `map` →
+    /// `verdict_epochs`, `map` → `last_placed`, `map` → `last_closed`.
+    fn note_closed<'a>(&self, ids: impl IntoIterator<Item = &'a str>) {
+        let ids: Vec<&str> = ids.into_iter().collect();
+        self.forget_removed(ids.iter().copied());
+        let now = Instant::now();
+        let mut closed = self.last_closed.lock().unwrap_or_else(|p| p.into_inner());
+        for id in ids {
+            closed.insert(id.to_string(), now);
+        }
+    }
+
+    /// Rows that LEFT the map (removed, re-keyed away): drop everything this
+    /// process remembers of them — verdict epochs, last placement, last close —
+    /// so nothing in memory outlives its row. The caller holds `map`: the lock
+    /// orders of [`Self::note_closed`].
+    fn forget_removed<'a>(&self, ids: impl IntoIterator<Item = &'a str>) {
+        let ids: Vec<&str> = ids.into_iter().collect();
+        if let Ok(mut epochs) = self.verdict_epochs.lock() {
+            for id in &ids {
+                epochs.remove(*id);
+            }
+        }
+        let mut placed = self.last_placed.lock().unwrap_or_else(|p| p.into_inner());
+        for id in &ids {
+            placed.remove(*id);
+        }
+        drop(placed);
+        let mut closed = self.last_closed.lock().unwrap_or_else(|p| p.into_inner());
+        for id in &ids {
+            closed.remove(*id);
+        }
+    }
+
+    /// Record which observation `claude_session_id`'s verdict came from —
+    /// `None`, none (it is then never current). The caller holds `map`: lock
+    /// order `map` → `verdict_epochs`.
+    fn tag_verdict(&self, claude_session_id: &str, epoch: Option<u64>) {
+        if let Ok(mut epochs) = self.verdict_epochs.lock() {
+            match epoch {
+                Some(epoch) => {
+                    epochs.insert(claude_session_id.to_string(), epoch);
+                }
+                None => {
+                    epochs.remove(claude_session_id);
+                }
+            }
+        }
+    }
+
+    /// Count this store's binding mismatches and refused moves into `counters`
+    /// rather than the process-wide ones `/health` serves. Once; tests use it
+    /// to assert exact counts.
+    pub fn attach_binding_counters(&self, counters: Arc<BindingCounters>) {
+        if self.binding_counters.set(counters).is_err() {
+            warn!("session_lifecycle_store: binding counters already attached — ignoring");
+        }
+    }
+
+    /// The counters this store counts into.
+    pub(crate) fn binding_counters(&self) -> &BindingCounters {
+        match self.binding_counters.get() {
+            Some(counters) => counters.as_ref(),
+            None => BindingCounters::global(),
         }
     }
 
@@ -1669,6 +2102,20 @@ impl SessionLifecycleStore {
         }
     }
 
+    /// Offer `claude_session_id`'s open row to the restore-record mirror
+    /// without writing it — for a caller whose re-record would change nothing
+    /// (the reconcile pass's unchanged re-bind). The emitter re-emits only a
+    /// material change, and this is how it retries a row it skipped for want of
+    /// a coord session, as a re-record would have.
+    pub fn refresh_restore_mirror(&self, claude_session_id: &str) {
+        if self.restore_emitter.get().is_none() {
+            return;
+        }
+        if let Some(rec) = self.get(claude_session_id) {
+            self.mirror_restore_record(&rec);
+        }
+    }
+
     /// Append a CHANGE entry for the records this mutation actually touched,
     /// if a history sink is attached. Called by every layout-meaningful
     /// mutation AFTER the registry write; best-effort by construction (the sink
@@ -1720,13 +2167,140 @@ impl SessionLifecycleStore {
         history.record_heartbeat(self.snapshot_sessions(records));
     }
 
+    /// Insert or refresh a session by `claude_session_id`, discarding what the
+    /// store did with it. For callers with nothing to do on a refusal — tests.
+    /// Production code calls [`Self::record_open_checked`], whose outcome is
+    /// `#[must_use]`, and acts on a [`RecordOpenOutcome::MoveRefused`].
+    #[cfg(test)]
+    pub fn record_open(&self, rec: TerminalSessionRecord) {
+        let _ = self.record_open_checked(rec);
+    }
+
     /// Insert or refresh a session by `claude_session_id`. If a record
     /// already exists, its `opened_at` is preserved; the record is always
     /// (re-)marked `open` (clearing `closed_at` / `close_reason`), its
     /// mutable fields are refreshed, and `last_seen_at` is bumped to now.
     /// A brand-new record sets `opened_at == last_seen_at == now`. Atomic-
     /// writes after mutating.
-    pub fn record_open(&self, rec: TerminalSessionRecord) {
+    ///
+    /// ## The binding guard (plan `2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session`)
+    ///
+    /// Rows are keyed by session, so a record naming a terminal other than the
+    /// one its session's open row sits on MOVES that row. Every binder writes
+    /// through here, and a binder can be wrong: on 2026-10-25 one pane's row
+    /// came to name the session a live peer pane ran (which binder did it is
+    /// UNKNOWN; reconcile rung 3 is one that can — see
+    /// [`crate::session::pane_binding`]). So a WEAK move — a record that is not
+    /// authoritative — is checked against the pane it would leave
+    /// ([`Self::move_refusal_locked`]), under the same registry lock as the
+    /// write so nothing can move the row in between, and refused when that
+    /// pane's own record names the session: [`RecordOpenOutcome::MoveRefused`],
+    /// nothing written and nothing marked. A refused move is logged and counted
+    /// once per (session, pane) episode. A strong (authoritative) record always
+    /// proceeds — the SessionStart hook route, a pinned spawn, a migration's
+    /// respawn — and the next reconcile pass judges where it landed.
+    ///
+    /// Every other record is written. The row's
+    /// [`TerminalSessionRecord::binding_state`] is the store's own: never taken
+    /// from the incoming record, dropped when the row changes pane, and set
+    /// `matched` here when the bound pane's own `claude` names this session. A
+    /// bind never sets `unknown` — the reconcile pass judges that, with every
+    /// pane's evidence in view ([`crate::session::pane_binding::binding_verdicts`]).
+    /// The supersede scan spares a sibling a live pane's own `claude` still
+    /// runs.
+    pub fn record_open_checked(&self, rec: TerminalSessionRecord) -> RecordOpenOutcome {
+        let m = match self.map.lock() {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(error = %e, "session_lifecycle_store: lock poisoned on record_open");
+                return RecordOpenOutcome::Unavailable;
+            }
+        };
+        self.record_open_locked(m, rec, false, None)
+    }
+
+    /// [`Self::record_open_checked`] for a reconcile bind taken from pane
+    /// evidence enumerated at `enumerated_at`, which says nothing about a write
+    /// made since. `None` — nothing written — when the bind would
+    ///
+    /// - MOVE the session's open row onto another terminal, and a write placed
+    ///   that row after the enumeration ([`Self::placed_after`]); or
+    /// - RE-OPEN the session's closed row, and it closed after the enumeration
+    ///   ([`Self::closed_after`]) — an operator closing the tab mid-pass, say,
+    ///   whose row would otherwise come back open on the dead pane and be
+    ///   restored by a restart before the next pass closed it again.
+    ///
+    /// The next pass, enumerated after the write, decides. A bind that is
+    /// written spares, in its supersede, every sibling placed after the
+    /// enumeration ([`Self::record_open_locked`]). Asked under the registry
+    /// lock the write takes, so no placement or close can land in between.
+    /// `enumerated_at: None` (no observation time) checks nothing.
+    #[must_use]
+    pub fn record_bind_checked(
+        &self,
+        rec: TerminalSessionRecord,
+        enumerated_at: Option<Instant>,
+    ) -> Option<RecordOpenOutcome> {
+        let m = match self.map.lock() {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(error = %e, "session_lifecycle_store: lock poisoned on record_bind_checked");
+                return Some(RecordOpenOutcome::Unavailable);
+            }
+        };
+        let id = rec.claude_session_id.as_str();
+        let older_than_the_row = enumerated_at.is_some_and(|at| match m.get(id) {
+            Some(row) if row.state == "open" => {
+                !rec.terminal_id.trim().is_empty()
+                    && row.terminal_id != rec.terminal_id
+                    && self.placed_after(id, at)
+            }
+            Some(_) => self.closed_after(id, at),
+            None => false,
+        });
+        if older_than_the_row {
+            return None;
+        }
+        Some(self.record_open_locked(m, rec, false, enumerated_at))
+    }
+
+    /// [`Self::record_open_checked`] for a claim nothing has shown launched
+    /// anything — the typed-resume sniff on a pane whose processes it could not
+    /// read. Decided under the registry lock, against the row as it is: a
+    /// CLOSED row of the session stays closed (`None`, nothing written), and an
+    /// existing open row keeps its origin — the claim's own grade is written
+    /// only on a row it creates. Otherwise exactly
+    /// [`Self::record_open_checked`], binding guard included.
+    #[must_use]
+    pub fn record_open_provisional(&self, rec: TerminalSessionRecord) -> Option<RecordOpenOutcome> {
+        let m = match self.map.lock() {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(error = %e, "session_lifecycle_store: lock poisoned on record_open_provisional");
+                return Some(RecordOpenOutcome::Unavailable);
+            }
+        };
+        if m.get(&rec.claude_session_id)
+            .is_some_and(|row| row.state != "open")
+        {
+            return None;
+        }
+        Some(self.record_open_locked(m, rec, true, None))
+    }
+
+    /// The write behind [`Self::record_open_checked`],
+    /// [`Self::record_bind_checked`] and [`Self::record_open_provisional`],
+    /// under the registry lock `m`, which it consumes. `provisional`: an
+    /// existing row's origin is never replaced. `enumerated_at`: when a
+    /// reconcile bind's evidence was enumerated — the supersede spares every
+    /// sibling placed after it, which that evidence cannot have seen.
+    fn record_open_locked(
+        &self,
+        m: std::sync::MutexGuard<'_, HashMap<String, TerminalSessionRecord>>,
+        rec: TerminalSessionRecord,
+        provisional: bool,
+        enumerated_at: Option<Instant>,
+    ) -> RecordOpenOutcome {
         // Normalize a stray empty/whitespace-only config_dir to None: it must
         // never become a bogus `CLAUDE_CONFIG_DIR=""` on resume, and the sticky
         // guard below must treat "no account reported" uniformly as None (so an
@@ -1745,6 +2319,9 @@ impl SessionLifecycleStore {
             restore_tier: non_empty(rec.restore_tier),
             gate_id: non_empty(rec.gate_id),
             gate_consuming_device_id: non_empty(rec.gate_consuming_device_id),
+            // The binding verdict is the store's own, never a caller's — a new
+            // row is created from `rec` below and must not inherit one.
+            binding_state: None,
             ..rec
         };
         let now = Utc::now().timestamp_millis();
@@ -1761,13 +2338,27 @@ impl SessionLifecycleStore {
         // read here before `rec`'s fields are moved into the entry below.
         let new_is_confirmed = rec.confirmed_at.is_some();
         let (merged, superseded) = {
-            let mut m = match self.map.lock() {
-                Ok(m) => m,
-                Err(e) => {
-                    warn!(error = %e, "session_lifecycle_store: lock poisoned on record_open");
-                    return;
-                }
-            };
+            let mut m = m;
+            // The binding guard, asked UNDER the lock that the write below
+            // takes: the oracle answers from memory, and a row moved between a
+            // check and a write would make the check moot.
+            if let Some(held_by) =
+                self.move_refusal_locked(&m, &new_id, &new_terminal_id, new_is_authoritative)
+            {
+                drop(m);
+                self.report_refusal(&new_id, &held_by, &new_terminal_id);
+                return RecordOpenOutcome::MoveRefused { held_by };
+            }
+            // What the bound pane's own `claude` records — for the bind-time
+            // `matched` and for sparing the sibling it runs — and the epoch of
+            // the observation that says so.
+            let (pane, pane_epoch) = self.pane_evidence_with_epoch(&new_terminal_id);
+            // The terminal the row held before this write, if it existed — a
+            // binding verdict is about ONE pane, so a move drops it — and
+            // whether it was open: creating, moving and re-opening a row are
+            // what PLACE it ([`Self::last_placed`]).
+            let previous_terminal = m.get(&new_id).map(|r| r.terminal_id.clone());
+            let reopened = m.get(&new_id).is_some_and(|r| r.state != "open");
             // W-B: a BRAND-NEW record binding a terminal inherits the spawn-time
             // device default another open record on that terminal already
             // carries. The seam records a provisional row at spawn; an account
@@ -1816,13 +2407,38 @@ impl SessionLifecycleStore {
             if !rec.terminal_id.trim().is_empty() {
                 entry.terminal_id = rec.terminal_id;
             }
+            // The binding verdict (`binding_state`) is the store's own: never
+            // taken from the incoming record (normalized away above), dropped
+            // when the row changes pane, and `matched` — tagged with the
+            // oracle's current epoch, the observation it rests on — when the
+            // bound pane's own `claude` names this session. A bind never writes
+            // `unknown`: that takes every pane in view, which the reconcile
+            // pass has.
+            let moved = previous_terminal
+                .as_deref()
+                .is_some_and(|t| t != entry.terminal_id);
+            if moved {
+                entry.binding_state = None;
+            }
+            if is_new_record || moved || reopened {
+                self.note_placed(&new_id);
+            }
+            if entry.terminal_id == new_terminal_id
+                && pane.named_session() == Some(entry.claude_session_id.as_str())
+            {
+                entry.binding_state = Some(BindingState::Matched);
+                self.tag_verdict(&new_id, pane_epoch);
+            }
             entry.provider = rec.provider;
             // Unasserted origin (zone-move backstop / boot re-assert) must not
             // degrade an authoritative binding to reconciled — preserve on
             // None. The incoming value is normalized so a legacy caller still
-            // passing "pinned"/"guessed" lands as authoritative/reconciled.
+            // passing "pinned"/"guessed" lands as authoritative/reconciled. A
+            // provisional write grades only a row it created.
             if let Some(origin) = normalize_origin(rec.origin) {
-                entry.origin = Some(origin);
+                if !provisional || is_new_record {
+                    entry.origin = Some(origin);
+                }
             }
             // Confirmation is monotonic: a provisional re-record (the spawn-time
             // writer, a zone-move backstop) must NEVER clear a confirmation a
@@ -1905,7 +2521,7 @@ impl SessionLifecycleStore {
             // for an account choice — the verified resume that re-asserts it
             // ends the wait. A re-record that leaves the row unbound (a blank
             // incoming terminal over a held, detached row) is not a bind, so
-            // the hold stays — the same rule as [`Self::rebind_terminal`].
+            // the hold stays — the same rule as [`Self::rebind_terminal_checked`].
             if !entry.terminal_id.trim().is_empty() {
                 entry.awaiting_account_since = None;
             }
@@ -1949,8 +2565,35 @@ impl SessionLifecycleStore {
             //     `new_is_confirmed`: only a NEW CONFIRMED binding retires a prior
             //     confirmed sibling — an authoritative-but-UNCONFIRMED incoming
             //     (itself not yet proven) must NOT evict a confirmed row.
+            //
+            // A sibling some live pane's own `claude` still RUNS is never a
+            // phantom or a finished tenant, whatever this bind says: it is
+            // spared (plan
+            // `2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session`).
+            // If it is THIS pane's, the bind is the suspect one, and the next
+            // pass judges both rows; if it is another pane's, its row belongs
+            // there, not in the closed set. So is a sibling placed after a
+            // reconcile bind's evidence was enumerated: that evidence predates
+            // it, and the next pass judges it.
             let mut superseded: Vec<TerminalSessionRecord> = Vec::new();
             if (new_is_authoritative || new_is_confirmed) && !new_terminal_id.is_empty() {
+                // The siblings some live pane's own record names, and those
+                // placed after the bind's evidence.
+                let spared: HashSet<String> = m
+                    .values()
+                    .filter(|o| {
+                        o.claude_session_id != new_id
+                            && o.terminal_id == new_terminal_id
+                            && o.state == "open"
+                    })
+                    .filter(|o| {
+                        let id = o.claude_session_id.as_str();
+                        pane.named_session() == Some(id)
+                            || !self.panes_naming(id).is_empty()
+                            || enumerated_at.is_some_and(|at| self.placed_after(id, at))
+                    })
+                    .map(|o| o.claude_session_id.clone())
+                    .collect();
                 for other in m.values_mut() {
                     // A row held for an account choice is never a sibling: the
                     // hold detached its terminal, so it cannot share this one.
@@ -1958,6 +2601,15 @@ impl SessionLifecycleStore {
                         || other.terminal_id != new_terminal_id
                         || other.state != "open"
                     {
+                        continue;
+                    }
+                    if spared.contains(&other.claude_session_id) {
+                        debug!(
+                            terminal_id = %new_terminal_id,
+                            spared = %other.claude_session_id,
+                            by = %new_id,
+                            "session-restore: spared a sibling a live pane's own claude still runs, or one placed after this bind's evidence"
+                        );
                         continue;
                     }
                     if other.confirmed_at.is_none() {
@@ -1991,6 +2643,7 @@ impl SessionLifecycleStore {
                     }
                 }
             }
+            self.note_closed(superseded.iter().map(|r| r.claude_session_id.as_str()));
             // O(1) durable write: the merged record plus any sibling this open
             // superseded — never the whole map.
             let mut deltas = Vec::with_capacity(1 + superseded.len());
@@ -2007,6 +2660,177 @@ impl SessionLifecycleStore {
         // Phase 4 cloud mirror — emit AFTER the durable local write, from
         // the MERGED record (origin/confirmation preservation applied).
         self.mirror_restore_record(&merged);
+        // The session landed on this terminal: a refusal episode for this very
+        // move is over. One onto another terminal is not — a re-record on the
+        // pane that already holds the session (a hook, a refresh) must not
+        // turn the next tick's identical refusal into a new episode.
+        if let Ok(mut episodes) = self.refused_episodes.lock() {
+            episodes.remove(&(new_id.clone(), merged.terminal_id.clone()));
+        }
+        RecordOpenOutcome::Recorded
+    }
+
+    /// The binding guard, run while the caller holds the registry lock (`m`).
+    /// `Some(old_terminal)` when writing `session_id` onto `new_terminal` would
+    /// MOVE its open row off `old_terminal`, a live pane whose own `claude`
+    /// record names the session, by a WEAK bind — one that is not
+    /// authoritative (`incoming_strong` false): a transcript correlation, an
+    /// mtime fallback, a restore rebind, a provisional typed-resume sniff. A
+    /// strong bind is never refused; neither is a move off a pane that runs
+    /// nothing, runs another session, cannot be read ([`PaneEvidence::Unknown`]
+    /// names nothing) or is not live. With no oracle attached nothing is
+    /// refused. The oracle answers from memory.
+    fn move_refusal_locked(
+        &self,
+        m: &HashMap<String, TerminalSessionRecord>,
+        session_id: &str,
+        new_terminal: &str,
+        incoming_strong: bool,
+    ) -> Option<String> {
+        if incoming_strong || new_terminal.trim().is_empty() {
+            return None; // a strong bind proceeds; a blank terminal moves nothing
+        }
+        let row = m.get(session_id)?;
+        if row.state != "open"
+            || row.terminal_id.trim().is_empty()
+            || row.terminal_id == new_terminal
+        {
+            return None;
+        }
+        let old_terminal = row.terminal_id.as_str();
+        // No oracle attached: no evidence, so nothing is refused.
+        self.pane_evidence.get()?;
+        (self.pane_evidence_of(old_terminal).named_session() == Some(session_id))
+            .then(|| old_terminal.to_string())
+    }
+
+    /// Make a refused move visible — once per episode: the first refusal of
+    /// this (session, refused terminal), or the first after a quiet
+    /// [`REFUSAL_EPISODE_GAP`], is logged at warn and counted; a repeat inside
+    /// the episode is logged at debug. Nothing is written: a refusal is a fact
+    /// about the bind, not about any row (plan
+    /// `2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session`).
+    fn report_refusal(&self, session_id: &str, held_by: &str, refused_terminal: &str) {
+        let now = std::time::Instant::now();
+        let new_episode = match self.refused_episodes.lock() {
+            Ok(mut episodes) => {
+                episodes.retain(|_, at| now.duration_since(*at) <= REFUSAL_EPISODE_GAP);
+                episodes
+                    .insert((session_id.to_string(), refused_terminal.to_string()), now)
+                    .is_none()
+            }
+            Err(_) => true,
+        };
+        if new_episode {
+            self.binding_counters()
+                .note_move_refused(session_id, held_by, refused_terminal);
+        } else {
+            debug!(
+                claude_session = session_id,
+                held_by, refused_terminal, "session binder: move refused again (same episode)"
+            );
+        }
+    }
+
+    /// Record a binding verdict for `claude_session_id`'s row, taken from the
+    /// pane observation numbered `epoch` — only while that row is still open
+    /// on `terminal_id`, the pane the verdict is about. The epoch is recorded
+    /// every time, so a verdict re-taken unchanged becomes current again
+    /// ([`Self::current_binding_verdicts`]). Returns the PREVIOUS state when the
+    /// verdict applied (the row written only on a change), `None` when it did
+    /// not (the row is gone, closed, or moved since the verdict was taken; or
+    /// the lock is poisoned).
+    pub fn set_binding_state(
+        &self,
+        claude_session_id: &str,
+        terminal_id: &str,
+        state: BindingState,
+        epoch: Option<u64>,
+    ) -> Option<Option<BindingState>> {
+        self.set_binding_state_from(claude_session_id, terminal_id, state, epoch, None)
+    }
+
+    /// [`Self::set_binding_state`] for a verdict taken from pane evidence
+    /// enumerated at `enumerated_at`: an `unknown` does not apply to a row a
+    /// write placed after that ([`Self::placed_after`]) — evidence older than
+    /// the placement does not contradict it — and `None` is returned as for any
+    /// verdict that did not apply. Checked under the registry lock.
+    pub(crate) fn set_binding_state_from(
+        &self,
+        claude_session_id: &str,
+        terminal_id: &str,
+        state: BindingState,
+        epoch: Option<u64>,
+        enumerated_at: Option<Instant>,
+    ) -> Option<Option<BindingState>> {
+        let mut m = match self.map.lock() {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(error = %e, "session_lifecycle_store: lock poisoned on set_binding_state");
+                return None;
+            }
+        };
+        let row = m.get_mut(claude_session_id)?;
+        if !open_on_terminal(row, terminal_id) {
+            return None;
+        }
+        if state == BindingState::Unknown
+            && enumerated_at.is_some_and(|at| self.placed_after(claude_session_id, at))
+        {
+            return None;
+        }
+        self.tag_verdict(claude_session_id, epoch);
+        let previous = row.binding_state;
+        if previous != Some(state) {
+            row.binding_state = Some(state);
+            let changed = row.clone();
+            // Not snapshotted or mirrored: the verdict is neither layout nor a
+            // restore wire field.
+            self.persist(
+                m,
+                &[LifecycleDelta::Upsert {
+                    rec: Box::new(changed),
+                }],
+            );
+        }
+        Some(previous)
+    }
+
+    /// Rule 3 of [`crate::session::pane_binding::binding_verdicts`]: withdraw a
+    /// `matched` no live pane evidences any more — `claude_session_id`'s row,
+    /// still open on `terminal_id` and reading `matched`, whose pane's own
+    /// record (the oracle's, now) does not name it. Re-checked HERE, under the
+    /// registry lock, against the row as it is now: a `matched` a bind wrote
+    /// after the reconcile pass took its snapshot is not wiped. An `unknown`
+    /// is never withdrawn: that would only let the same episode be counted
+    /// again. Returns whether it withdrew one.
+    pub fn withdraw_matched(&self, claude_session_id: &str, terminal_id: &str) -> bool {
+        let mut m = match self.map.lock() {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(error = %e, "session_lifecycle_store: lock poisoned on withdraw_matched");
+                return false;
+            }
+        };
+        if self.pane_evidence_of(terminal_id).named_session() == Some(claude_session_id) {
+            return false;
+        }
+        let Some(row) = m.get_mut(claude_session_id) else {
+            return false;
+        };
+        if !open_on_terminal(row, terminal_id) || row.binding_state != Some(BindingState::Matched) {
+            return false;
+        }
+        row.binding_state = None;
+        self.tag_verdict(claude_session_id, None);
+        let changed = row.clone();
+        self.persist(
+            m,
+            &[LifecycleDelta::Upsert {
+                rec: Box::new(changed),
+            }],
+        );
+        true
     }
 
     /// Mark an open session closed. No-op (no error) if the session is
@@ -2035,7 +2859,7 @@ impl SessionLifecycleStore {
     /// `old_terminal_id` is answered with [`CloseOutcome::TerminalSuperseded`] instead
     /// of being resolved against the map (where it would land as a
     /// mis-bound `NotFound`). Call it AFTER the replacement's
-    /// [`Self::record_open`] and BEFORE tearing the old PTY down — the
+    /// [`Self::record_open_checked`] and BEFORE tearing the old PTY down — the
     /// account migration's step 4.
     pub fn mark_terminal_superseded(&self, old_terminal_id: &str, new_terminal_id: &str) {
         let old = old_terminal_id.trim();
@@ -2082,7 +2906,7 @@ impl SessionLifecycleStore {
     /// ## Why this exists
     ///
     /// The durable binding is established as a `(terminal_id,
-    /// claude_session_id)` PAIR by [`Self::record_open`], and was historically
+    /// claude_session_id)` PAIR by [`Self::record_open_checked`], and was historically
     /// dissolved by `claude_session_id` ALONE. A frontend tab can legitimately
     /// carry a `claudeSessionId` that no longer keys the record for *its own*
     /// terminal — a provisional spawn-seam id, a restored id whose PTY was
@@ -2235,6 +3059,7 @@ impl SessionLifecycleStore {
                 // Unreachable: `resolve_close_target` only names OPEN rows.
                 _ => return outcome,
             };
+            self.note_closed([closed.claude_session_id.as_str()]);
             let workdir = closed.working_dir.clone();
             // Answered under the lock rather than off a full-map clone — the
             // clone existed only to serve this one query.
@@ -2289,7 +3114,7 @@ impl SessionLifecycleStore {
     /// row has no pane by design, and its old terminal id may already host
     /// another session — see [`awaiting_account_hold`]. `page_id` and
     /// `zone_index` stay, for placement. Only a bind ends the hold and re-binds
-    /// the row ([`Self::record_open`] on a verified resume).
+    /// the row ([`Self::record_open_checked`] on a verified resume).
     ///
     /// No write when nothing changes. Absent, closed or finished record (none
     /// of which the hold can hold) → no-op.
@@ -2346,6 +3171,10 @@ impl SessionLifecycleStore {
                     "session_lifecycle_store: held for an account choice — detached from its old terminal"
                 );
                 rec.terminal_id.clear();
+                // A verdict is about the pane it left; and a move is a
+                // placement ([`Self::last_placed`]).
+                rec.binding_state = None;
+                self.note_placed(claude_session_id);
             }
             if (rec.awaiting_account_since, rec.terminal_id.clone()) == before {
                 return; // already stamped and unbound — nothing to flush
@@ -2544,15 +3373,35 @@ impl SessionLifecycleStore {
     /// (the map is keyed by `claude_session_id`, so a swapped call puts a
     /// session id in the terminal slot and would silently rebind a record onto
     /// a "terminal" that is really another session).
-    pub fn rebind_terminal(&self, claude_session_id: &str, terminal_id: &str, zone_index: i32) {
+    ///
+    /// The same binding guard as [`Self::record_open_checked`], under the same
+    /// lock as the write. A rebind carries no evidence of its own (it re-points
+    /// a restored row at the tab the frontend made for it), so it is a WEAK
+    /// bind: it never takes a row from a live pane whose own record names the
+    /// session — [`RecordOpenOutcome::MoveRefused`]. After a restart the old
+    /// pane is gone and the rebind goes through. Every no-op answers
+    /// [`RecordOpenOutcome::Recorded`]: nothing was refused.
+    pub fn rebind_terminal_checked(
+        &self,
+        claude_session_id: &str,
+        terminal_id: &str,
+        zone_index: i32,
+    ) -> RecordOpenOutcome {
         let changed = {
             let mut m = match self.map.lock() {
                 Ok(m) => m,
                 Err(e) => {
                     warn!(error = %e, "session_lifecycle_store: lock poisoned on rebind_terminal");
-                    return;
+                    return RecordOpenOutcome::Unavailable;
                 }
             };
+            if let Some(held_by) =
+                self.move_refusal_locked(&m, claude_session_id, terminal_id, false)
+            {
+                drop(m);
+                self.report_refusal(claude_session_id, &held_by, terminal_id);
+                return RecordOpenOutcome::MoveRefused { held_by };
+            }
             // Checked WHILE the guard is already held — taking the lock a
             // second time to answer this would deadlock on a non-reentrant
             // Mutex. `debug_assert!` compiles out of release entirely, so this
@@ -2565,13 +3414,19 @@ impl SessionLifecycleStore {
                  claude_session_id={claude_session_id:?})"
             );
             let Some(rec) = m.get_mut(claude_session_id) else {
-                return; // unknown session — nothing to rebind
+                return RecordOpenOutcome::Recorded; // unknown session — nothing to rebind
             };
             if rec.state != "open" {
-                return; // closed/exited records are not restore targets
+                return RecordOpenOutcome::Recorded; // closed/exited records are not restore targets
             }
             if rec.terminal_id == terminal_id && rec.zone_index == zone_index {
-                return; // already current — no write, no flush
+                return RecordOpenOutcome::Recorded; // already current — no write, no flush
+            }
+            if rec.terminal_id != terminal_id {
+                // A binding verdict is about one pane; and a move is a
+                // placement ([`Self::last_placed`]).
+                rec.binding_state = None;
+                self.note_placed(claude_session_id);
             }
             rec.terminal_id = terminal_id.to_string();
             rec.zone_index = zone_index;
@@ -2591,6 +3446,13 @@ impl SessionLifecycleStore {
             changed
         };
         self.snapshot_change(std::iter::once(changed));
+        RecordOpenOutcome::Recorded
+    }
+
+    /// [`Self::rebind_terminal_checked`], discarding the outcome — for tests.
+    #[cfg(test)]
+    pub fn rebind_terminal(&self, claude_session_id: &str, terminal_id: &str, zone_index: i32) {
+        let _ = self.rebind_terminal_checked(claude_session_id, terminal_id, zone_index);
     }
 
     /// Mirror a terminal-page move into the durable registry, resolved by
@@ -2701,7 +3563,7 @@ impl SessionLifecycleStore {
     /// resume reopens it, but ONLY when the gate's outcome is already owned
     /// elsewhere.
     ///
-    /// The fields are sticky in [`Self::record_open`], so a gate-less reopen
+    /// The fields are sticky in [`Self::record_open_checked`], so a gate-less reopen
     /// would otherwise keep them. A later non-restorable close of the reopened
     /// row would then report `runner_restart` a second time for a gate that is
     /// already settled.
@@ -3097,10 +3959,23 @@ impl SessionLifecycleStore {
     /// Record that the provider ADOPTED `claude_session_id` from
     /// `predecessor` — its SessionStart hook reported the id with `source:
     /// "clear"` while `predecessor` was the session open on that terminal
-    /// (see [`TerminalSessionRecord::adopted_from`]). Writes only on change;
+    /// (see [`TerminalSessionRecord::adopted_from`]) — and whether
+    /// `predecessor` was then the pane's current `matched` row
+    /// ([`TerminalSessionRecord::adopted_from_matched`],
+    /// [`Self::matched_now_on`]). A mark naming the predecessor already
+    /// recorded never downgrades a confirmed link: a duplicate SessionStart
+    /// POST for the same id can land after the next pass, when the
+    /// predecessor is no longer the pane's matched row (the pane runs its
+    /// successor now), and what it reads then says nothing about the `/clear`.
+    /// A different predecessor takes its own flag. Writes only on change;
     /// no-op when the session is absent, `predecessor` is empty, or names the
     /// session itself. Never creates a record.
-    pub fn mark_adopted_from(&self, claude_session_id: &str, predecessor: &str) {
+    pub fn mark_adopted_from(
+        &self,
+        claude_session_id: &str,
+        predecessor: &str,
+        predecessor_matched: bool,
+    ) {
         if predecessor.trim().is_empty() || predecessor == claude_session_id {
             return;
         }
@@ -3112,11 +3987,21 @@ impl SessionLifecycleStore {
             }
         };
         let changed = match m.get_mut(claude_session_id) {
-            Some(rec) if rec.adopted_from.as_deref() != Some(predecessor) => {
+            Some(rec) => {
+                let same_predecessor = rec.adopted_from.as_deref() == Some(predecessor);
+                let matched = if same_predecessor {
+                    predecessor_matched || rec.adopted_from_matched
+                } else {
+                    predecessor_matched
+                };
+                if same_predecessor && rec.adopted_from_matched == matched {
+                    return;
+                }
                 rec.adopted_from = Some(predecessor.to_string());
+                rec.adopted_from_matched = matched;
                 rec.clone()
             }
-            _ => return,
+            None => return,
         };
         self.persist(
             m,
@@ -3491,6 +4376,7 @@ impl SessionLifecycleStore {
             let Some(mut rec) = m.remove(old_id) else {
                 return; // old id absent — nothing to re-key
             };
+            self.forget_removed([old_id]);
             rec.claude_session_id = new_id.to_string();
             m.insert(new_id.to_string(), rec.clone());
             self.persist(
@@ -3522,22 +4408,39 @@ impl SessionLifecycleStore {
     /// append, a removed id kept showing up from the older lines that still
     /// carried it. Omitting the entry is therefore behavior-preserving.
     pub fn remove_session(&self, claude_session_id: &str) {
+        let _ = self.remove_session_if(claude_session_id, |_| true);
+    }
+
+    /// [`Self::remove_session`], only if `still_removable` holds for the row as
+    /// it is under the registry lock the removal takes — so a row a write
+    /// confirmed, moved or placed again between a caller's look at it and this
+    /// removal is not removed on that look. `true` when the row was removed.
+    /// The predicate runs under the lock: it may ask this store's in-memory
+    /// placement ([`Self::placed_after`]), never anything that takes `map`.
+    pub fn remove_session_if(
+        &self,
+        claude_session_id: &str,
+        still_removable: impl FnOnce(&TerminalSessionRecord) -> bool,
+    ) -> bool {
         let mut m = match self.map.lock() {
             Ok(m) => m,
             Err(e) => {
                 warn!(error = %e, "session_lifecycle_store: lock poisoned on remove_session");
-                return;
+                return false;
             }
         };
-        if m.remove(claude_session_id).is_none() {
-            return; // absent — nothing to flush
+        if !m.get(claude_session_id).is_some_and(still_removable) {
+            return false; // absent, or no longer removable — nothing to flush
         }
+        m.remove(claude_session_id);
+        self.forget_removed([claude_session_id]);
         self.persist(
             m,
             &[LifecycleDelta::Remove {
                 id: claude_session_id.to_string(),
             }],
         );
+        true
     }
 
     /// Clone of the open record whose session is RUNNING on `terminal_id`, if
@@ -3578,11 +4481,19 @@ impl SessionLifecycleStore {
     /// ([`crate::session::reconcile::is_phantom_record`]) and the restore
     /// classifier, so only a real, correctly-identified session lights up
     /// session-scoped UI.
+    ///
+    /// A row whose [`BindingState`] is `Unknown` is skipped for the same
+    /// reason: the pane's own `claude` records a different session, so lighting
+    /// the tab up with this row would label the pane with another session's
+    /// name, PRs and account (plan
+    /// `2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session`).
     pub fn find_confirmed_open_by_terminal(
         &self,
         terminal_id: &str,
     ) -> Option<TerminalSessionRecord> {
-        self.ranked_open_on_terminal(terminal_id, |r| r.confirmed_at.is_some())
+        self.ranked_open_on_terminal(terminal_id, |r| {
+            r.confirmed_at.is_some() && r.binding_state != Some(BindingState::Unknown)
+        })
     }
 
     /// Record that a provider's SessionStart hook just reported
@@ -3637,6 +4548,8 @@ impl SessionLifecycleStore {
     /// subtree), so a first match over the `HashMap` would pick one by
     /// iteration order. This ranks instead, greatest wins:
     ///
+    /// 0. a row whose [`TerminalSessionRecord::binding_state`] is not `unknown`
+    ///    outranks one that is — the pane's own `claude` contradicts that row;
     /// 1. the latest SessionStart hook seen for the id in this process
     ///    ([`Self::note_session_start_hook`]) — a row with one outranks a row
     ///    without;
@@ -3653,12 +4566,29 @@ impl SessionLifecycleStore {
     /// session keeps the older stamp and would lose to the pane on
     /// `confirmed_at` alone. The process-local order leads the durable stamp
     /// because it cannot be misordered by a wall-clock step.
+    ///
+    /// The latest hook is the predecessor a `/clear` records for coord lineage,
+    /// even when the pane's last observation saw another session there — a
+    /// switch made since, which the next pass would see. Whether it WAS that
+    /// observed session is recorded beside it
+    /// ([`TerminalSessionRecord::adopted_from_matched`]): only then is it a
+    /// leftover whose mismatch goes uncounted.
     pub fn latest_open_on_terminal(
         &self,
         terminal_id: &str,
         exclude: &str,
     ) -> Option<TerminalSessionRecord> {
         self.ranked_open_on_terminal(terminal_id, |r| r.claude_session_id != exclude)
+    }
+
+    /// Whether `claude_session_id`'s CURRENT binding verdict is `matched` on
+    /// `terminal_id` ([`Self::current_binding_verdicts`]): that pane's own
+    /// `claude` named it in the latest observation. `false` without a fresh,
+    /// judged observation — unknown is never confirmation.
+    pub fn matched_now_on(&self, claude_session_id: &str, terminal_id: &str) -> bool {
+        self.current_binding_verdicts()
+            .get(claude_session_id)
+            .is_some_and(|v| v.terminal_id == terminal_id && v.state == BindingState::Matched)
     }
 
     /// The open row on `terminal_id` that `admit` accepts and that ranks
@@ -3700,6 +4630,13 @@ impl SessionLifecycleStore {
             .max_by(|a, b| {
                 let key = |r: &TerminalSessionRecord| {
                     (
+                        // A row its pane's own `claude` contradicts never
+                        // outranks one it does not (plan
+                        // `2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session`):
+                        // every terminal-keyed reader — the egress tenant, the
+                        // migration's source row — would otherwise act on the
+                        // session the pane does not run.
+                        r.binding_state != Some(BindingState::Unknown),
                         hooks.1.get(&r.claude_session_id).copied(),
                         r.last_session_start_at,
                         r.confirmed_at,
@@ -4060,6 +4997,17 @@ impl SessionLifecycleStore {
             if m.len() == before {
                 return; // nothing pruned — skip the write
             }
+            if let Ok(mut epochs) = self.verdict_epochs.lock() {
+                epochs.retain(|id, _| m.contains_key(id));
+            }
+            self.last_placed
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .retain(|id, _| m.contains_key(id));
+            self.last_closed
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .retain(|id, _| m.contains_key(id));
         }
         // A prune drops an unbounded number of rows and already scanned the
         // whole map, so it is O(N) by construction — fold straight into a fresh
@@ -4187,6 +5135,7 @@ impl SessionLifecycleStore {
             if closed == 0 {
                 return 0; // nothing collapsed — skip the write
             }
+            self.note_closed(closed_recs.iter().map(|r| r.claude_session_id.as_str()));
             (closed_recs, closed)
         };
         // Boot-time bulk repair — one compaction rather than N deltas.
@@ -4284,7 +5233,10 @@ impl SessionLifecycleStore {
     }
 
     /// Re-read this store's on-disk snapshot (+ WAL replay) and REPLACE the
-    /// in-memory map with it. Returns the record count now held.
+    /// in-memory map with it. Returns the record count now held. What this
+    /// process remembered of the replaced rows — verdict epochs, the servable
+    /// epoch, placements and closes — is forgotten with them, so a seeded row
+    /// never serves a stale verdict as current.
     ///
     /// THE DEFECT this exists for: the `seed-lifecycle-store` test seam writes
     /// the snapshot file directly, but a RUNNING runner holds the authoritative
@@ -4329,6 +5281,26 @@ impl SessionLifecycleStore {
             );
         }
         *m = fresh;
+        // What this process remembers of the replaced rows describes them, not
+        // the reloaded ones: no verdict of theirs is current, no placement or
+        // close of theirs is recent, and no observation's verdicts are served
+        // until a pass judges the reloaded rows. Lock order: `map` → each.
+        self.verdict_epochs
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
+        self.last_placed
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
+        self.last_closed
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
+        *self
+            .servable_epoch
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = None;
         let count = m.len();
         if let Err(e) = write_map(&self.path, &m) {
             warn!(error = %e, "session_lifecycle_store: reload snapshot rewrite failed");
@@ -4470,7 +5442,7 @@ pub enum CloseOutcome {
     /// observer, the workdir nonce kept. See
     /// [`SessionLifecycleStore::mark_terminal_superseded`].
     ///
-    /// Distinct from the `close_reason: "superseded"` that [`SessionLifecycleStore::record_open`]
+    /// Distinct from the `close_reason: "superseded"` that [`SessionLifecycleStore::record_open_checked`]
     /// writes when another session binds a ROW's terminal — that closes a row;
     /// this retires a terminal and closes nothing.
     #[serde(rename_all = "camelCase")]
@@ -4830,6 +5802,8 @@ fn detach_held_rows(map: &mut HashMap<String, TerminalSessionRecord>, now_ms: i6
     for rec in map.values_mut() {
         if awaiting_account_hold(rec, now_ms) && !rec.terminal_id.is_empty() {
             rec.terminal_id.clear();
+            // A verdict is about the pane it left.
+            rec.binding_state = None;
             detached += 1;
         }
     }
@@ -4853,8 +5827,8 @@ fn open_on_terminal(r: &TerminalSessionRecord, terminal_id: &str) -> bool {
 ///
 /// A held row has no pane by design, so it holds no terminal: the hold
 /// detaches `terminal_id` (blank = unbound, as for any uncorrelated row) and
-/// only a bind ends it ([`SessionLifecycleStore::record_open`],
-/// [`SessionLifecycleStore::rebind_terminal`]). That one rule keeps it out of
+/// only a bind ends it ([`SessionLifecycleStore::record_open_checked`],
+/// [`SessionLifecycleStore::rebind_terminal_checked`]). That one rule keeps it out of
 /// every terminal contest — the restore dedupe, the boot collision repair,
 /// `record_open`'s supersede arms, the poll's direct match and the frontend's
 /// reconnect — without an exemption in any of them.
@@ -5920,16 +6894,19 @@ pub(crate) fn test_open_record(id: &str) -> TerminalSessionRecord {
         finish_synced: false,
         spawn_device_default: None,
         adopted_from: None,
+        adopted_from_matched: false,
         last_session_start_at: None,
         gate_id: None,
         gate_consuming_device_id: None,
         gate_bound_boot_ms: None,
+        binding_state: None,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::pane_binding::FixedPanes;
     use tempfile::tempdir;
 
     /// Terminal liveness for [`SessionLifecycleStore::mark_awaiting_account`]
@@ -6153,10 +7130,12 @@ mod tests {
             finish_synced: false,
             spawn_device_default: None,
             adopted_from: None,
+            adopted_from_matched: false,
             last_session_start_at: None,
             gate_id: None,
             gate_consuming_device_id: None,
             gate_bound_boot_ms: None,
+            binding_state: None,
         }
     }
 
@@ -8063,6 +9042,875 @@ mod tests {
             }
         );
         assert_eq!(fired.load(Ordering::SeqCst), 1);
+    }
+
+    fn names(id: &str) -> PaneEvidence {
+        PaneEvidence::Names(id.to_string())
+    }
+
+    /// A store whose panes answer `panes` and whose binding counters are its
+    /// own, so a count is asserted exactly.
+    fn guarded_store(
+        dir: &std::path::Path,
+        panes: &[(&str, PaneEvidence)],
+    ) -> (SessionLifecycleStore, Arc<BindingCounters>) {
+        let store = SessionLifecycleStore::open(dir.join("s.json")).unwrap();
+        store.attach_pane_evidence(FixedPanes::of(panes));
+        let counters = Arc::new(BindingCounters::default());
+        store.attach_binding_counters(counters.clone());
+        (store, counters)
+    }
+
+    /// The binding guard (plan
+    /// `2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session`, Phase 3):
+    /// a confirmed `observed` bind of S_B onto pane A — the write rung 3 makes
+    /// in the Phase 1 reproduction — is REFUSED while B's own `claude` still
+    /// runs S_B. Nothing is written, nothing on either pane is marked, and the
+    /// refusal counts once however often it is retried.
+    #[test]
+    fn record_open_refuses_to_move_a_row_off_a_pane_that_still_runs_it() {
+        let dir = tempdir().unwrap();
+        let (store, counters) = guarded_store(
+            dir.path(),
+            &[("term-a", PaneEvidence::Unknown), ("term-b", names("s-b"))],
+        );
+        store.record_open(auth_on("s-a", "term-a"));
+        store.record_open(auth_on("s-b", "term-b"));
+
+        let thief = || {
+            let mut thief = rec("s-b");
+            thief.terminal_id = "term-a".to_string();
+            thief.origin = Some(ORIGIN_OBSERVED.to_string());
+            thief.confirmed_at = Some(999);
+            thief
+        };
+        for _ in 0..3 {
+            assert_eq!(
+                store.record_open_checked(thief()),
+                RecordOpenOutcome::MoveRefused {
+                    held_by: "term-b".to_string()
+                }
+            );
+        }
+
+        let b = store.get("s-b").unwrap();
+        assert_eq!(
+            (b.state.as_str(), b.terminal_id.as_str()),
+            ("open", "term-b")
+        );
+        assert!(
+            b.confirmed_at.is_none(),
+            "nothing of the refused record landed"
+        );
+        let a = store.get("s-a").unwrap();
+        assert_eq!(
+            (a.state.as_str(), a.terminal_id.as_str()),
+            ("open", "term-a")
+        );
+        assert_eq!(
+            (a.binding_state, b.binding_state),
+            (None, Some(BindingState::Matched)),
+            "a refusal marks no row: the refused pane's evidence names nothing, and \
+             S_B keeps the verdict its own pane gave it at bind time"
+        );
+        assert_eq!(counters.refused_moves(), 1, "one episode, three refusals");
+        assert_eq!(counters.mismatches(), 0);
+
+        // A re-record on the pane that holds the session (a hook, a refresh)
+        // does not end the episode: the next identical refusal is still the
+        // same one.
+        store.record_open(auth_on("s-b", "term-b"));
+        assert!(!store.record_open_checked(thief()).is_recorded());
+        assert_eq!(counters.refused_moves(), 1);
+        // A different refused destination is a different episode.
+        let mut elsewhere = thief();
+        elsewhere.terminal_id = "term-c".to_string();
+        assert!(!store.record_open_checked(elsewhere).is_recorded());
+        assert_eq!(counters.refused_moves(), 2);
+    }
+
+    /// The moves the guard ALLOWS — every strong bind, and every weak one off
+    /// a pane whose record does not name the session, unreadable included —
+    /// and the one it refuses: a weak bind off a pane whose own record names
+    /// the session. A moved row drops its old verdict: a verdict is about one
+    /// pane.
+    #[test]
+    fn record_open_refuses_only_a_weak_move_off_a_pane_whose_record_names_it() {
+        // (old pane's evidence, incoming is strong?, moved?)
+        let cases = [
+            (PaneEvidence::NoClaude, false, true),
+            (names("another-session"), false, true),
+            (PaneEvidence::Unknown, false, true),
+            (PaneEvidence::Unknown, true, true),
+            (names("s"), true, true),
+            (names("s"), false, false),
+        ];
+        for (old_pane, strong, moved) in cases {
+            let dir = tempdir().unwrap();
+            let (store, counters) = guarded_store(dir.path(), &[("term-old", old_pane.clone())]);
+            let mut original = rec("s");
+            original.terminal_id = "term-old".to_string();
+            store.record_open(original);
+            let _ = store.set_binding_state("s", "term-old", BindingState::Matched, None);
+
+            let mut incoming = rec("s");
+            incoming.terminal_id = "term-new".to_string();
+            incoming.origin = Some(
+                if strong {
+                    ORIGIN_AUTHORITATIVE
+                } else {
+                    ORIGIN_RECONCILED
+                }
+                .to_string(),
+            );
+            let outcome = store.record_open_checked(incoming);
+
+            let row = store.get("s").unwrap();
+            if moved {
+                assert_eq!(
+                    outcome,
+                    RecordOpenOutcome::Recorded,
+                    "{old_pane:?} strong={strong}"
+                );
+                assert_eq!(row.terminal_id, "term-new", "{old_pane:?} strong={strong}");
+                assert_eq!(row.binding_state, None, "the old pane's verdict is dropped");
+                assert_eq!(counters.refused_moves(), 0);
+            } else {
+                assert_eq!(
+                    outcome,
+                    RecordOpenOutcome::MoveRefused {
+                        held_by: "term-old".to_string()
+                    },
+                    "{old_pane:?} strong={strong}"
+                );
+                assert_eq!(row.terminal_id, "term-old", "{old_pane:?} strong={strong}");
+                assert_eq!(
+                    row.binding_state,
+                    Some(BindingState::Matched),
+                    "the held row keeps its own verdict"
+                );
+                assert_eq!(counters.refused_moves(), 1);
+            }
+        }
+    }
+
+    /// Bind-time verdict: a record bound onto a pane whose own `claude` names
+    /// THIS session reads `matched` at once, tagged with the oracle's epoch. A
+    /// bind never reads `unknown` — that takes every pane in view, which the
+    /// reconcile pass has. An incoming record's own `binding_state` is never
+    /// taken.
+    #[test]
+    fn record_open_marks_a_bind_matched_only_when_its_pane_names_it() {
+        let dir = tempdir().unwrap();
+        let (store, counters) = guarded_store(dir.path(), &[("term-a", names("s-a"))]);
+
+        let mut claims_matched = auth_on("s-x", "term-a");
+        claims_matched.binding_state = Some(BindingState::Matched);
+        store.record_open(claims_matched);
+        assert_eq!(
+            store.get("s-x").unwrap().binding_state,
+            None,
+            "neither matched (the pane names s-a) nor unknown, and never the caller's value"
+        );
+        assert_eq!(counters.mismatches(), 0);
+
+        store.record_open(auth_on("s-a", "term-a"));
+        assert_eq!(
+            store.get("s-a").unwrap().binding_state,
+            Some(BindingState::Matched)
+        );
+        store.serve_verdicts_from(0);
+        assert_eq!(
+            store
+                .current_binding_verdicts()
+                .get("s-a")
+                .map(|v| (v.terminal_id.as_str(), v.state)),
+            Some(("term-a", BindingState::Matched)),
+            "the bind-time verdict is the current observation's, on its pane"
+        );
+        // No evidence for a pane: no verdict.
+        store.record_open(auth_on("s-c", "term-c"));
+        assert_eq!(store.get("s-c").unwrap().binding_state, None);
+    }
+
+    /// The supersede scan spares a sibling some live pane's own `claude` still
+    /// runs: a bind onto a pane can be wrong (or ahead of the pane's record),
+    /// and closing a session that runs is not a phantom eviction.
+    #[test]
+    fn a_bind_never_supersedes_a_sibling_a_live_pane_runs() {
+        let dir = tempdir().unwrap();
+        let (store, _counters) = guarded_store(
+            dir.path(),
+            &[
+                ("term-a", names("runs-here")),
+                ("term-b", names("runs-there")),
+            ],
+        );
+        let mut here = auth_on("runs-here", "term-a");
+        here.origin = None; // unconfirmed and not authoritative: a phantom by shape
+        store.record_open(here);
+        let mut there = auth_on("runs-there", "term-a");
+        there.origin = None;
+        store.record_open(there);
+        let mut phantom = auth_on("phantom", "term-a");
+        phantom.origin = None;
+        store.record_open(phantom);
+
+        let mut incoming = auth_on("incoming", "term-a");
+        incoming.confirmed_at = Some(1);
+        assert!(store.record_open_checked(incoming).is_recorded());
+
+        let state = |id: &str| store.get(id).unwrap().state;
+        assert_eq!(state("runs-here"), "open", "the pane's own claude runs it");
+        assert_eq!(state("runs-there"), "open", "another pane's claude runs it");
+        assert_eq!(
+            state("phantom"),
+            "closed",
+            "nothing runs it: evicted as before"
+        );
+    }
+
+    /// A row its pane contradicts never lights up a tab: `terminal_list`'s
+    /// `sessionIdsByTerminal` reads through this lookup.
+    #[test]
+    fn find_confirmed_open_by_terminal_skips_a_row_its_pane_contradicts() {
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        let mut confirmed = auth_on("s-b", "term-a");
+        confirmed.confirmed_at = Some(1);
+        store.record_open(confirmed);
+        assert!(store.find_confirmed_open_by_terminal("term-a").is_some());
+
+        assert_eq!(
+            store.set_binding_state("s-b", "term-a", BindingState::Unknown, None),
+            Some(None),
+            "applied; the row was unchecked before"
+        );
+        assert!(store.find_confirmed_open_by_terminal("term-a").is_none());
+        assert_eq!(
+            store
+                .find_open_by_terminal("term-a")
+                .map(|r| r.claude_session_id),
+            Some("s-b".to_string()),
+            "the row itself is untouched — only the label lookup skips it"
+        );
+    }
+
+    /// A verdict applies only to the row still open on the pane it is about.
+    #[test]
+    fn set_binding_state_applies_only_to_the_row_still_open_on_that_pane() {
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        store.record_open(auth_on("s", "term-a"));
+        assert_eq!(
+            store.set_binding_state("s", "term-b", BindingState::Matched, None),
+            None
+        );
+        assert_eq!(
+            store.set_binding_state("absent", "term-a", BindingState::Matched, None),
+            None
+        );
+        assert_eq!(
+            store.set_binding_state("s", "term-a", BindingState::Matched, None),
+            Some(None)
+        );
+        assert_eq!(
+            store.set_binding_state("s", "term-a", BindingState::Matched, None),
+            Some(Some(BindingState::Matched)),
+            "a repeat reports the state it found"
+        );
+        store.record_close("s", "explicit");
+        assert_eq!(
+            store.set_binding_state("s", "term-a", BindingState::Unknown, None),
+            None
+        );
+    }
+
+    /// The restore rebind is a weak bind under the same guard: it never takes
+    /// a row from a live pane that still runs it, and says so.
+    #[test]
+    fn rebind_terminal_never_takes_a_row_from_a_live_pane_that_runs_it() {
+        let dir = tempdir().unwrap();
+        let (store, counters) = guarded_store(dir.path(), &[("term-a", names("s"))]);
+        store.record_open(auth_on("s", "term-a"));
+        assert_eq!(
+            store.rebind_terminal_checked("s", "term-b", 3),
+            RecordOpenOutcome::MoveRefused {
+                held_by: "term-a".to_string()
+            }
+        );
+        assert_eq!(store.get("s").unwrap().terminal_id, "term-a");
+        assert_eq!(counters.refused_moves(), 1);
+        // A pane gone since (no evidence) lets the rebind through.
+        store.record_open(auth_on("t", "term-gone"));
+        assert_eq!(
+            store.rebind_terminal_checked("t", "term-b", 3),
+            RecordOpenOutcome::Recorded
+        );
+        assert_eq!(store.get("t").unwrap().terminal_id, "term-b");
+        assert_eq!(
+            store.rebind_terminal_checked("absent", "term-b", 3),
+            RecordOpenOutcome::Recorded,
+            "nothing to move is not a refusal"
+        );
+    }
+
+    /// The census reads only CURRENT verdicts: taken from an observation at
+    /// or after the servable epoch, which the reconcile pass raises once its
+    /// first judgement of an observation is stored (review L3) — so between a
+    /// new observation and that judgement the previous observation's verdicts
+    /// stay served — and only while the latest observation is fresh. A verdict
+    /// from an older observation reads as unchecked; re-judging it makes it
+    /// current again. Each comes with the terminal it was judged on.
+    #[test]
+    fn only_a_verdict_from_the_servable_observation_on_is_current() {
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        let registry = Arc::new(crate::session::pane_binding::LivePaneRegistry::new());
+        store.attach_pane_evidence(registry.clone());
+        store.record_open(auth_on("s", "term-a"));
+        let served = |store: &SessionLifecycleStore| {
+            store
+                .current_binding_verdicts()
+                .get("s")
+                .map(|v| (v.terminal_id.clone(), v.state))
+        };
+        let matched_on_a = Some(("term-a".to_string(), BindingState::Matched));
+        assert_eq!(served(&store), None, "no observation yet");
+
+        let first = store.observe_panes(PaneObservation::default()).epoch();
+        assert_eq!(
+            store.set_binding_state("s", "term-a", BindingState::Matched, first),
+            Some(None)
+        );
+        assert_eq!(served(&store), None, "no pass has judged yet");
+        store.serve_verdicts_from(first.unwrap());
+        assert_eq!(served(&store), matched_on_a);
+
+        let second = store.observe_panes(PaneObservation::default()).epoch();
+        assert_ne!(first, second);
+        assert_eq!(
+            served(&store),
+            matched_on_a,
+            "until the new observation is judged, the previous one's verdicts stay served"
+        );
+        store.serve_verdicts_from(second.unwrap());
+        assert_eq!(
+            served(&store),
+            None,
+            "once it is, a verdict it did not re-take is not served"
+        );
+        assert_eq!(
+            store.get("s").unwrap().binding_state,
+            Some(BindingState::Matched),
+            "the row keeps it; only its currency lapsed"
+        );
+        let _ = store.set_binding_state("s", "term-a", BindingState::Matched, second);
+        assert_eq!(served(&store), matched_on_a);
+
+        // A verdict stored with no epoch is never current, and a reload
+        // carries none.
+        let _ = store.set_binding_state("s", "term-a", BindingState::Unknown, None);
+        assert_eq!(served(&store), None);
+        let _ = store.set_binding_state("s", "term-a", BindingState::Unknown, second);
+        drop(store);
+        let reloaded = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        reloaded.attach_pane_evidence(registry);
+        assert_eq!(
+            reloaded.get("s").unwrap().binding_state,
+            Some(BindingState::Unknown)
+        );
+        assert!(reloaded.current_binding_verdicts().is_empty());
+    }
+
+    /// Review N6: the floor admits every verdict from the servable
+    /// observation ON — `>=`, not `==`. A bind's `matched` taken from an
+    /// observation newer than the floor (stored after the pass raised it, and
+    /// before the next pass does) is current.
+    #[test]
+    fn a_bind_time_verdict_from_an_observation_past_the_floor_is_current() {
+        use crate::session::claude_activity::LivePid;
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        store.attach_pane_evidence(Arc::new(
+            crate::session::pane_binding::LivePaneRegistry::new(),
+        ));
+        let floor = store
+            .observe_panes(PaneObservation::default())
+            .epoch()
+            .unwrap();
+        store.serve_verdicts_from(floor);
+        let me = std::process::id();
+        let newer = store
+            .observe_panes(PaneObservation {
+                panes: [(
+                    "term-a".to_string(),
+                    vec![LivePid {
+                        pid: me,
+                        process_started_ms: None,
+                    }],
+                )]
+                .into_iter()
+                .collect(),
+                sessions: [(me, "s".to_string())].into_iter().collect(),
+                enumerated_at: Instant::now(),
+            })
+            .epoch()
+            .unwrap();
+        assert!(newer > floor, "precondition: an observation past the floor");
+
+        store.record_open(auth_on("s", "term-a"));
+
+        assert_eq!(
+            store
+                .current_binding_verdicts()
+                .get("s")
+                .map(|v| (v.terminal_id.as_str(), v.state)),
+            Some(("term-a", BindingState::Matched)),
+            "the bind's matched, from observation {newer}, is current over floor {floor}"
+        );
+    }
+
+    /// Review M2: a pass that re-derives the same `unknown` (rule 2 again)
+    /// re-tags it with the current epoch — without counting it again — so a
+    /// still-true `unknown` stays served; one that rule 3 merely keeps is not
+    /// re-tagged, and is not served.
+    #[test]
+    fn a_re_derived_unknown_stays_current_and_a_kept_one_does_not() {
+        use crate::session::pane_binding::{apply_binding_verdicts, binding_verdicts};
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        store.attach_pane_evidence(Arc::new(
+            crate::session::pane_binding::LivePaneRegistry::new(),
+        ));
+        let counters = Arc::new(BindingCounters::default());
+        store.attach_binding_counters(counters.clone());
+        store.record_open(auth_on("s", "term-a"));
+        let judge = |panes: &[(&str, PaneEvidence)]| {
+            let epoch = store.observe_panes(PaneObservation::default()).epoch();
+            let evidence: HashMap<String, PaneEvidence> = panes
+                .iter()
+                .map(|(t, e)| (t.to_string(), e.clone()))
+                .collect();
+            apply_binding_verdicts(
+                &store,
+                &binding_verdicts(&store.open_records(), &evidence),
+                epoch,
+                None,
+            );
+            store.serve_verdicts_from(epoch.unwrap());
+        };
+        let served = || store.current_binding_verdicts().get("s").map(|v| v.state);
+        let runs_elsewhere = [("term-a", names("x")), ("term-b", names("s"))];
+
+        judge(&runs_elsewhere);
+        assert_eq!(served(), Some(BindingState::Unknown));
+        judge(&runs_elsewhere);
+        assert_eq!(
+            served(),
+            Some(BindingState::Unknown),
+            "re-derived in a new epoch: still served"
+        );
+        assert_eq!(counters.mismatches(), 1, "and not counted again");
+
+        judge(&[("term-a", names("x"))]);
+        assert_eq!(
+            store.get("s").unwrap().binding_state,
+            Some(BindingState::Unknown),
+            "rule 3 keeps the unknown"
+        );
+        assert_eq!(served(), None, "but this observation did not produce it");
+    }
+
+    /// Rule 3's withdrawal is re-checked under the registry lock: it takes a
+    /// `matched` off a row its pane's record no longer names, never one the
+    /// pane names now (a bind that landed after the pass's snapshot), never an
+    /// `unknown`, and never a row that moved or closed.
+    #[test]
+    fn withdraw_matched_takes_only_a_matched_its_pane_no_longer_names() {
+        let dir = tempdir().unwrap();
+        let (store, _counters) = guarded_store(
+            dir.path(),
+            &[
+                ("term-a", names("named")),
+                ("term-b", PaneEvidence::NoClaude),
+            ],
+        );
+        store.record_open(auth_on("named", "term-a"));
+        assert_eq!(
+            store.get("named").unwrap().binding_state,
+            Some(BindingState::Matched)
+        );
+        assert!(
+            !store.withdraw_matched("named", "term-a"),
+            "the pane names it now"
+        );
+
+        store.record_open(auth_on("gone", "term-b"));
+        let _ = store.set_binding_state("gone", "term-b", BindingState::Matched, Some(0));
+        assert!(
+            !store.withdraw_matched("gone", "term-elsewhere"),
+            "not open there"
+        );
+        assert!(store.withdraw_matched("gone", "term-b"));
+        assert_eq!(store.get("gone").unwrap().binding_state, None);
+        assert!(!store.current_binding_verdicts().contains_key("gone"));
+
+        let _ = store.set_binding_state("gone", "term-b", BindingState::Unknown, Some(0));
+        assert!(
+            !store.withdraw_matched("gone", "term-b"),
+            "an unknown is kept"
+        );
+        assert_eq!(
+            store.get("gone").unwrap().binding_state,
+            Some(BindingState::Unknown)
+        );
+    }
+
+    /// Review L4: a row its pane contradicts never outranks one it does not,
+    /// whatever the hook order — every terminal-keyed reader (the egress
+    /// tenant, the migration's source row) takes the uncontradicted row.
+    #[test]
+    fn a_contradicted_row_never_outranks_a_matched_one_on_its_terminal() {
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        // Two open rows on one terminal, as a `/clear` leaves them: the older
+        // one confirmed, the newer one written by its hook (authoritative,
+        // unconfirmed — which supersedes only unconfirmed siblings).
+        let mut older = auth_on("matched", "term-a");
+        older.last_session_start_at = Some(100);
+        older.confirmed_at = Some(100);
+        let mut newer = auth_on("contradicted", "term-a");
+        newer.last_session_start_at = Some(200);
+        store.record_open(older);
+        store.record_open(newer);
+        assert_eq!(store.get("matched").unwrap().state, "open");
+        store.note_session_start_hook("contradicted");
+        assert_eq!(
+            store
+                .find_open_by_terminal("term-a")
+                .map(|r| r.claude_session_id),
+            Some("contradicted".to_string()),
+            "precondition: by hook order alone it wins"
+        );
+        let _ = store.set_binding_state("contradicted", "term-a", BindingState::Unknown, None);
+        let _ = store.set_binding_state("matched", "term-a", BindingState::Matched, None);
+        assert_eq!(
+            store
+                .find_open_by_terminal("term-a")
+                .map(|r| r.claude_session_id),
+            Some("matched".to_string())
+        );
+    }
+
+    /// Review L9: a verdict is about a live pane, so a close clears it — a
+    /// closed row serves neither a stale `matched` nor a withheld terminal.
+    #[test]
+    fn closing_a_row_clears_its_binding_verdict() {
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        store.record_open(auth_on("s", "term-a"));
+        let _ = store.set_binding_state("s", "term-a", BindingState::Unknown, None);
+        store.record_close("s", "explicit");
+        let closed = store.get("s").unwrap();
+        assert_eq!(closed.state, "closed");
+        assert_eq!(closed.binding_state, None);
+        assert!(
+            !store.withdraw_matched("s", "term-a"),
+            "nothing to withdraw on a closed row"
+        );
+    }
+
+    /// Round 11: `record_bind_checked` against the instant its evidence was
+    /// enumerated. A bind that would move the row back off the terminal a
+    /// later write placed it on writes nothing; a re-record where the row
+    /// already is moves nothing and is written; evidence enumerated after the
+    /// placement decides; and a bind with no enumeration time checks nothing.
+    #[test]
+    fn a_reconcile_bind_never_moves_a_row_placed_after_its_evidence() {
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        // Two `Instant`s taken back to back can tie.
+        let tick = || std::thread::sleep(std::time::Duration::from_millis(2));
+        let on = |terminal: &str| store.get("s").unwrap().terminal_id == terminal;
+        store.record_open(auth_on("s", "term-a"));
+        let enumerated = Instant::now();
+        tick();
+        store.record_open(auth_on("s", "term-b"));
+        assert!(store.placed_after("s", enumerated));
+
+        assert_eq!(
+            store.record_bind_checked(auth_on("s", "term-a"), Some(enumerated)),
+            None
+        );
+        assert!(on("term-b"), "not moved back");
+        assert_eq!(
+            store.record_bind_checked(auth_on("s", "term-b"), Some(enumerated)),
+            Some(RecordOpenOutcome::Recorded),
+            "a re-record where the row already is"
+        );
+        assert_eq!(
+            store.record_bind_checked(auth_on("s", "term-a"), None),
+            Some(RecordOpenOutcome::Recorded),
+            "no enumeration time: nothing to compare"
+        );
+        assert!(on("term-a"));
+        tick();
+        assert_eq!(
+            store.record_bind_checked(auth_on("s", "term-b"), Some(Instant::now())),
+            Some(RecordOpenOutcome::Recorded),
+            "evidence enumerated after the placement decides"
+        );
+        assert!(on("term-b"));
+    }
+
+    /// Round 11: evidence enumerated before a row CLOSED does not re-open it —
+    /// the operator closed the tab mid-pass, and a bind from that evidence
+    /// would put the row back open on the dead pane. Evidence enumerated after
+    /// the close re-opens it as before, and the re-open ends the close.
+    #[test]
+    fn a_reconcile_bind_never_re_opens_a_row_closed_after_its_evidence() {
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        let tick = || std::thread::sleep(std::time::Duration::from_millis(2));
+        store.record_open(auth_on("s", "term-a"));
+        let enumerated = Instant::now();
+        tick();
+        store.record_close("s", "explicit");
+        assert!(store.closed_after("s", enumerated));
+
+        assert_eq!(
+            store.record_bind_checked(auth_on("s", "term-a"), Some(enumerated)),
+            None
+        );
+        assert_eq!(store.get("s").unwrap().state, "closed", "not re-opened");
+        tick();
+        assert_eq!(
+            store.record_bind_checked(auth_on("s", "term-a"), Some(Instant::now())),
+            Some(RecordOpenOutcome::Recorded),
+            "evidence enumerated after the close decides"
+        );
+        assert_eq!(store.get("s").unwrap().state, "open");
+        assert!(!store.closed_after("s", enumerated), "the re-open ends it");
+    }
+
+    /// Round 11: a reconcile bind's supersede spares every sibling placed after
+    /// its evidence was enumerated — a respawn's pin and a hook-confirmed row
+    /// written on the pane mid-pass, which that evidence cannot have seen. A
+    /// bind from evidence enumerated after them retires both, as before.
+    #[test]
+    fn a_reconcile_bind_spares_a_sibling_placed_after_its_evidence() {
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        let enumerated = Instant::now();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let mut hooked = auth_on("hooked", "term-a");
+        hooked.confirmed_at = Some(1);
+        store.record_open(hooked);
+        store.record_open(auth_on("pin", "term-a"));
+        let mut bind = auth_on("s", "term-a");
+        bind.confirmed_at = Some(1);
+        let closed_as = |id: &str| {
+            let row = store.get(id).unwrap();
+            (row.state, row.close_reason)
+        };
+
+        assert_eq!(
+            store.record_bind_checked(bind.clone(), Some(enumerated)),
+            Some(RecordOpenOutcome::Recorded)
+        );
+        assert_eq!(closed_as("pin"), ("open".to_string(), None));
+        assert_eq!(closed_as("hooked"), ("open".to_string(), None));
+
+        assert_eq!(
+            store.record_bind_checked(bind, Some(Instant::now())),
+            Some(RecordOpenOutcome::Recorded)
+        );
+        assert_eq!(
+            closed_as("pin"),
+            ("closed".to_string(), Some("superseded".to_string()))
+        );
+        assert_eq!(
+            closed_as("hooked"),
+            (
+                "closed".to_string(),
+                Some("superseded-terminal-reuse".to_string())
+            )
+        );
+    }
+
+    /// Round 11: a reload from disk forgets what this process remembered of
+    /// the replaced rows. A verdict that was current before is not served as
+    /// current after — the reloaded row keeps its verdict from disk, but no
+    /// observation of this process has judged it — and no placement or close
+    /// of the replaced rows counts as recent.
+    #[test]
+    fn a_reload_from_disk_forgets_the_replaced_rows_verdicts_placements_and_closes() {
+        let dir = tempdir().unwrap();
+        let (store, _counters) = guarded_store(dir.path(), &[("term-a", names("s"))]);
+        let before = Instant::now();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        store.record_open(auth_on("s", "term-a"));
+        store.record_open(auth_on("c", "term-c"));
+        store.record_close("c", "explicit");
+        store.serve_verdicts_from(0);
+        let served = || store.current_binding_verdicts().get("s").map(|v| v.state);
+        assert_eq!(served(), Some(BindingState::Matched), "precondition");
+        assert!(store.placed_after("s", before) && store.closed_after("c", before));
+
+        assert_eq!(store.reload_from_disk().unwrap(), 2);
+        assert_eq!(
+            store.get("s").unwrap().binding_state,
+            Some(BindingState::Matched),
+            "the row keeps its verdict from disk"
+        );
+        assert_eq!(served(), None, "but it is not current");
+        assert!(!store.placed_after("s", before));
+        assert!(!store.closed_after("c", before));
+        // The verdict epochs went with the rows: raising the floor serves
+        // nothing until a pass judges again...
+        store.serve_verdicts_from(0);
+        assert_eq!(served(), None);
+        // ...and the servable epoch goes too: after another reload, a verdict
+        // judged since is not served until its pass raises the floor.
+        assert_eq!(store.reload_from_disk().unwrap(), 2);
+        let _ = store.set_binding_state("s", "term-a", BindingState::Matched, Some(0));
+        assert_eq!(served(), None);
+        store.serve_verdicts_from(0);
+        assert_eq!(served(), Some(BindingState::Matched));
+    }
+
+    /// A replayed `/clear` mark never downgrades a confirmed link: a duplicate
+    /// SessionStart POST for the same id, landing after the next pass, reads
+    /// the predecessor no longer matched, and the link stays confirmed. A
+    /// replay that confirms an unconfirmed link does. A mark naming a different
+    /// predecessor takes its own flag, either way.
+    #[test]
+    fn a_replayed_clear_mark_never_downgrades_a_confirmed_link() {
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        store.record_open(auth_on("s2", "term-a"));
+        let link = || {
+            let rec = store.get("s2").unwrap();
+            (rec.adopted_from, rec.adopted_from_matched)
+        };
+        let to = |predecessor: &str, matched: bool| (Some(predecessor.to_string()), matched);
+
+        store.mark_adopted_from("s2", "s", true);
+        assert_eq!(link(), to("s", true));
+        store.mark_adopted_from("s2", "s", false);
+        assert_eq!(link(), to("s", true), "the replay keeps the confirmation");
+
+        store.mark_adopted_from("s2", "t", false);
+        assert_eq!(
+            link(),
+            to("t", false),
+            "a different predecessor, its own flag"
+        );
+        store.mark_adopted_from("s2", "t", true);
+        assert_eq!(link(), to("t", true), "a replay may confirm");
+        store.mark_adopted_from("s2", "u", false);
+        assert_eq!(
+            link(),
+            to("u", false),
+            "a different predecessor, its own flag"
+        );
+    }
+
+    /// `adoptedFromMatched` round-trips through the snapshot when set, is left
+    /// out when not, and a row written before the field loads with it `false`
+    /// — an old store confirms no `/clear` link, so it grants no leftover.
+    #[test]
+    fn adopted_from_matched_round_trips_and_legacy_rows_load_it_false() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("s.json");
+        {
+            let store = SessionLifecycleStore::open(&path).unwrap();
+            store.record_open(auth_on("s", "term-a"));
+            store.record_open(auth_on("s2", "term-a"));
+            store.mark_adopted_from("s2", "s", true);
+            store.record_open(auth_on("t2", "term-b"));
+            store.mark_adopted_from("t2", "t", false);
+            store.compact();
+        }
+        let reopened = SessionLifecycleStore::open(&path).unwrap();
+        let s2 = reopened.get("s2").unwrap();
+        assert_eq!(
+            (s2.adopted_from.as_deref(), s2.adopted_from_matched),
+            (Some("s"), true)
+        );
+        assert_eq!(
+            serde_json::to_value(&s2).unwrap()["adoptedFromMatched"],
+            true
+        );
+        let t2 = reopened.get("t2").unwrap();
+        assert_eq!(
+            (t2.adopted_from.as_deref(), t2.adopted_from_matched),
+            (Some("t"), false)
+        );
+        assert!(serde_json::to_value(&t2)
+            .unwrap()
+            .get("adoptedFromMatched")
+            .is_none());
+
+        let legacy: TerminalSessionRecord = serde_json::from_value(serde_json::json!({
+            "claudeSessionId": "old",
+            "configDir": null,
+            "workingDir": null,
+            "pageId": "default",
+            "zoneIndex": 0,
+            "title": null,
+            "terminalId": "term-old",
+            "openedAt": 1,
+            "lastSeenAt": 1,
+            "state": "open",
+            "closedAt": null,
+            "closeReason": null,
+            "adoptedFrom": "older"
+        }))
+        .unwrap();
+        assert_eq!(
+            (legacy.adopted_from.as_deref(), legacy.adopted_from_matched),
+            (Some("older"), false)
+        );
+    }
+
+    /// `bindingState` round-trips camelCase through the snapshot, and a row
+    /// written before the field loads as unchecked.
+    #[test]
+    fn binding_state_round_trips_and_legacy_rows_load_without_it() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("s.json");
+        {
+            let store = SessionLifecycleStore::open(&path).unwrap();
+            store.record_open(auth_on("s", "term-a"));
+            store.set_binding_state("s", "term-a", BindingState::Matched, None);
+            store.compact();
+        }
+        let reopened = SessionLifecycleStore::open(&path).unwrap();
+        assert_eq!(
+            reopened.get("s").unwrap().binding_state,
+            Some(BindingState::Matched)
+        );
+        let wire = serde_json::to_value(reopened.get("s").unwrap()).unwrap();
+        assert_eq!(wire["bindingState"], "matched");
+
+        let legacy: TerminalSessionRecord = serde_json::from_value(serde_json::json!({
+            "claudeSessionId": "old",
+            "configDir": null,
+            "workingDir": null,
+            "pageId": "default",
+            "zoneIndex": 0,
+            "title": null,
+            "terminalId": "term-old",
+            "openedAt": 1,
+            "lastSeenAt": 1,
+            "state": "open",
+            "closedAt": null,
+            "closeReason": null
+        }))
+        .unwrap();
+        assert_eq!(legacy.binding_state, None);
     }
 
     /// The register is keyed by terminal id alone: a superseded entry must not
@@ -10193,10 +12041,12 @@ mod tests {
             finish_synced: false,
             spawn_device_default: None,
             adopted_from: None,
+            adopted_from_matched: false,
             last_session_start_at: None,
             gate_id: None,
             gate_consuming_device_id: None,
             gate_bound_boot_ms: None,
+            binding_state: None,
         }
     }
 
@@ -13249,6 +15099,7 @@ mod gate_continuation_tests {
             gate_id: Some(GATE.to_string()),
             gate_consuming_device_id: Some(DEVICE.to_string()),
             gate_bound_boot_ms: Some(boot),
+            binding_state: None,
             ..old_row()
         }
     }

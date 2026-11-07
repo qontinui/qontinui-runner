@@ -1048,6 +1048,7 @@ mod tests {
             session_id: session_id.map(str::to_string),
             session_status: status.map(str::to_string),
             session_status_since: None,
+            binding_state: None,
             blocks_restart: status != Some("finished"),
             wind_down: None,
         }

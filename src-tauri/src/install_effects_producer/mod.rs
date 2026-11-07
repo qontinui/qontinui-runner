@@ -288,7 +288,26 @@ async fn post_session_open(
 
     match store {
         Some(store) => {
-            record_session_open_into(&store, &req, &provider);
+            let outcome = record_session_open_into(&store, &req, &provider);
+            if !outcome.is_recorded() {
+                // Plan `2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session`:
+                // the hook's record is authoritative, which the binding guard
+                // never refuses, so this is `Unavailable` — the store could not
+                // take its registry lock (poisoned). Nothing was recorded on
+                // this terminal, so nothing is confirmed, stamped, emitted to
+                // the tab or re-keyed in coord — each would report a binding
+                // the store does not hold. 200 all the same: the hook must
+                // never wedge the provider's startup.
+                warn!(
+                    terminal_id = %req.terminal_id,
+                    session_id = %req.session_id,
+                    provider = %provider,
+                    source = %req.source.as_deref().unwrap_or("?"),
+                    outcome = ?outcome,
+                    "control/session-open: session NOT recorded — no confirmation, tab stamp or coord re-key"
+                );
+                return Ok(Json(ApiResponse::success(())));
+            }
             info!(
                 terminal_id = %req.terminal_id,
                 session_id = %req.session_id,
@@ -1201,11 +1220,18 @@ fn normalize_msys_cwd(cwd: &str) -> String {
 /// the SAME TERMINAL before falling back to the hook's own context. The terminal
 /// is the right key — the grid page and zone are properties of where the PTY
 /// sits, not of whichever session id currently owns it.
+///
+/// Returns what the store did with the record. Every step after the write —
+/// confirmation, the session-start stamp, the `/clear` adoption marker, the
+/// identity stamp — runs only when it was recorded. The record is
+/// authoritative, which the binding guard never refuses; the one other
+/// outcome is `Unavailable` (a poisoned registry lock), and then there is no
+/// row this hook wrote to stamp.
 fn record_session_open_into(
     store: &crate::session::session_lifecycle_store::SessionLifecycleStore,
     req: &SessionOpenRequest,
     provider: &str,
-) {
+) -> crate::session::session_lifecycle_store::RecordOpenOutcome {
     let existing = store.get(&req.session_id);
     // The most recent OTHER session open on this terminal, read before
     // `record_open` below can supersede it. Deterministic, not a first match:
@@ -1213,6 +1239,11 @@ fn record_session_open_into(
     // `SessionLifecycleStore::latest_open_on_terminal`), and the `/clear`
     // predecessor below must be the one that was actually running here.
     let terminal_latest = store.latest_open_on_terminal(&req.terminal_id, &req.session_id);
+    // Whether that session is the one this pane's own `claude` was last
+    // observed running — read, like it, before this hook's write.
+    let terminal_latest_matched = terminal_latest
+        .as_ref()
+        .is_some_and(|prior| store.matched_now_on(&prior.claude_session_id, &req.terminal_id));
     // Layout inheritance consults it only when the provider's id has no record
     // of its own; see the "inherited by TERMINAL" paragraph above.
     let terminal_prior = existing
@@ -1255,7 +1286,7 @@ fn record_session_open_into(
         .clone()
         .or_else(|| existing.as_ref().and_then(|r| r.config_dir.clone()))
         .or_else(|| terminal_prior.as_ref().and_then(|r| r.config_dir.clone()));
-    crate::commands::terminal::record_pinned_session_open(
+    let outcome = crate::commands::terminal::record_pinned_session_open(
         store,
         req.session_id.clone(),
         req.terminal_id.clone(),
@@ -1267,6 +1298,9 @@ fn record_session_open_into(
         provider.to_string(),
         None,
     );
+    if !outcome.is_recorded() {
+        return outcome;
+    }
     // CONFIRM the record (session-restore-redesign Phase 2 coordinator
     // refinement). This route is hit ONLY by a provider's SessionStart hook,
     // which fires only when a REAL provider session actually started in this
@@ -1290,10 +1324,18 @@ fn record_session_open_into(
     // pinned to some other id P, both rows stay open, and a `/clear` in X
     // continues X (X's own coord row), never P. Every other source (`resume`,
     // `startup`, `compact`, absent) records no predecessor. See
-    // `TerminalSessionRecord::adopted_from`.
+    // `TerminalSessionRecord::adopted_from`. Beside it, whether the
+    // predecessor was the pane's current `matched` row
+    // (`TerminalSessionRecord::adopted_from_matched`): a session switched to
+    // since the last observation, or a row a strong write put on the pane, is
+    // the latest hook without being that, and its link grants no leftover.
     if req.source.as_deref() == Some(HOOK_SOURCE_CLEAR) {
         if let Some(prior) = terminal_latest.as_ref() {
-            store.mark_adopted_from(&req.session_id, &prior.claude_session_id);
+            store.mark_adopted_from(
+                &req.session_id,
+                &prior.claude_session_id,
+                terminal_latest_matched,
+            );
         }
     }
 
@@ -1320,6 +1362,7 @@ fn record_session_open_into(
     {
         store.update_identity(&req.session_id, &live.identity_update());
     }
+    outcome
 }
 
 /// `POST /install-effects/run`.
@@ -2297,7 +2340,7 @@ mod tests {
             ..session_open_req("term-after-restore", csid)
         };
         assert!(session_open_rejection(&req).is_none());
-        record_session_open_into(&store, &req, "claude");
+        let _ = record_session_open_into(&store, &req, "claude");
 
         let after = store.get(csid).unwrap();
         assert_eq!(after.terminal_id, "term-after-restore");
@@ -2395,7 +2438,7 @@ mod tests {
 
         // Drive the handler's own contract: reject first, write only on accept.
         if session_open_rejection(&bad).is_none() {
-            record_session_open_into(&store, &bad, "claude");
+            let _ = record_session_open_into(&store, &bad, "claude");
         }
 
         assert!(
@@ -2416,7 +2459,7 @@ mod tests {
         // emptiness above is the gate working rather than a broken writer.
         let good = session_open_req("term-1", "good-id_1");
         if session_open_rejection(&good).is_none() {
-            record_session_open_into(&store, &good, "claude");
+            let _ = record_session_open_into(&store, &good, "claude");
         }
         assert!(
             store.get("good-id_1").is_some(),
@@ -2477,10 +2520,12 @@ mod tests {
             finish_synced: false,
             spawn_device_default: None,
             adopted_from: None,
+            adopted_from_matched: false,
             last_session_start_at: None,
             gate_id: None,
             gate_consuming_device_id: None,
             gate_bound_boot_ms: None,
+            binding_state: None,
         }
     }
 
@@ -2915,7 +2960,7 @@ mod tests {
             config_dir: Some("C:/cfg".to_string()),
             cwd: Some("C:/repos/widget".to_string()),
         };
-        record_session_open_into(&store, &req, "claude");
+        let _ = record_session_open_into(&store, &req, "claude");
 
         let open = store.open_records();
         assert_eq!(open.len(), 1, "exactly one record written");
@@ -2943,7 +2988,7 @@ mod tests {
         // and refreshes the row rather than duplicating it.
         let mut resume = req;
         resume.source = Some("resume".to_string());
-        record_session_open_into(&store, &resume, "claude");
+        let _ = record_session_open_into(&store, &resume, "claude");
         assert_eq!(
             store.open_records().len(),
             1,
@@ -3001,10 +3046,12 @@ mod tests {
             finish_synced: false,
             spawn_device_default: None,
             adopted_from: None,
+            adopted_from_matched: false,
             last_session_start_at: None,
             gate_id: None,
             gate_consuming_device_id: None,
             gate_bound_boot_ms: None,
+            binding_state: None,
         });
 
         // The confirming hook fires with bash-flavored context.
@@ -3016,7 +3063,7 @@ mod tests {
             config_dir: None, // hook may omit — must not erase the known one
             cwd: Some("/d/qontinui-root".to_string()),
         };
-        record_session_open_into(&store, &req, "claude");
+        let _ = record_session_open_into(&store, &req, "claude");
 
         let rec = store.get("sess-1").unwrap();
         assert_eq!(rec.page_id, "bf44dfd5-real-page", "page preserved");
@@ -3061,7 +3108,7 @@ mod tests {
                 config_dir: Some(config.clone()),
                 cwd: None,
             };
-            record_session_open_into(&store, &req, "claude");
+            let _ = record_session_open_into(&store, &req, "claude");
         };
         // Each terminal first hosts an open session, then the hook reports a
         // NEW id on it under each source.
@@ -3082,6 +3129,10 @@ mod tests {
             Some("prior-on-term-c"),
             "a clear records WHOSE session it continued"
         );
+        assert!(
+            !cleared.adopted_from_matched,
+            "with no observation, the link is not confirmed"
+        );
         for (id, _, source) in &cases[1..] {
             let rec = store.get(id).expect("recorded");
             assert_eq!(
@@ -3094,6 +3145,106 @@ mod tests {
         assert_eq!(store.get("cleared-alone").unwrap().adopted_from, None);
         // The first session on each terminal records none either.
         assert_eq!(store.get("prior-on-term-c").unwrap().adopted_from, None);
+    }
+
+    /// A `/clear` records the latest session on its pane as the predecessor —
+    /// coord lineage follows it — and, beside it, whether that session was the
+    /// pane's current `matched` row (plan
+    /// `2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session`). Only a
+    /// confirmed link makes the predecessor a leftover whose mismatch goes
+    /// uncounted:
+    ///
+    /// - pane 1, a `/clear` while matched: `a` → `a2`, confirmed; `a` resumed
+    ///   elsewhere is a leftover;
+    /// - pane 2, two switches inside one pass: `b` matched, then `c`'s hook
+    ///   (an in-TUI `/resume`), then a `/clear` → `c2`. The predecessor is `c`
+    ///   — the session the pane really cleared — but unconfirmed, the last
+    ///   observation having seen `b`; `c` resumed elsewhere is counted;
+    /// - pane 3, a wrong row written over the pane: `d` matched, then a hook
+    ///   carrying pane 3's terminal for `e`, which runs elsewhere, then a
+    ///   `/clear` → `d2`. The latest hook is `e`, so the predecessor is `e`,
+    ///   unconfirmed: `e`'s mismatch stays counted.
+    #[test]
+    fn a_clear_records_whether_its_predecessor_was_the_panes_matched_session() {
+        use crate::session::pane_binding::{binding_verdicts, FixedPanes, PaneEvidence};
+        use crate::session::session_lifecycle_store::{BindingState, SessionLifecycleStore};
+        let names = |id: &str| PaneEvidence::Names(id.to_string());
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        // What each pane's own `claude` was last observed running.
+        store.attach_pane_evidence(FixedPanes::of(&[
+            ("term-1", names("a")),
+            ("term-2", names("b")),
+            ("term-3", names("d")),
+        ]));
+        let config = dir.path().join("cfg").to_string_lossy().into_owned();
+        let open = |id: &str, term: &str, source: &str| {
+            let req = SessionOpenRequest {
+                terminal_id: term.to_string(),
+                session_id: id.to_string(),
+                source: Some(source.to_string()),
+                provider: Some("claude".to_string()),
+                config_dir: Some(config.clone()),
+                cwd: None,
+            };
+            assert!(record_session_open_into(&store, &req, "claude").is_recorded());
+        };
+        for (id, term) in [("a", "term-1"), ("b", "term-2"), ("d", "term-3")] {
+            open(id, term, "startup");
+        }
+        store.serve_verdicts_from(0);
+        for id in ["a", "b", "d"] {
+            assert_eq!(
+                store.current_binding_verdicts().get(id).map(|v| v.state),
+                Some(BindingState::Matched),
+                "precondition: {id} is its pane's matched row"
+            );
+        }
+        open("c", "term-2", "resume");
+        open("e", "term-3", "startup");
+        open("a2", "term-1", "clear");
+        open("c2", "term-2", "clear");
+        open("d2", "term-3", "clear");
+
+        let link = |id: &str| {
+            let rec = store.get(id).unwrap();
+            (rec.adopted_from, rec.adopted_from_matched)
+        };
+        assert_eq!(link("a2"), (Some("a".to_string()), true), "matched");
+        assert_eq!(
+            link("c2"),
+            (Some("c".to_string()), false),
+            "the session switched to since the last observation"
+        );
+        assert_eq!(
+            link("d2"),
+            (Some("e".to_string()), false),
+            "the wrong row, by hook order"
+        );
+
+        // The panes now run their successors, and each predecessor runs in a
+        // pane of its own: only the confirmed link grants a leftover.
+        let evidence: std::collections::HashMap<String, PaneEvidence> = [
+            ("term-1", "a2"),
+            ("term-2", "c2"),
+            ("term-3", "d2"),
+            ("term-x", "a"),
+            ("term-y", "c"),
+            ("term-z", "e"),
+        ]
+        .into_iter()
+        .map(|(term, id)| (term.to_string(), names(id)))
+        .collect();
+        let verdicts = binding_verdicts(&store.open_records(), &evidence);
+        let leftover = |id: &str| {
+            verdicts
+                .iter()
+                .find(|v| v.claude_session_id == id)
+                .map(|v| (v.state, v.leftover))
+        };
+        assert_eq!(leftover("a"), Some((Some(BindingState::Unknown), true)));
+        assert_eq!(leftover("c"), Some((Some(BindingState::Unknown), false)));
+        assert_eq!(leftover("e"), Some((Some(BindingState::Unknown), false)));
     }
 
     /// A pane pinned to P whose operator exited and typed `claude --resume X`
@@ -3120,7 +3271,7 @@ mod tests {
                     config_dir: Some(config.clone()),
                     cwd: None,
                 };
-                record_session_open_into(&store, &req, "claude");
+                let _ = record_session_open_into(&store, &req, "claude");
             };
             // Vary which id sorts first too, so a tie-break on the id cannot
             // pass the test by accident either.
@@ -3209,10 +3360,12 @@ mod tests {
                     finish_synced: false,
                     spawn_device_default: None,
                     adopted_from: None,
+                    adopted_from_matched: false,
                     last_session_start_at: None,
                     gate_id: None,
                     gate_consuming_device_id: None,
                     gate_bound_boot_ms: None,
+                    binding_state: None,
                 });
             };
             let hook = |id: &str, source: &str| {
@@ -3224,7 +3377,7 @@ mod tests {
                     config_dir: Some(config.clone()),
                     cwd: None,
                 };
-                record_session_open_into(&store, &req, "claude");
+                let _ = record_session_open_into(&store, &req, "claude");
             };
             let (pane, resumed) = if round % 2 == 0 {
                 ("aaaa-pane", "zzzz-resumed")
@@ -3310,10 +3463,12 @@ mod tests {
             finish_synced: false,
             spawn_device_default: None,
             adopted_from: None,
+            adopted_from_matched: false,
             last_session_start_at: None,
             gate_id: None,
             gate_consuming_device_id: None,
             gate_bound_boot_ms: None,
+            binding_state: None,
         });
 
         // The provider reports a DIFFERENT id about itself, from bash.
@@ -3325,7 +3480,7 @@ mod tests {
             config_dir: None,
             cwd: Some("/d/qontinui-root".to_string()),
         };
-        record_session_open_into(&store, &req, "claude");
+        let _ = record_session_open_into(&store, &req, "claude");
 
         let rec = store
             .get("provider-adopted-id")
@@ -3402,10 +3557,12 @@ mod tests {
             finish_synced: false,
             spawn_device_default: None,
             adopted_from: None,
+            adopted_from_matched: false,
             last_session_start_at: None,
             gate_id: None,
             gate_consuming_device_id: None,
             gate_bound_boot_ms: None,
+            binding_state: None,
         });
 
         let req = SessionOpenRequest {
@@ -3416,7 +3573,7 @@ mod tests {
             config_dir: None,
             cwd: Some("/d/qontinui-root".to_string()),
         };
-        record_session_open_into(&store, &req, "claude");
+        let _ = record_session_open_into(&store, &req, "claude");
 
         let rec = store.get("fresh-id").expect("hook record written");
         assert_eq!(
@@ -3465,7 +3622,7 @@ mod tests {
             cwd: None,
         };
         // The handler computes `provider`; mirror its default here.
-        record_session_open_into(&store, &req, "claude");
+        let _ = record_session_open_into(&store, &req, "claude");
         let rec = store.get("s").unwrap();
         // No cwd ⇒ title falls back to the provider name.
         assert_eq!(rec.title.as_deref(), Some("claude"));
