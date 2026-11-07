@@ -48,7 +48,7 @@ use serde::Serialize;
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TryRecvError};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
@@ -521,6 +521,67 @@ pub struct ThreadCensus {
     pub by_wait_reason: BTreeMap<String, usize>,
 }
 
+/// OS thread id of the thread that owns the runner's main window — the native
+/// UI thread. `0` = not identified yet (before the window exists, server mode,
+/// a headless build, or a non-Windows platform).
+///
+/// Plan `2026-11-04-runner-wedge-detector-reads-a-boot-as-a-wedge-and-never-bound-is-silent`,
+/// Phase 1. The anonymous [`ThreadCensus`] histogram cannot say what THE UI
+/// thread is waiting on — the one diagnostics record of a `ui_thread_wedged`
+/// escalation on file held only the histogram, with nothing to pick the main
+/// thread out of it. Published by the bin's `ui_thread_probe` whenever it
+/// caches the main window's handle; read by the [`CaptureStep::UiThread`] step.
+static UI_THREAD_OS_ID: AtomicU32 = AtomicU32::new(0);
+
+/// Record the native UI thread's OS thread id. `0` is ignored — it is the
+/// "not identified" sentinel, and a failed lookup must not erase a good id.
+pub fn set_ui_thread_os_id(tid: u32) {
+    if tid != 0 {
+        UI_THREAD_OS_ID.store(tid, Ordering::SeqCst);
+    }
+}
+
+/// The native UI thread's OS thread id, or `None` when it is not identified.
+pub fn ui_thread_os_id() -> Option<u32> {
+    match UI_THREAD_OS_ID.load(Ordering::SeqCst) {
+        0 => None,
+        tid => Some(tid),
+    }
+}
+
+/// The native UI thread's kernel scheduling state, read from the same native
+/// enumeration as [`ThreadCensus`] but for ONE identified thread.
+///
+/// **What a `ui_thread_wedged` reader does with it.** `state` says whether the
+/// thread is blocked (`Waiting`) or busy (`Running` / `Ready`); `wait_reason`
+/// says on what kind of wait (`UserRequest` is an ordinary wait on a handle,
+/// `WrLpcReply` / `WrAlertByThreadId` a synchronous call into another process
+/// or thread). The CPU times and `context_switches` are cumulative, so two
+/// records of one incident (escalate, re-escalate) tell a thread that is
+/// spinning (times climb) from one parked on a single wait (nothing moves).
+///
+/// **No stack, deliberately.** A user-mode stack of another thread needs
+/// `SuspendThread` on the UI thread plus `StackWalk64` and symbol loading.
+/// Suspending the thread the detector is reporting on, from the detector, is
+/// exactly the shared-fate move this module's rules forbid, and symbol loading
+/// is neither bounded nor cheap. A live dump of a reproduced freeze is the tool
+/// for the stack; this record says when and where to take it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UiThreadState {
+    pub os_thread_id: u32,
+    /// `KTHREAD_STATE` name — see [`thread_state_name`].
+    pub state: &'static str,
+    /// `KWAIT_REASON` name — see [`wait_reason_name`]. Meaningful only when
+    /// `state` is `Waiting`.
+    pub wait_reason: &'static str,
+    /// Cumulative user-mode CPU time, milliseconds.
+    pub user_time_ms: u64,
+    /// Cumulative kernel-mode CPU time, milliseconds.
+    pub kernel_time_ms: u64,
+    /// Cumulative context switches.
+    pub context_switches: u32,
+}
+
 /// Per-thread NAME tally for THIS process — the sibling of [`ThreadCensus`]
 /// that answers "what are these threads?" rather than "what are they waiting
 /// on?" (plan `2026-09-21-runner-blocking-pool-ratchets-to-peak-because-
@@ -742,8 +803,9 @@ pub struct WedgeDiagnosticRecord {
     /// never for elapsed arithmetic (see `unresponsive_for_secs`).
     pub ts: String,
     pub pid: u32,
-    /// `"escalate"` or `"re-escalate"` — the escalation that triggered this
-    /// capture.
+    /// `"escalate"`, `"re-escalate"`, or `"never-answered"` (the backend
+    /// rung's one-shot report of a `/livez` that has not answered since process
+    /// start) — the escalation that triggered this capture.
     pub event: &'static str,
     pub consecutive_failures: u32,
     /// Phase 3's REAL elapsed since the first failed probe of this incident,
@@ -752,6 +814,11 @@ pub struct WedgeDiagnosticRecord {
     pub unresponsive_for_ms: u64,
     pub tracked_blocking_bodies: TrackedBlockingBodies,
     pub threads: Captured<ThreadCensus>,
+    /// The native UI thread, named separately from the anonymous `threads`
+    /// histogram. `"ui_thread_not_identified"` when no main window has been
+    /// cached (server mode, before the window exists), `"ui_thread_not_found"`
+    /// when the identified thread is not among this process's threads.
+    pub ui_thread: Captured<UiThreadState>,
     pub children: Captured<ChildCensus>,
 }
 
@@ -873,6 +940,24 @@ pub fn cap_tally(tally: BTreeMap<String, usize>, keep: usize) -> BTreeMap<String
 // everywhere even though only Windows produces these codes
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Name of a kernel `KTHREAD_STATE` value
+/// (`SYSTEM_THREAD_INFORMATION.ThreadState`).
+pub fn thread_state_name(code: u32) -> &'static str {
+    match code {
+        0 => "Initialized",
+        1 => "Ready",
+        2 => "Running",
+        3 => "Standby",
+        4 => "Terminated",
+        5 => "Waiting",
+        6 => "Transition",
+        7 => "DeferredReady",
+        8 => "GateWaitObsolete",
+        9 => "WaitingForProcessInSwap",
+        _ => "UnknownThreadState",
+    }
+}
+
 /// Render a Windows `KWAIT_REASON` code as its kernel name.
 ///
 /// These are the kernel's own names, not WMI's `Win32_Thread.ThreadWaitReason`
@@ -983,6 +1068,8 @@ pub fn parse_proc_stat_ppid(stat: &str) -> Option<u32> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaptureStep {
     Threads,
+    /// The identified native UI thread ([`ui_thread_os_id`]).
+    UiThread,
     Children,
 }
 
@@ -992,6 +1079,8 @@ pub enum CaptureStep {
 #[derive(Debug, Clone, PartialEq)]
 pub enum StepOutput {
     Threads(Option<ThreadCensus>),
+    /// `Err` carries the reason string for the record.
+    UiThread(Result<UiThreadState, &'static str>),
     Children(Option<ChildCensus>),
 }
 
@@ -1000,6 +1089,7 @@ impl StepOutput {
         matches!(
             (self, step),
             (StepOutput::Threads(_), CaptureStep::Threads)
+                | (StepOutput::UiThread(_), CaptureStep::UiThread)
                 | (StepOutput::Children(_), CaptureStep::Children)
         )
     }
@@ -1011,6 +1101,7 @@ impl StepOutput {
 pub fn run_capture_step(step: CaptureStep) -> StepOutput {
     match step {
         CaptureStep::Threads => StepOutput::Threads(capture_thread_census()),
+        CaptureStep::UiThread => StepOutput::UiThread(capture_ui_thread_state()),
         CaptureStep::Children => StepOutput::Children(capture_child_census()),
     }
 }
@@ -1042,6 +1133,20 @@ pub fn capture_thread_census() -> Option<ThreadCensus> {
 #[cfg(target_os = "windows")]
 pub fn capture_thread_census() -> Option<ThreadCensus> {
     windows_thread_census::census()
+}
+
+/// The identified native UI thread's scheduling state — see [`UiThreadState`].
+#[cfg(target_os = "windows")]
+pub fn capture_ui_thread_state() -> Result<UiThreadState, &'static str> {
+    let tid = ui_thread_os_id().ok_or("ui_thread_not_identified")?;
+    windows_thread_census::thread_state(tid)
+}
+
+/// No native UI thread is identified off Windows: the main-window handle the
+/// id is derived from is a Win32 concept (`ui_thread_probe`).
+#[cfg(not(target_os = "windows"))]
+pub fn capture_ui_thread_state() -> Result<UiThreadState, &'static str> {
+    Err("unsupported_platform")
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
@@ -1290,7 +1395,7 @@ pub fn capture_child_census() -> Option<ChildCensus> {
 #[cfg(target_os = "windows")]
 #[allow(dead_code, non_snake_case)]
 mod windows_thread_census {
-    use super::{wait_reason_name, ThreadCensus};
+    use super::{thread_state_name, wait_reason_name, ThreadCensus, UiThreadState};
     use std::collections::BTreeMap;
 
     const SYSTEM_PROCESS_INFORMATION: u32 = 5;
@@ -1469,6 +1574,30 @@ mod windows_thread_census {
                 by_wait_reason,
             }
         })
+    }
+
+    /// One identified thread's scheduling state —
+    /// [`super::capture_ui_thread_state`]'s arm. `Err` names why there is no
+    /// value.
+    pub(super) fn thread_state(tid: u32) -> Result<UiThreadState, &'static str> {
+        let table = ProcessTable::read().ok_or("enumeration_failed")?;
+        table
+            .with_own_threads(|threads| {
+                threads
+                    .iter()
+                    .find(|t| t.client_id.unique_thread as usize as u32 == tid)
+                    .map(|t| UiThreadState {
+                        os_thread_id: tid,
+                        state: thread_state_name(t.thread_state),
+                        wait_reason: wait_reason_name(t.wait_reason),
+                        // The kernel reports both times in 100 ns units.
+                        user_time_ms: (t.user_time.max(0) as u64) / 10_000,
+                        kernel_time_ms: (t.kernel_time.max(0) as u64) / 10_000,
+                        context_switches: t.context_switches,
+                    })
+            })
+            .ok_or("enumeration_failed")?
+            .ok_or("ui_thread_not_found")
     }
 
     /// Every thread's description — [`super::capture_thread_name_census`]'s
@@ -1752,6 +1881,12 @@ impl WedgeDiagnostics {
             Ok(_) => Captured::Unavailable("timed_out"),
             Err(reason) => Captured::Unavailable(reason),
         };
+        let ui_thread = match self.capturer.capture(CaptureStep::UiThread) {
+            Ok(StepOutput::UiThread(Ok(state))) => Captured::Value(state),
+            Ok(StepOutput::UiThread(Err(reason))) => Captured::Unavailable(reason),
+            Ok(_) => Captured::Unavailable("timed_out"),
+            Err(reason) => Captured::Unavailable(reason),
+        };
         let children = match self.capturer.capture(CaptureStep::Children) {
             Ok(StepOutput::Children(Some(c))) => Captured::Value(c),
             Ok(StepOutput::Children(None)) => Captured::Unavailable("enumeration_failed"),
@@ -1768,6 +1903,7 @@ impl WedgeDiagnostics {
             unresponsive_for_ms: unresponsive_for.as_millis().min(u64::MAX as u128) as u64,
             tracked_blocking_bodies,
             threads,
+            ui_thread,
             children,
         }
     }
@@ -2595,6 +2731,14 @@ mod tests {
                     ("UserRequest".to_string(), 528),
                 ]),
             }),
+            ui_thread: Captured::Value(UiThreadState {
+                os_thread_id: 7104,
+                state: "Waiting",
+                wait_reason: "WrUserRequest",
+                user_time_ms: 1234,
+                kernel_time_ms: 56,
+                context_switches: 789,
+            }),
             children: Captured::Value(ChildCensus {
                 total: 324,
                 by_name: BTreeMap::from([("git.exe".to_string(), 324)]),
@@ -2639,6 +2783,8 @@ mod tests {
         );
         assert_eq!(v["threads"]["total"], 540);
         assert_eq!(v["threads"]["by_wait_reason"]["UserRequest"], 528);
+        assert_eq!(v["ui_thread"]["os_thread_id"], 7104);
+        assert_eq!(v["ui_thread"]["wait_reason"], "WrUserRequest");
         assert_eq!(v["children"]["total"], 324);
         assert_eq!(v["children"]["oldest"][0]["pid"], 9001);
     }
@@ -2669,6 +2815,8 @@ mod tests {
             + &untracked
             + r#"},"#
             + r#""threads":{"total":540,"by_wait_reason":{"Executive":12,"UserRequest":528}},"#
+            + r#""ui_thread":{"os_thread_id":7104,"state":"Waiting","wait_reason":"WrUserRequest","#
+            + r#""user_time_ms":1234,"kernel_time_ms":56,"context_switches":789},"#
             + r#""children":{"total":324,"by_name":{"git.exe":324},"#
             + r#""oldest":[{"pid":9001,"name":"git.exe","elapsed_secs":4000,"#
             + r#""cpu_percent":0.0}]}}"#
@@ -2860,6 +3008,7 @@ mod tests {
             tmp.path().to_path_buf(),
             BoundedCapturer::with_runner(Duration::from_millis(50), |s| match s {
                 CaptureStep::Threads => StepOutput::Threads(None),
+                CaptureStep::UiThread => StepOutput::UiThread(Err("ui_thread_not_identified")),
                 CaptureStep::Children => StepOutput::Children(None),
             }),
         );
@@ -2902,6 +3051,7 @@ mod tests {
             let _ = release_rx.recv();
             match s {
                 CaptureStep::Threads => StepOutput::Threads(None),
+                CaptureStep::UiThread => StepOutput::UiThread(Err("ui_thread_not_identified")),
                 CaptureStep::Children => StepOutput::Children(None),
             }
         });
@@ -2938,6 +3088,7 @@ mod tests {
                 let _ = release_rx.recv();
                 match s {
                     CaptureStep::Threads => StepOutput::Threads(None),
+                    CaptureStep::UiThread => StepOutput::UiThread(Err("ui_thread_not_identified")),
                     CaptureStep::Children => StepOutput::Children(None),
                 }
             }),
@@ -2955,6 +3106,7 @@ mod tests {
         let v: serde_json::Value =
             serde_json::from_str(body.trim_end()).expect("a valid JSONL record");
         assert_eq!(v["threads"], "timed_out");
+        assert_eq!(v["ui_thread"], "timed_out");
         assert_eq!(v["children"], "timed_out");
         assert_eq!(v["consecutive_failures"], 63);
         assert_eq!(
@@ -2980,6 +3132,14 @@ mod tests {
                     total: 7,
                     by_wait_reason: BTreeMap::from([("UserRequest".to_string(), 7)]),
                 })),
+                CaptureStep::UiThread => StepOutput::UiThread(Ok(UiThreadState {
+                    os_thread_id: 4242,
+                    state: "Waiting",
+                    wait_reason: "UserRequest",
+                    user_time_ms: 10,
+                    kernel_time_ms: 2,
+                    context_switches: 30,
+                })),
                 CaptureStep::Children => StepOutput::Children(Some(ChildCensus {
                     total: 2,
                     by_name: BTreeMap::from([("git".to_string(), 2)]),
@@ -2994,6 +3154,8 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(body.trim_end()).expect("valid JSONL");
         assert_eq!(v["event"], "re-escalate");
         assert_eq!(v["threads"]["total"], 7);
+        assert_eq!(v["ui_thread"]["os_thread_id"], 4242);
+        assert_eq!(v["ui_thread"]["state"], "Waiting");
         assert_eq!(v["children"]["total"], 2);
 
         // A second escalation appends rather than truncating.
@@ -3009,6 +3171,7 @@ mod tests {
     fn a_round_trip_returns_the_steps_own_output() {
         let mut cap = BoundedCapturer::with_runner(Duration::from_secs(30), |s| match s {
             CaptureStep::Threads => StepOutput::Threads(None),
+            CaptureStep::UiThread => StepOutput::UiThread(Err("ui_thread_not_found")),
             CaptureStep::Children => StepOutput::Children(Some(ChildCensus {
                 total: 0,
                 by_name: BTreeMap::new(),
@@ -3023,6 +3186,42 @@ mod tests {
             cap.capture(CaptureStep::Children),
             Ok(StepOutput::Children(Some(_)))
         ));
+        // A reason the step itself returned comes back as that reason, never as
+        // a timeout.
+        assert_eq!(
+            cap.capture(CaptureStep::UiThread),
+            Ok(StepOutput::UiThread(Err("ui_thread_not_found")))
+        );
+    }
+
+    #[test]
+    fn thread_state_names_are_the_kernels() {
+        assert_eq!(thread_state_name(2), "Running");
+        assert_eq!(thread_state_name(5), "Waiting");
+        assert_eq!(thread_state_name(9), "WaitingForProcessInSwap");
+        assert_eq!(thread_state_name(42), "UnknownThreadState");
+    }
+
+    /// The native arm finds a thread it was pointed at in THIS process — the
+    /// test thread itself stands in for the UI thread.
+    #[test]
+    #[cfg_attr(
+        not(target_os = "windows"),
+        ignore = "the UI thread is a Win32 concept"
+    )]
+    fn the_ui_thread_step_reads_an_identified_thread_of_this_process() {
+        #[cfg(target_os = "windows")]
+        {
+            let me = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
+            let state = windows_thread_census::thread_state(me).expect("own thread found");
+            assert_eq!(state.os_thread_id, me);
+            // This thread is executing the enumeration, so it is not Waiting.
+            assert_ne!(state.state, "Waiting", "{state:?}");
+            assert_eq!(
+                windows_thread_census::thread_state(u32::MAX - 3),
+                Err("ui_thread_not_found")
+            );
+        }
     }
 
     // ---- native census: it must produce plausible values for THIS process ----

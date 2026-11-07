@@ -1074,7 +1074,7 @@ fn collect_host_lane() -> ResourceSample {
     // cost on a 30s publish loop for the same reason this function's own doc
     // gives for the volume enumeration, and the wrong one on the synchronous
     // spawn path — which is why `spawn_gate_reading` carries none of it.
-    let probe_port = crate::install_effects_producer::intercept::bound_port();
+    let probe_port = crate::mcp::types::bound_port();
     s.sock_probe_port = Some(probe_port);
     match crate::fleet::socket_census::collect(probe_port) {
         Some(census) => {

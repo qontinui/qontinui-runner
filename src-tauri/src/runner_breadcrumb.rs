@@ -5,7 +5,7 @@
 //! # Why this exists
 //!
 //! Both of the runner's port resolvers are **in-process only**:
-//! `install_effects_producer::intercept::bound_port()` reads a process-global
+//! `mcp::types::bound_port()` reads a process-global
 //! `AtomicU16`, and `coord_mcp::resolve_bound_api_port()` needs a live Tauri
 //! `AppHandle`. Neither is reachable from a separate process — yet the identity
 //! shim (`bin/qontinui_shim.rs`), a *parent* of `claude`, must find a live
