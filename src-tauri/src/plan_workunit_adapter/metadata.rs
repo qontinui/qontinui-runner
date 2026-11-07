@@ -103,6 +103,7 @@ const SCANNER_OWNED_KEYS: &[ScannerKey] = &[
         name: "phases",
         absent_rule: AbsentRule::OmitWhenAbsent,
     },
+    // The plan file's `Repo(s):` / `Repos:` line (`body_push::extract_repos`).
     // `repos` has OTHER writers: sessions hand-write `metadata.repos` with
     // `coord_work_unit_upsert`, in both `qontinui/<repo>` and bare spellings
     // (measured on stored plan-backed units by plan
@@ -116,7 +117,6 @@ const SCANNER_OWNED_KEYS: &[ScannerKey] = &[
     ScannerKey {
         name: "repos",
         absent_rule: AbsentRule::OmitWhenAbsent,
-        source: "the plan file's `Repo(s):` line (`body_push::extract_repos`)",
     },
 ];
 
