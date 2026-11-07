@@ -2914,6 +2914,36 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
                     let row = resp.json::<JsonValue>().await.ok();
                     return PushOutcome::Conflict { row };
                 }
+                // Nor is a 409 on the `finished` PATCH a finish: "row gone"
+                // and "already finished" read the same here, and only a row
+                // OBSERVED reading `finished` may stamp `finish_synced`. A
+                // 409 body that carries the row reading `finished` is
+                // observed; anything else is unconfirmed and takes the
+                // bounded retry like an unconfirmed 2xx.
+                if kind == "finished" {
+                    use super::coord_sync_finish_ack::{
+                        finished_ack_verdict, unconfirmed_message, FinishedAck,
+                    };
+                    let body = match resp.text().await {
+                        Ok(body) => body,
+                        Err(e) => return PushOutcome::Transport(transport_error(&e)),
+                    };
+                    // Judge the BODY as a row: the status is already known.
+                    return match finished_ack_verdict(200, &body) {
+                        FinishedAck::Observed => PushOutcome::Acked,
+                        FinishedAck::Unconfirmed(reason) => {
+                            PushOutcome::Transport(unconfirmed_message(
+                                status.as_u16(),
+                                &format!("a 409 answer: {reason}"),
+                            ))
+                        }
+                        // Unreachable for the 200 judged above.
+                        FinishedAck::Refused => PushOutcome::Transport(unconfirmed_message(
+                            status.as_u16(),
+                            "a 409 answer",
+                        )),
+                    };
+                }
                 // Except a re-key: acking a 409 as success voided the re-key
                 // silently while the local record claimed it. coord's refusal
                 // that another active row holds the id is its own outcome; any
