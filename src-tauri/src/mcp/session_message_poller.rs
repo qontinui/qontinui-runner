@@ -962,16 +962,22 @@ enum ResolvedTarget {
 fn resolve_open_record(
     rec: &crate::session::session_lifecycle_store::TerminalSessionRecord,
 ) -> Option<ResolvedTarget> {
-    if rec.state != "open" {
-        return None;
-    }
-    if !typed_record_is_bound(rec) {
-        return None;
-    }
     Some(ResolvedTarget::Terminal {
-        terminal_id: rec.terminal_id.clone(),
+        terminal_id: bound_open_terminal_id(rec)?.to_string(),
         claude_session_id: rec.claude_session_id.clone(),
     })
+}
+
+/// The terminal an `open` lifecycle record may be ACTED ON through, by
+/// nothing but its own binding — `None` for a record in any other state (a
+/// closed session's terminal may already host someone else) or one whose
+/// binding is not known ([`typed_record_is_bound`]). The one predicate both
+/// the message injector ([`resolve_open_record`]) and the relay's remote
+/// attach/end resolver (`backend_relay::resolve_coord_terminal_id`) route on.
+pub(crate) fn bound_open_terminal_id(
+    rec: &crate::session::session_lifecycle_store::TerminalSessionRecord,
+) -> Option<&str> {
+    (rec.state == "open" && typed_record_is_bound(rec)).then_some(rec.terminal_id.as_str())
 }
 
 /// May a typed terminal's record route a message by itself, on nothing but
