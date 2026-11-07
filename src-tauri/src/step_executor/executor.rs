@@ -410,6 +410,10 @@ pub struct StepExecutor {
     /// Per-workflow security profile override (e.g., "standard", "strict").
     /// When set, overrides the default profile from settings.
     pub(crate) workflow_security_profile: Option<String>,
+    /// The workflow's own account pick, handed to every handler context so an
+    /// AI step's session runs under the workflow's account
+    /// (`HandlerContext::account`).
+    pub(crate) account: Option<crate::ai_provider::AccountChoice>,
 }
 
 impl StepExecutor {
@@ -427,6 +431,7 @@ impl StepExecutor {
             pid_tracker: None,
             path_scope_policy: crate::paths::PathScopePolicy::default(),
             workflow_security_profile: None,
+            account: None,
         }
     }
 
@@ -448,6 +453,7 @@ impl StepExecutor {
             pid_tracker: None,
             path_scope_policy: crate::paths::PathScopePolicy::default(),
             workflow_security_profile: None,
+            account: None,
         }
     }
 
@@ -468,6 +474,11 @@ impl StepExecutor {
     /// Set the per-workflow security profile override.
     pub fn set_workflow_security_profile(&mut self, profile: Option<String>) {
         self.workflow_security_profile = profile;
+    }
+
+    /// Set the workflow's account pick, propagated like the task run id.
+    pub fn set_account(&mut self, account: Option<crate::ai_provider::AccountChoice>) {
+        self.account = account;
     }
 
     /// Set the task run ID for database logging (mutable setter).
@@ -525,6 +536,7 @@ impl StepExecutor {
             self.pid_tracker.clone(),
         )
         .with_path_scope_policy(self.path_scope_policy.clone())
+        .with_account(self.account.clone())
         .with_security_policy(security_policy.clone())
         .with_audit_logger(audit_logger.clone());
 

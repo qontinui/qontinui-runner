@@ -50,6 +50,11 @@ impl VerificationExecutor {
         self.executor.set_task_run_id(task_run_id);
     }
 
+    /// Set the workflow's account pick, propagated like the task run id.
+    pub fn set_account(&mut self, account: Option<crate::ai_provider::AccountChoice>) {
+        self.executor.set_account(account);
+    }
+
     /// Set the path scope policy on the inner step executor.
     pub fn set_path_scope_policy(&mut self, policy: crate::paths::PathScopePolicy) {
         self.executor.set_path_scope_policy(policy);

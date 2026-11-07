@@ -603,9 +603,18 @@ pub async fn dispatch_subtask(
     };
 
     // 2. Re-pick the best account for THIS dispatch (account exhaustion
-    //    mitigation — never pin once per run). No-op only in Manual mode;
-    //    mirrors `agent_runtime`'s call site.
-    crate::ai_provider::account_usage::pick_best_account();
+    //    mitigation — never pin once per run). Carried into the spawn as this
+    //    dispatch's OWN pick (`AccountChoice::Picked`): parallel subtask
+    //    dispatch is the burst case, and reading the shared resolved dir back
+    //    would hand this worker whichever sibling picked last. `None` (Manual
+    //    mode, a gateway, no valid account) leaves the choice to the spawn.
+    //    The pick reads settings and cooldown state, so it runs on the
+    //    blocking pool, as the workflow loop controller's pick does.
+    let account = spawn_blocking_tracked(crate::ai_provider::account_usage::pick_best_account)
+        .await
+        .ok()
+        .flatten()
+        .map(crate::ai_provider::AccountChoice::Picked);
 
     // Resolve managed state up-front so a missing dependency fails loud before
     // we spawn a CLI we can't track.
@@ -647,7 +656,8 @@ pub async fn dispatch_subtask(
         // AiSessionContext tags this worker's output events with the
         // task_run_id so the tab + transcript bind to this worker. Mirrors
         // `create_ai_session`'s `AiSessionContext::setup`.
-        let session_ctx = crate::execution_context::AiSessionContext::setup(&trid, &task_name);
+        let mut session_ctx = crate::execution_context::AiSessionContext::setup(&trid, &task_name);
+        session_ctx.account = account;
 
         // Pin the CLI session id to the task_run_id for a deterministic
         // transcript path (restart-resume parity with create_ai_session).

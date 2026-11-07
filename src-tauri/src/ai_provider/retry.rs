@@ -178,6 +178,14 @@ where
     let mut rate_limit_waits: u32 = 0;
 
     loop {
+        // The account THIS attempt runs under. The providers resolve their
+        // account from the shared `RESOLVED_CONFIG_DIR` per call (threading a
+        // per-call account into them is out of scope for plan
+        // `2026-11-05-a-spawn-takes-its-own-account-pick-not-the-shared-resolved-dir`),
+        // so the closest observable is the global as it stands the instant the
+        // call is issued — not after it returns, by when a sibling's pick may
+        // have rewritten it. Rotation cools THIS dir.
+        let call_dir = super::config::get_resolved_config_dir();
         let response = operation();
 
         if response.success {
@@ -223,9 +231,12 @@ where
                 return response;
             }
 
-            if super::config::rotate_account_on_rate_limit() {
-                let new_account = super::config::get_resolved_config_dir()
-                    .unwrap_or_else(|| "unknown".to_string());
+            // `call_dir` is `None` when the global was unset as the call was
+            // issued: no account is named, so none is cooled, and rotation
+            // still publishes the first non-cooled account for the providers.
+            if let Some(new_account) =
+                super::config::rotate_account_on_rate_limit(call_dir.as_deref())
+            {
                 let label = std::path::Path::new(&new_account)
                     .file_name()
                     .and_then(|n| n.to_str())
@@ -347,6 +358,8 @@ where
         }
     }
 
+    // The account the primary call runs under — see `retry_with_backoff_tracked`.
+    let call_dir = super::config::get_resolved_config_dir();
     let response = primary();
     if response.success {
         if let Some(key) = primary_provider_key {
@@ -367,13 +380,13 @@ where
     if let Some(fb) = fallback {
         if is_retryable_error(error_msg) {
             // Rotate account on rate-limit before trying fallback
-            if is_rate_limit_error(error_msg) {
-                if super::config::rotate_account_on_rate_limit() {
-                    warn!(
-                        "{}: rate-limit on primary, rotated account before fallback",
-                        operation_name
-                    );
-                }
+            if is_rate_limit_error(error_msg)
+                && super::config::rotate_account_on_rate_limit(call_dir.as_deref()).is_some()
+            {
+                warn!(
+                    "{}: rate-limit on primary, rotated account before fallback",
+                    operation_name
+                );
             }
             warn!(
                 "{}: primary failed with retryable error, trying fallback model",

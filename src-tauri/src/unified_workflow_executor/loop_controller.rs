@@ -247,12 +247,21 @@ impl LoopController {
         // =====================================================================
         // PICK BEST CLAUDE ACCOUNT for this workflow run
         // =====================================================================
-        // Pin the account with the most-available cooldown state (first
+        // Pick the account with the most-available cooldown state (first
         // non-cooled, else closest-to-expiry). Runs once per workflow so
         // warm-provider prompt-cache locality is preserved across the
-        // workflow's many AI calls. No-op unless multi-account least-usage
-        // mode is enabled in settings.
-        let _ = spawn_blocking_tracked(crate::ai_provider::pick_best_account).await;
+        // workflow's many AI calls. The pick IS the workflow's account: it is
+        // propagated below to every phase executor (as the task run id is) and
+        // rides each AI session context as `AccountChoice::Picked`, so the
+        // children run under it rather than under whatever a sibling spawn
+        // last wrote to the shared resolved dir. `None` (Manual mode, a
+        // declared gateway, no credential-valid account) leaves each spawn to
+        // the resolver's no-choice arm.
+        let account = spawn_blocking_tracked(crate::ai_provider::pick_best_account)
+            .await
+            .ok()
+            .flatten()
+            .map(crate::ai_provider::AccountChoice::Picked);
 
         // =====================================================================
         // PROPAGATE TASK RUN ID to phase executors
@@ -266,6 +275,24 @@ impl LoopController {
         }
         self.completion_executor
             .set_task_run_id(config.execution_id.clone());
+
+        // =====================================================================
+        // PROPAGATE THE WORKFLOW'S ACCOUNT PICK to phase executors
+        // =====================================================================
+        self.setup_executor.set_account(account.clone());
+        if let Some(ve) = Arc::get_mut(&mut self.verification_executor) {
+            ve.set_account(account.clone());
+        } else {
+            warn!("verification executor is shared; the workflow's account pick is not propagated to it");
+        }
+        if let Some(ae) = Arc::get_mut(&mut self.agentic_executor) {
+            ae.set_account(account.clone());
+        } else {
+            warn!(
+                "agentic executor is shared; the workflow's account pick is not propagated to it"
+            );
+        }
+        self.completion_executor.set_account(account);
 
         // =====================================================================
         // PROPAGATE PATH SCOPE POLICY to phase executors

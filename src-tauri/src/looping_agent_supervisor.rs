@@ -1515,11 +1515,11 @@ async fn spawn_looping_agent_terminal(
     // instantly with a 401 under a quota-exhausted/unauthenticated default.
     // Resolved BEFORE the argv build so its per-account launch command can layer
     // into the shared launch seam.
-    let _ = spawn_blocking_tracked(crate::ai_provider::pick_best_account).await;
-    let (selected_config_dir, _config_dir_source) = {
-        let ai = crate::settings::get_ai_settings();
-        crate::ai_provider::get_effective_config_dir(&ai.claude_cli)
-    };
+    // The account is this spawn's OWN pick, never the shared resolved dir read
+    // back after it (a sibling's pick may have rewritten it in between).
+    let selected_config_dir = crate::agent_runtime::resolve_account_for_spawn(None)
+        .await
+        .dir;
     let launch_cfg = crate::claude_session::launch_spec::LaunchConfig::from_settings(
         selected_config_dir.as_deref(),
     );
