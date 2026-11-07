@@ -2407,9 +2407,6 @@ export function useTerminalInitialization({
                   await drainColdResume({
                     tabId: restore.tabId,
                     claudeSessionId,
-                    configDir: restore.claudeConfigDir,
-                    provider: restore.provider,
-                    gate: restore.gate,
                     zoneIndex: restore.recordOpen?.zoneIndex ?? -1,
                     readLiveIds: fetchLiveClaudeSessionIds,
                     updateTab,
@@ -2420,6 +2417,7 @@ export function useTerminalInitialization({
                         claudeSessionId,
                         configDir: restore.claudeConfigDir,
                         provider: restore.provider,
+                        gate: restore.gate,
                         updateTab,
                         recordOpen: restore.recordOpen,
                         // The pane was created as a plain shell just above, so
