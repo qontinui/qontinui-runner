@@ -65,14 +65,16 @@ Examples:
       --label "coord:upstream-of=qontinui/qontinui-schemas#42"
   set-label.sh --repo qontinui/qontinui-coord --pr 75 --label coord:merge-strategy=squash
 
-No label holds a PR. To hold one, place a coord hold once coord serves it
-(coord's own tools/list offers coord_set_pr_hold -- a runner proxy may filter
-it from your session's list; then use coord's door or the HTTP twin
-POST /coord/repos/<owner>/<repo>/pull-requests/<n>/hold; both are PLANNED and
-exist only once coord ships the hold):
+No label holds a PR. To hold one, place a coord hold (a runner proxy may filter
+coord_set_pr_hold from your session's list; then use coord's own POST /mcp door
+or the HTTP twin POST /coord/repos/<owner>/<repo>/pull-requests/<n>/hold):
   coord_set_pr_hold {"repo":"qontinui/qontinui-coord","pr_number":75,"held":true,"reason":"<why>"}
-Until then convert the PR to draft (gh pr ready --undo <n>) -- that works on
-public repos, and on private repos until the GitHub Free downgrade takes effect.
+To release it on a condition, give the hold a gate_id.
+On a repo whose own auto-merge.yml lands PRs, ignores a coord hold and honours
+an auto-merge:hold label (check its header), a coord hold holds nothing: label
+the PR auto-merge:hold instead. To release that,
+remove the label and re-fire the PR's lint (push, or gh run rerun <the head's
+lint run id>): removing it alone does not land the PR.
 EOF
 }
 
@@ -221,7 +223,7 @@ validate_label() {
   # RETIRED_HOLD_LABEL_ERR; retired 2026-06-20, nothing consumes the rows).
   case "$rest" in
     operator-review|version-bump|version-bump=*)
-      echo "error: $label: retired label — labels no longer hold PRs; place a coord hold (coord_set_pr_hold {repo, pr_number, held: true, reason}; to release it on a condition, give the hold a gate_id) once coord serves it, else convert the PR to draft (gh pr ready --undo), which works on public repos and on private repos until the GitHub Free downgrade" >&2
+      echo "error: $label: retired label — labels no longer hold PRs; place a coord hold (coord_set_pr_hold {repo, pr_number, held: true, reason}); to release it on a condition, give the hold a gate_id. On a repo whose auto-merge.yml honours an auto-merge:hold label instead of a coord hold, label the PR auto-merge:hold (to release: remove the label, then re-fire the PR's lint)" >&2
       return 1
       ;;
   esac
@@ -229,13 +231,14 @@ validate_label() {
   # `blocked` / `experimental` are the same retirement. coord matches them in
   # `data/repo_branches.rs` `inert_hold_labels` and posts
   # `render_inert_hold_label_comment` telling the author they do NOT hold the
-  # PR; their only live effect is downgrading dequeue routing (Contending, no
-  # fast-land). An author reaching for them wants a hold, so refuse and name
-  # the one that works. (Accepting them here was the 2026-07-10 incident's
+  # PR; their only live effects are downgrading dequeue routing (Contending, no
+  # fast-land) and dropping the PR out of topological-merge readiness. An
+  # author reaching for them wants a hold, so refuse and name the one that
+  # works. (Accepting them here was the 2026-07-10 incident's
   # shape: a PR "held" by `coord:blocked` auto-merged once green.)
   case "$rest" in
     blocked|experimental)
-      echo "error: $label: retired hold label — coord treats it as inert and the PR still auto-merges once green. To hold a PR, place a coord hold (coord_set_pr_hold {repo, pr_number, held: true, reason}) once coord serves it, else convert the PR to draft (gh pr ready --undo), which works on public repos and on private repos until the GitHub Free downgrade" >&2
+      echo "error: $label: retired hold label — it does not hold the PR, which still auto-merges once green. To hold a PR, place a coord hold (coord_set_pr_hold {repo, pr_number, held: true, reason}); to release it on a condition, give the hold a gate_id. On a repo whose auto-merge.yml honours an auto-merge:hold label instead of a coord hold, label the PR auto-merge:hold (to release: remove the label, then re-fire the PR's lint)" >&2
       return 1
       ;;
   esac
@@ -250,7 +253,7 @@ validate_label() {
   # unhelpful errors for one cause, and neither naming the fix.
   case "$rest" in
     priority|priority=*)
-      echo "error: coord:priority must be set on the PR itself (\`gh api -X POST repos/<owner>/<repo>/issues/<n>/labels -f 'labels[]=coord:priority'\`), and any holder of repo write — agent or operator — may set it on its own authority. A skill-set row is invisible on GitHub and inert in the merge scheduler, which only honours source='github' (provenance, not authority). Read it back with \`gh api repos/<owner>/<repo>/issues/<n>/labels\`. The label moves the queue only while COORD_MERGE_PRIORITY=on is deployed: read priority_reason on the queued row (coord_query_train_health -> candidates_in_flight) — 'label' = honoured; label_expired / label_ignored_multi_repo / label_not_github / aged / red_main_fix = this label did not count; 'none' = lane off or label not yet mirrored" >&2
+      echo "error: coord:priority must be set on the PR itself (\`gh api -X POST repos/<owner>/<repo>/issues/<n>/labels -f 'labels[]=coord:priority'\`), and any holder of repo write — agent or operator — may set it on its own authority. A skill-set row is invisible on GitHub and inert in the merge scheduler, which only honours source='github' (provenance, not authority). Read it back with \`gh api repos/<owner>/<repo>/issues/<n>/labels\`. The label moves the queue only while COORD_MERGE_PRIORITY=on is deployed: read priority_reason on the queued row (coord_query_train_health -> candidates_in_flight) — 'label' = honoured; label_expired / label_ignored_multi_repo / label_not_github / aged / red_main_fix / attested_destructive_migration = this label did not count; 'none' = lane off or label not yet mirrored" >&2
       return 1
       ;;
   esac
