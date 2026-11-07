@@ -636,6 +636,7 @@ mod tests {
             transport_kind: None,
             physical_device_id: None,
             activated_by: None,
+            bearer: crate::mcp::sdk_client::ConnectionBearer::Absent,
         };
         mgr.connections.insert(url.to_string(), conn);
         mgr.active_url = Some(url.to_string());
