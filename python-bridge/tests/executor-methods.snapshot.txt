@@ -14,8 +14,6 @@ _cmd_set_input_capture_enabled
 _cmd_start
 _cmd_status
 _cmd_stop
-_cmd_test_results_configure
-_cmd_test_results_status
 _cmd_update_capture_settings
 _emit_event_wrapper
 _fetch_contexts_content
