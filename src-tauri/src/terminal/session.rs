@@ -1693,19 +1693,52 @@ impl TerminalSession {
         extra_env: Option<Vec<(String, String)>>,
         resource_override: bool,
         spawn_tenant: Option<uuid::Uuid>,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, super::TerminalCreateError> {
         // Spawn-time resource gate — BEFORE the PTY is opened, so a refusal
         // leaves no half-built session behind and nothing already running is
         // touched. Below the warn floor this emits a notice and returns
         // `Ok(())`; below the critical floor it returns the typed refusal that
-        // `src/lib/resourceGuard.ts` turns into the "Start anyway" dialog. Any
-        // unreadable sensor proceeds silently.
+        // `src/lib/resourceGuard.ts` turns into the "Start anyway" dialog and
+        // `POST /terminals` into a retryable 503. Any unreadable sensor
+        // proceeds silently.
         crate::resource_guard::admit_spawn(
             "terminal session",
             resource_override,
             Some(&app_handle),
-        )?;
+        )
+        .map_err(super::TerminalCreateError::ResourceGuard)?;
+        Self::spawn_admitted(
+            id,
+            title,
+            working_dir,
+            page_id,
+            cols,
+            rows,
+            app_handle,
+            interceptor,
+            command,
+            extra_env,
+            spawn_tenant,
+        )
+        .map_err(super::TerminalCreateError::Failed)
+    }
 
+    /// [`Self::spawn`] past its resource gate: every failure from here on is a
+    /// real spawn failure, never a headroom verdict.
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_admitted(
+        id: TerminalId,
+        title: String,
+        working_dir: String,
+        page_id: String,
+        cols: u16,
+        rows: u16,
+        app_handle: AppHandle,
+        interceptor: Arc<OutputInterceptor>,
+        command: Option<Vec<String>>,
+        extra_env: Option<Vec<(String, String)>>,
+        spawn_tenant: Option<uuid::Uuid>,
+    ) -> Result<Self, String> {
         // The pane's backend: in-process `LocalPty`, or — behind
         // `terminal.pty_holder`, default ON on Linux since Phase 5 — an out-of-process PTY holder
         // (plan `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`
@@ -4334,6 +4367,12 @@ impl TerminalSession {
         self.grid_generation.load(Ordering::Acquire)
     }
 
+    /// Whether this pane is backed by an out-of-process PTY holder
+    /// ([`PaneIo::holder_backed`]).
+    pub fn holder_backed(&self) -> bool {
+        self.io.holder_backed()
+    }
+
     /// Get terminal info for the frontend.
     pub fn info(&self) -> TerminalInfo {
         // Phase 2: title is now `Arc<Mutex<String>>`. Clone under the lock
@@ -5839,6 +5878,15 @@ pub(crate) mod tests {
     /// reader/waiter threads are NOT spawned — `submit_prompt` only
     /// touches `self.writer`, so this is enough.
     pub(crate) fn make_test_session(buf: Arc<Mutex<Vec<u8>>>) -> TerminalSession {
+        make_test_session_with_io(buf, Arc::new(crate::terminal::pane_io::InertPaneIo))
+    }
+
+    /// [`make_test_session`] over a chosen pane backend, for tests that read
+    /// a property of the backend through the session (e.g. `holder_backed`).
+    pub(crate) fn make_test_session_with_io(
+        buf: Arc<Mutex<Vec<u8>>>,
+        io: Arc<dyn PaneIo>,
+    ) -> TerminalSession {
         let writer: Box<dyn Write + Send> = Box::new(CapturingWriter(buf));
         let (output_tx, _) = broadcast::channel::<String>(1);
         TerminalSession {
@@ -5847,7 +5895,7 @@ pub(crate) mod tests {
             working_dir: ".".to_string(),
             page_id: Arc::new(Mutex::new("default".to_string())),
             writer: Arc::new(Mutex::new(writer)),
-            io: Arc::new(crate::terminal::pane_io::InertPaneIo),
+            io,
             wire_flow: Arc::new(WireFlow::new(Arc::new(
                 crate::terminal::pane_io::InertPaneIo,
             ))),

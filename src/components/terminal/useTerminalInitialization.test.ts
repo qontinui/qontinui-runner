@@ -17,6 +17,8 @@ vi.mock("@tauri-apps/api/core", () => ({
 import {
   fetchOpenRecords,
   fetchRestoreSet,
+  unadoptedOrphansNotice,
+  pruneUnadoptedOrphans,
   waitForHolderSweep,
   recheckRefusedAfterSweep,
   HOLDER_SWEEP_RECHECK_ATTEMPTS,
@@ -28,6 +30,9 @@ import {
   ABORT_RETRY_BASE_MS,
   ABORT_RETRY_LIMIT,
   RerunTimers,
+  RestoreGuardRetry,
+  GUARD_GATE_HOLD_MS,
+  restoreGuardWaitKey,
   beginRestoreRun,
   scheduleRestoreRerun,
   settleRestoreRun,
@@ -53,6 +58,14 @@ import {
   type NeedsAccountRecord,
 } from "./useTerminalInitialization";
 import type { TerminalSessionRecord } from "./types";
+import {
+  GUARD_WAIT_INITIAL_MS,
+  ResourceGuardDeferral,
+  getWaitsSnapshot,
+  parseResourceGuardRefusal,
+  withdrawResourceGuardWait,
+} from "@/lib/resourceGuard";
+import wire from "@/lib/resourceGuardWire.fixture.json";
 import type { SessionOpenArgs } from "./sessionRecordArgs";
 
 /** The default Claude home the account rule is judged against. */
@@ -1158,6 +1171,49 @@ describe("applyDrainSkip (item 1 — the wiring, not just the decision)", () => 
  * device drain holds, `terminal_session_list_open` withholds the restore set
  * with a `deferredByDrain` marker. That must never read as "no sessions".
  */
+describe("pruneUnadoptedOrphans", () => {
+  const list = [
+    { removedPageIds: ["page-a"], sessionIds: ["s-1", "s-2", "s-3"] },
+    { removedPageIds: ["page-b"], sessionIds: null },
+  ];
+
+  it("drops what a partial adopting run adopted or no longer read, and keeps the rest", () => {
+    expect(pruneUnadoptedOrphans(list, new Set(["s-1", "s-3"]), new Set(["s-1"]), false)).toEqual([
+      { removedPageIds: ["page-a"], sessionIds: ["s-3"] },
+      { removedPageIds: ["page-b"], sessionIds: null },
+    ]);
+  });
+
+  it("drops an entry with nothing left, and returns the list itself when nothing moved", () => {
+    expect(
+      pruneUnadoptedOrphans(list.slice(0, 1), new Set(["s-2"]), new Set(["s-2"]), false),
+    ).toEqual([]);
+    const same = pruneUnadoptedOrphans(list, new Set(["s-1", "s-2", "s-3"]), new Set(), false);
+    expect(same).toBe(list);
+  });
+
+  it("clears everything after a run that reached every record", () => {
+    expect(pruneUnadoptedOrphans(list, new Set(["s-1"]), new Set(), true)).toEqual([]);
+  });
+});
+
+describe("unadoptedOrphansNotice", () => {
+  it("names the closed pages and the sessions no page adopted", () => {
+    expect(unadoptedOrphansNotice({ removedPageIds: ["page-a"], sessionIds: ["s-1", "s-2"] })).toBe(
+      "Closing page page-a left orphaned sessions s-1, s-2, and no page could adopt them. " +
+        "They are not restored; resume them from Previous Sessions.",
+    );
+  });
+
+  it("says so when the registry was never read", () => {
+    expect(unadoptedOrphansNotice({ removedPageIds: ["page-a", "page-b"], sessionIds: null })).toBe(
+      "Closing pages page-a, page-b left orphaned sessions it could not name (the session " +
+        "registry could not be read), and no page could adopt them. They are not restored; " +
+        "resume them from Previous Sessions.",
+    );
+  });
+});
+
 describe("fetchRestoreSet — coord device drain", () => {
   beforeEach(() => {
     mockInvoke.mockReset();
@@ -1198,7 +1254,20 @@ describe("fetchRestoreSet — coord device drain", () => {
 
     mockInvoke.mockResolvedValueOnce({ success: true, data: { sessions: [] } });
     const empty = await fetchRestoreSet("default");
-    expect(empty).toEqual({ records: [], deferredByDrain: null });
+    expect(empty).toEqual({ records: [], deferredByDrain: null, readFailed: false });
+  });
+
+  it("marks a failed read as failed, never as an empty restore set", async () => {
+    mockInvoke.mockRejectedValueOnce(new Error("ipc down"));
+    expect(await fetchRestoreSet("default")).toEqual({
+      records: [],
+      deferredByDrain: null,
+      readFailed: true,
+    });
+    mockInvoke.mockResolvedValueOnce({ success: false, error: "registry unreadable" });
+    expect((await fetchRestoreSet("default")).readFailed).toBe(true);
+    mockInvoke.mockResolvedValueOnce({ success: true, data: {} });
+    expect((await fetchRestoreSet("default")).readFailed).toBe(true);
   });
 
   it("keeps fetchOpenRecords' contract: a deferral yields no records", async () => {
@@ -1857,5 +1926,199 @@ describe("applyNeedsAccountNote (mark: false never touches the registry row)", (
     } finally {
       warn.mockRestore();
     }
+  });
+});
+
+/**
+ * A restore the resource guard refused is retried as a later MERGING run, not
+ * waited on inside the run (plan
+ * `2026-11-04-unplanned-restart-restore-is-page-gated-and-counts-unverified-resumes`
+ * Phase 5). The retry is a `RerunTimers` timer, so the two ways a wait used
+ * to outlive its page — an unmount, and a superseding run — both cancel it,
+ * and nothing reaches `terminal_create` afterwards.
+ */
+describe("RestoreGuardRetry — a guard-refused restore retries as a new run", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    mockInvoke.mockReset();
+  });
+  afterEach(() => {
+    for (const w of getWaitsSnapshot()) withdrawResourceGuardWait(w.key);
+    vi.useRealTimers();
+  });
+
+  const deferral = () =>
+    new ResourceGuardDeferral(
+      parseResourceGuardRefusal(wire.refusals.thread_count)!,
+      wire.refusals.thread_count,
+    );
+
+  function wiring() {
+    const runs: Array<{ pageId: string; merge: boolean }> = [];
+    const w: RestoreRerunWiring = {
+      queue: new RestoreRerunQueue(),
+      timers: new RerunTimers(),
+      markMerging: () => {},
+      trigger: (pageId, merge) => runs.push({ pageId, merge }),
+    };
+    const released: string[] = [];
+    const retry = new RestoreGuardRetry();
+    retry.setGateRelease((page) => released.push(page));
+    return { w, runs, released, retry };
+  }
+
+  it("publishes the wait and re-runs the page, merging, after the backoff", async () => {
+    const { w, runs, retry } = wiring();
+    retry.defer(w, "page-2", deferral(), "session restore", retry.begin("page-2"));
+    expect(getWaitsSnapshot()).toMatchObject([
+      {
+        key: restoreGuardWaitKey("page-2"),
+        sourceLabel: "session restore",
+        metric: "thread_count",
+        reading: { lane: null, observed: "540", limit: "400" },
+        refusals: 1,
+      },
+    ]);
+    await vi.advanceTimersByTimeAsync(GUARD_WAIT_INITIAL_MS - 1);
+    expect(runs).toEqual([]);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(runs).toEqual([{ pageId: "page-2", merge: true }]);
+    // The trigger only ARMS a run (a page off screen runs when activated): the
+    // wait stays up until a run of the page actually begins, saying it
+    // retries when the page is opened rather than naming a time.
+    expect(getWaitsSnapshot()).toMatchObject([{ retryAt: null }]);
+    expect(retry.owes("page-2")).toBe(true);
+    retry.begin("page-2");
+    expect(getWaitsSnapshot()).toEqual([]);
+
+    // Refused again: the next wait is twice as long.
+    retry.defer(w, "page-2", deferral(), "session restore", retry.begin("page-2"));
+    expect(getWaitsSnapshot()[0].refusals).toBe(2);
+    await vi.advanceTimersByTimeAsync(2 * GUARD_WAIT_INITIAL_MS - 1);
+    expect(runs).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(runs).toHaveLength(2);
+
+    // A run that restored without a refusal starts the backoff over.
+    retry.restored("page-2");
+    expect(retry.owes("page-2")).toBe(false);
+    retry.defer(w, "page-2", deferral(), "session restore", retry.begin("page-2"));
+    expect(getWaitsSnapshot()[0].refusals).toBe(1);
+  });
+
+  it("an unmount mid-wait cancels the retry: no re-run, no terminal_create, no wait left", async () => {
+    const { w, runs, retry } = wiring();
+    retry.defer(w, "page-2", deferral(), "session restore", retry.begin("page-2"));
+    // The hook's unmount cleanup.
+    w.timers.setActive(false);
+    retry.withdrawAll();
+    await vi.advanceTimersByTimeAsync(10 * GUARD_WAIT_INITIAL_MS);
+    expect(runs).toEqual([]);
+    expect(vi.getTimerCount()).toBe(0);
+    expect(getWaitsSnapshot()).toEqual([]);
+    expect(mockInvoke).not.toHaveBeenCalledWith("terminal_create", expect.anything());
+    // …and a run that settles after the unmount schedules nothing.
+    retry.defer(w, "page-2", deferral(), "session restore", retry.begin("page-2"));
+    expect(vi.getTimerCount()).toBe(0);
+    expect(getWaitsSnapshot()).toEqual([]);
+  });
+
+  it("an aborted retry run that leaves the page owed is re-armed at the same backoff", async () => {
+    const { w, runs, retry } = wiring();
+    retry.defer(w, "page-2", deferral(), "session restore", retry.begin("page-2"));
+    // The retry run begins (withdrawing the wait) and aborts.
+    beginRestoreRun(w, "page-2");
+    const run = retry.begin("page-2");
+    expect(getWaitsSnapshot()).toEqual([]);
+    retry.rearm(w, "page-2", run);
+    expect(getWaitsSnapshot()).toMatchObject([{ refusals: 1, retryAt: expect.any(Number) }]);
+    await vi.advanceTimersByTimeAsync(GUARD_WAIT_INITIAL_MS);
+    expect(runs).toEqual([{ pageId: "page-2", merge: true }]);
+  });
+
+  it("holds the auto-save gate for at most GUARD_GATE_HOLD_MS from the first deferral", async () => {
+    const { w, released, retry } = wiring();
+    retry.defer(w, "page-2", deferral(), "session restore", retry.begin("page-2"));
+    expect(retry.holdsSave("page-2")).toBe(true);
+    await vi.advanceTimersByTimeAsync(GUARD_GATE_HOLD_MS / 2);
+    // A second refusal does not restart the hold.
+    retry.defer(w, "page-2", deferral(), "session restore", retry.begin("page-2"));
+    await vi.advanceTimersByTimeAsync(GUARD_GATE_HOLD_MS / 2 - 1);
+    expect(released).toEqual([]);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(released).toEqual(["page-2"]);
+    expect(retry.gateReleased("page-2")).toBe(true);
+    expect(retry.holdsSave("page-2")).toBe(false);
+    expect(retry.owes("page-2")).toBe(true);
+    // A run that restores clears it all.
+    retry.restored("page-2");
+    expect(retry.gateReleased("page-2")).toBe(false);
+    expect(retry.owes("page-2")).toBe(false);
+  });
+
+  it("a re-mount that cleared the gate-hold re-arms it for what is left of the bound", async () => {
+    const { w, released, retry } = wiring();
+    retry.defer(w, "page-2", deferral(), "session restore", retry.begin("page-2"));
+    await vi.advanceTimersByTimeAsync(GUARD_GATE_HOLD_MS * 0.4);
+    // StrictMode re-mount: the cleanup clears the hold timer; the remount re-activates.
+    w.timers.setActive(false);
+    retry.withdrawAll();
+    w.timers.setActive(true);
+    // The page's next refusal on the same instance re-arms the hold from the
+    // FIRST deferral, not from now.
+    retry.defer(w, "page-2", deferral(), "session restore", retry.begin("page-2"));
+    await vi.advanceTimersByTimeAsync(GUARD_GATE_HOLD_MS * 0.6 - 1);
+    expect(released).toEqual([]);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(released).toEqual(["page-2"]);
+  });
+
+  it("a hold whose bound passed while no timer was armed releases on the next deferral", async () => {
+    const { w, released, retry } = wiring();
+    retry.defer(w, "page-2", deferral(), "session restore", retry.begin("page-2"));
+    w.timers.setActive(false);
+    retry.withdrawAll();
+    await vi.advanceTimersByTimeAsync(GUARD_GATE_HOLD_MS + 1);
+    expect(released).toEqual([]);
+    w.timers.setActive(true);
+    retry.defer(w, "page-2", deferral(), "session restore", retry.begin("page-2"));
+    expect(released).toEqual(["page-2"]);
+    expect(retry.holdsSave("page-2")).toBe(false);
+  });
+
+  it("forgetting a page drops its retry, its wait and its hold for good", async () => {
+    const { w, runs, released, retry } = wiring();
+    retry.defer(w, "page-2", deferral(), "session restore", retry.begin("page-2"));
+    retry.forget(w, "page-2");
+    expect(retry.owes("page-2")).toBe(false);
+    expect(getWaitsSnapshot()).toEqual([]);
+    await vi.advanceTimersByTimeAsync(2 * GUARD_GATE_HOLD_MS);
+    expect(runs).toEqual([]);
+    expect(released).toEqual([]);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("an unmount keeps what is owed but ends the gate-hold timer", async () => {
+    const { w, released, retry } = wiring();
+    retry.defer(w, "page-2", deferral(), "session restore", retry.begin("page-2"));
+    w.timers.setActive(false);
+    retry.withdrawAll();
+    expect(retry.holdsSave("page-2")).toBe(true);
+    await vi.advanceTimersByTimeAsync(2 * GUARD_GATE_HOLD_MS);
+    expect(released).toEqual([]);
+  });
+
+  it("a superseding run of the page cancels the retry and withdraws its wait", async () => {
+    const { w, runs, retry } = wiring();
+    retry.defer(w, "page-2", deferral(), "session restore", retry.begin("page-2"));
+    // The init effect's own start of a run for the page.
+    beginRestoreRun(w, "page-2");
+    retry.begin("page-2");
+    expect(getWaitsSnapshot()).toEqual([]);
+    await vi.advanceTimersByTimeAsync(10 * GUARD_WAIT_INITIAL_MS);
+    expect(runs).toEqual([]);
+    // Only the page's gate-hold is left: the run that began IS the retry, and
+    // the page stays owed until a run of it restores.
+    expect(vi.getTimerCount()).toBe(1);
   });
 });

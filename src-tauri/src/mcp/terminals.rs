@@ -308,7 +308,7 @@ pub(crate) fn edit_sibling_bad_request(
 pub async fn create_terminal_handler(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<CreateTerminalRequest>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+) -> Result<Json<ApiResponse<serde_json::Value>>, axum::response::Response> {
     let terminal_manager = get_terminal_manager(&state);
     let app_handle = state.app_handle.clone();
 
@@ -336,7 +336,8 @@ pub async fn create_terminal_handler(
         return Err((
             StatusCode::CONFLICT,
             Json(crate::coord_drain_state::api_refusal(&reason, class)),
-        ));
+        )
+            .into_response());
     }
 
     // The other half of D6: a `workingDir` the runner cannot use must come
@@ -353,7 +354,8 @@ pub async fn create_terminal_handler(
                 Json(api_error(format!(
                     "workingDir is not an existing directory: {dir}"
                 ))),
-            ));
+            )
+                .into_response());
         }
     }
 
@@ -362,7 +364,7 @@ pub async fn create_terminal_handler(
     // caller's to fix (a typed 400 naming the heal); an unreadable credential
     // store is UNKNOWN, so a 503 — see `spawn_tenant_bad_request`.
     let spawn_tenant = crate::commands::terminal::admit_spawn_tenant(request.tenant_id.as_deref())
-        .map_err(spawn_tenant_bad_request)?;
+        .map_err(|refusal| spawn_tenant_bad_request(refusal).into_response())?;
 
     // The declared edit siblings are judged here too, before the allocation a
     // refusal would otherwise leak — and before `acquire_for_terminal`'s
@@ -371,7 +373,13 @@ pub async fn create_terminal_handler(
         request.intent_repo.as_deref(),
         &request.edit_siblings,
     )
-    .map_err(edit_sibling_bad_request)?;
+    .map_err(|refusal| edit_sibling_bad_request(refusal).into_response())?;
+
+    // The requested account, then the resource guard's early-out — in that
+    // order, before `acquire_for_terminal` (see `admit_account_then_guard`).
+    let resolved_account = admit_account_then_guard(request.account.as_deref(), || {
+        crate::resource_guard::precheck_spawn("terminal session", false)
+    })?;
 
     // Phase 2 round 2 — route through the shared `acquire_for_terminal`
     // helper so this entry point matches the other five
@@ -404,28 +412,17 @@ pub async fn create_terminal_handler(
         )
         .unwrap_or_default();
 
-    // Per-request account pin: resolve → validate → pre-seed CLAUDE_CONFIG_DIR
-    // onto the PTY env (merged with the session env above, not replacing it).
-    // Bogus name → 400, logged-out → 409 — same contract as /sessions/spawn.
-    // The trust arm follows the pin: a resolved account means workspace trust is
+    // Per-request account pin, resolved above: pre-seed CLAUDE_CONFIG_DIR onto
+    // the PTY env (merged with the session env above, not replacing it). The
+    // trust arm follows the pin: a resolved account means workspace trust is
     // DERIVED for that one account at the PTY seam (and the dial is warmed here,
     // the async side, so the seam's sync gate does not decide on a cold cache);
     // no account means it is chosen by whatever the caller types.
     let mut trust_arm = crate::terminal::TrustArm::AccountChosenLater;
-    if let Some(account) = request.account.as_deref().filter(|a| !a.is_empty()) {
-        match crate::ai_provider::resolve_requested_account(account) {
-            Ok(resolved) => {
-                trust_arm = crate::terminal::TrustArm::Pinned(Some(resolved.config_dir.clone()));
-                extra_env_vec.push(("CLAUDE_CONFIG_DIR".to_string(), resolved.config_dir));
-                crate::claude_session::trust_gate::warm_dial().await;
-            }
-            Err(e @ crate::ai_provider::AccountSelectError::NotInRoster { .. }) => {
-                return Err((StatusCode::BAD_REQUEST, Json(api_error(e.message()))));
-            }
-            Err(e @ crate::ai_provider::AccountSelectError::NotLoggedIn { .. }) => {
-                return Err((StatusCode::CONFLICT, Json(api_error(e.message()))));
-            }
-        }
+    if let Some(resolved) = resolved_account {
+        trust_arm = crate::terminal::TrustArm::Pinned(Some(resolved.config_dir.clone()));
+        extra_env_vec.push(("CLAUDE_CONFIG_DIR".to_string(), resolved.config_dir));
+        crate::claude_session::trust_gate::warm_dial().await;
     }
 
     let extra_env = if extra_env_vec.is_empty() {
@@ -483,12 +480,145 @@ pub async fn create_terminal_handler(
 
             Ok(Json(ApiResponse::success(serde_json::json!(info))))
         }
-        Err(e) => {
-            error!("HTTP: Failed to create terminal session: {}", e);
-            Err((
+        Err(e) => Err(create_failure_response(e)),
+    }
+}
+
+/// `POST /terminals`' requested account, then the resource guard's early-out —
+/// in that order, both before `acquire_for_terminal`.
+///
+/// **The account first.** A bogus name is a `400` and a logged-out account a
+/// `409` (the same contract as `/sessions/spawn`): the caller's request is
+/// wrong, and no amount of waiting fixes it. Judged after the guard, a busy box
+/// would answer that request with a retryable `503`, and a scripted caller
+/// would retry a request that can never succeed.
+///
+/// **Then the guard** (`precheck`, injected so a test can make it refuse),
+/// BEFORE the allocation: under `QONTINUI_AGENT_WORKTREE_MODE` that allocation
+/// does a `git worktree add` and takes a coord claim, and a refusal at the PTY
+/// seam afterwards leaks the directory (`resource_guard::precheck_spawn` gives
+/// the whole argument; the Tauri `terminal_create` command runs the same
+/// pre-check for it). This door tells a refused caller to come back after
+/// `Retry-After`, so an unguarded allocation would leak one worktree per
+/// retry. The seam stays the authority and answers the same 503 if the box
+/// crossed the limit in between — and then the allocated worktree is left on
+/// disk for `agent_worktree::reclaim` to prune, the one place removal lives
+/// (`IsolatedEditContext::release_repo` gives the reasoning).
+fn admit_account_then_guard(
+    account: Option<&str>,
+    precheck: impl FnOnce() -> Result<(), crate::resource_guard::CriticalRefusal>,
+) -> Result<Option<crate::ai_provider::ResolvedAccount>, axum::response::Response> {
+    let resolved = match account.filter(|a| !a.is_empty()) {
+        None => None,
+        Some(account) => match crate::ai_provider::resolve_requested_account(account) {
+            Ok(resolved) => Some(resolved),
+            Err(e @ crate::ai_provider::AccountSelectError::NotInRoster { .. }) => {
+                return Err((StatusCode::BAD_REQUEST, Json(api_error(e.message()))).into_response());
+            }
+            Err(e @ crate::ai_provider::AccountSelectError::NotLoggedIn { .. }) => {
+                return Err((StatusCode::CONFLICT, Json(api_error(e.message()))).into_response());
+            }
+        },
+    };
+    precheck().map_err(|refusal| {
+        create_failure_response(crate::terminal::TerminalCreateError::ResourceGuard(refusal))
+    })?;
+    Ok(resolved)
+}
+
+/// How long `POST /terminals` tells a caller refused by the resource guard to
+/// wait before asking again (`Retry-After`, seconds).
+///
+/// 15 s is the cadence the webview's unattended restore already waits between
+/// guard refusals (`GUARD_WAIT_INITIAL_MS` in `src/lib/resourceGuard.ts`), so a
+/// scripted caller and the restore queue come back at the same rate rather than
+/// one hammering a box the other is waiting on. It is long against the guard's
+/// own sampling (one thread-table walk per
+/// [`crate::health_monitor::THREAD_READING_TTL`], 250 ms), so a retry always
+/// meets a fresh reading, and short against how long a refusal actually lasts —
+/// the box regains headroom when a running session finishes, which is seconds
+/// to minutes, not milliseconds. It is a hint, not a promise: the retry is
+/// judged afresh and may be refused again.
+const RESOURCE_GUARD_RETRY_AFTER_SECS: u64 = 15;
+
+/// The `resourceGuard` object of a `503` refusal: the lane, the reading and the
+/// limit as fields, so a caller deciding whether to wait never parses the
+/// operator-facing `error` text (which is free to be reworded).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ResourceGuardRefusalBody<'a> {
+    /// `"host"`, `"wsl"` or `"threads"`.
+    lane: &'a str,
+    /// `free_commit_bytes` (a floor: `observed` fell below `limit`) or
+    /// `thread_count` (a ceiling: `observed` rose above `limit`).
+    metric: &'static str,
+    /// The reading, in the metric's unit (bytes or threads).
+    observed: u64,
+    /// The floor or ceiling it was judged against, in the same unit.
+    limit: u64,
+    /// The `Retry-After` header's value, repeated for a client that reads only
+    /// the body.
+    retry_after_secs: u64,
+}
+
+/// `POST /terminals`' answer to a create that did not happen.
+///
+/// A resource-guard refusal is `503 Service Unavailable` with `Retry-After`,
+/// code `RESOURCE_GUARD_REFUSED` and a typed `resourceGuard` object: the box is
+/// short of headroom right now, which clears by itself, and the status says so
+/// — the `500` it used to be told a scripted caller the runner was broken.
+/// There is deliberately no override field to send instead (plan
+/// `2026-11-04-unplanned-restart-restore-is-page-gated-and-counts-unverified-resumes`
+/// D4): a door that let a remote caller start past the floor would undo the
+/// machine owner's own protection. The `error` text is unchanged, so a caller
+/// that matched the refusal prefix inside it still does.
+///
+/// Every other failure stays a `500` with the text it always had.
+fn create_failure_response(
+    error: crate::terminal::TerminalCreateError,
+) -> axum::response::Response {
+    match error {
+        crate::terminal::TerminalCreateError::ResourceGuard(refusal) => {
+            let observation = refusal.observation();
+            warn!(
+                lane = %observation.lane,
+                metric = observation.metric.wire_name(),
+                observed = observation.observed,
+                limit = observation.limit,
+                "HTTP: terminal create refused by the resource guard — answering 503, \
+                 Retry-After {RESOURCE_GUARD_RETRY_AFTER_SECS}s"
+            );
+            let body = ApiResponse::<()>::error_with_code(
+                format!("Failed to create terminal: {refusal}"),
+                "RESOURCE_GUARD_REFUSED",
+            );
+            let mut json = serde_json::to_value(&body).unwrap_or_else(|_| serde_json::json!({}));
+            if let Some(obj) = json.as_object_mut() {
+                obj.insert(
+                    "resourceGuard".into(),
+                    serde_json::json!(ResourceGuardRefusalBody {
+                        lane: &observation.lane,
+                        metric: observation.metric.wire_name(),
+                        observed: observation.observed,
+                        limit: observation.limit,
+                        retry_after_secs: RESOURCE_GUARD_RETRY_AFTER_SECS,
+                    }),
+                );
+            }
+            let mut response = (StatusCode::SERVICE_UNAVAILABLE, Json(json)).into_response();
+            response.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from(RESOURCE_GUARD_RETRY_AFTER_SECS),
+            );
+            response
+        }
+        crate::terminal::TerminalCreateError::Failed(message) => {
+            error!("HTTP: Failed to create terminal session: {}", message);
+            (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!("Failed to create terminal: {}", e))),
-            ))
+                Json(api_error(format!("Failed to create terminal: {}", message))),
+            )
+                .into_response()
         }
     }
 }
@@ -1212,6 +1342,124 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A thread-lane CRITICAL refusal as the spawn gate returns it.
+    fn thread_refusal() -> crate::resource_guard::CriticalRefusal {
+        crate::resource_guard::CriticalRefusal::new(
+            "terminal session",
+            crate::resource_guard::GateObservation {
+                lane: "threads".to_string(),
+                metric: crate::resource_guard::LaneMetric::ThreadCount,
+                observed: 540,
+                limit: 400,
+            },
+        )
+    }
+
+    async fn body_json(response: axum::response::Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("body reads");
+        serde_json::from_slice(&bytes).expect("body is JSON")
+    }
+
+    /// A resource-guard refusal on `POST /terminals` is a retryable 503, not a
+    /// 500: `Retry-After` in seconds, code `RESOURCE_GUARD_REFUSED`, and the
+    /// lane, reading and limit as typed fields. The `error` text is the one the
+    /// route always sent, so a caller matching the refusal prefix in it still
+    /// matches. No override field is offered (plan D4).
+    #[tokio::test]
+    async fn a_resource_guard_refusal_is_a_503_with_retry_after_and_a_typed_body() {
+        let refusal = thread_refusal();
+        let wire = refusal.to_string();
+        let response =
+            create_failure_response(crate::terminal::TerminalCreateError::ResourceGuard(refusal));
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers().get(axum::http::header::RETRY_AFTER),
+            Some(&axum::http::HeaderValue::from_static("15"))
+        );
+        let body = body_json(response).await;
+        assert_eq!(body["success"], false);
+        assert_eq!(body["code"], "RESOURCE_GUARD_REFUSED");
+        assert_eq!(
+            body["resourceGuard"],
+            serde_json::json!({
+                "lane": "threads",
+                "metric": "thread_count",
+                "observed": 540,
+                "limit": 400,
+                "retryAfterSecs": 15,
+            })
+        );
+        assert_eq!(body["error"], format!("Failed to create terminal: {wire}"));
+        assert!(wire.starts_with(crate::resource_guard::CRITICAL_REFUSAL_PREFIX));
+    }
+
+    /// A request naming an account that is not in the roster is the caller's to
+    /// fix, so it is a `400` even while the resource guard would refuse — never
+    /// a retryable `503` — and the guard is not even asked. With no account,
+    /// the same refusing guard is the `503`.
+    #[test]
+    fn a_bad_account_is_a_400_before_the_guard_is_asked() {
+        let _amb = crate::test_env::isolated_ambient();
+        let asked = std::cell::Cell::new(false);
+        let refusing = || {
+            asked.set(true);
+            Err(thread_refusal())
+        };
+        let response = admit_account_then_guard(Some("no-such-account"), refusing)
+            .expect_err("a bogus account is refused");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            !asked.get(),
+            "the guard is not consulted for a request that cannot run"
+        );
+        assert!(response
+            .headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .is_none());
+
+        let response = admit_account_then_guard(None, refusing).expect_err("guard refuses");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(asked.get());
+        assert!(admit_account_then_guard(None, || Ok(())).unwrap().is_none());
+    }
+
+    /// Every other create failure keeps the 500 and the text it always had,
+    /// with no `Retry-After` and no guard fields: retrying a missing PTY or a
+    /// refused tenant does not make it work.
+    #[tokio::test]
+    async fn a_non_guard_create_error_is_still_a_500() {
+        let response = create_failure_response(crate::terminal::TerminalCreateError::Failed(
+            "Failed to open PTY: os error 5".to_string(),
+        ));
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(response
+            .headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .is_none());
+        let body = body_json(response).await;
+        assert_eq!(
+            body["error"],
+            "Failed to create terminal: Failed to open PTY: os error 5"
+        );
+        assert!(body.get("resourceGuard").is_none());
+        assert_ne!(body["code"], "RESOURCE_GUARD_REFUSED");
+    }
+
+    /// The typed create error converts back to exactly the refusal wire, so
+    /// every caller that propagates it as a `String` — the Tauri command the
+    /// webview's dialog parses, the looping-agent supervisor's prefix match —
+    /// sees the bytes it always saw.
+    #[test]
+    fn the_typed_create_error_keeps_the_refusal_wire_as_its_string() {
+        let refusal = thread_refusal();
+        let wire = refusal.to_string();
+        let as_string: String = crate::terminal::TerminalCreateError::ResourceGuard(refusal).into();
+        assert_eq!(as_string, wire);
+        assert!(as_string.starts_with("resource_guard:critical:thread_count: "));
+    }
 
     /// `GET /terminals` rows: every `TerminalInfo` key unchanged, plus the
     /// camelCase `permissionRequestHook` — the contract

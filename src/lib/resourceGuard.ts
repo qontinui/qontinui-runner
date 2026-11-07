@@ -105,6 +105,57 @@ export interface ResourceGuardSource {
    * Omitted when the caller has no queue.
    */
   queued?: number;
+  /**
+   * What a refusal does. `"ask"` (the default) is the attended path: a live
+   * grant for the lane is spent, else the operator is asked. `"defer"` is for a
+   * caller with nobody to answer — the boot / session restore: the refusal
+   * rejects at once as a {@link ResourceGuardDeferral}, without opening the
+   * dialog, spending a grant or retrying. The caller owns the retry, so a wait
+   * for room is never a promise held open inside it (see
+   * {@link spawnWithResourceGuard}).
+   */
+  onRefusal?: "ask" | "defer";
+}
+
+/**
+ * The reading a refusal names, as the operator reads it: `observed` and `limit`
+ * keep the refusal's own units (`"540"` threads / `"400"`, or `"1.00 GiB"` /
+ * `"1.50 GiB"`). `lane` is the memory lane's name (`"host"`, `"wsl"`), or
+ * `null` on the thread lane, which has only one.
+ */
+export interface ResourceGuardReading {
+  lane: string | null;
+  observed: string;
+  limit: string;
+}
+
+/**
+ * The reading out of a refusal's text, or `null` when the text does not carry
+ * one in a shape this build reads.
+ *
+ * Read from the operator-facing text because a Tauri `Err(String)` is all the
+ * webview receives; the phrasing is pinned by `resourceGuardWire.fixture.json`,
+ * which the Rust tests hold byte for byte, so a rewording breaks a test here
+ * rather than this display. `null` is shown as "reading not stated", never as a
+ * guessed number.
+ */
+export function parseResourceGuardReading(
+  refusal: ResourceGuardRefusal,
+): ResourceGuardReading | null {
+  if (refusal.metric === "thread_count") {
+    const m = /carrying (\d+) threads?, above the (\d+)-thread critical ceiling/.exec(
+      refusal.message,
+    );
+    return m ? { lane: null, observed: m[1], limit: m[2] } : null;
+  }
+  if (refusal.metric === "free_commit_bytes") {
+    const m =
+      /the (\S+) lane has ([\d.]+ GiB) of free commit, below the ([\d.]+ GiB) critical floor/.exec(
+        refusal.message,
+      );
+    return m ? { lane: m[1], observed: m[2], limit: m[3] } : null;
+  }
+  return null;
 }
 
 /**
@@ -212,9 +263,77 @@ interface LiveGrant extends ResourceGuardGrant {
 
 const grants = new Map<KnownResourceGuardMetric, LiveGrant>();
 
+/** First wait after an unattended refusal — the restore queue's guard cadence. */
+export const GUARD_WAIT_INITIAL_MS = 15_000;
+/** The backoff doubles per consecutive refusal and never exceeds this. */
+export const GUARD_WAIT_MAX_MS = 120_000;
+
+/** The wait before the `refusals`-th consecutive retry (1-based): 15 s doubling to 120 s. */
+export function guardWaitMs(refusals: number): number {
+  return Math.min(GUARD_WAIT_INITIAL_MS * 2 ** Math.max(0, refusals - 1), GUARD_WAIT_MAX_MS);
+}
+
+/**
+ * An unattended spawn the guard refused, waiting for room before its caller
+ * retries it (`onRefusal: "defer"`).
+ *
+ * Shown rather than silent: an unattended restore that is waiting is
+ * indistinguishable from one that is stuck unless something says which, and
+ * what it is waiting for. {@link resourceGuardWaitText} in
+ * `resourceGuardCopy.ts` renders it as
+ * "waiting: thread ceiling (observed 540 / limit 400)".
+ */
+export interface ResourceGuardWait {
+  /** The caller's own key for this wait — one wait per key. */
+  key: string;
+  /** The caller's {@link ResourceGuardSource.label}. */
+  sourceLabel: string;
+  metric: ResourceGuardMetric;
+  /** The latest refusal's reading, or `null` when its text carried none. */
+  reading: ResourceGuardReading | null;
+  /** Consecutive refusals so far (≥ 1). */
+  refusals: number;
+  /**
+   * Epoch ms of the next attempt, or `null` when none is scheduled: the
+   * caller retries when its page is next opened.
+   */
+  retryAt: number | null;
+}
+
+const waits = new Map<string, ResourceGuardWait>();
+
+/** Publish (or replace) the wait under `wait.key`. */
+export function publishResourceGuardWait(wait: ResourceGuardWait): void {
+  waits.set(wait.key, wait);
+  notify();
+}
+
+/** Withdraw the wait under `key`; a no-op when there is none. */
+export function withdrawResourceGuardWait(key: string): void {
+  if (waits.delete(key)) notify();
+}
+
+/**
+ * The `onRefusal: "defer"` rejection: the guard refused and nobody is asked.
+ * `original` is what the spawn rejected with, so a caller that logs it logs
+ * Rust's text.
+ */
+export class ResourceGuardDeferral extends Error {
+  readonly refusal: ResourceGuardRefusal;
+  readonly original: unknown;
+
+  constructor(refusal: ResourceGuardRefusal, original: unknown) {
+    super(`resource guard deferred the spawn: ${refusal.message}`);
+    this.name = "ResourceGuardDeferral";
+    this.refusal = refusal;
+    this.original = original;
+  }
+}
+
 const listeners = new Set<() => void>();
 let pendingSnapshot: PendingResourceBlock | null = null;
 let grantsSnapshot: readonly ResourceGuardGrant[] = [];
+let waitsSnapshot: readonly ResourceGuardWait[] = [];
 
 /**
  * Rebuild both snapshots, then wake subscribers. `useSyncExternalStore`
@@ -237,6 +356,7 @@ function notify(): void {
     expiresAt,
     sourceLabel,
   }));
+  waitsSnapshot = [...waits.values()];
   for (const l of [...listeners]) l();
 }
 
@@ -260,6 +380,19 @@ export function getSnapshot(): PendingResourceBlock | null {
 /** Every live grant. See {@link subscribe}. */
 export function getGrantsSnapshot(): readonly ResourceGuardGrant[] {
   return grantsSnapshot;
+}
+
+/** Every unattended spawn waiting for room. See {@link subscribe}. */
+export function getWaitsSnapshot(): readonly ResourceGuardWait[] {
+  return waitsSnapshot;
+}
+
+/**
+ * Every unattended spawn waiting for room ({@link ResourceGuardWait}), for the
+ * guard banner and the restore strip.
+ */
+export function useResourceGuardWaits(): readonly ResourceGuardWait[] {
+  return useSyncExternalStore(subscribe, getWaitsSnapshot);
 }
 
 /** The decision the dialog should be showing, or `null` when there is none. */
@@ -377,6 +510,14 @@ function askOperator(
  *
  * `source` names the caller for the dialog ({@link ResourceGuardSource}).
  *
+ * A source with `onRefusal: "defer"` has nobody to ask, so its refusal never
+ * reaches the dialog: it rejects at once with a {@link ResourceGuardDeferral}
+ * and the caller schedules its own retry, without the override. It does not
+ * spend a live grant either. A grant is the operator's answer to the start they
+ * were shown; letting a restore of hundreds of rows drain it would turn one
+ * click into a burst past the limit, the amplifier the grant's count bound
+ * exists to stop.
+ *
  * Every attended spawn surface should call through this rather than invoking
  * directly, so the override handling exists in exactly one place.
  */
@@ -389,6 +530,7 @@ export async function spawnWithResourceGuard<T>(
   } catch (err) {
     const refusal = parseResourceGuardRefusal(err);
     if (refusal === null) throw err;
+    if (source?.onRefusal === "defer") throw new ResourceGuardDeferral(refusal, err);
     if (consumeGrant(refusal.metric)) return attempt(true);
     const startAnyway = await askOperator(refusal, source ?? null);
     if (!startAnyway) throw err;

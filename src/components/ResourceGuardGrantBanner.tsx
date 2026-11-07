@@ -12,18 +12,27 @@
  * no "hide" that leaves the grant running: the banner goes away when the grant
  * does — spent, lapsed, or revoked — and not before.
  *
+ * It also shows every unattended spawn the guard is holding (a session restore
+ * waiting for room — `ResourceGuardWait`), because that spawn opens no dialog
+ * and a wait nobody can see reads as a restore that hung.
+ *
  * Mounted once at the App root beside `ResourceGuardDialog`, prop-less, for the
  * same reason the dialog is: the store is module-level and any spawn surface
  * can create a grant.
  */
 
 import { useEffect, useState } from "react";
-import { ShieldOff } from "lucide-react";
-import { revokeResourceGuardGrant, useResourceGuardGrants } from "@/lib/resourceGuard";
-import { grantAnnouncement, grantBannerText } from "@/lib/resourceGuardCopy";
+import { Hourglass, ShieldOff } from "lucide-react";
+import {
+  revokeResourceGuardGrant,
+  useResourceGuardGrants,
+  useResourceGuardWaits,
+} from "@/lib/resourceGuard";
+import { grantAnnouncement, grantBannerText, resourceGuardWaitText } from "@/lib/resourceGuardCopy";
 
 export function ResourceGuardGrantBanner() {
   const grants = useResourceGuardGrants();
+  const waits = useResourceGuardWaits();
   const [now, setNow] = useState(() => Date.now());
 
   // Tick only while a grant is live: the countdown is the banner's whole point,
@@ -40,7 +49,7 @@ export function ResourceGuardGrantBanner() {
     };
   }, [grants.length]);
 
-  if (grants.length === 0) return null;
+  if (grants.length === 0 && waits.length === 0) return null;
 
   return (
     <div className="fixed top-3 left-1/2 -translate-x-1/2 z-40 flex flex-col gap-2">
@@ -65,6 +74,18 @@ export function ResourceGuardGrantBanner() {
           >
             Revoke
           </button>
+        </div>
+      ))}
+      {waits.map((wait) => (
+        <div
+          key={wait.key}
+          role="status"
+          className="flex items-center gap-3 px-4 py-2 rounded-lg border border-zinc-600/60 bg-zinc-900/95 text-zinc-300 text-sm shadow-lg"
+        >
+          <Hourglass className="w-4 h-4 shrink-0" />
+          <span>
+            {wait.sourceLabel} — {resourceGuardWaitText(wait)}
+          </span>
         </div>
       ))}
     </div>

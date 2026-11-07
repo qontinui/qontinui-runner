@@ -1762,7 +1762,7 @@ pub(crate) fn thread_name_census_memoized() -> Option<ThreadNameCensus> {
 }
 
 /// The memoized census as the `/health` object serves it under `threadCensus`:
-/// `{ total, byName: [{name, count}], sessionThreads, sampledAt }`, or JSON
+/// `{ total, byName: [{name, count}], sessionThreads, holderThreads, sampledAt }`, or JSON
 /// `null` when the
 /// census is UNKNOWN — never an empty list (served policy
 /// `verification-and-evidence` `silent-empty-is-unknown`).
@@ -1784,10 +1784,12 @@ fn thread_name_census_to_json(census: &ThreadNameCensus) -> serde_json::Value {
             .iter()
             .map(|row| serde_json::json!({ "name": row.name, "count": row.count }))
             .collect::<Vec<_>>(),
-        // The UNCAPPED per-session tally (`terminal-reader` + `terminal-waiter`)
+        // The UNCAPPED per-pane tally (`terminal-reader` + `terminal-waiter`,
+        // plus `pty-holder-ctl` + `pty-holder-pump` for a holder-backed pane)
         // the thread guard subtracts — `byName` is capped and must never be
-        // summed for it.
+        // summed for it. `holderThreads` is the holder part of it.
         "sessionThreads": census.session_threads,
+        "holderThreads": census.holder_threads,
         "sampledAt": sampled_at,
     })
 }
@@ -2166,7 +2168,14 @@ mod tests {
                 .collect(),
             session_threads: rows
                 .iter()
-                .filter(|(name, _)| name.starts_with("terminal-"))
+                .filter(|(name, _)| {
+                    name.starts_with("terminal-") || name.starts_with("pty-holder-")
+                })
+                .map(|(_, n)| n)
+                .sum(),
+            holder_threads: rows
+                .iter()
+                .filter(|(name, _)| name.starts_with("pty-holder-"))
                 .map(|(_, n)| n)
                 .sum(),
             sampled_at: std::time::UNIX_EPOCH + Duration::from_secs(1_800_000_000),
@@ -2226,6 +2235,7 @@ mod tests {
         assert_eq!(v["byName"].as_array().map(Vec::len), Some(2));
         assert_eq!(v["sampledAt"], "2027-01-15T08:00:00+00:00");
         assert_eq!(v["sessionThreads"], 19);
+        assert_eq!(v["holderThreads"], 0);
         assert!(v.get("by_name").is_none(), "wire keys are camelCase");
     }
 

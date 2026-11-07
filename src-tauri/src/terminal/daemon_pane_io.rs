@@ -514,6 +514,9 @@ impl<P: PaneIo> PaneIo for WithNotice<P> {
     fn unwatched_pauses_source(&self) -> bool {
         self.inner.unwatched_pauses_source()
     }
+    fn holder_backed(&self) -> bool {
+        self.inner.holder_backed()
+    }
     fn credential_scrub(&self) -> CredentialScrub {
         self.inner.credential_scrub()
     }
@@ -1898,6 +1901,11 @@ impl PaneIo for DaemonPaneIo {
         false
     }
 
+    /// The child lives in the holder; this pane is the runner's link to it.
+    fn holder_backed(&self) -> bool {
+        true
+    }
+
     fn credential_scrub(&self) -> CredentialScrub {
         CredentialScrub::ScrubbedOutOfProcess
     }
@@ -2093,6 +2101,23 @@ pub fn kill_failed_notice(holder_pid: u32, child_pid: u32) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The fallback notice wrapper IS its inner pane for the guard's
+    /// holder-pane count: it never makes an in-process fallback read as a
+    /// holder pane, nor hides one that is.
+    #[test]
+    fn with_notice_answers_holder_backed_as_its_inner_pane() {
+        let local = WithNotice {
+            notice: b"fallback".to_vec(),
+            inner: crate::terminal::pane_io::InertPaneIo,
+        };
+        assert!(!local.holder_backed());
+        let holder = WithNotice {
+            notice: Vec::new(),
+            inner: crate::terminal::pane_io::InertHolderPaneIo,
+        };
+        assert!(holder.holder_backed());
+    }
 
     /// Records everything a pane sends.
     #[derive(Default)]

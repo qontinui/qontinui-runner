@@ -1040,6 +1040,7 @@ fn collect_host_lane() -> ResourceSample {
         s.thread_count.and_then(|n| usize::try_from(n).ok()),
         s.active_terminal_sessions
             .and_then(|n| usize::try_from(n).ok()),
+        live_holder_pane_count(),
     );
 
     s.blocking_lanes = Some(
@@ -1133,6 +1134,16 @@ fn live_terminal_session_count() -> Option<i32> {
     manager
         .count_checked()
         .map(|n| n.min(i32::MAX as usize) as i32)
+}
+
+/// How many live terminals are backed by an out-of-process PTY holder, or
+/// `None` when the registry cannot be read — the resource guard's independent
+/// bound on the holder threads it charges as session load.
+fn live_holder_pane_count() -> Option<usize> {
+    use std::sync::Arc;
+    let app = crate::tauri_app_handle::current()?;
+    let manager = tauri::Manager::try_state::<Arc<crate::terminal::TerminalManager>>(&app)?;
+    manager.holder_backed_count_checked()
 }
 
 /// The `(lane, free commit, free physical)` reading the spawn gate decides on —
