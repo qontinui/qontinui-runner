@@ -16,12 +16,15 @@ export interface WithheldSkill {
   skill_id: string;
   code: string;
   error: string;
+  /** The stored template, verbatim: the export file keeps what a read can no longer serve. */
+  stored_template?: string;
 }
 
 export interface SkillImportOutcome {
   imported?: number;
   overwritten?: number;
   errors?: string[];
+  warnings?: string[];
   refused?: SkillIntakeRefusal[];
 }
 
@@ -50,6 +53,10 @@ export function skillImportNotice(outcome: SkillImportOutcome): string | null {
   if (errors.length > 0) {
     parts.push(`Import errors: ${errors.join("; ")}`);
   }
+  const warnings = outcome.warnings ?? [];
+  if (warnings.length > 0) {
+    parts.push(`Import warnings: ${warnings.join("; ")}`);
+  }
   return parts.length > 0 ? `Skill import: ${parts.join(" ")}` : null;
 }
 
@@ -57,9 +64,12 @@ export function skillImportNotice(outcome: SkillImportOutcome): string | null {
 export function skillExportNotice(withheld: WithheldSkill[] | undefined): string | null {
   if (!withheld || withheld.length === 0) return null;
   const ids = withheld.map((w) => w.skill_id);
+  const one = ids.length === 1;
   return (
-    `Skill export: left out ${quoted(ids)} because ${ids.length === 1 ? "its" : "their"} stored ` +
-    "template no longer parses. Delete and re-create " +
-    `${ids.length === 1 ? "that skill" : "those skills"} to export ${ids.length === 1 ? "it" : "them"}.`
+    `Skill export: left out ${quoted(ids)} because ` +
+    `${one ? "its stored template no longer parses" : "their stored templates no longer parse"}. ` +
+    `The exported file keeps ${one ? "it" : "them"} under "withheld", with the stored template: ` +
+    "move a playbook body into a .qontinui/contexts/*.md file, then delete " +
+    `${one ? "that skill" : "those skills"}.`
   );
 }

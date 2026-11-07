@@ -58,7 +58,9 @@ pub enum SkillRewriteError {
     #[error(
         "user skill {skill_id}: its stored template does not parse ({error}); refusing to \
          rewrite it, because it is served as an empty single_step template and a rewrite \
-         would store that in place of the original. Delete the skill and create it again."
+         would store that in place of the original. Export the skill to recover the stored \
+         template (the export lists it under `withheld`, with the stored text); a `playbook` \
+         body belongs in a `.qontinui/contexts/*.md` file. Then delete the skill."
     )]
     UnparseableStoredTemplate { skill_id: String, error: String },
     /// A pool, query or serialization failure.
@@ -82,6 +84,14 @@ fn require_parseable_stored_template(skill_id: &str, raw: &str) -> Result<(), Sk
 pub struct ExportableUserSkills {
     pub skills: Vec<SkillDefinition>,
     pub withheld: Vec<crate::skills::WithheldSkill>,
+}
+
+/// What a version bump wrote ([`PgDb::bump_user_skill_version`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillVersionBump {
+    pub previous_version: String,
+    pub version: String,
+    pub checksum: String,
 }
 
 /// Map a Clorinde row to SkillDefinition.
@@ -174,9 +184,11 @@ fn partition_for_export(
         }
         match parse_stored_template(&r.template) {
             Ok(_) => out.skills.push(row_to_skill!(r)),
-            Err(e) => out
-                .withheld
-                .push(crate::skills::WithheldSkill::unparseable(&r.id, e)),
+            Err(e) => out.withheld.push(crate::skills::WithheldSkill::unparseable(
+                &r.id,
+                &r.template,
+                e,
+            )),
         }
     }
     out
@@ -232,12 +244,12 @@ impl PgDb {
     }
 
     /// Read one user skill for a REWRITE ([`Self::update_user_skill`],
-    /// [`Self::fork_skill`], the version bump): `Ok(None)` when no row has the
-    /// id, and [`SkillRewriteError::UnparseableStoredTemplate`] when the row's
-    /// stored template does not parse, because the definition
+    /// [`Self::fork_skill`], [`Self::bump_user_skill_version`]): `Ok(None)`
+    /// when no row has the id, and [`SkillRewriteError::UnparseableStoredTemplate`]
+    /// when the row's stored template does not parse, because the definition
     /// [`Self::get_user_skill`] would hand back carries the fallback rather
     /// than what is stored.
-    pub(crate) async fn get_user_skill_for_rewrite(
+    async fn get_user_skill_for_rewrite(
         &self,
         id: &str,
     ) -> Result<Option<SkillDefinition>, SkillRewriteError> {
@@ -681,8 +693,41 @@ impl PgDb {
             .ok_or_else(|| SkillRewriteError::Failed("Failed to retrieve forked skill".to_string()))
     }
 
-    /// Update the version and checksum of a skill.
-    pub async fn update_skill_version(
+    /// Bump a user skill's version and store the checksum recomputed over the
+    /// bumped definition ([`crate::skills::bump_semver`]: `patch`, `minor` or
+    /// `major`).
+    ///
+    /// Reads through [`Self::get_user_skill_for_rewrite`]: the checksum is
+    /// computed over the template, and over the served fallback it would be
+    /// the checksum of a skill that is not the stored one. A stored template
+    /// that does not parse is [`SkillRewriteError::UnparseableStoredTemplate`],
+    /// and nothing is written.
+    pub async fn bump_user_skill_version(
+        &self,
+        id: &str,
+        bump_type: &str,
+    ) -> Result<SkillVersionBump, SkillRewriteError> {
+        let mut skill = self
+            .get_user_skill_for_rewrite(id)
+            .await?
+            .ok_or_else(|| SkillRewriteError::NotFound(id.to_string()))?;
+        let previous_version = skill.version.clone().unwrap_or_else(|| "1.0.0".to_string());
+        let version = crate::skills::bump_semver(&previous_version, bump_type);
+        skill.version = Some(version.clone());
+        let checksum = crate::skills::compute_skill_checksum(&skill);
+        self.update_skill_version(id, &version, &checksum)
+            .await
+            .map_err(SkillRewriteError::Failed)?;
+        Ok(SkillVersionBump {
+            previous_version,
+            version,
+            checksum,
+        })
+    }
+
+    /// Update the version and checksum of a skill. Private: a version is only
+    /// written by [`Self::bump_user_skill_version`], behind the rewrite gate.
+    async fn update_skill_version(
         &self,
         skill_id: &str,
         version: &str,
@@ -870,7 +915,9 @@ mod tests {
         }
     }
 
-    /// The refusal's message names the skill, the cause and the remedy.
+    /// The refusal's message names the skill, the cause and the remedy, and
+    /// the remedy recovers the stored template (through an export) before it
+    /// says to delete the skill: deleting first would lose the only copy.
     #[test]
     fn the_rewrite_refusal_names_the_skill_the_cause_and_the_remedy() {
         let refusal = require_parseable_stored_template(
@@ -881,13 +928,21 @@ mod tests {
         let message = refusal.to_string();
         assert!(message.contains("user:sf-login"), "{message}");
         assert!(message.contains("unknown variant `playbook`"), "{message}");
-        assert!(message.contains("Delete the skill"), "{message}");
+        let recover = message
+            .find("Export the skill to recover the stored template")
+            .unwrap_or_else(|| panic!("names the export as the way to recover it: {message}"));
+        let delete = message
+            .find("Then delete the skill")
+            .unwrap_or_else(|| panic!("names the deletion: {message}"));
+        assert!(recover < delete, "recover before delete: {message}");
+        assert!(message.contains(".qontinui/contexts/"), "{message}");
     }
 
     /// An outbound door (export, sync push) WITHHOLDS a row whose stored
-    /// template does not parse, naming it with its code and parse error,
-    /// rather than sending the served fallback; parseable rows go out as
-    /// stored, and a non-empty id list keeps only the ids asked for.
+    /// template does not parse, naming it with its code and parse error and
+    /// carrying the stored template verbatim, rather than sending the served
+    /// fallback; parseable rows go out as stored, and a non-empty id list keeps
+    /// only the ids asked for.
     #[test]
     fn an_outbound_door_withholds_a_stored_template_that_does_not_parse() {
         let rows = || {
@@ -912,6 +967,10 @@ mod tests {
             "{:?}",
             all.withheld
         );
+        assert_eq!(
+            all.withheld[0].stored_template, r#"{"kind":"playbook","content":"x"}"#,
+            "the stored template leaves with the refusal, so the export keeps it"
+        );
 
         let asked = partition_for_export(rows(), &["user:sf-login".to_string()]);
         assert!(asked.skills.is_empty(), "{:?}", asked.skills);
@@ -924,16 +983,30 @@ mod tests {
 
     /// The rewrite gate at its call sites, against a live Postgres: update
     /// (with and without a template in the request), fork, and the version
-    /// bump's read all refuse a stored `playbook` row with
-    /// `UnparseableStoredTemplate`, and the stored template column is
-    /// byte-identical afterwards. Reverting any call site to the plain
-    /// `get_user_skill` turns this red.
+    /// bump ([`PgDb::bump_user_skill_version`], which the bump-version handler
+    /// calls) all refuse a stored `playbook` row with
+    /// `UnparseableStoredTemplate`, and the stored template, version and
+    /// checksum columns are byte-identical afterwards. Reverting any of the
+    /// three methods to the plain `get_user_skill` turns this red. The row,
+    /// and any fork a regression wrote, are deleted whether or not the
+    /// assertions pass.
     ///
     /// `#[ignore]` to match the `database/pg/*` convention. Run with:
     /// `cargo test -p qontinui-runner database::pg::skills::tests::every_rewrite_refuses_a_stored_playbook_row_and_leaves_it_as_stored -- --ignored`
     #[tokio::test]
     #[ignore = "needs PG fixture (DATABASE_URL); user_skills table"]
     async fn every_rewrite_refuses_a_stored_playbook_row_and_leaves_it_as_stored() {
+        use futures::FutureExt;
+
+        fn refused<T: std::fmt::Debug>(r: Result<T, SkillRewriteError>, id: &str, what: &str) {
+            match r {
+                Err(SkillRewriteError::UnparseableStoredTemplate { skill_id, .. }) => {
+                    assert_eq!(skill_id, id, "{what}")
+                }
+                other => panic!("{what} must be refused, got {other:?}"),
+            }
+        }
+
         let pg = PgDb::new_for_test().await;
         let slug = format!("p7-playbook-{}", uuid::Uuid::new_v4());
         let id = format!("user:{slug}");
@@ -953,54 +1026,74 @@ mod tests {
         )
         .await
         .expect("insert the stored playbook row");
-
-        let refused = |r: Result<SkillDefinition, SkillRewriteError>, what: &str| match r {
-            Err(SkillRewriteError::UnparseableStoredTemplate { skill_id, .. }) => {
-                assert_eq!(skill_id, id, "{what}")
-            }
-            other => panic!("{what} must be refused, got {other:?}"),
+        let columns = "SELECT template, version, checksum FROM user_skills WHERE id = $1";
+        let read = |row: tokio_postgres::Row| -> (String, Option<String>, Option<String>) {
+            (
+                row.try_get(0).expect("template column"),
+                row.try_get(1).expect("version column"),
+                row.try_get(2).expect("checksum column"),
+            )
         };
-        let no_template: crate::mcp::skills::UpdateSkillRequest =
-            serde_json::from_value(serde_json::json!({"name": "renamed"})).expect("request");
-        refused(
-            pg.update_user_skill(&id, &no_template).await,
-            "update without a template",
-        );
-        let with_template: crate::mcp::skills::UpdateSkillRequest =
-            serde_json::from_value(serde_json::json!({
-                "template": {"kind": "single_step", "step": {}}
-            }))
-            .expect("request");
-        refused(
-            pg.update_user_skill(&id, &with_template).await,
-            "update carrying the served fallback",
-        );
-        refused(pg.fork_skill(&id, None).await, "fork");
-        assert!(
-            matches!(
-                pg.get_user_skill_for_rewrite(&id).await,
-                Err(SkillRewriteError::UnparseableStoredTemplate { .. })
-            ),
-            "the version bump's read"
+        let before = read(
+            conn.query_one(columns, &[&id])
+                .await
+                .expect("the inserted row"),
         );
 
-        let row = conn
-            .query_one("SELECT template FROM user_skills WHERE id = $1", &[&id])
-            .await
-            .expect("the row is still there");
-        let after: String = row.try_get(0).expect("template column");
+        // Every rewrite runs inside catch_unwind, so the clean-up below runs
+        // even when one of them is not refused.
+        let outcome = std::panic::AssertUnwindSafe(async {
+            let no_template: crate::mcp::skills::UpdateSkillRequest =
+                serde_json::from_value(serde_json::json!({"name": "renamed"})).expect("request");
+            refused(
+                pg.update_user_skill(&id, &no_template).await,
+                &id,
+                "update without a template",
+            );
+            let with_template: crate::mcp::skills::UpdateSkillRequest =
+                serde_json::from_value(serde_json::json!({
+                    "template": {"kind": "single_step", "step": {}}
+                }))
+                .expect("request");
+            refused(
+                pg.update_user_skill(&id, &with_template).await,
+                &id,
+                "update carrying the served fallback",
+            );
+            refused(pg.fork_skill(&id, None).await, &id, "fork");
+            refused(
+                pg.bump_user_skill_version(&id, "patch").await,
+                &id,
+                "version bump",
+            );
+        })
+        .catch_unwind()
+        .await;
+
+        let after = conn.query_one(columns, &[&id]).await;
         let forks = conn
             .query_one(
                 "SELECT count(*) FROM user_skills WHERE forked_from = $1",
                 &[&id],
             )
-            .await
-            .expect("count forks");
-        let fork_count: i64 = forks.try_get(0).expect("count");
-        conn.execute("DELETE FROM user_skills WHERE id = $1", &[&id])
-            .await
-            .expect("clean up");
-        assert_eq!(after, stored, "the stored template is untouched");
+            .await;
+        conn.execute(
+            "DELETE FROM user_skills WHERE id = $1 OR forked_from = $1",
+            &[&id],
+        )
+        .await
+        .expect("clean up");
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
+
+        let after = read(after.expect("the row is still there"));
+        let fork_count: i64 = forks.expect("count forks").try_get(0).expect("count");
+        assert_eq!(after.0, stored, "the stored template is untouched");
+        assert_eq!(
+            after, before,
+            "template, version and checksum are untouched"
+        );
         assert_eq!(fork_count, 0, "fork wrote no copy");
     }
 }
