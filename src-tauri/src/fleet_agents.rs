@@ -272,6 +272,17 @@ pub(crate) fn remove_retired_agents(
     };
     for line in retired {
         let (name, shipped) = parse_retired_line(line);
+        // This function deletes files, so it trusts no name: exactly one plain
+        // path component, or nothing happens (a `C:x.md` or `../x.md` would
+        // otherwise make `join` leave the agents directory).
+        let mut components = Path::new(name).components();
+        if !matches!(
+            (components.next(), components.next()),
+            (Some(std::path::Component::Normal(_)), None)
+        ) {
+            tracing::warn!("fleet_agents: ignoring retired entry {name:?}: not a plain file name");
+            continue;
+        }
         let path = dst_dir.join(name);
         if let Some(reason) = keep.reason(name) {
             if std::fs::symlink_metadata(&path).is_ok() {
