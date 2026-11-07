@@ -14543,6 +14543,29 @@ mod tests {
         );
     }
 
+    /// The retirement as the population meets it, entered where every spawn
+    /// enters: a session this build provisions gets no `test-generator.md`.
+    /// The name is a literal rather than a read of the retired table, so the
+    /// test keeps naming the file this build stopped shipping.
+    #[test]
+    fn provision_agent_defs_provision_no_test_generator() {
+        let root = tempfile::tempdir().unwrap();
+        let wt = tempfile::tempdir().unwrap();
+        let wt_cwd = wt.path().to_string_lossy().into_owned();
+
+        provision_agent_definitions_from_root(root.path(), &wt_cwd).unwrap();
+
+        let dst = wt.path().join(".claude").join("agents");
+        assert!(
+            dst.join("code-reviewer.md").is_file(),
+            "the embedded floor must still provision the current agents"
+        );
+        assert!(
+            !dst.join("test-generator.md").exists(),
+            "test-generator is retired: no session this build provisions may resolve it"
+        );
+    }
+
     /// A retired definition for the retirement-pass tests: a body, and the
     /// `RETIRED_AGENTS`-shaped line that retires it, built from that body's own
     /// git blob id so no test depends on a blob this binary no longer carries.
