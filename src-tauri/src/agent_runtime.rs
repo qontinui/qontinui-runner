@@ -1126,22 +1126,16 @@ pub(crate) fn resolve_claude_bin() -> String {
         Some(p) => p,
         None => return bare,
     };
-    // Skip our own per-terminal shim/identity dirs — they hold the
-    // extensionless script that triggers os error 193 under a direct
-    // `CreateProcessW`.
-    use crate::install_effects_producer::intercept::shim_materializer::{
-        IDENTITY_DIR_PREFIX, SHIM_DIR_PREFIX,
-    };
-    let is_shim_dir = |d: &std::path::Path| {
-        d.file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with(IDENTITY_DIR_PREFIX) || n.starts_with(SHIM_DIR_PREFIX))
-    };
+    // Skip every qontinui shim/identity dir — ours or one inherited from
+    // another session. They hold the extensionless script that triggers os
+    // error 193 under a direct `CreateProcessW`, and a shim is never the real
+    // tool.
+    use crate::install_effects_producer::intercept::shim_materializer::is_qontinui_shim_dir;
     // Only extensions CreateProcessW can natively launch — see doc comment.
     #[cfg(windows)]
     let exts: &[&str] = &[".exe", ".com"];
     for dir in std::env::split_paths(&path) {
-        if is_shim_dir(&dir) {
+        if is_qontinui_shim_dir(&dir) {
             continue;
         }
         #[cfg(windows)]
