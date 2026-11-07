@@ -1101,18 +1101,21 @@ pub struct ExecutionResult {
 
 /// Result of running all verification_steps in a unified workflow
 ///
-/// This is returned by execute_verification_steps and used to:
+/// This is returned by execute_verification_steps_with_events and used to:
 /// 1. Determine if the agentic phase should run (any failures)
 /// 2. Build context for the AI about what failed
 /// 3. Store results in the database for the Recap page
 ///
 /// Verification pass/fail is determined by `required` steps:
-/// all_passed = all steps with required=true (default) succeeded.
+/// all_passed = at least one step with required=true (the default) ran, and
+/// every such step succeeded. A set with no required step — an empty set
+/// included — checked nothing, so it is not a pass.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VerificationPhaseResult {
     /// Iteration number (1-indexed)
     pub iteration: u32,
-    /// Whether all required verification steps passed
+    /// Whether at least one required verification step ran and every
+    /// required step passed (false when no required step ran)
     pub all_passed: bool,
     /// Total number of verification steps
     pub total_steps: usize,
