@@ -138,6 +138,45 @@ async fn a_2xx_with_no_session_status_is_not_stamped_and_the_row_is_kept() {
     assert!(state.retry.contains_key(&s));
 }
 
+/// A PATCH 409 ("row gone or already in target state") is not a finish
+/// either: without a row reading `finished` in its body it is unconfirmed,
+/// kept and retried — never stamped as the old idempotent-409 ACK did.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_409_on_the_finished_patch_is_not_stamped_and_the_row_is_kept() {
+    let (_d, outbox, coord, _rec, acks) = finish_rig(Some((409, r#"{"error":"conflict"}"#))).await;
+    let s = Uuid::new_v4();
+    queue_finish(&outbox, s, "csid-409", 42);
+    let mut state = DrainState::default();
+    drain_tick(&coord.inner, &mut state).await;
+    assert!(acks.lock().unwrap().is_empty(), "never stamped");
+    assert_eq!(kinds(&pending_of(&outbox, s)), vec!["finished"]);
+    let retry = state.retry.get(&s).expect("on its own backoff");
+    assert_eq!(retry.serving_failures, 0, "never charged to the quarantine");
+    assert!(
+        retry.unconfirmed_finish.is_some(),
+        "counted against the bound"
+    );
+}
+
+/// …while a 409 whose body carries the row reading `finished` is observed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_409_whose_body_reads_finished_stamps_the_mark() {
+    let (_d, outbox, coord, _rec, acks) = finish_rig(Some((
+        409,
+        r#"{"id":"01a1ab84-1c55-7000-8000-000000000001","session_status":"finished"}"#,
+    )))
+    .await;
+    let s = Uuid::new_v4();
+    queue_finish(&outbox, s, "csid-409-finished", 42);
+    let mut state = DrainState::default();
+    drain_tick(&coord.inner, &mut state).await;
+    assert_eq!(
+        *acks.lock().unwrap(),
+        vec![("csid-409-finished".to_string(), Some(42))]
+    );
+    assert!(pending_of(&outbox, s).is_empty());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn five_unconfirmed_answers_drop_the_row_unstamped_and_count_it() {
     let (_d, outbox, coord, rec, acks) =
