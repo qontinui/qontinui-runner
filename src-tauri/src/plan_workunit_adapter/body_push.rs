@@ -275,44 +275,67 @@ const REPO_STOPWORDS: [&str; 10] = [
     "and", "plus", "the", "for", "only", "none", "n/a", "primary", "also", "with",
 ];
 
-/// Extract the repos a plan/prompt declares from its `> **Repo(s):**` line.
+/// Where a `Repo(s):` declaration stops being a list and becomes prose: a
+/// sentence end (`. ` or a final `.`), an em-dash clause (` — `), or a ` -- `.
+/// Matched AFTER parentheticals are stripped, so a period inside a role
+/// (`(the migration. and its test)`) does not end the list early.
+static REPO_DECL_CUT: once_cell::sync::Lazy<regex::Regex> =
+    once_cell::sync::Lazy::new(|| regex::Regex::new(r"\.(?:\s|$)| — | -- ").expect("valid regex"));
+
+/// A same-line bold label (`**Topic:**`, `**Resource-keys:**`, `**Status: …`)
+/// ends the declaration, exactly as such a label on a continuation line does.
+static REPO_DECL_LABEL: once_cell::sync::Lazy<regex::Regex> =
+    once_cell::sync::Lazy::new(|| regex::Regex::new(r"\*\*[A-Z][A-Za-z-]*:").expect("valid regex"));
+
+/// The shape a kept repo name must have once lowercased.
+static REPO_NAME: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+    regex::Regex::new(r"^[a-z][a-z0-9_-]*[a-z0-9]$").expect("valid regex")
+});
+
+/// Extract the repos a plan/prompt declares from its `**Repo(s):**` line.
 ///
-/// The corpus writes this line half a dozen ways — inside a blockquote or not,
-/// backticked or bare, comma- or `+`-separated, with parenthetical roles, with a
-/// trailing period, and sometimes wrapped onto a continuation line:
+/// ONE parser of that line, feeding two consumers: the plan-library `repos`
+/// facet ([`build_artifact`]) and the work-unit `metadata.repos` key
+/// (`parser::ParsedWorkUnit::repos`), which coord turns into worktree
+/// allocations. A stray token there costs a continuation, not a facet, so the
+/// parse is strict (plan
+/// `2026-11-02-plan-backed-work-units-carry-no-repos-so-coords-repo-readers-read-empty`
+/// D2, census-validated against the plan corpus):
+///
+/// 1. Take the marker line plus its blockquote continuation lines (a `>` line
+///    carrying no new `**bold**` marker); each line join is a chunk boundary.
+/// 2. Strip parentheticals, cut at a same-line bold label, strip `**`, then cut
+///    at the first sentence end (`. ` or a final `.`), ` — `, or ` -- `.
+/// 3. Split on `,` `+` `;` `·`, a line join, and the word `and`.
+/// 4. In each chunk strip backticks, surrounding punctuation and a trailing
+///    `only` (any case). The chunk counts only if exactly ONE token is left —
+///    a multi-word chunk is prose, never a repo.
+/// 5. `owner/repo` becomes `repo` (a deeper path is dropped). Lowercase; keep
+///    only names matching `[a-z][a-z0-9_-]*[a-z0-9]` that are not in
+///    [`REPO_STOPWORDS`]. Deduped, first-seen order.
 ///
 /// ```text
 /// > **Repo(s):** qontinui-coord (primary), qontinui-web (Phase 4 alembic migration).
-/// **Repo(s):** `ui-bridge`
-/// > **Repo(s):** qontinui-coord (progress PATCH added by #749) + qontinui-runner (progress
-/// > outbox).
+/// **Repo(s):** qontinui-coord only — no web migration, no schema change
+/// > **Repo(s):** `qontinui/qontinui-web` and `qontinui/qontinui-coord`. Two repos, two PRs.
 /// ```
 ///
-/// So: take the first marker line, plus its blockquote continuation lines (a
-/// `>` line carrying no new `**bold**` marker), strip parenthetical spans, split
-/// on `,` `+` `;`, and keep the first bare token of each chunk. Order-preserving
-/// and deduped. Returns empty when the line is absent — most of the corpus has
-/// no `Repo(s):` line at all, which is a real empty, not a parse failure.
-#[expect(
-    clippy::string_slice,
-    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
-)]
+/// Returns empty when the line is absent — most of the corpus has no
+/// `Repo(s):` line at all, which is a real empty, not a parse failure.
 pub fn extract_repos(body: &str) -> Vec<String> {
     const MARKER: &str = "**Repo(s):**";
     let mut lines = body.lines();
-    let mut joined = String::new();
+    let mut segments: Vec<&str> = Vec::new();
     let mut in_blockquote = false;
-    let mut found = false;
 
     for line in lines.by_ref() {
-        if let Some(idx) = line.find(MARKER) {
-            found = true;
+        if let Some((_, tail)) = line.split_once(MARKER) {
             in_blockquote = line.trim_start().starts_with('>');
-            joined.push_str(&line[idx + MARKER.len()..]);
+            segments.push(tail);
             break;
         }
     }
-    if !found {
+    if segments.is_empty() {
         // Most of the corpus has no `Repo(s):` line at all — a real empty.
         return Vec::new();
     }
@@ -325,31 +348,63 @@ pub fn extract_repos(body: &str) -> Vec<String> {
             if rest.contains("**") || rest.trim().is_empty() {
                 break;
             }
-            joined.push(' ');
-            joined.push_str(rest);
+            segments.push(rest);
         }
     }
 
-    let cleaned = strip_parenthetical(&joined);
+    // Step 1: a line join is a chunk boundary, carried as `\n`.
+    let joined = segments.join("\n");
+    // Step 2.
+    let no_roles = strip_parenthetical(&joined);
+    let unlabelled = REPO_DECL_LABEL.split(&no_roles).next().unwrap_or("");
+    let unbolded = unlabelled.replace("**", "");
+    let declaration = REPO_DECL_CUT.split(&unbolded).next().unwrap_or("");
+
     let mut out: Vec<String> = Vec::new();
-    for chunk in cleaned.split([',', '+', ';', '/']) {
-        let token = chunk
-            .split_whitespace()
-            .next()
-            .unwrap_or("")
-            .trim_matches(|c: char| !(c.is_alphanumeric() || c == '-' || c == '_' || c == '.'));
-        if token.is_empty() || token.len() > 64 {
-            continue;
-        }
-        let lowered = token.to_lowercase();
-        if REPO_STOPWORDS.contains(&lowered.as_str()) {
-            continue;
-        }
-        if !out.iter().any(|e| e == &lowered) {
-            out.push(lowered);
+    // Step 3.
+    for chunk in declaration.split([',', '+', ';', '·', '\n']) {
+        let words: Vec<&str> = chunk.split_whitespace().collect();
+        for sub in words.split(|w| w.eq_ignore_ascii_case("and")) {
+            if let Some(repo) = repo_from_chunk(sub) {
+                if !out.contains(&repo) {
+                    out.push(repo);
+                }
+            }
         }
     }
     out
+}
+
+/// Steps 4 and 5 of [`extract_repos`] for one chunk's words.
+fn repo_from_chunk(words: &[&str]) -> Option<String> {
+    let mut tokens: Vec<String> = words
+        .iter()
+        .map(|w| {
+            w.replace('`', "")
+                .trim_matches(|c: char| !(c.is_alphanumeric() || c == '-' || c == '_'))
+                .to_string()
+        })
+        .filter(|t| !t.is_empty())
+        .collect();
+    if tokens
+        .last()
+        .is_some_and(|t| t.eq_ignore_ascii_case("only"))
+    {
+        tokens.pop();
+    }
+    let [token] = tokens.as_slice() else {
+        return None;
+    };
+    let lowered = token.to_lowercase();
+    let name = match lowered.split('/').collect::<Vec<_>>().as_slice() {
+        [name] => *name,
+        [_owner, name] => *name,
+        _ => return None,
+    };
+    if name.len() > 64 || !REPO_NAME.is_match(name) || REPO_STOPWORDS.contains(&name) {
+        return None;
+    }
+    Some(name.to_string())
 }
 
 /// Drop `(...)` spans, which carry roles ("(primary)", "(Phase 4 alembic
@@ -3894,6 +3949,12 @@ mod tests {
     }
 
     // ---- repos ----------------------------------------------------------
+    //
+    // The D2 rule of plan
+    // `2026-11-02-plan-backed-work-units-carry-no-repos-so-coords-repo-readers-read-empty`.
+    // Inputs marked "corpus" are verbatim `Repo(s):` lines from
+    // qontinui-dev-notes `plans/`; some reached here via the stale peer
+    // qontinui-runner#2278, whose rule is NOT what these assert.
 
     #[test]
     fn repos_from_a_blockquote_line_with_roles_and_a_period() {
@@ -3933,6 +3994,156 @@ mod tests {
     fn continuation_stops_at_the_next_bold_marker() {
         let body = "> **Repo(s):** qontinui-runner\n> **Status: vetted**\n";
         assert_eq!(extract_repos(body), vec!["qontinui-runner"]);
+    }
+
+    /// The old rule split on `/` and yielded `qontinui` (the owner) as a repo.
+    /// `owner/repo` is now `repo`, and both spellings dedupe to one entry.
+    #[test]
+    fn owner_prefix_is_stripped_and_dedupes_with_the_bare_name() {
+        assert_eq!(
+            extract_repos(
+                "> **Repo(s):** qontinui/qontinui-coord, qontinui-coord, qontinui-runner\n"
+            ),
+            vec!["qontinui-coord", "qontinui-runner"]
+        );
+        // corpus
+        assert_eq!(
+            extract_repos("> **Repo(s):** `qontinui/qontinui-runner` · `qontinui/qontinui-web`\n"),
+            vec!["qontinui-runner", "qontinui-web"]
+        );
+    }
+
+    /// corpus. The old rule emitted `no` here (the first word after `—`).
+    #[test]
+    fn an_em_dash_ends_the_declaration_and_trailing_only_is_dropped() {
+        let body = "**Repo(s):** qontinui-coord only — no web migration, no schema change\n";
+        assert_eq!(extract_repos(body), vec!["qontinui-coord"]);
+        // corpus: the em-dash inside a parenthetical is stripped with it.
+        let body = "**Repo(s):** `qontinui-coord` (primary); `qontinui-web` (alembic migrations ONLY — coord authors zero `coord.*` DDL, alembic is sole author, CI-gated)\n";
+        assert_eq!(extract_repos(body), vec!["qontinui-coord", "qontinui-web"]);
+    }
+
+    /// corpus. The old rule emitted `ci-only` and `no` (one word per comma
+    /// after the sentence end).
+    #[test]
+    fn a_sentence_end_ends_the_declaration() {
+        let body = "> **Repo(s):** `qontinui-runner` only. CI-only change: no Rust, no TypeScript, no migration, no DDL.\n";
+        assert_eq!(extract_repos(body), vec!["qontinui-runner"]);
+        // corpus: an UPPERCASE `ONLY` and a following sentence.
+        let body = "> **Repo(s):** qontinui-coord ONLY. Depends-On: 2026-06-18-coord-workunit-authz-graduated-trust (SHIPPED).\n";
+        assert_eq!(extract_repos(body), vec!["qontinui-coord"]);
+        // corpus: a repo named only after the first sentence end is prose
+        // about a repo the plan does not change, so it is dropped (D2).
+        let body = "**Repo(s):** qontinui-coord (all phases). qontinui-web / qontinui-runner are read for a consumer census only (Phase 4), not modified.\n";
+        assert_eq!(extract_repos(body), vec!["qontinui-coord"]);
+        let body =
+            "> **Repo(s):** qontinui-runner (both changes). qontinui-dev-notes (this plan).\n";
+        assert_eq!(extract_repos(body), vec!["qontinui-runner"]);
+    }
+
+    /// corpus. A period followed by a line join is a sentence end too: the
+    /// continuation line here is prose about a read-only repo.
+    #[test]
+    fn a_sentence_end_at_a_line_join_ends_the_declaration() {
+        let body = "> **Repo(s):** `qontinui/qontinui-coord` (the only repo any phase changes).\n\
+                    > `qontinui/qontinui-dev-notes` is a read-only evidence population — its PRs\n\
+                    > and git history are read, never written, beyond this plan file.\n";
+        assert_eq!(extract_repos(body), vec!["qontinui-coord"]);
+    }
+
+    /// corpus. The word `and` separates repos, and the sentence after the
+    /// list is cut.
+    #[test]
+    fn and_separates_repos() {
+        let body = "> **Repo(s):** `qontinui/qontinui-web` and `qontinui/qontinui-coord`. Two repos, two PRs.\n";
+        assert_eq!(extract_repos(body), vec!["qontinui-web", "qontinui-coord"]);
+        // corpus: `and` at a line end, the second repo on the continuation.
+        let body = "> **Repo(s):** qontinui-coord (trigger, resolver, delivery dispatch, config) and qontinui-runner\n> (the load-bearing missing piece — a push-executor that injects into the live session).\n";
+        assert_eq!(
+            extract_repos(body),
+            vec!["qontinui-coord", "qontinui-runner"]
+        );
+    }
+
+    /// corpus. A line join is a chunk boundary: the list continues on the
+    /// second blockquote line after a trailing comma.
+    #[test]
+    fn the_list_continues_on_a_blockquote_line() {
+        let body = "> **Repo(s):** qontinui-runner (slice 1 — this plan), qontinui-schemas,\n> qontinui-web, qontinui-coord (slices 2–4 — scoped out, see \"One plan or several\").\n";
+        assert_eq!(
+            extract_repos(body),
+            vec![
+                "qontinui-runner",
+                "qontinui-schemas",
+                "qontinui-web",
+                "qontinui-coord"
+            ]
+        );
+        // A role containing a full stop must not end the list early:
+        // parentheticals are stripped before the sentence cut, even across a
+        // line join.
+        let body = "> **Repo(s):** qontinui-web (the migration. and its test), qontinui-claude-config\n> (one knowledge-base paragraph). No change is needed in coord\n";
+        assert_eq!(
+            extract_repos(body),
+            vec!["qontinui-web", "qontinui-claude-config"]
+        );
+    }
+
+    /// corpus. A multi-word chunk is prose and is dropped whole — the old
+    /// rule kept its first word, which is how `likely`, `no` and `main`
+    /// became repos.
+    #[test]
+    fn a_multi_word_chunk_is_dropped_and_prose_words_never_emitted() {
+        let body = "> **Repo(s):** likely `qontinui-runner` (the collector) — to be settled in Phase 2. No\n";
+        assert!(extract_repos(body).is_empty(), "{:?}", extract_repos(body));
+        let body = "> **Repo(s):** `qontinui-runner`, `qontinui-claude-config` — both now out of scope for\n";
+        assert_eq!(
+            extract_repos(body),
+            vec!["qontinui-runner", "qontinui-claude-config"]
+        );
+        // A bare stopword is never a repo, and `n/a` does not become `a`.
+        // (A lone repo-SHAPED word such as `docs` does pass the shape test by
+        // design: the runner cannot know a tenant's repos, so coord's
+        // allocatability filter drops it — plan D2 option C.)
+        for body in ["**Repo(s):** none\n", "**Repo(s):** n/a\n"] {
+            assert!(extract_repos(body).is_empty(), "{body}");
+        }
+    }
+
+    /// corpus (via #2278). Bold emphasis is unwrapped; a chunk that is a
+    /// phrase after unwrapping (`qontinui-web for Phase 3 only`) is prose.
+    #[test]
+    fn emphasis_is_unwrapped_and_a_bold_label_ends_the_list() {
+        let body = "> **Repo(s):** `qontinui-runner`; **`qontinui-web` for Phase 3 only** **Topic:** `merge-engine`\n";
+        assert_eq!(extract_repos(body), vec!["qontinui-runner"]);
+        // A same-line bold label ends the declaration, as it does on a
+        // continuation line — else `qontinui-coord` joins the label's chunk.
+        let body = "> **Repo(s):** qontinui-coord  **Resource-keys:** `qontinui-coord:crates/coord/src/a.rs`, `b`\n";
+        assert_eq!(extract_repos(body), vec!["qontinui-coord"]);
+        // corpus: bold around a repo name is emphasis, not a label.
+        let body = "> **Repo(s):** qontinui-runner (primary), qontinui-claude-config, **qontinui-coord** (Phase 5 —\n";
+        assert_eq!(
+            extract_repos(body),
+            vec![
+                "qontinui-runner",
+                "qontinui-claude-config",
+                "qontinui-coord"
+            ]
+        );
+    }
+
+    /// A deeper path is not a repo, a dotted name fails the shape, and `n/a`
+    /// does not become `a`.
+    #[test]
+    fn paths_and_non_repo_shapes_are_dropped() {
+        assert_eq!(
+            extract_repos("**Repo(s):** crates/coord/src, n/a, ui-bridge\n"),
+            vec!["ui-bridge"]
+        );
+        assert_eq!(
+            extract_repos("**Repo(s):** qontinui.io, qontinui-coord\n"),
+            vec!["qontinui-coord"]
+        );
     }
 
     // ---- digest + authored_at -------------------------------------------
