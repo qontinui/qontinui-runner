@@ -106,7 +106,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 /// Wall-clock bound on ALL the `git` spawns one probe runs, together. The
-/// same 5 s class as `provision_guard::PROBE_BUDGET`: generous for a few local
+/// same 5 s class as `provision_guard::PROBE_TIMEOUT`: generous for a few local
 /// reads, tight for a spawn an operator is waiting on.
 pub(crate) const PROBE_BUDGET: Duration = Duration::from_secs(5);
 
@@ -1612,11 +1612,13 @@ impl<'a> Git<'a> {
         // ONE absolute deadline, process creation included: the clock does
         // not wait for `spawn()` to return (plan
         // `2026-10-19-served-corpus-probe-budget-excludes-process-creation`).
-        use crate::process_deadline::{DeadlineOutcome, NotStarted};
+        use crate::process_deadline::{DeadlineOutcome, DeadlineRun, NotStarted};
         let span = tracing::debug_span!(
             "served_corpus.git_run",
             spawn_ms = tracing::field::Empty,
-            outcome = tracing::field::Empty
+            outcome = tracing::field::Empty,
+            killed_pid = tracing::field::Empty,
+            reaped = tracing::field::Empty
         )
         .entered();
         let result =
@@ -1631,6 +1633,17 @@ impl<'a> Git<'a> {
             },
         };
         span.record("outcome", outcome);
+        // A killed git: its pid, and whether it exited inside the kill grace.
+        // `reaped=false` means it was PARKED for the detached-child reaper
+        // rather than waited on, so this is the pid to look for there.
+        if let Ok(DeadlineRun {
+            outcome: DeadlineOutcome::TimedOut { pid, reaped },
+            ..
+        }) = &result
+        {
+            span.record("killed_pid", *pid);
+            span.record("reaped", *reaped);
+        }
         if let Some(d) = result.as_ref().ok().and_then(|r| r.spawn_elapsed) {
             span.record("spawn_ms", u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
         }

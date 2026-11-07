@@ -101,6 +101,10 @@ pub trait RequestHints {
 
 const CODE_UNSUPPORTED_MEDIA_TYPE: &str = "UNSUPPORTED_MEDIA_TYPE";
 const CODE_INVALID_JSON: &str = "INVALID_JSON";
+/// A 400 whose body was not UTF-8 at all — distinct from [`CODE_INVALID_JSON`]
+/// because the remedy is the CLIENT'S ENCODING, not its JSON. See
+/// [`invalid_utf8_message`].
+pub(crate) const CODE_INVALID_UTF8: &str = "INVALID_UTF8";
 const CODE_INVALID_REQUEST: &str = "INVALID_REQUEST";
 const CODE_PAYLOAD_TOO_LARGE: &str = "PAYLOAD_TOO_LARGE";
 const CODE_BAD_REQUEST: &str = "BAD_REQUEST";
@@ -139,6 +143,55 @@ pub fn envelope_400(msg: impl Into<String>) -> (StatusCode, Json<ApiResponse<()>
     (
         StatusCode::BAD_REQUEST,
         Json(ApiResponse::<()>::error_with_code(msg, CODE_INVALID_JSON)),
+    )
+}
+
+/// The marker serde_json's `Display` writes for `ErrorCode::InvalidUnicodeCodePoint`.
+///
+/// In serde_json 1.0.149 (locked) through 1.0.154 every site that raises that
+/// code is a `str::from_utf8`
+/// failure on the raw body slice (`read.rs` `as_str`, and the raw-buffering
+/// paths behind `RawValue`); a `\u` escape names a surrogate problem in its own
+/// words ("lone leading surrogate…", "unexpected end of hex escape"). So the marker means "these bytes are not
+/// UTF-8". Pinned by `serde_json_still_words_invalid_utf8_this_way`, so a
+/// serde_json rewording fails the build instead of silently reverting to the
+/// generic message.
+const SERDE_INVALID_UTF8_MARKER: &str = "invalid unicode code point";
+
+/// How axum-core words a `JsonSyntaxError` rejection (its `Display` prefix,
+/// followed by `": "` and the serde error). Pinned by
+/// `non_utf8_body_gives_400_invalid_utf8_not_invalid_json`, which goes through
+/// the real extractor.
+const AXUM_JSON_SYNTAX_PREFIX: &str = "Failed to parse the request body as JSON";
+
+/// When a JSON rejection's text says the body was not UTF-8, the message to
+/// answer instead — `None` for every other rejection.
+///
+/// Why this exists: a Windows Git Bash `curl -d '{"reason":"a — b"}'` hands the
+/// native curl an argv in the ANSI code page, so the em dash goes out as the
+/// single byte `0x97` (measured 2026-10-17 against a local echo:
+/// `…226120972062…`). axum then answered `INVALID_JSON: … invalid unicode code
+/// point`, which reads as "your JSON is malformed" and sends the caller hunting
+/// for a syntax error in a body that has none. The same text sent as UTF-8
+/// (`e2 80 94`) is accepted.
+pub(crate) fn invalid_utf8_message(rejection_text: &str) -> Option<String> {
+    if !rejection_text.contains(SERDE_INVALID_UTF8_MARKER) {
+        return None;
+    }
+    Some(format!(
+        "request body is not valid UTF-8 ({rejection_text}). JSON must be sent as UTF-8 \
+         bytes. A common cause: Git Bash / MSYS curl on Windows passes a non-ASCII `-d` \
+         argument (an em dash, a curly quote) through the ANSI code page — write the body \
+         to a UTF-8 file and send it with `--data-binary @file`, or escape the character \
+         in the JSON (`\\u2014`)."
+    ))
+}
+
+/// Build a 400 envelope for a body that is not UTF-8 (see [`invalid_utf8_message`]).
+fn envelope_400_invalid_utf8(msg: String) -> (StatusCode, Json<ApiResponse<()>>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ApiResponse::<()>::error_with_code(msg, CODE_INVALID_UTF8)),
     )
 }
 
@@ -210,6 +263,10 @@ fn map_json_rejection_with_hints<T: RequestHints>(
     match rejection {
         JsonRejection::MissingJsonContentType(_) => envelope_415(),
         JsonRejection::JsonSyntaxError(e) => {
+            // Not-UTF-8 is an encoding problem, not a syntax one: say so.
+            if let Some(msg) = invalid_utf8_message(&e.to_string()) {
+                return envelope_400_invalid_utf8(msg);
+            }
             // Syntax errors (e.g. truncated JSON, bad escape) benefit from
             // shape hints too — a caller who sends `{action:"click"}` with
             // bad JSON likely still wants the allowed-values list.
@@ -434,8 +491,24 @@ pub async fn envelope_rewrite_middleware(req: Request, next: Next) -> Response {
     // The code half lives in `code_for_status` so the JSON stamping pass
     // below answers `BAD_GATEWAY` for a 502 whichever shape the handler
     // happened to emit — one mapping, not two that can drift apart.
-    let code = code_for_status(status);
-    let message: String = if original_msg.is_empty() {
+    let mut code = code_for_status(status);
+    // axum's plain `Json<T>` rejection for a non-UTF-8 body is a 400 whose
+    // text says "invalid unicode code point" — answer `INVALID_UTF8` with the
+    // encoding remedy rather than `INVALID_JSON` (see `invalid_utf8_message`).
+    // Keyed on axum's `JsonSyntaxError` prefix too, so a handler's own 400 that
+    // happens to quote a serde error about OTHER bytes is not relabelled.
+    let utf8_message =
+        if status == StatusCode::BAD_REQUEST && original_msg.starts_with(AXUM_JSON_SYNTAX_PREFIX) {
+            invalid_utf8_message(&original_msg)
+        } else {
+            None
+        };
+    if utf8_message.is_some() {
+        code = CODE_INVALID_UTF8;
+    }
+    let message: String = if let Some(m) = utf8_message {
+        m
+    } else if original_msg.is_empty() {
         default_message_for_status(status)
     } else {
         // ─── 5xx ──────────────────────────────────────────────────────────
@@ -1054,6 +1127,96 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["success"], false);
         assert_eq!(body["code"], "INVALID_JSON");
+    }
+
+    /// Raw-bytes twin of [`send`], for bodies that are deliberately NOT UTF-8.
+    async fn send_bytes(app: Router, body: &'static [u8]) -> (StatusCode, serde_json::Value) {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/probe")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    /// 400 INVALID_UTF8 — the exact bytes Windows Git Bash curl sent for an em
+    /// dash (`0x97`, CP1252) on 2026-10-17. Not "malformed JSON".
+    #[tokio::test]
+    async fn non_utf8_body_gives_400_invalid_utf8_not_invalid_json() {
+        let (status, body) = send_bytes(test_router(), b"{\"value\":\"a \x97 b\"}").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], "INVALID_UTF8");
+        let msg = body["error"].as_str().unwrap();
+        assert!(msg.starts_with("request body is not valid UTF-8"), "{msg}");
+        assert!(msg.contains("--data-binary"), "{msg}");
+        assert!(
+            msg.contains("`\\u2014`"),
+            "the JSON escape advice is literal: {msg}"
+        );
+    }
+
+    /// A handler's OWN 400 that quotes a serde error about some other bytes
+    /// keeps `INVALID_JSON`: only axum's body-parse rejection is relabelled.
+    #[tokio::test]
+    async fn handler_400_quoting_serde_text_is_not_relabelled() {
+        async fn h() -> (StatusCode, String) {
+            (
+                StatusCode::BAD_REQUEST,
+                "config file: invalid unicode code point at line 1 column 3".to_string(),
+            )
+        }
+        let app = Router::new()
+            .route("/probe", post(h))
+            .layer(middleware::from_fn(envelope_rewrite_middleware));
+        let (status, body) = send_bytes(app, b"{}").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], "INVALID_JSON");
+    }
+
+    /// The same text sent as UTF-8 (`e2 80 94`) is accepted — the runner never
+    /// rejected valid UTF-8; the em dash was only ever an encoding problem.
+    #[tokio::test]
+    async fn utf8_em_dash_is_accepted() {
+        let (status, body) = send_bytes(test_router(), b"{\"value\":\"a \xe2\x80\x94 b\"}").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["data"], "a \u{2014} b");
+    }
+
+    /// The `UiBridgeJson` extractor's syntax arm says the same thing.
+    #[tokio::test]
+    async fn ui_bridge_json_extractor_also_names_invalid_utf8() {
+        async fn h(UiBridgeJson(b): UiBridgeJson<Probe>) -> Json<ApiResponse<String>> {
+            Json(ApiResponse::success(b.value))
+        }
+        let app = Router::new().route("/probe", post(h));
+        let (status, body) = send_bytes(app, b"{\"value\":\"\xff\"}").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], "INVALID_UTF8");
+    }
+
+    /// Pins the marker [`invalid_utf8_message`] keys on to serde_json's real
+    /// wording, and shows a genuine syntax error does NOT trip it.
+    #[test]
+    fn serde_json_still_words_invalid_utf8_this_way() {
+        let err = serde_json::from_slice::<serde_json::Value>(b"{\"v\":\"\x97\"}").unwrap_err();
+        assert!(
+            invalid_utf8_message(&err.to_string()).is_some(),
+            "serde_json reworded its invalid-UTF-8 error ({err}); update SERDE_INVALID_UTF8_MARKER"
+        );
+        let syntax = serde_json::from_slice::<serde_json::Value>(b"not-valid-json{").unwrap_err();
+        assert!(invalid_utf8_message(&syntax.to_string()).is_none());
+        let surrogate =
+            serde_json::from_slice::<serde_json::Value>(br#"{"v":"\ud800"}"#).unwrap_err();
+        assert!(
+            invalid_utf8_message(&surrogate.to_string()).is_none(),
+            "{surrogate}"
+        );
     }
 
     /// 422 INVALID_REQUEST — syntactically valid JSON but missing required field.

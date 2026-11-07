@@ -1983,6 +1983,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn probe_unknown_in_repo_is_its_own_skip_reason() {
+        assert_eq!(
+            SkipReason::ProbeUnknownInRepo.wire(),
+            "probe_unknown_in_repo"
+        );
+        assert_ne!(SkipReason::ProbeUnknownInRepo, SkipReason::GitTracked);
+        let json = serde_json::to_value(SkipReason::ProbeUnknownInRepo).unwrap();
+        assert_eq!(json["reason"], "probe_unknown_in_repo");
+    }
+
+    #[test]
     fn repo_authored_is_its_own_skip_reason() {
         assert_eq!(SkipReason::RepoAuthored.wire(), "repo_authored");
         assert_ne!(SkipReason::RepoAuthored, SkipReason::GitTracked);

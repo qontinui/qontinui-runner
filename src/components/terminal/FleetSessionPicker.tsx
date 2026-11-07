@@ -19,6 +19,7 @@ import {
   groupByDevice,
   type FleetSession,
   type FleetSessionsResponse,
+  normalizeCoordInstant,
 } from "./useFleetSessions";
 import {
   DEFAULT_FLEET_SERVER_FILTER,
@@ -227,6 +228,24 @@ export function sessionStateLabel(s: FleetSession): string {
   const liveness = s.state?.trim() || "—";
   const work = s.sessionStatus?.trim();
   return work ? `${liveness} · ${work}` : liveness;
+}
+
+/** How far ahead of this clock a work-status stamp may be and still read as now. */
+const WORK_STATUS_CLOCK_SKEW_MS = 60_000;
+
+/**
+ * How long ago the work axis moved, e.g. `finished 3h ago`, or null when that is
+ * not known. A finish can be dated by the marking runner's own clock, so a stamp
+ * further ahead than ordinary skew is unknown too, as is an unreadable one. A
+ * `stalled` row is never dated: its clock belongs to the status it stalled in.
+ */
+export function workStatusMoved(s: FleetSession): { iso: string; label: string } | null {
+  const work = s.sessionStatus?.trim();
+  if (!work || work === "stalled" || !s.sessionStatusSince) return null;
+  const iso = normalizeCoordInstant(s.sessionStatusSince);
+  const ahead = Date.parse(iso) - Date.now();
+  if (Number.isNaN(ahead) || ahead > WORK_STATUS_CLOCK_SKEW_MS) return null;
+  return { iso, label: `${work} ${ahead > 0 ? "just now" : formatRelativeTime(iso)}` };
 }
 
 /**
@@ -1609,7 +1628,8 @@ export function FleetSessionPicker() {
                           const free = [s.provider, s.correlationTopic].filter(
                             (v): v is string => typeof v === "string" && v.length > 0,
                           );
-                          if (free.length === 0 && !activity) return null;
+                          const moved = workStatusMoved(s);
+                          if (free.length === 0 && !activity && !moved) return null;
                           return (
                             <div className="text-[10px] text-[#565f89] truncate">
                               {/* Each half carries its OWN title. One tooltip over
@@ -1632,6 +1652,15 @@ export function FleetSessionPicker() {
                                   title={`${activity.verb} at ${activity.iso}`}
                                 >
                                   {activity.verb} {formatRelativeTime(activity.iso)}
+                                </span>
+                              )}
+                              {(free.length > 0 || activity) && moved && " · "}
+                              {moved && (
+                                <span
+                                  data-session-status-since={moved.iso}
+                                  title={`${s.sessionStatus?.trim()} since ${moved.iso}`}
+                                >
+                                  {moved.label}
                                 </span>
                               )}
                             </div>

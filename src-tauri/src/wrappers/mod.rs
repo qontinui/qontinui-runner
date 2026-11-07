@@ -61,7 +61,7 @@ pub(crate) fn capture_logs<F: FnOnce()>(f: F) -> String {
         .with_ansi(false)
         .with_writer(move || sink.clone())
         .finish();
-    tracing::subscriber::with_default(subscriber, f);
+    crate::resource_guard::with_log_capture(subscriber, f);
     let bytes = buf.0.lock().unwrap().clone();
     String::from_utf8_lossy(&bytes).into_owned()
 }

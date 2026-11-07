@@ -10,7 +10,7 @@ import { RemoteTabControls } from "../RemoteTabControls";
 import { useTerminalWindowActions } from "../useTerminalWindowActions";
 import { SessionInfoDropdown } from "../SessionInfoDropdown";
 import { TabTitle, useDisplayTitle } from "../displayTitle";
-import { zoneHeaderReserveClass } from "./headerReserve";
+import { zoneHeaderReserveClass, zoneHeaderToggleClass } from "./headerReserve";
 import { formatTotalOutput } from "./outputSize";
 
 /**
@@ -123,6 +123,10 @@ export function ZoneLabel({
   const [labelValue, setLabelValue] = useState(zoneLabel ?? "");
   const selectorRef = useRef<HTMLDivElement>(null);
   const { popOutTab } = useTerminalWindowActions();
+  // Below the width in `headerReserve.ts` these toggles live in the hover
+  // cluster's overflow menu instead (`ZoneHoverActions`' `headerActions`). A set
+  // pin or filter stays on the row: the toggle is the only sign of either.
+  const toggleClass = zoneHeaderToggleClass(!!tab.remote);
 
   // Item 8: expose session/zone identity to UI Bridge clients. The label is
   // the session title so `ai/find` by title resolves to this header; the
@@ -350,7 +354,7 @@ export function ZoneLabel({
             e.stopPropagation();
             onTogglePin();
           }}
-          className={`p-0.5 rounded transition-colors shrink-0 ${
+          className={`p-0.5 rounded transition-colors shrink-0 ${isPinned ? "" : toggleClass} ${
             isPinned
               ? "text-[#7aa2f7] bg-[#7aa2f7]/15"
               : "text-[#565f89] hover:text-[#a9b1d6] hover:bg-[#2a2d3d]"
@@ -372,7 +376,7 @@ export function ZoneLabel({
             onToggleFilter();
           }}
           onMouseDown={(e) => e.stopPropagation()}
-          className={`p-0.5 rounded transition-colors shrink-0 ${
+          className={`p-0.5 rounded transition-colors shrink-0 ${filterActive ? "" : toggleClass} ${
             filterActive
               ? "text-[#e0af68] bg-[#e0af68]/10"
               : "text-[#565f89] hover:text-[#a9b1d6] hover:bg-[#2a2d3d]/50"
@@ -390,7 +394,7 @@ export function ZoneLabel({
             onTogglePrompts();
           }}
           onMouseDown={(e) => e.stopPropagation()}
-          className={`p-0.5 rounded transition-colors shrink-0 ${
+          className={`p-0.5 rounded transition-colors shrink-0 ${toggleClass} ${
             promptsVisible
               ? "text-[#9ece6a] bg-[#9ece6a]/15"
               : "text-[#565f89] hover:text-[#a9b1d6] hover:bg-[#2a2d3d]/50"
@@ -411,7 +415,7 @@ export function ZoneLabel({
             onScrollToBottom();
           }}
           onMouseDown={(e) => e.stopPropagation()}
-          className="p-0.5 rounded text-[#565f89] hover:text-[#a9b1d6] hover:bg-[#2a2d3d]/50 transition-colors shrink-0"
+          className={`p-0.5 rounded text-[#565f89] hover:text-[#a9b1d6] hover:bg-[#2a2d3d]/50 transition-colors shrink-0 ${toggleClass}`}
           title="Scroll to bottom"
         >
           <ArrowDownToLine className="w-2.5 h-2.5" />

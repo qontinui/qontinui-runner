@@ -37,11 +37,11 @@ unreviewed_ceiling = 229
 [[disposition]]
 class = "machine_path"
 file = "src/commands/setup_wizard.rs"
-symbol = "discover_claude_config_dirs"
+symbol = "const WINDOWS_MULTI_ACCOUNT_ROOT"
 disposition = "fallback_correct"
-note = "Probes the fleet's C:\\claude multi-account convention behind is_dir(); absent everywhere else, where CLAUDE_CONFIG_DIR and ~/.claude still apply."
+note = "Probes the fleet's C:\\claude multi-account convention, read only on the Windows discovery layout (DiscoveryLayout); an absent dir reads as no accounts. Elsewhere the configured roster, CLAUDE_CONFIG_DIR and ~/.claude apply. Moved from the discover_claude_config_dirs key when the literal became this const (qontinui-runner#2544); same disposition."
 reviewed = [
-    "let claude_root = std::path::Path::new(\"C:\\\\claude\");",
+    "const WINDOWS_MULTI_ACCOUNT_ROOT: &str = \"C:\\\\claude\";",
 ]
 
 [[disposition]]
@@ -295,6 +295,16 @@ disposition = "dev_only_surface"
 note = "The transitional dev-origin grace: only the qontinui-web dev frontend on :3001 is admitted at TRUSTED_DOOR_GRACE doors. A dev-only surface that no published build serves from that origin; plan 2026-09-17-retire-the-runner-origin-guard-dev-grace retires it (Phase 6 deletes the constant)."
 reviewed = [
     "pub const GRACE_ORIGINS: &[&str] = &[\"http://localhost:3001\", \"http://127.0.0.1:3001\"];",
+]
+
+[[disposition]]
+class = "dev_ports"
+file = "src/pair.rs"
+symbol = "BrowserPairPage::provenance"
+disposition = "dev_only_surface"
+note = "Operator-facing provenance text for `device pair --browser`: it names the qontinui-web dev frontend on :3001 only as an example value for $QONTINUI_WEB_FRONTEND_BASE when the page origin was derived from the API base. Nothing dials it; the page URL comes from the env override or the API-base derivation (runner#2287)."
+reviewed = [
+    "to override (local dev: http://localhost:3001)\",",
 ]
 
 [[disposition]]
@@ -605,6 +615,19 @@ file = "src/session/tracking_health.rs"
 symbol = "const WORK_CHILD_IMAGES"
 disposition = "fallback_correct"
 note = "Process-IMAGE names compared against a session's direct children on every OS, never launched or required: a pwsh/powershell direct child (a shell a tool runs under) counts as WORK. On a box without PowerShell nothing matches, and the rest of child_signals_work decides as before."
+reviewed = [
+    "\"powershell\",",
+    "\"pwsh\",",
+]
+
+# qontinui-runner#2376 (plan 2026-10-23-runner-sessions-stop-at-permission-dialogs-so-accept-them-by-default-with-a-tenant-switch
+# Phase 2): the PermissionRequest hook carrier's shell-program list.
+[[disposition]]
+class = "os_bound_tooling"
+file = "src/session/claude_hook.rs"
+symbol = "const SHELL_PROGRAMS"
+disposition = "fallback_correct"
+note = "Shell-name stems compared against the argv[0] of a spawn on every OS, never launched or required: the env-var carrier applies only where an interactive shell resolves `claude` through the identity shim. pwsh/powershell are two entries among ten (bash, sh, zsh, fish, dash, ksh, cmd, nu); on a box without PowerShell they match nothing and the rest decide as before."
 reviewed = [
     "\"powershell\",",
     "\"pwsh\",",

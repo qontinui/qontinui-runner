@@ -284,7 +284,6 @@ pub const CREDENTIAL_DOORS: &[&str] = &[
     "/session-repository/*",
     "GET /health/diagnostic-screenshot",
     "GET /vga/capture",
-    "POST /gui-config/capture-elements",
     "/install-effects/registry-credentials/*",
     "/ui-bridge/test/coord-mcp/seed-agent-token",
     "/settings/self-healing/api-key",
@@ -362,6 +361,13 @@ pub const CREDENTIAL_DOORS: &[&str] = &[
     "POST /gui-config/start-executor",
     "POST /state-machine/execute-transition",
     "POST /scheduler/tasks/{id}/run",
+    // The managed-task upsert (plan 2026-10-29-recurring-agents-declared-in-
+    // coord-reconciled-by-runner D5): its callers are the in-process
+    // reconciler and non-browser installers, never a browser, and the task it
+    // writes runs unattended on this device. The handler also refuses every
+    // browser class itself (`refuse_browser_caller`), so the refusal holds
+    // under every route policy, not only where doors are enforced.
+    "PUT /scheduler/tasks/by-key/{source}/{tenant_id}/{agent}",
     "POST /restate/*",
     "POST /git-supervision/test-emit",
     "POST /shell-commands",

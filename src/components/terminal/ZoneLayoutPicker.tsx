@@ -8,7 +8,7 @@ import {
   type LayoutPreset,
 } from "./useZoneLayout";
 import { useUIComponent, UIBridgeComponentScope } from "@qontinui/ui-bridge";
-import { callRegistry, textArg } from "./commands";
+import { callRegistry, readTextArg, textArg } from "./commands";
 import { guardedHandler } from "@/lib/ui-bridge/guardedHandler";
 import { usePageSessionGetter, useTerminalSession } from "./contexts";
 
@@ -24,6 +24,20 @@ const GET_PAGE_LAYOUT_SCHEMA = {
   pageId:
     "string (optional terminal page id from GET /terminal-pages; defaults to the active page)",
 } as const;
+
+/**
+ * The `pageId` a bridge action was given, or `null` when it was not given.
+ *
+ * An absent `pageId` means the page on screen, so one that was SUPPLIED and
+ * names nothing (`""`, a blank shell variable) must not read as absent: it would
+ * re-grid the page the operator is looking at instead of the page the caller
+ * failed to name. `/layout --page` refuses the same input for the same reason.
+ */
+function readPageIdArg(action: string, args: Record<string, unknown>): string | null {
+  const read = readTextArg(args, "pageId");
+  if (read.kind === "invalid") throw new Error(`${action}: pageId needs a page id`);
+  return read.kind === "text" ? read.text : null;
+}
 
 interface ZoneLayoutPickerProps {
   currentLayoutId: string;
@@ -119,7 +133,8 @@ export function ZoneLayoutPicker({
           "Switch a page's terminal grid to a layout preset, named or by window count " +
           "(1 single, 2 split, 3 triptych, 4 quad, 5-6 six-pack, 7-9 full-grid, 10+ flow-grid). " +
           "Returns the layout the grid settles at, which is larger than requested when the " +
-          "page holds more sessions than the preset has zones.",
+          "page holds more sessions than the preset has zones, and leftTmux: true when the " +
+          "request took the page out of tmux work mode.",
         paramSchema: SELECT_LAYOUT_SCHEMA,
         // `write` — switches the grid preset and redistributes zone assignments. No
         // terminal is ended: `applyLayout` preserves in-range assignments and only
@@ -145,7 +160,11 @@ export function ZoneLayoutPicker({
                 `${[...LAYOUT_PRESETS.map((l) => l.id), FLOW_GRID_ID].join(", ")}, or a window count of 1 or more`,
             );
           }
-          const pageId = textArg(args, "pageId");
+          const pageId = readPageIdArg("select-layout", args);
+          // Read before the request: `/layout` exits tmux mode, so afterwards
+          // the page no longer says it was in it.
+          const target = getPageSession(pageId ?? activePageId);
+          const leftTmux = target?.zoneLayout.workMode === "tmux";
           // Phase 1c — delegates to registry `terminal.layout`. The
           // registry handler calls the same `zoneLayout.setLayoutId`
           // closure that `onSelectLayout` does (both source from
@@ -154,7 +173,7 @@ export function ZoneLayoutPicker({
           // landing point instead of two. It refuses an unknown page.
           await callRegistry(
             "terminal.layout",
-            pageId ? { preset: layoutId, page: pageId } : { preset: layoutId },
+            pageId !== null ? { preset: layoutId, page: pageId } : { preset: layoutId },
           );
           setOpen(false);
           // The registry's verdict is prose; a caller trimming a grid needs
@@ -162,22 +181,30 @@ export function ZoneLayoutPicker({
           // zone, so it is the same pure rule the registry reports with. A
           // `/layout` request exits tmux mode, so the settle is predicted for
           // grid mode, as `terminal.layout` does.
-          const tabs = pageId ? (getPageSession(pageId)?.tabs.length ?? tabCount) : tabCount;
+          const tabs = target?.tabs.length ?? tabCount;
           const settled = computeAutoGrowLayoutId(requested, tabs, "grid") ?? requested;
-          return { requested, layoutId: settled, pageId: pageId || activePageId, tabCount: tabs };
+          return {
+            requested,
+            layoutId: settled,
+            pageId: pageId ?? activePageId,
+            tabCount: tabs,
+            leftTmux,
+          };
         }),
       },
       {
         id: "get-page-layout",
         label: "Get Page Layout",
         description:
-          "Return {pageId, layoutId, zoneCount, tabCount, maximizedZone} for one terminal page, " +
-          "whether or not it is the page on screen; with no pageId, for the page on screen.",
+          "Return {pageId, layoutId, zoneCount, tabCount, maximizedZone, workMode} for one " +
+          "terminal page, whether or not it is the page on screen; with no pageId, for the page " +
+          'on screen. A page with workMode "tmux" shows one session, so it reads as a one-zone ' +
+          "single layout whatever its tab count, and select-layout takes it back to a grid.",
         paramSchema: GET_PAGE_LAYOUT_SCHEMA,
         // `read` — reports one page's grid state; changes nothing.
         effect: "read",
         handler: guardedHandler("get-page-layout", GET_PAGE_LAYOUT_SCHEMA, (args) => {
-          const pageId = textArg(args, "pageId") || activePageId;
+          const pageId = readPageIdArg("get-page-layout", args) ?? activePageId;
           const page = getPageSession(pageId);
           if (!page) throw new Error(`No terminal page with id "${pageId}"`);
           return {
@@ -186,6 +213,7 @@ export function ZoneLayoutPicker({
             zoneCount: page.zoneLayout.layout.zones.length,
             tabCount: page.tabs.length,
             maximizedZone: page.zoneLayout.maximizedZone,
+            workMode: page.zoneLayout.workMode,
           };
         }),
       },

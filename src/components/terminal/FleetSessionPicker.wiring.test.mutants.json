@@ -913,8 +913,8 @@
         {
           "label": "fsp-wiring-row-activity-null-is-unknown-placeholder",
           "file": "src/components/terminal/FleetSessionPicker.tsx",
-          "anchor": "if (free.length === 0 && !activity) return null;",
-          "replace": "if (free.length === 0) return null;",
+          "anchor": "if (free.length === 0 && !activity && !moved) return null;",
+          "replace": "if (free.length === 0 && !moved) return null;",
           "expect_count": 1,
           "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'renders nothing at all when coord served no parseable'"
         }
@@ -940,6 +940,37 @@
           "replace": "data-session-activity-verb={activity.verb}",
           "expect_count": 1,
           "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'projects the exact instant for a driver'"
+        }
+      ]
+    },
+    {
+      "id": "FleetSessionPicker.wiring:row-work-status-moved",
+      "kind": "vitest-it",
+      "test_file": "src/components/terminal/FleetSessionPicker.wiring.test.ts",
+      "mutants": [
+        {
+          "label": "fsp-wiring-row-work-status-moved-read-gone",
+          "file": "src/components/terminal/FleetSessionPicker.tsx",
+          "anchor": "const moved = workStatusMoved(s);",
+          "replace": "const moved = null as ReturnType<typeof workStatusMoved>;",
+          "expect_count": 1,
+          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'shows how long ago the work axis moved'"
+        },
+        {
+          "label": "fsp-wiring-row-work-status-moved-iso-attr-gone",
+          "file": "src/components/terminal/FleetSessionPicker.tsx",
+          "anchor": "data-session-status-since={moved.iso}",
+          "replace": "data-session-status-since-x={moved.iso}",
+          "expect_count": 1,
+          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'shows how long ago the work axis moved'"
+        },
+        {
+          "label": "fsp-wiring-row-work-status-moved-label-gone",
+          "file": "src/components/terminal/FleetSessionPicker.tsx",
+          "anchor": "{moved.label}",
+          "replace": "{moved.iso}",
+          "expect_count": 1,
+          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'shows how long ago the work axis moved'"
         }
       ]
     },

@@ -27,8 +27,8 @@ pub mod url_lock;
 pub use bridge_helpers::{
     get_or_create_default_bridge, get_or_create_default_bridge_compartment,
     is_default_bridge_running, is_default_bridge_running_compartment, require_running_bridge,
-    require_running_bridge_compartment, stop_default_bridge, stop_default_bridge_compartment,
-    with_default_bridge, with_default_bridge_compartment,
+    require_running_bridge_compartment, run_bridge_blocking, stop_default_bridge,
+    stop_default_bridge_compartment, with_default_bridge, with_default_bridge_compartment,
 };
 pub use bridge_manager::{BridgeInfo, BridgeManager, BridgeMode, CreateBridgeResult};
 pub use execution_helpers::{prompt_builder, timeout_helper};

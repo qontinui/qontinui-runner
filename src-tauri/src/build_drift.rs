@@ -1135,7 +1135,7 @@ const COORD_MCP_DELIBERATE_EXCLUSION_PREFIXES: &[&str] = &["coord_onboard"];
                 .with_writer(sink)
                 .with_max_level(tracing::Level::WARN)
                 .finish();
-            let out = tracing::subscriber::with_default(subscriber, f);
+            let out = crate::resource_guard::with_log_capture(subscriber, f);
             let logged = String::from_utf8_lossy(&buf.lock().expect("capture lock")).to_string();
             (out, logged)
         }

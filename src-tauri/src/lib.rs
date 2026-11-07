@@ -189,6 +189,10 @@ pub mod peer_user_guard;
 // share one code path. See `pair.rs` for the canonical wire shapes.
 pub mod pair;
 
+// The qontinui-web FRONTEND origin (pages like /connect-runner), distinct from
+// its API origin. Shared by the runner's `api_config` and `pair`.
+pub mod web_origin;
+
 // Cognito Hosted-UI sign-in (RFC 8252 PKCE). Phase 5 of the
 // unified-Cognito-identity plan. Tauri-free (loopback + system browser); the
 // `cognito_sign_in` Tauri command in `commands::auth` drives it.
@@ -199,6 +203,10 @@ pub mod cognito;
 // the marker names so the spawn-site strips, the startup warning and the
 // `coord doctor` check can never disagree on the spelling.
 pub mod claude_env;
+/// Long-lived Claude OAuth tokens (`claude setup-token`) stored per account in
+/// `<config dir>/settings.json` — the one reader account selection, the usage
+/// probe, the warm path and the doctor share.
+pub mod claude_oauth_token;
 
 // `coord doctor` self-check (plan 2026-06-13 Phase 4). Lifted into the lib so
 // BOTH the standalone `coord_doctor` bin and the in-app Tauri command

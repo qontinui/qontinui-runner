@@ -428,9 +428,8 @@ jobs:
           # train for 5h+ on 2026-08-20. The scan cannot notice, because it
           # iterates this file: the entry it would have checked is simply gone.
           #
-          # ci-integrity.yml does not cover this. It triggers only on
-          # .github/workflows/** and .github/actions/**, so a PR touching ONLY
-          # the manifest never fires it — and there is no GATING list to add it
+          # ci-integrity.yml does not cover this. Its trigger does not name the
+          # manifest, so a PR touching ONLY the manifest never fires it — and there is no GATING list to add it
           # to either. ci-integrity's scope is its own trigger minus an empty
           # NON_GATING list, so membership is decided by the path, not by an
           # allowlist anyone maintains — bringing this manifest in would mean
@@ -441,12 +440,10 @@ jobs:
           # So the invariant is narrower and exactly right: a SHA may change
           # freely (that is the bump), but a repo may only LEAVE the manifest in
           # a PR that also edits ci.yml — the file that decides whether that
-          # sibling is checked out at all. ci.yml IS inside ci-integrity's scope
-          # ON A PR BASED ON `main` — that guard is `pull_request_target:
-          # branches: [main]`, so a STACKED PR editing ci.yml produces no
-          # ci-integrity run at all, and this escape hatch is correspondingly
-          # unwitnessed there. So a genuine removal cannot be made silently on a
-          # main-based PR: the guard reds it until it is declared. Note WHICH
+          # sibling is checked out at all. ci.yml IS inside ci-integrity's scope,
+          # on a PR with any base (that guard has carried no base-branch filter
+          # since #1253). So a genuine removal cannot be made silently: the guard
+          # reds it until it is declared. Note WHICH
           # declaration, because removing a checkout-sibling step mutates an
           # EXISTING ci.yml job — `ci:gate-change=alters-a-gate` plus a whole-line
           # `Gate-Change: ci#<job-key>` in the PR body, not the plain label. Only
@@ -520,7 +517,7 @@ jobs:
                   [ -n "$r" ] && echo "::error::  - $r"
                 done <<< "$removed"
                 echo "::error::A repo absent from this file is resolved by DEFAULT BRANCH, i.e. cloned floating — the coupling #1158 removed, and the one that held this repo's merge train for 5h+ on 2026-08-20 with no runner commit involved."
-                echo "::error::If un-pinning is genuinely intended, stop checking that sibling out in the same PR: remove its checkout-sibling step from .github/workflows/ci.yml. That file is inside ci-integrity.yml's scope (on a PR based on main), so a re-float cannot be made silently: the guard reds the PR until you declare the change — 'ci:gate-change=alters-a-gate' plus a 'Gate-Change: ci#<job-key>' body line, because removing a step alters an existing job — and then records it against you. No operator is involved. This check then permits the removal."
+                echo "::error::If un-pinning is genuinely intended, stop checking that sibling out in the same PR: remove its checkout-sibling step from .github/workflows/ci.yml. That file is inside ci-integrity.yml's scope, so a re-float cannot be made silently: the guard reds the PR until you declare the change — 'ci:gate-change=alters-a-gate' plus a 'Gate-Change: ci#<job-key>' body line, because removing a step alters an existing job — and then records it against you. No operator is involved. This check then permits the removal."
                 exit 1
               fi
             fi

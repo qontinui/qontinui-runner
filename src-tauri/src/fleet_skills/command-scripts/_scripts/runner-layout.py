@@ -22,8 +22,9 @@ Drives the runner's UI Bridge component `zone-layout-picker`
 back with `get-page-layout`. Stdlib only.
 
 Exit codes: 0 every page set (or skipped) and verified, 1 a set failed or did
-not verify, 3 UNKNOWN: the runner could not be read, or its build predates the
-page-targeted layout actions (`ACTION_NOT_SUPPORTED`).
+not verify, 2 the argument names no layout or --page names no page, 3 UNKNOWN:
+the runner could not be read, or its build predates the page-targeted layout
+actions (`ACTION_NOT_SUPPORTED`).
 """
 import argparse
 import json
@@ -100,6 +101,10 @@ def plan(arg, state, trim_only):
     if target is None:
         return "SKIPPED", None, None, "no tabs on the page" if arg == "fit" else f"{arg!r} names no layout"
     settled = settles_at(target, tabs)
+    if trim_only and state.get("workMode") == "tmux":
+        # A tmux page shows one session and reads as single, so there is no grid
+        # to trim, and any set would take it out of the mode the operator chose.
+        return "SKIPPED", settled, send, "tmux mode has no grid to trim"
     if trim_only and settled == current:
         # Re-applying the current id cannot shrink it (a flow-grid keeps its
         # highest occupied zone) and would clear a maximized zone.
@@ -165,14 +170,16 @@ def set_page(arg, page_id, trim_only, dry_run):
     except PAGE_FAULTS as e:
         row["reason"] = f"get-page-layout refused: {e}"
         return row
-    row["before"] = f"{state['layoutId']} ({state['zoneCount']} zones, {state['tabCount']} tabs)"
+    tmux = state.get("workMode") == "tmux"
+    mode = ", tmux mode" if tmux else ""
+    row["before"] = f"{state['layoutId']} ({state['zoneCount']} zones, {state['tabCount']} tabs{mode})"
     status, settled, send, reason = plan(arg, state, trim_only)
     row["target"] = settled
     if status == "SKIPPED":
         row["status"], row["reason"] = "SKIPPED", reason
         return row
     if dry_run:
-        row["status"], row["reason"] = "DRY-RUN", f"would set {settled}"
+        row["status"], row["reason"] = "DRY-RUN", f"would set {settled}" + ("; leaves tmux mode" if tmux else "")
         return row
     try:
         res = action("select-layout", {"layoutId": send, "pageId": page_id})
@@ -190,14 +197,23 @@ def set_page(arg, page_id, trim_only, dry_run):
         except PAGE_FAULTS as e:
             row["reason"] = f"set sent; read-back refused: {e}"
             return row
-        if after["layoutId"] == want and (not trim_only or after["zoneCount"] < state["zoneCount"]):
+        if (after["layoutId"] == want and (not trim_only or after["zoneCount"] < state["zoneCount"])
+                and not (tmux and after.get("workMode") == "tmux")):
             row["after"], row["status"] = f"{want} ({after['zoneCount']} zones)", "SET"
-            row["reason"] = "read back"
+            row["reason"] = "read back; left tmux mode" if tmux else "read back"
             return row
     if after is not None:
         row["after"] = f"{after['layoutId']} ({after['zoneCount']} zones)"
         row["reason"] = f"read back {row['after']}, wanted {want}" + (" with fewer zones" if trim_only else "")
+        if tmux and after.get("workMode") == "tmux":
+            row["reason"] = f"read back {row['after']}, still in tmux mode"
     return row
+
+
+def page_ids(arg):
+    """The ids a --page value names, or None when --page was not given. An empty
+    list is a --page that was given and names nothing, which is not the same."""
+    return None if arg is None else [p.strip() for p in arg.split(",") if p.strip()]
 
 
 def selftest():
@@ -229,11 +245,20 @@ def selftest():
         ("fit", {"layoutId": "split", "zoneCount": 2, "tabCount": 5}, True, "SKIPPED", "six-pack"),
         ("fit", {"layoutId": "split", "zoneCount": 2, "tabCount": 5}, False, "SEND", "six-pack"),
         ("fit", {"layoutId": "single", "zoneCount": 1, "tabCount": 0}, True, "SKIPPED", None),
+        ("fit", {"layoutId": "single", "zoneCount": 1, "tabCount": 1, "workMode": "tmux"}, True, "SKIPPED", "single"),
+        # The one case only the tmux rule skips: a flow-grid target passes the zone test.
+        ("fit", {"layoutId": "single", "zoneCount": 1, "tabCount": 12, "workMode": "tmux"}, True, "SKIPPED", FLOW_GRID),
+        ("fit", {"layoutId": "single", "zoneCount": 1, "tabCount": 4, "workMode": "tmux"}, False, "SEND", "quad"),
+        ("fit", {"layoutId": "full-grid", "zoneCount": 9, "tabCount": 4, "workMode": "grid"}, True, "SEND", "quad"),
     ]
     for arg, state, trim, want_status, want_settled in plans:
         got = plan(arg, state, trim)[:2]
         if got != (want_status, want_settled):
             print(f"FAIL plan({arg!r}, {state}, trim={trim}) = {got}, want {(want_status, want_settled)}")
+            failures += 1
+    for arg, want in [(None, None), ("", []), (" , ", []), ("a", ["a"]), ("a, b,", ["a", "b"])]:
+        if page_ids(arg) != want:
+            print(f"FAIL page_ids({arg!r}) = {page_ids(arg)!r}, want {want!r}")
             failures += 1
     for bad in ("\u00b2", "\u0664"):
         if resolve(bad, 3)[0] is not None:
@@ -250,7 +275,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("layout", help="a preset id, a window count, or `fit`")
     g = ap.add_mutually_exclusive_group()
-    g.add_argument("--page", default="", help="page id(s), comma-separated (default: the active page)")
+    g.add_argument("--page", help="page id(s), comma-separated (default: the active page)")
     g.add_argument("--all-pages", action="store_true")
     ap.add_argument("--trim-only", action="store_true", help="only set a page whose grid would shrink")
     ap.add_argument("--dry-run", action="store_true", help="read and report; set nothing")
@@ -264,8 +289,14 @@ def main():
         print(f"{a.layout!r} is not a layout: use a preset id, a window count of 1 or more, or `fit`",
               file=sys.stderr)
         return 2
+    named = page_ids(a.page)
+    if named == []:
+        # A blank `--page "$PAGE"` must not fall through to the page on screen:
+        # that re-grids what the operator is looking at, not the page meant.
+        print(f"--page {a.page!r} names no page", file=sys.stderr)
+        return 2
     try:
-        targets = pages() if a.all_pages else [p for p in a.page.split(",") if p] or [active_page()]
+        targets = pages() if a.all_pages else named or [active_page()]
         if None in targets:
             raise RuntimeError("the active page could not be read; pass --page")
         rows = [set_page(a.layout, p, a.trim_only, a.dry_run) for p in targets]

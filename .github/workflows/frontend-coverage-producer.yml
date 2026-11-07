@@ -56,7 +56,11 @@ concurrency:
 jobs:
   produce:
     name: Per-file coverage -> coord
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(((vars.RUNNER_CI_LANE_FRONTEND_COVERAGE_PRODUCER || vars.RUNNER_CI_LIGHT_LANE) == 'self-hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && '["self-hosted","Linux","X64","qontinui-host-nawa","qontinui"]' || '"ubuntu-latest"') }}
+    env:
+      # vitest defaults to nproc - 1 workers (127 on a nawa runner); pin the
+      # hosted 4-core value on both lanes.
+      VITEST_MAX_WORKERS: 3
     # Budget for the per-file loop over the test corpus; non-gating, so the
     # wall-clock never blocks anything.
     #
@@ -171,12 +175,16 @@ jobs:
         uses: pnpm/action-setup@v4
         with:
           version: 10.33.2
+          # On the self-hosted lane pnpm installs under this job's runner.temp
+          # and the pnpm-store cache is hosted-only, as in ci.yml's `test`.
+          dest: ${{ runner.environment == 'self-hosted' && format('{0}/setup-pnpm', runner.temp) || '~/setup-pnpm' }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v5
         with:
           node-version: "20"
-          cache: "pnpm"
+          cache: ${{ runner.environment == 'github-hosted' && 'pnpm' || '' }}
+          package-manager-cache: ${{ runner.environment == 'github-hosted' }}
           cache-dependency-path: pnpm-lock.yaml
 
       - name: Install dependencies

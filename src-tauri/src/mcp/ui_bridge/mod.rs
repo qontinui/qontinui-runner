@@ -35,6 +35,7 @@ pub mod history;
 pub mod intents;
 pub mod intents_registry;
 pub mod keyboard;
+pub mod media_override;
 pub mod misc;
 pub mod network;
 pub mod page;
@@ -320,7 +321,7 @@ pub(crate) use ipc_handler_post_bumps_mutation;
 
 // Per-family submodules host the rest of the macro-generated handlers:
 //   - state_machine.rs   (states/, state/, state-groups/, transitions/)
-//   - ai_analyze.rs      (ai/analyze/*, ai/semantic-search, ai/diff, media-compare, image-diff)
+//   - ai_analyze.rs      (ai/analyze/*, ai/semantic-search, ai/diff, image-diff)
 //   - design_eval.rs     (control/design/evaluate/*)
 //   - intents_registry.rs (control/intents/*)
 //   - misc.rs            (undo/redo, specs, component-state, scroll,
@@ -367,6 +368,7 @@ pub(super) fn route_manifest() -> &'static [(&'static str, &'static str)] {
         all.extend_from_slice(intents::route_entries());
         all.extend_from_slice(intents_registry::route_entries());
         all.extend_from_slice(keyboard::route_entries());
+        all.extend_from_slice(media_override::route_entries());
         all.extend_from_slice(misc::route_entries());
         all.extend_from_slice(network::route_entries());
         all.extend_from_slice(page::route_entries());
@@ -451,6 +453,7 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .merge(intents::routes())
         .merge(intents_registry::routes())
         .merge(keyboard::routes())
+        .merge(media_override::routes())
         .merge(misc::routes())
         .merge(network::routes())
         .merge(page::routes())
@@ -958,7 +961,6 @@ mod manifest_drift_tests {
             ("POST", "/ui-bridge/control/action-plan"),
             ("POST", "/ui-bridge/control/activate-tab/{}"),
             ("POST", "/ui-bridge/control/annotations"),
-            ("POST", "/ui-bridge/control/capture-element-images"),
             ("POST", "/ui-bridge/control/clear-storage"),
             ("POST", "/ui-bridge/control/design/evaluate"),
             ("POST", "/ui-bridge/control/design/evaluate/baseline"),
@@ -1038,15 +1040,6 @@ mod manifest_drift_tests {
             // Real subsystem (CLI subprocess orchestration), not a handler;
             // tracked separately.
             ("POST", "/ui-bridge/control/sdk/spawn-headless"),
-            // In-situ media override (SDK 835aa75, ui-bridge v0.35.0) — a dev
-            // control the pinned SDK declares and whose runner handlers are
-            // qontinui-runner#2311 (image plan Phase 18), not yet on main. The
-            // ui-bridge pin moved past 835aa75 to reach POST
-            // /control/text-visibility (ui-bridge#265). Delete these three
-            // lines when #2311 lands.
-            ("DELETE", "/ui-bridge/control/media/override"),
-            ("GET", "/ui-bridge/control/media/override"),
-            ("POST", "/ui-bridge/control/media/override"),
         ]
         .into_iter()
         .collect();

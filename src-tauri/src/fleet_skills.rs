@@ -442,7 +442,7 @@ impl<'a> SkillSource<'a> {
 /// repository" section). A skipped write
 /// must never become an aborted spawn, and a failed or slow probe must never
 /// become one either. The probe runs ONCE for the whole tree, not
-/// once per file, so this costs one process spawn rather than ~15.
+/// once per file, so this costs one process spawn rather than one per file.
 /// `canonical` is the canonical rung's last loaded snapshot of the bundled
 /// skills (`None` before the first refresh, or in a test); each skill's files
 /// come from the [`SkillSource`] its name resolves to.

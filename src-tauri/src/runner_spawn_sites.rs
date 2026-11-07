@@ -9,7 +9,9 @@
 //! path is therefore red until it declares how the drain applies to it — the
 //! mechanism coord's `spawn_admission_sites.txt` applies to coord's publish seam.
 //!
-//! Test-only: the whole module is `#[cfg(test)]` in `main.rs`.
+//! Test-only: the whole module is `#[cfg(test)]` in `main.rs`. Its source walk
+//! (`load_sources`, `comment_mask`, `token_re`) is shared with the close-site
+//! roster, `runner_close_sites.rs`.
 //!
 //! ## Known limits (a source scan, not a type check)
 //!
@@ -85,7 +87,7 @@ struct Row {
     detail: String,
 }
 
-type Sources = BTreeMap<String, String>;
+pub(crate) type Sources = BTreeMap<String, String>;
 type Rows = BTreeMap<(String, String), Row>;
 
 fn src_root() -> PathBuf {
@@ -105,7 +107,7 @@ fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-fn load_sources() -> Sources {
+pub(crate) fn load_sources() -> Sources {
     let root = src_root();
     let mut files = Vec::new();
     collect_rs(&root, &mut files);
@@ -130,7 +132,7 @@ fn load_sources() -> Sources {
 /// Per line: is it a comment? `//` lines, and every line of a `/* … */` block
 /// that opens a line. A `*`-led CODE line (`*slot = tm.create(..)`) is code —
 /// only inside a block comment does a leading `*` mean a comment.
-fn comment_mask(lines: &[&str]) -> Vec<bool> {
+pub(crate) fn comment_mask(lines: &[&str]) -> Vec<bool> {
     let mut in_block = false;
     lines
         .iter()
@@ -259,7 +261,7 @@ fn primitive_families() -> Vec<(&'static str, Vec<Regex>)> {
 
 /// A literal call token (`foo(`, `.start_inner(`) as a regex that tolerates
 /// whitespace before the paren.
-fn token_re(token: &str) -> Regex {
+pub(crate) fn token_re(token: &str) -> Regex {
     let (head, paren) = match token.strip_suffix('(') {
         Some(h) => (h, r"\s*\("),
         None => (token, ""),

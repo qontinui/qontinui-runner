@@ -2637,9 +2637,11 @@ pub struct PairBaseOrigin {
 /// Which rung of [`resolve_cli_web_base`] produced the web-backend base.
 ///
 /// Serves all three CLI pairing flows — `--pair-code` redemption,
-/// `--auth-token` `pair-cli`, AND the `--browser` flow's `/connect-runner`
-/// page. The rungs have DIFFERENT remediations when a request fails against
-/// the resolved host, and the URL alone does not distinguish them —
+/// `--auth-token` `pair-cli`, AND (indirectly) the `--browser` flow, whose
+/// `/connect-runner` page origin is DERIVED from this API base by
+/// [`resolve_browser_pair_page`] — the page itself is never opened on it.
+/// The rungs have DIFFERENT remediations when a request fails against the
+/// resolved host, and the URL alone does not distinguish them —
 /// `https://api.qontinui.io` looks identical whether it came from an operator
 /// export, a profile's `api_url`, or the compiled-in default. Reporting the
 /// winning arm turns "wrong host" from a guess into a one-line fix.
@@ -2703,8 +2705,9 @@ impl std::fmt::Display for CliWebBaseSource {
 }
 
 /// Resolve the qontinui-web backend base the CLI pairing flows dial, WITH the
-/// arm that produced it. The one ladder for `--pair-code`, `--auth-token` and
-/// `--browser`; three rungs, in order:
+/// arm that produced it. The one API-base ladder for `--pair-code`,
+/// `--auth-token` and `--browser` (which derives its FRONTEND page origin from
+/// this base — see [`resolve_browser_pair_page`]); three rungs, in order:
 ///
 /// 1. `env` (`$QONTINUI_WEB_BASE`) — an explicit operator override.
 /// 2. `profile` — the active profile's `api_url`, as returned by
@@ -2948,6 +2951,60 @@ mod cli_web_base_tests {
             );
         }
     }
+
+    // `device pair --browser` must open /connect-runner on the web FRONTEND.
+    // 2026-10-18: it opened https://api.qontinui.io/connect-runner, which
+    // 404s, because the page URL was built from the API base.
+
+    #[test]
+    fn browser_pair_page_defaults_to_the_production_frontend() {
+        let page = resolve_browser_pair_page(None, None, None);
+        assert_eq!(page.page_url, "https://qontinui.io/connect-runner");
+        assert_eq!(page.frontend_base, "https://qontinui.io");
+        assert_eq!(page.api_base, "https://api.qontinui.io");
+        assert_eq!(page.api_source, CliWebBaseSource::ProdDefault);
+        // Pin the whole line the CLI prints: it must name both rungs and the
+        // override, with no stray whitespace.
+        let expected = [
+            "web frontend derived from API base https://api.qontinui.io, itself from the ",
+            "compiled-in production default (no $QONTINUI_WEB_BASE, no profile api_url); ",
+            "set $QONTINUI_WEB_FRONTEND_BASE to override (local dev: http://localhost:3001)",
+        ]
+        .concat();
+        assert_eq!(page.provenance(), expected);
+    }
+
+    #[test]
+    fn browser_pair_page_follows_the_api_base_overrides() {
+        // $QONTINUI_WEB_BASE keeps steering the page, via derivation.
+        let page = resolve_browser_pair_page(Some("https://api.staging.example/"), None, None);
+        assert_eq!(page.page_url, "https://staging.example/connect-runner");
+        assert_eq!(page.api_source, CliWebBaseSource::EnvOverride);
+        // So does a profile api_url.
+        let page = resolve_browser_pair_page(None, profile("https://api.p.example"), None);
+        assert_eq!(page.page_url, "https://p.example/connect-runner");
+        // A unified/dev origin with no `api.` label is used as-is.
+        let page = resolve_browser_pair_page(Some("http://127.0.0.1:8000"), None, None);
+        assert_eq!(page.page_url, "http://127.0.0.1:8000/connect-runner");
+    }
+
+    #[test]
+    fn browser_pair_page_frontend_override_wins_over_every_api_rung() {
+        let page = resolve_browser_pair_page(
+            Some("http://127.0.0.1:8000"),
+            profile("https://api.p.example"),
+            Some("http://localhost:3001/"),
+        );
+        assert_eq!(page.page_url, "http://localhost:3001/connect-runner");
+        assert_eq!(
+            page.frontend_source,
+            crate::web_origin::WebFrontendSource::EnvOverride
+        );
+        // The API base is untouched by the frontend override: API calls keep
+        // their own ladder.
+        assert_eq!(page.api_base, "http://127.0.0.1:8000");
+        assert_eq!(page.provenance(), "$QONTINUI_WEB_FRONTEND_BASE override");
+    }
 }
 
 /// Replace URL userinfo (`scheme://user:pass@host`) with `scheme://***@host`
@@ -3157,7 +3214,8 @@ pub fn pair_with_auth_token_with_ids_typed(
 /// returned by ``pair-cli`` so the runner can use a single decoder for
 /// both paths. This struct is named for the field set declared in the
 /// web schema (``app/schemas/pair_code.py::PairCodeRedeemOut``):
-/// ``{user_id, tenant_id, device_id, expires_at?, device_token_jwt}``.
+/// ``{user_id, tenant_id, device_id, expires_at?, device_token_jwt,
+/// device_machine_key?}``.
 ///
 /// The redeem path returns ``device_token_jwt`` (not ``token``) for
 /// disambiguation in the web schema, so we accept both spellings via
@@ -3174,6 +3232,12 @@ pub struct PairCodeRedeemResponse {
     /// the legacy ``token`` alias too in case the API ever renames.
     #[serde(alias = "token")]
     pub device_token_jwt: String,
+    /// Device machine key (`dmk_`) the web redeem auto-mints, so a pair-code
+    /// pairing gets the same >30-day cold-start recovery credential a
+    /// `pair-cli` pairing does. Optional: a web backend predating it omits the
+    /// field, which decodes to `None`.
+    #[serde(default)]
+    pub device_machine_key: Option<String>,
 }
 
 impl PairCodeRedeemResponse {
@@ -3192,8 +3256,7 @@ impl PairCodeRedeemResponse {
             jti: None,
             exp: None,
             tenant_id: Some(self.tenant_id),
-            // The pair-code redeem path does not carry a dmk_ in this phase.
-            device_machine_key: None,
+            device_machine_key: self.device_machine_key,
         }
     }
 }
@@ -3286,12 +3349,6 @@ pub(crate) struct CallbackCapture {
     pub token_id: Option<String>,
 }
 
-/// Browser-mediated pair. Spins up a localhost axum server, calls coord's
-/// `POST /coord/devices/pair-start` to register the flow and obtain a
-/// coord-minted state nonce + redirect URL, opens the browser, waits for
-/// the user's click + redirect which delivers the device-token JWT
-/// directly via the callback query params (coord's `pair-complete` is
-/// called by the web frontend, not the runner).
 /// Body of the anonymous `POST /coord/devices/pair-start` that opens the
 /// browser pairing flow. Carries `device_id` so coord binds the flow to THIS
 /// device and refuses a `pair-complete` for any other (`device_mismatch`,
@@ -3315,6 +3372,74 @@ fn pair_start_request_body(
     })
 }
 
+/// Where the browser pair flow sends the user, and which rungs chose it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowserPairPage {
+    /// The `/connect-runner` page URL handed to coord as `web_pair_url`.
+    pub page_url: String,
+    /// The web-FRONTEND origin the page is served from.
+    pub frontend_base: String,
+    pub frontend_source: crate::web_origin::WebFrontendSource,
+    /// The web-API base the frontend origin was derived from (when it was).
+    pub api_base: String,
+    pub api_source: CliWebBaseSource,
+}
+
+impl BrowserPairPage {
+    /// Operator-facing provenance for the page origin: the frontend rung,
+    /// and — when derived — the API rung underneath it, since the two have
+    /// different fixes.
+    pub fn provenance(&self) -> String {
+        use crate::web_origin::{WebFrontendSource, WEB_FRONTEND_BASE_ENV};
+        match &self.frontend_source {
+            WebFrontendSource::EnvOverride => format!("${WEB_FRONTEND_BASE_ENV} override"),
+            WebFrontendSource::SettingOverride => {
+                "runner setting web_integration.web_base_url".to_string()
+            }
+            WebFrontendSource::DerivedFromApiBase { api_base } => format!(
+                "web frontend derived from API base {api_base}, itself from the {}; set ${} \
+                 to override (local dev: http://localhost:3001)",
+                self.api_source, WEB_FRONTEND_BASE_ENV
+            ),
+        }
+    }
+}
+
+/// Resolve the `/connect-runner` page the browser pair flow opens. Pure — the
+/// caller passes the environment and the profile in.
+///
+/// `/connect-runner` is a qontinui-web FRONTEND page (Next.js). In production
+/// the frontend (`qontinui.io`) and the API (`api.qontinui.io`) are different
+/// hosts, and the API host answers the page path with `404 NOT_FOUND` — the
+/// 2026-10-18 defect, where this flow opened
+/// `https://api.qontinui.io/connect-runner`. So the page origin is resolved by
+/// [`crate::web_origin::resolve_web_frontend_base`]: `$QONTINUI_WEB_FRONTEND_BASE`,
+/// else derived from the API base that [`resolve_cli_web_base`] picks (so
+/// `$QONTINUI_WEB_BASE` and a profile `api_url` keep steering it).
+pub fn resolve_browser_pair_page(
+    web_base_env: Option<&str>,
+    profile: Option<(String, crate::profiles::ApiUrlSource)>,
+    frontend_env: Option<&str>,
+) -> BrowserPairPage {
+    let (api_base, api_source) = resolve_cli_web_base(web_base_env, profile);
+    let (frontend_base, frontend_source) =
+        crate::web_origin::resolve_web_frontend_base(frontend_env, None, &api_base);
+    BrowserPairPage {
+        page_url: format!("{frontend_base}/connect-runner"),
+        frontend_base,
+        frontend_source,
+        api_base,
+        api_source,
+    }
+}
+
+/// Browser-mediated pair. Spins up a localhost axum server, calls coord's
+/// `POST /coord/devices/pair-start` to register the flow and obtain a
+/// coord-minted state nonce + redirect URL, opens the browser on the web
+/// FRONTEND's `/connect-runner` ([`resolve_browser_pair_page`]), waits for
+/// the user's click + redirect which delivers the device-token JWT
+/// directly via the callback query params (coord's `pair-complete` is
+/// called by the web frontend, not the runner).
 pub fn pair_via_browser(
     coord_base: &str,
     tenant_id: uuid::Uuid,
@@ -3327,15 +3452,21 @@ pub fn pair_via_browser(
     // coord's pair-complete.
     let device_id = read_device_id()?;
 
-    // Web backend URL: the one CLI web-base ladder ($QONTINUI_WEB_BASE, then
-    // the active profile's api_url, then the production default). This
-    // deliberately does NOT derive from `coord_base` — see
-    // `resolve_cli_web_base` for the reasoning and the measured failure.
-    let (web_base, web_source) = resolve_cli_web_base(
+    // The /connect-runner page lives on the web FRONTEND, not the API host.
+    // This deliberately does NOT derive from `coord_base` either — see
+    // `resolve_cli_web_base` for that measured failure.
+    let page = resolve_browser_pair_page(
         std::env::var("QONTINUI_WEB_BASE").ok().as_deref(),
         crate::profiles::api_url_with_source(),
+        std::env::var(crate::web_origin::WEB_FRONTEND_BASE_ENV)
+            .ok()
+            .as_deref(),
     );
-    eprintln!("Opening connect-runner on {web_base} ({web_source})");
+    eprintln!(
+        "Opening connect-runner on {} ({})",
+        page.frontend_base,
+        page.provenance()
+    );
     let hostname_now = detect_hostname();
 
     // Bind a port for the callback. Use 0 to let the OS pick — then read it
@@ -3355,7 +3486,7 @@ pub fn pair_via_browser(
 
     // Step 1: Call coord's pair-start to register the pairing flow and
     // obtain a coord-minted state nonce + redirect URL.
-    let web_pair_url = format!("{}/connect-runner", web_base.trim_end_matches('/'));
+    let web_pair_url = page.page_url.clone();
     let pair_start_url = format!("{}/coord/devices/pair-start", coord_base);
     let pair_start_body = pair_start_request_body(
         &device_id,
@@ -3579,7 +3710,10 @@ pub fn pair_via_browser(
 /// LoginScreen. This must NOT be called from any background context — doing so
 /// would let a background write blank an unreadable store. See
 /// `SecureStorage::WriteMode`.
-pub fn persist_pairing(resp: &PairCompleteResponse, tenant_id: uuid::Uuid) -> Result<(), String> {
+pub fn persist_pairing(
+    resp: &PairCompleteResponse,
+    tenant_id: uuid::Uuid,
+) -> Result<PairingPersisted, String> {
     use crate::auth::AuthManager;
     let mgr = AuthManager::new();
     let path = paired_user_path().ok_or_else(|| "could not resolve data_local_dir".to_string())?;
@@ -3599,19 +3733,73 @@ pub fn persist_pairing(resp: &PairCompleteResponse, tenant_id: uuid::Uuid) -> Re
     // Best-effort: if the web pair response auto-minted a device machine key
     // (`dmk_`), persist it so the refresher's Phase-4b cold-start exchange can
     // recover a device JWT after a >30-day outage with no user session. A
-    // missing dmk_ (pre-Phase-3 web / non-cli pairing) is a no-op.
-    if let Some(dmk) = resp
+    // missing dmk_ (an older web backend) is a no-op. A failed store does not
+    // fail the pairing — the device JWT is already saved — but it is reported
+    // in the returned `dmk_stored` and logged at `warn!`.
+    let dmk_stored = if has_device_machine_key(resp) {
+        match crate::secure_storage::SecureStorage::new() {
+            Ok(storage) => persist_device_machine_key(&storage, resp),
+            Err(e) => {
+                tracing::warn!(
+                    "persist_pairing: secure storage unavailable, device machine key NOT stored: {e}"
+                );
+                false
+            }
+        }
+    } else {
+        false
+    };
+    Ok(PairingPersisted { dmk_stored })
+}
+
+/// What [`persist_pairing`] wrote beyond the mandatory device-JWT persist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PairingPersisted {
+    /// `true` only when the pair response carried a non-blank device machine
+    /// key (`dmk_`) AND secure storage holds exactly that key after the write
+    /// (read back, not assumed from the response). `false` when the response
+    /// carried none, or the store or its read-back failed.
+    pub dmk_stored: bool,
+}
+
+fn has_device_machine_key(resp: &PairCompleteResponse) -> bool {
+    resp.device_machine_key
+        .as_deref()
+        .is_some_and(|k| !k.trim().is_empty())
+}
+
+/// Store `resp`'s device machine key into `storage` (explicit-acquisition
+/// `_fresh` write) and confirm it by reading it back. Returns whether storage
+/// now holds that key; every failure is logged at `warn!`.
+pub(crate) fn persist_device_machine_key(
+    storage: &crate::secure_storage::SecureStorage,
+    resp: &PairCompleteResponse,
+) -> bool {
+    let Some(dmk) = resp
         .device_machine_key
         .as_deref()
         .filter(|k| !k.trim().is_empty())
-    {
-        if let Ok(storage) = crate::secure_storage::SecureStorage::new() {
-            if let Err(e) = storage.store_device_machine_key_fresh(dmk) {
-                tracing::debug!("store_device_machine_key non-fatal: {e}");
-            }
+    else {
+        return false;
+    };
+    if let Err(e) = storage.store_device_machine_key_fresh(dmk) {
+        tracing::warn!("persist_pairing: device machine key NOT stored: {e}");
+        return false;
+    }
+    match storage.get_device_machine_key() {
+        Ok(Some(stored)) if stored == dmk => true,
+        Ok(_) => {
+            tracing::warn!(
+                "persist_pairing: device machine key write reported success but the read-back \
+                 does not hold it"
+            );
+            false
+        }
+        Err(e) => {
+            tracing::warn!("persist_pairing: device machine key read-back failed: {e}");
+            false
         }
     }
-    Ok(())
 }
 
 /// Parameterized core of [`persist_pairing`] — explicit `AuthManager` +
@@ -4386,6 +4574,90 @@ mod tests {
         assert_eq!(parsed.device_token_jwt, "legacy.jwt.xyz");
     }
 
+    /// Plan `2026-11-03-pair-code-pairing-mints-no-device-machine-key` Phase 2:
+    /// the redeem response's optional `device_machine_key` decodes when the web
+    /// sends it, and defaults to `None` (also for an explicit `null`) when an
+    /// older backend omits it.
+    #[test]
+    fn pair_code_redeem_response_decodes_optional_device_machine_key() {
+        let base = serde_json::json!({
+            "user_id":          "22222222-2222-4222-8222-222222222222",
+            "tenant_id":        "11111111-2222-3333-4444-555555555555",
+            "device_id":        "00000000-0000-4000-8000-000000000000",
+            "device_token_jwt": "abc.def.ghi",
+        });
+
+        let mut with_key = base.clone();
+        with_key["device_machine_key"] = serde_json::json!("dmk_unit_fixture_placeholder");
+        let parsed: PairCodeRedeemResponse =
+            serde_json::from_value(with_key).expect("decode with device_machine_key");
+        assert_eq!(
+            parsed.device_machine_key.as_deref(),
+            Some("dmk_unit_fixture_placeholder")
+        );
+
+        let parsed: PairCodeRedeemResponse =
+            serde_json::from_value(base.clone()).expect("decode without device_machine_key");
+        assert!(parsed.device_machine_key.is_none());
+
+        let mut null_key = base;
+        null_key["device_machine_key"] = serde_json::Value::Null;
+        let parsed: PairCodeRedeemResponse =
+            serde_json::from_value(null_key).expect("decode null device_machine_key");
+        assert!(parsed.device_machine_key.is_none());
+    }
+
+    /// `persist_device_machine_key` (the dmk_ half of `persist_pairing`)
+    /// reports `true` only when the isolated store actually holds the key the
+    /// response carried, and `false` — writing nothing — when the response
+    /// carried none or a blank one.
+    #[test]
+    fn persist_device_machine_key_reports_what_storage_holds() {
+        let dir = temp_dir_for("persist_dmk_reports_storage");
+        let storage = crate::secure_storage::SecureStorage::with_path(dir.join("tokens.enc"))
+            .expect("test storage");
+
+        let mut resp = pair_resp("jwt.a.1");
+        assert!(
+            !persist_device_machine_key(&storage, &resp),
+            "no key → not stored"
+        );
+        resp.device_machine_key = Some("   ".to_string());
+        assert!(
+            !persist_device_machine_key(&storage, &resp),
+            "blank key → not stored"
+        );
+        assert!(storage.get_device_machine_key().unwrap().is_none());
+
+        resp.device_machine_key = Some("dmk_unit_fixture_placeholder".to_string());
+        assert!(persist_device_machine_key(&storage, &resp));
+        assert_eq!(
+            storage.get_device_machine_key().unwrap().as_deref(),
+            Some("dmk_unit_fixture_placeholder")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A store that FAILS must report `false`, never the response's word that
+    /// it carried a key: here the token file path is a directory, so the
+    /// write cannot land and `dmk_stored` must read false.
+    #[test]
+    fn persist_device_machine_key_reports_false_when_the_store_fails() {
+        let dir = temp_dir_for("persist_dmk_store_fails");
+        let token_path = dir.join("tokens.enc");
+        let storage = crate::secure_storage::SecureStorage::with_path(token_path.clone())
+            .expect("test storage");
+        std::fs::create_dir_all(&token_path).expect("occupy the token path with a directory");
+
+        let mut resp = pair_resp("jwt.a.1");
+        resp.device_machine_key = Some("dmk_unit_fixture_placeholder".to_string());
+        assert!(
+            !persist_device_machine_key(&storage, &resp),
+            "a failed store must not read as stored"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// ``PairCodeRedeemResponse::into_pair_complete`` produces a
     /// ``PairCompleteResponse`` with the same fields callers expect
     /// from ``pair-cli``, so ``persist_pairing`` can consume it
@@ -4398,8 +4670,14 @@ mod tests {
             device_id: "00000000-0000-4000-8000-000000000000".to_string(),
             expires_at: None,
             device_token_jwt: "abc.def.ghi".to_string(),
+            device_machine_key: Some("dmk_unit_fixture_placeholder".to_string()),
         };
         let pc = redeem.into_pair_complete();
+        assert_eq!(
+            pc.device_machine_key.as_deref(),
+            Some("dmk_unit_fixture_placeholder"),
+            "the redeem's machine key must pass through to persist_pairing"
+        );
         assert_eq!(pc.token, "abc.def.ghi");
         assert_eq!(pc.user_id, "22222222-2222-4222-8222-222222222222");
         assert_eq!(

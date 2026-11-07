@@ -10,8 +10,8 @@
  * `headerReserve.ts` cannot silently fall behind the header.
  *
  * A remote tab's row adds `RemoteTabControls`' items, budgeted by
- * `HEADER_REMOTE_FLOORS_PX`. `TenantBadge` (multi-tenant devices) is stubbed to
- * nothing: `headerControlsMinPx` does not budget it.
+ * `HEADER_REMOTE_FLOORS_PX`. `TenantBadge` is the real one, on a stubbed
+ * multi-tenant device, so it renders and is counted.
  */
 
 import { act, createElement } from "react";
@@ -29,7 +29,11 @@ vi.mock("@tauri-apps/api/core", () => ({
 }));
 vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: vi.fn() }));
 vi.mock("@qontinui/ui-bridge", () => ({ useUIElement: () => ({ ref: { current: null } }) }));
-vi.mock("../TenantBadge", () => ({ TenantBadge: () => null }));
+vi.mock("@/contexts/TenantContext", () => ({ useTenant: () => ({ showSwitcher: true }) }));
+vi.mock("../useSessionInfo", async (orig) => ({
+  ...(await orig<typeof import("../useSessionInfo")>()),
+  useSessionInfo: () => ({ body: null }),
+}));
 vi.mock("../contexts/TerminalSessionContext", () => ({ useTerminalSession: () => ({}) }));
 vi.mock("../useRemoteAttachWaiting", () => ({ useRemoteAttachWaiting: () => ({}) }));
 vi.mock("../useRemoteInteractivity", () => ({ useRemoteInteractivity: () => [{}, 0] }));
@@ -61,6 +65,7 @@ import {
   HEADER_TRUNCATING_FLOORS_PX,
   headerControlsMinPx,
 } from "../ZoneHoverActions";
+import { ZONE_HEADER_TOGGLE_CLASS, ZONE_HEADER_TOGGLE_REMOTE_CLASS } from "./headerReserve";
 import type { TerminalTab } from "../useTerminalManager";
 
 let container: HTMLDivElement;
@@ -71,6 +76,7 @@ const tab = {
   title: "Session name",
   workingDir: "/home/u/project",
   claudeSessionId: "abcdef12-0000-0000-0000-000000000000",
+  tenantId: "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a",
 } as unknown as TerminalTab;
 const other = { ...tab, id: "t2", claudeSessionId: undefined } as unknown as TerminalTab;
 const remoteTab = {
@@ -153,7 +159,7 @@ describe("zone header row against headerControlsMinPx", () => {
     expect(children).toHaveLength(
       Object.keys(HEADER_FIXED_ITEMS_PX).length + Object.keys(HEADER_TRUNCATING_FLOORS_PX).length,
     );
-    expect(headerControlsMinPx()).toBe(256);
+    expect(headerControlsMinPx()).toBe(280);
   });
 
   it("a remote tab's row adds only truncating items, each budgeted", async () => {
@@ -184,7 +190,64 @@ describe("zone header row against headerControlsMinPx", () => {
     expect(row.querySelector('[data-ui-bridge-id="terminal.remote-note.t1"]')?.textContent).toBe(
       "no earlier output",
     );
-    expect(headerControlsMinPx(true)).toBe(322);
+    expect(headerControlsMinPx(true)).toBe(346);
+  });
+
+  it("the tenant badge truncates, keeps its icon, and keeps the tenant in its title", () => {
+    const badge = renderRow().querySelector('[data-testid="tenant-badge"]')!;
+    expect(holdsWidth(badge)).toBe(false);
+    expect(classes(badge)).toContain("min-w-[18px]");
+    expect(classes(badge.querySelector("svg")!)).toContain("shrink-0");
+    expect(classes(badge.querySelector("span")!)).toContain("truncate");
+    expect(badge.getAttribute("title")).toContain("c231d9da");
+  });
+
+  it("hides the four toggles the overflow menu carries, by the tab's width", () => {
+    const titled = (row: HTMLElement, title: string) =>
+      Array.from(row.querySelectorAll("button")).find((b) => b.title === title)!;
+    for (const [shown, cls] of [
+      [tab, ZONE_HEADER_TOGGLE_CLASS],
+      [remoteTab, ZONE_HEADER_TOGGLE_REMOTE_CLASS],
+    ] as const) {
+      const row = renderRow(undefined, shown);
+      for (const title of [
+        "Pin zone (keep full terminal in auto mode)",
+        "Filter output",
+        "Show my prompts",
+        "Scroll to bottom",
+      ]) {
+        expect(classes(titled(row, title)), title).toContain(cls);
+      }
+      // The toggles the menu does not carry never hide.
+      expect(classes(titled(row, "Switch session in this zone")).join(" ")).not.toContain(
+        "/zone:hidden",
+      );
+    }
+  });
+
+  it("a set pin or an active filter stays on the row at every width", () => {
+    act(() => {
+      root.render(
+        createElement(ZoneLabel, {
+          tab,
+          state: "working",
+          zoneIndex: 0,
+          allTabs: [tab],
+          assignments: { 0: "t1" },
+          sessionStates: {},
+          isPinned: true,
+          onTogglePin: () => {},
+          filterActive: true,
+          onToggleFilter: () => {},
+        }),
+      );
+    });
+    const row = container.querySelector<HTMLElement>('[data-zone-index="0"]')!;
+    const buttons = Array.from(row.querySelectorAll("button"));
+    const pin = buttons.find((b) => b.title.startsWith("Unpin zone"))!;
+    const filter = buttons.find((b) => b.title === "Filter output")!;
+    expect(pin.className).not.toContain("/zone:hidden");
+    expect(filter.className).not.toContain("/zone:hidden");
   });
 
   it("the session-info count is capped so its budget holds", () => {
@@ -198,6 +261,7 @@ describe("zone header row against headerControlsMinPx", () => {
     expect(cls).toContain("gap-1.5");
     expect(cls).toContain("px-2");
     expect(cls).toContain("group-hover:pr-[148px]");
+    expect(cls.join(" ")).not.toContain("/zone:top-");
   });
 
   it("the total-output label truncates and keeps its full figure in its title", () => {

@@ -463,10 +463,16 @@ pub(crate) fn mark_grant_revoked_for_test(config_dir: &str) {
     mark_hard_failure(&creds_path, snap.refresh_token_fp);
 }
 
-/// Whether `config_dir` has live, usable Claude OAuth credentials: a
-/// `.credentials.json` exists *in that exact dir* AND the token is either
-/// unexpired or still refreshable (a `refreshToken` the token endpoint has not
-/// rejected — see [`creds_path_is_valid`]).
+/// Whether `config_dir` has live, usable Claude OAuth credentials: either a
+/// long-lived `claude setup-token` token in that dir's `settings.json`
+/// ([`qontinui_runner_lib::claude_oauth_token::from_config_dir`]), or a
+/// `.credentials.json` *in that exact dir* whose token is either unexpired or
+/// still refreshable (a `refreshToken` the token endpoint has not rejected —
+/// see [`creds_path_is_valid`]).
+///
+/// A long-lived token has no expiry the runner can read and nothing to refresh,
+/// so its presence is the whole verdict; a revoked one surfaces as the usage
+/// probe's auth error (which marks the account exhausted), not here.
 ///
 /// This is the highest-precedence account-selection filter (see
 /// [`super::account_usage::pick_best_account`]): selection must never pin a
@@ -479,6 +485,9 @@ pub(crate) fn mark_grant_revoked_for_test(config_dir: &str) {
 /// and report them all identically — silently defeating the per-account
 /// distinction this predicate exists to make.
 pub(crate) fn has_valid_credentials(config_dir: &str) -> bool {
+    if qontinui_runner_lib::claude_oauth_token::from_config_dir(Path::new(config_dir)).is_some() {
+        return true;
+    }
     let creds_path = PathBuf::from(config_dir).join(".credentials.json");
     creds_path_is_valid(&creds_path)
 }
@@ -492,6 +501,11 @@ pub(crate) fn has_valid_credentials(config_dir: &str) -> bool {
 /// Spawn paths use this to decide whether an unset-`CLAUDE_CONFIG_DIR` spawn
 /// would land on a real login or 401-zombie under a dead default.
 pub(crate) fn default_location_has_valid_credentials() -> bool {
+    // A long-lived `claude setup-token` token the child would inherit (process
+    // env, `$CLAUDE_CONFIG_DIR/settings.json`, `~/.claude/settings.json`).
+    if qontinui_runner_lib::claude_oauth_token::ambient().is_some() {
+        return true;
+    }
     if let Some(path) = find_creds_path(None) {
         if creds_path_is_valid(&path) {
             return true;
@@ -715,6 +729,29 @@ mod tests {
             .unwrap()
             .as_millis() as i64)
             - 60_000
+    }
+
+    #[test]
+    fn has_valid_credentials_true_for_a_long_lived_token_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("settings.json"),
+            r#"{"env":{"CLAUDE_CODE_OAUTH_TOKEN":"sk-ant-oat01-longlived"}}"#,
+        )
+        .expect("write settings");
+        assert!(!dir.path().join(".credentials.json").exists());
+        assert!(has_valid_credentials(&dir.path().to_string_lossy()));
+    }
+
+    #[test]
+    fn has_valid_credentials_ignores_a_placeholder_token() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("settings.json"),
+            r#"{"env":{"CLAUDE_CODE_OAUTH_TOKEN":"REPLACE_ME"}}"#,
+        )
+        .expect("write settings");
+        assert!(!has_valid_credentials(&dir.path().to_string_lossy()));
     }
 
     #[test]

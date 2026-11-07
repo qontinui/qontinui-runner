@@ -346,6 +346,8 @@ expect_reject "coord:requires-tag="           'value after "=" cannot be empty'
 # that carries the fix, so a reworded preamble does not silently un-pin it.
 expect_reject "coord:priority"                "must be set on the PR itself"
 expect_reject "coord:priority=1"              "must be set on the PR itself"
+expect_reject "coord:destructive-attested"              "must be set on the PR itself"
+expect_reject "coord:destructive-attested=abcdef123456" "must be set on the PR itself"
 
 # `coord:red-main-fix` is rejected by coord with the GENERIC message -- coord
 # has no bespoke arm for it, so this mirror must not invent one. This case pins

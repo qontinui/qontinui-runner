@@ -201,6 +201,12 @@ pub const WRITE_DEADLINE: Duration = Duration::from_secs(10);
 /// fails and the INPUT connection is ended; the next write opens a fresh one,
 /// which supersedes it in the holder (whatever of the old connection's bytes
 /// were not yet queued is discarded, never delivered after the new one's).
+///
+/// A failed write is NOT "none of these bytes arrived": frames the holder had
+/// already queued, and bytes already in the socket that it reads before the
+/// next connection supersedes this one, still reach the child. So the
+/// failure means "an unknown PREFIX of these bytes was delivered" — a blind
+/// retry of the whole write can duplicate part of it (review follow-up).
 pub const INPUT_DEADLINE: Duration = Duration::from_secs(60);
 
 /// How long one input write waits for the pane's input connection to open
@@ -454,8 +460,15 @@ fn spawn_holder_pane_or_fallback_blocking(
     );
     let local = super::pane_io::LocalPty::open(terminal_id, cols, rows)
         .and_then(|opened| opened.spawn(cmd))
+        // The fallback's own error goes FIRST: it is the failure that decided
+        // the outcome, and coord's spawn-failure classifier reads an anchored
+        // prefix of a detail capped at 200 characters
+        // (`continuation_spawn_retry.rs`, `UNABLE_TO_SPAWN_PREFIX`). With the
+        // holder's reason in front, a transient missing-`claude` failure read as
+        // deterministic and its continuation was never re-driven (plan
+        // 2026-11-04-devops-a-claude-reinstall-through-the-pty-holder-reads-as-deterministic-so-the-continuation-is-never-re-driven).
         .map_err(|e| {
-            format!("PTY holder unavailable ({reason}); in-process fallback failed: {e}")
+            format!("{e} (in-process fallback, after PTY holder unavailable: {reason})")
         })?;
     Ok(Arc::new(WithNotice {
         notice: fallback_notice(&reason),
@@ -762,9 +775,11 @@ impl HolderLink for HolderConn {
                 h.shutdown();
             }
             return Err(format!(
-                "pty holder {}: input write failed ({e}); the next write reopens the input \
-                 connection",
-                self.key
+                "pty holder {}: input write failed ({e}); an unknown prefix of these {} bytes \
+                 may still reach the pane process, so do not resend them blindly; the next \
+                 write reopens the input connection",
+                self.key,
+                bytes.len()
             ));
         }
         Ok(())
@@ -1846,26 +1861,7 @@ impl PaneIo for DaemonPaneIo {
             return Ok(());
         }
         self.kill_requested.store(true, Ordering::Release);
-        // The holder kills its own child's tree and reports the real exit,
-        // which settles `wait`; nothing is fabricated here.
-        if let Err(asked) = self.link.kill(budget) {
-            // The holder did not answer a kill on a fresh connection of its
-            // own. Leaving it would orphan the child behind a closed tab, so
-            // end the holder itself — only once it is verified to be the
-            // holder this pane attached to — which hangs up the child's PTY
-            // (Unix) or closes the job holding its tree (Windows).
-            let how = self.link.terminate(self.holder_pid());
-            warn!(
-                pane = %self.pane_id,
-                holder_pid = self.holder_pid(),
-                error = %asked,
-                how = %how.detail,
-                "pty holder: kill not answered — terminating the holder out of band"
-            );
-            if !how.signalled {
-                return Err(format!("{asked}; holder not terminated: {}", how.detail));
-            }
-        }
+        kill_through(self.link.as_ref(), &self.pane_id, &self.holder_pid, budget)?;
         self.killed.store(true, Ordering::Release);
         Ok(())
     }
@@ -1971,30 +1967,117 @@ impl PaneIo for DaemonPaneIo {
     }
 }
 
+/// `kill` through `link`, bounded by `budget`: `Ok` once the child's end is
+/// in motion — the holder answered the kill, the verified holder was
+/// terminated out of band, or the holder is provably already gone (its death
+/// ended the child; the pump reports it).
+fn kill_through(
+    link: &dyn HolderLink,
+    pane_id: &PaneId,
+    holder_pid: &AtomicU32,
+    budget: Duration,
+) -> Result<(), String> {
+    // The holder kills its own child's tree and reports the real exit,
+    // which settles `wait`; nothing is fabricated here.
+    let Err(asked) = link.kill(budget) else {
+        return Ok(());
+    };
+    // The holder did not answer a kill on a fresh connection of its own.
+    // Leaving it would orphan the child behind a closed tab, so end the holder
+    // itself — only once it is verified to be the holder this pane attached to
+    // — which hangs up the child's PTY (Unix) or closes the job holding its
+    // tree (Windows).
+    // Read the pid only now: a holder upgraded while the kill was pending
+    // is the one to verify against (`DaemonPaneIo::holder_pid`).
+    let holder_pid = holder_pid.load(Ordering::Acquire);
+    let how = link.terminate(holder_pid);
+    warn!(
+        pane = %pane_id,
+        holder_pid,
+        error = %asked,
+        how = %how.detail,
+        "pty holder: kill not answered — terminating the holder out of band"
+    );
+    if how.signalled {
+        return Ok(());
+    }
+    if how.holder_gone {
+        // Review follow-up L4: the holder died between the unanswered kill
+        // and the termination. That death ended the child, so this is a kill
+        // that landed — never "may still be running".
+        info!(
+            pane = %pane_id,
+            holder_pid,
+            "pty holder: already gone when terminated — its exit ended the pane process"
+        );
+        return Ok(());
+    }
+    Err(format!("{asked}; holder not terminated: {}", how.detail))
+}
+
 /// Review round 2, N3: a pane dropped WITHOUT `release` — a `spawn_with_io`
 /// step that failed after the pane was built (`reader()?`, a thread spawn) —
 /// must not orphan its holder and child. It is killed (bounded; out of band
 /// if the holder does not answer), then every connection is closed.
+///
+/// Review follow-up L3: that kill and the wait for its exit report can take
+/// up to twice [`DROP_KILL_BUDGET`], and `drop` runs on whatever thread
+/// failed the spawn (a Tauri command). So they run on a thread of their own;
+/// only when that thread cannot be spawned do they run here.
+///
+/// The cost: `drop` returning no longer means the holder is gone. For up to
+/// twice [`DROP_KILL_BUDGET`] afterwards it may still hold its pane lock, and
+/// if this process exits inside that window the kill may never be sent —
+/// which leaves the holder exactly where Phase 3's boot sweep (the orphan
+/// ledger) finds it. A new pane takes a fresh terminal id (a v4 uuid,
+/// `TerminalManager`), so no respawn waits on that lock.
 impl Drop for DaemonPaneIo {
     fn drop(&mut self) {
-        if !self.released.load(Ordering::Acquire) && !self.out.is_finished() {
-            warn!(
-                pane = %self.pane_id,
-                holder_pid = self.holder_pid(),
-                "pty holder: pane dropped without release — killing its holder's child rather \
-                 than orphaning it"
-            );
-            if let Err(e) = PaneIo::kill(self, DROP_KILL_BUDGET) {
-                warn!(pane = %self.pane_id, error = %e, "pty holder: kill on drop failed");
-            } else {
-                // Let the exit report arrive so the holder, its exit
-                // delivered, leaves now instead of lingering.
-                let _ = self.out.wait_for(DROP_KILL_BUDGET);
-            }
+        if self.released.load(Ordering::Acquire) || self.out.is_finished() {
+            self.control.close();
+            self.link.close();
+            return;
         }
-        self.control.close();
-        self.link.close();
+        warn!(
+            pane = %self.pane_id,
+            holder_pid = self.holder_pid(),
+            "pty holder: pane dropped without release — killing its holder's child rather \
+             than orphaning it"
+        );
+        let (link, out, control) = (self.link.clone(), self.out.clone(), self.control.clone());
+        let (pane_id, holder_pid) = (self.pane_id.clone(), self.holder_pid.clone());
+        let spawned = std::thread::Builder::new()
+            .name(format!("pty-holder-drop-{}", self.pane_id))
+            .spawn(move || kill_on_drop(link.as_ref(), &out, &control, &pane_id, &holder_pid));
+        if spawned.is_err() {
+            kill_on_drop(
+                self.link.as_ref(),
+                &self.out,
+                &self.control,
+                &self.pane_id,
+                &self.holder_pid,
+            );
+        }
     }
+}
+
+/// The body of [`DaemonPaneIo`]'s `drop` for an unreleased live pane.
+fn kill_on_drop(
+    link: &dyn HolderLink,
+    out: &PaneOutput,
+    control: &ControlQueue,
+    pane_id: &PaneId,
+    holder_pid: &AtomicU32,
+) {
+    if let Err(e) = kill_through(link, pane_id, holder_pid, DROP_KILL_BUDGET) {
+        warn!(pane = %pane_id, error = %e, "pty holder: kill on drop failed");
+    } else {
+        // Let the exit report arrive so the holder, its exit delivered,
+        // leaves now instead of lingering.
+        let _ = out.wait_for(DROP_KILL_BUDGET);
+    }
+    control.close();
+    link.close();
 }
 
 /// In-band notice for a pane whose `kill` did not land.
@@ -2020,6 +2103,11 @@ mod tests {
         closes: std::sync::atomic::AtomicUsize,
         terminations: std::sync::atomic::AtomicUsize,
         fail_kill: AtomicBool,
+        /// `terminate` reports the holder already gone.
+        holder_gone: AtomicBool,
+        /// While set, `kill` does not answer (bounded at 5 s) — a holder slow
+        /// to answer. Cleared by the test to let it through.
+        kill_held: AtomicBool,
     }
 
     impl HolderLink for RecordingLink {
@@ -2032,6 +2120,10 @@ mod tests {
             Ok(())
         }
         fn kill(&self, _budget: Duration) -> Result<(), String> {
+            let end = Instant::now() + Duration::from_secs(5);
+            while self.kill_held.load(Ordering::SeqCst) && Instant::now() < end {
+                std::thread::sleep(Duration::from_millis(5));
+            }
             if self.fail_kill.load(Ordering::SeqCst) {
                 return Err("holder unreachable".into());
             }
@@ -2048,6 +2140,7 @@ mod tests {
             self.terminations.fetch_add(1, Ordering::SeqCst);
             Termination {
                 signalled: false,
+                holder_gone: self.holder_gone.load(Ordering::SeqCst),
                 detail: "not signalled: no holder in this test".into(),
             }
         }
@@ -2520,6 +2613,7 @@ mod tests {
             fn terminate(&self, _holder_pid: u32) -> Termination {
                 Termination {
                     signalled: false,
+                    holder_gone: false,
                     detail: "test".into(),
                 }
             }
@@ -2737,8 +2831,17 @@ mod tests {
     fn pty_holder_drop_without_release_kills() {
         let (link, pane) = recorded_pane();
         drop(pane);
+        // The kill runs on its own thread (follow-up L3).
+        link.saw(HolderControl::Kill);
+        let end = Instant::now() + Duration::from_secs(10);
+        while link.closes.load(Ordering::SeqCst) == 0 {
+            assert!(
+                Instant::now() < end,
+                "the dropped pane never closed its link"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
         assert_eq!(link.controls(), vec![HolderControl::Kill]);
-        assert!(link.closes.load(Ordering::SeqCst) >= 1);
 
         let (link, pane) = recorded_pane();
         pane.release(Duration::from_millis(10)).unwrap();
@@ -2747,6 +2850,60 @@ mod tests {
             !link.controls().contains(&HolderControl::Kill),
             "a released pane is not killed on drop: {:?}",
             link.controls()
+        );
+    }
+
+    /// Review follow-up L3: dropping an unreleased pane does not block the
+    /// dropping thread on the kill — a holder slow to answer is waited for on
+    /// another thread — and the kill still lands.
+    #[test]
+    fn pty_holder_drop_does_not_block_on_the_kill() {
+        // Ordering, not timing: `kill` cannot answer until the test lets it,
+        // so a `drop` that ran the kill on this thread would return only
+        // after the kill had answered (at its 5 s cap) and recorded `Kill`.
+        let (link, pane) = recorded_pane();
+        link.kill_held.store(true, Ordering::SeqCst);
+        drop(pane);
+        assert!(
+            !link.controls().contains(&HolderControl::Kill),
+            "drop returned only after the kill answered: it blocked on it"
+        );
+        link.kill_held.store(false, Ordering::SeqCst);
+        link.saw(HolderControl::Kill);
+    }
+
+    /// Review follow-up L4: the holder dies between an unanswered kill and the
+    /// out-of-band termination. Its death ended the child, so the kill counts
+    /// as landed: the release is not an error and the pane never claims the
+    /// process "may still be running".
+    #[test]
+    fn pty_holder_kill_of_an_already_gone_holder_is_not_a_failed_kill() {
+        let (link, pane) = recorded_pane();
+        link.fail_kill.store(true, Ordering::SeqCst);
+        link.holder_gone.store(true, Ordering::SeqCst);
+        let mut reader = pane.reader().unwrap();
+        pane.kill(Duration::from_millis(10))
+            .expect("a gone holder is a landed kill");
+        assert!(
+            pane.killed.load(Ordering::Acquire),
+            "the kill counts as landed"
+        );
+        assert_eq!(link.terminations.load(Ordering::SeqCst), 1);
+        // Released BEFORE the exit is reported, so release takes its
+        // killed-vs-kill-requested branch — the one that would print the
+        // "may still be running" notice for a kill that did not land.
+        pane.release(Duration::from_millis(10))
+            .expect("release after a landed kill");
+        // What the pump does when it finds the holder gone; first settle wins
+        // over the background settle-after-kill.
+        pane.out.settle(Err("holder gone".into()));
+        assert_eq!(pane.wait(), Err("holder gone".into()));
+        let mut shown = Vec::new();
+        reader.read_to_end(&mut shown).unwrap();
+        assert!(
+            !String::from_utf8_lossy(&shown).contains("may still be running"),
+            "{}",
+            String::from_utf8_lossy(&shown)
         );
     }
 
@@ -2825,6 +2982,37 @@ mod tests {
             String::from_utf8_lossy(&got)
         );
         assert!(String::from_utf8_lossy(&got).contains("FALLBACK_MARK"));
+    }
+
+    /// When the holder is unavailable AND the in-process fallback cannot spawn
+    /// the command, the detail leads with the fallback's own error, so the
+    /// 200-character head coord classifies on carries the `Unable to spawn`
+    /// clause rather than the holder's reason.
+    #[cfg(unix)]
+    #[test]
+    fn fallback_spawn_failure_leads_with_the_fallbacks_own_error() {
+        let mut cmd = portable_pty::CommandBuilder::new("/nonexistent/qontinui-test/claude");
+        cmd.cwd(std::env::temp_dir());
+        let err = match spawn_holder_pane_or_fallback_in(
+            Err("no holder in this test".into()),
+            Err("unused".into()),
+            "fallback-fail-term",
+            ScrubbedCommand::seal(cmd),
+            80,
+            24,
+        ) {
+            Ok(_) => panic!("a nonexistent command must not spawn"),
+            Err(e) => e,
+        };
+        let head: String = err.chars().take(200).collect();
+        assert!(
+            head.starts_with(
+                "Failed to spawn shell: Unable to spawn /nonexistent/qontinui-test/claude \
+                 because it doesn't exist on the filesystem or is not executable"
+            ),
+            "head: {head:?}"
+        );
+        assert!(err.contains("no holder in this test"), "full: {err:?}");
     }
 
     /// End to end against the real `qontinui-pty-holder`. Linux only: the

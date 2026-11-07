@@ -1773,6 +1773,10 @@ const REVIEWED_NOT_DOOR: &[(&str, &str)] = &[
     ("POST", "/checks/repair-associations"),
     ("GET", "/control/sessions/restore-census"),
     ("GET", "/control/sessions/restore-health"),
+    // Not a runner route: the in-process MOCK of coord's per-binding seed
+    // door in `device_jwt_refresher`'s `tenant_seed_arm_tests` (plan
+    // 2026-09-20 Phase 7), like `/devices/{device_id}/refresh-token` below.
+    ("POST", "/coord/devices/{device_id}/tenant-token"),
     ("GET", "/current-execution/steps"),
     ("POST", "/devices/{device_id}/refresh-token"),
     ("GET", "/evaluation/cache-stats"),
@@ -2117,4 +2121,50 @@ async fn foreign_origin_cannot_create_or_update_a_task_with_a_probe() {
         status("PUT", "/scheduler/tasks/t1", None, with_probe).await,
         StatusCode::OK
     );
+}
+
+/// The managed-task upsert (plan 2026-10-29-recurring-agents-declared-in-coord-
+/// reconciled-by-runner, Phase 4a review) is a CREDENTIAL_DOORS entry, so
+/// under the default `enforce-doors` policy the guard refuses every browser
+/// class before the handler runs; the stand-in below runs the handler's REAL
+/// `refuse_browser_caller` too, which refuses them under every policy (here
+/// `shadow` and `off`, where the guard admits them).
+#[tokio::test]
+async fn no_browser_origin_can_upsert_a_managed_task() {
+    use axum::routing::put;
+    const ROUTE: &str = "/scheduler/tasks/by-key/{source}/{tenant_id}/{agent}";
+    assert!(is_credential_door("PUT", ROUTE));
+
+    async fn gate(principal: Option<axum::Extension<RequesterPrincipal>>) -> StatusCode {
+        match crate::mcp::scheduler::refuse_browser_caller(principal.as_ref().map(|p| &p.0)) {
+            Ok(()) => StatusCode::OK,
+            Err(_) => StatusCode::FORBIDDEN,
+        }
+    }
+    let uri = "/scheduler/tasks/by-key/coord/0b0e9a40-6b1f-4c3e-9d55-5d1b8c4a2f10/cleanup-steward";
+    for policy in ["enforce-doors", "shadow", "off"] {
+        let h = harness(policy);
+        let router = apply(Router::new().route(ROUTE, put(gate)), h.guard.clone());
+        let host = host(&h);
+        for (origin, want) in [
+            (Some(EVIL), StatusCode::FORBIDDEN),
+            (Some(WEB), StatusCode::FORBIDDEN),
+            (None, StatusCode::OK),
+        ] {
+            let mut headers = vec![
+                ("host", host.as_str()),
+                ("content-type", "application/json"),
+            ];
+            if let Some(o) = origin {
+                headers.push(("origin", o));
+            }
+            let got = router
+                .clone()
+                .oneshot(req("PUT", uri, &headers, "{}"))
+                .await
+                .unwrap()
+                .status();
+            assert_eq!(got, want, "policy {policy}, origin {origin:?}");
+        }
+    }
 }

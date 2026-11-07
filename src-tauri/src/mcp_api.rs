@@ -2482,13 +2482,21 @@ async fn health(
         // of the drain's last tick (`observedAt`; `pending: null` = no tick
         // yet, UNKNOWN rather than empty), `lastAckAt` of anything coord
         // accepted, and `lastFailure {kind, status, at}` — `kind` one of
-        // server_error / rate_limited / unauthorized / rejected / conflict /
-        // network / timeout. `retryingSessions` are on their own backoff;
-        // `quarantinedSessions` had their rows moved to the
-        // `<outbox>.quarantine.jsonl` sidecar after failing while coord served
-        // everything else. `heartbeatsSuperseded` counts pending heartbeat
-        // rows dropped unsent because a newer heartbeat was queued right
-        // behind them. A stalled drain used to be invisible from here.
+        // server_error / rate_limited / unauthorized / rejected / not_found /
+        // conflict / http_error / network / timeout. `retryingSessions` are
+        // on their own backoff; `quarantinedSessions` had their rows moved to
+        // the `<outbox>.quarantine.jsonl` sidecar after failing while coord
+        // served everything else. Three counters (process lifetime, `null`
+        // before the first tick) split the heartbeat rows the drain dropped
+        // without coord taking them, by cause: `heartbeatsSuperseded` (a newer
+        // pending heartbeat of the session replaces them), `heartbeatsMuted`
+        // (the session is quarantined and its `started`/`closed` row went to
+        // the sidecar, so none of its heartbeats will be sent), and
+        // `heartbeatsDroppedOnFailure` (the push failed: no answer, a 5xx, a
+        // 4xx other than 409, or another non-2xx answer), with
+        // `heartbeatsDroppedOnFailureByKind` mapping each `lastFailure` kind
+        // to its count (only non-zero kinds; the values sum to the scalar).
+        // A stalled drain used to be invisible from here.
         "sessionOutbox": crate::session::coord_sync::session_outbox_health_json(),
         // Session-message push evidence (plan
         // 2026-09-07-session-message-delivery-is-blind-and-park-collection-
@@ -2714,6 +2722,14 @@ async fn health(
         // the switch refused in this process. The per-deployment answer to
         // "which flows are on" — read by the desktop Privacy section.
         "egress": crate::egress::health_json(),
+        // The permission auto-accept dial (plan 2026-10-23-runner-sessions-
+        // stop-at-permission-dialogs-so-accept-them-by-default-with-a-tenant-
+        // switch, D7): `answered` — has coord answered `permission_auto_accept`
+        // in this process; `level` — `on` | `off`, null when unanswered or
+        // unrecognised (UNKNOWN, never a level); `acceptCount` — how many
+        // PermissionRequest dialogs the pad has answered `allow` since boot.
+        // Field names are a contract read by qontinui-claude-config.
+        "permissionAutoAccept": crate::session::permission_accept::health_json(),
         // Per-local-user connection guard (plan 2026-10-04-runner-loopback-
         // api-refuses-other-local-users): installed/enabled/supported, the kill
         // switch's name, and admit/refusal counters. No uid or SID is served —
@@ -3118,6 +3134,14 @@ pub(crate) enum SelfIdOutcome {
     /// registers before it can proxy. Kept because that is a property of the
     /// spawn ordering, not a guarantee.
     NoSession,
+    /// Primary chain: SEVERAL runner-managed task runs claim the nonce's
+    /// workdir (`WorkdirTaskRun::Ambiguous`, which also covers an unreadable
+    /// session table). Refused with no header rather than handed to the
+    /// lifecycle fallback: the task runs own that workdir's calls, and the
+    /// lifecycle store holds interactive terminals, so a single admitted record
+    /// there would name a SIBLING terminal, not the caller. See
+    /// [`caller_chain_after_workdir_lookup`].
+    AmbiguousTaskRunWorkdir,
 }
 
 impl SelfIdOutcome {
@@ -3152,6 +3176,7 @@ impl SelfIdOutcome {
             Self::InjectedViaClientAssertionOverSingleCandidate => {
                 "injected_via_client_assertion_over_single_candidate"
             }
+            Self::AmbiguousTaskRunWorkdir => "ambiguous_task_run_workdir",
         }
     }
 
@@ -3197,12 +3222,13 @@ impl SelfIdOutcome {
             Self::InjectedViaClientAssertionUnrecordedTerminal => 20,
             Self::InjectedViaClientAssertionUnrecordedWorkdir => 21,
             Self::InjectedViaClientAssertionOverSingleCandidate => 22,
+            Self::AmbiguousTaskRunWorkdir => 23,
         }
     }
 
     /// Every outcome, in counter-slot order — `ALL[i].index() == i`, asserted
     /// in the tests so the two orderings cannot drift.
-    pub(crate) const ALL: [Self; 23] = [
+    pub(crate) const ALL: [Self; 24] = [
         Self::Injected,
         Self::InjectedViaTerminal,
         Self::InjectedViaLifecycle,
@@ -3226,13 +3252,14 @@ impl SelfIdOutcome {
         Self::InjectedViaClientAssertionUnrecordedTerminal,
         Self::InjectedViaClientAssertionUnrecordedWorkdir,
         Self::InjectedViaClientAssertionOverSingleCandidate,
+        Self::AmbiguousTaskRunWorkdir,
     ];
 }
 
 /// Per-outcome counters, indexed by [`SelfIdOutcome::index`] (which is the
 /// declaration order of [`SelfIdOutcome::ALL`]).
-fn self_id_counters() -> &'static [std::sync::atomic::AtomicU64; 23] {
-    static COUNTERS: std::sync::OnceLock<[std::sync::atomic::AtomicU64; 23]> =
+fn self_id_counters() -> &'static [std::sync::atomic::AtomicU64; 24] {
+    static COUNTERS: std::sync::OnceLock<[std::sync::atomic::AtomicU64; 24]> =
         std::sync::OnceLock::new();
     COUNTERS.get_or_init(Default::default)
 }
@@ -3615,9 +3642,14 @@ fn resolve_caller_session_id(
     let Some(workdir) = crate::coord_mcp::workdir_for_nonce(nonce) else {
         return (None, SelfIdOutcome::NoWorkdir);
     };
-    let task_run_id = app
+    let found = app
         .try_state::<Arc<crate::claude_session::SessionManager>>()
-        .and_then(|sm| sm.task_run_id_for_workdir(&workdir));
+        .map(|sm| sm.task_run_id_for_workdir(&workdir));
+    let task_run_id = match caller_chain_after_workdir_lookup(found) {
+        CallerWorkdirNext::TaskRun(id) => Some(id),
+        CallerWorkdirNext::TryLifecycle => None,
+        CallerWorkdirNext::Refuse(outcome) => return (None, outcome),
+    };
     match task_run_id {
         // Primary chain hit.
         Some(task_run_id) => {
@@ -3645,6 +3677,35 @@ fn resolve_caller_session_id(
         // store instead: workdir → the single admitted open record → its own
         // anchor. Every miss arrives already typed as the gate that rejected.
         None => resolve_caller_via_lifecycle(app, &workdir, client_asserted),
+    }
+}
+
+/// What the caller-identity chain does after the primary chain's workdir
+/// lookup — the pure decision, so the refusal is unit-testable without a Tauri
+/// app (the twin of the event lane's `event_lane_after_workdir_lookup`).
+///
+/// - `Found` -> the primary chain (registrar filter, then the anchor).
+/// - `NoCandidate`, or no `SessionManager` installed -> the lifecycle fallback.
+/// - `Ambiguous` -> REFUSED as [`SelfIdOutcome::AmbiguousTaskRunWorkdir`]. The
+///   task runs own that workdir's calls; the lifecycle fallback could name a
+///   sibling interactive terminal. No header beats a wrong one.
+#[derive(Debug, PartialEq, Eq)]
+enum CallerWorkdirNext {
+    TaskRun(String),
+    TryLifecycle,
+    Refuse(SelfIdOutcome),
+}
+
+fn caller_chain_after_workdir_lookup(
+    found: Option<crate::claude_session::WorkdirTaskRun>,
+) -> CallerWorkdirNext {
+    use crate::claude_session::WorkdirTaskRun;
+    match found {
+        Some(WorkdirTaskRun::Found(id)) => CallerWorkdirNext::TaskRun(id),
+        Some(WorkdirTaskRun::NoCandidate) | None => CallerWorkdirNext::TryLifecycle,
+        Some(WorkdirTaskRun::Ambiguous) => {
+            CallerWorkdirNext::Refuse(SelfIdOutcome::AmbiguousTaskRunWorkdir)
+        }
     }
 }
 
@@ -4513,11 +4574,19 @@ fn resolve_event_lane_session_id(
     }
     // Leg 2 — the runner-managed AI plane, keyed on the nonce's workdir.
     let workdir = crate::coord_mcp::workdir_for_nonce(nonce).ok_or(EventLaneMiss::NoWorkdir)?;
-    let task_run_id = app
+    let task_run_id = match app
         .and_then(|a| a.try_state::<Arc<crate::claude_session::SessionManager>>())
         .ok_or(EventLaneMiss::AiPlaneStateMissing)?
         .task_run_id_for_workdir(&workdir)
-        .ok_or(EventLaneMiss::NoTaskRun)?;
+    {
+        crate::claude_session::WorkdirTaskRun::Found(id) => id,
+        crate::claude_session::WorkdirTaskRun::NoCandidate => return Err(EventLaneMiss::NoTaskRun),
+        // Several sessions claim this workdir: a task run owns its calls, so
+        // refuse rather than file one under any lane.
+        crate::claude_session::WorkdirTaskRun::Ambiguous => {
+            return Err(EventLaneMiss::AiAmbiguousWorkdir)
+        }
+    };
     app.and_then(|a| a.try_state::<Arc<crate::claude_session::coord_register::AiCoordRegistrar>>())
         .ok_or(EventLaneMiss::AiPlaneStateMissing)?
         .session_id_for(&task_run_id)
@@ -4555,6 +4624,10 @@ enum EventLaneMiss {
     /// The task run exists but never registered with coord, so it holds no
     /// `coord.sessions.id`.
     AiSessionUnregistered,
+    /// Terminal-less binding whose workdir is claimed by SEVERAL runner-managed
+    /// sessions (or whose session table could not be read). REFUSED: the task
+    /// run owns that workdir's calls, so no lane is guessed.
+    AiAmbiguousWorkdir,
 }
 
 impl EventLaneMiss {
@@ -4569,6 +4642,7 @@ impl EventLaneMiss {
             Self::AiPlaneStateMissing => "ai_plane_state_missing",
             Self::NoTaskRun => "no_task_run",
             Self::AiSessionUnregistered => "ai_session_unregistered",
+            Self::AiAmbiguousWorkdir => "ai_ambiguous_workdir",
         }
     }
 
@@ -4583,7 +4657,8 @@ impl EventLaneMiss {
             Self::NoWorkdir
             | Self::AiPlaneStateMissing
             | Self::NoTaskRun
-            | Self::AiSessionUnregistered => "ai_plane",
+            | Self::AiSessionUnregistered
+            | Self::AiAmbiguousWorkdir => "ai_plane",
         }
     }
 
@@ -4600,12 +4675,13 @@ impl EventLaneMiss {
             Self::AiPlaneStateMissing => 5,
             Self::NoTaskRun => 6,
             Self::AiSessionUnregistered => 7,
+            Self::AiAmbiguousWorkdir => 8,
         }
     }
 
     /// Every miss, in counter-slot order — `ALL[i].index() == i`, asserted in
     /// the tests so the two orderings cannot drift.
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 9] = [
         Self::NoNonce,
         Self::NoTerminalManager,
         Self::TerminalGone,
@@ -4614,6 +4690,7 @@ impl EventLaneMiss {
         Self::AiPlaneStateMissing,
         Self::NoTaskRun,
         Self::AiSessionUnregistered,
+        Self::AiAmbiguousWorkdir,
     ];
 }
 
@@ -5173,10 +5250,30 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 /// `coord_push_to_branch`, `coord_push_credential` — sessions open PRs via the
 /// dedicated `/vcs/pull-requests` loopback route, not this proxy), reservations
 /// (`coord_migration_reserve`, `coord_reserve_resource`), policy/state
-/// mutation (`coord_request_policy`, `coord_flag_state`, `coord_flag_states`),
-/// and per-agent levers coord would also hand to every un-curated agent
-/// (`coord_fleet_drain`, `coord_fleet_undrain`, `coord_fleet_drain_host`,
-/// `coord_fleet_undrain_host`).
+/// mutation (`coord_request_policy`, `coord_flag_state`, `coord_flag_states`).
+///
+/// The fleet-drain writes (`coord_fleet_drain`, `coord_fleet_undrain`,
+/// `coord_fleet_drain_host`, `coord_fleet_undrain_host`) are IN, beside their
+/// read `coord_fleet_drain_status`. They used to be withheld as "per-agent
+/// levers coord would also hand to every un-curated agent"; served
+/// `decision_record/fleet-drain-default-for-agents` (accepted 2026-11-04,
+/// operator: "agents should have all drain tools"; evidence finding
+/// `f802311d-aef5-40e8-a5f8-4bd3a554b37e`) makes handing them to every agent
+/// the intent, so that rationale no longer holds. coord's half of the decision
+/// puts all five on `DEVICE_DEFAULT_TOOLS`; it is NOT on coord `origin/main` as
+/// of this change (`DEVICE_FLOOR_PRIVILEGED_EXCLUSIONS` still fences the four
+/// writes off the device floor). coord stays the gate on who may call them; what bounds
+/// a call is coord's, unchanged from `decision_record/fleet-drain-agent-authority`:
+/// the ownership floor (the device is in the caller's tenant), the redacted
+/// `drained_by`, an unreadable drain set never reading `Clear`, and the mandatory
+/// `until`, so every drain is reversible and self-expiring. Prefer a lane-scoped
+/// drain (`lanes: ["agent"]`) when only spawns need holding, so CI keeps running.
+/// Forwarding ahead of coord's floor change: until it lands, coord itself
+/// refuses a device principal and an agent curated by a role template, while a
+/// row-less (un-curated) agent, whose catalog is coord's whole surface, gains
+/// the levers at once. That is the outcome the decision intends, not a leak.
+/// Until then a device's `tools/list` will not advertise the four writes, so
+/// they show in `coordMcpForwardedUnadvertised`; that is expected, not drift.
 ///
 /// LOAD-BEARING, do not strip as "reads nobody uses": `coord_list_prompt_documents`
 /// and `coord_get_prompt_document` are how the fleet reads served POLICY, and the
@@ -5573,8 +5670,11 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 ///   guard still refuses to remove a tree with uncommitted work, so nothing is
 ///   deleted by this call itself.
 ///
-/// The other eight are in [`COORD_MCP_DELIBERATE_EXCLUSIONS`], each with its
-/// reason in that list's note.
+/// Four more (`coord_fleet_drain`, `coord_fleet_undrain`, `coord_fleet_drain_host`,
+/// `coord_fleet_undrain_host`) were first classified as deliberate exclusions and
+/// were moved IN by `decision_record/fleet-drain-default-for-agents` (see the
+/// fleet-drain paragraph above). The other four are in
+/// [`COORD_MCP_DELIBERATE_EXCLUSIONS`], each with its reason in that list's note.
 ///
 /// **The per-repo tenant binding writes are IN, with their risk stated** (plan
 /// `2026-10-17-per-repo-tenant-binding-overrides-the-org-tenant` Phase 6; the
@@ -5598,8 +5698,9 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 /// binding writes are let through because they carry a both-tenants admin
 /// check and a server-written audit and notification that no other
 /// onboarding-family write has — that is the security rationale the note
-/// above asks for. As of this entry coord does not serve the three binding
-/// tools yet; they are forwarded ahead, which the note below says is harmless.
+/// above asks for. They were forwarded ahead of coord serving them
+/// (qontinui-runner#2381); coord now serves all three, since qontinui-coord#3522
+/// (`bc72b8534`, the bind door), so the authorization described here is live.
 ///
 /// `coord_merge_order` stays IN although coord keeps it off the device floor.
 /// It is a READ: it composes a safe merge ordering from the queue, the PR
@@ -5616,6 +5717,22 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 ///
 /// Forwarding a name coord does not yet serve is harmless — coord answers it as
 /// an unknown tool — so these entries may land ahead of the coord side.
+///
+/// `coord_fleet_dispatch_roles` (qontinui-coord#3015, plan
+/// `2026-10-02-fleet-machine-roles-workhorse-bench-ci-node` Phase 3) is the
+/// read-only twin of `GET /coord/fleet/dispatch-roles`: every machine of the
+/// caller's tenant with its dispatch role, per-lane state with the role and
+/// drain layers shown separately, and the role suggestion. That PR landed on
+/// coord `main` (`a5962a19b..602279acd`) granting it on coord's
+/// `READ_ONLY_TOOLS`, `MERGER_TOOLS` and `DEVICE_DEFAULT_TOOLS`; later commits
+/// added `OVERLORD_TOOLS` (`1edd47702`) and `BOOTSTRAP_READ_TOOLS`
+/// (`6b604d803`). As of coord `origin/main` `b8ac37b6b` (read 2026-10-18) it is
+/// on all five (`crates/coord/src/mcp/agent_tool_access.rs`), each beside
+/// `coord_fleet_drain_status`, for the same reason: a session that cannot see
+/// a machine's role reads a bench or CI node as an idle workhorse. Its WRITE
+/// (`PUT /coord/fleet/dispatch-role`) is operator-only there and has no MCP
+/// tool, so there is nothing to exclude. Re-verify against coord
+/// `origin/main` when editing this paragraph.
 ///
 /// **Landed is not delivered** (plan `2026-09-03-coord-mcp-403-names-its-own-cause`
 /// Phase 3). This list is compiled into the binary, so a PR that edits it is
@@ -5643,8 +5760,8 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_ask_question",
     "coord_attest_gate",
     // Plan 2026-10-17-per-repo-tenant-binding-overrides-the-org-tenant Phase 6:
-    // the per-repo tenant binding door, forwarded ahead of coord serving it.
-    // coord will authorize it (the device user must be admin in BOTH tenants);
+    // the per-repo tenant binding door (served by coord since qontinui-coord#3522).
+    // coord authorizes it (the device user must be admin in BOTH tenants);
     // this list only forwards. Risk and limits: the doc comment above.
     "coord_bind_repo_tenant",
     "coord_bind_self_session",
@@ -5697,7 +5814,14 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_explain_worktree",
     "coord_find_references",
     "coord_fixer_arm_readiness",
+    "coord_fleet_dispatch_roles",
+    // decision_record/fleet-drain-default-for-agents (2026-11-04): every agent
+    // holds all five drain tools; coord, not this list, is the gate.
+    "coord_fleet_drain",
+    "coord_fleet_drain_host",
     "coord_fleet_drain_status",
+    "coord_fleet_undrain",
+    "coord_fleet_undrain_host",
     "coord_force_clear_gate",
     "coord_gate_doctor",
     "coord_gate_inspect",
@@ -5710,6 +5834,13 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_is_merge_safe",
     "coord_land_provenance_backfill",
     "coord_layering_triage",
+    // Plan 2026-10-03-dossier-query-door-filters-sort-cursor Phase 4: the
+    // dossier query door (twin `GET /coord/agent-dossiers`), read-only. coord's
+    // `agent_tool_access::DEVICE_DEFAULT_TOOLS` grants it; without this entry a
+    // runner-proxied session is refused it as METHOD_NOT_ALLOWED and the
+    // `/pvi`, `/unattended` and `/findings-steward` dossier reads cannot reach
+    // it. This list only forwards.
+    "coord_list_dossiers",
     "coord_list_prompt_documents",
     "coord_list_worktrees",
     // Plan 2026-09-17-findings-carry-a-triage-stamp-and-the-steward-reads-since-last-run
@@ -5896,24 +6027,13 @@ fn coord_mcp_tool_is_allowed(name: &str) -> bool {
 ///
 /// MUST stay sorted — membership is a `binary_search`.
 ///
-/// Eight of them were added on the classification of finding `31a69d12` (record:
+/// Four of them were added on the classification of finding `31a69d12` (record:
 /// coord finding `4ba64e8b`, correcting `73b15a9b`). None of them was forwarded
-/// before, so listing it here takes nothing away. Four join an existing family
-/// in the note above, and the fleet-drain writes start a new one (per-agent
-/// grants):
+/// before, so listing it here takes nothing away. They join existing families
+/// in the note above. (That classification also listed the four fleet-drain
+/// writes here; `decision_record/fleet-drain-default-for-agents`, accepted
+/// 2026-11-04, moved them to [`COORD_MCP_ALLOWED_TOOLS`] — see its note.)
 ///
-/// * `coord_fleet_drain`, `coord_fleet_undrain`, `coord_fleet_drain_host`,
-///   `coord_fleet_undrain_host`: coord keeps these off its device floor and
-///   grants them per AGENT (`decision_record/fleet-drain-agent-authority`), so
-///   a dev-ops agent holds them and an ordinary implementation agent does not.
-///   Agents DO reach this door: a nonce bound to an agent (`ProxyPrincipal::Agent`)
-///   forwards with that agent's own JWT. But coord gives an agent token with NO
-///   `coord.agent_tool_access` rows its whole UN-CURATED catalog (`allow ==
-///   None`), which includes these four. Forwarding them would therefore hand a
-///   fleet-wide capacity lever to every spawned agent that has no rows, which is
-///   exactly the agent the decision withholds them from. They stay withheld
-///   here until coord curates row-less agents; then move them to the allowlist
-///   and let coord's per-agent grant decide.
 /// * `coord_push_credential`: code publication. It mints a `contents:write`
 ///   token for ANY repository under a tenant-bound owner, including existing
 ///   ones, which is a raw push that bypasses the PR path. That is a stronger
@@ -5937,7 +6057,7 @@ fn coord_mcp_tool_is_allowed(name: &str) -> bool {
 ///
 /// Two more are recorded here because coord grants them on the device floor and
 /// this list masks them on purpose. They were found while classifying the
-/// eleven above:
+/// eleven names of finding `31a69d12`:
 ///
 /// * `coord_create_pr`: coord grants it on the device floor (operator decision
 ///   2026-08-04), and this door MASKS it anyway. That is a recorded deselection,
@@ -5964,10 +6084,6 @@ const COORD_MCP_DELIBERATE_EXCLUSIONS: &[&str] = &[
     "coord_enroll_repo",
     "coord_flag_state",
     "coord_flag_states",
-    "coord_fleet_drain",
-    "coord_fleet_drain_host",
-    "coord_fleet_undrain",
-    "coord_fleet_undrain_host",
     "coord_migration_reserve",
     "coord_pr_merge_profile",
     "coord_pr_merge_verdict",
@@ -14640,6 +14756,7 @@ mod transport_rung_counter_tests {
     #[test]
     fn lane_miss_ai_session_unregistered_moves_only_its_series() {
         assert_only_this_series_moves(EventLaneMiss::AiSessionUnregistered);
+        assert_only_this_series_moves(EventLaneMiss::AiAmbiguousWorkdir);
     }
 
     /// `ALL[i].index() == i`, and every label is distinct — the two orderings
@@ -15161,6 +15278,39 @@ mod self_id_chain_tests {
         TerminalSessionRecord, ORIGIN_AUTHORITATIVE, ORIGIN_OBSERVED, ORIGIN_RECONCILED,
     };
 
+    /// The caller chain's twin of the event lane's leg-3 guard: only a workdir
+    /// NO task run claims (or a host with no `SessionManager`) may reach the
+    /// lifecycle fallback. An ambiguous one is refused with its own outcome —
+    /// if `Ambiguous` ever falls through to `resolve_caller_via_lifecycle`,
+    /// this fails.
+    #[test]
+    fn an_ambiguous_task_run_workdir_never_reaches_the_lifecycle_fallback() {
+        use super::{caller_chain_after_workdir_lookup, CallerWorkdirNext};
+        use crate::claude_session::WorkdirTaskRun;
+        assert_eq!(
+            caller_chain_after_workdir_lookup(Some(WorkdirTaskRun::Ambiguous)),
+            CallerWorkdirNext::Refuse(SelfIdOutcome::AmbiguousTaskRunWorkdir)
+        );
+        assert_eq!(
+            caller_chain_after_workdir_lookup(Some(WorkdirTaskRun::NoCandidate)),
+            CallerWorkdirNext::TryLifecycle
+        );
+        assert_eq!(
+            caller_chain_after_workdir_lookup(None),
+            CallerWorkdirNext::TryLifecycle
+        );
+        assert_eq!(
+            caller_chain_after_workdir_lookup(Some(WorkdirTaskRun::Found("t".to_string()))),
+            CallerWorkdirNext::TaskRun("t".to_string())
+        );
+        // Its own /health series, distinct from the transient `no_session`.
+        assert_ne!(
+            SelfIdOutcome::AmbiguousTaskRunWorkdir.label(),
+            SelfIdOutcome::NoSession.label()
+        );
+        assert!(!TERMINAL_LEG_OUTCOMES.contains(&SelfIdOutcome::AmbiguousTaskRunWorkdir));
+    }
+
     #[test]
     fn every_outcome_has_a_distinct_label() {
         let labels: Vec<&str> = SelfIdOutcome::ALL.iter().map(|o| o.label()).collect();
@@ -15178,8 +15328,9 @@ mod self_id_chain_tests {
         // client-pick arm, two per leg (`injected_via_client_pick_*`,
         // `client_pick_not_candidate_*`); +2 for the uncontradicted-assertion
         // arm, one per leg (`injected_via_client_assertion_unrecorded_*`); +1
-        // for the single-candidate override split out of the workdir one.
-        assert_eq!(SelfIdOutcome::ALL.len(), 23);
+        // for the single-candidate override split out of the workdir one; +1
+        // for the primary chain's ambiguous task-run workdir.
+        assert_eq!(SelfIdOutcome::ALL.len(), 24);
     }
 
     /// FIX 5: the counter slot is a compiler-checked `match`, not a search of
@@ -15860,6 +16011,7 @@ mod self_id_chain_tests {
             EventLaneMiss::AiPlaneStateMissing,
             EventLaneMiss::NoTaskRun,
             EventLaneMiss::AiSessionUnregistered,
+            EventLaneMiss::AiAmbiguousWorkdir,
         ];
         let mut labels: Vec<&str> = all.iter().map(|m| m.as_str()).collect();
         labels.sort_unstable();
@@ -17734,7 +17886,8 @@ mod coord_mcp_body_gate_tests {
 
     /// Plan `2026-10-17-per-repo-tenant-binding-overrides-the-org-tenant`
     /// Phase 6: the per-repo tenant binding tools and the repo-tenants read
-    /// twin forward (the binding tools ahead of coord serving them). Their
+    /// twin forward (coord serves all four; the binding tools since
+    /// qontinui-coord#3522). Their
     /// names deliberately stay OUT of the `coord_onboard` family, whose prefix
     /// exclusion would mask them from the device-provisioned sessions coord's
     /// bind door is designed to admit — so this pins both that
@@ -18499,14 +18652,20 @@ mod coord_mcp_body_gate_tests {
 
     /// Finding `31a69d12`: the eleven names coord advertised that this door had
     /// left unclassified. A literal enumeration of the decision recorded in
-    /// coord finding `4ba64e8b`. Moving any name between the two lists reds
-    /// this test by name, so the decision cannot change by drift.
+    /// coord finding `4ba64e8b`, as amended by
+    /// `decision_record/fleet-drain-default-for-agents` (the four drain writes
+    /// moved to forwarded). Moving any name between the two lists reds this
+    /// test by name, so the decision cannot change by drift.
     #[test]
     fn finding_31a69d12_drift_is_classified() {
         for tool in [
             "coord_check_repo_name",
             "coord_create_repo",
             "coord_pin_worktree",
+            "coord_fleet_drain",
+            "coord_fleet_undrain",
+            "coord_fleet_drain_host",
+            "coord_fleet_undrain_host",
         ] {
             assert!(coord_mcp_tool_is_allowed(tool), "{tool} must be forwarded");
             assert!(
@@ -18515,10 +18674,6 @@ mod coord_mcp_body_gate_tests {
             );
         }
         for tool in [
-            "coord_fleet_drain",
-            "coord_fleet_undrain",
-            "coord_fleet_drain_host",
-            "coord_fleet_undrain_host",
             "coord_push_credential",
             "coord_enroll_repo",
             "coord_attest_advisory_ci_override",
@@ -18533,6 +18688,29 @@ mod coord_mcp_body_gate_tests {
                 "{tool} must be recorded as a deliberate exclusion, not drift"
             );
         }
+    }
+
+    /// The dossier query door coord grants on its device floor (plan
+    /// 2026-10-03-dossier-query-door-filters-sort-cursor Phase 4) must be
+    /// forwarded: the `/pvi`, `/unattended` and `/findings-steward` dossier
+    /// reads call it through this proxy, and withholding it answered them
+    /// METHOD_NOT_ALLOWED (measured 2026-11-03 on runner `8dae5bb424c1`).
+    #[test]
+    fn dossier_query_door_is_forwarded() {
+        let tool = "coord_list_dossiers";
+        assert!(coord_mcp_tool_is_allowed(tool), "{tool} must be forwarded");
+        assert!(
+            !coord_mcp_withholding_is_deliberate(tool),
+            "{tool} must not be both allowed and listed as a deliberate exclusion"
+        );
+        assert!(
+            gate(serde_json::json!({
+                "jsonrpc":"2.0","id":1,"method":"tools/call",
+                "params":{"name":tool,"arguments":{}}
+            }))
+            .is_ok(),
+            "{tool} must be callable through the proxy"
+        );
     }
 
     /// The agent escalate-evidence door and the ten device-floor names found
@@ -18580,6 +18758,75 @@ mod coord_mcp_body_gate_tests {
         assert!(coord_mcp_withholding_is_deliberate(
             "coord_attest_escalate_override"
         ));
+    }
+
+    /// The dispatch-role read (qontinui-coord#3015) is forwarded like its
+    /// sibling drain read. Pinned by name so dropping it reds this test.
+    #[test]
+    fn fleet_dispatch_roles_read_is_forwarded() {
+        let tool = "coord_fleet_dispatch_roles";
+        let parsed = crate::build_drift::parse_tool_policy_consts(include_str!("mcp_api.rs"))
+            .expect("mcp_api.rs parses");
+        assert_eq!(
+            parsed.allowed.iter().filter(|t| t.as_str() == tool).count(),
+            1,
+            "the parser must read {tool} exactly once: {:?}",
+            parsed.allowed
+        );
+        assert_eq!(parsed.allowed.len(), COORD_MCP_ALLOWED_TOOLS.len());
+        assert!(
+            coord_mcp_tool_is_allowed(tool),
+            "{tool} is on coord's device floor beside coord_fleet_drain_status and must \
+             not be withheld here"
+        );
+        assert!(
+            !coord_mcp_withholding_is_deliberate(tool),
+            "{tool} must not be both allowed and listed as a deliberate exclusion"
+        );
+        assert!(
+            gate(serde_json::json!({
+                "jsonrpc":"2.0","id":1,"method":"tools/call",
+                "params":{"name":tool,"arguments":{}}
+            }))
+            .is_ok(),
+            "{tool} must be callable through the proxy"
+        );
+    }
+
+    /// `decision_record/fleet-drain-default-for-agents` (accepted 2026-11-04;
+    /// finding `f802311d-aef5-40e8-a5f8-4bd3a554b37e`): all five fleet-drain
+    /// tools are forwarded, none reads as a deliberate withholding, and a
+    /// refusal for one can never carry `cause: deliberate` again. Pinned by
+    /// name so re-adding any to the exclusions reds this test.
+    #[test]
+    fn fleet_drain_tools_are_forwarded_by_default() {
+        let parsed = crate::build_drift::parse_tool_policy_consts(include_str!("mcp_api.rs"))
+            .expect("mcp_api.rs parses");
+        for tool in [
+            "coord_fleet_drain",
+            "coord_fleet_undrain",
+            "coord_fleet_drain_host",
+            "coord_fleet_undrain_host",
+            "coord_fleet_drain_status",
+        ] {
+            assert!(coord_mcp_tool_is_allowed(tool), "{tool} must be forwarded");
+            assert!(
+                !coord_mcp_withholding_is_deliberate(tool),
+                "{tool} must not be both allowed and listed as a deliberate exclusion"
+            );
+            assert!(
+                parsed.allows(tool) && !parsed.deliberately_excludes(tool),
+                "the trunk-policy parser must read {tool} as allowed, not deliberate"
+            );
+            assert!(
+                gate(serde_json::json!({
+                    "jsonrpc":"2.0","id":1,"method":"tools/call",
+                    "params":{"name":tool,"arguments":{}}
+                }))
+                .is_ok(),
+                "{tool} must be callable through the proxy"
+            );
+        }
     }
 
     /// Non-allowlisted tools are refused with the request's id echoed —

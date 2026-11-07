@@ -126,6 +126,19 @@ fn clear_held_slot(agent_id: &str) -> Option<HeldSlot> {
     guard.as_mut().and_then(|m| m.remove(agent_id))
 }
 
+/// Last observed `(running, tab_alive, idle, cadence_elapsed)` per agent, for
+/// edge-triggered tick-state logging (see [`log_tick_state`]).
+#[allow(clippy::type_complexity)]
+static LAST_TICK_STATE: Mutex<Option<HashMap<String, (bool, bool, bool, bool)>>> = Mutex::new(None);
+
+/// When each agent last got the "cadence elapsed but the tab never looks idle"
+/// warning, so a stuck gate is reported every [`STUCK_IDLE_WARN_EVERY_MS`], not
+/// every 5s tick.
+static LAST_STUCK_IDLE_WARN: Mutex<Option<HashMap<String, i64>>> = Mutex::new(None);
+
+/// Re-warn interval for a tab that is overdue for a nudge but not idle.
+const STUCK_IDLE_WARN_EVERY_MS: i64 = 10 * 60 * 1000;
+
 /// Last-logged effective posture per agent, so the posture line is
 /// edge-triggered rather than emitted every 5s tick (the same
 /// log-only-on-transition discipline `fleet_policy_poller` uses).
@@ -163,8 +176,9 @@ fn default_journal_path(agent_id: &str) -> String {
 }
 
 /// Open (or fall back for) the registry, seed the built-in Merge Shepherd
-/// (DISABLED — the operator flips it on explicitly), manage the registry in
-/// Tauri state for the control-surface commands, and start the supervised
+/// (ENABLED by default — the operator turns it off with
+/// `looping_agent_set_enabled`; an existing row is never reseeded), manage the
+/// registry in Tauri state for the control-surface commands, and start the supervised
 /// tick loop. Call once from `main.rs` setup.
 pub(crate) fn start(app: &tauri::AppHandle) {
     let path = registry_path();
@@ -272,7 +286,11 @@ fn role_for_agent(playbook_ref: &str) -> Option<&'static str> {
 /// through the durable lifecycle record (whose terminal id a boot-restore
 /// rewrites). Returns the pure [`Liveness`], the live session handle (only for
 /// a tab whose process is RUNNING), and the id of a registered tab whose
-/// process has EXITED — the stale pane the death-respawn arm closes.
+/// process has EXITED — the stale pane to close. On [`Liveness::Exited`] that
+/// is the pane the death-respawn arm closes before respawning; on a
+/// [`Liveness::Live`] re-attach through the lifecycle record it is the
+/// abandoned direct pane, closed by the re-attach bookkeeping
+/// ([`stale_tab_to_close`]).
 ///
 /// "Registered" alone used to mean live, so a tab whose `claude` had exited
 /// read [`Liveness::Live`] and the supervisor nudged into its dead PTY every
@@ -341,12 +359,28 @@ fn resolve_live_session(
     }
 
     let liveness = policy::resolve_liveness(direct, lifecycle_open, lifecycle_tab);
-    if liveness != Liveness::Exited {
-        // Only an `Exited` verdict hands a stale tab to the respawn arm; on
-        // `Live` via a re-attached tab the stale direct id is simply dropped.
-        exited = None;
-    }
+    let live_id = live.as_ref().map(|(tid, _)| tid.as_str());
+    let exited = stale_tab_to_close(liveness, exited.as_deref(), live_id);
     (liveness, live, exited)
+}
+
+/// Which registered-but-exited tab, if any, the supervisor should close this
+/// tick. `Exited` hands its stale pane to the death-respawn arm. `Live` via a
+/// lifecycle re-attach hands over the abandoned DIRECT pane, which would
+/// otherwise stay registered as a frozen frame over a dead PTY for the life of
+/// the runner. Never the live tab itself, and nothing on `PendingRestore` or
+/// `Dead`.
+fn stale_tab_to_close(
+    liveness: Liveness,
+    exited: Option<&str>,
+    live_id: Option<&str>,
+) -> Option<String> {
+    match liveness {
+        Liveness::Exited | Liveness::Live => exited
+            .filter(|stale| Some(*stale) != live_id)
+            .map(str::to_string),
+        Liveness::PendingRestore | Liveness::Dead => None,
+    }
 }
 
 /// The supervisor's NUDGE-SAFE idle read over one settled grid: the shared
@@ -439,11 +473,13 @@ fn spawn_streak_clears(liveness: Liveness, spawn_grace_elapsed: bool) -> bool {
 /// failed coord read (Withhold, promoted to a block on the interactive PTY),
 /// and backing it off would keep the agent down for up to 15 minutes after
 /// coord recovers — the same reason the resource-guard refusal takes none.
-fn trust_refusal_backs_off(dial: &crate::claude_session::trust_gate::DialResolution) -> bool {
-    !matches!(
-        dial,
-        crate::claude_session::trust_gate::DialResolution::Unresolved { .. }
-    )
+///
+/// Decided from the refusal TEXT, which names the dial the gate actually
+/// decided on ([`crate::claude_session::trust_gate::annotate_unread_dial`]),
+/// never from a second peek: the dial cache can refresh or expire between the
+/// gate's decision and this read.
+fn trust_refusal_backs_off(refusal: &str) -> bool {
+    !crate::claude_session::trust_gate::refusal_rests_on_unread_dial(refusal)
 }
 
 /// Supervise a single agent for one tick: observe, decide (pure), act.
@@ -544,6 +580,28 @@ async fn supervise_one(
             );
             registry.update_runtime(&rec.def.id, |rt| rt.terminal_id = Some(tid));
         }
+        // The direct id this record held pointed at a tab whose process
+        // exited; the agent lives on in the re-attached tab. Close the frozen
+        // pane so it does not sit in the tab bar over a dead PTY.
+        if let (Some(stale), Some(tm)) = (
+            exited_tab.as_deref(),
+            app.try_state::<Arc<crate::terminal::TerminalManager>>(),
+        ) {
+            info!(
+                agent = %rec.def.id,
+                terminal = %stale,
+                live = %tid,
+                "looping_agent_supervisor: closing the exited tab the re-attach abandoned"
+            );
+            if let Err(e) = tm.inner().close(stale) {
+                warn!(
+                    agent = %rec.def.id,
+                    terminal = %stale,
+                    error = %e,
+                    "looping_agent_supervisor: closing the abandoned exited tab failed"
+                );
+            }
+        }
     }
 
     // Observe idle/context-low on the live grid, through the ONE quiescence
@@ -635,6 +693,19 @@ async fn supervise_one(
         cycles_since_relaunch: rec.runtime.cycles_since_relaunch,
         relaunch_every_cycles: rec.def.lifecycle_policy.relaunch_every_cycles,
     };
+
+    log_tick_state(
+        &rec.def.id,
+        &input,
+        live.is_some(),
+        overdue_ms(
+            now_ms,
+            rec.runtime.last_cycle_started_at_ms,
+            rec.def.cadence_secs,
+        ),
+        rec.def.cadence_secs,
+        now_ms,
+    );
 
     // See [`spawn_streak_clears`]: the streak clears only once a spawn has
     // proven itself, never at spawn time.
@@ -1025,6 +1096,136 @@ async fn reconcile_slot_lease(
     false
 }
 
+/// Make the nudge gate observable. Without this a tab that is overdue for its
+/// next cycle but never looks idle (a processing indicator or spinner glyph on
+/// screen, no `❯` prompt row, or a dialog — see `looping_agent::idle` and
+/// [`nudge_safe_idle`]) produces no log line at all, so "no further cycles"
+/// cannot be told apart from "the agent is disabled".
+///
+/// Edge-triggered at info on any change of
+/// `(running, tab_alive, idle, cadence_elapsed)` ([`tick_state_changed`]), plus a rate-limited warn
+/// ([`stuck_idle_warn_due`]) once a probed tab has been held back by the idle
+/// gate alone for a long time.
+fn log_tick_state(
+    agent_id: &str,
+    input: &TickInput,
+    probed: bool,
+    overdue_ms: Option<i64>,
+    cadence_secs: u64,
+    now_ms: i64,
+) {
+    if let Some((running, tab_alive, idle, cadence_elapsed)) =
+        tick_state_changed(&LAST_TICK_STATE, agent_id, input)
+    {
+        info!(
+            agent = %agent_id,
+            running,
+            tab_alive,
+            idle,
+            cadence_elapsed,
+            "looping_agent_supervisor: tick state changed"
+        );
+    }
+    if stuck_idle_warn_due(
+        &LAST_STUCK_IDLE_WARN,
+        agent_id,
+        input,
+        probed,
+        overdue_ms,
+        now_ms,
+    ) {
+        warn!(
+            agent = %agent_id,
+            cadence_secs,
+            overdue_secs = overdue_ms.map(|ms| ms / 1000),
+            "looping_agent_supervisor: next cycle is overdue but the tab has not looked idle \
+             (processing text / spinner on screen, no input prompt row, or a dialog) — \
+             not nudging"
+        );
+    }
+}
+
+/// The agent's `(running, tab_alive, idle, cadence_elapsed)` when it differs
+/// from the last tick's (recording it in `memo`), `None` when unchanged. A stopped agent is
+/// recorded with `idle` and `cadence_elapsed` folded to `false`: `decide` never
+/// acts on them, so their flips are not news.
+#[allow(clippy::type_complexity)]
+fn tick_state_changed(
+    memo: &Mutex<Option<HashMap<String, (bool, bool, bool, bool)>>>,
+    agent_id: &str,
+    input: &TickInput,
+) -> Option<(bool, bool, bool, bool)> {
+    let running = input.enabled && input.desired_running;
+    let state = (
+        running,
+        input.tab_alive,
+        running && input.idle,
+        running && input.cadence_elapsed,
+    );
+    let mut guard = memo.lock().unwrap_or_else(|e| e.into_inner());
+    let map = guard.get_or_insert_with(HashMap::new);
+    if map.get(agent_id) == Some(&state) {
+        return None;
+    }
+    map.insert(agent_id.to_string(), state);
+    Some(state)
+}
+
+/// How long past its cadence the next cycle is: `now - (last start + cadence)`.
+/// `None` when no cycle has started yet (the first cycle has no due time).
+fn overdue_ms(
+    now_ms: i64,
+    last_cycle_started_at_ms: Option<i64>,
+    cadence_secs: u64,
+) -> Option<i64> {
+    last_cycle_started_at_ms.map(|t| {
+        now_ms
+            .saturating_sub(t)
+            .saturating_sub((cadence_secs as i64).saturating_mul(1000))
+    })
+}
+
+/// Whether the "overdue but not idle" warning fires this tick.
+///
+/// Only on the exact branch where [`policy::decide`] withholds a nudge because
+/// of `idle` alone (running, live tab past its spawn grace, cadence elapsed,
+/// not idle), only for a tab whose grid was actually probed (a pending restore
+/// reads `tab_alive` with nothing to probe), and only once the cycle is
+/// [`STUCK_IDLE_WARN_EVERY_MS`] past due, so an ordinary turn that runs past
+/// its cadence is not reported. At most once per that interval per agent; the
+/// memo is cleared whenever the condition stops holding, so a new stuck
+/// episode is reported on its own schedule.
+fn stuck_idle_warn_due(
+    memo: &Mutex<Option<HashMap<String, i64>>>,
+    agent_id: &str,
+    input: &TickInput,
+    probed: bool,
+    overdue_ms: Option<i64>,
+    now_ms: i64,
+) -> bool {
+    let idle_gate_holds = input.enabled
+        && input.desired_running
+        && input.tab_alive
+        && input.spawn_grace_elapsed
+        && input.cadence_elapsed
+        && !input.idle;
+    let long_overdue = overdue_ms.is_some_and(|ms| ms >= STUCK_IDLE_WARN_EVERY_MS);
+    let mut guard = memo.lock().unwrap_or_else(|e| e.into_inner());
+    let map = guard.get_or_insert_with(HashMap::new);
+    if !(idle_gate_holds && probed && long_overdue) {
+        map.remove(agent_id);
+        return false;
+    }
+    let due = map
+        .get(agent_id)
+        // A wall clock stepped backwards re-arms rather than silencing.
+        .is_none_or(|at| now_ms < *at || now_ms - *at >= STUCK_IDLE_WARN_EVERY_MS);
+    if due {
+        map.insert(agent_id.to_string(), now_ms);
+    }
+    due
+}
+
 /// Edge-triggered posture logging: emit a line only when an agent's effective
 /// posture CHANGES, never once per 5s tick.
 fn log_posture_transition(agent_id: &str, effective: &EffectiveDesired) {
@@ -1190,12 +1391,10 @@ async fn do_spawn(
             // coord read, not a verdict, and takes no backoff
             // ([`trust_refusal_backs_off`]) — the next tick re-asks, exactly as
             // the resource-guard refusal does.
-            let dial = crate::claude_session::trust_gate::peek_dial();
-            if trust_refusal_backs_off(&dial) {
+            if trust_refusal_backs_off(&e) {
                 warn!(
                     agent = %def.id,
                     error = %e,
-                    dial = ?dial,
                     "looping_agent_supervisor: spawn refused by the workspace-trust gate — \
                      a policy verdict, backing off; trust the agent's home dir for the pinned \
                      account or move the tenant's autonomy dial"
@@ -1205,7 +1404,6 @@ async fn do_spawn(
                 warn!(
                     agent = %def.id,
                     error = %e,
-                    dial = ?dial,
                     "looping_agent_supervisor: spawn refused by the workspace-trust gate \
                      because the tenant's autonomy dial could not be read — retrying on the \
                      next tick, no backoff"
@@ -1458,6 +1656,12 @@ pub(crate) struct LoopingAgentStatus {
     /// Rendered-grid idle read (`None` when there is no live tab). Single
     /// read, no quiescence debounce — status is observational.
     pub idle: Option<bool>,
+    /// The dialog marker that vetoed `idle`: says WHY a quiet-looking tab
+    /// reads `idle: false` — a Claude Code dialog is waiting to be answered.
+    /// `None` when there is no live tab, when no dialog is on screen, and
+    /// also when the grid already reads busy (the dialog check only runs on
+    /// a grid the idle predicate passed).
+    pub dialog: Option<&'static str>,
 }
 
 /// Assemble the live status for one record.
@@ -1466,14 +1670,15 @@ pub(crate) fn status_snapshot(
     rec: &LoopingAgentRecord,
 ) -> LoopingAgentStatus {
     let (liveness, live, _exited) = resolve_live_session(app, rec);
-    let idle = live.as_ref().map(|(_, session)| {
+    let read = live.as_ref().map(|(_, session)| {
         let (lines, cursor_row) = session.grid_text();
-        nudge_safe_idle(snapshot_looks_idle(&lines, cursor_row), &lines).0
+        nudge_safe_idle(snapshot_looks_idle(&lines, cursor_row), &lines)
     });
     LoopingAgentStatus {
         record: rec.clone(),
         tab_alive: liveness.tab_alive(),
-        idle,
+        idle: read.map(|(safe, _)| safe),
+        dialog: read.and_then(|(_, dialog)| dialog),
     }
 }
 
@@ -1485,6 +1690,189 @@ mod nudge_and_exit_tests {
 
     fn lines(rows: &[&str]) -> Vec<String> {
         rows.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn tick(tab_alive: bool, idle: bool, cadence_elapsed: bool) -> TickInput {
+        TickInput {
+            enabled: true,
+            desired_running: true,
+            tab_alive,
+            ever_spawned: true,
+            spawn_backoff_elapsed: true,
+            spawn_grace_elapsed: true,
+            idle,
+            context_low: false,
+            cadence_elapsed,
+            cycles_since_relaunch: 1,
+            relaunch_every_cycles: 10,
+        }
+    }
+
+    /// The "overdue but not idle" warning fires only on the branch where the
+    /// idle gate alone withholds the nudge, for a probed tab that is long
+    /// overdue, and then at most once per interval per agent.
+    #[test]
+    fn the_stuck_idle_warning_is_rate_limited_and_only_for_a_long_overdue_busy_tab() {
+        let memo = Mutex::new(None);
+        let long = Some(STUCK_IDLE_WARN_EVERY_MS);
+        let stuck = tick(true, false, true);
+        let due = |input: &TickInput, probed: bool, overdue: Option<i64>, now: i64| {
+            stuck_idle_warn_due(&memo, "a", input, probed, overdue, now)
+        };
+        // Not the idle gate: idle, cadence not elapsed, no live tab.
+        assert!(!due(&tick(true, true, true), true, long, 0));
+        assert!(!due(&tick(true, false, false), true, long, 0));
+        assert!(!due(&tick(false, false, true), true, long, 0));
+        // Disabled / stopped agents are left alone on purpose.
+        assert!(!due(
+            &TickInput {
+                enabled: false,
+                ..stuck
+            },
+            true,
+            long,
+            0
+        ));
+        assert!(!due(
+            &TickInput {
+                desired_running: false,
+                ..stuck
+            },
+            true,
+            long,
+            0
+        ));
+        // Still inside the spawn grace: the grace, not idle, holds the nudge.
+        assert!(!due(
+            &TickInput {
+                spawn_grace_elapsed: false,
+                ..stuck
+            },
+            true,
+            long,
+            0
+        ));
+        // A pending restore reads tab_alive with no grid to probe.
+        assert!(!due(&stuck, false, long, 0));
+        // An ordinary turn running a little past its cadence is not reported,
+        // nor is an agent with no cycle started yet.
+        assert!(!due(&stuck, true, Some(STUCK_IDLE_WARN_EVERY_MS - 1), 0));
+        assert!(!due(&stuck, true, None, 0));
+        // First long-overdue tick warns; later ticks inside the interval do not.
+        assert!(due(&stuck, true, long, 1_000));
+        assert!(!due(&stuck, true, long, 6_000));
+        assert!(!due(
+            &stuck,
+            true,
+            long,
+            1_000 + STUCK_IDLE_WARN_EVERY_MS - 1
+        ));
+        // Another agent is tracked separately.
+        assert!(stuck_idle_warn_due(&memo, "b", &stuck, true, long, 6_000));
+        // Once the interval has passed, it warns again.
+        assert!(due(&stuck, true, long, 1_000 + STUCK_IDLE_WARN_EVERY_MS));
+        // Leaving the stuck state clears the memo, so a new episode warns at
+        // once instead of waiting out the old interval.
+        assert!(!due(
+            &tick(true, true, true),
+            true,
+            long,
+            1_000 + STUCK_IDLE_WARN_EVERY_MS + 5
+        ));
+        assert!(due(
+            &stuck,
+            true,
+            long,
+            1_000 + STUCK_IDLE_WARN_EVERY_MS + 10
+        ));
+    }
+
+    #[test]
+    fn the_tick_state_line_fires_on_a_change_only() {
+        let memo = Mutex::new(None);
+        let changed = |id: &str, input: &TickInput| tick_state_changed(&memo, id, input);
+        let busy = tick(true, false, true);
+        assert_eq!(
+            changed("a", &busy),
+            Some((true, true, false, true)),
+            "first sight logs"
+        );
+        assert_eq!(changed("a", &busy), None, "same state is quiet");
+        assert!(changed("a", &tick(true, true, true)).is_some());
+        assert!(changed("a", &tick(true, true, false)).is_some());
+        assert!(changed("a", &tick(false, false, false)).is_some());
+        assert!(
+            changed("b", &tick(false, false, false)).is_some(),
+            "per agent"
+        );
+        // A stopped agent logs once, with idle / cadence folded to false so
+        // the line matches what is recorded; their flips are not news.
+        let stopped = TickInput {
+            enabled: false,
+            ..busy
+        };
+        assert_eq!(changed("c", &stopped), Some((false, true, false, false)));
+        assert_eq!(
+            changed(
+                "c",
+                &TickInput {
+                    idle: true,
+                    ..stopped
+                }
+            ),
+            None
+        );
+        assert_eq!(
+            changed(
+                "c",
+                &TickInput {
+                    cadence_elapsed: false,
+                    ..stopped
+                }
+            ),
+            None
+        );
+        // ...but its tab going away still is.
+        assert_eq!(
+            changed(
+                "c",
+                &TickInput {
+                    tab_alive: false,
+                    ..stopped
+                }
+            ),
+            Some((false, false, false, false))
+        );
+        // Starting it again is news.
+        assert!(changed("c", &busy).is_some());
+    }
+
+    #[test]
+    fn a_clock_stepped_back_rearms_the_stuck_warning() {
+        let memo = Mutex::new(None);
+        let stuck = tick(true, false, true);
+        let long = Some(STUCK_IDLE_WARN_EVERY_MS);
+        assert!(stuck_idle_warn_due(
+            &memo, "a", &stuck, true, long, 1_000_000
+        ));
+        assert!(stuck_idle_warn_due(&memo, "a", &stuck, true, long, 10_000));
+        // The re-arm records the new time, so it does not then fire every tick.
+        assert!(!stuck_idle_warn_due(&memo, "a", &stuck, true, long, 15_000));
+        assert!(stuck_idle_warn_due(
+            &memo,
+            "a",
+            &stuck,
+            true,
+            long,
+            10_000 + STUCK_IDLE_WARN_EVERY_MS
+        ));
+    }
+
+    #[test]
+    fn overdue_is_measured_past_the_cadence_not_from_the_cycle_start() {
+        assert_eq!(overdue_ms(100_000, None, 60), None);
+        assert_eq!(overdue_ms(100_000, Some(0), 60), Some(40_000));
+        assert_eq!(overdue_ms(30_000, Some(0), 60), Some(-30_000));
     }
 
     /// The screen the Merge Shepherd sat on when the nudge's Enter answered
@@ -1522,6 +1910,38 @@ mod nudge_and_exit_tests {
     }
 
     #[test]
+    fn a_reattach_closes_the_abandoned_exited_pane_but_never_the_live_one() {
+        // The combination the re-attach close exists for: the direct tab
+        // exited, the lifecycle record moved to a running tab. It must read
+        // Live (so the Spawn arm, which needs Exited/Dead, never also takes the
+        // stale pane) AND hand the direct id over for closing.
+        assert_eq!(
+            policy::resolve_liveness(TabProbe::Exited, true, TabProbe::Running),
+            Liveness::Live
+        );
+        // Exited: the stale pane goes to the death-respawn arm.
+        assert_eq!(
+            stale_tab_to_close(Liveness::Exited, Some("t1"), None),
+            Some("t1".to_string())
+        );
+        // Live via the lifecycle record: the abandoned direct pane is closed.
+        assert_eq!(
+            stale_tab_to_close(Liveness::Live, Some("t1"), Some("t2")),
+            Some("t1".to_string())
+        );
+        // Never the live tab itself.
+        assert_eq!(
+            stale_tab_to_close(Liveness::Live, Some("t2"), Some("t2")),
+            None
+        );
+        assert_eq!(stale_tab_to_close(Liveness::Live, None, Some("t2")), None);
+        // Nothing while a restore may be in flight, or with no tab at all.
+        for l in [Liveness::PendingRestore, Liveness::Dead] {
+            assert_eq!(stale_tab_to_close(l, Some("t1"), None), None, "{l:?}");
+        }
+    }
+
+    #[test]
     fn only_an_early_agent_caused_exit_backs_off() {
         assert!(exited_tab_backs_off(true, false));
         // A runner-initiated close inside the grace is not a broken spawn.
@@ -1544,14 +1964,29 @@ mod nudge_and_exit_tests {
 
     #[test]
     fn a_trust_refusal_backs_off_unless_the_dial_could_not_be_read() {
-        use crate::claude_session::trust_gate::{AutonomyTier, DialResolution};
-        assert!(!trust_refusal_backs_off(&DialResolution::Unresolved {
-            error: "coord unreachable".to_string()
-        }));
-        assert!(trust_refusal_backs_off(&DialResolution::Fresh {
+        use crate::claude_session::trust_gate::{
+            annotate_unread_dial, AutonomyTier, DialResolution, TrustGateDecision,
+        };
+        let block = || TrustGateDecision::SpawnBlocked {
+            rule: "dial-withholds-underived-mint-on-interactive-pty",
+            failed: vec!["coord_allocation_row=unsatisfied (no row)".to_string()],
+        };
+        // The refusal the gate renders from the dial it DECIDED on — never a
+        // later peek of the cache.
+        let rendered = |dial: DialResolution| {
+            annotate_unread_dial(block(), &dial)
+                .refusal()
+                .expect("a block renders a refusal")
+        };
+        assert!(!trust_refusal_backs_off(&rendered(
+            DialResolution::Unresolved {
+                error: "coord unreachable".to_string()
+            }
+        )));
+        assert!(trust_refusal_backs_off(&rendered(DialResolution::Fresh {
             tier: AutonomyTier::DraftRequired
-        }));
-        assert!(trust_refusal_backs_off(&DialResolution::Absent));
+        })));
+        assert!(trust_refusal_backs_off(&rendered(DialResolution::Absent)));
     }
 
     #[test]

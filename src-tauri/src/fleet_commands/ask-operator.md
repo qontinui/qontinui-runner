@@ -98,6 +98,12 @@ circular.
   with its version, and, when the door test ran, the doors it confirmed, why
   no door can exist, and the adversary's verdict. That line is what makes the question auditable: the question row is
   coord's durable copy of why it was asked.
+- **Write your recommendation and what overturning it costs**, for step 3's
+  `recommendation` and `if_overturned`. Putting your pick first in `options` does
+  not record it. Without the `recommendation` argument the operator's one-screen
+  view labels the question an open question, which is unfinished work. It is not
+  refused: if you truly have no recommendation, ask anyway, and say why in the
+  question.
 - Pick the **surface** that selects the priority composition:
   - `user_facing` — a user-facing UX decision (ux-led).
   - `system_internal` — an implementation/code decision (engineering-led). **Default.**
@@ -133,7 +139,9 @@ coord_ask_question(
   options:    [{label, description}, ...],
   surface:    "<surface>",
   plan_phase: "<optional context label>",
-  scores:     { "<label>": { "<priority>": 0.0-1.0 } }
+  scores:     { "<label>": { "<priority>": 0.0-1.0 } },
+  recommendation: "<the option you recommend, and why>",
+  if_overturned:  "<what changes if the operator chooses differently>"
 )
 ```
 
@@ -142,6 +150,12 @@ verdict (`{status: resolved|undecided, option?, margin?}`): **what the policy
 resolver WOULD have answered**. This is recorded but NOT acted on (shadow). Show
 the shadow verdict in your output so the operator sees the policy's pick
 alongside their own.
+
+A pending reply also carries `shape`: `fork_with_recommendation` when the
+recommendation is on the question. `recommendation_recorded: false` means the
+question was recorded without it, and `recommendation_note` says why;
+`recommendation_recorded: true` with a note means it was stored but the write
+could not be confirmed. Report the note either way and do not ask again.
 
 **If `coord_ask_question` is unavailable** (not in this session's MCP allow-set
 / no coord connection): fall back to the built-in `AskUserQuestion`, and note in

@@ -1415,6 +1415,10 @@ struct IdentitySeamOutcome {
     /// bounded [`crate::served_corpus::probe`] so the zero-I/O briefing render
     /// right after the seam can carry its `[served-corpus: …]` header line.
     served: crate::served_corpus::ServedCorpus,
+    /// The `--settings` carrier the seam materialized and exported as
+    /// `QONTINUI_CLAUDE_HOOK_SETTINGS`, or `None` when materialization failed.
+    /// Feeds [`TerminalSession::permission_request_hook`] for the shim path.
+    hook_carrier: Option<std::path::PathBuf>,
 }
 
 /// What the waiter thread knows when a pane's process exits, handed to the
@@ -1559,6 +1563,19 @@ pub struct TerminalSession {
     /// tab's `spawnName` (shared `TerminalInfo` is schema-owned and carries no
     /// such field, so it travels beside it like `sessionIdsByTerminal`).
     spawn_name: std::sync::OnceLock<String>,
+    /// Whether this terminal was handed a carrier that registers the
+    /// `PermissionRequest` hook (plan
+    /// `2026-10-23-runner-sessions-stop-at-permission-dialogs-so-accept-them-by-default-with-a-tenant-switch`
+    /// D7), served beside `TerminalInfo` on `GET /terminals` as
+    /// `permissionRequestHook`. Set once, by [`Self::spawn`]; unset (an adopted
+    /// holder pane, a remote mirror, a test fixture) reads `absent`.
+    permission_request_hook:
+        std::sync::OnceLock<crate::session::claude_hook::PermissionRequestHook>,
+    /// The per-spawn nonce this terminal's child carries as
+    /// `QONTINUI_PERMREQ_NONCE`, once [`Self::spawn`] registered it as the
+    /// terminal's grant (`session::permission_accept`). `Drop` forgets the
+    /// grant only while it is still this nonce's.
+    permission_request_nonce: std::sync::OnceLock<String>,
     /// R1 (session-lifecycle-cleanup) — best-effort hook invoked by the
     /// waiter thread the instant the backing PTY process exits. Wired by
     /// `terminal_create` alongside [`Self::set_coord_session_id`]: it
@@ -1570,7 +1587,7 @@ pub struct TerminalSession {
     /// slot so the already-spawned waiter thread can read it once the
     /// registration completes; cloned into the waiter at spawn time.
     /// Idempotent against the frontend `terminal_close` path because
-    /// `SessionRegistry::close` is itself idempotent.
+    /// `SessionRegistry::close_by_id` is itself idempotent.
     /// Widened from `Fn(uuid::Uuid)` to also carry the exit code (plan
     /// `2026-08-27-operator-touch-observation-runner-emitter` §2b/§2c,
     /// Phase B2): the coord-close callback still receives the coord session
@@ -1718,6 +1735,10 @@ impl TerminalSession {
         // IS the shell is kept: only a shell pane gets a composed spawn-prompt
         // file below — a direct exec's argv already settled its own carrier.
         let is_shell_pane = command.as_ref().is_none_or(|parts| parts.is_empty());
+        // The argv's own `--settings`, if any, is half of what this terminal
+        // reports as `permissionRequestHook` (plan 2026-10-23 D7); the seam's
+        // carrier below is the other half. Kept before `command` is consumed.
+        let spawn_argv: Vec<String> = command.clone().unwrap_or_default();
         let mut cmd = Self::build_command_from(command);
 
         // Set working directory
@@ -1765,6 +1786,21 @@ impl TerminalSession {
                 cmd.env(k, v);
             }
         }
+        // Permission auto-accept (plan
+        // `2026-10-23-runner-sessions-stop-at-permission-dialogs-so-accept-them-by-default-with-a-tenant-switch`):
+        // two per-spawn secrets for the carrier's PermissionRequest hook: the
+        // request key it SENDS to the runner's pad, and the nonce the pad must
+        // ECHO before the hook answers a dialog (the key is derived one-way
+        // from the nonce, so whoever receives a request cannot forge the echo).
+        // Set AFTER the caller's env so neither a caller nor an inherited copy
+        // (a runner started inside a runner session) can plant a known value.
+        // Recorded as this terminal's grant once the child is up, below.
+        let permreq_nonce = crate::session::permission_accept::new_nonce();
+        cmd.env(crate::session::permission_accept::NONCE_ENV, &permreq_nonce);
+        cmd.env(
+            crate::session::permission_accept::REQUEST_KEY_ENV,
+            crate::session::permission_accept::request_key_for(&permreq_nonce),
+        );
 
         // Resolve the EFFECTIVE Claude config dir that is (or is about to be)
         // placed into the PTY env — the caller pin wins, else the credential-
@@ -1820,6 +1856,10 @@ impl TerminalSession {
             )
         }?;
         let pinned_session_id = seam.pinned_session_id;
+        let permission_request_hook = crate::session::claude_hook::permission_request_hook_for(
+            Some(&spawn_argv),
+            seam.hook_carrier.as_deref(),
+        );
 
         // ---- The canonical runner-context briefing --------------------------
         // Rendered HERE, immediately after the identity seam, and NOT in
@@ -1899,7 +1939,7 @@ impl TerminalSession {
             )?,
         };
 
-        Self::spawn_with_io(
+        let session = Self::spawn_with_io(
             id,
             title,
             cwd,
@@ -1910,7 +1950,13 @@ impl TerminalSession {
             interceptor,
             io,
             pinned_session_id,
-        )
+        )?;
+        // Only THIS path records it: an adopted holder pane or a remote mirror
+        // is built by `spawn_with_io` alone and reads `absent` — and holds no
+        // grant, so the pad never answers its prompts.
+        session.set_permission_request_hook(permission_request_hook);
+        session.record_permission_request_grant(permreq_nonce, spawn_tenant);
+        Ok(session)
     }
 
     /// Build a live session around an already-constructed [`PaneIo`].
@@ -1965,7 +2011,15 @@ impl TerminalSession {
         }
 
         // Get the input writer from the pane
-        let writer = Arc::new(Mutex::new(io.writer()?));
+        // A failure from here on would leave the spawned child behind a pane
+        // nothing owns, so every early return ends it (`abandon_pane`).
+        let writer = Arc::new(Mutex::new(io.writer().map_err(|e| {
+            abandon_pane(
+                io.as_ref(),
+                &id,
+                format!("Failed to open the pane's writer: {e}"),
+            )
+        })?));
 
         let is_alive = Arc::new(AtomicBool::new(true));
         let exit_code: Arc<Mutex<Option<i32>>> = Arc::new(Mutex::new(None));
@@ -1995,7 +2049,13 @@ impl TerminalSession {
             .unwrap_or_default()
             .as_millis() as u64;
         // Get an output reader from the pane
-        let mut reader = io.reader()?;
+        let mut reader = io.reader().map_err(|e| {
+            abandon_pane(
+                io.as_ref(),
+                &id,
+                format!("Failed to open the pane's reader: {e}"),
+            )
+        })?;
 
         // Coord mirror identity, populated by `terminal_create` after
         // `register_external` returns. Declared HERE (ahead of the reader
@@ -2376,7 +2436,7 @@ impl TerminalSession {
                 }
                 debug!(terminal_id = %reader_id, "Reader thread exiting");
             })
-            .map_err(|e| format!("Failed to spawn reader thread: {}", e))?;
+            .map_err(|e| abandon_pane(io.as_ref(), &id, format!("Failed to spawn reader thread: {e}")))?;
 
         // R1 — shared slots the waiter thread reads on PTY exit so it can
         // close the coord session mirror immediately (vs. leaving it for
@@ -2505,7 +2565,7 @@ impl TerminalSession {
                     );
                 }
             })
-            .map_err(|e| format!("Failed to spawn waiter thread: {}", e))?;
+            .map_err(|e| abandon_pane(io.as_ref(), &id, format!("Failed to spawn waiter thread: {e}")))?;
 
         Ok(Self {
             id,
@@ -2537,6 +2597,8 @@ impl TerminalSession {
             grid,
             coord_session_id,
             spawn_name: std::sync::OnceLock::new(),
+            permission_request_hook: std::sync::OnceLock::new(),
+            permission_request_nonce: std::sync::OnceLock::new(),
             agent_status_last,
             grid_idle_tracker: Mutex::new(qontinui_runner_lib::wind_down::GridIdleTracker::new()),
             on_exit,
@@ -3355,7 +3417,7 @@ impl TerminalSession {
                 .entered();
         let hook_result = crate::session::claude_hook::materialize(&hook_dir);
         drop(hook_span);
-        match hook_result {
+        match &hook_result {
             Some(settings_path) => {
                 cmd.env(
                     crate::session::claude_hook::CLAUDE_SETTINGS_ENV,
@@ -3535,6 +3597,7 @@ impl TerminalSession {
             pinned_session_id: pinned,
             coord_mcp,
             served,
+            hook_carrier: hook_result,
         })
     }
 
@@ -4509,6 +4572,36 @@ impl TerminalSession {
         self.spawn_name.get().cloned()
     }
 
+    /// Record what [`Self::spawn`] handed this terminal (first write wins).
+    pub fn set_permission_request_hook(
+        &self,
+        hook: crate::session::claude_hook::PermissionRequestHook,
+    ) {
+        let _ = self.permission_request_hook.set(hook);
+    }
+
+    /// Register this terminal's permission auto-accept grant: the nonce its
+    /// child env carries and the tenant it was spawned for (`None` when the
+    /// caller named none). First write wins.
+    fn record_permission_request_grant(&self, nonce: String, spawn_tenant: Option<uuid::Uuid>) {
+        if self.permission_request_nonce.set(nonce.clone()).is_ok() {
+            crate::session::permission_accept::register_terminal_grant(
+                &self.id,
+                nonce,
+                spawn_tenant,
+            );
+        }
+    }
+
+    /// `GET /terminals` `permissionRequestHook`: `Absent` unless
+    /// [`Self::spawn`] recorded a current carrier.
+    pub fn permission_request_hook(&self) -> crate::session::claude_hook::PermissionRequestHook {
+        self.permission_request_hook
+            .get()
+            .copied()
+            .unwrap_or(crate::session::claude_hook::PermissionRequestHook::Absent)
+    }
+
     /// Read the coord-native session id, if one has been wired.
     pub fn coord_session_id(&self) -> Option<uuid::Uuid> {
         self.coord_session_id.lock().ok().and_then(|g| *g)
@@ -4786,10 +4879,15 @@ impl TerminalSession {
     /// protocol. Crate code reaches this through `TerminalManager::graceful_exit`,
     /// the one public entry point, whose close also drops the pane from the
     /// manager and skips the kill when the pane's process already exited.
+    ///
+    /// `authority` is the caller's close authority, checked once the probe has
+    /// found a live `claude` and before any byte is typed. See
+    /// [`crate::terminal::close_authority`].
     pub(super) async fn graceful_exit_then<C, CF>(
         &self,
         deadline: std::time::Duration,
         close_tab: C,
+        authority: Option<crate::terminal::close_authority::CloseAuthority>,
     ) -> crate::terminal::graceful_exit::GracefulExitOutcome
     where
         C: FnOnce() -> CF,
@@ -4800,6 +4898,7 @@ impl TerminalSession {
             crate::terminal::graceful_exit::ExitTiming::with_deadline(deadline),
             move |tracked| crate::terminal::graceful_exit::probe_claude_under(root, tracked),
             close_tab,
+            authority,
         )
         .await
     }
@@ -4811,6 +4910,7 @@ impl TerminalSession {
         timing: crate::terminal::graceful_exit::ExitTiming,
         probe: P,
         close_tab: C,
+        authority: Option<crate::terminal::close_authority::CloseAuthority>,
     ) -> crate::terminal::graceful_exit::GracefulExitOutcome
     where
         P: FnMut(Vec<crate::terminal::graceful_exit::ProcIdentity>) -> PF,
@@ -4818,22 +4918,32 @@ impl TerminalSession {
         C: FnOnce() -> CF,
         CF: std::future::Future<Output = crate::terminal::graceful_exit::CloseTabResult>,
     {
-        use crate::terminal::graceful_exit::{drive, GracefulExitOutcome};
+        use crate::terminal::graceful_exit::{drive_graceful_exit, GracefulExitOutcome};
 
         info!(
             terminal_id = %self.id,
             deadline_s = timing.deadline.as_secs(),
+            authority = authority.is_some(),
             "graceful_exit: starting"
         );
-        let outcome = drive(
+        let outcome = drive_graceful_exit(
             |bytes| self.write(bytes, PtyWriteCaller::GracefulExit),
             || self.grid_screen(),
             probe,
             close_tab,
             timing,
+            authority,
         )
         .await;
         match &outcome {
+            GracefulExitOutcome::NoCloseAuthority { claude_pids } => warn!(
+                terminal_id = %self.id,
+                pids = ?claude_pids,
+                outcome = outcome.word(),
+                "graceful_exit: refused no_close_authority — a live claude is in the pane and \
+                 the caller presented no CloseAuthority (none can be minted before the \
+                 lifecycle Closer); nothing typed, nothing closed"
+            ),
             GracefulExitOutcome::ExitStuck { claude_pids, .. } => warn!(
                 terminal_id = %self.id,
                 pids = ?claude_pids,
@@ -4909,7 +5019,14 @@ impl TerminalSession {
     /// closing one pane): the joins are already individually capped at 2 s each
     /// and there is no competing work. The app-shutdown path uses
     /// [`Self::close_with_deadline`] instead.
-    pub fn close(&self) {
+    ///
+    /// `pub(super)`, like every session-level close entry point: only
+    /// `crate::terminal` may call one. Everything else closes a pane through
+    /// `TerminalManager`, which is where the close-site roster
+    /// (`runner_close_sites.txt`) finds and classes every caller. A
+    /// session-level call from outside `terminal/` would be a close the
+    /// roster's scan of `terminal/` cannot see, so it does not compile.
+    pub(super) fn close(&self) {
         self.close_with_deadline(None);
     }
 
@@ -4925,7 +5042,9 @@ impl TerminalSession {
     /// - each thread join gets `min(2s, remaining)`;
     /// - once nothing is left, the joins and the shim-dir sweep are skipped
     ///   (the PTY child is already dead by then — that part always runs).
-    pub fn close_with_deadline(&self, deadline: Option<std::time::Instant>) {
+    ///
+    /// `pub(super)` — see [`Self::close`].
+    pub(super) fn close_with_deadline(&self, deadline: Option<std::time::Instant>) {
         self.close_inner(deadline, true);
     }
 
@@ -5106,7 +5225,9 @@ impl TerminalSession {
     /// past process exit, so it is the only step kept; the thread joins, the
     /// PTY-handle drop and the shim sweep are all reclaimed by the imminent
     /// `process::exit` or by the next boot's stale sweep.
-    pub fn close_kill_only(&self) {
+    ///
+    /// `pub(super)` — see [`Self::close`].
+    pub(super) fn close_kill_only(&self) {
         warn!(
             terminal_id = %self.id,
             "Shutdown deadline exhausted — kill-only terminal teardown"
@@ -5118,6 +5239,28 @@ impl TerminalSession {
             warn!(terminal_id = %self.id, pid = ?self.child_pid, "kill-only {e}");
         }
     }
+}
+
+/// `spawn_with_io` failed after the pane was built (pty_holder review
+/// follow-up L2): its writer or reader could not be opened, or a thread could
+/// not be spawned. When the WAITER thread fails to spawn, the already-running
+/// reader thread holds the pane — through the `WireFlow` and its reader — and
+/// blocks until the pane's output ends, so the pane is never dropped and no
+/// `Drop` ever runs: the child would outlive a spawn that reported failure,
+/// with no session to close it. When the READER thread fails to spawn the pane
+/// is dropped on return, but a `LocalPty` has no kill on drop. Either way, end
+/// it here — kill, then release, which ends the reader's stream so a running
+/// reader thread exits — and return `reason` as the spawn's error. (A holder
+/// pane's own `Drop` then sees it released and does not kill again.)
+fn abandon_pane(io: &dyn PaneIo, id: &TerminalId, reason: String) -> String {
+    warn!(terminal_id = %id, pid = ?io.pid(), "{reason} — ending the pane rather than orphaning it");
+    if let Err(e) = io.kill(TASKKILL_TIMEOUT) {
+        warn!(terminal_id = %id, error = %e, "abandoned pane: kill failed");
+    }
+    if let Err(e) = io.release(lock_acquire_budget(None)) {
+        warn!(terminal_id = %id, error = %e, "abandoned pane: release reported an error");
+    }
+    reason
 }
 
 /// Called by the waiter once the child has exited: clears `is_alive` and
@@ -5252,6 +5395,9 @@ impl Drop for TerminalSession {
     fn drop(&mut self) {
         if self.is_alive.load(Ordering::Relaxed) {
             self.close();
+        }
+        if let Some(nonce) = self.permission_request_nonce.get() {
+            crate::session::permission_accept::forget_terminal_grant(&self.id, nonce);
         }
     }
 }
@@ -5742,6 +5888,8 @@ pub(crate) mod tests {
             grid: Arc::new(Mutex::new(Grid::new(80, 24))),
             coord_session_id: Arc::new(Mutex::new(None)),
             spawn_name: std::sync::OnceLock::new(),
+            permission_request_hook: std::sync::OnceLock::new(),
+            permission_request_nonce: std::sync::OnceLock::new(),
             agent_status_last: Arc::new(Mutex::new(None)),
             grid_idle_tracker: Mutex::new(qontinui_runner_lib::wind_down::GridIdleTracker::new()),
             on_exit: Arc::new(Mutex::new(None)),
@@ -5834,6 +5982,55 @@ pub(crate) mod tests {
         }
     }
 
+    /// A pane that records the order of `kill` and `release`.
+    #[derive(Default)]
+    struct TeardownRecordingPaneIo(Mutex<Vec<&'static str>>);
+
+    impl crate::terminal::pane_io::PaneIo for TeardownRecordingPaneIo {
+        fn reader(&self) -> Result<Box<dyn Read + Send>, String> {
+            Ok(Box::new(std::io::empty()))
+        }
+        fn writer(&self) -> Result<Box<dyn Write + Send>, String> {
+            Ok(Box::new(std::io::sink()))
+        }
+        fn resize(&self, _cols: u16, _rows: u16) -> Result<(), String> {
+            Ok(())
+        }
+        fn wait(&self) -> Result<i32, String> {
+            Ok(0)
+        }
+        fn kill(&self, _budget: Duration) -> Result<(), String> {
+            self.0.lock().unwrap().push("kill");
+            Ok(())
+        }
+        fn set_paused(&self, _paused: bool) -> Result<(), String> {
+            Ok(())
+        }
+        fn pid(&self) -> Option<u32> {
+            None
+        }
+        fn credential_scrub(&self) -> crate::terminal::pane_io::CredentialScrub {
+            crate::terminal::pane_io::CredentialScrub::NoChildEnv
+        }
+        fn release(&self, _budget: Duration) -> Result<(), String> {
+            self.0.lock().unwrap().push("release");
+            Ok(())
+        }
+    }
+
+    /// pty_holder review follow-up L2: a spawn that fails after its reader
+    /// thread started ends the pane — kill, then release (which ends the
+    /// reader's stream) — and returns the failure as the spawn's error, rather
+    /// than leaving the child running behind a pane nothing will ever drop.
+    #[test]
+    fn abandoned_pane_is_killed_then_released() {
+        let io = TeardownRecordingPaneIo::default();
+        let id: TerminalId = "t-abandon".into();
+        let err = abandon_pane(&io, &id, "Failed to spawn waiter thread: boom".into());
+        assert_eq!(err, "Failed to spawn waiter thread: boom");
+        assert_eq!(*io.0.lock().unwrap(), vec!["kill", "release"]);
+    }
+
     /// A writer that records what was typed and, like a TUI input line, echoes
     /// it onto the grid.
     struct EchoingWriter {
@@ -5869,14 +6066,25 @@ pub(crate) mod tests {
         }
     }
 
-    /// A LIVE pane showing `screen` (bytes fed to its grid), whose writer
-    /// echoes onto the grid when `echo`, and whose pane counts kills.
-    fn prompt_pane(screen: &str, echo: bool) -> PromptPane {
+    /// The parts of a LIVE pane showing `screen` (bytes fed to its grid), whose
+    /// writer echoes onto the grid when `echo`, whose pane counts kills, and
+    /// whose process probe is rooted at `root_pid`. Returned bare, so each
+    /// fixture wrapper owns the one `Drop` that marks the session dead again.
+    fn live_prompt_parts(
+        screen: &str,
+        echo: bool,
+        root_pid: Option<u32>,
+    ) -> (
+        TerminalSession,
+        Arc<KillCountingPaneIo>,
+        Arc<Mutex<Vec<u8>>>,
+    ) {
         let io = Arc::new(KillCountingPaneIo::default());
         let typed = Arc::new(Mutex::new(Vec::new()));
         let mut session = make_test_session(Arc::new(Mutex::new(Vec::new())));
         let pane: Arc<dyn crate::terminal::pane_io::PaneIo> = io.clone();
         session.io = pane;
+        session.child_pid = root_pid;
         {
             let mut parser = vte::Parser::new();
             session
@@ -5892,11 +6100,96 @@ pub(crate) mod tests {
         });
         session.writer = Arc::new(Mutex::new(writer));
         session.is_alive.store(true, Ordering::Relaxed);
+        (session, io, typed)
+    }
+
+    /// A LIVE pane showing `screen` (bytes fed to its grid), whose writer
+    /// echoes onto the grid when `echo`, and whose pane counts kills.
+    fn prompt_pane(screen: &str, echo: bool) -> PromptPane {
+        let (session, io, typed) = live_prompt_parts(screen, echo, None);
         PromptPane {
             session: Arc::new(session),
             io,
             typed,
         }
+    }
+
+    /// A LIVE, PTY-less pane at an empty prompt that echoes whatever is typed
+    /// into it, and whose process probe reads a SCRIPTED subtree:
+    ///
+    /// * [`live_claude_pane`] — ONE live `claude` with ZERO children. This is
+    ///   the pane every caller of the graceful-exit primitive must be refused
+    ///   on when it presents no `CloseAuthority` (plan
+    ///   `2026-10-28-one-session-lifecycle-authority`, Phase 14). Given an
+    ///   authority, the primitive WOULD type `/exit` here. That is what makes a
+    ///   refusal observable: nothing typed, nothing killed.
+    /// * [`bare_shell_pane`] — no `claude` at all, which every caller must still
+    ///   be able to handle exactly as before.
+    ///
+    /// The probe is the production `probe_claude_under`, answering from the
+    /// scripted table (`graceful_exit::fake_process_table`) under a root pid no
+    /// real process can hold. A test can therefore enter through a CALLER of
+    /// `TerminalManager::graceful_exit` with no OS process behind the pane.
+    pub(crate) struct ScriptedPane {
+        pub(crate) session: Arc<TerminalSession>,
+        /// The scripted `claude` pids, top-level first (empty: a bare shell).
+        pub(crate) claude_pids: Vec<u32>,
+        io: Arc<KillCountingPaneIo>,
+        typed: Arc<Mutex<Vec<u8>>>,
+        _scripted: crate::terminal::graceful_exit::fake_process_table::FakePane,
+    }
+
+    impl ScriptedPane {
+        /// Every byte written into the pane, in order.
+        pub(crate) fn typed(&self) -> Vec<u8> {
+            self.typed.lock().unwrap().clone()
+        }
+
+        /// How many times the pane's process was killed.
+        pub(crate) fn kills(&self) -> usize {
+            self.io.kills()
+        }
+    }
+
+    impl Drop for ScriptedPane {
+        fn drop(&mut self) {
+            // Let the fixture drop without its Drop-time close.
+            self.session.is_alive.store(false, Ordering::Relaxed);
+        }
+    }
+
+    fn scripted_pane(
+        subtree_claude: Vec<crate::terminal::graceful_exit::ProcIdentity>,
+    ) -> ScriptedPane {
+        let claude_pids = subtree_claude.iter().map(|id| id.pid).collect();
+        let scripted = crate::terminal::graceful_exit::fake_process_table::register(
+            crate::terminal::graceful_exit::PaneProcesses {
+                subtree_claude,
+                top_level_children: 0,
+                tracked_alive: Vec::new(),
+            },
+        );
+        let (session, io, typed) = live_prompt_parts(EMPTY_PROMPT, true, Some(scripted.root_pid));
+        ScriptedPane {
+            session: Arc::new(session),
+            claude_pids,
+            io,
+            typed,
+            _scripted: scripted,
+        }
+    }
+
+    /// One live `claude`, ZERO children — see [`ScriptedPane`].
+    pub(crate) fn live_claude_pane() -> ScriptedPane {
+        scripted_pane(vec![crate::terminal::graceful_exit::ProcIdentity {
+            pid: 4242,
+            started_at: 1_000,
+        }])
+    }
+
+    /// No `claude` in the pane: a bare shell — see [`ScriptedPane`].
+    pub(crate) fn bare_shell_pane() -> ScriptedPane {
+        scripted_pane(Vec::new())
     }
 
     const EMPTY_PROMPT: &str = "done.\r\n\u{276f} ";
@@ -5971,6 +6264,7 @@ pub(crate) mod tests {
                     closer.close_after_graceful_exit();
                     crate::terminal::graceful_exit::CloseTabResult::Closed
                 },
+                Some(crate::terminal::close_authority::CloseAuthority::for_test()),
             )
             .await;
 
@@ -5981,6 +6275,41 @@ pub(crate) mod tests {
         assert_eq!(pane.io.kills(), 0, "a live claude's pane was killed");
         assert!(pane.session.is_alive(), "the pane must be left running");
         assert_eq!(pane.typed.lock().unwrap().as_slice(), b"/exit\r");
+    }
+
+    /// R0a at the session seam, through the PRODUCTION probe: the real writer
+    /// and grid, a pane at an empty prompt that echoes, one live `claude` with
+    /// zero children, and no authority. Refused before a byte is written;
+    /// nothing killed, nothing closed, the pane left live.
+    #[tokio::test(start_paused = true)]
+    async fn graceful_exit_without_an_authority_types_nothing_into_a_live_claude() {
+        use crate::terminal::graceful_exit::GracefulExitOutcome;
+
+        let pane = live_claude_pane();
+        let closed = Arc::new(AtomicBool::new(false));
+        let closed_flag = Arc::clone(&closed);
+        let outcome = pane
+            .session
+            .graceful_exit_then(
+                Duration::from_secs(60),
+                move || async move {
+                    closed_flag.store(true, Ordering::SeqCst);
+                    crate::terminal::graceful_exit::CloseTabResult::Closed
+                },
+                None,
+            )
+            .await;
+
+        assert_eq!(
+            outcome,
+            GracefulExitOutcome::NoCloseAuthority {
+                claude_pids: pane.claude_pids.clone()
+            }
+        );
+        assert!(pane.typed().is_empty(), "typed into a live claude");
+        assert!(!closed.load(Ordering::SeqCst), "the close was reached");
+        assert_eq!(pane.kills(), 0);
+        assert!(pane.session.is_alive());
     }
 
     #[tokio::test(start_paused = true)]
@@ -6008,6 +6337,7 @@ pub(crate) mod tests {
                     closer.close_after_graceful_exit();
                     crate::terminal::graceful_exit::CloseTabResult::Closed
                 },
+                Some(crate::terminal::close_authority::CloseAuthority::for_test()),
             )
             .await;
         assert!(
@@ -6043,6 +6373,7 @@ pub(crate) mod tests {
                     closer.close_after_graceful_exit();
                     crate::terminal::graceful_exit::CloseTabResult::Closed
                 },
+                Some(crate::terminal::close_authority::CloseAuthority::for_test()),
             )
             .await;
         assert!(
@@ -6084,6 +6415,7 @@ pub(crate) mod tests {
                     closer.close_after_graceful_exit();
                     crate::terminal::graceful_exit::CloseTabResult::Closed
                 },
+                Some(crate::terminal::close_authority::CloseAuthority::for_test()),
             )
             .await;
         assert!(
@@ -6112,6 +6444,7 @@ pub(crate) mod tests {
                     closer.close_after_graceful_exit();
                     crate::terminal::graceful_exit::CloseTabResult::Closed
                 },
+                Some(crate::terminal::close_authority::CloseAuthority::for_test()),
             )
             .await;
         assert!(
@@ -6144,6 +6477,7 @@ pub(crate) mod tests {
                     closer.close_after_graceful_exit();
                     crate::terminal::graceful_exit::CloseTabResult::Closed
                 },
+                Some(crate::terminal::close_authority::CloseAuthority::for_test()),
             )
             .await;
         match &outcome {
@@ -6174,6 +6508,7 @@ pub(crate) mod tests {
                     closer.close_after_graceful_exit();
                     crate::terminal::graceful_exit::CloseTabResult::Closed
                 },
+                Some(crate::terminal::close_authority::CloseAuthority::for_test()),
             )
             .await;
         assert!(

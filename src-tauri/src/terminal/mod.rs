@@ -15,6 +15,7 @@ pub mod agent_status_sideband;
 pub mod auto_response;
 pub mod auto_response_fleet;
 pub mod claude_resume_sniff;
+pub mod close_authority;
 pub mod commit_report;
 pub mod context_watcher;
 pub mod coord_warn;

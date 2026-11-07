@@ -50,9 +50,16 @@ function dense(tabIds: string[]): ZoneAssignments {
  * function. Passing `tabIds` to it swaps the live tab list (a new array, as a
  * close or a spawn produces), so the hook's reconcile effect sees the change.
  */
-function mount(layoutId: string, tabIds: string[], assignments: ZoneAssignments) {
+function mount(
+  layoutId: string,
+  tabIds: string[],
+  assignments: ZoneAssignments,
+  layoutOrigin?: "auto" | "operator",
+) {
   harness.reset();
-  persisted.value = { layoutId, assignments, focusedZone: 0 };
+  // No origin by default: a page saved before the field, which reads as
+  // `operator` — never auto-trimmed, so a close keeps today's behaviour.
+  persisted.value = { layoutId, assignments, focusedZone: 0, layoutOrigin };
   let live = tabIds;
   function ZoneLayoutHost() {
     harness.beginRender();
@@ -161,7 +168,7 @@ describe("useZoneLayout — closing a flow-grid terminal hides no other terminal
     const after = without(before, "t3");
     render(after).setFocusedZone(9);
 
-    render().setLayoutId(FLOW_GRID_ID);
+    render().setLayoutId(FLOW_GRID_ID, { source: "operator" });
     const r = render();
     const expected = dense(before);
     delete expected[3];
@@ -169,6 +176,44 @@ describe("useZoneLayout — closing a flow-grid terminal hides no other terminal
     expect(r.layout.zones).toHaveLength(10);
     // Zone 9 is still rendered, so focus on it is not clamped away.
     expect(r.focusedZone).toBe(9);
+  });
+
+  it("an operator flow-grid closing to 9 tabs keeps its holes: nothing re-packs", () => {
+    const before = ids(10);
+    const render = mount(FLOW_GRID_ID, before, dense(before), "operator");
+    render();
+    const r = render(without(before, "t3"));
+    expect(r.layoutId).toBe(FLOW_GRID_ID);
+    const expected = dense(before);
+    delete expected[3];
+    expect(r.assignments).toStrictEqual(expected);
+  });
+
+  it("an AUTO flow-grid closing to 9 tabs trims to full-grid, survivors all drawn", () => {
+    // The runner grew this grid, so a close may shrink it (`zoneAutoTrim.ts`).
+    // t9 is compacted into the hole t3 left; its zone metadata follows it by
+    // tab (`useZoneLayout.autoTrim.test.ts` pins that half).
+    const before = ids(10);
+    const render = mount(FLOW_GRID_ID, before, dense(before), "auto");
+    render();
+    const after = without(before, "t3");
+    const r = render(after);
+    expect(r.layoutId).toBe("full-grid");
+    expect(r.layout.zones).toHaveLength(9);
+    expect(drawnNowhere(r, after)).toEqual([]);
+    expect(r.unassignedTabIds).toEqual([]);
+    const expected = dense(without(before, "t9"));
+    expected[3] = "t9";
+    expect(r.assignments).toStrictEqual(expected);
+  });
+
+  it("an AUTO flow-grid still at 10+ tabs stays flow-grid with its holes", () => {
+    const before = ids(12);
+    const render = mount(FLOW_GRID_ID, before, dense(before), "auto");
+    render();
+    const r = render(without(before, "t3"));
+    expect(r.layoutId).toBe(FLOW_GRID_ID);
+    expect(r.layout.zones).toHaveLength(12);
   });
 
   it("preset layouts are unchanged: a close leaves its zone empty and the size fixed", () => {

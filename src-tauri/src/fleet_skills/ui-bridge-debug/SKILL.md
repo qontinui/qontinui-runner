@@ -73,13 +73,18 @@ curl -s -X POST $BASE/control/element/<id>/action -H "Content-Type: application/
 **Read the element's verbs before acting.** Each element advertises the verbs it
 accepts in its `actions` list (`GET $BASE/control/element/<id>`, or the
 element's entry in the snapshot) — use one of those rather than guessing.
-Today an unknown verb is rejected with a 400 whose message is
-`Unknown action '<x>'. Supported actions: <list>` and whose context carries
-`supportedActions` — but that list is the runner's GLOBAL verb list, not this
-element's, and there is no suggestion. Runner builds carrying the verb-hint
-change will instead list the element's own accepted verbs and add
-`didYouMean` and `paramsHint` (e.g. `press` → `sendKeys` with
-`{"keys": ["Enter"]}`). Either way, the element's `actions` list is the answer.
+On the runner, when an enabled element advertises a list, a verb not on it is
+refused with a 400 naming that list (`hoverClick` also passes wherever `click`
+does; a malformed `type` request fails its own param check first):
+`supportedActions` for an unknown verb (`INVALID_REQUEST`), `supported_actions`
+for a built-in verb this element does not advertise (`ACTION_NOT_SUPPORTED`).
+The context can add `didYouMean`, a near-miss the element accepts (e.g. `press`
+→ `sendKeys`), and `paramsHint`, params for it. Check that a hint names the key
+you meant before copying it. An element advertising no list, or one the runner
+could not read, gets no such 400. A runner build older than qontinui-runner
+`6c88e5a37` instead answers an unknown verb with `Unknown action '<x>'.
+Supported actions: <list>`, where the list is the runner's GLOBAL verb list and
+there is no suggestion. Either way, the element's `actions` list is the answer.
 
 ### 4. Verify layout without screenshots
 

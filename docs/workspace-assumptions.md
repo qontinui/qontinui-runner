@@ -9,14 +9,14 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | class | rows | hits | unreviewed | fallback_correct | dev_only_surface | defect |
 |---|---:|---:|---:|---:|---:|---:|
 | `repo_layout` | 79 | 93 | 73 | 6 | 0 | 0 |
-| `dev_ports` | 27 | 27 | 26 | 0 | 1 | 0 |
+| `dev_ports` | 28 | 28 | 26 | 0 | 2 | 0 |
 | `supervisor_dependency` | 57 | 57 | 0 | 47 | 4 | 6 |
 | `tenant_literal` | 0 | 0 | 0 | 0 | 0 | 0 |
 | `machine_path` | 5 | 5 | 0 | 4 | 1 | 0 |
 | `fleet_host_name` | 0 | 0 | 0 | 0 | 0 | 0 |
 | `fleet_device_uuid` | 0 | 0 | 0 | 0 | 0 | 0 |
 | `plans_dir` | 34 | 35 | 34 | 0 | 0 | 0 |
-| `os_bound_tooling` | 98 | 99 | 96 | 2 | 0 | 0 |
+| `os_bound_tooling` | 100 | 101 | 96 | 4 | 0 | 0 |
 
 ## `repo_layout` (79 rows)
 
@@ -102,7 +102,7 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `src/workspace_paths.rs` | `persist_resolved_workspace_root` | `'paths.workspace_root' was left unset. Set $QONTINUI_ROOT (or the \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/workspace_paths.rs` | `runner_workspace_root` | `"env QONTINUI_ROOT / QONTINUI_WORKSPACE_ROOT / settings paths.workspace_root (runner_workspace_root)",` | 1 | unreviewed | `workspace_root` |
 
-## `dev_ports` (27 rows)
+## `dev_ports` (28 rows)
 
 | file | symbol | excerpt | n | disposition |
 |---|---|---|---:|---|
@@ -115,6 +115,7 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `src/mcp/origin_guard.rs` | `const DEFAULT_TRUSTED_ORIGINS` | `"http://localhost:3001",` | 1 | unreviewed |
 | `src/mcp/origin_guard.rs` | `const GRACE_ORIGINS` | `pub const GRACE_ORIGINS: &[&str] = &["http://localhost:3001", "http://127.0.0.1:3001"];` | 1 | dev_only_surface — The transitional dev-origin grace: only the qontinui-web dev frontend on :3001 is admitted at TRUSTED_DOOR_GRACE doors. A dev-only surface that no published build serves from that origin; plan 2026-09-17-retire-the-runner-origin-guard-dev-grace retires it (Phase 6 deletes the constant). |
 | `src/mcp/ui_bridge/exploration.rs` | `start_ui_bridge_exploration` | `Example: {{\"connection_url\": \"http://localhost:3001\", \"target_type\": \"web\"}}",` | 1 | unreviewed |
+| `src/pair.rs` | `BrowserPairPage::provenance` | `to override (local dev: http://localhost:3001)",` | 1 | dev_only_surface — Operator-facing provenance text for 'device pair --browser': it names the qontinui-web dev frontend on :3001 only as an example value for $QONTINUI_WEB_FRONTEND_BASE when the page origin was derived from the API base. Nothing dials it; the page URL comes from the env override or the API-base derivation (runner#2287). |
 | `src/reflection/workflow.rs` | `build_ui_bridge_agentic_prompt` | `- **Web relay health**: 'curl http://localhost:3001/api/ui-bridge/health' — is a browser tab connected? Are there SSE listeners?` | 1 | unreviewed |
 | `src/step_executor/handlers/ui_bridge.rs` | `UiBridgeHandler::execute` | `.unwrap_or("http://localhost:3001");` | 1 | unreviewed |
 | `src/step_output/script_emitter.rs` | `build_prompt_split` | `"outputPreview: \"State Recv-Q Send-Q Local Address:Port Peer Address:Port\\nLISTEN 0 128 0.0.0.0:22 0.0.0.0:*\\nLISTEN 0 128 *:443 *:*\\...` | 1 | unreviewed |
@@ -204,7 +205,7 @@ _No hits._
 
 | file | symbol | excerpt | n | disposition |
 |---|---|---|---:|---|
-| `src/commands/setup_wizard.rs` | `discover_claude_config_dirs` | `let claude_root = std::path::Path::new("C:\\claude");` | 1 | fallback_correct — Probes the fleet's C:\claude multi-account convention behind is_dir(); absent everywhere else, where CLAUDE_CONFIG_DIR and ~/.claude still apply. |
+| `src/commands/setup_wizard.rs` | `const WINDOWS_MULTI_ACCOUNT_ROOT` | `const WINDOWS_MULTI_ACCOUNT_ROOT: &str = "C:\\claude";` | 1 | fallback_correct — Probes the fleet's C:\claude multi-account convention, read only on the Windows discovery layout (DiscoveryLayout); an absent dir reads as no accounts. Elsewhere the configured roster, CLAUDE_CONFIG_DIR and ~/.claude apply. Moved from the discover_claude_config_dirs key when the literal became this const (qontinui-runner#2544); same disposition. |
 | `src/mcp/test_fixtures.rs` | `const DEFAULT_TEST_CONFIG_DIR` | `const DEFAULT_TEST_CONFIG_DIR: &str = "C:\\claude\\.claude-test-fixture";` | 1 | dev_only_surface — Debug-gated test-fixture injection endpoints for manual UI testing. |
 | `src/projects/snapshot.rs` | `const NOISE_PREFIXES` | `const NOISE_PREFIXES: [&str; 1] = ["c:\\claude\\"];` | 1 | fallback_correct — Filters the operator's C:\claude agent-scratch rows out of project attribution; on another box it filters nothing, which only leaves some noise rows in the view. |
 | `src/session_archive/discovery.rs` | `discover_account_homes_from_env` | `Some(PathBuf::from("C:\\claude")),` | 1 | fallback_correct — Probes C:/claude behind is_dir() on every platform, per its own doc comment; false everywhere else. |
@@ -257,7 +258,7 @@ _No hits._
 | `src/plans_dir_migration.rs` | `persist_env_plans_dir` | `let existing = get_setting::<PathSettings>().plans_dir;` | 1 | unreviewed |
 | `src/plans_dir_migration.rs` | `persist_env_plans_dir` | `update_setting::<PathSettings, _>(\|paths\| paths.plans_dir = Some(value.clone()))?;` | 1 | unreviewed |
 
-## `os_bound_tooling` (98 rows)
+## `os_bound_tooling` (100 rows)
 
 | file | symbol | excerpt | n | disposition |
 |---|---|---|---:|---|
@@ -330,6 +331,8 @@ _No hits._
 | `src/profile_cli.rs` | `read_user_path` | `cfg(windows)-only fn 'read_user_path' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/profile_cli.rs` | `write_user_path` | `cfg(windows)-only fn 'write_user_path' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/screen/dpi.rs` | `set_windows_dpi_awareness` | `cfg(windows)-only fn 'set_windows_dpi_awareness' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
+| `src/session/claude_hook.rs` | `const SHELL_PROGRAMS` | `"powershell",` | 1 | fallback_correct — Shell-name stems compared against the argv[0] of a spawn on every OS, never launched or required: the env-var carrier applies only where an interactive shell resolves 'claude' through the identity shim. pwsh/powershell are two entries among ten (bash, sh, zsh, fish, dash, ksh, cmd, nu); on a box without PowerShell they match nothing and the rest decide as before. |
+| `src/session/claude_hook.rs` | `const SHELL_PROGRAMS` | `"pwsh",` | 1 | fallback_correct — Shell-name stems compared against the argv[0] of a spawn on every OS, never launched or required: the env-var carrier applies only where an interactive shell resolves 'claude' through the identity shim. pwsh/powershell are two entries among ten (bash, sh, zsh, fish, dash, ksh, cmd, nu); on a box without PowerShell they match nothing and the rest decide as before. |
 | `src/session/tracking_health.rs` | `const WORK_CHILD_IMAGES` | `"powershell",` | 1 | fallback_correct — Process-IMAGE names compared against a session's direct children on every OS, never launched or required: a pwsh/powershell direct child (a shell a tool runs under) counts as WORK. On a box without PowerShell nothing matches, and the rest of child_signals_work decides as before. |
 | `src/session/tracking_health.rs` | `const WORK_CHILD_IMAGES` | `"pwsh",` | 1 | fallback_correct — Process-IMAGE names compared against a session's direct children on every OS, never launched or required: a pwsh/powershell direct child (a shell a tool runs under) counts as WORK. On a box without PowerShell nothing matches, and the rest of child_signals_work decides as before. |
 | `src/step_executor/handlers/check.rs` | `CheckHandler::execute` | `let mut c = crate::process_helpers::tokio_no_window("powershell");` | 1 | unreviewed |

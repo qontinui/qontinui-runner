@@ -150,6 +150,10 @@ pub async fn ui_bridge_session_handler(
 /// result and returns ONLY the projection in the `ApiResponse::success`
 /// envelope. On invoke error, returns the same error envelope the invoke
 /// handler returns (the raw payload is never leaked).
+///
+/// The body follows the invoke route's rule
+/// (`InvokeRequestBody::resolve_args`): a top-level key other than `args` is
+/// a 400 naming it, never silently dropped.
 pub async fn ui_bridge_observe_handler(
     State(state): State<Arc<ApiState>>,
     Path(command): Path<String>,
@@ -176,9 +180,13 @@ pub async fn ui_bridge_observe_handler(
     // across the IPC boundary to correlate on).
     let trace_seq = crate::outbound_trace::current_seq();
 
+    // Same body rule as invoke: a stray top-level key is resolved or refused,
+    // never dropped.
+    let args = body.resolve_args(&command)?;
+
     // Same round-trip as invoke; error envelope is returned verbatim (`?`).
     let raw = crate::mcp::ui_bridge_invoke_handlers::perform_invoke_round_trip(
-        &state, &command, &body.args, timeout_ms,
+        &state, &command, &args, timeout_ms,
     )
     .await?;
 

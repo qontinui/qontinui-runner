@@ -30,7 +30,7 @@ use reqwest::Method;
 use serde::Deserialize;
 use tracing::{debug, error, info, warn};
 
-use crate::mcp::app_dispatch::AppDispatcher;
+use crate::mcp::app_dispatch::{AppDispatcher, DispatchError};
 use crate::mcp::app_registry::{AppRegistry, AppTransport};
 use crate::mcp::envelope::UiBridgeJson;
 use crate::mcp::types::{api_error, api_error_detailed, ApiResponse, ApiState};
@@ -682,33 +682,14 @@ const SUPPORTED_ACTION_NAMES: &[&str] = &[
     "autocomplete",
 ];
 
-/// Validate a user-supplied action name against [`SUPPORTED_ACTION_NAMES`].
+/// True when `raw` names a built-in action: a member of
+/// [`SUPPORTED_ACTION_NAMES`], after trimming and matched case-sensitively.
 ///
-/// Returns the canonical action name on success (currently the input
-/// unchanged — case-sensitive match — but the indirection keeps the
-/// future option of accepting a kebab-case alias open without churning
-/// every caller).
-///
-/// On failure returns a structured [`UiBridgeError`] with
-/// `code = INVALID_REQUEST` and the full supported list in
-/// `context.supportedActions`, so the handler can build a 400 envelope
-/// that mirrors the `tab/activate` -> `knownTabs` prior art.
-///
-/// Split out from the handler as a pure helper so it's unit-testable
-/// without spinning up an `axum::Router` — see `validate_action_name_tests`
-/// below. This matches the seam established for
-/// `validate_wait_for_element_state_request` / `validate_tab_id`.
-pub(crate) fn validate_action_name(raw: &str) -> Result<&str, UiBridgeError> {
-    let trimmed = raw.trim();
-    if !trimmed.is_empty() && SUPPORTED_ACTION_NAMES.contains(&trimmed) {
-        return Ok(trimmed);
-    }
-    Err(UiBridgeError::invalid_action(
-        raw,
-        None,
-        SUPPORTED_ACTION_NAMES,
-        None,
-    ))
+/// This only classifies the verb. Rejecting one needs the element's own list,
+/// so the 400 is built by the deferred gate in `execute_action_dispatch`
+/// (`action_vocabulary::deferred_unknown_action_error`).
+pub(crate) fn is_builtin_action(raw: &str) -> bool {
+    SUPPORTED_ACTION_NAMES.contains(&raw.trim())
 }
 
 /// True when a `get_element` IPC reply is the frontend's "there is no such
@@ -935,7 +916,7 @@ fn advertise_custom_actions_in_element_response(data: &mut serde_json::Value) {
 /// `false` (don't accuse — degrade gracefully).
 ///
 /// Match semantics mirror `SUPPORTED_ACTION_NAMES` membership in
-/// `validate_action_name`: exact (case-sensitive) string equality. The SDK
+/// `is_builtin_action`: case-sensitive string equality, here untrimmed. The SDK
 /// emits canonical camelCase names in element metadata; aliases like
 /// `scroll_into_view` -> `scrollIntoView` are normalized SDK-side before the
 /// `actions` list is built, so an additional alias-fold here would be a
@@ -1091,7 +1072,7 @@ pub(crate) enum TypeParamError {
 /// NOT flow through `relay-handlers.ts::executeElementAction`, so the
 /// SDK-side gate alone is insufficient. Without this helper a malformed
 /// `{action:"type", params:{value:"foo"}}` request fell through the
-/// `validate_action_name` whitelist (`"type"` is a known action), reached
+/// `is_builtin_action` whitelist (`"type"` is a known action), reached
 /// `execute_action`, IPC-failed because the frontend's type handler needs
 /// `params.text`, then hit the Phase 5 `RecoveryExecutor::llm_fallback`
 /// which synthesized a non-null `commandChosen` and returned HTTP 200
@@ -1425,7 +1406,7 @@ async fn execute_action_dispatch(
     // -> RecoveryExecutor::llm_fallback, which synthesized a click on a
     // random "Active" button and returned HTTP 200 `success:true`
     // (verified empirically 2026-05-21). Mirrors the `tab/activate`
-    // -> `knownTabs` 400 envelope shape; see `validate_action_name`.
+    // -> `knownTabs` 400 envelope shape.
     //
     // BUT: `SUPPORTED_ACTION_NAMES` only enumerates the built-in dispatcher
     // vocabulary — it cannot know about app-registered **custom actions**
@@ -1438,7 +1419,7 @@ async fn execute_action_dispatch(
     // the element's `customActions` and rejects ("Unknown action") only when
     // the name is neither a built-in nor a registered custom action on THIS
     // element. Built-in behavior is unchanged.
-    let action_is_builtin = validate_action_name(&request.action).is_ok();
+    let action_is_builtin = is_builtin_action(&request.action);
 
     // ── Type-action param-shape gate ────────────────────────────────────
     // Reject `{action:"type", params:{value:"foo"}}` and `{action:"type",
@@ -1716,7 +1697,7 @@ async fn execute_action_dispatch(
     //
     // Without this gate, e.g. `scrollIntoView` against a `<button>` whose
     // actions are `["click", "focus", "blur"]` would:
-    //   1. pass the `validate_action_name` whitelist (scrollIntoView is a
+    //   1. pass the `is_builtin_action` whitelist (scrollIntoView is a
     //      runner-known action name),
     //   2. dispatch to IPC,
     //   3. IPC fail with whatever shape the SDK emits for "this element
@@ -2298,15 +2279,23 @@ pub(crate) async fn try_ws_dispatch_for_app(
         return None;
     }
     debug!(
-        "[ui-bridge/elements] {} via WS → app_id='{}' (path={})",
-        action, app_id, http_path
+        "[ui-bridge/elements] {} via WS → app_id='{}' (http equivalent: {} {})",
+        action, app_id, http_method, http_path
     );
-    Some(
-        dispatcher
-            .dispatch(app_id, action, http_method, http_path, payload)
-            .await
-            .map_err(|e| e.to_user_message()),
-    )
+    ws_route_outcome(dispatcher.dispatch_websocket(app_id, action, payload).await)
+}
+
+/// A WebSocket-only dispatch's result in [`try_ws_dispatch_for_app`]'s terms.
+/// A registration that turned HTTP since the caller's read is refused
+/// (`NotWebsocket`) rather than sent down the HTTP arm, and reads as "no WS
+/// entry" — the caller falls through, as it would had its read seen HTTP.
+fn ws_route_outcome(
+    result: Result<serde_json::Value, DispatchError>,
+) -> Option<Result<serde_json::Value, String>> {
+    match result {
+        Err(DispatchError::NotWebsocket(_)) => None,
+        result => Some(result.map_err(|e| e.to_user_message())),
+    }
 }
 
 /// Whose components a `GET /ui-bridge/control/components` read returns.
@@ -2399,14 +2388,10 @@ async fn ws_collect_components(
             continue;
         }
         let app_id = entry.app.app_id.clone();
+        // WebSocket ONLY: an app that turned HTTP since `list_live` is refused,
+        // not sent a WebSocket command down the HTTP arm.
         match dispatcher
-            .dispatch(
-                &app_id,
-                "getComponents",
-                Method::GET,
-                "/ui-bridge/control/components",
-                serde_json::json!({}),
-            )
+            .dispatch_websocket(&app_id, "getComponents", serde_json::json!({}))
             .await
         {
             Ok(value) => {
@@ -2423,6 +2408,13 @@ async fn ws_collect_components(
                     // Single-component object — push as-is.
                     out.push(value);
                 }
+            }
+            // Expected, not a failure: the app turned HTTP mid fan-out.
+            Err(DispatchError::NotWebsocket(_)) => {
+                debug!(
+                    "[ui-bridge/elements] getComponents skipped '{}': no longer WS-registered",
+                    app_id
+                );
             }
             Err(e) => {
                 warn!(
@@ -2677,15 +2669,10 @@ pub async fn ui_bridge_execute_component_action_handler(
     Path((id, action_id)): Path<(String, String)>,
     request: UiBridgeJson<UIBridgeComponentActionRequest>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    // Which app the action lands on: a WS wrapper registered under the
-    // component id owns it (see `component_action_dispatch`); otherwise the
-    // runner's own webview does. Read before dispatch, from the same registry
-    // lookup the dispatch makes.
-    let app_id = match state.app_registry.get_live(&id).await {
-        Some(entry) if entry.transport == AppTransport::Websocket => id.clone(),
-        _ => crate::spec_api::storage::RUNNER_APP_ID.to_string(),
-    };
-    let result = component_action_dispatch(
+    // Which app the action landed on — a WS wrapper registered under the
+    // component id, else the runner's own webview — as the dispatch itself
+    // routed it, not from a second registry read that could disagree.
+    let (app_id, result) = component_action_dispatch(
         State(Arc::clone(&state)),
         Path((id.clone(), action_id.clone())),
         request,
@@ -2707,13 +2694,17 @@ pub async fn ui_bridge_execute_component_action_handler(
     result
 }
 
+type ComponentActionResult =
+    Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)>;
+
 /// The body of [`ui_bridge_execute_component_action_handler`], split out so
-/// the journey capture sees every exit in one place.
+/// the journey capture sees every exit in one place. Returns the app the
+/// action was routed to beside its result.
 async fn component_action_dispatch(
     State(state): State<Arc<ApiState>>,
     Path((id, action_id)): Path<(String, String)>,
     UiBridgeJson(request): UiBridgeJson<UIBridgeComponentActionRequest>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+) -> (String, ComponentActionResult) {
     info!(
         "UI Bridge API: Executing action {} on component {}",
         action_id, id
@@ -2741,12 +2732,25 @@ async fn component_action_dispatch(
     )
     .await
     {
-        return match ws_outcome {
+        let result = match ws_outcome {
             Ok(value) => Ok(Json(ApiResponse::success(value))),
             Err(e) => Err(ws_dispatch_error_response(e)),
         };
+        return (id, result);
     }
+    (
+        crate::spec_api::storage::RUNNER_APP_ID.to_string(),
+        component_action_ipc(&state, &id, &action_id, payload).await,
+    )
+}
 
+/// [`component_action_dispatch`]'s IPC arm: the runner's own webview.
+async fn component_action_ipc(
+    state: &Arc<ApiState>,
+    id: &str,
+    action_id: &str,
+    payload: serde_json::Value,
+) -> ComponentActionResult {
     // Iter-3 item 4 — detect "component not found" / "action not found"
     // inner-failure shapes BEFORE wrap_ipc_result flattens them to the
     // default INTERNAL_ERROR envelope. The frontend's
@@ -2757,7 +2761,7 @@ async fn component_action_dispatch(
     // `ELEMENT_NOT_FOUND` taxonomy entry (the closest available — the
     // canonical schema has no `UB-COMPONENT-NOT-AVAILABLE` yet) instead
     // of being misclassified as a transport-level INTERNAL_ERROR.
-    let ipc_result = ui_bridge_request_sync(&state, "execute_component_action", payload).await;
+    let ipc_result = ui_bridge_request_sync(state, "execute_component_action", payload).await;
     if let Ok(ref data) = ipc_result {
         if data.get("success").and_then(|v| v.as_bool()) == Some(false) {
             let error_msg = data.get("error").and_then(|v| v.as_str()).unwrap_or("");
@@ -2769,7 +2773,7 @@ async fn component_action_dispatch(
                 && (error_msg.to_lowercase().contains("not found")
                     || error_msg.to_lowercase().contains("unknown"));
             if is_component_missing {
-                let detail = UiBridgeError::element_not_found(&id);
+                let detail = UiBridgeError::element_not_found(id);
                 let message = format!("Component not found: {}", id);
                 return Err((
                     StatusCode::NOT_FOUND,
@@ -5653,16 +5657,25 @@ mod components_envelope_tests {
 mod ws_dispatch_selection_tests {
     use super::{
         components_read, try_ws_dispatch_for_app, ws_collect_components, ws_components_for,
-        ComponentSources,
+        ws_route_outcome, ComponentSources,
     };
     use crate::mcp::app_discovery::DiscoveredApp;
-    use crate::mcp::app_dispatch::AppDispatcher;
+    use crate::mcp::app_dispatch::{AppDispatcher, DispatchError};
     use crate::mcp::app_registry::{AppRegistry, AppTransport};
     use crate::mcp::command_relay::{CommandRelay, CommandResponse};
     use crate::mcp::ws_relay::WsConnectionManager;
     use reqwest::Method;
     use serde_json::json;
     use std::time::Duration;
+
+    #[test]
+    fn a_route_that_is_no_longer_websocket_falls_through() {
+        let flipped = ws_route_outcome(Err(DispatchError::NotWebsocket("w".into())));
+        assert_eq!(flipped, None);
+        let failed = ws_route_outcome(Err(DispatchError::NotRegistered("w".into())));
+        assert!(matches!(failed, Some(Err(_))), "{failed:?}");
+        assert_eq!(ws_route_outcome(Ok(json!(1))), Some(Ok(json!(1))));
+    }
 
     /// m8: a dispatch REFRESHES the row it dispatches to.
     ///
@@ -6435,93 +6448,56 @@ mod ws_dispatch_selection_tests {
 }
 
 #[cfg(test)]
-mod validate_action_name_tests {
-    //! Validation seam for the invalid-action gate that lives at the top of
-    //! `ui_bridge_execute_action_handler`. Exercises the pure helper so we
-    //! don't need an axum router / live IPC harness — matches the precedent
-    //! set by `validate_wait_for_element_state_request` /
-    //! `validate_tab_id`. Locks down both the accept-list (every known
-    //! action round-trips) and the reject-shape (`INVALID_REQUEST` code +
-    //! `supportedActions` context payload) so a future rename can't
-    //! silently let `press` through to the RecoveryExecutor again.
-    use super::{validate_action_name, SUPPORTED_ACTION_NAMES};
-    use crate::mcp::ui_bridge::types::UiBridgeErrorCode;
+mod is_builtin_action_tests {
+    //! The verb classifier behind the invalid-action gate in
+    //! `ui_bridge_execute_action_handler`. Locks down the accept-list so a
+    //! future rename can't silently let `press` through to the
+    //! RecoveryExecutor again. The 400 a non-built-in verb gets is the deferred
+    //! gate's, tested in `action_vocabulary`.
+    use super::is_builtin_action;
 
+    /// Literal names, so a rename in `SUPPORTED_ACTION_NAMES` fails here.
     #[test]
-    fn every_supported_action_is_accepted() {
-        for name in SUPPORTED_ACTION_NAMES {
-            let got = validate_action_name(name)
-                .unwrap_or_else(|_| panic!("expected {name} to validate"));
-            assert_eq!(got, *name, "validator must return the canonical name");
+    fn the_core_verbs_are_builtin() {
+        for name in [
+            "click",
+            "hoverClick",
+            "doubleClick",
+            "type",
+            "sendKeys",
+            "focus",
+            "hover",
+            "scrollIntoView",
+            "scroll_into_view",
+        ] {
+            assert!(is_builtin_action(name), "expected {name} to be built-in");
         }
     }
 
     #[test]
-    fn canonical_click_round_trips() {
-        // Sanity check the click path explicitly — it's the dominant call
-        // site and the one most likely to regress under refactor.
-        assert_eq!(validate_action_name("click").unwrap(), "click");
+    fn surrounding_whitespace_is_trimmed() {
+        assert!(is_builtin_action("  click "));
     }
 
     #[test]
-    fn unknown_action_is_rejected_with_invalid_request_code() {
-        let err = validate_action_name("press").expect_err("press must not be accepted");
-        assert!(
-            matches!(err.code, UiBridgeErrorCode::InvalidRequest),
-            "expected INVALID_REQUEST code, got {:?}",
-            err.code
-        );
-        assert!(
-            err.message.contains("press"),
-            "message must surface the rejected name, got: {}",
-            err.message
-        );
+    fn unknown_action_is_not_builtin() {
+        assert!(!is_builtin_action("press"));
+        assert!(!is_builtin_action("slap"));
     }
 
     #[test]
-    fn unknown_action_carries_supported_list_in_context() {
-        let err = validate_action_name("slap").expect_err("slap must not be accepted");
-        let ctx = err.context.as_ref().expect("context must be present");
-        let supported = ctx
-            .get("supportedActions")
-            .and_then(|v| v.as_array())
-            .expect("supportedActions must be an array");
-        let names: Vec<&str> = supported.iter().filter_map(|v| v.as_str()).collect();
-        // Spot-check a couple of canonical names — full equality with
-        // SUPPORTED_ACTION_NAMES is locked down by
-        // `every_supported_action_is_accepted` above.
-        assert!(names.contains(&"click"), "supportedActions must list click");
-        assert!(names.contains(&"type"), "supportedActions must list type");
-        assert!(
-            names.contains(&"scrollIntoView"),
-            "supportedActions must list scrollIntoView"
-        );
-        // And the offending name is echoed back so callers don't have to
-        // remember what they sent.
-        assert_eq!(ctx.get("action").and_then(|v| v.as_str()), Some("slap"));
-    }
-
-    #[test]
-    fn empty_action_is_rejected() {
-        let err = validate_action_name("").expect_err("empty action must be rejected");
-        assert!(matches!(err.code, UiBridgeErrorCode::InvalidRequest));
-    }
-
-    #[test]
-    fn whitespace_only_action_is_rejected() {
-        // Trim-then-check semantics: a body whose `action` field is `"   "`
-        // is the same misuse as an empty string.
-        let err = validate_action_name("   ").expect_err("whitespace-only action must be rejected");
-        assert!(matches!(err.code, UiBridgeErrorCode::InvalidRequest));
+    fn empty_and_whitespace_only_actions_are_not_builtin() {
+        // A body whose `action` field is `"   "` is the same misuse as `""`.
+        assert!(!is_builtin_action(""));
+        assert!(!is_builtin_action("   "));
     }
 
     #[test]
     fn case_sensitive_match_is_enforced() {
-        // `Click` (capital C) is NOT in the SDK vocabulary; rejecting it
-        // here matches what the wrapper SDK's relay-handlers.ts would do
+        // `Click` (capital C) is NOT in the SDK vocabulary; not classifying it
+        // as built-in matches what the wrapper SDK's relay-handlers.ts would do
         // and prevents downstream "no handler" silent failures.
-        let err = validate_action_name("Click").expect_err("Click must not be accepted");
-        assert!(matches!(err.code, UiBridgeErrorCode::InvalidRequest));
+        assert!(!is_builtin_action("Click"));
     }
 }
 

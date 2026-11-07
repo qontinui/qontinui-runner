@@ -345,10 +345,16 @@ impl CgroupDispatch {
         KillPath::Incomplete
     }
 
+    /// The kernel's cumulative `oom_kill` count for this dispatch's cgroup;
+    /// `None` when `memory.events` is unreadable (UNKNOWN, never 0).
+    pub(crate) fn oom_kill_count(&self) -> Option<u64> {
+        parse_oom_kill(&fs::read_to_string(self.dir.join("memory.events")).ok()?)
+    }
+
     /// `oom_kill` events not yet reported, as a log line; `None` when there
     /// are none (or `memory.events` is unreadable).
     pub(crate) fn take_oom_note(&self) -> Option<String> {
-        let n = parse_oom_kill(&fs::read_to_string(self.dir.join("memory.events")).ok()?)?;
+        let n = self.oom_kill_count()?;
         let prev = self.oom_reported.swap(n, Ordering::Relaxed);
         (n > prev).then(|| {
             format!(
@@ -375,7 +381,11 @@ impl Drop for CgroupDispatch {
     /// Kill strays, then `rmdir`. The kernel keeps a cgroup until its last
     /// process is reaped, so a first `rmdir` can fail EBUSY; the retries run
     /// on a detached thread so this (async-context) drop never sleeps. A
-    /// leftover empty directory is reused or removed by a later run.
+    /// leftover empty directory is removed only if the SAME dispatch id runs
+    /// again (`create_in`); otherwise it stays until the unit's cgroup is
+    /// torn down (systemd removes a delegated subtree when the unit stops).
+    /// Under a `QONTINUI_CI_CGROUP_ROOT` systemd does not manage, nothing
+    /// removes it: dispatch ids are not reused.
     fn drop(&mut self) {
         self.kill();
         match fs::remove_dir(&self.dir) {
