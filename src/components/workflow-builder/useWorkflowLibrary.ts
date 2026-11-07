@@ -1,4 +1,5 @@
 import { useState, useCallback, useEffect, useMemo, useRef } from "react";
+import { skillExportNotice, skillImportNotice } from "./skillTransferNotice";
 import type { UnifiedWorkflow, WorkflowExport } from "../../types";
 import { registerUserSkills } from "@qontinui/workflow-utils";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
@@ -292,6 +293,7 @@ export function useWorkflowLibrary(
       const data = await response.json();
       if (data.success && data.data) {
         const exportData = data.data;
+        setWorkflowImportError(skillExportNotice(exportData.withheld));
         const blob = new Blob([JSON.stringify(exportData, null, 2)], {
           type: "application/json",
         });
@@ -304,6 +306,7 @@ export function useWorkflowLibrary(
         URL.revokeObjectURL(url);
       } else {
         console.error("Failed to export skills:", data.error);
+        setWorkflowImportError(`Skill export failed: ${data.error ?? "unknown error"}`);
       }
     } catch (error) {
       console.error("Failed to export skills:", error);
@@ -355,6 +358,7 @@ export function useWorkflowLibrary(
       const result = await response.json();
       if (result.success && result.data) {
         const { imported, skipped, overwritten, errors } = result.data;
+        setWorkflowImportError(skillImportNotice(result.data));
         log.debug(
           `Skills imported: ${imported}, skipped: ${skipped}, overwritten: ${overwritten}`,
           errors.length > 0 ? `Errors: ${errors.join(", ")}` : "",
@@ -373,6 +377,7 @@ export function useWorkflowLibrary(
         }
       } else {
         console.error("Failed to import skills:", result.error);
+        setWorkflowImportError(`Skill import failed: ${result.error ?? "unknown error"}`);
       }
     } catch (error) {
       console.error("Failed to import skills:", error);

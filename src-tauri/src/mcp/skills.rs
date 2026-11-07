@@ -153,6 +153,10 @@ pub struct SyncPushResult {
     pub pushed: usize,
     pub failed: usize,
     pub errors: Vec<String>,
+    /// Local skills not pushed because their stored template does not parse:
+    /// pushing the served fallback would publish an empty skill to the org.
+    /// Not in `errors` and not counted in `failed`.
+    pub withheld: Vec<crate::skills::WithheldSkill>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -305,11 +309,7 @@ pub async fn update_skill(
     }
 }
 
-/// The machine-readable code on the refusal of a rewrite (update, fork) of a
-/// skill whose stored template does not parse.
-const STORED_SKILL_TEMPLATE_UNPARSEABLE: &str = "STORED_SKILL_TEMPLATE_UNPARSEABLE";
-
-/// The HTTP answer for a skill rewrite (update, fork) that wrote nothing: no
+/// The HTTP answer for a skill rewrite (update, fork, version bump) that wrote nothing: no
 /// such skill is 404, a stored template that does not parse is a typed 409
 /// (the row's state, not the request, is what prevents the rewrite), and a
 /// database failure is 500.
@@ -325,7 +325,7 @@ fn skill_rewrite_failure(
             StatusCode::CONFLICT,
             Json(ApiResponse::error_with_code(
                 message,
-                STORED_SKILL_TEMPLATE_UNPARSEABLE,
+                crate::skills::STORED_SKILL_TEMPLATE_UNPARSEABLE,
             )),
         ),
         SkillRewriteError::Failed(_) => {
@@ -419,7 +419,10 @@ pub async fn export_skills(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<ExportSkillsRequest>,
 ) -> Result<Json<ApiResponse<crate::skills::SkillExport>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let mut skills = match state
+    let crate::database::pg::skills::ExportableUserSkills {
+        mut skills,
+        withheld,
+    } = match state
         .app_state
         .pg_db
         .export_user_skills(&request.skill_ids)
@@ -433,6 +436,14 @@ pub async fn export_skills(
             ))
         }
     };
+    for w in &withheld {
+        tracing::warn!(
+            skill_id = %w.skill_id,
+            code = %w.code,
+            error = %w.error,
+            "skills export: withheld a skill whose stored template does not parse"
+        );
+    }
 
     // Compute individual skill checksums for any that don't have one
     for skill in &mut skills {
@@ -456,55 +467,37 @@ pub async fn export_skills(
     Ok(Json(ApiResponse::success(crate::skills::SkillExport {
         manifest,
         skills,
+        withheld,
     })))
 }
 
-/// Read an import request body, refusing the whole import with a typed 422
-/// (`code: PLAYBOOK_TEMPLATE_RETIRED`) when any skill in it has a template of
-/// the retired `playbook` kind. The refusal reads the RAW body, before typed
-/// deserialization, which would otherwise answer serde's bare
-/// `unknown variant`. A body that is not otherwise a valid import request is a
-/// 422 `INVALID_REQUEST`.
+/// Read an import request body, refusing each skill whose template is of the
+/// retired `playbook` kind with its typed reason
+/// ([`crate::skills::SkillIntakeRefusal`]) and keeping the rest. The refusal
+/// reads the RAW body, before typed deserialization, which would otherwise fail
+/// the whole request with serde's bare `unknown variant`. A body that is not
+/// otherwise a valid import request is a 422 `INVALID_REQUEST`.
 fn import_request_from_body(
-    body: Value,
-) -> Result<ImportSkillsRequest, (StatusCode, Json<ApiResponse<()>>)> {
-    let refusals: Vec<crate::skills::SkillIntakeRefusal> = body
-        .get("skills")
-        .and_then(Value::as_array)
-        .map(|skills| {
-            skills
-                .iter()
-                .filter_map(crate::skills::refuse_retired_template)
-                .collect()
-        })
-        .unwrap_or_default();
-    if let Some(first) = refusals.first() {
-        let skills = refusals
-            .iter()
-            .map(|r| format!("`{}`", r.skill()))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let message = format!(
-            "Import refused, nothing was imported: {skills} {} a template of the retired \
-             `playbook` kind, which this runner no longer loads or runs.",
-            if refusals.len() == 1 { "has" } else { "have" },
+    mut body: Value,
+) -> Result<
+    (ImportSkillsRequest, Vec<crate::skills::SkillIntakeRefusal>),
+    (StatusCode, Json<ApiResponse<()>>),
+> {
+    let mut refused = Vec::new();
+    if let Some(skills) = body.get_mut("skills").and_then(Value::as_array_mut) {
+        skills.retain(
+            |skill| match crate::skills::refuse_retired_template(skill) {
+                Some(refusal) => {
+                    refused.push(refusal);
+                    false
+                }
+                None => true,
+            },
         );
-        return Err((
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(ApiResponse::error_with_code_and_suggestions(
-                message,
-                first.code(),
-                vec![
-                    "Remove the playbook-kind skills from the import and send the rest."
-                        .to_string(),
-                    "Put each playbook's knowledge in a `.qontinui/contexts/*.md` file instead."
-                        .to_string(),
-                ],
-            )),
-        ));
     }
-    serde_json::from_value(body)
-        .map_err(|e| crate::mcp::envelope::envelope_422(format!("Invalid import request: {e}")))
+    let request = serde_json::from_value(body)
+        .map_err(|e| crate::mcp::envelope::envelope_422(format!("Invalid import request: {e}")))?;
+    Ok((request, refused))
 }
 
 /// Import skills from a shared export
@@ -513,7 +506,14 @@ pub async fn import_skills(
     Json(body): Json<Value>,
 ) -> Result<Json<ApiResponse<crate::skills::SkillImportResult>>, (StatusCode, Json<ApiResponse<()>>)>
 {
-    let request = import_request_from_body(body)?;
+    let (request, refused) = import_request_from_body(body)?;
+    for refusal in &refused {
+        tracing::warn!(
+            skill = refusal.skill(),
+            code = refusal.code(),
+            "skills import: refused a skill: {refusal}"
+        );
+    }
     let mut checksum_warnings: Vec<String> = Vec::new();
 
     // Verify export checksum if manifest is present
@@ -542,6 +542,7 @@ pub async fn import_skills(
     {
         Ok(mut result) => {
             result.warnings.extend(checksum_warnings);
+            result.refused = refused;
             Ok(Json(ApiResponse::success(result)))
         }
         Err(e) => Err((
@@ -631,7 +632,10 @@ pub async fn sync_push(
     Json(req): Json<SyncPushRequest>,
 ) -> Result<Json<ApiResponse<SyncPushResult>>, (StatusCode, Json<ApiResponse<()>>)> {
     // Export skills from local DB
-    let mut skills = match state
+    let crate::database::pg::skills::ExportableUserSkills {
+        mut skills,
+        withheld,
+    } = match state
         .app_state
         .pg_db
         .export_user_skills(&req.skill_ids)
@@ -645,12 +649,26 @@ pub async fn sync_push(
             ))
         }
     };
+    for w in &withheld {
+        tracing::warn!(
+            skill_id = %w.skill_id,
+            code = %w.code,
+            error = %w.error,
+            "skills sync push: withheld a skill whose stored template does not parse"
+        );
+    }
 
     if skills.is_empty() {
+        let errors = if withheld.is_empty() {
+            vec!["No user skills found to push".to_string()]
+        } else {
+            Vec::new()
+        };
         return Ok(Json(ApiResponse::success(SyncPushResult {
             pushed: 0,
             failed: 0,
-            errors: vec!["No user skills found to push".to_string()],
+            errors,
+            withheld,
         })));
     }
 
@@ -713,6 +731,7 @@ pub async fn sync_push(
         pushed,
         failed: errors.len(),
         errors,
+        withheld,
     })))
 }
 
@@ -890,8 +909,10 @@ pub async fn bump_version(
         ));
     }
 
-    // Get the current skill
-    let skill = match state.app_state.pg_db.get_user_skill(&id).await {
+    // Get the current skill. Read through the rewrite gate: the checksum is
+    // computed over the template, and over the served fallback it would be
+    // the checksum of a skill that is not the stored one.
+    let skill = match state.app_state.pg_db.get_user_skill_for_rewrite(&id).await {
         Ok(Some(s)) => s,
         Ok(None) => {
             return Err((
@@ -899,12 +920,7 @@ pub async fn bump_version(
                 Json(api_error(format!("Skill not found: {}", id))),
             ))
         }
-        Err(e) => {
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!("Failed to get skill: {}", e))),
-            ))
-        }
+        Err(e) => return Err(skill_rewrite_failure("bump the version of", e)),
     };
 
     let current_version = skill.version.as_deref().unwrap_or("1.0.0");
@@ -1097,49 +1113,49 @@ mod tests {
         serde_json::json!({"kind": "playbook", "content": "x"})
     }
 
-    /// Import refuses the WHOLE request, typed, when any skill in it has a
-    /// `playbook` template, naming every refused skill; nothing is imported.
+    /// Import refuses each `playbook`-kind skill with its typed reason and
+    /// keeps the rest: the live skill deserializes for import, the refused
+    /// ones are named by slug, and neither is filed as the other.
     #[test]
-    fn import_refuses_a_playbook_template_with_a_typed_422() {
+    fn import_refuses_each_playbook_template_by_type_and_keeps_the_rest() {
         let body = serde_json::json!({"skills": [
             skill_item("lint", single_step()),
             skill_item("sf-login", playbook()),
             skill_item("crm-notes", playbook()),
         ]});
-        let (status, json) = super::import_request_from_body(body)
-            .expect_err("a playbook template refuses the import");
-        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-        let json = serde_json::to_value(&json.0).unwrap();
-        assert_eq!(json["success"], false);
-        assert_eq!(json["code"], "PLAYBOOK_TEMPLATE_RETIRED");
-        let error = json["error"].as_str().expect("error message");
-        assert!(error.contains("`sf-login`, `crm-notes`"), "{error}");
-        assert!(error.contains("nothing was imported"), "{error}");
-        assert!(
-            !error.contains("`lint`"),
-            "a live skill is not named: {error}"
+        let (request, refused) =
+            super::import_request_from_body(body).expect("the live skill still imports");
+        let kept: Vec<&str> = request.skills.iter().map(|s| s.slug.as_str()).collect();
+        assert_eq!(kept, ["lint"]);
+        assert_eq!(
+            refused,
+            vec![
+                crate::skills::SkillIntakeRefusal::PlaybookTemplateRetired {
+                    skill: "sf-login".to_string()
+                },
+                crate::skills::SkillIntakeRefusal::PlaybookTemplateRetired {
+                    skill: "crm-notes".to_string()
+                },
+            ]
         );
-        let suggestions = json["suggestions"].as_array().expect("suggestions");
-        assert!(
-            suggestions.iter().any(|s| s
-                .as_str()
-                .is_some_and(|s| s.contains(".qontinui/contexts/"))),
-            "{suggestions:?}"
-        );
+        let wire = serde_json::to_value(&refused).unwrap();
+        assert_eq!(wire[0]["code"], "PLAYBOOK_TEMPLATE_RETIRED");
+        assert_eq!(wire[0]["skill"], "sf-login");
     }
 
     /// Control arms of the same door: an import with no playbook template
-    /// deserializes as before, and a body that is not an import request is a
-    /// typed 422 INVALID_REQUEST rather than the playbook refusal.
+    /// deserializes as before with nothing refused, and a body that is not an
+    /// import request is a typed 422 INVALID_REQUEST.
     #[test]
     fn import_without_a_playbook_template_reads_as_before() {
-        let request = super::import_request_from_body(serde_json::json!({"skills": [
+        let (request, refused) = super::import_request_from_body(serde_json::json!({"skills": [
             skill_item("lint", single_step())
         ]}))
         .expect("a live template imports");
         assert_eq!(request.skills.len(), 1);
         assert_eq!(request.skills[0].slug, "lint");
         assert_eq!(request.conflict_mode, "skip");
+        assert!(refused.is_empty(), "{refused:?}");
 
         let (status, json) = super::import_request_from_body(serde_json::json!({"skill": []}))
             .expect_err("no `skills` array is not an import request");
@@ -1185,7 +1201,7 @@ mod tests {
         );
     }
 
-    /// Each way a rewrite (update, fork) can write nothing has its own status:
+    /// Each way a rewrite (update, fork, version bump) can write nothing has its own status:
     /// no skill 404, a stored template that does not parse a typed 409, a
     /// database failure 500.
     #[test]

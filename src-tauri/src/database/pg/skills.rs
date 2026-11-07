@@ -45,7 +45,8 @@ fn stored_template_or_fallback(skill_id: &str, raw: &str) -> SkillTemplate {
     })
 }
 
-/// Why [`PgDb::update_user_skill`] or [`PgDb::fork_skill`] wrote nothing.
+/// Why a rewrite of a stored skill ([`PgDb::update_user_skill`],
+/// [`PgDb::fork_skill`], a version bump) wrote nothing.
 #[derive(Debug, thiserror::Error)]
 pub enum SkillRewriteError {
     /// No user skill has the id.
@@ -73,6 +74,14 @@ fn require_parseable_stored_template(skill_id: &str, raw: &str) -> Result<(), Sk
             error: e.to_string(),
         }
     })
+}
+
+/// What an outbound door (export, sync push) may send: the stored skills
+/// whose templates parse, and the ones withheld because theirs does not.
+#[derive(Debug, Default)]
+pub struct ExportableUserSkills {
+    pub skills: Vec<SkillDefinition>,
+    pub withheld: Vec<crate::skills::WithheldSkill>,
 }
 
 /// Map a Clorinde row to SkillDefinition.
@@ -149,59 +158,94 @@ macro_rules! row_to_skill {
     }};
 }
 
+/// Partition stored rows for an outbound door, keeping only the ids asked for
+/// (every row when `ids` is empty). A row whose stored template does not parse
+/// is WITHHELD rather than served: the read fallback is an empty
+/// `single_step`, and sending that on would hand an empty skill to the next
+/// runner as if it were the stored one.
+fn partition_for_export(
+    rows: Vec<qontinui_db::queries::skills::ListUserSkills>,
+    ids: &[String],
+) -> ExportableUserSkills {
+    let mut out = ExportableUserSkills::default();
+    for r in rows {
+        if !ids.is_empty() && !ids.contains(&r.id) {
+            continue;
+        }
+        match parse_stored_template(&r.template) {
+            Ok(_) => out.skills.push(row_to_skill!(r)),
+            Err(e) => out
+                .withheld
+                .push(crate::skills::WithheldSkill::unparseable(&r.id, e)),
+        }
+    }
+    out
+}
+
 impl PgDb {
     /// List all user skills.
     pub async fn list_user_skills(&self) -> Result<Vec<SkillDefinition>, String> {
+        Ok(self
+            .list_user_skill_rows()
+            .await?
+            .into_iter()
+            .map(|r| row_to_skill!(r))
+            .collect())
+    }
+
+    /// Every stored user-skill row, as stored.
+    async fn list_user_skill_rows(
+        &self,
+    ) -> Result<Vec<qontinui_db::queries::skills::ListUserSkills>, String> {
         let conn = self
             .pool
             .get()
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
-        let rows = qontinui_db::queries::skills::list_user_skills()
+        qontinui_db::queries::skills::list_user_skills()
             .bind(&conn)
             .all()
             .await
-            .map_err(|e| crate::database::pg::pg_err("PG list_user_skills", &e))?;
-        Ok(rows.into_iter().map(|r| row_to_skill!(r)).collect())
+            .map_err(|e| crate::database::pg::pg_err("PG list_user_skills", &e))
     }
 
     /// Get a single user skill by ID.
     pub async fn get_user_skill(&self, id: &str) -> Result<Option<SkillDefinition>, String> {
+        Ok(self.get_user_skill_row(id).await?.map(|r| row_to_skill!(r)))
+    }
+
+    /// One stored user-skill row by id, as stored.
+    async fn get_user_skill_row(
+        &self,
+        id: &str,
+    ) -> Result<Option<qontinui_db::queries::skills::GetUserSkill>, String> {
         let conn = self
             .pool
             .get()
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
-        let row = qontinui_db::queries::skills::get_user_skill()
+        qontinui_db::queries::skills::get_user_skill()
             .bind(&conn, &id)
             .opt()
             .await
-            .map_err(|e| crate::database::pg::pg_err("PG get_user_skill", &e))?;
-        Ok(row.map(|r| row_to_skill!(r)))
+            .map_err(|e| crate::database::pg::pg_err("PG get_user_skill", &e))
     }
 
     /// Read one user skill for a REWRITE ([`Self::update_user_skill`],
-    /// [`Self::fork_skill`]): `Ok(None)` when no row has the id, and
-    /// [`SkillRewriteError::UnparseableStoredTemplate`] when the row's stored
-    /// template does not parse, because the definition [`Self::get_user_skill`]
-    /// would hand back carries the fallback rather than what is stored.
-    async fn get_user_skill_for_rewrite(
+    /// [`Self::fork_skill`], the version bump): `Ok(None)` when no row has the
+    /// id, and [`SkillRewriteError::UnparseableStoredTemplate`] when the row's
+    /// stored template does not parse, because the definition
+    /// [`Self::get_user_skill`] would hand back carries the fallback rather
+    /// than what is stored.
+    pub(crate) async fn get_user_skill_for_rewrite(
         &self,
         id: &str,
     ) -> Result<Option<SkillDefinition>, SkillRewriteError> {
-        let conn = self
-            .pool
-            .get()
+        let Some(r) = self
+            .get_user_skill_row(id)
             .await
-            .map_err(|e| SkillRewriteError::Failed(format!("PG pool error: {}", e)))?;
-        let row = qontinui_db::queries::skills::get_user_skill()
-            .bind(&conn, &id)
-            .opt()
-            .await
-            .map_err(|e| {
-                SkillRewriteError::Failed(crate::database::pg::pg_err("PG get_user_skill", &e))
-            })?;
-        let Some(r) = row else {
+            .map_err(SkillRewriteError::Failed)?
+        else {
             return Ok(None);
         };
         require_parseable_stored_template(&r.id, &r.template)?;
@@ -436,6 +480,7 @@ impl PgDb {
             overwritten,
             errors,
             warnings: Vec::new(),
+            refused: Vec::new(),
         })
     }
 
@@ -521,15 +566,15 @@ impl PgDb {
             })
     }
 
-    /// Export user skills. If `ids` is empty, exports all.
-    pub async fn export_user_skills(&self, ids: &[String]) -> Result<Vec<SkillDefinition>, String> {
-        if ids.is_empty() {
-            return self.list_user_skills().await;
-        }
-
-        // Filter from full list for simplicity (PG doesn't have dynamic IN-clause easily)
-        let all = self.list_user_skills().await?;
-        Ok(all.into_iter().filter(|s| ids.contains(&s.id)).collect())
+    /// The user skills an outbound door (export, sync push) may send; every
+    /// one when `ids` is empty. A skill whose stored template does not parse
+    /// is withheld, not sent ([`partition_for_export`]).
+    pub async fn export_user_skills(&self, ids: &[String]) -> Result<ExportableUserSkills, String> {
+        // Filtered in Rust: the generated query has no dynamic IN clause.
+        Ok(partition_for_export(
+            self.list_user_skill_rows().await?,
+            ids,
+        ))
     }
 
     /// Update the approval status of a skill.
@@ -722,6 +767,7 @@ impl PgDb {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::resource_guard::capture_logs;
 
     /// A stored row as Clorinde returns it, with `template` as stored.
     fn stored_row(id: &str, template: &str) -> qontinui_db::queries::skills::ListUserSkills {
@@ -752,42 +798,6 @@ mod tests {
         }
     }
 
-    /// Run `f` under a WARN-level capture scoped to this thread; return its
-    /// result and the text it logged. Scoped, not global: tests run in parallel.
-    fn warns_of<R>(f: impl FnOnce() -> R) -> (R, String) {
-        #[derive(Clone, Default)]
-        struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-        impl std::io::Write for Captured {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
-            type Writer = Captured;
-            fn make_writer(&'a self) -> Self::Writer {
-                self.clone()
-            }
-        }
-        let sink = Captured::default();
-        let buf = sink.0.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(sink)
-            .with_ansi(false)
-            .with_max_level(tracing::Level::WARN)
-            .finish();
-        let out = tracing::subscriber::with_default(subscriber, f);
-        let logged =
-            String::from_utf8_lossy(&buf.lock().unwrap_or_else(|e| e.into_inner())).to_string();
-        (out, logged)
-    }
-
     /// The plan's case: a stored `{"kind":"playbook","content":"x"}` row is
     /// served as the empty `single_step` fallback, and the read WARNs naming
     /// the skill and the parse error. Control, through the same capture: a
@@ -795,12 +805,8 @@ mod tests {
     /// the unparseable template's and not the capture's.
     #[test]
     fn a_stored_playbook_row_is_served_as_the_fallback_with_a_warning_naming_the_skill() {
-        let (skill, logged) = warns_of(|| {
-            row_to_skill!(stored_row(
-                "user:sf-login",
-                r#"{"kind":"playbook","content":"x"}"#
-            ))
-        });
+        let row = stored_row("user:sf-login", r#"{"kind":"playbook","content":"x"}"#);
+        let (skill, logged) = capture_logs(|| row_to_skill!(row));
         assert_eq!(
             serde_json::to_value(&skill.template).expect("a served template serializes"),
             serde_json::json!({"kind": "single_step", "step": {}}),
@@ -819,18 +825,17 @@ mod tests {
             "carries the parse error: {logged}"
         );
 
-        let (skill, logged) = warns_of(|| {
-            row_to_skill!(stored_row(
-                "user:lint",
-                r#"{"kind":"single_step","step":{"type":"command"}}"#
-            ))
-        });
+        let row = stored_row(
+            "user:lint",
+            r#"{"kind":"single_step","step":{"type":"command"}}"#,
+        );
+        let (skill, logged) = capture_logs(|| row_to_skill!(row));
         assert_eq!(
             serde_json::to_value(&skill.template).expect("a served template serializes"),
             serde_json::json!({"kind": "single_step", "step": {"type": "command"}}),
             "a parseable row is served as stored"
         );
-        assert!(logged.is_empty(), "a parseable row warns nothing: {logged}");
+        assert!(logged.is_empty(), "a parseable row logs nothing: {logged}");
     }
 
     /// Every arm of the rewrite gate that update and fork read through. A
@@ -877,5 +882,125 @@ mod tests {
         assert!(message.contains("user:sf-login"), "{message}");
         assert!(message.contains("unknown variant `playbook`"), "{message}");
         assert!(message.contains("Delete the skill"), "{message}");
+    }
+
+    /// An outbound door (export, sync push) WITHHOLDS a row whose stored
+    /// template does not parse, naming it with its code and parse error,
+    /// rather than sending the served fallback; parseable rows go out as
+    /// stored, and a non-empty id list keeps only the ids asked for.
+    #[test]
+    fn an_outbound_door_withholds_a_stored_template_that_does_not_parse() {
+        let rows = || {
+            vec![
+                stored_row(
+                    "user:lint",
+                    r#"{"kind":"single_step","step":{"type":"command"}}"#,
+                ),
+                stored_row("user:sf-login", r#"{"kind":"playbook","content":"x"}"#),
+                stored_row("user:notes", r#"{"kind":"multi_step","steps":[]}"#),
+            ]
+        };
+
+        let all = partition_for_export(rows(), &[]);
+        let sent: Vec<&str> = all.skills.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(sent, ["user:lint", "user:notes"]);
+        assert_eq!(all.withheld.len(), 1, "{:?}", all.withheld);
+        assert_eq!(all.withheld[0].skill_id, "user:sf-login");
+        assert_eq!(all.withheld[0].code, "STORED_SKILL_TEMPLATE_UNPARSEABLE");
+        assert!(
+            all.withheld[0].error.contains("unknown variant `playbook`"),
+            "{:?}",
+            all.withheld
+        );
+
+        let asked = partition_for_export(rows(), &["user:sf-login".to_string()]);
+        assert!(asked.skills.is_empty(), "{:?}", asked.skills);
+        assert_eq!(asked.withheld.len(), 1);
+
+        let asked = partition_for_export(rows(), &["user:lint".to_string()]);
+        assert_eq!(asked.skills.len(), 1);
+        assert!(asked.withheld.is_empty());
+    }
+
+    /// The rewrite gate at its call sites, against a live Postgres: update
+    /// (with and without a template in the request), fork, and the version
+    /// bump's read all refuse a stored `playbook` row with
+    /// `UnparseableStoredTemplate`, and the stored template column is
+    /// byte-identical afterwards. Reverting any call site to the plain
+    /// `get_user_skill` turns this red.
+    ///
+    /// `#[ignore]` to match the `database/pg/*` convention. Run with:
+    /// `cargo test -p qontinui-runner database::pg::skills::tests::every_rewrite_refuses_a_stored_playbook_row_and_leaves_it_as_stored -- --ignored`
+    #[tokio::test]
+    #[ignore = "needs PG fixture (DATABASE_URL); user_skills table"]
+    async fn every_rewrite_refuses_a_stored_playbook_row_and_leaves_it_as_stored() {
+        let pg = PgDb::new_for_test().await;
+        let slug = format!("p7-playbook-{}", uuid::Uuid::new_v4());
+        let id = format!("user:{slug}");
+        let stored = r#"{"kind":"playbook","content":"x"}"#;
+        let conn = pg.pool.get().await.expect("pool");
+        conn.execute(
+            "INSERT INTO user_skills (id, name, slug, description, category, tags, icon, color,
+                allowed_phases, parameters, template, source, version, usage_count,
+                created_at, updated_at)
+            VALUES ($1, 'Salesforce login', $2, '', 'custom', '[]', 'puzzle', 'gray',
+                '[\"setup\"]', '[]', $3, 'user', '1.0.0', 0, NOW(), NOW())",
+            &[
+                &id as &(dyn tokio_postgres::types::ToSql + Sync),
+                &slug,
+                &stored,
+            ],
+        )
+        .await
+        .expect("insert the stored playbook row");
+
+        let refused = |r: Result<SkillDefinition, SkillRewriteError>, what: &str| match r {
+            Err(SkillRewriteError::UnparseableStoredTemplate { skill_id, .. }) => {
+                assert_eq!(skill_id, id, "{what}")
+            }
+            other => panic!("{what} must be refused, got {other:?}"),
+        };
+        let no_template: crate::mcp::skills::UpdateSkillRequest =
+            serde_json::from_value(serde_json::json!({"name": "renamed"})).expect("request");
+        refused(
+            pg.update_user_skill(&id, &no_template).await,
+            "update without a template",
+        );
+        let with_template: crate::mcp::skills::UpdateSkillRequest =
+            serde_json::from_value(serde_json::json!({
+                "template": {"kind": "single_step", "step": {}}
+            }))
+            .expect("request");
+        refused(
+            pg.update_user_skill(&id, &with_template).await,
+            "update carrying the served fallback",
+        );
+        refused(pg.fork_skill(&id, None).await, "fork");
+        assert!(
+            matches!(
+                pg.get_user_skill_for_rewrite(&id).await,
+                Err(SkillRewriteError::UnparseableStoredTemplate { .. })
+            ),
+            "the version bump's read"
+        );
+
+        let row = conn
+            .query_one("SELECT template FROM user_skills WHERE id = $1", &[&id])
+            .await
+            .expect("the row is still there");
+        let after: String = row.try_get(0).expect("template column");
+        let forks = conn
+            .query_one(
+                "SELECT count(*) FROM user_skills WHERE forked_from = $1",
+                &[&id],
+            )
+            .await
+            .expect("count forks");
+        let fork_count: i64 = forks.try_get(0).expect("count");
+        conn.execute("DELETE FROM user_skills WHERE id = $1", &[&id])
+            .await
+            .expect("clean up");
+        assert_eq!(after, stored, "the stored template is untouched");
+        assert_eq!(fork_count, 0, "fork wrote no copy");
     }
 }
