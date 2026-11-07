@@ -644,10 +644,13 @@ pub fn decorate_read_back(
             .map(|o| json!({ "outcome": o.reason() }))
             .unwrap_or(JsonValue::Null),
     );
-    // The stored stamp made `delivery` read `acked`; coord's own row now
-    // contradicts it and nothing was re-queued, so the response cannot keep
-    // claiming the write landed.
-    if stored_synced && !finish_synced && !matches!(rb.heal, Some(HealOutcome::Resent { .. })) {
+    // `delivery` was decided from the stamp BEFORE the read; once the response
+    // says `finishSynced: false` (coord's own row contradicts it, or the heal
+    // withdrew the stamp without re-queuing) it cannot keep claiming `acked`.
+    if !finish_synced
+        && coord.get("delivery").and_then(JsonValue::as_str) == Some("acked")
+        && !matches!(rb.heal, Some(HealOutcome::Resent { .. }))
+    {
         coord.insert(
             "delivery".to_string(),
             JsonValue::String("unknown".to_string()),

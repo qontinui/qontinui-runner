@@ -700,6 +700,34 @@ fn a_read_back_over_another_rows_finish_does_not_read_synced() {
     );
 }
 
+/// A heal that withdrew the stamp but could not re-queue (`NotQueued`) leaves
+/// nothing in flight: `delivery` must not keep the pre-read `acked` beside
+/// `finishSynced: false`.
+#[test]
+fn a_read_back_whose_heal_did_not_requeue_never_reads_acked() {
+    let (_d, store, at) = synced_store("rb-notq");
+    let mut resp = read_back_response(&store, "rb-notq");
+    assert_eq!(
+        resp["coord"]["delivery"], "acked",
+        "decided before the read"
+    );
+    // The heal withdrew the stamp; the store now reads unsynced.
+    assert!(store.clear_finish_synced("rb-notq", at));
+    let rb = ReadBack {
+        observed: None,
+        observed_at: chrono::DateTime::<Utc>::from_timestamp_millis(at + 5_000).unwrap(),
+        unobserved_reason: None,
+        own_row: None,
+        heal: Some(HealOutcome::NotQueued {
+            row: Uuid::parse_str(ROW).unwrap(),
+            reason: "no_coord_session",
+        }),
+    };
+    decorate_read_back(&mut resp, &rb, store.get("rb-notq").as_ref());
+    assert_eq!(resp["session"]["finishSynced"], false);
+    assert_eq!(resp["coord"]["delivery"], "unknown");
+}
+
 // ---------------------------------------------------------------------------
 // Review round 2: the stored own row (F2), unsynced marks (F3), chunking
 // ---------------------------------------------------------------------------
