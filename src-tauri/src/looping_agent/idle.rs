@@ -95,7 +95,8 @@ pub const PROMPT_MARKER: char = '❯';
 ///    ([`PROCESSING_INDICATORS`]).
 /// 2. NO spinner glyph on screen ([`SPINNER_GLYPHS`], `·` excepted), save on
 ///    the static completed-turn line ([`is_completed_turn_line`]).
-/// 3. A prompt row containing [`PROMPT_MARKER`] (`❯`) is visible.
+/// 3. A prompt row containing [`PROMPT_MARKER`] (`❯`) is visible; the
+///    bottom-most such row is the input box.
 /// 4. The cursor sits AT OR BELOW the prompt row (in the input area), not up
 ///    in streaming output.
 pub fn snapshot_looks_idle(lines: &[String], cursor_row: u16) -> bool {
@@ -135,8 +136,12 @@ pub fn idle_veto(lines: &[String], cursor_row: u16) -> Option<String> {
         }
     }
 
-    // (3) prompt marker visible — remember its row for (4).
-    let Some(prompt_row) = lines.iter().position(|l| l.contains(PROMPT_MARKER)) else {
+    // (3) prompt marker visible — remember its row for (4). The BOTTOM-most
+    // `❯` row is the input box (as `snapshot_shows_dialog` reads it): an
+    // earlier one is transcript — a `❯ <your message>` echo in scrollback —
+    // and taking it would make (4) pass for a cursor up in streaming output.
+    // Bottom-most is never below the top-most, so this only ever vetoes more.
+    let Some(prompt_row) = lines.iter().rposition(|l| l.contains(PROMPT_MARKER)) else {
         // No visible input prompt ⇒ can't confirm ready-for-input ⇒ not idle.
         return Some("no `❯` prompt row on screen".to_string());
     };
@@ -536,6 +541,22 @@ mod tests {
             "❯ ",
         ]);
         assert!(!snapshot_looks_idle(&grid, 2));
+    }
+
+    /// A `❯ <message>` echo in scrollback is not the input box: with the
+    /// cursor up in streaming output, between the echo and the real prompt,
+    /// the screen is busy.
+    #[test]
+    fn a_scrollback_prompt_echo_does_not_stand_in_for_the_input_row() {
+        let grid = lines(&[
+            "❯ Run the shell command and report back",
+            "  streaming answer text",
+            "  more streaming answer text",
+            "❯ ",
+        ]);
+        assert!(!snapshot_looks_idle(&grid, 1), "cursor in streaming output");
+        assert!(idle_veto(&grid, 1).unwrap().contains("prompt row 3"));
+        assert!(snapshot_looks_idle(&grid, 3), "cursor on the input row");
     }
 
     #[test]
