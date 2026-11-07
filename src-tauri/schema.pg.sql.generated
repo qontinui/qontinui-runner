@@ -858,7 +858,8 @@ CREATE TABLE agent.work_artifact_edges (
     created_by text,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     CONSTRAINT ck_work_artifact_edges_followup_note CHECK (((relation <> 'spawned_followup'::text) OR ((note IS NOT NULL) AND (btrim(note, ' 	
-v'::text) <> ''::text)))),
+
+v'::text) <> ''::text)))),
     CONSTRAINT ck_work_artifact_edges_open_target CHECK (((relation = 'spawned_followup'::text) OR (to_id IS NOT NULL))),
     CONSTRAINT ck_work_artifact_edges_relation CHECK ((relation = ANY (ARRAY['produced_report'::text, 'feeds'::text, 'authored_plan'::text, 'supersedes'::text, 'depends_on'::text, 'spawned_followup'::text, 'refutes'::text])))
 );
@@ -1012,6 +1013,7 @@ CREATE TABLE atlas_managed.spec_proposals (
     last_error text,
     candidate_ir jsonb,
     metadata jsonb DEFAULT '{}'::jsonb NOT NULL,
+    app_id text NOT NULL,
     CONSTRAINT spec_proposals_kind_chk CHECK ((kind = ANY (ARRAY['fullPage'::text, 'patch'::text])))
 );
 
@@ -24254,7 +24256,8 @@ CREATE UNIQUE INDEX uq_work_artifact_edges_from_to_relation ON agent.work_artifa
 --
 
 CREATE UNIQUE INDEX uq_work_artifact_edges_open_followup ON agent.work_artifact_edges USING btree (from_id, relation, btrim(note, ' 	
-v'::text)) WHERE ((to_id IS NULL) AND (relation = 'spawned_followup'::text));
+
+v'::text)) WHERE ((to_id IS NULL) AND (relation = 'spawned_followup'::text));
 
 
 --
@@ -24356,10 +24359,10 @@ CREATE INDEX regression_suites_ir_doc_id_idx ON atlas_managed.regression_suites 
 
 
 --
--- Name: spec_proposals_kind_target_uniq; Type: INDEX; Schema: atlas_managed; Owner: -
+-- Name: spec_proposals_app_kind_target_uniq; Type: INDEX; Schema: atlas_managed; Owner: -
 --
 
-CREATE UNIQUE INDEX spec_proposals_kind_target_uniq ON atlas_managed.spec_proposals USING btree (kind, COALESCE(pathname, spec_id));
+CREATE UNIQUE INDEX spec_proposals_app_kind_target_uniq ON atlas_managed.spec_proposals USING btree (app_id, kind, COALESCE(pathname, spec_id));
 
 
 --

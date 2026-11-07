@@ -78,10 +78,13 @@ pub const ATLAS_MANAGED_TABLES: [&str; 6] = [
 
 /// Columns added to a table after it first shipped, with the value a legacy
 /// row gets when its copy predates the column. `proposal_events.app_id` is the
-/// spec-multi-app Stream E.1 column; `'qontinui-runner'` is the value the
-/// app_id backfill in `verify_and_provision` gives every pre-multi-app row.
-const LEGACY_COLUMN_FILLS: &[(&str, &str, &str)] =
-    &[("proposal_events", "app_id", "'qontinui-runner'")];
+/// spec-multi-app Stream E.1 column and `spec_proposals.app_id` the per-app
+/// proposal queue's; `'qontinui-runner'` is the value the app_id backfills in
+/// `verify_and_provision` give every row that predates them.
+const LEGACY_COLUMN_FILLS: &[(&str, &str, &str)] = &[
+    ("proposal_events", "app_id", "'qontinui-runner'"),
+    ("spec_proposals", "app_id", "'qontinui-runner'"),
+];
 
 /// `pg_advisory_xact_lock` key for the move ("atlasmv" in ASCII).
 const MOVE_LOCK_KEY: i64 = 0x0061_746c_6173_6d76;
@@ -1045,6 +1048,22 @@ mod tests {
         assert_eq!(
             plan[1],
             ("app_id".to_string(), "'qontinui-runner'".to_string())
+        );
+    }
+
+    /// `spec_proposals.app_id` is NOT NULL with no default, so without its
+    /// fill a legacy copy that predates the per-app queue could never merge.
+    #[test]
+    fn plan_fills_app_id_for_a_legacy_spec_proposals_copy() {
+        let target = [col("id", false, false), col("app_id", false, false)];
+        let source = [col("id", false, false)];
+        let plan = plan_merge_columns("spec_proposals", &target, &source).unwrap();
+        assert_eq!(
+            plan,
+            vec![
+                ("id".to_string(), "s.\"id\"".to_string()),
+                ("app_id".to_string(), "'qontinui-runner'".to_string()),
+            ]
         );
     }
 

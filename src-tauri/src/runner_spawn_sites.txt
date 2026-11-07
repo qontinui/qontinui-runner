@@ -12,6 +12,8 @@
 #   spawn_claude_child(         a headless `claude` child
 #   spawn_workflow_with_panic_guard( / spawn_sequence_with_panic_guard(   a workflow run
 #   "spawn-independent-claude.py"   the Python spawn script
+#   call_door_in_process(       a spawn door called in-process, under an origin the
+#                               CALLER chooses — so each caller declares its own gate
 # — or that calls a `helper` row's token below. Pinned by
 #     runner_spawn_sites::every_spawn_site_is_listed_and_no_row_is_a_ghost
 # (a new caller is RED until it is listed here),
@@ -72,6 +74,11 @@ mcp/task_runs.rs | resume_task_run | autonomous | resume_task_run
 # partition_for_drain, reconcile_task's drain_gate_for_work, run_task_now's drain_gate);
 # the chain below names the periodic one.
 scheduler_remote_agent.rs | launch | autonomous | scheduler_service.rs::tick_pass > scheduler_service.rs::try_start_due_task > scheduler_service.rs::execute_task > scheduler_service.rs::execute_task_with_context > scheduler_service.rs::launch_and_await_remote_agent > launch
+# post_self calls the spawn door in-process ONLY for an operator origin (the runner UI's
+# "Run now", scheduler_run_task_now); every autonomous launch goes over HTTP, where the
+# door's own drain gate judges it as `unknown`. The chain names the periodic entry point,
+# whose partition_for_drain gates the launch.
+scheduler_service.rs | post_self | autonomous | tick_pass > try_start_due_task > execute_task > execute_task_with_context > launch_unified_workflow > post_self
 mcp/tauri_proxy.rs | dispatch | autonomous | dispatch
 mcp/terminals.rs | create_terminal_handler | autonomous | create_terminal_handler
 mcp/unified_workflows.rs | execute_inline_workflow | autonomous | execute_inline_workflow
@@ -102,4 +109,8 @@ terminal/account_migration.rs | spawn_resumed_pane | helper | spawn_resumed_pane
 trigger_system/executor.rs | execute_triggered_workflow | autonomous | execute_triggered_workflow
 unified_ai_session.rs | execute | exempt | a phase of a unified-workflow run that is already running; every workflow START is a gated row here
 unified_workflow_executor/auto_run.rs | launch_workflow_by_id | autonomous | launch_workflow_by_id
+# The spec flywheel's execute (plan 2026-11-06-what-the-fleet-records-and-advertises-matches-what-actually-ran,
+# Phase 3): branches on authorize_spawn (standing_continuation, the caller's origin — which
+# runs the drain gate first) before it persists or starts anything.
+workflow_generation/meta_workflow_run.rs | execute_meta_workflow_blocking | autonomous | execute_meta_workflow_blocking
 unified_workflow_executor/startup_resume.rs | resume_interrupted_workflows | autonomous | resume_interrupted_workflows
