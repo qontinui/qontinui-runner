@@ -211,8 +211,7 @@ pub(crate) fn registrar_terminal_row_disagreements() -> u64 {
 fn prefer_terminal_row(registrar: Option<Uuid>, terminal: Option<Uuid>) -> Option<Uuid> {
     match (registrar, terminal) {
         (Some(r), Some(t)) if r != t => {
-            REGISTRAR_TERMINAL_ROW_DISAGREEMENTS
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            REGISTRAR_TERMINAL_ROW_DISAGREEMENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             debug!(
                 "ai_coord_register: registrar row {} and live terminal row {} disagree — \
                  taking the terminal's",
@@ -1715,11 +1714,7 @@ impl AiCoordRegistrar {
             // answers the new row, so a concurrent row must already find its
             // tenant there. Through a poisoned lock, as `evict_tenant` does.
             {
-                let mut tenants = self
-                    .inner
-                    .tenants
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner());
+                let mut tenants = self.inner.tenants.lock().unwrap_or_else(|p| p.into_inner());
                 if let Some(t) = tenants.remove(&old) {
                     tenants.insert(new_coord_id, t);
                 }
@@ -1735,11 +1730,7 @@ impl AiCoordRegistrar {
                 }
             }
             let old_was_minted_here = {
-                let mut adopted = self
-                    .inner
-                    .adopted
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner());
+                let mut adopted = self.inner.adopted.lock().unwrap_or_else(|p| p.into_inner());
                 let was_adopted = adopted.remove(&old);
                 adopted.insert(new_coord_id);
                 !was_adopted
@@ -3473,9 +3464,8 @@ mod tests {
         let on = |terminal: &str| {
             let mut rec = test_open_record(&csid);
             rec.terminal_id = terminal.to_string();
-            rec.origin = Some(
-                crate::session::session_lifecycle_store::ORIGIN_AUTHORITATIVE.to_string(),
-            );
+            rec.origin =
+                Some(crate::session::session_lifecycle_store::ORIGIN_AUTHORITATIVE.to_string());
             rec
         };
         store.record_open(on("term-old"));
