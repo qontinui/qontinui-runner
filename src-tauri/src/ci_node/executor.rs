@@ -1900,9 +1900,10 @@ mod tests {
 
     /// The callee path of every call on one line of CODE (comments removed,
     /// literals emptied): the run of identifier characters and `::` just before
-    /// each `(`, such as `crate::process_helpers::tokio_no_window`. A `(` after
-    /// anything else (a space, `)`, `!`, `>`) names no callee, and a definition
-    /// (`fn x(`) is not a call.
+    /// each `(`, such as `crate::process_helpers::tokio_no_window`. A turbofish
+    /// is skipped first, so `new::<&str>(` is a call of `new`. A `(` after
+    /// anything else (a space, `)`, `!`, a `>` that closes no turbofish) names
+    /// no callee, and a definition (`fn x(`) is not a call.
     fn callees(code: &str) -> Vec<String> {
         let mut out = Vec::new();
         for (at, c) in code.char_indices() {
@@ -1910,6 +1911,11 @@ mod tests {
                 continue;
             }
             let before = code.get(..at).unwrap_or("");
+            let before = before
+                .strip_suffix('>')
+                .and_then(|b| b.rfind("::<"))
+                .and_then(|i| before.get(..i))
+                .unwrap_or(before);
             let Some(start) = before
                 .char_indices()
                 .rev()
@@ -1976,6 +1982,7 @@ mod tests {
     /// The process builders and runners `process_helpers` exports, by name, so
     /// an unqualified call after a `use` is caught too. A trailing `*` is a
     /// prefix.
+    // Mirrors `process_helpers`' exports BY HAND: update it whenever they change.
     const PROCESS_HELPERS_BUILDERS: [&str; 9] = [
         "no_window",
         "tokio_no_window",
@@ -1988,8 +1995,9 @@ mod tests {
         "run_probe*",
     ];
 
-    /// Whether a call builds or runs a process: `Command::new`, any call
-    /// through `process_helpers::`, or a `process_helpers` builder by name.
+    /// Whether a callee path, as a DIRECT call by path, constructs or runs a
+    /// process: `Command::new`, any use of `process_helpers::`, or a
+    /// `process_helpers` builder by name.
     fn builds_a_process(callee: &str) -> bool {
         let name = callee.rsplit("::").next().unwrap_or(callee);
         path_is(callee, "Command::new")
@@ -2007,15 +2015,20 @@ mod tests {
     /// `run_dispatch` reaches a step only through it, that `run_step` spawns
     /// only through `spawn_step_child`, that both of `spawn_step_child`'s
     /// commands get the scrub through `apply_step_env`, that
-    /// `build_step_command` has no other caller in this file, and that this
-    /// file builds or runs a process in exactly one place:
-    /// `build_step_command`'s `process_helpers::tokio_no_window`. No
-    /// `Command::new`, no other `process_helpers::` call and no other
+    /// `build_step_command` has no other caller in this file, and that the
+    /// only process constructed in this file by a direct call by path is
+    /// `build_step_command`'s `process_helpers::tokio_no_window`: no
+    /// `Command::new`, no other use of `process_helpers::` and no other
     /// `process_helpers` builder by name ([`PROCESS_HELPERS_BUILDERS`]). Calls
-    /// are found in code only, never in a comment or a literal. A new caller,
-    /// a wrapper or a second spawn path in this file turns it red; a step
-    /// spawned from ANOTHER module is outside its reach
-    /// (`env_agent/apply_versions.rs` has an unrelated `run_step`).
+    /// are found in code only, never in a comment or a literal, and a
+    /// turbofish is read through. A new caller, a wrapper or a second spawn
+    /// path in this file turns it red.
+    ///
+    /// Out of its reach: a constructor passed as a value
+    /// (`.map(Command::new)`), a `use … as` alias, and processes run by
+    /// helpers in OTHER modules this file calls (`checkout`, `tools`,
+    /// `canonical`, `tree_kill`). A step spawned from another module is outside
+    /// it too (`env_agent/apply_versions.rs` has an unrelated `run_step`).
     #[test]
     fn the_step_path_is_run_dispatch_then_run_step_then_spawn_step_child() {
         let (production, _) = include_str!("executor.rs")
@@ -2051,7 +2064,60 @@ mod tests {
         assert_eq!(
             process_calls,
             ["build_step_command -> crate::process_helpers::tokio_no_window"],
-            "this file must build or run a process only in build_step_command"
+            "the only process this file constructs by a direct call by path must be \
+             build_step_command's, and this file uses process_helpers only in build_step_command"
+        );
+    }
+
+    /// The scan itself, on synthetic source: the shapes it must catch and the
+    /// ones it must ignore. A regression in `path_is`, the `*` prefix match,
+    /// the turbofish skip, the definition check or the lexer turns THIS red,
+    /// instead of quietly widening what the call-path test above lets through.
+    #[test]
+    fn the_process_scan_catches_direct_calls_and_ignores_mentions() {
+        let src = r#"
+fn std_command() {
+    let _ = std::process::Command::new("sh");
+}
+fn tokio_command() {
+    let _ = tokio::process::Command::new("sh"); // Command::new( in a comment
+}
+fn turbofish_command() {
+    let _ = std::process::Command::new::<&str>("sh");
+}
+fn unqualified_builder() {
+    use crate::process_helpers::tokio_no_window;
+    let _ = tokio_no_window("sh");
+}
+fn prefixed_runner() {
+    let _ = run_with_timeout_detailed(cmd, limit);
+}
+fn in_a_literal() {
+    let _ = "Command::new(";
+}
+fn in_a_block_comment() {
+    /* a comment over several lines
+       std::process::Command::new("sh")
+       still the comment */
+    let _ = 1;
+}
+fn tokio_no_window(program: &str) {}
+"#;
+        let found: Vec<String> = calls_in(src)
+            .into_iter()
+            .filter(|(_, callee)| builds_a_process(callee))
+            .map(|(enclosing, callee)| format!("{enclosing} -> {callee}"))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                "std_command -> std::process::Command::new",
+                "tokio_command -> tokio::process::Command::new",
+                "turbofish_command -> std::process::Command::new",
+                "unqualified_builder -> tokio_no_window",
+                "prefixed_runner -> run_with_timeout_detailed",
+            ],
+            "the scan missed a direct call, or counted a comment, a literal or a definition"
         );
     }
 }
