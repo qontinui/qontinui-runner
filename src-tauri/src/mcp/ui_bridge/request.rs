@@ -424,6 +424,25 @@ pub(crate) fn pending_key(window_label: &str, request_id: &str) -> String {
     format!("{window_label}\u{1f}{request_id}")
 }
 
+/// The window an explicit `window_label` addresses: empty means the main
+/// window, the same rule [`split_target_window`] applies to a payload's
+/// `windowLabel`.
+///
+/// The read/convenience family's `helpers::read_window_label` answers `""` for
+/// "no `windowLabel` sent". Passed straight to
+/// [`ui_bridge_request_sync_in_window`], that reached the inner lookup as a
+/// window NAMED `""` and failed with "No runner window labeled ''". Even past
+/// that check the request would have waited under the `""` pending key while
+/// the reply came back under `main`. Every default `type-into` mutation step
+/// failed that way.
+pub(crate) fn effective_window_label(window_label: &str) -> &str {
+    if window_label.is_empty() {
+        MAIN_WINDOW_LABEL
+    } else {
+        window_label
+    }
+}
+
 /// Whether targeted per-window `ui-bridge-request` emit is enabled.
 ///
 /// Default ON now that pop-out windows answer the bridge (capabilities + per-realm
@@ -822,6 +841,8 @@ pub async fn ui_bridge_request_sync_in_window(
     additional_payload: serde_json::Value,
     window_label: &str,
 ) -> Result<serde_json::Value, String> {
+    let window_label = effective_window_label(window_label);
+
     // 1. Check circuit breaker
     state.ui_bridge_circuit_breaker.check().await?;
 
@@ -1750,8 +1771,8 @@ mod wrap_ipc_result_tests {
     //! success, inner failure (with/without error field), absent success
     //! field, and non-bool success values.
     use super::{
-        extract_response_data, handle_ui_bridge_response, pending_key, split_target_window,
-        wrap_ipc_result, MAIN_WINDOW_LABEL,
+        effective_window_label, extract_response_data, handle_ui_bridge_response, pending_key,
+        split_target_window, wrap_ipc_result, MAIN_WINDOW_LABEL,
     };
     use axum::http::StatusCode;
     use serde_json::json;
@@ -1762,6 +1783,21 @@ mod wrap_ipc_result_tests {
     use tokio::sync::{oneshot, Mutex};
 
     // ── Window-aware dispatch (Phase 0) ─────────────────────────────────────
+
+    #[test]
+    fn an_empty_explicit_window_label_addresses_the_main_window() {
+        // `read_window_label` answers "" for "no windowLabel sent"; passed to
+        // `ui_bridge_request_sync_in_window` it must reach the main window, not
+        // a window named "" (which no webview answers to).
+        assert_eq!(effective_window_label(""), MAIN_WINDOW_LABEL);
+        assert_eq!(
+            pending_key(effective_window_label(""), "id-1"),
+            pending_key(MAIN_WINDOW_LABEL, "id-1"),
+            "the request must wait under the key the main window's reply is delivered to"
+        );
+        assert_eq!(effective_window_label(MAIN_WINDOW_LABEL), MAIN_WINDOW_LABEL);
+        assert_eq!(effective_window_label("term-1"), "term-1");
+    }
 
     #[test]
     fn split_target_window_defaults_to_main_when_absent() {
