@@ -555,32 +555,75 @@ pub fn parse_verification_verdict(output: &str) -> Option<VerificationVerdict> {
     serde_json::from_str::<VerificationVerdict>(json_str.trim()).ok()
 }
 
-/// Heuristic verdict parsing when structured JSON is not available.
-/// Uses keyword analysis to approximate the verification status.
+/// Prose that claims the goal was met. In a verifier output that carries no
+/// structured verdict, these phrases are a claim, not a verdict — see
+/// [`heuristic_verdict`].
+const PROSE_PASS_CLAIMS: &[&str] = &[
+    "goal achieved",
+    "all checks pass",
+    "all checks passing",
+    "all verification checks pass",
+    "all verification checks are passing",
+    "verification checks passing",
+    "successfully completed",
+    "\"status\": \"pass\"",
+    "status: pass",
+    "all_passed: true",
+    "\"all_passed\": true",
+    "\"all_passed\":true",
+    "no action needed",
+    "no further action",
+    "no fixes needed",
+    "0 failures",
+    "already passing",
+    "already fixed",
+];
+
+/// Leads every heuristic verdict's observations, so the worker agent, the
+/// canvas panel and the task output all see that no structured verdict was read.
+const UNPARSED_VERDICT_NOTE: &str = "[VERDICT NOT PARSED] The verifier's output carried no structured verdict, so it was read heuristically, and a heuristic never reads a pass.";
+
+/// Heuristic verdict for a verifier output that did not parse as a structured
+/// [`VerificationVerdict`] (callers try [`parse_verification_verdict`] first).
+///
+/// Keyword analysis still reads progress, a dead end or a failure, but it
+/// NEVER reads a pass: a pass is a claim the verifier makes in its structured
+/// verdict. Prose that only sounds like one — "0 failures", "no action
+/// needed", an echoed `all_passed: true` — used to return `Pass` at a
+/// confidence (0.8 and up) above the default threshold (0.6), so a verdict that
+/// failed to parse ended the agentic-verification loop as verified. Such prose
+/// now yields a non-passing verdict at zero confidence whose issue names the
+/// parse failure (served policy verification-and-evidence/silent-empty-is-unknown;
+/// plan 2026-11-06-a-product-workflow-verification-with-nothing-to-check-never-reports-passed,
+/// Phase 2 — an `unknown` once its Phase 8 vocabulary exists).
 pub fn heuristic_verdict(output: &str) -> VerificationVerdict {
     let lower = output.to_lowercase();
+    let excerpt: String = output.chars().take(1000).collect();
+    let observations = format!("{UNPARSED_VERDICT_NOTE}\n\n{excerpt}");
 
-    let status = if lower.contains("goal achieved")
-        || lower.contains("all checks pass")
-        || lower.contains("all checks passing")
-        || lower.contains("all verification checks pass")
-        || lower.contains("all verification checks are passing")
-        || lower.contains("verification checks passing")
-        || lower.contains("successfully completed")
-        || lower.contains("\"status\": \"pass\"")
-        || lower.contains("status: pass")
-        || lower.contains("all_passed: true")
-        || lower.contains("\"all_passed\": true")
-        || lower.contains("\"all_passed\":true")
-        || lower.contains("no action needed")
-        || lower.contains("no further action")
-        || lower.contains("no fixes needed")
-        || lower.contains("0 failures")
-        || lower.contains("already passing")
-        || lower.contains("already fixed")
-    {
-        VerificationStatus::Pass
-    } else if lower.contains("unreachable")
+    if PROSE_PASS_CLAIMS.iter().any(|claim| lower.contains(claim)) {
+        return VerificationVerdict {
+            status: VerificationStatus::Fail,
+            confidence: 0.0,
+            observations,
+            next_priority: Some(
+                "Re-run verification: the verifier must state its verdict in the structured JSON block"
+                    .to_string(),
+            ),
+            issues: vec![VerificationIssue {
+                description: "The verifier claimed success in prose but emitted no structured verdict; a claim without a verdict is not a pass".to_string(),
+                severity: "critical".to_string(),
+                suggestion: Some(
+                    "Emit the JSON verdict block (status, confidence, observations, issues)"
+                        .to_string(),
+                ),
+            }],
+            unreachable: false,
+            unreachable_reason: None,
+        };
+    }
+
+    let status = if lower.contains("unreachable")
         || lower.contains("impossible")
         || lower.contains("cannot be achieved")
     {
@@ -594,53 +637,10 @@ pub fn heuristic_verdict(output: &str) -> VerificationVerdict {
         VerificationStatus::Fail
     };
 
-    // Count how many pass-related keywords match for confidence scaling.
-    // Multiple matching keywords indicate higher certainty of a pass.
-    let pass_keyword_count = [
-        "goal achieved",
-        "all checks pass",
-        "all checks passing",
-        "all verification checks pass",
-        "verification checks passing",
-        "successfully completed",
-        "all_passed: true",
-        "\"all_passed\": true",
-        "0 failures",
-        "no action needed",
-        "already passing",
-        "already fixed",
-    ]
-    .iter()
-    .filter(|kw| lower.contains(**kw))
-    .count();
-
-    let confidence = match status {
-        VerificationStatus::Pass => {
-            // Scale confidence by number of matching keywords:
-            // 1 keyword  → 0.8 (meets default threshold)
-            // 2 keywords → 0.85
-            // 3+ keywords → 0.9
-            if pass_keyword_count >= 3 {
-                0.9
-            } else if pass_keyword_count >= 2 {
-                0.85
-            } else {
-                0.8
-            }
-        }
-        VerificationStatus::Unreachable => 0.5,
-        VerificationStatus::Partial => 0.5,
-        VerificationStatus::Fail => 0.5,
-        // The text verifier never emits Refused — that's a WSM-only
-        // verdict. If the heuristic ever sees one through an unexpected
-        // code path, treat it like Fail for confidence purposes.
-        VerificationStatus::Refused => 0.5,
-    };
-
     VerificationVerdict {
         status,
-        confidence,
-        observations: output.chars().take(1000).collect(),
+        confidence: 0.5,
+        observations,
         next_priority: None,
         issues: vec![],
         unreachable: false,
@@ -1156,10 +1156,17 @@ pub struct PipelineCheckpoint {
 
 impl MultiAgentPipelineResult {
     /// Convert to a LoopResult for compatibility with the unified workflow executor.
+    ///
+    /// Every exit of `run_multi_agent_pipeline_loop` comes through here, so this
+    /// is where "nothing checked is never passed" holds for the pipeline: a
+    /// result that derived no acceptance criterion verified nothing, whatever
+    /// `goal_achieved` says, and reads `no_verification_steps` instead of a pass
+    /// (served policy verification-and-evidence/silent-empty-is-unknown).
     pub fn to_loop_result(&self) -> crate::unified_workflow_executor::LoopResult {
+        let nothing_to_verify = self.total_criteria == 0;
         crate::unified_workflow_executor::LoopResult {
             iterations_run: self.total_iterations,
-            verification_passed: self.goal_achieved,
+            verification_passed: self.goal_achieved && !nothing_to_verify,
             max_iterations_reached: self.max_iterations_reached,
             critical_failure: false,
             was_stopped: self.was_stopped,
@@ -1224,7 +1231,7 @@ impl MultiAgentPipelineResult {
                 .into_iter()
                 .collect(),
             fix_attempts_exhausted: false,
-            no_verification_steps: false,
+            no_verification_steps: nothing_to_verify,
             fix_attempts: 0,
             ci_auto_resumes: 0,
             node_rollups: Vec::new(),
@@ -1238,6 +1245,8 @@ impl MultiAgentPipelineResult {
                 "STOPPED after {} iteration(s) ({}/{} criteria passed)",
                 self.total_iterations, self.passed_criteria, self.total_criteria
             )
+        } else if self.total_criteria == 0 {
+            "No acceptance criteria derived — nothing to verify, which is not a pass".to_string()
         } else if self.goal_achieved {
             format!(
                 "All {} criteria PASSED after {} iteration(s) across {} subtree(s)",
@@ -1348,10 +1357,57 @@ mod tests {
 
     // ── heuristic_verdict ───────────────────────────────────────────────
 
+    /// The agentic-verification loop's own fallback expression
+    /// (`agentic_verification_loop.rs`): a verifier output that does not parse
+    /// is read by `heuristic_verdict`, and a prose claim of success there is
+    /// never a pass — one claim or many, and an echoed status that is not valid
+    /// JSON included.
     #[test]
-    fn heuristic_goal_achieved_returns_pass() {
-        let verdict = heuristic_verdict("The goal achieved successfully and everything is fine.");
-        assert_eq!(verdict.status, VerificationStatus::Pass);
+    fn an_unparseable_verdict_is_never_a_pass() {
+        for output in [
+            "The goal achieved successfully and everything is fine.",
+            "All checks pass. 0 failures, no action needed. all_passed: true",
+            "```json\n{ \"status\": \"pass\", confidence: INVALID }\n```",
+        ] {
+            assert!(
+                parse_verification_verdict(output).is_none(),
+                "fixture must not parse: {output:?}"
+            );
+            let verdict =
+                parse_verification_verdict(output).unwrap_or_else(|| heuristic_verdict(output));
+            assert_ne!(verdict.status, VerificationStatus::Pass, "{output:?}");
+            assert!(verdict.confidence.abs() < f64::EPSILON, "{output:?}");
+        }
+    }
+
+    #[test]
+    fn a_prose_pass_claim_names_the_parse_failure() {
+        let verdict = heuristic_verdict("goal achieved");
+        assert_eq!(verdict.status, VerificationStatus::Fail);
+        assert!(
+            verdict.observations.starts_with("[VERDICT NOT PARSED]"),
+            "{}",
+            verdict.observations
+        );
+        assert!(verdict.observations.ends_with("goal achieved"));
+        assert_eq!(verdict.issues.len(), 1);
+        assert_eq!(verdict.issues[0].severity, "critical");
+        assert!(verdict.issues[0]
+            .description
+            .contains("emitted no structured verdict"));
+        assert!(verdict.next_priority.is_some());
+    }
+
+    #[test]
+    fn non_pass_prose_keeps_its_heuristic_status_and_names_the_parse_failure() {
+        let verdict = heuristic_verdict("We made some progress toward the solution.");
+        assert_eq!(verdict.status, VerificationStatus::Partial);
+        assert!((verdict.confidence - 0.5).abs() < f64::EPSILON);
+        assert!(verdict.observations.starts_with("[VERDICT NOT PARSED]"));
+        assert!(verdict
+            .observations
+            .ends_with("We made some progress toward the solution."));
+        assert!(verdict.issues.is_empty());
     }
 
     #[test]
@@ -1379,12 +1435,6 @@ mod tests {
     }
 
     #[test]
-    fn heuristic_pass_confidence_is_0_6() {
-        let verdict = heuristic_verdict("goal achieved");
-        assert!((verdict.confidence - 0.8).abs() < f64::EPSILON);
-    }
-
-    #[test]
     fn heuristic_non_pass_confidence_is_0_5() {
         let unreachable = heuristic_verdict("unreachable state");
         assert!((unreachable.confidence - 0.5).abs() < f64::EPSILON);
@@ -1394,5 +1444,74 @@ mod tests {
 
         let fail = heuristic_verdict("nothing relevant");
         assert!((fail.confidence - 0.5).abs() < f64::EPSILON);
+    }
+
+    // ── MultiAgentPipelineResult::to_loop_result ────────────────────────
+
+    /// A pipeline result as `run_multi_agent_pipeline_loop` builds one at an
+    /// exit, with `total_criteria` criteria and the given `goal_achieved`.
+    fn pipeline_result(total_criteria: u32, goal_achieved: bool) -> MultiAgentPipelineResult {
+        MultiAgentPipelineResult {
+            total_iterations: 0,
+            goal_achieved,
+            was_stopped: false,
+            max_iterations_reached: false,
+            subtree_results: Vec::new(),
+            integration_result: None,
+            agent_traces: Vec::new(),
+            dag: ExecutionDAG {
+                nodes: std::collections::HashMap::new(),
+                roots: Vec::new(),
+                levels: Vec::new(),
+                subtrees: Vec::new(),
+            },
+            total_criteria,
+            passed_criteria: if goal_achieved { total_criteria } else { 0 },
+            total_tokens: 0,
+            total_cost_usd: 0.0,
+        }
+    }
+
+    /// Every pipeline exit converts through `to_loop_result`. A run that
+    /// derived no acceptance criterion checked nothing, so even a
+    /// `goal_achieved: true` beside it (what an `all()` over nothing returns)
+    /// is not a pass.
+    #[test]
+    fn a_pipeline_that_derived_no_criteria_never_reports_passed() {
+        let loop_result = pipeline_result(0, true).to_loop_result();
+        assert!(!loop_result.verification_passed);
+        assert!(!loop_result.should_run_completion());
+    }
+
+    #[test]
+    fn no_criteria_reads_no_verification_steps_and_names_it() {
+        let result = pipeline_result(0, false);
+        let loop_result = result.to_loop_result();
+        assert!(!loop_result.verification_passed);
+        assert!(loop_result.no_verification_steps);
+        assert!(!loop_result.critical_failure);
+        assert!(!loop_result.max_iterations_reached);
+        assert_eq!(
+            result.summary(),
+            "No acceptance criteria derived — nothing to verify, which is not a pass"
+        );
+    }
+
+    #[test]
+    fn one_satisfied_criterion_still_passes() {
+        let loop_result = pipeline_result(1, true).to_loop_result();
+        assert!(loop_result.verification_passed);
+        assert!(!loop_result.no_verification_steps);
+    }
+
+    #[test]
+    fn many_criteria_follow_goal_achieved() {
+        let passed = pipeline_result(3, true).to_loop_result();
+        assert!(passed.verification_passed);
+        assert!(!passed.no_verification_steps);
+
+        let failed = pipeline_result(3, false).to_loop_result();
+        assert!(!failed.verification_passed);
+        assert!(!failed.no_verification_steps);
     }
 }

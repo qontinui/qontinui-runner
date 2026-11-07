@@ -538,7 +538,7 @@ impl QontinuiWorkflow for QontinuiWorkflowImpl {
 
         // SharedWorkflowContext is read-only — cannot call set().
         // Instead, signal the stop through the database. The running workflow's
-        // is_stop_requested() polls PG for status == "cancelling" || "stopped".
+        // per-iteration stop check in `run` polls PG for status == "cancelling" || "stopped".
         let app_state = get_app_state()?;
         if let Err(e) = app_state
             .pg_db

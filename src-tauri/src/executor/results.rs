@@ -572,44 +572,6 @@ impl IntoOutcome for crate::unified_workflow_executor::SetupResult {
     }
 }
 
-/// Implement IntoOutcome for VerificationResult
-impl IntoOutcome for crate::unified_workflow_executor::VerificationResult {
-    fn into_outcome(self, duration_ms: u64) -> ExecutionOutcome {
-        let phase_result = &self.phase_result;
-
-        if phase_result.all_passed {
-            ExecutionOutcome::success("Verification phase passed")
-                .with_duration(duration_ms)
-                .with_output("iteration", serde_json::json!(phase_result.iteration))
-                .with_output("passed_steps", serde_json::json!(phase_result.passed_steps))
-                .with_output("total_steps", serde_json::json!(phase_result.total_steps))
-        } else {
-            let summary = if phase_result.critical_failure {
-                "Verification phase failed with critical failure"
-            } else {
-                "Verification phase failed"
-            };
-
-            ExecutionOutcome::failure(
-                summary,
-                ExecutionError::execution(format!(
-                    "{}/{} steps failed",
-                    phase_result.failed_steps, phase_result.total_steps
-                )),
-            )
-            .with_duration(duration_ms)
-            .with_output("iteration", serde_json::json!(phase_result.iteration))
-            .with_output("passed_steps", serde_json::json!(phase_result.passed_steps))
-            .with_output("failed_steps", serde_json::json!(phase_result.failed_steps))
-            .with_output("total_steps", serde_json::json!(phase_result.total_steps))
-            .with_output(
-                "critical_failure",
-                serde_json::json!(phase_result.critical_failure),
-            )
-        }
-    }
-}
-
 /// Implement IntoOutcome for CompletionResult
 impl IntoOutcome for crate::unified_workflow_executor::CompletionResult {
     fn into_outcome(self, duration_ms: u64) -> ExecutionOutcome {

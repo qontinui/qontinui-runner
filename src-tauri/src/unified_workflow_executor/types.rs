@@ -1431,16 +1431,18 @@ mod tests {
 
     #[test]
     fn loop_result_omits_node_rollups_when_empty() {
+        // Built from the required keys only, so every `#[serde(default)]` field
+        // (node_rollups, no_verification_steps, ...) takes its default without
+        // this fixture naming it.
         let lr: LoopResult = serde_json::from_value(serde_json::json!({
             "iterations_run": 1,
             "verification_passed": true,
             "max_iterations_reached": false,
             "critical_failure": false,
             "was_stopped": false,
-            "unfixable_errors": false,
             "iteration_results": [],
         }))
-        .unwrap();
+        .expect("a LoopResult from its required keys");
         assert!(lr.node_rollups.is_empty());
         let v = serde_json::to_value(&lr).unwrap();
         assert!(

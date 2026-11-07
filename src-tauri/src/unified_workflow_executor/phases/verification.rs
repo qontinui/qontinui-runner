@@ -7,7 +7,6 @@ use std::sync::Arc;
 use tracing::{debug, info, instrument, warn};
 
 use crate::config_storage::ConfigStorage;
-use crate::executor::{ExecutionOutcome, IntoOutcome};
 use crate::step_executor::{
     ExecutionStepConfig, StepExecutionResult, StepExecutor, VerificationPhaseResult,
 };
@@ -17,7 +16,6 @@ use crate::step_types::StepType;
 use crate::workflow_state::{in_stage, CheckpointManager, StepCheckpoint};
 use crate::AppState;
 
-use super::super::phase_configs::{VerificationConfig, VerificationResult};
 use super::super::phase_helpers::{
     clear_console_errors, fetch_browser_events_from_ui_bridge, fetch_console_errors_from_ui_bridge,
     fetch_health_from_ui_bridge, fetch_network_failures_from_ui_bridge,
@@ -114,7 +112,7 @@ impl VerificationExecutor {
         let steps: Vec<ExecutionStepConfig> = steps
             .iter()
             .filter(|step| {
-                if step.dev_mode_only.unwrap_or(false) && !cfg!(debug_assertions) {
+                if !step.runs_in_build(cfg!(debug_assertions)) {
                     info!(
                         "VERIFICATION-PHASE: Skipping dev-mode-only step: {:?}",
                         step.name
@@ -350,45 +348,6 @@ impl VerificationExecutor {
 
         let step_results = result.step_results.clone();
         (result, step_results)
-    }
-
-    /// Run verification and return a unified ExecutionOutcome.
-    ///
-    /// This uses the IntoOutcome trait to convert the VerificationResult into a
-    /// standardized ExecutionOutcome, which is useful for consistent result handling.
-    ///
-    /// # Arguments
-    /// * `config` - The verification configuration
-    /// * `logger` - Logger for step events
-    ///
-    /// # Returns
-    /// An `ExecutionOutcome` summarizing the verification phase execution.
-    pub async fn run_verification_to_outcome(
-        &self,
-        config: &VerificationConfig,
-        logger: &StepEventLogger,
-    ) -> ExecutionOutcome {
-        let start = std::time::Instant::now();
-
-        let (phase_result, step_results) = self
-            .run_verification(
-                &config.steps,
-                &config.execution_id,
-                config.iteration,
-                &config.workflow_name,
-                logger,
-                None,
-            )
-            .await;
-
-        let duration_ms = start.elapsed().as_millis() as u64;
-
-        // Use the IntoOutcome trait for consistent conversion
-        let result = VerificationResult {
-            phase_result,
-            step_results,
-        };
-        result.into_outcome(duration_ms)
     }
 
     /// Run a subset of verification steps by their indices.
