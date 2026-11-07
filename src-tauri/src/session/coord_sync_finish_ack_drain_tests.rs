@@ -109,7 +109,10 @@ async fn a_2xx_whose_row_reads_working_is_not_stamped_and_the_row_is_kept() {
     assert!(acks.lock().unwrap().is_empty(), "never stamped");
     let kept = pending_of(&outbox, s);
     assert_eq!(kinds(&kept), vec!["finished"], "the finish stays queued");
-    let retry = state.retry.get(&s).expect("the session is on its own backoff");
+    let retry = state
+        .retry
+        .get(&s)
+        .expect("the session is on its own backoff");
     assert_eq!(retry.failures, 1);
     assert_eq!(retry.serving_failures, 0, "never charged to the quarantine");
     assert_eq!(retry.unconfirmed_finish, Some(((s, kept[0].0), 1)));
@@ -172,10 +175,16 @@ async fn five_unconfirmed_answers_drop_the_row_unstamped_and_count_it() {
         vec![("csid-bounded".to_string(), Some(42), s)],
         "the drop hands over the row the finish was SENT to, once"
     );
-    assert!(!state.quarantined.contains(&s), "the bound fired, not the quarantine");
+    assert!(
+        !state.quarantined.contains(&s),
+        "the bound fired, not the quarantine"
+    );
     assert!(!state.retry.contains_key(&s));
     // Process-global: only this test drives a finish to its bound.
-    assert_eq!(FINISHED_UNCONFIRMED_DROPPED.load(Ordering::Relaxed) - before, 1);
+    assert_eq!(
+        FINISHED_UNCONFIRMED_DROPPED.load(Ordering::Relaxed) - before,
+        1
+    );
     let health = render_session_outbox_health(&SessionOutboxHealth {
         observed_at: Some(Utc::now()),
         finished_unconfirmed: 1,
@@ -200,7 +209,10 @@ async fn a_503_progress_write_not_applied_is_ordinary_transport() {
     assert!(acks.lock().unwrap().is_empty());
     assert_eq!(kinds(&pending_of(&outbox, s)), vec!["finished"]);
     let retry = state.retry.get(&s).expect("retried on the session backoff");
-    assert_eq!(retry.unconfirmed_finish, None, "a 5xx is not the unconfirmed bound");
+    assert_eq!(
+        retry.unconfirmed_finish, None,
+        "a 5xx is not the unconfirmed bound"
+    );
 }
 
 /// Plan 2026-11-01's refusal: dropped, and never reported as synced.
@@ -215,7 +227,10 @@ async fn a_422_stale_finish_refused_is_dropped_unstamped() {
     queue_finish(&outbox, s, "csid-422", 42);
     let mut state = DrainState::default();
     drain_tick(&coord.inner, &mut state).await;
-    assert!(acks.lock().unwrap().is_empty(), "a refusal is never a delivery");
+    assert!(
+        acks.lock().unwrap().is_empty(),
+        "a refusal is never a delivery"
+    );
     assert!(pending_of(&outbox, s).is_empty(), "the 4xx is ACK-dropped");
 }
 
@@ -295,8 +310,15 @@ async fn an_unconfirmed_finish_on_one_session_does_not_stop_another_from_drainin
     record_started(&outbox, Uuid::new_v4(), b);
     let mut state = DrainState::default();
     let tick = drain_tick(&coord.inner, &mut state).await;
-    assert_eq!(kinds(&pending_of(&outbox, a)), vec!["finished"], "A is kept");
-    assert!(pending_of(&outbox, b).is_empty(), "B drained on the same tick");
+    assert_eq!(
+        kinds(&pending_of(&outbox, a)),
+        vec!["finished"],
+        "A is kept"
+    );
+    assert!(
+        pending_of(&outbox, b).is_empty(),
+        "B drained on the same tick"
+    );
     assert!(
         rec.lock().await.posts.iter().any(|p| p["id"] == json!(b)),
         "B's started row reached coord"
@@ -341,5 +363,9 @@ async fn an_observed_ack_records_the_answering_row_on_the_mark() {
     drain_tick(&coord.inner, &mut state).await;
     let rec = store.get("csid-row").unwrap();
     assert!(rec.finish_synced);
-    assert_eq!(rec.finish_coord_session_id, Some(s), "the row the PATCH addressed");
+    assert_eq!(
+        rec.finish_coord_session_id,
+        Some(s),
+        "the row the PATCH addressed"
+    );
 }
