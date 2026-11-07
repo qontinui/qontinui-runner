@@ -708,16 +708,27 @@ fn pty_holder_trickling_peer_cannot_stretch_the_probe_deadline() {
     };
     let listener = UnixListener::bind(dir.join("p1.sock")).unwrap();
     let step = Duration::from_millis(150);
+    // A valid hello_ack, sent one byte per `step`.
+    let ack = qontinui_pty_holder::frame::encode_frame(
+        KIND_CONTROL,
+        br#"{"type":"hello_ack","version":1,"holder_build":"x","holder_pid":1,"child_pid":null}"#,
+    )
+    .unwrap();
+    let deadline = Duration::from_millis(500);
+    // What this pins is that the probe ends by its own deadline, not how
+    // promptly a loaded CI runner schedules it, so the bound is several
+    // deadlines wide (the same treatment as qontinui-runner#2105 gave the
+    // server's handshake-timeout test; the old fixed 300 ms of slack was
+    // scheduler latency alone away from a red).
+    let bound = deadline * 4;
+    // Self-check: a probe with only per-syscall timeouts would wait out the
+    // whole trickle, which must outlast the bound by a clear margin or this
+    // test could not tell the two probes apart.
+    assert!(step * (ack.len() as u32) > bound * 3);
     std::thread::spawn(move || {
         if let Ok((mut s, _)) = listener.accept() {
             let mut buf = [0u8; 64];
             let _ = s.read(&mut buf);
-            // A valid hello_ack, one byte per `step`.
-            let ack = qontinui_pty_holder::frame::encode_frame(
-                KIND_CONTROL,
-                br#"{"type":"hello_ack","version":1,"holder_build":"x","holder_pid":1,"child_pid":null}"#,
-            )
-            .unwrap();
             for b in ack {
                 std::thread::sleep(step);
                 if s.write_all(&[b]).is_err() {
@@ -727,7 +738,6 @@ fn pty_holder_trickling_peer_cannot_stretch_the_probe_deadline() {
         }
     });
 
-    let deadline = Duration::from_millis(500);
     let started = Instant::now();
     let verdict = probe(&dir, &pane, started + deadline);
     let took = started.elapsed();
@@ -738,9 +748,16 @@ fn pty_holder_trickling_peer_cannot_stretch_the_probe_deadline() {
         ),
         other => panic!("a reply that cannot arrive by the deadline is Unknown: {other:?}"),
     }
-    // Per-syscall timeouts would have taken ~90 bytes x 150 ms.
+    // The reason string is the same for any handshake error, so only the
+    // clock can show the deadline decided rather than an early refusal. Half
+    // the deadline catches an immediate give-up without making timer
+    // rounding a new way to flake.
     assert!(
-        took < deadline + Duration::from_millis(300),
+        took >= deadline / 2,
+        "probe gave up before its deadline: {took:?}"
+    );
+    assert!(
+        took < bound,
         "probe overran its deadline: {took:?}"
     );
     let _ = std::fs::remove_dir_all(&dir);
