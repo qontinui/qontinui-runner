@@ -904,6 +904,15 @@
     {
       "class": "os_bound_tooling",
       "file": "src/ui_thread_probe.rs",
+      "symbol": "publish_ui_thread_of",
+      "excerpt": "cfg(windows)-only fn `publish_ui_thread_of` has no cfg(not(windows)) sibling in this file",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "Captures the main window's owning thread id via GetWindowThreadProcessId when the HWND is cached; called only from the cfg(windows) HWND-cache path, and off Windows there is no HWND and no UI-thread identity to record."
+    },
+    {
+      "class": "os_bound_tooling",
+      "file": "src/ui_thread_probe.rs",
       "symbol": "resolve_own_main_window",
       "excerpt": "cfg(windows)-only fn `resolve_own_main_window` has no cfg(not(windows)) sibling in this file",
       "count": 1,
@@ -972,6 +981,15 @@
       "excerpt": "cfg(windows)-only fn `thread_description` has no cfg(not(windows)) sibling in this file",
       "count": 1,
       "disposition": "unreviewed"
+    },
+    {
+      "class": "os_bound_tooling",
+      "file": "src/wedge_diagnostics.rs",
+      "symbol": "thread_state",
+      "excerpt": "cfg(windows)-only fn `thread_state` has no cfg(not(windows)) sibling in this file",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "Reads one thread's kernel state and wait reason for the wedge-diagnostics `ui_thread` field; called only from the cfg(windows) census, and off Windows the field is omitted from the record."
     },
     {
       "class": "os_bound_tooling",

@@ -16,7 +16,7 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `fleet_host_name` | 0 | 0 | 0 | 0 | 0 | 0 |
 | `fleet_device_uuid` | 0 | 0 | 0 | 0 | 0 | 0 |
 | `plans_dir` | 34 | 35 | 34 | 0 | 0 | 0 |
-| `os_bound_tooling` | 98 | 99 | 96 | 2 | 0 | 0 |
+| `os_bound_tooling` | 100 | 101 | 96 | 4 | 0 | 0 |
 
 ## `repo_layout` (79 rows)
 
@@ -257,7 +257,7 @@ _No hits._
 | `src/plans_dir_migration.rs` | `persist_env_plans_dir` | `let existing = get_setting::<PathSettings>().plans_dir;` | 1 | unreviewed |
 | `src/plans_dir_migration.rs` | `persist_env_plans_dir` | `update_setting::<PathSettings, _>(\|paths\| paths.plans_dir = Some(value.clone()))?;` | 1 | unreviewed |
 
-## `os_bound_tooling` (98 rows)
+## `os_bound_tooling` (100 rows)
 
 | file | symbol | excerpt | n | disposition |
 |---|---|---|---:|---|
@@ -340,6 +340,7 @@ _No hits._
 | `src/step_executor/legacy_steps.rs` | `StepExecutor::execute_shell_command_step` | `let mut c = crate::process_helpers::tokio_no_window("powershell");` | 1 | unreviewed |
 | `src/terminal/claude_resume_sniff.rs` | `is_claude_program` | `matches!(base, "claude" \| "claude.exe" \| "claude.cmd" \| "claude.ps1")` | 1 | unreviewed |
 | `src/terminal/session.rs` | `TerminalSession::assign_to_job_object` | `cfg(windows)-only fn 'assign_to_job_object' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
+| `src/ui_thread_probe.rs` | `publish_ui_thread_of` | `cfg(windows)-only fn 'publish_ui_thread_of' has no cfg(not(windows)) sibling in this file` | 1 | fallback_correct — Captures the main window's owning thread id via GetWindowThreadProcessId when the HWND is cached; called only from the cfg(windows) HWND-cache path, and off Windows there is no HWND and no UI-thread identity to record. |
 | `src/ui_thread_probe.rs` | `resolve_own_main_window` | `cfg(windows)-only fn 'resolve_own_main_window' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/webview_recovery.rs` | `attach_process_failed` | `cfg(windows)-only fn 'attach_process_failed' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/webview_recovery.rs` | `is_terminal_for_a_non_main_webview` | `cfg(windows)-only fn 'is_terminal_for_a_non_main_webview' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
@@ -349,6 +350,7 @@ _No hits._
 | `src/wedge_diagnostics.rs` | `names` | `cfg(windows)-only fn 'names' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/wedge_diagnostics.rs` | `own_threads` | `cfg(windows)-only fn 'own_threads' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/wedge_diagnostics.rs` | `thread_description` | `cfg(windows)-only fn 'thread_description' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
+| `src/wedge_diagnostics.rs` | `thread_state` | `cfg(windows)-only fn 'thread_state' has no cfg(not(windows)) sibling in this file` | 1 | fallback_correct — Reads one thread's kernel state and wait reason for the wedge-diagnostics 'ui_thread' field; called only from the cfg(windows) census, and off Windows the field is omitted from the record. |
 | `src/win32_compat.rs` | `ThreadDpiContextGuard::drop` | `cfg(windows)-only fn 'drop' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/win32_compat.rs` | `ThreadDpiContextGuard::is_active` | `cfg(windows)-only fn 'is_active' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/win32_compat.rs` | `ThreadDpiContextGuard::set_per_monitor_v2` | `cfg(windows)-only fn 'set_per_monitor_v2' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
