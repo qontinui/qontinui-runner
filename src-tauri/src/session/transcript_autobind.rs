@@ -110,7 +110,7 @@ pub enum Decision {
 /// defer, never a tenant-less row.
 pub fn decide(resolution: &RowResolution, mint_tenant: Option<Uuid>) -> Decision {
     match resolution {
-        RowResolution::Existing(id) => Decision::Adopt(*id),
+        RowResolution::Existing { id, .. } => Decision::Adopt(*id),
         RowResolution::Unknown => match mint_tenant {
             Some(t) => Decision::Mint(t),
             None => Decision::Defer("minting not licensed for this transcript".to_string()),
@@ -321,7 +321,34 @@ pub fn apply_decision(
     }
 }
 
+/// Pure: the live pane's row to adopt INSTEAD of the row coord served, or
+/// `None` to keep coord's answer. Only when coord served a row whose liveness
+/// state is known and is not `active` (coord's work-status names the newest
+/// row in ANY state, so it can name a closed row while an older one is live),
+/// and the live terminal pinned to the harness id is bound to a DIFFERENT row
+/// (`live`, from [`AiCoordRegistrar::live_coord_row`](crate::claude_session::coord_register::AiCoordRegistrar::live_coord_row)).
+/// An unserved state is not known to be closed, so it changes nothing. Plan
+/// `2026-11-07-a-runner-finish-is-addressed-to-a-stale-coord-row-after-a-pane-respawn`
+/// Phase 2.
+fn live_row_over_inactive(resolution: &RowResolution, live: Option<Uuid>) -> Option<Uuid> {
+    let RowResolution::Existing {
+        id,
+        state: Some(state),
+    } = resolution
+    else {
+        return None;
+    };
+    if state.trim() == "active" {
+        return None;
+    }
+    live.filter(|l| l != id)
+}
+
 /// Settle what to do for an unbound transcript once coord has answered.
+///
+/// A served row that is not `active` is declined in favour of the live
+/// pane's own row when one is bound ([`live_row_over_inactive`], counted as
+/// `autobind_closed_row_declined`); otherwise coord's answer stands.
 ///
 /// Only an `unknown` answer reaches the mint arm, and it is licensed in two
 /// steps before any row is written: an undelivered `Started` already in the
@@ -333,6 +360,18 @@ async fn settle(
     identity: &TranscriptIdentity,
     resolution: &RowResolution,
 ) -> Decision {
+    if let RowResolution::Existing { id, state } = resolution {
+        let live = tailer.live_coord_row(&identity.claude_session_id);
+        if let Some(live) = live_row_over_inactive(resolution, live) {
+            info!(
+                "transcript_autobind: {} — coord served row {} in state {:?}; adopting the \
+                 live pane's row {} instead",
+                identity.claude_session_id, id, state, live
+            );
+            tailer.note_autobind_closed_row_declined();
+            return Decision::Adopt(live);
+        }
+    }
     if !matches!(resolution, RowResolution::Unknown) {
         return decide(resolution, None);
     }
@@ -482,7 +521,13 @@ mod tests {
         let row = Uuid::new_v4();
         let tenant = Uuid::new_v4();
         assert_eq!(
-            decide(&RowResolution::Existing(row), None),
+            decide(
+                &RowResolution::Existing {
+                    id: row,
+                    state: None
+                },
+                None
+            ),
             Decision::Adopt(row)
         );
         assert_eq!(
@@ -698,6 +743,71 @@ mod tests {
             None,
             "another session's pending Started is not this one's"
         );
+    }
+
+    fn served(id: Uuid, state: &str) -> RowResolution {
+        RowResolution::Existing {
+            id,
+            state: Some(state.to_string()),
+        }
+    }
+
+    fn identity() -> TranscriptIdentity {
+        TranscriptIdentity {
+            claude_session_id: CSID.to_string(),
+            config_dir: "/home/u/.claude".to_string(),
+            account_label: ".claude".to_string(),
+        }
+    }
+
+    /// Plan `2026-11-07-...-after-a-pane-respawn` Phase 2: coord served a
+    /// CLOSED row while the live pane pinned to this harness id is bound to
+    /// another — the pane's row is adopted, and the decline is counted.
+    #[tokio::test]
+    async fn a_closed_served_row_yields_to_the_live_pinned_terminals_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let (t, r, _o) = tailer(dir.path());
+        let (closed, live) = (Uuid::new_v4(), Uuid::new_v4());
+        r.attach_terminal_coord_lookup(move |c| (c == CSID).then_some(live));
+        assert_eq!(
+            settle(&t, &identity(), &served(closed, "closed")).await,
+            Decision::Adopt(live)
+        );
+        assert_eq!(t.coverage().autobind_closed_row_declined, 1);
+    }
+
+    #[tokio::test]
+    async fn a_closed_served_row_with_no_live_terminal_is_adopted_as_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let (t, _r, _o) = tailer(dir.path());
+        let closed = Uuid::new_v4();
+        assert_eq!(
+            settle(&t, &identity(), &served(closed, "closed")).await,
+            Decision::Adopt(closed)
+        );
+        assert_eq!(t.coverage().autobind_closed_row_declined, 0);
+    }
+
+    #[tokio::test]
+    async fn an_active_served_row_is_adopted_even_beside_a_live_terminal() {
+        let dir = tempfile::tempdir().unwrap();
+        let (t, r, _o) = tailer(dir.path());
+        let (active, other) = (Uuid::new_v4(), Uuid::new_v4());
+        r.attach_terminal_coord_lookup(move |c| (c == CSID).then_some(other));
+        assert_eq!(
+            settle(&t, &identity(), &served(active, "active")).await,
+            Decision::Adopt(active)
+        );
+        // An unserved state is not known to be closed: unchanged too.
+        let unserved = RowResolution::Existing {
+            id: active,
+            state: None,
+        };
+        assert_eq!(
+            settle(&t, &identity(), &unserved).await,
+            Decision::Adopt(active)
+        );
+        assert_eq!(t.coverage().autobind_closed_row_declined, 0);
     }
 
     #[test]

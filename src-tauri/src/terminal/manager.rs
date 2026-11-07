@@ -247,9 +247,16 @@ fn is_within(dir: &str, root: &str) -> bool {
 }
 
 /// The rule behind [`TerminalManager::coord_session_id_for_pinned`], over
-/// `(pinned harness id, coord session id)` for every live terminal — pure so
-/// the production rule is unit-testable without a PTY: the coord row of a live
-/// terminal PINNED to `claude_session_id` that has one.
+/// `(pinned harness id, (coord session id, bind order))` for every live
+/// terminal — pure so the production rule is unit-testable without a PTY: the
+/// coord row of a live terminal PINNED to `claude_session_id` that has one.
+///
+/// When several live terminals are pinned to the id (a respawn or account
+/// migration whose old pane has not closed yet), the MOST RECENTLY BOUND one
+/// wins (largest bind order, [`super::session::TerminalSession::coord_binding`]):
+/// every pane spawn mints a fresh coord row, and the newest is the live one.
+/// The iteration order of the manager's map never decides it (plan
+/// `2026-11-07-a-runner-finish-is-addressed-to-a-stale-coord-row-after-a-pane-respawn`).
 ///
 /// It resolves by pinned id ONLY. A session the provider adopted onto a
 /// terminal (`/clear`) resolves through its predecessor's id instead
@@ -257,12 +264,14 @@ fn is_within(dir: &str, root: &str) -> bool {
 /// happens to name: a typed `claude --resume X` names a pane pinned to some
 /// other id, and that pane's row is not X's.
 pub(crate) fn resolve_pinned_coord<'a>(
-    terminals: impl Iterator<Item = (&'a str, Option<uuid::Uuid>)>,
+    terminals: impl Iterator<Item = (&'a str, Option<(uuid::Uuid, u64)>)>,
     claude_session_id: &str,
 ) -> Option<uuid::Uuid> {
     terminals
         .filter(|(pinned, _)| *pinned == claude_session_id)
-        .find_map(|(_, coord)| coord)
+        .filter_map(|(_, binding)| binding)
+        .max_by_key(|(_, bound_seq)| *bound_seq)
+        .map(|(coord, _)| coord)
 }
 
 impl TerminalManager {
@@ -314,7 +323,7 @@ impl TerminalManager {
         resolve_pinned_coord(
             sessions
                 .values()
-                .map(|s| (s.pinned_session_id(), s.coord_session_id())),
+                .map(|s| (s.pinned_session_id(), s.coord_binding())),
             pinned_session_id,
         )
     }
@@ -1353,12 +1362,12 @@ mod tests {
         let (c1, c2) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
         let live = || {
             vec![
-                ("pinned-1", Some(c1)),
-                ("pinned-2", Some(c2)),
+                ("pinned-1", Some((c1, 1))),
+                ("pinned-2", Some((c2, 2))),
                 ("pinned-3", None),
                 // A second terminal pinned to the same id (a re-spawn) — the
                 // one with a row wins over the one without.
-                ("pinned-3", Some(c2)),
+                ("pinned-3", Some((c2, 3))),
                 ("pinned-4", None),
             ]
             .into_iter()
@@ -1376,6 +1385,41 @@ mod tests {
             None,
             "an id no terminal is pinned to never resolves by terminal"
         );
+    }
+
+    /// Plan `2026-11-07-a-runner-finish-is-addressed-to-a-stale-coord-row-after-a-pane-respawn`
+    /// Phase 1: two live panes pinned to one harness id (a respawn or
+    /// migration whose old pane is still up) resolve to the row bound LAST,
+    /// whatever order the manager's map yields them in.
+    #[test]
+    fn two_panes_pinned_to_one_id_resolve_to_the_newest_bound() {
+        use super::resolve_pinned_coord;
+        let (old, new) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let forward = [("p", Some((old, 10))), ("p", Some((new, 11)))];
+        let backward = [("p", Some((new, 11))), ("p", Some((old, 10)))];
+        assert_eq!(resolve_pinned_coord(forward.into_iter(), "p"), Some(new));
+        assert_eq!(resolve_pinned_coord(backward.into_iter(), "p"), Some(new));
+
+        // And through the production door: two live panes pinned to the same
+        // id in the manager's map; `bind_coord_session` stamps the order.
+        use std::sync::{Arc, Mutex};
+        let pane = || {
+            Arc::new(crate::terminal::session::tests::make_test_session(
+                Arc::new(Mutex::new(Vec::new())),
+            ))
+        };
+        let (a, b) = (pane(), pane());
+        let pinned = a.pinned_session_id().to_string();
+        assert_eq!(b.pinned_session_id(), pinned, "precondition: one pinned id");
+        let tm = TerminalManager::new();
+        tm.insert_for_test("term-a", a.clone());
+        tm.insert_for_test("term-b", b.clone());
+        tm.bind_coord_session(&a, old);
+        tm.bind_coord_session(&b, new);
+        assert_eq!(tm.coord_session_id_for_pinned(&pinned), Some(new));
+        // Re-binding the other pane makes IT the newest.
+        tm.bind_coord_session(&a, old);
+        assert_eq!(tm.coord_session_id_for_pinned(&pinned), Some(old));
     }
 
     /// Every close path clears BOTH remote maps. `close` and `close_all`
