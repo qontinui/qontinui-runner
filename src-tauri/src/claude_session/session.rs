@@ -673,7 +673,7 @@ impl ClaudeSession {
         let heartbeat_handle = thread::spawn(move || {
             let mut last_update = 0u64;
             loop {
-                if stop_rx.try_recv().is_ok() {
+                if super::heartbeat::heartbeat_should_stop(&stop_rx) {
                     break;
                 }
                 thread::sleep(Duration::from_millis(100));

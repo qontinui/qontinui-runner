@@ -2,16 +2,16 @@
  * useBackgroundActivities.ts
  *
  * Hook for tracking all background activities in the application.
- * Aggregates web extraction, AI tasks, and data transmission states
+ * Aggregates web extraction and web sync states
  * into a unified interface for display in the status bar.
  *
  * Only returns active activities - no notifications for inactivity.
  */
 
-import { useState, useEffect, useCallback, useMemo } from "react";
+import { useState, useEffect, useMemo } from "react";
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
 
-export type ActivityType = "extraction" | "ai" | "sync";
+export type ActivityType = "extraction" | "sync";
 
 export interface BackgroundActivity {
   id: string;
@@ -27,8 +27,6 @@ interface UseBackgroundActivitiesProps {
   isExtracting: boolean;
   extractionUrl?: string;
   extractionProgress?: { pages_extracted: number; total_pages: number };
-
-  // AI task tracking is handled internally via events
 }
 
 interface UseBackgroundActivitiesReturn {
@@ -45,11 +43,6 @@ export function useBackgroundActivities({
   extractionUrl,
   extractionProgress,
 }: UseBackgroundActivitiesProps): UseBackgroundActivitiesReturn {
-  // Track AI sessions that are currently active
-  const [activeAiSessions, setActiveAiSessions] = useState<
-    Map<string, { name: string; startedAt: Date }>
-  >(new Map());
-
   // Track web sync operations
   const [activeSync, setActiveSync] = useState<{
     label: string;
@@ -81,74 +74,6 @@ export function useBackgroundActivities({
       setExtractionState({ isExtracting: false });
     }
   }, [isExtracting, extractionUrl, extractionProgress, extractionState.isExtracting]);
-
-  // Listen for AI output events to track active AI sessions
-  useEffect(() => {
-    let unlisten: UnlistenFn | null = null;
-
-    const setupListener = async () => {
-      unlisten = await listen<{
-        line?: string;
-        source?: string;
-        actionId?: string;
-        sessionId?: string;
-        sessionName?: string;
-      }>("ai-output", (event) => {
-        const { sessionId, sessionName, line } = event.payload;
-
-        if (sessionId) {
-          // Check for session end markers
-          if (
-            line?.includes("[TASK_COMPLETE]") ||
-            line?.includes("Session ended") ||
-            line?.includes("Error:")
-          ) {
-            setActiveAiSessions((prev) => {
-              const next = new Map(prev);
-              next.delete(sessionId);
-              return next;
-            });
-          } else {
-            // Only show workflow sessions in the status bar (not chats)
-            // Workflow sessions have phase suffixes like " - Setup", " - Verification", " - Iteration", " - Completion"
-            const name = sessionName || "";
-            const isWorkflowSession =
-              name.includes(" - Setup") ||
-              name.includes(" - Verification") ||
-              name.includes(" - Iteration") ||
-              name.includes(" - Completion");
-
-            if (isWorkflowSession) {
-              setActiveAiSessions((prev) => {
-                if (!prev.has(sessionId)) {
-                  // Extract just the workflow name (before the phase suffix)
-                  const shortName = name.replace(
-                    / - (Setup|Verification \d+|Iteration \d+|Completion)$/,
-                    "",
-                  );
-                  const truncated =
-                    shortName.length > 40 ? shortName.slice(0, 37) + "..." : shortName;
-                  const next = new Map(prev);
-                  next.set(sessionId, {
-                    name: truncated,
-                    startedAt: new Date(),
-                  });
-                  return next;
-                }
-                return prev;
-              });
-            }
-          }
-        }
-      });
-    };
-
-    setupListener();
-
-    return () => {
-      unlisten?.();
-    };
-  }, []);
 
   // Listen for executor events (extraction and sync operations)
   useEffect(() => {
@@ -252,16 +177,6 @@ export function useBackgroundActivities({
       });
     }
 
-    // AI Sessions
-    activeAiSessions.forEach((session, sessionId) => {
-      result.push({
-        id: `ai-${sessionId}`,
-        type: "ai",
-        label: session.name,
-        startedAt: session.startedAt,
-      });
-    });
-
     // Web Sync
     if (activeSync) {
       result.push({
@@ -273,29 +188,7 @@ export function useBackgroundActivities({
     }
 
     return result;
-  }, [extractionState, extractionUrl, extractionProgress, activeAiSessions, activeSync]);
-
-  // Clear stale AI sessions after 10 minutes of no updates
-  const clearStaleAiSessions = useCallback(() => {
-    const tenMinutesAgo = new Date(Date.now() - 10 * 60 * 1000);
-    setActiveAiSessions((prev) => {
-      const next = new Map(prev);
-      let changed = false;
-      next.forEach((session, id) => {
-        if (session.startedAt < tenMinutesAgo) {
-          next.delete(id);
-          changed = true;
-        }
-      });
-      return changed ? next : prev;
-    });
-  }, []);
-
-  // Periodically clean up stale sessions
-  useEffect(() => {
-    const interval = setInterval(clearStaleAiSessions, 60000); // Every minute
-    return () => clearInterval(interval);
-  }, [clearStaleAiSessions]);
+  }, [extractionState, extractionUrl, extractionProgress, activeSync]);
 
   return {
     activities,
