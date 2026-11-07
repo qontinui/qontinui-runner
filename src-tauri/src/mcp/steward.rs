@@ -1008,7 +1008,7 @@ pub async fn steward_start_handler(
     Path(kind): Path<String>,
     Json(request): Json<StewardStartRequest>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    start_steward(
+    start_steward_detached(
         state.app_handle.clone(),
         kind,
         request,
@@ -1029,7 +1029,7 @@ pub async fn steward_start(
     mode: Option<String>,
     interval: Option<String>,
 ) -> Result<serde_json::Value, String> {
-    match start_steward(
+    match start_steward_detached(
         app_handle,
         kind,
         StewardStartRequest { mode, interval },
@@ -1075,7 +1075,7 @@ pub(crate) async fn restart_after_drain(
     app_handle: tauri::AppHandle,
     kind: &str,
 ) -> Result<RestartOutcome, String> {
-    match start_steward(
+    match start_steward_detached(
         app_handle,
         kind.to_string(),
         StewardStartRequest {
@@ -1144,6 +1144,18 @@ pub(crate) enum RestartOutcome {
 /// The shared start path behind the HTTP route and the Tauri command. `origin`
 /// decides how the coord device drain applies: `Steward` (autonomous) is
 /// deferred while the drain holds, `OperatorTerminal` is not.
+async fn start_steward_detached(
+    app_handle: tauri::AppHandle,
+    kind: String,
+    request: StewardStartRequest,
+    origin: crate::coord_drain_state::SpawnOrigin,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    // Detached, so a client that disconnects while the create runs off-worker
+    // cannot drop this start after the PTY opened: the steward would never be
+    // recorded, `stop` could not find it, and a retry would open a second pane.
+    crate::spawn_off_worker::run_detached(start_steward(app_handle, kind, request, origin)).await
+}
+
 async fn start_steward(
     app_handle: tauri::AppHandle,
     kind: String,
@@ -1249,34 +1261,43 @@ async fn start_steward(
         spec.skill, mode, interval
     );
 
-    match terminal_manager.create(
-        Some(spec.skill.to_string()),
-        None, // working_dir — default to workspace root
-        None, // page_id — default "default"
-        None, // cols — default
-        None, // rows — default
-        app_handle,
-        None, // command override — interactive shell, we type the command in
-        // The shared session-env contribution. No isolated edit context here
-        // (a steward runs in the shared checkout), so `QONTINUI_SESSION_WORKTREES`
-        // is omitted exactly as before — but a steward is an agent session and
-        // must still learn where the plans live. See `agent_worktree::session_env`.
-        // No tenant key either: a steward runs under the machine default tenant
-        // (`None` below), so it reads the device-default directories.
-        crate::agent_worktree::session_env::session_extra_env(None, None),
-        // UNATTENDED spawn — respect the critical floor. A steward is a
-        // long-running autonomous agent session; starting one on a box
-        // that is already out of commit is how the incident's `claude`-inside-a-
-        // terminal deaths happened. The refusal returns as this endpoint's error
-        // body (with lane/headroom/floor), and stewards are explicitly
-        // restartable, so a refusal defers the steward rather than losing it.
-        false,
-        // Interactive shell; the skill command is typed in afterwards and the
-        // account is chosen then, so the every-account mint applies.
-        crate::terminal::TrustArm::AccountChosenLater,
-        // A steward session runs under the machine default tenant.
-        None,
-    ) {
+    // Off the API runtime's workers: this create can block for seconds to
+    // minutes (see `spawn_off_worker`).
+    let created = {
+        let terminal_manager = terminal_manager.clone();
+        crate::spawn_off_worker::run_terminal_create_off_worker(move || {
+            terminal_manager.create(
+                Some(spec.skill.to_string()),
+                None, // working_dir — default to workspace root
+                None, // page_id — default "default"
+                None, // cols — default
+                None, // rows — default
+                app_handle,
+                None, // command override — interactive shell, we type the command in
+                // The shared session-env contribution. No isolated edit context here
+                // (a steward runs in the shared checkout), so `QONTINUI_SESSION_WORKTREES`
+                // is omitted exactly as before — but a steward is an agent session and
+                // must still learn where the plans live. See `agent_worktree::session_env`.
+                // No tenant key either: a steward runs under the machine default tenant
+                // (`None` below), so it reads the device-default directories.
+                crate::agent_worktree::session_env::session_extra_env(None, None),
+                // UNATTENDED spawn — respect the critical floor. A steward is a
+                // long-running autonomous agent session; starting one on a box
+                // that is already out of commit is how the incident's `claude`-inside-a-
+                // terminal deaths happened. The refusal returns as this endpoint's error
+                // body (with lane/headroom/floor), and stewards are explicitly
+                // restartable, so a refusal defers the steward rather than losing it.
+                false,
+                // Interactive shell; the skill command is typed in afterwards and the
+                // account is chosen then, so the every-account mint applies.
+                crate::terminal::TrustArm::AccountChosenLater,
+                // A steward session runs under the machine default tenant.
+                None,
+            )
+        })
+        .await
+    };
+    match created {
         Ok(info) => {
             info!("HTTP: Created {} terminal: {}", spec.skill, info.id);
 

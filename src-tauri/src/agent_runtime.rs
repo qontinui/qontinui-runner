@@ -7609,11 +7609,21 @@ async fn run_continuation_terminal(
         let command = Some(argv);
 
         // Bundle /vet-plan and /implement-plan into the session cwd so they resolve
-        // as project slash commands regardless of the device's ~/.claude.
-        crate::fleet_commands::provision_fleet_commands_for_session(workdir);
-        // Same for the fleet SKILLS (.claude/skills/<name>/SKILL.md) — a device with
-        // no qontinui-claude-config checkout has no skills dir at all.
-        crate::fleet_skills::provision_fleet_skills_for_session(workdir);
+        // as project slash commands regardless of the device's ~/.claude. Then do
+        // the same for the fleet SKILLS (.claude/skills/<name>/SKILL.md): a device
+        // with no qontinui-claude-config checkout has no skills dir at all. Both
+        // run on the blocking pool. Each pass joins a registry fetch and polls a
+        // `git ls-files` child, and on 2026-10-27 twenty of them ran one after
+        // another, each holding a worker (plan
+        // 2026-10-28-runner-spawn-bursts-overwhelm-the-box-beyond-the-continuation-cap, D2).
+        {
+            let wd = workdir.to_string();
+            crate::spawn_off_worker::run_provisioning_off_worker(workdir, move || {
+                crate::fleet_commands::provision_fleet_commands_for_session(&wd);
+                crate::fleet_skills::provision_fleet_skills_for_session(&wd);
+            })
+            .await;
+        }
 
         // The PTY seam derives workspace trust for the pinned account through the
         // trust gate's SYNC door, which can only read the dial cache. Warm it here,
@@ -7622,30 +7632,57 @@ async fn run_continuation_terminal(
         // and leave an unattended, interactive `claude` facing the trust dialog).
         crate::claude_session::trust_gate::warm_dial().await;
 
-        let result = crate::commands::terminal::create_tracked_terminal_session_backend(
-            &terminal_manager,
-            &session_registry,
-            app.clone(),
-            title.clone(),
-            workdir.to_string(),
-            payload.anchor_key.clone(),
-            payload.anchor_key.clone(),
-            intent_repo.clone(),
-            command,
-            ctx.take(),
-            capture_hint,
-            Some(target_page),
-            // UNATTENDED spawn — resource_override: false, i.e. this path RESPECTS
-            // the critical floor. A gate continuation is brand-new autonomous work
-            // with nobody at the keyboard to answer a dialog, and it is exactly the
-            // class of spawn that piled `claude` + `rustc` onto an already-starved
-            // box on the night of the incident. Refusing here is NOT a silent
-            // forever-refusal: the `Err` arm below calls `report_spawn_failed`, so
-            // coord learns the continuation did not start and can re-dispatch it
-            // once the box breathes — the same defer-don't-reject posture
-            // `ci_node::admission` takes for CI work.
-            false,
-        );
+        // The create is SYNCHRONOUS (ConPTY open, `CreateProcess`, coord row
+        // registration). One was measured at 38 s on 2026-10-27. So it runs on the
+        // blocking pool instead of holding an async worker for that whole time
+        // (plan 2026-10-28-runner-spawn-bursts-overwhelm-the-box-beyond-the-continuation-cap,
+        // D2). Everything it needs is moved in: the managers are `Arc` clones and
+        // the `AppHandle` is a handle clone. Boot resume and account migration
+        // already run this same create off the runtime.
+        let result = {
+            let (tm, sr, app, title, workdir) = (
+                terminal_manager.clone(),
+                session_registry.clone(),
+                app.clone(),
+                title.clone(),
+                workdir.to_string(),
+            );
+            let (slug, topic, repo, isolated) = (
+                payload.anchor_key.clone(),
+                payload.anchor_key.clone(),
+                intent_repo.clone(),
+                ctx.take(),
+            );
+            crate::spawn_off_worker::run_terminal_create_off_worker(move || {
+                crate::commands::terminal::create_tracked_terminal_session_backend(
+                    &tm,
+                    &sr,
+                    app,
+                    title,
+                    workdir,
+                    slug,
+                    topic,
+                    repo,
+                    command,
+                    isolated,
+                    capture_hint,
+                    Some(target_page),
+                    // UNATTENDED spawn — resource_override: false, i.e. this path
+                    // RESPECTS the critical floor. A gate continuation is brand-new
+                    // autonomous work with nobody at the keyboard to answer a
+                    // dialog, and it is exactly the class of spawn that piled
+                    // `claude` + `rustc` onto an already-starved box on the night
+                    // of the incident. Refusing here is NOT a silent
+                    // forever-refusal: the `Err` arm below calls
+                    // `report_spawn_failed`, so coord learns the continuation did
+                    // not start and can re-dispatch it once the box breathes — the
+                    // same defer-don't-reject posture `ci_node::admission` takes
+                    // for CI work.
+                    false,
+                )
+            })
+            .await
+        };
 
         let (terminal_id, coord_session_id) = match result {
             Ok(created) => created,
@@ -8623,27 +8660,40 @@ async fn run_condition_check_terminal(
     // sync trust gate decides on the tenant's word, not a cold cache.
     crate::claude_session::trust_gate::warm_dial().await;
 
-    let result = crate::commands::terminal::create_tracked_terminal_session_backend(
-        &terminal_manager,
-        &session_registry,
-        app.clone(),
-        title,
-        workdir,
-        None, // work_unit_slug — a condition check is not work-unit-scoped
-        None, // correlation_topic
-        None, // intent_repo — no repo edited
-        command,
-        None, // isolated_ctx — no worktree acquired
-        capture_hint,
-        Some(target_page),
-        // UNATTENDED spawn — respect the critical floor (see the gate-
-        // continuation site above for the full rationale). A condition check is
-        // the *cheapest* thing to drop when the box is out of commit: it edits
-        // nothing, commits nothing, and coord re-issues the check on its next
-        // pass, so a refusal here costs one deferred probe rather than a lost
-        // session.
-        false,
-    );
+    // Synchronous create, run on the blocking pool for the same reason as the
+    // gate-continuation site above (plan
+    // 2026-10-28-runner-spawn-bursts-overwhelm-the-box-beyond-the-continuation-cap, D2).
+    let result = {
+        let (tm, sr, app) = (
+            terminal_manager.clone(),
+            session_registry.clone(),
+            app.clone(),
+        );
+        crate::spawn_off_worker::run_terminal_create_off_worker(move || {
+            crate::commands::terminal::create_tracked_terminal_session_backend(
+                &tm,
+                &sr,
+                app,
+                title,
+                workdir,
+                None, // work_unit_slug — a condition check is not work-unit-scoped
+                None, // correlation_topic
+                None, // intent_repo — no repo edited
+                command,
+                None, // isolated_ctx — no worktree acquired
+                capture_hint,
+                Some(target_page),
+                // UNATTENDED spawn — respect the critical floor (see the gate-
+                // continuation site above for the full rationale). A condition
+                // check is the *cheapest* thing to drop when the box is out of
+                // commit: it edits nothing, commits nothing, and coord re-issues
+                // the check on its next pass, so a refusal here costs one
+                // deferred probe rather than a lost session.
+                false,
+            )
+        })
+        .await
+    };
 
     match result {
         Ok((terminal_id, coord_session_id)) => {
@@ -9865,18 +9915,28 @@ async fn run_agent_subprocess(
         }
     }
 
-    // Provision the named-subagent defs into the spawned worktree's cwd so the
-    // headless `claude` can resolve subagents the spawn prompt references
-    // (merge-specialist, repo-auditor, ...). Fail-soft: a copy error here must
-    // not abort an otherwise-launchable spawn — the agent just lacks subagents.
-    provision_agent_definitions_recorded(&primary_wt);
-    // Bundle /vet-plan and /implement-plan into the spawned worktree cwd so they
-    // resolve as project slash commands regardless of the device's ~/.claude.
-    crate::fleet_commands::provision_fleet_commands_for_session(&primary_wt);
-    // Same for the fleet SKILLS. Note provision_agent_definitions above still
-    // COPIES .claude/agents from a claude-config checkout, so agents remain
-    // absent on a device without one; skills no longer do.
-    crate::fleet_skills::provision_fleet_skills_for_session(&primary_wt);
+    // Provision the session cwd, all of it on the blocking pool: the copies, the
+    // registry fetches and the `git ls-files` probes are synchronous and would
+    // otherwise hold an async worker (plan
+    // 2026-10-28-runner-spawn-bursts-overwhelm-the-box-beyond-the-continuation-cap, D2).
+    {
+        let wd = primary_wt.clone();
+        crate::spawn_off_worker::run_provisioning_off_worker(&primary_wt, move || {
+            // The named-subagent defs, so the headless `claude` can resolve
+            // subagents the spawn prompt references (merge-specialist,
+            // repo-auditor, ...). Fail-soft: a copy error here must not abort an
+            // otherwise-launchable spawn — the agent just lacks subagents.
+            provision_agent_definitions_recorded(&wd);
+            // /vet-plan and /implement-plan, so they resolve as project slash
+            // commands regardless of the device's ~/.claude.
+            crate::fleet_commands::provision_fleet_commands_for_session(&wd);
+            // The fleet SKILLS. Note provision_agent_definitions above still
+            // COPIES .claude/agents from a claude-config checkout, so agents
+            // remain absent on a device without one; skills no longer do.
+            crate::fleet_skills::provision_fleet_skills_for_session(&wd);
+        })
+        .await;
+    }
 
     let log_path = agent_log_path(payload.agent_id);
 
@@ -11647,6 +11707,76 @@ mod tests {
     }
 
     use super::*;
+
+    // ── D2 of plan 2026-10-28-runner-spawn-bursts-overwhelm-the-box-beyond-the-
+    //    continuation-cap: the PTY create runs off the async workers ──
+
+    /// The continuation PTY create must not hold an async worker. It goes
+    /// through `spawn_off_worker::run_terminal_create_off_worker`. The pin
+    /// `spawn_off_worker::tests::continuation_terminal_create_sites_all_run_off_the_async_workers`
+    /// holds `run_continuation_terminal` and every other unattended create site
+    /// to that seam. This test is the seam's latency.
+    ///
+    /// Four stand-in creates block 2 s each (one real create was measured at
+    /// 38 s on 2026-10-27) on a 2-worker runtime. An unrelated 50 ms timer must
+    /// still finish within 50 + 500 ms. There are four creates rather than one
+    /// because a single blocked worker of two leaves the other free, and the
+    /// test could then not fail.
+    ///
+    /// Mutation check: make the seam call `create()` inline instead of through
+    /// `spawn_blocking_tracked`. Then both workers stay blocked, the timer is
+    /// about 2 s late, and this test fails.
+    #[test]
+    fn continuation_terminal_create_runs_off_the_async_workers() {
+        use crate::spawn_off_worker::test_support::{timer_delay_while_blocked, MAX_EXTRA_DELAY};
+        use std::sync::atomic::Ordering;
+
+        let (extra, outs) = timer_delay_while_blocked(4, |i, entered| async move {
+            crate::spawn_off_worker::run_terminal_create_off_worker(move || {
+                entered.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                Ok::<_, String>((format!("terminal-{i}"), None::<uuid::Uuid>))
+            })
+            .await
+        });
+        assert!(
+            extra <= MAX_EXTRA_DELAY,
+            "four 2 s terminal creates delayed a 50 ms timer by {extra:?} (bound 500ms) — the \
+             create ran on the async workers"
+        );
+        let expected: Vec<Result<(String, Option<uuid::Uuid>), String>> = (0..4)
+            .map(|i| Ok((format!("terminal-{i}"), None)))
+            .collect();
+        assert_eq!(outs, expected);
+    }
+
+    /// The seam returns the create's own refusal unchanged, so the site's
+    /// classifier (`classify_pty_spawn_error`) still sees the prefix it keys
+    /// on. A create that panics becomes an `Err` that the site's spawn-failed
+    /// arm reports, rather than a panic of the continuation task.
+    #[tokio::test]
+    async fn continuation_terminal_create_off_worker_keeps_the_create_error_and_reports_a_panic() {
+        let refused: Result<(), String> =
+            crate::spawn_off_worker::run_terminal_create_off_worker(|| {
+                Err("resource_guard:critical: threads 401 >= 400".to_string())
+            })
+            .await;
+        assert_eq!(
+            refused,
+            Err("resource_guard:critical: threads 401 >= 400".to_string())
+        );
+
+        let panicked: Result<(), String> =
+            crate::spawn_off_worker::run_terminal_create_off_worker(|| {
+                panic!("stand-in create panic")
+            })
+            .await;
+        let msg = panicked.expect_err("a panicked create must be an Err");
+        assert!(
+            msg.starts_with("terminal create task did not complete: "),
+            "{msg}"
+        );
+    }
 
     // ── presentation boot readiness (plan 2026-09-17-a-gate-continuation-
     //    delivered-before-the-runner-finishes-booting-…, Phase 1) ──

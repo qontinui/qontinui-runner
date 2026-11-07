@@ -5876,29 +5876,39 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
         let registration_dir = working_dir.clone();
         let registration_repo = effective_intent_repo.clone();
 
-        match tm.create(
-            title,
-            working_dir,
-            None,
-            cols,
-            rows,
-            api_state.app_handle.clone(),
-            None,
-            extra_env,
-            // UNATTENDED spawn — respect the critical floor. This is
-            // qontinui-web asking the runner to open a terminal over the relay
-            // WebSocket: the request originates on another machine, so the
-            // memory it is about to consume is this machine's and the person
-            // who could approve the risk is not here. The refusal travels back
-            // over the relay as this frame's error, naming lane/headroom/floor,
-            // which is what lets the web UI tell the user why.
-            false,
-            // The account is chosen after this point (a shell the relay
-            // types into), so the every-account mint applies.
-            crate::terminal::TrustArm::AccountChosenLater,
-            // No spawn tenant — see the allocate above.
-            None,
-        ) {
+        let create_app_handle = api_state.app_handle.clone();
+        // Off the API runtime's workers: this create can block for seconds to
+        // minutes (see `spawn_off_worker`).
+        let created = {
+            let tm = tm.clone();
+            crate::spawn_off_worker::run_terminal_create_off_worker(move || {
+                tm.create(
+                    title,
+                    working_dir,
+                    None,
+                    cols,
+                    rows,
+                    create_app_handle,
+                    None,
+                    extra_env,
+                    // UNATTENDED spawn — respect the critical floor. This is
+                    // qontinui-web asking the runner to open a terminal over the relay
+                    // WebSocket: the request originates on another machine, so the
+                    // memory it is about to consume is this machine's and the person
+                    // who could approve the risk is not here. The refusal travels back
+                    // over the relay as this frame's error, naming lane/headroom/floor,
+                    // which is what lets the web UI tell the user why.
+                    false,
+                    // The account is chosen after this point (a shell the relay
+                    // types into), so the every-account mint applies.
+                    crate::terminal::TrustArm::AccountChosenLater,
+                    // No spawn tenant — see the allocate above.
+                    None,
+                )
+            })
+            .await
+        };
+        match created {
             Ok(info) => {
                 if let Some(ctx) = isolated_ctx {
                     if let Some(session) = tm.get(&info.id) {
