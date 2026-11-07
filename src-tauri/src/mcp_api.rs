@@ -5779,6 +5779,12 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_claim_check",
     "coord_claim_heartbeat",
     "coord_claim_release",
+    // Plan 2026-11-06-a-regression-test-run-is-judged-by-what-it-covered-and-a-silent-run-reads-unknown
+    // Phase 8: the condition-runs read (twin `GET /coord/agent-condition-runs`,
+    // that plan's Phase 7): a tenant's condition groups, runs and coverage,
+    // for the caller's own tenant. coord's device grant is the authority; this
+    // list only forwards, so it may land ahead of coord serving the tool.
+    "coord_condition_runs",
     "coord_conflict_check",
     "coord_correct_gate",
     "coord_create_repo",
@@ -17716,6 +17722,33 @@ mod coord_mcp_body_gate_tests {
                 .allowed
                 .iter()
                 .filter(|t| t.as_str() == "coord_mark_findings_triaged")
+                .count(),
+            1,
+            "the parser must read the entry exactly once: {:?}",
+            parsed.allowed
+        );
+        assert_eq!(parsed.allowed.len(), COORD_MCP_ALLOWED_TOOLS.len());
+    }
+
+    /// Plan `2026-11-06-a-regression-test-run-is-judged-by-what-it-covered-and-a-silent-run-reads-unknown`
+    /// Phase 8: the condition-runs read forwards, and the source-text parser the
+    /// drift verdict runs over this file reads the entry back — the comment
+    /// above it must not hide it from, or add a phantom to, that parse.
+    #[test]
+    fn coord_condition_runs_is_allowed_and_parses_from_source() {
+        assert!(coord_mcp_tool_is_allowed("coord_condition_runs"));
+        assert!(
+            COORD_MCP_ALLOWED_TOOLS
+                .binary_search(&"coord_condition_runs")
+                .is_ok(),
+            "membership is a binary_search, so the entry must sit in sorted position"
+        );
+        let parsed = working_tree_tool_policy();
+        assert_eq!(
+            parsed
+                .allowed
+                .iter()
+                .filter(|t| t.as_str() == "coord_condition_runs")
                 .count(),
             1,
             "the parser must read the entry exactly once: {:?}",
