@@ -2600,9 +2600,10 @@ async fn health(
         // Coalesced view-switching (plan 2026-10-28-runner-spawn-bursts-
         // overwhelm-the-box-beyond-the-continuation-cap, D3): unattended
         // spawns switch the operator's view at most once per `windowSecs`
-        // (one window for the named origins, one for `Unknown`);
-        // `suppressedTotal` counts the rest since boot. `lastSurfaceAt` /
-        // `lastUnknownSurfaceAt: null` = no such view switch since boot.
+        // (one window for continuations and condition checks, one for the
+        // origins that only select a tab); `suppressedTotal` counts the rest
+        // since boot. `lastSurfaceAt` / `lastTabOnlySurfaceAt: null` = no such
+        // surface since boot.
         "focusCoalescer": crate::terminal::focus_coalescer::health_json(),
         "ai": {
             "configured": ai_configured,

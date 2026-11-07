@@ -74,10 +74,12 @@ export function newestAddedTabId(
 
 /**
  * `newestAddedTabId` over the tabs allowed to take the focus. A tab the runner's
- * focus coalescer suppressed (`coalesced`) still lands in the grid, but it must
- * not scroll the grid or become active: without this, a burst of unattended
- * spawns in flow mode would move the focus to each one in turn, and whatever the
- * operator next typed or inserted would go to the wrong session.
+ * focus coalescer suppressed (`coalesced`) still lands in the grid, but this
+ * does not route the focus to it: otherwise a burst of unattended spawns in flow
+ * mode would move the focus to each one in turn, and whatever the operator next
+ * typed or inserted would go to the wrong session. A tab that auto-fills the
+ * empty zone the operator has focused still becomes that zone's tab, through the
+ * zone assignment rather than this routing; no session is displaced there.
  */
 export function newestSurfacedTabId(
   prevTabIds: ReadonlySet<string>,

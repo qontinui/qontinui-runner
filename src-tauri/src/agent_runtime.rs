@@ -5218,8 +5218,11 @@ const CONDITION_CHECK_SPAWN_ORIGIN: crate::coord_drain_state::SpawnOrigin =
 /// Emit a `terminal-focus-request` to the MAIN window only — when the focus
 /// coalescer surfaces it.
 ///
-/// `origin` is why the terminal was spawned. Unattended origins are coalesced to
-/// at most one view switch per minute across all of them
+/// `origin` is why the terminal was spawned. Continuations and condition checks
+/// are coalesced to at most one view-switch decision per minute across all of
+/// them, and a looping agent's first spawn is decided in the tab-only window. The
+/// decision is made at the create, so the requests that follow their start
+/// verdicts can land closer together than that
 /// ([`crate::terminal::focus_coalescer`], plan
 /// `2026-10-28-runner-spawn-bursts-overwhelm-the-box-beyond-the-continuation-cap`
 /// D3); a terminal whose create-time `terminal-created` already carried the
