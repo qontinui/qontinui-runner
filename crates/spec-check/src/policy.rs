@@ -12,8 +12,8 @@
 //!   * else `Pass`.
 
 use crate::{
-    AssertionOutcome, AssertionResult, AssertionScope, ConjunctEvaluation, ConjunctRule,
-    MatchOutcome, PolicyEvaluation, PolicyStatus, SpecCheckPolicy, SpecCheckResult,
+    AssertionResult, AssertionScope, ConjunctEvaluation, ConjunctRule, MatchOutcome,
+    PolicyEvaluation, PolicyStatus, SpecAssertionVerdict, SpecCheckPolicy, SpecCheckResult,
     StateMatchResult,
 };
 
@@ -151,8 +151,51 @@ fn match_outcome_rank(outcome: MatchOutcome) -> u8 {
     }
 }
 
-fn is_pass(a: &AssertionResult) -> bool {
-    matches!(a.outcome, AssertionOutcome::Pass { .. })
+/// The decided failures and the unknowns in a conjunct's scope, counted
+/// apart (plan `2026-11-06-no-verification-instrument-reads-an-absence-as-a-pass`
+/// D4). An `Unknown` is "could not look", never "looked and failed", so a
+/// rule may not count it as a failure — and it may not count it as a pass
+/// either. Each rule decides at conjunct grain: `Fail` when the decided
+/// failures alone break it, `Pass` when it holds even with every unknown
+/// counted failed, otherwise `Indeterminate`. An unknown is therefore never
+/// treated worse than a failure, and never better than one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VerdictTally {
+    total: usize,
+    failed: usize,
+    unknown: usize,
+}
+
+impl VerdictTally {
+    fn of(scope: &[ScopedAssertion<'_>]) -> Self {
+        let mut tally = VerdictTally {
+            total: scope.len(),
+            failed: 0,
+            unknown: 0,
+        };
+        for sa in scope {
+            match sa.assertion.outcome {
+                SpecAssertionVerdict::Pass { .. } => {}
+                SpecAssertionVerdict::Fail { .. } => tally.failed += 1,
+                SpecAssertionVerdict::Unknown { .. } => tally.unknown += 1,
+            }
+        }
+        tally
+    }
+
+    /// Failures if every unknown turned out failed — the worst case the
+    /// evidence still allows.
+    fn failed_at_worst(self) -> usize {
+        self.failed + self.unknown
+    }
+
+    /// The shared evidence suffix naming both counts.
+    fn counts_text(self) -> String {
+        format!(
+            "{} failed, {} unknown of {}",
+            self.failed, self.unknown, self.total
+        )
+    }
 }
 
 /// Evaluate a single conjunct rule against the filtered scope.
@@ -175,32 +218,53 @@ fn evaluate_rule(
                     "no assertions in scope".to_string(),
                 );
             }
-            let failed = scope.iter().filter(|sa| !is_pass(sa.assertion)).count();
-            let total = scope.len();
-            if failed == 0 {
-                (PolicyStatus::Pass, format!("all {total} in scope passed"))
-            } else {
+            let tally = VerdictTally::of(scope);
+            let total = tally.total;
+            if tally.failed > 0 {
                 (
                     PolicyStatus::Fail,
-                    format!("{failed} of {total} in scope failed"),
+                    format!(
+                        "{} of {total} in scope failed ({})",
+                        tally.failed,
+                        tally.counts_text()
+                    ),
                 )
+            } else if tally.unknown > 0 {
+                (
+                    PolicyStatus::Indeterminate,
+                    format!(
+                        "{} of {total} in scope unknown, none failed ({})",
+                        tally.unknown,
+                        tally.counts_text()
+                    ),
+                )
+            } else {
+                (PolicyStatus::Pass, format!("all {total} in scope passed"))
             }
         }
 
         ConjunctRule::MaxFailures { count } => {
             // MaxFailures is meaningful even on empty scope (0 failures
             // trivially ≤ count), so no indeterminate here.
-            let failed = scope.iter().filter(|sa| !is_pass(sa.assertion)).count();
-            let total = scope.len();
-            if failed <= *count as usize {
+            let tally = VerdictTally::of(scope);
+            let max = *count as usize;
+            if tally.failed > max {
+                (
+                    PolicyStatus::Fail,
+                    format!("{} (max {count} failures)", tally.counts_text()),
+                )
+            } else if tally.failed_at_worst() <= max {
                 (
                     PolicyStatus::Pass,
-                    format!("{failed} of {total} failed (max {count})"),
+                    format!("{} (max {count} failures)", tally.counts_text()),
                 )
             } else {
                 (
-                    PolicyStatus::Fail,
-                    format!("{failed} of {total} failed (max {count})"),
+                    PolicyStatus::Indeterminate,
+                    format!(
+                        "{} (max {count} failures): the unknowns could break the limit",
+                        tally.counts_text()
+                    ),
                 )
             }
         }
@@ -212,21 +276,32 @@ fn evaluate_rule(
                     "no assertions in scope (failure rate undefined)".to_string(),
                 );
             }
-            let total = scope.len();
-            let failed = scope.iter().filter(|sa| !is_pass(sa.assertion)).count();
-            let actual = failed as f32 / total as f32;
-            if actual < *rate {
+            let tally = VerdictTally::of(scope);
+            let total = tally.total as f32;
+            let decided = tally.failed as f32 / total;
+            let worst = tally.failed_at_worst() as f32 / total;
+            if decided >= *rate {
+                (
+                    PolicyStatus::Fail,
+                    format!(
+                        "failure rate {decided:.3} ({}) at or above threshold {rate:.3}",
+                        tally.counts_text()
+                    ),
+                )
+            } else if worst < *rate {
                 (
                     PolicyStatus::Pass,
                     format!(
-                        "failure rate {actual:.3} ({failed}/{total}) below threshold {rate:.3}"
+                        "failure rate {decided:.3} ({}) below threshold {rate:.3}",
+                        tally.counts_text()
                     ),
                 )
             } else {
                 (
-                    PolicyStatus::Fail,
+                    PolicyStatus::Indeterminate,
                     format!(
-                        "failure rate {actual:.3} ({failed}/{total}) at or above threshold {rate:.3}"
+                        "failure rate between {decided:.3} and {worst:.3} ({}) straddles threshold {rate:.3}",
+                        tally.counts_text()
                     ),
                 )
             }
@@ -431,7 +506,7 @@ mod tests {
             description: format!("desc {id}"),
             severity: severity.to_string(),
             category: category.to_string(),
-            outcome: AssertionOutcome::Pass {
+            outcome: SpecAssertionVerdict::Pass {
                 matched: MatchedElement {
                     element_id: None,
                     role: None,
@@ -448,13 +523,38 @@ mod tests {
             description: format!("desc {id}"),
             severity: severity.to_string(),
             category: category.to_string(),
-            outcome: AssertionOutcome::Fail {
+            outcome: SpecAssertionVerdict::Fail {
                 miss: AssertionMiss {
                     reason: MissReason::NoCandidates,
                     candidates: vec![],
                 },
             },
         }
+    }
+
+    fn unknown_assertion(id: &str, severity: &str, category: &str) -> AssertionResult {
+        AssertionResult {
+            assertion_id: id.to_string(),
+            description: format!("desc {id}"),
+            severity: severity.to_string(),
+            category: category.to_string(),
+            outcome: SpecAssertionVerdict::Unknown {
+                code: crate::UnknownCode::NoExpectation,
+            },
+        }
+    }
+
+    /// One conjunct over every assertion in `assertions`, in one state.
+    fn eval_rule(assertions: Vec<AssertionResult>, rule: ConjunctRule) -> PolicyEvaluation {
+        let result = make_result(vec![state("s", 0.0, assertions)], MatchOutcome::NoMatch);
+        let policy = SpecCheckPolicy {
+            conjuncts: vec![PolicyConjunct {
+                name: "n".to_string(),
+                scope: AssertionScope::default(),
+                rule,
+            }],
+        };
+        apply_policy(&result, &policy)
     }
 
     fn state(id: &str, rate: f32, assertions: Vec<AssertionResult>) -> StateMatchResult {
@@ -703,6 +803,119 @@ mod tests {
             }],
         };
         let eval = apply_policy(&result, &policy);
+        assert_eq!(eval.overall_status, PolicyStatus::Indeterminate);
+    }
+
+    // ------------- Unknown verdicts (D4) -------------
+    //
+    // Each rule decides at conjunct grain: Fail when the decided failures
+    // alone break it, Pass when it holds with every unknown counted failed,
+    // otherwise Indeterminate.
+
+    /// Mutation: restoring `failed = !is_pass` (an unknown counted as a
+    /// failure) turns this `Fail`.
+    #[test]
+    fn all_pass_indeterminate_on_unknown_without_failure() {
+        let eval = eval_rule(
+            vec![
+                pass_assertion("p", "error", "c"),
+                unknown_assertion("u", "error", "c"),
+            ],
+            ConjunctRule::AllPass,
+        );
+        assert_eq!(eval.overall_status, PolicyStatus::Indeterminate);
+        let evidence = &eval.conjunct_results[0].evidence;
+        assert!(evidence.contains("0 failed, 1 unknown of 2"), "{evidence}");
+    }
+
+    /// A decided failure still decides the rule however many unknowns sit
+    /// beside it. Mutation: checking unknowns before failures turns this
+    /// `Indeterminate`.
+    #[test]
+    fn all_pass_fails_on_failure_beside_unknown() {
+        let eval = eval_rule(
+            vec![
+                fail_assertion("f", "error", "c"),
+                unknown_assertion("u", "error", "c"),
+            ],
+            ConjunctRule::AllPass,
+        );
+        assert_eq!(eval.overall_status, PolicyStatus::Fail);
+    }
+
+    /// An unknown that could not break the limit leaves `Pass`: it is never
+    /// treated worse than a failure would be. Mutation: counting the unknown
+    /// as a failure past `count` turns this `Fail`.
+    #[test]
+    fn max_failures_passes_when_unknown_cannot_break_limit() {
+        let eval = eval_rule(
+            vec![
+                pass_assertion("p", "error", "c"),
+                unknown_assertion("u", "error", "c"),
+            ],
+            ConjunctRule::MaxFailures { count: 1 },
+        );
+        assert_eq!(eval.overall_status, PolicyStatus::Pass);
+    }
+
+    /// Unknowns that COULD break the limit leave it undecided — neither the
+    /// optimistic `Pass` nor the pessimistic `Fail`. Mutation: ignoring
+    /// unknowns turns this `Pass`; counting them failed turns it `Fail`.
+    #[test]
+    fn max_failures_indeterminate_when_unknowns_could_break_limit() {
+        let eval = eval_rule(
+            vec![
+                unknown_assertion("u1", "error", "c"),
+                unknown_assertion("u2", "error", "c"),
+            ],
+            ConjunctRule::MaxFailures { count: 1 },
+        );
+        assert_eq!(eval.overall_status, PolicyStatus::Indeterminate);
+    }
+
+    #[test]
+    fn max_failures_fails_on_decided_failures_alone() {
+        let eval = eval_rule(
+            vec![
+                fail_assertion("f1", "error", "c"),
+                fail_assertion("f2", "error", "c"),
+                unknown_assertion("u", "error", "c"),
+            ],
+            ConjunctRule::MaxFailures { count: 1 },
+        );
+        assert_eq!(eval.overall_status, PolicyStatus::Fail);
+    }
+
+    /// 0 decided of 4 is below 0.3 and 1-at-worst of 4 (0.25) is too, so the
+    /// unknown cannot move the verdict. Mutation: letting any unknown force
+    /// `Indeterminate` (over-caution) reds this.
+    #[test]
+    fn failure_rate_below_passes_when_unknowns_cannot_cross() {
+        let eval = eval_rule(
+            vec![
+                pass_assertion("p1", "error", "c"),
+                pass_assertion("p2", "error", "c"),
+                pass_assertion("p3", "error", "c"),
+                unknown_assertion("u", "error", "c"),
+            ],
+            ConjunctRule::FailureRateBelow { rate: 0.3 },
+        );
+        assert_eq!(eval.overall_status, PolicyStatus::Pass);
+    }
+
+    /// 0 decided (0.0) is below 0.3 but 2-at-worst of 4 (0.5) is not, so the
+    /// rule is undecided. Mutation: restoring `!is_pass` turns this `Fail`.
+    #[test]
+    fn failure_rate_below_indeterminate_when_unknowns_straddle() {
+        let eval = eval_rule(
+            vec![
+                pass_assertion("p1", "error", "c"),
+                pass_assertion("p2", "error", "c"),
+                unknown_assertion("u1", "error", "c"),
+                unknown_assertion("u2", "error", "c"),
+            ],
+            ConjunctRule::FailureRateBelow { rate: 0.3 },
+        );
         assert_eq!(eval.overall_status, PolicyStatus::Indeterminate);
     }
 
