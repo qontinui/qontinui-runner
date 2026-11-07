@@ -500,6 +500,10 @@ pub async fn create_terminal_handler(
         Some(extra_env_vec)
     };
 
+    // `create` consumes both; the post-create coord wiring reads them after.
+    let title_for_intent = request.title.clone();
+    let working_dir_for_wiring = working_dir.clone();
+
     // door-scan: spawn — the door's real spawn; the context is in hand until here.
     match terminal_manager.create(
         request.title,
@@ -527,12 +531,40 @@ pub async fn create_terminal_handler(
         crate::coord_drain_state::SpawnOrigin::Unknown,
     ) {
         Ok(info) => {
-            if let Some(ctx) = isolated_ctx {
-                if let Some(session) = terminal_manager.get(&info.id) {
-                    session.set_isolated_edit_ctx(ctx);
-                }
-            }
             info!("HTTP: Created terminal session: {}", info.id);
+
+            // The same post-create coord wiring the `terminal_create` Tauri
+            // command runs (`coord_wiring`): without it this pane had no
+            // `terminal_shell` coord row, `GET /terminals/{id}/coord-session`
+            // read `null`, and a remote end of it answered `not_found` (plan
+            // 2026-11-05-remote-session-end-reaches-the-target-but-cannot-end-a-real-session,
+            // Phase 4). Fresh, not pane-keyed: this door has no restore
+            // round-trip to key a pane by.
+            let intent = crate::commands::terminal::coord_wiring::terminal_shell_intent(
+                title_for_intent.as_deref(),
+                "HTTP terminal session",
+                request.intent_repo,
+                None,
+                None,
+                working_dir_for_wiring.as_deref(),
+                spawn_tenant,
+            );
+            let registry = state
+                .app_handle
+                .try_state::<Arc<crate::session::SessionRegistry>>()
+                .map(|r| r.inner().clone());
+            crate::commands::terminal::coord_wiring::finish_terminal_create(
+                &terminal_manager,
+                registry.as_ref(),
+                Some(&state.app_handle),
+                &info.id,
+                isolated_ctx,
+                intent,
+                crate::commands::terminal::coord_wiring::CoordRegistration::FreshPinned,
+                working_dir_for_wiring,
+                "http_post_terminals",
+            )
+            .await;
 
             // Send initial command after a short delay for shell initialization
             if let Some(cmd) = request.initial_command {
@@ -1105,17 +1137,19 @@ async fn handle_ws_terminal(
 /// | `Some(Some(id))` | the terminal exists and carries a coord session id | `200`, `coord_session_id: "<uuid>"` |
 ///
 /// ⚠️ `Some(None)` is deliberately NOT a 404. A terminal with no coord mirror
-/// is a normal, transient state (the mirror is registered after the pane is
-/// created), and the caller — the `session-id-stamp.sh` SessionStart hook —
+/// is a normal, transient state (the mirror is registered just after the pane
+/// is created, by the post-create wiring every create door shares —
+/// `commands::terminal::coord_wiring` — or never, when that registration
+/// failed and was logged), and the caller — the `session-id-stamp.sh` SessionStart hook —
 /// shape-gates the answer against a strict UUID regex and SKIPS the bind when
 /// it does not match. A `null` is therefore a correct, honest answer that the
 /// client already handles; collapsing it into "terminal not found" would tell
 /// the caller something false about the terminal.
 ///
 /// Split out from the handler purely so the three arms are testable: the
-/// handler half needs an `ApiState`, which needs a live Tauri `AppHandle`, and
-/// a PTY-backed `TerminalSession` fixture — none of which a unit test in this
-/// crate can build.
+/// handler half needs an `ApiState`, which needs a live Tauri `AppHandle` a
+/// unit test in this crate cannot build. [`coord_session_for`] is the lookup
+/// half, against a bare manager.
 fn coord_session_response(
     id: &str,
     lookup: Option<Option<uuid::Uuid>>,
@@ -1176,12 +1210,21 @@ pub async fn get_coord_session_handler(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let terminal_manager = get_terminal_manager(&state);
+    coord_session_for(&get_terminal_manager(&state), &id)
+}
+
+/// The lookup + response of `GET /terminals/{id}/coord-session` against a
+/// bare [`TerminalManager`] — the handler's whole body, callable from a test
+/// that has no `ApiState`.
+pub(crate) fn coord_session_for(
+    terminal_manager: &TerminalManager,
+    id: &str,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     // `map` (not `and_then`) on purpose: it keeps "no such terminal" and "no
     // coord session id on that terminal" distinguishable, which is the whole
     // difference between the 404 and the `null` arm.
-    let lookup = terminal_manager.get(&id).map(|s| s.coord_session_id());
-    coord_session_response(&id, lookup)
+    let lookup = terminal_manager.get(id).map(|s| s.coord_session_id());
+    coord_session_response(id, lookup)
 }
 
 /// GET /terminals/transport-stats — the terminal output transport counters
