@@ -88,10 +88,10 @@ from event_manager import EventManager, EventType  # noqa: E402
 from event_translator import EventTranslator  # noqa: E402
 from execution_tree import ExecutionNode, ExecutionTree  # noqa: E402
 from executor_core import ExecutorCore  # noqa: E402
+from training_export import TrainingExportCoordinator  # noqa: E402
 
 # UI Bridge explorer - lightweight, doesn't need ML stack
 from services.ui_bridge_explorer_service import UIBridgeExplorerService  # noqa: E402
-from training_export import TrainingExportCoordinator  # noqa: E402
 
 # isort: split
 # The per-domain command mixins. Importing the package runs executor_commands._shared,

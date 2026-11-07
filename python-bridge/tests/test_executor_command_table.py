@@ -668,6 +668,11 @@ def test_sm_execute_transition_never_reports_an_unstated_success(result):
 _DELETED_HANDLER = "test_results_handler"
 
 
+def _names_handler(dotted: str | None) -> bool:
+    """True when a dotted module or import name has the deleted handler as any part."""
+    return _DELETED_HANDLER in (dotted or "").split(".")
+
+
 def handler_accesses(source: str) -> list[int]:
     """Line numbers at which ``source`` touches the deleted QA-results handler.
 
@@ -680,10 +685,10 @@ def handler_accesses(source: str) -> list[int]:
         if (
             (isinstance(node, ast.Attribute) and node.attr == _DELETED_HANDLER)
             or (isinstance(node, ast.Name) and node.id == _DELETED_HANDLER)
-            or (isinstance(node, ast.ImportFrom) and node.module == _DELETED_HANDLER)
+            or (isinstance(node, ast.ImportFrom) and _names_handler(node.module))
             or (
-                isinstance(node, ast.Import)
-                and any(alias.name == _DELETED_HANDLER for alias in node.names)
+                isinstance(node, (ast.Import, ast.ImportFrom))
+                and any(_names_handler(alias.name) for alias in node.names)
             )
             or (isinstance(node, ast.Constant) and node.value == _DELETED_HANDLER)
         ):
@@ -701,6 +706,10 @@ def handler_accesses(source: str) -> list[int]:
         "getattr(self, 'test_results_handler', None)\n",  # by string
         "from test_results_handler import TestResultsHandler\n",  # its module, from-import
         "import test_results_handler\n",  # its module, plain import
+        "import test_results_handler.sub\n",  # a submodule of it, plain import
+        "from test_results_handler.sub import X\n",  # a submodule of it, from-import
+        "from services import test_results_handler\n",  # it, imported from a package
+        "from services.test_results_handler import X\n",  # it, as a package's module
     ],
 )
 def test_handler_access_scanner_sees_each_shape(source):
