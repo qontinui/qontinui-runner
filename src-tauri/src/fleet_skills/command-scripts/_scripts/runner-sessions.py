@@ -151,14 +151,10 @@ def last_activity(row):
 
 
 def account(row):
-    """The account label the runner recorded. It labels the default config dir
-    (~/.claude) `unknown`; that one is named `default`. A row with no config
-    dir keeps the label it has."""
-    label = (row.get("account") or {}).get("label")
-    cd = row.get("configDir")
-    if label in (None, "", "unknown") and cd and os.path.normpath(cd) == os.path.expanduser("~/.claude"):
-        return "default"
-    return label or os.path.basename(cd or "") or "?"
+    """The account label the runner recorded, or - where it says `unknown` -
+    the config dir's suffix (`.claude-paktis` is `paktis`, `.claude` is
+    `default`). close-finished-sessions' account_of, so both reports agree."""
+    return cfs.account_of(row)
 
 
 def registry_rows():
@@ -209,6 +205,12 @@ def pane(term, rows, table, ready):
     else:
         f["unreadable"] = f"the pane's pid {term.get('pid')} is not in the process table"
     row, note = pick_row(rows, live)
+    # The registry's config dir can be blank; the running claude's own
+    # CLAUDE_CONFIG_DIR is where it writes, and names its account. Only for a
+    # row that claude holds (or when its session id is unreadable): an older
+    # row picked after /clear may belong to another account.
+    if row and (not live or row.get("claudeSessionId") in live):
+        row = cfs.with_live_config_dir(row, table, term.get("pid"))
     if f["claude"] is False:
         had = row is not None
         f["exited"] = ("exited" if had else "shell (no Claude session registered)") + \
@@ -362,9 +364,14 @@ def selftest():
         got = waiting_reason(*args)
         if (want and want not in got) or (not want and got):
             bad.append(f"waiting_reason{args}: want {want!r}, got {got!r}")
+    for row, want in [({"account": {"label": "unknown"}, "configDir": "/h/.claude-lukas"}, "lukas"),
+                      ({"account": {"label": "unknown"}, "configDir": os.path.expanduser("~/.claude")}, "default"),
+                      ({"account": {"label": "paktis"}, "configDir": None}, "paktis")]:
+        if account(row) != want:
+            bad.append(f"account {row}: want {want!r}, got {account(row)!r}")
     for line in bad:
         print("SELFTEST FAIL: " + line)
-    print(f"selftest: {len(cases)} state cases + 6 row-pick cases + {len(waits)} waiting cases, "
+    print(f"selftest: {len(cases)} state cases + 6 row-pick cases + {len(waits)} waiting cases + 3 account cases, "
           f"{len(bad)} failure(s)")
     return 1 if bad else 0
 
