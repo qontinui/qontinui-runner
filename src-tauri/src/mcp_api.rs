@@ -11535,6 +11535,7 @@ struct ProvisionSessionBody {
 /// | Status | `code` | Meaning |
 /// |---|---|---|
 /// | 400 | `COORD_MCP_PROVISION_INVALID_BODY` | body is not `{cwd:String, tenant?:Uuid}` — `tenant_id` is accepted as an alias for `tenant`; a non-UUID tenant, both spellings at once, and any other key all land here |
+/// | 400 | `INVALID_UTF8` | body is not UTF-8 (e.g. a non-ASCII `cwd` sent by Git Bash `curl -d` in the ANSI code page); the message names the encoding remedy |
 /// | 400 | `COORD_MCP_PROVISION_INVALID_CWD` | `cwd` empty or not an existing dir |
 /// | 403 | `COORD_MCP_PROVISION_NO_HANDSHAKE` | no (or empty) `X-Qontinui-Loopback-Key` header |
 /// | 403 | `COORD_MCP_PROVISION_HANDSHAKE_MISMATCH` | handshake presented, not this runner start's key |
@@ -11611,6 +11612,13 @@ fn provision_session_after_gate(body: &[u8]) -> axum::response::Response {
     let req: ProvisionSessionBody = match serde_json::from_slice(body) {
         Ok(r) => r,
         Err(e) => {
+            // A `cwd` under a non-ASCII Windows profile dir, sent by Git Bash
+            // `curl -d`, arrives in the ANSI code page — an ENCODING problem,
+            // not a shape one. Same diagnosis as every other JSON door
+            // (`envelope::invalid_utf8_message`).
+            if let Some(msg) = crate::mcp::envelope::invalid_utf8_message(&e.to_string()) {
+                return crate::mcp::envelope::envelope_400_invalid_utf8(msg).into_response();
+            }
             return provision_refusal(
                 axum::http::StatusCode::BAD_REQUEST,
                 "COORD_MCP_PROVISION_INVALID_BODY",
@@ -21336,6 +21344,22 @@ mod coord_provision_session_gate_tests {
                 "an unknown key must refuse rather than read as 'no tenant': {body}"
             );
         }
+    }
+
+    /// A body that is not UTF-8 — a non-ASCII `cwd` Git Bash curl sent in the
+    /// ANSI code page (`0xE9` for `é`) — answers `INVALID_UTF8` with the
+    /// encoding remedy, not `COORD_MCP_PROVISION_INVALID_BODY`.
+    #[tokio::test]
+    async fn a_non_utf8_body_is_invalid_utf8_not_invalid_body() {
+        let _amb = crate::test_env::isolated_ambient();
+        let resp = super::provision_session_after_gate(b"{\"cwd\":\"C:/Users/Jos\xe9\"}");
+        assert_eq!(resp.status(), 400);
+        let v = body_json(resp).await;
+        assert_eq!(v["code"], "INVALID_UTF8");
+        assert!(v["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("request body is not valid UTF-8"));
     }
 
     /// The route-level half of `659b574a`: the measured defect was
