@@ -2873,6 +2873,7 @@ mod tests {
                     total_bytes: 1_000,
                     free_bytes: 400,
                     removable: false,
+                    read_only: false,
                 },
                 census::VolumeReport {
                     volume: "D:".to_string(),
@@ -2880,6 +2881,7 @@ mod tests {
                     total_bytes: 4_000,
                     free_bytes: 93,
                     removable: false,
+                    read_only: false,
                 },
             ],
             taken_at: now - age,

@@ -978,6 +978,16 @@ pub struct VolumeReport {
     /// ignores unknown fields until it learns to read this one.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub removable: bool,
+    /// `sysinfo::Disk::is_read_only()` for the volume — see
+    /// [`MountReading::read_only`]. The low-disk alarm never speaks for a
+    /// read-only volume; see [`low_disk_alarms`].
+    ///
+    /// ALWAYS serialized, `false` included — unlike `removable`. Coord reads
+    /// this as three-valued: an ABSENT key means a runner build that does not
+    /// publish it, so "unknown", never "writable" (plan
+    /// `2026-11-03-devops-headroom-grades-read-only-and-esp-volumes-against-the-disk-floor`
+    /// D3). Skipping `false` would make every writable volume read unknown.
+    pub read_only: bool,
 }
 
 /// Census row for one worktree.
@@ -1823,6 +1833,7 @@ fn volumes_from_mounts(
         total,
         available: free,
         removable,
+        read_only,
     } in mounts
     {
         if *total == 0 {
@@ -1846,6 +1857,7 @@ fn volumes_from_mounts(
                 total_bytes: *total,
                 free_bytes: *free,
                 removable: *removable,
+                read_only: *read_only,
             });
     }
     out.into_values().collect()
@@ -2659,6 +2671,7 @@ fn build_census_chunked(
         &mounts,
         &req,
         declared_external_mount().as_deref(),
+        &essential_paths(),
         LowDiskFloors::from_env(),
     );
     req
@@ -2706,6 +2719,22 @@ impl LowDiskFloors {
         }
     }
 
+    /// Does the in-use rule govern `v`? True for a removable volume, and for
+    /// a fixed one whose total is at or below the critical floor: such a
+    /// volume (an EFI system partition, a small boot partition) is under the
+    /// critical floor however empty it is, so an absolute-floor alarm on it
+    /// carries no information unless the runner uses it.
+    ///
+    /// Never for the POSIX root `/`: a full root disk breaks the box whether
+    /// or not a worktree is on it, so a small fixed `/` (a VM with `/home` on
+    /// another disk) alarms like any large fixed volume. The Windows system
+    /// drive and the runner's own config, data and log dirs are kept in use
+    /// by [`essential_paths`] at the alarm's edges instead, because naming
+    /// them takes the environment.
+    fn in_use_rule_applies(&self, v: &VolumeReport) -> bool {
+        v.removable || (v.total_bytes <= self.crit && v.volume != "/")
+    }
+
     /// The floor `free_bytes` is under, or `None` when it is above both.
     ///
     /// Critical is tested first, and the overrides do not enforce an order: a
@@ -2728,10 +2757,20 @@ impl LowDiskFloors {
 struct LowDiskVerdict<'a> {
     /// Volumes under a floor that the alarm speaks for, each with its level.
     alarms: Vec<(&'a VolumeReport, LowDiskLevel)>,
-    /// Removable volumes under a floor that nothing the runner uses is on.
+    /// Volumes under a floor the alarm does not speak for, each with why.
     /// Silenced; [`log_low_disk_verdict`] logs each once per process so a
     /// missing alarm can be explained.
-    suppressed: Vec<&'a VolumeReport>,
+    suppressed: Vec<(&'a VolumeReport, LowDiskSuppression)>,
+}
+
+/// Why [`low_disk_alarms`] silenced a volume under a floor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LowDiskSuppression {
+    /// Read-only: its free space is not a capacity question.
+    ReadOnly,
+    /// Removable, or fixed but no larger than the critical floor, and nothing
+    /// the runner uses is on it.
+    NotInUse,
 }
 
 /// PURE: which volumes under a floor the low-disk alarm speaks for.
@@ -2756,27 +2795,42 @@ struct LowDiskVerdict<'a> {
 ///   [`publisher_probe_from`]). Every removable volume under a floor then
 ///   alarms. An unknown is not evidence the volume is unused.
 ///
-/// A FIXED volume is never filtered. "How much disk is left, anywhere?" is the
-/// publisher's question, and an internal disk filling up is the runner's
-/// problem whether or not a worktree is on it.
+/// A READ-ONLY volume never alarms: it reads 0 free by construction (nawa's
+/// `/mnt/winiso` ISO), nothing can consume it, and a full one is its normal
+/// state (plan
+/// `2026-11-03-devops-headroom-grades-read-only-and-esp-volumes-against-the-disk-floor`
+/// Phase 4).
+///
+/// A FIXED volume whose total is at or below the critical floor follows the
+/// same in-use rule as a removable one ([`LowDiskFloors::in_use_rule_applies`]):
+/// a 1 GB EFI system partition is "under the 25 GiB floor" however empty it
+/// is, so the alarm speaks for it only when the runner uses it.
+///
+/// Any other FIXED volume is never filtered. "How much disk is left,
+/// anywhere?" is the publisher's question, and an internal disk filling up is
+/// the runner's problem whether or not a worktree is on it.
 fn low_disk_alarms<'a>(
     volumes: &'a [VolumeReport],
     in_use: Option<&[PathBuf]>,
     external_mount: Option<&Path>,
     floors: LowDiskFloors,
 ) -> LowDiskVerdict<'a> {
-    // Resolved only once a removable volume is under a floor, so a box with no
-    // removable media never walks the paths.
+    // Resolved only once a volume the in-use rule governs is under a floor,
+    // so a box with only large fixed volumes never walks the paths.
     let mut held: Option<HashSet<&str>> = None;
     let mut verdict = LowDiskVerdict::default();
     for v in volumes {
         let Some(level) = floors.level(v.free_bytes) else {
             continue;
         };
-        if let (true, Some(paths)) = (v.removable, in_use) {
+        if v.read_only {
+            verdict.suppressed.push((v, LowDiskSuppression::ReadOnly));
+            continue;
+        }
+        if let (true, Some(paths)) = (floors.in_use_rule_applies(v), in_use) {
             let held = held.get_or_insert_with(|| volumes_in_use(volumes, paths, external_mount));
             if !held.contains(v.volume.as_str()) {
-                verdict.suppressed.push(v);
+                verdict.suppressed.push((v, LowDiskSuppression::NotInUse));
                 continue;
             }
         }
@@ -2892,11 +2946,21 @@ fn warn_on_low_disk(
 fn log_low_disk_verdict(verdict: &LowDiskVerdict<'_>) -> bool {
     const GB: f64 = 1_073_741_824.0;
     let seen = LOW_DISK_SUPPRESSED_LOGGED.get_or_init(|| Mutex::new(HashSet::new()));
-    for v in &verdict.suppressed {
+    for (v, why) in &verdict.suppressed {
         if first_low_disk_suppression(seen, &v.volume) {
+            let reason = match why {
+                LowDiskSuppression::ReadOnly => "read-only",
+                LowDiskSuppression::NotInUse if v.removable => {
+                    "removable, under floor, not in use by this instance"
+                }
+                LowDiskSuppression::NotInUse => {
+                    "small fixed volume (no larger than the critical floor), \
+                     not in use by this instance"
+                }
+            };
             info!(
-                "worktree_census: {} removable, under floor, not in use by this instance; \
-                 low-disk alarm suppressed ({:.1} GB free). Logged once per process.",
+                "worktree_census: {} {reason}; low-disk alarm suppressed ({:.1} GB free). \
+                 Logged once per process.",
                 v.volume,
                 v.free_bytes as f64 / GB
             );
@@ -2932,6 +2996,30 @@ fn log_low_disk_verdict(verdict: &LowDiskVerdict<'_>) -> bool {
 /// and handed down from there.
 fn declared_external_mount() -> Option<PathBuf> {
     crate::external_volume::declared().map(|v| v.mount)
+}
+
+/// The paths that keep a volume in use whatever the census holds: the
+/// system root (`/`, or `%SystemDrive%\` on Windows) and the runner's own
+/// config, data and log dirs. Read at the alarm's two edges and appended to
+/// the in-use paths, so a small fixed volume holding one of them alarms
+/// rather than being treated like an unused EFI partition (see
+/// [`LowDiskFloors::in_use_rule_applies`]).
+fn essential_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if cfg!(windows) {
+        if let Some(drive) = std::env::var_os("SystemDrive").filter(|d| !d.is_empty()) {
+            let mut root = PathBuf::from(drive);
+            root.push("\\");
+            paths.push(root);
+        }
+    } else {
+        paths.push(PathBuf::from("/"));
+    }
+    paths.extend(qontinui_runner_lib::instance_env::runner_config_dir().map(|(d, _)| d));
+    paths.extend(qontinui_runner_lib::instance_env::runner_data_local_base());
+    paths.extend(qontinui_runner_lib::instance_env::runner_app_data_dir());
+    paths.push(crate::startup_panic::resolve_log_dir());
+    paths
 }
 
 /// PURE: the paths that put a removable volume in use. That is the workspace
@@ -2976,10 +3064,14 @@ fn warn_on_walked_low_disk(
     mounts: &[MountReading],
     req: &WorktreeCensusReq,
     external_mount: Option<&Path>,
+    essential: &[PathBuf],
     floors: LowDiskFloors,
 ) -> Vec<(String, LowDiskLevel)> {
-    let in_use = in_use_paths(None, Some(req));
+    let mut in_use = in_use_paths(None, Some(req));
+    // The volume SET stays scoped to the walked rows; only the in-use test
+    // also counts the essential paths.
     let volumes = collect_volumes(mounts, &in_use);
+    in_use.extend_from_slice(essential);
     let verdict = low_disk_alarms(&volumes, Some(&in_use), external_mount, floors);
     log_low_disk_verdict(&verdict);
     verdict
@@ -3208,7 +3300,7 @@ struct PublisherProbe {
 /// secondary's own build output is this process's `CARGO_TARGET_DIR`; a
 /// relative value resolves to no volume and so changes nothing.
 fn probe_volumes_for_publisher() -> PublisherProbe {
-    publisher_probe_from(
+    let mut probe = publisher_probe_from(
         collect_all_volumes(),
         LowDiskFloors::from_env(),
         || !runs_machine_census(),
@@ -3216,15 +3308,23 @@ fn probe_volumes_for_publisher() -> PublisherProbe {
         latest_census,
         declared_external_mount(),
         || std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from),
-    )
+    );
+    // A KNOWN in-use list also counts the essential paths; an UNKNOWN one
+    // (`None`) already alarms on every volume the in-use rule governs.
+    if let Some(paths) = probe.in_use.as_mut() {
+        paths.extend(essential_paths());
+    }
+    probe
 }
 
 /// PURE core of [`probe_volumes_for_publisher`], with every live source
 /// injected.
 ///
-/// The in-use paths are built only when a removable volume is under a floor
-/// ([`LowDiskFloors::level`], so a critical floor set above the warn floor
-/// counts), which is the only case in which [`low_disk_alarms`] reads them.
+/// The in-use paths are built only when a writable volume the in-use rule
+/// governs ([`LowDiskFloors::in_use_rule_applies`]: removable, or no larger
+/// than the critical floor) is under a floor ([`LowDiskFloors::level`], so a
+/// critical floor set above the warn floor counts), which is the only case in
+/// which [`low_disk_alarms`] reads them.
 /// Otherwise they are an empty, KNOWN list. When such a volume is present:
 ///
 /// * On a SECONDARY instance (`is_secondary`), which runs no census, they are
@@ -3253,9 +3353,9 @@ fn publisher_probe_from(
     external_mount: Option<PathBuf>,
     secondary_target_dir: impl FnOnce() -> Option<PathBuf>,
 ) -> PublisherProbe {
-    let needs_paths = volumes
-        .iter()
-        .any(|v| v.removable && floors.level(v.free_bytes).is_some());
+    let needs_paths = volumes.iter().any(|v| {
+        !v.read_only && floors.in_use_rule_applies(v) && floors.level(v.free_bytes).is_some()
+    });
     let in_use = if !needs_paths {
         Some(Vec::new())
     } else if is_secondary() {
@@ -4644,6 +4744,7 @@ mod tests {",
             total,
             available,
             removable: false,
+            read_only: false,
         }
     }
 
@@ -4818,6 +4919,7 @@ mod tests {",
             total_bytes: 16 * GIB,
             free_bytes: 3_700_000_000,
             removable: true,
+            read_only: false,
         }
     }
 
@@ -4829,6 +4931,7 @@ mod tests {",
             total_bytes: 4_000 * GIB,
             free_bytes: 2_000 * GIB,
             removable: false,
+            read_only: false,
         }
     }
 
@@ -4973,6 +5076,7 @@ mod tests {",
             total_bytes: 500 * GIB,
             free_bytes: 10 * GIB,
             removable: false,
+            read_only: false,
         };
         let nearly_full = VolumeReport {
             volume: "/mnt/data".to_string(),
@@ -4980,6 +5084,7 @@ mod tests {",
             total_bytes: 1_000 * GIB,
             free_bytes: 60 * GIB,
             removable: false,
+            read_only: false,
         };
         assert_eq!(
             alarms_for(&[full_internal, nearly_full], &[], None),
@@ -4987,6 +5092,210 @@ mod tests {",
                 ("C:".to_string(), LowDiskLevel::Critical),
                 ("/mnt/data".to_string(), LowDiskLevel::Warn),
             ]
+        );
+    }
+
+    /// nawa's ESP, measured 2026-11-03: a 1.02 GB fixed `/boot/efi` with
+    /// 1.01 GB free. It cannot hold the 25 GiB critical floor even empty, so
+    /// it follows the in-use rule a removable stick does: silent while nothing
+    /// the runner uses is on it, Critical once something is (plan
+    /// `2026-11-03-devops-headroom-grades-read-only-and-esp-volumes-against-the-disk-floor`
+    /// Phase 4).
+    #[test]
+    fn a_fixed_volume_too_small_for_the_critical_floor_follows_the_in_use_rule() {
+        let root = VolumeReport {
+            volume: "/".to_string(),
+            drive_letter: None,
+            total_bytes: 500 * GIB,
+            free_bytes: 200 * GIB,
+            removable: false,
+            read_only: false,
+        };
+        let esp = VolumeReport {
+            volume: "/boot/efi".to_string(),
+            drive_letter: None,
+            total_bytes: 1_020_000_000,
+            free_bytes: 1_010_000_000,
+            removable: false,
+            read_only: false,
+        };
+        let volumes = vec![root, esp];
+        assert_eq!(
+            alarms_for(&volumes, &["/home/u/qontinui-root/qontinui-runner"], None),
+            vec![],
+            "an ESP holding no in-use path must not alarm"
+        );
+        assert_eq!(
+            alarms_for(&volumes, &["/boot/efi/scratch"], None),
+            vec![("/boot/efi".to_string(), LowDiskLevel::Critical)],
+            "a small fixed volume the runner uses alarms as before"
+        );
+        // UNKNOWN in-use set: it alarms, exactly as an unknown stick does.
+        assert_eq!(
+            alarm_keys(&low_disk_alarms(&volumes, None, None, DEFAULT_FLOORS)),
+            vec![("/boot/efi".to_string(), LowDiskLevel::Critical)]
+        );
+        // The boundary is inclusive: total == crit is small; crit + 1 is not.
+        let at_floor = VolumeReport {
+            volume: "/var".to_string(),
+            drive_letter: None,
+            total_bytes: DEFAULT_LOW_DISK_CRIT_BYTES,
+            free_bytes: GIB,
+            removable: false,
+            read_only: false,
+        };
+        let above_floor = VolumeReport {
+            volume: "/srv".to_string(),
+            total_bytes: DEFAULT_LOW_DISK_CRIT_BYTES + 1,
+            ..at_floor.clone()
+        };
+        assert_eq!(
+            alarms_for(&[at_floor, above_floor], &[], None),
+            vec![("/srv".to_string(), LowDiskLevel::Critical)],
+            "a fixed volume above the critical floor alarms with nothing on it"
+        );
+    }
+
+    /// A small fixed ROOT disk (a 20 GB `/` on a VM whose `/home` is on
+    /// another disk) alarms with no worktree on it, while a small fixed
+    /// `/boot/efi` holding nothing stays quiet.
+    #[test]
+    fn a_small_fixed_root_volume_still_alarms_with_nothing_in_use_on_it() {
+        let small_root = VolumeReport {
+            volume: "/".to_string(),
+            drive_letter: None,
+            total_bytes: 20_000_000_000,
+            free_bytes: 500_000_000,
+            removable: false,
+            read_only: false,
+        };
+        let home = VolumeReport {
+            volume: "/home".to_string(),
+            total_bytes: 2_000 * GIB,
+            free_bytes: 1_000 * GIB,
+            ..small_root.clone()
+        };
+        let esp = VolumeReport {
+            volume: "/boot/efi".to_string(),
+            total_bytes: 1_020_000_000,
+            free_bytes: 1_010_000_000,
+            ..small_root.clone()
+        };
+        assert_eq!(
+            alarms_for(&[small_root, home, esp], &["/home/u/qontinui-root/w"], None),
+            vec![("/".to_string(), LowDiskLevel::Critical)]
+        );
+    }
+
+    /// The essential paths keep a small fixed volume in use: a small Windows
+    /// system drive, or a small volume holding the runner's data dir, alarms
+    /// with no worktree on it once [`essential_paths`]' entries are in the
+    /// in-use list, as both edges put them.
+    #[test]
+    fn an_essential_path_keeps_a_small_fixed_volume_in_use() {
+        let system = VolumeReport {
+            volume: "C:".to_string(),
+            drive_letter: Some("C:".to_string()),
+            total_bytes: 20_000_000_000,
+            free_bytes: 500_000_000,
+            removable: false,
+            read_only: false,
+        };
+        let data = VolumeReport {
+            volume: "/var/lib/qontinui".to_string(),
+            drive_letter: None,
+            ..system.clone()
+        };
+        let volumes = vec![system, data];
+        assert_eq!(alarms_for(&volumes, &[], None), vec![]);
+        assert_eq!(
+            alarms_for(
+                &volumes,
+                &[r"C:\", "/var/lib/qontinui/com.qontinui.runner"],
+                None
+            ),
+            vec![
+                ("C:".to_string(), LowDiskLevel::Critical),
+                ("/var/lib/qontinui".to_string(), LowDiskLevel::Critical),
+            ]
+        );
+        assert!(
+            essential_paths().iter().any(|p| p.is_absolute()),
+            "the edge must name at least one absolute path"
+        );
+    }
+
+    /// A read-only mount (nawa's `/mnt/winiso`, 0 free by construction) is
+    /// not a capacity question: it never alarms, whatever is on it.
+    #[test]
+    fn a_read_only_volume_never_raises_a_low_disk_alarm() {
+        let iso = VolumeReport {
+            volume: "/mnt/winiso".to_string(),
+            drive_letter: None,
+            total_bytes: 8_150_000_000,
+            free_bytes: 0,
+            removable: false,
+            read_only: true,
+        };
+        let big_full_ro = VolumeReport {
+            volume: "/mnt/archive".to_string(),
+            total_bytes: 2_000 * GIB,
+            ..iso.clone()
+        };
+        let volumes = vec![iso, big_full_ro];
+        for in_use in [None, Some(vec![PathBuf::from("/mnt/winiso/x")])] {
+            let verdict = low_disk_alarms(&volumes, in_use.as_deref(), None, DEFAULT_FLOORS);
+            assert_eq!(alarm_keys(&verdict), vec![], "in_use = {in_use:?}");
+            assert_eq!(
+                verdict
+                    .suppressed
+                    .iter()
+                    .map(|(v, why)| (v.volume.as_str(), *why))
+                    .collect::<Vec<_>>(),
+                vec![
+                    ("/mnt/winiso", LowDiskSuppression::ReadOnly),
+                    ("/mnt/archive", LowDiskSuppression::ReadOnly),
+                ]
+            );
+        }
+        // The publisher needs no in-use paths for a read-only volume.
+        let probe = publisher_probe_from(
+            volumes,
+            DEFAULT_FLOORS,
+            || panic!("the instance role must not be read"),
+            || panic!("the root must not be read"),
+            || panic!("the census must not be read"),
+            None,
+            || panic!("the target dir must not be read"),
+        );
+        assert_eq!(probe.in_use, Some(vec![]));
+    }
+
+    /// The publisher looks up in-use paths for a small fixed volume, because
+    /// the alarm now reads them for one.
+    #[test]
+    fn the_publisher_probe_reads_paths_for_a_small_fixed_volume() {
+        let esp = VolumeReport {
+            volume: "/boot/efi".to_string(),
+            drive_letter: None,
+            total_bytes: 1_020_000_000,
+            free_bytes: 1_010_000_000,
+            removable: false,
+            read_only: false,
+        };
+        assert_eq!(
+            publisher_alarms(
+                vec![esp.clone()],
+                Some("/home/u/qontinui-root"),
+                Some(snapshot_of(vec![])),
+                None,
+            ),
+            vec![]
+        );
+        assert_eq!(
+            publisher_alarms(vec![esp], Some("/home/u/qontinui-root"), None, None),
+            vec![("/boot/efi".to_string(), LowDiskLevel::Critical)],
+            "no snapshot yet: in-use is UNKNOWN, so it alarms"
         );
     }
 
@@ -5003,6 +5312,7 @@ mod tests {",
             total_bytes: 16 * GIB,
             free_bytes: 2 * GIB,
             removable: true,
+            read_only: false,
         };
         let volumes = vec![healthy_internal(), external];
         assert_eq!(
@@ -5223,9 +5533,9 @@ mod tests {",
             verdict
                 .suppressed
                 .iter()
-                .map(|v| v.volume.as_str())
+                .map(|(v, why)| (v.volume.as_str(), *why))
                 .collect::<Vec<_>>(),
-            vec!["E:"]
+            vec![("E:", LowDiskSuppression::NotInUse)]
         );
 
         let seen = Mutex::new(HashSet::new());
@@ -5349,7 +5659,7 @@ mod tests {",
         ];
         let walked = snapshot_of(vec![row_building_into(r"D:\w\a", Some("E:/target"))]);
         assert_eq!(
-            warn_on_walked_low_disk(&mounts, &walked.req, None, DEFAULT_FLOORS),
+            warn_on_walked_low_disk(&mounts, &walked.req, None, &[], DEFAULT_FLOORS),
             vec![("E:".to_string(), LowDiskLevel::Critical)]
         );
     }
@@ -5389,6 +5699,7 @@ mod tests {",
             total: 16 * GIB,
             available: GIB,
             removable: true,
+            read_only: false,
         });
         let all = volumes_from_mounts(&mounts, None);
         let stick = all.iter().find(|v| v.volume == "F:").expect("F: reported");
@@ -5405,6 +5716,37 @@ mod tests {",
         );
         let removable = serde_json::to_value(removable_stick()).unwrap();
         assert_eq!(removable.get("removable"), Some(&serde_json::json!(true)));
+    }
+
+    /// `read_only` is ALWAYS on the wire: `false` for a writable mount, `true`
+    /// for a read-only one. Coord reads an absent key as UNKNOWN (an older
+    /// runner build), so skipping `false` the way `removable` does would turn
+    /// every writable volume into an unknown one.
+    #[test]
+    fn read_only_is_on_the_wire_for_writable_and_read_only_volumes() {
+        let mut ro = fixed_mount("/mnt/winiso", 8_150_000_000, 0);
+        ro.read_only = true;
+        let mounts = vec![fixed_mount("/", 500 * GIB, 200 * GIB), ro];
+        let all = volumes_from_mounts(&mounts, None);
+        let wire: Vec<serde_json::Value> = all
+            .iter()
+            .map(|v| serde_json::to_value(v).unwrap())
+            .collect();
+        let by_key = |key: &str| {
+            wire.iter()
+                .find(|v| v["volume"] == key)
+                .unwrap_or_else(|| panic!("{key} reported: {wire:?}"))
+                .clone()
+        };
+        assert_eq!(
+            by_key("/").get("read_only"),
+            Some(&serde_json::json!(false)),
+            "a writable volume must carry read_only: false"
+        );
+        assert_eq!(
+            by_key("/mnt/winiso").get("read_only"),
+            Some(&serde_json::json!(true))
+        );
     }
 
     /// Before the first sample the reading is ABSENT, and absence is the
@@ -5426,6 +5768,7 @@ mod tests {",
             total_bytes: 4_000,
             free_bytes: 93,
             removable: false,
+            read_only: false,
         }]);
         assert_eq!(published.volumes.len(), 1);
         let read_back = latest_volume_sample().expect("a published sample must be readable");
@@ -6373,6 +6716,7 @@ mod tests {",
             total_bytes: 100,
             free_bytes: 40,
             removable: false,
+            read_only: false,
         }]);
 
         let mut chunks = Vec::new();
@@ -6407,6 +6751,7 @@ mod tests {",
                     total_bytes: 100,
                     free_bytes: 50,
                     removable: false,
+                    read_only: false,
                 }],
                 worktrees: vec![
                     row("qontinui-runner", "D:/x/a", 10),
