@@ -145,6 +145,7 @@ export function TriggersTab({ className = "" }: TriggersTabProps) {
     loadHistory,
     refresh,
     dismissToast,
+    clearSaveRefusals,
   } = useTriggers();
 
   const handleCreate = () => {
@@ -158,11 +159,12 @@ export function TriggersTab({ className = "" }: TriggersTabProps) {
   };
 
   const handleSave = async (data: CreateTriggerRequest | UpdateTriggerRequest) => {
-    if (editingTrigger) {
-      await updateTrigger(editingTrigger.id, data as UpdateTriggerRequest);
-    } else {
-      await createTrigger(data as CreateTriggerRequest);
-    }
+    const saved = editingTrigger
+      ? await updateTrigger(editingTrigger.id, data as UpdateTriggerRequest)
+      : await createTrigger(data as CreateTriggerRequest);
+    // The hook has already shown why. Closing here would discard what was typed,
+    // and the server's refusal of a cron is exactly what the author must correct.
+    if (!saved) return;
     setEditorOpen(false);
     setEditingTrigger(null);
   };
@@ -192,6 +194,7 @@ export function TriggersTab({ className = "" }: TriggersTabProps) {
           trigger={editingTrigger}
           onSave={handleSave}
           onCancel={() => {
+            clearSaveRefusals();
             setEditorOpen(false);
             setEditingTrigger(null);
           }}

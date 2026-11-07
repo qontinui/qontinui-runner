@@ -749,8 +749,8 @@ export function TriggerEditor({ trigger, onSave, onCancel }: TriggerEditorProps)
                 <FieldError message={validationErrors.cronExpression} />
                 {!validationErrors.cronExpression && (
                   <p className="text-xs text-gray-500 mt-1">
-                    Format: minute hour day-of-month month day-of-week (e.g., "0 */6 * * *" = every
-                    6 hours)
+                    Format: minute hour day-of-month month day-of-week (0 or 7 = Sunday, 1 = Monday;
+                    e.g., "0 */6 * * *" = every 6 hours)
                   </p>
                 )}
               </div>

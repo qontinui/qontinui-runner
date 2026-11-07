@@ -713,7 +713,7 @@ export function SchedulerTaskForm({
               className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-hidden focus:ring-2 focus:ring-primary/50 font-mono text-sm"
             />
             <p className="text-xs text-muted-foreground">
-              Format: minute hour day-of-month month day-of-week
+              Format: minute hour day-of-month month day-of-week (0 or 7 = Sunday, 1 = Monday)
             </p>
           </div>
         )}
