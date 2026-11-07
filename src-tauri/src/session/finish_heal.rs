@@ -644,6 +644,15 @@ pub fn decorate_read_back(
             .map(|o| json!({ "outcome": o.reason() }))
             .unwrap_or(JsonValue::Null),
     );
+    // The stored stamp made `delivery` read `acked`; coord's own row now
+    // contradicts it and nothing was re-queued, so the response cannot keep
+    // claiming the write landed.
+    if stored_synced && !finish_synced && !matches!(rb.heal, Some(HealOutcome::Resent { .. })) {
+        coord.insert(
+            "delivery".to_string(),
+            JsonValue::String("unknown".to_string()),
+        );
+    }
     if let Some(HealOutcome::Resent { row }) = &rb.heal {
         // The heal re-queued the finish: the read-back now reports that write.
         coord.insert("queued".to_string(), JsonValue::Bool(true));

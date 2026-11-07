@@ -868,16 +868,18 @@ async fn finish_session(
     // it).
     let target = id.clone();
     let blocking_store = store.clone();
-    let outcome = spawn_blocking_tracked(move || apply_finish_outcome(&blocking_store, &target, req))
-        .await
-        .map_err(|join_err| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!(
-                    "finish for session `{id}` did not complete ({join_err}) — whether the                      marker was written is unknown"
-                ),
-            )
-        })??;
+    let outcome =
+        spawn_blocking_tracked(move || apply_finish_outcome(&blocking_store, &target, req))
+            .await
+            .map_err(|join_err| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!(
+                        "finish for session `{id}` did not complete ({join_err}) — whether the \
+                     marker was written is unknown"
+                    ),
+                )
+            })??;
     let mut body = outcome.response_json();
     // The READ-BACK (a reason-less re-finish of a finished mark) observes
     // coord: `coord.observed` is coord's own work-status row for this session,

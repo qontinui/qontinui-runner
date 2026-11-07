@@ -2338,10 +2338,6 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
                 );
                 succeeded.push(row);
                 finished_unconfirmed_dropped += 1;
-                inner.lifecycle_drops.record(
-                    &blocked_rec.event_kind,
-                    LifecycleDropReason::FinishedUnconfirmed,
-                );
                 // Keep the row the finish was SENT to on the mark (unstamped),
                 // so the next runner start's heal sweep can re-offer it there.
                 notify_finished_unconfirmed(inner, &blocked_rec);
@@ -2378,6 +2374,14 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
                 if finished_unconfirmed_dropped > 0 {
                     super::coord_sync_finish_ack::FINISHED_UNCONFIRMED_DROPPED
                         .fetch_add(finished_unconfirmed_dropped, Ordering::Relaxed);
+                    // Counted with the ACK, like the total above: a failed
+                    // ACK re-offers the row, and it must not count twice.
+                    for _ in 0..finished_unconfirmed_dropped {
+                        inner.lifecycle_drops.record(
+                            SessionEventKind::Finished.as_str(),
+                            LifecycleDropReason::FinishedUnconfirmed,
+                        );
+                    }
                 }
                 if superseded_count > 0 {
                     let total = HEARTBEATS_SUPERSEDED
@@ -3362,6 +3366,14 @@ async fn recover_row_missing(
         reason: why,
         message: format!("{cause} (after {reason})"),
     };
+    // A retired session or a missing body re-registers nothing, so coord's
+    // own 404 stays the leading status: the failure classifiers (`/health`
+    // `lastFailure`, the per-cause heartbeat drops) keep reading `not_found`.
+    let unrecoverable_404 =
+        |why: LifecycleDropReason, cause: String| PushOutcome::RowUnrecoverable {
+            reason: why,
+            message: format!("{reason} — {cause}"),
+        };
     let sid = rec.session_id;
     let base = inner.coord_url.trim_end_matches('/');
     let fallback_scope = record_session_tenant(inner, rec);
@@ -3375,15 +3387,15 @@ async fn recover_row_missing(
             other => other,
         },
         Attempt::Done(ReregisterOutcome::Transport(e)) => PushOutcome::Transport(e),
-        Attempt::Retired(Retired::Closed) => unrecoverable(
+        Attempt::Retired(Retired::Closed) => unrecoverable_404(
             LifecycleDropReason::NotFoundClosed,
             format!("session {sid} is closed; its coord row is not re-created"),
         ),
-        Attempt::Retired(Retired::Superseded) => unrecoverable(
+        Attempt::Retired(Retired::Superseded) => unrecoverable_404(
             LifecycleDropReason::NotFoundSuperseded,
             format!("session {sid} was superseded by a resume; its coord row is not re-created"),
         ),
-        Attempt::Done(ReregisterOutcome::NoBody) => unrecoverable(
+        Attempt::Done(ReregisterOutcome::NoBody) => unrecoverable_404(
             LifecycleDropReason::OrphanedNoBody,
             format!("no recorded create body for session {sid}; nothing re-registered"),
         ),
