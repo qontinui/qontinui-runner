@@ -1,0 +1,13 @@
+// Fixture for scripts/__tests__/validate-ws-actions.test.mjs — the wrapper
+// vocabulary covering every runner action in sdk_client.rs, plus one orphan.
+export const handlers = {
+  plain: () => relayCommand('plainAction'),
+  typed: () => relay.queueCommand<unknown>('typedAction', {}),
+  byId: () => relayWithFallback('byIdAction', {}),
+  crateVisible: () => relayCommand('crateVisibleAction'),
+  publicAction: () => relayCommand('publicAction'),
+  longDoc: () => relayCommand('longDocAction'),
+  legacy: () => relayCommand('legacyAction'),
+  undocumented: () => relayCommand('undocumentedAction'),
+  orphan: () => relayCommand('wrapperOnlyAction'),
+};
