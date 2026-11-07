@@ -1223,6 +1223,23 @@ static USAGE_PROBE_CACHE: Lazy<
     crate::commands::usage_probe_cache::CoalescingCache<AccountUsageInfo>,
 > = Lazy::new(|| crate::commands::usage_probe_cache::CoalescingCache::new(USAGE_PROBE_TTL));
 
+/// An account's label: the basename of its config dir. A dir that names no
+/// final component lexically (`…/..`, a trailing `.`) is resolved on disk
+/// first. One that still has none (a filesystem root, or a path that does not
+/// exist) keeps its full path, which serves local displays only: the coord
+/// report sends no row whose label is not a bare name
+/// ([`usage_twin_report::wire_label`]).
+fn account_label(config_dir: &str) -> String {
+    let path = std::path::Path::new(config_dir);
+    if let Some(name) = path.file_name() {
+        return name.to_string_lossy().into_owned();
+    }
+    std::fs::canonicalize(path)
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| config_dir.to_string())
+}
+
 /// Probe a single account for its weekly rate limit utilization.
 ///
 /// Reads through a shared single-flight + TTL cache
@@ -1243,10 +1260,7 @@ pub async fn probe_account_usage(config_dir: String) -> AccountUsageInfo {
     // (`crate::model_gateway`). Answered before the cache so no stale sample
     // outlives the switch.
     if crate::model_gateway::gateway_declared() {
-        let label = std::path::Path::new(&config_dir)
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| config_dir.clone());
+        let label = account_label(&config_dir);
         return AccountUsageInfo {
             config_dir,
             label,
@@ -1268,10 +1282,7 @@ pub async fn probe_account_usage(config_dir: String) -> AccountUsageInfo {
 /// Call [`probe_account_usage`] instead — going straight to this bypasses the
 /// coalescing that keeps the runner off Anthropic's rate limiter.
 async fn probe_account_usage_uncached(config_dir: String) -> AccountUsageInfo {
-    let label = std::path::Path::new(&config_dir)
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| config_dir.clone());
+    let label = account_label(&config_dir);
 
     // Pre-flight: if the stored OAuth token is already expired, attempt a
     // silent refresh BEFORE issuing the probe. Mirrors the warm-path discipline
@@ -1551,8 +1562,10 @@ pub fn record_usage_snapshot(results: &[AccountUsageInfo]) {
 /// the periodic timer (see `main.rs`), so a runner whose Settings/Terminal UI is
 /// never opened (e.g. a headless or co-pilot-only runner) still has fresh
 /// weekly-usage pace data for `pick_best_account`. No-op when fewer than two
-/// accounts are configured (single-account runners have nothing to choose
-/// between).
+/// accounts are configured. This path sits in front of the startup pick and the
+/// migration decision, so a single-account runner must not pay a probe here.
+/// The periodic fleet report covers that runner instead (see
+/// [`plan_usage_refresh`]).
 ///
 /// Returns the fresh per-account results so callers that need more than the
 /// recorded snapshot (e.g. `account_migration`'s reset-time-aware cooldown)
@@ -1561,35 +1574,180 @@ pub fn record_usage_snapshot(results: &[AccountUsageInfo]) {
 /// network round-trip to the provider that the latency-sensitive migration
 /// path must not pay.
 pub async fn refresh_account_usage_snapshot() -> Vec<AccountUsageInfo> {
-    refresh_usage(false).await
+    refresh_usage(UsageRefreshCaller::SelectionSnapshot).await
 }
 
 /// The periodic fleet report: [`refresh_account_usage_snapshot`] PLUS the
 /// prepaid (pay-as-you-go) balances, mirrored to coord on the same body.
 ///
-/// Unlike the accounts half this reports on a runner with fewer than two
-/// Claude accounts too: a prepaid balance is money on the account whatever the
-/// Claude roster looks like, and gating it on the account count would leave
-/// every single-account runner's balance with no fleet copy — which is the
-/// whole defect of plan `2026-09-12-prepaid-balance-is-a-fleet-fact-with-no-ingest`.
+/// Both halves report on a runner with fewer than two Claude accounts. A
+/// prepaid balance is money on the account whatever the Claude roster looks
+/// like (plan `2026-09-12-prepaid-balance-is-a-fleet-fact-with-no-ingest`). A
+/// lone Claude account spends a usage window that coord's launch budget has to
+/// count (plan `2026-10-29-launch-budget-is-a-coord-answer-not-a-per-box-script`
+/// Phase 2). That includes a runner with NO configured account list, whose one
+/// account is the one it spends (see [`spent_account_dir`]). Before that plan,
+/// this half sent nothing for such a runner.
 pub async fn refresh_fleet_usage_report() -> Vec<AccountUsageInfo> {
-    refresh_usage(true).await
+    refresh_usage(UsageRefreshCaller::FleetReport).await
 }
 
-async fn refresh_usage(include_prepaid: bool) -> Vec<AccountUsageInfo> {
-    let config_dirs = crate::settings::get_claude_config_dirs();
-    let results = if config_dirs.len() < 2 {
-        Vec::new()
+/// Which of the two refresh entry points is asking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UsageRefreshCaller {
+    /// Startup and `account_migration`: feeds the account picker.
+    SelectionSnapshot,
+    /// The 10-minute timer: the fleet report to coord.
+    FleetReport,
+}
+
+/// What one refresh does, decided from how many Claude config dirs the runner
+/// has configured and who is asking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UsageRefreshPlan {
+    /// Probe the configured dirs.
+    probe_configured: bool,
+    /// Below two configured dirs, probe instead the one account this runner
+    /// spends ([`spent_account_dir`]).
+    probe_spent: bool,
+    /// Record the results into the account picker's snapshot.
+    record_snapshot: bool,
+}
+
+/// The picker's snapshot is recorded only from two configured accounts up,
+/// exactly as before plan `2026-10-29-launch-budget-…` Phase 2, so picker
+/// behaviour does not change. The fleet report also covers a runner with fewer
+/// than two, by probing the account it spends, because coord's launch budget
+/// has to count it. That probe's only consumer is the report, so it runs only
+/// when `reports_lone_account`: the runner has a coord to report to and the
+/// account is its own ([`lone_account_scope`]).
+fn plan_usage_refresh(
+    dir_count: usize,
+    caller: UsageRefreshCaller,
+    reports_lone_account: bool,
+) -> UsageRefreshPlan {
+    let multi = dir_count >= 2;
+    UsageRefreshPlan {
+        probe_configured: multi,
+        probe_spent: !multi && caller == UsageRefreshCaller::FleetReport && reports_lone_account,
+        record_snapshot: multi,
+    }
+}
+
+/// The account a runner with fewer than two configured accounts actually
+/// spends: what a `claude` it spawns runs on. That is the dir the spawn paths
+/// pin as `CLAUDE_CONFIG_DIR` ([`crate::ai_provider::get_effective_config_dir`]:
+/// the picker's pick or `claude_cli.config_dir`, when it has credentials).
+/// When nothing is pinned the child inherits the runner's own environment, so
+/// it is then the runner's `CLAUDE_CONFIG_DIR`, else the default `~/.claude`
+/// when it exists. A lone roster entry is therefore NOT assumed to be the
+/// account in use: in `Manual` mode the spawn takes `config_dir`, whatever the
+/// roster lists. `None` under a model gateway, which has no subscription
+/// account, and when no candidate exists.
+///
+/// `include_inherited` is true only for the primary
+/// ([`LoneAccountScope::Primary`]). A SUBJECT runner reports only a pinned
+/// account. Its roster and settings sit under
+/// its instance root (`claude_accounts::claude_accounts_file_path`), so a pin
+/// is its own. The two inherited steps are not: `HOME` is not re-rooted for
+/// any runner, and its environment is its launcher's, so the inherited
+/// `CLAUDE_CONFIG_DIR` and `~/.claude` are the harness's account. Any other
+/// secondary never reaches this function for a lone account (see
+/// [`lone_account_scope`]).
+fn spent_account_dir(include_inherited: bool) -> Option<String> {
+    if crate::model_gateway::gateway_declared() {
+        return None;
+    }
+    let (pinned, _source) =
+        crate::ai_provider::get_effective_config_dir(&settings::get_ai_settings().claude_cli);
+    if pinned.is_some() || !include_inherited {
+        return pinned;
+    }
+    std::env::var("CLAUDE_CONFIG_DIR")
+        .ok()
+        .filter(|dir| !dir.trim().is_empty())
+        .or_else(|| {
+            default_claude_config_dir()
+                .filter(|dir| dir.is_dir())
+                .map(|dir| dir.to_string_lossy().into_owned())
+        })
+}
+
+/// Which runner may report a lone account as its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoneAccountScope {
+    /// The box's canonical runner: every step of [`spent_account_dir`],
+    /// inherited ones included.
+    Primary,
+    /// A nameless runner under an instance root: only the pin in its own
+    /// roster, which sits under that root.
+    Subject,
+}
+
+/// Who this runner is for a lone account, or `None` when the account is not
+/// its own to report.
+///
+/// - **Primary** is `crate::instance::owns_shared_root_state`, which fails
+///   closed: a runner showing any secondary signal (a name, a root,
+///   `QONTINUI_PRIMARY_PORT`, a non-default API port) is not the primary.
+///   `is_secondary` would miss the last two and report the primary's inherited
+///   account a second time.
+/// - **Subject** is a runner with an instance root and NO name. A named runner
+///   under a root is a child a subject spawned: it inherits the root and
+///   resolves the same roster, so its report would duplicate the subject's.
+/// - Everything else (a named or temp secondary, a nameless secondary found by
+///   its ports) resolves the primary's machine-global roster and, unless
+///   redirected, the primary's `settings.json`, so its pin and its inherited
+///   environment are both the primary's account.
+///
+/// A secondary's two-or-more-account roster is a different path and still
+/// reports, as it did before this.
+fn lone_account_scope() -> Option<LoneAccountScope> {
+    use qontinui_runner_lib::instance_env::{instance_name, instance_root};
+    if crate::instance::owns_shared_root_state() {
+        Some(LoneAccountScope::Primary)
+    } else if instance_name().is_none() && instance_root().is_some() {
+        Some(LoneAccountScope::Subject)
     } else {
-        let futures: Vec<_> = config_dirs
+        None
+    }
+}
+
+async fn refresh_usage(caller: UsageRefreshCaller) -> Vec<AccountUsageInfo> {
+    let mut config_dirs = crate::settings::get_claude_config_dirs();
+    let report_base = usage_twin_report::report_base();
+    let scope = lone_account_scope();
+    let plan = plan_usage_refresh(
+        config_dirs.len(),
+        caller,
+        report_base.is_some() && scope.is_some(),
+    );
+    if !plan.probe_configured {
+        config_dirs.clear();
+    }
+    // Which probed accounts are the ones in use. From a roster, the picker's
+    // selection (`account_infos`, one source with the Tauri command). A lone
+    // spent account is in use by construction: it is what a spawn runs on.
+    let active_dirs: std::collections::HashSet<String> = if plan.probe_spent {
+        let spent = spent_account_dir(scope == Some(LoneAccountScope::Primary));
+        config_dirs.extend(spent.clone());
+        spent.into_iter().collect()
+    } else {
+        account_infos()
             .into_iter()
-            .map(|dir| async move { probe_account_usage(dir).await })
-            .collect();
-        let results = futures::future::join_all(futures).await;
-        record_usage_snapshot(&results);
-        results
+            .filter(|a| a.is_active)
+            .map(|a| a.config_dir)
+            .collect()
     };
-    let prepaid = if include_prepaid {
+    let futures: Vec<_> = config_dirs
+        .into_iter()
+        .map(|dir| async move { probe_account_usage(dir).await })
+        .collect();
+    let results = futures::future::join_all(futures).await;
+    if plan.record_snapshot {
+        record_usage_snapshot(&results);
+    }
+    let prepaid = if caller == UsageRefreshCaller::FleetReport {
         crate::ai_provider::prepaid_balance::get_prepaid_balances().await
     } else {
         Vec::new()
@@ -1597,8 +1755,8 @@ async fn refresh_usage(include_prepaid: bool) -> Vec<AccountUsageInfo> {
     // Nothing measured, nothing to say. An empty `prepaid` makes coord write
     // nothing for that half, so the accounts-only caller can never blank a
     // balance the timer reported.
-    if !results.is_empty() || !prepaid.is_empty() {
-        usage_twin_report::report_to_coord(&results, &prepaid).await;
+    if let Some(base) = report_base.filter(|_| !results.is_empty() || !prepaid.is_empty()) {
+        usage_twin_report::report_to_coord(&base, &results, &active_dirs, &prepaid).await;
     }
     results
 }
@@ -1629,6 +1787,15 @@ mod usage_twin_report {
         exhausted: bool,
         source: Option<&'a str>,
         error: bool,
+        /// The provider's own verdict on this account, passed through unread:
+        /// the 7-day status header on the probe path (`allowed`,
+        /// `allowed_warning`, `rejected`), `blocked` from the OAuth usage
+        /// endpoint. Absent when the source gave none, which is UNKNOWN, not
+        /// "allowed". Coord's ingest ignores this key until Phase 3 of plan
+        /// `2026-10-29-launch-budget-is-a-coord-answer-not-a-per-box-script`
+        /// stores it for the launch budget's `provider_rejected` HOLD.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        status: Option<&'a str>,
         /// Which account this machine's rotation has ACTUALLY selected right
         /// now — the same flag [`super::AccountInfo::is_active`] carries, from
         /// the same `ai_provider::get_account_statuses()` source. Without it
@@ -1691,37 +1858,55 @@ mod usage_twin_report {
         account_selection_mode: &'static str,
     }
 
+    /// The coord this runner reports to, or `None` when it reports nothing.
+    ///
+    /// Connected-set: on a hosted (`qontinui_account`-tier) runner the
+    /// production coordinator IS this account's backend, so the usage rollup
+    /// must reach it even when profiles.json carries no explicit `coord_url`.
+    /// An isolated runner reports nothing, and the
+    /// `QONTINUI_ACCOUNT_USAGE_REPORT_DISABLED` kill switch opts a connected
+    /// one out.
+    pub(super) fn report_base() -> Option<String> {
+        if std::env::var_os("QONTINUI_ACCOUNT_USAGE_REPORT_DISABLED").is_some() {
+            return None;
+        }
+        qontinui_runner_lib::profiles::connected_coord_base()
+    }
+
+    /// The label as sent, or `None` for a label that is not a bare name: the
+    /// wire never carries a local path ([`super::account_label`] keeps one for
+    /// a dir with no final component).
+    fn wire_label(label: &str) -> Option<&str> {
+        let bare = !label.is_empty()
+            && label != "."
+            && label != ".."
+            && !label.contains(['/', '\\'])
+            && !std::path::Path::new(label).has_root();
+        bare.then_some(label)
+    }
+
+    /// Post one report. `active_dirs` names the probed accounts in use, keyed
+    /// by `config_dir` (not `label`: two roster dirs can share a basename, and
+    /// the probe results carry the full dir).
     pub(super) async fn report_to_coord(
+        base: &str,
         results: &[super::AccountUsageInfo],
+        active_dirs: &std::collections::HashSet<String>,
         prepaid: &[crate::ai_provider::prepaid_balance::PrepaidBalanceInfo],
     ) {
-        if std::env::var_os("QONTINUI_ACCOUNT_USAGE_REPORT_DISABLED").is_some() {
-            return;
-        }
-        // Connected-set: on a hosted (`qontinui_account`-tier) runner the
-        // production coordinator IS this account's backend, so the usage
-        // rollup must reach it even when profiles.json carries no explicit
-        // `coord_url`. An isolated runner reports nothing (and the
-        // `QONTINUI_ACCOUNT_USAGE_REPORT_DISABLED` kill switch above still
-        // opts a connected one out).
-        let Some(base) = qontinui_runner_lib::profiles::connected_coord_base() else {
-            return;
-        };
         let url = format!("{}/coord/claude-accounts/usage", base.trim_end_matches('/'));
-        // The live per-account status, from the SAME source the Tauri command
-        // `get_claude_accounts` reads — one selection truth, two surfaces.
-        // Keyed by `config_dir` (not `label`): two roster dirs can share a
-        // basename, and the probe results carry the full dir.
-        let active_dirs: std::collections::HashSet<String> = super::account_infos()
-            .into_iter()
-            .filter(|a| a.is_active)
-            .map(|a| a.config_dir)
-            .collect();
         let body = WireBody {
             accounts: results
                 .iter()
-                .map(|r| WireAccount {
-                    label: &r.label,
+                .filter_map(|r| {
+                    let label = wire_label(&r.label);
+                    if label.is_none() {
+                        warn!("account usage row with no bare-name label not reported to coord");
+                    }
+                    Some((r, label?))
+                })
+                .map(|(r, label)| WireAccount {
+                    label,
                     weekly_utilization: r.utilization,
                     weekly_resets_at: r.resets_at,
                     session_utilization: r.session_utilization,
@@ -1730,6 +1915,7 @@ mod usage_twin_report {
                     exhausted: super::probe_result_exhausted(r),
                     source: r.source.as_deref(),
                     error: r.error.is_some(),
+                    status: r.status.as_deref(),
                     is_active: active_dirs.contains(&r.config_dir),
                 })
                 .collect(),
@@ -1879,6 +2065,7 @@ mod usage_twin_report {
                     exhausted: false,
                     source: Some("oauth_usage"),
                     error: false,
+                    status: None,
                     is_active: true,
                 }],
                 prepaid: Vec::new(),
@@ -1942,6 +2129,45 @@ mod usage_twin_report {
             assert!(refusal_warning(&last, 404, "", None).is_none());
         }
 
+        /// What `report_to_coord` itself decides: a reading with no status
+        /// carries no `status` key (an absent status is UNKNOWN, so it must not
+        /// arrive as a value), and a row whose label is not a bare name is not
+        /// sent at all, so a local path never reaches coord.
+        #[tokio::test]
+        async fn report_to_coord_omits_absent_status_and_path_labels() {
+            let _amb = crate::test_env::isolated_ambient();
+            let coord = super::super::usage_report_scope_tests::FakeCoord::start().await;
+            let row = |label: &str| crate::commands::ai_settings::AccountUsageInfo {
+                config_dir: format!("/x/{label}"),
+                label: label.into(),
+                ..Default::default()
+            };
+            let rows = [
+                row(".claude-silent"),
+                row("/home/someone/.claude"),
+                row("/"),
+                row(".."),
+                row(r"C:\Users\someone\.claude"),
+            ];
+
+            report_to_coord(&coord.base, &rows, &Default::default(), &[]).await;
+
+            let bodies = coord.bodies();
+            assert_eq!(bodies.len(), 1, "one report, one POST: {bodies:?}");
+            let accounts = bodies[0]["accounts"].as_array().expect("accounts");
+            assert_eq!(
+                accounts.len(),
+                1,
+                "only the bare-name row is sent: {accounts:?}"
+            );
+            assert_eq!(accounts[0]["label"], serde_json::json!(".claude-silent"));
+            assert!(
+                accounts[0].get("status").is_none(),
+                "no status means no key: {}",
+                accounts[0]
+            );
+        }
+
         /// `is_active` is a per-account flag; a report where nothing has been
         /// resolved yet is all-`false`, not a missing key.
         #[test]
@@ -1958,6 +2184,7 @@ mod usage_twin_report {
                     exhausted: false,
                     source: None,
                     error: true,
+                    status: None,
                     is_active: false,
                 }],
                 prepaid: Vec::new(),
@@ -2158,6 +2385,14 @@ pub struct CliAuthStatus {
     pub credentials_path: Option<String>,
 }
 
+/// Claude Code's own default config dir, `~/.claude`. It belongs to the user's
+/// Claude login rather than to the runner, so it stays machine-global even
+/// under an instance root. This is the file's one door to it (the census in
+/// `ambient::tests::USER_GLOBAL_DIRS_ALLOWLIST` counts exactly one).
+fn default_claude_config_dir() -> Option<std::path::PathBuf> {
+    dirs::home_dir().map(|home| home.join(".claude"))
+}
+
 /// Find the Claude CLI credentials file, respecting config_dir settings.
 pub(crate) fn find_claude_credentials_path() -> Option<std::path::PathBuf> {
     // 1. Check effective config_dir from runner AI settings (respects least-usage mode)
@@ -2180,8 +2415,8 @@ pub(crate) fn find_claude_credentials_path() -> Option<std::path::PathBuf> {
     }
 
     // 3. Check default ~/.claude/
-    if let Some(home) = dirs::home_dir() {
-        let path = home.join(".claude").join(".credentials.json");
+    if let Some(dir) = default_claude_config_dir() {
+        let path = dir.join(".credentials.json");
         if path.exists() {
             return Some(path);
         }
@@ -2736,6 +2971,471 @@ mod save_selection_mode_tests {
             resolve_saved_selection_mode(Some("bogus"), stored),
             AccountSelectionMode::default()
         );
+    }
+}
+
+#[cfg(test)]
+mod usage_report_scope_tests {
+    // Every test here that writes the machine-global roster is `cfg(unix)`.
+    // Windows resolves the known folders once per process and ignores a later
+    // `USERPROFILE`, so a roster write lands in an earlier fixture's temp dir
+    // (measured on CI: two different `.tmp*` dirs) — the reason
+    // `subject_isolation_harness` cannot write on Windows either. Their
+    // helpers are dead code there, not wrong.
+    #![cfg_attr(windows, allow(dead_code, unused_imports))]
+    use super::{
+        refresh_account_usage_snapshot, refresh_fleet_usage_report, AccountUsageInfo,
+        USAGE_PROBE_CACHE,
+    };
+    use crate::settings::AccountSelectionMode;
+    use crate::test_env::{EnvVarRestore, IsolatedAmbient};
+    use std::sync::{Arc, Mutex};
+
+    /// A coord that records every usage report it is sent, so these tests read
+    /// what actually went out on the wire.
+    pub(super) struct FakeCoord {
+        pub(super) base: String,
+        received: Arc<Mutex<Vec<serde_json::Value>>>,
+    }
+
+    impl FakeCoord {
+        pub(super) async fn start() -> Self {
+            let received = Arc::new(Mutex::new(Vec::new()));
+            let sink = received.clone();
+            let app = axum::Router::new().route(
+                "/coord/claude-accounts/usage",
+                axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                    let sink = sink.clone();
+                    async move {
+                        sink.lock().unwrap().push(body);
+                        axum::http::StatusCode::OK
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.ok();
+            });
+            Self {
+                base: format!("http://{addr}"),
+                received,
+            }
+        }
+
+        pub(super) fn bodies(&self) -> Vec<serde_json::Value> {
+            self.received.lock().unwrap().clone()
+        }
+
+        /// Every account row coord received, in order.
+        fn rows(&self) -> Vec<serde_json::Value> {
+            self.bodies()
+                .iter()
+                .flat_map(|b| b["accounts"].as_array().cloned().unwrap_or_default())
+                .collect()
+        }
+
+        /// The labels of every account row coord received, in order.
+        fn reported_labels(&self) -> Vec<String> {
+            self.rows()
+                .iter()
+                .map(|a| a["label"].as_str().unwrap_or_default().to_string())
+                .collect()
+        }
+
+        /// Make this the coord the runner under test is connected to.
+        /// `isolated_ambient` captured `COORD_HTTP_URL` and restores it.
+        fn connect(&self) {
+            std::env::set_var("COORD_HTTP_URL", &self.base);
+        }
+    }
+
+    /// The env these tests need beyond `isolated_ambient`, restored on drop.
+    /// - `XDG_CONFIG_HOME`: an inherited value would put a roster write in the
+    ///   operator's real `claude-accounts.json` (set per test by
+    ///   [`write_roster`]).
+    /// - The kill switch is removed, or a box exporting it reads every
+    ///   positive test as red.
+    /// - `QONTINUI_PORT` is removed, so the fixture reads as the primary on its
+    ///   default API port (`QONTINUI_PRIMARY_PORT` is already removed by the
+    ///   fixture).
+    /// - The prepaid half of every fleet report must find no key: the keychain
+    ///   is switched to its file store and both env fallbacks are removed, so
+    ///   no test calls a provider or blocks on a locked secret service.
+    fn extra_env() -> EnvVarRestore {
+        let restore = EnvVarRestore::capture(&[
+            "XDG_CONFIG_HOME",
+            "QONTINUI_ACCOUNT_USAGE_REPORT_DISABLED",
+            "QONTINUI_DISABLE_KEYCHAIN",
+            "DEEPSEEK_API_KEY",
+            "OPENAI_COMPATIBLE_API_KEY",
+            "QONTINUI_PORT",
+        ]);
+        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
+        for key in [
+            "QONTINUI_PORT",
+            "QONTINUI_ACCOUNT_USAGE_REPORT_DISABLED",
+            "DEEPSEEK_API_KEY",
+            "OPENAI_COMPATIBLE_API_KEY",
+        ] {
+            std::env::remove_var(key);
+        }
+        restore
+    }
+
+    /// Assert `path` lies under `root`, comparing the two as the filesystem
+    /// resolves them rather than as spelled (macOS spells its temp dir through
+    /// the `/var` -> `/private/var` link). `path` may not exist yet, so its
+    /// nearest existing ancestor is resolved and the rest re-joined lexically.
+    /// Nothing is created, so a path that did escape is not touched.
+    fn assert_inside(path: &std::path::Path, root: &std::path::Path, what: &str) {
+        let root = std::fs::canonicalize(root).expect("canonicalize the fixture root");
+        let mut existing = path;
+        let mut rest = Vec::new();
+        while !existing.exists() {
+            rest.push(existing.file_name().expect("a path under a root has names"));
+            existing = existing.parent().expect("a path under a root has a parent");
+        }
+        let mut resolved = std::fs::canonicalize(existing).expect("canonicalize the ancestor");
+        resolved.extend(rest.into_iter().rev());
+        assert!(
+            resolved.starts_with(&root),
+            "{what}: {} (resolved {}) is not under {}",
+            path.display(),
+            resolved.display(),
+            root.display()
+        );
+    }
+
+    /// Write the machine-global roster inside the fixture: `dirs` in `mode`,
+    /// with `config_dir` as the manual pin. The path is checked before the
+    /// write.
+    fn write_roster(
+        amb: &IsolatedAmbient,
+        dirs: Vec<String>,
+        mode: AccountSelectionMode,
+        config_dir: Option<String>,
+    ) {
+        std::env::set_var("XDG_CONFIG_HOME", amb.dir().join("xdg-config"));
+        let path = crate::claude_accounts::claude_accounts_file_path().expect("roster path");
+        assert_inside(&path, amb.dir(), "the roster escaped the fixture");
+        crate::claude_accounts::update(move |r| {
+            r.claude_config_dirs = dirs;
+            r.account_selection_mode = mode;
+            r.account_selection_pinned = true;
+            r.config_dir = config_dir;
+        })
+        .expect("write roster");
+    }
+
+    /// A config dir with no credentials: the probe answers from the filesystem
+    /// with an error row, so it never reaches a provider.
+    fn logged_out_dir(amb: &IsolatedAmbient, name: &str) -> String {
+        let dir = amb.dir().join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.to_string_lossy().into_owned()
+    }
+
+    /// A config dir with unexpired credentials, so the spawn resolver accepts
+    /// it as `CLAUDE_CONFIG_DIR`. Its probe result is seeded into the probe
+    /// cache (fresh for the cache's TTL), so the report reads `reading`
+    /// instead of calling the provider.
+    async fn logged_in_dir(amb: &IsolatedAmbient, name: &str, status: Option<&str>) -> String {
+        let dir = logged_out_dir(amb, name);
+        let expires_ms = chrono::Utc::now().timestamp_millis() + 86_400_000;
+        std::fs::write(
+            std::path::Path::new(&dir).join(".credentials.json"),
+            format!(
+                r#"{{"claudeAiOauth":{{"accessToken":"sk-ant-test","refreshToken":"rt","expiresAt":{expires_ms}}}}}"#
+            ),
+        )
+        .unwrap();
+        let reading = AccountUsageInfo {
+            config_dir: dir.clone(),
+            label: name.to_string(),
+            utilization: 0.25,
+            status: status.map(str::to_string),
+            source: Some("oauth_usage".into()),
+            ..Default::default()
+        };
+        USAGE_PROBE_CACHE
+            .get_or_fetch(&dir, move || async move { reading })
+            .await;
+        dir
+    }
+
+    /// The planner's table. Kept in its own module so the imports of the
+    /// planner (which this change adds) do not stop the report tests below
+    /// from building against a tree without it.
+    mod plan_tests {
+        use super::super::{plan_usage_refresh, UsageRefreshCaller, UsageRefreshPlan};
+
+        fn plan(
+            probe_configured: bool,
+            probe_spent: bool,
+            record_snapshot: bool,
+        ) -> UsageRefreshPlan {
+            UsageRefreshPlan {
+                probe_configured,
+                probe_spent,
+                record_snapshot,
+            }
+        }
+
+        /// The picker path (startup, account migration) is unchanged by the fleet
+        /// report: it probes and records only from two configured accounts up, so
+        /// a single-account runner pays no probe in front of its first pick.
+        #[test]
+        fn the_selection_path_needs_two_accounts() {
+            let c = UsageRefreshCaller::SelectionSnapshot;
+            for lone in [true, false] {
+                assert_eq!(plan_usage_refresh(0, c, lone), plan(false, false, false));
+                assert_eq!(plan_usage_refresh(1, c, lone), plan(false, false, false));
+                assert_eq!(plan_usage_refresh(2, c, lone), plan(true, false, true));
+            }
+        }
+
+        /// The fleet report covers a runner with fewer than two accounts by
+        /// probing the account it spends, only when it reports lone accounts; from
+        /// two up it is the roster, exactly as the picker sees it.
+        #[test]
+        fn the_fleet_report_covers_single_and_unlisted_accounts() {
+            let c = UsageRefreshCaller::FleetReport;
+            assert_eq!(plan_usage_refresh(0, c, true), plan(false, true, false));
+            assert_eq!(plan_usage_refresh(1, c, true), plan(false, true, false));
+            assert_eq!(plan_usage_refresh(3, c, true), plan(true, false, true));
+            assert_eq!(plan_usage_refresh(0, c, false), plan(false, false, false));
+            assert_eq!(plan_usage_refresh(1, c, false), plan(false, false, false));
+            assert_eq!(plan_usage_refresh(3, c, false), plan(true, false, true));
+        }
+    }
+
+    /// The population this phase exists for, entered where the 10-minute timer
+    /// enters: a one-account runner's account reaches coord, marked in use, and
+    /// the provider's status rides along. The picker path over the same roster
+    /// stays silent, because that guard is the picker's.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_fleet_report_sends_a_single_configured_account_to_coord() {
+        let amb = crate::test_env::isolated_ambient();
+        let _env = extra_env();
+        let coord = FakeCoord::start().await;
+        coord.connect();
+        let solo = logged_in_dir(&amb, ".claude-solo", Some("rejected")).await;
+        write_roster(
+            &amb,
+            vec![solo.clone()],
+            AccountSelectionMode::Manual,
+            Some(solo),
+        );
+
+        let picker = refresh_account_usage_snapshot().await;
+        assert!(picker.is_empty(), "the picker path probed: {picker:?}");
+        assert!(coord.bodies().is_empty(), "the picker path reported");
+
+        let results = refresh_fleet_usage_report().await;
+        assert_eq!(results.len(), 1, "{results:?}");
+        let rows = coord.rows();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0]["label"], serde_json::json!(".claude-solo"));
+        assert_eq!(rows[0]["is_active"], serde_json::json!(true), "{}", rows[0]);
+        assert_eq!(
+            rows[0]["status"],
+            serde_json::json!("rejected"),
+            "{}",
+            rows[0]
+        );
+    }
+
+    /// A one-entry roster is not the account in use when `Manual` mode pins a
+    /// different `config_dir`: spawns run on the pin, so the pin is reported.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_fleet_report_sends_the_pinned_account_not_the_lone_roster_entry() {
+        let amb = crate::test_env::isolated_ambient();
+        let _env = extra_env();
+        let coord = FakeCoord::start().await;
+        coord.connect();
+        let listed = logged_in_dir(&amb, ".claude-listed", None).await;
+        let pinned = logged_in_dir(&amb, ".claude-pinned", None).await;
+        write_roster(
+            &amb,
+            vec![listed],
+            AccountSelectionMode::Manual,
+            Some(pinned),
+        );
+
+        refresh_fleet_usage_report().await;
+
+        assert_eq!(coord.reported_labels(), vec![".claude-pinned".to_string()]);
+    }
+
+    /// No list and no pin: a spawn inherits the runner's own environment, so
+    /// an inherited `CLAUDE_CONFIG_DIR` is the account in use, ahead of
+    /// `~/.claude`. Its label is the dir's real name even when the path ends
+    /// in `..`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_fleet_report_sends_an_inherited_claude_config_dir_to_coord() {
+        let amb = crate::test_env::isolated_ambient();
+        let _env = extra_env();
+        let coord = FakeCoord::start().await;
+        coord.connect();
+        write_roster(&amb, Vec::new(), AccountSelectionMode::Manual, None);
+        logged_out_dir(&amb, ".claude");
+        let inherited = logged_out_dir(&amb, ".claude-env");
+        std::fs::create_dir_all(std::path::Path::new(&inherited).join("sub")).unwrap();
+        std::env::set_var("CLAUDE_CONFIG_DIR", format!("{inherited}/sub/.."));
+
+        refresh_fleet_usage_report().await;
+
+        assert_eq!(coord.reported_labels(), vec![".claude-env".to_string()]);
+        let row = &coord.rows()[0];
+        assert_eq!(row["error"], serde_json::json!(true), "logged out: {row}");
+        assert_eq!(row["is_active"], serde_json::json!(true), "{row}");
+    }
+
+    /// A named or temp secondary reports no lone account, even a pinned one:
+    /// its roster is the primary's machine-global one, so its row would be the
+    /// primary's written twice. A subject reports the pin in the roster under
+    /// its own instance root, and never its inherited `CLAUDE_CONFIG_DIR`,
+    /// which is the harness's account.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn only_a_subject_secondary_reports_its_own_pinned_lone_account() {
+        let amb = crate::test_env::isolated_ambient();
+        let _env = extra_env();
+        let coord = FakeCoord::start().await;
+        coord.connect();
+        std::env::set_var("CLAUDE_CONFIG_DIR", logged_out_dir(&amb, ".claude-env"));
+
+        let shared = logged_in_dir(&amb, ".claude-shared", None).await;
+        write_roster(&amb, Vec::new(), AccountSelectionMode::Manual, Some(shared));
+        std::env::set_var("QONTINUI_INSTANCE_NAME", "temp-runner");
+        let named = refresh_fleet_usage_report().await;
+        std::env::remove_var("QONTINUI_INSTANCE_NAME");
+        assert!(named.is_empty(), "a named secondary reported: {named:?}");
+        assert!(coord.reported_labels().is_empty());
+
+        std::env::set_var("QONTINUI_INSTANCE_ROOT", amb.root());
+        let roster = crate::claude_accounts::claude_accounts_file_path().expect("roster path");
+        assert_inside(
+            &roster,
+            &amb.root(),
+            "a subject's roster must sit under its instance root",
+        );
+        write_roster(&amb, Vec::new(), AccountSelectionMode::Manual, None);
+        let unpinned = refresh_fleet_usage_report().await;
+        assert!(
+            unpinned.is_empty(),
+            "a subject reported its inherited env dir: {unpinned:?}"
+        );
+        let own = logged_in_dir(&amb, ".claude-own", None).await;
+        write_roster(&amb, Vec::new(), AccountSelectionMode::Manual, Some(own));
+
+        // A named child of the subject inherits its root, so it resolves the
+        // same pinned roster; its report would be the subject's twice.
+        std::env::set_var("QONTINUI_INSTANCE_NAME", "subject-child");
+        let child = refresh_fleet_usage_report().await;
+        std::env::remove_var("QONTINUI_INSTANCE_NAME");
+        assert!(
+            child.is_empty(),
+            "a named child under the root reported: {child:?}"
+        );
+        assert!(coord.reported_labels().is_empty());
+
+        refresh_fleet_usage_report().await;
+        std::env::remove_var("QONTINUI_INSTANCE_ROOT");
+        assert_eq!(coord.reported_labels(), vec![".claude-own".to_string()]);
+    }
+
+    /// A nameless secondary that only its ports give away (a primary to proxy
+    /// to, or a non-default API port) is not the primary, so it does not
+    /// report the inherited account the primary already reports.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_nameless_secondary_reports_no_lone_account() {
+        let amb = crate::test_env::isolated_ambient();
+        let _env = extra_env();
+        let coord = FakeCoord::start().await;
+        coord.connect();
+        write_roster(&amb, Vec::new(), AccountSelectionMode::Manual, None);
+        std::env::set_var("CLAUDE_CONFIG_DIR", logged_out_dir(&amb, ".claude-env"));
+
+        std::env::set_var("QONTINUI_PRIMARY_PORT", "9876");
+        let proxied = refresh_fleet_usage_report().await;
+        std::env::remove_var("QONTINUI_PRIMARY_PORT");
+        assert!(
+            proxied.is_empty(),
+            "a proxying secondary reported: {proxied:?}"
+        );
+
+        std::env::set_var("QONTINUI_PORT", "9881");
+        let off_port = refresh_fleet_usage_report().await;
+        std::env::remove_var("QONTINUI_PORT");
+        assert!(
+            off_port.is_empty(),
+            "an off-port secondary reported: {off_port:?}"
+        );
+        assert!(coord.reported_labels().is_empty());
+
+        refresh_fleet_usage_report().await;
+        assert_eq!(coord.reported_labels(), vec![".claude-env".to_string()]);
+    }
+
+    /// No list, no pin, nothing inherited: the default `~/.claude`. Unix only:
+    /// `HOME` steers `dirs::home_dir` there, and the Windows lookup does not
+    /// promise to follow the fixture.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_fleet_report_sends_the_default_dir_to_coord() {
+        let amb = crate::test_env::isolated_ambient();
+        let _env = extra_env();
+        let coord = FakeCoord::start().await;
+        coord.connect();
+        write_roster(&amb, Vec::new(), AccountSelectionMode::Manual, None);
+        logged_out_dir(&amb, ".claude");
+
+        refresh_fleet_usage_report().await;
+
+        assert_eq!(coord.reported_labels(), vec![".claude".to_string()]);
+    }
+
+    /// An isolated runner has nobody to report to, so a lone account is not
+    /// probed: below two accounts the probe's only consumer is the report.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_isolated_runner_does_not_probe_a_lone_account() {
+        let amb = crate::test_env::isolated_ambient();
+        let _env = extra_env();
+        write_roster(&amb, Vec::new(), AccountSelectionMode::Manual, None);
+        std::env::set_var("CLAUDE_CONFIG_DIR", logged_out_dir(&amb, ".claude-env"));
+
+        let results = refresh_fleet_usage_report().await;
+
+        assert!(results.is_empty(), "probed with no consumer: {results:?}");
+    }
+
+    /// The kill switch silences a connected runner's report, and so its
+    /// lone-account probe too.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_kill_switch_stops_the_lone_account_report() {
+        let amb = crate::test_env::isolated_ambient();
+        let _env = extra_env();
+        let coord = FakeCoord::start().await;
+        coord.connect();
+        write_roster(&amb, Vec::new(), AccountSelectionMode::Manual, None);
+        std::env::set_var("CLAUDE_CONFIG_DIR", logged_out_dir(&amb, ".claude-env"));
+        std::env::set_var("QONTINUI_ACCOUNT_USAGE_REPORT_DISABLED", "1");
+
+        let results = refresh_fleet_usage_report().await;
+
+        assert!(
+            results.is_empty(),
+            "probed under the kill switch: {results:?}"
+        );
+        assert!(coord.bodies().is_empty(), "reported under the kill switch");
     }
 }
 
