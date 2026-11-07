@@ -2498,6 +2498,12 @@ async fn health(
         // to its count (only non-zero kinds; the values sum to the scalar).
         // A stalled drain used to be invisible from here.
         "sessionOutbox": crate::session::coord_sync::session_outbox_health_json(),
+        // The finish heal (plan 2026-11-05-finish-synced-is-stamped-on-a-2xx-
+        // that-did-not-move-session-status, Phase 5): boot sweeps and finish
+        // read-backs run, and every synced finished mark they judged counted
+        // by outcome — `resent`, or the reason it was left alone
+        // (`coord_finished`, `revived_after_finish`, `coord_unreadable`, …).
+        "finishHeal": crate::session::finish_heal::heal_health_json(),
         // Session-message push evidence (plan
         // 2026-09-07-session-message-delivery-is-blind-and-park-collection-
         // resolves-on-a-guess, Phase 4): every tick the poller could not push
@@ -15626,6 +15632,7 @@ mod self_id_chain_tests {
             wind_down_arm: None,
             finish_reason: None,
             finish_synced: false,
+            finish_coord_session_id: None,
             spawn_device_default: None,
             adopted_from: None,
             last_session_start_at: None,
