@@ -23784,19 +23784,18 @@ pub(crate) mod doctor {
         // whether the operator was asked. Scoped to the account exactly as the
         // UI's `get_binding_gap_asks` is, so it never crosses an account switch.
         let binding_gap_lapses = {
-            let tenant_slots = am.try_list_tenant_device_jwt_tenants().ok();
+            let tenant_slots = am
+                .try_list_tenant_device_jwt_tenants()
+                .map_err(|e| format!("{e:#}"));
             let legacy_present = am
                 .get_access_token()
                 .map(|t| !t.trim().is_empty())
                 .unwrap_or(false);
-            let account = crate::mcp::device_jwt_refresher::binding_gap_ask_account(
-                legacy_present,
-                tenant_slots.as_deref(),
-                qontinui_runner_lib::pair::read_paired_user_id_from_disk(),
-            );
-            crate::mcp::device_jwt_refresher::binding_gap_lapses_report(
+            crate::mcp::device_jwt_refresher::binding_gap_lapses_for_doctor(
                 crate::mcp::device_jwt_refresher::binding_gap_ask_path().as_deref(),
-                account.as_deref(),
+                legacy_present,
+                tenant_slots.as_deref().map_err(String::clone),
+                qontinui_runner_lib::pair::read_paired_user_id_from_disk(),
             )
         };
 
