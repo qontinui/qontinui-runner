@@ -402,6 +402,37 @@ pub struct SkillExportManifest {
 pub struct SkillExport {
     pub manifest: SkillExportManifest,
     pub skills: Vec<SkillDefinition>,
+    /// Stored skills the export left out because their stored template does
+    /// not parse: exporting the served fallback would hand an empty skill on
+    /// as if it were the stored one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub withheld: Vec<WithheldSkill>,
+}
+
+/// A stored skill an outbound door (export, sync push) left out, with why.
+///
+/// Serializes as `{"skill_id": "...", "code": "STORED_SKILL_TEMPLATE_UNPARSEABLE",
+/// "error": "<the parse error>"}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WithheldSkill {
+    pub skill_id: String,
+    pub code: String,
+    pub error: String,
+}
+
+/// The code on a [`WithheldSkill`], and on the refusal of a rewrite, of a
+/// stored skill whose template does not parse.
+pub const STORED_SKILL_TEMPLATE_UNPARSEABLE: &str = "STORED_SKILL_TEMPLATE_UNPARSEABLE";
+
+impl WithheldSkill {
+    /// A stored skill withheld because its stored template does not parse.
+    pub fn unparseable(skill_id: &str, error: impl ToString) -> Self {
+        Self {
+            skill_id: skill_id.to_string(),
+            code: STORED_SKILL_TEMPLATE_UNPARSEABLE.to_string(),
+            error: error.to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -412,6 +443,9 @@ pub struct SkillImportResult {
     pub errors: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+    /// Skills refused before import, each with its typed reason (a template of
+    /// the retired `playbook` kind). The rest of the request still imports.
+    pub refused: Vec<SkillIntakeRefusal>,
 }
 
 /// Compute a SHA-256 checksum of a skill's content for integrity verification.
@@ -824,6 +858,25 @@ pub fn instantiate_skill(
             ));
         }
     };
+
+    // A step with no `type` is nothing a workflow can run. It is also the
+    // shape a stored template that does not parse is served as (an empty
+    // `single_step`), so instantiating it would hand back a typeless step as if
+    // it were the skill.
+    if let Some(i) = template_steps
+        .iter()
+        .position(|step| !step.get("type").is_some_and(Value::is_string))
+    {
+        return Err(format!(
+            "Skill \"{}\" ({}) has a template step with no `type` (step {} of {}), so there is \
+             nothing to instantiate. A stored template that does not parse is served as an \
+             empty single_step; delete the skill and create it again.",
+            skill.name,
+            skill.id,
+            i + 1,
+            template_steps.len()
+        ));
+    }
 
     let total = template_steps.len();
     let mut result = Vec::with_capacity(total);
@@ -1739,6 +1792,58 @@ mod tests {
         let message = refusal.to_string();
         assert!(message.contains("`sf-login`"), "{message}");
         assert!(message.contains(".qontinui/contexts/"), "{message}");
+    }
+
+    /// A template step with no `type` (the empty `single_step` a stored
+    /// template that does not parse is served as, or an untyped step of a
+    /// multi_step) is refused, naming the skill; a typed step still
+    /// instantiates through the same call.
+    #[test]
+    fn instantiate_refuses_a_template_step_with_no_type() {
+        let skill_with = |template: SkillTemplate| SkillDefinition {
+            id: "user:sf-login".into(),
+            name: "Salesforce login".into(),
+            slug: "sf-login".into(),
+            description: String::new(),
+            category: "custom".into(),
+            tags: vec![],
+            icon: "puzzle".into(),
+            color: "gray".into(),
+            allowed_phases: vec!["setup".into()],
+            parameters: vec![],
+            template,
+            source: SkillSource::User,
+            version: None,
+            author: None,
+            checksum: None,
+            depends_on: None,
+            usage_count: None,
+            approval_status: None,
+            forked_from: None,
+        };
+        let typed = || HashMap::from([("type".to_string(), Value::String("command".into()))]);
+        let untyped_templates = [
+            SkillTemplate::SingleStep {
+                step: HashMap::new(),
+            },
+            SkillTemplate::MultiStep {
+                steps: vec![typed(), HashMap::from([("type".to_string(), Value::Null)])],
+            },
+        ];
+        for template in untyped_templates {
+            let err = instantiate_skill(&skill_with(template), "setup", &HashMap::new())
+                .expect_err("an untyped step is refused");
+            assert!(err.contains("user:sf-login"), "{err}");
+            assert!(err.contains("no `type`"), "{err}");
+        }
+        let steps = instantiate_skill(
+            &skill_with(SkillTemplate::SingleStep { step: typed() }),
+            "setup",
+            &HashMap::new(),
+        )
+        .expect("a typed step instantiates");
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0]["type"], "command");
     }
 
     /// With the variant deleted a `playbook` template no longer deserializes,
