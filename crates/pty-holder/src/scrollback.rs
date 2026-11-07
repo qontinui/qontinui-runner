@@ -122,12 +122,17 @@
 //!
 //! ## Layout (integers big-endian)
 //!
-//! Header, 24 bytes: magic `QPTYSCRL` (8), format [`SCROLLBACK_FORMAT`] (4),
-//! child pid (4), FNV-1a 64 of those 16 bytes (8).
+//! Header, 32 bytes: magic `QPTYSCRL` (8), format [`SCROLLBACK_FORMAT`] (4),
+//! child pid (4), file nonce (8), FNV-1a 64 of those 24 bytes (8).
 //!
 //! Record, 20 + `n` bytes: absolute start offset (8), length `n` ≤
-//! [`SCROLLBACK_CAP_BYTES`] (4), the bytes (`n`), FNV-1a 64 of the offset,
-//! length and bytes (8).
+//! [`SCROLLBACK_CAP_BYTES`] (4), the bytes (`n`), FNV-1a 64 of the file
+//! nonce, offset, length and bytes (8).
+//!
+//! The nonce is fresh per file (every rewrite draws a new one). Because each
+//! record's checksum covers it, a record that survives from an earlier file —
+//! a stale tail left by a predecessor's file after a power loss, or spliced
+//! in by a bug — fails its checksum here instead of reading as contiguous.
 //!
 //! DATA-PATH module: `source_guard` bans text decoding here.
 
@@ -160,10 +165,10 @@ pub const REWRITE_MIN_INTERVAL: Duration = Duration::from_secs(30);
 pub const FSYNC_INTERVAL: Duration = Duration::from_secs(30);
 
 /// The on-disk format version this build writes and reads.
-pub const SCROLLBACK_FORMAT: u32 = 2;
+pub const SCROLLBACK_FORMAT: u32 = 3;
 
 const MAGIC: &[u8; 8] = b"QPTYSCRL";
-const HEADER_LEN: usize = 8 + 4 + 4 + 8;
+const HEADER_LEN: usize = 8 + 4 + 4 + 8 + 8;
 const RECORD_OVERHEAD: usize = 8 + 4 + 8;
 
 /// Largest file the writer lets grow and [`read_scrollback`] will read: the
@@ -212,25 +217,46 @@ fn fnv1a64(parts: &[&[u8]]) -> u64 {
     h
 }
 
-fn encode_header(child_pid: u32) -> Vec<u8> {
+/// A per-file nonce. It only has to differ between files of one pane, so it
+/// mixes clock, pid, a process-wide counter and an ASLR-dependent address
+/// through FNV rather than adding a randomness dependency to every holder.
+fn fresh_nonce() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let addr = &COUNTER as *const AtomicU64 as usize as u64;
+    fnv1a64(&[
+        &nanos.to_be_bytes(),
+        &u64::from(std::process::id()).to_be_bytes(),
+        &n.to_be_bytes(),
+        &addr.to_be_bytes(),
+    ])
+}
+
+fn encode_header(child_pid: u32, nonce: u64) -> Vec<u8> {
     let mut out = Vec::with_capacity(HEADER_LEN);
     out.extend_from_slice(MAGIC);
     out.extend_from_slice(&SCROLLBACK_FORMAT.to_be_bytes());
     out.extend_from_slice(&child_pid.to_be_bytes());
+    out.extend_from_slice(&nonce.to_be_bytes());
     let sum = fnv1a64(&[&out]);
     out.extend_from_slice(&sum.to_be_bytes());
     out
 }
 
 /// Append one record for `bytes` starting at absolute offset `start`.
-fn encode_record(out: &mut Vec<u8>, start: u64, bytes: &[u8]) {
+fn encode_record(out: &mut Vec<u8>, nonce: u64, start: u64, bytes: &[u8]) {
     let start_be = start.to_be_bytes();
     // Every caller passes at most the cap, which fits a u32.
     let len_be = (bytes.len() as u32).to_be_bytes();
     out.extend_from_slice(&start_be);
     out.extend_from_slice(&len_be);
     out.extend_from_slice(bytes);
-    out.extend_from_slice(&fnv1a64(&[&start_be, &len_be, bytes]).to_be_bytes());
+    out.extend_from_slice(&fnv1a64(&[&nonce.to_be_bytes(), &start_be, &len_be, bytes]).to_be_bytes());
 }
 
 fn be_u32(b: &[u8]) -> u32 {
@@ -256,10 +282,11 @@ fn decode(buf: &[u8]) -> Result<Scrollback, ScrollbackError> {
     if be_u32(&header[8..]) != SCROLLBACK_FORMAT {
         return corrupt("unknown format version");
     }
-    if be_u64(&header[16..]) != fnv1a64(&[&header[..16]]) {
+    if be_u64(&header[24..]) != fnv1a64(&[&header[..24]]) {
         return corrupt("header checksum mismatch");
     }
     let child_pid = be_u32(&header[12..]);
+    let nonce_be = &header[16..24];
 
     // The longest valid prefix: stop at the first record that is incomplete,
     // over the cap, or fails its checksum — whatever its position, since an
@@ -279,7 +306,7 @@ fn decode(buf: &[u8]) -> Result<Scrollback, ScrollbackError> {
         let total = RECORD_OVERHEAD + len;
         let bytes = &rest[12..12 + len];
         let sum = be_u64(&rest[12 + len..]);
-        if sum != fnv1a64(&[&rest[..8], &rest[8..12], bytes]) {
+        if sum != fnv1a64(&[nonce_be, &rest[..8], &rest[8..12], bytes]) {
             break;
         }
         // A record that passes its checksum is one the writer wrote whole;
@@ -406,6 +433,8 @@ pub struct ScrollbackWriter {
     path: PathBuf,
     tmp: PathBuf,
     child_pid: u32,
+    /// Nonce of the current file (see the module docs); drawn per rewrite.
+    nonce: u64,
     /// The current file, open for appending; `None` before the first write
     /// and after any failed one — either way the next write is a rewrite.
     file: Option<File>,
@@ -441,6 +470,7 @@ impl ScrollbackWriter {
             path: scrollback_path(pane_dir, pane),
             tmp: scrollback_tmp_path(pane_dir, pane),
             child_pid,
+            nonce: 0,
             file: None,
             file_len: 0,
             persisted_end: 0,
@@ -544,7 +574,7 @@ impl ScrollbackWriter {
             return Err(io::Error::other("no current file to append to"));
         };
         let mut rec = Vec::with_capacity(RECORD_OVERHEAD + bytes.len());
-        encode_record(&mut rec, start, bytes);
+        encode_record(&mut rec, self.nonce, start, bytes);
         f.write_all(&rec)?;
         self.file_len += rec.len() as u64;
         self.persisted_end = start + bytes.len() as u64;
@@ -553,8 +583,9 @@ impl ScrollbackWriter {
     }
 
     fn rewrite(&mut self, start: u64, bytes: &[u8]) -> io::Result<()> {
-        let mut out = encode_header(self.child_pid);
-        encode_record(&mut out, start, bytes);
+        let nonce = fresh_nonce();
+        let mut out = encode_header(self.child_pid, nonce);
+        encode_record(&mut out, nonce, start, bytes);
         // A `.tmp` left by a holder killed mid-rewrite is garbage: drop it,
         // then create exclusively so the open can never follow a planted link.
         match std::fs::remove_file(&self.tmp) {
@@ -595,6 +626,7 @@ impl ScrollbackWriter {
         let mut opts = OpenOptions::new();
         opts.append(true);
         self.file = Some(crate::lock::open_checked(&mut opts, &self.path)?);
+        self.nonce = nonce;
         self.file_len = out.len() as u64;
         self.persisted_end = start + bytes.len() as u64;
         self.unsynced = false;
@@ -1200,18 +1232,18 @@ mod tests {
             "absent is None"
         );
 
-        let mut good = encode_header(7);
-        encode_record(&mut good, 100, b"hello");
-        encode_record(&mut good, 105, b" world");
+        let mut good = encode_header(7, NONCE);
+        encode_record(&mut good, NONCE, 100, b"hello");
+        encode_record(&mut good, NONCE, 105, b" world");
         std::fs::write(&target, &good).unwrap();
         let sb = read(&dir);
         assert_eq!((sb.child_pid, sb.start_offset), (7, 100));
         assert_eq!(sb.bytes, b"hello world");
 
         let gap = {
-            let mut b = encode_header(7);
-            encode_record(&mut b, 100, b"hello");
-            encode_record(&mut b, 200, b"gap");
+            let mut b = encode_header(7, NONCE);
+            encode_record(&mut b, NONCE, 100, b"hello");
+            encode_record(&mut b, NONCE, 200, b"gap");
             b
         };
         let over_cap = {
@@ -1223,7 +1255,7 @@ mod tests {
         };
         let corrupt_cases: Vec<(&str, Vec<u8>)> = vec![
             ("empty", Vec::new()),
-            ("header only", encode_header(7)),
+            ("header only", encode_header(7, NONCE)),
             ("bad magic", {
                 let mut b = good.clone();
                 b[0] = b'X';
