@@ -16,7 +16,7 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `fleet_host_name` | 0 | 0 | 0 | 0 | 0 | 0 |
 | `fleet_device_uuid` | 0 | 0 | 0 | 0 | 0 | 0 |
 | `plans_dir` | 34 | 35 | 34 | 0 | 0 | 0 |
-| `os_bound_tooling` | 100 | 101 | 96 | 4 | 0 | 0 |
+| `os_bound_tooling` | 104 | 105 | 96 | 8 | 0 | 0 |
 
 ## `repo_layout` (79 rows)
 
@@ -258,7 +258,7 @@ _No hits._
 | `src/plans_dir_migration.rs` | `persist_env_plans_dir` | `let existing = get_setting::<PathSettings>().plans_dir;` | 1 | unreviewed |
 | `src/plans_dir_migration.rs` | `persist_env_plans_dir` | `update_setting::<PathSettings, _>(\|paths\| paths.plans_dir = Some(value.clone()))?;` | 1 | unreviewed |
 
-## `os_bound_tooling` (100 rows)
+## `os_bound_tooling` (104 rows)
 
 | file | symbol | excerpt | n | disposition |
 |---|---|---|---:|---|
@@ -305,10 +305,14 @@ _No hits._
 | `src/fleet/resource_sample.rs` | `wsl_distro` | `cfg(windows)-only fn 'wsl_distro' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/fleet/resource_sample.rs` | `wsl_distro_base_path` | `cfg(windows)-only fn 'wsl_distro_base_path' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/fleet/resource_sample.rs` | `wsl_probe` | `cfg(windows)-only fn 'wsl_probe' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
+| `src/fleet/top_consumers.rs` | `read_process` | `cfg(windows)-only fn 'read_process' has no cfg(not(windows)) sibling in this file` | 1 | fallback_correct — Windows per-process reader for the top_consumers sample. Its Linux sibling is read_proc_dir under cfg(target_os = "linux"), and on every other OS collect_top returns None, so the field is omitted (UNKNOWN), never fabricated. |
+| `src/fleet/top_consumers.rs` | `windows_creation_time` | `cfg(windows)-only fn 'windows_creation_time' has no cfg(not(windows)) sibling in this file` | 1 | fallback_correct — Leaf of the Windows read_process (GetProcessTimes). Off Windows, started_at comes from /proc stat starttime + btime on Linux, and other OSes omit the field. |
+| `src/fleet/top_consumers.rs` | `windows_image_name` | `cfg(windows)-only fn 'windows_image_name' has no cfg(not(windows)) sibling in this file` | 1 | fallback_correct — Leaf of the Windows read_process (QueryFullProcessImageNameW on the opened handle). Its only caller is cfg(windows); off Windows the Linux /proc reader names processes from comm, and other OSes omit the field. |
 | `src/fs_atomic.rs` | `is_transient_rename_denial` | `cfg(windows)-only fn 'is_transient_rename_denial' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/fs_perms.rs` | `process_owner_sid_blob` | `cfg(windows)-only fn 'process_owner_sid_blob' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/fs_perms.rs` | `set_owner_only_dacl` | `cfg(windows)-only fn 'set_owner_only_dacl' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/health_monitor.rs` | `probe_ui_thread_blocking` | `cfg(windows)-only fn 'probe_ui_thread_blocking' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
+| `src/health_monitor.rs` | `process_memory_counters` | `cfg(windows)-only fn 'process_memory_counters' has no cfg(not(windows)) sibling in this file` | 1 | fallback_correct — Windows PROCESS_MEMORY_COUNTERS_EX reader shared by the working-set probe and top_consumers. Its callers are themselves cfg(windows), and each has a non-Windows arm (the /proc reader, or an UNKNOWN reading), so no non-Windows box calls it. |
 | `src/install_effects_producer/intercept/shim_materializer.rs` | `copy_exe_stub` | `cfg(windows)-only fn 'copy_exe_stub' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/install_effects_producer/intercept/shim_materializer.rs` | `exe_shadow_needed` | `cfg(windows)-only fn 'exe_shadow_needed' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/install_effects_producer/intercept/shim_materializer.rs` | `locate_stub_exe` | `cfg(windows)-only fn 'locate_stub_exe' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
