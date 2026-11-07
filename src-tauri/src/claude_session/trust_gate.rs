@@ -1179,6 +1179,48 @@ pub fn is_spawn_blocked_refusal(message: &str) -> bool {
     message.starts_with(SPAWN_BLOCKED_REFUSAL_PREFIX)
 }
 
+/// The entry [`annotate_unread_dial`] appends to a block's `failed` list when
+/// the decision rests on a tenant dial that could NOT be read. It is NOT a
+/// conjunct: it is always the LAST entry, after the failing conjuncts.
+pub const DIAL_UNREAD_REFUSAL_MARKER: &str = "dial=unresolved-read";
+
+/// Mark a [`TrustGateDecision::SpawnBlocked`] that rests on an UNREAD dial, so
+/// the refusal TEXT says so. A caller that holds only the rendered string can
+/// then tell a failed coord read, which is worth retrying at once, from a
+/// standing verdict, without peeking the dial again after the fact. A second
+/// peek can see a different dial than the one that decided: the cache may
+/// refresh or expire in between. Every other decision, and a block reached on
+/// a dial that WAS read, is returned unchanged.
+pub fn annotate_unread_dial(
+    decision: TrustGateDecision,
+    dial: &DialResolution,
+) -> TrustGateDecision {
+    match (decision, dial) {
+        (
+            TrustGateDecision::SpawnBlocked { rule, mut failed },
+            DialResolution::Unresolved { error },
+        ) => {
+            failed.push(format!(
+                "{DIAL_UNREAD_REFUSAL_MARKER} (the tenant's autonomy dial could not be read: {error})"
+            ));
+            TrustGateDecision::SpawnBlocked { rule, failed }
+        }
+        (other, _) => other,
+    }
+}
+
+/// Whether a [`TrustGateDecision::refusal`] string rests on an unread dial
+/// (see [`annotate_unread_dial`]).
+pub fn refusal_rests_on_unread_dial(message: &str) -> bool {
+    // `refusal` joins `failed` with "; " after an em dash, so the marker always
+    // opens an entry: match it at that boundary, not anywhere in the text (a
+    // conjunct detail may quote a path). Not by splitting, either: the dial
+    // error embedded in the marker's own entry may itself contain "; ".
+    is_spawn_blocked_refusal(message)
+        && (message.contains(&format!("— {DIAL_UNREAD_REFUSAL_MARKER} ("))
+            || message.contains(&format!("; {DIAL_UNREAD_REFUSAL_MARKER} (")))
+}
+
 /// The pure decision core: no HTTP, no clock, no globals.
 ///
 /// The whole matrix, so the failure directions are readable in one place:
@@ -1822,7 +1864,10 @@ fn finish(
         child_reads.as_deref(),
         read_parent,
     );
-    let decision = promote_for_surface(decide(trust, &conjuncts, posture), surface);
+    let decision = annotate_unread_dial(
+        promote_for_surface(decide(trust, &conjuncts, posture), surface),
+        &dial,
+    );
 
     let mut write_outcome = None;
     if decision.writes_trust() {
@@ -1963,8 +2008,65 @@ fn finish(
     }
 }
 
+/// Real-git fixtures shared by the trust tests here and in
+/// [`super::spawn_preconditions`], so the worktree layout both modules assert
+/// on is built one way.
+#[cfg(test)]
+pub(crate) mod test_fixtures {
+    use std::path::{Path, PathBuf};
+
+    /// Run `git` in `dir`, scrubbed of the repo-selecting variables a git hook
+    /// exports — without that, a `cargo test` run from a hook would init and
+    /// add worktrees in the OUTER repository — and of the machine's global and
+    /// system config, so a `commit.gpgsign` or `core.hooksPath` there cannot
+    /// fail the fixture or run hooks inside it. The global path is a file that
+    /// does not exist, which git reads as empty on every platform.
+    pub(crate) fn git(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_COMMON_DIR")
+            .env("GIT_CONFIG_GLOBAL", dir.join("no-global-gitconfig"))
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    }
+
+    /// A real primary + `git worktree add` fixture: `(tempdir, primary, worktree)`.
+    pub(crate) fn linked_worktree_fixture(extra: &[&str]) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let primary = tmp.path().join("repo");
+        std::fs::create_dir(&primary).unwrap();
+        git(&primary, &["init", "-q"]);
+        git(
+            &primary,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "i",
+            ],
+        );
+        let wt = tmp.path().join("wt");
+        let mut args: Vec<&str> = extra.to_vec();
+        args.extend(["worktree", "add", "-q", wt.to_str().unwrap()]);
+        git(&primary, &args);
+        (tmp, primary, wt)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::test_fixtures::linked_worktree_fixture;
     use super::*;
 
     // ------------------------------------------------- allocation index lookup
@@ -2573,42 +2675,6 @@ THE AUTONOMY DIAL. One of:
         ));
     }
 
-    fn git(dir: &Path, args: &[&str]) {
-        let out = std::process::Command::new("git")
-            .args(args)
-            .current_dir(dir)
-            .output()
-            .expect("git runs");
-        assert!(out.status.success(), "git {args:?}: {out:?}");
-    }
-
-    /// A real primary + `git worktree add` fixture: `(tempdir, primary, worktree)`.
-    fn linked_worktree_fixture(extra: &[&str]) -> (tempfile::TempDir, PathBuf, PathBuf) {
-        let tmp = tempfile::tempdir().unwrap();
-        let primary = tmp.path().join("repo");
-        std::fs::create_dir(&primary).unwrap();
-        git(&primary, &["init", "-q"]);
-        git(
-            &primary,
-            &[
-                "-c",
-                "user.name=t",
-                "-c",
-                "user.email=t@t",
-                "commit",
-                "-q",
-                "--allow-empty",
-                "-m",
-                "i",
-            ],
-        );
-        let wt = tmp.path().join("wt");
-        let mut args: Vec<&str> = extra.to_vec();
-        args.extend(["worktree", "add", "-q", wt.to_str().unwrap()]);
-        git(&primary, &args);
-        (tmp, primary, wt)
-    }
-
     #[test]
     fn verified_primary_checkout_accepts_a_real_linked_worktree() {
         let (_tmp, primary, wt) = linked_worktree_fixture(&[]);
@@ -2746,6 +2812,25 @@ THE AUTONOMY DIAL. One of:
         assert!(workspace_trust::is_runner_minted(&cfg, &wk));
     }
 
+    /// The spawn instrument's explicit-trust reading keys the very entry this
+    /// gate mints: untrusted before `finish`, trusted after, same key. If the
+    /// two ever derived the primary differently, the reading would stay
+    /// `untrusted` here.
+    #[test]
+    fn the_explicit_trust_reading_keys_the_entry_finish_mints() {
+        use crate::claude_session::spawn_preconditions::explicit_trust_for;
+        let (_tmp, _primary, wt, cfg, acct) = finish_fixture(serde_json::json!({}));
+        let before = explicit_trust_for(&wt, Some(cfg.as_path())).unwrap();
+        assert!(matches!(before.verdict, TrustVerdict::Untrusted { .. }));
+
+        let r = run_finish(&wt, &acct, AutonomyTier::Proceed);
+        assert_eq!(r.primary_checkout_write_outcome.as_deref(), Some("Trusted"));
+
+        let after = explicit_trust_for(&wt, Some(cfg.as_path())).unwrap();
+        assert_eq!(after.primary_key, before.primary_key);
+        assert_eq!(after.verdict, TrustVerdict::Trusted);
+    }
+
     /// The laundering sequence: a stamped primary does not satisfy conjunct 2
     /// under a stricter dial, so nothing is written.
     #[test]
@@ -2762,6 +2847,41 @@ THE AUTONOMY DIAL. One of:
             r.decision
         );
         assert_eq!(std::fs::read(&cfg).unwrap(), before);
+    }
+
+    /// `finish` itself marks a PTY block that rests on an UNREAD dial, and
+    /// leaves one on a dial that was read unmarked, so a caller holding only
+    /// the refusal text can tell a failed read from a standing verdict.
+    #[test]
+    fn finish_marks_a_pty_block_on_an_unread_dial_and_only_that() {
+        let (_tmp, _primary, wt, _cfg, acct) = finish_fixture(serde_json::json!({}));
+        let cwd = wt.to_string_lossy().into_owned();
+        let run = |dial: DialResolution| {
+            let trust =
+                crate::claude_session::spawn_preconditions::trust_precondition(&cwd, Some(&acct));
+            finish(
+                &cwd,
+                &trust.verdict,
+                Some(&acct),
+                Some(&acct),
+                CoordRowLookup::Matched {
+                    session_id: "test".to_string(),
+                },
+                dial,
+                SpawnSurface::InteractivePty,
+            )
+            .decision
+            .refusal()
+            .expect("an underived mint on a PTY under a withholding dial is a block")
+        };
+        let unread = run(DialResolution::Unresolved {
+            error: "coord unreachable".to_string(),
+        });
+        assert!(refusal_rests_on_unread_dial(&unread), "{unread}");
+        let read = run(DialResolution::Fresh {
+            tier: AutonomyTier::DraftRequired,
+        });
+        assert!(!refusal_rests_on_unread_dial(&read), "{read}");
     }
 
     /// A human-trusted primary IS a derivation source: the worktree grant is
@@ -2948,6 +3068,42 @@ THE AUTONOMY DIAL. One of:
         assert!(!c.all_satisfied());
         assert_eq!(c.failing().len(), 1);
         assert!(!decide(&untrusted(), &c, EnforcementPosture::Block).allows_spawn());
+    }
+
+    #[test]
+    fn only_a_block_on_an_unread_dial_is_marked_unread() {
+        let block = || {
+            decide(
+                &untrusted(),
+                &conj(true, false, true),
+                EnforcementPosture::Block,
+            )
+        };
+        let unread = DialResolution::Unresolved {
+            error: "transport: reset; retry — later".to_string(),
+        };
+        let r = annotate_unread_dial(block(), &unread)
+            .refusal()
+            .expect("still a block");
+        assert!(refusal_rests_on_unread_dial(&r), "{r}");
+        assert!(r.contains("transport: reset; retry — later"), "{r}");
+        // A block on a dial that WAS read stays unmarked.
+        for dial in [
+            DialResolution::Absent,
+            DialResolution::Fresh {
+                tier: AutonomyTier::AskFirst,
+            },
+        ] {
+            let r = annotate_unread_dial(block(), &dial).refusal().unwrap();
+            assert!(!refusal_rests_on_unread_dial(&r), "{dial:?}: {r}");
+        }
+        // A non-block decision is never changed, and carries no refusal.
+        let grant = TrustGateDecision::Grant {
+            rule: "dial-permits-underived-mint",
+        };
+        assert_eq!(annotate_unread_dial(grant.clone(), &unread), grant);
+        // A string that is not a trust-gate refusal is never read as one.
+        assert!(!refusal_rests_on_unread_dial(DIAL_UNREAD_REFUSAL_MARKER));
     }
 
     #[test]

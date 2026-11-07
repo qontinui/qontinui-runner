@@ -42,6 +42,7 @@
 
 pub(crate) mod admission;
 pub(crate) mod canonical;
+pub(crate) mod cgroup;
 pub(crate) mod checkout;
 pub(crate) mod executor;
 pub(crate) mod host_sizing;
@@ -51,6 +52,7 @@ pub(crate) mod reporting;
 pub(crate) mod services;
 pub(crate) mod settings_directive;
 pub(crate) mod sibling;
+mod sibling_git_env;
 pub(crate) mod subscription;
 pub(crate) mod tools;
 

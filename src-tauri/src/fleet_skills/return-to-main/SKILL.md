@@ -853,7 +853,7 @@ the upstream tip (listed under `untracked` as "on upstream").
 |---|---|
 | `0`, and the summary reads `untracked: … 0 not on upstream` | Every dirty path is already on main (or in-footprint residue). ACT repo for a fast-forward (1b: its `checkout-ff` verdict QUIET): the 1c re-check (`LABEL=residue-<repo>`), then re-run the sweep with `--restore-residue` (below), which removes exactly those files and lets the repo fast-forward. SHADOW: report "WOULD pass --restore-residue <repo>" with the class tally. |
 | `0`, with any `untracked-not-on-upstream:` line | The tracked dirt is restorable but an untracked file is content upstream lacks, which the sweep never removes. Leave the repo and list those untracked paths. |
-| `1` | Some file is decided NOT restorable: `UNIQUE` content (a mode-only change included), or a `RUNNER_BUNDLE` / `EOL_ONLY` file outside the provisioner footprint. Leave the repo exactly as found and report every `not-restorable:` line verbatim — that list is exactly what a human or agent has to decide. |
+| `1` | Some file is decided NOT restorable: `UNIQUE` content (a mode-only change included), or a `RUNNER_BUNDLE` / `EOL_ONLY` file outside the provisioner footprint. Leave the repo exactly as found and report every `not-restorable:` line verbatim — that list is exactly what a human or agent has to decide. A `verdict: EOL_REWRITE_ONLY` says every UNIQUE such file is a line-ending rewrite of the tip's own blob (one `eol-rewrite-only:` line each, naming the `git restore` that clears it): nothing in it exists only on disk, but it is still not restored here. |
 | `3` | UNKNOWN. Leave it. |
 | `4` | Usage — a defect in this skill's call. Leave it and report the message. |
 
@@ -978,8 +978,8 @@ forever.
 **`--adjudicated-landed` is NEVER the argument for superseded content.** Until
 `--adjudicated-superseded` existed it was the only argument that could move such
 a branch, so a session that correctly concluded "superseded" had to assert
-"landed" to act at all. On 2026-09-16 that is exactly what happened on
-`qontinui-dev-notes`: the durable decision row reads `verdict_source:
+"landed" to act at all. On 2026-09-16 that is exactly what happened on a
+plans repository: the durable decision row reads `verdict_source:
 adjudicated` for 8 commits that demonstrably never landed, while the evidence
 file beside it says `SUPERSEDED_BY_UPSTREAM`. A ledger that cannot distinguish
 the two will eventually be used to prove something false.
@@ -1225,6 +1225,86 @@ Never title it `DOSSIER stale-shared-checkouts-read-as-defects …`, never post 
 as `kind="dossier"`, and never pass `supersedes` against the head — each of
 those impersonates the head, and merging a contribution into it is a dossier
 steward's job, not this job's.
+
+**A nightly DOSSIER-CONTRIB to `return-to-main-sweep-never-acts`, every night,
+new shape or not.** The block above records NEW shapes, so a standing problem
+that recurs unchanged is never recorded: each night's finding says "no new
+dossier shape" and expires in 14 days. The recurrence is the signal here — the
+sweep ran N nights and acted on nothing — so this contribution is unconditional,
+including on a late-fire or capped skip, a `DEADLINE` or `DIED` run, and a SHADOW
+night. It is posted AFTER the Step 5 report has been posted (or has failed with
+`COORD FINDING NOT RECORDED`), never before it and never in its place: the
+report is what hard rule 11 requires, and this is the second post. Read the head
+first, exactly as above:
+
+```text
+coord_recent_findings(kind="dossier", topic="dossier:return-to-main-sweep-never-acts")  # envelope-ok: an agent-issued MCP call whose answer the session reads by the keys named in the next paragraph (available before count), not a script parsing a response
+```
+
+`available: false` makes the head UNKNOWN; `count: 0` with `available: true`
+means no head is open yet. Either way post the contribution, and say which in
+its body.
+
+One contribution per sweep run. Every figure comes from this run's own files
+(`$RUN_DIR/quiesce*.json`, every `pass-*.jsonl`), none inferred, and every count
+is of DISTINCT repos, because one repo can have rows in several pass logs:
+
+- **acted** — repos whose final decision row (the latest by `ts`; on equal `ts` the later pass log in the order the run wrote them, then the later line) has `action`
+  `RETURNED` or `FAST_FORWARDED`, whatever its `verdict_source` (`classifier`,
+  `adjudicated` and `adjudicated_superseded` each count the repo once). A SHADOW
+  run measured clean is 0. Repos whose final row is `FAILED` are reported
+  separately in the body as `failed: <n>`.
+- **would-act** — repos with a `WOULD_RETURN` or `WOULD_FAST_FORWARD` row in any
+  `--dry-run` pass, plus each repo named in a "WOULD pass --adjudicated-…" or
+  "WOULD pass --restore-residue" line Step 3 reported. A repo counts once even
+  when several of these apply. `acted` and `would-act` are not additive: a repo
+  that WOULD act in pass A and moved in pass B is in both.
+- **quiet-eligible** — the number of repo names in the `per_repo_summary.act_eligible`
+  list (a flat list of repos whose quiet verdict was QUIET) of each Step 1b quiet
+  file, one number per move class (`checkout-ff`, `checkout-return`), counting
+  only repos that appear in pass A's decision rows (intersect the list with those
+  repo names; `examined` is a count of checkouts and can differ). It is independent of `--act`: it says how many
+  repos the quiet check would have let act, not how many did. The denominator is
+  pass A's `run_end.examined`; report `capped_out` when it is non-zero. Report
+  separately how many of those repos Step 1c or 1d then downgraded to SHADOW
+  (read from the `quiesce-<label>.json` re-checks and the 1d claim answers).
+  For each repo that was not quiet-eligible quote the class that held it: its
+  `per_repo[R].blocking[]` entries verbatim (the list is capped at 20, so say so
+  when `blocking_truncated` is set), or `unknown_because` for an UNKNOWN repo;
+  and quote the machine-level `blocking[]` / `overridable[]` classes once.
+
+If any figure cannot be read — a pass log that failed the Step 2 consistency
+check, a quiet verdict that was UNKNOWN, an empty `RUN_DIR`, or a run that ended
+`DEADLINE` or `DIED` — write `UNKNOWN` (or `skipped: <reason>` for a late-fire or
+capped skip) in that figure's slot, in place of the number. This outranks "a
+SHADOW run is 0": a zero you did not measure is the false signal this dossier
+exists to catch. Elapsed seconds go in the body only when you timed the run
+yourself; never infer them.
+
+```text
+coord_post_finding(  # envelope-ok: an agent-issued MCP call; success is read as posted:true with the id at finding.finding_id, as Step 5 says, not parsed by a script
+  title="DOSSIER-CONTRIB return-to-main-sweep-never-acts — <host> <YYYY-MM-DD>: <n|UNKNOWN|skipped: reason> acted, <n|UNKNOWN|skipped: reason> would-act, ff <n|UNKNOWN|skipped: reason>/return <n|UNKNOWN|skipped: reason> of <N|UNKNOWN|skipped: reason> repos quiet-eligible",
+  body="<head status (available:false / count:0 / head id); RUN_DIR timestamp; requested vs effective mode; failed count; capped_out; the blocking classes above; abstentions by verdict; any dirty-provenance timeout; the finding_id of tonight's Step 5 report, or 'Step 5 report NOT RECORDED'>",
+  kind="investigation",
+  topic="dossier:return-to-main-sweep-never-acts",
+  resource_keys=["2026-09-13-nightly-return-to-main-sweep", "<repo>", ...]
+)
+```
+
+Same rules as above: never title it `DOSSIER return-to-main-sweep-never-acts …`,
+never post it as `kind="dossier"`, never pass `supersedes`. A second run on the
+same device and date posts its own contribution; the RUN_DIR timestamp in the
+body is what tells them apart. If `coord_post_finding` is not a visible tool or
+a call answers `"Command failed with no output"`, follow Step 5's recovery
+(`/coord-revive`, re-issue over the live door), but verify by reading the
+CONTRIBUTION's own topic — `coord_recent_findings(topic="dossier:return-to-main-sweep-never-acts")`,
+matching this run's `RUN_DIR` timestamp in the body — never `checkout-staleness`,
+which would find the Step 5 report and read it as this post. If it still did not
+land, put `DOSSIER CONTRIBUTION NOT RECORDED: <the failure you saw>` in the same
+place Step 5 puts its own outcome (the final output when that arm was taken).
+This post is the second one of the run and is budgeted as such: if the wait
+budget is already spent at the Step 5 post, still make this one attempt, and
+skip only the `/coord-revive` recovery.
 
 ## Hard rules
 

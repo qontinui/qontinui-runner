@@ -110,8 +110,10 @@ pub(crate) struct HeartbeatUiThread {
     /// stopped), which is NOT the same claim as `false` ("a round trip came
     /// back"). See `ui_error::NativeUiLiveness::wedged`.
     wedged: Option<bool>,
-    /// `"pumping" | "unknown" | "native_probe_wedged" |
-    /// "window_getter_unresponsive" | "events_undelivered"`.
+    /// `"pumping" | "unknown" | "ping_not_emitted" | "native_probe_wedged" |
+    /// "window_getter_unresponsive" | "events_undelivered"`. `ping_not_emitted`
+    /// (additive, 2026-10-24) is a non-wedged UNKNOWN: the event pong is stale
+    /// but pings were not sent and left unanswered for the whole window.
     reason: &'static str,
     /// The Win32 `SendMessageTimeoutW` rung. `null` = could not ask
     /// (non-Windows, or no main-window handle cached yet) — UNKNOWN, not fine.
@@ -378,10 +380,11 @@ pub fn start_heartbeat(app_state: Arc<AppState>) {
             // Read the /health-driven embedding probe cache. `None` (probe
             // hasn't run yet) collapses to "healthy" so a pre-probe heartbeat
             // doesn't flap to "degraded" on boot.
-            // `pg_reachable = None`: the heartbeat loop does not run a DB
-            // round-trip (the bounded PG liveness probe lives only in the
-            // `/health` handler), so it passes unknown rather than probing on
-            // every tick.
+            // `pg_reachable` / `pg_schema_ok` come from the CACHED PG health
+            // snapshot (`database::pg::health`): no DB round-trip per tick,
+            // age-bounded (stale or never observed is `None`), and a breaker
+            // that is open reads `Some(false)` — so a down database reaches
+            // this off-box heartbeat's `derived_status`.
             //
             // `ui_dead` is a REAL value here, not `None`. A dead WebView2 host
             // is invisible to `ui_error` (the React error boundary cannot run)
@@ -419,6 +422,7 @@ pub fn start_heartbeat(app_state: Arc<AppState>) {
                 crate::mcp::backend_relay::web_integration_status_for(&app_state).await;
             let relay = HeartbeatRelay::from(&relay_status);
             let relay_connected = relay.connected;
+            let (pg_reachable, pg_schema_ok) = crate::database::pg::health::status_pg_inputs();
             let base_status =
                 crate::ui_error::compute_derived_status(&crate::ui_error::HealthInputs {
                     has_ui_error: ui_error_snapshot.is_some(),
@@ -426,6 +430,8 @@ pub fn start_heartbeat(app_state: Arc<AppState>) {
                     ui_dead: Some(ui_dead),
                     native_ui_wedged: native_ui.wedged,
                     embedding_reachable: crate::mcp_api::embedding_reachable_cached(),
+                    pg_reachable,
+                    pg_schema_ok,
                     relay_connected,
                     ..Default::default()
                 });
@@ -823,6 +829,7 @@ mod tests {
                     pong_age_ms: 0,
                     last_event_pong: 1,
                     event_pong_age_ms: 0,
+                    ping: crate::ui_error::PingAsk::NONE,
                 }),
                 no_ping_evidence(),
             ),
@@ -943,6 +950,15 @@ mod tests {
             pong_age_ms: 2_000,
             last_event_pong: 1_700_000_000_000,
             event_pong_age_ms: 400_000,
+            // Pings sent and unanswered for longer than the window, still
+            // being sent — the "asked and nobody answered" reading
+            // `events_undelivered` requires since the 2026-10-19 ui-wedge plan.
+            ping: crate::ui_error::PingAsk {
+                last_ok: 1_700_000_398_000,
+                last_ok_age_ms: 2_000,
+                first_unanswered: 1_700_000_001_000,
+                first_unanswered_age_ms: 399_000,
+            },
         });
         let payload = HeartbeatPayload {
             hostname: "test-host".to_string(),
@@ -1011,6 +1027,7 @@ mod tests {
             pong_age_ms: 600_000,
             last_event_pong: 1_700_000_000_000,
             event_pong_age_ms: 600_000,
+            ping: crate::ui_error::PingAsk::NONE,
         });
         // The 2026-09-01 storm, as it stands on the wire: emits failing right
         // now, a death verdict suppressed 49 times.
@@ -1047,6 +1064,7 @@ mod tests {
             pong_age_ms: 0,
             last_event_pong: 0,
             event_pong_age_ms: 0,
+            ping: crate::ui_error::PingAsk::NONE,
         });
         let json = serde_json::to_value(HeartbeatUiThread::new(native, no_ping_evidence()))
             .expect("serializes");
@@ -1083,6 +1101,7 @@ mod tests {
             pong_age_ms: 600_000,
             last_event_pong: 1_700_000_000_000,
             event_pong_age_ms: 600_000,
+            ping: crate::ui_error::PingAsk::NONE,
         });
         const NOW: u64 = 1_800_000_000_000;
         let ping = crate::ui_error::classify_ping_delivery_report(
@@ -1126,6 +1145,7 @@ mod tests {
             pong_age_ms: 0,
             last_event_pong: 0,
             event_pong_age_ms: 0,
+            ping: crate::ui_error::PingAsk::NONE,
         });
         let json = serde_json::to_value(HeartbeatUiThread::new(native, no_ping_evidence()))
             .expect("serializes");
@@ -1168,6 +1188,7 @@ mod tests {
                     pong_age_ms: 0,
                     last_event_pong: 1,
                     event_pong_age_ms: 0,
+                    ping: crate::ui_error::PingAsk::NONE,
                 }),
                 no_ping_evidence(),
             ),

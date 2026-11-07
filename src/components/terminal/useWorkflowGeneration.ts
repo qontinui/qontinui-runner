@@ -10,6 +10,7 @@ import { buildPlanImplementationWorkflow } from "@/lib/workflow-builder/buildPla
 import type { CommandResponse } from "./types";
 import { invokeOperatorDoor } from "@/lib/operatorDoors";
 import { describeThrown } from "@/lib/utils";
+import { usePersistedShowSidebar } from "./sessionSidebarPersistence";
 
 interface GenerateWorkflowResponse {
   success: boolean;
@@ -44,6 +45,10 @@ interface UseWorkflowGenerationParams {
   loadMessages: (sessionId: string) => Promise<TranscriptMessage[]>;
   onNavigateToBuilder?: () => void;
   onNavigateToActive?: () => void;
+  /** The terminal page this state belongs to — keys the persisted sidebar flag. */
+  pageId: string;
+  /** The window hosting the page (`"main"` or a pop-out label) — same reason. */
+  windowLabel?: string;
 }
 
 interface UseWorkflowGenerationResult {
@@ -93,6 +98,8 @@ export function useWorkflowGeneration({
   loadMessages,
   onNavigateToBuilder,
   onNavigateToActive,
+  pageId,
+  windowLabel,
 }: UseWorkflowGenerationParams): UseWorkflowGenerationResult {
   // ── Generation state ────────────────────────────────────────────────────────
   const [isGenerating, setIsGenerating] = useState(false);
@@ -112,7 +119,9 @@ export function useWorkflowGeneration({
   } | null>(null);
 
   // ── Sidebar + content panel state ──────────────────────────────────────────
-  const [showSidebar, setShowSidebar] = useState(false);
+  // Persisted per page/window: in tmux work mode the sidebar is the only
+  // navigator, so it must not reload closed (`sessionSidebarPersistence`).
+  const [showSidebar, setShowSidebar] = usePersistedShowSidebar(pageId, windowLabel);
   const [selectedTranscriptSessionId, setSelectedTranscriptSessionId] = useState<string | null>(
     null,
   );
@@ -272,7 +281,7 @@ export function useWorkflowGeneration({
         setNotification({ message, type: "error" });
         return { ok: false, code: "detect-failed", message };
       }
-    }, [activeId, tabs, handleSelectTranscriptSession]);
+    }, [activeId, tabs, handleSelectTranscriptSession, setShowSidebar]);
 
   // ── Generation entry points ────────────────────────────────────────────────
 

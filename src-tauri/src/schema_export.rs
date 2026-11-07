@@ -36,13 +36,14 @@ pub fn export_all_schemas() -> Value {
         accessibility as qa, agent_commands as qac, agent_text_units as qatu, ai_workflows as qaw,
         app_events as qae, apps as qap, completeness_verdict as qcv, config as qcfg,
         constraints as qc, discovery as qdc, execution as qe, findings as qfn,
-        functional_spec as qfs, geometry as qg, git_ops as qgo, helper_task as qht, ir as qir,
-        journey as qj, mcp_config as qmc, memory as qmem, orchestration_config as qoc,
-        priorities_profile as qpp, process_management as qpm, projects as qprj, rag as qr,
-        runner as qrn, scheduler as qs, spec_api_events as qsae, spec_check as qsc,
-        state_machine as qsm, targets as qt, task_run as qtr, terminal as qtm,
-        ticket_system as qts, tree_events as qte, ui_bridge as qub, verification as qv,
-        worker_output as qwo, workflow as qw, workflow_step as qws,
+        functional_spec as qfs, geometry as qg, git_ops as qgo, helper_task as qht,
+        image_slot as qis, ir as qir, journey as qj, mcp_config as qmc, memory as qmem,
+        orchestration_config as qoc, priorities_profile as qpp, process_management as qpm,
+        projects as qprj, rag as qr, runner as qrn, scheduler as qs, spec_api_events as qsae,
+        spec_check as qsc, spec_model as qspm, state_machine as qsm, targets as qt,
+        task_run as qtr, terminal as qtm, ticket_system as qts, tree_events as qte,
+        ui_bridge as qub, verification as qv, worker_output as qwo, workflow as qw,
+        workflow_step as qws,
     };
 
     // Built via a plain Map instead of `json!` to avoid the
@@ -149,6 +150,26 @@ pub fn export_all_schemas() -> Value {
     add!("NextTaskInfo", qs::NextTaskInfo);
     add!("CreateScheduledTaskRequest", qs::CreateScheduledTaskRequest);
     add!("UpdateScheduledTaskRequest", qs::UpdateScheduledTaskRequest);
+    // Recurring agents declared in coord and reconciled by the runner (plan
+    // 2026-10-29-recurring-agents-declared-in-coord-reconciled-by-runner,
+    // qontinui-schemas#276 / #283): the managed key a ScheduledTask carries,
+    // and the wire types of coord's device read and the status report.
+    add!("ManagedBy", qs::ManagedBy);
+    add!("RecurringAgentDispatchRole", qs::RecurringAgentDispatchRole);
+    add!("RecurringAgentOs", qs::RecurringAgentOs);
+    add!("RecurringAgentTarget", qs::RecurringAgentTarget);
+    add!(
+        "RecurringAgentExcludedValue",
+        qs::RecurringAgentExcludedValue
+    );
+    add!("RecurringAgentParamKind", qs::RecurringAgentParamKind);
+    add!("RecurringAgentParamDef", qs::RecurringAgentParamDef);
+    add!("RecurringAgentParamSchema", qs::RecurringAgentParamSchema);
+    add!("RecurringAgentSpec", qs::RecurringAgentSpec);
+    add!("RecurringAgentState", qs::RecurringAgentState);
+    add!("RecurringAgentOverride", qs::RecurringAgentOverride);
+    add!("RecurringAgentStatus", qs::RecurringAgentStatus);
+    add!("RecurringAgentStatusReport", qs::RecurringAgentStatusReport);
 
     // ── qontinui-types: workflow frame ──
     add!("RoutingRule", qw::RoutingRule);
@@ -736,6 +757,25 @@ pub fn export_all_schemas() -> Value {
     add!("CompletenessVerdict", qcv::CompletenessVerdict);
     add!("SectionVerdict", qcv::SectionVerdict);
     add!("SpecSection", qcv::SpecSection);
+    // spec_model — spec-artifact frontmatter (plan 2026-10-10 spec front end
+    // phase 6, Phase 2).
+    add!("EarsPattern", qspm::EarsPattern);
+    add!("CriterionVerification", qspm::CriterionVerification);
+    add!("SpecFrontmatter", qspm::SpecFrontmatter);
+    add!("RequestFrontmatter", qspm::RequestFrontmatter);
+    add!("RequirementFrontmatter", qspm::RequirementFrontmatter);
+    add!(
+        "InterfaceMappingFrontmatter",
+        qspm::InterfaceMappingFrontmatter
+    );
+    add!("StoryFrontmatter", qspm::StoryFrontmatter);
+    add!("SpecAcceptanceCriterion", qspm::SpecAcceptanceCriterion);
+    add!("SourceCitation", qspm::SourceCitation);
+    add!("SourceCitationKind", qspm::SourceCitationKind);
+    add!("ExternalRef", qspm::ExternalRef);
+    add!("TemplateRef", qspm::TemplateRef);
+    add!("MappingRow", qspm::MappingRow);
+    add!("SpecLanguage", qspm::SpecLanguage);
     add!("ProvenanceMix", qcv::ProvenanceMix);
     add!("CoverageGap", qcv::CoverageGap);
     add!("GapReason", qcv::GapReason);
@@ -888,6 +928,60 @@ pub fn export_all_schemas() -> Value {
     add!("JourneyEdgeObservation", qj::JourneyEdgeObservation);
     add!("FrontierEntry", qj::FrontierEntry);
     add!("JourneyLedgerHealth", qj::JourneyLedgerHealth);
+    // ── journey queries + the temporal track (same plan, Phases 2 and 4).
+    // The answer VALUES of `GET /apps/{app_id}/journey/*` — the shared query
+    // results (their sub-types — nodes, edges, coverage, search frontier —
+    // are `$defs`), the runner's two route-local answer, and the
+    // vision-core timeline and edge-timing types the ledger stores and
+    // `edge-timing` returns. The `Observation<T>` envelope around them is
+    // registered with its own plan, not here. (11) ──
+    add!("JourneyFilter", qj::JourneyFilter);
+    add!("JourneyGraph", qj::JourneyGraph);
+    add!("JourneyReachable", qj::JourneyReachable);
+    add!("JourneySteps", qj::JourneySteps);
+    add!("JourneyDeadEnds", qj::JourneyDeadEnds);
+    add!("JourneyPriorKnowledge", qj::JourneyPriorKnowledge);
+    add!("JourneyFrontier", qj::JourneyFrontier);
+    add!(
+        "JourneyUnmeasuredDepartures",
+        qj::JourneyUnmeasuredDepartures
+    );
+    add!("JourneyArrivalDoubt", qj::JourneyArrivalDoubt);
+    add!(
+        "JourneyEdgeTimingAnswer",
+        crate::journey_wire::JourneyEdgeTimingAnswer
+    );
+    add!("ChangeTimeline", qontinui_vision_core::ChangeTimeline);
+    add!("EdgeTiming", qontinui_vision_core::EdgeTiming);
+    // Types more than one of the answers above reference. Each is top-level so
+    // the TypeScript pass imports ONE declaration instead of inlining a
+    // structural copy per file (compile_typescript.mjs refuses a fork). The
+    // nine envelope types are registered exactly as qontinui-runner#2118
+    // (the Observation-envelope plan) registers them — `Observation<Value>`,
+    // since a binding cannot be generic — and are already pending-registration
+    // bindings in qontinui-schemas; whichever PR lands second drops its copy.
+    // (+15) ──
+    add!("JourneyCoverage", qj::JourneyCoverage);
+    add!("JourneySearchFrontier", qj::JourneySearchFrontier);
+    add!("JourneySearchFrontierNode", qj::JourneySearchFrontierNode);
+    add!("JourneyGraphEdge", qj::JourneyGraphEdge);
+    add!("DetectedAnimation", qontinui_vision_core::DetectedAnimation);
+    add!(
+        "MetricDistribution",
+        qontinui_vision_core::MetricDistribution
+    );
+    {
+        use qontinui_vision_core::observation as qob;
+        add!("Observation", qob::Observation<serde_json::Value>);
+        add!("ObservationStatus", qob::ObservationStatus);
+        add!("UnknownCode", qob::UnknownCode);
+        add!("UnknownInfo", qob::UnknownInfo);
+        add!("Provenance", qob::Provenance);
+        add!("Producer", qob::Producer);
+        add!("ObservationCoverage", qob::ObservationCoverage);
+        add!("UnmeasuredDimension", qob::UnmeasuredDimension);
+        add!("CacheProvenance", qob::CacheProvenance);
+    }
     // ── qontinui-types: page (plan
     // 2026-09-05-every-bounded-read-is-a-page-that-reads-as-a-corpus,
     // qontinui-schemas#186). The bounded-read wire contract every list
@@ -896,6 +990,15 @@ pub fn export_all_schemas() -> Value {
     add!("BoundKind", qontinui_types::page::BoundKind);
     add!("BoundedReadMeta", qontinui_types::page::BoundedReadMeta);
     add!("FilterNarrowing", qontinui_types::page::FilterNarrowing);
+    // ── qontinui-types: image_slot (plan
+    // 2026-10-13-image-generation-and-visual-judgment Phase 14,
+    // qontinui-schemas#230). The ROOT only: every `ImageSlot*` sub-type is a
+    // `$defs` entry of this schema, so the generated `ImageSlotSpec.d.ts` and
+    // `image_slot_spec.py` declare each one beside it. Read the
+    // `qontinui_types::image_slot` module doc before registering a sub-type on
+    // its own: the TypeScript generator's fork guard is why each one has a
+    // single reference site. (1) ──
+    add!("ImageSlotSpec", qis::ImageSlotSpec);
 
     Value::Object(m)
 }
@@ -977,20 +1080,75 @@ mod tests {
         // FilterNarrowing — plan
         // 2026-09-05-every-bounded-read-is-a-page-that-reads-as-a-corpus,
         // qontinui-schemas#186) = 569.
-        // The codegen's "Processing N top-level types" line should read 569 here.
-        assert_eq!(obj.len(), 569, "Expected 569 schema entries");
+        // + the 1 image-slot spec (ImageSlotSpec — plan
+        // 2026-10-13-image-generation-and-visual-judgment Phase 14,
+        // qontinui-schemas#230; its sub-types are `$defs`) = 570.
+        // + the 11 journey query / temporal-track answer types (JourneyFilter,
+        // JourneyGraph, JourneyReachable, JourneySteps, JourneyDeadEnds,
+        // JourneyPriorKnowledge, JourneyFrontier, JourneyUnmeasuredDepartures,
+        // JourneyEdgeTimingAnswer, ChangeTimeline, EdgeTiming — plan
+        // 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time
+        // Phases 2 and 4) = 581.
+        // + the 15 types those answers share (JourneyCoverage,
+        // JourneySearchFrontier, JourneySearchFrontierNode, JourneyGraphEdge,
+        // DetectedAnimation, MetricDistribution, and the 9 Observation-envelope
+        // types) so the TS pass declares each once = 596.
+        // + JourneyArrivalDoubt (shared by JourneyGraph and
+        // JourneyPriorKnowledge) = 597.
+        // + the 14 spec_model spec-artifact frontmatter types (EarsPattern,
+        // CriterionVerification, SpecFrontmatter, RequestFrontmatter,
+        // RequirementFrontmatter, InterfaceMappingFrontmatter, StoryFrontmatter,
+        // SpecAcceptanceCriterion, SourceCitation, SourceCitationKind,
+        // ExternalRef, TemplateRef, MappingRow, SpecLanguage) = 611.
+        // + the 13 recurring-agent types (ManagedBy, RecurringAgentDispatchRole,
+        // RecurringAgentOs, RecurringAgentTarget, RecurringAgentExcludedValue,
+        // RecurringAgentParamKind,
+        // RecurringAgentParamDef, RecurringAgentParamSchema, RecurringAgentSpec,
+        // RecurringAgentState, RecurringAgentOverride, RecurringAgentStatus,
+        // RecurringAgentStatusReport — plan
+        // 2026-10-29-recurring-agents-declared-in-coord-reconciled-by-runner
+        // Phase 4a) = 624.
+        // The codegen's "Processing N top-level types" line should read 624 here.
+        assert_eq!(obj.len(), 624, "Expected 624 schema entries");
+        for recurring in [
+            "ManagedBy",
+            "RecurringAgentTarget",
+            "RecurringAgentExcludedValue",
+            "RecurringAgentParamSchema",
+            "RecurringAgentSpec",
+            "RecurringAgentStatus",
+            "RecurringAgentStatusReport",
+        ] {
+            assert!(obj.contains_key(recurring), "Missing {recurring} schema");
+        }
         for journey in [
             "JourneyNode",
             "JourneyTrigger",
             "JourneyEdgeObservation",
             "FrontierEntry",
             "JourneyLedgerHealth",
+            "JourneyFilter",
+            "JourneyGraph",
+            "JourneyReachable",
+            "JourneySteps",
+            "JourneyDeadEnds",
+            "JourneyPriorKnowledge",
+            "JourneyFrontier",
+            "JourneyUnmeasuredDepartures",
+            "JourneyArrivalDoubt",
+            "JourneyEdgeTimingAnswer",
+            "ChangeTimeline",
+            "EdgeTiming",
         ] {
             assert!(obj.contains_key(journey), "Missing {journey} schema");
         }
         for page in ["BoundKind", "BoundedReadMeta", "FilterNarrowing"] {
             assert!(obj.contains_key(page), "Missing {page} schema");
         }
+        assert!(
+            obj.contains_key("ImageSlotSpec"),
+            "Missing ImageSlotSpec schema from qontinui_types::image_slot"
+        );
         assert!(
             obj.contains_key("RunnerInstance") && obj.contains_key("RunnerInstanceRole"),
             "Missing RunnerInstance / RunnerInstanceRole schema"

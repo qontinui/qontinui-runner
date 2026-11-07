@@ -760,6 +760,7 @@ done < "$L"
      git -C "$top" checkout "$branch"
      git -C "$top" branch -f "$default" "origin/$default"   # default ref returns to origin; commits live only on the branch
      ```
+   - Before the PR opens, run `/implement-plan` Step 4.3 (fold in open follow-ups on the files this diff touches) — it adds one `Resolves-Followup:` body line per fold and moves each to `fixing` after the read-back. Run it in `$top`, after the branch exists and before the push below.
    - Push the BRANCH (never the default branch), then open a PR naming the loop from inside that checkout — CHAINED, so a refused push opens nothing and the repo is skipped:
      ```bash
      # $top, $branch and $default come from the fence above. In a fresh shell, rebind them first:

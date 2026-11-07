@@ -140,6 +140,33 @@ pub struct GetWebIntegrationStatusResponse {
     pub settings_fault: Option<crate::settings::SettingsFault>,
 }
 
+/// The web-FRONTEND origin the runner GUI opens qontinui-web pages on
+/// (`/connect-runner-github`, `/sessions/<id>`, `/login`), resolved by
+/// `web_origin::resolve_web_frontend_base`: `$QONTINUI_WEB_FRONTEND_BASE`, then
+/// the `web_integration.web_base_url` setting, then derived from the resolved
+/// API base (`https://api.X` -> `https://X`). The API host serves no pages, so
+/// a page link built from the API base 404s in production and opens the wrong
+/// port in split local dev. `caller` only labels the log line.
+pub(crate) fn resolve_gui_web_frontend_origin(caller: &str) -> String {
+    let settings = settings::load_settings();
+    let env = std::env::var(qontinui_runner_lib::web_origin::WEB_FRONTEND_BASE_ENV).ok();
+    let (origin, source) = qontinui_runner_lib::web_origin::resolve_web_frontend_base(
+        env.as_deref(),
+        settings.web_integration.web_base_url.as_deref(),
+        &crate::api_config::get_api_base_url(),
+    );
+    info!(caller, origin = %origin, source = ?source, "web frontend origin resolved");
+    origin
+}
+
+/// Tauri door onto [`resolve_gui_web_frontend_origin`] for frontend code that
+/// opens a qontinui-web page (e.g. `ConflictModal`'s dashboard link), so the
+/// TS side never re-derives the origin or hard-codes production.
+#[tauri::command]
+pub fn get_web_frontend_origin() -> String {
+    resolve_gui_web_frontend_origin("get_web_frontend_origin")
+}
+
 #[tauri::command]
 pub async fn get_web_integration_status(
     integration: State<'_, IntegrationCompartment>,

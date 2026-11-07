@@ -437,7 +437,7 @@ pub async fn get_ai_session_state(
 /// task-run insert has been awaited, when that insert then fails.
 ///
 /// Two things now run unconditionally between building the insert future and
-/// polling it: `register_session` (hoisted ahead of the spawn because the
+/// polling it: `register_session_in` (hoisted ahead of the spawn because the
 /// minted coord session id seeds the agent_logs emitter) and
 /// `AgentLogEmitter::start` (which opens the session's queue in the shared
 /// emitter service). Before the insert and the spawn were run concurrently,
@@ -535,9 +535,15 @@ pub async fn create_ai_session(
     // Done BEFORE spawn (it only needs the task_run_id) so the minted coord
     // session id is available to seed the Phase-1b agent_logs emitter, which the
     // stdout reader + waiter threads need at spawn time. The R6 idempotency
-    // guard means this is the single Started write; the later (post-spawn)
-    // success re-register is a no-op.
-    let coord_session_id = ai_coord_registrar.register_session(&task_run_id, &name, None);
+    // guard makes this the single Started write.
+    //
+    // The session's tenant follows the workspace + repo it is spawned into —
+    // the runner's process cwd, the same directory the spawn below resolves
+    // (plan 2026-09-20 Phase 5).
+    let spawn_cwd = std::env::current_dir().ok();
+    let coord_session_id = ai_coord_registrar
+        .register_session_in(&task_run_id, &name, None, spawn_cwd.as_deref())
+        .await;
 
     // Phase 1b/1c — build the interactive-agent log emitter when the
     // `QONTINUI_AGENT_LOGS_FROM_SESSIONS` gate is ON (the default) and the
@@ -1579,6 +1585,11 @@ async fn reacquire_and_restore_session_worktree(
     //    original claim → idempotent renew within TTL / clean re-take after.
     let agent_session_id = crate::drain::stable_ai_session_id(task_run_id);
     let intent = format!("resume chat session {task_run_id}");
+    // Plan 2026-10-10 D7 (narrowed by vet V5): every NON-PRIMARY repo the
+    // session had its own worktree for is plausibly edited, so it is re-requested
+    // as an edit sibling — otherwise a co-requested consumer that declares it
+    // would have it redirected at the read-only sibling store on resume.
+    let edit_siblings = crate::agent_worktree::edit_sibling::resume_edit_siblings(&repos);
 
     match acquire(AcquireRequest {
         repos: &repos,
@@ -1589,6 +1600,7 @@ async fn reacquire_and_restore_session_worktree(
         agent_session_id: Some(agent_session_id),
         spawn_tenant: None,
         shared_branch: crate::agent_worktree::SharedBranchPolicy::Honor,
+        edit_siblings: &edit_siblings,
     })
     .await
     {
@@ -1986,9 +1998,20 @@ pub async fn resume_ai_sessions(
         // idempotency guard makes the later post-spawn register a no-op), so
         // the minted coord session id can seed the Phase-1b agent_logs emitter
         // the spawn's stdout/waiter threads consume. `None` registrar → no id.
-        let coord_session_id = ai_coord_registrar
-            .as_ref()
-            .and_then(|reg| reg.register_session(&task_run_id, &task_name, None));
+        // The tenant follows the workspace + repo it re-spawns into (plan
+        // 2026-09-20 Phase 5).
+        let coord_session_id = match ai_coord_registrar.as_ref() {
+            Some(reg) => {
+                reg.register_session_in(
+                    &task_run_id,
+                    &task_name,
+                    None,
+                    Some(std::path::Path::new(&working_dir_for_spawn)),
+                )
+                .await
+            }
+            None => None,
+        };
         // Phase 1b/1c emitter — `None` (default) unless the
         // `QONTINUI_AGENT_LOGS_FROM_SESSIONS` gate is ON and the id resolved.
         let agent_log_emitter = coord_session_id
@@ -2549,7 +2572,9 @@ mod failed_task_run_teardown_tests {
         let (reg, _dir) = registrar();
         let task_run_id = uuid::Uuid::new_v4().to_string();
 
-        // Exactly what the command does before the `join!`.
+        // What the command does before the `join!` — minus the tenant
+        // resolution `register_session_in` adds, which needs a workdir and
+        // network and is not what this test is about.
         let coord_session_id = reg
             .register_session(&task_run_id, "New Chat", None)
             .expect("registration enabled by default");

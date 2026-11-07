@@ -1,0 +1,8 @@
+[1m[92m   Compiling[0m qontinui-runner v1.0.11 (D:\a\qontinui-runner\qontinui-runner\src-tauri)
+[1m[91merror[E0425][0m[1m[97m: cannot find value `retry_budget` in this scope[0m
+   [1m[96m--> [0msrc-tauri\src\process_helpers.rs:1839:17
+    [1m[96m|[0m
+[1m[96m1839[0m [1m[96m|[0m                 "echo error launching git: spawn failed (os error 1455) 1>&2 & exit 1", retry_budget,
+    [1m[96m|[0m                                                                                       [1m[91m^^^^^^^^^^^^[0m [1m[91mnot found in this scope[0m
+
+[1m[91merror[0m: could not compile `qontinui-runner` (lib test) due to 1 previous error

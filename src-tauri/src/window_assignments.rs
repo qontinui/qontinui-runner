@@ -77,8 +77,18 @@ pub struct WindowGeometry {
 /// `2026-09-28-runner-popout-window-geometry-poisoning-and-webview-recovery-wedge`).
 const WINDOWS_ICONIC_SENTINEL: i32 = -32000;
 
+/// Smallest rect worth restoring, in physical pixels (the unit
+/// [`WindowGeometry`] stores). A collapsed window can report a non-zero sliver
+/// (e.g. 15×37) that passes a plain `> 0` check yet is unusable; such a rect
+/// falls back to the default placement. The minimum inner size of every window
+/// this rule is applied to (pop-outs, the main window) is well above this at
+/// any scale factor ≥ 1.
+const MIN_RESTORABLE_WIDTH: u32 = 200;
+const MIN_RESTORABLE_HEIGHT: u32 = 150;
+
 /// Whether a window rect can be applied to a window and yield something
-/// visible: a non-zero size, and not parked at the Windows iconic sentinel.
+/// visible: at least the minimum usable size, and not parked at the Windows
+/// iconic sentinel.
 ///
 /// The ONE validity rule for every runner-owned window rect, whoever captures
 /// it: the pop-out registry ([`WindowGeometry::is_restorable`], on both its
@@ -89,7 +99,7 @@ const WINDOWS_ICONIC_SENTINEL: i32 = -32000;
 /// sentinel corner is refused.
 pub fn is_restorable_rect(x: i32, y: i32, w: u32, h: u32) -> bool {
     let iconic = x <= WINDOWS_ICONIC_SENTINEL && y <= WINDOWS_ICONIC_SENTINEL;
-    w > 0 && h > 0 && !iconic
+    w >= MIN_RESTORABLE_WIDTH && h >= MIN_RESTORABLE_HEIGHT && !iconic
 }
 
 impl WindowGeometry {
@@ -1050,6 +1060,12 @@ mod tests {
         assert!(!geom(100, 100, 0, 0, false).is_restorable());
         assert!(!geom(100, 100, 0, 600, false).is_restorable());
         assert!(!geom(100, 100, 800, 0, false).is_restorable());
+        // A collapsed sliver is non-zero but unusable.
+        assert!(!geom(177, 177, 15, 37, false).is_restorable());
+        // The minimum is inclusive.
+        assert!(geom(100, 100, 200, 150, false).is_restorable());
+        assert!(!geom(100, 100, 199, 150, false).is_restorable());
+        assert!(!geom(100, 100, 200, 149, false).is_restorable());
     }
 
     #[test]

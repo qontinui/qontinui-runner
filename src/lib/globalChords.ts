@@ -113,6 +113,16 @@ export const GLOBAL_CHORDS = {
   runCycleAlt: { key: "`", shift: false, meta: false },
   /** Terminal CommandBar focus (`terminal/CommandBar`) — Ctrl+/, no Shift. */
   commandBar: { key: "/", shift: false, meta: false },
+  /**
+   * Terminal work mode, Grid ⇄ tmux (`terminal/useKeyboardShortcuts` →
+   * `applyWorkModeRequest`). Declared here rather than as an inline letter so
+   * a new surface reaching for Ctrl+Shift+Y collides with it in the table
+   * instead of in the field. `y` was free of every claim in both registries;
+   * the neighbouring free letters were not usable — Ctrl+Shift+C/V are the
+   * terminal copy/paste convention, Ctrl+Shift+U is the Linux IBus/GTK
+   * unicode-entry chord, and Ctrl+Shift+Z is redo inside the CommandBar input.
+   */
+  terminalWorkMode: { key: "y", shift: true, meta: false },
 } as const satisfies Record<string, GlobalChord>;
 
 /**

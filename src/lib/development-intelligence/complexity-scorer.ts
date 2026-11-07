@@ -6,7 +6,7 @@
  * files to detect drift.
  */
 
-const API_BASE = "http://localhost:9876";
+import { getApiBase } from "@/lib/runner-api";
 
 export interface ComplexityScore {
   page: string;
@@ -54,7 +54,7 @@ export interface DriftAlert {
 }
 
 export async function analyzeComplexity(projectPath: string): Promise<ComplexityAnalysisResult> {
-  const response = await fetch(`${API_BASE}/development-intelligence/complexity-scores`, {
+  const response = await fetch(`${getApiBase()}/development-intelligence/complexity-scores`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ project_path: projectPath }),

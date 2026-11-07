@@ -624,7 +624,7 @@ export function SessionReviewBadge({
       }}
       onMouseDown={(e) => e.stopPropagation()}
       className={cn(
-        "shrink-0 rounded px-1 text-[9px] leading-[14px]",
+        "min-w-0 truncate rounded px-1 text-[9px] leading-[14px]",
         unknown
           ? "bg-fuchsia-500/15 text-fuchsia-300"
           : state.unread > 0

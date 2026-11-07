@@ -86,15 +86,6 @@ export type UIBridgeRequestType =
   // Workflow execution
   | "run_workflow"
   | "get_workflow_status"
-  // Media discovery
-  | "find_media"
-  | "media_audit"
-  | "capture_media_snapshot"
-  | "analyze_media"
-  // Element image capture (DOM-based, no screen capture)
-  | "capture_element_images"
-  // Element image metadata (reads <img> src attributes from DOM)
-  | "get_element_images"
   // Browser events & timeline
   | "get_browser_events"
   | "get_timeline"
@@ -172,12 +163,14 @@ export type UIBridgeRequestType =
   | "design_evaluate_baseline"
   | "design_evaluate_contexts"
   | "design_evaluate_diff"
-  // Media compare
-  | "media_compare"
   // Pixel-accurate visual regression diff
   | "image_diff"
-  // Single-element screenshot with DOM fallback strategies
-  | "capture_single_element"
+  // In-situ asset override — dev control (plan
+  // 2026-10-13-image-generation-and-visual-judgment, Phase 18); backs
+  // POST / DELETE / GET /ui-bridge/control/media/override.
+  | "media_override_apply"
+  | "media_override_restore"
+  | "media_override_list"
   // Annotations import
   | "annotations_import"
   // Intents NL
@@ -231,6 +224,10 @@ export type UIBridgeRequestType =
   | "clear_network_stubs"
   // Non-consuming stub verification (N3)
   | "verify_network_stub"
+  // Text visibility — dev control (plan
+  // 2026-10-13-image-generation-and-visual-judgment, Phase 16); backs
+  // POST /ui-bridge/control/text-visibility and vision captureTextHidden.
+  | "text_visibility"
   // Toast ring buffer (GET /control/toasts)
   | "get_toast_buffer"
   // Spec execution (POST /control/spec/{id}/run)
@@ -332,7 +329,8 @@ export type PageEventTypes =
   | "list_network_stubs"
   | "delete_network_stub"
   | "clear_network_stubs"
-  | "verify_network_stub";
+  | "verify_network_stub"
+  | "text_visibility";
 
 export type DesignEventTypes =
   | "design_get_snapshot"
@@ -446,15 +444,10 @@ export type AISearchEventTypes =
 export type WorkflowEventTypes = "get_workflows" | "run_workflow" | "get_workflow_status";
 
 export type MediaEventTypes =
-  | "find_media"
-  | "media_audit"
-  | "capture_media_snapshot"
-  | "analyze_media"
-  | "capture_element_images"
-  | "get_element_images"
-  | "capture_single_element"
   | "image_diff"
-  | "media_compare";
+  | "media_override_apply"
+  | "media_override_restore"
+  | "media_override_list";
 
 export type AnnotationEventTypes =
   | "annotations_list"

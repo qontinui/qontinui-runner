@@ -35,6 +35,7 @@
 //! module; they are deliberately absent until the P1 work-unit API lands.
 
 pub mod body_push;
+pub mod metadata;
 pub mod parser;
 pub mod push;
 pub mod ref_scan;

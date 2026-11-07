@@ -148,7 +148,11 @@ const NAMED_KEYS: Readonly<Record<string, string>> = {
 };
 
 function lookupNamedKey(key: string): string | undefined {
-  return NAMED_KEYS[key.toLowerCase()];
+  // `hasOwn`, because a plain index reads through `Object.prototype`: `constructor`
+  // resolved to a function, which `encodeKey` returned, and the join wrote its
+  // source text into the PTY as if it were keystrokes.
+  const name = key.toLowerCase();
+  return Object.hasOwn(NAMED_KEYS, name) ? NAMED_KEYS[name] : undefined;
 }
 
 /**
@@ -285,6 +289,8 @@ function encodeKey(desc: KeyDescriptor): string {
     const bits =
       (mods.shift ? 1 : 0) + (mods.alt ? 2 : 0) + (mods.ctrl ? 4 : 0) + (mods.meta ? 8 : 0);
     if (bits === 0) return named;
+    // Back-tab, the one modified form of Tab a terminal defines.
+    if (bits === 1 && key.toLowerCase() === "tab") return `${CSI}Z`;
 
     const param = bits + 1;
     // Matched by prefix rather than a regex literal: an ESC inside a regex

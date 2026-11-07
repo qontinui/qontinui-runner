@@ -5502,7 +5502,9 @@ fn restore_proxy_nonces_from(store: &crate::secure_storage::SecureStorage) -> No
     // Each binding's expectation (plan 2026-09-20-a-sessions-tenant-follows-
     // its-repo… Phase 2), built BEFORE the registry lock: the caller-named half
     // reads the workspace declaration files. The cwd half is restored VERBATIM
-    // — the spawn-time expectation, never re-resolved (F2) — and an entry
+    // — the spawn-time expectation, never re-resolved (F2) — for every variant
+    // EXCEPT `Unknown`, which restores pending and is re-resolved (it describes
+    // the credential / coord build that measured it, not the repo); an entry
     // persisted without one says so rather than guessing.
     let persisted: Vec<_> = persisted
         .into_iter()
@@ -5531,9 +5533,20 @@ fn restore_proxy_nonces_from(store: &crate::secure_storage::SecureStorage) -> No
             // cannot read) restores PENDING: the first proxied call
             // re-resolves it from the persisted workdir, rather than
             // freezing a standing unknown for the life of the key.
+            // A persisted UNKNOWN (standing or not) also restores pending: an
+            // unknown describes the moment it was measured — the credential,
+            // the coord build — not the repo, and a restart is exactly when
+            // that moment has passed.
             let expected = match binding.expected_tenant.clone() {
-                Some(cwd) => crate::coord_mcp_tenant::SessionExpectation::known(cwd, caller_named),
-                None => crate::coord_mcp_tenant::SessionExpectation::pending(caller_named),
+                Some(cwd)
+                    if !matches!(
+                        cwd,
+                        qontinui_runner_lib::repo_tenant::CwdTenant::Unknown { .. }
+                    ) =>
+                {
+                    crate::coord_mcp_tenant::SessionExpectation::known(cwd, caller_named)
+                }
+                _ => crate::coord_mcp_tenant::SessionExpectation::pending(caller_named),
             }
             .with_settle_hook(persist_on_settle());
             // Only DEVICE bindings are ever persisted (OQ3), so a restored entry
@@ -12396,8 +12409,11 @@ pub(crate) enum CredentialTenantRead {
     /// The proxy would select this tenant's slot; `None` is the default
     /// (`access_token`) slot.
     Resolved(Option<Uuid>),
-    /// The proxy would refuse every request. The string is its typed refusal body.
-    Refused(String),
+    /// The proxy would refuse every request, with this typed refusal — kept
+    /// whole so the report can name the refusal's OWN code rather than calling
+    /// every refusal "unresolvable" (plan
+    /// `2026-09-14-credential-posture-second-residuals` Phase 3 follow-up).
+    Refused(ProxyRefusal),
 }
 
 /// Resolve `nonce` the way the coord-mcp proxy does, without its logging.
@@ -12410,7 +12426,7 @@ fn credential_tenant_for_nonce(nonce: Option<&str>) -> CredentialTenantRead {
     }
     match session_tenant_decision(Some(nonce)).into_result() {
         Ok(tenant) => CredentialTenantRead::Resolved(tenant),
-        Err(refusal) => CredentialTenantRead::Refused(refusal.message),
+        Err(refusal) => CredentialTenantRead::Refused(refusal),
     }
 }
 
@@ -18644,6 +18660,44 @@ mod tests {
         let _ = std::fs::remove_dir_all(&store_dir);
     }
 
+    /// A persisted UNKNOWN — even a standing one — restores PENDING, so a
+    /// restart re-resolves it instead of freezing a fact about the credential
+    /// or the coord build that measured it (tenant-follows-repo Phase 4
+    /// review W1).
+    #[test]
+    fn a_persisted_unknown_expectation_restores_pending() {
+        use qontinui_runner_lib::repo_tenant::CwdTenant;
+        let _amb = crate::test_env::isolated_ambient();
+        let _serial = restore_forensics_lock();
+        let (store_dir, store) = temp_store("expectation-unknown");
+        let wd = store_dir.join("wd").to_string_lossy().to_string();
+        let nonce = format!("unk-{}", uuid::Uuid::new_v4().simple());
+        store
+            .store_coord_mcp_nonce_sets(
+                &HashMap::from([(
+                    nonce.clone(),
+                    crate::secure_storage::StoredNonceBinding {
+                        workdir: wd.clone(),
+                        expected_tenant: Some(CwdTenant::unknown(
+                            "coord tenants-for-repo unreadable: 403 (unproven_device_principal)",
+                        )),
+                        ..Default::default()
+                    },
+                )]),
+                &HashMap::new(),
+            )
+            .unwrap();
+        restore_proxy_nonces_from(&store);
+        let (exp, _) = session_expectation_for_nonce(&nonce).expect("restored");
+        assert_eq!(
+            exp.settled(),
+            None,
+            "a persisted unknown restores PENDING, never frozen as settled"
+        );
+        NonceRegistry::global().test_live().remove(&nonce);
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
     /// The mint snapshot persists the expectation once it has resolved, and
     /// an explicit spawn tenant is recorded as caller-named.
     #[tokio::test]
@@ -19505,9 +19559,9 @@ mod tests {
 
         // Point the root-config self-heal (Phase 5b) at `base` — which holds no
         // `.mcp.json` — so this test exercises ONLY the session path and never
-        // touches the operator's real `qontinui-root/.mcp.json`. Restored below.
+        // touches the operator's real `qontinui-root/.mcp.json`. The fixture
+        // captures QONTINUI_ROOT and restores it on drop, unwinding included.
         std::fs::create_dir_all(&base).unwrap();
-        let prev_root = std::env::var("QONTINUI_ROOT").ok();
         std::env::set_var("QONTINUI_ROOT", &base);
 
         // Stale proxy config on :9999 → must be rewritten to :9876.
@@ -19688,10 +19742,6 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&base);
-        match prev_root {
-            Some(p) => std::env::set_var("QONTINUI_ROOT", p),
-            None => std::env::remove_var("QONTINUI_ROOT"),
-        }
     }
 
     /// **Security regression pin.** An AGENT-class `.mcp.json` sitting on the
@@ -23729,6 +23779,27 @@ pub(crate) mod doctor {
         let binding_store_unknown = binding_store.is_unknown();
         let binding_store_failed = binding_store.failed();
 
+        // Phase 7 (plan 2026-09-20): what the refresher did about each
+        // binding gap — the per-binding seed attempt and its outcome, and
+        // whether the operator was asked. Scoped to the account exactly as the
+        // UI's `get_binding_gap_asks` is, so it never crosses an account switch.
+        let binding_gap_lapses = {
+            let tenant_slots = am.try_list_tenant_device_jwt_tenants().ok();
+            let legacy_present = am
+                .get_access_token()
+                .map(|t| !t.trim().is_empty())
+                .unwrap_or(false);
+            let account = crate::mcp::device_jwt_refresher::binding_gap_ask_account(
+                legacy_present,
+                tenant_slots.as_deref(),
+                qontinui_runner_lib::pair::read_paired_user_id_from_disk(),
+            );
+            crate::mcp::device_jwt_refresher::binding_gap_lapses_report(
+                crate::mcp::device_jwt_refresher::binding_gap_ask_path().as_deref(),
+                account.as_deref(),
+            )
+        };
+
         let (verdict, layer, detail) = verdict_for(
             &selected,
             &legacy,
@@ -23757,6 +23828,10 @@ pub(crate) mod doctor {
             "binding_store": binding_store,
             "binding_store_failed": binding_store_failed,
             "binding_store_unknown": binding_store_unknown,
+            // `{"lapses": [...]}` or `{"unknown": "<why>"}` — the latter is
+            // NOT "no lapses". A `seed_not_bound: true` lapse opens no ask and
+            // is visible here only.
+            "binding_gap_lapses": binding_gap_lapses,
             "slot_health": crate::mcp::device_jwt_refresher::tenant_slot_health()
                 .map(|h| serde_json::json!({
                     "observed_at_unix": h.observed_at_unix,
@@ -26094,7 +26169,9 @@ mod spawn_tenant_credential_tests {
                 .code,
             TENANT_REPO_UNSETTLED_CODE
         );
-        tokio::runtime::Runtime::new()
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
             .unwrap()
             .block_on(establish_session_expectation(&a_nonce));
         let a_tenant = session_tenant_or_refuse(Some(&a_nonce)).unwrap();
@@ -26258,7 +26335,7 @@ mod spawn_tenant_credential_tests {
             .credential
             .reason
             .as_deref()
-            .is_some_and(|r| r.starts_with("tenant_unresolvable:")));
+            .is_some_and(|r| r.starts_with("COORD_MCP_PROXY_TENANT_UNRESOLVABLE:")));
     }
 
     /// B1 (review). A second spawn for ANOTHER tenant into an existing

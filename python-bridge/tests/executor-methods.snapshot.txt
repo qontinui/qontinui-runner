@@ -19,8 +19,6 @@ _cmd_test_results_status
 _cmd_update_capture_settings
 _emit_event_wrapper
 _fetch_contexts_content
-_fetch_ui_bridge_element_captures
-_fetch_ui_bridge_snapshot
 _get_accessibility_capture_service
 _get_ai_builder_generator_service
 _get_ai_shell_command_generator_service
@@ -87,8 +85,6 @@ _handle_get_ui_bridge_exploration_status
 _handle_get_uitars_extraction_results
 _handle_get_uitars_extraction_status
 _handle_gui_config_build
-_handle_gui_config_capture_elements
-_handle_gui_config_capture_multi_state
 _handle_list_browser_targets
 _handle_load_state_machine
 _handle_models_delete
@@ -147,7 +143,6 @@ _handle_verify_elements
 _initialize_unified_data_services
 _map_transitions_to_states
 _normalize_sm_config
-_perform_ui_bridge_action
 _process_click_capture_internal
 _run_workflow
 _send_candidates_to_web

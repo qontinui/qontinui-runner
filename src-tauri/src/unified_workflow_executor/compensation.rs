@@ -768,20 +768,11 @@ pub async fn execute_worktree_remove(
 pub async fn execute_process_kill(pid: u32) -> Result<(), String> {
     #[cfg(windows)]
     {
-        let output = crate::process_helpers::tokio_no_window("taskkill")
-            .args(["/F", "/T", "/PID", &pid.to_string()])
-            .output()
+        // In-process tree kill: no `taskkill` is spawned to do it.
+        crate::tree_kill::kill_tree_by_pid_async(pid, std::time::Duration::from_secs(10))
             .await
-            .map_err(|e| format!("taskkill failed: {}", e))?;
-
-        if output.status.success() {
-            Ok(())
-        } else {
-            Err(format!(
-                "taskkill failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            ))
-        }
+            .map(drop)
+            .map_err(|e| format!("tree kill failed: {e}"))
     }
 
     #[cfg(unix)]

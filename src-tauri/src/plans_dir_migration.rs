@@ -521,7 +521,7 @@ mod tests {
     #[test]
     fn a_rooted_subject_persists_its_plans_dir_into_its_own_config() {
         let amb = crate::test_env::isolated_ambient();
-        let (root, _restore) = crate::instance::enter_rooted_subject_for_test(&amb);
+        let root = crate::instance::enter_rooted_subject_for_test(&amb);
         let plans = amb.dir().join("plans");
         std::env::remove_var(RUNNER_CONTEXT_ENV);
         std::env::remove_var(PLAN_ADAPTER_DIR_ENV);

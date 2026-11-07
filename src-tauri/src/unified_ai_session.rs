@@ -378,7 +378,7 @@ Create event-driven triggers that automatically run workflows:
 
 ```bash
 # Create a file-watch trigger (runs workflow when files change)
-curl -s -X POST http://localhost:9876/triggers \
+curl -s -X POST http://127.0.0.1:9876/triggers \
   -H "Content-Type: application/json" \
   -d '{"name":"On src change","trigger_config":{"type":"file_watch","paths":["/path/to/src"],"patterns":["*.ts","*.rs"],"ignore_patterns":["node_modules/**"],"recursive":true},"workflow_id":"WORKFLOW_UUID"}'
 ```
@@ -387,11 +387,11 @@ Trigger types: webhook, file_watch, workflow_chain, git_event, health_check, sch
 
 ```bash
 # List triggers
-curl -s http://localhost:9876/triggers
+curl -s http://127.0.0.1:9876/triggers
 # Test a trigger (dry run)
-curl -s -X POST http://localhost:9876/triggers/TRIGGER_ID/test
+curl -s -X POST http://127.0.0.1:9876/triggers/TRIGGER_ID/test
 # Delete a trigger
-curl -s -X DELETE http://localhost:9876/triggers/TRIGGER_ID
+curl -s -X DELETE http://127.0.0.1:9876/triggers/TRIGGER_ID
 ```
 "##
 }
@@ -409,14 +409,14 @@ Use canvas panels to show structured data visually in the user's dashboard inste
 
 **Create or update** (POST — reuse panel_id to update in-place):
 ```bash
-curl -s -X POST http://localhost:9876/canvas/panels \
+curl -s -X POST http://127.0.0.1:9876/canvas/panels \
   -H "Content-Type: application/json" \
   -d '{"panel_id":"my-panel","component":"Table","title":"Results","data":{...}}'
 ```
 
 Optional fields: `"priority":10` (lower=first, default 50), `"size":"compact"|"normal"|"large"`, `"group":"Analysis"` (section header).
 
-**Delete:** `curl -s -X DELETE http://localhost:9876/canvas/panels/my-panel`
+**Delete:** `curl -s -X DELETE http://127.0.0.1:9876/canvas/panels/my-panel`
 
 ### Component Schemas
 
@@ -454,7 +454,7 @@ When the target app is connected via UI Bridge SDK, these endpoints provide runt
 ### Quick Health Check
 
 ```bash
-curl http://localhost:9876/ui-bridge/sdk/console/health
+curl http://127.0.0.1:9876/ui-bridge/sdk/console/health
 ```
 Returns a health score (0-100), status (healthy/degraded/broken), error breakdown by severity, and top issue. **Start here** to see if the app has problems.
 
@@ -463,15 +463,15 @@ Returns a health score (0-100), status (healthy/degraded/broken), error breakdow
 ```bash
 # Recent browser console events
 # Query params: severity (crash|error|warning|noise), deduplicate (bool), since (timestamp), limit (number)
-curl "http://localhost:9876/ui-bridge/sdk/console/browser-events?severity=error&deduplicate=true"
+curl "http://127.0.0.1:9876/ui-bridge/sdk/console/browser-events?severity=error&deduplicate=true"
 
 # Interleaved action+error timeline
 # Query params: since, limit, minSeverity
-curl "http://localhost:9876/ui-bridge/sdk/console/timeline?limit=20"
+curl "http://127.0.0.1:9876/ui-bridge/sdk/console/timeline?limit=20"
 
 # Network request chains with error correlation
 # Query params: failuresOnly (bool), limit, url (pattern)
-curl "http://localhost:9876/ui-bridge/sdk/console/network-chains?failuresOnly=true"
+curl "http://127.0.0.1:9876/ui-bridge/sdk/console/network-chains?failuresOnly=true"
 ```
 
 ### Error Sessions (Track Errors Around an Action)
@@ -480,16 +480,16 @@ Wrap an action with start/end to capture only the errors it produces:
 
 ```bash
 # 1. Start tracking before performing an action
-curl -X POST http://localhost:9876/ui-bridge/sdk/console/error-sessions/start \
+curl -X POST http://127.0.0.1:9876/ui-bridge/sdk/console/error-sessions/start \
   -H "Content-Type: application/json" -d '{"label":"my-action"}'
 
 # 2. ... perform the action (make code changes, click buttons, etc.) ...
 
 # 3. End session — returns summary of errors captured during the session
-curl -X POST http://localhost:9876/ui-bridge/sdk/console/error-sessions/end
+curl -X POST http://127.0.0.1:9876/ui-bridge/sdk/console/error-sessions/end
 
 # List all session summaries
-curl http://localhost:9876/ui-bridge/sdk/console/error-sessions
+curl http://127.0.0.1:9876/ui-bridge/sdk/console/error-sessions
 ```
 
 ### Error Baselines (Detect Regressions)
@@ -498,13 +498,13 @@ Capture a snapshot of current errors before making changes, then compare after t
 
 ```bash
 # 1. Capture baseline before making changes
-curl -X POST http://localhost:9876/ui-bridge/sdk/console/error-baselines/capture \
+curl -X POST http://127.0.0.1:9876/ui-bridge/sdk/console/error-baselines/capture \
   -H "Content-Type: application/json" -d '{"label":"before-fix"}'
 
 # 2. ... make code changes ...
 
 # 3. Compare current state against baseline — returns new errors (regressions) and fixed errors
-curl -X POST http://localhost:9876/ui-bridge/sdk/console/error-baselines/compare \
+curl -X POST http://127.0.0.1:9876/ui-bridge/sdk/console/error-baselines/compare \
   -H "Content-Type: application/json" -d '{"label":"before-fix"}'
 ```
 

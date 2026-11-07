@@ -70,41 +70,41 @@ describe("pickLayout — smallest uniform preset that fits N tabs (cap full-grid
 
 describe("computeAutoGrowLayoutId — grow-only, capacity-gated", () => {
   it("grows single → split when a 2nd tab arrives", () => {
-    expect(computeAutoGrowLayoutId("single", 2)).toBe("split");
+    expect(computeAutoGrowLayoutId("single", 2, "grid")).toBe("split");
   });
 
   it("grows single → full-grid when 9 tabs arrive at once (reconnect ingest)", () => {
-    expect(computeAutoGrowLayoutId("single", 9)).toBe("full-grid");
+    expect(computeAutoGrowLayoutId("single", 9, "grid")).toBe("full-grid");
   });
 
   it("returns null when the current layout already fits (no thrash)", () => {
-    expect(computeAutoGrowLayoutId("quad", 4)).toBeNull();
-    expect(computeAutoGrowLayoutId("quad", 3)).toBeNull();
+    expect(computeAutoGrowLayoutId("quad", 4, "grid")).toBeNull();
+    expect(computeAutoGrowLayoutId("quad", 3, "grid")).toBeNull();
   });
 
   it("NEVER shrinks: more zones than tabs → null", () => {
-    expect(computeAutoGrowLayoutId("full-grid", 2)).toBeNull();
-    expect(computeAutoGrowLayoutId("six-pack", 1)).toBeNull();
+    expect(computeAutoGrowLayoutId("full-grid", 2, "grid")).toBeNull();
+    expect(computeAutoGrowLayoutId("six-pack", 1, "grid")).toBeNull();
   });
 
   it("grows full-grid → flow-grid at the 10th tab (past-9 has no fixed ceiling now)", () => {
-    expect(computeAutoGrowLayoutId("full-grid", 10)).toBe(FLOW_GRID_ID);
-    expect(computeAutoGrowLayoutId("full-grid", 50)).toBe(FLOW_GRID_ID);
+    expect(computeAutoGrowLayoutId("full-grid", 10, "grid")).toBe(FLOW_GRID_ID);
+    expect(computeAutoGrowLayoutId("full-grid", 50, "grid")).toBe(FLOW_GRID_ID);
   });
 
   it("stays put once IN flow-grid (self-sizing to tabCount, no thrash)", () => {
-    expect(computeAutoGrowLayoutId(FLOW_GRID_ID, 10)).toBeNull();
-    expect(computeAutoGrowLayoutId(FLOW_GRID_ID, 11)).toBeNull();
-    expect(computeAutoGrowLayoutId(FLOW_GRID_ID, 100)).toBeNull();
+    expect(computeAutoGrowLayoutId(FLOW_GRID_ID, 10, "grid")).toBeNull();
+    expect(computeAutoGrowLayoutId(FLOW_GRID_ID, 11, "grid")).toBeNull();
+    expect(computeAutoGrowLayoutId(FLOW_GRID_ID, 100, "grid")).toBeNull();
     // Even when tabs close, flow-grid re-sizes in place (same id) — no shrink target.
-    expect(computeAutoGrowLayoutId(FLOW_GRID_ID, 3)).toBeNull();
+    expect(computeAutoGrowLayoutId(FLOW_GRID_ID, 3, "grid")).toBeNull();
   });
 
   it("has NO pin escape hatch: overflow always grows, even from an explicit layout", () => {
     // The removed `pinned` latch let these return null, hiding live
     // gate-continuation sessions behind a small layout. Overflow must grow.
-    expect(computeAutoGrowLayoutId("single", 9)).toBe("full-grid");
-    expect(computeAutoGrowLayoutId("split", 6)).toBe("six-pack");
+    expect(computeAutoGrowLayoutId("single", 9, "grid")).toBe("full-grid");
+    expect(computeAutoGrowLayoutId("split", 6, "grid")).toBe("six-pack");
   });
 
   it("only grows to a STRICTLY larger preset (asymmetric presets never shrink zones)", () => {
@@ -117,7 +117,7 @@ describe("computeAutoGrowLayoutId — grow-only, capacity-gated", () => {
       ["six-pack", 9],
     ];
     for (const [current, count] of cases) {
-      const target = computeAutoGrowLayoutId(current, count);
+      const target = computeAutoGrowLayoutId(current, count, "grid");
       expect(target).not.toBeNull();
       const cur = LAYOUT_PRESETS.find((l) => l.id === current)!;
       const tgt = LAYOUT_PRESETS.find((l) => l.id === target!)!;

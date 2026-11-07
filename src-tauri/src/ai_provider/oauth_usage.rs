@@ -141,6 +141,12 @@ fn snapshot_from_wire(wire: WireUsage) -> OauthUsageSnapshot {
 /// (`sk-ant-oat*`); API keys have no usage windows, so callers should skip
 /// straight to the probe for those.
 pub async fn fetch(token: &str) -> Result<OauthUsageSnapshot, String> {
+    // A subscription-only endpoint: never called while a model gateway is
+    // declared (subscription accounts are off, `crate::model_gateway`), and
+    // never routed to the gateway, which would hand it a subscription token.
+    if crate::model_gateway::gateway_declared() {
+        return Err(crate::model_gateway::SUBSCRIPTION_OFF_REASON.to_string());
+    }
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(20))
         .build()

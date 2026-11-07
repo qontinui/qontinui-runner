@@ -126,7 +126,7 @@ describe("pipeline model — CommandBar has not drifted from pipeline.testkit.ts
       "CommandBar.tsx composes its own status line again. The ok/noop/error " +
         "split must come from verdict.ts::renderCommandStatus, or the corpus " +
         "harness is characterizing a model of it instead of the real thing.",
-    ).toContain("setStatus(renderCommandStatus(action.slash, result.value))");
+    ).toContain("paint(renderCommandStatus(action.slash, result.value))");
     expect(exec).not.toContain('report.affected === 0 ? "noop" : "ok"');
   });
 

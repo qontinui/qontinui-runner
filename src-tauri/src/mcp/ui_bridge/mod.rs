@@ -12,6 +12,7 @@
 //! shared `ipc_handler_*` macro definitions, and a small drift-test
 //! module. All per-endpoint handlers live in their family submodules.
 
+pub mod action_vocabulary;
 pub mod ai;
 pub mod ai_analyze;
 pub mod analytics;
@@ -34,6 +35,7 @@ pub mod history;
 pub mod intents;
 pub mod intents_registry;
 pub mod keyboard;
+pub mod media_override;
 pub mod misc;
 pub mod network;
 pub mod page;
@@ -49,9 +51,11 @@ pub mod state_machine;
 pub mod stubs;
 pub mod tauri_audit;
 pub mod terminals;
+pub mod text_visibility;
 pub mod toasts;
 pub mod types;
 pub mod vision_ai;
+pub mod vision_capture_access;
 pub mod vision_frame_source;
 pub mod vision_routes;
 pub mod window_probe;
@@ -317,7 +321,7 @@ pub(crate) use ipc_handler_post_bumps_mutation;
 
 // Per-family submodules host the rest of the macro-generated handlers:
 //   - state_machine.rs   (states/, state/, state-groups/, transitions/)
-//   - ai_analyze.rs      (ai/analyze/*, ai/semantic-search, ai/diff, media-compare, image-diff)
+//   - ai_analyze.rs      (ai/analyze/*, ai/semantic-search, ai/diff, image-diff)
 //   - design_eval.rs     (control/design/evaluate/*)
 //   - intents_registry.rs (control/intents/*)
 //   - misc.rs            (undo/redo, specs, component-state, scroll,
@@ -364,6 +368,7 @@ pub(super) fn route_manifest() -> &'static [(&'static str, &'static str)] {
         all.extend_from_slice(intents::route_entries());
         all.extend_from_slice(intents_registry::route_entries());
         all.extend_from_slice(keyboard::route_entries());
+        all.extend_from_slice(media_override::route_entries());
         all.extend_from_slice(misc::route_entries());
         all.extend_from_slice(network::route_entries());
         all.extend_from_slice(page::route_entries());
@@ -374,6 +379,7 @@ pub(super) fn route_manifest() -> &'static [(&'static str, &'static str)] {
         all.extend_from_slice(stubs::route_entries());
         all.extend_from_slice(tauri_audit::route_entries());
         all.extend_from_slice(terminals::route_entries());
+        all.extend_from_slice(text_visibility::route_entries());
         all.extend_from_slice(toasts::route_entries());
         all.extend_from_slice(vision_routes::route_entries());
         all
@@ -447,6 +453,7 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .merge(intents::routes())
         .merge(intents_registry::routes())
         .merge(keyboard::routes())
+        .merge(media_override::routes())
         .merge(misc::routes())
         .merge(network::routes())
         .merge(page::routes())
@@ -457,6 +464,7 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .merge(stubs::routes())
         .merge(tauri_audit::routes())
         .merge(terminals::routes())
+        .merge(text_visibility::routes())
         .merge(toasts::routes())
         .merge(vision_routes::routes())
         // Tier 2.1 — safelisted Tauri command proxy
@@ -486,6 +494,48 @@ mod manifest_drift_tests {
     use super::route_manifest;
     use std::collections::HashSet;
     use std::path::PathBuf;
+
+    /// Every family module that defines `routes()` is MOUNTED here, not only
+    /// listed. [`manifest_matches_route_calls`] scans `.route(...)` text across
+    /// every file, so a family whose routes were written and listed in
+    /// `route_manifest()` but never `.merge`d into [`routes`] passed it — and
+    /// the SDK parity test, which reads the manifest, passed too — while every
+    /// request 404'd. axum cannot list a router's routes, so this pins the
+    /// composition by source: each `<family>.rs` with `pub fn routes()` must
+    /// be `.merge(<family>::routes())`d AND contribute `<family>::route_entries()`.
+    #[test]
+    fn every_family_router_is_merged_and_listed() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/mcp/ui_bridge");
+        let mod_rs = std::fs::read_to_string(dir.join("mod.rs")).expect("read mod.rs");
+        let mut families = Vec::new();
+        for entry in std::fs::read_dir(&dir).expect("read_dir").flatten() {
+            let path = entry.path();
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if stem == "mod" || path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).expect("read family");
+            if src.contains("\npub fn routes()") {
+                families.push(stem.to_string());
+            }
+        }
+        assert!(
+            families.len() > 20,
+            "found only {families:?}: the scan is broken"
+        );
+        let mut problems = Vec::new();
+        for f in &families {
+            if !mod_rs.contains(&format!(".merge({f}::routes())")) {
+                problems.push(format!("{f}::routes() is never merged into routes()"));
+            }
+            if !mod_rs.contains(&format!("extend_from_slice({f}::route_entries())")) {
+                problems.push(format!("{f}::route_entries() is not in route_manifest()"));
+            }
+        }
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
+    }
 
     /// Verify `route_manifest()` matches the actual `.route(...)` calls in
     /// this file. Catches the common drift bug where someone adds a new
@@ -855,7 +905,6 @@ mod manifest_drift_tests {
             ("POST", "/ui-bridge/ai/expect"),
             ("POST", "/ui-bridge/ai/fill-form"),
             ("POST", "/ui-bridge/ai/image-diff"),
-            ("POST", "/ui-bridge/ai/media/audit/{}"),
             // page-summary is a runner-only `/ai/*` read extension (not in the
             // SDK contract). It accepts GET as well as POST so verification
             // drivers can read it with GET without tripping the auto-405 →
@@ -912,7 +961,6 @@ mod manifest_drift_tests {
             ("POST", "/ui-bridge/control/action-plan"),
             ("POST", "/ui-bridge/control/activate-tab/{}"),
             ("POST", "/ui-bridge/control/annotations"),
-            ("POST", "/ui-bridge/control/capture-element-images"),
             ("POST", "/ui-bridge/control/clear-storage"),
             ("POST", "/ui-bridge/control/design/evaluate"),
             ("POST", "/ui-bridge/control/design/evaluate/baseline"),
@@ -988,12 +1036,6 @@ mod manifest_drift_tests {
             ("GET", "/ui-bridge/ai/analyze/data"),
             ("GET", "/ui-bridge/ai/analyze/regions"),
             ("GET", "/ui-bridge/ai/analyze/structured-data"),
-            // Media audit named subpaths — runner exposes the parameterised
-            // /ai/media/audit/{audit_type} form which routes via Path<String>.
-            // SDK declares concrete subpaths; aliasing them would require
-            // wrapper handlers that hardcode the audit-type string.
-            ("POST", "/ui-bridge/ai/media/audit/accessibility"),
-            ("POST", "/ui-bridge/ai/media/audit/performance"),
             // Spawn-headless — deferred (Bucket C7 of the 2026-05-07 plan).
             // Real subsystem (CLI subprocess orchestration), not a handler;
             // tracked separately.

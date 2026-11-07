@@ -238,3 +238,43 @@ describe("getTerminalHotStore — per-page scoping", () => {
     expect(getTerminalHotStore("page-a").getTabSlice("t1").lastOutputLines).toEqual(["from a"]);
   });
 });
+
+describe("TerminalHotStore — total output bytes", () => {
+  it("is undefined (unknown) until a total is noted, then served on the slice", () => {
+    const store = new TerminalHotStore();
+    expect(store.getTabSlice("a").totalBytes).toBeUndefined();
+    store.noteTabTotalBytes("a", 376_950);
+    expect(store.getTabSlice("a").totalBytes).toBe(376_950);
+    expect(store.getTabSlice("b").totalBytes).toBeUndefined();
+  });
+
+  it("only grows: a lagging or replayed reading never moves it back", () => {
+    const store = new TerminalHotStore();
+    let notified = 0;
+    store.subscribeTab("a", () => notified++);
+    store.noteTabTotalBytes("a", 1000);
+    store.noteTabTotalBytes("a", 900);
+    store.noteTabTotalBytes("a", 1000);
+    expect(store.getTabSlice("a").totalBytes).toBe(1000);
+    expect(notified).toBe(1);
+    store.noteTabTotalBytes("a", 1500);
+    expect(store.getTabSlice("a").totalBytes).toBe(1500);
+    expect(notified).toBe(2);
+  });
+
+  it("ignores a non-finite or negative reading", () => {
+    const store = new TerminalHotStore();
+    store.noteTabTotalBytes("a", Number.NaN);
+    store.noteTabTotalBytes("a", -1);
+    expect(store.getTabSlice("a").totalBytes).toBeUndefined();
+  });
+
+  it("is dropped with the tab", () => {
+    const store = new TerminalHotStore();
+    store.noteTabTotalBytes("dead", 10);
+    store.noteTabTotalBytes("alive", 20);
+    store.retainTabs(new Set(["alive"]));
+    expect(store.getField("totalBytes")).toEqual({ alive: 20 });
+  });
+});
+

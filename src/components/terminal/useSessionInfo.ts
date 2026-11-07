@@ -179,9 +179,84 @@ export interface TenancyRepoExpected {
   verdictAt: string | null;
 }
 
+/** One leg's tenant, in a `mismatch` display. */
+export interface TenantConflict {
+  /** `credential` | `data_plane` | `row_stamp` | `spawn_device_default` |
+   * `repo_expected` | `coord_row`. */
+  leg: string;
+  tenantId: string;
+}
+
+/**
+ * The runner's ONE derived answer to "which tenant is this session?" —
+ * `tenancy.display`, computed in Rust (`commands/session_tenant_display.rs`)
+ * so the dropdown row, the zone badge and the UI-Bridge oracle render one fact
+ * instead of three re-derivations (plan
+ * `2026-10-17-session-info-tenant-row-renders-unknown-for-a-resolved-tenant`).
+ * Spellings mirror the Rust struct; the contract fixture
+ * `__fixtures__/session-tenancy-display.json` pins both sides.
+ */
+export interface TenantDisplay {
+  /** `resolved` | `mismatch` | `stamp_only` (only the spawn stamp names one) |
+   * `unknown` (with `reason`). */
+  status: "resolved" | "mismatch" | "stamp_only" | "unknown";
+  /** The acting tenant the precedence picked; `null` when `unknown`, and in a
+   * `mismatch` where no leg could be picked as the acting one. */
+  tenantId: string | null;
+  /** Coord's own slug, only from an answer that tenant gave this session. */
+  tenantSlug: string | null;
+  /** `credential` | `credential_default_slot` | `data_plane` |
+   * `data_plane_device` | `row_stamp`. */
+  source: string | null;
+  /** Why the acting tenant is not (fully) established: set when no tenant was
+   * picked (`unknown`, or a `mismatch` with no acting tenant), for
+   * `stamp_only`, and — as the credential's reason — for a data-plane source
+   * while the credential is unknown. */
+  reason: string | null;
+  conflicts: TenantConflict[];
+  conflictDetail: string | null;
+  bound: {
+    /** `measured` | `unknown` — an unknown set is never an empty one. */
+    status: "measured" | "unknown";
+    tenantIds: string[];
+    reason: string | null;
+  };
+  /** `null` — never `false` — when the bound set is unknown. */
+  multiBound: boolean | null;
+  /** Whether `tenantId` is one of the bound tenants; `null` when unknowable. */
+  actingInBoundSet: boolean | null;
+}
+
+/** The fifth leg: the tenant coord's own session row was created under, as
+ * this runner process registered it or as coord's resume-probe answer named
+ * it. */
+export interface TenancyCoordRow {
+  /** `registered` (the row's tenant is known — see `source`) | `unknown`
+   * (with `reason`) | `not_applicable` (the session's coord row IS the hosting
+   * terminal's own `SessionRegistry` row, decided by coord id — whether reached
+   * through the pinned terminal or a registrar entry auto-bind adopted — and
+   * the `dataPlane` leg names the row's own tenant: the one this runner
+   * authored the row's create body with, or the one coord's answer to a
+   * resume probe named: never a warning, never blocks agreement). */
+  status: string;
+  tenantId: string | null;
+  /** When registered: `registrar` (this runner minted the row) |
+   * `resume_probe` (the hosting terminal's resumed row, whose tenant coord's
+   * resume-probe answer named and the `dataPlane` leg does not show). */
+  source: string | null;
+  /** unknown: `not_registered_by_this_process` | `registered_without_tenant` |
+   * `adopted_row_tenant_not_observed` | `terminal_row_not_wired` |
+   * `terminal_row_tenant_unresolved` | `terminal_row_resume_unconfirmed` |
+   * `registrar_state_poisoned` |
+   * `row_of_another_terminal` | `registrar_unavailable`;
+   * not_applicable: `terminal_plane_row_is_the_data_plane_leg`. */
+  reason: string | null;
+}
+
 export interface SessionTenancy {
-  /** `tenantId: null` ⇒ the spawn chose none (coord's row holds the device
-   * default) — NOT "no tenant". */
+  /** `tenantId: null` ⇒ the spawn chose none — NOT "no tenant". Coord's row
+   * then holds what the registrar sent: the machine pin, else the paired
+   * default binding (read {@link coordRow} for the value it recorded). */
   row: {
     tenantId: string | null;
     /** The machine's default tenant as read when this session was SPAWNED —
@@ -227,6 +302,11 @@ export interface SessionTenancy {
    * `2026-09-20-a-sessions-tenant-follows-its-repo-and-every-coord-answer-names-its-tenant`
    * Phase 2). `null` when the runner predates the leg — UNKNOWN, not agreement. */
   repoExpected: TenancyRepoExpected | null;
+  /** The fifth leg — `null` when the runner predates it (UNKNOWN). */
+  coordRow: TenancyCoordRow | null;
+  /** The display projection — `null` when the runner predates it, which the
+   * Tenant row renders as `unknown — runner predates tenancy.display`. */
+  display: TenantDisplay | null;
   /** The tenants that ARE known name more than one tenant. `false` is NOT
    * agreement — read {@link divergence}. */
   diverged: boolean;
@@ -273,6 +353,7 @@ export type SessionInfoField =
   | "claude-session-id"
   | "fleet-handle"
   | "tenant"
+  | "spawn-stamp"
   | "task-run"
   | "working-dir"
   | "recorded-page"
@@ -636,6 +717,9 @@ export interface InfoRowSpec {
   display: string;
   /** Ids get a copy button. */
   copyable: boolean;
+  /** The full text behind a truncated `display` (hover / accessible name);
+   * `undefined` ⇒ the display itself. */
+  title?: string;
 }
 
 /**
@@ -665,8 +749,149 @@ export function formatEpochMs(ms: number | null): string | null {
   return `${new Date(ms).toISOString().slice(0, 19).replace("T", " ")}Z`;
 }
 
+/** A uuid's discriminating stem. */
+function shortId(id: string): string {
+  return id.length > 8 ? id.slice(0, 8) : id;
+}
+
+/** How each display source reads after the tenant. */
+const DISPLAY_SOURCE_TEXT: Record<string, string> = {
+  credential: "via credential",
+  credential_default_slot: "via default-slot credential (device default binding)",
+  data_plane: "via runner data plane",
+  data_plane_device: "via runner data plane (device default binding)",
+  row_stamp: "spawn stamp only — acting tenant not observed",
+};
+
+/** Display sources that do NOT come from the credential — a `reason` beside
+ * one of these is the credential's own unknown reason. */
+export const DATA_PLANE_SOURCES: ReadonlySet<string> = new Set(["data_plane", "data_plane_device"]);
+
+/** The Tenant row's text when the runner sends no display. */
+export const TENANT_DISPLAY_ABSENT_TEXT = "unknown — runner predates tenancy.display";
+
+/** The bound-set suffix: `· 1 of 4 bound`, withheld on a single binding, and
+ * an explicit unknown rather than silence when the set could not be read. */
+function boundSuffix(d: TenantDisplay): string {
+  if (d.bound.status !== "measured") {
+    return ` · bound set unknown — ${d.bound.reason ?? "no reason given"}`;
+  }
+  if (d.multiBound !== true) return "";
+  const n = d.bound.tenantIds.length;
+  return d.actingInBoundSet === false ? ` · not among ${n} bound` : ` · 1 of ${n} bound`;
+}
+
+/** How a `registered` coord row's tenant became known, in words. Pure. */
+export function coordRowSourceText(source: string | null): string {
+  if (source === "resume_probe") return "as coord answered this runner's resume probe";
+  if (source === "registrar") return "as registered by this runner";
+  // An unrecognised or absent source is shown as such, never given a provenance.
+  return `source ${source ?? "unstated"}`;
+}
+
+/** The Tenant row's hover text: the full acting id, the full bound set, every
+ * conflict and coord's own row. */
+function tenantRowTitle(d: TenantDisplay, coordRow: TenancyCoordRow | null): string {
+  const lines: string[] = [];
+  lines.push(
+    d.tenantId
+      ? `Acting tenant: ${d.tenantId}${d.tenantSlug ? ` (${d.tenantSlug})` : ""} — source ${d.source ?? "?"}`
+      : `Acting tenant: unknown — ${d.reason ?? "no reason given"}`,
+  );
+  if (d.status === "stamp_only") {
+    lines.push(
+      `Only the spawn stamp names it; the acting tenant is unknown (${d.reason ?? "no reason given"}).`,
+    );
+  }
+  if (d.tenantId && DATA_PLANE_SOURCES.has(d.source ?? "") && d.reason) {
+    lines.push(`Credential: unknown — ${d.reason}`);
+  }
+  for (const c of d.conflicts) lines.push(`Conflict — ${c.leg}: ${c.tenantId}`);
+  if (d.conflictDetail) lines.push(`Detail: ${d.conflictDetail}`);
+  lines.push(
+    d.bound.status === "measured"
+      ? `Bound tenants (${d.bound.tenantIds.length}): ${d.bound.tenantIds.join(", ") || "none"}`
+      : `Bound tenants: unknown — ${d.bound.reason ?? "no reason given"}`,
+  );
+  lines.push(
+    !coordRow
+      ? "Coord session row: unknown — runner predates the leg"
+      : coordRow.status === "registered"
+        ? `Coord session row: ${coordRow.tenantId ?? "?"} (${coordRowSourceText(coordRow.source)})`
+        : coordRow.status === "not_applicable"
+          ? "Coord session row: terminal-hosted — its tenant is the data-plane leg above"
+          : `Coord session row: unknown — ${coordRow.reason ?? "no reason given"}`,
+  );
+  return lines.join("\n");
+}
+
 /**
- * The panel's labelled rows, one per D1 field group, ALWAYS all seventeen —
+ * The Tenant row, fed ONLY by `tenancy.display` — the old rendering read the
+ * spawn stamp (`identity.tenantId`) and so said `unknown` for every session
+ * whose spawn chose no tenant, however resolved its credential was. Pure.
+ */
+export function tenantRow(
+  tenancy: SessionTenancy | null,
+): Pick<InfoRowSpec, "value" | "display" | "title"> {
+  const d = tenancy?.display ?? null;
+  if (!d) return { value: null, display: TENANT_DISPLAY_ABSENT_TEXT };
+  const title = tenantRowTitle(d, tenancy?.coordRow ?? null);
+  // Checked BEFORE the no-tenant fallback: a mismatch with no acting tenant is
+  // still a mismatch, and its conflict groups are the point.
+  if (d.status === "mismatch") {
+    // Grouped by tenant, so two legs that AGREE are not printed as unequal.
+    const byTenant = new Map<string, string[]>();
+    for (const c of d.conflicts) {
+      const key = c.tenantId.toLowerCase();
+      byTenant.set(key, [...(byTenant.get(key) ?? []), c.leg]);
+    }
+    const groups = [...byTenant].map(([t, legs]) => `${shortId(t)} (${legs.join(", ")})`);
+    const text = groups.length > 0 ? groups.join(" ≠ ") : "(no leg listed)";
+    // A verdict-only mismatch (every leg names one tenant; coord answered from
+    // another) is explained by the detail, so it is shown inline too.
+    const detail = d.conflictDetail ? ` — ${d.conflictDetail}` : "";
+    const acting = d.tenantId ? "" : ` — acting tenant unknown — ${d.reason ?? "no reason given"}`;
+    return { value: d.tenantId, display: `MISMATCH ${text}${detail}${acting}`, title };
+  }
+  if (d.status === "unknown" || !d.tenantId) {
+    return { value: null, display: `unknown — ${d.reason ?? "no reason given"}`, title };
+  }
+  const id = shortId(d.tenantId);
+  const name = d.tenantSlug ? `${d.tenantSlug} (${id})` : id;
+  const via = DISPLAY_SOURCE_TEXT[d.source ?? ""] ?? `via ${d.source ?? "?"}`;
+  // A data-plane answer beside an UNREADABLE credential says so, rather than
+  // reading as if the credential agreed.
+  const credential =
+    DATA_PLANE_SOURCES.has(d.source ?? "") && d.reason ? ` · credential unknown — ${d.reason}` : "";
+  return {
+    value: d.tenantId,
+    display: `${name} · ${via}${credential}${boundSuffix(d)}`,
+    title,
+  };
+}
+
+/**
+ * The `Spawned for` row: the tenant the spawn STAMPED, labelled as a stamp.
+ * A spawn that chose none names the device default it was spawned under — a
+ * hypothesis about coord's row, never "the tenant". Pure.
+ */
+export function spawnStampRow(
+  tenancy: SessionTenancy | null,
+): Pick<InfoRowSpec, "value" | "display"> {
+  if (!tenancy) return { value: null, display: UNKNOWN_TEXT };
+  const stamp = tenancy.row.tenantId;
+  if (stamp) return { value: stamp, display: stamp };
+  return {
+    value: null,
+    display:
+      tenancy.row.spawnDeviceDefaultStatus === "recorded"
+        ? `none — device default at spawn: ${tenancy.row.spawnDeviceDefaultTenantId ?? "none"}`
+        : `not recorded (${tenancy.row.spawnDeviceDefaultReason ?? "no reason given"})`,
+  };
+}
+
+/**
+ * The panel's labelled rows, one per D1 field group, ALWAYS all eighteen —
  * a field with no value renders `unknown`, it does not vanish (R2). Pure —
  * unit-tested, so the UI Bridge id/field contract is checkable without a DOM.
  */
@@ -693,7 +918,7 @@ export const PROVISIONAL_NOTE =
   "runner's spawn-time prediction, not an observation.";
 
 export function sessionInfoRows(body: SessionInfoBody): InfoRowSpec[] {
-  const { identity, name, account, placement, lifecycle, prs } = body;
+  const { identity, name, account, placement, lifecycle, prs, tenancy } = body;
   // The id and account come from the spawn-time seam, which fires for every
   // terminal. Without corroboration they are a PREDICTION, and the panel must
   // not print a prediction the way it prints an observation.
@@ -738,7 +963,8 @@ export function sessionInfoRows(body: SessionInfoBody): InfoRowSpec[] {
       true,
     ),
     row("fleet-handle", "Fleet handle", identity.fleetSessionHandle, undefined, true),
-    row("tenant", "Tenant", identity.tenantId, undefined, true),
+    { field: "tenant", label: "Tenant", copyable: true, ...tenantRow(tenancy) },
+    { field: "spawn-stamp", label: "Spawned for", copyable: true, ...spawnStampRow(tenancy) },
     row("task-run", "Task run", identity.taskRunId, undefined, true),
     row("working-dir", "Working dir", placement.workingDir, undefined, true),
     // The two placement fields the projection has always returned and nothing
@@ -883,6 +1109,8 @@ export function normalizeTenancy(raw: unknown): SessionTenancy | null {
       posture?: { status?: unknown; value?: unknown; canAnswer?: unknown; reason?: unknown };
     };
     repoExpected?: Record<string, unknown> | null;
+    coordRow?: unknown;
+    display?: unknown;
     diverged?: unknown;
     divergence?: unknown;
   };
@@ -936,8 +1164,75 @@ export function normalizeTenancy(raw: unknown): SessionTenancy | null {
       },
     },
     repoExpected: normalizeRepoExpected(v.repoExpected),
+    coordRow: normalizeCoordRow(v.coordRow),
+    display: normalizeTenantDisplay(v.display),
     diverged: v.diverged,
     divergence,
+  };
+}
+
+/** The fifth tenancy leg → typed, or `null` when absent/malformed. Pure. */
+export function normalizeCoordRow(raw: unknown): TenancyCoordRow | null {
+  if (!raw || typeof raw !== "object") return null;
+  const r = raw as Record<string, unknown>;
+  const status = str(r.status);
+  if (!status) return null;
+  return { status, tenantId: str(r.tenantId), source: str(r.source), reason: str(r.reason) };
+}
+
+const DISPLAY_STATUSES = ["resolved", "mismatch", "stamp_only", "unknown"] as const;
+
+/** `tenancy.display` → typed, or `null` when absent/malformed — which the
+ * Tenant row renders as an explicit unknown, never as a tenant. Pure. */
+export function normalizeTenantDisplay(raw: unknown): TenantDisplay | null {
+  if (!raw || typeof raw !== "object") return null;
+  const r = raw as Record<string, unknown>;
+  const status = DISPLAY_STATUSES.find((s) => s === r.status);
+  if (!status) return null;
+  // A missing or malformed bound set does NOT discard the display — the acting
+  // tenant is still the runner's answer. The set alone reads `unknown`.
+  const bound: Record<string, unknown> =
+    r.bound && typeof r.bound === "object" && !Array.isArray(r.bound)
+      ? (r.bound as Record<string, unknown>)
+      : {};
+  const boundStatus = bound.status === "measured" ? "measured" : "unknown";
+  const strings = (x: unknown): string[] =>
+    Array.isArray(x) ? x.filter((t): t is string => typeof t === "string") : [];
+  return {
+    status,
+    tenantId: str(r.tenantId),
+    tenantSlug: str(r.tenantSlug),
+    source: str(r.source),
+    reason: str(r.reason),
+    conflicts: Array.isArray(r.conflicts)
+      ? r.conflicts.flatMap((c) => {
+          const leg = str((c as { leg?: unknown })?.leg);
+          const tenantId = str((c as { tenantId?: unknown })?.tenantId);
+          return leg && tenantId ? [{ leg, tenantId }] : [];
+        })
+      : [],
+    conflictDetail: str(r.conflictDetail),
+    bound: {
+      status: boundStatus,
+      tenantIds: boundStatus === "measured" ? strings(bound.tenantIds) : [],
+      // An unknown set always carries a reason: `malformed` when the block
+      // itself was not a well-formed `bound`, `reason_missing` when it said
+      // `unknown` and gave none.
+      reason:
+        str(bound.reason) ??
+        (boundStatus === "unknown"
+          ? bound.status === "unknown"
+            ? "reason_missing"
+            : "malformed"
+          : null),
+    },
+    // An unknown set never yields a confident `false`.
+    multiBound:
+      boundStatus === "measured" && typeof r.multiBound === "boolean" ? r.multiBound : null,
+    actingInBoundSet:
+      boundStatus === "measured" && typeof r.actingInBoundSet === "boolean"
+        ? r.actingInBoundSet
+        : null,
   };
 }
 

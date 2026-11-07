@@ -24,6 +24,8 @@
  * asserted without a DOM, a React tree or a UI Bridge.
  */
 
+import type { TerminalWorkMode } from "../terminalWorkMode";
+
 /** What a maximize/restore request resolves to, before anything is mutated. */
 export type MaximizePlan = { ok: true; next: number | null } | { ok: false; error: string };
 
@@ -66,8 +68,22 @@ export function parseZoneIndex(raw: unknown, zoneCount: number): MaximizePlan {
   return { ok: true, next: raw };
 }
 
+/**
+ * Maximize is a grid-mode view. tmux work mode already shows one session at
+ * full size and `useZoneLayout` ignores every maximize request there, so a
+ * maximize asked for in tmux is refused by name rather than reported as a
+ * change nothing made.
+ */
+export const MAXIMIZE_IN_TMUX_ERROR =
+  "maximize is a grid-mode view, and the page is in tmux work mode, which already shows one session at full size — switch to grid mode first (set-terminal-work-mode { mode: 'grid' })";
+
 /** `maximize-zone`: pin one zone to the whole page. */
-export function planMaximizeZone(raw: unknown, zoneCount: number): MaximizePlan {
+export function planMaximizeZone(
+  raw: unknown,
+  zoneCount: number,
+  workMode: TerminalWorkMode = "grid",
+): MaximizePlan {
+  if (workMode === "tmux") return { ok: false, error: MAXIMIZE_IN_TMUX_ERROR };
   return parseZoneIndex(raw, zoneCount);
 }
 
@@ -80,7 +96,9 @@ export function planToggleMaximizeZone(
   raw: unknown,
   zoneCount: number,
   current: number | null,
+  workMode: TerminalWorkMode = "grid",
 ): MaximizePlan {
+  if (workMode === "tmux") return { ok: false, error: MAXIMIZE_IN_TMUX_ERROR };
   const parsed = parseZoneIndex(raw, zoneCount);
   if (!parsed.ok) return parsed;
   return { ok: true, next: current === parsed.next ? null : parsed.next };

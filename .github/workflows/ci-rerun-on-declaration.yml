@@ -225,7 +225,7 @@ jobs:
     # on `main-merge-gates` and must never become one — see the "never fail the
     # PR on this" note at the bottom of each step.
     name: Re-fire required CI (sibling declaration, base retarget)
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(((vars.RUNNER_CI_LANE_CI_RERUN_ON_DECLARATION || vars.RUNNER_CI_LIGHT_LANE) == 'self-hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && '["self-hosted","Linux","X64","qontinui-host-nawa","qontinui"]' || '"ubuntu-latest"') }}
     # A cancel can take a short while to settle before a re-run is accepted;
     # everything else here is a handful of API calls. Nothing in this job
     # compiles. 20, not 15: the cancel poll alone is up to 10 min, plus the

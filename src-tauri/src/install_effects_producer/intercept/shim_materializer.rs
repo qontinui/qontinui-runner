@@ -2547,6 +2547,97 @@ mod resolve_wait_tests {
         );
     }
 
+    /// npm's placeholder `bin/claude.exe`, as the reinstall window leaves it.
+    const NPM_STUB: &str = "echo \"Error: claude native binary not installed.\" >&2\nexit 1\n";
+
+    /// The 2026-10-21 shape: npm has re-linked `bin/claude` but postinstall has
+    /// not yet replaced the placeholder stub. The shim must wait the stub out
+    /// rather than exec it.
+    ///
+    /// The swap is made by a fake `sleep` on PATH, which only the shim's wait
+    /// loop calls, so it happens strictly AFTER a scan has seen the stub and
+    /// rejected it. A timer thread could fire before the shim's first scan on a
+    /// loaded box, and the test would then pass without ever meeting the stub.
+    #[test]
+    fn identity_shim_waits_out_the_npm_placeholder_stub() {
+        if system_claude_present() {
+            return;
+        }
+        let Some(real_sleep) = ["/bin/sleep", "/usr/bin/sleep"]
+            .into_iter()
+            .find(|p| Path::new(p).exists())
+        else {
+            eprintln!("SKIP: no /bin/sleep or /usr/bin/sleep for the fake sleep to exec");
+            return;
+        };
+        let _serial = EXE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let (shim_dir, real_dir) = (tmp.path().join("shim"), tmp.path().join("real"));
+        std::fs::create_dir_all(&shim_dir).unwrap();
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let marker = tmp.path().join("ran");
+        let real = real_dir.join("claude");
+        write_exe(&real, NPM_STUB);
+        // "postinstall": the real binary, staged beside the stub and renamed
+        // over it on the wait loop's first `sleep`.
+        let staged = tmp.path().join("claude.staged");
+        write_exe(&staged, &fake_claude_body(&marker));
+        write_exe(
+            &real_dir.join("sleep"),
+            &format!(
+                "#!/bin/sh\n[ -e '{staged}' ] && mv -f '{staged}' '{real}'\nexec {real_sleep} \"$@\"\n",
+                staged = staged.display(),
+                real = real.display(),
+            ),
+        );
+        let cmd = identity_cmd(&shim_dir, &real_dir, "10");
+
+        let out = crate::process_helpers::output_with_timeout(cmd, BUDGET).unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "shim failed: {stderr}");
+        assert!(
+            !staged.exists(),
+            "the wait loop never ran, so the stub was never treated as a miss: {stderr}"
+        );
+        assert!(marker.exists(), "the real claude never ran: {stderr}");
+        assert!(
+            !stderr.contains("native binary not installed"),
+            "the stub must not have run: {stderr}"
+        );
+    }
+
+    /// A stub that outlives the wait: the give-up line names the stub instead
+    /// of saying only "not found", and the fall-through runs it.
+    #[test]
+    fn identity_shim_names_the_npm_placeholder_stub_when_it_gives_up() {
+        if system_claude_present() {
+            return;
+        }
+        let _serial = EXE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let (shim_dir, real_dir) = (tmp.path().join("shim"), tmp.path().join("real"));
+        std::fs::create_dir_all(&shim_dir).unwrap();
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let stub = real_dir.join("claude");
+        write_exe(&stub, NPM_STUB);
+        let out = crate::process_helpers::output_with_timeout(
+            identity_cmd(&shim_dir, &real_dir, "1"),
+            BUDGET,
+        )
+        .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "the stub exits 1: {stderr}");
+        assert!(
+            stderr.contains("after waiting 1s; only the npm placeholder stub is there")
+                && stderr.contains(&stub.display().to_string()),
+            "the give-up line must name the stub: {stderr}"
+        );
+        assert!(
+            stderr.contains("native binary not installed"),
+            "the fall-through runs the stub, whose own message the user sees: {stderr}"
+        );
+    }
+
     #[test]
     fn identity_shim_names_the_tool_and_path_when_it_gives_up() {
         if system_claude_present() {
@@ -2579,6 +2670,119 @@ mod resolve_wait_tests {
         assert!(
             begun.elapsed() < Duration::from_secs(15),
             "the wait must be bounded by QONTINUI_SHIM_RESOLVE_WAIT_SECS"
+        );
+    }
+
+    /// The argv the real tool receives when the shim is launched with `args`
+    /// and the pin set, and with the settings and mcp-config env when `hook_env`.
+    fn identity_argv_seen_by_real_tool(args: &[&str], hook_env: bool) -> Vec<String> {
+        let _serial = EXE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let (shim_dir, real_dir) = (tmp.path().join("shim"), tmp.path().join("real"));
+        std::fs::create_dir_all(&shim_dir).unwrap();
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let seen = tmp.path().join("argv");
+        write_exe(
+            &real_dir.join("claude"),
+            &format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n", seen.display()),
+        );
+        let (settings, mcp) = (tmp.path().join("s.json"), tmp.path().join("m.json"));
+        std::fs::write(&settings, "{}").unwrap();
+        std::fs::write(&mcp, "{}").unwrap();
+        let shim = shim_dir.join("claude");
+        write_exe(&shim, &render_identity_for_test("claude", &shim_dir));
+        let mut cmd = Command::new(bash());
+        cmd.arg(&shim)
+            .args(args)
+            .env_clear()
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}:/usr/bin:/bin",
+                    shim_dir.display(),
+                    real_dir.display()
+                ),
+            )
+            .env("QONTINUI_PINNED_SESSION_ID", "pin-1");
+        if hook_env {
+            cmd.env("QONTINUI_CLAUDE_HOOK_SETTINGS", &settings)
+                .env("QONTINUI_MCP_CONFIG", &mcp);
+        }
+        let out = crate::process_helpers::output_with_timeout(cmd, BUDGET).unwrap();
+        assert!(
+            out.status.success(),
+            "shim failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        std::fs::read_to_string(&seen)
+            .unwrap()
+            .lines()
+            .map(|l| {
+                if l.ends_with("s.json") {
+                    "S".to_string()
+                } else if l.ends_with("m.json") {
+                    "M".to_string()
+                } else {
+                    l.to_string()
+                }
+            })
+            .collect()
+    }
+
+    /// Everything after a `--` is positional, so the shim's flags must land
+    /// ahead of it or they would reach the CLI as prompt words. A continuation's
+    /// argv has this shape, and it reaches the shim by bare name in a reinstall
+    /// window.
+    #[test]
+    fn identity_shim_keeps_its_flags_ahead_of_the_terminator() {
+        assert_eq!(
+            identity_argv_seen_by_real_tool(&["--verbose", "--", "the prompt", "--settings"], true),
+            [
+                "--verbose",
+                "--settings",
+                "S",
+                "--mcp-config",
+                "M",
+                "--session-id",
+                "pin-1",
+                "--",
+                "the prompt",
+                "--settings",
+            ]
+        );
+        // The user-chose branch: no pin, the same placement.
+        assert_eq!(
+            identity_argv_seen_by_real_tool(&["--session-id", "mine", "--", "the prompt"], true),
+            [
+                "--session-id",
+                "mine",
+                "--settings",
+                "S",
+                "--mcp-config",
+                "M",
+                "--",
+                "the prompt",
+            ]
+        );
+        // A session-looking prompt after `--` is not the user choosing one.
+        assert_eq!(
+            identity_argv_seen_by_real_tool(&["--", "resume"], true),
+            [
+                "--settings",
+                "S",
+                "--mcp-config",
+                "M",
+                "--session-id",
+                "pin-1",
+                "--",
+                "resume",
+            ]
+        );
+        // Every array the exec line expands is empty here. Only a bash below
+        // 4.4 can fail this one, which is the shape it guards.
+        assert_eq!(
+            identity_argv_seen_by_real_tool(&[], false),
+            ["--session-id", "pin-1"]
         );
     }
 

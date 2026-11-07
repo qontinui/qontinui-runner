@@ -127,6 +127,9 @@ const R16: &str = "window lifecycle; ends the session rather than moving within 
 const R17: &str = "viewport configuration; not a UI affordance";
 const R18: &str = "clears browser storage; not a UI affordance";
 const R19: &str = "effect prediction; acts on nothing";
+const R20: &str = "dev control: swaps an image asset in place for a capture, then is undone (DELETE / TTL); alters rendering, activates no app affordance";
+const R21: &str = "dev control: hides every glyph for a capture, then restores exactly (hidden:false / TTL); alters rendering, activates no app affordance";
+const R22: &str = "vision analysis / assertion over the page; acts on nothing. With captureTextHidden it also hides the runner webview's text for one capture and restores it (R21), activating no app affordance";
 
 /// POST routes that are not UI actions, each with the reason.
 const NOT_AN_ACTION: &[(&str, &str)] = &[
@@ -214,6 +217,7 @@ const NOT_AN_ACTION: &[(&str, &str)] = &[
     ("/ui-bridge/control/forms/snapshot", R01),
     ("/ui-bridge/control/intents", R11),
     ("/ui-bridge/control/intents/find", R11),
+    ("/ui-bridge/control/media/override", R20),
     ("/ui-bridge/control/network-requests/wait", R02),
     ("/ui-bridge/control/network/stubs", R05),
     ("/ui-bridge/control/network/verify-stub", R05),
@@ -237,6 +241,7 @@ const NOT_AN_ACTION: &[(&str, &str)] = &[
     ("/ui-bridge/control/state/{id}/activate", R07),
     ("/ui-bridge/control/state/{id}/deactivate", R07),
     ("/ui-bridge/control/states/find-path", R03),
+    ("/ui-bridge/control/text-visibility", R21),
     ("/ui-bridge/control/viewport-constraints", R17),
     ("/ui-bridge/control/visibility", R00),
     ("/ui-bridge/control/wait-for-app", R04),
@@ -298,14 +303,6 @@ const NOT_AN_ACTION: &[(&str, &str)] = &[
     ("/ui-bridge/sdk/ai/find", R03),
     ("/ui-bridge/sdk/ai/intents/find", R11),
     ("/ui-bridge/sdk/ai/intents/register", R11),
-    ("/ui-bridge/sdk/ai/media/analyze", R00),
-    ("/ui-bridge/sdk/ai/media/analyze/batch", R00),
-    ("/ui-bridge/sdk/ai/media/analyze/page", R00),
-    ("/ui-bridge/sdk/ai/media/audit/accessibility", R00),
-    ("/ui-bridge/sdk/ai/media/audit/performance", R00),
-    ("/ui-bridge/sdk/ai/media/compare", R00),
-    ("/ui-bridge/sdk/ai/media/find", R03),
-    ("/ui-bridge/sdk/ai/media/snapshot", R00),
     ("/ui-bridge/sdk/ai/scoped-diff", R01),
     ("/ui-bridge/sdk/ai/search", R03),
     ("/ui-bridge/sdk/ai/semantic-search", R03),
@@ -338,6 +335,7 @@ const NOT_AN_ACTION: &[(&str, &str)] = &[
     ("/ui-bridge/sdk/control/find", R03),
     ("/ui-bridge/sdk/control/forms/diff", R01),
     ("/ui-bridge/sdk/control/forms/snapshot", R01),
+    ("/ui-bridge/sdk/control/media/override", R20),
     ("/ui-bridge/sdk/control/network-requests/wait", R02),
     ("/ui-bridge/sdk/control/page-evaluate", R12),
     ("/ui-bridge/sdk/control/page/find-by-text", R03),
@@ -349,6 +347,7 @@ const NOT_AN_ACTION: &[(&str, &str)] = &[
     ("/ui-bridge/sdk/control/state/{id}/activate", R07),
     ("/ui-bridge/sdk/control/state/{id}/deactivate", R07),
     ("/ui-bridge/sdk/control/states/find-path", R03),
+    ("/ui-bridge/sdk/control/text-visibility", R21),
     ("/ui-bridge/sdk/control/viewport", R17),
     ("/ui-bridge/sdk/control/wait-for-element", R02),
     ("/ui-bridge/sdk/control/wait-for-element-by-condition", R02),
@@ -402,9 +401,9 @@ const NOT_AN_ACTION: &[(&str, &str)] = &[
     ("/ui-bridge/test/seed-error-scenario", R08),
     ("/ui-bridge/test/seed-lifecycle-store", R08),
     ("/ui-bridge/test/seed-terminal-scenario", R08),
-    ("/ui-bridge/vision/analyze", R00),
+    ("/ui-bridge/vision/analyze", R22),
     ("/ui-bridge/vision/annotate", R00),
-    ("/ui-bridge/vision/assert", R06),
+    ("/ui-bridge/vision/assert", R22),
     ("/ui-bridge/vision/baseline", R00),
     ("/ui-bridge/vision/capture", R00),
     ("/ui-bridge/vision/describe", R00),

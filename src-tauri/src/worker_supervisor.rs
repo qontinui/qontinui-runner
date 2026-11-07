@@ -901,7 +901,11 @@ mod tests {
         // must contain `spawn_supervised` and no bare `tokio::spawn(` /
         // `tauri::async_runtime::spawn(`.
         const SUPERVISED: &[(&str, &str, &str)] = &[
-            ("fleet.rs", "pub fn spawn_heartbeat()", "fleet.heartbeat"),
+            (
+                "fleet/heartbeat_loop.rs",
+                "pub fn spawn_heartbeat()",
+                "fleet.heartbeat",
+            ),
             (
                 "fleet.rs",
                 "pub fn spawn_budget_republisher(",
@@ -943,6 +947,14 @@ mod tests {
                 "plan_workunit_adapter.reconcile_loop",
             ),
         ];
+        // Loop bodies factored OUT of a SUPERVISED entry point: (file, body
+        // signature prefix). They run inside the supervised future, so a bare
+        // spawn here escapes supervision exactly as it would in the entry
+        // point — but the entry point's region no longer contains them.
+        const SUPERVISED_BODIES: &[(&str, &str)] = &[(
+            "fleet/heartbeat_loop.rs",
+            "pub(crate) async fn run_heartbeat_loop<",
+        )];
         // Calls interleaved with the SUPERVISED set above (main.rs's two
         // fleet-thread blocks, `spawn_heartbeat` through
         // `spawn_auto_fresh_engine`, plus the plan adapter) that the
@@ -1065,6 +1077,14 @@ mod tests {
             if !main_src.contains(&format!("::{fn_name}(")) {
                 violations.push(format!(
                     "main.rs no longer calls `{fn_name}(` — re-classify {file}"
+                ));
+            }
+        }
+        for (file, signature) in SUPERVISED_BODIES {
+            let region = fn_region(&src_root, file, signature);
+            if region.contains("tokio::spawn(") || region.contains("tauri::async_runtime::spawn(") {
+                violations.push(format!(
+                    "{file} `{signature}`: supervised loop body holds a bare spawn"
                 ));
             }
         }

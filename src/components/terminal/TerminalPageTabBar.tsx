@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from "react";
-import { Plus, X, Shuffle, SquareArrowOutUpRight } from "lucide-react";
+import { Plus, X, Shuffle, SquareArrowOutUpRight, BrushCleaning } from "lucide-react";
 import { keyboardReorderTarget, type TerminalPageConfig } from "./useTerminalPages";
 
 /**
@@ -23,6 +23,10 @@ interface TerminalPageTabBarProps {
    */
   onReorderPage?: (sourceId: string, targetId: string | null) => void;
   onReorganize?: () => void;
+  /** Close every page that hosts no terminals. Resolves to how many were closed. */
+  onCloseEmptyPages?: () => Promise<number>;
+  /** Last-known count of tabs the button would close; 0 disables it. Omitted = unknown, stays enabled. */
+  emptyPageCount?: number;
   /** Open a new pop-out OS window (same process) hosting its own terminals. */
   onPopOut?: () => void;
   /** Detach an entire page (all its terminals + layout) into its own window. */
@@ -43,6 +47,8 @@ export function TerminalPageTabBar({
   onRenamePage,
   onReorderPage,
   onReorganize,
+  onCloseEmptyPages,
+  emptyPageCount,
   onPopOut,
   onPopOutPage,
   isPinned,
@@ -50,6 +56,22 @@ export function TerminalPageTabBar({
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editValue, setEditValue] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
+  const [closingEmpty, setClosingEmpty] = useState(false);
+  const [closeEmptyNote, setCloseEmptyNote] = useState<string | null>(null);
+
+  const handleCloseEmpty = async () => {
+    if (!onCloseEmptyPages || closingEmpty) return;
+    setClosingEmpty(true);
+    try {
+      const n = await onCloseEmptyPages();
+      setCloseEmptyNote(n > 0 ? `Closed ${n} empty` : "No empty tabs");
+    } catch {
+      setCloseEmptyNote("Couldn't close empty tabs");
+    } finally {
+      setClosingEmpty(false);
+      setTimeout(() => setCloseEmptyNote(null), 3000);
+    }
+  };
 
   // Drag-to-reorder state: the tab currently being dragged, and the tab it's
   // currently hovering over (drop target). Both are cleared on drop/dragend
@@ -63,6 +85,19 @@ export function TerminalPageTabBar({
       inputRef.current.select();
     }
   }, [editingId]);
+
+  // The tab list scrolls horizontally once the pages outgrow the strip (the
+  // controls after it stay pinned), so keep the active tab in view.
+  // `scrollIntoView` is optional-called because jsdom does not implement it.
+  // Keyed on the active tab's POSITION (not the whole order), so moving the
+  // active tab re-scrolls but reordering some other tab does not yank the strip
+  // back to the active one; the Alt+Arrow handler scrolls the moved tab itself.
+  const tabListRef = useRef<HTMLDivElement>(null);
+  const activeIndex = pages.findIndex((p) => p.id === activePageId);
+  useEffect(() => {
+    const active = tabListRef.current?.querySelector<HTMLElement>('[aria-selected="true"]');
+    active?.scrollIntoView?.({ block: "nearest", inline: "nearest" });
+  }, [activePageId, activeIndex]);
 
   const startRename = (id: string, currentName: string) => {
     setEditingId(id);
@@ -95,201 +130,242 @@ export function TerminalPageTabBar({
   }
 
   return (
-    <div className="flex items-center gap-0.5 px-2 py-1 bg-[#13141f] border-b border-[#2a2d3d] shrink-0">
-      {pages.map((page) => {
-        const isActive = page.id === activePageId;
-        const isEditing = editingId === page.id;
-        const isDragging = draggedId === page.id;
-        // Only the tab under the pointer — not the one being dragged — shows
-        // the drop-target highlight (dragging a tab over itself is a no-op).
-        const isDropTarget = !!onReorderPage && dragOverId === page.id && draggedId !== page.id;
+    <div className="flex items-center gap-0.5 px-2 py-0.5 bg-[#13141f] border-b border-[#2a2d3d] shrink-0 min-w-0">
+      {/* Tabs scroll; the controls below are pinned. Without this split the
+          row simply overflowed, and past ~17 pages every control (add,
+          reorganize, close-empty, pop-out) rendered beyond the viewport. */}
+      <div
+        ref={tabListRef}
+        data-testid="terminal-page-tab-list"
+        className="flex items-center gap-0.5 min-w-0 overflow-x-auto overflow-y-hidden p-0.5"
+      >
+        {pages.map((page) => {
+          const isActive = page.id === activePageId;
+          const isEditing = editingId === page.id;
+          const isDragging = draggedId === page.id;
+          // Only the tab under the pointer — not the one being dragged — shows
+          // the drop-target highlight (dragging a tab over itself is a no-op).
+          const isDropTarget = !!onReorderPage && dragOverId === page.id && draggedId !== page.id;
 
-        const tabClasses = `group flex items-center gap-1 px-2.5 py-1 rounded text-[11px] cursor-pointer transition-colors ${
-          isActive
-            ? "bg-[#2a2d3d] text-[#c0caf5]"
-            : "text-[#565f89] hover:text-[#a9b1d6] hover:bg-[#1e1f2e]"
-        } ${isDragging ? "opacity-40" : ""} ${
-          isDropTarget ? "ring-1 ring-inset ring-[#7aa2f7]" : ""
-        }`;
+          const tabClasses = `group shrink-0 flex items-center focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-[#7aa2f7] gap-1 px-2.5 py-1 rounded text-[11px] cursor-pointer transition-colors ${
+            isActive
+              ? "bg-[#2a2d3d] text-[#c0caf5]"
+              : "text-[#565f89] hover:text-[#a9b1d6] hover:bg-[#1e1f2e]"
+          } ${isDragging ? "opacity-40" : ""} ${
+            isDropTarget ? "ring-1 ring-inset ring-[#7aa2f7]" : ""
+          }`;
 
-        // Render a <div> when editing (input inside button is invalid HTML)
-        if (isEditing) {
+          // Render a <div> when editing (input inside button is invalid HTML)
+          if (isEditing) {
+            return (
+              <div key={page.id} className={tabClasses}>
+                <input
+                  ref={inputRef}
+                  value={editValue}
+                  onChange={(e) => setEditValue(e.target.value)}
+                  onBlur={commitRename}
+                  onKeyDown={(e) => {
+                    e.stopPropagation();
+                    if (e.key === "Enter") commitRename();
+                    if (e.key === "Escape") {
+                      setEditingId(null);
+                      setEditValue("");
+                    }
+                  }}
+                  className="bg-[#13141f] border border-[#7aa2f7] rounded px-1 py-0 text-[11px] text-[#c0caf5] outline-hidden w-24"
+                  maxLength={30}
+                />
+              </div>
+            );
+          }
+
           return (
-            <div key={page.id} className={tabClasses}>
-              <input
-                ref={inputRef}
-                value={editValue}
-                onChange={(e) => setEditValue(e.target.value)}
-                onBlur={commitRename}
-                onKeyDown={(e) => {
-                  e.stopPropagation();
-                  if (e.key === "Enter") commitRename();
-                  if (e.key === "Escape") {
-                    setEditingId(null);
-                    setEditValue("");
-                  }
-                }}
-                className="bg-[#13141f] border border-[#7aa2f7] rounded px-1 py-0 text-[11px] text-[#c0caf5] outline-hidden w-24"
-                maxLength={30}
-              />
-            </div>
+            <button
+              key={page.id}
+              role="tab"
+              aria-selected={isActive}
+              className={tabClasses}
+              draggable={!!onReorderPage}
+              onClick={() => onSelectPage(page.id)}
+              onDoubleClick={() => startRename(page.id, page.name)}
+              onDragStart={(e) => {
+                setDraggedId(page.id);
+                e.dataTransfer.effectAllowed = "move";
+                // Firefox requires data to be set for the drag to start at all.
+                e.dataTransfer.setData("text/plain", page.id);
+              }}
+              onDragEnd={() => {
+                setDraggedId(null);
+                setDragOverId(null);
+              }}
+              onDragOver={(e) => {
+                if (!onReorderPage || !draggedId || draggedId === page.id) return;
+                e.preventDefault();
+                e.dataTransfer.dropEffect = "move";
+                if (dragOverId !== page.id) setDragOverId(page.id);
+              }}
+              onDragLeave={() => {
+                setDragOverId((current) => (current === page.id ? null : current));
+              }}
+              onDrop={(e) => {
+                e.preventDefault();
+                const sourceId = draggedId ?? e.dataTransfer.getData("text/plain");
+                setDraggedId(null);
+                setDragOverId(null);
+                if (onReorderPage && sourceId && sourceId !== page.id) {
+                  onReorderPage(sourceId, page.id);
+                }
+              }}
+              onKeyDown={(e) => {
+                // Alt+Arrow reorder: the non-dragging alternative WCAG 2.5.7
+                // requires for a drag-only interaction. Swaps the focused tab
+                // with its immediate neighbor; focus follows it (React moves
+                // rather than remounts a same-key element across a reorder).
+                // The index arithmetic lives in `keyboardReorderTarget`
+                // (unit-tested directly — see its doc comment for why).
+                if (!onReorderPage || !e.altKey) return;
+                if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+                e.preventDefault();
+                const target = keyboardReorderTarget(
+                  pages,
+                  page.id,
+                  e.key === "ArrowLeft" ? "left" : "right",
+                );
+                if (target !== undefined) {
+                  onReorderPage(page.id, target);
+                  // React moves (not remounts) this element, so after the
+                  // reorder commits it is still the focused tab: keep it in view.
+                  const moved = e.currentTarget;
+                  requestAnimationFrame(() =>
+                    moved.scrollIntoView?.({ block: "nearest", inline: "nearest" }),
+                  );
+                }
+              }}
+              title={`Switch to ${page.name}${onReorderPage ? " (drag, or Alt+←/→, to reorder)" : ""}`}
+            >
+              <span className="truncate max-w-[120px]">{page.name}</span>
+              {onPopOutPage && (
+                <span
+                  role="button"
+                  tabIndex={0}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onPopOutPage(page.id);
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" || e.key === " ") {
+                      e.stopPropagation();
+                      onPopOutPage(page.id);
+                    }
+                  }}
+                  className="p-0.5 rounded opacity-0 group-hover:opacity-100 text-[#565f89] hover:text-[#7aa2f7] hover:bg-[#7aa2f7]/10 transition-all"
+                  title="Pop out this page into its own window"
+                >
+                  <SquareArrowOutUpRight className="w-3 h-3" />
+                </span>
+              )}
+              {pages.length > 1 && (
+                <span
+                  role="button"
+                  tabIndex={0}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onRemovePage(page.id);
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" || e.key === " ") {
+                      e.stopPropagation();
+                      onRemovePage(page.id);
+                    }
+                  }}
+                  className="p-0.5 rounded opacity-0 group-hover:opacity-100 text-[#565f89] hover:text-[#f7768e] hover:bg-[#f7768e]/10 transition-all"
+                  title="Close page"
+                >
+                  <X className="w-3 h-3" />
+                </span>
+              )}
+            </button>
           );
-        }
-
-        return (
-          <button
-            key={page.id}
-            role="tab"
-            aria-selected={isActive}
-            className={tabClasses}
-            draggable={!!onReorderPage}
-            onClick={() => onSelectPage(page.id)}
-            onDoubleClick={() => startRename(page.id, page.name)}
-            onDragStart={(e) => {
-              setDraggedId(page.id);
-              e.dataTransfer.effectAllowed = "move";
-              // Firefox requires data to be set for the drag to start at all.
-              e.dataTransfer.setData("text/plain", page.id);
-            }}
-            onDragEnd={() => {
-              setDraggedId(null);
-              setDragOverId(null);
-            }}
+        })}
+        {onReorderPage && draggedId && (
+          // "Move to end" drop zone: only a per-tab `onDrop` exists otherwise,
+          // so a tab could never become the LAST tab (there's nothing after it
+          // to drop "before"). Rendered only mid-drag so it costs no layout
+          // space the rest of the time.
+          <div
             onDragOver={(e) => {
-              if (!onReorderPage || !draggedId || draggedId === page.id) return;
               e.preventDefault();
               e.dataTransfer.dropEffect = "move";
-              if (dragOverId !== page.id) setDragOverId(page.id);
+              if (dragOverId !== END_ZONE_ID) setDragOverId(END_ZONE_ID);
             }}
             onDragLeave={() => {
-              setDragOverId((current) => (current === page.id ? null : current));
+              setDragOverId((current) => (current === END_ZONE_ID ? null : current));
             }}
             onDrop={(e) => {
               e.preventDefault();
               const sourceId = draggedId ?? e.dataTransfer.getData("text/plain");
               setDraggedId(null);
               setDragOverId(null);
-              if (onReorderPage && sourceId && sourceId !== page.id) {
-                onReorderPage(sourceId, page.id);
-              }
+              if (sourceId) onReorderPage(sourceId, null);
             }}
-            onKeyDown={(e) => {
-              // Alt+Arrow reorder: the non-dragging alternative WCAG 2.5.7
-              // requires for a drag-only interaction. Swaps the focused tab
-              // with its immediate neighbor; focus follows it (React moves
-              // rather than remounts a same-key element across a reorder).
-              // The index arithmetic lives in `keyboardReorderTarget`
-              // (unit-tested directly — see its doc comment for why).
-              if (!onReorderPage || !e.altKey) return;
-              if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
-              e.preventDefault();
-              const target = keyboardReorderTarget(
-                pages,
-                page.id,
-                e.key === "ArrowLeft" ? "left" : "right",
-              );
-              if (target !== undefined) onReorderPage(page.id, target);
-            }}
-            title={`Switch to ${page.name}${onReorderPage ? " (drag, or Alt+←/→, to reorder)" : ""}`}
+            className={`self-stretch shrink-0 w-2 rounded transition-colors ${
+              dragOverId === END_ZONE_ID ? "bg-[#7aa2f7]/30 ring-1 ring-inset ring-[#7aa2f7]" : ""
+            }`}
+            aria-hidden="true"
+          />
+        )}
+      </div>
+      <div data-testid="terminal-page-tab-controls" className="flex items-center gap-0.5 shrink-0">
+        <button
+          onClick={handleAdd}
+          aria-label="Add terminal page"
+          className="flex items-center gap-0.5 px-1.5 py-1 rounded text-[10px] text-[#565f89] hover:text-[#9ece6a] hover:bg-[#9ece6a]/10 transition-colors"
+          title="Add terminal page"
+        >
+          <Plus className="w-3 h-3" />
+        </button>
+        {pages.length >= 2 && onReorganize && (
+          <button
+            onClick={onReorganize}
+            className="flex items-center gap-0.5 px-1.5 py-1 rounded text-[10px] text-[#565f89] hover:text-[#bb9af7] hover:bg-[#bb9af7]/10 transition-colors"
+            title="Reorganize pages by topic (AI)"
           >
-            <span className="truncate max-w-[120px]">{page.name}</span>
-            {onPopOutPage && (
-              <span
-                role="button"
-                tabIndex={0}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onPopOutPage(page.id);
-                }}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter" || e.key === " ") {
-                    e.stopPropagation();
-                    onPopOutPage(page.id);
-                  }
-                }}
-                className="p-0.5 rounded opacity-0 group-hover:opacity-100 text-[#565f89] hover:text-[#7aa2f7] hover:bg-[#7aa2f7]/10 transition-all"
-                title="Pop out this page into its own window"
-              >
-                <SquareArrowOutUpRight className="w-3 h-3" />
-              </span>
-            )}
-            {pages.length > 1 && (
-              <span
-                role="button"
-                tabIndex={0}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onRemovePage(page.id);
-                }}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter" || e.key === " ") {
-                    e.stopPropagation();
-                    onRemovePage(page.id);
-                  }
-                }}
-                className="p-0.5 rounded opacity-0 group-hover:opacity-100 text-[#565f89] hover:text-[#f7768e] hover:bg-[#f7768e]/10 transition-all"
-                title="Close page"
-              >
-                <X className="w-3 h-3" />
-              </span>
-            )}
+            <Shuffle className="w-3 h-3" />
           </button>
-        );
-      })}
-      {onReorderPage && draggedId && (
-        // "Move to end" drop zone: only a per-tab `onDrop` exists otherwise,
-        // so a tab could never become the LAST tab (there's nothing after it
-        // to drop "before"). Rendered only mid-drag so it costs no layout
-        // space the rest of the time.
-        <div
-          onDragOver={(e) => {
-            e.preventDefault();
-            e.dataTransfer.dropEffect = "move";
-            if (dragOverId !== END_ZONE_ID) setDragOverId(END_ZONE_ID);
-          }}
-          onDragLeave={() => {
-            setDragOverId((current) => (current === END_ZONE_ID ? null : current));
-          }}
-          onDrop={(e) => {
-            e.preventDefault();
-            const sourceId = draggedId ?? e.dataTransfer.getData("text/plain");
-            setDraggedId(null);
-            setDragOverId(null);
-            if (sourceId) onReorderPage(sourceId, null);
-          }}
-          className={`self-stretch w-2 rounded transition-colors ${
-            dragOverId === END_ZONE_ID ? "bg-[#7aa2f7]/30 ring-1 ring-inset ring-[#7aa2f7]" : ""
-          }`}
-          aria-hidden="true"
-        />
-      )}
-      <button
-        onClick={handleAdd}
-        aria-label="Add terminal page"
-        className="flex items-center gap-0.5 px-1.5 py-1 rounded text-[10px] text-[#565f89] hover:text-[#9ece6a] hover:bg-[#9ece6a]/10 transition-colors"
-        title="Add terminal page"
-      >
-        <Plus className="w-3 h-3" />
-      </button>
-      {pages.length >= 2 && onReorganize && (
-        <button
-          onClick={onReorganize}
-          className="flex items-center gap-0.5 px-1.5 py-1 rounded text-[10px] text-[#565f89] hover:text-[#bb9af7] hover:bg-[#bb9af7]/10 transition-colors"
-          title="Reorganize pages by topic (AI)"
-        >
-          <Shuffle className="w-3 h-3" />
-        </button>
-      )}
-      {onPopOut && (
-        <button
-          onClick={onPopOut}
-          aria-label="Open terminal in a new window"
-          className="flex items-center gap-0.5 px-1.5 py-1 rounded text-[10px] text-[#565f89] hover:text-[#7aa2f7] hover:bg-[#7aa2f7]/10 transition-colors"
-          title="Open a new pop-out terminal window"
-        >
-          <SquareArrowOutUpRight className="w-3 h-3" />
-        </button>
-      )}
+        )}
+        {pages.length >= 2 && onCloseEmptyPages && (
+          <button
+            onClick={() => void handleCloseEmpty()}
+            disabled={closingEmpty || emptyPageCount === 0}
+            aria-label="Close empty tabs"
+            className="flex items-center gap-0.5 px-1.5 py-1 rounded text-[10px] text-[#565f89] hover:text-[#f7768e] hover:bg-[#f7768e]/10 transition-colors disabled:opacity-50"
+            title={
+              emptyPageCount === 0
+                ? "No empty tabs to close"
+                : emptyPageCount === undefined
+                  ? "Close empty tabs (tabs that have no terminals open)"
+                  : `Close ${emptyPageCount} empty tab${emptyPageCount === 1 ? "" : "s"} (no terminals open)`
+            }
+          >
+            <BrushCleaning className="w-3 h-3" />
+          </button>
+        )}
+        {closeEmptyNote && (
+          <span role="status" className="text-[10px] text-[#565f89] px-1">
+            {closeEmptyNote}
+          </span>
+        )}
+        {onPopOut && (
+          <button
+            onClick={onPopOut}
+            aria-label="Open terminal in a new window"
+            className="flex items-center gap-0.5 px-1.5 py-1 rounded text-[10px] text-[#565f89] hover:text-[#7aa2f7] hover:bg-[#7aa2f7]/10 transition-colors"
+            title="Open a new pop-out terminal window"
+          >
+            <SquareArrowOutUpRight className="w-3 h-3" />
+          </button>
+        )}
+      </div>
     </div>
   );
 }

@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 use qontinui_types::journey::{
     ChokePoint, EdgeOutcome, JourneyNode, JourneyTrigger, NavigationTriggerKind,
 };
+use qontinui_vision_core::ChangeTimeline;
 
 use super::node::{component_action_fingerprint, unknown_node, AffordanceIndex};
 
@@ -358,6 +359,11 @@ pub(crate) struct EdgeDraft {
     pub to_node: Option<JourneyNode>,
     pub trigger: JourneyTrigger,
     pub outcome: EdgeOutcome,
+    /// The interaction timeline the action's own response carried (an
+    /// execute-with-diff `timeline`), ALREADY projected through
+    /// [`ChangeTimeline::for_ledger`] — the only value the row's `timeline`
+    /// column may hold (plan Phase 4). `None` = the action recorded none.
+    pub timeline: Option<Box<ChangeTimeline>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -367,6 +373,7 @@ struct PendingEdge {
     trigger: JourneyTrigger,
     hint: Option<EdgeOutcome>,
     provenance: Provenance,
+    timeline: Option<Box<ChangeTimeline>>,
     opened_at: Instant,
 }
 
@@ -384,6 +391,7 @@ impl PendingEdge {
             to_node: to.map(|o| o.node.clone()),
             trigger: self.trigger,
             outcome,
+            timeline: self.timeline,
         }
     }
 }
@@ -417,6 +425,22 @@ impl Cursors {
         hint: Option<EdgeOutcome>,
         now: Instant,
     ) -> Option<EdgeDraft> {
+        self.open_with_timeline(key, action, provenance, hint, None, now)
+    }
+
+    /// [`Self::open`], carrying the action's interaction timeline onto the
+    /// pending edge so the row that edge closes into stores it. The caller
+    /// passes the [`ChangeTimeline::for_ledger`] projection, never the raw
+    /// timeline (it is re-projected at write time regardless — idempotent).
+    pub(crate) fn open_with_timeline(
+        &mut self,
+        key: &CursorKey,
+        action: &ActionSpec,
+        provenance: Provenance,
+        hint: Option<EdgeOutcome>,
+        timeline: Option<Box<ChangeTimeline>>,
+        now: Instant,
+    ) -> Option<EdgeDraft> {
         let cursor = self.map.entry(key.clone()).or_default();
         let displaced = cursor.pending.take().map(|p| p.close(key, None));
         cursor.pending = Some(PendingEdge {
@@ -429,6 +453,7 @@ impl Cursors {
             trigger: resolve_trigger(action, &cursor.last_affordances),
             hint,
             provenance,
+            timeline,
             opened_at: now,
         });
         displaced

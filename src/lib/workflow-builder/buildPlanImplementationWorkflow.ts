@@ -176,7 +176,7 @@ ${description ?? "Test all features that were just implemented. Focus on the UI 
 4. Fix any bugs found during testing
 5. Report test results
 
-Use \`curl -s http://localhost:9876/ui-bridge/control/snapshot\` for Runner UI testing.
+Use \`curl -s http://127.0.0.1:9876/ui-bridge/control/snapshot\` for Runner UI testing.
 Use \`curl -s http://localhost:3001/api/ui-bridge/control/snapshot\` for Web UI testing.`;
 }
 

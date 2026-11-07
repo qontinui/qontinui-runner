@@ -11,9 +11,10 @@
 //! PATH entry (`ENOENT`). The native binary the package ships is also written in
 //! place, so the same window yields `EACCES` (the file exists before its mode
 //! bit is set) and `ENOEXEC` (the file is only partly written). All three were
-//! measured in the runner's logs. A spawn that lands in the window used to fail
-//! once and be final: a scheduler task's tick, a headless gate continuation, or
-//! the first attempt of a coord agent spawn.
+//! measured in the runner's logs. npm's placeholder stub, which has no shebang,
+//! gives `ENOEXEC` here too. A spawn that lands in the window used to fail once
+//! and be final: a scheduler task's tick, a headless gate continuation, or the
+//! first attempt of a coord agent spawn.
 //!
 //! This module is the one place that decides what counts as transient for a CLI
 //! spawn, and it retries those errors with a short, bounded back-off. Its

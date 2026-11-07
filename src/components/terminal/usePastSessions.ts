@@ -1,6 +1,7 @@
 import { useState, useCallback, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { CommandResponse } from "./types";
+import type { ResumeAccount } from "@/lib/session-ledger";
 
 /**
  * The account a past session belonged to — the `/rename`-wrapper pair the
@@ -19,7 +20,7 @@ export interface PastSessionAccount {
  *
  * The headline field is `resumeName` — the real `/rename` name the operator
  * gave the session — and `resumeCommand` is a ready-to-paste
- * `clg --resume <id>`-style command.
+ * `cd "<dir>" && CLAUDE_CONFIG_DIR="<config>" claude --resume <id>` line.
  *
  * Keys are camelCase, matching the Rust command's serde output exactly.
  */
@@ -28,8 +29,18 @@ export interface PastSession {
   claudeSessionId: string;
   /** The real `/rename` name (the headline — show prominently). */
   resumeName: string;
-  /** Ready-to-copy resume command, e.g. `"clg --resume <id>"`. */
-  resumeCommand: string;
+  /**
+   * Ready-to-copy resume line (Rust `session_ledger::resume_command_for`):
+   * `cd "<dir>" && CLAUDE_CONFIG_DIR="<config>" claude --resume <id>`. `null`
+   * when the account or the working dir is unknown — omitted, never guessed.
+   */
+  resumeCommand: string | null;
+  /**
+   * The account a one-click Resume types (Rust `session_ledger::ResumeAccount`),
+   * resolved like {@link resumeCommand}. `known: false` ⇒ the account is unknown
+   * and Resume is refused rather than run under the default account.
+   */
+  resumeAccount: ResumeAccount;
   /** Which account/wrapper the session ran under. */
   account: PastSessionAccount;
   /** Terminal page the session belonged to. */
@@ -46,6 +57,12 @@ export interface PastSession {
   configDir?: string;
   /** Working directory the terminal was opened in. */
   workingDir?: string;
+  /**
+   * The directory a resume opens in — THE resume-dir rule (Rust
+   * `session_ledger::resume_dir_of`: the launch dir, else its worktree root),
+   * the same dir {@link resumeCommand} uses. `null` when neither is known.
+   */
+  resumeDir: string | null;
   /** AI-CLI provider that owned the session (`"claude"`, `"gemini"`). */
   provider: string;
   /** Epoch ms the record was last refreshed (sort key, newest-first). */
@@ -115,6 +132,8 @@ export interface PastSessionsQuery {
 export interface UsePastSessionsResult {
   sessions: PastSession[];
   loading: boolean;
+  /** True once a read has SUCCEEDED — before that an empty `sessions` is UNKNOWN, not none. */
+  loaded: boolean;
   error: string | null;
   refresh: () => void;
 }
@@ -129,17 +148,17 @@ export interface UsePastSessionsResult {
  * `2026-08-29-no-single-answer-to-is-it-safe-to-restart-the-runner` Phase 2).
  * Reading `sessions` by name is exactly why that addition is non-breaking here.
  * The sibling `transcript_list_sessions` returns a bare array. Accept either,
- * and return
- * `[]` for anything unexpected: consumers iterate this value during render, so
- * a non-array here would throw and take the whole panel down with it.
+ * and return `null` for anything unexpected: the caller renders that as no rows,
+ * because consumers iterate the list during render and a non-array would take
+ * the whole panel down, and it records that the read did not succeed.
  */
-function extractSessions(data: unknown): PastSession[] {
+function extractSessions(data: unknown): PastSession[] | null {
   if (Array.isArray(data)) return data as PastSession[];
   if (data && typeof data === "object") {
     const inner = (data as { sessions?: unknown }).sessions;
     if (Array.isArray(inner)) return inner as PastSession[];
   }
-  return [];
+  return null;
 }
 
 /**
@@ -151,6 +170,7 @@ function extractSessions(data: unknown): PastSession[] {
 export function usePastSessions(opts?: PastSessionsQuery): UsePastSessionsResult {
   const [sessions, setSessions] = useState<PastSession[]>([]);
   const [loading, setLoading] = useState(false);
+  const [loaded, setLoaded] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const didLoad = useRef(false);
 
@@ -168,7 +188,10 @@ export function usePastSessions(opts?: PastSessionsQuery): UsePastSessionsResult
         // degrade to "no sessions", never throw into the render tree (an
         // earlier revision assigned the envelope object straight to state,
         // and `groupByCohort`'s `for...of` then crashed the whole panel).
-        setSessions(extractSessions(result.data));
+        // `loaded` stays false for it: that is a read we could not understand.
+        const extracted = extractSessions(result.data);
+        setSessions(extracted ?? []);
+        setLoaded(extracted !== null);
       } else {
         setError(result.message || "Failed to load previous sessions");
       }
@@ -189,6 +212,7 @@ export function usePastSessions(opts?: PastSessionsQuery): UsePastSessionsResult
   return {
     sessions,
     loading,
+    loaded,
     error,
     refresh: fetchSessions,
   };

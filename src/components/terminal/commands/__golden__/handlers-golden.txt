@@ -53,6 +53,8 @@ terminal.maximize	canonical	[["zone",1]]	ok	zone.toggleMaximize	false	maximized 
 terminal.maximize	empty	[]	ok	zone.toggleMaximize	false	maximized 1 zone 1 [state]	ok
 terminal.metrics	canonical	[]	ok	ctx.showCard	false	showed 8 metric	ok
 terminal.metrics	empty	[]	ok	ctx.showCard	false	showed 8 metric	ok
+terminal.mode	canonical	[["mode","x"]]	error:invalid-mode	-	false	-	error
+terminal.mode	empty	[]	ok	zone.enterTmuxMode,workflow.setShowSidebar	false	entered 1 tmux mode [state]	ok
 terminal.mute	canonical	[]	ok	-	false	muted 0 sound [state]	noop
 terminal.mute	empty	[]	ok	-	false	muted 0 sound [state]	noop
 terminal.orchestrate	canonical	[["goal","ship it"]]	error:no-run-id	invoke	true	-	error

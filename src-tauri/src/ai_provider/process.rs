@@ -102,6 +102,13 @@ mod tests {
 
     #[test]
     fn ai_child_env_preamble_scrubs_credential_values() {
+        // The scrub applies the LIVE model-gateway plan, which reads the
+        // runner config dir. A sibling test's `IsolatedAmbient` rewrites the
+        // process env (on Windows, `USERPROFILE` too, which can make the
+        // platform config dir unresolvable mid-test); an unresolvable dir is
+        // an unresolved gateway that pins `CLAUDE_CONFIG_DIR` away. Hold the
+        // fixture so this test reads a known, gateway-free config dir.
+        let _amb = crate::test_env::isolated_ambient();
         let mut cmd = Command::new("dummy");
         // As the caller / inherited process env would have supplied them.
         for name in crate::terminal::CREDENTIAL_VALUE_ENV_VARS {

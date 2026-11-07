@@ -160,7 +160,7 @@ export function useStateExploration(
             const capture: CaptureRecord = {
               captureId,
               timestamp: Date.now(),
-              url: connectedApp?.port ? `http://localhost:${connectedApp.port}` : "unknown",
+              url: connectedApp?.port ? `http://localhost:${connectedApp.port}` : "unknown", // runner-localhost-ok: the connected SDK app, not a runner
               title: connectedApp?.appName || "SDK App",
               elementFingerprints: hashes,
               elementCount: mapped.length,

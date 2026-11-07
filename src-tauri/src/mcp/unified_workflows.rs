@@ -2226,7 +2226,6 @@ pub async fn execute_inline_workflow(
             phase_timeout_ms: None,
             max_fix_attempts: workflow.max_fix_attempts,
             max_ci_auto_resumes: workflow.max_ci_auto_resumes,
-            ci_failure_context: None,
             htn_config: crate::planning_bridge::HtnConfig::default(),
         };
 
@@ -2766,7 +2765,6 @@ pub async fn run_composed_workflow(
                 phase_timeout_ms: None,
                 max_fix_attempts: 3,
                 max_ci_auto_resumes: 10,
-                ci_failure_context: None,
                 htn_config: crate::planning_bridge::HtnConfig::default(),
             };
 

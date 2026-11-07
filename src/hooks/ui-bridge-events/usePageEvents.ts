@@ -1,5 +1,5 @@
 import { useCallback } from "react";
-import { getApiPort } from "@/lib/runner-api";
+import { getApiBase } from "@/lib/runner-api";
 import type { UIBridgeRequestPayload, UIBridgeEventContext, PageEventTypes } from "./types";
 import { createLogger } from "@/lib/logger";
 import {
@@ -26,6 +26,7 @@ import {
   describeEvaluateBudget,
 } from "./utils";
 import { describeThrown } from "@/lib/utils";
+import { runTextVisibilityRequest } from "./textVisibilityRequest";
 
 const logger = createLogger("UIBridgePageEvents");
 
@@ -58,6 +59,7 @@ const PAGE_EVENT_TYPES: ReadonlySet<PageEventTypes> = new Set<PageEventTypes>([
   "delete_network_stub",
   "clear_network_stubs",
   "verify_network_stub",
+  "text_visibility",
 ]);
 
 function isPageEventType(type: string): type is PageEventTypes {
@@ -227,7 +229,7 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
             });
 
             try {
-              fetch(`http://localhost:${getApiPort()}/ui-bridge/control/render-log`, {
+              fetch(`${getApiBase()}/ui-bridge/control/render-log`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
@@ -1407,6 +1409,24 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
               type,
               success: false,
               error: String(err),
+              timestamp: Date.now(),
+            });
+          }
+          return true;
+        }
+
+        case "text_visibility": {
+          // Dev control (Phase 16): hide or restore every glyph, behind the
+          // SDK's dev-controls gate. See ./textVisibilityRequest.ts.
+          try {
+            const reply = await runTextVisibilityRequest(payload);
+            await sendResponse({ requestId, type, ...reply, timestamp: Date.now() });
+          } catch (e) {
+            await sendResponse({
+              requestId,
+              type,
+              success: false,
+              error: describeThrown(e, "Text visibility failed"),
               timestamp: Date.now(),
             });
           }

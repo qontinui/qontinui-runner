@@ -9,9 +9,12 @@
  *     EXACTLY — no hole, no duplicated boundary bytes.
  */
 
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { describe, it, expect, vi } from "vitest";
 import {
   PaneVisibilityService,
+  mountBootstrapPlan,
   routeOutputChunk,
   type PaneVisibilityHooks,
 } from "./paneVisibilityService";
@@ -580,5 +583,50 @@ describe("hidden → visible resync is gap-free", () => {
     const pane = new PaneModel(ringOver(all, 4096), true);
     for (const c of stream) pane.push(c);
     expect(pane.rendered).toEqual(all);
+  });
+});
+
+describe("mountBootstrapPlan — a pane mounted hidden neither resizes nor paints", () => {
+  it("a visible, laid-out, caught-up pane runs the full bootstrap", () => {
+    expect(mountBootstrapPlan({ hasLayout: true, visible: true, behind: false })).toEqual({
+      resize: true,
+      paint: true,
+    });
+  });
+
+  it("a pane mounted hidden (no box, dropping chunks) skips both", () => {
+    // The live-check splice: a parked pane's buffer stops at its ring replay
+    // while the grid moves on. Painting the newer grid over it, then replaying
+    // the dropped window from the paint's cursor on reveal, duplicated older
+    // rows and lost the ones after the replay.
+    expect(mountBootstrapPlan({ hasLayout: false, visible: false, behind: true })).toEqual({
+      resize: false,
+      paint: false,
+    });
+    expect(mountBootstrapPlan({ hasLayout: false, visible: false, behind: false }).paint).toBe(
+      false,
+    );
+  });
+
+  it("never paints over a buffer that is behind the stream, even when visible", () => {
+    expect(mountBootstrapPlan({ hasLayout: true, visible: true, behind: true }).paint).toBe(false);
+  });
+
+  it("never resizes the PTY from a container with no box", () => {
+    expect(mountBootstrapPlan({ hasLayout: false, visible: true, behind: false }).resize).toBe(
+      false,
+    );
+  });
+
+  it("TerminalInstance gates its bootstrap resize and paint on the plan", () => {
+    const source = readFileSync(resolve(__dirname, "./TerminalInstance.tsx"), "utf8");
+    expect(source).toMatch(
+      /const bootstrapPlan = mountBootstrapPlan\(\{\s*hasLayout: laidOut,\s*visible: visibleRef\.current,\s*behind: paneService\.behind,\s*\}\);/,
+    );
+    expect(source).toContain("if (bootstrapPlan.resize) {");
+    expect(source).toContain("if (bootstrapPlan.paint) {");
+    // The layout wait reports the box it measured rather than assuming one.
+    expect(source).toContain("resolve(hasLayout());");
+    expect(source).not.toMatch(/setTimeout\(\(\) => \{\s*ro\.disconnect\(\);\s*resolve\(true\);/);
   });
 });

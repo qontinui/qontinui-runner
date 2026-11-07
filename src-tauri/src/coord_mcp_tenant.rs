@@ -482,7 +482,7 @@ pub(crate) fn tenant_verdict(
             why: reason.clone(),
         },
         CwdTenant::RepoUnregistered { repo } => TenantVerdict::ExpectedUnknown {
-            why: format!("repo {repo} has no owning tenant in coord's registry"),
+            why: format!("no tenant this device is paired to owns repo {repo}"),
         },
         // A repo registered to several tenants: an answer from ANY owner is
         // that repo's data; one from a non-owner is another project's.
@@ -495,7 +495,7 @@ pub(crate) fn tenant_verdict(
                 expected: ExpectedTenant {
                     tenant_ids: tenant_ids.clone(),
                     repo: Some(repo.clone()),
-                    source: "canonical_repos".to_string(),
+                    source: qontinui_runner_lib::repo_tenant::REPO_TENANTS_SOURCE.to_string(),
                 },
                 answered: answer.clone(),
             },

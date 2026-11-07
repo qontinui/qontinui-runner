@@ -97,9 +97,8 @@ async fn seed_demo_workflows_pg(pg: &Arc<PgDb>) {
 /// Write embedded setup scripts to the app data directory.
 /// Returns the path to the scripts directory.
 fn write_setup_scripts() -> Result<String, String> {
-    let app_data = dirs::data_dir()
+    let app_data = qontinui_runner_lib::instance_env::runner_app_data_dir()
         .ok_or_else(|| "Cannot determine app data directory".to_string())?
-        .join("com.qontinui.runner")
         .join("demo-scripts");
 
     std::fs::create_dir_all(&app_data)

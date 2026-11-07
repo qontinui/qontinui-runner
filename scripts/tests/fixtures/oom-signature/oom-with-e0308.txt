@@ -1,0 +1,5 @@
+   Compiling qontinui-runner v1.0.11 (/home/runner/work/qontinui-runner/qontinui-runner/src-tauri)
+error[E0308]: mismatched types
+rustc-LLVM ERROR: out of memory
+Allocation failed
+error: could not compile `qontinui-runner` (lib test) due to 1 previous error

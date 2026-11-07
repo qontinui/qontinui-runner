@@ -39,6 +39,7 @@ import {
   ExternalLink,
 } from "lucide-react";
 import { SectionHeader } from "./SectionHeader";
+import { EgressPrivacyPanel } from "./EgressPrivacyPanel";
 import type { LogFunction } from "./types";
 import type { SetRunnerTierResult } from "@/hooks/useRunnerTier";
 import {
@@ -606,6 +607,11 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
   // the backend URL (api.qontinui.io → qontinui.io); null when the backend
   // field is empty/invalid, in which case the help text renders without a link.
   const webAppUrl = deriveWebAppUrl(formBackendUrl);
+  // The origin a PAGE link opens on: the "Web frontend URL" field when set
+  // (split local dev — Next.js :3001 vs FastAPI :8000, where the derived
+  // backend origin serves no pages), else the derived origin. Mirrors the
+  // Rust `web_origin::resolve_web_frontend_base` setting rung.
+  const webPageOrigin = formWebBaseUrl.trim().replace(/\/+$/, "") || webAppUrl;
 
   // Honest connection state for the Primary section. `wsConnected`/`runnerId`
   // are now truthful for Cognito/pair-code runners (Rust status fix), so we can
@@ -1232,6 +1238,12 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
         </div>
       </div>
 
+      {/* Privacy — the six outbound data flows and this project's switch for
+          each (plan 2026-10-10-spec-front-end-phase-9-generic-boundary,
+          Phase 8). Read-only: the switches are written in the web console.
+          The user's own sync toggles below stay independent of it. */}
+      <EgressPrivacyPanel webAppUrl={status?.webBaseUrl?.trim() || webAppUrl} />
+
       {/* Session metadata sync — independent consent toggle (gate 2 of the
           session-history cloud-sync consent model, split off by plan
           2026-07-10-split-cloud-sync-consent). Saves immediately. */}
@@ -1579,9 +1591,9 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
           <div className="text-xs text-muted-foreground pl-5 space-y-1">
             <p>
               1. Log into{" "}
-              {webAppUrl ? (
+              {webPageOrigin ? (
                 <a
-                  href={`${webAppUrl}/login`}
+                  href={`${webPageOrigin}/login`}
                   target="_blank"
                   rel="noreferrer"
                   className="text-primary hover:underline inline-flex items-center gap-1"

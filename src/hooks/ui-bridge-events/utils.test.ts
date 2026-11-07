@@ -869,10 +869,10 @@ describe("toFindRequest - one filter seam for both discover and find", () => {
 describe("pong window labels", () => {
   it("pongUrl carries the provenance, the sender's label and its document nonce", () => {
     expect(pongUrl(9876, "event", "main")).toBe(
-      `http://localhost:9876/ui-bridge/pong?source=event&label=main&doc=${encodeURIComponent(DOCUMENT_NONCE)}`,
+      `http://127.0.0.1:9876/ui-bridge/pong?source=event&label=main&doc=${encodeURIComponent(DOCUMENT_NONCE)}`,
     );
     expect(pongUrl("9877", "safety-net", "terminal-abc")).toBe(
-      `http://localhost:9877/ui-bridge/pong?source=safety-net&label=terminal-abc&doc=${encodeURIComponent(DOCUMENT_NONCE)}`,
+      `http://127.0.0.1:9877/ui-bridge/pong?source=safety-net&label=terminal-abc&doc=${encodeURIComponent(DOCUMENT_NONCE)}`,
     );
   });
 

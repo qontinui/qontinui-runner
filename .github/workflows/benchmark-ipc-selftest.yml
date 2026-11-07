@@ -52,7 +52,7 @@ concurrency:
 jobs:
   selftest:
     name: benchmark-ipc selftest
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(((vars.RUNNER_CI_LANE_BENCHMARK_IPC_SELFTEST || vars.RUNNER_CI_LIGHT_LANE) == 'self-hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && '["self-hosted","Linux","X64","qontinui-host-nawa","qontinui"]' || '"ubuntu-latest"') }}
     # A checkout plus eleven unittest cases, about two seconds in all.
     timeout-minutes: 5
     steps:

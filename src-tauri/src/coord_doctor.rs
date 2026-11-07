@@ -770,7 +770,7 @@ fn build_checks(inputs: &DoctorInputs) -> Vec<Check<'_>> {
             } else {
                 (
                     false,
-                    "no authenticated Claude account (no valid ~/.claude/.credentials.json)".into(),
+                    "no authenticated Claude account (no valid ~/.claude/.credentials.json and no long-lived CLAUDE_CODE_OAUTH_TOKEN)".into(),
                 )
             }
         }),
@@ -1210,6 +1210,16 @@ fn creds_path_is_valid(creds_path: &Path) -> bool {
 }
 
 fn claude_account_has_valid_credentials(config_dir: Option<&str>) -> bool {
+    // A long-lived `claude setup-token` token (`settings.json`
+    // `env.CLAUDE_CODE_OAUTH_TOKEN`) is a login with nothing to expire or
+    // refresh on this clock — the account dir's own, else the ambient one
+    // (the same fall-through `find_creds_path` applies to the creds file).
+    let long_lived = config_dir
+        .and_then(|dir| crate::claude_oauth_token::from_config_dir(Path::new(dir)))
+        .or_else(crate::claude_oauth_token::ambient);
+    if long_lived.is_some() {
+        return true;
+    }
     if let Some(path) = find_creds_path(config_dir) {
         if creds_path_is_valid(&path) {
             return true;
@@ -4664,10 +4674,9 @@ mod tests {
     #[test]
     fn provisioning_gate_enforce_env_parsing() {
         let _env_lock = env_lock();
-        // Save/restore the process-global so this test is self-contained. This
-        // is the ONLY test that touches the flag; no sibling reads it, so the
-        // save/restore is sufficient (and there's no parallel reader to race).
-        let prev = std::env::var(PROVISIONING_GATE_ENFORCE_ENV).ok();
+        // Restore the process-global on drop, unwinding included, so a failed
+        // assertion cannot leave the flag set for later tests in the binary.
+        let _restore = crate::test_env::EnvVarRestore::capture(&[PROVISIONING_GATE_ENFORCE_ENV]);
 
         std::env::remove_var(PROVISIONING_GATE_ENFORCE_ENV);
         assert!(
@@ -4688,11 +4697,6 @@ mod tests {
                 provisioning_gate_enforce_enabled(),
                 "{on:?} must read as enforcing"
             );
-        }
-
-        match prev {
-            Some(p) => std::env::set_var(PROVISIONING_GATE_ENFORCE_ENV, p),
-            None => std::env::remove_var(PROVISIONING_GATE_ENFORCE_ENV),
         }
     }
 }

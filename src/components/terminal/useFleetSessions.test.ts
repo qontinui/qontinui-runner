@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from "vitest";
+import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import {
   activityInstant,
   emptyReasonFor,
@@ -9,7 +9,7 @@ import {
   type FleetSession,
   type FleetSessionsResponse,
 } from "./useFleetSessions";
-import { sessionStateLabel, sessionDescription, degradedNotice } from "./FleetSessionPicker";
+import { workStatusMoved, sessionStateLabel, sessionDescription, degradedNotice } from "./FleetSessionPicker";
 
 function session(over: Partial<FleetSession> = {}): FleetSession {
   return {
@@ -107,6 +107,33 @@ describe("degradedNotice — the banner names what was unreadable", () => {
 });
 
 describe("groupByDevice", () => {
+  it("carries the rows' MINT tenant on the group, not their served one", () => {
+    const B = "bbbbbbbb-0000-4000-8000-00000000000b";
+    const C = "cccccccc-0000-4000-8000-00000000000c";
+    // A read that named no tenant: served under B, but its create mints with
+    // no tenant, exactly as before the selector.
+    const [single] = groupByDevice([
+      session({ sessionId: "a", deviceId: "d1", servedTenantId: B, mintTenantId: null }),
+    ]);
+    expect(single.tenantId).toBe(B);
+    expect(single.mintTenantId).toBeNull();
+    // A merged read: each group mints under its own walk's tenant.
+    const merged = groupByDevice(
+      [
+        session({ sessionId: "a", deviceId: "d1", servedTenantId: B, mintTenantId: B }),
+        session({ sessionId: "b", deviceId: "d1", servedTenantId: C, mintTenantId: C }),
+      ],
+      { byTenant: true },
+    );
+    expect(merged.map((g) => [g.tenantId, g.mintTenantId])).toEqual(
+      expect.arrayContaining([
+        [B, B],
+        [C, C],
+      ]),
+    );
+    expect(merged).toHaveLength(2);
+  });
+
   it("puts the caller's own device first, then labels alphabetically", () => {
     const rows = [
       session({ sessionId: "s1", deviceId: "d-zeta", deviceHostname: "zeta" }),
@@ -281,6 +308,52 @@ describe("sessionStateLabel — the two axes stay distinct", () => {
     expect(sessionStateLabel(session({ state: "working", sessionStatus: "finished" }))).toBe(
       "working · finished",
     );
+  });
+});
+
+describe("workStatusMoved", () => {
+  const moved = (sessionStatusSince: string | null | undefined, sessionStatus: string | null = "finished") =>
+    workStatusMoved(session({ state: "active", sessionStatus, sessionStatusSince }));
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-13T12:00:00Z"));
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("says how long ago a finished session finished", () => {
+    expect(moved("2026-09-13T09:00:00Z")?.label).toBe("finished 3h ago");
+  });
+
+  it("reads coord's nanosecond stamps through the normalizer every engine can parse", () => {
+    expect(moved("2026-09-13T08:59:59.123456789Z")).toEqual({
+      iso: "2026-09-13T08:59:59.123Z",
+      label: "finished 3h ago",
+    });
+  });
+
+  it("is unknown when coord served none or an unreadable one, never a duration", () => {
+    expect(moved(undefined)).toBeNull();
+    expect(moved(null)).toBeNull();
+    expect(moved("not a time")).toBeNull();
+  });
+
+  it("never dates a stalled row: that clock belongs to the status it stalled in", () => {
+    expect(moved("2026-09-13T09:00:00Z", "stalled")).toBeNull();
+  });
+
+  it("does not date an unknown work axis", () => {
+    expect(moved("2026-09-13T09:00:00Z", null)).toBeNull();
+  });
+
+  it("reads a stamp within ordinary clock skew as now", () => {
+    expect(moved("2026-09-13T12:00:30Z")?.label).toBe("finished just now");
+  });
+
+  it("is unknown when a stamp is further ahead than ordinary skew", () => {
+    expect(moved("2026-09-13T12:02:00Z")).toBeNull();
   });
 });
 

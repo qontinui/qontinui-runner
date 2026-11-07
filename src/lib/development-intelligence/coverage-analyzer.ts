@@ -5,7 +5,7 @@
  * (what IS tested). Surfaces pages with rich specs but few/no tests.
  */
 
-const API_BASE = "http://localhost:9876";
+import { getApiBase } from "@/lib/runner-api";
 
 export interface CoverageGap {
   page: string;
@@ -63,7 +63,7 @@ interface SpecAssertion {
 }
 
 export async function analyzeCoverage(projectPath: string): Promise<CoverageAnalysisResult> {
-  const response = await fetch(`${API_BASE}/development-intelligence/coverage-analysis`, {
+  const response = await fetch(`${getApiBase()}/development-intelligence/coverage-analysis`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ project_path: projectPath }),

@@ -61,7 +61,11 @@ pub struct AiConnectionTestResult {
 
 /// Get the current AI settings.
 ///
-/// Returns the AI settings stored in the persistent settings file.
+/// Returns the AI settings stored in the persistent settings file, flattened
+/// together with four READ-ONLY derived keys — `effective_account_selection_mode`,
+/// `account_selection_source` (`fleet` | `local` | `pinned`),
+/// `fleet_account_selection_mode` (the raw fleet value, `null` = no opinion)
+/// and `fleet_account_selection_answered` — see [`settings::AiSettingsView`].
 ///
 /// # Returns
 /// * `Ok(CommandResponse)` - Success with AI settings data
@@ -74,18 +78,44 @@ pub fn get_ai_settings() -> Result<CommandResponse, String> {
 fn get_ai_settings_impl() -> Result<CommandResponse, AppError> {
     info!("Getting AI settings");
 
-    let ai_settings = settings::get_ai_settings();
+    let view = settings::AiSettingsView::current();
 
     Ok(CommandResponse {
         success: true,
         message: Some("AI settings retrieved".to_string()),
-        data: Some(serde_json::to_value(&ai_settings)?),
+        data: Some(serde_json::to_value(&view)?),
     })
+}
+
+/// The account-selection mode a Tauri `save_ai_settings` call stores. PURE.
+///
+/// An ABSENT mode (`None` — a caller that does not send it) KEEPS the stored
+/// mode: the mode is machine-global (mirrored into `claude-accounts.json`), so
+/// defaulting it would silently re-point every runner on the machine. A sent
+/// value is parsed with `AccountSelectionMode::from_wire`; an unknown spelling
+/// is `AccountSelectionMode::default()` (settings.rs). Plan
+/// `2026-10-01-fleet-account-selection-effective-mode-visibility-and-pin-safe-saves`
+/// Phase 1.
+fn resolve_saved_selection_mode(
+    sent: Option<&str>,
+    stored: AccountSelectionMode,
+) -> AccountSelectionMode {
+    // A named mode is taken as given; an unknown spelling resolves to the
+    // default (`AccountSelectionMode::default()` in settings.rs).
+    match sent {
+        None => stored,
+        Some(raw) => AccountSelectionMode::from_wire(raw).unwrap_or_default(),
+    }
 }
 
 /// Save AI settings.
 ///
 /// Updates the AI settings in the persistent settings file.
+///
+/// Absent-means-keep for `account_selection_mode`, `account_selection_pinned`
+/// and the migration toggles; `config_dir` stays EXPLICIT — over Tauri IPC an
+/// absent and a `null` value both arrive as `None`, and the Settings page
+/// always sends it, so `None` clears it.
 ///
 /// # Arguments
 /// * `provider` - AI provider ("claude_cli" or "claude_api")
@@ -115,10 +145,11 @@ pub fn save_ai_settings(
     interactive_sessions_enabled: Option<bool>,
     auto_migrate_on_token_exhaustion: Option<bool>,
     auto_continue_after_migration: Option<bool>,
+    account_selection_pinned: Option<bool>,
 ) -> Result<CommandResponse, String> {
     info!(
-        "Saving AI settings: provider={}, execution_mode={}, timeout={}s, config_dir={:?}, account_selection={:?}, video_after_iterations={:?}, interactive={:?}",
-        provider, execution_mode, timeout_seconds, config_dir, account_selection_mode, auto_refine_video_after_iterations, interactive_sessions_enabled
+        "Saving AI settings: provider={}, execution_mode={}, timeout={}s, config_dir={:?}, account_selection={:?}, account_selection_pinned={:?}, video_after_iterations={:?}, interactive={:?}",
+        provider, execution_mode, timeout_seconds, config_dir, account_selection_mode, account_selection_pinned, auto_refine_video_after_iterations, interactive_sessions_enabled
     );
 
     let ai_provider = match provider.as_str() {
@@ -141,62 +172,69 @@ pub fn save_ai_settings(
     };
 
     // Get existing settings to preserve Gemini configuration when saving Claude settings
-    let existing_settings = settings::get_ai_settings();
+    // Read-modify-write under the AI-settings write lock so a concurrent
+    // save (HTTP PUT, another command) cannot be lost between the read and
+    // the write.
+    settings::update_ai_settings(|existing_settings| {
+        let selection_mode = resolve_saved_selection_mode(
+            account_selection_mode.as_deref(),
+            existing_settings.claude_cli.account_selection_mode,
+        );
 
-    // Default to highest-expected-usage; only an explicit "manual" pins to a
-    // single account, and only an explicit "least_usage" opts into the older
-    // headroom-only ranking. (None / unknown resolve to HighestExpectedUsage
-    // so a multi-account runner auto-balances by default — matching the
-    // AccountSelectionMode::HighestExpectedUsage default in settings.rs.)
-    let selection_mode = match account_selection_mode.as_deref() {
-        Some("manual") => AccountSelectionMode::Manual,
-        Some("least_usage") => AccountSelectionMode::LeastUsage,
-        _ => AccountSelectionMode::HighestExpectedUsage,
-    };
+        let ai_settings = AiSettings {
+            provider: ai_provider,
+            claude_cli: ClaudeCliSettings {
+                execution_mode: cli_execution_mode,
+                custom_path,
+                timeout_seconds,
+                config_dir,
+                account_selection_mode: selection_mode,
+                // `None` (an older frontend that does not send the pin) PRESERVES
+                // the configured value — it must never silently unpin a machine
+                // and hand it to the fleet policy.
+                account_selection_pinned: account_selection_pinned
+                    .unwrap_or(existing_settings.claude_cli.account_selection_pinned),
+                // `None` (older frontends) preserves whatever is configured.
+                auto_migrate_on_token_exhaustion: auto_migrate_on_token_exhaustion.unwrap_or(
+                    existing_settings
+                        .claude_cli
+                        .auto_migrate_on_token_exhaustion,
+                ),
+                auto_continue_after_migration: auto_continue_after_migration
+                    .unwrap_or(existing_settings.claude_cli.auto_continue_after_migration),
+            },
+            claude_api: ClaudeApiSettings { model, max_tokens },
+            // Preserve existing Gemini settings
+            gemini_cli: existing_settings.gemini_cli,
+            gemini_api: existing_settings.gemini_api,
+            // Preserve existing pi CLI settings
+            pi_cli: existing_settings.pi_cli,
+            // Preserve existing Ollama / OpenAI-compatible settings (Tier 0 substrate)
+            ollama: existing_settings.ollama,
+            openai_compatible: existing_settings.openai_compatible,
+            auto_refine_video_after_iterations: auto_refine_video_after_iterations.unwrap_or(3),
+            // Preserve compression, retry, and routing settings
+            compression: existing_settings.compression,
+            retry: existing_settings.retry,
+            routing: existing_settings.routing,
+            interactive_sessions_enabled: interactive_sessions_enabled
+                .unwrap_or(existing_settings.interactive_sessions_enabled),
+            ai_path_prediction_enabled: existing_settings.ai_path_prediction_enabled,
+            // PRESERVE — no frontend surface sends this yet, so a save that
+            // reconstructed it from the default would silently re-enable git-op
+            // federation for anyone who had opted out, every time they touched an
+            // unrelated AI setting. Plan:
+            // `2026-07-28-git-op-federation-lost-its-kill-switch`.
+            git_op_federation_enabled: existing_settings.git_op_federation_enabled,
+        };
 
-    let ai_settings = AiSettings {
-        provider: ai_provider,
-        claude_cli: ClaudeCliSettings {
-            execution_mode: cli_execution_mode,
-            custom_path,
-            timeout_seconds,
-            config_dir,
-            account_selection_mode: selection_mode,
-            // `None` (older frontends) preserves whatever is configured.
-            auto_migrate_on_token_exhaustion: auto_migrate_on_token_exhaustion.unwrap_or(
-                existing_settings
-                    .claude_cli
-                    .auto_migrate_on_token_exhaustion,
-            ),
-            auto_continue_after_migration: auto_continue_after_migration
-                .unwrap_or(existing_settings.claude_cli.auto_continue_after_migration),
-        },
-        claude_api: ClaudeApiSettings { model, max_tokens },
-        // Preserve existing Gemini settings
-        gemini_cli: existing_settings.gemini_cli,
-        gemini_api: existing_settings.gemini_api,
-        // Preserve existing pi CLI settings
-        pi_cli: existing_settings.pi_cli,
-        // Preserve existing Ollama / OpenAI-compatible settings (Tier 0 substrate)
-        ollama: existing_settings.ollama,
-        openai_compatible: existing_settings.openai_compatible,
-        auto_refine_video_after_iterations: auto_refine_video_after_iterations.unwrap_or(3),
-        // Preserve compression, retry, and routing settings
-        compression: existing_settings.compression,
-        retry: existing_settings.retry,
-        routing: existing_settings.routing,
-        interactive_sessions_enabled: interactive_sessions_enabled
-            .unwrap_or(existing_settings.interactive_sessions_enabled),
-        ai_path_prediction_enabled: existing_settings.ai_path_prediction_enabled,
-        // PRESERVE — no frontend surface sends this yet, so a save that
-        // reconstructed it from the default would silently re-enable git-op
-        // federation for anyone who had opted out, every time they touched an
-        // unrelated AI setting. Plan:
-        // `2026-07-28-git-op-federation-lost-its-kill-switch`.
-        git_op_federation_enabled: existing_settings.git_op_federation_enabled,
-    };
-
-    settings::save_ai_settings(ai_settings).map_err(|e| {
+        Ok::<_, std::convert::Infallible>(ai_settings)
+    })
+    .map_err(|e| {
+        let e = match e {
+            settings::AiSettingsUpdateError::SaveFailed(msg) => msg,
+            settings::AiSettingsUpdateError::Rejected(never) => match never {},
+        };
         String::from(AppError::ConfigError(format!(
             "Failed to save AI settings: {}",
             e
@@ -257,43 +295,52 @@ pub fn save_gemini_settings(
     };
 
     // Get existing settings to preserve Claude configuration AND provider selection
-    let existing_settings = settings::get_ai_settings();
+    // Read-modify-write under the AI-settings write lock so a concurrent
+    // save (HTTP PUT, another command) cannot be lost between the read and
+    // the write.
+    settings::update_ai_settings(|existing_settings| {
+        let ai_settings = AiSettings {
+            // IMPORTANT: Preserve the existing provider - don't overwrite it!
+            provider: existing_settings.provider,
+            // Preserve existing Claude settings
+            claude_cli: existing_settings.claude_cli,
+            claude_api: existing_settings.claude_api,
+            gemini_cli: GeminiCliSettings {
+                execution_mode: cli_execution_mode,
+                custom_path,
+                timeout_seconds,
+                auth_method: gemini_auth_method,
+                model: model.clone(),
+            },
+            gemini_api: GeminiApiSettings {
+                model,
+                max_output_tokens,
+                temperature,
+            },
+            // Preserve existing pi CLI / Ollama / OpenAI-compatible settings
+            pi_cli: existing_settings.pi_cli,
+            ollama: existing_settings.ollama,
+            openai_compatible: existing_settings.openai_compatible,
+            auto_refine_video_after_iterations: existing_settings
+                .auto_refine_video_after_iterations,
+            // Preserve compression, retry, routing, and interactive settings
+            compression: existing_settings.compression,
+            retry: existing_settings.retry,
+            routing: existing_settings.routing,
+            interactive_sessions_enabled: existing_settings.interactive_sessions_enabled,
+            ai_path_prediction_enabled: existing_settings.ai_path_prediction_enabled,
+            // Preserve — see the note in `save_ai_settings`; reconstructing this
+            // from the default would silently re-enable federation on every save.
+            git_op_federation_enabled: existing_settings.git_op_federation_enabled,
+        };
 
-    let ai_settings = AiSettings {
-        // IMPORTANT: Preserve the existing provider - don't overwrite it!
-        provider: existing_settings.provider,
-        // Preserve existing Claude settings
-        claude_cli: existing_settings.claude_cli,
-        claude_api: existing_settings.claude_api,
-        gemini_cli: GeminiCliSettings {
-            execution_mode: cli_execution_mode,
-            custom_path,
-            timeout_seconds,
-            auth_method: gemini_auth_method,
-            model: model.clone(),
-        },
-        gemini_api: GeminiApiSettings {
-            model,
-            max_output_tokens,
-            temperature,
-        },
-        // Preserve existing pi CLI / Ollama / OpenAI-compatible settings
-        pi_cli: existing_settings.pi_cli,
-        ollama: existing_settings.ollama,
-        openai_compatible: existing_settings.openai_compatible,
-        auto_refine_video_after_iterations: existing_settings.auto_refine_video_after_iterations,
-        // Preserve compression, retry, routing, and interactive settings
-        compression: existing_settings.compression,
-        retry: existing_settings.retry,
-        routing: existing_settings.routing,
-        interactive_sessions_enabled: existing_settings.interactive_sessions_enabled,
-        ai_path_prediction_enabled: existing_settings.ai_path_prediction_enabled,
-        // Preserve — see the note in `save_ai_settings`; reconstructing this
-        // from the default would silently re-enable federation on every save.
-        git_op_federation_enabled: existing_settings.git_op_federation_enabled,
-    };
-
-    settings::save_ai_settings(ai_settings).map_err(|e| {
+        Ok::<_, std::convert::Infallible>(ai_settings)
+    })
+    .map_err(|e| {
+        let e = match e {
+            settings::AiSettingsUpdateError::SaveFailed(msg) => msg,
+            settings::AiSettingsUpdateError::Rejected(never) => match never {},
+        };
         String::from(AppError::ConfigError(format!(
             "Failed to save Gemini settings: {}",
             e
@@ -407,7 +454,10 @@ async fn test_ai_connection_impl() -> Result<CommandResponse, AppError> {
 
     let ai_settings = settings::get_ai_settings();
 
+    let refusal = crate::model_gateway::provider_refusal(&ai_settings.provider);
     let result = match ai_settings.provider {
+        // Review M5: refused while a model gateway is declared.
+        _ if refusal.is_some() => Err(refusal.unwrap_or_default()),
         AiProvider::ClaudeCli => test_claude_cli_connection(&ai_settings.claude_cli).await,
         AiProvider::ClaudeApi => test_claude_api_connection(&ai_settings.claude_api).await,
         AiProvider::GeminiCli => test_gemini_cli_connection(&ai_settings.gemini_cli).await,
@@ -513,28 +563,39 @@ async fn test_claude_cli_connection(settings: &ClaudeCliSettings) -> Result<Stri
 
 /// Test Claude API connection
 async fn test_claude_api_connection(settings: &ClaudeApiSettings) -> Result<String, String> {
-    // Get API key from keychain
-    let api_key = get_ai_api_key("claude_api")
-        .map_err(|e| {
-            String::from(AppError::ConfigError(format!(
-                "Failed to retrieve API key: {}",
-                e
-            )))
-        })?
-        .ok_or_else(|| "No API key configured. Please enter your Claude API key.".to_string())?;
+    // Vendor host + keychain key, or the declared model gateway + its
+    // api-key-helper key (`crate::model_gateway`). Resolved on a blocking
+    // thread: the helper is a subprocess.
+    let call = spawn_blocking_tracked(|| {
+        crate::model_gateway::ModelCall::resolve(|| {
+            get_ai_api_key("claude_api")
+                .map_err(|e| {
+                    String::from(AppError::ConfigError(format!(
+                        "Failed to retrieve API key: {}",
+                        e
+                    )))
+                })?
+                .ok_or_else(|| {
+                    "No API key configured. Please enter your Claude API key.".to_string()
+                })
+        })
+    })
+    .await
+    .map_err(|e| format!("credential resolution task failed: {e}"))??;
 
     info!(
-        "Testing Claude API connection with model: {}",
-        settings.model
+        "Testing Claude API connection with model: {} (route: {})",
+        settings.model,
+        call.route_label()
     );
 
     // Make a minimal API request to test the connection
     let client = reqwest::Client::new();
-    // coord-auth-exempt(not-coord): Anthropic's API. A coord bearer here would be
-    // a credential leak to a third party.
-    let response = client
-        .post("https://api.anthropic.com/v1/messages")
-        .header("x-api-key", &api_key)
+    // Not a coord write: Anthropic's API or the operator's declared model
+    // gateway, built by `ModelCall` (which never attaches a coord bearer — that
+    // would be a credential leak to a third party).
+    let response = call
+        .post_async(&client, crate::model_gateway::MESSAGES_PATH)
         .header("anthropic-version", "2023-06-01")
         .header("content-type", "application/json")
         .json(&serde_json::json!({
@@ -932,60 +993,69 @@ pub fn save_agentic_settings(
     );
 
     // Get existing settings to preserve other configurations
-    let existing_settings = settings::get_ai_settings();
+    // Read-modify-write under the AI-settings write lock so a concurrent
+    // save (HTTP PUT, another command) cannot be lost between the read and
+    // the write.
+    settings::update_ai_settings(|existing_settings| {
+        let compression_config = CompressionConfig {
+            enabled: compression_enabled,
+            threshold_tokens: compression_threshold_tokens,
+            target_tokens: compression_target_tokens,
+            keep_recent_items: compression_keep_recent_items,
+            summarize_batch_size: compression_summarize_batch_size,
+            tokens_per_char: existing_settings.compression.tokens_per_char, // Preserve advanced setting
+        };
 
-    let compression_config = CompressionConfig {
-        enabled: compression_enabled,
-        threshold_tokens: compression_threshold_tokens,
-        target_tokens: compression_target_tokens,
-        keep_recent_items: compression_keep_recent_items,
-        summarize_batch_size: compression_summarize_batch_size,
-        tokens_per_char: existing_settings.compression.tokens_per_char, // Preserve advanced setting
-    };
+        let retry_config = RetryConfig {
+            enabled: retry_enabled,
+            max_retries: retry_max_retries,
+            base_delay_ms: retry_base_delay_ms,
+            max_delay_ms: retry_max_delay_ms,
+            exponential_base: retry_exponential_base,
+            jitter: retry_jitter,
+            feedback_injection: retry_feedback_injection,
+            retryable_errors: existing_settings.retry.retryable_errors, // Preserve custom patterns
+        };
 
-    let retry_config = RetryConfig {
-        enabled: retry_enabled,
-        max_retries: retry_max_retries,
-        base_delay_ms: retry_base_delay_ms,
-        max_delay_ms: retry_max_delay_ms,
-        exponential_base: retry_exponential_base,
-        jitter: retry_jitter,
-        feedback_injection: retry_feedback_injection,
-        retryable_errors: existing_settings.retry.retryable_errors, // Preserve custom patterns
-    };
+        let routing_config = RoutingConfig {
+            enabled: routing_enabled,
+            simple_model: routing_simple_model,
+            medium_model: routing_medium_model,
+            complex_model: routing_complex_model,
+            file_count_thresholds: (routing_file_threshold_simple, routing_file_threshold_medium),
+            prompt_length_thresholds: existing_settings.routing.prompt_length_thresholds, // Preserve
+            complex_keywords: existing_settings.routing.complex_keywords, // Preserve
+            simple_keywords: existing_settings.routing.simple_keywords,   // Preserve
+        };
 
-    let routing_config = RoutingConfig {
-        enabled: routing_enabled,
-        simple_model: routing_simple_model,
-        medium_model: routing_medium_model,
-        complex_model: routing_complex_model,
-        file_count_thresholds: (routing_file_threshold_simple, routing_file_threshold_medium),
-        prompt_length_thresholds: existing_settings.routing.prompt_length_thresholds, // Preserve
-        complex_keywords: existing_settings.routing.complex_keywords,                 // Preserve
-        simple_keywords: existing_settings.routing.simple_keywords,                   // Preserve
-    };
+        let ai_settings = AiSettings {
+            provider: existing_settings.provider,
+            claude_cli: existing_settings.claude_cli,
+            claude_api: existing_settings.claude_api,
+            gemini_cli: existing_settings.gemini_cli,
+            gemini_api: existing_settings.gemini_api,
+            pi_cli: existing_settings.pi_cli,
+            ollama: existing_settings.ollama,
+            openai_compatible: existing_settings.openai_compatible,
+            auto_refine_video_after_iterations: existing_settings
+                .auto_refine_video_after_iterations,
+            compression: compression_config,
+            retry: retry_config,
+            routing: routing_config,
+            interactive_sessions_enabled: existing_settings.interactive_sessions_enabled,
+            ai_path_prediction_enabled: existing_settings.ai_path_prediction_enabled,
+            // Preserve — see the note in `save_ai_settings`; reconstructing this
+            // from the default would silently re-enable federation on every save.
+            git_op_federation_enabled: existing_settings.git_op_federation_enabled,
+        };
 
-    let ai_settings = AiSettings {
-        provider: existing_settings.provider,
-        claude_cli: existing_settings.claude_cli,
-        claude_api: existing_settings.claude_api,
-        gemini_cli: existing_settings.gemini_cli,
-        gemini_api: existing_settings.gemini_api,
-        pi_cli: existing_settings.pi_cli,
-        ollama: existing_settings.ollama,
-        openai_compatible: existing_settings.openai_compatible,
-        auto_refine_video_after_iterations: existing_settings.auto_refine_video_after_iterations,
-        compression: compression_config,
-        retry: retry_config,
-        routing: routing_config,
-        interactive_sessions_enabled: existing_settings.interactive_sessions_enabled,
-        ai_path_prediction_enabled: existing_settings.ai_path_prediction_enabled,
-        // Preserve — see the note in `save_ai_settings`; reconstructing this
-        // from the default would silently re-enable federation on every save.
-        git_op_federation_enabled: existing_settings.git_op_federation_enabled,
-    };
-
-    settings::save_ai_settings(ai_settings).map_err(|e| {
+        Ok::<_, std::convert::Infallible>(ai_settings)
+    })
+    .map_err(|e| {
+        let e = match e {
+            settings::AiSettingsUpdateError::SaveFailed(msg) => msg,
+            settings::AiSettingsUpdateError::Rejected(never) => match never {},
+        };
         String::from(AppError::ConfigError(format!(
             "Failed to save agentic settings: {}",
             e
@@ -1083,8 +1153,17 @@ fn compute_expected_usage(
     )
 }
 
-/// Read the OAuth access token from a Claude config directory's credentials file.
+/// Read the OAuth token a Claude config directory authenticates with: its
+/// long-lived `claude setup-token` token (`settings.json`
+/// `env.CLAUDE_CODE_OAUTH_TOKEN`) when it has one — that is what a `claude`
+/// child under this dir uses, since Claude Code applies the settings `env`
+/// block — else the access token in its `.credentials.json`.
 pub(crate) fn read_oauth_token(config_dir: &str) -> Result<String, String> {
+    if let Some(token) =
+        qontinui_runner_lib::claude_oauth_token::from_config_dir(std::path::Path::new(config_dir))
+    {
+        return Ok(token);
+    }
     let creds_path = std::path::PathBuf::from(config_dir).join(".credentials.json");
     let content = std::fs::read_to_string(&creds_path).map_err(|e| {
         String::from(AppError::IoError(std::io::Error::new(
@@ -1159,6 +1238,22 @@ static USAGE_PROBE_CACHE: Lazy<
 ///
 /// See [`crate::commands::usage_probe_cache`] for the mechanism.
 pub async fn probe_account_usage(config_dir: String) -> AccountUsageInfo {
+    // Subscription accounts are off while a model gateway is declared, and a
+    // subscription token must not be spent or sent on their behalf
+    // (`crate::model_gateway`). Answered before the cache so no stale sample
+    // outlives the switch.
+    if crate::model_gateway::gateway_declared() {
+        let label = std::path::Path::new(&config_dir)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| config_dir.clone());
+        return AccountUsageInfo {
+            config_dir,
+            label,
+            error: Some(crate::model_gateway::SUBSCRIPTION_OFF_REASON.to_string()),
+            ..Default::default()
+        };
+    }
     let key = config_dir.clone();
     USAGE_PROBE_CACHE
         .get_or_fetch(&key, move || probe_account_usage_uncached(config_dir))
@@ -1272,12 +1367,14 @@ async fn probe_account_usage_uncached(config_dir: String) -> AccountUsageInfo {
     // `anthropic-beta: oauth-2025-04-20`; API keys (`sk-ant-api*`) go via
     // `x-api-key`. `anthropic_auth::apply_async` dispatches on token prefix.
     let client = reqwest::Client::new();
-    let request = crate::ai_provider::anthropic_auth::apply_async(
-        // coord-auth-exempt(not-coord): Anthropic's API, authenticated by the
-        // operator's own OAuth/API credential via `anthropic_auth::apply_async`.
-        client.post("https://api.anthropic.com/v1/messages"),
-        &token,
-    )
+    // Not a coord write: Anthropic's API, authenticated by the operator's own
+    // OAuth/API credential via `anthropic_auth::apply_async`.
+    // Always the vendor route: this measures a subscription account's own quota,
+    // and `probe_account_usage` never reaches here while a gateway is declared.
+    let request = crate::model_gateway::ModelCall::Vendor {
+        token: token.to_string(),
+    }
+    .post_async(&client, crate::model_gateway::MESSAGES_PATH)
     .header("anthropic-version", "2023-06-01")
     .header("content-type", "application/json")
     .json(&serde_json::json!({
@@ -1584,7 +1681,8 @@ mod usage_twin_report {
         /// stored by coord in its own `coord.prepaid_balances` table.
         prepaid: Vec<WirePrepaid<'a>>,
         /// The machine-global selection strategy, snake_case
-        /// (`"manual"` | `"least_usage"` — see
+        /// (`"manual"` | `"least_usage"` | `"highest_expected_usage"` |
+        /// `"weighted_random"` | `"alternating_handoff"` — see
         /// [`crate::settings::AccountSelectionMode::as_str`]). Per-REPORT, not
         /// per-account: the roster file holds one mode for the whole box.
         ///
@@ -1648,20 +1746,116 @@ mod usage_twin_report {
         // coord-tenant-scope(device): the payload is this machine's whole Claude-account roster (:1540-1561) -- a device property, with no session and no artifact in scope.
         let req = qontinui_runner_lib::auth::attach_device_auth(client.post(&url));
         match req.json(&body).send().await {
-            Ok(resp) if resp.status().is_success() => {
-                debug!(
-                    accounts = results.len(),
-                    prepaid = prepaid.len(),
-                    "account usage mirrored to coord twin"
-                );
-            }
             Ok(resp) => {
-                warn!(status = %resp.status(), "coord account-usage ingest non-2xx (older coord?) — skipped");
+                let status = resp.status().as_u16();
+                let success = resp.status().is_success();
+                let bytes = resp.bytes().await.unwrap_or_default();
+                // coord's FleetPrincipal verifies the bearer on this route, so
+                // a 2xx is a real Accepted (resets the dark streak); coord's
+                // codeless 403 classifies Indeterminate and records nothing.
+                crate::mcp::device_jwt_refresher::note_coord_upstream_verdict(
+                    None, true, status, &bytes,
+                );
+                if success {
+                    *last_refusal().lock().unwrap_or_else(|e| e.into_inner()) = None;
+                    debug!(
+                        accounts = results.len(),
+                        prepaid = prepaid.len(),
+                        "account usage mirrored to coord twin"
+                    );
+                } else {
+                    let body = String::from_utf8_lossy(&bytes);
+                    let posture = crate::mcp::device_jwt_refresher::coord_credential_posture()
+                        .map(|s| s.posture);
+                    if let Some(line) = refusal_warning(last_refusal(), status, &body, posture) {
+                        warn!("{line}");
+                    }
+                }
             }
             Err(e) => {
                 warn!(error = %e, "coord account-usage report failed — skipped");
             }
         }
+    }
+
+    /// The (status, refusal token, posture) of the last refusal WARNed. The report runs on
+    /// every usage refresh, so an unchanged refusal must not re-WARN each tick
+    /// (147 identical lines in one day on 2026-10-07). Cleared on a 2xx so the
+    /// next refusal after a recovery is announced again.
+    type RefusalKey = (u16, String, String);
+
+    fn last_refusal() -> &'static std::sync::Mutex<Option<RefusalKey>> {
+        static LAST: std::sync::Mutex<Option<RefusalKey>> = std::sync::Mutex::new(None);
+        &LAST
+    }
+
+    /// The WARN line for a non-2xx ingest answer, or `None` when it repeats
+    /// the last one.
+    ///
+    /// 401/403 is a CREDENTIAL refusal, not route-absence: coord's ingest
+    /// answers every device-verification failure with a uniform
+    /// `403 {"error":"auth_required"}` and no typed code
+    /// (qontinui-coord `fleet_principal.rs`), so the cause cannot be read off
+    /// the response — it is named from the runner's own credential posture.
+    /// Every other status keeps the older-coord wording.
+    fn refusal_warning(
+        last: &std::sync::Mutex<Option<RefusalKey>>,
+        status: u16,
+        body: &str,
+        posture: Option<crate::mcp::device_jwt_refresher::CoordCredentialPosture>,
+    ) -> Option<String> {
+        use crate::mcp::device_jwt_refresher::upstream_refusal_code;
+        let credential = matches!(status, 401 | 403);
+        let posture_label = match posture {
+            Some(p) => match p.cause() {
+                Some(cause) => format!("{} ({cause})", p.as_str()),
+                None => p.as_str().to_string(),
+            },
+            None => "unknown (no refresher pass yet)".to_string(),
+        };
+        let code = if credential {
+            upstream_refusal_code(body)
+                .or_else(|| {
+                    serde_json::from_str::<serde_json::Value>(body)
+                        .ok()?
+                        .get("error")?
+                        .as_str()
+                        .map(str::to_string)
+                })
+                .unwrap_or_else(|| "none".to_string())
+        } else {
+            String::new()
+        };
+        let key = (
+            status,
+            code.clone(),
+            if credential {
+                posture_label.clone()
+            } else {
+                String::new()
+            },
+        );
+        {
+            let mut guard = last.lock().unwrap_or_else(|e| e.into_inner());
+            if guard.as_ref() == Some(&key) {
+                return None;
+            }
+            *guard = Some(key);
+        }
+        if !credential {
+            return Some(format!(
+                "coord account-usage ingest non-2xx ({status}) (older coord?) — skipped"
+            ));
+        }
+        let action = if posture.is_some_and(|p| p.can_answer()) {
+            "credential looks live locally; coord does not say why"
+        } else {
+            "re-pair"
+        };
+        Some(format!(
+            "coord account-usage ingest refused ({status} {code}) — credential rejected; \
+             runner coord credential posture: {posture_label} — device feed not updating; {action}"
+        ))
     }
 
     #[cfg(test)]
@@ -1705,6 +1899,47 @@ mod usage_twin_report {
                 acct.get("config_dir").is_none(),
                 "the wire must never carry a local path"
             );
+        }
+
+        /// An expired credential against coord's uniform
+        /// `403 {"error":"auth_required"}` yields ONE credential-rejected WARN
+        /// across repeated reports — not one per refresh — and a recovery
+        /// re-arms it.
+        #[test]
+        fn expired_credential_refusal_warns_once_per_state_change() {
+            use crate::mcp::device_jwt_refresher::CoordCredentialPosture;
+            let last = std::sync::Mutex::new(None);
+            let body = r#"{"error":"auth_required"}"#;
+            let expired = Some(CoordCredentialPosture::Expired);
+            let lines: Vec<String> = (0..5)
+                .filter_map(|_| refusal_warning(&last, 403, body, expired))
+                .collect();
+            assert_eq!(lines.len(), 1, "one WARN, not one per tick: {lines:?}");
+            let line = &lines[0];
+            assert!(line.contains("refused (403 auth_required)"), "{line}");
+            assert!(line.contains("credential rejected"), "{line}");
+            assert!(line.contains("posture: expired"), "{line}");
+            assert!(line.ends_with("re-pair"), "{line}");
+            assert!(!line.contains("older coord"), "{line}");
+
+            // A posture change is new information and WARNs again.
+            let absent = refusal_warning(&last, 403, body, Some(CoordCredentialPosture::Absent));
+            assert!(absent.is_some_and(|l| l.contains("posture: absent")));
+
+            // A 2xx clears the state (what `report_to_coord` does), so the
+            // next refusal is announced again.
+            *last.lock().unwrap() = None;
+            assert!(refusal_warning(&last, 403, body, expired).is_some());
+        }
+
+        /// A 404 is route-absence and keeps the older-coord wording.
+        #[test]
+        fn not_found_keeps_older_coord_wording() {
+            let last = std::sync::Mutex::new(None);
+            let line = refusal_warning(&last, 404, "", None).expect("first warns");
+            assert!(line.contains("older coord?"), "{line}");
+            assert!(!line.contains("credential"), "{line}");
+            assert!(refusal_warning(&last, 404, "", None).is_none());
         }
 
         /// `is_active` is a per-account flag; a report where nothing has been
@@ -1955,10 +2190,46 @@ pub(crate) fn find_claude_credentials_path() -> Option<std::path::PathBuf> {
     None
 }
 
+/// The long-lived `claude setup-token` token for the account a spawn would
+/// use, with the settings file it came from: the effective (selected or
+/// pinned) config dir's, else — only when no dir is in force — the ambient one
+/// a child with no `CLAUDE_CONFIG_DIR` inherits.
+///
+/// Checked BEFORE [`find_claude_credentials_path`] by its callers because, for
+/// the same account dir, Claude Code authenticates with the settings token in
+/// preference to `.credentials.json`.
+pub(crate) fn find_long_lived_token() -> Option<(String, Option<std::path::PathBuf>)> {
+    use qontinui_runner_lib::claude_oauth_token as tok;
+    let ai_settings = settings::get_ai_settings();
+    let (effective_dir, _source) =
+        crate::ai_provider::get_effective_config_dir(&ai_settings.claude_cli);
+    match effective_dir {
+        Some(dir) => {
+            let dir = std::path::PathBuf::from(dir);
+            tok::from_config_dir(&dir).map(|t| (t, Some(tok::settings_path(&dir))))
+        }
+        None => tok::ambient().map(|t| (t, None)),
+    }
+}
+
 /// Read and parse Claude CLI auth status from credentials file.
 pub fn get_cli_auth_status() -> CliAuthStatus {
     let ai_settings = settings::get_ai_settings();
     let is_cli = matches!(ai_settings.provider, AiProvider::ClaudeCli);
+
+    // A long-lived token does not expire on the runner's clock and is never
+    // refreshed, so it reports as valid with no expiry.
+    if let Some((_token, source)) = find_long_lived_token() {
+        return CliAuthStatus {
+            has_credentials: true,
+            expired: false,
+            is_cli_provider: is_cli,
+            expires_at: None,
+            minutes_until_expiry: None,
+            subscription_type: Some("long-lived token".to_string()),
+            credentials_path: source.map(|p| p.to_string_lossy().to_string()),
+        };
+    }
 
     let creds_path = match find_claude_credentials_path() {
         Some(p) => p,
@@ -2418,6 +2689,54 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
             reset_provider_circuit,
         ])
         .build()
+}
+
+#[cfg(test)]
+mod save_selection_mode_tests {
+    use super::*;
+
+    #[test]
+    fn absent_mode_keeps_the_stored_mode() {
+        for stored in [
+            AccountSelectionMode::Manual,
+            AccountSelectionMode::LeastUsage,
+            AccountSelectionMode::HighestExpectedUsage,
+            AccountSelectionMode::WeightedRandom,
+            AccountSelectionMode::AlternatingHandoff,
+        ] {
+            assert_eq!(resolve_saved_selection_mode(None, stored), stored);
+        }
+    }
+
+    #[test]
+    fn sent_mode_replaces_the_stored_mode() {
+        let stored = AccountSelectionMode::Manual;
+        assert_eq!(
+            resolve_saved_selection_mode(Some("least_usage"), stored),
+            AccountSelectionMode::LeastUsage
+        );
+        assert_eq!(
+            resolve_saved_selection_mode(Some("highest_expected_usage"), stored),
+            AccountSelectionMode::HighestExpectedUsage
+        );
+        assert_eq!(
+            resolve_saved_selection_mode(Some("manual"), AccountSelectionMode::LeastUsage),
+            AccountSelectionMode::Manual
+        );
+        assert_eq!(
+            resolve_saved_selection_mode(Some("weighted_random"), stored),
+            AccountSelectionMode::WeightedRandom
+        );
+        assert_eq!(
+            resolve_saved_selection_mode(Some("alternating_handoff"), stored),
+            AccountSelectionMode::AlternatingHandoff
+        );
+        // An unknown spelling falls back to the default.
+        assert_eq!(
+            resolve_saved_selection_mode(Some("bogus"), stored),
+            AccountSelectionMode::default()
+        );
+    }
 }
 
 #[cfg(test)]

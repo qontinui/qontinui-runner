@@ -73,8 +73,9 @@ do not re-derive it from a summary elsewhere.
 | coord `coord_memory_search` | `{hits, vector_arm, live_row_count, query_echo, anchored_hits, anchored_hit_count, …}` — **no `count`** (measured live 2026-09-26; web `MemoryQueryResponse` declares none) | `require_key(p, "hits")` — NOT `require_collection`, which would answer UNKNOWN on the absent `count` every time. Beside a zero read `live_row_count` (this response's own tenant-wide denominator) and `vector_arm` (`skipped_no_embedding` is the normal case); a zero against `live_row_count > 0` is still a hypothesis until a control query returns rows |
 | coord `coord_memory_overview` | `{row_count, corpus_complete, facets: {live_row_count, by_kind, by_scope} or null, …}` | `require_key(p, "facets.live_row_count")` — NESTED under `facets` (a top-level `live_row_count` read is the wrong-key defect); `facets: null` beside `corpus_complete: false` is UNKNOWN |
 | web `GET /api/v1/memory/records` | `{records, next_cursor, count}` | `require_collection(p, "records")` |
-| web `GET /api/v1/plan-library` | `{items, total, offset, limit, count}` | `require_collection(p, "items")`; `total` is the UNPAGED total |
-| web `/plan-library/candidates`, `/open-followups` | `{items, total, count}` | `require_collection(p, "items")` |
+| web `GET /api/v1/plan-library` | `{items, count, limit, shown, total, truncated, bound_kind, next_cursor, …}` (shared `BoundedReadMeta`) | `require_collection(p, "items")`; `total` counts from THIS page's start; walk `next_cursor` (sent back as `cursor`) |
+| web `/plan-library/candidates`, `/followups` | `{items, total, count, truncated, bound_kind, next_cursor, …}` | `require_collection(p, "items")`; keyset, no `offset` |
+| web `/plan-library/reconciliation` | `{items, total, count, truncated, bound_kind, next_cursor, …}` (`BoundedReadMeta`) | `require_collection(p, "items")`; follow `next_cursor` until null — page 1 is never the corpus |
 
 `count` is REQUIRED by `require_collection`: absent is an `EnvelopeUnknown`
 (the backend predates the phase that added it — that is unknown, not zero),

@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
-# Pre-push guard: mirrors CI's Rust gate so a correctness failure is surfaced
-# in 60-90s of local cycle time instead of 8-15 min of CI roundtrip per push.
+# Pre-push guard: mirrors the default-target clippy/fmt gate of CI's ubuntu leg so a
+# correctness failure is surfaced in 60-90s of local cycle time instead of
+# 8-15 min of CI roundtrip per push. CI's parallel `clippy-windows` job ALSO
+# lints test targets (`--all-targets`), so a deny-tier lint in shared
+# #[cfg(test)] code passes this hook and fails that job (see the T1 note below).
 # Tiered per plan 2026-07-05-lint-tiers-and-diff-scoped-gates: formatting
 # auto-applies (never blocks), and clippy runs plain (no `-D warnings`) so only
 # deny-tier (correctness/suspicious) lints from Cargo.toml [lints.clippy] block.
@@ -88,8 +91,8 @@ if [[ -f "$PUSH_RANGE_LIB" && -f "$CRATE_INPUTS_LIB" ]]; then
     echo "[pre-push] no upstream, origin/HEAD or origin/main to scope the diff against — running the full gate"
   else
     # THE SCOPE IS NOT `src-tauri/`, and the gap is not only about embeds.
-    # `cd src-tauri && cargo clippy` — this hook's own command, and CI's —
-    # also compiles the in-repo path dependencies (`crates/spec-check`,
+    # `cd src-tauri && cargo clippy` — this hook's own command, and CI's
+    # (clippy-windows adds `--all-targets`) — also compiles the in-repo path dependencies (`crates/spec-check`,
     # `crates/runner-stats`, `crates/runner-win32`, `vendor/tao-0.35.0`), reads
     # what `build.rs` declares (`src/components/app/tab-types.ts`, whose
     # absence build.rs turns into a deliberate `panic!`), and takes its verdict
@@ -275,7 +278,8 @@ STRICT="${QONTINUI_PREPUSH_STRICT:-0}"
 # DELIBERATE. gen-events-drift.sh truthfully tells you CI does NOT cover its TS
 # domain. Here the reverse is true and verified: ci.yml runs
 # `cargo fmt -- --check` and `cargo clippy` inside the REQUIRED
-# `test (ubuntu-22.04)` context, plus a parallel `clippy-windows` job. Copying
+# `test (ubuntu-22.04)` context, plus a parallel `clippy-windows` job (check
+# context `Clippy (windows)`, run with `--all-targets`). Copying
 # the sibling's wording would tell developers they are unprotected when they
 # are not.
 cannot_evaluate() {
@@ -296,7 +300,8 @@ cannot_evaluate() {
   echo "[pre-push]   Coverage while this is unresolved: CI STILL GATES BOTH HALVES." >&2
   echo "[pre-push]   ci.yml runs 'cargo fmt -- --check' and 'cargo clippy' inside the" >&2
   echo "[pre-push]   required 'test (ubuntu-22.04)' context, plus a parallel" >&2
-  echo "[pre-push]   'clippy-windows' job. Declining here costs LATENCY, NOT COVERAGE:" >&2
+  echo "[pre-push]   'Clippy (windows)' check (which also lints test targets)." >&2
+  echo "[pre-push]   Declining here costs LATENCY, NOT COVERAGE:" >&2
   echo "[pre-push]   you lose the 60-90s local signal, not the gate itself." >&2
   if [[ "$STRICT" == "1" ]]; then
     echo "[pre-push]   QONTINUI_PREPUSH_STRICT=1 — treating this as a failure." >&2
@@ -443,8 +448,12 @@ if [[ "$SKIP_CLIPPY" == "1" ]]; then
 fi
 
 # T1 (correctness) — block. Plain `cargo clippy`: NO `--all-targets` (that
-# compiles #[cfg(test)] modules this PR didn't touch — stricter than CI and a
-# frequent source of unrelated-lint push blocks) and NO `-D warnings` (that
+# compiles #[cfg(test)] modules this PR didn't touch, a frequent source of
+# unrelated-lint push blocks, and it would lengthen every push on fleet
+# hosts). This makes the hook LOOSER than CI's `clippy-windows` job for test
+# code — that job runs `--all-targets` per PR (qontinui-runner#2392), so a
+# deny-tier lint in shared #[cfg(test)] code is caught there, not here; the
+# ubuntu leg stays default-target like this hook. Also NO `-D warnings` (that
 # would promote every warning to an error and neuter the Cargo.toml tiering).
 # Lint levels come solely from `[lints.clippy]` in src-tauri/Cargo.toml: a
 # `deny`-tier (correctness/suspicious) lint still exits non-zero and blocks,
@@ -478,10 +487,44 @@ echo "[pre-push] cargo clippy (levels from Cargo.toml [lints.clippy]; deny-tier 
 # a cause it cannot support.
 CLIPPY_LOG="$(mktemp)"
 cleanup_clippy_log() { rm -f "$CLIPPY_LOG"; }
-trap 'restore_lock; cleanup_clippy_log' EXIT
+# A missing lib/shared-target.sh (noted above) defines no release; the trap
+# must still run the other two.
+declare -F release_shared_target >/dev/null 2>&1 || release_shared_target() { :; }
+trap 'restore_lock; cleanup_clippy_log; release_shared_target' EXIT
+
+# Build under the shared target's TREE LOCK and freshness ledger, or not at all.
+# Without them cargo replays a PEER worktree's units from a shared target as
+# Fresh, and clippy reports that peer's errors as this tree's: on 2026-10-29 a
+# false `error[E0432]` for a module that existed in the pushed tree (coord
+# finding 7b603cde; see lib/shared-target.sh). Taken AFTER the skip exit, so a
+# fmt-only push takes no lock, and after every scope-sensitive git call above.
+GUARD_RC=10
+if declare -F guard_shared_target >/dev/null 2>&1; then
+  GUARD_RC=0
+  guard_shared_target "$ROOT" "[pre-push]" "$ROOT/src-tauri" || GUARD_RC=$?
+fi
+case "$GUARD_RC" in
+  0|10) ;;
+  *)
+    echo >&2
+    echo "[pre-push] CANNOT RUN CLIPPY GUARDED — ${SHARED_TARGET_GUARD_REASON:-guard rc $GUARD_RC}." >&2
+    echo "[pre-push]   A clippy run without the tree lock can replay a PEER worktree's build as" >&2
+    echo "[pre-push]   Fresh and report errors that are not in this tree, so it is not run." >&2
+    echo "[pre-push]   CI still gates clippy ('test (ubuntu-22.04)', 'Clippy (windows)'); fmt above" >&2
+    echo "[pre-push]   still ran. This costs LATENCY, NOT COVERAGE." >&2
+    if [[ "$STRICT" == "1" ]]; then
+      echo "[pre-push]   QONTINUI_PREPUSH_STRICT=1 — treating this as a failure." >&2
+      exit 1
+    fi
+    echo "[pre-push]   Not blocking the push. Set QONTINUI_PREPUSH_STRICT=1 to block instead." >&2
+    exit 0
+    ;;
+esac
 
 clippy_rc=0
-cargo clippy 2>&1 | tee "$CLIPPY_LOG" || clippy_rc=$?
+# `9>&-`: the tree lock's descriptor (flock arm) must not leak into cargo or a
+# daemon it spawns, which could otherwise hold the lock past this hook's exit.
+cargo clippy 9>&- 2>&1 | tee "$CLIPPY_LOG" || clippy_rc=$?
 if [[ "$clippy_rc" -ne 0 ]]; then
   rc="$clippy_rc"
   echo
@@ -501,6 +544,25 @@ if [[ "$clippy_rc" -ne 0 ]]; then
   elif [[ "$rc" -eq 127 ]] || grep -qiE 'command not found|could not execute|no such file or directory' "$CLIPPY_LOG"; then
     echo "[pre-push] FAIL — clippy could not run at all (exit $rc). This is NOT a lint failure."
     echo "          Check the toolchain: rustup component add clippy."
+  elif grep -qE '^error\[E[0-9]{4}\]' "$CLIPPY_LOG"; then
+    # A rustc error CODE is a compile error, not a clippy lint (lints carry
+    # none). Calling it "a lint fired" sent the 2026-10-29 push hunting a lint
+    # that did not exist.
+    echo "[pre-push] FAIL — a compile error (or deny-tier lint) — see the error[E…] lines above."
+    # Said on EVERY coded error, guarded or not: the tree lock only knows builds
+    # that take it, and cargo-guard.sh (until qontinui-claude-config#1823),
+    # rust-analyzer or a raw cargo can still leave a peer's units in the target
+    # (see lib/shared-target.sh, "WHAT IT DOES NOT COVER").
+    if [[ "$GUARD_RC" == "10" ]]; then
+      echo "          This target is UNGUARDED, so a peer checkout's stale build can"
+      echo "          be the cause."
+    else
+      echo "          The target was guarded, but builds that skip the tree lock can"
+      echo "          still leave a peer checkout's stale units behind."
+    fi
+    echo "          If the error names code that EXISTS in this tree, re-run with a"
+    echo "          private CARGO_TARGET_DIR before changing any code."
+    echo "          Fix it, or QONTINUI_PREPUSH_SKIP=1 git push to let CI gate."
   elif grep -qE '^error(\[|:)' "$CLIPPY_LOG"; then
     echo "[pre-push] FAIL — a deny-tier (correctness/suspicious) clippy lint fired."
     echo "          Fix the lint, or QONTINUI_PREPUSH_SKIP=1 git push to let CI gate."

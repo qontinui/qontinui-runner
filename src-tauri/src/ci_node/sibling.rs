@@ -111,8 +111,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
-use super::checkout::run_git;
 use super::manifest::{CiSibling, SiblingPin};
+use super::sibling_git_env::{self, run_sibling_git, SiblingGitEnv};
 use crate::github_budget::{self, CacheMode};
 use crate::trigger_system::github_api::{cache_action, CacheAction};
 
@@ -202,13 +202,20 @@ pub(crate) fn forms_label(forms: &[DeclarationForm]) -> String {
 pub(crate) enum DeclaredTarget {
     /// No declaration — resolve to the sibling's branch.
     None,
-    /// A declaration exists and is unambiguous, but it orders the sibling
-    /// AFTER this side and this step did not opt in
-    /// ([`CiSibling::accept_trailing_sibling`]). Resolve to the branch — but
-    /// as a DECIDED outcome that names itself in the log, never as a silent
-    /// fallback that is indistinguishable from "nobody declared anything".
+    /// Only declarations ordering the sibling AFTER this side exist, and this
+    /// step did not opt in ([`CiSibling::accept_trailing_sibling`]). Resolve
+    /// to the branch — but as a DECIDED outcome that names itself in the log,
+    /// never as a silent fallback that is indistinguishable from "nobody
+    /// declared anything".
+    ///
+    /// `numbers` may hold SEVERAL sibling PRs, and that is not ambiguous here:
+    /// none of their trees is followed, so the answer is the branch however
+    /// many trail. Refusing them was a false red (runner#2311, 2026-10-31:
+    /// ui-bridge#266 and #270 both legitimately declared
+    /// `coord:downstream-of=qontinui-runner#2311`). Mirrors
+    /// `.github/actions/checkout-sibling/action.yml`.
     TrailingSiblingDeclined {
-        number: u64,
+        numbers: Vec<u64>,
         forms: Vec<DeclarationForm>,
     },
     Pr {
@@ -270,9 +277,12 @@ fn ambiguous(what: &str, sibling_repo: &str, numbers: &[u64]) -> String {
 /// the author's to resolve, never ours to guess. Ways to be ambiguous, all
 /// hard-failing alike:
 ///
-/// * two same-direction labels on the dispatched PR naming different siblings,
-/// * two sibling PRs declaring the same form at this one,
-/// * any two forms naming DIFFERENT sibling PRs,
+/// * two `downstream-of` labels on the dispatched PR naming different siblings,
+/// * two sibling PRs declaring `upstream-of` at this one,
+/// * a LEADING form and any other form naming DIFFERENT sibling PRs,
+/// * only when `accept_trailing_sibling` is set: the TRAILING forms naming
+///   different sibling PRs (with it unset they are all declined, so several
+///   of them are [`DeclaredTarget::TrailingSiblingDeclined`], not an error),
 /// * both merge ORDERS declared for the same pair — a cycle in coord's dep
 ///   graph, which holds BOTH pull requests forever. Compiling against the
 ///   right tree would hide that behind a green check, so it reds here.
@@ -347,17 +357,6 @@ pub(crate) fn resolve_declaration(
             &downs,
         ));
     }
-    let self_ups = dedup(self_ups);
-    if self_ups.len() > 1 {
-        return Err(ambiguous(
-            &format!(
-                "this pull request carries {UPSTREAM_PREFIX} labels naming DIFFERENT \
-                 {sibling_short} pull requests"
-            ),
-            sibling_repo,
-            &self_ups,
-        ));
-    }
     let ups = dedup(ups);
     if ups.len() > 1 {
         return Err(ambiguous(
@@ -369,33 +368,27 @@ pub(crate) fn resolve_declaration(
             &ups,
         ));
     }
+    // The two TRAILING forms (this side leads) are kept as SETS rather than
+    // refused at >1 the way the leading forms are above. Several sibling PRs
+    // declaring that they land AFTER this one is an ordinary state — one
+    // change that two independent adaptations both wait on — and it is a
+    // contradiction only when ONE tree must be chosen from the set: when a
+    // leading form exists, or when this step follows a trailing sibling. Both
+    // are decided below. Refusing it here hard-failed runner#2311 (ui-bridge
+    // #266 and #270) on a step that would have built the branch anyway.
+    let self_ups = dedup(self_ups);
     let sib_downs = dedup(sib_downs);
-    if sib_downs.len() > 1 {
-        return Err(ambiguous(
-            &format!(
-                "several open {sibling_short} pull requests declare \
-                 {DOWNSTREAM_PREFIX}{this_short}#{this_pr}"
-            ),
-            sibling_repo,
-            &sib_downs,
-        ));
-    }
 
     // Reconcile the four forms. Order is stable so the provenance string and
     // the tests do not depend on hash iteration order.
     let mut forms: Vec<DeclarationForm> = Vec::new();
-    let mut targets: Vec<u64> = Vec::new();
-    for (hit, form) in [
-        (downs.first().copied(), DeclarationForm::DownstreamOf),
-        (ups.first().copied(), DeclarationForm::UpstreamOf),
-        (self_ups.first().copied(), DeclarationForm::SelfUpstreamOf),
-        (
-            sib_downs.first().copied(),
-            DeclarationForm::SiblingDownstreamOf,
-        ),
+    for (hits, form) in [
+        (&downs, DeclarationForm::DownstreamOf),
+        (&ups, DeclarationForm::UpstreamOf),
+        (&self_ups, DeclarationForm::SelfUpstreamOf),
+        (&sib_downs, DeclarationForm::SiblingDownstreamOf),
     ] {
-        if let Some(n) = hit {
-            targets.push(n);
+        if !hits.is_empty() {
             forms.push(form);
         }
     }
@@ -403,7 +396,52 @@ pub(crate) fn resolve_declaration(
         return Ok(DeclaredTarget::None);
     }
 
-    let distinct = dedup(targets);
+    // Every trailing target, both forms unioned.
+    let trail_targets = dedup(self_ups.iter().chain(sib_downs.iter()).copied().collect());
+    let has_leads = !downs.is_empty() || !ups.is_empty();
+
+    if !has_leads {
+        // TRAILING forms only. Not opted in: every one is declined, so the
+        // count is irrelevant to the answer — see `TrailingSiblingDeclined`.
+        // See [`CiSibling::accept_trailing_sibling`] for why declining is the
+        // safe default.
+        if !accept_trailing_sibling {
+            return Ok(DeclaredTarget::TrailingSiblingDeclined {
+                numbers: trail_targets,
+                forms,
+            });
+        }
+        // Opted in: exactly one trailing tree must be chosen, so several
+        // distinct ones are ambiguous.
+        if trail_targets.len() > 1 {
+            return Err(ambiguous(
+                &format!(
+                    "this step follows a trailing sibling, and the coord dep labels ordering \
+                     {sibling_short} after {this_short}#{this_pr} name DIFFERENT \
+                     {sibling_short} pull requests"
+                ),
+                sibling_repo,
+                &trail_targets,
+            ));
+        }
+        return Ok(DeclaredTarget::Pr {
+            number: trail_targets[0],
+            forms,
+        });
+    }
+
+    // A LEADING form exists, so strictness is unchanged: every form — the
+    // trailing set included — must name the same PR. The union check runs
+    // FIRST so a trailing target DIFFERENT from the leading one reads as the
+    // ambiguity it is; only when all agree does the cycle check speak.
+    let distinct = dedup(
+        downs
+            .iter()
+            .chain(ups.iter())
+            .chain(trail_targets.iter())
+            .copied()
+            .collect(),
+    );
     if distinct.len() > 1 {
         return Err(ambiguous(
             &format!(
@@ -429,7 +467,7 @@ pub(crate) fn resolve_declaration(
         .copied()
         .filter(|f| !f.sibling_leads())
         .collect();
-    if !leads.is_empty() && !trails.is_empty() {
+    if !trails.is_empty() {
         return Err(format!(
             "contradictory merge ORDER declared for the pair {this_short}#{this_pr} / \
              {sibling_repo}#{number}: {} order {sibling_short} first, while {} order \
@@ -438,14 +476,6 @@ pub(crate) fn resolve_declaration(
             forms_label(&leads),
             forms_label(&trails),
         ));
-    }
-
-    // The sibling TRAILS. Following it would compile against a tree that is
-    // not this repo's main yet and will not be until after this change lands,
-    // so only a step that opted in gets it. See
-    // [`CiSibling::accept_trailing_sibling`] for why that is the safe default.
-    if leads.is_empty() && !accept_trailing_sibling {
-        return Ok(DeclaredTarget::TrailingSiblingDeclined { number, forms });
     }
 
     Ok(DeclaredTarget::Pr { number, forms })
@@ -883,13 +913,19 @@ async fn fetch_sibling_pr_detail(
 
 /// Resolve a branch tip to a SHA so both resolution paths converge on the
 /// same "fetch this exact commit" primitive.
-async fn ls_remote_branch_sha(cwd: &Path, repo: &str, branch: &str) -> Result<String, String> {
+async fn ls_remote_branch_sha(
+    cwd: &Path,
+    git_env: &SiblingGitEnv,
+    repo: &str,
+    branch: &str,
+) -> Result<String, String> {
     let url = clone_url(repo);
     let refspec = format!("refs/heads/{branch}");
-    let out = run_git(
+    let out = run_sibling_git(
         cwd,
         &["ls-remote", "--exit-code", &url, &refspec],
         SIBLING_FETCH_TIMEOUT,
+        git_env,
     )
     .await
     .map_err(|e| format!("resolving {repo}@{branch}: {e}"))?;
@@ -931,6 +967,7 @@ pub(crate) struct ResolvedSibling {
 /// action's `if [ -n "${SHA}" ]; then return 0; fi`.
 async fn no_declaration(
     cwd: &Path,
+    git_env: &SiblingGitEnv,
     worktree: &Path,
     sibling: &CiSibling,
     why: &str,
@@ -943,7 +980,7 @@ async fn no_declaration(
             provenance: format!("pinned in {SIBLING_PIN_FILE} ({why}; no declaration applied)"),
         });
     }
-    let sha = ls_remote_branch_sha(cwd, &sibling.repo, &sibling.branch).await?;
+    let sha = ls_remote_branch_sha(cwd, git_env, &sibling.repo, &sibling.branch).await?;
     Ok(ResolvedSibling {
         repo: sibling.repo.clone(),
         sha,
@@ -956,6 +993,7 @@ async fn no_declaration(
 /// dispatched commit, exactly as `.qontinui/ci.toml` itself was.
 async fn resolve_one(
     cwd: &Path,
+    git_env: &SiblingGitEnv,
     worktree: &Path,
     client: &reqwest::Client,
     token: Option<&str>,
@@ -964,7 +1002,7 @@ async fn resolve_one(
     pr_number: Option<u64>,
 ) -> Result<ResolvedSibling, String> {
     if sibling.pin == SiblingPin::DefaultBranch {
-        let sha = ls_remote_branch_sha(cwd, &sibling.repo, &sibling.branch).await?;
+        let sha = ls_remote_branch_sha(cwd, git_env, &sibling.repo, &sibling.branch).await?;
         return Ok(ResolvedSibling {
             repo: sibling.repo.clone(),
             sha,
@@ -977,6 +1015,7 @@ async fn resolve_one(
     let Some(pr) = pr_number else {
         return no_declaration(
             cwd,
+            git_env,
             worktree,
             sibling,
             "no pull request on this dispatch — no declaration probe",
@@ -997,16 +1036,28 @@ async fn resolve_one(
         sibling.accept_trailing_sibling,
         &inputs,
     )? {
-        DeclaredTarget::None => no_declaration(cwd, worktree, sibling, "no declaration").await,
-        DeclaredTarget::TrailingSiblingDeclined { number, forms } => {
+        DeclaredTarget::None => {
+            no_declaration(cwd, git_env, worktree, sibling, "no declaration").await
+        }
+        DeclaredTarget::TrailingSiblingDeclined { numbers, forms } => {
+            let list = numbers
+                .iter()
+                .map(|n| format!("{}#{n}", sibling.repo))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let (noun, verb) = if numbers.len() == 1 {
+                ("declaration", "orders")
+            } else {
+                ("declarations", "order")
+            };
             no_declaration(
                 cwd,
+                git_env,
                 worktree,
                 sibling,
                 &format!(
-                    "declaration {}#{number} (via {}) orders {} AFTER this side; \
+                    "{noun} {list} (via {}) {verb} {} AFTER this side; \
                      this step does not accept a trailing sibling",
-                    sibling.repo,
                     forms_label(&forms),
                     short_name(&sibling.repo),
                 ),
@@ -1034,7 +1085,11 @@ async fn resolve_one(
 /// `git init` → `fetch --depth 1 <sha>` → `checkout FETCH_HEAD` → **assert we
 /// got exactly that commit**. The assertion is the point: without it a fetch
 /// that resolved something else is a silent substitution.
-async fn materialise(dest: &Path, resolved: &ResolvedSibling) -> Result<(), String> {
+async fn materialise(
+    dest: &Path,
+    git_env: &SiblingGitEnv,
+    resolved: &ResolvedSibling,
+) -> Result<(), String> {
     if dest.exists() {
         return Err(format!(
             "{} already exists — refusing to overwrite a checkout that is already there",
@@ -1048,9 +1103,21 @@ async fn materialise(dest: &Path, resolved: &ResolvedSibling) -> Result<(), Stri
     let dest_str = dest.to_string_lossy().to_string();
     let url = clone_url(&resolved.repo);
 
-    run_git(parent, &["init", "-q", &dest_str], GIT_LOCAL_TIMEOUT).await?;
-    run_git(dest, &["remote", "add", "origin", &url], GIT_LOCAL_TIMEOUT).await?;
-    run_git(
+    run_sibling_git(
+        parent,
+        &["init", "-q", &dest_str],
+        GIT_LOCAL_TIMEOUT,
+        git_env,
+    )
+    .await?;
+    run_sibling_git(
+        dest,
+        &["remote", "add", "origin", &url],
+        GIT_LOCAL_TIMEOUT,
+        git_env,
+    )
+    .await?;
+    run_sibling_git(
         dest,
         &[
             "fetch",
@@ -1061,6 +1128,7 @@ async fn materialise(dest: &Path, resolved: &ResolvedSibling) -> Result<(), Stri
             &resolved.sha,
         ],
         SIBLING_FETCH_TIMEOUT,
+        git_env,
     )
     .await
     .map_err(|e| {
@@ -1069,9 +1137,15 @@ async fn materialise(dest: &Path, resolved: &ResolvedSibling) -> Result<(), Stri
             resolved.repo, resolved.sha
         )
     })?;
-    run_git(dest, &["checkout", "-q", "FETCH_HEAD"], GIT_LOCAL_TIMEOUT).await?;
+    run_sibling_git(
+        dest,
+        &["checkout", "-q", "FETCH_HEAD"],
+        GIT_LOCAL_TIMEOUT,
+        git_env,
+    )
+    .await?;
 
-    let got = run_git(dest, &["rev-parse", "HEAD"], GIT_LOCAL_TIMEOUT).await?;
+    let got = run_sibling_git(dest, &["rev-parse", "HEAD"], GIT_LOCAL_TIMEOUT, git_env).await?;
     if got.trim() != resolved.sha {
         return Err(format!(
             "asked for {} but checked out {} — refusing a substituted tree",
@@ -1116,6 +1190,10 @@ pub(crate) async fn provision(
         }
     }
 
+    // One isolated git environment (and one `git --version` floor check) for
+    // every sibling git call of this provision — see [`sibling_git_env`].
+    let git_env = sibling_git_env::prepare_isolated_sibling_git(dispatch_root).await?;
+
     let token = crate::session_pr_reconciler::resolve_github_token().await;
     if token.is_none() && pr_number.is_some() {
         // Unauthenticated GitHub reads work for public repos but are limited
@@ -1135,6 +1213,7 @@ pub(crate) async fn provision(
     for sibling in siblings {
         let resolved = resolve_one(
             dispatch_root,
+            &git_env,
             worktree,
             &client,
             token.as_deref(),
@@ -1151,7 +1230,7 @@ pub(crate) async fn provision(
             resolved.sha,
             resolved.provenance
         ));
-        materialise(&dest, &resolved).await?;
+        materialise(&dest, &git_env, &resolved).await?;
         info!(
             "ci_node: sibling {} materialised at {} ({})",
             sibling.repo,
@@ -1408,7 +1487,7 @@ mod tests {
         assert_eq!(
             got,
             DeclaredTarget::TrailingSiblingDeclined {
-                number: 104,
+                numbers: vec![104],
                 forms: vec![DeclarationForm::SiblingDownstreamOf]
             }
         );
@@ -1424,7 +1503,7 @@ mod tests {
         assert_eq!(
             got,
             DeclaredTarget::TrailingSiblingDeclined {
-                number: 104,
+                numbers: vec![104],
                 forms: vec![DeclarationForm::SelfUpstreamOf]
             }
         );
@@ -1538,6 +1617,102 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("contradictory"), "got: {err}");
+    }
+
+    /// Several TRAILING declarations are not ambiguous on a step that does not
+    /// follow a trailing sibling: every one is declined, so the answer is the
+    /// branch however many there are. Refusing them was a false red on
+    /// runner#2311 (ui-bridge#266 and #270 both declared
+    /// `coord:downstream-of=qontinui-runner#2311`). They become ambiguous only
+    /// when a tree must be chosen from among them.
+    #[test]
+    fn several_trailing_declarations_are_declined_not_ambiguous() {
+        let two_sibling_trails = inputs(
+            &[],
+            &[
+                (266, &["coord:downstream-of=qontinui-runner#7"]),
+                (270, &["coord:downstream-of=qontinui/qontinui-runner#7"]),
+            ],
+        );
+
+        // (a) two trailing, not opted in -> the branch, both listed.
+        let got =
+            super::resolve_declaration(SCHEMAS, RUNNER, 7, false, &two_sibling_trails).unwrap();
+        assert_eq!(
+            got,
+            DeclaredTarget::TrailingSiblingDeclined {
+                numbers: vec![266, 270],
+                forms: vec![DeclarationForm::SiblingDownstreamOf]
+            }
+        );
+
+        // Both trailing forms at once, naming different PRs, not opted in.
+        let got = super::resolve_declaration(
+            SCHEMAS,
+            RUNNER,
+            7,
+            false,
+            &inputs(
+                &[
+                    "coord:upstream-of=qontinui-schemas#104",
+                    "coord:upstream-of=qontinui-schemas#105",
+                ],
+                &[(266, &["coord:downstream-of=qontinui-runner#7"])],
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            got,
+            DeclaredTarget::TrailingSiblingDeclined {
+                numbers: vec![104, 105, 266],
+                forms: vec![
+                    DeclarationForm::SelfUpstreamOf,
+                    DeclarationForm::SiblingDownstreamOf
+                ]
+            }
+        );
+
+        // (b) two trailing, opted in -> a tree must be chosen: ambiguous.
+        let err =
+            super::resolve_declaration(SCHEMAS, RUNNER, 7, true, &two_sibling_trails).unwrap_err();
+        assert!(err.contains("contradictory"), "got: {err}");
+        assert!(err.contains("#266") && err.contains("#270"), "got: {err}");
+
+        // (c) one leading plus two trailing -> refused, in either setting.
+        for accept in [false, true] {
+            let err = super::resolve_declaration(
+                SCHEMAS,
+                RUNNER,
+                7,
+                accept,
+                &inputs(
+                    &["coord:downstream-of=qontinui-schemas#300"],
+                    &[
+                        (266, &["coord:downstream-of=qontinui-runner#7"]),
+                        (270, &["coord:downstream-of=qontinui-runner#7"]),
+                    ],
+                ),
+            )
+            .unwrap_err();
+            assert!(err.contains("DIFFERENT"), "accept={accept} got: {err}");
+        }
+
+        // A leading target that one of several trailing targets coincides
+        // with is still the different-target ambiguity, not a silent pick.
+        let err = resolve_declaration(
+            SCHEMAS,
+            RUNNER,
+            7,
+            &inputs(
+                &["coord:downstream-of=qontinui-schemas#266"],
+                &[
+                    (266, &["coord:downstream-of=qontinui-runner#7"]),
+                    (270, &["coord:downstream-of=qontinui-runner#7"]),
+                ],
+            ),
+        )
+        .unwrap_err();
+        assert!(err.contains("DIFFERENT"), "got: {err}");
     }
 
     /// Duplicates of the SAME declaration are not a contradiction.
@@ -1818,40 +1993,151 @@ mod tests {
         assert_eq!(read_pin(dir.path(), UI_BRIDGE).unwrap(), PIN_A);
     }
 
+    /// Drive the production provisioning entry for one sibling and collect
+    /// what it logged.
+    async fn provision_one(
+        dispatch_root: &Path,
+        worktree: &Path,
+        sibling: &CiSibling,
+    ) -> (Result<Vec<ResolvedSibling>, String>, Vec<String>) {
+        let mut lines = Vec::new();
+        let res = {
+            let mut log = |l: String| lines.push(l);
+            provision(
+                dispatch_root,
+                worktree,
+                std::slice::from_ref(sibling),
+                "qontinui/qontinui-runner",
+                None,
+                &mut log,
+            )
+            .await
+        };
+        (res, lines)
+    }
+
     /// The no-declaration funnel: under `pin-file` every exit that found no
     /// declaration answers with the recorded commit and says so in the
     /// provenance, with NO network call — the branch is never consulted.
+    ///
+    /// Entered through [`provision`] with the sibling's destination already
+    /// present, so materialisation refuses before any fetch: what the
+    /// resolution chose is read off the provision log.
     #[tokio::test]
     async fn no_declaration_answers_with_the_recorded_pin() {
         let dir = tempfile::tempdir().unwrap();
-        let manifest = dir.path().join(SIBLING_PIN_FILE);
+        let worktree = dir.path().join("qontinui-runner");
+        let manifest = worktree.join(SIBLING_PIN_FILE);
         std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
         std::fs::write(&manifest, format!("{UI_BRIDGE} {PIN_A}\n")).unwrap();
 
         let mut sibling = sib(UI_BRIDGE);
         sibling.pin = SiblingPin::PinFile;
+        std::fs::create_dir_all(sibling_dest(dir.path(), &sibling)).unwrap();
         // The SHA assertion below is what catches a regression that consulted
         // the branch: `ls-remote` needs no repository cwd, so on a networked
         // box it would answer with ui-bridge's real tip, which is not PIN_A.
-        let resolved = no_declaration(dir.path(), dir.path(), &sibling, "no declaration")
-            .await
-            .unwrap();
-        assert_eq!(resolved.sha, PIN_A);
-        assert_eq!(resolved.repo, UI_BRIDGE);
+        let (res, lines) = provision_one(dir.path(), &worktree, &sibling).await;
+        let err = res.unwrap_err();
+        assert!(err.contains("already exists"), "got: {err}");
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let line = &lines[0];
         assert!(
-            resolved.provenance.contains(SIBLING_PIN_FILE)
-                && resolved.provenance.contains("no declaration"),
-            "got: {}",
-            resolved.provenance
+            line.contains(&format!("sibling {UI_BRIDGE} "))
+                && line.contains(&format!("@ {PIN_A} ")),
+            "got: {line}"
+        );
+        assert!(
+            line.contains(SIBLING_PIN_FILE) && line.contains("no declaration"),
+            "got: {line}"
         );
 
         // A half-finished bump reaches the dispatch as the manifest's own
         // error, not as a float: the branch is still never consulted.
         std::fs::write(&manifest, format!("{UI_BRIDGE}\n")).unwrap();
-        let err = no_declaration(dir.path(), dir.path(), &sibling, "no declaration")
-            .await
-            .unwrap_err();
+        let (res, lines) = provision_one(dir.path(), &worktree, &sibling).await;
+        let err = res.unwrap_err();
         assert!(err.contains("no commit SHA after it"), "got: {err}");
+        assert!(lines.is_empty(), "{lines:?}");
+    }
+
+    /// The runner's CI root is the workspace root, itself a git repository:
+    /// `<root>/.ci-worktrees/<id>` sits INSIDE it. That enclosing repo's own
+    /// `.git/config` — here an `insteadOf` that would route a sibling's
+    /// GitHub URL to a local repository — must not reach the sibling's
+    /// `ls-remote`. Unisolated, the rewrite resolves the local repository's
+    /// tip and the provision logs it; isolated, the GitHub URL is asked
+    /// as-is (a repository that does not exist, so it fails — offline or
+    /// not) and the local tip is never seen.
+    #[tokio::test]
+    async fn a_sibling_provision_ignores_an_enclosing_repos_url_rewrite() {
+        let git = |cwd: &Path, args: &[&str]| -> String {
+            let out = std::process::Command::new("git")
+                .current_dir(cwd)
+                .args(args)
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .output()
+                .expect("git runs");
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        // A local "remote" with one commit on `main`.
+        let remote = dir.path().join("remote");
+        std::fs::create_dir_all(&remote).unwrap();
+        git(&remote, &["init", "-q", "-b", "main"]);
+        git(
+            &remote,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "local",
+            ],
+        );
+        let local_tip = git(&remote, &["rev-parse", "HEAD"]);
+        // The enclosing repository, carrying the rewrite in its local config.
+        let enclosing = dir.path().join("ws");
+        std::fs::create_dir_all(&enclosing).unwrap();
+        git(&enclosing, &["init", "-q"]);
+        let target = format!("{}/", remote.parent().unwrap().display());
+        git(
+            &enclosing,
+            &[
+                "config",
+                &format!("url.{target}.insteadOf"),
+                "https://github.com/qontinui-arming-probe/",
+            ],
+        );
+        let dispatch_root = enclosing.join(".ci-worktrees").join("d-1");
+        let worktree = dispatch_root.join("qontinui-runner");
+        std::fs::create_dir_all(&worktree).unwrap();
+        // `https://github.com/qontinui-arming-probe/remote.git` → `<dir>/remote.git`.
+        std::fs::rename(&remote, dir.path().join("remote.git")).unwrap();
+
+        let text = "version = 1\n[[siblings]]\nrepo = \"qontinui-arming-probe/remote\"\n\
+                    pin = \"default-branch\"\nbranch = \"main\"\n\
+                    [[steps]]\nname = \"x\"\ncommand = [\"true\"]\n";
+        let sibling = super::super::manifest::parse_and_validate(text)
+            .unwrap()
+            .siblings
+            .remove(0);
+        let (res, lines) = provision_one(&dispatch_root, &worktree, &sibling).await;
+        assert!(
+            !lines.iter().any(|l| l.contains(&local_tip)),
+            "the enclosing repo's insteadOf reached sibling git: {lines:?}"
+        );
+        let err = res.unwrap_err();
+        assert!(
+            err.contains("resolving qontinui-arming-probe/remote@main"),
+            "got: {err}"
+        );
     }
 
     /// Lane parity on this repo's REAL files, so the audit the manifests ask

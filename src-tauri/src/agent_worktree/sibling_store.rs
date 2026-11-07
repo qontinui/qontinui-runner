@@ -23,7 +23,10 @@
 //!   while an unwritten config only costs the old (duplicating) behaviour.
 //!
 //! The per-allocation sibling worktree is unaffected; it still serves Poetry and
-//! co-development (deleting `<agent_root>/.cargo/config.toml` is the opt-out).
+//! co-development. The opt-out for ONE sibling is [`super::edit_sibling`]: the
+//! `editSiblings` spawn field, or `POST /agent-worktrees/edit-sibling`
+//! mid-session; both leave every other sibling on the store and record the
+//! choice in `<agent_root>/.cargo/edit-siblings`.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;

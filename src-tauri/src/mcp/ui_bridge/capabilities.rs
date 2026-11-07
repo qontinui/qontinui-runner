@@ -656,16 +656,19 @@ pub async fn ui_bridge_capabilities_handler() -> Json<ApiResponse<serde_json::Va
                 }
             },
             "ai": {
-                "description": "AI-powered search, assertions, semantic snapshots, NL actions",
+                "description": "AI-powered search, assertions, semantic snapshots, NL actions, and a pixel diff of two base64 images",
+                // `image-diff` is the one live route of the retired `media`
+                // category. The `/ai/media/*` family it sat beside died in two
+                // steps: the ui-bridge SDK removed its `/ai/media/*` handlers
+                // in ui-bridge 2d35d0d (2026-05-14), after which the RUNNER's
+                // `/ui-bridge/sdk/ai/media/*` proxies to them returned no
+                // image fact; those runner proxies were then deleted by
+                // runner#2242 (landed as ce93e149a; plan
+                // 2026-10-13-image-generation-and-visual-judgment D6).
+                // Image capture and analysis live under `/ui-bridge/vision/*`.
                 "endpoints": ["find", "search", "execute", "assert", "assert-batch", "snapshot", "summary",
                     "semantic-search", "diff", "execute-with-diff", "bookmarks", "scoped-diff",
-                    "summarize-diff", "categorize-last-diff"]
-            },
-            "media": {
-                "description": "Media element discovery, audits, and analysis",
-                "endpoints": ["media/find", "media/audit/accessibility", "media/audit/performance",
-                    "media/snapshot", "media/analyze", "media/analyze/batch", "media/analyze/page", "media/compare",
-                    "image-diff"]
+                    "summarize-diff", "categorize-last-diff", "image-diff"]
             },
             "stateMachine": {
                 "description": "State discovery, activation, transitions, navigation",
@@ -1087,8 +1090,11 @@ pub async fn ui_bridge_list_runner_windows_handler(
 /// atomic and were indistinguishable after the fact:
 ///
 /// * `?source=event` — the `ui-bridge-ping` Tauri event was DELIVERED to the
-///   renderer. The pong itself may still travel back over HTTP (the JS→Rust
-///   `emit` fallback for the WebView2 IPC failure mode), but delivery of the
+///   renderer. Since the 2026-10-19 ui-wedge plan this is the PRIMARY answer
+///   to a ping (`answerPing` in `src/hooks/ui-bridge-events/utils.ts`): a JS
+///   `emit` is an async Tauri command run on `app-rt`, which never settles
+///   while `app-rt` is starved, whereas this route is served on `mcp-api-rt`.
+///   The Tauri `ui-bridge-pong` event is the fallback leg. Delivery of the
 ///   ping is proof the native message loop pumped, so this stamps the
 ///   event-provenance clock.
 /// * `?source=safety-net` — the frontend's unconditional 3s interval, which is

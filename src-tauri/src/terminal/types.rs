@@ -43,6 +43,17 @@ pub struct RemoteTabIdentity {
     /// True when the target holds ring bytes OLDER than the attach seed —
     /// the "Load earlier output" affordance is offered only then.
     pub history_available: bool,
+    /// The tenant whose credential minted this tab's grant, whenever the
+    /// resolved scope named one (`Owned` — a tenant the opener stated, or the
+    /// machine's pin when it stated none); `None` for the Device slot.
+    /// Recording the pin is deliberate: the session lives in the pin's tenant,
+    /// so a reattach after the pin MOVES must still present that tenant —
+    /// `None` would re-resolve to the new pin and 404. The cost is that a
+    /// reattach of such a tab goes through the explicit-tenant admission. A
+    /// reattach / restore passes it back so the fresh
+    /// grant is minted in the tenant the session lives in — coord resolves an
+    /// attach target within the presented principal's tenant only.
+    pub tenant: Option<String>,
 }
 
 /// What `terminal_attach_remote` returns: the ordinary `TerminalInfo` the

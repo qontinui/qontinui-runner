@@ -90,6 +90,7 @@ fn sunshine_base_url() -> String {
         .ok()
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(SUNSHINE_API_PORT);
+    // runner-localhost-ok: the Sunshine streaming host, not a runner port.
     format!("https://localhost:{}", port)
 }
 

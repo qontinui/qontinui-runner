@@ -41,15 +41,6 @@ export { StateDetectionService } from "./StateDetectionService";
 export { SessionManager, sessionManager } from "./SessionManager";
 export type { SessionContext, SessionStatus, SessionChangeListener } from "./SessionManager";
 
-// Verification Services (AI self-healing)
-export { verificationService } from "./VerificationService";
-export type {
-  PendingVerification,
-  VerificationPendingMarker,
-  VerificationCompletedMarker,
-  VerificationFailedMarker,
-} from "./VerificationService";
-
 // Findings Tracking Services (categorized findings system)
 export { FindingsTracker, findingsTracker } from "./FindingsTracker";
 export type { FindingsTrackerEventType, FindingsTrackerEvent } from "./FindingsTracker";

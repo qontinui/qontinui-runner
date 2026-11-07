@@ -658,7 +658,7 @@ impl InstanceManager {
 
 /// Path to the session file that tracks which instances were running.
 fn session_file_path() -> Option<std::path::PathBuf> {
-    dirs::config_dir().map(|d| d.join("com.qontinui.runner").join("active_instances.json"))
+    qontinui_runner_lib::instance_env::runner_config_base().map(|d| d.join("active_instances.json"))
 }
 
 /// Persist the set of running instance IDs.
@@ -748,6 +748,6 @@ async fn probe_instance_api(port: u16) -> bool {
         Err(_) => return false,
     };
 
-    let url = format!("http://localhost:{}/status", port);
+    let url = format!("{}/status", crate::mcp::types::runner_loopback_base(port));
     client.get(&url).send().await.is_ok()
 }

@@ -280,20 +280,6 @@ pub struct StageConfig {
     pub completion_prompts_first: bool,
 }
 
-/// Context from a CI failure that triggered an auto-resume.
-/// Populated by the PR watcher and consumed by the failure context builder.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct CiFailureContext {
-    /// Names of CI checks that failed (e.g., "build", "test", "lint").
-    pub failed_check_names: Vec<String>,
-    /// Truncated log output per check (check_name -> log excerpt).
-    pub check_logs: HashMap<String, String>,
-    /// PR number that triggered this resume (if applicable).
-    pub pr_number: Option<u64>,
-    /// Whether the PR has a merge conflict.
-    pub merge_conflict: bool,
-}
-
 /// Configuration for the verification-agentic loop.
 #[derive(Debug, Clone)]
 pub struct LoopConfig {
@@ -457,11 +443,8 @@ pub struct LoopConfig {
     /// Default: 3. Set to 0 to disable fix-attempt tracking (preserves existing behavior).
     pub max_fix_attempts: u32,
     /// Maximum number of CI-triggered auto-resumes before requiring manual intervention.
-    /// Used by the PR watcher (Phase 2). Default: 10.
+    /// Nothing reads it. Default: 10.
     pub max_ci_auto_resumes: u32,
-    /// CI failure context injected by the PR watcher when auto-resuming after CI failure.
-    /// When present, failed check names and logs are prepended to the failure context.
-    pub ci_failure_context: Option<CiFailureContext>,
     /// HTN planning configuration. When enabled, the loop attempts structured
     /// plan-based fixes before falling back to AI agentic sessions.
     pub htn_config: crate::planning_bridge::HtnConfig,
@@ -590,7 +573,6 @@ impl LoopConfig {
             }),
             max_fix_attempts: workflow.max_fix_attempts,
             max_ci_auto_resumes: workflow.max_ci_auto_resumes,
-            ci_failure_context: None,
             htn_config: {
                 let mut htn = crate::planning_bridge::HtnConfig {
                     enabled: workflow.htn_enabled,

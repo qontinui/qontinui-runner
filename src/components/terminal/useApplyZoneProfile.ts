@@ -90,7 +90,7 @@ export function useApplyZoneProfile(
       pendingProfileSessionsRef: pendingRef,
     } = latest.current;
 
-    zl.setLayoutId(profile.layoutId);
+    zl.setLayoutId(profile.layoutId, { source: "operator" });
     lt.setZoneLabels(profile.labels);
     lt.setZoneNotes(profile.notes);
     lt.setPinnedZones(new Set(profile.pins));

@@ -498,7 +498,7 @@ impl ProcessCaptureManager {
     ///
     /// Phase 5: when `QONTINUI_REAP_RESTART=1` is set, also walks the
     /// previously-tracked descendant tree and force-kills each PID. This
-    /// catches the case where `stop()` (which calls `taskkill /F /T`)
+    /// catches the case where `stop()` (an in-process tree kill on Windows)
     /// fails to take down a late-forked uvicorn worker — without the
     /// explicit reap, the next `start_process` fights the orphan for the
     /// health port and lands in the `Bound`-not-`Listen` half-bound state

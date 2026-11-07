@@ -2,7 +2,7 @@
 //! (`project.session_prs`).
 //!
 //! Hand-written tokio-postgres (NOT Clorinde), mirroring the connection idiom
-//! in [`super::pr_watch_ops`] (`let conn = self.pool.get().await …;
+//! of the other hand-written ops (`let conn = self.pool.get().await …;
 //! conn.query(...)`). The table is a single-consumer, runner-local projection:
 //! the attribution reconciler ([`crate::session_pr_reconciler`]) writes it and
 //! the Terminal zone-header dropdown command

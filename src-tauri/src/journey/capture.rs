@@ -42,6 +42,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use qontinui_types::journey::{EdgeOutcome, JourneyEdgeObservation, JourneyNode, RunKind};
+use qontinui_vision_core::ChangeTimeline;
 use tokio::sync::mpsc;
 use tracing::warn;
 
@@ -336,12 +337,16 @@ pub(crate) fn finalize(draft: EdgeDraft) -> JourneyEdgeObservation {
 ///
 /// Neither frontier branch matches anything when `$14` (the trigger's
 /// fingerprint) is NULL.
+///
+/// `$17` (`timeline`, plan Phase 4) binds `Option<serde_json::Value>` with the
+/// same SQL-NULL rule as `to_node`, and only ever a
+/// `ChangeTimeline::for_ledger()` projection ([`edge_insert`]).
 pub(crate) const EDGE_WRITE_SQL: &str = r#"WITH inserted AS (
     INSERT INTO project.journey_edge_observations
         (id, observed_at, app_id, app_version, runner_build_id, runner_instance,
-         run_id, run_kind, from_node, to_node, trigger, outcome)
+         run_id, run_kind, from_node, to_node, trigger, outcome, timeline)
     VALUES ($1::text::uuid, $2::text::timestamptz, $3, $4, $5, $6,
-            $7, $8, $9::jsonb, $10::jsonb, $11::jsonb, $12)
+            $7, $8, $9::jsonb, $10::jsonb, $11::jsonb, $12, $17::jsonb)
     RETURNING id
 ), cleared AS (
     DELETE FROM project.journey_frontier f
@@ -372,7 +377,7 @@ SELECT (SELECT count(*) FROM inserted) AS inserted,
 
 /// Number of parameters [`EDGE_WRITE_SQL`] binds; sizes the call site's
 /// params array so SQL/param arity drift is a compile error plus a test.
-pub(crate) const EDGE_WRITE_BINDS: usize = 16;
+pub(crate) const EDGE_WRITE_BINDS: usize = 17;
 
 /// The bind values of [`EDGE_WRITE_SQL`], built by a pure function so the
 /// null-handling of `to_node` is testable without a database.
@@ -398,6 +403,10 @@ pub(crate) struct EdgeInsert {
     /// For the `error` branch's frontier upsert (`read` / `write` /
     /// `destructive`; `None` = undeclared).
     pub declared_effect: Option<String>,
+    /// The `timeline` column: `None` binds SQL NULL ("this action recorded no
+    /// timeline"); `Some` is ALWAYS the [`ChangeTimeline::for_ledger`]
+    /// projection, serialized through its typed mirror.
+    pub timeline: Option<serde_json::Value>,
 }
 
 /// Validate a row against the contract and produce its binds.
@@ -405,7 +414,15 @@ pub(crate) struct EdgeInsert {
 /// Validation runs here, before every write: a failure is returned as the
 /// contract error's text and counted as a write failure by the caller —
 /// never a silent drop.
-pub(crate) fn edge_insert(obs: &JourneyEdgeObservation) -> Result<EdgeInsert, String> {
+///
+/// `timeline` is projected through [`ChangeTimeline::for_ledger`] HERE, at the
+/// last step before the bind, whatever the caller passed — the projection is
+/// idempotent, so the column can never receive a URL path, an event's prose
+/// summary, or a source key outside `LEDGER_SOURCE_KEYS`.
+pub(crate) fn edge_insert(
+    obs: &JourneyEdgeObservation,
+    timeline: Option<&ChangeTimeline>,
+) -> Result<EdgeInsert, String> {
     obs.validate()
         .map_err(|e| format!("contract validation: {e}"))?;
     let to_json = |n: &JourneyNode| serde_json::to_value(n).map_err(|e| e.to_string());
@@ -435,6 +452,9 @@ pub(crate) fn edge_insert(obs: &JourneyEdgeObservation) -> Result<EdgeInsert, St
             .trigger
             .declared_effect
             .map(|e| frontier::effect_str(e).to_string()),
+        timeline: timeline
+            .map(|t| serde_json::to_value(t.for_ledger()).map_err(|e| e.to_string()))
+            .transpose()?,
     })
 }
 
@@ -614,6 +634,9 @@ pub(crate) enum JourneyEvent {
         provenance: Provenance,
         action: ActionSpec,
         hint: Option<EdgeOutcome>,
+        /// The action response's interaction timeline, already projected
+        /// through [`ChangeTimeline::for_ledger`]; `None` = none recorded.
+        timeline: Option<Box<ChangeTimeline>>,
     },
     /// A successful, UNFILTERED snapshot of the cursor's page (closes a
     /// pending edge). May be the SDK's `{success, data}` envelope; the worker
@@ -666,6 +689,7 @@ pub(crate) fn record_action(
             provenance,
             action,
             hint: failure_hint(failed),
+            timeline: None,
         },
     );
 }
@@ -706,8 +730,41 @@ pub(crate) fn diff_outcome_hint(response: &serde_json::Value, failed: bool) -> O
         .then_some(EdgeOutcome::SettleTimeout)
 }
 
+/// What an execute-with-diff response says about its interaction timeline.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum DiffTimeline {
+    /// No `timeline` key (the request sent `timeline: false`, or the producer
+    /// predates the default-on timeline).
+    Absent,
+    /// A timeline, parsed and projected through
+    /// [`ChangeTimeline::for_ledger`].
+    Parsed(Box<ChangeTimeline>),
+    /// A `timeline` key whose value is not a `ChangeTimeline` — counted on
+    /// `/journey/health`, never stored.
+    Unparseable(String),
+}
+
+/// The timeline of an execute-with-diff response, at the top level (the
+/// relay body, an `ActionDiffResult`) or under `data` (the in-process
+/// server's `success(result)` envelope, and the guarded failure shape). A
+/// JSON `null` is [`DiffTimeline::Absent`].
+pub(crate) fn diff_timeline(response: &serde_json::Value) -> DiffTimeline {
+    let raw = response
+        .get("timeline")
+        .or_else(|| response.get("data").and_then(|d| d.get("timeline")))
+        .filter(|v| !v.is_null());
+    match raw {
+        None => DiffTimeline::Absent,
+        Some(v) => match serde_json::from_value::<ChangeTimeline>(v.clone()) {
+            Ok(t) => DiffTimeline::Parsed(Box::new(t.for_ledger())),
+            Err(e) => DiffTimeline::Unparseable(e.to_string()),
+        },
+    }
+}
+
 /// An execute-with-diff: a pending edge like every other action, carrying
-/// the diff's outcome hint.
+/// the diff's outcome hint and its interaction timeline (plan Phase 4 — the
+/// row this edge closes into stores `timeline.for_ledger()`).
 pub(crate) fn record_diff(
     pg_db: Arc<PgDb>,
     key: CursorKey,
@@ -716,6 +773,14 @@ pub(crate) fn record_diff(
     provenance: Provenance,
     failed: bool,
 ) {
+    let timeline = match diff_timeline(response) {
+        DiffTimeline::Absent => None,
+        DiffTimeline::Parsed(t) => Some(t),
+        DiffTimeline::Unparseable(e) => {
+            health::record_timeline_unparseable(e);
+            None
+        }
+    };
     enqueue_edge_observation(
         pg_db,
         JourneyEvent::Action {
@@ -723,6 +788,7 @@ pub(crate) fn record_diff(
             provenance,
             action: ActionSpec::with_diff(request_body),
             hint: diff_outcome_hint(response, failed),
+            timeline,
         },
     );
 }
@@ -751,8 +817,16 @@ async fn process_event(pg: &PgDb, cursors: &mut Cursors, event: JourneyEvent) {
             provenance,
             action,
             hint,
+            timeline,
         } => {
-            if let Some(displaced) = cursors.open(&key, &action, provenance, hint, Instant::now()) {
+            if let Some(displaced) = cursors.open_with_timeline(
+                &key,
+                &action,
+                provenance,
+                hint,
+                timeline,
+                Instant::now(),
+            ) {
                 write_edge(pg, displaced).await;
             }
         }
@@ -882,9 +956,10 @@ async fn writable_connection(pg: &PgDb) -> Option<deadpool_postgres::Object> {
     }
 }
 
-async fn write_edge(pg: &PgDb, draft: EdgeDraft) {
+async fn write_edge(pg: &PgDb, mut draft: EdgeDraft) {
+    let timeline = draft.timeline.take();
     let obs = finalize(draft);
-    let binds = match edge_insert(&obs) {
+    let binds = match edge_insert(&obs, timeline.as_deref()) {
         Ok(b) => b,
         Err(e) => {
             health::record_write_failure(e);
@@ -911,11 +986,12 @@ async fn write_edge(pg: &PgDb, draft: EdgeDraft) {
         &binds.target_fingerprint,
         &binds.target_role,
         &binds.declared_effect,
+        &binds.timeline,
     ];
     match conn.query_one(EDGE_WRITE_SQL, &params).await {
         Ok(row) => {
             let cleared = row.try_get::<_, i64>(1).unwrap_or(0);
-            health::record_edge_written(cleared.max(0) as u64);
+            health::record_edge_written(cleared.max(0) as u64, binds.timeline.is_some());
         }
         Err(e) => {
             health::record_write_failure(crate::database::pg::pg_err("journey edge insert", &e));
@@ -1025,7 +1101,7 @@ mod tests {
         let displaced = c
             .open(&key(), &click("y"), Provenance::default(), None, now)
             .unwrap();
-        let binds = edge_insert(&finalize(displaced)).expect("a valid row");
+        let binds = edge_insert(&finalize(displaced), None).expect("a valid row");
         assert_eq!(binds.to_node, None, "to_node must bind SQL NULL");
         assert_ne!(binds.to_node, Some(serde_json::Value::Null));
         assert_eq!(binds.outcome, "to_node_unobserved");
@@ -1045,7 +1121,7 @@ mod tests {
         let edge = c
             .observe(&key(), seen("b", &["2"]), AffordanceIndex::default(), now)
             .unwrap();
-        let binds = edge_insert(&finalize(edge)).unwrap();
+        let binds = edge_insert(&finalize(edge), None).unwrap();
         assert!(binds.from_node.is_object());
         assert!(binds.to_node.as_ref().is_some_and(|v| v.is_object()));
         assert!(binds.trigger.is_object());
@@ -1075,8 +1151,9 @@ mod tests {
             to_node: Some(node("a", &["1"])),
             trigger: resolve_trigger(&click("x"), &AffordanceIndex::default()),
             outcome: EdgeOutcome::Changed,
+            timeline: None,
         };
-        let err = edge_insert(&finalize(draft)).expect_err("validation must refuse it");
+        let err = edge_insert(&finalize(draft), None).expect_err("validation must refuse it");
         assert!(err.contains("contract validation"), "{err}");
     }
 
@@ -1097,7 +1174,7 @@ mod tests {
         for needle in [
             "INSERT INTO project.journey_edge_observations",
             "(id, observed_at, app_id, app_version, runner_build_id, runner_instance,",
-            "run_id, run_kind, from_node, to_node, trigger, outcome)",
+            "run_id, run_kind, from_node, to_node, trigger, outcome, timeline)",
             "$1::text::uuid",
             "$2::text::timestamptz",
             "$9::jsonb, $10::jsonb, $11::jsonb",
@@ -1110,8 +1187,8 @@ mod tests {
             assert!(EDGE_WRITE_SQL.contains(needle), "missing {needle:?}");
         }
         assert!(
-            !EDGE_WRITE_SQL.contains("timeline"),
-            "the timeline column is Phase 4's; this producer never writes it"
+            EDGE_WRITE_SQL.contains("$12, $17::jsonb)"),
+            "the timeline column binds $17 as jsonb"
         );
     }
 
@@ -1466,7 +1543,7 @@ mod tests {
             .unwrap();
 
         let row = serde_json::to_string(&finalize(edge.clone())).unwrap();
-        let binds = edge_insert(&finalize(edge)).unwrap();
+        let binds = edge_insert(&finalize(edge), None).unwrap();
         let frontier_after = frontier::frontier_batch("qontinui-web", &to, &to_aff, None)
             .unwrap()
             .unwrap();
@@ -1489,5 +1566,81 @@ mod tests {
             from.page_label, None,
             "a pathname-only page has no pageLabel"
         );
+    }
+
+    // -- Phase 4: the stored timeline is the ledger projection --------------
+
+    #[test]
+    fn a_stored_timeline_is_the_ledger_projection_with_no_url_path_or_text() {
+        use crate::journey::test_fixtures::{page_changed, timeline_json};
+        let raw = timeline_json(
+            vec![page_changed(
+                40,
+                "https://app.example/search/sentinel-7f3a?q=sentinel-7f3a",
+            )],
+            120,
+        );
+        // Both producers' shapes: the relay's top-level ActionDiffResult and
+        // the in-process `{success, data}` envelope.
+        for response in [
+            serde_json::json!({ "actionSuccess": true, "timeline": raw.clone() }),
+            serde_json::json!({ "success": true, "data": { "actionSuccess": true, "timeline": raw.clone() } }),
+        ] {
+            let DiffTimeline::Parsed(t) = diff_timeline(&response) else {
+                panic!("a timeline must parse: {response}");
+            };
+            let mut c = Cursors::default();
+            let now = Instant::now();
+            c.open_with_timeline(
+                &key(),
+                &click("x"),
+                Provenance::default(),
+                None,
+                Some(t),
+                now,
+            );
+            let edge = c
+                .observe(&key(), seen("b", &["2"]), AffordanceIndex::default(), now)
+                .expect("closed");
+            let timeline = edge.timeline.clone();
+            let binds = edge_insert(&finalize(edge), timeline.as_deref()).unwrap();
+            let stored = binds.timeline.expect("the column is written");
+            let text = stored.to_string();
+            assert!(
+                !text.contains("sentinel-7f3a"),
+                "a URL path or query leaked: {text}"
+            );
+            assert!(!text.contains("clicked Save"), "event prose leaked: {text}");
+            assert!(!text.contains("/search"), "{text}");
+            // It IS the projection, byte for byte.
+            let parsed: qontinui_vision_core::ChangeTimeline =
+                serde_json::from_value(raw.clone()).unwrap();
+            assert_eq!(stored, serde_json::to_value(parsed.for_ledger()).unwrap());
+        }
+    }
+
+    #[test]
+    fn an_absent_or_garbage_timeline_stores_null() {
+        assert_eq!(
+            diff_timeline(&serde_json::json!({"actionSuccess": true})),
+            DiffTimeline::Absent
+        );
+        assert_eq!(
+            diff_timeline(&serde_json::json!({"timeline": null})),
+            DiffTimeline::Absent
+        );
+        assert!(matches!(
+            diff_timeline(&serde_json::json!({"timeline": {"events": "nope"}})),
+            DiffTimeline::Unparseable(_)
+        ));
+        let mut c = Cursors::default();
+        let now = Instant::now();
+        c.open(&key(), &click("x"), Provenance::default(), None, now);
+        let edge = c
+            .observe(&key(), seen("b", &["2"]), AffordanceIndex::default(), now)
+            .expect("closed");
+        assert!(edge.timeline.is_none());
+        let binds = edge_insert(&finalize(edge), None).unwrap();
+        assert!(binds.timeline.is_none(), "SQL NULL, never a JSON null");
     }
 }

@@ -57,6 +57,7 @@ import {
   normalizeFleetCursor,
   statesSeenIn,
   type FleetDeviceOption,
+  fleetUnionTruncation,
 } from "./fleetDiscovery";
 import { devicesSeenIn, type FleetSession, type FleetSessionsResponse } from "./useFleetSessions";
 
@@ -292,10 +293,12 @@ describe("fleetTruncation — completeness is `nextCursor`, and nothing else", (
 });
 
 describe("the cursor is OPAQUE — re-sent verbatim, never interpreted", () => {
-  const SOURCES = ["./fleetDiscovery.ts", "./useFleetSessions.ts"].map((rel) => ({
-    rel,
-    text: readFileSync(fileURLToPath(new URL(rel, import.meta.url)), "utf8"),
-  }));
+  const SOURCES = ["./fleetDiscovery.ts", "./useFleetSessions.ts", "./fleetWalker.ts"].map(
+    (rel) => ({
+      rel,
+      text: readFileSync(fileURLToPath(new URL(rel, import.meta.url)), "utf8"),
+    }),
+  );
 
   it("no cursor-carrying module decodes, splits or parses a cursor", () => {
     // coord's contract makes the cursor opaque: a client that learns to read it
@@ -326,12 +329,15 @@ describe("the cursor is OPAQUE — re-sent verbatim, never interpreted", () => {
 });
 
 describe("fleetScopeKey — what a cursor is valid within", () => {
-  const base = { deviceId: null, state: null, includeClosed: false };
+  const base = { deviceId: null, state: null, includeClosed: false, tenantId: null };
 
   it.each([
     ["device", { ...base, deviceId: "a" }],
     ["state", { ...base, state: "active" }],
     ["closed", { ...base, includeClosed: true }],
+    // coord fingerprints the principal's tenant into the cursor, so a tenant
+    // switch must restart the walk rather than replay a cursor across tenants.
+    ["tenant", { ...base, tenantId: "c231d9da-0000-4000-8000-000000000001" }],
   ])("a changed %s invalidates the cursor", (_name, changed) => {
     expect(fleetScopesEqual(base, changed)).toBe(false);
   });
@@ -340,8 +346,11 @@ describe("fleetScopeKey — what a cursor is valid within", () => {
     // coord leaves `limit` out of the scope fingerprint on purpose: resizing a
     // page changes the slice, not the sequence. Including it here would restart
     // a walk that did not need restarting and silently re-fetch every page.
-    const small = fleetScopeOf({ ...DEFAULT_FLEET_SERVER_FILTER, limit: FLEET_DEFAULT_LIMIT });
-    const large = fleetScopeOf({ ...DEFAULT_FLEET_SERVER_FILTER, limit: FLEET_MAX_LIMIT });
+    const small = fleetScopeOf(
+      { ...DEFAULT_FLEET_SERVER_FILTER, limit: FLEET_DEFAULT_LIMIT },
+      null,
+    );
+    const large = fleetScopeOf({ ...DEFAULT_FLEET_SERVER_FILTER, limit: FLEET_MAX_LIMIT }, null);
     expect(fleetScopesEqual(small, large)).toBe(true);
     expect(fleetScopeKey(small)).not.toMatch(String(FLEET_MAX_LIMIT));
     expect(fleetScopeKey(small)).not.toMatch(String(FLEET_DEFAULT_LIMIT));
@@ -349,6 +358,17 @@ describe("fleetScopeKey — what a cursor is valid within", () => {
 
   it("distinguishes a null filter from the empty string", () => {
     expect(fleetScopesEqual(base, { ...base, state: "" })).toBe(false);
+  });
+
+  it("carries the tenant supplied beside the filter into the scope", () => {
+    const t = "c231d9da-0000-4000-8000-000000000001";
+    expect(fleetScopeOf(DEFAULT_FLEET_SERVER_FILTER, t).tenantId).toBe(t);
+    expect(
+      fleetScopesEqual(
+        fleetScopeOf(DEFAULT_FLEET_SERVER_FILTER, t),
+        fleetScopeOf(DEFAULT_FLEET_SERVER_FILTER, null),
+      ),
+    ).toBe(false);
   });
 });
 
@@ -1363,5 +1383,134 @@ describe("fleetSessionActivity — the row's most recent OBSERVED instant", () =
     // a round-tripped or reformatted value would lose coord's own precision.
     const iso = "2026-09-11T04:05:06.789123Z";
     expect(fleetSessionActivity(session({ lastHeartbeatAt: iso }))?.iso).toBe(iso);
+  });
+});
+
+/**
+ * The merged multi-tenant view (plan
+ * `2026-09-29-fleet-view-reads-one-unchosen-tenant-so-a-multi-bound-device-sees-a-fraction-of-its-fleet`,
+ * Phase 4): N independent walks, so completeness, the empty message and the
+ * count line are all statements about a UNION and must say so.
+ */
+describe("fleetUnionTruncation — completeness over N tenant walks", () => {
+  const done = (n: number) => ({
+    response: response({ sessions: page(n), nextCursor: null }),
+    loaded: n,
+    canAdvance: false,
+  });
+  const more = (n: number, limit = 100) => ({
+    response: response({ sessions: page(n), nextCursor: "ck", limit }),
+    loaded: n,
+    canAdvance: true,
+  });
+  const stuck = (n: number) => ({
+    response: response({ sessions: page(n), nextCursor: "ck" }),
+    loaded: n,
+    canAdvance: false,
+  });
+  const unanswered = { response: null, loaded: 0, canAdvance: false };
+
+  it("classifies a single walk exactly as fleetTruncation does", () => {
+    for (const w of [done(3), more(100), stuck(7), unanswered]) {
+      expect(fleetUnionTruncation([w])).toEqual(
+        fleetTruncation(w.response, w.loaded, w.canAdvance),
+      );
+    }
+  });
+
+  it("offers more while ANY walk can advance, counting the union's rows", () => {
+    const t = fleetUnionTruncation([done(3), more(100, 200), unanswered]);
+    expect(t).toMatchObject({ kind: "more-available", shown: 103, pageSize: 200 });
+    if (t.kind === "more-available") {
+      expect(t.message).toMatch(/across 3 tenants/);
+      expect(t.message).toMatch(/in 1 of them/);
+    }
+  });
+
+  it("says unreachable when a walk has more it cannot fetch and none can advance", () => {
+    expect(fleetUnionTruncation([done(2), stuck(5)])).toMatchObject({
+      kind: "unreachable",
+      shown: 7,
+    });
+  });
+
+  it("is never `none` while any tenant is unanswered", () => {
+    expect(fleetUnionTruncation([done(2), unanswered]).kind).toBe("unknown");
+    expect(fleetUnionTruncation([done(2), done(0)]).kind).toBe("none");
+    expect(fleetUnionTruncation([]).kind).toBe("unknown");
+  });
+});
+
+describe("fleetEmptyReadMessage — a merged read names every tenant it did and did not read", () => {
+  const A = "aaaaaaaa-0000-4000-8000-00000000000a";
+  const B = "bbbbbbbb-0000-4000-8000-00000000000b";
+  const C = "cccccccc-0000-4000-8000-00000000000c";
+
+  it("is byte-identical to the single-tenant form for one answered tenant", () => {
+    for (const complete of [true, false]) {
+      expect(
+        fleetEmptyReadMessage(
+          DEFAULT_FLEET_SERVER_FILTER,
+          "",
+          { answered: [A], failed: [] },
+          complete,
+        ),
+      ).toEqual(fleetEmptyReadMessage(DEFAULT_FLEET_SERVER_FILTER, "", A, complete));
+    }
+  });
+
+  it("scopes the claim to the tenants that answered", () => {
+    const m = fleetEmptyReadMessage(
+      DEFAULT_FLEET_SERVER_FILTER,
+      "",
+      { answered: [A, B], failed: [] },
+      true,
+    ).message;
+    expect(m).toBe(`No open sessions in 2 tenants (${A}, ${B}).`);
+  });
+
+  it("names a FAILED tenant right after the scope, as unknown — never folded into the empty claim", () => {
+    const m = fleetEmptyReadMessage(
+      DEFAULT_FLEET_SERVER_FILTER,
+      "",
+      { answered: [A], failed: [C] },
+      false,
+    ).message;
+    expect(m).toContain(`Tenant ${C} could not be read, so its sessions are unknown — not absent.`);
+    expect(m.indexOf(C)).toBeGreaterThan(m.indexOf(A));
+    expect(m).not.toMatch(/anywhere/);
+  });
+
+  it("names several failed tenants, and the runner's own default by name", () => {
+    const m = fleetEmptyReadMessage(
+      { ...DEFAULT_FLEET_SERVER_FILTER, state: "active" },
+      "",
+      { answered: [A], failed: [null, C] },
+      true,
+    ).message;
+    expect(m).toContain(
+      `2 tenants (the device default tenant, tenant ${C}) could not be read, so their sessions are unknown`,
+    );
+  });
+
+  it("says unknown, not empty, when a merged read has an unnamed tenant", () => {
+    const m = fleetEmptyReadMessage(
+      DEFAULT_FLEET_SERVER_FILTER,
+      "",
+      { answered: [A, null], failed: [] },
+      true,
+    ).message;
+    expect(m).toContain("(aaaaaaaa-0000-4000-8000-00000000000a, unnamed)");
+    expect(m).toMatch(/did not name the tenant one of these reads covered/);
+  });
+});
+
+describe("fleetCountSummary — a merged read says it is a union", () => {
+  it("names the tenant count only when more than one answered", () => {
+    const base = { matched: 4, loaded: 4, devices: 2, devicesLoaded: 2, remote: 1 };
+    expect(fleetCountSummary({ ...base, tenants: 3 })).toBe(
+      "4 sessions on 2 devices · 3 tenants · 1 remote",
+    );
+    expect(fleetCountSummary({ ...base, tenants: 1 })).toBe(fleetCountSummary(base));
   });
 });

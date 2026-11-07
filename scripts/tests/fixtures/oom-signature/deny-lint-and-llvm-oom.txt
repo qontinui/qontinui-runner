@@ -1,0 +1,11 @@
+   Compiling qontinui-runner v1.0.11 (/home/runner/work/qontinui-runner/qontinui-runner/src-tauri)
+error: unused variable: `retry_budget`
+  --> src-tauri/src/process_helpers.rs:1839:13
+   |
+1839 |         let retry_budget = 3;
+   |             ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_retry_budget`
+   |
+   = note: `-D unused-variables` implied by `-D warnings`
+rustc-LLVM ERROR: out of memory
+Allocation failed
+error: could not compile `qontinui-runner` (lib test) due to 1 previous error

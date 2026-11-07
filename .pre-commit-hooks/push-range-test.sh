@@ -55,6 +55,14 @@ unset QONTINUI_PREPUSH_SKIP QONTINUI_PREPUSH_SKIP_ALL QONTINUI_PREPUSH_STRICT
 # guard override or workspace root would decide the linked-worktree cases below
 # instead of the fixture.
 unset CARGO_TARGET_DIR QONTINUI_PREPUSH_CARGO_GUARD QONTINUI_ROOT
+# The tree-lock guard reads these; an exported lib dir, wait bound or lock
+# claim would put the guard arms below under the developer's own environment.
+unset QONTINUI_PREPUSH_TREE_GUARD_LIB_DIR QONTINUI_PREPUSH_TREE_LOCK_MAX_WAIT \
+    CARGO_VERIFY_TREE_LOCK_HELD CARGO_VERIFY_TREE_LOCK_PROOF CARGO_BUILD_TARGET_DIR \
+    CARGO_VERIFY_TREE_LOCK_MAX_WAIT CARGO_VERIFY_TREE_LOCK_MODE
+# The guard's "taking the tree lock" notice goes to /dev/tty; ~20 hook runs
+# below must not write it onto the developer's terminal.
+export QONTINUI_PREPUSH_NO_TTY=1
 # The pushed-range resolution reads these. A developer running the tests from
 # inside a real pre-commit pre-push invocation would otherwise have the RANGE
 # under test decided by their own push.
@@ -189,9 +197,28 @@ TOML
     # under test shells out to `cargo`, so intercepting that call is a faithful
     # observation of the decision, not a simulation of it.
     mkdir -p "$root/bin"
+    #
+    # Two additions serve the tree-lock guard arms and are inert elsewhere:
+    # `metadata` answers with the target_directory cargo would use (the guard
+    # asks cargo rather than keeping a second resolver), and when a stub
+    # tree-lock library is in play (STUB_LIB_LOG) every build call records
+    # whether the stub lock was HELD at that moment — the property under test,
+    # observed rather than inferred from call order alone.
     cat > "$root/bin/cargo" <<'SHIM'
 #!/usr/bin/env bash
 printf '%s | CARGO_TARGET_DIR=%s\n' "$*" "${CARGO_TARGET_DIR:-}" >> "$CARGO_SHIM_LOG"
+if [ "${1:-}" = metadata ]; then
+    [ "${STUB_META_EMPTY:-0}" = 1 ] && exit 0
+    printf '{"packages":[],"target_directory":"%s","version":1}\n' "${CARGO_TARGET_DIR:-$PWD/target}"
+    exit 0
+fi
+if [ -n "${STUB_LIB_LOG:-}" ]; then
+    printf 'cargo %s held=%s\n' "${1:-}" "$([ -f "$STUB_HELD" ] && echo yes || echo no)" >> "$STUB_LIB_LOG"
+fi
+if [ "${1:-}" = clippy ]; then
+    if [ -n "${STUB_CLIPPY_OUT:-}" ]; then printf '%s\n' "$STUB_CLIPPY_OUT"; fi
+    exit "${STUB_CLIPPY_RC:-0}"
+fi
 exit 0
 SHIM
     chmod +x "$root/bin/cargo"
@@ -538,6 +565,195 @@ HOOK_OUT="$(cd "$WORK" && commit_change "src-tauri/src/lib.rs" "// primary rust"
 check "primary checkout -> cargo ran" "yes" "$(cargo_ran)"
 check "primary checkout -> the guard is NOT asked" "" "$(cat "$GUARD_LOG")"
 check "primary checkout -> no CARGO_TARGET_DIR is set" "" "$(shim_targets)"
+
+echo "  -- clippy builds under the shared target's tree lock, or not at all --"
+
+# coord finding 7b603cde: a shared target last built from a PEER worktree serves
+# that peer's units as Fresh, and on 2026-10-29 this hook's clippy reported a
+# false `error[E0432]` from one. The fix wraps the build in the tree lock and
+# freshness ledger of qontinui-claude-config's lib/cargo-tree-freshness.sh.
+#
+# A STUB library stands in for it here (QONTINUI_PREPUSH_TREE_GUARD_LIB_DIR), so
+# the suite stays toolchain- and ccfg-free. Each stub call appends to one log,
+# and the cargo shim appends `cargo <sub> held=<yes|no>` to the SAME log, so
+# "clippy ran while the lock was held, after the refresh" is one ordered read.
+# shared-target-test.sh pins the REAL library's contract.
+stub_lib_fixture() {
+    STUB_LIB="$(dirname "$WORK")/stub-tree-lib"
+    STUB_LIB_LOG="$(dirname "$WORK")/stub-tree-lib.log"
+    STUB_HELD="$(dirname "$WORK")/stub-tree-lib.held"
+    mkdir -p "$STUB_LIB"
+    printf 'tree_identity_line() { echo stub; }\n' > "$STUB_LIB/tree-identity.sh"
+    cat > "$STUB_LIB/cargo-tree-freshness.sh" <<'STUBLIB'
+ctf_lock_acquire() {
+    printf 'acquire %s %s\n' "$1" "${CARGO_VERIFY_TREE_LOCK_MAX_WAIT:-unset}" >> "$STUB_LIB_LOG"
+    local rc="${STUB_ACQUIRE_RC:-0}"
+    [ "$rc" = 0 ] && : > "$STUB_HELD"
+    return "$rc"
+}
+ctf_refresh() { printf 'refresh %s\n' "$2" >> "$STUB_LIB_LOG"; return "${STUB_REFRESH_RC:-0}"; }
+ctf_lock_release() {
+    if [ -f "$STUB_HELD" ]; then printf 'release\n' >> "$STUB_LIB_LOG"; fi
+    rm -f "$STUB_HELD"
+}
+STUBLIB
+    : > "$STUB_LIB_LOG"
+    rm -f "$STUB_HELD"
+}
+
+# The stub log, one line per event, joined with `;` so a whole sequence is one
+# comparable string. A LITERAL target in the `acquire` line is asserted where the
+# arm knows it; arms that do not normalise it away.
+lib_seq() { tr '\n' ';' < "$STUB_LIB_LOG" | sed 's/;$//'; }
+lib_seq_no_target() {
+    sed -e 's/^acquire .* \([0-9a-z]*\)$/acquire <t> \1/' -e 's/^refresh .*/refresh <t>/' "$STUB_LIB_LOG" \
+        | tr '\n' ';' | sed 's/;$//'
+}
+
+run_guarded_in_wt() {
+    run_prepush_in_wt env QONTINUI_PREPUSH_TREE_GUARD_LIB_DIR="$STUB_LIB" \
+        STUB_LIB_LOG="$STUB_LIB_LOG" STUB_HELD="$STUB_HELD" "$@"
+}
+
+# (a) linked worktree + a caller-set CARGO_TARGET_DIR: the incident's branch.
+worktree_fixture; stub_lib_fixture
+run_guarded_in_wt CARGO_TARGET_DIR=/caller/chose/this
+check "(a) caller CARGO_TARGET_DIR -> fmt unlocked, then acquire, refresh, clippy UNDER the lock, release" \
+    "cargo fmt held=no;acquire /caller/chose/this 300;refresh /caller/chose/this;cargo clippy held=yes;release" \
+    "$(lib_seq)"
+check "(a) caller CARGO_TARGET_DIR -> the push is not blocked" "0" "$HOOK_RC"
+case "$HOOK_OUT" in
+    *"building under the tree lock on /caller/chose/this"*) pass_note "(a) and it names the target it locked" ;;
+    *) fail_note "(a) expected the locked target to be named, got: $HOOK_OUT" ;;
+esac
+
+# (b) linked worktree + the guard-resolved shared target.
+worktree_fixture; stub_lib_fixture
+run_guarded_in_wt QONTINUI_PREPUSH_CARGO_GUARD="$STUB_GUARD"
+check "(b) guard-resolved shared target -> the same guarded order, on THAT target" \
+    "cargo fmt held=no;acquire $SHARED_TARGET 300;refresh $SHARED_TARGET;cargo clippy held=yes;release" \
+    "$(lib_seq)"
+
+# (c) the primary checkout is guarded too: its own target/ is shared with every
+# writer that builds there, and the primary's tree can be the stale one.
+worktree_fixture; stub_lib_fixture
+HOOK_OUT="$(cd "$WORK" && commit_change "src-tauri/src/lib.rs" "// primary rust" && \
+    CARGO_SHIM_LOG="$SHIM_LOG" PATH="$SHIM_BIN:$PATH" QONTINUI_PREPUSH_TREE_GUARD_LIB_DIR="$STUB_LIB" \
+    STUB_LIB_LOG="$STUB_LIB_LOG" STUB_HELD="$STUB_HELD" bash "$PREPUSH" 2>&1 </dev/null)"
+HOOK_RC=$?
+check "(c) primary checkout -> guarded too" \
+    "cargo fmt held=no;acquire <t> 300;refresh <t>;cargo clippy held=yes;release" "$(lib_seq_no_target)"
+# The shim answers `metadata` with `$PWD/target`, so this also pins WHERE cargo
+# is asked: from src-tauri/, where clippy runs and where cargo starts its
+# `.cargo/config.toml` lookup — not from the repo root.
+case "$(sed -n 's/^acquire \(.*\) [0-9]*$/\1/p' "$STUB_LIB_LOG")" in
+    */src-tauri/target) pass_note "(c) and the locked target is the one cargo reports from src-tauri/" ;;
+    *) fail_note "(c) expected cargo to be asked from src-tauri/, got: $(cat "$STUB_LIB_LOG")" ;;
+esac
+
+# (d) every way the guard cannot be taken: clippy is NOT run, the push is not
+# blocked, the reason is named, and STRICT turns it into a refusal.
+guard_refusal_arm() {
+    local label="$1" want_reason="$2"; shift 2
+    worktree_fixture; stub_lib_fixture
+    run_guarded_in_wt CARGO_TARGET_DIR=/caller/chose/this "$@"
+    check "(d) $label -> clippy is NOT run unguarded" "no" \
+        "$(grep -q '^cargo clippy' "$STUB_LIB_LOG" && echo yes || echo no)"
+    check "(d) $label -> the push is not blocked" "0" "$HOOK_RC"
+    case "$HOOK_OUT" in
+        *"CANNOT RUN CLIPPY GUARDED"*"$want_reason"*"CI still gates clippy"*)
+            pass_note "(d) $label -> it names the reason and the residual coverage" ;;
+        *) fail_note "(d) $label -> expected CANNOT RUN CLIPPY GUARDED / $want_reason / CI still gates clippy, got: $HOOK_OUT" ;;
+    esac
+    check "(d) $label -> no lock is left held" "no" "$([ -f "$STUB_HELD" ] && echo yes || echo no)"
+    worktree_fixture; stub_lib_fixture
+    run_guarded_in_wt CARGO_TARGET_DIR=/caller/chose/this QONTINUI_PREPUSH_STRICT=1 "$@"
+    check "(d) $label + QONTINUI_PREPUSH_STRICT=1 -> the push is refused" "1" "$HOOK_RC"
+}
+guard_refusal_arm "lock wait timed out (acquire rc 1)" "timed out" STUB_ACQUIRE_RC=1
+guard_refusal_arm "lock unavailable (acquire rc 2)" "could not be taken" STUB_ACQUIRE_RC=2
+guard_refusal_arm "lock claim unproven (acquire rc 3)" "does not prove" STUB_ACQUIRE_RC=3
+guard_refusal_arm "touch failed (refresh rc 1)" "could not be touched" STUB_REFRESH_RC=1
+guard_refusal_arm "cargo names no target (metadata empty)" "could not say which target" STUB_META_EMPTY=1
+
+# The wait bound is the hook's own (a push is interactive), and overridable.
+worktree_fixture; stub_lib_fixture
+run_guarded_in_wt CARGO_TARGET_DIR=/caller/chose/this QONTINUI_PREPUSH_TREE_LOCK_MAX_WAIT=5
+check "QONTINUI_PREPUSH_TREE_LOCK_MAX_WAIT bounds the lock wait" \
+    "acquire /caller/chose/this 5" "$(grep '^acquire' "$STUB_LIB_LOG")"
+
+# (e) no tree-lock library on this machine: build as before, and say so.
+worktree_fixture; stub_lib_fixture
+run_guarded_in_wt CARGO_TARGET_DIR=/caller/chose/this \
+    QONTINUI_PREPUSH_TREE_GUARD_LIB_DIR="$(dirname "$WORK")/no-such-lib"
+check "(e) no library -> clippy still runs" "yes" \
+    "$(grep -q '^clippy' "$SHIM_LOG" && echo yes || echo no)"
+check "(e) no library -> the push is not blocked" "0" "$HOOK_RC"
+case "$HOOK_OUT" in
+    *"this build is UNGUARDED"*) pass_note "(e) and a NOTE says the build is unguarded" ;;
+    *) fail_note "(e) expected an UNGUARDED note, got: $HOOK_OUT" ;;
+esac
+# A library that loads but lacks a function is a stale ccfg: unguarded, not a crash.
+worktree_fixture; stub_lib_fixture
+printf ': no functions here\n' > "$STUB_LIB/tree-identity.sh"
+run_guarded_in_wt CARGO_TARGET_DIR=/caller/chose/this
+check "(e) library missing a function -> clippy still runs, unlocked" "cargo fmt held=no;cargo clippy held=no" "$(lib_seq)"
+case "$HOOK_OUT" in
+    *"defines no tree_identity_line"*) pass_note "(e) and the NOTE names the missing function" ;;
+    *) fail_note "(e) expected a NOTE naming tree_identity_line, got: $HOOK_OUT" ;;
+esac
+
+# (f) a fmt-only push takes no lock.
+worktree_fixture; stub_lib_fixture
+run_guarded_in_wt CARGO_TARGET_DIR=/caller/chose/this QONTINUI_PREPUSH_SKIP=1
+check "(f) QONTINUI_PREPUSH_SKIP=1 -> no lock is taken" "cargo fmt held=no" "$(lib_seq)"
+
+# (g) the lock is released even when clippy fails.
+worktree_fixture; stub_lib_fixture
+run_guarded_in_wt CARGO_TARGET_DIR=/caller/chose/this STUB_CLIPPY_RC=101 \
+    STUB_CLIPPY_OUT="error: this lint is denied"
+check "(g) clippy fails -> the push is refused" "1" "$HOOK_RC"
+check "(g) clippy fails -> the lock is still released" \
+    "cargo fmt held=no;acquire /caller/chose/this 300;refresh /caller/chose/this;cargo clippy held=yes;release" \
+    "$(lib_seq)"
+case "$HOOK_OUT" in
+    *"clippy lint fired"*) pass_note "(g) and an uncoded error: line keeps the lint wording" ;;
+    *) fail_note "(g) expected the lint wording for an uncoded error:, got: $HOOK_OUT" ;;
+esac
+
+# (h) a rustc error CODE is a compile error, not "a lint fired" — the wording
+# that sent the 2026-10-29 push looking for a lint that did not exist.
+worktree_fixture; stub_lib_fixture
+run_guarded_in_wt CARGO_TARGET_DIR=/caller/chose/this STUB_CLIPPY_RC=101 \
+    STUB_CLIPPY_OUT="error[E0432]: unresolved import \`qontinui_runner_win32::process_tree\`"
+case "$HOOK_OUT" in
+    *"a compile error (or deny-tier lint)"*) pass_note "(h) error[E0432] -> reported as a compile error" ;;
+    *) fail_note "(h) expected compile-error wording, got: $HOOK_OUT" ;;
+esac
+case "$HOOK_OUT" in
+    *"clippy lint fired"*) fail_note "(h) error[E0432] must not be reported as a lint" ;;
+    *) pass_note "(h) and not as a lint" ;;
+esac
+case "$HOOK_OUT" in
+    *"This target is UNGUARDED"*) fail_note "(h) a guarded build must not carry the unguarded hint" ;;
+    *) pass_note "(h) and a GUARDED build carries no unguarded hint" ;;
+esac
+# ...but it still names the residual: builds that skip the lock (cargo-guard.sh
+# until qontinui-claude-config#1823) can leave a peer's units behind.
+case "$HOOK_OUT" in
+    *"builds that skip the tree lock"*"private CARGO_TARGET_DIR"*)
+        pass_note "(h) and a GUARDED compile error still names the lock-skipping residual" ;;
+    *) fail_note "(h) expected the guarded residual hint, got: $HOOK_OUT" ;;
+esac
+worktree_fixture; stub_lib_fixture
+run_guarded_in_wt CARGO_TARGET_DIR=/caller/chose/this STUB_CLIPPY_RC=101 \
+    QONTINUI_PREPUSH_TREE_GUARD_LIB_DIR="$(dirname "$WORK")/no-such-lib" \
+    STUB_CLIPPY_OUT="error[E0432]: unresolved import \`qontinui_runner_win32::process_tree\`"
+case "$HOOK_OUT" in
+    *"This target is UNGUARDED"*"private CARGO_TARGET_DIR"*)
+        pass_note "(h) an UNGUARDED compile error says a peer's stale build may be the cause" ;;
+    *) fail_note "(h) expected the unguarded hint, got: $HOOK_OUT" ;;
+esac
 
 echo "  -- Defect B: decline honestly when cargo cannot load the workspace --"
 

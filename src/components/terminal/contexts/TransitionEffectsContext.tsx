@@ -13,22 +13,11 @@ import { useStateTransitionEffects } from "../useStateTransitionEffects";
 import { useWindowTitle } from "../useWindowTitle";
 import { getTerminalHotStore } from "../terminalHotStore";
 import { windowTitleCounts } from "../sessionCounts";
+import { restartInZone, type RestartOutcome } from "../restartInZone";
 
 type TransitionEffectsReturn = ReturnType<typeof useStateTransitionEffects>;
 
-/**
- * What a restart attempt actually did.
- *
- * `handleRestartInZone` has three exits and the void signature made all three
- * look alike to a caller: the zone was not in a restartable state, the
- * replacement terminal failed to spawn (the resource gate refuses below the
- * free-commit floor, and the operator can decline the override), or the swap
- * completed. The middle one leaves the ORIGINAL errored pane in place, and
- * `/restart` rendered success for it.
- */
-export type RestartOutcome =
-  | { restarted: true; tabId: string; retiredTabId: string | null }
-  | { restarted: false; reason: "not-restartable" | "spawn-failed"; state?: string };
+export type { RestartOutcome };
 
 export interface TransitionEffectsContextValue extends TransitionEffectsReturn {
   handleRestartInZone: (zoneIdx: number) => Promise<RestartOutcome>;
@@ -61,75 +50,29 @@ export function TransitionEffectsProvider({ children }: TransitionEffectsProvide
   const handleRestartInZoneRef = useRef<(zoneIdx: number) => void>(() => {});
 
   /**
-   * Replace the finished/errored pane in `zoneIdx` with a fresh terminal.
-   *
-   * RETIRES THE OLD PANE. It used to only swap the ZONE ASSIGNMENT, leaving the
-   * replaced tab in the roster with its PTY alive and its `error` /`completed`
-   * session state intact. Two visible consequences, both fixed here by routing
-   * the retirement through the manager's `closeTerminal` instead of quietly
-   * orphaning the tab:
-   *
-   *   1. The status strip counts session states over the whole `tabs` roster,
-   *      not over the zones, so a restarted error pane kept its error forever —
-   *      the strip sat at "1 error" with nothing on screen to clear.
-   *   2. The orphan's PTY stayed alive with NO zone showing it, so its durable
-   *      lifecycle record — already `closed` by the backend liveness poll once
-   *      `claude` exited (`poll-dead`; or `never-started` for a provisional row
-   *      that never ran a provider) — still mapped to a LIVE terminal. That is
-   *      the "closed record, live PTY" pair: it is the RETIRED pane's record,
-   *      not the replacement's. Nothing re-binds a record on restart; restart
-   *      issues no lifecycle `invoke` at all.
-   *
-   * `closeTerminal` is the one path that does all of it: it drops the tab from
-   * the roster (which is what clears the strip), fires
-   * `terminal_session_record_close` with reason `explicit` for the tab's Claude
-   * session — deterministically, instead of waiting out the poll's debounce —
-   * kills the PTY, and re-syncs the tab list against the backend afterwards.
-   *
-   * Ordering: the replacement is created FIRST and the old pane retired only
-   * once it exists. The spawn can legitimately fail (the resource gate refuses
-   * below the free-commit floor, and the operator can decline the override), and
-   * destroying the operator's scrollback for a replacement that never arrived
-   * would lose the only evidence of what went wrong.
+   * Replace the finished/errored pane in `zoneIdx` with a fresh terminal,
+   * retiring the old one — `restartInZone`, bound to this page's contexts.
    */
+  const { assignments, replaceTab, setFocusedZone, cosmeticZoneFor } = zoneLayout;
   const handleRestartInZone = useCallback(
-    async (zoneIdx: number): Promise<RestartOutcome> => {
-      const oldTabId = zoneLayout.assignments[zoneIdx];
-      const oldTab = tabs.find((t) => t.id === oldTabId);
-      const state = oldTabId ? (stateTracking.sessionStates[oldTabId] ?? "idle") : "idle";
-      if (state !== "completed" && state !== "error") {
-        return { restarted: false, reason: "not-restartable", state };
-      }
-      const label = labelsAndTags.zoneLabels[zoneIdx];
-      const tabId = await createTerminal(
-        oldTab?.title ? `${oldTab.title} (2)` : undefined,
-        oldTab?.workingDir ?? undefined,
-        undefined,
-        { label: "restart in zone" },
-      );
-      if (tabId) {
-        zoneLayout.assignTabToZone(zoneIdx, tabId);
-        zoneLayout.setFocusedZone(zoneIdx);
-        if (label) {
-          labelsAndTags.setZoneLabel(zoneIdx, label);
-        }
-        // Retire the pane we just replaced — after the zone points at the
-        // replacement, so the zone is never momentarily empty.
-        if (oldTabId) {
-          closeTerminal(oldTabId);
-        }
-        return { restarted: true, tabId, retiredTabId: oldTabId ?? null };
-      }
-      // `createTerminal` returned nothing: the replacement never existed, so
-      // the old pane was deliberately NOT retired. Saying so is the whole
-      // point of this return type.
-      return { restarted: false, reason: "spawn-failed" };
-    },
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    (zoneIdx: number): Promise<RestartOutcome> =>
+      restartInZone(
+        {
+          zoneLayout: { assignments, replaceTab, setFocusedZone, cosmeticZoneFor },
+          tabs,
+          sessionStates: stateTracking.sessionStates,
+          zoneLabels: labelsAndTags.zoneLabels,
+          setZoneLabel: labelsAndTags.setZoneLabel,
+          createTerminal,
+          closeTerminal,
+        },
+        zoneIdx,
+      ),
     [
-      zoneLayout.assignments,
-      zoneLayout.assignTabToZone,
-      zoneLayout.setFocusedZone,
+      assignments,
+      replaceTab,
+      setFocusedZone,
+      cosmeticZoneFor,
       tabs,
       stateTracking.sessionStates,
       labelsAndTags.zoneLabels,

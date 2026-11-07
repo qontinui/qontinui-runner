@@ -147,7 +147,7 @@ function mountSparseQuad(
   const zones = resolveLayout("quad", tabIds.length).zones.length;
   expect(zones).toBe(4);
   expect(reconcileAssignments(assignments, tabIds, zones)).toBe(assignments);
-  expect(computeAutoGrowLayoutId("quad", tabIds.length)).toBeNull();
+  expect(computeAutoGrowLayoutId("quad", tabIds.length, "grid")).toBeNull();
 
   persisted.value = { layoutId: "quad", assignments, focusedZone: opts.focusedZone ?? 0 };
   // Named like a component: it is the harness's stand-in for one render.

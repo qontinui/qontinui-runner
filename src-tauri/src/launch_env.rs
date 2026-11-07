@@ -222,7 +222,7 @@ impl RunnerLaunchEnv {
         // honors the env-var-or-fallback resolution from Item 5: prefer
         // WEBVIEW2_USER_DATA_FOLDER (set by the supervisor) and fall back
         // to qontinui_types::wire::webview2_data_dir for standalone
-        // launches. Returns None on non-Windows.
+        // launches. Off Windows: None except under an instance root.
         let webview2_user_data_dir = crate::instance::webview2_data_dir();
 
         let restate = RestateEnvHints {

@@ -11,7 +11,7 @@
  * module closes that half by telling the runner what each terminal is worth:
  *
  *  - `focused`    — a mounted, visible pane. Every coalesced frame, as today.
- *  - `background` — a mounted but hidden pane (parked by `HiddenTerminal`, a
+ *  - `background` — a mounted but hidden pane (a parked unzoned or off-screen tab, a
  *                   non-maximized zone under single view, a compact zone
  *                   card). Nothing renders it, but the page-level output tap
  *                   still feeds its state chip and sparkline from the stream,

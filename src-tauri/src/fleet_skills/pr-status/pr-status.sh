@@ -226,7 +226,7 @@ __resolve_fleet_script() {
   [ -n "$__FLEET_HERE_PHYS" ] && __rfs_try "$__FLEET_HERE_PHYS/_scripts/$__rfs_rel"
   # A SIBLING skill's render. `pr-status.sh` carries this block byte for byte
   # and resolves `coord-acting-bearer.sh` through it, so this rung is what
-  # spares the bundle a second copy of the same six files. `..` here is
+  # spares the bundle a second copy of the same rostered files. `..` here is
   # resolved by the kernel after any symlink, so it lands in the same
   # `skills/` directory the running copy was provisioned into.
   __rfs_try "$HERE/../coord-revive/_scripts/$__rfs_rel"
@@ -1195,6 +1195,7 @@ else
       0)   note_fail "MINT_EMPTY (coord-acting-bearer.sh exited 0 but printed no token)" ;;
       2)   note_fail "NO_TOKEN (\$COORD_AGENT_JWT unset/empty — it is the helper's only credential source)" ;;
       3)   note_fail "MINT_FAILED (coord rejected or never answered the acting-user mint — device unknown / no bound user / coord down)" ;;
+      4)   note_fail "PRESENTER_NOT_ADMITTED (coord refused to exchange \$COORD_AGENT_JWT — only a paired device JWT or an allocated-authenticated agent token may act for the operator)" ;;
       127) note_fail "HELPER_DEPS_MISSING (coord-acting-bearer.sh: curl missing, or no working JSON reader)" ;;
       *)   note_fail "HELPER_FAILED (coord-acting-bearer.sh exit $RC)" ;;
     esac
