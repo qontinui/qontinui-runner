@@ -777,42 +777,65 @@ async fn materialize(
         &working_dir,
         &claude_session_id,
     );
-    let (terminal_id, _coord_id) = crate::terminal::account_migration::spawn_resumed_pane(
-        &app,
-        &terminal_manager,
-        &session_registry,
-        crate::terminal::account_migration::ResumeSpawn {
-            claude_session_id: &claude_session_id,
-            working_dir: &working_dir,
-            model_transcript,
-            config_dir: &config_dir,
-            title,
-            // Land back on the tile the session used to occupy when this box
-            // still remembers it; otherwise the default page, zone 0 (a wrong
-            // tile beats a lost session).
-            page_id: local
-                .as_ref()
-                .map(|r| r.page_id.clone())
-                .unwrap_or_else(|| "default".to_string()),
-            zone_index: local.as_ref().map(|r| r.zone_index).unwrap_or(0),
-            work_unit_slug: child_intent.work_unit_slug.clone(),
-            correlation_topic: child_intent.correlation_topic.clone(),
-            intent_repo: child_intent.repo.clone(),
-            coord_lineage: Some(crate::commands::terminal::CoordSessionLineage {
-                parent_session_id: Some(respawn.source_session_id),
-                claude_code_session_id: Some(claude_session_id.clone()),
-            }),
-            // NOT the migration's `true`. A respawn genuinely CREATES something
-            // (its source is already closed and gone), so it must respect the
-            // spawn-time resource floor like every other new autonomous spawn.
-            resource_override: false,
-            // A cross-machine respawn's source session ran on ANOTHER device,
-            // so its continuation registration — and the consuming device id
-            // coord keys the outcome write on — are not this box's to carry.
-            gate_identity: None,
-        },
-    )
-    .map_err(RespawnError::Spawn)?;
+    // Land back on the tile the session used to occupy when this box still
+    // remembers it; otherwise the default page, zone 0 (a wrong tile beats a
+    // lost session).
+    let page_id = local
+        .as_ref()
+        .map(|r| r.page_id.clone())
+        .unwrap_or_else(|| "default".to_string());
+    let zone_index = local.as_ref().map(|r| r.zone_index).unwrap_or(0);
+    let (work_unit_slug, correlation_topic, intent_repo) = (
+        child_intent.work_unit_slug.clone(),
+        child_intent.correlation_topic.clone(),
+        child_intent.repo.clone(),
+    );
+    let parent_session_id = respawn.source_session_id;
+    // The resume is a SYNCHRONOUS PTY create, so it runs on the blocking pool
+    // rather than holding an async worker for its duration (plan
+    // 2026-10-28-runner-spawn-bursts-overwhelm-the-box-beyond-the-continuation-cap,
+    // D2), the same as boot resume does.
+    let (sid, wd, cfg) = (
+        claude_session_id.clone(),
+        working_dir.clone(),
+        config_dir.clone(),
+    );
+    let (terminal_id, _coord_id) =
+        crate::spawn_off_worker::run_terminal_create_off_worker(move || {
+            crate::terminal::account_migration::spawn_resumed_pane(
+                &app,
+                &terminal_manager,
+                &session_registry,
+                crate::terminal::account_migration::ResumeSpawn {
+                    claude_session_id: &sid,
+                    working_dir: &wd,
+                    model_transcript,
+                    config_dir: &cfg,
+                    title,
+                    page_id,
+                    zone_index,
+                    work_unit_slug,
+                    correlation_topic,
+                    intent_repo,
+                    coord_lineage: Some(crate::commands::terminal::CoordSessionLineage {
+                        parent_session_id: Some(parent_session_id),
+                        claude_code_session_id: Some(sid.clone()),
+                    }),
+                    // NOT the migration's `true`. A respawn genuinely CREATES
+                    // something (its source is already closed and gone), so it
+                    // must respect the spawn-time resource floor like every
+                    // other new autonomous spawn.
+                    resource_override: false,
+                    // A cross-machine respawn's source session ran on ANOTHER
+                    // device, so its continuation registration — and the
+                    // consuming device id coord keys the outcome write on — are
+                    // not this box's to carry.
+                    gate_identity: None,
+                },
+            )
+        })
+        .await
+        .map_err(RespawnError::Spawn)?;
 
     // 7. Re-acquire held claims under this device — idempotent by
     //    resource_key, best-effort, exactly as the handoff receiver does.

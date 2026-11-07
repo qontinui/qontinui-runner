@@ -1489,8 +1489,17 @@ async fn spawn_looping_agent_terminal(
     // `2026-08-21-memory-clause-liveness-gate-is-coarser-than-the-session`).
     // Provisioning runs before the render here, so the honest value is available.
     let coord_mcp = crate::coord_mcp::provision_coord_mcp_for_session(&workdir, bound_port, None);
-    crate::fleet_commands::provision_fleet_commands_for_session(&workdir);
-    crate::fleet_skills::provision_fleet_skills_for_session(&workdir);
+    // The fleet pair runs on the blocking pool: each pass joins a registry fetch
+    // and polls a `git ls-files` child (plan
+    // 2026-10-28-runner-spawn-bursts-overwhelm-the-box-beyond-the-continuation-cap, D2).
+    {
+        let wd = workdir.clone();
+        crate::spawn_off_worker::run_provisioning_off_worker(&workdir, move || {
+            crate::fleet_commands::provision_fleet_commands_for_session(&wd);
+            crate::fleet_skills::provision_fleet_skills_for_session(&wd);
+        })
+        .await;
+    }
 
     // Interactive `claude` argv with the prompt as the trailing positional
     // arg (the proven continuation recipe — flags before prompt, `--`
@@ -1607,35 +1616,46 @@ async fn spawn_looping_agent_terminal(
     // first spawn after a runner start is not decided by a cold cache.
     crate::claude_session::trust_gate::warm_dial().await;
 
+    // Synchronous create, run on the blocking pool so it does not hold an async
+    // worker for its duration (plan
+    // 2026-10-28-runner-spawn-bursts-overwhelm-the-box-beyond-the-continuation-cap, D2).
+    let (tm, sr, create_app) = (terminal_manager, session_registry, app.clone());
+    let (topic, repo) = (
+        Some(format!("looping-agent:{}", def.id)),
+        def.repos.first().cloned(),
+    );
     let (terminal_id, _coord_session) =
-        crate::commands::terminal::create_tracked_terminal_session_backend(
-            &terminal_manager,
-            &session_registry,
-            app.clone(),
-            tab_title,
-            workdir,
-            None,
-            Some(format!("looping-agent:{}", def.id)),
-            def.repos.first().cloned(),
-            command,
-            None,
-            capture_hint,
-            Some(target_page),
-            // UNATTENDED spawn — respect the critical floor. A looping agent is
-            // by construction the one caller that will ask again: the supervisor
-            // re-evaluates its definitions on every tick, so a refusal now is a
-            // deferral, not a cancellation. `do_spawn` classifies the refusal by
-            // its `resource_guard:critical:` prefix and does NOT feed it to
-            // `note_spawn_failure`, so the agent restarts on the first tick after
-            // the box has commit to spare rather than sitting out an escalating
-            // backoff it did nothing to earn — a resource verdict is not a broken
-            // agent. (Without that arm the refusal would land in the generic
-            // `Err` arm and the fifth one would delay the restart by up to
-            // 15 minutes past recovery.) Overriding here would instead let a loop
-            // hammer a starved machine with new `claude` processes indefinitely —
-            // the exact shape of the 2026-08-06→07 incident.
-            false,
-        )?;
+        crate::spawn_off_worker::run_terminal_create_off_worker(move || {
+            crate::commands::terminal::create_tracked_terminal_session_backend(
+                &tm,
+                &sr,
+                create_app,
+                tab_title,
+                workdir,
+                None,
+                topic,
+                repo,
+                command,
+                None,
+                capture_hint,
+                Some(target_page),
+                // UNATTENDED spawn — respect the critical floor. A looping agent is
+                // by construction the one caller that will ask again: the supervisor
+                // re-evaluates its definitions on every tick, so a refusal now is a
+                // deferral, not a cancellation. `do_spawn` classifies the refusal by
+                // its `resource_guard:critical:` prefix and does NOT feed it to
+                // `note_spawn_failure`, so the agent restarts on the first tick after
+                // the box has commit to spare rather than sitting out an escalating
+                // backoff it did nothing to earn — a resource verdict is not a broken
+                // agent. (Without that arm the refusal would land in the generic
+                // `Err` arm and the fifth one would delay the restart by up to
+                // 15 minutes past recovery.) Overriding here would instead let a loop
+                // hammer a starved machine with new `claude` processes indefinitely —
+                // the exact shape of the 2026-08-06→07 incident.
+                false,
+            )
+        })
+        .await?;
     Ok((terminal_id, pinned_session_id))
 }
 

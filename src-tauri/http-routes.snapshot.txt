@@ -1341,7 +1341,7 @@ POST /task-runs/{id}/rename rename_task_run
 POST /task-runs/{id}/resume resume_task_run_http
 POST /task-runs/{id}/stop stop_task_run
 POST /task-runs/{id}/unpause unpause_task_run
-POST /terminals create_terminal_handler
+POST /terminals create_terminal_detached
 POST /terminals/transport-stats reset_transport_stats_handler
 POST /terminals/{id}/move move_terminal_handler
 POST /terminals/{id}/resize resize_terminal_handler

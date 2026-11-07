@@ -305,9 +305,20 @@ pub(crate) fn edit_sibling_bad_request(
 }
 
 /// Create a new terminal session.
-pub async fn create_terminal_handler(
+pub async fn create_terminal_detached(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<CreateTerminalRequest>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    // Detached, so a client that disconnects while the create runs off-worker
+    // cannot drop this request after the PTY opened: its isolated context would
+    // release its claims under the new terminal, and its initial command would
+    // never be typed.
+    crate::spawn_off_worker::run_detached(create_terminal_handler(state, request)).await
+}
+
+async fn create_terminal_handler(
+    state: Arc<ApiState>,
+    request: CreateTerminalRequest,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let terminal_manager = get_terminal_manager(&state);
     let app_handle = state.app_handle.clone();
@@ -434,29 +445,38 @@ pub async fn create_terminal_handler(
         Some(extra_env_vec)
     };
 
-    match terminal_manager.create(
-        request.title,
-        working_dir,
-        request.page_id,
-        request.cols,
-        request.rows,
-        app_handle,
-        None,
-        extra_env,
-        // UNATTENDED spawn — respect the critical floor. This is the runner's
-        // HTTP `POST /terminals` door: the caller is a script, an MCP tool or a
-        // peer runner, and there is no dialog to show it. The refusal is not
-        // silent — it comes back as the request's error body with the lane, the
-        // live headroom and the floor in it, so the caller can retry when the
-        // box has room. A door that quietly overrode the floor would let any
-        // remote caller undo the machine owner's own protection.
-        false,
-        // With `account` the caller resolved the account and pinned it above, so
-        // trust is derived for that one account; without it the account is chosen
-        // by whatever the caller types into the shell.
-        trust_arm,
-        spawn_tenant,
-    ) {
+    // Off the API runtime's workers: this create can block for seconds to
+    // minutes (see `spawn_off_worker`).
+    let created = {
+        let terminal_manager = terminal_manager.clone();
+        crate::spawn_off_worker::run_terminal_create_off_worker(move || {
+            terminal_manager.create(
+                request.title,
+                working_dir,
+                request.page_id,
+                request.cols,
+                request.rows,
+                app_handle,
+                None,
+                extra_env,
+                // UNATTENDED spawn — respect the critical floor. This is the runner's
+                // HTTP `POST /terminals` door: the caller is a script, an MCP tool or a
+                // peer runner, and there is no dialog to show it. The refusal is not
+                // silent — it comes back as the request's error body with the lane, the
+                // live headroom and the floor in it, so the caller can retry when the
+                // box has room. A door that quietly overrode the floor would let any
+                // remote caller undo the machine owner's own protection.
+                false,
+                // With `account` the caller resolved the account and pinned it above, so
+                // trust is derived for that one account; without it the account is chosen
+                // by whatever the caller types into the shell.
+                trust_arm,
+                spawn_tenant,
+            )
+        })
+        .await
+    };
+    match created {
         Ok(info) => {
             if let Some(ctx) = isolated_ctx {
                 if let Some(session) = terminal_manager.get(&info.id) {
@@ -1142,7 +1162,7 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
     axum::Router::new()
         .route(
             "/terminals",
-            get(list_terminals_handler).post(create_terminal_handler),
+            get(list_terminals_handler).post(create_terminal_detached),
         )
         // Page-centric grouping of live terminals (which sessions on which page).
         .route("/terminal-pages", get(list_terminal_pages_handler))
