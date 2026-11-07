@@ -8762,12 +8762,6 @@ mod tests {
         let (m, s) = (Uuid::new_v4(), Uuid::new_v4());
         outbox
             .record(
-                machine,
-                failing,
-                SessionEventKind::StateChange,
-                json!({ "state": "active" }),
-            )
-            .record(
                 m,
                 s,
                 SessionEventKind::StateChange,
@@ -9248,7 +9242,7 @@ mod tests {
         let dropped = attach_drop_log(&coord);
         let registry = build_registry(coord.clone());
         let fresh = registry
-            .resume_external(old, make_test_intent())
+            .resume_external(old, make_test_intent(), None)
             .await
             .unwrap();
         assert_ne!(fresh, old, "the 404 fallback minted a fresh id");
@@ -9676,7 +9670,12 @@ mod tests {
         rec.lock().await.fail_all = true;
         let failing = Uuid::new_v4();
         outbox
-            .record(machine, failing, SessionEventKind::Heartbeat, json!({}))
+            .record(
+                machine,
+                failing,
+                SessionEventKind::StateChange,
+                json!({ "state": "active" }),
+            )
             .unwrap();
         outbox
             .record(
