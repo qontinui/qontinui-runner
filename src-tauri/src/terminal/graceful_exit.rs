@@ -285,6 +285,16 @@ fn prompt_ready_with(
     if require_idle && !snapshot_looks_idle(&screen.lines, screen.cursor_row) {
         return Err("the screen does not look idle".to_string());
     }
+    // The idle predicate reads row by row; the busy arm reads the whole grid
+    // normalized, so a marker wrapped across two rows (or painted with a
+    // non-breaking space) is seen by the busy arm only. Refusing it here too
+    // keeps the two arms disjoint by construction, not by hope.
+    if require_idle && shows_busy_marker(screen) {
+        return Err(format!(
+            "the busy marker (`{}`) is on screen — a busy turn",
+            super::account_migration::BUSY_MARKER
+        ));
+    }
     if is_numbered_option(&line.input) {
         return Err("a numbered choice is selected — a dialog, not the input prompt".to_string());
     }
@@ -1124,6 +1134,32 @@ mod tests {
         end.cursor_col = 34;
         assert!(busy_prompt_accepts_input(&end).is_err());
         assert!(input_prompt_ready(&s).is_err());
+    }
+
+    /// A marker the idle predicate cannot see row by row — wrapped across two
+    /// rows on a narrow pane, or painted with a non-breaking space — is still
+    /// the busy arm's alone: the idle arms refuse it, so the arms never overlap.
+    #[test]
+    fn a_marker_only_the_busy_arm_can_see_is_refused_by_the_idle_arms() {
+        let wrapped = {
+            let mut s = empty_prompt();
+            s.lines
+                .push("  ⏵⏵ bypass permissions on · 1 shell · esc to".to_string());
+            s.lines.push("  interrupt · ↓ to manage".to_string());
+            s
+        };
+        let nbsp = {
+            let mut s = empty_prompt();
+            s.lines
+                .push("  ⏵⏵ bypass permissions on · esc\u{a0}to interrupt".to_string());
+            s
+        };
+        for (name, s) in [("wrapped", wrapped), ("nbsp", nbsp)] {
+            assert!(shows_busy_marker(&s), "{name}: the busy arm sees it");
+            let why = input_prompt_ready(&s).unwrap_err();
+            assert!(why.contains("busy marker"), "{name}: {why}");
+            assert!(exit_prompt_ready(&s).is_err(), "{name}: never /exit");
+        }
     }
 
     #[test]

@@ -105,7 +105,7 @@ pub fn snapshot_looks_idle(lines: &[String], cursor_row: u16) -> bool {
 /// Which of [`snapshot_looks_idle`]'s checks vetoes idle on this snapshot, as
 /// a short human-readable reason; `None` exactly when the snapshot looks idle.
 /// The same checks in the same order — the diagnostic for a pane that keeps
-/// reading busy (see `restart_prep::notice`'s told-but-busy log line).
+/// reading busy (restart-prep's told-but-busy log line, #2569, reads it).
 pub fn idle_veto(lines: &[String], cursor_row: u16) -> Option<String> {
     // (1) any processing-indicator text ⇒ busy.
     for (row, line) in lines.iter().enumerate() {
@@ -519,6 +519,10 @@ mod tests {
             "✻ Cogitated for",
             "✻ working",
             "✻ Thinking for 3s…",
+            // A finished turn that left background work running is NOT idle
+            // (main's `is_completed_turn_summary` read both of these as done).
+            "✻ Worked for 1m 2s · 1 shell still running",
+            "✻ Cogitated for 9m 42s · done 6:36 AM · 1 shell still running",
         ] {
             assert!(!is_completed_turn_line(busy), "not completed: {busy:?}");
             let grid = lines(&[busy, "❯ "]);
