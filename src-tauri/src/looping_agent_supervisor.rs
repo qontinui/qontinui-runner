@@ -1567,18 +1567,10 @@ async fn spawn_looping_agent_terminal(
         ));
     }
 
-    // Spread across non-full pages (same picker + ceiling as continuations).
-    let counts: Vec<(String, usize)> = {
-        let mut per_page: HashMap<String, usize> = HashMap::new();
-        for info in terminal_manager.list() {
-            *per_page.entry(info.page_id).or_insert(0) += 1;
-        }
-        per_page.into_iter().collect()
-    };
-    let target_page = crate::agent_runtime::pick_continuation_page(
-        &counts,
-        crate::agent_runtime::CONTINUATION_PAGE_ZONE_CEILING,
-        || uuid::Uuid::new_v4().to_string(),
+    // Spread across pages with room (the one page-capacity rule, as continuations).
+    let target_page = crate::terminal::page_placement::pick_page_for_new_session(
+        &terminal_manager,
+        crate::terminal::page_placement::lifecycle_store(&app).as_deref(),
     );
 
     let capture_hint = crate::commands::terminal::SessionCaptureHint {

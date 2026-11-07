@@ -96,7 +96,7 @@ function savePages(pages: TerminalPageConfig[]) {
  * tab. This INCLUDES "default": `loadPages` only injects the default page when
  * NO pages are persisted, so once the operator has created their own pages the
  * default page is absent from the persisted list — a terminal parked on
- * "default" (e.g. any created via `POST /terminals` with no `pageId`) would
+ * "default" (e.g. any created via `POST /terminals` with `pageId: "default"`) would
  * then render nowhere. Synthesizing it here (named "Terminal", its canonical
  * name) is what keeps such a terminal reachable instead of orphaned.
  * Operator-created pages and their names are left intact (only ADD missing ids;

@@ -150,6 +150,10 @@ pub async fn terminal_create(
     // before `page_id` is moved into `terminal_manager.create`. Used to
     // look up / persist this pane's coord session id so a restart RESUMES
     // the prior coord row instead of orphaning it.
+    // An OPERATOR-opened terminal: the webview sends the `default` page as
+    // `null`, so `None` here is the default page, never "place automatically"
+    // (see `page_placement::operator_page`).
+    let page_id = Some(crate::terminal::page_placement::operator_page(page_id));
     let pane_key = PaneKey::from_create_in_window(
         page_id.as_deref().unwrap_or("default"),
         title.as_deref().unwrap_or(""),
@@ -1827,14 +1831,16 @@ pub fn terminal_session_list_open(
     // captured ONCE at boot (main.rs setup, before this command can run) —
     // the on-disk marker itself already says `clean:false` for the NOW-
     // running process and must never be re-read for restore decisions.
-    let boot = crate::session::shutdown_marker::boot_classification();
-    let prior_marker_at = boot.and_then(|c| c.prior_marker_at);
+    //
     // On a crash (unclean) boot the marker is the crashed process's own boot
     // instant — a boot artifact, not session liveness — so it must NOT feed
     // the cohort anchor (its stray-later `at` is exactly what pulled the
     // 2026-07-19 anchor ~1h46m past the crash band and stranded 81 sessions).
     // Only a CLEAN shutdown marker is an honest last-moment-of-life signal.
-    let boot_was_clean = boot.map(|c| !c.crash_recovery).unwrap_or(false);
+    // The page picker reads the restorable set through the same helper
+    // (`terminal::page_placement::page_loads`), so the two agree on it.
+    let (prior_marker_at, boot_was_clean) =
+        crate::session::shutdown_marker::restore_admission_inputs();
     // Rows stamped BEFORE this process booted are judged against the prior
     // boot's own last moment of life (the store's boot line — see
     // `restorable_records`), so a restore that ran hours late (a coord drain
@@ -2796,8 +2802,10 @@ pub(crate) fn create_terminal_session_backend(
                 policy_delivery: _,
             } = hint;
             // Single source of truth for the recorded page: the hint's page_id
-            // (set by the caller to the picked page), defaulting to "default".
-            let record_page_id = hint_page_id.unwrap_or_else(|| "default".to_string());
+            // (set by the caller to the picked page), else the page `create`
+            // actually put the pane on (its unpaged arm picks one), so the
+            // record and the live pane never disagree.
+            let record_page_id = hint_page_id.unwrap_or_else(|| info.page_id.clone());
             let record_zone_index = hint_zone_index.unwrap_or(0);
             if let Some(pinned) = pinned_session_id {
                 // Pre-pinned id: record synchronously, then verify async that

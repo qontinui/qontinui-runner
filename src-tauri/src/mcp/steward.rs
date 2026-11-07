@@ -1252,7 +1252,7 @@ async fn start_steward(
     match terminal_manager.create(
         Some(spec.skill.to_string()),
         None, // working_dir — default to workspace root
-        None, // page_id — default "default"
+        None, // page_id — placed by the page picker (terminal::page_placement)
         None, // cols — default
         None, // rows — default
         app_handle,

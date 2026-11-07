@@ -5892,6 +5892,15 @@ pub(crate) mod tests {
         }
     }
 
+    /// [`make_test_session`] under `id`, so `info().id` matches the key a
+    /// test holds it under in a [`super::super::TerminalManager`], as a real
+    /// spawn's does.
+    pub(crate) fn make_test_session_with_id(id: &str) -> TerminalSession {
+        let mut session = make_test_session(Arc::new(Mutex::new(Vec::new())));
+        session.id = id.to_string();
+        session
+    }
+
     /// A `TerminalSession` fixture that reads as ALIVE for the duration of a
     /// test, and is restored to dead before it drops.
     ///
