@@ -1996,7 +1996,7 @@ mod tests {
     ];
 
     /// Whether a callee path, as a DIRECT call by path, constructs or runs a
-    /// process: `Command::new`, any use of `process_helpers::`, or a
+    /// process: `Command::new`, any call through `process_helpers::`, or a
     /// `process_helpers` builder by name.
     fn builds_a_process(callee: &str) -> bool {
         let name = callee.rsplit("::").next().unwrap_or(callee);
@@ -2018,17 +2018,19 @@ mod tests {
     /// `build_step_command` has no other caller in this file, and that the
     /// only process constructed in this file by a direct call by path is
     /// `build_step_command`'s `process_helpers::tokio_no_window`: no
-    /// `Command::new`, no other use of `process_helpers::` and no other
+    /// `Command::new`, no other call through `process_helpers::` and no other
     /// `process_helpers` builder by name ([`PROCESS_HELPERS_BUILDERS`]). Calls
     /// are found in code only, never in a comment or a literal, and a
     /// turbofish is read through. A new caller, a wrapper or a second spawn
     /// path in this file turns it red.
     ///
     /// Out of its reach: a constructor passed as a value
-    /// (`.map(Command::new)`), a `use … as` alias, and processes run by
-    /// helpers in OTHER modules this file calls (`checkout`, `tools`,
-    /// `canonical`, `tree_kill`). A step spawned from another module is outside
-    /// it too (`env_agent/apply_versions.rs` has an unrelated `run_step`).
+    /// (`.map(Command::new)`), a `use … as` alias, a nested turbofish
+    /// (`Command::new::<Vec::<u8>>(`), a qualified-self call
+    /// (`<Command>::new(`), and processes run by helpers in OTHER modules this
+    /// file calls (`checkout`, `tools`, `canonical`, `tree_kill`). A step
+    /// spawned from another module is outside it too
+    /// (`env_agent/apply_versions.rs` has an unrelated `run_step`).
     #[test]
     fn the_step_path_is_run_dispatch_then_run_step_then_spawn_step_child() {
         let (production, _) = include_str!("executor.rs")
@@ -2065,14 +2067,17 @@ mod tests {
             process_calls,
             ["build_step_command -> crate::process_helpers::tokio_no_window"],
             "the only process this file constructs by a direct call by path must be \
-             build_step_command's, and this file uses process_helpers only in build_step_command"
+             build_step_command's, and this file calls through process_helpers only in \
+             build_step_command"
         );
     }
 
     /// The scan itself, on synthetic source: the shapes it must catch and the
-    /// ones it must ignore. A regression in `path_is`, the `*` prefix match,
-    /// the turbofish skip, the definition check or the lexer turns THIS red,
-    /// instead of quietly widening what the call-path test above lets through.
+    /// ones it must ignore, lookalike names among them. A regression in
+    /// `path_is`, the `process_helpers::` arm, the builder-name match (exact,
+    /// or a prefix on `*`), the turbofish skip, the definition check or the
+    /// lexer turns THIS red, instead of quietly changing what the call-path
+    /// test above lets through.
     #[test]
     fn the_process_scan_catches_direct_calls_and_ignores_mentions() {
         let src = r#"
@@ -2092,6 +2097,9 @@ fn unqualified_builder() {
 fn prefixed_runner() {
     let _ = run_with_timeout_detailed(cmd, limit);
 }
+fn qualified_other() {
+    let _ = crate::process_helpers::some_future_runner(x);
+}
 fn in_a_literal() {
     let _ = "Command::new(";
 }
@@ -2100,6 +2108,10 @@ fn in_a_block_comment() {
        std::process::Command::new("sh")
        still the comment */
     let _ = 1;
+}
+fn lookalike() {
+    let _ = MyCommand::new();
+    let _ = my_tokio_no_window();
 }
 fn tokio_no_window(program: &str) {}
 "#;
@@ -2116,8 +2128,10 @@ fn tokio_no_window(program: &str) {}
                 "turbofish_command -> std::process::Command::new",
                 "unqualified_builder -> tokio_no_window",
                 "prefixed_runner -> run_with_timeout_detailed",
+                "qualified_other -> crate::process_helpers::some_future_runner",
             ],
-            "the scan missed a direct call, or counted a comment, a literal or a definition"
+            "the scan missed a direct call, or counted a comment, a literal, a definition or a \
+             lookalike name"
         );
     }
 }
