@@ -5218,9 +5218,8 @@ const CONDITION_CHECK_SPAWN_ORIGIN: crate::coord_drain_state::SpawnOrigin =
 /// Emit a `terminal-focus-request` to the MAIN window only — when the focus
 /// coalescer surfaces it.
 ///
-/// `origin` is why the terminal was spawned. Named unattended origins are
-/// coalesced to at most one view switch per minute across all of them, and
-/// `SpawnOrigin::Unknown` to one per minute in a window of its own
+/// `origin` is why the terminal was spawned. Unattended origins are coalesced to
+/// at most one view switch per minute across all of them
 /// ([`crate::terminal::focus_coalescer`], plan
 /// `2026-10-28-runner-spawn-bursts-overwhelm-the-box-beyond-the-continuation-cap`
 /// D3); a terminal whose create-time `terminal-created` already carried the

@@ -9,29 +9,31 @@
 //! Terminal panel. On 2026-10-27 that was 46 view switches in 20 minutes, 19 of
 //! them inside 17 seconds.
 //!
-//! The rule here: across all NAMED unattended origins
-//! ([`SpawnOrigin::is_autonomous`], every one except [`SpawnOrigin::Unknown`])
-//! at most ONE view-switching decision surfaces per [`FOCUS_COALESCE_WINDOW`].
-//! The first spawn of a burst still surfaces (the reason the focus request
-//! exists — plan `2026-06-07-gate-continuation-auto-surface-and-focus`); the
-//! rest appear as tabs without stealing the view. Operator origins always
-//! surface and open no window.
+//! The rule here: across the origins that switch the operator's view
+//! ([`switches_the_view`]: continuations, condition checks, looping agents) at
+//! most ONE decision surfaces per [`FOCUS_COALESCE_WINDOW`]. The first spawn of
+//! a burst still surfaces (the reason the focus request exists — plan
+//! `2026-06-07-gate-continuation-auto-surface-and-focus`); the rest appear as
+//! tabs without stealing the view. Operator origins always surface and open no
+//! window.
 //!
-//! [`SpawnOrigin::Unknown`] — a caller this runner cannot name (an agent's
-//! HTTP `POST /terminals`, a UI-Bridge or relay create) — has a window of its
-//! OWN. An `Unknown` request surfaces only when neither the named window nor
-//! the `Unknown` window is open, and its surface opens only the `Unknown`
-//! window. So an all-`Unknown` burst is still held to one surface per
-//! window, while an agent's own terminal create never suppresses the next
-//! real gate continuation's surface.
+//! Every other unattended origin only ever selects a tab: a boot resume, a
+//! respawn or usage-limit migration, a steward, a scheduled task, orchestration
+//! fan-out, and [`SpawnOrigin::Unknown`] (a caller this runner cannot name, such
+//! as an agent's HTTP `POST /terminals` or a UI-Bridge or relay create). These
+//! have a TAB-ONLY window of their own. Such a request surfaces only when
+//! neither window is open, and its surface opens only the tab-only window. So a
+//! burst of them is still held to one surface per window, while none of them
+//! can suppress the next real gate continuation's view switch: that switch is
+//! never retried, so a window it did not get would leave an operator on another
+//! panel seeing nothing.
 //!
 //! One decision per spawn. The tab-selection half rides `terminal-created`,
 //! which the [`TerminalManager`](super::TerminalManager) emits at PTY create;
-//! the main-view half is the later `terminal-focus-request`. The create-time
-//! decision is recorded against the terminal id and the first focus request
-//! for that id TAKES it, so the two halves can never disagree (a create that
-//! surfaced is followed by its view switch; a suppressed create never gets
-//! one). A REFOCUS (a duplicate anchor folded onto a live tab) only PEEKS the
+//! the main-view half is the later `terminal-focus-request`, for the origins
+//! that send one. The create-time decision is recorded against the terminal id
+//! and the first focus request for that id TAKES it, so the two halves can never
+//! disagree (a suppressed create never gets a view switch). A REFOCUS (a duplicate anchor folded onto a live tab) only PEEKS the
 //! recorded decision, so it can never consume the original's and hand that
 //! terminal a fresh decision later. A peeked suppression stays suppressed; a
 //! peeked surface is NOT replayed — the refocus is a new request and is
@@ -41,7 +43,7 @@
 //! A suppression is never silent: it is a `debug!`, a `/health`
 //! `focusCoalescer.suppressedTotal` count, and one `info!` `focus: coalesced N
 //! unattended focus requests`, logged at the first decision or `/health` read
-//! after every open window (named and `Unknown`) has closed.
+//! after every open window has closed.
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -51,8 +53,8 @@ use tracing::{debug, info};
 
 use crate::coord_drain_state::SpawnOrigin;
 
-/// At most one named unattended view switch, plus one
-/// [`SpawnOrigin::Unknown`] view switch, per this window (D3).
+/// At most one view-switching surface, plus one tab-only surface, per this
+/// window (D3).
 pub const FOCUS_COALESCE_WINDOW: Duration = Duration::from_secs(60);
 
 /// How long a create-time decision waits for its focus request. A
@@ -70,8 +72,8 @@ const PENDING_DECISION_CAP: usize = 512;
 ///
 /// Operator origins always surface. An unattended origin surfaces when that
 /// window has had no surface yet, or when at least `window` has elapsed since
-/// its last one. [`Coalescer::decide`] checks a [`SpawnOrigin::Unknown`]
-/// request against both windows.
+/// its last one. [`Coalescer::decide`] checks a tab-only request against both
+/// windows.
 pub fn should_surface(
     now: Instant,
     last_surface: Option<Instant>,
@@ -87,20 +89,41 @@ pub fn should_surface(
     }
 }
 
+/// Whether a spawn from `origin` ever emits a `terminal-focus-request`, the
+/// request that moves the operator's main view. The callers of
+/// `agent_runtime::emit_terminal_focus_request` are continuations, condition
+/// checks (`CoordDispatch`) and a looping agent's first spawn. Exhaustive, so a
+/// new origin has to say which it is.
+fn switches_the_view(origin: SpawnOrigin) -> bool {
+    match origin {
+        SpawnOrigin::GateContinuation
+        | SpawnOrigin::UnitContinuation
+        | SpawnOrigin::CoordDispatch
+        | SpawnOrigin::LoopingAgent => true,
+        SpawnOrigin::Steward
+        | SpawnOrigin::Respawn
+        | SpawnOrigin::Scheduler
+        | SpawnOrigin::Orchestration
+        | SpawnOrigin::BootResume
+        | SpawnOrigin::OperatorTerminal
+        | SpawnOrigin::OperatorChat
+        | SpawnOrigin::Unknown => false,
+    }
+}
+
 /// The process-global coalescer state. Time is injected into every method so
 /// the state machine is tested without a clock.
 #[derive(Debug, Default)]
 struct Coalescer {
-    /// The instant the last NAMED unattended request surfaced (the named
-    /// window; [`SpawnOrigin::Unknown`] never sets it).
+    /// The instant the last view-switching request surfaced (the shared
+    /// window; a tab-only origin never sets it).
     last_surface: Option<Instant>,
     /// Wall-clock twin of `last_surface`, for `/health`.
     last_surface_at: Option<chrono::DateTime<chrono::Utc>>,
-    /// The instant the last [`SpawnOrigin::Unknown`] request surfaced (the
-    /// `Unknown` window).
-    last_unknown_surface: Option<Instant>,
-    /// Wall-clock twin of `last_unknown_surface`, for `/health`.
-    last_unknown_surface_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The instant the last tab-only request surfaced (the tab-only window).
+    last_tab_only_surface: Option<Instant>,
+    /// Wall-clock twin of `last_tab_only_surface`, for `/health`.
+    last_tab_only_surface_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Suppressed requests since boot.
     suppressed_total: u64,
     /// Suppressed requests not yet reported by the window-close `info!`.
@@ -111,11 +134,10 @@ struct Coalescer {
 }
 
 impl Coalescer {
-    /// If every open window (named and `Unknown`) has closed with
-    /// suppressions in it, return that count and reset it — the caller logs
-    /// it once.
+    /// If every open window has closed with suppressions in it, return that
+    /// count and reset it — the caller logs it once.
     fn take_closed_window(&mut self, now: Instant, window: Duration) -> Option<u64> {
-        let last = self.last_surface.max(self.last_unknown_surface)?;
+        let last = self.last_surface.max(self.last_tab_only_surface)?;
         if self.suppressed_in_window == 0 || now.saturating_duration_since(last) < window {
             return None;
         }
@@ -125,10 +147,9 @@ impl Coalescer {
     /// Decide one request and update the state. Returns (surfaced, the
     /// closed-window count to log, if any).
     ///
-    /// A NAMED unattended origin is checked against, and opens, the named
-    /// window. [`SpawnOrigin::Unknown`] is checked against both windows and
-    /// opens only its own (module doc). A suppressed request of either kind
-    /// is counted.
+    /// A view-switching origin is checked against, and opens, the shared
+    /// window. A tab-only origin is checked against both windows and opens only
+    /// its own (module doc). A suppressed request of either kind is counted.
     fn decide(
         &mut self,
         now: Instant,
@@ -137,16 +158,16 @@ impl Coalescer {
         window: Duration,
     ) -> (bool, Option<u64>) {
         let closed = self.take_closed_window(now, window);
-        let unknown = origin == SpawnOrigin::Unknown;
+        let tab_only = !switches_the_view(origin);
         let surface = should_surface(now, self.last_surface, origin, window)
-            && (!unknown || should_surface(now, self.last_unknown_surface, origin, window));
+            && (!tab_only || should_surface(now, self.last_tab_only_surface, origin, window));
         if origin.is_autonomous() {
             if !surface {
                 self.suppressed_total += 1;
                 self.suppressed_in_window += 1;
-            } else if unknown {
-                self.last_unknown_surface = Some(now);
-                self.last_unknown_surface_at = Some(wall);
+            } else if tab_only {
+                self.last_tab_only_surface = Some(now);
+                self.last_tab_only_surface_at = Some(wall);
             } else {
                 self.last_surface = Some(now);
                 self.last_surface_at = Some(wall);
@@ -262,7 +283,7 @@ fn health_json_of(c: &Coalescer) -> serde_json::Value {
         "windowSecs": FOCUS_COALESCE_WINDOW.as_secs(),
         "suppressedTotal": c.suppressed_total,
         "lastSurfaceAt": c.last_surface_at.map(|t| t.to_rfc3339()),
-        "lastUnknownSurfaceAt": c.last_unknown_surface_at.map(|t| t.to_rfc3339()),
+        "lastTabOnlySurfaceAt": c.last_tab_only_surface_at.map(|t| t.to_rfc3339()),
     })
 }
 
@@ -351,8 +372,8 @@ pub fn decide_for_refocus(origin: SpawnOrigin, terminal_id: &str) -> bool {
     surface
 }
 
-/// `/health` `focusCoalescer`. `lastSurfaceAt` is the named window's last
-/// surface and `lastUnknownSurfaceAt` the `Unknown` window's; `null` means no
+/// `/health` `focusCoalescer`. `lastSurfaceAt` is the shared window's last
+/// surface and `lastTabOnlySurfaceAt` the tab-only window's; `null` means no
 /// such request has surfaced since boot.
 pub fn health_json() -> serde_json::Value {
     let now = Instant::now();
@@ -559,7 +580,7 @@ mod tests {
                 "windowSecs": 60,
                 "suppressedTotal": 0,
                 "lastSurfaceAt": null,
-                "lastUnknownSurfaceAt": null,
+                "lastTabOnlySurfaceAt": null,
             })
         );
 
@@ -585,7 +606,7 @@ mod tests {
             Some(3)
         );
         assert_eq!(c.suppressed_in_window, 0);
-        // An `Unknown` surface after the named window closed opens its own.
+        // An `Unknown` surface after the shared window closed opens its own.
         let t = base + Duration::from_secs(62);
         assert!(
             c.decide(t, rfc("2026-10-27T20:31:26.933Z"), SpawnOrigin::Unknown, w)
@@ -597,7 +618,7 @@ mod tests {
                 "windowSecs": 60,
                 "suppressedTotal": 3,
                 "lastSurfaceAt": "2026-10-27T20:30:24.933+00:00",
-                "lastUnknownSurfaceAt": "2026-10-27T20:31:26.933+00:00",
+                "lastTabOnlySurfaceAt": "2026-10-27T20:31:26.933+00:00",
             })
         );
     }
@@ -608,7 +629,7 @@ mod tests {
         assert_eq!(v["windowSecs"], 60);
         assert!(v["suppressedTotal"].is_u64(), "{v}");
         assert!(v.get("lastSurfaceAt").is_some(), "{v}");
-        assert!(v.get("lastUnknownSurfaceAt").is_some(), "{v}");
+        assert!(v.get("lastTabOnlySurfaceAt").is_some(), "{v}");
     }
 
     // ── The create -> focus handoff, at the Coalescer level (injected time) ──
@@ -658,6 +679,7 @@ mod tests {
         }
         assert!(c.pending.is_empty());
         assert_eq!(c.last_surface, None);
+        assert_eq!(c.last_tab_only_surface, None);
     }
 
     #[test]
@@ -754,9 +776,64 @@ mod tests {
         assert!(c.decide(at(0), wall(), SpawnOrigin::Unknown, w).0);
         assert!(c.decide(at(30), wall(), gate, w).0);
         assert!(!c.decide(at(40), wall(), gate, w).0);
-        // The `Unknown` window closed at 60 s, but the named one is open to 90 s.
+        // The tab-only window closed at 60 s, but the shared one is open to 90 s.
         assert_eq!(c.take_closed_window(at(60), w), None);
         assert_eq!(c.take_closed_window(at(90), w), Some(1));
+    }
+
+    /// A spawn that only selects a tab must not take the window from a real
+    /// continuation: the view switch it would suppress is never retried, so an
+    /// operator on another panel would see nothing.
+    #[test]
+    fn a_tab_only_spawn_does_not_take_a_continuations_view_switch() {
+        let w = FOCUS_COALESCE_WINDOW;
+        for origin in [
+            SpawnOrigin::BootResume,
+            SpawnOrigin::Respawn,
+            SpawnOrigin::Steward,
+            SpawnOrigin::Scheduler,
+            SpawnOrigin::Orchestration,
+            SpawnOrigin::Unknown,
+        ] {
+            let base = Instant::now();
+            let mut c = Coalescer::default();
+            assert!(c.decide(base, wall(), origin, w).0, "{origin:?}");
+            assert_eq!(c.last_surface, None, "{origin:?}");
+            let t1 = base + Duration::from_secs(20);
+            assert!(
+                c.decide(t1, wall(), SpawnOrigin::GateContinuation, w).0,
+                "{origin:?} took the continuation's window"
+            );
+            // A burst of tab-only spawns is still held to one per window.
+            let t2 = base + Duration::from_secs(21);
+            assert!(!c.decide(t2, wall(), origin, w).0, "{origin:?}");
+        }
+    }
+
+    /// The table `decide` splits on, as literals: which origins send a
+    /// `terminal-focus-request` at all.
+    #[test]
+    fn only_continuations_condition_checks_and_looping_agents_switch_the_view() {
+        for origin in [
+            SpawnOrigin::GateContinuation,
+            SpawnOrigin::UnitContinuation,
+            SpawnOrigin::CoordDispatch,
+            SpawnOrigin::LoopingAgent,
+        ] {
+            assert!(switches_the_view(origin), "{origin:?}");
+        }
+        for origin in [
+            SpawnOrigin::Steward,
+            SpawnOrigin::Respawn,
+            SpawnOrigin::Scheduler,
+            SpawnOrigin::Orchestration,
+            SpawnOrigin::BootResume,
+            SpawnOrigin::OperatorTerminal,
+            SpawnOrigin::OperatorChat,
+            SpawnOrigin::Unknown,
+        ] {
+            assert!(!switches_the_view(origin), "{origin:?}");
+        }
     }
 
     #[test]
@@ -773,12 +850,12 @@ mod tests {
         assert!(c.decide(base, wall(), SpawnOrigin::GateContinuation, w).0);
         let t1 = base + Duration::from_secs(30);
         assert!(!c.decide(t1, wall(), SpawnOrigin::Unknown, w).0);
-        assert_eq!(c.last_unknown_surface, None);
+        assert_eq!(c.last_tab_only_surface, None);
         assert_eq!(c.suppressed_total, 1);
     }
 
     #[test]
-    fn unknown_only_suppressions_are_reported_when_the_unknown_window_closes() {
+    fn tab_only_suppressions_are_reported_when_the_tab_only_window_closes() {
         let base = Instant::now();
         let w = FOCUS_COALESCE_WINDOW;
         let mut c = Coalescer::default();
@@ -799,15 +876,15 @@ mod tests {
     }
 
     #[test]
-    fn unknown_origin_opens_only_its_own_window() {
+    fn unknown_origin_opens_only_the_tab_only_window() {
         let base = Instant::now();
         let w = FOCUS_COALESCE_WINDOW;
         let mut c = Coalescer::default();
         // An agent's HTTP create surfaces (no window is open) and opens only
-        // the `Unknown` window...
+        // the tab-only window...
         assert!(c.decide(base, wall(), SpawnOrigin::Unknown, w).0);
         assert_eq!(c.last_surface, None);
-        assert_eq!(c.last_unknown_surface, Some(base));
+        assert_eq!(c.last_tab_only_surface, Some(base));
         // ...so a real gate continuation one second later still surfaces.
         let t1 = base + Duration::from_secs(1);
         assert!(c.decide(t1, wall(), SpawnOrigin::GateContinuation, w).0);

@@ -19,8 +19,8 @@ use crate::coord_drain_state::SpawnOrigin;
 /// D3). `surface` says whether the frontend should SELECT the new tab; it is
 /// [`super::focus_coalescer::decide_for_create`]'s verdict for the spawn's
 /// origin — always `true` for an operator-created tab; for unattended ones
-/// coalesced per window (one window shared by the named origins, a separate
-/// one for `SpawnOrigin::Unknown`). Flattened beside the info rather than added to
+/// coalesced per window (one window shared by the view-switching origins, a
+/// separate one for the tab-only origins). Flattened beside the info rather than added to
 /// `TerminalInfo`, which is the cross-repo wire schema (`qontinui-schemas`,
 /// `deny_unknown_fields`) — the same reasoning that keeps the bypass hint a
 /// separate event.
@@ -1334,6 +1334,36 @@ pub(crate) fn command_implies_bypass_permissions(argv: &[String]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// The `terminal-created` wire shape the frontend reads: `surface` sits
+    /// beside the flattened `TerminalInfo` fields, never nested under an `info`
+    /// key. Losing the flatten or renaming `surface` would stay green elsewhere
+    /// and silently end auto-select for every tab.
+    #[test]
+    fn terminal_created_event_flattens_the_info_beside_surface() {
+        let info = crate::terminal::types::TerminalInfo {
+            id: "t-1".to_string(),
+            title: "Terminal 1".to_string(),
+            pid: Some(42),
+            cols: 80,
+            rows: 24,
+            working_dir: "/w".to_string(),
+            is_alive: true,
+            exit_code: None,
+            created_at: 1,
+            total_bytes_produced: 7,
+            page_id: "default".to_string(),
+        };
+        let v = serde_json::to_value(super::TerminalCreatedEvent {
+            info: &info,
+            surface: false,
+        })
+        .unwrap();
+        assert_eq!(v["surface"], serde_json::json!(false));
+        assert_eq!(v["id"], serde_json::json!("t-1"));
+        assert_eq!(v["isAlive"], serde_json::json!(true));
+        assert!(v.get("info").is_none(), "{v}");
+    }
+
     use super::{apply_trust_arm, command_implies_bypass_permissions, TerminalManager, TrustArm};
 
     /// Review (adoption) M1: the late-delivery wiring end to end on a REAL

@@ -3,6 +3,7 @@ import {
   scrollCellIntoView,
   focusedTabIdFor,
   newestAddedTabId,
+  newestSurfacedTabId,
   zoneForTab,
   FLOW_SCROLL_INTO_VIEW_OPTS,
 } from "./flowScrollRouting";
@@ -57,6 +58,28 @@ describe("focusedTabIdFor", () => {
     expect(focusedTabIdFor(assignments, 0)).toBe("a");
     expect(focusedTabIdFor(assignments, 2)).toBe("c");
     expect(focusedTabIdFor(assignments, 1)).toBeNull();
+  });
+});
+
+describe("newestSurfacedTabId", () => {
+  it("skips tabs the focus coalescer suppressed, so a burst keeps the focus where it is", () => {
+    const prev = new Set(["a"]);
+    const burst = [
+      { id: "a" },
+      { id: "b-1" },
+      { id: "b-2", coalesced: true },
+      { id: "b-3", coalesced: true },
+    ];
+    expect(newestSurfacedTabId(prev, burst)).toBe("b-1");
+  });
+
+  it("returns null when every new tab was suppressed", () => {
+    const prev = new Set(["a"]);
+    expect(newestSurfacedTabId(prev, [{ id: "a" }, { id: "b", coalesced: true }])).toBeNull();
+  });
+
+  it("treats a tab with no verdict as allowed: an operator's own new tab still focuses", () => {
+    expect(newestSurfacedTabId(new Set(["a"]), [{ id: "a" }, { id: "b" }])).toBe("b");
   });
 });
 

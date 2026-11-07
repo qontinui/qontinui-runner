@@ -34,7 +34,7 @@ import { useZoneVirtualization } from "./useZoneVirtualization";
 import {
   scrollCellIntoView,
   focusedTabIdFor,
-  newestAddedTabId,
+  newestSurfacedTabId,
   zoneForTab,
 } from "./flowScrollRouting";
 import { writeToTerminalById } from "./writeToTerminalById";
@@ -461,7 +461,7 @@ function ZoneGridInner({
       // First flow-mode pass — seed without focusing (restore/initial burst).
       return;
     }
-    const added = newestAddedTabId(prev, currentIds);
+    const added = newestSurfacedTabId(prev, tabs);
     if (added) pendingFocusTabIdRef.current = added;
     const pending = pendingFocusTabIdRef.current;
     if (!pending) return;
