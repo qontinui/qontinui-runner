@@ -563,6 +563,12 @@ pub struct ThreadNameCensus {
     /// count (`resource_guard::session_thread_attribution` treats that shape as
     /// a mis-read, i.e. UNKNOWN).
     pub session_threads: usize,
+    /// The subset of [`Self::session_threads`] in a holder-backed pane's
+    /// families ([`HOLDER_SESSION_THREAD_FAMILIES`]) — two per holder-backed
+    /// terminal. Kept apart so `resource_guard` can size the per-session
+    /// multiplier from the HOLDER count alone: a leak in the in-process
+    /// `terminal-*` families then cannot loosen that multiplier at all.
+    pub holder_session_threads: usize,
     /// When the walk ran. Wall-clock, because the consumer is a `/health`
     /// reader comparing it against its own clock.
     pub sampled_at: std::time::SystemTime,
@@ -584,12 +590,34 @@ pub const MAX_THREAD_NAME_ROWS: usize = 12;
 /// The bucket a thread with no description lands in.
 pub const UNNAMED_THREAD: &str = "<unnamed>";
 
-/// The thread-name prefixes of the PER-SESSION families: the two threads every
-/// live terminal holds for its whole life (`terminal/session.rs` names them
-/// `terminal-reader-<id>` and `terminal-waiter-<id>`, the id a
-/// `uuid::Uuid::new_v4()` from `terminal/manager.rs`).
+/// The thread-name prefixes of the PER-SESSION families every live terminal
+/// holds for its whole life, whatever its pane I/O: `terminal/session.rs` names
+/// them `terminal-reader-<id>` and `terminal-waiter-<id>`, the id a
+/// `uuid::Uuid::new_v4()` from `terminal/manager.rs`.
+pub const IN_PROCESS_SESSION_THREAD_FAMILIES: &[&str] = &["terminal-reader", "terminal-waiter"];
+
+/// The thread-name prefixes of the per-session families a HOLDER-BACKED pane
+/// adds in the runner process: `terminal/daemon_pane_io.rs` spawns
+/// `pty-holder-ctl-<key>` and `pty-holder-pump-<key>` for every pane whose PTY
+/// lives in a `pty-holder` process. They live for as long as the pane is
+/// attached, so a holder-backed terminal holds FOUR runner threads, not two.
 ///
-/// Exactly these two and nothing else, deliberately. `pipe-drain` is one
+/// Leaving them out made them look like non-session load: measured
+/// 2026-11-04 on nawa (128 cores, 503 GiB), 234 holder panes put 468 of these
+/// threads into the at-rest baseline (622, capped to 512). The pool arm then
+/// had 105 threads of headroom over a floor that grew 2 threads with every new
+/// session, and every gate continuation deferred at
+/// `thread_pressure:warn:1099_over_1085` while the kernel, cgroup and memory
+/// were nowhere near a limit. The holder server's OWN threads (`pty-holder-pump`
+/// in `crates/pty-holder/src/server.rs` and the rest) run in the holder
+/// process and never appear in this census.
+pub const HOLDER_SESSION_THREAD_FAMILIES: &[&str] = &["pty-holder-ctl", "pty-holder-pump"];
+
+/// Every PER-SESSION family: [`IN_PROCESS_SESSION_THREAD_FAMILIES`] followed by
+/// [`HOLDER_SESSION_THREAD_FAMILIES`]. A test pins that this list is exactly
+/// that union.
+///
+/// These and nothing else, deliberately. `pipe-drain` is one
 /// TRANSIENT thread per piped child process and `transcript-scan` is a
 /// dispatcher singleton — neither scales with the number of terminals.
 /// Counting them as session load would inflate the measured threads-per-session
@@ -600,9 +628,14 @@ pub const UNNAMED_THREAD: &str = "<unnamed>";
 ///
 /// Matched with `starts_with` over the raw names, which holds on both
 /// platforms: on Linux `comm`'s 15-byte truncation yields exactly
-/// `terminal-reader` / `terminal-waiter`, and on Windows the full
-/// `terminal-reader-<uuid>` description survives.
-pub const SESSION_THREAD_FAMILIES: &[&str] = &["terminal-reader", "terminal-waiter"];
+/// `terminal-reader` / `terminal-waiter` / `pty-holder-ctl-` / `pty-holder-pump`,
+/// and on Windows the full `terminal-reader-<uuid>` description survives.
+pub const SESSION_THREAD_FAMILIES: &[&str] = &[
+    "terminal-reader",
+    "terminal-waiter",
+    "pty-holder-ctl",
+    "pty-holder-pump",
+];
 
 /// One direct child process.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -1102,10 +1135,15 @@ pub fn finish_thread_name_census(names: Vec<String>) -> Option<ThreadNameCensus>
         return None;
     }
     let session_threads = names.iter().filter(|name| is_session_thread(name)).count();
+    let holder_session_threads = names
+        .iter()
+        .filter(|name| in_families(name, HOLDER_SESSION_THREAD_FAMILIES))
+        .count();
     Some(ThreadNameCensus {
         total: names.len(),
         by_name: collapse_thread_names(names.iter().map(String::as_str)),
         session_threads,
+        holder_session_threads,
         sampled_at: std::time::SystemTime::now(),
     })
 }
@@ -1113,10 +1151,13 @@ pub fn finish_thread_name_census(names: Vec<String>) -> Option<ThreadNameCensus>
 /// `true` when a raw thread name belongs to one of the
 /// [`SESSION_THREAD_FAMILIES`].
 fn is_session_thread(name: &str) -> bool {
+    in_families(name, SESSION_THREAD_FAMILIES)
+}
+
+/// `true` when a raw thread name starts with one of `families`.
+fn in_families(name: &str, families: &[&str]) -> bool {
     let name = name.trim();
-    SESSION_THREAD_FAMILIES
-        .iter()
-        .any(|family| name.starts_with(family))
+    families.iter().any(|family| name.starts_with(family))
 }
 
 /// Collapse a list of thread names into the top [`MAX_THREAD_NAME_ROWS`] rows.
@@ -3228,6 +3269,61 @@ mod tests {
             "pipe-drain".to_string(),
             "transcript-scan".to_string(),
             "terminal".to_string(),
+        ])
+        .expect("census");
+        assert_eq!(c.session_threads, 0);
+    }
+
+    /// A holder-backed pane's runner-side `pty-holder-ctl-<key>` and
+    /// `pty-holder-pump-<key>` threads are per-session load, under both the
+    /// Linux `comm` truncation and the full Windows name. Before this they fell
+    /// into the non-session remainder (nawa, 2026-11-04: 468 of them, the
+    /// whole margin of `thread_pressure:warn:1099_over_1085`). The holder
+    /// process's own singletons and the transient per-pane helpers stay out.
+    #[test]
+    fn holder_pane_threads_are_session_threads() {
+        assert_eq!(
+            SESSION_THREAD_FAMILIES,
+            [
+                IN_PROCESS_SESSION_THREAD_FAMILIES,
+                HOLDER_SESSION_THREAD_FAMILIES
+            ]
+            .concat()
+            .as_slice()
+        );
+
+        // Linux: 15-byte `comm` truncation of `pty-holder-ctl-<key>` and
+        // `pty-holder-pump-<key>`.
+        let mut linux: Vec<String> = Vec::new();
+        for family in [
+            "terminal-reader",
+            "terminal-waiter",
+            "pty-holder-ctl-",
+            "pty-holder-pump",
+        ] {
+            linux.extend(vec![family.to_string(); 234]);
+        }
+        linux.extend(vec!["app-rt".to_string(); 34]);
+        let c = finish_thread_name_census(linux).expect("census");
+        assert_eq!(c.session_threads, 936);
+        assert_eq!(c.holder_session_threads, 468);
+
+        // Windows: the full description survives.
+        let pane_id = "3f2a1b4c-9d8e-4f00-a1b2-0123456789ab";
+        let c = finish_thread_name_census(vec![
+            format!("pty-holder-ctl-{pane_id}"),
+            format!("pty-holder-pump-{pane_id}"),
+        ])
+        .expect("census");
+        assert_eq!(c.session_threads, 2);
+        assert_eq!(c.holder_session_threads, 2);
+
+        // Not per-session: transient per-pane helpers and boot singletons.
+        let c = finish_thread_name_census(vec![
+            "pty-holder-settle-1".to_string(),
+            "pty-holder-adopt-1".to_string(),
+            "pty-holder-census".to_string(),
+            "pty-holder-boot-sweep".to_string(),
         ])
         .expect("census");
         assert_eq!(c.session_threads, 0);

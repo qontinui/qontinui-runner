@@ -1784,10 +1784,12 @@ fn thread_name_census_to_json(census: &ThreadNameCensus) -> serde_json::Value {
             .iter()
             .map(|row| serde_json::json!({ "name": row.name, "count": row.count }))
             .collect::<Vec<_>>(),
-        // The UNCAPPED per-session tally (`terminal-reader` + `terminal-waiter`)
-        // the thread guard subtracts — `byName` is capped and must never be
-        // summed for it.
+        // The UNCAPPED per-session tally (`terminal-reader` + `terminal-waiter`,
+        // plus `pty-holder-ctl` + `pty-holder-pump` on holder-backed panes) the
+        // thread guard subtracts — `byName` is capped and must never be summed
+        // for it. `holderSessionThreads` is the holder-family subset.
         "sessionThreads": census.session_threads,
+        "holderSessionThreads": census.holder_session_threads,
         "sampledAt": sampled_at,
     })
 }
@@ -2169,6 +2171,7 @@ mod tests {
                 .filter(|(name, _)| name.starts_with("terminal-"))
                 .map(|(_, n)| n)
                 .sum(),
+            holder_session_threads: 0,
             sampled_at: std::time::UNIX_EPOCH + Duration::from_secs(1_800_000_000),
         }
     }
@@ -2226,6 +2229,7 @@ mod tests {
         assert_eq!(v["byName"].as_array().map(Vec::len), Some(2));
         assert_eq!(v["sampledAt"], "2027-01-15T08:00:00+00:00");
         assert_eq!(v["sessionThreads"], 19);
+        assert_eq!(v["holderSessionThreads"], 0);
         assert!(v.get("by_name").is_none(), "wire keys are camelCase");
     }
 
