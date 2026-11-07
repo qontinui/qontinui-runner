@@ -271,16 +271,38 @@ pub fn has_status_stamp(body: &str) -> bool {
 }
 
 /// Tokens that survive `Repo(s):` chunking but are English, not repositories.
-const REPO_STOPWORDS: [&str; 10] = [
-    "and", "plus", "the", "for", "only", "none", "n/a", "primary", "also", "with",
+/// Under `metadata.repos`' OmitWhenAbsent rule one stray word here overwrites
+/// a correct hand-written list, so placeholder words are listed too.
+const REPO_STOPWORDS: [&str; 18] = [
+    "and", "plus", "the", "for", "only", "none", "n/a", "primary", "also", "with", "tbd",
+    "various", "multiple", "unknown", "all", "any", "several", "same",
 ];
 
+/// The whole-plan declaration marker, anchored at line start (after optional
+/// whitespace and one `>`), so a prose mention such as "the `**Repo(s):**`
+/// line" is not a declaration. `**Repos:**` is the same declaration spelled
+/// differently. `**Repo:**` is NOT accepted: in the corpus it is usually a
+/// per-phase label (`**Repo:** X. **Files:** …`), not the plan's list.
+static REPO_DECL_MARKER: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+    regex::Regex::new(r"^\s*(?:>\s*)?\*\*Repo(?:\(s\)|s):\*\*").expect("valid regex")
+});
+
+/// A continuation line opening with a plain label (`Source: …`, `Area: …`)
+/// starts a new field, so it ends the declaration.
+static REPO_DECL_PLAIN_LABEL: once_cell::sync::Lazy<regex::Regex> =
+    once_cell::sync::Lazy::new(|| {
+        regex::Regex::new(r"^[A-Z][A-Za-z-]*:(?:\s|$)").expect("valid regex")
+    });
+
 /// Where a `Repo(s):` declaration stops being a list and becomes prose: a
-/// sentence end (`. ` or a final `.`), an em-dash clause (` — `), or a ` -- `.
+/// sentence end (`. ` or a final `.`), an em-dash clause (` — `), or a ` -- `
+/// — the dash followed by whitespace OR the end of the text, so a dash that
+/// ends a line (`qontinui-coord —` then a prose continuation) cuts too.
 /// Matched AFTER parentheticals are stripped, so a period inside a role
 /// (`(the migration. and its test)`) does not end the list early.
-static REPO_DECL_CUT: once_cell::sync::Lazy<regex::Regex> =
-    once_cell::sync::Lazy::new(|| regex::Regex::new(r"\.(?:\s|$)| — | -- ").expect("valid regex"));
+static REPO_DECL_CUT: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+    regex::Regex::new(r"\.(?:\s|$)|\s—(?:\s|$)|\s--(?:\s|$)").expect("valid regex")
+});
 
 /// A same-line bold label (`**Topic:**`, `**Resource-keys:**`, `**Status: …`)
 /// ends the declaration, exactly as such a label on a continuation line does.
@@ -292,7 +314,8 @@ static REPO_NAME: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::n
     regex::Regex::new(r"^[a-z][a-z0-9_-]*[a-z0-9]$").expect("valid regex")
 });
 
-/// Extract the repos a plan/prompt declares from its `**Repo(s):**` line.
+/// Extract the repos a plan/prompt declares from its `**Repo(s):**` (or
+/// `**Repos:**`) line.
 ///
 /// ONE parser of that line, feeding two consumers: the plan-library `repos`
 /// facet ([`build_artifact`]) and the work-unit `metadata.repos` key
@@ -300,19 +323,31 @@ static REPO_NAME: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::n
 /// allocations. A stray token there costs a continuation, not a facet, so the
 /// parse is strict (plan
 /// `2026-11-02-plan-backed-work-units-carry-no-repos-so-coords-repo-readers-read-empty`
-/// D2, census-validated against the plan corpus):
+/// D2):
 ///
-/// 1. Take the marker line plus its blockquote continuation lines (a `>` line
-///    carrying no new `**bold**` marker); each line join is a chunk boundary.
+/// 1. Take the first line STARTING with the marker (see `REPO_DECL_MARKER`)
+///    plus its blockquote continuation lines (a `>` line carrying no new
+///    `**bold**` marker and not opening with a plain `Label:`); each line join
+///    is a chunk boundary.
 /// 2. Strip parentheticals, cut at a same-line bold label, strip `**`, then cut
 ///    at the first sentence end (`. ` or a final `.`), ` — `, or ` -- `.
 /// 3. Split on `,` `+` `;` `·`, a line join, and the word `and`.
 /// 4. In each chunk strip backticks, surrounding punctuation and a trailing
 ///    `only` (any case). The chunk counts only if exactly ONE token is left —
 ///    a multi-word chunk is prose, never a repo.
-/// 5. `owner/repo` becomes `repo` (a deeper path is dropped). Lowercase; keep
-///    only names matching `[a-z][a-z0-9_-]*[a-z0-9]` that are not in
-///    [`REPO_STOPWORDS`]. Deduped, first-seen order.
+/// 5. A token starting with `~`, `.` or `/` is a filesystem path, never a repo.
+///    `owner/repo` becomes `repo` only when the owner has no `-` (so
+///    `qontinui-dev-notes/plans` is a path, not a repo named `plans`); a
+///    deeper path is dropped. Lowercase; keep only names matching
+///    `[a-z][a-z0-9_-]*[a-z0-9]`, checking [`REPO_STOPWORDS`] against both the
+///    whole token and the name. Deduped, first-seen order.
+///
+/// How it was checked: a Python port of this function run over every
+/// `plans/*.md` on qontinui-dev-notes `origin/main` `a539cc02d` (2026-11-07,
+/// 3,067 files): 1,534 carry a marker, 1,517 yield at least one repo, and 9
+/// emitted tokens are not in `gh repo list qontinui` (51 names) — 5 are
+/// new or out-of-org repos, 4 are prose (`coord`, `decision`, and `skill`/`an`
+/// from a bullet-list declaration, which this parse does not model).
 ///
 /// ```text
 /// > **Repo(s):** qontinui-coord (primary), qontinui-web (Phase 4 alembic migration).
@@ -323,15 +358,14 @@ static REPO_NAME: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::n
 /// Returns empty when the line is absent — most of the corpus has no
 /// `Repo(s):` line at all, which is a real empty, not a parse failure.
 pub fn extract_repos(body: &str) -> Vec<String> {
-    const MARKER: &str = "**Repo(s):**";
     let mut lines = body.lines();
     let mut segments: Vec<&str> = Vec::new();
     let mut in_blockquote = false;
 
     for line in lines.by_ref() {
-        if let Some((_, tail)) = line.split_once(MARKER) {
+        if let Some(m) = REPO_DECL_MARKER.find(line) {
             in_blockquote = line.trim_start().starts_with('>');
-            segments.push(tail);
+            segments.push(line.get(m.end()..).unwrap_or(""));
             break;
         }
     }
@@ -345,7 +379,10 @@ pub fn extract_repos(body: &str) -> Vec<String> {
             let Some(rest) = t.strip_prefix('>') else {
                 break;
             };
-            if rest.contains("**") || rest.trim().is_empty() {
+            if rest.contains("**")
+                || rest.trim().is_empty()
+                || REPO_DECL_PLAIN_LABEL.is_match(rest.trim_start())
+            {
                 break;
             }
             segments.push(rest);
@@ -377,28 +414,40 @@ pub fn extract_repos(body: &str) -> Vec<String> {
 
 /// Steps 4 and 5 of [`extract_repos`] for one chunk's words.
 fn repo_from_chunk(words: &[&str]) -> Option<String> {
-    let mut tokens: Vec<String> = words
+    // (backtick-stripped word, punctuation-trimmed token)
+    let mut tokens: Vec<(String, String)> = words
         .iter()
         .map(|w| {
-            w.replace('`', "")
+            let raw = w.replace('`', "");
+            let trimmed = raw
                 .trim_matches(|c: char| !(c.is_alphanumeric() || c == '-' || c == '_'))
-                .to_string()
+                .to_string();
+            (raw, trimmed)
         })
-        .filter(|t| !t.is_empty())
+        .filter(|(_, t)| !t.is_empty())
         .collect();
     if tokens
         .last()
-        .is_some_and(|t| t.eq_ignore_ascii_case("only"))
+        .is_some_and(|(_, t)| t.eq_ignore_ascii_case("only"))
     {
         tokens.pop();
     }
-    let [token] = tokens.as_slice() else {
+    let [(raw, token)] = tokens.as_slice() else {
         return None;
     };
+    // A filesystem path (`~/.gitconfig`, `.claude/`, `/etc/x`), judged before
+    // trimming strips the leading character that says so.
+    if raw.starts_with(['~', '.', '/']) {
+        return None;
+    }
     let lowered = token.to_lowercase();
+    if REPO_STOPWORDS.contains(&lowered.as_str()) {
+        return None;
+    }
     let name = match lowered.split('/').collect::<Vec<_>>().as_slice() {
         [name] => *name,
-        [_owner, name] => *name,
+        // An owner never has a `-`; `qontinui-dev-notes/plans` is a path.
+        [owner, name] if !owner.contains('-') => *name,
         _ => return None,
     };
     if name.len() > 64 || !REPO_NAME.is_match(name) || REPO_STOPWORDS.contains(&name) {
@@ -4142,6 +4191,107 @@ mod tests {
         );
         assert_eq!(
             extract_repos("**Repo(s):** qontinui.io, qontinui-coord\n"),
+            vec!["qontinui-coord"]
+        );
+    }
+
+    // ---- review round 1: one test per fix -------------------------------
+
+    /// Fix 1. `**Repos:**` is the same whole-plan declaration (corpus,
+    /// 2026-05-31-push-land-action-effect-signatures-plan); `**Repo:**` is
+    /// usually a per-phase label and is NOT one (corpus).
+    #[test]
+    fn the_repos_spelling_is_a_declaration_and_repo_singular_is_not() {
+        assert_eq!(
+            extract_repos("> **Repos:** `qontinui-coord` (primary).\n"),
+            vec!["qontinui-coord"]
+        );
+        assert!(
+            extract_repos("> **Repo:** `qontinui-runner` (current branch: `main`)\n").is_empty()
+        );
+    }
+
+    /// Fix 1. The marker is anchored at line start: a prose mention of it
+    /// (corpus, 2026-08-10-plan-and-prompt-library-in-web) is not a
+    /// declaration — it used to yield `line`, `body` and `sha` — and the real
+    /// declaration below it is the one read.
+    #[test]
+    fn a_prose_mention_of_the_marker_is_not_a_declaration() {
+        let mention = "  `> **Repo(s):**` line), body, and sha. Skip on unchanged sha.\n";
+        assert!(
+            extract_repos(mention).is_empty(),
+            "{:?}",
+            extract_repos(mention)
+        );
+        let body = format!("{mention}\n> **Repo(s):** qontinui-web\n");
+        assert_eq!(extract_repos(&body), vec!["qontinui-web"]);
+    }
+
+    /// Fix 2. A continuation line opening with a plain `Label:` starts a new
+    /// field. Corpus, 2026-10-29-supervisor-spawn-attribution-window-and-
+    /// hermetic-dev-action-coord: this used to yield a finding UUID.
+    #[test]
+    fn a_plain_label_continuation_line_ends_the_declaration() {
+        let body = "> **Repo(s):** qontinui-supervisor; qontinui-dev-notes (this plan)\n\
+                    > Source: coord findings `023f8910-e72a-4d42-bbea-7313567835a3` (topic `supervisor-dev-actions`) and\n\
+                    > `ab7c97d7-cd9e-4d5e-bcce-416206a9c5d2` (topic `supervisor-tests`), both posted 2026-10-28 by\n";
+        assert_eq!(
+            extract_repos(body),
+            vec!["qontinui-supervisor", "qontinui-dev-notes"]
+        );
+    }
+
+    /// Fix 3. Filesystem paths are not repos. Corpus,
+    /// 2026-07-15-vscode-coord-git-credential-prompt (used to yield
+    /// `gitconfig`) and 2026-08-31-fleet-provisioners-overwrite-tracked-
+    /// claude-source (used to yield `plans`): an owner never has a `-`.
+    #[test]
+    fn filesystem_paths_and_dashed_owners_are_not_repos() {
+        let body = "> **Repo(s):** qontinui-runner (all code changes); qontinui-dev-notes (operator one-off script, optional); ~/.gitconfig (operator-controlled state, mutated idempotently by runner setup)\n";
+        assert_eq!(
+            extract_repos(body),
+            vec!["qontinui-runner", "qontinui-dev-notes"]
+        );
+        let body = "> **Repo(s):** `qontinui-runner` (delivered by #1244, not by this plan);\n\
+                    > `qontinui-dev-notes/plans` (Phase 5, this plan's own commit).\n\
+                    > Area: fleet-bundle-parity\n";
+        assert_eq!(extract_repos(body), vec!["qontinui-runner"]);
+        // Constructed: two repos joined by `/` are a path, not owner/repo.
+        assert!(extract_repos("**Repo(s):** qontinui-web/qontinui-runner\n").is_empty());
+        // A dash-free owner is still stripped.
+        assert_eq!(
+            extract_repos("**Repo(s):** `qontinui/qontinui-coord`\n"),
+            vec!["qontinui-coord"]
+        );
+        // The whole-token stopword check: `N/A` is a stopword before any split.
+        assert!(extract_repos("**Repo(s):** N/A\n").is_empty());
+    }
+
+    /// Fix 4. A dash that ENDS a line cuts too. Constructed from the review's
+    /// example: the continuation used to emit `primarily`.
+    #[test]
+    fn a_dash_at_line_end_ends_the_declaration() {
+        let body = "> **Repo(s):** qontinui-coord —\n> primarily, with the web half read only.\n";
+        assert_eq!(extract_repos(body), vec!["qontinui-coord"]);
+        let body = "> **Repo(s):** qontinui-coord --\n> primarily, with the web half read only.\n";
+        assert_eq!(extract_repos(body), vec!["qontinui-coord"]);
+    }
+
+    /// Fix 5. Placeholder words are never repos: under OmitWhenAbsent one
+    /// stray word overwrites a correct hand-written `metadata.repos`.
+    /// Constructed (no corpus declaration is a bare placeholder today).
+    #[test]
+    fn placeholder_words_are_stopwords() {
+        for w in [
+            "TBD", "various", "multiple", "unknown", "all", "any", "several", "same",
+        ] {
+            assert!(
+                extract_repos(&format!("**Repo(s):** {w}\n")).is_empty(),
+                "{w}"
+            );
+        }
+        assert_eq!(
+            extract_repos("**Repo(s):** qontinui-coord, various\n"),
             vec!["qontinui-coord"]
         );
     }
