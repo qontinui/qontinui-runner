@@ -2216,6 +2216,13 @@ mod tests {
                     work_status: WorkStatus::Finished,
                     sideband: Sideband::NeverReported,
                     grid: GridIdle::Idle { since_ms: 1_000 },
+                    prompt: qontinui_runner_lib::wind_down::PromptScreen::Ready,
+                    screen_quiet_since_ms: Some(1_000),
+                    last_input_at_ms: None,
+                    record: qontinui_runner_lib::wind_down::SessionRecord {
+                        status: qontinui_runner_lib::wind_down::RecordStatus::Idle,
+                        last_message_ms: Some(1_000),
+                    },
                     has_live_children,
                     finished_at_ms: None,
                     grace: std::time::Duration::from_secs(1),
