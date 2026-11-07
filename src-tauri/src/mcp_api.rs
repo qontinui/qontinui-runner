@@ -5748,7 +5748,7 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 /// "stale_binary"`, which is the refusal saying the same thing.
 ///
 /// MUST stay sorted — membership is a `binary_search`.
-const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
+pub(crate) const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_ack_message",
     "coord_adopt_pr",
     "coord_agent_registry_effective",

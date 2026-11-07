@@ -363,9 +363,11 @@ const READ_TOOLS: &[&str] = &[
     "coord_build_info",
     "coord_can",
     "coord_change_conflict",
+    "coord_claim_check",
     "coord_conflict_check",
     "coord_diagnose",
     "coord_diff_impact",
+    "coord_expedited_land_status",
     // No `coord_fleet_` prefix covers it, so without this it reads as a write.
     "coord_fleet_dispatch_roles",
     "coord_fleet_drain_status",
@@ -385,8 +387,19 @@ const READ_TOOLS: &[&str] = &[
     "coord_primary_tree_branch_status",
     "coord_project_state",
     "coord_reevaluate_dry",
+    "coord_repo_tenant_bindings",
+    "coord_resolve_origin",
+    "coord_resolve_pr_author_session",
+    "coord_resolve_session",
+    "coord_secret_presence",
     "coord_session_obligations",
     "coord_session_worktrees",
+    "coord_signature",
+    "coord_slo_metrics",
+    "coord_symbol_lookup",
+    "coord_tenants_for_repo",
+    "coord_twin_catalog",
+    "coord_typecheck_file",
     "coord_verification_queue",
     "coord_watch_verdict",
     "coord_who_is_working_on",
@@ -1039,6 +1052,150 @@ mod tests {
             "a batch is as strong as its strongest member"
         );
         assert_eq!(operation_for_body(b"not json"), OPERATION_WRITE);
+    }
+
+    /// Every tool the runner's `/coord-mcp` proxy forwards is classified ON
+    /// PURPOSE. The read/write tables are hand-kept and drift silently — a
+    /// read added to the allowlist without a `READ_TOOLS` entry is reported as
+    /// a write, which is how #2306 / #2409 and the twelve `coord_resolve_*` /
+    /// language-service / status reads beside them went unnoticed. Pinning
+    /// both the allowlisted WRITES and the allowlisted reads that only a
+    /// `READ_TOOL_PREFIXES` family classifies makes adding a tool to
+    /// `mcp_api::COORD_MCP_ALLOWED_TOOLS` fail here until it is placed — a
+    /// write spelled like a read family (`coord_get_…`) is caught too. Place it
+    /// in `READ_TOOLS` or `ALLOWLISTED_PREFIX_READS` if coord's own tool
+    /// description says it mutates nothing, in `ALLOWLISTED_WRITES` otherwise.
+    /// `coord_query_*` is exempt: the proxy forwards it as a family
+    /// (`COORD_MCP_ALLOWED_TOOL_PREFIXES`), the whole family is coord's twin
+    /// reads, and enumerating it would drift with every new query.
+    #[test]
+    fn every_proxy_allowlisted_tool_is_classified_deliberately() {
+        const ALLOWLISTED_WRITES: &[&str] = &[
+            "coord_ack_message",
+            "coord_adopt_pr",
+            "coord_alert_claim",
+            "coord_alert_release",
+            "coord_answer_agent_question",
+            "coord_ask_question",
+            "coord_attest_gate",
+            "coord_bind_repo_tenant",
+            "coord_bind_self_session",
+            "coord_cancel_continuation",
+            "coord_citations_reenrich",
+            "coord_claim_acquire",
+            "coord_claim_heartbeat",
+            "coord_claim_release",
+            "coord_correct_gate",
+            "coord_create_repo",
+            "coord_declare_intent",
+            "coord_declare_supersession",
+            "coord_edit_verify", // unconfirmed: verify_core's side effects not audited
+            "coord_expectation_checkin",
+            "coord_expectation_close",
+            "coord_expectation_register",
+            "coord_fleet_drain",
+            "coord_fleet_drain_host",
+            "coord_fleet_undrain",
+            "coord_fleet_undrain_host",
+            "coord_force_clear_gate",
+            "coord_land_provenance_backfill",
+            "coord_mark_findings_triaged",
+            "coord_memory_record",
+            "coord_memory_supersede",
+            "coord_mute_gate",
+            "coord_notify_sensitive_action",
+            "coord_operator_touch_classify",
+            "coord_overlord_pass_record",
+            "coord_overlord_record",
+            "coord_pin_worktree",
+            "coord_post_finding",
+            "coord_pr_label_set",
+            "coord_pr_label_unset",
+            "coord_record_decision",
+            "coord_record_verification",
+            "coord_record_verification_label",
+            "coord_reevaluate",
+            "coord_register_gate",
+            "coord_reject_gate",
+            "coord_reopen_gate",
+            "coord_repoint_gate",
+            "coord_report_status",
+            "coord_request_handoff",
+            "coord_send_message",
+            "coord_set_gate_audience",
+            "coord_snooze_gate",
+            "coord_submit_escalate_evidence",
+            "coord_unbind_repo_tenant",
+            "coord_unmute_gate",
+            "coord_withdraw_agent_question",
+            "coord_withdraw_gate",
+            "coord_work_unit_add_citation",
+            "coord_work_unit_attest_phase",
+            "coord_work_unit_refresh_citations",
+            "coord_work_unit_remove_citation",
+            "coord_work_unit_retract_phase_attestation",
+            "coord_work_unit_transition",
+            "coord_work_unit_upsert",
+            "coord_write_prompt_document",
+            "coord_yield",
+        ];
+        const ALLOWLISTED_PREFIX_READS: &[&str] = &[
+            "coord_check_gate_predicate",
+            "coord_check_install_safety",
+            "coord_check_publish_safety",
+            "coord_check_repo_name",
+            "coord_edit_predict",
+            "coord_edit_predict_and_check",
+            "coord_explain_isolation_decision",
+            "coord_explain_pr_close",
+            "coord_explain_ref_event",
+            "coord_explain_worktree",
+            "coord_find_references",
+            "coord_fixer_arm_readiness",
+            "coord_gate_doctor",
+            "coord_gate_inspect",
+            "coord_gate_list",
+            "coord_gate_status",
+            "coord_get_answer",
+            "coord_get_prompt_document",
+            "coord_is_commit_live",
+            "coord_is_merge_safe",
+            "coord_list_dossiers",
+            "coord_list_prompt_documents",
+            "coord_list_worktrees",
+            "coord_predict_resource_collisions",
+            "coord_recent_errors",
+            "coord_recent_findings",
+            "coord_work_unit_list",
+            "coord_work_unit_list_citations",
+        ];
+        let allowlisted = || crate::mcp_api::COORD_MCP_ALLOWED_TOOLS.iter().copied();
+        let classified_writes: Vec<&str> = allowlisted()
+            .filter(|t| operation_for_call("tools/call", Some(t)) == OPERATION_WRITE)
+            .collect();
+        assert_eq!(
+            classified_writes, ALLOWLISTED_WRITES,
+            "the proxy allowlist and the read/write tables disagree on a WRITE; \
+             classify the tool in READ_TOOLS or ALLOWLISTED_WRITES"
+        );
+        let prefix_reads: Vec<&str> = allowlisted()
+            .filter(|t| !t.starts_with("coord_query_"))
+            .filter(|t| READ_TOOLS.binary_search(t).is_err())
+            .filter(|t| operation_for_call("tools/call", Some(t)) == OPERATION_READ)
+            .collect();
+        assert_eq!(
+            prefix_reads, ALLOWLISTED_PREFIX_READS,
+            "a tool is classified a read by a READ_TOOL_PREFIXES family alone; \
+             confirm it is a read and add it to ALLOWLISTED_PREFIX_READS"
+        );
+        // A read-table entry the proxy cannot forward is dead weight at best
+        // and a typo at worst; every exact read must name a forwarded tool.
+        for tool in READ_TOOLS {
+            assert!(
+                crate::mcp_api::COORD_MCP_ALLOWED_TOOLS.contains(tool),
+                "{tool} is in READ_TOOLS but not in the proxy allowlist"
+            );
+        }
     }
 
     #[test]
