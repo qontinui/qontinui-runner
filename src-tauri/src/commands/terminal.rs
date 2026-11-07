@@ -1517,15 +1517,34 @@ pub fn terminal_session_rebind_terminal(
     terminal_id: String,
     zone_index: i32,
 ) -> Result<CommandResponse, String> {
-    store.rebind_terminal(&claude_session_id, &terminal_id, zone_index);
-    // The page follows the pane: `rebind_terminal` moves only the terminal and
-    // zone, so without this the record keeps the page it was opened on and
-    // `/sessions/history` names a page `/terminals` does not place it on.
-    if let Some(live_page) = terminal_manager.live_page_of(&terminal_id) {
-        store.update_page_by_terminal(&terminal_id, &live_page);
+    rebind_and_sync_page(
+        &store,
+        &terminal_manager,
+        &claude_session_id,
+        &terminal_id,
+        zone_index,
+    )
+}
+
+/// The body of [`terminal_session_rebind_terminal`] over plain references, so
+/// tests drive the command's own wiring rather than a copy of it.
+pub(crate) fn rebind_and_sync_page(
+    store: &SessionLifecycleStore,
+    terminal_manager: &TerminalManager,
+    claude_session_id: &str,
+    terminal_id: &str,
+    zone_index: i32,
+) -> Result<CommandResponse, String> {
+    store.rebind_terminal(claude_session_id, terminal_id, zone_index);
+    // The page follows the pane: `rebind_terminal` moves only terminal + zone,
+    // so otherwise `/sessions/history` names a page `/terminals` does not place
+    // the session on. An unheld or dead pane names no page; the record keeps
+    // the one it had.
+    if let Some(live_page) = terminal_manager.live_page_of(terminal_id) {
+        store.update_page_by_terminal(terminal_id, &live_page);
     }
     store.mark_restored_from_boot(
-        &claude_session_id,
+        claude_session_id,
         crate::session::session_lifecycle_store::RESTORE_TIER_TERMINAL_ONLY,
     );
     Ok(CommandResponse {
@@ -4275,7 +4294,6 @@ mod tests {
         );
     }
 
-
     // ---------------------------------------------------------------------
     // Rebind: the record's page follows the pane it is bound to (plan
     // 2026-11-07-triage-sessions-ten-gaps-from-an-every-page-act-run, N10)
@@ -4303,23 +4321,6 @@ mod tests {
         LivePaneOn { tm, session }
     }
 
-    /// The store half of [`terminal_session_rebind_terminal`], in its order:
-    /// re-point, then sync the page from the live pane. The command takes its
-    /// store and manager from Tauri state, which a unit test cannot build, so
-    /// this mirrors its two calls against the real types.
-    fn rebind_like_the_command(
-        store: &SessionLifecycleStore,
-        tm: &TerminalManager,
-        claude_session_id: &str,
-        terminal_id: &str,
-        zone_index: i32,
-    ) {
-        store.rebind_terminal(claude_session_id, terminal_id, zone_index);
-        if let Some(live_page) = tm.live_page_of(terminal_id) {
-            store.update_page_by_terminal(terminal_id, &live_page);
-        }
-    }
-
     /// N10: a boot-restore rebind onto a pane on page P leaves the record on
     /// P. `rebind_terminal` alone keeps the record's old page — the defect.
     #[test]
@@ -4336,7 +4337,7 @@ mod tests {
             "the store's re-point alone does not move the page"
         );
 
-        rebind_like_the_command(&store, &pane.tm, "sess-moved", "term-new", 1);
+        rebind_and_sync_page(&store, &pane.tm, "sess-moved", "term-new", 1).unwrap();
         let rec = store.get("sess-moved").unwrap();
         assert_eq!(rec.terminal_id, "term-new");
         assert_eq!(rec.zone_index, 1);
@@ -4353,7 +4354,7 @@ mod tests {
         store.record_open(restore_candidate_record("sess-hist"));
         let pane = live_pane_on("term-hist", "page-P");
 
-        rebind_like_the_command(&store, &pane.tm, "sess-hist", "term-hist", 0);
+        rebind_and_sync_page(&store, &pane.tm, "sess-hist", "term-hist", 0).unwrap();
 
         let opts = crate::session::past_sessions::PastSessionsOpts {
             include_shells: true,
@@ -4387,7 +4388,7 @@ mod tests {
         store.record_open(rec);
         let tm = TerminalManager::new();
 
-        rebind_like_the_command(&store, &tm, "sess-keep", "term-unheld", 0);
+        rebind_and_sync_page(&store, &tm, "sess-keep", "term-unheld", 0).unwrap();
         assert_eq!(store.get("sess-keep").unwrap().page_id, "page-K");
     }
 }
