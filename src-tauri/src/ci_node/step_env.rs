@@ -196,32 +196,82 @@ pub(crate) fn current_step_env_removals() -> Vec<OsString> {
 /// (Re)create the empty `CLAUDE_CONFIG_DIR` of the step at `step_index`:
 /// `<dispatch_root>/.ci-claude-config/<step_index>`, a directory of that step's
 /// own, so a process an earlier step left running writes into the earlier
-/// step's directory and never into this one. Whatever already sits at the path
-/// is replaced, never followed: a real directory is removed whole, and anything
-/// else (a regular file, or a symlink, broken or not) is unlinked, so a link
-/// planted there cannot empty, or hand the step, the directory it points at.
+/// step's directory and never into this one.
+///
+/// Nothing found at either path is followed. The parent `.ci-claude-config` is
+/// kept if it is a real directory (it holds the earlier steps' directories);
+/// anything else there (a regular file, or a symlink, broken or not) is
+/// unlinked and the parent made anew. At the step's own path, a real directory
+/// is removed whole and anything else is unlinked. Both are then made with
+/// `create_dir`, never `create_dir_all`: if anything appears at the path in
+/// between, a link planted after the removal included, the creation fails, and
+/// with it the step, rather than the link being followed.
+///
+/// Not closed here: a parent swapped for a link AFTER its check and before the
+/// step's directory is made; closing that needs directory-fd-relative calls.
+/// That swap can only relocate the step's newly made, empty directory. It
+/// cannot hand the step an existing one, since `create_dir` refuses an existing
+/// path. (Code running as the node owner can read the owner's login anyway;
+/// see the module docs.)
 ///
 /// `Err` means no empty directory could be guaranteed: the caller fails the
 /// step rather than run it with the variable pointing somewhere that is not
-/// empty.
+/// empty. The dispatch root itself must already exist; it holds the worktree.
 pub(crate) fn fresh_empty_config_dir(
     dispatch_root: &Path,
     step_index: usize,
 ) -> Result<PathBuf, String> {
-    let dir = dispatch_root
-        .join(EMPTY_CONFIG_DIR_NAME)
-        .join(step_index.to_string());
-    match std::fs::symlink_metadata(&dir) {
-        Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(&dir)
-            .map_err(|e| format!("could not empty {}: {e}", dir.display()))?,
-        Ok(meta) => remove_non_directory(&dir, &meta)
-            .map_err(|e| format!("could not remove {}: {e}", dir.display()))?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(format!("could not inspect {}: {e}", dir.display())),
+    fresh_empty_config_dir_with(dispatch_root, step_index, |_| {})
+}
+
+/// [`fresh_empty_config_dir`], with a hook run in the window between the step
+/// directory's removal and its creation: the window a planted link would use.
+/// Production passes a no-op; a test plants a link there.
+fn fresh_empty_config_dir_with(
+    dispatch_root: &Path,
+    step_index: usize,
+    between_remove_and_create: impl FnOnce(&Path),
+) -> Result<PathBuf, String> {
+    let parent = dispatch_root.join(EMPTY_CONFIG_DIR_NAME);
+    match inspect(&parent)? {
+        Some(meta) if meta.is_dir() => {}
+        Some(meta) => {
+            remove_non_directory(&parent, &meta)
+                .map_err(|e| format!("could not remove {}: {e}", parent.display()))?;
+            create_new_dir(&parent)?;
+        }
+        None => create_new_dir(&parent)?,
     }
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| format!("could not create {}: {e}", dir.display()))?;
+
+    let dir = parent.join(step_index.to_string());
+    match inspect(&dir)? {
+        Some(meta) if meta.is_dir() => std::fs::remove_dir_all(&dir)
+            .map_err(|e| format!("could not empty {}: {e}", dir.display()))?,
+        Some(meta) => remove_non_directory(&dir, &meta)
+            .map_err(|e| format!("could not remove {}: {e}", dir.display()))?,
+        None => {}
+    }
+    between_remove_and_create(&dir);
+    create_new_dir(&dir)?;
     Ok(dir)
+}
+
+/// What is at `path`, read with `symlink_metadata` (a link is reported as a
+/// link, never followed). `None` when nothing is there; `Err` when it cannot be
+/// read, which includes a path whose parent is not a directory.
+fn inspect(path: &Path) -> Result<Option<std::fs::Metadata>, String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => Ok(Some(meta)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("could not inspect {}: {e}", path.display())),
+    }
+}
+
+/// Make `path` as a NEW directory with `create_dir`, which fails when anything
+/// already exists there (a link, broken or not, included) instead of reusing
+/// or following it, as `create_dir_all` would.
+fn create_new_dir(path: &Path) -> Result<(), String> {
+    std::fs::create_dir(path).map_err(|e| format!("could not create {}: {e}", path.display()))
 }
 
 /// Remove an entry `symlink_metadata` says is not a real directory: a regular
@@ -513,6 +563,141 @@ mod tests {
         assert!(
             login.join(".credentials.json").exists(),
             "the directory behind the link was emptied through it"
+        );
+    }
+
+    /// The names a directory holds, sorted: what "untouched" is checked against.
+    fn entries(dir: &Path) -> Vec<OsString> {
+        let mut names: Vec<OsString> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// THE RACE: a link planted at the step's path AFTER its removal and before
+    /// its creation (the seam runs in exactly that window). `create_dir` finds
+    /// the path taken and fails, so the step fails instead of being pointed
+    /// through the link; `create_dir_all` would have followed it and said Ok.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_planted_after_the_removal_fails_the_call_and_is_never_followed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let login = tmp.path().join("owner-claude");
+        std::fs::create_dir_all(&login).unwrap();
+        std::fs::write(login.join(".credentials.json"), "x").unwrap();
+
+        let err = fresh_empty_config_dir_with(tmp.path(), 0, |leaf| {
+            std::os::unix::fs::symlink(&login, leaf).unwrap();
+        })
+        .expect_err("a link planted after the removal was followed");
+        assert!(
+            err.contains("could not create") && err.contains(".ci-claude-config"),
+            "got: {err}"
+        );
+        assert_eq!(
+            entries(&login),
+            [OsString::from(".credentials.json")],
+            "the link target was touched"
+        );
+    }
+
+    /// A parent `.ci-claude-config` that is a symlink, to a directory holding a
+    /// login or to nothing, is unlinked and made anew as a real directory: the
+    /// step's directory lands inside the dispatch root, never behind the link,
+    /// and the link's target is left exactly as it was.
+    #[cfg(unix)]
+    #[test]
+    fn a_parent_that_is_a_symlink_is_unlinked_and_made_anew_never_followed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path().join(".ci-claude-config");
+        let login = tmp.path().join("owner-claude");
+        std::fs::create_dir_all(&login).unwrap();
+        std::fs::write(login.join(".credentials.json"), "x").unwrap();
+        std::os::unix::fs::symlink(&login, &parent).unwrap();
+
+        let dir = fresh_empty_config_dir(tmp.path(), 0).unwrap();
+        assert_eq!(dir, parent.join("0"));
+        assert!(
+            std::fs::symlink_metadata(&parent).unwrap().is_dir(),
+            "the parent link was not replaced by a real directory"
+        );
+        assert!(std::fs::symlink_metadata(&dir).unwrap().is_dir());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        assert_eq!(
+            entries(&login),
+            [OsString::from(".credentials.json")],
+            "the directory behind the parent link was touched"
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path().join(".ci-claude-config");
+        std::os::unix::fs::symlink(tmp.path().join("nowhere"), &parent).unwrap();
+        let dir = fresh_empty_config_dir(tmp.path(), 0).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&parent).unwrap().is_dir(),
+            "a broken parent link was not replaced by a real directory"
+        );
+        assert!(std::fs::symlink_metadata(&dir).unwrap().is_dir());
+        assert!(
+            !tmp.path().join("nowhere").exists(),
+            "the broken link's target was created through it"
+        );
+    }
+
+    /// A parent `.ci-claude-config` that is a regular file is replaced by a real
+    /// directory rather than failing the step.
+    #[test]
+    fn a_parent_that_is_a_regular_file_is_replaced_by_a_real_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path().join(".ci-claude-config");
+        std::fs::write(&parent, "planted").unwrap();
+
+        let dir = fresh_empty_config_dir(tmp.path(), 0).unwrap();
+        assert_eq!(dir, parent.join("0"));
+        assert!(
+            std::fs::symlink_metadata(&parent).unwrap().is_dir(),
+            "the planted file was not replaced by a directory"
+        );
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+    }
+
+    /// Windows: a JUNCTION at the step's path (which `remove_file` refuses) is
+    /// removed as a link and replaced by a real empty directory; the junction's
+    /// target keeps its file. Junctions need no elevation, unlike symlinks.
+    #[cfg(windows)]
+    #[test]
+    fn a_junction_at_the_config_dir_path_is_unlinked_never_followed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path().join(".ci-claude-config");
+        std::fs::create_dir_all(&parent).unwrap();
+        let login = tmp.path().join("owner-claude");
+        std::fs::create_dir_all(&login).unwrap();
+        std::fs::write(login.join(".credentials.json"), "x").unwrap();
+        let leaf = parent.join("0");
+        let status = std::process::Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(&leaf)
+            .arg(&login)
+            .status()
+            .expect("cmd runs");
+        assert!(status.success(), "mklink /J failed: {status}");
+
+        let dir = fresh_empty_config_dir(tmp.path(), 0).unwrap();
+        assert_eq!(dir, leaf);
+        let meta = std::fs::symlink_metadata(&dir).unwrap();
+        assert!(
+            meta.is_dir() && !meta.file_type().is_symlink(),
+            "the junction was not replaced by a real directory"
+        );
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        assert_eq!(
+            entries(&login),
+            [OsString::from(".credentials.json")],
+            "the junction's target was touched"
         );
     }
 

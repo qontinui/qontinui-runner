@@ -1776,12 +1776,8 @@ mod tests {
                 parent.display()
             );
         }
-        // Each step's own: a process step 2 left running would write into a
-        // directory step 3 is not pointed at.
-        assert_ne!(
-            cfgs[1], cfgs[2],
-            "steps 2 and 3 were pointed at the same CLAUDE_CONFIG_DIR"
-        );
+        // Each step's own (distinct indexes, so distinct paths): a process step 2
+        // left running would write into a directory step 3 is not pointed at.
         for (step_index, cfg) in cfgs.iter().enumerate() {
             assert_eq!(
                 cfg[0],
@@ -1941,10 +1937,12 @@ mod tests {
     /// this pins that `run_dispatch` reaches a step only through it, that
     /// `run_step` spawns only through `spawn_step_child`, that both of
     /// `spawn_step_child`'s commands get the scrub through `apply_step_env`,
-    /// and that `build_step_command` is called nowhere else, so no step command
-    /// is built off this path. A new caller, a wrapper or a second spawn path
-    /// turns it red. Scans this
-    /// file only: `env_agent/apply_versions.rs` has an unrelated `run_step`.
+    /// and that `build_step_command` has no other caller in this file. It also
+    /// pins that this file builds a process nowhere else: no `Command::new`,
+    /// and `tokio_no_window` only inside `build_step_command`. A new caller, a
+    /// wrapper or a second spawn path in this file turns it red. It scans this
+    /// file only, so a step spawned from ANOTHER module is outside its reach
+    /// (`env_agent/apply_versions.rs` has an unrelated `run_step`).
     #[test]
     fn the_step_path_is_run_dispatch_then_run_step_then_spawn_step_child() {
         let (production, _) = include_str!("executor.rs")
@@ -1965,12 +1963,22 @@ mod tests {
             ["spawn_step_child", "spawn_step_child"],
             "apply_step_env must be called exactly twice, both by spawn_step_child"
         );
-        // And no step command is built anywhere else, so none can bypass the
-        // scrub on its way to a spawn.
+        // And no step command is built anywhere else in this file, so none can
+        // bypass the scrub on its way to a spawn.
         assert_eq!(
             calls_of(production, "build_step_command"),
             ["spawn_step_child", "spawn_step_child"],
             "build_step_command must be called exactly twice, both by spawn_step_child"
+        );
+        assert_eq!(
+            calls_of(production, "Command::new"),
+            Vec::<String>::new(),
+            "this file must not build a process directly: go through build_step_command"
+        );
+        assert_eq!(
+            calls_of(production, "tokio_no_window"),
+            ["build_step_command"],
+            "tokio_no_window must be called only by build_step_command"
         );
     }
 }
