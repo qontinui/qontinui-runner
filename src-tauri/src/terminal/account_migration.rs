@@ -1183,7 +1183,9 @@ pub(crate) async fn migrate_session_off_runtime(
         // table. Taken here because the snapshot is async and
         // `migrate_session` is not.
         || old_pane_claude(app, &record.terminal_id),
-        move |old_writer| migrate_session(&app_owned, &record_owned, &src, &dst, old_writer, origin),
+        move |old_writer| {
+            migrate_session(&app_owned, &record_owned, &src, &dst, old_writer, origin)
+        },
     )
     .await
     .inspect_err(|e| {
