@@ -5,8 +5,9 @@
 //! depending on `account_selection_mode`:
 //!
 //! - `AlternatingHandoff` (the default) and `WeightedRandom`: see "Handoff
-//!   strategies" below. At spawn time `AlternatingHandoff` picks exactly as
-//!   `HighestExpectedUsage` does (its "account 1"); `WeightedRandom` draws.
+//!   strategies" below. At spawn time `AlternatingHandoff` spreads new
+//!   sessions over the top under-pace accounts (see "Spawn spread" below), and
+//!   `WeightedRandom` draws.
 //! - `HighestExpectedUsage`: among accounts that are **not** in
 //!   a rate-limit cooldown, not exhausted, AND currently under their expected
 //!   linear pace (actual 7-day utilization < expected utilization at this
@@ -56,6 +57,9 @@
 //! 3. If every account is cooled, the one with the **shortest remaining
 //!    cooldown** (closest to expiry).
 //!
+//! A spawn under `AlternatingHandoff` replaces step 1 with the spread pick
+//! when any account is under pace (see "Spawn spread" below).
+//!
 //! The usage signal comes from a cached snapshot, never an inline probe: the
 //! probe endpoint (`commands::ai_settings::probe_account_usage`) self-rate-
 //! limits, so probing on the hot path would give the worst signal exactly
@@ -71,8 +75,9 @@
 //! subprocess path uses [`super::config::mark_account_rate_limited`] with
 //! the default 5-minute cooldown (no header source on stdout).
 //!
-//! [`pick_best_account`] is a no-op when `account_selection_mode == Manual`
-//! or no accounts are configured.
+//! [`pick_best_account`] and [`pick_spawn_account`] are no-ops returning
+//! `None` when `account_selection_mode == Manual` or no accounts are
+//! configured.
 //!
 //! # Handoff strategies
 //!
@@ -98,6 +103,39 @@
 //! With no account under pace both fall back to the cross-mode ranking
 //! [`pick_target_from`] uses. Every handoff in every mode is recorded in the
 //! ledger, so switching to `AlternatingHandoff` continues from real history.
+//!
+//! # Spawn spread
+//!
+//! A spawn site asks [`pick_spawn_account`] for the account a new session runs
+//! under, and spawns under the dir it returns. Under `AlternatingHandoff` that
+//! pick alternates new sessions the same way handoffs alternate, over at most
+//! the top five under-pace accounts: account 1 plus the next
+//! [`SPAWN_SPREAD_OTHERS`] by expected usage, so 1,2,1,3,1,4,1,5,1,2,...
+//! ([`alternating_spawn_pick`]). The candidates pass the handoff path's
+//! eligibility (logged in, out of cooldown, not known-exhausted). Picking only
+//! the single best account sent a whole burst of spawns to one account (the
+//! operator-reported 2026-11-03 incident on the Linux box nawa: 58 gate
+//! continuations on one account within two minutes, then about 75 on the
+//! next).
+//!
+//! The spawn picks have their own in-memory ledger, pruned to the same
+//! [`HANDOFF_WINDOW`], so spawns and handoffs do not move each other's
+//! sequence. Each pick is recorded under the lock that read the ledger, so
+//! every spawn in a burst sees the ones before it. A pick counts once it is
+//! made, even if the spawn then fails to start. With no account under pace the
+//! spawn pick is the `HighestExpectedUsage` chain, unchanged. In every other
+//! mode [`pick_spawn_account`] is [`pick_best_account`];
+//! `HighestExpectedUsage` still sends every spawn to account 1. On a tie in
+//! expected usage the two can name different accounts as account 1:
+//! [`pick_from_highest_expected`] takes the roster-last of equal maxima, the
+//! spread's stable sort the roster-first. The alternation is unaffected.
+//!
+//! The spread pick is returned, never published. The process-global dir
+//! [`pick_best_account`] publishes is also the account of the in-process AI
+//! providers and the account a rate-limit cooldown is charged to, so it stays
+//! the mode's single pick (account 1 under `AlternatingHandoff`). Moving it
+//! with every spawn would switch those providers' account mid-unit and charge
+//! a 429 to whichever account was picked last.
 
 use super::config::{cmp_rank, UsageRank};
 use crate::claude_session::federation::derive_account_name;
@@ -109,7 +147,7 @@ use std::time::{Duration, Instant};
 use tracing::info;
 
 /// How far back [`AccountSelectionMode::AlternatingHandoff`] looks at earlier
-/// handoffs.
+/// handoffs, and at earlier spawn picks.
 pub const HANDOFF_WINDOW: Duration = Duration::from_secs(3 * 3600);
 
 /// Handoffs as `(when, target config dir)`, oldest first, pruned to
@@ -117,14 +155,30 @@ pub const HANDOFF_WINDOW: Duration = Duration::from_secs(3 * 3600);
 /// clock step neither drops nor keeps entries wrongly.
 static HANDOFFS: Mutex<VecDeque<(Instant, String)>> = Mutex::new(VecDeque::new());
 
+/// How many accounts after account 1 the `AlternatingHandoff` spawn pick
+/// spreads over: the spawn sequence is 1,2,1,3,1,4,1,5,1,2,... over the top
+/// `1 + SPAWN_SPREAD_OTHERS` under-pace accounts by expected usage.
+pub const SPAWN_SPREAD_OTHERS: usize = 4;
+
+/// The `AlternatingHandoff` spawn picks as `(when, config dir)`, oldest first,
+/// pruned to [`HANDOFF_WINDOW`] whenever it is read. Separate from
+/// [`HANDOFFS`] so a burst of spawns does not move the handoff sequence, nor a
+/// handoff the spawn sequence.
+static SPAWNS: Mutex<VecDeque<(Instant, String)>> = Mutex::new(VecDeque::new());
+
 /// Pin the most-available Claude config dir as the effective account for the
-/// current process. Call this once at the start of each logical unit of AI
-/// work (workflow run, prompt-home submission, AI chat session) — *not* per
-/// call, so warm-provider prompt-cache locality is preserved within a unit.
+/// current process, and return it. Call this once at the start of each logical
+/// unit of AI work (workflow run, prompt-home submission, AI chat session) —
+/// *not* per call, so warm-provider prompt-cache locality is preserved within
+/// a unit. A site that spawns a session calls [`pick_spawn_account`] instead.
+/// Callers that only want the published dir updated can ignore the return.
 ///
-/// No-op when:
+/// No-op returning `None` when:
+///   - a model gateway is declared
 ///   - account selection mode is `Manual`
 ///   - no accounts are configured
+///   - no configured account has live credentials (the published dir is left
+///     unchanged)
 ///
 /// With a single configured account it simply pins that account (so the
 /// effective config dir resolves even for users who never set a manual
@@ -135,11 +189,29 @@ static HANDOFFS: Mutex<VecDeque<(Instant, String)>> = Mutex::new(VecDeque::new()
 /// draw under `WeightedRandom`); falls back to first-non-cooled
 /// (cold start), then to the soonest-to-expire cooldown when every account is
 /// rate-limited. Full key: the module doc.
-pub fn pick_best_account() {
+pub fn pick_best_account() -> Option<String> {
+    pick_account(false)
+}
+
+/// Pick the account a new session spawns under: [`pick_best_account`], except
+/// that under `AlternatingHandoff`, the default, the RETURNED dir alternates
+/// over account 1 and the next [`SPAWN_SPREAD_OTHERS`] under-pace accounts
+/// (module doc, "Spawn spread"). The dir published process-globally is still
+/// [`pick_best_account`]'s, so the caller must spawn under the dir returned
+/// here ([`super::config::get_effective_config_dir_for_pick`]), never under a
+/// re-read of the published one.
+pub fn pick_spawn_account() -> Option<String> {
+    pick_account(true)
+}
+
+/// The one body behind [`pick_best_account`] and [`pick_spawn_account`]:
+/// publishes the mode's pick and returns it, or, for a `spawn` under
+/// `AlternatingHandoff` with an account under pace, returns the spread pick.
+fn pick_account(spawn: bool) -> Option<String> {
     // Subscription accounts are off while a model gateway is declared: there
     // is nothing to pick between (`crate::model_gateway`).
     if crate::model_gateway::gateway_declared() {
-        return;
+        return None;
     }
     // The EFFECTIVE mode — the local roster/settings mode resolved against the
     // fleet's `account_selection_mode` policy and this machine's pin — never
@@ -148,42 +220,36 @@ pub fn pick_best_account() {
     // cannot rotate under one mode while the spawn honours another.
     let mode = crate::claude_accounts::effective_selection_mode();
     if mode == AccountSelectionMode::Manual {
-        return;
+        return None;
     }
 
     let config_dirs = settings::get_claude_config_dirs();
     if config_dirs.is_empty() {
-        return;
+        return None;
     }
 
+    let highest_expected = || {
+        pick_from_highest_expected(
+            &config_dirs,
+            |d| super::oauth_refresh::has_valid_credentials(d),
+            |d| super::config::is_account_cooled_down(d),
+            |d| super::config::usage_rank_highest_expected(d),
+            |d| super::config::account_known_exhausted(d),
+            |d| super::config::time_until_cooled_down(d),
+        )
+    };
     let chosen = match mode {
         AccountSelectionMode::WeightedRandom => {
             let candidates = under_pace_candidates(&config_dirs, |d| {
                 super::oauth_refresh::has_valid_credentials(d)
                     && !super::config::is_account_cooled_down(d)
             });
-            weighted_pick(&candidates, rand::random::<f64>()).or_else(|| {
-                pick_from_highest_expected(
-                    &config_dirs,
-                    |d| super::oauth_refresh::has_valid_credentials(d),
-                    |d| super::config::is_account_cooled_down(d),
-                    |d| super::config::usage_rank_highest_expected(d),
-                    |d| super::config::account_known_exhausted(d),
-                    |d| super::config::time_until_cooled_down(d),
-                )
-            })
+            weighted_pick(&candidates, rand::random::<f64>()).or_else(highest_expected)
         }
-        // At spawn time the alternating strategy's "account 1" is exactly the
-        // highest-expected pick; the alternation applies to handoffs.
+        // The published pick of the alternating strategy is its "account 1",
+        // exactly the highest-expected pick; spawns alternate below.
         AccountSelectionMode::HighestExpectedUsage | AccountSelectionMode::AlternatingHandoff => {
-            pick_from_highest_expected(
-                &config_dirs,
-                |d| super::oauth_refresh::has_valid_credentials(d),
-                |d| super::config::is_account_cooled_down(d),
-                |d| super::config::usage_rank_highest_expected(d),
-                |d| super::config::account_known_exhausted(d),
-                |d| super::config::time_until_cooled_down(d),
-            )
+            highest_expected()
         }
         AccountSelectionMode::LeastUsage => pick_from(
             &config_dirs,
@@ -196,13 +262,59 @@ pub fn pick_best_account() {
         AccountSelectionMode::Manual => unreachable!("returned above"),
     };
 
-    if let Some(dir) = chosen {
-        let current = super::config::get_resolved_config_dir();
-        if current.as_deref() != Some(dir.as_str()) {
-            info!("pick_best_account: selecting '{}'", short_label(&dir));
-            super::config::set_resolved_config_dir(Some(dir));
+    let dir = chosen?;
+    let current = super::config::get_resolved_config_dir();
+    if current.as_deref() != Some(dir.as_str()) {
+        info!("pick_best_account: selecting '{}'", short_label(&dir));
+        super::config::set_resolved_config_dir(Some(dir.clone()));
+    }
+
+    if spawn && mode == AccountSelectionMode::AlternatingHandoff {
+        if let Some(spread) = spread_spawn_pick(&config_dirs) {
+            if spread != dir {
+                info!("pick_spawn_account: spawning on '{}'", short_label(&spread));
+            }
+            return Some(spread);
         }
     }
+    Some(dir)
+}
+
+/// Whether `config_dir` may take a handoff or an `AlternatingHandoff` spawn:
+/// logged in, out of cooldown, and not known-exhausted.
+fn handoff_eligible(config_dir: &str) -> bool {
+    super::oauth_refresh::has_valid_credentials(config_dir)
+        && !super::config::is_account_cooled_down(config_dir)
+        && !super::config::account_known_exhausted(config_dir)
+}
+
+/// The `AlternatingHandoff` spawn pick ([`alternating_spawn_pick`]) over the
+/// eligible under-pace accounts, continuing from the spawn ledger and recorded
+/// in it under the lock that read it, so a burst of concurrent spawns each
+/// sees the ones before it. The candidates are read before the lock is taken,
+/// so the lock covers only the ledger. `None` when no account is under pace;
+/// nothing is recorded then, and the caller takes its fallback.
+fn spread_spawn_pick(config_dirs: &[String]) -> Option<String> {
+    let under = under_pace_candidates(config_dirs, handoff_eligible);
+    let mut ledger = SPAWNS.lock().unwrap_or_else(|e| e.into_inner());
+    let now = Instant::now();
+    prune_ledger(&mut ledger, now);
+    let chosen = alternating_spawn_pick(&under, ledger.iter().map(|(_, d)| d.as_str()))?;
+    ledger.push_back((now, chosen.clone()));
+    Some(chosen)
+}
+
+/// The spawn half of `AlternatingHandoff`, free of globals: [`alternating_pick`]
+/// over account 1 and the next [`SPAWN_SPREAD_OTHERS`] only. `under` is the
+/// eligible under-pace accounts sorted by expected usage (highest first),
+/// `recent` the spawn picks in the window, oldest first. The sequence is
+/// 1,2,1,3,1,4,1,5,1,2,...; an account ranked below the top five is never
+/// chosen. `None` when no account is under pace.
+fn alternating_spawn_pick<'a>(
+    under: &[UnderPace],
+    recent: impl DoubleEndedIterator<Item = &'a str> + Clone,
+) -> Option<String> {
+    alternating_pick(&under[..under.len().min(1 + SPAWN_SPREAD_OTHERS)], recent)
 }
 
 /// Pure selection core, parameterised over the cooldown/usage/expiry lookups
@@ -355,10 +467,10 @@ fn pick_from_highest_expected<'a>(
 /// instead of a least-bad fallback. Does NOT touch the global resolved dir;
 /// the caller pins the choice per-spawn via `CLAUDE_CONFIG_DIR`.
 ///
-/// Also unlike [`pick_best_account`], this is NOT gated on
-/// `account_selection_mode == LeastUsage`: the migration feature has its own
-/// settings switch (`claude_cli.auto_migrate_on_token_exhaustion`), and a
-/// Manual-mode operator who triggers a manual migration still wants a target.
+/// Also unlike [`pick_best_account`], this runs in every mode, `Manual`
+/// included: the migration feature has its own settings switch
+/// (`claude_cli.auto_migrate_on_token_exhaustion`), and a Manual-mode operator
+/// who triggers a manual migration still wants a target.
 ///
 /// Under `WeightedRandom` and `AlternatingHandoff` the target is chosen by
 /// that strategy (module doc, "Handoff strategies") and the ranking above is
@@ -374,12 +486,8 @@ pub fn pick_migration_target(exclude_dir: &str) -> Option<String> {
 
     let mut ledger = HANDOFFS.lock().unwrap_or_else(|e| e.into_inner());
     let now = Instant::now();
-    prune_handoffs(&mut ledger, now);
-    let under = under_pace_candidates(&config_dirs, |d| {
-        super::oauth_refresh::has_valid_credentials(d)
-            && !super::config::is_account_cooled_down(d)
-            && !super::config::account_known_exhausted(d)
-    });
+    prune_ledger(&mut ledger, now);
+    let under = under_pace_candidates(&config_dirs, handoff_eligible);
     let chosen = choose_handoff_target(
         crate::claude_accounts::effective_selection_mode(),
         &under,
@@ -427,7 +535,7 @@ fn choose_handoff_target<'a>(
 pub fn record_handoff(config_dir: &str) {
     let mut ledger = HANDOFFS.lock().unwrap_or_else(|e| e.into_inner());
     let now = Instant::now();
-    prune_handoffs(&mut ledger, now);
+    prune_ledger(&mut ledger, now);
     ledger.push_back((now, config_dir.to_string()));
 }
 
@@ -441,7 +549,8 @@ pub fn unrecord_handoff(config_dir: &str) {
     }
 }
 
-fn prune_handoffs(ledger: &mut VecDeque<(Instant, String)>, now: Instant) {
+/// Drop the entries of a handoff or spawn ledger older than [`HANDOFF_WINDOW`].
+fn prune_ledger(ledger: &mut VecDeque<(Instant, String)>, now: Instant) {
     while ledger
         .front()
         .is_some_and(|(at, _)| now.saturating_duration_since(*at) > HANDOFF_WINDOW)
@@ -849,7 +958,7 @@ mod tests {
     }
 
     #[test]
-    fn prune_handoffs_drops_entries_older_than_the_window() {
+    fn prune_ledger_drops_entries_older_than_the_window() {
         let t0 = Instant::now();
         let mut ledger: VecDeque<(Instant, String)> = [
             (t0, "old".to_string()),
@@ -857,7 +966,7 @@ mod tests {
             (t0 + Duration::from_secs(20), "new".to_string()),
         ]
         .into();
-        prune_handoffs(&mut ledger, t0 + HANDOFF_WINDOW + Duration::from_secs(5));
+        prune_ledger(&mut ledger, t0 + HANDOFF_WINDOW + Duration::from_secs(5));
         assert_eq!(
             ledger.iter().map(|(_, d)| d.as_str()).collect::<Vec<_>>(),
             vec!["edge", "new"]
@@ -942,6 +1051,108 @@ mod tests {
         assert_eq!(
             alternating_pick(&cands, ["a", "b"].into_iter()),
             Some("c".into())
+        );
+    }
+
+    // --- alternating_spawn_pick: the AlternatingHandoff spawn spread --------
+
+    /// Drive `alternating_spawn_pick` for `n` spawns, feeding each pick back as
+    /// the spawn ledger, and return the account numbers (1-based, by expected
+    /// rank).
+    fn spawn_spread(cands: &[UnderPace], n: usize) -> Vec<usize> {
+        let mut ledger: Vec<String> = Vec::new();
+        (0..n)
+            .map(|_| {
+                let pick =
+                    alternating_spawn_pick(cands, ledger.iter().map(String::as_str)).unwrap();
+                ledger.push(pick.clone());
+                cands.iter().position(|(d, _, _)| *d == pick).unwrap() + 1
+            })
+            .collect()
+    }
+
+    #[test]
+    fn spawn_spread_alternates_over_account_one_and_the_next_four_only() {
+        // Seven under-pace accounts, listed out of rank order.
+        let cands = ranked_under_pace(&[
+            ("e", 0.50, 0.1),
+            ("a", 0.90, 0.1),
+            ("g", 0.30, 0.1),
+            ("c", 0.70, 0.1),
+            ("b", 0.80, 0.1),
+            ("f", 0.40, 0.1),
+            ("d", 0.60, 0.1),
+        ]);
+        assert_eq!(spawn_spread(&cands, 10), vec![1, 2, 1, 3, 1, 4, 1, 5, 1, 2]);
+        // Over a long burst the 6th and 7th are never chosen, each of the top
+        // five is, and account 1 takes every other spawn.
+        let long = spawn_spread(&cands, 80);
+        assert!(long.iter().all(|&n| n <= 1 + SPAWN_SPREAD_OTHERS));
+        for n in 1..=1 + SPAWN_SPREAD_OTHERS {
+            assert!(long.contains(&n), "account {n} never chosen");
+        }
+        assert_eq!(long.iter().filter(|&&n| n == 1).count(), 40);
+    }
+
+    #[test]
+    fn spawn_spread_alternates_over_the_candidates_that_exist() {
+        let two = ranked_under_pace(&[("b", 0.4, 0.1), ("a", 0.6, 0.1)]);
+        assert_eq!(spawn_spread(&two, 6), vec![1, 2, 1, 2, 1, 2]);
+        let three = ranked_under_pace(&[("a", 0.6, 0.1), ("b", 0.4, 0.1), ("c", 0.2, 0.1)]);
+        assert_eq!(spawn_spread(&three, 8), vec![1, 2, 1, 3, 1, 2, 1, 3]);
+    }
+
+    #[test]
+    fn spawn_spread_with_one_candidate_always_picks_it() {
+        let one = ranked_under_pace(&[("a", 0.5, 0.1)]);
+        assert_eq!(spawn_spread(&one, 4), vec![1, 1, 1, 1]);
+        // Even after spawns went to accounts that have since left the pool.
+        assert_eq!(
+            alternating_spawn_pick(&one, ["b", "a", "c"].into_iter()),
+            Some("a".into())
+        );
+    }
+
+    #[test]
+    fn spawn_spread_without_a_candidate_leaves_the_pick_to_the_fallback() {
+        // `None` is what makes `pick_spawn_account` return the published
+        // pick, the `HighestExpectedUsage` chain, instead.
+        assert_eq!(alternating_spawn_pick(&[], std::iter::empty()), None);
+        assert_eq!(alternating_spawn_pick(&[], ["a", "b"].into_iter()), None);
+    }
+
+    #[test]
+    fn spawn_spread_serves_the_least_recent_of_the_top_five_next() {
+        let cands = ranked_under_pace(&[
+            ("a", 0.9, 0.1),
+            ("b", 0.8, 0.1),
+            ("c", 0.7, 0.1),
+            ("d", 0.6, 0.1),
+            ("e", 0.5, 0.1),
+            ("f", 0.4, 0.1),
+        ]);
+        // b, c and e were each served after an account-1 spawn; d never was,
+        // so it is next.
+        assert_eq!(
+            alternating_spawn_pick(&cands, ["a", "b", "a", "c", "a", "e", "a"].into_iter()),
+            Some("d".into())
+        );
+        // Every one of the top five has been served, and f (ranked 6th) never
+        // has: the cut at five is what keeps f out, so b, served longest ago,
+        // is next. Without the cut, never-served f would win.
+        assert_eq!(
+            alternating_spawn_pick(
+                &cands,
+                ["a", "b", "a", "c", "a", "d", "a", "e", "a"].into_iter()
+            ),
+            Some("b".into())
+        );
+        assert_eq!(
+            alternating_pick(
+                &cands,
+                ["a", "b", "a", "c", "a", "d", "a", "e", "a"].into_iter()
+            ),
+            Some("f".into())
         );
     }
 

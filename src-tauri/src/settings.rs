@@ -117,8 +117,13 @@ pub enum AccountSelectionMode {
     /// Among accounts under their expected pace, ranked by expected usage
     /// (highest first), alternate handoffs between the first account and each
     /// of the others in turn (1,2,1,3,1,4,1,2,...), from the handoffs of the
-    /// last 3 hours. Spawn-time selection takes the first account. No-op when
-    /// fewer than two config dirs are configured, so safe as the default.
+    /// last 3 hours. Spawn-time selection alternates the same way over the
+    /// first account and the next four only (1,2,1,3,1,4,1,5,1,2,...), from
+    /// its own record of the spawns of the last 3 hours
+    /// (`ai_provider::account_usage::SPAWN_SPREAD_OTHERS`); with no account
+    /// under pace it picks as `HighestExpectedUsage` does. The process-wide
+    /// account (in-process AI calls) stays the first account. With a single
+    /// config dir every pick is that dir, so safe as the default.
     #[default]
     AlternatingHandoff,
 }

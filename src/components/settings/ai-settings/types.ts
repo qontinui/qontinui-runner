@@ -161,7 +161,7 @@ export const SELECTION_MODE_OPTIONS: {
   {
     mode: "alternating_handoff",
     label: "Alternating Handoff",
-    hint: "Handoffs alternate between the top under-pace account and each of the others",
+    hint: "New sessions alternate between the top under-pace account and the next 4; handoffs between it and each of the others",
   },
   {
     mode: "weighted_random",

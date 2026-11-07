@@ -247,11 +247,10 @@ impl LoopController {
         // =====================================================================
         // PICK BEST CLAUDE ACCOUNT for this workflow run
         // =====================================================================
-        // Pin the account with the most-available cooldown state (first
-        // non-cooled, else closest-to-expiry). Runs once per workflow so
-        // warm-provider prompt-cache locality is preserved across the
-        // workflow's many AI calls. No-op unless multi-account least-usage
-        // mode is enabled in settings.
+        // Pin the account the selection mode picks (`pick_best_account`).
+        // Runs once per workflow so warm-provider prompt-cache locality is
+        // preserved across the workflow's many AI calls. No-op in `Manual`
+        // mode or with no accounts configured.
         let _ = spawn_blocking_tracked(crate::ai_provider::pick_best_account).await;
 
         // =====================================================================

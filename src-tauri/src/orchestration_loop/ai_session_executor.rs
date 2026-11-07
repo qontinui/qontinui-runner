@@ -341,7 +341,7 @@ pub(crate) fn isolation_refusal(
 ///    [`DispatchError::Transient`], anything else is [`DispatchError::Failed`],
 ///    and worktree mode being off also marks the row `Failed` — see
 ///    [`isolation_refusal`].
-/// 2. **Re-pick** the lowest-utilization Claude account via `pick_best_account`
+/// 2. **Re-pick** the Claude account the selection mode picks, via `pick_best_account`
 ///    — PER DISPATCH, not once per run, so account exhaustion across a long run
 ///    is mitigated.
 /// 3. Spawn an interactive `ClaudeSession` (stream-json, NOT `--print`), pinned

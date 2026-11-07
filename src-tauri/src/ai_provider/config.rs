@@ -220,6 +220,41 @@ impl std::fmt::Display for ClaudeConfigDirSource {
 pub fn get_effective_config_dir(
     cli_settings: &settings::ClaudeCliSettings,
 ) -> (Option<String>, ClaudeConfigDirSource) {
+    effective_config_dir_from(cli_settings, get_resolved_config_dir)
+}
+
+/// [`get_effective_config_dir`] for a spawn that ran
+/// [`pick_spawn_account`](super::account_usage::pick_spawn_account) and holds
+/// its answer: `picked` stands in for the process-global resolved dir.
+///
+/// Under the default mode the spawn pick alternates across accounts and is
+/// returned, never published — the published dir stays the mode's single
+/// pick — so re-reading the global would discard it. And any published pick
+/// can be replaced by a concurrent caller's before this one reads it.
+/// Everything else is [`get_effective_config_dir`] unchanged: the model
+/// gateway wins first, `Manual` mode uses `config_dir`, the candidate must
+/// pass the credential check, and the arm is the same auto arm. With `picked`
+/// `None` (the picker chose nothing) the global is read exactly as before.
+///
+/// Not [`get_effective_config_dir_with_override`]: an override skips the
+/// credential check and reports [`ClaudeConfigDirSource::RequestOverride`],
+/// which would claim a per-request pin this spawn never had.
+pub fn get_effective_config_dir_for_pick(
+    cli_settings: &settings::ClaudeCliSettings,
+    picked: Option<&str>,
+) -> (Option<String>, ClaudeConfigDirSource) {
+    effective_config_dir_from(cli_settings, || {
+        picked.map(str::to_string).or_else(get_resolved_config_dir)
+    })
+}
+
+/// The one traversal behind [`get_effective_config_dir`] and
+/// [`get_effective_config_dir_for_pick`]: `resolved` supplies the auto
+/// picker's dir, and is only consulted in an auto mode.
+fn effective_config_dir_from(
+    cli_settings: &settings::ClaudeCliSettings,
+    resolved: impl FnOnce() -> Option<String>,
+) -> (Option<String>, ClaudeConfigDirSource) {
     if let Some(dir) = crate::model_gateway::session_config_dir_override() {
         return (Some(dir), ClaudeConfigDirSource::ModelGateway);
     }
@@ -234,15 +269,16 @@ pub fn get_effective_config_dir(
     // was given.
     let mode = crate::claude_accounts::resolve_for_cli_settings(cli_settings);
     let (candidate, source) = match mode {
-        // Every auto mode pins its choice via the same `RESOLVED_CONFIG_DIR`
-        // set by `pick_best_account` — the source names predate the other
-        // auto modes but still apply: they describe "the auto-picker resolved
-        // / fell back", not which ranking the picker used.
+        // Every auto mode's choice is the picker's: the spawn's own pick when
+        // it handed one in, else the `RESOLVED_CONFIG_DIR` `pick_best_account`
+        // published — the source names predate the other auto modes but still
+        // apply: they describe "the auto-picker resolved / fell back", not
+        // which ranking the picker used.
         AccountSelectionMode::LeastUsage
         | AccountSelectionMode::HighestExpectedUsage
         | AccountSelectionMode::WeightedRandom
         | AccountSelectionMode::AlternatingHandoff => {
-            match get_resolved_config_dir() {
+            match resolved() {
                 // The resolved dir (set by the credential-aware picker) wins.
                 Some(dir) => (Some(dir), ClaudeConfigDirSource::LeastUsageResolved),
                 // else fall back to the manual config_dir.
@@ -892,8 +928,9 @@ mod tests {
     /// `RESOLVED_CONFIG_DIR`. What IS serialized: every test holding
     /// `pin_account_selection_for_test` (directly or through
     /// `isolated_ambient_with_fleet_pin`) — this one,
-    /// `effective_config_dir_follows_the_fleet_mode_unless_pinned` (the one test
-    /// that publishes a dir there), the `config_report_cmd` tests that reach
+    /// `effective_config_dir_follows_the_fleet_mode_unless_pinned` and
+    /// `effective_config_dir_for_pick_uses_the_callers_pick_not_the_global` (the
+    /// tests that publish a dir there), the `config_report_cmd` tests that reach
     /// `get_effective_config_dir` through the report, and
     /// `retry::tests::test_retry_succeeds_on_second_attempt` (whose 429 reaches
     /// `rotate_account_on_rate_limit`. On Linux under the fixture/cargo-guard
@@ -1018,6 +1055,84 @@ mod tests {
         set_resolved_config_dir(Some(picked_dir));
         assert_eq!(
             get_effective_config_dir(&pinned_manual),
+            (Some(manual_dir), ClaudeConfigDirSource::Manual)
+        );
+    }
+
+    /// **The spawn's own pick beats the published one.** The default mode's
+    /// spawn pick is returned, not published, and a published pick can be
+    /// replaced by a concurrent caller's. With its own pick handed in, a spawn
+    /// lands on the account it picked — under the same auto arm and the same
+    /// credential check as the global read, never as a `RequestOverride`.
+    ///
+    /// Serialized and restored exactly like
+    /// `effective_config_dir_follows_the_fleet_mode_unless_pinned`.
+    #[test]
+    fn effective_config_dir_for_pick_uses_the_callers_pick_not_the_global() {
+        let _fleet = crate::mcp::fleet_policy_poller::pin_account_selection_for_test(Some(
+            AccountSelectionMode::AlternatingHandoff,
+        ));
+        let (_mine_guard, my_pick) = dir_with_live_credentials();
+        let (_peer_guard, peer_pick) = dir_with_live_credentials();
+        let (_manual_guard, manual_dir) = dir_with_live_credentials();
+        let _restore = ResolvedConfigDirRestore::capture();
+
+        let cli = settings::ClaudeCliSettings {
+            account_selection_mode: AccountSelectionMode::AlternatingHandoff,
+            config_dir: Some(manual_dir.clone()),
+            ..Default::default()
+        };
+
+        // A peer spawn's pick is what the global holds now.
+        set_resolved_config_dir(Some(peer_pick.clone()));
+        assert_eq!(
+            get_effective_config_dir_for_pick(&cli, Some(&my_pick)),
+            (
+                Some(my_pick.clone()),
+                ClaudeConfigDirSource::LeastUsageResolved
+            )
+        );
+        // The plain resolver still reads the global, unchanged.
+        assert_eq!(
+            get_effective_config_dir(&cli),
+            (
+                Some(peer_pick.clone()),
+                ClaudeConfigDirSource::LeastUsageResolved
+            )
+        );
+
+        // A pick with no live credentials is rejected, not passed through.
+        assert_eq!(
+            get_effective_config_dir_for_pick(
+                &cli,
+                Some("/qontinui-test/no-such-account-dir/for_pick_dead")
+            ),
+            (None, ClaudeConfigDirSource::RejectedNoCredentials)
+        );
+
+        // No pick: the global, exactly as `get_effective_config_dir` reads it,
+        // and with no global either, the auto arm's `config_dir` fallback.
+        assert_eq!(
+            get_effective_config_dir_for_pick(&cli, None),
+            (Some(peer_pick), ClaudeConfigDirSource::LeastUsageResolved)
+        );
+        set_resolved_config_dir(None);
+        assert_eq!(
+            get_effective_config_dir_for_pick(&cli, None),
+            (
+                Some(manual_dir.clone()),
+                ClaudeConfigDirSource::LeastUsageConfigDirFallback
+            )
+        );
+
+        // A pinned `Manual` machine ignores a pick, as it ignores the global.
+        let pinned_manual = settings::ClaudeCliSettings {
+            account_selection_mode: AccountSelectionMode::Manual,
+            account_selection_pinned: true,
+            ..cli
+        };
+        assert_eq!(
+            get_effective_config_dir_for_pick(&pinned_manual, Some(&my_pick)),
             (Some(manual_dir), ClaudeConfigDirSource::Manual)
         );
     }

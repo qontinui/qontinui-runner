@@ -475,9 +475,9 @@ pub async fn plan_intent_handler(
     );
     let full_prompt = format!("{}\n\nUser request: {}", system_prompt, request.prompt);
 
-    // Pin the Claude account with the most remaining quota for the duration
-    // of this prompt-home submission. No-op unless multi-account least-usage
-    // mode is enabled in settings.
+    // Pin the Claude account the selection mode picks for the duration of
+    // this prompt-home submission. No-op in `Manual` mode or with no accounts
+    // configured.
     let ai_response = spawn_blocking_tracked(move || {
         crate::ai_provider::pick_best_account();
         crate::ai_provider::routing::run_prompt_sync(&full_prompt, None)

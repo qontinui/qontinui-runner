@@ -42,10 +42,11 @@
 //! 2. **The account pin, resolved through the shipped seam** —
 //!    [`crate::agent_runtime::resolve_spawn_account`] →
 //!    [`crate::ai_provider::resolve_requested_account`]. **NOT**
-//!    `pick_best_account`, which is a side-effect-only rotation helper
-//!    (returns `()`, no-ops unless `account_selection_mode == LeastUsage`, and
-//!    every call site discards it). 🔒 An unresolvable pin **FAILS the
-//!    respawn**; it never degrades to rotation and never lands the session on
+//!    `pick_best_account` / `pick_spawn_account`, which are rotation helpers
+//!    (they pick by the selection mode, publish a pick process-globally, no-op
+//!    in `Manual` mode, and never honour a requested account). 🔒 An
+//!    unresolvable pin **FAILS the respawn**; it never degrades to rotation
+//!    and never lands the session on
 //!    a different account, because a pinned account silently ignored is
 //!    indistinguishable from one honoured
 //!    (`agent_runtime.rs` `LaunchPayload::account`, :54-57). Nor is the pin
