@@ -2606,6 +2606,31 @@ jobs:
         with:
           version: 10.33.2
 
-      - name: Run pnpm audit
-        run: pnpm audit --audit-level=moderate || true
+      # No pnpm cache: the gate below never installs, it only audits lockfiles.
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: "20"
+
+      # pnpm audit gate — base-vs-head, NOT a plain blocking audit. A plain
+      # audit judges the tree against today's advisory DB, so a newly
+      # published advisory reds every open PR with no change in its tree (what
+      # PR #2501 hit for Cargo.lock). The gate fails only on --prod advisories
+      # (moderate+, or an unrecognised severity) present at HEAD and absent at
+      # BASE; an unchanged package.json + pnpm-lock.yaml exits 0 with no
+      # network call; an audit that cannot run is UNKNOWN and fails; and a
+      # change to package.json pnpm.auditConfig fails (.npmrc key changes only
+      # warn: the audit never reads .npmrc). BASE (PR merge-base / trunk push
+      # `before` / merge-base with main for merge-candidate refs, where an
+      # unresolvable BASE is UNKNOWN, never HEAD^) is resolved inside the
+      # script, fetching as needed. Logic and rationale: scripts/ci-pnpm-audit-diff.mjs. Plan
+      # 2026-11-02-only-cargo-lock-is-gated-by-a-dependency-audit.
+      - name: pnpm audit (fail on advisories this change introduces)
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          node --test scripts/__tests__/ci-pnpm-audit-diff.test.mjs
+          node scripts/ci-pnpm-audit-diff.mjs
 
