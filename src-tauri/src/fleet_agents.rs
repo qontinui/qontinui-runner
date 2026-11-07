@@ -226,24 +226,28 @@ pub(crate) fn retired_agent_names(retired: &[&str]) -> Vec<String> {
 /// whose copy on disk is a blob it shipped as, and record each removal on
 /// `report`.
 ///
-/// Nothing outside the workdir is ever removed: when `.claude` or
-/// `.claude/agents` resolves (through a symlink) to a directory that is not
-/// under `workdir`, every retired copy there is kept and recorded as
-/// [`RetainedReason::OutsideWorkdir`]. The workspace root's `.claude` is such a
-/// link into qontinui-claude-config, whose copies are that repository's own.
+/// Only the workdir's own files are ever removed: when `.claude` or
+/// `.claude/agents` is reached through a symlink (the directory does not
+/// canonicalize to `<canonical workdir>/.claude/agents`), a shipped copy there
+/// is kept and recorded as [`RetainedReason::LinkedElsewhere`]. The workspace
+/// root's `.claude` is such a link into qontinui-claude-config, whose copies
+/// are that repository's own.
 ///
 /// What stays, by arm:
 /// - **absent**: nothing to do;
 /// - **kept by `keep`**: a copy the enclosing repository tracks, or one that
 ///   existed when the tracked-file probe could not answer inside a repository,
 ///   stays exactly as both provisioning layers keep it (`keep` was decided
-///   before either layer wrote);
+///   before either layer wrote), and is recorded as
+///   [`RetainedReason::KeptByRepository`];
 /// - **any other blob**: somebody edited it, so it is kept, logged and
 ///   recorded as [`RetainedReason::LocallyModified`]. That is the
 ///   own-files-only rule `install-agents.sh --uninstall` applies;
 /// - **unreadable or unremovable**: kept, and recorded as
 ///   [`RetainedReason::ReadFailed`] / [`RetainedReason::RemoveFailed`], so the
-///   pass reads degraded and names a retired definition that still resolves.
+///   pass reads degraded and names a retired definition that still resolves. A
+///   copy that vanishes between the read and the removal (a concurrent pass
+///   into the same workdir) is already gone and is not recorded.
 ///
 /// A blob is matched on the bytes as they are and on the same bytes with CRLF
 /// folded to LF. A checkout with `core.autocrlf=true` holds a CRLF copy of a
@@ -259,8 +263,10 @@ pub(crate) fn remove_retired_agents(
     report: &mut ProvisionReport,
 ) {
     let dst_dir = workdir.join(".claude").join("agents");
-    let outside = match (dst_dir.canonicalize(), workdir.canonicalize()) {
-        (Ok(dst), Ok(root)) => (!dst.starts_with(&root)).then(|| dst.display().to_string()),
+    let linked = match (dst_dir.canonicalize(), workdir.canonicalize()) {
+        (Ok(dst), Ok(root)) => {
+            (dst != root.join(".claude").join("agents")).then(|| dst.display().to_string())
+        }
         // No agents directory: nothing retired can be on disk.
         _ => return,
     };
@@ -268,11 +274,17 @@ pub(crate) fn remove_retired_agents(
         let (name, shipped) = parse_retired_line(line);
         let path = dst_dir.join(name);
         if let Some(reason) = keep.reason(name) {
-            tracing::info!(
-                "fleet_agents: keeping retired {} as it is on disk — {}",
-                path.display(),
-                reason.describe()
-            );
+            if std::fs::symlink_metadata(&path).is_ok() {
+                tracing::info!(
+                    "fleet_agents: keeping retired {} as it is on disk — {}",
+                    path.display(),
+                    reason.describe()
+                );
+                report.record_retained_retired(
+                    name,
+                    RetainedReason::KeptByRepository(reason.wire().to_string()),
+                );
+            }
             continue;
         }
         let bytes = match std::fs::read(&path) {
@@ -287,15 +299,6 @@ pub(crate) fn remove_retired_agents(
                 continue;
             }
         };
-        if let Some(resolved) = &outside {
-            tracing::warn!(
-                "fleet_agents: keeping retired {} — the agents directory resolves to {resolved}, \
-                 outside the workdir",
-                path.display()
-            );
-            report.record_retained_retired(name, RetainedReason::OutsideWorkdir(resolved.clone()));
-            continue;
-        }
         let blob = match shipped_blob(&bytes, &shipped) {
             Ok(blob) => blob,
             Err(own) => {
@@ -308,6 +311,15 @@ pub(crate) fn remove_retired_agents(
                 continue;
             }
         };
+        if let Some(resolved) = &linked {
+            tracing::warn!(
+                "fleet_agents: keeping retired {} — .claude/agents is reached through a \
+                 symlink, to {resolved}",
+                path.display()
+            );
+            report.record_retained_retired(name, RetainedReason::LinkedElsewhere(resolved.clone()));
+            continue;
+        }
         match std::fs::remove_file(&path) {
             Ok(()) => {
                 tracing::info!(
@@ -315,6 +327,12 @@ pub(crate) fn remove_retired_agents(
                     path.display()
                 );
                 report.record_removed(name, blob);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                tracing::info!(
+                    "fleet_agents: retired {} was already removed by a concurrent pass",
+                    path.display()
+                );
             }
             Err(e) => {
                 tracing::warn!(
@@ -494,7 +512,7 @@ mod tests {
 
     /// The `test-generator.md` line is pinned byte for byte, because a blob
     /// dropped from it would leave that version's copies on disk forever. The
-    /// qontinui-claude-config PR that deletes the source gives
+    /// qontinui-claude-config PR that deletes the source will give
     /// `scripts/install-agents.sh` the same line.
     #[test]
     fn the_retired_table_carries_every_blob_test_generator_shipped_as() {
