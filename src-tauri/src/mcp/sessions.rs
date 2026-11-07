@@ -352,7 +352,9 @@ async fn spawn_session(
 
     let mut session_ctx = AiSessionContext::setup(&task_run_id, &req.task_name);
     if let Some(ref resolved) = resolved_account {
-        session_ctx.pinned_config_dir = Some(resolved.config_dir.clone());
+        session_ctx.account = Some(crate::ai_provider::AccountChoice::Pinned(
+            resolved.config_dir.clone(),
+        ));
     }
 
     let dispatched = slash_command.is_some();

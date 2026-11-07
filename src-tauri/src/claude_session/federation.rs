@@ -30,7 +30,6 @@ use anyhow::Result;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::settings::ClaudeCliSettings;
 use qontinui_runner_lib::observable_bridge::{ReconcileReport, SessionContext};
 
 /// Why federation was skipped for a session. Returned by
@@ -108,16 +107,27 @@ pub fn session_uuid(session_id: &str) -> Uuid {
 ///   tenant-scoped, so a session spawned for tenant B must federate B's
 ///   pool even when the machine default is A.
 /// - `device_id` → `~/.qontinui/machine.json::device_id`.
-/// - `account_name` → derived from `effective_config_dir` (trailing
-///   `.claude-<name>` component). Falls back to `"default"` for a
-///   single-account install where `config_dir` is `~/.claude`.
+/// - `account_name` → derived from the dir the spawn's child RUNS UNDER
+///   (trailing `.claude-<name>` component): `config_dir` as the spawn resolved
+///   it, or — when the spawn set no `CLAUDE_CONFIG_DIR` (`None`, an ambient
+///   child) — the ambient default the child inherits
+///   ([`ambient_claude_config_dir`](crate::terminal::transcript::ambient_claude_config_dir):
+///   the runner's own `$CLAUDE_CONFIG_DIR`, else `~/.claude`), see
+///   [`child_config_dir`](crate::terminal::transcript::child_config_dir). A
+///   dir with no `.claude-<name>` suffix (e.g.
+///   `~/.claude`) names `"default"`. Taken from the caller rather than re-read
+///   from the shared resolved dir, which a concurrent sibling's pick may have
+///   rewritten — so federation can never name a different account than the
+///   child, even under an explicit pin. Federation is skipped
+///   ([`FederationSkipReason::NoConfigDir`]) only when neither resolves (no
+///   home dir).
 ///
 /// The home-dir identity PIN (`federation.rs` device identity) is
 /// deliberately untouched (plan §6).
 pub fn build_federation_ctx(
     session_id: &str,
     working_dir: &str,
-    cli_settings: &ClaudeCliSettings,
+    config_dir: Option<&str>,
     session_tenant: crate::session::NewSessionTenant,
 ) -> Result<SessionContext, FederationSkipReason> {
     let session_tenant = match session_tenant {
@@ -158,14 +168,12 @@ pub fn build_federation_ctx(
         }
     };
 
-    let (effective_config_dir, _config_dir_source) =
-        crate::ai_provider::get_effective_config_dir(cli_settings);
-    let config_dir_str = match effective_config_dir {
+    let config_dir_str = match crate::terminal::transcript::child_config_dir(config_dir) {
         Some(s) => s,
         None => {
             warn!(
-                "claude_session::federation: no effective claude config_dir; \
-                 skipping federation for session {session_id}"
+                "claude_session::federation: no claude config_dir (none resolved for the \
+                 spawn and no ambient default); skipping federation for session {session_id}"
             );
             return Err(FederationSkipReason::NoConfigDir);
         }

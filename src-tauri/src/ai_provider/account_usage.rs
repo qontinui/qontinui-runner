@@ -137,11 +137,23 @@ static HANDOFFS: Mutex<VecDeque<(Instant, String)>> = Mutex::new(VecDeque::new()
 /// `WeightedRandom`, the default); falls back to first-non-cooled
 /// (cold start), then to the soonest-to-expire cooldown when every account is
 /// rate-limited. Full key: the module doc.
-pub fn pick_best_account() {
+///
+/// Returns the dir it chose — THIS caller's pick, which a spawn carries as
+/// [`AccountChoice::Picked`](super::config::AccountChoice::Picked) into
+/// [`get_effective_config_dir_for`](super::config::get_effective_config_dir_for)
+/// instead of reading `RESOLVED_CONFIG_DIR` back. The global is still written
+/// for the display and status readers that want "the latest pick", but under
+/// `WeightedRandom` a concurrent sibling's pick can overwrite it between this
+/// pick and any later read, so a spawn must never take its account from there.
+///
+/// Returns `None`, publishing nothing, when a model gateway is declared, the
+/// effective mode is `Manual`, no dirs are configured, or no account is
+/// credential-valid.
+pub fn pick_best_account() -> Option<String> {
     // Subscription accounts are off while a model gateway is declared: there
     // is nothing to pick between (`crate::model_gateway`).
     if crate::model_gateway::gateway_declared() {
-        return;
+        return None;
     }
     // The EFFECTIVE mode — the local roster/settings mode resolved against the
     // fleet's `account_selection_mode` policy and this machine's pin — never
@@ -150,12 +162,12 @@ pub fn pick_best_account() {
     // cannot rotate under one mode while the spawn honours another.
     let mode = crate::claude_accounts::effective_selection_mode();
     if mode == AccountSelectionMode::Manual {
-        return;
+        return None;
     }
 
     let config_dirs = settings::get_claude_config_dirs();
     if config_dirs.is_empty() {
-        return;
+        return None;
     }
 
     let chosen = match mode {
@@ -198,13 +210,25 @@ pub fn pick_best_account() {
         AccountSelectionMode::Manual => unreachable!("returned above"),
     };
 
-    if let Some(dir) = chosen {
-        let current = super::config::get_resolved_config_dir();
-        if current.as_deref() != Some(dir.as_str()) {
-            info!("pick_best_account: selecting '{}'", short_label(&dir));
-            super::config::set_resolved_config_dir(Some(dir));
-        }
-    }
+    publish_pick(chosen)
+}
+
+/// Publish one pick to `RESOLVED_CONFIG_DIR` and hand the SAME value back to
+/// the caller — the seam that makes "the returned value is the published
+/// value" true by construction rather than by a second read of the global.
+///
+/// Logs every pick, naming the dir it returns. It used to log only when the
+/// pick differed from the global, so under `WeightedRandom` a repeated draw
+/// was silent and a spread count taken from the log undercounted.
+fn publish_pick(chosen: Option<String>) -> Option<String> {
+    let dir = chosen?;
+    info!(
+        config_dir = %dir,
+        "pick_best_account: selecting '{}'",
+        short_label(&dir)
+    );
+    super::config::set_resolved_config_dir(Some(dir.clone()));
+    Some(dir)
 }
 
 /// Pure selection core, parameterised over the cooldown/usage/expiry lookups
@@ -773,6 +797,30 @@ mod tests {
                 cands.iter().position(|(d, _, _)| *d == pick).unwrap() + 1
             })
             .collect()
+    }
+
+    /// What `pick_best_account` returns IS what it published: a spawn carrying
+    /// the returned value as `AccountChoice::Picked` holds exactly the account
+    /// the display readers see as "the latest pick" at that instant. A pick of
+    /// nothing returns nothing and leaves the global untouched.
+    #[test]
+    fn the_returned_pick_is_the_published_pick() {
+        let _fleet = crate::mcp::fleet_policy_poller::pin_account_selection_for_test(None);
+        let _restore = super::super::config::ResolvedConfigDirRestore::capture();
+        let earlier = "/qontinui-test/publish-pick/earlier".to_string();
+        let drawn = "/qontinui-test/publish-pick/drawn".to_string();
+        super::super::config::set_resolved_config_dir(Some(earlier));
+
+        let returned = publish_pick(Some(drawn.clone()));
+        assert_eq!(returned, Some(drawn));
+        assert_eq!(returned, super::super::config::get_resolved_config_dir());
+
+        assert_eq!(publish_pick(None), None);
+        assert_eq!(
+            super::super::config::get_resolved_config_dir(),
+            returned,
+            "a pick of nothing publishes nothing"
+        );
     }
 
     #[test]

@@ -874,7 +874,7 @@ fn seam_reports(fp: &EnvFingerprinter, config_dir: Option<&str>) -> Vec<SeamEnvR
             // program is chosen per-platform by
             // `launch_spec::render_program_and_argv`; do not read this literal as
             // the report asserting what gets spawned.
-            &crate::claude_session::runner::build_inline_child_command("cmd.exe", &[], "."),
+            &crate::claude_session::runner::build_inline_child_command("cmd.exe", &[], ".", None),
         ),
         std_seam(
             fp,
@@ -2415,6 +2415,14 @@ mod tests {
             ),
             (
                 (
+                    Some("C:/claude/acct-e".to_string()),
+                    ClaudeConfigDirSource::PickedForThisSpawn,
+                ),
+                "C:/claude/acct-e",
+                "picked_for_this_spawn",
+            ),
+            (
+                (
                     Some("C:/q/model-gateway/claude-config".to_string()),
                     ClaudeConfigDirSource::ModelGateway,
                 ),
@@ -2496,7 +2504,11 @@ mod tests {
         }
 
         // Layer 11 — always KNOWN from the runner app: "no account" is a
-        // reading, not an unreadable layer.
+        // reading, not an unreadable layer. `picked_for_this_spawn` is
+        // deliberately NOT allowed: the report resolves through
+        // `get_effective_config_dir`, which carries no spawn's `AccountChoice`,
+        // so that arm here would mean the report claimed a per-spawn pick it
+        // never had.
         match &report
             .row("claude_config_dir")
             .expect("row present")

@@ -42,9 +42,9 @@
 //! 2. **The account pin, resolved through the shipped seam** —
 //!    [`crate::agent_runtime::resolve_spawn_account`] →
 //!    [`crate::ai_provider::resolve_requested_account`]. **NOT**
-//!    `pick_best_account`, which is a side-effect-only rotation helper
-//!    (returns `()`, no-ops unless `account_selection_mode == LeastUsage`, and
-//!    every call site discards it). 🔒 An unresolvable pin **FAILS the
+//!    `pick_best_account`, which is the runner's own rotation (what it
+//!    returns is a pick, never a pin, and it publishes nothing in `Manual`
+//!    mode). 🔒 An unresolvable pin **FAILS the
 //!    respawn**; it never degrades to rotation and never lands the session on
 //!    a different account, because a pinned account silently ignored is
 //!    indistinguishable from one honoured
@@ -374,9 +374,21 @@ async fn materialize_logged(
 ///   another account with a warning.
 /// - no pin (`null`, or blank — which names no account at all, so the shipped
 ///   seam reads it as absence rather than a wrong name) → this runner's own
-///   resolved default, i.e. today's rotation, untouched. When even that is
-///   absent we still refuse rather than guess a directory.
+///   rotation: a FRESH pick for this respawn, resolved through the one
+///   per-spawn resolver as `AccountChoice::Picked` (so it is credential-checked
+///   too). It used to read the raw shared `RESOLVED_CONFIG_DIR` — no draw, no
+///   credential check, and whichever sibling picked last. When nothing
+///   resolves we still refuse rather than guess a directory.
 fn resolve_target_config_dir(account: Option<&str>) -> Result<String, RespawnError> {
+    resolve_target_config_dir_with(account, crate::ai_provider::pick_best_account)
+}
+
+/// [`resolve_target_config_dir`] with the no-pin arm's pick injected, so a test
+/// can race a sibling's draw against it. `pick` is not called for a pin.
+fn resolve_target_config_dir_with(
+    account: Option<&str>,
+    pick: impl FnOnce() -> Option<String>,
+) -> Result<String, RespawnError> {
     let pinned = crate::agent_runtime::resolve_spawn_account(account)
         .map_err(|e| RespawnError::AccountPin(format!("{e:#}")))?;
     match pinned {
@@ -397,7 +409,13 @@ fn resolve_target_config_dir(account: Option<&str>) -> Result<String, RespawnErr
             );
             Ok(acct.config_dir)
         }
-        None => crate::ai_provider::get_resolved_config_dir().ok_or(RespawnError::NoAccount),
+        None => crate::ai_provider::resolve_spawn_account_choice(
+            &crate::settings::get_ai_settings().claude_cli,
+            None,
+            pick,
+        )
+        .dir
+        .ok_or(RespawnError::NoAccount),
     }
 }
 
@@ -1280,6 +1298,33 @@ mod tests {
             .unwrap();
             assert!(resolved.is_none(), "pin {pin:?} must read as absence");
         }
+    }
+
+    /// **A respawn with no pin draws, and holds its draw.** It used to return
+    /// the raw shared `RESOLVED_CONFIG_DIR` — whichever sibling picked last,
+    /// with no credential check. Now it takes a fresh pick of its own and
+    /// resolves it through the one resolver, so a sibling's draw landing in
+    /// the global between the pick and the resolution does not move it.
+    #[test]
+    fn an_unpinned_respawn_takes_its_own_pick_not_the_global() {
+        let _amb = crate::test_env::isolated_ambient();
+        let _fleet = crate::mcp::fleet_policy_poller::pin_account_selection_for_test(Some(
+            crate::settings::AccountSelectionMode::WeightedRandom,
+        ));
+        let (_mine_guard, mine) =
+            crate::ai_provider::config::test_support::dir_with_live_credentials();
+        let (_sibling_guard, sibling) =
+            crate::ai_provider::config::test_support::dir_with_live_credentials();
+        let _restore = crate::ai_provider::config::ResolvedConfigDirRestore::capture();
+
+        let drawn = mine.clone();
+        let dir = super::resolve_target_config_dir_with(None, move || {
+            crate::ai_provider::set_resolved_config_dir(Some(drawn.clone()));
+            crate::ai_provider::set_resolved_config_dir(Some(sibling));
+            Some(drawn)
+        })
+        .unwrap();
+        assert_eq!(dir, mine);
     }
 
     // -----------------------------------------------------------------------
