@@ -1681,40 +1681,52 @@ fn spent_account_dir(include_inherited: bool) -> Option<String> {
         })
 }
 
-/// Which runner may report a lone account as its own.
+/// Which runner may report a roster as its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LoneAccountScope {
     /// The box's canonical runner: every step of [`spent_account_dir`],
     /// inherited ones included.
     Primary,
-    /// A nameless runner under an instance root: only the pin in its own
+    /// A runner under an instance root, named or not: only the pin in its own
     /// roster, which sits under that root.
     Subject,
 }
 
-/// Who this runner is for a lone account, or `None` when the account is not
-/// its own to report.
+/// Who owns the roster this runner resolved, or `None` when it is not this
+/// runner's to report. Ownership is keyed on WHERE the roster resolved
+/// (`claude_accounts::claude_accounts_file_path` -> `platform_dir`), never on
+/// the runner's name:
 ///
 /// - **Primary** is `crate::instance::owns_shared_root_state`, which fails
 ///   closed: a runner showing any secondary signal (a name, a root,
 ///   `QONTINUI_PRIMARY_PORT`, a non-default API port) is not the primary.
 ///   `is_secondary` would miss the last two and report the primary's inherited
-///   account a second time.
-/// - **Subject** is a runner with an instance root and NO name. A named runner
-///   under a root is a child a subject spawned: it inherits the root and
-///   resolves the same roster, so its report would duplicate the subject's.
-/// - Everything else (a named or temp secondary, a nameless secondary found by
-///   its ports) resolves the primary's machine-global roster and, unless
-///   redirected, the primary's `settings.json`, so its pin and its inherited
-///   environment are both the primary's account.
+///   account a second time. The primary resolves the machine-global roster.
+/// - **Subject** is any runner with an instance root, named or not: the roster
+///   resolves under `<root>/data/config`, so it is that runner's own. A
+///   supervisor-named runner has its own root and so reports its own pinned
+///   account. (A named child that inherits its parent's root cannot be told
+///   apart by env and reports the same roster; coord keys rows by label.)
+/// - Everything else (a named or temp secondary with no root, a nameless
+///   secondary found by its ports) resolves the primary's machine-global
+///   roster and, unless redirected, the primary's `settings.json`: its pin, its
+///   inherited environment and any 2+ account roster are the primary's, which
+///   the primary already reports.
 ///
-/// A secondary's two-or-more-account roster is a different path and still
-/// reports, as it did before this.
+/// The decision applies to the 2+-account roster as well as the lone account.
+/// A non-owner still probes for its own picker; it just sends nothing to coord.
 fn lone_account_scope() -> Option<LoneAccountScope> {
-    use qontinui_runner_lib::instance_env::{instance_name, instance_root};
-    if crate::instance::owns_shared_root_state() {
+    account_scope_from(
+        crate::instance::owns_shared_root_state(),
+        qontinui_runner_lib::instance_env::instance_root().is_some(),
+    )
+}
+
+/// Env-free core of [`lone_account_scope`].
+fn account_scope_from(is_primary: bool, has_instance_root: bool) -> Option<LoneAccountScope> {
+    if is_primary {
         Some(LoneAccountScope::Primary)
-    } else if instance_name().is_none() && instance_root().is_some() {
+    } else if has_instance_root {
         Some(LoneAccountScope::Subject)
     } else {
         None
@@ -1763,8 +1775,11 @@ async fn refresh_usage(caller: UsageRefreshCaller) -> Vec<AccountUsageInfo> {
     // Nothing measured, nothing to say. An empty `prepaid` makes coord write
     // nothing for that half, so the accounts-only caller can never blank a
     // balance the timer reported.
-    if let Some(base) = report_base.filter(|_| !results.is_empty() || !prepaid.is_empty()) {
-        usage_twin_report::report_to_coord(&base, &results, &active_dirs, &prepaid).await;
+    // Account rows go to coord only from the runner that owns the roster; a
+    // secondary on the primary's machine-global roster would repeat them.
+    let reported: &[AccountUsageInfo] = if scope.is_some() { &results } else { &[] };
+    if let Some(base) = report_base.filter(|_| !reported.is_empty() || !prepaid.is_empty()) {
+        usage_twin_report::report_to_coord(&base, reported, &active_dirs, &prepaid).await;
     }
     results
 }
@@ -3304,11 +3319,11 @@ mod usage_report_scope_tests {
         assert_eq!(row["is_active"], serde_json::json!(true), "{row}");
     }
 
-    /// A named or temp secondary reports no lone account, even a pinned one:
-    /// its roster is the primary's machine-global one, so its row would be the
-    /// primary's written twice. A subject reports the pin in the roster under
-    /// its own instance root, and never its inherited `CLAUDE_CONFIG_DIR`,
-    /// which is the harness's account.
+    /// A named or temp secondary with no root reports no lone account, even a
+    /// pinned one: its roster is the primary's machine-global one, so its row
+    /// would be the primary's written twice. A runner with an instance root
+    /// reports the pin in the roster under that root, and never its inherited
+    /// `CLAUDE_CONFIG_DIR`, which is the harness's account.
     #[cfg(unix)]
     #[tokio::test]
     async fn only_a_subject_secondary_reports_its_own_pinned_lone_account() {
@@ -3342,20 +3357,64 @@ mod usage_report_scope_tests {
         let own = logged_in_dir(&amb, ".claude-own", None).await;
         write_roster(&amb, Vec::new(), AccountSelectionMode::Manual, Some(own));
 
-        // A named child of the subject inherits its root, so it resolves the
-        // same pinned roster; its report would be the subject's twice.
-        std::env::set_var("QONTINUI_INSTANCE_NAME", "subject-child");
-        let child = refresh_fleet_usage_report().await;
-        std::env::remove_var("QONTINUI_INSTANCE_NAME");
-        assert!(
-            child.is_empty(),
-            "a named child under the root reported: {child:?}"
-        );
-        assert!(coord.reported_labels().is_empty());
-
         refresh_fleet_usage_report().await;
         std::env::remove_var("QONTINUI_INSTANCE_ROOT");
         assert_eq!(coord.reported_labels(), vec![".claude-own".to_string()]);
+    }
+
+    /// Ownership follows where the roster resolved, not the runner's name: a
+    /// supervisor-named runner has its own instance root, so its own pinned
+    /// lone account reaches coord (it used to be dropped for having a name).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_named_runner_under_its_own_root_reports_its_pinned_account() {
+        let amb = crate::test_env::isolated_ambient();
+        let _env = extra_env();
+        let coord = FakeCoord::start().await;
+        coord.connect();
+        std::env::set_var("QONTINUI_INSTANCE_ROOT", amb.root());
+        std::env::set_var("QONTINUI_INSTANCE_NAME", "supervisor-named");
+        let own = logged_in_dir(&amb, ".claude-own", None).await;
+        write_roster(&amb, Vec::new(), AccountSelectionMode::Manual, Some(own));
+
+        refresh_fleet_usage_report().await;
+        std::env::remove_var("QONTINUI_INSTANCE_NAME");
+        std::env::remove_var("QONTINUI_INSTANCE_ROOT");
+
+        assert_eq!(coord.reported_labels(), vec![".claude-own".to_string()]);
+    }
+
+    /// A named secondary with no root and two or more accounts resolves the
+    /// primary's machine-global roster. It still probes (its picker needs the
+    /// numbers) but sends nothing, or coord would get the primary's rows twice.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_named_secondary_without_a_root_does_not_re_report_the_shared_roster() {
+        let amb = crate::test_env::isolated_ambient();
+        let _env = extra_env();
+        let coord = FakeCoord::start().await;
+        coord.connect();
+        let a = logged_in_dir(&amb, ".claude-a", None).await;
+        let b = logged_in_dir(&amb, ".claude-b", None).await;
+        write_roster(&amb, vec![a, b], AccountSelectionMode::Manual, None);
+
+        std::env::set_var("QONTINUI_INSTANCE_NAME", "temp-runner");
+        let secondary = refresh_fleet_usage_report().await;
+        std::env::remove_var("QONTINUI_INSTANCE_NAME");
+        assert_eq!(secondary.len(), 2, "the secondary still probes its picker");
+        assert!(coord.reported_labels().is_empty(), "{:?}", coord.bodies());
+
+        refresh_fleet_usage_report().await;
+        assert_eq!(coord.reported_labels().len(), 2, "the primary reports both");
+    }
+
+    /// The ownership table, with no env or filesystem.
+    #[test]
+    fn roster_ownership_is_primary_or_under_a_root() {
+        use super::super::{account_scope_from, LoneAccountScope::*};
+        assert_eq!(account_scope_from(true, false), Some(Primary));
+        assert_eq!(account_scope_from(false, true), Some(Subject));
+        assert_eq!(account_scope_from(false, false), None);
     }
 
     /// A nameless secondary that only its ports give away (a primary to proxy
