@@ -69,6 +69,7 @@ import type {
 import type { TerminalWorkMode } from "./terminalWorkMode";
 import { parseWorkModeRequest, resolveWorkModeRequest } from "./terminalWorkModeControl";
 import { FLOW_GRID_ID } from "./useZoneLayout";
+import { computeAutoTrimLayoutId, type LayoutOrigin } from "./zoneAutoTrim";
 
 /** Every terminal tab's UI Bridge element (`TerminalBridgeProxies`). */
 export const TERMINAL_INPUT_GLOB = "terminal-input-*";
@@ -340,7 +341,8 @@ export interface ZoneViewFacts {
    * How many zone headers the TILED grid renders — occupied zones whose cell
    * is not a compact card (`ZoneGrid`: `!showCompactCard && showLabels`).
    * `null` when that cannot be known: flow-grid virtualization decides which
-   * cells mount from the viewport.
+   * cells mount from the viewport, and an auto-trim that leaving the
+   * maximized view may release swaps the layout first ({@link zoneViewFactsFrom}).
    */
   labelledZonesWhenTiled: number | null;
 }
@@ -381,6 +383,45 @@ export function countLabelledZones(input: ZoneLabelInputs): number | null {
     if (!compact) count += 1;
   }
   return count;
+}
+
+/** What {@link zoneViewFactsFrom} needs from the page. */
+export interface ZoneViewFactInputs extends ZoneLabelInputs {
+  maximizedZone: number | null;
+  /** `useZoneLayout().layoutOrigin`: who chose the current layout. */
+  layoutOrigin: LayoutOrigin | undefined;
+  workMode: TerminalWorkMode;
+}
+
+/**
+ * The zone-view facts the maximize/restore signatures predict from.
+ *
+ * A maximized zone HOLDS an owed auto-trim (`autoTrimHold` → `maximized`,
+ * `zoneAutoTrim.ts`), and the trim effect in `useZoneLayout` re-runs on
+ * `maximizedZone`. So leaving the maximized view can release a trim that
+ * swaps the layout the tiled grid comes back in: a runner-grown `quad`
+ * whose tabs closed down to one trims to `single`, which renders no header.
+ * Whether a trim is actually owed is a latch inside `useZoneLayout` (a tab
+ * count decrease seen while held) that the page cannot observe. So whenever
+ * the trim WOULD apply to the current state (`computeAutoTrimLayoutId` is
+ * non-null), the tiled header count read off the current layout no longer
+ * describes the grid that renders, and it is reported unknown (`null`)
+ * rather than guessed. That covers a trim to a multi-zone layout too: it
+ * re-deals the zones, so the current count is not the one that renders.
+ */
+export function zoneViewFactsFrom(input: ZoneViewFactInputs): ZoneViewFacts {
+  const trimTarget = computeAutoTrimLayoutId(
+    input.layoutId,
+    input.layoutOrigin,
+    input.tabs.length,
+    input.zoneCount,
+    input.workMode,
+  );
+  return {
+    maximizedZone: input.maximizedZone,
+    zoneCount: input.zoneCount,
+    labelledZonesWhenTiled: trimTarget === null ? countLabelledZones(input) : null,
+  };
 }
 
 /**

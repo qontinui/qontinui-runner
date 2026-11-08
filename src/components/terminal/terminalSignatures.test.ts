@@ -21,8 +21,11 @@ import {
   predictWorkMode,
   predictZoneView,
   PTY_SPAWN_SETTLE_MS,
+  zoneViewFactsFrom,
   type ZoneLabelInputs,
+  type ZoneViewFactInputs,
 } from "./terminalPageSignatures";
+import { computeAutoTrimLayoutId } from "./zoneAutoTrim";
 import {
   loadProfileSignature,
   predictLoadProfile,
@@ -193,6 +196,54 @@ describe("zone view (maximize / restore / toggle)", () => {
       elementsDisappear: [{ id: "terminal-zone-header-*" }],
     });
     expect(predictZoneView("maximize", p({ zoneIndex: 9 }), GRID, tiled)).toEqual({});
+  });
+});
+
+describe("restore after closes: a released auto-trim decides which grid comes back", () => {
+  // A page auto-grown to `quad` with tabs a-d; zone 1 (b) maximized; a, c and
+  // d closed while maximized. The maximized view held the owed trim, and
+  // restoring releases it: `quad` trims to `single`, which renders no header.
+  const afterCloses: ZoneViewFactInputs = {
+    maximizedZone: 1,
+    layoutOrigin: "auto",
+    workMode: "grid",
+    layoutId: "quad",
+    zoneCount: 4,
+    assignments: { 1: "b" },
+    tabs: [{ id: "b" }],
+    focusedZone: 1,
+    pinnedZones: new Set<number>(),
+    compactView: false,
+  };
+
+  it("the scenario is real: the trim this restore releases lands on single", () => {
+    expect(computeAutoTrimLayoutId("quad", "auto", 1, 4, "grid")).toBe("single");
+  });
+
+  it("restore-zone and toggle-maximize-zone predict no headers the trim will remove", () => {
+    const facts = zoneViewFactsFrom(afterCloses);
+    expect(facts.labelledZonesWhenTiled).toBeNull();
+    expect(predictZoneView("restore", p({}), snap(), facts)).toEqual({});
+    expect(predictZoneView("toggle", p({ zoneIndex: 1 }), snap(), facts)).toEqual({});
+  });
+
+  it("with no trim to release, restoring still predicts the tiled headers", () => {
+    // The operator chose this quad: auto-trim never touches it.
+    const operatorQuad = zoneViewFactsFrom({ ...afterCloses, layoutOrigin: "operator" });
+    expect(operatorQuad.labelledZonesWhenTiled).toBe(1);
+    expect(predictZoneView("restore", p({}), snap(), operatorQuad)).toEqual({
+      elementsAppear: [{ id: "terminal-zone-header-*" }],
+    });
+    // A runner-grown quad that still holds all four tabs: nothing to trim.
+    const fullQuad = zoneViewFactsFrom({
+      ...afterCloses,
+      assignments: { 0: "a", 1: "b", 2: "c", 3: "d" },
+      tabs: [{ id: "a" }, { id: "b" }, { id: "c" }, { id: "d" }],
+    });
+    expect(fullQuad.labelledZonesWhenTiled).toBe(4);
+    expect(predictZoneView("restore", p({}), snap(), fullQuad)).toEqual({
+      elementsAppear: [{ id: "terminal-zone-header-*" }],
+    });
   });
 });
 
