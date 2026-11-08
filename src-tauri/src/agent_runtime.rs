@@ -2143,7 +2143,7 @@ fn spawn_run_task(payload: LaunchPayload) {
         // same reason as the load guard above: a refused launch leaves no
         // worktree behind. The slot counts the session against its kind until
         // the run ends — a headless run holds it throughout, a terminal run
-        // trades it for its page reservation (`run_agent_terminal`). Reported as
+        // until its session starts (`run_agent_terminal`). Reported as
         // the same re-offerable `deferred_load:` deferral.
         let kind_slot = match admit_spawn_kind_blocking(
             spawn_kind(payload.session_name.as_deref(), &payload.initial_prompt),
@@ -4248,6 +4248,12 @@ fn admit_spawn_kind(
     })
 }
 
+/// How many admissions [`admit_spawn_kind_blocking`] let through UNCAPPED
+/// because the count could not be read. Served by `GET /spawn-caps` as
+/// `admissionReadFailures`, so caps that are silently off are visible without
+/// reading logs.
+static KIND_CAP_READ_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// [`admit_spawn_kind`] off the async worker: the count reads the terminal list
 /// and the lifecycle store under the process-wide reservation lock, so it runs
 /// on the blocking pool like every other store read here. A blocking-pool
@@ -4261,8 +4267,9 @@ async fn admit_spawn_kind_blocking(
     match spawn_blocking_tracked(move || admit_spawn_kind(group, &what)).await {
         Ok(verdict) => verdict,
         Err(e) => {
+            KIND_CAP_READ_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             warn!(
-                "agent_runtime: kind-cap admission read for group={} failed ({e});                  admitting uncapped",
+                "agent_runtime: kind-cap admission read for group={} failed ({e}); admitting uncapped",
                 group.page_prefix()
             );
             crate::terminal::spawn_pages::try_reserve(group, None, Vec::new)
@@ -4319,7 +4326,13 @@ pub(crate) fn spawn_caps_json() -> serde_json::Value {
         })
         .collect();
     ignored.sort();
-    serde_json::json!({ "groups": groups, "overrides": overrides, "ignoredOverrides": ignored })
+    serde_json::json!({
+        "groups": groups,
+        "overrides": overrides,
+        "ignoredOverrides": ignored,
+        "admissionReadFailures":
+            KIND_CAP_READ_FAILURES.load(std::sync::atomic::Ordering::Relaxed),
+    })
 }
 
 /// [`evaluate_continuation_guard`] with the load reading taken LIVE through
@@ -7060,9 +7073,9 @@ async fn run_gate_continuation_inner(
     // worktree. It defers through the SAME non-consuming door the load lanes
     // use, so the row stays pending and is re-delivered by the backstop poll or
     // the capacity-freed exit hook. Returning drops `reservation`, which gives
-    // the anchor back. The slot counts the session against its kind until it
-    // ends: the terminal arm trades it for its page reservation, the headless
-    // arm holds it until the child exits.
+    // the anchor back. The slot counts the session against its kind: the
+    // terminal arm holds it until the session starts (its running terminal
+    // counts from then), the headless arm until the child exits.
     let kind_slot = match admit_spawn_kind_blocking(
         spawn_kind(payload.session_name.as_deref(), &payload.initial_prompt),
         format!("gate-continuation anchor_key={:?}", payload.anchor_key),
@@ -7589,9 +7602,11 @@ async fn run_continuation_terminal(
     // fallback cwd because of it; `None` when a worktree was acquired or none
     // was intended. Becomes the runner's note in the system prompt.
     no_worktree_cause: Option<&str>,
-    // The kind-cap admission step 1a took. The first attempt trades it for its
-    // page reservation; a never-started retry re-places uncapped, because it
-    // replaces an attempt that was already admitted. `None` places uncapped.
+    // The kind-cap admission step 1a took. HELD until a session starts, across
+    // every never-started retry (each placed uncapped: it replaces an attempt
+    // already admitted), so a dead attempt's pane leaves no uncounted window
+    // before its retry. Released at the start verdict, when the running
+    // terminal carries the count, or when this returns. `None` holds nothing.
     mut kind_slot: Option<crate::terminal::spawn_pages::KindSlot>,
 ) -> anyhow::Result<TerminalStart> {
     use std::sync::Arc;
@@ -7775,22 +7790,18 @@ async fn run_continuation_terminal(
         // The page id is persisted in the durable record, so a restart re-lands
         // the session on the same page. The placement is a reservation until the
         // create below returns.
-        let loads = || {
-            crate::terminal::page_placement::page_loads(
-                &terminal_manager,
-                crate::terminal::page_placement::lifecycle_store(&app).as_deref(),
-            )
-        };
-        let placement = match kind_slot.take() {
-            Some(slot) => slot.place(loads),
-            None => crate::terminal::spawn_pages::place(
-                crate::terminal::spawn_pages::SpawnGroup::classify(
-                    spawn_name.as_deref(),
-                    Some(payload.initial_prompt.as_str()),
-                ),
-                loads,
+        let placement = crate::terminal::spawn_pages::place(
+            crate::terminal::spawn_pages::SpawnGroup::classify(
+                spawn_name.as_deref(),
+                Some(payload.initial_prompt.as_str()),
             ),
-        };
+            || {
+                crate::terminal::page_placement::page_loads(
+                    &terminal_manager,
+                    crate::terminal::page_placement::lifecycle_store(&app).as_deref(),
+                )
+            },
+        );
         let target_page = placement.page_id().to_string();
 
         let mut capture_hint = crate::commands::terminal::SessionCaptureHint {
@@ -8030,6 +8041,8 @@ async fn run_continuation_terminal(
                 return Err(anyhow::anyhow!(reason));
             }
             ContinuationStart::Started { pty_alive } => {
+                // Started: its running terminal now carries the kind count.
+                drop(kind_slot.take());
                 // Register in the live continuation-session registry so P3 (dedup by
                 // anchor_key) sees this session as live until
                 // its PTY exits (reaped lazily by the guard's liveness prune).
@@ -9936,7 +9949,7 @@ async fn run_agent_subprocess(
     stop: tokio_util::sync::CancellationToken,
     // This launch's kind-cap admission. Held for the whole run on the headless
     // arm (it drops when this returns); handed to `run_agent_terminal` on the
-    // terminal arm, which trades it for the tab's page reservation.
+    // terminal arm, which holds it until the session starts.
     kind_slot: crate::terminal::spawn_pages::KindSlot,
 ) -> anyhow::Result<()> {
     // Coord emits each worktree's `repo` as a full `owner/name` slug and its
@@ -10798,9 +10811,11 @@ async fn run_agent_terminal(
     coord_mcp: crate::coord_mcp::CoordMcpDelivery,
     stop: &tokio_util::sync::CancellationToken,
     primary_push_ref: Option<&str>,
-    // The launch's kind-cap admission (`spawn_run_task`). The first attempt
-    // trades it for its page reservation; a never-started retry re-places
-    // uncapped, because it replaces an attempt that was already admitted.
+    // The launch's kind-cap admission (`spawn_run_task`). HELD until a session
+    // starts, across every never-started retry (each placed uncapped: it
+    // replaces an attempt already admitted), so a dead attempt's pane leaves no
+    // uncounted window before its retry. Released at the start verdict, when
+    // the running terminal carries the count, or when this returns.
     kind_slot: crate::terminal::spawn_pages::KindSlot,
 ) {
     let agent_id = payload.agent_id;
@@ -10897,16 +10912,12 @@ async fn run_agent_terminal(
             crate::session::spawn_prompt::delivery_unless_replacement(policy_delivery, &argv);
 
         // The group's typed page, under `page_placement`'s restore-aware loads.
-        let loads = || {
+        let placement = crate::terminal::spawn_pages::place(group, || {
             crate::terminal::page_placement::page_loads(
                 &terminal_manager,
                 crate::terminal::page_placement::lifecycle_store(&app).as_deref(),
             )
-        };
-        let placement = match kind_slot.take() {
-            Some(slot) => slot.place(loads),
-            None => crate::terminal::spawn_pages::place(group, loads),
-        };
+        });
         let target_page = placement.page_id().to_string();
         let capture_hint = crate::commands::terminal::SessionCaptureHint {
             config_dir: selected_config_dir.clone(),
@@ -11064,6 +11075,8 @@ async fn run_agent_terminal(
                 return;
             }
             ContinuationStart::Started { .. } => {
+                // Started: its running terminal now carries the kind count.
+                drop(kind_slot.take());
                 info!(
                     "agent_runtime: agent_id={agent_id} terminal session started \
                      terminal_id={terminal_id} group={} coord_session={coord_session_id:?} \
@@ -18407,10 +18420,10 @@ mod tests {
     }
 
     /// Both launch arms and the gate-continuation path take the kind cap
-    /// before any worktree or coord claim exists, and the terminal arms spend
-    /// the admission on their first placement rather than re-counting it.
+    /// before any worktree or coord claim exists, and the terminal arms hold
+    /// the admission until their session starts.
     #[test]
-    fn every_capped_spawn_path_admits_before_setup_and_trades_the_slot() {
+    fn every_capped_spawn_path_admits_before_setup_and_holds_the_slot_until_start() {
         let source = include_str!("agent_runtime.rs");
         let (prod, _) = source
             .split_once(
@@ -18448,13 +18461,19 @@ mod tests",
         assert!(admit < claim, "the cap precedes the coord claim");
         assert!(cont.contains("spawn_kind_cap_stamp_reason("));
 
+        // The terminal arms hold the slot until the session starts.
         for f in [
             "async fn run_agent_terminal(",
             "async fn run_continuation_terminal(",
         ] {
+            let body = body_of(f);
+            let place = body.find("spawn_pages::place(").expect("a placement");
+            let release = body
+                .find("drop(kind_slot.take());")
+                .expect("the slot is released at the start verdict");
             assert!(
-                body_of(f).contains("Some(slot) => slot.place(loads)"),
-                "{f}"
+                place < release,
+                "{f}: held across placement, released on start"
             );
         }
     }

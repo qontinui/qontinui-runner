@@ -1382,7 +1382,8 @@ async fn livez() -> impl axum::response::IntoResponse {
     (axum::http::StatusCode::OK, "ok")
 }
 
-/// `GET /spawn-caps` — `{ groups: [{group, count, cap, atCap}], overrides }`.
+/// `GET /spawn-caps` — `{ groups: [{group, count, cap, atCap}], overrides,
+/// ignoredOverrides, admissionReadFailures }`.
 /// `cap: null` is unlimited. See `agent_runtime::spawn_caps_json`.
 async fn spawn_caps() -> impl axum::response::IntoResponse {
     // The loads read the terminal list and the lifecycle store, both blocking.

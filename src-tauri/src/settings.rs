@@ -3368,9 +3368,6 @@ pub(crate) const SHIPPED_WARN_THREAD_CEILING: usize = 256;
 /// `resource_guard` keeps constant on every machine.
 pub(crate) const SHIPPED_CRITICAL_THREAD_CEILING: usize = 400;
 
-/// [`SessionGuardSettings::warn_thread_count`]'s load migration: a stored
-/// value equal to the old default ([`SHIPPED_WARN_THREAD_CEILING`]) was never
-/// distinguishable from "unset" and reads as `None`; anything else is kept.
 /// [`Settings::spawn_caps`]'s lenient reader: keeps each entry whose value is
 /// a non-negative integer and drops (with a warning) every other entry, and a
 /// non-object value entirely, instead of failing the whole `Settings` parse.
@@ -3400,7 +3397,7 @@ fn spawn_caps_from_value(raw: &serde_json::Value) -> std::collections::HashMap<S
                 Some(n) => Some((kind.clone(), n)),
                 None => {
                     warn!(
-                        "settings: spawn_caps.{kind} = {value} is not a non-negative integer;                          ignored, that kind keeps its default cap"
+                        "settings: spawn_caps.{kind} = {value} is not a non-negative integer; ignored, that kind keeps its default cap"
                     );
                     None
                 }
@@ -3409,6 +3406,9 @@ fn spawn_caps_from_value(raw: &serde_json::Value) -> std::collections::HashMap<S
         .collect()
 }
 
+/// [`SessionGuardSettings::warn_thread_count`]'s load migration: a stored
+/// value equal to the old default ([`SHIPPED_WARN_THREAD_CEILING`]) was never
+/// distinguishable from "unset" and reads as `None`; anything else is kept.
 fn deserialize_warn_thread_ceiling<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -3967,7 +3967,8 @@ pub struct Settings {
     /// Read LENIENTLY ([`deserialize_spawn_caps`]): there is no write route,
     /// so this is hand-edited, and one bad value must not make the whole
     /// `settings.json` unreadable. An entry that is not a non-negative integer
-    /// is dropped with a warning (its kind keeps the default).
+    /// is dropped with a warning (its kind keeps the default) — and, since the
+    /// next settings save writes back what was read, dropped from the file too.
     #[serde(
         default,
         skip_serializing_if = "std::collections::HashMap::is_empty",

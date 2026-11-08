@@ -221,16 +221,16 @@ pub(crate) fn pick_group_page(
         .expect("an unbounded range always yields a page with room")
 }
 
-/// Admissions not yet visible in the terminal manager.
+/// The process-wide reservation ledger.
 ///
 /// `pages`: placements chosen but not yet created, per page. A spawn path picks
 /// its page, then awaits (account selection, trust warm-up) before the terminal
 /// exists. Two spawns racing through that window would both read the same count
 /// and overfill one page; counting the reservation closes it.
 ///
-/// `slots`: per-group admissions under the kind cap that hold NO page — a
-/// headless run for its whole life, and a terminal run between its admission
-/// and its placement (see [`KindSlot`]).
+/// `slots`: per-group admissions under the kind cap — a headless run for its
+/// whole life, and a terminal run from admission until its session starts (see
+/// [`KindSlot`]).
 #[derive(Default)]
 struct Reservations {
     pages: HashMap<String, usize>,
@@ -327,9 +327,9 @@ where
 /// releases its reservation cannot slip between this read and this reservation.
 ///
 /// UNCAPPED. The kind cap is an admission taken earlier, by [`try_reserve`],
-/// and spent here by [`KindSlot::place`]; this door is for the spawns that are
-/// never capped (stewards, condition checks) and for the never-started retry of
-/// a spawn that was already admitted.
+/// whose [`KindSlot`] the caller holds across this placement until its session
+/// starts; spawns that are never capped (stewards, condition checks) place
+/// here with no slot at all.
 pub(crate) fn place<I>(group: SpawnGroup, page_loads: impl FnOnce() -> I) -> PagePlacement
 where
     I: IntoIterator<Item = (String, usize)>,
@@ -395,42 +395,26 @@ pub(crate) struct AtCap {
     pub(crate) cap: usize,
 }
 
-/// One admitted autonomous session of `group` that holds no page.
+/// One admitted autonomous session of `group`, counted against its kind's cap
+/// while it is held.
 ///
 /// The count it adds is what makes the cap PER KIND rather than per tab: a
 /// headless run (a `LaunchPayload` without `presentation: terminal`, or a
 /// headless gate continuation) holds its slot for its whole life, so a headless
 /// fixer counts against the fixer cap exactly as a fixer tab does. A terminal
-/// run trades its slot for a page reservation with [`KindSlot::place`] — the
-/// two are swapped under one lock, so the session is counted continuously.
-/// Dropping the slot releases it.
+/// run holds it from admission until its session STARTS — across its page
+/// placement and any never-started retry — and drops it then, when its running
+/// terminal carries the count. Dropping the slot releases it.
 ///
-/// Two edges, both accepted: between a terminal's create and its placement's
-/// release the session is counted twice (as a running terminal and as a
-/// reservation), so a concurrent admission in that instant can be refused one
-/// early — the safe direction; and a tab the operator drags off its kind's
-/// pages stops counting, because the count is per page (`<prefix>-<n>`).
+/// Two edges, both accepted: while a terminal session is starting it is
+/// counted twice (its slot, and its reservation or its running terminal), so a
+/// concurrent admission in that window can be refused one early — the safe
+/// direction, and coord re-offers a refused launch; and a tab the operator
+/// drags off its kind's pages stops counting, because the count is per page
+/// (`<prefix>-<n>`).
 #[derive(Debug)]
 pub(crate) struct KindSlot {
     group: SpawnGroup,
-}
-
-impl KindSlot {
-    /// Trade this slot for a page reservation on its group's pages (see
-    /// [`place`] for the loads). Uncapped: the slot was the admission.
-    pub(crate) fn place<I>(self, page_loads: impl FnOnce() -> I) -> PagePlacement
-    where
-        I: IntoIterator<Item = (String, usize)>,
-    {
-        let group = self.group;
-        let mut res = lock_pending();
-        let placement = reserve_page(group, &mut res, page_loads());
-        decrement(&mut res.slots, &group);
-        // The slot's count was just moved onto the page reservation; its own
-        // drop must not take it away a second time.
-        std::mem::forget(self);
-        placement
-    }
 }
 
 impl Drop for KindSlot {
@@ -852,19 +836,21 @@ mod tests {
     }
 
     #[test]
-    fn a_slot_traded_for_a_page_is_counted_once_and_continuously() {
-        let slot = try_reserve(SpawnGroup::Impl, Some(1), no_loads).expect("empty kind");
-        assert!(try_reserve(SpawnGroup::Impl, Some(1), no_loads).is_err());
-        // Admission → placement: still exactly one.
-        let placement = slot.place(no_loads);
+    fn a_slot_counts_until_dropped_and_a_starting_terminal_counts_twice() {
+        let slot = try_reserve(SpawnGroup::Impl, Some(2), no_loads).expect("empty kind");
+        // A terminal run places while still holding its slot: the start window
+        // over-counts by one (the accepted, safe-direction edge).
+        let placement = place(SpawnGroup::Impl, no_loads);
         assert_eq!(placement.page_id(), "impl-1");
-        let refused = try_reserve(SpawnGroup::Impl, Some(1), no_loads).unwrap_err();
-        assert_eq!(refused.count, 1, "not double-counted across the trade");
-        // Placement → live terminal: the manager's load carries it.
+        let refused = try_reserve(SpawnGroup::Impl, Some(2), no_loads).unwrap_err();
+        assert_eq!(refused.count, 2);
+        // Created and running: the manager's load carries it, the reservation
+        // is released, and the slot drops at the start verdict.
         placement.release();
-        let live = || vec![("impl-1".to_string(), 1)];
+        drop(slot);
+        let running = || vec![("impl-1".to_string(), 1)];
         assert_eq!(
-            try_reserve(SpawnGroup::Impl, Some(1), live)
+            try_reserve(SpawnGroup::Impl, Some(1), running)
                 .unwrap_err()
                 .count,
             1

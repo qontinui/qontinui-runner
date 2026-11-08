@@ -165,13 +165,22 @@ fn normalized_page(page_id: &str) -> &str {
     }
 }
 
-/// Pure core of [`page_loads`]: live terminals per page, plus each row of
-/// `awaiting` whose `terminal_id` is blank or names no live terminal, on its
+/// Pure core of [`page_loads`]: listed terminals per page, plus each row of
+/// `awaiting` whose `terminal_id` is blank or names no listed terminal, on its
 /// recorded page. Sorted by page id so the output is deterministic.
-fn loads_from(live: &[TerminalInfo], awaiting: &[TerminalSessionRecord]) -> Vec<(String, usize)> {
+///
+/// `running_only` counts only terminals whose process is running (see
+/// [`running_page_loads`]). A row bound to a listed terminal is NOT awaiting
+/// restore whether or not that terminal is running, so an exited pane is not
+/// counted back in through its own lifecycle row.
+fn loads_from(
+    live: &[TerminalInfo],
+    awaiting: &[TerminalSessionRecord],
+    running_only: bool,
+) -> Vec<(String, usize)> {
     let mut per_page: HashMap<String, usize> = HashMap::new();
     let live_ids: HashSet<&str> = live.iter().map(|t| t.id.as_str()).collect();
-    for info in live {
+    for info in live.iter().filter(|t| !running_only || t.is_alive) {
         *per_page
             .entry(normalized_page(&info.page_id).to_string())
             .or_insert(0) += 1;
@@ -212,11 +221,11 @@ fn loads_under(
     let restorable = store
         .map(|s| s.restorable_records(view.prior_marker_at, view.boot_was_clean))
         .unwrap_or_default();
-    let mut listed = tm.list();
-    if running_only {
-        listed.retain(|t| t.is_alive);
-    }
-    loads_from(&listed, &awaiting_restore(restorable, view))
+    loads_from(
+        &tm.list(),
+        &awaiting_restore(restorable, view),
+        running_only,
+    )
 }
 
 /// The restorable rows a restore in THIS process may still bring back: the
@@ -452,7 +461,11 @@ mod tests {
         running.set_alive_for_test(true);
         tm.insert_for_test("t-running", running.clone());
         live(&tm, "t-exited", "fixer-1");
-        let (_dir, store) = store_with(rows_on("fixer-2", 2));
+        // The exited pane's own lifecycle row, still open: bound to a listed
+        // terminal, so it must not count the dead pane back in.
+        let mut rows = rows_on("fixer-2", 2);
+        rows.push(row("exited-session", "fixer-1", "t-exited"));
+        let (_dir, store) = store_with(rows);
 
         let tabs = page_loads_under(&tm, Some(&store), VIEW);
         let running_loads = loads_under(&tm, Some(&store), VIEW, true);
