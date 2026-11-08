@@ -11795,10 +11795,12 @@ mod tests {
                 ),
             )
             .unwrap();
-            let mut snap = crate::process_capture::process_tree::ProcessSnapshot::default();
-            snap.stale = false;
-            snap.parent_map.insert(1, vec![31524]);
-            snap.creation_times.insert(31524, created);
+            let snap = crate::process_capture::process_tree::ProcessSnapshot {
+                stale: false,
+                parent_map: HashMap::from([(1, vec![31524])]),
+                creation_times: HashMap::from([(31524, created)]),
+                ..Default::default()
+            };
             let live = vec![LivePty {
                 terminal_id: "pane-1".into(),
                 pid: Some(1),
@@ -11810,7 +11812,8 @@ mod tests {
             }];
             let cmdlines: HashMap<u32, String> = [(31524u32, LIVE.to_string())].into();
             let tick = |store: &SessionLifecycleStore| {
-                let rows = compute_provider_rows_blocking(&live, &snap, &[cfg.path().to_path_buf()]);
+                let rows =
+                    compute_provider_rows_blocking(&live, &snap, || vec![cfg.path().to_path_buf()]);
                 let actions = run_reconcile(
                     store,
                     &live,

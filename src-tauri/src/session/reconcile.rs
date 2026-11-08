@@ -1016,8 +1016,9 @@ pub fn decide_title_refresh(
 /// silent drop; it is the observation that the pane's claude now runs another
 /// id, which the coord re-key (`provider_registry`) acts on.
 fn note_title_refresh_mismatch(terminal_id: &str, provider_id: &str, record_id: &str) {
-    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<(String, String)>>> =
-        std::sync::OnceLock::new();
+    static SEEN: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashSet<(String, String)>>,
+    > = std::sync::OnceLock::new();
     let seen = SEEN.get_or_init(Default::default);
     let first = seen
         .lock()
@@ -1116,19 +1117,37 @@ pub fn refresh_titles_pass(
 /// the coord re-key, so both read the same answer.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ProviderRows {
-    by_terminal: HashMap<String, ProviderRowValidity>,
+    by_terminal: HashMap<String, ProviderEntry>,
+}
+
+/// One terminal's verdict with the anchor it was read for (pid + creation
+/// time), so a caller can tell "the same process, read again" from "a new one".
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProviderEntry {
+    anchor: (u32, Option<i64>),
+    verdict: ProviderRowValidity,
 }
 
 impl ProviderRows {
+    /// Rows with no anchor information (pid 0, creation unknown).
     pub fn from_pairs(pairs: impl IntoIterator<Item = (String, ProviderRowValidity)>) -> Self {
+        Self::from_entries(pairs.into_iter().map(|(t, v)| (t, (0, None), v)))
+    }
+
+    pub fn from_entries(
+        entries: impl IntoIterator<Item = (String, (u32, Option<i64>), ProviderRowValidity)>,
+    ) -> Self {
         Self {
-            by_terminal: pairs.into_iter().collect(),
+            by_terminal: entries
+                .into_iter()
+                .map(|(t, anchor, verdict)| (t, ProviderEntry { anchor, verdict }))
+                .collect(),
         }
     }
 
     /// The session id this terminal's anchor provably runs, if any.
     pub fn valid_id(&self, terminal_id: &str) -> Option<&str> {
-        match self.by_terminal.get(terminal_id)? {
+        match &self.by_terminal.get(terminal_id)?.verdict {
             ProviderRowValidity::Valid { session_id, .. } => Some(session_id),
             _ => None,
         }
@@ -1144,14 +1163,25 @@ impl ProviderRows {
             .keys()
             .filter_map(|t| self.valid_id(t).map(|id| (t.as_str(), id)))
     }
+
+    /// Every `(terminal id, anchor, verdict)` read this tick.
+    pub fn entries(
+        &self,
+    ) -> impl Iterator<Item = (&str, (u32, Option<i64>), &ProviderRowValidity)> {
+        self.by_terminal
+            .iter()
+            .map(|(t, e)| (t.as_str(), e.anchor, &e.verdict))
+    }
 }
 
 /// Blocking: resolve anchors from `snapshot` and read every config dir's file
-/// for each anchor pid. An unknown snapshot anchors nothing.
+/// for each anchor pid. An unknown snapshot anchors nothing. `config_dirs` is
+/// only called when at least one anchor exists, so a tick with no claude pane
+/// does no directory discovery.
 pub fn compute_provider_rows_blocking(
     live: &[LivePty],
     snapshot: &ProcessSnapshot,
-    config_dirs: &[PathBuf],
+    config_dirs: impl FnOnce() -> Vec<PathBuf>,
 ) -> ProviderRows {
     let anchored = anchor_live_ptys(live, snapshot);
     let pids: Vec<(u32, Option<i64>)> = anchored
@@ -1164,10 +1194,16 @@ pub fn compute_provider_rows_blocking(
     if pids.is_empty() {
         return ProviderRows::default();
     }
-    let verdicts = read_provider_rows(config_dirs, &pids);
-    ProviderRows::from_pairs(anchored.iter().filter_map(|p| {
-        let verdict = verdicts.get(&p.ai_pid?)?.clone();
-        Some((p.terminal_id.clone(), verdict))
+    let verdicts = read_provider_rows(&config_dirs(), &pids);
+    ProviderRows::from_entries(anchored.iter().filter_map(|p| {
+        let pid = p.ai_pid?;
+        let verdict = verdicts.get(&pid)?.clone();
+        let creation = snapshot
+            .creation_times
+            .get(&pid)
+            .copied()
+            .filter(|&s| s > 0);
+        Some((p.terminal_id.clone(), (pid, creation), verdict))
     }))
 }
 
@@ -1180,7 +1216,7 @@ pub async fn compute_provider_rows(live: &[LivePty], snapshot: &ProcessSnapshot)
         compute_provider_rows_blocking(
             &live,
             &snapshot,
-            &crate::terminal::transcript::find_claude_config_dirs(),
+            crate::terminal::transcript::find_claude_config_dirs,
         )
     })
     .await
@@ -1856,14 +1892,16 @@ mod tests {
             ),
         )
         .unwrap();
-        let mut snap = ProcessSnapshot::default();
-        snap.stale = false;
-        snap.parent_map.insert(1, vec![31524]);
-        snap.creation_times.insert(31524, created);
+        let snap = ProcessSnapshot {
+            stale: false,
+            parent_map: HashMap::from([(1, vec![31524])]),
+            creation_times: HashMap::from([(31524, created)]),
+            ..Default::default()
+        };
         let rows = compute_provider_rows_blocking(
             &[pty_anchored("term-1", 31524, created, "C:/repo")],
             &snap,
-            &[dir.path().to_path_buf()],
+            || vec![dir.path().to_path_buf()],
         );
         (dir, rows)
     }

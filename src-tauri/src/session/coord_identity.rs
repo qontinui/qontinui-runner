@@ -56,6 +56,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value as JsonValue};
 use uuid::Uuid;
 
+use super::claude_activity::ProviderRowValidity;
 use super::reconcile::{BindOrigin, ProviderRows, ReconcileAction};
 use super::{SessionError, SessionRegistry, SessionState};
 
@@ -225,6 +226,10 @@ struct ParkedRekey {
 struct LedgerInner {
     sessions: HashMap<Uuid, SessionRekeyState>,
     parked: HashMap<String, ParkedRekey>,
+    /// Per terminal: the anchor (pid, creation time) a provider-registry id was
+    /// queued or already current for. While it holds, rung 2 stays suppressed
+    /// even when this tick's registry read is transiently Unknown.
+    provider_anchors: HashMap<String, (u32, Option<i64>)>,
     counts: [SourceCounts; 4],
     no_coord_row: u64,
     invalid: u64,
@@ -251,6 +256,33 @@ impl RekeyLedger {
     /// Held across a record's move and its outbox append (see `record_move`).
     pub(crate) fn record_move_guard(&self) -> MutexGuard<'_, ()> {
         self.record_move.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Remember that the provider registry decided this terminal's id for
+    /// `anchor`.
+    fn remember_provider_anchor(&self, terminal_id: &str, anchor: (u32, Option<i64>)) {
+        self.with(|l| {
+            l.provider_anchors.insert(terminal_id.to_string(), anchor);
+        });
+    }
+
+    /// Does the memory for `terminal_id` still hold for `anchor`? A memory for a
+    /// different anchor (the process changed) is dropped.
+    fn provider_anchor_holds(&self, terminal_id: &str, anchor: (u32, Option<i64>)) -> bool {
+        self.with(|l| match l.provider_anchors.get(terminal_id) {
+            Some(&a) if a == anchor => true,
+            Some(_) => {
+                l.provider_anchors.remove(terminal_id);
+                false
+            }
+            None => false,
+        })
+    }
+
+    fn forget_provider_anchor(&self, terminal_id: &str) {
+        self.with(|l| {
+            l.provider_anchors.remove(terminal_id);
+        });
     }
 
     pub(crate) fn note_queued(&self, source: RekeySource) {
@@ -917,6 +949,13 @@ pub fn rekey_provider_rows(
 /// [`apply_reconcile_tick`] with this tick's provider rows. A valid provider
 /// row wins over the rung-2 argv id: rung 2 is skipped for a terminal that has
 /// one, so the seam is called at most once per terminal per tick.
+///
+/// The precedence is not stateless. Once a provider-registry id has been queued
+/// (or was already current) for an anchor, rung 2 stays suppressed for that
+/// same anchor (pid + creation time) even if a later read is transiently
+/// Unknown (a half-rewritten file, an unreadable dir), so the row cannot flap
+/// back to the stale argv id. The memory is cleared by a positive Stale verdict
+/// or by a different anchor.
 pub fn apply_reconcile_tick_with(
     registry: &SessionRegistry,
     actions: &[ReconcileAction],
@@ -924,8 +963,35 @@ pub fn apply_reconcile_tick_with(
     coord_row_for: impl Fn(&str) -> Option<Uuid>,
 ) -> Vec<(String, RekeyOutcome)> {
     let restored = restore_declines(registry);
-    let mut out = rekey_rung2_binds(registry, actions, &coord_row_for, |t| rows.has_valid(t));
-    out.extend(rekey_provider_rows(registry, rows, &coord_row_for));
+    let ledger = registry.coord_sync().rekeys();
+    let mut suppress_rung2: HashSet<&str> = HashSet::new();
+    for (terminal_id, anchor, verdict) in rows.entries() {
+        match verdict {
+            ProviderRowValidity::Valid { .. } => {
+                suppress_rung2.insert(terminal_id);
+            }
+            ProviderRowValidity::Stale => ledger.forget_provider_anchor(terminal_id),
+            ProviderRowValidity::Unknown => {
+                if ledger.provider_anchor_holds(terminal_id, anchor) {
+                    suppress_rung2.insert(terminal_id);
+                }
+            }
+        }
+    }
+    let mut out = rekey_rung2_binds(registry, actions, &coord_row_for, |t| {
+        suppress_rung2.contains(t)
+    });
+    let provider_out = rekey_provider_rows(registry, rows, &coord_row_for);
+    for (terminal_id, outcome) in &provider_out {
+        if matches!(outcome, RekeyOutcome::Queued | RekeyOutcome::AlreadyCurrent) {
+            if let Some((_, anchor, _)) =
+                rows.entries().find(|(t, _, _)| *t == terminal_id.as_str())
+            {
+                ledger.remember_provider_anchor(terminal_id, anchor);
+            }
+        }
+    }
+    out.extend(provider_out);
     retry_parked(registry, &coord_row_for);
     retry_restored(registry, restored);
     retry_deferred(registry);
@@ -1113,7 +1179,10 @@ mod tests {
         let queued = rekeys_for(&outbox, row);
         assert_eq!(queued.len(), 1, "{queued:?}");
         assert_eq!(queued[0].payload["claude_code_session_id"], json!(LIVE));
-        assert_eq!(queued[0].payload["rekey_source"], json!("provider_registry"));
+        assert_eq!(
+            queued[0].payload["rekey_source"],
+            json!("provider_registry")
+        );
         assert_eq!(
             reg.coord_sync()
                 .rekeys()
@@ -1123,7 +1192,11 @@ mod tests {
         );
 
         apply_reconcile_tick_with(&reg, &[], &rows, lookup);
-        assert_eq!(rekeys_for(&outbox, row).len(), 1, "the next tick queues none");
+        assert_eq!(
+            rekeys_for(&outbox, row).len(),
+            1,
+            "the next tick queues none"
+        );
     }
 
     /// Precedence: argv `--session-id` X (a rung-2 bind) plus a valid provider
@@ -1146,8 +1219,80 @@ mod tests {
         assert_eq!(queued.len(), 1, "{queued:?}");
         assert_eq!(queued[0].payload["claude_code_session_id"], json!(VALID));
         apply_reconcile_tick_with(&reg, &actions, &rows, lookup);
-        assert_eq!(rekeys_for(&outbox, row).len(), 1, "no flapping on the next tick");
-        assert_eq!(reg.coord_sync().rekeys().counts(RekeySource::Rung2).queued, 0);
+        assert_eq!(
+            rekeys_for(&outbox, row).len(),
+            1,
+            "no flapping on the next tick"
+        );
+        assert_eq!(
+            reg.coord_sync().rekeys().counts(RekeySource::Rung2).queued,
+            0
+        );
+    }
+
+    /// Flapping guard: Valid(Y), then a transient Unknown, then Valid(Y), with an
+    /// unconfirmed argv bind X present every tick, queues exactly one re-key, to
+    /// Y. A positive Stale verdict (or a different anchor) hands rung 2 back.
+    #[test]
+    fn a_transient_unknown_read_does_not_hand_the_row_back_to_the_argv_id() {
+        use crate::session::claude_activity::ProviderRowValidity as V;
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = tempfile::tempdir().unwrap();
+        let (reg, outbox) = registry(dir.path());
+        let row = reg
+            .register_external_with_lineage(intent(), None, Some(PIN.into()))
+            .unwrap();
+        let actions = [bind("t1", LIVE, BindOrigin::Authoritative)];
+        let lookup = |t: &str| (t == "t1").then_some(row);
+        let anchor = (31524u32, Some(1_790_000_000i64));
+        let rows = |v: V| ProviderRows::from_entries([("t1".to_string(), anchor, v)]);
+        let valid = || V::Valid {
+            session_id: VALID.into(),
+            config_dir: std::path::PathBuf::from("cfg"),
+        };
+
+        apply_reconcile_tick_with(&reg, &actions, &rows(valid()), lookup);
+        apply_reconcile_tick_with(&reg, &actions, &rows(V::Unknown), lookup);
+        apply_reconcile_tick_with(&reg, &actions, &rows(valid()), lookup);
+        let queued = rekeys_for(&outbox, row);
+        assert_eq!(queued.len(), 1, "{queued:?}");
+        assert_eq!(queued[0].payload["claude_code_session_id"], json!(VALID));
+
+        // A different anchor (the process changed): Unknown no longer suppresses.
+        let other = ProviderRows::from_entries([("t1".to_string(), (99, Some(1)), V::Unknown)]);
+        apply_reconcile_tick_with(&reg, &actions, &other, lookup);
+        let queued = rekeys_for(&outbox, row);
+        assert_eq!(queued.len(), 2, "{queued:?}");
+        assert_eq!(queued[1].payload["claude_code_session_id"], json!(LIVE));
+    }
+
+    /// A positive Stale verdict clears the memory, so rung 2 applies again.
+    #[test]
+    fn a_stale_verdict_clears_the_provider_memory() {
+        use crate::session::claude_activity::ProviderRowValidity as V;
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = tempfile::tempdir().unwrap();
+        let (reg, outbox) = registry(dir.path());
+        let row = reg
+            .register_external_with_lineage(intent(), None, Some(PIN.into()))
+            .unwrap();
+        let actions = [bind("t1", LIVE, BindOrigin::Authoritative)];
+        let lookup = |t: &str| (t == "t1").then_some(row);
+        let anchor = (31524u32, Some(1_790_000_000i64));
+        let rows = |v: V| ProviderRows::from_entries([("t1".to_string(), anchor, v)]);
+        apply_reconcile_tick_with(
+            &reg,
+            &actions,
+            &rows(V::Valid {
+                session_id: VALID.into(),
+                config_dir: std::path::PathBuf::from("cfg"),
+            }),
+            lookup,
+        );
+        apply_reconcile_tick_with(&reg, &actions, &rows(V::Stale), lookup);
+        let queued = rekeys_for(&outbox, row);
+        assert_eq!(queued.len(), 2, "{queued:?}");
+        assert_eq!(queued[1].payload["claude_code_session_id"], json!(LIVE));
     }
 
     /// Rung 2 stays the fallback when the anchor has no valid row (a stale or
