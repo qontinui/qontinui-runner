@@ -48,8 +48,10 @@
 //!    `_runner_proxy_relay`, so both senders share one implementation. It
 //!    sends exactly one fixed frame, `GET /terminal-layout`, server-side; no
 //!    caller chooses its method or path. That is its INTENDED caller, not its
-//!    only one: sender 1 can send the same frame for a device owner, and the
-//!    response is redacted the same way whichever sender asked.
+//!    only one: sender 1's relay arm can send the same frame for a device
+//!    owner, and the relayed response is redacted the same way whichever
+//!    sender asked. (Sender 1's co-located admin arm never reaches this
+//!    policy: it calls the loopback API directly, as a local caller.)
 //!
 //! The proxy route's callers, measured 2026-09-12:
 //!

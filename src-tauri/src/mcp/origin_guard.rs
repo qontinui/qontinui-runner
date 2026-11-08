@@ -273,11 +273,15 @@ pub const CREDENTIAL_DOORS: &[&str] = &[
     // The per-tab session snapshot (`mcp::terminal_layout`): terminal titles,
     // which are PTY-derived session content, plus session ids, accounts and
     // the device id. No browser page needs it. Its intended caller is
-    // qontinui-web's saved-session-lists capture over the backend relay; a
-    // device owner can also reach it through qontinui-web's device-bridge
-    // runner proxy (`/api/v1/device-bridge/runner-proxy/terminal-layout`), which
-    // rides the same relay and gets the same per-tenant title redaction. A
-    // relayed request reaches this API with no `Origin` and no `Sec-Fetch-*`:
+    // qontinui-web's saved-session-lists capture over the backend relay. Two
+    // other callers can reach it through qontinui-web's device-bridge runner
+    // proxy (`/api/v1/device-bridge/runner-proxy/terminal-layout`): a device
+    // owner through its relay arm (with `X-Qontinui-Device-Id`), which rides
+    // the same relay and gets the same per-tenant title redaction; and a
+    // platform admin through its co-located arm (no device header), which
+    // calls this loopback API directly and so, like any local caller, gets
+    // the titles unredacted (see `mcp::terminal_layout`). A relayed request
+    // reaches this API with no `Origin` and no `Sec-Fetch-*`:
     // qontinui-web's `runner_relay` drops them and
     // `backend_relay::RELAY_SKIP_REQUEST_HEADERS` drops `origin` and
     // `sec-fetch-site` again. So it classifies NonBrowser and is admitted (plan
