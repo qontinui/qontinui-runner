@@ -56,7 +56,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value as JsonValue};
 use uuid::Uuid;
 
-use super::reconcile::{BindOrigin, ReconcileAction};
+use super::reconcile::{BindOrigin, ProviderRows, ReconcileAction};
 use super::{SessionError, SessionRegistry, SessionState};
 
 /// How many `rejected` answers one id gets, on the 45 s tick, before it waits
@@ -778,8 +778,7 @@ pub fn confirm_for_terminal(
 /// a rung-3 `Observed` or rung-4 `Reconciled` correlation. At most one seam
 /// call per terminal, and none for a terminal whose anchor has a valid
 /// provider row this tick (`has_valid_provider_row`; the provider-registry
-/// source is the stronger, current evidence). Until Phase 1b lands that
-/// predicate is always `false`.
+/// source is the stronger, current evidence, fed by [`rekey_provider_rows`]).
 pub fn rekey_rung2_binds(
     registry: &SessionRegistry,
     actions: &[ReconcileAction],
@@ -884,15 +883,49 @@ pub fn apply_reconcile_tick(
     actions: &[ReconcileAction],
     coord_row_for: impl Fn(&str) -> Option<Uuid>,
 ) -> Vec<(String, RekeyOutcome)> {
+    apply_reconcile_tick_with(registry, actions, &ProviderRows::default(), coord_row_for)
+}
+
+/// Feed this tick's valid provider rows through the seam
+/// (`source=provider_registry`): for every live PTY whose claude anchor has a
+/// valid registry row AND whose terminal has a coord row, re-key that row to the
+/// id the provider says the process runs. At most one call per terminal. A
+/// terminal with no coord row is skipped (nothing to re-key; the registry row
+/// is re-read next tick). Never reads rung 3 or 4.
+pub fn rekey_provider_rows(
+    registry: &SessionRegistry,
+    rows: &ProviderRows,
+    coord_row_for: impl Fn(&str) -> Option<Uuid>,
+) -> Vec<(String, RekeyOutcome)> {
+    let mut out = Vec::new();
+    for (terminal_id, session_id) in rows.valid() {
+        let Some(coord_row) = coord_row_for(terminal_id) else {
+            continue;
+        };
+        let outcome = confirm_for_terminal(
+            registry,
+            terminal_id,
+            Some(coord_row),
+            session_id,
+            RekeySource::ProviderRegistry,
+        );
+        out.push((terminal_id.to_string(), outcome));
+    }
+    out
+}
+
+/// [`apply_reconcile_tick`] with this tick's provider rows. A valid provider
+/// row wins over the rung-2 argv id: rung 2 is skipped for a terminal that has
+/// one, so the seam is called at most once per terminal per tick.
+pub fn apply_reconcile_tick_with(
+    registry: &SessionRegistry,
+    actions: &[ReconcileAction],
+    rows: &ProviderRows,
+    coord_row_for: impl Fn(&str) -> Option<Uuid>,
+) -> Vec<(String, RekeyOutcome)> {
     let restored = restore_declines(registry);
-    let out = rekey_rung2_binds(
-        registry,
-        actions,
-        &coord_row_for,
-        // Phase 1b (the provider-registry source) is not on this build: no
-        // terminal has a valid provider row yet, so rung 2 is never pre-empted.
-        |_| false,
-    );
+    let mut out = rekey_rung2_binds(registry, actions, &coord_row_for, |t| rows.has_valid(t));
+    out.extend(rekey_provider_rows(registry, rows, &coord_row_for));
     retry_parked(registry, &coord_row_for);
     retry_restored(registry, restored);
     retry_deferred(registry);
@@ -901,11 +934,15 @@ pub fn apply_reconcile_tick(
 
 /// [`apply_reconcile_tick`] against the app's terminal manager + registry.
 /// Fire-and-forget; a no-op when either is not in Tauri state.
-pub fn apply_reconcile_tick_in_app(app: &tauri::AppHandle, actions: &[ReconcileAction]) {
+pub fn apply_reconcile_tick_in_app(
+    app: &tauri::AppHandle,
+    actions: &[ReconcileAction],
+    rows: &ProviderRows,
+) {
     let Some((terminals, registry)) = app_parts(app) else {
         return;
     };
-    apply_reconcile_tick(&registry, actions, |t| {
+    apply_reconcile_tick_with(&registry, actions, rows, |t| {
         terminals.get(t).and_then(|s| s.coord_session_id())
     });
 }
@@ -1044,6 +1081,107 @@ mod tests {
             1,
             "the next tick queues none"
         );
+    }
+
+    const VALID: &str = "3c37caf2-0000-4000-8000-000000000003";
+
+    fn valid_rows(terminal: &str, id: &str) -> ProviderRows {
+        ProviderRows::from_pairs([(
+            terminal.to_string(),
+            crate::session::claude_activity::ProviderRowValidity::Valid {
+                session_id: id.into(),
+                config_dir: std::path::PathBuf::from("cfg"),
+            },
+        )])
+    }
+
+    /// A valid provider file naming X for a pane whose row carries Y queues one
+    /// re-key (source provider_registry), and the next tick queues none.
+    #[test]
+    fn a_valid_provider_row_queues_one_rekey_and_the_next_tick_none() {
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = tempfile::tempdir().unwrap();
+        let (reg, outbox) = registry(dir.path());
+        let row = reg
+            .register_external_with_lineage(intent(), None, Some(PIN.into()))
+            .unwrap();
+        let rows = valid_rows("t1", LIVE);
+        let lookup = |t: &str| (t == "t1").then_some(row);
+
+        let first = apply_reconcile_tick_with(&reg, &[], &rows, lookup);
+        assert_eq!(first, vec![("t1".to_string(), RekeyOutcome::Queued)]);
+        let queued = rekeys_for(&outbox, row);
+        assert_eq!(queued.len(), 1, "{queued:?}");
+        assert_eq!(queued[0].payload["claude_code_session_id"], json!(LIVE));
+        assert_eq!(queued[0].payload["rekey_source"], json!("provider_registry"));
+        assert_eq!(
+            reg.coord_sync()
+                .rekeys()
+                .counts(RekeySource::ProviderRegistry)
+                .queued,
+            1
+        );
+
+        apply_reconcile_tick_with(&reg, &[], &rows, lookup);
+        assert_eq!(rekeys_for(&outbox, row).len(), 1, "the next tick queues none");
+    }
+
+    /// Precedence: argv `--session-id` X (a rung-2 bind) plus a valid provider
+    /// row Y gives exactly one re-key, to Y, and none on the next tick.
+    #[test]
+    fn a_valid_provider_row_beats_the_rung2_argv_id() {
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = tempfile::tempdir().unwrap();
+        let (reg, outbox) = registry(dir.path());
+        let row = reg
+            .register_external_with_lineage(intent(), None, Some(PIN.into()))
+            .unwrap();
+        let rows = valid_rows("t1", VALID);
+        let actions = [bind("t1", LIVE, BindOrigin::Authoritative)];
+        let lookup = |t: &str| (t == "t1").then_some(row);
+
+        let first = apply_reconcile_tick_with(&reg, &actions, &rows, lookup);
+        assert_eq!(first, vec![("t1".to_string(), RekeyOutcome::Queued)]);
+        let queued = rekeys_for(&outbox, row);
+        assert_eq!(queued.len(), 1, "{queued:?}");
+        assert_eq!(queued[0].payload["claude_code_session_id"], json!(VALID));
+        apply_reconcile_tick_with(&reg, &actions, &rows, lookup);
+        assert_eq!(rekeys_for(&outbox, row).len(), 1, "no flapping on the next tick");
+        assert_eq!(reg.coord_sync().rekeys().counts(RekeySource::Rung2).queued, 0);
+    }
+
+    /// Rung 2 stays the fallback when the anchor has no valid row (a stale or
+    /// unknown verdict), and a pane with no coord row is not re-keyed.
+    #[test]
+    fn rung2_applies_without_a_valid_row_and_a_rowless_pane_is_skipped() {
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = tempfile::tempdir().unwrap();
+        let (reg, outbox) = registry(dir.path());
+        let row = reg
+            .register_external_with_lineage(intent(), None, Some(PIN.into()))
+            .unwrap();
+        let stale = ProviderRows::from_pairs([(
+            "t1".to_string(),
+            crate::session::claude_activity::ProviderRowValidity::Stale,
+        )]);
+        let out = apply_reconcile_tick_with(
+            &reg,
+            &[bind("t1", LIVE, BindOrigin::Authoritative)],
+            &stale,
+            |t| (t == "t1").then_some(row),
+        );
+        assert_eq!(out, vec![("t1".to_string(), RekeyOutcome::Queued)]);
+        assert_eq!(
+            rekeys_for(&outbox, row)[0].payload["claude_code_session_id"],
+            json!(LIVE)
+        );
+
+        let two = dir.path().join("two");
+        std::fs::create_dir_all(&two).unwrap();
+        let (reg2, outbox2) = registry(&two);
+        let none = apply_reconcile_tick_with(&reg2, &[], &valid_rows("t9", VALID), |_| None);
+        assert!(none.is_empty(), "{none:?}");
+        assert!(outbox2.pending().unwrap().is_empty());
     }
 
     /// A terminal with a valid provider row is not re-keyed from rung 2
