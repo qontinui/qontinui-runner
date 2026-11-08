@@ -2145,10 +2145,12 @@ fn spawn_run_task(payload: LaunchPayload) {
         // the run ends — a headless run holds it throughout, a terminal run
         // trades it for its page reservation (`run_agent_terminal`). Reported as
         // the same re-offerable `deferred_load:` deferral.
-        let kind_slot = match admit_spawn_kind(
+        let kind_slot = match admit_spawn_kind_blocking(
             spawn_kind(payload.session_name.as_deref(), &payload.initial_prompt),
-            &format!("coord spawn-request agent_id={agent_id}"),
-        ) {
+            format!("coord spawn-request agent_id={agent_id}"),
+        )
+        .await
+        {
             Ok(slot) => slot,
             Err(at) => {
                 drop(stop_registration);
@@ -4190,9 +4192,12 @@ fn admit_launch(
 // Phase 3)
 // =============================================================================
 
-/// The per-page loads a kind cap counts — `terminal::page_placement`'s
-/// restore-aware loads, from the live `TerminalManager`. Empty with no Tauri
-/// runtime (a unit test, a headless-only context), where no page exists.
+/// The per-page loads a kind cap counts —
+/// [`crate::terminal::page_placement::running_page_loads`]: terminals whose
+/// process is still running plus the rows a boot restore is about to bring
+/// back, but NOT an exited or never-started pane left open as a tab. Empty with
+/// no Tauri runtime (a unit test, a headless-only context), where no page
+/// exists.
 fn live_spawn_page_loads() -> Vec<(String, usize)> {
     use std::sync::Arc;
     let Some(app) = crate::tauri_app_handle::current() else {
@@ -4201,7 +4206,7 @@ fn live_spawn_page_loads() -> Vec<(String, usize)> {
     let Some(tm) = tauri::Manager::try_state::<Arc<crate::terminal::TerminalManager>>(&app) else {
         return Vec::new();
     };
-    crate::terminal::page_placement::page_loads(
+    crate::terminal::page_placement::running_page_loads(
         &tm,
         crate::terminal::page_placement::lifecycle_store(&app).as_deref(),
     )
@@ -4243,6 +4248,28 @@ fn admit_spawn_kind(
     })
 }
 
+/// [`admit_spawn_kind`] off the async worker: the count reads the terminal list
+/// and the lifecycle store under the process-wide reservation lock, so it runs
+/// on the blocking pool like every other store read here. A blocking-pool
+/// failure (a panic in the read) admits uncapped rather than dropping the
+/// spawn — the load lanes have already admitted it, and a cap that cannot be
+/// read is not evidence the kind is full.
+async fn admit_spawn_kind_blocking(
+    group: crate::terminal::spawn_pages::SpawnGroup,
+    what: String,
+) -> Result<crate::terminal::spawn_pages::KindSlot, crate::terminal::spawn_pages::AtCap> {
+    match spawn_blocking_tracked(move || admit_spawn_kind(group, &what)).await {
+        Ok(verdict) => verdict,
+        Err(e) => {
+            warn!(
+                "agent_runtime: kind-cap admission read for group={} failed ({e});                  admitting uncapped",
+                group.page_prefix()
+            );
+            crate::terminal::spawn_pages::try_reserve(group, None, Vec::new)
+        }
+    }
+}
+
 /// The `spawn-failed` reason for a launch refused at its kind cap:
 /// `deferred_load:spawn_kind_cap:<group>`. The `deferred_load:` prefix is what
 /// has coord re-offer it (see [`DEFERRED_LOAD_REASON_PREFIX`]).
@@ -4262,7 +4289,8 @@ fn spawn_kind_cap_stamp_reason(group: crate::terminal::spawn_pages::SpawnGroup) 
 }
 
 /// `GET /spawn-caps`: each kind's live count and effective cap (`null` =
-/// unlimited), counted exactly as an admission counts it.
+/// unlimited), counted exactly as an admission counts it, plus the raw
+/// `spawn_caps` overrides and any of their keys that cap nothing.
 pub(crate) fn spawn_caps_json() -> serde_json::Value {
     let overrides = crate::settings::get_spawn_caps();
     let groups: Vec<serde_json::Value> =
@@ -4277,7 +4305,21 @@ pub(crate) fn spawn_caps_json() -> serde_json::Value {
                 })
             })
             .collect();
-    serde_json::json!({ "groups": groups, "overrides": overrides })
+    // Override keys that cap nothing: a misspelt kind, or `stewards` (never
+    // capped). Listed so a typo is visible rather than silently ignored.
+    let mut ignored: Vec<&String> = overrides
+        .keys()
+        .filter(|k| {
+            !crate::terminal::spawn_pages::SpawnGroup::ALL
+                .iter()
+                .any(|g| {
+                    g.page_prefix() == k.as_str()
+                        && *g != crate::terminal::spawn_pages::SpawnGroup::Steward
+                })
+        })
+        .collect();
+    ignored.sort();
+    serde_json::json!({ "groups": groups, "overrides": overrides, "ignoredOverrides": ignored })
 }
 
 /// [`evaluate_continuation_guard`] with the load reading taken LIVE through
@@ -7021,10 +7063,12 @@ async fn run_gate_continuation_inner(
     // the anchor back. The slot counts the session against its kind until it
     // ends: the terminal arm trades it for its page reservation, the headless
     // arm holds it until the child exits.
-    let kind_slot = match admit_spawn_kind(
+    let kind_slot = match admit_spawn_kind_blocking(
         spawn_kind(payload.session_name.as_deref(), &payload.initial_prompt),
-        &format!("gate-continuation anchor_key={:?}", payload.anchor_key),
-    ) {
+        format!("gate-continuation anchor_key={:?}", payload.anchor_key),
+    )
+    .await
+    {
         Ok(slot) => slot,
         Err(at) => {
             defer_continuation_unclaimed(
@@ -18387,7 +18431,7 @@ mod tests",
         };
         let launch = body_of("fn spawn_run_task(");
         let admit = launch
-            .find("admit_spawn_kind(")
+            .find("admit_spawn_kind_blocking(")
             .expect("launch admits its kind");
         let run = launch.find("run_agent_subprocess(").expect("the run");
         assert!(
@@ -18398,7 +18442,7 @@ mod tests",
 
         let cont = body_of("async fn run_gate_continuation_inner(");
         let admit = cont
-            .find("admit_spawn_kind(")
+            .find("admit_spawn_kind_blocking(")
             .expect("continuation admits its kind");
         let claim = cont.find("// Step 2").expect("the coord claim step");
         assert!(admit < claim, "the cap precedes the coord claim");

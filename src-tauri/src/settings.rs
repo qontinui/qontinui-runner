@@ -3371,6 +3371,44 @@ pub(crate) const SHIPPED_CRITICAL_THREAD_CEILING: usize = 400;
 /// [`SessionGuardSettings::warn_thread_count`]'s load migration: a stored
 /// value equal to the old default ([`SHIPPED_WARN_THREAD_CEILING`]) was never
 /// distinguishable from "unset" and reads as `None`; anything else is kept.
+/// [`Settings::spawn_caps`]'s lenient reader: keeps each entry whose value is
+/// a non-negative integer and drops (with a warning) every other entry, and a
+/// non-object value entirely, instead of failing the whole `Settings` parse.
+fn deserialize_spawn_caps<'de, D>(
+    deserializer: D,
+) -> Result<std::collections::HashMap<String, usize>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(spawn_caps_from_value(&serde_json::Value::deserialize(
+        deserializer,
+    )?))
+}
+
+/// Pure core of [`deserialize_spawn_caps`].
+fn spawn_caps_from_value(raw: &serde_json::Value) -> std::collections::HashMap<String, usize> {
+    let Some(entries) = raw.as_object() else {
+        if !raw.is_null() {
+            warn!("settings: spawn_caps is not an object ({raw}); ignored, default caps apply");
+        }
+        return std::collections::HashMap::new();
+    };
+    entries
+        .iter()
+        .filter_map(|(kind, value)| {
+            match value.as_u64().and_then(|n| usize::try_from(n).ok()) {
+                Some(n) => Some((kind.clone(), n)),
+                None => {
+                    warn!(
+                        "settings: spawn_caps.{kind} = {value} is not a non-negative integer;                          ignored, that kind keeps its default cap"
+                    );
+                    None
+                }
+            }
+        })
+        .collect()
+}
+
 fn deserialize_warn_thread_ceiling<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -3925,7 +3963,16 @@ pub struct Settings {
     /// 9), `0` makes that kind unlimited, and `stewards` is never capped. Read
     /// on every admission through [`get_spawn_caps`], so a change is live with
     /// no runner restart. A missing key loads as an empty map.
-    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    ///
+    /// Read LENIENTLY ([`deserialize_spawn_caps`]): there is no write route,
+    /// so this is hand-edited, and one bad value must not make the whole
+    /// `settings.json` unreadable. An entry that is not a non-negative integer
+    /// is dropped with a warning (its kind keeps the default).
+    #[serde(
+        default,
+        skip_serializing_if = "std::collections::HashMap::is_empty",
+        deserialize_with = "deserialize_spawn_caps"
+    )]
     pub spawn_caps: std::collections::HashMap<String, usize>,
     /// Ask the cloud memory endpoint (`POST /api/v1/memory/query`) for the
     /// link-expansion retrieval arm — the third RRF arm that one-hop-expands
@@ -7705,5 +7752,27 @@ mod load_persist_tests {
             "no env-supplied web-integration value may appear anywhere in the \
              file: {text}"
         );
+    }
+}
+
+#[cfg(test)]
+mod spawn_caps_tests {
+    use super::*;
+
+    /// One hand-edited bad value drops that entry only; the rest of
+    /// `settings.json` still loads, and a missing key is an empty map.
+    #[test]
+    fn spawn_caps_reads_leniently_and_never_fails_the_whole_file() {
+        let s: Settings = serde_json::from_str(
+            r#"{"spawn_caps": {"fixer": 3, "pr": 0, "impl": -1, "resume": "6", "checks": null}}"#,
+        )
+        .expect("a bad spawn_caps entry must not fail the Settings parse");
+        let mut got: Vec<(String, usize)> = s.spawn_caps.into_iter().collect();
+        got.sort();
+        assert_eq!(got, vec![("fixer".to_string(), 3), ("pr".to_string(), 0)]);
+
+        let s: Settings = serde_json::from_str(r#"{"spawn_caps": 5}"#).expect("non-object");
+        assert!(s.spawn_caps.is_empty());
+        assert!(Settings::default().spawn_caps.is_empty());
     }
 }

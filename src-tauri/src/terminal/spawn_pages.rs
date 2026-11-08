@@ -346,6 +346,14 @@ where
 
 /// The default live cap for each group, before the operator's `spawn_caps`
 /// overrides. `None` = unlimited.
+///
+/// What is ADMITTED against a cap: coord launches (`LaunchPayload`, both arms)
+/// and gate continuations — the spawns that have a re-offerable deferral door.
+/// Condition checks (`ConditionCheckPayload`) and the runner's own steward /
+/// looping-agent spawns are placed uncapped: a condition check has no deferral
+/// door (only a run-failed report), so it is not refused here. Its tab still
+/// COUNTS toward the `checks` cap while it runs, so `checks` bounds the
+/// launches and continuations classified `check-…`, not condition checks.
 pub(crate) fn default_spawn_cap(group: SpawnGroup) -> Option<usize> {
     match group {
         SpawnGroup::Fixer => Some(6),
@@ -394,8 +402,14 @@ pub(crate) struct AtCap {
 /// headless gate continuation) holds its slot for its whole life, so a headless
 /// fixer counts against the fixer cap exactly as a fixer tab does. A terminal
 /// run trades its slot for a page reservation with [`KindSlot::place`] — the
-/// two are swapped under one lock, so the session is counted continuously and
-/// never twice. Dropping the slot releases it.
+/// two are swapped under one lock, so the session is counted continuously.
+/// Dropping the slot releases it.
+///
+/// Two edges, both accepted: between a terminal's create and its placement's
+/// release the session is counted twice (as a running terminal and as a
+/// reservation), so a concurrent admission in that instant can be refused one
+/// early — the safe direction; and a tab the operator drags off its kind's
+/// pages stops counting, because the count is per page (`<prefix>-<n>`).
 #[derive(Debug)]
 pub(crate) struct KindSlot {
     group: SpawnGroup,

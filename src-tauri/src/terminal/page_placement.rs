@@ -198,10 +198,25 @@ fn page_loads_under(
     store: Option<&SessionLifecycleStore>,
     view: RestoreView,
 ) -> Vec<(String, usize)> {
+    loads_under(tm, store, view, false)
+}
+
+/// [`page_loads_under`], optionally counting only terminals whose process is
+/// still running (see [`running_page_loads`]).
+fn loads_under(
+    tm: &TerminalManager,
+    store: Option<&SessionLifecycleStore>,
+    view: RestoreView,
+    running_only: bool,
+) -> Vec<(String, usize)> {
     let restorable = store
         .map(|s| s.restorable_records(view.prior_marker_at, view.boot_was_clean))
         .unwrap_or_default();
-    loads_from(&tm.list(), &awaiting_restore(restorable, view))
+    let mut listed = tm.list();
+    if running_only {
+        listed.retain(|t| t.is_alive);
+    }
+    loads_from(&listed, &awaiting_restore(restorable, view))
 }
 
 /// The restorable rows a restore in THIS process may still bring back: the
@@ -223,6 +238,22 @@ pub(crate) fn page_loads(
     store: Option<&SessionLifecycleStore>,
 ) -> Vec<(String, usize)> {
     page_loads_under(tm, store, RestoreView::current())
+}
+
+/// [`page_loads`] counting only terminals whose process is still RUNNING, plus
+/// the same rows awaiting restore — the load a per-kind live cap counts
+/// (`spawn_pages::try_reserve`).
+///
+/// A page's TAB count ([`page_loads`]) keeps an exited pane until the operator
+/// closes it, and a never-started pane is left open on purpose as evidence;
+/// that is right for page capacity, which is about tabs. A cap on how many
+/// sessions of a kind RUN at once must not count them, or a handful of dead
+/// panes would hold the kind at its cap with nothing running.
+pub(crate) fn running_page_loads(
+    tm: &TerminalManager,
+    store: Option<&SessionLifecycleStore>,
+) -> Vec<(String, usize)> {
+    loads_under(tm, store, RestoreView::current(), true)
 }
 
 /// The loads an unpaged placement chooses among: every page but the typed
@@ -407,6 +438,28 @@ mod tests {
             "every fixture row must be restorable"
         );
         (dir, store)
+    }
+
+    /// A kind cap counts running terminals only: an exited (or never-started)
+    /// pane still holds its page's TAB slot, but not a running-session slot.
+    #[test]
+    fn running_loads_skip_exited_panes_and_keep_rows_awaiting_restore() {
+        let tm = TerminalManager::new();
+        let running = Arc::new(crate::terminal::session::tests::make_test_session_with_id(
+            "t-running",
+        ));
+        running.set_page("fixer-1".to_string());
+        running.set_alive_for_test(true);
+        tm.insert_for_test("t-running", running.clone());
+        live(&tm, "t-exited", "fixer-1");
+        let (_dir, store) = store_with(rows_on("fixer-2", 2));
+
+        let tabs = page_loads_under(&tm, Some(&store), VIEW);
+        let running_loads = loads_under(&tm, Some(&store), VIEW, true);
+        // Back to dead before the fixture drops (see `set_alive_for_test`).
+        running.set_alive_for_test(false);
+        assert_eq!(tabs, vec![page("fixer-1", 2), page("fixer-2", 2)]);
+        assert_eq!(running_loads, vec![page("fixer-1", 1), page("fixer-2", 2)]);
     }
 
     /// The incident: 58 rows awaiting restore on `default`, 0 live. A live-only
