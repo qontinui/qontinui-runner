@@ -2489,14 +2489,18 @@ async fn health(
         // accepted, and `lastFailure {kind, status, at}` — `kind` one of
         // server_error / rate_limited / unauthorized / rejected / not_found /
         // conflict / http_error / network / timeout. `retryingSessions` are
-        // on their own backoff; `quarantinedSessions` had their rows moved to
-        // the `<outbox>.quarantine.jsonl` sidecar after failing while coord
-        // served everything else. Three counters (process lifetime, `null`
-        // before the first tick) split the heartbeat rows the drain dropped
-        // without coord taking them, by cause: `heartbeatsSuperseded` (a newer
-        // pending heartbeat of the session replaces them), `heartbeatsMuted`
-        // (the session is quarantined and its `started`/`closed` row went to
-        // the sidecar, so none of its heartbeats will be sent), and
+        // on their own backoff; `quarantinedSessions` kept failing while coord
+        // served everything else, so their non-lifecycle, non-heartbeat rows
+        // were moved to the `<outbox>.quarantine.jsonl` sidecar — their
+        // `started`/`state_change`/`closed`/`finished` rows are never
+        // sidecarred, they stay pending and retry at the maximum backoff.
+        // `quarantineRotations` counts the times that sidecar reached its cap
+        // and was rotated to `<outbox>.quarantine.1.jsonl` (replacing the
+        // previous rotated generation) instead of dropping rows. Two counters
+        // (process lifetime, `null` before the first tick) split the heartbeat
+        // rows the drain dropped without coord taking them, by cause:
+        // `heartbeatsSuperseded` (a newer pending heartbeat of the session
+        // replaces them) and
         // `heartbeatsDroppedOnFailure` (the push failed: no answer, a 5xx, a
         // 4xx other than 409, or another non-2xx answer), with
         // `heartbeatsDroppedOnFailureByKind` mapping each `lastFailure` kind
