@@ -28,13 +28,23 @@ const tabs = [
 
 function mount(ledger: RecordedZoneLedger) {
   harness.reset();
-  let props: { workMode: TerminalWorkMode; assignments: ZoneAssignments } = {
+  let props: {
+    workMode: TerminalWorkMode;
+    assignments: ZoneAssignments;
+    restoreComplete?: boolean;
+  } = {
     workMode: "grid",
     assignments: {},
   };
   function Host() {
     harness.beginRender();
-    useRecordedZoneBackstop({ ...props, tabs, pageId: "p", recordedZones: ledger });
+    useRecordedZoneBackstop({
+      restoreComplete: true,
+      ...props,
+      tabs,
+      pageId: "p",
+      recordedZones: ledger,
+    });
   }
   return (next: typeof props) => {
     props = next;
@@ -139,5 +149,29 @@ describe("useRecordedZoneBackstop", () => {
       ["sess-b", 3],
     ]);
     expect(recorded()).toEqual([]);
+  });
+
+  it("before the page's restore finishes, a first-seen session is neither synced nor seeded", () => {
+    // A webview reload: reconnected tabs sit in localStorage / auto-fill zones
+    // while the durable record is still what restore reads.
+    const ledger: RecordedZoneLedger = new Map();
+    const render = mount(ledger);
+    render({ workMode: "grid", assignments: { 1: "a", 2: "b" }, restoreComplete: false });
+    expect(invoke).not.toHaveBeenCalled();
+    expect(ledger.size).toBe(0);
+    // Restore done: the same sessions are first-seen now, at their live zones.
+    render({ workMode: "grid", assignments: { 0: "a", 2: "b" }, restoreComplete: true });
+    expect(synced()).toEqual([
+      ["sess-a", 0],
+      ["sess-b", 2],
+    ]);
+  });
+
+  it("before the page's restore finishes, a session this page wrote still follows its zone", () => {
+    const ledger: RecordedZoneLedger = new Map([["sess-a", 0]]);
+    mount(ledger)({ workMode: "grid", assignments: { 3: "a", 1: "b" }, restoreComplete: false });
+    expect(recorded()).toEqual([["sess-a", 3]]);
+    expect(synced()).toEqual([]);
+    expect(ledger.has("sess-b")).toBe(false);
   });
 });

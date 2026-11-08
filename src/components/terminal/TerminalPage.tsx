@@ -893,16 +893,6 @@ function TerminalPageInner({
   // The registry record was already written backend-side — this is UI-only.
   useSessionBoundEvents({ tabs, updateTab });
 
-  // Zone re-resolution backstop (`useRecordedZoneBackstop`): keeps each
-  // session's durable recorded zone in step with its zone in the grid, and
-  // stands down in tmux work mode, whose one viewport is not a grid.
-  useRecordedZoneBackstop({
-    workMode: zoneLayout.workMode,
-    assignments: zoneLayout.assignments,
-    tabs,
-    pageId,
-    recordedZones,
-  });
   const {
     labelsAndTags,
     eventHistory,
@@ -1069,6 +1059,19 @@ function TerminalPageInner({
         focusedZone: zoneLayout.gridView.focusedZone,
       },
     });
+
+  // Zone re-resolution backstop (`useRecordedZoneBackstop`): keeps each
+  // session's durable recorded zone in step with its zone in the grid, and
+  // stands down in tmux work mode, whose one viewport is not a grid. It waits
+  // for this page's restore before syncing a session it never wrote.
+  useRecordedZoneBackstop({
+    workMode: zoneLayout.workMode,
+    assignments: zoneLayout.assignments,
+    tabs,
+    pageId,
+    recordedZones,
+    restoreComplete: restoreCompletePages.has(pageId),
+  });
 
   // Operator-clickable retry for a restored tab whose resume verification
   // failed (Phase 3, #548): re-run the same type-and-verify path. The durable
