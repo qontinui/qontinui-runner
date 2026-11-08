@@ -18475,6 +18475,13 @@ mod tests",
                 place < release,
                 "{f}: held across placement, released on start"
             );
+            let started = body
+                .find("ContinuationStart::Started")
+                .expect("the start verdict arm");
+            assert!(
+                started < release,
+                "{f}: released in the Started arm, never on a never-started retry"
+            );
         }
     }
 
