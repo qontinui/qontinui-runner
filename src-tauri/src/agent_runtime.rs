@@ -158,6 +158,64 @@ pub struct LaunchPayload {
     /// is indistinguishable from one honoured.
     #[serde(default)]
     pub account: Option<String>,
+    /// How this launch is surfaced (plan
+    /// `2026-11-08-coord-fixers-open-terminal-tabs-and-spawn-kinds-are-capped`
+    /// Phase 1): `terminal` opens a visible tab on the launch's typed page
+    /// ([`run_agent_terminal`]), `headless` runs today's tokio child.
+    ///
+    /// An ABSENT key means [`Presentation::Headless`] — the reverse of
+    /// [`GateContinuationPayload::presentation`], whose derived default is
+    /// `Terminal`. Every coord that predates the key sends none and gets
+    /// exactly today's behaviour, so the default comes from its own fn
+    /// ([`default_launch_presentation`]), never from `#[derive(Default)]`.
+    ///
+    /// Read leniently ([`deserialize_launch_presentation`]): a `null` or a value
+    /// this runner does not know is `Headless` with a warning, never a frame
+    /// parse failure that would drop the whole launch.
+    #[serde(
+        default = "default_launch_presentation",
+        deserialize_with = "deserialize_launch_presentation"
+    )]
+    pub presentation: Presentation,
+    /// Coord's intent-derived display name for this launch (`fix-runner#1863`,
+    /// `red-main-coord`, …; coord's `spawn_name` grammar). On the terminal arm
+    /// it becomes `claude --name`, the tab title, the commit `Session-Name`
+    /// trailer and the input [`crate::terminal::spawn_pages::SpawnGroup::classify`]
+    /// places the tab by. Unread on the headless arm. Absent on a coord that
+    /// predates it.
+    #[serde(default)]
+    pub session_name: Option<String>,
+}
+
+/// [`LaunchPayload::presentation`]'s default: a launch frame that names no
+/// presentation runs headless, as every launch did before the key existed.
+fn default_launch_presentation() -> Presentation {
+    Presentation::Headless
+}
+
+/// [`LaunchPayload::presentation`]'s reader. Only `"terminal"` opens a tab;
+/// `"headless"`, `null` and any value a newer coord might send run headless.
+/// A strict enum here would fail the WHOLE frame on an unknown value, and a
+/// launch frame that does not parse is dropped with no lifecycle post, leaving
+/// coord's row `spawning` and re-dispatched on every reconnect.
+fn deserialize_launch_presentation<'de, D>(d: D) -> Result<Presentation, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(d)?;
+    Ok(match value.as_str() {
+        Some("terminal") => Presentation::Terminal,
+        Some("headless") => Presentation::Headless,
+        _ => {
+            if !value.is_null() {
+                warn!(
+                    "agent_runtime: launch frame names an unknown presentation {value}; \
+                     running it headless"
+                );
+            }
+            Presentation::Headless
+        }
+    })
 }
 
 impl LaunchPayload {
@@ -9977,7 +10035,11 @@ async fn run_agent_subprocess(
 
     // Step 2: heartbeat task — runs for the agent's whole life.
     let hb_payload = payload.clone();
-    let hb_task = tokio::spawn(async move { run_heartbeat_loop(hb_payload).await });
+    // Aborted on drop as well as explicitly, so a panic in either arm cannot
+    // leave a detached heartbeat renewing the claim of a run that is gone.
+    let hb_task = AbortOnDrop(tokio::spawn(
+        async move { run_heartbeat_loop(hb_payload).await },
+    ));
 
     // Step 3: subprocess + restart loop.
     let mut restarts = 0u32;
@@ -10004,6 +10066,40 @@ async fn run_agent_subprocess(
     // the override is passed to every (re)spawn below.
     if pinned_config_dir.is_none() {
         let _ = spawn_blocking_tracked(crate::ai_provider::pick_best_account).await;
+    }
+
+    // The presentation branch (plan
+    // `2026-11-08-coord-fixers-open-terminal-tabs-and-spawn-kinds-are-capped`
+    // Phase 1). Everything above is shared; only the spawn differs. A
+    // `terminal` launch runs as a visible tab and returns when the tab ends,
+    // with no restart loop (see `run_agent_terminal`).
+    let terminal_host = match payload.presentation {
+        Presentation::Terminal => agent_terminal_host(),
+        Presentation::Headless => None,
+    };
+    match (
+        agent_launch_arm(payload.presentation, terminal_host.is_some()),
+        terminal_host,
+    ) {
+        (AgentLaunchArm::Terminal, Some(host)) => {
+            run_agent_terminal(
+                host,
+                &payload,
+                &primary_wt,
+                pinned_config_dir.as_deref(),
+                coord_mcp,
+                &stop,
+                primary_push_ref.as_deref(),
+            )
+            .await;
+            hb_task.0.abort();
+            return Ok(());
+        }
+        _ if payload.presentation == Presentation::Terminal => warn!(
+            "agent_runtime: agent_id={agent_id} asked for a terminal but this runner has no \
+             terminal host (no Tauri runtime / TerminalManager); running it headless"
+        ),
+        _ => {}
     }
 
     loop {
@@ -10147,7 +10243,7 @@ async fn run_agent_subprocess(
         tokio::time::sleep(Duration::from_secs(2u64.pow(restarts.min(3)))).await;
     }
 
-    hb_task.abort();
+    hb_task.0.abort();
 
     if final_exit_code == Some(0) {
         // Clean exit was already reported via spawn-complete; nothing
@@ -10168,6 +10264,619 @@ async fn run_agent_subprocess(
     )
     .await;
     Ok(())
+}
+
+// =============================================================================
+// Terminal arm for coord launches (plan
+// `2026-11-08-coord-fixers-open-terminal-tabs-and-spawn-kinds-are-capped`,
+// Phase 1)
+// =============================================================================
+
+/// A task handle aborted when dropped — on every exit route, a panic included.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Which arm a coord launch runs on, once every shared setup step is done.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentLaunchArm {
+    /// A visible tab on the launch's typed page ([`run_agent_terminal`]).
+    Terminal,
+    /// Today's tokio child and its restart loop.
+    Headless,
+}
+
+/// Route a launch. A `terminal` frame opens a tab only when this runner has a
+/// terminal host (a Tauri runtime with a `TerminalManager`); without one it
+/// runs headless rather than failing, because `presentation` asks how the work
+/// is SHOWN — a runner that cannot show it can still do it. A `headless` frame
+/// (and every frame from a coord that sends no key) runs headless.
+fn agent_launch_arm(presentation: Presentation, terminal_host_available: bool) -> AgentLaunchArm {
+    match presentation {
+        Presentation::Terminal if terminal_host_available => AgentLaunchArm::Terminal,
+        _ => AgentLaunchArm::Headless,
+    }
+}
+
+/// The managed Tauri state a terminal launch spawns through, reached from this
+/// backend task via the process-global AppHandle (the same door
+/// [`run_continuation_terminal`] uses).
+struct AgentTerminalHost {
+    app: tauri::AppHandle,
+    terminal_manager: Arc<crate::terminal::TerminalManager>,
+    session_registry: Arc<crate::session::SessionRegistry>,
+}
+
+/// The terminal host, or `None` when this runner has no webview runtime or the
+/// state is not managed yet.
+fn agent_terminal_host() -> Option<AgentTerminalHost> {
+    use tauri::Manager;
+    let app = crate::tauri_app_handle::current()?;
+    let terminal_manager = app
+        .try_state::<Arc<crate::terminal::TerminalManager>>()?
+        .inner()
+        .clone();
+    let session_registry = app
+        .try_state::<Arc<crate::session::SessionRegistry>>()?
+        .inner()
+        .clone();
+    Some(AgentTerminalHost {
+        app,
+        terminal_manager,
+        session_registry,
+    })
+}
+
+/// One live agent terminal in [`agent_terminals`].
+struct AgentTerminalEntry {
+    agent_id: uuid::Uuid,
+    /// Fired once by [`notify_agent_terminal_exit`] from the pane's on-exit hook.
+    exited: Option<tokio::sync::oneshot::Sender<crate::terminal::session::PaneExitFacts>>,
+}
+
+/// Live coord-launch terminals, `terminal_id → (agent_id, exit signal)`. An
+/// entry lives exactly as long as its [`AgentTerminalRegistration`], which
+/// [`run_agent_terminal`] holds until the tab ends, so the map names every
+/// agent running in a tab and nothing that has finished.
+#[allow(clippy::type_complexity)]
+fn agent_terminals(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, AgentTerminalEntry>> {
+    static AGENT_TERMINALS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, AgentTerminalEntry>>,
+    > = std::sync::OnceLock::new();
+    AGENT_TERMINALS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// A terminal's registration in [`agent_terminals`]; dropping it removes the
+/// entry, on every exit from the run task, a panic included.
+struct AgentTerminalRegistration {
+    terminal_id: String,
+    exited: tokio::sync::oneshot::Receiver<crate::terminal::session::PaneExitFacts>,
+}
+
+impl Drop for AgentTerminalRegistration {
+    fn drop(&mut self) {
+        lock_recover(agent_terminals(), "agent_terminals").remove(&self.terminal_id);
+    }
+}
+
+/// Register `terminal_id` as `agent_id`'s tab and arm its exit signal.
+fn register_agent_terminal(agent_id: uuid::Uuid, terminal_id: &str) -> AgentTerminalRegistration {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    lock_recover(agent_terminals(), "agent_terminals").insert(
+        terminal_id.to_string(),
+        AgentTerminalEntry {
+            agent_id,
+            exited: Some(tx),
+        },
+    );
+    AgentTerminalRegistration {
+        terminal_id: terminal_id.to_string(),
+        exited: rx,
+    }
+}
+
+/// The terminal a live coord launch runs in, if it runs in one.
+#[cfg(test)]
+fn agent_terminal_of(agent_id: uuid::Uuid) -> Option<String> {
+    lock_recover(agent_terminals(), "agent_terminals")
+        .iter()
+        .find(|(_, e)| e.agent_id == agent_id)
+        .map(|(id, _)| id.clone())
+}
+
+/// Called from a backend-created pane's on-exit hook
+/// (`commands::terminal::create_terminal_session_backend`): wakes the
+/// [`run_agent_terminal`] waiting on that pane. A no-op for every pane that is
+/// not a coord launch's. The hook is installed only when the pane's coord
+/// registration succeeded, and a pane can exit before it is registered here, so
+/// [`await_agent_terminal_end`] also polls liveness; this signal only makes the
+/// common case prompt.
+pub(crate) fn notify_agent_terminal_exit(
+    terminal_id: &str,
+    exit: crate::terminal::session::PaneExitFacts,
+) {
+    let sender = lock_recover(agent_terminals(), "agent_terminals")
+        .get_mut(terminal_id)
+        .and_then(|e| e.exited.take());
+    if let Some(tx) = sender {
+        let _ = tx.send(exit);
+    }
+}
+
+/// How often [`await_agent_terminal_end`] re-reads the pane's liveness — the
+/// backstop for an exit the on-exit hook could not signal.
+const AGENT_TERMINAL_LIVENESS_POLL: Duration = Duration::from_secs(5);
+
+/// The reason a stop reports, matching the headless arm's word for word.
+const AGENT_STOPPED_REASON: &str = "stopped by operator (events.agent.stop_requested)";
+
+/// How a STARTED agent terminal's life ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentTerminalEnd {
+    /// Coord's `stop_requested` cancelled the agent's stop token.
+    Stopped,
+    /// The PTY exited; `None` when no exit facts were recorded.
+    Exited(Option<crate::terminal::session::PaneExitFacts>),
+    /// The manager no longer holds the pane (closed by the operator or any
+    /// other close door) before an exit was observed here.
+    PaneGone,
+}
+
+/// The end a pane's current state already shows, or `None` while it runs.
+fn agent_terminal_end_of(
+    terminal_manager: &crate::terminal::TerminalManager,
+    terminal_id: &str,
+) -> Option<AgentTerminalEnd> {
+    match terminal_manager.get(terminal_id) {
+        None => Some(AgentTerminalEnd::PaneGone),
+        Some(s) if !s.is_alive() => Some(AgentTerminalEnd::Exited(
+            s.exit_snapshot().map(|(facts, _)| facts),
+        )),
+        Some(_) => None,
+    }
+}
+
+/// Wait until the agent's tab ends: its PTY exits (the on-exit signal, or the
+/// liveness poll), the pane disappears, or coord stops the agent.
+async fn await_agent_terminal_end(
+    terminal_manager: &crate::terminal::TerminalManager,
+    registration: &mut AgentTerminalRegistration,
+    stop: &tokio_util::sync::CancellationToken,
+) -> AgentTerminalEnd {
+    loop {
+        if stop.is_cancelled() {
+            return AgentTerminalEnd::Stopped;
+        }
+        // A fired exit signal first: the pane may already be closed and gone,
+        // and its facts (a crash code) live only in the signal then.
+        if let Ok(facts) = registration.exited.try_recv() {
+            return AgentTerminalEnd::Exited(Some(facts));
+        }
+        if let Some(end) = agent_terminal_end_of(terminal_manager, &registration.terminal_id) {
+            return end;
+        }
+        tokio::select! {
+            biased;
+            _ = stop.cancelled() => return AgentTerminalEnd::Stopped,
+            exit = &mut registration.exited => {
+                return match exit {
+                    Ok(facts) => AgentTerminalEnd::Exited(Some(facts)),
+                    // The sender went without a send: read the pane instead.
+                    Err(_) => agent_terminal_end_of(terminal_manager, &registration.terminal_id)
+                        .unwrap_or(AgentTerminalEnd::Exited(None)),
+                };
+            }
+            _ = tokio::time::sleep(AGENT_TERMINAL_LIVENESS_POLL) => {}
+        }
+    }
+}
+
+/// What a started agent terminal's end reports to coord, as `(reason,
+/// exit_code)`; `None` posts nothing.
+///
+/// Unlike the headless arm there is NO restart: the operator can see the tab,
+/// and the session reports its own outcome to coord. So the runner reports only
+/// the two ends the headless arm reports too — coord's stop, and the agent's
+/// own non-zero exit (a crash). A clean exit leaves `spawn-complete` standing,
+/// as a headless clean exit does. A tab the operator or the runner closed
+/// (`close_requested`, or a pane gone) and an exit whose code nobody observed
+/// post nothing: an interactive `claude` does not exit on its own after its
+/// turn, so closing a finished session's tab is the ORDINARY end, and reporting
+/// it as a failure would tell coord that work which may have landed did not.
+fn agent_terminal_end_report(end: AgentTerminalEnd) -> Option<(String, Option<i64>)> {
+    match end {
+        AgentTerminalEnd::Stopped => Some((AGENT_STOPPED_REASON.to_string(), None)),
+        AgentTerminalEnd::Exited(Some(facts)) => match facts.agent_exit_code() {
+            Some(code) if code != 0 => {
+                Some((format!("non-zero exit code {code}"), Some(i64::from(code))))
+            }
+            _ => None,
+        },
+        AgentTerminalEnd::Exited(None) | AgentTerminalEnd::PaneGone => None,
+    }
+}
+
+/// Close an agent's tab on coord's stop with `TerminalManager::close` — a hard
+/// kill, as the headless arm's `child.kill()` on the same stop is (the close
+/// kills the pane's whole process tree, where `child.kill()` reaches `claude`
+/// alone). No graceful stop-by-id exists (no production `CloseAuthority`; the
+/// plan records it out of scope). Run off the async worker: the close joins the
+/// pane's threads synchronously.
+async fn close_agent_terminal_on_stop(
+    terminal_manager: &Arc<crate::terminal::TerminalManager>,
+    terminal_id: &str,
+    agent_id: uuid::Uuid,
+) {
+    info!(
+        "agent_runtime: stop requested for agent_id={agent_id}; closing its terminal \
+         terminal_id={terminal_id} (no restart)"
+    );
+    let terminal_manager = terminal_manager.clone();
+    let id = terminal_id.to_string();
+    match spawn_blocking_tracked(move || terminal_manager.close(&id)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => warn!(
+            "agent_runtime: agent_id={agent_id}: closing terminal {terminal_id} on stop \
+             failed: {e} — its claude may still be running"
+        ),
+        Err(e) => warn!(
+            "agent_runtime: agent_id={agent_id}: close task for terminal {terminal_id} \
+             failed: {e:#}"
+        ),
+    }
+}
+
+/// The re-offerable deferral a PTY create refused by the resource guard's
+/// CRITICAL floor reports, or `None` for any other create error. A launch is
+/// admitted against load in `spawn_run_task` well before the PTY exists, and
+/// load can cross the floor in between; a plain `spawn-failed` would latch the
+/// work failed, while a `deferred_load:` reason has coord re-offer it.
+fn pty_floor_deferral_reason(create_error: &str) -> Option<String> {
+    let rest = create_error.strip_prefix(crate::resource_guard::CRITICAL_REFUSAL_PREFIX)?;
+    let lane: String = rest
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    let lane = if lane.is_empty() {
+        "unknown".to_string()
+    } else {
+        lane
+    };
+    Some(format!("deferred_load:pty_critical_floor:{lane}"))
+}
+
+/// Run a coord launch as a VISIBLE terminal tab.
+///
+/// Every setup step — account pin, agent credential, worktrees, the agent token
+/// slot and AGENT-proxy `.mcp.json`, provisioning, heartbeat — has already run
+/// in [`run_agent_subprocess`], which calls this where its headless restart
+/// loop would begin and keeps the heartbeat (and, through its caller, the
+/// [`AgentRunTeardown`]) alive until this returns. So the token slot, the
+/// daemons and the heartbeat live exactly as long as the tab.
+///
+/// Differences from the headless arm, each deliberate:
+/// - the prompt is the trailing positional of an INTERACTIVE `claude` (never
+///   `--print`), built by [`build_continuation_claude_command`] with the pinned
+///   `--session-id`, `--name <session_name>`, the briefing in
+///   `--append-system-prompt(-file)` and the operator's permission posture
+///   layered over `--dangerously-skip-permissions` by the launch seam — the
+///   same posture [`headless_agent_args`] renders;
+/// - a session that never STARTS is retried with a fresh id up to
+///   [`CONTINUATION_START_MAX_ATTEMPTS`] (the gate-continuation bound), but a
+///   session that started is NEVER restarted (headless restarts up to
+///   [`MAX_RESTARTS`]): see [`agent_terminal_end_report`];
+/// - coord's stop closes the tab ([`close_agent_terminal_on_stop`]).
+///
+/// It does not steal focus: the tab lands on its typed page (`fixer-<n>` for a
+/// coord fixer) without switching the operator's view to it.
+async fn run_agent_terminal(
+    host: AgentTerminalHost,
+    payload: &LaunchPayload,
+    primary_wt: &str,
+    pinned_config_dir: Option<&str>,
+    coord_mcp: crate::coord_mcp::CoordMcpDelivery,
+    stop: &tokio_util::sync::CancellationToken,
+    primary_push_ref: Option<&str>,
+) {
+    let agent_id = payload.agent_id;
+    let AgentTerminalHost {
+        app,
+        terminal_manager,
+        session_registry,
+    } = host;
+
+    let spawn_name = payload
+        .session_name
+        .as_deref()
+        .and_then(crate::claude_session::launch_spec::sanitize_session_name);
+    let title = spawn_name.clone().unwrap_or_else(|| {
+        let id = agent_id.to_string();
+        format!("coord agent {}", &id[..8])
+    });
+
+    // The account the headless child would run under: the per-spawn pin when
+    // there is one, else the rotation the shared setup just ran. Resolved
+    // explicitly because the PTY takes it as `capture_hint.config_dir`.
+    let ai = crate::settings::get_ai_settings();
+    let (selected_config_dir, _source) = crate::ai_provider::get_effective_config_dir_with_override(
+        &ai.claude_cli,
+        pinned_config_dir,
+    );
+    if selected_config_dir.is_none()
+        && !crate::ai_provider::oauth_refresh::default_location_has_valid_credentials()
+    {
+        let instance = crate::instance::instance_name().unwrap_or_else(|| "primary".to_string());
+        let reason = format!(
+            "no authenticated Claude account on this runner — run /login (instance={instance})"
+        );
+        warn!("agent_runtime: agent_id={agent_id} terminal launch aborted — {reason}");
+        report_spawn_failed(agent_id, &reason, None, 0, primary_push_ref).await;
+        return;
+    }
+    let launch_cfg = crate::claude_session::launch_spec::LaunchConfig::from_settings(
+        selected_config_dir.as_deref(),
+    );
+    let served = crate::served_corpus::probe_async(primary_wt).await;
+    let intent_repo = payload.worktrees.first().map(|w| w.repo.clone());
+    let group = crate::terminal::spawn_pages::SpawnGroup::classify(
+        spawn_name.as_deref(),
+        Some(payload.initial_prompt.as_str()),
+    );
+    // The PTY seam derives workspace trust through the trust gate's sync door,
+    // which reads only the dial cache — warm it from this async context first
+    // (the same step the gate-continuation terminal takes).
+    crate::claude_session::trust_gate::warm_dial().await;
+
+    let mut attempt: u32 = 1;
+    loop {
+        // A stop that landed during setup (or a retry back-off) spawns nothing,
+        // as the headless loop's pre-spawn check does.
+        if stop.is_cancelled() {
+            report_spawn_failed(
+                agent_id,
+                AGENT_STOPPED_REASON,
+                None,
+                attempt.saturating_sub(1),
+                primary_push_ref,
+            )
+            .await;
+            return;
+        }
+        // Fresh per attempt: the CLI refuses a reused id, and a never-started
+        // pane stays visible under its own.
+        let session_id = uuid::Uuid::new_v4();
+        let pinned_session_id = session_id.to_string();
+        let claude_bin = spawn_blocking_tracked(resolve_claude_bin)
+            .await
+            .unwrap_or_else(|_| claude_bin_path());
+        let prompt_carrier = crate::session::spawn_prompt::resolve_system_prompt_carrier(Some(
+            crate::terminal::runner_context(
+                crate::terminal::spawn_seam_api_port(),
+                coord_mcp,
+                &served,
+            ),
+        ));
+        let policy_delivery = prompt_carrier.as_ref().and_then(|c| c.policy_delivery());
+        let argv = build_continuation_claude_command(
+            claude_bin,
+            &pinned_session_id,
+            spawn_name.as_deref(),
+            Vec::new(),
+            payload.initial_prompt.clone(),
+            prompt_carrier,
+            crate::session::claude_hook::direct_spawn_settings_args(),
+            &launch_cfg,
+        );
+        let policy_delivery =
+            crate::session::spawn_prompt::delivery_unless_replacement(policy_delivery, &argv);
+
+        let placement = crate::terminal::spawn_pages::place(group, || {
+            terminal_manager.list().into_iter().map(|info| info.page_id)
+        });
+        let target_page = placement.page_id().to_string();
+        let capture_hint = crate::commands::terminal::SessionCaptureHint {
+            config_dir: selected_config_dir.clone(),
+            working_dir: primary_wt.to_string(),
+            title: title.clone(),
+            spawn_name: spawn_name.clone(),
+            page_id: Some(target_page.clone()),
+            claude_session_id: Some(pinned_session_id.clone()),
+            zone_index: None,
+            inject_agent_git_identity: true,
+            // No gate: a coord launch reports through the agent lifecycle posts.
+            gate_identity: None,
+            coord_lineage: Some(
+                crate::commands::terminal::CoordSessionLineage::for_pinned_session(
+                    &pinned_session_id,
+                ),
+            ),
+            policy_delivery,
+        };
+        let result = crate::commands::terminal::create_tracked_terminal_session_backend(
+            &terminal_manager,
+            &session_registry,
+            app.clone(),
+            title.clone(),
+            primary_wt.to_string(),
+            payload.work_unit_slug().map(str::to_string),
+            payload.correlation_topic.clone(),
+            intent_repo.clone(),
+            Some(argv),
+            // The worktrees were materialized by the shared setup; there is no
+            // isolated-edit context to park on the pane.
+            None,
+            capture_hint,
+            Some(target_page),
+            // UNATTENDED autonomous work: respect the resource floor, exactly as
+            // the gate-continuation terminal does.
+            false,
+        );
+        // Listed by the manager now (or the create failed): stop reserving.
+        placement.release();
+
+        let (terminal_id, coord_session_id) = match result {
+            Ok(created) => created,
+            Err(e) => {
+                if let Some(reason) = pty_floor_deferral_reason(&e) {
+                    info!(
+                        "agent_runtime: agent_id={agent_id} terminal create refused by the \
+                         resource floor; deferring ({reason}): {e}"
+                    );
+                    report_launch_deferral(agent_id, &reason).await;
+                    return;
+                }
+                let (reason, phase) = classify_pty_spawn_error(&e);
+                warn!("agent_runtime: agent_id={agent_id} terminal create failed: {reason}");
+                report_spawn_failed_in_phase(
+                    agent_id,
+                    &reason,
+                    None,
+                    attempt.saturating_sub(1),
+                    primary_push_ref,
+                    phase,
+                )
+                .await;
+                return;
+            }
+        };
+        let mut registration = register_agent_terminal(agent_id, &terminal_id);
+
+        let transcript_paths = continuation_transcript_paths(
+            selected_config_dir.as_deref(),
+            primary_wt,
+            &pinned_session_id,
+        );
+        let started = tokio::select! {
+            biased;
+            _ = stop.cancelled() => None,
+            s = await_continuation_start(&terminal_manager, &terminal_id, &transcript_paths) => Some(s),
+        };
+        let Some(started) = started else {
+            close_agent_terminal_on_stop(&terminal_manager, &terminal_id, agent_id).await;
+            report_spawn_failed(
+                agent_id,
+                AGENT_STOPPED_REASON,
+                None,
+                attempt.saturating_sub(1),
+                primary_push_ref,
+            )
+            .await;
+            return;
+        };
+        match started {
+            ContinuationStart::Closed => {
+                let reason = "agent terminal pane was closed before the session started";
+                warn!("agent_runtime: agent_id={agent_id} terminal_id={terminal_id}: {reason}");
+                report_spawn_failed(
+                    agent_id,
+                    reason,
+                    None,
+                    attempt.saturating_sub(1),
+                    primary_push_ref,
+                )
+                .await;
+                return;
+            }
+            ContinuationStart::NeverStarted(evidence) => {
+                let detail = never_started_detail(&evidence);
+                // A pane that died within ~100 ms can exit before its coord
+                // session id was bound, so its exit hook never closed the row.
+                if let Some(coord_id) = coord_session_id {
+                    if let Err(e) = session_registry.close_by_id(coord_id) {
+                        debug!(
+                            "agent_runtime: never-started agent terminal coord session \
+                             {coord_id} close: {e}"
+                        );
+                    }
+                }
+                drop(registration);
+                if attempt < CONTINUATION_START_MAX_ATTEMPTS {
+                    warn!(
+                        "agent_runtime: agent_id={agent_id} terminal_id={terminal_id} never \
+                         started (attempt {attempt}/{CONTINUATION_START_MAX_ATTEMPTS}): {detail} \
+                         — retrying in {}s",
+                        CONTINUATION_START_RETRY_DELAY.as_secs()
+                    );
+                    // The dead pane is left visible as evidence (its pid is gone,
+                    // so there is nothing to kill).
+                    tokio::select! {
+                        biased;
+                        _ = stop.cancelled() => {
+                            report_spawn_failed(
+                                agent_id,
+                                AGENT_STOPPED_REASON,
+                                None,
+                                attempt.saturating_sub(1),
+                                primary_push_ref,
+                            )
+                            .await;
+                            return;
+                        }
+                        _ = tokio::time::sleep(CONTINUATION_START_RETRY_DELAY) => {}
+                    }
+                    attempt += 1;
+                    continue;
+                }
+                let reason = format!("never started ({attempt} attempts): {detail}");
+                warn!("agent_runtime: agent_id={agent_id} terminal_id={terminal_id} {reason}");
+                report_spawn_failed(
+                    agent_id,
+                    &reason,
+                    evidence.exit_code.map(i64::from),
+                    attempt.saturating_sub(1),
+                    primary_push_ref,
+                )
+                .await;
+                return;
+            }
+            ContinuationStart::Started { .. } => {
+                info!(
+                    "agent_runtime: agent_id={agent_id} terminal session started \
+                     terminal_id={terminal_id} group={} coord_session={coord_session_id:?} \
+                     attempt={attempt}",
+                    group.page_prefix()
+                );
+                // The headless restart-0 posts, in the same order: which session
+                // the dispatch launched (off the spawn path), then spawn-complete.
+                tokio::spawn(report_session_launched(agent_id, session_id));
+                report_spawn_complete(
+                    agent_id,
+                    None,
+                    Some("coord launch (terminal)"),
+                    primary_push_ref,
+                )
+                .await;
+                let end =
+                    await_agent_terminal_end(&terminal_manager, &mut registration, stop).await;
+                if end == AgentTerminalEnd::Stopped {
+                    close_agent_terminal_on_stop(&terminal_manager, &terminal_id, agent_id).await;
+                }
+                info!(
+                    "agent_runtime: agent_id={agent_id} terminal_id={terminal_id} ended: {end:?}"
+                );
+                if let Some((reason, code)) = agent_terminal_end_report(end) {
+                    report_spawn_failed_in_phase(
+                        agent_id,
+                        &reason,
+                        code,
+                        0,
+                        primary_push_ref,
+                        SpawnPhase::Exited,
+                    )
+                    .await;
+                }
+                return;
+            }
+        }
+    }
 }
 
 /// `git worktree add` each allocated worktree from the primary checkout
@@ -13089,6 +13798,8 @@ mod tests {
             plan_phase: Some(4),
             correlation_topic: Some("my-coordination-topic".to_string()),
             account: None,
+            presentation: Presentation::Headless,
+            session_name: None,
         };
         let serialized = serde_json::to_value(serde_json::json!({
             "channel": format!("events.agent.spawn_requested.{}", payload.target_device_id),
@@ -13239,6 +13950,201 @@ mod tests {
         })))
         .unwrap();
         assert_eq!(with.account.as_deref(), Some(".claude-hotmail"));
+    }
+
+    /// Plan `2026-11-08-coord-fixers-open-terminal-tabs-and-spawn-kinds-are-capped`
+    /// Phase 1: an ABSENT `presentation` is HEADLESS (the reverse of the gate
+    /// continuation's derived `Terminal` default), so every coord that predates
+    /// the key keeps today's behaviour; both keys parse when present.
+    #[test]
+    fn launch_payload_presentation_defaults_to_headless() {
+        let without: LaunchPayload =
+            serde_json::from_value(launch_body_with(serde_json::json!({}))).unwrap();
+        assert_eq!(without.presentation, Presentation::Headless);
+        assert_eq!(without.session_name, None);
+
+        let terminal: LaunchPayload = serde_json::from_value(launch_body_with(serde_json::json!({
+            "presentation": "terminal",
+            "session_name": "fix-runner#1863"
+        })))
+        .unwrap();
+        assert_eq!(terminal.presentation, Presentation::Terminal);
+        assert_eq!(terminal.session_name.as_deref(), Some("fix-runner#1863"));
+
+        let headless: LaunchPayload = serde_json::from_value(launch_body_with(
+            serde_json::json!({ "presentation": "headless" }),
+        ))
+        .unwrap();
+        assert_eq!(headless.presentation, Presentation::Headless);
+    }
+
+    /// An unknown or `null` presentation must not fail the frame (a launch
+    /// that does not parse is dropped with no lifecycle post): it runs headless.
+    #[test]
+    fn an_unknown_presentation_runs_headless_instead_of_dropping_the_frame() {
+        for value in [
+            serde_json::json!("popout"),
+            serde_json::Value::Null,
+            serde_json::json!(7),
+        ] {
+            let p: LaunchPayload = serde_json::from_value(launch_body_with(
+                serde_json::json!({ "presentation": value.clone() }),
+            ))
+            .unwrap_or_else(|e| panic!("{value} must parse: {e}"));
+            assert_eq!(p.presentation, Presentation::Headless, "{value}");
+        }
+    }
+
+    #[test]
+    fn a_pty_floor_refusal_defers_the_launch_and_nothing_else_does() {
+        let refusal = format!(
+            "{}commit_pressure: Not starting a new terminal session: low memory.",
+            crate::resource_guard::CRITICAL_REFUSAL_PREFIX
+        );
+        let reason = pty_floor_deferral_reason(&refusal).expect("a floor refusal defers");
+        assert_eq!(reason, "deferred_load:pty_critical_floor:commit_pressure");
+        assert!(!reason.contains(char::is_whitespace), "{reason}");
+        assert_eq!(pty_floor_deferral_reason("spawn_blocked: trust"), None);
+        assert_eq!(pty_floor_deferral_reason("no such file"), None);
+    }
+
+    #[test]
+    fn a_terminal_frame_routes_to_the_terminal_arm() {
+        let frame: LaunchPayload = serde_json::from_value(launch_body_with(
+            serde_json::json!({ "presentation": "terminal" }),
+        ))
+        .unwrap();
+        assert_eq!(
+            agent_launch_arm(frame.presentation, true),
+            AgentLaunchArm::Terminal
+        );
+        // No terminal host (no Tauri runtime): the work still runs, headless.
+        assert_eq!(
+            agent_launch_arm(frame.presentation, false),
+            AgentLaunchArm::Headless
+        );
+        let legacy: LaunchPayload =
+            serde_json::from_value(launch_body_with(serde_json::json!({}))).unwrap();
+        assert_eq!(
+            agent_launch_arm(legacy.presentation, true),
+            AgentLaunchArm::Headless
+        );
+        assert_eq!(
+            agent_launch_arm(Presentation::Headless, true),
+            AgentLaunchArm::Headless
+        );
+    }
+
+    /// The branch sits where the headless restart loop begins: every shared
+    /// setup step precedes it, and the terminal arm provisions no device-JWT
+    /// `.mcp.json` of its own (the shared step wrote the AGENT-proxy one).
+    #[test]
+    fn the_terminal_arm_branches_after_every_shared_setup_step() {
+        let source = include_str!("agent_runtime.rs");
+        let (prod, _) = source
+            .split_once("#[cfg(test)]\nmod tests")
+            .expect("the test module marker");
+        let body_of = |signature: &str| -> &str {
+            let (_, rest) = prod
+                .split_once(signature)
+                .unwrap_or_else(|| panic!("{signature} exists"));
+            rest.split_once("\n}\n").map_or(rest, |(body, _)| body)
+        };
+        let subprocess = body_of("async fn run_agent_subprocess(");
+        let branch = subprocess
+            .find("run_agent_terminal(")
+            .expect("run_agent_subprocess calls run_agent_terminal");
+        for step in [
+            "resolve_spawn_account(",
+            "fetch_agent_credential(",
+            "materialize_worktrees(",
+            "register_agent_token(",
+            "write_coord_mcp_agent_proxy_config(",
+            "provision_agent_definitions_recorded(",
+            "provision_fleet_commands_for_session(",
+            "provision_fleet_skills_for_session(",
+            "run_heartbeat_loop(",
+        ] {
+            let at = subprocess
+                .find(step)
+                .unwrap_or_else(|| panic!("{step} is a shared setup step"));
+            assert!(
+                at < branch,
+                "{step} must run before the presentation branch"
+            );
+        }
+        let restart_loop = subprocess
+            .find("headless_agent_args(")
+            .expect("the headless restart loop");
+        assert!(
+            branch < restart_loop,
+            "the branch precedes the restart loop"
+        );
+
+        let terminal = body_of("async fn run_agent_terminal(");
+        assert!(!terminal.contains("provision_coord_mcp_for_session"));
+        assert!(terminal.contains("spawn_pages::place("));
+        assert!(terminal.contains("placement.release()"));
+        assert!(terminal.contains("inject_agent_git_identity: true"));
+        assert!(terminal.contains("gate_identity: None"));
+        // A stop is honoured before any pane is created.
+        let stop_check = terminal
+            .find("if stop.is_cancelled()")
+            .expect("a pre-create stop check");
+        let create = terminal
+            .find("create_tracked_terminal_session_backend(")
+            .expect("the create");
+        assert!(stop_check < create);
+    }
+
+    #[test]
+    fn the_agent_terminal_map_removes_its_entry_when_the_run_ends() {
+        let agent_id = uuid::Uuid::new_v4();
+        let terminal_id = format!("term-{agent_id}");
+        let mut registration = register_agent_terminal(agent_id, &terminal_id);
+        assert_eq!(agent_terminal_of(agent_id), Some(terminal_id.clone()));
+
+        // The pane's on-exit hook wakes the waiter with the exit facts …
+        let facts = crate::terminal::session::PaneExitFacts {
+            code: Some(0),
+            close_requested: false,
+        };
+        notify_agent_terminal_exit(&terminal_id, facts);
+        assert_eq!(registration.exited.try_recv(), Ok(facts));
+        // … a second notification (or one for a pane that is not an agent's)
+        // is a no-op …
+        notify_agent_terminal_exit(&terminal_id, facts);
+        notify_agent_terminal_exit("not-an-agent-terminal", facts);
+        // … and the run ending drops the entry.
+        drop(registration);
+        assert_eq!(agent_terminal_of(agent_id), None);
+    }
+
+    #[test]
+    fn a_started_agent_terminal_reports_only_a_stop_or_a_crash() {
+        let exited = |code: Option<i32>, close_requested: bool| {
+            AgentTerminalEnd::Exited(Some(crate::terminal::session::PaneExitFacts {
+                code,
+                close_requested,
+            }))
+        };
+        assert_eq!(
+            agent_terminal_end_report(AgentTerminalEnd::Stopped),
+            Some((AGENT_STOPPED_REASON.to_string(), None))
+        );
+        assert_eq!(
+            agent_terminal_end_report(exited(Some(3), false)),
+            Some(("non-zero exit code 3".to_string(), Some(3)))
+        );
+        // A clean exit leaves spawn-complete standing, as headless does.
+        assert_eq!(agent_terminal_end_report(exited(Some(0), false)), None);
+        // A tab the runner or operator closed is the ordinary end, not a failure.
+        assert_eq!(agent_terminal_end_report(exited(Some(1), true)), None);
+        assert_eq!(agent_terminal_end_report(AgentTerminalEnd::PaneGone), None);
+        assert_eq!(
+            agent_terminal_end_report(AgentTerminalEnd::Exited(None)),
+            None
+        );
     }
 
     #[test]
