@@ -272,12 +272,15 @@ pub const CREDENTIAL_DOORS: &[&str] = &[
     "GET /sessions/{id}/file-changes",
     // The per-tab session snapshot (`mcp::terminal_layout`): terminal titles,
     // which are PTY-derived session content, plus session ids, accounts and
-    // the device id. No browser page needs it. Its one caller is qontinui-web's
-    // saved-session-lists capture over the backend relay, and a relayed request
-    // reaches this API with no `Origin` and no `Sec-Fetch-*`: qontinui-web's
-    // `runner_relay` drops them and `backend_relay::RELAY_SKIP_REQUEST_HEADERS`
-    // drops `origin` and `sec-fetch-site` again. So it classifies NonBrowser
-    // and is admitted (plan
+    // the device id. No browser page needs it. Its intended caller is
+    // qontinui-web's saved-session-lists capture over the backend relay; a
+    // device owner can also reach it through qontinui-web's device-bridge
+    // runner proxy (`/api/v1/device-bridge/runner-proxy/terminal-layout`), which
+    // rides the same relay and gets the same per-tenant title redaction. A
+    // relayed request reaches this API with no `Origin` and no `Sec-Fetch-*`:
+    // qontinui-web's `runner_relay` drops them and
+    // `backend_relay::RELAY_SKIP_REQUEST_HEADERS` drops `origin` and
+    // `sec-fetch-site` again. So it classifies NonBrowser and is admitted (plan
     // `2026-11-08-save-per-tab-runner-session-lists-on-sessions-page-kept-14-days`).
     "GET /terminal-layout",
     // Reads a local Claude Code transcript and queues it for coord: it decides
