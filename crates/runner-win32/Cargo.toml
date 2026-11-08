@@ -32,6 +32,9 @@ windows-sys = { version = "0.59", features = [
     # dependency is transitive through the struct, not textual. Verified by
     # removing it and watching the build break.
     "Win32_System_Threading",
+    # `process_tree::raw_command_line`: NtQueryInformationProcess with
+    # ProcessCommandLineInformation, the raw PEB command line.
+    "Wdk_System_Threading",
 ] }
 # The holder spawner's WMI fallback (`holder_spawn::wmi`, plan
 # 2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions Phase 3):
