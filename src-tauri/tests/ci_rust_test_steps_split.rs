@@ -659,8 +659,9 @@ fn the_memory_sampler_is_gated_to_the_windows_leg() {
 #[test]
 fn the_job_cap_contains_both_rust_step_bounds_plus_measured_overhead() {
     const MEASURED_OVERHEAD_MAX_MINUTES: u64 = 50; // 49.0 measured, rounded up
-    const BOUNDED_AFTER_THE_MEASUREMENT: [&str; 3] = [
+    const BOUNDED_AFTER_THE_MEASUREMENT: [&str; 4] = [
         UNIX_EXTRACTOR_SENTINEL,
+        PROVISIONING_E2E_UNKNOWN,
         PROVISIONING_E2E_SETUP,
         PROVISIONING_E2E,
     ];
@@ -690,6 +691,7 @@ fn the_job_cap_contains_both_rust_step_bounds_plus_measured_overhead() {
 }
 
 const UNIX_EXTRACTOR_SENTINEL: &str = "Unix extractor tests ran (ubuntu)";
+const PROVISIONING_E2E_UNKNOWN: &str = "Provisioning env e2e UNKNOWN (self-hosted)";
 const PROVISIONING_E2E_SETUP: &str = "Setup Python (provisioning env e2e)";
 const PROVISIONING_E2E: &str = "Provisioning env e2e";
 
@@ -825,6 +827,53 @@ fn the_provisioning_env_e2e_gates_both_hosted_legs() {
             "`{PROVISIONING_E2E}` must contain `{needle}`"
         );
     }
+}
+
+/// The e2e runs on hosted runners only, and the ubuntu leg routes a same-repo
+/// pull request to the self-hosted Linux pool when its lane says so — so on
+/// such a run the e2e is SKIPPED. That skip must be visible: a bounded step
+/// gated on exactly the complement of the e2e's `if:` prints a `::notice`
+/// naming it UNKNOWN. Pinned because a skip that says nothing reads as a pass.
+#[test]
+fn a_self_hosted_run_says_the_provisioning_env_e2e_did_not_run() {
+    let doc = ci_workflow();
+    let steps = job_steps(&doc, "test");
+    let notice = find_step(&steps, PROVISIONING_E2E_UNKNOWN);
+    assert_eq!(
+        notice.get("if").and_then(|v| v.as_str()),
+        Some("runner.environment != 'github-hosted'"),
+        "`{PROVISIONING_E2E_UNKNOWN}` must run exactly where `{PROVISIONING_E2E}` does not"
+    );
+    assert_eq!(
+        find_step(&steps, PROVISIONING_E2E)
+            .get("if")
+            .and_then(|v| v.as_str()),
+        Some("runner.environment == 'github-hosted'"),
+        "`{PROVISIONING_E2E_UNKNOWN}`'s `if:` is the complement of this one; \
+         change both together"
+    );
+    assert_eq!(
+        timeout_minutes(notice, PROVISIONING_E2E_UNKNOWN),
+        1,
+        "`{PROVISIONING_E2E_UNKNOWN}` only prints, so it is bounded at one minute"
+    );
+    assert!(
+        notice.get("continue-on-error").is_none(),
+        "`{PROVISIONING_E2E_UNKNOWN}` prints a notice and cannot fail"
+    );
+    // Before the setup step: nothing after it may name Python, and the
+    // notice names `setup-python`.
+    assert!(
+        position(&steps, RUN) < position(&steps, PROVISIONING_E2E_UNKNOWN)
+            && position(&steps, PROVISIONING_E2E_UNKNOWN)
+                < position(&steps, PROVISIONING_E2E_SETUP),
+        "`{PROVISIONING_E2E_UNKNOWN}` sits after `{RUN}` and before `{PROVISIONING_E2E_SETUP}`"
+    );
+    let body = command_lines(notice, PROVISIONING_E2E_UNKNOWN);
+    assert!(
+        body.contains("::notice title=Provisioning env e2e UNKNOWN::"),
+        "`{PROVISIONING_E2E_UNKNOWN}` must emit the UNKNOWN notice: {body}"
+    );
 }
 
 #[test]

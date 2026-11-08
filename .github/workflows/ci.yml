@@ -451,14 +451,16 @@ jobs:
     #
     # 190 since plan
     # 2026-11-06-ci-node-provisioning-children-inherit-only-an-allowlisted-environment
-    # (Phases 2 and 4) added three BOUNDED steps that the 49-minute measurement
+    # (Phases 2 and 4) added four BOUNDED steps that the 49-minute measurement
     # predates, so their bounds join the sum: `Unix extractor tests ran
-    # (ubuntu)` 2 + `Setup Python (provisioning env e2e)` 5 + `Provisioning
-    # env e2e` 10 = 17, and 169 + 17 = 186, past 180 — rounded up to 190. The
-    # cap still bounds a genuine hang at 3 h 10 min, about half GitHub's
-    # 360-minute default.
+    # (ubuntu)` 2 + `Provisioning env e2e UNKNOWN (self-hosted)` 1 + `Setup
+    # Python (provisioning env e2e)` 5 + `Provisioning env e2e` 10 = 18, and
+    # 169 + 18 = 187, past 180 — rounded up to 190. (The notice step and the
+    # two e2e steps never run in the same job, so 18 over-counts by at most 1;
+    # summing every bound keeps the rule simple.) The cap still bounds a
+    # genuine hang at 3 h 10 min, about half GitHub's 360-minute default.
     # `ci_rust_test_steps_split.rs` pins this cap >= build + run + 50 + the
-    # bounds of those three steps, so a future change to any of those step
+    # bounds of those four steps, so a future change to any of those step
     # bounds has to move this line too.
     timeout-minutes: 190
 
@@ -1765,6 +1767,11 @@ jobs:
       # spelled out below, has a `... ok` line. It leaves with
       # `ci_node/tools.rs` when qontinui-runner#1995 lands. `.qontinui/ci.toml`
       # declares it as a divergence.
+      #
+      # It runs on self-hosted too (no `runner.environment` gate, unlike the
+      # provisioning env e2e below): it reads this job's own log and installs
+      # nothing, so it is valid on any pool. `ci_rust_test_steps_split.rs`
+      # pins its `if:` to exactly the platform test.
       - name: Unix extractor tests ran (ubuntu)
         if: matrix.platform == 'ubuntu-22.04'
         timeout-minutes: 2
@@ -2186,12 +2193,27 @@ jobs:
       #
       # POOLS: hosted runners only, until a self-hosted pool is MEASURED able
       # to run `setup-python` (or to supply its own Python 3 with venv); an
-      # unmeasured pool is UNKNOWN, not capable. Every pull request takes the
-      # hosted floor, so each PR's own run still exercises this. Widen the
-      # `if:` by pool label as pools are measured.
+      # unmeasured pool is UNKNOWN, not capable. NOT every run reaches this:
+      # the windows leg keeps every pull request on the hosted floor, but the
+      # ubuntu leg routes a same-repo pull request like a push (see `runs-on`
+      # above) — to the self-hosted Linux pool when RUNNER_CI_LINUX_LANE is
+      # `self-hosted`, or under `auto` when the route job hands back that
+      # pool's labels. On such a run the ubuntu leg does not execute the e2e,
+      # and the step just below says so with a `::notice`, so the skip is
+      # visible instead of silent. Widen the `if:` by pool label as pools are
+      # measured, and narrow the notice step's to match.
       #
-      # BOUNDS: each step carries its own, and both join the job cap's sum
-      # above `timeout-minutes` for this job.
+      # BOUNDS: each step carries its own, and all three join the job cap's
+      # sum above `timeout-minutes` for this job.
+      #
+      # This step sits BEFORE `Setup Python` because nothing after that step
+      # may name Python (`ci_rust_test_steps_split.rs`), and this message does.
+      - name: Provisioning env e2e UNKNOWN (self-hosted)
+        if: runner.environment != 'github-hosted'
+        timeout-minutes: 1
+        run: |
+          echo '::notice title=Provisioning env e2e UNKNOWN::this self-hosted pool is unmeasured for setup-python, so the provisioning env e2e did not run here; see plan 2026-11-06-ci-node-provisioning-children-inherit-only-an-allowlisted-environment 1.3'
+
       - name: Setup Python (provisioning env e2e)
         if: runner.environment == 'github-hosted'
         timeout-minutes: 5

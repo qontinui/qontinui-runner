@@ -268,6 +268,8 @@ cargo_build_jobs = 1
 #   installs (`no_python_refusal` in src-tauri/src/ci_node/tools.rs), plus
 #   `actions/setup-python`, a hosted-infra setup action this manifest does not
 #   mirror. Both leave with ci_node/tools.rs when qontinui-runner#1995 lands.
+#   So does their self-hosted twin, "Provisioning env e2e UNKNOWN
+#   (self-hosted)", which only prints that the e2e did not run on that pool.
 #
 # - "Unix extractor tests ran (ubuntu)" (ubuntu only; Phase 4 of the same
 #   plan): it reads `cargo-test-output.log`, an Actions-only log of the
