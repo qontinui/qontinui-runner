@@ -54,7 +54,7 @@
 //! |---|---|---|
 //! | basename `target` at ANY depth inside a checkout/worktree (`<wt>/target`, `<wt>/src-tauri/target`, `_wt/<slug>/target`) | worktree reclaim ([`super::reclaim`]) | [`SkipReason::OwnedByWorktreeReclaim`] — never a candidate |
 //! | basename `target` with NO enclosing checkout at all (`D:/scratch/target`) | nobody — `super::reclaim` only ever removes `<worktree>/target` for a worktree in its census | falls through to the ordinary gates; a genuine orphan keeps a verb |
-//! | anything under `target-pool/`, or basename `target-agent`, ANYWHERE | the build system / `cargo-guard` | [`SkipReason::OwnedByBuildPool`] — never a candidate |
+//! | anything under `target-pool/`, or basename `target-agent` / `target-arming`, ANYWHERE | the build system / `cargo-guard` | [`SkipReason::OwnedByBuildPool`] — never a candidate |
 //! | any root inside a **canonical checkout** (`.git` is a dir) | nobody yet — v1 defers the verb | [`SkipReason::ReportOnly`] — measured and reported, never removed |
 //! | a root whose enclosing dir's `.git` could not be READ | UNKNOWN | [`SkipReason::OwnershipUnknown`] — never a candidate |
 //! | a **renamed** in-worktree build dir in a linked worktree (`target-<slug>`, `target-sessrestore`, …) | THIS reaper | subject to G-dirty + the five gates |
@@ -115,7 +115,7 @@
 //!     directory) has no v1 verb. Reported with its bytes; never removed, not
 //!     even when armed.
 //!   * **G-owner** — a root another engine owns by path (basename `target`
-//!     inside a checkout/worktree, `target-agent`, or anything under
+//!     inside a checkout/worktree, `target-agent`, `target-arming`, or anything under
 //!     `target-pool/`) is never a candidate here, so the two engines cannot race
 //!     on one path. Matched on the basename at any DEPTH — never on a path
 //!     relative to a resolved checkout root, which a failed `.git` read would
@@ -529,10 +529,15 @@ const NEVER_DESCEND: &[&str] = &[
 const WORKTREE_RECLAIM_BASENAME: &str = "target";
 
 /// Build directories inside a checkout/worktree that belong to the **build
-/// system** (`cargo-guard`'s shared agent dir and the supervisor's build pool).
-/// `target-agent` is matched on the basename; `target-pool` on any path
-/// component, so `target-pool/slot-0` and `target-pool/lkg` are both covered.
-const BUILD_POOL_BASENAME: &str = "target-agent";
+/// system**: `cargo-guard`'s shared agent dir (`target-agent`), the arming
+/// prove's persistent per-repo target (`target-arming`, qontinui-claude-config
+/// `scripts/lib/arming_runs.py`; plan
+/// `2026-11-06-arming-prove-shared-target-lock-starvation` D1 keeps it WARM on
+/// purpose, so reaping it would turn every prove back into a cold build) and
+/// the supervisor's build pool. The named dirs are matched on the basename;
+/// `target-pool` on any path component, so `target-pool/slot-0` and
+/// `target-pool/lkg` are both covered.
+const BUILD_POOL_BASENAMES: &[&str] = &["target-agent", "target-arming"];
 const BUILD_POOL_COMPONENT: &str = "target-pool";
 
 /// True iff `COORD_ORPHAN_TARGET_REAP_ENABLED` is truthy. Default OFF (dry-run).
@@ -1238,8 +1243,8 @@ pub enum SkipReason {
     /// **G-owner** — the worktree reclaim engine owns this path
     /// (`<worktree>/target`, `<worktree>/src-tauri/target`).
     OwnedByWorktreeReclaim,
-    /// **G-owner** — the build system owns this path (`target-agent`, or
-    /// anything under `target-pool/`).
+    /// **G-owner** — the build system owns this path (`target-agent`,
+    /// `target-arming`, or anything under `target-pool/`).
     OwnedByBuildPool,
     /// **G-ownership-unknown** — the enclosing directory's `.git` entry could
     /// not be read, so which engine (if any) owns this path is UNKNOWN. Refused,
@@ -1363,8 +1368,9 @@ impl SkipReason {
                  so the two engines cannot race."
             }
             SkipReason::OwnedByBuildPool => {
-                "The build system owns this name (`target-agent` / anything under \
-                 `target-pool/`) — the shared agent build dir or a supervisor pool slot, not \
+                "The build system owns this name (`target-agent` / `target-arming` / anything \
+                 under `target-pool/`) — the shared agent build dir, the arming prove's warm \
+                 target or a supervisor pool slot, not \
                  garbage. Matched on the path alone, so the pool is protected by what it IS \
                  rather than by where it currently happens to live."
             }
@@ -1680,7 +1686,7 @@ fn boundary_verdict(c: &Candidate, opts: &ClassifyOptions) -> Result<(), SkipRea
 
     // G-owner (build pool), evaluated on the PATH alone — the pool is protected
     // by what it IS, so no read failure anywhere can dissolve this boundary.
-    if basename == BUILD_POOL_BASENAME
+    if BUILD_POOL_BASENAMES.contains(&basename)
         || c.path
             .components()
             .any(|comp| comp.as_os_str() == BUILD_POOL_COMPONENT)
@@ -3337,6 +3343,7 @@ mod tests {
         // relied on: the gate must hold on the path alone.
         mk_target_root(&root.join("target-pool/slot-0"));
         mk_target_root(&root.join("target-agent"));
+        mk_target_root(&wt.join("target-arming"));
 
         let opts = ClassifyOptions::with_probe(Duration::ZERO, |_| DirtyProbe::Clean);
         let verdict = |name: &str| {
@@ -3352,6 +3359,11 @@ mod tests {
             "<worktree>/target belongs to the worktree reclaim engine"
         );
         assert_eq!(verdict("target-agent"), Err(SkipReason::OwnedByBuildPool));
+        assert_eq!(
+            verdict("target-arming"),
+            Err(SkipReason::OwnedByBuildPool),
+            "the arming prove's warm target is the build system's, not a renamed orphan"
+        );
         assert_eq!(
             verdict("slot-0"),
             Err(SkipReason::OwnedByBuildPool),
@@ -3389,6 +3401,10 @@ mod tests {
         let opts = ClassifyOptions::with_probe(Duration::ZERO, |_| DirtyProbe::Clean);
         assert_eq!(
             classify_candidate(&demoted(Path::new("/ws/repo-wt-x/target-agent")), &opts),
+            Err(SkipReason::OwnedByBuildPool)
+        );
+        assert_eq!(
+            classify_candidate(&demoted(Path::new("/ws/repo-wt-x/target-arming")), &opts),
             Err(SkipReason::OwnedByBuildPool)
         );
         assert_eq!(

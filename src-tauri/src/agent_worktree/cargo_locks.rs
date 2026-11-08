@@ -15,7 +15,10 @@
 //! ([`super::census::is_canonical_repo_root`] under
 //! [`super::census::qontinui_root`]). Per repo root (and its `src-tauri/`
 //! sub-root, where the runner's own cargo workspace lives) the candidate
-//! target dirs are `target`, `target-agent` and each `target-pool/*` slot; the
+//! target dirs are `target`, `target-agent`, `target-arming` (the arming
+//! prove's per-repo target, serialised by one whole-prove lease — plan
+//! `2026-11-06-arming-prove-shared-target-lock-starvation` D1/D2) and each
+//! `target-pool/*` slot; the
 //! lock files are `<t>/*/.cargo-lock`, and `<t>/*/*/.cargo-lock` only under a
 //! level-1 dir that has no lock of its own (the `--target <triple>` layout).
 //! No deeper recursion, and at most [`MAX_CARGO_LOCK_ITEMS`] items.
@@ -105,7 +108,7 @@ const MAX_FD_SCAN: usize = 100_000;
 const TARGET_BASES: &[&str] = &["", "src-tauri"];
 
 /// Target dirs under a base that are SHARED (not per-worktree).
-const SHARED_TARGET_NAMES: &[&str] = &["target", "target-agent"];
+const SHARED_TARGET_NAMES: &[&str] = &["target", "target-agent", "target-arming"];
 
 /// Parent dir of the build-pool slots (`target-pool/slot-0`, …).
 const TARGET_POOL: &str = "target-pool";
@@ -448,8 +451,9 @@ fn child_dirs(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// The shared target dirs of ONE repo checkout: `target`, `target-agent` and
-/// each `target-pool/*` under the repo root and its `src-tauri/`.
+/// The shared target dirs of ONE repo checkout: `target`, `target-agent`,
+/// `target-arming` and each `target-pool/*` under the repo root and its
+/// `src-tauri/`.
 fn shared_target_dirs(repo_root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for base in TARGET_BASES {
@@ -1153,6 +1157,7 @@ lock:\t1: FLOCK  ADVISORY  WRITE 1351229 08:01:16669579 0 EOF\n";
         touch(&root.join("qontinui-coord/target-other/debug/.cargo-lock"));
 
         std::fs::create_dir_all(root.join("qontinui-runner/.git")).expect("git dir");
+        touch(&root.join("qontinui-runner/target-arming/debug/.cargo-lock"));
         touch(&root.join("qontinui-runner/target-pool/slot-0/debug/.cargo-lock"));
         touch(&root.join("qontinui-runner/target-pool/slot-1/debug/.cargo-lock"));
         touch(&root.join("qontinui-runner/src-tauri/target/debug/.cargo-lock"));
@@ -1179,6 +1184,7 @@ lock:\t1: FLOCK  ADVISORY  WRITE 1351229 08:01:16669579 0 EOF\n";
                 "qontinui-coord/target/release",
                 "qontinui-coord/target-agent/debug",
                 "qontinui-coord/target-agent/x86_64-unknown-linux-gnu/debug",
+                "qontinui-runner/target-arming/debug",
                 "qontinui-runner/target-pool/slot-0/debug",
                 "qontinui-runner/target-pool/slot-1/debug",
                 "qontinui-runner/src-tauri/target/debug",
@@ -1192,8 +1198,8 @@ lock:\t1: FLOCK  ADVISORY  WRITE 1351229 08:01:16669579 0 EOF\n";
         let (files, truncated) = enumerate_shared_lock_files(tmp.path(), 3);
         assert_eq!(files.len(), 3);
         assert!(truncated);
-        let (files, truncated) = enumerate_shared_lock_files(tmp.path(), 7);
-        assert_eq!(files.len(), 7);
+        let (files, truncated) = enumerate_shared_lock_files(tmp.path(), 8);
+        assert_eq!(files.len(), 8);
         assert!(!truncated, "exactly at the cap is not a truncation");
     }
 
