@@ -52,7 +52,12 @@ pub struct CreateTerminalRequest {
     pub cols: Option<u16>,
     #[serde(default)]
     pub rows: Option<u16>,
-    /// Which terminal page this session belongs to.
+    /// Which terminal page this session belongs to. Absent means AUTOMATIC
+    /// placement, not `"default"`: the page-capacity rule
+    /// (`terminal::page_placement::pick_page_for_new_session`) picks `default`
+    /// while it has room, then the emptiest page under the ceiling, else a
+    /// freshly minted page. Send `"default"` to pin the session there. The
+    /// response's `pageId` is the page actually chosen.
     #[serde(default, alias = "page_id")]
     pub page_id: Option<String>,
     /// Optional command to execute immediately after shell initialization.
