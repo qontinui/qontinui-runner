@@ -74,7 +74,10 @@
  * `taskkill /F /IM node.exe`, `Stop-Process -Name node`, `Stop-Process -Name
  * powershell` and ANY process-tree (`/T`) kill are forbidden outright — they
  * terminate live Claude Code sessions, including the caller's own. T10 kills
- * the runner process BY PID and by exact image name, with a hard refusal list.
+ * ONE pid — the `--port` target's, as the self-hosting gate resolved it from
+ * the OS and re-resolved immediately before the kill — after a runner-image
+ * check and a hard refusal list (`planTargetKill` in
+ * `uibridge-session-info-lib.mjs`). It never enumerates runners by name.
  *
  * ## Why 127.0.0.1 and why the timeouts look large
  *
@@ -91,6 +94,12 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
+
+import {
+  killTargetRunner,
+  resolveTargetRunnerPid,
+  selfHostingVerdict,
+} from "./uibridge-session-info-lib.mjs";
 
 // ===========================================================================
 // Configuration
@@ -138,11 +147,8 @@ const FIXTURE_TRANSCRIPT_BUDGET_MS = 120_000;
 /** Gap between fixture-progress polls (buffer reads + restore-health). */
 const FIXTURE_POLL_INTERVAL_MS = 4_000;
 
-/** Process image names this script will NEVER kill (they host live sessions). */
-const NEVER_KILL = ["node", "node.exe", "powershell", "powershell.exe", "pwsh", "pwsh.exe"];
-
-/** The runner's own image name — the only thing T10 is allowed to stop. */
-const RUNNER_PROCESS_NAME = "qontinui-runner";
+// `NEVER_KILL` and the runner-image predicate live in
+// `uibridge-session-info-lib.mjs`, beside the kill planner that enforces them.
 
 /** The seventeen addressable row fields this oracle compares raw-to-raw (plan
  * D5). The panel renders eighteen: `prs-scanned` is not compared here. */
@@ -608,31 +614,34 @@ async function measureEmptiness(owned) {
 }
 
 /**
- * The §0.1 self-hosting gate: would restarting this runner kill THIS process?
+ * The §0.1 self-hosting gate: would restarting the `--port` TARGET runner kill
+ * THIS process?
  *
- * The authoritative test is PROCESS ANCESTRY, not the runner's registry.
- * Restarting a runner kills its process tree, so the only thing that decides
- * the question is whether a runner process is an ancestor of this one.
+ * That is a question about the target's own pid, so the gate resolves it from
+ * the OS (the process holding the LISTEN socket on `port` — plan D3, option A,
+ * which reaches every build because it asks the OS rather than the runner) and
+ * checks whether that pid is in this process's ancestry. Restarting a runner
+ * kills ITS process tree, and only its.
+ *
+ * ⚠️ It used to refuse whenever ANY `qontinui-runner` was an ancestor — a proxy
+ * for the property, not the property. Measured 2026-11-08: the target temp
+ * runner (pid 149760) was not an ancestor, yet T0.1b refused on ancestor pid
+ * 1158459, the primary. Another runner in the chain is now CONTEXT.
  *
  * ⚠️ Do NOT gate on "is my `CLAUDE_CODE_SESSION_ID` in `/control/sessions/
- * restore-health`". That was this gate's original implementation and it is
- * WRONG in the common direction — it aborts runs that are perfectly safe.
- * The runner tracks Claude sessions it merely NOTICED: `origin: "observed"` is
- * documented in `session_lifecycle_store.rs` as "a claude-process-start-anchored,
- * uniquely-correlated TRANSCRIPT bind — the transcript proves the session
- * exists". A `claude` launched from an ordinary PowerShell window is discovered
- * exactly that way and appears in the registry bound to a terminal id, while
- * being no part of the runner's process tree. Measured 2026-08-17: a session
- * present in `restore-health` as `origin: "observed"` SURVIVED the runner being
- * killed, and its ancestry was
+ * restore-health`" either. The runner tracks Claude sessions it merely NOTICED
+ * (`origin: "observed"`, a transcript bind): measured 2026-08-17, such a
+ * session SURVIVED the runner being killed, its ancestry being
  * `powershell.exe <- claude.exe <- powershell.exe <- WindowsTerminal.exe`.
+ * Registry presence is reported as CONTEXT, never as the verdict.
  *
- * Registry presence is therefore reported as CONTEXT, never as the verdict.
+ * Fails CLOSED: an unresolved target pid or an unwalkable ancestry is UNKNOWN
+ * (`evaluable: false, safe: false`) — we cannot prove we are outside, which is
+ * not the same as being outside.
  *
- * Fails CLOSED: if ancestry cannot be walked, we cannot prove we are outside,
- * which is not the same as being outside.
+ * @returns {Promise<{safe:boolean, evaluable:boolean, targetPid:number|null, detail:string}>}
  */
-async function measureSelfHosting(health) {
+async function measureSelfHosting(health, port) {
   const own = (process.env.CLAUDE_CODE_SESSION_ID || "").trim();
 
   // Context only — see the warning above. Never decides `safe`.
@@ -650,33 +659,19 @@ async function measureSelfHosting(health) {
     }
   }
 
+  const target = await resolveTargetRunnerPid(port);
   const ancestry = await walkProcessAncestry();
   if (!ancestry.ok) {
     return {
       safe: false,
       evaluable: false,
+      targetPid: target.pid,
       detail:
         `cannot walk process ancestry (${ancestry.error}) — cannot prove this process is ` +
-        `outside the runner's process tree. Failing closed. [${registryNote}]`,
+        `outside the target runner's process tree. Failing closed. [${registryNote}]`,
     };
   }
-  const runnerAncestor = ancestry.chain.find((p) => /qontinui-runner/i.test(p.name));
-  if (runnerAncestor) {
-    return {
-      safe: false,
-      evaluable: true,
-      detail:
-        `SELF-HOSTED: ${runnerAncestor.name} (pid ${runnerAncestor.pid}) is an ancestor of this ` +
-        `process. Restarting this runner would kill the test mid-run. [${registryNote}]`,
-    };
-  }
-  return {
-    safe: true,
-    evaluable: true,
-    detail:
-      `no runner process in this process's ancestry ` +
-      `(${ancestry.chain.map((p) => p.name).join(" <- ")}) [${registryNote}]`,
-  };
+  return selfHostingVerdict({ chain: ancestry.chain, target, registryNote });
 }
 
 /**
@@ -725,6 +720,8 @@ async function walkProcessAncestry() {
  * Re-run BOTH gates and return whether a mutating action may proceed. Called
  * once in T0 and AGAIN immediately before every restart in T7/T10 — the plan's
  * "every restart re-runs the emptiness check from T0 first", made mechanical.
+ * Also returns `pid`: the target runner pid the self-hosting check resolved
+ * (null unless `ok`), which T10 hands to `killTargetRunner`.
  */
 async function gatesAllowMutation(label, ctx) {
   const owned = {
@@ -734,10 +731,12 @@ async function gatesAllowMutation(label, ctx) {
     terminals: new Set((ctx?.fixtures ?? []).map((x) => x.terminalId).filter(Boolean)),
   };
   const e = await measureEmptiness(owned);
-  const s = await measureSelfHosting(e.health);
+  const s = await measureSelfHosting(e.health, ctx.opts.port);
   const ok = e.evaluable && e.empty && s.evaluable && s.safe;
   return {
     ok,
+    // The target runner pid THIS check resolved — the only pid T10 may kill.
+    pid: ok ? s.targetPid : null,
     detail:
       `${label} gate re-check:\n  emptiness: ${e.empty ? "EMPTY" : "NOT EMPTY"} — ${e.detail}\n` +
       `  self-hosting: ${s.safe ? "OUTSIDE the runner" : "BLOCKED"} — ${s.detail}`,
@@ -1548,7 +1547,7 @@ async function runT0(ctx) {
     );
   }
 
-  const s = await measureSelfHosting(e.health);
+  const s = await measureSelfHosting(e.health, ctx.opts.port);
   ctx.gates.notSelfHosted = s.evaluable && s.safe;
   if (s.evaluable && s.safe) {
     pass("T0.1b", "the test process's own session is NOT hosted in this runner", s.detail);
@@ -2163,54 +2162,6 @@ async function waitForHealthy(budgetMs = HEALTH_POLL_BUDGET_MS) {
   return { ok: false, detail: `no healthy /health within ${budgetMs}ms (last: ${last})` };
 }
 
-/**
- * Stop ONLY the runner process, by pid, by exact image name.
- *
- * Never `node.exe`, never `powershell.exe`, and never a process-tree (`/T`)
- * kill — all three terminate live Claude Code sessions, including the caller's
- * own, and none of them is inside the operator's carve-out. The refusal list is
- * checked at the point of the kill, not assumed from the query.
- */
-function killRunnerProcessOnly() {
-  const list = powershell([
-    "-Command",
-    `Get-Process -Name '${RUNNER_PROCESS_NAME}' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id`,
-  ]);
-  const pids = (list.stdout || "")
-    .split(/\r?\n/)
-    .map((s) => s.trim())
-    .filter((s) => /^\d+$/.test(s));
-  if (pids.length === 0) {
-    return {
-      ok: false,
-      detail: `no process named '${RUNNER_PROCESS_NAME}' is running — nothing to crash`,
-    };
-  }
-  const killed = [];
-  for (const pid of pids) {
-    const nameProbe = powershell([
-      "-Command",
-      `(Get-Process -Id ${pid} -ErrorAction SilentlyContinue).ProcessName`,
-    ]);
-    const name = (nameProbe.stdout || "").trim().toLowerCase();
-    if (NEVER_KILL.includes(name) || name !== RUNNER_PROCESS_NAME.toLowerCase()) {
-      return {
-        ok: false,
-        detail: `REFUSED: pid ${pid} resolves to '${name}', not '${RUNNER_PROCESS_NAME}'. This script never kills node/powershell and never uses a process-tree flag.`,
-      };
-    }
-    // Single pid, no -T / tree semantics anywhere.
-    const k = powershell(["-Command", `Stop-Process -Id ${pid} -Force -Confirm:$false`]);
-    if (!k.ok)
-      return { ok: false, detail: `Stop-Process -Id ${pid} failed: ${k.stderr || k.error}` };
-    killed.push(pid);
-  }
-  return {
-    ok: true,
-    detail: `stopped runner pid(s) ${killed.join(", ")} (no tree flag, no node/powershell touched)`,
-  };
-}
-
 // ===========================================================================
 // T6-T9 — restore
 // ===========================================================================
@@ -2743,7 +2694,7 @@ async function runHonestyAssertions(ctx) {
     skip(
       "T10",
       "a hard-crash boot reports verdict 'unknown', not 'match'",
-      "--allow-restart is OFF by default. T10 crashes the runner (runner process only, by pid, no tree flag) " +
+      "--allow-restart is OFF by default. T10 crashes the --port target runner (its one pid, SIGKILL, no tree flag) " +
         "and that is inside the plan's §0 carve-out ONLY for an empty runner the implementer itself emptied.",
     );
   } else {
@@ -2755,7 +2706,15 @@ async function runHonestyAssertions(ctx) {
         `ABORTED — ${gate.detail}`,
       );
     } else {
-      const k = killRunnerProcessOnly();
+      // Only the pid the gate just resolved, re-resolved and planned again
+      // immediately before the kill (plan D4); `killTargetRunner` enumerates
+      // nothing else on the box.
+      const k = await killTargetRunner(gate.pid, (pid, signal) => process.kill(pid, signal), {
+        port: opts.port,
+        devStartPort: DEFAULT_RUNNER_PORT,
+        devStartExplicit: opts.devStartExplicit,
+        platform: process.platform,
+      });
       if (!k.ok) {
         fail("T10", "a hard-crash boot reports verdict 'unknown', not 'match'", k.detail);
       } else {
