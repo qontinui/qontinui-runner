@@ -22,7 +22,11 @@ pub async fn ui_bridge_clipboard_read_handler(
     info!("UI Bridge API: Reading clipboard");
 
     // The shared instance, not a fresh one: see `SYSTEM_CLIPBOARD`.
-    match crate::commands::clipboard::system_clipboard_read_text() {
+    let read = crate::commands::clipboard::run_system_clipboard(
+        crate::commands::clipboard::system_clipboard_read_text,
+    )
+    .await;
+    match read {
         Ok(text) => {
             let has_text = text.is_some();
             Json(ApiResponse::success(serde_json::json!({
@@ -31,8 +35,8 @@ pub async fn ui_bridge_clipboard_read_handler(
             })))
         }
         Err(e) => {
-            error!("UI Bridge API: {}", e);
-            Json(ApiResponse::error(e))
+            error!("UI Bridge API: Clipboard read failed: {}", e);
+            Json(ApiResponse::error(format!("Clipboard read failed: {}", e)))
         }
     }
 }
@@ -46,21 +50,19 @@ pub async fn ui_bridge_clipboard_write_handler(
 
     // The shared instance, not a fresh one: a dropped instance takes the
     // content with it on Linux (see `SYSTEM_CLIPBOARD`).
-    let (result, formats) = match &body.html {
-        // Write both HTML and plain text alternatives
-        Some(html) => (
-            crate::commands::clipboard::with_system_clipboard(|clipboard| {
-                clipboard.set_html(html.as_str(), Some(body.text.as_str()))
-            }),
-            vec!["text/html", "text/plain"],
-        ),
-        None => (
-            crate::commands::clipboard::with_system_clipboard(|clipboard| {
-                clipboard.set_text(body.text.as_str())
-            }),
-            vec!["text/plain"],
-        ),
+    let formats = if body.html.is_some() {
+        vec!["text/html", "text/plain"]
+    } else {
+        vec!["text/plain"]
     };
+    let result = crate::commands::clipboard::run_system_clipboard(move || {
+        crate::commands::clipboard::with_system_clipboard(|clipboard| match &body.html {
+            // Write both HTML and plain text alternatives
+            Some(html) => clipboard.set_html(html.as_str(), Some(body.text.as_str())),
+            None => clipboard.set_text(body.text.as_str()),
+        })
+    })
+    .await;
     match result {
         Ok(()) => Json(ApiResponse::success(serde_json::json!({
             "written": true,

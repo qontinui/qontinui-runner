@@ -129,9 +129,16 @@ async fn share_to_mobile_impl(text: String) -> Result<ClipboardEntryResponse, Ap
 /// between calls, so keeping it is harmless there.
 static SYSTEM_CLIPBOARD: std::sync::Mutex<Option<arboard::Clipboard>> = std::sync::Mutex::new(None);
 
-/// Run `op` against the shared clipboard, creating it on first use. A failed
-/// operation discards the instance, so the next call re-initialises it rather
-/// than reusing a context whose X connection may have died.
+/// Run `op` against the shared clipboard, creating it on first use.
+///
+/// A failed OPERATION keeps the instance: on X11 a read can fail only because
+/// the current owner never answered, and discarding the instance then would
+/// drop whatever the runner itself is still serving — the bug this exists to
+/// fix. Only a failed initialisation leaves the slot empty for a retry.
+///
+/// BLOCKING: on X11 a read waits for the selection owner's reply, which can be
+/// the runner's own webview. Never call this on the main thread; async
+/// callers go through [`run_system_clipboard`].
 pub fn with_system_clipboard<T>(
     op: impl FnOnce(&mut arboard::Clipboard) -> Result<T, arboard::Error>,
 ) -> Result<T, String> {
@@ -143,12 +150,7 @@ pub fn with_system_clipboard<T>(
             Some(arboard::Clipboard::new().map_err(|e| format!("Clipboard init failed: {}", e))?);
     }
     let clipboard = guard.as_mut().expect("initialised above");
-    op(clipboard).map_err(|e| {
-        if !matches!(e, arboard::Error::ContentNotAvailable) {
-            *guard = None;
-        }
-        e.to_string()
-    })
+    op(clipboard).map_err(|e| e.to_string())
 }
 
 /// Read the clipboard's text, answering `Ok(None)` for a clipboard that is
@@ -159,7 +161,16 @@ pub fn system_clipboard_read_text() -> Result<Option<String>, String> {
         Err(arboard::Error::ContentNotAvailable) => Ok(None),
         Err(e) => Err(e),
     })
-    .map_err(|e| format!("Clipboard read failed: {}", e))
+}
+
+/// Run a blocking clipboard call off the async runtime's worker (and off the
+/// main thread), so a slow X selection owner cannot stall either.
+pub async fn run_system_clipboard<T: Send + 'static>(
+    call: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    tauri::async_runtime::spawn_blocking(call)
+        .await
+        .map_err(|e| format!("clipboard task failed: {}", e))?
 }
 
 /// Write text to the local OS clipboard.
@@ -171,8 +182,9 @@ pub fn system_clipboard_read_text() -> Result<Option<String>, String> {
 /// native side writes to the OS clipboard directly with no focus
 /// requirement — via the shared instance, see [`SYSTEM_CLIPBOARD`].
 #[tauri::command]
-pub fn clipboard_write_text(text: String) -> Result<(), String> {
-    with_system_clipboard(|clipboard| clipboard.set_text(&text))
+pub async fn clipboard_write_text(text: String) -> Result<(), String> {
+    run_system_clipboard(move || with_system_clipboard(|clipboard| clipboard.set_text(&text)))
+        .await
         .map_err(|e| format!("Clipboard write failed: {}", e))
 }
 
@@ -181,9 +193,16 @@ pub fn clipboard_write_text(text: String) -> Result<(), String> {
 /// `navigator.clipboard.readText()` needs focus and a permission grant that
 /// the webview (WebView2, WebKitGTK) does not reliably give, so the terminal
 /// paste paths read through here first.
+///
+/// `async` + [`run_system_clipboard`]: a sync command runs on the main thread,
+/// and when the runner's own webview owns the selection the reply it waits for
+/// is handled on that same thread.
 #[tauri::command]
-pub fn clipboard_read_text() -> Result<String, String> {
-    system_clipboard_read_text().map(|text| text.unwrap_or_default())
+pub async fn clipboard_read_text() -> Result<String, String> {
+    run_system_clipboard(system_clipboard_read_text)
+        .await
+        .map(|text| text.unwrap_or_default())
+        .map_err(|e| format!("Clipboard read failed: {}", e))
 }
 
 /// Response from POST /api/v1/files/upload
