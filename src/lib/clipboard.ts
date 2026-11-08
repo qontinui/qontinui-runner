@@ -36,3 +36,29 @@ export async function writeClipboard(text: string): Promise<boolean> {
     }
   }
 }
+
+/**
+ * Read text from the OS clipboard — the read twin of {@link writeClipboard}.
+ *
+ * Native first (`clipboard_read_text`, backed by the same long-lived `arboard`
+ * instance the write uses), because `navigator.clipboard.readText()` needs
+ * focus and a permission grant the webview does not reliably give. Falls back
+ * to the browser API only when the native command is unavailable (non-Tauri
+ * contexts). Resolves `""` for an empty clipboard.
+ *
+ * @throws when BOTH reads fail — a paste that cannot read is a failure the
+ *   caller must surface, not an empty clipboard (see `readClipboardForPaste`).
+ */
+export async function readClipboard(): Promise<string> {
+  try {
+    return await invoke<string>("clipboard_read_text");
+  } catch (nativeErr) {
+    try {
+      return await navigator.clipboard.readText();
+    } catch (browserErr) {
+      throw new Error(
+        `clipboard read failed (native: ${String(nativeErr)}; browser: ${String(browserErr)})`,
+      );
+    }
+  }
+}

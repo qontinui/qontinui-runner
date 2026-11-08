@@ -79,7 +79,7 @@ vi.mock("@qontinui/ui-bridge", () => ({
 }));
 
 // `navigator.clipboard` does not exist under `environment: "node"`; the `paste`
-// action (item 5) is defined in terms of it on BOTH paths.
+// action (item 5) falls back to it on BOTH paths when the native read fails.
 const clipboardText = { value: "" };
 // Set to make the next `readText()` REJECT (permission denied / not focused).
 const clipboardRejection: { value: Error | null } = { value: null };
@@ -108,7 +108,16 @@ vi.mock("./subordinateBridgeRegistration", () => ({
 }));
 
 vi.mock("@tauri-apps/api/core", () => ({
-  invoke: (cmd: string, args: Record<string, unknown>) => invoke(cmd, args),
+  // `readClipboard` reads natively first (`clipboard_read_text`), so the
+  // native command serves the same clipboard state as the `navigator` stub —
+  // including its rejection, so a failing read fails on BOTH routes.
+  invoke: async (cmd: string, args: Record<string, unknown>) => {
+    if (cmd === "clipboard_read_text") {
+      if (clipboardRejection.value) throw clipboardRejection.value;
+      return clipboardText.value;
+    }
+    return invoke(cmd, args);
+  },
 }));
 
 const { TerminalBridgeProxies } = await import("./TerminalBridgeProxies");
@@ -982,7 +991,9 @@ describe("pane custom actions refuse a malformed BAG before any write", () => {
 describe("both paste paths share the rejecting clipboard reader", () => {
   it.each(PATHS.map((f) => [f]))("%s reads the clipboard through readClipboardForPaste", (file) => {
     const code = codeOf(file);
-    expect(code).toMatch(/const text = await readClipboardForPaste\(\);/);
+    // Native-first reader (`readClipboard`): the navigator default alone
+    // pastes nothing in a webview that refuses the async clipboard read.
+    expect(code).toMatch(/const text = await readClipboardForPaste\(readClipboard\);/);
     // The swallow that made a rejected read look like an empty clipboard.
     expect(code).not.toMatch(/readText\(\)\s*\.catch\(\s*\(\)\s*=>\s*""\s*\)/);
   });

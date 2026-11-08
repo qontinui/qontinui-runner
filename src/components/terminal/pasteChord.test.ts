@@ -61,6 +61,6 @@ describe("TerminalInstance's Ctrl+V branch", () => {
   // green while the double paste came back.
   it("gates the manual paste on claimPasteChord", () => {
     const src = readFileSync(resolve(__dirname, "TerminalInstance.tsx"), "utf8");
-    expect(src).toMatch(/if \(claimPasteChord\(event\)\) \{\s*navigator\.clipboard/);
+    expect(src).toMatch(/if \(claimPasteChord\(event\)\) \{(?:\s*\/\/[^\n]*)*\s*readClipboard\(\)/);
   });
 });

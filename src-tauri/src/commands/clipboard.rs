@@ -109,24 +109,81 @@ async fn share_to_mobile_impl(text: String) -> Result<ClipboardEntryResponse, Ap
     Ok(entry)
 }
 
+/// The ONE process-wide `arboard::Clipboard`, kept alive for the runner's life.
+///
+/// THE DEFECT this replaces: every clipboard site did `Clipboard::new()`,
+/// wrote, and dropped the instance at end of scope. On Linux (X11 and
+/// Wayland) the clipboard has no storage of its own — its content is SERVED
+/// by whichever process last claimed the selection, and arboard serves it from
+/// a thread that lives only while some `Clipboard` instance does. Dropping the
+/// last instance hands the content to a clipboard manager if one is running,
+/// and otherwise the content is gone. A headless Xvfb + openbox box (the
+/// runner on nilan, viewed over x11vnc) runs no clipboard manager, so every
+/// copy "succeeded" and the clipboard read back empty one second later
+/// (measured 2026-11-08: `/ui-bridge/control/clipboard/write` -> `written:
+/// true`, then `/read` -> `text: null`). x11vnc could never forward it to
+/// the viewer, and the runner's own paste had nothing to read.
+///
+/// Holding one instance keeps the runner owning the selection until another
+/// app claims it. On Windows and macOS an instance holds no OS resource
+/// between calls, so keeping it is harmless there.
+static SYSTEM_CLIPBOARD: std::sync::Mutex<Option<arboard::Clipboard>> = std::sync::Mutex::new(None);
+
+/// Run `op` against the shared clipboard, creating it on first use. A failed
+/// operation discards the instance, so the next call re-initialises it rather
+/// than reusing a context whose X connection may have died.
+pub fn with_system_clipboard<T>(
+    op: impl FnOnce(&mut arboard::Clipboard) -> Result<T, arboard::Error>,
+) -> Result<T, String> {
+    let mut guard = SYSTEM_CLIPBOARD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if guard.is_none() {
+        *guard =
+            Some(arboard::Clipboard::new().map_err(|e| format!("Clipboard init failed: {}", e))?);
+    }
+    let clipboard = guard.as_mut().expect("initialised above");
+    op(clipboard).map_err(|e| {
+        if !matches!(e, arboard::Error::ContentNotAvailable) {
+            *guard = None;
+        }
+        e.to_string()
+    })
+}
+
+/// Read the clipboard's text, answering `Ok(None)` for a clipboard that is
+/// empty or holds no text, which is not an error.
+pub fn system_clipboard_read_text() -> Result<Option<String>, String> {
+    with_system_clipboard(|clipboard| match clipboard.get_text() {
+        Ok(text) => Ok(Some(text)),
+        Err(arboard::Error::ContentNotAvailable) => Ok(None),
+        Err(e) => Err(e),
+    })
+    .map_err(|e| format!("Clipboard read failed: {}", e))
+}
+
 /// Write text to the local OS clipboard.
 ///
 /// The browser Async Clipboard API (`navigator.clipboard.writeText`) is
-/// unreliable inside the Tauri WebView2: it requires document focus /
+/// unreliable inside the Tauri webview: it requires document focus /
 /// transient user activation and silently rejects otherwise, which is why
 /// terminal copy "often doesn't work". Routing through `arboard` on the
 /// native side writes to the OS clipboard directly with no focus
-/// requirement (same crate the UI Bridge clipboard endpoints already use).
-///
-/// # Arguments
-/// * `text` - The text to place on the clipboard.
+/// requirement — via the shared instance, see [`SYSTEM_CLIPBOARD`].
 #[tauri::command]
 pub fn clipboard_write_text(text: String) -> Result<(), String> {
-    let mut clipboard =
-        arboard::Clipboard::new().map_err(|e| format!("Clipboard init failed: {}", e))?;
-    clipboard
-        .set_text(&text)
+    with_system_clipboard(|clipboard| clipboard.set_text(&text))
         .map_err(|e| format!("Clipboard write failed: {}", e))
+}
+
+/// Read text from the local OS clipboard; `""` when it is empty or holds no
+/// text. The native twin of [`clipboard_write_text`], for the same reason:
+/// `navigator.clipboard.readText()` needs focus and a permission grant that
+/// the webview (WebView2, WebKitGTK) does not reliably give, so the terminal
+/// paste paths read through here first.
+#[tauri::command]
+pub fn clipboard_read_text() -> Result<String, String> {
+    system_clipboard_read_text().map(|text| text.unwrap_or_default())
 }
 
 /// Response from POST /api/v1/files/upload
@@ -243,6 +300,7 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
             share_to_mobile,
             share_file_to_mobile,
             clipboard_write_text,
+            clipboard_read_text,
         ])
         .build()
 }

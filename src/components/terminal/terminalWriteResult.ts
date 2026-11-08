@@ -144,7 +144,7 @@ export function buildClipboardReadFailure(cause: unknown): Error & {
     "The page may lack focus or clipboard permission. Focus the runner window " +
     "and retry, or send the text directly with `pasteText`.";
   const err = new Error(
-    `${CLIPBOARD_READ_FAILED}: navigator.clipboard.readText() was rejected${
+    `${CLIPBOARD_READ_FAILED}: the clipboard read was rejected${
       detail ? `: ${detail}` : ""
     }. ${hint}`,
   );
@@ -164,7 +164,8 @@ export function buildClipboardReadFailure(cause: unknown): Error & {
  * {@link throwIfWriteFailed}). A genuinely empty clipboard still resolves `""`,
  * which the callers keep answering as `{ success: true, bytes: 0 }`.
  *
- * `read` is injectable for tests; production callers pass nothing.
+ * Production callers pass `readClipboard` from `@/lib/clipboard` (native
+ * first); the `navigator.clipboard` default serves non-Tauri contexts and tests.
  */
 export async function readClipboardForPaste(
   read: () => Promise<string> = () => navigator.clipboard.readText(),

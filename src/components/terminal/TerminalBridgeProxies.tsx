@@ -2,6 +2,7 @@ import { memo, useEffect, useMemo, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useUIBridgeOptional } from "@qontinui/ui-bridge";
 import { attachSubordinateBridgeInput } from "./subordinateBridgeRegistration";
+import { readClipboard } from "@/lib/clipboard";
 import { readClipboardForPaste, throwIfWriteFailed } from "./terminalWriteResult";
 import { preparePasteData } from "./preparePaste";
 import { readBracketedPasteMode } from "./bracketedPasteById";
@@ -403,7 +404,7 @@ const TerminalBridgeProxy = memo(function TerminalBridgeProxy({
               // intermittently and looks like a flake.
               // A REJECTED read throws CLIPBOARD_READ_FAILED; only a genuinely
               // empty clipboard is the zero-byte success below.
-              const text = await readClipboardForPaste();
+              const text = await readClipboardForPaste(readClipboard);
               if (!text) return { success: true, bytes: 0 };
               const prepared = preparePasteData(
                 text,
