@@ -104,9 +104,105 @@
 #                    `working`, or `unknown`, which is never quiet -- whose
 #                    touch-ledger touches within --touch-window (6h) name R
 #                    (primary or a linked worktree of R, which shares R's
-#                    .git), or are UNATTRIBUTED, or whose attribution is
-#                    UNKNOWN (no session id, no ledger for it, no ledger
-#                    directory); a session whose cwd is in R; a build that
+#                    .git), or include a SPECIFIC unattributed one (it names
+#                    somewhere the ledger cannot: an unresolvable cd / -C /
+#                    --manifest-path / --prefix / --directory / --cwd target,
+#                    an Edit/Write path it cannot resolve, an unreadable
+#                    envelope, an unresolved root -- every repo), or whose
+#                    attribution is UNKNOWN
+#                    (no session id, no ledger for it, no ledger directory --
+#                    every repo). A working session whose unattributed touches
+#                    in the window are all GENERIC (the no-path marker, a
+#                    "generic":true `$` argument) blocks, beyond its touched
+#                    and cwd repos, only each R whose own ref records moved
+#                    inside the window -- a GENERIC line can hide a ref move
+#                    (GIT_DIR=, --git-dir=, -c core.worktree=, xargs {}, a
+#                    script). Those records are R's logs/HEAD, the log of the
+#                    branch HEAD names and logs/refs/stash, each by its newest
+#                    entry's time or the file's mtime, whichever is later (an
+#                    exported GIT_COMMITTER_DATE backdates an entry; a
+#                    commit's own date is never read), and the mtimes of HEAD,
+#                    of the loose refs/stash (`git update-ref refs/stash`
+#                    logs nothing when refs/stash has no log yet, unless
+#                    --create-reflog or core.logAllRefUpdates=always) and
+#                    of that branch's loose ref -- or, when it has none, of
+#                    packed-refs and of the directory a loose ref was
+#                    unlinked from. It also blocks each R whose working tree
+#                    has a change written inside the window: a TRACKED
+#                    change, or an UNTRACKED file (an ignored file never
+#                    counts). git status --untracked-files=all
+#                    (--no-optional-locks, so it never takes index.lock in a
+#                    shared checkout or rewrites the index;
+#                    core.fsmonitor=false, so no file-system monitor answers
+#                    for it or is started by it) lists them, dated by the
+#                    index's, each dirty path's own (an untracked file's
+#                    exactly as a tracked one's) and, for a deleted path, its
+#                    nearest existing parent's mtime OR ctime, whichever is
+#                    later (cp -p, rsync -a, tar x, touch -d, mv of an older
+#                    file and chmod keep or backdate an mtime, not a ctime);
+#                    an old dirty tree stays QUIET, untracked files included.
+#                    That dating is POSIX's: on Windows st_ctime is the
+#                    CREATION time, which none of those writes moves, so
+#                    there ANY change, an untracked file included, blocks R
+#                    however old (the safe direction: no stale residue is
+#                    restored or removed there while such a session works).
+#                    RESIDUAL, stated: the .git internals above are read by
+#                    mtime and entries only (a fixture cannot age a ctime), so
+#                    one rewritten with a preserved or backdated mtime and no
+#                    log entry is not seen; a stash deleted outright (git
+#                    stash clear, or a drop of its last entry, removes the ref
+#                    and its log alike) leaves nothing to read, and the sweep
+#                    never touches a stash; and git status, to compare a
+#                    stat-dirty tracked file's content, runs any clean filter
+#                    configured for it (git-lfs's among them) -- a process
+#                    this read starts, as repo_work()'s status does too, and
+#                    one that may write its own store (git-lfs writes
+#                    .git/lfs/objects). R
+#                    also blocks when any of that cannot be read (HEAD naming
+#                    neither a branch nor an object id; a missing, unreadable,
+#                    torn, unparseable or emptied HEAD or branch log; an
+#                    unreadable stash log or refs/stash; a git dir rev-parse
+#                    cannot resolve; a failing git status; any exception
+#                    reading R, which is R's UNKNOWN and is named on stderr,
+#                    never the whole probe's crash: UNKNOWN, never "no move").
+#                    RISKS, stated: checkout-ff QUIET also gates
+#                    --restore-residue, which reverts tracked files to a
+#                    classed upstream state AND unlinks each untracked file
+#                    byte-identical to the upstream tip, even in a tree with
+#                    no tracked change -- which is why the tree's recency
+#                    counts, untracked files included, not ref moves alone
+#                    (`cp $W/x $R/x` of the tip's x, or `git
+#                    --git-dir=$R/.git show origin/main:x > $R/x`, writes one
+#                    a restore would unlink). Every untracked file counts,
+#                    not only one at a path the last-fetched tip has: the
+#                    sweep fetches before it restores, so a stale
+#                    origin/<default> cannot bound which ones it unlinks --
+#                    and so an untracked file something keeps writing (a log
+#                    nothing ignores) keeps R BUSY while such a session
+#                    works: the safe direction. A long-running READER of R
+#                    that the ledger saw only through a `$` path
+#                    (`grep -r x $R`, a script reading `$R/...`, its cwd
+#                    elsewhere) no longer makes R BUSY: a read writes no ref
+#                    record and no tracked change, so a fast-forward can
+#                    change files under a read in progress (a build the census
+#                    sees still blocks R, by the build rule below). The
+#                    sweep's own fast-forward, and any pull, writes R's
+#                    logs/HEAD, so R stays BUSY for a window after it while a
+#                    GENERIC-only session works: the safe direction. Each
+#                    primary costs one read of HEAD and one git rev-parse,
+#                    plus a git status only when those leave it undecided (not
+#                    moved, not unreadable) -- each retried once, so one to
+#                    four git calls, each bounded at 30 s; a failure or a
+#                    timeout is that primary's UNKNOWN, so it blocks. Nothing
+#                    bounds the whole run to the scheduler's 120 s probe
+#                    ceiling (schedule-return-to-main.sh
+#                    PROBE_TIMEOUT_SECONDS): a probe that runs past it is
+#                    killed and reads NOT met (the runner's
+#                    scheduler_probe.rs), so the job does not fire -- the
+#                    safe direction.
+#                    A ledger reader that serves no specific_* keeps the old
+#                    rule: any unattributed touch in the window blocks every
+#                    repo. Also: a session whose cwd is in R; a build that
 #                    READS R's working tree (its source is R, or a path
 #                    dependency lands in R; a build sourced in a linked
 #                    worktree reads no primary; a build whose source cannot be
@@ -122,7 +218,12 @@
 #                    repos, nor by coord rows (not read under checkout-ff: a
 #                    fast-forward kills no session).
 #   checkout-return  (switch R off a parked branch) is blocked by all of the
-#                    above PLUS every session not `finished` (coord's
+#                    above -- except that the GENERIC confinement is
+#                    checkout-ff's alone: here ANY unattributed touch by a
+#                    working session within the window still blocks every
+#                    repo, unchanged (a return switches branches, and the
+#                    lifetime rule below is blind to a switch that landed
+#                    GENERIC) -- PLUS every session not `finished` (coord's
 #                    sessionStatus; an unreadable coord reads "not finished")
 #                    that EVER touched R's primary checkout -- its next commit
 #                    would land on the wrong branch. Whole-life attribution is
@@ -202,9 +303,15 @@
 #                       origin/<default> as last fetched (`git rev-list --count
 #                       HEAD..origin/<default>`), or modified TRACKED files
 #                       (`git --no-optional-locks status --porcelain
-#                       --untracked-files=no`; untracked files are never
-#                       residue-restored); checkout-return -- HEAD not on the
-#                       default branch. A git read that fails counts as work.
+#                       --untracked-files=no`). An untracked file alone is
+#                       not, although a residue restore does unlink one that
+#                       equals the upstream tip's file at its path: level with
+#                       origin/<default> that path is tracked, and behind it
+#                       the behind-count is work already; a parked or ahead
+#                       checkout whose only dirt is such a file waits for a
+#                       run another repo fires (repo_work() says why);
+#                       checkout-return -- HEAD not on the default branch. A
+#                       git read that fails counts as work.
 #                       The first QUIET repo with work stops the scan, and each
 #                       repo read carries per_repo[R].work{has_work, reason}.
 #
@@ -512,13 +619,23 @@ def cmd_next_cursor(body):
 # section-2 table. Quiet is a property of a (task, repo) pair:
 #   checkout-ff      blocked by a session WORKING (census activity working, or
 #                    unknown -- which is never quiet) whose touches within the
-#                    touch window name R, or are unattributed; a build reading
+#                    touch window name R, or include a SPECIFIC unattributed
+#                    one (every repo), or are unattributed only GENERICALLY
+#                    while R's own ref records (HEAD's log, its branch's log,
+#                    the stash log; HEAD, refs/stash and the loose ref, else
+#                    packed-refs, by mtime) moved inside the window, its tree
+#                    has a tracked change or an untracked file written in it,
+#                    or either cannot be read (a reader serving no specific_*
+#                    reads any unattributed touch as every repo);
+#                    a build reading
 #                    R's working tree; a git lock in R; an AI session whose cwd
 #                    names R. NOT by idle / waiting / stale sessions anywhere,
 #                    nor by builds of other repos.
-#   checkout-return  all of the above, PLUS any session not `finished` that
-#                    touched R at any point in its life (its next commit would
-#                    land on the wrong branch).
+#   checkout-return  all of the above -- except that ANY unattributed touch by
+#                    a working session in the window is every repo, unchanged
+#                    -- PLUS any session not `finished` that touched R at any
+#                    point in its life (its next commit would land on the
+#                    wrong branch).
 #   process-restart  today's machine-wide rule, unchanged, for every repo.
 # UNKNOWN activity or UNKNOWN attribution is the blocking case, never quiet
 # [policy: verification-and-evidence silent-empty-is-unknown].
@@ -638,23 +755,374 @@ def _under_root(path, root_native):
     return False
 
 
-def _git(repo_dir, *args):
+def _git(repo_dir, *args, raw=False):
+    """git's stdout, stripped; None when git fails or times out. raw=True gives
+    the BYTES unstripped -- `status -z` begins with a status column that may be
+    a space, and a path is not text. Every call READS a shared checkout, so it
+    takes no optional lock (--no-optional-locks, and GIT_OPTIONAL_LOCKS=0 for
+    any git it runs) and consults no file-system monitor (core.fsmonitor=false):
+    a configured hook would answer git status from its own state, and the
+    builtin daemon (core.fsmonitor=true) is STARTED by a git status that finds
+    it not running."""
     env = {k: v for k, v in os.environ.items() if k not in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE")}
     env["GIT_OPTIONAL_LOCKS"] = "0"
     try:
-        p = subprocess.run(["git", "--no-optional-locks", "-C", repo_dir] + list(args), capture_output=True,
-                           text=True, timeout=30, env=env)
+        p = subprocess.run(["git", "--no-optional-locks", "-C", repo_dir, "-c", "core.fsmonitor=false"] + list(args),
+                           capture_output=True, text=not raw, timeout=30, env=env)
     except (OSError, subprocess.SubprocessError):
         return None
-    return p.stdout.strip() if p.returncode == 0 else None
+    if p.returncode != 0:
+        return None
+    return p.stdout if raw else p.stdout.strip()
+
+
+# One reflog line, matched over the WHOLE line and about as strict as git's own
+# reader (show_one_reflog_ent in refs/files-backend.c, as of git v2.47.0) -- it
+# also takes a pair of object ids that mixes 40 and 64 hex, which git would
+# refuse, and it skips a blank line: two object ids, the identity up to the
+# FIRST '>' after them (a name may hold a TAB), a space, the entry's time, a
+# space and a +/-HHMM zone, then an optional TAB and message (`symbolic-ref`
+# without -m writes none). The time is 1-20 ASCII digits. [0-9], never \d: \d
+# also takes another script's decimal digits (U+0663, U+FF13), which int()
+# reads too (1, U+0663, 3 reads as 133), so a line git refuses would be read as
+# a time; and never str.isdigit(), which takes a superscript digit (U+00B2)
+# that int() refuses -- a crash. At most 20, because int() also refuses a
+# string past sys.get_int_max_str_digits().
+_REFLOG_LINE = re.compile(r"\A(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64}) (?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64}) "
+                          r"[^>]*> ([0-9]{1,20}) [+-][0-9]{4}(?:\t.*)?\Z", re.S)
+_OBJECT_ID = re.compile(r"\A(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})\Z")
+# A symref target refuses control characters, a space and DEL, as git's own
+# ref-name check does: a NUL would otherwise reach subprocess as an argument.
+_HEAD_SYMREF = re.compile(r"\Aref:\s*(refs/[^\x00-\x20\x7f]+)\Z")
+
+
+def _reflog_newest(path, missing_ok):
+    """The newest time one reflog FILE vouches for: the later of its newest
+    entry's time and the file's mtime. 0 for a missing file when `missing_ok`
+    (the stash log: no stash was ever made, or the last was dropped). None --
+    UNKNOWN -- for a missing HEAD or branch log, a file that cannot be read, a
+    torn last line, any line git's own reader would refuse (_REFLOG_LINE, or a
+    time of 0), and a HEAD or branch log holding no entry at all
+    (`git reflog expire --expire=now --all` leaves one 0 bytes long, hiding
+    every move it held).
+
+    The FILE, never `git log -g`: when HEAD's own log is missing or empty, git's
+    reflog walk falls back to the BRANCH's log (the review-arm corroborator's
+    `_head_log()` reads the file for the same reason). An entry's time is the
+    committer date git stamped it with -- now, unless an exported
+    GIT_COMMITTER_DATE says otherwise, which is why the mtime is read beside it
+    -- and never the commit's own date: a `reset --hard` to an old commit is a
+    recent entry."""
+    try:
+        with open(path, "rb") as fh:
+            mtime = os.fstat(fh.fileno()).st_mtime
+            text = fh.read().decode("utf-8", "replace")
+    except FileNotFoundError:
+        return 0 if missing_ok else None
+    except OSError:
+        return None
+    lines = text.split("\n")
+    if lines[-1].strip():
+        return None  # a torn last line: git appends whole lines, so a missing newline is a cut-short write
+    epochs = []
+    for ln in lines[:-1]:
+        if not ln.strip():
+            continue
+        m = _REFLOG_LINE.match(ln)
+        if m is None or int(m.group(1)) == 0:
+            return None  # a line git's own reader would refuse is UNKNOWN, never skipped
+        epochs.append(int(m.group(1)))
+    if not epochs and not missing_ok:
+        return None  # a HEAD or branch log holding no entry was emptied, so it cannot say
+    newest = max(epochs) if epochs else 0
+    return max(newest, mtime)
+
+
+def _mtime(path):
+    """A file's mtime; 0 when there is no such file (a branch whose ref is
+    packed has no loose one); None -- UNKNOWN -- when it cannot be read."""
+    try:
+        return os.stat(path).st_mtime
+    except FileNotFoundError:
+        return 0
+    except OSError:
+        return None
+
+
+def _latest(*times):
+    """The latest of several times; None -- UNKNOWN -- when any is None."""
+    return None if None in times else max(times)
+
+
+def _dir_above(path, stop):
+    """The mtime of the nearest existing directory above `path`, no higher than
+    `stop`: unlinking an entry rewrites it, so a loose ref deleted over an older
+    packed value still leaves a trace. None when that cannot be read."""
+    p = os.path.dirname(path)
+    while True:
+        try:
+            return os.stat(p).st_mtime
+        except FileNotFoundError:
+            if os.path.normcase(os.path.abspath(p)) == os.path.normcase(os.path.abspath(stop)):
+                return None
+            p = os.path.dirname(p)
+        except OSError:
+            return None
+
+
+def _changed(st):
+    """When a WORKING-TREE file last changed: the later of its mtime and its
+    ctime. A write that keeps or backdates the mtime -- cp -p, rsync -a, tar x,
+    touch -d, an mv of an older file over it, a chmod -- still moves the ctime,
+    which nothing in user space can set. That is POSIX's ctime: on Windows
+    st_ctime is the CREATION time, which none of those writes moves, so nothing
+    here could date them -- _tree_changes_written() dates no change there
+    (any change blocks) and never reaches this. Not used for the .git
+    internals: a fixture -- or anything -- that ages their mtime cannot age a
+    ctime, and their entries already carry their own times."""
+    return max(st.st_mtime, st.st_ctime)
+
+
+def _wt_changed(path):
+    """_changed() of one file by path; 0 when there is no such file; None --
+    UNKNOWN -- when it cannot be read."""
+    try:
+        return _changed(os.stat(path))
+    except FileNotFoundError:
+        return 0
+    except OSError:
+        return None
+
+
+def _named_git_dir(g):
+    """The git dir as an explicit argument, for every git call that reads a
+    primary's records: NAMED, never discovered -- from a primary whose .git is
+    corrupt, discovery walks up into an enclosing repository (a workspace root
+    may be one) and answers with that repository's records and tree."""
+    return "--git-dir=" + g
+
+
+def _primary_records(d):
+    """The times one primary's ref records vouch for (primary_generic_blockers()),
+    each None when that record cannot be read; None outright when HEAD names
+    neither a branch nor an object id, or rev-parse cannot resolve the paths."""
+    g = os.path.join(d, ".git")
+    try:
+        with open(os.path.join(g, "HEAD"), "rb") as fh:
+            head_mtime = os.fstat(fh.fileno()).st_mtime
+            head = fh.read().decode("utf-8", "replace").strip()
+    except OSError:
+        return None
+    sym = _HEAD_SYMREF.match(head)
+    if sym and ".." not in sym.group(1):
+        ref = sym.group(1)
+    elif _OBJECT_ID.match(head):
+        ref = None  # a detached HEAD names no branch, so it has no branch log to read
+    else:
+        return None
+    q = [_named_git_dir(g), "rev-parse", "--path-format=absolute", "--git-path", "logs/HEAD",
+         "--git-path", "logs/refs/stash"]
+    if ref:
+        q += ["--git-path", "logs/" + ref, "--git-path", ref, "--git-path", "packed-refs"]
+    q += ["--git-path", "refs/stash"]  # last, so every path above keeps its place
+    out = _git(d, *q)
+    if out is None:  # one retry: a transient failure on a loaded box is not blindness
+        out = _git(d, *q)
+    paths = (out or "").splitlines()
+    if len(paths) != (6 if ref else 3):
+        return None
+    times = [head_mtime,  # HEAD itself: a tool that rewrites HEAD without logging leaves only this
+             _reflog_newest(paths[0], False),  # logs/HEAD
+             _reflog_newest(paths[1], True)]  # logs/refs/stash
+    # The loose refs/stash: `git update-ref refs/stash` logs nothing when refs/stash has no log yet,
+    # unless --create-reflog (or core.logAllRefUpdates=always), so only this file's mtime records it.
+    times.append(_mtime(paths[-1]))  # the loose refs/stash
+    if ref:
+        times.append(_reflog_newest(paths[2], False))  # the branch's own log: a move made from another worktree skips logs/HEAD
+        loose = _mtime(paths[3])  # the branch's loose ref, when one exists: a ref file written with no log entry
+        if loose == 0:  # no loose ref: packed-refs (a packed ref rewritten in place), and the directory a loose ref was unlinked from
+            loose = _latest(_mtime(paths[4]), _dir_above(paths[3], g))
+        times.append(loose)
+    return times
+
+
+def _path_written(path, root):
+    """When one dirty path was last changed (_changed: mtime or ctime): its own
+    (lstat: a tracked symlink is itself the change); for a path that is gone,
+    its nearest existing parent directory's (removing an entry rewrites its
+    parent); None -- UNKNOWN -- when that cannot be read, or the checkout root
+    itself is gone."""
+    p = path
+    while True:
+        try:
+            return _changed(os.lstat(p))
+        except FileNotFoundError:
+            if os.path.normcase(os.path.abspath(p)) == os.path.normcase(os.path.abspath(root)):
+                return None
+            p = os.path.dirname(p)  # a path that is gone: its nearest existing parent records the removal
+        except OSError:
+            return None
+
+
+def _tree_changes_written(d, since):
+    """Whether a primary's working tree carries a change written inside the
+    window: a TRACKED change, or an UNTRACKED file -- git status
+    --untracked-files=all lists every one, and never an ignored file, which no
+    residue restore touches. False when the tree is clean, or (POSIX) every
+    change in it is older -- an old dirty tree stays QUIET, untracked files
+    included, so a stale residue can still be restored or removed. None --
+    UNKNOWN -- when git status fails or times out, or a dirty path cannot be
+    read. A change is dated by the latest of the index's change time (staging
+    writes it), each dirty path's own (both paths of a rename or copy; an
+    untracked file's exactly as a tracked one's) and, for a path that is gone,
+    its nearest existing parent's -- each by mtime or ctime (_changed). That
+    dating is POSIX's: on Windows (os.name nt) st_ctime is the CREATION time,
+    so cp -p or an mv of an older file over a tracked path, or an mv of one
+    into an untracked path, leaves nothing that could date the write, and ANY
+    change there -- an untracked file included -- reads as written inside the
+    window: a change that cannot be dated is never read as old. Why it counts:
+    checkout-ff QUIET also gates --restore-residue, which reverts tracked files
+    to a classed upstream state AND unlinks each untracked file byte-identical
+    to the upstream tip, even in a tree with no tracked change -- so a change a
+    live session wrote -- `GIT_DIR=$R/.git git checkout <old> -- p`,
+    `sed -i ... $C/x.md`, `cp $W/x $R/x` of the tip's x,
+    `git --git-dir=$R/.git show origin/main:x > $R/x` -- would be reverted or
+    unlinked under it. Every untracked file counts, not only one at a path the
+    last-fetched origin/<default> has: the sweep fetches before it restores,
+    so that tip cannot bound which ones a restore unlinks. _git() runs this
+    status with --no-optional-locks (and GIT_OPTIONAL_LOCKS=0), so it never
+    takes index.lock in a shared checkout -- a live session's commit would
+    fail on it -- nor rewrites the index whose time it then reads, and with
+    core.fsmonitor=false, so it scans the tree itself rather than trusting a
+    monitor's own state."""
+    g = os.path.join(d, ".git")
+    q = (_named_git_dir(g), "--work-tree=" + d, "status", "--porcelain=v1", "-z", "--untracked-files=all")
+    out = _git(d, *q, raw=True)
+    if out is None:  # one retry: a transient failure on a loaded box is not blindness
+        out = _git(d, *q, raw=True)
+    if out is None:
+        return None  # a status that failed or timed out cannot say the tree is clean
+    fields, paths, i = out.split(b"\0"), [], 0
+    while i < len(fields):
+        entry, i = fields[i], i + 1
+        if not entry:
+            continue
+        if len(entry) < 4:
+            return None  # a status entry out of shape
+        paths.append(entry[3:])  # `XY path`, a tracked change; `?? path`, an untracked file -- dated alike below
+        if (b"R" in entry[:2] or b"C" in entry[:2]) and i < len(fields):
+            paths.append(fields[i])  # a rename or copy names its source in the next field
+            i += 1
+    if not paths:
+        return False
+    if os.name == "nt":
+        return True  # st_ctime is the CREATION time here, so no time can date a write that kept its mtime: any change blocks, an untracked file included
+    times = [_wt_changed(os.path.join(g, "index"))]  # staging (git add, rm --cached, checkout -- p) rewrites the index
+    times += [_path_written(os.path.join(d, os.fsdecode(p)), d) for p in paths]
+    if None in times:
+        return None
+    return max(times) >= since
+
+
+def primary_generic_blockers(primaries, root_native, since):
+    """(moved, dirty, unread) over the primaries: what a working session whose
+    in-window unattributed touches are all GENERIC blocks under checkout-ff.
+
+    MOVED: a record git keeps of a ref write is newer than `since` -- the
+    primary's own logs/HEAD, the log of the branch HEAD names, logs/refs/stash
+    (each by its newest entry's time or the file's mtime, whichever is later),
+    or the mtime of HEAD itself, of the loose refs/stash, of that branch's loose
+    ref, or, with no loose ref, of packed-refs and of the directory a loose ref
+    was unlinked from (HEAD rewritten by a tool that does not log, a ref file
+    written directly -- a stash made by `update-ref refs/stash` among them -- a
+    packed ref rewritten in place, a loose ref deleted over an older packed
+    value). Residual, stated: these .git internals are read by mtime and
+    entries only, so one rewritten with a preserved or backdated mtime and no
+    log entry is not seen.
+
+    DIRTY: the working tree carries a change written inside the window -- a
+    tracked change or an untracked file, never an ignored one
+    (_tree_changes_written) -- by mtime or ctime; on Windows, where st_ctime
+    is the creation time, any change, an untracked file included.
+
+    UNREAD -- UNKNOWN, never "no move" [policy: verification-and-evidence
+    unknown-must-not-render-as-a-default]: HEAD names neither a branch nor an
+    object id, rev-parse cannot resolve the records' paths, a record cannot be
+    read (_reflog_newest(); a branch log is required on a branch, and a
+    detached HEAD has none), git status fails, or reading the primary raised at
+    all -- an input no reader here anticipated is that primary's UNKNOWN, named
+    on stderr, never the whole probe's crash. The git dir is NAMED rather than
+    discovered (_named_git_dir).
+
+    Cost, per primary: one read of HEAD and one rev-parse, and a git status only
+    when those leave it undecided (not moved, not unreadable) -- each retried
+    once, so one to four git calls -- at _git()'s 30 s timeout, plus a few
+    small file reads and one lstat per dirty path, untracked files included
+    (that status walks every directory that is not ignored). Nothing bounds
+    the whole run to the scheduler's 120 s probe ceiling
+    (schedule-return-to-main.sh PROBE_TIMEOUT_SECONDS): a probe that runs past
+    it is killed and reads NOT met (the runner's scheduler_probe.rs), so the
+    job does not fire -- the safe direction."""
+    moved, dirty, unread = set(), set(), set()
+    for r in sorted(primaries):
+        try:
+            verdict = _primary_verdict(os.path.join(root_native, r), since)
+        except Exception as e:  # one primary's unanticipated input is its own UNKNOWN, never the whole probe's crash
+            sys.stderr.write("machine-quiesce-check: reading %s's ref records raised %s (%s) -- read as UNKNOWN\n"
+                             % (r, type(e).__name__, e))
+            verdict = None
+        if verdict is None:
+            unread.add(r)
+        elif verdict == "moved":
+            moved.add(r)
+        elif verdict == "dirty":
+            dirty.add(r)
+    return moved, dirty, unread
+
+
+def _primary_verdict(d, since):
+    """One primary's verdict -- moved, dirty, still, or None (UNKNOWN): its ref
+    records first, then its git status only when they leave it undecided -- a
+    status costs a git call per primary, and a moved or unreadable primary
+    blocks whatever its tree holds."""
+    times = _primary_records(d)
+    if times is None or None in times:
+        return None
+    if max(times) >= since:
+        return "moved"
+    written = _tree_changes_written(d, since)
+    if written is None:
+        return None
+    return "dirty" if written else "still"
+
+
+def _names(repos, cap=6):
+    """A repo set spelled for a one-line `why`: the names, or a count and the
+    first few when the set is long."""
+    s = sorted(repos)
+    if not s:
+        return "none"
+    return ",".join(s) if len(s) <= cap else "%d: %s,..." % (len(s), ",".join(s[:cap]))
 
 
 def repo_work(for_class, repo_dir):
     """Whether R has something the sweep would do under this task class, read
     cheaply from what is already on disk (NO fetch: origin/<default> as last
     fetched -- the sweep fetches before it acts). checkout-ff: on its default
-    branch and behind origin/<default>, or modified TRACKED files (the only
-    thing a residue restore ever touches; untracked files never are).
+    branch and behind origin/<default>, or modified TRACKED files (residue
+    candidates). An untracked file alone is not, although a residue restore
+    does unlink one: only one byte-identical to the upstream tip's file at its
+    own path (dirty-provenance.sh untracked_on_upstream). On the default
+    branch level with origin/<default> that path is one HEAD tracks, so an
+    untracked file there means the index dropped it -- a staged deletion,
+    which this --untracked-files=no status lists -- and behind origin the
+    behind-count is work already; counting every untracked file would fire
+    the job for files no restore can touch. The residual, stated: a parked or
+    ahead checkout whose only dirt is such a file reads "nothing to do" and
+    fires nothing by itself -- a delay, never a move: the sweep still visits
+    it on a run another repo fires. Whether a restore may run at all is
+    per_repo_verdicts()'s question, not this one, and its GENERIC arm reads
+    untracked files (_tree_changes_written).
     checkout-return: HEAD on another branch or detached. A read that fails is
     reported as work (`unknown`): an unproven "nothing to do" must not keep
     the job from firing."""
@@ -723,6 +1191,14 @@ def per_repo_verdicts(for_class, machine_verdict, per_repo, census, blocking, pr
             # differently from its directory entry; compare as the OS does.
             return by_case.get(os.path.normcase(r), r)
         since = NOW - touch_window_s
+        generic_read = []  # primary_generic_blockers()'s one answer for this run
+
+        def generic_blockers():
+            """(moved, dirty, unread) -- read only when some working session's
+            in-window unattributed lines are all GENERIC, and at most once per run."""
+            if not generic_read:
+                generic_read.append(primary_generic_blockers(primaries, root_native, since))
+            return generic_read[0]
 
         def attribution(sid, lifetime):
             """(repos-or-ALL, why). Window touches for a working session;
@@ -746,12 +1222,39 @@ def per_repo_verdicts(for_class, machine_verdict, per_repo, census, blocking, pr
                     if (v.get("count") or 0) > 0:  # primary touches only: a worktree commit never lands on R's branch
                         repos.add(canon(r))
                 return repos, "touched %s in its life" % (",".join(sorted(repos)) or "no primary")
-            if (u.get("last_epoch") or 0) >= since:
-                return ALL, "an unattributed mutating call within %ds" % touch_window_s
             for r, v in (L.get("repos") or {}).items():
                 if max(v.get("last_epoch") or 0, v.get("worktree_last_epoch") or 0) >= since:
                     repos.add(canon(r))
-            return repos, "touched %s within %ds" % (",".join(sorted(repos)) or "no repo", touch_window_s)
+            why = "touched %s within %ds" % (",".join(sorted(repos)) or "no repo", touch_window_s)
+            if (u.get("last_epoch") or 0) < since:
+                return repos, why
+            # An unattributed mutating call inside the window. Every class but
+            # checkout-ff keeps reading it as every repo (a return switches
+            # branches, and the lifetime rule is already blind to a switch that
+            # landed GENERIC), and so does a reader that serves no specific_*:
+            # it cannot tell GENERIC from SPECIFIC, and absent is not null.
+            if for_class != "checkout-ff" or "specific_last_epoch" not in u:
+                return ALL, "an unattributed mutating call within %ds" % touch_window_s
+            if (u.get("specific_last_epoch") or 0) >= since:
+                return ALL, ("a SPECIFIC unattributed mutating call within %ds: it names somewhere the ledger cannot "
+                             "(an unresolvable cd / -C / --manifest-path / --prefix / --directory / --cwd target, an "
+                             "Edit/Write path it cannot resolve, an unreadable envelope or an unresolved workspace "
+                             "root)" % touch_window_s)
+            # GENERIC lines only (the no-path marker, a "generic":true `$`
+            # argument). One can still hide a ref move -- GIT_DIR=, --git-dir=,
+            # -c core.worktree=, xargs {}, a script -- or a write into the
+            # tree, tracked or untracked, so each repo's own records decide
+            # (primary_generic_blockers): HEAD's log, the named branch's log
+            # and the stash log, the mtimes of those files, of HEAD, of
+            # refs/stash and of the branch's loose ref (else packed-refs), and
+            # the tree's changes written in the window, untracked files
+            # included.
+            moved, dirty, unread = generic_blockers()
+            repos.update(moved, dirty, unread)
+            return repos, ("%s; GENERIC unattributed calls within %ds, so also every repo whose HEAD, branch or stash "
+                           "records moved in it (%s), has a tracked change or an untracked file written in it (%s), "
+                           "or cannot be read (%s)"
+                           % (why, touch_window_s, _names(moved), _names(dirty), _names(unread)))
 
         census_pids = set()
         for p in (census or {}).get("processes") or []:

@@ -10,12 +10,31 @@ triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid).
 <N> is a window count: 1 single, 2 split, 3 triptych, 4 quad, 5-6 six-pack,
 7-9 full-grid, 10+ flow-grid. `fit` means "the count of tabs on that page",
 resolved per page, which is how a page is trimmed after its finished sessions
-are closed: the runner grows a grid by itself but never shrinks one.
+are closed: a runner older than auto-trim grows a grid by itself but never
+shrinks one.
 
 With no --page the active page (the one on screen) is set. --trim-only skips a
 page unless the target has FEWER zones than the page's current grid, so it
 never grows a page or re-applies its current layout; re-applying clears a
-maximized zone, which is why a no-op is skipped rather than sent.
+maximized zone, which is why a no-op is skipped rather than sent. It also skips
+a page in tmux work mode (`workMode`), which has no grid to trim; a set without
+--trim-only takes such a page back to a grid and the row says so.
+
+--trim-only also reads who chose each page's layout (`get-page-layout`
+`layoutOrigin`, served by a runner that trims on its own):
+  auto      SKIPPED -- the runner chose it and shrinks it itself when tabs close;
+  operator  SKIPPED -- the operator chose it, and nothing shrinks that choice;
+  legacy    the page predates the field: trimmed as below, and sent with
+            `origin: "auto"`, so the runner owns (and trims) it from then on;
+  absent    a runner that does not trim on its own: trimmed as below.
+With the runner's own trim turned off (`autoTrim` false) the runner shrinks
+nothing, so an `auto` page is trimmed here too, again sent with
+`origin: "auto"`. Every trim of a page that reports an origin carries
+`origin: "auto"`: a set without one is an operator request, which the runner
+records as `operator`, and an `operator` page is one this step never trims
+again. The read-back requires `layoutOrigin` auto.
+The served field is how the build is told apart, not a `gitSha` ancestry test.
+Any other value is SKIPPED as unrecognised rather than guessed at.
 
 Drives the runner's UI Bridge component `zone-layout-picker`
 (`select-layout`, `get-page-layout`) over its HTTP API, and reads every set
@@ -93,6 +112,39 @@ def settles_at(target, tabs):
     return grown if zones(grown, tabs) > zones(target, tabs) else target
 
 
+# What --trim-only does with each served `layoutOrigin` (absent: None). A
+# runner that serves the field trims its own `auto` pages when tabs close, using
+# its own `pickLayout` (3 tabs -> quad) rather than `layout_for_count` (3 ->
+# triptych); skipping those pages is what keeps the two rules from fighting
+# over one grid. A `legacy` page this script trims is handed to the runner with
+# `origin: "auto"`, and the runner never re-trims a triptych at 3 tabs, because
+# it trims only to strictly fewer zones.
+ORIGIN_SKIPS = {
+    "auto": "runner trims this page itself when tabs close (layoutOrigin auto)",
+    "operator": "operator-chosen layout (layoutOrigin operator)",
+}
+TRIMMABLE_ORIGINS = (None, "legacy")
+
+
+def runner_trims(state):
+    """Does the runner shrink this page's grid by itself? Only a runner that
+    reports `autoTrim` true does; absent (an older build) or false does not."""
+    return state.get("autoTrim") is True
+
+
+def send_origin(state, trim_only):
+    """The `origin` to send with a set, or None to send none. A --trim-only set
+    of a page that reports an origin (it is `auto` or `legacy`, since `plan`
+    skips the rest) is the runner's kind of change, so it says so: sent without
+    an origin it would be an operator request, which records the page as
+    `operator`, and no later pass would trim it again. A trim always changes the
+    layout id, so the runner does record `auto`. A set without --trim-only is
+    the operator-style request the runner's `/layout` makes by default, and a
+    runner that serves no `layoutOrigin` is never sent a field it may not
+    know."""
+    return "auto" if trim_only and state.get("layoutOrigin") in ("auto", "legacy") else None
+
+
 def plan(arg, state, trim_only):
     """(status, settled, send, reason) for one page's read state, where status
     is SEND or SKIPPED. Pure, so the selftest can pin the trim rule."""
@@ -101,6 +153,13 @@ def plan(arg, state, trim_only):
     if target is None:
         return "SKIPPED", None, None, "no tabs on the page" if arg == "fit" else f"{arg!r} names no layout"
     settled = settles_at(target, tabs)
+    origin = state.get("layoutOrigin")
+    if trim_only and origin == "auto" and not runner_trims(state):
+        origin = None  # the runner's trim is off: this page is ours to trim, as on an older build
+    if trim_only and origin in ORIGIN_SKIPS:
+        return "SKIPPED", settled, send, ORIGIN_SKIPS[origin]
+    if trim_only and origin not in TRIMMABLE_ORIGINS:
+        return "SKIPPED", settled, send, f"unrecognised layoutOrigin {origin!r}; not trimmed"
     if trim_only and state.get("workMode") == "tmux":
         # A tmux page shows one session and reads as single, so there is no grid
         # to trim, and any set would take it out of the mode the operator chose.
@@ -109,7 +168,13 @@ def plan(arg, state, trim_only):
         # Re-applying the current id cannot shrink it (a flow-grid keeps its
         # highest occupied zone) and would clear a maximized zone.
         return "SKIPPED", settled, send, f"already {current}"
-    if trim_only and settled != FLOW_GRID and zones(settled, tabs) >= state["zoneCount"]:
+    if trim_only and settled == FLOW_GRID:
+        # flow-grid has a zone per tab and keeps one for its highest occupied
+        # tile, so it never has fewer zones than a fixed preset holding the same
+        # tabs: a page that settles there from another layout GROWS (full-grid
+        # at 12 tabs, before the runner's own auto-grow, read as SEND here).
+        return "SKIPPED", settled, send, f"{settled} would not trim {current}"
+    if trim_only and zones(settled, tabs) >= state["zoneCount"]:
         return "SKIPPED", settled, send, f"{settled} would not trim {current}"
     return "SEND", settled, send, ""
 
@@ -172,17 +237,25 @@ def set_page(arg, page_id, trim_only, dry_run):
         return row
     tmux = state.get("workMode") == "tmux"
     mode = ", tmux mode" if tmux else ""
-    row["before"] = f"{state['layoutId']} ({state['zoneCount']} zones, {state['tabCount']} tabs{mode})"
+    origin = state.get("layoutOrigin")
+    owner = f", origin {origin}" if origin is not None else ""
+    row["before"] = f"{state['layoutId']} ({state['zoneCount']} zones, {state['tabCount']} tabs{mode}{owner})"
     status, settled, send, reason = plan(arg, state, trim_only)
     row["target"] = settled
     if status == "SKIPPED":
         row["status"], row["reason"] = "SKIPPED", reason
         return row
+    hand_over = send_origin(state, trim_only)
+    handed = "; hands the page to the runner (origin auto)" if hand_over else ""
     if dry_run:
-        row["status"], row["reason"] = "DRY-RUN", f"would set {settled}" + ("; leaves tmux mode" if tmux else "")
+        row["status"], row["reason"] = ("DRY-RUN", f"would set {settled}"
+                                        + ("; leaves tmux mode" if tmux else "") + handed)
         return row
+    params = {"layoutId": send, "pageId": page_id}
+    if hand_over:
+        params["origin"] = hand_over
     try:
-        res = action("select-layout", {"layoutId": send, "pageId": page_id})
+        res = action("select-layout", params)
     except PAGE_FAULTS as e:
         row["reason"] = f"select-layout refused: {e}"
         return row
@@ -198,15 +271,18 @@ def set_page(arg, page_id, trim_only, dry_run):
             row["reason"] = f"set sent; read-back refused: {e}"
             return row
         if (after["layoutId"] == want and (not trim_only or after["zoneCount"] < state["zoneCount"])
-                and not (tmux and after.get("workMode") == "tmux")):
+                and not (tmux and after.get("workMode") == "tmux")
+                and (not hand_over or after.get("layoutOrigin") == hand_over)):
             row["after"], row["status"] = f"{want} ({after['zoneCount']} zones)", "SET"
-            row["reason"] = "read back; left tmux mode" if tmux else "read back"
+            row["reason"] = ("read back; left tmux mode" if tmux else "read back") + handed
             return row
     if after is not None:
         row["after"] = f"{after['layoutId']} ({after['zoneCount']} zones)"
         row["reason"] = f"read back {row['after']}, wanted {want}" + (" with fewer zones" if trim_only else "")
         if tmux and after.get("workMode") == "tmux":
             row["reason"] = f"read back {row['after']}, still in tmux mode"
+        elif hand_over and after["layoutId"] == want and after.get("layoutOrigin") != hand_over:
+            row["reason"] = f"read back {row['after']}, but layoutOrigin {after.get('layoutOrigin')!r}, wanted {hand_over!r}"
     return row
 
 
@@ -246,16 +322,51 @@ def selftest():
         ("fit", {"layoutId": "split", "zoneCount": 2, "tabCount": 5}, False, "SEND", "six-pack"),
         ("fit", {"layoutId": "single", "zoneCount": 1, "tabCount": 0}, True, "SKIPPED", None),
         ("fit", {"layoutId": "single", "zoneCount": 1, "tabCount": 1, "workMode": "tmux"}, True, "SKIPPED", "single"),
-        # The one case only the tmux rule skips: a flow-grid target passes the zone test.
         ("fit", {"layoutId": "single", "zoneCount": 1, "tabCount": 12, "workMode": "tmux"}, True, "SKIPPED", FLOW_GRID),
+        # A flow-grid target never trims: from full-grid at 12 tabs it would grow.
+        ("fit", {"layoutId": "full-grid", "zoneCount": 9, "tabCount": 12}, True, "SKIPPED", FLOW_GRID),
+        ("full-grid", {"layoutId": "full-grid", "zoneCount": 9, "tabCount": 12, "layoutOrigin": "legacy", "autoTrim": True}, True, "SKIPPED", FLOW_GRID),
+        ("fit", {"layoutId": "full-grid", "zoneCount": 9, "tabCount": 12}, False, "SEND", FLOW_GRID),
         ("fit", {"layoutId": "single", "zoneCount": 1, "tabCount": 4, "workMode": "tmux"}, False, "SEND", "quad"),
         ("fit", {"layoutId": "full-grid", "zoneCount": 9, "tabCount": 4, "workMode": "grid"}, True, "SEND", "quad"),
+        # layoutOrigin (a runner that trims on its own): auto and operator pages
+        # are the runner's and the operator's; a legacy page is trimmed as before.
+        ("fit", {"layoutId": "full-grid", "zoneCount": 9, "tabCount": 4, "layoutOrigin": "auto", "autoTrim": True}, True, "SKIPPED", "quad"),
+        # The runner's own trim off (or unreported): an auto page is ours to trim.
+        ("fit", {"layoutId": "full-grid", "zoneCount": 9, "tabCount": 4, "layoutOrigin": "auto", "autoTrim": False}, True, "SEND", "quad"),
+        ("fit", {"layoutId": "full-grid", "zoneCount": 9, "tabCount": 4, "layoutOrigin": "auto"}, True, "SEND", "quad"),
+        ("fit", {"layoutId": "full-grid", "zoneCount": 9, "tabCount": 4, "layoutOrigin": "operator", "autoTrim": False}, True, "SKIPPED", "quad"),
+        ("fit", {"layoutId": "full-grid", "zoneCount": 9, "tabCount": 4, "layoutOrigin": "operator"}, True, "SKIPPED", "quad"),
+        ("fit", {"layoutId": "full-grid", "zoneCount": 9, "tabCount": 4, "layoutOrigin": "legacy"}, True, "SEND", "quad"),
+        ("fit", {"layoutId": "full-grid", "zoneCount": 9, "tabCount": 4, "layoutOrigin": "mystery"}, True, "SKIPPED", "quad"),
+        # Without --trim-only the origin decides nothing: an explicit set is sent.
+        ("fit", {"layoutId": "full-grid", "zoneCount": 9, "tabCount": 4, "layoutOrigin": "operator"}, False, "SEND", "quad"),
     ]
     for arg, state, trim, want_status, want_settled in plans:
         got = plan(arg, state, trim)[:2]
         if got != (want_status, want_settled):
             print(f"FAIL plan({arg!r}, {state}, trim={trim}) = {got}, want {(want_status, want_settled)}")
             failures += 1
+    origins = [  # (state, trim_only, origin a set sends)
+        ({"layoutOrigin": "legacy", "autoTrim": True}, True, "auto"),
+        ({"layoutOrigin": "legacy", "autoTrim": False}, True, "auto"),
+        ({"layoutOrigin": "auto", "autoTrim": False}, True, "auto"),
+        ({"layoutOrigin": "legacy"}, False, None),  # an explicit set is the operator's
+        ({}, True, None),  # an older runner is never sent the field
+    ]
+    for state, trim, want in origins:
+        if send_origin(state, trim) != want:
+            print(f"FAIL send_origin({state}, trim={trim}) = {send_origin(state, trim)!r}, want {want!r}")
+            failures += 1
+    # The invariant the rows above sample: no --trim-only SEND of a page that
+    # reports an origin goes out without one, or the page turns `operator`.
+    for origin in ("auto", "legacy", "operator", "mystery"):
+        for trim_on in (True, False):
+            st = {"layoutId": "full-grid", "zoneCount": 9, "tabCount": 4, "layoutOrigin": origin, "autoTrim": trim_on}
+            for arg in ("fit", "4", "Quad"):
+                if plan(arg, st, True)[0] == "SEND" and send_origin(st, True) != "auto":
+                    print(f"FAIL a --trim-only SEND of a {origin} page ({arg!r}) carries no origin")
+                    failures += 1
     for arg, want in [(None, None), ("", []), (" , ", []), ("a", ["a"]), ("a, b,", ["a", "b"])]:
         if page_ids(arg) != want:
             print(f"FAIL page_ids({arg!r}) = {page_ids(arg)!r}, want {want!r}")
@@ -265,11 +376,17 @@ def selftest():
             print(f"FAIL resolve({bad!r}) accepted a non-ASCII digit")
             failures += 1
     print(f"selftest: {len(expect)} count cases, {len(cases)} resolve cases, {len(plans)} plan cases, "
+          f"{len(origins)} origin cases, "
           f"{failures} failure(s)")
     return 1 if failures else 0
 
 
 def main():
+    for stream in (sys.stdout, sys.stderr):  # a piped Windows console is cp1252
+        try:
+            stream.reconfigure(encoding="utf-8", errors="backslashreplace")
+        except (AttributeError, ValueError, OSError):
+            pass
     if "--selftest" in sys.argv[1:]:
         return selftest()
     ap = argparse.ArgumentParser()
