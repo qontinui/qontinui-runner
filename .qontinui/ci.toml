@@ -261,6 +261,18 @@ cargo_build_jobs = 1
 #   extractor smoke" (ubuntu only, continue-on-error, needs a secret): not
 #   part of `test (windows-latest)`, so a Windows shadow correctly omits them.
 #
+# - "Setup Python (provisioning env e2e)" + "Provisioning env e2e" (both
+#   legs, hosted runners only; plan
+#   2026-11-06-ci-node-provisioning-children-inherit-only-an-allowlisted-environment
+#   2.6): the e2e needs a host Python 3 with `venv`, which this lane never
+#   installs (`no_python_refusal` in src-tauri/src/ci_node/tools.rs), plus
+#   `actions/setup-python`, a hosted-infra setup action this manifest does not
+#   mirror. Both leave with ci_node/tools.rs when qontinui-runner#1995 lands.
+#
+# - "Unix extractor tests ran (ubuntu)" (ubuntu only; Phase 4 of the same
+#   plan): it reads `cargo-test-output.log`, an Actions-only log of the
+#   build/run split, which this lane folds into one `cargo test`.
+#
 # - Non-gate diagnostics and reporting ("Explain which Rust test phase the
 #   bound expired in", "Windows memory peak after the Rust test steps",
 #   "Report test results to coord"): they read Actions-only state and decide

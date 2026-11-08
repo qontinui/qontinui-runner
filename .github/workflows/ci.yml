@@ -447,11 +447,20 @@ jobs:
     # 180 = 90 + 20 + 10 (allowance for an `if: failure()` failure-path
     # classifier with a 600 s budget, proposed in open PRs #1655/#1769) + 49
     # (measured overhead max) = 169, rounded up to 180 (~6.5% for overhead
-    # growth). The cap
-    # still bounds a genuine hang at 3 h, half GitHub's 360-minute default.
-    # `ci_rust_test_steps_split.rs` pins this cap >= build + run + 50 so a
-    # future change to either step bound has to move this line too.
-    timeout-minutes: 180
+    # growth).
+    #
+    # 190 since plan
+    # 2026-11-06-ci-node-provisioning-children-inherit-only-an-allowlisted-environment
+    # (Phases 2 and 4) added three BOUNDED steps that the 49-minute measurement
+    # predates, so their bounds join the sum: `Unix extractor tests ran
+    # (ubuntu)` 2 + `Setup Python (provisioning env e2e)` 5 + `Provisioning
+    # env e2e` 10 = 17, and 169 + 17 = 186, past 180 — rounded up to 190. The
+    # cap still bounds a genuine hang at 3 h 10 min, about half GitHub's
+    # 360-minute default.
+    # `ci_rust_test_steps_split.rs` pins this cap >= build + run + 50 + the
+    # bounds of those three steps, so a future change to any of those step
+    # bounds has to move this line too.
+    timeout-minutes: 190
 
     steps:
       # Full history, blobless: workspace_assumptions_are_enumerated.rs takes its
@@ -1745,6 +1754,46 @@ jobs:
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
+      # Plan 2026-11-06-ci-node-provisioning-children-inherit-only-an-allowlisted-environment,
+      # Phase 4 (follow-up #2 of plan 2026-08-08-ci-tool-registry-and-canonical-configuration-parity):
+      # the ubuntu leg PROVES that the three Unix-discriminating extractor tests
+      # of `ci_node::tools` ran. They drive the extractor's `#[cfg(unix)]`
+      # arms, which a Windows run never executes, and a test that silently
+      # stops running — renamed, re-gated, its binary lost — leaves every
+      # check green. This
+      # reads the run half's own log (no cargo) and fails unless each name,
+      # spelled out below, has a `... ok` line. It leaves with
+      # `ci_node/tools.rs` when qontinui-runner#1995 lands. `.qontinui/ci.toml`
+      # declares it as a divergence.
+      - name: Unix extractor tests ran (ubuntu)
+        if: matrix.platform == 'ubuntu-22.04'
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          LOG="$GITHUB_WORKSPACE/cargo-test-output.log"
+          if [ ! -s "$LOG" ]; then
+            echo "::error title=Unix extractor tests UNKNOWN::$LOG is missing or empty, so whether the Unix extractor tests ran is UNKNOWN, not a pass."
+            exit 1
+          fi
+          # Strip ANSI into a file first: a `| grep -q` would end the pipe early
+          # and, under pipefail, turn a match into a SIGPIPE failure.
+          ESC=$(printf '\033')
+          CLEAN="$RUNNER_TEMP/cargo-test-output.plain.log"
+          sed -e "s/${ESC}\[[0-9;]*m//g" "$LOG" > "$CLEAN"
+          missing=0
+          for name in \
+            ci_node::tools::tests::two_link_chain_cannot_escape_the_extraction_root \
+            ci_node::tools::tests::no_symlink_is_ever_created_under_the_destination \
+            ci_node::tools::tests::a_contained_link_chain_materialises; do
+            if grep -qF "test $name ... ok" "$CLEAN"; then
+              echo "ran: test $name ... ok"
+            else
+              echo "::error title=Unix extractor test did not run::no \`test $name ... ok\` line in $LOG. A Unix-only arm of the tool extractor stopped executing on the ubuntu leg."
+              missing=1
+            fi
+          done
+          exit "$missing"
+
       # Plan 2026-10-27-coord-routes-ci-jobs-by-runner-capability, Phase 1 (D4):
       # say so when a Rust test step ran OUT OF MEMORY, so coord treats the red
       # as CAPACITY rather than CODE. Job 122032841168 died in `Build Rust tests`
@@ -2119,6 +2168,78 @@ jobs:
         run: |
           & ./scripts/ci/stop-leftover-processes.ps1 -Workspace $env:GITHUB_WORKSPACE -TargetRoot "$env:QONTINUI_CI_TARGET" -Why 'this job'
           exit $LASTEXITCODE
+
+      # Plan 2026-11-06-ci-node-provisioning-children-inherit-only-an-allowlisted-environment,
+      # Phase 2 (D5): the hermetic proof that a CI-node provisioning child —
+      # entered through `ci_node::tools::provision`, the function a dispatch
+      # calls — sees only the allowlisted environment, on BOTH legs. The test
+      # is `#[ignore]`d in the suite because it needs a host Python 3 with
+      # `venv` (and a host node, which `Setup Node.js` already provides); these
+      # two steps supply the Python and run the built bin test binary directly,
+      # as `Live AI extractor smoke` does — no cargo.
+      #
+      # POSITION: after every step that runs Python. `setup-python` changes
+      # what `python3`/`python` resolve to, PATH and, on Linux,
+      # `LD_LIBRARY_PATH` for every LATER step, so these two sit below the
+      # windows contract smoke as well, whose runner boot could start a
+      # Python. `Report this job's resources` stays last.
+      #
+      # POOLS: hosted runners only, until a self-hosted pool is MEASURED able
+      # to run `setup-python` (or to supply its own Python 3 with venv); an
+      # unmeasured pool is UNKNOWN, not capable. Every pull request takes the
+      # hosted floor, so each PR's own run still exercises this. Widen the
+      # `if:` by pool label as pools are measured.
+      #
+      # BOUNDS: each step carries its own, and both join the job cap's sum
+      # above `timeout-minutes` for this job.
+      - name: Setup Python (provisioning env e2e)
+        if: runner.environment == 'github-hosted'
+        timeout-minutes: 5
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Gating, never `continue-on-error`. The two canaries are what the test
+      # proves absent: the proxy must reach no child but `pip install` (it
+      # points at a closed loopback port, and the probe installs with
+      # `--no-index`), and the credential must reach none. The test first
+      # REQUIRES both in its own environment, so a run without them reds
+      # rather than passing vacuously. `.qontinui/ci.toml` declares both steps
+      # as a divergence.
+      - name: Provisioning env e2e
+        if: runner.environment == 'github-hosted'
+        timeout-minutes: 10
+        shell: bash
+        env:
+          HTTPS_PROXY: http://127.0.0.1:9
+          QONTINUI_E2E_CANARY_PASSWORD: canary
+        run: |
+          # KEEP THIS `cd` — cargo runs a test binary from the package manifest
+          # directory, and so must we (see `Run Rust tests`).
+          cd src-tauri
+          BUILD_LOG="$GITHUB_WORKSPACE/cargo-test-build.log"
+          BIN=""
+          if [ -f "$BUILD_LOG" ]; then
+            # Every match, then the first by parameter expansion: a `| head`
+            # could end the pipe early and fail it under pipefail.
+            ESC=$(printf '\033')
+            BINS=$(sed -e "s/${ESC}\[[0-9;]*m//g" "$BUILD_LOG" \
+              | sed -n 's/^[[:space:]]*Executable `\(.*[/\\]qontinui_runner-[0-9a-f]\{16\}\(\.exe\)\{0,1\}\)`[[:space:]]*$/\1/p')
+            BIN="${BINS%%$'\n'*}"
+          fi
+          if [ -z "$BIN" ]; then
+            echo "::error title=Provisioning env e2e not run::found no qontinui_runner bin test binary in $BUILD_LOG. This is UNKNOWN, not a pass."
+            exit 1
+          fi
+          # `--exact` on a renamed test matches nothing, and libtest exits 0 on
+          # `0 passed`, so the step must also see the one pass.
+          "${BIN//\\//}" --ignored --exact \
+            ci_node::child_env::tests::provisioning_children_see_only_allowlisted_names \
+            2>&1 | tee "$RUNNER_TEMP/provisioning-env-e2e.log"
+          if ! grep -q 'test result: ok\. 1 passed' "$RUNNER_TEMP/provisioning-env-e2e.log"; then
+            echo "::error title=Provisioning env e2e ran no test::the test binary did not report exactly one passing test. The test was probably renamed. This is UNKNOWN, not a pass."
+            exit 1
+          fi
 
       # Plan 2026-10-27-coord-routes-ci-jobs-by-runner-capability, Phase 2:
       # ONE `::notice title=qontinui-resource-report::{json}` per job saying
