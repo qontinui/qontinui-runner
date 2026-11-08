@@ -25,6 +25,15 @@ interface RecordedZoneBackstopInput {
   pageId: string;
   /** What each session's durable record was last WRITTEN with. */
   recordedZones: RecordedZoneLedger;
+  /**
+   * The page's restore run has finished (`restoreCompletePages.has(pageId)`).
+   * Until then the durable record is the SOURCE OF TRUTH the restore places
+   * sessions from, and a reload's reconnected tabs sit in zones taken from
+   * localStorage or creation-order auto-fill, so a first-seen sync would
+   * overwrite the record restore is about to read. First-seen sessions are
+   * therefore neither synced nor seeded until this is true.
+   */
+  restoreComplete: boolean;
 }
 
 /**
@@ -70,20 +79,27 @@ export function useRecordedZoneBackstop({
   tabs,
   pageId,
   recordedZones,
+  restoreComplete,
 }: RecordedZoneBackstopInput): void {
   const isTmux = workMode === "tmux";
   useEffect(() => {
     if (isTmux) return;
     const timer = setTimeout(() => {
+      const observed = tabs
+        .filter((tab): tab is typeof tab & { claudeSessionId: string } => !!tab.claudeSessionId)
+        .map((tab) => ({
+          claudeSessionId: tab.claudeSessionId,
+          tabId: tab.id,
+          zoneIndex: resolveZoneIndex(assignments, tab.id),
+        }));
+      // Before the page's restore has finished, only sessions this page has
+      // already written are re-resolved: a first-seen session stays unseeded,
+      // so it is first-seen again once `restoreComplete` flips.
       const { reemits, firstSeen } = planZoneReemits(
         recordedZones,
-        tabs
-          .filter((tab): tab is typeof tab & { claudeSessionId: string } => !!tab.claudeSessionId)
-          .map((tab) => ({
-            claudeSessionId: tab.claudeSessionId,
-            tabId: tab.id,
-            zoneIndex: resolveZoneIndex(assignments, tab.id),
-          })),
+        restoreComplete
+          ? observed
+          : observed.filter((obs) => recordedZones.has(obs.claudeSessionId)),
       );
       for (const emit of reemits) {
         const tab = tabs.find((t) => t.id === emit.tabId);
@@ -111,5 +127,5 @@ export function useRecordedZoneBackstop({
       }
     }, ZONE_BACKSTOP_DEBOUNCE_MS);
     return () => clearTimeout(timer);
-  }, [assignments, tabs, pageId, recordedZones, isTmux]);
+  }, [assignments, tabs, pageId, recordedZones, isTmux, restoreComplete]);
 }
