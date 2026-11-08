@@ -173,6 +173,20 @@ impl ProgressSink {
         Self { tx, tail, flusher }
     }
 
+    /// TEST-ONLY sink with no coord: the tail ring records every line and the
+    /// flusher only drains the channel. A dead-port [`ProgressSink::start`]
+    /// attempts a POST per line once [`FLUSH_MAX_LINES`] are pending, and
+    /// with no device JWT each attempt waits out the re-mint window, so a
+    /// test pushing tens of thousands of lines could not `finish()` in any
+    /// useful time.
+    #[cfg(test)]
+    pub(crate) fn tail_only() -> Self {
+        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        let tail = Arc::new(Mutex::new(TailRing::new(LOG_TAIL_CAP_BYTES)));
+        let flusher = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        Self { tx, tail, flusher }
+    }
+
     /// Record one output line (tail ring + progress batch). Never blocks.
     pub(crate) fn push(&self, line: &str) {
         if let Ok(mut tail) = self.tail.lock() {
