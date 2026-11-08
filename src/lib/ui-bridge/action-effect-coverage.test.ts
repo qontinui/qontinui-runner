@@ -418,6 +418,111 @@ function resolveSignature(init: ts.Expression): EffectSignature | string {
   return `unresolvable signature initializer ${init.getText()}`;
 }
 
+/**
+ * Non-vacuity floor for the live-argument check: the non-literal factory
+ * arguments the four components' registrations passed on 2026-11-08
+ * (three `zoneViewSignature` facts refs, `popOutActiveTerminalSignature`,
+ * `popOutPageSignature`, `moveTerminalSignature`, `selectLayoutSignature`,
+ * `loadProfileSignature`, and `workModeSignature`'s thunk).
+ */
+const MIN_LIVE_SIGNATURE_ARGS = 9;
+
+/** The initializer of `const <name> = …` in `sf`, or `undefined` when none. */
+function constInitializer(sf: ts.SourceFile, name: string): ts.Expression | undefined {
+  let found: ts.Expression | undefined;
+  const visit = (node: ts.Node): void => {
+    if (found) return;
+    if (
+      ts.isVariableDeclaration(node) &&
+      ts.isIdentifier(node.name) &&
+      node.name.text === name &&
+      node.initializer
+    ) {
+      found = node.initializer;
+      return;
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sf);
+  return found;
+}
+
+function isCallTo(expr: ts.Expression | undefined, callee: string): boolean {
+  return (
+    expr !== undefined &&
+    ts.isCallExpression(expr) &&
+    ts.isIdentifier(expr.expression) &&
+    expr.expression.text === callee
+  );
+}
+
+/** Does `sf` assign `<name>.current = …` anywhere? */
+function assignsCurrent(sf: ts.SourceFile, name: string): boolean {
+  let found = false;
+  const visit = (node: ts.Node): void => {
+    if (found) return;
+    if (
+      ts.isBinaryExpression(node) &&
+      node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+      ts.isPropertyAccessExpression(node.left) &&
+      node.left.name.text === "current" &&
+      ts.isIdentifier(node.left.expression) &&
+      node.left.expression.text === name
+    ) {
+      found = true;
+      return;
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sf);
+  return found;
+}
+
+/**
+ * Why a non-literal signature-factory argument at a registration does NOT
+ * hand the signature live state, or `null` when it does.
+ *
+ * `useUIComponent` keeps the signature an action was first registered with,
+ * so a factory argument is read when `predict` runs, long after the render
+ * that built it. Two shapes carry live state there:
+ *   - an identifier bound by `const R = useLiveRef(…)` in the same file
+ *     (`src/components/terminal/useLiveRef.ts`);
+ *   - a thunk `() => R.current…` over such a ref, or over a `useRef` the file
+ *     keeps current by assigning `R.current = …` (the work-mode actions'
+ *     invocation-time `workModeRef`).
+ * Anything else, such as `{ current: value }`, a `useRef` nothing updates,
+ * or a thunk returning a constant, freezes the value the signature predicts
+ * from at mount.
+ */
+function liveArgumentDefect(arg: ts.Expression): string | null {
+  const sf = arg.getSourceFile();
+  if (ts.isIdentifier(arg)) {
+    const init = constInitializer(sf, arg.text);
+    return isCallTo(init, "useLiveRef")
+      ? null
+      : `\`${arg.text}\` is not bound by \`useLiveRef(…)\` (bound by: ${init?.getText().slice(0, 60) ?? "nothing in this file"})`;
+  }
+  if (ts.isArrowFunction(arg) && !ts.isBlock(arg.body)) {
+    let root: ts.Expression = arg.body;
+    while (ts.isPropertyAccessExpression(root) && root.name.text !== "current") {
+      root = root.expression;
+    }
+    if (
+      ts.isPropertyAccessExpression(root) &&
+      root.name.text === "current" &&
+      ts.isIdentifier(root.expression)
+    ) {
+      const name = root.expression.text;
+      const init = constInitializer(sf, name);
+      if (isCallTo(init, "useLiveRef")) return null;
+      if (isCallTo(init, "useRef") && assignsCurrent(sf, name)) return null;
+      return `thunk reads \`${name}.current\`, but \`${name}\` is neither a \`useLiveRef\` nor a \`useRef\` the file keeps current`;
+    }
+    return `thunk \`${arg.getText().slice(0, 60)}\` does not read a ref's \`.current\``;
+  }
+  return `\`${arg.getText().slice(0, 60)}\` is neither a \`useLiveRef\` ref nor a thunk over one`;
+}
+
 function snapshotOf(ids: string[]): SemanticSnapshot {
   return { elements: ids.map((id) => ({ id })) } as unknown as SemanticSnapshot;
 }
@@ -493,6 +598,27 @@ describe("component-action signature coverage (terminal page)", () => {
       if (normalized?.provenance !== "declared") wrong.push(`${key}: provenance not declared`);
     }
     expect(wrong).toEqual([]);
+  });
+
+  it("every non-literal signature-factory argument hands the signature LIVE state", () => {
+    // The stubs above stand in for these arguments, so the predict checks
+    // cannot see what a registration really passes. This reads it from source:
+    // a ref the signature reads when `predict` runs, never a value frozen at
+    // mount (see `liveArgumentDefect`).
+    const defects: string[] = [];
+    let checked = 0;
+    for (const a of scoped) {
+      const init = a.signature;
+      if (!init || !ts.isCallExpression(init)) continue;
+      for (const arg of init.arguments) {
+        if (ts.isStringLiteral(arg) || ts.isNoSubstitutionTemplateLiteral(arg)) continue;
+        checked += 1;
+        const defect = liveArgumentDefect(arg);
+        if (defect) defects.push(`${a.component}.${a.action} (${a.where}): ${defect}`);
+      }
+    }
+    expect(checked).toBeGreaterThanOrEqual(MIN_LIVE_SIGNATURE_ARGS);
+    expect(defects).toEqual([]);
   });
 
   it("factory-built actions carry their signature at RUNTIME, not only in source", () => {
