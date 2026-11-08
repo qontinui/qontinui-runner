@@ -133,3 +133,22 @@ describe("TenantBadge mount sites mirror the SessionInfoDropdown mount sites", (
     }
   });
 });
+
+/**
+ * `ZoneCell` is memoized per tab and must stay context-free: the tenant
+ * switcher flag reaches it as the `tenantSwitcherShown` prop (plan
+ * `2026-11-08-tenant-badge-parity-and-oracle-fixtures` D2). A context read in
+ * the cell would re-render every zone on each tenant-context change.
+ */
+describe("ZoneCell stays context-free for the tenant flag", () => {
+  it("reads neither useTenant nor TenantContext", () => {
+    // Code lines only: the prop's docstring names `useTenant()` to say why not.
+    const code = ZONE_CELL.split("\n")
+      .filter((line) => !/^\s*(\*|\/\/|\/\*)/.test(line))
+      .join("\n");
+    expect(code).not.toMatch(/\buseTenant\s*\(/);
+    expect(code).not.toMatch(/\bTenantContext\b/);
+    expect(code).not.toMatch(/\buseContext\s*\(/);
+    expect(ZONE_CELL).toContain("tenantSwitcherShown");
+  });
+});
