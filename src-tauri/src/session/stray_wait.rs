@@ -3104,8 +3104,10 @@ mod tests {
         /// D2) on real processes: it keeps a recorded stray that is still the same
         /// process and still a stray of its class, and drops one that is gone, one
         /// whose start ticks differ (a reused pid), one whose argv differs (an
-        /// `exec`), and one whose loop condition has flipped. One test, because the
-        /// re-proof is single-flight: two running at once could read each other BUSY.
+        /// `exec`), and one whose loop condition has flipped; and the child gate's
+        /// `ChildExemptions::admitted` over the same real stray. One test, because
+        /// the re-proof is single-flight: two running at once could read each other
+        /// BUSY.
         #[tokio::test]
         async fn reprove_keeps_only_a_stray_whose_identity_and_verdict_still_hold() {
             let dir = tempfile::tempdir().unwrap();
@@ -3141,6 +3143,35 @@ mod tests {
                 "only the unchanged stray of the same class is re-proven"
             );
             assert!(reprove_strays(Vec::new()).await.is_empty());
+
+            // The graceful-exit child gate's `ProvenStray` arm, end to end over
+            // the same real stray: admitted only while it re-proves, only among
+            // the children it is asked about.
+            use crate::terminal::graceful_exit::ChildExemptions;
+            let other = stray.pid.wrapping_add(1);
+            assert_eq!(
+                ChildExemptions::from_strays(vec![stray.clone()])
+                    .admitted(&[stray.pid, other])
+                    .await,
+                std::collections::BTreeSet::from([stray.pid]),
+                "a re-proven stray among the children is admitted"
+            );
+            assert!(
+                ChildExemptions::from_strays(vec![stray.clone()])
+                    .admitted(&[other])
+                    .await
+                    .is_empty(),
+                "a stray that WOULD re-prove is not admitted when it is not a child"
+            );
+            let mut execed = stray.clone();
+            execed.argv.push("x".to_string());
+            assert!(
+                ChildExemptions::from_strays(vec![execed])
+                    .admitted(&[stray.pid, other])
+                    .await
+                    .is_empty(),
+                "a stray whose argv changed is not admitted"
+            );
 
             // Class (b-file): a loop whose condition flipped is the same process
             // with the same argv and start ticks, now on its way to post-loop work.
