@@ -8,9 +8,11 @@
 //!
 //! NAMES, NEVER VALUES. Every child these tests start prints the names of its
 //! environment and nothing else, and every assertion and failure message
-//! carries names only. A mutation run (no `env_clear()`) spawns children that
-//! inherit the whole test environment, which on a developer box holds
-//! plaintext passwords.
+//! carries names only — a token a child reports is printed only when it is a
+//! name this process already knows ([`printable`]), and an error only through
+//! [`headline`], which withholds child output. A mutation run (no
+//! `env_clear()`) spawns children that inherit the whole test environment,
+//! which on a developer box holds plaintext passwords.
 
 use super::*;
 use std::path::{Path, PathBuf};
@@ -164,9 +166,9 @@ fn reported_names(output: &str) -> Vec<String> {
 }
 
 /// Is `token` shaped like an environment NAME (`^[A-Za-z_][A-Za-z0-9_()]*$`,
-/// the parentheses for Windows' `ProgramFiles(x86)`)? Only such a token is
-/// ever printed; any other may be part of a value, so it counts as unexpected
-/// and is never printed.
+/// the parentheses for Windows' `ProgramFiles(x86)`)? A token that is not
+/// may be part of a value, so it counts as unexpected and is never printed.
+/// Name-shaped is necessary for printing, not sufficient: see [`printable`].
 fn printable_name(token: &str) -> bool {
     let mut chars = token.chars();
     chars
@@ -175,17 +177,45 @@ fn printable_name(token: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '(' | ')'))
 }
 
-/// `tokens` as a failure message may show them: the printable names, and a
-/// COUNT of the rest — never their text.
+/// Every name these tests spell out as a literal: the two allowlists, the
+/// explicit pip config, the spawn test's explicit name and both interpreters'
+/// measured additions.
+fn literal_names() -> Vec<&'static str> {
+    let mut names = base_names();
+    names.extend(NETWORK_NAMES.iter().copied());
+    names.extend(["PIP_CONFIG_FILE", EXPLICIT]);
+    names.extend(printer_allowance());
+    names.extend(probe_allowance());
+    names
+}
+
+/// May a failure message print `token`? Fails CLOSED. Name-SHAPED is not
+/// enough: the Windows printer echoes the start of each continuation line of
+/// a multi-line value, and such a fragment can be name-shaped (a word, a
+/// key). So a token is printed only when it is also a NAME this process
+/// already knows — a key of its own environment (compared the way the OS
+/// compares names) or one of [`literal_names`]. A child's environment is a
+/// subset of those two by construction, so nothing a correct child reports
+/// is lost; anything else is counted, never shown.
+fn printable(token: &str) -> bool {
+    printable_name(token)
+        && (holds(&literal_names(), token)
+            || std::env::vars_os().any(|(name, _)| same(&name.to_string_lossy(), token)))
+}
+
+/// `tokens` as a failure message may show them: the [`printable`] names, and
+/// a COUNT of the rest — never their text.
 fn shown<S: AsRef<str>>(tokens: &[S]) -> String {
     let printable: Vec<&str> = tokens
         .iter()
         .map(AsRef::as_ref)
-        .filter(|token| printable_name(token))
+        .filter(|token| printable(token))
         .collect();
     match tokens.len() - printable.len() {
         0 => format!("{printable:?}"),
-        withheld => format!("{printable:?} and {withheld} unprintable token(s), withheld"),
+        withheld => {
+            format!("{printable:?} and {withheld} token(s) that are not a known name, withheld")
+        }
     }
 }
 
@@ -386,18 +416,113 @@ async fn names_seen_by_a_child(policy: ChildEnv, envs: &[(String, String)]) -> V
     reported_names(&out)
 }
 
-/// A name printer's failure, fit for a panic message. `run_capture_env`
-/// appends the child's OUTPUT to an exit failure (`… exited <status>
-/// (<output>)`), and a printer's output may hold a value fragment, so only the
-/// command and status are kept. A spawn or timeout failure carries no output.
+/// A name printer's failure, fit for a panic message: [`headline`] of it.
 fn printer_failure(error: &str) -> String {
-    match error.split_once(" exited ") {
-        Some((command, rest)) => {
-            let status = rest.split(" (").next().unwrap_or_default();
-            format!("{command} exited {status} (its output is withheld)")
-        }
-        None => error.to_string(),
+    headline(&error)
+}
+
+/// What a test message may say about a spawn or provisioning error: the
+/// program, its redacted argv and the exit status, never child output (it
+/// could echo an environment value). Fails CLOSED: any shape not recognised
+/// here is withheld whole. Ported from the qontinui-schemas ci-exec twin; the
+/// shapes are `tools::run_capture_env`'s and `find_python`'s:
+///
+/// - A first line holding `reported ` anywhere is withheld whole:
+///   `find_python`'s refusal quotes a candidate's stdout there.
+/// - `<program> <argv> exited <status> (<child output>)`, the exit shape,
+///   keeps the text before the first ` exited ` plus at most 60 characters of
+///   the status, cut at ` (`.
+/// - Without ` exited `, `spawn <program>: <os error>` (and the Windows
+///   `spawn <program> (direct: …; cmd /C: …)`) and the exact timeout shape
+///   `<program> did not answer [<argv>] within <n>s` carry no child output,
+///   so their first line passes.
+fn headline(e: &impl std::fmt::Display) -> String {
+    let text = e.to_string();
+    let first_line = text.lines().next().unwrap_or("");
+    let withheld = format!("<error withheld: {} bytes>", text.len());
+    // find_python's refusal quotes a candidate's stdout after `reported `,
+    // and a child can print anything inside ` exited ... (`: check both
+    // before any arm that would pass the line through.
+    if first_line.contains("reported ") {
+        return withheld;
     }
+    let Some(at) = first_line.find(" exited ") else {
+        if first_line.starts_with("spawn ") || is_did_not_answer(first_line) {
+            return first_line.to_string();
+        }
+        return withheld;
+    };
+    let prefix = &first_line[..at];
+    let rest = &first_line[at + " exited ".len()..];
+    let status: String = rest
+        .split(" (")
+        .next()
+        .unwrap_or("")
+        .chars()
+        .take(60)
+        .collect();
+    format!("{prefix} exited {status} (child output withheld)")
+}
+
+/// `run_capture_env`'s timeout shape, anchored at both ends:
+/// `<program> did not answer [<argv>] within <n>s`.
+fn is_did_not_answer(line: &str) -> bool {
+    let Some(at) = line.find(" did not answer [") else {
+        return false;
+    };
+    let Some(within) = line.rfind("] within ") else {
+        return false;
+    };
+    let secs = &line[within + "] within ".len()..];
+    within > at
+        && !line[..at].contains(' ')
+        && secs.len() > 1
+        && secs.ends_with('s')
+        && secs[..secs.len() - 1].chars().all(|c| c.is_ascii_digit())
+}
+
+#[test]
+fn headline_never_passes_child_output() {
+    let cases = [
+        // find_python's refusal: a candidate's stdout, then a timeout.
+        "no Python 3 interpreter found — tried (python3: reported \"SECRET=hunter2\"; \
+         python: python did not answer [\"--version\"] within 30s)",
+        // ...and beside an exited candidate, where only the `reported `
+        // check withholds it.
+        "no Python 3 interpreter found — tried (python3: reported \"SECRET=hunter2\"; \
+         python: python [\"--version\"] exited exit status: 9009 (x))",
+        // a spawn line must not pass once ` exited ` follows it.
+        "spawn npm: x exited 1 (TOKEN=abc)",
+        // child output that merely contains the timeout words.
+        "npm [\"ci\"] exited exit status: 1 (TOKEN=abc registry did not answer in time)",
+        "npm [\"ci\"] exited exit status: 1 (TOKEN=abc)",
+        "something else entirely: TOKEN=abc",
+    ];
+    for case in cases {
+        let shown = headline(&case);
+        assert!(
+            !shown.contains("hunter2") && !shown.contains("TOKEN"),
+            "headline passed child output for a case of {} bytes",
+            case.len()
+        );
+    }
+    assert_eq!(
+        headline(&"npm [\"ci\"] exited exit status: 1 (TOKEN=abc)"),
+        "npm [\"ci\"] exited exit status: 1 (child output withheld)"
+    );
+    let timeout = "python3 [\"-m\", \"venv\"] did not answer within 60s";
+    assert!(!is_did_not_answer(timeout), "argv is printed in [...]");
+    let timeout = "python3 [\"-m\", \"venv\"] did not answer [\"x\"] within 60s";
+    assert!(
+        !is_did_not_answer(timeout),
+        "program must be one word before the argv"
+    );
+    let timeout = "python3 did not answer [\"-m\", \"venv\"] within 60s";
+    assert_eq!(headline(&timeout), timeout);
+    assert_eq!(
+        headline(&"spawn python3: No such file or directory"),
+        "spawn python3: No such file or directory"
+    );
 }
 
 /// A provisioning child sees the allowlist, the explicit pip config and its
@@ -770,13 +895,19 @@ async fn provisioning_children_see_only_allowlisted_names() {
         }
         let mut log: Vec<String> = Vec::new();
         let outcome = tools::provision(&root, &declared, &mut |line| log.push(line)).await;
+        // The log is never printed: its lines can carry child output.
         if let Err(e) = outcome {
-            panic!("{pass}: provisioning the probe failed: {e}\nlog: {log:#?}");
+            panic!(
+                "{pass}: provisioning the probe failed: {} ({} log lines withheld)",
+                headline(&e),
+                log.len()
+            );
         }
         assert!(
             log.iter().any(|line| line.contains(path_marker)),
             "{pass}: no `{path_marker}` line, so this call did not take the path \
-             it is named for; log: {log:#?}"
+             it is named for ({} log lines withheld: they can carry child output)",
+            log.len()
         );
         let seen = std::fs::read_to_string(&seen_file).unwrap_or_else(|e| {
             panic!(
@@ -806,15 +937,21 @@ async fn provisioning_children_see_only_allowlisted_names() {
         ChildEnv::Provisioning,
     )
     .await
-    .unwrap_or_else(|e| panic!("the host node did not report a version: {e}"));
+    .unwrap_or_else(|e| panic!("the host node did not report a version: {}", headline(&e)));
     let version = reported.trim().trim_start_matches('v').to_string();
     let provides = tools::verify_node_tree_for_test(bin_dir, &version)
         .await
-        .unwrap_or_else(|e| panic!("the host node tree failed verification: {e}"));
+        .unwrap_or_else(|e| panic!("the host node tree failed verification: {}", headline(&e)));
+    // Only each report's leading program word is printed: the rest is a
+    // child's stdout, which a test message never carries.
+    let verified: Vec<&str> = provides
+        .iter()
+        .filter_map(|line| line.split_whitespace().next())
+        .collect();
     for companion in ["npm ", "npx "] {
         assert!(
             provides.iter().any(|line| line.starts_with(companion)),
-            "no `{companion}` report from the node verification: {provides:?}"
+            "no `{companion}` report from the node verification (verified: {verified:?})"
         );
     }
 }
@@ -823,7 +960,8 @@ async fn provisioning_children_see_only_allowlisted_names() {
 /// environment: `pip install` fetches through it, and each tool's own
 /// `--version` code runs under it. A measurement, run by hand once per
 /// reachable OS — no CI step runs it (plan D5, 2.7). Run with `--nocapture`
-/// to see each tool's outcome and reported versions.
+/// to see each tool's outcome and time. Its log and child output are never
+/// printed, so a failure names only the error's [`headline`].
 #[tokio::test]
 #[ignore = "networked: downloads every registry tool (GitHub, nodejs.org, PyPI); a once-per-OS measurement, not a gate"]
 async fn networked_provision_of_every_registry_tool() {
@@ -859,12 +997,18 @@ async fn networked_provision_of_every_registry_tool() {
             },
             started.elapsed().as_secs_f64()
         );
-        for line in &log {
-            println!("   {line}");
-        }
+        // Neither the log nor a raw error is printed: both can carry child
+        // output, and `pip install` runs with the proxy names, which can hold
+        // a credential. Only the outcome, the log size and the error's
+        // `headline` are shown.
+        println!(
+            "   {} log lines withheld (they can carry child output)",
+            log.len()
+        );
         if let Err(e) = outcome {
-            println!("   error: {e}");
-            failures.push(format!("{name} {version}: {e}"));
+            let shown = headline(&e);
+            println!("   error: {shown}");
+            failures.push(format!("{name} {version}: {shown}"));
         }
     }
     assert!(failures.is_empty(), "{failures:#?}");
