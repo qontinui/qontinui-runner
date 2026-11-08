@@ -10412,10 +10412,18 @@ fn provision_agent_definitions_from_root(
     };
     let embedded = embedded_report.written;
     capability_manifest::record_provision(worktree_cwd, embedded_report);
+    // The floor's files on disk now: every embedded def this pass did not keep.
+    // Each untracked one gets its own anchored exclude line below, with the
+    // overlay's, so a no-op closeout does not read the runner's copies as work.
+    let mut written_agents: Vec<String> = crate::fleet_agents::embedded_agent_names()
+        .into_iter()
+        .filter(|name| keep.reason(name).is_none() && dst_dir.join(name).is_file())
+        .collect();
 
     // CHECKOUT WINS: the operator's live copies are overlaid on top below, so
     // editing qontinui-claude-config/.claude/agents behaves exactly as before.
     if !src_dir.is_dir() {
+        exclude_written_agents(&dst_dir, &tracked, &written_agents);
         warn!(
             "agent_runtime: no claude-config agents dir at {}; keeping the \
              {embedded} embedded subagent def(s) already provisioned into {}",
@@ -10497,8 +10505,10 @@ fn provision_agent_definitions_from_root(
             continue;
         }
         report.record_written();
+        written_agents.push(unit);
         copied += 1;
     }
+    exclude_written_agents(&dst_dir, &tracked, &written_agents);
     info!(
         "agent_runtime: overlaid {copied} checkout subagent def(s) onto {embedded} embedded default(s) in {}",
         dst_dir.display()
@@ -10513,6 +10523,28 @@ fn provision_agent_definitions_from_root(
         report.set_rung(capability_manifest::Rung::Unresolved);
     }
     Ok(report)
+}
+
+/// One anchored exclude line per agent def this pass wrote into `dst_dir` that
+/// the repo does not track (plan
+/// `2026-11-03-the-runners-served-claude-corpus-makes-every-no-op-closeout-not-closeable`
+/// Phase 1; the writer is [`crate::fleet::exclude_served_files`]). An UNKNOWN
+/// tracked probe inside a repository writes none: it cannot say which are
+/// tracked.
+fn exclude_written_agents(
+    dst_dir: &Path,
+    tracked: &crate::provision_guard::TrackedPaths,
+    written: &[String],
+) {
+    if tracked.is_unknown_in_repo() {
+        return;
+    }
+    let untracked: Vec<PathBuf> = written
+        .iter()
+        .filter(|name| !tracked.contains(Path::new(name.as_str())))
+        .map(PathBuf::from)
+        .collect();
+    crate::fleet::exclude_served_files(dst_dir, &untracked, &[]);
 }
 
 /// The workspace root holding the runner's canonical checkouts.
@@ -14334,6 +14366,190 @@ mod tests {
             p.display()
         );
         assert!(p.to_string_lossy().contains("qontinui-worktrees"));
+    }
+
+    /// Plan 2026-11-03-the-runners-served-claude-corpus-makes-every-no-op-closeout-not-closeable
+    /// Phase 1: provisioning all three served folders into a LINKED worktree
+    /// of a fixture repo leaves `git status --porcelain` empty, because each
+    /// provisioner excludes exactly the untracked files it wrote, per file, in
+    /// the common dir's `info/exclude`.
+    mod served_corpus_excludes {
+        use super::*;
+        use std::process::Command;
+
+        fn git(dir: &Path, args: &[&str]) -> String {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.com")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.com")
+                .output()
+                .expect("git runs");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim_end().to_string()
+        }
+
+        /// A primary checkout tracking `tracked`, and a linked worktree of it.
+        fn fixture(tracked: &[(&str, &str)]) -> (tempfile::TempDir, PathBuf, PathBuf) {
+            let tmp = tempfile::tempdir().unwrap();
+            let primary = tmp.path().join("app");
+            std::fs::create_dir_all(&primary).unwrap();
+            git(&primary, &["init", "--quiet", "-b", "main"]);
+            git(&primary, &["config", "commit.gpgsign", "false"]);
+            std::fs::write(primary.join("README.md"), "app\n").unwrap();
+            for (rel, body) in tracked {
+                let path = primary.join(rel);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, body).unwrap();
+            }
+            git(&primary, &["add", "-A"]);
+            git(&primary, &["commit", "--quiet", "-m", "app"]);
+            let tree = tmp.path().join("wt");
+            git(
+                &primary,
+                &[
+                    "worktree",
+                    "add",
+                    "--quiet",
+                    "--detach",
+                    tree.to_str().unwrap(),
+                ],
+            );
+            (tmp, primary, tree)
+        }
+
+        /// Run every served-corpus provisioner the spawn paths run.
+        fn provision(tree: &Path, qontinui_root: &Path) {
+            let claude = tree.join(".claude");
+            crate::fleet_commands::provision_fleet_commands_into(
+                &claude.join("commands"),
+                &crate::agent_commands::AgentCommandRegistry::new(),
+            )
+            .unwrap();
+            crate::fleet_skills::provision_fleet_skills_into(
+                &claude.join("skills"),
+                &crate::agent_skills::AgentSkillRegistry::new(),
+                None,
+            )
+            .unwrap();
+            provision_agent_definitions_from_root(qontinui_root, &tree.to_string_lossy()).unwrap();
+        }
+
+        fn status(tree: &Path) -> String {
+            git(tree, &["status", "--porcelain", "--untracked-files=all"])
+        }
+
+        /// (a) Nothing tracked under `.claude/`.
+        #[test]
+        fn nothing_tracked_reads_clean() {
+            let (tmp, primary, tree) = fixture(&[]);
+            provision(&tree, tmp.path());
+            assert!(
+                tree.join(".claude/commands/vet-plan.md").is_file(),
+                "it provisioned"
+            );
+            assert_eq!(status(&tree), "", "every runner-written file is excluded");
+            // The lines are per file and anchored, in the COMMON dir's exclude.
+            let exclude = std::fs::read_to_string(primary.join(".git/info/exclude")).unwrap();
+            assert!(
+                exclude
+                    .lines()
+                    .any(|l| l == "/.claude/commands/vet-plan.md"),
+                "{exclude}"
+            );
+            assert!(
+                exclude
+                    .lines()
+                    .any(|l| l == "/.claude/skills/**/__pycache__/"),
+                "{exclude}"
+            );
+            assert!(!exclude
+                .lines()
+                .any(|l| l == "/.claude/commands/" || l == ".claude/commands/"));
+            // The primary reads clean too: it shares that exclude.
+            assert_eq!(status(&primary), "");
+            // A second pass adds nothing: the writer is append-only and whole-line.
+            provision(&tree, tmp.path());
+            assert_eq!(
+                std::fs::read_to_string(primary.join(".git/info/exclude")).unwrap(),
+                exclude
+            );
+            // Bytecode a session's helper run leaves is covered as well.
+            let pyc = tree.join(".claude/skills/command-scripts/x/__pycache__/m.cpython-313.pyc");
+            std::fs::create_dir_all(pyc.parent().unwrap()).unwrap();
+            std::fs::write(&pyc, b"x").unwrap();
+            assert_eq!(status(&tree), "");
+        }
+
+        /// (b) The clone-factory shape: a tracked `.claude/agents/<x>.md`.
+        #[test]
+        fn clone_factory_shape_reads_clean() {
+            let (tmp, _primary, tree) =
+                fixture(&[(".claude/agents/clone-implementer.md", "tracked\n")]);
+            provision(&tree, tmp.path());
+            assert_eq!(status(&tree), "");
+        }
+
+        /// (c) A tracked `.claude/commands/vet-plan.md` gets no line, and a NEW
+        /// untracked file under the same folder is still listed.
+        #[test]
+        fn tracked_command_gets_no_line_and_new_files_stay_visible() {
+            let (tmp, primary, tree) =
+                fixture(&[(".claude/commands/vet-plan.md", "the repo's own\n")]);
+            provision(&tree, tmp.path());
+            let exclude = std::fs::read_to_string(primary.join(".git/info/exclude")).unwrap();
+            assert!(!exclude.contains("vet-plan.md"), "{exclude}");
+            assert!(
+                exclude
+                    .lines()
+                    .any(|l| l == "/.claude/commands/implement-plan.md"),
+                "{exclude}"
+            );
+            assert_eq!(
+                status(&tree),
+                "",
+                "the tracked file was kept, the rest excluded"
+            );
+            std::fs::write(tree.join(".claude/commands/new.md"), "a session's work\n").unwrap();
+            assert_eq!(status(&tree), "?? .claude/commands/new.md");
+        }
+
+        /// Outside any repository nothing is written and nothing fails.
+        #[test]
+        fn outside_a_repository_writes_no_exclude() {
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path().join(".claude").join("commands");
+            crate::fleet_commands::provision_fleet_commands_into(
+                &dir,
+                &crate::agent_commands::AgentCommandRegistry::new(),
+            )
+            .unwrap();
+            assert!(!tmp.path().join(".git").exists());
+        }
+
+        /// A name holding glob characters matches only itself.
+        #[test]
+        fn exclude_lines_are_literal() {
+            let (_tmp, primary, tree) = fixture(&[]);
+            let dir = tree.join(".claude/commands");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("a*.md"), "x").unwrap();
+            std::fs::write(dir.join("ab.md"), "y").unwrap();
+            crate::fleet::exclude_served_files(&dir, &[PathBuf::from("a*.md")], &[]);
+            let exclude = std::fs::read_to_string(primary.join(".git/info/exclude")).unwrap();
+            assert!(
+                exclude.lines().any(|l| l == "/.claude/commands/a\\*.md"),
+                "{exclude}"
+            );
+            assert_eq!(status(&tree), "?? .claude/commands/ab.md");
+        }
     }
 
     #[test]

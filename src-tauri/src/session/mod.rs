@@ -84,6 +84,7 @@ pub mod respawn;
 pub mod restore_census; // Pre/post-restart session census — the G6 outcome check behind GET /control/sessions/restore-census
 pub mod restore_record_emitter;
 pub mod resume_door; // POST /control/sessions/resume — local resume of closed unfinished sessions (plan 2026-10-06-closed-sessions-whose-work-is-unfinished, Phase 4)
+pub mod served_residue; // The served-corpus residue rule the custody probe applies before calling a tree dirty — the runner half of qontinui-claude-config session-closeable.sh (plan 2026-11-03-the-runners-served-claude-corpus-makes-every-no-op-closeout-not-closeable, Phase 2)
 pub mod session_id; // The ONE Rust answer to "is this a usable provider session id?" — mirrors the frontend isValidSessionId (plan 2026-08-23-single-source-derived-facts, item 1 step 1)
 pub mod session_ledger; // Rebuild-safe, DISK-persisted open-session ledger — the post-rebuild "what did not come back" report (plan 2026-08-22-wip-custody, Phase 4)
 pub mod session_lifecycle_store;

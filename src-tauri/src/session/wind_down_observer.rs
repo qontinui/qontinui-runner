@@ -56,6 +56,7 @@ use std::time::Duration;
 
 use crate::agent_worktree::custody::{self, coord::CoordOwnership};
 use crate::mcp::session_work_status::StatusFetch;
+use crate::session::served_residue;
 use crate::session::session_lifecycle_store::TerminalSessionRecord;
 use crate::session::tracking_health::{LiveClaudeProcess, SessionWorkStatus, TrackingHealthPass};
 use crate::terminal::agent_status_sideband::ObservedAgentState;
@@ -842,6 +843,14 @@ impl GitCustodyProbe {
             .env("GIT_NO_LAZY_FETCH", "1")
             .stdin(std::process::Stdio::null())
             .kill_on_drop(true);
+        // A caller `GIT_CONFIG_*` override can set `core.excludesFile` and hide
+        // untracked work from `git status`, so none reaches a probe (the same
+        // rule as qontinui-claude-config session-closeable.sh).
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("GIT_CONFIG") {
+                cmd.env_remove(key);
+            }
+        }
         match tokio::time::timeout(self.timeout, cmd.output()).await {
             Ok(Ok(output)) => Ok(output),
             Ok(Err(e)) => Err(format!("git {} could not run: {e}", args.join(" "))),
@@ -930,6 +939,35 @@ impl GitCustodyProbe {
     }
 }
 
+/// Fold one tree's [`served_residue::ChangesJudgement`] and its unpushed-commit
+/// count into a [`MemberState`]. A definite reason (uncommitted work, or
+/// commits on no remote) outranks an unjudged one; an unjudged tree with
+/// nothing definite is a failed probe — UNKNOWN, never clean.
+fn member_state_from(
+    judgement: served_residue::ChangesJudgement,
+    ahead: Result<u64, String>,
+) -> MemberState {
+    if judgement.residue > 0 {
+        tracing::debug!(
+            residue = judgement.residue,
+            "custody probe: untracked served-corpus files judged runner residue"
+        );
+    }
+    match (judgement.uncommitted, judgement.unknown, ahead) {
+        (_, _, Err(e)) => MemberState::ProbeFailed(e),
+        (Some(_), _, Ok(ahead)) => MemberState::Probed { dirty: true, ahead },
+        (None, Some(_), Ok(ahead)) if ahead > 0 => MemberState::Probed {
+            dirty: false,
+            ahead,
+        },
+        (None, Some(why), Ok(_)) => MemberState::ProbeFailed(why),
+        (None, None, Ok(ahead)) => MemberState::Probed {
+            dirty: false,
+            ahead,
+        },
+    }
+}
+
 /// One line describing a git probe that exited non-zero.
 fn failed_git(args: &[&str], output: &std::process::Output) -> String {
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -978,20 +1016,42 @@ impl CustodyProbe for GitCustodyProbe {
             Ok(_) => {}
             Err(e) => return MemberState::ProbeFailed(format!("{}/.git: {e}", root.display())),
         }
-        let status = match self
-            .git_ok(root, &["status", "--porcelain", "--untracked-files=normal"])
-            .await
-        {
-            Ok(out) => out,
+        let status_args = ["status", "--porcelain", "--untracked-files=normal"];
+        let status = match self.git(root, &status_args).await {
+            Ok(out) if out.status.success() => out,
+            Ok(out) => return MemberState::ProbeFailed(failed_git(&status_args, &out)),
             Err(e) => return MemberState::ProbeFailed(e),
         };
-        match self.unpushed_commits(root).await {
-            Ok(ahead) => MemberState::Probed {
-                dirty: !status.is_empty(),
-                ahead,
-            },
-            Err(e) => MemberState::ProbeFailed(e),
-        }
+        // The served-corpus residue rule (plan
+        // 2026-11-03-the-runners-served-claude-corpus-makes-every-no-op-closeout-not-closeable,
+        // Phase 2): untracked files that are the runner's own provisioned
+        // bytes are not the session's work, and anything `git status` warned
+        // about is unjudged rather than clean.
+        let judgement = {
+            let root = root.to_path_buf();
+            let porcelain = String::from_utf8_lossy(&status.stdout).into_owned();
+            let warning =
+                (!status.stderr.is_empty()).then(|| served_residue::stderr_gist(&status.stderr));
+            let per_call = self.timeout;
+            qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
+                let refs = served_residue::ServedRefs::under(
+                    crate::workspace_paths::workspace_root_readonly().as_deref(),
+                );
+                served_residue::judge_changes(
+                    &root,
+                    &porcelain,
+                    warning.as_deref(),
+                    &refs,
+                    &served_residue::Git::new(per_call),
+                )
+            })
+            .await
+        };
+        let judgement = match judgement {
+            Ok(j) => j,
+            Err(e) => return MemberState::ProbeFailed(format!("served-corpus judge died: {e}")),
+        };
+        member_state_from(judgement, self.unpushed_commits(root).await)
     }
 
     async fn slot_wip_state(&self, root: &Path, claude_session_id: &str) -> Option<String> {
@@ -1031,6 +1091,55 @@ mod tests {
             blocks_restart: status != Some("finished"),
             wind_down: None,
         }
+    }
+
+    /// The residue judgement folds into a member state: definite outranks
+    /// unjudged, and unjudged with nothing definite is never clean.
+    #[test]
+    fn member_state_from_folds_the_residue_judgement() {
+        use served_residue::ChangesJudgement;
+        let clean = ChangesJudgement {
+            residue: 3,
+            ..Default::default()
+        };
+        let dirty = ChangesJudgement {
+            uncommitted: Some("edit".into()),
+            ..Default::default()
+        };
+        let unknown = ChangesJudgement {
+            unknown: Some("unverifiable".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            member_state_from(clean.clone(), Ok(0)),
+            MemberState::Probed {
+                dirty: false,
+                ahead: 0
+            }
+        );
+        assert_eq!(
+            member_state_from(dirty, Ok(0)),
+            MemberState::Probed {
+                dirty: true,
+                ahead: 0
+            }
+        );
+        assert_eq!(
+            member_state_from(unknown.clone(), Ok(0)),
+            MemberState::ProbeFailed("unverifiable".into())
+        );
+        // Unpushed commits are definite: the tree is dirty whatever was unjudged.
+        assert_eq!(
+            member_state_from(unknown, Ok(2)),
+            MemberState::Probed {
+                dirty: false,
+                ahead: 2
+            }
+        );
+        assert_eq!(
+            member_state_from(clean, Err("x".into())),
+            MemberState::ProbeFailed("x".into())
+        );
     }
 
     #[test]

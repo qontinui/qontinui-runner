@@ -485,6 +485,9 @@ pub(crate) fn provision_fleet_skills_into(
         registry.override_count()
     ));
 
+    // Files this pass wrote that the repo does not track: each gets its own
+    // anchored exclude line once every skill is written.
+    let mut untracked_written: Vec<std::path::PathBuf> = Vec::new();
     for (skill, source) in resolved.iter().zip(&sources) {
         let files = source.files();
         // A whole-skill refusal is recorded as `<name>/*`, not as the bare
@@ -603,7 +606,17 @@ pub(crate) fn provision_fleet_skills_into(
                 continue;
             }
             out.record_written();
+            if !tracked.contains(&relative) {
+                untracked_written.push(relative);
+            }
         }
+    }
+    // One anchored line per untracked file written, plus the bytecode cache a
+    // bundled Python helper leaves beside itself when a session runs it. An
+    // UNKNOWN probe inside a repository writes none (it cannot say what is
+    // tracked); a pass that wrote nothing adds no `__pycache__` line either.
+    if !tracked.is_unknown_in_repo() && !untracked_written.is_empty() {
+        crate::fleet::exclude_served_files(skills_dir, &untracked_written, &["**/__pycache__/"]);
     }
 
     if out.written == 0 {
