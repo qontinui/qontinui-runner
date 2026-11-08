@@ -360,6 +360,25 @@ impl Grid {
         trimmed
     }
 
+    /// The DIM attribute of each cell of `row`, indexed as [`Self::row_text`]'s
+    /// characters are (wide-glyph right halves skipped, NOT trimmed), so entry
+    /// `i` belongs to `row_text(row).chars().nth(i)`. Empty for a row off the
+    /// grid. Claude Code paints its prompt ghost text (a suggestion, the
+    /// placeholder) DIM and typed input normal, so this tells them apart where
+    /// the text alone cannot.
+    pub fn row_dim_mask(&self, row: u16) -> Vec<bool> {
+        if row >= self.rows {
+            return Vec::new();
+        }
+        let start = (row as usize) * (self.cols as usize);
+        let end = start + self.cols as usize;
+        self.cells[start..end]
+            .iter()
+            .filter(|cell| cell.attrs & ATTR_WIDE_RIGHT == 0)
+            .map(|cell| cell.attrs & ATTR_DIM != 0)
+            .collect()
+    }
+
     pub fn lines(&self) -> Vec<String> {
         (0..self.rows).map(|r| self.row_text(r)).collect()
     }
@@ -568,8 +587,13 @@ impl Grid {
                 40..=47 => self.cur_bg = ansi_color_16(p as u8 - 40, false),
                 100..=107 => self.cur_bg = ansi_color_16(p as u8 - 100, true),
                 49 => self.cur_bg = COLOR_DEFAULT,
-                38 | 48 => {
+                // 58 is the underline colour: the grid does not keep it, but
+                // its parameters must be consumed like 38/48's, or a stray `2`
+                // in `58;2;R;G;B` reads as DIM — and DIM on the input row is
+                // how ghost text is told from typed text.
+                38 | 48 | 58 => {
                     let is_fg = p == 38;
+                    let is_bg = p == 48;
                     if i + 1 < flat.len() {
                         match flat[i + 1] {
                             2 => {
@@ -580,7 +604,7 @@ impl Grid {
                                     let c = pack_rgb(r, g, b);
                                     if is_fg {
                                         self.cur_fg = c;
-                                    } else {
+                                    } else if is_bg {
                                         self.cur_bg = c;
                                     }
                                     i += 4;
@@ -592,7 +616,7 @@ impl Grid {
                                     let c = palette_256(n);
                                     if is_fg {
                                         self.cur_fg = c;
-                                    } else {
+                                    } else if is_bg {
                                         self.cur_bg = c;
                                     }
                                     i += 2;
@@ -1112,6 +1136,21 @@ impl<'a> Perform for GridPerformer<'a> {
                 let n = first_param(params, 1);
                 self.grid.cursor.col = self.grid.cursor.col.saturating_sub(n);
             }
+            // CHA / HPA — cursor to an absolute column (1-based), row kept.
+            // Claude Code's diff renderer leans on CHA to skip cells it
+            // believes unchanged (`SAFE\x1b[8GTO`); ignoring it shifted every
+            // later glyph left, so the grid dropped blanks and letters
+            // (`✻Brewed for 1m 16s ·dne 9:09 AM`) and the idle predicate's
+            // finished-turn matcher could not read the line.
+            'G' | '`' => {
+                let col = first_param(params, 1).saturating_sub(1);
+                self.grid.cursor.col = col.min(self.grid.cols.saturating_sub(1));
+            }
+            // VPA — cursor to an absolute row (1-based), column kept.
+            'd' => {
+                let row = first_param(params, 1).saturating_sub(1);
+                self.grid.cursor.row = row.min(self.grid.rows.saturating_sub(1));
+            }
             'J' => {
                 let mode = first_param_default_zero(params, 0);
                 let cols = self.grid.cols;
@@ -1387,6 +1426,42 @@ mod tests {
         assert_eq!(cells[4].ch, 'o');
         assert_eq!(grid.cursor().col, 5);
         assert_eq!(grid.cursor().row, 0);
+    }
+
+    #[test]
+    fn cha_and_hpa_move_to_an_absolute_column() {
+        // Claude Code's diff renderer skips cells it believes unchanged with
+        // CHA (`ESC[nG`). Before CHA was handled, both writes below landed
+        // back to back and the row read `SAFETO`.
+        let mut grid = Grid::new(40, 4);
+        feed(&mut grid, b"\x1b[2CSAFE\x1b[8GTO\x1b[11GCLOSE");
+        assert_eq!(grid.row_text(0), "  SAFE TO CLOSE");
+        // The 1-based column is clamped to the grid; 0 and no param mean 1.
+        feed(&mut grid, b"\r\n\x1b[99Gx\r\n\x1b[5`y\x1b[0Gz\r\n\x1b[Gw");
+        assert_eq!(grid.row_text(1), format!("{}x", " ".repeat(39)));
+        assert_eq!(grid.row_text(2), "z   y");
+        assert_eq!(grid.row_text(3), "w");
+    }
+
+    #[test]
+    fn vpa_moves_to_an_absolute_row_keeping_the_column() {
+        let mut grid = Grid::new(20, 6);
+        feed(&mut grid, b"\x1b[4Ca\x1b[3db\x1b[99dc");
+        assert_eq!(grid.row_text(0), "    a");
+        assert_eq!(grid.row_text(2), "     b");
+        assert_eq!(grid.row_text(5), "      c");
+    }
+
+    #[test]
+    fn underline_colour_params_do_not_leak_into_the_pen() {
+        let mut grid = Grid::new(20, 2);
+        feed(&mut grid, b"\x1b[58;2;255;100;50mA\x1b[58;5;2mB");
+        let cells = &grid.snapshot().cells;
+        for cell in &cells[..2] {
+            assert_eq!(cell.attrs & ATTR_DIM, 0, "{cell:?}");
+            assert_eq!(cell.fg, COLOR_DEFAULT);
+            assert_eq!(cell.bg, COLOR_DEFAULT);
+        }
     }
 
     #[test]

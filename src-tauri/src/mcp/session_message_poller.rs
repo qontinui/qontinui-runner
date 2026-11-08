@@ -2656,6 +2656,7 @@ mod tests {
             lines: lines(rows),
             cursor_row,
             cursor_col,
+            cursor_row_dim: None,
         }
     }
 

@@ -4749,6 +4749,7 @@ impl TerminalSession {
         let guard = grid.lock().unwrap_or_else(|e| e.into_inner());
         let snap = guard.text_snapshot();
         crate::terminal::graceful_exit::ScreenText {
+            cursor_row_dim: Some(guard.row_dim_mask(snap.cursor_row)),
             lines: snap.lines,
             cursor_row: snap.cursor_row,
             cursor_col: snap.cursor_col,

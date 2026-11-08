@@ -1646,6 +1646,7 @@ mod tests {
             lines: rows.iter().map(|r| r.to_string()).collect(),
             cursor_row,
             cursor_col,
+            cursor_row_dim: None,
         }
     }
 

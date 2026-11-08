@@ -196,13 +196,23 @@ pub fn is_completed_turn_line(line: &str) -> bool {
             return false;
         }
         // The clock time: `6:36 AM`, `18:02`. Digits, colons and an AM/PM.
+        // A turn that ended on an earlier day dates it first, in the locale's
+        // words: `done Tuesday 9:26 PM`, `done Wednesday, Oct 28, 9:26 PM`,
+        // `done Mittwoch, 21:26` (shapes from runner#2369) — so before the
+        // clock, and only before it, a run of letters or of digits, each
+        // optionally ending in `,`, is the date.
         let mut saw_time = false;
         for w in words {
             let is_clock = w.contains(':') && w.chars().all(|c| c.is_ascii_digit() || c == ':');
             let is_meridiem = matches!(w.to_ascii_uppercase().as_str(), "AM" | "PM");
+            let date_word = w.strip_suffix(',').unwrap_or(w);
+            let is_date = !saw_time
+                && !date_word.is_empty()
+                && (date_word.chars().all(char::is_alphabetic)
+                    || date_word.chars().all(|c| c.is_ascii_digit()));
             if is_clock {
                 saw_time = true;
-            } else if !is_meridiem {
+            } else if !is_meridiem && !is_date {
                 return false;
             }
         }
@@ -250,14 +260,14 @@ pub fn is_completed_turn_line(line: &str) -> bool {
     saw_duration
 }
 
-/// `9m`, `42s`, `1h`, or several glued together (`2m39s`).
+/// `9m`, `42s`, `1h`, `1d`, or several glued together (`2m39s`).
 fn is_duration_token(w: &str) -> bool {
     let mut saw_unit = false;
     let mut digits = 0usize;
     for c in w.chars() {
         if c.is_ascii_digit() {
             digits += 1;
-        } else if matches!(c, 'h' | 'm' | 's') && digits > 0 {
+        } else if matches!(c, 'd' | 'h' | 'm' | 's') && digits > 0 {
             digits = 0;
             saw_unit = true;
         } else {
@@ -271,7 +281,18 @@ fn is_duration_token(w: &str) -> bool {
 /// not prose, so they do not turn up in an ordinary finished turn. Shared with
 /// `terminal::graceful_exit`'s prompt-ready checks, which scan for the same
 /// hints. Lowercased before match.
-pub const DIALOG_CHROME_MARKERS: &[&str] = &["esc to cancel", "enter to confirm"];
+///
+/// The last five are the other dialogs' key hints (a select list, a detail
+/// view, a menu that closes or exits, a nested step), ported from runner#2369.
+pub const DIALOG_CHROME_MARKERS: &[&str] = &[
+    "esc to cancel",
+    "enter to confirm",
+    "enter to select",
+    "enter to view",
+    "esc to close",
+    "esc to exit",
+    "esc to go back",
+];
 
 /// Literal text of Claude Code's workspace-trust dialog (both the current
 /// "Quick safety check" wording and the older "Do you trust the files" one).
@@ -464,6 +485,11 @@ mod tests {
             "✻ Worked for 45s · done 18:02",
             "✻ Baked for 1h 2m 3s",
             "  ✻ Sautéed for 12s · done 9:01 pm",
+            // A turn that ended on an earlier day (runner#2369's shapes).
+            "✻ Brewed for 1d 2h 3m",
+            "✻ Cooked for 9s · done Tuesday 9:26 PM",
+            "✻ Cooked for 9s · done Wednesday, Oct 28, 9:26 PM",
+            "✻ Cooked for 9s · done Mittwoch, 21:26",
         ] {
             let grid = lines(&[
                 "● Done — the change is committed.",
@@ -528,6 +554,13 @@ mod tests {
             // (main's `is_completed_turn_summary` read both of these as done).
             "✻ Worked for 1m 2s · 1 shell still running",
             "✻ Cogitated for 9m 42s · done 6:36 AM · 1 shell still running",
+            "✻ Waiting for 1 background agent to finish",
+            // Date words are read only BEFORE the clock, and a clock is still
+            // required.
+            "✻ Cooked for 9s · done 9:26 PM still running",
+            "✻ Cooked for 9s · done Tuesday",
+            "✻ Cooked for 9s · done Tuesday, 3 shells",
+            "✻ Brewed for 1x 2h",
         ] {
             assert!(!is_completed_turn_line(busy), "not completed: {busy:?}");
             let grid = lines(&[busy, "❯ "]);
@@ -757,6 +790,21 @@ mod tests {
             snapshot_shows_dialog(&grid),
             Some("selected numbered choice on a `❯` row")
         );
+    }
+
+    #[test]
+    fn every_dialog_key_hint_is_a_dialog() {
+        for hint in [
+            "Esc to cancel",
+            "Enter to confirm · Esc to cancel",
+            "↑/↓ to navigate · Enter to select · Esc to go back",
+            "Enter to view",
+            "Esc to close",
+            "Esc to exit",
+        ] {
+            let grid = lines(&[" Select a model", "   Sonnet", "❯ Opus", "", hint]);
+            assert!(snapshot_shows_dialog(&grid).is_some(), "{hint}");
+        }
     }
 
     #[test]
