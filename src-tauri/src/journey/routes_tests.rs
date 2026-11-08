@@ -3,10 +3,11 @@
 //! answers with, never on an intermediate.
 
 use super::*;
-use crate::journey::read::TimedEdge;
+use crate::journey::read::{OlderEdgeGroup, TimedEdge};
 use crate::journey::test_fixtures::{edge, frontier, key, timeline, writing};
 use chrono::TimeZone;
 use qontinui_types::journey::{FrontierEntry, JourneyEdgeObservation, LedgerState};
+use serde_json::json;
 
 fn at() -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 10, 24, 12, 0, 0).unwrap()
@@ -366,6 +367,7 @@ fn timed(id: u32, from: &str, to: &str, settle: Option<u64>) -> TimedEdge {
         edge: edge(id, from, Some(to), "affordance", "changed", "fp"),
         timeline: settle.map(|ms| timeline(vec![], ms).for_ledger()),
         timeline_unparseable: false,
+        rows: 1,
     }
 }
 
@@ -517,8 +519,10 @@ fn a_run_kind_query_over_a_small_ledger_does_not_claim_the_read_bound() {
     let (edges, bad) = crate::journey::read::parse_rows::<JourneyEdgeObservation>(rows);
     let read = LedgerRead {
         edges,
+        older_groups: Vec::new(),
         frontier: Vec::new(),
         edges_truncated: truncated,
+        older_groups_truncated: false,
         frontier_truncated: false,
         rows_unparseable: bad,
     };
@@ -578,6 +582,7 @@ fn edge_timing_rejects_contract_violations_rather_than_sampling_or_filtering() {
         edge: edge(3, "a", Some("b"), "affordance", "no_change", "fp"),
         timeline: None,
         timeline_unparseable: false,
+        rows: 1,
     };
     assert!(invalid.edge.validate().is_err(), "fixture must be invalid");
     // An untrusted row whose keys name ANOTHER pair: matching on keys before
@@ -813,13 +818,473 @@ fn a_pre_since_exit_makes_the_node_unexplored_not_a_dead_end() {
     );
 
     // The read-bound detail itself, produced by a truncated read over an
-    // otherwise settled graph, names the bound and never offers ?since=.
+    // otherwise settled graph, names the bound and the lever that narrows it.
     let settled = vec![edge(2, "a", Some("b"), "affordance", "changed", "fp-a1")];
     let g = build_graph(&settled, &[], &writing(), &JourneyFilter::default());
     let v = answer_dead_ends(&gappy("dead-ends"), &g);
     let detail = v["unknown"]["detail"].as_str().expect("an unknown detail");
     assert!(detail.contains("read bound"), "{v:#}");
-    assert!(!detail.contains("?since="), "{v:#}");
+    assert!(detail.contains("`since`"), "{v:#}");
+}
+
+// -- A `since` read: rows before it arrive as groups ------------------------
+
+/// The instant the fixtures below partition at.
+fn cutoff() -> DateTime<Utc> {
+    Utc.with_ymd_and_hms(2026, 10, 1, 0, 0, 0).unwrap()
+}
+
+fn since_cutoff() -> JourneyFilter {
+    JourneyFilter {
+        since: Some(cutoff()),
+        ..JourneyFilter::default()
+    }
+}
+
+/// `row` as observed before [`cutoff`], with a distinct id per `n`.
+fn before_cutoff(mut row: JourneyEdgeObservation, n: u32) -> JourneyEdgeObservation {
+    row.id = format!("10000000-0000-4000-8000-{n:012}");
+    row.observed_at = format!("2026-09-01T00:{:02}:00.000000Z", n % 60);
+    row
+}
+
+/// `(template, withdrawn)`: one older transition of each kind `build_graph`
+/// treats differently, all of them trusted.
+fn trusted_templates() -> Vec<(JourneyEdgeObservation, bool)> {
+    vec![
+        // B's only exit: an excluded departure, so B is never a dead end.
+        (
+            edge(0, "b", Some("c"), "affordance", "changed", "fp-b"),
+            false,
+        ),
+        // A withdrawn departure from D, so D is never a dead end either.
+        (
+            edge(0, "d", Some("e"), "affordance", "changed", "fp-d"),
+            true,
+        ),
+        // An older click INTO U, whose kept arrival is a URL: never settled
+        // as prior knowledge.
+        (
+            edge(0, "x", Some("u"), "affordance", "changed", "fp-x"),
+            false,
+        ),
+        // A URL arrival, a back, and a dead click (a genuine negative).
+        (edge(0, "f", Some("g"), "push", "changed", "fp-f"), false),
+        (edge(0, "m", Some("n"), "pop", "changed", "fp-m"), false),
+        (
+            edge(0, "z", Some("z"), "affordance", "no_change", "fp-z"),
+            false,
+        ),
+        // Closes whose destination is unknown.
+        (
+            edge(0, "p", None, "affordance", "to_node_unobserved", "fp-p"),
+            false,
+        ),
+        (
+            edge(0, "q", Some("r"), "affordance", "settle_timeout", "fp-q"),
+            false,
+        ),
+        (
+            edge(0, "s", Some("t"), "affordance", "error", "fp-s"),
+            false,
+        ),
+    ]
+}
+
+/// Untrusted templates: `no_change` across two keys fails validate(). One live
+/// and one withdrawn, which `build_graph` counts differently.
+fn untrusted_templates() -> Vec<(JourneyEdgeObservation, bool)> {
+    vec![
+        (
+            edge(0, "j", Some("k"), "affordance", "no_change", "fp-j"),
+            false,
+        ),
+        (
+            edge(0, "v", Some("w"), "affordance", "no_change", "fp-v"),
+            true,
+        ),
+    ]
+}
+
+/// The same ledger two ways: every row, and full rows plus older groups whose
+/// representatives are aggregates, as the SQL's are: a mix of columns that no
+/// real row has, which the `since` filter must exclude before reading.
+fn both_reads(
+    templates: Vec<(JourneyEdgeObservation, bool)>,
+    rows_each: u32,
+) -> (Vec<JourneyEdgeObservation>, LedgerRead) {
+    let recent = vec![
+        edge(1, "a", Some("b"), "affordance", "changed", "fp-a"),
+        edge(2, "a", Some("d"), "affordance", "changed", "fp-a2"),
+        // A true dead end: seen, with no exit in any row.
+        edge(3, "a", Some("end"), "affordance", "changed", "fp-a3"),
+        // U is only ever reached by URL among the kept rows.
+        edge(4, "a", Some("u"), "push", "changed", "fp-a4"),
+        // Y is too, with nothing older arriving: settled prior knowledge.
+        edge(5, "a", Some("y"), "push", "changed", "fp-a5"),
+        // Z exists among the kept rows, so its older dead click is judged.
+        edge(6, "a", Some("z"), "affordance", "changed", "fp-a6"),
+    ];
+    let mut every_row = recent.clone();
+    let mut older_groups = Vec::new();
+    for (t, (template, withdrawn)) in templates.into_iter().enumerate() {
+        let t = u32::try_from(t).unwrap();
+        let copies: Vec<JourneyEdgeObservation> = (0..rows_each)
+            .map(|i| {
+                let mut row = before_cutoff(template.clone(), t * 1000 + i);
+                if withdrawn {
+                    row.invalidated_at = Some("2026-09-02T00:00:00.000000Z".into());
+                }
+                row
+            })
+            .collect();
+        every_row.extend(copies.iter().cloned());
+        let mut representative = copies[0].clone();
+        representative.app_version = Some("aggregate-of-many".into());
+        representative.run_id = None;
+        representative.runner_instance = "aggregate".into();
+        older_groups.push(OlderEdgeGroup {
+            edge: representative,
+            rows: u64::from(rows_each),
+        });
+    }
+    let read = LedgerRead {
+        edges: recent,
+        older_groups,
+        ..LedgerRead::default()
+    };
+    (every_row, read)
+}
+
+/// What an answer concludes: everything but the size of the counts.
+fn verdict(v: &Value) -> Value {
+    let result = if status(v) == "measured" {
+        &v["value"]
+    } else {
+        &v["provenance"]["source"]["result"]
+    };
+    let keys = |field: &str| -> Vec<Value> {
+        result[field]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .map(|n| json!([n["nodeKey"], n["backOnly"]]))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let dimensions: Vec<Value> = v["provenance"]["coverage"]["unmeasured"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| json!([d["dimension"], d["code"]]))
+        .collect();
+    json!({
+        "status": v["status"],
+        "code": v["unknown"]["code"],
+        "deadEnds": keys("deadEnds"),
+        "unexplored": keys("unexplored"),
+        "settled": keys("nodes"),
+        "unsettled": keys("unsettled"),
+        "dimensions": dimensions,
+        "unknownDestinations": result["unknownDestinationArrivals"].as_u64().unwrap_or(0) > 0,
+    })
+}
+
+/// The `nodeKey`s an answer lists under `field`, compared whole: a substring
+/// test would read `"end#s"` as listing `"d#s"`.
+fn listed(v: &Value, field: &str) -> Vec<String> {
+    let result = if status(v) == "measured" {
+        &v["value"]
+    } else {
+        &v["provenance"]["source"]["result"]
+    };
+    result[field]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|n| n["nodeKey"].as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// [`trusted_templates`] without the closes whose destination is unknown,
+/// which unsettle every prior-knowledge candidate on their own and so would
+/// hide whether an older group did.
+fn trusted_templates_with_known_destinations() -> Vec<(JourneyEdgeObservation, bool)> {
+    trusted_templates()
+        .into_iter()
+        .filter(|(e, _)| {
+            let from = e.from_node.key();
+            e.to_node.is_some() && from != key("q") && from != key("s")
+        })
+        .collect()
+}
+
+/// Every graph answer agrees between the two reads.
+fn assert_same_conclusions(templates: Vec<(JourneyEdgeObservation, bool)>) {
+    let (every_row, read) = both_reads(templates, 5);
+    let filter = since_cutoff();
+    let whole = build_graph(&every_row, &[], &writing(), &filter);
+    let grouped = read.build_graph(&writing(), &filter);
+    let c = ctx("q");
+    let pairs = [
+        (
+            "graph",
+            answer_graph(&c, &whole),
+            answer_graph(&c, &grouped),
+        ),
+        (
+            "dead-ends",
+            answer_dead_ends(&c, &whole),
+            answer_dead_ends(&c, &grouped),
+        ),
+        (
+            "prior-knowledge",
+            answer_prior_knowledge(&c, &whole),
+            answer_prior_knowledge(&c, &grouped),
+        ),
+        (
+            "reachable",
+            answer_reachable(&c, &whole, &key("a")),
+            answer_reachable(&c, &grouped, &key("a")),
+        ),
+        (
+            "steps",
+            answer_steps(&c, &whole, &key("b"), &key("c")),
+            answer_steps(&c, &grouped, &key("b"), &key("c")),
+        ),
+    ];
+    for (name, a, b) in pairs {
+        assert_eq!(verdict(&a), verdict(&b), "{name}\nrows {a:#}\ngroups {b:#}");
+    }
+}
+
+/// The whole point of grouping: summarized rows change no conclusion. Only the
+/// size of the counts differs, so a dropped or misjudged group shows here.
+#[test]
+fn older_groups_conclude_exactly_what_their_rows_would() {
+    assert_same_conclusions(trusted_templates());
+    assert_same_conclusions(trusted_templates_with_known_destinations());
+    let mut with_untrusted = trusted_templates();
+    with_untrusted.extend(untrusted_templates());
+    assert_same_conclusions(with_untrusted);
+}
+
+/// The contract's core scenario over a grouped read, with nothing else
+/// unsettling the graph: an exit before `since` keeps a node out of the dead
+/// ends, and a node with no exit in any row is still listed as one.
+#[test]
+fn an_older_grouped_exit_keeps_a_node_from_being_a_dead_end() {
+    let (_, read) = both_reads(trusted_templates(), 5);
+    let g = read.build_graph(&writing(), &since_cutoff());
+    let v = answer_dead_ends(&ctx("dead-ends"), &g);
+    let dead = listed(&v, "deadEnds");
+    let unexplored = listed(&v, "unexplored");
+    assert!(dead.contains(&key("end")), "{v:#}");
+    assert!(!dead.contains(&key("b")), "{v:#}");
+    assert!(unexplored.contains(&key("b")), "{v:#}");
+    assert!(!dead.contains(&key("d")), "withdrawn exit: {v:#}");
+    assert!(unexplored.contains(&key("d")), "withdrawn exit: {v:#}");
+    assert_ne!(status(&v), "absent", "{v:#}");
+
+    // Removing just B's older exit makes B a settled dead end, so the
+    // assertion above is really about that group.
+    let mut without = read.clone();
+    without
+        .older_groups
+        .retain(|group| group.edge.from_node.key() != key("b"));
+    let g = without.build_graph(&writing(), &since_cutoff());
+    let v = answer_dead_ends(&ctx("dead-ends"), &g);
+    assert!(listed(&v, "deadEnds").contains(&key("b")), "{v:#}");
+}
+
+/// An older click into a node whose kept arrivals are all URLs means the node
+/// may not need prior knowledge at all.
+#[test]
+fn an_older_grouped_click_unsettles_prior_knowledge() {
+    let (_, read) = both_reads(trusted_templates_with_known_destinations(), 5);
+    let g = read.build_graph(&writing(), &since_cutoff());
+    let v = answer_prior_knowledge(&ctx("prior-knowledge"), &g);
+    assert!(!listed(&v, "nodes").contains(&key("u")), "{v:#}");
+    assert!(listed(&v, "unsettled").contains(&key("u")), "{v:#}");
+    // Y has no older click into it, so it stays settled: the doubt on U is
+    // the older group's, not the graph's.
+    assert!(listed(&v, "nodes").contains(&key("y")), "{v:#}");
+
+    // Without just the older click into U, U is settled too.
+    let mut without = read.clone();
+    without
+        .older_groups
+        .retain(|group| group.edge.to_node.as_ref().map(|n| n.key()) != Some(key("u")));
+    let g = without.build_graph(&writing(), &since_cutoff());
+    let v = answer_prior_knowledge(&ctx("prior-knowledge"), &g);
+    assert!(listed(&v, "nodes").contains(&key("u")), "{v:#}");
+}
+
+/// The three row totals count ROWS however they were read, or `filteredOut 8`
+/// would be reported over a thousand excluded rows.
+#[test]
+fn older_groups_keep_the_row_totals_of_their_rows() {
+    let mut templates = trusted_templates();
+    templates.extend(untrusted_templates());
+    let (every_row, read) = both_reads(templates, 5);
+    let filter = since_cutoff();
+    let whole = build_graph(&every_row, &[], &writing(), &filter);
+    let grouped = read.build_graph(&writing(), &filter);
+    assert_eq!(
+        grouped.coverage.edges_filtered_out, 40,
+        "8 live trusted x 5"
+    );
+    assert_eq!(grouped.coverage.edges_invalidated, 10, "2 withdrawn x 5");
+    assert_eq!(grouped.unplaced_rejected_rows, 10, "2 untrusted x 5");
+    assert_eq!(
+        grouped.coverage.edges_filtered_out,
+        whole.coverage.edges_filtered_out
+    );
+    assert_eq!(
+        grouped.coverage.edges_invalidated,
+        whole.coverage.edges_invalidated
+    );
+    assert_eq!(grouped.unplaced_rejected_rows, whole.unplaced_rejected_rows);
+    assert_eq!(
+        grouped.coverage.edges_observed,
+        whole.coverage.edges_observed
+    );
+    // The shared crate's invariant: edge entries' `rows` sum to the count.
+    let entries: u64 = grouped.rejected.iter().map(|r| r.rows).sum();
+    assert_eq!(entries, grouped.unplaced_rejected_rows);
+    assert_eq!(read.older_rows(), 55);
+}
+
+/// Too many older groups is its own gap, with advice that works: a later
+/// `since` would only push more rows into the groups.
+#[test]
+fn truncated_older_groups_are_their_own_gap() {
+    let edges = vec![edge(1, "a", Some("b"), "affordance", "changed", "fp-a1")];
+    let g = build_graph(&edges, &[], &writing(), &JourneyFilter::default());
+    let c = AnswerCtx {
+        gaps: ReadGaps {
+            older_groups_truncated: true,
+            ..ReadGaps::default()
+        },
+        ..ctx("dead-ends")
+    };
+    assert!(c.gaps.any());
+    let v = answer_dead_ends(&c, &g);
+    assert_eq!(status(&v), "unknown", "{v:#}");
+    let detail = v["unknown"]["detail"].as_str().expect("an unknown detail");
+    assert!(detail.contains("earlier `since`"), "{v:#}");
+    assert!(!detail.contains("later `since`"), "{v:#}");
+    assert!(
+        v.to_string()
+            .contains("older_groups_beyond_read_bound_20000"),
+        "{v:#}"
+    );
+}
+
+/// A group of one is simply a row, so no correction may be applied to it.
+#[test]
+fn an_older_group_of_one_is_a_row() {
+    let (every_row, read) = both_reads(trusted_templates(), 1);
+    let filter = since_cutoff();
+    assert_eq!(
+        read.build_graph(&writing(), &filter),
+        build_graph(&every_row, &[], &writing(), &filter)
+    );
+}
+
+/// With nothing older, the read is exactly `build_graph` over its rows.
+#[test]
+fn a_read_with_no_older_groups_is_plain_build_graph() {
+    let rows = vec![edge(1, "a", Some("b"), "affordance", "changed", "fp-a")];
+    let read = LedgerRead {
+        edges: rows.clone(),
+        ..LedgerRead::default()
+    };
+    let filter = JourneyFilter::default();
+    assert_eq!(
+        read.build_graph(&writing(), &filter),
+        build_graph(&rows, &[], &writing(), &filter)
+    );
+    assert_eq!(read.older_rows(), 0);
+}
+
+/// Summarized rows are a disclosed resolution, not a gap: a settled listing
+/// over them stays settled, and an unsummarized answer's bytes do not change.
+#[test]
+fn summarized_rows_are_disclosed_and_are_not_a_gap() {
+    let gaps = ReadGaps {
+        summarized_rows: 45,
+        summarized_groups: 9,
+        ..ReadGaps::default()
+    };
+    assert!(!gaps.any());
+    assert!(gaps.dimensions().is_empty());
+    let (_, read) = both_reads(trusted_templates(), 5);
+    let of_read = ReadGaps::of(&read);
+    assert_eq!(of_read.summarized_rows, 45);
+    assert_eq!(of_read.summarized_groups, 9);
+
+    let filter = since_cutoff();
+    let g = read.build_graph(&writing(), &filter);
+    let mut v = answer_dead_ends(&ctx("dead-ends"), &g);
+    let untouched = v.clone();
+    disclose_summarized(&mut v, &ReadGaps::default());
+    assert_eq!(v, untouched, "nothing summarized, nothing added");
+    disclose_summarized(&mut v, &of_read);
+    assert_eq!(
+        v["provenance"]["coverage"]["edgesSummarized"],
+        json!({ "rows": 45, "groups": 9 })
+    );
+    assert!(serde_json::from_value::<Observation<Value>>(v).is_ok());
+}
+
+/// Edge-timing reports every count in rows: a group is weighed by its count,
+/// and it is never a sample.
+#[test]
+fn edge_timing_weighs_an_older_group_by_its_rows() {
+    let group = |id: u32, outcome: &str, rows: u64| TimedEdge {
+        edge: before_cutoff(edge(id, "a", Some("b"), "affordance", outcome, "fp"), id),
+        timeline: None,
+        timeline_unparseable: false,
+        rows,
+    };
+    let live = group(1, "changed", 7);
+    let mut withdrawn = group(2, "changed", 3);
+    withdrawn.edge.invalidated_at = Some("2026-09-02T00:00:00.000000Z".into());
+    let untrusted = group(3, "no_change", 2);
+    assert!(
+        untrusted.edge.validate().is_err(),
+        "fixture must be invalid"
+    );
+    let other_pair = TimedEdge {
+        edge: before_cutoff(edge(4, "c", Some("d"), "affordance", "changed", "fp"), 4),
+        timeline: None,
+        timeline_unparseable: false,
+        rows: 11,
+    };
+    let rows = [
+        timed(9, "a", "b", Some(100)),
+        live,
+        withdrawn,
+        untrusted,
+        other_pair,
+    ];
+    let v = answer_edge_timing(
+        &ctx("edge-timing"),
+        &rows,
+        &key("a"),
+        &key("b"),
+        &since_cutoff(),
+        &writing(),
+    );
+    assert_eq!(status(&v), "measured", "{v:#}");
+    assert_eq!(v["value"]["edgesFilteredOut"], 7, "{v:#}");
+    assert_eq!(v["value"]["edgesInvalidated"], 3, "{v:#}");
+    assert_eq!(v["value"]["rowsRejected"], 2, "{v:#}");
+    assert_eq!(v["value"]["timing"]["n"], 1, "only the kept row: {v:#}");
 }
 
 // -- Re-review 2: an unexplored node always degrades the dead-end listing ---
