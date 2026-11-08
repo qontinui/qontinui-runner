@@ -7,7 +7,7 @@
  * Expectations are literals (pids, image names, refusal reasons), never values
  * recomputed with the helper under test.
  *
- * Plan: `2026-11-08-tenant-badge-parity-and-oracle-fixtures` Phases 3-4.
+ * Plan: `2026-11-08-tenant-badge-parity-and-oracle-fixtures` Phases 3-5.
  */
 
 import { test, describe } from "node:test";
@@ -19,8 +19,10 @@ import { fileURLToPath } from "node:url";
 import {
   KNOWN_LAUNCH_GATES,
   accountInRoster,
+  badgeCardinality,
   buildFixtureTerminalRequest,
   classifyTerminalSpawn,
+  compareBadgeElement,
   deriveAccountName,
   imageBasename,
   isRunnerImage,
@@ -37,6 +39,8 @@ import {
   resolveTargetRunnerPid,
   sameRoster,
   selfHostingVerdict,
+  tenantBadgeElementId,
+  tenantBadgeExpectation,
   terminalBufferText,
   verifyRosterSeed,
   zoneIndexOf,
@@ -858,4 +862,273 @@ describe("no script evaluation in the webview", () => {
       for (const n of needles) assert.equal(src.includes(n), false, `${file} contains ${n}`);
     });
   }
+});
+
+// ===========================================================================
+// Phase 5 — the per-zone tenant badge (T0.2b, T2b)
+// ===========================================================================
+
+const T_STAMP = "c231d9da-1111-4222-8333-444455556666";
+const T_ACT = "7e0b1a2c-aaaa-4bbb-8ccc-dddddddddddd";
+const T_CRED = "99999999-0000-4000-8000-000000000000";
+
+/** A tenancy block shaped like `/control/sessions/info`'s, minus legs no rule reads. */
+function tenancy({ stamp = null, diverged = false, display = null } = {}) {
+  return { row: { tenantId: stamp }, diverged, display };
+}
+const DISPLAY_RESOLVED = {
+  status: "resolved",
+  tenantId: T_ACT,
+  source: "credential",
+  conflicts: [],
+};
+const DISPLAY_STAMP_ONLY = {
+  status: "stamp_only",
+  tenantId: T_STAMP,
+  source: "row_stamp",
+  conflicts: [],
+};
+const DISPLAY_UNKNOWN = { status: "unknown", tenantId: null, source: null, conflicts: [] };
+
+describe("tenantBadgeElementId", () => {
+  test("the per-zone id shape TenantBadge.tsx owns", () => {
+    assert.equal(tenantBadgeElementId(0), "terminal-tenant-badge-0");
+    assert.equal(tenantBadgeElementId(7), "terminal-tenant-badge-7");
+  });
+});
+
+describe("tenantBadgeExpectation", () => {
+  test("present: showSwitcher and a spawn stamp", () => {
+    const e = tenantBadgeExpectation({
+      pickerPresent: true,
+      tenancy: tenancy({ stamp: T_STAMP, display: DISPLAY_STAMP_ONLY }),
+    });
+    assert.equal(e.expect, "present");
+    assert.match(e.reason, /a spawn stamp/);
+  });
+  test("present: showSwitcher and a divergence (no stamp, no resolved tenant)", () => {
+    const e = tenantBadgeExpectation({
+      pickerPresent: true,
+      tenancy: tenancy({ diverged: true, display: DISPLAY_UNKNOWN }),
+    });
+    assert.equal(e.expect, "present");
+    assert.match(e.reason, /a divergence/);
+  });
+  test("present: showSwitcher and a RESOLVED acting tenant (no stamp)", () => {
+    const e = tenantBadgeExpectation({
+      pickerPresent: true,
+      tenancy: tenancy({ display: DISPLAY_RESOLVED }),
+    });
+    assert.equal(e.expect, "present");
+    assert.match(e.reason, /a resolved acting tenant/);
+  });
+  test("absent: no picker (<= 1 binding), whatever the tenancy says", () => {
+    const e = tenantBadgeExpectation({
+      pickerPresent: false,
+      tenancy: tenancy({ stamp: T_STAMP, display: DISPLAY_RESOLVED }),
+    });
+    assert.equal(e.expect, "absent");
+  });
+  test("absent: showSwitcher, but nothing names a tenant", () => {
+    const e = tenantBadgeExpectation({
+      pickerPresent: true,
+      tenancy: tenancy({ display: DISPLAY_UNKNOWN }),
+    });
+    assert.equal(e.expect, "absent");
+    assert.match(e.reason, /display.status=unknown/);
+  });
+  test("unknown: the picker's presence could not be read", () => {
+    assert.equal(
+      tenantBadgeExpectation({ pickerPresent: null, tenancy: tenancy({ stamp: T_STAMP }) }).expect,
+      "unknown",
+    );
+  });
+  test("unknown: no tenancy block", () => {
+    assert.equal(tenantBadgeExpectation({ pickerPresent: true, tenancy: null }).expect, "unknown");
+  });
+  test("unknown: nothing to say and tenancy.display absent (runner predates it)", () => {
+    const e = tenantBadgeExpectation({ pickerPresent: true, tenancy: tenancy({ display: null }) });
+    assert.equal(e.expect, "unknown");
+    assert.match(e.reason, /predates/);
+  });
+});
+
+/** A registry element as `GET /ui-bridge/control/element/<id>` serves it. */
+function badge({ label, dataset }) {
+  return { id: "terminal-tenant-badge-0", label, state: { dataset } };
+}
+const PRESENT = { expect: "present", reason: "test" };
+const statuses = (r) => Object.fromEntries(r.findings.map((f) => [f.check, f.status]));
+
+describe("compareBadgeElement", () => {
+  test("resolved acting tenant: label, diverged and acting all PASS", () => {
+    const t = tenancy({ display: DISPLAY_RESOLVED });
+    const el = badge({
+      label: `This session acts as tenant ${T_ACT} via its coord credential.`,
+      dataset: { tenantDiverged: "false", tenantDisplayStatus: "resolved", tenantActing: T_ACT },
+    });
+    const r = compareBadgeElement(el, PRESENT, t, { build: "b1" });
+    assert.equal(r.status, "PASS");
+    assert.deepEqual(statuses(r), {
+      presence: "PASS",
+      label: "PASS",
+      diverged: "PASS",
+      acting: "PASS",
+    });
+  });
+  test("row_stamp source: data-tenant-acting must be ABSENT — present is a FAIL", () => {
+    const t = tenancy({ stamp: T_STAMP, display: DISPLAY_STAMP_ONLY });
+    const ok = badge({
+      label: `This session is acting as tenant ${T_STAMP}.`,
+      dataset: { tenantDiverged: "false", tenantDisplayStatus: "stamp_only" },
+    });
+    assert.equal(compareBadgeElement(ok, PRESENT, t).status, "PASS");
+    const bad = badge({
+      label: `This session is acting as tenant ${T_STAMP}.`,
+      dataset: {
+        tenantDiverged: "false",
+        tenantDisplayStatus: "stamp_only",
+        tenantActing: T_STAMP,
+      },
+    });
+    const r = compareBadgeElement(bad, PRESENT, t);
+    assert.equal(r.status, "FAIL");
+    assert.equal(statuses(r).acting, "FAIL");
+    assert.match(
+      r.findings.find((f) => f.check === "acting").detail,
+      /must be ABSENT \(display.source=row_stamp\)/,
+    );
+  });
+  test("acting value differing from display.tenantId is a FAIL", () => {
+    const r = compareBadgeElement(
+      badge({
+        label: `acts as tenant ${T_ACT}`,
+        dataset: { tenantDiverged: "false", tenantDisplayStatus: "resolved", tenantActing: T_CRED },
+      }),
+      PRESENT,
+      tenancy({ display: DISPLAY_RESOLVED }),
+    );
+    assert.equal(statuses(r).acting, "FAIL");
+  });
+  test("a build predating #2510 (no data-tenant-display-status) is UNKNOWN naming the build, never PASS", () => {
+    const r = compareBadgeElement(
+      badge({ label: `acts as tenant ${T_ACT}`, dataset: { tenantDiverged: "false" } }),
+      PRESENT,
+      tenancy({ display: DISPLAY_RESOLVED }),
+      { build: "1731000000-ce1235d33" },
+    );
+    assert.equal(r.status, "UNKNOWN");
+    assert.equal(statuses(r).acting, "UNKNOWN");
+    assert.match(
+      r.findings.find((f) => f.check === "acting").detail,
+      /build 1731000000-ce1235d33 predates PR #2510/,
+    );
+  });
+  test("diverged session: the label must start TENANT MISMATCH", () => {
+    const t = tenancy({
+      stamp: T_STAMP,
+      diverged: true,
+      display: { ...DISPLAY_RESOLVED, status: "mismatch" },
+    });
+    const good = badge({
+      label: "TENANT MISMATCH — this session does not act as one tenant.",
+      dataset: { tenantDiverged: "true", tenantDisplayStatus: "mismatch", tenantActing: T_ACT },
+    });
+    assert.equal(compareBadgeElement(good, PRESENT, t).status, "PASS");
+    const bad = badge({
+      label: `This session is acting as tenant ${T_STAMP}.`,
+      dataset: { tenantDiverged: "true", tenantDisplayStatus: "mismatch", tenantActing: T_ACT },
+    });
+    assert.equal(statuses(compareBadgeElement(bad, PRESENT, t)).label, "FAIL");
+  });
+  test("data-tenant-diverged disagreeing with tenancy.diverged is a FAIL", () => {
+    const r = compareBadgeElement(
+      badge({
+        label: `acting as tenant ${T_STAMP}`,
+        dataset: { tenantDiverged: "true", tenantDisplayStatus: "stamp_only" },
+      }),
+      PRESENT,
+      tenancy({ stamp: T_STAMP, display: DISPLAY_STAMP_ONLY }),
+    );
+    assert.equal(statuses(r).diverged, "FAIL");
+  });
+  test("a label not naming the stamped tenant is a FAIL", () => {
+    const r = compareBadgeElement(
+      badge({
+        label: `acting as tenant ${T_CRED}`,
+        dataset: { tenantDiverged: "false", tenantDisplayStatus: "stamp_only" },
+      }),
+      PRESENT,
+      tenancy({ stamp: T_STAMP, display: DISPLAY_STAMP_ONLY }),
+    );
+    assert.equal(statuses(r).label, "FAIL");
+  });
+  test("expected present but not rendered is a FAIL; expected absent but rendered is a FAIL", () => {
+    assert.equal(
+      compareBadgeElement(null, PRESENT, tenancy({ display: DISPLAY_RESOLVED })).status,
+      "FAIL",
+    );
+    const absent = { expect: "absent", reason: "no picker" };
+    assert.equal(
+      compareBadgeElement(badge({ label: "x", dataset: {} }), absent, null).status,
+      "FAIL",
+    );
+    assert.equal(compareBadgeElement(null, absent, null).status, "PASS");
+  });
+  test("an unknown expectation renders the arm UNKNOWN, never PASS or FAIL", () => {
+    const r = compareBadgeElement(null, { expect: "unknown", reason: "picker unread" }, null);
+    assert.equal(r.status, "UNKNOWN");
+    assert.match(r.findings[0].detail, /picker unread/);
+  });
+});
+
+describe("badgeCardinality", () => {
+  const two = [
+    { zoneIndex: 0, expect: "present" },
+    { zoneIndex: 1, expect: "present" },
+  ];
+  test("FAILS on one id shared by two zones (the measured defect)", () => {
+    const r = badgeCardinality({
+      registryIds: ["terminal-zone-header-0", "terminal-zone-header-1", "terminal.tenant-badge"],
+      zones: two,
+    });
+    assert.equal(r.ok, false);
+    assert.match(r.detail, /shared pre-per-zone id 'terminal.tenant-badge'/);
+    assert.match(r.detail, /1 distinct badge id\(s\) \[terminal.tenant-badge\] for 2 zone\(s\)/);
+  });
+  test("FAILS on a duplicated per-zone id", () => {
+    const r = badgeCardinality({
+      registryIds: ["terminal-tenant-badge-0", "terminal-tenant-badge-0"],
+      zones: two,
+    });
+    assert.equal(r.ok, false);
+    assert.match(r.detail, /duplicated badge id\(s\): terminal-tenant-badge-0/);
+  });
+  test("passes with one distinct per-zone id per zone expecting a badge", () => {
+    const r = badgeCardinality({
+      registryIds: ["terminal-tenant-badge-0", "terminal-tenant-badge-1", "terminal-zone-header-0"],
+      zones: [...two, { zoneIndex: 2, expect: "absent" }],
+    });
+    assert.deepEqual(r, { ok: true, detail: "2 distinct per-zone badge id(s) for 2 zone(s)" });
+  });
+  test("a badge on a zone that expects none is a FAIL", () => {
+    const r = badgeCardinality({
+      registryIds: ["terminal-tenant-badge-0", "terminal-tenant-badge-1"],
+      zones: [
+        { zoneIndex: 0, expect: "present" },
+        { zoneIndex: 1, expect: "absent" },
+      ],
+    });
+    assert.equal(r.ok, false);
+  });
+  test("an UNKNOWN zone expectation makes the count UNKNOWN", () => {
+    const r = badgeCardinality({
+      registryIds: ["terminal-tenant-badge-0"],
+      zones: [
+        { zoneIndex: 0, expect: "present" },
+        { zoneIndex: 1, expect: "unknown" },
+      ],
+    });
+    assert.equal(r.ok, null);
+  });
 });
