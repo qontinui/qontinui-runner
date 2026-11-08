@@ -10260,19 +10260,18 @@ async fn materialize_worktrees(payload: &LaunchPayload) -> anyhow::Result<()> {
 /// `*.md` defs, NOT the whole `.claude` tree (avoid pulling in settings/hooks/
 /// mcp that could alter spawn behavior).
 ///
-/// Fail-soft: if the source dir is missing we `warn` and return a report — the
-/// agent then simply lacks subagents (same as before this fix; no regression). The
-/// fleet-portability follow-up is to BUNDLE these defs into the runner binary
-/// (`include_str!`) so non-operator devices without a `qontinui-claude-config`
-/// checkout still get them; this copy-from-checkout path unblocks the current
-/// operator fleet.
+/// The embedded floor ([`crate::fleet_agents`], defs bundled into the binary) is
+/// written FIRST in both arms — with a checkout root and without one — so a
+/// device with no `qontinui-claude-config` checkout, a published install above
+/// all, still gets a working subagent set; the checkout copy is overlaid on top
+/// where one resolves.
 ///
-/// Returns a [`ProvisionReport`] for the CHECKOUT layer (`agent_definitions`).
-/// The no-root arm below used to be a bare `warn!` and an `Ok(())` — an
-/// unresolved checkout stated only in a log file — and is now a
-/// [`capability_manifest::Rung::Unresolved`] row naming what was skipped and
-/// why. The control flow is unchanged: it returns a report, never an error, and
-/// the spawn still proceeds.
+/// Fail-soft: a missing source dir or root is a report, never an error, and the
+/// spawn still proceeds. Returns a [`ProvisionReport`] for the CHECKOUT layer
+/// (`agent_definitions`): with no root resolved it is a
+/// [`capability_manifest::Rung::Unresolved`] row naming what was skipped, why,
+/// and how many embedded defaults stand in. The floor's own `fleet_agents` row
+/// is recorded into the session ledger from inside, by both arms.
 fn provision_agent_definitions(worktree_cwd: &str) -> ProvisionReport {
     provision_agent_definitions_with_root(qontinui_root_dir().as_deref(), worktree_cwd)
 }
@@ -10283,57 +10282,139 @@ fn provision_agent_definitions_with_root(
     root: Option<&Path>,
     worktree_cwd: &str,
 ) -> ProvisionReport {
-    let Some(root) = root else {
-        warn!(
-            "agent_runtime: no qontinui-root resolved; skipping .claude/agents \
-             provisioning for {worktree_cwd} (auto-spawned subagents will not resolve)"
-        );
-        let mut report = ProvisionReport::unresolved(
-            "agent_definitions",
-            0,
-            Path::new(worktree_cwd)
-                .join(".claude")
-                .join("agents")
-                .display()
-                .to_string(),
-            "no qontinui-root resolved, so <root>/qontinui-claude-config/.claude/agents \
-             cannot be located — the normal state on a published install",
-        );
-        // An older binary's copy of a retired definition can sit in this workdir
-        // whether or not a root resolves now, so the retirement pass runs here too.
-        retire_agent_definitions(
-            worktree_cwd,
-            crate::fleet_agents::RETIRED_AGENTS,
-            &mut report,
-        );
-        return report;
-    };
-    provision_agent_definitions_from_root(root, worktree_cwd)
+    match root {
+        Some(root) => provision_agent_definitions_from_root(root, worktree_cwd),
+        None => {
+            provision_agent_definitions_no_root(worktree_cwd, crate::fleet_agents::RETIRED_AGENTS)
+        }
+    }
 }
 
-/// The retirement pass on its own, for a spawn with no checkout root: the
-/// [`crate::provision_guard::KeepDecisions`] are decided over the retired names
-/// alone, since no layer writes in this workdir.
-fn retire_agent_definitions(worktree_cwd: &str, retired: &[&str], report: &mut ProvisionReport) {
-    let workdir = Path::new(worktree_cwd);
-    let dst_dir = workdir.join(".claude").join("agents");
-    if !dst_dir.is_dir() {
-        return;
-    }
-    let tracked = crate::provision_guard::TrackedPaths::probe(&dst_dir);
-    let names = crate::fleet_agents::retired_agent_names(retired);
-    let keep = crate::provision_guard::KeepDecisions::decide(
-        &tracked,
-        &dst_dir,
-        names.iter().map(String::as_str),
+/// The no-root arm of [`provision_agent_definitions_with_root`], with the
+/// retired-definition table passed in so a test can retire a body whose blob it
+/// computed itself.
+///
+/// No checkout root resolves (the normal state on a published install), so there
+/// is no overlay — but the embedded floor is exactly what such a device needs:
+/// without it every spawned agent gets ZERO subagents, `code-reviewer` included,
+/// and the served pre-PR-review policy that names that subagent cannot be met.
+/// So this arm runs the same steps as [`provision_agent_definitions_retiring`]
+/// minus the overlay: one [`crate::provision_guard::KeepDecisions`] over the
+/// embedded and retired names, decided before any write; the floor, recorded as
+/// its own `fleet_agents` row; then the retirement pass with the same `keep`.
+pub(crate) fn provision_agent_definitions_no_root(
+    worktree_cwd: &str,
+    retired: &[&str],
+) -> ProvisionReport {
+    let dst_dir = Path::new(worktree_cwd).join(".claude").join("agents");
+    let keep = decide_agent_definition_keeps(&dst_dir, retired, None);
+    let embedded = provision_embedded_agent_floor(worktree_cwd, &dst_dir, &keep);
+    warn!(
+        "agent_runtime: no qontinui-root resolved; no checkout overlay for \
+         {worktree_cwd}, so the {embedded} embedded subagent def(s) stand in"
     );
-    crate::fleet_agents::remove_retired_agents(workdir, &keep, retired, report);
+    let mut report = ProvisionReport::unresolved(
+        "agent_definitions",
+        0,
+        dst_dir.display().to_string(),
+        format!(
+            "no qontinui-root resolved, so <root>/qontinui-claude-config/.claude/agents \
+             cannot be located — the normal state on a published install; the {embedded} \
+             embedded default(s) stand in"
+        ),
+    )
+    .with_destination(dst_dir.display().to_string());
+    // An older binary's copy of a retired definition can sit in this workdir
+    // whether or not a root resolves now, so the retirement pass runs here too,
+    // after the floor and with the keep decided before it wrote.
+    crate::fleet_agents::remove_retired_agents(
+        Path::new(worktree_cwd),
+        &keep,
+        retired,
+        &mut report,
+    );
+    report
+}
+
+/// The ONE tracked-destination decision both arms make, before either layer
+/// writes, so the UNKNOWN arm keys on what was on disk before this pass (see
+/// `provision_guard::KeepDecisions`). The candidates are every embedded name,
+/// every `retired` name (so a retired copy the repository tracks is kept by the
+/// retirement pass exactly as the layers keep theirs), and every `*.md` in the
+/// checkout's agents dir when there is one.
+///
+/// In a qontinui-claude-config worktree `.claude/agents/*.md` is tracked
+/// content: the floor wrote this binary's render over it and the overlay wrote
+/// the PRIMARY checkout's copy (a different commit) over it, which left every
+/// such worktree dirty and fed the wip-custody snapshots a stream of junk refs.
+/// Same guard, same probe, as `fleet_commands` and `fleet_skills`.
+fn decide_agent_definition_keeps(
+    dst_dir: &Path,
+    retired: &[&str],
+    checkout_src: Option<&Path>,
+) -> crate::provision_guard::KeepDecisions {
+    let tracked = crate::provision_guard::TrackedPaths::probe(dst_dir);
+    let mut candidates = crate::fleet_agents::embedded_agent_names();
+    candidates.extend(crate::fleet_agents::retired_agent_names(retired));
+    if let Some(Ok(entries)) = checkout_src.map(std::fs::read_dir) {
+        candidates.extend(
+            entries
+                .filter_map(Result::ok)
+                .map(|e| e.path())
+                .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("md"))
+                .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())),
+        );
+    }
+    crate::provision_guard::KeepDecisions::decide(
+        &tracked,
+        dst_dir,
+        candidates.iter().map(String::as_str),
+    )
+}
+
+/// Write the subagent defs bundled into this binary into `dst_dir` and record
+/// that layer's `fleet_agents` row against `worktree_cwd`; returns how many it
+/// wrote. Both arms call it, so a device with no qontinui-claude-config checkout
+/// gets a working subagent set instead of none (see `crate::fleet_agents`).
+///
+/// Deliberately NOT fatal: a failed write is recorded as an `unresolved`
+/// `fleet_agents` row naming the error, and the caller continues — to the
+/// checkout overlay where there is one, because a checkout present on this
+/// device is a complete answer on its own.
+fn provision_embedded_agent_floor(
+    worktree_cwd: &str,
+    dst_dir: &Path,
+    keep: &crate::provision_guard::KeepDecisions,
+) -> usize {
+    let embedded_report = match crate::fleet_agents::provision_fleet_agents_into(dst_dir, keep) {
+        Ok(report) => report,
+        Err(e) => {
+            warn!(
+                "agent_runtime: embedded agent-def write into {} failed: {e}",
+                dst_dir.display()
+            );
+            let mut report = ProvisionReport::new(
+                "fleet_agents",
+                crate::fleet_agents::embedded_agent_count(),
+                capability_manifest::Rung::Unresolved,
+            )
+            .with_destination(dst_dir.display().to_string());
+            report.skip(
+                dst_dir.display().to_string(),
+                capability_manifest::SkipReason::WriteFailed(e.to_string()),
+            );
+            report
+        }
+    };
+    let embedded = embedded_report.written;
+    capability_manifest::record_provision(worktree_cwd, embedded_report);
+    embedded
 }
 
 /// Provision the named-subagent defs into `workdir` and RECORD both layers'
 /// session-ledger rows — [`provision_agent_definitions`]'s `agent_definitions`
 /// report here, and the embedded `fleet_agents` floor from inside
-/// [`provision_agent_definitions_from_root`].
+/// [`provision_agent_definitions_with_root`] (either arm).
 ///
 /// Extracted from the spawn path so the capability-manifest provision probe
 /// (`POST /capability-manifest/provision-probe`, plan
@@ -10349,7 +10430,7 @@ fn retire_agent_definitions(worktree_cwd: &str, retired: &[&str], report: &mut P
 ///
 /// Returns the `agent_definitions` report it recorded -- ONE entry. The embedded
 /// `fleet_agents` floor is recorded from inside
-/// [`provision_agent_definitions_from_root`], which does not hand it back, so it
+/// [`provision_agent_definitions_with_root`], which does not hand it back, so it
 /// is observable on the next manifest read rather than in this value. The spawn
 /// path ignores the return entirely.
 pub(crate) fn provision_agent_definitions_recorded(workdir: &str) -> Vec<ProvisionReport> {
@@ -10365,8 +10446,8 @@ pub(crate) fn provision_agent_definitions_recorded(workdir: &str) -> Vec<Provisi
 ///
 /// Reports BOTH layers: the returned [`ProvisionReport`] is the checkout overlay
 /// (`agent_definitions`), and the embedded floor's own report (`fleet_agents`)
-/// is recorded into the session ledger from here, because this is the only
-/// caller that can see it. The retirement pass runs last and records its
+/// is recorded into the session ledger from here (as the no-root arm records
+/// its own), because only the arm that wrote it can see it. The retirement pass runs last and records its
 /// removals on the returned report.
 fn provision_agent_definitions_from_root(root: &Path, worktree_cwd: &str) -> ProvisionReport {
     provision_agent_definitions_retiring(root, worktree_cwd, crate::fleet_agents::RETIRED_AGENTS)
@@ -10386,64 +10467,14 @@ fn provision_agent_definitions_retiring(
         .join("agents");
     let dst_dir = Path::new(worktree_cwd).join(".claude").join("agents");
 
-    // TRACKED DESTINATIONS ARE KEPT, in both layers below. Decided ONCE, before
-    // either writes, so the UNKNOWN arm keys on what was on disk before this
-    // pass (see `provision_guard::KeepDecisions`). In a qontinui-claude-config
-    // worktree `.claude/agents/*.md` is tracked content: the floor wrote this
-    // binary's render over it and the overlay wrote the PRIMARY checkout's copy
-    // (a different commit) over it, which left every such worktree dirty and fed
-    // the wip-custody snapshots a stream of junk refs. Same guard, same probe, as
-    // `fleet_commands` and `fleet_skills`.
-    let tracked = crate::provision_guard::TrackedPaths::probe(&dst_dir);
-    let mut candidates = crate::fleet_agents::embedded_agent_names();
-    // Retired names are candidates too, so a retired copy the repository tracks
-    // is kept by the retirement pass below exactly as the layers keep theirs.
-    candidates.extend(crate::fleet_agents::retired_agent_names(retired));
-    if let Ok(entries) = std::fs::read_dir(&src_dir) {
-        candidates.extend(
-            entries
-                .filter_map(Result::ok)
-                .map(|e| e.path())
-                .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("md"))
-                .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())),
-        );
-    }
-    let keep = crate::provision_guard::KeepDecisions::decide(
-        &tracked,
-        &dst_dir,
-        candidates.iter().map(String::as_str),
-    );
+    // TRACKED DESTINATIONS ARE KEPT, in both layers below and by the retirement
+    // pass: decided ONCE, before either layer writes.
+    let keep = decide_agent_definition_keeps(&dst_dir, retired, Some(&src_dir));
 
-    // FLOOR FIRST: write the defs bundled into this binary, so a device with no
-    // qontinui-claude-config checkout gets a working subagent set instead of
-    // none. This is the fleet-portability follow-up this function's docstring
-    // has named since it was written; see `crate::fleet_agents`.
-    //
-    // Deliberately NOT fatal: if the embedded write fails we warn and continue
-    // to the checkout overlay, because a checkout present on this device is a
-    // complete answer on its own.
-    let embedded_report = match crate::fleet_agents::provision_fleet_agents_into(&dst_dir, &keep) {
-        Ok(report) => report,
-        Err(e) => {
-            warn!(
-                "agent_runtime: embedded agent-def write into {} failed; using checkout only: {e}",
-                dst_dir.display()
-            );
-            let mut report = ProvisionReport::new(
-                "fleet_agents",
-                crate::fleet_agents::embedded_agent_count(),
-                capability_manifest::Rung::Unresolved,
-            )
-            .with_destination(dst_dir.display().to_string());
-            report.skip(
-                dst_dir.display().to_string(),
-                capability_manifest::SkipReason::WriteFailed(e.to_string()),
-            );
-            report
-        }
-    };
-    let embedded = embedded_report.written;
-    capability_manifest::record_provision(worktree_cwd, embedded_report);
+    // FLOOR FIRST: write the defs bundled into this binary, so a device whose
+    // root resolves but holds no qontinui-claude-config checkout still gets a
+    // working subagent set. Not fatal; see `provision_embedded_agent_floor`.
+    let embedded = provision_embedded_agent_floor(worktree_cwd, &dst_dir, &keep);
 
     // CHECKOUT WINS: the operator's live copies are overlaid on top, so editing
     // qontinui-claude-config/.claude/agents behaves as before, except that a
@@ -15037,33 +15068,35 @@ mod tests {
 
     /// With no checkout root at all, the no-root arm still runs the pass.
     #[test]
-    fn retire_agent_definitions_removes_a_shipped_copy_with_no_root() {
+    fn no_root_arm_removes_a_shipped_copy() {
         let (body, line) = retired_fixture();
         let (wt, dst) = workdir_with(&[("retired-agent.md", body)]);
         let wt_cwd = wt.path().to_string_lossy().into_owned();
-        let mut report = ProvisionReport::unresolved("agent_definitions", 0, "x", "no root");
 
-        retire_agent_definitions(&wt_cwd, &[line.as_str()], &mut report);
+        let report = provision_agent_definitions_no_root(&wt_cwd, &[line.as_str()]);
 
         assert!(!dst.join("retired-agent.md").exists());
         assert_eq!(report.removed.len(), 1, "{:?}", report.removed);
 
-        // And a workdir with no agents directory is a no-op, not an error.
+        // And a workdir with no agents directory gets the floor and has
+        // nothing retired to judge: not an error, nothing removed or kept.
         let empty = tempfile::tempdir().unwrap();
-        let mut report = ProvisionReport::unresolved("agent_definitions", 0, "x", "no root");
-        retire_agent_definitions(
-            &empty.path().to_string_lossy(),
-            &[line.as_str()],
-            &mut report,
-        );
+        let report =
+            provision_agent_definitions_no_root(&empty.path().to_string_lossy(), &[line.as_str()]);
         assert!(report.removed.is_empty() && report.retained_retired.is_empty());
+        assert!(empty
+            .path()
+            .join(".claude")
+            .join("agents")
+            .join("code-reviewer.md")
+            .is_file());
     }
 
     /// The delete path trusts no name: a retired entry that is not exactly one
     /// plain file name is ignored, so a shipped copy it would reach outside the
     /// agents directory survives and nothing is recorded.
     #[test]
-    fn retire_agent_definitions_ignore_a_name_that_is_not_a_plain_file_name() {
+    fn no_root_arm_ignores_a_retired_name_that_is_not_a_plain_file_name() {
         let (body, line) = retired_fixture();
         let blob = crate::provenance::git_blob_id(body.as_bytes());
         let (wt, _dst) = workdir_with(&[]);
@@ -15071,16 +15104,10 @@ mod tests {
         std::fs::write(&outside, body).unwrap();
         let escaping = format!("../retired-agent.md {blob}");
         let nested = format!("sub/retired-agent.md {blob}");
-        let mut report = ProvisionReport::new(
-            "agent_definitions",
-            0,
-            crate::capability_manifest::Rung::OperatorCheckout,
-        );
 
-        retire_agent_definitions(
+        let report = provision_agent_definitions_no_root(
             &wt.path().to_string_lossy(),
             &[escaping.as_str(), nested.as_str()],
-            &mut report,
         );
 
         assert!(
@@ -15101,7 +15128,8 @@ mod tests {
             body,
         )
         .unwrap();
-        retire_agent_definitions(&wt.path().to_string_lossy(), &[line.as_str()], &mut report);
+        let report =
+            provision_agent_definitions_no_root(&wt.path().to_string_lossy(), &[line.as_str()]);
         assert_eq!(report.removed.len(), 1, "{:?}", report.removed);
     }
 
@@ -15109,17 +15137,12 @@ mod tests {
     /// pass reads degraded. A directory in the file's place is unreadable as a
     /// file on every platform and for every user.
     #[test]
-    fn retire_agent_definitions_keep_an_unreadable_copy_and_say_so() {
+    fn no_root_arm_keeps_an_unreadable_retired_copy_and_says_so() {
         let (_, line) = retired_fixture();
         let (wt, dst) = workdir_with(&[]);
         std::fs::create_dir(dst.join("retired-agent.md")).unwrap();
-        let mut report = ProvisionReport::new(
-            "agent_definitions",
-            0,
-            crate::capability_manifest::Rung::OperatorCheckout,
-        );
-
-        retire_agent_definitions(&wt.path().to_string_lossy(), &[line.as_str()], &mut report);
+        let report =
+            provision_agent_definitions_no_root(&wt.path().to_string_lossy(), &[line.as_str()]);
 
         assert!(dst.join("retired-agent.md").exists());
         assert_eq!(
@@ -15148,7 +15171,7 @@ mod tests {
     /// removal, never as a skipped write.
     #[cfg(unix)]
     #[test]
-    fn retire_agent_definitions_report_a_failed_removal_as_one() {
+    fn no_root_arm_reports_a_failed_retired_removal_as_one() {
         use std::os::unix::fs::PermissionsExt;
         let (body, line) = retired_fixture();
         let (wt, dst) = workdir_with(&[("retired-agent.md", body)]);
@@ -15157,19 +15180,14 @@ mod tests {
         if std::fs::write(dst.join("probe"), b"").is_ok() {
             std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755)).unwrap();
             eprintln!(
-                "retire_agent_definitions_report_a_failed_removal_as_one: SKIPPED — a 0o555 \
+                "no_root_arm_reports_a_failed_retired_removal_as_one: SKIPPED — a 0o555 \
                  directory is still writable by this user (root?), so the failed-removal arm \
                  cannot be exercised"
             );
             return;
         }
-        let mut report = ProvisionReport::new(
-            "agent_definitions",
-            0,
-            crate::capability_manifest::Rung::OperatorCheckout,
-        );
-
-        retire_agent_definitions(&wt.path().to_string_lossy(), &[line.as_str()], &mut report);
+        let report =
+            provision_agent_definitions_no_root(&wt.path().to_string_lossy(), &[line.as_str()]);
         std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         assert!(dst.join("retired-agent.md").exists());
@@ -15185,8 +15203,12 @@ mod tests {
             crate::capability_manifest::RetainedReason::RemoveFailed(_)
         ));
         assert!(
-            report.skipped.is_empty(),
-            "a failed removal is not a skipped write"
+            report
+                .skipped
+                .iter()
+                .all(|s| s.reason.wire() != "write_failed"),
+            "a failed removal is not a skipped write: {}",
+            report.summary()
         );
         assert!(!report.is_complete());
     }
@@ -15195,7 +15217,7 @@ mod tests {
     /// through a symlink keeps its shipped copy, wherever the link points.
     #[cfg(unix)]
     #[test]
-    fn retire_agent_definitions_never_remove_through_a_symlink() {
+    fn no_root_arm_never_removes_a_retired_copy_through_a_symlink() {
         let (body, line) = retired_fixture();
         let elsewhere = tempfile::tempdir().unwrap();
         let foreign = elsewhere.path().join(".claude").join("agents");
@@ -15204,13 +15226,8 @@ mod tests {
         let wt = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink(elsewhere.path().join(".claude"), wt.path().join(".claude"))
             .unwrap();
-        let mut report = ProvisionReport::new(
-            "agent_definitions",
-            0,
-            crate::capability_manifest::Rung::OperatorCheckout,
-        );
-
-        retire_agent_definitions(&wt.path().to_string_lossy(), &[line.as_str()], &mut report);
+        let report =
+            provision_agent_definitions_no_root(&wt.path().to_string_lossy(), &[line.as_str()]);
 
         assert!(
             foreign.join("retired-agent.md").is_file(),
@@ -15232,12 +15249,8 @@ mod tests {
         std::fs::write(inner.join("retired-agent.md"), body).unwrap();
         std::fs::create_dir(wt.path().join(".claude")).unwrap();
         std::os::unix::fs::symlink(&inner, wt.path().join(".claude").join("agents")).unwrap();
-        let mut report = ProvisionReport::new(
-            "agent_definitions",
-            0,
-            crate::capability_manifest::Rung::OperatorCheckout,
-        );
-        retire_agent_definitions(&wt.path().to_string_lossy(), &[line.as_str()], &mut report);
+        let report =
+            provision_agent_definitions_no_root(&wt.path().to_string_lossy(), &[line.as_str()]);
         assert!(inner.join("retired-agent.md").is_file());
         assert!(report.removed.is_empty());
         assert!(matches!(
@@ -15249,19 +15262,22 @@ mod tests {
 
         // An edited copy behind a link is a deliberate keep, not a failure.
         std::fs::write(inner.join("retired-agent.md"), "# edited\n").unwrap();
-        let mut report = ProvisionReport::new(
-            "agent_definitions",
-            0,
-            crate::capability_manifest::Rung::OperatorCheckout,
-        );
-        retire_agent_definitions(&wt.path().to_string_lossy(), &[line.as_str()], &mut report);
+        let report =
+            provision_agent_definitions_no_root(&wt.path().to_string_lossy(), &[line.as_str()]);
         assert!(matches!(
             report.retained_retired.first().map(|r| &r.reason),
             Some(crate::capability_manifest::RetainedReason::LocallyModified(
                 _
             ))
         ));
-        assert!(report.is_complete());
+        assert!(
+            !report
+                .retained_retired
+                .iter()
+                .any(|r| r.reason.is_failure()),
+            "{}",
+            report.summary()
+        );
     }
 
     /// The no-root arm (a published install's normal state) hands the
@@ -15284,6 +15300,64 @@ mod tests {
             vec![("test-generator.md", "locally_modified")],
             "the no-root arm must retire with the production table: {}",
             report.summary()
+        );
+    }
+
+    /// A runner with NO workspace root (a published install's normal state)
+    /// still writes the embedded floor: `code-reviewer.md` — which the served
+    /// pre-PR-review policy names — and every other embedded definition. Before
+    /// this the no-root arm wrote nothing, so every spawned agent there had zero
+    /// subagents.
+    #[test]
+    fn provision_agent_defs_no_root_arm_writes_the_embedded_floor() {
+        let wt = tempfile::tempdir().unwrap();
+        let wt_cwd = wt.path().to_string_lossy().into_owned();
+
+        let report = provision_agent_definitions_with_root(None, &wt_cwd);
+
+        let dst = wt.path().join(".claude").join("agents");
+        assert!(
+            dst.join("code-reviewer.md").is_file(),
+            "code-reviewer must resolve on a runner with no workspace root"
+        );
+        let names = crate::fleet_agents::embedded_agent_names();
+        assert!(
+            !names.is_empty(),
+            "fixture: the bundle must carry definitions"
+        );
+        for name in &names {
+            assert!(dst.join(name).is_file(), "embedded {name} was not written");
+        }
+        // The checkout layer is still honestly unresolved, and says the
+        // embedded defaults stand in.
+        assert_eq!(report.capability, "agent_definitions");
+        assert_eq!(report.rung, crate::capability_manifest::Rung::Unresolved);
+        let why = report.skipped[0].reason.describe();
+        assert!(
+            why.contains(&format!("the {} embedded default(s) stand in", names.len())),
+            "{why}"
+        );
+    }
+
+    /// The no-root floor keeps a TRACKED destination exactly as the from-root
+    /// arm does: the keep is decided before the floor writes.
+    #[test]
+    fn provision_agent_defs_no_root_arm_keeps_a_tracked_definition() {
+        use crate::provision_guard::test_support::{git_add, git_init};
+        let (wt, dst) = workdir_with(&[("code-reviewer.md", "# WORKTREE's own reviewer")]);
+        git_init(wt.path());
+        git_add(wt.path(), &dst.join("code-reviewer.md"));
+
+        provision_agent_definitions_with_root(None, &wt.path().to_string_lossy());
+
+        assert_eq!(
+            std::fs::read_to_string(dst.join("code-reviewer.md")).unwrap(),
+            "# WORKTREE's own reviewer",
+            "the embedded floor must not overwrite a tracked definition"
+        );
+        assert!(
+            dst.join("merge-specialist.md").is_file(),
+            "an untracked embedded definition is still written"
         );
     }
 

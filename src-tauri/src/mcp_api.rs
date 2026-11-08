@@ -1647,7 +1647,7 @@ struct ProvisionProbeResponse {
     provisioned_into: String,
     /// The `agent_definitions` report this pass recorded — ONE entry, not both
     /// rows. The embedded `fleet_agents` floor is recorded by the same call from
-    /// inside `provision_agent_definitions_from_root`, which does not hand it
+    /// inside `provision_agent_definitions_with_root`, which does not hand it
     /// back, so it is visible on the next manifest read rather than here. A
     /// caller that needs both reads the manifest, which is what the parity
     /// harness does anyway.

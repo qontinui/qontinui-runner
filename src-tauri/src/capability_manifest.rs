@@ -758,9 +758,9 @@ pub const CAPABILITY_SPECS: &[CapabilitySpec] = &[
                       qontinui-claude-config's hourly `fleet-agents-parity` gate \
                       (`agent-bundle-parity.sh`) checks that the two repositories' \
                       default branches agree, not this disk against this binary. When \
-                      the root does not resolve the \
-                      copy is a no-op that logs \"no qontinui-root resolved; skipping \
-                      .claude/agents\" and continues.",
+                      the root does not resolve there is no checkout copy: this row reads \
+                      `unresolved` and names the embedded default(s) that stand in, and \
+                      the `fleet_agents` floor is still written.",
         expected_rungs: &[Rung::OperatorCheckout, Rung::Unresolved],
         anchor: "agent_runtime::provision_agent_definitions_from_root",
     },
@@ -2124,9 +2124,9 @@ pub fn render_manifest_doc() -> String {
          --capability-manifest-doc > docs/runner-capabilities.md`. NOT from PowerShell, \
          whose `>` writes UTF-16 or a BOM that `include_str!` cannot read at all. The \
          source of truth is `CAPABILITY_SPECS` in \
-         `src-tauri/src/capability_manifest.rs`, and \
-         `.github/workflows/capability-manifest-fresh.yml` fails any PR whose checked-in \
-         copy differs from a fresh render. -->\n\n",
+         `src-tauri/src/capability_manifest.rs`, and the runner test \
+         `the_checked_in_capability_doc_matches_a_fresh_render` (in `src-tauri/src/main.rs`) \
+         fails any change whose checked-in copy differs from a fresh render. -->\n\n",
     );
     out.push_str(&format!("Manifest schema version: `{SCHEMA_VERSION}`.\n\n"));
 
@@ -2865,6 +2865,36 @@ mod tests {
             .is_some_and(|n| n.contains("bundled_resources::resolve_with_rung")));
 
         reset_provision_store();
+    }
+
+    /// A runner with no workspace root records the embedded floor it wrote as
+    /// a `fleet_agents` row on rung `embedded`, in the session's ledger, beside
+    /// the checkout layer's `unresolved` row. Lives here rather than in
+    /// `agent_runtime::tests` because it reads the PROCESS-WIDE store, which
+    /// only this module's `store_lock` serializes against the tests that reset
+    /// or flood it.
+    #[test]
+    fn the_no_root_arm_records_the_embedded_floor_in_the_ledger() {
+        let _guard = store_lock();
+        let wt = tempfile::tempdir().unwrap();
+        let workdir = wt.path().to_string_lossy().into_owned();
+
+        let returned = crate::agent_runtime::provision_agent_definitions_no_root(
+            &workdir,
+            crate::fleet_agents::RETIRED_AGENTS,
+        );
+
+        let ledger = session_provision_ledger(&workdir).expect("the floor was recorded");
+        let floor = ledger
+            .reports
+            .iter()
+            .find(|r| r.capability == "fleet_agents")
+            .unwrap_or_else(|| panic!("no fleet_agents row: {}", ledger.render()));
+        assert_eq!(floor.rung, Rung::Embedded, "{}", floor.summary());
+        assert_eq!(floor.written, crate::fleet_agents::embedded_agent_count());
+        assert!(floor.is_complete(), "{}", floor.summary());
+        assert_eq!(returned.capability, "agent_definitions");
+        assert_eq!(returned.rung, Rung::Unresolved);
     }
 
     /// The ledger is bounded: a long-lived runner spawns thousands of sessions,
