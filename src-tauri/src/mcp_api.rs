@@ -11401,7 +11401,7 @@ async fn coord_work_unit_deps_get_handler(
 /// `coord-revive`), and serde's default is to DROP a key it does not know. A
 /// misspelled tenant key therefore used to deserialize as "no tenant" and mint
 /// on the machine's default slot with a 200 — measured live (coord finding
-/// `659b574a`), when every shipped caller sent `tenant_id` while this struct
+/// `659b574a`), when the shipped caller sent `tenant_id` while this struct
 /// only knew `tenant`. An unknown key is now a typed 400
 /// `COORD_MCP_PROVISION_INVALID_BODY`, so the NEXT drift reports itself.
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -11436,10 +11436,12 @@ struct ProvisionSessionBody {
     ///
     /// **Accepted as `tenant_id` too.** Plan
     /// `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential` P2
-    /// specified the field as `tenant_id`, and that is the spelling every
-    /// shipped caller sends (`coord-provision-nonce.sh`, which `/coord-revive`
-    /// L4 source 3 drives, and the runner's own bundled copy of it). Sending
-    /// both keys is a duplicate-field 400, never a silent pick.
+    /// specified the field as `tenant_id`, and `coord-provision-nonce.sh`
+    /// (which `/coord-revive` L4 source 3 drives) sent that until
+    /// qontinui-claude-config `34211016e` moved it to `tenant`, the spelling
+    /// every build with a selector reads. A runner must still take `tenant_id`
+    /// from any older copy of the script. Sending both keys is a duplicate-field
+    /// 400, never a silent pick.
     #[serde(default, alias = "tenant_id")]
     tenant: Option<uuid::Uuid>,
 }
@@ -21352,10 +21354,11 @@ mod coord_provision_session_gate_tests {
         );
     }
 
-    /// Coord finding `659b574a`: every shipped caller spells the selector
-    /// `tenant_id` (plan 2026-09-10 P2's name), and before the alias serde
-    /// dropped it — so a named tenant minted on the machine's default slot with
-    /// a 200. Both spellings select; both at once, and any unknown key, refuse.
+    /// Coord finding `659b574a`: older copies of `coord-provision-nonce.sh` spell
+    /// the selector `tenant_id` (plan 2026-09-10 P2's name), and before the alias
+    /// serde dropped it — so a named tenant minted on the machine's default slot
+    /// with a 200. Both spellings select; both at once, and any unknown key,
+    /// refuse.
     #[test]
     fn provision_body_takes_tenant_id_and_refuses_unknown_keys() {
         use super::ProvisionSessionBody;
@@ -21365,7 +21368,7 @@ mod coord_provision_session_gate_tests {
         assert_eq!(
             aliased.tenant,
             Some(t),
-            "tenant_id is the fleet callers' spelling and must select, not vanish"
+            "tenant_id is an older caller's spelling and must select, not vanish"
         );
 
         assert!(

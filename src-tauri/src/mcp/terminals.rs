@@ -89,7 +89,10 @@ pub struct CreateTerminalRequest {
     /// machine default, a malformed uuid is a 400, and a tenant this runner
     /// holds no coord credential for is refused (plan
     /// `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential`).
-    #[serde(default, alias = "tenant_id")]
+    /// `tenant` is `POST /coord-mcp/provision-session`'s spelling of the same
+    /// selector; this struct drops unknown keys, so without the alias it would
+    /// silently spawn on the machine default.
+    #[serde(default, alias = "tenant_id", alias = "tenant")]
     pub tenant_id: Option<String>,
     /// Repos the session will EDIT beside `intentRepo` (bare or `owner/name`),
     /// taken off the sibling-store cargo override so its edits reach its build
@@ -265,9 +268,22 @@ pub async fn list_terminals_handler(
     }))))
 }
 
-/// `POST /terminals`' answer to a refused spawn tenant. The refusal itself is
-/// the shared [`crate::commands::terminal::admit_spawn_tenant`], whose text
-/// always opens with a stable `terminal:tenant_<kind>:` prefix.
+/// The `<kind>` of a `terminal:tenant_<kind>:` spawn-tenant refusal text, or
+/// `None` for any other text.
+fn spawn_tenant_refusal_kind(text: &str) -> Option<&str> {
+    text.strip_prefix("terminal:tenant_")
+        .and_then(|rest| rest.split_once(':'))
+        .map(|(kind, _)| kind)
+        .filter(|k| !k.is_empty() && k.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'))
+}
+
+/// `POST /terminals`' answer to a refused spawn tenant. A refusal comes from
+/// one of two places, and both texts open with the same stable
+/// `terminal:tenant_<kind>:` prefix: the shared
+/// [`crate::commands::terminal::admit_spawn_tenant`] precheck, and the identity
+/// seam in [`crate::terminal::session::TerminalSession::spawn`], which is the
+/// only one that can judge a cwd declaring another tenant — see
+/// [`terminal_spawn_failed`].
 ///
 /// That prefix is lifted into the envelope's top-level `code`
 /// (`TERMINAL_TENANT_<KIND>`) so a client can branch on it. Without one, the
@@ -277,14 +293,9 @@ pub async fn list_terminals_handler(
 /// UNKNOWN and not the caller's to fix, so it is a 503 — as the
 /// provision-session door answers it — and every other kind (malformed,
 /// unpaired, a cwd declaring another tenant) is a 400.
-fn spawn_tenant_bad_request(refusal: String) -> (StatusCode, Json<ApiResponse<()>>) {
+fn spawn_tenant_refused(refusal: String) -> (StatusCode, Json<ApiResponse<()>>) {
     warn!("HTTP: rejecting terminal create — {refusal}");
-    let kind = refusal
-        .strip_prefix("terminal:tenant_")
-        .and_then(|rest| rest.split_once(':'))
-        .map(|(kind, _)| kind)
-        .filter(|k| !k.is_empty() && k.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'));
-    let Some(kind) = kind else {
+    let Some(kind) = spawn_tenant_refusal_kind(&refusal) else {
         // Not a spawn-tenant refusal text; keep the untyped 400 rather than
         // inventing a code for it.
         return (StatusCode::BAD_REQUEST, Json(api_error(refusal)));
@@ -296,6 +307,27 @@ fn spawn_tenant_bad_request(refusal: String) -> (StatusCode, Json<ApiResponse<()
     };
     let code = format!("TERMINAL_TENANT_{}", kind.to_ascii_uppercase());
     (status, Json(ApiResponse::error_with_code(refusal, code)))
+}
+
+/// `POST /terminals`' answer to a failed `terminal_manager.create`.
+///
+/// The precheck runs before the worktree allocation and cannot see the final
+/// cwd, so `WorkdirDeclaresOtherTenant` is only ever decided inside the spawn,
+/// and it comes back through here as plain `Err` text. Taking every `Err` for a
+/// runner fault answered that refusal `500 INTERNAL_ERROR`, telling the caller
+/// to retry a request that cannot succeed until it changes its cwd or tenant.
+///
+/// So a refusal from here is not "nothing happened", unlike the precheck's: the
+/// handler has already run the worktree allocation by the time the spawn fails.
+fn terminal_spawn_failed(error: String) -> (StatusCode, Json<ApiResponse<()>>) {
+    if spawn_tenant_refusal_kind(&error).is_some() {
+        return spawn_tenant_refused(error);
+    }
+    error!("HTTP: Failed to create terminal session: {}", error);
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(api_error(format!("Failed to create terminal: {}", error))),
+    )
 }
 
 /// A refused `editSiblings` input → the typed 400 `invalid_edit_sibling`,
@@ -365,9 +397,9 @@ pub async fn create_terminal_handler(
     // The spawn tenant is judged BEFORE the worktree allocation below, which a
     // refusal would otherwise leak. A malformed or unpaired tenant is the
     // caller's to fix (a typed 400 naming the heal); an unreadable credential
-    // store is UNKNOWN, so a 503 — see `spawn_tenant_bad_request`.
+    // store is UNKNOWN, so a 503 — see `spawn_tenant_refused`.
     let spawn_tenant = crate::commands::terminal::admit_spawn_tenant(request.tenant_id.as_deref())
-        .map_err(spawn_tenant_bad_request)?;
+        .map_err(spawn_tenant_refused)?;
 
     // The declared edit siblings are judged here too, before the allocation a
     // refusal would otherwise leak — and before `acquire_for_terminal`'s
@@ -491,11 +523,17 @@ pub async fn create_terminal_handler(
             Ok(Json(ApiResponse::success(serde_json::json!(info))))
         }
         Err(e) => {
-            error!("HTTP: Failed to create terminal session: {}", e);
-            Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!("Failed to create terminal: {}", e))),
-            ))
+            // The context's Drop releases its claims, not the worktree on disk,
+            // so a failure this late leaves one behind whatever status the
+            // caller gets. Name it here; the response cannot.
+            for worktree in isolated_ctx.iter().flat_map(|ctx| ctx.worktrees.iter()) {
+                warn!(
+                    "HTTP: terminal create failed after allocating worktree {} ({})",
+                    worktree.worktree_path.display(),
+                    worktree.repo
+                );
+            }
+            Err(terminal_spawn_failed(e))
         }
     }
 }
@@ -1289,7 +1327,7 @@ mod tests {
             .unwrap();
 
         let admit = |raw: Option<&str>| {
-            crate::commands::terminal::admit_spawn_tenant(raw).map_err(spawn_tenant_bad_request)
+            crate::commands::terminal::admit_spawn_tenant(raw).map_err(spawn_tenant_refused)
         };
         let (status, Json(body)) = admit(Some(&b.to_string())).expect_err("unpaired → refused");
         assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -1361,7 +1399,7 @@ mod tests {
     /// `terminal:tenant_` family keeps the untyped 400 rather than a made-up code.
     #[test]
     fn spawn_tenant_refusal_code_and_status_follow_the_refusal_kind() {
-        let (status, Json(body)) = spawn_tenant_bad_request(
+        let (status, Json(body)) = spawn_tenant_refused(
             "terminal:tenant_credential_store_unreadable: tenant x: io error".to_string(),
         );
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
@@ -1370,7 +1408,7 @@ mod tests {
             Some("TERMINAL_TENANT_CREDENTIAL_STORE_UNREADABLE")
         );
 
-        let (status, Json(body)) = spawn_tenant_bad_request(
+        let (status, Json(body)) = spawn_tenant_refused(
             "terminal:tenant_workdir_declares_other_tenant: /w/.mcp.json".to_string(),
         );
         assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -1379,9 +1417,92 @@ mod tests {
             Some("TERMINAL_TENANT_WORKDIR_DECLARES_OTHER_TENANT")
         );
 
-        let (status, Json(body)) = spawn_tenant_bad_request("something else".to_string());
+        let (status, Json(body)) = spawn_tenant_refused("something else".to_string());
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body.code, None);
+    }
+
+    /// The precheck cannot judge a cwd, so `WorkdirDeclaresOtherTenant` only
+    /// ever reaches this door as a failed `terminal_manager.create`. Every text
+    /// here is the real refusal's `Display`, the same string the identity seam
+    /// returns, so the typed answer cannot drift from what the seam says.
+    #[test]
+    fn a_refusal_from_the_spawn_keeps_its_typed_answer() {
+        use crate::coord_mcp::{DeclaredWorkdirKey, SpawnTenantRefusal};
+        let tenant = uuid::Uuid::from_u128(0xE7E7_0000_0000_4000_8000_0000_0000_00E7);
+
+        let refusal = SpawnTenantRefusal::WorkdirDeclaresOtherTenant {
+            tenant,
+            declared_file: std::path::PathBuf::from("/w/.mcp.json"),
+            declared: DeclaredWorkdirKey::NotLive,
+        };
+        let text = refusal.to_string();
+        let (status, Json(body)) = terminal_spawn_failed(text.clone());
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body.code.as_deref(),
+            Some("TERMINAL_TENANT_WORKDIR_DECLARES_OTHER_TENANT")
+        );
+        assert_eq!(
+            body.error.as_deref(),
+            Some(text.as_str()),
+            "the refusal names its own heal, unwrapped"
+        );
+
+        let refusal = SpawnTenantRefusal::NotPaired { tenant };
+        let (status, Json(body)) = terminal_spawn_failed(refusal.to_string());
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.code.as_deref(), Some("TERMINAL_TENANT_NOT_PAIRED"));
+
+        let refusal = SpawnTenantRefusal::CredentialStoreUnreadable {
+            tenant,
+            error: "io error".to_string(),
+        };
+        let (status, Json(body)) = terminal_spawn_failed(refusal.to_string());
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            body.code.as_deref(),
+            Some("TERMINAL_TENANT_CREDENTIAL_STORE_UNREADABLE")
+        );
+    }
+
+    /// A create failure outside the refusal family is still the runner's fault,
+    /// and a text merely mentioning the family mid-string is not a refusal.
+    #[test]
+    fn any_other_spawn_failure_stays_an_untyped_500() {
+        for text in [
+            "Failed to open PTY: out of ptys",
+            "wrapped: terminal:tenant_not_paired: elsewhere",
+        ] {
+            let (status, Json(body)) = terminal_spawn_failed(text.to_string());
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(body.code, None);
+            assert_eq!(
+                body.error,
+                Some(format!("Failed to create terminal: {text}"))
+            );
+        }
+    }
+
+    /// Finding 659b574a's defect class on this door: a `tenant` key the struct
+    /// did not know was dropped, spawning on the machine default.
+    /// provision-session takes the same spelling, so a caller moving between
+    /// the two doors selects the tenant on both.
+    #[test]
+    fn create_terminal_request_selects_the_tenant_under_every_spelling() {
+        for key in ["tenantId", "tenant_id", "tenant"] {
+            let req: CreateTerminalRequest =
+                serde_json::from_value(serde_json::json!({ key: "t-1" })).unwrap();
+            assert_eq!(req.tenant_id.as_deref(), Some("t-1"), "{key}");
+        }
+        assert!(
+            serde_json::from_value::<CreateTerminalRequest>(serde_json::json!({
+                "tenantId": "t-1",
+                "tenant": "t-2",
+            }))
+            .is_err(),
+            "two spellings at once is a duplicate field, never a silent pick"
+        );
     }
 
     #[test]
