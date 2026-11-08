@@ -99,10 +99,10 @@ pub(crate) const JOIN_WAIT_MAX: Duration =
 pub(crate) const ENV_IN_PROCESS: &str = "QONTINUI_PROCESS_TABLE_IN_PROCESS";
 
 /// The provider's tunables. Production uses [`Config::default`]; tests pass
-/// their own.
+/// their own. The memo age is not one of them: each read passes its own
+/// `max_age` ([`MEMO_TTL`] for a memoized read, zero for [`snapshot_fresh`]).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Config {
-    pub(crate) memo_ttl: Duration,
     pub(crate) circuit_base: Duration,
     pub(crate) circuit_max: Duration,
     pub(crate) join_wait_max: Duration,
@@ -111,7 +111,6 @@ pub(crate) struct Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
-            memo_ttl: MEMO_TTL,
             circuit_base: CIRCUIT_BASE,
             circuit_max: CIRCUIT_MAX,
             join_wait_max: JOIN_WAIT_MAX,
