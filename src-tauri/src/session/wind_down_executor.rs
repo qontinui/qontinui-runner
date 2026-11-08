@@ -166,7 +166,7 @@ use crate::session::wind_down_observer::{
     self, CustodyProbe, GitCustodyProbe, OwnershipRead, SessionCustodyContext,
 };
 use crate::settings::FinishedSessionClose;
-use crate::terminal::graceful_exit::GracefulExitOutcome;
+use crate::terminal::graceful_exit::{ChildExemptions, GracefulExitOutcome};
 use crate::terminal::TerminalManager;
 use qontinui_runner_lib::wind_down::{self, CustodyVerdict, SessionKind};
 
@@ -722,6 +722,26 @@ pub fn claude_left(outcome: &GracefulExitOutcome) -> bool {
     )
 }
 
+/// PURE: does a close under `arm` record strays to present as child
+/// exemptions? Only [`CloseArm::FinishedClose`], and only while
+/// [`WIND_DOWN_PRESENTS_CLOSE_AUTHORITY`] is true.
+fn records_strays(arm: CloseArm) -> bool {
+    arm == CloseArm::FinishedClose && WIND_DOWN_PRESENTS_CLOSE_AUTHORITY
+}
+
+/// PURE: the child exemptions a close presents for the strays it `recorded`.
+/// None at all unless it records strays ([`records_strays`]).
+fn stray_exemptions(
+    presents_strays: bool,
+    recorded: &[crate::session::stray_wait::RecordedStray],
+) -> ChildExemptions {
+    if presents_strays {
+        ChildExemptions::from_strays(recorded.to_vec())
+    } else {
+        ChildExemptions::none()
+    }
+}
+
 /// Exit a pane, ending the stray wait loops it leaves behind.
 ///
 /// A stray background shell leads its own session and group, so no pane exit
@@ -729,17 +749,24 @@ pub fn claude_left(outcome: &GracefulExitOutcome) -> bool {
 /// run on for ever with nothing left to report it. So: record it FIRST, while it is
 /// still under its `claude`; and end it only once `claude` is gone, because a shell
 /// it still owns is its own to end.
-async fn exit_ending_strays<Strays, EndFut>(
+///
+/// `exit` is handed the strays just recorded, so the graceful exit's child gate
+/// can leave out exactly those it re-proves stray (plan
+/// `2026-11-08-wind-down-exempts-proven-strays-from-graceful-exit-child-refusal`,
+/// D1). Nothing is ended before the exit: an exemption only stops a stray from
+/// COUNTING while `claude` is alive.
+async fn exit_ending_strays<Strays, ExitFut, EndFut>(
     record: impl std::future::Future<Output = Strays>,
-    exit: impl std::future::Future<Output = Result<GracefulExitOutcome, String>>,
+    exit: impl FnOnce(&Strays) -> ExitFut,
     end: impl FnOnce(Strays) -> EndFut,
     mut log: impl FnMut(&str),
 ) -> Result<GracefulExitOutcome, String>
 where
+    ExitFut: std::future::Future<Output = Result<GracefulExitOutcome, String>>,
     EndFut: std::future::Future<Output = Vec<String>>,
 {
     let strays = record.await;
-    let outcome = exit.await?;
+    let outcome = exit(&strays).await?;
     if claude_left(&outcome) {
         for line in end(strays).await {
             log(&line);
@@ -1311,8 +1338,13 @@ pub(crate) trait CloseEffects {
     /// agnostic, and a trait method spelled that way would have put one there
     /// — which is the tripwire working, not a false positive. This module
     /// never closes a pane; it asks for a graceful exit and the exit closes it.
+    ///
+    /// `arm` is the arm closing it: only [`CloseArm::FinishedClose`] may record
+    /// strays and present them as child exemptions, and only while
+    /// [`WIND_DOWN_PRESENTS_CLOSE_AUTHORITY`] is true.
     async fn wind_down_one(
         &self,
+        arm: CloseArm,
         session_id: &str,
         terminal_id: &str,
     ) -> Result<GracefulExitOutcome, String>;
@@ -1426,7 +1458,7 @@ pub(crate) async fn close_batch<E: CloseEffects + Sync>(
             outcomes.push(CandidateOutcome::Shadowed);
             continue;
         }
-        let outcome = match effects.wind_down_one(&session_id, &terminal_id).await {
+        let outcome = match effects.wind_down_one(arm, &session_id, &terminal_id).await {
             Ok(outcome) => outcome,
             Err(e) => {
                 warn!(session_id = %session_id, terminal_id = %terminal_id, error = %e, "wind_down_executor: graceful exit could not start");
@@ -1471,8 +1503,28 @@ pub(crate) async fn close_batch<E: CloseEffects + Sync>(
     outcomes
 }
 
+/// Does [`wind_down_exit`] present a close authority to the graceful exit?
+/// `false`: it passes `None`, because no production code can mint one until
+/// the lifecycle Closer does (plan `2026-10-28-one-session-lifecycle-authority`,
+/// Phase 93). So every exit that finds a live `claude` is refused
+/// `no_close_authority` BEFORE the child gate, and any strays recorded for that
+/// gate could never be used.
+///
+/// The `finished_close` arm therefore records strays (a bounded `/proc` walk)
+/// only while this is `true` (plan
+/// `2026-11-08-wind-down-exempts-proven-strays-from-graceful-exit-child-refusal`,
+/// D4). A source tripwire pins the pairing: the module's one `graceful_exit(`
+/// call passes `None` exactly when this is `false`, so handing `wind_down_exit`
+/// an authority without flipping it is red, and flipping it turns the recording
+/// back on. Whoever flips it must first read served `finished-criteria`
+/// condition 2 (coord question `9b74628d`).
+pub const WIND_DOWN_PRESENTS_CLOSE_AUTHORITY: bool = false;
+
 /// The ONE way this module reaches a pane: `TerminalManager::graceful_exit`,
 /// presenting NO close authority, then the log line for what it answered.
+///
+/// See [`WIND_DOWN_PRESENTS_CLOSE_AUTHORITY`], which states that fact as a
+/// constant the stray recording is gated on.
 ///
 /// No authority, because this executor has none to present. The lifecycle
 /// Closer is the only minter, and it does not exist until Phase 93 (plan
@@ -1487,14 +1539,20 @@ pub(crate) async fn close_batch<E: CloseEffects + Sync>(
 /// tests can enter through [`close_batch`] and reach THIS code, and the real
 /// primitive beneath it, without an `AppHandle`. It is still the module's one
 /// `graceful_exit` call, and the kill-path tripwire counts it.
+///
+/// `exempt` is the child-gate policy handed through to the primitive (plan
+/// `2026-11-08-wind-down-exempts-proven-strays-from-graceful-exit-child-refusal`):
+/// the strays the `finished_close` arm recorded, or none. It cannot get a close
+/// past the missing authority above; the primitive checks that first.
 pub(crate) async fn wind_down_exit(
     manager: &Arc<TerminalManager>,
     session_id: &str,
     terminal_id: &str,
     kind: SessionKind,
+    exempt: ChildExemptions,
 ) -> Result<GracefulExitOutcome, String> {
     let outcome = manager
-        .graceful_exit(terminal_id, EXIT_DEADLINE, None)
+        .graceful_exit(terminal_id, EXIT_DEADLINE, None, exempt)
         .await?;
     match &outcome {
         GracefulExitOutcome::Exited { .. } => {
@@ -1632,6 +1690,7 @@ impl CloseEffects for LiveCloseEffects<'_> {
 
     async fn wind_down_one(
         &self,
+        arm: CloseArm,
         session_id: &str,
         terminal_id: &str,
     ) -> Result<GracefulExitOutcome, String> {
@@ -1658,19 +1717,37 @@ impl CloseEffects for LiveCloseEffects<'_> {
 
         // Only the panes the pass discounted a stray from: every other close reads
         // nothing extra. A shell not discounted there was work, and this close
-        // would not have been admitted.
-        let claudes: Vec<u32> = self
-            .pass
-            .report
-            .terminal_hosted
-            .iter()
-            .filter(|p| p.session_id.as_deref() == Some(session_id) && p.stray_wait_shells > 0)
-            .map(|p| p.pid)
-            .collect();
+        // would not have been admitted. And only for the `finished_close` arm,
+        // the population the policy names, while the exit presents an authority:
+        // without one the exit is refused before the child gate, and the walk
+        // would buy nothing (D4).
+        let presents_strays = records_strays(arm);
+        let claudes: Vec<u32> = if presents_strays {
+            self.pass
+                .report
+                .terminal_hosted
+                .iter()
+                .filter(|p| {
+                    p.session_id.as_deref() == Some(session_id) && p.stray_wait_shells > 0
+                })
+                .map(|p| p.pid)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let manager = &self.manager;
         exit_ending_strays(
             crate::session::stray_wait::record_strays(claudes),
             // The ONE way this module reaches a pane. Never `TerminalManager::close`.
-            wind_down_exit(&self.manager, session_id, terminal_id, kind),
+            |recorded: &Vec<crate::session::stray_wait::RecordedStray>| {
+                wind_down_exit(
+                    manager,
+                    session_id,
+                    terminal_id,
+                    kind,
+                    stray_exemptions(presents_strays, recorded),
+                )
+            },
             crate::session::stray_wait::end_strays,
             |line| info!(session_id = %session_id, terminal_id = %terminal_id, "wind_down_executor: {line}"),
         )
@@ -2458,20 +2535,23 @@ mod tests {
         }
     }
 
-    /// Recorded before the exit, ended after it, and only when `claude` left.
+    /// Recorded before the exit, handed to the exit exactly as recorded, ended
+    /// after it, and only when `claude` left.
     #[tokio::test]
     async fn strays_are_recorded_before_the_exit_and_ended_only_after_claude_left() {
         let run = |outcome: Result<GracefulExitOutcome, String>| async move {
             let order = std::cell::RefCell::new(Vec::new());
             let lines = std::cell::RefCell::new(Vec::new());
+            let handed = std::cell::RefCell::new(None);
             let result = exit_ending_strays(
                 async {
                     order.borrow_mut().push("record");
-                    vec![7u32]
+                    vec![7u32, 9]
                 },
-                async {
+                |strays: &Vec<u32>| {
                     order.borrow_mut().push("exit");
-                    outcome
+                    *handed.borrow_mut() = Some(strays.clone());
+                    async { outcome }
                 },
                 |strays: Vec<u32>| {
                     order.borrow_mut().push("end");
@@ -2480,14 +2560,20 @@ mod tests {
                 |line| lines.borrow_mut().push(line.to_string()),
             )
             .await;
-            (result.is_ok(), order.into_inner(), lines.into_inner())
+            (
+                result.is_ok(),
+                order.into_inner(),
+                handed.into_inner(),
+                lines.into_inner(),
+            )
         };
         assert_eq!(
             run(Ok(exited())).await,
             (
                 true,
                 vec!["record", "exit", "end"],
-                vec!["ended [7]".to_string()]
+                Some(vec![7, 9]),
+                vec!["ended [7, 9]".to_string()]
             )
         );
         // `claude` is still there: every shell under it is still its own.
@@ -2496,10 +2582,101 @@ mod tests {
             claude_pids: vec![42],
             last_probe_unreadable: false,
         };
-        assert_eq!(run(Ok(stuck)).await, (true, vec!["record", "exit"], vec![]));
+        assert_eq!(
+            run(Ok(stuck)).await,
+            (true, vec!["record", "exit"], Some(vec![7, 9]), vec![])
+        );
         assert_eq!(
             run(Err("no such pane".to_string())).await,
-            (false, vec!["record", "exit"], vec![])
+            (false, vec!["record", "exit"], Some(vec![7, 9]), vec![])
+        );
+    }
+
+    /// D4 and D3: strays are recorded and presented ONLY for `finished_close`,
+    /// and only while the exit presents an authority. Today it does not
+    /// (`WIND_DOWN_PRESENTS_CLOSE_AUTHORITY` is false, pinned by the tripwire
+    /// below), so no arm records anything and every exit presents no exemption.
+    #[test]
+    fn only_an_authorized_finished_close_records_or_presents_strays() {
+        let stray = crate::session::stray_wait::RecordedStray {
+            pid: 7,
+            start: 1,
+            argv: vec!["bash".to_string()],
+            class: "a".to_string(),
+        };
+        assert!(!records_strays(CloseArm::Drain), "the drain arm never records");
+        assert_eq!(
+            records_strays(CloseArm::FinishedClose),
+            WIND_DOWN_PRESENTS_CLOSE_AUTHORITY,
+            "finished_close records exactly when the exit presents an authority"
+        );
+        assert!(stray_exemptions(false, std::slice::from_ref(&stray)).is_empty());
+        assert_eq!(
+            stray_exemptions(true, std::slice::from_ref(&stray)),
+            ChildExemptions::from_strays(vec![stray.clone()])
+        );
+        // Every arm that does not record presents nothing — today, both.
+        for arm in [CloseArm::Drain, CloseArm::FinishedClose] {
+            assert_eq!(
+                stray_exemptions(records_strays(arm), std::slice::from_ref(&stray)).is_empty(),
+                !records_strays(arm),
+                "{arm:?}"
+            );
+        }
+        // The live impl gates the walk itself on the predicate: the pane list
+        // it records under is built only when `records_strays(arm)` holds.
+        let executor = executable_lines(include_str!("wind_down_executor.rs"));
+        assert!(
+            executor.contains("let presents_strays = records_strays(arm);")
+                && executor.contains("let claudes: Vec<u32> = if presents_strays {")
+                && executor.contains("stray_exemptions(presents_strays, recorded)"),
+            "LiveCloseEffects::wind_down_one no longer gates the stray walk on records_strays"
+        );
+    }
+
+    /// D4's tripwire: the module's ONE `graceful_exit(` call presents an
+    /// authority exactly when [`WIND_DOWN_PRESENTS_CLOSE_AUTHORITY`] says so.
+    /// Handing `wind_down_exit` an authority without flipping the constant,
+    /// or flipping it without handing one, is red.
+    #[test]
+    fn the_one_graceful_exit_call_passes_none_exactly_when_no_authority_is_presented() {
+        let executor = executable_lines(include_str!("wind_down_executor.rs"));
+        let calls: Vec<&str> = executor.split(".graceful_exit(").skip(1).collect();
+        assert_eq!(calls.len(), 1, "exactly one graceful_exit call");
+        // The call's arguments, up to its closing parenthesis.
+        let mut depth = 1usize;
+        let mut end = None;
+        for (i, c) in calls[0].char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let args: Vec<String> = calls[0]
+            .get(..end.expect("the call closes"))
+            .expect("a char boundary")
+            .split(',')
+            .map(|a| a.trim().to_string())
+            .filter(|a| !a.is_empty())
+            .collect();
+        assert_eq!(
+            args.len(),
+            4,
+            "graceful_exit(id, deadline, authority, exemptions): {args:?}"
+        );
+        assert_eq!(
+            args[2] == "None",
+            !WIND_DOWN_PRESENTS_CLOSE_AUTHORITY,
+            "the authority argument is `{}` while WIND_DOWN_PRESENTS_CLOSE_AUTHORITY is {}",
+            args[2],
+            WIND_DOWN_PRESENTS_CLOSE_AUTHORITY
         );
     }
 
@@ -2550,6 +2727,7 @@ mod tests {
         }
         async fn wind_down_one(
             &self,
+            _arm: CloseArm,
             _session_id: &str,
             terminal_id: &str,
         ) -> Result<GracefulExitOutcome, String> {
@@ -2871,6 +3049,7 @@ mod tests {
         }
         async fn wind_down_one(
             &self,
+            arm: CloseArm,
             session_id: &str,
             terminal_id: &str,
         ) -> Result<GracefulExitOutcome, String> {
@@ -2879,6 +3058,7 @@ mod tests {
                 session_id,
                 terminal_id,
                 SessionKind::Terminal,
+                stray_exemptions(records_strays(arm), &[]),
             )
             .await
         }
