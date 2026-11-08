@@ -254,6 +254,19 @@ for _cr in "coord:clears-red=some-repo" "coord:clears-red=acme/some-repo" \
   expect_reject "$_cr" "labels[]=coord:clears-red=<repo>"
   expect_absent "$_cr" "unknown coord:* label key"
 done
+# `destructive-attested` is GitHub-applied only too (coord's
+# DESTRUCTIVE_ATTESTED_LABEL_ERR): every spelling, well-formed or not, gets the
+# error naming the route -- never the generic fallthroughs.
+for _da in "coord:destructive-attested=0123456789ab" "coord:destructive-attested=not-a-digest" \
+           "coord:destructive-attested" "coord:destructive-attested="; do
+  expect_reject "$_da" "coord:destructive-attested=<digest12> must be set on the PR itself"
+  expect_reject "$_da" "labels[]=coord:destructive-attested=<digest12>"
+  expect_absent "$_da" "unknown coord:* label key"
+  expect_absent "$_da" 'parameterised labels need "=value"'
+done
+# The arm is exact: a near-miss key is NOT this refusal. Widening it to
+# `destructive-attested*` would pass every assertion above.
+expect_reject "coord:destructive-attestedx=0123456789ab" "unknown coord:* label key"
 
 # ----- an accepted dry run states what it did NOT check -----------------------
 # `--dry-run` clears the grammar and the ceiling, which closes cause 2 of
@@ -303,6 +316,17 @@ expect_reject "coord:state=open"              "coord-set label"
 expect_reject "coord:blocked-by=x"            "coord-set label"
 expect_reject "coord:operator-review"         "retired label"
 expect_reject "coord:version-bump=1"          "retired label"
+# The coord hold is served, so every retired-hold refusal names it and none still
+# offers the draft fallback coord's RETIRED_HOLD_LABEL_ERR dropped.
+for _rh in "coord:blocked" "coord:experimental" "coord:operator-review" "coord:version-bump=1"; do
+  expect_reject "$_rh" "coord_set_pr_hold"
+  # A coord hold holds nothing on this repo: auto-merge.yml does not read it.
+  expect_reject "$_rh" "auto-merge:hold"
+  # Removing the label alone lands nothing: auto-merge.yml is edge-triggered.
+  expect_reject "$_rh" "then re-fire the PR's lint"
+  expect_absent "$_rh" "gh pr ready"
+  expect_absent "$_rh" "once coord serves"
+done
 expect_reject "coord:bogus=1"                 "unknown coord:* label key"
 expect_reject "not-a-coord-label"             "must start with"
 expect_reject "coord:downstream-of=repo#abc"  "must be int"

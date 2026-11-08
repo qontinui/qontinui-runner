@@ -37,6 +37,31 @@ exactly localhost, [::1] or 127.a.b.c with CANONICAL decimal octets <= 255 -
 no leading zero, which would send `127.08.0.1` to DNS) and resolves on the
 DEFAULT arm otherwise. Same rule as mcp_url_is_loopback in mcp-env-ref.sh.
 
+PORT gate - the environment's nonce goes to the HOSTING RUNNER only (finding
+e4c596d6; plan 2026-11-06-a-walked-up-mcp-json-gets-the-sessions-nonce-on-any-loopback-port):
+loopback alone is not enough, because the doors find their .mcp.json by
+walking UP from a directory, and a file planted in a directory the walk
+reaches first could name `http://127.0.0.1:<any port>/x` with this terminal's
+`${QONTINUI_COORD_MCP_NONCE_<K>}` and receive it. The terminal nonce has ONE
+audience, the runner that hosts this terminal, whose API port (the port its
+coord-mcp proxy is served on) the runner exports as $QONTINUI_RUNNER_API_PORT.
+So expand_env_ref_for_url reads the environment only when
+url_port_is_hosting_runner(url) holds: the URL is loopback (above), its host is
+EXACTLY 127.0.0.1 (the one host the runner writes and binds - `localhost`,
+`[::1]` and 127.0.0.2 are loopback a planted listener can hold on the runner's
+port), AND its effective port (the explicit one, else 80 for http / 443 for https) equals
+$QONTINUI_RUNNER_API_PORT (1-5 ASCII digits, 1..65535, compared as integers,
+read from the same mapping the expansion reads). Every other URL resolves on
+the DEFAULT arm - the file's own literal, never this process's secret. An unset
+or malformed $QONTINUI_RUNNER_API_PORT reads the environment for no URL.
+Same rule as mcp_url_port_is_hosting_runner in mcp-env-ref.sh and
+Test-CoordMcpHostingRunnerUrl in coord-credential.psm1. Only the `127.0.0.1`
+SPELLING gets the environment value: a `localhost:<runner port>` door resolves
+on its default unless its caller normalizes the host first (coord-mcp-shim.py
+does). $QONTINUI_RUNNER_API_PORT is trusted as the host's port, so an operator
+who points it at another runner directs the terminal nonce there (a planted
+file cannot set it).
+
 The error message names the VARIABLE only - never a value, never the default
 (the default is a nonce).
 """
@@ -61,20 +86,28 @@ _OCTET = r"(0|[1-9][0-9]{0,2})"
 _LOOPBACK_V4 = re.compile(r"\A127\." + _OCTET + r"\." + _OCTET + r"\." + _OCTET + r"\Z")
 
 
-def url_is_loopback(url):
-    """True iff `url` is strictly this box's loopback (see the module doc)."""
-    if not isinstance(url, str):
-        return False
+def _authority(url):
+    """(scheme length, authority) of `url`, or None without an http(s) scheme."""
     m = _SCHEME.match(url)
     if not m:
-        return False
+        return None
     rest = url[m.end():]
     cut = len(rest)
     for ch in "/?#":
         i = rest.find(ch)
         if i != -1 and i < cut:
             cut = i
-    auth = rest[:cut]
+    return m.end(), rest[:cut]
+
+
+def url_is_loopback(url):
+    """True iff `url` is strictly this box's loopback (see the module doc)."""
+    if not isinstance(url, str):
+        return False
+    parsed = _authority(url)
+    if parsed is None:
+        return False
+    auth = parsed[1]
     if not _AUTHORITY_CHARS.match(auth):
         return False
     if auth == "[::1]":
@@ -92,10 +125,41 @@ def url_is_loopback(url):
     return bool(v4) and all(int(o) <= 255 for o in v4.groups())
 
 
+RUNNER_API_PORT_ENV = "QONTINUI_RUNNER_API_PORT"
+RUNNER_HOST = "127.0.0.1"
+_API_PORT = re.compile(r"\A[0-9]{1,5}\Z")
+
+
+def url_port_is_hosting_runner(url, environ=None):
+    """True iff `url` is loopback AND its effective port is the hosting
+    runner's $QONTINUI_RUNNER_API_PORT, read from `environ` (default
+    os.environ). See "PORT gate" in the module doc."""
+    if not url_is_loopback(url):
+        return False
+    env = os.environ if environ is None else environ
+    api = env.get(RUNNER_API_PORT_ENV) or ""
+    if not _API_PORT.match(api) or not 1 <= int(api) <= 65535:
+        return False
+    scheme_len, auth = _authority(url)
+    default = 443 if scheme_len == len("https://") else 80
+    host, _, port = auth.partition(":")
+    # Exactly the host the runner writes and binds. `localhost`, `[::1]` and
+    # any other 127.x.y.z are loopback too, but a planted listener can hold
+    # them on the runner's port while the runner holds only 127.0.0.1.
+    if host != RUNNER_HOST:
+        return False
+    if not port:
+        return default == int(api)
+    # url_is_loopback already holds the port to ASCII digits; bound its length
+    # before int() so a 4000-digit port is a plain mismatch.
+    return len(port) <= 5 and int(port) == int(api)
+
+
 def expand_env_ref_for_url(value, url, environ=None):
     """expand_env_ref for a value about to be sent to `url`: the environment
-    arm only for a strictly-loopback URL, the DEFAULT arm otherwise."""
-    return expand_env_ref(value, environ if url_is_loopback(url) else {})
+    arm only for the HOSTING RUNNER's loopback port, the DEFAULT arm for every
+    other URL (see "URL gate" and "PORT gate" in the module doc)."""
+    return expand_env_ref(value, environ if url_port_is_hosting_runner(url, environ) else {})
 
 
 def env_ref_allowlisted(name):
