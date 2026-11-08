@@ -125,7 +125,9 @@ impl SpawnGroup {
             return Self::Steward;
         }
         if let Some((skill, rest)) = prompt.and_then(leading_slash_command) {
-            if is_fixer_skill(skill) || (skill == "merge-train-steward" && rest.contains("--respond-to-alert")) {
+            if is_fixer_skill(skill)
+                || (skill == "merge-train-steward" && rest.contains("--respond-to-alert"))
+            {
                 return Self::Fixer;
             }
             if is_steward_skill(skill) {
@@ -146,7 +148,13 @@ impl SpawnGroup {
 fn is_fixer_skill(skill: &str) -> bool {
     matches!(
         skill,
-        "fix" | "ufix" | "fix-red-main" | "test-fix" | "code-fix" | "auto-fix" | "adjudicate-bundle-red"
+        "fix"
+            | "ufix"
+            | "fix-red-main"
+            | "test-fix"
+            | "code-fix"
+            | "auto-fix"
+            | "adjudicate-bundle-red"
     )
 }
 
@@ -179,7 +187,11 @@ fn leading_slash_command(prompt: &str) -> Option<(&str, &str)> {
 /// `n >= 1` whose page holds fewer than `ceiling` terminals. A page absent from
 /// `counts` is empty, so when every existing page is full this opens the next
 /// one.
-pub(crate) fn pick_group_page(group: SpawnGroup, counts: &HashMap<String, usize>, ceiling: usize) -> String {
+pub(crate) fn pick_group_page(
+    group: SpawnGroup,
+    counts: &HashMap<String, usize>,
+    ceiling: usize,
+) -> String {
     let prefix = group.page_prefix();
     (1usize..)
         .map(|n| format!("{prefix}-{n}"))
@@ -283,53 +295,98 @@ mod tests {
     #[test]
     fn a_generic_name_defers_to_the_prompts_leading_skill() {
         let fix = Some("/fix-red-main qontinui/qontinui-coord\n\nbrief");
-        assert_eq!(SpawnGroup::classify(Some("resume-red-main"), fix), SpawnGroup::Fixer);
-        assert_eq!(SpawnGroup::classify(None, Some("run /ufix --once")), SpawnGroup::Fixer);
+        assert_eq!(
+            SpawnGroup::classify(Some("resume-red-main"), fix),
+            SpawnGroup::Fixer
+        );
+        assert_eq!(
+            SpawnGroup::classify(None, Some("run /ufix --once")),
+            SpawnGroup::Fixer
+        );
         let responder = Some("/merge-train-steward --respond-to-alert 42 --once");
         assert_eq!(SpawnGroup::classify(None, responder), SpawnGroup::Fixer);
         assert_eq!(
             SpawnGroup::classify(Some("resume-x"), Some("/cleanup-steward --once")),
             SpawnGroup::Steward
         );
-        assert_eq!(SpawnGroup::classify(Some("pr-runner#5"), Some("/babysit-prs")), SpawnGroup::Pr);
+        assert_eq!(
+            SpawnGroup::classify(Some("pr-runner#5"), Some("/babysit-prs")),
+            SpawnGroup::Pr
+        );
         // A resource stem that happens to end in `-steward` is not a steward.
-        assert_eq!(SpawnGroup::classify(Some("resume-retire-the-plan-steward"), None), SpawnGroup::Resume);
+        assert_eq!(
+            SpawnGroup::classify(Some("resume-retire-the-plan-steward"), None),
+            SpawnGroup::Resume
+        );
     }
 
     #[test]
     fn a_specific_name_is_not_overridden_by_the_prompt() {
         let prompt = Some("/fix-red-main qontinui/qontinui-runner");
-        assert_eq!(SpawnGroup::classify(Some("post-merge-runner#1"), prompt), SpawnGroup::PostMerge);
-        assert_eq!(SpawnGroup::classify(Some("impl-x"), prompt), SpawnGroup::Impl);
+        assert_eq!(
+            SpawnGroup::classify(Some("post-merge-runner#1"), prompt),
+            SpawnGroup::PostMerge
+        );
+        assert_eq!(
+            SpawnGroup::classify(Some("impl-x"), prompt),
+            SpawnGroup::Impl
+        );
     }
 
     #[test]
     fn only_the_first_line_and_a_word_initial_slash_count() {
         // A path is not a slash command.
-        assert_eq!(SpawnGroup::classify(None, Some("see src/fix.rs")), SpawnGroup::Spawned);
+        assert_eq!(
+            SpawnGroup::classify(None, Some("see src/fix.rs")),
+            SpawnGroup::Spawned
+        );
         // A skill quoted in the brief body is context, not the job.
-        assert_eq!(SpawnGroup::classify(None, Some("Look at PR 4\nthen /fix-red-main")), SpawnGroup::Spawned);
+        assert_eq!(
+            SpawnGroup::classify(None, Some("Look at PR 4\nthen /fix-red-main")),
+            SpawnGroup::Spawned
+        );
     }
 
     #[test]
     fn picks_the_lowest_numbered_page_with_room() {
         let c = PAGE_ZONE_CEILING;
-        assert_eq!(pick_group_page(SpawnGroup::PostMerge, &counts(&[]), c), "post-merge-1");
-        assert_eq!(pick_group_page(SpawnGroup::PostMerge, &counts(&[("post-merge-1", 8)]), c), "post-merge-1");
         assert_eq!(
-            pick_group_page(SpawnGroup::PostMerge, &counts(&[("post-merge-1", 9), ("post-merge-2", 9)]), c),
+            pick_group_page(SpawnGroup::PostMerge, &counts(&[]), c),
+            "post-merge-1"
+        );
+        assert_eq!(
+            pick_group_page(SpawnGroup::PostMerge, &counts(&[("post-merge-1", 8)]), c),
+            "post-merge-1"
+        );
+        assert_eq!(
+            pick_group_page(
+                SpawnGroup::PostMerge,
+                &counts(&[("post-merge-1", 9), ("post-merge-2", 9)]),
+                c
+            ),
             "post-merge-3"
         );
         // A freed slot on a lower page is refilled before a higher page grows.
         assert_eq!(
-            pick_group_page(SpawnGroup::PostMerge, &counts(&[("post-merge-1", 4), ("post-merge-2", 3)]), c),
+            pick_group_page(
+                SpawnGroup::PostMerge,
+                &counts(&[("post-merge-1", 4), ("post-merge-2", 3)]),
+                c
+            ),
             "post-merge-1"
         );
         // A gap (page 1 closed) is reopened.
-        assert_eq!(pick_group_page(SpawnGroup::Impl, &counts(&[("impl-2", 9)]), c), "impl-1");
+        assert_eq!(
+            pick_group_page(SpawnGroup::Impl, &counts(&[("impl-2", 9)]), c),
+            "impl-1"
+        );
         // Other groups' pages and the operator's pages are never chosen.
         assert_eq!(
-            pick_group_page(SpawnGroup::Steward, &counts(&[("default", 0), ("post-merge-1", 0)]), c),
+            pick_group_page(
+                SpawnGroup::Steward,
+                &counts(&[("default", 0), ("post-merge-1", 0)]),
+                c
+            ),
             "stewards-1"
         );
     }
@@ -341,7 +398,11 @@ mod tests {
         let first = place(SpawnGroup::Check, live());
         assert_eq!(first.page_id(), "checks-1");
         let second = place(SpawnGroup::Check, live());
-        assert_eq!(second.page_id(), "checks-2", "the reserved last slot of checks-1 is taken");
+        assert_eq!(
+            second.page_id(),
+            "checks-2",
+            "the reserved last slot of checks-1 is taken"
+        );
         first.release();
         second.release();
         let third = place(SpawnGroup::Check, live());
@@ -387,7 +448,8 @@ mod tests {
             .expect("SPAWN_GROUP_PAGE_PREFIXES declared");
         let list = &ts[start..start + ts[start..].find(']').expect("list closes")];
         let mut ts_prefixes: Vec<&str> = list.split('"').skip(1).step_by(2).collect();
-        let mut rust_prefixes: Vec<&str> = SpawnGroup::ALL.iter().map(|g| g.page_prefix()).collect();
+        let mut rust_prefixes: Vec<&str> =
+            SpawnGroup::ALL.iter().map(|g| g.page_prefix()).collect();
         ts_prefixes.sort_unstable();
         rust_prefixes.sort_unstable();
         assert_eq!(ts_prefixes, rust_prefixes);
