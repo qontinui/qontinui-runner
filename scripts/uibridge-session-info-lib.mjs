@@ -20,6 +20,9 @@
  * spawn-admission retry classifier. Nothing here, or in the oracle, reaches the
  * webview's script-evaluation door or the Tauri global: the exe-mode CSP
  * (`script-src 'self'`) refuses string eval, and a static test pins that.
+ *
+ * Phase 5: the per-zone tenant badge — its expectation, the element comparison
+ * and the cardinality check behind T0.2b / T2b.
  */
 
 // ===========================================================================
@@ -1113,4 +1116,306 @@ export function openResidue(openRows, owned) {
         owned.terminalIds.has(String(r?.terminalId)),
     )
     .map((r) => `${r.claudeSessionId}@${r.terminalId}`);
+}
+
+// ===========================================================================
+// Phase 5 — the per-zone tenant badge (T0.2b, T2b)
+// ===========================================================================
+
+/**
+ * The badge's per-zone UI Bridge id. This shape is OWNED by
+ * `src/components/terminal/TenantBadge.tsx` `tenantBadgeElementId` (plan D1,
+ * PR-A of this plan) — kept literal here because the oracle reads a runner it
+ * does not import from, and the per-zone family (`terminal-zone-header-<n>`,
+ * `terminal-session-info-<field>-<n>`) is spelled the same way.
+ *
+ * @param {number} zoneIndex
+ */
+export function tenantBadgeElementId(zoneIndex) {
+  return `terminal-tenant-badge-${zoneIndex}`;
+}
+
+/** The pre-D1 id every zone's badge shared — its presence is the defect. */
+export const LEGACY_TENANT_BADGE_ID = "terminal.tenant-badge";
+
+/** The spawn-tenant picker's id: registered only when `showSwitcher`. */
+export const SPAWN_TENANT_PICKER_ID = "terminal.spawn-tenant-picker";
+
+/**
+ * Should the zone's badge render? Mirrors `tenantBadgeLabel`'s null rule
+ * (`TenantBadge.tsx`): hidden unless `showSwitcher`, and then shown only when
+ * something names a tenant — the spawn stamp, a divergence, or a RESOLVED
+ * acting tenant in `tenancy.display`. Pure.
+ *
+ * - `pickerPresent` is `terminal.spawn-tenant-picker` being registered, the
+ *   observable of `showSwitcher`; a non-boolean (the registry read failed) is
+ *   UNKNOWN.
+ * - `tenancy` null (no block, or a runner predating it) with the picker
+ *   present is UNKNOWN; so is a block with nothing to say whose `display` is
+ *   null (a runner predating `tenancy.display` could still have resolved one).
+ *
+ * @param {{pickerPresent: boolean|null|undefined, tenancy: any}} input
+ * @returns {{expect:"present"|"absent"|"unknown", reason:string}}
+ */
+export function tenantBadgeExpectation({ pickerPresent, tenancy }) {
+  if (typeof pickerPresent !== "boolean") {
+    return {
+      expect: "unknown",
+      reason: `whether ${SPAWN_TENANT_PICKER_ID} is registered could not be read, so showSwitcher is UNKNOWN`,
+    };
+  }
+  if (!pickerPresent) {
+    return {
+      expect: "absent",
+      reason: `${SPAWN_TENANT_PICKER_ID} is not registered (showSwitcher false: <= 1 tenant binding)`,
+    };
+  }
+  if (!tenancy || typeof tenancy !== "object") {
+    return {
+      expect: "unknown",
+      reason: "the session carries no tenancy block, so what the badge would name is UNKNOWN",
+    };
+  }
+  const stamped = typeof tenancy.row?.tenantId === "string" && tenancy.row.tenantId.trim() !== "";
+  const diverged = tenancy.diverged === true;
+  const display = tenancy.display ?? null;
+  const resolved = display?.status === "resolved" && Boolean(display.tenantId);
+  if (stamped || diverged || resolved) {
+    const why = [
+      stamped && "a spawn stamp",
+      diverged && "a divergence",
+      resolved && "a resolved acting tenant",
+    ]
+      .filter(Boolean)
+      .join(" and ");
+    return { expect: "present", reason: `showSwitcher and ${why}` };
+  }
+  if (!display) {
+    return {
+      expect: "unknown",
+      reason:
+        "no stamp and no divergence, and tenancy.display is absent (runner predates it) — UNKNOWN",
+    };
+  }
+  return {
+    expect: "absent",
+    reason: `showSwitcher, but nothing names a tenant (no stamp, no divergence, display.status=${display.status})`,
+  };
+}
+
+/** A dataset/attribute read that tells "absent" from "present and empty". */
+function readAttr(element, kebab) {
+  const camel = kebab
+    .replace(/^data-/, "")
+    .split("-")
+    .map((p, i) => (i === 0 ? p : p[0].toUpperCase() + p.slice(1)))
+    .join("");
+  const ds = element?.state?.dataset;
+  if (ds && typeof ds === "object" && camel in ds && ds[camel] !== undefined) {
+    return { present: true, value: String(ds[camel]) };
+  }
+  for (const bag of [element?.attributes, element?.state?.attributes]) {
+    if (bag && typeof bag === "object" && kebab in bag && bag[kebab] !== undefined) {
+      return { present: true, value: String(bag[kebab]) };
+    }
+  }
+  return { present: false, value: undefined };
+}
+
+/** The badge's full label: aria-label / title carry it; the visible text is a stem. */
+function badgeLabel(element) {
+  for (const v of [
+    element?.label,
+    element?.accessibleName,
+    element?.state?.accessibleName,
+    element?.attributes?.["aria-label"],
+    element?.state?.attributes?.["aria-label"],
+    element?.attributes?.title,
+    element?.state?.attributes?.title,
+  ]) {
+    if (typeof v === "string" && v.trim() !== "") return v;
+  }
+  return null;
+}
+
+/**
+ * Compare ONE zone's badge element with its expectation. Pure.
+ *
+ * Findings (each `{check, status, detail}`, status PASS / FAIL / UNKNOWN):
+ * - presence — the element is there exactly when expected;
+ * - label — a diverged session's label starts `TENANT MISMATCH`; otherwise it
+ *   names the stamped tenant, else the resolved acting tenant;
+ * - diverged — `data-tenant-diverged` equals `tenancy.diverged`;
+ * - acting — `data-tenant-acting` is ABSENT when `display.source` is
+ *   `row_stamp` (a record of the spawn's choice, never an observation), else
+ *   `display.tenantId` (open PR #2510's `tenantBadgeDisplayAttrs` rule). A
+ *   badge without `data-tenant-display-status` is from a build that predates
+ *   #2510: the acting comparison is UNKNOWN naming the build, never PASS.
+ *
+ * An `unknown` expectation renders the whole arm UNKNOWN with its reason.
+ * Overall: any FAIL → FAIL; else any UNKNOWN → UNKNOWN; else PASS.
+ *
+ * @param {object|null} element the badge element (null when not registered)
+ * @param {{expect:string, reason:string}} expectation
+ * @param {any} tenancy
+ * @param {{build?:string, label?:string}} [opts]
+ */
+export function compareBadgeElement(element, expectation, tenancy, opts = {}) {
+  const build = opts.build ?? "unknown";
+  const who = opts.label ?? "badge";
+  const findings = [];
+  const add = (check, status, detail) => findings.push({ check, status, detail });
+  const verdict = () => {
+    const status = findings.some((f) => f.status === "FAIL")
+      ? "FAIL"
+      : findings.some((f) => f.status === "UNKNOWN")
+        ? "UNKNOWN"
+        : "PASS";
+    return { status, findings };
+  };
+
+  if (expectation?.expect === "unknown") {
+    add("expectation", "UNKNOWN", `${who}: expectation UNKNOWN — ${expectation.reason}`);
+    return verdict();
+  }
+  if (expectation?.expect === "absent") {
+    if (element) {
+      add("presence", "FAIL", `${who}: rendered, but must not (${expectation.reason})`);
+    } else {
+      add("presence", "PASS", `${who}: absent, as expected (${expectation.reason})`);
+    }
+    return verdict();
+  }
+  if (!element) {
+    add("presence", "FAIL", `${who}: NOT rendered, but expected (${expectation?.reason ?? "?"})`);
+    return verdict();
+  }
+  add("presence", "PASS", `${who}: rendered`);
+
+  const diverged = tenancy?.diverged === true;
+  const display = tenancy?.display ?? null;
+  const label = badgeLabel(element);
+  if (label === null) {
+    add(
+      "label",
+      "UNKNOWN",
+      `${who}: the element carries no label/accessibleName/aria-label to read`,
+    );
+  } else if (diverged) {
+    if (label.trimStart().startsWith("TENANT MISMATCH"))
+      add("label", "PASS", `${who}: TENANT MISMATCH`);
+    else
+      add(
+        "label",
+        "FAIL",
+        `${who}: the session is diverged but the label reads '${label.slice(0, 80)}'`,
+      );
+  } else {
+    const stamp = typeof tenancy?.row?.tenantId === "string" ? tenancy.row.tenantId.trim() : "";
+    const acting = display?.status === "resolved" ? display.tenantId : null;
+    const want = stamp || acting || null;
+    if (!want)
+      add("label", "UNKNOWN", `${who}: no stamped or resolved tenant to look for in the label`);
+    else if (label.includes(want)) add("label", "PASS", `${who}: names ${want}`);
+    else add("label", "FAIL", `${who}: the label does not name ${want}: '${label.slice(0, 120)}'`);
+  }
+
+  const dv = readAttr(element, "data-tenant-diverged");
+  const wantDiverged = diverged ? "true" : "false";
+  if (!dv.present)
+    add("diverged", "FAIL", `${who}: data-tenant-diverged is absent (expected '${wantDiverged}')`);
+  else if (dv.value === wantDiverged)
+    add("diverged", "PASS", `${who}: data-tenant-diverged='${dv.value}'`);
+  else
+    add(
+      "diverged",
+      "FAIL",
+      `${who}: data-tenant-diverged='${dv.value}', backend diverged=${diverged}`,
+    );
+
+  const status = readAttr(element, "data-tenant-display-status");
+  if (!status.present) {
+    add(
+      "acting",
+      "UNKNOWN",
+      `${who}: no data-tenant-display-status — runner build ${build} predates PR #2510's display attributes, so data-tenant-acting cannot be compared`,
+    );
+  } else {
+    const actingAttr = readAttr(element, "data-tenant-acting");
+    const wantActing = display?.source === "row_stamp" ? null : (display?.tenantId ?? null);
+    if (wantActing === null) {
+      if (actingAttr.present) {
+        add(
+          "acting",
+          "FAIL",
+          `${who}: data-tenant-acting='${actingAttr.value}' but must be ABSENT (display.source=${display?.source ?? "null"})`,
+        );
+      } else {
+        add(
+          "acting",
+          "PASS",
+          `${who}: data-tenant-acting absent (display.source=${display?.source ?? "null"})`,
+        );
+      }
+    } else if (!actingAttr.present) {
+      add("acting", "FAIL", `${who}: data-tenant-acting is absent, expected '${wantActing}'`);
+    } else if (actingAttr.value === wantActing) {
+      add("acting", "PASS", `${who}: data-tenant-acting='${wantActing}'`);
+    } else {
+      add(
+        "acting",
+        "FAIL",
+        `${who}: data-tenant-acting='${actingAttr.value}', expected '${wantActing}'`,
+      );
+    }
+  }
+  return verdict();
+}
+
+/**
+ * T2b's cardinality: the registered badge ids must be distinct, per-zone, and
+ * exactly as many as the zones expecting a badge. Pure. The defect it pins
+ * (measured on a two-zone page): one `terminal.tenant-badge` for two zones.
+ *
+ * @param {{registryIds:string[], zones:{zoneIndex:number, expect:string}[]}} input
+ * @returns {{ok:boolean|null, detail:string}} `ok: null` is UNKNOWN
+ */
+export function badgeCardinality({ registryIds, zones }) {
+  const ids = (registryIds ?? []).map(String);
+  const badgeIds = ids.filter(
+    (id) => id === LEGACY_TENANT_BADGE_ID || /^terminal-tenant-badge-\d+$/.test(id),
+  );
+  const unknown = (zones ?? []).filter((z) => z.expect === "unknown");
+  if (unknown.length) {
+    return {
+      ok: null,
+      detail: `zone(s) ${unknown.map((z) => z.zoneIndex).join(", ")} have an UNKNOWN expectation, so how many badges are owed is UNKNOWN`,
+    };
+  }
+  const expecting = (zones ?? []).filter((z) => z.expect === "present");
+  const problems = [];
+  const dup = badgeIds.filter((id, i) => badgeIds.indexOf(id) !== i);
+  if (dup.length) problems.push(`duplicated badge id(s): ${[...new Set(dup)].join(", ")}`);
+  if (badgeIds.includes(LEGACY_TENANT_BADGE_ID)) {
+    problems.push(`the shared pre-per-zone id '${LEGACY_TENANT_BADGE_ID}' is registered`);
+  }
+  const distinct = new Set(badgeIds);
+  if (distinct.size !== expecting.length) {
+    problems.push(
+      `${distinct.size} distinct badge id(s) [${[...distinct].join(", ")}] for ${expecting.length} zone(s) expecting a badge [${expecting.map((z) => z.zoneIndex).join(", ")}]`,
+    );
+  }
+  for (const z of expecting) {
+    if (!distinct.has(tenantBadgeElementId(z.zoneIndex))) {
+      problems.push(
+        `zone ${z.zoneIndex} expects ${tenantBadgeElementId(z.zoneIndex)}, which is not registered`,
+      );
+    }
+  }
+  return problems.length
+    ? { ok: false, detail: problems.join("; ") }
+    : {
+        ok: true,
+        detail: `${distinct.size} distinct per-zone badge id(s) for ${expecting.length} zone(s)`,
+      };
 }

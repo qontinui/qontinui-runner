@@ -115,8 +115,12 @@ import {
   KEY_DOWN,
   KEY_ENTER,
   KNOWN_LAUNCH_GATES,
+  LEGACY_TENANT_BADGE_ID,
+  SPAWN_TENANT_PICKER_ID,
+  badgeCardinality,
   buildFixtureTerminalRequest,
   classifyTerminalSpawn,
+  compareBadgeElement,
   killTargetRunner,
   openResidue,
   parseZoneViewState,
@@ -128,6 +132,8 @@ import {
   resolveTargetRunnerPid,
   sameRoster,
   selfHostingVerdict,
+  tenantBadgeElementId,
+  tenantBadgeExpectation,
   terminalBufferText,
   verifyRosterSeed,
   zoneIndexOf,
@@ -1229,6 +1235,7 @@ async function createFixtures(ctx) {
       T02_WHAT,
       "--fixture needs at least one name in --accounts; the roster is machine-global and this script will not guess account names",
     );
+    skip("T0.2b", T02B_WHAT, "no fixtures");
     skip(
       "T0.3",
       "a trivial prompt in each fixture session (transcript + confirmed_at)",
@@ -1248,6 +1255,7 @@ async function createFixtures(ctx) {
 
   const refuseAll = (why) => {
     fail("T0.2", T02_WHAT, why);
+    skip("T0.2b", T02B_WHAT, "no fixtures");
     skip(
       "T0.3",
       "a trivial prompt in each fixture session (transcript + confirmed_at)",
@@ -1317,6 +1325,12 @@ async function createFixtures(ctx) {
     }
     for (const g of r.gatesAnswered ?? []) gatesAnswered.add(g);
     created.push({ spec, session: r.session, terminalId: r.terminalId, zoneIndex: r.zoneIndex });
+    // T0.2b reads the ONE-terminal page, which exists only between the first
+    // fixture confirming and the second one landing.
+    if (created.length === 1) await runSingleZoneBadgeArm(ctx, created[0]);
+  }
+  if (created.length === 0) {
+    skip("T0.2b", T02B_WHAT, "no fixture was created, so there is no single-zone page to read");
   }
   ctx.fixtures = created;
 
@@ -1558,16 +1572,190 @@ async function runT0(ctx) {
   if (!ctx.opts.fixture) {
     const why = "--fixture not given (default is a non-mutating run)";
     skip("T0.2", T02_WHAT, why);
+    skip("T0.2b", T02B_WHAT, why);
     skip("T0.3", "a trivial prompt in each fixture session (transcript + confirmed_at)", why);
     skip("T0.4", "one operator-renamed session and one Claude-derived one", why);
   } else if (!ctx.gates.empty || !ctx.gates.notSelfHosted) {
     const why = "the T0 gates did not hold — fixture creation is aborted (plan §0/R4)";
     skip("T0.2", T02_WHAT, why);
+    skip("T0.2b", T02B_WHAT, why);
     skip("T0.3", "a trivial prompt in each fixture session (transcript + confirmed_at)", why);
     skip("T0.4", "one operator-renamed session and one Claude-derived one", why);
   } else {
     await createFixtures(ctx);
   }
+}
+
+// ===========================================================================
+// T0.2b / T2b — the per-zone tenant badge (plan Phase 5)
+// ===========================================================================
+
+const T02B_WHAT =
+  "single zone: the info trigger and the tenant badge render in the one-terminal strip";
+const T2B_WHAT =
+  "every bound zone's terminal-tenant-badge-<n> matches its expectation; ids distinct, one per zone expecting a badge";
+
+/** Wait for one element id to be registered; returns the registry ids last read. */
+async function waitForElement(id, budgetMs = TRIGGER_MOUNT_BUDGET_MS) {
+  const deadline = Date.now() + budgetMs;
+  let last = { ok: false, ids: new Set(), error: "never read" };
+  while (Date.now() < deadline) {
+    const reg = await fetchElements();
+    last = reg.ok
+      ? { ok: true, ids: new Set(reg.elements.map((e) => String(e?.id ?? ""))), error: null }
+      : { ok: false, ids: new Set(), error: reg.error };
+    if (last.ok && last.ids.has(id)) return last;
+    await sleep(FIXTURE_POLL_INTERVAL_MS);
+  }
+  return last;
+}
+
+/** The badge element for `zoneIndex`, or null when its per-zone id is not registered. */
+async function readBadgeElement(ids, zoneIndex) {
+  const id = tenantBadgeElementId(zoneIndex);
+  if (!ids.has(id)) return { ok: true, element: null, error: null };
+  const el = await fetchElement(id);
+  return el.ok
+    ? { ok: true, element: el.element, error: null }
+    : { ok: false, element: null, error: el.error };
+}
+
+/** A note appended to a missing-badge finding when the pre-D1 shared id is what renders. */
+const legacyNote = (ids) =>
+  ids.has(LEGACY_TENANT_BADGE_ID)
+    ? ` (the shared pre-per-zone id '${LEGACY_TENANT_BADGE_ID}' IS registered — this build predates the per-zone badge id)`
+    : "";
+
+/**
+ * Fold badge findings (`{status, detail}`, status PASS / FAIL / UNKNOWN) into
+ * one row. Any FAIL fails the arm; otherwise any UNKNOWN makes it NOT
+ * evaluated (a SKIP whose text says UNKNOWN) — never a PASS.
+ */
+function recordBadgeArm(id, what, findings) {
+  const bad = findings.filter((f) => f.status === "FAIL");
+  const unknown = findings.filter((f) => f.status === "UNKNOWN");
+  if (findings.length === 0) return skip(id, what, "no subjects to evaluate");
+  if (bad.length) return fail(id, what, bad.map((f) => f.detail).join("\n"));
+  if (unknown.length) {
+    return skip(id, what, `UNKNOWN — ${unknown.map((f) => f.detail).join("\n")}`);
+  }
+  return pass(id, what, findings.map((f) => f.detail).join("; "));
+}
+
+/**
+ * T0.2b — the one-terminal page, the layout most operators run, where the
+ * badge used to be missing entirely (defect 1). Runs right after the FIRST
+ * fixture confirms, and only when the page has exactly one zone; any other
+ * layout SKIPs naming it — this arm never changes the layout.
+ */
+async function runSingleZoneBadgeArm(ctx, fixture) {
+  const v = await fetchZoneViewState(ctx.build);
+  if (!v.ok) return skip("T0.2b", T02B_WHAT, `get-zone-view-state: ${v.error}`);
+  if (v.view.zoneCount !== 1) {
+    return skip(
+      "T0.2b",
+      T02B_WHAT,
+      `the page's layout is '${v.view.layoutId ?? "?"}' with ${v.view.zoneCount ?? "?"} zone(s), not one — ` +
+        `this arm reads the single-zone strip and never changes the layout`,
+    );
+  }
+  const zone = zoneIndexOf(v.view.assignments, fixture.terminalId) ?? 0;
+  const triggerId = infoElementId("trigger", zone);
+  const reg = await waitForElement(triggerId);
+  if (!reg.ok) return fail("T0.2b", T02B_WHAT, `GET /ui-bridge/control/elements: ${reg.error}`);
+  const findings = [];
+  findings.push(
+    reg.ids.has(triggerId)
+      ? { status: "PASS", detail: `${triggerId} rendered` }
+      : {
+          status: "FAIL",
+          detail: `${triggerId} absent after ${TRIGGER_MOUNT_BUDGET_MS}ms on the one-terminal page`,
+        },
+  );
+  const info = await fetchSessionsInfo();
+  const sid = fixture.session?.identity?.claudeSessionId;
+  const session = info.ok ? info.sessions.find((s) => s.identity?.claudeSessionId === sid) : null;
+  const tenancy = session ? (session.tenancy ?? null) : (fixture.session?.tenancy ?? null);
+  const expectation = tenantBadgeExpectation({
+    pickerPresent: reg.ids.has(SPAWN_TENANT_PICKER_ID),
+    tenancy,
+  });
+  const badge = await readBadgeElement(reg.ids, zone);
+  if (!badge.ok) {
+    findings.push({
+      status: "FAIL",
+      detail: `GET element ${tenantBadgeElementId(zone)}: ${badge.error}`,
+    });
+  } else {
+    const cmp = compareBadgeElement(badge.element, expectation, tenancy, {
+      build: ctx.build,
+      label: `zone ${zone} ${tenantBadgeElementId(zone)}`,
+    });
+    for (const f of cmp.findings) {
+      const extra = f.check === "presence" && f.status === "FAIL" ? legacyNote(reg.ids) : "";
+      findings.push({ status: f.status, detail: f.detail + extra });
+    }
+  }
+  return recordBadgeArm("T0.2b", T02B_WHAT, findings);
+}
+
+/**
+ * T2b — every session-bound zone's badge, by its per-zone id, against the
+ * expectation its own session's tenancy implies; then the cardinality: the
+ * badge ids are distinct and as many as the zones expecting one (defect 2:
+ * one `terminal.tenant-badge` for two zones).
+ */
+async function runMultiZoneBadgeArm(ctx, z, info) {
+  if (!z.ok) return skip("T2b", T2B_WHAT, `elements read failed: ${z.error}`);
+  const bound = z.zones.filter((x) => x.claudeSessionId);
+  if (z.zones.length < 2) {
+    return skip(
+      "T2b",
+      T2B_WHAT,
+      `${z.zones.length} zone header(s) — not a multi-zone page (T0.2b covers the single zone)`,
+    );
+  }
+  if (bound.length === 0)
+    return skip("T2b", T2B_WHAT, "no zone header carries a data-claude-session-id");
+  if (!info.ok || info.status !== "ok") {
+    return skip(
+      "T2b",
+      T2B_WHAT,
+      `UNKNOWN — /control/sessions/info ${info.ok ? `status='${info.status}'` : info.error}, so no zone's tenancy is known`,
+    );
+  }
+  const ids = new Set((z.registry || []).map((e) => String(e?.id ?? "")));
+  const pickerPresent = ids.has(SPAWN_TENANT_PICKER_ID);
+  const findings = [];
+  const zonesExp = [];
+  for (const zone of bound) {
+    const session = info.sessions.find((s) => s.identity?.claudeSessionId === zone.claudeSessionId);
+    const tenancy = session?.tenancy ?? null;
+    const expectation = tenantBadgeExpectation({ pickerPresent, tenancy });
+    zonesExp.push({ zoneIndex: zone.zoneIndex, expect: expectation.expect });
+    const badge = await readBadgeElement(ids, zone.zoneIndex);
+    if (!badge.ok) {
+      findings.push({
+        status: "FAIL",
+        detail: `GET element ${tenantBadgeElementId(zone.zoneIndex)}: ${badge.error}`,
+      });
+      continue;
+    }
+    const cmp = compareBadgeElement(badge.element, expectation, tenancy, {
+      build: ctx.build,
+      label: `zone ${zone.zoneIndex} ${tenantBadgeElementId(zone.zoneIndex)}`,
+    });
+    for (const f of cmp.findings) {
+      const extra = f.check === "presence" && f.status === "FAIL" ? legacyNote(ids) : "";
+      findings.push({ status: f.status, detail: f.detail + extra });
+    }
+  }
+  const card = badgeCardinality({ registryIds: [...ids], zones: zonesExp });
+  findings.push({
+    status: card.ok === true ? "PASS" : card.ok === false ? "FAIL" : "UNKNOWN",
+    detail: `cardinality: ${card.detail}`,
+  });
+  return recordBadgeArm("T2b", T2B_WHAT, findings);
 }
 
 // ===========================================================================
@@ -2083,6 +2271,9 @@ async function runDropdownAssertions(ctx) {
       findings,
     );
   }
+
+  // --- T2b -------------------------------------------------------------
+  await runMultiZoneBadgeArm(ctx, z, info);
 
   // --- T0.5 (PR arm honesty) + T3/T4/T5 -----------------------------------
   const withPrs = info.ok
