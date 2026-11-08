@@ -408,10 +408,13 @@ pub struct ApiResponse<T: Serialize> {
     /// suggestions or workaround guidance to callers.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hint: Option<serde_json::Value>,
-    /// Canonical SCREAMING_SNAKE_CASE error code for transport-layer and
-    /// handler-level rejections (e.g. `INVALID_JSON`, `INVALID_REQUEST`,
-    /// `UNSUPPORTED_MEDIA_TYPE`, `PAYLOAD_TOO_LARGE`). Absent on success
-    /// responses and on legacy error paths that predate the envelope plan.
+    /// Machine-readable error code. Transport-layer and handler-level
+    /// rejections use SCREAMING_SNAKE_CASE (e.g. `INVALID_JSON`,
+    /// `INVALID_REQUEST`, `UNSUPPORTED_MEDIA_TYPE`, `PAYLOAD_TOO_LARGE`); a
+    /// shared refusal from `qontinui_types::refusal` carries its snake_case
+    /// wire form (`RefusalCode::as_str`, e.g. `workspace_root_unresolved`).
+    /// Absent on success responses and on legacy error paths that predate the
+    /// envelope plan.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
     /// Optional human-readable recovery suggestions surfaced to callers

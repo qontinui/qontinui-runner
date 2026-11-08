@@ -34,7 +34,18 @@
 # `const CAPABILITY_SPECS` key. The three moved rows are now reviewed
 # (fallback_correct, below); the CAPABILITY_SPECS prose row stays unreviewed
 # with its key's siblings. 230 rendered - 3 reviewed = 227. A fall, held.
-unreviewed_ceiling = 227
+# 227 -> 221 (qontinui-schemas#269 follow-up): seven unreviewed `repo_layout`
+# rows, each a hand-written "Set $QONTINUI_ROOT" sentence, are gone. Five sites
+# (database/pg/apps.rs, env_agent/apply_repos.rs's in-runner arm, main.rs,
+# mcp/task_runs.rs, planning_bridge.rs's unresolved-root warning) render the
+# shared `WorkspaceRootUnresolved` sentence; mcp/api_surface.rs renders it or
+# `SiblingCheckoutAbsent`; planning_bridge.rs's per-tree warning names a clone
+# or an install instead. One row is NEW and deliberately left unreviewed:
+# env_agent/apply_repos.rs `const CLI_UNRESOLVED_ROOT_NOTE`, because a
+# standalone `env apply` cannot read the "Workspace root" setting, so
+# $QONTINUI_ROOT is the true next action there. Whether `env apply` is a
+# dev-only surface is a disposition call this change does not make. Net -6.
+unreviewed_ceiling = 221
 
 # First triage pass (plan 2026-09-20-published-runner-parity-count-comes-from-a-run-not-from-reports Phase 4):
 # every supervisor_dependency, tenant_literal and machine_path key. The
@@ -696,3 +707,10 @@ reviewed = [
     "\"powershell\",",
     "\"pwsh\",",
 ]
+# qontinui-schemas#269 follow-up: the standalone-CLI arm of the repos apply.
+[[disposition]]
+class = "repo_layout"
+file = "src/env_agent/apply_repos.rs"
+symbol = "const CLI_UNRESOLVED_ROOT_NOTE"
+disposition = "unreviewed"
+note = "Acknowledged, not triaged. A standalone `env apply --section repos` exits before the runner publishes its settings door (collectors::workspace_root_reads_setting), so it cannot read the Workspace root setting and $QONTINUI_ROOT is the true next action there; the in-runner arm renders the shared WorkspaceRootUnresolved sentence instead. Left unreviewed because whether `env apply` is a dev_only_surface is a disposition call this change does not make."
