@@ -1669,7 +1669,11 @@ struct ProvisionProbeResponse {
 /// absence of two readings, never parity.
 ///
 /// It calls [`crate::agent_runtime::provision_agent_definitions_recorded`] —
-/// the SAME function the spawn path calls, not a copy. That is the condition
+/// the SAME function the spawn path calls, not a copy. That function's
+/// retirement pass removes files, but only shipped copies of RETIRED
+/// definitions, and only inside the probe's own fresh `probe-<uuid>` directory
+/// (it is the workdir the pass is handed), which starts empty — so a probe never
+/// removes anything outside the directory it created. That is the condition
 /// Fork B was decided on: a probe that can drift from the real path would
 /// certify a provisioning arm nobody runs.
 ///

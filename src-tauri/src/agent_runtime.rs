@@ -10501,15 +10501,15 @@ fn provision_agent_definitions_retiring(
         };
 
     // RETIRED LAST. A definition this binary retired stopped shipping when its
-    // file left the bundle, but a copy an older binary or a checkout overlay
-    // wrote is still on disk, so it is removed here when its blob is one the
-    // definition shipped as. Neither layer writes a retired name (none is
-    // bundled, and the overlay skips them), so the pass judges only copies that
-    // were already on disk. It runs whether the checkout answered, was absent
-    // or errored, because a device with no
-    // checkout is exactly where an older binary's embedded copy sits (the
-    // no-root arm of `provision_agent_definitions` runs it as well). `keep`
-    // was decided before either layer wrote, so a tracked copy stays.
+    // file left the bundle, but a copy an older binary (its floor or its
+    // checkout overlay) wrote is still on disk, so it is removed here when its
+    // blob is one the definition shipped as. Neither layer writes a retired name
+    // (none is bundled, and the overlay skips them), so the pass judges only
+    // copies that were already on disk. It runs whether the checkout answered,
+    // was absent or errored, because a device with no checkout is exactly where
+    // an older binary's embedded copy sits (the no-root arm of
+    // `provision_agent_definitions` runs it as well). `keep` was decided before
+    // either layer wrote, so a tracked copy stays.
     crate::fleet_agents::remove_retired_agents(
         Path::new(worktree_cwd),
         &keep,
@@ -15099,9 +15099,14 @@ mod tests {
     fn no_root_arm_ignores_a_retired_name_that_is_not_a_plain_file_name() {
         let (body, line) = retired_fixture();
         let blob = crate::provenance::git_blob_id(body.as_bytes());
-        let (wt, _dst) = workdir_with(&[]);
+        let (wt, dst) = workdir_with(&[]);
         let outside = wt.path().join(".claude").join("retired-agent.md");
         std::fs::write(&outside, body).unwrap();
+        // A shipped copy the `sub/` entry WOULD reach if it were trusted, so
+        // that half of the test can fail too.
+        let nested_copy = dst.join("sub").join("retired-agent.md");
+        std::fs::create_dir_all(nested_copy.parent().unwrap()).unwrap();
+        std::fs::write(&nested_copy, body).unwrap();
         let escaping = format!("../retired-agent.md {blob}");
         let nested = format!("sub/retired-agent.md {blob}");
 
@@ -15113,6 +15118,10 @@ mod tests {
         assert!(
             outside.is_file(),
             "a copy outside the agents directory must survive"
+        );
+        assert!(
+            nested_copy.is_file(),
+            "a copy in a subdirectory of the agents directory must survive"
         );
         assert!(
             report.removed.is_empty() && report.retained_retired.is_empty(),

@@ -760,7 +760,15 @@ pub const CAPABILITY_SPECS: &[CapabilitySpec] = &[
                       default branches agree, not this disk against this binary. When \
                       the root does not resolve there is no checkout copy: this row reads \
                       `unresolved` and names the embedded default(s) that stand in, and \
-                      the `fleet_agents` floor is still written.",
+                      the `fleet_agents` floor is still written. The same row carries \
+                      the RETIREMENT pass over `.claude/agents`, in either arm: its detail \
+                      names `removed <unit>` for a shipped copy it deleted, \
+                      `retired but kept: <unit> (<reason>)` for a deliberate keep (locally \
+                      modified, or tracked by the repository), and \
+                      `not overlaid (retired): <unit>` for a retired definition the \
+                      checkout still holds; a copy it could not remove is in the note \
+                      as `retired unit(s) the pass could not remove, which may still \
+                      resolve`, and degrades the row.",
         expected_rungs: &[Rung::OperatorCheckout, Rung::Unresolved],
         anchor: "agent_runtime::provision_agent_definitions_from_root",
     },
@@ -1317,8 +1325,8 @@ impl ProvisionReport {
         self.rung = rung;
     }
 
-    /// True when every expected unit was written, nothing was skipped, and no
-    /// retired unit the pass meant to remove is still on disk.
+    /// True when every expected unit was written, nothing was skipped, and the
+    /// pass left no retained retired unit whose reason `is_failure()`.
     #[must_use]
     pub fn is_complete(&self) -> bool {
         self.skipped.is_empty()
@@ -1326,8 +1334,8 @@ impl ProvisionReport {
             && !self.retained_retired.iter().any(|r| r.reason.is_failure())
     }
 
-    /// True when this pass delivered less than its roster, or left a retired
-    /// unit on disk that it meant to remove — the states that used to be
+    /// True when this pass delivered less than its roster, or left a retained
+    /// retired unit whose reason `is_failure()` — the states that used to be
     /// invisible.
     #[must_use]
     pub fn is_degraded(&self) -> bool {
@@ -1384,8 +1392,9 @@ impl ProvisionReport {
     /// The skipped units land in [`CapabilityObservation::note`] WITH their
     /// reasons, so a manifest read on an operator's machine states what the
     /// session did not get and why — which is the entire deliverable of this
-    /// phase. A retired unit the pass meant to remove and could not lands in the
-    /// note too; removed units and deliberate keeps land in the detail.
+    /// phase. A retained retired unit whose reason `is_failure()` lands in the
+    /// note too; removed units and deliberate keeps (a retained retired unit
+    /// whose reason is not a failure) land in the detail.
     #[must_use]
     pub fn observation(&self) -> CapabilityObservation {
         let mut detail = format!("wrote {}/{} unit(s)", self.written, self.expected);
@@ -1469,7 +1478,8 @@ pub struct SessionProvisionLedger {
 }
 
 impl SessionProvisionLedger {
-    /// The reports for passes that delivered less than their roster.
+    /// The reports for passes that delivered less than their roster, or left a
+    /// retained retired unit whose reason `is_failure()`.
     #[must_use]
     pub fn degraded(&self) -> Vec<&ProvisionReport> {
         self.reports.iter().filter(|r| r.is_degraded()).collect()
