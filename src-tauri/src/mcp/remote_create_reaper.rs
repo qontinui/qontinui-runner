@@ -1225,6 +1225,7 @@ mod tests {
             crate::terminal::graceful_exit::PaneProcesses {
                 subtree_claude: Vec::new(),
                 top_level_children: 0,
+                exempted_children: Vec::new(),
                 tracked_alive: Vec::new(),
             },
         )
@@ -1238,6 +1239,7 @@ mod tests {
                     started_at: 1_000,
                 }],
                 top_level_children: 0,
+                exempted_children: Vec::new(),
                 tracked_alive: Vec::new(),
             },
         )

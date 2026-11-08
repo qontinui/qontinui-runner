@@ -6515,6 +6515,7 @@ pub(crate) async fn end_admitted_terminal(
                         &graceful_id,
                         crate::terminal::graceful_exit::DEFAULT_DEADLINE,
                         None,
+                        crate::terminal::graceful_exit::ChildExemptions::none(),
                     )
                     .await
             },

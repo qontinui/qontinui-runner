@@ -4954,20 +4954,37 @@ impl TerminalSession {
     /// `authority` is the caller's close authority, checked once the probe has
     /// found a live `claude` and before any byte is typed. See
     /// [`crate::terminal::close_authority`].
+    ///
+    /// `exempt` is the child-gate policy: the direct children of the `claude`
+    /// it admits are not counted against the close. It reaches the FIRST probe
+    /// only, the one whose child count the gate reads; every later probe
+    /// (the wait for `claude` to leave) counts nothing and needs none.
     pub(super) async fn graceful_exit_then<C, CF>(
         &self,
         deadline: std::time::Duration,
         close_tab: C,
         authority: Option<crate::terminal::close_authority::CloseAuthority>,
+        exempt: crate::terminal::graceful_exit::ChildExemptions,
     ) -> crate::terminal::graceful_exit::GracefulExitOutcome
     where
         C: FnOnce() -> CF,
         CF: std::future::Future<Output = crate::terminal::graceful_exit::CloseTabResult>,
     {
         let root = self.child_pid;
+        let mut first = Some(exempt);
         self.graceful_exit_driven(
             crate::terminal::graceful_exit::ExitTiming::with_deadline(deadline),
-            move |tracked| crate::terminal::graceful_exit::probe_claude_under(root, tracked),
+            move |tracked| {
+                let exempt = first
+                    .take()
+                    .unwrap_or_else(crate::terminal::graceful_exit::ChildExemptions::none);
+                async move {
+                    crate::terminal::graceful_exit::probe_claude_under_exempting(
+                        root, tracked, &exempt,
+                    )
+                    .await
+                }
+            },
             close_tab,
             authority,
         )
@@ -6238,16 +6255,21 @@ pub(crate) mod tests {
         }
     }
 
+    /// `children`: the direct children of the top-level `claude`, each counted
+    /// against a close unless the caller's exemptions admit it.
     fn scripted_pane(
         subtree_claude: Vec<crate::terminal::graceful_exit::ProcIdentity>,
+        children: Vec<u32>,
     ) -> ScriptedPane {
         let claude_pids = subtree_claude.iter().map(|id| id.pid).collect();
-        let scripted = crate::terminal::graceful_exit::fake_process_table::register(
+        let scripted = crate::terminal::graceful_exit::fake_process_table::register_with_children(
             crate::terminal::graceful_exit::PaneProcesses {
                 subtree_claude,
                 top_level_children: 0,
+                exempted_children: Vec::new(),
                 tracked_alive: Vec::new(),
             },
+            children,
         );
         let (session, io, typed) = live_prompt_parts(EMPTY_PROMPT, true, Some(scripted.root_pid));
         ScriptedPane {
@@ -6261,15 +6283,30 @@ pub(crate) mod tests {
 
     /// One live `claude`, ZERO children — see [`ScriptedPane`].
     pub(crate) fn live_claude_pane() -> ScriptedPane {
-        scripted_pane(vec![crate::terminal::graceful_exit::ProcIdentity {
-            pid: 4242,
-            started_at: 1_000,
-        }])
+        scripted_pane(
+            vec![crate::terminal::graceful_exit::ProcIdentity {
+                pid: 4242,
+                started_at: 1_000,
+            }],
+            Vec::new(),
+        )
+    }
+
+    /// One live `claude` whose ONLY direct child is `child` — refused for its
+    /// child unless the caller's exemptions admit it. See [`ScriptedPane`].
+    pub(crate) fn live_claude_pane_with_child(child: u32) -> ScriptedPane {
+        scripted_pane(
+            vec![crate::terminal::graceful_exit::ProcIdentity {
+                pid: 4242,
+                started_at: 1_000,
+            }],
+            vec![child],
+        )
     }
 
     /// No `claude` in the pane: a bare shell — see [`ScriptedPane`].
     pub(crate) fn bare_shell_pane() -> ScriptedPane {
-        scripted_pane(Vec::new())
+        scripted_pane(Vec::new(), Vec::new())
     }
 
     const EMPTY_PROMPT: &str = "done.\r\n\u{276f} ";
@@ -6297,6 +6334,7 @@ pub(crate) mod tests {
             crate::terminal::graceful_exit::PaneProcesses {
                 subtree_claude: subtree.to_vec(),
                 top_level_children: 0,
+                exempted_children: Vec::new(),
                 tracked_alive: alive.to_vec(),
             },
         )
@@ -6377,6 +6415,7 @@ pub(crate) mod tests {
                     crate::terminal::graceful_exit::CloseTabResult::Closed
                 },
                 None,
+                crate::terminal::graceful_exit::ChildExemptions::none(),
             )
             .await;
 

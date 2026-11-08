@@ -1037,12 +1037,23 @@ impl TerminalManager {
     /// pane holding a live `claude`. A bare shell pane still answers
     /// `NoLiveClaude`, as before. See [`crate::terminal::close_authority`].
     ///
+    /// **`exempt`** (plan
+    /// `2026-11-08-wind-down-exempts-proven-strays-from-graceful-exit-child-refusal`):
+    /// the child-gate policy. A direct child of the `claude` it admits — today
+    /// only a recorded stray wait loop re-proven stray at the probe — is not
+    /// counted against the close. It never moves the check above, and every
+    /// caller but the wind-down `finished_close` arm passes
+    /// [`ChildExemptions::none`]. The close-time re-probe below counts nothing
+    /// and takes none.
+    ///
     /// [`CloseAuthority`]: crate::terminal::close_authority::CloseAuthority
+    /// [`ChildExemptions::none`]: crate::terminal::graceful_exit::ChildExemptions::none
     pub async fn graceful_exit(
         self: &std::sync::Arc<Self>,
         id: &str,
         deadline: std::time::Duration,
         authority: Option<crate::terminal::close_authority::CloseAuthority>,
+        exempt: crate::terminal::graceful_exit::ChildExemptions,
     ) -> Result<crate::terminal::graceful_exit::GracefulExitOutcome, String> {
         let session = self
             .get(id)
@@ -1126,6 +1137,7 @@ impl TerminalManager {
                 }
                 },
                 authority,
+                exempt,
             )
             .await)
     }
@@ -1647,7 +1659,12 @@ mod tests {
         tm.insert_for_test("live-claude", pane.session.clone());
 
         let outcome = tm
-            .graceful_exit("live-claude", std::time::Duration::from_secs(60), None)
+            .graceful_exit(
+                "live-claude",
+                std::time::Duration::from_secs(60),
+                None,
+                crate::terminal::graceful_exit::ChildExemptions::none(),
+            )
             .await
             .expect("the pane is registered");
 
@@ -1663,6 +1680,64 @@ mod tests {
             tm.get("live-claude").is_some(),
             "a refused close must leave the pane registered"
         );
+    }
+
+    /// The child-gate policy survives `TerminalManager::graceful_exit` →
+    /// `graceful_exit_then` → the probe (plan
+    /// `2026-11-08-wind-down-exempts-proven-strays-from-graceful-exit-child-refusal`).
+    /// A pane whose `claude` has ONE direct child, presented an authority: with
+    /// that child admitted it gets past the child gate (and, since the scripted
+    /// `claude` never leaves, `/exit` is typed and the exit is stuck, nothing
+    /// killed); with no exemptions it is refused for the child, nothing typed.
+    #[tokio::test(start_paused = true)]
+    async fn graceful_exit_forwards_child_exemptions_to_the_child_gate() {
+        use crate::terminal::close_authority::CloseAuthority;
+        use crate::terminal::graceful_exit::{ChildExemptions, GracefulExitOutcome};
+        use std::sync::Arc;
+
+        const CHILD: u32 = 5151;
+
+        let tm = Arc::new(TerminalManager::new());
+        let admitted = crate::terminal::session::tests::live_claude_pane_with_child(CHILD);
+        tm.insert_for_test("admitted", admitted.session.clone());
+        let outcome = tm
+            .graceful_exit(
+                "admitted",
+                std::time::Duration::from_secs(60),
+                Some(CloseAuthority::for_test()),
+                ChildExemptions::admit_for_test(CHILD),
+            )
+            .await
+            .expect("the pane is registered");
+        assert!(
+            matches!(outcome, GracefulExitOutcome::ExitStuck { .. }),
+            "an admitted only child must pass the child gate: {outcome:?}"
+        );
+        assert_eq!(admitted.typed(), b"/exit\r");
+        assert_eq!(admitted.kills(), 0);
+        assert!(tm.get("admitted").is_some());
+
+        let counted = crate::terminal::session::tests::live_claude_pane_with_child(CHILD);
+        tm.insert_for_test("counted", counted.session.clone());
+        let outcome = tm
+            .graceful_exit(
+                "counted",
+                std::time::Duration::from_secs(60),
+                Some(CloseAuthority::for_test()),
+                ChildExemptions::none(),
+            )
+            .await
+            .expect("the pane is registered");
+        match &outcome {
+            GracefulExitOutcome::Refused { reason, .. } => assert_eq!(
+                reason, "the claude process has 1 child process(es) attached",
+                "no exemption: the child counts and nothing is named"
+            ),
+            other => panic!("expected the child refusal, got {other:?}"),
+        }
+        assert!(counted.typed().is_empty(), "typed into a live claude");
+        assert_eq!(counted.kills(), 0);
+        assert!(tm.get("counted").is_some());
     }
 
     fn account_with(projects: serde_json::Value) -> tempfile::TempDir {

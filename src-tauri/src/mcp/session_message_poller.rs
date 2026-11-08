@@ -2741,6 +2741,7 @@ mod tests {
         let no_claude = ClaudeProbe::Readable(PaneProcesses {
             subtree_claude: vec![],
             top_level_children: 0,
+            exempted_children: Vec::new(),
             tracked_alive: vec![],
         });
         assert_eq!(
@@ -2758,6 +2759,7 @@ mod tests {
                 started_at: 1,
             }],
             top_level_children: 0,
+            exempted_children: Vec::new(),
             tracked_alive: vec![],
         });
         assert_eq!(claude_live(&live, |_| true), Ok(()));
