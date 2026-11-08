@@ -314,6 +314,11 @@ fn spawn_tenant_refused(refusal: String) -> (StatusCode, Json<ApiResponse<()>>) 
 ///
 /// So a refusal from here is not "nothing happened", unlike the precheck's: the
 /// handler has already run the worktree allocation by the time the spawn fails.
+///
+/// The tests cover this function, not the handler's `Err` arm that calls it:
+/// driving `create_terminal` needs an `AppHandle`. Putting that arm back to an
+/// inline 500 would still pass every test here, and would show up only as a
+/// dead-code warning on this function in a non-test build.
 fn terminal_spawn_failed(error: String) -> (StatusCode, Json<ApiResponse<()>>) {
     if spawn_tenant_refusal_kind(&error).is_some() {
         return spawn_tenant_refused(error);
@@ -518,10 +523,12 @@ pub async fn create_terminal_handler(
         Err(e) => {
             // The context's Drop releases its claims, not the worktree on disk,
             // so a failure this late leaves one behind whatever status the
-            // caller gets. Name it here; the response cannot.
+            // caller gets. Name it here; the response cannot. The context may
+            // hold a worktree this call allocated or one it reused from the
+            // request's cwd, so the line says only that it is still there.
             for worktree in isolated_ctx.iter().flat_map(|ctx| ctx.worktrees.iter()) {
                 warn!(
-                    "HTTP: terminal create failed after allocating worktree {} ({})",
+                    "HTTP: terminal create failed; isolated worktree {} ({}) stays on disk",
                     worktree.worktree_path.display(),
                     worktree.repo
                 );
