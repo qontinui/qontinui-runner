@@ -911,9 +911,11 @@ pub struct TerminalSessionRecord {
     /// Unix millis of the most recent provider SessionStart hook that reported
     /// this id ([`SessionLifecycleStore::note_session_start_hook`]) — when its
     /// process last started (or resumed into) its terminal. The durable half of
-    /// [`SessionLifecycleStore::latest_open_on_terminal`]'s ranking, so a pane
-    /// whose operator ran `/resume` still resolves to the resumed session after
-    /// a restart. `None` = no hook seen, or the record predates the field.
+    /// [`SessionLifecycleStore::latest_open_on_terminal`]'s ranking, and an
+    /// input to [`open_authority_key`], so a pane whose operator ran `/resume`
+    /// still resolves to the resumed session after a restart — in the terminal
+    /// lookups, the boot repair and the restore read alike. `None` = no hook
+    /// seen, or the record predates the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_session_start_at: Option<i64>,
     /// The `coord.gates` row this session is a continuation of — the same value
@@ -3870,10 +3872,9 @@ impl SessionLifecycleStore {
     /// The persistent boot repair fixes the durable store, but it must not RACE
     /// the frontend's on-mount restore read, so the read is deduped here too:
     /// among admitted `open` rows sharing a non-empty `terminal_id` we keep the
-    /// single most-authoritative one (CONFIRMED over unconfirmed, then newest
-    /// `last_seen_at`, then newest `opened_at`) and drop the rest — a row held
-    /// for an account choice has no terminal, so it is kept but never contests
-    /// one (see [`dedupe_open_by_terminal`]). This is
+    /// single most-authoritative one ([`open_authority_key`]) and drop the rest
+    /// — a row held for an account choice has no terminal, so it is kept but
+    /// never contests one (see [`dedupe_open_by_terminal`]). This is
     /// idempotent with the boot repair and immunizes the read regardless of when
     /// the repair persists.
     pub fn restorable_records(
@@ -4128,10 +4129,16 @@ impl SessionLifecycleStore {
                     return 0;
                 }
             };
-            // Group the OPEN rows by their (non-empty) terminal_id.
+            // Group the OPEN, UNFINISHED rows by their (non-empty) terminal_id:
+            // the same contenders the restore read dedupes, which partitions
+            // finished rows out first. A finished row must not close an
+            // unfinished sibling the read may already be restoring.
             let mut by_terminal: HashMap<String, Vec<String>> = HashMap::new();
             for rec in m.values() {
-                if rec.state == "open" && !rec.terminal_id.trim().is_empty() {
+                if rec.state == "open"
+                    && rec.finished_at.is_none()
+                    && !rec.terminal_id.trim().is_empty()
+                {
                     by_terminal
                         .entry(rec.terminal_id.clone())
                         .or_default()
@@ -4152,8 +4159,8 @@ impl SessionLifecycleStore {
                 // violate it (a later zone-move / boot re-assert can give an
                 // unconfirmed phantom a marginally newer `last_seen_at` than the
                 // real confirmed session, so we'd keep the phantom and close
-                // the real one). Same key, over the same contenders (open rows
-                // bound to a terminal), as the read-time dedupe in
+                // the real one). Same key, over the same contenders (unfinished
+                // open rows bound to a terminal), as the read-time dedupe in
                 // `restorable_records`. A row held for an account choice is in
                 // neither: the hold detached its terminal, so it never joins a
                 // group here and is never closed as a reuse loser.
@@ -4161,15 +4168,20 @@ impl SessionLifecycleStore {
                 ranked.sort_by(|a, b| {
                     let ka = m.get(a.as_str()).map(open_authority_key).unwrap_or((
                         false,
+                        None,
                         i64::MIN,
                         i64::MIN,
                     ));
                     let kb = m.get(b.as_str()).map(open_authority_key).unwrap_or((
                         false,
+                        None,
                         i64::MIN,
                         i64::MIN,
                     ));
-                    kb.cmp(&ka)
+                    // The id breaks a full tie the way the read-time dedupe
+                    // does; `ids` came out of a `HashMap`, so its order must
+                    // never decide which live session is closed.
+                    kb.cmp(&ka).then_with(|| b.cmp(a))
                 });
                 for id in ranked.into_iter().skip(1) {
                     if let Some(rec) = m.get_mut(id.as_str()) {
@@ -4596,12 +4608,32 @@ fn resolve_close_target(
 /// Restore-authority key for an `open` row on a contested terminal, greatest =
 /// most likely to be the LIVE session. A CONFIRMED row (a provider hook proved
 /// a real session ran) outranks any unconfirmed one regardless of timestamps;
-/// among equal confirmation, the newest `last_seen_at` then `opened_at` wins.
+/// among equal confirmation, the latest
+/// [`TerminalSessionRecord::last_session_start_at`] wins (a row with one
+/// outranks a row without), then the newest `last_seen_at`, then `opened_at`.
 /// Shared by the read-time dedupe ([`dedupe_open_by_terminal`]) and the boot
 /// repair ([`SessionLifecycleStore::repair_terminal_id_collisions`]) so both
 /// agree on which colliding row to keep.
-fn open_authority_key(rec: &TerminalSessionRecord) -> (bool, i64, i64) {
-    (rec.confirmed_at.is_some(), rec.last_seen_at, rec.opened_at)
+///
+/// The hook stamp leads `last_seen_at` because the liveness poll touches every
+/// open row on a pane whose provider is alive, so `last_seen_at` cannot tell
+/// the session running there from the row it replaced, and `opened_at` is kept
+/// across a re-open, so a resumed session can carry the OLDER one. Ranked on
+/// those alone, a restart could close the session a pane was running and
+/// restore the stale row beside it.
+///
+/// Two limits, both accepted. The stamp is only as good as the hook: a resume
+/// whose hook POST was lost keeps its older stamp and ranks below the row it
+/// replaced until its next hook. And this is a pure function of the row, so
+/// unlike [`SessionLifecycleStore::latest_open_on_terminal`] it has no
+/// process-local order to survive a wall-clock step between two starts.
+fn open_authority_key(rec: &TerminalSessionRecord) -> (bool, Option<i64>, i64, i64) {
+    (
+        rec.confirmed_at.is_some(),
+        rec.last_session_start_at,
+        rec.last_seen_at,
+        rec.opened_at,
+    )
 }
 
 /// This process's boot instant for a freshly opened store: the shared
@@ -5022,7 +5054,11 @@ fn dedupe_open_by_terminal(records: Vec<TerminalSessionRecord>) -> Vec<TerminalS
         winner
             .entry(r.terminal_id.as_str())
             .and_modify(|best| {
-                if open_authority_key(r) > open_authority_key(best) {
+                // The id breaks a full tie the way the boot repair does, so
+                // over the same contenders the two keep the same row.
+                if (open_authority_key(r), &r.claude_session_id)
+                    > (open_authority_key(best), &best.claude_session_id)
+                {
                     *best = r;
                 }
             })
@@ -7814,7 +7850,8 @@ mod tests {
         );
     }
 
-    /// `latest_open_on_terminal` ranks hook order, then `confirmed_at`, then
+    /// `latest_open_on_terminal` ranks hook order, then the durable hook stamp,
+    /// then `confirmed_at`, then
     /// `last_seen_at` / `opened_at`, then the id — so it is deterministic on a
     /// full tie, never names the excluded id, and ignores closed rows and other
     /// terminals.
@@ -11795,6 +11832,158 @@ mod tests {
             vec!["confirmed-real".to_string(), "solo".to_string()],
             "the confirmed row wins the shared terminal; the phantom is dropped; solo kept"
         );
+    }
+
+    /// The restart half of the 2026-10-29 incident, driven through the calls
+    /// the hook route makes. A pane's own row P and the session X its operator
+    /// resumed are both open and confirmed; the liveness poll touched P last
+    /// and X was confirmed first, so only the SessionStart stamp says X is the
+    /// one running. The boot repair must close P, and the restore read must
+    /// return X. Ranked without the stamp, both keep P and the repair closes
+    /// the running session.
+    #[test]
+    fn boot_repair_and_restore_read_keep_the_resumed_session() {
+        for _ in 0..32 {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("s.json");
+            {
+                let store = SessionLifecycleStore::open(&path).unwrap();
+                let mut x = auth_on("resumed-x", "term-r");
+                x.confirmed_at = Some(1_000);
+                store.record_open(x);
+                store.record_open(auth_on("pane-p", "term-r"));
+                store.confirm_session("pane-p");
+                store.note_session_start_hook("pane-p");
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                store.note_session_start_hook("resumed-x");
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                store.touch("pane-p");
+            }
+            let reloaded = SessionLifecycleStore::open(&path).unwrap();
+            let restored = reloaded.restorable_records(None, true);
+            let ids: Vec<&str> = restored
+                .iter()
+                .map(|r| r.claude_session_id.as_str())
+                .collect();
+            assert_eq!(ids, vec!["resumed-x"], "the restore read names X");
+
+            assert_eq!(reloaded.repair_terminal_id_collisions(), 1);
+            assert_eq!(reloaded.get("resumed-x").unwrap().state, "open");
+            let pane = reloaded.get("pane-p").unwrap();
+            assert_eq!(pane.state, "closed");
+            assert_eq!(
+                pane.close_reason.as_deref(),
+                Some("superseded-terminal-reuse")
+            );
+        }
+    }
+
+    /// The order around the stamp: confirmation still leads it (the dangerous
+    /// window of a reused terminal), a stamped row beats an unstamped one even
+    /// when the unstamped one was seen later, and two rows with no stamp — every
+    /// record written before the field existed — keep the `last_seen_at` order.
+    #[test]
+    fn open_authority_key_ranks_the_stamp_after_confirmation_before_last_seen() {
+        let mk = |last_seen: i64, confirmed: Option<i64>, stamp: Option<i64>| {
+            let mut r = fixture_rec("r", "open", last_seen, None, None);
+            r.confirmed_at = confirmed;
+            r.last_session_start_at = stamp;
+            open_authority_key(&r)
+        };
+        assert!(mk(1, Some(1), None) > mk(9, None, Some(9)));
+        assert!(mk(1, Some(1), Some(5)) > mk(9, Some(1), Some(4)));
+        assert!(mk(1, Some(1), Some(5)) > mk(9, Some(1), None));
+        assert!(mk(9, Some(1), None) > mk(1, Some(1), None));
+    }
+
+    /// The resumed session has been marked finished but is still open. The
+    /// restore read partitions finished rows out before it dedupes, so the
+    /// unfinished sibling is the one it restores, and the boot repair must not
+    /// close that row on behalf of a row the read never ranked against it.
+    #[test]
+    fn repair_does_not_close_a_sibling_on_behalf_of_a_finished_row() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("s.json");
+        let shutdown = 1_700_000_000_000_i64;
+        let mut pane = fixture_rec("pane-p", "open", shutdown, None, None);
+        pane.terminal_id = "term-r".to_string();
+        pane.confirmed_at = Some(1_000);
+        pane.last_session_start_at = Some(100);
+        let mut finished = fixture_rec("resumed-x", "open", shutdown - 1, None, None);
+        finished.terminal_id = "term-r".to_string();
+        finished.confirmed_at = Some(1_000);
+        finished.last_session_start_at = Some(200);
+        finished.finished_at = Some(shutdown - 1);
+        write_fixture(&path, vec![pane, finished]);
+        let store = SessionLifecycleStore::open(&path).unwrap();
+
+        let restored = store.restorable_records(Some(shutdown), true);
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].claude_session_id, "pane-p");
+        assert_eq!(store.repair_terminal_id_collisions(), 0);
+        assert_eq!(store.get("pane-p").unwrap().state, "open");
+        assert_eq!(store.get("resumed-x").unwrap().state, "open");
+    }
+
+    /// A close whose id does not match the terminal closes the row the boot
+    /// repair would keep: the later SessionStart, and on a full tie the greatest
+    /// id. Both consumers must name the same row as the one running there.
+    #[test]
+    fn mismatched_close_picks_the_row_the_repair_would_keep() {
+        for (stamps, expected) in [
+            ([Some(200), Some(100)], "row-a"),
+            ([Some(100), Some(200)], "row-b"),
+            ([None, None], "row-b"),
+        ] {
+            let mk = |id: &str, stamp: Option<i64>| {
+                let mut r = fixture_rec(id, "open", 1_000, None, None);
+                r.terminal_id = "shared".to_string();
+                r.confirmed_at = Some(1_000);
+                r.last_session_start_at = stamp;
+                r
+            };
+            // Two stores, two directories: the close's WAL delta would replay
+            // over a fixture rewritten at the same path.
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("s.json");
+            write_fixture(&path, vec![mk("row-a", stamps[0]), mk("row-b", stamps[1])]);
+            let store = SessionLifecycleStore::open(&path).unwrap();
+            let outcome = store.record_close_checked("unknown-id", Some("shared"), "explicit");
+            match outcome {
+                CloseOutcome::RedirectedAmbiguous { closed, .. } => assert_eq!(closed, expected),
+                other => panic!("expected RedirectedAmbiguous, got {other:?}"),
+            }
+
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("s.json");
+            write_fixture(&path, vec![mk("row-a", stamps[0]), mk("row-b", stamps[1])]);
+            let store = SessionLifecycleStore::open(&path).unwrap();
+            assert_eq!(store.repair_terminal_id_collisions(), 1);
+            assert_eq!(store.get(expected).unwrap().state, "open");
+        }
+    }
+
+    /// On a full key tie the boot repair and the restore read keep the SAME row,
+    /// whatever order the `HashMap` yields them in.
+    #[test]
+    fn repair_and_dedupe_agree_on_a_full_tie() {
+        for _ in 0..32 {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("s.json");
+            let mk = |id: &str| {
+                let mut r = fixture_rec(id, "open", 1_000, None, None);
+                r.terminal_id = "shared".to_string();
+                r.confirmed_at = Some(1_000);
+                r
+            };
+            write_fixture(&path, vec![mk("tied-a"), mk("tied-b"), mk("tied-c")]);
+            let store = SessionLifecycleStore::open(&path).unwrap();
+            let kept = dedupe_open_by_terminal(store.open_records());
+            assert_eq!(kept.len(), 1);
+            assert_eq!(kept[0].claude_session_id, "tied-c");
+            assert_eq!(store.repair_terminal_id_collisions(), 2);
+            assert_eq!(store.get("tied-c").unwrap().state, "open");
+        }
     }
 
     /// Unit coverage for the read-time dedupe helper: confirmed beats a newer

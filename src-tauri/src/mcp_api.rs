@@ -4320,8 +4320,8 @@ fn terminal_leg(
 ///
 /// ## Why it refuses instead of ranking
 ///
-/// The store's `open_authority_key` — `(confirmed_at.is_some(),
-/// last_seen_at, opened_at)` — is the right tie-break for RESTORE, and the
+/// The store's `open_authority_key`, which ranks confirmation first, is the
+/// right tie-break for RESTORE, and the
 /// wrong one here. In the dangerous window (a reused terminal between PTY
 /// spawn and the new session's SessionStart-hook confirmation) the STALE row
 /// is the confirmed one and the fresh row is not, so authority-ranking
@@ -16192,9 +16192,9 @@ mod self_id_chain_tests {
     ///
     /// The fixture is the dangerous window deliberately: the STALE row is the
     /// CONFIRMED one and the fresh row is not, which is precisely the shape
-    /// where the store's `open_authority_key` (`confirmed_at.is_some()`,
-    /// `last_seen_at`, `opened_at`) would rank the WRONG session first. So the
-    /// leg refuses rather than ranks.
+    /// where the store's `open_authority_key`, which ranks confirmation first,
+    /// would rank the WRONG session first. So the leg refuses rather than
+    /// ranks.
     #[test]
     fn terminal_selection_refuses_two_open_rows_on_one_terminal() {
         let mut stale = rec(ANCHOR_A, Some("D:/repo"), 100);
