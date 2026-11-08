@@ -2,9 +2,11 @@
 /**
  * `useZoneViewFacts` wires the page's zone layout into `zoneViewFactsFrom`.
  * `terminalSignatures.test.ts` pins what the pure function answers. This file
- * pins that the hook hands it the inputs the auto-trim reads (`layoutOrigin`,
- * `workMode`). Without them, a restore that releases an owed trim would predict
- * zone headers that the trim then removes.
+ * pins that the hook hands it the page's `layoutOrigin`, which the auto-trim
+ * reads. Without it, a restore that releases an owed trim would predict zone
+ * headers that the trim then removes. (`workMode` is passed too but not pinned
+ * here: in tmux the hook reports no maximized zone and a single-zone layout, so
+ * no header prediction depends on it.)
  *
  * The two contexts the hook reads are mocked with the shapes it uses. The
  * scenario is the one the restore defect was found on: a runner-grown `quad`,
