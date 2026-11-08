@@ -482,7 +482,34 @@ pub enum ChildExemption {
     /// wiring test prove the exemptions reach the probe with no real process.
     #[cfg(test)]
     AdmitForTest(u32),
+    /// Test-only: admits nothing, and counts each [`ChildExemptions::admitted`]
+    /// call it is consulted in. Lets a test pin WHICH probes apply exemptions.
+    #[cfg(test)]
+    CountAdmissions(AdmissionCounter),
 }
+
+/// Test-only: a shared count of [`ChildExemptions::admitted`] calls. Two
+/// counters are equal only when they are the same counter.
+#[cfg(test)]
+#[derive(Debug, Clone, Default)]
+pub(crate) struct AdmissionCounter(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+#[cfg(test)]
+impl AdmissionCounter {
+    pub(crate) fn count(&self) -> usize {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[cfg(test)]
+impl PartialEq for AdmissionCounter {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+#[cfg(test)]
+impl Eq for AdmissionCounter {}
 
 /// The child-gate policy a graceful-exit caller presents. [`Self::none`] is
 /// every child counted, which is what every caller but the wind-down
@@ -506,9 +533,20 @@ impl ChildExemptions {
         Self(vec![ChildExemption::AdmitForTest(pid)])
     }
 
+    /// Test-only: exactly these exemptions.
+    #[cfg(test)]
+    pub(crate) fn for_test(exemptions: Vec<ChildExemption>) -> Self {
+        Self(exemptions)
+    }
+
     /// One [`ChildExemption::ProvenStray`] per recorded stray.
     pub fn from_strays(strays: Vec<crate::session::stray_wait::RecordedStray>) -> Self {
-        Self(strays.into_iter().map(ChildExemption::ProvenStray).collect())
+        Self(
+            strays
+                .into_iter()
+                .map(ChildExemption::ProvenStray)
+                .collect(),
+        )
     }
 
     /// Of `children` (the top-level `claude`'s direct children), the pids an
@@ -531,6 +569,10 @@ impl ChildExemptions {
                     if children.contains(pid) {
                         admitted.insert(*pid);
                     }
+                }
+                #[cfg(test)]
+                ChildExemption::CountAdmissions(counter) => {
+                    counter.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }
             }
         }
@@ -1050,7 +1092,10 @@ pub(crate) mod fake_process_table {
                     .collect();
                 exempted.sort_unstable();
                 exempted.dedup();
-                let counted = children.iter().filter(|pid| !admitted.contains(pid)).count();
+                let counted = children
+                    .iter()
+                    .filter(|pid| !admitted.contains(pid))
+                    .count();
                 (counted, exempted)
             }
         };
@@ -1496,8 +1541,9 @@ mod tests {
         assert_eq!(exempt.admitted(&[210, 211]).await, set(&[210]));
         assert!(ChildExemptions::none().admitted(&[210]).await.is_empty());
         assert!(ChildExemptions::none().is_empty());
-        // A recorded stray whose pid is not among the children is never
-        // re-proven, let alone admitted.
+        // A recorded stray whose pid is not among the children is not
+        // admitted. (This pid could not re-prove either; the live twin in
+        // `stray_wait`'s `reprove_keeps_only_…` test uses one that would.)
         let stray = crate::session::stray_wait::RecordedStray {
             pid: 4_000_000_002,
             start: 1,
@@ -1556,7 +1602,10 @@ mod tests {
         );
         assert_eq!(pane.typed.lock().unwrap().as_slice(), b"/exit\r");
         let log = entries(&log);
-        assert_eq!(&log[..3], ["probe(tracked=0)", "write:\"/exit\"", "write:\"\\r\""]);
+        assert_eq!(
+            &log[..3],
+            ["probe(tracked=0)", "write:\"/exit\"", "write:\"\\r\""]
+        );
         assert_eq!(log.last().map(String::as_str), Some("close"));
     }
 
@@ -1606,7 +1655,10 @@ mod tests {
                 claude_pids: vec![200],
             }
         );
-        assert!(pane.typed.lock().unwrap().is_empty(), "typed into a live claude");
+        assert!(
+            pane.typed.lock().unwrap().is_empty(),
+            "typed into a live claude"
+        );
         assert_eq!(entries(&log), vec!["probe(tracked=0)"]);
     }
 

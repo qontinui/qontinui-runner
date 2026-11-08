@@ -6431,6 +6431,56 @@ pub(crate) mod tests {
         assert!(pane.session.is_alive());
     }
 
+    /// The child-gate exemptions reach the FIRST probe only: the one whose child
+    /// count the gate reads. The wait loop that follows probes many more times
+    /// (the scripted `claude` never leaves, so the run ends `ExitStuck` at the
+    /// deadline after a probe every poll interval) and must consult the
+    /// exemptions — which, for a stray, is a `/proc` re-proof — not once more.
+    #[tokio::test(start_paused = true)]
+    async fn graceful_exit_then_applies_exemptions_on_the_first_probe_only() {
+        use crate::terminal::graceful_exit::{
+            AdmissionCounter, ChildExemption, ChildExemptions, GracefulExitOutcome,
+        };
+
+        const CHILD: u32 = 5252;
+        let pane = live_claude_pane_with_child(CHILD);
+        let counter = AdmissionCounter::default();
+        let closed = Arc::new(AtomicBool::new(false));
+        let closed_flag = Arc::clone(&closed);
+        let outcome = pane
+            .session
+            .graceful_exit_then(
+                Duration::from_secs(60),
+                move || async move {
+                    closed_flag.store(true, Ordering::SeqCst);
+                    crate::terminal::graceful_exit::CloseTabResult::Closed
+                },
+                Some(crate::terminal::close_authority::CloseAuthority::for_test()),
+                ChildExemptions::for_test(vec![
+                    ChildExemption::AdmitForTest(CHILD),
+                    ChildExemption::CountAdmissions(counter.clone()),
+                ]),
+            )
+            .await;
+
+        // Past the child gate (the admitted child), `/exit` typed, then a full
+        // deadline of wait probes.
+        match &outcome {
+            GracefulExitOutcome::ExitStuck { waited_ms, .. } => {
+                assert!(*waited_ms >= 60_000, "{outcome:?}")
+            }
+            other => panic!("expected ExitStuck past the child gate, got {other:?}"),
+        }
+        assert_eq!(pane.typed(), b"/exit\r");
+        assert_eq!(
+            counter.count(),
+            1,
+            "the exemptions were consulted on a probe other than the first"
+        );
+        assert!(!closed.load(Ordering::SeqCst));
+        assert_eq!(pane.kills(), 0);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn graceful_exit_does_not_close_while_claude_lives_outside_the_subtree() {
         use crate::terminal::graceful_exit::GracefulExitOutcome;

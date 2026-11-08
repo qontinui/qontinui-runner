@@ -726,7 +726,41 @@ pub fn claude_left(outcome: &GracefulExitOutcome) -> bool {
 /// exemptions? Only [`CloseArm::FinishedClose`], and only while
 /// [`WIND_DOWN_PRESENTS_CLOSE_AUTHORITY`] is true.
 fn records_strays(arm: CloseArm) -> bool {
-    arm == CloseArm::FinishedClose && WIND_DOWN_PRESENTS_CLOSE_AUTHORITY
+    records_strays_when(arm, WIND_DOWN_PRESENTS_CLOSE_AUTHORITY)
+}
+
+/// [`records_strays`] with the constant as a parameter, so a test can also
+/// judge the arm as it will be once the exit presents an authority.
+fn records_strays_when(arm: CloseArm, presents_close_authority: bool) -> bool {
+    arm == CloseArm::FinishedClose && presents_close_authority
+}
+
+/// PURE: the `claude` pids a close of `session_id` under `arm` records strays
+/// under: the panes the pass discounted a stray from, and only when the arm
+/// records strays at all ([`records_strays`]). Empty means no `/proc` walk.
+fn stray_claudes(
+    arm: CloseArm,
+    terminal_hosted: &[LiveClaudeProcess],
+    session_id: &str,
+) -> Vec<u32> {
+    stray_claudes_when(records_strays(arm), terminal_hosted, session_id)
+}
+
+/// [`stray_claudes`] with the arm's verdict as a parameter (see
+/// [`records_strays_when`]).
+fn stray_claudes_when(
+    records: bool,
+    terminal_hosted: &[LiveClaudeProcess],
+    session_id: &str,
+) -> Vec<u32> {
+    if !records {
+        return Vec::new();
+    }
+    terminal_hosted
+        .iter()
+        .filter(|p| p.session_id.as_deref() == Some(session_id) && p.stray_wait_shells > 0)
+        .map(|p| p.pid)
+        .collect()
 }
 
 /// PURE: the child exemptions a close presents for the strays it `recorded`.
@@ -1722,19 +1756,7 @@ impl CloseEffects for LiveCloseEffects<'_> {
         // without one the exit is refused before the child gate, and the walk
         // would buy nothing (D4).
         let presents_strays = records_strays(arm);
-        let claudes: Vec<u32> = if presents_strays {
-            self.pass
-                .report
-                .terminal_hosted
-                .iter()
-                .filter(|p| {
-                    p.session_id.as_deref() == Some(session_id) && p.stray_wait_shells > 0
-                })
-                .map(|p| p.pid)
-                .collect()
-        } else {
-            Vec::new()
-        };
+        let claudes = stray_claudes(arm, &self.pass.report.terminal_hosted, session_id);
         let manager = &self.manager;
         exit_ending_strays(
             crate::session::stray_wait::record_strays(claudes),
@@ -2604,7 +2626,10 @@ mod tests {
             argv: vec!["bash".to_string()],
             class: "a".to_string(),
         };
-        assert!(!records_strays(CloseArm::Drain), "the drain arm never records");
+        assert!(
+            !records_strays(CloseArm::Drain),
+            "the drain arm never records"
+        );
         assert_eq!(
             records_strays(CloseArm::FinishedClose),
             WIND_DOWN_PRESENTS_CLOSE_AUTHORITY,
@@ -2615,20 +2640,52 @@ mod tests {
             stray_exemptions(true, std::slice::from_ref(&stray)),
             ChildExemptions::from_strays(vec![stray.clone()])
         );
-        // Every arm that does not record presents nothing — today, both.
-        for arm in [CloseArm::Drain, CloseArm::FinishedClose] {
-            assert_eq!(
-                stray_exemptions(records_strays(arm), std::slice::from_ref(&stray)).is_empty(),
-                !records_strays(arm),
-                "{arm:?}"
-            );
-        }
-        // The live impl gates the walk itself on the predicate: the pane list
-        // it records under is built only when `records_strays(arm)` holds.
+
+        // A pass that DID discount strays: this session's pane (pid 10) holds
+        // two, another session's pane (pid 20) one, and a pane of this session
+        // with none (pid 30) is not walked.
+        let mut mine = candidate_proc(10, Some("s1"), Some("eligible"), false);
+        mine.stray_wait_shells = 2;
+        let mut theirs = candidate_proc(20, Some("s2"), Some("eligible"), false);
+        theirs.stray_wait_shells = 1;
+        let quiet = candidate_proc(30, Some("s1"), Some("eligible"), false);
+        let hosted = vec![mine, theirs, quiet];
+
+        // Production: the drain arm never walks, and neither does
+        // finished_close while the exit presents no authority.
+        assert!(stray_claudes(CloseArm::Drain, &hosted, "s1").is_empty());
+        assert_eq!(
+            stray_claudes(CloseArm::FinishedClose, &hosted, "s1").is_empty(),
+            !WIND_DOWN_PRESENTS_CLOSE_AUTHORITY,
+            "while no authority is presented, finished_close records nothing"
+        );
+
+        // As it will be once an authority is presented: finished_close walks
+        // exactly this session's stray-holding pane; the drain arm still never.
+        assert!(!records_strays_when(CloseArm::Drain, true));
+        assert!(!records_strays_when(CloseArm::FinishedClose, false));
+        assert!(records_strays_when(CloseArm::FinishedClose, true));
+        assert_eq!(
+            stray_claudes_when(
+                records_strays_when(CloseArm::FinishedClose, true),
+                &hosted,
+                "s1"
+            ),
+            vec![10]
+        );
+        assert!(
+            stray_claudes_when(records_strays_when(CloseArm::Drain, true), &hosted, "s1")
+                .is_empty()
+        );
+
+        // The live impl uses exactly these: the walk and the exemptions.
         let executor = executable_lines(include_str!("wind_down_executor.rs"));
         assert!(
             executor.contains("let presents_strays = records_strays(arm);")
-                && executor.contains("let claudes: Vec<u32> = if presents_strays {")
+                && executor.contains(
+                    "let claudes = stray_claudes(arm, &self.pass.report.terminal_hosted, session_id);"
+                )
+                && executor.contains("record_strays(claudes)")
                 && executor.contains("stray_exemptions(presents_strays, recorded)"),
             "LiveCloseEffects::wind_down_one no longer gates the stray walk on records_strays"
         );
