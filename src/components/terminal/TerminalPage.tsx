@@ -101,7 +101,7 @@ import {
   recordedZoneLedgerFor,
   type SessionOrigin,
 } from "./sessionRecordArgs";
-import { useRecordedZoneBackstop } from "./useRecordedZoneBackstop";
+import { useRecordedZoneBackstop, zoneSyncRestoreComplete } from "./useRecordedZoneBackstop";
 import { buildAiLaunchCommandForTab } from "./aiLaunchCommand";
 import {
   getActiveProjectHint,
@@ -1121,7 +1121,7 @@ function TerminalPageInner({
     tabs,
     pageId,
     recordedZones,
-    restoreComplete: restoreCompletePages.has(pageId),
+    restoreComplete: zoneSyncRestoreComplete(restoreCompletePages, restoreDeferredPages, pageId),
   });
 
   // Operator-clickable retry for a restored tab whose resume verification

@@ -17,6 +17,22 @@ const logger = createLogger("TerminalPage");
 /** How long the assignments must hold still before a pass re-resolves them. */
 export const ZONE_BACKSTOP_DEBOUNCE_MS = 300;
 
+/**
+ * Whether the page's restore has really finished for the zone backstop's
+ * purposes. A drain-DEFERRED page is in `restoreCompletePages` too (its gate
+ * opens so auto-save and auto-trim are not held for the drain), but restore
+ * has read and placed nothing yet: its reconnected tabs still sit in
+ * localStorage / auto-fill zones, and the deferred re-run will read the
+ * durable record. So a deferred page is NOT complete here.
+ */
+export function zoneSyncRestoreComplete(
+  restoreCompletePages: ReadonlySet<string>,
+  restoreDeferredPages: ReadonlySet<string>,
+  pageId: string,
+): boolean {
+  return restoreCompletePages.has(pageId) && !restoreDeferredPages.has(pageId);
+}
+
 interface RecordedZoneBackstopInput {
   workMode: TerminalWorkMode;
   /** The page's live zone assignments. */
@@ -31,7 +47,10 @@ interface RecordedZoneBackstopInput {
    * sessions from, and a reload's reconnected tabs sit in zones taken from
    * localStorage or creation-order auto-fill, so a first-seen sync would
    * overwrite the record restore is about to read. First-seen sessions are
-   * therefore neither synced nor seeded until this is true.
+   * therefore neither synced nor seeded until this is true. Callers compute
+   * it with {@link zoneSyncRestoreComplete}. A page whose restore aborts and
+   * is never retried stays not-complete, exactly as its auto-save gate does,
+   * so its first-seen sessions wait for the page's next restore run.
    */
   restoreComplete: boolean;
 }

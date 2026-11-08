@@ -16,7 +16,11 @@ const invoke = vi.hoisted(() => vi.fn((..._args: unknown[]) => Promise.resolve(n
 vi.mock("@tauri-apps/api/core", () => ({ invoke }));
 
 import { hooksHarness as harness } from "@/lib/__test-helpers__/hooks-harness";
-import { ZONE_BACKSTOP_DEBOUNCE_MS, useRecordedZoneBackstop } from "./useRecordedZoneBackstop";
+import {
+  ZONE_BACKSTOP_DEBOUNCE_MS,
+  useRecordedZoneBackstop,
+  zoneSyncRestoreComplete,
+} from "./useRecordedZoneBackstop";
 import type { RecordedZoneLedger } from "./sessionRecordArgs";
 import type { TerminalWorkMode } from "./terminalWorkMode";
 import type { ZoneAssignments } from "./useZoneLayout";
@@ -173,5 +177,28 @@ describe("useRecordedZoneBackstop", () => {
     expect(recorded()).toEqual([["sess-a", 3]]);
     expect(synced()).toEqual([]);
     expect(ledger.has("sess-b")).toBe(false);
+  });
+
+  it("flipping only restoreComplete re-runs the pass (same assignments object)", () => {
+    const ledger: RecordedZoneLedger = new Map();
+    const render = mount(ledger);
+    const assignments: ZoneAssignments = { 1: "a", 2: "b" };
+    render({ workMode: "grid", assignments, restoreComplete: false });
+    expect(invoke).not.toHaveBeenCalled();
+    render({ workMode: "grid", assignments, restoreComplete: true });
+    expect(synced()).toEqual([
+      ["sess-a", 1],
+      ["sess-b", 2],
+    ]);
+  });
+});
+
+describe("zoneSyncRestoreComplete", () => {
+  it("is true only for a page whose restore completed and was not drain-deferred", () => {
+    expect(zoneSyncRestoreComplete(new Set(["p"]), new Set(), "p")).toBe(true);
+    expect(zoneSyncRestoreComplete(new Set(), new Set(), "p")).toBe(false);
+    // A drain-deferred page has its gate open but restore has placed nothing.
+    expect(zoneSyncRestoreComplete(new Set(["p"]), new Set(["p"]), "p")).toBe(false);
+    expect(zoneSyncRestoreComplete(new Set(["p"]), new Set(["q"]), "p")).toBe(true);
   });
 });
