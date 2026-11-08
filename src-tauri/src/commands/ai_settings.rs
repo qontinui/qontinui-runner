@@ -3411,7 +3411,7 @@ mod usage_report_scope_tests {
     /// The ownership table, with no env or filesystem.
     #[test]
     fn roster_ownership_is_primary_or_under_a_root() {
-        use super::super::{account_scope_from, LoneAccountScope::*};
+        use super::{account_scope_from, LoneAccountScope::*};
         assert_eq!(account_scope_from(true, false), Some(Primary));
         assert_eq!(account_scope_from(false, true), Some(Subject));
         assert_eq!(account_scope_from(false, false), None);
