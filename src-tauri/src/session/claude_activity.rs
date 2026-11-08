@@ -178,7 +178,10 @@ pub struct LivePid {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RawRecord {
+    #[serde(default, deserialize_with = "lenient_pid")]
     pid: Option<u32>,
+    #[serde(default, deserialize_with = "lenient_string")]
+    pid_domain: Option<String>,
     session_id: Option<String>,
     cwd: Option<String>,
     status: Option<String>,
@@ -187,6 +190,25 @@ struct RawRecord {
     /// A string on every record seen; a number is accepted too, since the
     /// comparison is textual against `/proc` either way.
     proc_start: Option<serde_json::Value>,
+}
+
+/// A pid written as a number or as a decimal string; anything else (including
+/// a wrong type) reads as "not stated" rather than failing the whole file.
+fn lenient_pid<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u32>, D::Error> {
+    Ok(match serde_json::Value::deserialize(d)? {
+        serde_json::Value::Number(n) => n.as_u64().and_then(|v| u32::try_from(v).ok()),
+        serde_json::Value::String(s) => s.trim().parse().ok(),
+        _ => None,
+    })
+}
+
+/// A string-or-number field read as text; any other type reads as absent.
+fn lenient_string<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    Ok(match serde_json::Value::deserialize(d)? {
+        serde_json::Value::String(s) => Some(s),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    })
 }
 
 impl RawRecord {
@@ -458,6 +480,205 @@ fn read_one(
         }
     }
     RecordReading::Parsed(ev)
+}
+
+// ---------------------------------------------------------------------------
+// Provider-row validity — the ONE rule for "does this `<pid>.json` describe the
+// process that holds `pid` now?" (plan
+// `2026-10-23-a-hookless-resume-in-a-runner-pane-leaves-the-session-with-no-active-coord-row`,
+// D5 (iii)). The coord re-key reads it STRICT; `restart_readiness` keeps the
+// lenient classification above.
+// ---------------------------------------------------------------------------
+
+/// What the provider's registry says about one anchor pid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderRowValidity {
+    /// Exactly one session id is named by every valid row.
+    Valid {
+        session_id: String,
+        config_dir: PathBuf,
+    },
+    /// Every row read belongs to an earlier holder of the pid.
+    Stale,
+    /// No row, an unreadable or unrecognised one, or valid rows that disagree:
+    /// nothing may be re-keyed from it.
+    Unknown,
+}
+
+/// Whether a check that cannot be made counts against a row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValidityMode {
+    /// A row no check can reach is accepted on its `pid` match alone.
+    Lenient,
+    /// A row no check can reach is [`ProviderRowValidity::Unknown`].
+    Strict,
+}
+
+/// The live process's own clocks, from one snapshot / `/proc` read.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PidClock {
+    /// Creation time as epoch SECONDS (`ProcessSnapshot::creation_times`);
+    /// `None` when unknown (the snapshot stores `0` for that).
+    pub creation_secs: Option<i64>,
+    /// Fresh `/proc/<pid>/stat` field 22 (Linux).
+    pub proc_start_ticks: Option<String>,
+    /// `/proc/stat` `btime` and `CLK_TCK` (Linux).
+    pub btime: Option<i64>,
+    pub clk_tck: Option<i64>,
+}
+
+const FILETIME_UNIX_EPOCH_SECS: i64 = 11_644_473_600;
+/// Seconds of slack between a FILETIME `procStart` and the snapshot's
+/// second-granular creation time.
+const FILETIME_SLACK_SECS: i64 = 1;
+
+/// Does `raw` describe the process holding `pid` NOW, by its `pidDomain`?
+/// `Some(false)` is a positive mismatch; `None` is "this domain's check cannot
+/// be made" (unknown domain, malformed or absent `procStart`, no clock).
+fn domain_check(raw: &RawRecord, clock: &PidClock) -> Option<bool> {
+    let domain = raw.pid_domain.as_deref()?;
+    let proc_start = raw.proc_start()?;
+    let value: u64 = proc_start.parse().ok()?;
+    if domain.starts_with("win32:") {
+        let creation = clock.creation_secs?;
+        let secs = i64::try_from(value / 10_000_000).ok()? - FILETIME_UNIX_EPOCH_SECS;
+        return Some((secs - creation).abs() <= FILETIME_SLACK_SECS);
+    }
+    if domain.starts_with("linux:") {
+        let mut checks: Vec<bool> = Vec::new();
+        if let Some(actual) = clock.proc_start_ticks.as_deref() {
+            checks.push(actual.parse::<u64>().ok() == Some(value));
+        }
+        if let (Some(btime), Some(tck), Some(creation)) =
+            (clock.btime, clock.clk_tck, clock.creation_secs)
+        {
+            if tck > 0 {
+                checks.push(btime + i64::try_from(value).ok()? / tck == creation);
+            }
+        }
+        return if checks.is_empty() {
+            None
+        } else {
+            Some(checks.iter().any(|&ok| ok))
+        };
+    }
+    None
+}
+
+/// Judge the provider rows found for anchor `pid`. `files` is every
+/// `(config_dir, file body)` read for `<pid>.json` across ALL config dirs.
+///
+/// Only valid rows count: a stale reused-pid file in one dir never masks the
+/// live one in another, and two valid rows naming different ids are
+/// [`ProviderRowValidity::Unknown`]. A row is valid only when the file's `pid`
+/// equals the anchor pid (the file name) and the clock chosen by its
+/// `pidDomain` matches the live process.
+pub fn provider_row_validity(
+    pid: u32,
+    files: &[(PathBuf, String)],
+    clock: &PidClock,
+    mode: ValidityMode,
+) -> ProviderRowValidity {
+    let mut valid: Vec<(String, &PathBuf)> = Vec::new();
+    let (mut stale, mut unknown) = (false, false);
+    for (dir, body) in files {
+        let Ok(raw) = serde_json::from_str::<RawRecord>(body) else {
+            unknown = true;
+            continue;
+        };
+        if raw.pid != Some(pid) {
+            unknown = true;
+            continue;
+        }
+        let verdict = match domain_check(&raw, clock) {
+            Some(v) => Some(v),
+            None if mode == ValidityMode::Strict => None,
+            None => Some(
+                same_process(
+                    &raw,
+                    LivePid {
+                        pid,
+                        process_started_ms: clock.creation_secs.map(|s| s * 1000),
+                    },
+                    &|_| clock.proc_start_ticks.clone(),
+                )
+                .unwrap_or(true),
+            ),
+        };
+        match verdict {
+            Some(true) => match raw.session_id.filter(|s| !s.trim().is_empty()) {
+                Some(id) => valid.push((id, dir)),
+                None => unknown = true,
+            },
+            Some(false) => stale = true,
+            None => unknown = true,
+        }
+    }
+    if let Some((first, dir)) = valid.first() {
+        if valid.iter().any(|(id, _)| id != first) {
+            return ProviderRowValidity::Unknown;
+        }
+        return ProviderRowValidity::Valid {
+            session_id: first.clone(),
+            config_dir: (*dir).clone(),
+        };
+    }
+    if unknown || !stale {
+        ProviderRowValidity::Unknown
+    } else {
+        ProviderRowValidity::Stale
+    }
+}
+
+/// `/proc/stat` `btime` and `CLK_TCK`; `(None, None)` off Linux.
+fn linux_clock_constants() -> (Option<i64>, Option<i64>) {
+    #[cfg(target_os = "linux")]
+    {
+        let btime = std::fs::read_to_string("/proc/stat").ok().and_then(|s| {
+            s.lines()
+                .find_map(|l| l.strip_prefix("btime ")?.trim().parse().ok())
+        });
+        // SAFETY: sysconf has no preconditions.
+        let tck = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+        (btime, (tck > 0).then_some(i64::from(tck)))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        (None, None)
+    }
+}
+
+/// STRICT [`provider_row_validity`] for each `(anchor pid, creation secs)`,
+/// reading `<dir>/sessions/<pid>.json` in EVERY config dir. Blocking file I/O —
+/// call it off the async executor.
+pub fn read_provider_rows(
+    config_dirs: &[PathBuf],
+    anchors: &[(u32, Option<i64>)],
+) -> HashMap<u32, ProviderRowValidity> {
+    let (btime, clk_tck) = linux_clock_constants();
+    anchors
+        .iter()
+        .map(|&(pid, creation)| {
+            let files: Vec<(PathBuf, String)> = config_dirs
+                .iter()
+                .filter_map(|dir| {
+                    std::fs::read_to_string(dir.join("sessions").join(format!("{pid}.json")))
+                        .ok()
+                        .map(|body| (dir.clone(), body))
+                })
+                .collect();
+            let clock = PidClock {
+                creation_secs: creation.filter(|&s| s > 0),
+                proc_start_ticks: proc_start_ticks(pid),
+                btime,
+                clk_tck,
+            };
+            (
+                pid,
+                provider_row_validity(pid, &files, &clock, ValidityMode::Strict),
+            )
+        })
+        .collect()
 }
 
 #[cfg(test)]
