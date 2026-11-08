@@ -323,11 +323,44 @@ fn terminal_spawn_failed(error: String) -> (StatusCode, Json<ApiResponse<()>>) {
     if spawn_tenant_refusal_kind(&error).is_some() {
         return spawn_tenant_refused(error);
     }
+    if let Some((status, code)) = spawn_refusal_answer(&error) {
+        warn!("HTTP: terminal create refused — {error}");
+        return (status, Json(ApiResponse::error_with_code(error, code)));
+    }
     error!("HTTP: Failed to create terminal session: {}", error);
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(api_error(format!("Failed to create terminal: {}", error))),
     )
+}
+
+/// The two other refusal families the spawn returns as plain `Err` text, each
+/// recognised by the prefix its producer documents as stable.
+///
+/// - The resource guard's CRITICAL verdict
+///   ([`crate::resource_guard::CRITICAL_REFUSAL_PREFIX`]) is decided by the
+///   seam's `admit_spawn`, and this route runs no precheck for it. It clears
+///   when the box recovers, so it is a 503.
+/// - The trust gate's block on a pinned-account spawn
+///   ([`crate::claude_session::trust_gate::SPAWN_BLOCKED_REFUSAL_PREFIX`]) is
+///   a standing verdict about the workspace, so it is a 409. One that rests on
+///   a tenant dial coord could not answer is worth retrying at once, so it is
+///   a 503 with its own code.
+///
+/// Both used to answer `500 INTERNAL_ERROR`, which names neither the refusal
+/// nor whether a retry can succeed. Anything else is `None`, and stays the
+/// runner's fault.
+fn spawn_refusal_answer(error: &str) -> Option<(StatusCode, &'static str)> {
+    use crate::claude_session::trust_gate;
+    if error.starts_with(crate::resource_guard::CRITICAL_REFUSAL_PREFIX) {
+        Some((StatusCode::SERVICE_UNAVAILABLE, "RESOURCE_GUARD_CRITICAL"))
+    } else if trust_gate::refusal_rests_on_unread_dial(error) {
+        Some((StatusCode::SERVICE_UNAVAILABLE, "SPAWN_BLOCKED_DIAL_UNREAD"))
+    } else if trust_gate::is_spawn_blocked_refusal(error) {
+        Some((StatusCode::CONFLICT, "SPAWN_BLOCKED"))
+    } else {
+        None
+    }
 }
 
 /// A refused `editSiblings` input → the typed 400 `invalid_edit_sibling`,
@@ -1466,6 +1499,53 @@ mod tests {
         );
     }
 
+    /// The resource guard's and the trust gate's refusals reach this door as
+    /// plain text too. Each case below is built by its real producer's format
+    /// (the guard's prefix, the gate's own `refusal()`), so a reworded producer
+    /// cannot drift away from the answer silently.
+    #[test]
+    fn a_resource_guard_or_trust_gate_refusal_keeps_a_typed_answer() {
+        use crate::claude_session::trust_gate::{
+            annotate_unread_dial, DialResolution, TrustGateDecision,
+        };
+        let blocked = || TrustGateDecision::SpawnBlocked {
+            rule: "ask-first",
+            failed: vec!["coord_worktree_row=failed".to_string()],
+        };
+        let guard = format!(
+            "{}thread_count: Not starting a new terminal session: over the ceiling.",
+            crate::resource_guard::CRITICAL_REFUSAL_PREFIX
+        );
+        let standing = blocked().refusal().expect("a block renders a refusal");
+        let unread = annotate_unread_dial(
+            blocked(),
+            &DialResolution::Unresolved {
+                error: "coord timed out".to_string(),
+            },
+        )
+        .refusal()
+        .expect("a block renders a refusal");
+
+        for (text, status, code) in [
+            (
+                guard,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "RESOURCE_GUARD_CRITICAL",
+            ),
+            (standing, StatusCode::CONFLICT, "SPAWN_BLOCKED"),
+            (
+                unread,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "SPAWN_BLOCKED_DIAL_UNREAD",
+            ),
+        ] {
+            let (got, Json(body)) = terminal_spawn_failed(text.clone());
+            assert_eq!(got, status, "{text}");
+            assert_eq!(body.code.as_deref(), Some(code), "{text}");
+            assert_eq!(body.error.as_deref(), Some(text.as_str()));
+        }
+    }
+
     /// A create failure outside the refusal family is still the runner's fault,
     /// and a text merely mentioning the family mid-string is not a refusal.
     #[test]
@@ -1473,6 +1553,8 @@ mod tests {
         for text in [
             "Failed to open PTY: out of ptys",
             "wrapped: terminal:tenant_not_paired: elsewhere",
+            "wrapped: resource_guard:critical:thread_count: elsewhere",
+            "wrapped: spawn_blocked (ask-first): elsewhere",
         ] {
             let (status, Json(body)) = terminal_spawn_failed(text.to_string());
             assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
