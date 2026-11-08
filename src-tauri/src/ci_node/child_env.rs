@@ -42,6 +42,18 @@
 //! added the way a registry entry is: a reviewed change naming the consumer
 //! that breaks without it, never a wildcard.
 //!
+//! # The one exception: a caller's explicit `envs`
+//!
+//! `tools::run_capture_env` takes an `envs` list from its caller and applies
+//! it AFTER the allowlist, without passing it through [`admits`]. That is
+//! deliberate and caller-owned: it exists so `services` can hand a container
+//! runtime a secret without putting it on an argv. No production provisioning
+//! call passes any `envs` — they all go through `tools::run_capture`, which
+//! passes `&[]` — and `child_env::tests` pins that every production caller
+//! with a non-empty `envs` runs under [`ChildEnv::ContainerRuntime`]. What
+//! the spawn HELPER sets is different: that is re-applied only through
+//! [`admits`].
+//!
 //! # What this does not close
 //!
 //! Only the ENVIRONMENT channel. A child still runs as the runner's OS user,

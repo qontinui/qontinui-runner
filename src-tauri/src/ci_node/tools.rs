@@ -1970,6 +1970,17 @@ pub(super) async fn run_capture(
 /// gets its password while the password never appears in a command line —
 /// neither in this function's error strings, nor in the host process table
 /// that every other session on the machine can read.
+///
+/// `envs` IS A DELIBERATE, CALLER-OWNED EXCEPTION TO THE ALLOWLIST. They are
+/// applied AFTER [`child_env::provisioning_env`] and are NOT filtered by
+/// [`child_env::admits`]: a caller that names a variable here has chosen to
+/// hand it to this child, which is the whole point of the parameter. Under the
+/// provisioning policies that means a caller could widen the child's
+/// environment, so no production provisioning call passes any — every one goes
+/// through [`run_capture`], which passes `&[]`, and the only production caller
+/// with a non-empty `envs` is `services::run_owned_env`, under
+/// [`ChildEnv::ContainerRuntime`]. `child_env::tests`
+/// `production_callers_pass_envs_only_under_the_container_policy` pins that.
 pub(super) async fn run_capture_env(
     program: &str,
     args: &[&str],
@@ -2024,6 +2035,10 @@ pub(super) async fn run_capture_env(
                 cmd.env("PATH", joined);
             }
         }
+        // The caller's explicit `envs` last, and NOT through `admits`: they
+        // are a deliberate caller-owned exception to the allowlist (see the
+        // doc on `run_capture_env`). No production provisioning call passes
+        // any.
         for (k, v) in envs {
             cmd.env(k, v);
         }

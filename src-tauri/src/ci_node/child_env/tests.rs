@@ -692,6 +692,99 @@ fn tools_rs_hands_the_network_policy_to_pip_install_alone() {
     );
 }
 
+/// `run_capture_env`'s `envs` bypass the allowlist by design (a caller-owned
+/// exception, applied after it). That is safe only while no production
+/// provisioning call passes any, so every production call of
+/// `run_capture_env` in the crate must either pass `&[]` or run under
+/// `ChildEnv::ContainerRuntime`.
+///
+/// Read from the source of every `.rs` file under `src/`, outside test
+/// modules and with comment-only lines dropped, for the same reason as the
+/// test above: the property is about which CALL passes what.
+#[test]
+fn production_callers_pass_envs_only_under_the_container_policy() {
+    fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("read a source directory") {
+            let path = entry.expect("a directory entry").path();
+            if path.is_dir() {
+                // A `tests` directory is a test module's body.
+                if path.file_name().is_some_and(|name| name != "tests") {
+                    rust_files(&path, out);
+                }
+            } else if path.extension().is_some_and(|ext| ext == "rs")
+                && path.file_name().is_some_and(|name| name != "tests.rs")
+            {
+                out.push(path);
+            }
+        }
+    }
+    /// The text between the `(` at `open` and its matching `)`.
+    fn call_arguments(code: &str, open: usize) -> &str {
+        let mut depth = 0usize;
+        for (at, c) in code[open..].char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &code[open + 1..open + at];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("an unclosed `run_capture_env(` call");
+    }
+
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    rust_files(&src, &mut files);
+    let mut calls = 0usize;
+    let mut offenders = Vec::new();
+    for file in files {
+        let source = std::fs::read_to_string(&file).expect("read a source file");
+        let production = source
+            .split_once("#[cfg(test)]\nmod tests")
+            .map_or(source.as_str(), |(before, _)| before);
+        let code: String = production
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for (at, _) in code.match_indices("run_capture_env(") {
+            if code[..at].ends_with("fn ") {
+                continue;
+            }
+            calls += 1;
+            let args = call_arguments(&code, at + "run_capture_env".len());
+            let last = args
+                .trim()
+                .trim_end_matches(',')
+                .rsplit(',')
+                .next()
+                .unwrap_or("");
+            if last.trim() != "&[]" && !args.contains("ChildEnv::ContainerRuntime") {
+                offenders.push(
+                    file.strip_prefix(&src)
+                        .unwrap_or(&file)
+                        .display()
+                        .to_string(),
+                );
+            }
+        }
+    }
+    assert!(
+        calls >= 2,
+        "found {calls} production `run_capture_env` call(s); `run_capture` and \
+         `services::run_owned_env` are two, so this scan has lost its reach"
+    );
+    assert!(
+        offenders.is_empty(),
+        "these files call `run_capture_env` with caller `envs` under a \
+         provisioning policy, where `envs` bypass the allowlist: {offenders:?}"
+    );
+}
+
 // ── End to end through `provision()` ─────────────────────────────────────
 
 const PROBE_DISTRIBUTION: &str = "qontinui-env-probe";
