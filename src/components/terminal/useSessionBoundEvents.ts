@@ -11,9 +11,16 @@
  * binder already wrote the registry record (with the right origin grade)
  * before emitting; a frontend re-record would pointlessly re-assert — and the
  * launch-menu path's "authoritative" origin argument must never overwrite an
- * observed-grade bind. That holds for a CORRECTION too — the record the
- * provider's `/control/session-open` just wrote carries the terminal's real
- * page/zone, so there is nothing for the frontend to re-assert.
+ * observed-grade bind. That holds for a CORRECTION too. Note what the record
+ * the provider's `/control/session-open` just wrote does NOT carry: the
+ * terminal's real page/zone. The backend has no view of the grid, so it copies
+ * them from the session's own prior row, or else from the latest other open
+ * row on that terminal (`install_effects_producer/mod.rs`, the
+ * `existing.or(terminal_prior)` match), and with neither it writes page
+ * `default`, zone 0. A copied or defaulted zone can be wrong; it is
+ * reconciled by the zone backstop (`useRecordedZoneBackstop`), whose first
+ * observation of a session this page never wrote calls the zone-only
+ * `terminal_session_sync_zone` — never a `record_open` re-assert.
  */
 
 import { useEffect, useRef } from "react";

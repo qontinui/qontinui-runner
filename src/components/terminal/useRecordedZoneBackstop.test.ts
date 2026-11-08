@@ -43,13 +43,20 @@ function mount(ledger: RecordedZoneLedger) {
   };
 }
 
-/** The `[sessionId, zoneIndex]` pairs the backstop recorded. */
-function recorded(): Array<[string, number]> {
-  return invoke.mock.calls.map((call) => {
-    const args = call[1] as { claudeSessionId: string; zoneIndex: number };
-    return [args.claudeSessionId, args.zoneIndex];
-  });
+/** The `[sessionId, zoneIndex]` pairs the backstop sent to `command`. */
+function sentTo(command: string): Array<[string, number]> {
+  return invoke.mock.calls
+    .filter((call) => call[0] === command)
+    .map((call) => {
+      const args = call[1] as { claudeSessionId: string; zoneIndex: number };
+      return [args.claudeSessionId, args.zoneIndex];
+    });
 }
+
+/** The `[sessionId, zoneIndex]` pairs the backstop re-recorded with `record_open`. */
+const recorded = () => sentTo("terminal_session_record_open");
+/** The `[sessionId, zoneIndex]` pairs the backstop zone-synced. */
+const synced = () => sentTo("terminal_session_sync_zone");
 
 beforeEach(() => {
   vi.useFakeTimers();
@@ -89,5 +96,48 @@ describe("useRecordedZoneBackstop", () => {
     render({ workMode: "tmux", assignments: { 0: "b" } });
     render({ workMode: "grid", assignments: { 0: "a", 2: "b" } });
     expect(recorded()).toEqual([["sess-b", 2]]);
+  });
+
+  it("grid mode: a session this page never wrote is zone-synced, never re-recorded", () => {
+    // Empty ledger: both records were written by the backend (a
+    // `POST /terminals` session is recorded at zone 0), not by this page.
+    const ledger: RecordedZoneLedger = new Map();
+    mount(ledger)({ workMode: "grid", assignments: { 1: "a", 2: "b" } });
+    expect(recorded()).toEqual([]);
+    expect(synced()).toEqual([
+      ["sess-a", 1],
+      ["sess-b", 2],
+    ]);
+    // Keyed by the tab id — the id the backend stored as the record's terminal.
+    expect(invoke.mock.calls.map((call) => call[1])).toEqual([
+      { claudeSessionId: "sess-a", terminalId: "a", zoneIndex: 1 },
+      { claudeSessionId: "sess-b", terminalId: "b", zoneIndex: 2 },
+    ]);
+  });
+
+  it("grid mode: a first-seen session is synced once, not on every pass", () => {
+    const ledger: RecordedZoneLedger = new Map();
+    const render = mount(ledger);
+    render({ workMode: "grid", assignments: { 1: "a", 2: "b" } });
+    render({ workMode: "grid", assignments: { 1: "a", 2: "b" } });
+    expect(synced()).toEqual([
+      ["sess-a", 1],
+      ["sess-b", 2],
+    ]);
+  });
+
+  it("tmux mode: nothing is zone-synced either, and the ledger is not seeded", () => {
+    const ledger: RecordedZoneLedger = new Map();
+    const render = mount(ledger);
+    render({ workMode: "tmux", assignments: { 0: "b" } });
+    expect(invoke).not.toHaveBeenCalled();
+    expect(ledger.size).toBe(0);
+    // Back in grid mode the never-written sessions are first-seen there.
+    render({ workMode: "grid", assignments: { 0: "a", 3: "b" } });
+    expect(synced()).toEqual([
+      ["sess-a", 0],
+      ["sess-b", 3],
+    ]);
+    expect(recorded()).toEqual([]);
   });
 });

@@ -15,6 +15,7 @@ import { describe, it, expect, vi } from "vitest";
 import {
   buildSessionCloseArgs,
   buildSessionOpenArgs,
+  buildSessionSyncZoneArgs,
   describeRecordOpenOutcome,
   noteRecordedZone,
   planZoneReemits,
@@ -306,9 +307,10 @@ describe("planZoneReemits — durable zoneIndex re-resolution", () => {
     // The id-bind path wrote the OPEN before the tab had a zone.
     noteRecordedZone(ledger, "sid-a", UNZONED_INDEX);
 
-    const emits = planZoneReemits(ledger, [obs("sid-a", "tab-a", 2)]);
+    const { reemits, firstSeen } = planZoneReemits(ledger, [obs("sid-a", "tab-a", 2)]);
 
-    expect(emits).toEqual([obs("sid-a", "tab-a", 2)]);
+    expect(firstSeen).toEqual([]);
+    expect(reemits).toEqual([obs("sid-a", "tab-a", 2)]);
     expect(ledger.get("sid-a")).toBe(2);
   });
 
@@ -317,24 +319,32 @@ describe("planZoneReemits — durable zoneIndex re-resolution", () => {
     noteRecordedZone(ledger, "sid-a", UNZONED_INDEX);
     planZoneReemits(ledger, [obs("sid-a", "tab-a", 2)]);
 
-    expect(planZoneReemits(ledger, [obs("sid-a", "tab-a", 2)])).toEqual([]);
+    expect(planZoneReemits(ledger, [obs("sid-a", "tab-a", 2)])).toEqual({
+      reemits: [],
+      firstSeen: [],
+    });
   });
 
   it("emits nothing when the written zone already matches the live zone", () => {
     const ledger: RecordedZoneLedger = new Map();
     noteRecordedZone(ledger, "sid-a", 3);
 
-    expect(planZoneReemits(ledger, [obs("sid-a", "tab-a", 3)])).toEqual([]);
+    expect(planZoneReemits(ledger, [obs("sid-a", "tab-a", 3)])).toEqual({
+      reemits: [],
+      firstSeen: [],
+    });
   });
 
   it("follows an operator move in BOTH directions, including back to unzoned", () => {
     const ledger: RecordedZoneLedger = new Map();
     noteRecordedZone(ledger, "sid-a", 0);
 
-    expect(planZoneReemits(ledger, [obs("sid-a", "tab-a", 4)])).toEqual([obs("sid-a", "tab-a", 4)]);
+    expect(planZoneReemits(ledger, [obs("sid-a", "tab-a", 4)]).reemits).toEqual([
+      obs("sid-a", "tab-a", 4),
+    ]);
     // Dragged out of every zone: `-1` is a real recorded value, so the record
     // follows the tab DOWN as well as up. It is never clamped to zone 0.
-    expect(planZoneReemits(ledger, [obs("sid-a", "tab-a", UNZONED_INDEX)])).toEqual([
+    expect(planZoneReemits(ledger, [obs("sid-a", "tab-a", UNZONED_INDEX)]).reemits).toEqual([
       obs("sid-a", "tab-a", UNZONED_INDEX),
     ]);
     expect(ledger.get("sid-a")).toBe(UNZONED_INDEX);
@@ -346,22 +356,71 @@ describe("planZoneReemits — durable zoneIndex re-resolution", () => {
 
     // The tab is live but beyond the 9-zone ceiling — it resolves to no zone,
     // agrees with the record, and must produce no write at all.
-    expect(planZoneReemits(ledger, [obs("sid-hidden", "tab-h", UNZONED_INDEX)])).toEqual([]);
+    expect(planZoneReemits(ledger, [obs("sid-hidden", "tab-h", UNZONED_INDEX)])).toEqual({
+      reemits: [],
+      firstSeen: [],
+    });
     expect(ledger.get("sid-hidden")).toBe(UNZONED_INDEX);
   });
 
-  it("seeds silently for a record this page never wrote (restore-owned)", () => {
-    // No `noteRecordedZone` — the boot-restore path owns this row. Re-asserting
-    // `record_open` for it would refresh `last_seen_at` on a row the restore
-    // deliberately left alone, which is how ghost records became immortal.
+  it("reports a record this page never wrote as first-seen, never as a re-emit", () => {
+    // No `noteRecordedZone` — a backend writer (the `POST /terminals` spawn
+    // seam, the typed-line sniff) or the boot-restore path owns this row.
+    // Re-asserting `record_open` for it would refresh `last_seen_at` on a row
+    // nothing live touched, which is how ghost records became immortal — so
+    // it is reported as FIRST-SEEN, for the zone-only sync, and not re-emitted.
     const ledger: RecordedZoneLedger = new Map();
 
-    expect(planZoneReemits(ledger, [obs("sid-restored", "tab-r", 1)])).toEqual([]);
+    expect(planZoneReemits(ledger, [obs("sid-restored", "tab-r", 1)])).toEqual({
+      reemits: [],
+      firstSeen: [obs("sid-restored", "tab-r", 1)],
+    });
     expect(ledger.get("sid-restored")).toBe(1);
-    // ...and once seeded it behaves normally on a later genuine move.
-    expect(planZoneReemits(ledger, [obs("sid-restored", "tab-r", 5)])).toEqual([
-      obs("sid-restored", "tab-r", 5),
+    // ...once seeded it is no longer first-seen: a second pass at the same
+    // zone reports nothing at all...
+    expect(planZoneReemits(ledger, [obs("sid-restored", "tab-r", 1)])).toEqual({
+      reemits: [],
+      firstSeen: [],
+    });
+    // ...and a later genuine move is a known-and-changed re-emit.
+    expect(planZoneReemits(ledger, [obs("sid-restored", "tab-r", 5)])).toEqual({
+      reemits: [obs("sid-restored", "tab-r", 5)],
+      firstSeen: [],
+    });
+  });
+
+  it("reports an HTTP-created session in zone 2 as first-seen at zone 2", () => {
+    // The measured defect (coord finding 898efce4): the backend recorded zone
+    // 0, the tab renders in zone 2, and the page never wrote the record.
+    const ledger: RecordedZoneLedger = new Map();
+    const { reemits, firstSeen } = planZoneReemits(ledger, [
+      obs("sid-http-0", "term-0", 0),
+      obs("sid-http-1", "term-1", 1),
+      obs("sid-http-2", "term-2", 2),
     ]);
+    expect(reemits).toEqual([]);
+    expect(firstSeen).toEqual([
+      obs("sid-http-0", "term-0", 0),
+      obs("sid-http-1", "term-1", 1),
+      obs("sid-http-2", "term-2", 2),
+    ]);
+  });
+
+  it("separates first-seen from known-and-changed in one pass", () => {
+    const ledger: RecordedZoneLedger = new Map();
+    noteRecordedZone(ledger, "sid-known-moved", 0);
+    noteRecordedZone(ledger, "sid-known-still", 3);
+
+    expect(
+      planZoneReemits(ledger, [
+        obs("sid-known-moved", "tab-m", 4),
+        obs("sid-known-still", "tab-s", 3),
+        obs("sid-new", "tab-n", 2),
+      ]),
+    ).toEqual({
+      reemits: [obs("sid-known-moved", "tab-m", 4)],
+      firstSeen: [obs("sid-new", "tab-n", 2)],
+    });
   });
 
   it("prunes sessions that no longer exist so a reused id re-seeds cleanly", () => {
@@ -371,8 +430,12 @@ describe("planZoneReemits — durable zoneIndex re-resolution", () => {
     planZoneReemits(ledger, []);
     expect(ledger.has("sid-gone")).toBe(false);
 
-    // Re-seeded from scratch → treated as never-written, so no emit.
-    expect(planZoneReemits(ledger, [obs("sid-gone", "tab-g", 7)])).toEqual([]);
+    // Re-seeded from scratch → treated as never-written: no re-emit, and
+    // first-seen again, so the zone-only sync reconciles it.
+    expect(planZoneReemits(ledger, [obs("sid-gone", "tab-g", 7)])).toEqual({
+      reemits: [],
+      firstSeen: [obs("sid-gone", "tab-g", 7)],
+    });
   });
 
   it("handles several sessions in one pass, emitting only the disagreements", () => {
@@ -380,9 +443,17 @@ describe("planZoneReemits — durable zoneIndex re-resolution", () => {
     noteRecordedZone(ledger, "sid-a", UNZONED_INDEX);
     noteRecordedZone(ledger, "sid-b", 1);
 
-    expect(planZoneReemits(ledger, [obs("sid-a", "tab-a", 0), obs("sid-b", "tab-b", 1)])).toEqual([
-      obs("sid-a", "tab-a", 0),
-    ]);
+    expect(
+      planZoneReemits(ledger, [obs("sid-a", "tab-a", 0), obs("sid-b", "tab-b", 1)]).reemits,
+    ).toEqual([obs("sid-a", "tab-a", 0)]);
+  });
+});
+
+describe("buildSessionSyncZoneArgs — the zone-only sync payload", () => {
+  it("keys the sync by the tab id, which is the backend terminal id", () => {
+    expect(
+      buildSessionSyncZoneArgs({ claudeSessionId: "sid-x", tabId: "term-x", zoneIndex: 2 }),
+    ).toEqual({ claudeSessionId: "sid-x", terminalId: "term-x", zoneIndex: 2 });
   });
 });
 
