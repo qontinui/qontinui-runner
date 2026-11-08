@@ -38,33 +38,50 @@
  *
  *   - fixture creation (T0.2-T0.5) requires `--fixture`
  *
- * ## What a FIXTURE is (rewritten 2026-08-20)
+ * ## What a FIXTURE is (rewritten 2026-11-08: no script evaluation)
  *
- * A fixture is a REAL, terminal-bound provider session, built the way the
- * product builds one: `build_ai_launch_command` composes the flag set, the
- * command is typed into a PTY created by `POST /terminals`, and the runner's
- * own `terminal_session_record_open` writes the spawn-time record.
+ * A fixture is a REAL, terminal-bound provider session, built over the
+ * runner's HTTP API and read-only UI Bridge component actions — never by
+ * evaluating script in the webview, which the exe-mode CSP (`script-src
+ * 'self'`) refuses (plan `2026-11-08-tenant-badge-parity-and-oracle-fixtures`
+ * D5; the old route built 0/3 fixtures on every current build):
  *
- * It used to be a `POST /sessions/spawn`, which cannot work: that route makes a
- * HEADLESS session while `/control/sessions/info` projects terminal-bound
- * records, so the waiter blocked on something that could never appear and
- * 18 assertions SKIPped behind it.
+ *   - `terminal-page` `get-zone-view-state` names the page the UI shows and
+ *     its grid zone map (a build that serves neither is refused by name);
+ *   - `POST /terminals {page_id, title, working_dir, account, initial_command:
+ *     "claude"}` spawns it — the RUNNER pins the account (roster-validated) and
+ *     its identity seam writes the one spawn-time record; a spawn refused by
+ *     the runner's admission guard for load is retried with bounded backoff;
+ *   - the session id is read from `/control/sessions/restore-health` by
+ *     terminal id, and the rendered zone from the grid map.
  *
- * Two properties are NOT this script's to manufacture:
+ * A supervisor temp runner starts with an EMPTY account roster: the run then
+ * refuses naming the missing accounts, unless `--seed-roster` names config
+ * dirs to add for the run (restored at teardown, verified by read-back).
+ *
+ * Three properties are NOT this script's to manufacture:
  *
  *   - `confirmed_at` is written only by the provider's SessionStart hook
  *     (`POST /control/session-open`), so it is proof a provider really started.
  *     This script never posts that route; it waits for it.
  *   - the transcript appears only once the provider writes a conversation to
  *     disk, which is what the trivial T0.3 prompt is for.
+ *   - the RECORDED zone. T1 asserts the backend places each session where the
+ *     UI renders it; re-recording zones here would make T1 check the
+ *     harness's own write (plan D6).
  *
  * A real `claude` opens first-run gates before its session starts, and an
  * unanswered gate parks the process at a menu forever. Only gates named in
- * `KNOWN_LAUNCH_GATES` are answered, each with a fixed key sequence that is
- * reported in the run. The external-CLAUDE.md-imports gate is deliberately
- * REFUSED, not answered: it approves loading code from outside the cwd, which
- * is the operator's decision. The default `--fixture-cwd` is an empty temp dir
- * precisely so that gate never opens.
+ * `KNOWN_LAUNCH_GATES` are answered — BY LABEL: the cursor is moved to the
+ * target option and Enter is sent only once a re-read shows it there; every
+ * key is reported in the run. The external-CLAUDE.md-imports gate is
+ * deliberately REFUSED, not answered: it approves loading code from outside
+ * the cwd, which is the operator's decision. The default `--fixture-cwd` is a
+ * fresh empty temp dir precisely so that gate never opens.
+ *
+ * Every run that changed anything ends in a teardown (T0.6): its terminals
+ * are DELETEd, their records must leave the open set (residue is named), the
+ * roster is restored and the temp cwd removed.
  *   - every restart (T7, T10) requires `--allow-restart`
  *   - BOTH re-run the T0 emptiness + self-hosting gates IMMEDIATELY BEFORE
  *     acting, and abort if either fails
@@ -90,15 +107,30 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
-import { randomUUID } from "node:crypto";
 
 import {
+  KEY_DOWN,
+  KEY_ENTER,
+  KNOWN_LAUNCH_GATES,
+  buildFixtureTerminalRequest,
+  classifyTerminalSpawn,
   killTargetRunner,
+  openResidue,
+  parseZoneViewState,
+  pickFixtureSessionId,
+  planMenuAnswer,
+  planRosterSeed,
+  planSpawnRetry,
+  refusedGateIn,
   resolveTargetRunnerPid,
+  sameRoster,
   selfHostingVerdict,
+  terminalBufferText,
+  verifyRosterSeed,
+  zoneIndexOf,
 } from "./uibridge-session-info-lib.mjs";
 
 // ===========================================================================
@@ -146,6 +178,11 @@ const RESTORE_SETTLE_BUDGET_MS = 300_000;
 const FIXTURE_TRANSCRIPT_BUDGET_MS = 120_000;
 /** Gap between fixture-progress polls (buffer reads + restore-health). */
 const FIXTURE_POLL_INTERVAL_MS = 4_000;
+/**
+ * T0.3's prompt. A plain one-word reply: measured answering in 2-3 s with no
+ * tool call (plan Phase 1), so it cannot park at a permission dialog.
+ */
+const FIXTURE_PROMPT = "Reply with the single word ok.";
 
 // `NEVER_KILL` and the runner-image predicate live in
 // `uibridge-session-info-lib.mjs`, beside the kill planner that enforces them.
@@ -194,13 +231,16 @@ function parseArgs(argv) {
     readOnly: false,
     strict: false,
     accounts: [],
-    // Fixture cwd. A directory THIS SCRIPT owns, deliberately outside every
-    // repo: a cwd whose CLAUDE.md imports files from outside it makes `claude`
-    // open an "Allow external CLAUDE.md file imports?" gate before the session
-    // starts, and answering that on the operator's behalf would be approving
-    // third-party code they never saw. An empty temp dir raises no such
-    // question. Override only if you accept that (see `--fixture-cwd`).
-    fixtureCwd: join(tmpdir(), "qontinui-uibridge-fixtures"),
+    // Config dirs `--seed-roster` may add to an EMPTY temp-runner roster.
+    seedRoster: [],
+    // Fixture cwd. `null` = a FRESH temp dir THIS SCRIPT creates per run and
+    // removes at teardown, deliberately outside every repo: a cwd whose
+    // CLAUDE.md imports files from outside it makes `claude` open an "Allow
+    // external CLAUDE.md file imports?" gate before the session starts, and
+    // answering that on the operator's behalf would be approving third-party
+    // code they never saw. An empty temp dir raises no such question. Override
+    // only if you accept that (see `--fixture-cwd`).
+    fixtureCwd: null,
     devStart: process.env.QONTINUI_DEV_START || "C:/qontinui-root/dev-start.ps1",
     devStartExplicit: false,
     oracle: join(tmpdir(), "uibridge-session-info-oracle.json"),
@@ -246,6 +286,13 @@ function parseArgs(argv) {
       case "--accounts":
         [v, i] = take(i, "--accounts");
         opts.accounts = (v || "")
+          .split(",")
+          .map((s) => s.trim())
+          .filter(Boolean);
+        break;
+      case "--seed-roster":
+        [v, i] = take(i, "--seed-roster");
+        opts.seedRoster = (v || "")
           .split(",")
           .map((s) => s.trim())
           .filter(Boolean);
@@ -303,11 +350,16 @@ node scripts/uibridge-session-info.test.mjs [flags]
                         emptiness + self-hosting gates to pass first.
   --allow-restart       permit the T7 / T10 restarts. Default OFF. Each restart
                         re-runs the T0 gates immediately before acting.
-  --accounts a,b        Claude account names for the fixture spawns (>=2).
-  --fixture-cwd <path>  cwd for fixture sessions (default: a temp dir this
-                        script creates). Point it at a repo and the launch
-                        opens an external-CLAUDE.md-imports gate this script
-                        REFUSES to answer for you.
+  --accounts a,b        Claude account names for the fixture spawns (>=2),
+                        as the runner's roster names them ('.claude-<name>').
+  --seed-roster d1,d2   config dirs to ADD to the target's account roster when
+                        an --accounts name is missing (a supervisor temp runner
+                        starts with an EMPTY roster). Never on port 9876. The
+                        prior roster is restored at teardown and read back.
+  --fixture-cwd <path>  cwd for fixture sessions (default: a fresh temp dir
+                        this script creates and removes). Point it at a repo
+                        and the launch opens an external-CLAUDE.md-imports
+                        gate this script REFUSES to answer for you.
   --dev-start <path>    dev-start.ps1 (default C:/qontinui-root/dev-start.ps1).
   --oracle <path>       where T6 writes / T8 reads the pre-restart census.
   --ff-pr owner/repo#N  the known ff-landed PR for T11.
@@ -748,53 +800,13 @@ async function gatesAllowMutation(label, ctx) {
 // ===========================================================================
 
 // ===========================================================================
-// Fixture plumbing — a fixture is a REAL terminal-bound provider session
+// Fixture plumbing — a fixture is a REAL terminal-bound provider session,
+// built with no script evaluation in the webview (plan
+// `2026-11-08-tenant-badge-parity-and-oracle-fixtures` D5): `POST /terminals`
+// plus read-only UI Bridge component actions. The exe-mode CSP
+// (`script-src 'self'`) refuses string eval, which is why the old route built
+// 0/3 fixtures on every current build.
 // ===========================================================================
-
-/** `POST /ui-bridge/control/page/evaluate` — the UI Bridge's JS door. */
-async function evaluatePage(expression) {
-  const r = await getJson("/ui-bridge/control/page/evaluate", {
-    method: "POST",
-    body: { expression, awaitPromise: true },
-  });
-  if (!r.ok) return { ok: false, value: null, error: r.error };
-  return { ok: true, value: r.data?.result?.value ?? null, error: null };
-}
-
-/**
- * Invoke a Tauri command through the webview.
- *
- * Arguments travel as BASE64-ENCODED JSON, never as a JS literal, and the
- * reason is not stylistic. A Windows path inside a JS string literal is
- * silently corrupted: in "C:\claude\.claude-gmail" neither \c nor \. is a valid
- * escape, so JS drops both backslashes and yields `C:claude.claude-gmail`. The
- * command then receives a config dir that does not exist, and the failure
- * surfaces far away as "the account never launched" (measured 2026-08-20 — it
- * first read as a bug in the Rust launch builder). Base64 carries no
- * backslashes, so nothing can be re-interpreted on the way in.
- *
- * Wrapped in an IIFE because `page/evaluate` does NOT return the last
- * statement's value of a multi-statement expression — a bare `a; b; c` comes
- * back as `a`.
- */
-async function invokeTauri(command, args) {
-  const b64 = Buffer.from(JSON.stringify(args ?? {}), "utf8").toString("base64");
-  const expr =
-    `(function(){var a=JSON.parse(atob(${JSON.stringify(b64)}));` +
-    `return window.__TAURI__.core.invoke(${JSON.stringify(command)},a).then(` +
-    `function(r){return JSON.stringify({ok:true,data:r===undefined?null:r});},` +
-    `function(e){return JSON.stringify({ok:false,error:String(e)});});})()`;
-  const r = await evaluatePage(expr);
-  if (!r.ok) return { ok: false, data: null, error: `invoke ${command}: ${r.error}` };
-  let parsed;
-  try {
-    parsed = JSON.parse(String(r.value));
-  } catch {
-    return { ok: false, data: null, error: `invoke ${command}: unparseable answer ${r.value}` };
-  }
-  if (!parsed.ok) return { ok: false, data: null, error: `invoke ${command}: ${parsed.error}` };
-  return { ok: true, data: parsed.data, error: null };
-}
 
 /** Write raw text to a terminal PTY stdin (`/terminals/{id}/write` takes base64). */
 async function writeTerminal(terminalId, text) {
@@ -804,7 +816,11 @@ async function writeTerminal(terminalId, text) {
   });
 }
 
-/** A terminal visible text: base64 buffer, ANSI stripped. */
+/**
+ * A terminal's visible text: the base64 buffer, decoded by
+ * `terminalBufferText` (cursor-column moves become spaces BEFORE the other
+ * escape sequences are stripped, so a menu reads as words).
+ */
 async function readTerminalText(terminalId) {
   const r = await getJson(`/terminals/${encodeURIComponent(terminalId)}/buffer`);
   if (!r.ok) return { ok: false, text: "", error: r.error };
@@ -816,323 +832,350 @@ async function readTerminalText(terminalId) {
   } catch (e) {
     return { ok: false, text: "", error: `undecodable buffer: ${e}` };
   }
-  // eslint-disable-next-line no-control-regex
-  const text = raw.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, "").replace(/\r/g, "");
-  return { ok: true, text, error: null };
+  return { ok: true, text: terminalBufferText(raw), error: null };
 }
 
-/**
- * The first-run interactive gates a real `claude` opens BEFORE its session
- * starts — and therefore before its SessionStart hook can confirm anything.
- * Until one is answered the provider is not running, so a fixture that ignores
- * them waits out its whole budget on a process parked at a menu (measured
- * 2026-08-20: `confirmed` stayed false for 190 s while the PTY sat on the trust
- * prompt).
- *
- * Two rules keep this from becoming a key-masher:
- *
- *  - ONLY a gate matched here is answered, with a FIXED key sequence that is
- *    reported in the result table. An unrecognized prompt is never guessed at:
- *    the fixture fails and prints the buffer tail.
- *  - The external-imports gate is deliberately in REFUSED_LAUNCH_GATES, not
- *    here. It asks whether to trust files imported from OUTSIDE the cwd — code
- *    the operator has not seen — so answering it automatically would launder a
- *    real security decision through a test.
- */
-/**
- * Build a whitespace-TOLERANT matcher from a readable phrase.
- *
- * A TUI paints with cursor positioning rather than spaces, so once the escape
- * sequences are stripped the prompt arrives with NO spaces at all:
- * `Isthisaprojectyoucreatedoroneyoutrust?`. A pattern written with spaces
- * therefore never matches, the gate is never answered, and the provider sits at
- * the menu until the confirm budget expires — surfacing as the misleading
- * "the provider never started".
- *
- * This hid for three green runs because both accounts already trusted the
- * default `--fixture-cwd`, so no gate ever opened. It appeared the moment the
- * suite was pointed at a FRESH directory (2026-08-20), which is the only
- * configuration that exercises the gate path at all.
- */
-function gatePhrase(phrase) {
-  const escaped = phrase.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return new RegExp(escaped.trim().split(/\s+/).join("\\s*"), "i");
-}
-
-const KNOWN_LAUNCH_GATES = [
-  {
-    id: "folder-trust",
-    match: gatePhrase("Is this a project you created or one you trust"),
-    keys: ["1", "\r"],
-    why: "the fixture cwd is a directory this script created, so trusting it is not a judgement about code the operator has not seen",
-  },
-];
-
-/** Gates this script REFUSES to answer, with the reason it gives the operator. */
-const REFUSED_LAUNCH_GATES = [
-  {
-    id: "external-claude-md-imports",
-    match: gatePhrase("Allow external CLAUDE.md file imports"),
-    why: "answering it would approve loading files from OUTSIDE the cwd, which is a security decision belonging to the operator rather than to a test. Use the default --fixture-cwd (an empty temp dir), which never opens this gate.",
-  },
-];
+/** How many of the buffer's last characters a gate is read from. */
+const GATE_TAIL_CHARS = 6000;
+/** Re-reads allowed for the cursor to land after the arrow keys. */
+const GATE_VERIFY_READS = 3;
+/** Gap between a key and the re-read that verifies it. */
+const GATE_KEY_SETTLE_MS = 600;
 
 /**
- * Answer any known launch gate showing in `terminalId`. Returns what it did so
- * the caller can report it; an unknown or refused gate is an ERROR, never a
- * silent skip.
+ * Answer any known launch gate showing in `terminalId` (plan D7): find the
+ * menu's last render, move the cursor to the TARGET label, re-read the buffer
+ * and send Enter only when the cursor is on it. Returns what it did so the
+ * caller can report every key; a refused or unrecognised gate is an ERROR
+ * carrying the buffer tail, never a guess and never a silent skip.
+ *
+ * Each gate is answered ONCE per terminal (`alreadyAnswered`): the buffer is
+ * scrollback, so a gate's text still matches after the provider has moved on,
+ * and re-answering would type into a LIVE session — spending tokens and
+ * polluting the transcript T0.3 asserts on. `planMenuAnswer` also treats a gate
+ * followed by a later gate's title as scrollback.
  */
 async function answerLaunchGates(terminalId, alreadyAnswered = new Set()) {
   const buf = await readTerminalText(terminalId);
-  if (!buf.ok) return { ok: false, answered: [], error: `buffer read: ${buf.error}` };
-  const tail = buf.text.slice(-4000);
-  for (const gate of REFUSED_LAUNCH_GATES) {
-    if (alreadyAnswered.has(gate.id)) continue;
-    if (gate.match.test(tail)) {
-      return { ok: false, answered: [], error: `launch gate ${gate.id} is open and ${gate.why}` };
-    }
-  }
-  const answered = [];
-  for (const gate of KNOWN_LAUNCH_GATES) {
-    // ONCE per terminal. The PTY buffer is scrollback, so a gate's text still
-    // matches after it has been answered and the provider has moved on —
-    // re-answering would type `1` and Enter into a LIVE session as ordinary
-    // input, spending tokens and polluting the very transcript T0.3 asserts on.
-    if (alreadyAnswered.has(gate.id)) continue;
-    if (!gate.match.test(tail)) continue;
-    for (const key of gate.keys) {
-      const w = await writeTerminal(terminalId, key);
-      if (!w.ok) return { ok: false, answered, error: `answering ${gate.id}: ${w.error}` };
-      await sleep(600);
-    }
-    answered.push(gate.id);
-  }
-  return { ok: true, answered, error: null };
-}
-
-/**
- * The zone the FRONTEND assigned a terminal, read from its own layout state.
- *
- * The record `zone_index` must match what the UI rendered, so this mirrors
- * production: `recordSessionOpen` resolves the zone from the live assignments
- * map rather than inventing an index. Backend-created terminals reach the tab
- * list through the mount/close/`terminal-exit` re-sync, and the `useZoneLayout`
- * auto-grow then widens the layout and assigns a zone — so the index exists
- * without this script choosing one (verified: two terminals grew `single` into
- * `split` with assignments {0,1}).
- *
- * Coupled to a storage key on purpose: it is the only place the assignment is
- * observable BEFORE the session id is bound — the zone header label carries
- * that id, which is exactly what we do not have yet.
- */
-async function readZoneAssignments(pageId, port) {
-  const keys = [`page:${pageId}:qontinui-zone-layout:${port}`, `qontinui-zone-layout:${port}`];
-  const expr =
-    `(function(){var ks=${JSON.stringify(keys)};` +
-    `for(var i=0;i<ks.length;i++){var v=localStorage.getItem(ks[i]);if(v)return v;}return "";})()`;
-  const r = await evaluatePage(expr);
-  if (!r.ok) return { ok: false, assignments: {}, layoutId: null, error: r.error };
-  const raw = String(r.value ?? "");
-  if (!raw) return { ok: true, assignments: {}, layoutId: null, error: null };
-  try {
-    const parsed = JSON.parse(raw);
-    return {
-      ok: true,
-      assignments: parsed?.assignments ?? {},
-      layoutId: parsed?.layoutId ?? null,
-      error: null,
-    };
-  } catch (e) {
-    return { ok: false, assignments: {}, layoutId: null, error: `unparseable zone layout: ${e}` };
-  }
-}
-
-/** Zone index the frontend gave `terminalId`, or null when it has not yet. */
-function zoneIndexOf(assignments, terminalId) {
-  for (const [zone, tid] of Object.entries(assignments ?? {})) {
-    if (String(tid) === String(terminalId)) return Number(zone);
-  }
-  return null;
-}
-
-/**
- * The page the UI is actually showing. Fixtures must land there or their zone
- * headers never render, and every T1-T5 assertion reads a rendered header.
- * `/terminal-pages` can legitimately be empty while the frontend holds an
- * active page, so the frontend own state is the authority here.
- */
-async function resolveActivePageId(port) {
-  const r = await evaluatePage(
-    `(function(){return localStorage.getItem("qontinui-terminal-active-page:${port}")||"";})()`,
-  );
-  const fromUi = r.ok ? String(r.value ?? "").trim() : "";
-  if (fromUi) return { pageId: fromUi, source: "frontend active page" };
-  const pages = await getJson("/terminal-pages");
-  const first = pages.ok ? (pages.data?.pages ?? [])[0]?.id : null;
-  if (first) return { pageId: String(first), source: "GET /terminal-pages" };
-  return { pageId: "default", source: "fallback" };
-}
-
-/** Resolve one `--accounts` name to its roster `config_dir`. */
-async function resolveConfigDir(accountName) {
-  const r = await invokeTauri("get_claude_config_dirs", {});
-  if (!r.ok) return { ok: false, configDir: null, error: r.error };
-  const dirs = r.data?.data?.dirs ?? r.data?.dirs ?? [];
-  if (!Array.isArray(dirs) || dirs.length === 0) {
-    return { ok: false, configDir: null, error: "the machine-global Claude roster is EMPTY" };
-  }
-  const want = String(accountName).trim().toLowerCase();
-  const derive = (d) => {
-    const base =
-      String(d)
-        .replace(/[\\/]+$/, "")
-        .split(/[\\/]/)
-        .pop() ?? "";
-    return (base.match(/^\.claude-(.+)$/)?.[1] ?? base).toLowerCase();
-  };
-  const hit =
-    dirs.find((d) => derive(d) === want) || dirs.find((d) => String(d).toLowerCase() === want);
-  if (!hit) {
+  if (!buf.ok) return { ok: false, answered: [], keys: [], error: `buffer read: ${buf.error}` };
+  const tail = buf.text.slice(-GATE_TAIL_CHARS);
+  const shortTail = () => tail.slice(-400).replace(/\s+/g, " ").trim();
+  const refused = refusedGateIn(tail, alreadyAnswered);
+  if (refused) {
     return {
       ok: false,
-      configDir: null,
-      error: `account ${accountName} is not in the roster (${dirs.map(derive).join(", ")})`,
+      answered: [],
+      keys: [],
+      error: `launch gate ${refused.id} is open and ${refused.why}`,
     };
   }
-  return { ok: true, configDir: hit, error: null };
+  const answered = [];
+  const keys = [];
+  for (const gate of KNOWN_LAUNCH_GATES) {
+    let plan = planMenuAnswer(tail, gate, { answered: alreadyAnswered });
+    if (plan.action === "none") continue;
+    if (plan.action === "refuse") {
+      return { ok: false, answered, keys, error: `${plan.reason}. Buffer tail: ${shortTail()}` };
+    }
+    if (plan.action === "move") {
+      for (const key of plan.keys) {
+        const w = await writeTerminal(terminalId, key);
+        if (!w.ok) return { ok: false, answered, keys, error: `answering ${gate.id}: ${w.error}` };
+        keys.push(`${gate.id}:${key === KEY_DOWN ? "Down" : "Up"}`);
+        await sleep(GATE_KEY_SETTLE_MS);
+      }
+      let lastTail = tail;
+      for (let i = 0; i < GATE_VERIFY_READS; i++) {
+        const again = await readTerminalText(terminalId);
+        if (!again.ok) {
+          return { ok: false, answered, keys, error: `re-reading ${gate.id}: ${again.error}` };
+        }
+        lastTail = again.text.slice(-GATE_TAIL_CHARS);
+        plan = planMenuAnswer(lastTail, gate, { answered: alreadyAnswered, afterMove: true });
+        if (plan.action === "confirm") break;
+        await sleep(GATE_KEY_SETTLE_MS);
+      }
+      if (plan.action !== "confirm") {
+        const why = plan.reason ?? `${gate.id}: the menu disappeared before Enter was verified`;
+        const t = lastTail.slice(-400).replace(/\s+/g, " ").trim();
+        return { ok: false, answered, keys, error: `${why}. Buffer tail: ${t}` };
+      }
+    }
+    // `confirm`: the cursor is verified on the target label.
+    const w = await writeTerminal(terminalId, KEY_ENTER);
+    if (!w.ok) return { ok: false, answered, keys, error: `answering ${gate.id}: ${w.error}` };
+    keys.push(`${gate.id}:Enter on '${gate.target}'`);
+    answered.push(gate.id);
+    await sleep(GATE_KEY_SETTLE_MS);
+  }
+  return { ok: true, answered, keys, error: null };
 }
 
 /**
- * Build ONE fixture: a real, TERMINAL-BOUND provider session.
+ * `terminal-page` `get-zone-view-state` — the eval-free door to the page the UI
+ * shows (`pageId`), the GRID zone map (`assignments`) and the work mode. A
+ * `read` action. An envelope without those fields refuses, naming the build.
+ */
+async function fetchZoneViewState(build) {
+  const r = await getJson("/ui-bridge/control/component/terminal-page/action/get-zone-view-state", {
+    method: "POST",
+    body: {},
+  });
+  if (!r.ok) return { ok: false, error: `get-zone-view-state: ${r.error}` };
+  // The control route may wrap the handler's return value; accept both.
+  const d = r.data;
+  const payload =
+    d && typeof d === "object" && d.result && typeof d.result === "object" ? d.result : d;
+  return parseZoneViewState(payload, build);
+}
+
+/** `/health` `spawnAdmission.threads.verdict`, or null when unread. */
+async function readAdmissionVerdict() {
+  const h = await http("/health", { timeoutMs: HEALTH_PROBE_TIMEOUT_MS });
+  const sa = h.json?.spawnAdmission ?? h.json?.data?.spawnAdmission ?? null;
+  return sa?.threads?.verdict ?? sa?.verdict ?? null;
+}
+
+/**
+ * `POST /terminals`, retried with bounded backoff while the runner's spawn
+ * admission (its resource guard) refuses for load — HTTP 500
+ * `resource_guard:<severity>:<lane>: …`. Every other refusal returns at once,
+ * classified; a guard that keeps refusing past the budget is reported with
+ * its reason and the last `/health` admission verdict.
+ */
+async function postTerminalWithAdmission(body) {
+  const started = Date.now();
+  for (let attempt = 0; ; attempt++) {
+    const res = await http("/terminals", { method: "POST", body });
+    const c = classifyTerminalSpawn(res);
+    if (c.kind === "ok") {
+      const u = unwrap(res);
+      return u.ok
+        ? { ok: true, data: u.data, attempts: attempt + 1 }
+        : { ok: false, kind: "error", error: u.error };
+    }
+    const verdict = c.retry ? await readAdmissionVerdict() : null;
+    const next = planSpawnRetry({
+      classification: c,
+      attempt,
+      elapsedMs: Date.now() - started,
+      admissionVerdict: verdict,
+    });
+    if (!next.retry) return { ok: false, kind: c.kind, error: next.reason };
+    note(
+      `POST /terminals refused by spawn admission (${c.detail}; threads verdict ` +
+        `${verdict ?? "unread"}) — retrying in ${next.delayMs}ms`,
+    );
+    await sleep(next.delayMs);
+  }
+}
+
+/** `GET /settings/claude-config-dirs` → `{ok, dirs}`. */
+async function fetchRoster() {
+  const r = await getJson("/settings/claude-config-dirs");
+  if (!r.ok) return { ok: false, dirs: [], error: r.error };
+  const dirs = r.data?.dirs;
+  if (!Array.isArray(dirs)) return { ok: false, dirs: [], error: "no `dirs` array in the answer" };
+  return { ok: true, dirs: dirs.map(String), error: null };
+}
+
+/** `PUT /settings/claude-config-dirs`, then read it back: the PUT drops dirs silently. */
+async function putRoster(dirs) {
+  const put = await getJson("/settings/claude-config-dirs", { method: "PUT", body: { dirs } });
+  if (!put.ok) return { ok: false, dirs: [], error: `PUT: ${put.error}` };
+  const back = await fetchRoster();
+  if (!back.ok) return { ok: false, dirs: [], error: `read-back: ${back.error}` };
+  return { ok: true, dirs: back.dirs, error: null };
+}
+
+/**
+ * Make every `--accounts` name resolvable on the target before any spawn.
  *
- * The previous implementation posted `/sessions/spawn` and waited for the
- * session to show up in `/control/sessions/info`. It never could.
- * `/sessions/spawn` creates a HEADLESS AI session (`mcp/sessions.rs` — register,
- * then `send_initial_prompt`) and answers `state: "ready"`, while
- * `/control/sessions/info` projects `TerminalSessionRecord`s out of the
- * `SessionLifecycleStore` — terminal-bound sessions. A headless spawn is not a
- * terminal, so the waiter blocked on something that could not arrive and every
- * downstream arm SKIPped behind it (measured 2026-08-20: created 0/3, three
- * 120 s timeouts, while the spawn had genuinely launched `claude` each time).
+ * A supervisor temp runner starts with an EMPTY roster, and `POST /terminals`
+ * with an account then answers 400 `not in roster`. Without `--seed-roster`
+ * this REFUSES naming the missing accounts and the flag; with it, the named
+ * config dirs are added (never on the primary's port), the accepted roster is
+ * read back, and the prior roster is recorded in `ctx.rosterSeed` so teardown
+ * restores it exactly — state-neutral, verified by read-back.
+ */
+async function ensureRoster(ctx) {
+  const { opts } = ctx;
+  const cur = await fetchRoster();
+  if (!cur.ok) return { ok: false, error: `GET /settings/claude-config-dirs: ${cur.error}` };
+  const plan = planRosterSeed({
+    current: cur.dirs,
+    accounts: opts.accounts,
+    seedDirs: opts.seedRoster,
+    port: opts.port,
+    protectedPort: DEFAULT_RUNNER_PORT,
+  });
+  if (plan.action === "none") return { ok: true, error: null };
+  if (plan.action === "refuse") return { ok: false, error: plan.error };
+  // Recorded BEFORE the write, so a PUT that half-lands is still restored.
+  ctx.rosterSeed = { prior: plan.prior, requested: plan.next };
+  const put = await putRoster(plan.next);
+  if (!put.ok) return { ok: false, error: `--seed-roster: ${put.error}` };
+  const v = verifyRosterSeed({ accepted: put.dirs, requested: plan.next, accounts: opts.accounts });
+  note(
+    `--seed-roster: roster was ${plan.prior.length ? plan.prior.join(", ") : "EMPTY"}; ` +
+      `now ${put.dirs.join(", ") || "EMPTY"} (restored at teardown)` +
+      (v.dropped.length ? `; the runner DROPPED ${v.dropped.join(", ")}` : ""),
+  );
+  return v.ok ? { ok: true, error: null } : { ok: false, error: v.error };
+}
+
+/** M4's ceiling for a deleted fixture's record to leave the open set. */
+const FIXTURE_RETIRE_BUDGET_MS = 600_000;
+
+/**
+ * DELETE `terminalIds`, then wait (up to the M4 ceiling) for every owned record
+ * to leave restore-health's open set. Returns the residue BY NAME — a record
+ * still open is reported, never dropped. Measured: M1 records leave in ~1-2 s
+ * (`closeReason: pty-exit`).
+ */
+async function deleteAndAwaitRetire(terminalIds, sessionIds) {
+  const owned = {
+    terminalIds: new Set([...terminalIds].map(String)),
+    sessionIds: new Set([...sessionIds].map(String)),
+  };
+  // Every owned session's CURRENT terminal: a restore re-creates terminals
+  // under new ids, and the session id is what survives it.
+  const before = await fetchRestoreHealth();
+  if (before.ok) {
+    for (const r of before.sessions) {
+      if (owned.sessionIds.has(String(r.claudeSessionId)))
+        owned.terminalIds.add(String(r.terminalId));
+      if (owned.terminalIds.has(String(r.terminalId)) && r.claudeSessionId) {
+        owned.sessionIds.add(String(r.claudeSessionId));
+      }
+    }
+  }
+  const deleteErrors = [];
+  const live = await fetchTerminals();
+  const liveIds = new Set(live.ok ? live.terminals.map((t) => String(t.id)) : owned.terminalIds);
+  for (const id of owned.terminalIds) {
+    if (!liveIds.has(id)) continue;
+    const d = await getJson(`/terminals/${encodeURIComponent(id)}`, { method: "DELETE" });
+    if (!d.ok) deleteErrors.push(`DELETE /terminals/${id}: ${d.error}`);
+  }
+  let residue = [];
+  let readError = null;
+  const deadline = Date.now() + FIXTURE_RETIRE_BUDGET_MS;
+  const started = Date.now();
+  while (Date.now() < deadline) {
+    const rh = await fetchRestoreHealth();
+    if (rh.ok) {
+      readError = null;
+      residue = openResidue(rh.sessions, owned);
+      if (residue.length === 0) break;
+    } else {
+      readError = rh.error;
+    }
+    await sleep(FIXTURE_POLL_INTERVAL_MS);
+  }
+  return {
+    residue,
+    deleteErrors,
+    readError,
+    deleted: owned.terminalIds.size,
+    ms: Date.now() - started,
+  };
+}
+
+/**
+ * Build ONE fixture: a real, TERMINAL-BOUND provider session, with no script
+ * evaluation anywhere.
  *
- * So this builds the session the way the product does — the same sequence
- * `TerminalPage.handleLaunchAiSession` runs, minus the menu:
+ *   1. `POST /terminals` with `buildFixtureTerminalRequest` — Phase 1's
+ *      measured spelling M1: a bare `claude`, account-pinned by the RUNNER
+ *      (roster-validated; it seeds `CLAUDE_CONFIG_DIR`). The runner's identity
+ *      seam pins the session id and writes the spawn-time record itself, with
+ *      the account stamped — one authoritative record per terminal. Retried
+ *      while spawn admission refuses for load.
+ *   2. take the zone the FRONTEND assigned, from `get-zone-view-state`
+ *      `assignments` — never invent one;
+ *   3. read the session id from restore-health by `terminalId`, answering the
+ *      first-run launch gates by label meanwhile, and wait for the provider to
+ *      CONFIRM itself.
  *
- *   1. resolve the account to its roster `config_dir`;
- *   2. `build_ai_launch_command` composes the flag set. It is the SINGLE source
- *      of truth (the operator per-account override and the machine-global
- *      template layer in there), so the fixture cannot drift from what a real
- *      launch types;
- *   3. `POST /terminals` with `initial_command`, on the page the UI is showing;
- *   4. take the zone the FRONTEND assigned — never invent one;
- *   5. `terminal_session_record_open` writes the spawn-time record, which is
- *      deliberately PROVISIONAL (`confirmed_at: None`);
- *   6. answer the first-run launch gate, then wait for the provider to CONFIRM
- *      itself.
- *
- * Step 6 is the load-bearing one. This script does not and must not write
- * `confirmed_at`: that flips only when the provider SessionStart hook POSTs
- * `/control/session-open`, which happens only if a real provider actually
- * started in that terminal. Forging it here — by calling that route directly —
- * would make T0.3 assert a fact the fixture had manufactured, which is worth
- * less than no fixture at all.
+ * This script does not and must not write `confirmed_at`: it flips only when
+ * the provider's SessionStart hook POSTs `/control/session-open`, which happens
+ * only if a real provider started in that terminal. Nor does it write the
+ * record's zone (plan D6): T1 asserts that the BACKEND places each session
+ * where the UI shows it, a product property the harness must not manufacture.
  */
 async function spawnFixtureSession(spec, ctx) {
   const { taskName, account } = spec;
-  const { pageId, port, fixtureCwd } = ctx;
+  const { pageId, fixtureCwd, build } = ctx;
 
-  const cd = await resolveConfigDir(account);
-  if (!cd.ok) return { ok: false, error: `${taskName}: ${cd.error}` };
-
-  const sessionId = randomUUID();
-  const built = await invokeTauri("build_ai_launch_command", {
-    configDir: cd.configDir,
-    sessionId,
-    isWindows: process.platform === "win32",
-  });
-  if (!built.ok) return { ok: false, error: `${taskName}: ${built.error}` };
-  const command = built.data?.data?.command ?? built.data?.command ?? null;
-  const pinned = built.data?.data?.pinnedSessionId ?? built.data?.pinnedSessionId ?? null;
-  if (!command) {
-    return { ok: false, error: `${taskName}: build_ai_launch_command returned no command` };
+  const created = await postTerminalWithAdmission(
+    buildFixtureTerminalRequest({ pageId, title: taskName, fixtureCwd, account }),
+  );
+  if (!created.ok) {
+    const hint =
+      created.kind === "roster"
+        ? " — the account is not in this runner's roster; a supervisor temp runner starts EMPTY (see --seed-roster)"
+        : "";
+    return { ok: false, error: `${taskName}: POST /terminals: ${created.error}${hint}` };
   }
-  if (!pinned) {
-    // An opaque per-account alias was configured, so the runner could not pin
-    // `--session-id`. Production falls back to a freshest-mtime capture; a
-    // fixture must not, because a guessed id cannot be asserted against.
-    return {
-      ok: false,
-      error:
-        `${taskName}: the launch command for '${account}' is an opaque alias with no --session-id pin, ` +
-        `so the session id cannot be known up front. Clear that account custom launch command to build fixtures on it.`,
-    };
-  }
-
-  const created = await getJson("/terminals", {
-    method: "POST",
-    body: {
-      page_id: pageId,
-      title: taskName,
-      working_dir: fixtureCwd,
-      initial_command: command,
-    },
-  });
-  if (!created.ok) return { ok: false, error: `${taskName}: POST /terminals: ${created.error}` };
   const terminalId = created.data?.id;
   if (!terminalId) return { ok: false, error: `${taskName}: POST /terminals returned no id` };
-  const workingDir = created.data?.workingDir ?? fixtureCwd;
+  ctx.spawnedTerminals.add(String(terminalId));
 
-  // The zone is the FRONTEND's to decide. Backend-created terminals reach the
-  // tab list through the re-sync, and the layout auto-grow assigns an index;
-  // taking that index (rather than picking one) is what keeps the record and
-  // the rendered header agreeing, which is exactly what T1 checks.
+  // The zone is the FRONTEND's to decide: a backend-created terminal reaches
+  // the tab list through the re-sync, and the layout auto-grow assigns it.
   let zoneIndex = null;
+  let viewError = null;
   const zoneDeadline = Date.now() + FIXTURE_APPEAR_BUDGET_MS;
   while (Date.now() < zoneDeadline) {
-    const za = await readZoneAssignments(pageId, port);
-    if (za.ok) {
-      const z = zoneIndexOf(za.assignments, terminalId);
-      if (z !== null) {
-        zoneIndex = z;
-        break;
-      }
+    const v = await fetchZoneViewState(build);
+    if (v.ok) {
+      viewError = null;
+      zoneIndex = zoneIndexOf(v.view.assignments, terminalId);
+      if (zoneIndex !== null) break;
+    } else {
+      viewError = v.error;
+      if (v.tmux) break;
     }
     await sleep(FIXTURE_POLL_INTERVAL_MS);
   }
   if (zoneIndex === null) {
     return {
       ok: false,
+      terminalId,
       error:
         `${taskName}: the frontend never assigned terminal ${terminalId} a zone within ` +
-        `${FIXTURE_APPEAR_BUDGET_MS}ms — it is on page ${pageId}, which the UI may not be showing`,
+        `${FIXTURE_APPEAR_BUDGET_MS}ms on page ${pageId}` +
+        (viewError ? ` (${viewError})` : ""),
     };
   }
 
-  const rec = await invokeTauri("terminal_session_record_open", {
-    claudeSessionId: pinned,
-    configDir: cd.configDir,
-    workingDir,
-    pageId,
-    zoneIndex,
-    title: taskName,
-    terminalId,
-    origin: "authoritative",
-    provider: "claude",
-  });
-  if (!rec.ok) return { ok: false, error: `${taskName}: ${rec.error}` };
-
   const answered = new Set();
+  const keys = [];
+  let sessionId = null;
+  let pickError = null;
   let confirmed = false;
   const confirmDeadline = Date.now() + FIXTURE_CONFIRM_BUDGET_MS;
   while (Date.now() < confirmDeadline) {
     const rh = await fetchRestoreHealth();
-    const row = rh.ok ? rh.sessions.find((s) => s.claudeSessionId === pinned) : null;
-    if (row?.confirmed) {
-      confirmed = true;
-      break;
+    if (rh.ok) {
+      const pick = pickFixtureSessionId(rh.sessions, terminalId);
+      if (pick.ok) {
+        sessionId = pick.sessionId;
+        pickError = null;
+        if (pick.row?.confirmed) {
+          confirmed = true;
+          break;
+        }
+      } else if (!pick.pending) {
+        return { ok: false, terminalId, error: `${taskName}: ${pick.error}` };
+      } else {
+        pickError = pick.error;
+      }
     }
     const gate = await answerLaunchGates(terminalId, answered);
-    if (!gate.ok) return { ok: false, error: `${taskName}: ${gate.error}` };
+    keys.push(...gate.keys);
+    if (!gate.ok) return { ok: false, terminalId, error: `${taskName}: ${gate.error}` };
     for (const g of gate.answered) answered.add(g);
     await sleep(FIXTURE_POLL_INTERVAL_MS);
   }
@@ -1143,9 +1186,11 @@ async function spawnFixtureSession(spec, ctx) {
       : `(PTY buffer unreadable: ${buf.error})`;
     return {
       ok: false,
+      terminalId,
       error:
-        `${taskName}: never confirmed within ${FIXTURE_CONFIRM_BUDGET_MS}ms. Confirmation comes from ` +
-        `the provider SessionStart hook, so this means the provider never started. PTY tail: ${tail}`,
+        `${taskName}: never confirmed within ${FIXTURE_CONFIRM_BUDGET_MS}ms ` +
+        `(session ${sessionId ?? `unknown — ${pickError}`}). Confirmation comes from the provider ` +
+        `SessionStart hook, so this means the provider never started. PTY tail: ${tail}`,
     };
   }
 
@@ -1153,48 +1198,35 @@ async function spawnFixtureSession(spec, ctx) {
   while (Date.now() < infoDeadline) {
     const info = await fetchSessionsInfo();
     if (info.ok && info.status === "ok") {
-      const session = info.sessions.find((s) => s.identity?.claudeSessionId === pinned);
+      const session = info.sessions.find((s) => s.identity?.claudeSessionId === sessionId);
       if (session) {
-        return {
-          ok: true,
-          session,
-          terminalId,
-          zoneIndex,
-          gatesAnswered: [...answered],
-        };
+        return { ok: true, session, terminalId, zoneIndex, gatesAnswered: [...answered], keys };
       }
     }
     await sleep(FIXTURE_POLL_INTERVAL_MS);
   }
   return {
     ok: false,
+    terminalId,
     error:
       `${taskName}: confirmed, but never appeared in /control/sessions/info within ` +
-      `${FIXTURE_APPEAR_BUDGET_MS}ms (session ${pinned})`,
+      `${FIXTURE_APPEAR_BUDGET_MS}ms (session ${sessionId})`,
   };
 }
+
+const T02_WHAT = "three fixture sessions across >=2 Claude accounts, in distinct RENDERED zones";
 
 async function createFixtures(ctx) {
   const { opts } = ctx;
   const accounts = opts.accounts;
-  // A SECOND account is needed by exactly ONE arm (T5's cross-session account
-  // distinctness). Every other arm needs only three sessions. Refusing to build
-  // any fixtures without two accounts therefore collapses ~18 assertions to 2 on
-  // a single-account machine -- measured 2026-08-18, where the roster
-  // (%APPDATA%/com.qontinui.runner/claude-accounts.json) is EMPTY, i.e. one
-  // default account. Coupling an optional precondition to a mandatory one is the
-  // wrong trade: it converts "one arm is unprovable here" into "nothing is
-  // proved", which is exactly the silent-coverage-loss this suite exists to
-  // prevent.
-  //
-  // So: zero accounts named -> still refuse (we will not guess a roster we
-  // cannot see). One account -> build all three fixtures on it, and let T5's
-  // distinctness arm SKIP for the honest reason, while T5's nameSource branch
-  // (operator vs derived) still runs.
+  // A SECOND account is needed by T0.2's account half and T5's distinctness
+  // arm. Every other arm needs only three sessions, so one account still
+  // builds all three fixtures; the account half is then reported as NOT
+  // EVALUABLE, by name, rather than failed or silently passed.
   if (accounts.length < 1) {
     skip(
       "T0.2",
-      "three fixture sessions across >=2 Claude accounts, in distinct zones",
+      T02_WHAT,
       "--fixture needs at least one name in --accounts; the roster is machine-global and this script will not guess account names",
     );
     skip(
@@ -1210,33 +1242,59 @@ async function createFixtures(ctx) {
   if (singleAccount) {
     note(
       `only one account ('${accounts[0]}') was supplied — building all three fixtures on it. ` +
-        `T5's cross-account distinctness arm will SKIP; every other arm still runs.`,
+        `T0.2's >=2-account half and T5's cross-account arm are NOT evaluable; every other arm runs.`,
     );
   }
 
-  // Fixtures run in a directory this script owns, deliberately outside every
-  // repo — see `opts.fixtureCwd`. Created here so the very first run does not
-  // fail on a missing cwd.
-  try {
-    mkdirSync(opts.fixtureCwd, { recursive: true });
-  } catch (e) {
-    fail(
-      "T0.2",
-      "three fixture sessions across >=2 Claude accounts, in distinct zones",
-      `could not create the fixture cwd ${opts.fixtureCwd}: ${e}`,
+  const refuseAll = (why) => {
+    fail("T0.2", T02_WHAT, why);
+    skip(
+      "T0.3",
+      "a trivial prompt in each fixture session (transcript + confirmed_at)",
+      "no fixtures",
     );
-    skip("T0.3", "a trivial prompt in each fixture session (transcript + confirmed_at)", "no cwd");
-    skip("T0.4", "one operator-renamed session and one Claude-derived one", "no cwd");
+    skip("T0.4", "one operator-renamed session and one Claude-derived one", "no fixtures");
+  };
+
+  // The page and the grid, from the eval-free read. An envelope without
+  // `pageId` / `assignments` refuses here, naming the build; so does tmux mode.
+  const view = await fetchZoneViewState(ctx.build);
+  if (!view.ok) {
+    refuseAll(view.error);
     return;
   }
 
-  // Fixtures must land on the page the UI is SHOWING or their zone headers
-  // never render, and every T1-T5 assertion reads a rendered header.
-  const page = await resolveActivePageId(opts.port);
-  const fixtureCtx = { pageId: page.pageId, port: opts.port, fixtureCwd: opts.fixtureCwd };
+  // Fixtures run in a directory this script owns, outside every repo. By
+  // default a FRESH temp dir per run, removed at teardown: it exercises the
+  // gate path every run and leaves nothing behind.
+  try {
+    if (opts.fixtureCwd) {
+      mkdirSync(opts.fixtureCwd, { recursive: true });
+      ctx.fixtureCwd = opts.fixtureCwd;
+    } else {
+      ctx.fixtureCwd = mkdtempSync(join(tmpdir(), "qontinui-uibridge-fixtures-"));
+      ctx.ownedCwd = ctx.fixtureCwd;
+    }
+  } catch (e) {
+    refuseAll(`could not create the fixture cwd: ${e}`);
+    return;
+  }
+
+  const roster = await ensureRoster(ctx);
+  if (!roster.ok) {
+    refuseAll(roster.error);
+    return;
+  }
+
+  const fixtureCtx = {
+    pageId: view.view.pageId,
+    fixtureCwd: ctx.fixtureCwd,
+    build: ctx.build,
+    spawnedTerminals: ctx.spawnedTerminals,
+  };
   note(
-    `fixtures: cwd ${opts.fixtureCwd}; page ${page.pageId} (${page.source}); ` +
-      `accounts ${accounts.join(", ")}`,
+    `fixtures: cwd ${ctx.fixtureCwd}; page ${view.view.pageId} (get-zone-view-state, layout ` +
+      `${view.view.layoutId ?? "?"}); accounts ${accounts.join(", ")}; launch: bare 'claude', account-pinned`,
   );
 
   const specs = [
@@ -1244,23 +1302,17 @@ async function createFixtures(ctx) {
     { taskName: "uibridge-fixture-b", account: accounts[singleAccount ? 0 : 1] },
     { taskName: "uibridge-fixture-c", account: accounts[0] },
   ];
-  // Snapshot BEFORE creating anything, so a fixture that fails partway can be
-  // torn down. A failed fixture otherwise leaves a terminal and/or a durable
-  // record behind, and the NEXT run's T0.1 emptiness gate then refuses to build
-  // anything at all -- one orphaned record aborted the following run entirely
-  // (observed 2026-08-20). Cleaning up after ourselves keeps a single bad run
-  // from poisoning the suite until someone clears it by hand.
-  const beforeTerminals = new Set(((await fetchTerminals()).terminals || []).map((t) => t.id));
-  const beforeRecords = new Set(
-    ((await fetchRestoreHealth()).sessions || []).map((x) => x.claudeSessionId),
-  );
   const created = [];
   const problems = [];
+  const failedTerminals = [];
   const gatesAnswered = new Set();
+  const keysSent = [];
   for (const spec of specs) {
     const r = await spawnFixtureSession(spec, fixtureCtx);
+    keysSent.push(...(r.keys ?? []));
     if (!r.ok) {
       problems.push(r.error);
+      if (r.terminalId) failedTerminals.push(String(r.terminalId));
       continue;
     }
     for (const g of r.gatesAnswered ?? []) gatesAnswered.add(g);
@@ -1268,166 +1320,108 @@ async function createFixtures(ctx) {
   }
   ctx.fixtures = created;
 
-  if (problems.length > 0) {
-    const keepTerminals = new Set(created.map((x) => x.terminalId));
-    const keepSessions = new Set(created.map((x) => x.session.identity?.claudeSessionId));
-    const nowTerminals = await fetchTerminals();
-    const strayTerminals = nowTerminals.ok
-      ? nowTerminals.terminals
-          .map((t) => t.id)
-          .filter((id) => !beforeTerminals.has(id) && !keepTerminals.has(id))
-      : [];
-    for (const id of strayTerminals) {
-      await getJson(`/terminals/${encodeURIComponent(id)}`, { method: "DELETE" });
-    }
-    const nowRecords = await fetchRestoreHealth();
-    const strayRecords = nowRecords.ok
-      ? nowRecords.sessions
-          .map((x) => x.claudeSessionId)
-          .filter((sid) => !beforeRecords.has(sid) && !keepSessions.has(sid))
-      : [];
-    for (const sid of strayRecords) {
-      await invokeTauri("terminal_session_record_close", {
-        claudeSessionId: sid,
-        reason: "orphaned by a failed uibridge fixture",
-      });
-    }
-    if (strayTerminals.length > 0 || strayRecords.length > 0) {
-      note(
-        `cleaned up after failed fixture(s): ${strayTerminals.length} terminal(s), ` +
-          `${strayRecords.length} durable record(s)`,
-      );
-    }
+  // A failed fixture's terminal is torn down NOW: left up, it is a foreign
+  // zone to every later arm, and its record poisons the next run's T0.1.
+  if (failedTerminals.length > 0) {
+    const t = await deleteAndAwaitRetire(failedTerminals, []);
+    for (const id of failedTerminals) ctx.spawnedTerminals.delete(id);
+    note(
+      `cleaned up after failed fixture(s): DELETEd ${failedTerminals.length} terminal(s)` +
+        (t.residue.length
+          ? `; RESIDUE still open: ${t.residue.join(", ")}`
+          : "; no record left open") +
+        (t.deleteErrors.length ? `; ${t.deleteErrors.join("; ")}` : ""),
+    );
+    ctx.residue.push(...t.residue);
   }
   // Every automated answer is reported. A launch gate answered silently is a
   // decision made on the operator's behalf without a record of it.
   if (gatesAnswered.size > 0) {
-    note(`answered first-run launch gate(s): ${[...gatesAnswered].join(", ")}`);
-  }
-
-  // Settle the zones, THEN re-record.
-  //
-  // Each fixture recorded the zone it held at ITS creation, but the layout is
-  // still growing at that point: terminal #2 turns `single` into `split` and
-  // #3 turns that into `quad`, and the frontend reflows the assignments each
-  // time. A per-fixture read therefore captures an index that is already
-  // stale when the next fixture lands — measured 2026-08-20, where all three
-  // records said zone 0 while the UI had them in 0, 1 and 2.
-  //
-  // Re-recording against the settled map is not a workaround bolted on here;
-  // it is the same move the product makes when a session is dragged between
-  // zones (TerminalPage's zone-move backstop re-records with the new index).
-  if (created.length > 0) {
-    // WAIT for the layout to finish growing before reading it. The frontend
-    // reflows asynchronously (re-sync -> auto-grow -> assign), so a read taken
-    // the instant the last fixture confirms still shows the pre-growth map —
-    // which is how the first attempt at this fix still recorded every fixture
-    // at zone 0 (measured 2026-08-20). Settled means: every fixture terminal
-    // has an assignment, and the assignments are distinct.
-    let settled = { ok: false, assignments: {}, error: "never read" };
-    const settleDeadline = Date.now() + FIXTURE_APPEAR_BUDGET_MS;
-    while (Date.now() < settleDeadline) {
-      settled = await readZoneAssignments(fixtureCtx.pageId, fixtureCtx.port);
-      if (settled.ok) {
-        const zones = created.map((c) => zoneIndexOf(settled.assignments, c.terminalId));
-        if (zones.every((z) => z !== null) && new Set(zones).size === zones.length) break;
-      }
-      await sleep(FIXTURE_POLL_INTERVAL_MS);
-    }
     note(
-      `zone layout after settle: layoutId=${settled.layoutId ?? "?"} ` +
-        `assignments=${JSON.stringify(settled.assignments ?? {})} ` +
-        `fixtures=${JSON.stringify(created.map((c) => ({ t: c.terminalId, z: c.zoneIndex })))}` +
-        (settled.ok ? "" : ` (read failed: ${settled.error})`),
+      `answered first-run launch gate(s): ${[...gatesAnswered].join(", ")}; keys ${keysSent.join(", ")}`,
     );
-    if (settled.ok) {
-      for (const c of created) {
-        const zone = zoneIndexOf(settled.assignments, c.terminalId);
-        // Compare against the DURABLE value, not against the index this script
-        // intended to write. Something between the pre-confirmation record and
-        // here resets `zone_index` to 0 — the SessionStart hook preserves a
-        // prior record's zone (`record_session_open_into`), so a record it
-        // creates FIRST is the likely resetter, but the harness does not need
-        // to know which writer won: it needs the record to end up agreeing with
-        // the rendered grid. Comparing intent-to-intent skipped every
-        // re-record while the stored zone was still 0 (measured 2026-08-20:
-        // the settle read was correct and the fixtures already carried
-        // z=0,1,2, yet all three records read 0).
-        const stored = c.session.placement?.zoneIndex ?? null;
-        if (zone === null || zone === stored) continue;
-        const ident = c.session.identity ?? {};
-        const rr = await invokeTauri("terminal_session_record_open", {
-          claudeSessionId: ident.claudeSessionId,
-          configDir: c.session.account?.configDir,
-          workingDir: c.session.placement?.workingDir,
-          pageId: fixtureCtx.pageId,
-          zoneIndex: zone,
-          title: c.spec.taskName,
-          terminalId: c.terminalId,
-          origin: "authoritative",
-          provider: "claude",
-        });
-        if (rr.ok) c.zoneIndex = zone;
-        else problems.push(`${c.spec.taskName}: re-record to zone ${zone}: ${rr.error}`);
-      }
-      // Re-read so T0.2 asserts on the durable record, not on local state.
-      const after = await fetchSessionsInfo();
-      if (after.ok && after.status === "ok") {
-        for (const c of created) {
-          const fresh = after.sessions.find(
-            (x) => x.identity?.claudeSessionId === c.session.identity?.claudeSessionId,
-          );
-          if (fresh) c.session = fresh;
-        }
-      }
-    } else {
-      problems.push(`could not read the settled zone layout: ${settled.error}`);
-    }
   }
 
-  const zones = new Set(created.map((c) => c.session.placement?.zoneIndex));
+  // T0.2 is FIXTURE CONSTRUCTION: the RENDERED zones (the grid's assignments)
+  // are distinct. The RECORDED zone is not re-written here (plan D6) — T1
+  // keeps that product claim, and fails honestly while it does not hold.
+  let renderedZones = created.map(() => null);
+  let lastView = view;
+  const settleDeadline = Date.now() + FIXTURE_APPEAR_BUDGET_MS;
+  while (created.length > 0 && Date.now() < settleDeadline) {
+    lastView = await fetchZoneViewState(ctx.build);
+    if (lastView.ok) {
+      renderedZones = created.map((c) => zoneIndexOf(lastView.view.assignments, c.terminalId));
+      if (
+        renderedZones.every((z) => z !== null) &&
+        new Set(renderedZones).size === created.length
+      ) {
+        break;
+      }
+    }
+    await sleep(FIXTURE_POLL_INTERVAL_MS);
+  }
+  created.forEach((c, i) => {
+    if (renderedZones[i] !== null) c.zoneIndex = renderedZones[i];
+  });
+  const refreshed = await fetchSessionsInfo();
+  if (refreshed.ok && refreshed.status === "ok") {
+    for (const c of created) {
+      const fresh = refreshed.sessions.find(
+        (x) => x.identity?.claudeSessionId === c.session.identity?.claudeSessionId,
+      );
+      if (fresh) c.session = fresh;
+    }
+  }
+  const zones = new Set(renderedZones.filter((z) => z !== null));
   const accountLabels = new Set(created.map((c) => c.session.account?.label).filter(Boolean));
+  const zoneText = created
+    .map((c, i) => `${c.spec.taskName}=zone ${renderedZones[i] ?? "?"}`)
+    .join(", ");
   if (problems.length || created.length !== 3) {
+    fail("T0.2", T02_WHAT, [`created ${created.length}/3`, ...problems].join("\n"));
+  } else if (zones.size !== 3 || renderedZones.some((z) => z === null)) {
     fail(
       "T0.2",
-      "three fixture sessions across >=2 Claude accounts, in distinct zones",
-      [`created ${created.length}/3`, ...problems].join("\n"),
+      T02_WHAT,
+      `rendered zones were ${zoneText} — not three distinct zones` +
+        (lastView.ok ? "" : ` (last get-zone-view-state read failed: ${lastView.error})`),
     );
-  } else if (zones.size !== 3) {
-    fail(
+  } else if (accountLabels.size < 2 && singleAccount) {
+    skip(
       "T0.2",
-      "three fixture sessions across >=2 Claude accounts, in distinct zones",
-      `zone indices were ${[...zones].join(", ")} — not three distinct zones`,
+      T02_WHAT,
+      `only ONE account was supplied (--accounts ${accounts[0]}), so the >=2-account half cannot be ` +
+        `posed here. The rest held: 3/3 fixtures, rendered zones ${[...zones].join(",")}, account ` +
+        `label ${[...accountLabels].join(",") || "?"}. Supply a second roster account to evaluate it.`,
     );
   } else if (accountLabels.size < 2) {
     fail(
       "T0.2",
-      "three fixture sessions across >=2 Claude accounts, in distinct zones",
-      `only ${accountLabels.size} distinct account label(s) observed: ${[...accountLabels].join(", ")}`,
+      T02_WHAT,
+      `--accounts named ${accounts.length} accounts (${accounts.join(", ")}), but only ` +
+        `${accountLabels.size} distinct account label(s) were observed: ${[...accountLabels].join(", ") || "none"}`,
     );
   } else {
     pass(
       "T0.2",
-      "three fixture sessions across >=2 Claude accounts, in distinct zones",
-      `zones ${[...zones].join(",")}; accounts ${[...accountLabels].join(",")}`,
+      T02_WHAT,
+      `rendered zones ${[...zones].join(",")} (${zoneText}); accounts ${[...accountLabels].join(",")}`,
     );
   }
 
   // Step 3 — a trivial prompt each, so every fixture has a real transcript and
-  // a `confirmed_at`. Trivial on purpose: cost near-nothing, finish fast.
-  // Submit the prompt, then assert what the name PROMISES. This used to assert
-  // only that the POST returned 200, which is not evidence of either half: a
-  // transcript exists only once the provider has written a conversation to
-  // disk, and `confirmed_at` is set only by its SessionStart hook. Both are
+  // a `confirmed_at`. A plain one-word reply: measured finishing in 2-3 s with
+  // no tool call, so it can never park at a permission dialog. Both halves are
   // read back from `/control/sessions/restore-health`, which reports them per
-  // open record.
+  // open record — a 200 from submit-prompt is evidence of neither.
   const promptFindings = [];
   for (const c of created) {
     const tid = c.session.identity.terminalId;
     const sid = c.session.identity.claudeSessionId;
     const r = await getJson(`/terminals/${encodeURIComponent(tid)}/submit-prompt`, {
       method: "POST",
-      body: { message: "echo uibridge-fixture-ready" },
+      body: { message: FIXTURE_PROMPT },
     });
     if (!r.ok) {
       promptFindings.push({ ok: false, detail: `submit-prompt to ${tid}: ${r.error}` });
@@ -1563,12 +1557,12 @@ async function runT0(ctx) {
 
   if (!ctx.opts.fixture) {
     const why = "--fixture not given (default is a non-mutating run)";
-    skip("T0.2", "three fixture sessions across >=2 Claude accounts, in distinct zones", why);
+    skip("T0.2", T02_WHAT, why);
     skip("T0.3", "a trivial prompt in each fixture session (transcript + confirmed_at)", why);
     skip("T0.4", "one operator-renamed session and one Claude-derived one", why);
   } else if (!ctx.gates.empty || !ctx.gates.notSelfHosted) {
     const why = "the T0 gates did not hold — fixture creation is aborted (plan §0/R4)";
-    skip("T0.2", "three fixture sessions across >=2 Claude accounts, in distinct zones", why);
+    skip("T0.2", T02_WHAT, why);
     skip("T0.3", "a trivial prompt in each fixture session (transcript + confirmed_at)", why);
     skip("T0.4", "one operator-renamed session and one Claude-derived one", why);
   } else {
@@ -2874,6 +2868,68 @@ async function runHonestyAssertions(ctx) {
 }
 
 // ===========================================================================
+// Teardown — state-neutral, verified by read-back
+// ===========================================================================
+
+/**
+ * Leave the target as found: DELETE every terminal this run created, wait for
+ * each owned record to leave the open set (residue is NAMED), restore a
+ * `--seed-roster` change to the exact prior roster and read it back, and
+ * remove a fixture cwd this run created. Recorded as T0.6 whenever this run
+ * changed anything, so residue is a FAIL row rather than a log line.
+ */
+async function teardown(ctx) {
+  const touched =
+    ctx.spawnedTerminals.size > 0 ||
+    (ctx.fixtures ?? []).length > 0 ||
+    ctx.rosterSeed !== null ||
+    ctx.ownedCwd !== null ||
+    ctx.residue.length > 0;
+  if (!touched) return;
+  section("Teardown");
+  const what = "teardown: fixtures deleted, their records left the open set, the roster restored";
+  const problems = [];
+  const done = [];
+
+  const sessionIds = (ctx.fixtures ?? [])
+    .map((f) => f.session?.identity?.claudeSessionId)
+    .filter(Boolean);
+  if (ctx.spawnedTerminals.size > 0 || sessionIds.length > 0) {
+    const t = await deleteAndAwaitRetire(ctx.spawnedTerminals, sessionIds);
+    done.push(`${t.deleted} terminal(s) DELETEd; open set re-read for ${Math.round(t.ms / 1000)}s`);
+    problems.push(...t.deleteErrors);
+    if (t.readError) problems.push(`restore-health unreadable at the end: ${t.readError}`);
+    if (t.residue.length) problems.push(`RESIDUE still open: ${t.residue.join(", ")}`);
+  }
+  if (ctx.residue.length) problems.push(`RESIDUE from failed fixtures: ${ctx.residue.join(", ")}`);
+
+  if (ctx.rosterSeed) {
+    const r = await putRoster(ctx.rosterSeed.prior);
+    if (!r.ok) problems.push(`roster restore: ${r.error}`);
+    else if (!sameRoster(r.dirs, ctx.rosterSeed.prior)) {
+      problems.push(
+        `roster restore read back ${r.dirs.join(", ") || "EMPTY"}, not the prior ` +
+          `${ctx.rosterSeed.prior.join(", ") || "EMPTY"}`,
+      );
+    } else {
+      done.push(`roster restored to ${ctx.rosterSeed.prior.join(", ") || "EMPTY"} (read back)`);
+    }
+  }
+
+  if (ctx.ownedCwd) {
+    try {
+      rmSync(ctx.ownedCwd, { recursive: true, force: true });
+      done.push(`removed fixture cwd ${ctx.ownedCwd}`);
+    } catch (e) {
+      problems.push(`could not remove fixture cwd ${ctx.ownedCwd}: ${e?.message ?? e}`);
+    }
+  }
+
+  if (problems.length) fail("T0.6", what, [...problems, ...done].join("\n"));
+  else pass("T0.6", what, done.join("; "));
+}
+
+// ===========================================================================
 // Reporting
 // ===========================================================================
 
@@ -2965,12 +3021,27 @@ async function main() {
   );
   console.log(`  /health       ${health.status} in ${health.ms}ms`);
 
-  const ctx = { opts, gates: { empty: false, notSelfHosted: false }, oracle: null };
+  const ctx = {
+    opts,
+    build: String(buildId),
+    gates: { empty: false, notSelfHosted: false },
+    oracle: null,
+    // Every terminal this run POSTed, and residue no cleanup could retire.
+    spawnedTerminals: new Set(),
+    residue: [],
+    rosterSeed: null,
+    fixtureCwd: null,
+    ownedCwd: null,
+  };
 
-  await runT0(ctx);
-  await runDropdownAssertions(ctx);
-  await runRestoreAssertions(ctx);
-  await runHonestyAssertions(ctx);
+  try {
+    await runT0(ctx);
+    await runDropdownAssertions(ctx);
+    await runRestoreAssertions(ctx);
+    await runHonestyAssertions(ctx);
+  } finally {
+    await teardown(ctx);
+  }
 
   return report(opts);
 }

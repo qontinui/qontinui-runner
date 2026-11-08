@@ -52,6 +52,7 @@ import {
   planMaximizeZone,
   planToggleMaximizeZone,
   buildMaximizeResult,
+  buildZoneViewState,
 } from "./zone-grid/maximizeActions";
 import {
   applyWorkModeRequest,
@@ -259,6 +260,7 @@ function TerminalPageInner({
     setMaximizedZone: zoneLayout.setMaximizedZone,
     layoutId: zoneLayout.layoutId,
     workMode: zoneLayout.workMode,
+    pageId,
   });
   useEffect(() => {
     zoneMaximizeRef.current = {
@@ -267,6 +269,7 @@ function TerminalPageInner({
       setMaximizedZone: zoneLayout.setMaximizedZone,
       layoutId: zoneLayout.layoutId,
       workMode: zoneLayout.workMode,
+      pageId,
     };
   }, [
     zoneLayout.maximizedZone,
@@ -274,6 +277,7 @@ function TerminalPageInner({
     zoneLayout.setMaximizedZone,
     zoneLayout.layoutId,
     zoneLayout.workMode,
+    pageId,
   ]);
 
   // Plan `2026-10-11-runner-terminal-tmux-work-mode`, Phase 4 — the work-mode
@@ -530,15 +534,25 @@ function TerminalPageInner({
         id: "get-zone-view-state",
         label: "Get Zone View State",
         description:
-          "Return { maximizedZone, zoneCount, layoutId } — the read that lets a caller assert the maximized view without inferring it from a DOM snapshot.",
-        // `read` — a query.
+          "Return { maximizedZone, zoneCount, layoutId, pageId, assignments, workMode } — the read that lets a caller assert the maximized view without inferring it from a DOM snapshot. `pageId` is the terminal page this view shows (a terminal created with that `page_id` mounts here); `assignments` is the grid's zone map, zone index → terminal id; `workMode` is 'grid' or 'tmux' (in tmux one viewport is not a grid).",
+        // `read` — a query. It is the eval-free door to the page id and the
+        // zone map: a page-evaluate read of the persisted keys is refused by
+        // the webview CSP (`script-src 'self'`), so the session-info oracle
+        // (`scripts/uibridge-session-info.test.mjs`) builds its fixtures from
+        // this envelope. `assignments` is read from `assignmentsRef` at
+        // invocation — the map `recordSessionOpen` resolves zones from — not
+        // duplicated into `zoneMaximizeRef`.
         effect: "read",
         signature: GET_ZONE_VIEW_STATE_SIGNATURE,
-        handler: () => ({
-          maximizedZone: zoneMaximizeRef.current.maximizedZone,
-          zoneCount: zoneMaximizeRef.current.zoneCount,
-          layoutId: zoneMaximizeRef.current.layoutId,
-        }),
+        handler: () =>
+          buildZoneViewState({
+            maximizedZone: zoneMaximizeRef.current.maximizedZone,
+            zoneCount: zoneMaximizeRef.current.zoneCount,
+            layoutId: zoneMaximizeRef.current.layoutId,
+            pageId: zoneMaximizeRef.current.pageId,
+            assignments: assignmentsRef.current,
+            workMode: zoneMaximizeRef.current.workMode,
+          }),
       },
       // ── tmux work mode, drivable and assertable ──
       //

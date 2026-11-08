@@ -13,6 +13,13 @@
  * Phase 3 (D3: the self-hosting gate resolves the TARGET runner's own pid from
  * the OS and fails closed; D4: T10 kills the pid the gate resolved and nothing
  * else). Later phases add their exports below the sections here.
+ *
+ * Phase 4 (D5-D7): eval-free fixtures — the PTY-buffer decoder, the launch-gate
+ * menu answerer, the `POST /terminals` body, the restore-health session-id
+ * picker, the `get-zone-view-state` parser, the account-roster check and the
+ * spawn-admission retry classifier. Nothing here, or in the oracle, reaches the
+ * webview's script-evaluation door or the Tauri global: the exe-mode CSP
+ * (`script-src 'self'`) refuses string eval, and a static test pins that.
  */
 
 // ===========================================================================
@@ -549,4 +556,561 @@ export async function killTargetRunner(
     detail: `killed target runner pid ${plan.pid} with SIGKILL (${plan.detail}; no tree flag, nothing else touched)`,
     plan,
   };
+}
+
+// ===========================================================================
+// Phase 4 — the PTY buffer, decoded for a human-shaped read
+// ===========================================================================
+
+/**
+ * Decode a terminal's raw output into the text a person would read, for gate
+ * matching. `GET /terminals/{id}/buffer` serves the PTY bytes; Claude Code's
+ * TUI paints menus with cursor-column moves (`ESC[<n>G`) instead of spaces and
+ * redraws a moved cursor with `ESC[<n>C`, so each of those becomes ONE space
+ * BEFORE every other escape sequence is stripped. Without that, the prompt
+ * reads `Isthisaproject…` and a redraw glues options together.
+ *
+ * Also drops OSC sequences (`ESC ] … BEL`, the shell-integration marks and
+ * window titles), charset selects, `ESC 7`/`ESC 8`, carriage returns and other
+ * C0 controls except `\n` and `\t`.
+ *
+ * @param {string} raw
+ * @returns {string}
+ */
+export function terminalBufferText(raw) {
+  if (typeof raw !== "string") return "";
+  return (
+    raw
+      // eslint-disable-next-line no-control-regex
+      .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "")
+      // eslint-disable-next-line no-control-regex
+      .replace(/\x1b\[\d*[GC]/g, " ")
+      // eslint-disable-next-line no-control-regex
+      .replace(/\x1b\[[0-9;?<>=]*[ -/]*[@-~]/g, "")
+      // eslint-disable-next-line no-control-regex
+      .replace(/\x1b[()][0-9A-Za-z]/g, "")
+      // eslint-disable-next-line no-control-regex
+      .replace(/\x1b[78=>]/g, "")
+      // eslint-disable-next-line no-control-regex
+      .replace(/[\x00-\x08\x0b-\x1f\x7f]/g, "")
+  );
+}
+
+// ===========================================================================
+// Phase 4 — launch gates, answered by label and verified before Enter (D7)
+// ===========================================================================
+
+/**
+ * Build a whitespace-TOLERANT matcher from a readable phrase. A TUI paints
+ * with cursor positioning, so even after `terminalBufferText` a phrase may
+ * arrive with no spaces or with several; `\s*` between words absorbs both.
+ *
+ * @param {string} phrase
+ * @returns {RegExp}
+ */
+export function gatePhrase(phrase) {
+  const escaped = phrase.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(escaped.trim().split(/\s+/).join("\\s*"), "i");
+}
+
+/** The menu's cursor glyph (Claude Code v2.1.319). */
+export const MENU_CURSOR = "❯";
+/** Down / Up arrow, as the PTY receives them. */
+export const KEY_DOWN = "\x1b[B";
+export const KEY_UP = "\x1b[A";
+export const KEY_ENTER = "\r";
+
+/**
+ * The first-run gates a real `claude` opens before its session starts — and so
+ * before its SessionStart hook can confirm anything. Each is answered BY LABEL:
+ * the options are listed in render order, `target` is the one chosen, and the
+ * answerer verifies the cursor sits on `target` before it sends Enter. A key
+ * that picks by position could choose `No, exit`.
+ *
+ * Measured on Claude Code v2.1.319 (plan Phase 1, coord finding 898efce4):
+ * no option numbers are shown; trust opens with the cursor on `No, exit`, the
+ * MCP menu with it already on `Continue without using this MCP server`.
+ */
+export const KNOWN_LAUNCH_GATES = [
+  {
+    id: "folder-trust",
+    match: gatePhrase("Is this a project you created or one you trust"),
+    options: ["No, exit", "Yes, I trust this folder"],
+    target: "Yes, I trust this folder",
+    why: "the fixture cwd is a directory this script created, so trusting it is not a judgement about code the operator has not seen",
+  },
+  {
+    id: "mcp-server",
+    match: gatePhrase("New MCP server found in this project"),
+    options: [
+      "Use this MCP server",
+      "Use this and all future MCP servers in this project",
+      "Continue without using this MCP server",
+    ],
+    target: "Continue without using this MCP server",
+    why: "declining loads no server and judges no code",
+  },
+];
+
+/** Gates this script REFUSES to answer, with the reason it gives the operator. */
+export const REFUSED_LAUNCH_GATES = [
+  {
+    id: "external-claude-md-imports",
+    match: gatePhrase("Allow external CLAUDE.md file imports"),
+    why: "answering it would approve loading files from OUTSIDE the cwd, which is a security decision belonging to the operator rather than to a test. Use the default --fixture-cwd (a fresh temp dir), which never opens this gate.",
+  },
+];
+
+/** Whitespace-free, lowercased — compares a label however the TUI spaced it. */
+const squash = (s) =>
+  String(s ?? "")
+    .replace(/\s+/g, "")
+    .toLowerCase();
+
+/** Index just past the LAST match of `re` in `text`, or -1. */
+function lastMatchEnd(text, re) {
+  const g = new RegExp(re.source, re.flags.includes("g") ? re.flags : `${re.flags}g`);
+  let end = -1;
+  for (let m = g.exec(text); m !== null; m = g.exec(text)) {
+    end = m.index + m[0].length;
+    if (m[0].length === 0) g.lastIndex++;
+  }
+  return end;
+}
+
+/**
+ * A refused gate open in `tail`, or null. One a caller has already recorded
+ * as handled is skipped.
+ *
+ * @param {string} tail decoded buffer tail (`terminalBufferText`)
+ * @param {Set<string>} [answered]
+ * @returns {{id:string, why:string}|null}
+ */
+export function refusedGateIn(tail, answered = new Set()) {
+  for (const gate of REFUSED_LAUNCH_GATES) {
+    if (answered.has(gate.id)) continue;
+    if (gate.match.test(String(tail ?? ""))) return { id: gate.id, why: gate.why };
+  }
+  return null;
+}
+
+/**
+ * Decide the keys that answer `gate` from the decoded buffer tail. Pure.
+ *
+ * Reads the menu's LAST render — the text after the final occurrence of the
+ * gate's title — and the LAST cursor glyph in it: a redraw after an arrow key
+ * appends a partial line such as `  No, exit ❯ Yes, I trust this folder`, so
+ * the last glyph is where the cursor is now.
+ *
+ * Returns:
+ * - `{action:"none", reason}` — the gate is not showing, the caller already
+ *   answered it (`answered`), or a later known gate's title follows it (it is
+ *   scrollback, and re-answering would type into a live session);
+ * - `{action:"confirm", keys:[Enter]}` — the cursor is on `target`;
+ * - `{action:"move", keys:[Down|Up …]}` — arrows that bring the cursor to
+ *   `target`; the caller sends them, re-reads, and plans again with
+ *   `afterMove: true`;
+ * - `{action:"refuse", reason}` — the menu is not the one we know (an option
+ *   missing, no cursor, the cursor on an unknown line), or — after a move — the
+ *   cursor is not on `target`. Nothing is guessed.
+ *
+ * @param {string} tail
+ * @param {{id:string, match:RegExp, options:string[], target:string}} gate
+ * @param {{answered?: Set<string>, afterMove?: boolean, laterGates?: {match:RegExp}[]}} [opts]
+ */
+export function planMenuAnswer(tail, gate, opts = {}) {
+  const answered = opts.answered ?? new Set();
+  const text = String(tail ?? "");
+  if (answered.has(gate.id)) return { action: "none", reason: `${gate.id} already answered` };
+  const titleEnd = lastMatchEnd(text, gate.match);
+  if (titleEnd < 0) return { action: "none", reason: `${gate.id} is not showing` };
+
+  const others = (opts.laterGates ?? KNOWN_LAUNCH_GATES).filter((g) => g.id !== gate.id);
+  const region = text.slice(titleEnd);
+  for (const other of others) {
+    if (other.match.test(region)) {
+      return {
+        action: "none",
+        reason: `${gate.id} is scrollback: ${other.id ?? "a later gate"} was drawn after it`,
+      };
+    }
+  }
+
+  const sq = squash(region);
+  const missing = gate.options.filter((o) => !sq.includes(squash(o)));
+  if (missing.length) {
+    return {
+      action: "refuse",
+      reason: `${gate.id}: unrecognised menu — option(s) ${missing.map((o) => `'${o}'`).join(", ")} not rendered after the title`,
+    };
+  }
+  const at = region.lastIndexOf(MENU_CURSOR);
+  if (at < 0) {
+    return { action: "refuse", reason: `${gate.id}: unrecognised menu — no ${MENU_CURSOR} cursor` };
+  }
+  const line = region.slice(at + MENU_CURSOR.length).split("\n")[0];
+  const lineSq = squash(line).replace(/^\d+\./, "");
+  // Longest label first, so a label that prefixes another cannot shadow it.
+  const byLength = gate.options
+    .map((o, i) => ({ o, i }))
+    .sort((a, b) => squash(b.o).length - squash(a.o).length);
+  const hit = byLength.find(({ o }) => lineSq.startsWith(squash(o)));
+  if (!hit) {
+    return {
+      action: "refuse",
+      reason: `${gate.id}: unrecognised menu — the cursor is on '${line.trim()}', which is none of ${gate.options.map((o) => `'${o}'`).join(", ")}`,
+    };
+  }
+  const targetIdx = gate.options.indexOf(gate.target);
+  const delta = targetIdx - hit.i;
+  if (delta === 0) return { action: "confirm", keys: [KEY_ENTER], cursor: hit.o };
+  if (opts.afterMove) {
+    return {
+      action: "refuse",
+      reason: `${gate.id}: after the arrow keys the cursor is on '${hit.o}', not '${gate.target}' — Enter withheld`,
+    };
+  }
+  return {
+    action: "move",
+    keys: Array(Math.abs(delta)).fill(delta > 0 ? KEY_DOWN : KEY_UP),
+    cursor: hit.o,
+  };
+}
+
+// ===========================================================================
+// Phase 4 — fixture spawn (D5, Phase 1 spelling M1)
+// ===========================================================================
+
+/**
+ * The `POST /terminals` body for one fixture, in Phase 1's measured spelling
+ * M1: a bare `claude`, account-pinned by the runner. The runner validates
+ * `account` against its roster (400 not in roster, 409 not logged in), seeds
+ * `CLAUDE_CONFIG_DIR` and derives workspace trust for it; its identity seam
+ * pins and records the session at spawn, so each terminal yields exactly one
+ * authoritative, account-labelled record whose id is read back from
+ * restore-health by `terminalId`.
+ *
+ * M2 (`claude --session-id <uuid>`) is deliberately NOT offered: it leaves a
+ * superseded phantom row whose record outlives `DELETE` by ~163 s
+ * (coord finding 898efce4).
+ *
+ * @param {{pageId:string, title:string, fixtureCwd:string, account:string}} input
+ */
+export function buildFixtureTerminalRequest({ pageId, title, fixtureCwd, account }) {
+  return {
+    page_id: pageId,
+    title,
+    working_dir: fixtureCwd,
+    account,
+    initial_command: "claude",
+  };
+}
+
+/**
+ * Pick a fixture's Claude session id from `/control/sessions/restore-health`
+ * rows (the default, open-rows-only view) by its terminal. Pure.
+ *
+ * - one row → `{ok:true, sessionId, row}`;
+ * - none → `{ok:false, pending:true}` — the seam has not recorded it yet;
+ * - two or more → `{ok:false, pending:false}` naming them: M1 yields one record
+ *   per terminal, so two is a defect to report, never a coin toss.
+ *
+ * @param {object[]} rows
+ * @param {string} terminalId
+ */
+export function pickFixtureSessionId(rows, terminalId) {
+  const mine = (Array.isArray(rows) ? rows : []).filter(
+    (r) => r && String(r.terminalId) === String(terminalId) && r.claudeSessionId,
+  );
+  if (mine.length === 1)
+    return { ok: true, sessionId: String(mine[0].claudeSessionId), row: mine[0] };
+  if (mine.length === 0) {
+    return {
+      ok: false,
+      pending: true,
+      error: `no restore-health record names terminal ${terminalId} yet`,
+    };
+  }
+  return {
+    ok: false,
+    pending: false,
+    error:
+      `${mine.length} open records name terminal ${terminalId} ` +
+      `(${mine.map((r) => `${r.claudeSessionId} origin=${r.origin ?? "?"} confirmed=${r.confirmed ?? "?"}`).join("; ")}) — ` +
+      `expected exactly one`,
+  };
+}
+
+/**
+ * Parse the `terminal-page` `get-zone-view-state` action result. Pure.
+ *
+ * Fixture creation needs `pageId` (where a `POST /terminals` terminal mounts),
+ * `assignments` (the grid zone map the rendered zone is read from) and
+ * `workMode`. A build that serves none of them predates plan
+ * `2026-11-08-tenant-badge-parity-and-oracle-fixtures` Phase 4, and the old
+ * fallbacks (a `default` page guess, an evaluated `localStorage` read) are not
+ * taken: an absent field is UNKNOWN, and fixture creation is refused naming the
+ * build.
+ *
+ * Also refuses tmux work mode: one viewport is not a grid, so "distinct
+ * rendered zones" cannot be posed there.
+ *
+ * @param {unknown} data the action's result (unwrapped)
+ * @param {string} build the runner build id, for the refusal text
+ */
+export function parseZoneViewState(data, build) {
+  const d = data && typeof data === "object" ? /** @type {any} */ (data) : null;
+  if (!d) {
+    return { ok: false, error: `get-zone-view-state returned no object (runner build ${build})` };
+  }
+  const missing = [];
+  if (typeof d.pageId !== "string" || d.pageId.trim() === "") missing.push("pageId");
+  if (!d.assignments || typeof d.assignments !== "object" || Array.isArray(d.assignments)) {
+    missing.push("assignments");
+  }
+  if (d.workMode !== "grid" && d.workMode !== "tmux") missing.push("workMode");
+  if (missing.length) {
+    return {
+      ok: false,
+      error:
+        `get-zone-view-state carries no ${missing.join(", ")} — runner build ${build} predates ` +
+        `plan 2026-11-08-tenant-badge-parity-and-oracle-fixtures Phase 4, so fixture creation is ` +
+        `refused (no page guess, no evaluated localStorage read)`,
+    };
+  }
+  /** @type {Record<number,string>} */
+  const assignments = {};
+  for (const [k, v] of Object.entries(d.assignments)) {
+    if (/^\d+$/.test(k) && typeof v === "string") assignments[Number(k)] = v;
+  }
+  const view = {
+    pageId: d.pageId,
+    assignments,
+    workMode: d.workMode,
+    zoneCount: Number.isInteger(d.zoneCount) ? d.zoneCount : null,
+    layoutId: typeof d.layoutId === "string" ? d.layoutId : null,
+    maximizedZone: Number.isInteger(d.maximizedZone) ? d.maximizedZone : null,
+  };
+  if (view.workMode === "tmux") {
+    return {
+      ok: false,
+      tmux: true,
+      view,
+      error:
+        `the terminal page is in tmux work mode — one viewport is not a grid, so fixtures cannot ` +
+        `be placed in distinct rendered zones. Switch the page to grid mode first.`,
+    };
+  }
+  return { ok: true, view };
+}
+
+/** The zone index the grid gives `terminalId`, or null. */
+export function zoneIndexOf(assignments, terminalId) {
+  for (const [zone, tid] of Object.entries(assignments ?? {})) {
+    if (String(tid) === String(terminalId)) return Number(zone);
+  }
+  return null;
+}
+
+// ===========================================================================
+// Phase 4 — the account roster (a supervisor temp runner starts EMPTY)
+// ===========================================================================
+
+/** Mirror of the runner's `derive_account_name` (`claude_session/federation.rs`). */
+export function deriveAccountName(configDir) {
+  const s = String(configDir ?? "");
+  const base = s.split(/[/\\]/).pop() ?? s;
+  const stripped = base.replace(/^\.+/, "");
+  const name = stripped.startsWith("claude-") ? stripped.slice("claude-".length) : "";
+  return name || "default";
+}
+
+/** Mirror of the runner's `resolve_from` matching (`ai_provider/account_usage.rs`). */
+export function accountInRoster(account, roster) {
+  const want = String(account ?? "").trim();
+  const dirs = Array.isArray(roster) ? roster : [];
+  if (!want) return false;
+  const lower = want.toLowerCase();
+  return dirs.some((d) => {
+    const dir = String(d);
+    const base = dir.split(/[/\\]/).pop() ?? dir;
+    return (
+      dir === want || deriveAccountName(dir).toLowerCase() === lower || base.toLowerCase() === lower
+    );
+  });
+}
+
+/**
+ * Plan the roster step before any fixture spawn. Pure.
+ *
+ * A supervisor temp runner starts with an EMPTY roster (measured: `{"dirs":[]}`,
+ * and `POST /terminals` with an account answers 400 `not in roster`). This
+ * decides what to do about the `--accounts` that do not resolve:
+ *
+ * - every account resolves → `{action:"none"}`;
+ * - some do not and `seedDirs` is empty → `{action:"refuse"}` naming them and
+ *   the opt-in flag (the roster is never changed unasked);
+ * - `--seed-roster` on the protected port (the primary) → `{action:"refuse"}`:
+ *   the operator's live roster is never edited by a test;
+ * - otherwise → `{action:"seed", next, prior}`: the union, prior first, so
+ *   teardown can restore `prior` exactly.
+ *
+ * @param {{current:string[], accounts:string[], seedDirs:string[], port:number, protectedPort:number}} input
+ */
+export function planRosterSeed({ current, accounts, seedDirs, port, protectedPort }) {
+  const roster = Array.isArray(current) ? current.map(String) : [];
+  const missing = (accounts ?? []).filter((a) => !accountInRoster(a, roster));
+  const shown = roster.length ? roster.map(deriveAccountName).join(", ") : "EMPTY";
+  if (missing.length === 0) return { action: "none", missing: [], prior: roster };
+  const seeds = (seedDirs ?? []).map(String).filter(Boolean);
+  if (seeds.length === 0) {
+    return {
+      action: "refuse",
+      missing,
+      prior: roster,
+      error:
+        `account(s) ${missing.join(", ")} are not in this runner's roster (${shown}). A supervisor ` +
+        `temp runner starts with an EMPTY roster. Re-run with --seed-roster <configDir>[,<configDir>…] ` +
+        `to add them for this run (each dir needs a projects/ subdirectory; the prior roster is restored ` +
+        `at teardown).`,
+    };
+  }
+  if (port === protectedPort) {
+    return {
+      action: "refuse",
+      missing,
+      prior: roster,
+      error:
+        `--seed-roster refused on port ${port}: that is the primary runner's port, and its roster is the ` +
+        `operator's live setting. Seed only a temp runner.`,
+    };
+  }
+  const next = [...roster];
+  for (const d of seeds) if (!next.includes(d)) next.push(d);
+  return { action: "seed", missing, prior: roster, next };
+}
+
+/**
+ * Check the roster the runner ACCEPTED after a seed `PUT`: the PUT silently
+ * drops a dir with no `projects/` subdirectory, so the read-back is the truth.
+ *
+ * @param {{accepted:string[], requested:string[], accounts:string[]}} input
+ */
+export function verifyRosterSeed({ accepted, requested, accounts }) {
+  const got = Array.isArray(accepted) ? accepted.map(String) : [];
+  const dropped = (requested ?? []).filter((d) => !got.includes(String(d)));
+  const unresolved = (accounts ?? []).filter((a) => !accountInRoster(a, got));
+  if (unresolved.length === 0) return { ok: true, dropped, unresolved };
+  return {
+    ok: false,
+    dropped,
+    unresolved,
+    error:
+      `after --seed-roster the runner's roster still lacks ${unresolved.join(", ")}` +
+      (dropped.length
+        ? `; it dropped ${dropped.join(", ")} (no projects/ subdirectory there)`
+        : "") +
+      ` — accepted roster: ${got.length ? got.join(", ") : "EMPTY"}`,
+  };
+}
+
+/** Same members, order ignored. */
+export function sameRoster(a, b) {
+  const x = [...new Set((a ?? []).map(String))].sort();
+  const y = [...new Set((b ?? []).map(String))].sort();
+  return x.length === y.length && x.every((v, i) => v === y[i]);
+}
+
+// ===========================================================================
+// Phase 4 — spawn admission (the runner's resource guard)
+// ===========================================================================
+
+/** Bounded backoff for a guard-refused spawn. */
+export const SPAWN_RETRY_BUDGET_MS = 120_000;
+export const SPAWN_RETRY_BASE_MS = 2_000;
+export const SPAWN_RETRY_CAP_MS = 15_000;
+
+/**
+ * Classify a `POST /terminals` answer. Pure.
+ *
+ * - 2xx → `{kind:"ok"}`;
+ * - 500 whose error names `resource_guard:` → `{kind:"admission", retry:true}`:
+ *   the runner's spawn admission refused for load (e.g.
+ *   `resource_guard:critical:thread_count: …`), which passes;
+ * - 400 `not in roster` → `{kind:"roster"}`;
+ * - 409 → `{kind:"not-logged-in"}`;
+ * - anything else → `{kind:"error"}`. Only `admission` is ever retried.
+ *
+ * @param {{status:number, ok?:boolean, text?:string, json?:any, error?:string|null}} res
+ */
+export function classifyTerminalSpawn(res) {
+  const status = Number(res?.status ?? 0);
+  const body =
+    typeof res?.json?.error === "string"
+      ? res.json.error
+      : typeof res?.text === "string"
+        ? res.text
+        : String(res?.error ?? "");
+  if (status >= 200 && status < 300) return { kind: "ok", retry: false, detail: "" };
+  if (status === 500 && /resource_guard:/.test(body)) {
+    return { kind: "admission", retry: true, detail: body.trim() };
+  }
+  if (status === 400 && /not in roster/i.test(body)) {
+    return { kind: "roster", retry: false, detail: body.trim() };
+  }
+  if (status === 409) return { kind: "not-logged-in", retry: false, detail: body.trim() };
+  return {
+    kind: "error",
+    retry: false,
+    detail: `HTTP ${status || "?"}${body ? `: ${body.trim()}` : ` (${res?.error ?? "no body"})`}`,
+  };
+}
+
+/**
+ * The next step after a refused spawn. Pure. `admissionVerdict` is `/health`
+ * `spawnAdmission.threads.verdict` as last read (reported, never trusted to
+ * skip a retry — the guard answered, so the guard decides).
+ *
+ * @param {{classification:{kind:string,retry:boolean,detail:string}, attempt:number, elapsedMs:number, budgetMs?:number, admissionVerdict?:string|null}} input
+ * @returns {{retry:true, delayMs:number} | {retry:false, reason:string}}
+ */
+export function planSpawnRetry({
+  classification,
+  attempt,
+  elapsedMs,
+  budgetMs = SPAWN_RETRY_BUDGET_MS,
+  admissionVerdict = null,
+}) {
+  if (!classification?.retry) {
+    return { retry: false, reason: classification?.detail ?? "not retryable" };
+  }
+  const delayMs = Math.min(SPAWN_RETRY_CAP_MS, SPAWN_RETRY_BASE_MS * 2 ** Math.max(0, attempt));
+  if (elapsedMs + delayMs > budgetMs) {
+    return {
+      retry: false,
+      reason:
+        `the runner's spawn admission kept refusing for ${Math.round(elapsedMs / 1000)}s ` +
+        `(${attempt + 1} attempt(s), budget ${Math.round(budgetMs / 1000)}s): ${classification.detail}` +
+        ` — /health spawnAdmission.threads.verdict=${admissionVerdict ?? "unread"}`,
+    };
+  }
+  return { retry: true, delayMs };
+}
+
+/**
+ * Which of the owned fixtures are still in the open set. Pure. Residue is
+ * NAMED — a record still open after cleanup is reported, never dropped.
+ *
+ * @param {object[]} openRows restore-health rows (open set)
+ * @param {{sessionIds:Set<string>, terminalIds:Set<string>}} owned
+ * @returns {string[]} `<session>@<terminal>` for each open owned row
+ */
+export function openResidue(openRows, owned) {
+  return (Array.isArray(openRows) ? openRows : [])
+    .filter(
+      (r) =>
+        owned.sessionIds.has(String(r?.claudeSessionId)) ||
+        owned.terminalIds.has(String(r?.terminalId)),
+    )
+    .map((r) => `${r.claudeSessionId}@${r.terminalId}`);
 }

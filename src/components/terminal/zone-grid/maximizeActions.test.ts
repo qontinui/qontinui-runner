@@ -5,6 +5,7 @@ import {
   planMaximizeZone,
   planToggleMaximizeZone,
   buildMaximizeResult,
+  buildZoneViewState,
 } from "./maximizeActions";
 
 /**
@@ -120,5 +121,68 @@ describe("maximize in tmux work mode", () => {
   it("grid mode plans as before", () => {
     expect(planMaximizeZone(1, 4, "grid")).toEqual({ ok: true, next: 1 });
     expect(planToggleMaximizeZone(1, 4, 1, "grid")).toEqual({ ok: true, next: null });
+  });
+});
+
+/**
+ * Plan `2026-11-08-tenant-badge-parity-and-oracle-fixtures`, Phase 4: the
+ * `get-zone-view-state` envelope carries `pageId`, `assignments` and
+ * `workMode`, which the session-info oracle builds its fixtures from instead of
+ * an evaluated `localStorage` read. Literal envelopes, not recomputed ones.
+ */
+describe("buildZoneViewState", () => {
+  it("returns every field, including pageId, assignments and workMode", () => {
+    expect(
+      buildZoneViewState({
+        maximizedZone: null,
+        zoneCount: 4,
+        layoutId: "quad",
+        pageId: "page-7",
+        assignments: { 0: "term-a", 1: "term-b", 2: "term-c" },
+        workMode: "grid",
+      }),
+    ).toEqual({
+      maximizedZone: null,
+      zoneCount: 4,
+      layoutId: "quad",
+      pageId: "page-7",
+      assignments: { 0: "term-a", 1: "term-b", 2: "term-c" },
+      workMode: "grid",
+    });
+  });
+
+  it("reports tmux work mode and a maximized zone as given", () => {
+    expect(
+      buildZoneViewState({
+        maximizedZone: 1,
+        zoneCount: 2,
+        layoutId: "split",
+        pageId: "default",
+        assignments: {},
+        workMode: "tmux",
+      }),
+    ).toEqual({
+      maximizedZone: 1,
+      zoneCount: 2,
+      layoutId: "split",
+      pageId: "default",
+      assignments: {},
+      workMode: "tmux",
+    });
+  });
+
+  it("copies the assignments, so the envelope cannot alias the live map", () => {
+    const live: Record<number, string> = { 0: "term-a" };
+    const env = buildZoneViewState({
+      maximizedZone: null,
+      zoneCount: 1,
+      layoutId: "single",
+      pageId: "p",
+      assignments: live,
+      workMode: "grid",
+    });
+    env.assignments[1] = "term-x";
+    expect(live).toEqual({ 0: "term-a" });
+    expect(env.assignments).not.toBe(live);
   });
 });
