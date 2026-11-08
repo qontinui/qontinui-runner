@@ -105,11 +105,16 @@ struct WireRow {
     session_status: Option<String>,
     /// When the work axis last genuinely transitioned (coord's
     /// `state_started_at`) — for a `finished` row, the honest `finished_at`.
-    /// RFC 3339. Absent on a coord that predates the field.
+    /// RFC 3339, or `null` when coord holds no transition time. coord has sent
+    /// the key since the route was created (qontinui-coord `0230dcabc`), so a
+    /// missing key means a malformed body; it reads as `None`.
     #[serde(default)]
     since: Option<String>,
-    /// WHICH `coord.sessions` row answered (the latest for the harness id —
-    /// the key is not unique). Absent on a coord that predates the field.
+    /// WHICH `coord.sessions` row answered: the one coord's pick order names
+    /// for the harness id, active first and then newest, because the key is
+    /// not unique. coord has always sent it as a non-null UUID
+    /// (qontinui-coord `0230dcabc`), so a missing or unparseable one means a
+    /// malformed body, settled as unresolved rather than guessed.
     #[serde(default)]
     coord_session_id: Option<String>,
 }
@@ -547,7 +552,8 @@ pub async fn fetch(ids: &[String]) -> StatusFetch {
 /// are kept apart because only one of them licenses minting a row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RowResolution {
-    /// coord has a row for this id; this is the latest one (adopt it).
+    /// coord has a row for this id, the one its pick order names (active
+    /// first, then newest); adopt it.
     Existing(uuid::Uuid),
     /// coord resolved NO session for this id in this tenant — the one answer
     /// that licenses minting a fresh row.
@@ -575,7 +581,7 @@ fn resolution_from_body(body: &WireResponse, csid: &str) -> RowResolution {
             Some(id) => RowResolution::Existing(id),
             None => RowResolution::Unresolved(
                 "coord answered a row without a parseable coord_session_id \
-                 (a coord that predates the field)"
+                 (coord always sends one, so the body is malformed)"
                     .to_string(),
             ),
         };
@@ -608,18 +614,152 @@ pub async fn resolve_coord_row(csid: &str) -> RowResolution {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::{json, Value};
 
-    fn body(json: serde_json::Value) -> WireResponse {
+    /// The keys coord's `WorkStatusResponse` serializes, every one on every
+    /// response (qontinui-coord `crates/coord/src/session_work_status.rs`,
+    /// read at `c84e73784`).
+    ///
+    /// These three lists are a SNAPSHOT. Nothing checks them against coord, so
+    /// re-read `WorkStatusResponse` and `WorkStatusRow` whenever coord changes
+    /// either. They live here rather than as `deny_unknown_fields` on the
+    /// production structs, because production deliberately ignores keys it
+    /// does not read (`state`, `started_at`).
+    const RESPONSE_KEYS: &[&str] = &[
+        "statuses",
+        "unknown",
+        "invalid",
+        "accepted",
+        "input_truncated",
+        "sessionBridgeColumnPresent",
+    ];
+    /// The `WorkStatusRow` keys coord sends on every row.
+    const ROW_KEYS_ALWAYS: &[&str] = &["session_status", "since", "coord_session_id", "state"];
+    /// The `WorkStatusRow` key coord omits when unset.
+    const ROW_KEYS_OPTIONAL: &[&str] = &["started_at"];
+
+    /// Decode a fixture after checking its KEYS against the snapshot above.
+    /// Every response key and every always-sent row key must be present, and
+    /// no key outside the snapshot may be (`started_at` is the one optional
+    /// row key). Values are not checked: the harness ids here are short labels
+    /// (`sid`, `a`) where coord sends UUID strings, which this module treats
+    /// as opaque keys either way.
+    ///
+    /// [`WireResponse`] ignores unknown keys and defaults missing ones, so
+    /// without this a fixture can model a body coord cannot send and still
+    /// pass. Six fixtures did exactly that with `truncated` after
+    /// qontinui-runner#2150 dropped its alias (coord pins the key's absence in
+    /// `session_fleet.rs`, `the_three_session_routes_share_one_at_cap_vocabulary`).
+    /// A fixture that breaks the contract on purpose says so and goes through
+    /// [`decode_off_contract`].
+    fn body(json: Value) -> WireResponse {
+        let top = json.as_object().expect("a fixture is a JSON object");
+        for key in top.keys() {
+            assert!(
+                RESPONSE_KEYS.contains(&key.as_str()),
+                "fixture key `{key}` is not a field coord's WorkStatusResponse serves: {json}"
+            );
+        }
+        for key in RESPONSE_KEYS {
+            assert!(
+                top.contains_key(*key),
+                "fixture lacks `{key}`, which coord's WorkStatusResponse always sends: {json}"
+            );
+        }
+        let statuses = top["statuses"]
+            .as_object()
+            .expect("`statuses` is a JSON object");
+        for (id, row) in statuses {
+            let row = row.as_object().expect("a statuses row is a JSON object");
+            for key in row.keys() {
+                assert!(
+                    ROW_KEYS_ALWAYS.contains(&key.as_str())
+                        || ROW_KEYS_OPTIONAL.contains(&key.as_str()),
+                    "fixture row `{id}` key `{key}` is not a field coord's WorkStatusRow serves: {json}"
+                );
+            }
+            for key in ROW_KEYS_ALWAYS {
+                assert!(
+                    row.contains_key(*key),
+                    "fixture row `{id}` lacks `{key}`, which coord's WorkStatusRow always sends: {json}"
+                );
+            }
+        }
+        decode_off_contract(json)
+    }
+
+    /// Decode with NO contract check. Only for a fixture that sends, on
+    /// purpose, a body coord cannot (a missing, extra or retired key) to
+    /// exercise a defensive arm. Every caller says why.
+    fn decode_off_contract(json: Value) -> WireResponse {
         serde_json::from_value(json).expect("decode")
+    }
+
+    /// A `statuses` row carrying every key coord always sends. `n` keeps the
+    /// `coord_session_id` distinct, as it is for distinct harness ids.
+    fn row(n: u32, session_status: Value, since: Value) -> Value {
+        json!({
+            "session_status": session_status,
+            "since": since,
+            "coord_session_id": format!("00000000-0000-7000-9000-{n:012}"),
+            "state": "active"
+        })
     }
 
     const ROW: &str = "01a11324-7598-7e22-82e3-7ed378f59c62";
 
     #[test]
+    #[should_panic(expected = "fixture key `truncated` is not a field")]
+    fn the_fixture_guard_refuses_a_response_key_coord_does_not_serve() {
+        body(json!({
+            "statuses": {}, "unknown": [], "invalid": [], "accepted": 0,
+            "input_truncated": false, "truncated": false,
+            "sessionBridgeColumnPresent": true
+        }));
+    }
+
+    #[test]
+    #[should_panic(expected = "fixture lacks `input_truncated`")]
+    fn the_fixture_guard_refuses_a_body_missing_a_key_coord_always_sends() {
+        body(json!({
+            "statuses": {}, "unknown": [], "invalid": [], "accepted": 0,
+            "sessionBridgeColumnPresent": true
+        }));
+    }
+
+    #[test]
+    #[should_panic(expected = "fixture row `sid` key `status` is not a field")]
+    fn the_fixture_guard_refuses_a_row_key_coord_does_not_serve() {
+        body(json!({
+            "statuses": {"sid": {
+                "session_status": "working", "since": null,
+                "coord_session_id": ROW, "state": "active", "status": "working"
+            }},
+            "unknown": [], "invalid": [], "accepted": 1, "input_truncated": false,
+            "sessionBridgeColumnPresent": true
+        }));
+    }
+
+    #[test]
+    #[should_panic(expected = "fixture row `sid` lacks `state`")]
+    fn the_fixture_guard_refuses_a_row_missing_a_key_coord_always_sends() {
+        body(json!({
+            "statuses": {"sid": {
+                "session_status": "working", "since": null, "coord_session_id": ROW
+            }},
+            "unknown": [], "invalid": [], "accepted": 1, "input_truncated": false,
+            "sessionBridgeColumnPresent": true
+        }));
+    }
+
+    #[test]
     fn resolution_adopts_the_row_coord_names() {
-        let b = body(serde_json::json!({
-            "statuses": {"sid": {"session_status": null, "coord_session_id": ROW}},
-            "unknown": [], "invalid": [], "accepted": 1, "truncated": false,
+        let b = body(json!({
+            "statuses": {"sid": {
+                "session_status": null, "since": null,
+                "coord_session_id": ROW, "state": "active"
+            }},
+            "unknown": [], "invalid": [], "accepted": 1, "input_truncated": false,
             "sessionBridgeColumnPresent": true
         }));
         assert_eq!(
@@ -630,9 +770,9 @@ mod tests {
 
     #[test]
     fn resolution_mints_only_on_an_explicit_unknown() {
-        let unknown = body(serde_json::json!({
+        let unknown = body(json!({
             "statuses": {}, "unknown": ["sid"], "invalid": [], "accepted": 1,
-            "truncated": false, "sessionBridgeColumnPresent": true
+            "input_truncated": false, "sessionBridgeColumnPresent": true
         }));
         assert_eq!(
             resolution_from_body(&unknown, "sid"),
@@ -640,18 +780,20 @@ mod tests {
         );
 
         // In neither bucket: coord did not settle it — must NOT read as mintable.
-        let silent = body(serde_json::json!({
+        // Off-contract on purpose: coord puts every accepted id in `statuses`
+        // or `unknown`, so this exercises only the defensive arm.
+        let silent = body(json!({
             "statuses": {}, "unknown": [], "invalid": [], "accepted": 1,
-            "truncated": false, "sessionBridgeColumnPresent": true
+            "input_truncated": false, "sessionBridgeColumnPresent": true
         }));
         assert!(matches!(
             resolution_from_body(&silent, "sid"),
             RowResolution::Unresolved(_)
         ));
         // Bridge column absent: even an `unknown` entry is meaningless.
-        let no_bridge = body(serde_json::json!({
+        let no_bridge = body(json!({
             "statuses": {}, "unknown": ["sid"], "invalid": [], "accepted": 1,
-            "truncated": false, "sessionBridgeColumnPresent": false
+            "input_truncated": false, "sessionBridgeColumnPresent": false
         }));
         assert!(matches!(
             resolution_from_body(&no_bridge, "sid"),
@@ -659,11 +801,14 @@ mod tests {
         ));
     }
 
+    /// Off-contract on purpose: coord has always sent `coord_session_id` as a
+    /// non-null UUID, so this row lacks a key and exercises only the defensive
+    /// arm.
     #[test]
     fn resolution_refuses_a_row_without_a_parseable_id() {
-        let b = body(serde_json::json!({
-            "statuses": {"sid": {"session_status": "working"}},
-            "unknown": [], "invalid": [], "accepted": 1, "truncated": false,
+        let b = decode_off_contract(json!({
+            "statuses": {"sid": {"session_status": "working", "since": null, "state": "active"}},
+            "unknown": [], "invalid": [], "accepted": 1, "input_truncated": false,
             "sessionBridgeColumnPresent": true
         }));
         assert!(matches!(
@@ -674,14 +819,14 @@ mod tests {
 
     #[test]
     fn maps_the_five_canonical_words_and_the_legacy_alias() {
-        let (m, note) = map_from_body(&body(serde_json::json!({
+        let (m, note) = map_from_body(&body(json!({
             "statuses": {
-                "a": {"session_status": "working"},
-                "b": {"session_status": "blocked"},
-                "c": {"session_status": "stalled"},
-                "d": {"session_status": "waiting_human"},
-                "e": {"session_status": "finished"},
-                "f": {"session_status": "done"},
+                "a": row(1, json!("working"), Value::Null),
+                "b": row(2, json!("blocked"), Value::Null),
+                "c": row(3, json!("stalled"), Value::Null),
+                "d": row(4, json!("waiting_human"), Value::Null),
+                "e": row(5, json!("finished"), Value::Null),
+                "f": row(6, json!("done"), Value::Null),
             },
             "unknown": [], "invalid": [], "accepted": 6, "input_truncated": false,
             "sessionBridgeColumnPresent": true
@@ -696,15 +841,19 @@ mod tests {
         assert!(note.is_empty(), "clean read carries no note: {note}");
     }
 
+    /// Two `since` values are off-contract on purpose. coord serializes UTC
+    /// RFC 3339 ending in `Z`, so `+00:00` tests leniency and `yesterday` tests
+    /// the parse-failure arm. A row with no transition time carries
+    /// `"since": null`, which is how coord says it.
     #[test]
     fn finished_at_is_read_only_from_finished_rows_with_a_parseable_since() {
-        let b = body(serde_json::json!({
+        let b = body(json!({
             "statuses": {
-                "done-new": {"session_status": "finished", "since": "2026-09-13T10:00:00Z"},
-                "done-alias": {"session_status": "done", "since": "2026-09-13T10:00:01+00:00"},
-                "working": {"session_status": "working", "since": "2026-09-13T10:00:00Z"},
-                "no-since": {"session_status": "finished"},
-                "bad-since": {"session_status": "finished", "since": "yesterday"},
+                "done-new": row(1, json!("finished"), json!("2026-09-13T10:00:00Z")),
+                "done-alias": row(2, json!("done"), json!("2026-09-13T10:00:01+00:00")),
+                "working": row(3, json!("working"), json!("2026-09-13T10:00:00Z")),
+                "null-since": row(4, json!("finished"), Value::Null),
+                "bad-since": row(5, json!("finished"), json!("yesterday")),
             },
             "unknown": [], "invalid": [], "accepted": 5, "input_truncated": false,
             "sessionBridgeColumnPresent": true
@@ -714,8 +863,11 @@ mod tests {
         assert_eq!(m.get("done-new"), Some(&1_789_293_600_000));
         assert_eq!(m.get("done-alias"), Some(&1_789_293_601_000));
 
-        let absent = body(serde_json::json!({
-            "statuses": {"x": {"session_status": "finished", "since": "2026-09-13T10:00:00Z"}},
+        // Off-contract on purpose: with the bridge column absent coord sends
+        // `statuses: {}`. A row is sent here so the assertion cannot pass
+        // vacuously on an empty map.
+        let absent = body(json!({
+            "statuses": {"x": row(1, json!("finished"), json!("2026-09-13T10:00:00Z"))},
             "unknown": [], "invalid": [], "accepted": 1, "input_truncated": false,
             "sessionBridgeColumnPresent": false
         }));
@@ -725,20 +877,22 @@ mod tests {
     /// `since` is decoded for EVERY resolved status, not only `finished` —
     /// `/restart-readiness` serves it per process as `sessionStatusSince`, so a
     /// revival (`working` again) carries its own transition time. A row with no
-    /// resolved status, a missing `since` or an unparseable one maps to
-    /// nothing (UNKNOWN), and an inexpressible join yields nothing at all.
+    /// resolved status, a null `since` or an unparseable one maps to nothing
+    /// (UNKNOWN), and an inexpressible join yields nothing at all. The
+    /// `+00:00` and `yesterday` values are off-contract on purpose, as in the
+    /// test above.
     #[test]
     fn since_is_read_for_every_resolved_status_with_a_parseable_since() {
-        let b = body(serde_json::json!({
+        let b = body(json!({
             "statuses": {
-                "working": {"session_status": "working", "since": "2026-09-13T10:00:00Z"},
-                "waiting": {"session_status": "waiting_human", "since": "2026-09-13T10:00:02+00:00"},
-                "finished": {"session_status": "finished", "since": "2026-09-13T10:00:01Z"},
-                "unrecognised": {"session_status": "vacationing", "since": "2026-09-13T10:00:03Z"},
-                "unset": {"session_status": null, "since": "2026-09-13T10:00:00Z"},
-                "blank": {"session_status": "  ", "since": "2026-09-13T10:00:00Z"},
-                "no-since": {"session_status": "working"},
-                "bad-since": {"session_status": "working", "since": "yesterday"},
+                "working": row(1, json!("working"), json!("2026-09-13T10:00:00Z")),
+                "waiting": row(2, json!("waiting_human"), json!("2026-09-13T10:00:02+00:00")),
+                "finished": row(3, json!("finished"), json!("2026-09-13T10:00:01Z")),
+                "unrecognised": row(4, json!("vacationing"), json!("2026-09-13T10:00:03Z")),
+                "unset": row(5, Value::Null, json!("2026-09-13T10:00:00Z")),
+                "blank": row(6, json!("  "), json!("2026-09-13T10:00:00Z")),
+                "null-since": row(7, json!("working"), Value::Null),
+                "bad-since": row(8, json!("working"), json!("yesterday")),
             },
             "unknown": [], "invalid": [], "accepted": 8, "input_truncated": false,
             "sessionBridgeColumnPresent": true
@@ -754,9 +908,11 @@ mod tests {
         assert_eq!(f.len(), 1, "{f:?}");
         assert_eq!(f.get("finished"), Some(&1_789_293_601_000));
 
-        let no_bridge = body(serde_json::json!({
-            "statuses": {"x": {"session_status": "working", "since": "2026-09-13T10:00:00Z"}},
-            "unknown": [], "invalid": [], "accepted": 1, "truncated": false,
+        // Off-contract on purpose (coord sends `statuses: {}` here), so the
+        // emptiness below is the decoder's doing, not the fixture's.
+        let no_bridge = body(json!({
+            "statuses": {"x": row(1, json!("working"), json!("2026-09-13T10:00:00Z"))},
+            "unknown": [], "invalid": [], "accepted": 1, "input_truncated": false,
             "sessionBridgeColumnPresent": false
         }));
         assert!(since_from_body(&no_bridge).is_empty());
@@ -766,8 +922,8 @@ mod tests {
     fn a_null_work_axis_produces_no_entry() {
         // The row EXISTS and its axis is unset. That is UNKNOWN, and an absent
         // map entry is exactly how the caller is told to keep blocking.
-        let (m, _) = map_from_body(&body(serde_json::json!({
-            "statuses": {"a": {"session_status": null}},
+        let (m, _) = map_from_body(&body(json!({
+            "statuses": {"a": row(1, Value::Null, Value::Null)},
             "unknown": [], "invalid": [], "accepted": 1, "input_truncated": false,
             "sessionBridgeColumnPresent": true
         })));
@@ -776,8 +932,8 @@ mod tests {
 
     #[test]
     fn unrecognised_status_is_carried_verbatim_and_is_not_finished() {
-        let (m, _) = map_from_body(&body(serde_json::json!({
-            "statuses": {"a": {"session_status": "vacationing"}},
+        let (m, _) = map_from_body(&body(json!({
+            "statuses": {"a": row(1, json!("vacationing"), Value::Null)},
             "unknown": [], "invalid": [], "accepted": 1, "input_truncated": false,
             "sessionBridgeColumnPresent": true
         })));
@@ -793,10 +949,12 @@ mod tests {
         );
     }
 
+    /// Off-contract on purpose: with the bridge column absent coord sends
+    /// `statuses: {}`. The row is what makes "discards" falsifiable.
     #[test]
     fn bridge_column_absent_discards_the_whole_body() {
-        let (m, note) = map_from_body(&body(serde_json::json!({
-            "statuses": {"a": {"session_status": "finished"}},
+        let (m, note) = map_from_body(&body(json!({
+            "statuses": {"a": row(1, json!("finished"), Value::Null)},
             "unknown": [], "invalid": [], "accepted": 1, "input_truncated": false,
             "sessionBridgeColumnPresent": false
         })));
@@ -807,17 +965,26 @@ mod tests {
         assert!(note.contains("sessionBridgeColumnPresent"));
     }
 
+    /// coord sets `input_truncated` only when a bucket hit its cap: 500 valid
+    /// ids, or 50 echoed bad tokens (`MAX_IDS`, `MAX_INVALID_ECHOED`). This
+    /// body is the second case, with every accepted id in `unknown`, so all
+    /// three notes come from one body coord can send.
     #[test]
     fn unknown_and_invalid_ids_are_noted_not_mapped() {
-        let (m, note) = map_from_body(&body(serde_json::json!({
+        let invalid: Vec<String> = (0..50).map(|i| format!("not-a-uuid-{i}")).collect();
+        let (m, note) = map_from_body(&body(json!({
             "statuses": {},
-            "unknown": ["a", "b"], "invalid": ["not-a-uuid"],
+            "unknown": [
+                "00000000-0000-7000-8000-000000000001",
+                "00000000-0000-7000-8000-000000000002"
+            ],
+            "invalid": invalid,
             "accepted": 2, "input_truncated": true,
             "sessionBridgeColumnPresent": true
         })));
         assert!(m.is_empty());
         assert!(note.contains("2 id(s) resolved to no coord session"));
-        assert!(note.contains("1 id(s) were not UUIDs"));
+        assert!(note.contains("50 id(s) were not UUIDs"));
         assert!(note.contains("truncated the INPUT id list"));
     }
 
@@ -826,31 +993,47 @@ mod tests {
     /// ONLY the new name. A bare `truncated` is not read as the input cap: on
     /// the sibling routes that word meant "more rows exist", which is the
     /// confusion the rename removed.
+    ///
+    /// The base is 500 accepted ids, every one answered (coord puts each
+    /// accepted id in `statuses` or `unknown`). That is the shape of a request
+    /// coord cut at its 500-id cap (`input_truncated: true`) and of one that
+    /// sent exactly 500 (`false`). The base leaves `input_truncated` out, so
+    /// only the first step, which adds it, is a body coord can send.
     #[test]
     fn input_truncated_is_read_and_the_legacy_name_is_not() {
         let base = || {
-            serde_json::json!({
-                "statuses": {}, "unknown": [], "invalid": [], "accepted": 500,
+            let statuses: serde_json::Map<String, Value> = (0..500u32)
+                .map(|i| {
+                    (
+                        format!("00000000-0000-7000-8000-{i:012}"),
+                        row(i, json!("working"), Value::Null),
+                    )
+                })
+                .collect();
+            json!({
+                "statuses": statuses, "unknown": [], "invalid": [], "accepted": 500,
                 "sessionBridgeColumnPresent": true
             })
         };
         let mut v = base();
-        v["input_truncated"] = serde_json::json!(true);
+        v["input_truncated"] = json!(true);
         let b = body(v);
         assert!(b.input_truncated);
         assert!(map_from_body(&b).1.contains("truncated the INPUT id list"));
 
+        // Off-contract on purpose: a body carrying only the retired name.
         let mut v = base();
-        v["truncated"] = serde_json::json!(true);
-        let b = body(v);
+        v["truncated"] = json!(true);
+        let b = decode_off_contract(v);
         assert!(
             !b.input_truncated,
             "the legacy `truncated` must not be read"
         );
         assert!(map_from_body(&b).1.is_empty());
 
-        // Absent -> false, and no note.
-        let b = body(base());
+        // Off-contract on purpose: coord always sends the key, so absent is
+        // the defensive default. It reads false, with no note.
+        let b = decode_off_contract(base());
         assert!(!b.input_truncated);
         assert!(map_from_body(&b).1.is_empty());
     }

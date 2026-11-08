@@ -17,8 +17,9 @@
 //! (`<config>/projects/<cwd>/<id>.jsonl`):
 //!
 //! 1. ask coord which `coord.sessions` row answers for that harness id
-//!    ([`crate::mcp::session_work_status::resolve_coord_row`] — the latest row,
-//!    since the id is not unique);
+//!    ([`crate::mcp::session_work_status::resolve_coord_row`] — the row
+//!    coord's pick order names, active first and then newest, since the id is
+//!    not unique);
 //! 2. [`decide`]: adopt that row, MINT one only when coord answered `unknown`,
 //!    and DEFER (never mint) on anything that does not settle the question —
 //!    a second row beside an existing one is the duplicate-row defect;
