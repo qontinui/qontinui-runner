@@ -843,14 +843,16 @@ impl GitCustodyProbe {
             .env("GIT_NO_LAZY_FETCH", "1")
             .stdin(std::process::Stdio::null())
             .kill_on_drop(true);
-        // A caller `GIT_CONFIG_*` override can set `core.excludesFile` and hide
-        // untracked work from `git status`, so none reaches a probe (the same
-        // rule as qontinui-claude-config session-closeable.sh).
-        for (key, _) in std::env::vars_os() {
-            if key.to_string_lossy().starts_with("GIT_CONFIG") {
-                cmd.env_remove(key);
-            }
+        // The custody probes share one environment with the residue rule —
+        // the reference script's scrub: no caller config override (one can
+        // point `core.excludesFile` at `*` and hide untracked work), no
+        // tracing or stderr redirect (any stderr is read as a skipped
+        // directory), no optional locks, no lazy fetch.
+        let (remove, set) = served_residue::probe_env();
+        for key in remove {
+            cmd.env_remove(key);
         }
+        cmd.envs(set);
         match tokio::time::timeout(self.timeout, cmd.output()).await {
             Ok(Ok(output)) => Ok(output),
             Ok(Err(e)) => Err(format!("git {} could not run: {e}", args.join(" "))),
@@ -954,6 +956,12 @@ fn member_state_from(
         );
     }
     match (judgement.uncommitted, judgement.unknown, ahead) {
+        // Definite work outranks an unpushed probe that failed: dirty with
+        // `ahead: 0` (custody_gate reports the uncommitted reason first).
+        (Some(_), _, Err(_)) => MemberState::Probed {
+            dirty: true,
+            ahead: 0,
+        },
         (_, _, Err(e)) => MemberState::ProbeFailed(e),
         (Some(_), _, Ok(ahead)) => MemberState::Probed { dirty: true, ahead },
         (None, Some(_), Ok(ahead)) if ahead > 0 => MemberState::Probed {
@@ -1118,7 +1126,15 @@ mod tests {
             }
         );
         assert_eq!(
-            member_state_from(dirty, Ok(0)),
+            member_state_from(dirty.clone(), Ok(0)),
+            MemberState::Probed {
+                dirty: true,
+                ahead: 0
+            }
+        );
+        // Definite work outranks a failed unpushed probe.
+        assert_eq!(
+            member_state_from(dirty.clone(), Err("x".into())),
             MemberState::Probed {
                 dirty: true,
                 ahead: 0

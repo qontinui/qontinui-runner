@@ -3825,11 +3825,12 @@ pub(crate) fn append_managed_exclude_lines<S: AsRef<str>>(
 }
 
 /// Escape one path for a gitignore-syntax line so it matches only itself:
-/// `\`, `*`, `?` and `[` are taken literally, and trailing spaces (which git
-/// strips) are kept. `None` for a path no exclude line can name — one holding
-/// a newline or a carriage return.
+/// `\`, `*`, `?` and `[` are taken literally. `None` for a path no exclude
+/// line can name: one holding a newline or a carriage return, or one ending in
+/// a space (git strips an unescaped trailing space, and an escaped one would
+/// defeat the writer's whole-line, trimmed "already present" match).
 fn gitignore_literal(path: &str) -> Option<String> {
-    if path.contains('\n') || path.contains('\r') {
+    if path.contains('\n') || path.contains('\r') || path.ends_with(' ') {
         return None;
     }
     let mut out = String::with_capacity(path.len());
@@ -3839,15 +3840,14 @@ fn gitignore_literal(path: &str) -> Option<String> {
         }
         out.push(c);
     }
-    let trailing = out.len() - out.trim_end_matches(' ').len();
-    if trailing > 0 {
-        out.truncate(out.len() - trailing);
-        for _ in 0..trailing {
-            out.push_str("\\ ");
-        }
-    }
     Some(out)
 }
+
+/// The three served folders, as `git rev-parse --show-prefix` names them when
+/// the provisioned dir sits at a work-tree root — the only place
+/// [`exclude_served_files`] writes for.
+const SERVED_EXCLUDE_PREFIXES: [&str; 3] =
+    [".claude/commands/", ".claude/skills/", ".claude/agents/"];
 
 /// Exclude exactly the served-corpus files one provisioner pass wrote into
 /// `dir` (plan `2026-11-03-the-runners-served-claude-corpus-makes-every-no-op-closeout-not-closeable`
@@ -3898,7 +3898,11 @@ pub(crate) fn exclude_served_files(
             return;
         }
     };
-    let text = String::from_utf8_lossy(&out);
+    // A lossy decode would build a garbled path for `create_dir_all`.
+    let Ok(text) = std::str::from_utf8(&out) else {
+        debug!("fleet::exclude_served_files: git rev-parse printed non-UTF-8; no exclude lines written");
+        return;
+    };
     let mut answer = text.split('\n');
     let (Some(exclude), Some(prefix)) = (answer.next(), answer.next()) else {
         debug!(
@@ -3908,12 +3912,30 @@ pub(crate) fn exclude_served_files(
     };
     let exclude = exclude.trim_end_matches('\r');
     let prefix = prefix.trim_end_matches('\r');
-    if exclude.is_empty() {
+    // The exclude path must be absolute: git before 2.31 does not know
+    // `--path-format` and echoes it back as its first line, which would put a
+    // junk file in the runner's own working directory.
+    if !std::path::Path::new(exclude).is_absolute() {
+        debug!(
+            "fleet::exclude_served_files: git rev-parse named no absolute exclude path \
+             ({exclude:?}); no exclude lines written"
+        );
         return;
     }
-    let Some(prefix_literal) = gitignore_literal(prefix) else {
+    // Only a served folder AT A WORK-TREE ROOT is excluded. The residue rule
+    // (`session::served_residue`, and session-closeable.sh) judges
+    // `.claude/{commands,skills,agents}` at the root only, so a line for
+    // `<sub>/.claude/...` would hide an edited copy that no closeability check
+    // then reads — a false clean.
+    if !SERVED_EXCLUDE_PREFIXES.contains(&prefix) {
+        debug!(
+            "fleet::exclude_served_files: {} is not a served folder at a work-tree root \
+             (prefix {prefix:?}); no exclude lines written",
+            dir.display()
+        );
         return;
-    };
+    }
+    let prefix_literal = prefix;
     let mut lines: Vec<String> = Vec::with_capacity(written.len() + dir_patterns.len());
     for rel in written {
         let Some(rel) = rel.to_str() else { continue };

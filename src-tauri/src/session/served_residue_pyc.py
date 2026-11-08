@@ -10,7 +10,7 @@ that source" is a property only an interpreter can test, so
 reason per item ('' = the check passed). Keep it in step with the script: two
 closeability authorities must not drift.
 
-argv[1] is JSON: {"root": <tree>, "items": [{"mode": "mismatch"|"not_cache",
+stdin is JSON: {"root": <tree>, "items": [{"mode": "mismatch"|"not_cache",
 "rel": <pyc>, "source": <py>, "tag": <cache tag>, "opt": <0|1|2>}]}. stdout is
 a JSON list of reasons, one per item, in order.
 """
@@ -157,7 +157,7 @@ def pyc_not_cache(rel, lead):
 
 def main():
     global root
-    req = json.loads(sys.argv[1])
+    req = json.loads(sys.stdin.buffer.read().decode("utf-8"))
     root = req["root"]
     out = []
     for item in req["items"]:

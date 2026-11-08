@@ -10390,7 +10390,9 @@ fn provision_agent_definitions_from_root(
     // Deliberately NOT fatal: if the embedded write fails we warn and continue
     // to the checkout overlay, because a checkout present on this device is a
     // complete answer on its own.
-    let embedded_report = match crate::fleet_agents::provision_fleet_agents_into(&dst_dir, &keep) {
+    let floor = crate::fleet_agents::provision_fleet_agents_into(&dst_dir, &keep);
+    let floor_wrote = floor.is_ok();
+    let embedded_report = match floor {
         Ok(report) => report,
         Err(e) => {
             warn!(
@@ -10415,10 +10417,16 @@ fn provision_agent_definitions_from_root(
     // The floor's files on disk now: every embedded def this pass did not keep.
     // Each untracked one gets its own anchored exclude line below, with the
     // overlay's, so a no-op closeout does not read the runner's copies as work.
-    let mut written_agents: Vec<String> = crate::fleet_agents::embedded_agent_names()
-        .into_iter()
-        .filter(|name| keep.reason(name).is_none() && dst_dir.join(name).is_file())
-        .collect();
+    // A floor write that failed part-way says nothing about which files on
+    // disk are its own, so none of them is excluded.
+    let mut written_agents: Vec<String> = if floor_wrote {
+        crate::fleet_agents::embedded_agent_names()
+            .into_iter()
+            .filter(|name| keep.reason(name).is_none() && dst_dir.join(name).is_file())
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     // CHECKOUT WINS: the operator's live copies are overlaid on top below, so
     // editing qontinui-claude-config/.claude/agents behaves exactly as before.
@@ -14488,13 +14496,29 @@ mod tests {
             assert_eq!(status(&tree), "");
         }
 
-        /// (b) The clone-factory shape: a tracked `.claude/agents/<x>.md`.
+        /// (b) The clone-factory shape: a tracked `.claude/agents/<x>.md`, with
+        /// a qontinui-claude-config checkout whose overlay copies one more def.
         #[test]
         fn clone_factory_shape_reads_clean() {
-            let (tmp, _primary, tree) =
+            let (tmp, primary, tree) =
                 fixture(&[(".claude/agents/clone-implementer.md", "tracked\n")]);
+            let overlay = tmp.path().join("qontinui-claude-config/.claude/agents");
+            std::fs::create_dir_all(&overlay).unwrap();
+            std::fs::write(overlay.join("overlay-only.md"), "# overlay\n").unwrap();
             provision(&tree, tmp.path());
+            assert!(tree.join(".claude/agents/overlay-only.md").is_file());
             assert_eq!(status(&tree), "");
+            let exclude = std::fs::read_to_string(primary.join(".git/info/exclude")).unwrap();
+            assert!(
+                exclude
+                    .lines()
+                    .any(|l| l == "/.claude/agents/overlay-only.md"),
+                "{exclude}"
+            );
+            assert!(
+                !exclude.contains("clone-implementer"),
+                "a tracked def gets no line"
+            );
         }
 
         /// (c) A tracked `.claude/commands/vet-plan.md` gets no line, and a NEW
@@ -14521,17 +14545,25 @@ mod tests {
             assert_eq!(status(&tree), "?? .claude/commands/new.md");
         }
 
-        /// Outside any repository nothing is written and nothing fails.
+        /// A served folder below the work-tree root gets no line: the residue
+        /// rule judges `.claude/` at the root only, so an exclude there would
+        /// hide an edited copy no closeability check reads.
         #[test]
-        fn outside_a_repository_writes_no_exclude() {
-            let tmp = tempfile::tempdir().unwrap();
-            let dir = tmp.path().join(".claude").join("commands");
+        fn served_folder_below_the_root_gets_no_line() {
+            let (_tmp, primary, tree) = fixture(&[]);
+            let dir = tree.join("frontend/.claude/commands");
             crate::fleet_commands::provision_fleet_commands_into(
                 &dir,
                 &crate::agent_commands::AgentCommandRegistry::new(),
             )
             .unwrap();
-            assert!(!tmp.path().join(".git").exists());
+            let exclude =
+                std::fs::read_to_string(primary.join(".git/info/exclude")).unwrap_or_default();
+            assert!(!exclude.contains("frontend"), "{exclude}");
+            assert!(
+                status(&tree).contains("frontend/"),
+                "the copies stay visible"
+            );
         }
 
         /// A name holding glob characters matches only itself.

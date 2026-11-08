@@ -191,29 +191,11 @@ impl Git {
         }
     }
 
-    /// The probe environment every call gets: no optional locks (the probe runs
-    /// in peers' worktrees), no lazy fetch, no prompt, no replace refs, no
-    /// inherited repository, and no caller `GIT_CONFIG_*` override.
-    pub(crate) fn scrub(cmd: &mut std::process::Command) {
-        cmd.env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_INDEX_FILE")
-            .env_remove("GIT_OBJECT_DIRECTORY")
-            .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
-            .env_remove("GIT_COMMON_DIR")
-            .env("GIT_OPTIONAL_LOCKS", "0")
-            .env("GIT_NO_LAZY_FETCH", "1")
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env("GIT_NO_REPLACE_OBJECTS", "1");
-        for (key, _) in std::env::vars_os() {
-            if key.to_string_lossy().starts_with("GIT_CONFIG") {
-                cmd.env_remove(key);
-            }
-        }
-    }
-
     /// Run git in `cwd`. `None` when it could not run, `cwd` is not a
-    /// directory, or the call (or the pass) ran out of time.
+    /// directory, or the call (or the pass) ran out of time. Output comes back
+    /// through PIPES, never temp files: a full temp directory can accept an
+    /// empty file and then lose git's writes to it, and a lost stderr would
+    /// read as "git warned about nothing" (item 12).
     pub(crate) fn run(&self, cwd: &Path, args: &[&str]) -> Option<GitOut> {
         if !cwd.is_dir() {
             return None;
@@ -223,41 +205,146 @@ impl Git {
             return None;
         }
         let bound = self.per_call.min(self.deadline - now);
-        let out = tempfile::NamedTempFile::new().ok()?;
-        let err = tempfile::NamedTempFile::new().ok()?;
         let mut cmd = crate::process_helpers::no_window("git");
         cmd.arg("--no-optional-locks").arg("-C").arg(cwd).args(args);
-        Self::scrub(&mut cmd);
-        let mut child = cmd
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(out.reopen().ok()?))
-            .stderr(Stdio::from(err.reopen().ok()?))
-            .spawn()
-            .ok()?;
-        let until = Instant::now() + bound;
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break status,
-                Ok(None) if Instant::now() >= until => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return None;
-                }
-                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
-                Err(_) => return None,
-            }
-        };
-        Some(GitOut {
-            code: status.code(),
-            stdout: std::fs::read(out.path()).ok()?,
-            stderr: std::fs::read(err.path()).ok()?,
-        })
+        let (remove, set) = probe_env();
+        for key in remove {
+            cmd.env_remove(key);
+        }
+        cmd.envs(set);
+        run_bounded(cmd, None, bound).ok()
     }
 
     /// git's stdout on a zero exit, else `None`.
     fn stdout(&self, cwd: &Path, args: &[&str]) -> Option<Vec<u8>> {
         self.run(cwd, args).filter(GitOut::ok).map(|o| o.stdout)
     }
+}
+
+/// The environment every custody git probe runs under — the reference
+/// script's own scrub (session-closeable.sh `mc:unset-trace`,
+/// `mc:trace2-off`, `mc:unset-git-config`), plus the probe's own pins:
+///
+/// * removed: an inherited repository (`GIT_DIR`, `GIT_WORK_TREE`, ...); every
+///   `GIT_TRACE*` and Git for Windows' `GIT_REDIRECT_STDERR`/`_STDOUT`, since
+///   any stderr is read as a skipped directory and a redirect would hide one;
+///   and the caller's config OVERRIDES (`GIT_CONFIG_PARAMETERS`,
+///   `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_<n>` / `GIT_CONFIG_VALUE_<n>`), which
+///   can point `core.excludesFile` at `*` and hide every untracked file.
+///   `GIT_CONFIG_GLOBAL` / `_SYSTEM` / `_NOSYSTEM` are KEPT, as the script
+///   keeps them: they locate config files (`safe.directory` among them), they
+///   do not override keys.
+/// * set: trace2 off, no optional locks (the probe runs in peers' worktrees),
+///   no lazy fetch, no prompt, no replace refs.
+pub(crate) fn probe_env() -> (Vec<std::ffi::OsString>, Vec<(&'static str, &'static str)>) {
+    let mut remove: Vec<std::ffi::OsString> = [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_COMMON_DIR",
+        "GIT_REDIRECT_STDERR",
+        "GIT_REDIRECT_STDOUT",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_COUNT",
+    ]
+    .iter()
+    .map(|k| std::ffi::OsString::from(*k))
+    .collect();
+    for (key, _) in std::env::vars_os() {
+        let k = key.to_string_lossy();
+        let override_pair = k.starts_with("GIT_CONFIG_KEY_") || k.starts_with("GIT_CONFIG_VALUE_");
+        let trace = k.starts_with("GIT_TRACE") && !k.starts_with("GIT_TRACE2");
+        if override_pair || trace {
+            remove.push(key);
+        }
+    }
+    let set = vec![
+        ("GIT_TRACE2", "0"),
+        ("GIT_TRACE2_EVENT", "0"),
+        ("GIT_TRACE2_PERF", "0"),
+        ("GIT_OPTIONAL_LOCKS", "0"),
+        ("GIT_NO_LAZY_FETCH", "1"),
+        ("GIT_TERMINAL_PROMPT", "0"),
+        ("GIT_NO_REPLACE_OBJECTS", "1"),
+    ];
+    (remove, set)
+}
+
+/// Run `cmd` with piped stdout/stderr (and `stdin` fed when given), each read
+/// on its own thread, killed past `bound`. `Err` when it could not start, did
+/// not finish in time, or a pipe could not be read.
+fn run_bounded(
+    mut cmd: std::process::Command,
+    stdin: Option<Vec<u8>>,
+    bound: Duration,
+) -> Result<GitOut, String> {
+    use std::io::Write as _;
+    cmd.stdin(if stdin.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    })
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| format!("could not start: {e}"))?;
+    let reader = |pipe: Option<Box<dyn std::io::Read + Send>>| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let got = match pipe {
+                Some(mut p) => p.read_to_end(&mut buf).map(|_| buf),
+                None => Ok(buf),
+            };
+            let _ = tx.send(got);
+        });
+        rx
+    };
+    let out_rx = reader(
+        child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn std::io::Read + Send>),
+    );
+    let err_rx = reader(
+        child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn std::io::Read + Send>),
+    );
+    if let (Some(bytes), Some(mut pipe)) = (stdin, child.stdin.take()) {
+        std::thread::spawn(move || {
+            let _ = pipe.write_all(&bytes);
+        });
+    }
+    let until = Instant::now() + bound;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() >= until => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("did not finish within {} s", bound.as_secs()));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(e) => return Err(format!("could not be waited on: {e}")),
+        }
+    };
+    let left = until.saturating_duration_since(Instant::now()) + Duration::from_secs(1);
+    let stdout = out_rx
+        .recv_timeout(left)
+        .map_err(|_| "its stdout was not read in time".to_string())?
+        .map_err(|e| format!("its stdout could not be read: {e}"))?;
+    let stderr = err_rx
+        .recv_timeout(left)
+        .map_err(|_| "its stderr was not read in time".to_string())?
+        .map_err(|e| format!("its stderr could not be read: {e}"))?;
+    Ok(GitOut {
+        code: status.code(),
+        stdout,
+        stderr,
+    })
 }
 
 /// The first non-blank line of git's stderr, bounded, for a reason.
@@ -1209,48 +1296,32 @@ fn run_pyc_checks(
             serde_json::json!({"mode": mode, "rel": rel, "source": source, "tag": tag, "opt": opt})
         })
         .collect();
+    // The request goes on STDIN: a command line is capped (32,767 characters
+    // on Windows), and one item per cache would reach that cap on a busy box.
     let request =
         serde_json::json!({"root": root.display().to_string(), "items": items}).to_string();
     let mut last = String::from("no python3/python on PATH");
     for interpreter in ["python3", "python"] {
-        let out = tempfile::NamedTempFile::new().map_err(|e| e.to_string())?;
-        let spawned = crate::process_helpers::no_window(interpreter)
-            .arg("-I")
-            .arg("-c")
-            .arg(PYC_CHECK)
-            .arg(&request)
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(out.reopen().map_err(|e| e.to_string())?))
-            .stderr(Stdio::null())
-            .spawn();
-        let mut child = match spawned {
-            Ok(c) => c,
-            Err(e) => {
-                last = format!("{interpreter} could not run: {e}");
+        let mut cmd = crate::process_helpers::no_window(interpreter);
+        cmd.arg("-I").arg("-c").arg(PYC_CHECK);
+        let out = match run_bounded(cmd, Some(request.clone().into_bytes()), bound) {
+            Ok(out) => out,
+            Err(why) => {
+                last = format!("{interpreter} {why}");
                 continue;
             }
         };
-        let until = Instant::now() + bound;
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(s)) => break s,
-                Ok(None) if Instant::now() >= until => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(format!(
-                        "{interpreter} did not finish within {} s",
-                        bound.as_secs()
-                    ));
-                }
-                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
-                Err(e) => return Err(e.to_string()),
-            }
-        };
-        if !status.success() {
-            return Err(format!("{interpreter} exited {status}"));
+        // A non-zero exit (a store stub, a broken install) tries the next
+        // interpreter rather than ending the check.
+        if !out.ok() {
+            last = format!(
+                "{interpreter} exited {:?}: {}",
+                out.code,
+                stderr_gist(&out.stderr)
+            );
+            continue;
         }
-        let text = std::fs::read(out.path()).map_err(|e| e.to_string())?;
-        let reasons: Vec<String> = serde_json::from_slice(&text)
+        let reasons: Vec<String> = serde_json::from_slice(&out.stdout)
             .map_err(|e| format!("{interpreter} printed no verdict list: {e}"))?;
         if reasons.len() != checks.len() {
             return Err(format!(
