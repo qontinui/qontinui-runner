@@ -175,6 +175,10 @@ qontinui-runner-win32 = { path = "../crates/runner-win32" }
 # the frame protocol, the client, and the spawner the runner starts holders
 # with. The holder BINARY ships beside the runner as a Tauri externalBin.
 qontinui-pty-holder = { path = "../crates/pty-holder" }
+# The session-lifecycle kernel's first slice, `classify_child` (plan
+# 2026-11-04-runner-finished-close-closes-nothing-on-any-box, Phase 2a; the
+# crate is lifecycle Phase 37's). Pure: the runner reads, the crate decides.
+session-lifecycle = { path = "../crates/session-lifecycle" }
 # `host-probe`: `ci_node::host_sizing::probe` reads the live host (sysinfo).
 qontinui-types = { path = "../../qontinui-schemas/rust", features = ["host-probe"] }
 qontinui-code-graph = { path = "../../qontinui-schemas/code-graph" }

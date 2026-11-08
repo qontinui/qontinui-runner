@@ -621,6 +621,16 @@ pub async fn command_lines_for_pids(pids: &[u32]) -> Option<HashMap<u32, String>
     super::process_table::command_lines_for(pids).await
 }
 
+/// The RAW command lines of exactly `pids` — the text each process was started
+/// with (Windows: its PEB; Unix: `/proc/<pid>/cmdline`), for a caller that
+/// matches command lines against a measured shape. Use this, not
+/// [`command_lines_for_pids`], whenever quoting matters: that door's Windows
+/// answer is `sysinfo`'s argv rejoined, which loses cmd's `^"` escapes. `None`
+/// = UNKNOWN; a pid absent from a `Some` map is unreadable.
+pub async fn raw_command_lines_for_pids(pids: &[u32]) -> Option<HashMap<u32, String>> {
+    super::process_table::raw_command_lines_for(pids).await
+}
+
 /// Identify which descendant is "the service" — port owner → leaf →
 /// fallback to `spawned_pid`. See module-level docs for rules.
 pub fn identify_service_pid(

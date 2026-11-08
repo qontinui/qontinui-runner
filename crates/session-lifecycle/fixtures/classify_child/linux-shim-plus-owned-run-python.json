@@ -1,0 +1,55 @@
+{
+  "provenance": {
+    "host": "merytshost (Linux 6.12.113+deb13-amd64, Python 3.13.5)",
+    "measured_at": "2026-11-08T06:22:00Z",
+    "method": "ssh merytshost 'ps -eo pid=,ppid=,etimes=,comm=,args='; subtree of one real claude; start = capture epoch - etimes (seconds, the runner's /proc granularity); coord-mcp-shim credential filenames redacted; tool-shell bodies redacted",
+    "shape": "python3(),python3(MainThread(MainThread(next-server())))",
+    "census": "343 claude on the box at capture: 337 held exactly one python3 child, 341 python3 children ran `/usr/bin/python3 ~/Projects/qontinui-root/qontinui-claude-config/scripts/coord-mcp-shim.py --credential <path>`, 1 ran owned-run.py (a next dev server)"
+  },
+  "platform": "linux",
+  "claude_pid": 2994258,
+  "table": [
+    {
+      "pid": 2994258,
+      "ppid": 2993948,
+      "image": "claude",
+      "start": 1794042735,
+      "cmdline": "<claude argv not recorded>"
+    },
+    {
+      "pid": 3004876,
+      "ppid": 2994258,
+      "image": "python3",
+      "start": 1794042737,
+      "cmdline": "/usr/bin/python3 /home/spinak/Projects/qontinui-root/qontinui-claude-config/scripts/coord-mcp-shim.py --credential /home/spinak/.qontinui/coord-mcp-shim/0123456789abcdef.json"
+    },
+    {
+      "pid": 4001809,
+      "ppid": 2994258,
+      "image": "python3",
+      "start": 1794093342,
+      "cmdline": "python3 /home/spinak/Projects/qontinui-root/qontinui-claude-config/scripts/owned-run.py --max-runtime 28800 -- pnpm exec next dev --webpack -H 127.0.0.1 -p 3000"
+    },
+    {
+      "pid": 4001873,
+      "ppid": 4001809,
+      "image": "MainThread",
+      "start": 1794093342,
+      "cmdline": "node /home/spinak/.nvm/versions/node/v24.19.0/bin/pnpm exec next dev --webpack -H 127.0.0.1 -p 3000"
+    },
+    {
+      "pid": 4002333,
+      "ppid": 4001873,
+      "image": "MainThread",
+      "start": 1794093342,
+      "cmdline": "node ./node_modules/.bin/../next/dist/bin/next dev --webpack -H 127.0.0.1 -p 3000"
+    },
+    {
+      "pid": 4002652,
+      "ppid": 4002333,
+      "image": "next-server",
+      "start": 1794093342,
+      "cmdline": "(v1 next-server (v16.4.5)"
+    }
+  ]
+}

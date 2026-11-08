@@ -1209,7 +1209,17 @@ impl FinishedCloseWorld for LiveFinishedCloseWorld<'_> {
             debug!(unknowns = ?fresh.unknowns, "wind_down_executor: finished_close census incomplete");
         }
         let observed = fresh.observed;
-        fresh.pass.map(|pass| LiveCensus { pass, observed })
+        let census = fresh.pass.map(|pass| LiveCensus { pass, observed });
+        // SHADOW ONLY (plan 2026-11-04-runner-finished-close-closes-nothing-on-any-box,
+        // Phase 2a): log what `classify_child` would admit or refuse for every
+        // finished session, on a task of its own this census never waits on.
+        // It changes no candidate, verdict or close.
+        if let Some(census) = &census {
+            crate::session::classify_child_shadow::spawn_observe(
+                &census.pass.report.terminal_hosted,
+            );
+        }
+        census
     }
 
     fn census_view<'p>(
