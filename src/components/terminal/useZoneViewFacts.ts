@@ -7,27 +7,30 @@
  * A hook rather than inline reads in `TerminalPage` so the page gains one call
  * line, and so the inputs `ZoneGrid` renders headers from (layout, occupied
  * zones, focus, pins, compact view) are read from the same contexts it reads
- * them from. Plain values, memoized — no refs read during render.
+ * them from. Plain values, memoized — no refs read during render. The facts
+ * themselves, including the auto-trim a restore can release, are
+ * `zoneViewFactsFrom`'s.
  */
 
 import { useMemo } from "react";
 
 import { useTerminalSession, useUIStateCx } from "./contexts";
-import { countLabelledZones, type ZoneViewFacts } from "./terminalPageSignatures";
+import { zoneViewFactsFrom, type ZoneViewFacts } from "./terminalPageSignatures";
 
 export function useZoneViewFacts(): ZoneViewFacts {
   const { tabs, zoneLayout, labelsAndTags } = useTerminalSession();
   const { state: uiState } = useUIStateCx();
   const zoneCount = zoneLayout.layout.zones.length;
-  const { maximizedZone, layoutId, assignments, focusedZone } = zoneLayout;
+  const { maximizedZone, layoutId, layoutOrigin, workMode, assignments, focusedZone } = zoneLayout;
   const { pinnedZones } = labelsAndTags;
   const compactView = uiState.viewMode === "compact";
 
   return useMemo(
-    () => ({
-      maximizedZone,
-      zoneCount,
-      labelledZonesWhenTiled: countLabelledZones({
+    () =>
+      zoneViewFactsFrom({
+        maximizedZone,
+        layoutOrigin,
+        workMode,
         layoutId,
         zoneCount,
         assignments,
@@ -36,7 +39,17 @@ export function useZoneViewFacts(): ZoneViewFacts {
         pinnedZones,
         compactView,
       }),
-    }),
-    [maximizedZone, zoneCount, layoutId, assignments, tabs, focusedZone, pinnedZones, compactView],
+    [
+      maximizedZone,
+      layoutOrigin,
+      workMode,
+      zoneCount,
+      layoutId,
+      assignments,
+      tabs,
+      focusedZone,
+      pinnedZones,
+      compactView,
+    ],
   );
 }
