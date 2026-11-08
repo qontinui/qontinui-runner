@@ -511,12 +511,25 @@ mod tests {
             )),
             "Ok(AlreadyRetired)"
         );
-        for final_reason in [
-            "no_retirable_row: statuses [\"merged\"]",
-            "retire_shortfall: 0 of 1 predicted row(s) moved",
+        // Coord answers no_retirable_row only when no matched row is
+        // allocated or active, so each reason rides the statuses it comes with.
+        // The mixed case is not a retire already done: one row is merged.
+        for (statuses, final_reason) in [
+            (&["merged"][..], "no_retirable_row: statuses [\"merged\"]"),
+            (
+                &["abandoned", "merged"][..],
+                "no_retirable_row: statuses [\"abandoned\", \"merged\"]",
+            ),
+            (
+                &["allocated"][..],
+                "retire_shortfall: 0 of 1 predicted row(s) moved",
+            ),
         ] {
             assert_eq!(
-                classify_retire_response(StatusCode::OK, &coord_answer(0, Some(final_reason))),
+                classify_retire_response(
+                    StatusCode::OK,
+                    &coord_answer_for(statuses, 0, Some(final_reason))
+                ),
                 Ok(RetireOutcome::Refused(final_reason.into())),
                 "{final_reason}"
             );
@@ -602,7 +615,11 @@ mod tests {
                 (503, "{}".to_string()),
                 (
                     200,
-                    coord_answer(0, Some("no_retirable_row: statuses [\"merged\"]")),
+                    coord_answer_for(
+                        &["merged"],
+                        0,
+                        Some("no_retirable_row: statuses [\"merged\"]"),
+                    ),
                 ),
             ],
         )])
