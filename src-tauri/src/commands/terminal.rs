@@ -1653,12 +1653,38 @@ pub fn terminal_session_clear_restore_pending(
 #[tauri::command]
 pub fn terminal_session_record_close(
     store: tauri::State<'_, Arc<SessionLifecycleStore>>,
+    terminal_manager: tauri::State<'_, Arc<TerminalManager>>,
     claude_session_id: String,
     terminal_id: Option<String>,
     reason: String,
 ) -> Result<CommandResponse, String> {
-    let outcome = store.record_close_checked(&claude_session_id, terminal_id.as_deref(), &reason);
+    let outcome = record_close_for(
+        &terminal_manager,
+        &store,
+        &claude_session_id,
+        terminal_id.as_deref(),
+        &reason,
+    );
     Ok(close_outcome_response(&outcome))
+}
+
+/// The body of [`terminal_session_record_close`]: the close behind THIS
+/// manager's shutdown latch, so a `pty-exit` that arrives after
+/// [`TerminalManager::close_all`] began leaves its row as it was (plan
+/// `2026-10-28-force-exited-runner-restore-set-follow-ups`, Phase 6).
+pub(crate) fn record_close_for(
+    terminal_manager: &TerminalManager,
+    store: &SessionLifecycleStore,
+    claude_session_id: &str,
+    terminal_id: Option<&str>,
+    reason: &str,
+) -> CloseOutcome {
+    store.record_close_gated(
+        terminal_manager.is_shutting_down(),
+        claude_session_id,
+        terminal_id,
+        reason,
+    )
 }
 
 /// Mark a session FINISHED (or unmark it) — the WORK axis.
@@ -3309,6 +3335,9 @@ mod tests {
             CloseOutcome::AlreadyClosed {
                 claude_session_id: "s".to_string(),
             },
+            CloseOutcome::IgnoredDuringShutdown {
+                claude_session_id: "s".to_string(),
+            },
             CloseOutcome::TerminalSuperseded {
                 requested: "s".to_string(),
                 terminal_id: "t-old".to_string(),
@@ -3316,7 +3345,7 @@ mod tests {
         ] {
             assert!(
                 close_outcome_response(&resolved).success,
-                "{resolved:?} resolved to a real record — it is a success"
+                "{resolved:?} is not a failure (it resolved, or was deliberately not consulted)"
             );
         }
     }
@@ -3365,6 +3394,38 @@ mod tests {
         let gone = store.get("gone").unwrap();
         assert_eq!(gone.terminal_id, "", "held and detached");
         assert!(gone.awaiting_account_since.is_some());
+    }
+
+    /// Phase 6 of plan `2026-10-28-force-exited-runner-restore-set-follow-ups`,
+    /// at the command layer: the close reads the REAL manager's latch. A
+    /// `pty-exit` before `close_all` closes its row; once `close_all` has run, a
+    /// `pty-exit` leaves its row `open`, while `explicit` still closes.
+    #[test]
+    fn record_close_for_reads_the_managers_shutdown_latch() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
+        for id in ["before", "after", "user"] {
+            let mut r = restore_candidate_record(id);
+            r.terminal_id = format!("term-{id}");
+            store.record_open(r);
+        }
+        let tm = TerminalManager::new();
+
+        let before = record_close_for(&tm, &store, "before", Some("term-before"), "pty-exit");
+        assert!(matches!(before, CloseOutcome::Closed { .. }), "{before:?}");
+        assert_eq!(store.get("before").unwrap().state, "closed");
+
+        let _ = tm.close_all(std::time::Instant::now());
+
+        let after = record_close_for(&tm, &store, "after", Some("term-after"), "pty-exit");
+        assert!(
+            matches!(after, CloseOutcome::IgnoredDuringShutdown { .. }),
+            "{after:?}"
+        );
+        assert_eq!(store.get("after").unwrap().state, "open");
+
+        let user = record_close_for(&tm, &store, "user", Some("term-user"), "explicit");
+        assert!(matches!(user, CloseOutcome::Closed { .. }), "{user:?}");
     }
 
     fn restore_candidate_record(id: &str) -> TerminalSessionRecord {
