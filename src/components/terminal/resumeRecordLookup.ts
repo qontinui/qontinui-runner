@@ -104,6 +104,8 @@ export function buildRetryResumeArgs(params: {
     configDir,
     ...(record?.provider ? { provider: record.provider } : {}),
     ...(gate ? { gate } : {}),
-    recordOpen,
+    // The verified re-assert must keep the provider the command typed, or
+    // `record_open` resets a non-Claude row to the default provider.
+    recordOpen: record?.provider ? { ...recordOpen, provider: record.provider } : recordOpen,
   };
 }

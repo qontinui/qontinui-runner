@@ -1141,6 +1141,10 @@ pub const CLOSE_RESUME_FAILED_STALE: &str = "resume-failed-stale";
 /// - the restore marker was set by THIS process (`restored_in_generation ==
 ///   current_generation`) — a marker carried over from an earlier process
 ///   is waiting for this process's own restore, not stale;
+/// - the record's tier is `failed`, which [`SessionLifecycleStore::mark_restore_pending`]
+///   stamps before a resume is typed. [`SessionLifecycleStore::mark_restored_from_boot`]
+///   stamps the generation alone, so a terminal-only rebind of a row carrying
+///   an earlier process's marker is not an attempted resume;
 /// - the record is open and its restore marker is older than
 ///   [`RESTORE_PENDING_TTL_MS`] (the same staleness rule
 ///   [`describe_restore_status`] renders as "verification timed out");
@@ -1171,6 +1175,9 @@ pub fn stale_failed_restore_report(
     if rec.restored_in_generation.as_deref() != Some(current_generation) {
         return None;
     }
+    if rec.restore_tier.as_deref() != Some(RESTORE_TIER_FAILED) {
+        return None;
+    }
     let marker = rec.restore_pending_at?;
     if now_ms.saturating_sub(marker) <= RESTORE_PENDING_TTL_MS {
         return None;
@@ -1187,6 +1194,43 @@ pub fn stale_failed_restore_report(
             CLOSE_RESUME_FAILED_STALE,
         ),
     })
+}
+
+/// The liveness poll's D4 step for a row the boot-census hold keeps open: the
+/// gate to watch when this row's Claude may have been refused a restore as
+/// still alive ("skip-alive").
+///
+/// A row the restore skips at classify time gets no pane, no `mark_*` and no
+/// rebind, so it keeps its dead terminal id and its pre-boot `last_seen_at`.
+/// [`BootCensus::awaits_restore`](crate::session::restore_census::BootCensus::awaits_restore)
+/// stays true for it, so [`hold_for_withheld_boot_restore`] keeps it from ever
+/// closing `no-terminal`, and the close observer's live-host watch would never
+/// arm. Its gate then stayed `spawned` after its host exited.
+///
+/// `Some` only for an open row held by the census arm alone, with no terminal
+/// matched this tick, no restore attempted by this process, no holder adoption
+/// pending, and a prior-generation gate this process has not reported. While a
+/// drain or the restore phase withholds the boot restore (`id_match_only`) the
+/// row is waiting, so it is left alone until that lifts. The caller still has
+/// to find a live host: a held row without one is simply waiting for its page.
+pub fn held_row_gate_to_watch(
+    rec: &TerminalSessionRecord,
+    awaiting_boot_restore: bool,
+    hold: BootRestoreHold,
+    terminal_matched: bool,
+    adoption_pending: bool,
+    current_generation: &str,
+) -> Option<(uuid::Uuid, uuid::Uuid)> {
+    if rec.state != "open"
+        || !awaiting_boot_restore
+        || hold.id_match_only
+        || terminal_matched
+        || adoption_pending
+        || rec.restored_in_generation.as_deref() == Some(current_generation)
+    {
+        return None;
+    }
+    prior_generation_gate(rec, current_generation)
 }
 
 /// The close observer's D2 step, as production runs it: read the
@@ -2888,7 +2932,7 @@ impl SessionLifecycleStore {
     /// row would then report `runner_restart` a second time for a gate that is
     /// already settled.
     ///
-    /// The gate is released only in two cases:
+    /// The gate is released only in three cases:
     /// - it was bound by THIS process (`gate_bound_generation ==
     ///   current_generation`), because this process's exit hook or reaper
     ///   owns the outcome;
@@ -3203,7 +3247,7 @@ impl SessionLifecycleStore {
     /// Claim THIS generation's one runner-side `work_unreported` report for
     /// the record's gate: stamp `gate_reported_generation = current_generation`
     /// and persist. Returns `true` when this call made the claim, `false` when
-    /// the record no longer owes `gate_id` a report — absent, already claimed
+    /// the record no longer owes `gate_id` a report — already claimed
     /// by this generation, re-adopted by it (`gate_bound_generation ==
     /// current`, so its own exit hook reports), or now carrying a different
     /// gate. The caller must then NOT post. Decided under the same lock as the
@@ -3215,7 +3259,10 @@ impl SessionLifecycleStore {
     /// [`Self::release_gate_identity`] while a D4 watcher held the deferred
     /// report. The release counted that report as owned, so the watcher's
     /// in-memory copy is the only holder left and must still post; there is
-    /// no gate on the row to stamp, and nothing else can report it.
+    /// no gate on the row to stamp, and nothing else can report it. An ABSENT
+    /// row is the same case: a closed row is pruned after
+    /// [`CLOSED_RETENTION_MS`], a host can outlive that, and the watcher again
+    /// holds the only copy of the report.
     pub fn claim_gate_report(
         &self,
         claude_session_id: &str,
@@ -3230,6 +3277,7 @@ impl SessionLifecycleStore {
             }
         };
         let changed = match m.get_mut(claude_session_id) {
+            None => return true,
             Some(rec) if rec.gate_id.is_none() => return true,
             Some(rec)
                 if prior_generation_gate(rec, current_generation).map(|(g, _)| g)
@@ -5837,14 +5885,22 @@ pub fn hold_for_withheld_boot_restore(action: PollAction, held: bool) -> PollAct
 /// [`SessionLifecycleStore::report_stale_failed_restore`] for this record this
 /// tick (plan 2026-10-07 D3)? Only for a restore-pending record, only on a
 /// determinate snapshot (an indeterminate one makes `claude_present == false`
-/// prove nothing), and never while its boot restore is withheld (`held`): that
-/// record is waiting for its restore, not failed by one.
+/// prove nothing), never while a drain or the restore phase withholds its boot
+/// restore, and never while a holder adoption is pending: those records are
+/// waiting, not failed.
+///
+/// Takes [`BootRestoreHold::id_match_only`], NOT [`BootRestoreHold::hold`]. The
+/// census arm of `hold` stays true for a row's whole failed lifetime, because a
+/// failed resume never writes `last_seen_at`, and
+/// [`stale_failed_restore_report`] already requires that THIS process attempted
+/// the restore. Keying on `hold` would disable the report for every census row.
 pub fn may_report_stale_failed_restore(
     restore_pending: bool,
     snapshot_ok: bool,
-    held: bool,
+    hold: BootRestoreHold,
+    adoption_pending: bool,
 ) -> bool {
-    restore_pending && snapshot_ok && !held
+    restore_pending && snapshot_ok && !hold.id_match_only && !adoption_pending
 }
 
 // ---------------------------------------------------------------------------
@@ -14103,18 +14159,95 @@ mod gate_continuation_tests {
 
     #[test]
     fn the_poll_consults_the_stale_failed_report_only_when_determinate_and_unheld() {
-        assert!(may_report_stale_failed_restore(true, true, false));
+        const WITHHELD: BootRestoreHold = BootRestoreHold {
+            id_match_only: true,
+            hold: true,
+        };
+        const CLEAR: BootRestoreHold = BootRestoreHold {
+            id_match_only: false,
+            hold: false,
+        };
+        assert!(may_report_stale_failed_restore(true, true, CLEAR, false));
         assert!(
-            !may_report_stale_failed_restore(false, true, false),
-            "no marker"
+            !may_report_stale_failed_restore(false, true, CLEAR, false),
+            "no restore marker: not a failed restore"
         );
         assert!(
-            !may_report_stale_failed_restore(true, false, false),
-            "indeterminate snapshot"
+            !may_report_stale_failed_restore(true, false, CLEAR, false),
+            "an indeterminate snapshot proves nothing about claude_present"
         );
         assert!(
-            !may_report_stale_failed_restore(true, true, true),
-            "boot restore withheld"
+            !may_report_stale_failed_restore(true, true, WITHHELD, false),
+            "a withheld boot restore is waiting, not failed"
+        );
+        assert!(
+            !may_report_stale_failed_restore(true, true, CLEAR, true),
+            "a pending holder adoption is waiting, not failed"
+        );
+    }
+
+    /// The census arm of the hold never lifts for a row whose resume failed: a
+    /// failed resume writes no `last_seen_at`, and `awaits_restore` only reads
+    /// the latched set. That row must still reach the stale-failed report.
+    #[test]
+    fn a_census_held_failed_restore_may_still_report_stale() {
+        let hold = boot_restore_hold(1_000, Some(2_000), BootRestorePhase::Ran, false, true);
+        assert!(hold.hold, "the census arm holds the row");
+        assert!(!hold.id_match_only, "nothing withholds its restore");
+        assert!(may_report_stale_failed_restore(true, true, hold, false));
+    }
+
+    #[test]
+    fn only_a_census_held_unmatched_unrestored_prior_gate_is_watched_from_the_poll() {
+        let census_only = BootRestoreHold {
+            id_match_only: false,
+            hold: true,
+        };
+        let withheld = BootRestoreHold {
+            id_match_only: true,
+            hold: true,
+        };
+        let row = gate_row(PRIOR);
+        let watched = |rec: &TerminalSessionRecord,
+                       awaiting: bool,
+                       hold: BootRestoreHold,
+                       matched: bool,
+                       adopting: bool| {
+            held_row_gate_to_watch(rec, awaiting, hold, matched, adopting, cur())
+        };
+        assert_eq!(
+            watched(&row, true, census_only, false, false).map(|(g, _)| g),
+            Some(gate())
+        );
+        assert_eq!(watched(&row, false, census_only, false, false), None);
+        assert_eq!(watched(&row, true, withheld, false, false), None);
+        assert_eq!(watched(&row, true, census_only, true, false), None);
+        assert_eq!(watched(&row, true, census_only, false, true), None);
+        assert_eq!(
+            watched(&gate_row(cur()), true, census_only, false, false),
+            None,
+            "this generation's own producers report its gate"
+        );
+        let mut attempted = gate_row(PRIOR);
+        attempted.restored_in_generation = Some(cur().to_string());
+        assert_eq!(
+            watched(&attempted, true, census_only, false, false),
+            None,
+            "a restore this process attempted is D3's or adoption's"
+        );
+        let mut reported = gate_row(PRIOR);
+        reported.gate_reported_generation = Some(cur().to_string());
+        assert_eq!(watched(&reported, true, census_only, false, false), None);
+        assert_eq!(
+            watched(
+                &closed(gate_row(PRIOR), "no-terminal"),
+                true,
+                census_only,
+                false,
+                false
+            ),
+            None,
+            "a closed row is the close observer's"
         );
     }
 
@@ -14179,10 +14312,22 @@ mod gate_continuation_tests {
         );
 
         // No marker at all (a live, verified session): nothing.
-        let (_dir3, s3) = store();
-        s3.record_open(gate_row(PRIOR));
+        let mut unmarked = gate_row(PRIOR);
+        unmarked.restored_in_generation = Some(cur().to_string());
+        unmarked.restore_tier = Some(RESTORE_TIER_FAILED.to_string());
         assert_eq!(
-            s3.report_stale_failed_restore(&csid, false, cur(), i64::MAX),
+            stale_failed_restore_report(&unmarked, false, cur(), i64::MAX),
+            None
+        );
+
+        // A terminal-only rebind stamps the generation but attempted no resume,
+        // so an earlier process's marker on it is not this process's failure.
+        let mut rebound = gate_row(PRIOR);
+        rebound.restored_in_generation = Some(cur().to_string());
+        rebound.restore_tier = Some(RESTORE_TIER_TERMINAL_ONLY.to_string());
+        rebound.restore_pending_at = Some(0);
+        assert_eq!(
+            stale_failed_restore_report(&rebound, false, cur(), i64::MAX),
             None
         );
 
@@ -14190,6 +14335,8 @@ mod gate_continuation_tests {
         let mut unstamped = gate_row(PRIOR);
         unstamped.gate_bound_generation = None;
         unstamped.state = "open".to_string();
+        unstamped.restored_in_generation = Some(cur().to_string());
+        unstamped.restore_tier = Some(RESTORE_TIER_FAILED.to_string());
         unstamped.restore_pending_at = Some(0);
         assert_eq!(
             stale_failed_restore_report(&unstamped, false, cur(), i64::MAX),
@@ -14197,6 +14344,8 @@ mod gate_continuation_tests {
         );
         // A closed record is the D2 close observer's, not the poll's.
         let mut shut = closed(gate_row(PRIOR), "no-terminal");
+        shut.restored_in_generation = Some(cur().to_string());
+        shut.restore_tier = Some(RESTORE_TIER_FAILED.to_string());
         shut.restore_pending_at = Some(0);
         assert_eq!(
             stale_failed_restore_report(&shut, false, cur(), i64::MAX),
@@ -14216,7 +14365,9 @@ mod gate_continuation_tests {
         assert!(s.claim_gate_report(&csid, cur(), &gate()));
         assert!(!s.claim_gate_report(&csid, cur(), &gate()));
         assert!(s.claim_gate_report(&csid, OTHER, &gate()));
-        assert!(!s.claim_gate_report("absent", cur(), &gate()));
+        // An absent row (pruned while a watcher held the deferred report): the
+        // watcher holds the only copy, so it still posts.
+        assert!(s.claim_gate_report("absent", cur(), &gate()));
 
         // A row this generation re-adopted (bound to `cur()`) owes no runner
         // report: its own exit hook reports it.

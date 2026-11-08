@@ -5,9 +5,10 @@
 //!
 //! A boot restore that finds a gate continuation's Claude process STILL
 //! RUNNING skips it ("skip-alive"). The durable record keeps pointing at the
-//! dead terminal id (or is rebound to a bare `terminal-only` shell), so the
-//! liveness poll closes it non-restorably after ~2¼ min, and the D2 close
-//! observer then posted `exit=crashed` for a session whose agent was alive.
+//! dead terminal id (or is rebound to a bare `terminal-only` shell). A rebound
+//! row, or one outside the boot census, is closed non-restorably by the
+//! liveness poll, and the D2 close observer then posted `exit=crashed` for a
+//! session whose agent was alive.
 //! The live process's own later `work_completed` was refused (coord admits one
 //! `work_*` per continuation), and once coord#2729 lands `crashed` is
 //! re-delivered — duplicate work beside the still-running original.
@@ -36,6 +37,13 @@
 //! precedence, which can hide the live row behind a dead one. The PID-filtered
 //! listing filtered by session id is the same registry read with the filter
 //! the plan asks for.
+//!
+//! A row in the boot census never closes that way: the census hold keeps it
+//! open, so no close observer fires. The poll arms the same watch directly for
+//! such a row ([`watch_then_report`], decided by
+//! [`held_row_gate_to_watch`](crate::session::session_lifecycle_store::held_row_gate_to_watch)),
+//! tagged [`CLOSE_BOOT_HELD`]. Without a live host it is simply waiting for its
+//! page, so nothing is posted.
 //!
 //! ## PID reuse
 //!
@@ -80,6 +88,15 @@ pub const INDETERMINATE_LOOKUP_ATTEMPTS: usize = 3;
 /// Suffix appended to the close reason of a report posted when a skip-alive
 /// host exits.
 pub const SKIP_ALIVE_EXIT_SUFFIX: &str = "+skip-alive-exit";
+
+/// The `close=` tag of a report for a row that never closed: the boot-census
+/// hold still has it open when its skip-alive host exits.
+pub const CLOSE_BOOT_HELD: &str = "boot-held";
+
+/// How often a watcher armed from the liveness poll re-probes its hosts. Each
+/// probe is a process-table snapshot, and these watchers have no close to
+/// bound how many run, so they keep the poll's own cadence.
+pub const HELD_WATCH_INTERVAL: Duration = Duration::from_secs(45);
 
 /// One Claude process hosting the session, identified so a reused pid cannot
 /// impersonate it.
@@ -241,6 +258,15 @@ pub async fn production_probe() -> HostProbe {
     }
 }
 
+/// The probe a watch needs once its hosts are known: the process table alone.
+/// It never reads the registry, which is what makes it cheap enough to repeat.
+pub async fn production_watch_probe() -> HostProbe {
+    HostProbe {
+        snapshot: crate::process_capture::process_tree::snapshot_process_table_public().await,
+        live_rows: Vec::new(),
+    }
+}
+
 /// The close observer's D2 post, gated on D4's live-host check.
 ///
 /// `report` is the already-decided D2 report for the just-closed record
@@ -316,11 +342,42 @@ pub async fn report_on_close<P, PF, S, SF>(
         opened_at: closed.opened_at,
         close: closed.close,
     };
+    watch_then_report(
+        store,
+        claude_session_id,
+        current_generation,
+        watch,
+        probe,
+        post,
+        interval,
+    )
+    .await;
+}
+
+/// Watch `watch.hosts` until every one has exited, then claim and post its
+/// [`SkipAliveWatch::exit_report`]. A dropped store (the runner shutting down)
+/// ends the watch without posting. An indeterminate probe is never read as an
+/// exit. The claim makes the post at-most-once per generation, and refuses it
+/// if this generation re-adopted the row or re-bound it to another gate.
+pub async fn watch_then_report<P, PF, S, SF>(
+    store: Weak<SessionLifecycleStore>,
+    claude_session_id: String,
+    current_generation: String,
+    watch: SkipAliveWatch,
+    mut probe: P,
+    mut post: S,
+    interval: Duration,
+) where
+    P: FnMut() -> PF,
+    PF: Future<Output = HostProbe>,
+    S: FnMut(RunnerRestartUnreported) -> SF,
+    SF: Future<Output = ()>,
+{
     info!(
         claude_session = %claude_session_id,
         gate_id = %watch.gate_id,
         pids = ?watch.hosts.iter().map(|h| h.pid).collect::<Vec<_>>(),
-        "continuation close: a live process still hosts the session — work_unreported deferred until it exits"
+        "continuation: a live process still hosts the session — work_unreported deferred until it exits"
     );
     loop {
         tokio::time::sleep(interval).await;
@@ -332,13 +389,16 @@ pub async fn report_on_close<P, PF, S, SF>(
             break;
         }
     }
-    if claim(&store) {
+    let claimed = store.upgrade().is_some_and(|s| {
+        s.claim_gate_report(&claude_session_id, &current_generation, &watch.gate_id)
+    });
+    if claimed {
         let exit = watch.exit_report(chrono::Utc::now().timestamp_millis());
         info!(
             claude_session = %claude_session_id,
             gate_id = %exit.gate_id,
             detail = %exit.detail,
-            "continuation close: skip-alive host exited — posting work_unreported"
+            "continuation: skip-alive host exited — posting work_unreported"
         );
         post(exit).await;
     }
@@ -512,6 +572,100 @@ mod tests {
         );
         let out = posts.lock().unwrap().clone();
         out
+    }
+
+    /// Run [`watch_then_report`] directly, the way the liveness poll arms it for
+    /// a row still open under the boot-census hold.
+    async fn run_held_watch(
+        store: &Arc<SessionLifecycleStore>,
+        script: Vec<HostProbe>,
+    ) -> Vec<RunnerRestartUnreported> {
+        let script = Arc::new(Mutex::new(VecDeque::from(script)));
+        let posts = Arc::new(Mutex::new(Vec::new()));
+        {
+            let script = script.clone();
+            let posts = posts.clone();
+            watch_then_report(
+                Arc::downgrade(store),
+                CSID.to_string(),
+                CUR.to_string(),
+                SkipAliveWatch {
+                    hosts: vec![LiveHost {
+                        pid: PID,
+                        started_at: STARTED_AT,
+                    }],
+                    gate_id: uuid::Uuid::parse_str(GATE).unwrap(),
+                    consuming_device_id: uuid::Uuid::parse_str(DEVICE).unwrap(),
+                    terminal_id: TERMINAL.to_string(),
+                    opened_at: 0,
+                    close: CLOSE_BOOT_HELD.to_string(),
+                },
+                move || {
+                    let next = script.lock().unwrap().pop_front().expect("probe script");
+                    async move { next }
+                },
+                move |r| {
+                    posts.lock().unwrap().push(r);
+                    async {}
+                },
+                TICK,
+            )
+            .await;
+        }
+        let out = posts.lock().unwrap().clone();
+        out
+    }
+
+    fn open_gate_store() -> (tempfile::TempDir, Arc<SessionLifecycleStore>) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap(),
+        );
+        store.record_open(gate_record());
+        (dir, store)
+    }
+
+    // A row the census hold keeps open: nothing while the host lives, one
+    // `boot-held` report when it exits, and the row stays open and claimed.
+    #[tokio::test(start_paused = true)]
+    async fn a_held_open_row_reports_once_when_its_host_exits() {
+        let (_dir, store) = open_gate_store();
+        let posts = run_held_watch(&store, vec![host_alive(), indeterminate(), host_gone()]).await;
+        assert_eq!(posts.len(), 1, "exactly one post: {posts:?}");
+        assert!(
+            posts[0].detail.starts_with("exit=unknown code=none after="),
+            "{}",
+            posts[0].detail
+        );
+        assert!(
+            posts[0].detail.ends_with(&format!(
+                "terminal={TERMINAL} reason=runner_restart close={CLOSE_BOOT_HELD}{SKIP_ALIVE_EXIT_SUFFIX}"
+            )),
+            "{}",
+            posts[0].detail
+        );
+        let rec = store.get(CSID).unwrap();
+        assert_eq!(rec.state, "open");
+        assert_eq!(rec.gate_reported_generation.as_deref(), Some(CUR));
+    }
+
+    // Another producer already claimed it: the watch ends without a second post.
+    #[tokio::test(start_paused = true)]
+    async fn a_held_row_already_claimed_posts_nothing() {
+        let (_dir, store) = open_gate_store();
+        assert!(store.claim_gate_report(CSID, CUR, &uuid::Uuid::parse_str(GATE).unwrap()));
+        let posts = run_held_watch(&store, vec![host_gone()]).await;
+        assert_eq!(posts, Vec::new());
+    }
+
+    // The row was pruned while the host outlived it. The watcher holds the only
+    // copy of the report, so it still posts.
+    #[tokio::test(start_paused = true)]
+    async fn a_watch_whose_row_was_removed_still_posts() {
+        let (_dir, store) = open_gate_store();
+        store.remove_session(CSID);
+        let posts = run_held_watch(&store, vec![host_alive(), host_gone()]).await;
+        assert_eq!(posts.len(), 1, "exactly one post: {posts:?}");
     }
 
     // (g) A live host defers the report until it exits, then posts once.

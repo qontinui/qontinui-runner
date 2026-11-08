@@ -53,6 +53,7 @@ describe("buildRetryResumeArgs (test i — the hand retry carries the record's g
     });
     expect(args.gate).toEqual({ gateId: GATE, gateConsumingDeviceId: DEVICE });
     expect(args.provider).toBe("claude");
+    expect(args.recordOpen.provider).toBe("claude");
     expect(args).toMatchObject({
       tabId: "tab-1",
       claudeSessionId: "sess-1",
@@ -72,6 +73,7 @@ describe("buildRetryResumeArgs (test i — the hand retry carries the record's g
       });
       expect("gate" in args).toBe(false);
       expect("provider" in args).toBe(false);
+      expect(args.recordOpen).toBe(recordOpen);
     }
   });
 
