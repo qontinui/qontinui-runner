@@ -15,7 +15,7 @@
 
 import { useUIComponent } from "@qontinui/ui-bridge";
 import { guardedHandler } from "@/lib/ui-bridge/guardedHandler";
-import { MAIN_WINDOW_LABEL, readWindowLabel } from "./contexts/WindowAssignmentsContext";
+import { MAIN_WINDOW_LABEL, readWindowLabel } from "./contexts/windowLabel";
 import type { TerminalPageConfig } from "./useTerminalPages";
 
 /** `list-pages` takes no argument; an undeclared key is refused by the guard. */
