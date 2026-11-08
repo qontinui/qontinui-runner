@@ -3918,16 +3918,6 @@ fn relay_content_route(raw_path: &str) -> Option<(RelayContentRoute, Option<Stri
     }
 }
 
-/// C2: blank the session content of every record in an `http_request`
-/// response whose session's tenant has `egress_terminal_stream` off (a record
-/// whose tenant cannot be established is judged by the strictest bound
-/// tenant). On the run routes each blanked field becomes `""` (`output_log`,
-/// which clients read as a string) or `null`, and the record gains
-/// `egress_redacted: [fields]`, so a client can tell a refusal from an empty
-/// run; a `/terminal-layout` row reads `title: null, titleWithheld: true`
-/// instead ([`RelayContentRoute::withhold`]). `None` = the body is left
-/// exactly as the local API produced it (not a content route, not JSON, or
-/// nothing to blank).
 /// What [`redact_relay_content`] decided for one response body.
 #[derive(Debug, PartialEq, Eq)]
 enum RelayContent {
@@ -3939,6 +3929,18 @@ enum RelayContent {
     Refuse,
 }
 
+/// C2: blank the session content of every record in an `http_request`
+/// response whose session's tenant has `egress_terminal_stream` off (a record
+/// whose tenant cannot be established is judged by the strictest bound
+/// tenant). On the run routes each blanked field becomes `""` (`output_log`,
+/// which clients read as a string) or `null`, and the record gains
+/// `egress_redacted: [fields]`, so a client can tell a refusal from an empty
+/// run; a `/terminal-layout` row reads `title: null, titleWithheld: true`
+/// instead ([`RelayContentRoute::withhold`]). [`RelayContent::Keep`] = the
+/// body is left exactly as the local API produced it (not a content route, or
+/// nothing to blank). A content route's body that is not JSON is kept only
+/// when even the strictest bound tenant permits, else
+/// [`RelayContent::Refuse`].
 fn redact_relay_content(raw_path: &str, body: &[u8]) -> RelayContent {
     let Some((route, path_run)) = relay_content_route(raw_path) else {
         return RelayContent::Keep;
@@ -11165,8 +11167,15 @@ mod egress_tests {
     async fn relayed_layout(
         server: &RecordingServer,
     ) -> (Vec<u8>, qontinui_types::terminal::TerminalLayout) {
-        let reply =
-            relay_http_to_base(&server.base, &dashboard_frame("GET", "/terminal-layout")).await;
+        relayed_layout_at(server, "/terminal-layout").await
+    }
+
+    /// [`relayed_layout`] with the frame's path spelled as `path`.
+    async fn relayed_layout_at(
+        server: &RecordingServer,
+        path: &str,
+    ) -> (Vec<u8>, qontinui_types::terminal::TerminalLayout) {
+        let reply = relay_http_to_base(&server.base, &dashboard_frame("GET", path)).await;
         assert_eq!(
             reply["status"], 200,
             "the layout is never refused outright: {reply}"
@@ -11258,6 +11267,26 @@ mod egress_tests {
         assert!(layout.labels_registered);
         assert_eq!(layout.runner.device_id.as_deref(), Some("device-1"));
 
+        // Every spelling the allow-list admits is redacted the same way: the
+        // gate matches the normalised path, as the allow-list does.
+        for spelling in [
+            "/TERMINAL-LAYOUT",
+            "/terminal-layout?x=1",
+            "\\terminal-layout",
+        ] {
+            let (bytes, layout) = relayed_layout_at(&server, spelling).await;
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(!text.contains("SECRET claude title"), "{spelling}: {text}");
+            let claude = layout_row(&layout, "t-claude");
+            assert_eq!(claude.title, None, "{spelling}");
+            assert!(claude.title_withheld, "{spelling}");
+            assert_eq!(
+                layout_row(&layout, "t-shell").title.as_deref(),
+                Some("SECRET shell title"),
+                "{spelling}"
+            );
+        }
+
         // The same tenant flipped ON.
         drop(refuse);
         let _permit = pin_for(Flow::TerminalStream, tenant, Level::On);
@@ -11272,10 +11301,16 @@ mod egress_tests {
         assert!(!claude.title_withheld);
 
         let seen = server.seen.lock().unwrap().clone();
-        assert_eq!(seen.len(), 2, "both reads reached the local API: {seen:?}");
+        assert_eq!(seen.len(), 5, "every read reached the local API: {seen:?}");
         for request in &seen {
+            // `\` reaches the stub as a path separator, so a backslash
+            // spelling may arrive as `//terminal-layout`; the method and the
+            // route are what this pins.
+            let line = request.lines().next().unwrap_or("").to_ascii_lowercase();
             assert!(
-                request.starts_with("GET /terminal-layout HTTP/1.1"),
+                line.starts_with("get /")
+                    && line.contains("terminal-layout")
+                    && line.ends_with(" http/1.1"),
                 "forwarded as the read it is: {request}"
             );
         }

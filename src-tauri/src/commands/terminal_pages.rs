@@ -25,8 +25,13 @@ use crate::terminal::layout::{self, PageLabelRegistry, PageLabels, RegisteredPag
 /// bound only stops a malformed call from parking an unbounded list.
 pub const MAX_REGISTERED_PAGES: usize = 1024;
 
-/// Longest label accepted, in characters.
+/// Longest label kept, in characters. A longer one is cut to this length and
+/// ends in [`TRUNCATION_MARK`], so it reads as cut rather than as the
+/// operator's whole label.
 pub const MAX_LABEL_CHARS: usize = 256;
+
+/// What a truncated label ends with.
+pub const TRUNCATION_MARK: char = '\u{2026}';
 
 /// One page as the webview sends it: `{pageId, label, order}`.
 #[derive(Debug, Clone, Deserialize)]
@@ -47,9 +52,10 @@ pub struct PageLabelInput {
 /// then by position in the list (so equal orders keep the webview's order).
 ///
 /// Refuses the WHOLE registration, leaving the previous one in place, when a
-/// page id is blank or listed twice, a label is over [`MAX_LABEL_CHARS`], or
-/// the list is over [`MAX_REGISTERED_PAGES`]. A partly-applied list would
-/// label some tabs from one roster and some from another.
+/// page id is blank or listed twice, or the list is over
+/// [`MAX_REGISTERED_PAGES`]: a partly-applied list would label some tabs from
+/// one roster and some from another. A label over [`MAX_LABEL_CHARS`] is not
+/// a reason to drop the roster; it is truncated ([`truncate_label`]).
 pub fn normalize_registration(pages: Vec<PageLabelInput>) -> Result<Vec<RegisteredPage>, String> {
     if pages.len() > MAX_REGISTERED_PAGES {
         return Err(format!(
@@ -73,18 +79,8 @@ pub fn normalize_registration(pages: Vec<PageLabelInput>) -> Result<Vec<Register
         }
         let label = page
             .label
-            .map(|l| l.trim().to_string())
+            .map(|l| truncate_label(l.trim()))
             .filter(|l| !l.is_empty());
-        if let Some(l) = &label {
-            let chars = l.chars().count();
-            if chars > MAX_LABEL_CHARS {
-                return Err(format!(
-                    "terminal_pages_register: the label of pageId {} is {chars} characters, \
-                     over the {MAX_LABEL_CHARS}-character limit",
-                    page.page_id
-                ));
-            }
-        }
         ordered.push((
             position,
             RegisteredPage {
@@ -96,6 +92,20 @@ pub fn normalize_registration(pages: Vec<PageLabelInput>) -> Result<Vec<Register
     }
     ordered.sort_by_key(|(position, page)| (page.order, *position));
     Ok(ordered.into_iter().map(|(_, page)| page).collect())
+}
+
+/// `label` as kept: unchanged up to [`MAX_LABEL_CHARS`] characters, otherwise
+/// its first `MAX_LABEL_CHARS - 1` characters (whitespace at the cut trimmed)
+/// followed by [`TRUNCATION_MARK`]. Counted in characters, never cut inside
+/// one.
+pub fn truncate_label(label: &str) -> String {
+    if label.chars().count() <= MAX_LABEL_CHARS {
+        return label.to_string();
+    }
+    let kept: String = label.chars().take(MAX_LABEL_CHARS - 1).collect();
+    let mut out = kept.trim_end().to_string();
+    out.push(TRUNCATION_MARK);
+    out
 }
 
 /// Replace this runner's tab-label registration with the webview's full page
@@ -229,7 +239,6 @@ mod tests {
         let refusals = [
             vec![input("p1", Some("One"), 0), input("p1", Some("Again"), 1)],
             vec![input("  ", Some("Blank id"), 0)],
-            vec![input("p2", Some(&"x".repeat(MAX_LABEL_CHARS + 1)), 0)],
             (0..=MAX_REGISTERED_PAGES)
                 .map(|i| input(&format!("p{i}"), None, i as u32))
                 .collect(),
@@ -243,13 +252,55 @@ mod tests {
             );
             assert_eq!(registry.snapshot(), before, "{err}");
         }
-        // A label exactly at the limit is accepted.
+    }
+
+    /// A label over the limit does not cost the roster: it is cut to
+    /// MAX_LABEL_CHARS characters ending in the truncation mark, counted in
+    /// characters, while a label exactly at the limit is kept whole and the
+    /// rest of the registration lands unchanged.
+    #[test]
+    fn an_over_long_label_is_truncated_not_refused() {
+        let registry = PageLabelRegistry::new();
+        let at_limit = "é".repeat(MAX_LABEL_CHARS);
+        let over = format!(
+            "{}{}",
+            "é".repeat(MAX_LABEL_CHARS - 2),
+            "  tail beyond the cut"
+        );
         register_into(
             &registry,
-            vec![input("p2", Some(&"é".repeat(MAX_LABEL_CHARS)), 0)],
+            vec![
+                input("p-at", Some(&at_limit), 0),
+                input("p-over", Some(&over), 1),
+                input("p-short", Some("Short"), 2),
+            ],
             at(),
         )
-        .expect("at the limit, counted in characters");
+        .expect("an over-long label is not a refusal");
+        let labels = registry.snapshot();
+        let label = |id: &str| {
+            labels
+                .pages()
+                .iter()
+                .find(|p| p.page_id == id)
+                .and_then(|p| p.label.clone())
+                .unwrap_or_else(|| panic!("{id} registered with a label"))
+        };
+        assert_eq!(label("p-at"), at_limit, "at the limit: kept whole");
+        let cut = label("p-over");
+        assert_eq!(cut.chars().count(), MAX_LABEL_CHARS - 1, "{cut}");
+        assert!(cut.ends_with(TRUNCATION_MARK), "{cut}");
+        assert!(
+            cut.starts_with(&"é".repeat(MAX_LABEL_CHARS - 2)),
+            "the cut keeps the label's start: {cut}"
+        );
+        assert!(!cut.contains("tail"), "{cut}");
+        assert_eq!(label("p-short"), "Short");
+        assert_eq!(truncate_label("Short"), "Short");
+        let long = "x".repeat(MAX_LABEL_CHARS + 50);
+        let cut = truncate_label(&long);
+        assert_eq!(cut.chars().count(), MAX_LABEL_CHARS);
+        assert!(cut.ends_with(TRUNCATION_MARK));
     }
 
     /// A position is a non-negative whole number: a negative or fractional
