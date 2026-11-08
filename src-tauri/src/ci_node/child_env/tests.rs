@@ -446,14 +446,12 @@ fn headline(e: &impl std::fmt::Display) -> String {
     if first_line.contains("reported ") {
         return withheld;
     }
-    let Some(at) = first_line.find(" exited ") else {
+    let Some((prefix, rest)) = first_line.split_once(" exited ") else {
         if first_line.starts_with("spawn ") || is_did_not_answer(first_line) {
             return first_line.to_string();
         }
         return withheld;
     };
-    let prefix = &first_line[..at];
-    let rest = &first_line[at + " exited ".len()..];
     let status: String = rest
         .split(" (")
         .next()
@@ -467,18 +465,18 @@ fn headline(e: &impl std::fmt::Display) -> String {
 /// `run_capture_env`'s timeout shape, anchored at both ends:
 /// `<program> did not answer [<argv>] within <n>s`.
 fn is_did_not_answer(line: &str) -> bool {
-    let Some(at) = line.find(" did not answer [") else {
+    let Some((program, after)) = line.split_once(" did not answer [") else {
         return false;
     };
-    let Some(within) = line.rfind("] within ") else {
+    // `rsplit_once` on what follows the program, so `] within ` must come
+    // AFTER the ` did not answer [` that opened the argv.
+    let Some((_, secs)) = after.rsplit_once("] within ") else {
         return false;
     };
-    let secs = &line[within + "] within ".len()..];
-    within > at
-        && !line[..at].contains(' ')
-        && secs.len() > 1
-        && secs.ends_with('s')
-        && secs[..secs.len() - 1].chars().all(|c| c.is_ascii_digit())
+    !program.contains(' ')
+        && secs
+            .strip_suffix('s')
+            .is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
 }
 
 #[test]
@@ -718,20 +716,23 @@ fn production_callers_pass_envs_only_under_the_container_policy() {
             }
         }
     }
-    /// The text between the `(` at `open` and its matching `)`.
-    fn call_arguments(code: &str, open: usize) -> &str {
+    /// The arguments of a call, given the text that starts at its `(`: the
+    /// text up to the matching `)`.
+    fn call_arguments(from_paren: &str) -> String {
         let mut depth = 0usize;
-        for (at, c) in code[open..].char_indices() {
+        let mut args = String::new();
+        for c in from_paren.chars() {
             match c {
                 '(' => depth += 1,
                 ')' => {
                     depth -= 1;
                     if depth == 0 {
-                        return &code[open + 1..open + at];
+                        return args.chars().skip(1).collect();
                     }
                 }
                 _ => {}
             }
+            args.push(c);
         }
         panic!("an unclosed `run_capture_env(` call");
     }
@@ -751,12 +752,16 @@ fn production_callers_pass_envs_only_under_the_container_policy() {
             .filter(|line| !line.trim_start().starts_with("//"))
             .collect::<Vec<_>>()
             .join("\n");
-        for (at, _) in code.match_indices("run_capture_env(") {
-            if code[..at].ends_with("fn ") {
+        // Each piece after the first follows one `run_capture_env(`; the
+        // piece before it says whether that is the definition.
+        let pieces: Vec<&str> = code.split("run_capture_env(").collect();
+        for pair in pieces.windows(2) {
+            let (before, after) = (pair[0], pair[1]);
+            if before.ends_with("fn ") {
                 continue;
             }
             calls += 1;
-            let args = call_arguments(&code, at + "run_capture_env".len());
+            let args = call_arguments(&format!("({after}"));
             let last = args
                 .trim()
                 .trim_end_matches(',')
