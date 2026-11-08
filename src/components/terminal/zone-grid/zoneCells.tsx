@@ -91,7 +91,9 @@ const FULL_PAGE_ZONE = { col: "1", row: "1" };
  * The tmux viewport is one full-page zone whatever the grid-mode settings say:
  * the header always shows (it carries `k / n` and the session switcher), a
  * compact card would replace the only terminal on screen, and there is no grid
- * to scroll, tile or maximize within.
+ * to scroll, tile or maximize within. Everything else — `tenantSwitcherShown`
+ * among it — passes through unchanged: the device's bindings do not depend on
+ * the work mode.
  */
 function tmuxCellProps(cellProps: ZoneCellSharedProps): ZoneCellSharedProps {
   return {
