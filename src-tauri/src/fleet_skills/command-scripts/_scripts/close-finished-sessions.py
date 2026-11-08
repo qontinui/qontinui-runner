@@ -23,6 +23,7 @@ LIVE, from /proc alone. /finish-session runs it. Exit 0 none live, 1 a live one,
 import argparse
 import datetime as dt
 import glob
+import http.client
 import json
 import os
 import re
@@ -34,6 +35,8 @@ import unicodedata
 import urllib.error
 import urllib.request
 
+# The helper runs from a provisioned skill directory, which must not collect a __pycache__.
+sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib"))
 from envelope import EnvelopeUnknown, load  # noqa: E402
 
@@ -63,12 +66,142 @@ SAFE_LINE_START = re.compile(
 HEDGE = re.compile(
     r"\b(?:not|never|except|but|unless|once|until|when|if|after|as soon as|then|assuming|provided|though|"
     r"however|first|must|should|pending|still|yet|blocked|awaiting|needs?|probably|maybe|unclear|unknown|"
-    r"uncommitted|unpushed|unverified|unreachable|dirty|failed|continu\w*|by mistake|mistakenly)\b|n't\b|\?", re.I)
+    r"uncommitted|unpushed|unverified|unreachable|dirty|failed|failing"
+    r"|continu(?!ation (?:report\)|(?:work )?outcome (?:[\u2014\u2013:] ?gate \S+,? outcome_recorded: ?work_completed\b"
+    r"|[\u2014\u2013:] ?not applicable\b|on gate \S+ (?:was|is) recorded as work_completed\b)))\w*"
+    r"|by mistake|mistakenly)\b"
+    r"|n't\b|\?", re.I)  # "continuing" hedges; /unattended's "continuation report/outcome" does not
 
 
 def sentence_at(text, start):
     """The rest of the sentence that begins at `start`."""
     return re.split(r"(?<=[.!?])\s|\n", text[start:start + 400], maxsplit=1)[0]
+
+
+# A hedge word that is itself NEGATED reports a zero, not a doubt: "no uncommitted changes, unpushed commits or
+# stashes", "nothing unpushed", "neither has uncommitted changes", "without uncommitted work", "nothing dirty".
+# Masked only as a NOUN LIST right after the negator, every word from the closed vocabulary below. ONE item may
+# be followed by punctuation, `and` or `anywhere` ("nothing unpushed, so", "no stashes and ..."; never a
+# preposition or here/there, which scope the zero - "no unpushed commits on main" - nor "so"). And a sentence whose zero was
+# masked must not then name local-only state ("no uncommitted changes, 3 commits ahead of origin"): see hedged(). SEVERAL items are a list only when the last is joined by `or`/`nor` - which distributes
+# the negation - and the list then ends at punctuation or the line end. `and` never continues a list ("no stashes,
+# and dirty files in the tree" says the files are dirty): it ends the masked item, so the hedge after it still
+# vetoes. "no uncommitted changes, unpushed commits remain" masks the first item alone and vetoes on "unpushed";
+# "nothing pushed, uncommitted work in tree" masks nothing ("pushed" is not in the vocabulary). A repeated
+# negator ("no unpushed commits and no stashes") is two single items.
+# Plan 2026-11-08-finished-sessions-held-open-by-idle-chrome-and-hedge-words, Phase 2.
+_ZERO_WORD = (r"(?:uncommitted|unpushed|unverified|unmerged|dirty|failed|failing|stashed|stray|leftover|left-over"
+              r"|local|background|allocated|open|changes?|commits?|work|files?|edits?|stash(?:es)?|branch(?:es)?"
+              r"|trees?|worktrees?|refs?|process(?:es)?|claims?|PRs?|jobs?|tests?|checks?|tasks?|items?)")
+_ZERO_ITEM = r"%s(?:[ \t]+%s){0,2}" % (_ZERO_WORD, _ZERO_WORD)
+_NEGATOR = (r"\b(?:no|without|zero|nothing(?:[ \t]+(?:is|was|left))?|neither(?:[ \t]+(?:has|have|is|holds?))?"
+            r"|none(?:[ \t]+(?:is|are|has|have))?)[ \t]+")
+_LIST_END = r"(?=[ \t]*(?:[.,;:)\u2014\u2013]|$))"
+
+
+def _negated_hedge(single_end):
+    return re.compile(
+        _NEGATOR + r"(?:%s(?:[ \t]*,[ \t]*(?:no[ \t]+)?%s)*[ \t]*,?[ \t]+(?:or|nor)[ \t]+(?:no[ \t]+)?%s%s|%s%s)"
+        % (_ZERO_ITEM, _ZERO_ITEM, _ZERO_ITEM, _LIST_END, _ZERO_ITEM, single_end), re.I | re.M)
+
+
+NEGATED_HEDGE = _negated_hedge(r"(?=[ \t]*(?:[.,;:)\u2014\u2013]|$)|[ \t]+(?:and|anywhere)\b)")
+# Before a mention, only a list closed by punctuation is masked ("clean and nothing unpushed, so it's safe to
+# close"): a list running on into the mention ("nothing dirty here is safe to close") keeps its negator for
+# SAFE_NEG_BEFORE.
+NEGATED_HEDGE_CLOSED = _negated_hedge(r"(?=[ \t]*[.,;:)\u2014\u2013])")
+# A parenthetical that explains a ZERO hand-off count in the report ("hand-off declared for 0 (the scratch clone
+# was never allocated, so there was nothing to declare)") is not a hedge. Only that shape is allowlisted - a
+# clone/worktree/tree/checkout never allocated, created or reserved, optionally followed by "so there was nothing
+# to declare" and NOTHING else - and any other note keeps its hedge: "(the fix commit was never created)", "(the
+# PR was never opened)", "(the worktree was never created, so the fix sits in the shared checkout)", "(not yet
+# declared)", "(coord unreachable)" veto.
+ZERO_HANDOFF_NOTE = re.compile(r"(\bhand-?off declared for 0[ \t]*\()([^()\n]*)(\))", re.I)
+ZERO_NOTE_OK = re.compile(
+    r"[ \t]*(?:the |a |an |this session's )?(?:scratch |agent |sibling )?(?:clone|worktree|tree|checkout|allocation)s?"
+    r" (?:was |were )?never (?:allocated|created|reserved)(?:[ \t]*[,;]?[ \t]*(?:so|and)?[ \t]*(?:there (?:was|were|is) )?"
+    r"(?:nothing|no hand-?off) to (?:declare|hand off))?[ \t.]*", re.I)
+
+
+def _mask_zero_note(m):
+    return m.group(1) + " " * len(m.group(2)) + m.group(3) if ZERO_NOTE_OK.fullmatch(m.group(2)) else m.group(0)
+
+
+NO_HANDOFF_NEEDED = re.compile(r"\bno (?:worktree )?hand-?offs?(?: declarations?)? (?:was |were )?needed\b", re.I)
+
+
+def unnegated(text, closed=False):
+    """`text` with negated hedge lists and zero-count notes blanked to spaces (lengths kept). `closed` masks
+    only lists that end at punctuation."""
+    # The report clause "no (worktree) hand-off was needed" first, whole, so the list mask cannot split it.
+    text = NO_HANDOFF_NEEDED.sub(lambda m: " " * len(m.group(0)), text)
+    text = (NEGATED_HEDGE_CLOSED if closed else NEGATED_HEDGE).sub(lambda m: " " * len(m.group(0)), text)
+    return ZERO_HANDOFF_NOTE.sub(_mask_zero_note, text)
+
+
+# Once a zero is masked, the REST of the sentence must be a plain clean report, by construction rather than by a
+# list of bad words: before the mask, the masked hedge word vetoed "no uncommitted changes, 3 commits ahead of
+# origin" or "... ; the push was rejected" by coincidence, and no list of local-state words can name every way
+# work is left owed. So after the report clauses and the "safe to close" phrase itself are removed, the rest is
+# split into clauses (at punctuation, "and", "so", "with"), and EVERY clause must match one of these closed clean
+# clause shapes - a grammar, not a bag of words, so "commits left on the branch" or "a stash exists" cannot be
+# assembled from clean-sounding words. Anything else keeps the veto the masked word used to give.
+_SUBJ = r"(?:(?:the|this|that|its|my|both|all|each|every) )?(?:(?:repo|coord|runner|web|notes|shared|scratch|session|agent) )?"
+_TREE = r"(?:worktrees?|trees?|checkouts?|repos?|repositor(?:y|ies)|clones?)"
+CLEAN_CLAUSES = re.compile(r"(?:" + r"|".join((
+    r"",
+    r"(?:also|yes|clean|checked|none touched|nothing|everything clean|step 4|9|9 verdict|verdict|hand-off safety"
+    r"|worktrees?|worktree check|repo|complete|github pr metadata)",
+    r"no (?:stray |leftover |background )*(?:processes|claims)(?: (?:from|of) (?:this|the) session)?",
+    r"(?:the|this) session had one (?:piece|unit) of work",
+    r"(?:now )?recorded in (?:that|a|the) (?:finding|gate|plan)",
+    r"(?:the label is )?" + _SUBJ + _TREE + r"(?: i checked)? (?:is|are|was|were) (?:left )?(?:clean|unchanged)",
+    r"(?:it|they|both|all|everything|that) (?:is|are|was|were) (?:all )?(?:clean|pushed|merged|landed)",
+    r"(?:(?:the|both|all|its|my|every|each) )?(?:commits?|branch(?:es)?|tags?) (?:is|are|was|were) (?:all )?"
+    r"(?:pushed|merged|landed)(?: to origin)?",
+    r"(?:which|that) (?:is|are|was|were) (?:pushed|merged|landed)",
+    # the subject of a masked zero ("this session has [no worktrees]", "there are [no uncommitted changes]")
+    r"(?:(?:(?:this|the) session|it|i|they|(?:the|this|each|the one) (?:(?:repo|coord|runner|web|notes|shared|scratch|session|agent) )?" + _TREE + r"(?: i checked)?"
+    r"|there) )?(?:has|had|have|holds|owns|left|made|allocated|touched|edited|created|is|are|was|were)",
+    r"(?:it's|it is)",
+    r"\d+ (?:repository )?(?:trees?|worktrees?)(?: (?:checked|touched|allocated|edited))?",
+    r"(?:(?:this|the) session|it|i) only changed coord state(?: and github pr metadata)?",
+    r"(?:the )?only change to the (?:shared |repo )?" + _TREE + r" is (?:one|a) tag",
+    r"i (?:checked|made|allocated|touched|edited|created)(?: \d+ (?:repository )?(?:trees?|worktrees?)| no| nothing)?",
+    r"(?:i )?left (?:it|them|the " + _TREE + r") in place(?: for the platform to reclaim)?",
+    r"(?:the " + _TREE + r" (?:is|are) )?left in place for the platform to reclaim",
+    r"(?:it|they) (?:was|were) handed off",
+    r"(?:from|of|by) (?:this|the) session",
+    r"nothing (?:that )?(?:exists|is left|left) only on (?:this machine's )?disk",
+    r"no (?:worktree )?hand-?offs? (?:was|were) needed",
+)) + r")", re.I)
+# "[I] pushed nothing" / "nothing pushed" is never a clean state, though each of its words is.
+_NOTHING_PUSHED = re.compile(r"\b(?:nothing|none|no|not)\b (?:\w+ )?(?:is |was |were |got |been )?(?:pushed|merged|landed)\b"
+                             r"|\b(?:pushed|merged|landed) (?:nothing|none)\b", re.I)
+_REPO_WORD = re.compile(r"\b(?:qontinui[\w.-]*|multistate)\b", re.I)
+
+
+def _benign_rest(masked):
+    """Whether `masked` (a sentence with its zeros blanked) holds nothing but clean-state reporting."""
+    rest = SAFE_RE.sub(" ", masked)
+    rest = re.sub(SAFE_CLAUSE, " ", rest, flags=re.I)
+    if _NOTHING_PUSHED.search(rest):
+        return False
+    rest = _REPO_WORD.sub("repo", rest)
+    for clause in re.split(r"[,;:.!?()\u2014\u2013]+|\s-\s|\b(?:and|so|with|which is pushed)\b", rest, flags=re.I):
+        clause = re.sub(r"\s+", " ", clause).strip().lstrip("-*># ").strip()
+        if not CLEAN_CLAUSES.fullmatch(clause):
+            return False
+    return True
+
+
+def hedged(text):
+    """A hedge in `text` that is not a negated report of a zero - or, once a zero was masked, anything in the rest
+    of the sentence that is not plain clean-state reporting."""
+    masked = unnegated(text)
+    # The clause grammar applies only where the mask removed a real hedge word: a zero with no hedge in it ("No
+    # open claims; PR #12 merged") never vetoed, and must not start to.
+    return HEDGE.search(masked) or (masked != text and HEDGE.search(text) and not _benign_rest(masked))
 
 
 # One clause of the report after the phrase. The report's first sentence must be
@@ -79,10 +212,11 @@ SAFE_CLAUSE = (
     r"(?:yes"
     r"|\d+ (?:repository )?(?:trees?|worktrees?) (?:checked|touched|allocated|edited)(?: or (?:edited|touched))?"
     r"(?: by this session)?(?: \([^()\n]*\))?"
-    r"|no (?:allocated )?(?:worktrees?|trees?|repository trees?|working trees?|commits)(?: (?:were|was))?"
+    r"|no (?:allocated |session )?(?:worktrees?|trees?|repository trees?|working trees?|commits)(?: (?:were|was))?"
     r"(?: (?:allocated|touched|edited|checked|created)(?: or (?:edited|touched))?| to hand off)?(?: by this session)?"
     r"|nothing (?:left |of this session's )?(?:exists |is )?(?:left )?only on (?:this machine's )?disk"
     r"|no work (?:exists |is )?(?:left )?only on (?:this machine's )?disk"
+    r"|no (?:files?|edits?|changes?)(?: of mine)? (?:exists? |is |are )?(?:left )?only on (?:this machine's )?disk"
     r"|nothing to hand off"
     r"|hand-?off declared for \d+(?: \([^()\n]*\))?"
     r"|no (?:worktree )?hand-?offs?(?: declarations?)? (?:was |were )?needed)")
@@ -104,31 +238,65 @@ SAFE_NEG_BEFORE = re.compile(
 # does the one full phrase "no work exists only on disk" - never "no work was pushed" or "no work is done".
 SAFE_NEG_AFTER = re.compile(
     r"[ \t]*(?:\?|[:=\u2014\u2013-][ \t]*(?:not|false|negative|n/a|unknown|unclear|pending|no"
-    r"(?![ \t]+(?:allocated[ \t]+)?(?:worktrees?|trees?|repository|working|commits|hand-?offs?)\b)"
-    r"(?![ \t]+work (?:exists |is )?(?:left )?only on (?:this machine's )?disk\b))\b)", re.I)
+    r"(?![ \t]+(?:(?:allocated|session)[ \t]+)?(?:worktrees?|trees?|repository|working|commits|hand-?offs?)\b)"
+    r"(?![ \t]+work (?:exists |is )?(?:left )?only on (?:this machine's )?disk\b)"
+    r"(?![ \t]+(?:files?|edits?|changes?)(?: of mine)? (?:exists? |is |are )?(?:left )?only on "
+    r"(?:this machine's )?disk\b))\b)", re.I)
+
+
+def neg_after(line):
+    """SAFE_NEG_AFTER on the rest of a mention's line, except a `: no` that opens a negated hedge list
+    ("Safe to close: no uncommitted changes or unpushed commits") - a report of zeros, not a no."""
+    m = SAFE_NEG_AFTER.match(line)
+    if m and m.group(0)[-2:].lower() == "no":
+        z = NEGATED_HEDGE.match(line, m.end() - 2)
+        if z and HEDGE.search(z.group(0)):
+            return None
+    return m
+
+
 # The line before a mention introduces a quotation of the format, not a report.
 QUOTED_EXAMPLE = re.compile(r"(?:format|example|e\.g\.|template|looks like|such as)[^\n]*:[ \t]*\n"
                             r"(?:[ \t]*\n)*$", re.I)
 DISK_LEFT = re.compile(r"\bonly on (?:this machine's )?disk\b", re.I)
-NO_WORK_BEFORE_DISK = re.compile(r"\bno work (?:exists |is )?(?:left )?$", re.I)
+# "no work / no files of mine / no edits are left" before "only on disk" is nothing left, never work left.
+NO_WORK_BEFORE_DISK = re.compile(r"\bno (?:work|files?|edits?|changes?)(?: of mine)? (?:exists? |is |are )?"
+                                 r"(?:left )?$", re.I)
 # The label form `**Safe to close?** SAFE TO CLOSE - <report>`: a bare "Safe to close?" opening its line and
 # followed at once by a FULL yes - the bare headline ending its sentence, or the headline and a report the
-# grammar accepts - is a label, not a question, and is dropped. Anything else keeps its `?`, so
-# "Safe to close? Unclear", "Safe to close? Safe to close, I think." and "Safe to close? NOT SAFE TO CLOSE" veto.
-SAFE_LABEL = re.compile(r"(?m)^([ \t>-]*)safe[ _-]to[ _-]close\?[ \t]+(safe[ _-]to[ _-]close)\b([^\n]*)$",
+# grammar accepts - is a label, not a question, and is dropped. So is the label answered by the headline and a
+# COUNTED report (`**Safe to close? SAFE TO CLOSE** - 0 trees: this session edited no files ...`) when nothing on
+# the rest of the line hedges, promises or names work still owed: the question is answered in place, and the
+# headline is then judged like any other (an unlisted report is neither a yes nor a veto). Anything else keeps its `?`,
+# so "Safe to close? Unclear", "Safe to close? Safe to close, I think." and "Safe to close? NOT SAFE TO CLOSE" veto.
+# Markdown emphasis around the label and headline is allowed (phrase_hits strips it first anyway).
+SAFE_LABEL = re.compile(r"(?m)^([ \t>*-]*)safe[ _-]to[ _-]close\?\**[ \t]+\**(safe[ _-]to[ _-]close)\b([^\n]*)$",
                         re.I)
 
 
 def _drop_safe_label(m):
     rest = m.group(3)
-    sep = re.match(r"[ \t]*[:=\u2014\u2013-][ \t]*", rest)
+    sep = re.match(r"\**[ \t]*[:=\u2014\u2013-][ \t]*", rest)
     report = sentence_at(rest, sep.end()) if sep else ""
-    full_yes = (re.fullmatch(r"[ \t]*[.!]?[ \t]*", rest) or re.match(r"[ \t]*[.!][ \t]", rest)
+    full_yes = (re.fullmatch(r"\**[ \t]*[.!]?[ \t]*\**[ \t]*", rest) or re.match(r"\**[ \t]*[.!][ \t]", rest)
                 or (sep and SAFE_REPORT_LINE.match(report)
                     and not (ZERO_CHECKED.search(report) and not NO_TREES.search(report))))
     # The rest of the line must not take it back ("Safe to close? Safe to close. Not really though.").
-    full_yes = full_yes and not (HEDGE.search(rest) or neg_hits(rest))
-    return m.group(1) + m.group(2) + rest if full_yes else m.group(0)
+    full_yes = full_yes and not (hedged(rest) or neg_hits(rest))
+    # Answered in place by a ZERO-tree report the grammar does not list ("- 0 trees: this session edited no files"):
+    # the label goes only when nothing on the rest of the line hedges, promises, names work still owed or names
+    # local state ("2 local commits", "3 commits ahead").
+    answered = (re.match(r"\**(?:[ \t]*[:\u2014\u2013]|[ \t]+-)[ \t]+0 (?:repository )?(?:trees?|worktrees?)"
+                         r"(?: \w+)?[ \t]*[:,;]", rest)
+                and not (hedged(rest) or neg_hits(rest) or promise_hits(rest) or OWED_WORDS.search(rest))
+                and _benign_rest(unnegated(rest)))  # and, by construction, nothing but clean-state reporting
+    return m.group(1) + m.group(2) + rest if full_yes or answered else m.group(0)
+
+
+OWED_WORDS = re.compile(r"\b(?:owed?|owes|remains?|remaining|next|todo|to-do|later|will|needs?|fix(?:es)?"
+                        r"|local|ahead|behind|edits|commits?|changes|modified|untracked|staged"
+                        r"|broke|broken|breaks|errors?|regress\w*|red|failing|fails?|in progress|running"
+                        r"|mid-flight|waiting|unfinished|incomplete|queued|underway|half)\b|'ll\b", re.I)
 
 
 def safe_to_close(text):
@@ -150,8 +318,8 @@ def safe_to_close(text):
         disk = [d for d in DISK_LEFT.finditer(whole)
                 if "nothing" not in whole[max(0, d.start() - 45):d.start()].lower()
                 and not NO_WORK_BEFORE_DISK.search(whole[:d.start()])]
-        if (SAFE_NEG_BEFORE.search(text[max(0, m.start() - 60):m.start()]) or SAFE_NEG_AFTER.match(line)
-                or HEDGE.search(whole) or disk):
+        if (SAFE_NEG_BEFORE.search(unnegated(text[max(0, m.start() - 60):m.start()], closed=True)) or neg_after(line)
+                or hedged(whole) or disk):
             no = True
             continue
         if QUOTED_EXAMPLE.search(text[max(0, line_start - 300):line_start]):
@@ -162,7 +330,7 @@ def safe_to_close(text):
             # The bare headline, or "Safe to close." on its own line: the line
             # after it must not take it back ("But first: approve #12").
             following = next((ln for ln in text[m.end():].split("\n")[1:] if ln.strip()), "")
-            if HEDGE.search(following) or neg_hits(following):
+            if hedged(following) or neg_hits(following):
                 no = True
             else:
                 yes = True
@@ -170,7 +338,7 @@ def safe_to_close(text):
         after = re.match(r"[ \t]*[.!][ \t]", line)
         if after:  # "Safe to close. <the rest of its line>": that rest must not take it back
             rest = line[after.end():]
-            if HEDGE.search(rest) or neg_hits(rest):
+            if hedged(rest) or neg_hits(rest):
                 no = True
             else:
                 yes = True
@@ -181,6 +349,140 @@ def safe_to_close(text):
                                                            and not NO_TREES.search(report)):
             yes = True
     return yes, no
+
+
+# An EXPLICIT negative headline: the one wording that still vetoes a row whose runner marker /unattended set
+# (see unattended_trusted). A line opening with NOT SAFE TO CLOSE, Step 4.9's `UNKNOWN - <k> trees could not
+# be checked`, or `Safe to close: false|not|unknown` or a bare `no` (one ending the line or followed by punctuation
+# or a conjunction: `Safe to close: no - PR open`, `? No.`), after a bullet, emphasis or one allowlisted label - and
+# "not / isn't / is not safe to close" and "unsafe to close" anywhere at all, in any case (a quoted or past-tense
+# one errs toward keeping the tab). Also: a `Safe to close:` answer of `probably not`, `maybe` and the like; a
+# `Safe to close:` line that goes on to `but`/`except`/`unless`; the upper-case short form `NOT SAFE`;
+# `Session finished: no`; and `Session left UNFINISHED` and `verdict: INCOMPLETE`, which contradict the marker
+# outright. Labels are any `<word> verdict:`. Runs of blanks are folded to one space before matching.
+# "Safe to close: no session worktrees; ..." opens a report of zeros, not a no.
+_LABEL = r"(?:hand-off safety|step 4\.9(?: verdict)?|(?:[\w-]+ )?verdict|safe-to-close verdict|safe[ _-]to[ _-]close ?\?)"
+NEG_HEADLINE = re.compile(
+    r"(?im)^[ >#*+-]*(?:" + _LABEL + r" ?:? ?)?"
+    r"(?:unknown ?(?:[:(\u2014\u2013-] ?)?\d+ (?:repository )?(?:trees?|worktrees?) could not be checked"
+    r"|safe[ _-]to[ _-]close ?[?:=\u2014\u2013-] ?(?:(?:probably |likely |maybe |perhaps )?(?:false|not|unknown|unclear"
+    r"|uncertain|nope|negative|pending|n/a)\b|maybe\b|possibly\b|perhaps\b"
+    r"|(?:only )?(?:once|after|until|when|if|unless|before|as soon as)\b"
+    r"|no\b(?= ?(?:$|[^\w ])| (?:because|since|as|while|until|yet|not|and|but)\b))"
+    r"|safe[ _-]to[ _-]close ?[:=\u2014\u2013-][^\n]*\b(?:but|except|unless)\b"
+    r"|(?:[\w-]+ )?(?:closeable|closable|ready to close) ?: ?(?:no|false|not)\b)")
+# A negator wrapped onto the headline's own line ("this is not\nSAFE TO CLOSE - ..."), in any case.
+NEG_WRAPPED = re.compile(r"(?i)\b(?:not|no longer|never|isn't|is not|aren't)[ \t]*\n[ \t>#*-]*safe[ _-]to[ _-]close\b")
+# The same negatives spelled anywhere, read over the text with ALL whitespace (newlines too) folded to one space.
+NEG_ANYWHERE = re.compile(
+    r"(?i)(?:\b(?:not|no longer|never|nothing|none)|n't)(?: [\w'-]+){0,5}? safe[ _-]to[ _-]close\b"
+    r"|\bsafe[ _-]to[ _-]close ?[:=\u2014\u2013-] ?(?:\w+ )?(?:not|nah|nope)\b|\bsafe[ _-]to[ _-]close\b[^.!?;]{0,20}n't think so"
+    r"|'ll be (?:\w+ )?safe[ _-]to[ _-]close\b"
+    r"|\b(?:session|tab|terminal|pane|this|it) (?:should |must |will |needs? to )?(?:remain|stay|be kept) open\b"
+    r"|\b(?:keep|leave) (?:this|the|it|that)(?: session| tab| terminal| pane| window)? open\b"
+    r"|\b(?:once|after|until|when|if|as soon as)\b[^.!?;]{0,40}\bsafe[ _-]to[ _-]close\b"
+    r"|\bsafe[ _-]to[ _-]close ?[:=\u2014\u2013-] ?(?:no|false|not|unknown|unclear|n/a|pending|negative)\b"
+    r"(?! (?:session |allocated )?(?:worktrees?|trees?|work|files?|edits?|changes?|commits|repository|working|hand-?offs?)\b)"
+    r"(?! (?:uncommitted|unpushed|unverified|unmerged|dirty|failed|failing|stashed|stray|leftover|left-over|local"
+    r"|background|open|stash(?:es)?|claims?|PRs?)\b)"  # "Safe to close: no uncommitted changes ..." reports zeros
+    r"|\b(?:session|work|it|this|that|phase \d+)(?: \w+)? (?:is |was |remains )?(?:left )?(?:unfinished|incomplete)\b"
+    r"|\bunsafe\b[^.!?;]{0,30}\b(?:clos|exit)\w*|\b(?:clos|exit)\w*[^.!?;]{0,30}\bunsafe\b"
+    r"|\bnot (?:yet )?(?:ready|safe|ok|okay) to (?:close|exit|end)\b|\bhold off (?:on )?(?:closing|exiting)\b"
+    r"|\b(?:do not|don't|must not|mustn't) (?:yet )?(?:exit|end|kill)\b"
+    r"|\bsession (?:is |was )?not (?:yet )?(?:marked )?(?:finished|done)\b"
+    r"|\b(?:marked|finished)\b[^.!?;]{0,40}\b(?:by mistake|mistakenly|wrongly|in error)\b"
+    r"|\b(?:finish(?:ed)? mark|marked finished)\b[^.!?;]{0,20}\b(?:premature|too early)\b"
+    r"|\bshould(?: not|n't) have (?:been )?(?:marked|finished)\b|\b(?:marking|finishing) it[^.!?;]{0,20}\bwas a mistake\b"
+    r"|\breopening (?:this|the) session\b|\bunless\b[^.!?;]{0,40}\bsafe[ _-]to[ _-]close\b"
+    r"|(?:^|[.;] |\u00b6 )(?:[\w-]+ )?(?:closeable|closable|ready to close|safe-to-close verdict) ?: ?(?:no|false|not)\b"
+    r"|\b(?:by mistake|mistakenly|wrongly)\b[^.!?;]{0,40}\b(?:marked|finished)\b"
+    r"|n't think [^.]{0,20}safe[ _-]to[ _-]close\b|\bsafe[ _-]to[ _-]close ?\? ?(?:no|not)\b"
+    r"|\b(?:will|would|could|might|may) be (?:\w+ )?safe[ _-]to[ _-]close\b"
+    r"|\bsafe[ _-]to[ _-]close (?:only )?(?:once|after|until|when|if|unless|as soon as)\b"
+    r"|\bunsafe[ _-]to[ _-]close\b|\bsession (?:is |was )?(?:left )?unfinished\b"
+    r"|\b(?:session|work|it|this|that) (?:is |was )?not (?:yet |quite )?(?:done|finished|complete|completed)\b"
+    r"|\b(?:I'm|I am|we're|we are) not (?:yet |quite )?(?:done|finished|complete)\b"
+    r"|(?:^|[.!?:;] |\u00b6 )not (?:yet )?(?:done|finished|complete)\b|\bnot (?:done|finished|complete) yet\b"
+    r"|\b(?:should|must|needs? to) stay open\b"
+    r"|\b(?:must not|mustn't|should not|shouldn't|do not|don't|cannot|can't) (?:yet )?(?:be )?closed?\b"
+    r"|\b(?:keep|leave) (?:this|the|it)(?: session| tab)? open\b"
+    r"|\bsession (?:marked )?finished ?[?:=\u2014\u2013-] ?(?:no|not|false)\b"
+    r"|\bverdict ?[:\u2014\u2013-]? ?(?:is |was )?incomplete\b")
+NEG_HEADLINE_UPPER = re.compile(r"\bNOT SAFE\b")  # case matters: the short headline token
+
+
+def _folded(text):
+    """normalize(), with runs of spaces and tabs folded to one space."""
+    return re.sub(r"[ \t]+", " ", normalize(text))
+
+
+def negative_headline(text):
+    """The explicit negative headline in `text`, else None. Read over the WHOLE message, code and quotes
+    included, so a quoted headline errs toward keeping the tab."""
+    norm = _folded(text)
+    # Line breaks fold to a space, so "**Safe to close?**\nNo - ..." and "NOT\nSAFE TO CLOSE" stay one negative,
+    # EXCEPT a break after a label whose value is a bare zero ("Peer messages: none") or before the Step 4.9
+    # headline: those become a stop token, so "none" never negates the headline on the next line.
+    flat = re.sub(r"(?im)(:[ \t]*(?:none|nothing|n/a|no|zero)[ \t]*)\n|\n(?=[ \t>#*-]*safe[ _-]to[ _-]close[ \t]*[\u2014\u2013:-])",
+                  lambda m: (m.group(1) or "") + " \u00b6 ", norm)
+    flat = re.sub(r"\s+", " ", flat)
+    # The upper-case NOT SAFE token is unambiguous across ANY line break ("NOT\nSAFE TO CLOSE - ...").
+    m = (NEG_HEADLINE.search(norm) or NEG_ANYWHERE.search(flat) or NEG_WRAPPED.search(norm)
+         or NEG_HEADLINE_UPPER.search(re.sub(r"\s+", " ", norm)))
+    return m.group(0).strip()[:60] if m else None
+
+
+# The reply must also BE the report /unattended writes after its gate passed - a line OPENING at column 0 (no
+# indent, bullet or blockquote; code fences are stripped first) in one of the shapes it prints: the Step 4.9
+# headline `SAFE TO CLOSE - <n> trees checked|touched|allocated` (or `- no worktrees`), Step 4's lead line
+# `Unattended verdict: COMPLETE` (after at most one `<Label>:`), Step 5's `Session marked finished - carried by`,
+# or /finish-session's `Session finished - <session id>` - before the marker is trusted over its wording. A
+# subagent shares its parent's session id, so a stray "unattended:" finish can land on a parent that is still
+# talking. This narrows that case (labels, bullets, indents, fences and introduced quotes are refused - see
+# own_report) but cannot close it: a verbatim column-0 paste with no introducing line still passes, which needs
+# a second failure first (/unattended Step 5 forbids a subagent to run /finish-session at all).
+UNATTENDED_REPORT = re.compile(
+    r"^(?:#+ )?(?:Step 4\.9(?: verdict)?: ?)?SAFE[ _-]TO[ _-]CLOSE ?[:\u2014\u2013-] ?"
+    r"(?:\d+ (?:repository )?(?:trees?|worktrees?) (?:checked|touched|allocated)|no (?:session |allocated )?worktrees?)"
+    r"|^(?:#+ )?(?:Closeout: ?)?Unattended verdict:? ?COMPLETE\b"
+    r"|^(?:#+ )?Session marked finished ?[\u2014\u2013:] ?carried by [^,\n]+, read back\b"
+    r"|^(?:#+ )?Session finished ?[\u2014\u2013:] ?[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\b",
+    re.M)
+# A line introducing a quotation ("The closeout subagent returned:", "Subagent result:", "From the /unattended
+# subagent:") makes EVERY report shape after it a quote, to the end of the message: /unattended's report runs to
+# several paragraphs, so a pasted one cannot be bounded by its first blank line.
+REPORT_QUOTED = re.compile(r"(?i)\b(?:returned|reported|reports|report|result|results|output|said|says|wrote|printed"
+                           r"|summary|found|finished"
+                           r"|came back|subagent|agent|closeout|format|example|e\.g\.|template|looks like|such as)\b"
+                           r"[^\n]*:[ \t]*$"
+                           # ...and a heading or sentence naming a subagent's result without a colon:
+                           # "## Subagent result", "Here is what the closeout subagent found."
+                           r"|^(?:#+ [^\n]*\b(?:subagent|agent|result|results|report|summary|output)\b[^\n]*"
+                           r"|[^\n]*\bsub-?agent\b[^\n]*\b(?:found|returned|reported|said|wrote|result|report|verdict)"
+                           r"\b[^\n]*)$")
+
+
+def own_report(text):
+    """Whether `text` carries one of /unattended's report shapes as its OWN line: column 0, outside a code fence,
+    and before any line introducing a quotation (a parent pasting its subagent's report)."""
+    for ln in normalize(FENCED_BLOCKS.sub(" ", text)).split("\n"):
+        if REPORT_QUOTED.search(ln):
+            return False
+        if UNATTENDED_REPORT.match(ln):
+            return True
+    return False
+
+
+FENCED_BLOCKS = re.compile(r"^[ \t]*```[^\n]*\n.*?^[ \t]*```[ \t]*$", re.S | re.M)
+# Asks of the operator that a trusted row keeps as vetoes beside TRUST_KEEPS (the "states the next step" label,
+# which is dropped, also carries these two).
+OPERATOR_ASK = re.compile(r"\bneed your\b|\btell me\b|\blet me know\b", re.I)
+# Vetoes a trusted row KEEPS: the operator is being asked to act, or the reply says the session is not finished.
+# What it drops is the hedge, work-remains and promise wording the report carries about work it already settled.
+# ("session finished: no" is not kept as phrase_hits spells it - that pattern also reads "...marked the session
+# finished. No closer will ..." as a no - but negative_headline keeps the real `Session finished: no`.)
+TRUST_KEEPS = {"its closing paragraphs ask a question", "asks the operator to act", "waiting on the operator",
+               "not marking finished"}
 
 
 # Other closeout statements: /finish-session's report. Matched only at a line
@@ -615,6 +917,191 @@ _PROMISES_R2 = [
 ]
 PHRASE_CASES += [(t, "veto") for t in _PROMISES_R2] + [("Session marked finished.\n" + t, "veto") for t in _PROMISES_R2]
 
+# Plan 2026-11-08-finished-sessions-held-open-by-idle-chrome-and-hedge-words, Phase 2: a negated hedge, a note
+# explaining a zero hand-off, an emphasised label and "no files of mine ... only on disk" read as the reports they
+# are - synthetic strings modelled on the closeouts the old grammar vetoed. The vetoes after them must hold.
+PHRASE_CASES += [
+    ("SAFE TO CLOSE: 1 tree checked, nothing only on disk; hand-off declared for 0 (the scratch clone was never "
+     "allocated, so there was nothing to declare).", True),
+    ("**SAFE TO CLOSE** \u2014 no files of mine exist only on disk.", True),
+    ("SAFE TO CLOSE \u2014 no files exist only on disk.", True),
+    ("SAFE TO CLOSE: no edits are left only on disk.", True),
+    ("SAFE TO CLOSE \u2014 1 tree checked; nothing exists only on disk except the runner's .claude/ command set; "
+     "hand-off declared for 1.", "veto"),
+    ("SAFE TO CLOSE \u2014 1 tree checked, nothing only on disk; hand-off declared for 0 (not yet declared).", "veto"),
+    ("SAFE TO CLOSE \u2014 1 tree checked, nothing only on disk; hand-off declared for 0 (coord unreachable).", "veto"),
+    ("Safe to close: no uncommitted changes, unpushed commits remain.", "veto"),
+    ("Safe to close: nothing pushed, uncommitted work in the tree.", "veto"),
+    ("Safe to close: no uncommitted changes, but 2 unpushed commits.", "veto"),
+    ("Safe to close: no uncommitted changes, not yet pushed.", "veto"),
+    ("Safe to close: no unpushed commits, unless the push failed.", "veto"),
+    ("Safe to close: no work exists only on disk, but uncommitted files remain.", "veto"),
+    ("Safe to close: no files were pushed", "veto"),
+    ("**Safe to close? SAFE TO CLOSE** \u2014 0 trees: but CI is still red.", "veto"),
+    ("**Safe to close? SAFE TO CLOSE** \u2014 1 tree checked, nothing only on disk, once CI is green.", "veto"),
+    ("Safe to close? Safe to close \u2014 I think so?", "veto"),
+    ('The "safe to close" check couldn\'t confirm that nothing is still owed.', "veto"),
+    ("Coord still counts withdrawn gates as unfinished work, which means the session can never read as safe to "
+     "close. I overrode that check with --force.", "veto"),
+    ("Whether the session is safe to close is UNKNOWN: coord's obligations check timed out.", "veto"),
+    ("Safe to close: no", "veto"),
+    ("NOT SAFE TO CLOSE \u2014 1 tree", "veto"),
+    ("Safe to close: not yet \u2014 the push is still running.", "veto"),
+]
+NO_VETO_CASES_PHASE2 = [
+    "Safe to close: 1 tree checked; nothing exists only on disk (no uncommitted changes, unpushed commits or stashes).",
+    "Safe to close: the worktree is clean, with no unpushed commits and no stashes.",
+    "SAFE TO CLOSE: 2 trees checked, neither has uncommitted changes, and both commits are pushed.",
+    "Safe to close: this session has no worktrees, claims or uncommitted work.",
+    "Safe to close: this session has no allocated worktrees and no unpushed work.",
+    "Safe to close: the tree is clean, without uncommitted work.",
+    "Safe to close: nothing dirty, nothing only on disk.",
+    "Safe to close: no failed checks, and nothing only on disk.",
+    "- Worktree: clean and nothing unpushed, so it's safe to close.",
+    "- Safe to close: 1 tree checked: clean, nothing unpushed, nothing that exists only on disk.",
+    "- Worktrees: none touched, so nothing is uncommitted, unpushed or stashed. Safe to close: 0 trees checked, "
+    "nothing exists only on disk.",
+    "SAFE TO CLOSE \u2014 the worktree is clean and has no unpushed commits.",
+    "**Safe to close? SAFE TO CLOSE** \u2014 0 trees: this session edited no files; it only changed coord state. "
+    "No worktree hand-off was needed.",
+    "SAFE TO CLOSE. The one worktree I checked has no uncommitted changes and no unpushed commits.",
+    "Safe to close: no uncommitted changes or unpushed commits.",
+    "- SAFE TO CLOSE: no session worktrees; the shared checkout is clean.",
+    # review round 11: a zero with no hedge word in it never vetoed and must not start to
+    "SAFE TO CLOSE. No open claims; PR #12 merged as 4f3a2c1.",
+    "SAFE TO CLOSE. No stray processes; the gate watches PR #3.",
+    "SAFE TO CLOSE \u2014 1 tree checked, nothing only on disk; no open PRs, PR #12 merged.",
+    "SAFE TO CLOSE. No hand-off was needed: PR #12 merged.",
+    "Unattended verdict: COMPLETE. Two units (the finding, the continuation report), all recorded. Safe to close.",
+]
+PHRASE_CASES += [("Safe to close: no changes", "veto"), ("Safe to close: no, uncommitted changes.", "veto"),
+                 ("Safe to close: no uncommitted changes yet.", "veto"),
+                 ("I am continuing the work. Safe to close.", "veto"),
+                 # review round 1: `and` never continues a negated list; a counted label answer must not owe work
+                 ("SAFE TO CLOSE: no uncommitted changes and failed to push the branch.", "veto"),
+                 ("Safe to close: no stashes, and dirty files in the tree.", "veto"),
+                 ("Safe to close: no unpushed commits, and uncommitted changes in qontinui-web.", "veto"),
+                 ("Safe to close: no uncommitted changes and unpushed commits on main.", "veto"),
+                 ("Safe to close: no claims and failed checks on PR #3.", "veto"),
+                 ("Safe to close: no worktrees and dirty files in the shared checkout.", "veto"),
+                 ("**Safe to close? SAFE TO CLOSE** \u2014 I'll push it next.", "veto"),
+                 ("**Safe to close? SAFE TO CLOSE** \u2014 the PR is owed a fix", "veto"),
+                 ("**Safe to close? SAFE TO CLOSE** \u2014 0 trees: work remains on the branch.", "veto"),
+                 ("**Safe to close? SAFE TO CLOSE** \u2014 0 trees: the fix will land later.", "veto"),
+                 ("SAFE TO CLOSE. The continuation is running in this session.", "veto"),
+                 ("SAFE TO CLOSE. The continuation job is in progress.", "veto"),
+                 ("SAFE TO CLOSE. Continuation in progress here.", "veto"),
+                 # review round 2: a zero hand-off note saying the WORK was never done is no zero
+                 ("SAFE TO CLOSE \u2014 1 tree checked, nothing only on disk; hand-off declared for 0 (the fix was "
+                  "not committed)", "veto"),
+                 ("SAFE TO CLOSE \u2014 1 tree checked, nothing only on disk; hand-off declared for 0 (couldn't push "
+                  "the branch)", "veto"),
+                 ("SAFE TO CLOSE \u2014 1 tree checked, nothing only on disk; hand-off declared for 0 (the worktree "
+                  "was never pushed)", "veto"),
+                 ("SAFE TO CLOSE \u2014 1 tree checked, nothing only on disk; hand-off declared for 0 (the branch is "
+                  "not on origin)", "veto"),
+                 ("Safe to close: nothing dirty here is safe to close", "veto"),
+                 # review round 3
+                 ("SAFE TO CLOSE \u2014 1 tree checked, nothing only on disk; hand-off declared for 0 (the fix commit "
+                  "was never created).", "veto"),
+                 ("SAFE TO CLOSE \u2014 1 tree checked, nothing only on disk; hand-off declared for 0 (the PR was "
+                  "never opened).", "veto"),
+                 ("**Safe to close? SAFE TO CLOSE** \u2014 3 trees checked: web clean, schemas has 2 local commits.",
+                  "veto"),
+                 ("**Safe to close? SAFE TO CLOSE** \u2014 0 trees: schemas is 3 commits ahead of origin.", "veto"),
+                 ("Safe to close? SAFE TO CLOSE \u2014 2 trees touched: both have local edits.", "veto"),
+                 ("Safe to close: no failed checks so far.", "veto"),
+                 ("Safe to close: no unpushed commits on main from me.\nThe feature branch has 2.", "veto"),
+                 ("Safe to close: neither has uncommitted changes from the rebase.", "veto"),
+                 # review round 4: a masked zero beside local-only state; a note naming where work sits
+                 ("Safe to close: no uncommitted changes, 3 commits ahead of origin.", "veto"),
+                 ("Safe to close: no uncommitted changes and 2 local commits on the branch.", "veto"),
+                 ("SAFE TO CLOSE: 1 tree checked, nothing dirty, the fix commit sits on a local branch only.", "veto"),
+                 ("Safe to close: nothing unpushed here, 2 stashes kept.", "veto"),
+                 ("SAFE TO CLOSE \u2014 1 tree checked, nothing only on disk; hand-off declared for 0 (the worktree "
+                  "was never created, so the fix sits in the shared checkout).", "veto"),
+                 ("**Safe to close? SAFE TO CLOSE** \u2014 0 trees: the migration broke prod.", "veto"),
+                 # review round 5
+                 ("Safe to close: no unpushed commits, 3 modified files in qontinui-web.", "veto"),
+                 ("Safe to close: nothing unpushed, the tree has edits.", "veto"),
+                 ("Safe to close: no uncommitted changes, 1 commit only in this clone.", "veto"),
+                 ("Safe to close: no uncommitted changes, 1 unpublished commit.", "veto"),
+                 ("Safe to close: no uncommitted changes, 2 commits to push.", "veto"),
+                 ("Safe to close: no uncommitted changes and nothing pushed.", "veto"),
+                 ("Safe to close: zero failed, 2 failing.", "veto"),
+                 ("Safe to close: nothing unpushed here. Schemas has 2 unpushed commits.", "veto"),
+                 ("**Safe to close? SAFE TO CLOSE** \u2014 0 trees: tests are failing on main.", "veto"),
+                 ("**Safe to close? SAFE TO CLOSE** \u2014 0 trees: the deploy is in progress.", "veto"),
+                 ("**Safe to close? SAFE TO CLOSE** \u2014 0 trees: the migration is running in prod.", "veto"),
+                 ("**Safe to close? SAFE TO CLOSE** \u2014 0 trees: the release job is mid-flight.", "veto"),
+                 ("SAFE TO CLOSE. The continuation outcome: Phase 2 in progress here.", "veto"),
+                 # review round 8: placing or counting words beside a masked zero; a watched PR in progress
+                 ("Safe to close: no uncommitted changes; zero commits on origin.", "veto"),
+                 ("Safe to close: no uncommitted changes, nothing on origin.", "veto"),
+                 ("Safe to close: nothing dirty, the commit exists only in this worktree.", "veto"),
+                 ("Safe to close: no unpushed commits, 2 commits on main in the shared checkout.", "veto"),
+                 ("Safe to close: no uncommitted changes or unpushed commits: 2 on main.", "veto"),
+                 ("Safe to close: no uncommitted changes; a hand-off is required for the worktree.", "veto"),
+                 ("SAFE TO CLOSE.\nPR #3 checks in progress; a gate watches the merge.", True),
+                 # review round 9: the clean remainder is a clause grammar, not a bag of clean words
+                 ("Safe to close: no uncommitted changes; commits left on the branch.", "veto"),
+                 ("Safe to close: no uncommitted changes; the commit is in the worktree.", "veto"),
+                 ("Safe to close: no unpushed commits, the tree has changes.", "veto"),
+                 ("Safe to close: no unpushed commits; the files are edited in the shared checkout.", "veto"),
+                 ("Safe to close: nothing dirty; a stash exists.", "veto"),
+                 ("Safe to close: no dirty files; the branch has commits.", "veto"),
+                 ("**Safe to close? SAFE TO CLOSE** \u2014 0 trees: the stash has work.", "veto"),
+                 ("Safe to close: no uncommitted changes; I pushed nothing.", "veto"),
+                 ("SAFE TO CLOSE. The continuation report: Phase 2 is underway in this session.", "veto"),
+                 ("SAFE TO CLOSE. The continuation outcome is that I resume Phase 2 here.", "veto"),
+                 # review round 10: only /unattended's printed continuation shapes; no free words in clean clauses
+                 ("SAFE TO CLOSE. Continuation report, Phase 2 resumes in this session.", "veto"),
+                 ("SAFE TO CLOSE. Continuation outcome \u2014 Phase 2 resumes in this session.", "veto"),
+                 ("SAFE TO CLOSE\nContinuation outcome: work_abandoned \u2014 1 unit DROPPED.", "veto"),
+                 ("Safe to close: no uncommitted changes; i made commits.", "veto"),
+                 ("Safe to close: no uncommitted changes; hand-offs were needed.", "veto"),
+                 ("Safe to close: no uncommitted changes; the broken worktree is unchanged.", "veto"),
+                 ("Safe to close: 2 trees checked; one worktree has no uncommitted changes.", "veto"),
+                 ("Safe to close: no uncommitted changes; the only change to the prod database is one tag", "veto"),
+                 # review round 6
+                 ("**Safe to close? SAFE TO CLOSE** \u2014 0 trees: waiting on the release job.", "veto"),
+                 ("**Safe to close? SAFE TO CLOSE** \u2014 0 trees: the backfill is unfinished.", "veto"),
+                 ("**Safe to close? SAFE TO CLOSE** \u2014 0 trees: deploy half done.", "veto"),
+                 ("**Safe to close? SAFE TO CLOSE** \u2014 0 trees: CI is queued on #3.", "veto"),
+                 ("Safe to close: no uncommitted changes, the fix sits in my worktree.", "veto"),
+                 ("Safe to close: nothing dirty, the branch exists only here.", "veto"),
+                 ("Safe to close: no failed checks, the build is broken.", "veto"),
+                 ("Safe to close: no failing tests, 3 errors in the build.", "veto"),
+                 ("Nothing dirty, the rollout is running, safe to close.", "veto"),
+                 ("SAFE TO CLOSE \u2014 no uncommitted changes, rollout in flight", "veto"),
+                 # review round 7: the rest of a masked sentence must be clean-state reporting, by construction
+                 ("Safe to close: no uncommitted changes; the push was rejected by the hook.", "veto"),
+                 ("Safe to close: nothing unpushed, the remote diverged.", "veto"),
+                 ("Safe to close: no dirty files, the PR has conflicts.", "veto"),
+                 ("SAFE TO CLOSE \u2014 no uncommitted changes; the commit was lost.", "veto"),
+                 ("Safe to close: no uncommitted work, migration half-applied.", "veto"),
+                 ("**Safe to close? SAFE TO CLOSE** \u2014 0 trees: the hotfix PR was rejected by review.", "veto"),                 ("**Safe to close? SAFE TO CLOSE** \u2014 1 tree checked, nothing only on disk; hand-off declared for 1. "
+                  "The fix is not pushed.", "veto")]  # the label keeps its `?` when the line takes it back
+# negative_headline (Phase 3): text -> whether it is an explicit negative headline.
+NEG_HEADLINE_CASES = [
+    ("Safe to close: no", True), ("Safe to close? No.", True), ("**Safe to close:** no \u2014 PR #3 is open", True),
+    ("Safe to close: false", True), ("SAFE_TO_CLOSE: false", True), ("Safe to close: not yet", True),
+    ("Step 4.9 verdict: NOT SAFE TO CLOSE \u2014 1 tree", True), ("SAFE TO CLOSE? **NOT SAFE TO CLOSE \u2014 1 tree**", True),
+    ("UNKNOWN \u2014 2 trees could not be checked", True), ("It is not safe to close yet.", True),
+    ("- SAFE TO CLOSE: no session worktrees; the shared checkout is clean.", False),
+    ("Safe to close: no worktrees allocated, nothing only on disk.", False),
+    ("SAFE TO CLOSE \u2014 1 tree checked, nothing only on disk; hand-off declared for 1.", False),
+    ("- Closeability: UNKNOWN, the obligations lookup timed out.", False),
+    ("Safe to close: unclear", True), ("Safe to close: nope, 1 tree dirty.", True),
+    ("UNKNOWN (2 trees could not be checked)", True), ("Closeout verdict: UNKNOWN \u2014 2 trees could not be checked", True),
+    ("NOT SAFE \u2014 1 tree", True), ("Session left UNFINISHED.", True),
+    ("Safe to close: no worktrees; but qontinui-web has 2 unpushed commits.", True),
+    ("Unattended verdict: COMPLETE.", False), ("So I marked the session finished. No closer will close it.", False),
+    ("Session finished: no \u2014 blocked", True),("**Unattended verdict: INCOMPLETE** \u2014 1 unit waits on you", True),
+    ("The policy-read check was incomplete.", False),
+    ("Whether it is safe to close automatically is UNKNOWN.", False),
+]
+
 # Real closeouts from finished sessions in wordings the grammar does not list.
 # They need not read as a yes, but they must NOT veto a runner finished marker.
 NO_VETO_CASES = [
@@ -643,7 +1130,7 @@ NO_VETO_CASES = [
     "SAFE TO CLOSE. Running the suite now shows 284 green.",
     "Starting now, the hook blocks raw cargo.",
     "No jobs are running now.",
-]
+] + NO_VETO_CASES_PHASE2
 
 
 # windDown block -> True (vetoes a close) / False (leaves it to this script's own checks).
@@ -719,6 +1206,13 @@ def selftest():
             bad.append(f"veto expected: {text[:60]!r} -> pos={pos} neg={neg}")
         elif (bool(pos) and not neg) != bool(want is True):
             bad.append(f"{'closeout' if want else 'not a closeout'} expected: {text[:60]!r} -> pos={pos} neg={neg}")
+    for text in NO_VETO_CASES_PHASE2:
+        if negative_headline(text):
+            bad.append(f"a Phase 2 zero report must not read as a negative headline: {text[:60]!r} -> "
+                       f"{negative_headline(text)!r}")
+    for text, want in NEG_HEADLINE_CASES:
+        if bool(negative_headline(text)) != want:
+            bad.append(f"negative_headline {text!r} expected {want}, got {negative_headline(text)!r}")
     for text, want in FOOTER_CASES:
         got = footer_nothing_owed(text) is not None
         if got != want:
@@ -868,7 +1362,39 @@ def selftest():
     if two["t"]["claudeSessionId"] != "new":
         bad.append("a terminal with two open rows must resolve to the newest openedAt")
     finish_cases = finish_time_cases(bad)
-    stray_cases = stray_selftest(bad, empty) + end_strays_selftest(bad)
+    stray_cases = stray_selftest(bad, empty) + end_strays_selftest(bad) + zombie_live_selftest(bad)
+    for row, want in [({"account": {"label": "paktis"}, "configDir": "/h/.claude-x"}, "paktis"),
+                      ({"account": {"label": "unknown"}, "configDir": "/h/.claude-lukas"}, "lukas"),
+                      ({"account": {"label": "unknown"}, "configDir": os.path.expanduser("~/.claude") + "/"}, "default"),
+                      ({"account": {"label": "unknown"}, "configDir": "~/.claude"}, "default"),
+                      ({"account": {"label": "unknown"}, "configDir": "/other/home/.claude"}, ".claude"),
+                      ({"account": {"label": "unknown"}, "configDir": None}, "unknown"),
+                      ({"account": {"label": "unknown"}, "configDir": "/h/acct-x"}, "acct-x"),
+                      ({"account": {"label": "unknown"}, "configDir": "C:\\u\\.claude-win\\"}, "win"),
+                      ({}, "?")]:
+        if account_of(row) != want:
+            bad.append(f"account_of {row} expected {want}, got {account_of(row)}")
+    home = os.path.expanduser("~/.claude")
+    for row, live, want in [({"configDir": "/h/.claude-a"}, "/h/.claude-b", "/h/.claude-b"),
+                            ({"configDir": None}, "", home), ({"configDir": "/h/.claude-a"}, None, "/h/.claude-a")]:
+        got = with_live_config_dir(row, {}, 1, read=lambda _t, _p, v=live: v)["configDir"]
+        if got != want:
+            bad.append(f"with_live_config_dir {row} live={live!r} expected {want}, got {got}")
+    if with_live_config_dir(None, {}, 1, read=lambda _t, _p: "/h/.claude-b") is not None:
+        bad.append("with_live_config_dir(None) must stay None")
+    def cwd_of(v):
+        def read():
+            if isinstance(v, Exception):
+                raise v
+            return v
+        return read
+    for cd, cwd, want in [("", "/w", ""), ("/h/.claude-a/", "/w", "/h/.claude-a"),
+                          ("~/.claude-a", "/w", os.path.expanduser("~/.claude-a")),
+                          ("acct", "/w/p", "/w/p/acct"), ("../.claude-b", "/w/p", "/w/.claude-b"),
+                          ("acct", "/w/p (deleted)", None), ("acct", OSError("gone"), None)]:
+        got = resolve_config_dir(cd, cwd_of(cwd))
+        if got != want:
+            bad.append(f"resolve_config_dir {cd!r} cwd={cwd!r} expected {want!r}, got {got!r}")
     for line in bad:
         print("SELFTEST FAIL: " + line)
     print(f"selftest: {len(PHRASE_CASES)} phrase cases, {len(WIND_DOWN_CASES)} wind-down reason cases, "
@@ -899,6 +1425,11 @@ def finish_time_cases(bad):
     marker = {"finished": True, "finishedAt": before}
     wake = "<task-notification><task-id>b1</task-id> background build finished"
     prompted = ("coord finished", "then prompted")
+    ua = {"finished": True, "finishedAt": after, "finishReason": "unattended: 3 units, all landed or watched"}
+    hedgy = dict(base, final_text="PR #3 is pushed; its checks are still running and a gate watches the merge.\n"
+                                  "- Whether coord can auto-close this session is UNKNOWN: the obligations check "
+                                  "timed out.\n\nSAFE TO CLOSE \u2014 1 tree checked, nothing only on disk; hand-off "
+                                  "declared for 1.")
     cases = [  # (registry row, readiness row, transcript, want, reason fragment(s): all must appear, "!x" must not)
         ({}, at(before), base, "REVIVED", prompted),
         ({}, at(before), shut, "REVIVED", "predates that prompt"),
@@ -956,6 +1487,208 @@ def finish_time_cases(bad):
         # a time on a status that is not finished is no finish time
         ({"finished": True, "finishedAt": after}, {"sessionStatus": "working", "sessionStatusSince": before},
          base, "FINISHED", "runner finished marker"),
+        # Plan 2026-11-08-...-hedge-words Phase 3: a marker /unattended set ("unattended: ...") is trusted over the
+        # final reply's hedge words, work-remains and promise phrases; only a negative headline or a revival vetoes.
+        (ua, {}, hedgy, "FINISHED", ("runner finished marker (unattended:", "set by /unattended", "still running")),
+        (ua, at(after), hedgy, "FINISHED", ("no prompt since", "set by /unattended")),
+        (ua, {}, dict(hedgy, final_text="Doing it now.\n\nSAFE TO CLOSE \u2014 1 tree checked\n\nPOLICY_COMPLIANCE: ok"),
+         "FINISHED", "set by /unattended"),
+        (ua, {}, dict(hedgy, final_text="Unattended verdict: COMPLETE. PR #3's checks are still running.\n"
+                                        "- Whether it is safe to close is UNKNOWN: the lookup timed out."),
+         "FINISHED", "set by /unattended"),
+        # ...but not a reply that is not /unattended's report (a parent sharing a subagent's session id),
+        # nor one asking the operator to act
+        (ua, {}, dict(hedgy, final_text="PR #3 still needs the migration fix; I'll check it after CI."), "ACTIVE",
+         "work remains"),
+        (ua, {}, dict(hedgy, final_text=hedgy["final_text"] + "\n\nShall I start Phase 2?"), "ACTIVE",
+         "work remains"),
+        (ua, {}, dict(hedgy, final_text=hedgy["final_text"] + "\nWant me to open the PR too?"), "ACTIVE",
+         "work remains"),
+        (ua, {"sessionStatus": "finished", "sessionStatusSince": after}, hedgy, "FINISHED", "set by /unattended"),
+        (dict(ua, finishedAt=None), {"sessionStatus": "finished", "sessionStatusSince": after}, hedgy, "ACTIVE",
+         "work remains"),
+        (ua, {}, dict(hedgy, final_text="Session left UNFINISHED.\nSAFE TO CLOSE \u2014 1 tree checked\nCI still running."),
+         "ACTIVE", "work remains"),
+        # review round 2: a quoted SAFE TO CLOSE is not the report; spelled-out negatives and questions still veto
+        (ua, {}, dict(hedgy, final_text="The review subagent reported SAFE TO CLOSE for its scratch tree. I still "
+                                        "need to fix the two findings it raised; I'll check them next."),
+         "ACTIVE", "work remains"),
+        *[(ua, {}, dict(hedgy, final_text="Unattended verdict: COMPLETE.\n" + t), "ACTIVE", "work remains") for t in (
+            "It isn't SAFE TO CLOSE after all: qontinui-web has 2 unpushed commits.",
+            "NOT  SAFE TO CLOSE \u2014 1 tree\n  qontinui-web: 2 unpushed commits",
+            "Safe to close? Probably not \u2014 qontinui-web has 2 unpushed commits.",
+            "Safe to close: maybe \u2014 the unpushed commit may still be there.",
+            "SAFE TO CLOSE \u2014 1 tree checked; hand-off declared for 1\nUnsafe to close actually: qontinui-web is dirty.",
+            "Session finished: no \u2014 PR #3 still owes a fix.",
+            "SAFE TO CLOSE \u2014 1 tree checked\nDo I also open the follow-up PR? Let me know.",
+            "SAFE TO CLOSE \u2014 1 tree checked\nWait \u2014 should I also open PR #4 against main?")],
+        # review round 3: a quoted or recounted report is not the report; more spelled-out negatives and asks
+        *[(ua, {}, dict(hedgy, final_text=t), "ACTIVE", "work remains") for t in (
+            "The review subagent's report:\n> SAFE TO CLOSE \u2014 1 tree checked, nothing only on disk\nI still need "
+            "to fix the two findings it raised; I'll check them next.",
+            "- SAFE TO CLOSE (subagent's scratch tree). The parent work is still running; I'll check it after CI.",
+            "> Unattended verdict: COMPLETE\n(that was the subagent's verdict, not mine)\nStill running Phase 3 "
+            "tests; I'll check them next.",
+            "Session marked finished by the review subagent by mistake. I'll undo it; tests are still running.",
+            "Verdict: COMPLETE for Phase 1. Phase 2 is still running; I'll check back on it.",
+            "SAFE TO CLOSE \u2014 1 tree checked\nUpdate: it is no longer safe to close \u2014 2 unpushed commits.",
+            "SAFE TO CLOSE \u2014 1 tree checked\nI don't think it's safe to close yet: 2 unpushed commits remain.",
+            "SAFE TO CLOSE \u2014 1 tree checked\nThis session must not be closed: the migration is still running.",
+            "SAFE TO CLOSE \u2014 1 tree checked\nKeep this session open; the deploy is still running.",
+            "Session finished? No.\nCI is still running on PR #3; I'll check it after.",
+            "Session marked finished: no \u2014 1 unit is DROPPED. I'll resume after CI.",
+            "SAFE TO CLOSE \u2014 1 tree checked, nothing only on disk\nI need your sign-off on the schema change; "
+            "CI is still running.",
+            "SAFE TO CLOSE \u2014 1 tree checked, nothing only on disk\nTell me if you want Phase 2 started; CI is "
+            "still running.",
+            "Unattended verdict \u2014 INCOMPLETE: 1 unit DROPPED. CI is still running.")],
+        # review round 4: fenced, bulleted, indented or mid-line report shapes are not the report
+        *[(ua, {}, dict(hedgy, final_text=t), "ACTIVE", "work remains") for t in (
+            "The review subagent returned:\n```\nSAFE TO CLOSE \u2014 1 tree checked, nothing only on disk; hand-off "
+            "declared for 1\n```\nI still need to fix the two findings it raised; I will check them next.",
+            "Subagent report:\n- SAFE TO CLOSE \u2014 1 tree checked, nothing only on disk\nPhase 2 is still running; "
+            "I will check it after CI.",
+            "Subagent report:\n    SAFE TO CLOSE \u2014 1 tree checked, nothing only on disk\nPhase 2 is still "
+            "running; I will check it after CI.",
+            "The subagent said Unattended verdict: COMPLETE for Phase 1 only. Phase 2 is still running; I will "
+            "check it after CI.",
+            "Session marked finished \u2014 by the review subagent, by mistake. I will undo it; tests are still "
+            "running.",
+            "Session marked finished: by mistake (the subagent shares my id). Phase 2 still running; checking it next.",
+            "Unattended verdict: COMPLETE.\nIt is not quite safe to close: 2 unpushed commits remain.",
+            "Unattended verdict: COMPLETE.\nCorrection: NOT\nsafe to close, 2 unpushed commits.",
+            "Unattended verdict: COMPLETE.\nIs this safe to close? No \u2014 2 unpushed commits.\n\na\n\nb\n\nc",
+            "Unattended verdict: COMPLETE.\nLeave this session open; the migration is still running.",
+            "Unattended verdict: COMPLETE.\nThis session is not done: Phase 2 is still running here.",
+            "Unattended verdict: COMPLETE.\nSession NOT finished \u2014 bind attempted and failed; still waiting.")],
+        # review round 5: a labelled (recounted) report shape; strict negatives; not-done; conditional answers
+        *[(ua, {}, dict(hedgy, final_text=t), "ACTIVE", "work remains") for t in (
+            "Subagent: Unattended verdict: COMPLETE \u2014 2 units.\nI still need to fix the two findings; I'll check "
+            "CI next.",
+            "Subagent verdict: SAFE TO CLOSE \u2014 1 tree checked, nothing only on disk\nI still need to fix them; "
+            "I'll check CI next.",
+            "Review verdict: SAFE TO CLOSE \u2014 1 tree checked\nPhase 2 is still running; I'll check it after CI.",
+            "Note: Unattended verdict: COMPLETE was the subagent's.\nPhase 2 is still running; I'll check it.")]
+          + [(ua, {}, dict(hedgy, final_text="Unattended verdict: COMPLETE.\n" + t + "\nCI is still running."), "ACTIVE",
+              "work remains") for t in (
+            "Safe to close: negative, 2 unpushed commits.", "Safe to close: pending - CI on #3 has not finished.",
+            "Safe to close: n/a until #3 lands.",
+            "None of the three trees is safe to close: qontinui-web has 2 unpushed commits.",
+            "Nothing here is safe to close yet.", "Session is NOT complete: Phase 2 is still running.",
+            "Work is NOT complete.", "Not finished: Phase 2 is still running.", "We're not done.", "I'm not done yet.",
+            "Not done yet: Phase 2 is running.", "Session should stay open: Phase 2 is still running.",
+            "Safe to close: once #3 lands.", "Safe to close: only after #3 lands.", "Safe to close: when CI is green.",
+            "It will be safe to close once PR #3 lands.", "Only safe to close after I push the fix.",
+            "Do not close this session.", "Session is unfinished.")],
+        # review round 6: conditions before the phrase, any n't, unanchored answers, synonyms, a pasted report
+        *[(ua, {}, dict(hedgy, final_text="Unattended verdict: COMPLETE \u2014 3 units.\n" + t + "\nCI still running.\n"
+                                          "SAFE TO CLOSE \u2014 1 tree checked, nothing only on disk"), "ACTIVE",
+           "work remains") for t in (
+            "When CI is green this session is safe to close.", "Once PR #3 lands it is safe to close.",
+            "After the migration finishes, this is safe to close.", "It won't be safe to close.",
+            "It wasn't safe to close.", "It doesn't seem safe to close yet.", "This hasn't become safe to close.",
+            "- qontinui-web \u2014 safe to close: no (2 unpushed commits)", "qontinui-web safe to close: false",
+            "Overall safe to close: unknown", "The session is incomplete.", "Work remains incomplete.",
+            "Phase 2 is unfinished.", "Closing now would be unsafe.")],
+        (ua, {}, dict(hedgy, final_text="The closeout subagent returned:\n\nUnattended verdict: COMPLETE \u2014 2 units\n"
+                                        "SAFE TO CLOSE \u2014 1 tree checked, nothing only on disk\n\nI still need to fix "
+                                        "the two findings it raised; I'll check them next."), "ACTIVE", "work remains"),
+        # review round 7: a multi-paragraph pasted report; a self-written "carried by"; more explicit negatives
+        *[(ua, {}, dict(hedgy, final_text=t), "ACTIVE", "work remains") for t in (
+            "The closeout subagent returned:\n\nUnattended verdict: COMPLETE \u2014 2 units, 0 converted.\n\nFleet "
+            "policy read this run.\n\nSAFE TO CLOSE \u2014 1 tree checked, nothing only on disk; hand-off declared "
+            "for 1\n\nI still need to fix the two findings it raised; I'll check them next.",
+            "Subagent result:\nSAFE TO CLOSE \u2014 1 tree checked, nothing only on disk\nI'll check CI next.",
+            "From the /unattended subagent:\nUnattended verdict: COMPLETE\nPhase 2 is still running.",
+            "Session marked finished \u2014 carried by the review subagent's run, by mistake. I'll undo it after CI; "
+            "Phase 2 is still running.")]
+          + [(ua, {}, dict(hedgy, final_text="Unattended verdict: COMPLETE \u2014 3 units.\n" + t + " CI still running."),
+              "ACTIVE", "work remains") for t in (
+            "This session is not ready to close.", "Not safe to exit yet.", "Do not exit this session.",
+            "Hold off on closing this one.", "Session not marked finished.")],
+        (ua, {}, dict(hedgy, final_text="Session marked finished \u2014 carried by the runner door, read back from "
+                                        "coord.\nCI is still running on PR #3."), "FINISHED", "set by /unattended"),
+        # review round 11: a question on one line answered on the next stays one negative
+        *[(ua, {}, dict(hedgy, final_text="Unattended verdict: COMPLETE \u2014 3 units.\n" + t + "\n\nCI is still running."
+                                          "\n\nA\n\nB\n\nSAFE TO CLOSE \u2014 1 tree checked, nothing only on disk\n\nC"),
+           "ACTIVE", "work remains") for t in (
+            "Is this safe to close?\nNo \u2014 qontinui-web has 2 unpushed commits.",
+            "**Safe to close?**\nNo \u2014 qontinui-web has 2 unpushed commits.",
+            "Correction: this is NOT\nSAFE TO CLOSE \u2014 2 unpushed commits.",
+            "Session finished?\nNo \u2014 Phase 2 is still running.",
+            # review round 12: a lower-case negator wrapped onto the headline line
+            "Correction: this is not\nSAFE TO CLOSE \u2014 1 tree checked; 2 unpushed commits.",
+            "It is no longer\nSAFE TO CLOSE \u2014 1 tree checked.")],
+        # review round 12: closeability labels after a verdict line with no closing period
+        *[(ua, {}, dict(hedgy, final_text="Unattended verdict: COMPLETE \u2014 3 units\n" + t + "\nCI still running."),
+           "ACTIVE", "work remains") for t in ("Ready to close: no", "Closeable: no")],
+        # review round 10: a "none" on one line does not negate the next line's headline; retractions
+        *[(ua, {}, dict(hedgy, final_text="Unattended verdict: COMPLETE \u2014 3 units.\n" + t + "\nCI is still running.\n"
+                                          "SAFE TO CLOSE \u2014 2 trees checked, nothing only on disk"), "FINISHED",
+           "set by /unattended") for t in ("Peer messages: none", "- Open questions: none\n",
+                                          "Policy-read confidence: FULL \u2014 stop decisions: none\n")],
+        *[(ua, {}, dict(hedgy, final_text="Unattended verdict: COMPLETE \u2014 3 units.\n" + t + " CI still running."),
+           "ACTIVE", "work remains") for t in (
+            "Correction: the verdict is INCOMPLETE, Phase 2 is still running.",
+            "I should not have finished the session.", "Marking it finished was a mistake.",
+            "Reopening this session: Phase 2 is still running.")],
+        # review round 9: an introduction with no colon; more spelled-out negatives
+        (ua, {}, dict(hedgy, final_text="## Subagent result\n\nSAFE TO CLOSE \u2014 1 tree checked, nothing only on disk; "
+                                        "hand-off declared for 1\n\nPhase 2 is still running; I will check it after CI."),
+         "ACTIVE", "work remains"),
+        (ua, {}, dict(hedgy, final_text="Here is what the closeout subagent found.\n\nUnattended verdict: COMPLETE \u2014 2 "
+                                        "units\n\nI still need to fix the two findings; I'll check CI next."),
+         "ACTIVE", "work remains"),
+        *[(ua, {}, dict(hedgy, final_text="Unattended verdict: COMPLETE \u2014 3 units.\n" + t + " CI still running."),
+           "ACTIVE", "work remains") for t in (
+            "Safe-to-close verdict: NO.", "Closeable: no.", "Ready to close: no.", "The finish mark was premature.",
+            "Session should not have been marked finished.", "Unless CI fails, it is safe to close.")],
+        # review round 8
+        *[(ua, {}, dict(hedgy, final_text="Unattended verdict: COMPLETE \u2014 3 units.\n" + t + " CI still running.\n"
+                                          "SAFE TO CLOSE \u2014 1 tree checked, nothing only on disk"), "ACTIVE",
+           "work remains") for t in (
+            "Safe to close: I don't think so, qontinui-web has 2 unpushed commits.",
+            "Safe to close: definitely not, 2 unpushed commits.", "Safe to close: nah.",
+            "It'll be safe to close tomorrow, after the migration.", "The session should remain open.",
+            "Keep this terminal open; the deploy is still running.")],
+        (ua, {}, dict(hedgy, final_text="Here is the summary:\n\nUnattended verdict: COMPLETE \u2014 2 units\n\nSAFE TO "
+                                        "CLOSE \u2014 1 tree checked\n\nI still need to fix the two findings; I'll check "
+                                        "CI next."), "ACTIVE", "work remains"),
+        (ua, {}, dict(hedgy, final_text="Unattended verdict: COMPLETE \u2014 3 units.\nPR #3 checks are still running; "
+                                        "a gate watches the merge.\nSafe to close: no uncommitted changes or unpushed "
+                                        "commits."), "FINISHED", "set by /unattended"),
+        # the report shapes /unattended and /finish-session print are trusted
+        (ua, {}, dict(hedgy, final_text="**Session marked finished** \u2014 carried by the runner door, read back from "
+                                        "coord.\nCI is still "
+                                        "running on PR #3."), "FINISHED", "set by /unattended"),
+        # an old "unattended:" reason does not ride on a later finish another door made after a prompt
+        (dict(ua, finishedAt=now - 120 * m), at(after), dict(hedgy, final_text="I marked the session finished, but "
+                                                              "CI is still running; I'll check back on PR #3."),
+         "ACTIVE", "work remains"),
+        (ua, {}, dict(hedgy, final_text=hedgy["final_text"] + "\nNOT SAFE TO CLOSE \u2014 1 tree\n  x: 1 unpushed"),
+         "ACTIVE", "work remains"),
+        (ua, {}, dict(hedgy, final_text="**Safe to close:** no \u2014 PR #3 is open."), "ACTIVE", "work remains"),
+        (ua, {}, dict(hedgy, final_text="SAFE TO CLOSE? NOT SAFE TO CLOSE \u2014 1 tree"), "ACTIVE", "work remains"),
+        (ua, {}, dict(hedgy, final_text="UNKNOWN \u2014 2 trees could not be checked\nCI still running."), "ACTIVE",
+         "work remains"),
+        # a marker whose reason is not /unattended's keeps today's rules
+        (dict(ua, finishReason="done"), {}, hedgy, "ACTIVE", "work remains"),
+        (dict(ua, finishReason=None), {}, hedgy, "ACTIVE", "work remains"),
+        (dict(ua, finished=False), {}, hedgy, "ACTIVE", "work remains"),
+        # revived after the unattended mark: still REVIVED, never trusted
+        (dict(ua, finishedAt=before), {}, base, "REVIVED", "marked finished"),
+        (dict(ua, finishedAt=before), {}, hedgy, "ACTIVE", "work remains"),
+        (ua, at(before), hedgy, "ACTIVE", "work remains"),  # coord's stamp predates the prompt
+        (ua, {}, dict(hedgy, last_turn_open=now - 40 * m, last_turn_open_text=wake), "ACTIVE", "work remains"),
+        # kept working 30m past the mark: never trusted, closeout phrase or not
+        (ua, {}, dict(hedgy, final_text="PR #3 is pushed; its checks are still running.", last_asst=now - 30 * m,
+                      last_activity=now - 30 * m), "ACTIVE", "work remains"),
+        (ua, {}, dict(hedgy, last_asst=now - 30 * m, last_activity=now - 30 * m), "ACTIVE", "work remains"),
+        (ua, {"sessionStatus": "working", "sessionStatusSince": now - 30 * m}, hedgy, "ACTIVE", "work remains"),
+        (dict(ua, finishedAt=None), {}, hedgy, "ACTIVE", "work remains"),
+        # the idleness proof still runs first: a usage-limit stop and an unanswered prompt are not relaxed
+        (ua, {}, dict(hedgy, final_text="You've hit your session limit \u00b7 resets 5pm"), "LIMITED", "usage limit"),
+        (ua, {}, dict(hedgy, last_prompt=now - 50 * m), "ACTIVE", "has no reply"),
     ]
     g = globals()
     stubs = {"proc_facts": lambda table, pid, windows=WINDOWS: ([11], [], []),
@@ -1053,7 +1786,26 @@ def finish_time_cases(bad):
                 g.update(saved)
             if v != "REVIVED" or "a turn opened" not in "; ".join(why):
                 bad.append(f"a Session Bus delivery after coord's stamp = {v} {why}, want REVIVED (a turn opened)")
-    return len(cases) + 1 + len(turn_cases) + 1
+        # An idle compaction is not turn activity: the idle floor reads the reply before it.
+        with open(os.path.join(d, "projects", "x", "s.jsonl"), "w", encoding="utf-8") as fh:
+            fh.write("".join(json.dumps(r) + "\n" for r in [
+                rec("user", 0, "fix the bug"), said(5),
+                rec("user", 3000, "This session is being continued from a previous conversation",
+                    isCompactSummary=True)]))
+        got = transcript_facts({"configDir": d, "claudeSessionId": "s"})
+        if got["last_activity"] != t0 + 5 * 1000:
+            bad.append(f"an idle compaction moved last_activity to {got['last_activity']}, "
+                       f"want {t0 + 5 * 1000} (the reply before it)")
+        # ...while a compaction inside a turn is followed by that turn's own records, which count.
+        with open(os.path.join(d, "projects", "x", "s.jsonl"), "w", encoding="utf-8") as fh:
+            fh.write("".join(json.dumps(r) + "\n" for r in [
+                rec("user", 0, "fix the bug"), rec("assistant", 5, tool, stop="tool_use"),
+                rec("user", 6, result), rec("user", 60, "Summary", isCompactSummary=True), said(90)]))
+        got = transcript_facts({"configDir": d, "claudeSessionId": "s"})
+        if got["last_activity"] != t0 + 90 * 1000:
+            bad.append(f"a mid-turn compaction left last_activity at {got['last_activity']}, "
+                       f"want {t0 + 90 * 1000} (the turn's reply after it)")
+    return len(cases) + 1 + len(turn_cases) + 3
 
 
 def _tool_argv(cmd, acct="sales", cwd_file="/tmp/claude-1a2b-cwd"):
@@ -1062,6 +1814,58 @@ def _tool_argv(cmd, acct="sales", cwd_file="/tmp/claude-1a2b-cwd"):
             "true && shopt -u extglob 2>/dev/null || true && { \\builtin unalias -- 'unsetenv'; \\builtin unset -f -- "
             "'unsetenv'; } >/dev/null 2>&1 || true && eval '" + cmd.replace("'", "'\"'\"'")
             + f"' < /dev/null && pwd -P >| {cwd_file}"]
+
+
+def zombie_live_selftest(bad):
+    """ProcFacts.zombie() on real /proc (Linux only; skipped elsewhere): an unreaped child
+    reads zombie; a child whose MAIN thread exited while a worker still runs reads state Z
+    with an empty cmdline too, and must NOT, because it is live work. Returns cases run."""
+    if WINDOWS or not os.path.isdir("/proc/self"):
+        return 0
+    import ctypes
+    import threading
+    kids = []
+    try:
+        dead = os.fork()
+        if dead == 0:
+            os._exit(0)
+        kids.append(dead)
+        r, w = os.pipe()
+        busy = os.fork()
+        if busy == 0:  # the main thread exits; the worker lives until the parent closes the pipe
+            os.close(w)
+            threading.Thread(target=lambda: (os.read(r, 1), os._exit(0))).start()
+            ctypes.CDLL(None).pthread_exit(None)
+            os._exit(1)  # pthread_exit does not return
+        os.close(r)
+        kids.append(busy)
+        deadline, got = time.time() + 5, None
+        while time.time() < deadline:
+            time.sleep(0.1)
+            t = proc_table() or {}
+            try:
+                st = open(f"/proc/{busy}/stat").read().rsplit(")", 1)[1].split()[0]
+            except (OSError, IndexError):
+                st = None
+            if t.get(dead, (0, ["x"]))[1] == [] and st == "Z" and t.get(busy, (0, ["x"]))[1] == []:
+                f = ProcFacts(t)
+                got = (f.zombie(dead), f.zombie(busy))
+                break
+        if got is None:
+            return 0  # this kernel never showed both shapes inside the window: nothing to judge
+        if got != (True, False):
+            bad.append(f"zombie(): unreaped child / main-thread-exited live child = {got}, want (True, False)")
+        return 2
+    finally:
+        try:
+            os.close(w)
+        except (OSError, UnboundLocalError):
+            pass
+        for k in kids:
+            try:
+                os.waitpid(k, 0)
+            except OSError:
+                pass
 
 
 def end_strays_selftest(bad):
@@ -1243,6 +2047,17 @@ def stray_selftest(bad, empty_prompt=EMPTY_PROMPT_SCREEN):
                 stray_verdict({7: (1, ["bash.exe", UNREADABLE_CMDLINE])}, 7, ProcFacts({}, start={}, uids={}, files={},
                                                                                   self_pids=set()), 15)[0]:
             bad.append("a Windows / unreadable command line must never read as stray")
+        # (7) an empty-argv child that is NOT a zombie (a live process that blanked its argv,
+        # or a threaded one whose main thread exited) is work; a zombie one runs nothing.
+        n += 1
+        zl = "while ps aux | grep cargo >/dev/null; do sleep 5; done"
+        zt = {1: (0, ["/sbin/init"]), 10: (1, ["/usr/bin/claude"]), 30: (1, ["python3", "cfs.py"]),
+              40: (10, _tool_argv(zl)), 41: (40, [])}
+        for zs, want in ((set(), False), ({41}, True)):
+            got = stray_verdict(zt, 40, ProcFacts(zt, start={}, uids={}, files={}, self_pids={30}, now=now,
+                                                  dirs=set(), zombies=zs), 15)
+            if got[0] is not want:
+                bad.append(f"an empty-argv child with zombies={zs}: {got}, want stray={want}")
         # The classifier, case by case: (want_stray, class or None, command, extra, files, start, kids).
         census = "/s/census/cargo.log"
         old, held = (now - 3 * 3600, set(), "Compiling x\n"), (now - 3 * 3600, {950}, "Compiling x\n")
@@ -1321,6 +2136,9 @@ def stray_selftest(bad, empty_prompt=EMPTY_PROMPT_SCREEN):
             (False, None, f'until ! pgrep -fA "{gp}" >/dev/null; do sleep 15; done', None, {}, None, ()),
             (False, None, "until ! pgrep cargo; do sleep 15; done", None, {}, None, ()),  # no -f: names, not argv
             (True, "a", "while ps aux | grep cargo >/dev/null; do sleep 5; done", None, {}, None, ()),
+            # a probe that exited and is not yet reaped (a zombie: empty cmdline) runs nothing
+            (True, "a", "while ps aux | grep cargo >/dev/null; do sleep 5; done", None, {}, None, ((),)),
+            (True, "b-file", twait, None, {task: old}, None, (("sleep", "20"), ())),
             (False, None, "while ps aux | grep cargo | grep -v grep >/dev/null; do sleep 5; done", None, {}, None,
              ()),  # -v grep drops the loop's own line too, so it ends with its target
             (False, None, "while ps -p 4242 | grep -q 4242; do sleep 5; done", None, {}, None, ()),  # ps -p: selective
@@ -1337,6 +2155,46 @@ def stray_selftest(bad, empty_prompt=EMPTY_PROMPT_SCREEN):
             (False, None, "while kill -0 4243 2>/dev/null; do sleep 5; done", None, {}, {40: 100}, ()),
             (False, None, f'until ! pgrep -f "{gp}"; do sleep 5; done & wait', None, {}, None, ()),  # backgrounded
             (False, None, "cat <<EOF\nx\nEOF", None, {}, None, ()),  # heredoc: not read
+            # a wait for a file to GO is not proven frozen: nothing need hold a lock file open
+            (False, None, "while [ -f /s/lock ]; do sleep 5; done; ./next.sh", None, {"/s/lock": old}, None, ()),
+            (False, None, "until [ ! -e /s/lock ]; do sleep 5; done; ./next.sh", None, {"/s/lock": old}, None, ()),
+            (False, None, "until ! [ -f /s/lock ]; do sleep 5; done; ./next.sh", None, {"/s/lock": old}, None, ()),
+            (False, None, "while [ -s /s/queue ]; do sleep 5; done", None, {"/s/queue": old}, None, ()),
+            # ... and written as a read, which passes now and ends only when the file changes or goes
+            (False, None, "while grep -q Compiling /s/lock; do sleep 5; done; ./next.sh", None, {"/s/lock": old}, None,
+             ()),
+            (False, None, "until ! grep -q Compiling /s/lock; do sleep 5; done; ./next.sh", None, {"/s/lock": old},
+             None, ()),
+            (False, None, "while cat /s/lock >/dev/null 2>&1; do sleep 5; done; ./next.sh", None, {"/s/lock": old},
+             None, ()),
+            (False, None, "while tail -1 /s/lock | grep -q Compiling; do sleep 5; done", None, {"/s/lock": old}, None,
+             ()),
+            (False, None, "while grep -q Compiling < /s/lock; do sleep 5; done", None, {"/s/lock": old}, None, ()),
+            (False, None, "while tail -1 /s/lock >/dev/null; do sleep 5; done", None, {"/s/lock": old}, None, ()),
+            (False, None, "while head -1 /s/lock >/dev/null; do sleep 5; done", None, {"/s/lock": old}, None, ()),
+            # `grep -v` waits for its matching lines to go
+            (False, None, "until grep -qv Compiling /s/state; do sleep 5; done; ./next.sh", None, {"/s/state": old},
+             None, ()),
+            (False, None, "while ! grep -qv Compiling /s/state; do sleep 5; done", None, {"/s/state": old}, None, ()),
+            # one lock among the files is still a wait on the lock, harness file beside it or not
+            (False, None, f"while grep -q Compiling {task} /s/lock; do sleep 5; done; ./next.sh", None,
+             {task: old, "/s/lock": old}, None, ()),
+            # a bare read's status is its exit code: 0 on an empty file, 1 on a gone one
+            (False, None, "until cat /s/empty >/dev/null; do sleep 1; done; sleep 600; ./deploy.sh", None,
+             {"/s/empty": (now - 7200, set(), "")}, None, ()),
+            (False, None, f"while cat {task} >/dev/null 2>&1; do sleep 1; done; sleep 600; ./deploy.sh", None, {},
+             None, ()),
+            (False, None, f"until cat {task} >/dev/null; do sleep 1; done", None, {}, None, ()),
+            # ... a harness task's own output file stays judged, and so does a wait for a line to appear
+            (True, "b-file", f"while [ -f {task} ]; do sleep 5; done", None, {task: old}, None, ()),
+            (True, "b-file", "until grep -q DONE /s/a.log; do sleep 5; done", None, {"/s/a.log": old}, None, ()),
+            (True, "b-file", "until tail -1 /s/a.log | grep -q DONE; do sleep 5; done", None, {"/s/a.log": old}, None,
+             ()),
+            (True, "b-file", "until [ -s /s/empty ]; do sleep 5; done", None,
+             {"/s/empty": (now - 7200, set(), "")}, None, ()),
+            # the reason a shell is busy survives: a live target still names itself
+            (False, None, f'until ! pgrep -f "{gp}" && [ ! -f /s/lock ]; do sleep 5; done',
+             {90: (1, ["git", "push", "-u", "origin", "HEAD"])}, {"/s/lock": old}, None, ()),
         ]
         for want, cls, cmd, extra, files, start, kids in cases:
             n += 1
@@ -1465,6 +2323,52 @@ def readiness():
     if not isinstance(procs, list):
         return {}, f"terminal_sessions.processes is {type(procs).__name__}, not a list"
     return {p["sessionId"]: p for p in procs if isinstance(p, dict) and p.get("sessionId")}, None
+
+
+# The operator's restart prepare (plan
+# 2026-10-21-operator-prepare-for-restart-and-progressive-restore), the
+# `restart_prep` block of GET /restart-readiness. While one is `preparing` or
+# `ready`, the runner has told each live session to save, end its turn and wait,
+# so a paused session sits idle at an empty prompt with no finished signal:
+# exactly what the overlord screens call STOPPED. Typing into it ends the pause
+# and starts work the restart is about to cut off. A build that predates the
+# prepare serves no field, and `null` is no readable record: neither can be in
+# a prepare this runner knows about. `restoring` is after the restart.
+PREPARE_HOLDS = ("preparing", "ready")
+PREPARE_CLEAR = ("restoring", "done", "cancelled")
+
+
+def prepare_verdict(body):
+    """("clear" | "held" | "unknown", text) for a parsed /restart-readiness body.
+    Pure. A block this cannot read is unknown, never clear: the callers are about
+    to type into a live session."""
+    if not isinstance(body, dict):
+        return "unknown", f"restart prepare UNKNOWN: the readiness body is {type(body).__name__}, not an object"
+    block = body.get("restart_prep")
+    if block is None:
+        return "clear", ""
+    if not isinstance(block, dict):
+        return "unknown", f"restart prepare UNKNOWN: restart_prep is {type(block).__name__}, not an object"
+    state = block.get("state")
+    if state in PREPARE_CLEAR:
+        return "clear", ""
+    if state in PREPARE_HOLDS:
+        pid = str(block.get("prepare_id") or "<absent>")[:8]
+        hold = block.get("hold") or "<absent - UNKNOWN>"
+        return "held", (f"an operator restart prepare ({pid}, {state}, hold: {hold}) has not ended: its sessions "
+                        "were told to pause, so one that reads STOPPED or LIMITED is waiting for the restart, "
+                        "not stuck. An expired hold still holds this, until the prepare is cancelled or the runner "
+                        "restarts on a new build")
+    return "unknown", f"restart prepare UNKNOWN: restart_prep.state is {state!r}"
+
+
+def prepare_status():
+    """prepare_verdict over a fresh GET /restart-readiness. Unreadable is unknown."""
+    try:
+        with urllib.request.urlopen(API + "/restart-readiness", timeout=60) as r:
+            return prepare_verdict(json.loads(r.read()))
+    except (*READ_ERRORS, http.client.HTTPException, RecursionError) as e:  # IncompleteRead; absurdly nested JSON
+        return "unknown", f"restart prepare UNKNOWN: GET /restart-readiness unreadable ({str(e)[:120]})"
 
 
 # The runner's `windDown.reason` words. Runners on builds before and after its
@@ -2027,6 +2931,70 @@ def pid_alive(pid):
         return not k.GetExitCodeProcess(h, ctypes.byref(code)) or code.value == 259  # STILL_ACTIVE
     finally:
         k.CloseHandle(h)
+
+
+def config_dir_of(table, pid):
+    """CLAUDE_CONFIG_DIR of the pane's top claude (the first under pane `pid`),
+    read from its environment - the directory it really writes its transcript
+    to. "" when it runs the default (~/.claude), None when that claude's
+    environment is unreadable (an exiting process, a permission refusal, or
+    Windows, which has no /proc/<pid>/environ). A nested claude (a `claude -p`
+    from a tool call) is never consulted: it may run under another dir."""
+    claudes = proc_facts(table, pid)[0] if not WINDOWS and table and pid in table else []
+    if not claudes:
+        return None
+    try:
+        env = open(f"/proc/{claudes[0]}/environ", "rb").read().decode(errors="replace").split(chr(0))
+    except OSError:
+        return None
+    if not any("=" in e for e in env):
+        return None  # an exiting process shows an empty environment: unreadable, not "default"
+    cd = next((e.split("=", 1)[1] for e in env if e.startswith("CLAUDE_CONFIG_DIR=")), "")
+    return resolve_config_dir(cd, lambda: os.readlink(f"/proc/{claudes[0]}/cwd"))
+
+
+def resolve_config_dir(cd, read_cwd):
+    """A CLAUDE_CONFIG_DIR value as an absolute path. "" stays "" (the default
+    dir). A relative value is joined to THAT process's cwd, which `read_cwd()`
+    returns (a /proc/<pid>/cwd readlink) - not this script's cwd; None when that
+    cwd is unreadable or deleted, since there is then no directory to resolve
+    it against."""
+    if not cd:
+        return ""
+    cd = os.path.expanduser(cd)
+    if not os.path.isabs(cd):
+        try:
+            cwd = read_cwd()
+        except OSError:
+            return None
+        if cwd.endswith(" (deleted)"):
+            return None
+        cd = os.path.join(cwd, cd)
+    return os.path.normpath(cd)
+
+
+def with_live_config_dir(row, table, pid, read=None):
+    """`row` with configDir taken from the running claude when one is readable:
+    the process's own config dir is where it writes, and the registry's can be
+    blank. `read` stands in for config_dir_of in the selftest."""
+    cd = (read or config_dir_of)(table, pid) if row else None
+    return dict(row, configDir=cd or os.path.expanduser("~/.claude")) if cd is not None else row
+
+
+def account_of(row):
+    """The account label, or the config dir's suffix when the registry labels it
+    "unknown" (`.claude-paktis` is `paktis`, `.claude` is `default`, any other
+    dir its own name)."""
+    label = ((row or {}).get("account") or {}).get("label")
+    if label and label != "unknown":
+        return label
+    cd = ((row or {}).get("configDir") or "").rstrip("/" + chr(92))
+    def canon(p):
+        return os.path.normcase(os.path.realpath(os.path.expanduser(p)))
+    if cd and canon(cd) == canon("~/.claude"):
+        return "default"  # only THIS user's default dir; another home's .claude keeps its name
+    base = os.path.basename(cd.replace(chr(92), "/"))
+    return (base[len(".claude-"):] if base.startswith(".claude-") else base) or label or "?"
 
 
 def live_session_ids(claudes):
@@ -2627,8 +3595,9 @@ class ProcFacts:
     (mtime, holder pids, text), and a path missing from it is gone; `dirs` is the
     set of directories that exist (by default, those holding a `files` path)."""
 
-    def __init__(self, table, start=None, uids=None, files=None, self_pids=None, now=None, dirs=None):
+    def __init__(self, table, start=None, uids=None, files=None, self_pids=None, now=None, dirs=None, zombies=None):
         self.table, self._start, self._uids, self._files = table, start, uids, files
+        self._zombies = None if zombies is None else set(zombies)
         self._dirs = set(dirs) if dirs is not None else (
             None if files is None else {f.rsplit("/", 1)[0] for f in files})
         self.now = time.time() if now is None else now
@@ -2638,6 +3607,32 @@ class ProcFacts:
     def start(self, pid):
         """The process's start time in clock ticks (/proc/<pid>/stat field 22), or None."""
         return self._start.get(pid) if self._start is not None else proc_start(pid)
+
+    def zombie(self, pid):
+        """True when `pid` has wholly exited and awaits its reap, or is gone. Linux only.
+        State Z alone is not enough: a process whose MAIN thread called pthread_exit()
+        while other threads still run also reads Z with an empty cmdline, and it is live
+        work. So a zombie must also have exactly one task left. Any read that fails is
+        False (work). A selftest (`start` passed) has no /proc: `zombies` names its
+        zombies there, and without it an empty argv in the table stands for one."""
+        if self._start is not None:
+            return pid in self._zombies if self._zombies is not None else True
+        if WINDOWS:
+            return False
+        try:
+            stat = open(f"/proc/{pid}/stat").read()
+        except FileNotFoundError:
+            return True  # already reaped: it runs nothing
+        except OSError:
+            return False
+        try:
+            if stat.rsplit(")", 1)[1].split()[0] not in ("Z", "X"):
+                return False
+            return len(os.listdir(f"/proc/{pid}/task")) <= 1
+        except FileNotFoundError:
+            return True  # reaped between the two reads
+        except (OSError, IndexError):
+            return False
 
     def isdir(self, path):
         return path in self._dirs if self._dirs is not None else os.path.isdir(path)
@@ -2919,6 +3914,13 @@ def _atom(table, shell, pipe, facts, idle_min):
             label.append(f"{f} changed {fmt_age(mtime * 1000)} ago")
         else:
             label.append(f"{f} unchanged for {fmt_age(mtime * 1000)}, no process holds it")
+        # A file that passes its own test, in a loop still looping, is a wait for it
+        # to go away. Nothing need hold a lock file open and its mtime predicts nothing,
+        # so that is not proven frozen. A harness task's output file is the exception:
+        # the harness leaves it in place when its task ends, so old and unheld is normal.
+        if state == "ok" and test is not None and (test != "-s" or text != "") \
+                and not HARNESS_TASK_FILE_RE.search(f):
+            return 1, False, "b-file", f"{f} passes its test now: this waits for it to go"
         if test is None:
             if text is None:
                 return None
@@ -2937,6 +3939,16 @@ def _atom(table, shell, pipe, facts, idle_min):
                 return None
             lines = [ln for ln in lines if m(ln)]
         status = 0 if lines else 1
+        # A bare read that printed nothing: its status is its exit code, not its output,
+        # 0 on an empty file and 1 on a gone one. Not modelled.
+        if len(filters) == 1 and filters[0][0] in ("cat", "tail", "head") and not lines:
+            return 1, False, "b-file", f"{files[0]} reads empty: a bare read's status is not known"
+        # The same wait written as a read: it passes now, so it ends only when a file
+        # changes or goes (`while grep -q holder lock`), and `grep -v` waits for its
+        # matching lines to go. Nothing here can rule either out.
+        inverted = any(flt[0] not in ("cat", "tail", "head") and flt[3] for flt in filters)
+        if (status == 0 or inverted) and not all(HARNESS_TASK_FILE_RE.search(f) for f in files):
+            return 1, False, "b-file", f"{files[0]} can only change or go for this to end"
     return status, frozen, "b-file", "; ".join(label)
 
 
@@ -3009,8 +4021,9 @@ def _stray_verdict(table, pid, facts, idle_min):
     one unbounded until/while loop whose body only sleeps, nothing but that loop's
     own probes and sleeps runs under it, every part of its condition is frozen
     (class a: a self-matching pgrep -f / ps|grep with no live target; b-file: a
-    file no process holds open and unchanged past the idle floor, or a harness
-    task's output file that is gone; b-pid: a kill -0 pid that is gone or was
+    file no process holds open, unchanged past the idle floor, which the condition
+    does not already pass on, or a harness task's output file, even one that is
+    gone; b-pid: a kill -0 pid that is gone or was
     reused), and the condition still says "loop".
     `class` is "a", "b-file", "b-pid" or a "+" mix for a stray, "c" for a bounded
     wait, None otherwise."""
@@ -3053,6 +4066,13 @@ def _stray_verdict(table, pid, facts, idle_min):
     allowed = {"sleep"} | {exe_base(w[0]) for _, _, pipe in chain for w, _ in pipe}
     for d in subtree(table, pid):
         dv = table[d][1]
+        if not dv and facts.zombie(d):
+            # A child that has exited and is not yet reaped reads an EMPTY cmdline (the kernel
+            # frees its argv at exit): most often the loop's own probe, caught between its
+            # exit and bash's wait. It runs nothing. Read as work, it made a real stray miss
+            # one screen at random, and flaked the end_strays selftest on slower CI runners.
+            # A LIVE process with an empty cmdline (one that blanked its own argv) is still work.
+            continue
         if d != pid and dv != argv and not (dv and exe_base(dv[0]) in allowed
                                             and not (exe_base(dv[0]) == "tail" and any(
                                                 a.startswith(("-f", "-F", "--follow")) for a in dv[1:]))):
@@ -3176,22 +4196,30 @@ def fmt_age(msv):
     return f"{m:.0f}m" if m < 120 else f"{m / 60:.1f}h" if m < 2880 else f"{m / 1440:.1f}d"
 
 
+# What one JSONL line can raise while it is parsed and its time read: a cut line, a
+# bad time, a non-object line, deep nesting.
+BAD_RECORD = (ValueError, TypeError, KeyError, AttributeError, RecursionError)
+
+
 def newest_record(path):
-    """Timestamp (ms) of the newest user/assistant record in the last 64 KiB of a
-    JSONL file, or None."""
+    """Timestamp (ms) of the newest user/assistant record in a JSONL file, or
+    None. Reads the last 64 KiB, and the whole file only when that window holds
+    no such record: one record can be larger than the window."""
     try:
-        with open(path, "rb") as f:
-            f.seek(max(0, os.path.getsize(path) - 65536))
-            lines = f.read().decode(errors="replace").splitlines()
+        size = os.path.getsize(path)
+        for start in ([size - 65536, 0] if size > 65536 else [0]):
+            with open(path, "rb") as f:
+                f.seek(start)
+                lines = f.read().split(b"\n")  # never splitlines(): a raw U+2028 is legal inside a JSON string
+            for line in reversed(lines):
+                try:
+                    e = json.loads(line.decode(errors="replace"))
+                    if e.get("type") in ("user", "assistant") and e.get("timestamp") and not e.get("isCompactSummary"):
+                        return ms(e["timestamp"])
+                except BAD_RECORD:
+                    continue  # a line the window cut, a non-object line, an unreadable time
     except OSError:
         return None
-    for line in reversed(lines):
-        try:
-            e = json.loads(line)
-        except ValueError:
-            continue
-        if e.get("type") in ("user", "assistant") and e.get("timestamp"):
-            return ms(e["timestamp"])
     return None
 
 
@@ -3203,13 +4231,15 @@ NEXT_MOVE_PROMPT = re.compile(r"<command-name>/next-move</command-name>|^/next-m
 # classification, which reads files and coord and records an intervention.
 # Every mcp__coord* call is bookkeeping, so only file edits and git/gh writes count,
 # in the session's own transcript or in a subagent's (an `Agent` call itself is
-# not work: /next-move spawns its own fresh-context concurrence subagent).
+# not work: what the subagent then does is what counts). A PR write goes through
+# gh or the runner's own `qontinui-pr create`.
 WORK_TOOLS = ("Edit", "MultiEdit", "Write", "NotebookEdit")
 WORK_BASH = re.compile(r"\bgit(?:\s+(?:-[Cc]\s+\S+|--?[\w-]+(?:=\S+)?))*\s+(?:commit|push|commit-tree)\b"
-                       r"|\bgh\s+pr\s+(?:create|merge|edit|ready)\b")
+                       r"|\bgh\s+pr\s+(?:create|merge|edit|ready)\b"
+                       r"|\bqontinui-pr(?:\.exe)?\s+create\b")
 
 
-# Where /next-move writes its own scratch (the E1 row file, recheck evidence):
+# Where /next-move writes its own scratch (the E1 row file):
 # an edit there is classification, not work.
 SCRATCH_PATH = re.compile(r"(?:^|[\\/])(?:\.qontinui[\\/]scratch|scratchpad|\.agent-scratch)(?:[\\/]|$)"
                           r"|^(?:/tmp|/var/tmp)(?:/|$)|[\\/]AppData[\\/]Local[\\/]Temp(?:[\\/]|$)", re.I)
@@ -3249,6 +4279,23 @@ def nudge_facts(segments):
     return work, streak
 
 
+def nudge_replied(segments):
+    """True when the newest prompt is a /next-move the session really answered:
+    the model itself wrote text after it. A /next-move with no reply, or only
+    Claude Code's own notice (a limit, an expired login, an API error), never ran
+    its turn, so finding no work after it measures nothing."""
+    return bool(segments) and segments[-1]["nudge"] and bool(segments[-1].get("replied"))
+
+
+def model_wrote(e, text):
+    """False for assistant-shaped text Claude Code wrote itself. Those records
+    are flagged, or attributed to the <synthetic> model; LIMIT_RE covers a limit
+    notice from a transcript that predates the flag."""
+    if e.get("isApiErrorMessage") or e["message"].get("model") == "<synthetic>":
+        return False
+    return not LIMIT_RE.search(text[-300:])
+
+
 def subagent_work(path, segments):
     """Add a subagent transcript's work-class tool calls to the segment each
     falls in by time (the newest segment that started at or before it)."""
@@ -3261,7 +4308,7 @@ def subagent_work(path, segments):
             try:
                 e = json.loads(line)
                 at = ms(e["timestamp"]) if e.get("type") == "assistant" and e.get("timestamp") else None
-            except (ValueError, TypeError, KeyError, AttributeError):
+            except BAD_RECORD:
                 continue
             content = (e.get("message") or {}).get("content") if at and isinstance(e.get("message"), dict) else None
             for b in content if isinstance(content, list) else []:
@@ -3329,7 +4376,7 @@ def transcript_facts(row):
     # (turn_open), so a wake that `last_prompt` ignores can still be read.
     f = {"path": path, "last_activity": None, "last_prompt": None, "last_prompt_text": "",
          "last_asst": None, "final_text": "", "final_text_at": None, "pending_tool": False,
-         "task_prompts": 0, "work_tools_since_nudge": 0, "nudge_streak": 0, "cwd": None,
+         "task_prompts": 0, "work_tools_since_nudge": 0, "nudge_streak": 0, "nudge_replied": False, "cwd": None,
          "last_turn_open": None, "last_turn_open_text": ""}
     open_tools = set()
     turn = {"in": False, "before": None}
@@ -3338,14 +4385,22 @@ def transcript_facts(row):
     for line in open(path, encoding="utf-8", errors="replace"):  # never the locale codepage (cp1252 on Windows)
         try:
             e = json.loads(line)
-        except ValueError:
-            continue
-        ts = e.get("timestamp")
-        if not ts or not isinstance(e.get("message"), dict):
-            continue
+            ts = e.get("timestamp")
+            if not ts or not isinstance(e.get("message"), dict):
+                continue
+            at = ms(ts)
+        except BAD_RECORD:
+            continue  # a non-object line, an unreadable time or deep nesting
         content = e["message"].get("content")
-        if e.get("type") in ("user", "assistant"):
-            f["last_activity"] = ms(ts)
+        # A compaction summary is not activity: Claude Code compacts an IDLE
+        # session on its own ("Compacted while idle, before the prompt cache
+        # expired"), writing an isCompactSummary user record with no turn around
+        # it, which read as fresh activity and held a finished tab BUSY for the
+        # whole idle floor (2026-11-03: the transcript's `system` record carried
+        # that message, 2 s after the summary). A compaction inside a turn is
+        # followed by that turn's own records, which still count.
+        if e.get("type") in ("user", "assistant") and not e.get("isCompactSummary"):
+            f["last_activity"] = at
         if e.get("type") == "user":
             if e.get("cwd"):
                 f["cwd"] = e["cwd"]
@@ -3355,7 +4410,7 @@ def transcript_facts(row):
                         open_tools.discard(b.get("tool_use_id"))
             text = content if isinstance(content, str) else " ".join(
                 b.get("text", "") for b in content or [] if isinstance(b, dict) and b.get("type") == "text")
-            turn_open(f, turn, e, content, text, ms(ts))
+            turn_open(f, turn, e, content, text, at)
             if e.get("isMeta") or e.get("isCompactSummary"):
                 continue
             if text.lstrip().startswith(LOCAL_OUTPUT):
@@ -3366,34 +4421,42 @@ def transcript_facts(row):
                 before = None
             elif text.strip() and not text.lstrip().startswith(NON_PROMPT):
                 before = (f["last_prompt"], f["last_prompt_text"])
-                f["last_prompt"], f["last_prompt_text"] = ms(ts), text.strip()
+                f["last_prompt"], f["last_prompt_text"] = at, text.strip()
                 f["task_prompts"] += not text.lstrip().startswith(CLEAR)
                 segments.append({"nudge": bool(NEXT_MOVE_PROMPT.search(text.strip())), "work": 0, "final": "",
-                                 "at": ms(ts)})
+                                 "at": at})
         elif e.get("type") == "assistant":
             before = None
             turn["in"], turn["before"] = e["message"].get("stop_reason") == "tool_use", None
-            f["last_asst"] = ms(ts)
+            f["last_asst"] = at
             for b in content if isinstance(content, list) else []:
                 if not isinstance(b, dict):
                     continue
                 if b.get("type") == "text" and b.get("text", "").strip():
-                    f["final_text"], f["final_text_at"] = b["text"], ms(ts)
+                    f["final_text"], f["final_text_at"] = b["text"], at
                     if segments:
                         segments[-1]["final"] = b["text"]
+                        segments[-1]["replied"] = segments[-1].get("replied") or model_wrote(e, b["text"])
                 elif b.get("type") == "tool_use":
                     open_tools.add(b.get("id"))
                     if segments and is_work_tool(b):
                         segments[-1]["work"] += 1
     f["pending_tool"] = bool(open_tools)
+    # The streak walks back over the trailing run of /next-moves, so a subagent
+    # active at any point in that run can end it, not only one active since the newest.
+    run_from = None
+    for s in reversed(segments):
+        if not s["nudge"]:
+            break
+        run_from = s["at"]
     for sub in glob.glob(os.path.join(os.path.dirname(path), sid, "subagents", "*.jsonl")):
         t = newest_record(sub)
         if t and t > (f["last_activity"] or 0):
             f["last_activity"] = t
-        # Only a subagent active since the newest /next-move can add to its count.
-        if segments and segments[-1]["nudge"] and t and t >= segments[-1]["at"]:
+        if run_from is not None and t and t >= run_from:
             subagent_work(sub, segments)
     f["work_tools_since_nudge"], f["nudge_streak"] = nudge_facts(segments)
+    f["nudge_replied"] = nudge_replied(segments)
     return f
 
 
@@ -3419,6 +4482,67 @@ def status_since(rp, now_ms=None):
     if isinstance(v, bool) or not isinstance(v, int) or not SINCE_FLOOR_MS <= v <= now_ms + SINCE_FUTURE_MS:
         return None
     return v
+
+
+def finish_since(rp, coord_finished):
+    """Coord's usable finish time for a coord-finished row, else None."""
+    since = status_since(rp) if coord_finished else None
+    if since is not None and since > time.time() * 1000:
+        # The revival comparison ASSUMES coord's clock and this box's agree to well
+        # under the 1 s band (NTP-synced). It does not measure skew, so it cannot
+        # see a skew that has already been absorbed by the time a close is
+        # considered (a past stamp says nothing about skew). This guard covers
+        # only the rare case it CAN see: a stamp still ahead of this clock proves
+        # coord runs ahead, so it is not compared with a local prompt time and
+        # the coord-only rule decides. Closing is the unsafe direction;
+        # status_since still admits the stamp for the nudge side.
+        return None
+    return since
+
+
+UNATTENDED_REASON = "unattended:"
+
+
+def unattended_trusted(row, tx, since, neg, status=None):
+    """A reason line when the final reply's wording must NOT veto this row, else None.
+
+    /unattended marks the runner finish (finishReason "unattended: ...") only when every unit is LANDED,
+    WATCHED or RECORDED AND its own Step 4.9 headline reads SAFE TO CLOSE (unattended.md, the gate table),
+    and it sets that mark BEFORE it writes the final report. The structured decision is made; the prose after
+    it is a report, so a hedge word, a work-remains phrase or a promise phrase in it does not re-open it. What
+    still does:
+    - an explicit negative headline (negative_headline);
+    - a veto in TRUST_KEEPS or OPERATOR_ASK: a question or an ask for the operator to act (a real
+      `Session finished: no` is one of negative_headline's);
+    - a reply that is not that report at all (UNATTENDED_REPORT: a subagent shares its parent's session id, so
+      a stray "unattended:" finish can land on a parent that is still talking);
+    - a coord status read back as anything but finished, or a missing finishedAt;
+    - any sign the session was revived after EITHER finish time - a prompt or a turn-opening record later
+      than finishedAt + 1 s, or than coord's time - 1 s where usable (so an old "unattended:" reason does not
+      ride on a later finish some other door made), or a reply more than 10 min after the earlier of the two.
+      These are stricter than classify_row's own (whose runner arm checks prompts only, and whose 10-min guard
+      a closeout phrase exempts): this path relaxes a veto, so it takes the stricter test.
+    Every idleness check ran before this and is unchanged."""
+    why = row.get("finishReason")
+    if not row.get("finished") or not isinstance(why, str) or not why.lstrip().startswith(UNATTENDED_REASON):
+        return None
+    final = tx["final_text"]
+    if negative_headline(final) or any(label in TRUST_KEEPS for label in neg) or OPERATOR_ASK.search(final):
+        return None
+    if not own_report(final):
+        return None  # the reply is not the report /unattended writes (a parent session sharing the id?)
+    if status not in (None, "finished"):  # coord reads it back in some other state: not this rule's to relax
+        return None
+    fa = row.get("finishedAt")
+    if isinstance(fa, bool) or not isinstance(fa, (int, float)) or fa <= 0:
+        return None  # in both arms: a marker with no time of its own is not trusted
+    cut = fa + 1000 if since is None else min(fa + 1000, since - 1000)
+    if any(t and t > cut for t in (tx.get("last_prompt"), tx.get("last_turn_open"))):
+        return None
+    if tx.get("last_asst") and tx["last_asst"] - (fa if since is None else min(fa, since)) > 10 * 60000:
+        return None  # stricter than classify_row's guard, which a closeout phrase exempts: here nothing does
+    return (f"runner marker set by /unattended ({why.strip()[:50]}): its gate already required SAFE TO CLOSE, so "
+            f"the reply's hedge/work-remains/promise wording is not consulted (would have vetoed: {neg[0]})")
 
 
 def classify(term, row, table, idle_min, own_tid, ready, strays=None):
@@ -3500,8 +4624,13 @@ def classify_row(term, row, table, idle_min, own_tid, ready, strays):
     if tx["last_prompt"] and (tx["last_asst"] or 0) < tx["last_prompt"]:
         return "ACTIVE", [f"a prompt from {fmt_age(tx['last_prompt'])} ago has no reply"]
     pos, neg = phrase_hits(tx["final_text"])
+    since = finish_since(rp, coord_finished)
+    note = []
     if neg:
-        return "ACTIVE", ["final message says work remains: " + neg[0]]
+        trusted = unattended_trusted(row, tx, since, neg, rp.get("sessionStatus"))
+        if not trusted:
+            return "ACTIVE", ["final message says work remains: " + neg[0]]
+        note = [trusted]
     # Coord's finish time, where the runner serves it, is preferred over the
     # runner marker's: once coord restamps a finished->finished report (plan
     # Phase 2) and the runner passes the time through (plan Phase 3), it moves
@@ -3511,17 +4640,7 @@ def classify_row(term, row, table, idle_min, own_tid, ready, strays):
     # the band leans toward keeping the tab: a
     # prompt or any other turn-opening record later than since - 1 s revives the
     # session (finished-criteria cond. 4: a turn newer than the finish stamp).
-    since = status_since(rp) if coord_finished else None
-    if since is not None and since > time.time() * 1000:
-        # The comparison below ASSUMES coord's clock and this box's agree to well
-        # under the 1 s band (NTP-synced). It does not measure skew, so it cannot
-        # see a skew that has already been absorbed by the time a close is
-        # considered (a past stamp says nothing about skew). This guard covers
-        # only the rare case it CAN see: a stamp still ahead of this clock proves
-        # coord runs ahead, so it is not compared with a local prompt time and
-        # the coord-only rule below decides. Closing is the unsafe direction;
-        # status_since still admits the stamp for the nudge side.
-        since = None
+    # `since` is finish_since(): None when coord's stamp is unusable or ahead of this clock.
     if since is not None:
         if tx["last_prompt"] and tx["last_prompt"] > since - 1000:
             return "REVIVED", [f"coord finished {fmt_age(since)} ago, then prompted {fmt_age(tx['last_prompt'])} "
@@ -3534,7 +4653,7 @@ def classify_row(term, row, table, idle_min, own_tid, ready, strays):
         if tx["last_asst"] and tx["last_asst"] - since > 10 * 60000 and not pos:
             return "REVIVED", [f"kept working {(tx['last_asst'] - since) / 60000:.0f}m after coord's finish time "
                                "and its final message is not a closeout"]
-        return "FINISHED", [f"coord session_status=finished ({fmt_age(since)} ago), no prompt since"] + binding
+        return "FINISHED", [f"coord session_status=finished ({fmt_age(since)} ago), no prompt since"] + note + binding
     if finished:
         fa = row.get("finishedAt") or 0
         if tx["last_prompt"] and tx["last_prompt"] > fa + 1000:
@@ -3550,7 +4669,7 @@ def classify_row(term, row, table, idle_min, own_tid, ready, strays):
             return "REVIVED", [f"kept working {(tx['last_asst'] - fa) / 60000:.0f}m after its finish mark "
                                "and its final message is not a closeout"]
         why = row.get("finishReason")
-        return "FINISHED", ["runner finished marker" + (f" ({why[:70]})" if why else "")] + binding
+        return "FINISHED", ["runner finished marker" + (f" ({why[:70]})" if why else "")] + note + binding
     if pos:
         # With no coord finish time (an older runner, or unresolved), a
         # coord-only finish is only as good as the closeout line in the reply.
@@ -3600,10 +4719,9 @@ def screen_all(idle_min, only):
         terms = [t for t in terms if any(t["id"].startswith(o) for o in only)]
     out = []
     for t in terms:
-        row = rows.get(t["id"])
+        row = with_live_config_dir(rows.get(t["id"]), table, t.get("pid"))
         verdict, why = screen_one(t, row, table, idle_min, own, ready)
-        acct = ((row or {}).get("account") or {}).get("label") or re.sub(
-            r"^\.claude-?", "", os.path.basename((row or {}).get("configDir") or "")) or "?"
+        acct = account_of(row)
         out.append({
             "terminalId": t["id"], "verdict": verdict, "reasons": why,
             "name": (row or {}).get("resumeName") or t.get("title") or "",
@@ -3646,7 +4764,8 @@ def close_one(tid, idle_min, own, allowed):
         return False, f"readiness unreadable at re-screen ({err[:80]})"
     table = proc_table()
     found = []
-    verdict, why = screen_one(t, open_rows().get(tid), table, idle_min, own, ready, found)
+    row = with_live_config_dir(open_rows().get(tid), table, t.get("pid"))
+    verdict, why = screen_one(t, row, table, idle_min, own, ready, found)
     if verdict not in allowed:
         return False, f"re-screen now says {verdict}: {'; '.join(why)}"
     claudes = proc_facts(table, t["pid"])[0] if table and t.get("pid") in table else []
