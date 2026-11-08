@@ -12311,7 +12311,11 @@ mod tests {
         assert_eq!(got.restored_from_boot_at, None);
         assert_eq!(got.restore_tier, None);
         assert!(
-            crate::session::restore_census::observe_restored(&store, 0).is_empty(),
+            crate::session::restore_census::observe_restored(
+                &store,
+                crate::session::tracking_health::process_generation(),
+            )
+            .is_empty(),
             "a profile resume is not in the boot-restore census"
         );
     }
@@ -13164,7 +13168,6 @@ mod tests {
             }
         }
         let census = crate::session::restore_census::BootCensus {
-            boot_at_ms: boot,
             expected: crate::session::restore_census::expected_rows(
                 store.restorable_records(None, false),
                 &NoTranscripts,

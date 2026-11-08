@@ -458,7 +458,7 @@ mod tests {
             kind: "interactive".to_string(),
             started_at,
             updated_at: started_at,
-            resume_command: String::new(),
+            resume_command: None,
         }
     }
 
