@@ -241,6 +241,20 @@ fn rust_tests_are_built_and_run_in_separate_bounded_steps() {
          the suite and the split measures nothing"
     );
 
+    // The session-lifecycle kernel crate (plan
+    // 2026-10-28-one-session-lifecycle-authority, Phase 37) is a separate
+    // workspace member: a bare `cargo test --no-run` from `src-tauri` builds
+    // only `qontinui-runner`'s tests, so the kernel's would never run in the
+    // required job nor reach the ingest. Both packages are named.
+    for package in ["-p qontinui-runner", "-p session-lifecycle"] {
+        assert!(
+            build_run.contains(package),
+            "`{BUILD}` must build `{package}`'s tests: the required job runs \
+             only the binaries the build half printed, so a package it does \
+             not name has no tests in CI at all"
+        );
+    }
+
     // THE assertion this file exists for after run 35477464051. A second cargo
     // invocation re-checks freshness, and `tauri::generate_context!()` writes
     // its codegen assets into OUT_DIR ~4 s AFTER the fingerprint cargo recorded

@@ -704,6 +704,30 @@ pub(crate) fn command_lines_blocking(pids: &[u32]) -> Result<HashMap<u32, String
         .map_err(|_| "the in-process command-line read panicked".to_string())?
 }
 
+/// The RAW command lines of exactly `pids`, in-process, for a caller that must
+/// match the text a process was started with: Windows reads each PEB (never
+/// `sysinfo`'s split-and-rejoined `cmd()`, which cannot reproduce cmd's `^"`
+/// escapes), Unix reads `/proc/<pid>/cmdline`. No external fallback.
+///
+/// `None` when the read could not run (the in-process kill switch is set, or
+/// the blocking task did not join): UNKNOWN. A pid that is dead or unreadable
+/// is absent from a `Some` map.
+pub(crate) async fn raw_command_lines_for(pids: &[u32]) -> Option<HashMap<u32, String>> {
+    if pids.is_empty() {
+        return Some(HashMap::new());
+    }
+    if in_process_disabled() {
+        return None;
+    }
+    let asked = pids.to_vec();
+    spawn_blocking_tracked(move || {
+        std::panic::catch_unwind(|| platform::raw_command_lines(&asked)).ok()
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
 /// Command lines for exactly `pids`: in-process, with the external probe
 /// (Windows: the WMI query) as the fallback when the in-process read fails.
 ///
@@ -1010,6 +1034,38 @@ mod platform {
         }
     }
 
+    /// The RAW command line of exactly `pids` — the PEB's, as the process was
+    /// started with it ([`qontinui_runner_win32::process_tree::raw_command_line`]),
+    /// through a `PROCESS_QUERY_LIMITED_INFORMATION` handle. A pid that cannot
+    /// be opened or read is absent.
+    pub(super) fn raw_command_lines(pids: &[u32]) -> HashMap<u32, String> {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        let mut out = HashMap::new();
+        for &pid in pids {
+            if pid == 0 {
+                continue;
+            }
+            // SAFETY: OpenProcess takes no pointers; a non-null handle carries
+            // query access, is passed to `raw_command_line`, and closed once.
+            let line = unsafe {
+                let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+                if handle.is_null() {
+                    continue;
+                }
+                let line = qontinui_runner_win32::process_tree::raw_command_line(handle);
+                CloseHandle(handle);
+                line
+            };
+            if let Some(line) = line.filter(|l| !l.trim().is_empty()) {
+                out.insert(pid, line);
+            }
+        }
+        out
+    }
+
     /// `cmd()` for exactly `pids`. This process is asked for too: a read that
     /// does not list it did not read the table at all.
     pub(super) fn command_lines(pids: &[u32]) -> Result<HashMap<u32, String>, String> {
@@ -1082,6 +1138,11 @@ mod platform {
     /// is no finer per-pid read here.
     pub(super) fn precise_creation_filetime(_pid: u32) -> Option<u64> {
         None
+    }
+
+    /// `/proc/<pid>/cmdline` for exactly `pids` — already the raw read here.
+    pub(super) fn raw_command_lines(pids: &[u32]) -> HashMap<u32, String> {
+        process_tree::proc_command_lines(pids)
     }
 
     /// `/proc/<pid>/cmdline` for exactly `pids`.

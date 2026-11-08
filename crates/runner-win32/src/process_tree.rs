@@ -258,7 +258,8 @@ pub fn walk<T: ProcessTable>(
 
 #[cfg(windows)]
 pub use imp::{
-    creation_time, snapshot, terminate_process_tree, terminate_tree_of, OwnedProcess, Win32Table,
+    creation_time, raw_command_line, snapshot, terminate_process_tree, terminate_tree_of,
+    OwnedProcess, Win32Table,
 };
 
 #[cfg(windows)]
@@ -296,6 +297,80 @@ mod imp {
             unsafe { GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user) };
         (ok != 0)
             .then(|| (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
+    }
+
+    /// The command line of the process behind `handle`, EXACTLY as the process
+    /// was started with it — the PEB's `CommandLine` read through
+    /// `NtQueryInformationProcess(ProcessCommandLineInformation)`, the same
+    /// text WMI's `Win32_Process.CommandLine` serves.
+    ///
+    /// Not `sysinfo`'s `cmd()`: that splits the line with `CommandLineToArgvW`,
+    /// and a caller who rejoins the pieces cannot get the original back — cmd's
+    /// `^"` escapes inside a quoted `/c` body are consumed as quote toggles
+    /// (plan 2026-11-04-runner-finished-close-closes-nothing-on-any-box, Phase
+    /// 2a: the measured `cmd.exe /d /s /c "<python3> ^"<shim>^" …"` chain read
+    /// through `cmd()` + rejoin never matches). `None` when the call fails.
+    ///
+    /// # Safety
+    /// `handle` must be a valid process handle with at least
+    /// `PROCESS_QUERY_LIMITED_INFORMATION` access.
+    pub unsafe fn raw_command_line(handle: HANDLE) -> Option<String> {
+        use windows_sys::Wdk::System::Threading::{
+            NtQueryInformationProcess, ProcessCommandLineInformation,
+        };
+        use windows_sys::Win32::Foundation::UNICODE_STRING;
+        let mut needed: u32 = 0;
+        // SAFETY: a zero-length probe; only `needed` is written.
+        unsafe {
+            NtQueryInformationProcess(
+                handle,
+                ProcessCommandLineInformation,
+                std::ptr::null_mut(),
+                0,
+                &mut needed,
+            )
+        };
+        let header = std::mem::size_of::<UNICODE_STRING>();
+        if (needed as usize) < header || needed > 1 << 20 {
+            return None;
+        }
+        // u64 words keep the UNICODE_STRING header aligned.
+        let mut buf = vec![0u64; (needed as usize).div_ceil(8)];
+        let mut written: u32 = 0;
+        // SAFETY: `buf` is `needed` bytes (rounded up), writable, and outlives
+        // the call; the caller guarantees `handle`.
+        let status = unsafe {
+            NtQueryInformationProcess(
+                handle,
+                ProcessCommandLineInformation,
+                buf.as_mut_ptr().cast(),
+                needed,
+                &mut written,
+            )
+        };
+        if status < 0 || (written as usize) < header {
+            return None;
+        }
+        // SAFETY: the call succeeded, so the buffer starts with a UNICODE_STRING
+        // whose `Buffer` points into this same allocation.
+        let us = unsafe { &*(buf.as_ptr() as *const UNICODE_STRING) };
+        let units = usize::from(us.Length) / 2;
+        if us.Buffer.is_null() {
+            return (units == 0).then(String::new);
+        }
+        // The string must lie inside the bytes the call WROTE, after the header,
+        // at an even offset. It is then read out of `buf` by offset, never
+        // through the pointer the kernel wrote.
+        let offset = (us.Buffer as usize).checked_sub(buf.as_ptr() as usize)?;
+        let end = offset.checked_add(units * 2)?;
+        if offset < header || offset % 2 != 0 || end > written as usize {
+            return None;
+        }
+        // SAFETY: `buf` is an initialized `Vec<u64>`, so viewing it as u16s is
+        // valid and aligned; `offset..end` was bounds-checked just above.
+        let all: &[u16] =
+            unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u16>(), buf.len() * 4) };
+        Some(String::from_utf16_lossy(&all[offset / 2..end / 2]))
     }
 
     /// An owned process handle, closed on drop. While it is open the pid it
@@ -366,6 +441,12 @@ mod imp {
         pub fn creation_time(&self) -> Option<u64> {
             // SAFETY: opened (or duplicated) with query access.
             unsafe { creation_time(self.0) }
+        }
+
+        /// The process's raw command line ([`raw_command_line`]).
+        pub fn command_line(&self) -> Option<String> {
+            // SAFETY: opened (or duplicated) with query access.
+            unsafe { raw_command_line(self.0) }
         }
 
         /// Whether the process has exited.
@@ -837,6 +918,44 @@ mod tests {
             self.children.push(child);
             self.children.last_mut().expect("just pushed")
         }
+    }
+
+    /// The raw read returns the line the process was started with, byte for
+    /// byte, including cmd's `^"` escapes inside a quoted `/c` body — the shape
+    /// Claude Code wraps a stdio MCP server in, which `sysinfo`'s split-and-
+    /// rejoin cannot reproduce.
+    #[test]
+    fn raw_command_line_returns_the_cmd_wrapper_line_verbatim() {
+        use std::os::windows::process::CommandExt;
+        let body = r#"/d /s /c "ping -n 30 127.0.0.1 ^"x y^" >nul""#;
+        let mut child = Command::new("cmd.exe")
+            .raw_arg(body)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn cmd");
+        let job = crate::ScopedKillOnCloseJob::create(None).expect("job");
+        // SAFETY: `child` is alive and owns its handle for this call.
+        unsafe { job.assign(child.as_raw_handle() as _) };
+        let proc = OwnedProcess::open(child.id()).expect("open");
+        let line = proc.command_line().expect("read");
+        let _ = child.kill();
+        assert!(line.ends_with(&format!(" {body}")), "{line}");
+        assert!(line.to_ascii_lowercase().contains("cmd.exe"), "{line}");
+    }
+
+    #[test]
+    fn raw_command_line_reads_this_process() {
+        // SAFETY: the pseudo-handle for the current process carries full access.
+        let line = unsafe { raw_command_line(GetCurrentProcessHandle()) }.expect("read");
+        assert!(!line.trim().is_empty());
+    }
+
+    #[allow(non_snake_case)]
+    fn GetCurrentProcessHandle() -> windows_sys::Win32::Foundation::HANDLE {
+        // SAFETY: GetCurrentProcess takes no arguments and cannot fail.
+        unsafe { windows_sys::Win32::System::Threading::GetCurrentProcess() }
     }
 
     /// Every pid `snapshot` links below `root` (no identity check — test use).

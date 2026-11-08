@@ -1,0 +1,27 @@
+{
+  "provenance": {
+    "host": "merytshost (Linux 6.12.113+deb13-amd64, Python 3.13.5)",
+    "measured_at": "2026-11-08T06:22:00Z",
+    "method": "ssh merytshost 'ps -eo pid=,ppid=,etimes=,comm=,args='; subtree of one real claude; start = capture epoch - etimes (seconds, the runner's /proc granularity); coord-mcp-shim credential filenames redacted; tool-shell bodies redacted",
+    "shape": "python3()",
+    "census": "343 claude on the box at capture: 337 held exactly one python3 child, 341 python3 children ran `/usr/bin/python3 ~/Projects/qontinui-root/qontinui-claude-config/scripts/coord-mcp-shim.py --credential <path>`, 1 ran owned-run.py (a next dev server)"
+  },
+  "platform": "linux",
+  "claude_pid": 1893,
+  "table": [
+    {
+      "pid": 1893,
+      "ppid": 1907422,
+      "image": "claude",
+      "start": 1793827619,
+      "cmdline": "<claude argv not recorded>"
+    },
+    {
+      "pid": 11153,
+      "ppid": 1893,
+      "image": "python3",
+      "start": 1793827620,
+      "cmdline": "/usr/bin/python3 /home/spinak/Projects/qontinui-root/qontinui-claude-config/scripts/coord-mcp-shim.py --credential /home/spinak/.qontinui/coord-mcp-shim/0123456789abcdef.json"
+    }
+  ]
+}

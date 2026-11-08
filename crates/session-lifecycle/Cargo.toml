@@ -1,0 +1,25 @@
+[package]
+name = "session-lifecycle"
+version = "0.1.0"
+description = "The session-lifecycle kernel: pure evaluators the runner's close paths decide from (first slice: classify_child)"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+
+# Plan 2026-10-28-one-session-lifecycle-authority, Phase 37 (the kernel crate),
+# first slice delivered by plan
+# 2026-11-04-runner-finished-close-closes-nothing-on-any-box, Phase 2a.
+#
+# A PURE library: no Tauri, no tokio, no I/O, and no dependency on the
+# src-tauri crate (the crates/pty-holder precedent). The runner gathers process
+# facts and hands them in; this crate only decides. Keep the dependency list
+# empty: a kernel that reads nothing cannot disagree with the table it is given.
+
+[lib]
+name = "session_lifecycle"
+path = "src/lib.rs"
+
+[dependencies]
+
+[dev-dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

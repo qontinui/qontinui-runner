@@ -972,6 +972,9 @@ jobs:
         run: |
           cd src-tauri
           cargo fmt -- --check
+          # The session-lifecycle kernel crate is a separate workspace member,
+          # which a bare `cargo fmt` from src-tauri does not reach.
+          cargo fmt -p session-lifecycle -- --check
 
       - name: Clippy check
         # UBUNTU ONLY. Windows clippy moved to the parallel `clippy-windows`
@@ -1374,7 +1377,14 @@ jobs:
           if [ "$RUNNER_OS" = "Linux" ]; then
             cargo build -p qontinui-pty-holder
           fi
-          cargo test --no-run --verbose 2>&1 | tee "$GITHUB_WORKSPACE/cargo-test-build.log"
+          # `-p session-lifecycle`: the session-lifecycle kernel crate (plan
+          # 2026-10-28-one-session-lifecycle-authority, Phase 37; first slice
+          # plan 2026-11-04-runner-finished-close-closes-nothing-on-any-box,
+          # Phase 2a) builds its tests HERE, so its binaries are among the
+          # `Executable` lines the run half executes and reach the test-results
+          # ingest. Its fixtures are embedded at compile time, so the run half's
+          # `src-tauri` cwd does not matter to it. Pinned by the shape test.
+          cargo test --no-run --verbose -p qontinui-runner -p session-lifecycle 2>&1 | tee "$GITHUB_WORKSPACE/cargo-test-build.log"
         shell: bash
 
       # Plan 2026-10-27-coord-routes-ci-jobs-by-runner-capability, Phase 1:
@@ -2348,6 +2358,13 @@ jobs:
 
       - name: Clippy holder crates
         run: cargo clippy -p qontinui-pty-holder --all-targets
+
+      # The session-lifecycle kernel (plan
+      # 2026-10-28-one-session-lifecycle-authority, Phase 37): a small pure
+      # crate the `src-tauri` clippy run does not lint. Its tests run in the
+      # required `test` job's build half; this lints it, warnings fatal.
+      - name: Clippy session-lifecycle
+        run: cargo clippy -p session-lifecycle --all-targets -- -D warnings
 
   # Gating frontend unit-test lane (vitest).
   #
