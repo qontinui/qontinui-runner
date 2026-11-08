@@ -1826,6 +1826,11 @@ const REVIEWED_NOT_DOOR: &[(&str, &str)] = &[
     ("GET", "/state-machine/blocked-triggers"),
     ("GET", "/state-machine/permitted-triggers"),
     ("POST", "/stop-execution"),
+    // The per-tab session snapshot (`mcp::terminal_layout`): registered tab
+    // labels, terminal and session ids, accounts, names, zones, finished
+    // markers and terminal titles. A read of runner state; no credential, no
+    // caller-chosen path, no write, no outbound request.
+    ("GET", "/terminal-layout"),
     ("GET", "/terminal-pages"),
     ("POST", "/tests/execute-suite"),
     ("GET", "/ui-bridge/control/design/evaluate/contexts"),
