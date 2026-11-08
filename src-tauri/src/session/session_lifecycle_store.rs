@@ -2624,6 +2624,95 @@ impl SessionLifecycleStore {
         self.snapshot_change(std::iter::once(changed));
     }
 
+    /// Make an OPEN record's `zone_index` follow the grid zone its LIVE
+    /// terminal is rendered in — and change nothing else.
+    ///
+    /// Both backend writers that record a `POST /terminals` session (the
+    /// spawn-time identity seam in `terminal/session.rs` and the typed-line
+    /// sniff in `terminal/claude_resume_sniff.rs`) have no view of the grid,
+    /// so they write `zone_index: 0`. The frontend's zone backstop
+    /// (`useRecordedZoneBackstop`) is the only party that sees where the tab
+    /// actually landed, and it never wrote these records, so it must not
+    /// re-assert them with `record_open` (that refreshes `last_seen_at`, which
+    /// is what made ghost rows immortal). Measured 2026-11-08 on a temp runner
+    /// (coord finding `898efce4`): three sessions created over
+    /// `POST /terminals`, rendered in zones 0, 1 and 2, all recorded zone 0.
+    ///
+    /// The write happens only when ALL of these hold:
+    /// - the record exists and is `open` (a closed row is not a restore
+    ///   target and must not be edited back into relevance);
+    /// - its `terminal_id` EQUALS `terminal_id` — the caller's observation is
+    ///   of that live terminal, so a record still pointing at a dead
+    ///   pre-restart terminal (an auto-resume row before its verified
+    ///   re-record) is never moved by a zone it does not occupy;
+    /// - the zone differs (same zone → no write, no flush).
+    ///
+    /// Unlike [`Self::rebind_terminal`] it NEVER re-points the terminal, and
+    /// unlike that command's wrapper it never stamps a restore tier.
+    /// `last_seen_at`, `confirmed_at`, `origin`, `state`,
+    /// `restore_pending_at` and every other field are left untouched.
+    ///
+    /// Returns `updated` (a write happened) and `previous_zone`: the zone the
+    /// matching open record carried at call time, or `None` when no open
+    /// record on that terminal was found (absent, closed, or bound to another
+    /// terminal).
+    pub fn sync_zone(
+        &self,
+        claude_session_id: &str,
+        terminal_id: &str,
+        zone_index: i32,
+    ) -> SyncZoneOutcome {
+        const NOOP: SyncZoneOutcome = SyncZoneOutcome {
+            updated: false,
+            previous_zone: None,
+        };
+        let (changed, previous_zone) = {
+            let mut m = match self.map.lock() {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!(error = %e, "session_lifecycle_store: lock poisoned on sync_zone");
+                    return NOOP;
+                }
+            };
+            // Same swapped-argument tell as `rebind_terminal`, checked while
+            // the (non-reentrant) guard is already held.
+            debug_assert!(
+                !m.contains_key(terminal_id),
+                "sync_zone: terminal_id {terminal_id:?} is a claude_session_id key in the \
+                 lifecycle store — the two id arguments look swapped (expected \
+                 sync_zone(claude_session_id, terminal_id, ..), got \
+                 claude_session_id={claude_session_id:?})"
+            );
+            let Some(rec) = m.get_mut(claude_session_id) else {
+                return NOOP; // unknown session
+            };
+            if rec.state != "open" || rec.terminal_id != terminal_id {
+                return NOOP; // not a live record of THIS terminal
+            }
+            let previous_zone = rec.zone_index;
+            if previous_zone == zone_index {
+                return SyncZoneOutcome {
+                    updated: false,
+                    previous_zone: Some(previous_zone),
+                }; // already current — no write, no flush
+            }
+            rec.zone_index = zone_index;
+            let changed = rec.clone();
+            self.persist(
+                m,
+                &[LifecycleDelta::Upsert {
+                    rec: Box::new(changed.clone()),
+                }],
+            );
+            (changed, previous_zone)
+        };
+        self.snapshot_change(std::iter::once(changed));
+        SyncZoneOutcome {
+            updated: true,
+            previous_zone: Some(previous_zone),
+        }
+    }
+
     /// Mirror a terminal-page move into the durable registry, resolved by
     /// `terminal_id`. The `POST /terminals/{id}/move` surface mutates the
     /// in-memory `TerminalSession.page_id`; without this flush the durable
@@ -4456,6 +4545,18 @@ impl SessionLifecycleStore {
             self.compact();
         }
     }
+}
+
+/// Typed outcome of [`SessionLifecycleStore::sync_zone`], serialized into
+/// `CommandResponse.data` as `{updated, previousZone}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncZoneOutcome {
+    /// A write happened: the record's `zone_index` moved.
+    pub updated: bool,
+    /// The zone the matching OPEN record carried at call time; `None` when no
+    /// open record bound to the given terminal was found.
+    pub previous_zone: Option<i32>,
 }
 
 /// Typed outcome of [`SessionLifecycleStore::record_close_checked`].
@@ -13662,3 +13763,7 @@ mod gate_continuation_tests {
         assert!(!NON_RESTORABLE_CLOSE_REASONS.contains(&"pty-exit"));
     }
 }
+
+#[cfg(test)]
+#[path = "session_lifecycle_store_sync_zone_tests.rs"]
+mod sync_zone_tests;
