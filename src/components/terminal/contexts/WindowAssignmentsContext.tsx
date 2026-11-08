@@ -28,10 +28,10 @@ import {
 } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { getCurrentWindow } from "@tauri-apps/api/window";
 import { setPageBindings } from "@/lib/pageBindings";
+import { MAIN_WINDOW_LABEL, readWindowLabel } from "./windowLabel";
 
-export const MAIN_WINDOW_LABEL = "main";
+export { MAIN_WINDOW_LABEL, readWindowLabel };
 
 /** Map of sessionId/terminalId → owning window label. */
 export type SessionOwnerMap = Record<string, string>;
@@ -60,16 +60,6 @@ interface WindowAssignmentsValue {
   isOwned: (sessionId: string, pageId?: string | null) => boolean;
   /** The page THIS window is bound to (pop-out-page windows only), else null. */
   boundPage: string | null;
-}
-
-/** This window's Tauri label; `"main"` outside Tauri (tests / SSR). */
-export function readWindowLabel(): string {
-  try {
-    return getCurrentWindow().label || MAIN_WINDOW_LABEL;
-  } catch {
-    // Non-Tauri env (tests / SSR) — behave as the single main window.
-    return MAIN_WINDOW_LABEL;
-  }
 }
 
 const WindowAssignmentsContext = createContext<WindowAssignmentsValue | null>(null);

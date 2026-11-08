@@ -4,7 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { COORD_DRAIN_STATE_EVENT } from "@/hooks/useCoordDrainState";
 import { instanceStorage } from "@/lib/instance-storage";
 import { getPageBindings, subscribePageBindings } from "@/lib/pageBindings";
-import { MAIN_WINDOW_LABEL, readWindowLabel } from "./contexts/WindowAssignmentsContext";
+import { MAIN_WINDOW_LABEL, readWindowLabel } from "./contexts/windowLabel";
 import { DEFAULT_PAGE_NAME, nextAutoPageName, renameRefusal, uniquePageName } from "./pageNaming";
 
 /**
