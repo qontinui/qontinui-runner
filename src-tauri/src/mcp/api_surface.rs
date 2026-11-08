@@ -287,7 +287,7 @@ enum ScanRootMissing {
 /// usually takes the unresolved-root arm) learns that configuring a root alone
 /// will not make the scan work.
 const RUNNER_CHECKOUT_HINT: &str =
-    "This page scans the runner's own source code, which only a development \
+    "This scan reads the runner's own source code, which only a development \
      checkout has. On a development machine, set the \"Workspace root\" setting \
      to the folder that holds the qontinui-runner checkout, or start the runner \
      from inside that checkout.";
