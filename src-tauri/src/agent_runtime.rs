@@ -8047,7 +8047,9 @@ fn classify_pty_spawn_error(e: &str) -> (String, SpawnPhase) {
 /// `POST /terminals`' report of a spawn that failed AFTER its worktree was
 /// allocated. Coord moves the allocation's rows from `allocated` to
 /// `abandoned`, so the allocation stops counting as live. That is a ledger fact:
-/// it does not remove the tree from disk. The failure is classified the way the
+/// it does not remove the tree from disk. Best-effort, like every caller of
+/// [`report_spawn_failed_in_phase`]: one attempt, and nothing is posted on a
+/// runner with no connected coord base. The failure is classified the way the
 /// condition-check path classifies a PTY-seam failure
 /// ([`classify_pty_spawn_error`]), so a trust-gate block posts as `blocked`.
 pub(crate) async fn report_http_terminal_spawn_failed(agent_id: uuid::Uuid, error: &str) {

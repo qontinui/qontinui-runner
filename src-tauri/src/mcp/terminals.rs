@@ -572,14 +572,17 @@ pub async fn create_terminal_handler(
             // `abandoned`, so the allocation stops counting as live. That is a
             // ledger fact only. Removing the tree from disk is reclaim's call,
             // and `abandoned` alone does not authorize it, so the tree can still
-            // remain. Detached, so the caller's answer does not wait on coord.
+            // remain. Detached and best-effort: one attempt, and none at all on
+            // a runner with no connected coord base (the reporter logs that), so
+            // the caller's answer never waits on coord.
             if let Some(ctx) = isolated_ctx.as_ref() {
                 for worktree in &ctx.worktrees {
                     warn!(
-                        "HTTP: terminal create failed after allocating worktree {} ({}); \
-                         reporting the allocation abandoned (the tree stays on disk)",
-                        worktree.worktree_path.display(),
-                        worktree.repo
+                        "HTTP: terminal create failed after allocation {} ({} at {}); \
+                         reporting it abandoned, best-effort",
+                        ctx.agent_id,
+                        worktree.repo,
+                        worktree.worktree_path.display()
                     );
                 }
                 match uuid::Uuid::parse_str(&ctx.agent_id) {
