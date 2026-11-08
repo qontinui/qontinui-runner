@@ -6219,7 +6219,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     // Resolved once: the success arm uses the path, the failure
                     // arm renders the shared sentence from the same resolution.
                     let workspace_root = crate::workspace_paths::require_workspace_root();
-                    if let Some(workspace) = workspace_root.as_ref().ok().cloned() {
+                    if let Ok(workspace) = &workspace_root {
                         let mutated =
                             dev_services::upgrade_and_dedupe_configs(&mut configs, &workspace);
 
