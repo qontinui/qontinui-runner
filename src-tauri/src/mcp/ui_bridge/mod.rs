@@ -24,6 +24,8 @@ pub mod component_errors;
 pub mod design;
 pub mod design_eval;
 pub mod diagnostics;
+#[cfg(test)]
+mod doc_route_agreement;
 pub mod effects;
 pub mod elements;
 pub mod errors;
