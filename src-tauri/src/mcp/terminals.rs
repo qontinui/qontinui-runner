@@ -571,17 +571,40 @@ pub async fn create_terminal_handler(
             Ok(Json(ApiResponse::success(serde_json::json!(info))))
         }
         Err(e) => {
-            // The context's Drop releases its claims, not the worktree on disk,
-            // so a failure this late leaves one behind whatever status the
-            // caller gets. Name it here; the response cannot. The context may
-            // hold a worktree this call allocated or one it reused from the
-            // request's cwd, so the line says only that it is still there.
-            for worktree in isolated_ctx.iter().flat_map(|ctx| ctx.worktrees.iter()) {
-                warn!(
-                    "HTTP: terminal create failed; isolated worktree {} ({}) stays on disk",
-                    worktree.worktree_path.display(),
-                    worktree.repo
-                );
+            // The context's Drop releases its claims, not the worktree on disk.
+            // A context exists only when this call allocated fresh (the reuse
+            // arm of `acquire_for_terminal` returns none), so the tree is this
+            // call's own. Report the failed spawn on the allocation, as the gate
+            // continuation path does: coord moves its rows from `allocated` to
+            // `abandoned`, so the allocation stops counting as live. That is a
+            // ledger fact only. Removing the tree from disk is reclaim's call,
+            // and `abandoned` alone does not authorize it, so the tree can still
+            // remain. Detached, so the caller's answer does not wait on coord.
+            if let Some(ctx) = isolated_ctx.as_ref() {
+                for worktree in &ctx.worktrees {
+                    warn!(
+                        "HTTP: terminal create failed after allocating worktree {} ({}); \
+                         reporting the allocation abandoned (the tree stays on disk)",
+                        worktree.worktree_path.display(),
+                        worktree.repo
+                    );
+                }
+                match uuid::Uuid::parse_str(&ctx.agent_id) {
+                    Ok(agent_id) => {
+                        let reason = e.clone();
+                        tokio::spawn(async move {
+                            crate::agent_runtime::report_http_terminal_spawn_failed(
+                                agent_id, &reason,
+                            )
+                            .await;
+                        });
+                    }
+                    Err(_) => warn!(
+                        "HTTP: allocation agent_id {:?} is not a uuid; its worktree stays \
+                         until reclaim finds it",
+                        ctx.agent_id
+                    ),
+                }
             }
             Err(terminal_spawn_failed(e))
         }
