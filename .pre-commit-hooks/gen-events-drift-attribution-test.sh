@@ -1019,8 +1019,10 @@ git_shim_failing() {
     local name="$1" glob="$2" dir
     dir="$(dirname "$WORK")/shim-$name"
     mkdir -p "$dir"
-    printf '#!/usr/bin/env bash\ncase "$*" in %s) echo "shim: %s fails" >&2; exit 128 ;; esac\nexec "%s" "$@"\n' \
-        "$glob" "$name" "$REAL_GIT" > "$dir/git"
+    # Every call is logged to "$dir/calls", so a case can assert its own
+    # premise: that the git it meant to fail actually went through the shim.
+    printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "%s/calls"\ncase "$*" in %s) echo "shim: %s fails" >&2; exit 128 ;; esac\nexec "%s" "$@"\n' \
+        "$dir" "$glob" "$name" "$REAL_GIT" > "$dir/git"
     chmod +x "$dir/git"
     printf '%s' "$dir"
 }
@@ -1493,8 +1495,15 @@ ITA_SHIM="$(git_shim_failing ita '*--ita-visible-in-index*')"
 printf '# readme\n' >> "$WORK/README"
 git -C "$WORK" add README
 ( cd "$WORK" && HOOK_PATH_PREFIX="$ITA_SHIM" git commit -qm "partial" -- README ) >/dev/null 2>&1
-check "a failing staged-later read is UNAVAILABLE, naming the call" "unavailable|yes" \
-    "$(hook_state)|$(grep -qF 'against the real index failed' "$WORK/.hook-reason" 2>/dev/null && echo yes || echo no)"
+# The premise: the hook's own git call went through the shim. Where it does not
+# (measured on Git for Windows) the case would prove nothing, so it is skipped
+# rather than failed.
+if grep -qF -- '--ita-visible-in-index' "$ITA_SHIM/calls" 2>/dev/null; then
+    check "a failing staged-later read is UNAVAILABLE, naming the call" "unavailable|yes" \
+        "$(hook_state)|$(grep -qF 'against the real index failed' "$WORK/.hook-reason" 2>/dev/null && echo yes || echo no)"
+else
+    skip_note "failing staged-later read: the hook's git call never reached the PATH shim here"
+fi
 
 # `commit -a` with a path ALREADY staged: it is in both indexes, and is listed
 # once, as staged — not a second time as staged-later.
@@ -1538,17 +1547,32 @@ fixture
 ODD_E='src-tauri/src/é b.rs'
 ODD_Q='src-tauri/src/q"t.rs'
 printf '// e\n' > "$WORK/$ODD_E"
-printf '// q\n' > "$WORK/$ODD_Q"
+printf '// q\n' > "$WORK/$ODD_Q" 2>/dev/null
+# A name is under test only when git itself lists it EXACTLY: MSYS (Git for
+# Windows) does not refuse `"` or a tab in a file name, it silently maps them to
+# private-use characters, so the write succeeds and git sees another name.
+git_sees_name() {
+    local listed
+    listed="$(git -C "$WORK" ls-files -z --others --exclude-standard | tr '\0' '\n')"
+    grep -qxF -- "$1" <<< "$listed"
+}
 ODD_T=""
-if printf '// t\n' > "$WORK/src-tauri/src/a"$'\t'"b.rs" 2>/dev/null; then
+if printf '// t\n' > "$WORK/src-tauri/src/a"$'\t'"b.rs" 2>/dev/null \
+   && git_sees_name "src-tauri/src/a"$'\t'"b.rs"; then
     ODD_T="src-tauri/src/a"$'\t'"b.rs"
 fi
+ODD_Q_OK=""
+git_sees_name "$ODD_Q" && ODD_Q_OK=1
 decide
 check "odd names are MINE" "mine" "$ATTRIBUTION_STATE"
 check "  é b.rs is labelled by its real name" yes \
     "$(grep -qxF "$ODD_E"$'\t'"untracked" <<< "$ATTRIBUTION_TOUCHED_DETAIL" && echo yes || echo no)"
-check "  q\"t.rs is labelled by its real name" yes \
-    "$(grep -qxF "$ODD_Q"$'\t'"untracked" <<< "$ATTRIBUTION_TOUCHED_DETAIL" && echo yes || echo no)"
+if [ -n "$ODD_Q_OK" ]; then
+    check "  q\"t.rs is labelled by its real name" yes \
+        "$(grep -qxF "$ODD_Q"$'\t'"untracked" <<< "$ATTRIBUTION_TOUCHED_DETAIL" && echo yes || echo no)"
+else
+    skip_note "q\"t.rs: this filesystem does not keep a \" in a file name (git lists another name)"
+fi
 if [ -n "$ODD_T" ]; then
     ODD_T_SHOWN="$(printf '%q' "$ODD_T")"
     check "  a tab-named file is kept, in its %q form" yes \
@@ -1556,7 +1580,7 @@ if [ -n "$ODD_T" ]; then
     check "  and counted in the flat list" yes \
         "$(grep -qxF "$ODD_T_SHOWN" <<< "$ATTRIBUTION_TOUCHED" && echo yes || echo no)"
 else
-    skip_note "tab-named file: this filesystem refuses a tab in a file name"
+    skip_note "tab-named file: this filesystem refuses or remaps a tab in a file name"
 fi
 RENDERED="$(gen_events_render_mine)"
 check "  the message shows é b.rs raw" yes \
