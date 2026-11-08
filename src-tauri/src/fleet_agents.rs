@@ -274,9 +274,11 @@ pub(crate) fn remove_retired_agents(
 /// Only a NotFound means "no agents directory, so nothing retired can be on
 /// disk". Any other resolution failure leaves the pass unable to tell whether
 /// the directory is the workdir's own, so it removes nothing and records every
-/// retired copy that is visibly there as [`RetainedReason::ReadFailed`]: a pass
-/// that returned silently would read complete while a retired copy may still
-/// resolve.
+/// retired copy that is visibly there as [`RetainedReason::ReadFailed`] — except
+/// one `keep` covers, which is recorded as the deliberate keep it is
+/// ([`RetainedReason::KeptByRepository`]), since keeping needs no resolution. A
+/// pass that returned silently would read complete while a retired copy may
+/// still resolve.
 fn remove_retired_agents_resolving(
     workdir: &Path,
     keep: &KeepDecisions,
@@ -695,6 +697,42 @@ mod tests {
             "only the copy that is there is named; an absent one is not"
         );
         assert!(!report.is_complete(), "{}", report.summary());
+
+        // A copy the repository tracks is labelled as the deliberate keep it
+        // is, even when resolution fails, rather than as a read failure.
+        {
+            use crate::provision_guard::test_support::{git_add, git_init};
+            let repo = tempfile::tempdir().unwrap();
+            let tracked_dst = repo.path().join(".claude").join("agents");
+            std::fs::create_dir_all(&tracked_dst).unwrap();
+            std::fs::write(tracked_dst.join("retired-agent.md"), body).unwrap();
+            git_init(repo.path());
+            git_add(repo.path(), Path::new(".claude/agents/retired-agent.md"));
+            let tracked = crate::provision_guard::TrackedPaths::probe(&tracked_dst);
+            let keep = KeepDecisions::decide(&tracked, &tracked_dst, ["retired-agent.md"]);
+            assert!(
+                keep.reason("retired-agent.md").is_some(),
+                "fixture is tracked"
+            );
+            let mut report = fresh();
+            remove_retired_agents_resolving(
+                repo.path(),
+                &keep,
+                &[line.as_str()],
+                &mut report,
+                |_| Err(std::io::Error::other("injected")),
+            );
+            assert!(tracked_dst.join("retired-agent.md").is_file());
+            assert_eq!(report.retained_retired.len(), 1, "{}", report.summary());
+            assert!(
+                matches!(
+                    report.retained_retired[0].reason,
+                    RetainedReason::KeptByRepository(_)
+                ),
+                "{}",
+                report.summary()
+            );
+        }
 
         // NotFound is still the quiet "nothing can be on disk" arm.
         let mut report = fresh();
