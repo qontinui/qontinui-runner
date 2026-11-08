@@ -1192,7 +1192,11 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
               const bytes = encoder.encode(prepared);
               invoke("terminal_write", { terminalId, data: uint8ToBase64(bytes) }).catch(() => {});
             })
-            .catch(() => {});
+            .catch((err: unknown) => {
+              // contextmenu is preventDefaulted above, so no native paste
+              // follows: a rejected read is a paste that did not happen.
+              console.warn("[terminal] right-click clipboard read failed; nothing pasted", err);
+            });
         };
         container.addEventListener("contextmenu", contextMenuCopyPaste);
 
