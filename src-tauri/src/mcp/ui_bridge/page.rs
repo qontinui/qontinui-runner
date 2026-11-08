@@ -4325,7 +4325,7 @@ mod allowed_actions_tests {
     use super::*;
 
     /// The shape-error `allowedActions` list is derived from the route's own
-    /// allowlist, so it cannot drift from what `validate_action_name` accepts.
+    /// allowlist, so it cannot drift from what `is_builtin_action` accepts.
     #[test]
     fn navigate_and_wait_allowed_actions_equal_supported_action_names() {
         let data = NavigateAndWaitRequest::shape_error_data().expect("data");
