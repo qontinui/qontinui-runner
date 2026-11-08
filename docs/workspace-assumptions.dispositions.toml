@@ -668,3 +668,23 @@ reviewed = [
     "\"powershell\",",
     "\"pwsh\",",
 ]
+
+[[disposition]]
+class = "repo_layout"
+file = "src/workspace_paths.rs"
+symbol = "runner_workspace_root"
+disposition = "dev_only_surface"
+note = "The label passed to ambient::canary, which reads it only while the canary is armed (cfg(test), or an explicit arm): it names the inputs an unguarded test reached, in the deflection message. An installed runner never shows it to an operator; the resolver it guards reads its inputs through the shared qontinui_types::paths rungs and degrades to Unresolved. Plan 2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists B3."
+reviewed = [
+    "\"env QONTINUI_ROOT / QONTINUI_WORKSPACE_ROOT / settings paths.workspace_root (runner_workspace_root)\",",
+]
+
+[[disposition]]
+class = "repo_layout"
+file = "src/workspace_paths.rs"
+symbol = "session_workspace_root"
+disposition = "dev_only_surface"
+note = "The label passed to ambient::canary, which reads it only while the canary is armed (cfg(test), or an explicit arm): it names the inputs an unguarded test reached, in the deflection message. An installed runner never shows it to an operator; the resolver it guards reads its inputs through the shared qontinui_types::paths rungs and degrades to Unresolved. Plan 2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists B3."
+reviewed = [
+    "\"env QONTINUI_ROOT / QONTINUI_WORKSPACE_ROOT / settings paths.workspace_root (session_workspace_root)\",",
+]
