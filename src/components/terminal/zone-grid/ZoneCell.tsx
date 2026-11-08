@@ -35,6 +35,7 @@ import { WorkerSessionCell } from "../WorkerSessionCell";
 import { SuggestionChip } from "../suggestions";
 import { ZoneHoverActions } from "../ZoneHoverActions";
 import { SessionInfoDropdown } from "../SessionInfoDropdown";
+import { TenantBadge, tenantBadgeRendersWithoutSession } from "../TenantBadge";
 import { ZonePromptsPanel } from "../ZonePromptsPanel";
 import { SessionReviewPanel, SessionReviewToggle } from "../SessionReviewPanel";
 import { reviewBadgeState } from "../sessionReviewView";
@@ -139,6 +140,15 @@ export interface ZoneCellProps {
   onCancelRestart?: (zoneIndex: number) => void;
   isDropTarget: boolean;
   showLabels: boolean;
+  /**
+   * `useTenant().showSwitcher`, read once by `TerminalPage` and threaded down
+   * beside `showLabels`: whether this device has more than one tenant binding,
+   * so tenant UI shows at all. A prop rather than a `useTenant()` in the cell
+   * because the cell is `memo`'d, and a context read here would re-render
+   * every cell on each tenant-context change. Feeds the solo strip's
+   * stamped-badge arm (D2 of `2026-11-08-tenant-badge-parity-and-oracle-fixtures`).
+   */
+  tenantSwitcherShown: boolean;
   isMultiZone: boolean;
   autoCompact: boolean;
   forceCompact: boolean;
@@ -253,6 +263,7 @@ function ZoneCellInner({
   onCancelRestart,
   isDropTarget,
   showLabels: showLabelsProp,
+  tenantSwitcherShown,
   isMultiZone,
   autoCompact,
   forceCompact,
@@ -428,6 +439,7 @@ function ZoneCellInner({
       showLabels,
       showCompactCard,
       claudeSessionId: tab?.claudeSessionId,
+      stampedTenantBadge: tenantBadgeRendersWithoutSession(tenantSwitcherShown, tab?.tenantId),
     });
   // A parked tmux cell offers no prompts/review panel, so it reads no review.
   const promptsAvailable =
@@ -767,9 +779,14 @@ function ZoneCellInner({
           {/* D1: the single-zone layout renders no `ZoneLabel`, so before this
               the session-info trigger had NO mount site on a one-terminal page
               — the layout most operators run. This is the same 20px strip
-              `ZoneLabel` occupies, carrying only the trigger, and the terminal
-              body below gets the same 20px of top padding, so it displaces the
-              first output line rather than covering it. Left-anchored, matching
+              `ZoneLabel` occupies, carrying the tenant badge and the trigger in
+              `ZoneLabel`'s order (D2 of
+              `2026-11-08-tenant-badge-parity-and-oracle-fixtures`: the badge
+              renders wherever the dropdown does, and a stamped plain shell on a
+              multi-bound device gets the strip for its badge alone, as it gets
+              the badge in a multi-zone header). The terminal body below gets
+              the same 20px of top padding, so the strip displaces the first
+              output line rather than covering it. Left-anchored, matching
               `ZoneLabel`: `ZoneHoverActions` owns the top-RIGHT corner
               (`top-1 right-1 z-30`) and is NOT multi-zone gated, so a
               right-anchored trigger would sit under it on every hover. */}
@@ -778,6 +795,11 @@ function ZoneCellInner({
               className="absolute top-0 left-0 right-0 flex items-center gap-1.5 px-1 bg-[#13141f]/85 backdrop-blur-sm z-10"
               style={{ height: `${ZONE_HEADER_HEIGHT_PX}px` }}
             >
+              <TenantBadge
+                tenantId={tab.tenantId}
+                claudeSessionId={tab.claudeSessionId}
+                zoneIndex={zoneIdx}
+              />
               <SessionInfoDropdown claudeSessionId={tab.claudeSessionId} zoneIndex={zoneIdx} />
               {promptsAvailable && (
                 <button

@@ -48,27 +48,34 @@ export function countMatches(lines: string[], filter: string): number {
 
 /**
  * Whether a zone must carry the standalone session-info strip (D1 of
- * `plans/2026-08-19-session-info-dropdown-mount-gaps-remediation.md`).
+ * `plans/2026-08-19-session-info-dropdown-mount-gaps-remediation.md`, widened
+ * by D2 of `2026-11-08-tenant-badge-parity-and-oracle-fixtures`).
  *
  * `showLabels` gates the full `ZoneLabel` chrome — rename, pin, filter,
  * output stats — on a MULTI-zone grid, because on a one-terminal page that
- * chrome is redundant with the tab bar. The session-info trigger is not
- * chrome: it is the only surface that answers "which Claude session is this,
- * and what has it opened?", and a one-terminal page is the layout most
- * operators actually run. Gating it on `showLabels` therefore made the whole
- * feature invisible for them.
+ * chrome is redundant with the tab bar. The session-info trigger and the
+ * tenant badge are not chrome: they answer "which Claude session is this,
+ * what has it opened, and which tenant does it act as?", and a one-terminal
+ * page is the layout most operators actually run.
  *
- * So: mount it wherever `ZoneLabel` does NOT, provided the tab actually has a
- * session to describe (a tab with no `claudeSessionId` has no session info to
- * be unknown ABOUT — the same distinction `SessionInfoDropdown` makes when it
- * returns `null`). The compact card is excluded because it replaces the whole
- * zone body with its own summary UI.
+ * So the strip mounts wherever `ZoneLabel` does NOT, and the compact card is
+ * excluded because it replaces the whole zone body with its own summary UI.
+ * Within that, it renders when it has something to carry:
+ *  - the tab has a Claude session (`claudeSessionId`) — the dropdown renders,
+ *    and a tab with no session has no session info to be unknown ABOUT, the
+ *    same distinction `SessionInfoDropdown` makes when it returns `null`; or
+ *  - `stampedTenantBadge` — the tenant badge renders with no session (a
+ *    stamped tab on a multi-bound device, `tenantBadgeRendersWithoutSession`).
+ *    `ZoneLabel` shows the badge for that stamped plain shell in a multi-zone
+ *    header, so without this arm the same shell on a one-terminal page would
+ *    show nothing: the badge appears under the same condition in every layout.
  */
 export function showSoloSessionInfo(opts: {
   showLabels: boolean;
   showCompactCard: boolean;
   claudeSessionId?: string;
+  stampedTenantBadge: boolean;
 }): boolean {
   if (opts.showLabels || opts.showCompactCard) return false;
-  return !!opts.claudeSessionId;
+  return !!opts.claudeSessionId || opts.stampedTenantBadge;
 }

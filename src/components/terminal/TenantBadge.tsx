@@ -246,16 +246,50 @@ export function tenantBadgeLabel(
   };
 }
 
+/**
+ * The badge's UI Bridge id for one zone (plan
+ * `2026-11-08-tenant-badge-parity-and-oracle-fixtures` D1). Per-zone, like
+ * `terminal-zone-header-<n>` and `terminal-session-info-<field>-<n>`: the
+ * runner's DOM scanner registers one element per id, so a shared id made every
+ * zone's badge one ambiguous control. Pure; the single source for both
+ * `data-ui-bridge-id` and `data-testid`.
+ */
+export function tenantBadgeElementId(zoneIndex: number): string {
+  return `terminal-tenant-badge-${zoneIndex}`;
+}
+
+/**
+ * Whether the badge can render for a tab that has NO Claude session (plan
+ * `2026-11-08-tenant-badge-parity-and-oracle-fixtures` D2): with no session
+ * there is no tenancy block to read, so only a spawn stamp names a tenant, and
+ * only a multi-bound device (`showSwitcher`) shows tenant UI at all. The
+ * single-zone strip uses it so a stamped plain shell gets the badge on a
+ * one-terminal page exactly as `ZoneLabel` shows it in a multi-zone header.
+ * Pure; mirrors the stamp arm of `tenantBadgeLabel`.
+ */
+export function tenantBadgeRendersWithoutSession(
+  showSwitcher: boolean,
+  tenantId: string | undefined | null,
+): boolean {
+  return showSwitcher && !!tenantId?.trim();
+}
+
 interface TenantBadgeProps {
   /** The tenant this session was spawned under (`TerminalTab.tenantId`). */
   tenantId?: string;
   /** The session to read the tenancy block for (`TerminalTab.claudeSessionId`). */
   claudeSessionId?: string;
+  /**
+   * The zone this badge sits in — the same index the mount site passes its
+   * `SessionInfoDropdown`. Required so no mount site can omit it and silently
+   * re-create a shared id.
+   */
+  zoneIndex: number;
   /** Extra classes for per-surface sizing (the compact card uses pills). */
   className?: string;
 }
 
-export function TenantBadge({ tenantId, claudeSessionId, className }: TenantBadgeProps) {
+export function TenantBadge({ tenantId, claudeSessionId, zoneIndex, className }: TenantBadgeProps) {
   const { showSwitcher } = useTenant();
   // Read only where the badge can render at all (D12).
   const info = useSessionInfo(showSwitcher ? claudeSessionId : undefined);
@@ -270,14 +304,15 @@ export function TenantBadge({ tenantId, claudeSessionId, className }: TenantBadg
 
   return (
     <span
-      // UI-Bridge-discoverable identity. `data-ui-bridge-id` is the runner's
-      // DOM-scan discovery attribute (same mechanism the sibling
-      // `SpawnTenantPicker` <select> uses, `terminal.spawn-tenant-picker`), so
-      // a snapshot / find-by-text sees this badge when it renders — it is a
-      // non-interactive <span> and would otherwise be invisible to the bridge.
-      // `data-testid` mirrors the neighbouring display badges (`ai-status-badge`).
-      data-ui-bridge-id="terminal.tenant-badge"
-      data-testid="tenant-badge"
+      // UI-Bridge-discoverable identity, one per zone. `data-ui-bridge-id` is
+      // the runner's DOM-scan discovery attribute, so a snapshot sees this
+      // non-interactive <span> when it renders. The id carries the zone index
+      // (`terminal-tenant-badge-<n>`, the per-zone family of
+      // `terminal-session-info-<field>-<n>`): one id shared by every zone
+      // registered a single ambiguous element. `data-testid` is the same value,
+      // as on the session-info dropdown rows.
+      data-ui-bridge-id={tenantBadgeElementId(zoneIndex)}
+      data-testid={tenantBadgeElementId(zoneIndex)}
       data-tenant-id={tenantId}
       data-tenant-diverged={label.diverged ? "true" : "false"}
       data-tenant-credential={info.body?.tenancy?.credential.tenantId ?? undefined}

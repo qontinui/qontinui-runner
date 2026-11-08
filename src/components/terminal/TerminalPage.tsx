@@ -179,8 +179,14 @@ function TerminalPageInner({
   // behind a `display:none` tab". See `lib/surfaceVisible`.
   const pageRootRef = useRef<HTMLDivElement>(null);
   // F2 — the tenant the next spawn binds to (`SpawnTenantPicker` writes it)
-  // and the device's persisted pin as the fallback.
-  const { spawnTenantId, candidates: tenantCandidates } = useTenant();
+  // and the device's persisted pin as the fallback. `showSwitcher` (more than
+  // one binding) is handed to the grid so its memo'd cells can show tenant UI
+  // without each subscribing to the tenant context.
+  const {
+    spawnTenantId,
+    candidates: tenantCandidates,
+    showSwitcher: tenantSwitcherShown,
+  } = useTenant();
   // Auth state at reset time, forwarded into the tree-reset report (P0
   // tree-reset observability) — the tree's usual killer IS an auth flip.
   const { authStatus } = useAuth();
@@ -1634,6 +1640,7 @@ function TerminalPageInner({
                   onExit={handleExit}
                   onExportZone={handleExportZone}
                   onUserInputLine={midSessionProbe.feed}
+                  tenantSwitcherShown={tenantSwitcherShown}
                 />
               ) : (
                 <div className="h-full flex flex-col items-center justify-center text-[#565f89] gap-2">

@@ -194,7 +194,7 @@ describe("zone header row against headerControlsMinPx", () => {
   });
 
   it("the tenant badge truncates, keeps its icon, and keeps the tenant in its title", () => {
-    const badge = renderRow().querySelector('[data-testid="tenant-badge"]')!;
+    const badge = renderRow().querySelector('[data-testid="terminal-tenant-badge-0"]')!;
     expect(holdsWidth(badge)).toBe(false);
     expect(classes(badge)).toContain("min-w-[18px]");
     expect(classes(badge.querySelector("svg")!)).toContain("shrink-0");

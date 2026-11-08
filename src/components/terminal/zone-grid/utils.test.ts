@@ -25,26 +25,62 @@ describe("showSoloSessionInfo", () => {
         showLabels: false,
         showCompactCard: false,
         claudeSessionId: SESSION,
+        stampedTenantBadge: false,
       }),
     ).toBe(true);
   });
 
   it("does NOT double-mount on a multi-zone layout — ZoneLabel already hosts it", () => {
     expect(
-      showSoloSessionInfo({ showLabels: true, showCompactCard: false, claudeSessionId: SESSION }),
+      showSoloSessionInfo({
+        showLabels: true,
+        showCompactCard: false,
+        claudeSessionId: SESSION,
+        stampedTenantBadge: false,
+      }),
     ).toBe(false);
   });
 
   it("stays out of the compact card, which owns the whole zone body", () => {
     expect(
-      showSoloSessionInfo({ showLabels: false, showCompactCard: true, claudeSessionId: SESSION }),
+      showSoloSessionInfo({
+        showLabels: false,
+        showCompactCard: true,
+        claudeSessionId: SESSION,
+        stampedTenantBadge: false,
+      }),
     ).toBe(false);
   });
 
   it("renders nothing for a tab with no Claude session — no session to describe", () => {
-    expect(showSoloSessionInfo({ showLabels: false, showCompactCard: false })).toBe(false);
     expect(
-      showSoloSessionInfo({ showLabels: false, showCompactCard: false, claudeSessionId: "" }),
+      showSoloSessionInfo({ showLabels: false, showCompactCard: false, stampedTenantBadge: false }),
+    ).toBe(false);
+    expect(
+      showSoloSessionInfo({
+        showLabels: false,
+        showCompactCard: false,
+        claudeSessionId: "",
+        stampedTenantBadge: false,
+      }),
+    ).toBe(false);
+  });
+
+  // D2 of `2026-11-08-tenant-badge-parity-and-oracle-fixtures`: a stamped plain
+  // shell on a multi-bound device shows the tenant badge in a multi-zone
+  // header, so the one-terminal page gives it the strip too.
+  it("mounts for a stamped tenant badge with no Claude session (D2)", () => {
+    expect(
+      showSoloSessionInfo({ showLabels: false, showCompactCard: false, stampedTenantBadge: true }),
+    ).toBe(true);
+  });
+
+  it("the stamped-badge arm still yields to ZoneLabel and the compact card", () => {
+    expect(
+      showSoloSessionInfo({ showLabels: true, showCompactCard: false, stampedTenantBadge: true }),
+    ).toBe(false);
+    expect(
+      showSoloSessionInfo({ showLabels: false, showCompactCard: true, stampedTenantBadge: true }),
     ).toBe(false);
   });
 });

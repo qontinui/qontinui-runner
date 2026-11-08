@@ -8,7 +8,12 @@
 
 import { describe, expect, it } from "vitest";
 
-import { repoExpectedText, tenantBadgeLabel } from "./TenantBadge";
+import {
+  repoExpectedText,
+  tenantBadgeElementId,
+  tenantBadgeLabel,
+  tenantBadgeRendersWithoutSession,
+} from "./TenantBadge";
 import type { SessionTenancy, TenancyRepoExpected, TenantDisplay } from "./useSessionInfo";
 import {
   explicitSpawnTenant,
@@ -21,6 +26,40 @@ import {
 
 const A = "6b1f4b0e-1111-4000-8000-000000000001";
 const B = "91ffaa20-2222-4000-8000-000000000002";
+
+describe("tenantBadgeElementId (plan 2026-11-08-tenant-badge-parity-and-oracle-fixtures D1)", () => {
+  it("is one id per zone, in the per-zone family's shape", () => {
+    expect(tenantBadgeElementId(0)).toBe("terminal-tenant-badge-0");
+    expect(tenantBadgeElementId(7)).toBe("terminal-tenant-badge-7");
+  });
+});
+
+describe("tenantBadgeRendersWithoutSession (D2)", () => {
+  it("is true only for a stamped tab on a multi-bound device", () => {
+    expect(tenantBadgeRendersWithoutSession(true, A)).toBe(true);
+  });
+
+  it("is false on a single-binding device, stamped or not", () => {
+    expect(tenantBadgeRendersWithoutSession(false, A)).toBe(false);
+    expect(tenantBadgeRendersWithoutSession(false, undefined)).toBe(false);
+  });
+
+  it("is false with no stamp, a null stamp, or a blank stamp", () => {
+    expect(tenantBadgeRendersWithoutSession(true, undefined)).toBe(false);
+    expect(tenantBadgeRendersWithoutSession(true, null)).toBe(false);
+    expect(tenantBadgeRendersWithoutSession(true, "   ")).toBe(false);
+  });
+
+  it("agrees with tenantBadgeLabel's no-session arm", () => {
+    for (const showSwitcher of [true, false]) {
+      for (const tenantId of [A, undefined, null, "  "]) {
+        expect(tenantBadgeRendersWithoutSession(showSwitcher, tenantId)).toBe(
+          tenantBadgeLabel(tenantId, showSwitcher, null) !== null,
+        );
+      }
+    }
+  });
+});
 
 describe("tenantBadgeLabel", () => {
   it("renders nothing on a single-tenant device (D12 no-clutter rule)", () => {

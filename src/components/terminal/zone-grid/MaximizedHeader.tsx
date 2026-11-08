@@ -12,6 +12,7 @@ import { MessageSquare, ChevronLeft, ChevronRight, Trash2 } from "lucide-react";
 import type { TerminalTab } from "../useTerminalManager";
 import { TabTitle } from "../displayTitle";
 import { SessionInfoDropdown } from "../SessionInfoDropdown";
+import { TenantBadge } from "../TenantBadge";
 import { MAXIMIZED_HEADER_HEIGHT_PX } from "./constants";
 
 /** Neighbour navigation within the maximized view. */
@@ -60,6 +61,13 @@ export function MaximizedHeader({
       <span className="text-[10px] text-[#a9b1d6]">
         <TabTitle tab={tab} />
       </span>
+      {/* Tenant parity with the zone header: the badge renders wherever the
+          dropdown renders, under the same zone's id. */}
+      <TenantBadge
+        tenantId={tab.tenantId}
+        claudeSessionId={tab.claudeSessionId}
+        zoneIndex={zoneIdx}
+      />
       <SessionInfoDropdown claudeSessionId={tab.claudeSessionId} zoneIndex={zoneIdx} />
       {onTogglePrompts && (
         <button

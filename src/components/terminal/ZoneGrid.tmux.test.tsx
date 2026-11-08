@@ -156,7 +156,10 @@ vi.mock("./useSessionReview", () => ({
   useSessionReview: () => ({ changes: null, review: null }),
 }));
 vi.mock("./sessionReviewView", () => ({ reviewBadgeState: () => null }));
-vi.mock("./TenantBadge", () => ({ TenantBadge: () => null }));
+vi.mock("./TenantBadge", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./TenantBadge")>()),
+  TenantBadge: () => null,
+}));
 vi.mock("./RemoteTabControls", () => ({ RemoteTabControls: () => null }));
 vi.mock("./useTerminalWindowActions", () => ({
   useTerminalWindowActions: () => ({ popOutTab: () => Promise.resolve() }),
@@ -219,7 +222,14 @@ function renderGridPage(
   };
   const onZoneClick = () => {};
   act(() => {
-    root.render(createElement(ZoneGrid, { onZoneClick, onZoneDoubleClick: noop, onExit: noop }));
+    root.render(
+      createElement(ZoneGrid, {
+        onZoneClick,
+        onZoneDoubleClick: noop,
+        onExit: noop,
+        tenantSwitcherShown: false,
+      }),
+    );
   });
 }
 
@@ -261,7 +271,14 @@ function renderTmuxPage(
   // re-renders it through the real context in the product).
   const onZoneClick = () => {};
   act(() => {
-    root.render(createElement(ZoneGrid, { onZoneClick, onZoneDoubleClick: noop, onExit: noop }));
+    root.render(
+      createElement(ZoneGrid, {
+        onZoneClick,
+        onZoneDoubleClick: noop,
+        onExit: noop,
+        tenantSwitcherShown: false,
+      }),
+    );
   });
 }
 
