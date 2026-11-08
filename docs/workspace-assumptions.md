@@ -277,7 +277,7 @@ _No hits._
 | `src/check_executor/analyzers/security/patterns.rs` | `const CMD_INJECTION_RUST` | `pattern: r#"Command::new\s*\(\s*['\"](?:sh\|bash\|cmd\|powershell)['\"]"#,` | 1 | unreviewed |
 | `src/ci_node/executor.rs` | `spawn_step_child` | `let mut shim = build_step_command("cmd.exe", &argv);` | 1 | unreviewed |
 | `src/ci_node/services.rs` | `reap_blocking` | `spawn("cmd.exe", &shim_argv)` | 1 | unreviewed |
-| `src/ci_node/tools.rs` | `run_capture_env` | `let mut shim = build("cmd.exe", &argv_ref, path_dir, envs);` | 1 | unreviewed |
+| `src/ci_node/tools.rs` | `run_capture_env` | `let mut shim = build("cmd.exe", &argv_ref, path_dir, policy, envs);` | 1 | unreviewed |
 | `src/commands/saved_projects.rs` | `is_drive_rooted` | `cfg(windows)-only fn 'is_drive_rooted' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/commands/saved_projects.rs` | `resolve_subst_once` | `cfg(windows)-only fn 'resolve_subst_once' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/commands/saved_projects.rs` | `rewrite_msys_root` | `cfg(windows)-only fn 'rewrite_msys_root' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |

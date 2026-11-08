@@ -148,11 +148,14 @@
 //! is never success on this lane.
 
 use sha2::{Digest, Sha256};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tracing::{info, warn};
 
+use super::child_env::{self, ChildEnv};
 use super::manifest::CiTool;
+use super::package_index::PackageIndex;
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 /// Archive shape of a release asset.
@@ -230,6 +233,9 @@ pub(crate) enum Installer {
         /// guess, and a wrong guess is silent: the tool provisions green and
         /// the step fails with "command not found" minutes later.
         command: &'static str,
+        /// Where pip resolves the distribution from. PyPI for every curated
+        /// entry; see [`PackageIndex`].
+        index: PackageIndex,
     },
 }
 
@@ -456,6 +462,7 @@ static KNOWN_TOOLS: &[ToolSpec] = &[
             module: "poetry",
             // Distribution, module and console script all agree here.
             command: "poetry",
+            index: PackageIndex::PyPi,
         },
     },
     ToolSpec {
@@ -469,6 +476,7 @@ static KNOWN_TOOLS: &[ToolSpec] = &[
             distribution: "twine",
             module: "twine",
             command: "twine",
+            index: PackageIndex::PyPi,
         },
     },
     ToolSpec {
@@ -490,11 +498,21 @@ static KNOWN_TOOLS: &[ToolSpec] = &[
             // schema-drift.yml invokes it by that name — so a shim called
             // anything else provisions green and leaves the gate failing.
             command: "datamodel-codegen",
+            index: PackageIndex::PyPi,
         },
     },
 ];
 
 pub(crate) fn lookup(name: &str) -> Option<&'static ToolSpec> {
+    // Test builds only: an entry a test registered on top of the closed
+    // registry. It never shadows a curated one (registering a curated name is
+    // refused) and `known_tool_names` never lists it — see `package_index`.
+    #[cfg(test)]
+    {
+        if let Some(spec) = super::package_index::test_tool(name) {
+            return Some(spec);
+        }
+    }
     KNOWN_TOOLS.iter().find(|t| t.name == name)
 }
 
@@ -550,6 +568,7 @@ enum Source {
     PythonPackage {
         requirement: String,
         module: &'static str,
+        index: PackageIndex,
     },
 }
 
@@ -638,6 +657,7 @@ fn resolve(spec: &'static ToolSpec, version: &str, triple: &str) -> Result<Resol
             distribution,
             module,
             command,
+            index,
         } => Ok(Resolved {
             // NEVER the venv's own Scripts/bin: those console scripts do not
             // survive the atomic rename, and putting them on PATH would shadow
@@ -653,6 +673,7 @@ fn resolve(spec: &'static ToolSpec, version: &str, triple: &str) -> Result<Resol
             source: Source::PythonPackage {
                 requirement: format!("{distribution}=={version}"),
                 module,
+                index: *index,
             },
         }),
     }
@@ -904,6 +925,7 @@ async fn install(
         Source::PythonPackage {
             requirement,
             module,
+            index,
         } => {
             install_python_package(
                 staging.path(),
@@ -911,6 +933,7 @@ async fn install(
                 &resolved.primary,
                 requirement,
                 module,
+                *index,
                 log,
             )
             .await?;
@@ -1694,7 +1717,15 @@ async fn find_python() -> Result<&'static [&'static str], String> {
         let mut argv: Vec<&str> = candidate[1..].to_vec();
         argv.push("--version");
         let shown = candidate.join(" ");
-        match run_capture(candidate[0], &argv, VERIFY_TIMEOUT, None).await {
+        match run_capture(
+            candidate[0],
+            &argv,
+            VERIFY_TIMEOUT,
+            None,
+            ChildEnv::Provisioning,
+        )
+        .await
+        {
             // The Store alias answers `--version` with "Python was not found",
             // which is exactly why the match is on `Python 3` and not on a
             // zero exit status.
@@ -1736,6 +1767,7 @@ async fn install_python_package(
     shim_stem: &str,
     requirement: &str,
     module: &str,
+    index: PackageIndex,
     log: &mut (dyn FnMut(String) + Send),
 ) -> Result<(), String> {
     let python = find_python().await?;
@@ -1743,15 +1775,21 @@ async fn install_python_package(
     let venv_str = venv.to_string_lossy().to_string();
     let mut venv_argv: Vec<&str> = python[1..].to_vec();
     venv_argv.extend(["-m", "venv", venv_str.as_str()]);
-    run_capture(python[0], &venv_argv, VENV_TIMEOUT, None)
-        .await
-        .map_err(|e| {
-            format!(
-                "creating a private venv with `{} -m venv` failed: {e}. \
+    run_capture(
+        python[0],
+        &venv_argv,
+        VENV_TIMEOUT,
+        None,
+        ChildEnv::Provisioning,
+    )
+    .await
+    .map_err(|e| {
+        format!(
+            "creating a private venv with `{} -m venv` failed: {e}. \
                  On Debian/Ubuntu the venv module ships separately (python3-venv)",
-                python.join(" ")
-            )
-        })?;
+            python.join(" ")
+        )
+    })?;
     let venv_bin = venv.join(if cfg!(target_os = "windows") {
         "Scripts"
     } else {
@@ -1771,26 +1809,29 @@ async fn install_python_package(
     // machine. `--no-cache-dir` keeps the install from writing into the user's
     // pip cache — the version-keyed tool cache is the only thing this lane
     // leaves behind.
+    let mut pip_argv: Vec<&str> = vec![
+        "-m",
+        "pip",
+        "install",
+        "--no-cache-dir",
+        "--no-input",
+        "--disable-pip-version-check",
+        "--only-binary=:all:",
+    ];
+    // The registry entry's own index, explicit, so where the distribution
+    // comes from is a property of the registry rather than of whatever pip
+    // config the host happens to carry (`PackageIndex::pip_args`).
+    let index_args = index.pip_args();
+    pip_argv.extend(index_args.iter().map(String::as_str));
+    pip_argv.push(requirement);
+    // The ONE provisioning child that sees the proxy and CA names: it fetches,
+    // and `--only-binary=:all:` runs no package code while it does (D2).
     let out = run_capture(
         &venv_python.to_string_lossy(),
-        &[
-            "-m",
-            "pip",
-            "install",
-            "--no-cache-dir",
-            "--no-input",
-            "--disable-pip-version-check",
-            "--only-binary=:all:",
-            // Explicit, so the source of the distribution is a property of
-            // this registry rather than of whatever pip config the host
-            // happens to carry. Belt and braces with the PIP_* scrub in
-            // `run_capture`.
-            "--index-url",
-            "https://pypi.org/simple",
-            requirement,
-        ],
+        &pip_argv,
         PACKAGE_INSTALL_TIMEOUT,
         None,
+        ChildEnv::ProvisioningNetwork,
     )
     .await
     .map_err(|e| format!("pip install {requirement} failed: {e}"))?;
@@ -1906,13 +1947,19 @@ pub(super) fn redacted_argv(args: &[&str]) -> Vec<String> {
     out
 }
 
+/// Run `program` and return its combined output, failing on a non-zero exit,
+/// a spawn error or a timeout. `policy` decides what the child inherits from
+/// the runner's environment — see [`child_env`]. Every provisioning child in
+/// this module takes [`ChildEnv::Provisioning`], except `pip install`, the one
+/// that fetches.
 pub(super) async fn run_capture(
     program: &str,
     args: &[&str],
     timeout: Duration,
     path_dir: Option<&Path>,
+    policy: ChildEnv,
 ) -> Result<String, String> {
-    run_capture_env(program, args, timeout, path_dir, &[]).await
+    run_capture_env(program, args, timeout, path_dir, policy, &[]).await
 }
 
 /// [`run_capture`] plus environment variables handed to the child.
@@ -1928,12 +1975,14 @@ pub(super) async fn run_capture_env(
     args: &[&str],
     timeout: Duration,
     path_dir: Option<&Path>,
+    policy: ChildEnv,
     envs: &[(String, String)],
 ) -> Result<String, String> {
     fn build(
         program: &str,
         args: &[&str],
         path_dir: Option<&Path>,
+        policy: ChildEnv,
         envs: &[(String, String)],
     ) -> tokio::process::Command {
         let mut cmd = crate::process_helpers::tokio_no_window(program);
@@ -1949,58 +1998,24 @@ pub(super) async fn run_capture_env(
             // half-built venv behind. Same reason `agent_pusher` and
             // `mcp::misc` set it.
             .kill_on_drop(true);
-        // Provisioning children are OURS, not the repo's steps, so the host's
-        // ambient ecosystem config must not decide what gets installed.
-        // `PIP_INDEX_URL`/`PIP_CONFIG_FILE` redirect where a distribution
-        // comes from; `PYTHONPATH`/`PYTHONHOME`/`VIRTUAL_ENV` redirect which
-        // modules a verification actually imports. The manifest cannot set
-        // these (they are off ENV_ALLOWLIST), but INHERITING them would leave
-        // the same hole open from the other side — and the allowlist rationale
-        // says the provisioned layout is executor-owned, so it has to be.
-        for (key, _) in std::env::vars_os() {
-            let name = key.to_string_lossy().to_ascii_uppercase();
-            if name.starts_with("PIP_")
-                || name.starts_with("PYTHON")
-                || name.starts_with("POETRY_")
-                || name.starts_with("NPM_CONFIG_")
-                || name == "VIRTUAL_ENV"
-            {
-                cmd.env_remove(&key);
-            }
+        // What the child inherits is `child_env`'s decision. A provisioning
+        // child starts EMPTY and gets back only the allowlisted names plus the
+        // explicit `PIP_CONFIG_FILE`; `None` (a container runtime) inherits.
+        // `env_clear()` also discards what `tokio_no_window` set explicitly, so
+        // those are read back first and re-applied only when the same
+        // allowlist admits them: what a spawn helper chooses to set can never
+        // widen the set.
+        if let Some(env) = child_env::provisioning_env(policy, std::env::vars_os()) {
+            let set_by_helper: Vec<(OsString, OsString)> = cmd
+                .as_std()
+                .get_envs()
+                .filter_map(|(name, value)| Some((name.to_os_string(), value?.to_os_string())))
+                .filter(|(name, _)| child_env::admits(policy, name))
+                .collect();
+            cmd.env_clear();
+            cmd.envs(env);
+            cmd.envs(set_by_helper);
         }
-        // Removing `PIP_CONFIG_FILE` does NOT disable pip's config — it makes
-        // pip fall back to its defaults (`/etc/pip.conf`, `~/.pip/pip.conf`,
-        // `~/.config/pip/pip.conf`, `%APPDATA%\pip\pip.ini`). `--index-url`
-        // overrides a config `index-url`, but `extra-index-url`, `find-links`,
-        // `trusted-host` and `pre` are ADDITIVE and survive, so a box with an
-        // internal mirror configured still had a dependency-confusion surface.
-        // Setting the variable to the null device is the documented way to make
-        // pip load no config file at all.
-        //
-        // THE SPELLING IS LOAD-BEARING AND MUST BE LOWERCASE. pip's skip is an
-        // exact string comparison, not a path resolution
-        // (`_internal/configuration.py::_load_config_files`):
-        //
-        //     if config_files[kinds.ENV][0:1] == [os.devnull]:
-        //         return   # this return is what skips GLOBAL and SITE too
-        //
-        // and `os.devnull` on Windows is `'nul'`, lowercase (`ntpath.py`).
-        // `"NUL" != "nul"`, so an uppercase value never fires that return:
-        // measured with this repo's own Python, `PIP_CONFIG_FILE=NUL` gives
-        // `devnull match: False` and still loads the GLOBAL and SITE configs —
-        // i.e. exactly the additive `extra-index-url`/`find-links`/
-        // `trusted-host` this is here to neutralise. Only the USER config gets
-        // suppressed, incidentally, because `iter_config_files` drops USER
-        // whenever the variable is set at all. With `nul` the match is True and
-        // nothing is loaded. POSIX `/dev/null` matches exactly and is fine.
-        cmd.env(
-            "PIP_CONFIG_FILE",
-            if cfg!(target_os = "windows") {
-                "nul"
-            } else {
-                "/dev/null"
-            },
-        );
         if let Some(dir) = path_dir {
             let inherited = std::env::var_os("PATH").unwrap_or_default();
             let mut entries = vec![dir.to_path_buf()];
@@ -2014,7 +2029,7 @@ pub(super) async fn run_capture_env(
         }
         cmd
     }
-    let mut cmd = build(program, args, path_dir, envs);
+    let mut cmd = build(program, args, path_dir, policy, envs);
     let spawned = tokio::time::timeout(timeout, cmd.output()).await;
     let out = match spawned {
         Ok(Ok(o)) => o,
@@ -2025,7 +2040,7 @@ pub(super) async fn run_capture_env(
             let mut argv = vec!["/C".to_string(), program.to_string()];
             argv.extend(args.iter().map(|a| (*a).to_string()));
             let argv_ref: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
-            let mut shim = build("cmd.exe", &argv_ref, path_dir, envs);
+            let mut shim = build("cmd.exe", &argv_ref, path_dir, policy, envs);
             match tokio::time::timeout(timeout, shim.output()).await {
                 Ok(Ok(o)) => o,
                 Ok(Err(e2)) => return Err(format!("spawn {program} (direct: {e}; cmd /C: {e2})")),
@@ -2081,6 +2096,7 @@ async fn verify(
         verify_args,
         VERIFY_TIMEOUT,
         Some(path_dir),
+        ChildEnv::Provisioning,
     )
     .await?;
     if !version_is_reported(&text, version) {
@@ -2131,6 +2147,24 @@ async fn verify_installed(
     Ok(reports)
 }
 
+/// Test door: [`verify_installed`] for the registry's node entry against a
+/// node tree the test did not provision (the host's), claiming `version`.
+/// `resolve()` refuses a node version nobody reviewed, and a host node is one,
+/// so the entry's [`Resolved`] is built from a reviewed version — only its
+/// primary and companions matter to the verification.
+#[cfg(test)]
+pub(crate) async fn verify_node_tree_for_test(
+    bin_dir: &Path,
+    version: &str,
+) -> Result<Vec<String>, String> {
+    let spec = lookup("node").ok_or_else(|| "node is not in the registry".to_string())?;
+    let (reviewed, _, _) = NODE_DIGESTS
+        .first()
+        .ok_or_else(|| "the registry reviews no node version".to_string())?;
+    let resolved = resolve(spec, reviewed, host_triple())?;
+    verify_installed(bin_dir, spec, &resolved, version).await
+}
+
 /// Run a companion binary and return what it reported. Its version is a
 /// property of the primary's release, so it is logged rather than asserted —
 /// but it must exist and it must run.
@@ -2140,6 +2174,7 @@ async fn run_reporting_version(bin: &Path, path_dir: &Path) -> Result<String, St
         &["--version"],
         VERIFY_TIMEOUT,
         Some(path_dir),
+        ChildEnv::Provisioning,
     )
     .await?;
     Ok(text.trim().replace(['\r', '\n'], " "))
@@ -2286,11 +2321,14 @@ mod tests {
         #[cfg(not(target_os = "windows"))]
         let (program, args) = ("sh", vec!["-c", "printf %s \"$QONTINUI_TEST_SECRET\""]);
 
+        // The container policy: the services path is the one that hands a
+        // child a credential through `envs`.
         let out = run_capture_env(
             program,
             &args,
             Duration::from_secs(30),
             None,
+            ChildEnv::ContainerRuntime,
             &[(
                 "QONTINUI_TEST_SECRET".to_string(),
                 "correcthorsebatterystaple".to_string(),
@@ -2303,6 +2341,82 @@ mod tests {
         // the thing that could carry it — rather than against a literal here
         // that never contained it.
         assert!(out.contains("correcthorsebatterystaple"), "got {out:?}");
+    }
+
+    /// The executor's own entry, end to end: a password set in the runner's
+    /// environment must not reach the child `provision()` starts to verify a
+    /// cached tool.
+    ///
+    /// A cached `poetry 2.1.3` tree is laid out by hand. Its `bin/poetry`
+    /// records the NAMES of its environment (never a value) beside the tree
+    /// and reports the version, so `provision()` takes the cache-hit path and
+    /// runs it through `verify_installed`. It names only `provision`, `CiTool`
+    /// and `tool_dir`, unchanged since before the allowlist, so this same test
+    /// compiles against the code without it — and goes red there, because the
+    /// inherited environment carried the password straight through.
+    #[tokio::test]
+    async fn a_provisioning_child_never_sees_a_host_set_password() {
+        const PASSWORD: &str = "QONTINUI_PROVISIONING_TEST_PASSWORD";
+        let root = tempfile::tempdir().expect("tempdir");
+        let tree = tool_dir(root.path(), "poetry", "2.1.3");
+        let bin = tree.join("bin");
+        std::fs::create_dir_all(&bin).expect("create the cached tree");
+        #[cfg(target_os = "windows")]
+        std::fs::write(
+            bin.join("poetry.cmd"),
+            "@echo off\r\n\
+             (for /f \"delims==\" %%v in ('set') do @echo %%v)>\"%~dp0..\\seen-env-names.txt\"\r\n\
+             echo Poetry (version 2.1.3)\r\n",
+        )
+        .expect("write the recorder");
+        #[cfg(not(target_os = "windows"))]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let script = bin.join("poetry");
+            std::fs::write(
+                &script,
+                "#!/bin/sh\n\
+                 awk 'BEGIN { for (k in ENVIRON) print k }' >\"$(dirname \"$0\")/../seen-env-names.txt\"\n\
+                 echo 'Poetry (version 2.1.3)'\n",
+            )
+            .expect("write the recorder");
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod the recorder");
+        }
+
+        let declared = [CiTool {
+            name: "poetry".to_string(),
+            version: "2.1.3".to_string(),
+        }];
+        let mut log: Vec<String> = Vec::new();
+        let outcome = {
+            // The host — this process — carries the password while the child
+            // starts, under the suite's one env lock.
+            let _env = crate::test_env::env_lock();
+            std::env::set_var(PASSWORD, "x");
+            let outcome = provision(root.path(), &declared, &mut |line| log.push(line)).await;
+            std::env::remove_var(PASSWORD);
+            outcome
+        };
+        if let Err(e) = outcome {
+            panic!("provisioning the cached tool failed: {e}");
+        }
+        assert!(
+            log.iter().any(|line| line.contains("cache hit")),
+            "the cached tree was not verified in place: {log:?}"
+        );
+        let seen = std::fs::read_to_string(tree.join("seen-env-names.txt"))
+            .expect("the verify child recorded its environment's names");
+        let seen: Vec<&str> = seen.lines().map(str::trim).collect();
+        assert!(
+            seen.iter().any(|name| name.eq_ignore_ascii_case("PATH")),
+            "the verify child recorded no PATH, so its record proves nothing"
+        );
+        assert!(
+            !seen.iter().any(|name| name.eq_ignore_ascii_case(PASSWORD)),
+            "{PASSWORD}, set in the runner's own environment, reached the child \
+             provision() started to verify a cached tool"
+        );
     }
 
     #[test]
@@ -2599,6 +2713,7 @@ mod tests {
                     Source::PythonPackage {
                         requirement,
                         module,
+                        ..
                     } => {
                         assert_eq!(requirement, want_req, "{name}");
                         assert_eq!(module, want_module, "{name}");

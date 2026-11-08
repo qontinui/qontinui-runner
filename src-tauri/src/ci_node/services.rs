@@ -191,6 +191,7 @@ use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+use super::child_env::ChildEnv;
 use super::manifest::CiService;
 use super::tools::run_capture;
 
@@ -669,7 +670,14 @@ impl ServiceStack {
             // id would make `run --name` fail — the same reason
             // `prepare_worktree` clears a stale dispatch dir before re-adding.
             let stale = removal_argv(&name);
-            let _ = run_capture(&runtime, &removal_args(&stale), CONTAINER_CMD_TIMEOUT, None).await;
+            let _ = run_capture(
+                &runtime,
+                &removal_args(&stale),
+                CONTAINER_CMD_TIMEOUT,
+                None,
+                ChildEnv::ContainerRuntime,
+            )
+            .await;
 
             // REGISTERED BEFORE CREATED. From here every exit path — a failed
             // run, a readiness timeout, a later service's failure, a failed
@@ -741,6 +749,7 @@ impl ServiceStack {
                         &removal_args(&leftover),
                         CONTAINER_CMD_TIMEOUT,
                         None,
+                        ChildEnv::ContainerRuntime,
                     )
                     .await;
                     if !retryable {
@@ -1089,6 +1098,7 @@ async fn detect_runtime(candidates: &[&str], services: &[CiService]) -> Result<S
             &["info", "--format", "{{.ServerVersion}}"],
             RUNTIME_PROBE_TIMEOUT,
             None,
+            ChildEnv::ContainerRuntime,
         )
         .await
         {
@@ -1206,7 +1216,15 @@ async fn run_owned_env(
     envs: &[(String, String)],
 ) -> Result<String, String> {
     let args: Vec<&str> = argv.iter().map(String::as_str).collect();
-    super::tools::run_capture_env(runtime, &args, timeout, None, envs).await
+    super::tools::run_capture_env(
+        runtime,
+        &args,
+        timeout,
+        None,
+        ChildEnv::ContainerRuntime,
+        envs,
+    )
+    .await
 }
 
 /// Does this `run` failure mean the host port was taken between reservation
@@ -1346,6 +1364,7 @@ async fn container_is_running(runtime: &str, name: &str) -> Result<bool, String>
         &["inspect", "-f", "{{.State.Running}}", name],
         CONTAINER_CMD_TIMEOUT,
         None,
+        ChildEnv::ContainerRuntime,
     )
     .await?;
     Ok(out.trim().eq_ignore_ascii_case("true"))
@@ -1365,6 +1384,7 @@ async fn container_ip(runtime: &str, name: &str) -> Result<String, String> {
         ],
         CONTAINER_CMD_TIMEOUT,
         None,
+        ChildEnv::ContainerRuntime,
     )
     .await?;
     out.split_whitespace()
@@ -1379,6 +1399,7 @@ async fn container_logs(runtime: &str, name: &str) -> String {
         &["logs", "--tail", LOG_TAIL_LINES, name],
         CONTAINER_CMD_TIMEOUT,
         None,
+        ChildEnv::ContainerRuntime,
     )
     .await
     {
@@ -2210,12 +2231,18 @@ mod tests {
             "{{range .Mounts}}{{if eq .Type \"volume\"}}{{.Name}} {{end}}{{end}}",
         ];
         inspect.extend(stack.container_names().iter().map(String::as_str));
-        let volumes: Vec<String> = run_capture(&runtime, &inspect, CONTAINER_CMD_TIMEOUT, None)
-            .await
-            .expect("inspect must answer")
-            .split_whitespace()
-            .map(str::to_string)
-            .collect();
+        let volumes: Vec<String> = run_capture(
+            &runtime,
+            &inspect,
+            CONTAINER_CMD_TIMEOUT,
+            None,
+            ChildEnv::ContainerRuntime,
+        )
+        .await
+        .expect("inspect must answer")
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
         assert!(
             volumes.len() >= 2,
             "every registry image declares a VOLUME, so each container owns one: {volumes:?}"
@@ -2241,6 +2268,7 @@ mod tests {
             ],
             CONTAINER_CMD_TIMEOUT,
             None,
+            ChildEnv::ContainerRuntime,
         )
         .await
         .expect("ps must answer");
@@ -2257,6 +2285,7 @@ mod tests {
             &["volume", "ls", "-q"],
             CONTAINER_CMD_TIMEOUT,
             None,
+            ChildEnv::ContainerRuntime,
         )
         .await
         .expect("volume ls must answer");
@@ -2306,6 +2335,7 @@ mod tests {
             ],
             CONTAINER_CMD_TIMEOUT,
             None,
+            ChildEnv::ContainerRuntime,
         )
         .await
         .expect("ps must answer");
