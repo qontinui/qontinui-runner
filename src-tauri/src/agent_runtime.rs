@@ -7505,14 +7505,27 @@ async fn run_continuation_terminal(
         // Manual default) keeps the prior behavior. RISK note: the id resolver
         // scans config dirs first-hit-wins, but worktree paths are
         // per-continuation-unique, so cross-account binding stays low-probability.
-        // Page distribution: pick a page with room at create-time, counting the
-        // rows a boot restore is about to bring back (`terminal::page_placement`),
-        // and persist it in the durable record so a restart re-lands on the same
-        // page.
-        let target_page = crate::terminal::page_placement::pick_page_for_new_session(
-            &terminal_manager,
-            crate::terminal::page_placement::lifecycle_store(&app).as_deref(),
+        // Page placement: the continuation lands on its KIND's page
+        // (`post-merge-<n>`, `impl-<n>`, `fixer-<n>`, …; see
+        // `terminal::spawn_pages`), opening the next page of that kind when the
+        // current one is full. A page's load is `terminal::page_placement`'s
+        // (live terminals plus the rows a boot restore is about to bring back).
+        // The page id is persisted in the durable record, so a restart re-lands
+        // the session on the same page. The placement is a reservation until the
+        // create below returns.
+        let placement = crate::terminal::spawn_pages::place(
+            crate::terminal::spawn_pages::SpawnGroup::classify(
+                spawn_name.as_deref(),
+                Some(payload.initial_prompt.as_str()),
+            ),
+            || {
+                crate::terminal::page_placement::page_loads(
+                    &terminal_manager,
+                    crate::terminal::page_placement::lifecycle_store(&app).as_deref(),
+                )
+            },
         );
+        let target_page = placement.page_id().to_string();
 
         let mut capture_hint = crate::commands::terminal::SessionCaptureHint {
             config_dir: selected_config_dir.clone(),
@@ -7658,6 +7671,9 @@ async fn run_continuation_terminal(
             // `ci_node::admission` takes for CI work.
             false,
         );
+        // The terminal is listed by the manager now (or the create failed), so the
+        // reservation would only double-count it.
+        placement.release();
 
         let (terminal_id, coord_session_id) = match result {
             Ok(created) => created,
@@ -8593,11 +8609,18 @@ async fn run_condition_check_terminal(
         return Err(anyhow::anyhow!(reason));
     }
 
-    // Spread across pages with room (the one page-capacity rule, as the gate path).
-    let target_page = crate::terminal::page_placement::pick_page_for_new_session(
-        &terminal_manager,
-        crate::terminal::page_placement::lifecycle_store(&app).as_deref(),
+    // Condition checks share the `checks-<n>` pages (see `terminal::spawn_pages`),
+    // under the restore-aware loads of `terminal::page_placement`.
+    let placement = crate::terminal::spawn_pages::place(
+        crate::terminal::spawn_pages::SpawnGroup::Check,
+        || {
+            crate::terminal::page_placement::page_loads(
+                &terminal_manager,
+                crate::terminal::page_placement::lifecycle_store(&app).as_deref(),
+            )
+        },
     );
+    let target_page = placement.page_id().to_string();
 
     // Kept for the start verdict below: the transcript probe looks in the
     // selected account's config dir first.
@@ -8649,6 +8672,9 @@ async fn run_condition_check_terminal(
         // session.
         false,
     );
+    // The terminal is listed by the manager now (or the create failed), so the
+    // reservation would only double-count it.
+    placement.release();
 
     match result {
         Ok((terminal_id, coord_session_id)) => {

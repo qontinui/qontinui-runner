@@ -1255,10 +1255,22 @@ async fn start_steward(
         spec.skill, mode, interval
     );
 
-    match terminal_manager.create(
+    // Every steward shares the `stewards-<n>` pages with the looping agents
+    // (see `terminal::spawn_pages`) instead of landing on the operator's page,
+    // under the restore-aware loads of `terminal::page_placement`.
+    let placement = crate::terminal::spawn_pages::place(
+        crate::terminal::spawn_pages::SpawnGroup::Steward,
+        || {
+            crate::terminal::page_placement::page_loads(
+                &terminal_manager,
+                crate::terminal::page_placement::lifecycle_store(&app_handle).as_deref(),
+            )
+        },
+    );
+    let created = terminal_manager.create(
         Some(spec.skill.to_string()),
         None, // working_dir — default to workspace root
-        None, // page_id — placed by the page picker (terminal::page_placement)
+        Some(placement.page_id().to_string()),
         None, // cols — default
         None, // rows — default
         app_handle,
@@ -1282,7 +1294,10 @@ async fn start_steward(
         crate::terminal::TrustArm::AccountChosenLater,
         // A steward session runs under the machine default tenant.
         None,
-    ) {
+    );
+    // Listed by the manager now (or failed): the reservation would double-count.
+    placement.release();
+    match created {
         Ok(info) => {
             info!("HTTP: Created {} terminal: {}", spec.skill, info.id);
 

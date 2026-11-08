@@ -1701,11 +1701,19 @@ async fn spawn_looping_agent_terminal(
         ));
     }
 
-    // Spread across pages with room (the one page-capacity rule, as continuations).
-    let target_page = crate::terminal::page_placement::pick_page_for_new_session(
-        &terminal_manager,
-        crate::terminal::page_placement::lifecycle_store(&app).as_deref(),
+    // Looping agents (the Merge Shepherd among them) share the stewards'
+    // `stewards-<n>` pages (see `terminal::spawn_pages`), under the
+    // restore-aware loads of `terminal::page_placement`.
+    let placement = crate::terminal::spawn_pages::place(
+        crate::terminal::spawn_pages::SpawnGroup::Steward,
+        || {
+            crate::terminal::page_placement::page_loads(
+                &terminal_manager,
+                crate::terminal::page_placement::lifecycle_store(&app).as_deref(),
+            )
+        },
     );
+    let target_page = placement.page_id().to_string();
 
     let capture_hint = crate::commands::terminal::SessionCaptureHint {
         config_dir: selected_config_dir,
@@ -1733,7 +1741,7 @@ async fn spawn_looping_agent_terminal(
     // first spawn after a runner start is not decided by a cold cache.
     crate::claude_session::trust_gate::warm_dial().await;
 
-    let (terminal_id, _coord_session) =
+    let created =
         crate::commands::terminal::create_tracked_terminal_session_backend(
             &terminal_manager,
             &session_registry,
@@ -1761,7 +1769,10 @@ async fn spawn_looping_agent_terminal(
             // hammer a starved machine with new `claude` processes indefinitely —
             // the exact shape of the 2026-08-06→07 incident.
             false,
-        )?;
+        );
+    // Listed by the manager now (or failed): the reservation would double-count.
+    placement.release();
+    let (terminal_id, _coord_session) = created?;
     Ok((terminal_id, pinned_session_id))
 }
 
