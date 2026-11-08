@@ -180,7 +180,7 @@ pub struct TerminalPagesResponse {
     pub labels_registered: bool,
     /// When it last registered (RFC 3339); `null` before the first time.
     pub labels_registered_at: Option<String>,
-    /// Pages with at least one live terminal: registered pages first, in
+    /// Pages with at least one terminal: registered pages first, in
     /// registered order, then the rest by page id.
     pub pages: Vec<TerminalPageGroup>,
 }
