@@ -440,17 +440,57 @@ export function selfHostingVerdict({ chain, target, registryNote }) {
 // T10's kill (plan D4)
 // ===========================================================================
 
+/** PowerShell interpreters T10's restart door can use, in preference order. */
+export const POWERSHELL_INTERPRETERS = ["powershell", "pwsh"];
+
+/**
+ * The first PowerShell interpreter on `PATH` (`powershell`, then `pwsh`), or
+ * null. Pure: `exists` is injected. On Windows a bare name also matches
+ * `<name>.exe`. A Linux box typically carries only `pwsh` (user-space install),
+ * so a door that always spawned `powershell` would fail there AFTER the kill.
+ *
+ * @param {{pathEnv?:string, platform?:string, exists:(path:string)=>boolean}} input
+ * @returns {string|null} the absolute interpreter path
+ */
+export function resolvePowerShellInterpreter({ pathEnv = "", platform = "linux", exists }) {
+  const sep = platform === "win32" ? ";" : ":";
+  const slash = platform === "win32" ? "\\" : "/";
+  const dirs = String(pathEnv)
+    .split(sep)
+    .map((d) => d.trim())
+    .filter(Boolean);
+  for (const name of POWERSHELL_INTERPRETERS) {
+    const names = platform === "win32" ? [`${name}.exe`, name] : [name];
+    for (const dir of dirs) {
+      for (const n of names) {
+        const candidate = `${dir.replace(/[\\/]+$/, "")}${slash}${n}`;
+        try {
+          if (exists(candidate)) return candidate;
+        } catch {
+          // unreadable entry — keep looking
+        }
+      }
+    }
+  }
+  return null;
+}
+
 /**
  * Decide whether T10 may kill `gatePid`. Pure. Refuses unless ALL hold:
  *
  * - the gate resolved a pid, and the fresh re-resolution (immediately before
  *   the kill) found the same pid holding the port;
  * - that holder's image is not a `NEVER_KILL` name, and is a runner;
- * - T10's restart door (`dev-start.ps1 -Runner` via PowerShell) can bring THIS
- *   target back: `--dev-start` named a script for it, or the platform is
- *   Windows and `port` is the port `dev-start.ps1` manages (T7's guard).
+ * - T10's restart door (`<interpreter> -File <devStart> -Runner`) can bring
+ *   THIS target back: `--dev-start` named a script for it, or the platform is
+ *   Windows and `port` is the port `dev-start.ps1` manages (T7's guard);
+ * - off Windows, `port` is not the primary's port: the Linux primary is a
+ *   systemd user service, which no `-File` door restarts;
+ * - the door is RUNNABLE, proved before the kill: an interpreter resolved and
+ *   the script exists. Killing first and discovering the door is missing
+ *   leaves the target dead.
  *
- * @param {{gatePid:number|null, freshPid:number|null, imageName:string|null, port:number, devStartPort:number, devStartExplicit:boolean, platform:string, resolveError?:string|null}} input
+ * @param {{gatePid:number|null, freshPid:number|null, imageName:string|null, port:number, devStartPort:number, devStartExplicit:boolean, platform:string, doorRunnable:boolean, interpreter?:string|null, devStart?:string|null, resolveError?:string|null}} input
  * @returns {{ok:true, pid:number, detail:string} | {ok:false, reason:string, detail:string}}
  */
 export function planTargetKill({
@@ -461,6 +501,9 @@ export function planTargetKill({
   devStartPort,
   devStartExplicit,
   platform,
+  doorRunnable,
+  interpreter = null,
+  devStart = null,
   resolveError = null,
 }) {
   const refuse = (reason, detail) => ({
@@ -512,10 +555,26 @@ export function planTargetKill({
       );
     }
   }
+  if (platform !== "win32" && port === devStartPort) {
+    return refuse(
+      "primary-not-restartable",
+      `--port ${port} is the primary's port on '${platform}', where the primary is a systemd ` +
+        `service no -File restart door brings back`,
+    );
+  }
+  if (doorRunnable !== true) {
+    return refuse(
+      "door-unrunnable",
+      `the restart door cannot run (interpreter ${interpreter ?? "<none of " + POWERSHELL_INTERPRETERS.join(", ") + " on PATH>"}, ` +
+        `script ${devStart ?? "<unset>"}) — killing would leave the target dead`,
+    );
+  }
   return {
     ok: true,
     pid: gatePid,
-    detail: `pid ${gatePid} ('${imageName}') still holds port ${port} and the restart door reaches it`,
+    detail:
+      `pid ${gatePid} ('${imageName}') still holds port ${port} and the restart door reaches it ` +
+      `(${interpreter ?? "?"} -File ${devStart ?? "?"})`,
   };
 }
 
@@ -528,7 +587,8 @@ export function planTargetKill({
  *
  * @param {number|null} gatePid the pid `gatesAllowMutation` resolved
  * @param {(pid:number, signal:string) => unknown} [killFn]
- * @param {{port:number, devStartPort:number, devStartExplicit:boolean, platform?:string, io?:ResolveIo, resolve?: typeof resolveTargetRunnerPid}} ctx
+ * @param {{port:number, devStartPort:number, devStartExplicit:boolean, platform?:string, doorRunnable?:boolean, interpreter?:string|null, devStart?:string|null, io?:ResolveIo, resolve?: typeof resolveTargetRunnerPid}} ctx
+ *   `doorRunnable` defaults to false: an unproven door refuses the kill.
  * @returns {Promise<{ok:boolean, detail:string, plan:object}>}
  */
 export async function killTargetRunner(
@@ -546,6 +606,9 @@ export async function killTargetRunner(
     devStartPort: ctx.devStartPort,
     devStartExplicit: Boolean(ctx.devStartExplicit),
     platform: ctx.platform ?? ctx.io?.platform ?? process.platform,
+    doorRunnable: ctx.doorRunnable === true,
+    interpreter: ctx.interpreter ?? null,
+    devStart: ctx.devStart ?? null,
     resolveError: fresh.error ?? null,
   });
   if (!plan.ok) return { ok: false, detail: plan.detail, plan };
@@ -1074,13 +1137,22 @@ export function classifyTerminalSpawn(res) {
  * `spawnAdmission.threads.verdict` as last read (reported, never trusted to
  * skip a retry — the guard answered, so the guard decides).
  *
- * @param {{classification:{kind:string,retry:boolean,detail:string}, attempt:number, elapsedMs:number, budgetMs?:number, admissionVerdict?:string|null}} input
+ * The budget covers the WHOLE retry, not just the sleeps: `elapsedMs` is read
+ * after the refused request and its `/health` read, and `lastAttemptMs` (that
+ * attempt's request + `/health` time) stands in for what the NEXT attempt will
+ * cost, so a retry is scheduled only when sleep + another such attempt still
+ * fits. Worst case: one attempt slower than the one before it can overrun the
+ * budget by at most one request timeout plus one `/health` timeout (the
+ * oracle's 30 s + 20 s).
+ *
+ * @param {{classification:{kind:string,retry:boolean,detail:string}, attempt:number, elapsedMs:number, lastAttemptMs?:number, budgetMs?:number, admissionVerdict?:string|null}} input
  * @returns {{retry:true, delayMs:number} | {retry:false, reason:string}}
  */
 export function planSpawnRetry({
   classification,
   attempt,
   elapsedMs,
+  lastAttemptMs = 0,
   budgetMs = SPAWN_RETRY_BUDGET_MS,
   admissionVerdict = null,
 }) {
@@ -1088,7 +1160,8 @@ export function planSpawnRetry({
     return { retry: false, reason: classification?.detail ?? "not retryable" };
   }
   const delayMs = Math.min(SPAWN_RETRY_CAP_MS, SPAWN_RETRY_BASE_MS * 2 ** Math.max(0, attempt));
-  if (elapsedMs + delayMs > budgetMs) {
+  const nextCost = Number.isFinite(lastAttemptMs) && lastAttemptMs > 0 ? lastAttemptMs : 0;
+  if (elapsedMs + delayMs + nextCost > budgetMs) {
     return {
       retry: false,
       reason:
@@ -1123,11 +1196,14 @@ export function openResidue(openRows, owned) {
 // ===========================================================================
 
 /**
- * The badge's per-zone UI Bridge id. This shape is OWNED by
- * `src/components/terminal/TenantBadge.tsx` `tenantBadgeElementId` (plan D1,
- * PR-A of this plan) — kept literal here because the oracle reads a runner it
- * does not import from, and the per-zone family (`terminal-zone-header-<n>`,
- * `terminal-session-info-<field>-<n>`) is spelled the same way.
+ * The badge's per-zone UI Bridge id. This is a DEPENDENCY on PR-A of this plan
+ * (plan D1): PR-A adds `tenantBadgeElementId` to
+ * `src/components/terminal/TenantBadge.tsx`, which is NOT yet on this branch —
+ * until PR-A lands the runner still stamps the legacy shared id, and this
+ * literal is the shape the oracle expects it to produce. Kept literal because
+ * the oracle reads a runner it does not import from; the per-zone family
+ * (`terminal-zone-header-<n>`, `terminal-session-info-<field>-<n>`) is spelled
+ * the same way.
  *
  * @param {number} zoneIndex
  */
@@ -1377,19 +1453,30 @@ export function compareBadgeElement(element, expectation, tenancy, opts = {}) {
  * exactly as many as the zones expecting a badge. Pure. The defect it pins
  * (measured on a two-zone page): one `terminal.tenant-badge` for two zones.
  *
- * @param {{registryIds:string[], zones:{zoneIndex:number, expect:string}[]}} input
- * @returns {{ok:boolean|null, detail:string}} `ok: null` is UNKNOWN
+ * A per-zone badge on a zone in `unboundZones` (its header carries no
+ * `data-claude-session-id` yet) is NOT counted: whether that zone owes a badge
+ * is UNKNOWN until it binds (or it is a stamped plain shell, plan D2), so it
+ * is returned in `unboundBadges` for the caller to report as its own UNKNOWN
+ * finding rather than turned into a count FAIL.
+ *
+ * @param {{registryIds:string[], zones:{zoneIndex:number, expect:string}[], unboundZones?:number[]}} input
+ * @returns {{ok:boolean|null, detail:string, unboundBadges:string[]}} `ok: null` is UNKNOWN
  */
-export function badgeCardinality({ registryIds, zones }) {
+export function badgeCardinality({ registryIds, zones, unboundZones = [] }) {
   const ids = (registryIds ?? []).map(String);
+  const unboundIds = new Set((unboundZones ?? []).map((z) => tenantBadgeElementId(z)));
+  const unboundBadges = [...new Set(ids.filter((id) => unboundIds.has(id)))];
   const badgeIds = ids.filter(
-    (id) => id === LEGACY_TENANT_BADGE_ID || /^terminal-tenant-badge-\d+$/.test(id),
+    (id) =>
+      !unboundIds.has(id) &&
+      (id === LEGACY_TENANT_BADGE_ID || /^terminal-tenant-badge-\d+$/.test(id)),
   );
   const unknown = (zones ?? []).filter((z) => z.expect === "unknown");
   if (unknown.length) {
     return {
       ok: null,
       detail: `zone(s) ${unknown.map((z) => z.zoneIndex).join(", ")} have an UNKNOWN expectation, so how many badges are owed is UNKNOWN`,
+      unboundBadges,
     };
   }
   const expecting = (zones ?? []).filter((z) => z.expect === "present");
@@ -1413,9 +1500,10 @@ export function badgeCardinality({ registryIds, zones }) {
     }
   }
   return problems.length
-    ? { ok: false, detail: problems.join("; ") }
+    ? { ok: false, detail: problems.join("; "), unboundBadges }
     : {
         ok: true,
         detail: `${distinct.size} distinct per-zone badge id(s) for ${expecting.length} zone(s)`,
+        unboundBadges,
       };
 }

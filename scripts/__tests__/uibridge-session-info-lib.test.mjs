@@ -35,6 +35,7 @@ import {
   planRosterSeed,
   planSpawnRetry,
   planTargetKill,
+  resolvePowerShellInterpreter,
   refusedGateIn,
   resolveTargetRunnerPid,
   sameRoster,
@@ -364,7 +365,50 @@ const OK_WIN_PRIMARY = {
   devStartPort: 9876,
   devStartExplicit: false,
   platform: "win32",
+  doorRunnable: true,
+  interpreter: "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+  devStart: "C:/qontinui-root/dev-start.ps1",
 };
+
+describe("resolvePowerShellInterpreter", () => {
+  test("prefers powershell, falls back to pwsh (the Linux user-space install)", () => {
+    const onlyPwsh = new Set(["/home/u/.local/bin/pwsh"]);
+    assert.equal(
+      resolvePowerShellInterpreter({
+        pathEnv: "/usr/bin:/home/u/.local/bin",
+        platform: "linux",
+        exists: (p) => onlyPwsh.has(p),
+      }),
+      "/home/u/.local/bin/pwsh",
+    );
+    const both = new Set(["/usr/bin/pwsh", "/opt/ps/powershell"]);
+    assert.equal(
+      resolvePowerShellInterpreter({
+        pathEnv: "/usr/bin:/opt/ps/",
+        platform: "linux",
+        exists: (p) => both.has(p),
+      }),
+      "/opt/ps/powershell",
+    );
+  });
+  test("Windows: matches name.exe on a ;-separated PATH", () => {
+    const want = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
+    assert.equal(
+      resolvePowerShellInterpreter({
+        pathEnv: "C:\\x;C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\",
+        platform: "win32",
+        exists: (p) => p === want,
+      }),
+      want,
+    );
+  });
+  test("none on PATH -> null", () => {
+    assert.equal(
+      resolvePowerShellInterpreter({ pathEnv: "/usr/bin", platform: "linux", exists: () => false }),
+      null,
+    );
+  });
+});
 
 describe("planTargetKill", () => {
   test("ok: the same runner pid still holds the dev-start port on Windows", () => {
@@ -372,18 +416,35 @@ describe("planTargetKill", () => {
     assert.equal(p.ok, true);
     assert.equal(p.pid, 8812);
   });
-  test("ok: an explicit --dev-start reaches a temp runner on Linux", () => {
-    const p = planTargetKill({
-      ...OK_WIN_PRIMARY,
-      gatePid: 149760,
-      freshPid: 149760,
-      imageName: "qontinui-runner",
-      port: 9877,
-      devStartExplicit: true,
-      platform: "linux",
-    });
+  const OK_LINUX_TEMP = {
+    ...OK_WIN_PRIMARY,
+    gatePid: 149760,
+    freshPid: 149760,
+    imageName: "qontinui-runner",
+    port: 9877,
+    devStartExplicit: true,
+    platform: "linux",
+    doorRunnable: true,
+    interpreter: "/home/u/.local/bin/pwsh",
+    devStart: "/home/u/restart-9877.ps1",
+  };
+  test("ok: an explicit, runnable --dev-start reaches a temp runner on Linux", () => {
+    const p = planTargetKill(OK_LINUX_TEMP);
     assert.equal(p.ok, true);
     assert.equal(p.pid, 149760);
+  });
+  test("refuses on Linux when the door is not proven runnable", () => {
+    for (const doorRunnable of [false, undefined]) {
+      const p = planTargetKill({ ...OK_LINUX_TEMP, doorRunnable, interpreter: null });
+      assert.equal(p.ok, false);
+      assert.equal(p.reason, "door-unrunnable");
+      assert.match(p.detail, /powershell, pwsh/);
+    }
+  });
+  test("refuses the Linux primary's port 9876 even with an explicit, runnable door", () => {
+    const p = planTargetKill({ ...OK_LINUX_TEMP, port: 9876 });
+    assert.equal(p.ok, false);
+    assert.equal(p.reason, "primary-not-restartable");
   });
   const refusals = [
     ["no-gate-pid", { gatePid: null }],
@@ -396,6 +457,8 @@ describe("planTargetKill", () => {
     ["port-not-managed", { port: 9877 }],
     ["no-restart-door", { platform: "linux" }],
     ["no-restart-door", { platform: "darwin", port: 9877 }],
+    ["door-unrunnable", { doorRunnable: false }],
+    ["primary-not-restartable", { platform: "linux", devStartExplicit: true }],
   ];
   for (const [reason, patch] of refusals) {
     test(`refuses: ${reason} ${JSON.stringify(patch)}`, () => {
@@ -436,6 +499,7 @@ describe("killTargetRunner", () => {
       devStartPort: 9876,
       devStartExplicit: false,
       platform: "win32",
+      doorRunnable: true,
       resolve: resolvesTo({ pid: 8812, holderPid: 8812, imageName: "qontinui-runner" }),
     });
     assert.equal(r.ok, true);
@@ -444,13 +508,16 @@ describe("killTargetRunner", () => {
   test("ok path through the real resolver on a fake /proc", async () => {
     const k = recordingKill();
     const io = fakeLinuxIo({
-      tcp: TCP_LISTEN_AND_ESTABLISHED,
-      procs: { 149760: { fds: { 17: "socket:[4242]" }, exe: "/x/qontinui-runner" } },
+      tcp6: TCP6_LISTEN_9877,
+      procs: { 149760: { fds: { 17: "socket:[7777]" }, exe: "/x/qontinui-runner" } },
     });
     const r = await killTargetRunner(149760, k.fn, {
-      port: 9876,
+      port: 9877,
       devStartPort: 9876,
       devStartExplicit: true,
+      doorRunnable: true,
+      interpreter: "/home/u/.local/bin/pwsh",
+      devStart: "/home/u/restart-9877.ps1",
       io,
     });
     assert.equal(r.ok, true);
@@ -474,6 +541,24 @@ describe("killTargetRunner", () => {
       { pid: 8812, holderPid: 8812, imageName: "qontinui-runner" },
       { platform: "linux" },
     ],
+    [
+      "door unrunnable (no interpreter on PATH)",
+      8812,
+      { pid: 8812, holderPid: 8812, imageName: "qontinui-runner" },
+      { doorRunnable: false, interpreter: null },
+    ],
+    [
+      "door runnability not stated (defaults to refuse)",
+      8812,
+      { pid: 8812, holderPid: 8812, imageName: "qontinui-runner" },
+      { doorRunnable: undefined },
+    ],
+    [
+      "linux primary port 9876 with an explicit door",
+      8812,
+      { pid: 8812, holderPid: 8812, imageName: "qontinui-runner" },
+      { platform: "linux", devStartExplicit: true },
+    ],
   ];
   for (const [label, gatePid, fresh, ctxPatch] of refusalCases) {
     test(`refusal never calls kill: ${label}`, async () => {
@@ -483,6 +568,7 @@ describe("killTargetRunner", () => {
         devStartPort: 9876,
         devStartExplicit: false,
         platform: "win32",
+        doorRunnable: true,
         resolve: resolvesTo(fresh),
         ...ctxPatch,
       });
@@ -501,6 +587,7 @@ describe("killTargetRunner", () => {
         port: 9876,
         devStartPort: 9876,
         platform: "win32",
+        doorRunnable: true,
         resolve: resolvesTo({ pid: 8812, holderPid: 8812, imageName: "qontinui-runner" }),
       },
     );
@@ -826,6 +913,16 @@ describe("spawn admission", () => {
     assert.match(out.reason, /thread_count/);
     assert.match(out.reason, /verdict=critical/);
   });
+  test("request + /health time counts against the budget, not just the sleeps", () => {
+    // 100s elapsed + 15s sleep fits 120s alone; a 10s attempt on top does not.
+    const c = classifyTerminalSpawn(guard);
+    assert.equal(planSpawnRetry({ classification: c, attempt: 5, elapsedMs: 100_000 }).retry, true);
+    assert.equal(
+      planSpawnRetry({ classification: c, attempt: 5, elapsedMs: 100_000, lastAttemptMs: 10_000 })
+        .retry,
+      false,
+    );
+  });
   test("a non-retryable refusal never schedules a retry", () => {
     const r = planSpawnRetry({
       classification: classifyTerminalSpawn({ status: 409, json: { error: "logged out" } }),
@@ -862,6 +959,30 @@ describe("no script evaluation in the webview", () => {
       for (const n of needles) assert.equal(src.includes(n), false, `${file} contains ${n}`);
     });
   }
+});
+
+describe("the oracle kills only the target (static)", () => {
+  // Plan D3/D4. Needles assembled so this file does not itself contain them.
+  // Against ba08d28f1's oracle this fails: it enumerated runners by name and
+  // stopped every pid listed, and gated on any runner ancestor.
+  const src = () => readFileSync(join(HERE, "..", "uibridge-session-info.test.mjs"), "utf8");
+  for (const forbidden of ["Get-Process " + "-Name", "Stop-" + "Process", "task" + "kill"]) {
+    test(`the oracle source never contains '${forbidden}' outside its doc comments`, () => {
+      // Doc comments may NAME the forbidden spellings (to forbid them); code may not.
+      const code = src()
+        .replace(/\/\*[\s\S]*?\*\//g, "")
+        .replace(/^\s*\/\/.*$/gm, "");
+      assert.equal(code.includes(forbidden), false, `oracle code contains ${forbidden}`);
+    });
+  }
+  test("T10 kills through killTargetRunner with the gate's pid", () => {
+    assert.equal(src().includes("killTargetRunner(" + "gate.pid"), true);
+  });
+  test("the self-hosting gate decides through selfHostingVerdict", () => {
+    const s = src();
+    assert.equal(s.includes("return selfHosting" + "Verdict("), true);
+    assert.equal(s.includes("resolveTargetRunner" + "Pid(port)"), true);
+  });
 });
 
 // ===========================================================================
@@ -1109,7 +1230,11 @@ describe("badgeCardinality", () => {
       registryIds: ["terminal-tenant-badge-0", "terminal-tenant-badge-1", "terminal-zone-header-0"],
       zones: [...two, { zoneIndex: 2, expect: "absent" }],
     });
-    assert.deepEqual(r, { ok: true, detail: "2 distinct per-zone badge id(s) for 2 zone(s)" });
+    assert.deepEqual(r, {
+      ok: true,
+      detail: "2 distinct per-zone badge id(s) for 2 zone(s)",
+      unboundBadges: [],
+    });
   });
   test("a badge on a zone that expects none is a FAIL", () => {
     const r = badgeCardinality({
@@ -1120,6 +1245,22 @@ describe("badgeCardinality", () => {
       ],
     });
     assert.equal(r.ok, false);
+  });
+  test("a badge on a zone with no bound session yet is set aside as UNKNOWN, not a count FAIL", () => {
+    const r = badgeCardinality({
+      registryIds: ["terminal-tenant-badge-0", "terminal-tenant-badge-1"],
+      zones: [{ zoneIndex: 0, expect: "present" }],
+      unboundZones: [1],
+    });
+    assert.equal(r.ok, true);
+    assert.deepEqual(r.unboundBadges, ["terminal-tenant-badge-1"]);
+    // Without the unbound set the same registry is a count FAIL.
+    const without = badgeCardinality({
+      registryIds: ["terminal-tenant-badge-0", "terminal-tenant-badge-1"],
+      zones: [{ zoneIndex: 0, expect: "present" }],
+    });
+    assert.equal(without.ok, false);
+    assert.deepEqual(without.unboundBadges, []);
   });
   test("an UNKNOWN zone expectation makes the count UNKNOWN", () => {
     const r = badgeCardinality({

@@ -107,7 +107,7 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -129,6 +129,7 @@ import {
   planRosterSeed,
   planSpawnRetry,
   refusedGateIn,
+  resolvePowerShellInterpreter,
   resolveTargetRunnerPid,
   sameRoster,
   selfHostingVerdict,
@@ -947,11 +948,14 @@ async function readAdmissionVerdict() {
  * admission (its resource guard) refuses for load — HTTP 500
  * `resource_guard:<severity>:<lane>: …`. Every other refusal returns at once,
  * classified; a guard that keeps refusing past the budget is reported with
- * its reason and the last `/health` admission verdict.
+ * its reason and the last `/health` admission verdict. The budget counts
+ * request and `/health` time as well as the sleeps (see `planSpawnRetry` for
+ * the worst-case overrun).
  */
 async function postTerminalWithAdmission(body) {
   const started = Date.now();
   for (let attempt = 0; ; attempt++) {
+    const attemptStarted = Date.now();
     const res = await http("/terminals", { method: "POST", body });
     const c = classifyTerminalSpawn(res);
     if (c.kind === "ok") {
@@ -965,6 +969,8 @@ async function postTerminalWithAdmission(body) {
       classification: c,
       attempt,
       elapsedMs: Date.now() - started,
+      // This attempt's request + /health time, as the estimate of the next one.
+      lastAttemptMs: Date.now() - attemptStarted,
       admissionVerdict: verdict,
     });
     if (!next.retry) return { ok: false, kind: c.kind, error: next.reason };
@@ -1659,7 +1665,16 @@ async function runSingleZoneBadgeArm(ctx, fixture) {
         `this arm reads the single-zone strip and never changes the layout`,
     );
   }
-  const zone = zoneIndexOf(v.view.assignments, fixture.terminalId) ?? 0;
+  const zone = zoneIndexOf(v.view.assignments, fixture.terminalId);
+  if (zone === null || zone === undefined) {
+    // An absent assignment is UNKNOWN — never zone 0 by default.
+    return skip(
+      "T0.2b",
+      T02B_WHAT,
+      `UNKNOWN — get-zone-view-state assigns terminal ${fixture.terminalId} to no zone, so which ` +
+        `zone's badge to read is unknown`,
+    );
+  }
   const triggerId = infoElementId("trigger", zone);
   const reg = await waitForElement(triggerId);
   if (!reg.ok) return fail("T0.2b", T02B_WHAT, `GET /ui-bridge/control/elements: ${reg.error}`);
@@ -1750,11 +1765,20 @@ async function runMultiZoneBadgeArm(ctx, z, info) {
       findings.push({ status: f.status, detail: f.detail + extra });
     }
   }
-  const card = badgeCardinality({ registryIds: [...ids], zones: zonesExp });
+  const unboundZones = z.zones.filter((x) => !x.claudeSessionId).map((x) => x.zoneIndex);
+  const card = badgeCardinality({ registryIds: [...ids], zones: zonesExp, unboundZones });
   findings.push({
     status: card.ok === true ? "PASS" : card.ok === false ? "FAIL" : "UNKNOWN",
     detail: `cardinality: ${card.detail}`,
   });
+  if (card.unboundBadges.length) {
+    findings.push({
+      status: "UNKNOWN",
+      detail:
+        `badge(s) ${card.unboundBadges.join(", ")} render on zone(s) whose header carries no ` +
+        `data-claude-session-id yet — whether those zones owe a badge is UNKNOWN until they bind`,
+    });
+  }
   return recordBadgeArm("T2b", T2B_WHAT, findings);
 }
 
@@ -2318,9 +2342,36 @@ async function runDropdownAssertions(ctx) {
 // Restart machinery (T7 / T10) — gated, guarded, never a process-tree kill
 // ===========================================================================
 
+/**
+ * The PowerShell interpreter on PATH (`powershell`, falling back to `pwsh`),
+ * or null. Resolved once, lazily; the SAME value proves T10's door runnable
+ * before the kill and runs the restart after it, so the two cannot disagree.
+ */
+let resolvedInterpreter;
+function powershellInterpreter() {
+  if (resolvedInterpreter === undefined) {
+    resolvedInterpreter = resolvePowerShellInterpreter({
+      pathEnv: process.env.PATH ?? process.env.Path ?? "",
+      platform: process.platform,
+      exists: existsSync,
+    });
+  }
+  return resolvedInterpreter;
+}
+
 /** Run a PowerShell command, returning `{ok, stdout, stderr, code}`. */
 function powershell(args, { timeoutMs = 600_000 } = {}) {
-  const r = spawnSync("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", ...args], {
+  const interpreter = powershellInterpreter();
+  if (!interpreter) {
+    return {
+      ok: false,
+      code: null,
+      stdout: "",
+      stderr: "",
+      error: "no PowerShell interpreter (powershell, pwsh) on PATH",
+    };
+  }
+  const r = spawnSync(interpreter, ["-NoProfile", "-ExecutionPolicy", "Bypass", ...args], {
     encoding: "utf8",
     timeout: timeoutMs,
     windowsHide: true,
@@ -2894,11 +2945,18 @@ async function runHonestyAssertions(ctx) {
       // Only the pid the gate just resolved, re-resolved and planned again
       // immediately before the kill (plan D4); `killTargetRunner` enumerates
       // nothing else on the box.
+      // The restart door must be PROVEN runnable before the kill — an
+      // interpreter on PATH and the script on disk — or the kill would leave
+      // the target dead.
+      const interpreter = powershellInterpreter();
       const k = await killTargetRunner(gate.pid, (pid, signal) => process.kill(pid, signal), {
         port: opts.port,
         devStartPort: DEFAULT_RUNNER_PORT,
         devStartExplicit: opts.devStartExplicit,
         platform: process.platform,
+        interpreter,
+        devStart: opts.devStart,
+        doorRunnable: interpreter !== null && existsSync(opts.devStart),
       });
       if (!k.ok) {
         fail("T10", "a hard-crash boot reports verdict 'unknown', not 'match'", k.detail);
@@ -3082,17 +3140,33 @@ async function teardown(ctx) {
   const problems = [];
   const done = [];
 
+  // ORDER MATTERS: the fixture terminals are deleted and their records awaited
+  // out of the open set BEFORE the roster is restored, because a restore that
+  // removes an account while a session spawned under it is still open strands
+  // that session under an account the runner no longer lists.
   const sessionIds = (ctx.fixtures ?? [])
     .map((f) => f.session?.identity?.claudeSessionId)
     .filter(Boolean);
+  /** Everything the retire step could not confirm gone — named, never dropped. */
+  const unretired = [];
   if (ctx.spawnedTerminals.size > 0 || sessionIds.length > 0) {
     const t = await deleteAndAwaitRetire(ctx.spawnedTerminals, sessionIds);
     done.push(`${t.deleted} terminal(s) DELETEd; open set re-read for ${Math.round(t.ms / 1000)}s`);
     problems.push(...t.deleteErrors);
-    if (t.readError) problems.push(`restore-health unreadable at the end: ${t.readError}`);
-    if (t.residue.length) problems.push(`RESIDUE still open: ${t.residue.join(", ")}`);
+    unretired.push(...t.deleteErrors);
+    if (t.readError) {
+      problems.push(`restore-health unreadable at the end: ${t.readError}`);
+      unretired.push(`retirement UNKNOWN (restore-health unreadable: ${t.readError})`);
+    }
+    if (t.residue.length) {
+      problems.push(`RESIDUE still open: ${t.residue.join(", ")}`);
+      unretired.push(...t.residue);
+    }
   }
-  if (ctx.residue.length) problems.push(`RESIDUE from failed fixtures: ${ctx.residue.join(", ")}`);
+  if (ctx.residue.length) {
+    problems.push(`RESIDUE from failed fixtures: ${ctx.residue.join(", ")}`);
+    unretired.push(...ctx.residue);
+  }
 
   if (ctx.rosterSeed) {
     const r = await putRoster(ctx.rosterSeed.prior);
@@ -3102,8 +3176,18 @@ async function teardown(ctx) {
         `roster restore read back ${r.dirs.join(", ") || "EMPTY"}, not the prior ` +
           `${ctx.rosterSeed.prior.join(", ") || "EMPTY"}`,
       );
+    } else if (unretired.length) {
+      // Done, but NOT clean: say which fixtures it was done around.
+      problems.push(
+        `roster restored to ${ctx.rosterSeed.prior.join(", ") || "EMPTY"} (read back) ` +
+          `WITH RESIDUE — these fixtures were not confirmed retired first, so they may now ` +
+          `sit under an account the restored roster no longer lists: ${unretired.join(", ")}`,
+      );
     } else {
-      done.push(`roster restored to ${ctx.rosterSeed.prior.join(", ") || "EMPTY"} (read back)`);
+      done.push(
+        `roster restored to ${ctx.rosterSeed.prior.join(", ") || "EMPTY"} (read back, ` +
+          `after every fixture retired)`,
+      );
     }
   }
 
