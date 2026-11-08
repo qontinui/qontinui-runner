@@ -11083,87 +11083,81 @@ mod egress_tests {
     // Phase 1: qontinui-web's saved-session-lists capture relays
     // `GET /terminal-layout`. Each test enters through the relay's own core,
     // `relay_http_to_base` (the `http_request` arm, path verdict included),
-    // against a loopback stub serving a body the REAL layout builder made, so
+    // against a loopback stub serving a literal wire body that every answer is
+    // deserialized back through the qontinui-schemas `TerminalLayout` type, so
     // the gate is pinned to the wire type's field names. The title of each
     // session row is judged by that row's terminal's session tenant.
 
     /// The tenant the layout tests refuse or permit terminal streaming for.
     const LAYOUT_TENANT: u128 = 0x7e7a_0020;
 
-    /// A `/terminal-layout` body from `terminal::layout::build_layout`: a
-    /// confirmed, finished session (`t-claude`), a plain shell with no
-    /// confirmed record (`t-shell`) and an untitled terminal (`t-untitled`),
-    /// on two registered tabs. Every title starts `SECRET`.
+    /// A literal `/terminal-layout` wire body in the qontinui-schemas
+    /// `TerminalLayout` shape: a confirmed, finished session (`t-claude`), a
+    /// plain shell with no confirmed record (`t-shell`) and an untitled
+    /// terminal (`t-untitled`), on two registered tabs. Every title starts
+    /// `SECRET`. It is written out rather than produced by
+    /// `terminal::layout::build_layout`, so these tests enter ONLY through the
+    /// relay (`relay_http_to_base`) and never on the builder's producer side;
+    /// `terminal::layout::tests` pin the builder, and `relayed_layout`
+    /// deserializes every answer back through the wire type.
     fn layout_body() -> String {
-        use crate::terminal::layout::{build_layout, JoinedTerminal, PageLabels, RegisteredPage};
-        let info = |id: &str, page: &str, title: &str| crate::terminal::types::TerminalInfo {
-            id: id.to_string(),
-            title: title.to_string(),
-            pid: None,
-            cols: 80,
-            rows: 24,
-            working_dir: "/w".to_string(),
-            is_alive: true,
-            exit_code: None,
-            created_at: 0,
-            total_bytes_produced: 0,
-            page_id: page.to_string(),
+        let no_session = |terminal_id: &str, title: Option<&str>| {
+            serde_json::json!({
+                "terminalId": terminal_id,
+                "title": title,
+                "titleWithheld": false,
+                "isAlive": true,
+                "spawnName": null,
+                "claudeSessionId": null,
+                "accountLabel": null,
+                "sessionName": null,
+                "zoneIndex": null,
+                "finished": null,
+                "finishedAt": null,
+                "finishReason": null,
+            })
         };
-        let record: crate::session::session_lifecycle_store::TerminalSessionRecord =
-            serde_json::from_value(serde_json::json!({
-                "claudeSessionId": "11111111-2222-3333-4444-555555555555",
-                "pageId": "p-work",
-                "zoneIndex": 2,
-                "terminalId": "t-claude",
-                "openedAt": 1,
-                "lastSeenAt": 1,
-                "state": "open",
-                "confirmedAt": 1,
-                "accountLabel": "hotmail",
-                "sessionName": "1234 fix the relay",
-                "finishedAt": 1_794_128_400_000_i64,
-                "finishReason": "unattended: all landed",
-            }))
-            .expect("fixture record parses");
-        let joined = vec![
-            JoinedTerminal {
-                info: info("t-claude", "p-work", "SECRET claude title"),
-                spawn_name: Some("1234 fix the relay".to_string()),
-                session: Some(record),
+        serde_json::json!({
+            "runner": {
+                "instanceName": UNNAMED_INSTANCE_NAME,
+                "port": 1,
+                "buildId": "build-1",
+                "deviceId": "device-1",
             },
-            JoinedTerminal {
-                info: info("t-shell", "p-shells", "SECRET shell title"),
-                spawn_name: None,
-                session: None,
-            },
-            JoinedTerminal {
-                info: info("t-untitled", "p-shells", ""),
-                spawn_name: None,
-                session: None,
-            },
-        ];
-        let page = |id: &str, label: &str, order: u32| RegisteredPage {
-            page_id: id.to_string(),
-            label: Some(label.to_string()),
-            order,
-        };
-        let labels = PageLabels::new(
-            vec![page("p-work", "Work", 0), page("p-shells", "Shells", 1)],
-            chrono::Utc::now(),
-        );
-        let runner = qontinui_types::terminal::TerminalLayoutRunner {
-            instance_name: Some(UNNAMED_INSTANCE_NAME.to_string()),
-            port: Some(1),
-            build_id: Some("build-1".to_string()),
-            device_id: Some("device-1".to_string()),
-        };
-        serde_json::to_string(&build_layout(
-            runner,
-            "2026-11-08T09:00:00.000Z".to_string(),
-            joined,
-            &labels,
-        ))
-        .unwrap()
+            "labelsRegistered": true,
+            "capturedAt": "2026-11-08T09:00:00.000Z",
+            "pages": [
+                {
+                    "pageId": "p-work",
+                    "label": "Work",
+                    "order": 0,
+                    "sessions": [{
+                        "terminalId": "t-claude",
+                        "title": "SECRET claude title",
+                        "titleWithheld": false,
+                        "isAlive": true,
+                        "spawnName": "1234 fix the relay",
+                        "claudeSessionId": "11111111-2222-3333-4444-555555555555",
+                        "accountLabel": "hotmail",
+                        "sessionName": "1234 fix the relay",
+                        "zoneIndex": 2,
+                        "finished": true,
+                        "finishedAt": "2026-11-08T09:00:00.000Z",
+                        "finishReason": "unattended: all landed",
+                    }],
+                },
+                {
+                    "pageId": "p-shells",
+                    "label": "Shells",
+                    "order": 1,
+                    "sessions": [
+                        no_session("t-shell", Some("SECRET shell title")),
+                        no_session("t-untitled", None),
+                    ],
+                },
+            ],
+        })
+        .to_string()
     }
 
     /// Relay one `GET /terminal-layout` to `server` and decode what the
