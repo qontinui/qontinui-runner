@@ -8507,10 +8507,9 @@ async fn run_condition_check_terminal(
     // QONTINUI_ROOT. We intentionally do NOT provision `.mcp.json`/fleet commands
     // here (the gate path writes those into its per-continuation worktree; doing
     // so against the shared canonical root would clobber the operator's files).
-    let workdir = match qontinui_root_dir() {
-        Some(p) => p.to_string_lossy().to_string(),
-        None => {
-            let reason = "no QONTINUI_ROOT resolved — nowhere to run the check from";
+    let workdir = match crate::workspace_paths::require_workspace_root() {
+        Ok(p) => p.to_string_lossy().to_string(),
+        Err(reason) => {
             warn!("agent_runtime: condition-check: {reason}");
             report_condition_run_failed(&payload, format!("spawn_failed: {reason}")).await;
             return Err(anyhow::anyhow!("condition-check: {reason}"));
@@ -8851,7 +8850,7 @@ async fn acquire_continuation_workdir(
     // anything — with the `workdir_not_a_checkout` detail the caller posts as
     // the gate's `spawn_failed` outcome.
     let workdir = continuation_fallback_workdir(
-        qontinui_root_dir(),
+        crate::workspace_paths::require_workspace_root(),
         repos,
         crate::agent_worktree::canonical_paths::has_foreign_owner,
         crate::agent_worktree::canonical_paths::default_canonical_path,
@@ -8962,11 +8961,12 @@ use crate::agent_worktree::NO_ISOLATED_WORKTREE;
 /// Pure core of the continuation fallback cwd — reached only when no worktree
 /// was acquired.
 ///
-/// - no repos → the workspace root, else `Err`;
+/// - no repos → the workspace root, else `root`'s own error (the shared
+///   `WorkspaceRootUnresolved` sentence, which names the next action);
 /// - a `qontinui/*` or bare-slug repo → EXACTLY the pre-existing order: the
 ///   workspace root (Phase 3 of
 ///   `2026-08-20-worktree-spawn-autonomy-and-trust-preconditions` — the trusted,
-///   non-shared cwd), else its canonical checkout, else `Err`. Unverified on
+///   non-shared cwd), else its canonical checkout, else `root`'s error. Unverified on
 ///   purpose: a fork-origin clone or a box holding a subset of the repos must
 ///   keep working as it did;
 /// - a repo with any other owner whose VERIFIED checkout is under the root →
@@ -8984,7 +8984,7 @@ use crate::agent_worktree::NO_ISOLATED_WORKTREE;
 /// Every resolver is INJECTED so the order is asserted against synthetic paths
 /// rather than against whatever this machine happens to have on disk.
 fn continuation_fallback_workdir<E: std::fmt::Display>(
-    root: Option<std::path::PathBuf>,
+    root: Result<std::path::PathBuf, String>,
     repos: &[String],
     foreign_owner: impl Fn(&str) -> bool,
     canonical: impl Fn(&str) -> Result<std::path::PathBuf, String>,
@@ -8993,19 +8993,17 @@ fn continuation_fallback_workdir<E: std::fmt::Display>(
 ) -> Result<String, String> {
     let lossy = |p: &std::path::Path| p.to_string_lossy().to_string();
     let Some(repo) = repos.first() else {
-        return root
-            .map(|p| lossy(&p))
-            .ok_or_else(|| "no QONTINUI_ROOT or canonical checkout resolved".to_string());
+        return root.map(|p| lossy(&p));
     };
     if !foreign_owner(repo) {
-        return root
-            .map(|p| lossy(&p))
-            .or_else(|| canonical(repo).ok().map(|p| lossy(&p)))
-            .ok_or_else(|| "no QONTINUI_ROOT or canonical checkout resolved".to_string());
+        return match root {
+            Ok(root) => Ok(lossy(&root)),
+            Err(unresolved) => canonical(repo).map(|p| lossy(&p)).map_err(|_| unresolved),
+        };
     }
     let checkout = resolve_checkout(repo).map_err(|e| e.to_string())?;
     match root {
-        Some(root) if crate::agent_worktree::canonical_paths::path_is_within(&root, &checkout) => {
+        Ok(root) if crate::agent_worktree::canonical_paths::path_is_within(&root, &checkout) => {
             Ok(lossy(&root))
         }
         _ => Err(format!(
@@ -9942,9 +9940,9 @@ async fn run_agent_subprocess(
     // Bundle /vet-plan and /implement-plan into the spawned worktree cwd so they
     // resolve as project slash commands regardless of the device's ~/.claude.
     crate::fleet_commands::provision_fleet_commands_for_session(&primary_wt);
-    // Same for the fleet SKILLS. Note provision_agent_definitions above still
-    // COPIES .claude/agents from a claude-config checkout, so agents remain
-    // absent on a device without one; skills no longer do.
+    // Same for the fleet SKILLS. Unlike the skills, the agent defs above need a
+    // resolved workspace root even for their embedded floor, so they stay absent
+    // when nothing is declared and this cwd is not a checkout.
     crate::fleet_skills::provision_fleet_skills_for_session(&primary_wt);
 
     let log_path = agent_log_path(payload.agent_id);
@@ -10273,8 +10271,27 @@ async fn materialize_worktrees(payload: &LaunchPayload) -> anyhow::Result<()> {
 /// [`capability_manifest::Rung::Unresolved`] row naming what was skipped and
 /// why. The control flow is unchanged: it still returns `Ok` and the spawn
 /// still proceeds.
-fn provision_agent_definitions(worktree_cwd: &str) -> anyhow::Result<ProvisionReport> {
-    let Some(root) = qontinui_root_dir() else {
+///
+/// `resolved` is the root as this session sees it
+/// ([`crate::workspace_paths::session_workspace_root`]), so a session opened on
+/// a checkout reaches the embedded floor even when nothing is declared. Passed
+/// in so a test can drive that case without depending on where its binary sits.
+fn provision_agent_definitions(
+    resolved: qontinui_types::paths::WorkspaceRoot,
+    worktree_cwd: &str,
+) -> anyhow::Result<ProvisionReport> {
+    if let Some(rejected) = resolved.rejected {
+        warn!(
+            "agent_runtime: {} — continuing with the next resolution rung",
+            rejected.describe()
+        );
+    }
+    info!(
+        "agent_runtime: agent-def provisioning for {worktree_cwd} resolved the workspace root \
+         as {}",
+        resolved.kind.wire()
+    );
+    let Some(root) = resolved.into_root() else {
         warn!(
             "agent_runtime: no qontinui-root resolved; skipping .claude/agents \
              provisioning for {worktree_cwd} (auto-spawned subagents will not resolve)"
@@ -10288,7 +10305,8 @@ fn provision_agent_definitions(worktree_cwd: &str) -> anyhow::Result<ProvisionRe
                 .display()
                 .to_string(),
             "no qontinui-root resolved, so <root>/qontinui-claude-config/.claude/agents \
-             cannot be located — the normal state on a published install",
+             cannot be located — the normal state on a published install whose session \
+             folder is not a repository checkout",
         ));
     };
     provision_agent_definitions_from_root(&root, worktree_cwd)
@@ -10317,7 +10335,8 @@ fn provision_agent_definitions(worktree_cwd: &str) -> anyhow::Result<ProvisionRe
 /// is observable on the next manifest read rather than in this value. The spawn
 /// path ignores the return entirely.
 pub(crate) fn provision_agent_definitions_recorded(workdir: &str) -> Vec<ProvisionReport> {
-    let report = match provision_agent_definitions(workdir) {
+    let resolved = crate::workspace_paths::session_workspace_root(Path::new(workdir));
+    let report = match provision_agent_definitions(resolved, workdir) {
         Ok(report) => report,
         Err(e) => {
             warn!("agent_runtime: agent-def provisioning errored (continuing): {e:#}");
@@ -10411,6 +10430,7 @@ fn provision_agent_definitions_from_root(
         }
     };
     let embedded = embedded_report.written;
+    let floor_write_failed = embedded_report.rung == capability_manifest::Rung::Unresolved;
     capability_manifest::record_provision(worktree_cwd, embedded_report);
 
     // CHECKOUT WINS: the operator's live copies are overlaid on top below, so
@@ -10422,14 +10442,20 @@ fn provision_agent_definitions_from_root(
             src_dir.display(),
             dst_dir.display()
         );
+        // Zero written is not a failure on its own: a tracked file is kept, not
+        // rewritten. Only a failed floor write means nothing serves this.
+        let fallback = if floor_write_failed {
+            qontinui_types::paths::SiblingFallback::Unsupported
+        } else {
+            qontinui_types::paths::SiblingFallback::EmbeddedCopy
+        };
+        let absent =
+            qontinui_types::paths::SiblingCheckoutAbsent::new("qontinui-claude-config", fallback);
         return Ok(ProvisionReport::unresolved(
             "agent_definitions",
             0,
             src_dir.display().to_string(),
-            format!(
-                "no claude-config agents dir on this device; the {embedded} embedded \
-                 default(s) stand in"
-            ),
+            format!("{absent} Embedded default(s) written: {embedded}."),
         )
         .with_destination(dst_dir.display().to_string()));
     }
@@ -14551,13 +14577,11 @@ mod tests {
         assert_eq!(report.written, 0);
         assert_eq!(report.skipped.len(), 1);
         assert_eq!(report.skipped[0].reason.wire(), "unresolved");
+        let why = report.skipped[0].reason.describe();
         assert!(
-            report.skipped[0]
-                .reason
-                .describe()
-                .contains("no claude-config agents dir"),
-            "the skip must NAME the missing rung, not merely count it: {:?}",
-            report.skipped[0].reason
+            why.contains("qontinui-claude-config")
+                && why.contains("served from the copy built into the application"),
+            "the skip must NAME the missing sibling and what stood in for it: {why}"
         );
 
         let dst = wt.path().join(".claude").join("agents");
@@ -14856,6 +14880,59 @@ mod tests {
         );
     }
 
+    /// Plan `2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists`,
+    /// B3: when nothing is declared and the workdir is a repository checkout, the
+    /// embedded subagents are written instead of the no-root arm skipping them. A
+    /// folder that is not a checkout still takes that arm. Only the paths that call
+    /// this provisioner benefit; the terminal chokepoint does not call it yet.
+    #[test]
+    fn a_session_opened_on_a_checkout_reaches_the_embedded_floor() {
+        let _amb = crate::test_env::isolated_ambient();
+        let parent = tempfile::tempdir().unwrap();
+        let repo = parent.path().join("their-repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let cwd = repo.to_string_lossy().into_owned();
+
+        let resolved = qontinui_types::paths::resolve_workspace_root(
+            None,
+            None,
+            None,
+            None,
+            Some(&repo),
+            None,
+        );
+        assert_eq!(
+            resolved.kind,
+            qontinui_types::paths::WorkspaceRootKind::SessionRepoParent
+        );
+        let report = provision_agent_definitions(resolved, &cwd).expect("fail-soft Ok");
+        let why = report.skipped[0].reason.describe();
+        assert!(why.contains("qontinui-claude-config"), "{why}");
+        let written = std::fs::read_dir(repo.join(".claude").join("agents"))
+            .expect("the embedded floor must create the agents dir")
+            .count();
+        assert_eq!(written, crate::fleet_agents::embedded_agent_count());
+
+        let plain = parent.path().join("plain-folder");
+        std::fs::create_dir_all(&plain).unwrap();
+        let cwd = plain.to_string_lossy().into_owned();
+        let resolved = qontinui_types::paths::resolve_workspace_root(
+            None,
+            None,
+            None,
+            None,
+            Some(&plain),
+            None,
+        );
+        let report = provision_agent_definitions(resolved, &cwd).expect("fail-soft Ok");
+        assert_eq!(report.rung, crate::capability_manifest::Rung::Unresolved);
+        assert!(!plain.join(".claude").exists());
+    }
+
+    /// The rendered `WorkspaceRootUnresolved` a `require_workspace_root` caller
+    /// passes in, standing in for the real sentence so the tests stay pure.
+    const UNRESOLVED: &str = "the workspace root sentence";
+
     /// Phase 3 of `2026-08-20-worktree-spawn-autonomy-and-trust-preconditions`:
     /// a non-worktree `qontinui/*` continuation lands at the WORKSPACE ROOT, not
     /// at the canonical checkout of its first repo — and, since the resolver for
@@ -14876,7 +14953,7 @@ mod tests {
 
         assert_eq!(
             continuation_fallback_workdir(
-                Some(root.clone()),
+                Ok(root.clone()),
                 &repos,
                 foreign,
                 canonical,
@@ -14887,25 +14964,44 @@ mod tests {
             "the root wins, and a failing verifier is never consulted"
         );
         assert_eq!(
-            continuation_fallback_workdir(Some(root), &[], foreign, canonical, refuse, "off"),
+            continuation_fallback_workdir(Ok(root), &[], foreign, canonical, refuse, "off"),
             Ok("D:/qontinui-root".to_string())
         );
         // No root: the canonical checkout survives as the last resort.
         assert_eq!(
-            continuation_fallback_workdir(None, &repos, foreign, canonical, refuse, "off"),
+            continuation_fallback_workdir(
+                Err(UNRESOLVED.to_string()),
+                &repos,
+                foreign,
+                canonical,
+                refuse,
+                "off"
+            ),
             Ok("D:/qontinui-root/qontinui-runner".to_string())
         );
-        assert!(continuation_fallback_workdir(
-            None,
-            &repos,
-            foreign,
-            |_: &str| Err("no root".to_string()),
-            refuse,
-            "off"
-        )
-        .is_err());
-        assert!(
-            continuation_fallback_workdir(None, &[], foreign, canonical, refuse, "off").is_err()
+        // Nothing left: the refusal is the root's own sentence, verbatim, so it
+        // names the next action rather than a variable the operator never set.
+        assert_eq!(
+            continuation_fallback_workdir(
+                Err(UNRESOLVED.to_string()),
+                &repos,
+                foreign,
+                |_: &str| Err("no root".to_string()),
+                refuse,
+                "off"
+            ),
+            Err(UNRESOLVED.to_string())
+        );
+        assert_eq!(
+            continuation_fallback_workdir(
+                Err(UNRESOLVED.to_string()),
+                &[],
+                foreign,
+                canonical,
+                refuse,
+                "off"
+            ),
+            Err(UNRESOLVED.to_string())
         );
     }
 
@@ -14925,7 +15021,7 @@ mod tests {
         let resolve =
             |_: &str| Ok::<_, String>(std::path::PathBuf::from("D:/portofino-pizzeria/backend"));
         let err = continuation_fallback_workdir(
-            Some(root.clone()),
+            Ok(root.clone()),
             &repos,
             foreign,
             canonical,
@@ -14942,7 +15038,7 @@ mod tests {
         let under = |_: &str| Ok::<_, String>(std::path::PathBuf::from("D:/qontinui-root/backend"));
         assert_eq!(
             continuation_fallback_workdir(
-                Some(root.clone()),
+                Ok(root.clone()),
                 &repos,
                 foreign,
                 canonical,
@@ -14955,7 +15051,7 @@ mod tests {
         let sibling =
             |_: &str| Ok::<_, String>(std::path::PathBuf::from("D:/qontinui-root-old/backend"));
         assert!(continuation_fallback_workdir(
-            Some(root),
+            Ok(root),
             &repos,
             foreign,
             canonical,
@@ -14986,7 +15082,7 @@ mod tests {
             )
         };
         let err = continuation_fallback_workdir(
-            Some(std::path::PathBuf::from("D:/qontinui-root")),
+            Ok(std::path::PathBuf::from("D:/qontinui-root")),
             &repos,
             crate::agent_worktree::canonical_paths::has_foreign_owner,
             |_: &str| Ok(std::path::PathBuf::from("D:/qontinui-root/mobile")),

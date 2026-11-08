@@ -115,21 +115,67 @@ pub fn runner_workspace_root() -> WorkspaceRoot {
     // `<dir>/root`, and the answer a clean box gives. It is resolved through
     // the pure core with NO env, setting or exe input, so neither the box's
     // `$QONTINUI_ROOT` nor its checkout can leak in.
-    if qontinui_runner_lib::ambient::canary(
+    if let Some(deflected) = deflected_unguarded_read(
         "env QONTINUI_ROOT / QONTINUI_WORKSPACE_ROOT / settings paths.workspace_root (runner_workspace_root)",
-    ) == qontinui_runner_lib::ambient::Verdict::Deflect
-    {
-        let root = qontinui_runner_lib::ambient::deflected_workspace_root();
-        return qontinui_types::paths::resolve_workspace_root(
-            Some(&root.to_string_lossy()),
-            None,
-            None,
-            None,
-            None,
-            None,
-        );
+    ) {
+        return deflected;
     }
     runner_workspace_root_from(get_setting::<PathSettings>().workspace_root.as_deref())
+}
+
+/// The canary [`runner_workspace_root`] and [`session_workspace_root`] share:
+/// `Some` when a test reached the resolver with no `isolated_ambient()` guard,
+/// holding the empty, created root it is deflected to.
+fn deflected_unguarded_read(source: &str) -> Option<WorkspaceRoot> {
+    if qontinui_runner_lib::ambient::canary(source)
+        != qontinui_runner_lib::ambient::Verdict::Deflect
+    {
+        return None;
+    }
+    let root = qontinui_runner_lib::ambient::deflected_workspace_root();
+    Some(qontinui_types::paths::resolve_workspace_root(
+        Some(&root.to_string_lossy()),
+        None,
+        None,
+        None,
+        None,
+        None,
+    ))
+}
+
+/// [`runner_workspace_root`] for a caller scoped to ONE session: the same
+/// resolution, plus the checkout that session was opened on as the
+/// `SessionRepoParent` rung.
+///
+/// `session_repo` is the checkout's top-level directory. It ranks below every
+/// declaration and the ancestor walk, so a box that declares its root or runs
+/// from inside a checkout resolves the same way. It ranks above
+/// `<home>/qontinui-root`, so a box answered only by that default gets the folder
+/// holding the session's checkout instead. It answers for an operator who cloned
+/// one repository and declared nothing. Anything that is not a checkout's top
+/// level skips the rung.
+pub fn session_workspace_root(session_repo: &Path) -> WorkspaceRoot {
+    if let Some(deflected) = deflected_unguarded_read(
+        "env QONTINUI_ROOT / QONTINUI_WORKSPACE_ROOT / settings paths.workspace_root (session_workspace_root)",
+    ) {
+        return deflected;
+    }
+    let exe = std::env::current_exe().ok();
+    session_workspace_root_from(
+        get_setting::<PathSettings>().workspace_root.as_deref(),
+        exe.as_deref(),
+        session_repo,
+    )
+}
+
+/// [`session_workspace_root`] over injected inputs, so a test can choose which
+/// rungs are available without depending on where its binary was built.
+fn session_workspace_root_from(
+    configured: Option<&str>,
+    exe: Option<&Path>,
+    session_repo: &Path,
+) -> WorkspaceRoot {
+    qontinui_workspace_root(configured, exe_anchor(exe), Some(session_repo))
 }
 
 /// [`runner_workspace_root`] over a `paths.workspace_root` the caller already
@@ -163,7 +209,8 @@ pub fn runner_workspace_root_from(configured: Option<&str>) -> WorkspaceRoot {
     // surface and every session the runner hosts, so it has no single session
     // repository to offer. Passing one session's checkout here would make the
     // whole runner's root a function of whichever session asked first. The
-    // `SessionRepoParent` rung is for a caller scoped to one session.
+    // `SessionRepoParent` rung is for a caller scoped to one session, which is
+    // what `session_workspace_root` serves.
     qontinui_workspace_root(configured, exe_anchor(exe.as_deref()), None)
 }
 
@@ -320,6 +367,12 @@ pub fn require_workspace_root() -> Result<PathBuf, String> {
 /// `WorkspaceRootUnresolved::detail`, which a `String` caller has nowhere to
 /// show, so it is logged here instead of being dropped.
 fn require_rendered(resolved: WorkspaceRoot) -> Result<PathBuf, String> {
+    if let Some(rejected) = resolved.rejected {
+        warn!(
+            "workspace_paths: {} — continuing with the next resolution rung",
+            rejected.describe()
+        );
+    }
     resolved.require().map_err(|e| {
         warn!(
             "workspace_paths: workspace root unresolved — {}",
@@ -393,8 +446,9 @@ pub fn persist_resolved_workspace_root() -> Result<(), String> {
     let Some(value) = migration_write(existing.as_deref(), workspace_root().as_deref()) else {
         info!(
             "workspace_paths: no workspace root resolves on this machine, so \
-             `paths.workspace_root` was left unset. Set $QONTINUI_ROOT (or the \
-             setting) if this runner should manage canonical checkouts."
+             `paths.workspace_root` was left unset. Set the \"{}\" setting if this \
+             runner should manage canonical checkouts.",
+            qontinui_types::paths::WORKSPACE_ROOT_SETTING
         );
         return Ok(());
     };
@@ -770,5 +824,33 @@ mod tests {
             doc["paths"]["workspace_root"].as_str().map(PathBuf::from),
             Some(expected)
         );
+    }
+
+    /// Plan `2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists`,
+    /// B3, through the runner's own door. With nothing declared and no useful
+    /// exe ancestry, the session's checkout names the root. With a declaration
+    /// present, the declaration still wins, which is why a box that declares its
+    /// root sees no change.
+    #[test]
+    fn a_session_checkout_names_the_root_only_when_nothing_higher_answers() {
+        let amb = crate::test_env::isolated_ambient();
+        let parent = tempfile::tempdir().unwrap();
+        let repo = parent.path().join("their-repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+
+        let declared = session_workspace_root_from(None, None, &repo);
+        assert_eq!(declared.kind, WorkspaceRootKind::Declared);
+        assert_eq!(declared.root, Some(amb.root()));
+
+        std::env::remove_var("QONTINUI_ROOT");
+        let inferred = session_workspace_root_from(None, None, &repo);
+        assert_eq!(inferred.kind, WorkspaceRootKind::SessionRepoParent);
+        assert_eq!(inferred.root.as_deref(), Some(parent.path()));
+
+        // A folder that is not a checkout's top level skips the rung.
+        let not_a_checkout = parent.path().join("plain-folder");
+        std::fs::create_dir_all(&not_a_checkout).unwrap();
+        let skipped = session_workspace_root_from(None, None, &not_a_checkout);
+        assert_ne!(skipped.kind, WorkspaceRootKind::SessionRepoParent);
     }
 }
