@@ -12747,8 +12747,9 @@ impl std::fmt::Display for SpawnTenantRefusal {
                     "{code}: {} declares a coord-mcp server, which this session would use \
                      instead of a credential for tenant {tenant}, and its key {resolves} — \
                      refusing the spawn. Spawn it in a directory whose .mcp.json declares no \
-                     coord-mcp (a freshly allocated worktree via intent_repo does this; one \
-                     reused from an earlier session may carry that session's), or without a tenant",
+                     coord-mcp or one keyed to tenant {tenant} (a freshly allocated worktree via \
+                     intent_repo gets such a key; one reused from an earlier session may keep \
+                     that session's), or without a tenant",
                     declared_file.display()
                 )
             }

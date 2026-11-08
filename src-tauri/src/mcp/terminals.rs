@@ -443,6 +443,16 @@ pub async fn create_terminal_handler(
     )
     .map_err(edit_sibling_bad_request)?;
 
+    // The resource guard's CRITICAL verdict, judged before the allocation for
+    // the same reason as `commands::terminal::terminal_create` judges it: the
+    // seam's `admit_spawn` decides it only after `acquire_for_terminal` has run
+    // a `git worktree add`, and a refusal there leaves that worktree on disk.
+    // This door answers that refusal with a retryable 503, so without this
+    // check every retry against a box at CRITICAL would leave one more tree.
+    // `false`: this door never overrides the floor (see the create call below).
+    crate::resource_guard::precheck_spawn("terminal session", false)
+        .map_err(terminal_spawn_failed)?;
+
     // Phase 2 round 2 — route through the shared `acquire_for_terminal`
     // helper so this entry point matches the other five
     // terminal_manager.create call sites. `intent_repo == None` is a
