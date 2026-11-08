@@ -17,22 +17,31 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const ACTING = "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a";
+// Per-test switch for the device's multi-tenant flag (`useTenant().showSwitcher`).
+const tenantFlag = vi.hoisted(() => ({ showSwitcher: true }));
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(() => new Promise(() => {})) }));
-vi.mock("@/contexts/TenantContext", () => ({ useTenant: () => ({ showSwitcher: true }) }));
+vi.mock("@/contexts/TenantContext", () => ({
+  useTenant: () => ({ showSwitcher: tenantFlag.showSwitcher }),
+}));
 vi.mock("./useSessionInfo", async (orig) => ({
   ...(await orig<typeof import("./useSessionInfo")>()),
-  useSessionInfo: () => ({
-    body: {
-      tenancy: {
-        row: { tenantId: null },
-        diverged: false,
-        divergence: "agree",
-        credential: { status: "resolved", tenantId: ACTING },
-        dataPlane: { status: "resolved", tenantId: ACTING },
-        display: { status: "resolved", tenantId: ACTING, source: "credential" },
-      },
-    },
+  // The real hook reads nothing for an undefined session id (the badge passes
+  // `undefined` when there is no Claude session, or when the switcher is hidden).
+  useSessionInfo: (claudeSessionId?: string) => ({
+    body:
+      claudeSessionId === undefined
+        ? null
+        : {
+            tenancy: {
+              row: { tenantId: null },
+              diverged: false,
+              divergence: "agree",
+              credential: { status: "resolved", tenantId: ACTING },
+              dataPlane: { status: "resolved", tenantId: ACTING },
+              display: { status: "resolved", tenantId: ACTING, source: "credential" },
+            },
+          },
   }),
 }));
 
@@ -42,6 +51,7 @@ let container: HTMLDivElement;
 let root: Root;
 
 beforeEach(() => {
+  tenantFlag.showSwitcher = true;
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
   container = document.createElement("div");
   document.body.appendChild(container);
@@ -90,5 +100,40 @@ describe("TenantBadge per-zone identity", () => {
     expect(container.querySelector('[data-ui-bridge-id="terminal.tenant-badge"]')).toBeNull();
     expect(container.querySelector('[data-testid="tenant-badge"]')).toBeNull();
     expect(container.innerHTML).not.toContain("terminal.tenant-badge");
+  });
+});
+
+/**
+ * The no-session chain the single-zone strip relies on (plan D2): a stamped
+ * plain shell has no Claude session, so the badge has no tenancy to read and
+ * must render from its spawn stamp alone — and only on a multi-tenant device.
+ * `ZoneCell` opens the strip for exactly this case, so a badge that rendered
+ * nothing here would leave an empty strip.
+ */
+describe("TenantBadge with no Claude session (stamped plain shell)", () => {
+  function renderShell(): void {
+    act(() => {
+      root.render(createElement(TenantBadge, { tenantId: ACTING, zoneIndex: 0 }));
+    });
+  }
+
+  it("renders from the spawn stamp on a multi-tenant device", () => {
+    renderShell();
+    const badge = container.querySelector('[data-ui-bridge-id="terminal-tenant-badge-0"]');
+    expect(badge).not.toBeNull();
+    expect(badge?.getAttribute("data-tenant-id")).toBe(ACTING);
+  });
+
+  it("renders nothing on a single-binding device", () => {
+    tenantFlag.showSwitcher = false;
+    renderShell();
+    expect(container.innerHTML).toBe("");
+  });
+
+  it("renders nothing with neither a stamp nor a session", () => {
+    act(() => {
+      root.render(createElement(TenantBadge, { zoneIndex: 0 }));
+    });
+    expect(container.innerHTML).toBe("");
   });
 });
