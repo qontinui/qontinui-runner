@@ -1491,13 +1491,22 @@ async fn connect_and_pump(
     info!("agent_runtime: WS connected for device_id={device_id}");
 
     // Fix (c2): on every fresh connect, replay any gate-continuation dispatches
-    // coord persisted while we were disconnected. Best-effort — a poll failure
-    // must never abort the pump (the live WS subscription proceeds regardless).
-    poll_pending_continuations(device_id).await;
-    // Work-unit DAG replay backstop: same reconnect tick, back-to-back. Replays
-    // any unit dispatches coord persisted while we were disconnected (keyed on
-    // dispatch_id). Best-effort, same warn-and-continue posture.
-    poll_pending_unit_dispatches(device_id).await;
+    // coord persisted while we were disconnected, then (same tick, back-to-back)
+    // any work-unit dispatches, keyed on dispatch_id. Best-effort: a poll failure
+    // must never abort the pump.
+    //
+    // SPAWNED, not awaited. A large pending list can take the whole
+    // [`PENDING_LIST_FETCH_TIMEOUT`], and nothing below this point runs
+    // until the replay returns: not the keepalive, so the ALB's ~60 s idle timer
+    // (see [`KEEPALIVE_INTERVAL_SECS`]) would be running against this replay, and
+    // not `ws.next()`, so live frames would wait behind it. A frame and a poll
+    // racing for one gate is the ordinary case the in-process claim already
+    // arbitrates, and the capacity-kick re-poll spawns this same pair.
+    //
+    // Coalesced across reconnects ([`start_connect_replay`]): a WS flap that
+    // reconnects while a replay is still running asks it for one more pass
+    // instead of stacking a second pull of the same list on one slow link.
+    start_connect_replay(device_id);
 
     let mut keepalive = tokio::time::interval(Duration::from_secs(KEEPALIVE_INTERVAL_SECS));
     keepalive.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -2107,7 +2116,7 @@ fn spawn_run_task(payload: LaunchPayload) {
 /// `{"pending": [{"gate_id", "payload": {…}, "dispatched_at"}], "total": N}`,
 /// where `payload` is the EXACT spawn-payload object coord publishes on the WS
 /// channel (same shape [`GateContinuationPayload`] parses, now carrying
-/// `gate_id`). Rows are dispatched-but-unconsumed within the last 24h.
+/// `gate_id`). Rows are dispatched-but-unconsumed within coord's replay window.
 #[derive(Debug, Clone, Deserialize)]
 struct PendingContinuation {
     gate_id: uuid::Uuid,
@@ -5526,11 +5535,180 @@ enum DispatchOutcome {
     Denied,
 }
 
+/// The whole-request bound on one pending-list pull (gate continuations, and
+/// work-unit dispatches), BODY INCLUDED (`RequestBuilder::timeout` runs until
+/// the body has been read).
+///
+/// The continuation list has no fixed size. Coord returns every
+/// dispatched-but-unconsumed row in the replay window, each carrying its full
+/// spawn payload, so the list grows exactly when continuations are not being
+/// consumed. And the list is not the only factor: the link is. On merytshost
+/// (device eb2155ed) at about 17:00 UTC on 2026-11-02, a curl of this route
+/// (coord finding 92333ba0-e0c8-4158-9118-844f0b6e3d20) returned 193 rows,
+/// 636 KB, in 9.9-12.7 s at about 50 KB/s. That was inside the window, about
+/// 15:00 to 20:00 UTC, when the runner's own pulls kept failing: that day's log
+/// holds 98
+/// `pending-continuations parse failed (continuing): error decoding response
+/// body` lines (the former 5 s bound failing a pull mid-body, reported as a
+/// decode error) beside 148 successful listings of 241-419 rows, nearly all
+/// outside the window. Lists of 191-192 rows fit under 5 s on 2026-11-04. So
+/// link speed, not list size alone, decided whether a pull fit, and when it did
+/// not, the replay backstop went dark.
+///
+/// Sized against that tail with room to grow, and still well under the 300 s
+/// backstop cadence ([`CONTINUATION_BACKSTOP_POLL_SECS_DEFAULT`]). A failure is
+/// still only a missed poll, retried on the next tick.
+const PENDING_LIST_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Coalesces the on-connect replay across reconnects. A WS flap reconnects on a
+/// 2 s doubling backoff. Unguarded, each connect would start its own pull of the
+/// same list: the pulls split one slow link, each is more likely to hit the
+/// bound, and the last to finish (possibly a `fetch_failed` one) overwrites
+/// coord's per-device poll report. A plain skip would be worse: a row coord
+/// dispatched while the WS was down is missing from the list a running replay
+/// already took, so a connect that arrives mid-replay asks for one more pass
+/// rather than none.
+///
+/// Only the on-connect replay goes through it. The backstop loop, the
+/// capacity-kick re-poll and the runtime-ready catch-up still call the polls
+/// directly and can overlap a replay, as they always could.
+struct ReplayCoalescer {
+    in_flight: std::sync::atomic::AtomicBool,
+    rerun: std::sync::atomic::AtomicBool,
+}
+
+impl ReplayCoalescer {
+    const fn new() -> Self {
+        Self {
+            in_flight: std::sync::atomic::AtomicBool::new(false),
+            rerun: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// A connect asks for a replay. `true`: the caller starts one. `false`: one
+    /// is running, and it will make another pass for this request.
+    fn request(&self) -> bool {
+        self.rerun.store(true, Ordering::SeqCst);
+        self.in_flight
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+
+    /// The running replay asks whether a pass is owed (and consumes the request).
+    fn take_pass(&self) -> bool {
+        self.rerun.swap(false, Ordering::SeqCst)
+    }
+
+    /// The running replay found no pass owed. It releases the flag and then looks
+    /// once more: a request made after its last `take_pass` found the flag still
+    /// held and returned `false`, so it must not be dropped. `true`: the replay
+    /// took the flag back and keeps running.
+    fn release(&self) -> bool {
+        self.in_flight.store(false, Ordering::SeqCst);
+        self.rerun.load(Ordering::SeqCst)
+            && self
+                .in_flight
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+    }
+
+    /// A replay that panicked gives the flag up, so the next connect can start one.
+    fn abandon(&self) {
+        self.in_flight.store(false, Ordering::SeqCst);
+    }
+}
+
+static CONNECT_REPLAY: ReplayCoalescer = ReplayCoalescer::new();
+
+/// Replay what coord persisted while this runner was disconnected: the
+/// gate-continuation list, then the work-unit dispatches. SPAWNED, never
+/// awaited by the pump, and coalesced through [`CONNECT_REPLAY`].
+fn start_connect_replay(device_id: uuid::Uuid) {
+    if !CONNECT_REPLAY.request() {
+        debug!(
+            "agent_runtime: on-connect replay for device_id={device_id} coalesced into the \
+             one still running (it makes another pass)"
+        );
+        return;
+    }
+    tokio::spawn(async move {
+        // Gives the flag up when the task unwinds (a poll panicked) or is dropped
+        // at runtime shutdown; a normal exit releases it below instead.
+        struct AbandonOnPanic;
+        impl Drop for AbandonOnPanic {
+            fn drop(&mut self) {
+                CONNECT_REPLAY.abandon();
+            }
+        }
+        let on_panic = AbandonOnPanic;
+        loop {
+            while CONNECT_REPLAY.take_pass() {
+                poll_pending_continuations(device_id).await;
+                poll_pending_unit_dispatches(device_id).await;
+            }
+            if !CONNECT_REPLAY.release() {
+                break;
+            }
+        }
+        std::mem::forget(on_panic);
+    });
+}
+
+/// Why a pending-list pull failed. A non-2xx status is kept as a status so a
+/// caller can treat one (a 404 from an undeployed route) differently; every
+/// other failure is the sentence the caller logs.
+#[derive(Debug)]
+enum PendingListFetchError {
+    Status(reqwest::StatusCode),
+    Failed(String),
+}
+
+impl std::fmt::Display for PendingListFetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Status(status) => write!(f, "GET returned {status}"),
+            Self::Failed(why) => f.write_str(why),
+        }
+    }
+}
+
+/// Pull and decode one pending list (gate continuations or work-unit
+/// dispatches). It separates a body that could not be READ (a timeout mid-body:
+/// the list is too large for the bound or the link) from one that was read and
+/// does not PARSE (a contract break): `resp.json()` reports both as `error
+/// decoding response body`, and those two call for different fixes.
+async fn fetch_pending_list<T: serde::de::DeserializeOwned>(
+    client: &reqwest::Client,
+    url: &str,
+    timeout: Duration,
+) -> Result<T, PendingListFetchError> {
+    let resp = client
+        .get(url)
+        .timeout(timeout)
+        .send()
+        .await
+        .map_err(|e| PendingListFetchError::Failed(format!("GET failed: {e:#}")))?;
+    if !resp.status().is_success() {
+        return Err(PendingListFetchError::Status(resp.status()));
+    }
+    let body = resp.bytes().await.map_err(|e| {
+        let why = if e.is_timeout() {
+            format!("timed out at the {}s bound", timeout.as_secs_f32())
+        } else {
+            "connection failed".to_string()
+        };
+        PendingListFetchError::Failed(format!("body read failed ({why}): {e:#}"))
+    })?;
+    serde_json::from_slice(&body).map_err(|e| {
+        PendingListFetchError::Failed(format!("parse failed ({} bytes): {e:#}", body.len()))
+    })
+}
+
 /// Poll coord for gate-continuation dispatches that landed while this runner was
 /// disconnected, and replay any we haven't already dispatched (Fix (c2)).
 ///
 /// `GET <coord_http_base>/coord/agents/pending-continuations?device_id=<uuid>`
-/// returns the dispatched-but-unconsumed rows from the last 24h. For each row we
+/// returns the dispatched-but-unconsumed rows in coord's replay window. For each row we
 /// stamp the row's `gate_id` onto the parsed payload (so the shared dispatch
 /// seam can dedupe + ack it) and route it through [`dispatch_gate_continuation`],
 /// which dedupes against the in-process set, spawns the continuation, and acks
@@ -5555,35 +5733,15 @@ async fn poll_pending_continuations(device_id: uuid::Uuid) {
         post_continuation_poll_report(device_id, PollRunCounts::fetch_failure()).await;
         return;
     };
-    let resp = match client
-        .get(&url)
-        .timeout(Duration::from_secs(5))
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            warn!("agent_runtime: pending-continuations GET failed (continuing): {e:#}");
-            post_continuation_poll_report(device_id, PollRunCounts::fetch_failure()).await;
-            return;
-        }
-    };
-    if !resp.status().is_success() {
-        warn!(
-            "agent_runtime: pending-continuations GET returned {} (continuing)",
-            resp.status()
-        );
-        post_continuation_poll_report(device_id, PollRunCounts::fetch_failure()).await;
-        return;
-    }
-    let body: PendingContinuationsResponse = match resp.json().await {
-        Ok(b) => b,
-        Err(e) => {
-            warn!("agent_runtime: pending-continuations parse failed (continuing): {e:#}");
-            post_continuation_poll_report(device_id, PollRunCounts::fetch_failure()).await;
-            return;
-        }
-    };
+    let body: PendingContinuationsResponse =
+        match fetch_pending_list(client, &url, PENDING_LIST_FETCH_TIMEOUT).await {
+            Ok(b) => b,
+            Err(why) => {
+                warn!("agent_runtime: pending-continuations {why} (continuing)");
+                post_continuation_poll_report(device_id, PollRunCounts::fetch_failure()).await;
+                return;
+            }
+        };
     if body.pending.is_empty() {
         debug!("agent_runtime: pending-continuations poll: none pending for device_id={device_id}");
         // Still self-report: a zero-listed report every tick is the liveness
@@ -5836,41 +5994,26 @@ async fn poll_pending_unit_dispatches(device_id: uuid::Uuid) {
         warn!("agent_runtime: pending-unit-dispatches: no shared coord client");
         return;
     };
-    let resp = match client
-        .get(&url)
-        .timeout(Duration::from_secs(5))
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            warn!("agent_runtime: pending-unit-dispatches GET failed (continuing): {e:#}");
-            return;
-        }
-    };
-    if !resp.status().is_success() {
-        // A 404 is expected until coord's Phase 2 endpoint is deployed — log at
-        // debug for that, warn for anything else.
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            debug!(
-                "agent_runtime: pending-unit-dispatches GET 404 (endpoint not deployed yet; \
-                 continuing)"
-            );
-        } else {
-            warn!(
-                "agent_runtime: pending-unit-dispatches GET returned {} (continuing)",
-                resp.status()
-            );
-        }
-        return;
-    }
-    let body: PendingUnitDispatchesResponse = match resp.json().await {
-        Ok(b) => b,
-        Err(e) => {
-            warn!("agent_runtime: pending-unit-dispatches parse failed (continuing): {e:#}");
-            return;
-        }
-    };
+    // The same bound as the gate-continuation pull, body included. The former
+    // 5 s bound failed this pull 29 times on merytshost on 2026-11-02 (27
+    // `GET failed`, 2 `error decoding response body`), on the same slow link.
+    let body: PendingUnitDispatchesResponse =
+        match fetch_pending_list(client, &url, PENDING_LIST_FETCH_TIMEOUT).await {
+            Ok(b) => b,
+            // A 404 is expected until coord's Phase 2 endpoint is deployed — log at
+            // debug for that, warn for anything else.
+            Err(PendingListFetchError::Status(reqwest::StatusCode::NOT_FOUND)) => {
+                debug!(
+                    "agent_runtime: pending-unit-dispatches GET 404 (endpoint not deployed \
+                     yet; continuing)"
+                );
+                return;
+            }
+            Err(why) => {
+                warn!("agent_runtime: pending-unit-dispatches {why} (continuing)");
+                return;
+            }
+        };
     if body.pending.is_empty() {
         debug!(
             "agent_runtime: pending-unit-dispatches poll: none pending for device_id={device_id}"
@@ -11698,6 +11841,207 @@ async fn report_launch_deferral(agent_id: uuid::Uuid, reason: &str) {
 
 #[cfg(test)]
 mod tests {
+    /// Serve one HTTP response, `head` then `tail` after `gap`, on an ephemeral
+    /// port, and return its URL.
+    async fn serve_in_two_parts(
+        status: &'static str,
+        head: &'static str,
+        tail: &'static str,
+        gap: std::time::Duration,
+    ) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("accept");
+            let mut request = [0u8; 2048];
+            let _ = sock.read(&mut request).await;
+            let headers = format!(
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                head.len() + tail.len()
+            );
+            let _ = sock.write_all(headers.as_bytes()).await;
+            let _ = sock.write_all(head.as_bytes()).await;
+            let _ = sock.flush().await;
+            tokio::time::sleep(gap).await;
+            let _ = sock.write_all(tail.as_bytes()).await;
+            let _ = sock.flush().await;
+        });
+        format!("http://{addr}/coord/agents/pending-continuations")
+    }
+
+    /// The 2026-11-02 shape: the status line answers at once and the BODY takes
+    /// longer than the bound. The bound must cover the body, and running out of
+    /// it must read as a body that could not be read, naming the bound, never as
+    /// a parse failure. Given enough time, the same response decodes.
+    #[tokio::test]
+    async fn a_pending_list_slower_than_the_bound_is_a_body_read_failure_not_a_parse_failure() {
+        // The bound also covers connect and headers, so it needs room on a loaded
+        // box: too tight and this reads as `GET failed` instead of testing the body.
+        let client = reqwest::Client::new();
+        let (head, tail) = (r#"{"pending":[],"#, r#""total":0}"#);
+
+        let url =
+            serve_in_two_parts("200 OK", head, tail, std::time::Duration::from_secs(30)).await;
+        let err = super::fetch_pending_list::<super::PendingContinuationsResponse>(
+            &client,
+            &url,
+            std::time::Duration::from_secs(3),
+        )
+        .await
+        .expect_err("the body outlasts the bound")
+        .to_string();
+        assert!(err.contains("body read failed"), "{err}");
+        assert!(err.contains("timed out at the 3s bound"), "{err}");
+        assert!(!err.contains("parse failed"), "{err}");
+
+        let url =
+            serve_in_two_parts("200 OK", head, tail, std::time::Duration::from_millis(600)).await;
+        let body: super::PendingContinuationsResponse =
+            super::fetch_pending_list(&client, &url, std::time::Duration::from_secs(60))
+                .await
+                .expect("the same response decodes once it has time to arrive");
+        assert!(body.pending.is_empty());
+    }
+
+    /// The on-connect replay must not hold up the pump: nothing after it runs
+    /// until it returns, keepalive included, and a large list can take the whole
+    /// fetch bound against the ALB's ~60 s idle timer. A behavioural test would
+    /// need a live WS peer, so this pins the wiring in the source, as
+    /// `the_live_pre_checks_read_both_resource_lanes` does: the pump, up to its
+    /// `loop {`, starts the replay and awaits no poll, and the replay spawns both
+    /// polls inside its task, coalesced through `CONNECT_REPLAY`.
+    #[test]
+    fn the_pending_list_replay_on_connect_is_spawned_not_awaited() {
+        let source = include_str!("agent_runtime.rs");
+        let (prod, _) = source
+            .split_once("#[cfg(test)]\nmod tests")
+            .expect("the test module marker");
+        let (_, pump) = prod
+            .split_once("async fn connect_and_pump(")
+            .expect("connect_and_pump exists");
+        let (before_loop, _) = pump
+            .split_once("\n    loop {")
+            .expect("the pump has its loop");
+        assert!(
+            before_loop.contains("start_connect_replay(device_id);"),
+            "the pump starts the replay: {before_loop}"
+        );
+        assert!(
+            !before_loop.contains("poll_pending_"),
+            "a poll awaited by the pump holds it up: {before_loop}"
+        );
+        let (_, starter) = prod
+            .split_once("fn start_connect_replay(")
+            .expect("start_connect_replay exists");
+        let (starter, _) = starter
+            .split_once("\n}\n")
+            .expect("the starter's body ends");
+        let (before_spawn, spawned) = starter
+            .split_once("tokio::spawn(async move {")
+            .expect("the replay is spawned");
+        assert!(
+            before_spawn.contains("CONNECT_REPLAY.request()"),
+            "the replay is coalesced across reconnects: {before_spawn}"
+        );
+        assert!(!before_spawn.contains("poll_pending_"), "{before_spawn}");
+        assert!(
+            spawned.contains("poll_pending_continuations(device_id).await"),
+            "{spawned}"
+        );
+        assert!(
+            spawned.contains("poll_pending_unit_dispatches(device_id).await"),
+            "{spawned}"
+        );
+    }
+
+    /// A connect that arrives while a replay runs asks it for one more pass, and
+    /// that request is kept even when it lands between the replay's last
+    /// `take_pass` and its release. A dropped request would leave a row coord
+    /// dispatched while the WS was down waiting for the 300 s backstop.
+    #[test]
+    fn a_connect_during_a_replay_gets_one_more_pass_not_none() {
+        let c = super::ReplayCoalescer::new();
+        assert!(c.request(), "the first connect starts the replay");
+        assert!(!c.request(), "a second connect coalesces into it");
+        assert!(c.take_pass(), "one pass serves both requests");
+        assert!(!c.take_pass());
+        assert!(!c.release(), "nothing asked since: the replay ends");
+
+        assert!(
+            c.request(),
+            "the flag was released: the next connect starts one"
+        );
+        assert!(c.take_pass());
+        assert!(!c.take_pass());
+        assert!(
+            !c.request(),
+            "arrives after the last take_pass, flag still held"
+        );
+        assert!(
+            c.release(),
+            "the replay takes the flag back instead of ending"
+        );
+        assert!(c.take_pass(), "and makes the pass that connect asked for");
+        assert!(!c.take_pass());
+        assert!(!c.release());
+
+        assert!(c.request());
+        c.abandon();
+        assert!(c.request(), "a panicked replay gives the flag up");
+    }
+
+    /// A complete body that does not decode is a contract break, and reads as
+    /// one; a non-2xx is reported by its status, without reading a body at all.
+    #[tokio::test]
+    async fn a_pending_list_that_arrives_malformed_or_refused_says_which() {
+        let client = reqwest::Client::new();
+        let quick = std::time::Duration::from_millis(1);
+        let bound = std::time::Duration::from_secs(10);
+
+        let url = serve_in_two_parts("200 OK", "not ", "json", quick).await;
+        let err =
+            super::fetch_pending_list::<super::PendingContinuationsResponse>(&client, &url, bound)
+                .await
+                .expect_err("malformed")
+                .to_string();
+        assert!(err.contains("parse failed (8 bytes)"), "{err}");
+
+        let url = serve_in_two_parts("503 Service Unavailable", "busy", "", quick).await;
+        let err =
+            super::fetch_pending_list::<super::PendingUnitDispatchesResponse>(&client, &url, bound)
+                .await
+                .expect_err("refused");
+        assert!(
+            matches!(
+                err,
+                super::PendingListFetchError::Status(reqwest::StatusCode::SERVICE_UNAVAILABLE)
+            ),
+            "a status stays a status, so the unit poll can tell a 404 apart: {err}"
+        );
+        assert!(err.to_string().contains("GET returned 503"), "{err}");
+    }
+
+    /// The bound has to clear the measured slow tail (193 rows, 636 KB, 12.7 s on
+    /// merytshost at about 17:00 UTC on 2026-11-02) with room to grow, and must
+    /// stay well under the backstop cadence so one slow pull cannot occupy the
+    /// whole interval. Put back at the former 5 s, this goes red.
+    #[test]
+    fn the_pending_list_bound_clears_the_measured_tail() {
+        let bound = super::PENDING_LIST_FETCH_TIMEOUT.as_secs();
+        assert!(
+            bound >= 2 * 13,
+            "{bound}s does not clear twice the measured 13 s pull"
+        );
+        assert!(
+            bound * 5 <= super::CONTINUATION_BACKSTOP_POLL_SECS_DEFAULT,
+            "{bound}s is too long against the {}s cadence",
+            super::CONTINUATION_BACKSTOP_POLL_SECS_DEFAULT
+        );
+    }
+
     #[test]
     fn append_sibling_notes_lists_each_note_and_leaves_empty_alone() {
         assert_eq!(super::append_sibling_notes("CTX".to_string(), &[]), "CTX");
