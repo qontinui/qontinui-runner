@@ -67,9 +67,8 @@ impl SpawnGroup {
             })
     }
 
-    /// Every group, for the frontend-parity test.
-    #[cfg(test)]
-    const ALL: [Self; 8] = [
+    /// Every group.
+    pub(crate) const ALL: [Self; 8] = [
         Self::PostMerge,
         Self::Pr,
         Self::Impl,
@@ -142,6 +141,12 @@ impl SpawnGroup {
         }
         Self::Spawned
     }
+}
+
+/// Whether `page_id` is any group's typed page (`<prefix>-<n>`, `n >= 1`) —
+/// the Rust twin of the frontend's `isSpawnGroupPageId`.
+pub(crate) fn is_spawn_group_page(page_id: &str) -> bool {
+    SpawnGroup::ALL.iter().any(|g| g.owns_page(page_id))
 }
 
 /// Skills whose session is a one-shot repair.
@@ -238,7 +243,14 @@ impl Drop for PagePlacement {
     }
 }
 
-/// Choose and reserve the page for a new `group` terminal. `page_loads` yields
+/// Choose and reserve the page for a new `group` terminal.
+///
+/// Cost, accepted: the loads are read while the process-wide reservation lock
+/// is held, so concurrent typed spawns serialize behind one terminal list and
+/// one lifecycle-store read. That ordering is what keeps two spawns from both
+/// reading a page as having room (a create-and-release cannot slip between the
+/// read and the reservation); spawns are rare enough that the wait is small.
+/// `page_loads` yields
 /// per-page loads — at the call sites,
 /// [`page_placement::page_loads`](super::page_placement::page_loads), so rows
 /// awaiting restore count — of which only `group`'s own pages are kept. It is
@@ -425,6 +437,40 @@ mod tests {
         };
         let p = place(SpawnGroup::Resume, loads);
         assert_eq!(p.page_id(), "resume-2");
+    }
+
+    #[test]
+    fn any_groups_numbered_page_is_a_typed_page() {
+        assert!(is_spawn_group_page("post-merge-3"));
+        assert!(is_spawn_group_page("stewards-1"));
+        assert!(!is_spawn_group_page("default"));
+        assert!(!is_spawn_group_page("3f2b8c1e-9a4d-4e2f-b1c7-123456789012"));
+        assert!(!is_spawn_group_page("minted-1"));
+    }
+
+    #[test]
+    fn concurrent_placements_never_overfill_a_page() {
+        // A group no other test uses. One slot left on `spawned-1`: of eight
+        // racing placements exactly one takes it and the rest open `spawned-2`.
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    place(SpawnGroup::Spawned, || {
+                        vec![("spawned-1".to_string(), PAGE_ZONE_CEILING - 1)]
+                    })
+                })
+            })
+            .collect();
+        let placements: Vec<PagePlacement> =
+            handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let on_first = placements
+            .iter()
+            .filter(|p| p.page_id() == "spawned-1")
+            .count();
+        assert_eq!(on_first, 1);
+        assert!(placements
+            .iter()
+            .all(|p| p.page_id() == "spawned-1" || p.page_id() == "spawned-2"));
     }
 
     #[test]
