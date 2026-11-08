@@ -531,6 +531,7 @@ GET /task-runs/{id}/verification-phase-results get_task_run_verification_phase_r
 GET /task-runs/{id}/verification-results get_task_run_verification_results
 GET /task-runs/{id}/workflow-state get_workflow_state
 GET /tenant/active get_active_tenant
+GET /terminal-layout terminal_layout_handler
 GET /terminal-pages list_terminal_pages_handler
 GET /terminals list_terminals_handler
 GET /terminals/transport-stats get_transport_stats_handler
@@ -1007,6 +1008,7 @@ MERGE task_runs::routes
 MERGE tauri_audit::routes
 MERGE tauri_proxy::routes
 MERGE tenant::routes
+MERGE terminal_layout::routes
 MERGE terminals::routes
 MERGE terminals::routes
 MERGE test_fixtures::routes
