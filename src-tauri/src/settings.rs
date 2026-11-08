@@ -3916,6 +3916,17 @@ pub struct Settings {
     /// so a change is live with no runner restart.
     #[serde(default)]
     pub sessions: SessionsSettings,
+    /// Per-kind live caps on the runner's autonomous spawns, keyed by the
+    /// typed page prefix (`fixer`, `post-merge`, `pr`, `impl`, `resume`,
+    /// `checks`, `spawned`; plan
+    /// `2026-11-08-coord-fixers-open-terminal-tabs-and-spawn-kinds-are-capped`
+    /// Phase 3). OVERRIDES only: a key absent here keeps its compiled-in
+    /// default (`terminal::spawn_pages::default_spawn_cap` — fixer 6, the rest
+    /// 9), `0` makes that kind unlimited, and `stewards` is never capped. Read
+    /// on every admission through [`get_spawn_caps`], so a change is live with
+    /// no runner restart. A missing key loads as an empty map.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub spawn_caps: std::collections::HashMap<String, usize>,
     /// Ask the cloud memory endpoint (`POST /api/v1/memory/query`) for the
     /// link-expansion retrieval arm — the third RRF arm that one-hop-expands
     /// over `coord.memory_links` (plan
@@ -6807,6 +6818,21 @@ pub fn get_finished_session_close() -> Result<FinishedSessionClose, String> {
 /// Persist the `finished_close` arm's switch.
 pub fn save_finished_session_close(mode: FinishedSessionClose) -> Result<(), String> {
     update_settings(|settings| settings.sessions.finished_session_close = mode)
+}
+
+/// The operator's `spawn_caps` overrides (see [`Settings::spawn_caps`]).
+///
+/// Read through [`read_settings_from_disk`] (a cached parse) because every
+/// autonomous admission calls it. An unreadable `settings.json` yields NO
+/// overrides, which means the compiled-in defaults govern — a damaged file
+/// therefore never lifts a cap.
+pub fn get_spawn_caps() -> std::collections::HashMap<String, usize> {
+    let loaded = read_settings_from_disk();
+    if loaded.provenance.is_authoritative() {
+        loaded.settings.spawn_caps
+    } else {
+        std::collections::HashMap::new()
+    }
 }
 
 /// Get the cloud memory link-expansion arm flag. Default false — see

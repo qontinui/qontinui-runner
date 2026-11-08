@@ -221,14 +221,37 @@ pub(crate) fn pick_group_page(
         .expect("an unbounded range always yields a page with room")
 }
 
-/// Placements chosen but not yet visible in the terminal manager, per page.
+/// Admissions not yet visible in the terminal manager.
 ///
-/// A spawn path picks its page, then awaits (account selection, trust warm-up)
-/// before the terminal exists. Two spawns racing through that window would both
-/// read the same count and overfill one page; counting the reservation closes it.
-fn pending() -> &'static Mutex<HashMap<String, usize>> {
-    static PENDING: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
-    PENDING.get_or_init(|| Mutex::new(HashMap::new()))
+/// `pages`: placements chosen but not yet created, per page. A spawn path picks
+/// its page, then awaits (account selection, trust warm-up) before the terminal
+/// exists. Two spawns racing through that window would both read the same count
+/// and overfill one page; counting the reservation closes it.
+///
+/// `slots`: per-group admissions under the kind cap that hold NO page — a
+/// headless run for its whole life, and a terminal run between its admission
+/// and its placement (see [`KindSlot`]).
+#[derive(Default)]
+struct Reservations {
+    pages: HashMap<String, usize>,
+    slots: HashMap<SpawnGroup, usize>,
+}
+
+fn lock_pending() -> std::sync::MutexGuard<'static, Reservations> {
+    static PENDING: OnceLock<Mutex<Reservations>> = OnceLock::new();
+    PENDING
+        .get_or_init(|| Mutex::new(Reservations::default()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+fn decrement<K: std::hash::Hash + Eq>(map: &mut HashMap<K, usize>, key: &K) {
+    if let Some(n) = map.get_mut(key) {
+        *n = n.saturating_sub(1);
+        if *n == 0 {
+            map.remove(key);
+        }
+    }
 }
 
 /// A chosen page, reserved until the terminal is created. Release it (or drop
@@ -250,14 +273,43 @@ impl PagePlacement {
 
 impl Drop for PagePlacement {
     fn drop(&mut self) {
-        let mut map = pending().lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(n) = map.get_mut(&self.page_id) {
-            *n = n.saturating_sub(1);
-            if *n == 0 {
-                map.remove(&self.page_id);
-            }
+        decrement(&mut lock_pending().pages, &self.page_id);
+    }
+}
+
+/// `group`'s per-page counts: its pending page reservations plus the
+/// `page_loads` of its own `<prefix>-<n>` pages. Called under the lock.
+fn group_page_counts<I>(
+    group: SpawnGroup,
+    res: &Reservations,
+    page_loads: I,
+) -> HashMap<String, usize>
+where
+    I: IntoIterator<Item = (String, usize)>,
+{
+    let mut counts: HashMap<String, usize> = res
+        .pages
+        .iter()
+        .filter(|(id, _)| group.owns_page(id))
+        .map(|(id, n)| (id.clone(), *n))
+        .collect();
+    for (id, load) in page_loads {
+        if group.owns_page(&id) {
+            *counts.entry(id).or_insert(0) += load;
         }
     }
+    counts
+}
+
+/// Pick and reserve `group`'s page. Called under the lock.
+fn reserve_page<I>(group: SpawnGroup, res: &mut Reservations, page_loads: I) -> PagePlacement
+where
+    I: IntoIterator<Item = (String, usize)>,
+{
+    let counts = group_page_counts(group, res, page_loads);
+    let page_id = pick_group_page(group, &counts, PAGE_ZONE_CEILING);
+    *res.pages.entry(page_id.clone()).or_insert(0) += 1;
+    PagePlacement { page_id }
 }
 
 /// Choose and reserve the page for a new `group` terminal.
@@ -273,24 +325,166 @@ impl Drop for PagePlacement {
 /// awaiting restore count — of which only `group`'s own pages are kept. It is
 /// read UNDER the reservation lock, so a spawn that creates its terminal and
 /// releases its reservation cannot slip between this read and this reservation.
+///
+/// UNCAPPED. The kind cap is an admission taken earlier, by [`try_reserve`],
+/// and spent here by [`KindSlot::place`]; this door is for the spawns that are
+/// never capped (stewards, condition checks) and for the never-started retry of
+/// a spawn that was already admitted.
 pub(crate) fn place<I>(group: SpawnGroup, page_loads: impl FnOnce() -> I) -> PagePlacement
 where
     I: IntoIterator<Item = (String, usize)>,
 {
-    let mut map = pending().lock().unwrap_or_else(|e| e.into_inner());
-    let mut counts: HashMap<String, usize> = map
-        .iter()
-        .filter(|(id, _)| group.owns_page(id))
-        .map(|(id, n)| (id.clone(), *n))
-        .collect();
-    for (id, load) in page_loads() {
-        if group.owns_page(&id) {
-            *counts.entry(id).or_insert(0) += load;
+    let mut res = lock_pending();
+    reserve_page(group, &mut res, page_loads())
+}
+
+// =============================================================================
+// Per-kind live caps (plan
+// `2026-11-08-coord-fixers-open-terminal-tabs-and-spawn-kinds-are-capped`
+// Phase 3)
+// =============================================================================
+
+/// The default live cap for each group, before the operator's `spawn_caps`
+/// overrides. `None` = unlimited.
+pub(crate) fn default_spawn_cap(group: SpawnGroup) -> Option<usize> {
+    match group {
+        SpawnGroup::Fixer => Some(6),
+        SpawnGroup::PostMerge
+        | SpawnGroup::Pr
+        | SpawnGroup::Impl
+        | SpawnGroup::Resume
+        | SpawnGroup::Check
+        | SpawnGroup::Spawned => Some(9),
+        SpawnGroup::Steward => None,
+    }
+}
+
+/// The effective cap for `group` under the operator's `overrides` (settings
+/// `spawn_caps`, keyed by page prefix). An override replaces its own key's
+/// default only — a key absent from the map keeps the default — and `0` means
+/// unlimited. `stewards` is never capped whatever the map says: a steward is a
+/// singleton loop, and deferring one would stop a lane rather than bound it.
+pub(crate) fn effective_spawn_cap(
+    group: SpawnGroup,
+    overrides: &HashMap<String, usize>,
+) -> Option<usize> {
+    if group == SpawnGroup::Steward {
+        return None;
+    }
+    match overrides.get(group.page_prefix()) {
+        Some(0) => None,
+        Some(n) => Some(*n),
+        None => default_spawn_cap(group),
+    }
+}
+
+/// A refused admission: `group` already holds `count` live sessions against
+/// its `cap`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AtCap {
+    pub(crate) group: SpawnGroup,
+    pub(crate) count: usize,
+    pub(crate) cap: usize,
+}
+
+/// One admitted autonomous session of `group` that holds no page.
+///
+/// The count it adds is what makes the cap PER KIND rather than per tab: a
+/// headless run (a `LaunchPayload` without `presentation: terminal`, or a
+/// headless gate continuation) holds its slot for its whole life, so a headless
+/// fixer counts against the fixer cap exactly as a fixer tab does. A terminal
+/// run trades its slot for a page reservation with [`KindSlot::place`] — the
+/// two are swapped under one lock, so the session is counted continuously and
+/// never twice. Dropping the slot releases it.
+#[derive(Debug)]
+pub(crate) struct KindSlot {
+    group: SpawnGroup,
+}
+
+impl KindSlot {
+    /// Trade this slot for a page reservation on its group's pages (see
+    /// [`place`] for the loads). Uncapped: the slot was the admission.
+    pub(crate) fn place<I>(self, page_loads: impl FnOnce() -> I) -> PagePlacement
+    where
+        I: IntoIterator<Item = (String, usize)>,
+    {
+        let group = self.group;
+        let mut res = lock_pending();
+        let placement = reserve_page(group, &mut res, page_loads());
+        decrement(&mut res.slots, &group);
+        // The slot's count was just moved onto the page reservation; its own
+        // drop must not take it away a second time.
+        std::mem::forget(self);
+        placement
+    }
+}
+
+impl Drop for KindSlot {
+    fn drop(&mut self) {
+        decrement(&mut lock_pending().slots, &self.group);
+    }
+}
+
+/// `group`'s live count: the load on its pages (live terminals plus rows
+/// awaiting restore), its pending page reservations, and its page-less slots.
+/// Called under the lock.
+fn group_count<I>(group: SpawnGroup, res: &Reservations, page_loads: I) -> usize
+where
+    I: IntoIterator<Item = (String, usize)>,
+{
+    group_page_counts(group, res, page_loads)
+        .values()
+        .sum::<usize>()
+        + res.slots.get(&group).copied().unwrap_or(0)
+}
+
+/// Admit one more `group` session against `cap` (`None` = unlimited), or
+/// refuse with the count that filled it.
+///
+/// The count is read and the slot taken under the SAME lock [`place`] reserves
+/// under, with `page_loads` read inside it, so two concurrent admissions at
+/// `cap - 1` cannot both pass: the second one counts the first one's slot.
+pub(crate) fn try_reserve<I>(
+    group: SpawnGroup,
+    cap: Option<usize>,
+    page_loads: impl FnOnce() -> I,
+) -> Result<KindSlot, AtCap>
+where
+    I: IntoIterator<Item = (String, usize)>,
+{
+    let mut res = lock_pending();
+    if let Some(cap) = cap {
+        let count = group_count(group, &res, page_loads());
+        if count >= cap {
+            return Err(AtCap { group, count, cap });
         }
     }
-    let page_id = pick_group_page(group, &counts, PAGE_ZONE_CEILING);
-    *map.entry(page_id.clone()).or_insert(0) += 1;
-    PagePlacement { page_id }
+    *res.slots.entry(group).or_insert(0) += 1;
+    Ok(KindSlot { group })
+}
+
+/// Every group's live count and effective cap, for `GET /spawn-caps`. Read
+/// under the reservation lock, so it agrees with what [`try_reserve`] would
+/// count at the same instant.
+pub(crate) fn snapshot<I>(
+    overrides: &HashMap<String, usize>,
+    page_loads: impl FnOnce() -> I,
+) -> Vec<(SpawnGroup, usize, Option<usize>)>
+where
+    I: IntoIterator<Item = (String, usize)>,
+{
+    let res = lock_pending();
+    let loads: Vec<(String, usize)> = page_loads().into_iter().collect();
+    SpawnGroup::ALL
+        .iter()
+        .map(|&g| {
+            (
+                g,
+                group_count(g, &res, loads.iter().cloned()),
+                effective_spawn_cap(g, overrides),
+            )
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -563,5 +757,124 @@ mod tests {
         ts_prefixes.sort_unstable();
         rust_prefixes.sort_unstable();
         assert_eq!(ts_prefixes, rust_prefixes);
+    }
+
+    // ---- per-kind caps. Each test uses a group no placement test above uses,
+    // because the reservation ledger is process-global and tests run in
+    // parallel.
+
+    fn no_loads() -> Vec<(String, usize)> {
+        Vec::new()
+    }
+
+    #[test]
+    fn spawn_cap_defaults_and_overrides() {
+        let none = HashMap::new();
+        assert_eq!(effective_spawn_cap(SpawnGroup::Fixer, &none), Some(6));
+        for g in [
+            SpawnGroup::PostMerge,
+            SpawnGroup::Pr,
+            SpawnGroup::Impl,
+            SpawnGroup::Resume,
+            SpawnGroup::Check,
+            SpawnGroup::Spawned,
+        ] {
+            assert_eq!(effective_spawn_cap(g, &none), Some(9), "{g:?}");
+        }
+        // An override replaces only its own key; `0` is unlimited.
+        let o = counts(&[("fixer", 0), ("pr", 2)]);
+        assert_eq!(effective_spawn_cap(SpawnGroup::Fixer, &o), None);
+        assert_eq!(effective_spawn_cap(SpawnGroup::Pr, &o), Some(2));
+        assert_eq!(effective_spawn_cap(SpawnGroup::Impl, &o), Some(9));
+    }
+
+    #[test]
+    fn stewards_are_never_capped() {
+        assert_eq!(default_spawn_cap(SpawnGroup::Steward), None);
+        let o = counts(&[("stewards", 1)]);
+        assert_eq!(effective_spawn_cap(SpawnGroup::Steward, &o), None);
+        // So no load on their pages ever refuses one.
+        let full = || vec![("stewards-1".to_string(), 1000)];
+        let slot = try_reserve(
+            SpawnGroup::Steward,
+            effective_spawn_cap(SpawnGroup::Steward, &o),
+            full,
+        );
+        assert!(slot.is_ok());
+    }
+
+    #[test]
+    fn an_unlimited_cap_admits_any_load() {
+        let heavy = || vec![("post-merge-1".to_string(), 500)];
+        let slots: Vec<_> = (0..20)
+            .map(|_| try_reserve(SpawnGroup::PostMerge, None, heavy).expect("unlimited"))
+            .collect();
+        assert_eq!(slots.len(), 20);
+    }
+
+    #[test]
+    fn a_full_kind_is_refused_with_its_count_until_a_session_ends() {
+        // One live fixer tab on `fixer-1` (a different page's load and another
+        // group's page do not count), cap 2.
+        let loads = || {
+            vec![
+                ("fixer-1".to_string(), 1),
+                ("default".to_string(), 40),
+                ("pr-1".to_string(), 9),
+            ]
+        };
+        let first = try_reserve(SpawnGroup::Fixer, Some(2), loads).expect("1 < 2");
+        let refused = try_reserve(SpawnGroup::Fixer, Some(2), loads).unwrap_err();
+        assert_eq!(
+            refused,
+            AtCap {
+                group: SpawnGroup::Fixer,
+                count: 2,
+                cap: 2
+            }
+        );
+        drop(first);
+        assert!(try_reserve(SpawnGroup::Fixer, Some(2), loads).is_ok());
+    }
+
+    #[test]
+    fn a_slot_traded_for_a_page_is_counted_once_and_continuously() {
+        let slot = try_reserve(SpawnGroup::Impl, Some(1), no_loads).expect("empty kind");
+        assert!(try_reserve(SpawnGroup::Impl, Some(1), no_loads).is_err());
+        // Admission → placement: still exactly one.
+        let placement = slot.place(no_loads);
+        assert_eq!(placement.page_id(), "impl-1");
+        let refused = try_reserve(SpawnGroup::Impl, Some(1), no_loads).unwrap_err();
+        assert_eq!(refused.count, 1, "not double-counted across the trade");
+        // Placement → live terminal: the manager's load carries it.
+        placement.release();
+        let live = || vec![("impl-1".to_string(), 1)];
+        assert_eq!(
+            try_reserve(SpawnGroup::Impl, Some(1), live)
+                .unwrap_err()
+                .count,
+            1
+        );
+        // The session ends.
+        assert!(try_reserve(SpawnGroup::Impl, Some(1), no_loads).is_ok());
+    }
+
+    #[test]
+    fn concurrent_admissions_at_cap_minus_one_admit_exactly_one() {
+        // Two live `pr` tabs against a cap of 3: of eight racing admissions
+        // exactly one passes.
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    try_reserve(SpawnGroup::Pr, Some(3), || vec![("pr-1".to_string(), 2)])
+                })
+            })
+            .collect();
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+        assert!(results
+            .iter()
+            .filter_map(|r| r.as_ref().err())
+            .all(|e| e.count == 3 && e.cap == 3));
     }
 }

@@ -464,6 +464,7 @@ GET /shell-commands/{id} get_shell_command_handler
 GET /skills list_skills
 GET /skills/search search_skills
 GET /skills/{id} get_skill
+GET /spawn-caps spawn_caps
 GET /spawn-placement/preview preview_spawn_placement_route
 GET /spawn-placement/temp lookup_temp_spawn_placement
 GET /spawn-placement/temps list_temp_spawn_placements
