@@ -7,21 +7,42 @@
  * Expectations are literals (pids, image names, refusal reasons), never values
  * recomputed with the helper under test.
  *
- * Plan: `2026-11-08-tenant-badge-parity-and-oracle-fixtures` Phase 3.
+ * Plan: `2026-11-08-tenant-badge-parity-and-oracle-fixtures` Phases 3-4.
  */
 
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import {
+  KNOWN_LAUNCH_GATES,
+  accountInRoster,
+  buildFixtureTerminalRequest,
+  classifyTerminalSpawn,
+  deriveAccountName,
   imageBasename,
   isRunnerImage,
   killTargetRunner,
   listenerInodeForPort,
+  openResidue,
+  parseZoneViewState,
+  pickFixtureSessionId,
+  planMenuAnswer,
+  planRosterSeed,
+  planSpawnRetry,
   planTargetKill,
+  refusedGateIn,
   resolveTargetRunnerPid,
+  sameRoster,
   selfHostingVerdict,
+  terminalBufferText,
+  verifyRosterSeed,
+  zoneIndexOf,
 } from "../uibridge-session-info-lib.mjs";
+
+const HERE = dirname(fileURLToPath(import.meta.url));
 
 // ---------------------------------------------------------------------------
 // /proc/net/tcp fixtures. Port 9876 = 0x2694, 9877 = 0x2695.
@@ -482,4 +503,359 @@ describe("killTargetRunner", () => {
     assert.equal(r.ok, false);
     assert.match(r.detail, /ESRCH/);
   });
+});
+
+// ===========================================================================
+// Phase 4 — eval-free fixtures
+// ===========================================================================
+
+/**
+ * Claude Code v2.1.319 PTY bytes, captured 2026-11-08 and sanitised of host
+ * and path. Raw escape sequences are kept on purpose: the decoder is part of
+ * what these cases protect.
+ */
+const CAPS = JSON.parse(readFileSync(join(HERE, "fixtures", "uibridge-claude-gates.json"), "utf8"));
+const TRUST = KNOWN_LAUNCH_GATES.find((g) => g.id === "folder-trust");
+const MCP = KNOWN_LAUNCH_GATES.find((g) => g.id === "mcp-server");
+
+describe("terminalBufferText", () => {
+  test("cursor-column moves become spaces, so the menu reads as words", () => {
+    const t = terminalBufferText(CAPS.trustInitial);
+    assert.match(t, /Is this a project you created or one you trust\?/);
+    assert.match(t, /❯ No, exit\n Yes, I trust this folder/);
+    assert.doesNotMatch(t, /\x1b/);
+  });
+  test("a redraw after Down appends the moved cursor on one line", () => {
+    assert.match(terminalBufferText(CAPS.trustAfterDown), /No, exit ❯ Yes, I trust this folder/);
+  });
+  test("OSC sequences (shell marks, window titles) are dropped whole", () => {
+    assert.equal(terminalBufferText("a\x1b]633;P;Cwd=/x\x07b\x1b]0;title\x07c"), "abc");
+  });
+});
+
+describe("planMenuAnswer", () => {
+  test("trust: the cursor opens on 'No, exit', so ONE Down — never Enter", () => {
+    const plan = planMenuAnswer(terminalBufferText(CAPS.trustInitial), TRUST);
+    assert.deepEqual(plan, { action: "move", keys: ["\x1b[B"], cursor: "No, exit" });
+  });
+  test("trust: after the Down the re-read shows the cursor on the target, so Enter", () => {
+    const plan = planMenuAnswer(terminalBufferText(CAPS.trustAfterDown), TRUST, {
+      afterMove: true,
+    });
+    assert.deepEqual(plan, { action: "confirm", keys: ["\r"], cursor: "Yes, I trust this folder" });
+  });
+  test("MCP: the default cursor is already on 'Continue without…', so Enter at once", () => {
+    const plan = planMenuAnswer(terminalBufferText(CAPS.mcpInitial), MCP);
+    assert.deepEqual(plan, {
+      action: "confirm",
+      keys: ["\r"],
+      cursor: "Continue without using this MCP server",
+    });
+  });
+  test("a cursor not on the target after the arrows is refused, Enter withheld", () => {
+    // The Down never landed: the re-read still shows the first render.
+    const plan = planMenuAnswer(terminalBufferText(CAPS.trustInitial), TRUST, {
+      afterMove: true,
+    });
+    assert.equal(plan.action, "refuse");
+    assert.match(plan.reason, /cursor is on 'No, exit', not 'Yes, I trust this folder'/);
+  });
+  test("an unrecognised menu (an option renamed) is refused, not guessed", () => {
+    const changed = terminalBufferText(CAPS.trustInitial).replace(
+      "Yes, I trust this folder",
+      "Yes, proceed",
+    );
+    const plan = planMenuAnswer(changed, TRUST);
+    assert.equal(plan.action, "refuse");
+    assert.match(plan.reason, /unrecognised menu/);
+    assert.match(plan.reason, /'Yes, I trust this folder'/);
+  });
+  test("a menu with no cursor glyph is refused", () => {
+    const plan = planMenuAnswer(terminalBufferText(CAPS.trustInitial).replace("❯", " "), TRUST);
+    assert.equal(plan.action, "refuse");
+    assert.match(plan.reason, /no ❯ cursor/);
+  });
+  test("the cursor on a line that is no option is refused", () => {
+    const tail = `${terminalBufferText(CAPS.mcpInitial)}\n ❯ something else\n`;
+    const plan = planMenuAnswer(tail, MCP);
+    assert.equal(plan.action, "refuse");
+    assert.match(plan.reason, /cursor is on 'something else'/);
+  });
+  test("an already-answered gate in scrollback is not answered again", () => {
+    const all = terminalBufferText(CAPS.trustAfterDown + CAPS.mcpInitial + CAPS.bannerAfterGates);
+    // Recorded as answered by the caller:
+    assert.deepEqual(planMenuAnswer(all, MCP, { answered: new Set(["mcp-server"]) }), {
+      action: "none",
+      reason: "mcp-server already answered",
+    });
+    // And by the tail alone: a later gate was drawn after the trust menu.
+    const trust = planMenuAnswer(all, TRUST);
+    assert.equal(trust.action, "none");
+    assert.match(trust.reason, /folder-trust is scrollback: mcp-server was drawn after it/);
+  });
+  test("a gate that is not showing is none", () => {
+    assert.equal(planMenuAnswer("$ ls\n", TRUST).action, "none");
+  });
+  test("the external CLAUDE.md imports gate stays refused", () => {
+    const r = refusedGateIn("Allow external CLAUDE.md file imports?\n ❯ Yes\n No");
+    assert.equal(r?.id, "external-claude-md-imports");
+    assert.equal(refusedGateIn(terminalBufferText(CAPS.trustInitial)), null);
+  });
+});
+
+describe("buildFixtureTerminalRequest", () => {
+  test("M1: a bare 'claude', account-pinned by the runner", () => {
+    assert.deepEqual(
+      buildFixtureTerminalRequest({
+        pageId: "page-1",
+        title: "uibridge-fixture-a",
+        fixtureCwd: "/tmp/qontinui-uibridge-fixtures-x",
+        account: "tiohorst",
+      }),
+      {
+        page_id: "page-1",
+        title: "uibridge-fixture-a",
+        working_dir: "/tmp/qontinui-uibridge-fixtures-x",
+        account: "tiohorst",
+        initial_command: "claude",
+      },
+    );
+  });
+});
+
+describe("pickFixtureSessionId", () => {
+  const rows = [
+    { claudeSessionId: "s-other", terminalId: "t-9", origin: "authoritative", confirmed: true },
+    { claudeSessionId: "s-1", terminalId: "t-1", origin: "authoritative", confirmed: true },
+  ];
+  test("one row for the terminal -> its session id", () => {
+    const r = pickFixtureSessionId(rows, "t-1");
+    assert.equal(r.ok, true);
+    assert.equal(r.sessionId, "s-1");
+  });
+  test("no row yet -> pending, not an error", () => {
+    const r = pickFixtureSessionId(rows, "t-2");
+    assert.equal(r.ok, false);
+    assert.equal(r.pending, true);
+  });
+  test("two rows for one terminal -> refused, naming both", () => {
+    const r = pickFixtureSessionId(
+      [...rows, { claudeSessionId: "s-phantom", terminalId: "t-1", origin: "observed" }],
+      "t-1",
+    );
+    assert.equal(r.ok, false);
+    assert.equal(r.pending, false);
+    assert.match(r.error, /2 open records name terminal t-1/);
+    assert.match(r.error, /s-1/);
+    assert.match(r.error, /s-phantom/);
+  });
+});
+
+describe("parseZoneViewState", () => {
+  const full = {
+    maximizedZone: null,
+    zoneCount: 4,
+    layoutId: "quad",
+    pageId: "page-1",
+    assignments: { 0: "t-a", 1: "t-b", 2: "t-c" },
+    workMode: "grid",
+  };
+  test("present: page, grid map and mode are read", () => {
+    assert.deepEqual(parseZoneViewState(full, "b1"), {
+      ok: true,
+      view: {
+        pageId: "page-1",
+        assignments: { 0: "t-a", 1: "t-b", 2: "t-c" },
+        workMode: "grid",
+        zoneCount: 4,
+        layoutId: "quad",
+        maximizedZone: null,
+      },
+    });
+  });
+  test("absent pageId (today's envelope) refuses, naming the build", () => {
+    const r = parseZoneViewState(
+      { layoutId: "single", maximizedZone: null, zoneCount: 1 },
+      "1730000000-abc",
+    );
+    assert.equal(r.ok, false);
+    assert.match(r.error, /carries no pageId, assignments, workMode/);
+    assert.match(r.error, /runner build 1730000000-abc predates/);
+  });
+  test("absent assignments refuses", () => {
+    const { assignments: _drop, ...noAssign } = full;
+    const r = parseZoneViewState(noAssign, "b2");
+    assert.equal(r.ok, false);
+    assert.match(r.error, /carries no assignments — runner build b2/);
+  });
+  test("tmux work mode refuses fixture creation", () => {
+    const r = parseZoneViewState({ ...full, workMode: "tmux" }, "b3");
+    assert.equal(r.ok, false);
+    assert.equal(r.tmux, true);
+    assert.match(r.error, /tmux work mode/);
+  });
+  test("zoneIndexOf reads the rendered zone from the grid map", () => {
+    assert.equal(zoneIndexOf(full.assignments, "t-c"), 2);
+    assert.equal(zoneIndexOf(full.assignments, "t-z"), null);
+  });
+});
+
+describe("account roster", () => {
+  test("deriveAccountName / accountInRoster mirror the runner's matching", () => {
+    assert.equal(deriveAccountName("/home/u/.claude-tiohorst"), "tiohorst");
+    assert.equal(deriveAccountName("C:\\claude\\.claude-hotmail"), "hotmail");
+    assert.equal(deriveAccountName("/home/u/.claude"), "default");
+    assert.equal(accountInRoster("TIOHORST", ["/home/u/.claude-tiohorst"]), true);
+    assert.equal(accountInRoster(".claude-tiohorst", ["/home/u/.claude-tiohorst"]), true);
+    assert.equal(accountInRoster("jan", ["/home/u/.claude-tiohorst"]), false);
+  });
+  test("an EMPTY roster (a fresh temp runner) is detected and refused, naming the flag", () => {
+    const p = planRosterSeed({
+      current: [],
+      accounts: ["tiohorst", "jan"],
+      seedDirs: [],
+      port: 9877,
+      protectedPort: 9876,
+    });
+    assert.equal(p.action, "refuse");
+    assert.deepEqual(p.missing, ["tiohorst", "jan"]);
+    assert.match(p.error, /roster \(EMPTY\)/);
+    assert.match(p.error, /--seed-roster/);
+  });
+  test("every account present -> nothing to do", () => {
+    const p = planRosterSeed({
+      current: ["/h/.claude-tiohorst", "/h/.claude-jan"],
+      accounts: ["tiohorst", "jan"],
+      seedDirs: ["/h/.claude-x"],
+      port: 9877,
+      protectedPort: 9876,
+    });
+    assert.equal(p.action, "none");
+  });
+  test("--seed-roster: the union, prior recorded for teardown", () => {
+    const p = planRosterSeed({
+      current: ["/h/.claude-tiohorst"],
+      accounts: ["tiohorst", "jan"],
+      seedDirs: ["/h/.claude-jan", "/h/.claude-tiohorst"],
+      port: 9877,
+      protectedPort: 9876,
+    });
+    assert.deepEqual(p, {
+      action: "seed",
+      missing: ["jan"],
+      prior: ["/h/.claude-tiohorst"],
+      next: ["/h/.claude-tiohorst", "/h/.claude-jan"],
+    });
+  });
+  test("--seed-roster on the primary's port is refused", () => {
+    const p = planRosterSeed({
+      current: [],
+      accounts: ["jan"],
+      seedDirs: ["/h/.claude-jan"],
+      port: 9876,
+      protectedPort: 9876,
+    });
+    assert.equal(p.action, "refuse");
+    assert.match(p.error, /primary runner's port/);
+  });
+  test("the read-back catches a dir the PUT silently dropped", () => {
+    const v = verifyRosterSeed({
+      accepted: ["/h/.claude-tiohorst"],
+      requested: ["/h/.claude-tiohorst", "/h/.claude-jan"],
+      accounts: ["tiohorst", "jan"],
+    });
+    assert.equal(v.ok, false);
+    assert.deepEqual(v.dropped, ["/h/.claude-jan"]);
+    assert.match(v.error, /no projects\/ subdirectory/);
+    assert.equal(sameRoster(["b", "a"], ["a", "b"]), true);
+    assert.equal(sameRoster([], ["a"]), false);
+  });
+});
+
+describe("spawn admission", () => {
+  const guard = {
+    status: 500,
+    json: { success: false, error: "resource_guard:critical:thread_count: 31950 >= 30000" },
+  };
+  test("a resource-guard 500 is the ONE retryable refusal", () => {
+    assert.deepEqual(classifyTerminalSpawn(guard), {
+      kind: "admission",
+      retry: true,
+      detail: "resource_guard:critical:thread_count: 31950 >= 30000",
+    });
+  });
+  test("roster 400, not-logged-in 409 and any other 500 are not retried", () => {
+    assert.equal(
+      classifyTerminalSpawn({
+        status: 400,
+        json: { error: "account 'jan' not in roster; available: " },
+      }).kind,
+      "roster",
+    );
+    assert.equal(
+      classifyTerminalSpawn({ status: 409, json: { error: "x" } }).kind,
+      "not-logged-in",
+    );
+    const other = classifyTerminalSpawn({ status: 500, json: { error: "pty spawn failed" } });
+    assert.equal(other.kind, "error");
+    assert.equal(other.retry, false);
+    assert.equal(classifyTerminalSpawn({ status: 200 }).kind, "ok");
+  });
+  test("bounded backoff, then the budget expires with the reason named", () => {
+    const c = classifyTerminalSpawn(guard);
+    assert.deepEqual(planSpawnRetry({ classification: c, attempt: 0, elapsedMs: 0 }), {
+      retry: true,
+      delayMs: 2000,
+    });
+    assert.deepEqual(planSpawnRetry({ classification: c, attempt: 5, elapsedMs: 10_000 }), {
+      retry: true,
+      delayMs: 15000,
+    });
+    const out = planSpawnRetry({
+      classification: c,
+      attempt: 9,
+      elapsedMs: 110_000,
+      admissionVerdict: "critical",
+    });
+    assert.equal(out.retry, false);
+    assert.match(out.reason, /kept refusing for 110s/);
+    assert.match(out.reason, /thread_count/);
+    assert.match(out.reason, /verdict=critical/);
+  });
+  test("a non-retryable refusal never schedules a retry", () => {
+    const r = planSpawnRetry({
+      classification: classifyTerminalSpawn({ status: 409, json: { error: "logged out" } }),
+      attempt: 0,
+      elapsedMs: 0,
+    });
+    assert.equal(r.retry, false);
+  });
+});
+
+describe("openResidue", () => {
+  test("names every owned record still open, by session or by terminal", () => {
+    const rows = [
+      { claudeSessionId: "s-1", terminalId: "t-1" },
+      { claudeSessionId: "s-new", terminalId: "t-2" },
+      { claudeSessionId: "s-foreign", terminalId: "t-9" },
+    ];
+    assert.deepEqual(
+      openResidue(rows, { sessionIds: new Set(["s-1"]), terminalIds: new Set(["t-2"]) }),
+      ["s-1@t-1", "s-new@t-2"],
+    );
+    assert.deepEqual(openResidue([], { sessionIds: new Set(["s-1"]), terminalIds: new Set() }), []);
+  });
+});
+
+describe("no script evaluation in the webview", () => {
+  // The exe-mode CSP refuses string eval; the oracle builds fixtures over
+  // HTTP and read-only component actions only (plan D5). The needles are
+  // assembled so this file does not itself contain them.
+  const needles = ["/ui-bridge/control/page/" + "evaluate", "__TA" + "URI__"];
+  for (const file of ["uibridge-session-info.test.mjs", "uibridge-session-info-lib.mjs"]) {
+    test(`${file} never names the evaluate door or the Tauri global`, () => {
+      const src = readFileSync(join(HERE, "..", file), "utf8");
+      for (const n of needles) assert.equal(src.includes(n), false, `${file} contains ${n}`);
+    });
+  }
 });
