@@ -112,14 +112,30 @@ pub enum AccountSelectionMode {
     LeastUsage, // Auto-select the account with lowest utilization relative to expected pace.
     HighestExpectedUsage, // Auto-select, among accounts under their expected pace, the one with the highest expected usage.
     /// Among accounts under their expected pace, pick at random, weighted by
-    /// `expected * (expected - actual)`.
+    /// `expected * (expected - actual)` — at spawn time AND at every handoff,
+    /// a fresh draw each pick, so the picks of a burst spread across the
+    /// under-pace accounts by weight instead of all naming one. The default
+    /// (operator decision 2026-11-05): the deterministic modes put every spawn
+    /// of a burst on their single top account. Each pick is published through
+    /// the process-global resolved dir, so a spawn that reads it after a
+    /// sibling's pick takes the sibling's draw, and concurrent spawns can share
+    /// one draw (plan
+    /// `2026-11-05-a-spawn-takes-its-own-account-pick-not-the-shared-resolved-dir`).
+    ///
+    /// Fallbacks: at spawn time, when no account has a fresh under-pace
+    /// sample, the `HighestExpectedUsage` pick (deterministic, so that
+    /// fallback does concentrate); a handoff falls back to the cross-mode
+    /// ranking `pick_target_from` uses. With one config dir, spawn-time
+    /// selection picks it when its credentials are valid; there is no handoff
+    /// target.
+    #[default]
     WeightedRandom,
     /// Among accounts under their expected pace, ranked by expected usage
     /// (highest first), alternate handoffs between the first account and each
     /// of the others in turn (1,2,1,3,1,4,1,2,...), from the handoffs of the
-    /// last 3 hours. Spawn-time selection takes the first account. No-op when
-    /// fewer than two config dirs are configured, so safe as the default.
-    #[default]
+    /// last 3 hours. Spawn-time selection takes the first account, so it
+    /// spreads handoffs but not spawns. No-op when fewer than two config dirs
+    /// are configured.
     AlternatingHandoff,
 }
 
@@ -1875,9 +1891,14 @@ pub struct WebIntegrationSettings {
     pub backend_url: String,
 
     /// Optional override for the Next.js web frontend origin — the host that
-    /// serves user-facing pages like `/connect-runner`. When unset, falls
-    /// back to `backend_url`. Only needed in split local-dev setups where
-    /// the API (8000) and SPA (3001) run on different ports.
+    /// serves user-facing pages like `/connect-runner-github`. When unset,
+    /// the origin is derived from the RESOLVED API base (`backend_url`, or
+    /// whatever env/profile rung `api_config` picked) by
+    /// `web_origin::derive_web_base_url` (`https://api.X` → `https://X`;
+    /// any other host unchanged). `$QONTINUI_WEB_FRONTEND_BASE` overrides it
+    /// (`web_origin::resolve_web_frontend_base`). Only needed in split
+    /// local-dev setups where the API (8000) and SPA (3001) run on different
+    /// ports.
     /// No trailing slash required.
     #[serde(default)]
     pub web_base_url: Option<String>,
@@ -6005,6 +6026,11 @@ pub fn save_claude_config_dirs(dirs: Vec<String>) -> Result<(), String> {
     crate::config_facade::save_claude_config_dirs(dirs)
 }
 
+/// Add Claude Code config directories to the roster, never removing one
+pub fn append_claude_config_dirs(dirs: &[String]) -> Result<usize, String> {
+    crate::config_facade::append_claude_config_dirs(dirs)
+}
+
 /// Get custom launch commands per account config directory
 pub fn get_claude_account_launch_commands() -> std::collections::HashMap<String, String> {
     crate::config_facade::get_claude_account_launch_commands()
@@ -7361,10 +7387,11 @@ mod account_selection_mode_tests {
         // than failing the document it sits in.
         let unknown: AccountSelectionMode =
             serde_json::from_value(serde_json::json!("from_a_newer_runner")).unwrap();
-        assert_eq!(unknown, AccountSelectionMode::default());
+        // Both halves spelled as LITERALS, so moving `#[default]` reddens this.
+        assert_eq!(unknown, AccountSelectionMode::WeightedRandom);
         assert_eq!(
             AccountSelectionMode::default(),
-            AccountSelectionMode::AlternatingHandoff
+            AccountSelectionMode::WeightedRandom
         );
         assert_eq!(
             AccountSelectionMode::WeightedRandom.as_str(),
@@ -7400,6 +7427,67 @@ mod account_selection_mode_tests {
         assert!(!cli.account_selection_pinned);
         assert_eq!(cli.account_selection_mode, AccountSelectionMode::LeastUsage);
         assert!(!super::ClaudeCliSettings::default().account_selection_pinned);
+    }
+
+    /// A `claude_cli` block that stores NO mode — a fresh install, or a file
+    /// written before the field existed — resolves to weighted random, and so
+    /// does a default-constructed one. A stored mode is NOT this case: it is
+    /// kept as written (the fleet `account_selection_mode` policy is what moves
+    /// an unpinned machine off it), which the `least_usage` decode above pins.
+    #[test]
+    fn a_block_with_no_mode_resolves_to_weighted_random() {
+        let cli: super::ClaudeCliSettings = serde_json::from_value(serde_json::json!({
+            "execution_mode": "auto",
+            "custom_path": null,
+            "timeout_seconds": 600,
+            "config_dir": null,
+        }))
+        .expect("a claude_cli block with no mode decodes");
+        assert_eq!(
+            cli.account_selection_mode,
+            AccountSelectionMode::WeightedRandom
+        );
+        assert_eq!(
+            super::ClaudeCliSettings::default().account_selection_mode,
+            AccountSelectionMode::WeightedRandom
+        );
+    }
+
+    /// The Settings page tells the operator which mode is the default (the
+    /// selector option whose hint starts `Default.`, in
+    /// `src/components/settings/ai-settings/types.ts`). That label restates
+    /// this enum's `#[default]` across the language boundary, so pin the two
+    /// together: exactly one option may claim it, and its `mode` must be the
+    /// default's wire spelling.
+    #[test]
+    fn settings_page_default_label_names_the_enum_default() {
+        let ts = include_str!("../../src/components/settings/ai-settings/types.ts");
+        let marker = "hint: \"Default.";
+        assert_eq!(
+            ts.matches(marker).count(),
+            1,
+            "exactly one selector option may be labelled the default"
+        );
+        let (before, _) = ts.split_once(marker).expect("counted above");
+        let (_, from_mode) = before
+            .rsplit_once("mode: \"")
+            .expect("the labelled option names its mode");
+        let mode = from_mode
+            .split('"')
+            .next()
+            .expect("mode spelling is quoted");
+        assert_eq!(mode, AccountSelectionMode::default().as_str());
+    }
+
+    /// The env-agent collector lives in the LIB crate and cannot name this
+    /// bin-crate enum, so it carries the default as a string. Pin the two
+    /// together: moving `#[default]` without the collector reddens here.
+    #[test]
+    fn collector_default_spelling_matches_the_enum_default() {
+        assert_eq!(
+            qontinui_runner_lib::env_agent::collectors::DEFAULT_LOCAL_SELECTION_MODE,
+            AccountSelectionMode::default().as_str()
+        );
     }
 
     /// The pin survives a serialize → deserialize round trip in both states.

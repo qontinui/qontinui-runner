@@ -57,6 +57,15 @@ on:
   workflow_dispatch:
   pull_request:
     branches: [main]
+    # Path filter: a PR that touches no PowerShell cannot change this verdict,
+    # and this job needs pwsh, which the self-hosted pool does not carry, so it
+    # stays on the shared org hosted queue. It is not a required check, so a
+    # skipped run blocks nothing. (2026-11-04: 132 runs in 48h, almost all on
+    # PRs with no .ps1/.psm1 change, while that queue held 84 runner runs.)
+    paths:
+      - '**.ps1'
+      - '**.psm1'
+      - '.github/workflows/powershell-parse.yml'
 
 # Least-privilege, stated explicitly rather than inherited from the repo-level
 # `default_workflow_permissions` (an operator-flippable setting invisible in

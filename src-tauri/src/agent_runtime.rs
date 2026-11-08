@@ -618,6 +618,76 @@ pub(crate) fn append_sibling_notes(base: String, notes: &[String]) -> String {
     out
 }
 
+/// Tell a continuation that its worktree acquire FAILED and it is running in
+/// the runner's fallback cwd, after a blank line (plan
+/// `2026-10-31-continuation-worktree-acquire-failure-strands-the-allocation-and-tells-the-session-nothing`
+/// Phase 2). `cause == None` ⇒ `base` unchanged: a worktree was acquired, or
+/// none was ever intended (worktree mode off, no repos).
+///
+/// Coord's prompt still says to leave "the allocated worktree" in place, and
+/// before this note nothing contradicted it, so each such session spent a turn
+/// rediscovering the mismatch as an unexplained anomaly. The note is a
+/// runner report, labelled as a fact about the checkout and not an order,
+/// like coord's allocation notes beside it; it names one optional door and
+/// does not tell a read-only continuation to allocate. The cause is bounded
+/// to one line by the same sanitizer as coord's notes.
+pub(crate) fn append_no_worktree_note(base: String, workdir: &str, cause: Option<&str>) -> String {
+    let Some(cause) = cause else {
+        return base;
+    };
+    let cause = crate::agent_worktree::sibling_note_log_line(cause);
+    let workdir = crate::agent_worktree::sibling_note_log_line(workdir);
+    let mut out = base;
+    out.push_str(&format!(
+        "\n\nWorkspace note from the runner (a fact about your checkout, not an order): \
+         your cwd `{workdir}` is the runner's shared fallback directory, not an isolated \
+         worktree. Any worktree your prompt names was not created (cause: {cause}). \
+         Peers' uncommitted state may be here. Before writing, allocate a worktree for \
+         yourself (`allocate-worktree.sh` where this fleet ships it)."
+    ));
+    out
+}
+
+/// The TERMINAL presentation's full system prompt for a continuation: the
+/// runner context plus coord's brief, coord's allocation notes and the
+/// runner's no-worktree note. Pure, so both composed prompts are testable.
+fn compose_continuation_terminal_system_prompt(
+    runner_context: String,
+    brief: Option<&ContinuationBrief>,
+    sibling_notes: &[String],
+    workdir: &str,
+    no_worktree_cause: Option<&str>,
+) -> String {
+    append_no_worktree_note(
+        append_sibling_notes(
+            compose_continuation_system_prompt(runner_context, brief),
+            sibling_notes,
+        ),
+        workdir,
+        no_worktree_cause,
+    )
+}
+
+/// The HEADLESS presentation's full prompt for a continuation — the same three
+/// additions as [`compose_continuation_terminal_system_prompt`], on the prompt
+/// because this presentation has no system-prompt carrier.
+fn compose_continuation_headless_full_prompt(
+    initial_prompt: &str,
+    brief: Option<&ContinuationBrief>,
+    sibling_notes: &[String],
+    workdir: &str,
+    no_worktree_cause: Option<&str>,
+) -> String {
+    append_no_worktree_note(
+        append_sibling_notes(
+            compose_continuation_headless_prompt(initial_prompt, brief),
+            sibling_notes,
+        ),
+        workdir,
+        no_worktree_cause,
+    )
+}
+
 /// The HEADLESS half of the same seam.
 ///
 /// `Presentation::Headless` reaches `run_continuation_headless` ->
@@ -1126,22 +1196,16 @@ pub(crate) fn resolve_claude_bin() -> String {
         Some(p) => p,
         None => return bare,
     };
-    // Skip our own per-terminal shim/identity dirs — they hold the
-    // extensionless script that triggers os error 193 under a direct
-    // `CreateProcessW`.
-    use crate::install_effects_producer::intercept::shim_materializer::{
-        IDENTITY_DIR_PREFIX, SHIM_DIR_PREFIX,
-    };
-    let is_shim_dir = |d: &std::path::Path| {
-        d.file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with(IDENTITY_DIR_PREFIX) || n.starts_with(SHIM_DIR_PREFIX))
-    };
+    // Skip every qontinui shim/identity dir — ours or one inherited from
+    // another session. They hold the extensionless script that triggers os
+    // error 193 under a direct `CreateProcessW`, and a shim is never the real
+    // tool.
+    use crate::install_effects_producer::intercept::shim_materializer::is_qontinui_shim_dir;
     // Only extensions CreateProcessW can natively launch — see doc comment.
     #[cfg(windows)]
     let exts: &[&str] = &[".exe", ".com"];
     for dir in std::env::split_paths(&path) {
-        if is_shim_dir(&dir) {
+        if is_qontinui_shim_dir(&dir) {
             continue;
         }
         #[cfg(windows)]
@@ -1537,7 +1601,12 @@ async fn handle_message(txt: &str, device_id: uuid::Uuid) -> anyhow::Result<()> 
                         // `dispatch_condition_check` spawns detached. Outcome
                         // counts matter only on the poll path, which still awaits.
                         tokio::spawn(async move {
-                            let _ = dispatch_gate_continuation(payload, device_id).await;
+                            let _ = dispatch_gate_continuation(
+                                payload,
+                                device_id,
+                                ContinuationDelivery::Payload,
+                            )
+                            .await;
                         });
                     }
                     None => warn!(
@@ -2046,6 +2115,61 @@ struct PendingContinuation {
     #[serde(default)]
     #[allow(dead_code)]
     dispatched_at: Option<String>,
+    /// Coord's `coord.gates.continuation_spawn_attempts` for this row: the
+    /// counter coord's re-drive CAS (`continuation_spawn_retry::REDRIVE_SQL`)
+    /// bumps in the SAME statement that re-arms the row. It is the re-delivery
+    /// episode key the poll path dispatches under
+    /// ([`PendingContinuation::dispatch_attempt`]), because coord re-drives a
+    /// row without rewriting its persisted payload — so the payload's `retry`
+    /// block alone reads attempt 0 on every re-listing (plan
+    /// `2026-10-09-a-re-listed-gate-continuation-is-silently-dropped-and-a-deferral-streak-has-no-clock` D1).
+    ///
+    /// Absent (an older coord), `null`, negative or unreadable all read 0 —
+    /// never a parse failure, because one bad row must not drop the whole
+    /// pending list.
+    #[serde(default, deserialize_with = "deserialize_lenient_spawn_attempts")]
+    continuation_spawn_attempts: u32,
+}
+
+impl PendingContinuation {
+    /// The re-delivery attempt this poll row is dispatched under:
+    /// `max(payload.retry.attempt, continuation_spawn_attempts)`.
+    ///
+    /// Either source can only RAISE the attempt, and coord raises
+    /// `continuation_spawn_attempts` only inside the CAS that re-arms the row,
+    /// so the runner never sees a "new" episode coord did not create. If
+    /// coord's `retry` block and this counter ever number episodes
+    /// differently, `max()` can over-advance by one but never under-advance (a
+    /// dropped re-delivery — the defect this exists to close). Coord has NO
+    /// backstop for an over-advance: its consume claim carries no attempt and
+    /// answers every copy, so the in-process dedupe is the only guard against a
+    /// double spawn. That is why a poll row may advance the episode only past
+    /// a `Sealed` or `Released` claim, never past a `Held` one (see
+    /// [`gate_claim_verdict`]).
+    fn dispatch_attempt(&self) -> u32 {
+        self.payload
+            .retry_attempt()
+            .max(self.continuation_spawn_attempts)
+    }
+}
+
+/// Lenient reader for [`PendingContinuation::continuation_spawn_attempts`]:
+/// a non-negative integer (or a numeric string) that fits a `u32` is taken;
+/// anything else — `null`, a negative, a float, out of range, garbage — reads
+/// 0 with no error.
+fn deserialize_lenient_spawn_attempts<'de, D>(d: D) -> Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(d)?;
+    let parsed = match &value {
+        serde_json::Value::Number(n) => n.as_u64(),
+        serde_json::Value::String(s) => s.trim().parse::<u64>().ok(),
+        _ => None,
+    };
+    // Out of range reads 0 too: saturating to u32::MAX would pin the gate's
+    // claim above every attempt coord could ever send.
+    Ok(parsed.map_or(0, |n| u32::try_from(n).unwrap_or(0)))
 }
 
 /// The envelope of coord's `GET /coord/agents/pending-continuations` response.
@@ -2419,6 +2543,24 @@ fn lock_recover<'a, T>(
     })
 }
 
+/// Monotonic counter for [`dispatched_gate_ids`]. Every won claim and every
+/// seal takes the next value ([`next_claim_epoch`]); a poll run reads the
+/// current value ([`current_claim_epoch`]) BEFORE it fetches the pending list,
+/// so an entry whose epoch is larger was claimed or sealed after that list was
+/// read.
+static CLAIM_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The latest claim epoch handed out. A claim made after this read has a
+/// strictly larger epoch.
+fn current_claim_epoch() -> u64 {
+    CLAIM_EPOCH.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Take the next claim epoch (strictly larger than any value read before).
+fn next_claim_epoch() -> u64 {
+    CLAIM_EPOCH.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
+}
+
 /// Process-wide set of gate_ids whose continuation we have ALREADY dispatched.
 ///
 /// At-least-once delivery means a single continuation can arrive via BOTH the WS
@@ -2435,12 +2577,17 @@ fn lock_recover<'a, T>(
 /// by resetting the SAME gate row, and a gate whose session ran stays claimed
 /// here for the life of the process — so a set of bare ids would drop every
 /// re-delivery to this device forever. A strictly LARGER attempt therefore
-/// claims afresh, while a duplicate of the same attempt (WS + poll) or a stale
-/// older one is still dropped. This is the ONLY guard against a same-device
+/// claims afresh — subject to the poll-row pinning in [`gate_claim_verdict`]
+/// — while a duplicate of the same attempt (WS + poll) or a stale older one is
+/// still dropped. This is the ONLY guard against a same-device
 /// duplicate: coord's consume route answers `consumed` to a re-claim of an
 /// already-consumed row rather than refusing it.
 ///
-/// Each entry is `(attempt, state)`, and a release only TOMBSTONES the entry
+/// Each entry is `(attempt, state, epoch)` — `epoch` is the [`CLAIM_EPOCH`]
+/// value taken when the entry was claimed and taken again when it was SEALED,
+/// which lets a poll row tell a seal coord accepted BEFORE its pending list was
+/// fetched from one accepted after (see [`gate_claim_verdict`]) — and a release
+/// only TOMBSTONES the entry
 /// for the attempt that holds it — it never removes it. An attempt whose claim
 /// coord ACCEPTED is [`GateClaimState::Sealed`]: coord has consumed that row, so
 /// nothing may re-open the attempt locally (a later error release is a no-op),
@@ -2450,9 +2597,9 @@ fn lock_recover<'a, T>(
 /// the newer attempt's second copy — or a stale older frame — would claim and
 /// spawn again on the same device (review round 1 #1).
 fn dispatched_gate_ids(
-) -> &'static std::sync::Mutex<std::collections::HashMap<uuid::Uuid, (u32, GateClaimState)>> {
+) -> &'static std::sync::Mutex<std::collections::HashMap<uuid::Uuid, (u32, GateClaimState, u64)>> {
     static DISPATCHED: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<uuid::Uuid, (u32, GateClaimState)>>,
+        std::sync::Mutex<std::collections::HashMap<uuid::Uuid, (u32, GateClaimState, u64)>>,
     > = std::sync::OnceLock::new();
     DISPATCHED.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
@@ -2462,22 +2609,295 @@ fn dispatched_gate_ids(
 /// dispatch); `false` if it must skip as a duplicate. Insert-and-test under one
 /// lock so two concurrent deliveries can't both win.
 ///
-/// Wins iff nothing is held for this gate, the held attempt is EARLIER, or the
-/// held attempt is THIS one and was released (a local skip that left the row
-/// pending on coord, so its re-listing must dispatch). Monotone: a frame of an
-/// older attempt never claims again, released or not.
+/// The WS-frame rule, as a bool: wins iff nothing is held for this gate, the
+/// held attempt is EARLIER, or the held attempt is THIS one and was released (a
+/// local skip that left the row pending on coord, so its re-listing must
+/// dispatch). Monotone: a frame of an older attempt never claims again,
+/// released or not. The dispatcher goes through [`gate_claim_verdict`], which
+/// adds the poll-row pinning; this form is the tests' handle on the base rule.
+#[cfg(test)]
 fn claim_gate_dispatch_attempt(gate_id: uuid::Uuid, attempt: u32) -> bool {
+    try_claim_gate_dispatch_attempt(gate_id, attempt) == GateClaimAttempt::Won
+}
+
+/// The result of one [`try_claim_gate_dispatch_attempt`]: whether this call
+/// won the claim, and — when it lost — what was held, so the dispatcher can
+/// tell a plain duplicate from a contradiction with coord (see
+/// [`ContinuationDelivery::GatePollRow`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateClaimAttempt {
+    /// This call claimed the attempt; the caller dispatches.
+    Won,
+    /// Dropped: the gate already holds `held_attempt` in `held_state`.
+    /// `after_listing` is true when that entry was claimed or sealed after the
+    /// poll row's pending list was fetched (always false for a WS frame).
+    Lost {
+        held_attempt: u32,
+        held_state: GateClaimState,
+        after_listing: bool,
+    },
+}
+
+/// [`claim_gate_dispatch_attempt`], reporting what blocked a losing claim
+/// (the WS-frame rule: no poll-row pinning).
+#[cfg(test)]
+fn try_claim_gate_dispatch_attempt(gate_id: uuid::Uuid, attempt: u32) -> GateClaimAttempt {
+    try_claim_gate_dispatch_attempt_as(gate_id, attempt, None)
+}
+
+/// The single place the claim rule lives. `poll_listed_epoch` is `None` for a
+/// WS frame (plain monotone rule) and, for a poll row, the
+/// [`current_claim_epoch`] read before its pending list was fetched. A poll
+/// row is PINNED — it cannot advance past the prior claim at any attempt — when
+/// that prior is `Held`, or was `Sealed` after the listing; see
+/// [`gate_claim_verdict`] for why. Decided under the same lock as the insert,
+/// so a WS frame and a poll row cannot both win.
+fn try_claim_gate_dispatch_attempt_as(
+    gate_id: uuid::Uuid,
+    attempt: u32,
+    poll_listed_epoch: Option<u64>,
+) -> GateClaimAttempt {
     let mut held = lock_recover(dispatched_gate_ids(), "dispatched_gate_ids");
-    let wins = match held.get(&gate_id) {
-        None => true,
-        Some(&(prev, state)) => {
-            attempt > prev || (attempt == prev && state == GateClaimState::Released)
+    let verdict = match held.get(&gate_id) {
+        None => GateClaimAttempt::Won,
+        Some(&(prev, state, epoch)) => {
+            let after_listing = poll_listed_epoch.is_some_and(|listed| epoch > listed);
+            let pinned = poll_listed_epoch.is_some()
+                && (state == GateClaimState::Held
+                    || (state == GateClaimState::Sealed && after_listing));
+            let advances = attempt > prev && !pinned;
+            if advances || (attempt == prev && state == GateClaimState::Released) {
+                GateClaimAttempt::Won
+            } else {
+                GateClaimAttempt::Lost {
+                    held_attempt: prev,
+                    held_state: state,
+                    after_listing,
+                }
+            }
         }
     };
-    if wins {
-        held.insert(gate_id, (attempt, GateClaimState::Held));
+    if verdict == GateClaimAttempt::Won {
+        held.insert(gate_id, (attempt, GateClaimState::Held, next_claim_epoch()));
     }
-    wins
+    verdict
+}
+
+/// How a gate continuation reached [`dispatch_gate_continuation`] — which
+/// decides the re-delivery attempt it claims under and how a lost claim is
+/// classified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContinuationDelivery {
+    /// The live WS frame (or a work-unit dispatch replay, which carries no
+    /// gate-level counter): the attempt is `payload.retry_attempt()` alone.
+    /// A lost claim is classified a plain duplicate — the frame is a copy of an
+    /// episode this process already claimed, or a stale one. (Coord's republish
+    /// of a re-driven row carries no `retry`, so the frame cannot name its
+    /// episode; the poll copy of that episode is what [`gate_claim_verdict`]
+    /// pins against it.)
+    Payload,
+    /// A row of coord's `pending-continuations` list: the attempt is
+    /// [`PendingContinuation::dispatch_attempt`] (the max of the payload's
+    /// `retry` and coord's `continuation_spawn_attempts`). A row coord still
+    /// lists UN-consumed whose attempt this process holds `Sealed` (coord
+    /// accepted that attempt's consume claim) is a contradiction, not a
+    /// duplicate — see [`gate_claim_verdict`]. `listed_epoch` is the
+    /// [`current_claim_epoch`] read before the pending list was fetched.
+    GatePollRow { attempt: u32, listed_epoch: u64 },
+}
+
+impl ContinuationDelivery {
+    /// The attempt this delivery claims under.
+    fn attempt(self, payload: &GateContinuationPayload) -> u32 {
+        match self {
+            ContinuationDelivery::Payload => payload.retry_attempt(),
+            ContinuationDelivery::GatePollRow { attempt, .. } => attempt,
+        }
+    }
+}
+
+/// The dispatcher's in-process verdict on one gate delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateClaimVerdict {
+    /// Claimed: dispatch it.
+    Claim,
+    /// A duplicate of an in-flight or earlier-consumed episode: drop it.
+    Duplicate,
+    /// A poll row coord lists un-consumed, at an attempt this process has
+    /// `Sealed` (plan
+    /// `2026-10-09-a-re-listed-gate-continuation-is-silently-dropped-and-a-deferral-streak-has-no-clock`
+    /// D2). Coord says the row is pending; this process says coord consumed
+    /// it. Still dropped — re-spawning it would be the double spawn the seal
+    /// exists to stop — but loudly: `warn!` (rate-limited per gate) and its
+    /// own poll-report reason, because each one is a re-delivery that will
+    /// never run in this process.
+    SealedButRelisted,
+}
+
+/// Claim `gate_id` for `delivery` and classify the result. Free of I/O apart
+/// from the process-wide claim map and one rate-limited `warn!` (a poll row
+/// pinned behind a stale-looking `Held` claim), so the dedupe contract is
+/// testable without the async dispatcher's I/O.
+///
+/// **A poll row that meets a `Held` claim is a duplicate at ANY attempt.**
+/// Coord's main writes no `retry` block, so a WS republish of a re-driven row
+/// arrives as attempt 0 while the poll copy of the same episode arrives as
+/// attempt K >= 1 (from `continuation_spawn_attempts`). If the poll copy could
+/// advance past a held claim, a process holding nothing (or an older attempt)
+/// would claim (0, Held) from the frame and then (K, Held) from the poll, and
+/// both would reach coord's consume claim — which carries no attempt and
+/// answers both, so that is a double spawn with nothing behind it to stop it.
+///
+/// **The same holds for a prior SEALED after the row's list was fetched.** A
+/// frame's claim can be made before the fetch and its consume accepted after
+/// it (the consume POST is still in flight while the GET reads the row), or the
+/// whole claim-and-seal can land while the poll loop awaits earlier rows.
+/// Either way the list still names the row at K although the frame has
+/// consumed it, so the row is a duplicate. That is why the seal re-stamps the
+/// entry's epoch. A seal stamped BEFORE the fetch means coord consumed the row
+/// before the list was read, so a row still listed at K > its attempt is a
+/// genuine re-drive. Pinning a late seal costs at most one backstop tick: a
+/// row that really is still pending is listed again next poll, after the seal,
+/// and claims then.
+///
+/// **Accepted gap: a claim that stays `Held` pins its gate for the process
+/// lifetime.** A `SpawnDespiteClaimError` spawn is never sealed (coord may not
+/// have recorded the consume, and its pending list keeps every un-consumed,
+/// un-cancelled, un-expired row), so the row may still be listed for the
+/// episode that already ran. The same pin follows a dispatch task that
+/// panicked before releasing. Pinning is what stops that listing from spawning
+/// a second time; the cost is that a later re-drive of that gate does not run
+/// in this process. It is counted as `already_dispatched`, and a poll row
+/// pinned at a LARGER attempt than the Held one warns (rate-limited per gate)
+/// so the drop is visible. A double spawn is the worse failure.
+///
+/// Otherwise a `Sealed` prior (coord accepted that attempt; re-drive re-arms
+/// only such rows) or a `Released` one lets the poll's counter open a new
+/// episode. The WS-frame path keeps the plain monotone rule.
+fn gate_claim_verdict(
+    gate_id: uuid::Uuid,
+    delivery: ContinuationDelivery,
+    attempt: u32,
+) -> GateClaimVerdict {
+    let listed_epoch = match delivery {
+        ContinuationDelivery::GatePollRow { listed_epoch, .. } => Some(listed_epoch),
+        ContinuationDelivery::Payload => None,
+    };
+    match try_claim_gate_dispatch_attempt_as(gate_id, attempt, listed_epoch) {
+        GateClaimAttempt::Won => GateClaimVerdict::Claim,
+        GateClaimAttempt::Lost {
+            held_attempt,
+            held_state: GateClaimState::Sealed,
+            after_listing: false,
+        } if held_attempt == attempt && listed_epoch.is_some() => {
+            GateClaimVerdict::SealedButRelisted
+        }
+        GateClaimAttempt::Lost {
+            held_attempt,
+            held_state: GateClaimState::Held,
+            after_listing,
+        } if attempt > held_attempt && listed_epoch.is_some() => {
+            // A claim made after the listing is the ordinary WS/poll race, not
+            // a stuck pin: only a claim older than the listing warns.
+            if !after_listing && should_warn_pinned_behind_held(gate_id, std::time::Instant::now())
+            {
+                warn!(
+                    "agent_runtime: gate-continuation gate_id={gate_id} is listed by coord at \
+                     attempt {attempt}, but this process still holds attempt {held_attempt} \
+                     un-sealed (in flight, or a spawn whose consume claim errored) — dropping \
+                     the row to avoid a double spawn; if attempt {held_attempt} is no longer \
+                     running, this re-drive will not run in this process. Counted as \
+                     already_dispatched (warned once per gate per hour)"
+                );
+            }
+            GateClaimVerdict::Duplicate
+        }
+        GateClaimAttempt::Lost { .. } => GateClaimVerdict::Duplicate,
+    }
+}
+
+/// Per-gate last-warned times for the pinned-behind-Held warning.
+fn pinned_behind_held_last_warn(
+) -> &'static std::sync::Mutex<std::collections::HashMap<uuid::Uuid, std::time::Instant>> {
+    static LAST: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<uuid::Uuid, std::time::Instant>>,
+    > = std::sync::OnceLock::new();
+    LAST.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Decide-and-record: should the pinned-behind-Held warning fire for
+/// `gate_id` at `now`? At most once per [`SEALED_BUT_RELISTED_WARN_INTERVAL`]
+/// per gate (the same backstop cadence applies).
+fn should_warn_pinned_behind_held(gate_id: uuid::Uuid, now: std::time::Instant) -> bool {
+    rate_limited_per_gate(
+        pinned_behind_held_last_warn(),
+        "pinned_behind_held_last_warn",
+        gate_id,
+        now,
+    )
+}
+
+/// The poll-report outcome of a delivery the in-process dedupe dropped, or
+/// `None` when it claimed (the dispatcher goes on to spawn). The single map
+/// from [`GateClaimVerdict`] to [`DispatchOutcome`], shared by the dispatcher
+/// and its tests.
+fn gate_verdict_skip_outcome(
+    gate_id: uuid::Uuid,
+    verdict: GateClaimVerdict,
+) -> Option<DispatchOutcome> {
+    match verdict {
+        GateClaimVerdict::Claim => None,
+        GateClaimVerdict::Duplicate => Some(DispatchOutcome::AlreadyDispatched),
+        GateClaimVerdict::SealedButRelisted => Some(DispatchOutcome::SealedButRelisted(gate_id)),
+    }
+}
+
+/// Minimum interval between `sealed_but_relisted` warnings for the SAME gate.
+/// The backstop re-lists the row every ~300 s, so an un-throttled warning is
+/// ~12 lines an hour per stuck gate; one an hour keeps it loud and readable.
+const SEALED_BUT_RELISTED_WARN_INTERVAL: Duration = Duration::from_secs(3600);
+
+/// Per-gate last-warned times for the `sealed_but_relisted` warning.
+fn sealed_but_relisted_last_warn(
+) -> &'static std::sync::Mutex<std::collections::HashMap<uuid::Uuid, std::time::Instant>> {
+    static LAST: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<uuid::Uuid, std::time::Instant>>,
+    > = std::sync::OnceLock::new();
+    LAST.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Decide-and-record: should the `sealed_but_relisted` warning fire for
+/// `gate_id` at `now`? `true` at most once per
+/// [`SEALED_BUT_RELISTED_WARN_INTERVAL`] per gate. Takes `now` so the window
+/// is unit-testable (the shape of [`should_post_deferred_stamp`]).
+fn should_warn_sealed_but_relisted(gate_id: uuid::Uuid, now: std::time::Instant) -> bool {
+    rate_limited_per_gate(
+        sealed_but_relisted_last_warn(),
+        "sealed_but_relisted_last_warn",
+        gate_id,
+        now,
+    )
+}
+
+/// `true` at most once per [`SEALED_BUT_RELISTED_WARN_INTERVAL`] per gate in
+/// `last_warn`, recording `now` when it fires.
+fn rate_limited_per_gate(
+    last_warn: &std::sync::Mutex<std::collections::HashMap<uuid::Uuid, std::time::Instant>>,
+    name: &'static str,
+    gate_id: uuid::Uuid,
+    now: std::time::Instant,
+) -> bool {
+    let mut map = lock_recover(last_warn, name);
+    if let Some(last) = map.get(&gate_id) {
+        if now.saturating_duration_since(*last) < SEALED_BUT_RELISTED_WARN_INTERVAL {
+            return false;
+        }
+    }
+    if map.len() > 1024 {
+        map.retain(|_, t| now.saturating_duration_since(*t) < SEALED_BUT_RELISTED_WARN_INTERVAL);
+    }
+    map.insert(gate_id, now);
+    true
 }
 
 /// Test shim: [`claim_gate_dispatch_attempt`] at attempt 0 (a first delivery).
@@ -2506,12 +2926,15 @@ enum GateClaimState {
 }
 
 /// Seal the claim `attempt` holds once coord accepted it (see
-/// [`GateClaimState::Sealed`]). No-op for any other attempt.
+/// [`GateClaimState::Sealed`]), re-stamping its epoch so a poll listing read
+/// before this seal is pinned behind it ([`gate_claim_verdict`]). Only a
+/// `Held` claim is sealed. No-op for any other attempt.
 fn seal_gate_dispatch_attempt(gate_id: uuid::Uuid, attempt: u32) {
     let mut held = lock_recover(dispatched_gate_ids(), "dispatched_gate_ids");
     if let Some(entry) = held.get_mut(&gate_id) {
-        if entry.0 == attempt {
+        if entry.0 == attempt && entry.1 == GateClaimState::Held {
             entry.1 = GateClaimState::Sealed;
+            entry.2 = next_claim_epoch();
         }
     }
 }
@@ -3344,10 +3767,11 @@ enum ContinuationGuard {
     /// (a dispatch still between the guard and its spawn, or a session
     /// mid-account-migration; see [`AnchorHolder::Reserved`]).
     DuplicateAnchor(AnchorHolder),
-    /// The machine is short of a measured resource: the spawn seam's own
-    /// composed verdict ([`crate::resource_guard::probe_for_spawn`] — the free
-    /// memory lane and the thread lane, heavier wins) returned something other
-    /// than `Proceed`. Defer the spawn.
+    /// The machine is short of a measured resource: the composed verdict over
+    /// the free memory lane and the thread lane (heavier wins), with admitted
+    /// but not yet running continuations charged as projected cost
+    /// ([`crate::resource_guard::AdmissionReading::projected`]), returned
+    /// something other than `Proceed`. Defer the spawn.
     ///
     /// Carries the severity word (`"warn"` / `"critical"`) beside the
     /// observation that produced it, so the log and the coord stamp name the
@@ -3364,7 +3788,7 @@ enum ContinuationGuard {
 }
 
 /// Pre-spawn guard: prune dead sessions, then enforce P3 (anchor_key dedup) and
-/// machine load. Pure over (`anchor_key`, `is_live`, the injected load verdict)
+/// machine load. Pure over (`anchor_key`, `is_live`, the injected load reading)
 /// so it is unit-testable without a live `TerminalManager` and without a live
 /// reading.
 ///
@@ -3379,7 +3803,7 @@ enum ContinuationGuard {
 ///    arrives as a closure rather than as a value. `poll_pending_continuations`
 ///    `tokio::spawn`s one task per row coord returns — a route coord serves with
 ///    no `LIMIT` — so a batch of rows stranded on `duplicate_anchor` runs this
-///    guard concurrently, once per row. Passing `probe_for_spawn()` as an
+///    guard concurrently, once per row. Passing the reading as an
 ///    *argument expression* would evaluate every one of those readings before
 ///    this arm discarded them: on Windows that is a system-wide
 ///    `CreateToolhelp32Snapshot` per row (plus a `settings.json` stat/parse and
@@ -3436,8 +3860,9 @@ enum ContinuationGuard {
 ///   Bounded by NOTHING in steady state — not by the count either, which never
 ///   measured them. A Linux runner's children also share its systemd unit's
 ///   `pids.max` and `kernel.threads-max`, which no lane reads; the burst RATE is
-///   owned by plan
-///   `2026-10-01-runner-spawn-bursts-are-unregulated-coord-must-admit-spawns-per-machine`,
+///   owned by plans
+///   `2026-10-01-runner-spawn-bursts-are-unregulated-coord-must-admit-spawns-per-machine`
+///   and `2026-10-28-runner-spawn-bursts-overwhelm-the-box-beyond-the-continuation-cap`,
 ///   and a task-ceiling lane, if one is needed, by the resource-guard follow-ups.
 ///   The count was never a semaphore either: every task of one poll read the
 ///   same pre-burst count.
@@ -3679,7 +4104,7 @@ fn admit_launch(
 ///
 /// The split exists so the guard itself stays pure over its inputs (the property
 /// its own doc claims and its unit tests rely on): a test injects a closure
-/// returning a [`crate::resource_guard::SpawnGate`], while the one production
+/// returning a [`crate::resource_guard::AdmissionReading`], while the one production
 /// call site — [`run_gate_continuation_inner`]'s step 1 — takes this wrapper and
 /// pays the reading.
 ///
@@ -4851,6 +5276,7 @@ enum ConsumeTarget {
 async fn dispatch_gate_continuation(
     payload: GateContinuationPayload,
     device_id: uuid::Uuid,
+    delivery: ContinuationDelivery,
 ) -> DispatchOutcome {
     // Instance-targeting self-gate (primary-only by default). A continuation
     // spawns on EXACTLY the instance it is addressed to; an absent
@@ -4941,32 +5367,68 @@ async fn dispatch_gate_continuation(
         // Fast-path dedupe: drop an in-process duplicate before any claim.
         // (The agent-registry check above is the one I/O that precedes it — it
         // must, so a refused dispatch never claims anything.)
-        let attempt = payload.retry_attempt();
-        if payload.retry.is_some() && attempt == 0 {
+        //
+        // The attempt is the payload's `retry` on a WS frame, and on a poll row
+        // the max of that and coord's `continuation_spawn_attempts` — the
+        // counter coord's re-drive bumps without rewriting the payload, so a
+        // re-driven row is a NEW episode here rather than a duplicate of the
+        // sealed one (plan 2026-10-09-a-re-listed-gate-continuation… D1).
+        let attempt = delivery.attempt(&payload);
+        if payload.retry.is_some() && payload.retry_attempt() == 0 {
             warn!(
                 "agent_runtime: gate-continuation gate_id={gate_id} carries a coord `retry` \
-                 annotation with no readable attempt — treated as attempt 0; on a device that \
-                 already ran this gate the re-delivery will be dropped as a duplicate"
+                 annotation with no readable attempt — treated as attempt 0 (dispatching \
+                 under attempt {attempt}); on a device that already ran this gate at that \
+                 attempt the re-delivery will be dropped as a duplicate"
             );
         }
-        if !claim_gate_dispatch_attempt(gate_id, attempt) {
-            if attempt > 0 {
-                info!(
-                    "agent_runtime: gate-continuation gate_id={gate_id} re-delivery attempt \
-                     {attempt} already dispatched in this process; skipping duplicate"
+        let verdict = gate_claim_verdict(gate_id, delivery, attempt);
+        match verdict {
+            GateClaimVerdict::Claim => {}
+            GateClaimVerdict::Duplicate => {
+                // A poll row of an in-flight re-drive is re-listed every
+                // backstop tick until it settles, so only a WS frame earns
+                // the `info!`; poll duplicates stay at `debug!`.
+                if attempt > 0 && delivery == ContinuationDelivery::Payload {
+                    info!(
+                        "agent_runtime: gate-continuation gate_id={gate_id} re-delivery attempt \
+                         {attempt} already dispatched in this process; skipping duplicate"
+                    );
+                }
+                debug!(
+                    "agent_runtime: gate-continuation gate_id={gate_id} attempt={attempt} \
+                     already dispatched; skipping duplicate"
                 );
             }
-            debug!(
-                "agent_runtime: gate-continuation gate_id={gate_id} attempt={attempt} already \
-                 dispatched; skipping duplicate"
-            );
-            return DispatchOutcome::AlreadyDispatched;
+            GateClaimVerdict::SealedButRelisted => {
+                if should_warn_sealed_but_relisted(gate_id, std::time::Instant::now()) {
+                    warn!(
+                        "agent_runtime: gate-continuation gate_id={gate_id} is re-listed by \
+                         coord as PENDING at attempt {attempt}, but this process holds that \
+                         attempt in held state Sealed (coord accepted its consume claim) — \
+                         dropping it to avoid a double spawn; it will not run in this process \
+                         until coord re-drives it as a newer attempt \
+                         (continuation_spawn_attempts > {attempt}). Counted as \
+                         skip_reasons.sealed_but_relisted (warned once per gate per hour)"
+                    );
+                }
+            }
+        }
+        if let Some(outcome) = gate_verdict_skip_outcome(gate_id, verdict) {
+            return outcome;
         }
         if let Some(retry) = payload.retry.as_ref() {
             info!(
                 "agent_runtime: gate-continuation gate_id={gate_id} is coord RE-DELIVERY attempt \
                  {}/{} ({} family, class {}); prior outcome {:?}",
                 retry.attempt, retry.max_attempts, retry.family, retry.class, retry.prior_outcome
+            );
+        }
+        if attempt > payload.retry_attempt() {
+            info!(
+                "agent_runtime: gate-continuation gate_id={gate_id} is coord RE-DRIVE attempt \
+                 {attempt} (continuation_spawn_attempts on the pending row; the payload carried \
+                 no newer `retry`) — claimed as a new episode"
             );
         }
         // One task owns the whole claim → spawn → outcome handshake. The #469
@@ -5050,6 +5512,11 @@ enum DispatchOutcome {
     Dispatched,
     /// Dropped at the in-process dedupe — this id is in-flight or consumed.
     AlreadyDispatched,
+    /// A poll row coord lists un-consumed at an attempt this process holds
+    /// `Sealed` ([`GateClaimVerdict::SealedButRelisted`]). Dropped like a
+    /// duplicate, but counted and named separately in the poll report,
+    /// because coord and this process contradict each other about the row.
+    SealedButRelisted(uuid::Uuid),
     /// Not addressed to this instance (the addressed instance spawns it).
     NotAddressedToSelf,
     /// Refused by the agent registry (`agent-spawn-authorization`): the
@@ -5077,6 +5544,9 @@ async fn poll_pending_continuations(device_id: uuid::Uuid) {
         return;
     };
     let url = format!("{base}/coord/agents/pending-continuations?device_id={device_id}");
+    // Read before the fetch: a claim made after this point may have consumed a
+    // row the list still names (see `gate_claim_verdict`).
+    let listed_epoch = current_claim_epoch();
     // Every fetch-failure exit below still self-reports (all-zeros +
     // `skip_reasons.fetch_failed`): coord must be able to tell "poll loop
     // alive but the pull route failing" apart from "poll loop dead".
@@ -5131,29 +5601,42 @@ async fn poll_pending_continuations(device_id: uuid::Uuid) {
         ..Default::default()
     };
     for row in body.pending {
-        // The row's gate_id is authoritative; stamp it onto the payload so the
-        // shared seam dedupes + acks even if coord omitted it inside `payload`.
-        let mut payload = row.payload;
-        payload.gate_id = Some(row.gate_id);
-        match dispatch_gate_continuation(payload, device_id).await {
-            DispatchOutcome::Dispatched => counts.dispatched_n += 1,
-            DispatchOutcome::AlreadyDispatched => counts.already_dispatched += 1,
-            DispatchOutcome::NotAddressedToSelf => counts.not_addressed_to_self += 1,
-            DispatchOutcome::Denied => counts.spawn_authorization_denied += 1,
-        }
+        let (payload, delivery) = poll_row_delivery(row, listed_epoch);
+        counts.record(dispatch_gate_continuation(payload, device_id, delivery).await);
     }
     post_continuation_poll_report(device_id, counts).await;
 }
 
+/// Turn one `pending-continuations` row into what the dispatcher takes: the
+/// payload, with the row's authoritative `gate_id` stamped on (so the shared
+/// seam dedupes + acks even if coord omitted it inside `payload`), and the
+/// [`ContinuationDelivery::GatePollRow`] keyed on the row's episode —
+/// `max(payload retry, continuation_spawn_attempts)`, stamped with the
+/// `listed_epoch` read before the list was fetched. The poll loop's whole
+/// per-row mapping, pure so it is tested as the loop runs it.
+fn poll_row_delivery(
+    row: PendingContinuation,
+    listed_epoch: u64,
+) -> (GateContinuationPayload, ContinuationDelivery) {
+    let delivery = ContinuationDelivery::GatePollRow {
+        attempt: row.dispatch_attempt(),
+        listed_epoch,
+    };
+    let mut payload = row.payload;
+    payload.gate_id = Some(row.gate_id);
+    (payload, delivery)
+}
+
 /// Aggregate counts from one [`poll_pending_continuations`] run, feeding the
 /// coord self-report. `listed_n` = rows fetched; `dispatched_n` = ids NEWLY
-/// claimed this run; the two skip counters are the dedupe-drops and the
-/// not-addressed-to-this-instance drops (skipped = listed − dispatched).
+/// claimed this run; the skip counters are the per-reason drops (dedupe,
+/// sealed-but-relisted, not addressed to this instance, …), and
+/// skipped = listed − dispatched.
 /// `fetch_failed` marks a run whose pending-list pull itself failed (client
 /// build / GET / non-2xx / parse) — reported so coord can tell "poll loop
 /// alive but the pull route failing" apart from "poll loop dead" (the exact
 /// ambiguity the self-report exists to kill).
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 struct PollRunCounts {
     listed_n: usize,
     dispatched_n: usize,
@@ -5164,8 +5647,21 @@ struct PollRunCounts {
     /// standing continuations" apart from a dedupe drop or a dead poll loop —
     /// the two look identical in `skipped_n` alone.
     spawn_authorization_denied: usize,
+    /// Poll rows coord lists un-consumed at an attempt this process holds
+    /// `Sealed` ([`DispatchOutcome::SealedButRelisted`]). A partition of the
+    /// skips, NOT a subset of `already_dispatched`: each such row is counted
+    /// here only.
+    sealed_but_relisted: usize,
+    /// The first [`SEALED_BUT_RELISTED_GATE_IDS_CAP`] gate ids behind
+    /// `sealed_but_relisted`, in poll order. Bounded so a pathological list
+    /// cannot grow the report body; the count above stays exact.
+    sealed_but_relisted_gate_ids: Vec<uuid::Uuid>,
     fetch_failed: bool,
 }
+
+/// Upper bound on `sealed_but_relisted_gate_ids` in one poll report (plan
+/// `2026-10-09-a-re-listed-gate-continuation-is-silently-dropped-and-a-deferral-streak-has-no-clock` D2).
+const SEALED_BUT_RELISTED_GATE_IDS_CAP: usize = 20;
 
 impl PollRunCounts {
     /// The counts for a run whose pending-list pull failed before any row was
@@ -5174,6 +5670,23 @@ impl PollRunCounts {
         Self {
             fetch_failed: true,
             ..Default::default()
+        }
+    }
+
+    /// Fold one row's [`DispatchOutcome`] into the counts — the single place
+    /// the poll loop's per-row accounting lives.
+    fn record(&mut self, outcome: DispatchOutcome) {
+        match outcome {
+            DispatchOutcome::Dispatched => self.dispatched_n += 1,
+            DispatchOutcome::AlreadyDispatched => self.already_dispatched += 1,
+            DispatchOutcome::SealedButRelisted(gate_id) => {
+                self.sealed_but_relisted += 1;
+                if self.sealed_but_relisted_gate_ids.len() < SEALED_BUT_RELISTED_GATE_IDS_CAP {
+                    self.sealed_but_relisted_gate_ids.push(gate_id);
+                }
+            }
+            DispatchOutcome::NotAddressedToSelf => self.not_addressed_to_self += 1,
+            DispatchOutcome::Denied => self.spawn_authorization_denied += 1,
         }
     }
 }
@@ -5185,7 +5698,15 @@ struct ContinuationPollReportBody {
     listed_n: usize,
     dispatched_n: usize,
     skipped_n: usize,
+    /// Count-only histogram: coord's `sanitize_skip_reasons` coerces every
+    /// value to an integer, so ids can never ride here.
     skip_reasons: std::collections::BTreeMap<&'static str, usize>,
+    /// The gate ids behind `skip_reasons.sealed_but_relisted`, at most
+    /// [`SEALED_BUT_RELISTED_GATE_IDS_CAP`]. Omitted when empty, so a report
+    /// with no such row keeps its pre-existing wire shape; coord's request
+    /// type does not deny unknown fields, so an older coord ignores it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    sealed_but_relisted_gate_ids: Vec<uuid::Uuid>,
 }
 
 impl ContinuationPollReportBody {
@@ -5196,6 +5717,9 @@ impl ContinuationPollReportBody {
         }
         if counts.not_addressed_to_self > 0 {
             skip_reasons.insert("not_addressed_to_self", counts.not_addressed_to_self);
+        }
+        if counts.sealed_but_relisted > 0 {
+            skip_reasons.insert("sealed_but_relisted", counts.sealed_but_relisted);
         }
         if counts.spawn_authorization_denied > 0 {
             skip_reasons.insert(
@@ -5212,6 +5736,7 @@ impl ContinuationPollReportBody {
             dispatched_n: counts.dispatched_n,
             skipped_n: counts.listed_n.saturating_sub(counts.dispatched_n),
             skip_reasons,
+            sealed_but_relisted_gate_ids: counts.sealed_but_relisted_gate_ids,
         }
     }
 }
@@ -5364,7 +5889,9 @@ async fn poll_pending_unit_dispatches(device_id: uuid::Uuid) {
         let mut payload = row.payload;
         payload.dispatch_id = Some(row.dispatch_id);
         // Outcome counts are aggregated only on the gate-continuations poll.
-        let _ = dispatch_gate_continuation(payload, device_id).await;
+        // A unit dispatch has no gate-level re-delivery counter, so it is
+        // keyed on its payload exactly like a WS frame.
+        let _ = dispatch_gate_continuation(payload, device_id, ContinuationDelivery::Payload).await;
     }
 }
 
@@ -5910,17 +6437,21 @@ fn spawn_authorization_stamp_reason(label: &str) -> String {
 /// lifecycle untouched (still pending, still re-deliverable) — it only gives
 /// coord an honest, queryable "a runner saw this and deferred it" signal.
 /// Rate-limited per gate via [`should_post_deferred_stamp`] (once per hour).
-/// **Best-effort**: the route may 404 until coord's parallel phase deploys —
-/// ANY non-2xx or transport error is `debug!` and we move on.
+/// **Best-effort, but loud on loss**: a non-2xx or transport error is one
+/// `warn!` and we move on. A lost stamp is not cosmetic — coord's deferral
+/// escalation reads these stamps, so a silently failing post makes a stuck row
+/// look like one that was deferred once and is quietly waiting (plan
+/// `2026-10-09-a-re-listed-gate-continuation-is-silently-dropped-and-a-deferral-streak-has-no-clock`
+/// Phase 2). The success path stays `debug!`.
 async fn post_continuation_deferred(gate_id: uuid::Uuid, device_id: uuid::Uuid, reason: String) {
     let Some(base) = connected_coord_base() else {
         return;
     };
     let url = format!("{base}/coord/gates/{gate_id}/continuation-deferred");
     let Some(client) = crate::coord_http::coord_client() else {
-        debug!(
+        warn!(
             "agent_runtime: continuation-deferred: no shared coord client \
-             gate_id={gate_id} (continuing)"
+             gate_id={gate_id} — the deferral stamp did NOT land (continuing)"
         );
         return;
     };
@@ -5939,15 +6470,17 @@ async fn post_continuation_deferred(gate_id: uuid::Uuid, device_id: uuid::Uuid, 
             );
         }
         Ok(resp) => {
-            debug!(
-                "agent_runtime: continuation-deferred POST gate_id={gate_id} returned {} \
-                 (route may not be deployed yet; continuing)",
-                resp.status()
+            warn!(
+                "agent_runtime: continuation-deferred POST gate_id={gate_id} returned {} — \
+                 the deferral stamp did NOT land (reason={}; continuing)",
+                resp.status(),
+                body.reason
             );
         }
-        Err(e) => debug!(
-            "agent_runtime: continuation-deferred POST gate_id={gate_id} failed \
-             (continuing): {e:#}"
+        Err(e) => warn!(
+            "agent_runtime: continuation-deferred POST gate_id={gate_id} failed — the \
+             deferral stamp did NOT land (reason={}; continuing): {e:#}",
+            body.reason
         ),
     }
 }
@@ -6421,14 +6954,13 @@ async fn run_gate_continuation_inner(
     // release a claim the re-delivered session holds.
     let pinned_session_id = uuid::Uuid::new_v4();
 
-    let (workdir, ctx, agent_id) = match acquire_continuation_workdir(
-        &payload.repos,
-        &intent,
-        Some(pinned_session_id),
-    )
-    .await
-    {
-        Ok(triple) => triple,
+    let ContinuationWorkdir {
+        workdir,
+        ctx,
+        agent_id,
+        no_worktree_cause,
+    } = match acquire_continuation_workdir(&payload.repos, &intent, Some(pinned_session_id)).await {
+        Ok(w) => w,
         Err(e) => {
             warn!("agent_runtime: continuation worktree acquisition failed: {e:#}");
             // The gate claim was already posted (step 2): record the honest
@@ -6476,6 +7008,7 @@ async fn run_gate_continuation_inner(
                 ctx,
                 reservation,
                 pinned_session_id,
+                no_worktree_cause.as_deref(),
             )
             .await;
             let res = res.map(|start| {
@@ -6495,12 +7028,12 @@ async fn run_gate_continuation_inner(
             // rides on the PROMPT — byte-for-byte how coord itself delivers a
             // registrant's `hint` (appended to `initial_prompt` after a blank
             // line), so the two halves of one brief arrive the same way.
-            let headless_prompt = append_sibling_notes(
-                compose_continuation_headless_prompt(
-                    &payload.initial_prompt,
-                    payload.brief.as_ref(),
-                ),
+            let headless_prompt = compose_continuation_headless_full_prompt(
+                &payload.initial_prompt,
+                payload.brief.as_ref(),
                 ctx.as_ref().map_or(&[][..], |c| c.sibling_notes.as_slice()),
+                &workdir,
+                no_worktree_cause.as_deref(),
             );
             // Known lag, accepted: the headless fn returns only after the child
             // EXITS, so on this presentation the `spawned` outcome — and the
@@ -6653,54 +7186,6 @@ fn headless_bindable_session(exit: HeadlessExit, pinned: uuid::Uuid) -> Option<u
     }
 }
 
-/// Zone ceiling for a continuation page before it is considered "full".
-///
-/// Mirrors the frontend `useZoneLayout.ts` `full-grid` layout, which lays out
-/// at most 9 zones (a 3×3 grid) per page; beyond that, extra sessions spill
-/// into the page's Unassigned list. The backend picker uses this to spread
-/// continuations across non-full pages instead of overflowing one page.
-pub(crate) const CONTINUATION_PAGE_ZONE_CEILING: usize = 9;
-
-/// Choose the page_id a new continuation terminal should land on.
-/// Prefers, in order: the "default" page if under the ceiling, then any other
-/// existing page under the ceiling (fewest terminals first, tie-break by page_id
-/// for determinism), else a freshly-minted uuid.
-///
-/// `counts` is the live `(page_id, terminal count)` map. A page absent from
-/// `counts` is treated as count 0; in particular an absent `"default"` is
-/// treated as empty (so it is chosen when no continuations exist yet). The
-/// picker decides only among the pages PRESENT in `counts` plus the implicit
-/// `"default"`.
-pub(crate) fn pick_continuation_page(
-    counts: &[(String, usize)],
-    ceiling: usize,
-    mint: impl FnOnce() -> String,
-) -> String {
-    // Default page count (absent → 0).
-    let default_count = counts
-        .iter()
-        .find(|(p, _)| p == "default")
-        .map(|(_, c)| *c)
-        .unwrap_or(0);
-    if default_count < ceiling {
-        return "default".to_string();
-    }
-
-    // Among the OTHER existing pages under the ceiling, pick the one with the
-    // fewest terminals; tie-break by lexicographically-smallest page_id for
-    // determinism.
-    let best = counts
-        .iter()
-        .filter(|(p, c)| p != "default" && *c < ceiling)
-        .min_by(|(pa, ca), (pb, cb)| ca.cmp(cb).then_with(|| pa.cmp(pb)));
-    if let Some((page, _)) = best {
-        return page.clone();
-    }
-
-    // Everything full → mint a fresh page.
-    mint()
-}
-
 /// Build the gate-continuation `claude` spawn argv. Pure for unit-testing:
 /// every flag — including the pre-pinned `--session-id` — MUST precede the
 /// trailing positional prompt arg, or the CLI eats it as prompt text.
@@ -6842,6 +7327,10 @@ async fn run_continuation_terminal(
     // `run_gate_continuation_inner`). A never-started retry pins a fresh id
     // instead; the id that actually started is returned.
     pinned_session_id: uuid::Uuid,
+    // Why the worktree acquire failed, when this continuation is running in the
+    // fallback cwd because of it; `None` when a worktree was acquired or none
+    // was intended. Becomes the runner's note in the system prompt.
+    no_worktree_cause: Option<&str>,
 ) -> anyhow::Result<TerminalStart> {
     use std::sync::Arc;
 
@@ -7016,22 +7505,14 @@ async fn run_continuation_terminal(
         // Manual default) keeps the prior behavior. RISK note: the id resolver
         // scans config dirs first-hit-wins, but worktree paths are
         // per-continuation-unique, so cross-account binding stays low-probability.
-        // Page distribution: backend continuations historically all landed on the
-        // "default" page, overflowing its 9-zone grid into the Unassigned list. Pick
-        // a non-full page at create-time so continuations spread across pages, and
-        // persist it in the durable record so a restart re-lands on the same page.
-        // Count live terminals per page from the manager's current session list.
-        let counts: Vec<(String, usize)> = {
-            let mut per_page: std::collections::HashMap<String, usize> =
-                std::collections::HashMap::new();
-            for info in terminal_manager.list() {
-                *per_page.entry(info.page_id).or_insert(0) += 1;
-            }
-            per_page.into_iter().collect()
-        };
-        let target_page = pick_continuation_page(&counts, CONTINUATION_PAGE_ZONE_CEILING, || {
-            uuid::Uuid::new_v4().to_string()
-        });
+        // Page distribution: pick a page with room at create-time, counting the
+        // rows a boot restore is about to bring back (`terminal::page_placement`),
+        // and persist it in the durable record so a restart re-lands on the same
+        // page.
+        let target_page = crate::terminal::page_placement::pick_page_for_new_session(
+            &terminal_manager,
+            crate::terminal::page_placement::lifecycle_store(&app).as_deref(),
+        );
 
         let mut capture_hint = crate::commands::terminal::SessionCaptureHint {
             config_dir: selected_config_dir.clone(),
@@ -7105,16 +7586,16 @@ async fn run_continuation_terminal(
         // `2026-09-15-runner-policy-injection-off-sessionstart-hook-channel`), and
         // stays inline otherwise.
         let prompt_carrier = crate::session::spawn_prompt::resolve_system_prompt_carrier(Some(
-            append_sibling_notes(
-                compose_continuation_system_prompt(
-                    crate::terminal::runner_context(
-                        crate::terminal::spawn_seam_api_port(),
-                        coord_mcp,
-                        &served,
-                    ),
-                    payload.brief.as_ref(),
+            compose_continuation_terminal_system_prompt(
+                crate::terminal::runner_context(
+                    crate::terminal::spawn_seam_api_port(),
+                    coord_mcp,
+                    &served,
                 ),
+                payload.brief.as_ref(),
                 ctx.as_ref().map_or(&[][..], |c| c.sibling_notes.as_slice()),
+                workdir,
+                no_worktree_cause,
             ),
         ));
         // The marker the policy hook's route trusts as proof of delivery — taken
@@ -8112,18 +8593,11 @@ async fn run_condition_check_terminal(
         return Err(anyhow::anyhow!(reason));
     }
 
-    // Spread across non-full pages (same picker + ceiling as the gate path).
-    let counts: Vec<(String, usize)> = {
-        let mut per_page: std::collections::HashMap<String, usize> =
-            std::collections::HashMap::new();
-        for info in terminal_manager.list() {
-            *per_page.entry(info.page_id).or_insert(0) += 1;
-        }
-        per_page.into_iter().collect()
-    };
-    let target_page = pick_continuation_page(&counts, CONTINUATION_PAGE_ZONE_CEILING, || {
-        uuid::Uuid::new_v4().to_string()
-    });
+    // Spread across pages with room (the one page-capacity rule, as the gate path).
+    let target_page = crate::terminal::page_placement::pick_page_for_new_session(
+        &terminal_manager,
+        crate::terminal::page_placement::lifecycle_store(&app).as_deref(),
+    );
 
     // Kept for the start verdict below: the transcript probe looks in the
     // selected account's config dir first.
@@ -8248,19 +8722,20 @@ async fn run_condition_check_terminal(
 ///   order and its `workdir_not_a_checkout` / `no_isolated_worktree`
 ///   refusals), `None` context, and a fresh correlation UUID.
 /// - `Err` also when acquire succeeds but returns no worktrees.
+///
+/// `no_worktree_cause` is set only when a worktree was intended and the
+/// acquire FAILED, so the session can be told its cwd is the fallback.
 async fn acquire_continuation_workdir(
     repos: &[String],
     intent: &str,
     agent_session_id: Option<uuid::Uuid>,
-) -> anyhow::Result<(
-    String,
-    Option<crate::agent_worktree::isolated_edit::IsolatedEditContext>,
-    uuid::Uuid,
-)> {
+) -> anyhow::Result<ContinuationWorkdir> {
     use crate::agent_worktree::isolated_edit::{acquire, AcquireRequest};
 
     // Why no worktree came back, carried into a foreign repo's refusal.
     let mut no_worktree_because = String::new();
+    // Set only on a FAILED acquire: the cause the session's note carries.
+    let mut no_worktree_cause: Option<String> = None;
     if !repos.is_empty() {
         let acquired = acquire(AcquireRequest {
             repos,
@@ -8281,15 +8756,28 @@ async fn acquire_continuation_workdir(
             // "Not done here"); such a session uses the mid-session
             // `POST /agent-worktrees/edit-sibling` door.
             edit_siblings: &[],
+            // Unattended, no user waiting: retry through intermittent coord
+            // failures before taking the workspace-root fallback (plan
+            // 2026-10-31-continuation-worktree-acquire-failure-strands-the-allocation-and-tells-the-session-nothing
+            // D2/D3).
+            transport_retry: crate::agent_worktree::acquire_retry::CONTINUATION_TRANSPORT_RETRY,
         })
         .await;
-        let ctx = match settle_continuation_acquire(acquired) {
-            Ok(ctx) => Some(ctx),
-            Err(because) => {
-                no_worktree_because = because;
-                None
-            }
-        };
+        let settled = settle_continuation_acquire(acquired);
+        if let ContinuationAcquire::Failed(cause) = &settled {
+            // Names the continuation (its anchor rides on `intent`) and the
+            // pinned session id the allocate carried, so a session can join its
+            // own fallback to this line instead of inferring it from timing.
+            warn!(
+                intent = %intent,
+                agent_session_id = ?agent_session_id,
+                "agent_runtime: gate-continuation acquire failed ({cause}); \
+                 taking the fallback cwd"
+            );
+            no_worktree_cause = Some(cause.clone());
+        }
+        no_worktree_because = settled.because();
+        let ctx = settled.into_context();
         if let Some(ctx) = ctx {
             let workdir = ctx
                 .worktrees
@@ -8302,7 +8790,12 @@ async fn acquire_continuation_workdir(
             // to a fresh one for lifecycle correlation only.
             let agent_id =
                 uuid::Uuid::parse_str(&ctx.agent_id).unwrap_or_else(|_| uuid::Uuid::now_v7());
-            return Ok((workdir, Some(ctx), agent_id));
+            return Ok(ContinuationWorkdir {
+                workdir,
+                ctx: Some(ctx),
+                agent_id,
+                no_worktree_cause: None,
+            });
         }
     }
 
@@ -8367,7 +8860,58 @@ async fn acquire_continuation_workdir(
     )
     // Unprefixed: the refusal's detail must START with its stable token.
     .map_err(|e| anyhow::anyhow!(e))?;
-    Ok((workdir, None, uuid::Uuid::now_v7()))
+    Ok(ContinuationWorkdir {
+        workdir,
+        ctx: None,
+        agent_id: uuid::Uuid::now_v7(),
+        no_worktree_cause,
+    })
+}
+
+/// The working directory a gate continuation runs in, and what it knows about
+/// how it got there.
+struct ContinuationWorkdir {
+    workdir: String,
+    /// The held context when a worktree was materialized (keeps the claim
+    /// heartbeat alive).
+    ctx: Option<crate::agent_worktree::isolated_edit::IsolatedEditContext>,
+    /// coord's agent id, or a fresh one for lifecycle correlation only.
+    agent_id: uuid::Uuid,
+    /// `Some(cause)` only when a worktree was intended and the acquire
+    /// failed, so `workdir` is the fallback; the session is told so.
+    no_worktree_cause: Option<String>,
+}
+
+/// How a continuation's worktree acquire settled (plan 2026-10-31 Phase 2).
+/// Discriminated because the two no-worktree arms mean different things to the
+/// session: mode-off never intended a worktree, a failure did.
+#[derive(Debug, PartialEq, Eq)]
+enum ContinuationAcquire<C> {
+    Acquired(C),
+    /// `Ok(None)`: worktree mode is off or the acquire was declined.
+    WorktreeModeOff,
+    /// The acquire failed; the error's text.
+    Failed(String),
+}
+
+impl<C> ContinuationAcquire<C> {
+    /// The cause string carried into a foreign repo's refusal (unchanged).
+    fn because(&self) -> String {
+        match self {
+            ContinuationAcquire::Acquired(_) => String::new(),
+            ContinuationAcquire::WorktreeModeOff => {
+                "worktree mode is off or the acquire was declined".to_string()
+            }
+            ContinuationAcquire::Failed(e) => format!("worktree acquire failed: {e}"),
+        }
+    }
+
+    fn into_context(self) -> Option<C> {
+        match self {
+            ContinuationAcquire::Acquired(c) => Some(c),
+            _ => None,
+        }
+    }
 }
 
 /// The `spawn_failed` detail posted for a continuation whose cwd could not be
@@ -8402,20 +8946,14 @@ fn continuation_acquire_failure_detail(err: &str) -> String {
 /// root-first order and refuses a foreign repo with a typed reason.
 fn settle_continuation_acquire<C>(
     acquired: Result<Option<C>, crate::agent_worktree::AllocateError>,
-) -> Result<C, String> {
+) -> ContinuationAcquire<C> {
     match acquired {
-        Ok(Some(ctx)) => Ok(ctx),
+        Ok(Some(ctx)) => ContinuationAcquire::Acquired(ctx),
         Ok(None) => {
             debug!("agent_runtime: gate-continuation worktree mode off — using the fallback cwd");
-            Err("worktree mode is off or the acquire was declined".to_string())
+            ContinuationAcquire::WorktreeModeOff
         }
-        Err(e) => {
-            warn!(
-                "agent_runtime: gate-continuation acquire failed ({e}); \
-                 taking the fallback cwd"
-            );
-            Err(format!("worktree acquire failed: {e}"))
-        }
+        Err(e) => ContinuationAcquire::Failed(e.to_string()),
     }
 }
 
@@ -11177,6 +11715,85 @@ mod tests {
         );
     }
 
+    /// Plan 2026-10-31 Phase 2: a continuation that took the fallback because
+    /// its acquire FAILED says so in BOTH composed prompts — the system prompt
+    /// on the terminal presentation, the prompt on the headless one — and in
+    /// neither when a worktree was acquired or none was intended.
+    #[test]
+    fn a_fallback_session_is_told_its_cwd_in_both_presentations() {
+        let cause = "worktree acquire failed: POST https://coord/claims/acquire: \
+                     error sending request: connection refused [connect] (after 9 attempts)";
+        let term = super::compose_continuation_terminal_system_prompt(
+            "RUNNER-CTX".to_string(),
+            None,
+            &[],
+            "D:/qontinui-root",
+            Some(cause),
+        );
+        let head = super::compose_continuation_headless_full_prompt(
+            "do the follow-up",
+            None,
+            &[],
+            "D:/qontinui-root",
+            Some(cause),
+        );
+        for out in [&term, &head] {
+            assert!(out.contains("Workspace note from the runner"), "{out}");
+            assert!(out.contains("`D:/qontinui-root`"), "{out}");
+            assert!(out.contains("not an isolated worktree"), "{out}");
+            assert!(out.contains("connection refused"), "{out}");
+            assert!(out.contains("allocate-worktree.sh"), "{out}");
+        }
+        assert!(term.starts_with("RUNNER-CTX\n\n"), "{term}");
+        assert!(head.starts_with("do the follow-up\n\n"), "{head}");
+
+        // Acquired, or worktree mode off: no note on either carrier.
+        let term = super::compose_continuation_terminal_system_prompt(
+            "RUNNER-CTX".to_string(),
+            None,
+            &[],
+            "D:/w",
+            None,
+        );
+        let head =
+            super::compose_continuation_headless_full_prompt("do it", None, &[], "D:/w", None);
+        assert_eq!(term, "RUNNER-CTX");
+        assert_eq!(head, "do it");
+    }
+
+    /// The cause is forced onto one bounded line: a multi-line coord body can
+    /// neither forge extra prompt lines nor run unbounded.
+    #[test]
+    fn the_no_worktree_cause_is_one_bounded_line() {
+        let long = format!("first line\nsecond line\r\n{}", "x".repeat(5000));
+        let out = super::append_no_worktree_note("B".to_string(), "D:/r", Some(&long));
+        let note = out.strip_prefix("B\n\n").expect("blank-line separated");
+        assert!(!note.contains('\n') && !note.contains('\r'), "{note}");
+        assert!(note.contains("first line second line"), "{note}");
+        assert!(note.chars().count() < 1200, "{}", note.chars().count());
+        assert_eq!(
+            super::append_no_worktree_note("B".to_string(), "D:/r", None),
+            "B"
+        );
+    }
+
+    /// Only a FAILED acquire yields a cause; mode-off and acquired do not.
+    #[test]
+    fn only_a_failed_acquire_carries_a_note_cause() {
+        use crate::agent_worktree::AllocateError;
+        let failed =
+            super::settle_continuation_acquire::<u8>(Err(AllocateError::Other("boom".into())));
+        assert_eq!(failed, super::ContinuationAcquire::Failed("boom".into()));
+        assert_eq!(failed.because(), "worktree acquire failed: boom");
+        assert!(super::settle_continuation_acquire::<u8>(Ok(None))
+            .into_context()
+            .is_none());
+        assert_eq!(
+            super::settle_continuation_acquire(Ok(Some(3u8))).into_context(),
+            Some(3)
+        );
+    }
+
     use super::*;
 
     // ── presentation boot readiness (plan 2026-09-17-a-gate-continuation-
@@ -11855,10 +12472,6 @@ mod tests {
         );
     }
 
-    /// Sentinel returned by the test mint closure so a mint outcome is
-    /// unambiguous and deterministic (no uuid in tests).
-    const MINTED: &str = "MINTED";
-
     fn s(v: &str) -> Option<String> {
         Some(v.to_string())
     }
@@ -12018,77 +12631,6 @@ mod tests {
         );
         assert!(!fobj.contains_key("phase"));
         assert!(!fobj.contains_key("push_ref"));
-    }
-
-    fn page(id: &str, n: usize) -> (String, usize) {
-        (id.to_string(), n)
-    }
-
-    #[test]
-    fn pick_continuation_page_default_under_ceiling_picks_default() {
-        let counts = [page("default", 3), page("p1", 9)];
-        assert_eq!(
-            pick_continuation_page(&counts, 9, || MINTED.to_string()),
-            "default"
-        );
-    }
-
-    #[test]
-    fn pick_continuation_page_default_full_picks_nonfull_other() {
-        // default at the ceiling, p1 under it → p1.
-        let counts = [page("default", 9), page("p1", 4)];
-        assert_eq!(
-            pick_continuation_page(&counts, 9, || MINTED.to_string()),
-            "p1"
-        );
-        // default over the ceiling behaves the same.
-        let counts = [page("default", 12), page("p1", 4)];
-        assert_eq!(
-            pick_continuation_page(&counts, 9, || MINTED.to_string()),
-            "p1"
-        );
-    }
-
-    #[test]
-    fn pick_continuation_page_default_full_picks_fewest_terminals() {
-        let counts = [
-            page("default", 9),
-            page("p1", 7),
-            page("p2", 2),
-            page("p3", 5),
-        ];
-        assert_eq!(
-            pick_continuation_page(&counts, 9, || MINTED.to_string()),
-            "p2"
-        );
-    }
-
-    #[test]
-    fn pick_continuation_page_tie_breaks_lexicographically() {
-        // p_b and p_a tie at count 3 → smallest page_id wins (p_a).
-        let counts = [page("default", 9), page("p_b", 3), page("p_a", 3)];
-        assert_eq!(
-            pick_continuation_page(&counts, 9, || MINTED.to_string()),
-            "p_a"
-        );
-    }
-
-    #[test]
-    fn pick_continuation_page_everything_full_mints() {
-        let counts = [page("default", 9), page("p1", 9), page("p2", 11)];
-        assert_eq!(
-            pick_continuation_page(&counts, 9, || MINTED.to_string()),
-            MINTED
-        );
-    }
-
-    #[test]
-    fn pick_continuation_page_empty_counts_picks_default() {
-        let counts: [(String, usize); 0] = [];
-        assert_eq!(
-            pick_continuation_page(&counts, 9, || MINTED.to_string()),
-            "default"
-        );
     }
 
     /// The pinned `--session-id <uuid>` pair sits among the flags, BEFORE
@@ -14178,7 +14720,7 @@ mod tests {
     fn launchable_or_bare_falls_back_for_a_non_executable_file() {
         use std::os::unix::fs::PermissionsExt;
         let _env_lock = env_lock();
-        let prev_bin = std::env::var("QONTINUI_CLAUDE_BIN").ok();
+        let _restore = crate::test_env::EnvVarRestore::capture(&["QONTINUI_CLAUDE_BIN"]);
         std::env::remove_var("QONTINUI_CLAUDE_BIN");
         let tmp = tempfile::tempdir().unwrap();
         let f = tmp.path().join("claude");
@@ -14188,9 +14730,6 @@ mod tests {
         std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
         let exec = launchable_or_bare(f.to_string_lossy().into_owned());
         let missing = launchable_or_bare(tmp.path().join("gone").to_string_lossy().into_owned());
-        if let Some(v) = prev_bin {
-            std::env::set_var("QONTINUI_CLAUDE_BIN", v);
-        }
         assert_eq!(non_exec, "claude");
         assert_eq!(exec, f.to_string_lossy());
         assert_eq!(missing, "claude");
@@ -14199,13 +14738,9 @@ mod tests {
     #[test]
     fn claude_bin_respects_env_override() {
         let _env_lock = env_lock();
-        let prev = std::env::var("QONTINUI_CLAUDE_BIN").ok();
+        let _restore = crate::test_env::EnvVarRestore::capture(&["QONTINUI_CLAUDE_BIN"]);
         std::env::set_var("QONTINUI_CLAUDE_BIN", "/some/fake/claude-fixture");
         assert_eq!(claude_bin_path(), "/some/fake/claude-fixture");
-        match prev {
-            Some(v) => std::env::set_var("QONTINUI_CLAUDE_BIN", v),
-            None => std::env::remove_var("QONTINUI_CLAUDE_BIN"),
-        }
     }
 
     /// Smoke test using a fake claude binary fixture (the existing
@@ -14263,7 +14798,7 @@ mod tests {
     #[tokio::test]
     async fn a_stalled_child_is_reported_but_never_touched() {
         let _env_lock = env_lock();
-        let prev = std::env::var("QONTINUI_SPAWN_STALL_SECS").ok();
+        let _restore = crate::test_env::EnvVarRestore::capture(&["QONTINUI_SPAWN_STALL_SECS"]);
         std::env::set_var("QONTINUI_SPAWN_STALL_SECS", "1");
 
         let tmp = std::env::temp_dir();
@@ -14291,11 +14826,6 @@ mod tests {
             exit, 0,
             "the stall watch reports; it must never kill or alter the child"
         );
-
-        match prev {
-            Some(v) => std::env::set_var("QONTINUI_SPAWN_STALL_SECS", v),
-            None => std::env::remove_var("QONTINUI_SPAWN_STALL_SECS"),
-        }
     }
 
     /// The terminal arm launches the `claude` CLI with the prompt as a single
@@ -14307,7 +14837,7 @@ mod tests {
     #[test]
     fn terminal_continuation_command_is_interactive_positional_prompt() {
         let _env_lock = env_lock();
-        let prev = std::env::var("QONTINUI_CLAUDE_BIN").ok();
+        let _restore = crate::test_env::EnvVarRestore::capture(&["QONTINUI_CLAUDE_BIN"]);
         std::env::set_var("QONTINUI_CLAUDE_BIN", "/fake/claude");
 
         // Mirror the construction in `run_continuation_terminal` (a fixed-size
@@ -14324,11 +14854,6 @@ mod tests {
             !command.iter().any(|a| a == "--print" || a == "-p"),
             "must NOT use --print/-p: the session must stay interactive"
         );
-
-        match prev {
-            Some(v) => std::env::set_var("QONTINUI_CLAUDE_BIN", v),
-            None => std::env::remove_var("QONTINUI_CLAUDE_BIN"),
-        }
     }
 
     /// Phase 3 of `2026-08-20-worktree-spawn-autonomy-and-trust-preconditions`:
@@ -14496,10 +15021,22 @@ mod tests {
                 current_holder: "sibling-continuation".to_string(),
                 intent: None,
             }));
-        let because = settle_continuation_acquire(conflict).unwrap_err();
+        let settled = settle_continuation_acquire(conflict);
+        let because = settled.because();
         assert!(because.contains("claim already held"), "{because}");
-        assert!(settle_continuation_acquire::<u8>(Ok(None)).is_err());
-        assert_eq!(settle_continuation_acquire(Ok(Some(7u8))), Ok(7));
+        assert!(matches!(settled, ContinuationAcquire::Failed(_)));
+        assert_eq!(
+            settle_continuation_acquire::<u8>(Ok(None)),
+            ContinuationAcquire::WorktreeModeOff
+        );
+        assert_eq!(
+            settle_continuation_acquire::<u8>(Ok(None)).because(),
+            "worktree mode is off or the acquire was declined"
+        );
+        assert_eq!(
+            settle_continuation_acquire(Ok(Some(7u8))),
+            ContinuationAcquire::Acquired(7)
+        );
     }
 
     /// The terminal presentation's refusal arrives as text. A trust-gate
@@ -14739,6 +15276,7 @@ mod tests {
             None,
             AnchorReservation::none(),
             uuid::Uuid::new_v4(),
+            None,
         )
         .await;
         assert!(
@@ -14819,7 +15357,10 @@ mod tests {
         // The headless arm passes `--session-id <uuid>`, which a bare `sh`
         // rejects as an illegal option, so on Unix the fake is a tiny script
         // that RECORDS its argv (one arg per line) and runs stdin through `sh`.
-        let prev = std::env::var("QONTINUI_CLAUDE_BIN").ok();
+        let _restore = crate::test_env::EnvVarRestore::capture(&[
+            "QONTINUI_CLAUDE_BIN",
+            "QONTINUI_TRUST_GATE_TIER",
+        ]);
         let fake_dir = tempfile::tempdir().expect("tempdir for fake claude");
         let argv_file = fake_dir.path().join("argv");
         let fake_bin = if cfg!(target_os = "windows") {
@@ -14854,7 +15395,6 @@ mod tests {
         // the dial to `proceed` (today's live tenant value) so this test keeps
         // asserting the SPAWN path rather than the gate. The env override is the
         // same injectable seam the dial-flip tests use.
-        let prev_tier = std::env::var("QONTINUI_TRUST_GATE_TIER").ok();
         std::env::set_var("QONTINUI_TRUST_GATE_TIER", "proceed");
         let agent_id = uuid::Uuid::now_v7();
         let pinned = uuid::Uuid::new_v4();
@@ -14866,10 +15406,6 @@ mod tests {
             pinned,
         )
         .await;
-        match prev_tier {
-            Some(v) => std::env::set_var("QONTINUI_TRUST_GATE_TIER", v),
-            None => std::env::remove_var("QONTINUI_TRUST_GATE_TIER"),
-        }
         assert!(
             res.is_ok(),
             "gate-continuation headless dispatch must spawn + return Ok: {res:?}"
@@ -14901,11 +15437,6 @@ mod tests {
                 "the headless child carries its permission flags {expected:?} ahead of \
                  --session-id: {args:?}"
             );
-        }
-
-        match prev {
-            Some(v) => std::env::set_var("QONTINUI_CLAUDE_BIN", v),
-            None => std::env::remove_var("QONTINUI_CLAUDE_BIN"),
         }
     }
 
@@ -15121,6 +15652,632 @@ mod tests {
             claim_gate_dispatch_attempt(sealed, 1),
             "only a re-delivery gets back in"
         );
+    }
+
+    // =========================================================================
+    // Plan 2026-10-09-a-re-listed-gate-continuation-is-silently-dropped-and-a-
+    // deferral-streak-has-no-clock, Phase 2 (runner): the poll path keys on
+    // max(payload retry, coord's continuation_spawn_attempts), and a poll row
+    // dropped against a Sealed attempt is loud and counted.
+    // =========================================================================
+
+    /// A `pending-continuations` row for `gate`, with
+    /// `continuation_spawn_attempts` set to `spawn_attempts` (absent on `None`)
+    /// and the payload carrying NO `retry` block — coord's re-drive leaves the
+    /// persisted payload unchanged, which is the shape of the incident.
+    fn pending_row(
+        gate: uuid::Uuid,
+        spawn_attempts: Option<serde_json::Value>,
+    ) -> PendingContinuation {
+        let mut row = serde_json::json!({
+            "gate_id": gate,
+            "dispatched_at": "2026-10-08T22:00:53Z",
+            "payload": {
+                "target_device_id": "11111111-1111-1111-1111-111111111111",
+                "initial_prompt": "/implement-plan x",
+                "repos": [],
+                "source": "gate_continuation",
+            },
+        });
+        if let Some(v) = spawn_attempts {
+            row["continuation_spawn_attempts"] = v;
+        }
+        serde_json::from_value(row).expect("pending row parses")
+    }
+
+    /// Coord accepted attempt `attempt`'s consume claim: claim it as a first
+    /// WS delivery and seal it exactly as the dispatcher's settle does.
+    fn claim_and_seal(gate: uuid::Uuid, attempt: u32) {
+        assert_eq!(
+            gate_claim_verdict(gate, ContinuationDelivery::Payload, attempt),
+            GateClaimVerdict::Claim
+        );
+        assert_eq!(
+            settle_claim_decision(
+                &SpawnDecision::Spawn,
+                ConsumeTarget::Gate(gate, attempt),
+                gate
+            ),
+            ClaimOutcome::Spawn
+        );
+    }
+
+    /// One poll-loop row, exactly as [`poll_pending_continuations`] maps it
+    /// ([`poll_row_delivery`]) and as the dispatcher classifies it
+    /// ([`gate_claim_verdict`] → [`gate_verdict_skip_outcome`]), folded into
+    /// `counts`. Only the I/O around the claim (registry check, coord consume
+    /// claim, spawn) is left out; a claimed row is counted as dispatched.
+    fn poll_one_row(row: PendingContinuation, counts: &mut PollRunCounts) -> GateClaimVerdict {
+        let (payload, delivery) = poll_row_delivery(row, current_claim_epoch());
+        let gate = payload
+            .gate_id
+            .expect("poll_row_delivery stamps the row's gate_id");
+        let verdict = gate_claim_verdict(gate, delivery, delivery.attempt(&payload));
+        counts.record(
+            gate_verdict_skip_outcome(gate, verdict).unwrap_or(DispatchOutcome::Dispatched),
+        );
+        verdict
+    }
+
+    /// A poll-row delivery at `attempt` whose list was fetched NOW (after every
+    /// claim made so far).
+    fn poll_at(attempt: u32) -> ContinuationDelivery {
+        ContinuationDelivery::GatePollRow {
+            attempt,
+            listed_epoch: current_claim_epoch(),
+        }
+    }
+
+    /// Review finding (adoption of #2277): the poll loop reads the pending
+    /// list, then awaits each row; in that gap the WS copy of a re-driven
+    /// episode can claim (0, Held) and be SEALED. The list still names the row
+    /// at K, but the frame already consumed it, so the row must be a duplicate
+    /// — not a new episode (a double spawn) and not `sealed_but_relisted` (a
+    /// false contradiction). Listed again after that claim, a row still
+    /// pending is a genuine re-drive and claims.
+    #[test]
+    fn a_seal_made_after_the_listing_pins_the_listed_row() {
+        for k in [0_u32, 1, 3] {
+            let gate = uuid::Uuid::now_v7();
+            let listed_epoch = current_claim_epoch();
+            claim_and_seal(gate, 0);
+            let stale_listing = ContinuationDelivery::GatePollRow {
+                attempt: k,
+                listed_epoch,
+            };
+            assert_eq!(
+                gate_claim_verdict(gate, stale_listing, k),
+                GateClaimVerdict::Duplicate,
+                "k={k}: the frame consumed the row after the list was read"
+            );
+            let expected = if k == 0 {
+                GateClaimVerdict::SealedButRelisted
+            } else {
+                GateClaimVerdict::Claim
+            };
+            assert_eq!(
+                gate_claim_verdict(gate, poll_at(k), k),
+                expected,
+                "k={k}: a listing made after the seal is read as coord means it"
+            );
+        }
+    }
+
+    /// Re-review finding (adoption of #2277): the frame's claim is made BEFORE
+    /// the poll reads its list, and coord accepts its consume AFTER (the POST
+    /// was in flight while the GET read the row). The seal re-stamps the
+    /// entry, so the listed row is still pinned — not a second spawn.
+    #[test]
+    fn a_claim_before_the_listing_sealed_after_it_pins_the_listed_row() {
+        for k in [0_u32, 2] {
+            let gate = uuid::Uuid::now_v7();
+            assert_eq!(
+                gate_claim_verdict(gate, ContinuationDelivery::Payload, 0),
+                GateClaimVerdict::Claim
+            );
+            let listed_epoch = current_claim_epoch();
+            settle_claim_decision(&SpawnDecision::Spawn, ConsumeTarget::Gate(gate, 0), gate);
+            let listing = ContinuationDelivery::GatePollRow {
+                attempt: k,
+                listed_epoch,
+            };
+            assert_eq!(
+                gate_claim_verdict(gate, listing, k),
+                GateClaimVerdict::Duplicate,
+                "k={k}: consumed after the list was read"
+            );
+        }
+    }
+
+    /// The accepted gap: a `SpawnDespiteClaimError` spawn leaves its claim
+    /// `Held` (coord may still list the row for the episode that ran), so a
+    /// poll row at any attempt stays a duplicate — never a second spawn.
+    #[test]
+    fn a_spawn_despite_claim_error_pins_its_gate() {
+        let gate = uuid::Uuid::now_v7();
+        assert_eq!(
+            gate_claim_verdict(gate, ContinuationDelivery::Payload, 0),
+            GateClaimVerdict::Claim
+        );
+        assert_eq!(
+            settle_claim_decision(
+                &SpawnDecision::SpawnDespiteClaimError {
+                    cause: "coord 503".into()
+                },
+                ConsumeTarget::Gate(gate, 0),
+                gate
+            ),
+            ClaimOutcome::Spawn
+        );
+        for k in [0_u32, 1, 4] {
+            assert_eq!(
+                gate_claim_verdict(gate, poll_at(k), k),
+                GateClaimVerdict::Duplicate,
+                "k={k}"
+            );
+        }
+        assert!(
+            !should_warn_pinned_behind_held(gate, std::time::Instant::now()),
+            "the pinned-behind-Held warning already fired for this gate this hour"
+        );
+
+        // A claim made after the listing is the ordinary race: dropped, but
+        // it does not warn (the limiter is still unarmed for that gate).
+        let raced = uuid::Uuid::now_v7();
+        let listed_epoch = current_claim_epoch();
+        assert_eq!(
+            gate_claim_verdict(raced, ContinuationDelivery::Payload, 0),
+            GateClaimVerdict::Claim
+        );
+        let listing = ContinuationDelivery::GatePollRow {
+            attempt: 2,
+            listed_epoch,
+        };
+        assert_eq!(
+            gate_claim_verdict(raced, listing, 2),
+            GateClaimVerdict::Duplicate
+        );
+        assert!(
+            should_warn_pinned_behind_held(raced, std::time::Instant::now()),
+            "the raced drop did not consume the gate's warning"
+        );
+    }
+
+    /// `poll_row_delivery` stamps the row's authoritative gate id onto a
+    /// payload that omitted it, and keys the delivery on the row's episode.
+    #[test]
+    fn poll_row_delivery_stamps_the_gate_and_keys_on_the_row_episode() {
+        let gate = uuid::Uuid::now_v7();
+        let row = pending_row(gate, Some(serde_json::json!(2)));
+        assert_eq!(row.payload.gate_id, None, "coord omitted it inside payload");
+        let (payload, delivery) = poll_row_delivery(row, 7);
+        assert_eq!(payload.gate_id, Some(gate));
+        assert_eq!(
+            delivery,
+            ContinuationDelivery::GatePollRow {
+                attempt: 2,
+                listed_epoch: 7
+            }
+        );
+        assert_eq!(delivery.attempt(&payload), 2);
+    }
+
+    /// `continuation_spawn_attempts` is read leniently (one bad row must never
+    /// drop the whole pending list), and the poll row's attempt is the MAX of
+    /// it and the payload's `retry.attempt`.
+    #[test]
+    fn a_poll_row_attempt_is_the_max_of_retry_and_spawn_attempts() {
+        let gate = uuid::Uuid::now_v7();
+        for (raw, want) in [
+            (None, 0),
+            (Some(serde_json::Value::Null), 0),
+            (Some(serde_json::json!(-1)), 0),
+            (Some(serde_json::json!(1.5)), 0),
+            (Some(serde_json::json!("garbage")), 0),
+            (Some(serde_json::json!({"n": 2})), 0),
+            // Out of u32 range reads 0, never u32::MAX (which would pin the
+            // claim above every attempt coord could send).
+            (Some(serde_json::json!(u64::from(u32::MAX) + 1)), 0),
+            (
+                Some(serde_json::json!((u64::from(u32::MAX) + 1).to_string())),
+                0,
+            ),
+            (Some(serde_json::json!("2")), 2),
+            (Some(serde_json::json!(3)), 3),
+        ] {
+            let row = pending_row(gate, raw.clone());
+            assert_eq!(
+                row.continuation_spawn_attempts, want,
+                "continuation_spawn_attempts={raw:?}"
+            );
+            assert_eq!(row.dispatch_attempt(), want);
+        }
+
+        // A whole response with one garbled counter still yields every row.
+        let body: PendingContinuationsResponse = serde_json::from_value(serde_json::json!({
+            "pending": [
+                {
+                    "gate_id": gate, "continuation_spawn_attempts": "x",
+                    "payload": {"target_device_id": "11111111-1111-1111-1111-111111111111",
+                                "initial_prompt": "p", "source": "gate_continuation"}
+                },
+                {
+                    "gate_id": gate, "continuation_spawn_attempts": 4,
+                    "payload": {"target_device_id": "11111111-1111-1111-1111-111111111111",
+                                "initial_prompt": "p", "source": "gate_continuation"}
+                },
+            ],
+            "total": 2,
+        }))
+        .expect("a garbled counter never fails the list");
+        assert_eq!(body.pending.len(), 2);
+        assert_eq!(body.pending[0].dispatch_attempt(), 0);
+        assert_eq!(body.pending[1].dispatch_attempt(), 4);
+
+        // max(): a payload retry above the counter wins, and vice versa.
+        let mut row = pending_row(gate, Some(serde_json::json!(1)));
+        row.payload.retry = Some(
+            serde_json::from_value(serde_json::json!({"attempt": 3, "family": "spawn"}))
+                .expect("retry parses"),
+        );
+        assert_eq!(
+            row.dispatch_attempt(),
+            3,
+            "retry.attempt above the counter wins"
+        );
+        row.continuation_spawn_attempts = 5;
+        assert_eq!(
+            row.dispatch_attempt(),
+            5,
+            "the counter above retry.attempt wins"
+        );
+    }
+
+    /// Test (a): attempt 0 sealed (coord accepted it, the run then failed and
+    /// coord re-drove the row, bumping `continuation_spawn_attempts` to 1 but
+    /// leaving the payload alone). The re-listed poll row claims and
+    /// dispatches — before this phase it was dropped for the process's life.
+    #[test]
+    fn a_redriven_poll_row_claims_past_a_sealed_attempt() {
+        let gate = uuid::Uuid::now_v7();
+        claim_and_seal(gate, 0);
+        // The error-path release after the failed run is a no-op on a seal.
+        release_gate_dispatch_attempt(gate, 0);
+
+        let row = pending_row(gate, Some(serde_json::json!(1)));
+        assert_eq!(row.payload.retry_attempt(), 0, "coord sent no retry block");
+        let mut counts = PollRunCounts {
+            listed_n: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            poll_one_row(row, &mut counts),
+            GateClaimVerdict::Claim,
+            "the re-driven episode claims and dispatches"
+        );
+        let v = serde_json::to_value(ContinuationPollReportBody::new(gate, counts)).unwrap();
+        assert_eq!(v["dispatched_n"], 1);
+        assert_eq!(v["skipped_n"], 0);
+        assert!(v.get("sealed_but_relisted_gate_ids").is_none());
+
+        // …and the next re-listing of the SAME episode is a plain duplicate,
+        // not a second spawn.
+        let mut next = PollRunCounts {
+            listed_n: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            poll_one_row(pending_row(gate, Some(serde_json::json!(1))), &mut next),
+            GateClaimVerdict::Duplicate,
+            "attempt 1 is held in flight, so its re-listing is an ordinary duplicate"
+        );
+        assert_eq!(next.already_dispatched, 1);
+        assert_eq!(next.dispatched_n, 0);
+    }
+
+    /// Test (b): the same re-listed row WITHOUT a bumped counter (an older
+    /// coord, or a row coord lists without re-driving) is still dropped — the
+    /// seal holds — but now as `sealed_but_relisted`: counted under its own
+    /// skip reason (not `already_dispatched`) and named in the id list.
+    #[test]
+    fn a_relisted_row_against_a_sealed_attempt_is_counted_and_named() {
+        for raw in [Some(serde_json::json!(0)), None] {
+            let gate = uuid::Uuid::now_v7();
+            claim_and_seal(gate, 0);
+
+            let row = pending_row(gate, raw.clone());
+            let mut counts = PollRunCounts {
+                listed_n: 1,
+                ..Default::default()
+            };
+            assert_eq!(
+                poll_one_row(row, &mut counts),
+                GateClaimVerdict::SealedButRelisted,
+                "spawn_attempts={raw:?}: dropped, and classified as the contradiction"
+            );
+            assert_eq!(counts.already_dispatched, 0, "a partition, not a subset");
+            assert_eq!(counts.dispatched_n, 0);
+            let v = serde_json::to_value(ContinuationPollReportBody::new(gate, counts)).unwrap();
+            assert_eq!(v["skipped_n"], 1);
+            assert_eq!(
+                v["skip_reasons"],
+                serde_json::json!({ "sealed_but_relisted": 1 }),
+                "skip_reasons stays count-only"
+            );
+            assert_eq!(
+                v["sealed_but_relisted_gate_ids"],
+                serde_json::json!([gate.to_string()])
+            );
+        }
+
+        // The seal is never re-opened by a re-listing: the next one is
+        // classified the same way, not claimed.
+        let gate = uuid::Uuid::now_v7();
+        claim_and_seal(gate, 0);
+        let poll = poll_at(0);
+        assert_eq!(
+            gate_claim_verdict(gate, poll, 0),
+            GateClaimVerdict::SealedButRelisted
+        );
+        assert_eq!(
+            gate_claim_verdict(gate, poll, 0),
+            GateClaimVerdict::SealedButRelisted
+        );
+
+        // A poll row at an attempt only HELD (in flight, coord has not
+        // accepted it yet) is an ordinary duplicate, not a contradiction.
+        let held = uuid::Uuid::now_v7();
+        assert_eq!(
+            gate_claim_verdict(held, ContinuationDelivery::Payload, 0),
+            GateClaimVerdict::Claim
+        );
+        assert_eq!(
+            gate_claim_verdict(held, poll, 0),
+            GateClaimVerdict::Duplicate
+        );
+    }
+
+    /// The `sealed_but_relisted` warning fires at most once per gate per hour.
+    #[test]
+    fn sealed_but_relisted_warning_is_rate_limited_per_gate() {
+        let gate_a = uuid::Uuid::now_v7();
+        let gate_b = uuid::Uuid::now_v7();
+        let t0 = std::time::Instant::now();
+        assert!(
+            should_warn_sealed_but_relisted(gate_a, t0),
+            "first sighting warns"
+        );
+        assert!(
+            !should_warn_sealed_but_relisted(gate_a, t0 + Duration::from_secs(300)),
+            "the next backstop poll's sighting is suppressed"
+        );
+        assert!(
+            !should_warn_sealed_but_relisted(
+                gate_a,
+                t0 + SEALED_BUT_RELISTED_WARN_INTERVAL - Duration::from_secs(1)
+            ),
+            "still suppressed just inside the window"
+        );
+        assert!(
+            should_warn_sealed_but_relisted(gate_a, t0 + SEALED_BUT_RELISTED_WARN_INTERVAL),
+            "warns again once the hour has elapsed"
+        );
+        assert!(
+            should_warn_sealed_but_relisted(gate_b, t0),
+            "a different gate is independent"
+        );
+    }
+
+    /// Test (c): the double-spawn guard is untouched on the WS path. A frame
+    /// at attempt 0 after attempt 0 was sealed is dropped as a plain duplicate
+    /// — the WS path keys on the payload's `retry` alone, and it is never
+    /// classified as `sealed_but_relisted` (a WS frame is a second copy of an
+    /// episode, not coord re-listing a pending row).
+    #[test]
+    fn a_ws_frame_at_a_sealed_attempt_is_still_dropped() {
+        let gate = uuid::Uuid::now_v7();
+        claim_and_seal(gate, 0);
+        let frame: GateContinuationPayload = serde_json::from_value(serde_json::json!({
+            "target_device_id": "11111111-1111-1111-1111-111111111111",
+            "initial_prompt": "/implement-plan x",
+            "source": "gate_continuation",
+            "gate_id": gate,
+        }))
+        .expect("frame parses");
+        let attempt = ContinuationDelivery::Payload.attempt(&frame);
+        assert_eq!(attempt, 0);
+        assert_eq!(
+            gate_claim_verdict(gate, ContinuationDelivery::Payload, attempt),
+            GateClaimVerdict::Duplicate
+        );
+        // Even after a re-driven poll claimed attempt 1, a late attempt-0
+        // frame stays dropped.
+        assert_eq!(
+            gate_claim_verdict(gate, poll_at(1), 1),
+            GateClaimVerdict::Claim
+        );
+        assert_eq!(
+            gate_claim_verdict(gate, ContinuationDelivery::Payload, attempt),
+            GateClaimVerdict::Duplicate,
+            "a stale frame never re-runs a sealed episode"
+        );
+    }
+
+    /// Test (d), the race in the plan's Risks: attempt N is HELD (in flight,
+    /// not yet settled) when coord's re-drive lists the row at N+1. Coord's
+    /// consume claim carries no attempt and answers every copy, so the
+    /// in-process dedupe is the only guard: a poll row meeting a Held claim is
+    /// a duplicate at ANY attempt, and only a Sealed prior lets the counter
+    /// open N+1 — exactly once, however many copies race it.
+    #[test]
+    fn a_held_attempt_and_a_redriven_poll_yield_exactly_one_claim() {
+        const N: u32 = 2;
+
+        // Held N + poll N+1 => Duplicate (no second consume claim leaves).
+        let gate = uuid::Uuid::now_v7();
+        assert_eq!(
+            gate_claim_verdict(gate, ContinuationDelivery::Payload, N),
+            GateClaimVerdict::Claim,
+            "attempt N in flight"
+        );
+        let mut counts = PollRunCounts::default();
+        assert_eq!(
+            poll_one_row(
+                pending_row(gate, Some(serde_json::json!(N + 1))),
+                &mut counts
+            ),
+            GateClaimVerdict::Duplicate,
+            "a poll row never advances past a Held claim"
+        );
+        assert_eq!(counts.already_dispatched, 1);
+        assert_eq!(counts.dispatched_n, 0);
+
+        // N's task settles: coord accepted it (seal), and its error path
+        // releases (a no-op on a seal). Now Sealed N + poll N+1 => Claim, and
+        // when that copy races on many threads exactly one wins.
+        settle_claim_decision(&SpawnDecision::Spawn, ConsumeTarget::Gate(gate, N), gate);
+        release_gate_dispatch_attempt(gate, N);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    gate_claim_verdict(gate, poll_at(N + 1), N + 1)
+                })
+            })
+            .collect();
+        let verdicts: Vec<GateClaimVerdict> = handles
+            .into_iter()
+            .map(|h| h.join().expect("thread"))
+            .collect();
+        assert_eq!(
+            verdicts
+                .iter()
+                .filter(|v| **v == GateClaimVerdict::Claim)
+                .count(),
+            1,
+            "exactly one claim path for N+1: {verdicts:?}"
+        );
+        assert!(
+            verdicts
+                .iter()
+                .all(|v| matches!(v, GateClaimVerdict::Claim | GateClaimVerdict::Duplicate)),
+            "a held (unsealed) N+1 makes the losers plain duplicates: {verdicts:?}"
+        );
+
+        // Copies of N (WS frame or poll) arriving now are stale.
+        assert_eq!(
+            gate_claim_verdict(gate, ContinuationDelivery::Payload, N),
+            GateClaimVerdict::Duplicate
+        );
+        assert_eq!(
+            gate_claim_verdict(gate, poll_at(N), N),
+            GateClaimVerdict::Duplicate
+        );
+
+        // N+1 is then accepted by coord; a re-listing at N+1 is now the
+        // sealed contradiction, and still never a second claim.
+        settle_claim_decision(
+            &SpawnDecision::Spawn,
+            ConsumeTarget::Gate(gate, N + 1),
+            gate,
+        );
+        assert_eq!(
+            gate_claim_verdict(gate, poll_at(N + 1), N + 1),
+            GateClaimVerdict::SealedButRelisted
+        );
+    }
+
+    /// The review-round double spawn: coord's main writes no `retry` block, so
+    /// a WS republish of a re-driven row arrives as attempt 0 while its poll
+    /// copy arrives as attempt K >= 1. On a process holding nothing for the
+    /// gate (after a restart, a reconnect replay + republish), the frame
+    /// claims (0, Held); the poll copy at K must then be a duplicate, or both
+    /// reach coord's consume claim, which answers both.
+    #[test]
+    fn a_ws_frame_at_zero_then_its_poll_copy_at_k_yield_one_claim() {
+        for k in [1_u32, 3] {
+            let gate = uuid::Uuid::now_v7();
+            let frame: GateContinuationPayload = serde_json::from_value(serde_json::json!({
+                "target_device_id": "11111111-1111-1111-1111-111111111111",
+                "initial_prompt": "/implement-plan x",
+                "source": "gate_continuation",
+                "gate_id": gate,
+            }))
+            .expect("frame parses");
+            let ws_attempt = ContinuationDelivery::Payload.attempt(&frame);
+            assert_eq!(ws_attempt, 0, "coord main sends no retry block");
+            assert_eq!(
+                gate_claim_verdict(gate, ContinuationDelivery::Payload, ws_attempt),
+                GateClaimVerdict::Claim,
+                "nothing held: the frame claims (0, Held)"
+            );
+
+            let mut counts = PollRunCounts::default();
+            assert_eq!(
+                poll_one_row(pending_row(gate, Some(serde_json::json!(k))), &mut counts),
+                GateClaimVerdict::Duplicate,
+                "k={k}: the poll copy of the same episode never claims past Held"
+            );
+            assert_eq!(counts.dispatched_n, 0, "k={k}: one claim, not two");
+            assert_eq!(counts.already_dispatched, 1);
+
+            // Once the frame's attempt is released (a local skip that left the
+            // row pending), the poll copy may claim — that is the release
+            // contract, and still a single claim.
+            release_gate_dispatch_attempt(gate, 0);
+            let mut after = PollRunCounts::default();
+            assert_eq!(
+                poll_one_row(pending_row(gate, Some(serde_json::json!(k))), &mut after),
+                GateClaimVerdict::Claim,
+                "k={k}: a Released prior lets the poll's counter advance"
+            );
+            assert_eq!(
+                gate_claim_verdict(gate, ContinuationDelivery::Payload, 0),
+                GateClaimVerdict::Duplicate,
+                "k={k}: and the stale frame cannot claim again"
+            );
+        }
+    }
+
+    /// Test (e): the id list is capped at 20 while the count stays exact.
+    #[test]
+    fn sealed_but_relisted_gate_ids_are_capped_at_twenty() {
+        let ids: Vec<uuid::Uuid> = (0..25).map(|_| uuid::Uuid::now_v7()).collect();
+        let mut counts = PollRunCounts {
+            listed_n: 26,
+            ..Default::default()
+        };
+        for id in &ids {
+            counts.record(DispatchOutcome::SealedButRelisted(*id));
+        }
+        counts.record(DispatchOutcome::AlreadyDispatched);
+        assert_eq!(counts.sealed_but_relisted, 25);
+        assert_eq!(
+            counts.sealed_but_relisted_gate_ids.len(),
+            SEALED_BUT_RELISTED_GATE_IDS_CAP
+        );
+        assert_eq!(SEALED_BUT_RELISTED_GATE_IDS_CAP, 20);
+        assert_eq!(
+            counts.sealed_but_relisted_gate_ids[..],
+            ids[..20],
+            "the first 20, in poll order"
+        );
+
+        let dev = uuid::Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        let v = serde_json::to_value(ContinuationPollReportBody::new(dev, counts)).unwrap();
+        assert_eq!(v["skipped_n"], 26);
+        assert_eq!(
+            v["skip_reasons"],
+            serde_json::json!({ "already_dispatched": 1, "sealed_but_relisted": 25 })
+        );
+        let wire_ids = v["sealed_but_relisted_gate_ids"]
+            .as_array()
+            .expect("an array");
+        assert_eq!(wire_ids.len(), 20);
+        assert_eq!(wire_ids[0], serde_json::json!(ids[0].to_string()));
+        assert_eq!(wire_ids[19], serde_json::json!(ids[19].to_string()));
     }
 
     /// The `retry` key parses into the typed annotation, is absent on a first
@@ -15619,6 +16776,8 @@ mod tests {
                 already_dispatched: 2,
                 not_addressed_to_self: 1,
                 spawn_authorization_denied: 0,
+                sealed_but_relisted: 0,
+                sealed_but_relisted_gate_ids: Vec::new(),
                 fetch_failed: false,
             },
         );
@@ -16920,8 +18079,8 @@ mod tests {
     /// The sibling test above (`dedup_takes_precedence_over_thread_pressure`)
     /// pins which verdict wins; this one pins what a deduped row PAYS. They are
     /// different properties and only one of them is about the incident: on the
-    /// live path the closure is `resource_guard::probe_for_spawn`, whose body is
-    /// a `settings.json` stat + parse, a `claude_accounts` load, a memory read
+    /// live path the closure is `resource_guard::AdmissionReading::live`, whose
+    /// `lane_verdicts` read is a `settings.json` stat + parse, a `claude_accounts` load, a memory read
     /// and — on Windows — a system-wide `CreateToolhelp32Snapshot`. `poll_pending_continuations`
     /// spawns one task per row coord returns, on a route coord serves with no
     /// `LIMIT`, so with the verdict passed as an argument expression a batch of

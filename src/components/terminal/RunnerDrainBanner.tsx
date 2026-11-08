@@ -35,6 +35,12 @@ export interface DrainBannerModel {
    * Identity of the drain episode this banner describes, for dismissal. Built
    * from the fields that stay fixed for an episode — not from `detail`, whose
    * unknown-state cause is rewritten on every read (failure count, read age).
+   *
+   * A drained episode is `until` alone — the backend's own boundary
+   * (`DrainTracker::set`'s `entered_drained` in `coord_drain_state.rs`). Not
+   * `reason`: the heartbeat enters `drained` with no reason and the follow-up
+   * `me/drain` read fills it in for the same `until`, so keying on it would
+   * undo a dismissal made in that window.
    */
   episodeKey: string;
 }
@@ -79,7 +85,7 @@ export function drainBannerModel(s: CoordDrainSnapshot | null): DrainBannerModel
       detail: parts.length > 0 ? parts.join(" · ") : null,
       deferredLabel: deferredLabel(s.deferredCount, s.deferredCapped ?? false),
       restoreNote: RESTORE_NOTE,
-      episodeKey: `drained|${s.until ?? ""}|${s.reason ?? ""}`,
+      episodeKey: `drained|${s.until ?? ""}`,
     };
   }
   // At boot the state is "not read yet" until the first drain read lands; that
@@ -98,6 +104,19 @@ export function drainBannerModel(s: CoordDrainSnapshot | null): DrainBannerModel
   return null;
 }
 
+/**
+ * The dismissal that survives the current render. Only one episode is current
+ * at a time, so a dismissal of any other key — or of anything while no banner
+ * shows — is spent. Without this, drained(X) → unknown → drained(X), which the
+ * backend counts as a new episode, would come back already collapsed.
+ */
+export function liveDismissal(
+  dismissedKey: string | null,
+  currentKey: string | null,
+): string | null {
+  return dismissedKey !== null && dismissedKey === currentKey ? dismissedKey : null;
+}
+
 export function RunnerDrainBanner() {
   const model = drainBannerModel(useCoordDrainState());
   // Dismissal is per drain episode (`episodeKey`): a new drain, a
@@ -105,10 +124,9 @@ export function RunnerDrainBanner() {
   // Dismissing only collapses the notice to a small icon — spawns stay
   // deferred, so the runner keeps saying so; clicking it brings the banner back.
   const [dismissedKey, setDismissedKey] = useState<string | null>(null);
-  if (!model) {
-    if (dismissedKey !== null) setDismissedKey(null);
-    return null;
-  }
+  const live = liveDismissal(dismissedKey, model?.episodeKey ?? null);
+  if (live !== dismissedKey) setDismissedKey(live);
+  if (!model) return null;
   const key = model.episodeKey;
   const Icon = model.status === "error" ? AlertTriangle : PauseCircle;
   const drainState = model.status === "error" ? "unknown" : "drained";

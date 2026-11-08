@@ -15,9 +15,12 @@
 //!
 //! The synonym table is one literal map whose candidate lists name both the
 //! web verb (`click`) and the native verb (`press`); the per-element accepted
-//! filter chooses between them. Phase 8 of plan
-//! `2026-10-22-runner-ui-bridge-makes-an-agent-guess-its-own-vocabulary` (D3)
-//! plans a TypeScript copy for the ui-bridge SDK. No test would span the two.
+//! filter chooses between them. The ui-bridge SDK carries TypeScript copies
+//! (`packages/ui-bridge/src/control/actionVocabulary.ts` and its
+//! `ui-bridge-native` twin; plan
+//! `2026-10-22-runner-ui-bridge-makes-an-agent-guess-its-own-vocabulary`, D3 /
+//! Phase 8), whose `foldVerb` matches `fold_verb`. No test spans the copies;
+//! each pins its own entries as literals, so keep them in sync.
 
 use serde_json::{json, Value};
 

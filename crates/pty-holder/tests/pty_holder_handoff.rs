@@ -7,6 +7,9 @@
 //! Windows this suite has exactly one test, IGNORED with the reason — it
 //! reports "not applicable", never "passed".
 
+#[cfg(unix)]
+mod common;
+
 #[cfg(not(unix))]
 #[test]
 #[ignore = "not applicable: holder upgrade (plan Phase 8, D12a) is Unix-only — a Windows holder answers prepare_upgrade with `unsupported`"]
@@ -62,6 +65,12 @@ mod unix {
         PaneId::new("p1").unwrap()
     }
 
+    /// Pane p1's staged successor socket — in the shared socket root, not in
+    /// the pane dir (`pane::socket_path`).
+    fn staged_socket(dir: &Path) -> PathBuf {
+        qontinui_pty_holder::transport::staged_socket_path(dir, &p1()).unwrap()
+    }
+
     fn alive(pid: u32) -> bool {
         // SAFETY: signal 0 only checks for existence.
         unsafe { libc::kill(pid as i32, 0) == 0 }
@@ -98,7 +107,7 @@ mod unix {
             kill_verified(self.child_pid, &self.child_token);
             let _ = self.holder.kill();
             let _ = self.holder.wait();
-            let _ = std::fs::remove_dir_all(&self.dir);
+            let _ = crate::common::remove_pane_dir(&self.dir);
         }
     }
 
@@ -857,7 +866,7 @@ mod unix {
         assert_eq!(hello.child_pid, Some(pane.child_pid));
         no_snapshot_left(&dir);
         assert!(
-            !dir.join("p1.sock.upg").exists(),
+            !staged_socket(&dir).exists(),
             "no staged socket left behind"
         );
         let mut s = attach(&dir, None);
@@ -983,7 +992,7 @@ mod unix {
             assert_eq!(count(&r2.bytes, b"got:held"), 1, "{fault}: held input once");
             no_snapshot_left(&dir);
             assert!(
-                !dir.join("p1.sock.upg").exists(),
+                !staged_socket(&dir).exists(),
                 "{fault}: no staged socket left"
             );
             // The upgrade is not stuck "in progress": a second request runs
@@ -1094,9 +1103,9 @@ mod unix {
         let got = std::fs::read_to_string(&file).unwrap_or_default();
         assert_eq!(got.matches("held").count(), 1, "held input once: {got:?}");
         assert_eq!(got.matches("after").count(), 1, "{got:?}");
-        let _ = std::fs::remove_dir_all(&out);
+        let _ = crate::common::remove_pane_dir(&out);
         no_snapshot_left(&dir);
-        assert!(!dir.join("p1.sock.upg").exists());
+        assert!(!staged_socket(&dir).exists());
     }
 
     /// Review r3 nit (path C): the successor's endpoint rename FAILS after the
@@ -1178,7 +1187,7 @@ mod unix {
             matches!(probe(&dir, &p1(), soon()), Probe::Unknown { .. }),
             "unreachable but held: UNKNOWN, never dead"
         );
-        let _ = std::fs::remove_dir_all(&out);
+        let _ = crate::common::remove_pane_dir(&out);
     }
 
     /// Review r4, H2: the faults several tests here rely on exist only in a

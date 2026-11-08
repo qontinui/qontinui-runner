@@ -28,6 +28,7 @@
  */
 
 import { useCallback, useEffect, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { describeThrown } from "@/lib/utils";
@@ -70,22 +71,34 @@ interface ConflictEvent {
 }
 
 /**
- * Dashboard URL used to open the full conflict-resolution surface.
+ * Production dashboard origin, used only when the runner cannot resolve one.
  *
- * Pinned to the staging dashboard for now. When the runner gets a
- * setting for dashboard-base-URL (Phase 7+ tenant/SSO work) the const
- * will become a setting read.
+ * The real origin comes from the runner's `get_web_frontend_origin` command
+ * (`$QONTINUI_WEB_FRONTEND_BASE`, then the Web Integration "web frontend"
+ * setting, then derived from the API base), so a dev or staging runner opens
+ * its own dashboard rather than production's.
  */
-const DASHBOARD_BASE_URL = "https://qontinui.io";
+const FALLBACK_DASHBOARD_BASE_URL = "https://qontinui.io";
 
-function dashboardUrlFor(conflict: ConflictEvent): string {
+async function resolveDashboardBase(): Promise<string> {
+  try {
+    const origin = await invoke<string>("get_web_frontend_origin");
+    const trimmed = origin.trim().replace(/\/+$/, "");
+    return trimmed || FALLBACK_DASHBOARD_BASE_URL;
+  } catch (e) {
+    console.error("ConflictModal: get_web_frontend_origin failed; using production", e);
+    return FALLBACK_DASHBOARD_BASE_URL;
+  }
+}
+
+function dashboardUrlFor(base: string, conflict: ConflictEvent): string {
   // If we know the session id, open the session-detail panel directly;
   // otherwise drop to the list and let the operator find it.
   const sessionId = conflict.sessionMetadata?.session_id;
   if (sessionId) {
-    return `${DASHBOARD_BASE_URL}/sessions/${encodeURIComponent(sessionId)}`;
+    return `${base}/sessions/${encodeURIComponent(sessionId)}`;
   }
-  return `${DASHBOARD_BASE_URL}/sessions`;
+  return `${base}/sessions`;
 }
 
 export function ConflictModal() {
@@ -122,7 +135,7 @@ export function ConflictModal() {
     setOpening(true);
     setOpenError(null);
     try {
-      await openUrl(dashboardUrlFor(conflict));
+      await openUrl(dashboardUrlFor(await resolveDashboardBase(), conflict));
       // Auto-dismiss once we hand off to the dashboard.
       setConflict(null);
     } catch (e) {

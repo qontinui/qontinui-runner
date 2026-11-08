@@ -106,7 +106,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 /// Wall-clock bound on ALL the `git` spawns one probe runs, together. The
-/// same 5 s class as `provision_guard::PROBE_BUDGET`: generous for a few local
+/// same 5 s class as `provision_guard::PROBE_TIMEOUT`: generous for a few local
 /// reads, tight for a spawn an operator is waiting on.
 pub(crate) const PROBE_BUDGET: Duration = Duration::from_secs(5);
 

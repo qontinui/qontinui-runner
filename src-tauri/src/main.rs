@@ -123,6 +123,8 @@ mod dom_capture;
 mod drain;
 mod egress; // Plan 2026-10-10-spec-front-end-phase-9-generic-boundary Phase 7 — per-tenant egress switches
 #[cfg(test)]
+mod runner_close_sites;
+#[cfg(test)]
 mod runner_spawn_sites;
 // `embedded_pg` lives in the LIB crate as of P4 (lib-side consumers need it).
 // Re-bound here as `pub(crate)` so every existing `crate::embedded_pg::...`
@@ -226,7 +228,7 @@ mod prompt_snippets;
 mod prompts;
 /// The `qontinui-provenance:` frontmatter key both fleet provisioners stamp.
 mod provenance;
-/// The shared tracked-destination guard both fleet provisioners consult.
+/// The shared tracked-destination guard every fleet provisioner consults.
 mod provision_guard;
 mod rag;
 mod recording;
@@ -1683,6 +1685,11 @@ fn main() {
     // Enable backtraces in crash dumps for better diagnostics
     std::env::set_var("RUST_BACKTRACE", "1");
 
+    // Every `claude` the runner spawns inherits DISABLE_AUTOUPDATER=1, so no
+    // runner-hosted session swaps the shared binary under its live peers
+    // (lifecycle plan Phase 82; `session::claude_hook` module docs).
+    session::claude_hook::export_auto_updater_off();
+
     // Export the machine profile's outbound-network settings (HTTPS_PROXY /
     // HTTP_PROXY from `network.proxy_url` when the operator set neither, and
     // NO_PROXY always including loopback) into this process's environment, so
@@ -2259,7 +2266,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // one-shot best-effort sweep of stale credential-helper
                 // config files (%TEMP%/qontinui-git-cred-*.json older than
                 // 24h). Sessions normally remove their own file via the
-                // SessionRegistry::close funnel; the sweep reaps files
+                // SessionRegistry::close_by_id funnel; the sweep reaps files
                 // orphaned by crashes/kills. Never fails or slows the boot.
                 credential_helper::spawn_startup_sweep();
                 // Scheduled-maintenance executor (Phase 1, plan
@@ -3464,6 +3471,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::setup_wizard::complete_setup,
             commands::setup_wizard::detect_project_framework_for_setup,
             commands::setup_wizard::discover_claude_config_dirs,
+            commands::setup_wizard::add_claude_config_dirs_from_setup,
             commands::setup_wizard::github_clone_repo,
             commands::setup_wizard::github_connect_url,
             commands::setup_wizard::github_list_repos,
@@ -3703,6 +3711,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::watchers::update_watcher,
             commands::web_integration::get_settings_health,
             commands::web_integration::get_web_integration_status,
+            commands::web_integration::get_web_frontend_origin,
             commands::web_integration::redeem_pair_code,
             commands::web_integration::save_web_integration_settings,
             commands::web_integration::test_web_integration_connection,
@@ -4795,11 +4804,24 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         // stays the only per-record syscall. The claude-present
                         // signal needs image names and the PID-reuse guard needs
                         // creation times — both carried on the snapshot.
-                        let snap_captured_at_ms = chrono::Utc::now().timestamp_millis();
+                        let asked_at_ms = chrono::Utc::now().timestamp_millis();
                         let snap = crate::process_capture::process_tree::snapshot_process_table_public().await;
+                        // The table may be up to the provider's memo TTL older
+                        // than this call, so stamp the epoch with when ITS read
+                        // began — a lower bound on every row's observation —
+                        // not with the time it was asked for. A table no read
+                        // produced (observed_at_ms 0) is UNKNOWN and records
+                        // nothing (`tick_snapshot_ok` below).
+                        let snap_captured_at_ms = if snap.observed_at_ms > 0 {
+                            snap.observed_at_ms.min(asked_at_ms)
+                        } else {
+                            asked_at_ms
+                        };
                         // A totally-empty system parent_map means the snapshot
-                        // helper failed → classify Skips every matched record.
-                        let tick_snapshot_ok = !snap.parent_map.is_empty();
+                        // helper failed, and a `stale` one is the last good
+                        // table, not this tick's → classify Skips every
+                        // matched record.
+                        let tick_snapshot_ok = !snap.is_unknown();
 
                         // D1 identity refresh. Claude Code's per-process
                         // registry is the ONLY source for the account + name an
@@ -5381,10 +5403,11 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
                 // Tier-0 looping-agent supervisor (plan merge-shepherd-fixer,
                 // Phase 1): opens/seeds the durable looping-agents registry
-                // (built-in Merge Shepherd, DISABLED until the operator flips
-                // it), manages it for the control-surface commands, and starts
-                // the supervised tick loop (idle-nudge on cadence, context-low
-                // / K-cycle fresh relaunch, dead-tab respawn). Placed after the
+                // (built-in Merge Shepherd, ENABLED by default; spawning still
+                // needs a coord slot lease), manages it for the control-surface
+                // commands, and starts the supervised tick loop (idle-nudge on
+                // cadence, context-low / K-cycle fresh relaunch, dead-tab
+                // respawn). Placed after the
                 // lifecycle store manage so restart re-attach can resolve
                 // boot-restored tabs; the loop itself waits a boot-settle delay
                 // before its first tick.
@@ -6557,9 +6580,11 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // runners whose Settings/Terminal UI never polls usage. This
                 // loop ONLY refreshes the cache — re-picking is deferred to
                 // the next unit of AI work (so warm-provider prompt-cache
-                // locality within a unit is preserved). The account half is a
-                // no-op unless ≥2 accounts are configured; the prepaid half
-                // (`refresh_fleet_usage_report`) reports regardless.
+                // locality within a unit is preserved). Both halves report
+                // on every runner: the account half covers a single configured
+                // account, or the effective account when no list is configured,
+                // while the startup refresh above stays a no-op below two
+                // accounts so it never delays the first pick.
                 //
                 // The immediate first tick is NOT skipped: it is the first
                 // prepaid report, run here rather than in the startup call

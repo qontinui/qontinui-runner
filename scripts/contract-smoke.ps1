@@ -289,14 +289,6 @@ $SKIP_ROUTES = @{
 # longer declares -- is refused before any probe, -DryRun included.
 # ---------------------------------------------------------------------------
 $SDK_AHEAD_ROUTES = @{
-    # In-situ media override (SDK 835aa75, ui-bridge 0.35.0): handlers are
-    # qontinui-runner#2311 (image plan Phase 18), not on main. The ui-bridge pin
-    # moved past 835aa75 to reach POST /control/text-visibility (ui-bridge#265).
-    # #2311 deletes these three entries, and the three sdk_only_baseline lines
-    # in mod.rs, when it lands.
-    "GET /control/media/override"    = "handlers are qontinui-runner#2311, not on main"
-    "POST /control/media/override"   = "handlers are qontinui-runner#2311, not on main"
-    "DELETE /control/media/override" = "handlers are qontinui-runner#2311, not on main"
 }
 
 # ---------------------------------------------------------------------------
@@ -668,6 +660,11 @@ function Start-DirectRunner {
         "QONTINUI_SECURE_STORAGE_DIR" = $configDir
         "WEBVIEW2_USER_DATA_FOLDER"   = $webviewDir
         "QONTINUI_DISABLE_KEYCHAIN"   = "1"
+        # ~/.qontinui inside our temp tree as well: the runner writes its
+        # loopback key and breadcrumbs under qontinui_dir() (ambient.rs, which
+        # honours QONTINUI_HOME), and on a persistent self-hosted account those
+        # files would otherwise outlive this job in the real profile.
+        "QONTINUI_HOME"               = (Join-Path $tmpRoot "home")
         # Pin the runner's startup-panic log into our temp tree. The runner
         # writes <QONTINUI_RUNNER_LOG_DIR>/runner-panic.log on any early-init
         # panic (startup_panic.rs); an exit code 2 is *defined* as a panic
@@ -1168,7 +1165,11 @@ try {
             # returns a structured JSON error envelope (success:false / any
             # non-empty JSON error) is route-matched-but-resource-not-found --
             # the route IS registered, so PASS. A genuinely unregistered route
-            # falls through to axum's empty-body default 404 -> keep FAIL.
+            # is answered by the runner's router fallback (not_found_handler),
+            # which ALSO returns a structured envelope, so the body's presence
+            # proves nothing: its code == NOT_FOUND with an error starting
+            # "No route for" marks it unregistered -> keep FAIL. (An empty
+            # body is unregistered too.) See CONTRACT.md "404 discriminator".
             $hasParam = $r.Path -match ":[A-Za-z]+"
             $isStructuredErr = $false
             $rawBody = $res[1]
@@ -1176,9 +1177,12 @@ try {
                 try {
                     $parsed = $rawBody | ConvertFrom-Json
                     if ($null -ne $parsed) {
-                        $hasSuccessFalse = ($parsed.PSObject.Properties.Name -contains 'success') -and (-not $parsed.success)
-                        $hasErrorField = ($parsed.PSObject.Properties.Name -contains 'error') -and ($null -ne $parsed.error)
-                        if ($hasSuccessFalse -or $hasErrorField) { $isStructuredErr = $true }
+                        $names = $parsed.PSObject.Properties.Name
+                        $hasSuccessFalse = ($names -contains 'success') -and (-not $parsed.success)
+                        $hasErrorField = ($names -contains 'error') -and ($null -ne $parsed.error)
+                        $isRouteFallback = ($names -contains 'code') -and ($parsed.code -eq 'NOT_FOUND') -and
+                            $hasErrorField -and ([string]$parsed.error).StartsWith("No route for ", [System.StringComparison]::Ordinal)
+                        if (($hasSuccessFalse -or $hasErrorField) -and -not $isRouteFallback) { $isStructuredErr = $true }
                     }
                 } catch {
                     $isStructuredErr = $false

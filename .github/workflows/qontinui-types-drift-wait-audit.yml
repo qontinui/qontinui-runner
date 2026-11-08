@@ -1,0 +1,248 @@
+name: qontinui-types drift wait audit
+
+# Daily audit of the runner-leads wait that `qontinui-types drift` may absorb.
+# Plan: qontinui-dev-notes plans/2026-11-05-runner-leads-schemas-pair-reds-runner-main-for-the-partners-land-latency.md
+#
+# WHY. A push run of `qontinui-types drift` on main that finds runner main ahead
+# of schemas main because a declared runner-leads partner has not landed yet
+# re-checks against that partner and, on a full green, passes with a warning
+# (see that workflow's header). Coord then scores runner main GREEN until the
+# next push run touching that workflow's paths — which may be days away. If the
+# partner closes unlanded, or the 72 h bound passes, nothing in that workflow
+# would say so in between. This job does: it reads the NEWEST GREEN push run of
+# `qontinui-types drift` on main among the last 20 completed ones and, when that
+# run absorbed a wait, reds on a wait that is no longer valid. It audits that
+# green even when a later run is red or cancelled: coord keeps the last
+# conclusive baseline over a cancelled/stale run (`is_supersession_conclusion`)
+# and over a red whose failing jobs were all cancelled, so a later non-green
+# run does not prove coord stopped scoring the absorbed green — and a red here
+# holds nothing, so a redundant alarm is cheap. It regenerates nothing and reads
+# only GitHub plus at most three shallow git fetches.
+#
+# The re-check never applies the partner's codegen/pending-registration.toml
+# (main's rows decide), so there are no PR-side rows for this audit to police.
+#
+# "Landed" is decided by CONTENT: the absorbed commit's changes to the generated
+# files, from its merge base, reverse-apply cleanly to schemas main — so a land
+# by merge, fast-forward, rebase or squash all count, including one where main
+# had edited a shared barrel first (a whole-blob comparison would not).
+#
+# Known false alarms, all of which fail closed: a land whose generated files
+# main then edited again (within a hunk's context) before this runs reads
+# "partner gone unlanded" when the PR is closed, or "Waiting, valid" and then
+# "wait expired" when it was left open (the phantom-open shape); and a merge
+# from main into the partner PR (its head moves) reads "partner moved". The
+# thaw resolves either. One false green it does not see: a partner whose head
+# sha itself reached main (a merge, or a fast-forward of an up-to-date head) and
+# was then REVERTED on schemas main still compares behind; schemas' own drift
+# check reds on that revert.
+#
+# It also alarms on a drift red that a cancel or a lost runner during the wait's
+# extra minutes turned into a run coord reads as no verdict.
+#
+# WHY A SEPARATE WORKFLOW — the same reason as qontinui-schemas'
+# pending-registration-audit.yml: coord scores main per (repo, workflow name), so
+# scheduled runs inside `qontinui-types drift` could feed coord's baseline
+# freshness reads for that gate. A `schedule` run of THIS workflow establishes no
+# baseline (`establishes_main_baseline()` accepts `push` only), so its red is an
+# alarm that holds nothing. Acting on it: land the partner's bindings, or push a
+# thaw (any edit to qontinui-types-drift.yml) so the push run re-asks.
+#
+# NO push or pull_request trigger, on purpose: a push run WOULD baseline, and a
+# red one would freeze as a runner main-red that no schedule run can clear; a
+# pull_request run would audit live production state and red an unrelated PR.
+# Its logic is exercised by qontinui-types-drift-wait-tests.yml against fixtures.
+
+on:
+  schedule:
+    - cron: "23 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+  checks: read
+  pull-requests: read
+
+concurrency:
+  group: qontinui-types-drift-wait-audit
+  cancel-in-progress: true
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Audit the newest absorbed runner-leads wait
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUNNER_REPO: ${{ github.repository }}
+          # Test-only seams (scripts/tests/qontinui-types-drift-wait/run.sh), empty here.
+          DRIFT_WAIT_TEST_API: ""
+          DRIFT_WAIT_TEST_GIT_URL: ""
+          DRIFT_WAIT_TEST_NOW: ""
+        run: |
+          set -euo pipefail
+          SCHEMAS=qontinui/qontinui-schemas
+          TITLE='runner main is ahead of schemas main (declared wait)'
+          BOUND_SECS=$((72 * 3600))
+          now="${DRIFT_WAIT_TEST_NOW:-$(date -u +%s)}"
+          git_url="${DRIFT_WAIT_TEST_GIT_URL:-https://github.com/${SCHEMAS}.git}"
+          unknown() { echo "::error title=drift wait audit: UNKNOWN::${1}. An unread wait is not a valid one, so this audit reds."; exit 1; }
+          get() { # get <path> -> body on stdout; rc 1 on any non-2xx
+            if [ -n "${DRIFT_WAIT_TEST_API}" ]; then
+              local f; f="${DRIFT_WAIT_TEST_API}/$(printf '%s' "$1" | tr '/?=&' '____')"
+              [ -f "${f}" ] && cat "${f}"; return
+            fi
+            curl -sS --fail --connect-timeout 10 --max-time 60 --retry 2 --retry-connrefused \
+              -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" "https://api.github.com/$1"
+          }
+
+          runs="$(get "repos/${RUNNER_REPO}/actions/workflows/qontinui-types-drift.yml/runs?event=push&branch=main&status=completed&per_page=20")" \
+            || unknown "could not list qontinui-types drift push runs on main"
+          nruns="$(jq -er '.workflow_runs | if type == "array" then length else error("no array") end' <<<"${runs}")" || unknown "the runs list has no workflow_runs array"
+          if [ "${nruns}" -eq 0 ]; then echo "No completed push run of qontinui-types drift on main — nothing to audit."; exit 0; fi
+          # A drift red coord may have read as NO verdict. Off pull_request the
+          # drift check is continue-on-error, so a red is followed by up to 55
+          # minutes of partner search and re-check; a cancel or a lost runner in
+          # that window ends the run in a shape coord skips, keeping the last
+          # green over a genuine red. So every completed run newer than the newest
+          # green is read: one whose drift check went red and whose decide step
+          # reached neither verdict alarms. timed_out is not read — coord keeps it
+          # as a real red.
+          pre="$(jq -r '.workflow_runs | ((map(.conclusion) | index("success")) // length) as $i | .[:$i][] | select(.conclusion != "timed_out") | .id' <<<"${runs}")" \
+            || unknown "the runs list has an entry this audit cannot read"
+          for prid in ${pre}; do
+            pjobs="$(get "repos/${RUNNER_REPO}/actions/runs/${prid}/jobs?per_page=100")" || unknown "could not read run ${prid}'s jobs"
+            nv="$(jq -er '[.jobs[] | select(any(.steps[]?; .name == "Check for drift"))
+                    | select(any(.steps[]?; (.name == "Check for drift" and .conclusion == "failure")
+                                         or (.name == "Find a waiting runner-leads partner" and ((.conclusion // "skipped") != "skipped"))))
+                    | select(any(.steps[]?; .name == "Decide the drift verdict" and (.conclusion == "failure" or .conclusion == "success")) | not)
+                  ] | length' <<<"${pjobs}")" || unknown "run ${prid}'s jobs are not JSON"
+            if [ "${nv}" -ne 0 ]; then
+              echo "::error title=drift wait audit: drift red read as no verdict::Push run ${prid} of qontinui-types drift went red at its drift check and ended before the decide step reached a verdict (a cancel or a lost runner during the partner search or re-check). Coord may be keeping an older green over that red: push a thaw (any edit to qontinui-types-drift.yml) so a push run re-asks."
+              exit 1
+            fi
+          done
+          run="$(jq -c '[.workflow_runs[] | select(.conclusion == "success")] | first // empty' <<<"${runs}")"
+          if [ -z "${run}" ]; then
+            # No green in the window. A `failure` or `timed_out` is taken as a
+            # red that replaced it — coord keeps both as real signals. Edges this
+            # does not read: a red whose failing jobs were all cancelled,
+            # undispatched, runner-lost or build-killed, which coord skips; 20
+            # of those in a row could leave an older absorbed green out of
+            # reach. A window of only cancelled, stale or other runs: UNKNOWN.
+            conclusive="$(jq '[.workflow_runs[] | select(.conclusion == "failure" or .conclusion == "timed_out")] | length' <<<"${runs}")"
+            [ "${conclusive}" -gt 0 ] || unknown "none of the last ${nruns} push runs of qontinui-types drift is a success or a failure, so the green coord may still hold is out of reach"
+            echo "None of the last ${nruns} push runs of qontinui-types drift is green — nothing absorbed is being scored green."
+            exit 0
+          fi
+          rid="$(jq -r .id <<<"${run}")"; rsha="$(jq -r .head_sha <<<"${run}")"
+          echo "Newest green push run: ${rid} at ${rsha:0:12} (newest completed: $(jq -r '.workflow_runs[0] | "\(.id) \(.conclusion)"' <<<"${runs}"))"
+
+          jobs="$(get "repos/${RUNNER_REPO}/actions/runs/${rid}/jobs?per_page=100")" || unknown "could not read run ${rid}'s jobs"
+          # Key on STEPS, not job names: the drift job is the one that ran
+          # "Check for drift", and it absorbed a wait iff its re-check step
+          # concluded success. No such job at all is UNKNOWN, never "nothing".
+          drift_jobs="$(jq -er '[.jobs[] | select(any(.steps[]?; .name == "Check for drift"))]' <<<"${jobs}")" \
+            || unknown "run ${rid}'s jobs are not JSON"
+          [ "$(jq 'length' <<<"${drift_jobs}")" -gt 0 ] || unknown "no job in run ${rid} ran a 'Check for drift' step (renamed?)"
+          # The re-check step is listed even when skipped; its absence means it
+          # was renamed, and "absorbed nothing" would then be a guess.
+          [ "$(jq '[.[] | select(any(.steps[]?; .name == "Re-check against the waiting partner"))] | length' <<<"${drift_jobs}")" -gt 0 ] \
+            || unknown "no drift job in run ${rid} lists a 'Re-check against the waiting partner' step (renamed?)"
+          absorbed_jids="$(jq -r '.[] | select(any(.steps[]?; .name == "Re-check against the waiting partner" and .conclusion == "success")) | .id' <<<"${drift_jobs}")"
+          if [ -z "${absorbed_jids}" ]; then echo "That run absorbed nothing — runner main was consistent with schemas main."; exit 0; fi
+          msgs="$(mktemp)"
+          for jid in ${absorbed_jids}; do
+            ann="$(get "repos/${RUNNER_REPO}/check-runs/${jid}/annotations?per_page=100")" || unknown "could not read job ${jid}'s annotations"
+            jq -c --arg t "${TITLE}" '.[] | select(.annotation_level == "warning" and .title == $t) | .message' <<<"${ann}" >>"${msgs}" \
+              || unknown "job ${jid}'s annotations are not JSON"
+          done
+          # Exactly ONE distinct absorption message: two would be two partners,
+          # or a forged one, and choosing would be a guess.
+          nmsg="$(sort -u "${msgs}" | grep -c . || true)"
+          [ "${nmsg}" -gt 0 ] || unknown "run ${rid}'s re-check succeeded but carries no '${TITLE}' annotation naming the partner"
+          [ "${nmsg}" -eq 1 ] || unknown "run ${rid} carries ${nmsg} different '${TITLE}' annotations"
+          msg="$(sort -u "${msgs}" | jq -r .)"
+          echo "That run ABSORBED a wait: ${msg}"
+
+          pr="$(sed -nE 's/.*qontinui\/qontinui-schemas#([0-9]+) at ([0-9a-f]{40}),.*/\1/p' <<<"${msg}")"
+          absorbed="$(sed -nE 's/.*qontinui\/qontinui-schemas#([0-9]+) at ([0-9a-f]{40}),.*/\2/p' <<<"${msg}")"
+          stripped="$(sed -nE 's/.*coord stripped the declaration ([0-9TZ:-]+)\).*/\1/p' <<<"${msg}")"
+          { [ -n "${pr}" ] && [ -n "${absorbed}" ] && [ -n "${stripped}" ]; } || unknown "the absorbed run's warning does not name its partner, the absorbed commit and the strip time"
+          se="$(date -u -d "${stripped}" +%s)" || unknown "the absorbed run's strip time '${stripped}' is not a date"
+          age=$(( now - se ))
+
+          # Did the ABSORBED commit's bindings land? A land that keeps the head
+          # sha (a merge, or a fast-forward of an up-to-date head) puts the commit
+          # itself on main, and the compare reads behind/identical (with no
+          # files). A rebase or squash land — coord's rebase-ff land of
+          # schemas#285 was one — puts only its content there, and the compare
+          # reads diverged: then the
+          # absorbed commit's diff from its merge base, over the generated files
+          # it changed, must reverse-apply to schemas main (that is, main already
+          # carries it). The declared-wait toml is left out — other PRs edit it,
+          # and it is not what runner main regenerates.
+          cmp="$(get "repos/${SCHEMAS}/compare/main...${absorbed}")" || unknown "could not compare ${SCHEMAS} main...${absorbed}"
+          cst="$(jq -er .status <<<"${cmp}")" || unknown "the ${SCHEMAS} main...${absorbed} compare has no status"
+          case "${cst}" in
+            behind|identical)
+              echo "The wait has ENDED: the absorbed commit ${absorbed:0:12} is on schemas main (compare ${cst}). The absorbed wait is over; whether runner main still matches schemas main is the next push run's question."
+              exit 0 ;;
+            ahead|diverged) : ;;
+            *) unknown "the ${SCHEMAS} main...${absorbed} compare has status '${cst}'" ;;
+          esac
+          nf="$(jq -er '.files | if type == "array" then length else error("no files") end' <<<"${cmp}")" || unknown "the ${SCHEMAS} main...${absorbed} compare has no files array"
+          [ "${nf}" -lt 300 ] || unknown "the ${SCHEMAS} main...${absorbed} compare lists ${nf} files, the API ceiling, so it may be truncated"
+          gen='select(startswith("ts/src/generated/") or startswith("src/qontinui_schemas/generated/"))'
+          # A jq error here is an unread compare, never an empty half.
+          present_txt="$(jq -r "[.files[] | select(.status != \"removed\") | .filename | ${gen}] | .[]" <<<"${cmp}")" \
+            || unknown "the ${SCHEMAS} main...${absorbed} compare has a file entry the audit cannot read"
+          gone_txt="$(jq -r "[.files[] | ((select(.status == \"removed\") | .filename), (.previous_filename // empty)) | ${gen}] | .[]" <<<"${cmp}")" \
+            || unknown "the ${SCHEMAS} main...${absorbed} compare has a file entry the audit cannot read"
+          [ -n "${present_txt}${gone_txt}" ] || unknown "the absorbed commit ${absorbed} changes no generated file relative to schemas main's merge-base"
+          amb="$(jq -er '.merge_base_commit.sha' <<<"${cmp}")" || unknown "the ${SCHEMAS} main...${absorbed} compare has no merge base"
+          [[ "${amb}" =~ ^[0-9a-f]{40}$ ]] || unknown "the ${SCHEMAS} main...${absorbed} compare's merge base is not a commit id"
+          d="$(mktemp -d)"; git init -q "${d}"; git -C "${d}" remote add origin "${git_url}"
+          git -C "${d}" fetch -q --depth 1 --no-tags origin main || unknown "could not fetch ${SCHEMAS} main"
+          mainsha="$(git -C "${d}" rev-parse FETCH_HEAD)"
+          for c in "${absorbed}" "${amb}"; do
+            git -C "${d}" fetch -q --depth 1 --no-tags origin "${c}" || unknown "could not fetch ${c} from ${SCHEMAS}"
+          done
+          while IFS= read -r f; do
+            [ -n "${f}" ] || continue
+            [ -n "$(git -C "${d}" --literal-pathspecs ls-tree "${absorbed}" -- "${f}")" ] \
+              || unknown "the absorbed commit ${absorbed} has no blob at ${f@Q}, which its own compare lists"
+          done <<<"${present_txt}"
+          mapfile -t paths < <(printf '%s\n%s\n' "${present_txt}" "${gone_txt}" | grep -v '^$' | sort -u)
+          patch="$(mktemp)"
+          git -C "${d}" --literal-pathspecs diff --binary --no-renames "${amb}" "${absorbed}" -- "${paths[@]}" >"${patch}" \
+            || unknown "could not diff the absorbed commit against its merge base"
+          [ -s "${patch}" ] || unknown "the absorbed commit ${absorbed} changes none of its listed generated files relative to its merge base"
+          idx="${d}/main.index"
+          GIT_INDEX_FILE="${idx}" git -C "${d}" read-tree "${mainsha}" || unknown "could not read schemas main's tree"
+          if GIT_INDEX_FILE="${idx}" git -C "${d}" apply --cached --reverse --check "${patch}" 2>/dev/null; then
+            echo "The wait has ENDED: the absorbed commit ${absorbed:0:12}'s binding changes are on schemas main (${mainsha:0:12}) by content (compare ${cst}). The absorbed wait is over; whether runner main still matches schemas main is the next push run's question."
+            exit 0
+          fi
+
+          prj="$(get "repos/${SCHEMAS}/pulls/${pr}")" || unknown "could not read ${SCHEMAS}#${pr}"
+          state="$(jq -er .state <<<"${prj}")" || unknown "${SCHEMAS}#${pr} is not a pull request object"
+          head="$(jq -er .head.sha <<<"${prj}")" || unknown "${SCHEMAS}#${pr} has no head sha"
+          base="$(jq -er .base.ref <<<"${prj}")" || unknown "${SCHEMAS}#${pr} has no base ref"
+          thaw="push a thaw (any edit to .github/workflows/qontinui-types-drift.yml) so the push run re-asks"
+          if [ "${state}" != open ] || [ "${base}" != main ]; then
+            echo "::error title=drift wait audit: partner gone unlanded::Runner main's newest drift push run (${rid}) was absorbed against ${SCHEMAS}#${pr} at ${absorbed:0:12}, whose bindings are NOT on schemas main and which is now ${state} against '${base}'. Coord still scores that gate green. Land the bindings in a new schemas PR, or ${thaw}."
+            exit 1
+          fi
+          if [ "${head}" != "${absorbed}" ]; then
+            echo "::error title=drift wait audit: partner moved::Runner main's newest drift push run (${rid}) was absorbed against ${SCHEMAS}#${pr} at ${absorbed:0:12}, but that PR's head is now ${head:0:12}. What was verified is no longer what will land, and coord still scores that gate green. ${thaw^}."
+            exit 1
+          fi
+          if [ "${age}" -gt "${BOUND_SECS}" ]; then
+            echo "::error title=drift wait audit: wait expired::Runner main's newest drift push run (${rid}) was absorbed against ${SCHEMAS}#${pr}, still unlanded $(( age / 3600 )) h after coord stripped its declaration (bound 72 h). Coord still scores that gate green. Land ${SCHEMAS}#${pr} (apply coord:clears-red=qontinui-runner to it), or ${thaw}."
+            exit 1
+          fi
+          echo "Waiting, valid: ${SCHEMAS}#${pr} is open at the absorbed commit, $(( (BOUND_SECS - age) / 3600 )) h left of the 72 h bound."

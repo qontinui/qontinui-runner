@@ -607,6 +607,11 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
   // the backend URL (api.qontinui.io → qontinui.io); null when the backend
   // field is empty/invalid, in which case the help text renders without a link.
   const webAppUrl = deriveWebAppUrl(formBackendUrl);
+  // The origin a PAGE link opens on: the "Web frontend URL" field when set
+  // (split local dev — Next.js :3001 vs FastAPI :8000, where the derived
+  // backend origin serves no pages), else the derived origin. Mirrors the
+  // Rust `web_origin::resolve_web_frontend_base` setting rung.
+  const webPageOrigin = formWebBaseUrl.trim().replace(/\/+$/, "") || webAppUrl;
 
   // Honest connection state for the Primary section. `wsConnected`/`runnerId`
   // are now truthful for Cognito/pair-code runners (Rust status fix), so we can
@@ -851,6 +856,7 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
         userId: string;
         tenantId: string;
         deviceId: string;
+        dmkStored: boolean;
       }>("redeem_pair_code", {
         code: trimmed,
         backendUrl: formUrl || undefined,
@@ -861,6 +867,16 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
         message: `Paired (device ${result.deviceId.slice(0, 8)}…).`,
       });
       onLog("info", `Paired via one-time code (user=${result.userId})`);
+      // No stored device machine key means this box cannot recover a device
+      // JWT on its own after an outage longer than the token's life — it
+      // would need a fresh pair code or a sign-in. Say so rather than leave
+      // it silent.
+      if (!result.dmkStored) {
+        onLog(
+          "warning",
+          "No device machine key was stored with this pairing — after an outage longer than the device token's life, this runner will need a new pair code or a sign-in to reconnect.",
+        );
+      }
 
       // A successful pair-code redeem persists a device JWT but, like Save,
       // leaves the runner in Tier Local — so the WS relay stays idle. Promote
@@ -1586,9 +1602,9 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
           <div className="text-xs text-muted-foreground pl-5 space-y-1">
             <p>
               1. Log into{" "}
-              {webAppUrl ? (
+              {webPageOrigin ? (
                 <a
-                  href={`${webAppUrl}/login`}
+                  href={`${webPageOrigin}/login`}
                   target="_blank"
                   rel="noreferrer"
                   className="text-primary hover:underline inline-flex items-center gap-1"

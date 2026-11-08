@@ -16,7 +16,7 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `fleet_host_name` | 0 | 0 | 0 | 0 | 0 | 0 |
 | `fleet_device_uuid` | 0 | 0 | 0 | 0 | 0 | 0 |
 | `plans_dir` | 34 | 35 | 34 | 0 | 0 | 0 |
-| `os_bound_tooling` | 98 | 99 | 96 | 2 | 0 | 0 |
+| `os_bound_tooling` | 103 | 104 | 96 | 7 | 0 | 0 |
 
 ## `repo_layout` (79 rows)
 
@@ -205,10 +205,10 @@ _No hits._
 
 | file | symbol | excerpt | n | disposition |
 |---|---|---|---:|---|
-| `src/commands/setup_wizard.rs` | `discover_claude_config_dirs` | `let claude_root = std::path::Path::new("C:\\claude");` | 1 | fallback_correct — Probes the fleet's C:\claude multi-account convention behind is_dir(); absent everywhere else, where CLAUDE_CONFIG_DIR and ~/.claude still apply. |
+| `src/commands/setup_wizard.rs` | `const WINDOWS_MULTI_ACCOUNT_ROOT` | `const WINDOWS_MULTI_ACCOUNT_ROOT: &str = "C:\\claude";` | 1 | fallback_correct — Probes the fleet's C:\claude multi-account convention, read only on the Windows discovery layout (DiscoveryLayout); an absent dir reads as no accounts. Elsewhere the configured roster, CLAUDE_CONFIG_DIR and ~/.claude apply. Moved from the discover_claude_config_dirs key when the literal became this const (qontinui-runner#2544); same disposition. |
 | `src/mcp/test_fixtures.rs` | `const DEFAULT_TEST_CONFIG_DIR` | `const DEFAULT_TEST_CONFIG_DIR: &str = "C:\\claude\\.claude-test-fixture";` | 1 | dev_only_surface — Debug-gated test-fixture injection endpoints for manual UI testing. |
 | `src/projects/snapshot.rs` | `const NOISE_PREFIXES` | `const NOISE_PREFIXES: [&str; 1] = ["c:\\claude\\"];` | 1 | fallback_correct — Filters the operator's C:\claude agent-scratch rows out of project attribution; on another box it filters nothing, which only leaves some noise rows in the view. |
-| `src/session_archive/discovery.rs` | `discover_account_homes_from_env` | `Some(PathBuf::from("C:\\claude")),` | 1 | fallback_correct — Probes C:/claude behind is_dir() on every platform, per its own doc comment; false everywhere else. |
+| `src/session_archive/discovery.rs` | `claude_root_for` | `Some(PathBuf::from("C:\\claude"))` | 1 | fallback_correct — The Windows arm of the account-home scan root (the fleet's C:/claude layout); every other OS scans $HOME instead (plan 2026-10-01-a-commit-author-session-is-unreachable-because-every-session-roster-is-per-account Phase 1). |
 | `src/step_output/script_emitter.rs` | `build_prompt_split` | `"outputPreview: \"# local overrides\\nHOME=/home/jq\\nPATH=/usr/local/bin:/usr/bin:/bin\\nLANG=en_US.UTF-8\\nSHELL=/bin/bash\\nrecent_fil...` | 1 | fallback_correct — A worked example inside an AI prompt (HOME=/home/jq), not a path the runner reads. |
 
 ## `fleet_host_name` (0 rows)
@@ -258,7 +258,7 @@ _No hits._
 | `src/plans_dir_migration.rs` | `persist_env_plans_dir` | `let existing = get_setting::<PathSettings>().plans_dir;` | 1 | unreviewed |
 | `src/plans_dir_migration.rs` | `persist_env_plans_dir` | `update_setting::<PathSettings, _>(\|paths\| paths.plans_dir = Some(value.clone()))?;` | 1 | unreviewed |
 
-## `os_bound_tooling` (98 rows)
+## `os_bound_tooling` (103 rows)
 
 | file | symbol | excerpt | n | disposition |
 |---|---|---|---:|---|
@@ -320,9 +320,12 @@ _No hits._
 | `src/playwright/executor.rs` | `run_script_inline` | `"Running inline Playwright via cmd.exe in dir {}: {}",` | 1 | unreviewed |
 | `src/playwright/executor.rs` | `run_script_inline` | `.map_err(\|e\| format!("Failed to execute playwright via cmd.exe: {}", e))?` | 1 | unreviewed |
 | `src/process_capture/manager.rs` | `expected_node_bin` | `.or_else(\|\| after.strip_suffix(".ps1"))` | 1 | unreviewed |
+| `src/process_capture/process_tree.rs` | `command_lines_for_pids_powershell` | `cfg(windows)-only fn 'command_lines_for_pids_powershell' has no cfg(not(windows)) sibling in this file` | 1 | fallback_correct — The Windows-only WMI command-line query, reached only through process_table's circuit when the in-process sysinfo cmd() read fails. Unix reads /proc/<pid>/cmdline in-process. |
 | `src/process_capture/process_tree.rs` | `parse_command_lines_json` | `cfg(windows)-only fn 'parse_command_lines_json' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/process_capture/process_tree.rs` | `parse_powershell_snapshot` | `cfg(windows)-only fn 'parse_powershell_snapshot' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/process_capture/process_tree.rs` | `parse_wmi_creation_date` | `cfg(windows)-only fn 'parse_wmi_creation_date' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
+| `src/process_capture/process_tree.rs` | `port_owner_pid_powershell` | `cfg(windows)-only fn 'port_owner_pid_powershell' has no cfg(not(windows)) sibling in this file` | 1 | fallback_correct — The Windows-only Get-NetTCPConnection query, reached only through process_table's circuit when the in-process GetExtendedTcpTable listener read fails. Unix keeps its own lsof port_owner_pid. |
+| `src/process_capture/process_tree.rs` | `powershell_snapshot` | `cfg(windows)-only fn 'powershell_snapshot' has no cfg(not(windows)) sibling in this file` | 1 | fallback_correct — The Windows-only PowerShell/WMI snapshot, reached only through process_table's circuit when the in-process sysinfo walk fails. Unix reads /proc in-process and has no external snapshot fallback. |
 | `src/process_helpers.rs` | `ChildTreeGuard::attach_raw` | `cfg(windows)-only fn 'attach_raw' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/process_helpers.rs` | `cmd_no_window` | `no_window("cmd.exe")` | 1 | unreviewed |
 | `src/process_helpers.rs` | `tokio_cmd_no_window` | `tokio_no_window("cmd.exe")` | 1 | unreviewed |
@@ -331,6 +334,8 @@ _No hits._
 | `src/profile_cli.rs` | `read_user_path` | `cfg(windows)-only fn 'read_user_path' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/profile_cli.rs` | `write_user_path` | `cfg(windows)-only fn 'write_user_path' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/screen/dpi.rs` | `set_windows_dpi_awareness` | `cfg(windows)-only fn 'set_windows_dpi_awareness' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
+| `src/session/claude_hook.rs` | `const SHELL_PROGRAMS` | `"powershell",` | 1 | fallback_correct — Shell-name stems compared against the argv[0] of a spawn on every OS, never launched or required: the env-var carrier applies only where an interactive shell resolves 'claude' through the identity shim. pwsh/powershell are two entries among ten (bash, sh, zsh, fish, dash, ksh, cmd, nu); on a box without PowerShell they match nothing and the rest decide as before. |
+| `src/session/claude_hook.rs` | `const SHELL_PROGRAMS` | `"pwsh",` | 1 | fallback_correct — Shell-name stems compared against the argv[0] of a spawn on every OS, never launched or required: the env-var carrier applies only where an interactive shell resolves 'claude' through the identity shim. pwsh/powershell are two entries among ten (bash, sh, zsh, fish, dash, ksh, cmd, nu); on a box without PowerShell they match nothing and the rest decide as before. |
 | `src/session/tracking_health.rs` | `const WORK_CHILD_IMAGES` | `"powershell",` | 1 | fallback_correct — Process-IMAGE names compared against a session's direct children on every OS, never launched or required: a pwsh/powershell direct child (a shell a tool runs under) counts as WORK. On a box without PowerShell nothing matches, and the rest of child_signals_work decides as before. |
 | `src/session/tracking_health.rs` | `const WORK_CHILD_IMAGES` | `"pwsh",` | 1 | fallback_correct — Process-IMAGE names compared against a session's direct children on every OS, never launched or required: a pwsh/powershell direct child (a shell a tool runs under) counts as WORK. On a box without PowerShell nothing matches, and the rest of child_signals_work decides as before. |
 | `src/step_executor/handlers/check.rs` | `CheckHandler::execute` | `let mut c = crate::process_helpers::tokio_no_window("powershell");` | 1 | unreviewed |

@@ -203,6 +203,10 @@ pub mod cognito;
 // the marker names so the spawn-site strips, the startup warning and the
 // `coord doctor` check can never disagree on the spelling.
 pub mod claude_env;
+/// Long-lived Claude OAuth tokens (`claude setup-token`) stored per account in
+/// `<config dir>/settings.json` — the one reader account selection, the usage
+/// probe, the warm path and the doctor share.
+pub mod claude_oauth_token;
 
 // `coord doctor` self-check (plan 2026-06-13 Phase 4). Lifted into the lib so
 // BOTH the standalone `coord_doctor` bin and the in-app Tauri command
@@ -312,6 +316,12 @@ pub mod session_archive;
 /// `2026-08-29-runner-work-scoped-writes-default-tenant-credential`). In the
 /// lib crate because the plan adapter above is its principal consumer.
 pub mod repo_tenant;
+
+/// The context-size reading of a Claude Code `Stop` event (plan
+/// `2026-10-28-one-session-lifecycle-authority` Phase 82, folding
+/// qontinui-claude-config#1915). Pure; the `/lifecycle/hook` route (Phase 83)
+/// is its consumer.
+pub mod stop_context;
 
 // ============================================================================
 // Test-only: shared process-wide env lock

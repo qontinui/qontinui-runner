@@ -156,6 +156,16 @@ impl CiJob {
         }
     }
 
+    /// The dispatch cgroup's cumulative kernel `oom_kill` count. `None` off
+    /// Linux, when uncontained, or when `memory.events` is unreadable.
+    fn oom_kill_count(&self) -> Option<u64> {
+        #[cfg(target_os = "linux")]
+        if let super::cgroup::Containment::Cgroup(c) = &self.cgroup {
+            return c.oom_kill_count();
+        }
+        None
+    }
+
     /// A log line when the kernel OOM-killed part of the dispatch since the
     /// last call, so a memory kill reads as one rather than as a bare signal.
     fn memory_kill_note(&self) -> Option<String> {
@@ -526,6 +536,7 @@ pub(crate) async fn run_dispatch(
 
     // ── Steps (sequential; first failure short-circuits) ──
     let mut overall = StepOutcome::Success;
+    let mut result_reason: Option<&'static str> = None;
     for step in &manifest.steps {
         if cancel.is_cancelled() {
             overall = StepOutcome::Cancelled;
@@ -538,7 +549,9 @@ pub(crate) async fn run_dispatch(
             step.effective_timeout_secs()
         ));
         let step_started = Instant::now();
+        let oom_before = ci_job.oom_kill_count();
         let outcome = run_step(step, &dispatch_env, &worktree, &ci_job, &sink, &cancel).await;
+        let oom_after = ci_job.oom_kill_count();
         let duration = step_started.elapsed().as_secs();
         sink.push(&format!(
             "[ci-node] step {} → {} in {duration}s",
@@ -551,6 +564,7 @@ pub(crate) async fn run_dispatch(
             duration_secs: duration,
         });
         if outcome != StepOutcome::Success {
+            result_reason = step_failure_reason(&outcome, oom_before, oom_after);
             overall = outcome;
             break;
         }
@@ -587,7 +601,7 @@ pub(crate) async fn run_dispatch(
         &payload.dispatch_id,
         conclusion,
         &steps_summary,
-        None,
+        result_reason,
         &tail,
         capture.artifact(),
         Some(&canonical_outcome),
@@ -595,6 +609,31 @@ pub(crate) async fn run_dispatch(
     .await;
     // The receipt is the only key to cleanup; the artifact is already sent.
     workspace.cleanup(reported).await;
+}
+
+/// `summary.reason` for a dispatch whose failing step the kernel OOM-killed
+/// inside the dispatch cgroup. Same vocabulary as the Actions lane's
+/// `out_of_memory` no-verdict marker (coord `main_baseline_no_verdict`). Coord
+/// stores a dispatch `summary` as opaque JSON today and acts on no reason, so
+/// this is an operator-readable label until coord's dispatch-result ingest
+/// reads it. The conclusion stays `failure`; this only names why.
+const OUT_OF_MEMORY_REASON: &str = "out_of_memory";
+
+/// The result reason for a non-success step: `out_of_memory` only when the
+/// cgroup's `oom_kill` counter PROVABLY rose across the step. An unreadable
+/// counter on either side is UNKNOWN and claims nothing.
+fn step_failure_reason(
+    outcome: &StepOutcome,
+    oom_before: Option<u64>,
+    oom_after: Option<u64>,
+) -> Option<&'static str> {
+    if matches!(outcome, StepOutcome::Success | StepOutcome::Cancelled) {
+        return None;
+    }
+    match (oom_before, oom_after) {
+        (Some(b), Some(a)) if a > b => Some(OUT_OF_MEMORY_REASON),
+        _ => None,
+    }
 }
 
 /// Provision what the manifest declares. Returns the tool directories to
@@ -1001,6 +1040,125 @@ mod tests {
                 "a git CI step must not inherit {var}; removed: {removed:?}"
             );
         }
+    }
+
+    /// Where the runner's CI node actually enters sibling provisioning:
+    /// [`provision`], called by `run_dispatch` with the dispatch root under
+    /// `<root>/.ci-worktrees/<id>`. The runner's CI root is the workspace
+    /// root, itself a git repository, so that dispatch root sits INSIDE an
+    /// enclosing repo whose own `.git/config` carries an `insteadOf` routing
+    /// the sibling's GitHub URL to a local repository. The sibling's git must
+    /// not read it: isolated, the GitHub URL is asked as-is (a repository that
+    /// does not exist, so the resolve fails offline or not); unisolated, the
+    /// rewrite answers the resolve with the local repository's tip, so
+    /// provisioning gets past `resolving …` (and fails later, at the fetch,
+    /// which runs in the sibling's own repo) — the `resolving` error is what
+    /// tells the two apart.
+    #[tokio::test]
+    async fn a_dispatch_provision_ignores_an_enclosing_repos_url_rewrite() {
+        let git = |cwd: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(cwd)
+                .args(args)
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .output()
+                .expect("git runs");
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        };
+        let dir = tempfile::tempdir().unwrap();
+        // A local "remote" with one commit on `main`, at `<dir>/remote.git`.
+        let remote = dir.path().join("remote.git");
+        std::fs::create_dir_all(&remote).unwrap();
+        git(&remote, &["init", "-q", "-b", "main"]);
+        git(
+            &remote,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "local",
+            ],
+        );
+        // The CI root: a git repository whose local config rewrites the
+        // sibling's GitHub URL (`https://github.com/qontinui-arming-probe/
+        // remote.git`) to the local repository above.
+        let root = dir.path().join("ws");
+        std::fs::create_dir_all(&root).unwrap();
+        git(&root, &["init", "-q"]);
+        git(
+            &root,
+            &[
+                "config",
+                &format!("url.{}/.insteadOf", dir.path().display()),
+                "https://github.com/qontinui-arming-probe/",
+            ],
+        );
+        let payload: CiDispatchPayload = serde_json::from_value(serde_json::json!({
+            "dispatch_id": "d-1",
+            "repo": "qontinui/qontinui-runner",
+            "head_sha": "s",
+            "fetch_url": "u",
+            "candidate_ref": "refs/heads/merge-candidate/1",
+        }))
+        .unwrap();
+        let worktree = super::super::checkout::ci_worktree_path(&root, "d-1", &payload.repo);
+        std::fs::create_dir_all(&worktree).unwrap();
+        let manifest = super::super::manifest::parse_and_validate(
+            "version = 1\n[[siblings]]\nrepo = \"qontinui-arming-probe/remote\"\n\
+             pin = \"default-branch\"\nbranch = \"main\"\n\
+             [[steps]]\nname = \"x\"\ncommand = [\"true\"]\n",
+        )
+        .unwrap();
+        let cancel = CancellationToken::new();
+        // A coord base nothing listens on: the sink's flusher fails and drops.
+        let sink = ProgressSink::start(
+            "http://127.0.0.1:9".to_string(),
+            "d-1".to_string(),
+            cancel.clone(),
+        );
+        let mut services = super::super::services::ServiceStack::new("d-1");
+
+        let res = provision(
+            &payload,
+            &root,
+            &worktree,
+            &manifest,
+            &sink,
+            &cancel,
+            &mut services,
+        )
+        .await;
+        let err = res.expect_err("the enclosing repo's rewrite reached sibling git");
+        assert!(
+            err.contains("resolving qontinui-arming-probe/remote@main"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn oom_reason_only_when_the_counter_provably_rose() {
+        use StepOutcome::*;
+        assert_eq!(
+            step_failure_reason(&Failure, Some(0), Some(1)),
+            Some("out_of_memory")
+        );
+        assert_eq!(
+            step_failure_reason(&Timeout, Some(2), Some(3)),
+            Some("out_of_memory")
+        );
+        // No rise, or an unreadable counter on either side: claims nothing.
+        assert_eq!(step_failure_reason(&Failure, Some(1), Some(1)), None);
+        assert_eq!(step_failure_reason(&Failure, None, Some(1)), None);
+        assert_eq!(step_failure_reason(&Failure, Some(0), None), None);
+        // A cancelled or successful step is never relabelled.
+        assert_eq!(step_failure_reason(&Cancelled, Some(0), Some(1)), None);
+        assert_eq!(step_failure_reason(&Success, Some(0), Some(1)), None);
     }
 
     #[test]

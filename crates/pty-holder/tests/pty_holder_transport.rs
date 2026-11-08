@@ -8,6 +8,8 @@
 //! Unix file modes; on Windows everything else runs as-is (UNRUN on the Linux
 //! box this was written on).
 
+mod common;
+
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -19,6 +21,8 @@ use qontinui_pty_holder::client::{
 };
 use qontinui_pty_holder::frame::{KIND_CONTROL, KIND_DATA};
 use qontinui_pty_holder::lock::{read_record, PaneLock, TryLock};
+#[cfg(unix)]
+use qontinui_pty_holder::pane::socket_path;
 use qontinui_pty_holder::pane::{lock_path, PaneId};
 use qontinui_pty_holder::protocol::{
     parse_reply, to_payload, RejectReason, Reply, Request, PROTOCOL_VERSIONS,
@@ -31,8 +35,10 @@ fn soon() -> Instant {
     Instant::now() + Duration::from_secs(5)
 }
 
-/// A fresh, short pane dir. Short because a Unix socket path is capped at
-/// ~104-108 bytes and `$TMPDIR` can be long.
+/// A fresh, short pane dir. (The Unix socket no longer lives in it —
+/// `pane::socket_path` — so its length is no longer what keeps the socket
+/// under `sun_path`; `pty_holder_long_pane_dir_spawns_connects_and_readopts`
+/// covers a long one.)
 fn pane_dir(tag: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -227,7 +233,7 @@ fn pty_holder_handshake_ping_census_and_lock_record() {
         other => panic!("{other:?}"),
     }
     drop(h);
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = common::remove_pane_dir(&dir);
 }
 
 /// The positive allowlist (plan D5): an unknown verb gets a typed rejection
@@ -258,7 +264,7 @@ fn pty_holder_unknown_verb_is_rejected_and_closed() {
         Probe::Healthy { .. }
     ));
     drop(h);
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = common::remove_pane_dir(&dir);
 }
 
 #[test]
@@ -326,7 +332,7 @@ fn pty_holder_refusals_before_and_after_handshake() {
 
     assert!(matches!(probe(&dir, &pane, soon()), Probe::Healthy { .. }));
     drop(h);
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = common::remove_pane_dir(&dir);
 }
 
 /// D15: no common version is a visible, typed state — and the envelope verbs
@@ -384,7 +390,7 @@ fn pty_holder_no_common_version_is_incompatible_not_dead() {
     );
 
     drop(h);
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = common::remove_pane_dir(&dir);
 }
 
 /// Lock before endpoint: a second holder for a live pane exits `lock_held`
@@ -406,7 +412,7 @@ fn pty_holder_second_holder_for_a_live_pane_refuses() {
         other => panic!("{other:?}"),
     }
     drop(first);
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = common::remove_pane_dir(&dir);
 }
 
 /// A killed holder is Dead (its lock is acquirable); a new holder for the same
@@ -426,7 +432,7 @@ fn pty_holder_killed_holder_is_dead_and_the_pane_is_reusable() {
     }
     #[cfg(unix)]
     assert!(
-        dir.join("p1.sock").exists(),
+        socket_path(&dir, &pid("p1")).unwrap().exists(),
         "a SIGKILLed holder leaves its socket file behind"
     );
 
@@ -439,7 +445,100 @@ fn pty_holder_killed_holder_is_dead_and_the_pane_is_reusable() {
         other => panic!("{other:?}"),
     }
     drop(h2);
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = common::remove_pane_dir(&dir);
+}
+
+/// Plan 2026-11-04 (socket-overflow) Phase 4: a pane dir far past `sun_path`
+/// (a secondary runner's is ~95 bytes before the file name) still gets a
+/// holder-backed pane. The holder binds, a client connects, and a later
+/// caller — here a fresh census, as a restarted runner's adoption does —
+/// re-derives the SAME endpoint from (pane dir, pane id) alone.
+#[cfg(unix)]
+#[test]
+fn pty_holder_long_pane_dir_spawns_connects_and_readopts() {
+    let base = pane_dir("long");
+    let mut dir = base.clone().into_os_string();
+    dir.push("/");
+    let pad = 200usize.saturating_sub(dir.len()).max(1);
+    dir.push("x".repeat(pad));
+    let dir = PathBuf::from(dir);
+    assert!(dir.as_os_str().len() >= 200, "{}", dir.display());
+    make_private_dir(&dir);
+
+    let (h, line) = spawn_holder(&dir, "p1");
+    assert!(line.starts_with("holder_ready "), "holder did not start: {line}");
+    let sock = socket_path(&dir, &pid("p1")).unwrap();
+    assert!(
+        line.ends_with(&format!("endpoint={}", sock.display())),
+        "the holder bound the derived path: {line}"
+    );
+    assert!(sock.exists());
+    assert!(sock.as_os_str().len() <= qontinui_pty_holder::transport::max_path_len());
+
+    let mut c = connect(&dir, &pid("p1"), soon()).expect("handshake on a long pane dir");
+    assert_eq!(c.hello_ack().holder_pid, h.pid());
+    c.ping(soon()).unwrap();
+    drop(c);
+
+    // Adoption: nothing but (pane dir, pane id) is carried over, and it lands
+    // on the same socket.
+    assert_eq!(socket_path(&dir, &pid("p1")).unwrap(), sock);
+    let cen = census(&dir, Duration::from_secs(5), &[]).unwrap();
+    assert_eq!(cen.len(), 1, "{cen:?}");
+    assert!(
+        matches!(&cen[0].probe, Probe::Healthy { hello_ack } if hello_ack.holder_pid == h.pid()),
+        "{cen:?}"
+    );
+
+    drop(h);
+    // The socket lives in the shared root, not the pane dir: remove ours.
+    let _ = std::fs::remove_file(&sock);
+    let _ = common::remove_pane_dir(&base);
+}
+
+/// Review: a client reaches a holder on a later candidate (here a
+/// pre-Phase-4 holder's `<pane-dir>/<pane-id>.sock`) past a refused socket
+/// file at the preferred path — a dead holder's leftover.
+#[cfg(unix)]
+#[test]
+fn pty_holder_connect_passes_a_refused_socket_for_a_later_candidate() {
+    use std::os::unix::net::UnixListener;
+    let dir = pane_dir("cand");
+    make_private_dir(&dir);
+    let pane = pid("p1");
+    // A dead socket at the preferred path: bound, then its listener dropped.
+    let preferred = socket_path(&dir, &pane).unwrap();
+    let _ = std::fs::remove_file(&preferred);
+    drop(UnixListener::bind(&preferred).unwrap());
+    assert!(preferred.exists());
+    // A live listener at the legacy path.
+    let legacy = dir.join("p1.sock");
+    let listener = UnixListener::bind(&legacy).unwrap();
+    let accepted = std::thread::spawn(move || listener.accept().is_ok());
+    qontinui_pty_holder::transport::connect(&dir, &pane, soon())
+        .expect("the legacy listener is reached");
+    assert!(accepted.join().unwrap());
+    // A candidate this user may not connect to (mode 000) is passed over too.
+    // Root ignores the mode bits, so this half is skipped as root.
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } != 0 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&preferred, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let listener = UnixListener::bind(dir.join("p1.sock.tmp")).unwrap();
+        let _ = std::fs::remove_file(&legacy);
+        std::fs::rename(dir.join("p1.sock.tmp"), &legacy).unwrap();
+        let accepted = std::thread::spawn(move || listener.accept().is_ok());
+        qontinui_pty_holder::transport::connect(&dir, &pane, soon())
+            .expect("a permission-denied candidate is passed over");
+        assert!(accepted.join().unwrap());
+        std::fs::set_permissions(&preferred, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    // With nothing listening anywhere, the refusal is what is reported.
+    let _ = std::fs::remove_file(&legacy);
+    let e = qontinui_pty_holder::transport::connect(&dir, &pane, soon()).unwrap_err();
+    assert_eq!(e.kind(), std::io::ErrorKind::ConnectionRefused, "{e}");
+    let _ = std::fs::remove_file(&preferred);
+    let _ = common::remove_pane_dir(&dir);
 }
 
 /// A held lock with no endpoint (a holder between lock and bind, or one that
@@ -456,7 +555,7 @@ fn pty_holder_held_lock_without_handshake_is_unknown() {
         Probe::Unknown { .. } => {}
         other => panic!("held lock must be Unknown, got {other:?}"),
     }
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = common::remove_pane_dir(&dir);
 }
 
 /// THE health rule: a wedged holder still accepts from the kernel backlog, so
@@ -495,7 +594,7 @@ fn pty_holder_wedged_holder_is_unknown_within_the_deadline() {
         "probe overran its deadline: {took:?}"
     );
     drop(h);
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = common::remove_pane_dir(&dir);
 }
 
 /// Census: every lock file probed concurrently under ONE deadline, each pane
@@ -563,7 +662,7 @@ fn pty_holder_census_classifies_every_pane_under_one_deadline() {
     );
     assert!(matches!(by["not a pane"], Probe::Unknown { .. }));
     drop((healthy, wedged, wedged2, wedged3));
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = common::remove_pane_dir(&dir);
 }
 
 /// Census without Unix-only machinery: healthy + dead, on every OS.
@@ -601,7 +700,7 @@ fn pty_holder_census_healthy_and_dead() {
     assert_eq!(rows[1].pane_id, "live");
     assert!(matches!(rows[1].probe, Probe::Healthy { .. }));
     drop(healthy);
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = common::remove_pane_dir(&dir);
 }
 
 /// D5 on Unix: the pane dir is 0700 and the socket 0600, even when the dir
@@ -616,10 +715,10 @@ fn pty_holder_unix_endpoint_and_dir_are_private() {
     let h = spawn_ready(&dir, "p1");
     let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode(&dir), 0o700);
-    assert_eq!(mode(&dir.join("p1.sock")), 0o600);
+    assert_eq!(mode(&socket_path(&dir, &pid("p1")).unwrap()), 0o600);
     assert_eq!(mode(&dir.join("p1.lock")) & 0o077, 0);
     drop(h);
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = common::remove_pane_dir(&dir);
 }
 
 #[test]
@@ -656,7 +755,7 @@ fn pty_holder_census_skip_is_counted_not_probed() {
         other => panic!("{other:?}"),
     }
     drop(h);
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = common::remove_pane_dir(&dir);
 }
 
 /// The connection cap: past MAX_CONNECTIONS live connections a new client
@@ -686,7 +785,7 @@ fn pty_holder_connection_cap_rejects_busy() {
     }
     drop(held);
     drop(h);
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = common::remove_pane_dir(&dir);
 }
 
 /// M2: the probe deadline bounds the whole OPERATION, not each syscall. A fake
@@ -706,7 +805,7 @@ fn pty_holder_trickling_peer_cannot_stretch_the_probe_deadline() {
         TryLock::Acquired(l) => l,
         TryLock::Held => panic!("fresh"),
     };
-    let listener = UnixListener::bind(dir.join("p1.sock")).unwrap();
+    let listener = UnixListener::bind(socket_path(&dir, &pid("p1")).unwrap()).unwrap();
     let step = Duration::from_millis(150);
     std::thread::spawn(move || {
         if let Ok((mut s, _)) = listener.accept() {
@@ -743,7 +842,7 @@ fn pty_holder_trickling_peer_cannot_stretch_the_probe_deadline() {
         took < deadline + Duration::from_millis(300),
         "probe overran its deadline: {took:?}"
     );
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = common::remove_pane_dir(&dir);
 }
 
 /// L1: a pre-existing group/other-WRITABLE pane dir is refused, not repaired.
@@ -773,7 +872,7 @@ fn pty_holder_writable_pane_dir_is_refused() {
     ));
     let err = census(&dir, Duration::from_secs(1), &[]).unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = common::remove_pane_dir(&dir);
 }
 
 /// M-1: a request that times out mid-reply POISONS the client. Without it the
@@ -793,7 +892,7 @@ fn pty_holder_client_is_poisoned_after_a_mid_frame_timeout() {
         TryLock::Acquired(l) => l,
         TryLock::Held => panic!("fresh"),
     };
-    let listener = UnixListener::bind(dir.join("p1.sock")).unwrap();
+    let listener = UnixListener::bind(socket_path(&dir, &pid("p1")).unwrap()).unwrap();
     let (half_sent_tx, half_sent_rx) = std::sync::mpsc::channel::<()>();
     let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
     let fake = std::thread::spawn(move || {
@@ -848,7 +947,7 @@ fn pty_holder_client_is_poisoned_after_a_mid_frame_timeout() {
     ));
     drop(c);
     fake.join().unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = common::remove_pane_dir(&dir);
 }
 
 /// M-1: a `rejected` reply poisons too — the holder closes after sending it.
@@ -865,5 +964,5 @@ fn pty_holder_client_is_poisoned_after_a_rejection() {
     assert!(matches!(reply, Reply::Rejected { .. }), "{reply:?}");
     assert!(matches!(c.ping(soon()), Err(ConnectError::Poisoned(_))));
     drop(h);
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = common::remove_pane_dir(&dir);
 }

@@ -13,6 +13,7 @@
 pub mod coord_register;
 pub mod dispatcher;
 pub mod federation;
+pub(crate) mod heartbeat;
 pub mod launch_spec;
 pub mod manager;
 pub mod resume;
@@ -27,6 +28,6 @@ pub mod worker_message;
 pub mod workspace_trust;
 pub mod writer;
 
-pub use manager::SessionManager;
+pub use manager::{SessionManager, WorkdirTaskRun};
 pub use session::ClaudeSession;
 pub use state::SessionState;

@@ -9,6 +9,8 @@
 //! tests; these scripted cases are UNRUN there, not passed.
 #![cfg(unix)]
 
+mod common;
+
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -58,7 +60,7 @@ impl Drop for Holder {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.dir);
+        let _ = common::remove_pane_dir(&self.dir);
     }
 }
 
@@ -346,7 +348,7 @@ fn pty_holder_data_path_byte_fidelity_all_256_and_invalid_utf8() {
     );
     assert_eq!(exit_of(&rest.events).unwrap().code, Some(0));
     let _ = h.exits_within(Duration::from_secs(10));
-    let _ = std::fs::remove_dir_all(&dir_for_files);
+    let _ = common::remove_pane_dir(&dir_for_files);
 }
 
 /// Reattach at an offset resumes with no duplicate and no gap; detach leaves
@@ -466,7 +468,7 @@ fn pty_holder_data_path_reattach_resumes_and_gaps_are_reported() {
     let s = attach(&h, Some(total + 1_000));
     assert_eq!(s.info.start_offset, total);
     drop(s);
-    let _ = std::fs::remove_dir_all(&files);
+    let _ = common::remove_pane_dir(&files);
 }
 
 /// `pause` withholds output frames but never the PTY read: the child keeps
@@ -736,7 +738,7 @@ fn pty_holder_data_path_a_new_input_connection_supersedes_the_old_one() {
         "connection #1 was closed when superseded, not served to completion"
     );
     s.writer.kill(soon()).unwrap();
-    let _ = std::fs::remove_dir_all(&files);
+    let _ = common::remove_pane_dir(&files);
 }
 
 /// Input is refused on the attached connection: it would put the input queue
@@ -898,7 +900,7 @@ fn pty_holder_data_path_child_env_is_exactly_the_spec() {
     }
     let _ = child.kill();
     let _ = child.wait();
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = common::remove_pane_dir(&dir);
 }
 
 /// The spec never outlives start-up: the holder unlinks it.

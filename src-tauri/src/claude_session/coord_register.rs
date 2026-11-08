@@ -455,7 +455,12 @@ impl AiCoordRegistrar {
         let resolved =
             self.resolve_record(&rec.claude_session_id, rec.adopted_from.as_deref(), None);
         match rec.finished_at {
-            Some(at) => self.finish_session_on(&rec.claude_session_id, resolved, Some(at)),
+            Some(at) => self.finish_session_on(
+                &rec.claude_session_id,
+                resolved,
+                Some(at),
+                rec.finish_reason.as_deref(),
+            ),
             None => self.unfinish_session_on(&rec.claude_session_id, resolved),
         }
     }
@@ -1442,7 +1447,7 @@ impl AiCoordRegistrar {
     /// never disturbs the session.
     pub fn finish_session(&self, claude_session_id: &str, finished_at: Option<i64>) -> FinishSync {
         let resolved = self.resolve_coord_session_id(claude_session_id);
-        self.finish_session_on(claude_session_id, resolved, finished_at)
+        self.finish_session_on(claude_session_id, resolved, finished_at, None)
     }
 
     /// [`Self::finish_session`] against an already-resolved coord row
@@ -1452,6 +1457,7 @@ impl AiCoordRegistrar {
         claude_session_id: &str,
         resolved: Option<Uuid>,
         finished_at: Option<i64>,
+        finish_reason: Option<&str>,
     ) -> FinishSync {
         let Some(session_id) = resolved else {
             warn!(
@@ -1461,7 +1467,7 @@ impl AiCoordRegistrar {
             );
             return FinishSync::LocalOnly(LocalOnlyReason::NoCoordSession);
         };
-        self.enqueue_finished(claude_session_id, session_id, finished_at)
+        self.enqueue_finished(claude_session_id, session_id, finished_at, finish_reason)
     }
 
     /// Enqueue the `Finished` row for `claude_session_id`, addressed to the
@@ -1471,6 +1477,7 @@ impl AiCoordRegistrar {
         claude_session_id: &str,
         session_id: Uuid,
         finished_at: Option<i64>,
+        finish_reason: Option<&str>,
     ) -> FinishSync {
         let payload = self.stamp_tenant(
             session_id,
@@ -1478,6 +1485,7 @@ impl AiCoordRegistrar {
                 "id": session_id,
                 "claude_session_id": claude_session_id,
                 "finished_at": finished_at,
+                "finish_reason": finish_reason,
             }),
         );
         match self.inner.outbox.record(
@@ -1575,7 +1583,12 @@ impl AiCoordRegistrar {
                          to coord session {} — delivering the owed write",
                         rec.claude_session_id, target
                     );
-                    self.enqueue_finished(&rec.claude_session_id, target, rec.finished_at)
+                    self.enqueue_finished(
+                        &rec.claude_session_id,
+                        target,
+                        rec.finished_at,
+                        rec.finish_reason.as_deref(),
+                    )
                 })
                 .collect()
         })
@@ -3066,7 +3079,7 @@ mod tests {
         );
 
         let at = store
-            .set_finished(csid, true, None)
+            .set_finished(csid, true, Some("dismissed".to_string()))
             .unwrap()
             .record
             .finished_at;
@@ -3082,6 +3095,7 @@ mod tests {
         assert_eq!(pending[0].session_id, coord_id);
         assert_eq!(pending[0].event_kind, SessionEventKind::Finished.as_str());
         assert_eq!(pending[0].payload["finished_at"], json!(at));
+        assert_eq!(pending[0].payload["finish_reason"], json!("dismissed"));
 
         store.mark_finish_synced(csid, at);
         assert!(

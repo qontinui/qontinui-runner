@@ -131,6 +131,20 @@
 //! the pane clear immediately before removing it and refuses otherwise — see
 //! `terminal::graceful_exit::CloseTabResult`. A refusal arrives here as
 //! [`WIND_DOWN_CLOSE_REFUSED`] and is recorded like any other outcome.
+//!
+//! ## Neither arm closes a live session yet (R0a)
+//!
+//! Plan `2026-10-28-one-session-lifecycle-authority`, Phase 14: the primitive
+//! now requires a close authority once it finds a live `claude`, and only the
+//! lifecycle Closer (Phase 93) will be able to mint one. [`wind_down_exit`]
+//! presents none, so every close of a live session, by the drain arm or by
+//! `finished_close`, is refused before a byte is typed. Each refusal is logged
+//! `no_close_authority` and recorded as [`WIND_DOWN_NO_CLOSE_AUTHORITY`].
+//!
+//! Both arms still run their eligibility, custody and budget logic in full,
+//! and a pane whose `claude` has already left is still handled as
+//! `NoLiveClaude`. The refusal is a narrowing of the primitive, not of this
+//! module.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -145,7 +159,7 @@ use crate::session::finished_close::{self, PassPlan, SkipReason};
 use crate::session::session_lifecycle_store::{
     SessionLifecycleStore, WIND_DOWN_ARM_DRAIN, WIND_DOWN_ARM_FINISHED_CLOSE, WIND_DOWN_CLOSED,
     WIND_DOWN_CLOSE_REFUSED, WIND_DOWN_CLOSE_UNKNOWN, WIND_DOWN_EXIT_STUCK,
-    WIND_DOWN_NOT_ATTEMPTED,
+    WIND_DOWN_NOT_ATTEMPTED, WIND_DOWN_NO_CLOSE_AUTHORITY,
 };
 use crate::session::tracking_health::{LiveClaudeProcess, TrackingHealthPass};
 use crate::session::wind_down_observer::{
@@ -644,6 +658,12 @@ pub fn outcome_word(outcome: &GracefulExitOutcome) -> Option<&'static str> {
         GracefulExitOutcome::Refused { .. } | GracefulExitOutcome::WriteFailed { .. } => {
             Some(WIND_DOWN_NOT_ATTEMPTED)
         }
+        // Nothing was typed here either, and it IS recorded. It is the
+        // refusal of a close this executor attempted on a live session, and the
+        // one read-back that the close-authority gate (R0a) is armed on this
+        // box: until the lifecycle Closer mints authorities, every close of a
+        // live session lands here.
+        GracefulExitOutcome::NoCloseAuthority { .. } => Some(WIND_DOWN_NO_CLOSE_AUTHORITY),
         // These two return before anything is typed, so nothing happened to the
         // session and nothing is claimed.
         GracefulExitOutcome::NoLiveClaude | GracefulExitOutcome::ProbeUnavailable { .. } => None,
@@ -702,6 +722,32 @@ pub fn claude_left(outcome: &GracefulExitOutcome) -> bool {
     )
 }
 
+/// Exit a pane, ending the stray wait loops it leaves behind.
+///
+/// A stray background shell leads its own session and group, so no pane exit
+/// reaches it. It was discounted to let this session close, and left alone it would
+/// run on for ever with nothing left to report it. So: record it FIRST, while it is
+/// still under its `claude`; and end it only once `claude` is gone, because a shell
+/// it still owns is its own to end.
+async fn exit_ending_strays<Strays, EndFut>(
+    record: impl std::future::Future<Output = Strays>,
+    exit: impl std::future::Future<Output = Result<GracefulExitOutcome, String>>,
+    end: impl FnOnce(Strays) -> EndFut,
+    mut log: impl FnMut(&str),
+) -> Result<GracefulExitOutcome, String>
+where
+    EndFut: std::future::Future<Output = Vec<String>>,
+{
+    let strays = record.await;
+    let outcome = exit.await?;
+    if claude_left(&outcome) {
+        for line in end(strays).await {
+            log(&line);
+        }
+    }
+    Ok(outcome)
+}
+
 /// PURE: did this exit attempt POSITIVELY OBSERVE a `claude` in the pane?
 ///
 /// B4-1's evidence. The steward registry needs to know a pane was once
@@ -711,8 +757,8 @@ pub fn claude_left(outcome: &GracefulExitOutcome) -> bool {
 /// about.
 ///
 /// This reads the evidence the exit already gathered rather than re-deriving
-/// it: six of the eight outcomes carry `claude_pids`, and a NON-EMPTY list is
-/// the pids `drive` actually saw. `NoLiveClaude` (looked, found none) and
+/// it: seven of the nine outcomes carry `claude_pids`, and a NON-EMPTY list is
+/// the pids `drive_graceful_exit` actually saw. `NoLiveClaude` (looked, found none) and
 /// `ProbeUnavailable` (could not look) carry none, and both correctly answer
 /// false — the second because "could not look" is never evidence.
 ///
@@ -726,7 +772,10 @@ pub fn claude_was_observed(outcome: &GracefulExitOutcome) -> bool {
         | GracefulExitOutcome::Refused { claude_pids, .. }
         | GracefulExitOutcome::WriteFailed { claude_pids, .. }
         | GracefulExitOutcome::CloseRefused { claude_pids, .. }
-        | GracefulExitOutcome::CloseOutcomeUnknown { claude_pids, .. } => !claude_pids.is_empty(),
+        | GracefulExitOutcome::CloseOutcomeUnknown { claude_pids, .. }
+        // The authority refusal comes AFTER the probe found the `claude`, so
+        // its pids are the same positive evidence.
+        | GracefulExitOutcome::NoCloseAuthority { claude_pids } => !claude_pids.is_empty(),
         GracefulExitOutcome::NoLiveClaude | GracefulExitOutcome::ProbeUnavailable { .. } => false,
     }
 }
@@ -841,12 +890,8 @@ pub(crate) async fn judge_custody<P: CustodyProbe + ?Sized>(
     workspace_root: Option<&Path>,
     session_id: &str,
 ) -> CustodyVerdict {
-    let attributed = wind_down_observer::attributed_worktrees(
-        ownership,
-        session_id,
-        context.coord_session_id.as_deref(),
-        workspace_root,
-    );
+    let attributed =
+        wind_down_observer::attributed_worktrees(ownership, session_id, workspace_root);
     let inputs = wind_down_observer::gather_custody(probe, context, attributed, session_id).await;
     let verdict = wind_down::custody_gate(&inputs);
     debug!(
@@ -881,8 +926,9 @@ pub(crate) trait FinishedCloseWorld: Sync {
         &'p [LiveClaudeProcess],
         &'p wind_down_observer::ObservedInputs,
     );
-    /// The attributed-worktree read, made once per pass, with the liveness of
-    /// `claude_session_ids`' coord rows.
+    /// coord's keyed attributed-worktree read for exactly
+    /// `claude_session_ids`, made once per pass; an id it did not answer is
+    /// UNKNOWN.
     async fn ownership(&self, claude_session_ids: &[String]) -> OwnershipRead;
     /// The root a relative ledger path is anchored on.
     fn workspace_root(&self) -> Option<PathBuf>;
@@ -1303,7 +1349,7 @@ pub(crate) trait CloseEffects {
 ///   restarted, so a re-observed verdict is `NotYet` for another full grace
 ///   period — but the frozen one still says `Eligible`, `exit_prompt_ready`
 ///   passes (the pane genuinely IS at an empty prompt), and the session is
-///   closed out from under them. `drive`'s own preamble catches a pane that is
+///   closed out from under them. `drive_graceful_exit`'s own preamble catches a pane that is
 ///   BUSY at close time; it cannot catch one that was busy twenty seconds ago
 ///   and is momentarily quiet, which is precisely the state a grace period
 ///   exists to distinguish from idleness. Without this, two of this module's
@@ -1320,7 +1366,9 @@ pub(crate) trait CloseEffects {
 ///   included. The drain arm never consults custody.
 ///
 /// In `shadow`, every one of those checks still runs, and the close is logged
-/// instead of made.
+/// instead of made. `graceful_exit`'s own refusals (a child process, a nested
+/// `claude`, a screen not at an empty prompt) are not among them, so a logged
+/// "would close" can still be refused under `on`.
 pub(crate) async fn close_batch<E: CloseEffects + Sync>(
     arm: CloseArm,
     candidates: Vec<(String, String)>,
@@ -1389,7 +1437,7 @@ pub(crate) async fn close_batch<E: CloseEffects + Sync>(
         effects.record_outcome(arm, &session_id, &outcome);
 
         // B4-1: POSITIVE PROOF that a `claude` lived in this pane, taken at the
-        // exact moment the husk is created. Six of the eight outcomes carry the
+        // exact moment the husk is created. Seven of the nine outcomes carry the
         // pids they saw, and `claude_was_observed` reads THAT rather than
         // re-deriving it — so the latch the steward registry needs is written
         // by this executor, which runs on a timer the runner owns, and not by
@@ -1399,7 +1447,7 @@ pub(crate) async fn close_batch<E: CloseEffects + Sync>(
         }
 
         // D6: a steward the drain STOPPED is owed a restart on undrain. The
-        // predicate is "`claude` left", NOT "the tab closed" — `drive` reaches
+        // predicate is "`claude` left", NOT "the tab closed" — `drive_graceful_exit` reaches
         // its close callback only after `GONE_PROBES_REQUIRED` consecutive gone
         // probes, so `CloseRefused` and `CloseOutcomeUnknown` both mean the
         // steward's `claude` is already gone and only the bare shell survives.
@@ -1421,6 +1469,52 @@ pub(crate) async fn close_batch<E: CloseEffects + Sync>(
         outcomes.push(CandidateOutcome::Attempted);
     }
     outcomes
+}
+
+/// The ONE way this module reaches a pane: `TerminalManager::graceful_exit`,
+/// presenting NO close authority, then the log line for what it answered.
+///
+/// No authority, because this executor has none to present. The lifecycle
+/// Closer is the only minter, and it does not exist until Phase 93 (plan
+/// `2026-10-28-one-session-lifecycle-authority`, R0a). So on any pane where the
+/// probe finds a live `claude`, the primitive refuses `no_close_authority`
+/// before typing a byte. That holds under EITHER arm, whatever the eligibility
+/// verdict and the custody gate said, and nothing in this module can relax it,
+/// because the check lives in the primitive. A pane whose `claude` is already
+/// gone still answers `NoLiveClaude`, untouched.
+///
+/// It is its own fn rather than inline in [`LiveCloseEffects`], so the per-arm
+/// tests can enter through [`close_batch`] and reach THIS code, and the real
+/// primitive beneath it, without an `AppHandle`. It is still the module's one
+/// `graceful_exit` call, and the kill-path tripwire counts it.
+pub(crate) async fn wind_down_exit(
+    manager: &Arc<TerminalManager>,
+    session_id: &str,
+    terminal_id: &str,
+    kind: SessionKind,
+) -> Result<GracefulExitOutcome, String> {
+    let outcome = manager
+        .graceful_exit(terminal_id, EXIT_DEADLINE, None)
+        .await?;
+    match &outcome {
+        GracefulExitOutcome::Exited { .. } => {
+            info!(session_id = %session_id, terminal_id = %terminal_id, ?kind, "wind_down_executor: closed");
+        }
+        GracefulExitOutcome::NoCloseAuthority { claude_pids } => warn!(
+            session_id = %session_id,
+            terminal_id = %terminal_id,
+            ?kind,
+            pids = ?claude_pids,
+            outcome = WIND_DOWN_NO_CLOSE_AUTHORITY,
+            "wind_down_executor: refused no_close_authority — a live claude is in the pane and \
+             no close authority can be presented before the lifecycle Closer exists; nothing \
+             typed, nothing closed, the session is still running"
+        ),
+        other => {
+            warn!(session_id = %session_id, terminal_id = %terminal_id, ?kind, outcome = ?other, "wind_down_executor: not closed");
+        }
+    }
+    Ok(outcome)
 }
 
 /// The shipped [`CloseEffects`] — the real drain state and switch, the real
@@ -1524,7 +1618,7 @@ impl CloseEffects for LiveCloseEffects<'_> {
             judged_at_ms = self.observed.now_ms,
             grace_s = self.grace.as_secs(),
             custody = %custody,
-            "wind_down_executor: SHADOW — would close {session_id} (finished, idle past grace, re-checked custody {custody}); closing nothing"
+            "wind_down_executor: SHADOW — would close {session_id} (finished, idle past grace, re-checked custody {custody}; graceful_exit's process and screen checks not run); closing nothing"
         );
     }
 
@@ -1562,17 +1656,25 @@ impl CloseEffects for LiveCloseEffects<'_> {
             "wind_down_executor: graceful /exit — eligible past grace"
         );
 
-        // The ONE way this module reaches a pane. Never `TerminalManager::close`.
-        let outcome = self
-            .manager
-            .graceful_exit(terminal_id, EXIT_DEADLINE)
-            .await?;
-        if matches!(outcome, GracefulExitOutcome::Exited { .. }) {
-            info!(session_id = %session_id, terminal_id = %terminal_id, ?kind, "wind_down_executor: closed");
-        } else {
-            warn!(session_id = %session_id, terminal_id = %terminal_id, ?outcome, "wind_down_executor: not closed");
-        }
-        Ok(outcome)
+        // Only the panes the pass discounted a stray from: every other close reads
+        // nothing extra. A shell not discounted there was work, and this close
+        // would not have been admitted.
+        let claudes: Vec<u32> = self
+            .pass
+            .report
+            .terminal_hosted
+            .iter()
+            .filter(|p| p.session_id.as_deref() == Some(session_id) && p.stray_wait_shells > 0)
+            .map(|p| p.pid)
+            .collect();
+        exit_ending_strays(
+            crate::session::stray_wait::record_strays(claudes),
+            // The ONE way this module reaches a pane. Never `TerminalManager::close`.
+            wind_down_exit(&self.manager, session_id, terminal_id, kind),
+            crate::session::stray_wait::end_strays,
+            |line| info!(session_id = %session_id, terminal_id = %terminal_id, "wind_down_executor: {line}"),
+        )
+        .await
     }
 
     fn session_kind(&self, terminal_id: &str) -> SessionKind {
@@ -2142,6 +2244,7 @@ mod tests {
                 kind: SessionKind::Terminal,
                 custody: None,
             }),
+            stray_wait_shells: 0,
         }
     }
 
@@ -2353,6 +2456,51 @@ mod tests {
             kind: SessionKind::Terminal,
             custody: None,
         }
+    }
+
+    /// Recorded before the exit, ended after it, and only when `claude` left.
+    #[tokio::test]
+    async fn strays_are_recorded_before_the_exit_and_ended_only_after_claude_left() {
+        let run = |outcome: Result<GracefulExitOutcome, String>| async move {
+            let order = std::cell::RefCell::new(Vec::new());
+            let lines = std::cell::RefCell::new(Vec::new());
+            let result = exit_ending_strays(
+                async {
+                    order.borrow_mut().push("record");
+                    vec![7u32]
+                },
+                async {
+                    order.borrow_mut().push("exit");
+                    outcome
+                },
+                |strays: Vec<u32>| {
+                    order.borrow_mut().push("end");
+                    async move { vec![format!("ended {strays:?}")] }
+                },
+                |line| lines.borrow_mut().push(line.to_string()),
+            )
+            .await;
+            (result.is_ok(), order.into_inner(), lines.into_inner())
+        };
+        assert_eq!(
+            run(Ok(exited())).await,
+            (
+                true,
+                vec!["record", "exit", "end"],
+                vec!["ended [7]".to_string()]
+            )
+        );
+        // `claude` is still there: every shell under it is still its own.
+        let stuck = GracefulExitOutcome::ExitStuck {
+            waited_ms: 10,
+            claude_pids: vec![42],
+            last_probe_unreadable: false,
+        };
+        assert_eq!(run(Ok(stuck)).await, (true, vec!["record", "exit"], vec![]));
+        assert_eq!(
+            run(Err("no such pane".to_string())).await,
+            (false, vec!["record", "exit"], vec![])
+        );
     }
 
     fn exited() -> GracefulExitOutcome {
@@ -2671,6 +2819,164 @@ mod tests {
         assert!(calls.contains(&"claude_seen:t2".to_string()));
     }
 
+    // ── R0a: neither arm closes a live session without a close authority ──
+
+    /// A [`CloseEffects`] that admits everything and scripts every read, but
+    /// whose EXIT is the production [`wind_down_exit`], run against a real
+    /// `TerminalManager`. Through it, a test enters an arm's own batch driver
+    /// ([`close_batch`]) and reaches the real primitive.
+    struct ManagerEffects {
+        manager: Arc<TerminalManager>,
+        recorded: std::sync::Mutex<Vec<(CloseArm, String, Option<&'static str>)>>,
+        outcomes: std::sync::Mutex<Vec<GracefulExitOutcome>>,
+        claude_seen: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl ManagerEffects {
+        fn new(manager: Arc<TerminalManager>) -> Self {
+            Self {
+                manager,
+                recorded: std::sync::Mutex::default(),
+                outcomes: std::sync::Mutex::default(),
+                claude_seen: std::sync::Mutex::default(),
+            }
+        }
+    }
+
+    /// The re-check verdict of a coord-FINISHED terminal session that is idle
+    /// past grace. For a terminal session, `eligibility` answers `eligible` only
+    /// when coord reads it `finished` (rule 5), so this is the session the
+    /// `finished_close` arm exists to close.
+    fn finished_and_idle() -> wind_down::WindDownView {
+        view("eligible")
+    }
+
+    #[async_trait::async_trait]
+    impl CloseEffects for ManagerEffects {
+        fn arm_still_admitted(&self, _arm: CloseArm) -> Admission {
+            Admission::Close
+        }
+        async fn recheck(
+            &self,
+            _session_id: &str,
+            _terminal_id: &str,
+        ) -> Option<wind_down::WindDownView> {
+            Some(finished_and_idle())
+        }
+        async fn recheck_custody(&self, _session_id: &str, _terminal_id: &str) -> CustodyVerdict {
+            CustodyVerdict::Clean
+        }
+        fn would_close(&self, _session_id: &str, terminal_id: &str, _: Option<&CustodyVerdict>) {
+            panic!("admission is Close, never Shadow: would_close({terminal_id})");
+        }
+        async fn wind_down_one(
+            &self,
+            session_id: &str,
+            terminal_id: &str,
+        ) -> Result<GracefulExitOutcome, String> {
+            wind_down_exit(
+                &self.manager,
+                session_id,
+                terminal_id,
+                SessionKind::Terminal,
+            )
+            .await
+        }
+        fn session_kind(&self, _terminal_id: &str) -> SessionKind {
+            SessionKind::Terminal
+        }
+        fn steward_kind(&self, _terminal_id: &str) -> Option<String> {
+            None
+        }
+        fn record_outcome(&self, arm: CloseArm, session_id: &str, outcome: &GracefulExitOutcome) {
+            self.recorded.lock().unwrap().push((
+                arm,
+                session_id.to_string(),
+                outcome_word(outcome),
+            ));
+            self.outcomes.lock().unwrap().push(outcome.clone());
+        }
+        fn record_claude_seen(&self, terminal_id: &str) {
+            self.claude_seen
+                .lock()
+                .unwrap()
+                .push(terminal_id.to_string());
+        }
+        async fn record_stopped_by_drain(&self, kind: &str) {
+            panic!("a terminal session owes no steward restart: {kind}");
+        }
+    }
+
+    /// R0a for one arm. The session is coord-finished, eligible past grace and
+    /// custody-clean. Its pane holds ONE live `claude` with ZERO children, at
+    /// an empty prompt that would accept `/exit`. That is exactly the session
+    /// the arm exists to close.
+    ///
+    /// The arm reaches the real primitive through its own batch driver and the
+    /// production [`wind_down_exit`], and is REFUSED `no_close_authority`:
+    /// nothing typed, nothing killed, the pane still registered. The refusal is
+    /// recorded under the arm's word, and the probe's evidence still latches
+    /// `claude_seen`.
+    async fn assert_arm_is_refused_without_a_close_authority(arm: CloseArm) {
+        let pane = crate::terminal::session::tests::live_claude_pane();
+        let manager = Arc::new(TerminalManager::new());
+        manager.insert_for_test("t-finished", pane.session.clone());
+        let effects = ManagerEffects::new(manager.clone());
+
+        let outcomes = close_batch(
+            arm,
+            vec![("s-finished".to_string(), "t-finished".to_string())],
+            &effects,
+        )
+        .await;
+
+        assert_eq!(outcomes, vec![CandidateOutcome::Attempted], "{arm:?}");
+        assert_eq!(
+            *effects.outcomes.lock().unwrap(),
+            vec![GracefulExitOutcome::NoCloseAuthority {
+                claude_pids: pane.claude_pids.clone()
+            }],
+            "{arm:?}"
+        );
+        assert_eq!(
+            *effects.recorded.lock().unwrap(),
+            vec![(
+                arm,
+                "s-finished".to_string(),
+                Some(WIND_DOWN_NO_CLOSE_AUTHORITY)
+            )],
+            "{arm:?}: the refusal is recorded on the lifecycle record, under the arm"
+        );
+        assert!(
+            pane.typed().is_empty(),
+            "{arm:?}: a byte reached a live claude without a close authority"
+        );
+        assert_eq!(pane.kills(), 0, "{arm:?}");
+        assert!(
+            manager.get("t-finished").is_some(),
+            "{arm:?}: a refused close must leave the pane registered"
+        );
+        assert_eq!(
+            *effects.claude_seen.lock().unwrap(),
+            vec!["t-finished".to_string()],
+            "{arm:?}: the refusal's pids are positive evidence a claude was there"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_drain_arm_is_refused_no_close_authority_on_a_finished_session_with_zero_children()
+    {
+        assert_arm_is_refused_without_a_close_authority(CloseArm::Drain).await;
+    }
+
+    /// runner#2426's arm (default `On`, no drain needed). R0a refuses it like
+    /// every other caller until the Closer mints authorities.
+    #[tokio::test(start_paused = true)]
+    async fn the_finished_close_arm_is_refused_no_close_authority_on_a_finished_session_with_zero_children(
+    ) {
+        assert_arm_is_refused_without_a_close_authority(CloseArm::FinishedClose).await;
+    }
+
     /// `claude_was_observed` reads the pids the exit actually saw, so a variant
     /// that carries an EMPTY list is not evidence either.
     #[test]
@@ -2699,6 +3005,13 @@ mod tests {
         };
         assert!(claude_was_observed(&stuck));
         assert!(!claude_left(&stuck));
+        // The close-authority refusal (R0a) comes after the probe FOUND the
+        // claude, so its pids are evidence too, and the claude never left.
+        let refused = GracefulExitOutcome::NoCloseAuthority {
+            claude_pids: vec![9],
+        };
+        assert!(claude_was_observed(&refused));
+        assert!(!claude_left(&refused));
     }
 
     /// N-4: the nested check is the function's own, not a collaborator's.
@@ -2815,6 +3128,13 @@ mod tests {
                     claude_pids: pids.clone(),
                 },
                 Some(WIND_DOWN_NOT_ATTEMPTED),
+                false,
+            ),
+            (
+                GracefulExitOutcome::NoCloseAuthority {
+                    claude_pids: pids.clone(),
+                },
+                Some(WIND_DOWN_NO_CLOSE_AUTHORITY),
                 false,
             ),
             (GracefulExitOutcome::NoLiveClaude, None, false),
@@ -3616,13 +3936,14 @@ mod tests {
             if let Some(read) = &self.ownership_override {
                 return read.clone();
             }
-            // Every candidate's coord session is live and holds no rows.
+            // coord's keyed read answers every candidate with an entry of
+            // its own that holds no rows.
             let mut index = CoordOwnership::default();
-            let live: Vec<String> = claude_session_ids
-                .iter()
-                .map(|s| format!("coord-{s}"))
-                .collect();
-            index.mark_live(live.iter().map(String::as_str));
+            index.record_coord_rows(
+                claude_session_ids
+                    .iter()
+                    .map(|s| (s.clone(), format!("coord-{s}"))),
+            );
             Ok(index)
         }
         fn workspace_root(&self) -> Option<PathBuf> {
@@ -3636,7 +3957,6 @@ mod tests {
         ) -> SessionCustodyContext {
             SessionCustodyContext {
                 session_dir: Some(PathBuf::from(format!("/ws/{session_id}"))),
-                coord_session_id: Some(format!("coord-{session_id}")),
                 isolated_worktrees: Ok(Vec::new()),
             }
         }
@@ -3764,12 +4084,11 @@ mod tests {
         ));
     }
 
-    /// Round-2 CRITICAL 1, end to end: a candidate whose coord session is not
-    /// known live (auto-closed) is never closed, whatever its trees show.
+    /// End to end: a candidate coord's keyed read did not answer is never
+    /// closed, whatever its trees show.
     #[tokio::test]
-    async fn finished_close_tick_never_closes_a_session_whose_coord_row_is_not_live() {
-        // A valid read that marks nothing live: the coord row was closed, or
-        // moved between states while the pages were read.
+    async fn finished_close_tick_never_closes_a_session_coords_keyed_read_did_not_answer() {
+        // A valid read that answers no candidate: no entry of its own.
         let mut world = FakeWorld::with_sessions(&["t1"]);
         world.ownership_override = Some(Ok(CoordOwnership::default()));
         let FinishedCloseTick::Ran { judged, outcomes } = tick(&world).await else {

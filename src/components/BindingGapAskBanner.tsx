@@ -2,8 +2,10 @@
  * BindingGapAskBanner.tsx
  *
  * Shows the device-JWT refresher's once-per-lapse ask: this device is bound to
- * a tenant (per coord) but holds no credential for it, and no headless path
- * can seed one safely, so a human has to pair it once.
+ * a tenant (per coord) but holds no credential for it, and the refresher's
+ * one automatic seed through coord's per-binding door did not put one there,
+ * so a human has to pair it once. The ask's `reason` says what the seed
+ * attempt came to.
  *
  * The ask is READ, not received: {@link GET_BINDING_GAP_ASKS_CMD} on mount and
  * again on every {@link BINDING_GAP_NUDGE_EVENT}. The runner records the ask

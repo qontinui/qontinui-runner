@@ -4682,8 +4682,9 @@ fn classify_agent_binding_liveness(
     // An empty parent map means "could not read the process table", not "no
     // processes" — the same posture as the tracking-health tick and
     // `live_pids_from_snapshot`, both of which refuse to answer rather than
-    // answer zero.
-    if snapshot.parent_map.is_empty() {
+    // answer zero. A `stale` table (the last good one) is not a live read
+    // either.
+    if snapshot.is_unknown() {
         return AgentLivenessTally::all_unknown(n, "process_table_unavailable");
     }
     // The rows must account for the count the line declared. A partially
@@ -19559,9 +19560,9 @@ mod tests {
 
         // Point the root-config self-heal (Phase 5b) at `base` — which holds no
         // `.mcp.json` — so this test exercises ONLY the session path and never
-        // touches the operator's real `qontinui-root/.mcp.json`. Restored below.
+        // touches the operator's real `qontinui-root/.mcp.json`. The fixture
+        // captures QONTINUI_ROOT and restores it on drop, unwinding included.
         std::fs::create_dir_all(&base).unwrap();
-        let prev_root = std::env::var("QONTINUI_ROOT").ok();
         std::env::set_var("QONTINUI_ROOT", &base);
 
         // Stale proxy config on :9999 → must be rewritten to :9876.
@@ -19742,10 +19743,6 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&base);
-        match prev_root {
-            Some(p) => std::env::set_var("QONTINUI_ROOT", p),
-            None => std::env::remove_var("QONTINUI_ROOT"),
-        }
     }
 
     /// **Security regression pin.** An AGENT-class `.mcp.json` sitting on the
@@ -22415,6 +22412,7 @@ mod agent_binding_census_tests {
         created: &[(u32, i64)],
     ) -> crate::process_capture::process_tree::ProcessSnapshot {
         let mut snap = crate::process_capture::process_tree::ProcessSnapshot::default();
+        snap.stale = false; // a live read
         for (parent, child) in edges {
             snap.parent_map.entry(*parent).or_default().push(*child);
         }
@@ -23783,6 +23781,26 @@ pub(crate) mod doctor {
         let binding_store_unknown = binding_store.is_unknown();
         let binding_store_failed = binding_store.failed();
 
+        // Phase 7 (plan 2026-09-20): what the refresher did about each
+        // binding gap — the per-binding seed attempt and its outcome, and
+        // whether the operator was asked. Scoped to the account exactly as the
+        // UI's `get_binding_gap_asks` is, so it never crosses an account switch.
+        let binding_gap_lapses = {
+            let tenant_slots = am
+                .try_list_tenant_device_jwt_tenants()
+                .map_err(|e| format!("{e:#}"));
+            let legacy_present = am
+                .get_access_token()
+                .map(|t| !t.trim().is_empty())
+                .unwrap_or(false);
+            crate::mcp::device_jwt_refresher::binding_gap_lapses_for_doctor(
+                crate::mcp::device_jwt_refresher::binding_gap_ask_path().as_deref(),
+                legacy_present,
+                tenant_slots.as_deref().map_err(String::clone),
+                qontinui_runner_lib::pair::read_paired_user_id_from_disk(),
+            )
+        };
+
         let (verdict, layer, detail) = verdict_for(
             &selected,
             &legacy,
@@ -23811,6 +23829,10 @@ pub(crate) mod doctor {
             "binding_store": binding_store,
             "binding_store_failed": binding_store_failed,
             "binding_store_unknown": binding_store_unknown,
+            // `{"lapses": [...]}` or `{"unknown": "<why>"}` — the latter is
+            // NOT "no lapses". A `seed_not_bound: true` lapse opens no ask and
+            // is visible here only.
+            "binding_gap_lapses": binding_gap_lapses,
             "slot_health": crate::mcp::device_jwt_refresher::tenant_slot_health()
                 .map(|h| serde_json::json!({
                     "observed_at_unix": h.observed_at_unix,

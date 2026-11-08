@@ -142,7 +142,9 @@ checkout also arms every linked worktree, since worktrees share `.git/hooks`.
 
 **Not arming it costs you latency, not coverage.** CI gates both halves
 regardless: `cargo fmt -- --check` and `cargo clippy` both run inside the
-required `test (ubuntu-22.04)` context, with a parallel `clippy-windows` job.
+required `test (ubuntu-22.04)` context, with a parallel `clippy-windows` job
+(`Clippy (windows)`) that runs `--all-targets` and so also lints `#[cfg(test)]`
+code the local gate does not compile.
 The gate is a faster feedback loop, never the thing standing between a
 regression and `main`.
 
@@ -430,7 +432,7 @@ Workflows in `.github/workflows/` split into three tiers. The authoritative list
 
 - `ci.yml` — PR + push to `main`, `develop`, and the coord `merge-candidate/**` refs. Five jobs, six contexts (the `test` matrix reports one per platform):
   - `test (ubuntu-22.04)` / `test (windows-latest)` — the matrix leg: clones the sibling repos (`qontinui-schemas`, `qontinui-web`, `ui-bridge`), `pnpm install` + lint + typecheck + vitest + `pnpm run build`, then `cargo fmt -- --check`, `cargo test`, `pnpm run tauri build --debug --no-bundle`, plus the Windows-only SDK↔runner contract smoke. `cargo clippy` runs on the **ubuntu leg only** — the Windows clippy pass moved to its own job (next bullet). macOS is currently disabled in the matrix. Each platform leg must be either green **or** linked to a tracked open issue documenting an upstream-runner block (see "Platform escape valve" below). The escape valve is for hosted-runner pathologies you can't fix in the PR (e.g. rustc-LLVM crashing on the GitHub `windows-latest` image), not for "tests are flaky, ignore."
-  - `Clippy (windows)` — the `clippy-windows` job, split out of the matrix so it runs in **parallel** with `test (windows-latest)` instead of sitting on its critical path (~12 min saved there). It is not redundant with the ubuntu clippy: this repo has substantial `#[cfg(windows)]` code that is only compiled — hence only linted — on a Windows host, `clippy-tiers.yml` is ubuntu-only and advisory, and plain `cargo test` does not evaluate `[lints.clippy]` levels. If this job is not required, Windows lint coverage exists but gates nothing.
+  - `Clippy (windows)` — the `clippy-windows` job, split out of the matrix so it runs in **parallel** with `test (windows-latest)` instead of sitting on its critical path (~12 min saved there). It is not redundant with the ubuntu clippy: this repo has substantial `#[cfg(windows)]` code that is only compiled — hence only linted — on a Windows host, `clippy-tiers.yml` is ubuntu-only and advisory, and plain `cargo test` does not evaluate `[lints.clippy]` levels. Unlike the ubuntu leg's default-target clippy (and the local pre-push gate), it runs `cargo clippy --all-targets`, so a deny-tier lint in `#[cfg(test)]` code blocks a PR here, not on the ubuntu leg (qontinui-runner#2392). If this job is not required, Windows lint coverage exists but gates nothing.
   - `Frontend unit tests (vitest)` — the standalone `frontend-tests` job. The matrix leg runs `pnpm test` too, but wedged behind ~40-70 min of cargo; this job gives the same signal in ~1-2 min.
   - `seam-gate` — source-level assertion that the three `#[cfg(any(debug_assertions, feature = "test-fixtures"))]` anchors guarding the `/ui-bridge/test/*` injection seam are intact.
   - `security` — `cargo audit --file Cargo.lock` (with the documented `--ignore`s) + `pnpm audit --audit-level=moderate`. Runs in parallel with the matrix; don't ignore it just because it's a separate context.

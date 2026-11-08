@@ -331,17 +331,17 @@ pub struct GitHubClient {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrStatus {
-    pub number: u64,
     pub state: String,
     pub merged: bool,
+    /// RFC3339 merge time, present only for a GitHub merge (a fast-forward
+    /// land sets none) — see [`HeadPr::merged_at`].
+    pub merged_at: Option<String>,
     pub head_sha: String,
     /// The PR's BASE branch name (e.g. `"main"`), unprefixed — see
     /// [`HeadPr::base_ref`].
     pub base_ref: String,
     /// RFC3339 close time — see [`HeadPr::closed_at`].
     pub closed_at: Option<String>,
-    pub title: String,
-    pub html_url: String,
     /// Label names on the PR — see [`HeadPr::labels`], including the note on
     /// `#[serde(default)]`.
     #[serde(default)]
@@ -608,14 +608,12 @@ impl GitHubClient {
             .map_err(|e| format!("Failed to parse PR response: {}", e))?;
 
         Ok(PrStatus {
-            number,
             state: body["state"].as_str().unwrap_or("unknown").to_string(),
             merged: body["merged"].as_bool().unwrap_or(false),
+            merged_at: body["merged_at"].as_str().map(|s| s.to_string()),
             head_sha: body["head"]["sha"].as_str().unwrap_or("").to_string(),
             base_ref: body["base"]["ref"].as_str().unwrap_or("").to_string(),
             closed_at: body["closed_at"].as_str().map(|s| s.to_string()),
-            title: body["title"].as_str().unwrap_or("").to_string(),
-            html_url: body["html_url"].as_str().unwrap_or("").to_string(),
             labels: parse_labels(&body),
         })
     }

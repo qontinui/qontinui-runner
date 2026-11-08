@@ -234,11 +234,11 @@
     {
       "class": "machine_path",
       "file": "src/commands/setup_wizard.rs",
-      "symbol": "discover_claude_config_dirs",
-      "excerpt": "let claude_root = std::path::Path::new(\"C:\\\\claude\");",
+      "symbol": "const WINDOWS_MULTI_ACCOUNT_ROOT",
+      "excerpt": "const WINDOWS_MULTI_ACCOUNT_ROOT: &str = \"C:\\\\claude\";",
       "count": 1,
       "disposition": "fallback_correct",
-      "note": "Probes the fleet's C:\\claude multi-account convention behind is_dir(); absent everywhere else, where CLAUDE_CONFIG_DIR and ~/.claude still apply."
+      "note": "Probes the fleet's C:\\claude multi-account convention, read only on the Windows discovery layout (DiscoveryLayout); an absent dir reads as no accounts. Elsewhere the configured roster, CLAUDE_CONFIG_DIR and ~/.claude apply. Moved from the discover_claude_config_dirs key when the literal became this const (qontinui-runner#2544); same disposition."
     },
     {
       "class": "machine_path",
@@ -261,11 +261,11 @@
     {
       "class": "machine_path",
       "file": "src/session_archive/discovery.rs",
-      "symbol": "discover_account_homes_from_env",
-      "excerpt": "Some(PathBuf::from(\"C:\\\\claude\")),",
+      "symbol": "claude_root_for",
+      "excerpt": "Some(PathBuf::from(\"C:\\\\claude\"))",
       "count": 1,
       "disposition": "fallback_correct",
-      "note": "Probes C:/claude behind is_dir() on every platform, per its own doc comment; false everywhere else."
+      "note": "The Windows arm of the account-home scan root (the fleet's C:/claude layout); every other OS scans $HOME instead (plan 2026-10-01-a-commit-author-session-is-unreachable-because-every-session-roster-is-per-account Phase 1)."
     },
     {
       "class": "machine_path",
@@ -743,6 +743,15 @@
     {
       "class": "os_bound_tooling",
       "file": "src/process_capture/process_tree.rs",
+      "symbol": "command_lines_for_pids_powershell",
+      "excerpt": "cfg(windows)-only fn `command_lines_for_pids_powershell` has no cfg(not(windows)) sibling in this file",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "The Windows-only WMI command-line query, reached only through process_table's circuit when the in-process sysinfo cmd() read fails. Unix reads /proc/<pid>/cmdline in-process."
+    },
+    {
+      "class": "os_bound_tooling",
+      "file": "src/process_capture/process_tree.rs",
       "symbol": "parse_command_lines_json",
       "excerpt": "cfg(windows)-only fn `parse_command_lines_json` has no cfg(not(windows)) sibling in this file",
       "count": 1,
@@ -763,6 +772,24 @@
       "excerpt": "cfg(windows)-only fn `parse_wmi_creation_date` has no cfg(not(windows)) sibling in this file",
       "count": 1,
       "disposition": "unreviewed"
+    },
+    {
+      "class": "os_bound_tooling",
+      "file": "src/process_capture/process_tree.rs",
+      "symbol": "port_owner_pid_powershell",
+      "excerpt": "cfg(windows)-only fn `port_owner_pid_powershell` has no cfg(not(windows)) sibling in this file",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "The Windows-only Get-NetTCPConnection query, reached only through process_table's circuit when the in-process GetExtendedTcpTable listener read fails. Unix keeps its own lsof port_owner_pid."
+    },
+    {
+      "class": "os_bound_tooling",
+      "file": "src/process_capture/process_tree.rs",
+      "symbol": "powershell_snapshot",
+      "excerpt": "cfg(windows)-only fn `powershell_snapshot` has no cfg(not(windows)) sibling in this file",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "The Windows-only PowerShell/WMI snapshot, reached only through process_table's circuit when the in-process sysinfo walk fails. Unix reads /proc in-process and has no external snapshot fallback."
     },
     {
       "class": "os_bound_tooling",
@@ -827,6 +854,24 @@
       "excerpt": "cfg(windows)-only fn `set_windows_dpi_awareness` has no cfg(not(windows)) sibling in this file",
       "count": 1,
       "disposition": "unreviewed"
+    },
+    {
+      "class": "os_bound_tooling",
+      "file": "src/session/claude_hook.rs",
+      "symbol": "const SHELL_PROGRAMS",
+      "excerpt": "\"powershell\",",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "Shell-name stems compared against the argv[0] of a spawn on every OS, never launched or required: the env-var carrier applies only where an interactive shell resolves `claude` through the identity shim. pwsh/powershell are two entries among ten (bash, sh, zsh, fish, dash, ksh, cmd, nu); on a box without PowerShell they match nothing and the rest decide as before."
+    },
+    {
+      "class": "os_bound_tooling",
+      "file": "src/session/claude_hook.rs",
+      "symbol": "const SHELL_PROGRAMS",
+      "excerpt": "\"pwsh\",",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "Shell-name stems compared against the argv[0] of a spawn on every OS, never launched or required: the env-var carrier applies only where an interactive shell resolves `claude` through the identity shim. pwsh/powershell are two entries among ten (bash, sh, zsh, fish, dash, ksh, cmd, nu); on a box without PowerShell they match nothing and the rest decide as before."
     },
     {
       "class": "os_bound_tooling",

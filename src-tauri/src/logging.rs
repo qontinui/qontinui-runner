@@ -798,24 +798,26 @@ pub fn get_crash_dump_dir() -> PathBuf {
     crate::instance::scope_path(&base)
 }
 
-/// Write a crash dump file with detailed information
-pub fn write_crash_dump(location: &str, message: &str, backtrace: &str) {
-    // Prevent recursive crash handling
-    if CRASH_HANDLING.swap(true, Ordering::SeqCst) {
-        safe_eprintln("RECURSIVE CRASH DETECTED - skipping crash dump");
-        return;
-    }
+/// Header line carrying the crashing process's pid in a `crash_*.txt` dump.
+/// Parsed back by `crash_dumps::parse_crash_dump`; a dump written before
+/// this line existed simply lacks it (its `pid` reads as absent, never
+/// guessed).
+pub(crate) const CRASH_DUMP_PID_PREFIX: &str = "Pid:";
 
-    let crash_dir = get_crash_dump_dir();
-    let _ = std::fs::create_dir_all(&crash_dir);
-
-    let timestamp = Local::now().format("%Y%m%d_%H%M%S");
-    let crash_file = crash_dir.join(format!("crash_{}.txt", timestamp));
-
-    let crash_content = format!(
+/// Build the body of a `crash_*.txt` dump. Pure (apart from the ambient
+/// environment fields) so tests can pin the format — in particular the
+/// `Pid:` header — without panicking.
+pub(crate) fn format_crash_dump(
+    location: &str,
+    message: &str,
+    backtrace: &str,
+    pid: u32,
+) -> String {
+    format!(
         "=== QONTINUI RUNNER CRASH DUMP ===\n\
         Timestamp: {}\n\
         Version: {}\n\
+        {} {}\n\
         \n\
         === PANIC LOCATION ===\n\
         {}\n\
@@ -838,6 +840,8 @@ pub fn write_crash_dump(location: &str, message: &str, backtrace: &str) {
         === END CRASH DUMP ===\n",
         Local::now().to_rfc3339(),
         env!("CARGO_PKG_VERSION"),
+        CRASH_DUMP_PID_PREFIX,
+        pid,
         location,
         message,
         std::env::consts::OS,
@@ -846,7 +850,28 @@ pub fn write_crash_dump(location: &str, message: &str, backtrace: &str) {
         std::env::current_exe().ok(),
         std::thread::current().name().unwrap_or("unnamed"),
         backtrace,
-    );
+    )
+}
+
+/// Write a crash dump file with detailed information
+pub fn write_crash_dump(location: &str, message: &str, backtrace: &str) {
+    // Prevent recursive crash handling
+    if CRASH_HANDLING.swap(true, Ordering::SeqCst) {
+        safe_eprintln("RECURSIVE CRASH DETECTED - skipping crash dump");
+        return;
+    }
+
+    let crash_dir = get_crash_dump_dir();
+    let _ = std::fs::create_dir_all(&crash_dir);
+
+    let timestamp = Local::now().format("%Y%m%d_%H%M%S");
+    let crash_file = crash_dir.join(format!("crash_{}.txt", timestamp));
+
+    // `std::process::id()` is read HERE, inside the dying process, so the
+    // dump names the pid that actually crashed — a reader (the restarted
+    // runner's `/health.recent_crash.pid`, the supervisor) never has to guess
+    // it from whichever process later happens to hold the port.
+    let crash_content = format_crash_dump(location, message, backtrace, std::process::id());
 
     // Write to file
     match std::fs::File::create(&crash_file) {
@@ -963,6 +988,19 @@ pub fn setup_panic_handler() {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    /// The dump records the crashing process's pid at write time, and the
+    /// startup scanner reads that same value back.
+    #[test]
+    fn crash_dump_records_the_writing_process_pid() {
+        let pid = std::process::id();
+        let body = format_crash_dump("src/x.rs:1:1", "boom", "<bt>", pid);
+        assert!(
+            body.lines().any(|l| l == format!("Pid: {pid}")),
+            "dump must carry a `Pid: {pid}` header line:\n{body}"
+        );
+        assert_eq!(crate::crash_dumps::extract_pid(&body), Some(pid));
+    }
 
     /// Create `dir` and every missing parent, panicking on failure (tests only).
     fn mk(dir: &Path) {

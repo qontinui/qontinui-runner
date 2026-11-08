@@ -575,7 +575,8 @@ impl SurfacingTracker {
         };
         // `pty_never_idle` means a LIVE recipient is busy: a long turn, a
         // draft in the box, an open dialog. Those are ordinary for well past
-        // 60 s, and coord's alert is per message and never resolved, so the
+        // 60 s, and coord's alert is per message and stays open until the
+        // message is delivered, acked, expired or reaped, so the
         // first POST for that reason waits the repeat window (the
         // pre-2026-09-07 threshold). `target_not_live` keeps the short
         // threshold: nothing on this device can deliver it.
@@ -632,7 +633,8 @@ struct SurfaceCtx<'a> {
 /// local counter and log line?
 ///
 /// Only a `blocking` message does: its sender is waiting on it. coord opens
-/// one alert per message and nothing resolves it, so a non-blocking message
+/// one alert per message, which stays open until the message is delivered,
+/// acked, expired or reaped, so a non-blocking message
 /// must not post, whatever the reason. `target_not_live` is the EXPECTED
 /// outcome for a message to a session closed on this device (it is collected
 /// on the recipient's next `coord_inbox` drain), and `pty_never_idle` covers
@@ -917,7 +919,7 @@ async fn idle_gate(
         // (a process-table snapshot is a PowerShell/CIM call on Windows), and
         // anything the operator types or any `/exit` in that window must be
         // seen by the check that immediately precedes the paste. Same order
-        // as `graceful_exit::drive` (probe, then screen, then write).
+        // as `graceful_exit::drive_graceful_exit` (probe, then screen, then write).
         let probe =
             crate::terminal::graceful_exit::probe_claude_under(term.child_pid(), Vec::new()).await;
         claude_live(&probe, pid_reads_its_terminal)?;
@@ -2108,7 +2110,8 @@ mod tests {
     #[test]
     fn a_busy_live_recipient_waits_the_repeat_window_before_the_first_post() {
         // A long turn, a draft or a dialog is ordinary well past 60 s, and
-        // coord's alert is never resolved: `pty_never_idle` first-POSTs only
+        // coord's alert stays open until the message is delivered, acked,
+        // expired or reaped: `pty_never_idle` first-POSTs only
         // after the repeat window, though it still LOGS at the threshold.
         let mut t = SurfacingTracker::default();
         let t0 = Instant::now();
@@ -2792,7 +2795,8 @@ mod tests {
         assert!(posts_to_coord("blocking", BlockReason::TargetNotLive));
         assert!(posts_to_coord("blocking", BlockReason::PtyNeverIdle));
         // Anything else: counter and log only. coord's alert is per message
-        // and never resolved, and both reasons are ordinary states here.
+        // and stays open until the message is delivered, acked, expired or
+        // reaped, and both reasons are ordinary states here.
         assert!(!posts_to_coord("normal", BlockReason::TargetNotLive));
         assert!(!posts_to_coord("", BlockReason::TargetNotLive));
         assert!(!posts_to_coord("normal", BlockReason::PtyNeverIdle));

@@ -37,11 +37,11 @@ unreviewed_ceiling = 229
 [[disposition]]
 class = "machine_path"
 file = "src/commands/setup_wizard.rs"
-symbol = "discover_claude_config_dirs"
+symbol = "const WINDOWS_MULTI_ACCOUNT_ROOT"
 disposition = "fallback_correct"
-note = "Probes the fleet's C:\\claude multi-account convention behind is_dir(); absent everywhere else, where CLAUDE_CONFIG_DIR and ~/.claude still apply."
+note = "Probes the fleet's C:\\claude multi-account convention, read only on the Windows discovery layout (DiscoveryLayout); an absent dir reads as no accounts. Elsewhere the configured roster, CLAUDE_CONFIG_DIR and ~/.claude apply. Moved from the discover_claude_config_dirs key when the literal became this const (qontinui-runner#2544); same disposition."
 reviewed = [
-    "let claude_root = std::path::Path::new(\"C:\\\\claude\");",
+    "const WINDOWS_MULTI_ACCOUNT_ROOT: &str = \"C:\\\\claude\";",
 ]
 
 [[disposition]]
@@ -67,11 +67,11 @@ reviewed = [
 [[disposition]]
 class = "machine_path"
 file = "src/session_archive/discovery.rs"
-symbol = "discover_account_homes_from_env"
+symbol = "claude_root_for"
 disposition = "fallback_correct"
-note = "Probes C:/claude behind is_dir() on every platform, per its own doc comment; false everywhere else."
+note = "The Windows arm of the account-home scan root (the fleet's C:/claude layout); every other OS scans $HOME instead (plan 2026-10-01-a-commit-author-session-is-unreachable-because-every-session-roster-is-per-account Phase 1)."
 reviewed = [
-    "Some(PathBuf::from(\"C:\\\\claude\")),",
+    "Some(PathBuf::from(\"C:\\\\claude\"))",
 ]
 
 [[disposition]]
@@ -615,6 +615,55 @@ file = "src/session/tracking_health.rs"
 symbol = "const WORK_CHILD_IMAGES"
 disposition = "fallback_correct"
 note = "Process-IMAGE names compared against a session's direct children on every OS, never launched or required: a pwsh/powershell direct child (a shell a tool runs under) counts as WORK. On a box without PowerShell nothing matches, and the rest of child_signals_work decides as before."
+reviewed = [
+    "\"powershell\",",
+    "\"pwsh\",",
+]
+
+# Plan 2026-10-28-runner-spawn-bursts-overwhelm-the-box-beyond-the-continuation-cap
+# Phase 5: the PowerShell/WMI process-table reads became the FALLBACK behind the
+# in-process provider (src/process_capture/process_table.rs), whose platform
+# halves give every caller a non-Windows path. The fallback bodies themselves
+# are PowerShell by definition and only ever reached on Windows.
+
+[[disposition]]
+class = "os_bound_tooling"
+file = "src/process_capture/process_tree.rs"
+symbol = "powershell_snapshot"
+disposition = "fallback_correct"
+note = "The Windows-only PowerShell/WMI snapshot, reached only through process_table's circuit when the in-process sysinfo walk fails. Unix reads /proc in-process and has no external snapshot fallback."
+reviewed = [
+    "cfg(windows)-only fn `powershell_snapshot` has no cfg(not(windows)) sibling in this file",
+]
+
+[[disposition]]
+class = "os_bound_tooling"
+file = "src/process_capture/process_tree.rs"
+symbol = "command_lines_for_pids_powershell"
+disposition = "fallback_correct"
+note = "The Windows-only WMI command-line query, reached only through process_table's circuit when the in-process sysinfo cmd() read fails. Unix reads /proc/<pid>/cmdline in-process."
+reviewed = [
+    "cfg(windows)-only fn `command_lines_for_pids_powershell` has no cfg(not(windows)) sibling in this file",
+]
+
+[[disposition]]
+class = "os_bound_tooling"
+file = "src/process_capture/process_tree.rs"
+symbol = "port_owner_pid_powershell"
+disposition = "fallback_correct"
+note = "The Windows-only Get-NetTCPConnection query, reached only through process_table's circuit when the in-process GetExtendedTcpTable listener read fails. Unix keeps its own lsof port_owner_pid."
+reviewed = [
+    "cfg(windows)-only fn `port_owner_pid_powershell` has no cfg(not(windows)) sibling in this file",
+]
+
+# qontinui-runner#2376 (plan 2026-10-23-runner-sessions-stop-at-permission-dialogs-so-accept-them-by-default-with-a-tenant-switch
+# Phase 2): the PermissionRequest hook carrier's shell-program list.
+[[disposition]]
+class = "os_bound_tooling"
+file = "src/session/claude_hook.rs"
+symbol = "const SHELL_PROGRAMS"
+disposition = "fallback_correct"
+note = "Shell-name stems compared against the argv[0] of a spawn on every OS, never launched or required: the env-var carrier applies only where an interactive shell resolves `claude` through the identity shim. pwsh/powershell are two entries among ten (bash, sh, zsh, fish, dash, ksh, cmd, nu); on a box without PowerShell they match nothing and the rest decide as before."
 reviewed = [
     "\"powershell\",",
     "\"pwsh\",",

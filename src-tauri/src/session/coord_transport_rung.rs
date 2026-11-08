@@ -366,6 +366,8 @@ const READ_TOOLS: &[&str] = &[
     "coord_conflict_check",
     "coord_diagnose",
     "coord_diff_impact",
+    // No `coord_fleet_` prefix covers it, so without this it reads as a write.
+    "coord_fleet_dispatch_roles",
     "coord_fleet_drain_status",
     "coord_inbox",
     "coord_layering_triage",
@@ -385,6 +387,7 @@ const READ_TOOLS: &[&str] = &[
     "coord_reevaluate_dry",
     "coord_session_obligations",
     "coord_session_worktrees",
+    "coord_sessions_unfinished",
     "coord_verification_queue",
     "coord_watch_verdict",
     "coord_who_is_working_on",
@@ -994,6 +997,7 @@ mod tests {
         }
         for tool in [
             "coord_alert_queue",
+            "coord_fleet_dispatch_roles",
             "coord_fleet_drain_status",
             "coord_next_step_settings_effective",
             "coord_pending_agent_questions",

@@ -435,7 +435,6 @@ mod tests {
             outside.join("instance-x")
         );
     }
-    use crate::test_env::env_lock;
 
     #[test]
     fn sanitize_keeps_safe_chars() {
@@ -448,9 +447,15 @@ mod tests {
     /// secondaries so spawn-test runners never race the primary on a single
     /// shared `session-outbox.jsonl`. This asserts the exact `scope_path`
     /// contract relied on by the outbox + pane-store wiring in `main.rs`.
+    ///
+    /// The fixture captures `QONTINUI_INSTANCE_NAME` and restores it on drop,
+    /// unwinding included, so a failed assertion cannot leave every later test
+    /// in the binary reading a secondary. It also removes the hosting runner's
+    /// instance family first, so an inherited `QONTINUI_INSTANCE_ROOT` cannot
+    /// short-circuit `scope_path`.
     #[test]
     fn scope_path_isolates_outbox_dir_for_secondary() {
-        let _env = env_lock();
+        let _amb = crate::test_env::isolated_ambient();
         let base = Path::new(".qontinui").join("runner");
 
         // Secondary: appends `instance-<sanitized-name>`.
@@ -463,8 +468,6 @@ mod tests {
         );
         let outbox = scoped.join("session-outbox.jsonl");
         assert!(outbox.to_string_lossy().contains("instance-test-runner_7_"));
-
-        std::env::remove_var("QONTINUI_INSTANCE_NAME");
     }
 
     const PRIMARY: u16 = crate::mcp::types::MCP_API_PORT;

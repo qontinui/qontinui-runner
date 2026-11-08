@@ -576,7 +576,7 @@ pub(crate) fn pane_child_count(
     root_pid: Option<u32>,
 ) -> Option<usize> {
     let root = root_pid?;
-    if snapshot.parent_map.is_empty() {
+    if snapshot.is_unknown() {
         return None;
     }
     Some(snapshot.parent_map.get(&root).map_or(0, Vec::len))
@@ -736,14 +736,16 @@ async fn find_running_steward(
 
 /// A process snapshot for judging one kind's panes — taken only when that kind
 /// has a tracked pane, and otherwise the empty default (see
-/// [`find_running_steward_in`]).
+/// [`find_running_steward_in`]). A read begun now, never the memo: the reaper
+/// closes a pane, and the single-instance guard admits a second steward,
+/// because of what is ABSENT from it.
 async fn snapshot_for_kind(kind: &str) -> crate::process_capture::process_tree::ProcessSnapshot {
     let has_tracked = steward_meta_store()
         .lock()
         .map(|guard| !tracked_ids_for_kind(&guard, kind).is_empty())
         .unwrap_or(false);
     if has_tracked {
-        crate::process_capture::process_tree::snapshot_process_table_public().await
+        crate::process_capture::process_tree::snapshot_process_table_fresh().await
     } else {
         Default::default()
     }
@@ -941,6 +943,10 @@ fn get_terminal_manager(state: &ApiState) -> Arc<TerminalManager> {
 
 /// [`steward_status_in`] taking its own process snapshot. One snapshot serves
 /// every kind, and it is skipped entirely when nothing is tracked.
+///
+/// The memoized snapshot, not a fresh walk: this serves only the `GET
+/// /stewards` roster a UI polls every couple of seconds, and closes, reaps and
+/// admits nothing. Those act on absence and read [`snapshot_for_kind`] (fresh).
 async fn steward_status_all(terminal_manager: &TerminalManager) -> Vec<StewardStatusResponse> {
     let any_tracked = steward_meta_store()
         .lock()
@@ -1252,7 +1258,7 @@ async fn start_steward(
     match terminal_manager.create(
         Some(spec.skill.to_string()),
         None, // working_dir — default to workspace root
-        None, // page_id — default "default"
+        None, // page_id — placed by the page picker (terminal::page_placement)
         None, // cols — default
         None, // rows — default
         app_handle,
@@ -1418,6 +1424,69 @@ pub fn stops_at_boundary(at: Option<&str>) -> bool {
     at.map(str::trim) == Some(STOP_AT_BOUNDARY)
 }
 
+/// The `?at=boundary` stop of the running steward `spec` in terminal
+/// `terminal_id`: `TerminalManager::graceful_exit`, presenting NO close
+/// authority, answered as the stop route's body.
+///
+/// No authority, because a steward stop is an HTTP door any local process
+/// reaches, and only the lifecycle Closer will mint one (plan
+/// `2026-10-28-one-session-lifecycle-authority`, Phase 14 / R0a). So while the
+/// steward's `claude` is in the pane, this is refused `no_close_authority`
+/// before a byte is typed. The answer is `stopped: false` with that outcome,
+/// and the metadata row is kept, so `status` and the default stop still reach
+/// the steward. A pane whose `claude` is already gone answers `NoLiveClaude`,
+/// as before.
+///
+/// Split out of [`steward_stop_handler`] so its refusal is testable without an
+/// `AppHandle`. The handler resolves the running steward, then calls this.
+pub(crate) async fn stop_at_boundary(
+    manager: &Arc<TerminalManager>,
+    spec: &StewardSpec,
+    terminal_id: &str,
+) -> Result<serde_json::Value, (StatusCode, Json<ApiResponse<()>>)> {
+    info!(
+        "HTTP: Stopping {} at its iteration boundary (terminal {})",
+        spec.skill, terminal_id
+    );
+    let outcome = manager
+        .graceful_exit(
+            terminal_id,
+            crate::terminal::graceful_exit::DEFAULT_DEADLINE,
+            None,
+        )
+        .await
+        .map_err(|e| {
+            error!("HTTP: Failed to stop {} gracefully: {}", spec.skill, e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to stop {}: {}", spec.skill, e))),
+            )
+        })?;
+    let stopped = matches!(
+        outcome,
+        crate::terminal::graceful_exit::GracefulExitOutcome::Exited { .. }
+    );
+    // Only a real exit retires the metadata row. A steward left running
+    // must stay reachable by `status` and `stop`.
+    if stopped {
+        if let Ok(mut guard) = steward_meta_store().lock() {
+            guard.remove(terminal_id);
+        }
+    } else {
+        warn!(
+            outcome = outcome.word(),
+            "HTTP: {} was NOT stopped at its boundary — left running: {:?}", spec.skill, outcome
+        );
+    }
+    Ok(serde_json::json!({
+        "stopped": stopped,
+        "kind": spec.kind,
+        "session_id": terminal_id,
+        "at": STOP_AT_BOUNDARY,
+        "outcome": outcome,
+    }))
+}
+
 /// `POST /steward/{kind}/stop` — stop this steward's tracked terminal session.
 ///
 /// Two variants, selected by `?at=`:
@@ -1425,12 +1494,15 @@ pub fn stops_at_boundary(at: Option<&str>) -> bool {
 /// * **default** — the shipped `TerminalManager::close` kill path
 ///   (`terminal/manager.rs:221`, same as `close_terminal_handler`,
 ///   `mcp/terminals.rs:387`). Immediate, and it kills the `claude` in the pane.
-/// * **`?at=boundary`** — `TerminalManager::graceful_exit`: types `/exit` at
-///   the steward's idle window (its `/loop` iteration boundary), waits for
-///   `claude` to leave, and only then closes the tab. Never kills a live
-///   `claude` (D5), so it can answer `exit_stuck` and leave the steward
-///   RUNNING — the response says which, and the caller must read it rather
-///   than assume a 200 means stopped.
+/// * **`?at=boundary`** — `TerminalManager::graceful_exit` ([`stop_at_boundary`]):
+///   types `/exit` at the steward's idle window (its `/loop` iteration
+///   boundary), waits for `claude` to leave, and only then closes the tab.
+///   Never kills a live `claude` (D5), so it can answer `exit_stuck` and leave
+///   the steward RUNNING — the response says which, and the caller must read
+///   it rather than assume a 200 means stopped. Since plan
+///   `2026-10-28-one-session-lifecycle-authority` Phase 14 (R0a) it presents
+///   no close authority, so while the steward's `claude` is in the pane it
+///   answers `stopped: false`, `no_close_authority`, and types nothing.
 ///
 /// This is the same graceful path the wind-down executor uses; the difference
 /// is only that this one is asked for, so it does not wait for the idle window
@@ -1457,46 +1529,9 @@ pub async fn steward_stop_handler(
     let terminal_id = info.id.clone();
 
     if stops_at_boundary(query.at.as_deref()) {
-        info!(
-            "HTTP: Stopping {} at its iteration boundary (terminal {})",
-            spec.skill, terminal_id
-        );
-        let outcome = manager
-            .graceful_exit(
-                &terminal_id,
-                crate::terminal::graceful_exit::DEFAULT_DEADLINE,
-            )
+        return stop_at_boundary(&manager, spec, &terminal_id)
             .await
-            .map_err(|e| {
-                error!("HTTP: Failed to stop {} gracefully: {}", spec.skill, e);
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(api_error(format!("Failed to stop {}: {}", spec.skill, e))),
-                )
-            })?;
-        let stopped = matches!(
-            outcome,
-            crate::terminal::graceful_exit::GracefulExitOutcome::Exited { .. }
-        );
-        // Only a real exit retires the metadata row. A steward left running
-        // must stay reachable by `status` and `stop`.
-        if stopped {
-            if let Ok(mut guard) = steward_meta_store().lock() {
-                guard.remove(&info.id);
-            }
-        } else {
-            warn!(
-                "HTTP: {} was NOT stopped at its boundary — left running: {:?}",
-                spec.skill, outcome
-            );
-        }
-        return Ok(Json(ApiResponse::success(serde_json::json!({
-            "stopped": stopped,
-            "kind": spec.kind,
-            "session_id": info.id,
-            "at": STOP_AT_BOUNDARY,
-            "outcome": outcome,
-        }))));
+            .map(|body| Json(ApiResponse::success(body)));
     }
 
     info!("HTTP: Stopping {} (terminal {})", spec.skill, terminal_id);
@@ -1793,6 +1828,53 @@ mod tests {
         ] {
             assert!(!stops_at_boundary(Some(other)), "{other:?}");
         }
+    }
+
+    /// R0a, the steward stop's `?at=boundary`, entered at the stop route's
+    /// own boundary arm. The running steward's pane holds one live `claude`
+    /// with ZERO children, at an empty prompt: a steward sitting at its
+    /// `/loop` boundary, the moment this stop exists for. Refused
+    /// `no_close_authority`, and reported in the route's body
+    /// (`stopped: false`). Nothing typed, nothing killed; the pane stays
+    /// registered and its metadata row is kept.
+    #[tokio::test(start_paused = true)]
+    async fn the_boundary_stop_is_refused_no_close_authority_on_a_live_steward() {
+        let pane = crate::terminal::session::tests::live_claude_pane();
+        let tm = Arc::new(TerminalManager::new());
+        let id = "steward-r0a-boundary-stop";
+        tm.insert_for_test(id, pane.session.clone());
+        let spec = steward_spec("merge-train").expect("a roster kind");
+        steward_meta_store().lock().unwrap().insert(
+            id.to_string(),
+            StewardMeta {
+                kind: spec.kind.to_string(),
+                mode: spec.default_mode.to_string(),
+                interval: spec.default_interval.to_string(),
+                claude_seen: true,
+            },
+        );
+
+        let body = stop_at_boundary(&tm, spec, id).await;
+        let kept = steward_meta_store().lock().unwrap().remove(id).is_some();
+
+        let body = body.expect("a refused stop still answers 200 with its outcome");
+        assert_eq!(body["stopped"], false);
+        assert_eq!(body["at"], STOP_AT_BOUNDARY);
+        assert_eq!(body["outcome"]["outcome"], "no_close_authority");
+        assert_eq!(
+            body["outcome"]["claude_pids"],
+            serde_json::json!(pane.claude_pids)
+        );
+        assert!(pane.typed().is_empty(), "typed into a live steward");
+        assert_eq!(pane.kills(), 0);
+        assert!(
+            tm.get(id).is_some(),
+            "the steward's pane must stay registered"
+        );
+        assert!(
+            kept,
+            "a steward left running must stay reachable by status and stop"
+        );
     }
 
     #[test]

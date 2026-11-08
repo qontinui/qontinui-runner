@@ -129,6 +129,27 @@ pub(crate) struct ProcessRuntime {
     /// discovery completes; then either the port-owner / leaf / or the
     /// outer spawned PID as fallback.
     pub service_pid: Option<u32>,
+    /// Serializes this process's descendant-discovery passes (post-spawn and
+    /// every rediscovery): each holds it from reading the tracked set to
+    /// writing the merged one, so no pass overwrites another's result. A pass
+    /// that finds it held waits; the reconcile loop only checks it to avoid
+    /// queueing passes, and retries a trigger it found held on the next tick.
+    pub discovery_gate: std::sync::Arc<tokio::sync::Mutex<()>>,
+    /// What the last discovery pass did; the reconcile loop reads it once to
+    /// decide whether its rediscovery back-off resets.
+    pub last_discovery: DiscoveryPass,
+}
+
+/// What one descendant-discovery pass did, for the reconcile loop's
+/// rediscovery back-off.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct DiscoveryPass {
+    /// Counts the passes that wrote a tracked set; `0` = none yet.
+    pub seq: u64,
+    /// Entries this pass tracked that were not tracked before it.
+    pub new_entries: Vec<PidWithSpawnedAt>,
+    /// Whether this pass changed the service pid.
+    pub service_changed: bool,
 }
 
 impl Default for ProcessRuntime {
@@ -144,6 +165,8 @@ impl Default for ProcessRuntime {
             specs_discovered: false,
             descendant_pids: Vec::new(),
             service_pid: None,
+            discovery_gate: std::sync::Arc::default(),
+            last_discovery: DiscoveryPass::default(),
         }
     }
 }

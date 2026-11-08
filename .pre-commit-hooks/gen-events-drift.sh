@@ -449,6 +449,13 @@ else
     log "       resolved. Building into this checkout's own target/."
 fi
 
+# The build runs under the holder deadline (lib/shared-target.sh, "Bounding the
+# build") when qontinui-claude-config's lib is here: it holds the tree lock, so
+# a build stalled behind cargo's own target lock must not hold it for hours.
+# Absent the library (or the shared-target lib itself), it runs as before.
+declare -F guarded_build >/dev/null 2>&1 || guarded_build() { "$@"; }
+declare -F shared_target_build_stopped >/dev/null 2>&1 || shared_target_build_stopped() { return 1; }
+
 log "regenerating Rust JSON Schemas + per-type TS bindings into a scratch dir..."
 log "  scratch  : $SCRATCH_DIR"
 log "  baseline : $BASELINE_DIR (read-only)"
@@ -487,7 +494,7 @@ QONTINUI_PY_OUT_DIR="$SCRATCH_PY_DIR" \
 QONTINUI_SCHEMAS_DIR="$SCHEMAS_DIR" \
 QONTINUI_SCHEMAS_JSON="$SCRATCH_ROOT/schemas.json" \
 QONTINUI_TS_COMPILE_SCRIPT="$TS_CODEGEN_DEPS_SCRIPT" \
-    bash src-tauri/scripts/generate_types.sh --ts-only >"$GEN_LOG" 2>&1 9>&-
+    guarded_build bash src-tauri/scripts/generate_types.sh --ts-only >"$GEN_LOG" 2>&1 9>&-
 GEN_RC=$?
 set -e
 
@@ -560,6 +567,13 @@ fi
 # checkout. The tripwire is the safety property; it is evaluated first,
 # unconditionally, whatever codegen did.
 
+# A deadline stop is "cannot evaluate", exactly like a tree-lock timeout: the
+# run was stopped, not judged, so it is no evidence of drift (STRICT blocks).
+if shared_target_build_stopped "$GEN_RC" "[gen-events-drift]"; then
+    cannot_evaluate \
+        "$SHARED_TARGET_GUARD_REASON" \
+        "retry once the peer build holding cargo's target lock finishes (raise AGENT_BUILD_STALL_SECS / AGENT_BUILD_MAX_WALL_SECS to allow longer)"
+fi
 if [ "$GEN_RC" -ne 0 ]; then
     fail "ERROR: generate_types.sh failed (exit $GEN_RC). Last 30 lines:"
     tail -n 30 "$GEN_LOG" >&2 || true

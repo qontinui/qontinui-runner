@@ -1,5 +1,8 @@
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { describe, it, expect } from "vitest";
 import {
+  NON_RESTORABLE_CLOSE_REASONS,
   isUnfinished,
   parseResumeResponse,
   resumeUnfinished,
@@ -56,7 +59,12 @@ describe("parseResumeResponse", () => {
       data: {
         results: [
           { id: "a", outcome: "resumed", reason: null, verdict: "resumed" },
-          { id: "b", outcome: "skipped", reason: "no-transcript", verdict: "skipped(no-transcript)" },
+          {
+            id: "b",
+            outcome: "skipped",
+            reason: "no-transcript",
+            verdict: "skipped(no-transcript)",
+          },
         ],
       },
     };
@@ -115,5 +123,21 @@ describe("resumeUnfinished", () => {
     const [v] = await resumeUnfinished(["a"], f, 1, async () => null);
     expect(calls).toBe(1);
     expect(v.outcome).toBe("resumed");
+  });
+});
+
+describe("NON_RESTORABLE_CLOSE_REASONS", () => {
+  it("matches the Rust constant the runner's restore reads", () => {
+    const src = readFileSync(
+      fileURLToPath(
+        new URL("../../../src-tauri/src/session/session_lifecycle_store.rs", import.meta.url),
+      ),
+      "utf8",
+    );
+    const m = /pub const NON_RESTORABLE_CLOSE_REASONS: &\[&str\] =\s*&\[([^\]]*)\]/.exec(src);
+    if (!m) throw new Error("NON_RESTORABLE_CLOSE_REASONS not found in session_lifecycle_store.rs");
+    const rust = [...m[1].matchAll(/"([^"]+)"/g)].map((x) => x[1]);
+    expect(rust.length).toBeGreaterThan(0);
+    expect([...NON_RESTORABLE_CLOSE_REASONS].sort()).toEqual([...rust].sort());
   });
 });

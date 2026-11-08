@@ -97,7 +97,7 @@ concurrency:
 jobs:
   selftest:
     name: schedule-red-streak detector selftest
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(((vars.RUNNER_CI_LANE_ADVISORY_RED_DETECTOR || vars.RUNNER_CI_LIGHT_LANE) == 'self-hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && '["self-hosted","Linux","X64","qontinui-host-nawa","qontinui"]' || '"ubuntu-latest"') }}
     # A checkout plus a few hundred jq passes over ~200KB of recorded JSON.
     timeout-minutes: 5
     steps:

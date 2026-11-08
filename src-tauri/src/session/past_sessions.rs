@@ -79,7 +79,10 @@ pub struct PastSession {
     pub page_id: String,
     /// Grid zone index (-1 = unassigned).
     pub zone_index: i32,
-    /// `"open"` | `"closed"`.
+    /// `"open"` | `"closed"` — the registry record's terminal-hosting
+    /// lifecycle (`TerminalSessionRecord::state`): NOT the work axis
+    /// (`finished` / `finished_at`, which can be set on an `open` row) and NOT
+    /// liveness — use `GET /restart-readiness` for a live census.
     pub state: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub close_reason: Option<String>,

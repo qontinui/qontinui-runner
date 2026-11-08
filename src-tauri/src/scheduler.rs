@@ -408,6 +408,64 @@ impl ScheduleZone {
     pub fn from_settings(settings: &SchedulerSettings) -> Self {
         Self::from_setting(settings.timezone.as_deref())
     }
+
+    /// The zone ONE task's schedule is evaluated in: the task's own
+    /// `timezone` when it carries one, else `scheduler_zone` (the global
+    /// `SchedulerSettings::timezone`, already resolved).
+    ///
+    /// Plan `2026-10-29-recurring-agents-declared-in-coord-reconciled-by-runner`
+    /// D5: a per-task zone lets one fleet-wide declaration mean either "local
+    /// night on every device" (no zone) or a fixed instant (a named zone).
+    ///
+    /// Unlike [`Self::from_setting`], an unparseable per-task zone is an
+    /// `Err`, never a silent fall-back to the scheduler's zone: a task
+    /// declared for `Europe/Berlin` firing at a different zone's 04:20 is a
+    /// wrong-instant run nobody asked for. Every write path validates the zone
+    /// with [`Self::parse`] first, so an `Err` here means a row written around
+    /// them; callers surface it (an ERROR log and no next run) rather than
+    /// guess.
+    pub fn for_task(task_timezone: Option<&str>, scheduler_zone: Self) -> Result<Self, String> {
+        match task_timezone {
+            None => Ok(scheduler_zone),
+            Some(name) => Self::parse(name).map_err(|e| format!("task timezone: {e}")),
+        }
+    }
+}
+
+/// The next run of `task` after `now`, evaluated in the task's own zone (see
+/// [`ScheduleZone::for_task`]) ahead of `scheduler_zone`.
+///
+/// `Err` when the task's stored `timezone` does not parse. Callers log it
+/// against the task and store no `next_run`, so the task does not fire at an
+/// instant computed in a zone it was not declared in — and the API shows the
+/// missing `nextRun` beside the bad `timezone`.
+pub fn compute_task_next_run(
+    task: &ScheduledTask,
+    now: chrono::DateTime<chrono::Utc>,
+    scheduler_zone: ScheduleZone,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, String> {
+    let zone = ScheduleZone::for_task(task.timezone.as_deref(), scheduler_zone)?;
+    Ok(compute_next_run(&task.schedule, now, zone))
+}
+
+/// [`compute_task_next_run`] for the many call sites that store the result as
+/// an RFC 3339 string: an unusable task zone is logged at ERROR against the
+/// task and yields `None` (no next run), never a run in another zone.
+pub fn task_next_run_rfc3339(
+    task: &ScheduledTask,
+    now: chrono::DateTime<chrono::Utc>,
+    scheduler_zone: ScheduleZone,
+) -> Option<String> {
+    match compute_task_next_run(task, now, scheduler_zone) {
+        Ok(next) => next.map(|dt| dt.to_rfc3339()),
+        Err(e) => {
+            error!(
+                "scheduler: task '{}' ({}) has an unusable {e}; no next run is computed until it is corrected",
+                task.name, task.id
+            );
+            None
+        }
+    }
 }
 
 /// Normalize a cron expression to the `cron` crate's grammar.
@@ -717,6 +775,68 @@ mod tests {
             ScheduleZone::Local
         );
         assert_eq!(ScheduleZone::from_setting(Some("Europe/Berlin")), BERLIN);
+    }
+
+    fn nightly_task(timezone: Option<&str>) -> ScheduledTask {
+        let mut task = ScheduledTask::new(
+            "nightly".to_string(),
+            None,
+            nightly(),
+            scheduled_task_type_default(),
+        );
+        task.timezone = timezone.map(str::to_string);
+        task
+    }
+
+    /// Plan 2026-10-29 D5: a task's own `timezone` wins over the scheduler's
+    /// zone; with none, the scheduler's zone applies unchanged.
+    #[test]
+    fn a_task_timezone_takes_precedence_over_the_scheduler_zone() {
+        let from = utc("2026-07-01T12:00:00Z");
+        // Scheduler zone UTC, task in New York (EDT, UTC-4): 04:20 local = 08:20Z.
+        assert_eq!(
+            compute_task_next_run(
+                &nightly_task(Some("America/New_York")),
+                from,
+                ScheduleZone::Utc
+            ),
+            Ok(Some(utc("2026-07-02T08:20:00Z")))
+        );
+        // Scheduler zone Berlin (CEST, UTC+2), task pinned to UTC: 04:20Z.
+        assert_eq!(
+            compute_task_next_run(&nightly_task(Some("UTC")), from, BERLIN),
+            Ok(Some(utc("2026-07-02T04:20:00Z")))
+        );
+        // No task zone: the scheduler's zone decides (Berlin 04:20 = 02:20Z).
+        assert_eq!(
+            compute_task_next_run(&nightly_task(None), from, BERLIN),
+            Ok(Some(utc("2026-07-02T02:20:00Z")))
+        );
+        assert_eq!(
+            ScheduleZone::for_task(None, BERLIN),
+            Ok(BERLIN),
+            "None defers to the scheduler zone"
+        );
+    }
+
+    /// An unparseable per-task zone is an error, never the scheduler's zone
+    /// (from_setting's fall-back is for the global setting only).
+    #[test]
+    fn an_unusable_task_timezone_is_an_error_not_a_fallback() {
+        let err = ScheduleZone::for_task(Some("Mars/Olympus"), BERLIN).unwrap_err();
+        assert!(err.contains("Mars/Olympus"), "{err}");
+        assert!(ScheduleZone::for_task(Some("  "), ScheduleZone::Utc).is_err());
+        let from = utc("2026-07-01T12:00:00Z");
+        assert!(compute_task_next_run(&nightly_task(Some("Mars/Olympus")), from, BERLIN).is_err());
+        assert_eq!(
+            task_next_run_rfc3339(&nightly_task(Some("Mars/Olympus")), from, BERLIN),
+            None,
+            "no next run rather than one in another zone"
+        );
+        assert_eq!(
+            task_next_run_rfc3339(&nightly_task(Some("America/New_York")), from, BERLIN),
+            Some(utc("2026-07-02T08:20:00Z").to_rfc3339())
+        );
     }
 
     #[test]

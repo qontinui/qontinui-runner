@@ -212,8 +212,9 @@ pub fn connect_with_versions(
     let mut conn = transport::connect(pane_dir, pane, deadline)?;
     #[cfg(unix)]
     {
-        // The pane dir is 0700, so nobody else can bind there; checked anyway,
-        // symmetric with the holder's own peer check.
+        // The socket root is ours and 0700 (`pane::socket_candidates`), so
+        // nobody else can bind there; checked anyway, symmetric with the
+        // holder's own peer check.
         let uid = conn.peer_uid()?;
         if !transport::peer_authorized(uid, transport::own_uid()) {
             return Err(ConnectError::Protocol(format!(

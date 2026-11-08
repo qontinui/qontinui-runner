@@ -870,7 +870,6 @@ const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
     ("mcp/probe_executor.rs", "device", 1),
     ("repo_tenant.rs", "device", 2),
     ("plan_workunit_adapter/body_push.rs", "work-owed", 3),
-    ("session/handoff.rs", "escalated", 1),
 ];
 
 /// Totals across the whole table, asserted independently of the per-file rows
@@ -973,12 +972,20 @@ const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
 /// `GET /coord/repos/tenants` read. It is `device` by the route's contract:
 /// coord answers it over the caller DEVICE's own `tenant_devices` bindings and
 /// refuses any principal that does not prove a device. So `device` 21 -> 22.
+///
+/// Plan `2026-10-10-remote-create-residuals-followups` Phase 4 then retired
+/// `session/handoff.rs`'s `escalated` site: `close_source` no longer sends the
+/// operator-admin `DELETE /sessions/:id` but coord's device-authed
+/// `POST /sessions/:id/handoff/complete`, presenting the SOURCE session's
+/// tenant slot through `attach_device_auth_for` — the call was what was wrong,
+/// so it moved onto the stating seam and is no longer scanned. So `escalated`
+/// 2 -> 1.
 const EXPECTED_TENANT_SCOPE_TOTALS: &[(&str, usize)] = &[
     ("device", 22),
     ("session-noop", 11),
     ("session-owed", 0),
     ("work-owed", 8),
-    ("escalated", 2),
+    ("escalated", 1),
 ];
 
 /// Extract the kind from `coord-tenant-scope(<kind>):`.
@@ -1136,8 +1143,8 @@ fn every_defaulting_call_site_declares_its_tenant_scope() {
         "every scanned defaulting call site should have been classified"
     );
     assert_eq!(
-        sites, 43,
-        "expected 43 defaulting call sites — the Phase-2 census's 52 at ebbd3c70 minus the 12 \
+        sites, 42,
+        "expected 42 defaulting call sites — the Phase-2 census's 52 at ebbd3c70 minus the 12 \
          session-scoped ones Phase 5 moved onto the tenant-STATING seam (52 - 12 = 40), plus 1 \
          new work-owed defaulting call site (mcp/plan_library.rs's upstream_get_raw, the \
          body-export forward, which shares upstream_get's qontinui-web base and its \
@@ -1189,7 +1196,11 @@ fn every_defaulting_call_site_declares_its_tenant_scope() {
          bindings and refuses any principal that does not prove a device): 41 + 1 = 42. Plan \
          2026-09-30-session-attribution-is-too-sparse-to-derive-a-terminal-state Phase 4 then \
          added agent_runtime's report_session_launched (POST /agents/{{agent_id}}/session, \
-         session-noop): 42 to 43. Found {sites}. A change here \
+         session-noop): 42 to 43. Plan \
+         2026-10-10-remote-create-residuals-followups Phase 4 then moved session/handoff.rs's \
+         escalated close_source onto the stating seam (coord's device-authed handoff-complete \
+         door under the source session's tenant slot, replacing the operator-admin DELETE): \
+         43 - 1 = 42. Found {sites}. A change here \
          is fine — it just has \
          to be deliberate. It goes DOWN when a site adopts \
          `attach_device_auth_for(.., TenantScope)`, and UP only when someone adds a new \

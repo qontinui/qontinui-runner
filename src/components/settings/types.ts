@@ -415,9 +415,12 @@ export function compareForAccountSelectionMode(
 
 /** Whether a mode picks one predictable account, so the UI may mark it as the
  * auto-selected one. `manual` names its account explicitly; `weighted_random`
- * draws a new account on each pick. */
+ * draws a new account on each pick. An UNKNOWN mode (`undefined` — the
+ * settings load failed, so the form carries no mode) is not deterministic
+ * either: the page cannot know which account the runner will use, and the
+ * likeliest real mode, the runner's default, draws. */
 export function hasDeterministicPick(mode: AccountSelectionMode | undefined): boolean {
-  return mode !== "manual" && mode !== "weighted_random";
+  return mode !== undefined && mode !== "manual" && mode !== "weighted_random";
 }
 
 export interface ClaudeApiSettings {

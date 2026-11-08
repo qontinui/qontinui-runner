@@ -3190,6 +3190,13 @@ pub fn collect_env_contract() -> Section {
 // call it. We re-implement the tiny roster read inline against the same
 // on-disk shape.
 
+/// The wire spelling of the bin crate's `AccountSelectionMode::default()`
+/// (settings.rs) — the mode a roster/settings file with no explicit field
+/// resolves to. A string because this crate cannot name that enum; the bin
+/// crate's `collector_default_spelling_matches_the_enum_default` test keeps
+/// the two in step.
+pub const DEFAULT_LOCAL_SELECTION_MODE: &str = "weighted_random";
+
 /// On-disk probe of `claude-accounts.json` — only the fields this collector
 /// needs. Selection mode is read as a raw string (snake_case on disk) to avoid
 /// depending on the bin-crate `AccountSelectionMode` enum.
@@ -3332,7 +3339,10 @@ pub fn collect_claude_accounts() -> Option<Section> {
 ///
 /// SECRET-SAFETY INVARIANT (pinned by `secret_safety_claude_accounts_*`): this
 /// function NEVER opens `.credentials.json` (or `.claude.json`) — it emits only
-/// names/topology and `present`/`absent` EXISTENCE flags.
+/// names/topology and `present`/`absent` flags. The one credential it reads is
+/// an account's long-lived `CLAUDE_CODE_OAUTH_TOKEN` in `settings.json`, and
+/// only through `claude_oauth_token::from_config_dir` to decide that flag; the
+/// value never reaches the section.
 fn collect_claude_accounts_from(
     config_root: &Path,
     profiles_text: Option<&str>,
@@ -3343,9 +3353,7 @@ fn collect_claude_accounts_from(
     let settings_file = runner_dir.join("settings.json");
 
     let mut config_dirs: Vec<String> = Vec::new();
-    // Mirrors `AccountSelectionMode::default()` (settings.rs) — the mode a
-    // roster/settings file with no explicit field resolves to.
-    let mut local_selection_mode = String::from("alternating_handoff");
+    let mut local_selection_mode = String::from(DEFAULT_LOCAL_SELECTION_MODE);
     let mut launch_commands: HashMap<String, String> = HashMap::new();
     let mut accounts_file_found = false;
 
@@ -3398,10 +3406,16 @@ fn collect_claude_accounts_from(
     let names: Vec<&str> = pairs.iter().map(|(n, _)| n.as_str()).collect();
     put(&mut section, "accounts", names.join(","));
 
-    // auth_<name>: EXISTENCE of <config_dir>/.credentials.json — NEVER opened.
+    // auth_<name>: whether the account can log in — EXISTENCE of
+    // <config_dir>/.credentials.json (NEVER opened), or a usable long-lived
+    // `claude setup-token` token in its settings.json (the value is read only
+    // to test its shape and is never emitted). An account holding only such a
+    // token is logged in, so reporting it `absent` would be a false drift.
     for (name, dir) in &pairs {
         let creds = Path::new(dir).join(".credentials.json");
-        let flag = if creds.exists() { "present" } else { "absent" };
+        let logged_in =
+            creds.exists() || crate::claude_oauth_token::from_config_dir(Path::new(dir)).is_some();
+        let flag = if logged_in { "present" } else { "absent" };
         put(&mut section, &format!("auth_{name}"), flag);
     }
 
@@ -3472,6 +3486,24 @@ fn collect_claude_accounts_from(
 // `outside-workspace` when it resolves somewhere else. A setting spelled
 // relative is published normalized and verbatim — defensive only, since the
 // setting is documented as absolute.
+//
+// **`harness_scope_kind` says which rung resolved the root.** Relative
+// renderings make two roots comparable only when both were resolved as the
+// same concept, so — like `repos_scope_kind` — the section publishes the
+// resolution kind beside its readings. qontinui-web classifies it `derived`:
+// reported, excluded from `in_sync`, never an apply line.
+
+/// The provenance key: WHICH KIND of workspace-root resolution the harness
+/// observations were taken under. The value is `WorkspaceRootKind::wire()`:
+/// `declared` / `discovered` / `home_default` in practice. `session_repo_parent`
+/// is in the enum but unreachable here, because the process-wide resolver
+/// [`collect_harness`] uses passes no session repo; `unresolved` is in the enum
+/// but never published, because an unresolved root yields no section at all. NOT
+/// `ProbeScopeKind`, which is what `versions.probe_scope_kind` carries.
+/// qontinui-web registers it as a derived key
+/// (`devenv_section_policy._DERIVED_KEYS["harness"]`), so a pure provenance
+/// difference never reads as drift; renaming it breaks that registration.
+pub(crate) const HARNESS_SCOPE_KEY: &str = "harness_scope_kind";
 
 /// The bin crate's `paths.plans_dir` door, published as a FUNCTION for the
 /// same reason [`WorkspaceRootFn`] is: the setting is operator-editable and
@@ -4372,6 +4404,7 @@ pub fn collect_harness() -> Option<Section> {
             rejected.describe()
         );
     }
+    let kind = resolved.kind;
     let root = resolved.into_root()?;
     let plans_dir = match PLANS_DIR_DOOR.get() {
         Some(door) => PlansDirReading::Read(door()),
@@ -4384,19 +4417,22 @@ pub fn collect_harness() -> Option<Section> {
         &plans_dir,
         config_root.as_deref(),
         home.as_deref(),
+        kind,
     ))
 }
 
 /// Injectable core of [`collect_harness`]: `root` is the workspace root,
 /// `plans_dir` the settings door's answer, `config_root` the platform config
 /// dir the accounts roster lives under, `home` the user's home dir (the
-/// agent-skills install root and the global git config live under it). Every
+/// agent-skills install root and the global git config live under it), `kind`
+/// the rung that resolved `root` — published as [`HARNESS_SCOPE_KEY`]. Every
 /// value is a `Value::String`.
 fn collect_harness_under(
     root: &Path,
     plans_dir: &PlansDirReading,
     config_root: Option<&Path>,
     home: Option<&Path>,
+    kind: qontinui_types::paths::WorkspaceRootKind,
 ) -> Section {
     let config_repo = root.join(HARNESS_CONFIG_REPO_DIR);
     let mut section = Section::new();
@@ -4510,6 +4546,12 @@ fn collect_harness_under(
         "invariant_class",
         invariant_class(&shape, &tracked),
     );
+    // Every key above is a probe under `root` or a rendering relative to it,
+    // so the section carries WHICH rung resolved that root — exactly as
+    // `repos` does with `REPOS_SCOPE_KEY`. Without it, two boxes whose roots
+    // were resolved by different rungs compare these readings with nothing
+    // saying they did not measure the same concept.
+    put(&mut section, HARNESS_SCOPE_KEY, kind.wire());
 
     section
 }
@@ -4519,6 +4561,7 @@ mod tests {
     use super::*;
 
     use crate::test_env::env_lock;
+    use qontinui_types::paths::WorkspaceRootKind;
 
     #[test]
     fn sanitize_url_strips_password() {
@@ -6776,6 +6819,58 @@ dependencies = [
         );
     }
 
+    /// An account holding ONLY a long-lived `claude setup-token` token (no
+    /// `.credentials.json`) is logged in, so it reports `present` — and the
+    /// token value appears nowhere in the section. A placeholder that is not a
+    /// Claude OAuth token still reports `absent`.
+    #[test]
+    fn secret_safety_claude_accounts_long_lived_token_is_present_and_never_leaks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let runner = root.join("com.qontinui.runner");
+
+        let token = "sk-ant-oat01-SUPERSECRET-LONG-LIVED";
+        let tok_acct = root.join(".claude-tokenacct");
+        std::fs::create_dir_all(&tok_acct).unwrap();
+        std::fs::write(
+            tok_acct.join("settings.json"),
+            format!("{{\"env\":{{\"CLAUDE_CODE_OAUTH_TOKEN\":\"{token}\"}}}}"),
+        )
+        .unwrap();
+        let placeholder_acct = root.join(".claude-placeholder");
+        std::fs::create_dir_all(&placeholder_acct).unwrap();
+        std::fs::write(
+            placeholder_acct.join("settings.json"),
+            "{\"env\":{\"CLAUDE_CODE_OAUTH_TOKEN\":\"REPLACE_ME\"}}",
+        )
+        .unwrap();
+
+        write_roster(
+            &runner,
+            &format!(
+                "{{\"claude_config_dirs\":[{:?},{:?}]}}",
+                tok_acct.to_string_lossy(),
+                placeholder_acct.to_string_lossy()
+            ),
+        );
+
+        let section = collect_claude_accounts_from(root, None, None).expect("section present");
+        let json = serde_json::to_string(&section).unwrap();
+
+        assert_eq!(
+            section.get("auth_tokenacct").and_then(|v| v.as_str()),
+            Some("present"),
+            "a token-only account is logged in: {json}"
+        );
+        assert_eq!(
+            section.get("auth_placeholder").and_then(|v| v.as_str()),
+            Some("absent"),
+            "a placeholder is not a login: {json}"
+        );
+        assert!(!json.contains(token), "long-lived token leaked: {json}");
+        assert!(!json.contains("sk-ant-oat"), "token prefix leaked: {json}");
+    }
+
     /// Behavior: sorted stripped names, correct mode, auth presence reflects the
     /// credential file, and `None` when neither the file nor any dir exists.
     #[test]
@@ -6889,6 +6984,28 @@ dependencies = [
         assert_eq!(
             section.get("accounts").and_then(|v| v.as_str()),
             Some("personal")
+        );
+    }
+
+    /// A roster that stores no mode reports the runner's default as the local
+    /// mode — spelled as a LITERAL here, so changing the constant reddens this
+    /// test as well as the bin crate's enum-agreement test.
+    #[test]
+    fn claude_accounts_roster_without_a_mode_reports_weighted_random() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let runner = root.join("com.qontinui.runner");
+        let acct = root.join(".claude-personal");
+        std::fs::create_dir_all(&acct).unwrap();
+        write_roster(
+            &runner,
+            &format!("{{\"claude_config_dirs\":[{:?}]}}", acct.to_string_lossy()),
+        );
+
+        let section = collect_claude_accounts_from(root, None, None).unwrap();
+        assert_eq!(
+            section.get("local_selection_mode").and_then(|v| v.as_str()),
+            Some("weighted_random")
         );
     }
 
@@ -7122,6 +7239,7 @@ dependencies = [
             &PlansDirReading::Read(Some(plans)),
             None,
             Some(&home),
+            WorkspaceRootKind::Declared,
         );
 
         for (k, v) in &section {
@@ -7161,7 +7279,13 @@ dependencies = [
     #[test]
     fn harness_bare_root_reads_absent_everywhere() {
         let root = harness_root("bare");
-        let section = collect_harness_under(&root, &PlansDirReading::Read(None), None, None);
+        let section = collect_harness_under(
+            &root,
+            &PlansDirReading::Read(None),
+            None,
+            None,
+            WorkspaceRootKind::Declared,
+        );
         for key in [
             "link_claude_dir",
             "link_claude_md",
@@ -7180,6 +7304,43 @@ dependencies = [
         );
         assert_eq!(harness_value(&section, "plans_dir_relative"), "unset");
         assert_eq!(harness_value(&section, "invariant_class"), "(a)");
+        assert_eq!(harness_value(&section, HARNESS_SCOPE_KEY), "declared");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The section publishes WHICH rung resolved the root it probed, verbatim
+    /// from `WorkspaceRootKind::wire()` — the value set qontinui-web's
+    /// `_DERIVED_KEYS["harness"]` registration documents. Every variant: the
+    /// table is built through an exhaustive `match` with no wildcard, so a new
+    /// rung fails to COMPILE here until it is given an expected wire value.
+    /// The key name itself is pinned because the web registration is keyed on
+    /// it.
+    #[test]
+    fn harness_publishes_the_workspace_root_kind() {
+        fn expected_wire(kind: WorkspaceRootKind) -> &'static str {
+            match kind {
+                WorkspaceRootKind::Declared => "declared",
+                WorkspaceRootKind::Discovered => "discovered",
+                WorkspaceRootKind::SessionRepoParent => "session_repo_parent",
+                WorkspaceRootKind::HomeDefault => "home_default",
+                WorkspaceRootKind::Unresolved => "unresolved",
+            }
+        }
+        assert_eq!(HARNESS_SCOPE_KEY, "harness_scope_kind");
+        let root = harness_root("scope");
+        for kind in [
+            WorkspaceRootKind::Declared,
+            WorkspaceRootKind::Discovered,
+            WorkspaceRootKind::SessionRepoParent,
+            WorkspaceRootKind::HomeDefault,
+            WorkspaceRootKind::Unresolved,
+        ] {
+            let wire = expected_wire(kind);
+            let section =
+                collect_harness_under(&root, &PlansDirReading::Read(None), None, None, kind);
+            assert_eq!(harness_value(&section, HARNESS_SCOPE_KEY), wire);
+            assert!(section[HARNESS_SCOPE_KEY].is_string(), "envelope contract");
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -7194,7 +7355,13 @@ dependencies = [
         std::fs::create_dir_all(&tracked).unwrap();
 
         if make_link(&root.join("plans"), &tracked, true) {
-            let section = collect_harness_under(&root, &PlansDirReading::Read(None), None, None);
+            let section = collect_harness_under(
+                &root,
+                &PlansDirReading::Read(None),
+                None,
+                None,
+                WorkspaceRootKind::Declared,
+            );
             assert_eq!(harness_value(&section, "invariant_class"), "(b)");
             // Remove the link only (never the target). On Windows a directory
             // symlink/junction is removed as a directory.
@@ -7208,7 +7375,13 @@ dependencies = [
 
         std::fs::create_dir_all(root.join("plans")).unwrap();
         std::fs::write(root.join("plans").join("stray.md"), "# a second corpus\n").unwrap();
-        let section = collect_harness_under(&root, &PlansDirReading::Read(None), None, None);
+        let section = collect_harness_under(
+            &root,
+            &PlansDirReading::Read(None),
+            None,
+            None,
+            WorkspaceRootKind::Declared,
+        );
         assert_eq!(harness_value(&section, "invariant_class"), "(c)");
         assert!(
             root.join("plans").join("stray.md").is_file(),
@@ -7231,7 +7404,13 @@ dependencies = [
             let _ = std::fs::remove_dir_all(&root);
             return;
         }
-        let section = collect_harness_under(&root, &PlansDirReading::Read(None), None, None);
+        let section = collect_harness_under(
+            &root,
+            &PlansDirReading::Read(None),
+            None,
+            None,
+            WorkspaceRootKind::Declared,
+        );
         assert_eq!(harness_value(&section, "link_claude_dir"), "foreign");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -7253,13 +7432,25 @@ dependencies = [
         )
         .unwrap();
         std::fs::create_dir_all(root.join(".claude")).unwrap();
-        let section = collect_harness_under(&root, &PlansDirReading::Read(None), None, None);
+        let section = collect_harness_under(
+            &root,
+            &PlansDirReading::Read(None),
+            None,
+            None,
+            WorkspaceRootKind::Declared,
+        );
         assert_eq!(harness_value(&section, "link_claude_md"), "present");
         assert_eq!(harness_value(&section, "link_dev_start"), "present");
         assert_eq!(harness_value(&section, "link_claude_dir"), "foreign");
 
         std::fs::write(root.join("CLAUDE.md"), "# my own guidelines\n").unwrap();
-        let section = collect_harness_under(&root, &PlansDirReading::Read(None), None, None);
+        let section = collect_harness_under(
+            &root,
+            &PlansDirReading::Read(None),
+            None,
+            None,
+            WorkspaceRootKind::Declared,
+        );
         assert_eq!(harness_value(&section, "link_claude_md"), "foreign");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -7354,7 +7545,13 @@ dependencies = [
             matches!(shape, PathShape::Link { resolved: None, .. }),
             "expected a dangling link shape, got {shape:?}"
         );
-        let section = collect_harness_under(&root, &PlansDirReading::Read(None), None, None);
+        let section = collect_harness_under(
+            &root,
+            &PlansDirReading::Read(None),
+            None,
+            None,
+            WorkspaceRootKind::Declared,
+        );
         assert_eq!(harness_value(&section, "link_claude_dir"), "foreign");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -7832,7 +8029,13 @@ dependencies = [
             "#!/bin/sh\n",
         )
         .unwrap();
-        let section = collect_harness_under(&root, &PlansDirReading::Read(None), None, None);
+        let section = collect_harness_under(
+            &root,
+            &PlansDirReading::Read(None),
+            None,
+            None,
+            WorkspaceRootKind::Declared,
+        );
         assert_eq!(harness_value(&section, "installer_git_hooks"), "present");
 
         std::fs::write(
@@ -7840,7 +8043,13 @@ dependencies = [
             "[core]\n\thooksPath = .githooks\n",
         )
         .unwrap();
-        let section = collect_harness_under(&root, &PlansDirReading::Read(None), None, None);
+        let section = collect_harness_under(
+            &root,
+            &PlansDirReading::Read(None),
+            None,
+            None,
+            WorkspaceRootKind::Declared,
+        );
         assert_eq!(
             harness_value(&section, "installer_git_hooks"),
             "absent",
@@ -7852,7 +8061,13 @@ dependencies = [
             "#!/bin/sh\n",
         )
         .unwrap();
-        let section = collect_harness_under(&root, &PlansDirReading::Read(None), None, None);
+        let section = collect_harness_under(
+            &root,
+            &PlansDirReading::Read(None),
+            None,
+            None,
+            WorkspaceRootKind::Declared,
+        );
         assert_eq!(harness_value(&section, "installer_git_hooks"), "present");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -8300,6 +8515,7 @@ dependencies = [
             &PlansDirReading::Read(None),
             Some(&config_root),
             None,
+            WorkspaceRootKind::Declared,
         );
         assert_eq!(
             harness_value(&section, "installer_claude_accounts"),
@@ -8318,6 +8534,7 @@ dependencies = [
             &PlansDirReading::Read(None),
             Some(&config_root),
             None,
+            WorkspaceRootKind::Declared,
         );
         assert_eq!(
             harness_value(&section, "installer_claude_accounts"),
