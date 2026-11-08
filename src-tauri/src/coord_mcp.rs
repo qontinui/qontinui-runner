@@ -12747,7 +12747,8 @@ impl std::fmt::Display for SpawnTenantRefusal {
                     "{code}: {} declares a coord-mcp server, which this session would use \
                      instead of a credential for tenant {tenant}, and its key {resolves} — \
                      refusing the spawn. Spawn it in a directory whose .mcp.json declares no \
-                     coord-mcp (an isolated worktree via intent_repo does this), or without a tenant",
+                     coord-mcp (a freshly allocated worktree via intent_repo does this; one \
+                     reused from an earlier session may carry that session's), or without a tenant",
                     declared_file.display()
                 )
             }
@@ -12836,7 +12837,8 @@ pub(crate) fn check_workdir_declared_tenant(
 /// [`TerminalSession::spawn`]'s identity seam is the authority — it is where the
 /// credential is minted, and where the cwd-declared arm can be judged against
 /// the FINAL cwd. But by then `acquire_for_terminal` has already allocated a
-/// worktree and taken a claim, and a refusal there would leak both. Membership
+/// worktree and taken a claim. A refusal there releases the claim (the
+/// context's `Drop` does, best-effort) but leaves the worktree on disk. Membership
 /// does not depend on the cwd, so it is checked here first, the way
 /// `resource_guard::precheck_spawn` fronts the seam's resource gate.
 pub(crate) fn precheck_spawn_tenant(spawn_tenant: Option<Uuid>) -> Result<(), String> {
