@@ -10,16 +10,16 @@ use crate::provenance::{command_canonical, skill_canonical, with_provenance};
 use std::process::Command;
 
 fn git(dir: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .arg("-C")
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
         .arg(dir)
         .args(args)
         .env("GIT_AUTHOR_NAME", "t")
         .env("GIT_AUTHOR_EMAIL", "t@example.com")
         .env("GIT_COMMITTER_NAME", "t")
-        .env("GIT_COMMITTER_EMAIL", "t@example.com")
-        .output()
-        .expect("git runs");
+        .env("GIT_COMMITTER_EMAIL", "t@example.com");
+    let out = crate::process_helpers::output_with_timeout(cmd, Duration::from_secs(60))
+        .expect("git runs within 60 s");
     assert!(
         out.status.success(),
         "git {args:?} in {}: {}",
@@ -168,12 +168,12 @@ impl Fixture {
     /// `__pycache__/` beside it. `false` when no python3 is on PATH.
     fn compile_helper(&self) -> bool {
         let src = self.tree.join(".claude/skills/demo/lib/mod_a.py");
-        Command::new("python3")
-            .arg("-c")
+        let mut cmd = Command::new("python3");
+        cmd.arg("-c")
             .arg("import py_compile,sys; py_compile.compile(sys.argv[1], doraise=True)")
-            .arg(&src)
-            .status()
-            .is_ok_and(|s| s.success())
+            .arg(&src);
+        crate::process_helpers::output_with_timeout(cmd, Duration::from_secs(60))
+            .is_ok_and(|o| o.status.success())
     }
 
     fn judge(&self) -> ChangesJudgement {
@@ -423,9 +423,9 @@ fn clean_tree_is_clean() {
 fn foreign_bytecode_beside_residue_is_not_residue() {
     let fx = Fixture::new(&[]);
     fx.provision();
-    let tag = Command::new("python3")
-        .args(["-c", "import sys; print(sys.implementation.cache_tag)"])
-        .output();
+    let mut cmd = Command::new("python3");
+    cmd.args(["-c", "import sys; print(sys.implementation.cache_tag)"]);
+    let tag = crate::process_helpers::output_with_timeout(cmd, Duration::from_secs(60));
     let Some(tag) = tag.ok().filter(|o| o.status.success()) else {
         return; // no interpreter here: nothing to compile, nothing to judge
     };
