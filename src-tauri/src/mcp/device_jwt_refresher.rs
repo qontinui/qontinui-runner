@@ -1442,11 +1442,17 @@ pub(crate) async fn attempt_pair_mint(
     //
     // D3: gated on the SPECIFIC bail reasons this fallback answers — NOT a
     // blanket "anything but Healthy". `BailTenantMismatch` is deliberately
-    // excluded: coord already minted for the wrong tenant once this tick, and
-    // a dmk exchange mints from the SAME `coord.devices.tenant_id` column that
-    // wrong mint may have just overwritten, so falling through here would
-    // repeat the incident rather than recover from it. `BailNeedsSignIn` is
-    // included: the exchange needs no user, which is exactly the case it is.
+    // excluded as a caution: coord already minted for the wrong tenant once
+    // this tick. The two mints take their tenant from different places — the
+    // pair-cli mint from the request or the operator's home tenant, the dmk
+    // exchange from `coord.devices.tenant_id` — so the exchange is not certain
+    // to repeat the mistake, but a tick that just saw one wrong-tenant mint
+    // stops rather than try a second door. The exchange would refuse a
+    // mismatched mint anyway (`expected_tenant`, see
+    // [`try_device_machine_key_exchange`]). Before qontinui-coord#3457 the
+    // wrong pair-cli mint could also overwrite that column; it no longer moves
+    // an already-paired device's home. `BailNeedsSignIn` is included: the
+    // exchange needs no user, which is exactly the case it is.
     let mut dmk_jwt = None;
     if matches!(
         progress,
@@ -2919,19 +2925,24 @@ pub(crate) fn binding_gaps() -> BindingGapReport {
 //
 // Phase 4 as first written had an "Arm A": when a stored Cognito refresh
 // token was in window, run `pair-cli` headlessly with the GAP's tenant id.
-// It was removed before it shipped, because coord's pairing write
-// (`record_pairing`, shared by `pair-cli` and `pair-complete`) does two
-// things no refresher may do on its own:
+// It was removed before it shipped. Coord's pairing write (`record_pairing`,
+// shared by `pair-cli` and `pair-complete`) UPSERTS `coord.tenant_devices`, so
+// a coord-side unbind would be silently reversed by the next pass that still
+// believed the binding. No refresher may do that on its own, so this module
+// never runs it for a NON-default bound tenant's slot. Its one pre-existing
+// `pair-cli` call is the default tenant's own refresh in [`try_refresh_once`],
+// which re-binds that tenant in the same way; the per-tenant seed is kept off
+// that path.
 //
-// 1. it rewrites `coord.devices.tenant_id` to the requested tenant — the
-//    device's HOME pointer, which `machine-credential/exchange` mints for —
-//    so seeding non-default tenant B would make the default tenant's own
-//    recovery mint B and be refused as `TenantMismatch`;
-// 2. it UPSERTS `coord.tenant_devices`, so a coord-side unbind would be
-//    silently reversed by the next pass that still believed the binding.
+// When the arm was removed the write also rewrote `coord.devices.tenant_id`,
+// the device's HOME pointer, which `machine-credential/exchange` mints for.
+// qontinui-coord#3457 stopped that for a device that is already paired: the
+// home moves only when the caller names one, or on a never-paired row. That
+// half of the reason no longer holds; the UPSERT alone keeps this rule for
+// the non-default slots.
 //
 // The safe headless seed is a coord door that mints for an EXISTING binding
-// without touching either (the plan's Phase 6), consumed here by Phase 7.
+// without creating one (the plan's Phase 6), consumed here by Phase 7.
 // Phase 7 consumes that door ([`seed_tenant_slot`]): ONCE per tenant per
 // lapse, attempt recorded BEFORE the call, falling back to ONE durable ask
 // per tenant per lapse when it does not put a slot there (and to NO ask when
@@ -2966,19 +2977,40 @@ pub(crate) fn binding_gaps() -> BindingGapReport {
 pub const AUTONOMY_BINDING_GAP_EVENT: &str = "autonomy-binding-gap";
 
 /// Why the operator is asked rather than the runner seeding the slot itself.
-/// Stored on the record and shown verbatim.
+/// Shown verbatim, with the seed attempt's outcome appended by
+/// [`binding_gap_ask_reason`].
 pub(crate) const BINDING_GAP_ASK_REASON: &str = "this tenant's credential was not seeded \
-     automatically, and the runner never runs coord's pairing door (pair-cli) unattended: it \
-     also re-points this device's home tenant and re-creates the binding";
+     automatically, and the runner never runs coord's pairing door (pair-cli) unattended: a \
+     pairing re-creates the binding even if an operator removed it";
 
-/// What the heal command also does, stated on every ask. Pairing goes
-/// through coord's `record_pairing`, which makes the paired tenant this
-/// device's home (`coord.devices.tenant_id`), and qontinui-web rotates the
-/// device's single machine key to it.
-pub(crate) const BINDING_GAP_PAIR_CAVEAT: &str = "pairing also makes this tenant the \
-     device's home tenant in coord and rotates its machine key to it — that is how \
-     pairing works; coord's per-binding seed door (tried first, once per lapse) is the \
-     path that does neither, and it did not put a credential in this slot";
+/// What the heal command does and does not move, stated on every ask so nobody
+/// declines the heal for a side effect it no longer has. Since
+/// qontinui-coord#3457 a pairing leaves an already-paired device's home
+/// (`coord.devices.tenant_id`) alone unless the caller names one, and the
+/// `qontinui_profile device pair --tenant-id` command the ask offers names
+/// none. That command, with no `--auth-token`, pairs through the browser flow
+/// (web's `pair-confirm`), which mints no machine key at all; with
+/// `--auth-token` it goes through web's `pair-cli`, whose auto-mint keeps a key
+/// that is usable for more than `SELF_MINT_RENEWAL_WINDOW` (7 days).
+pub(crate) const BINDING_GAP_PAIR_CAVEAT: &str = "pairing binds this tenant to this device; \
+     for a device that is already paired it leaves the home tenant alone and keeps a \
+     machine key with more than a week left. Coord's per-binding seed door is the \
+     automatic path, and this slot still has no credential from it";
+
+/// The ask's operator-facing reason: today's [`BINDING_GAP_ASK_REASON`],
+/// plus what this lapse's seed attempt came to when there was one. Built each
+/// time the ask is shown rather than stored, so correcting the text corrects
+/// asks that are already open.
+pub(crate) fn binding_gap_ask_reason(seed_outcome: &str) -> String {
+    if seed_outcome.is_empty() {
+        BINDING_GAP_ASK_REASON.to_string()
+    } else {
+        format!(
+            "{BINDING_GAP_ASK_REASON}; automatic seed through coord's per-binding \
+             door: {seed_outcome}"
+        )
+    }
+}
 
 /// One tenant's state within the CURRENT lapse — the record that makes
 /// "exactly once" survive a restart, and the ask the UI reads back.
@@ -2987,8 +3019,10 @@ pub(crate) const BINDING_GAP_PAIR_CAVEAT: &str = "pairing also makes this tenant
 /// opens when a MEASURED, act-grade report first names the tenant and closes
 /// when a MEASURED report stops naming it. An `Unknown` report closes nothing.
 ///
-/// Unknown fields are ignored on read, so a record written by the pre-review
-/// build (which also carried `mint_attempted`) still loads.
+/// Unknown fields are ignored on read, so a record written by an older build
+/// (which also carried `mint_attempted`, or a stored `reason`) still loads.
+/// The reason is not stored: [`binding_gap_ask_reason`] builds it when the
+/// ask is shown, so an ask opened by an older build shows today's text.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct GapAskRecord {
     /// True once the ask for this tenant in this lapse has been RECORDED —
@@ -2998,17 +3032,13 @@ pub(crate) struct GapAskRecord {
     /// Unix seconds when this lapse was first observed.
     #[serde(default)]
     pub first_seen: i64,
-    /// The operator-facing reason, stored so the pull path can render the
-    /// ask without re-deriving it.
-    #[serde(default)]
-    pub reason: String,
     /// True once the Phase 7 seed attempt for this tenant in this lapse has
     /// been RECORDED — written BEFORE the network call, so a crash mid-call
     /// or a refusal can never produce a second attempt in the same lapse.
     #[serde(default)]
     pub seed_attempted: bool,
     /// What the seed attempt came to, in operator words; empty until the
-    /// attempt concludes. Folded into the ask's `reason` when it falls back.
+    /// attempt concludes. [`binding_gap_ask_reason`] folds it into the ask.
     #[serde(default)]
     pub seed_outcome: String,
     /// True when coord's seed door answered `403 not_bound`: coord says this
@@ -3049,7 +3079,6 @@ impl GapAskState {
             .or_insert(GapAskRecord {
                 notified: false,
                 first_seen: now,
-                reason: String::new(),
                 seed_attempted: false,
                 seed_outcome: String::new(),
                 seed_not_bound: false,
@@ -3174,7 +3203,9 @@ pub(crate) fn binding_gap_ask_payload(
         "command": format!("qontinui_profile device pair --tenant-id {tenant}"),
         // Said, not hidden: the heal is the SAME coord pairing write the
         // runner refuses to run unattended, so a human running it should know
-        // what it moves. The plan's Phase 6 door removes this caveat.
+        // what it moves and what it leaves alone. Phase 7's seed door is tried
+        // first when this runner can present a credential for it; this ask is
+        // the fallback when no credential reached the slot that way.
         "caveat": BINDING_GAP_PAIR_CAVEAT,
         "first_seen": first_seen,
     })
@@ -3220,13 +3251,10 @@ pub(crate) fn open_binding_gap_asks(
             .filter(|(_, r)| r.notified)
             .filter_map(|(k, r)| {
                 let tenant = uuid::Uuid::parse_str(k).ok()?;
-                let reason = if r.reason.is_empty() {
-                    BINDING_GAP_ASK_REASON
-                } else {
-                    r.reason.as_str()
-                };
-                (bound.contains(&tenant) && !slots.contains(&tenant))
-                    .then(|| binding_gap_ask_payload(&tenant, reason, r.first_seen))
+                (bound.contains(&tenant) && !slots.contains(&tenant)).then(|| {
+                    let reason = binding_gap_ask_reason(&r.seed_outcome);
+                    binding_gap_ask_payload(&tenant, &reason, r.first_seen)
+                })
             })
             .collect(),
     )
@@ -3560,16 +3588,7 @@ pub(crate) fn plan_gap_actions_at(
         let (first_seen, reason) = {
             let rec = state.entry(&tenant, now);
             rec.notified = true;
-            rec.reason = if rec.seed_outcome.is_empty() {
-                BINDING_GAP_ASK_REASON.to_string()
-            } else {
-                format!(
-                    "{BINDING_GAP_ASK_REASON}; automatic seed through coord's per-binding \
-                     door: {}",
-                    rec.seed_outcome
-                )
-            };
-            (rec.first_seen, rec.reason.clone())
+            (rec.first_seen, binding_gap_ask_reason(&rec.seed_outcome))
         };
         warn!(
             "device_jwt_refresher: asking the operator ONCE to pair bound tenant {tenant} \
@@ -12795,9 +12814,9 @@ mod tenant_slot_refresh_tests {
 
     /// REVIEW MAJOR 1 (and the headless half of MAJOR 2) — the runner never
     /// runs `pair-cli` to seed a bound tenant's slot. Coord's pairing write
-    /// re-points `coord.devices.tenant_id` and upserts `coord.tenant_devices`,
-    /// so a headless per-tenant pair would move this device's home tenant and
-    /// silently undo a coord-side unbind. The only `pair-cli` call in this
+    /// upserts `coord.tenant_devices`, so a headless per-tenant pair would
+    /// silently undo a coord-side unbind (it also re-pointed
+    /// `coord.devices.tenant_id` until qontinui-coord#3457). The only `pair-cli` call in this
     /// module is the pre-existing default-tenant refresh in
     /// [`try_refresh_once`]; a second one is the removed Arm A coming back.
     /// Reverse only through the coord door the plan's Phase 6 specifies —
@@ -12821,8 +12840,8 @@ mod tenant_slot_refresh_tests {
             1,
             "{calls:?}: exactly one pair-cli call site (try_refresh_once, the default \
              tenant) — a second one re-introduces the headless per-tenant seed the \
-             route-around review removed (it re-points coord.devices.tenant_id and \
-             re-creates bindings)"
+             route-around review removed (it re-creates bindings an operator \
+             removed)"
         );
         assert!(
             calls[0].starts_with(concat!(
@@ -12845,7 +12864,7 @@ mod tenant_slot_refresh_tests {
                 !src.lines()
                     .map(str::trim_start)
                     .any(|l| !l.starts_with("//") && l.contains(other)),
-                "the refresher must not call {other} — it re-points coord.devices.tenant_id"
+                "the refresher must not call {other} — it re-creates removed bindings"
             );
         }
         // Nor a hand-rolled request to the route: production code (everything
@@ -12878,7 +12897,7 @@ mod tenant_slot_refresh_tests {
             notified(&actions)[0]["reason"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("re-points this device's home tenant"),
+                .contains("re-creates the binding"),
             "the ask says WHY a human is needed"
         );
     }
@@ -13262,10 +13281,7 @@ mod tenant_slot_refresh_tests {
         let on_disk = load_gap_ask_state(&path);
         for t in [a, b] {
             let rec = on_disk.tenants.get(&t.to_string()).expect("record on disk");
-            assert!(
-                rec.notified && rec.first_seen > 0 && !rec.reason.is_empty(),
-                "{rec:?}"
-            );
+            assert!(rec.notified && rec.first_seen > 0, "{rec:?}");
         }
         assert_eq!(
             notified(&all)[0]["cta"],
@@ -13349,8 +13365,9 @@ mod tenant_slot_refresh_tests {
     }
 
     /// The lapse record round-trips, a corrupt one fails SOFT toward "nobody
-    /// asked yet", and a record written by the pre-review build (which also
-    /// carried `mint_attempted` and no `reason`) still loads and still serves.
+    /// asked yet", and a record written by an older build (one that carried
+    /// `mint_attempted`, or a stored `reason` with since-corrected text) still
+    /// loads and serves TODAY's reason.
     #[test]
     fn a_corrupt_or_legacy_lapse_record_fails_soft() {
         let path = gap_state_path("corrupt");
@@ -13362,7 +13379,7 @@ mod tenant_slot_refresh_tests {
             GapAskRecord {
                 notified: true,
                 first_seen: 1_800_000_000,
-                reason: "r".into(),
+                seed_outcome: "o".into(),
                 ..Default::default()
             },
         );
@@ -13381,6 +13398,19 @@ mod tenant_slot_refresh_tests {
             .expect("known");
         assert_eq!(open.len(), 1, "{open:?}");
         assert_eq!(open[0]["reason"], serde_json::json!(BINDING_GAP_ASK_REASON));
+
+        let stale = format!(
+            r#"{{"account":"acct-a","tenants":{{"{}":{{"notified":true,"first_seen":7,"reason":"it also re-points this device's home tenant","seed_outcome":"refused"}}}}}}"#,
+            tenant(3)
+        );
+        std::fs::write(&path, stale).expect("stale reason");
+        let open = open_binding_gap_asks(&path, &known(&[tenant(3)]), Some(&[]), Some(ACCT))
+            .expect("known");
+        assert_eq!(
+            open[0]["reason"],
+            serde_json::json!(binding_gap_ask_reason("refused")),
+            "an open ask shows today's reason, not the text stored by the build that opened it"
+        );
     }
 
     /// [`measured_gaps`] is the single UNKNOWN gate for the whole phase.
@@ -15303,8 +15333,8 @@ mod tenant_seed_arm_tests {
         assert_eq!(seed_refusal_code(r#"{"error":"forced"}"#), "forced");
     }
 
-    /// The arm must never reach for `pair-cli` (it re-points the device's home
-    /// tenant and re-creates bindings): its only request is to the seed door.
+    /// The arm must never reach for `pair-cli` (it re-creates bindings an
+    /// operator removed): its only request is to the seed door.
     #[test]
     fn the_seed_arm_calls_only_the_per_binding_door() {
         let src = include_str!("device_jwt_refresher.rs");
@@ -15368,7 +15398,6 @@ mod tenant_seed_arm_tests {
         GapAskRecord {
             notified: asked,
             first_seen: 1_700_000_000,
-            reason: String::new(),
             seed_attempted,
             seed_outcome: outcome.to_string(),
             seed_not_bound: not_bound,
