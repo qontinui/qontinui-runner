@@ -6221,9 +6221,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     let workspace_root = crate::workspace_paths::require_workspace_root();
                     if let Ok(workspace) = &workspace_root {
                         let mutated =
-                            dev_services::upgrade_and_dedupe_configs(&mut configs, &workspace);
+                            dev_services::upgrade_and_dedupe_configs(&mut configs, workspace);
 
-                        let missing = dev_services::get_missing_dev_services(&workspace, &configs);
+                        let missing = dev_services::get_missing_dev_services(workspace, &configs);
                         let injected = !missing.is_empty();
                         if injected {
                             info!(
