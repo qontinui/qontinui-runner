@@ -84,6 +84,70 @@ pub struct TauriInvokeResponse {
     pub status: Option<StatusCode>,
 }
 
+/// The arguments of the proxied `terminal_create` command.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TerminalCreateArgs {
+    title: Option<String>,
+    working_dir: Option<String>,
+    page_id: Option<String>,
+    cols: Option<u16>,
+    rows: Option<u16>,
+    /// Phase 2 of `plans/2026-05-28-isolate-session-edit-work-in-worktrees.md`.
+    /// When `Some(repo_slug)` AND `QONTINUI_AGENT_WORKTREE_MODE` is on,
+    /// allocate an isolated worktree for that repo and use it as the
+    /// PTY cwd instead of `working_dir`. Mirrors the `intent_repo`
+    /// argument on the `terminal_create` Tauri command.
+    intent_repo: Option<String>,
+    /// Stable session id of the agent creating this terminal,
+    /// supplied by the proxy caller (the initiator's context).
+    /// Folded into the isolated-worktree claim's owner token so
+    /// distinct agent sessions on one machine are distinct
+    /// holders. Absent → None.
+    #[serde(default)]
+    agent_session_id: Option<uuid::Uuid>,
+    /// The caller's explicit "start it anyway" past a CRITICAL
+    /// resource-guard verdict (plan
+    /// `2026-08-07-runner-resource-guard-and-session-protection`
+    /// §Part D). Mirrors the `resource_override` argument on the
+    /// `terminal_create` Tauri command this route proxies, and
+    /// defaults to `false`, so every existing caller keeps the
+    /// unattended posture it has today: the floor is respected and
+    /// the typed refusal comes back as the invoke error.
+    ///
+    /// It exists so the refusal is actually overridable from here.
+    /// A caller that IS fronted by a UI (an external tool that can
+    /// show its own dialog) recognises the
+    /// `resource_guard:critical:` prefix, asks its operator, and
+    /// re-invokes with `resourceOverride: true` — the same
+    /// refuse-ask-retry loop `src/lib/resourceGuard.ts` runs in the
+    /// webview. Without the field that loop had nowhere to land:
+    /// the second attempt would have been refused identically, and
+    /// the comment promising an override would have been describing
+    /// a path that did not exist.
+    #[serde(default)]
+    resource_override: bool,
+    /// The tenant to spawn this session for — the `tenant_id`
+    /// argument of the `terminal_create` Tauri command this route
+    /// proxies, with the same contract: absent/blank keeps the
+    /// machine default, a malformed uuid is refused, and a tenant
+    /// this runner holds no coord credential for refuses the spawn
+    /// (plan `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential`).
+    ///
+    /// This struct drops unknown keys, so a selector spelled any other way spawns
+    /// on the machine default with `success: true`. `tenant_id` is the Tauri
+    /// command's own spelling, and `tenant` is `POST /coord-mcp/provision-session`'s.
+    #[serde(default, alias = "tenant_id", alias = "tenant")]
+    tenant_id: Option<String>,
+    /// The repos the session will EDIT beside `intentRepo` — the
+    /// `edit_siblings` argument of the `terminal_create` Tauri
+    /// command this route proxies (plan
+    /// `2026-10-10-a-session-cannot-declare-the-sibling-it-will-edit-so-the-store-override-hides-its-edits`).
+    /// A bad entry is a typed 400 `invalid_edit_sibling`.
+    #[serde(default, alias = "edit_siblings")]
+    edit_siblings: Vec<String>,
+}
+
 /// The `terminal_create` proxy's spawn-tenant admission: the shared
 /// [`crate::commands::terminal::admit_spawn_tenant`], answered as the invoke
 /// error a refused `terminal_create` command would return.
@@ -210,65 +274,7 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
 
         // ── terminals ────────────────────────────────────────────────────────
         "terminal_create" => {
-            #[derive(Deserialize)]
-            #[serde(rename_all = "camelCase")]
-            struct Args {
-                title: Option<String>,
-                working_dir: Option<String>,
-                page_id: Option<String>,
-                cols: Option<u16>,
-                rows: Option<u16>,
-                /// Phase 2 of `plans/2026-05-28-isolate-session-edit-work-in-worktrees.md`.
-                /// When `Some(repo_slug)` AND `QONTINUI_AGENT_WORKTREE_MODE` is on,
-                /// allocate an isolated worktree for that repo and use it as the
-                /// PTY cwd instead of `working_dir`. Mirrors the `intent_repo`
-                /// argument on the `terminal_create` Tauri command.
-                intent_repo: Option<String>,
-                /// Stable session id of the agent creating this terminal,
-                /// supplied by the proxy caller (the initiator's context).
-                /// Folded into the isolated-worktree claim's owner token so
-                /// distinct agent sessions on one machine are distinct
-                /// holders. Absent → None.
-                #[serde(default)]
-                agent_session_id: Option<uuid::Uuid>,
-                /// The caller's explicit "start it anyway" past a CRITICAL
-                /// resource-guard verdict (plan
-                /// `2026-08-07-runner-resource-guard-and-session-protection`
-                /// §Part D). Mirrors the `resource_override` argument on the
-                /// `terminal_create` Tauri command this route proxies, and
-                /// defaults to `false`, so every existing caller keeps the
-                /// unattended posture it has today: the floor is respected and
-                /// the typed refusal comes back as the invoke error.
-                ///
-                /// It exists so the refusal is actually overridable from here.
-                /// A caller that IS fronted by a UI (an external tool that can
-                /// show its own dialog) recognises the
-                /// `resource_guard:critical:` prefix, asks its operator, and
-                /// re-invokes with `resourceOverride: true` — the same
-                /// refuse-ask-retry loop `src/lib/resourceGuard.ts` runs in the
-                /// webview. Without the field that loop had nowhere to land:
-                /// the second attempt would have been refused identically, and
-                /// the comment promising an override would have been describing
-                /// a path that did not exist.
-                #[serde(default)]
-                resource_override: bool,
-                /// The tenant to spawn this session for — the `tenant_id`
-                /// argument of the `terminal_create` Tauri command this route
-                /// proxies, with the same contract: absent/blank keeps the
-                /// machine default, a malformed uuid is refused, and a tenant
-                /// this runner holds no coord credential for refuses the spawn
-                /// (plan `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential`).
-                #[serde(default)]
-                tenant_id: Option<String>,
-                /// The repos the session will EDIT beside `intentRepo` — the
-                /// `edit_siblings` argument of the `terminal_create` Tauri
-                /// command this route proxies (plan
-                /// `2026-10-10-a-session-cannot-declare-the-sibling-it-will-edit-so-the-store-override-hides-its-edits`).
-                /// A bad entry is a typed 400 `invalid_edit_sibling`.
-                #[serde(default, alias = "edit_siblings")]
-                edit_siblings: Vec<String>,
-            }
-            let a = match serde_json::from_value::<Args>(req.args) {
+            let a = match serde_json::from_value::<TerminalCreateArgs>(req.args) {
                 Ok(v) => v,
                 Err(e) => return TauriInvokeResponse::err(format!("bad args: {}", e)),
             };
@@ -670,6 +676,27 @@ mod spawn_tenant_tests {
         assert_eq!(
             spawn_tenant_or_invoke_error(Some(&a.to_string())).ok(),
             Some(Some(a))
+        );
+    }
+
+    /// Coord finding `659b574a`'s defect class on this door: a selector spelled
+    /// any other way than `tenantId` used to be dropped, spawning on the machine
+    /// default with `success: true`. The Tauri command's own argument is
+    /// `tenant_id`, so that spelling was the one a caller would reach for.
+    #[test]
+    fn the_terminal_create_proxy_selects_the_tenant_under_every_spelling() {
+        for key in ["tenantId", "tenant_id", "tenant"] {
+            let args: TerminalCreateArgs =
+                serde_json::from_value(serde_json::json!({ key: "t-1" })).unwrap();
+            assert_eq!(args.tenant_id.as_deref(), Some("t-1"), "{key}");
+        }
+        assert!(
+            serde_json::from_value::<TerminalCreateArgs>(serde_json::json!({
+                "tenantId": "t-1",
+                "tenant": "t-2",
+            }))
+            .is_err(),
+            "two spellings at once is a duplicate field, never a silent pick"
         );
     }
 }
