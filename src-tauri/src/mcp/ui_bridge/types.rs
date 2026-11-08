@@ -1419,7 +1419,7 @@ mod allowed_actions_tests {
     use super::*;
 
     /// The shape-error `allowedActions` list is derived from the route's own
-    /// allowlist, so it cannot drift from what `validate_action_name` accepts.
+    /// allowlist, so it cannot drift from what `is_builtin_action` accepts.
     #[test]
     fn action_request_allowed_actions_equal_supported_action_names() {
         let data = UIBridgeActionRequest::shape_error_data().expect("data");
