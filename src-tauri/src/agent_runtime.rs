@@ -10678,8 +10678,12 @@ async fn run_agent_terminal(
         let policy_delivery =
             crate::session::spawn_prompt::delivery_unless_replacement(policy_delivery, &argv);
 
+        // The group's typed page, under `page_placement`'s restore-aware loads.
         let placement = crate::terminal::spawn_pages::place(group, || {
-            terminal_manager.list().into_iter().map(|info| info.page_id)
+            crate::terminal::page_placement::page_loads(
+                &terminal_manager,
+                crate::terminal::page_placement::lifecycle_store(&app).as_deref(),
+            )
         });
         let target_page = placement.page_id().to_string();
         let capture_hint = crate::commands::terminal::SessionCaptureHint {
