@@ -1437,6 +1437,15 @@ pub fn publish_workspace_root(door: WorkspaceRootFn) {
     let _ = WORKSPACE_ROOT_DOOR.set(door);
 }
 
+/// Whether [`workspace_root`] reads the operator's `paths.workspace_root`
+/// setting in this process: true once the binary published its door at boot,
+/// false in a standalone CLI run (`env capture`, `env apply`) that exits before
+/// boot and so resolves without the settings rung. A message naming the
+/// "Workspace root" setting is true only when this is.
+pub(crate) fn workspace_root_reads_setting() -> bool {
+    WORKSPACE_ROOT_DOOR.get().is_some()
+}
+
 /// Where the Qontinui repo checkouts live — the published door's answer when
 /// the binary supplied one, else the shared resolver's answer with the settings
 /// rung unavailable. See the section header for why there are two arms rather
