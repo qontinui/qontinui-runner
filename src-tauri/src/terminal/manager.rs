@@ -3,6 +3,7 @@
 //! Follows the same HashMap-based manager pattern as `claude_session::SessionManager`.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use tauri::{AppHandle, Emitter};
@@ -71,6 +72,18 @@ pub struct TerminalManager {
     /// build can insert over another (orphaning a session, unlisted but
     /// running), and the boot sweep skips them.
     in_flight: Mutex<HashSet<String>>,
+    /// The runner-shutdown latch: set at the top of [`Self::close_all`],
+    /// before anything is drained or killed. While set,
+    /// `terminal_session_record_close` refuses a `pty-exit` close, so a
+    /// lifecycle row's state after a runner shutdown is decided HERE — by the
+    /// backend — and never by whether the webview could still service an
+    /// `invoke` (plan `2026-10-28-force-exited-runner-restore-set-follow-ups`,
+    /// Phase 6).
+    ///
+    /// It is never cleared: `close_all` runs only on the way to process exit.
+    /// The known cost is that a PTY the user ends during the teardown window
+    /// also leaves its row `open`, which restores it — the safe direction.
+    shutting_down: AtomicBool,
 }
 
 /// Why [`TerminalManager::adopt_holder_pane`] adopted nothing.
@@ -302,6 +315,7 @@ impl TerminalManager {
             remote_panes: Mutex::new(HashMap::new()),
             coord_bind_observer: OnceLock::new(),
             in_flight: Mutex::new(HashSet::new()),
+            shutting_down: AtomicBool::new(false),
         }
     }
 
@@ -1236,6 +1250,11 @@ impl TerminalManager {
         pairs
     }
 
+    /// Whether [`Self::close_all`] has begun. Monotonic: once true it stays true.
+    pub fn is_shutting_down(&self) -> bool {
+        self.shutting_down.load(Ordering::SeqCst)
+    }
+
     /// Close all terminal sessions, under a GLOBAL deadline. Called on app
     /// shutdown.
     ///
@@ -1259,6 +1278,9 @@ impl TerminalManager {
     /// Phase 3).
     #[must_use = "the result says whether the teardown finished; the shutdown marker records it"]
     pub fn close_all(&self, deadline: std::time::Instant) -> bool {
+        // Before anything is drained or killed, so no `pty-exit` caused by
+        // this teardown can reach the lifecycle store as a close.
+        self.shutting_down.store(true, Ordering::SeqCst);
         let sessions: Vec<Arc<TerminalSession>> = {
             match self.sessions.lock() {
                 Ok(mut s) => s.drain().map(|(_, v)| v).collect(),
@@ -1537,6 +1559,38 @@ mod tests {
         let _ = tm.close_all(std::time::Instant::now());
         assert!(tm.remote_identity("close-all-tab").is_none());
         assert!(tm.remote_pane("close-all-tab").is_none());
+    }
+
+    /// `close_all` latches shutdown on every call, even an empty teardown, and
+    /// the latch is monotonic.
+    #[test]
+    fn close_all_latches_on_any_call_and_never_unlatches() {
+        let tm = TerminalManager::new();
+        assert!(!tm.is_shutting_down());
+        let _ = tm.close_all(std::time::Instant::now());
+        assert!(tm.is_shutting_down(), "even an empty teardown latches");
+        let _ = tm.close_all(std::time::Instant::now());
+        assert!(tm.is_shutting_down(), "monotonic: nothing un-latches it");
+    }
+
+    /// The latch is set BEFORE the sessions map is read: even a `close_all`
+    /// that bails on a poisoned lock, draining and killing nothing, has
+    /// latched. A latch moved below the drain would miss this case.
+    #[test]
+    fn close_all_latches_before_reading_the_sessions_map() {
+        let tm = std::sync::Arc::new(TerminalManager::new());
+        let poisoner = std::sync::Arc::clone(&tm);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.sessions.lock().unwrap();
+            panic!("poison the sessions lock");
+        })
+        .join();
+        assert!(tm.sessions.is_poisoned());
+        assert!(
+            !tm.close_all(std::time::Instant::now()),
+            "poisoned teardown reports unfinished"
+        );
+        assert!(tm.is_shutting_down(), "latched before the poisoned read");
     }
 
     /// `close_all` reports whether the teardown FINISHED, which `run_teardown`
