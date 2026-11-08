@@ -279,6 +279,12 @@ impl RekeyLedger {
         })
     }
 
+    /// Drop the memory of every terminal not in `live`. A live terminal with no
+    /// entry this tick keeps its memory.
+    fn retain_provider_anchors(&self, live: &HashSet<String>) {
+        self.with(|l| l.provider_anchors.retain(|t, _| live.contains(t)));
+    }
+
     fn forget_provider_anchor(&self, terminal_id: &str) {
         self.with(|l| {
             l.provider_anchors.remove(terminal_id);
@@ -998,6 +1004,13 @@ pub fn apply_reconcile_tick_with(
     out
 }
 
+/// End-of-tick housekeeping: forget the provider-anchor memory of terminals
+/// that are no longer live. `live` is every live terminal id, not only those
+/// with a registry row this tick.
+pub fn prune_provider_memory(registry: &SessionRegistry, live: &HashSet<String>) {
+    registry.coord_sync().rekeys().retain_provider_anchors(live);
+}
+
 /// [`apply_reconcile_tick`] against the app's terminal manager + registry.
 /// Fire-and-forget; a no-op when either is not in Tauri state.
 pub fn apply_reconcile_tick_in_app(
@@ -1011,6 +1024,8 @@ pub fn apply_reconcile_tick_in_app(
     apply_reconcile_tick_with(&registry, actions, rows, |t| {
         terminals.get(t).and_then(|s| s.coord_session_id())
     });
+    let live: HashSet<String> = terminals.list().into_iter().map(|i| i.id).collect();
+    prune_provider_memory(&registry, &live);
 }
 
 #[cfg(test)]
@@ -1293,6 +1308,43 @@ mod tests {
         let queued = rekeys_for(&outbox, row);
         assert_eq!(queued.len(), 2, "{queued:?}");
         assert_eq!(queued[1].payload["claude_code_session_id"], json!(LIVE));
+    }
+
+    /// The suppression memory of a closed terminal is pruned; a live terminal
+    /// with no entry this tick keeps it.
+    #[test]
+    fn closed_terminals_lose_their_provider_memory_and_live_ones_keep_it() {
+        use crate::session::claude_activity::ProviderRowValidity as V;
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = tempfile::tempdir().unwrap();
+        let (reg, outbox) = registry(dir.path());
+        let row = reg
+            .register_external_with_lineage(intent(), None, Some(PIN.into()))
+            .unwrap();
+        let actions = [bind("t1", LIVE, BindOrigin::Authoritative)];
+        let lookup = |t: &str| (t == "t1").then_some(row);
+        let anchor = (31524u32, Some(1_790_000_000i64));
+        let valid = ProviderRows::from_entries([(
+            "t1".to_string(),
+            anchor,
+            V::Valid {
+                session_id: VALID.into(),
+                config_dir: std::path::PathBuf::from("cfg"),
+            },
+        )]);
+        apply_reconcile_tick_with(&reg, &actions, &valid, lookup);
+        let unknown = ProviderRows::from_entries([("t1".to_string(), anchor, V::Unknown)]);
+
+        // t1 is live but has no entry this tick: memory kept, so Unknown still
+        // suppresses rung 2.
+        prune_provider_memory(&reg, &HashSet::from(["t1".to_string(), "t2".to_string()]));
+        apply_reconcile_tick_with(&reg, &actions, &unknown, lookup);
+        assert_eq!(rekeys_for(&outbox, row).len(), 1);
+
+        // t1 closed: memory dropped, so Unknown no longer suppresses rung 2.
+        prune_provider_memory(&reg, &HashSet::from(["t2".to_string()]));
+        apply_reconcile_tick_with(&reg, &actions, &unknown, lookup);
+        assert_eq!(rekeys_for(&outbox, row).len(), 2);
     }
 
     /// Rung 2 stays the fallback when the anchor has no valid row (a stale or

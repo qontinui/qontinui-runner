@@ -548,11 +548,17 @@ fn domain_check(raw: &RawRecord, clock: &PidClock) -> Option<bool> {
         // The fresh `/proc/<pid>/stat` read is decisive whenever it is
         // available; the btime formula is only the fallback for a failed read.
         if let Some(actual) = clock.proc_start_ticks.as_deref() {
-            return Some(actual.parse::<u64>().ok() == Some(value));
+            // A garbled `/proc` token says nothing: Unknown, never a mismatch.
+            return actual.trim().parse::<u64>().ok().map(|a| a == value);
         }
         let (btime, tck, creation) = (clock.btime?, clock.clk_tck?, clock.creation_secs?);
-        return (tck > 0)
-            .then(|| btime + i64::try_from(value).unwrap_or(i64::MAX) / tck == creation);
+        if tck <= 0 {
+            return None;
+        }
+        // An out-of-range `procStart` or overflowing arithmetic is Unknown, not
+        // a decisive mismatch.
+        let secs = btime.checked_add(i64::try_from(value).ok()? / tck)?;
+        return Some(secs == creation);
     }
     None
 }
@@ -1275,6 +1281,46 @@ mod tests {
                 ValidityMode::Strict
             ),
             ProviderRowValidity::Stale
+        );
+    }
+
+    #[test]
+    fn a_garbled_proc_token_or_an_out_of_range_start_is_unknown_never_stale() {
+        let ticks = 5_000_000;
+        // `/proc` read present but not a number.
+        let mut clock = linux_clock(ticks);
+        clock.proc_start_ticks = Some("12x".into());
+        assert_eq!(
+            provider_row_validity(
+                7,
+                &[(dir("a"), linux_row(7, ID_A, ticks))],
+                &clock,
+                ValidityMode::Strict
+            ),
+            ProviderRowValidity::Unknown
+        );
+        // btime fallback: procStart beyond i64.
+        let mut fallback = linux_clock(ticks);
+        fallback.proc_start_ticks = None;
+        assert_eq!(
+            provider_row_validity(
+                7,
+                &[(dir("a"), linux_row(7, ID_A, u64::MAX))],
+                &fallback,
+                ValidityMode::Strict
+            ),
+            ProviderRowValidity::Unknown
+        );
+        // btime fallback: the addition overflows.
+        fallback.btime = Some(i64::MAX);
+        assert_eq!(
+            provider_row_validity(
+                7,
+                &[(dir("a"), linux_row(7, ID_A, ticks))],
+                &fallback,
+                ValidityMode::Strict
+            ),
+            ProviderRowValidity::Unknown
         );
     }
 
