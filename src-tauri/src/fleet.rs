@@ -5264,7 +5264,7 @@ fn spawn_skill_parity_pass_if_due() {
 /// `2026-08-04-remove-hardcoded-machine-paths-from-product-code`.
 ///
 /// Still `Option`: a miss means this publish pass finds no repos and says so
-/// (see the "QONTINUI_ROOT to override. Skipping." log below), which is honest
+/// (see the "no workspace root resolved" log below), which is honest
 /// degradation rather than an error.
 fn qontinui_root() -> Option<PathBuf> {
     crate::workspace_paths::workspace_root()
@@ -6490,8 +6490,9 @@ pub async fn publish_tree_state() -> Result<(), String> {
         Some(p) => p,
         None => {
             info!(
-                "fleet::tree_publisher: no qontinui-root directory found (set \
-                 QONTINUI_ROOT to override). Skipping."
+                "fleet::tree_publisher: no workspace root resolved, so there are no repos \
+                 to publish (set the \"{}\" setting to point at them). Skipping.",
+                qontinui_types::paths::WORKSPACE_ROOT_SETTING
             );
             return Ok(());
         }

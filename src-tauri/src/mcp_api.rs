@@ -1688,10 +1688,19 @@ struct ProvisionProbeResponse {
 /// * `latest` — the probe's `agent_definitions` and `fleet_agents` readings
 ///   become the latest observation for those two capabilities, so
 ///   `GET /capability-manifest` reports them until the next real spawn records
-///   over them. That is the point of the route, and it cannot mislead about the
-///   RUNG: the probe runs the spawn path's own function against the same
-///   qontinui-root, so the rung is the one a real spawn would read. Only the
-///   destination differs (the probe's directory, not a session worktree).
+///   over them. That is the point of the route. The probe runs the spawn path's
+///   own function, but the root that function resolves depends on the
+///   destination: `session_workspace_root` adds the folder holding the session's
+///   checkout as a rung, ahead of the home default. The probe's directory is
+///   never a checkout (it refuses one, above), so the probe never reads that
+///   rung. Where a declared root or the runner's own checkout answers, the probe
+///   and a spawn resolve the same root and only the destination differs.
+///   Elsewhere they can disagree. With no other rung, the probe records
+///   `agent_definitions` unresolved and no `fleet_agents` row, while a spawn into
+///   a checkout writes the embedded floor. On a box answered only by
+///   `<home>/qontinui-root`, the probe reads that root while a spawn into a
+///   checkout reads the checkout's parent, so the two rows can name different
+///   rungs.
 /// * the per-session ledger index — each call adds one ledger keyed by its own
 ///   fresh `probe-<uuid>` directory, and that index is capped at
 ///   `LEDGER_CAPACITY` (64), oldest dropped first. So N calls can push the N
