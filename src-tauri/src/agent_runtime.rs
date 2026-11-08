@@ -15211,11 +15211,10 @@ mod tests {
             report.retained_retired[0].reason,
             crate::capability_manifest::RetainedReason::RemoveFailed(_)
         ));
+        // The no-root report carries exactly one skip, the `unresolved`
+        // checkout; a failed removal must not add a skip of any reason.
         assert!(
-            report
-                .skipped
-                .iter()
-                .all(|s| s.reason.wire() != "write_failed"),
+            report.skipped.len() == 1 && report.skipped[0].reason.wire() == "unresolved",
             "a failed removal is not a skipped write: {}",
             report.summary()
         );

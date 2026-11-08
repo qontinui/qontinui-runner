@@ -2746,7 +2746,7 @@ mod tests {
 
     /// The `unresolved` constructor is the shape that replaces a lone `warn!` on
     /// a resolver that found no source at all — `agent_runtime`'s "no
-    /// qontinui-root resolved; skipping .claude/agents" and `slash_commands`'
+    /// qontinui-root resolved; no checkout overlay" and `slash_commands`'
     /// missing-checkout error.
     #[test]
     fn an_unresolved_pass_states_the_rung_and_the_reason() {

@@ -313,15 +313,8 @@ fn remove_retired_agents_resolving(
             continue;
         }
         let path = dst_dir.join(name);
-        let linked = match &linked {
-            Ok(linked) => linked,
-            Err(why) => {
-                if std::fs::symlink_metadata(&path).is_ok() {
-                    report.record_retained_retired(name, RetainedReason::ReadFailed(why.clone()));
-                }
-                continue;
-            }
-        };
+        // A deliberate keep is labelled as one even when the directory could
+        // not be resolved: keeping deletes nothing, so it needs no resolution.
         if let Some(reason) = keep.reason(name) {
             if std::fs::symlink_metadata(&path).is_ok() {
                 tracing::info!(
@@ -336,6 +329,15 @@ fn remove_retired_agents_resolving(
             }
             continue;
         }
+        let linked = match &linked {
+            Ok(linked) => linked,
+            Err(why) => {
+                if std::fs::symlink_metadata(&path).is_ok() {
+                    report.record_retained_retired(name, RetainedReason::ReadFailed(why.clone()));
+                }
+                continue;
+            }
+        };
         let bytes = match std::fs::read(&path) {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
