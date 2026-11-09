@@ -1,3 +1,5 @@
+import { readdirSync, readFileSync, statSync } from "node:fs";
+import { join, relative, resolve, sep } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { SkillDefinition } from "@qontinui/shared-types/workflow";
 
@@ -82,5 +84,35 @@ describe("registerRunnableUserSkills", () => {
     expect(registerRunnableUserSkills([lint])).toEqual([]);
     expect(registerUserSkills).toHaveBeenCalledWith([lint]);
     expect(warn).not.toHaveBeenCalled();
+  });
+});
+
+/** Every TypeScript source under `src/`, test files excluded. */
+function sourceFiles(dir: string): string[] {
+  const files: string[] = [];
+  for (const name of readdirSync(dir)) {
+    const path = join(dir, name);
+    if (statSync(path).isDirectory()) {
+      files.push(...sourceFiles(path));
+    } else if (/\.tsx?$/.test(name) && !/\.test\.tsx?$/.test(name)) {
+      files.push(path);
+    }
+  }
+  return files;
+}
+
+describe("the skill catalog's only door", () => {
+  // A direct registerUserSkills call would put the served fallback (a step with
+  // no `type`) back in the catalog, past the filter above.
+  it("is registerRunnableUserSkills: nothing else in src/ calls registerUserSkills", () => {
+    const src = resolve(__dirname, "../..");
+    const files = sourceFiles(src);
+    const callers = files
+      .filter((file) => /\bregisterUserSkills\b/.test(readFileSync(file, "utf8")))
+      .map((file) => relative(src, file).split(sep).join("/"));
+
+    // Control: the walk reached the tree, and the one sanctioned caller.
+    expect(files.length).toBeGreaterThan(500);
+    expect(callers).toEqual(["components/workflow-builder/runnableUserSkills.ts"]);
   });
 });

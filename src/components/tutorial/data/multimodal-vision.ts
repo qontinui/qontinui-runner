@@ -213,7 +213,8 @@ autoInclude:
 |--------|------------------|---------------|
 | Workflow generation | Every \`.qontinui/contexts/*.md\`, plus the rule files it finds (\`CLAUDE.md\` and \`AGENTS.md\`, at the root and in subdirectories, \`.cursorrules\`, \`.cursor/rules/*.mdc\`), all from the runner's working directory | Not evaluated: every file is included |
 | Agentic verification (verifier and worker) | Context files whose \`autoInclude.taskMentions\` appear in the goal, plus the rule files above, narrowed by any \`filePatterns\` to the files touched so far. Read from the task's project path when one is set, else from the runner's working directory | Evaluated |
-| Brain (Brain/Actor mode) | No context files: only the goal, the element index, the UI state and recorded findings | — |
+| AI sessions | The contexts the session request names, plus, when it turns auto-include on, context files whose \`autoInclude.taskMentions\` appear in the prompt or whose \`actionTypes\` match an action type in the loaded configuration. Read from the runner's working directory | Evaluated only with auto-include on |
+| Brain (Brain/Actor mode) | No context files: only the goal, the element index, the UI state, recorded findings and, when one is captured, the annotated screenshot | — |
 
 **Size cap:** all project and rule-file contexts together are capped at 80,000 characters. Content past the cap is truncated with a marker, never silently dropped.
 
