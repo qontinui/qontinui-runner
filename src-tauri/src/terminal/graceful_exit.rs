@@ -154,6 +154,12 @@ pub struct ScreenText {
     pub lines: Vec<String>,
     pub cursor_row: u16,
     pub cursor_col: u16,
+    /// The DIM attribute of each character of `lines[cursor_row]`, indexed
+    /// as that row's `chars()` are (the grid's own cells, wide-glyph right
+    /// halves skipped; it may run past the trimmed text). `None` when the
+    /// attributes were not read — a text-only screen — which makes every
+    /// non-placeholder input read as a draft, as before.
+    pub cursor_row_dim: Option<Vec<bool>>,
 }
 
 /// The `❯` input line on the cursor row: the marker's column and the text
@@ -161,6 +167,11 @@ pub struct ScreenText {
 struct PromptLine {
     marker_col: usize,
     input: String,
+    /// Every visible character after the marker is painted DIM — Claude
+    /// Code's ghost text (a prompt suggestion such as `run the tests now`, or
+    /// `_(No suggestion.)_`), never typed input, which is painted normal.
+    /// `false` whenever the attributes are unknown.
+    input_dim_only: bool,
 }
 
 fn prompt_line(screen: &ScreenText) -> Option<PromptLine> {
@@ -169,7 +180,19 @@ fn prompt_line(screen: &ScreenText) -> Option<PromptLine> {
     let marker_col = chars.iter().position(|&c| c == '❯')?;
     let rest: String = chars[marker_col + 1..].iter().collect();
     let input = rest.trim().trim_end_matches('│').trim().to_string();
-    Some(PromptLine { marker_col, input })
+    let input_dim_only = screen.cursor_row_dim.as_ref().is_some_and(|dim| {
+        chars
+            .iter()
+            .enumerate()
+            .skip(marker_col + 1)
+            .filter(|(_, c)| !c.is_whitespace() && **c != '│')
+            .all(|(i, _)| dim.get(i).copied().unwrap_or(false))
+    });
+    Some(PromptLine {
+        marker_col,
+        input,
+        input_dim_only,
+    })
 }
 
 /// The column typed input starts at: the marker, one separator, then input.
@@ -209,8 +232,15 @@ fn is_box_edge(line: &str) -> bool {
 /// Scans for the full [`DIALOG_MARKERS`] list, including prose-shaped
 /// phrases. That errs toward refusing, which is right for `/exit`: a refusal
 /// only postpones a wind-down.
+///
+/// Unlike the paste arms, this one also takes a line of wholly DIM ghost text
+/// (a prompt suggestion) as empty. That is safe here and only here: `/exit`
+/// is submitted only after [`exit_echoed`] reads the line as exactly `/exit`,
+/// so if the DIM reading were ever wrong and the line held a draft, the echo
+/// would read `/exit<draft>`, nothing would be submitted, and the Ctrl-U
+/// recovery would leave the draft alone ([`input_is_only_our_exit_text`]).
 pub fn exit_prompt_ready(screen: &ScreenText) -> Result<(), String> {
-    prompt_ready_with(screen, DIALOG_MARKERS)
+    prompt_ready_with(screen, DIALOG_MARKERS, true, GhostText::Empty)
 }
 
 /// May a message be PASTED into the input box now? The same checks as
@@ -226,16 +256,90 @@ pub fn exit_prompt_ready(screen: &ScreenText) -> Result<(), String> {
 /// the operator next typed. A real permission dialog is still refused: its
 /// selected choice sits on the cursor row as a numbered option, and it prints
 /// the chrome hints.
+///
+/// A prompt suggestion (DIM ghost text) is NOT taken as empty here: a paste is
+/// submitted with a bare CR and no echo check, and a CR into a box whose paste
+/// was lost could submit the suggestion instead.
 pub fn input_prompt_ready(screen: &ScreenText) -> Result<(), String> {
-    prompt_ready_with(screen, DIALOG_CHROME_MARKERS)
+    prompt_ready_with(screen, DIALOG_CHROME_MARKERS, true, GhostText::Draft)
 }
 
-fn prompt_ready_with(screen: &ScreenText, dialog_markers: &[&str]) -> Result<(), String> {
+/// May a message be typed into the input box of a BUSY turn? (plan
+/// `2026-10-21-operator-prepare-for-restart-and-progressive-restore`, D2.)
+///
+/// [`input_prompt_ready`] minus the turn-complete predicate, plus the busy
+/// marker ([`crate::terminal::account_migration::BUSY_MARKER`]): Claude is
+/// mid-turn, AND its input box is the thing under the cursor, empty, with no
+/// numbered choice selected and no dialog chrome showing. Every screen check
+/// [`input_prompt_ready`] makes except "the screen looks idle" is kept, so a
+/// permission dialog that opens during a turn is refused here exactly as it
+/// is there.
+///
+/// Requiring the busy marker keeps the two arms disjoint: an idle screen is
+/// [`input_prompt_ready`]'s, never this one's, so a caller cannot reach an
+/// idle pane through the arm that skips the idle check.
+///
+/// Whether Claude Code QUEUES text typed into a busy turn's prompt box, and
+/// delivers it at the next input point, is the plan's Phase 1 probe 2 — this
+/// predicate only says the box is safe to type into.
+pub fn busy_prompt_accepts_input(screen: &ScreenText) -> Result<(), String> {
+    if !shows_busy_marker(screen) {
+        return Err(format!(
+            "no busy marker (`{}`) on screen — not a busy turn",
+            super::account_migration::BUSY_MARKER
+        ));
+    }
+    prompt_ready_with(screen, DIALOG_CHROME_MARKERS, false, GhostText::Draft)
+}
+
+/// Whether Claude's busy marker
+/// ([`crate::terminal::account_migration::BUSY_MARKER`], `esc to interrupt`) is
+/// painted anywhere on `screen`. Claude Code 2.1.306 paints it on the BOTTOM
+/// status line of a running turn (`⏵⏵ bypass permissions on … · esc to
+/// interrupt`), not on the spinner line, so the whole grid is scanned.
+pub fn shows_busy_marker(screen: &ScreenText) -> bool {
+    super::output_scan::normalize(&screen.lines.join("\n"))
+        .contains(super::account_migration::BUSY_MARKER)
+}
+
+/// How [`prompt_ready_with`] reads an input line painted wholly DIM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GhostText {
+    /// As empty — Claude Code's prompt suggestion. The `/exit` arm only.
+    Empty,
+    /// As text that is not the placeholder: refused.
+    Draft,
+}
+
+/// The shared screen check behind [`exit_prompt_ready`],
+/// [`input_prompt_ready`] and [`busy_prompt_accepts_input`].
+///
+/// `require_idle` adds the shared turn-complete predicate
+/// ([`snapshot_looks_idle`]). It is `false` ONLY for the busy arm, which
+/// checks the opposite (the busy marker) itself; every other check — the
+/// cursor-row `❯`, an empty input line, no numbered choice, no dialog text —
+/// applies to both.
+fn prompt_ready_with(
+    screen: &ScreenText,
+    dialog_markers: &[&str],
+    require_idle: bool,
+    ghost_text: GhostText,
+) -> Result<(), String> {
     let Some(line) = prompt_line(screen) else {
         return Err("no `❯` input prompt on the cursor row".to_string());
     };
-    if !snapshot_looks_idle(&screen.lines, screen.cursor_row) {
+    if require_idle && !snapshot_looks_idle(&screen.lines, screen.cursor_row) {
         return Err("the screen does not look idle".to_string());
+    }
+    // The idle predicate reads row by row; the busy arm reads the whole grid
+    // normalized, so a marker wrapped across two rows (or painted with a
+    // non-breaking space) is seen by the busy arm only. Refusing it here too
+    // keeps the two arms disjoint by construction, not by hope.
+    if require_idle && shows_busy_marker(screen) {
+        return Err(format!(
+            "the busy marker (`{}`) is on screen — a busy turn",
+            super::account_migration::BUSY_MARKER
+        ));
     }
     if is_numbered_option(&line.input) {
         return Err("a numbered choice is selected — a dialog, not the input prompt".to_string());
@@ -247,7 +351,12 @@ fn prompt_ready_with(screen: &ScreenText, dialog_markers: &[&str]) -> Result<(),
             screen.cursor_col
         ));
     }
-    if !line.input.is_empty() && !line.input.starts_with(PLACEHOLDER_PREFIX) {
+    // Empty, the placeholder, or — for the `/exit` arm only — ghost text
+    // painted wholly DIM (a prompt suggestion): nothing the operator typed. A
+    // typed draft is painted normal, so even with the cursor at the input
+    // start it is refused here.
+    let ghost_is_empty = ghost_text == GhostText::Empty && line.input_dim_only;
+    if !line.input.is_empty() && !line.input.starts_with(PLACEHOLDER_PREFIX) && !ghost_is_empty {
         return Err(
             "the input line holds text that is not the empty-prompt placeholder".to_string(),
         );
@@ -836,6 +945,37 @@ pub(crate) mod fake_process_table {
     }
 }
 
+/// Real Claude Code 2.1.306 screens captured by the plan's Phase 1 probe 2
+/// (plan `2026-10-21-operator-prepare-for-restart-and-progressive-restore`),
+/// verbatim except the banner's working-directory path. Each is a 71-row grid
+/// whose cursor sat at column 2 of row 68, the `❯` input row.
+#[cfg(test)]
+pub(crate) mod probe_fixtures {
+    use super::ScreenText;
+
+    /// A busy turn inside a tool call: `esc to interrupt` sits on the BOTTOM
+    /// status line (`⏵⏵ bypass permissions on · 1 shell · esc to interrupt ·
+    /// ↓ to manage`), not the spinner line; the input row is an empty `❯`.
+    pub(crate) const BUSY_TOOL_CALL: &str =
+        include_str!("fixtures/claude-2.1.306-busy-tool-call.txt");
+    /// A busy turn streaming its answer; the marker on the status line again.
+    pub(crate) const BUSY_STREAMING: &str =
+        include_str!("fixtures/claude-2.1.306-busy-streaming.txt");
+    /// The same busy turn after a message was typed and queued: the input row
+    /// reads `❯ Press up to edit queued messages`.
+    pub(crate) const BUSY_QUEUED: &str = include_str!("fixtures/claude-2.1.306-busy-queued.txt");
+
+    /// The cursor as the probe read it: column 2, row 68.
+    pub(crate) fn screen(raw: &str) -> ScreenText {
+        ScreenText {
+            lines: raw.lines().map(str::to_string).collect(),
+            cursor_row: 68,
+            cursor_col: 2,
+            cursor_row_dim: None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -853,6 +993,7 @@ mod tests {
             lines: rows,
             cursor_row,
             cursor_col,
+            cursor_row_dim: None,
         }
     }
 
@@ -950,6 +1091,168 @@ mod tests {
         )
     }
 
+    /// A turn in progress: the spinner line carries the busy marker, and the
+    /// input box below it is empty with the cursor at the input start — the
+    /// shape Claude Code paints while it works and the operator has typed
+    /// nothing.
+    fn busy_turn() -> ScreenText {
+        screen(
+            vec![
+                "✻ Churning… (12s · ↓ 310 tokens · esc to interrupt)".to_string(),
+                format!("{}● high · /effort", " ".repeat(102)),
+                edge(),
+                "❯\u{a0}".to_string(),
+                edge(),
+                "  ⏵⏵ bypass permissions on (shift+tab to cycle)".to_string(),
+            ],
+            3,
+            2,
+        )
+    }
+
+    /// A permission dialog opened mid-turn: the busy marker is still painted,
+    /// and the cursor row holds the dialog's selected numbered choice.
+    fn busy_turn_with_a_selected_choice() -> ScreenText {
+        screen(
+            vec![
+                "✻ Churning… (40s · esc to interrupt)".to_string(),
+                " Bash command".to_string(),
+                "   rm -rf build".to_string(),
+                " Do you want to proceed?".to_string(),
+                " ❯ 1. Yes".to_string(),
+                "   2. No, and tell Claude what to do differently (esc)".to_string(),
+            ],
+            4,
+            3,
+        )
+    }
+
+    #[test]
+    fn a_busy_screen_passes_the_busy_arm_and_fails_input_prompt_ready() {
+        let s = busy_turn();
+        assert_eq!(busy_prompt_accepts_input(&s), Ok(()));
+        let why = input_prompt_ready(&s).unwrap_err();
+        assert!(why.contains("idle"), "refused for the idle check: {why}");
+    }
+
+    /// The REAL busy shape (Claude Code 2.1.306): the marker on the bottom
+    /// status line, not the spinner line, and the cursor on an empty `❯` row.
+    #[test]
+    fn the_real_2_1_306_busy_screens_pass_the_busy_arm_and_fail_the_idle_one() {
+        use super::probe_fixtures::{screen, BUSY_STREAMING, BUSY_TOOL_CALL};
+        for (name, raw) in [("tool call", BUSY_TOOL_CALL), ("streaming", BUSY_STREAMING)] {
+            let s = screen(raw);
+            assert_eq!(s.lines.len(), 71, "{name}: the probe's 71-row grid");
+            assert!(
+                s.lines[68].starts_with('❯'),
+                "{name}: the cursor row is the input row"
+            );
+            let marker_rows: Vec<usize> = s
+                .lines
+                .iter()
+                .enumerate()
+                .filter(|(_, l)| l.contains("esc to interrupt"))
+                .map(|(i, _)| i)
+                .collect();
+            assert_eq!(
+                marker_rows,
+                [70],
+                "{name}: the busy marker is on the bottom status line only"
+            );
+            let spinner = s
+                .lines
+                .iter()
+                .find(|l| l.contains('…'))
+                .expect("a spinner line");
+            assert!(!spinner.contains("esc to interrupt"), "{name}: {spinner}");
+            assert!(shows_busy_marker(&s), "{name}");
+            assert_eq!(busy_prompt_accepts_input(&s), Ok(()), "{name}");
+            assert!(input_prompt_ready(&s).is_err(), "{name}: not idle");
+            assert!(
+                exit_prompt_ready(&s).is_err(),
+                "{name}: never /exit a busy turn"
+            );
+        }
+    }
+
+    /// After one message is queued the input row reads `Press up to edit
+    /// queued messages`: the busy arm refuses a second paste until the turn
+    /// ends.
+    #[test]
+    fn a_queued_message_line_refuses_a_second_busy_paste() {
+        use super::probe_fixtures::{screen, BUSY_QUEUED};
+        let s = screen(BUSY_QUEUED);
+        assert!(s.lines[68].contains("Press up to edit queued messages"));
+        assert!(shows_busy_marker(&s));
+        let why = busy_prompt_accepts_input(&s).unwrap_err();
+        assert!(
+            why.contains("not the empty-prompt placeholder"),
+            "refused for the queued line: {why}"
+        );
+        // Wherever the cursor sits on that row, it is refused.
+        let mut end = s.clone();
+        end.cursor_col = 34;
+        assert!(busy_prompt_accepts_input(&end).is_err());
+        assert!(input_prompt_ready(&s).is_err());
+    }
+
+    /// A marker the idle predicate cannot see row by row — wrapped across two
+    /// rows on a narrow pane, or painted with a non-breaking space — is still
+    /// the busy arm's alone: the idle arms refuse it, so the arms never overlap.
+    #[test]
+    fn a_marker_only_the_busy_arm_can_see_is_refused_by_the_idle_arms() {
+        let wrapped = {
+            let mut s = empty_prompt();
+            s.lines
+                .push("  ⏵⏵ bypass permissions on · 1 shell · esc to".to_string());
+            s.lines.push("  interrupt · ↓ to manage".to_string());
+            s
+        };
+        let nbsp = {
+            let mut s = empty_prompt();
+            s.lines
+                .push("  ⏵⏵ bypass permissions on · esc\u{a0}to interrupt".to_string());
+            s
+        };
+        for (name, s) in [("wrapped", wrapped), ("nbsp", nbsp)] {
+            assert!(shows_busy_marker(&s), "{name}: the busy arm sees it");
+            let why = input_prompt_ready(&s).unwrap_err();
+            assert!(why.contains("busy marker"), "{name}: {why}");
+            assert!(exit_prompt_ready(&s).is_err(), "{name}: never /exit");
+        }
+    }
+
+    #[test]
+    fn a_busy_screen_with_a_selected_numbered_choice_fails_both_arms() {
+        let s = busy_turn_with_a_selected_choice();
+        let busy = busy_prompt_accepts_input(&s).unwrap_err();
+        assert!(busy.contains("numbered choice"), "busy arm: {busy}");
+        assert!(input_prompt_ready(&s).is_err());
+    }
+
+    #[test]
+    fn the_busy_arm_keeps_every_screen_check_but_the_idle_one() {
+        // An idle screen is NOT the busy arm's: no busy marker.
+        let idle = busy_prompt_accepts_input(&empty_prompt()).unwrap_err();
+        assert!(idle.contains("busy marker"), "{idle}");
+        // A half-typed prompt during a turn: the operator's draft.
+        let mut draft = busy_turn();
+        draft.lines[3] = "❯\u{a0}half a thought".to_string();
+        draft.cursor_col = 16;
+        assert!(busy_prompt_accepts_input(&draft).is_err());
+        // Cursor parked at the input start over typed text is refused too.
+        draft.cursor_col = 2;
+        assert!(busy_prompt_accepts_input(&draft).is_err());
+        // Dialog chrome above the cursor during a turn.
+        let mut chrome = busy_turn();
+        chrome.lines[1] = "  Enter to confirm · Esc to cancel".to_string();
+        assert!(busy_prompt_accepts_input(&chrome).is_err());
+        // No `❯` on the cursor row: the cursor is up in streaming output.
+        let mut streaming = busy_turn();
+        streaming.cursor_row = 0;
+        assert!(busy_prompt_accepts_input(&streaming).is_err());
+    }
+
     #[test]
     fn the_empty_prompt_placeholder_is_ready() {
         assert_eq!(exit_prompt_ready(&empty_prompt()), Ok(()));
@@ -973,6 +1276,66 @@ mod tests {
         home.cursor_col = 2;
         let why = exit_prompt_ready(&home).unwrap_err();
         assert!(why.contains("not the empty-prompt placeholder"), "{why}");
+    }
+
+    /// An idle prompt holding Claude Code's ghost text — a prompt suggestion
+    /// — with each character's DIM attribute as `dim` says, cursor at the
+    /// input start.
+    fn suggestion_prompt(text: &str, dim: impl Fn(usize, char) -> bool) -> ScreenText {
+        let row = format!("❯\u{a0}{text}");
+        let mask = row.chars().enumerate().map(|(i, c)| dim(i, c)).collect();
+        let mut s = screen(
+            vec![
+                "● Compacted while idle, before the prompt cache expired · turn off with \"idleCompaction\": false in settings.json".to_string(),
+                edge(),
+                row,
+                edge(),
+                "  ⏵⏵ bypass permissions on (shift+tab to cycle)".to_string(),
+            ],
+            2,
+            2,
+        );
+        s.cursor_row_dim = Some(mask);
+        s
+    }
+
+    #[test]
+    fn dim_ghost_text_on_the_input_line_is_empty() {
+        // Wholly dim after the marker: a suggestion, not a draft.
+        for text in ["_(No suggestion.)_", "run the land_seam tests now"] {
+            let s = suggestion_prompt(text, |i, _| i >= 2);
+            assert_eq!(exit_prompt_ready(&s), Ok(()), "{text}");
+            // A paste is submitted with no echo check, so the paste arm keeps
+            // treating a suggestion as text: a lost paste must not let its CR
+            // submit the suggestion.
+            assert!(input_prompt_ready(&s).is_err(), "{text}");
+        }
+        // The marker and separator need not be dim; trailing blank cells past
+        // the trimmed text are ignored.
+        let mut s = suggestion_prompt("run the tests", |i, _| i >= 2);
+        s.cursor_row_dim.as_mut().unwrap().extend([false; 20]);
+        assert_eq!(exit_prompt_ready(&s), Ok(()));
+    }
+
+    #[test]
+    fn typed_text_on_the_input_line_is_a_draft_whatever_else_is_dim() {
+        // Typed input is painted normal: refused, even at the input start.
+        let typed = suggestion_prompt("run the tests now", |_, _| false);
+        let why = exit_prompt_ready(&typed).unwrap_err();
+        assert!(why.contains("not the empty-prompt placeholder"), "{why}");
+        assert!(input_prompt_ready(&typed).is_err());
+        // A typed prefix followed by dim completion ghost text: one normal
+        // character is enough to refuse.
+        let mixed = suggestion_prompt("run the tests now", |i, _| i >= 5);
+        assert!(exit_prompt_ready(&mixed).is_err());
+        // Attributes unknown (a text-only screen): refused, as before.
+        let mut unknown = suggestion_prompt("run the tests now", |_, _| true);
+        unknown.cursor_row_dim = None;
+        assert!(exit_prompt_ready(&unknown).is_err());
+        // A mask shorter than the text leaves the tail unknown: refused.
+        let mut short = suggestion_prompt("run the tests now", |_, _| true);
+        short.cursor_row_dim.as_mut().unwrap().truncate(6);
+        assert!(exit_prompt_ready(&short).is_err());
     }
 
     #[test]
