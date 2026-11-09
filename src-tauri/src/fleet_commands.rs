@@ -579,8 +579,11 @@ pub(crate) fn provision_fleet_commands_into(
     registry: &AgentCommandRegistry,
 ) -> std::io::Result<ProvisionReport> {
     std::fs::create_dir_all(commands_dir)?;
-    let tracked = crate::provision_guard::TrackedPaths::probe(commands_dir);
     let resolved = registry.all();
+    // Versioned iff the repo tracks a command this binary would write, never
+    // merely "anything under .claude/commands" (provision_guard module doc).
+    let tracked = crate::provision_guard::TrackedPaths::probe(commands_dir)
+        .versioning(resolved.iter().map(|c| std::path::PathBuf::from(c.file_name())));
     // The BODIES are the embedded defaults unless an override replaced one; the
     // rung of the account layer itself is the separate `agent_commands_registry`
     // row, which `provision_fleet_commands_for_session` records.
@@ -915,6 +918,26 @@ mod tests {
             "a tracked-but-deleted command is still written"
         );
         assert_eq!(out.written, 1, "only the tracked-but-deleted one");
+    }
+
+    /// A repository that tracks only a command of its OWN under
+    /// `.claude/commands` does not version the bundle: every bundled command is
+    /// still written.
+    #[test]
+    fn a_repo_tracking_only_its_own_command_still_gets_every_bundled_one() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let commands_dir = tmp.path().join(".claude").join("commands");
+        std::fs::create_dir_all(&commands_dir).unwrap();
+        crate::provision_guard::test_support::git_init(tmp.path());
+        let own = commands_dir.join("repo-local-only-command.md");
+        std::fs::write(&own, b"# mine\n").unwrap();
+        crate::provision_guard::test_support::git_add(tmp.path(), &own);
+
+        let out = provision_fleet_commands_into(&commands_dir, &AgentCommandRegistry::new())
+            .expect("provision");
+
+        assert!(out.skipped.is_empty(), "got {:?}", out.skipped);
+        assert_eq!(out.written, FLEET_COMMANDS.len());
     }
 
     /// The blast radius the module doc names: a checkout that tracks EVERY

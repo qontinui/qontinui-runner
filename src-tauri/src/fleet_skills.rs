@@ -456,12 +456,23 @@ pub(crate) fn provision_fleet_skills_into(
     };
 
     std::fs::create_dir_all(skills_dir)?;
-    let tracked = crate::provision_guard::TrackedPaths::probe(skills_dir);
     let resolved = registry.all();
     let sources: Vec<SkillSource<'_>> = resolved
         .iter()
         .map(|skill| SkillSource::choose(skill, canonical))
         .collect();
+    // Versioned iff the repo tracks a file this pass would write, never merely
+    // "anything under .claude/skills" — a repo-local skill of the repo's own
+    // does not make it the bundle's source (provision_guard module doc).
+    let tracked = crate::provision_guard::TrackedPaths::probe(skills_dir).versioning(
+        resolved.iter().zip(&sources).flat_map(|(skill, source)| {
+            source
+                .files()
+                .keys()
+                .map(|rel| Path::new(skill.dir_name()).join(rel))
+                .collect::<Vec<_>>()
+        }),
+    );
     let canonical_skills = sources
         .iter()
         .filter(|s| matches!(s, SkillSource::Canonical { .. }))
