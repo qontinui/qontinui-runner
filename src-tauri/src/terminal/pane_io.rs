@@ -865,13 +865,18 @@ mod tests {
 #[cfg(all(test, windows))]
 mod local_pty_kill_tests {
     use super::*;
-    use qontinui_runner_win32::process_tree::{snapshot, OwnedProcess};
+    use qontinui_runner_win32::process_tree::{
+        descendant_census_reaching, OwnedProcess, Win32Table,
+    };
     use std::sync::Arc;
     use std::time::Instant;
 
     /// Spawn `args` in a ConPTY pane and return it with handles on the
-    /// shell's own children (taken at once, so a reused pid cannot read as
-    /// alive later).
+    /// shell's descendants, by an identity-checked census over the pane's
+    /// held root handle (a process listed under the shell's pid but older
+    /// than the shell is a pid-reuse stranger, and is not returned). Each
+    /// handle is the one the check was made through, so a reused pid cannot
+    /// read as alive later.
     fn pane_with_children(args: &[&str]) -> (Arc<LocalPty>, Vec<OwnedProcess>) {
         let opened = LocalPty::open("local-pty-kill-test", 80, 24).expect("openpty");
         // `CommandBuilder::new` snapshots the whole process env, and that copy
@@ -896,24 +901,19 @@ mod local_pty_kill_tests {
             pane.root.is_some(),
             "the spawn-time handle duplicate failed"
         );
-        let root = pane.pid.expect("the pane's pid");
-        let end = Instant::now() + Duration::from_secs(20);
-        loop {
-            let kids: Vec<OwnedProcess> = snapshot()
-                .expect("snapshot")
-                .into_iter()
-                .filter(|&(pid, ppid)| ppid == root && pid != root)
-                .filter_map(|(pid, _)| OwnedProcess::open(pid).ok())
-                .collect();
-            if !kids.is_empty() {
-                return (pane, kids);
-            }
-            assert!(
-                Instant::now() < end,
-                "the pane's shell never started a child"
-            );
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        let root_pid = pane.pid.expect("the pane's pid");
+        let root = pane.root.as_ref().expect("the pane's held root handle");
+        let census = descendant_census_reaching(
+            &Win32Table,
+            root,
+            root_pid,
+            std::process::id(),
+            1,
+            Duration::from_secs(20),
+        )
+        .unwrap_or_else(|e| panic!("the pane's shell never started a child: {e}"));
+        let kids = census.members.into_iter().map(|(_, h)| h).collect();
+        (pane, kids)
     }
 
     fn wait_all_gone(procs: &[OwnedProcess]) {

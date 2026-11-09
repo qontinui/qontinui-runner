@@ -34,6 +34,9 @@
 
 use std::time::{Duration, Instant};
 
+mod census;
+pub use census::{descendant_census, descendant_census_reaching, DescendantCensus};
+
 /// Most snapshot passes one call makes. A pass catches what the previous one's
 /// kills raced with (a child forked between snapshot and kill); bounded, so a
 /// fork bomb cannot hold the caller forever.
@@ -126,6 +129,11 @@ pub trait ProcessTable {
     fn terminate(&self, h: &Self::Handle) -> bool;
     /// Whether the process behind `h` has exited.
     fn has_exited(&self, h: &Self::Handle) -> bool;
+    /// The executable's file name, for diagnostics only; `None` when it
+    /// cannot be read. The walk never consults it.
+    fn image_name(&self, _h: &Self::Handle) -> Option<String> {
+        None
+    }
 }
 
 /// Terminate the process behind `root` (pid `root_pid`) and every descendant,
@@ -289,9 +297,9 @@ mod imp {
         TH32CS_SNAPPROCESS,
     };
     use windows_sys::Win32::System::Threading::{
-        GetCurrentProcess, GetProcessId, GetProcessTimes, OpenProcess, TerminateProcess,
-        WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
-        PROCESS_TERMINATE,
+        GetCurrentProcess, GetProcessId, GetProcessTimes, OpenProcess, QueryFullProcessImageNameW,
+        TerminateProcess, WaitForSingleObject, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
     };
 
     /// The creation time of the process behind `handle`, as one FILETIME.
@@ -403,6 +411,23 @@ mod imp {
             // SAFETY: a process handle opened with PROCESS_TERMINATE.
             unsafe { TerminateProcess(self.0, 1) != 0 }
         }
+
+        /// The executable's file name (`QueryFullProcessImageNameW`, last
+        /// path component); `None` when it cannot be read.
+        pub fn image_name(&self) -> Option<String> {
+            let mut buf = [0u16; 1024];
+            let mut len = buf.len() as u32;
+            // SAFETY: a process handle with query access; `buf` holds `len`
+            // UTF-16 units and the call writes at most that many back.
+            let ok = unsafe {
+                QueryFullProcessImageNameW(self.0, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut len)
+            };
+            if ok == 0 {
+                return None;
+            }
+            let path = String::from_utf16_lossy(&buf[..len as usize]);
+            Some(path.rsplit('\\').next().unwrap_or(&path).to_string())
+        }
     }
 
     /// `(pid, parent pid)` of every process, from one Toolhelp snapshot.
@@ -452,6 +477,9 @@ mod imp {
         }
         fn has_exited(&self, h: &OwnedProcess) -> bool {
             h.has_exited()
+        }
+        fn image_name(&self, h: &OwnedProcess) -> Option<String> {
+            h.image_name()
         }
     }
 
@@ -534,17 +562,39 @@ mod admission_tests {
         assert!(!err.contains("  "), "no collapsed line continuation: {err}");
     }
 
-    /// The walk is pure source with no process creation in it: no
-    /// `std::process`, no `CreateProcess`, no shell. Read from the file itself
-    /// (above this test module), so a regression that reintroduces a spawn —
-    /// a `taskkill`, a `cmd /c` — cannot pass. A runtime census cannot prove
-    /// this: Toolhelp does not list a process that has already exited.
+    /// The walk and the census are pure source with no process creation in
+    /// them: no `std::process`, no `CreateProcess`, no shell. Read from the
+    /// files themselves (above each test module), so a regression that
+    /// reintroduces a spawn — a `taskkill`, a `cmd /c` — cannot pass. A
+    /// runtime census cannot prove this: Toolhelp does not list a process that
+    /// has already exited.
     #[test]
     fn process_tree_termination_source_creates_no_process() {
-        let src = include_str!("process_tree.rs");
-        let production = &src[..src
-            .find("#[cfg(test)]\nmod admission_tests")
-            .expect("the test module marker")];
+        let walk_src = include_str!("process_tree.rs");
+        let census_src = include_str!("process_tree/census.rs");
+        for (file, production) in [
+            (
+                "process_tree.rs",
+                &walk_src[..walk_src
+                    .find("#[cfg(test)]\nmod admission_tests")
+                    .expect("the test module marker")],
+            ),
+            (
+                "process_tree/census.rs",
+                &census_src[..census_src
+                    .find("#[cfg(test)]\nmod tests")
+                    .expect("the census test module marker")],
+            ),
+        ] {
+            assert!(
+                production.contains("fn "),
+                "{file}: an empty production slice"
+            );
+            scan_for_process_creation(file, production);
+        }
+    }
+
+    fn scan_for_process_creation(file: &str, production: &str) {
         for forbidden in [
             "std::process::Command",
             "Command::new",
@@ -559,7 +609,7 @@ mod admission_tests {
                 .filter(|(_, l)| !l.trim_start().starts_with("//"))
                 .filter(|(_, l)| l.contains(forbidden))
                 .collect();
-            assert!(hits.is_empty(), "{forbidden} in process_tree.rs: {hits:?}");
+            assert!(hits.is_empty(), "{forbidden} in {file}: {hits:?}");
         }
     }
 }
@@ -883,50 +933,137 @@ mod tests {
         }
     }
 
-    /// Every pid `snapshot` links below `root` (no identity check — test use).
-    fn descendants(root: u32) -> Vec<u32> {
-        let procs = snapshot().expect("snapshot");
-        let mut tree = vec![root];
-        let mut i = 0;
-        while i < tree.len() {
-            let parent = tree[i];
-            for &(pid, ppid) in &procs {
-                if ppid == parent && pid != parent && !tree.contains(&pid) {
-                    tree.push(pid);
-                }
-            }
-            i += 1;
-        }
-        tree.remove(0);
-        tree
-    }
-
-    /// Wait until the tree under `root` has `n` descendants.
-    fn wait_for_descendants(root: u32, n: usize) -> Vec<u32> {
-        let end = Instant::now() + Duration::from_secs(20);
-        loop {
-            let d = descendants(root);
-            if d.len() >= n {
-                return d;
-            }
-            assert!(Instant::now() < end, "tree never grew: {d:?}");
-            std::thread::sleep(Duration::from_millis(50));
+    /// Wait until the process behind `p` has exited; a timeout names `what`.
+    fn wait_gone(p: &OwnedProcess, what: &dyn std::fmt::Debug) {
+        let end = Instant::now() + Duration::from_secs(5);
+        while !p.has_exited() {
+            assert!(Instant::now() < end, "a tree member survived: {what:?}");
+            std::thread::sleep(Duration::from_millis(20));
         }
     }
 
-    /// Handles on `pids`, taken now, so a later liveness check cannot be
-    /// fooled by a reused pid.
-    fn watch(pids: &[u32]) -> Vec<OwnedProcess> {
-        pids.iter()
-            .filter_map(|p| OwnedProcess::open(*p).ok())
+    /// The census members still running, read through their held handles —
+    /// taken immediately before a tree kill, so a member that ended on its own
+    /// earlier is not demanded of the reaper.
+    fn alive_at_call(census: &DescendantCensus<OwnedProcess>) -> Vec<u32> {
+        census
+            .members
+            .iter()
+            .filter(|(_, h)| !h.has_exited())
+            .map(|(pid, _)| *pid)
             .collect()
     }
 
-    fn wait_gone(p: &OwnedProcess) {
-        let end = Instant::now() + Duration::from_secs(5);
-        while !p.has_exited() {
-            assert!(Instant::now() < end, "a tree member survived");
-            std::thread::sleep(Duration::from_millis(20));
+    /// [`Win32Table`] with one extra `(stranger, parent)` row in every
+    /// snapshot: the link a pid-reuse stranger has when the pid of its dead
+    /// parent now names `parent`. Everything else — handles, creation times,
+    /// kills — is real Win32.
+    struct ListedUnder {
+        stranger: u32,
+        parent: u32,
+    }
+
+    impl ProcessTable for ListedUnder {
+        type Handle = OwnedProcess;
+        fn now(&self) -> u64 {
+            Win32Table.now()
+        }
+        fn snapshot(&self) -> std::io::Result<Vec<(u32, u32)>> {
+            let mut procs = Win32Table.snapshot()?;
+            procs.push((self.stranger, self.parent));
+            Ok(procs)
+        }
+        fn open(&self, pid: u32) -> Option<OwnedProcess> {
+            Win32Table.open(pid)
+        }
+        fn creation_time(&self, h: &OwnedProcess) -> Option<u64> {
+            Win32Table.creation_time(h)
+        }
+        fn terminate(&self, h: &OwnedProcess) -> bool {
+            Win32Table.terminate(h)
+        }
+        fn has_exited(&self, h: &OwnedProcess) -> bool {
+            Win32Table.has_exited(h)
+        }
+        fn image_name(&self, h: &OwnedProcess) -> Option<String> {
+            Win32Table.image_name(h)
+        }
+    }
+
+    /// The CI failure's shape, made deterministic: a process OLDER than the
+    /// root is listed under it (on CI an orphaned MSVC `vctip.exe` whose dead
+    /// parent's pid the root had reused). The census refuses it, the walk
+    /// leaves it alone, and the genuine descendant is still reaped. Only the
+    /// link is injected; the decoy itself is a real, live process.
+    #[test]
+    fn process_tree_a_stranger_listed_under_the_root_is_neither_recorded_nor_killed() {
+        let mut fx = Fixture::new();
+        let decoy_pid = fx.spawn(&["ping", "-n", "60", "127.0.0.1"]).id();
+        let decoy = OwnedProcess::duplicate(fx.children[0].as_handle()).unwrap();
+        // Distinct clock ticks: an equal creation time would be admitted.
+        std::thread::sleep(Duration::from_millis(150));
+        let pid = fx
+            .spawn(&["cmd", "/c", "start", "/b", "ping", "-n", "60", "127.0.0.1"])
+            .id();
+        let root = OwnedProcess::duplicate(fx.children[1].as_handle()).unwrap();
+        let decoy_created = decoy.creation_time().expect("decoy creation time");
+        let root_created = root.creation_time().expect("root creation time");
+        assert!(
+            decoy_created < root_created,
+            "precondition: the decoy (created {decoy_created}) must predate the root \
+             (created {root_created})"
+        );
+        let _ = fx.children[1].wait();
+        assert!(root.has_exited());
+
+        let table = ListedUnder {
+            stranger: decoy_pid,
+            parent: pid,
+        };
+        let census = descendant_census_reaching(
+            &table,
+            &root,
+            pid,
+            std::process::id(),
+            1,
+            Duration::from_secs(20),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            census.refused.contains(&decoy_pid) && !census.member_pids().contains(&decoy_pid),
+            "the decoy {decoy_pid} must be refused, not recorded: {census:?}"
+        );
+        let alive = alive_at_call(&census);
+        assert!(!alive.is_empty(), "no live descendant to reap: {census:?}");
+
+        let report = walk(
+            &table,
+            &root,
+            pid,
+            std::process::id(),
+            Duration::from_secs(5),
+        )
+        .unwrap_or_else(|e| panic!("{e}; census {census:?}"));
+        assert!(
+            !report.killed.contains(&decoy_pid),
+            "the stranger {decoy_pid} was killed: {report:?}; census {census:?}"
+        );
+        assert!(!decoy.has_exited(), "the stranger {decoy_pid} is gone");
+        let members = census.member_pids();
+        for k in &report.killed {
+            assert!(
+                *k == pid || members.contains(k),
+                "{k} killed but not in the census: {report:?}; census {census:?}"
+            );
+        }
+        for p in &alive {
+            assert!(
+                report.killed.contains(p),
+                "{p} missing from {report:?}; census {census:?}"
+            );
+        }
+        for (_, h) in &census.members {
+            wait_gone(h, &census);
         }
     }
 
@@ -937,23 +1074,35 @@ mod tests {
         let pid = fx
             .spawn(&["cmd", "/c", "cmd", "/c", "ping", "-n", "60", "127.0.0.1"])
             .id();
-        let below = wait_for_descendants(pid, 2);
-        let watched = watch(&below);
         let root = OwnedProcess::duplicate(fx.children[0].as_handle()).unwrap();
         assert_eq!(root.pid(), Some(pid), "the handle names the spawned root");
+        let census = descendant_census_reaching(
+            &Win32Table,
+            &root,
+            pid,
+            std::process::id(),
+            2,
+            Duration::from_secs(20),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
         // A pid claim the handle does not vouch for is refused, unsignalled.
         assert!(matches!(
             terminate_tree_of(&root, pid.wrapping_add(4), Duration::from_secs(5)),
             Err(TreeKillError::Root(_))
         ));
         assert!(!root.has_exited(), "a refused walk signalled nothing");
+        let alive = alive_at_call(&census);
+        assert!(!alive.is_empty(), "no live descendant to reap: {census:?}");
         let report = terminate_tree_of(&root, pid, Duration::from_secs(5)).unwrap();
         assert!(report.killed.contains(&pid), "{report:?}");
-        for b in &below {
-            assert!(report.killed.contains(b), "{b} missing from {report:?}");
+        for p in &alive {
+            assert!(
+                report.killed.contains(p),
+                "{p} missing from {report:?}; census {census:?}"
+            );
         }
-        for w in &watched {
-            wait_gone(w);
+        for (_, h) in &census.members {
+            wait_gone(h, &census);
         }
         let _ = fx.children[0].wait();
         // Repetition: the same root again is a no-op, not an error.
@@ -964,6 +1113,11 @@ mod tests {
 
     /// The root has exited on its own: its live descendants are still ended,
     /// and the report says the root was already gone.
+    ///
+    /// The census is taken AFTER the root exits: `cmd /c start /b` creates
+    /// `ping` before `cmd` exits, so once `wait()` returns the genuine tree
+    /// under the dead root is complete and cannot grow from it. The root's pid
+    /// stays pinned by the held handle, so linking under it stays sound.
     #[test]
     fn process_tree_an_exited_root_still_has_its_descendants_reaped() {
         // `cmd /c start /b ping ...` exits at once and leaves ping running
@@ -973,17 +1127,29 @@ mod tests {
             .spawn(&["cmd", "/c", "start", "/b", "ping", "-n", "60", "127.0.0.1"])
             .id();
         let root = OwnedProcess::duplicate(fx.children[0].as_handle()).unwrap();
-        let below = wait_for_descendants(pid, 1);
-        let watched = watch(&below);
         let _ = fx.children[0].wait();
         assert!(root.has_exited());
+        let census = descendant_census_reaching(
+            &Win32Table,
+            &root,
+            pid,
+            std::process::id(),
+            1,
+            Duration::from_secs(20),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let alive = alive_at_call(&census);
+        assert!(!alive.is_empty(), "no live descendant to reap: {census:?}");
         let report = terminate_tree_of(&root, pid, Duration::from_secs(5)).unwrap();
         assert!(report.root_exited, "{report:?}");
-        for b in &below {
-            assert!(report.killed.contains(b), "{b} missing from {report:?}");
+        for p in &alive {
+            assert!(
+                report.killed.contains(p),
+                "{p} missing from {report:?}; census {census:?}"
+            );
         }
-        for w in &watched {
-            wait_gone(w);
+        for (_, h) in &census.members {
+            wait_gone(h, &census);
         }
     }
 

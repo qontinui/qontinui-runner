@@ -662,8 +662,10 @@ mod tests {
 #[cfg(all(test, windows))]
 mod windows_reap_tests {
     use super::*;
-    use qontinui_runner_win32::process_tree::{snapshot, OwnedProcess};
-    use std::os::windows::io::AsRawHandle;
+    use qontinui_runner_win32::process_tree::{
+        descendant_census_reaching, OwnedProcess, Win32Table,
+    };
+    use std::os::windows::io::{AsHandle, AsRawHandle};
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
 
@@ -683,19 +685,19 @@ mod windows_reap_tests {
         unsafe { job.assign(child.as_raw_handle() as _) };
         let pid = child.id();
 
-        let end = Instant::now() + Duration::from_secs(20);
-        let grandchild: OwnedProcess = loop {
-            let found = snapshot()
-                .expect("snapshot")
-                .into_iter()
-                .find(|&(p, pp)| pp == pid && p != pid)
-                .and_then(|(p, _)| OwnedProcess::open(p).ok());
-            if let Some(g) = found {
-                break g;
-            }
-            assert!(Instant::now() < end, "cmd never started ping");
-            std::thread::sleep(Duration::from_millis(50));
-        };
+        // The grandchild by identity, not by parent pid alone: a process
+        // listed under `cmd` whose dead parent's pid `cmd` reused is refused.
+        let root = OwnedProcess::duplicate(child.as_handle()).expect("duplicate cmd's handle");
+        let census = descendant_census_reaching(
+            &Win32Table,
+            &root,
+            pid,
+            std::process::id(),
+            1,
+            Duration::from_secs(20),
+        )
+        .unwrap_or_else(|e| panic!("cmd never started ping: {e}"));
+        let grandchild: &OwnedProcess = &census.members[0].1;
 
         let mut wrong = ReapReport::default();
         imp::reap_recorded_child(pid, Some("windows:1"), &mut wrong);
@@ -713,7 +715,7 @@ mod windows_reap_tests {
         while !(matches!(child.try_wait(), Ok(Some(_))) && grandchild.has_exited()) {
             assert!(
                 Instant::now() < end,
-                "the verified tree survived: {right:?}"
+                "the verified tree survived: {right:?}; census {census:?}"
             );
             std::thread::sleep(Duration::from_millis(20));
         }
