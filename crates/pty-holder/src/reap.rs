@@ -482,6 +482,11 @@ mod imp {
             "recorded child {child} is alive and verified (it was never contained by the \
              holder's job)"
         ));
+        // MUTANT: a matching token skips the walk.
+        if !token.is_empty() {
+            report.note("MUTANT: tree walk skipped".to_string());
+            return;
+        }
         match terminate_tree_of(&root, child, TREE_KILL_BUDGET) {
             Ok(tree) => {
                 if tree.budget_spent {

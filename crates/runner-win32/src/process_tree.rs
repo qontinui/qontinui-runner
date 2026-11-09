@@ -1036,6 +1036,24 @@ mod tests {
         let alive = alive_at_call(&census);
         assert!(!alive.is_empty(), "no live descendant to reap: {census:?}");
 
+        // RED-FIRST (not committed): the OLD parent-pid-only recording over
+        // the injected snapshot, asserted the way the old test did.
+        let old_below = {
+            let procs = table.snapshot().expect("snapshot");
+            let mut tree = vec![pid];
+            let mut i = 0;
+            while i < tree.len() {
+                let parent = tree[i];
+                for &(p, pp) in &procs {
+                    if pp == parent && p != parent && !tree.contains(&p) {
+                        tree.push(p);
+                    }
+                }
+                i += 1;
+            }
+            tree.remove(0);
+            tree
+        };
         let report = walk(
             &table,
             &root,
@@ -1044,6 +1062,9 @@ mod tests {
             Duration::from_secs(5),
         )
         .unwrap_or_else(|e| panic!("{e}; census {census:?}"));
+        for b in &old_below {
+            assert!(report.killed.contains(b), "{b} missing from {report:?}");
+        }
         assert!(
             !report.killed.contains(&decoy_pid),
             "the stranger {decoy_pid} was killed: {report:?}; census {census:?}"

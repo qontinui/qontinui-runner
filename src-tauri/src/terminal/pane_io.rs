@@ -421,7 +421,14 @@ impl PaneIo for LocalPty {
                     &fallback
                 }
             };
-            match terminate_tree_of(root, pid, budget) {
+            // MUTANT: the tree walk is skipped; a default report stands in.
+            let _ = terminate_tree_of;
+            let skipped: Result<
+                qontinui_runner_win32::process_tree::TreeKillReport,
+                qontinui_runner_win32::process_tree::TreeKillError,
+            > = Ok(Default::default());
+            let _ = root;
+            match skipped {
                 Ok(report) if report.budget_spent => Err(format!(
                     "tree kill of pid {pid} exceeded its {budget:?} budget after {} pass(es); \
                      killed {:?}",
