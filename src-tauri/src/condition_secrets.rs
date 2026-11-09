@@ -307,6 +307,23 @@ impl Held {
 /// a reader holding that lock sees a generation that matches what it reads.
 static HELD_GENERATION: AtomicU64 = AtomicU64::new(0);
 
+/// The last [`ScrubSet`] built, with the [`HELD_GENERATION`] it was built at.
+/// It holds the secret values, so it is emptied the moment no map is held.
+///
+/// Lock order: [`held`] first, then this; nothing takes them the other way
+/// round. No tracing layer may call into this module either: the hold-TTL
+/// purge's warning is written under the [`held`] lock.
+static SCRUB_CACHE: Mutex<Option<(u64, Option<Arc<ScrubSet>>)>> = Mutex::new(None);
+
+/// A change to the held maps, made while their lock is held: the cached scrub
+/// set is stale, and with nothing held it is dropped outright.
+fn held_changed(sessions: &HashMap<u64, Held>) {
+    HELD_GENERATION.fetch_add(1, Ordering::Relaxed);
+    if sessions.is_empty() {
+        *SCRUB_CACHE.lock().unwrap_or_else(PoisonError::into_inner) = None;
+    }
+}
+
 /// Every held map, keyed by its registration id, never by run id, so two
 /// deliveries of one run's frame hold and release independently.
 ///
@@ -332,7 +349,7 @@ fn held() -> MutexGuard<'static, HashMap<u64, Held>> {
         live
     });
     if sessions.len() != before {
-        HELD_GENERATION.fetch_add(1, Ordering::Relaxed);
+        held_changed(&sessions);
     }
     sessions
 }
@@ -351,9 +368,15 @@ pub struct Registration {
 
 impl Drop for Registration {
     fn drop(&mut self) {
-        let mut sessions = held();
-        if sessions.remove(&self.id).is_some() {
-            HELD_GENERATION.fetch_add(1, Ordering::Relaxed);
+        let released = {
+            let mut sessions = held();
+            let released = sessions.remove(&self.id).is_some();
+            if released {
+                held_changed(&sessions);
+            }
+            released
+        };
+        if released {
             debug!(
                 "condition_secrets: run_id={}: released its held secrets",
                 self.run_id
@@ -412,7 +435,7 @@ fn register_for(
                 held_until,
             },
         );
-        HELD_GENERATION.fetch_add(1, Ordering::Relaxed);
+        held_changed(&sessions);
     }
     info!(
         "condition_secrets: run_id={run_id}: holding {} secret ref(s) for this session",
@@ -668,6 +691,10 @@ pub fn app_bound_type_body(
     body: &Value,
     active: Option<&NormOrigin>,
 ) -> Result<Option<Value>, SubstitutionError> {
+    // The common case, no placeholder, never takes the held lock.
+    if first_placeholder(body).is_none() {
+        return Ok(None);
+    }
     let guarding = !held().is_empty();
     app_bound_type_body_while(body, active, guarding)
 }
@@ -820,12 +847,10 @@ impl ScrubSet {
     /// held maps ([`HELD_GENERATION`]) and shared until the next one, rather
     /// than rebuilt for every response and every event.
     fn current() -> Option<Arc<Self>> {
-        static CACHE: Mutex<Option<(u64, Option<Arc<ScrubSet>>)>> = Mutex::new(None);
-        // Lock order: `held` first, then the cache; nothing takes them the
-        // other way round.
+        // Lock order: `held` first, then the cache ([`SCRUB_CACHE`]).
         let sessions = held();
         let generation = HELD_GENERATION.load(Ordering::Relaxed);
-        let mut cache = CACHE.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut cache = SCRUB_CACHE.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some((built_at, set)) = cache.as_ref() {
             if *built_at == generation {
                 return set.clone();
