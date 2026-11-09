@@ -20,8 +20,12 @@
 //! (retired, refused, no row, a coord that does not implement the flag) ends
 //! the loop. A runner exit drops the task and the row ages out as before.
 //!
-//! No directory is removed here: `abandoned` grants no disk authority, and the
-//! existing unwind only releases claims. Disk stays with reclaim.
+//! No directory is removed here: `abandoned` grants no disk authority, and this
+//! unwind only releases claims and retires rows. The one runner path that
+//! removes a just-allocated tree is a terminal door's spawn refusal
+//! ([`super::remove_unspawned`], via `IsolatedEditContext::remove_unspawned`),
+//! which holds the fact `abandoned` cannot carry — that no child ever ran in
+//! it. Every other tree stays with reclaim.
 //!
 //! Out of scope: coord's dispatch-time rows (`payload.allocation`,
 //! `dispatch_source` set). This module only ever sees the rows of the runner's

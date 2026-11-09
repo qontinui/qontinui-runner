@@ -361,15 +361,16 @@ mod tests {
                 || line.starts_with("unsafe fn "))
     }
 
-    /// Plan `2026-11-08-…-leaves-the-tree-on-disk` Phase 0: every call site of
+    /// Plan `2026-11-08-…-leaves-the-tree-on-disk` Phases 0 and 2: every call site of
     /// `acquire_for_terminal` under `src-tauri/src` runs the resource-guard
     /// precheck BEFORE it (a CRITICAL refusal after the allocation leaks a
-    /// `git worktree add`) and reports an unspawned allocation AFTER it, on the
+    /// `git worktree add`) and removes-and-reports an unspawned allocation
+    /// (`remove_unspawned`) AFTER it, on the
     /// failure arm (coord otherwise keeps the failed allocation `allocated`).
     /// Enumerated from the source, so a new door is covered the moment it
     /// appears [policy: testing/coverage-is-enumerated-not-salient].
     #[test]
-    fn every_acquire_for_terminal_door_prechecks_and_reports_an_unspawned_allocation() {
+    fn every_acquire_for_terminal_door_prechecks_and_removes_an_unspawned_allocation() {
         // Spelled in two halves so this test's own source is never a match.
         let call = concat!("acquire_for_terminal", "(");
         let definition = concat!("fn acquire_for_terminal", "(");
@@ -407,9 +408,9 @@ mod tests {
                         lines[start].trim()
                     ));
                 }
-                if !after.contains("report_unspawned(") {
+                if !after.contains("remove_unspawned(") {
                     failures.push(format!(
-                        "{site}: no `report_unspawned(` after the allocation in `{}`",
+                        "{site}: no `remove_unspawned(` after the allocation in `{}`",
                         lines[start].trim()
                     ));
                 }

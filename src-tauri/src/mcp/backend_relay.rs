@@ -6028,11 +6028,16 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
                 Some(frame)
             }
             Err(e) => {
-                // The allocation (if this call made one) is reported, as on
-                // every `acquire_for_terminal` door; the context's Drop then
-                // releases its claims.
-                if let Some(ctx) = isolated_ctx.as_ref() {
-                    ctx.report_unspawned("backend_relay terminal_create", &e.message);
+                // The allocation (if this call made one) has its fresh tree
+                // removed when no child started and it holds nothing, and is
+                // reported spawn-failed, as on every `acquire_for_terminal`
+                // door; the context's Drop then releases its claims.
+                if let Some(ctx) = isolated_ctx {
+                    ctx.remove_unspawned(
+                        "backend_relay terminal_create",
+                        e.child_started,
+                        &e.message,
+                    );
                 }
                 Some(crate::terminal::spawn_refusal::relay_spawn_failed_frame(
                     &e.message,
