@@ -4127,11 +4127,14 @@ impl TerminalSession {
         // it here rather than after the CR, or a half-written submit would
         // read as "no input" to the phantom-turn detector.
         //
-        // A framed paste — submit or insert — is always input (no
-        // control-response exclusion applies to it), so the operator-input
-        // episode hook runs unconditionally; the caller door alone decides
-        // the actor class. Same funnel as `write`, never the body.
-        super::operator_input::on_input(self, &caller, chrono::Utc::now().timestamp());
+        // A framed paste — submit or insert — is input (no control-response
+        // exclusion applies to it), so the operator-input episode hook runs
+        // whenever it carried a body; the caller door alone decides the actor
+        // class. An empty body typed nothing, so — like a zero-byte `write` —
+        // it opens no episode. Same funnel as `write`, never the body.
+        if !report.body.is_empty() {
+            super::operator_input::on_input(self, &caller, chrono::Utc::now().timestamp());
+        }
         self.record_input(
             PtyInputObservation {
                 caller,
@@ -9837,6 +9840,7 @@ pub(crate) mod tests {
                 rule_id: "r".to_string(),
             },
             PtyWriteCaller::WorkerSession,
+            PtyWriteCaller::ReviewNotes,
             PtyWriteCaller::TauriTerminalWrite,
             PtyWriteCaller::TauriInvokeProxy,
             PtyWriteCaller::RemoteTerminalInput,
@@ -9863,7 +9867,7 @@ pub(crate) mod tests {
                 "{tag}"
             );
         }
-        assert_eq!(emitting, 6, "two human doors + four ambiguous doors");
+        assert_eq!(emitting, 7, "two human doors + five ambiguous doors");
     }
 
     /// `submit_prompt` is the second funnel and carries the same hook.
@@ -9879,6 +9883,37 @@ pub(crate) mod tests {
             .submit_prompt("nudge", PtyWriteCaller::LoopingAgentNudge)
             .expect("live fixture submit");
         assert_eq!(nudge.operator_input_episodes().opened(), 0);
+    }
+
+    /// `insert_prompt` shares `paste_prompt` with `submit_prompt`, so an
+    /// unsent draft typed through an ambiguous door opens an episode too —
+    /// and an automated producer's insert still opens none.
+    #[test]
+    fn insert_prompt_opens_an_operator_input_episode_for_an_ambiguous_door() {
+        let session = attributed_session();
+        session
+            .insert_prompt("draft", PtyWriteCaller::ReviewNotes)
+            .expect("live fixture insert");
+        assert_eq!(session.operator_input_episodes().opened(), 1);
+        let nudge = attributed_session();
+        nudge
+            .insert_prompt("draft", PtyWriteCaller::LoopingAgentNudge)
+            .expect("live fixture insert");
+        assert_eq!(nudge.operator_input_episodes().opened(), 0);
+    }
+
+    /// An empty paste typed nothing: like a zero-byte `write`, it opens no
+    /// operator-input episode even through an ambiguous door.
+    #[test]
+    fn an_empty_insert_opens_no_operator_input_episode() {
+        let session = attributed_session();
+        let _ = session.insert_prompt("", PtyWriteCaller::ReviewNotes);
+        assert_eq!(session.operator_input_episodes().opened(), 0);
+        // Control: the same door with a body does open one.
+        session
+            .insert_prompt("x", PtyWriteCaller::ReviewNotes)
+            .expect("live fixture insert");
+        assert_eq!(session.operator_input_episodes().opened(), 1);
     }
 
     /// 500 keystrokes on an attributed terminal → one episode and ONE state

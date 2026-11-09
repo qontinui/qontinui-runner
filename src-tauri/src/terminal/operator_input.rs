@@ -594,6 +594,7 @@ mod tests {
                 rule_id: "r1".to_string(),
             },
             PtyWriteCaller::WorkerSession,
+            PtyWriteCaller::ReviewNotes,
             PtyWriteCaller::TauriTerminalWrite,
             PtyWriteCaller::TauriInvokeProxy,
             PtyWriteCaller::RemoteTerminalInput,
@@ -617,7 +618,8 @@ mod tests {
                     PtyWriteCaller::TauriInvokeProxy
                     | PtyWriteCaller::HttpWrite
                     | PtyWriteCaller::WebSocketInput
-                    | PtyWriteCaller::HttpSubmitPrompt => Some(ActorClass::Unknown),
+                    | PtyWriteCaller::HttpSubmitPrompt
+                    | PtyWriteCaller::ReviewNotes => Some(ActorClass::Unknown),
                     PtyWriteCaller::LoopingAgentNudge
                     | PtyWriteCaller::AccountMigration
                     | PtyWriteCaller::SessionMessagePoller
@@ -637,9 +639,9 @@ mod tests {
     }
 
     #[test]
-    fn exactly_two_doors_are_human_four_are_unknown_and_the_rest_emit_nothing() {
+    fn exactly_two_doors_are_human_five_are_unknown_and_the_rest_emit_nothing() {
         let table = every_caller_with_expected_class();
-        assert_eq!(table.len(), 18, "17 production variants + Test");
+        assert_eq!(table.len(), 19, "18 production variants + Test");
         for (caller, expected) in &table {
             assert_eq!(actor_class_of(caller), *expected, "{caller}");
         }
@@ -650,7 +652,7 @@ mod tests {
                 .count()
         };
         assert_eq!(count(Some(ActorClass::Human)), 2);
-        assert_eq!(count(Some(ActorClass::Unknown)), 4);
+        assert_eq!(count(Some(ActorClass::Unknown)), 5);
         assert_eq!(count(None), 12);
     }
 
@@ -670,6 +672,7 @@ mod tests {
             PtyWriteCaller::HttpWrite,
             PtyWriteCaller::WebSocketInput,
             PtyWriteCaller::HttpSubmitPrompt,
+            PtyWriteCaller::ReviewNotes,
         ] {
             assert_eq!(ch(c), Some(Channel::RunnerHttp));
         }
