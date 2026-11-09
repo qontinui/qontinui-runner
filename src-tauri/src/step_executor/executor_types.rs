@@ -789,10 +789,11 @@ impl ExecutionStepConfig {
     /// Whether this step runs in a build whose `debug_assertions` setting is
     /// the one given: a `dev_mode_only` step runs only in a build with debug
     /// assertions, so the published runner never executes it. Callers pass
-    /// `cfg!(debug_assertions)`; tests pass either value. The ONE spelling of
-    /// that rule, shared by the verification phase (which drops such steps
-    /// before running) and the multi-agent pipeline (which derives its
-    /// acceptance criteria from the steps that will actually run).
+    /// `cfg!(debug_assertions)`; tests pass either value. The verification
+    /// phase (which drops such steps before running) and the multi-agent
+    /// pipeline (which derives its acceptance criteria from the steps that will
+    /// actually run) share it; the setup, agentic and completion phases still
+    /// spell the same rule inline.
     pub fn runs_in_build(&self, debug_assertions: bool) -> bool {
         debug_assertions || !self.dev_mode_only.unwrap_or(false)
     }
@@ -952,7 +953,11 @@ pub struct StepExecutionResult {
     /// Additional output data from the step handler
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_data: Option<serde_json::Value>,
-    /// Whether this step is required for verification pass/fail (from step config)
+    /// Whether this step counts toward the verification verdict: the step
+    /// config's `required`. In the verification phase, a step that checks
+    /// nothing (a `gate`, a verification `prompt` with no prompt content) is
+    /// stamped `Some(false)` instead (`verification_execution::result_required`);
+    /// results from the other phases copy the config's value unstamped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub required: Option<bool>,
     /// Resolved input values (for debugging data flow)

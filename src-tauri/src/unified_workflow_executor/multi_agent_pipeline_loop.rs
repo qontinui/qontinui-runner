@@ -2741,7 +2741,8 @@ mod tests {
         assert!(pipeline_goal_achieved(Some(true), &[subtree("s0", false)]));
     }
 
-    /// The census row (R63b): a subtree none of whose levels held its criteria
+    /// Plan 2's census (coord finding 902409b1), its process_subtree row: a
+    /// subtree none of whose levels held its criteria
     /// verified nothing, and the subtree fold read that as passed. The pipeline's
     /// folds need at least one checked item, and every one passed.
     #[test]

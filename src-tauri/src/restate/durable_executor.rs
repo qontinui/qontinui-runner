@@ -406,6 +406,43 @@ mod nothing_checked_tests {
         assert!(result.step_results.is_empty());
     }
 
+    /// The durable path's own entry: `execute_steps_batch` handed an empty
+    /// VERIFICATION batch returns before it builds a step executor or touches a
+    /// database, and that batch is not all_passed. An empty setup batch is the
+    /// control. The `AppState` is the in-memory one (no database, disk or
+    /// network).
+    #[tokio::test]
+    async fn the_batch_executor_does_not_pass_an_empty_verification_batch() {
+        let app_state = crate::AppState::new_for_test();
+        let config_storage = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::config_storage::ConfigStorage::new_degraded(),
+        ));
+        let verification = super::execute_steps_batch(
+            &app_state,
+            &config_storage,
+            "[]",
+            "verification",
+            Some(1),
+            "exec-durable",
+            None,
+        )
+        .await;
+        assert!(!verification.all_passed);
+        assert!(verification.success, "the phase ran; it checked nothing");
+        assert!(verification.step_results.is_empty());
+        let setup = super::execute_steps_batch(
+            &app_state,
+            &config_storage,
+            "[]",
+            "setup",
+            None,
+            "exec-durable",
+            None,
+        )
+        .await;
+        assert!(setup.all_passed);
+    }
+
     /// The control: a setup or completion phase with nothing to do succeeded.
     #[test]
     fn an_empty_setup_or_completion_batch_still_succeeds() {

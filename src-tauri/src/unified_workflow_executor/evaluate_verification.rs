@@ -7,8 +7,8 @@
 //! knowledge resolution — goes through [`EvaluationEffects`], whose production
 //! implementation is [`LoopController`]. That seam is what lets the handler
 //! itself, rather than a copy of its branching, run in a unit test against a
-//! recording fake: a `LoopController` needs a full `AppState` and a live Tauri
-//! `AppHandle`, neither of which a unit test can build.
+//! recording fake: a `LoopController` holds a live Tauri `AppHandle`, which no
+//! unit test can build (an `AppState` can be, through `AppState::new_for_test`).
 
 use std::collections::HashMap;
 
@@ -220,6 +220,38 @@ fn verdict_label(decision: &VerificationEvalDecision) -> &'static str {
     }
 }
 
+/// Every verdict word [`verdict_label`] returns, one per decision kind (the
+/// fix-escalation and continue-to-fix decisions share `FAILED`), so a reader
+/// of the output log can be tested against each of them.
+#[cfg(test)]
+pub(crate) fn every_verdict_label() -> [&'static str; 4] {
+    [
+        verdict_label(&VerificationEvalDecision::NoVerificationSteps),
+        verdict_label(&VerificationEvalDecision::VerificationPassed),
+        verdict_label(&VerificationEvalDecision::CriticalFailure),
+        verdict_label(&VerificationEvalDecision::ContinueToFix {
+            progress: FixProgressUpdate::Increment,
+        }),
+    ]
+}
+
+/// The verification summary line the handler writes to the output log. It is
+/// the one spelling of that line: `mcp/task_run_structured_output.rs` parses it
+/// back for `GET /task-runs/{id}/output-structured`, and its tests build their
+/// fixtures from this function so the two cannot drift apart.
+pub(crate) fn verification_summary_line(
+    iteration: u32,
+    status: &str,
+    passed: usize,
+    failed: usize,
+    total: usize,
+    required: usize,
+) -> String {
+    format!(
+        "\n--- Verification (Iteration {iteration}): {status} ({passed} passed, {failed} failed, {total} total, {required} required) ---\n"
+    )
+}
+
 /// Apply the decision's fix-progress bookkeeping to the loop context.
 fn apply_fix_progress(
     ctx: &mut LoopContext,
@@ -280,8 +312,7 @@ pub(crate) async fn handle_evaluate_verification(
 
     // Log verification results to output_log so the summary AI has context
     {
-        let summary_line = format!(
-            "\n--- Verification (Iteration {}): {} ({} passed, {} failed, {} total, {} required) ---\n",
+        let summary_line = verification_summary_line(
             ctx.iteration,
             status,
             verification_result.passed_steps,
@@ -357,8 +388,9 @@ pub(crate) async fn handle_evaluate_verification(
         .await;
 
     // Persist workflow state: VerificationComplete. `passed` is the decision's,
-    // not the producer's `all_passed`, which is vacuously true over a set with
-    // no required step.
+    // not the producer's `all_passed`: the decision tests for a required step
+    // first, so it holds even where a producer reports a set with no required
+    // step as `all_passed`.
     effects.persist_state(
         &config.execution_id,
         &UnifiedWorkflowState::verification_complete(
@@ -770,12 +802,15 @@ pub(super) mod evaluate_verification_arming {
         }
     }
 
-    /// ARMING (plan Phase 1, seam class `gate`). A unified-workflow verification
-    /// that checked nothing does not complete the loop as a pass. The input is
-    /// an empty step list fed the `all_passed: true` that both empty producer
-    /// arms returned. An all-`dev_mode_only` verification reaches the handler in
-    /// exactly this shape in a build without debug assertions, because
-    /// `run_verification` filters every step out first.
+    /// The plan's Phase 1 arming test. Its Arming line names seam class `gate`;
+    /// the PR's arming record declares `seam_class: none` and cites the mutants
+    /// that turn this test red. A unified-workflow verification that checked
+    /// nothing does not complete the loop as a pass. The input is an empty step
+    /// list fed the `all_passed: true` that both empty producer arms returned
+    /// before Phase 1. They now return `all_passed: false`, so this pins the
+    /// handler's own guard. An all-`dev_mode_only` verification in a build
+    /// without debug assertions reaches the handler with no step result,
+    /// because `run_verification` filters every step out first.
     ///
     /// It enters through the handler that every unified workflow run calls
     /// (`run_loop_state_machine` → `handle_evaluate_verification`). Before
@@ -854,9 +889,12 @@ mod evaluate_verification_tests {
             "{}",
             describe(&state)
         );
-        assert_eq!(
-            ctx.iteration_results[0].failure_context,
-            NOTHING_CHECKED_CONTEXT
+        assert!(
+            ctx.iteration_results[0]
+                .failure_context
+                .contains("nothing was checked and the run is not verified"),
+            "{}",
+            ctx.iteration_results[0].failure_context
         );
         let outputs = effects.outputs.lock().unwrap();
         assert_eq!(

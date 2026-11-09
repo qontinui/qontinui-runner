@@ -162,9 +162,11 @@ pub fn decide_preconditions(snap: &PreconditionsSnapshot) -> PreconditionDecisio
 #[derive(Debug, Clone)]
 pub struct VerificationEvalSnapshot {
     /// The producer's `all_passed`: every REQUIRED step passed. Never read
-    /// alone. Over a set with no required step the shared fold is a vacuous
-    /// `all()` (`step_executor/verification_execution.rs`) and reports `true`,
-    /// so `required_steps` is tested first.
+    /// alone: `required_steps` is tested first. The shared fold
+    /// (`step_executor/verification_execution.rs`) reports `false` over a set
+    /// with no required step, so that order is defense in depth against a
+    /// producer that reports `true` there, as every producer did before plan
+    /// 2026-11-06-a-product-workflow-verification-with-nothing-to-check-never-reports-passed.
     pub all_passed: bool,
     /// How many step results are required, counted by `required_step_count`.
     /// Zero means nothing was checked: an empty step list, every step
@@ -218,9 +220,9 @@ pub enum VerificationEvalDecision {
 /// *before* fix-progress bookkeeping, so we don't attach a
 /// `FixProgressUpdate` to them — they're terminal regardless.
 pub fn decide_evaluate_verification(snap: &VerificationEvalSnapshot) -> VerificationEvalDecision {
-    // Before `all_passed`: a set with no required step reports `all_passed`
-    // vacuously, and testing that first turned "nothing was checked" into a
-    // pass.
+    // Before `all_passed`: a producer that reports `all_passed` over a set
+    // with no required step (every producer did, before this plan) would
+    // otherwise turn "nothing was checked" into a pass.
     if snap.required_steps == 0 {
         return VerificationEvalDecision::NoVerificationSteps;
     }

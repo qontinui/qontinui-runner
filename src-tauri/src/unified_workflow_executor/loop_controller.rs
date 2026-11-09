@@ -543,7 +543,7 @@ impl LoopController {
             && resume_manager.prior_stages_checked_nothing(&config.execution_id);
         if self.stages_checked_nothing {
             warn!(
-                "Resuming a run in which a stage checked nothing (no required verification step): the workflow cannot report passed"
+                "Resuming a run in which a stage checked nothing (no required verification step), or whose stage record could not be read: the workflow cannot report passed"
             );
         }
 
@@ -1986,7 +1986,7 @@ impl LoopController {
                 // cause to name, even when a later stage passed.
                 match &first_checked_nothing {
                     Some((stage, lr)) => format!("Stage {}: {}", stage, lr.summary()),
-                    None => "A stage before this resume checked nothing (no required verification step ran), so the workflow is not verified".to_string(),
+                    None => "A stage before this resume checked nothing (no required verification step ran), or its record could not be read, so the workflow is not verified".to_string(),
                 }
             } else if let Some(ref lr) = last_loop_result {
                 if lr.max_iterations_reached {
