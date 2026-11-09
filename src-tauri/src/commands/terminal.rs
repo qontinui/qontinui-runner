@@ -1528,6 +1528,37 @@ pub fn terminal_session_rebind_terminal(
     })
 }
 
+/// Make an open session record's recorded zone follow the grid zone its LIVE
+/// terminal renders in.
+///
+/// Called by the frontend zone backstop (`useRecordedZoneBackstop`) for a
+/// session it sees for the first time — a record this page never wrote, such
+/// as one recorded by the `POST /terminals` spawn seam or the typed-line sniff,
+/// both of which have no view of the grid and record zone 0.
+///
+/// Deliberately neither [`terminal_session_record_open`] (refreshes
+/// `last_seen_at`, which makes ghost rows immortal) nor
+/// [`terminal_session_rebind_terminal`] (re-points the terminal and stamps the
+/// terminal-only restore tier — this is no restore). See
+/// [`SessionLifecycleStore::sync_zone`] for the guard: open record, bound to
+/// exactly `terminal_id`, zone differs.
+///
+/// A frontend command only: NOT in `UI_BRIDGE_COMMANDS`.
+#[tauri::command]
+pub fn terminal_session_sync_zone(
+    store: tauri::State<'_, Arc<SessionLifecycleStore>>,
+    claude_session_id: String,
+    terminal_id: String,
+    zone_index: i32,
+) -> Result<CommandResponse, String> {
+    let outcome = store.sync_zone(&claude_session_id, &terminal_id, zone_index);
+    Ok(CommandResponse {
+        success: true,
+        message: None,
+        data: Some(serde_json::json!(outcome)),
+    })
+}
+
 /// Mark a session restore-pending in the lifecycle registry: a resume is
 /// about to type `claude --resume` into a freshly-created plain shell and the
 /// handshake is not yet verified. While the marker is set the backend liveness
@@ -3292,6 +3323,7 @@ pub fn plugin() -> TauriPlugin<tauri::Wry> {
             terminal_session_mark_restore_pending,
             terminal_session_clear_restore_pending,
             terminal_session_rebind_terminal,
+            terminal_session_sync_zone,
             terminal_report_tree_reset,
             terminal_report_bridge_registration_failure,
         ])

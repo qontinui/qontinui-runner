@@ -16,7 +16,11 @@ const invoke = vi.hoisted(() => vi.fn((..._args: unknown[]) => Promise.resolve(n
 vi.mock("@tauri-apps/api/core", () => ({ invoke }));
 
 import { hooksHarness as harness } from "@/lib/__test-helpers__/hooks-harness";
-import { ZONE_BACKSTOP_DEBOUNCE_MS, useRecordedZoneBackstop } from "./useRecordedZoneBackstop";
+import {
+  ZONE_BACKSTOP_DEBOUNCE_MS,
+  useRecordedZoneBackstop,
+  zoneSyncRestoreComplete,
+} from "./useRecordedZoneBackstop";
 import type { RecordedZoneLedger } from "./sessionRecordArgs";
 import type { TerminalWorkMode } from "./terminalWorkMode";
 import type { ZoneAssignments } from "./useZoneLayout";
@@ -28,13 +32,23 @@ const tabs = [
 
 function mount(ledger: RecordedZoneLedger) {
   harness.reset();
-  let props: { workMode: TerminalWorkMode; assignments: ZoneAssignments } = {
+  let props: {
+    workMode: TerminalWorkMode;
+    assignments: ZoneAssignments;
+    restoreComplete?: boolean;
+  } = {
     workMode: "grid",
     assignments: {},
   };
   function Host() {
     harness.beginRender();
-    useRecordedZoneBackstop({ ...props, tabs, pageId: "p", recordedZones: ledger });
+    useRecordedZoneBackstop({
+      restoreComplete: true,
+      ...props,
+      tabs,
+      pageId: "p",
+      recordedZones: ledger,
+    });
   }
   return (next: typeof props) => {
     props = next;
@@ -43,13 +57,20 @@ function mount(ledger: RecordedZoneLedger) {
   };
 }
 
-/** The `[sessionId, zoneIndex]` pairs the backstop recorded. */
-function recorded(): Array<[string, number]> {
-  return invoke.mock.calls.map((call) => {
-    const args = call[1] as { claudeSessionId: string; zoneIndex: number };
-    return [args.claudeSessionId, args.zoneIndex];
-  });
+/** The `[sessionId, zoneIndex]` pairs the backstop sent to `command`. */
+function sentTo(command: string): Array<[string, number]> {
+  return invoke.mock.calls
+    .filter((call) => call[0] === command)
+    .map((call) => {
+      const args = call[1] as { claudeSessionId: string; zoneIndex: number };
+      return [args.claudeSessionId, args.zoneIndex];
+    });
 }
+
+/** The `[sessionId, zoneIndex]` pairs the backstop re-recorded with `record_open`. */
+const recorded = () => sentTo("terminal_session_record_open");
+/** The `[sessionId, zoneIndex]` pairs the backstop zone-synced. */
+const synced = () => sentTo("terminal_session_sync_zone");
 
 beforeEach(() => {
   vi.useFakeTimers();
@@ -89,5 +110,95 @@ describe("useRecordedZoneBackstop", () => {
     render({ workMode: "tmux", assignments: { 0: "b" } });
     render({ workMode: "grid", assignments: { 0: "a", 2: "b" } });
     expect(recorded()).toEqual([["sess-b", 2]]);
+  });
+
+  it("grid mode: a session this page never wrote is zone-synced, never re-recorded", () => {
+    // Empty ledger: both records were written by the backend (a
+    // `POST /terminals` session is recorded at zone 0), not by this page.
+    const ledger: RecordedZoneLedger = new Map();
+    mount(ledger)({ workMode: "grid", assignments: { 1: "a", 2: "b" } });
+    expect(recorded()).toEqual([]);
+    expect(synced()).toEqual([
+      ["sess-a", 1],
+      ["sess-b", 2],
+    ]);
+    // Keyed by the tab id — the id the backend stored as the record's terminal.
+    expect(invoke.mock.calls.map((call) => call[1])).toEqual([
+      { claudeSessionId: "sess-a", terminalId: "a", zoneIndex: 1 },
+      { claudeSessionId: "sess-b", terminalId: "b", zoneIndex: 2 },
+    ]);
+  });
+
+  it("grid mode: a first-seen session is synced once, not on every pass", () => {
+    const ledger: RecordedZoneLedger = new Map();
+    const render = mount(ledger);
+    render({ workMode: "grid", assignments: { 1: "a", 2: "b" } });
+    render({ workMode: "grid", assignments: { 1: "a", 2: "b" } });
+    expect(synced()).toEqual([
+      ["sess-a", 1],
+      ["sess-b", 2],
+    ]);
+  });
+
+  it("tmux mode: nothing is zone-synced either, and the ledger is not seeded", () => {
+    const ledger: RecordedZoneLedger = new Map();
+    const render = mount(ledger);
+    render({ workMode: "tmux", assignments: { 0: "b" } });
+    expect(invoke).not.toHaveBeenCalled();
+    expect(ledger.size).toBe(0);
+    // Back in grid mode the never-written sessions are first-seen there.
+    render({ workMode: "grid", assignments: { 0: "a", 3: "b" } });
+    expect(synced()).toEqual([
+      ["sess-a", 0],
+      ["sess-b", 3],
+    ]);
+    expect(recorded()).toEqual([]);
+  });
+
+  it("before the page's restore finishes, a first-seen session is neither synced nor seeded", () => {
+    // A webview reload: reconnected tabs sit in localStorage / auto-fill zones
+    // while the durable record is still what restore reads.
+    const ledger: RecordedZoneLedger = new Map();
+    const render = mount(ledger);
+    render({ workMode: "grid", assignments: { 1: "a", 2: "b" }, restoreComplete: false });
+    expect(invoke).not.toHaveBeenCalled();
+    expect(ledger.size).toBe(0);
+    // Restore done: the same sessions are first-seen now, at their live zones.
+    render({ workMode: "grid", assignments: { 0: "a", 2: "b" }, restoreComplete: true });
+    expect(synced()).toEqual([
+      ["sess-a", 0],
+      ["sess-b", 2],
+    ]);
+  });
+
+  it("before the page's restore finishes, a session this page wrote still follows its zone", () => {
+    const ledger: RecordedZoneLedger = new Map([["sess-a", 0]]);
+    mount(ledger)({ workMode: "grid", assignments: { 3: "a", 1: "b" }, restoreComplete: false });
+    expect(recorded()).toEqual([["sess-a", 3]]);
+    expect(synced()).toEqual([]);
+    expect(ledger.has("sess-b")).toBe(false);
+  });
+
+  it("flipping only restoreComplete re-runs the pass (same assignments object)", () => {
+    const ledger: RecordedZoneLedger = new Map();
+    const render = mount(ledger);
+    const assignments: ZoneAssignments = { 1: "a", 2: "b" };
+    render({ workMode: "grid", assignments, restoreComplete: false });
+    expect(invoke).not.toHaveBeenCalled();
+    render({ workMode: "grid", assignments, restoreComplete: true });
+    expect(synced()).toEqual([
+      ["sess-a", 1],
+      ["sess-b", 2],
+    ]);
+  });
+});
+
+describe("zoneSyncRestoreComplete", () => {
+  it("is true only for a page whose restore completed and was not drain-deferred", () => {
+    expect(zoneSyncRestoreComplete(new Set(["p"]), new Set(), "p")).toBe(true);
+    expect(zoneSyncRestoreComplete(new Set(), new Set(), "p")).toBe(false);
+    // A drain-deferred page has its gate open but restore has placed nothing.
+    expect(zoneSyncRestoreComplete(new Set(["p"]), new Set(["p"]), "p")).toBe(false);
+    expect(zoneSyncRestoreComplete(new Set(["p"]), new Set(["q"]), "p")).toBe(true);
   });
 });

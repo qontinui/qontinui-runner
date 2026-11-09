@@ -157,6 +157,22 @@ export function noteRecordedZone(
   ledger.set(claudeSessionId, zoneIndex);
 }
 
+/** What {@link planZoneReemits} decided for one pass over the live layout. */
+export interface ZoneReemitPlan {
+  /**
+   * Sessions whose record THIS page wrote, at a zone that no longer matches
+   * the live one — re-asserted with `terminal_session_record_open`.
+   */
+  reemits: ZoneObservation[];
+  /**
+   * Sessions seen for the first time, whose record this page never wrote —
+   * reconciled with `terminal_session_sync_zone`, which moves the recorded
+   * zone ONLY (never `last_seen_at`, never the binding, never a restore tier),
+   * and only when the open record is bound to this very terminal.
+   */
+  firstSeen: ZoneObservation[];
+}
+
 /**
  * Decide which observed placements disagree with the durable record and must
  * be re-emitted, updating `ledger` to match and pruning sessions that no
@@ -166,16 +182,22 @@ export function noteRecordedZone(
  *
  *  1. **Known recorded zone, unchanged** → nothing. A re-render that moved
  *     nothing emits nothing.
- *  2. **Known recorded zone, different** → re-emit. Covers both directions:
- *     an operator drag into a zone, AND a drag that leaves the tab unassigned
- *     (`-1` is a real recorded value, so the record follows it down too).
- *  3. **No recorded zone for this session** → seed silently, no emit. This is
- *     a record THIS page never wrote — i.e. one the boot-restore path owns.
- *     Re-asserting `terminal_session_record_open` for it would refresh
- *     `last_seen_at` on rows the restore deliberately left alone, which is
- *     precisely how ghost records were made immortal (see the
- *     `terminal_session_rebind_terminal` doc comment). Restore-owned records
- *     therefore keep their recorded placement until a live writer moves them.
+ *  2. **Known recorded zone, different** → re-emit (`reemits`). Covers both
+ *     directions: an operator drag into a zone, AND a drag that leaves the tab
+ *     unassigned (`-1` is a real recorded value, so the record follows it down
+ *     too).
+ *  3. **No recorded zone for this session** → seed the ledger and report it
+ *     in `firstSeen`. This is a record THIS page never wrote: one a backend
+ *     writer recorded (a `POST /terminals` session, recorded at zone 0 by the
+ *     spawn seam or the typed-line sniff, which have no view of the grid) or
+ *     one the boot-restore path owns. Re-asserting
+ *     `terminal_session_record_open` for it would refresh `last_seen_at` on
+ *     rows nothing live has touched, which is precisely how ghost records were
+ *     made immortal (see the `terminal_session_rebind_terminal` doc comment),
+ *     so case 3 never re-emits. Its zone is reconciled by the zone-only
+ *     `terminal_session_sync_zone` instead, which the backend applies only to
+ *     an OPEN record bound to the observed terminal — a restore-owned row that
+ *     still names its dead pre-restart terminal is left alone.
  *
  * Pure apart from the two explicit mutations of `ledger`, so the whole
  * re-resolution contract is unit-testable without React or Tauri.
@@ -183,8 +205,9 @@ export function noteRecordedZone(
 export function planZoneReemits(
   ledger: RecordedZoneLedger,
   observed: readonly ZoneObservation[],
-): ZoneObservation[] {
-  const emits: ZoneObservation[] = [];
+): ZoneReemitPlan {
+  const reemits: ZoneObservation[] = [];
+  const firstSeen: ZoneObservation[] = [];
   const seen = new Set<string>();
 
   for (const obs of observed) {
@@ -192,18 +215,41 @@ export function planZoneReemits(
     const recorded = ledger.get(obs.claudeSessionId);
     if (recorded === undefined) {
       ledger.set(obs.claudeSessionId, obs.zoneIndex);
+      firstSeen.push(obs);
       continue;
     }
     if (recorded === obs.zoneIndex) continue;
     ledger.set(obs.claudeSessionId, obs.zoneIndex);
-    emits.push(obs);
+    reemits.push(obs);
   }
 
   for (const sid of [...ledger.keys()]) {
     if (!seen.has(sid)) ledger.delete(sid);
   }
 
-  return emits;
+  return { reemits, firstSeen };
+}
+
+/**
+ * Args for the `terminal_session_sync_zone` Tauri command: move an open
+ * record's recorded zone to the zone its live terminal renders in.
+ * `terminalId` is the tab id, which IS the backend terminal id (a
+ * `terminal-created` ingest builds the tab with `id: info.id`), so the
+ * backend's equality guard compares like with like.
+ */
+export type SessionSyncZoneArgs = {
+  claudeSessionId: string;
+  terminalId: string;
+  zoneIndex: number;
+};
+
+/** Build the {@link SessionSyncZoneArgs} for one first-seen observation. */
+export function buildSessionSyncZoneArgs(obs: ZoneObservation): SessionSyncZoneArgs {
+  return {
+    claudeSessionId: obs.claudeSessionId,
+    terminalId: obs.tabId,
+    zoneIndex: obs.zoneIndex,
+  };
 }
 
 /**

@@ -117,3 +117,48 @@ export function buildMaximizeResult(
     changed: previous !== next,
   };
 }
+
+/**
+ * The `get-zone-view-state` envelope (plan
+ * `2026-11-08-tenant-badge-parity-and-oracle-fixtures`, Phase 4).
+ *
+ * Besides the maximized-view fields it carries what an eval-free caller needs
+ * to build and place terminals without reading the webview's `localStorage`
+ * (which the exe-mode CSP refuses to evaluate):
+ *
+ * - `pageId` — the terminal page this view shows. A terminal created over
+ *   `POST /terminals` with that `page_id` mounts here; one on any other page is
+ *   unwatched.
+ * - `assignments` — the GRID zone map (zone index → tab id), the same map the
+ *   session recorder resolves a session's zone from. Copied, so a caller can
+ *   never mutate the live ref through the envelope.
+ * - `workMode` — `grid` | `tmux`. In tmux mode one viewport is not a grid, so
+ *   a caller asserting grid placement must refuse there.
+ */
+export interface ZoneViewState {
+  maximizedZone: number | null;
+  zoneCount: number;
+  layoutId: string;
+  pageId: string;
+  assignments: Record<number, string>;
+  workMode: TerminalWorkMode;
+}
+
+/** Build the `get-zone-view-state` envelope from the values read at invocation. */
+export function buildZoneViewState(input: {
+  maximizedZone: number | null;
+  zoneCount: number;
+  layoutId: string;
+  pageId: string;
+  assignments: Readonly<Record<number, string>>;
+  workMode: TerminalWorkMode;
+}): ZoneViewState {
+  return {
+    maximizedZone: input.maximizedZone,
+    zoneCount: input.zoneCount,
+    layoutId: input.layoutId,
+    pageId: input.pageId,
+    assignments: { ...input.assignments },
+    workMode: input.workMode,
+  };
+}
