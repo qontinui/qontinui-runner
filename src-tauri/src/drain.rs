@@ -710,10 +710,7 @@ mod tests {
     /// `stash create` has a base commit to diff against.
     fn init_repo(dir: &std::path::Path) {
         let run = |args: &[&str]| {
-            let out = git_in(dir)
-                .args(args)
-                .output()
-                .expect("git spawn");
+            let out = git_in(dir).args(args).output().expect("git spawn");
             assert!(
                 out.status.success(),
                 "git {:?} failed: {}",
@@ -794,10 +791,7 @@ mod tests {
         std::fs::write(dir.join("seed.txt"), "seed\nlocal edit\n").unwrap();
         std::fs::write(dir.join("scratch.txt"), "uncommitted\n").unwrap();
         // Stage so `stash create` captures it (create stashes the index + tree).
-        git_in(&dir)
-            .args(["add", "-A"])
-            .output()
-            .unwrap();
+        git_in(&dir).args(["add", "-A"]).output().unwrap();
 
         let sid = stable_ai_session_id("task-dirty");
         let wrote = capture_wip_ref(
@@ -832,10 +826,7 @@ mod tests {
         // Dirty the tree: modify a tracked file + add an untracked file.
         std::fs::write(dir.join("seed.txt"), "seed\nWIP edit\n").unwrap();
         std::fs::write(dir.join("scratch.txt"), "uncommitted\n").unwrap();
-        git_in(&dir)
-            .args(["add", "-A"])
-            .output()
-            .unwrap();
+        git_in(&dir).args(["add", "-A"]).output().unwrap();
 
         let sid = stable_ai_session_id("task-roundtrip");
         let ref_name = format!("refs/wip/{sid}");

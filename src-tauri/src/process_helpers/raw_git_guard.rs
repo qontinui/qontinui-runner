@@ -195,7 +195,8 @@ fn the_detector_catches_a_raw_spawn_and_honours_the_marker() {
     assert_eq!(raw_git_spawns(multi_sig), (vec![8], 0));
     // A braceless head whose initializer line carries balanced braces
     // and ends in `;` ends there.
-    let struct_init = "#[cfg(test)]\nstatic S: Foo =\n    Foo { a: 1 };\nfn prod() { Command::new(\"git\"); }\n";
+    let struct_init =
+        "#[cfg(test)]\nstatic S: Foo =\n    Foo { a: 1 };\nfn prod() { Command::new(\"git\"); }\n";
     assert_eq!(raw_git_spawns(struct_init), (vec![4], 0));
     for spelling in [
         "tokio::process::Command::new(\"git\")",
@@ -287,7 +288,8 @@ fn the_all_lines_detector_reports_test_code_and_honours_the_marker() {
     assert_eq!(raw_git_spawns_all_lines(test_mod), (vec![4], vec![]));
     // The production arm still skips the same text.
     assert_eq!(raw_git_spawns(test_mod), (vec![], 0));
-    let marked = "#[cfg(test)]\nmod t {\n    fn g() {\n        // git-env-ok: re-exec control,\n        \
+    let marked =
+        "#[cfg(test)]\nmod t {\n    fn g() {\n        // git-env-ok: re-exec control,\n        \
                   // reads the inherited decoy.\n        Command::new(\"git\");\n    }\n}\n";
     assert_eq!(raw_git_spawns_all_lines(marked), (vec![], vec![6]));
     let commented = "#[cfg(test)]\nmod t {\n    // let c = Command::new(\"git\");\n    \
@@ -298,5 +300,8 @@ fn the_all_lines_detector_reports_test_code_and_honours_the_marker() {
         "// git-env-ok: too far.\n{}fn g() {{ Command::new(\"git\"); }}\n",
         "\n".repeat(MARKER_WINDOW)
     );
-    assert_eq!(raw_git_spawns_all_lines(&far), (vec![MARKER_WINDOW + 2], vec![]));
+    assert_eq!(
+        raw_git_spawns_all_lines(&far),
+        (vec![MARKER_WINDOW + 2], vec![])
+    );
 }

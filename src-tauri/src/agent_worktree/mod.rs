@@ -3365,10 +3365,7 @@ mod tests {
         let path = dir.path();
         let p = path.to_str().unwrap();
         let git = |args: &[&str]| {
-            let out = git_in(p)
-                .args(args)
-                .output()
-                .unwrap();
+            let out = git_in(p).args(args).output().unwrap();
             assert!(
                 out.status.success(),
                 "git {args:?} failed: {}",
@@ -4239,10 +4236,7 @@ mod tests {
     fn checkout_shared_branches_rolls_back_on_a_later_failure() {
         let init = |dir: &std::path::Path| -> String {
             let git = |args: &[&str]| {
-                let out = git_in(dir)
-                    .args(args)
-                    .output()
-                    .unwrap();
+                let out = git_in(dir).args(args).output().unwrap();
                 assert!(out.status.success(), "git {args:?}: {out:?}");
                 String::from_utf8(out.stdout).unwrap().trim().to_string()
             };
@@ -4291,10 +4285,7 @@ mod tests {
     #[test]
     fn checkout_shared_branches_rollback_keeps_a_branch_that_already_existed() {
         let git = |dir: &std::path::Path, args: &[&str]| {
-            let out = git_in(dir)
-                .args(args)
-                .output()
-                .unwrap();
+            let out = git_in(dir).args(args).output().unwrap();
             assert!(out.status.success(), "git {args:?}: {out:?}");
             String::from_utf8(out.stdout).unwrap().trim().to_string()
         };
@@ -4345,10 +4336,7 @@ mod tests {
         let path = dir.path();
         let p = path.to_str().unwrap();
         let git = |args: &[&str]| {
-            let out = git_in(p)
-                .args(args)
-                .output()
-                .unwrap();
+            let out = git_in(p).args(args).output().unwrap();
             assert!(out.status.success(), "git {args:?} failed");
         };
         git(&["init", "-q", "-b", "main"]);
@@ -4370,10 +4358,7 @@ mod tests {
         // Clean tree on `main`, switching to a NEW branch → allowed.
         assert!(checkout_shared_branch(path, "agent/clean", parent).is_ok());
         // Switch back to main so the next case starts off-target.
-        git_in(p)
-            .args(["checkout", "-q", "main"])
-            .output()
-            .unwrap();
+        git_in(p).args(["checkout", "-q", "main"]).output().unwrap();
 
         // Dirty the tree, then attempt a switch to a different branch → bail.
         std::fs::write(path.join("a.txt"), b"dirty").unwrap();

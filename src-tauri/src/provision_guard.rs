@@ -854,7 +854,8 @@ mod tests {
         fn snapshot(repo: &Path) -> RepoSnapshot {
             let git_dir = repo.join(".git");
             let read = |name: &str| {
-                std::fs::read(git_dir.join(name)).unwrap_or_else(|e| panic!("read .git/{name}: {e}"))
+                std::fs::read(git_dir.join(name))
+                    .unwrap_or_else(|e| panic!("read .git/{name}: {e}"))
             };
             RepoSnapshot {
                 index: read("index"),
@@ -868,7 +869,11 @@ mod tests {
         /// Asserts `dir` is the top level of its OWN repository, not a path
         /// resolved through someone else's `GIT_DIR`.
         fn assert_own_repo(dir: &Path) {
-            assert!(dir.join(".git").is_dir(), "{} has no .git of its own", dir.display());
+            assert!(
+                dir.join(".git").is_dir(),
+                "{} has no .git of its own",
+                dir.display()
+            );
             let top = scrubbed_git(dir, &["rev-parse", "--show-toplevel"]);
             assert_eq!(
                 std::fs::canonicalize(&top).expect("canonicalize toplevel"),
@@ -889,7 +894,12 @@ mod tests {
 
         fn assert_head_is_a_commit(dir: &Path) {
             let kind = scrubbed_git(dir, &["cat-file", "-t", "HEAD"]);
-            assert_eq!(kind, "commit", "{}'s own HEAD must resolve to a commit", dir.display());
+            assert_eq!(
+                kind,
+                "commit",
+                "{}'s own HEAD must resolve to a commit",
+                dir.display()
+            );
         }
 
         #[test]
@@ -968,7 +978,16 @@ mod tests {
             trust_git(tg.path(), &["add", "tg.txt"]);
             trust_git(
                 tg.path(),
-                &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "tg"],
+                &[
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "commit",
+                    "-q",
+                    "-m",
+                    "tg",
+                ],
             );
             assert_own_repo(tg.path());
             assert_head_is_a_commit(tg.path());
