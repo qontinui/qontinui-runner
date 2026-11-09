@@ -1752,7 +1752,12 @@ mod tests {
         }
         // Restore, then release, BEFORE `finish()`: on a dead-port sink with
         // no device JWT it takes seconds, and every env-touching test in the
-        // binary would queue behind this lock for them.
+        // binary would queue behind this lock for them. The job goes first,
+        // still inside the lock: it holds `ci_node`'s process-wide dispatch
+        // counts (a containment, and an uncontained run when it could not
+        // make one), and a slice-telemetry test that takes the lock next would
+        // read them as a CI job running beside session work.
+        drop(ci_job);
         drop(restore);
         drop(env_guard);
 
@@ -1879,13 +1884,16 @@ mod tests {
             ("CI".to_string(), "true".to_string()),
             ("CLAUDE_CONFIG_DIR".to_string(), pinned.clone()),
         ];
-        // Inside the lock: cgroup discovery reads `QONTINUI_CI_CGROUP_ROOT`.
-        let ci_job = {
-            let _env = crate::test_env::env_lock();
-            CiJob::create("apply-step-env-test")
-        };
+        // Inside the lock: cgroup discovery reads `QONTINUI_CI_CGROUP_ROOT`,
+        // and the job holds `ci_node`'s process-wide dispatch counts, which a
+        // slice-telemetry test holding the lock must not see move, so it is
+        // made and dropped while the lock is held.
+        let env = crate::test_env::env_lock();
+        let ci_job = CiJob::create("apply-step-env-test");
         let mut cmd = build_step_command("probe", &[]);
         apply_step_env(&mut cmd, tmp.path(), &removals, &envs, &ci_job);
+        drop(ci_job);
+        drop(env);
 
         let set: std::collections::HashMap<String, Option<String>> = cmd
             .as_std()
@@ -2196,11 +2204,13 @@ fn tokio_no_window(program: &str) {}
         );
         let cancel = CancellationToken::new();
         let sink = ProgressSink::tail_only();
-        // Inside the lock: cgroup discovery reads `QONTINUI_CI_CGROUP_ROOT`.
-        let ci_job = {
-            let _env = crate::test_env::env_lock();
-            CiJob::create(dispatch_id)
-        };
+        // Inside the lock: cgroup discovery reads `QONTINUI_CI_CGROUP_ROOT`,
+        // and the job holds `ci_node`'s process-wide dispatch counts (an
+        // uncontained run when it could not make a cgroup), which a
+        // slice-telemetry test holding the lock must not see move. So the job
+        // lives and is dropped inside the lock.
+        let env = crate::test_env::env_lock();
+        let ci_job = CiJob::create(dispatch_id);
         let outcome = run_step(
             &step,
             &dispatch_env,
@@ -2212,6 +2222,8 @@ fn tokio_no_window(program: &str) {}
             &cancel,
         )
         .await;
+        drop(ci_job);
+        drop(env);
         let tail = sink.finish().await;
         (outcome, tail)
     }
