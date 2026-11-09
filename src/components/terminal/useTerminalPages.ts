@@ -101,6 +101,32 @@ function savePages(pages: TerminalPageConfig[]) {
 }
 
 /**
+ * The page-id prefixes of the runner's typed spawn pages. MUST equal
+ * `SpawnGroup::page_prefix` in `src-tauri/src/terminal/spawn_pages.rs`, which
+ * places every autonomous spawn on a `<prefix>-<n>` page.
+ */
+export const SPAWN_GROUP_PAGE_PREFIXES = [
+  "post-merge",
+  "pr",
+  "impl",
+  "fixer",
+  "stewards",
+  "checks",
+  "resume",
+  "spawned",
+] as const;
+
+const SPAWN_GROUP_PAGE_RE = new RegExp(`^(?:${SPAWN_GROUP_PAGE_PREFIXES.join("|")})-[1-9][0-9]*$`);
+
+/**
+ * Is `id` a typed spawn page — `post-merge-2`, `impl-1`, `stewards-1`? The
+ * runner stores no label for such a page because its id IS its title.
+ */
+export function isSpawnGroupPageId(id: string): boolean {
+  return SPAWN_GROUP_PAGE_RE.test(id);
+}
+
+/**
  * Pure reconciliation: union the persisted page tabs with the distinct backend
  * page_ids, synthesizing a tab for any backend id NOT already persisted so a
  * minted page (and continuations restored onto it) get a visible, selectable
@@ -111,7 +137,8 @@ function savePages(pages: TerminalPageConfig[]) {
  * then render nowhere. Synthesizing it here (named "Terminal", its canonical
  * name) is what keeps such a terminal reachable instead of orphaned.
  * Operator-created pages and their names are left intact (only ADD missing ids;
- * never rename/remove existing). Synthesized names come from
+ * never rename/remove existing). A typed spawn page (`isSpawnGroupPageId`)
+ * is named by its own id. Every other synthesized name comes from
  * `nextAutoPageName` over the persisted roster plus the names already
  * synthesized in the same pass — never from a COUNT, which collided with
  * existing "Page N" tabs (finding `8c9e1419`). Synthesized pages carry
@@ -409,11 +436,20 @@ export function reconcilePages(
   const now = Date.now();
   const roster: TerminalPageConfig[] = [...persisted];
   for (const id of missing) {
-    // "default" keeps its canonical name (matches `loadPages`); any other
-    // minted id gets the next free "Page N" over everything named so far.
+    // "default" keeps its canonical name (matches `loadPages`); a typed spawn
+    // page (`post-merge-2`, `stewards-1`) is titled by its id, which IS its
+    // name (de-duplicated by `uniquePageName` only if an operator already took
+    // that name, and never a "Page N", so `nextAutoPageName` never counts it);
+    // any other minted id gets the next free "Page N" over everything named so
+    // far.
     roster.push({
       id,
-      name: id === "default" ? DEFAULT_PAGE_NAME : nextAutoPageName(roster),
+      name:
+        id === "default"
+          ? DEFAULT_PAGE_NAME
+          : isSpawnGroupPageId(id)
+            ? uniquePageName(id, roster)
+            : nextAutoPageName(roster),
       createdAt: now,
       origin: "auto",
     });

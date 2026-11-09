@@ -38,6 +38,7 @@ mod scan_gate;
 pub mod scan_interval;
 pub mod session;
 pub mod session_carry;
+pub(crate) mod spawn_pages;
 pub mod transcript;
 pub mod transcript_watcher;
 #[cfg(test)]

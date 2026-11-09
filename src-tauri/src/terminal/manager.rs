@@ -809,8 +809,10 @@ impl TerminalManager {
     /// ([`super::page_placement::pick_page_for_new_session`]) over this
     /// manager's live terminals and `store`'s rows awaiting restore. So no
     /// unpaged caller — `POST /terminals` without `pageId`, the tauri_proxy
-    /// create, the web-relay create, stewards, the SessionRegistry transports — can pile onto
-    /// `default` past the ceiling. `None` here always means "place
+    /// create, the web-relay create, the SessionRegistry transports — can pile onto
+    /// `default` past the ceiling, or onto a typed spawn page
+    /// ([`super::spawn_pages`]; stewards and the other autonomous spawns pass
+    /// their typed page explicitly). `None` here always means "place
     /// automatically": the operator-attended `terminal_create` command maps
     /// the webview's null-for-default to `"default"` first
     /// ([`super::page_placement::operator_page`]). Adoption (`insert_with_io`)
