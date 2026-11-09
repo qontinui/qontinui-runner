@@ -930,21 +930,31 @@ mod tests {
         let out = provision_fleet_skills_into(&skills_dir, &AgentSkillRegistry::new(), None)
             .expect("provision");
 
-        assert_eq!(out.skipped.len(), 1, "the tracked file should be skipped");
         // The reason, not just the count — that pairing is the deliverable.
-        assert_eq!(
-            out.skipped[0].reason,
-            crate::capability_manifest::SkipReason::GitTracked
-        );
+        let tracked_skips: Vec<_> = out
+            .skipped
+            .iter()
+            .filter(|s| s.reason == crate::capability_manifest::SkipReason::GitTracked)
+            .collect();
+        assert_eq!(tracked_skips.len(), 1, "the tracked file should be skipped");
         assert!(
-            out.skipped[0].unit.ends_with(SKILL_MANIFEST),
+            tracked_skips[0].unit.ends_with(SKILL_MANIFEST),
             "the skipped unit must name the file, got {:?}",
-            out.skipped[0].unit
+            tracked_skips[0].unit
         );
         assert!(out.is_degraded(), "a skipped unit means the pass degraded");
+        // The repo now VERSIONS `.claude/skills`, so every other embedded file
+        // is absent and untracked there and is NOT created (plan
+        // 2026-11-09-a-provisioned-copy-of-an-upstream-added-file-wedges-the-served-checkout-fast-forward
+        // Phase 2) — including whole skill directories the repo never had.
+        assert_eq!(out.written, 0);
         assert!(
-            out.written > 0,
-            "every OTHER embedded file should still be written"
+            out.skipped
+                .iter()
+                .filter(|s| s.reason != crate::capability_manifest::SkipReason::GitTracked)
+                .all(|s| s.reason == crate::capability_manifest::SkipReason::RootVersioned),
+            "every other unit is skipped as root_versioned, got {:?}",
+            out.skipped
         );
         assert_eq!(
             std::fs::read_to_string(&tracked).unwrap(),
