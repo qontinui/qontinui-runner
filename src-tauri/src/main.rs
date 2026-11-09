@@ -2748,7 +2748,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         // AppManifest is defined (`tauri-2.10.3/src/webview/mod.rs:1801-1806`).
         //
         // `ui_bridge_plugin` remains the one exception — its handler fns are
-        // non-`pub` and the frontend talks to them only via HTTP, not IPC.
+        // non-`pub`, so it stays a Tauri plugin, and the frontend reaches its
+        // artifact commands over IPC (`plugin:ui-bridge|save_artifact` and its
+        // siblings, through `@qontinui/ui-bridge`'s `IpcArtifactStore`).
         //
         // The remaining per-module `plugin()` fns are dead code; each is
         // deleted as its module moves onto `ipc_group!`.
