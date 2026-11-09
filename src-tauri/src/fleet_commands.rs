@@ -919,7 +919,11 @@ mod tests {
             out.skipped
         );
         assert_eq!(
-            std::fs::read_to_string(commands_dir.join(format!("{deleted}.md"))).unwrap(),
+            strip_provenance(
+                &std::fs::read_to_string(commands_dir.join(format!("{deleted}.md"))).unwrap()
+            )
+            .expect("provenance line")
+            .1,
             deleted_body,
             "a tracked-but-deleted command is still written"
         );
@@ -965,8 +969,12 @@ mod tests {
         let out = provision_fleet_commands_into(&commands_dir, &registry).expect("provision");
 
         assert_eq!(
-            std::fs::read_to_string(commands_dir.join(format!("{novel}.md")))
-                .expect("the account-only command is written"),
+            strip_provenance(
+                &std::fs::read_to_string(commands_dir.join(format!("{novel}.md")))
+                    .expect("the account-only command is written")
+            )
+            .expect("provenance line")
+            .1,
             "# my own procedure\n"
         );
         assert!(
