@@ -175,17 +175,22 @@ fn leading_slash_command(prompt: &str) -> Option<(&str, &str)> {
     let line = prompt.lines().map(str::trim).find(|l| !l.is_empty())?;
     let at = line
         .match_indices('/')
-        .find(|(i, _)| *i == 0 || line[..*i].ends_with(char::is_whitespace))?
+        .find(|(i, _)| {
+            *i == 0
+                || line
+                    .get(..*i)
+                    .is_some_and(|before| before.ends_with(char::is_whitespace))
+        })?
         .0;
-    let after = &line[at + 1..];
+    let after = line.get(at + 1..)?;
     let end = after
         .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
         .unwrap_or(after.len());
-    let skill = &after[..end];
+    let (skill, rest) = after.split_at_checked(end)?;
     if skill.is_empty() || !skill.starts_with(|c: char| c.is_ascii_lowercase()) {
         return None;
     }
-    Some((skill, &after[end..]))
+    Some((skill, rest))
 }
 
 /// The page a new `group` terminal lands on: `<prefix>-<n>` for the smallest
@@ -492,7 +497,11 @@ mod tests {
         let start = ts
             .find("SPAWN_GROUP_PAGE_PREFIXES = [")
             .expect("SPAWN_GROUP_PAGE_PREFIXES declared");
-        let list = &ts[start..start + ts[start..].find(']').expect("list closes")];
+        let list = ts
+            .get(start..)
+            .and_then(|tail| tail.split_once(']'))
+            .map(|(list, _)| list)
+            .expect("list closes");
         let mut ts_prefixes: Vec<&str> = list.split('"').skip(1).step_by(2).collect();
         let mut rust_prefixes: Vec<&str> =
             SpawnGroup::ALL.iter().map(|g| g.page_prefix()).collect();
