@@ -10638,8 +10638,20 @@ fn provision_agent_definitions_retiring(
     // embedded or overlay name), never merely "anything under .claude/agents":
     // qontinui-forge and its siblings track a repo-local clone-implementer.md
     // and must still receive code-reviewer and the rest (provision_guard).
-    let tracked = crate::provision_guard::TrackedPaths::probe(&dst_dir)
-        .versioning(written_names.iter().map(PathBuf::from));
+    // The roster is what a commit of the repo can add: the embedded names, and
+    // the overlay names the overlay's SOURCE checkout tracks. An untracked
+    // local `.md` in that checkout is a path no commit will deliver, so it is
+    // outside the roster and is written even in a versioned checkout.
+    let overlay_tracked = crate::provision_guard::TrackedPaths::probe(&src_dir);
+    let embedded_names = crate::fleet_agents::embedded_agent_names();
+    let tracked = crate::provision_guard::TrackedPaths::probe(&dst_dir).versioning(
+        written_names
+            .iter()
+            .filter(|n| {
+                embedded_names.contains(n) || overlay_tracked.contains(Path::new(n.as_str()))
+            })
+            .map(PathBuf::from),
+    );
     let mut candidates = written_names;
     // Retired names are candidates too, so a retired copy the repository tracks
     // is kept by the retirement pass below exactly as the layers keep theirs.
@@ -15025,7 +15037,14 @@ mod tests {
             .join(".claude")
             .join("agents");
         std::fs::create_dir_all(&src).unwrap();
+        // The primary checkout TRACKS overlay-only.md (it reached it upstream),
+        // so the worktree's own history can add it: it is in the roster. It
+        // holds local-only.md untracked, which no commit will ever deliver.
+        let primary = root.path().join("qontinui-claude-config");
+        git_init(&primary);
         std::fs::write(src.join("overlay-only.md"), "# PRIMARY overlay-only").unwrap();
+        git_add(&primary, &src.join("overlay-only.md"));
+        std::fs::write(src.join("local-only.md"), "# PRIMARY untracked").unwrap();
 
         let embedded = crate::fleet_agents::embedded_agent_names();
         assert!(
@@ -15053,6 +15072,10 @@ mod tests {
         assert!(
             !dst.join("overlay-only.md").exists(),
             "the overlay must not create one either"
+        );
+        assert!(
+            dst.join("local-only.md").exists(),
+            "an overlay file its source does not track is outside the roster, so it is written"
         );
         assert!(
             dst.join(&deleted).exists(),

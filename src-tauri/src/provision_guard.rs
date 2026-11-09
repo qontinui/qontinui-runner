@@ -47,6 +47,12 @@
 //!   `.claude/agents/clone-implementer.md`, and qontinui-studio a repo-local
 //!   `.claude/skills/launch-kit/`; keying on "any tracked path" would have cost
 //!   them every bundled agent (`code-reviewer` among them) or skill.
+//! - The skip is confined to that bundle — the paths the repository's own
+//!   history can add (builtin commands and skills, embedded agents, overlay
+//!   agents the overlay's source checkout tracks). An ACCOUNT-only command or
+//!   skill, or an overlay file its source does not track, is written even in a
+//!   versioned checkout: no commit will ever deliver it, so withholding it
+//!   would only lose the unit.
 //! - **The cost, stated:** a repository that tracks even ONE bundled path under
 //!   a provisioned root receives no bundled unit it does not track itself
 //!   there. In practice that is the canonical source (qontinui-claude-config)
@@ -219,6 +225,12 @@ pub(crate) struct TrackedPaths {
     /// tracks at least one path the BUNDLE carries under the probed root — it
     /// versions the provisioned tree itself. False until a provisioner asks.
     root_versioned: bool,
+    /// The bundle [`Self::versioning`] was given: the only paths a
+    /// [`SkipReason::RootVersioned`] skip may apply to, because they are the
+    /// only ones the repository's own history can add. A unit outside it (an
+    /// account-only command or skill, an untracked overlay agent) is written
+    /// even in a versioned checkout — no commit will ever deliver it.
+    roster: HashSet<PathBuf>,
 }
 
 impl TrackedPaths {
@@ -252,6 +264,7 @@ impl TrackedPaths {
             relative,
             unknown_in_repo: false,
             root_versioned: false,
+            roster: HashSet::new(),
         }
     }
 
@@ -280,6 +293,7 @@ impl TrackedPaths {
             relative: HashSet::new(),
             unknown_in_repo,
             root_versioned: false,
+            roster: HashSet::new(),
         }
     }
 
@@ -293,15 +307,24 @@ impl TrackedPaths {
     /// this provisioner would write under the probed root. A repository that
     /// tracks only units of its OWN under the root (a repo-local agent or
     /// skill the bundle does not carry) is not versioned, so it still receives
-    /// every bundled unit. Never true for an UNKNOWN probe, whose set is empty;
+    /// every bundled unit. `bundle` is also the roster a
+    /// [`SkipReason::RootVersioned`] skip is confined to, so pass only the paths
+    /// the repository's history can add (embedded or canonical units, overlay
+    /// files the overlay's source tracks), never an account-only unit.
+    /// Never true for an UNKNOWN probe, whose set is empty;
     /// that arm keeps its own rule. A provisioner that never calls this gets
     /// no [`SkipReason::RootVersioned`] skips at all.
     #[must_use]
-    pub(crate) fn versioning<P: AsRef<Path>>(mut self, bundle: impl IntoIterator<Item = P>) -> Self {
-        self.root_versioned = !self.unknown_in_repo
-            && bundle
-                .into_iter()
-                .any(|p| self.relative.contains(p.as_ref()));
+    pub(crate) fn versioning<P: AsRef<Path>>(
+        mut self,
+        bundle: impl IntoIterator<Item = P>,
+    ) -> Self {
+        self.roster = bundle
+            .into_iter()
+            .map(|p| p.as_ref().to_path_buf())
+            .collect();
+        self.root_versioned =
+            !self.unknown_in_repo && self.roster.iter().any(|p| self.relative.contains(p));
         self
     }
 
@@ -335,13 +358,17 @@ impl TrackedPaths {
     ///
     /// One more skip applies to an ABSENT `dst`: when the probe answered and
     /// the repository tracks at least one path of the bundle under the probed
-    /// root ([`Self::versioning`]), an absent path it does not track is
-    /// skipped ([`SkipReason::RootVersioned`]) — see the module doc's "A
+    /// root ([`Self::versioning`]), an absent path of that bundle it does not
+    /// track is skipped ([`SkipReason::RootVersioned`]); an absent path outside
+    /// the bundle is written — see the module doc's "A
     /// checkout that versions the provisioned tree" section. A tracked path
     /// that was deleted is still written, as above.
     pub(crate) fn skip_reason(&self, dst: &Path, relative: &Path) -> Option<SkipReason> {
         if !dst.exists() {
-            if self.is_root_versioned() && !self.contains(relative) {
+            if self.is_root_versioned()
+                && self.roster.contains(relative)
+                && !self.contains(relative)
+            {
                 return Some(SkipReason::RootVersioned);
             }
             return None;
@@ -811,8 +838,11 @@ mod tests {
         std::fs::write(&owned, b"body").unwrap();
         git_add(tmp.path(), &owned);
 
-        let tracked =
-            TrackedPaths::probe(tmp.path()).versioning(["owned.md", "upstream-added.md"]);
+        let tracked = TrackedPaths::probe(tmp.path()).versioning([
+            "owned.md",
+            "upstream-added.md",
+            "new-skill/helper.sh",
+        ]);
         assert!(tracked.is_root_versioned());
         let added = tmp.path().join("upstream-added.md");
         assert_eq!(
@@ -826,6 +856,33 @@ mod tests {
             "a whole upstream-added directory must not be created either"
         );
         assert!(!added.exists());
+    }
+
+    /// The skip is confined to the bundle `versioning` was given: an absent
+    /// path OUTSIDE it (an account-only command or skill, an untracked overlay
+    /// agent) is written even in a versioned checkout, because no commit of
+    /// the repository will ever add it.
+    #[test]
+    fn an_absent_path_outside_the_roster_is_written_in_a_root_versioned_repo() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        git_init(tmp.path());
+        let owned = tmp.path().join("owned.md");
+        std::fs::write(&owned, b"body").unwrap();
+        git_add(tmp.path(), &owned);
+
+        let tracked = TrackedPaths::probe(tmp.path()).versioning(["owned.md", "bundled.md"]);
+        assert!(tracked.is_root_versioned());
+        assert_eq!(
+            tracked.skip_reason(
+                &tmp.path().join("account-only.md"),
+                Path::new("account-only.md")
+            ),
+            None
+        );
+        assert_eq!(
+            tracked.skip_reason(&tmp.path().join("bundled.md"), Path::new("bundled.md")),
+            Some(SkipReason::RootVersioned)
+        );
     }
 
     /// Phase 2, arm 2: in that same root-versioned repo a tracked path the user
