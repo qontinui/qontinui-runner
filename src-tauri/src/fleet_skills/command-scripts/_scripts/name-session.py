@@ -66,6 +66,11 @@ def selftest():
 
 
 def main():
+    for stream in (sys.stdout, sys.stderr):  # a piped Windows console is cp1252
+        try:
+            stream.reconfigure(encoding="utf-8", errors="backslashreplace")
+        except (AttributeError, ValueError, OSError):
+            pass
     args = sys.argv[1:]
     if args == ["--selftest"]:
         return selftest()
