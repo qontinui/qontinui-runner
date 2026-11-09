@@ -63,8 +63,10 @@ pub struct RecoveryOutcome {
     /// `true` when either the structured command-retry path or the LLM
     /// fallback ultimately made the ORIGINAL action succeed, re-verified by an
     /// independent retry — exactly when [`RecoveryOutcome::retry_outcome`] is
-    /// [`RetryOutcome::Succeeded`]. Both are set in one place,
-    /// [`RecoveryOutcome::record_retry`], so they cannot disagree.
+    /// [`RetryOutcome::Succeeded`]. In production both are set in one place,
+    /// [`RecoveryOutcome::record_retry`], so they agree. Both fields are `pub`,
+    /// though, so the route's gate (`elements::recovery_is_genuine`) checks
+    /// `retry_outcome` as well rather than trusting that.
     ///
     /// NOT the frontend's `attemptSucceeded` (the `ai_recovery_attempt`
     /// payload, which decides `/ai/recovery/attempt`'s HTTP status in
@@ -498,7 +500,12 @@ async fn llm_fallback(
 ///    reads `success: true` → done (`StructuredCommand`).
 /// 3. Otherwise (or if the retry read `failed` or `indeterminate`) → LLM
 ///    fallback IPC (opt-in); if its scoped attempt acted, retry the original
-///    action again. `success: true` → done (`LlmFallback`).
+///    action again. `success: true` → done (`LlmFallback`). An
+///    `indeterminate` Tier-1 retry may already have run the action, so on this
+///    opt-in path a non-idempotent action can run twice, as it already could
+///    after a transport `Err`. Whether the ladder should stop there instead is
+///    not decided here: `attempt_recovery` cannot yet be entered by a test (no
+///    `ApiState` fixture), so a change to its control flow would land unpinned.
 /// 4. Otherwise → `RecoveryVia::None`, `recovered: false`, `retryOutcome`
 ///    saying what the last retry read (or `not_retried`); the caller surfaces
 ///    the original error.
@@ -535,7 +542,15 @@ pub async fn attempt_recovery(
                     ui_bridge_request_sync(state, "execute_action", original_action.clone()).await;
                 if outcome.record_retry(retry, RecoveryVia::StructuredCommand) {
                     outcome.command_chosen = chosen_command.clone();
-                    emit_telemetry(state, &error_code, &chosen_command, true, task_run_id).await;
+                    emit_telemetry(
+                        state,
+                        &error_code,
+                        &chosen_command,
+                        true,
+                        outcome.retry_outcome,
+                        task_run_id,
+                    )
+                    .await;
                     return outcome;
                 }
                 warn!(
@@ -569,7 +584,15 @@ pub async fn attempt_recovery(
             LLM_RECOVERY_ENV, error_code
         );
         outcome.via = RecoveryVia::None;
-        emit_telemetry(state, &error_code, &chosen_command, false, task_run_id).await;
+        emit_telemetry(
+            state,
+            &error_code,
+            &chosen_command,
+            false,
+            outcome.retry_outcome,
+            task_run_id,
+        )
+        .await;
         return outcome;
     }
 
@@ -588,7 +611,15 @@ pub async fn attempt_recovery(
             let retry =
                 ui_bridge_request_sync(state, "execute_action", original_action.clone()).await;
             if outcome.record_retry(retry, RecoveryVia::LlmFallback) {
-                emit_telemetry(state, &error_code, &chosen_command, true, task_run_id).await;
+                emit_telemetry(
+                    state,
+                    &error_code,
+                    &chosen_command,
+                    true,
+                    outcome.retry_outcome,
+                    task_run_id,
+                )
+                .await;
             } else {
                 warn!(
                     "recovery_executor: LLM fallback ran but the original action is not \
@@ -596,21 +627,38 @@ pub async fn attempt_recovery(
                     outcome.retry_outcome
                 );
                 outcome.via = RecoveryVia::None;
-                emit_telemetry(state, &error_code, &chosen_command, false, task_run_id).await;
+                emit_telemetry(
+                    state,
+                    &error_code,
+                    &chosen_command,
+                    false,
+                    outcome.retry_outcome,
+                    task_run_id,
+                )
+                .await;
             }
         }
         Err(e) => {
             warn!("recovery_executor: LLM fallback also failed: {}", e);
             outcome.via = RecoveryVia::None;
-            emit_telemetry(state, &error_code, &chosen_command, false, task_run_id).await;
+            emit_telemetry(
+                state,
+                &error_code,
+                &chosen_command,
+                false,
+                outcome.retry_outcome,
+                task_run_id,
+            )
+            .await;
         }
     }
     outcome
 }
 
-/// Emit `(errorCode, recovery_command_chosen, recovery_succeeded)` through the
-/// runner's existing structured-event surface. Fire-and-forget PG write keyed
-/// off `task_run_id` — matches `execute_action`'s telemetry pattern exactly
+/// Emit `(errorCode, recovery_command_chosen, recovery_succeeded,
+/// retryOutcome)` through the runner's existing structured-event surface.
+/// Fire-and-forget PG write keyed off `task_run_id` — matches
+/// `execute_action`'s telemetry pattern exactly
 /// (no new transport). When `task_run_id` is absent the tuple is still logged
 /// at info level (always observable) but not persisted (consistent with the
 /// existing event-persistence gate).
@@ -619,12 +667,13 @@ async fn emit_telemetry(
     error_code: &Option<CanonicalCode>,
     command_chosen: &Option<String>,
     succeeded: bool,
+    retry_outcome: RetryOutcome,
     task_run_id: Option<i64>,
 ) {
     let code_str = error_code.map(|c| c.as_str().to_string());
     info!(
-        "recovery_telemetry: errorCode={:?} command={:?} succeeded={}",
-        code_str, command_chosen, succeeded
+        "recovery_telemetry: errorCode={:?} command={:?} succeeded={} retryOutcome={:?}",
+        code_str, command_chosen, succeeded, retry_outcome
     );
 
     let Some(tr_id) = task_run_id else {
@@ -635,6 +684,7 @@ async fn emit_telemetry(
         "errorCode": code_str,
         "recoveryCommandChosen": command_chosen,
         "recoverySucceeded": succeeded,
+        "retryOutcome": retry_outcome,
     })
     .to_string();
 
