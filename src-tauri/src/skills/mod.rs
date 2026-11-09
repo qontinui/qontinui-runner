@@ -896,9 +896,10 @@ pub fn instantiate_skill(
     {
         return Err(format!(
             "Skill \"{}\" ({}) has a template step with no `type` (step {} of {}), so there is \
-             nothing to instantiate. A stored template that does not parse is served as an \
+             nothing to instantiate. If its stored template does not parse, it is served as an \
              empty single_step: export the skill to recover the stored template (the export \
-             lists it under `withheld`), then delete it.",
+             lists it under `withheld`), then delete it. Otherwise, update the template so every \
+             step has a string `type`.",
             skill.name,
             skill.id,
             i + 1,

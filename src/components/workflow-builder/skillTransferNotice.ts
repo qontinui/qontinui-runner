@@ -43,7 +43,7 @@ export function skillImportNotice(outcome: SkillImportOutcome): string | null {
   if (retired.length > 0) {
     parts.push(
       `Not imported: ${quoted(retired)} ${retired.length === 1 ? "is a playbook skill" : "are playbook skills"}, ` +
-        "which this runner no longer runs. Put that knowledge in a .qontinui/contexts/*.md file instead.",
+        "which this runner no longer supports. Put that knowledge in a .qontinui/contexts/*.md file instead.",
     );
   }
   if (otherRefused.length > 0) {

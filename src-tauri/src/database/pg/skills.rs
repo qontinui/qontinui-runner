@@ -54,13 +54,16 @@ pub enum SkillRewriteError {
     NotFound(String),
     /// The row's stored template does not parse. A read serves it as the empty
     /// `single_step` fallback ([`stored_template_or_fallback`]), so a rewrite
-    /// built from that read would store the fallback in place of the original.
+    /// built from that read would act on the fallback, not on the stored
+    /// template: an update would store it over the original, a fork would copy
+    /// it, and a version bump would checksum it.
     #[error(
         "user skill {skill_id}: its stored template does not parse ({error}); refusing to \
-         rewrite it, because it is served as an empty single_step template and a rewrite \
-         would store that in place of the original. Export the skill to recover the stored \
-         template (the export lists it under `withheld`, with the stored text); a `playbook` \
-         body belongs in a `.qontinui/contexts/*.md` file. Then delete the skill."
+         rewrite it, because it is served as an empty single_step template: an update would \
+         store that over the original, a fork would copy it, and a version bump would \
+         checksum it. Export the skill to recover the stored template (the export lists it \
+         under `withheld`, with the stored text); a `playbook` body belongs in a \
+         `.qontinui/contexts/*.md` file. Then delete the skill."
     )]
     UnparseableStoredTemplate { skill_id: String, error: String },
     /// A pool, query or serialization failure.

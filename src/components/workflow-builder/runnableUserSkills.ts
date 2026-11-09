@@ -56,8 +56,9 @@ export function registerRunnableUserSkills(skills: SkillDefinition[]): SkillDefi
   if (leftOut.length > 0) {
     console.warn(
       `Skill catalog: left out ${leftOut.map((s) => `"${s.id}"`).join(", ")}: a template ` +
-        "step has no `type`, which is how the runner serves a stored template it cannot " +
-        "parse. Export the skill to recover the stored template.",
+        "step has no `type`. If the stored template does not parse, the runner serves it " +
+        "that way: export the skill to recover the stored template. Otherwise, update the " +
+        "template so every step has a string `type`.",
     );
   }
   registerUserSkills(runnable);
