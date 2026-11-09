@@ -2015,7 +2015,7 @@ export function useTerminalInitialization({
             placeholders: restoreSet.placeholders,
             pageId,
             knownPageIds,
-            assignments: zoneLayout.gridView.assignments,
+            assignments: runGridView().assignments,
             runningSessionIds: new Set(
               liveTabsRef.current.map((t) => t.claudeSessionId).filter((id): id is string => !!id),
             ),
