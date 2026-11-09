@@ -1382,6 +1382,20 @@ async fn livez() -> impl axum::response::IntoResponse {
     (axum::http::StatusCode::OK, "ok")
 }
 
+/// `GET /spawn-caps` — `{ groups: [{group, count, cap, atCap}], overrides,
+/// ignoredOverrides, admissionReadFailures }`.
+/// `cap: null` is unlimited. See `agent_runtime::spawn_caps_json`.
+async fn spawn_caps() -> impl axum::response::IntoResponse {
+    // The loads read the terminal list and the lifecycle store, both blocking.
+    match spawn_blocking_tracked(crate::agent_runtime::spawn_caps_json).await {
+        Ok(body) => (axum::http::StatusCode::OK, axum::Json(body)),
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(serde_json::json!({ "error": format!("spawn-caps read failed: {e}") })),
+        ),
+    }
+}
+
 /// Explicit diagnostic capture, moved off `/health` (Phase 1.2).
 ///
 /// Kept as a separate route precisely because it is expensive and can fail:
@@ -13858,6 +13872,11 @@ pub fn create_router(
         // `/health` answers a much richer and much more blockable question.
         .route("/livez", get(livez))
         .route("/health", get(health))
+        // Per-kind live caps on autonomous spawns: each kind's live count and
+        // effective cap, counted as an admission counts it (plan
+        // `2026-11-08-coord-fixers-open-terminal-tabs-and-spawn-kinds-are-capped`
+        // Phase 3). Read-only.
+        .route("/spawn-caps", get(spawn_caps))
         // What can this binary actually DO here? `/health` says WHAT this
         // binary is (`gitSha`, `buildId`, `buildDrift`); this says which RUNG
         // answered for each capability it delivers, so a development build's

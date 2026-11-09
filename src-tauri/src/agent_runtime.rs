@@ -2137,11 +2137,32 @@ fn spawn_run_task(payload: LaunchPayload) {
             report_launch_deferral(agent_id, &reason).await;
             return;
         }
+        // Per-kind live cap (plan
+        // `2026-11-08-coord-fixers-open-terminal-tabs-and-spawn-kinds-are-capped`
+        // Phase 3), on BOTH arms and here, before `run_agent_subprocess`, for the
+        // same reason as the load guard above: a refused launch leaves no
+        // worktree behind. The slot counts the session against its kind until
+        // the run ends — a headless run holds it throughout, a terminal run
+        // until its session starts (`run_agent_terminal`). Reported as
+        // the same re-offerable `deferred_load:` deferral.
+        let kind_slot = match admit_spawn_kind_blocking(
+            spawn_kind(payload.session_name.as_deref(), &payload.initial_prompt),
+            format!("coord spawn-request agent_id={agent_id}"),
+        )
+        .await
+        {
+            Ok(slot) => slot,
+            Err(at) => {
+                drop(stop_registration);
+                report_launch_deferral(agent_id, &spawn_kind_cap_launch_reason(at.group)).await;
+                return;
+            }
+        };
         // Armed from admission on: `run_agent_subprocess` may register a proxy
         // nonce, a live agent token and daemons, and a panic inside it must not
         // leak them. See [`AgentRunTeardown`].
         let teardown = AgentRunTeardown::global(agent_id);
-        if let Err(e) = run_agent_subprocess(payload, stop).await {
+        if let Err(e) = run_agent_subprocess(payload, stop, kind_slot).await {
             error!("agent_runtime: run_agent_subprocess failed: {e:#}");
         }
         // The run task is fully done: per-agent teardown FIRST, then the stop
@@ -3897,6 +3918,15 @@ enum ContinuationGuard {
 /// continuation five times between 16:10Z and 20:14Z on 2026-10-02 while the
 /// operator saw seven sessions (measured; dossier
 /// `gate-continuation-work-never-happens`).
+///
+/// What this guard does NOT decide, and what came after it: a PER-KIND live
+/// cap (plan `2026-11-08-coord-fixers-open-terminal-tabs-and-spawn-kinds-are-capped`
+/// Phase 3; [`admit_spawn_kind`], step 1a of [`run_gate_continuation_inner`]).
+/// It is not the retired global number: it bounds how many sessions of ONE
+/// kind (fixers, post-merge follow-ups, …) run at once so one lane cannot crowd
+/// out the rest, is operator-tunable per kind in settings `spawn_caps` (`0` =
+/// unlimited), and never caps stewards. The load lanes here still decide
+/// whether the BOX can take another session at all.
 /// Its doc justified it as a backstop for costs the thread lane cannot see; each
 /// is bounded elsewhere, measured against `origin/main` when it was removed:
 ///
@@ -4124,9 +4154,11 @@ fn launch_deferral_reason(verdict: &crate::resource_guard::SpawnGate) -> Option<
 /// [`evaluate_continuation_guard`] applies, so the two unattended paths can
 /// never disagree about when the machine is too loaded.
 ///
-/// No count and no slot: an admitted launch is judged by what the machine has
-/// left, exactly as a continuation is (see [`evaluate_continuation_guard`] on
-/// why the count cap was retired). No duplicate arm: [`register_launch_stop`]
+/// No global count and no slot: an admitted launch is judged by what the
+/// machine has left, exactly as a continuation is (see
+/// [`evaluate_continuation_guard`] on why the global count cap was retired).
+/// The per-kind cap is a separate admission, [`admit_spawn_kind`], taken after
+/// this one. No duplicate arm: [`register_launch_stop`]
 /// is the launch path's duplicate gate. No anchor dedup: a launch payload has no
 /// anchor key.
 ///
@@ -4152,6 +4184,155 @@ fn admit_launch(
         Some(reason) => Err(reason),
         None => Ok(()),
     }
+}
+
+// =============================================================================
+// Per-kind live caps (plan
+// `2026-11-08-coord-fixers-open-terminal-tabs-and-spawn-kinds-are-capped`
+// Phase 3)
+// =============================================================================
+
+/// The per-page loads a kind cap counts —
+/// [`crate::terminal::page_placement::running_page_loads`]: terminals whose
+/// process is still running plus the rows a boot restore is about to bring
+/// back, but NOT an exited or never-started pane left open as a tab. Empty with
+/// no Tauri runtime (a unit test, a headless-only context), where no page
+/// exists.
+fn live_spawn_page_loads() -> Vec<(String, usize)> {
+    use std::sync::Arc;
+    let Some(app) = crate::tauri_app_handle::current() else {
+        return Vec::new();
+    };
+    let Some(tm) = tauri::Manager::try_state::<Arc<crate::terminal::TerminalManager>>(&app) else {
+        return Vec::new();
+    };
+    crate::terminal::page_placement::running_page_loads(
+        &tm,
+        crate::terminal::page_placement::lifecycle_store(&app).as_deref(),
+    )
+}
+
+/// The kind a spawn counts against: the same classification its page uses, so
+/// a session's cap and its page can never name different kinds.
+fn spawn_kind(
+    session_name: Option<&str>,
+    prompt: &str,
+) -> crate::terminal::spawn_pages::SpawnGroup {
+    crate::terminal::spawn_pages::SpawnGroup::classify(
+        session_name
+            .and_then(crate::claude_session::launch_spec::sanitize_session_name)
+            .as_deref(),
+        Some(prompt),
+    )
+}
+
+/// Admit one autonomous `group` session against its live cap (settings
+/// `spawn_caps` over the compiled-in defaults), logging the one deferral line
+/// a refusal gets — naming the group, its live count and its cap. `what`
+/// names the spawn in that line.
+fn admit_spawn_kind(
+    group: crate::terminal::spawn_pages::SpawnGroup,
+    what: &str,
+) -> Result<crate::terminal::spawn_pages::KindSlot, crate::terminal::spawn_pages::AtCap> {
+    let cap = crate::terminal::spawn_pages::effective_spawn_cap(
+        group,
+        &crate::settings::get_spawn_caps(),
+    );
+    crate::terminal::spawn_pages::try_reserve(group, cap, live_spawn_page_loads).inspect_err(|at| {
+        info!(
+            "agent_runtime: {what} deferred at its kind cap: group={} count={} cap={}",
+            at.group.page_prefix(),
+            at.count,
+            at.cap
+        );
+    })
+}
+
+/// How many admissions [`admit_spawn_kind_blocking`] let through UNCAPPED
+/// because the count could not be read. Served by `GET /spawn-caps` as
+/// `admissionReadFailures`, so caps that are silently off are visible without
+/// reading logs.
+static KIND_CAP_READ_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// [`admit_spawn_kind`] off the async worker: the count reads the terminal list
+/// and the lifecycle store under the process-wide reservation lock, so it runs
+/// on the blocking pool like every other store read here. A blocking-pool
+/// failure (a panic in the read) admits uncapped rather than dropping the
+/// spawn — the load lanes have already admitted it, and a cap that cannot be
+/// read is not evidence the kind is full.
+async fn admit_spawn_kind_blocking(
+    group: crate::terminal::spawn_pages::SpawnGroup,
+    what: String,
+) -> Result<crate::terminal::spawn_pages::KindSlot, crate::terminal::spawn_pages::AtCap> {
+    match spawn_blocking_tracked(move || admit_spawn_kind(group, &what)).await {
+        Ok(verdict) => verdict,
+        Err(e) => {
+            KIND_CAP_READ_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            warn!(
+                "agent_runtime: kind-cap admission read for group={} failed ({e}); admitting uncapped",
+                group.page_prefix()
+            );
+            crate::terminal::spawn_pages::try_reserve(group, None, Vec::new)
+        }
+    }
+}
+
+/// The `spawn-failed` reason for a launch refused at its kind cap:
+/// `deferred_load:spawn_kind_cap:<group>`. The `deferred_load:` prefix is what
+/// has coord re-offer it (see [`DEFERRED_LOAD_REASON_PREFIX`]).
+fn spawn_kind_cap_launch_reason(group: crate::terminal::spawn_pages::SpawnGroup) -> String {
+    format!(
+        "{DEFERRED_LOAD_REASON_PREFIX}{}",
+        spawn_kind_cap_stamp_reason(group)
+    )
+}
+
+/// The `continuation-deferred` reason for a gate continuation refused at its
+/// kind cap: `spawn_kind_cap:<group>` — the launch reason without the
+/// `deferred_load:` prefix, in the `<class>:<detail>` shape the continuation
+/// stamps share (see [`post_continuation_deferred`]).
+fn spawn_kind_cap_stamp_reason(group: crate::terminal::spawn_pages::SpawnGroup) -> String {
+    format!("spawn_kind_cap:{}", group.page_prefix())
+}
+
+/// `GET /spawn-caps`: each kind's live count and effective cap (`null` =
+/// unlimited), counted exactly as an admission counts it, plus the raw
+/// `spawn_caps` overrides and any of their keys that cap nothing.
+pub(crate) fn spawn_caps_json() -> serde_json::Value {
+    let overrides = crate::settings::get_spawn_caps();
+    let groups: Vec<serde_json::Value> =
+        crate::terminal::spawn_pages::snapshot(&overrides, live_spawn_page_loads)
+            .into_iter()
+            .map(|(group, count, cap)| {
+                serde_json::json!({
+                    "group": group.page_prefix(),
+                    "count": count,
+                    "cap": cap,
+                    "atCap": cap.is_some_and(|c| count >= c),
+                })
+            })
+            .collect();
+    // Override keys that cap nothing: a misspelt kind, or `stewards` (never
+    // capped). Listed so a typo is visible rather than silently ignored.
+    let mut ignored: Vec<&String> = overrides
+        .keys()
+        .filter(|k| {
+            !crate::terminal::spawn_pages::SpawnGroup::ALL
+                .iter()
+                .any(|g| {
+                    g.page_prefix() == k.as_str()
+                        && *g != crate::terminal::spawn_pages::SpawnGroup::Steward
+                })
+        })
+        .collect();
+    ignored.sort();
+    serde_json::json!({
+        "groups": groups,
+        "overrides": overrides,
+        "ignoredOverrides": ignored,
+        "admissionReadFailures":
+            KIND_CAP_READ_FAILURES.load(std::sync::atomic::Ordering::Relaxed),
+    })
 }
 
 /// [`evaluate_continuation_guard`] with the load reading taken LIVE through
@@ -6479,8 +6660,9 @@ fn spawn_authorization_stamp_reason(label: &str) -> String {
 /// | `commit_pressure:<severity>:<observed>_under_<limit>` | the machine is short of free memory (bytes of free commit; `MemAvailable` off Windows) | [`commit_pressure_stamp_reason`] |
 /// | `device_drain:<class>` | coord holds this device drained | [`drain_stamp_reason`] |
 /// | `spawn_authorization_<label>` | the agent registry refused the spawn | [`spawn_authorization_stamp_reason`] |
+/// | `spawn_kind_cap:<group>` | the continuation's kind (its typed page prefix: `fixer`, `post-merge`, …) is at its live cap | [`spawn_kind_cap_stamp_reason`] |
 ///
-/// All but the last follow `<class>:<detail>`; `spawn_authorization_` is
+/// All but `spawn_authorization_` follow `<class>:<detail>`; it is
 /// delimited by `_` and predates the grammar — see
 /// [`spawn_authorization_stamp_reason`].
 ///
@@ -6884,6 +7066,34 @@ async fn run_gate_continuation_inner(
         }
     }
 
+    // Step 1a: the per-kind live cap (plan
+    // `2026-11-08-coord-fixers-open-terminal-tabs-and-spawn-kinds-are-capped`
+    // Phase 3), with the other LOCAL guards and before step 2's coord claim for
+    // their reason: a capped continuation must burn no claim and leave no
+    // worktree. It defers through the SAME non-consuming door the load lanes
+    // use, so the row stays pending and is re-delivered by the backstop poll or
+    // the capacity-freed exit hook. Returning drops `reservation`, which gives
+    // the anchor back. The slot counts the session against its kind: the
+    // terminal arm holds it until the session starts (its running terminal
+    // counts from then), the headless arm until the child exits.
+    let kind_slot = match admit_spawn_kind_blocking(
+        spawn_kind(payload.session_name.as_deref(), &payload.initial_prompt),
+        format!("gate-continuation anchor_key={:?}", payload.anchor_key),
+    )
+    .await
+    {
+        Ok(slot) => slot,
+        Err(at) => {
+            defer_continuation_unclaimed(
+                consume_target,
+                device_id,
+                spawn_kind_cap_stamp_reason(at.group),
+            )
+            .await;
+            return Ok(());
+        }
+    };
+
     // Step 1b: agent-registry spawn authorization (plan
     // `2026-07-28-migrate-claude-md-into-qontinui.md` Phase 4c, served clause
     // `agent-spawn-authorization`). Placed with the other LOCAL guards and
@@ -7067,6 +7277,7 @@ async fn run_gate_continuation_inner(
                 reservation,
                 pinned_session_id,
                 no_worktree_cause.as_deref(),
+                Some(kind_slot),
             )
             .await;
             let res = res.map(|start| {
@@ -7107,6 +7318,8 @@ async fn run_gate_continuation_inner(
             )
             .await;
             drop(ctx);
+            // The child has exited: its kind slot ends with it.
+            drop(kind_slot);
             presentation_bindable_session(PresentationResult::Headless(res), pinned_session_id)
         }
     };
@@ -7389,6 +7602,12 @@ async fn run_continuation_terminal(
     // fallback cwd because of it; `None` when a worktree was acquired or none
     // was intended. Becomes the runner's note in the system prompt.
     no_worktree_cause: Option<&str>,
+    // The kind-cap admission step 1a took. HELD until a session starts, across
+    // every never-started retry (each placed uncapped: it replaces an attempt
+    // already admitted), so a dead attempt's pane leaves no uncounted window
+    // before its retry. Released at the start verdict, when the running
+    // terminal carries the count, or when this returns. `None` holds nothing.
+    mut kind_slot: Option<crate::terminal::spawn_pages::KindSlot>,
 ) -> anyhow::Result<TerminalStart> {
     use std::sync::Arc;
 
@@ -7822,6 +8041,8 @@ async fn run_continuation_terminal(
                 return Err(anyhow::anyhow!(reason));
             }
             ContinuationStart::Started { pty_alive } => {
+                // Started: its running terminal now carries the kind count.
+                drop(kind_slot.take());
                 // Register in the live continuation-session registry so P3 (dedup by
                 // anchor_key) sees this session as live until
                 // its PTY exits (reaped lazily by the guard's liveness prune).
@@ -9726,6 +9947,10 @@ pub(crate) fn resolve_spawn_account(
 async fn run_agent_subprocess(
     mut payload: LaunchPayload,
     stop: tokio_util::sync::CancellationToken,
+    // This launch's kind-cap admission. Held for the whole run on the headless
+    // arm (it drops when this returns); handed to `run_agent_terminal` on the
+    // terminal arm, which holds it until the session starts.
+    kind_slot: crate::terminal::spawn_pages::KindSlot,
 ) -> anyhow::Result<()> {
     // Coord emits each worktree's `repo` as a full `owner/name` slug and its
     // `worktree_path` for COORD's OWN host (a Linux `/root/qontinui-root.wt/...`
@@ -10090,6 +10315,7 @@ async fn run_agent_subprocess(
                 coord_mcp,
                 &stop,
                 primary_push_ref.as_deref(),
+                kind_slot,
             )
             .await;
             hb_task.0.abort();
@@ -10585,8 +10811,15 @@ async fn run_agent_terminal(
     coord_mcp: crate::coord_mcp::CoordMcpDelivery,
     stop: &tokio_util::sync::CancellationToken,
     primary_push_ref: Option<&str>,
+    // The launch's kind-cap admission (`spawn_run_task`). HELD until a session
+    // starts, across every never-started retry (each placed uncapped: it
+    // replaces an attempt already admitted), so a dead attempt's pane leaves no
+    // uncounted window before its retry. Released at the start verdict, when
+    // the running terminal carries the count, or when this returns.
+    kind_slot: crate::terminal::spawn_pages::KindSlot,
 ) {
     let agent_id = payload.agent_id;
+    let mut kind_slot = Some(kind_slot);
     let AgentTerminalHost {
         app,
         terminal_manager,
@@ -10842,6 +11075,8 @@ async fn run_agent_terminal(
                 return;
             }
             ContinuationStart::Started { .. } => {
+                // Started: its running terminal now carries the kind count.
+                drop(kind_slot.take());
                 info!(
                     "agent_runtime: agent_id={agent_id} terminal session started \
                      terminal_id={terminal_id} group={} coord_session={coord_session_id:?} \
@@ -16213,6 +16448,7 @@ mod tests {
             AnchorReservation::none(),
             uuid::Uuid::new_v4(),
             None,
+            None,
         )
         .await;
         assert!(
@@ -18137,6 +18373,116 @@ mod tests {
     #[test]
     fn deferred_load_prefix_is_the_coord_wire_value() {
         assert_eq!(DEFERRED_LOAD_REASON_PREFIX, "deferred_load:");
+    }
+
+    /// A launch refused at its kind cap rides the re-offerable `deferred_load:`
+    /// prefix with `spawn_kind_cap:<group>`; a gate continuation stamps the same
+    /// class without the prefix, as every continuation-deferred reason does.
+    #[test]
+    fn spawn_kind_cap_reasons_are_the_wire_values() {
+        use crate::terminal::spawn_pages::SpawnGroup;
+        assert_eq!(
+            spawn_kind_cap_launch_reason(SpawnGroup::Fixer),
+            "deferred_load:spawn_kind_cap:fixer"
+        );
+        assert_eq!(
+            spawn_kind_cap_launch_reason(SpawnGroup::PostMerge),
+            "deferred_load:spawn_kind_cap:post-merge"
+        );
+        assert_eq!(
+            spawn_kind_cap_stamp_reason(SpawnGroup::Check),
+            "spawn_kind_cap:checks"
+        );
+        // No whitespace, so coord's `<class>:<detail>` split survives.
+        for g in SpawnGroup::ALL {
+            assert!(!spawn_kind_cap_launch_reason(g).contains(char::is_whitespace));
+        }
+    }
+
+    /// A launch's kind is classified from the SAME sanitized name and prompt
+    /// its page is, so a fixer launch counts against the fixer cap.
+    #[test]
+    fn a_coord_fixer_launch_counts_against_the_fixer_kind() {
+        use crate::terminal::spawn_pages::SpawnGroup;
+        assert_eq!(
+            spawn_kind(Some("fix-runner#1863"), "/ufix"),
+            SpawnGroup::Fixer
+        );
+        assert_eq!(
+            spawn_kind(None, "/fix-red-main qontinui/qontinui-runner"),
+            SpawnGroup::Fixer
+        );
+        assert_eq!(spawn_kind(None, "do the thing"), SpawnGroup::Spawned);
+        assert_eq!(
+            spawn_kind(Some("merge-train-steward"), "x"),
+            SpawnGroup::Steward
+        );
+    }
+
+    /// Both launch arms and the gate-continuation path take the kind cap
+    /// before any worktree or coord claim exists, and the terminal arms hold
+    /// the admission until their session starts.
+    #[test]
+    fn every_capped_spawn_path_admits_before_setup_and_holds_the_slot_until_start() {
+        let source = include_str!("agent_runtime.rs");
+        let (prod, _) = source
+            .split_once(
+                "#[cfg(test)]
+mod tests",
+            )
+            .expect("the test module marker");
+        let body_of = |signature: &str| -> &str {
+            let (_, rest) = prod
+                .split_once(signature)
+                .unwrap_or_else(|| panic!("{signature} exists"));
+            rest.split_once(
+                "
+}
+",
+            )
+            .map_or(rest, |(body, _)| body)
+        };
+        let launch = body_of("fn spawn_run_task(");
+        let admit = launch
+            .find("admit_spawn_kind_blocking(")
+            .expect("launch admits its kind");
+        let run = launch.find("run_agent_subprocess(").expect("the run");
+        assert!(
+            admit < run,
+            "the cap precedes run_agent_subprocess (no worktree)"
+        );
+        assert!(launch.contains("spawn_kind_cap_launch_reason("));
+
+        let cont = body_of("async fn run_gate_continuation_inner(");
+        let admit = cont
+            .find("admit_spawn_kind_blocking(")
+            .expect("continuation admits its kind");
+        let claim = cont.find("// Step 2").expect("the coord claim step");
+        assert!(admit < claim, "the cap precedes the coord claim");
+        assert!(cont.contains("spawn_kind_cap_stamp_reason("));
+
+        // The terminal arms hold the slot until the session starts.
+        for f in [
+            "async fn run_agent_terminal(",
+            "async fn run_continuation_terminal(",
+        ] {
+            let body = body_of(f);
+            let place = body.find("spawn_pages::place(").expect("a placement");
+            let release = body
+                .find("drop(kind_slot.take());")
+                .expect("the slot is released at the start verdict");
+            assert!(
+                place < release,
+                "{f}: held across placement, released on start"
+            );
+            let started = body
+                .find("ContinuationStart::Started")
+                .expect("the start verdict arm");
+            assert!(
+                started < release,
+                "{f}: released in the Started arm, never on a never-started retry"
+            );
+        }
     }
 
     /// Poison-recovering (`unwrap_or_else(into_inner)`), matching the shared

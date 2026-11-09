@@ -1819,6 +1819,9 @@ const REVIEWED_NOT_DOOR: &[(&str, &str)] = &[
     ("GET", "/sessions/transcript-coverage"),
     ("GET", "/sessions/{id}/touched-files"),
     ("GET", "/settings/playwright/has-password"),
+    // Read-only per-kind spawn cap counts (`agent_runtime::spawn_caps_json`):
+    // no write, no credential, no session spawn.
+    ("GET", "/spawn-caps"),
     ("GET", "/spawn-placement/preview"),
     ("GET", "/spawn-placement/temp"),
     ("GET", "/spawn-placement/temps"),
