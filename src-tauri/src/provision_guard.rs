@@ -460,16 +460,21 @@ pub(crate) mod test_support {
     //! `git add`.
 
     use std::path::Path;
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
 
     /// Initialise a real repo in `dir` (quiet, no global config dependence).
+    ///
+    /// Built through [`crate::process_helpers::no_window`], which strips the
+    /// repo-local git environment (`GIT_DIR`, `GIT_INDEX_FILE`, ...): a test run
+    /// from inside a git hook inherits the hook's, and would otherwise act on
+    /// the hook's repository instead of `dir`.
     pub(crate) fn git_init(dir: &Path) {
         for args in [
             vec!["init", "--quiet"],
             vec!["config", "user.email", "t@example.com"],
             vec!["config", "user.name", "t"],
         ] {
-            let ok = Command::new("git")
+            let ok = crate::process_helpers::no_window("git")
                 .arg("-C")
                 .arg(dir)
                 .args(&args)
@@ -482,8 +487,10 @@ pub(crate) mod test_support {
         }
     }
 
+    /// Stage `path` in `dir`'s index, with the same scrubbed environment as
+    /// [`git_init`].
     pub(crate) fn git_add(dir: &Path, path: &Path) {
-        let ok = Command::new("git")
+        let ok = crate::process_helpers::no_window("git")
             .arg("-C")
             .arg(dir)
             .arg("add")
@@ -504,7 +511,9 @@ pub(crate) mod test_support {
     /// decay into a duplicate of the untracked-file test and still pass, leaving
     /// the arm it names unverified.
     pub(crate) fn assert_not_in_any_repo(dir: &Path) {
-        let inside = Command::new("git")
+        // Scrubbed like the two above: an inherited `GIT_DIR` would answer for
+        // the hook's repository, not for `dir`.
+        let inside = crate::process_helpers::no_window("git")
             .arg("-C")
             .arg(dir)
             .arg("rev-parse")
