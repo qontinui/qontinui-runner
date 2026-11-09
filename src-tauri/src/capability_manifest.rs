@@ -1000,6 +1000,14 @@ pub enum SkipReason {
     /// `fleet_skills` applies it per skill (a skill without `SKILL.md` is
     /// written whole, so this reason never lands on one of its files).
     ProbeUnknownInRepo,
+    /// The destination is ABSENT and untracked, and the enclosing repository
+    /// tracks at least one path under the provisioned tree root — it versions
+    /// that tree, so a path missing from it is one its own history has not
+    /// delivered yet. Writing it would leave an untracked file at a path
+    /// upstream adds, which wedges the checkout's fast-forward. See
+    /// [`crate::provision_guard`]'s "A checkout that versions the provisioned
+    /// tree" section.
+    RootVersioned,
     /// The write itself failed. Fail-soft: the pass continues and the spawn
     /// proceeds; the session simply lacks this unit.
     WriteFailed(String),
@@ -1038,6 +1046,7 @@ impl SkipReason {
         match self {
             SkipReason::GitTracked => "git_tracked",
             SkipReason::ProbeUnknownInRepo => "probe_unknown_in_repo",
+            SkipReason::RootVersioned => "root_versioned",
             SkipReason::WriteFailed(_) => "write_failed",
             SkipReason::Unresolved(_) => "unresolved",
             SkipReason::Rejected(_) => "rejected",
@@ -1054,6 +1063,9 @@ impl SkipReason {
             }
             SkipReason::ProbeUnknownInRepo => "kept: inside a git repository whose tracked-file \
                  probe could not answer, so what is already on disk was not overwritten"
+                .to_string(),
+            SkipReason::RootVersioned => "not created: absent and untracked in a checkout that \
+                 versions the provisioned tree, so its own history delivers it"
                 .to_string(),
             SkipReason::WriteFailed(why) => format!("write failed: {why}"),
             SkipReason::Unresolved(why) => format!("source rung did not resolve: {why}"),
