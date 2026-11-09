@@ -221,7 +221,12 @@ pub fn walk<T: ProcessTable>(
                     continue;
                 };
                 match table.creation_time(&h) {
-                    Some(created) if admits_descendant(created, parent_created, snapshot_at) => {
+                    // MUTANT: the creation-time identity rule is skipped.
+                    Some(created) if {
+                        let _ = (parent_created, snapshot_at);
+                        true
+                    } =>
+                    {
                         members.push((pid, created, h))
                     }
                     _ => {}
