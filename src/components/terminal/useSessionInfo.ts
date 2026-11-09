@@ -777,19 +777,20 @@ export const TENANT_DISPLAY_ABSENT_TEXT = "unknown — runner predates tenancy.d
  * is said whatever the set's size: one binding is exactly where the row would
  * otherwise read as an ordinary single-tenant device. A measured EMPTY set is
  * an absent binding store (`auth::binding_set_in`), which is per runner
- * instance, so it says that rather than reading as a membership fault. On a
- * multi-bound device `1 of N` is said only for membership the runner measured
- * as true; a membership it could not establish says so, never reading as in. */
+ * instance, so it says that rather than reading as a membership fault, and it
+ * holds nothing whatever membership claims. Only a membership the runner
+ * measured as true reads as in (`1 of N`, or the withheld marker on a single
+ * binding); one it could not establish says so on any set size, because the
+ * withheld marker would otherwise claim it. */
 function boundSuffix(d: TenantDisplay): string {
   if (d.bound.status !== "measured") {
     return ` · bound set unknown — ${d.bound.reason ?? "no reason given"}`;
   }
   const n = d.bound.tenantIds.length;
-  if (d.actingInBoundSet === false) {
-    return n === 0 ? " · this runner has no bound tenants" : ` · not among ${n} bound`;
-  }
-  if (d.multiBound !== true) return "";
-  return d.actingInBoundSet === true ? ` · 1 of ${n} bound` : ` · ${n} bound, membership unknown`;
+  if (n === 0) return " · this runner has no bound tenants";
+  if (d.actingInBoundSet === false) return ` · not among ${n} bound`;
+  if (d.actingInBoundSet !== true) return ` · ${n} bound, membership unknown`;
+  return d.multiBound === true ? ` · 1 of ${n} bound` : "";
 }
 
 /** How a `registered` coord row's tenant became known, in words. Pure. */

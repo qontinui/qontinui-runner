@@ -1191,6 +1191,32 @@ describe("tenantRow — the acting tenant, never the spawn stamp", () => {
     expect(row.display).toBe("c231d9da · via credential · 4 bound, membership unknown");
   });
 
+  it("does not let a single binding's withheld marker claim an unknown membership", () => {
+    const row = tenantRow(
+      tenancyWith(
+        display({
+          bound: { status: "measured", tenantIds: [QONTINUI], reason: null },
+          multiBound: false,
+          actingInBoundSet: null,
+        }),
+      ),
+    );
+    expect(row.display).toBe("c231d9da · via credential · 1 bound, membership unknown");
+  });
+
+  it("names an empty binding store whatever membership claims", () => {
+    const row = tenantRow(
+      tenancyWith(
+        display({
+          bound: { status: "measured", tenantIds: [], reason: null },
+          multiBound: false,
+          actingInBoundSet: null,
+        }),
+      ),
+    );
+    expect(row.display).toBe("c231d9da · via credential · this runner has no bound tenants");
+  });
+
   it("says when the acting tenant is outside the bound set", () => {
     const row = tenantRow(tenancyWith(display({ actingInBoundSet: false })));
     expect(row.display).toBe("c231d9da · via credential · not among 4 bound");
