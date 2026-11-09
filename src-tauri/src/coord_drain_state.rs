@@ -2222,6 +2222,7 @@ mod tests {
             deferred: BTreeSet::new(),
             deferred_capped: false,
             last_emitted: Some(CoordDrainState::Clear),
+            last_local_hold: None,
             folded_once: true,
             dispatch_role: None,
         }

@@ -1100,6 +1100,7 @@ fn restart_prep_the_census_join_reads_each_rows_own_process() {
             session_status_since: None,
             blocks_restart: true,
             wind_down: None,
+            stray_wait_shells: 0,
         }
     };
     let mut nested = process(14, Some("a"), Some(true), None);
