@@ -53,7 +53,7 @@ use super::types::ApiState;
 /// WS-only wrappers (which expose no HTTP server) need an entry there too.
 /// The scheme makes WS-only entries unambiguous in logs and prevents
 /// collision with real HTTP `/sdk/connect` URLs.
-fn ws_synthetic_url(app_id: &str) -> String {
+pub(crate) fn ws_synthetic_url(app_id: &str) -> String {
     format!("{WS_SYNTHETIC_URL_PREFIX}{app_id}")
 }
 

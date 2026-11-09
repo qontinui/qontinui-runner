@@ -2017,17 +2017,15 @@ fn condition_secret_substitution_capability(webview: bool, claude: bool) -> Opti
     (webview && claude).then(|| CONDITION_SECRET_SUBSTITUTION_CAPABILITY.to_string())
 }
 
-/// True when `claude` resolves to the absolute path of an existing,
-/// launchable executable: what a condition-check spawn execs
-/// (`agent_runtime::resolve_claude_bin`, then `agent_runtime::launchable_or_bare`).
-/// A miss falls back to the bare name there, which is not a launch this runner
-/// can vouch for; so does an explicit `QONTINUI_CLAUDE_BIN` that names a file
-/// without its execute bit, which `launchable_or_bare` hands back as it is.
-/// Stats PATH, so it is cached behind `HOST_PROBE_TTL` with the other slow
-/// probes.
+/// True when what a condition-check spawn execs is the absolute path of an
+/// existing, executable file. The spawn execs `agent_runtime::resolve_claude_bin`
+/// as it is (`run_condition_check_terminal`), so a miss there, a bare name, is
+/// not a launch this runner can vouch for, and neither is an explicit
+/// `QONTINUI_CLAUDE_BIN` naming a file without its execute bit. Stats PATH, so
+/// it is cached behind `HOST_PROBE_TTL` with the other slow probes.
 fn claude_launchable() -> bool {
     is_launchable_file(std::path::Path::new(
-        &crate::agent_runtime::launchable_or_bare(crate::agent_runtime::resolve_claude_bin()),
+        &crate::agent_runtime::resolve_claude_bin(),
     ))
 }
 
@@ -9499,8 +9497,9 @@ mod tests {",
     }
 
     /// `claude` counts as launchable only when it is an absolute, regular,
-    /// executable file: a non-executable `QONTINUI_CLAUDE_BIN` is handed back
-    /// as it is by `launchable_or_bare`, and a launch of it would fail.
+    /// executable file: `resolve_claude_bin` hands an explicit
+    /// `QONTINUI_CLAUDE_BIN` back as it is, and a launch of a non-executable
+    /// one would fail.
     #[cfg(unix)]
     #[test]
     fn condition_secrets_a_claude_without_its_execute_bit_is_not_launchable() {

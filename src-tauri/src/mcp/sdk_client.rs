@@ -1772,37 +1772,69 @@ fn record_journey_snapshot(
     );
 }
 
-/// The origin of the app an action dispatched now lands on: the active SDK
-/// connection's URL for an HTTP connection, and for a WebSocket app the browser
-/// origin that registered it. `None` when nothing is connected, or for a
-/// WebSocket app registered by a non-browser process or by tab key, whose
-/// origin is unknown. A condition-check secret is substituted only for its own
-/// session's app (`crate::condition_secrets`).
-fn active_origin(manager: &SdkConnectionManager) -> Option<crate::mcp::origin_guard::NormOrigin> {
+/// The origin of the app an element action dispatched now lands on, decided
+/// the way `AppDispatcher::dispatch_active` decides where it goes. When the app
+/// registry routes the active connection's app id over the WebSocket relay
+/// (`relay_routed`), the action goes to that app id's relay registrant, whose
+/// origin is the browser origin it registered with; otherwise it goes over HTTP
+/// to the active connection's URL. `None` when nothing is connected, or when the
+/// destination's origin is unknown: a relay registrant that is not a browser
+/// page (a local process, a tab key), or a relay app the registry no longer
+/// routes. A condition-check secret is substituted only for its own session's
+/// app (`crate::condition_secrets`), so this is read where the arm is chosen,
+/// not where the connection was made: an HTTP connection whose app id a relay
+/// registrant also holds is answered by the registrant.
+fn destination_origin(
+    manager: &SdkConnectionManager,
+    relay_routed: bool,
+) -> Option<crate::mcp::origin_guard::NormOrigin> {
     let conn = manager.active_connection()?;
-    if conn
-        .app_url
-        .starts_with(crate::mcp::ws_relay::WS_SYNTHETIC_URL_PREFIX)
-    {
-        return match &conn.activated_by {
+    if relay_routed {
+        let registrant = manager
+            .connections
+            .get(&crate::mcp::ws_relay::ws_synthetic_url(
+                &conn.app_info.app_id,
+            ))?;
+        return match &registrant.activated_by {
             Some(crate::mcp::relay_binding::Principal::Browser { origin, .. }) => {
                 Some(origin.clone())
             }
             _ => None,
         };
     }
+    if conn
+        .app_url
+        .starts_with(crate::mcp::ws_relay::WS_SYNTHETIC_URL_PREFIX)
+    {
+        return None;
+    }
     crate::mcp::origin_guard::NormOrigin::parse(&conn.app_url)
 }
 
-/// [`active_origin`] of the runner's connection manager.
+/// [`destination_origin`] of the runner's connection manager and app
+/// registry: the same two reads, in the same order, as `dispatch_active`.
 async fn active_app_origin(state: &Arc<ApiState>) -> Option<crate::mcp::origin_guard::NormOrigin> {
-    active_origin(&*state.sdk_connection.lock().await)
+    let app_id = state
+        .sdk_connection
+        .lock()
+        .await
+        .active_connection()
+        .map(|conn| conn.app_info.app_id.clone())?;
+    let relay_routed = matches!(
+        state
+            .app_registry
+            .get_live(&app_id)
+            .await
+            .map(|entry| entry.transport),
+        Some(AppTransport::Websocket)
+    );
+    destination_origin(&*state.sdk_connection.lock().await, relay_routed)
 }
 
 /// The WebSocket payload and HTTP body the APP receives for an element action.
 /// For a `type` action they carry the values of its `{{secret:<ref>}}`
-/// placeholders, when `active_origin` (the active connection's, see
-/// [`active_origin`]) is the app the holding condition session targets
+/// placeholders, when `active_origin` (where the action lands, see
+/// [`destination_origin`]) is the app the holding condition session targets
 /// (`crate::condition_secrets`, plan
 /// 2026-11-06-a-regression-test-run-is-judged-by-what-it-covered-and-a-silent-run-reads-unknown
 /// Phase 13). `body` stays unsubstituted: the IPC fallback, the journey ledger
@@ -10094,13 +10126,13 @@ mod condition_secrets_dispatch_tests {
     //! reaches its session's own app with its value, never another app, and
     //! the value comes back in no response, log line or ledger string. A
     //! handler needs an `ApiState`, which no test builds, so these run the
-    //! handler's own pieces in its order (`active_origin`,
+    //! handler's own pieces in its order (`destination_origin`,
     //! `element_action_app_payloads`, `AppDispatcher::dispatch_active`,
     //! `ws_element_action_result` / `ipc_fallback_refusal`, then
     //! `condition_secrets::scrub_action_result`). Their composition in the
     //! handler is pinned from source by `condition_secrets`' own tests.
     use super::{
-        active_origin, element_action_app_payloads, ipc_fallback_refusal, split_arm_payloads,
+        destination_origin, element_action_app_payloads, ipc_fallback_refusal, split_arm_payloads,
         ws_element_action_result, SdkConnectionManager,
     };
     use crate::condition_secrets::test_support::LogCapture;
@@ -10186,7 +10218,7 @@ mod condition_secrets_dispatch_tests {
         let (dispatcher, connections) = http_target(&echo_url).await;
         let logs = LogCapture::start();
         let body = json!({"action": "type", "params": {"text": "{{secret:cs-sdk-http-pw}}"}});
-        let origin = active_origin(&*connections.lock().await);
+        let origin = destination_origin(&*connections.lock().await, false);
         assert!(
             origin.is_some(),
             "anti-vacuity: an HTTP connection has an origin"
@@ -10289,7 +10321,7 @@ mod condition_secrets_dispatch_tests {
         let connections = manager_with_active("wapp", "ws-app://wapp", "");
         let body = json!({"action": "type", "text": "{{secret:cs-sdk-ws-pw}}"});
         assert_eq!(
-            active_origin(&*connections.lock().await),
+            destination_origin(&*connections.lock().await, true),
             None,
             "a WebSocket app registered by no browser has no origin"
         );
@@ -10307,7 +10339,7 @@ mod condition_secrets_dispatch_tests {
                 origin: NormOrigin::parse("http://127.0.0.1:3001").expect("an origin"),
             });
         }
-        let origin = active_origin(&*connections.lock().await);
+        let origin = destination_origin(&*connections.lock().await, true);
         let (ws_payload, http_body) =
             element_action_app_payloads("password-field", &body, Some("tab-7"), origin.as_ref())
                 .expect("a held ref, for the page its session targets");
@@ -10381,7 +10413,7 @@ mod condition_secrets_dispatch_tests {
             SECRET,
         );
         let (_dispatcher, connections) = http_target(&json_echo_app().await).await;
-        let origin = active_origin(&*connections.lock().await);
+        let origin = destination_origin(&*connections.lock().await, false);
         assert!(origin.is_some(), "anti-vacuity: another app is active");
         let body = json!({"action": "type", "params": {"text": "{{secret:cs-sdk-other-pw}}"}});
         let refused = element_action_app_payloads("password-field", &body, None, origin.as_ref())
@@ -10391,5 +10423,100 @@ mod condition_secrets_dispatch_tests {
             .refusal("the action was not dispatched")
             .to_string()
             .contains(SECRET));
+    }
+
+    /// A relay registrant of `app_id`, registered by `activated_by`.
+    fn relay_registrant(app_id: &str, activated_by: Option<Principal>) -> super::SdkConnection {
+        super::SdkConnection {
+            app_url: format!("ws-app://{app_id}"),
+            base_path: String::new(),
+            app_info: super::SdkAppInfo {
+                app_id: app_id.to_string(),
+                app_name: "t".into(),
+                app_type: "web".into(),
+                framework: None,
+                version: None,
+                capabilities: vec![],
+                port: 0,
+            },
+            client: reqwest::Client::new(),
+            connected_at: 0,
+            transport_kind: None,
+            physical_device_id: None,
+            activated_by,
+        }
+    }
+
+    fn browser(origin: &str) -> Option<Principal> {
+        Some(Principal::Browser {
+            class: OriginClass::Foreign,
+            origin: NormOrigin::parse(origin).expect("an origin"),
+        })
+    }
+
+    /// Where an action lands is decided the way `dispatch_active` decides
+    /// it: over HTTP, the active connection's URL; when the registry routes
+    /// the active connection's app id over the relay, that app id's relay
+    /// registrant, whose origin is its browser's (none for a non-browser
+    /// registrant).
+    #[tokio::test]
+    async fn condition_secrets_a_relay_routed_app_id_lands_on_its_registrant() {
+        let target = json_echo_app().await;
+        let (_dispatcher, connections) = http_target(&target).await;
+        let target_origin = NormOrigin::parse(&target);
+        assert_eq!(
+            destination_origin(&*connections.lock().await, false),
+            target_origin,
+            "over HTTP: the connection's own URL"
+        );
+        for activated_by in [None, browser("https://elsewhere.example"), browser(&target)] {
+            let expected = match &activated_by {
+                Some(Principal::Browser { origin, .. }) => Some(origin.clone()),
+                _ => None,
+            };
+            connections.lock().await.connections.insert(
+                "ws-app://happ".to_string(),
+                relay_registrant("happ", activated_by),
+            );
+            assert_eq!(
+                destination_origin(&*connections.lock().await, true),
+                expected,
+                "relay-routed: the registrant's origin"
+            );
+        }
+    }
+
+    /// The active HTTP connection is the session's own app, but a relay
+    /// registrant holds the same app id, so `dispatch_active` would send the
+    /// action over the relay to the registrant. The value is typed only when
+    /// the registrant is a browser page at the target origin.
+    #[tokio::test]
+    async fn condition_secrets_a_relay_registrant_of_the_same_app_id_is_the_destination() {
+        const SECRET: &str = "relay-collision-secret-Rc1";
+        let target = json_echo_app().await;
+        let _held = hold("run-sdk-collision", &target, "cs-sdk-collision-pw", SECRET);
+        let (_dispatcher, connections) = http_target(&target).await;
+        let body = json!({"action": "type", "text": "{{secret:cs-sdk-collision-pw}}"});
+        for (activated_by, lands) in [
+            (None, false),
+            (browser("https://elsewhere.example"), false),
+            (browser(&target), true),
+        ] {
+            connections.lock().await.connections.insert(
+                "ws-app://happ".to_string(),
+                relay_registrant("happ", activated_by),
+            );
+            let relayed = destination_origin(&*connections.lock().await, true);
+            let built =
+                element_action_app_payloads("password-field", &body, None, relayed.as_ref());
+            assert_eq!(built.is_ok(), lands, "{relayed:?}");
+            if let Err(refused) = built {
+                assert_eq!(refused.code(), WRONG_APP_CODE);
+                assert!(!refused
+                    .refusal("the action was not dispatched")
+                    .to_string()
+                    .contains(SECRET));
+            }
+        }
     }
 }
