@@ -2193,6 +2193,11 @@ struct PendingContinuationsResponse {
     #[serde(default)]
     #[allow(dead_code)]
     total: i64,
+    /// Names this pull. Echoed in the poll report so coord can pair the report
+    /// with the response it answers. Absent on an empty pull, and from a coord
+    /// predating the token.
+    #[serde(default)]
+    pull_token: Option<String>,
 }
 
 /// The `continuation_consumed_outcome` tokens **this runner** can honestly
@@ -5570,6 +5575,9 @@ async fn poll_pending_continuations(device_id: uuid::Uuid) {
     };
     let resp = match client
         .get(&url)
+        .query(&pending_continuations_query(
+            crate::instance::instance_name(),
+        ))
         .timeout(Duration::from_secs(5))
         .send()
         .await
@@ -5613,11 +5621,25 @@ async fn poll_pending_continuations(device_id: uuid::Uuid) {
         listed_n: body.pending.len(),
         ..Default::default()
     };
+    let pull_token = body.pull_token;
     for row in body.pending {
         let (payload, delivery) = poll_row_delivery(row, listed_epoch);
         counts.record(dispatch_gate_continuation(payload, device_id, delivery).await);
     }
-    post_continuation_poll_report(device_id, counts).await;
+    post_poll_report_body(ContinuationPollReportBody::new(device_id, counts).for_pull(pull_token))
+        .await;
+}
+
+/// The instance half of the pending pull's query string. Every instance on a
+/// machine shares the device id and lists all of its rows, so a named instance
+/// says who it is: its pull lists a row addressed to the primary and drops it,
+/// and coord must not read that as the row reaching its addressee. The primary
+/// sends nothing, which is also how a runner predating this reads.
+fn pending_continuations_query(instance_name: Option<String>) -> Vec<(&'static str, String)> {
+    instance_name
+        .map(|name| ("runner_instance_name", name))
+        .into_iter()
+        .collect()
 }
 
 /// Turn one `pending-continuations` row into what the dispatcher takes: the
@@ -5720,6 +5742,9 @@ struct ContinuationPollReportBody {
     /// type does not deny unknown fields, so an older coord ignores it.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     sealed_but_relisted_gate_ids: Vec<uuid::Uuid>,
+    /// The `pull_token` of the pull this report answers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pull_token: Option<String>,
 }
 
 impl ContinuationPollReportBody {
@@ -5750,7 +5775,16 @@ impl ContinuationPollReportBody {
             skipped_n: counts.listed_n.saturating_sub(counts.dispatched_n),
             skip_reasons,
             sealed_but_relisted_gate_ids: counts.sealed_but_relisted_gate_ids,
+            pull_token: None,
         }
+    }
+
+    /// Mark this report as answering one pull, so coord can treat it as proof
+    /// that THIS response arrived rather than that some poll on the device
+    /// succeeded.
+    fn for_pull(mut self, pull_token: Option<String>) -> Self {
+        self.pull_token = pull_token;
+        self
     }
 }
 
@@ -5762,6 +5796,11 @@ impl ContinuationPollReportBody {
 /// delivery**: a 404 (coord's route not deployed yet — parallel phase) is
 /// `debug!`; any other non-2xx or transport error is one `warn!`.
 async fn post_continuation_poll_report(device_id: uuid::Uuid, counts: PollRunCounts) {
+    post_poll_report_body(ContinuationPollReportBody::new(device_id, counts)).await;
+}
+
+/// POST a built poll self-report; see [`post_continuation_poll_report`].
+async fn post_poll_report_body(body: ContinuationPollReportBody) {
     let Some(base) = connected_coord_base() else {
         return;
     };
@@ -5770,7 +5809,6 @@ async fn post_continuation_poll_report(device_id: uuid::Uuid, counts: PollRunCou
         warn!("agent_runtime: poll-report: no shared coord client (continuing)");
         return;
     };
-    let body = ContinuationPollReportBody::new(device_id, counts);
     // coord-tenant-scope(device): body is ContinuationPollReportBody::new(device_id, counts) (:2241); coord's poll-report row has no tenant column and the handler takes no auth extractor.
     match crate::auth::attach_device_auth(client.post(&url))
         .timeout(Duration::from_secs(5))
@@ -16365,6 +16403,11 @@ mod tests {
             serde_json::from_value(serde_json::json!({})).unwrap();
         assert!(bare.pending.is_empty());
         assert_eq!(bare.total, 0);
+        assert_eq!(bare.pull_token, None);
+        let tokened: PendingContinuationsResponse =
+            serde_json::from_value(serde_json::json!({ "pending": [], "pull_token": "p" }))
+                .unwrap();
+        assert_eq!(tokened.pull_token.as_deref(), Some("p"));
     }
 
     // =========================================================================
@@ -17552,6 +17595,36 @@ mod tests {
         assert!(
             should_post_deferred_stamp(gate_b, t0),
             "a different gate is independent"
+        );
+    }
+
+    /// A report answering a pull echoes its token; with no token to echo (an
+    /// empty pull, or a coord predating the token) it serializes no key.
+    #[test]
+    fn continuation_poll_report_echoes_the_pull_it_answers() {
+        let dev = uuid::Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        let counts = PollRunCounts {
+            listed_n: 1,
+            ..Default::default()
+        };
+
+        let body =
+            ContinuationPollReportBody::new(dev, counts.clone()).for_pull(Some("pull-1".into()));
+        let v = serde_json::to_value(&body).unwrap();
+        assert_eq!(v["pull_token"], "pull-1");
+
+        let tokenless = ContinuationPollReportBody::new(dev, counts).for_pull(None);
+        let v = serde_json::to_value(&tokenless).unwrap();
+        assert!(v.get("pull_token").is_none());
+    }
+
+    /// A named instance identifies itself on the pull; the primary sends nothing.
+    #[test]
+    fn pending_continuations_query_names_only_a_named_instance() {
+        assert!(pending_continuations_query(None).is_empty());
+        assert_eq!(
+            pending_continuations_query(Some("e2e".to_string())),
+            vec![("runner_instance_name", "e2e".to_string())]
         );
     }
 
