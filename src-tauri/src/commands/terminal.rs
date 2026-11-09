@@ -59,6 +59,46 @@ pub(crate) fn admit_spawn_tenant(raw: Option<&str>) -> Result<Option<uuid::Uuid>
     Ok(tenant)
 }
 
+/// Settle `terminal_create`'s blocking spawn, reporting an unspawned
+/// allocation only where that is known to be safe.
+///
+/// - A **create error** is `TerminalManager::create`'s own `Err`: the allocation
+///   (if this call made one) is reported through `report`, as on every
+///   `acquire_for_terminal` door.
+/// - A **join error** is a panic inside `create`, which may come after
+///   `sessions.insert` — a live session may hold the tree — so it is logged and
+///   reports NOTHING (plan
+///   `2026-11-08-a-spawn-refused-after-its-worktree-allocation-leaves-the-tree-on-disk`,
+///   Why #5).
+///
+/// `report` is the seam the tests drive; the command passes
+/// [`crate::agent_worktree::isolated_edit::IsolatedEditContext::report_unspawned`].
+pub(crate) fn settle_terminal_spawn<T>(
+    joined: Result<Result<T, String>, tokio::task::JoinError>,
+    isolated_ctx: Option<&crate::agent_worktree::isolated_edit::IsolatedEditContext>,
+    report: impl FnOnce(&crate::agent_worktree::isolated_edit::IsolatedEditContext, &str),
+) -> Result<T, String> {
+    match joined {
+        Ok(Ok(info)) => Ok(info),
+        Ok(Err(e)) => {
+            if let Some(ctx) = isolated_ctx {
+                report(ctx, &e);
+            }
+            Err(e)
+        }
+        Err(join) => {
+            if let Some(ctx) = isolated_ctx {
+                warn!(
+                    "terminal_create: the spawn task failed ({join}) after allocation {}; a \
+                     session may already hold it, so it is not reported abandoned",
+                    ctx.agent_id
+                );
+            }
+            Err(format!("terminal spawn task failed: {join}"))
+        }
+    }
+}
+
 /// Create a new terminal session.
 ///
 /// Phase 2 of `plans/2026-05-28-isolate-session-edit-work-in-worktrees.md`:
@@ -250,7 +290,7 @@ pub async fn terminal_create(
     // so a CRITICAL refusal has somewhere to go — the frontend re-invokes with
     // `resource_override: true` once they pick "Start anyway".
     let create_resource_override = resource_override.unwrap_or(false);
-    let info = spawn_blocking_tracked(move || {
+    let joined = spawn_blocking_tracked(move || {
         let _create_span = tracing::debug_span!("terminal_spawn.manager_create").entered();
         create_manager.create(
             create_title,
@@ -270,8 +310,10 @@ pub async fn terminal_create(
             crate::coord_drain_state::SpawnOrigin::OperatorTerminal,
         )
     })
-    .await
-    .map_err(|e| format!("terminal spawn task failed: {e}"))??;
+    .await;
+    let info = settle_terminal_spawn(joined, isolated_ctx.as_ref(), |ctx, e| {
+        ctx.report_unspawned("terminal_create command", e)
+    })?;
 
     // Park the isolated edit context on the terminal session so its
     // heartbeat + claim live as long as the PTY. Cleared in `close()`.
@@ -3416,6 +3458,65 @@ mod tests {
         assert_eq!(
             partial["unreadableRecords"],
             serde_json::json!(["/h/.claude/sessions/7.json (does not parse)"])
+        );
+    }
+
+    /// Plan `2026-11-08-…-leaves-the-tree-on-disk` Phase 0, Why #5: a create
+    /// error posts the unspawned allocation once; a join error — a panic inside
+    /// `create` that may come after `sessions.insert` — posts nothing.
+    #[tokio::test]
+    async fn only_a_create_error_reports_the_unspawned_allocation() {
+        let ctx = crate::agent_worktree::isolated_edit::IsolatedEditContext::for_test_with_agent_id(
+            "6f1c2a7e-0000-4000-8000-00000000c0de".to_string(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let posted = std::sync::Mutex::new(Vec::<(uuid::Uuid, String)>::new());
+        let report = |ctx: &crate::agent_worktree::isolated_edit::IsolatedEditContext, e: &str| {
+            ctx.report_unspawned_with("test door", e, |id, reason| {
+                posted.lock().unwrap().push((id, reason))
+            });
+        };
+
+        let created: Result<Result<(), String>, tokio::task::JoinError> =
+            Ok(Err("Failed to open PTY: out of ptys".to_string()));
+        assert_eq!(
+            settle_terminal_spawn(created, Some(&ctx), report),
+            Err("Failed to open PTY: out of ptys".to_string())
+        );
+        assert_eq!(
+            *posted.lock().unwrap(),
+            vec![(
+                uuid::Uuid::parse_str("6f1c2a7e-0000-4000-8000-00000000c0de").unwrap(),
+                "Failed to open PTY: out of ptys".to_string()
+            )],
+            "a create error posts once"
+        );
+
+        let join = tokio::spawn(async { panic!("create panicked after insert") })
+            .await
+            .expect_err("a panicking task is a join error");
+        let settled = settle_terminal_spawn::<()>(Err(join), Some(&ctx), report);
+        assert!(
+            settled
+                .as_ref()
+                .is_err_and(|e| e.starts_with("terminal spawn task failed:")),
+            "{settled:?}"
+        );
+        assert_eq!(
+            posted.lock().unwrap().len(),
+            1,
+            "a join error posts nothing"
+        );
+
+        assert_eq!(
+            settle_terminal_spawn::<u8>(Ok(Ok(7)), Some(&ctx), report),
+            Ok(7)
+        );
+        assert_eq!(
+            posted.lock().unwrap().len(),
+            1,
+            "a spawned session posts nothing"
         );
     }
 

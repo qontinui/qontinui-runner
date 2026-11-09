@@ -5618,6 +5618,18 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
             "request_id": data.get("request_id"),
         }));
     }
+    // The resource guard's CRITICAL verdict, judged before `acquire_for_terminal`
+    // below runs a `git worktree add` a refusal would leave on disk — and, like
+    // the drain gate, before the grant gate, so a refusal spends no create
+    // grant. `false`: the relay never overrides the floor (see its create
+    // call). Answered with the failed-create arm's own typed frame.
+    if let Err(frame) = crate::terminal::spawn_refusal::relay_precheck(
+        || crate::resource_guard::precheck_spawn("terminal session", false),
+        data,
+    ) {
+        warn!("relay create: refused by the resource-guard precheck");
+        return Some(frame);
+    }
     // D2 — the TARGET chooses. A frame with no `remote` block is the
     // operator-web / mobile path and keeps its caller-chosen `working_dir`;
     // one carrying a block is a REMOTE create, and `admitted` holds the
@@ -6016,15 +6028,17 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
                 Some(frame)
             }
             Err(e) => {
-                let mut frame = serde_json::json!({
-                    "type": "error",
-                    "message": format!("Failed to create terminal: {}", e),
-                    "request_id": data.get("request_id"),
-                });
-                if admitted.is_some() {
-                    frame["remote"] = crate::mcp::remote_terminal::remote_echo(data);
+                // The allocation (if this call made one) is reported, as on
+                // every `acquire_for_terminal` door; the context's Drop then
+                // releases its claims.
+                if let Some(ctx) = isolated_ctx.as_ref() {
+                    ctx.report_unspawned("backend_relay terminal_create", &e);
                 }
-                Some(frame)
+                Some(crate::terminal::spawn_refusal::relay_spawn_failed_frame(
+                    &e,
+                    data,
+                    admitted.is_some(),
+                ))
             }
         }
     } else {
