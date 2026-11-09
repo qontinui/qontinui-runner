@@ -23,10 +23,12 @@
 //!
 //! ## A checkout that versions the provisioned tree: do not create new paths
 //!
-//! When the probe answered and the repository tracks at least one path under
-//! the probed root — the provisioned tree root itself (`.claude/commands`,
-//! `.claude/skills` as a whole, `.claude/agents`), never a per-skill directory —
-//! an ABSENT destination the repository does not track is skipped
+//! When the probe answered and the repository tracks at least one path the
+//! BUNDLE carries under the probed root — the provisioned tree root itself
+//! (`.claude/commands`, `.claude/skills` as a whole, `.claude/agents`), never a
+//! per-skill directory; each provisioner names its bundle with
+//! [`TrackedPaths::versioning`] — an ABSENT destination the repository does not
+//! track is skipped
 //! ([`SkipReason::RootVersioned`]). That checkout owns the tree; a path absent
 //! from it is one its own history has not delivered YET. Writing it creates an
 //! untracked file at a path upstream ADDS, and `git merge --ff-only` /
@@ -38,15 +40,19 @@
 //! upstream-added skill DIRECTORY being written into a stale tree.
 //!
 //! - A tracked path the user DELETED keeps today's write (below).
-//! - A repository that versions none of the provisioned tree (every agent
-//!   worktree of a product repo) is unaffected: its set is empty, so every
-//!   absent path is written as before.
-//! - **The cost, stated:** a repository that tracks even ONE path under a
-//!   provisioned root — say a single repo-local command — receives no bundled
-//!   unit it does not track itself under that root. The rule cannot tell "this
-//!   repo is the canonical source" from "this repo authored one of its own"; the
-//!   skip is recorded per unit in the `[provisioned: …]` ledger as
-//!   `skipped-root-versioned`, so it is never silent.
+//! - A repository that tracks NO bundled path under the root is unaffected and
+//!   receives every absent unit as before — including one that tracks units of
+//!   its OWN there. That case is live, not hypothetical: qontinui-forge,
+//!   qontinui-cloud and qontinui-clone-factory each track a repo-local
+//!   `.claude/agents/clone-implementer.md`, and qontinui-studio a repo-local
+//!   `.claude/skills/launch-kit/`; keying on "any tracked path" would have cost
+//!   them every bundled agent (`code-reviewer` among them) or skill.
+//! - **The cost, stated:** a repository that tracks even ONE bundled path under
+//!   a provisioned root receives no bundled unit it does not track itself
+//!   there. In practice that is the canonical source (qontinui-claude-config)
+//!   or a repo that vendored a bundled unit on purpose; the skip is recorded per
+//!   unit in the `[provisioned: …]` ledger as `skipped-root-versioned`, so it is
+//!   never silent.
 //!
 //! ## Which repos this actually changes
 //!
@@ -209,6 +215,10 @@ pub(crate) struct TrackedPaths {
     /// EXISTING destination is skipped — see the module doc's "UNKNOWN inside a
     /// repository" section.
     unknown_in_repo: bool,
+    /// Set by [`Self::versioning`]: the probe answered and the repository
+    /// tracks at least one path the BUNDLE carries under the probed root — it
+    /// versions the provisioned tree itself. False until a provisioner asks.
+    root_versioned: bool,
 }
 
 impl TrackedPaths {
@@ -241,6 +251,7 @@ impl TrackedPaths {
         Self {
             relative,
             unknown_in_repo: false,
+            root_versioned: false,
         }
     }
 
@@ -268,6 +279,7 @@ impl TrackedPaths {
         Self {
             relative: HashSet::new(),
             unknown_in_repo,
+            root_versioned: false,
         }
     }
 
@@ -276,12 +288,26 @@ impl TrackedPaths {
         self.unknown_in_repo
     }
 
-    /// True iff the probe ANSWERED and the repository tracks at least one path
-    /// under the probed root, i.e. the checkout versions the provisioned tree
-    /// itself. Never true for an UNKNOWN probe: its set is empty by
-    /// construction, so that arm keeps its own rule.
+    /// Decide whether the checkout VERSIONS the provisioned tree: the probe
+    /// answered and git tracks at least one of `bundle` — the relative paths
+    /// this provisioner would write under the probed root. A repository that
+    /// tracks only units of its OWN under the root (a repo-local agent or
+    /// skill the bundle does not carry) is not versioned, so it still receives
+    /// every bundled unit. Never true for an UNKNOWN probe, whose set is empty;
+    /// that arm keeps its own rule. A provisioner that never calls this gets
+    /// no [`SkipReason::RootVersioned`] skips at all.
+    #[must_use]
+    pub(crate) fn versioning<P: AsRef<Path>>(mut self, bundle: impl IntoIterator<Item = P>) -> Self {
+        self.root_versioned = !self.unknown_in_repo
+            && bundle
+                .into_iter()
+                .any(|p| self.relative.contains(p.as_ref()));
+        self
+    }
+
+    /// True iff [`Self::versioning`] found the checkout versions the tree.
     pub(crate) fn is_root_versioned(&self) -> bool {
-        !self.unknown_in_repo && !self.relative.is_empty()
+        self.root_versioned
     }
 
     /// True iff git tracks `relative` (a path relative to the probed root).
@@ -308,8 +334,8 @@ impl TrackedPaths {
     /// overwrite. An absent `dst` is still written.
     ///
     /// One more skip applies to an ABSENT `dst`: when the probe answered and
-    /// the repository tracks at least one path under the probed root (it
-    /// VERSIONS the provisioned tree), an absent path it does not track is
+    /// the repository tracks at least one path of the bundle under the probed
+    /// root ([`Self::versioning`]), an absent path it does not track is
     /// skipped ([`SkipReason::RootVersioned`]) — see the module doc's "A
     /// checkout that versions the provisioned tree" section. A tracked path
     /// that was deleted is still written, as above.
@@ -785,7 +811,8 @@ mod tests {
         std::fs::write(&owned, b"body").unwrap();
         git_add(tmp.path(), &owned);
 
-        let tracked = TrackedPaths::probe(tmp.path());
+        let tracked =
+            TrackedPaths::probe(tmp.path()).versioning(["owned.md", "upstream-added.md"]);
         assert!(tracked.is_root_versioned());
         let added = tmp.path().join("upstream-added.md");
         assert_eq!(
@@ -816,7 +843,7 @@ mod tests {
         git_add(tmp.path(), &gone);
         std::fs::remove_file(&gone).unwrap();
 
-        let tracked = TrackedPaths::probe(tmp.path());
+        let tracked = TrackedPaths::probe(tmp.path()).versioning(["keep.md", "gone.md"]);
         assert!(tracked.is_root_versioned());
         assert_eq!(tracked.skip_reason(&gone, Path::new("gone.md")), None);
     }
@@ -836,11 +863,53 @@ mod tests {
         let root = tmp.path().join(".claude").join("commands");
         std::fs::create_dir_all(&root).unwrap();
 
-        let tracked = TrackedPaths::probe(&root);
+        let tracked = TrackedPaths::probe(&root).versioning(["vet-plan.md"]);
         assert!(!tracked.is_unknown_in_repo(), "the probe answered");
         assert!(!tracked.is_root_versioned());
         assert_eq!(
             tracked.skip_reason(&root.join("vet-plan.md"), Path::new("vet-plan.md")),
+            None
+        );
+    }
+
+    /// A repository that tracks only a unit of its OWN under the root (one the
+    /// bundle does not carry) does NOT version the provisioned tree: every
+    /// bundled unit is still written. The live shape is qontinui-forge /
+    /// qontinui-cloud / qontinui-clone-factory, each tracking a repo-local
+    /// `.claude/agents/clone-implementer.md`.
+    #[test]
+    fn a_repo_tracking_only_its_own_unit_is_not_root_versioned() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        git_init(tmp.path());
+        let own = tmp.path().join("clone-implementer.md");
+        std::fs::write(&own, b"body").unwrap();
+        git_add(tmp.path(), &own);
+
+        let tracked =
+            TrackedPaths::probe(tmp.path()).versioning(["code-reviewer.md", "merge-specialist.md"]);
+        assert!(!tracked.is_root_versioned());
+        assert_eq!(
+            tracked.skip_reason(
+                &tmp.path().join("code-reviewer.md"),
+                Path::new("code-reviewer.md")
+            ),
+            None
+        );
+    }
+
+    /// Without a [`TrackedPaths::versioning`] call nothing is ever skipped as
+    /// root-versioned, however much the repository tracks.
+    #[test]
+    fn root_versioned_needs_a_named_bundle() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        git_init(tmp.path());
+        let owned = tmp.path().join("owned.md");
+        std::fs::write(&owned, b"body").unwrap();
+        git_add(tmp.path(), &owned);
+        let tracked = TrackedPaths::probe(tmp.path());
+        assert!(!tracked.is_root_versioned());
+        assert_eq!(
+            tracked.skip_reason(&tmp.path().join("new.md"), Path::new("new.md")),
             None
         );
     }
@@ -855,7 +924,7 @@ mod tests {
             b"gitdir: /nonexistent/qontinui-provision-guard-root-versioned-test\n",
         )
         .unwrap();
-        let tracked = TrackedPaths::probe(tmp.path());
+        let tracked = TrackedPaths::probe(tmp.path()).versioning(["absent.md"]);
         assert!(tracked.is_unknown_in_repo());
         assert!(!tracked.is_root_versioned());
         assert_eq!(
