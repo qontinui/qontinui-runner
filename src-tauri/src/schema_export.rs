@@ -992,8 +992,9 @@ pub fn export_all_schemas() -> Value {
     // registration above (vision-core's MIT twin); the two Rust copies are
     // held to one schema by `outcome_twins_have_identical_schemas` below,
     // because each `add!` is its own `schema_for!` root and the drift check
-    // compares regenerated bindings with committed ones only. `Verdict` is a
-    // fold INPUT with no schema derive. (3) ──
+    // compares regenerated bindings with committed ones only. `Verdict` (the
+    // fold's INPUT) has a hand-written schema impl but is not registered: no
+    // binding consumer reads it yet. (3) ──
     {
         use qontinui_types::outcome as qout;
         add!("AssertionOutcome", qout::AssertionOutcome);
