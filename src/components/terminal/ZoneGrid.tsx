@@ -35,6 +35,7 @@ import {
   scrollCellIntoView,
   focusedTabIdFor,
   newestSurfacedTabId,
+  surfacedTabIds,
   zoneForTab,
 } from "./flowScrollRouting";
 import { writeToTerminalById } from "./writeToTerminalById";
@@ -447,7 +448,9 @@ function ZoneGridInner({
   const prevTabIdsRef = useRef<Set<string> | null>(null);
   const pendingFocusTabIdRef = useRef<string | null>(null);
   useEffect(() => {
-    const currentIds = tabs.map((t) => t.id);
+    // The baseline is the SURFACED ids, so a tab whose verdict arrives late
+    // and says surface is routed when it flips, not lost as "already present".
+    const currentIds = surfacedTabIds(tabs);
     if (!isFlowMode) {
       // Keep the baseline current in preset mode so switching INTO flow mode
       // doesn't treat every already-open tab as newly added.

@@ -124,6 +124,15 @@ export interface TerminalTab {
    */
   coalesced?: boolean;
   /**
+   * True while this tab has no focus-coalescer verdict yet: the backend re-sync
+   * (`reconcileTabsWithBackend`) added it before its `terminal-created` event
+   * arrived, and only that event carries `surface`. Such a tab is held as
+   * `coalesced` meanwhile (an absent verdict is not a yes), and the event, when
+   * it lands, applies its verdict once and clears this flag
+   * (`reduceCreatedTerminal`).
+   */
+  awaitingSurfaceVerdict?: boolean;
+  /**
    * F1/F2 — the tenant this session was spawned under, as sent to
    * `terminal_create` (and therefore exactly what the Rust registry stamped
    * onto `Intent.tenant_id`). Immortal for the tab's life: switching the
@@ -297,7 +306,22 @@ export function reduceCreatedTerminal(
   pendingBypass = false,
   pendingRemote?: RemoteTabIdentity,
 ): TerminalTab[] {
-  if (tabs.some((t) => t.id === info.id)) return tabs;
+  const idx = tabs.findIndex((t) => t.id === info.id);
+  if (idx >= 0) {
+    // A tab the re-sync added ahead of this event takes the verdict the event
+    // carries, once. Any other existing tab is a re-delivery: left untouched.
+    // A payload with no `surface` (the page-move adopt passes a bare
+    // `terminal_list` row) carries no verdict, so it settles nothing.
+    const existing = tabs[idx];
+    if (!existing.awaitingSurfaceVerdict || info.surface === undefined) return tabs;
+    const next = tabs.slice();
+    next[idx] = {
+      ...existing,
+      awaitingSurfaceVerdict: undefined,
+      coalesced: info.surface === true ? undefined : true,
+    };
+    return next;
+  }
   return [
     ...tabs,
     {
@@ -537,7 +561,9 @@ export interface HiddenWorker {
  * the only source" reconciler (2026-08-20 manual-test loop, item A).
  *
  * Rules, in both directions:
- *  - ADD every backend terminal with no local tab (a missed `terminal-created`).
+ *  - ADD every backend terminal with no local tab (a missed `terminal-created`),
+ *    held `coalesced` and `awaitingSurfaceVerdict` because the missed event is
+ *    the only carrier of the focus coalescer's `surface` verdict.
  *  - DROP every local terminal tab with no backend terminal (closed out-of-band),
  *    EXCEPT plan tabs (no PTY — the backend never lists them), synthetic tabs
  *    (test fixtures, never backed by a PTY) and tabs younger than
@@ -602,6 +628,10 @@ export function reconcileTabsWithBackend(
       exitCode: info.exitCode ?? null,
       workingDir: info.workingDir || undefined,
       createdAt: info.createdAt,
+      // A missed `terminal-created` means a missed `surface` verdict: hold the
+      // tab as suppressed until the event (if it is merely late) supplies one.
+      coalesced: true,
+      awaitingSurfaceVerdict: true,
     }));
 
   if (added.length === 0 && kept.length === tabs.length) return tabs;
