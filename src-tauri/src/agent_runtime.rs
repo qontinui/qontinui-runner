@@ -791,13 +791,14 @@ pub struct ConditionCheckPayload {
     /// `POST /coord/condition-runs/{run_id}/report` — the ONLY credential that
     /// route accepts (it is public; a device JWT 403s there).
     ///
-    /// `Option` because coord does not put it in the frame today: it embeds the
-    /// token in [`Self::initial_prompt`] for the spawned agent to curl with. The
-    /// runner needs it too, so that a spawn which never happens can still report
-    /// the run terminal instead of leaving it `running` forever — see
-    /// [`report_condition_run_failed`]. Until coord promotes it to a field,
-    /// [`condition_report_token`] recovers it from the prompt; when coord does,
-    /// this field wins with no further change here.
+    /// Coord sends it as its own frame key since qontinui-coord#3856, and also
+    /// embeds it in [`Self::initial_prompt`] for the spawned agent to curl with.
+    /// The runner needs it too, so that a spawn which never happens can still
+    /// report the run terminal instead of leaving it `running` forever — see
+    /// [`report_condition_run_failed`]. `Option` because a coord build that
+    /// predates #3856 sends no such key: [`condition_report_token`] then
+    /// recovers the token from the prompt, and this field wins whenever it is
+    /// present.
     #[serde(default)]
     pub report_token: Option<String>,
     /// Human name of the condition being checked, when coord supplies one.
@@ -8339,8 +8340,9 @@ const CONDITION_REPORT_BEARER_MARKER: &str = "Authorization: Bearer ";
 ///
 /// Two rungs, in order:
 ///
-/// 1. [`ConditionCheckPayload::report_token`] — the explicit wire field. Coord
-///    does not send it today; when it does, nothing else here changes.
+/// 1. [`ConditionCheckPayload::report_token`] — the explicit wire field, which
+///    coord sends since qontinui-coord#3856. A coord build that predates it
+///    sends none, and rung 2 answers.
 /// 2. The token coord embedded in `initial_prompt`. The prompt builder writes
 ///    it as `Authorization: Bearer <token>`, twice — once as a header
 ///    instruction, once inside the example curl.
@@ -12778,9 +12780,10 @@ mod tests {
     }
 
     /// The struct holds the credential in TWO fields — `report_token`, and
-    /// `initial_prompt`, which is where coord actually ships it today and which
-    /// also embeds the operator's `auth_setup` secret. A derived `Debug` would
-    /// put both in the next log line that formats a payload.
+    /// `initial_prompt`, where coord also ships it (and where a coord build
+    /// that predates qontinui-coord#3856 ships it alone), and which also embeds
+    /// the operator's `auth_setup` secret. A derived `Debug` would put both in
+    /// the next log line that formats a payload.
     #[test]
     fn condition_check_payload_debug_redacts_both_credential_carriers() {
         let token = "9f1c4b2ad0e34f7a8b6c5d4e3f2a1b09";
@@ -12842,10 +12845,10 @@ mod tests {
         );
     }
 
-    /// A condition-check frame from a coord that does not send `report_token`
-    /// must still deserialize (the field is `#[serde(default)]`), and the frame
-    /// coord sends today must land with `report_token: None` so the prompt rung
-    /// is the one that runs.
+    /// A condition-check frame from a coord build that predates
+    /// qontinui-coord#3856, which sends no `report_token` key, must still
+    /// deserialize (the field is `#[serde(default)]`) and land with
+    /// `report_token: None`, so the prompt rung is the one that runs.
     #[test]
     fn condition_check_payload_tolerates_a_coord_without_the_token_field() {
         let frame = serde_json::json!({
@@ -12862,6 +12865,40 @@ mod tests {
             condition_report_token(&payload).as_deref(),
             Some("deadbeefdeadbeefdeadbeefdeadbeef")
         );
+    }
+
+    /// The frame coord sends since qontinui-coord#3856 (its `spawn_frame`, in
+    /// `qontinui-coord/crates/coord/src/conditions/dispatch.rs`): eight keys,
+    /// `report_token` among them. Through the production envelope parser the
+    /// explicit field lands, and it wins over the token the prompt also carries.
+    #[test]
+    fn condition_check_payload_reads_the_report_token_coord_sends_as_its_own_key() {
+        let field_token = uuid::Uuid::from_bytes([6; 16]).simple().to_string();
+        let prompt_token = uuid::Uuid::from_bytes([7; 16]).simple().to_string();
+        let frame = serde_json::json!({
+            "source": "condition_check",
+            "run_id": "018f0000-0000-7000-8000-000000000000",
+            "target_device_id": "018f0000-0000-7000-8000-000000000001",
+            "target_url": "http://localhost:3001",
+            "initial_prompt": format!("Authorization: Bearer {prompt_token}\n"),
+            "report_token": field_token,
+            "presentation": "terminal",
+            "condition_name": "login works",
+        });
+        let envelope = serde_json::json!({ "payload": frame });
+        let payload =
+            parse_condition_check_payload(&envelope).expect("coord's eight-key frame parses");
+        assert_eq!(payload.report_token.as_deref(), Some(field_token.as_str()));
+        assert_eq!(
+            condition_report_token(&payload).as_deref(),
+            Some(field_token.as_str()),
+            "the explicit field wins over the prompt's token"
+        );
+        assert_ne!(
+            field_token, prompt_token,
+            "anti-vacuity: the two tokens differ"
+        );
+        assert_eq!(payload.condition_name.as_deref(), Some("login works"));
     }
 
     // =======================================================================
