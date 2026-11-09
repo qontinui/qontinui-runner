@@ -13,52 +13,80 @@
 //!
 //! # Rules
 //!
-//! 1. **Held per session.** [`register`] holds a frame's map from just before
-//!    the condition-check PTY is created. The [`Registration`] it returns
-//!    releases the map when it drops: on any failed spawn, or, once handed to
-//!    [`release_at_pty_exit`], when the PTY exits. [`HOLD_TTL`] is the
+//! 1. **Held per session.** [`register`] holds a frame's map, with the origin
+//!    of the frame's `target_url`, from just before the condition-check PTY is
+//!    created. The [`Registration`] it returns releases the map when it drops:
+//!    on any failed spawn, or, once handed to [`release_at_pty_exit`], when the
+//!    PTY exits. A map can be substituted for [`SUBSTITUTE_TTL`]; it stays held
+//!    (so it is still scrubbed) until the PTY exits, with [`HOLD_TTL`] as the
 //!    backstop for an exit nobody observed.
-//! 2. **Substituted in the `type` action only, on the way to the app only.**
-//!    [`app_bound_type_body`] substitutes `params.text` and a top-level `text`
-//!    (ui-bridge's `type` handler reads `request.params?.text || request.text`)
-//!    in a COPY of the request: the copy `mcp::sdk_client::handle_element_action`
-//!    sends to the app as its WebSocket payload or HTTP body. The request
-//!    itself is never substituted, because the IPC fallback, the journey
-//!    ledger and the `ui_bridge_events` row all read it.
-//! 3. **Never typed into the runner's own UI.** The IPC fallback runs when no
-//!    SDK app is connected, so its target is the runner's webview. It never
-//!    substitutes, and [`ipc_refusal`] refuses any placeholder that would
-//!    reach it.
+//! 2. **Substituted in the `type` action's text only, on the way to the
+//!    session's own app only.** [`app_bound_type_body`] substitutes
+//!    `params.text` and a top-level `text` (ui-bridge's `type` handler reads
+//!    `request.params?.text || request.text`) in a COPY of the request: the copy
+//!    `mcp::sdk_client::handle_element_action` sends to the app as its
+//!    WebSocket payload or HTTP body. It substitutes only when the active SDK
+//!    connection is the app the holding session targets (its origin is the
+//!    origin of the frame's `target_url`), so one session's secret is never
+//!    typed into another app. The request itself is never substituted, because
+//!    the IPC fallback, the journey ledger and the `ui_bridge_events` row all
+//!    read it.
+//! 3. **Never typed as literal text.** A placeholder anywhere else (another
+//!    action, another field) is refused, so the literal `{{secret:<ref>}}` never
+//!    reaches an app as a password. The IPC fallback runs when no SDK app is
+//!    connected, so its target is the runner's webview: it never substitutes,
+//!    and [`ipc_refusal`] refuses any placeholder that would reach it.
 //! 4. **Never shown back.** While any map is held, [`scrub_sdk_responses`]
-//!    replaces each held value with its placeholder in every `/ui-bridge/sdk/*`
-//!    response, [`scrub_action_result`] does so before an action's ledger rows
-//!    are written, and [`debug_scrubbed`] before the relay logs an app's change
-//!    event.
+//!    replaces each held value, and each truncated echo of one (a prefix of at
+//!    least [`MIN_ECHO_CHARS`] characters ending in `...` or `…`, the way
+//!    ui-bridge shortens a field's value in its summaries), with [`REDACTED`] in
+//!    every response of a router that returns app content: the
+//!    `/ui-bridge/sdk/*` routers, `/ui-bridge/apps/{app_id}/dispatch`, and the
+//!    `/ui-bridge/control/*` element and effect routes, whose WebSocket-app
+//!    branches answer with the app's own content. [`scrub_action_result`] does
+//!    so before an action's ledger rows are written, and [`debug_scrubbed`] and
+//!    [`scrub_text`] before the relay logs app content. The mask names no ref,
+//!    so nothing shown back hands a reader a ref to replay.
 //!
-//! An unknown, malformed or ambiguous ref is refused with a typed error
-//! ([`SubstitutionError`]); a placeholder is never typed as literal text.
-//! Nothing here logs a value: log lines carry a run id and counts.
+//! An unknown, malformed or ambiguous ref, a placeholder outside a `type`
+//! action's text, and a session whose app is not the active connection are each
+//! refused with a typed error ([`SubstitutionError`]). A refusal never names a
+//! held ref, and nothing here logs a value: log lines carry a run id and counts.
 //!
 //! # Accepted residuals
 //!
 //! - **A very short secret over-scrubs.** Scrubbing is substring replacement,
 //!   so a one- or two-character value is replaced wherever those characters
-//!   occur in an SDK response while its session lives. That can garble
+//!   occur in a scrubbed response while its session lives. That can garble
 //!   unrelated text, a JSON number equal to the value, a base64 image whose
-//!   encoding happens to contain it, and even the text of another placeholder.
-//!   It fails safe: the value is never shown; the session reads less of the
-//!   page.
+//!   encoding happens to contain it, and even the mask itself. It fails safe:
+//!   the value is never shown; the session reads less of the page.
 //! - **Pixels are not scrubbed.** A screenshot of a field that renders its
 //!   value in clear text shows the value; only text a response carries is
 //!   scrubbed. (A password input renders its value masked.)
 //! - **Only the raw and JSON-escaped forms are matched.** A value an app
-//!   echoes URL-encoded, HTML-escaped or base64-encoded is not recognised.
+//!   echoes URL-encoded, HTML-escaped or base64-encoded is not recognised, nor
+//!   is a truncated echo shorter than [`MIN_ECHO_CHARS`] characters or one that
+//!   ends in anything but `...` or `…`.
+//! - **A value byte-scrubbed out of a bare JSON number** leaves an unquoted
+//!   mask, so that body no longer parses. It still carries no value.
+//! - **The binding reads the active connection twice.** The origin check and
+//!   the dispatch each read the process-wide active SDK connection; a switch in
+//!   the microseconds between the two reads is not caught. A WebSocket app
+//!   binds only through the browser origin that registered it, so one
+//!   registered by a non-browser process or by tab key never substitutes.
+//! - **Only the SDK element-action route substitutes.** The runner's own
+//!   `/ui-bridge/control/*` action routes do not, so a placeholder sent there
+//!   is typed as its literal text; no secret ever reaches them.
 //! - **Loopback replay.** `POST /ui-bridge/sdk/element/{id}/action` is a
 //!   `TRUSTED_ROUTES` door (`mcp::origin_guard`), so a local process, or a
 //!   page on a Trusted origin, that knows a ref can have its value typed into
-//!   the connected app while the session lives. Refs are per run and appear
-//!   only in that run's prompt.
+//!   the session's own app while that app is the active connection and the
+//!   session lives. Refs are per run and appear only in that run's prompt and
+//!   in its session transcript on disk; nothing the runner shows back names
+//!   one.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -76,6 +104,7 @@ use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 use tracing::{debug, info, warn};
 
+use crate::mcp::origin_guard::NormOrigin;
 use crate::terminal::TerminalManager;
 
 /// Opens a placeholder: `{{secret:<ref>}}`.
@@ -96,23 +125,50 @@ const MAX_REF_CHARS: usize = 128;
 /// name exactly (`case 'type'` in its element-action handler).
 const TYPE_ACTION: &str = "type";
 
+/// How long a held map can be substituted.
+///
+/// Two hours is four times the 1800-second report deadline the plan's D-D4
+/// gives coord's condition-run reaper: a session still typing that late reports
+/// into a run coord has already closed. A map past it is still held, and still
+/// scrubbed, until its PTY exits ([`HOLD_TTL`]).
+pub const SUBSTITUTE_TTL: Duration = Duration::from_secs(2 * 60 * 60);
+
 /// How long a held map outlives an exit nobody observed.
 ///
 /// The PTY-exit watcher normally releases a map within [`PTY_EXIT_POLL`] of
-/// its session ending; this bounds the case where it never does (a watcher
-/// dropped with the runtime, a pane the manager never let go of). Two hours is
-/// four times the 1800-second report deadline the plan's D-D4 gives coord's
-/// condition-run reaper: a session still typing that late reports into a run
-/// coord has already closed.
-pub const HOLD_TTL: Duration = Duration::from_secs(2 * 60 * 60);
+/// its session ending, and keeps it held (so a live session's responses stay
+/// scrubbed) for as long as the PTY lives. This bounds the case where the exit
+/// is never observed: a pane the manager never lets go of. (A watcher dropped
+/// with the runtime drops its [`Registration`], which releases the map.)
+pub const HOLD_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// How often the exit watcher reads the PTY's liveness flag (an atomic load).
 const PTY_EXIT_POLL: Duration = Duration::from_secs(1);
 
-/// The largest non-streaming SDK response the scrub buffers. A larger one is
+/// The largest non-streaming response the scrub buffers. A larger one is
 /// withheld (500) rather than sent unscrubbed; the runner API's request-body
 /// limit is the same 100 MiB.
 const SCRUB_BUFFER_LIMIT: usize = 100 * 1024 * 1024;
+
+/// What a held value is replaced with in anything the runner shows back.
+///
+/// Deliberately NOT a valid placeholder: `*` is outside the ref grammar, so the
+/// mask names no ref (a reader learns nothing it could replay on the action
+/// route), and a `type` action that sends it back is refused as an unknown ref
+/// instead of typing it.
+pub const REDACTED: &str = "{{secret:*}}";
+
+/// The shortest prefix of a held value the scrub recognises as a truncated
+/// echo. ui-bridge shortens a field's value to 12 characters in a form summary
+/// and 17 in an element description (`truncate` in its `summary-generator.ts`,
+/// via `truncateCodePoints`), so every such echo of a longer secret is at least
+/// this long.
+pub const MIN_ECHO_CHARS: usize = 8;
+
+/// The endings of a truncated echo: ui-bridge appends `...` (its
+/// `summary-generator.ts`, `semantic-snapshot.ts`, `change-tracker.ts`) or `…`
+/// (its `search-engine.ts`).
+const ELLIPSES: [&str; 2] = ["...", "…"];
 
 /// A placeholder named a ref no live condition session holds.
 pub const UNKNOWN_REF_CODE: &str = "CONDITION_SECRET_UNKNOWN_REF";
@@ -120,13 +176,14 @@ pub const UNKNOWN_REF_CODE: &str = "CONDITION_SECRET_UNKNOWN_REF";
 /// A placeholder named a ref two live sessions hold with different values.
 pub const AMBIGUOUS_REF_CODE: &str = "CONDITION_SECRET_AMBIGUOUS_REF";
 
+/// A placeholder sat somewhere other than a `type` action's text.
+pub const OUTSIDE_TYPE_TEXT_CODE: &str = "CONDITION_SECRET_OUTSIDE_TYPE_TEXT";
+
+/// The active SDK connection is not the app the holding session targets.
+pub const WRONG_APP_CODE: &str = "CONDITION_SECRET_WRONG_APP";
+
 /// A response that could not be scrubbed while a secret was held.
 const SCRUB_FAILED_CODE: &str = "CONDITION_SECRET_SCRUB_FAILED";
-
-/// `{{secret:<reference>}}`.
-pub fn placeholder(reference: &str) -> String {
-    format!("{PLACEHOLDER_OPEN}{reference}{PLACEHOLDER_CLOSE}")
-}
 
 fn is_ref_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':')
@@ -213,15 +270,34 @@ impl fmt::Debug for FrameSecrets {
 /// One condition session's held map.
 struct Held {
     run_id: String,
+    /// The origin of the frame's `target_url`: the one app this session's
+    /// values may be typed into. `None` when the URL does not parse, which
+    /// binds to nothing, so nothing is ever substituted for it.
+    target: Option<NormOrigin>,
     refs: BTreeMap<String, String>,
-    expires_at: Instant,
+    /// [`SUBSTITUTE_TTL`] after registration: substitution stops here.
+    substitutable_until: Instant,
+    /// [`HOLD_TTL`] after registration: the map is released here at the
+    /// latest, whether or not its PTY exit was observed.
+    held_until: Instant,
+}
+
+impl Held {
+    /// True when this session may have its values typed into the app at
+    /// `active`, the active SDK connection's origin.
+    fn binds(&self, active: Option<&NormOrigin>) -> bool {
+        match (&self.target, active) {
+            (Some(target), Some(active)) => target.same_principal(active),
+            _ => false,
+        }
+    }
 }
 
 /// Every held map, keyed by its registration id, never by run id, so two
 /// deliveries of one run's frame hold and release independently.
 ///
-/// Reading through this accessor is what enforces the TTL: an expired map is
-/// dropped on the next read, whoever reads.
+/// Reading through this accessor is what enforces [`HOLD_TTL`]: a map past
+/// it is dropped on the next read, whoever reads.
 fn held() -> MutexGuard<'static, HashMap<u64, Held>> {
     static HELD: OnceLock<Mutex<HashMap<u64, Held>>> = OnceLock::new();
     let mut sessions = HELD
@@ -230,11 +306,11 @@ fn held() -> MutexGuard<'static, HashMap<u64, Held>> {
         .unwrap_or_else(PoisonError::into_inner);
     let now = Instant::now();
     sessions.retain(|_, session| {
-        let live = session.expires_at > now;
+        let live = session.held_until > now;
         if !live {
             warn!(
-                "condition_secrets: run_id={}: held secrets reached their TTL with no observed \
-                 PTY exit; released",
+                "condition_secrets: run_id={}: held secrets reached their hold TTL with no \
+                 observed PTY exit; released",
                 session.run_id
             );
         }
@@ -252,7 +328,7 @@ fn held() -> MutexGuard<'static, HashMap<u64, Held>> {
 pub struct Registration {
     id: u64,
     run_id: String,
-    expires_at: Instant,
+    held_until: Instant,
 }
 
 impl Drop for Registration {
@@ -266,15 +342,22 @@ impl Drop for Registration {
     }
 }
 
-/// Hold `secrets` for the condition session of `run_id`, for at most
+/// Hold `secrets` for the condition session of `run_id`, bound to the origin
+/// of its `target_url`: substitutable for [`SUBSTITUTE_TTL`], held for at most
 /// [`HOLD_TTL`]. `None` when the frame carried no usable ref, so there is
 /// nothing to hold.
 #[must_use = "dropping the Registration releases the session's secrets at once"]
-pub fn register(run_id: &str, secrets: &FrameSecrets) -> Option<Registration> {
-    register_for(run_id, secrets, HOLD_TTL)
+pub fn register(run_id: &str, target_url: &str, secrets: &FrameSecrets) -> Option<Registration> {
+    register_for(run_id, target_url, secrets, SUBSTITUTE_TTL, HOLD_TTL)
 }
 
-fn register_for(run_id: &str, secrets: &FrameSecrets, ttl: Duration) -> Option<Registration> {
+fn register_for(
+    run_id: &str,
+    target_url: &str,
+    secrets: &FrameSecrets,
+    substitute_ttl: Duration,
+    hold_ttl: Duration,
+) -> Option<Registration> {
     if secrets.malformed > 0 {
         warn!(
             "condition_secrets: run_id={run_id}: {} malformed `secrets` entries dropped (a value \
@@ -286,15 +369,25 @@ fn register_for(run_id: &str, secrets: &FrameSecrets, ttl: Duration) -> Option<R
     if secrets.refs.is_empty() {
         return None;
     }
+    let target = NormOrigin::parse(target_url);
+    if target.is_none() {
+        warn!(
+            "condition_secrets: run_id={run_id}: target_url `{target_url}` has no origin, so \
+             no held secret of this session is ever substituted"
+        );
+    }
     static NEXT_ID: AtomicU64 = AtomicU64::new(1);
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    let expires_at = Instant::now() + ttl;
+    let now = Instant::now();
+    let held_until = now + hold_ttl;
     held().insert(
         id,
         Held {
             run_id: run_id.to_string(),
+            target,
             refs: secrets.refs.clone(),
-            expires_at,
+            substitutable_until: now + substitute_ttl,
+            held_until,
         },
     );
     info!(
@@ -304,14 +397,14 @@ fn register_for(run_id: &str, secrets: &FrameSecrets, ttl: Duration) -> Option<R
     Some(Registration {
         id,
         run_id: run_id.to_string(),
-        expires_at,
+        held_until,
     })
 }
 
 /// Hand a started session's [`Registration`] to a watcher that releases it
 /// when the session's PTY exits (the moment `terminal_id` is no longer a live
-/// pane of `terminal_manager`), or at its TTL. `None`, a frame that carried
-/// no secrets, is a no-op.
+/// pane of `terminal_manager`), or at [`HOLD_TTL`]. `None`, a frame that
+/// carried no secrets, is a no-op.
 pub fn release_at_pty_exit(
     registration: Option<Registration>,
     terminal_manager: &Arc<TerminalManager>,
@@ -334,7 +427,7 @@ fn release_at_pty_exit_polling(
     // The registration moves INTO the task, so a task that is dropped instead
     // of finishing (the runtime shutting down) releases the map as well.
     tokio::spawn(async move {
-        while Instant::now() < registration.expires_at
+        while Instant::now() < registration.held_until
             && manager
                 .get(&terminal_id)
                 .is_some_and(|pane| pane.is_alive())
@@ -359,6 +452,20 @@ pub enum SubstitutionError {
     /// Two live sessions hold this ref with DIFFERENT values. Typing either
     /// could put one session's secret into another session's app.
     AmbiguousRef { reference: String },
+    /// A placeholder sat outside a `type` action's `params.text` and top-level
+    /// `text`, the only text this module substitutes: in another action, or
+    /// in another field of a `type`. Sent on, the app would get the literal
+    /// placeholder as, say, a password. `action` is the request's action name.
+    OutsideTypeText { action: String },
+    /// The active SDK connection is not the app the holding session targets:
+    /// another session's app, a connection a peer switched to, or none at
+    /// all. Both are origins as `scheme://host[:port]`; `None` is no target
+    /// origin (an unparseable `target_url`) or no active connection, or one
+    /// whose origin is unknown.
+    WrongApp {
+        target: Option<String>,
+        active: Option<String>,
+    },
 }
 
 impl SubstitutionError {
@@ -367,35 +474,52 @@ impl SubstitutionError {
         match self {
             Self::UnknownRef { .. } => UNKNOWN_REF_CODE,
             Self::AmbiguousRef { .. } => AMBIGUOUS_REF_CODE,
+            Self::OutsideTypeText { .. } => OUTSIDE_TYPE_TEXT_CODE,
+            Self::WrongApp { .. } => WRONG_APP_CODE,
         }
     }
 
-    /// The text the refused placeholder named.
-    pub fn reference(&self) -> &str {
+    /// The text the refused placeholder named, for the two refusals that are
+    /// about one ref. `None` for the others.
+    pub fn reference(&self) -> Option<&str> {
         match self {
-            Self::UnknownRef { reference } | Self::AmbiguousRef { reference } => reference,
+            Self::UnknownRef { reference } | Self::AmbiguousRef { reference } => Some(reference),
+            Self::OutsideTypeText { .. } | Self::WrongApp { .. } => None,
         }
     }
 
     /// The body an SDK route answers a refused substitution with:
     /// `success: false`, the typed `code`, and `failure_origin: "runner"`.
     /// The runner refused before any UI was touched, so the journey ledger
-    /// records nothing for it (`journey::capture::sdk_refusal`). It names the
-    /// ref, never a value.
+    /// records nothing for it (`journey::capture::sdk_refusal`). It never
+    /// carries a value. Only the unknown-ref refusal names a ref, the text the
+    /// caller itself sent; the others do not, because the message also lands
+    /// in the `ui_bridge_events` row, and a held ref read there could be
+    /// replayed.
     pub fn refusal(&self, detail: &str) -> Value {
         let what = match self {
-            Self::UnknownRef { .. } => "no live condition-check session holds secret ref",
-            Self::AmbiguousRef { .. } => {
-                "two live condition-check sessions hold different values for secret ref"
+            Self::UnknownRef { reference } => {
+                format!("no live condition-check session holds secret ref `{reference}`")
             }
+            Self::AmbiguousRef { .. } => {
+                "two live condition-check sessions hold different values for this secret ref"
+                    .to_string()
+            }
+            Self::OutsideTypeText { action } => format!(
+                "a `{PLACEHOLDER_OPEN}<ref>{PLACEHOLDER_CLOSE}` placeholder is substituted only \
+                 in a `{TYPE_ACTION}` action's `params.text` or `text`, and this `{action}` request \
+                 carries one elsewhere"
+            ),
+            Self::WrongApp { target, active } => format!(
+                "the active SDK connection ({}) is not the app this condition check targets ({}); \
+                 connect to the target first (POST /ui-bridge/sdk/connect with its target_url)",
+                active.as_deref().unwrap_or("none, or one of unknown origin"),
+                target.as_deref().unwrap_or("an unparseable target_url"),
+            ),
         };
         serde_json::json!({
             "success": false,
-            "error": format!(
-                "{}: {what} `{}`; {detail}. Nothing was typed.",
-                self.code(),
-                self.reference()
-            ),
+            "error": format!("{}: {what}; {detail}. Nothing was typed.", self.code()),
             "code": self.code(),
             "failure_origin": crate::journey::capture::RUNNER_REJECTION_ORIGIN,
             "detail": detail,
@@ -404,28 +528,50 @@ impl SubstitutionError {
     }
 }
 
-/// The value every live session holds under `reference`, when they agree.
-fn resolve(reference: &str) -> Result<String, SubstitutionError> {
+/// The value the live sessions hold under `reference`, when they agree and
+/// one of them targets the app at `active` (the active SDK connection's
+/// origin). A session past [`SUBSTITUTE_TTL`] no longer substitutes, though
+/// its map is still held for the scrub.
+fn resolve(reference: &str, active: Option<&NormOrigin>) -> Result<String, SubstitutionError> {
+    let now = Instant::now();
     let sessions = held();
-    let mut values = sessions
+    let holders: Vec<&Held> = sessions
         .values()
-        .filter_map(|session| session.refs.get(reference));
-    let Some(first) = values.next() else {
+        .filter(|session| session.substitutable_until > now && session.refs.contains_key(reference))
+        .collect();
+    let Some(value) = holders
+        .first()
+        .and_then(|session| session.refs.get(reference))
+    else {
         return Err(SubstitutionError::UnknownRef {
             reference: reference.to_string(),
         });
     };
-    if values.any(|other| other != first) {
+    if holders
+        .iter()
+        .any(|session| session.refs.get(reference) != Some(value))
+    {
         return Err(SubstitutionError::AmbiguousRef {
             reference: reference.to_string(),
         });
     }
-    Ok(first.clone())
+    if !holders.iter().any(|session| session.binds(active)) {
+        return Err(SubstitutionError::WrongApp {
+            target: holders
+                .first()
+                .and_then(|session| session.target.as_ref())
+                .map(NormOrigin::as_origin_string),
+            active: active.map(NormOrigin::as_origin_string),
+        });
+    }
+    Ok(value.clone())
 }
 
 /// The ref a placeholder names, and the text after its closing `}}`.
-/// `after_open` is the text right after a [`PLACEHOLDER_OPEN`].
-fn parse_ref(after_open: &str) -> Result<(&str, &str), SubstitutionError> {
+/// `after_open` is the text right after a [`PLACEHOLDER_OPEN`]. On a
+/// malformed or unterminated placeholder: the text it named (at most 64
+/// characters), for the refusal.
+fn parse_ref(after_open: &str) -> Result<(&str, &str), String> {
     let end = after_open
         .find(|c: char| !is_ref_char(c))
         .unwrap_or(after_open.len());
@@ -441,21 +587,22 @@ fn parse_ref(after_open: &str) -> Result<(&str, &str), SubstitutionError> {
             if named.chars().count() > 64 {
                 shown.push('…');
             }
-            Err(SubstitutionError::UnknownRef { reference: shown })
+            Err(shown)
         }
     }
 }
 
-/// `text` with every placeholder replaced by its held value. One placeholder
-/// that cannot be substituted refuses the whole text, so a secret is never
-/// typed with part of its field missing.
-fn substitute(text: &str) -> Result<String, SubstitutionError> {
+/// `text` with every placeholder replaced by its held value, for the app at
+/// `active`. One placeholder that cannot be substituted refuses the whole
+/// text, so a secret is never typed with part of its field missing.
+fn substitute(text: &str, active: Option<&NormOrigin>) -> Result<String, SubstitutionError> {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some((before, after_open)) = rest.split_once(PLACEHOLDER_OPEN) {
         out.push_str(before);
-        let (reference, after_close) = parse_ref(after_open)?;
-        out.push_str(&resolve(reference)?);
+        let (reference, after_close) = parse_ref(after_open)
+            .map_err(|reference| SubstitutionError::UnknownRef { reference })?;
+        out.push_str(&resolve(reference, active)?);
         rest = after_close;
     }
     out.push_str(rest);
@@ -468,50 +615,83 @@ fn carries_placeholder(field: Option<&Value>) -> bool {
         .is_some_and(|text| text.contains(PLACEHOLDER_OPEN))
 }
 
-fn substitute_field(field: Option<&mut Value>) -> Result<(), SubstitutionError> {
+fn substitute_field(
+    field: Option<&mut Value>,
+    active: Option<&NormOrigin>,
+) -> Result<(), SubstitutionError> {
     if let Some(Value::String(text)) = field {
-        *text = substitute(text)?;
+        *text = substitute(text, active)?;
     }
     Ok(())
 }
 
-/// The copy of an element-action request the APP receives.
+/// The copy of an element-action request the APP receives, when the active
+/// SDK connection's origin is `active`.
 ///
-/// For a `type` action whose `params.text` or top-level `text` carries a
-/// placeholder: a copy with each placeholder in those two fields replaced by
-/// its held value. For anything else: `None`, meaning the request goes to the
-/// app as it is. `body` itself is never changed.
-pub fn app_bound_type_body(body: &Value) -> Result<Option<Value>, SubstitutionError> {
-    if body.get("action").and_then(Value::as_str) != Some(TYPE_ACTION) {
+/// - No placeholder anywhere: `None`, meaning the request goes to the app as
+///   it is.
+/// - A `type` action whose placeholders all sit in `params.text` or a
+///   top-level `text`: a copy with each one replaced by its held value, when
+///   the holding session targets the app at `active`.
+/// - A placeholder anywhere else (another action, or another field of a
+///   `type`): [`SubstitutionError::OutsideTypeText`], so the literal never
+///   reaches the app.
+///
+/// `body` itself is never changed.
+pub fn app_bound_type_body(
+    body: &Value,
+    active: Option<&NormOrigin>,
+) -> Result<Option<Value>, SubstitutionError> {
+    if first_placeholder(body).is_none() {
         return Ok(None);
     }
-    let in_params = carries_placeholder(body.get("params").and_then(|p| p.get("text")));
-    let at_top = carries_placeholder(body.get("text"));
-    if !in_params && !at_top {
-        return Ok(None);
+    let action = body.get("action").and_then(Value::as_str);
+    let outside = || SubstitutionError::OutsideTypeText {
+        action: action.unwrap_or("<no action>").chars().take(64).collect(),
+    };
+    if action != Some(TYPE_ACTION) {
+        return Err(outside());
+    }
+    // Everything but the two substituted fields must be free of placeholders.
+    let mut rest = body.clone();
+    if let Some(fields) = rest.as_object_mut() {
+        fields.remove("text");
+        if let Some(params) = fields.get_mut("params").and_then(Value::as_object_mut) {
+            params.remove("text");
+        }
+    }
+    if first_placeholder(&rest).is_some() {
+        return Err(outside());
     }
     let mut app_copy = body.clone();
-    if in_params {
-        substitute_field(app_copy.get_mut("params").and_then(|p| p.get_mut("text")))?;
+    if carries_placeholder(body.get("params").and_then(|p| p.get("text"))) {
+        substitute_field(
+            app_copy.get_mut("params").and_then(|p| p.get_mut("text")),
+            active,
+        )?;
     }
-    if at_top {
-        substitute_field(app_copy.get_mut("text"))?;
+    if carries_placeholder(body.get("text")) {
+        substitute_field(app_copy.get_mut("text"), active)?;
     }
     Ok(Some(app_copy))
 }
 
-/// The ref named by the first placeholder in `value`, a string at any depth.
+/// The ref named by the first placeholder in `value`, a string or object key
+/// at any depth (for a malformed placeholder, the text it named).
 fn first_placeholder(value: &Value) -> Option<String> {
+    let in_text = |text: &str| {
+        text.split_once(PLACEHOLDER_OPEN)
+            .map(|(_, after_open)| match parse_ref(after_open) {
+                Ok((reference, _)) => reference.to_string(),
+                Err(named) => named,
+            })
+    };
     match value {
-        Value::String(text) => {
-            text.split_once(PLACEHOLDER_OPEN)
-                .map(|(_, after_open)| match parse_ref(after_open) {
-                    Ok((reference, _)) => reference.to_string(),
-                    Err(refused) => refused.reference().to_string(),
-                })
-        }
+        Value::String(text) => in_text(text),
         Value::Array(items) => items.iter().find_map(first_placeholder),
-        Value::Object(fields) => fields.values().find_map(first_placeholder),
+        Value::Object(fields) => fields
+            .iter()
+            .find_map(|(key, field)| in_text(key).or_else(|| first_placeholder(field))),
         _ => None,
     }
 }
@@ -542,61 +722,153 @@ pub fn refused_action(
 // Scrubbing
 // =============================================================================
 
-/// The held values, each paired with the placeholder that replaces it,
-/// longest value first, so a value containing another is replaced whole.
+/// The longest truncated echo the scrub looks for, in characters. ui-bridge's
+/// longest cut keeps 57 (`semantic-snapshot.ts`); the bound keeps the prefix
+/// list small for a long secret such as a private key.
+const MAX_ECHO_CHARS: usize = 256;
+
+/// What the scrub looks for while a secret is held: every form a held value
+/// takes in text (raw and JSON-escaped), and every truncated echo of one.
 struct ScrubSet {
-    pairs: Vec<(String, String)>,
+    /// The raw values, for the exact-number arm of [`ScrubSet::scrub_json`].
+    values: Vec<String>,
+    /// Each value raw and JSON-escaped, deduplicated, never empty.
+    forms: Vec<Vec<u8>>,
+    /// Each value's proper prefixes of [`MIN_ECHO_CHARS`] to
+    /// [`MAX_ECHO_CHARS`] characters, raw and JSON-escaped, longest first: an
+    /// echo is one of these right before an ellipsis.
+    prefixes: Vec<Vec<u8>>,
+}
+
+fn push_form(list: &mut Vec<Vec<u8>>, form: String) {
+    if !form.is_empty() && !list.iter().any(|seen| seen.as_slice() == form.as_bytes()) {
+        list.push(form.into_bytes());
+    }
+}
+
+/// The first index at or after `from` where `needle` occurs in `hay`.
+fn find_from(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
+    if needle.is_empty() {
+        return None;
+    }
+    hay.get(from..)?
+        .windows(needle.len())
+        .position(|window| window == needle)
+        .map(|at| at + from)
+}
+
+/// `hay` with each of `spans` (sorted, disjoint byte ranges) replaced by
+/// [`REDACTED`].
+fn mask(hay: &[u8], spans: &[(usize, usize)]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(hay.len());
+    let mut at = 0;
+    for &(start, end) in spans {
+        out.extend_from_slice(hay.get(at..start).unwrap_or_default());
+        out.extend_from_slice(REDACTED.as_bytes());
+        at = end;
+    }
+    out.extend_from_slice(hay.get(at..).unwrap_or_default());
+    out
 }
 
 impl ScrubSet {
-    /// `None` when no condition session holds a secret: the path every SDK
+    /// `None` when no condition session holds a secret: the path every
     /// response takes outside a condition check.
     fn current() -> Option<Self> {
-        let mut pairs: Vec<(String, String)> = Vec::new();
+        let mut values: Vec<String> = Vec::new();
         for session in held().values() {
-            for (reference, value) in &session.refs {
-                if !value.is_empty() && !pairs.iter().any(|(held_value, _)| held_value == value) {
-                    pairs.push((value.clone(), placeholder(reference)));
+            for value in session.refs.values() {
+                if !value.is_empty() && !values.contains(value) {
+                    values.push(value.clone());
                 }
             }
         }
-        if pairs.is_empty() {
+        if values.is_empty() {
             return None;
         }
-        pairs.sort_by_key(|(value, _)| std::cmp::Reverse(value.len()));
-        Some(Self { pairs })
+        let mut forms = Vec::new();
+        let mut prefixes = Vec::new();
+        for value in &values {
+            push_form(&mut forms, value.clone());
+            push_form(&mut forms, json_escaped(value));
+            // `value[..at]` holds exactly `count` characters.
+            for (count, (at, _)) in value.char_indices().enumerate() {
+                if (MIN_ECHO_CHARS..=MAX_ECHO_CHARS).contains(&count) {
+                    let prefix = value.get(..at).unwrap_or_default();
+                    push_form(&mut prefixes, prefix.to_string());
+                    push_form(&mut prefixes, json_escaped(prefix));
+                }
+            }
+        }
+        prefixes.sort_by_key(|prefix| std::cmp::Reverse(prefix.len()));
+        Some(Self {
+            values,
+            forms,
+            prefixes,
+        })
     }
 
-    /// `text` with each held value replaced by its placeholder, in one pass
-    /// (an inserted placeholder is never rescanned). `None` when `text` holds
-    /// no held value.
-    fn scrub_str(&self, text: &str) -> Option<String> {
-        if !self
-            .pairs
-            .iter()
-            .any(|(value, _)| text.contains(value.as_str()))
-        {
-            return None;
+    /// The byte ranges of `hay` holding a held value (in either form) or a
+    /// truncated echo of one, sorted, with every overlapping or touching pair
+    /// merged: two held values that overlap in the text are masked as their
+    /// union, never as whichever one starts first.
+    fn spans(&self, hay: &[u8]) -> Vec<(usize, usize)> {
+        let mut spans = Vec::new();
+        for form in &self.forms {
+            let mut from = 0;
+            while let Some(at) = find_from(hay, form, from) {
+                spans.push((at, at + form.len()));
+                from = at + 1;
+            }
         }
-        let mut out = String::with_capacity(text.len());
-        let mut rest = text;
-        while let Some(c) = rest.chars().next() {
-            match self
-                .pairs
-                .iter()
-                .find(|(value, _)| rest.starts_with(value.as_str()))
-            {
-                Some((value, placeholder)) => {
-                    out.push_str(placeholder);
-                    rest = rest.get(value.len()..).unwrap_or_default();
-                }
-                None => {
-                    out.push(c);
-                    rest = rest.get(c.len_utf8()..).unwrap_or_default();
+        if !self.prefixes.is_empty() {
+            for ellipsis in ELLIPSES {
+                let ellipsis = ellipsis.as_bytes();
+                let mut from = 0;
+                while let Some(at) = find_from(hay, ellipsis, from) {
+                    let echo = self.prefixes.iter().find(|prefix| {
+                        at >= prefix.len()
+                            && hay.get(at - prefix.len()..at) == Some(prefix.as_slice())
+                    });
+                    if let Some(prefix) = echo {
+                        spans.push((at - prefix.len(), at));
+                    }
+                    from = at + ellipsis.len();
                 }
             }
         }
-        Some(out)
+        spans.sort_unstable();
+        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(spans.len());
+        for (start, end) in spans {
+            if let Some(last) = merged.last_mut() {
+                if start <= last.1 {
+                    last.1 = last.1.max(end);
+                    continue;
+                }
+            }
+            merged.push((start, end));
+        }
+        merged
+    }
+
+    /// Byte-level scrub: every held value, raw and JSON-escaped, and every
+    /// truncated echo of one, replaced by [`REDACTED`]. `None` when there is
+    /// none.
+    fn scrub_bytes(&self, bytes: &[u8]) -> Option<Vec<u8>> {
+        let spans = self.spans(bytes);
+        (!spans.is_empty()).then(|| mask(bytes, &spans))
+    }
+
+    /// [`ScrubSet::scrub_bytes`] over text. `None` when `text` holds nothing
+    /// held.
+    fn scrub_str(&self, text: &str) -> Option<String> {
+        self.scrub_bytes(text.as_bytes()).map(|bytes| {
+            // Every span starts and ends on a character boundary, because each
+            // needle is whole UTF-8, so this is always valid: the lossy arm is
+            // a guard, never a path.
+            String::from_utf8(bytes)
+                .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+        })
     }
 
     /// Scrub every string and object key at any depth, and every number whose
@@ -612,12 +884,11 @@ impl ScrubSet {
             },
             Value::Number(number) => {
                 let decimal = number.to_string();
-                match self.pairs.iter().find(|(held, _)| *held == decimal) {
-                    Some((_, placeholder)) => {
-                        *value = Value::String(placeholder.clone());
-                        true
-                    }
-                    None => false,
+                if self.values.iter().any(|held| *held == decimal) {
+                    *value = Value::String(REDACTED.to_string());
+                    true
+                } else {
+                    false
                 }
             }
             Value::Array(items) => {
@@ -645,86 +916,125 @@ impl ScrubSet {
         }
     }
 
-    /// Byte-level scrub, for a body that is not JSON: each held value, raw
-    /// and in its JSON-escaped form, replaced by its placeholder. `None` when
-    /// neither form occurs.
-    fn scrub_bytes(&self, bytes: &[u8]) -> Option<Vec<u8>> {
-        let mut patterns: Vec<(Vec<u8>, &str)> = Vec::new();
-        for (value, placeholder) in &self.pairs {
-            for form in [value.clone(), json_escaped(value)] {
-                let form = form.into_bytes();
-                if !form.is_empty() && !patterns.iter().any(|(seen, _)| *seen == form) {
-                    patterns.push((form, placeholder.as_str()));
-                }
-            }
-        }
-        patterns.sort_by_key(|(form, _)| std::cmp::Reverse(form.len()));
-        if !patterns.iter().any(|(form, _)| {
-            bytes
-                .windows(form.len())
-                .any(|window| window == form.as_slice())
-        }) {
-            return None;
-        }
-        let mut out = Vec::with_capacity(bytes.len());
-        let mut rest = bytes;
-        while let Some((&first, tail)) = rest.split_first() {
-            match patterns.iter().find(|(form, _)| rest.starts_with(form)) {
-                Some((form, placeholder)) => {
-                    out.extend_from_slice(placeholder.as_bytes());
-                    rest = rest.get(form.len()..).unwrap_or_default();
-                }
-                None => {
-                    out.push(first);
-                    rest = tail;
-                }
-            }
-        }
-        Some(out)
-    }
-
-    /// One server-sent-events frame scrubbed: a `data:` line that parses as
-    /// JSON is scrubbed field by field and re-serialized; every other line as
-    /// text. `None` when nothing changed.
+    /// One chunk of an event stream, scrubbed. axum's `Sse` writes one event
+    /// per chunk; a chunk may still carry several (an upstream relayed as it
+    /// is), so it is split into events at blank lines first. `None` when
+    /// nothing changed.
     fn scrub_sse_frame(&self, frame: &[u8]) -> Option<Vec<u8>> {
         let Ok(text) = std::str::from_utf8(frame) else {
             return self.scrub_bytes(frame);
         };
-        let mut changed = false;
         let mut out = String::with_capacity(text.len());
+        let mut changed = false;
+        let mut event: Vec<&str> = Vec::new();
         for line in text.split_inclusive('\n') {
-            let (content, newline) = match line.strip_suffix('\n') {
-                Some(content) => (content, "\n"),
-                None => (line, ""),
-            };
-            let scrubbed = match content.strip_prefix("data:") {
-                Some(data) => self.scrub_sse_data(data).map(|data| format!("data:{data}")),
-                None => self.scrub_str(content),
-            };
-            match scrubbed {
-                Some(scrubbed) => {
-                    changed = true;
-                    out.push_str(&scrubbed);
-                }
-                None => out.push_str(content),
+            event.push(line);
+            if line_content(line).is_empty() {
+                changed |= self.scrub_sse_event(&event, &mut out);
+                event.clear();
             }
-            out.push_str(newline);
+        }
+        if !event.is_empty() {
+            changed |= self.scrub_sse_event(&event, &mut out);
         }
         changed.then(|| out.into_bytes())
     }
 
-    fn scrub_sse_data(&self, data: &str) -> Option<String> {
-        let (lead, payload) = match data.strip_prefix(' ') {
-            Some(payload) => (" ", payload),
-            None => ("", data),
+    /// One event's lines (each with its terminator) written to `out`,
+    /// scrubbed. An event's `data:` lines are ONE value joined by `\n` (the
+    /// event-stream rule), so a held value split across two of them is still
+    /// found. Scrubbed, that value is written back at the first `data:` line,
+    /// one `data:` line per line of it; every other line is scrubbed as text.
+    /// True when anything changed.
+    fn scrub_sse_event(&self, lines: &[&str], out: &mut String) -> bool {
+        let data_at: Vec<usize> = (0..lines.len())
+            .filter(|&i| {
+                lines
+                    .get(i)
+                    .is_some_and(|line| line_content(line).starts_with("data:"))
+            })
+            .collect();
+        let payload = |i: usize| {
+            let data = lines
+                .get(i)
+                .map(|line| line_content(line))
+                .and_then(|content| content.strip_prefix("data:"))
+                .unwrap_or_default();
+            data.strip_prefix(' ').unwrap_or(data)
         };
-        match serde_json::from_str::<Value>(payload) {
-            Ok(mut parsed) => self
-                .scrub_json(&mut parsed)
-                .then(|| format!("{lead}{parsed}")),
-            Err(_) => self.scrub_str(data),
+        let joined: Vec<&str> = data_at.iter().map(|&i| payload(i)).collect();
+        let scrubbed_data = if joined.is_empty() {
+            None
+        } else {
+            self.scrub_sse_data(&joined.join("\n"))
+        };
+        let mut changed = scrubbed_data.is_some();
+        for (i, line) in lines.iter().enumerate() {
+            let content = line_content(line);
+            let terminator = line.get(content.len()..).unwrap_or_default();
+            match (
+                &scrubbed_data,
+                data_at.first() == Some(&i),
+                data_at.contains(&i),
+            ) {
+                (Some(data), true, _) => {
+                    let lead = if content.starts_with("data: ") {
+                        " "
+                    } else {
+                        ""
+                    };
+                    // The last data line's terminator closes the rewritten
+                    // block, so a chunk that ended mid-line still does.
+                    let last_terminator = data_at
+                        .last()
+                        .and_then(|&last| lines.get(last))
+                        .map(|last| last.get(line_content(last).len()..).unwrap_or_default())
+                        .unwrap_or(terminator);
+                    let mut rewritten = data.split('\n').peekable();
+                    while let Some(part) = rewritten.next() {
+                        out.push_str("data:");
+                        out.push_str(lead);
+                        out.push_str(part);
+                        out.push_str(if rewritten.peek().is_some() {
+                            "\n"
+                        } else {
+                            last_terminator
+                        });
+                    }
+                }
+                (Some(_), false, true) => {}
+                _ => match self.scrub_str(content) {
+                    Some(scrubbed) if !data_at.contains(&i) => {
+                        changed = true;
+                        out.push_str(&scrubbed);
+                        out.push_str(terminator);
+                    }
+                    _ => out.push_str(line),
+                },
+            }
         }
+        changed
     }
+
+    /// An event's data value, scrubbed: JSON field by field (re-serialized on
+    /// one line), else as text. A JSON value in which no field changed is
+    /// still scrubbed as text, because a parse can hide what the text carries
+    /// (a duplicate key keeps only its last value). `None` when nothing
+    /// changed.
+    fn scrub_sse_data(&self, data: &str) -> Option<String> {
+        if let Ok(mut parsed) = serde_json::from_str::<Value>(data) {
+            if self.scrub_json(&mut parsed) {
+                return Some(parsed.to_string());
+            }
+        }
+        self.scrub_str(data)
+    }
+}
+
+/// A line without its `\n` or `\r\n` terminator.
+fn line_content(line: &str) -> &str {
+    let line = line.strip_suffix('\n').unwrap_or(line);
+    line.strip_suffix('\r').unwrap_or(line)
 }
 
 /// `value` as it appears inside a JSON string literal.
@@ -768,17 +1078,33 @@ pub fn debug_scrubbed(value: &Option<Value>) -> String {
     }
 }
 
-/// `axum::middleware::from_fn` layer on the `/ui-bridge/sdk/*` routers: while
-/// a condition session holds a secret, no response carries its value.
+/// `text` with every held value, and every truncated echo of one, masked: for
+/// a log line or an error detail that may quote app content (serde's error
+/// for a mistyped field quotes the value it could not read).
+pub fn scrub_text(text: &str) -> Cow<'_, str> {
+    match ScrubSet::current().and_then(|set| set.scrub_str(text)) {
+        Some(scrubbed) => Cow::Owned(scrubbed),
+        None => Cow::Borrowed(text),
+    }
+}
+
+/// `axum::middleware::from_fn` layer on every router that returns app content
+/// to a caller (module rule 4): while a condition session holds a secret, no
+/// response carries its value.
 ///
 /// With nothing held a response passes untouched. With something held:
 /// - a JSON body is scrubbed field by field ([`ScrubSet::scrub_json`]) and
-///   re-serialized only when something changed; any other body byte by byte;
-/// - an event stream is scrubbed frame by frame as it flows, never buffered
-///   (it may never end), against the sessions live at that frame, so a
-///   stream opened before a session started is scrubbed once it does;
+///   re-serialized only when something changed; any other body, and a JSON
+///   body in which no field changed, byte by byte;
+/// - an event stream is scrubbed event by event as it flows, never buffered
+///   (it may never end), against the sessions live at that event, so a stream
+///   opened before a session started is scrubbed once it does;
 /// - a body that cannot be read in full is withheld with a 500, never sent
 ///   unscrubbed.
+///
+/// Never layer it on a channel that carries a command TO an app (the
+/// WebSocket relay, the relay's event stream): it would mask the very value
+/// a `type` action substituted for the app.
 pub async fn scrub_sdk_responses(request: Request, next: Next) -> Response {
     let response = next.run(request).await;
     if is_event_stream(response.headers()) {
@@ -821,10 +1147,7 @@ async fn scrub_buffered(response: Response, set: &ScrubSet) -> Response {
     let bytes = match axum::body::to_bytes(body, SCRUB_BUFFER_LIMIT).await {
         Ok(bytes) => bytes,
         Err(e) => {
-            warn!(
-                "condition_secrets: an SDK response could not be read for scrubbing ({e}); \
-                 withheld"
-            );
+            warn!("condition_secrets: a response could not be read for scrubbing ({e}); withheld");
             return scrub_failed();
         }
     };
@@ -833,25 +1156,25 @@ async fn scrub_buffered(response: Response, set: &ScrubSet) -> Response {
     } else {
         None
     };
-    let scrubbed = match parsed {
-        Some(mut value) => {
-            if !set.scrub_json(&mut value) {
-                None
-            } else {
-                match serde_json::to_vec(&value) {
-                    Ok(serialized) => Some(serialized),
-                    Err(e) => {
-                        warn!(
-                            "condition_secrets: a scrubbed SDK response could not be \
-                             re-serialized ({e}); withheld"
-                        );
-                        return scrub_failed();
-                    }
+    let mut scrubbed = None;
+    if let Some(mut value) = parsed {
+        if set.scrub_json(&mut value) {
+            match serde_json::to_vec(&value) {
+                Ok(serialized) => scrubbed = Some(serialized),
+                Err(e) => {
+                    warn!(
+                        "condition_secrets: a scrubbed response could not be re-serialized \
+                         ({e}); withheld"
+                    );
+                    return scrub_failed();
                 }
             }
         }
-        None => set.scrub_bytes(&bytes),
-    };
+    }
+    // Not JSON, or JSON in which no field changed: the bytes themselves,
+    // because a parse can hide what they still carry (a duplicate key keeps
+    // only its last value, a number is read in its canonical spelling).
+    let scrubbed = scrubbed.or_else(|| set.scrub_bytes(&bytes));
     match scrubbed {
         None => Response::from_parts(parts, Body::from(bytes)),
         Some(scrubbed) => {
@@ -956,6 +1279,15 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// The app every test session targets, and the active connection's origin
+    /// when that app is connected: the loopback interface spelled the other
+    /// way, which is still the same app.
+    const TARGET: &str = "http://localhost:3001";
+
+    fn connected() -> NormOrigin {
+        NormOrigin::parse("http://127.0.0.1:3001").expect("an origin")
+    }
+
     fn secrets(pairs: &[(&str, &str)]) -> FrameSecrets {
         let map: serde_json::Map<String, Value> = pairs
             .iter()
@@ -965,14 +1297,31 @@ mod tests {
     }
 
     fn hold(run_id: &str, pairs: &[(&str, &str)]) -> Registration {
-        register(run_id, &secrets(pairs)).expect("a non-empty map is held")
+        register(run_id, TARGET, &secrets(pairs)).expect("a non-empty map is held")
     }
 
-    /// Wait (bounded) until `reference` no longer resolves.
+    /// The app copy of `body` with the target app connected.
+    fn app_copy(body: &Value) -> Result<Option<Value>, SubstitutionError> {
+        app_bound_type_body(body, Some(&connected()))
+    }
+
+    fn is_held(reference: &str) -> bool {
+        held()
+            .values()
+            .any(|session| session.refs.contains_key(reference))
+    }
+
+    fn scrubbed_values() -> Vec<String> {
+        ScrubSet::current()
+            .map(|set| set.values)
+            .unwrap_or_default()
+    }
+
+    /// Wait (bounded) until no session holds `reference`.
     async fn released(reference: &str) -> bool {
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
-            if resolve(reference).is_err() {
+            if !is_held(reference) {
                 return true;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1010,7 +1359,7 @@ mod tests {
             );
         }
         assert!(
-            register("run-frame-empty", &none).is_none(),
+            register("run-frame-empty", TARGET, &none).is_none(),
             "nothing to hold"
         );
     }
@@ -1055,8 +1404,8 @@ mod tests {
     }
 
     /// A `type` action is substituted in the app's copy only: `params.text`
-    /// and a top-level `text` alike, nothing else in the request, never the
-    /// request itself, and never another action.
+    /// and a top-level `text` alike, nothing else in the request, and never
+    /// the request itself. A request carrying no placeholder goes as it is.
     #[test]
     fn a_type_action_is_substituted_in_the_app_copy_only() {
         let _held = hold(
@@ -1071,13 +1420,13 @@ mod tests {
             "params": {"text": "{{secret:cs-sub-pw}}", "clear": true},
             "text": "id {{secret:cs-sub-user}}!",
         });
-        let app_copy = app_bound_type_body(&body)
+        let copy = app_copy(&body)
             .expect("held refs")
             .expect("a copy for the app");
-        assert_eq!(app_copy["params"]["text"], json!("p@ss-sub-Hn5"));
-        assert_eq!(app_copy["text"], json!("id alice-sub-Hn6!"));
+        assert_eq!(copy["params"]["text"], json!("p@ss-sub-Hn5"));
+        assert_eq!(copy["text"], json!("id alice-sub-Hn6!"));
         assert_eq!(
-            app_copy["params"]["clear"],
+            copy["params"]["clear"],
             json!(true),
             "the rest of the request is untouched"
         );
@@ -1089,26 +1438,87 @@ mod tests {
 
         let top_level_only = json!({"action": "type", "text": "{{secret:cs-sub-pw}}"});
         assert_eq!(
-            app_bound_type_body(&top_level_only)
-                .expect("held")
-                .expect("copy")["text"],
+            app_copy(&top_level_only).expect("held").expect("copy")["text"],
             json!("p@ss-sub-Hn5"),
             "a placeholder in a top-level `text` is substituted"
         );
 
         for sent_as_is in [
-            json!({"action": "click", "params": {"text": "{{secret:cs-sub-pw}}"}}),
-            json!({"params": {"text": "{{secret:cs-sub-pw}}"}}),
-            json!({"action": "Type", "text": "{{secret:cs-sub-pw}}"}),
             json!({"action": "type", "params": {"text": "plain text"}}),
-            json!({"action": "type", "params": {"value": "{{secret:cs-sub-pw}}"}}),
+            json!({"action": "click", "params": {"text": "plain text"}}),
+            json!({"params": {}}),
         ] {
-            assert_eq!(app_bound_type_body(&sent_as_is), Ok(None), "{sent_as_is}");
+            assert_eq!(app_copy(&sent_as_is), Ok(None), "{sent_as_is}");
+        }
+    }
+
+    /// A placeholder outside a `type` action's `params.text` and `text` is a
+    /// typed refusal: another action, another field of a `type`, an action
+    /// name ui-bridge would not read as `type`, even an object key. Sent on,
+    /// the app would get the literal placeholder as, say, a password. The
+    /// refusal names neither the held ref nor its value.
+    #[test]
+    fn a_placeholder_outside_a_type_actions_text_is_refused_never_sent() {
+        let _held = hold("run-outside", &[("cs-out-pw", "outside-value-Ot1")]);
+        for (body, action) in [
+            (
+                json!({"action": "click", "params": {"text": "{{secret:cs-out-pw}}"}}),
+                "click",
+            ),
+            (
+                json!({"action": "setValue", "params": {"value": "{{secret:cs-out-pw}}"}}),
+                "setValue",
+            ),
+            (
+                json!({"action": "sendKeys", "params": {"text": "{{secret:cs-out-pw}}"}}),
+                "sendKeys",
+            ),
+            (
+                json!({"action": "Type", "text": "{{secret:cs-out-pw}}"}),
+                "Type",
+            ),
+            (
+                json!({"params": {"text": "{{secret:cs-out-pw}}"}}),
+                "<no action>",
+            ),
+            (
+                json!({"action": "type", "params": {"value": "{{secret:cs-out-pw}}"}}),
+                "type",
+            ),
+            (
+                json!({"action": "type", "params": {"text": "{{secret:cs-out-pw}}",
+                    "fields": [{"value": "{{secret:cs-out-pw}}"}]}}),
+                "type",
+            ),
+            (
+                json!({"action": "type", "params": {"{{secret:cs-out-pw}}": "a key"}}),
+                "type",
+            ),
+        ] {
+            let refused = app_copy(&body).expect_err("refused");
+            assert_eq!(
+                refused,
+                SubstitutionError::OutsideTypeText {
+                    action: action.to_string()
+                },
+                "{body}"
+            );
+            assert_eq!(refused.reference(), None);
+            let answer = refused.refusal("the action was not dispatched");
+            assert_eq!(answer["code"], json!(OUTSIDE_TYPE_TEXT_CODE));
+            assert_eq!(answer["failure_origin"], json!("runner"));
+            assert!(crate::journey::capture::sdk_refusal(&answer));
+            let text = answer.to_string();
+            assert!(
+                !text.contains("cs-out-pw") && !text.contains("outside-value-Ot1"),
+                "{text}"
+            );
         }
     }
 
     /// An unknown, malformed or unterminated ref is a typed refusal, never the
-    /// literal placeholder, and one bad placeholder refuses the whole text.
+    /// literal placeholder, and one bad placeholder refuses the whole text. So
+    /// is the scrub's own mask, sent back.
     #[test]
     fn an_unknown_or_malformed_ref_is_refused_never_typed_literally() {
         let _held = hold("run-unknown", &[("cs-unk-held", "held-value-Unk7")]);
@@ -1121,9 +1531,10 @@ mod tests {
                 "{{secret:cs-unk-held}} then {{secret:cs-unk-never-held}}",
                 "cs-unk-never-held",
             ),
+            (REDACTED, "*"),
         ] {
             let body = json!({"action": "type", "params": {"text": text}});
-            let refused = app_bound_type_body(&body).expect_err(text);
+            let refused = app_copy(&body).expect_err(text);
             assert_eq!(
                 refused,
                 SubstitutionError::UnknownRef {
@@ -1150,24 +1561,110 @@ mod tests {
     fn a_ref_two_sessions_hold_with_different_values_is_refused() {
         let _a = hold("run-amb-a", &[("cs-amb-pw", "tenant-a-pass-Am1")]);
         let _b = hold("run-amb-b", &[("cs-amb-pw", "tenant-b-pass-Am2")]);
-        let refused =
-            app_bound_type_body(&json!({"action": "type", "text": "{{secret:cs-amb-pw}}"}))
-                .expect_err("ambiguous");
+        let refused = app_copy(&json!({"action": "type", "text": "{{secret:cs-amb-pw}}"}))
+            .expect_err("ambiguous");
         assert_eq!(refused.code(), AMBIGUOUS_REF_CODE);
         let answer = refused.refusal("the action was not dispatched").to_string();
         assert!(
-            !answer.contains("tenant-a-pass-Am1") && !answer.contains("tenant-b-pass-Am2"),
+            !answer.contains("tenant-a-pass-Am1")
+                && !answer.contains("tenant-b-pass-Am2")
+                && !answer.contains("cs-amb-pw"),
             "{answer}"
         );
 
         let _c = hold("run-amb-c", &[("cs-amb-same", "same-pass-Am3")]);
         let _d = hold("run-amb-d", &[("cs-amb-same", "same-pass-Am3")]);
         assert_eq!(
-            app_bound_type_body(&json!({"action": "type", "text": "{{secret:cs-amb-same}}"}))
+            app_copy(&json!({"action": "type", "text": "{{secret:cs-amb-same}}"}))
                 .expect("not ambiguous")
                 .expect("copy")["text"],
             json!("same-pass-Am3")
         );
+    }
+
+    /// A session's value is typed only into the app its frame targets: the
+    /// active SDK connection must have the origin of the frame's `target_url`
+    /// (loopback spelled either way). Another app, no connection, and a
+    /// session whose `target_url` has no origin are each refused, naming
+    /// neither the ref nor the value.
+    #[test]
+    fn a_secret_is_typed_only_into_the_app_its_session_targets() {
+        let _a = register(
+            "run-bind-a",
+            TARGET,
+            &secrets(&[("cs-bind-a", "bound-a-value-Bd1")]),
+        )
+        .expect("held");
+        let _b = register(
+            "run-bind-b",
+            "https://app-b.example/login?next=/home",
+            &secrets(&[("cs-bind-b", "bound-b-value-Bd2")]),
+        )
+        .expect("held");
+        let _odd = register(
+            "run-bind-odd",
+            "not a url",
+            &secrets(&[("cs-bind-odd", "bound-odd-value-Bd3")]),
+        )
+        .expect("held");
+        let typed = |reference: &str, active: Option<&NormOrigin>| {
+            app_bound_type_body(
+                &json!({"action": "type", "text": format!("{{{{secret:{reference}}}}}")}),
+                active,
+            )
+        };
+        let app_b = NormOrigin::parse("https://app-b.example:443").expect("an origin");
+
+        assert_eq!(
+            typed("cs-bind-a", Some(&connected()))
+                .expect("own app")
+                .expect("copy")["text"],
+            json!("bound-a-value-Bd1")
+        );
+        assert_eq!(
+            typed("cs-bind-b", Some(&app_b))
+                .expect("own app")
+                .expect("copy")["text"],
+            json!("bound-b-value-Bd2"),
+            "a default port spelled out is the same origin"
+        );
+        for (reference, active, target, shown) in [
+            (
+                "cs-bind-a",
+                Some(&app_b),
+                Some("http://localhost:3001"),
+                Some("https://app-b.example"),
+            ),
+            (
+                "cs-bind-b",
+                Some(&connected()),
+                Some("https://app-b.example"),
+                Some("http://127.0.0.1:3001"),
+            ),
+            ("cs-bind-a", None, Some("http://localhost:3001"), None),
+            (
+                "cs-bind-odd",
+                Some(&connected()),
+                None,
+                Some("http://127.0.0.1:3001"),
+            ),
+        ] {
+            let refused = typed(reference, active).expect_err(reference);
+            assert_eq!(
+                refused,
+                SubstitutionError::WrongApp {
+                    target: target.map(String::from),
+                    active: shown.map(String::from),
+                },
+                "{reference}"
+            );
+            assert_eq!(refused.code(), WRONG_APP_CODE);
+            let answer = refused.refusal("the action was not dispatched").to_string();
+            assert!(
+                !answer.contains(reference) && !answer.contains("-value-Bd"),
+                "{answer}"
+            );
+        }
     }
 
     /// The IPC fallback never substitutes: a placeholder anywhere in a request
@@ -1208,7 +1705,8 @@ mod tests {
     }
 
     /// Held values leave strings, object keys and exact-match numbers, raw
-    /// and JSON-escaped bytes; a number that is not the value stays.
+    /// and JSON-escaped bytes, each replaced by a mask that names no ref; a
+    /// number that is not the value stays.
     #[test]
     fn held_values_are_scrubbed_from_json_text_and_bytes() {
         let _held = hold(
@@ -1227,26 +1725,98 @@ mod tests {
         assert!(set.scrub_json(&mut value));
         let rendered = value.to_string();
         assert!(
-            !rendered.contains("rub-Sc1") && !rendered.contains("4829173"),
+            !rendered.contains("rub-Sc1")
+                && !rendered.contains("4829173")
+                && !rendered.contains("cs-scrub"),
             "{rendered}"
         );
-        assert_eq!(value["echo"], json!("typed {{secret:cs-scrub-pw}}!"));
-        assert_eq!(value["pin"], json!("{{secret:cs-scrub-pin}}"));
+        assert_eq!(value["echo"], json!("typed {{secret:*}}!"));
+        assert_eq!(value["pin"], json!(REDACTED));
         assert_eq!(value["other"], json!(4829174), "a different number stays");
 
         let raw = "x sc\"rub-Sc1 y \"sc\\\"rub-Sc1\" z";
         let scrubbed =
             String::from_utf8(set.scrub_bytes(raw.as_bytes()).expect("changed")).expect("utf-8");
-        assert_eq!(
-            scrubbed,
-            "x {{secret:cs-scrub-pw}} y \"{{secret:cs-scrub-pw}}\" z"
-        );
+        assert_eq!(scrubbed, "x {{secret:*}} y \"{{secret:*}}\" z");
         assert_eq!(set.scrub_str("nothing held here"), None);
         assert_eq!(set.scrub_bytes(b"nothing held here"), None);
     }
 
-    /// The SDK-router layer: JSON, text and event-stream bodies come back with
-    /// the placeholder where the value was, and a body carrying no held value
+    /// ui-bridge shortens a field's value before it shows it (`truncate` in
+    /// `summary-generator.ts`: the first `max - 3` code points, then `...`;
+    /// `search-engine.ts` appends `…`). Every such echo of a held value, raw
+    /// or JSON-escaped, is masked, the ellipsis kept. A prefix shorter than
+    /// `MIN_ECHO_CHARS`, or one not followed by an ellipsis, is not an echo.
+    #[test]
+    fn truncated_echoes_of_a_held_value_are_scrubbed() {
+        const SECRET: &str = "sk_live_51HtruncEchoQ\"x9-Tr1-padding-to-forty";
+        let _held = hold("run-trunc", &[("cs-trunc-key", SECRET)]);
+        let set = ScrubSet::current().expect("held");
+        // ui-bridge's `truncate(str, max)`, over code points.
+        let truncate =
+            |max: usize| format!("{}...", SECRET.chars().take(max - 3).collect::<String>());
+        let element = format!("input \"API key\" value: \"{}\"", truncate(20));
+        let form = format!("    - API key = \"{}\"", truncate(15));
+        let found = format!("{}…", SECRET.chars().take(30).collect::<String>());
+        for shown in [&element, &form, &found] {
+            let scrubbed = set.scrub_str(shown).expect("an echo");
+            assert!(!scrubbed.contains("sk_live_51"), "{scrubbed}");
+            assert!(
+                scrubbed.contains("{{secret:*}}...") || scrubbed.contains("{{secret:*}}…"),
+                "the ellipsis is kept: {scrubbed}"
+            );
+        }
+        let escaped = format!(
+            "{{\"summary\":\"{}...\"}}",
+            json_escaped(&SECRET.chars().take(25).collect::<String>())
+        );
+        let scrubbed = String::from_utf8(set.scrub_bytes(escaped.as_bytes()).expect("an echo"))
+            .expect("utf-8");
+        assert!(!scrubbed.contains("truncEcho"), "{scrubbed}");
+
+        let short = format!(
+            "{}...",
+            SECRET.chars().take(MIN_ECHO_CHARS - 1).collect::<String>()
+        );
+        assert_eq!(set.scrub_str(&short), None, "shorter than an echo");
+        let no_ellipsis = SECRET.chars().take(20).collect::<String>();
+        assert_eq!(
+            set.scrub_str(&no_ellipsis),
+            None,
+            "a prefix alone is not an echo"
+        );
+    }
+
+    /// Two held values that overlap in a text are masked as their union. A
+    /// left-to-right match would mask the first and let most of the second
+    /// through.
+    #[test]
+    fn overlapping_held_values_are_masked_as_their_union() {
+        let _held = hold(
+            "run-overlap",
+            &[
+                ("cs-ovl-a", "ovl-head-Ov1-shared"),
+                ("cs-ovl-b", "shared-Ov2-tail-end"),
+            ],
+        );
+        let set = ScrubSet::current().expect("held");
+        assert_eq!(
+            set.scrub_str("[ovl-head-Ov1-shared-Ov2-tail-end]")
+                .as_deref(),
+            Some("[{{secret:*}}]")
+        );
+        assert_eq!(
+            set.scrub_str("a ovl-head-Ov1-shared b shared-Ov2-tail-end c")
+                .as_deref(),
+            Some("a {{secret:*}} b {{secret:*}} c"),
+            "disjoint occurrences stay separate"
+        );
+    }
+
+    /// The response layer: JSON, text and event-stream bodies come back with
+    /// the mask where the value was. A JSON body whose parse hides the value
+    /// (a duplicate key) is scrubbed as bytes; an event whose value spans two
+    /// `data:` lines is scrubbed as one value. A body carrying no held value
     /// passes byte for byte.
     #[tokio::test]
     async fn every_sdk_response_body_is_scrubbed_while_a_secret_is_held() {
@@ -1255,7 +1825,11 @@ mod tests {
         use tower::ServiceExt;
 
         const SECRET: &str = "mw-fixture-pa\"ss-Mw1";
-        let _held = hold("run-middleware", &[("cs-mw-pw", SECRET)]);
+        const SPLIT: &str = "mw-split-first\nmw-split-second-Mw2";
+        let _held = hold(
+            "run-middleware",
+            &[("cs-mw-pw", SECRET), ("cs-mw-split", SPLIT)],
+        );
         let app = axum::Router::new()
             .route(
                 "/json",
@@ -1265,6 +1839,15 @@ mod tests {
             )
             .route("/text", get(|| async { format!("plain {SECRET} text") }))
             .route(
+                "/duplicate-key",
+                get(|| async {
+                    (
+                        [(header::CONTENT_TYPE, "application/json")],
+                        format!("{{\"value\":\"{}\",\"value\":\"\"}}", json_escaped(SECRET)),
+                    )
+                }),
+            )
+            .route(
                 "/sse",
                 get(|| async {
                     Sse::new(futures_util::stream::iter([
@@ -1272,6 +1855,7 @@ mod tests {
                             Event::default().data(json!({"value": SECRET}).to_string()),
                         ),
                         Ok(Event::default().data(format!("raw {SECRET}"))),
+                        Ok(Event::default().data(format!("split {SPLIT}"))),
                     ]))
                 }),
             )
@@ -1303,17 +1887,23 @@ mod tests {
                 String::from_utf8_lossy(&bytes).into_owned()
             }
         };
-        for path in ["/json", "/text", "/sse"] {
+        for path in ["/json", "/text", "/duplicate-key", "/sse"] {
             let body = fetch(path).await;
             assert!(
                 !body.contains(SECRET) && !body.contains(&json_escaped(SECRET)),
                 "{path} must not carry the value: {body}"
             );
             assert!(
-                body.contains("{{secret:cs-mw-pw}}"),
-                "{path}: the placeholder stands where the value was: {body}"
+                body.contains(REDACTED) && !body.contains("cs-mw"),
+                "{path}: the mask stands where the value was, naming no ref: {body}"
             );
         }
+        let events = fetch("/sse").await;
+        assert!(
+            !events.contains("mw-split-second-Mw2") && !events.contains("mw-split-first"),
+            "a value split across data lines must not survive: {events}"
+        );
+        assert!(events.contains("data: split {{secret:*}}"), "{events}");
         assert_eq!(
             fetch("/clean").await,
             "{\n  \"pretty\": true\n}",
@@ -1323,16 +1913,18 @@ mod tests {
 
     /// A held map lives exactly as long as its session: released when its
     /// registration drops, when its PTY exits (read through a real terminal
-    /// manager, as production reads it), and at its TTL.
+    /// manager, as production reads it), and at its hold TTL. Past its
+    /// substitution TTL it substitutes nothing, but its value is still
+    /// scrubbed.
     #[tokio::test]
     async fn a_held_map_is_released_on_drop_at_pty_exit_and_at_its_ttl() {
         let dropped = hold("run-life-drop", &[("cs-life-drop", "life-drop-Lf1")]);
-        assert_eq!(resolve("cs-life-drop"), Ok("life-drop-Lf1".to_string()));
-        drop(dropped);
-        assert!(
-            resolve("cs-life-drop").is_err(),
-            "a dropped registration releases"
+        assert_eq!(
+            resolve("cs-life-drop", Some(&connected())),
+            Ok("life-drop-Lf1".to_string())
         );
+        drop(dropped);
+        assert!(!is_held("cs-life-drop"), "a dropped registration releases");
 
         let manager = Arc::new(TerminalManager::new());
         let pane = Arc::new(crate::terminal::session::tests::make_test_session(
@@ -1340,27 +1932,58 @@ mod tests {
         ));
         pane.set_alive_for_test(true);
         manager.insert_for_test("cs-life-pane", Arc::clone(&pane));
-        let watched = register("run-life-pty", &secrets(&[("cs-life-pty", "life-pty-Lf2")]));
+        let watched = register(
+            "run-life-pty",
+            TARGET,
+            &secrets(&[("cs-life-pty", "life-pty-Lf2")]),
+        );
         release_at_pty_exit_polling(watched, &manager, "cs-life-pane", Duration::from_millis(5));
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(
-            resolve("cs-life-pty"),
+            resolve("cs-life-pty", Some(&connected())),
             Ok("life-pty-Lf2".to_string()),
             "held while the PTY lives"
         );
         pane.set_alive_for_test(false);
         assert!(released("cs-life-pty").await, "released once the PTY exits");
 
+        let lapsed = register_for(
+            "run-life-sub",
+            TARGET,
+            &secrets(&[("cs-life-sub", "life-sub-Lf4")]),
+            Duration::from_millis(20),
+            Duration::from_secs(60),
+        )
+        .expect("held");
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert_eq!(
+            resolve("cs-life-sub", Some(&connected())),
+            Err(SubstitutionError::UnknownRef {
+                reference: "cs-life-sub".to_string()
+            }),
+            "past its substitution TTL a map substitutes nothing"
+        );
+        assert!(
+            scrubbed_values()
+                .iter()
+                .any(|value| value == "life-sub-Lf4"),
+            "and its value is still scrubbed while it is held"
+        );
+        drop(lapsed);
+
         let short = register_for(
             "run-life-ttl",
+            TARGET,
             &secrets(&[("cs-life-ttl", "life-ttl-Lf3")]),
+            Duration::from_millis(20),
             Duration::from_millis(20),
         )
         .expect("held");
-        assert!(released("cs-life-ttl").await, "released at its TTL");
+        assert!(released("cs-life-ttl").await, "released at its hold TTL");
         assert!(
-            ScrubSet::current()
-                .is_none_or(|set| !set.pairs.iter().any(|(value, _)| value == "life-ttl-Lf3")),
+            !scrubbed_values()
+                .iter()
+                .any(|value| value == "life-ttl-Lf3"),
             "an expired value is no longer held anywhere"
         );
         drop(short);
@@ -1369,6 +1992,12 @@ mod tests {
     /// The journey rows a `type` action produces (its edge, closed by the next
     /// snapshot, and the frontier of that snapshot) never carry what was
     /// typed, even when the app reports the field's new value.
+    ///
+    /// A guard, not a test of the scrub: `record_journey_snapshot` reads the
+    /// app's snapshot before any response layer runs, and this holds because
+    /// the journey extraction keeps only structural fields (ids, types,
+    /// route). It holds without this module, and fails the day that
+    /// extraction starts carrying a field's value or text.
     #[test]
     fn journey_rows_from_a_type_action_never_carry_the_value() {
         use crate::journey::capture::{edge_insert, finalize, snapshot_view};
@@ -1435,8 +2064,11 @@ mod tests {
         );
     }
 
-    /// Every `/ui-bridge/sdk/*` router carries the scrub layer AFTER its last
-    /// route (`Router::layer` wraps only the routes registered before it).
+    /// Every router that returns app content carries the scrub layer AFTER
+    /// its last route (`Router::layer` wraps only the routes registered before
+    /// it): the two `/ui-bridge/sdk/*` routers, `/ui-bridge/apps/*`, and the
+    /// element and effect routes whose WebSocket-app branches answer with the
+    /// app's content.
     #[test]
     fn every_sdk_router_carries_the_scrub_layer_after_its_last_route() {
         for (file, src) in [
@@ -1445,9 +2077,18 @@ mod tests {
                 "mcp/ui_bridge/sdk_spec_sync.rs",
                 include_str!("mcp/ui_bridge/sdk_spec_sync.rs"),
             ),
+            ("mcp/app_discovery.rs", include_str!("mcp/app_discovery.rs")),
+            (
+                "mcp/ui_bridge/effects.rs",
+                include_str!("mcp/ui_bridge/effects.rs"),
+            ),
+            (
+                "mcp/ui_bridge/elements.rs",
+                include_str!("mcp/ui_bridge/elements.rs"),
+            ),
         ] {
             let routes = src
-                .split("\npub fn routes() -> Router<Arc<ApiState>> {")
+                .split("\npub fn routes() -> ")
                 .nth(1)
                 .unwrap_or_else(|| panic!("{file}: no routes()"))
                 .split("\n}\n")
@@ -1466,10 +2107,11 @@ mod tests {
         }
     }
 
-    /// `handle_element_action` substitutes only the app-bound copies, answers
-    /// a refused substitution without dispatching, refuses a placeholder on
-    /// its IPC fallback before anything is typed, and scrubs its result
-    /// before the journey ledger and the event row read it. A handler needs an
+    /// `handle_element_action` reads the active connection's origin, then
+    /// substitutes only the app-bound copies for it, answers a refused
+    /// substitution without dispatching, refuses a placeholder on its IPC
+    /// fallback before anything is typed, and scrubs its result before the
+    /// journey ledger and the event row read it. A handler needs an
     /// `ApiState`, which no test builds, so the composition is pinned from
     /// source (the technique `sdk_client`'s own handler pins use).
     #[test]
@@ -1488,7 +2130,10 @@ mod tests {
                 .unwrap_or_else(|| panic!("handle_element_action lost `{needle}`"))
         };
         let dispatch = at("dispatch_app_request_typed(");
-        assert!(at("element_action_app_payloads(&id, &body, tab_id)") < dispatch);
+        let payloads =
+            at("element_action_app_payloads(&id, &body, tab_id, active_origin.as_ref())");
+        assert!(at("let active_origin = active_app_origin(&state).await;") < payloads);
+        assert!(payloads < dispatch);
         assert!(at("Err(refused) => crate::condition_secrets::refused_action(") < dispatch);
         let refusal = at("crate::condition_secrets::ipc_refusal(&body)");
         assert!(at("ipc_fallback_refusal(&e") < refusal);
