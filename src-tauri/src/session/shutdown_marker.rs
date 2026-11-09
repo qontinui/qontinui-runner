@@ -242,6 +242,22 @@ pub fn boot_classification() -> Option<BootClassification> {
     BOOT_CLASSIFICATION.get().copied()
 }
 
+/// The two boot inputs `SessionLifecycleStore::restorable_records` is read
+/// under: the prior marker's `at`, and whether the prior shutdown was clean.
+///
+/// One spelling for every reader that must agree with the boot restore about
+/// which rows are coming back (`terminal_session_list_open`, and the page
+/// picker's record-aware loads in `terminal::page_placement`). Before
+/// [`classify_boot`] has run this is `(None, false)`: no marker anchor, and a
+/// boot not proven clean. On a crash boot the marker's `at` is still returned;
+/// the store decides what it may anchor.
+pub fn restore_admission_inputs() -> (Option<i64>, bool) {
+    let boot = boot_classification();
+    let prior_marker_at = boot.and_then(|c| c.prior_marker_at);
+    let boot_was_clean = boot.map(|c| !c.crash_recovery).unwrap_or(false);
+    (prior_marker_at, boot_was_clean)
+}
+
 /// Write the marker for the NOW-running process as `clean:false`. Call once,
 /// early at boot, AFTER [`was_unclean_shutdown`] has read the prior value.
 /// If this process later crashes, the `clean:false` marker is what the next

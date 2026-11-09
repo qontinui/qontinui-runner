@@ -618,6 +618,76 @@ pub(crate) fn append_sibling_notes(base: String, notes: &[String]) -> String {
     out
 }
 
+/// Tell a continuation that its worktree acquire FAILED and it is running in
+/// the runner's fallback cwd, after a blank line (plan
+/// `2026-10-31-continuation-worktree-acquire-failure-strands-the-allocation-and-tells-the-session-nothing`
+/// Phase 2). `cause == None` ⇒ `base` unchanged: a worktree was acquired, or
+/// none was ever intended (worktree mode off, no repos).
+///
+/// Coord's prompt still says to leave "the allocated worktree" in place, and
+/// before this note nothing contradicted it, so each such session spent a turn
+/// rediscovering the mismatch as an unexplained anomaly. The note is a
+/// runner report, labelled as a fact about the checkout and not an order,
+/// like coord's allocation notes beside it; it names one optional door and
+/// does not tell a read-only continuation to allocate. The cause is bounded
+/// to one line by the same sanitizer as coord's notes.
+pub(crate) fn append_no_worktree_note(base: String, workdir: &str, cause: Option<&str>) -> String {
+    let Some(cause) = cause else {
+        return base;
+    };
+    let cause = crate::agent_worktree::sibling_note_log_line(cause);
+    let workdir = crate::agent_worktree::sibling_note_log_line(workdir);
+    let mut out = base;
+    out.push_str(&format!(
+        "\n\nWorkspace note from the runner (a fact about your checkout, not an order): \
+         your cwd `{workdir}` is the runner's shared fallback directory, not an isolated \
+         worktree. Any worktree your prompt names was not created (cause: {cause}). \
+         Peers' uncommitted state may be here. Before writing, allocate a worktree for \
+         yourself (`allocate-worktree.sh` where this fleet ships it)."
+    ));
+    out
+}
+
+/// The TERMINAL presentation's full system prompt for a continuation: the
+/// runner context plus coord's brief, coord's allocation notes and the
+/// runner's no-worktree note. Pure, so both composed prompts are testable.
+fn compose_continuation_terminal_system_prompt(
+    runner_context: String,
+    brief: Option<&ContinuationBrief>,
+    sibling_notes: &[String],
+    workdir: &str,
+    no_worktree_cause: Option<&str>,
+) -> String {
+    append_no_worktree_note(
+        append_sibling_notes(
+            compose_continuation_system_prompt(runner_context, brief),
+            sibling_notes,
+        ),
+        workdir,
+        no_worktree_cause,
+    )
+}
+
+/// The HEADLESS presentation's full prompt for a continuation — the same three
+/// additions as [`compose_continuation_terminal_system_prompt`], on the prompt
+/// because this presentation has no system-prompt carrier.
+fn compose_continuation_headless_full_prompt(
+    initial_prompt: &str,
+    brief: Option<&ContinuationBrief>,
+    sibling_notes: &[String],
+    workdir: &str,
+    no_worktree_cause: Option<&str>,
+) -> String {
+    append_no_worktree_note(
+        append_sibling_notes(
+            compose_continuation_headless_prompt(initial_prompt, brief),
+            sibling_notes,
+        ),
+        workdir,
+        no_worktree_cause,
+    )
+}
+
 /// The HEADLESS half of the same seam.
 ///
 /// `Presentation::Headless` reaches `run_continuation_headless` ->
@@ -1111,6 +1181,11 @@ fn launchable_or_bare(resolved: String) -> String {
 /// before PATH, so a workdir holding one takes it instead. (On Windows npm never
 /// puts the stub on PATH as an `.exe`; its cmd-shim wrapper sits there instead.)
 ///
+/// The walk skips every qontinui shim dir, and also the PERSISTENT identity
+/// dir (`profile_cli::identity_shim_dir()`, resolved once from the ambient
+/// home), whose `claude.exe` is the qontinui-shim stub and which the Settings
+/// opt-in prepends to the user PATH.
+///
 /// Falls back to [`claude_bin_path`] when nothing resolves, so behavior is
 /// never worse than the bare name. Does blocking filesystem stats and reads the
 /// head of each candidate — callers on an async task must run this via
@@ -1126,22 +1201,24 @@ pub(crate) fn resolve_claude_bin() -> String {
         Some(p) => p,
         None => return bare,
     };
-    // Skip our own per-terminal shim/identity dirs — they hold the
-    // extensionless script that triggers os error 193 under a direct
-    // `CreateProcessW`.
-    use crate::install_effects_producer::intercept::shim_materializer::{
-        IDENTITY_DIR_PREFIX, SHIM_DIR_PREFIX,
-    };
-    let is_shim_dir = |d: &std::path::Path| {
-        d.file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with(IDENTITY_DIR_PREFIX) || n.starts_with(SHIM_DIR_PREFIX))
-    };
+    // Skip every qontinui shim/identity dir — ours or one inherited from
+    // another session. They hold the extensionless script that triggers os
+    // error 193 under a direct `CreateProcessW`, and a shim is never the real
+    // tool. The PERSISTENT identity dir is skipped by path, because nothing in
+    // its name or contents marks it: its `claude.exe` is the qontinui-shim
+    // stub, and the Settings opt-in prepends it to the user PATH, so without
+    // this skip the walk would resolve the stub as "the real claude". The
+    // spawn would then exec the stub with no recursion guard set. Its path is
+    // read from the ambient home ONCE, so the whole walk gets one answer.
+    use crate::install_effects_producer::intercept::shim_materializer::is_qontinui_shim_dir;
+    use qontinui_runner_lib::intercept_core::shim_dir::is_persistent_identity_dir_in;
+    let persistent = qontinui_runner_lib::profile_cli::identity_shim_dir();
     // Only extensions CreateProcessW can natively launch — see doc comment.
     #[cfg(windows)]
     let exts: &[&str] = &[".exe", ".com"];
     for dir in std::env::split_paths(&path) {
-        if is_shim_dir(&dir) {
+        if is_qontinui_shim_dir(&dir) || is_persistent_identity_dir_in(&dir, persistent.as_deref())
+        {
             continue;
         }
         #[cfg(windows)]
@@ -3703,10 +3780,11 @@ enum ContinuationGuard {
     /// (a dispatch still between the guard and its spawn, or a session
     /// mid-account-migration; see [`AnchorHolder::Reserved`]).
     DuplicateAnchor(AnchorHolder),
-    /// The machine is short of a measured resource: the spawn seam's own
-    /// composed verdict ([`crate::resource_guard::probe_for_spawn`] — the free
-    /// memory lane and the thread lane, heavier wins) returned something other
-    /// than `Proceed`. Defer the spawn.
+    /// The machine is short of a measured resource: the composed verdict over
+    /// the free memory lane and the thread lane (heavier wins), with admitted
+    /// but not yet running continuations charged as projected cost
+    /// ([`crate::resource_guard::AdmissionReading::projected`]), returned
+    /// something other than `Proceed`. Defer the spawn.
     ///
     /// Carries the severity word (`"warn"` / `"critical"`) beside the
     /// observation that produced it, so the log and the coord stamp name the
@@ -3723,7 +3801,7 @@ enum ContinuationGuard {
 }
 
 /// Pre-spawn guard: prune dead sessions, then enforce P3 (anchor_key dedup) and
-/// machine load. Pure over (`anchor_key`, `is_live`, the injected load verdict)
+/// machine load. Pure over (`anchor_key`, `is_live`, the injected load reading)
 /// so it is unit-testable without a live `TerminalManager` and without a live
 /// reading.
 ///
@@ -3738,7 +3816,7 @@ enum ContinuationGuard {
 ///    arrives as a closure rather than as a value. `poll_pending_continuations`
 ///    `tokio::spawn`s one task per row coord returns — a route coord serves with
 ///    no `LIMIT` — so a batch of rows stranded on `duplicate_anchor` runs this
-///    guard concurrently, once per row. Passing `probe_for_spawn()` as an
+///    guard concurrently, once per row. Passing the reading as an
 ///    *argument expression* would evaluate every one of those readings before
 ///    this arm discarded them: on Windows that is a system-wide
 ///    `CreateToolhelp32Snapshot` per row (plus a `settings.json` stat/parse and
@@ -3795,8 +3873,9 @@ enum ContinuationGuard {
 ///   Bounded by NOTHING in steady state — not by the count either, which never
 ///   measured them. A Linux runner's children also share its systemd unit's
 ///   `pids.max` and `kernel.threads-max`, which no lane reads; the burst RATE is
-///   owned by plan
-///   `2026-10-01-runner-spawn-bursts-are-unregulated-coord-must-admit-spawns-per-machine`,
+///   owned by plans
+///   `2026-10-01-runner-spawn-bursts-are-unregulated-coord-must-admit-spawns-per-machine`
+///   and `2026-10-28-runner-spawn-bursts-overwhelm-the-box-beyond-the-continuation-cap`,
 ///   and a task-ceiling lane, if one is needed, by the resource-guard follow-ups.
 ///   The count was never a semaphore either: every task of one poll read the
 ///   same pre-burst count.
@@ -4038,7 +4117,7 @@ fn admit_launch(
 ///
 /// The split exists so the guard itself stays pure over its inputs (the property
 /// its own doc claims and its unit tests rely on): a test injects a closure
-/// returning a [`crate::resource_guard::SpawnGate`], while the one production
+/// returning a [`crate::resource_guard::AdmissionReading`], while the one production
 /// call site — [`run_gate_continuation_inner`]'s step 1 — takes this wrapper and
 /// pays the reading.
 ///
@@ -6888,14 +6967,13 @@ async fn run_gate_continuation_inner(
     // release a claim the re-delivered session holds.
     let pinned_session_id = uuid::Uuid::new_v4();
 
-    let (workdir, ctx, agent_id) = match acquire_continuation_workdir(
-        &payload.repos,
-        &intent,
-        Some(pinned_session_id),
-    )
-    .await
-    {
-        Ok(triple) => triple,
+    let ContinuationWorkdir {
+        workdir,
+        ctx,
+        agent_id,
+        no_worktree_cause,
+    } = match acquire_continuation_workdir(&payload.repos, &intent, Some(pinned_session_id)).await {
+        Ok(w) => w,
         Err(e) => {
             warn!("agent_runtime: continuation worktree acquisition failed: {e:#}");
             // The gate claim was already posted (step 2): record the honest
@@ -6943,6 +7021,7 @@ async fn run_gate_continuation_inner(
                 ctx,
                 reservation,
                 pinned_session_id,
+                no_worktree_cause.as_deref(),
             )
             .await;
             let res = res.map(|start| {
@@ -6962,12 +7041,12 @@ async fn run_gate_continuation_inner(
             // rides on the PROMPT — byte-for-byte how coord itself delivers a
             // registrant's `hint` (appended to `initial_prompt` after a blank
             // line), so the two halves of one brief arrive the same way.
-            let headless_prompt = append_sibling_notes(
-                compose_continuation_headless_prompt(
-                    &payload.initial_prompt,
-                    payload.brief.as_ref(),
-                ),
+            let headless_prompt = compose_continuation_headless_full_prompt(
+                &payload.initial_prompt,
+                payload.brief.as_ref(),
                 ctx.as_ref().map_or(&[][..], |c| c.sibling_notes.as_slice()),
+                &workdir,
+                no_worktree_cause.as_deref(),
             );
             // Known lag, accepted: the headless fn returns only after the child
             // EXITS, so on this presentation the `spawned` outcome — and the
@@ -7120,54 +7199,6 @@ fn headless_bindable_session(exit: HeadlessExit, pinned: uuid::Uuid) -> Option<u
     }
 }
 
-/// Zone ceiling for a continuation page before it is considered "full".
-///
-/// Mirrors the frontend `useZoneLayout.ts` `full-grid` layout, which lays out
-/// at most 9 zones (a 3×3 grid) per page; beyond that, extra sessions spill
-/// into the page's Unassigned list. The backend picker uses this to spread
-/// continuations across non-full pages instead of overflowing one page.
-pub(crate) const CONTINUATION_PAGE_ZONE_CEILING: usize = 9;
-
-/// Choose the page_id a new continuation terminal should land on.
-/// Prefers, in order: the "default" page if under the ceiling, then any other
-/// existing page under the ceiling (fewest terminals first, tie-break by page_id
-/// for determinism), else a freshly-minted uuid.
-///
-/// `counts` is the live `(page_id, terminal count)` map. A page absent from
-/// `counts` is treated as count 0; in particular an absent `"default"` is
-/// treated as empty (so it is chosen when no continuations exist yet). The
-/// picker decides only among the pages PRESENT in `counts` plus the implicit
-/// `"default"`.
-pub(crate) fn pick_continuation_page(
-    counts: &[(String, usize)],
-    ceiling: usize,
-    mint: impl FnOnce() -> String,
-) -> String {
-    // Default page count (absent → 0).
-    let default_count = counts
-        .iter()
-        .find(|(p, _)| p == "default")
-        .map(|(_, c)| *c)
-        .unwrap_or(0);
-    if default_count < ceiling {
-        return "default".to_string();
-    }
-
-    // Among the OTHER existing pages under the ceiling, pick the one with the
-    // fewest terminals; tie-break by lexicographically-smallest page_id for
-    // determinism.
-    let best = counts
-        .iter()
-        .filter(|(p, c)| p != "default" && *c < ceiling)
-        .min_by(|(pa, ca), (pb, cb)| ca.cmp(cb).then_with(|| pa.cmp(pb)));
-    if let Some((page, _)) = best {
-        return page.clone();
-    }
-
-    // Everything full → mint a fresh page.
-    mint()
-}
-
 /// Build the gate-continuation `claude` spawn argv. Pure for unit-testing:
 /// every flag — including the pre-pinned `--session-id` — MUST precede the
 /// trailing positional prompt arg, or the CLI eats it as prompt text.
@@ -7309,6 +7340,10 @@ async fn run_continuation_terminal(
     // `run_gate_continuation_inner`). A never-started retry pins a fresh id
     // instead; the id that actually started is returned.
     pinned_session_id: uuid::Uuid,
+    // Why the worktree acquire failed, when this continuation is running in the
+    // fallback cwd because of it; `None` when a worktree was acquired or none
+    // was intended. Becomes the runner's note in the system prompt.
+    no_worktree_cause: Option<&str>,
 ) -> anyhow::Result<TerminalStart> {
     use std::sync::Arc;
 
@@ -7483,22 +7518,14 @@ async fn run_continuation_terminal(
         // Manual default) keeps the prior behavior. RISK note: the id resolver
         // scans config dirs first-hit-wins, but worktree paths are
         // per-continuation-unique, so cross-account binding stays low-probability.
-        // Page distribution: backend continuations historically all landed on the
-        // "default" page, overflowing its 9-zone grid into the Unassigned list. Pick
-        // a non-full page at create-time so continuations spread across pages, and
-        // persist it in the durable record so a restart re-lands on the same page.
-        // Count live terminals per page from the manager's current session list.
-        let counts: Vec<(String, usize)> = {
-            let mut per_page: std::collections::HashMap<String, usize> =
-                std::collections::HashMap::new();
-            for info in terminal_manager.list() {
-                *per_page.entry(info.page_id).or_insert(0) += 1;
-            }
-            per_page.into_iter().collect()
-        };
-        let target_page = pick_continuation_page(&counts, CONTINUATION_PAGE_ZONE_CEILING, || {
-            uuid::Uuid::new_v4().to_string()
-        });
+        // Page distribution: pick a page with room at create-time, counting the
+        // rows a boot restore is about to bring back (`terminal::page_placement`),
+        // and persist it in the durable record so a restart re-lands on the same
+        // page.
+        let target_page = crate::terminal::page_placement::pick_page_for_new_session(
+            &terminal_manager,
+            crate::terminal::page_placement::lifecycle_store(&app).as_deref(),
+        );
 
         let mut capture_hint = crate::commands::terminal::SessionCaptureHint {
             config_dir: selected_config_dir.clone(),
@@ -7572,16 +7599,16 @@ async fn run_continuation_terminal(
         // `2026-09-15-runner-policy-injection-off-sessionstart-hook-channel`), and
         // stays inline otherwise.
         let prompt_carrier = crate::session::spawn_prompt::resolve_system_prompt_carrier(Some(
-            append_sibling_notes(
-                compose_continuation_system_prompt(
-                    crate::terminal::runner_context(
-                        crate::terminal::spawn_seam_api_port(),
-                        coord_mcp,
-                        &served,
-                    ),
-                    payload.brief.as_ref(),
+            compose_continuation_terminal_system_prompt(
+                crate::terminal::runner_context(
+                    crate::terminal::spawn_seam_api_port(),
+                    coord_mcp,
+                    &served,
                 ),
+                payload.brief.as_ref(),
                 ctx.as_ref().map_or(&[][..], |c| c.sibling_notes.as_slice()),
+                workdir,
+                no_worktree_cause,
             ),
         ));
         // The marker the policy hook's route trusts as proof of delivery — taken
@@ -8579,18 +8606,11 @@ async fn run_condition_check_terminal(
         return Err(anyhow::anyhow!(reason));
     }
 
-    // Spread across non-full pages (same picker + ceiling as the gate path).
-    let counts: Vec<(String, usize)> = {
-        let mut per_page: std::collections::HashMap<String, usize> =
-            std::collections::HashMap::new();
-        for info in terminal_manager.list() {
-            *per_page.entry(info.page_id).or_insert(0) += 1;
-        }
-        per_page.into_iter().collect()
-    };
-    let target_page = pick_continuation_page(&counts, CONTINUATION_PAGE_ZONE_CEILING, || {
-        uuid::Uuid::new_v4().to_string()
-    });
+    // Spread across pages with room (the one page-capacity rule, as the gate path).
+    let target_page = crate::terminal::page_placement::pick_page_for_new_session(
+        &terminal_manager,
+        crate::terminal::page_placement::lifecycle_store(&app).as_deref(),
+    );
 
     // Kept for the start verdict below: the transcript probe looks in the
     // selected account's config dir first.
@@ -8715,19 +8735,20 @@ async fn run_condition_check_terminal(
 ///   order and its `workdir_not_a_checkout` / `no_isolated_worktree`
 ///   refusals), `None` context, and a fresh correlation UUID.
 /// - `Err` also when acquire succeeds but returns no worktrees.
+///
+/// `no_worktree_cause` is set only when a worktree was intended and the
+/// acquire FAILED, so the session can be told its cwd is the fallback.
 async fn acquire_continuation_workdir(
     repos: &[String],
     intent: &str,
     agent_session_id: Option<uuid::Uuid>,
-) -> anyhow::Result<(
-    String,
-    Option<crate::agent_worktree::isolated_edit::IsolatedEditContext>,
-    uuid::Uuid,
-)> {
+) -> anyhow::Result<ContinuationWorkdir> {
     use crate::agent_worktree::isolated_edit::{acquire, AcquireRequest};
 
     // Why no worktree came back, carried into a foreign repo's refusal.
     let mut no_worktree_because = String::new();
+    // Set only on a FAILED acquire: the cause the session's note carries.
+    let mut no_worktree_cause: Option<String> = None;
     if !repos.is_empty() {
         let acquired = acquire(AcquireRequest {
             repos,
@@ -8748,15 +8769,28 @@ async fn acquire_continuation_workdir(
             // "Not done here"); such a session uses the mid-session
             // `POST /agent-worktrees/edit-sibling` door.
             edit_siblings: &[],
+            // Unattended, no user waiting: retry through intermittent coord
+            // failures before taking the workspace-root fallback (plan
+            // 2026-10-31-continuation-worktree-acquire-failure-strands-the-allocation-and-tells-the-session-nothing
+            // D2/D3).
+            transport_retry: crate::agent_worktree::acquire_retry::CONTINUATION_TRANSPORT_RETRY,
         })
         .await;
-        let ctx = match settle_continuation_acquire(acquired) {
-            Ok(ctx) => Some(ctx),
-            Err(because) => {
-                no_worktree_because = because;
-                None
-            }
-        };
+        let settled = settle_continuation_acquire(acquired);
+        if let ContinuationAcquire::Failed(cause) = &settled {
+            // Names the continuation (its anchor rides on `intent`) and the
+            // pinned session id the allocate carried, so a session can join its
+            // own fallback to this line instead of inferring it from timing.
+            warn!(
+                intent = %intent,
+                agent_session_id = ?agent_session_id,
+                "agent_runtime: gate-continuation acquire failed ({cause}); \
+                 taking the fallback cwd"
+            );
+            no_worktree_cause = Some(cause.clone());
+        }
+        no_worktree_because = settled.because();
+        let ctx = settled.into_context();
         if let Some(ctx) = ctx {
             let workdir = ctx
                 .worktrees
@@ -8769,7 +8803,12 @@ async fn acquire_continuation_workdir(
             // to a fresh one for lifecycle correlation only.
             let agent_id =
                 uuid::Uuid::parse_str(&ctx.agent_id).unwrap_or_else(|_| uuid::Uuid::now_v7());
-            return Ok((workdir, Some(ctx), agent_id));
+            return Ok(ContinuationWorkdir {
+                workdir,
+                ctx: Some(ctx),
+                agent_id,
+                no_worktree_cause: None,
+            });
         }
     }
 
@@ -8834,7 +8873,58 @@ async fn acquire_continuation_workdir(
     )
     // Unprefixed: the refusal's detail must START with its stable token.
     .map_err(|e| anyhow::anyhow!(e))?;
-    Ok((workdir, None, uuid::Uuid::now_v7()))
+    Ok(ContinuationWorkdir {
+        workdir,
+        ctx: None,
+        agent_id: uuid::Uuid::now_v7(),
+        no_worktree_cause,
+    })
+}
+
+/// The working directory a gate continuation runs in, and what it knows about
+/// how it got there.
+struct ContinuationWorkdir {
+    workdir: String,
+    /// The held context when a worktree was materialized (keeps the claim
+    /// heartbeat alive).
+    ctx: Option<crate::agent_worktree::isolated_edit::IsolatedEditContext>,
+    /// coord's agent id, or a fresh one for lifecycle correlation only.
+    agent_id: uuid::Uuid,
+    /// `Some(cause)` only when a worktree was intended and the acquire
+    /// failed, so `workdir` is the fallback; the session is told so.
+    no_worktree_cause: Option<String>,
+}
+
+/// How a continuation's worktree acquire settled (plan 2026-10-31 Phase 2).
+/// Discriminated because the two no-worktree arms mean different things to the
+/// session: mode-off never intended a worktree, a failure did.
+#[derive(Debug, PartialEq, Eq)]
+enum ContinuationAcquire<C> {
+    Acquired(C),
+    /// `Ok(None)`: worktree mode is off or the acquire was declined.
+    WorktreeModeOff,
+    /// The acquire failed; the error's text.
+    Failed(String),
+}
+
+impl<C> ContinuationAcquire<C> {
+    /// The cause string carried into a foreign repo's refusal (unchanged).
+    fn because(&self) -> String {
+        match self {
+            ContinuationAcquire::Acquired(_) => String::new(),
+            ContinuationAcquire::WorktreeModeOff => {
+                "worktree mode is off or the acquire was declined".to_string()
+            }
+            ContinuationAcquire::Failed(e) => format!("worktree acquire failed: {e}"),
+        }
+    }
+
+    fn into_context(self) -> Option<C> {
+        match self {
+            ContinuationAcquire::Acquired(c) => Some(c),
+            _ => None,
+        }
+    }
 }
 
 /// The `spawn_failed` detail posted for a continuation whose cwd could not be
@@ -8869,20 +8959,14 @@ fn continuation_acquire_failure_detail(err: &str) -> String {
 /// root-first order and refuses a foreign repo with a typed reason.
 fn settle_continuation_acquire<C>(
     acquired: Result<Option<C>, crate::agent_worktree::AllocateError>,
-) -> Result<C, String> {
+) -> ContinuationAcquire<C> {
     match acquired {
-        Ok(Some(ctx)) => Ok(ctx),
+        Ok(Some(ctx)) => ContinuationAcquire::Acquired(ctx),
         Ok(None) => {
             debug!("agent_runtime: gate-continuation worktree mode off — using the fallback cwd");
-            Err("worktree mode is off or the acquire was declined".to_string())
+            ContinuationAcquire::WorktreeModeOff
         }
-        Err(e) => {
-            warn!(
-                "agent_runtime: gate-continuation acquire failed ({e}); \
-                 taking the fallback cwd"
-            );
-            Err(format!("worktree acquire failed: {e}"))
-        }
+        Err(e) => ContinuationAcquire::Failed(e.to_string()),
     }
 }
 
@@ -10189,8 +10273,8 @@ async fn materialize_worktrees(payload: &LaunchPayload) -> anyhow::Result<()> {
 /// `*.md` defs, NOT the whole `.claude` tree (avoid pulling in settings/hooks/
 /// mcp that could alter spawn behavior).
 ///
-/// Fail-soft: if the source dir is missing we `warn` and return Ok — the agent
-/// then simply lacks subagents (same as before this fix; no regression). The
+/// Fail-soft: if the source dir is missing we `warn` and return a report — the
+/// agent then simply lacks subagents (same as before this fix; no regression). The
 /// fleet-portability follow-up is to BUNDLE these defs into the runner binary
 /// (`include_str!`) so non-operator devices without a `qontinui-claude-config`
 /// checkout still get them; this copy-from-checkout path unblocks the current
@@ -10200,15 +10284,24 @@ async fn materialize_worktrees(payload: &LaunchPayload) -> anyhow::Result<()> {
 /// The no-root arm below used to be a bare `warn!` and an `Ok(())` — an
 /// unresolved checkout stated only in a log file — and is now a
 /// [`capability_manifest::Rung::Unresolved`] row naming what was skipped and
-/// why. The control flow is unchanged: it still returns `Ok` and the spawn
-/// still proceeds.
-fn provision_agent_definitions(worktree_cwd: &str) -> anyhow::Result<ProvisionReport> {
-    let Some(root) = qontinui_root_dir() else {
+/// why. The control flow is unchanged: it returns a report, never an error, and
+/// the spawn still proceeds.
+fn provision_agent_definitions(worktree_cwd: &str) -> ProvisionReport {
+    provision_agent_definitions_with_root(qontinui_root_dir().as_deref(), worktree_cwd)
+}
+
+/// [`provision_agent_definitions`] with the root it resolved passed in, so a
+/// test can drive the no-root arm without touching the process-wide resolver.
+fn provision_agent_definitions_with_root(
+    root: Option<&Path>,
+    worktree_cwd: &str,
+) -> ProvisionReport {
+    let Some(root) = root else {
         warn!(
             "agent_runtime: no qontinui-root resolved; skipping .claude/agents \
              provisioning for {worktree_cwd} (auto-spawned subagents will not resolve)"
         );
-        return Ok(ProvisionReport::unresolved(
+        let mut report = ProvisionReport::unresolved(
             "agent_definitions",
             0,
             Path::new(worktree_cwd)
@@ -10218,9 +10311,36 @@ fn provision_agent_definitions(worktree_cwd: &str) -> anyhow::Result<ProvisionRe
                 .to_string(),
             "no qontinui-root resolved, so <root>/qontinui-claude-config/.claude/agents \
              cannot be located — the normal state on a published install",
-        ));
+        );
+        // An older binary's copy of a retired definition can sit in this workdir
+        // whether or not a root resolves now, so the retirement pass runs here too.
+        retire_agent_definitions(
+            worktree_cwd,
+            crate::fleet_agents::RETIRED_AGENTS,
+            &mut report,
+        );
+        return report;
     };
-    provision_agent_definitions_from_root(&root, worktree_cwd)
+    provision_agent_definitions_from_root(root, worktree_cwd)
+}
+
+/// The retirement pass on its own, for a spawn with no checkout root: the
+/// [`crate::provision_guard::KeepDecisions`] are decided over the retired names
+/// alone, since no layer writes in this workdir.
+fn retire_agent_definitions(worktree_cwd: &str, retired: &[&str], report: &mut ProvisionReport) {
+    let workdir = Path::new(worktree_cwd);
+    let dst_dir = workdir.join(".claude").join("agents");
+    if !dst_dir.is_dir() {
+        return;
+    }
+    let tracked = crate::provision_guard::TrackedPaths::probe(&dst_dir);
+    let names = crate::fleet_agents::retired_agent_names(retired);
+    let keep = crate::provision_guard::KeepDecisions::decide(
+        &tracked,
+        &dst_dir,
+        names.iter().map(String::as_str),
+    );
+    crate::fleet_agents::remove_retired_agents(workdir, &keep, retired, report);
 }
 
 /// Provision the named-subagent defs into `workdir` and RECORD both layers'
@@ -10246,23 +10366,7 @@ fn provision_agent_definitions(worktree_cwd: &str) -> anyhow::Result<ProvisionRe
 /// is observable on the next manifest read rather than in this value. The spawn
 /// path ignores the return entirely.
 pub(crate) fn provision_agent_definitions_recorded(workdir: &str) -> Vec<ProvisionReport> {
-    let report = match provision_agent_definitions(workdir) {
-        Ok(report) => report,
-        Err(e) => {
-            warn!("agent_runtime: agent-def provisioning errored (continuing): {e:#}");
-            let mut report = ProvisionReport::new(
-                "agent_definitions",
-                0,
-                capability_manifest::Rung::Unresolved,
-            )
-            .with_destination(workdir.to_string());
-            report.skip(
-                workdir.to_string(),
-                capability_manifest::SkipReason::WriteFailed(format!("{e:#}")),
-            );
-            report
-        }
-    };
+    let report = provision_agent_definitions(workdir);
     let echo = report.clone();
     capability_manifest::record_provision(workdir, report);
     vec![echo]
@@ -10275,11 +10379,20 @@ pub(crate) fn provision_agent_definitions_recorded(workdir: &str) -> Vec<Provisi
 /// Reports BOTH layers: the returned [`ProvisionReport`] is the checkout overlay
 /// (`agent_definitions`), and the embedded floor's own report (`fleet_agents`)
 /// is recorded into the session ledger from here, because this is the only
-/// caller that can see it.
-fn provision_agent_definitions_from_root(
+/// caller that can see it. The retirement pass runs last and records its
+/// removals on the returned report.
+fn provision_agent_definitions_from_root(root: &Path, worktree_cwd: &str) -> ProvisionReport {
+    provision_agent_definitions_retiring(root, worktree_cwd, crate::fleet_agents::RETIRED_AGENTS)
+}
+
+/// [`provision_agent_definitions_from_root`] with the retired-definition table
+/// passed in, so a test can retire a body whose blob it computed itself instead
+/// of depending on the content of a blob this binary no longer carries.
+fn provision_agent_definitions_retiring(
     root: &Path,
     worktree_cwd: &str,
-) -> anyhow::Result<ProvisionReport> {
+    retired: &[&str],
+) -> ProvisionReport {
     let src_dir = root
         .join("qontinui-claude-config")
         .join(".claude")
@@ -10296,6 +10409,9 @@ fn provision_agent_definitions_from_root(
     // `fleet_commands` and `fleet_skills`.
     let tracked = crate::provision_guard::TrackedPaths::probe(&dst_dir);
     let mut candidates = crate::fleet_agents::embedded_agent_names();
+    // Retired names are candidates too, so a retired copy the repository tracks
+    // is kept by the retirement pass below exactly as the layers keep theirs.
+    candidates.extend(crate::fleet_agents::retired_agent_names(retired));
     if let Ok(entries) = std::fs::read_dir(&src_dir) {
         candidates.extend(
             entries
@@ -10342,8 +10458,66 @@ fn provision_agent_definitions_from_root(
     let embedded = embedded_report.written;
     capability_manifest::record_provision(worktree_cwd, embedded_report);
 
-    // CHECKOUT WINS: the operator's live copies are overlaid on top below, so
-    // editing qontinui-claude-config/.claude/agents behaves exactly as before.
+    // CHECKOUT WINS: the operator's live copies are overlaid on top, so editing
+    // qontinui-claude-config/.claude/agents behaves as before, except that a
+    // retired definition is never overlaid.
+    // An overlay that errored still gets the retirement pass below, so its
+    // error becomes an errored report rather than an early return.
+    let mut report =
+        match overlay_checkout_agent_definitions(&src_dir, &dst_dir, &keep, embedded, retired) {
+            Ok(report) => report,
+            Err(e) => {
+                warn!("agent_runtime: agent-def checkout overlay errored (continuing): {e:#}");
+                let mut report = ProvisionReport::new(
+                    "agent_definitions",
+                    0,
+                    capability_manifest::Rung::Unresolved,
+                )
+                .with_destination(dst_dir.display().to_string());
+                report.skip(
+                    dst_dir.display().to_string(),
+                    capability_manifest::SkipReason::WriteFailed(format!("{e:#}")),
+                );
+                report
+            }
+        };
+
+    // RETIRED LAST. A definition this binary retired stopped shipping when its
+    // file left the bundle, but a copy an older binary or a checkout overlay
+    // wrote is still on disk, so it is removed here when its blob is one the
+    // definition shipped as. Neither layer writes a retired name (none is
+    // bundled, and the overlay skips them), so the pass judges only copies that
+    // were already on disk. It runs whether the checkout answered, was absent
+    // or errored, because a device with no
+    // checkout is exactly where an older binary's embedded copy sits (the
+    // no-root arm of `provision_agent_definitions` runs it as well). `keep`
+    // was decided before either layer wrote, so a tracked copy stays.
+    crate::fleet_agents::remove_retired_agents(
+        Path::new(worktree_cwd),
+        &keep,
+        retired,
+        &mut report,
+    );
+    report
+}
+
+/// The checkout overlay of [`provision_agent_definitions_retiring`]: copy every
+/// `*.md` from `src_dir` (the operator's qontinui-claude-config agents) into
+/// `dst_dir` over the embedded floor, except the definitions `keep` keeps and
+/// every name `retired` lists: a checkout that still holds a retired definition
+/// (stale, or on a branch that edited it) must not hand it to a session, so it is
+/// skipped and named in the report's detail. `embedded` is how many defaults the
+/// floor wrote, for the log line and the report's detail. No checkout dir is the `unresolved` report naming the
+/// embedded defaults that stand in, not an error.
+fn overlay_checkout_agent_definitions(
+    src_dir: &Path,
+    dst_dir: &Path,
+    keep: &crate::provision_guard::KeepDecisions,
+    embedded: usize,
+    retired: &[&str],
+) -> anyhow::Result<ProvisionReport> {
+    let retired_names = crate::fleet_agents::retired_agent_names(retired);
+    let mut not_overlaid = Vec::new();
     if !src_dir.is_dir() {
         warn!(
             "agent_runtime: no claude-config agents dir at {}; keeping the \
@@ -10362,7 +10536,7 @@ fn provision_agent_definitions_from_root(
         )
         .with_destination(dst_dir.display().to_string()));
     }
-    std::fs::create_dir_all(&dst_dir).map_err(|e| {
+    std::fs::create_dir_all(dst_dir).map_err(|e| {
         anyhow::anyhow!(
             "create {} for agent-def provisioning: {e}",
             dst_dir.display()
@@ -10377,7 +10551,7 @@ fn provision_agent_definitions_from_root(
     )
     .with_destination(dst_dir.display().to_string());
     let mut copied = 0usize;
-    for entry in std::fs::read_dir(&src_dir)
+    for entry in std::fs::read_dir(src_dir)
         .map_err(|e| anyhow::anyhow!("read agents dir {}: {e}", src_dir.display()))?
     {
         let entry = match entry {
@@ -10400,9 +10574,20 @@ fn provision_agent_definitions_from_root(
         let Some(name) = path.file_name() else {
             continue;
         };
+        let unit = name.to_string_lossy().into_owned();
+        // A RETIRED definition is never delivered, even by a checkout that still
+        // holds it (a stale primary, or one standing on a branch that edited it):
+        // the retirement pass then judges only copies that were already there.
+        if retired_names.contains(&unit) {
+            info!(
+                "agent_runtime: not overlaying retired {} from the checkout",
+                path.display()
+            );
+            not_overlaid.push(unit);
+            continue;
+        }
         let dst = dst_dir.join(name);
         report.expected += 1;
-        let unit = name.to_string_lossy().into_owned();
         if let Some(reason) = keep.reason(&unit) {
             info!(
                 "agent_runtime: keeping {} as it is on disk — {}",
@@ -10432,10 +10617,18 @@ fn provision_agent_definitions_from_root(
         "agent_runtime: overlaid {copied} checkout subagent def(s) onto {embedded} embedded default(s) in {}",
         dst_dir.display()
     );
-    report = report.with_detail(format!(
+    let mut detail = format!(
         "overlaid onto {embedded} embedded default(s) from {}",
         src_dir.display()
-    ));
+    );
+    if !not_overlaid.is_empty() {
+        not_overlaid.sort();
+        detail.push_str(&format!(
+            "; not overlaid (retired): {}",
+            not_overlaid.join(", ")
+        ));
+    }
+    report = report.with_detail(detail);
     if report.written == 0 {
         // The checkout was present but supplied nothing usable — `unresolved`
         // rather than `operator_checkout`, which would claim it answered.
@@ -11644,6 +11837,85 @@ mod tests {
         );
     }
 
+    /// Plan 2026-10-31 Phase 2: a continuation that took the fallback because
+    /// its acquire FAILED says so in BOTH composed prompts — the system prompt
+    /// on the terminal presentation, the prompt on the headless one — and in
+    /// neither when a worktree was acquired or none was intended.
+    #[test]
+    fn a_fallback_session_is_told_its_cwd_in_both_presentations() {
+        let cause = "worktree acquire failed: POST https://coord/claims/acquire: \
+                     error sending request: connection refused [connect] (after 9 attempts)";
+        let term = super::compose_continuation_terminal_system_prompt(
+            "RUNNER-CTX".to_string(),
+            None,
+            &[],
+            "D:/qontinui-root",
+            Some(cause),
+        );
+        let head = super::compose_continuation_headless_full_prompt(
+            "do the follow-up",
+            None,
+            &[],
+            "D:/qontinui-root",
+            Some(cause),
+        );
+        for out in [&term, &head] {
+            assert!(out.contains("Workspace note from the runner"), "{out}");
+            assert!(out.contains("`D:/qontinui-root`"), "{out}");
+            assert!(out.contains("not an isolated worktree"), "{out}");
+            assert!(out.contains("connection refused"), "{out}");
+            assert!(out.contains("allocate-worktree.sh"), "{out}");
+        }
+        assert!(term.starts_with("RUNNER-CTX\n\n"), "{term}");
+        assert!(head.starts_with("do the follow-up\n\n"), "{head}");
+
+        // Acquired, or worktree mode off: no note on either carrier.
+        let term = super::compose_continuation_terminal_system_prompt(
+            "RUNNER-CTX".to_string(),
+            None,
+            &[],
+            "D:/w",
+            None,
+        );
+        let head =
+            super::compose_continuation_headless_full_prompt("do it", None, &[], "D:/w", None);
+        assert_eq!(term, "RUNNER-CTX");
+        assert_eq!(head, "do it");
+    }
+
+    /// The cause is forced onto one bounded line: a multi-line coord body can
+    /// neither forge extra prompt lines nor run unbounded.
+    #[test]
+    fn the_no_worktree_cause_is_one_bounded_line() {
+        let long = format!("first line\nsecond line\r\n{}", "x".repeat(5000));
+        let out = super::append_no_worktree_note("B".to_string(), "D:/r", Some(&long));
+        let note = out.strip_prefix("B\n\n").expect("blank-line separated");
+        assert!(!note.contains('\n') && !note.contains('\r'), "{note}");
+        assert!(note.contains("first line second line"), "{note}");
+        assert!(note.chars().count() < 1200, "{}", note.chars().count());
+        assert_eq!(
+            super::append_no_worktree_note("B".to_string(), "D:/r", None),
+            "B"
+        );
+    }
+
+    /// Only a FAILED acquire yields a cause; mode-off and acquired do not.
+    #[test]
+    fn only_a_failed_acquire_carries_a_note_cause() {
+        use crate::agent_worktree::AllocateError;
+        let failed =
+            super::settle_continuation_acquire::<u8>(Err(AllocateError::Other("boom".into())));
+        assert_eq!(failed, super::ContinuationAcquire::Failed("boom".into()));
+        assert_eq!(failed.because(), "worktree acquire failed: boom");
+        assert!(super::settle_continuation_acquire::<u8>(Ok(None))
+            .into_context()
+            .is_none());
+        assert_eq!(
+            super::settle_continuation_acquire(Ok(Some(3u8))).into_context(),
+            Some(3)
+        );
+    }
+
     use super::*;
 
     // ── presentation boot readiness (plan 2026-09-17-a-gate-continuation-
@@ -12322,10 +12594,6 @@ mod tests {
         );
     }
 
-    /// Sentinel returned by the test mint closure so a mint outcome is
-    /// unambiguous and deterministic (no uuid in tests).
-    const MINTED: &str = "MINTED";
-
     fn s(v: &str) -> Option<String> {
         Some(v.to_string())
     }
@@ -12485,77 +12753,6 @@ mod tests {
         );
         assert!(!fobj.contains_key("phase"));
         assert!(!fobj.contains_key("push_ref"));
-    }
-
-    fn page(id: &str, n: usize) -> (String, usize) {
-        (id.to_string(), n)
-    }
-
-    #[test]
-    fn pick_continuation_page_default_under_ceiling_picks_default() {
-        let counts = [page("default", 3), page("p1", 9)];
-        assert_eq!(
-            pick_continuation_page(&counts, 9, || MINTED.to_string()),
-            "default"
-        );
-    }
-
-    #[test]
-    fn pick_continuation_page_default_full_picks_nonfull_other() {
-        // default at the ceiling, p1 under it → p1.
-        let counts = [page("default", 9), page("p1", 4)];
-        assert_eq!(
-            pick_continuation_page(&counts, 9, || MINTED.to_string()),
-            "p1"
-        );
-        // default over the ceiling behaves the same.
-        let counts = [page("default", 12), page("p1", 4)];
-        assert_eq!(
-            pick_continuation_page(&counts, 9, || MINTED.to_string()),
-            "p1"
-        );
-    }
-
-    #[test]
-    fn pick_continuation_page_default_full_picks_fewest_terminals() {
-        let counts = [
-            page("default", 9),
-            page("p1", 7),
-            page("p2", 2),
-            page("p3", 5),
-        ];
-        assert_eq!(
-            pick_continuation_page(&counts, 9, || MINTED.to_string()),
-            "p2"
-        );
-    }
-
-    #[test]
-    fn pick_continuation_page_tie_breaks_lexicographically() {
-        // p_b and p_a tie at count 3 → smallest page_id wins (p_a).
-        let counts = [page("default", 9), page("p_b", 3), page("p_a", 3)];
-        assert_eq!(
-            pick_continuation_page(&counts, 9, || MINTED.to_string()),
-            "p_a"
-        );
-    }
-
-    #[test]
-    fn pick_continuation_page_everything_full_mints() {
-        let counts = [page("default", 9), page("p1", 9), page("p2", 11)];
-        assert_eq!(
-            pick_continuation_page(&counts, 9, || MINTED.to_string()),
-            MINTED
-        );
-    }
-
-    #[test]
-    fn pick_continuation_page_empty_counts_picks_default() {
-        let counts: [(String, usize); 0] = [];
-        assert_eq!(
-            pick_continuation_page(&counts, 9, || MINTED.to_string()),
-            "default"
-        );
     }
 
     /// The pinned `--session-id <uuid>` pair sits among the flags, BEFORE
@@ -14278,7 +14475,7 @@ mod tests {
         let wt = tempfile::tempdir().unwrap();
         let wt_cwd = wt.path().to_string_lossy().into_owned();
 
-        let report = provision_agent_definitions_from_root(root.path(), &wt_cwd).unwrap();
+        let report = provision_agent_definitions_from_root(root.path(), &wt_cwd);
         // The checkout answered, and the report says so — two `*.md` copied,
         // `settings.json` not counted (it is not a definition).
         assert_eq!(
@@ -14311,7 +14508,7 @@ mod tests {
         );
 
         // Idempotent: a second run over the same dst overwrites cleanly.
-        provision_agent_definitions_from_root(root.path(), &wt_cwd).unwrap();
+        provision_agent_definitions_from_root(root.path(), &wt_cwd);
         assert!(dst.join("merge-specialist.md").is_file());
     }
 
@@ -14357,7 +14554,7 @@ mod tests {
         );
 
         let wt_cwd = wt.path().to_string_lossy().into_owned();
-        let report = provision_agent_definitions_from_root(root.path(), &wt_cwd).unwrap();
+        let report = provision_agent_definitions_from_root(root.path(), &wt_cwd);
 
         assert_eq!(
             std::fs::read_to_string(&tracked_overlay).unwrap(),
@@ -14424,7 +14621,7 @@ mod tests {
         std::fs::write(dst.join("code-reviewer.md"), "# WORKTREE's own reviewer").unwrap();
 
         let wt_cwd = wt.path().to_string_lossy().into_owned();
-        let report = provision_agent_definitions_from_root(root.path(), &wt_cwd).unwrap();
+        let report = provision_agent_definitions_from_root(root.path(), &wt_cwd);
 
         assert_eq!(
             std::fs::read_to_string(dst.join("code-reviewer.md")).unwrap(),
@@ -14464,13 +14661,13 @@ mod tests {
         let wt = tempfile::tempdir().unwrap();
         let wt_cwd = wt.path().to_string_lossy().into_owned();
 
-        let res = provision_agent_definitions_from_root(root.path(), &wt_cwd);
-        assert!(res.is_ok(), "missing source dir must still fail soft (Ok)");
+        // A missing source dir is fail-soft: the pass returns a report, never
+        // an error, and the spawn proceeds.
+        let report = provision_agent_definitions_from_root(root.path(), &wt_cwd);
 
         // Phase 3: the degradation is now a VALUE, not only a `warn!`. The
         // CHECKOUT layer is `unresolved` and says why; the embedded floor that
         // stood in for it is asserted below, exactly as before.
-        let report = res.expect("fail-soft Ok");
         assert_eq!(report.capability, "agent_definitions");
         assert_eq!(report.rung, crate::capability_manifest::Rung::Unresolved);
         assert_eq!(report.written, 0);
@@ -14500,6 +14697,644 @@ mod tests {
             dst.join("code-reviewer.md").is_file(),
             "code-reviewer must resolve on a checkout-less device — the fleet's              pre-PR-review policy names that subagent specifically"
         );
+    }
+
+    /// The retirement as the population meets it, entered where every spawn
+    /// with a resolved root enters: a session this build provisions gets no
+    /// `test-generator.md` (the no-root arm is
+    /// `provision_agent_defs_no_root_arm_hands_the_production_table_to_the_pass`).
+    /// The name is a literal rather than a read of the retired table, so the
+    /// test keeps naming the file this build stopped shipping.
+    #[test]
+    fn provision_agent_defs_provision_no_test_generator() {
+        let root = tempfile::tempdir().unwrap();
+        let wt = tempfile::tempdir().unwrap();
+        let wt_cwd = wt.path().to_string_lossy().into_owned();
+
+        provision_agent_definitions_from_root(root.path(), &wt_cwd);
+
+        let dst = wt.path().join(".claude").join("agents");
+        assert!(
+            dst.join("code-reviewer.md").is_file(),
+            "the embedded floor must still provision the current agents"
+        );
+        assert!(
+            !dst.join("test-generator.md").exists(),
+            "test-generator is retired: no session this build provisions may resolve it"
+        );
+    }
+
+    /// A retired definition for the retirement-pass tests: a body, and the
+    /// `RETIRED_AGENTS`-shaped line that retires it, built from that body's own
+    /// git blob id so no test depends on a blob this binary no longer carries.
+    /// The line names an unrelated blob before AND after the real one, so a
+    /// match must scan every blob rather than only the first or the last.
+    fn retired_fixture() -> (&'static str, String) {
+        let body = "---\nname: retired-agent\n---\n# a body this binary once shipped\n";
+        let line = format!(
+            "retired-agent.md 0000000000000000000000000000000000000000 {} \
+             1111111111111111111111111111111111111111",
+            crate::provenance::git_blob_id(body.as_bytes())
+        );
+        (body, line)
+    }
+
+    /// A qontinui-root whose claude-config checkout holds `defs`.
+    fn checkout_root_with(defs: &[(&str, &str)]) -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        let src = root
+            .path()
+            .join("qontinui-claude-config")
+            .join(".claude")
+            .join("agents");
+        std::fs::create_dir_all(&src).unwrap();
+        for (name, body) in defs {
+            std::fs::write(src.join(name), body).unwrap();
+        }
+        root
+    }
+
+    /// A session workdir whose `.claude/agents/` already holds `defs`.
+    fn workdir_with(defs: &[(&str, &str)]) -> (tempfile::TempDir, PathBuf) {
+        let wt = tempfile::tempdir().unwrap();
+        let dst = wt.path().join(".claude").join("agents");
+        std::fs::create_dir_all(&dst).unwrap();
+        for (name, body) in defs {
+            std::fs::write(dst.join(name), body).unwrap();
+        }
+        (wt, dst)
+    }
+
+    #[test]
+    fn provision_agent_defs_remove_a_retired_copy_whose_blob_it_shipped_as() {
+        let (body, line) = retired_fixture();
+        let root = checkout_root_with(&[("merge-specialist.md", "# PRIMARY copy")]);
+        let (wt, dst) = workdir_with(&[("retired-agent.md", body)]);
+
+        let wt_cwd = wt.path().to_string_lossy().into_owned();
+        let report = provision_agent_definitions_retiring(root.path(), &wt_cwd, &[line.as_str()]);
+
+        assert!(
+            !dst.join("retired-agent.md").exists(),
+            "a retired copy whose blob the definition shipped as must be removed"
+        );
+        assert_eq!(
+            report.removed,
+            vec![crate::capability_manifest::RemovedUnit {
+                unit: "retired-agent.md".to_string(),
+                blob: crate::provenance::git_blob_id(body.as_bytes()),
+            }],
+            "the removal is recorded on the report with the blob it matched"
+        );
+        assert!(
+            report.is_complete(),
+            "a removal is not a degraded pass: {}",
+            report.summary()
+        );
+        assert!(dst.join("merge-specialist.md").is_file());
+    }
+
+    /// The blob comparison is the whole safety of the removal: a retired copy
+    /// whose bytes are not a shipped blob is somebody's edit and stays.
+    #[test]
+    fn provision_agent_defs_keep_a_retired_copy_with_any_other_blob() {
+        let (_, line) = retired_fixture();
+        let root = checkout_root_with(&[("merge-specialist.md", "# PRIMARY copy")]);
+        let edited = "---\nname: retired-agent\n---\n# edited by hand in this workdir\n";
+        let (wt, dst) = workdir_with(&[("retired-agent.md", edited)]);
+
+        let wt_cwd = wt.path().to_string_lossy().into_owned();
+        let report = provision_agent_definitions_retiring(root.path(), &wt_cwd, &[line.as_str()]);
+
+        assert_eq!(
+            std::fs::read_to_string(dst.join("retired-agent.md")).unwrap(),
+            edited,
+            "a locally modified retired copy must be kept as it is"
+        );
+        assert!(report.removed.is_empty(), "{:?}", report.removed);
+        assert_eq!(
+            report.retained_retired,
+            vec![crate::capability_manifest::RetainedRetiredUnit {
+                unit: "retired-agent.md".to_string(),
+                reason: crate::capability_manifest::RetainedReason::LocallyModified(
+                    crate::provenance::git_blob_id(edited.as_bytes())
+                ),
+            }],
+            "a retired definition that still resolves is named on the report, with its blob"
+        );
+        assert!(
+            report.is_complete(),
+            "a deliberate keep does not degrade the pass: {}",
+            report.summary()
+        );
+    }
+
+    /// `keep` was decided before either layer wrote, and the retired names are
+    /// among its candidates, so a retired copy is kept in both of its arms even
+    /// when its blob is a shipped one: tracked by the enclosing repository, or
+    /// present when the tracked-file probe could not answer inside a repository.
+    #[test]
+    fn provision_agent_defs_keep_a_retired_copy_the_repository_keeps() {
+        use crate::provision_guard::test_support::{git_add, git_init};
+        let (body, line) = retired_fixture();
+        let root = checkout_root_with(&[("merge-specialist.md", "# PRIMARY copy")]);
+
+        // Arm 1: tracked.
+        let (wt, dst) = workdir_with(&[("retired-agent.md", body)]);
+        git_init(wt.path());
+        git_add(wt.path(), &dst.join("retired-agent.md"));
+        let wt_cwd = wt.path().to_string_lossy().into_owned();
+        let report = provision_agent_definitions_retiring(root.path(), &wt_cwd, &[line.as_str()]);
+        assert_eq!(
+            std::fs::read_to_string(dst.join("retired-agent.md")).unwrap(),
+            body,
+            "a retired definition the repository tracks must stay, as both layers keep it"
+        );
+        assert!(report.removed.is_empty(), "{:?}", report.removed);
+        assert_eq!(
+            report.retained_retired,
+            vec![crate::capability_manifest::RetainedRetiredUnit {
+                unit: "retired-agent.md".to_string(),
+                reason: crate::capability_manifest::RetainedReason::KeptByRepository(
+                    "git_tracked".to_string()
+                ),
+            }],
+            "a tracked retired copy still resolves, so it is named"
+        );
+
+        // Arm 2: the probe could not answer, inside a repository.
+        let (wt, dst) = workdir_with(&[("retired-agent.md", body)]);
+        std::fs::write(
+            wt.path().join(".git"),
+            b"gitdir: /nonexistent/qontinui-retired-agent-unknown-probe-test\n",
+        )
+        .unwrap();
+        let wt_cwd = wt.path().to_string_lossy().into_owned();
+        let report = provision_agent_definitions_retiring(root.path(), &wt_cwd, &[line.as_str()]);
+        assert_eq!(
+            std::fs::read_to_string(dst.join("retired-agent.md")).unwrap(),
+            body,
+            "an existing retired copy stays when the probe cannot answer in a repository"
+        );
+        assert!(report.removed.is_empty(), "{:?}", report.removed);
+        assert_eq!(
+            report.retained_retired,
+            vec![crate::capability_manifest::RetainedRetiredUnit {
+                unit: "retired-agent.md".to_string(),
+                reason: crate::capability_manifest::RetainedReason::KeptByRepository(
+                    "probe_unknown_in_repo".to_string()
+                ),
+            }]
+        );
+        assert!(
+            !report.is_complete(),
+            "an UNKNOWN probe degrades the pass, as it does both provisioning layers"
+        );
+    }
+
+    /// Only a retired NAME is ever removed: a current definition whose bytes
+    /// happen to be a retired blob, and the embedded floor's own agents, stay.
+    #[test]
+    fn provision_agent_defs_leave_current_agents_untouched() {
+        let (body, line) = retired_fixture();
+        let root = checkout_root_with(&[("current-agent.md", body)]);
+        let wt = tempfile::tempdir().unwrap();
+        let dst = wt.path().join(".claude").join("agents");
+
+        let wt_cwd = wt.path().to_string_lossy().into_owned();
+        let report = provision_agent_definitions_retiring(root.path(), &wt_cwd, &[line.as_str()]);
+
+        assert_eq!(
+            std::fs::read_to_string(dst.join("current-agent.md")).unwrap(),
+            body,
+            "a current definition is never removed, whatever its blob"
+        );
+        for name in crate::fleet_agents::embedded_agent_names() {
+            assert!(
+                dst.join(&name).is_file(),
+                "the embedded floor's {name} must stay provisioned"
+            );
+        }
+        assert!(report.removed.is_empty(), "{:?}", report.removed);
+    }
+
+    /// A stale checkout that still holds a retired definition, in ANY version
+    /// (shipped or edited), cannot re-deliver it: the overlay skips retired
+    /// names, and the pass removes the shipped copy that was already on disk.
+    #[test]
+    fn provision_agent_defs_never_overlay_a_retired_definition() {
+        let (body, line) = retired_fixture();
+        for checkout_copy in [
+            body,
+            "---\nname: retired-agent\n---\n# edited on a branch\n",
+        ] {
+            let root = checkout_root_with(&[
+                ("retired-agent.md", checkout_copy),
+                ("merge-specialist.md", "# PRIMARY copy"),
+            ]);
+            let wt = tempfile::tempdir().unwrap();
+            let dst = wt.path().join(".claude").join("agents");
+
+            let wt_cwd = wt.path().to_string_lossy().into_owned();
+            let report =
+                provision_agent_definitions_retiring(root.path(), &wt_cwd, &[line.as_str()]);
+
+            assert_eq!(
+                (report.expected, report.written),
+                (1, 1),
+                "the overlay copies the current definition and not the retired one"
+            );
+            assert!(
+                !dst.join("retired-agent.md").exists(),
+                "a checkout's retired copy must never reach the session"
+            );
+            assert!(
+                report.removed.is_empty() && report.retained_retired.is_empty(),
+                "nothing retired was on disk, so nothing is removed or kept: {}",
+                report.summary()
+            );
+            assert!(
+                report
+                    .detail
+                    .as_deref()
+                    .is_some_and(|d| d.ends_with("; not overlaid (retired): retired-agent.md")),
+                "the skipped checkout copy is named: {:?}",
+                report.detail
+            );
+            assert!(dst.join("merge-specialist.md").is_file());
+        }
+
+        // A shipped copy already in the workdir is still removed.
+        let root = checkout_root_with(&[("retired-agent.md", body)]);
+        let (wt, dst) = workdir_with(&[("retired-agent.md", body)]);
+        let report = provision_agent_definitions_retiring(
+            root.path(),
+            &wt.path().to_string_lossy(),
+            &[line.as_str()],
+        );
+        assert!(!dst.join("retired-agent.md").exists());
+        assert_eq!(report.removed.len(), 1, "{:?}", report.removed);
+    }
+
+    /// A device with no checkout is where an older binary's embedded copy sits,
+    /// so the retirement pass runs on the overlay's `unresolved` arm too.
+    #[test]
+    fn provision_agent_defs_remove_a_retired_copy_on_a_device_with_no_checkout() {
+        let (body, line) = retired_fixture();
+        let root = tempfile::tempdir().unwrap();
+        let (wt, dst) = workdir_with(&[("retired-agent.md", body)]);
+
+        let wt_cwd = wt.path().to_string_lossy().into_owned();
+        let report = provision_agent_definitions_retiring(root.path(), &wt_cwd, &[line.as_str()]);
+
+        assert_eq!(report.rung, crate::capability_manifest::Rung::Unresolved);
+        assert!(
+            !dst.join("retired-agent.md").exists(),
+            "with no checkout the retired copy must still be removed"
+        );
+        assert_eq!(report.removed.len(), 1, "{:?}", report.removed);
+    }
+
+    /// A checkout with `core.autocrlf=true` holds CRLF copies of LF blobs; such
+    /// a copy is the shipped content, so it is removed and the LF blob recorded.
+    #[test]
+    fn provision_agent_defs_remove_an_autocrlf_copy_of_a_shipped_blob() {
+        let (body, line) = retired_fixture();
+        let crlf = body.replace('\n', "\r\n");
+        let root = checkout_root_with(&[("merge-specialist.md", "# PRIMARY copy")]);
+        let (wt, dst) = workdir_with(&[("retired-agent.md", crlf.as_str())]);
+
+        let wt_cwd = wt.path().to_string_lossy().into_owned();
+        let report = provision_agent_definitions_retiring(root.path(), &wt_cwd, &[line.as_str()]);
+
+        assert!(
+            !dst.join("retired-agent.md").exists(),
+            "a CRLF copy of a shipped LF blob must be removed"
+        );
+        assert_eq!(
+            report.removed.first().map(|r| r.blob.clone()),
+            Some(crate::provenance::git_blob_id(body.as_bytes())),
+            "the recorded blob is the LF blob it shipped as"
+        );
+    }
+
+    /// The PRODUCTION table reaches the retirement pass where every spawn with
+    /// a resolved root enters. A test-generator copy no table blob matches is recorded as a
+    /// retired definition kept on disk, which only happens if
+    /// `provision_agent_definitions_from_root` hands the pass a table naming
+    /// `test-generator.md`. The literal name is deliberate, as above.
+    #[test]
+    fn provision_agent_defs_hand_the_production_table_to_the_retirement_pass() {
+        let root = tempfile::tempdir().unwrap();
+        let edited = "---\nname: test-generator\n---\n# edited in this workdir\n";
+        let (wt, dst) = workdir_with(&[("test-generator.md", edited)]);
+
+        let wt_cwd = wt.path().to_string_lossy().into_owned();
+        let report = provision_agent_definitions_with_root(Some(root.path()), &wt_cwd);
+
+        assert_eq!(
+            std::fs::read_to_string(dst.join("test-generator.md")).unwrap(),
+            edited
+        );
+        assert_eq!(
+            report
+                .retained_retired
+                .iter()
+                .map(|r| (r.unit.as_str(), r.reason.is_failure()))
+                .collect::<Vec<_>>(),
+            vec![("test-generator.md", false)],
+            "the production table must retire test-generator.md: {}",
+            report.summary()
+        );
+    }
+
+    /// With no checkout root at all, the no-root arm still runs the pass.
+    #[test]
+    fn retire_agent_definitions_removes_a_shipped_copy_with_no_root() {
+        let (body, line) = retired_fixture();
+        let (wt, dst) = workdir_with(&[("retired-agent.md", body)]);
+        let wt_cwd = wt.path().to_string_lossy().into_owned();
+        let mut report = ProvisionReport::unresolved("agent_definitions", 0, "x", "no root");
+
+        retire_agent_definitions(&wt_cwd, &[line.as_str()], &mut report);
+
+        assert!(!dst.join("retired-agent.md").exists());
+        assert_eq!(report.removed.len(), 1, "{:?}", report.removed);
+
+        // And a workdir with no agents directory is a no-op, not an error.
+        let empty = tempfile::tempdir().unwrap();
+        let mut report = ProvisionReport::unresolved("agent_definitions", 0, "x", "no root");
+        retire_agent_definitions(
+            &empty.path().to_string_lossy(),
+            &[line.as_str()],
+            &mut report,
+        );
+        assert!(report.removed.is_empty() && report.retained_retired.is_empty());
+    }
+
+    /// The delete path trusts no name: a retired entry that is not exactly one
+    /// plain file name is ignored, so a shipped copy it would reach outside the
+    /// agents directory survives and nothing is recorded.
+    #[test]
+    fn retire_agent_definitions_ignore_a_name_that_is_not_a_plain_file_name() {
+        let (body, line) = retired_fixture();
+        let blob = crate::provenance::git_blob_id(body.as_bytes());
+        let (wt, _dst) = workdir_with(&[]);
+        let outside = wt.path().join(".claude").join("retired-agent.md");
+        std::fs::write(&outside, body).unwrap();
+        let escaping = format!("../retired-agent.md {blob}");
+        let nested = format!("sub/retired-agent.md {blob}");
+        let mut report = ProvisionReport::new(
+            "agent_definitions",
+            0,
+            crate::capability_manifest::Rung::OperatorCheckout,
+        );
+
+        retire_agent_definitions(
+            &wt.path().to_string_lossy(),
+            &[escaping.as_str(), nested.as_str()],
+            &mut report,
+        );
+
+        assert!(
+            outside.is_file(),
+            "a copy outside the agents directory must survive"
+        );
+        assert!(
+            report.removed.is_empty() && report.retained_retired.is_empty(),
+            "{}",
+            report.summary()
+        );
+        // The well-formed line still works in the same pass shape.
+        std::fs::write(
+            wt.path()
+                .join(".claude")
+                .join("agents")
+                .join("retired-agent.md"),
+            body,
+        )
+        .unwrap();
+        retire_agent_definitions(&wt.path().to_string_lossy(), &[line.as_str()], &mut report);
+        assert_eq!(report.removed.len(), 1, "{:?}", report.removed);
+    }
+
+    /// A copy that cannot be read is kept, named as not removed, and the
+    /// pass reads degraded. A directory in the file's place is unreadable as a
+    /// file on every platform and for every user.
+    #[test]
+    fn retire_agent_definitions_keep_an_unreadable_copy_and_say_so() {
+        let (_, line) = retired_fixture();
+        let (wt, dst) = workdir_with(&[]);
+        std::fs::create_dir(dst.join("retired-agent.md")).unwrap();
+        let mut report = ProvisionReport::new(
+            "agent_definitions",
+            0,
+            crate::capability_manifest::Rung::OperatorCheckout,
+        );
+
+        retire_agent_definitions(&wt.path().to_string_lossy(), &[line.as_str()], &mut report);
+
+        assert!(dst.join("retired-agent.md").exists());
+        assert_eq!(
+            report.retained_retired.len(),
+            1,
+            "{:?}",
+            report.retained_retired
+        );
+        assert!(matches!(
+            report.retained_retired[0].reason,
+            crate::capability_manifest::RetainedReason::ReadFailed(_)
+        ));
+        assert!(
+            !report.is_complete(),
+            "a removal that could not run degrades the pass"
+        );
+        let note = report.observation().note.unwrap_or_default();
+        assert!(
+            note.contains("retired unit(s) the pass could not remove")
+                && !note.contains("write failed"),
+            "the note must say the retired file is still there, not that a write failed: {note}"
+        );
+    }
+
+    /// A shipped copy whose removal fails is kept and reported as a failed
+    /// removal, never as a skipped write.
+    #[cfg(unix)]
+    #[test]
+    fn retire_agent_definitions_report_a_failed_removal_as_one() {
+        use std::os::unix::fs::PermissionsExt;
+        let (body, line) = retired_fixture();
+        let (wt, dst) = workdir_with(&[("retired-agent.md", body)]);
+        std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // A user who can still write here (root) cannot exercise this arm.
+        if std::fs::write(dst.join("probe"), b"").is_ok() {
+            std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755)).unwrap();
+            eprintln!(
+                "retire_agent_definitions_report_a_failed_removal_as_one: SKIPPED — a 0o555 \
+                 directory is still writable by this user (root?), so the failed-removal arm \
+                 cannot be exercised"
+            );
+            return;
+        }
+        let mut report = ProvisionReport::new(
+            "agent_definitions",
+            0,
+            crate::capability_manifest::Rung::OperatorCheckout,
+        );
+
+        retire_agent_definitions(&wt.path().to_string_lossy(), &[line.as_str()], &mut report);
+        std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(dst.join("retired-agent.md").exists());
+        assert!(report.removed.is_empty());
+        assert_eq!(
+            report.retained_retired.len(),
+            1,
+            "{:?}",
+            report.retained_retired
+        );
+        assert!(matches!(
+            report.retained_retired[0].reason,
+            crate::capability_manifest::RetainedReason::RemoveFailed(_)
+        ));
+        assert!(
+            report.skipped.is_empty(),
+            "a failed removal is not a skipped write"
+        );
+        assert!(!report.is_complete());
+    }
+
+    /// Only the workdir's own files are removed: an agents directory reached
+    /// through a symlink keeps its shipped copy, wherever the link points.
+    #[cfg(unix)]
+    #[test]
+    fn retire_agent_definitions_never_remove_through_a_symlink() {
+        let (body, line) = retired_fixture();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let foreign = elsewhere.path().join(".claude").join("agents");
+        std::fs::create_dir_all(&foreign).unwrap();
+        std::fs::write(foreign.join("retired-agent.md"), body).unwrap();
+        let wt = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(elsewhere.path().join(".claude"), wt.path().join(".claude"))
+            .unwrap();
+        let mut report = ProvisionReport::new(
+            "agent_definitions",
+            0,
+            crate::capability_manifest::Rung::OperatorCheckout,
+        );
+
+        retire_agent_definitions(&wt.path().to_string_lossy(), &[line.as_str()], &mut report);
+
+        assert!(
+            foreign.join("retired-agent.md").is_file(),
+            "a shipped copy outside the workdir must never be removed"
+        );
+        assert!(report.removed.is_empty());
+        assert!(matches!(
+            report.retained_retired.first().map(|r| &r.reason),
+            Some(crate::capability_manifest::RetainedReason::LinkedElsewhere(
+                _
+            ))
+        ));
+
+        // A link whose target sits INSIDE the workdir is still a link: the file
+        // is not `<workdir>/.claude/agents/<name>`, so it stays too.
+        let wt = tempfile::tempdir().unwrap();
+        let inner = wt.path().join("elsewhere").join("agents");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::write(inner.join("retired-agent.md"), body).unwrap();
+        std::fs::create_dir(wt.path().join(".claude")).unwrap();
+        std::os::unix::fs::symlink(&inner, wt.path().join(".claude").join("agents")).unwrap();
+        let mut report = ProvisionReport::new(
+            "agent_definitions",
+            0,
+            crate::capability_manifest::Rung::OperatorCheckout,
+        );
+        retire_agent_definitions(&wt.path().to_string_lossy(), &[line.as_str()], &mut report);
+        assert!(inner.join("retired-agent.md").is_file());
+        assert!(report.removed.is_empty());
+        assert!(matches!(
+            report.retained_retired.first().map(|r| &r.reason),
+            Some(crate::capability_manifest::RetainedReason::LinkedElsewhere(
+                _
+            ))
+        ));
+
+        // An edited copy behind a link is a deliberate keep, not a failure.
+        std::fs::write(inner.join("retired-agent.md"), "# edited\n").unwrap();
+        let mut report = ProvisionReport::new(
+            "agent_definitions",
+            0,
+            crate::capability_manifest::Rung::OperatorCheckout,
+        );
+        retire_agent_definitions(&wt.path().to_string_lossy(), &[line.as_str()], &mut report);
+        assert!(matches!(
+            report.retained_retired.first().map(|r| &r.reason),
+            Some(crate::capability_manifest::RetainedReason::LocallyModified(
+                _
+            ))
+        ));
+        assert!(report.is_complete());
+    }
+
+    /// The no-root arm (a published install's normal state) hands the
+    /// PRODUCTION table to the pass: an edited test-generator copy is recorded
+    /// as a retired unit kept on disk.
+    #[test]
+    fn provision_agent_defs_no_root_arm_hands_the_production_table_to_the_pass() {
+        let edited = "---\nname: test-generator\n---\n# edited in this workdir\n";
+        let (wt, _dst) = workdir_with(&[("test-generator.md", edited)]);
+
+        let report = provision_agent_definitions_with_root(None, &wt.path().to_string_lossy());
+
+        assert_eq!(report.rung, crate::capability_manifest::Rung::Unresolved);
+        assert_eq!(
+            report
+                .retained_retired
+                .iter()
+                .map(|r| (r.unit.as_str(), r.reason.wire()))
+                .collect::<Vec<_>>(),
+            vec![("test-generator.md", "locally_modified")],
+            "the no-root arm must retire with the production table: {}",
+            report.summary()
+        );
+    }
+
+    /// A checkout overlay that ERRORS still gets the retirement pass: an
+    /// unlistable checkout agents directory must not cost the removal.
+    #[cfg(unix)]
+    #[test]
+    fn provision_agent_defs_retire_even_when_the_overlay_errors() {
+        use std::os::unix::fs::PermissionsExt;
+        let (body, line) = retired_fixture();
+        let root = checkout_root_with(&[("merge-specialist.md", "# PRIMARY copy")]);
+        let src = root
+            .path()
+            .join("qontinui-claude-config")
+            .join(".claude")
+            .join("agents");
+        std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_dir(&src).is_ok() {
+            std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o755)).unwrap();
+            eprintln!(
+                "provision_agent_defs_retire_even_when_the_overlay_errors: SKIPPED — a 0o000 \
+                 directory is still listable by this user (root?), so the overlay cannot error"
+            );
+            return;
+        }
+        let (wt, dst) = workdir_with(&[("retired-agent.md", body)]);
+
+        let wt_cwd = wt.path().to_string_lossy().into_owned();
+        let report = provision_agent_definitions_retiring(root.path(), &wt_cwd, &[line.as_str()]);
+        std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(report.rung, crate::capability_manifest::Rung::Unresolved);
+        assert_eq!(report.skipped.len(), 1, "{:?}", report.skipped);
+        assert!(
+            !dst.join("retired-agent.md").exists(),
+            "the retirement pass must run after an errored overlay"
+        );
+        assert_eq!(report.removed.len(), 1, "{:?}", report.removed);
     }
 
     #[test]
@@ -14603,6 +15438,39 @@ mod tests {
         let _env = ClaudeBinEnv::prepend(&[empty.clone(), bin_dir.clone()]);
         let found = resolve_claude_bin();
         assert_eq!(found, bin.to_string_lossy());
+    }
+
+    /// The PERSISTENT identity dir (`profile_cli::identity_shim_dir()`) is
+    /// never taken for the real `claude`, although nothing in its name or
+    /// contents marks it as a shim dir. The Settings opt-in prepends it to the
+    /// user PATH, so it sits AHEAD of the real tool. Before this skip the walk
+    /// returned its stub.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_claude_bin_skips_the_persistent_identity_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        // Reentrant with the fixture's own hold, which gives the ambient home.
+        let _env_lock = env_lock();
+        let _amb = crate::test_env::isolated_ambient();
+        let persistent = qontinui_runner_lib::profile_cli::identity_shim_dir()
+            .expect("the fixture provides a home");
+        let tmp = tempfile::tempdir().unwrap();
+        let real_dir = tmp.path().join("real");
+        std::fs::create_dir_all(&persistent).unwrap();
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let stub = persistent.join("claude");
+        let real = real_dir.join("claude");
+        for f in [&stub, &real] {
+            std::fs::write(f, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(f, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let _env = ClaudeBinEnv::prepend(&[persistent.clone(), real_dir.clone()]);
+        assert_eq!(
+            resolve_claude_bin(),
+            real.to_string_lossy(),
+            "the persistent identity dir's stub was taken for the real claude"
+        );
     }
 
     /// npm's placeholder stub is a miss: the walk moves past it to a real binary
@@ -14946,10 +15814,22 @@ mod tests {
                 current_holder: "sibling-continuation".to_string(),
                 intent: None,
             }));
-        let because = settle_continuation_acquire(conflict).unwrap_err();
+        let settled = settle_continuation_acquire(conflict);
+        let because = settled.because();
         assert!(because.contains("claim already held"), "{because}");
-        assert!(settle_continuation_acquire::<u8>(Ok(None)).is_err());
-        assert_eq!(settle_continuation_acquire(Ok(Some(7u8))), Ok(7));
+        assert!(matches!(settled, ContinuationAcquire::Failed(_)));
+        assert_eq!(
+            settle_continuation_acquire::<u8>(Ok(None)),
+            ContinuationAcquire::WorktreeModeOff
+        );
+        assert_eq!(
+            settle_continuation_acquire::<u8>(Ok(None)).because(),
+            "worktree mode is off or the acquire was declined"
+        );
+        assert_eq!(
+            settle_continuation_acquire(Ok(Some(7u8))),
+            ContinuationAcquire::Acquired(7)
+        );
     }
 
     /// The terminal presentation's refusal arrives as text. A trust-gate
@@ -15189,6 +16069,7 @@ mod tests {
             None,
             AnchorReservation::none(),
             uuid::Uuid::new_v4(),
+            None,
         )
         .await;
         assert!(
@@ -17991,8 +18872,8 @@ mod tests {
     /// The sibling test above (`dedup_takes_precedence_over_thread_pressure`)
     /// pins which verdict wins; this one pins what a deduped row PAYS. They are
     /// different properties and only one of them is about the incident: on the
-    /// live path the closure is `resource_guard::probe_for_spawn`, whose body is
-    /// a `settings.json` stat + parse, a `claude_accounts` load, a memory read
+    /// live path the closure is `resource_guard::AdmissionReading::live`, whose
+    /// `lane_verdicts` read is a `settings.json` stat + parse, a `claude_accounts` load, a memory read
     /// and — on Windows — a system-wide `CreateToolhelp32Snapshot`. `poll_pending_continuations`
     /// spawns one task per row coord returns, on a route coord serves with no
     /// `LIMIT`, so with the verdict passed as an argument expression a batch of

@@ -1797,11 +1797,10 @@ mod tests {
     fn empty_process_snapshot_is_unsafe_with_the_cause_named() {
         let now_ms = chrono::Utc::now().timestamp_millis();
 
-        // `compute` returns None on an empty parent_map; the handler turns that
-        // into this unknown. Assert the composition end of that contract.
-        let cause = "the terminal-session plane could not be determined: the process table is \
-                     unreadable (snapshot_process_table_public returned an empty parent_map), so \
-                     live `claude` processes cannot be enumerated";
+        // `compute` returns None on an UNKNOWN table (empty, or the stale
+        // last-good one); the handler turns that into this unknown. Assert the
+        // composition end of that contract.
+        let cause = crate::session::wind_down_observer::TERMINAL_PLANE_TABLE_UNKNOWN;
         let v = build_verdict(
             None,
             None,
@@ -1884,6 +1883,7 @@ mod tests {
                 session_status_since: None,
                 blocks_restart: true,
                 wind_down: None,
+                stray_wait_shells: 0,
             }],
             tracked_dead: vec![TrackedDeadRecord {
                 claude_session_id: "ghost".to_string(),
@@ -3132,6 +3132,7 @@ mod tests {
             session_status_since: None,
             blocks_restart: status != Some("finished"),
             wind_down: None,
+            stray_wait_shells: 0,
         }
     }
 

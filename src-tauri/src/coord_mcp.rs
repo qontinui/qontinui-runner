@@ -4682,8 +4682,9 @@ fn classify_agent_binding_liveness(
     // An empty parent map means "could not read the process table", not "no
     // processes" — the same posture as the tracking-health tick and
     // `live_pids_from_snapshot`, both of which refuse to answer rather than
-    // answer zero.
-    if snapshot.parent_map.is_empty() {
+    // answer zero. A `stale` table (the last good one) is not a live read
+    // either.
+    if snapshot.is_unknown() {
         return AgentLivenessTally::all_unknown(n, "process_table_unavailable");
     }
     // The rows must account for the count the line declared. A partially
@@ -22411,6 +22412,7 @@ mod agent_binding_census_tests {
         created: &[(u32, i64)],
     ) -> crate::process_capture::process_tree::ProcessSnapshot {
         let mut snap = crate::process_capture::process_tree::ProcessSnapshot::default();
+        snap.stale = false; // a live read
         for (parent, child) in edges {
             snap.parent_map.entry(*parent).or_default().push(*child);
         }
@@ -23784,19 +23786,18 @@ pub(crate) mod doctor {
         // whether the operator was asked. Scoped to the account exactly as the
         // UI's `get_binding_gap_asks` is, so it never crosses an account switch.
         let binding_gap_lapses = {
-            let tenant_slots = am.try_list_tenant_device_jwt_tenants().ok();
+            let tenant_slots = am
+                .try_list_tenant_device_jwt_tenants()
+                .map_err(|e| format!("{e:#}"));
             let legacy_present = am
                 .get_access_token()
                 .map(|t| !t.trim().is_empty())
                 .unwrap_or(false);
-            let account = crate::mcp::device_jwt_refresher::binding_gap_ask_account(
-                legacy_present,
-                tenant_slots.as_deref(),
-                qontinui_runner_lib::pair::read_paired_user_id_from_disk(),
-            );
-            crate::mcp::device_jwt_refresher::binding_gap_lapses_report(
+            crate::mcp::device_jwt_refresher::binding_gap_lapses_for_doctor(
                 crate::mcp::device_jwt_refresher::binding_gap_ask_path().as_deref(),
-                account.as_deref(),
+                legacy_present,
+                tenant_slots.as_deref().map_err(String::clone),
+                qontinui_runner_lib::pair::read_paired_user_id_from_disk(),
             )
         };
 

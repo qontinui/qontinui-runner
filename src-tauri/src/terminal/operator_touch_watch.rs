@@ -233,8 +233,9 @@ pub fn scan_idle_touches_once() {
     let snapshot = tauri::async_runtime::block_on(
         crate::process_capture::process_tree::snapshot_process_table_public(),
     );
-    if snapshot.parent_map.is_empty() {
-        // Unreadable table: nothing can be proven for any candidate this tick.
+    if snapshot.is_unknown() {
+        // Unreadable (or stale) table: nothing can be proven for any
+        // candidate this tick.
         *PROBE_NOT_BEFORE_MS
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = now_ms + UNREADABLE_PROBE_BACKOFF_MS;

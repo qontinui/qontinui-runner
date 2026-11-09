@@ -722,6 +722,32 @@ pub fn claude_left(outcome: &GracefulExitOutcome) -> bool {
     )
 }
 
+/// Exit a pane, ending the stray wait loops it leaves behind.
+///
+/// A stray background shell leads its own session and group, so no pane exit
+/// reaches it. It was discounted to let this session close, and left alone it would
+/// run on for ever with nothing left to report it. So: record it FIRST, while it is
+/// still under its `claude`; and end it only once `claude` is gone, because a shell
+/// it still owns is its own to end.
+async fn exit_ending_strays<Strays, EndFut>(
+    record: impl std::future::Future<Output = Strays>,
+    exit: impl std::future::Future<Output = Result<GracefulExitOutcome, String>>,
+    end: impl FnOnce(Strays) -> EndFut,
+    mut log: impl FnMut(&str),
+) -> Result<GracefulExitOutcome, String>
+where
+    EndFut: std::future::Future<Output = Vec<String>>,
+{
+    let strays = record.await;
+    let outcome = exit.await?;
+    if claude_left(&outcome) {
+        for line in end(strays).await {
+            log(&line);
+        }
+    }
+    Ok(outcome)
+}
+
 /// PURE: did this exit attempt POSITIVELY OBSERVE a `claude` in the pane?
 ///
 /// B4-1's evidence. The steward registry needs to know a pane was once
@@ -864,12 +890,8 @@ pub(crate) async fn judge_custody<P: CustodyProbe + ?Sized>(
     workspace_root: Option<&Path>,
     session_id: &str,
 ) -> CustodyVerdict {
-    let attributed = wind_down_observer::attributed_worktrees(
-        ownership,
-        session_id,
-        context.coord_session_id.as_deref(),
-        workspace_root,
-    );
+    let attributed =
+        wind_down_observer::attributed_worktrees(ownership, session_id, workspace_root);
     let inputs = wind_down_observer::gather_custody(probe, context, attributed, session_id).await;
     let verdict = wind_down::custody_gate(&inputs);
     debug!(
@@ -904,8 +926,9 @@ pub(crate) trait FinishedCloseWorld: Sync {
         &'p [LiveClaudeProcess],
         &'p wind_down_observer::ObservedInputs,
     );
-    /// The attributed-worktree read, made once per pass, with the liveness of
-    /// `claude_session_ids`' coord rows.
+    /// coord's keyed attributed-worktree read for exactly
+    /// `claude_session_ids`, made once per pass; an id it did not answer is
+    /// UNKNOWN.
     async fn ownership(&self, claude_session_ids: &[String]) -> OwnershipRead;
     /// The root a relative ledger path is anchored on.
     fn workspace_root(&self) -> Option<PathBuf>;
@@ -1633,8 +1656,25 @@ impl CloseEffects for LiveCloseEffects<'_> {
             "wind_down_executor: graceful /exit — eligible past grace"
         );
 
-        // The ONE way this module reaches a pane. Never `TerminalManager::close`.
-        wind_down_exit(&self.manager, session_id, terminal_id, kind).await
+        // Only the panes the pass discounted a stray from: every other close reads
+        // nothing extra. A shell not discounted there was work, and this close
+        // would not have been admitted.
+        let claudes: Vec<u32> = self
+            .pass
+            .report
+            .terminal_hosted
+            .iter()
+            .filter(|p| p.session_id.as_deref() == Some(session_id) && p.stray_wait_shells > 0)
+            .map(|p| p.pid)
+            .collect();
+        exit_ending_strays(
+            crate::session::stray_wait::record_strays(claudes),
+            // The ONE way this module reaches a pane. Never `TerminalManager::close`.
+            wind_down_exit(&self.manager, session_id, terminal_id, kind),
+            crate::session::stray_wait::end_strays,
+            |line| info!(session_id = %session_id, terminal_id = %terminal_id, "wind_down_executor: {line}"),
+        )
+        .await
     }
 
     fn session_kind(&self, terminal_id: &str) -> SessionKind {
@@ -2204,6 +2244,7 @@ mod tests {
                 kind: SessionKind::Terminal,
                 custody: None,
             }),
+            stray_wait_shells: 0,
         }
     }
 
@@ -2415,6 +2456,51 @@ mod tests {
             kind: SessionKind::Terminal,
             custody: None,
         }
+    }
+
+    /// Recorded before the exit, ended after it, and only when `claude` left.
+    #[tokio::test]
+    async fn strays_are_recorded_before_the_exit_and_ended_only_after_claude_left() {
+        let run = |outcome: Result<GracefulExitOutcome, String>| async move {
+            let order = std::cell::RefCell::new(Vec::new());
+            let lines = std::cell::RefCell::new(Vec::new());
+            let result = exit_ending_strays(
+                async {
+                    order.borrow_mut().push("record");
+                    vec![7u32]
+                },
+                async {
+                    order.borrow_mut().push("exit");
+                    outcome
+                },
+                |strays: Vec<u32>| {
+                    order.borrow_mut().push("end");
+                    async move { vec![format!("ended {strays:?}")] }
+                },
+                |line| lines.borrow_mut().push(line.to_string()),
+            )
+            .await;
+            (result.is_ok(), order.into_inner(), lines.into_inner())
+        };
+        assert_eq!(
+            run(Ok(exited())).await,
+            (
+                true,
+                vec!["record", "exit", "end"],
+                vec!["ended [7]".to_string()]
+            )
+        );
+        // `claude` is still there: every shell under it is still its own.
+        let stuck = GracefulExitOutcome::ExitStuck {
+            waited_ms: 10,
+            claude_pids: vec![42],
+            last_probe_unreadable: false,
+        };
+        assert_eq!(run(Ok(stuck)).await, (true, vec!["record", "exit"], vec![]));
+        assert_eq!(
+            run(Err("no such pane".to_string())).await,
+            (false, vec!["record", "exit"], vec![])
+        );
     }
 
     fn exited() -> GracefulExitOutcome {
@@ -3850,13 +3936,14 @@ mod tests {
             if let Some(read) = &self.ownership_override {
                 return read.clone();
             }
-            // Every candidate's coord session is live and holds no rows.
+            // coord's keyed read answers every candidate with an entry of
+            // its own that holds no rows.
             let mut index = CoordOwnership::default();
-            let live: Vec<String> = claude_session_ids
-                .iter()
-                .map(|s| format!("coord-{s}"))
-                .collect();
-            index.mark_live(live.iter().map(String::as_str));
+            index.record_coord_rows(
+                claude_session_ids
+                    .iter()
+                    .map(|s| (s.clone(), format!("coord-{s}"))),
+            );
             Ok(index)
         }
         fn workspace_root(&self) -> Option<PathBuf> {
@@ -3870,7 +3957,6 @@ mod tests {
         ) -> SessionCustodyContext {
             SessionCustodyContext {
                 session_dir: Some(PathBuf::from(format!("/ws/{session_id}"))),
-                coord_session_id: Some(format!("coord-{session_id}")),
                 isolated_worktrees: Ok(Vec::new()),
             }
         }
@@ -3998,12 +4084,11 @@ mod tests {
         ));
     }
 
-    /// Round-2 CRITICAL 1, end to end: a candidate whose coord session is not
-    /// known live (auto-closed) is never closed, whatever its trees show.
+    /// End to end: a candidate coord's keyed read did not answer is never
+    /// closed, whatever its trees show.
     #[tokio::test]
-    async fn finished_close_tick_never_closes_a_session_whose_coord_row_is_not_live() {
-        // A valid read that marks nothing live: the coord row was closed, or
-        // moved between states while the pages were read.
+    async fn finished_close_tick_never_closes_a_session_coords_keyed_read_did_not_answer() {
+        // A valid read that answers no candidate: no entry of its own.
         let mut world = FakeWorld::with_sessions(&["t1"]);
         world.ownership_override = Some(Ok(CoordOwnership::default()));
         let FinishedCloseTick::Ran { judged, outcomes } = tick(&world).await else {

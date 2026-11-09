@@ -3232,6 +3232,8 @@ pub(crate) fn open_binding_gap_asks(
     )
 }
 
+const NO_ACCOUNT_REASON: &str = "no signed-in, paired account to scope the lapse record to";
+
 /// The per-tenant lapse records — Phase 7's seed attempt and the Phase 4 ask —
 /// for the `/coord-mcp/doctor` report, so an agent can see WHY a bound tenant
 /// still has no slot without the desktop UI.
@@ -3251,6 +3253,30 @@ pub(crate) fn binding_gap_lapses_report(
     path: Option<&std::path::Path>,
     account: Option<&str>,
 ) -> serde_json::Value {
+    lapses_report_scoped(path, Ok(account))
+}
+
+/// [`binding_gap_lapses_report`] with an account that may itself be UNKNOWN.
+/// `Err(why)` is used only where the account matters, at the scoping step. A
+/// missing path, an absent file and a bad file still answer exactly as they do
+/// with a known account.
+fn lapses_report_scoped(
+    path: Option<&std::path::Path>,
+    account: Result<Option<&str>, &str>,
+) -> serde_json::Value {
+    let account = match account {
+        Ok(a) => a,
+        Err(why) => {
+            // Defer: validate the file first, then report `why` instead of
+            // a scope decision this read cannot make.
+            return match lapses_report_scoped(path, Ok(None)) {
+                v if v.get("unknown").is_some_and(|u| u == NO_ACCOUNT_REASON) => {
+                    serde_json::json!({ "unknown": why })
+                }
+                v => v,
+            };
+        }
+    };
     let Some(path) = path else {
         return serde_json::json!({"unknown": "the lapse record's path does not resolve"});
     };
@@ -3274,9 +3300,7 @@ pub(crate) fn binding_gap_lapses_report(
     match (account, state.account.as_deref()) {
         (Some(current), Some(owner)) if current == owner => {}
         (None, _) => {
-            return serde_json::json!({
-                "unknown": "no signed-in, paired account to scope the lapse record to"
-            });
+            return serde_json::json!({ "unknown": NO_ACCOUNT_REASON });
         }
         (Some(_), None) if state.tenants.is_empty() => {
             return serde_json::json!({"lapses": []});
@@ -3307,6 +3331,41 @@ pub(crate) fn binding_gap_lapses_report(
         })
         .collect();
     serde_json::json!({"lapses": lapses})
+}
+
+/// The doctor's door onto [`binding_gap_lapses_report`]: resolve the account
+/// exactly as `get_binding_gap_asks` does, but keep an UNREADABLE tenant slot
+/// store distinct from a signed-out box.
+///
+/// [`binding_gap_ask_account`] takes the slot list as an `Option`, so a store
+/// that failed to enumerate looks the same as "no slots". With no legacy slot
+/// either, the account then resolves to `None`, and the report would say
+/// nobody is signed in. That is a false reason, because the box may hold
+/// per-tenant slots that this read could not see. That case is reported here
+/// as the store failure it is, and only at the step where the account is
+/// needed. An absent record is still a real `[]`, and a missing path or a bad
+/// record still gives its own reason, since none of those depend on who is
+/// signed in.
+pub(crate) fn binding_gap_lapses_for_doctor(
+    path: Option<&std::path::Path>,
+    legacy_slot_present: bool,
+    tenant_slots: Result<&[uuid::Uuid], String>,
+    paired_user: Option<String>,
+) -> serde_json::Value {
+    let slots = match tenant_slots {
+        Ok(s) => Some(s),
+        Err(e) if !legacy_slot_present => {
+            let why = format!(
+                "the tenant slot store is unreadable, so whether an account is signed in is UNKNOWN: {e}"
+            );
+            return lapses_report_scoped(path, Err(&why));
+        }
+        // A legacy slot alone signs the box in, so the store failure cannot
+        // change which account the record is scoped to.
+        Err(_) => None,
+    };
+    let account = binding_gap_ask_account(legacy_slot_present, slots, paired_user);
+    binding_gap_lapses_report(path, account.as_deref())
 }
 
 /// Forget the evidence behind every ask — for a full sign-out or a
@@ -15264,6 +15323,43 @@ mod tenant_seed_arm_tests {
         ] {
             assert!(!body.contains(forbidden), "seed arm names {forbidden}");
         }
+    }
+
+    #[test]
+    fn doctor_names_an_unreadable_slot_store_not_a_signed_out_box() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("binding_gap_asks.json");
+        let unreadable = || Err::<&[uuid::Uuid], String>("decrypt failed".into());
+        let acct = || Some("acct-a".to_string());
+        // No record yet: a real empty list, whoever is signed in.
+        assert_eq!(
+            binding_gap_lapses_for_doctor(Some(&path), false, unreadable(), acct()),
+            serde_json::json!({"lapses": []})
+        );
+        // An unresolvable path keeps its own reason.
+        let v = binding_gap_lapses_for_doctor(None, false, unreadable(), acct());
+        assert!(v["unknown"].as_str().unwrap().contains("does not resolve"));
+
+        write_state(
+            &path,
+            "acct-a",
+            &[(uuid::Uuid::new_v4(), lapse(true, "", false, false))],
+        );
+        // Store unreadable, no legacy slot: the reason names the store.
+        let v = binding_gap_lapses_for_doctor(Some(&path), false, unreadable(), acct());
+        let why = v["unknown"].as_str().expect("unknown, never a list");
+        assert!(why.contains("slot store is unreadable"), "{why}");
+        assert!(why.contains("decrypt failed"), "{why}");
+        // A legacy slot signs the box in on its own, so the record is served.
+        let v = binding_gap_lapses_for_doctor(Some(&path), true, unreadable(), acct());
+        assert_eq!(v["lapses"].as_array().map(Vec::len), Some(1), "{v}");
+        // A readable, empty store with no legacy slot really is signed out.
+        let v = binding_gap_lapses_for_doctor(Some(&path), false, Ok(&[]), acct());
+        assert_eq!(v["unknown"], NO_ACCOUNT_REASON);
+        // A malformed record keeps its own reason too.
+        std::fs::write(&path, b"{not json").unwrap();
+        let v = binding_gap_lapses_for_doctor(Some(&path), false, unreadable(), acct());
+        assert!(v["unknown"].as_str().unwrap().contains("malformed"), "{v}");
     }
 
     // ---- the doctor's read of the lapse record (`binding_gap_lapses_report`) ----

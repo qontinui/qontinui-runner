@@ -91,8 +91,9 @@ describe("reconcilePages", () => {
     expect(out.slice(0, 3)).toEqual(persisted);
     expect(out.filter((p) => p.id === "default")).toHaveLength(1);
     const synth = out.find((p) => p.id === "minted-x")!;
-    // N = count of existing non-default pages (2) + 1 = 3.
-    expect(synth.name).toBe("Page 3");
+    // No existing "Page N" → the next auto name is "Page 1" (never a count).
+    expect(synth.name).toBe("Page 1");
+    expect(synth.origin).toBe("auto");
   });
 
   it("returns the SAME array reference when every backend id is already persisted", () => {
@@ -115,7 +116,7 @@ describe("reconcilePages", () => {
   it("synthesizes a 'Terminal' tab for 'default' when the operator layout dropped it but the backend still parks terminals there", () => {
     // The orphaning bug: once the operator has created pages, `loadPages` no
     // longer injects the default page, so it is ABSENT from `persisted`. A
-    // terminal created via `POST /terminals` with no pageId lands on "default"
+    // terminal created via `POST /terminals` with pageId "default" lands there
     // and must still get a visible, selectable tab (regression for the
     // 2026-07-18 fan-out, where API-spawned terminals vanished onto "default").
     const persisted: TerminalPageConfig[] = [

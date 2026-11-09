@@ -68,8 +68,9 @@ pub struct TreeKillReport {
 /// could not be read" (the descendants' fate is UNKNOWN) from the other cases.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TreeKillError {
-    /// The root is the calling process, could not be opened, or its creation
-    /// time is unreadable. Nothing was signalled.
+    /// The root is the calling process, could not be opened, its creation
+    /// time is unreadable, or its handle names a different pid than the one
+    /// claimed for it. Nothing was signalled.
     Root(String),
     /// The first process snapshot failed: only the root was signalled
     /// (`killed` says whether that landed), and its descendants were not
@@ -256,6 +257,19 @@ pub fn walk<T: ProcessTable>(
     Ok(report)
 }
 
+/// `Err` when the pid read from a root's handle disagrees with the pid the
+/// caller claimed for it; `Ok` when they agree or the handle's pid is unread.
+#[cfg(any(windows, test))]
+fn check_root_pid(from_handle: Option<u32>, claimed: u32) -> Result<(), TreeKillError> {
+    match from_handle {
+        Some(actual) if actual != claimed => Err(TreeKillError::Root(format!(
+            "pid {claimed}: the root handle names pid {actual}, refusing to walk a tree \
+             the handle does not vouch for"
+        ))),
+        _ => Ok(()),
+    }
+}
+
 #[cfg(windows)]
 pub use imp::{
     creation_time, snapshot, terminate_process_tree, terminate_tree_of, OwnedProcess, Win32Table,
@@ -263,7 +277,7 @@ pub use imp::{
 
 #[cfg(windows)]
 mod imp {
-    use super::{walk, ProcessTable, TreeKillError, TreeKillReport};
+    use super::{check_root_pid, walk, ProcessTable, TreeKillError, TreeKillReport};
     use std::os::windows::io::{AsRawHandle, BorrowedHandle};
     use std::time::Duration;
     use windows_sys::Win32::Foundation::{
@@ -275,8 +289,9 @@ mod imp {
         TH32CS_SNAPPROCESS,
     };
     use windows_sys::Win32::System::Threading::{
-        GetCurrentProcess, GetProcessTimes, OpenProcess, TerminateProcess, WaitForSingleObject,
-        PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+        GetCurrentProcess, GetProcessId, GetProcessTimes, OpenProcess, TerminateProcess,
+        WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+        PROCESS_TERMINATE,
     };
 
     /// The creation time of the process behind `handle`, as one FILETIME.
@@ -360,6 +375,15 @@ mod imp {
             } else {
                 Ok(Self(out))
             }
+        }
+
+        /// The pid behind the handle (`GetProcessId`). It names this process
+        /// for as long as the handle is open, even after the process exits;
+        /// `None` when the call fails.
+        pub fn pid(&self) -> Option<u32> {
+            // SAFETY: a process handle with query access.
+            let pid = unsafe { GetProcessId(self.0) };
+            (pid != 0).then_some(pid)
         }
 
         /// The process's creation time (FILETIME).
@@ -455,11 +479,19 @@ mod imp {
     /// Terminate the process behind `root` (pid `root_pid`) and every
     /// descendant — see [`walk`](super::walk). A root that has already exited
     /// is not signalled; its descendants still are.
+    ///
+    /// `root_pid` is a CLAIM, checked against the pid read from the handle
+    /// (`GetProcessId`): the walk links descendants by parent pid, so a pid
+    /// that disagreed with the handle would root the walk at a stranger's
+    /// tree while the handle vouched for a different process. A mismatch is
+    /// an `Err` naming both and nothing is signalled. Where the handle's pid
+    /// cannot be read the claim is used as given.
     pub fn terminate_tree_of(
         root: &OwnedProcess,
         root_pid: u32,
         budget: Duration,
     ) -> Result<TreeKillReport, TreeKillError> {
+        check_root_pid(root.pid(), root_pid)?;
         walk(&Win32Table, root, root_pid, std::process::id(), budget)
     }
 }
@@ -488,6 +520,18 @@ mod admission_tests {
             !admits_descendant(5_001, parent, snapshot),
             "created after the snapshot"
         );
+    }
+
+    /// The caller's root pid must agree with the handle's own pid; an
+    /// unreadable handle pid falls back to the claim.
+    #[test]
+    fn process_tree_root_pid_claim_is_checked_against_the_handle() {
+        use super::check_root_pid;
+        assert!(check_root_pid(Some(42), 42).is_ok(), "agreeing pids");
+        assert!(check_root_pid(None, 42).is_ok(), "unreadable handle pid");
+        let err = check_root_pid(Some(43), 42).unwrap_err().to_string();
+        assert!(err.contains("42") && err.contains("43"), "{err}");
+        assert!(!err.contains("  "), "no collapsed line continuation: {err}");
     }
 
     /// The walk is pure source with no process creation in it: no
@@ -896,6 +940,13 @@ mod tests {
         let below = wait_for_descendants(pid, 2);
         let watched = watch(&below);
         let root = OwnedProcess::duplicate(fx.children[0].as_handle()).unwrap();
+        assert_eq!(root.pid(), Some(pid), "the handle names the spawned root");
+        // A pid claim the handle does not vouch for is refused, unsignalled.
+        assert!(matches!(
+            terminate_tree_of(&root, pid.wrapping_add(4), Duration::from_secs(5)),
+            Err(TreeKillError::Root(_))
+        ));
+        assert!(!root.has_exited(), "a refused walk signalled nothing");
         let report = terminate_tree_of(&root, pid, Duration::from_secs(5)).unwrap();
         assert!(report.killed.contains(&pid), "{report:?}");
         for b in &below {

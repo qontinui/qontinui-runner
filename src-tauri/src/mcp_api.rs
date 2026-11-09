@@ -2464,7 +2464,12 @@ async fn health(
         // observations HANDED to the emitter; `laneMiss` partitions the
         // calls that never got a `coord.sessions` lane by the FIRST gate
         // they failed (one key per `EventLaneMiss` variant, present even at
-        // zero — an absent key is UNKNOWN, a zero is a number);
+        // zero — an absent key is UNKNOWN, a zero is a number; a
+        // terminal-less call on a workdir NO session claims reports the
+        // lifecycle leg's `lifecycle_*` gate; one several sessions claim
+        // reports `ai_ambiguous_workdir` and never reaches that leg;
+        // `no_task_run` is retained for series stability but is no longer
+        // produced);
         // `drainDropped` is what the outbox drain Ack-dropped on a 404
         // (coord does not know the lane), a 405 (no ingest route) or any
         // other 4xx (`other4xx` — the shared classifier's PermanentFailure,
@@ -2749,6 +2754,13 @@ async fn health(
         // R9-unkeyed from exactly these counters, so they are served here
         // rather than only to the test harness. The tuples carry no origin.
         "uiBridgeBinding": state.relay_binding.health_json(),
+        // The shared in-process process table (plan 2026-10-28-runner-spawn-
+        // bursts-overwhelm-the-box-beyond-the-continuation-cap, Phase 5):
+        // snapshot reads, how many the memo or a walk in flight answered,
+        // external-probe fallback attempts (expected 0 — on Windows each one
+        // is a PowerShell process creation), and when an open fallback
+        // circuit closes.
+        "processTable": crate::process_capture::process_table::health_json(),
         "storage": {
             "apiPort": api_port,
             "namespaceSuffix": storage_namespace_suffix,
@@ -4529,8 +4541,38 @@ fn open_only(
 ///    registered `coord.sessions.id`. Here the registrar IS the value rather
 ///    than merely a registered-ness filter, because this is the id space the
 ///    registrar holds.
+/// 3. **Lifecycle** (plan
+///    `2026-09-18-runner-transport-rung-rows-never-reach-coord-despite-a-serving-emitter`,
+///    Phase 2). Runs ONLY when leg 2 found NO candidate on the workdir
+///    ([`WorkdirTaskRun::NoCandidate`](crate::claude_session::WorkdirTaskRun)):
+///    nonce → workdir → the single admitted
+///    OPEN lifecycle record on that workdir (the SAME admission loop the
+///    caller-identity chain's [`resolve_caller_via_lifecycle`] decides
+///    through — [`select_lifecycle_candidate_censused`]) → its terminal →
+///    that `TerminalSession`'s `coord_session_id`. This is the terminal-less
+///    INTERACTIVE population — a `claude` in a runner terminal reading an
+///    in-cwd `.mcp.json` whose nonce carries no `terminal_id` — which leg 2
+///    cannot see by construction and which Phase 0 measured as the whole of
+///    `no_task_run` (finding `d3d824f0`). Pure half:
+///    [`event_lane_lifecycle_leg`].
 ///
-/// An `Err` — no event is emitted — when neither leg resolves. That is honest:
+///    Leg 3 does NOT run after the other leg-2 misses. `NoWorkdir` leaves it
+///    nothing to key on. `AiAmbiguousWorkdir` means SEVERAL sessions claim the
+///    workdir (`WorkdirTaskRun::Ambiguous`) — a task run owns its calls, so a
+///    lifecycle lookup could file this call under a sibling terminal's lane.
+///    `AiSessionUnregistered` means the workdir DOES host a task run, which
+///    owns that workdir's calls — falling through would file the task run's
+///    call under a sibling terminal's lane. And
+///    `AiPlaneStateMissing` is a mis-wired host (production installs both
+///    halves), which a fallthrough would mask rather than report.
+///
+///    Ambiguity is REFUSED, never settled: unlike the caller-identity chain,
+///    the lane does not consult the client's asserted pick
+///    ([`settle_ambiguity`]). That pick is a claim about the AGENT session;
+///    the lane is a `coord.sessions` row that one assertion cannot vouch for,
+///    and a wrong lane is worse than no row (below).
+///
+/// An `Err` — no event is emitted — when no leg resolves. That is honest:
 /// a call with no `coord.sessions` row has nowhere for coord to hang the event,
 /// and inventing a lane would only produce 404s. It is NOT the untagged arm,
 /// which is about a caller declaring no transport and DOES emit.
@@ -4555,6 +4597,7 @@ fn open_only(
 fn resolve_event_lane_session_id(
     app: Option<&tauri::AppHandle>,
     nonce: Option<&str>,
+    caller_session_id: Option<uuid::Uuid>,
 ) -> Result<uuid::Uuid, EventLaneMiss> {
     let Some(nonce) = nonce else {
         return Err(EventLaneMiss::NoNonce);
@@ -4581,23 +4624,158 @@ fn resolve_event_lane_session_id(
     }
     // Leg 2 — the runner-managed AI plane, keyed on the nonce's workdir.
     let workdir = crate::coord_mcp::workdir_for_nonce(nonce).ok_or(EventLaneMiss::NoWorkdir)?;
-    let task_run_id = match app
+    let found = app
         .and_then(|a| a.try_state::<Arc<crate::claude_session::SessionManager>>())
         .ok_or(EventLaneMiss::AiPlaneStateMissing)?
-        .task_run_id_for_workdir(&workdir)
-    {
-        crate::claude_session::WorkdirTaskRun::Found(id) => id,
-        crate::claude_session::WorkdirTaskRun::NoCandidate => return Err(EventLaneMiss::NoTaskRun),
-        // Several sessions claim this workdir: a task run owns its calls, so
-        // refuse rather than file one under any lane.
-        crate::claude_session::WorkdirTaskRun::Ambiguous => {
-            return Err(EventLaneMiss::AiAmbiguousWorkdir)
+        .task_run_id_for_workdir(&workdir);
+    let task_run_id = match event_lane_after_workdir_lookup(found) {
+        WorkdirLegNext::TaskRun(id) => id,
+        WorkdirLegNext::TryLifecycle => {
+            return resolve_event_lane_via_lifecycle(app, &workdir, caller_session_id)
         }
+        WorkdirLegNext::Refuse(miss) => return Err(miss),
     };
     app.and_then(|a| a.try_state::<Arc<crate::claude_session::coord_register::AiCoordRegistrar>>())
         .ok_or(EventLaneMiss::AiPlaneStateMissing)?
         .session_id_for(&task_run_id)
         .ok_or(EventLaneMiss::AiSessionUnregistered)
+}
+
+/// What leg 2's workdir lookup licenses next — the pure decision between the
+/// AI plane and leg 3, so the combination is unit-testable without a Tauri app.
+///
+/// - `Found` → that task run's registrar lane.
+/// - `NoCandidate` (no session claims the workdir) → leg 3, the ONLY arm that
+///   may look the session up in the lifecycle store.
+/// - `Ambiguous` (several sessions claim it) → refuse. A task run owns that
+///   workdir's calls, so a lifecycle lookup could file one under a sibling
+///   interactive terminal's lane, the misattribution leg 3 exists to refuse.
+#[derive(Debug, PartialEq, Eq)]
+enum WorkdirLegNext {
+    TaskRun(String),
+    TryLifecycle,
+    Refuse(EventLaneMiss),
+}
+
+fn event_lane_after_workdir_lookup(found: crate::claude_session::WorkdirTaskRun) -> WorkdirLegNext {
+    use crate::claude_session::WorkdirTaskRun;
+    match found {
+        WorkdirTaskRun::Found(id) => WorkdirLegNext::TaskRun(id),
+        WorkdirTaskRun::NoCandidate => WorkdirLegNext::TryLifecycle,
+        WorkdirTaskRun::Ambiguous => WorkdirLegNext::Refuse(EventLaneMiss::AiAmbiguousWorkdir),
+    }
+}
+
+/// Leg 3 of [`resolve_event_lane_session_id`]: the state-dependent half of
+/// [`event_lane_lifecycle_leg`]. Same lock discipline as
+/// [`resolve_caller_via_lifecycle`] — `open_records()` is a snapshot, every
+/// comparison runs lock-free after it.
+fn resolve_event_lane_via_lifecycle(
+    app: Option<&tauri::AppHandle>,
+    workdir: &str,
+    caller_session_id: Option<uuid::Uuid>,
+) -> Result<uuid::Uuid, EventLaneMiss> {
+    let store = app
+        .and_then(|a| {
+            a.try_state::<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>()
+        })
+        .ok_or(EventLaneMiss::LifecycleStateMissing)?;
+    let records = store.open_records(); // snapshot under the store lock
+    let target_canon = std::fs::canonicalize(workdir).ok();
+    let tm = app.and_then(|a| a.try_state::<Arc<crate::terminal::TerminalManager>>());
+    event_lane_lifecycle_leg(
+        &records,
+        workdir,
+        target_canon.as_deref(),
+        caller_session_id,
+        |terminal_id| match tm.as_ref() {
+            None => TerminalLaneProbe::NoManager,
+            Some(tm) => match tm.get(terminal_id) {
+                None => TerminalLaneProbe::Gone,
+                Some(t) => TerminalLaneProbe::Live(t.coord_session_id()),
+            },
+        },
+    )
+}
+
+/// The pure leg-3 decision for the event lane (unit-testable without a Tauri
+/// app): workdir → the single admitted lifecycle candidate → its terminal(s)
+/// → a `coord.sessions.id`.
+///
+/// Admission is [`select_lifecycle_candidate_censused`] — the caller-identity
+/// chain's own loop, not a copy of its rules. On top of it the lane adds two
+/// refusals that only matter because the lane goes THROUGH a terminal:
+///
+/// - **A contested terminal.** Every terminal backing the candidate must be
+///   one [`select_terminal_caller`] resolves to that SAME candidate. The
+///   durable registry can keep stale `open` rows on a reused terminal, so a
+///   terminal that also hosts another admitted session would hand this call
+///   that other session's lane. Refused as `lifecycle_ambiguous`.
+/// - **Two live lanes.** A candidate backed by several terminals (resumed into
+///   a new one while the old record stayed open) resolves only if exactly one
+///   distinct `coord.sessions.id` is live among them; two is
+///   `lifecycle_ambiguous`. None live reports the most specific reason seen:
+///   a live terminal without a mirror, then a missing manager, then gone.
+///
+/// And one refusal the lane takes from the call itself:
+///
+/// - **The caller says it is someone else.** `caller_session_id` is the
+///   `X-Coord-Caller-Session` the same call resolved to (the caller-identity
+///   chain's verdict, which may be the client's own uncontradicted
+///   assertion). It is in the candidate's id space (`coord.agent_sessions`).
+///   A lone admitted record on a workdir says nothing about a session sitting
+///   beside it, such as a plain-shell `claude` on the in-cwd `.mcp.json`. When
+///   the call names a DIFFERENT session, filing it under the candidate's
+///   terminal lane would write a row whose lane and `caller_session_id`
+///   contradict each other, and inflate the candidate's counts. Refused as
+///   `lifecycle_caller_disagrees`, before any terminal is probed. `None` (no
+///   caller resolved) leaves the lone-candidate rule unchanged.
+fn event_lane_lifecycle_leg(
+    records: &[crate::session::session_lifecycle_store::TerminalSessionRecord],
+    workdir: &str,
+    target_canon: Option<&std::path::Path>,
+    caller_session_id: Option<uuid::Uuid>,
+    mut probe: impl FnMut(&str) -> TerminalLaneProbe,
+) -> Result<uuid::Uuid, EventLaneMiss> {
+    let candidate = select_lifecycle_candidate_censused(records, workdir, target_canon)
+        .0
+        .map_err(|miss| match miss {
+            LifecycleMiss::NoRecord => EventLaneMiss::LifecycleNoRecord,
+            LifecycleMiss::Unregistered => EventLaneMiss::LifecycleUnadmitted,
+            LifecycleMiss::AnchorNotUuid => EventLaneMiss::LifecycleAnchorNotUuid,
+            LifecycleMiss::Ambiguous(_) => EventLaneMiss::LifecycleAmbiguous,
+        })?;
+    if caller_session_id.is_some_and(|caller| caller != candidate.session) {
+        return Err(EventLaneMiss::LifecycleCallerDisagrees);
+    }
+    if candidate
+        .terminal_ids
+        .iter()
+        .any(|tid| select_terminal_caller(records, tid).ok() != Some(candidate.session))
+    {
+        return Err(EventLaneMiss::LifecycleAmbiguous);
+    }
+    let mut lanes: Vec<uuid::Uuid> = Vec::new();
+    let (mut saw_unmirrored, mut saw_no_manager) = (false, false);
+    for tid in &candidate.terminal_ids {
+        match probe(tid) {
+            TerminalLaneProbe::Live(Some(sid)) => {
+                if !lanes.contains(&sid) {
+                    lanes.push(sid);
+                }
+            }
+            TerminalLaneProbe::Live(None) => saw_unmirrored = true,
+            TerminalLaneProbe::NoManager => saw_no_manager = true,
+            TerminalLaneProbe::Gone => {}
+        }
+    }
+    match lanes.as_slice() {
+        [sid] => Ok(*sid),
+        [] if saw_unmirrored => Err(EventLaneMiss::LifecycleTerminalHasNoCoordSession),
+        [] if saw_no_manager => Err(EventLaneMiss::LifecycleStateMissing),
+        [] => Err(EventLaneMiss::LifecycleTerminalGone),
+        _ => Err(EventLaneMiss::LifecycleAmbiguous),
+    }
 }
 
 /// Why [`resolve_event_lane_session_id`] produced no lane. Each variant names
@@ -4607,6 +4785,16 @@ fn resolve_event_lane_session_id(
 /// diagnosable from the logs alone). Each variant is also one series under
 /// `GET /health` `transportRung.laneMiss` ([`record_event_lane_miss`]), the
 /// counter that line used to say was deferred.
+///
+/// ## `lifecycle_no_record` is a correct refusal, not a defect
+///
+/// A terminal-less call whose workdir hosts neither a task run nor an OPEN
+/// lifecycle record is a session the runner did not spawn and does not track
+/// — a `claude` started in a plain shell that picked up an in-cwd `.mcp.json`,
+/// say. Such a session has no `coord.sessions` row this runner owns, so it is
+/// NOT runner-attributable by construction, and its rows will keep counting
+/// against coord's `coord_only` origin. That series going non-zero is the
+/// honest residual; closing it would mean inventing a lane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EventLaneMiss {
     /// The proxy call carried no nonce at all (the unauthenticated door).
@@ -4625,8 +4813,11 @@ enum EventLaneMiss {
     /// Terminal-less binding, and the AI-plane state (`SessionManager` /
     /// `AiCoordRegistrar`) is not installed on this host.
     AiPlaneStateMissing,
-    /// Terminal-less binding whose workdir hosts no runner-managed task run —
-    /// the ordinary case for an interactive session with no terminal binding.
+    /// UNREACHABLE since Phase 2: a workdir no session claims
+    /// (`WorkdirTaskRun::NoCandidate`) runs leg 3 and reports its own
+    /// `lifecycle_*` reason, and an ambiguous one reports `AiAmbiguousWorkdir`.
+    /// The variant and its `/health` series are kept (a removed key reads as
+    /// UNKNOWN, not zero); a non-zero value means the leg-3 fallthrough regressed.
     NoTaskRun,
     /// The task run exists but never registered with coord, so it holds no
     /// `coord.sessions.id`.
@@ -4635,6 +4826,32 @@ enum EventLaneMiss {
     /// sessions (or whose session table could not be read). REFUSED: the task
     /// run owns that workdir's calls, so no lane is guessed.
     AiAmbiguousWorkdir,
+    /// Leg 3: the `SessionLifecycleStore` (or, for every backing terminal,
+    /// the `TerminalManager`) is not in Tauri state on this host.
+    LifecycleStateMissing,
+    /// Leg 3: no OPEN lifecycle record on the workdir — not
+    /// runner-attributable by construction (see the type doc).
+    LifecycleNoRecord,
+    /// Leg 3: records matched the workdir, none with a trusted anchor origin
+    /// ([`lifecycle_record_anchor_is_trusted`]).
+    LifecycleUnadmitted,
+    /// Leg 3: admitted records exist, none with a uuid anchor.
+    LifecycleAnchorNotUuid,
+    /// Leg 3: more than one admitted session on the workdir, a backing
+    /// terminal contested by another session, or two live lanes for one
+    /// session. REFUSED — the client's pick is not consulted for the lane.
+    LifecycleAmbiguous,
+    /// Leg 3: the admitted record's terminal(s) are no longer held by the
+    /// `TerminalManager`.
+    LifecycleTerminalGone,
+    /// Leg 3: the admitted record's terminal is live but carries no
+    /// `coord.sessions` mirror.
+    LifecycleTerminalHasNoCoordSession,
+    /// Leg 3: the call's own resolved caller session names a DIFFERENT
+    /// session than the workdir's lone admitted record — a session beside it
+    /// (see [`event_lane_lifecycle_leg`]). REFUSED rather than filed under the
+    /// candidate's lane.
+    LifecycleCallerDisagrees,
 }
 
 impl EventLaneMiss {
@@ -4650,6 +4867,14 @@ impl EventLaneMiss {
             Self::NoTaskRun => "no_task_run",
             Self::AiSessionUnregistered => "ai_session_unregistered",
             Self::AiAmbiguousWorkdir => "ai_ambiguous_workdir",
+            Self::LifecycleStateMissing => "lifecycle_state_missing",
+            Self::LifecycleNoRecord => "lifecycle_no_record",
+            Self::LifecycleUnadmitted => "lifecycle_unadmitted",
+            Self::LifecycleAnchorNotUuid => "lifecycle_anchor_not_uuid",
+            Self::LifecycleAmbiguous => "lifecycle_ambiguous",
+            Self::LifecycleTerminalGone => "lifecycle_terminal_gone",
+            Self::LifecycleTerminalHasNoCoordSession => "lifecycle_terminal_has_no_coord_session",
+            Self::LifecycleCallerDisagrees => "lifecycle_caller_disagrees",
         }
     }
 
@@ -4666,6 +4891,14 @@ impl EventLaneMiss {
             | Self::NoTaskRun
             | Self::AiSessionUnregistered
             | Self::AiAmbiguousWorkdir => "ai_plane",
+            Self::LifecycleStateMissing
+            | Self::LifecycleNoRecord
+            | Self::LifecycleUnadmitted
+            | Self::LifecycleAnchorNotUuid
+            | Self::LifecycleAmbiguous
+            | Self::LifecycleTerminalGone
+            | Self::LifecycleTerminalHasNoCoordSession
+            | Self::LifecycleCallerDisagrees => "lifecycle",
         }
     }
 
@@ -4683,12 +4916,20 @@ impl EventLaneMiss {
             Self::NoTaskRun => 6,
             Self::AiSessionUnregistered => 7,
             Self::AiAmbiguousWorkdir => 8,
+            Self::LifecycleStateMissing => 9,
+            Self::LifecycleNoRecord => 10,
+            Self::LifecycleUnadmitted => 11,
+            Self::LifecycleAnchorNotUuid => 12,
+            Self::LifecycleAmbiguous => 13,
+            Self::LifecycleTerminalGone => 14,
+            Self::LifecycleTerminalHasNoCoordSession => 15,
+            Self::LifecycleCallerDisagrees => 16,
         }
     }
 
     /// Every miss, in counter-slot order — `ALL[i].index() == i`, asserted in
     /// the tests so the two orderings cannot drift.
-    const ALL: [Self; 9] = [
+    const ALL: [Self; 17] = [
         Self::NoNonce,
         Self::NoTerminalManager,
         Self::TerminalGone,
@@ -4698,6 +4939,14 @@ impl EventLaneMiss {
         Self::NoTaskRun,
         Self::AiSessionUnregistered,
         Self::AiAmbiguousWorkdir,
+        Self::LifecycleStateMissing,
+        Self::LifecycleNoRecord,
+        Self::LifecycleUnadmitted,
+        Self::LifecycleAnchorNotUuid,
+        Self::LifecycleAmbiguous,
+        Self::LifecycleTerminalGone,
+        Self::LifecycleTerminalHasNoCoordSession,
+        Self::LifecycleCallerDisagrees,
     ];
 }
 
@@ -4939,7 +5188,7 @@ fn record_coord_transport_rung(
         // that never reached `main.rs`'s install). Nothing to record into.
         return;
     };
-    let lane = match resolve_event_lane_session_id(app, nonce) {
+    let lane = match resolve_event_lane_session_id(app, nonce, caller_session_id) {
         Ok(lane) => lane,
         Err(miss) => {
             // A dropped observation has to be IDENTIFIABLE, or "the runner
@@ -5155,9 +5404,39 @@ fn select_lifecycle_caller_censused(
     workdir: &str,
     target_canon: Option<&std::path::Path>,
 ) -> (Result<uuid::Uuid, LifecycleMiss>, LifecycleMissCensus) {
+    let (result, census) = select_lifecycle_candidate_censused(records, workdir, target_canon);
+    (result.map(|c| c.session), census)
+}
+
+/// The single admitted lifecycle candidate for a workdir, WITH the terminals
+/// whose records back it — what [`select_lifecycle_caller_censused`] projects
+/// to a bare uuid, and what the event lane's lifecycle leg
+/// ([`event_lane_lifecycle_leg`]) needs to reach a `coord.sessions.id`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LifecycleCandidate {
+    /// The admitted anchor (the `coord.agent_sessions.id`).
+    session: uuid::Uuid,
+    /// DISTINCT `terminal_id`s of the admitted records naming `session`, in
+    /// record order. Usually one; more when a session was resumed into a new
+    /// terminal while its old record is still `open`.
+    terminal_ids: Vec<String>,
+}
+
+/// THE lifecycle admission implementation — both the caller-identity chain
+/// ([`select_lifecycle_caller_censused`]) and the event lane
+/// ([`event_lane_lifecycle_leg`]) decide through this one loop, so the two
+/// can never disagree about which record a workdir's caller is.
+fn select_lifecycle_candidate_censused(
+    records: &[crate::session::session_lifecycle_store::TerminalSessionRecord],
+    workdir: &str,
+    target_canon: Option<&std::path::Path>,
+) -> (
+    Result<LifecycleCandidate, LifecycleMiss>,
+    LifecycleMissCensus,
+) {
     let mut matched = 0usize;
     let mut admitted = 0usize;
-    let mut candidates: Vec<uuid::Uuid> = Vec::new();
+    let mut candidates: Vec<LifecycleCandidate> = Vec::new();
     for rec in records {
         let Some(dir) = rec.working_dir.as_deref() else {
             continue;
@@ -5178,8 +5457,16 @@ fn select_lifecycle_caller_censused(
         };
         // Distinct ids only: two records naming the SAME session are one
         // candidate, not an ambiguity.
-        if !candidates.contains(&sid) {
-            candidates.push(sid);
+        match candidates.iter_mut().find(|c| c.session == sid) {
+            Some(c) => {
+                if !c.terminal_ids.contains(&rec.terminal_id) {
+                    c.terminal_ids.push(rec.terminal_id.clone());
+                }
+            }
+            None => candidates.push(LifecycleCandidate {
+                session: sid,
+                terminal_ids: vec![rec.terminal_id.clone()],
+            }),
         }
     }
     let census = LifecycleMissCensus {
@@ -5194,8 +5481,10 @@ fn select_lifecycle_caller_censused(
     } else {
         match candidates.len() {
             0 => Err(LifecycleMiss::AnchorNotUuid),
-            1 => Ok(candidates[0]),
-            _ => Err(LifecycleMiss::Ambiguous(candidates)),
+            1 => Ok(candidates.swap_remove(0)),
+            _ => Err(LifecycleMiss::Ambiguous(
+                candidates.into_iter().map(|c| c.session).collect(),
+            )),
         }
     };
     (result, census)
@@ -5267,20 +5556,23 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 /// operator: "agents should have all drain tools"; evidence finding
 /// `f802311d-aef5-40e8-a5f8-4bd3a554b37e`) makes handing them to every agent
 /// the intent, so that rationale no longer holds. coord's half of the decision
-/// puts all five on `DEVICE_DEFAULT_TOOLS`; it is NOT on coord `origin/main` as
-/// of this change (`DEVICE_FLOOR_PRIVILEGED_EXCLUSIONS` still fences the four
-/// writes off the device floor). coord stays the gate on who may call them; what bounds
+/// puts all five on `DEVICE_DEFAULT_TOOLS` and takes the four writes out of
+/// `DEVICE_FLOOR_PRIVILEGED_EXCLUSIONS`; it landed on coord `main` as
+/// qontinui-coord#3729 (`b0b01bc1d`), after this list's change. Landed is not
+/// served: a coord deployment predating it still fences the four writes off the
+/// device floor. coord stays the gate on who may call them; what bounds
 /// a call is coord's, unchanged from `decision_record/fleet-drain-agent-authority`:
 /// the ownership floor (the device is in the caller's tenant), the redacted
 /// `drained_by`, an unreadable drain set never reading `Clear`, and the mandatory
 /// `until`, so every drain is reversible and self-expiring. Prefer a lane-scoped
 /// drain (`lanes: ["agent"]`) when only spawns need holding, so CI keeps running.
-/// Forwarding ahead of coord's floor change: until it lands, coord itself
-/// refuses a device principal and an agent curated by a role template, while a
-/// row-less (un-curated) agent, whose catalog is coord's whole surface, gains
-/// the levers at once. That is the outcome the decision intends, not a leak.
-/// Until then a device's `tools/list` will not advertise the four writes, so
-/// they show in `coordMcpForwardedUnadvertised`; that is expected, not drift.
+/// Against such a pre-#3729 coord, coord itself refuses a device principal and
+/// an agent curated by a role template, while a row-less (un-curated) agent,
+/// whose catalog is coord's whole surface, holds the levers regardless. That is
+/// the outcome the decision intends, not a leak. On that coord a device's
+/// `tools/list` does not advertise the four writes, so they show in
+/// `coordMcpForwardedUnadvertised`; that is a coord-deployment lag, not drift
+/// here, and it should clear once the serving coord contains `b0b01bc1d`.
 ///
 /// LOAD-BEARING, do not strip as "reads nobody uses": `coord_list_prompt_documents`
 /// and `coord_get_prompt_document` are how the fleet reads served POLICY, and the
@@ -5552,11 +5844,22 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 ///
 /// `coord_correct_gate` is IN for the same gate-verb family's reason (plan
 /// `2026-09-21-a-cleared-gate-is-uncorrectable-and-every-repair-mints-another-false-green-row`
-/// Phase 8). It corrects a CLEARED gate's recorded predicate or outcome. A
-/// correction is INSERT-only (it appends a correcting row, never edits history),
-/// applies to cleared gates only, and cannot release work: it clears nothing and
-/// approves nothing. Withheld, a cleared-gate error could only be repaired by
-/// registering another gate, which is the false-green row the plan exists to stop.
+/// Phase 8). It does NOT correct a gate's predicate or outcome: it records a
+/// `mispredicated` annotation for a CLEARED gate, one row INSERTed into
+/// `coord.gate_corrections`, optionally naming the replacement gate. `coord.gates`
+/// is never touched, so the gate's recorded verdict stays byte-identical (coord
+/// `correct_gate_core`). It applies to cleared gates only and releases no work:
+/// it clears nothing and approves nothing. Nor does it replace registering the
+/// replacement gate, which is still owed; it only lowers the standing of the
+/// green row the wrong question produced. Withheld, that row could be answered
+/// only by another registration, the false-green repeat the plan exists to stop.
+///
+/// It carries a risk `coord_repoint_gate` above does not: there is NO registrant
+/// rule. Any device session in the tenant may irrevocably annotate any cleared
+/// gate in the tenant, with free agent-authored `reason` text served verbatim to
+/// readers, and coord tiers it `GateActionTier::Silent`, so no notification
+/// fires. coord's own grant and its `correct_gate_core` risk model are the
+/// authority on that trade; forwarding it here widens nothing coord did not.
 ///
 /// `coord_citations_reenrich` is IN because it is a SHIPPED REPAIR ROUTE, and a
 /// repair route an agent cannot reach is the defect it was built to close (plan
@@ -5939,6 +6242,7 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_send_message",
     "coord_session_obligations",
     "coord_session_worktrees",
+    "coord_sessions_unfinished",
     "coord_set_gate_audience",
     "coord_signature",
     "coord_slo_metrics",
@@ -11238,6 +11542,7 @@ struct ProvisionSessionBody {
 /// | Status | `code` | Meaning |
 /// |---|---|---|
 /// | 400 | `COORD_MCP_PROVISION_INVALID_BODY` | body is not `{cwd:String, tenant?:Uuid}` — `tenant_id` is accepted as an alias for `tenant`; a non-UUID tenant, both spellings at once, and any other key all land here |
+/// | 400 | `INVALID_UTF8` | body is not UTF-8 (e.g. a non-ASCII `cwd` sent by Git Bash `curl -d` in the ANSI code page); the message names the encoding remedy |
 /// | 400 | `COORD_MCP_PROVISION_INVALID_CWD` | `cwd` empty or not an existing dir |
 /// | 403 | `COORD_MCP_PROVISION_NO_HANDSHAKE` | no (or empty) `X-Qontinui-Loopback-Key` header |
 /// | 403 | `COORD_MCP_PROVISION_HANDSHAKE_MISMATCH` | handshake presented, not this runner start's key |
@@ -11314,6 +11619,13 @@ fn provision_session_after_gate(body: &[u8]) -> axum::response::Response {
     let req: ProvisionSessionBody = match serde_json::from_slice(body) {
         Ok(r) => r,
         Err(e) => {
+            // A `cwd` under a non-ASCII Windows profile dir, sent by Git Bash
+            // `curl -d`, arrives in the ANSI code page — an ENCODING problem,
+            // not a shape one. Same diagnosis as every other JSON door
+            // (`envelope::invalid_utf8_message`).
+            if let Some(msg) = crate::mcp::envelope::invalid_utf8_message(&e.to_string()) {
+                return crate::mcp::envelope::envelope_400_invalid_utf8(msg).into_response();
+            }
             return provision_refusal(
                 axum::http::StatusCode::BAD_REQUEST,
                 "COORD_MCP_PROVISION_INVALID_BODY",
@@ -11576,6 +11888,14 @@ async fn vcs_create_pull_request_handler(
     let req: VcsPullRequestBody = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(e) => {
+            // A body that is not UTF-8 is an ENCODING problem, not a shape
+            // one — the same diagnosis the `Json<T>` extractor paths and the
+            // plan-library write door give (`envelope::invalid_utf8_message`).
+            // PR bodies are full of em dashes, which Git Bash curl sends as
+            // the single ANSI byte `0x97`.
+            if let Some(msg) = crate::mcp::envelope::invalid_utf8_message(&e.to_string()) {
+                return crate::mcp::envelope::envelope_400_invalid_utf8(msg).into_response();
+            }
             return (
                 axum::http::StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({
@@ -14105,12 +14425,18 @@ pub fn create_router(
 /// hint pointing at the two self-describing endpoints (`/ui-bridge/_routes` for
 /// the route manifest, `/ui-bridge/commands` for invokable commands) so a caller
 /// that fat-fingered a route can find the real one without grepping the source.
-/// Non-`/ui-bridge/` paths keep the bare message unchanged.
+/// When the path names a route the UI Bridge deliberately deleted, the message
+/// first says so and names the replacement (table:
+/// `mcp::ui_bridge::removed_routes::REMOVED_UI_BRIDGE_ROUTES`), then keeps the
+/// discovery hint. Non-`/ui-bridge/` paths keep the bare message unchanged.
 fn not_found_message(method: &axum::http::Method, path: &str) -> String {
     let base = format!("No route for {} {}", method, path);
     if path.starts_with("/ui-bridge/") {
+        let removed = crate::mcp::ui_bridge::removed_routes::removed_route_replacement(path)
+            .map(|replacement| format!(" — this route was removed; use {replacement}"))
+            .unwrap_or_default();
         format!(
-            "{base} — discover routes at GET /ui-bridge/_routes, \
+            "{base}{removed} — discover routes at GET /ui-bridge/_routes, \
              invokable commands at GET /ui-bridge/commands"
         )
     } else {
@@ -14766,6 +15092,23 @@ mod transport_rung_counter_tests {
         assert_only_this_series_moves(EventLaneMiss::AiAmbiguousWorkdir);
     }
 
+    /// Phase 2's leg-3 series, each moving only itself.
+    #[test]
+    fn lane_miss_lifecycle_series_each_move_only_themselves() {
+        for miss in [
+            EventLaneMiss::LifecycleStateMissing,
+            EventLaneMiss::LifecycleNoRecord,
+            EventLaneMiss::LifecycleUnadmitted,
+            EventLaneMiss::LifecycleAnchorNotUuid,
+            EventLaneMiss::LifecycleAmbiguous,
+            EventLaneMiss::LifecycleTerminalGone,
+            EventLaneMiss::LifecycleTerminalHasNoCoordSession,
+            EventLaneMiss::LifecycleCallerDisagrees,
+        ] {
+            assert_only_this_series_moves(miss);
+        }
+    }
+
     /// `ALL[i].index() == i`, and every label is distinct — the two orderings
     /// (and the `/health` keys) cannot drift.
     #[test]
@@ -14824,6 +15167,23 @@ mod transport_rung_counter_tests {
                 Some(0),
                 "GET /health transportRung.laneMiss is missing `{}` (or it is not zero)",
                 miss.as_str()
+            );
+        }
+        // Phase 2's leg-3 keys, spelled out: a consumer greps for these
+        // literal names, so a renamed label must fail here, not in a dashboard.
+        for key in [
+            "lifecycle_state_missing",
+            "lifecycle_no_record",
+            "lifecycle_unadmitted",
+            "lifecycle_anchor_not_uuid",
+            "lifecycle_ambiguous",
+            "lifecycle_terminal_gone",
+            "lifecycle_terminal_has_no_coord_session",
+        ] {
+            assert_eq!(
+                misses.get(key).and_then(|v| v.as_u64()),
+                Some(0),
+                "GET /health transportRung.laneMiss is missing `{key}` at zero"
             );
         }
         assert_eq!(snap["emitted"], serde_json::json!(0));
@@ -15274,7 +15634,8 @@ mod transport_rung_counter_tests {
 #[cfg(test)]
 mod self_id_chain_tests {
     use super::{
-        event_lane_terminal_leg, select_lifecycle_caller, select_lifecycle_caller_censused,
+        event_lane_lifecycle_leg, event_lane_terminal_leg, select_lifecycle_caller,
+        select_lifecycle_caller_censused, select_lifecycle_candidate_censused,
         select_terminal_caller, self_id_health_snapshot, self_id_miss_sample_dirs,
         self_id_miss_samples, settle_ambiguity, settle_lifecycle_selection, settle_terminal_leg,
         terminal_leg, terminal_leg_verdict, AmbiguousKey, ClientAssertion, EventLaneLeg,
@@ -16007,17 +16368,7 @@ mod self_id_chain_tests {
     /// (deferred) `/health` counter.
     #[test]
     fn event_lane_miss_labels_are_distinct_and_name_their_leg() {
-        let all = [
-            EventLaneMiss::NoNonce,
-            EventLaneMiss::NoTerminalManager,
-            EventLaneMiss::TerminalGone,
-            EventLaneMiss::TerminalHasNoCoordSession,
-            EventLaneMiss::NoWorkdir,
-            EventLaneMiss::AiPlaneStateMissing,
-            EventLaneMiss::NoTaskRun,
-            EventLaneMiss::AiSessionUnregistered,
-            EventLaneMiss::AiAmbiguousWorkdir,
-        ];
+        let all = EventLaneMiss::ALL;
         let mut labels: Vec<&str> = all.iter().map(|m| m.as_str()).collect();
         labels.sort_unstable();
         let count = labels.len();
@@ -16025,7 +16376,7 @@ mod self_id_chain_tests {
         assert_eq!(labels.len(), count, "event-lane miss labels must be unique");
         for miss in all {
             assert!(
-                matches!(miss.leg(), "nonce" | "terminal" | "ai_plane"),
+                matches!(miss.leg(), "nonce" | "terminal" | "ai_plane" | "lifecycle"),
                 "{} named an unknown leg {}",
                 miss.as_str(),
                 miss.leg()
@@ -16033,6 +16384,241 @@ mod self_id_chain_tests {
         }
         assert_eq!(EventLaneMiss::TerminalGone.leg(), "terminal");
         assert_eq!(EventLaneMiss::NoTaskRun.leg(), "ai_plane");
+        assert_eq!(EventLaneMiss::LifecycleAmbiguous.leg(), "lifecycle");
+        assert_eq!(EventLaneMiss::LifecycleNoRecord.leg(), "lifecycle");
+    }
+
+    // ---- Phase 2: the event lane's lifecycle leg (leg 3) -------------------
+
+    /// The combination of the workdir lookup and leg 3: only a workdir NO
+    /// session claims may reach the lifecycle store; an ambiguous one is
+    /// refused as its own series (never leg 3, never a lane), and a found task
+    /// run keeps its own lane.
+    #[test]
+    fn only_a_workdir_nobody_claims_reaches_the_lifecycle_leg() {
+        use super::{event_lane_after_workdir_lookup, WorkdirLegNext};
+        use crate::claude_session::WorkdirTaskRun;
+        assert_eq!(
+            event_lane_after_workdir_lookup(WorkdirTaskRun::NoCandidate),
+            WorkdirLegNext::TryLifecycle
+        );
+        assert_eq!(
+            event_lane_after_workdir_lookup(WorkdirTaskRun::Ambiguous),
+            WorkdirLegNext::Refuse(EventLaneMiss::AiAmbiguousWorkdir)
+        );
+        assert_eq!(
+            event_lane_after_workdir_lookup(WorkdirTaskRun::Found("t".to_string())),
+            WorkdirLegNext::TaskRun("t".to_string())
+        );
+        assert_eq!(EventLaneMiss::AiAmbiguousWorkdir.leg(), "ai_plane");
+    }
+
+    /// A lifecycle record for `csid` on `D:/repo`, hosted by terminal `tid`.
+    fn lane_rec(csid: &str, tid: &str) -> TerminalSessionRecord {
+        TerminalSessionRecord {
+            terminal_id: tid.to_string(),
+            ..rec(csid, Some("D:/repo"), 10)
+        }
+    }
+
+    /// THE Phase-2 fix: a terminal-less binding whose workdir hosts exactly
+    /// one admitted open record, whose terminal is live and mirrored, now has
+    /// a lane — so a rung row is emitted instead of `no_task_run`.
+    #[test]
+    fn lifecycle_leg_resolves_the_single_admitted_records_terminal_lane() {
+        let lane = uuid::Uuid::now_v7();
+        let records = [lane_rec(ANCHOR_A, "T1")];
+        let mut probed = Vec::new();
+        let got = event_lane_lifecycle_leg(&records, "D:/repo", None, None, |tid| {
+            probed.push(tid.to_string());
+            TerminalLaneProbe::Live(Some(lane))
+        });
+        assert_eq!(got, Ok(lane));
+        assert_eq!(
+            probed,
+            vec!["T1".to_string()],
+            "must probe the record's terminal"
+        );
+        // The lane is the TERMINAL's coord.sessions id, not the anchor (a
+        // coord.agent_sessions id — the wrong id space for session_events).
+        assert_ne!(got, Ok(uuid_of(ANCHOR_A)));
+    }
+
+    /// The call's resolved caller is a DIFFERENT session than the lone
+    /// admitted record: a session sitting beside it (a plain-shell `claude` on
+    /// the in-cwd `.mcp.json`). Refused before any terminal is probed, so the
+    /// row can never carry the candidate's lane beside another session's id.
+    #[test]
+    fn lifecycle_leg_refuses_a_caller_naming_another_session() {
+        let records = [lane_rec(ANCHOR_A, "T1")];
+        assert_eq!(
+            event_lane_lifecycle_leg(
+                &records,
+                "D:/repo",
+                None,
+                Some(uuid_of(ANCHOR_B)),
+                |_| unreachable!("a contradicting caller must not reach the terminal probe"),
+            ),
+            Err(EventLaneMiss::LifecycleCallerDisagrees)
+        );
+    }
+
+    /// A caller that names the candidate itself still resolves its lane, so
+    /// the refusal above cannot swallow the ordinary interactive case.
+    #[test]
+    fn lifecycle_leg_resolves_when_the_caller_is_the_candidate() {
+        let lane = uuid::Uuid::now_v7();
+        let records = [lane_rec(ANCHOR_A, "T1")];
+        assert_eq!(
+            event_lane_lifecycle_leg(&records, "D:/repo", None, Some(uuid_of(ANCHOR_A)), |_| {
+                TerminalLaneProbe::Live(Some(lane))
+            }),
+            Ok(lane)
+        );
+    }
+
+    /// Two admitted sessions on one workdir: no lane, and the client's pick
+    /// never chooses between them (the caller id can only REFUSE a lane).
+    #[test]
+    fn lifecycle_leg_refuses_two_admitted_records_on_the_workdir() {
+        let records = [lane_rec(ANCHOR_A, "T1"), lane_rec(ANCHOR_B, "T2")];
+        assert_eq!(
+            event_lane_lifecycle_leg(&records, "D:/repo", None, None, |_| unreachable!(
+                "an ambiguous workdir must not reach the terminal probe"
+            )),
+            Err(EventLaneMiss::LifecycleAmbiguous)
+        );
+    }
+
+    #[test]
+    fn lifecycle_leg_reports_no_record() {
+        let elsewhere = [TerminalSessionRecord {
+            terminal_id: "T9".to_string(),
+            ..rec(ANCHOR_A, Some("D:/other"), 10)
+        }];
+        for records in [&[][..], &elsewhere[..]] {
+            assert_eq!(
+                event_lane_lifecycle_leg(records, "D:/repo", None, None, |_| unreachable!()),
+                Err(EventLaneMiss::LifecycleNoRecord)
+            );
+        }
+    }
+
+    #[test]
+    fn lifecycle_leg_reports_a_gone_terminal() {
+        let records = [lane_rec(ANCHOR_A, "T1")];
+        assert_eq!(
+            event_lane_lifecycle_leg(&records, "D:/repo", None, None, |_| TerminalLaneProbe::Gone),
+            Err(EventLaneMiss::LifecycleTerminalGone)
+        );
+    }
+
+    #[test]
+    fn lifecycle_leg_reports_a_live_terminal_without_a_coord_session() {
+        let records = [lane_rec(ANCHOR_A, "T1")];
+        assert_eq!(
+            event_lane_lifecycle_leg(
+                &records,
+                "D:/repo",
+                None,
+                None,
+                |_| TerminalLaneProbe::Live(None)
+            ),
+            Err(EventLaneMiss::LifecycleTerminalHasNoCoordSession)
+        );
+        assert_eq!(
+            event_lane_lifecycle_leg(&records, "D:/repo", None, None, |_| {
+                TerminalLaneProbe::NoManager
+            }),
+            Err(EventLaneMiss::LifecycleStateMissing)
+        );
+    }
+
+    /// The admission rules are the caller chain's own: an untrusted anchor on
+    /// the workdir is unadmitted, a non-uuid one is not a candidate.
+    #[test]
+    fn lifecycle_leg_shares_the_caller_chains_admission_rules() {
+        let reconciled = [TerminalSessionRecord {
+            terminal_id: "T1".to_string(),
+            ..rec_with_origin(ANCHOR_A, Some("D:/repo"), Some(ORIGIN_RECONCILED))
+        }];
+        assert_eq!(
+            event_lane_lifecycle_leg(&reconciled, "D:/repo", None, None, |_| unreachable!()),
+            Err(EventLaneMiss::LifecycleUnadmitted)
+        );
+        let not_uuid = [lane_rec("not-a-uuid", "T1")];
+        assert_eq!(
+            event_lane_lifecycle_leg(&not_uuid, "D:/repo", None, None, |_| unreachable!()),
+            Err(EventLaneMiss::LifecycleAnchorNotUuid)
+        );
+    }
+
+    /// A backing terminal that ANOTHER admitted session also claims (a stale
+    /// open row on a reused terminal, recorded under a different workdir) is
+    /// contested: its lane may be the other session's, so refuse.
+    #[test]
+    fn lifecycle_leg_refuses_a_contested_terminal() {
+        let records = [
+            lane_rec(ANCHOR_A, "T1"),
+            TerminalSessionRecord {
+                terminal_id: "T1".to_string(),
+                ..rec(ANCHOR_B, Some("D:/other"), 10)
+            },
+        ];
+        assert_eq!(
+            event_lane_lifecycle_leg(
+                &records,
+                "D:/repo",
+                None,
+                None,
+                |_| TerminalLaneProbe::Live(Some(uuid::Uuid::now_v7()))
+            ),
+            Err(EventLaneMiss::LifecycleAmbiguous)
+        );
+    }
+
+    /// One session backed by two terminals (resumed into a new one while the
+    /// old record stayed open): the one live lane wins; two live lanes refuse.
+    #[test]
+    fn lifecycle_leg_takes_the_one_live_lane_among_a_sessions_terminals() {
+        let lane = uuid::Uuid::now_v7();
+        let records = [lane_rec(ANCHOR_A, "T-old"), lane_rec(ANCHOR_A, "T-new")];
+        assert_eq!(
+            event_lane_lifecycle_leg(&records, "D:/repo", None, None, |tid| match tid {
+                "T-new" => TerminalLaneProbe::Live(Some(lane)),
+                _ => TerminalLaneProbe::Gone,
+            }),
+            Ok(lane)
+        );
+        assert_eq!(
+            event_lane_lifecycle_leg(
+                &records,
+                "D:/repo",
+                None,
+                None,
+                |_| TerminalLaneProbe::Live(Some(uuid::Uuid::now_v7()))
+            ),
+            Err(EventLaneMiss::LifecycleAmbiguous)
+        );
+    }
+
+    /// The caller-identity chain is unchanged by the refactor that lets the
+    /// lane share its admission loop: same verdicts, same census.
+    #[test]
+    fn caller_selector_is_a_projection_of_the_shared_candidate_selector() {
+        let fixtures: Vec<Vec<TerminalSessionRecord>> = vec![
+            vec![],
+            vec![lane_rec(ANCHOR_A, "T1")],
+            vec![lane_rec(ANCHOR_A, "T1"), lane_rec(ANCHOR_A, "T2")],
+            vec![lane_rec(ANCHOR_A, "T1"), lane_rec(ANCHOR_B, "T2")],
+            vec![lane_rec(ANCHOR_C, "T1"), lane_rec("x", "T2")],
+        ];
+        for records in fixtures {
+            let (caller, c1) = select_lifecycle_caller_censused(&records, "D:/repo", None);
+            let (cand, c2) = select_lifecycle_candidate_censused(&records, "D:/repo", None);
+            assert_eq!(caller, cand.map(|c| c.session));
+            assert_eq!(c1, c2);
+        }
     }
 
     /// The terminal leg applies the anchor-trust guard too. Being the UNIQUE
@@ -18488,11 +19074,11 @@ mod coord_mcp_body_gate_tests {
             // The registrant-only re-point (coord#2056): the only way to carry a
             // superseded gate's continuation onto the replacement PR.
             "coord_repoint_gate",
-            // INSERT-only correction of a CLEARED gate; releases nothing.
-            "coord_correct_gate",
             // ...and the declaration that authorizes a NON-registrant re-point
             // of a superseded PR's system-registered gate.
             "coord_declare_supersession",
+            // INSERT-only annotation of a CLEARED gate; releases nothing.
+            "coord_correct_gate",
             // P4's own addition: mutates nothing, so neither dial-governed nor
             // notifying.
             "coord_gate_doctor",
@@ -20767,6 +21353,22 @@ mod coord_provision_session_gate_tests {
         }
     }
 
+    /// A body that is not UTF-8 — a non-ASCII `cwd` Git Bash curl sent in the
+    /// ANSI code page (`0xE9` for `é`) — answers `INVALID_UTF8` with the
+    /// encoding remedy, not `COORD_MCP_PROVISION_INVALID_BODY`.
+    #[tokio::test]
+    async fn a_non_utf8_body_is_invalid_utf8_not_invalid_body() {
+        let _amb = crate::test_env::isolated_ambient();
+        let resp = super::provision_session_after_gate(b"{\"cwd\":\"C:/Users/Jos\xe9\"}");
+        assert_eq!(resp.status(), 400);
+        let v = body_json(resp).await;
+        assert_eq!(v["code"], "INVALID_UTF8");
+        assert!(v["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("request body is not valid UTF-8"));
+    }
+
     /// The route-level half of `659b574a`: the measured defect was
     /// `{"cwd", "tenant_id": <unpaired>}` answering **200** with a document
     /// minted on the default slot. Through the post-gate half it must now be the
@@ -22567,6 +23169,39 @@ mod vcs_pr_proxy_tests {
         assert_eq!(v["code"], "VCS_PR_PROXY_UNAUTHORIZED");
     }
 
+    /// A PR body that is not UTF-8 (the `0x97` em dash Git Bash curl sends)
+    /// answers `INVALID_UTF8` with the encoding remedy, not the generic
+    /// `VCS_PR_PROXY_BAD_REQUEST` deserialize text.
+    #[tokio::test]
+    async fn non_utf8_pr_body_answers_invalid_utf8() {
+        let _amb = crate::test_env::isolated_ambient();
+        let nonce = crate::coord_mcp::register_agent_proxy_nonce(
+            "/tmp/vcs-pr-proxy-invalid-utf8-test",
+            uuid::Uuid::new_v4(),
+        );
+        let resp = vcs_router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/vcs/pull-requests")
+                    .header("X-Coord-Mcp-Proxy-Key", &nonce)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        &b"{\"repo\":\"a/b\",\"head\":\"h\",\"title\":\"a \x97 b\"}"[..],
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        let v = body_json(resp).await;
+        assert_eq!(v["code"], "INVALID_UTF8");
+        assert!(v["error"]
+            .as_str()
+            .unwrap()
+            .contains("request body is not valid UTF-8"));
+    }
+
     /// An AGENT-bound nonce is ACCEPTED by the principal gate (coord-spawned
     /// agent sessions are this feature's primary population — coord's upstream
     /// route takes agent JWTs too). With no live token slot registered for the
@@ -23041,6 +23676,86 @@ mod not_found_message_tests {
     fn non_ui_bridge_path_is_unchanged() {
         let msg = not_found_message(&Method::POST, "/api/v1/whatever");
         assert_eq!(msg, "No route for POST /api/v1/whatever");
+    }
+
+    /// An unknown path that was never a route keeps the plain discovery hint
+    /// and does not claim a removal.
+    #[test]
+    fn unknown_ui_bridge_path_does_not_claim_removal() {
+        let msg = not_found_message(&Method::POST, "/ui-bridge/control/screenshots");
+        assert_eq!(
+            msg,
+            "No route for POST /ui-bridge/control/screenshots — discover routes at \
+             GET /ui-bridge/_routes, invokable commands at GET /ui-bridge/commands"
+        );
+    }
+
+    /// Every deliberately removed route's 404 says it was removed, names the
+    /// replacement capture route and where its bytes live, and still carries
+    /// the discovery hint after it.
+    #[test]
+    fn removed_ui_bridge_route_names_its_replacement() {
+        use crate::mcp::ui_bridge::removed_routes::REMOVED_UI_BRIDGE_ROUTES;
+        // Guards an emptied table, which would make the loop below vacuous. A
+        // count floor went stale the first time an entry was dropped.
+        assert!(!REMOVED_UI_BRIDGE_ROUTES.is_empty());
+        for (removed, _) in REMOVED_UI_BRIDGE_ROUTES {
+            let path = match removed.strip_suffix("/*") {
+                Some(root) => format!("{root}/audit/accessibility"),
+                None => (*removed).to_string(),
+            };
+            let msg = not_found_message(&Method::POST, &path);
+            assert!(
+                msg.starts_with(&format!(
+                    "No route for POST {path} — this route was removed; use "
+                )),
+                "{path}: {msg}"
+            );
+            assert!(
+                msg.contains("POST /ui-bridge/vision/capture"),
+                "{path}: {msg}"
+            );
+            assert!(
+                msg.contains("GET /ui-bridge/vision/cache/{sha256}"),
+                "{path}: {msg}"
+            );
+            assert!(
+                msg.ends_with(
+                    "— discover routes at GET /ui-bridge/_routes, \
+                     invokable commands at GET /ui-bridge/commands"
+                ),
+                "{path}: {msg}"
+            );
+        }
+    }
+
+    /// Route level: a removed route still answers 404 / `NOT_FOUND` through
+    /// the real fallback handler — only the message text changed.
+    #[tokio::test]
+    async fn removed_route_404_keeps_status_and_code() {
+        use axum::{body::Body, http::Request, Router};
+        use tower::ServiceExt;
+        let resp = Router::new()
+            .fallback(super::not_found_handler)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/ui-bridge/control/screenshot")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["success"], false);
+        assert_eq!(v["code"], "NOT_FOUND");
+        let error = v["error"].as_str().unwrap();
+        assert!(error.starts_with("No route for POST /ui-bridge/control/screenshot"));
+        assert!(error.contains("POST /ui-bridge/vision/capture"), "{error}");
     }
 }
 

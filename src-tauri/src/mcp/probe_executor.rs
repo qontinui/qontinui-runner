@@ -275,7 +275,12 @@ pub fn newest_mtime_secs_ago(root: &Path, now: SystemTime) -> Option<i64> {
 /// session — only reports dead when the WHOLE device is claude-free). PR 6
 /// tightens this to a session-scoped root pid.
 async fn runner_claude_alive() -> Option<bool> {
-    let snapshot = crate::process_capture::process_tree::snapshot_process_table_public().await;
+    // A fresh walk, never the memo: this reports ABSENCE (`false`) to coord.
+    let snapshot = crate::process_capture::process_tree::snapshot_process_table_fresh().await;
+    // An unreadable or stale table answers UNKNOWN, never "claude-free".
+    if snapshot.is_unknown() {
+        return None;
+    }
     let runner_pid = std::process::id();
     // reference=0 disables the PID-reuse skew guard (we check the live runner
     // itself, whose pid cannot have been reused under it).

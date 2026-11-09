@@ -8,7 +8,7 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 
 | class | rows | hits | unreviewed | fallback_correct | dev_only_surface | defect |
 |---|---:|---:|---:|---:|---:|---:|
-| `repo_layout` | 79 | 93 | 73 | 6 | 0 | 0 |
+| `repo_layout` | 80 | 94 | 71 | 9 | 0 | 0 |
 | `dev_ports` | 28 | 28 | 26 | 0 | 2 | 0 |
 | `supervisor_dependency` | 57 | 57 | 0 | 47 | 4 | 6 |
 | `tenant_literal` | 0 | 0 | 0 | 0 | 0 | 0 |
@@ -16,16 +16,16 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `fleet_host_name` | 0 | 0 | 0 | 0 | 0 | 0 |
 | `fleet_device_uuid` | 0 | 0 | 0 | 0 | 0 | 0 |
 | `plans_dir` | 34 | 35 | 34 | 0 | 0 | 0 |
-| `os_bound_tooling` | 100 | 101 | 96 | 4 | 0 | 0 |
+| `os_bound_tooling` | 103 | 104 | 96 | 7 | 0 | 0 |
 
-## `repo_layout` (79 rows)
+## `repo_layout` (80 rows)
 
 | file | symbol | excerpt | n | disposition | capability |
 |---|---|---|---:|---|---|
 | `src/agent_runtime.rs` | `continuation_fallback_workdir` | `.ok_or_else(\|\| "no QONTINUI_ROOT or canonical checkout resolved".to_string());` | 2 | unreviewed | — (no CAPABILITY_SPECS row) |
-| `src/agent_runtime.rs` | `provision_agent_definitions` | `"agent_runtime: no qontinui-root resolved; skipping .claude/agents \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
-| `src/agent_runtime.rs` | `provision_agent_definitions` | `"no qontinui-root resolved, so <root>/qontinui-claude-config/.claude/agents \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
-| `src/agent_runtime.rs` | `provision_agent_definitions_from_root` | `.join("qontinui-claude-config")` | 1 | unreviewed | `agent_definitions` |
+| `src/agent_runtime.rs` | `provision_agent_definitions_retiring` | `.join("qontinui-claude-config")` | 1 | fallback_correct — The checkout OVERLAY of agent definitions, read from <root>/qontinui-claude-config/.claude/agents only after a root resolved. A missing dir makes read_dir fail and the overlay contributes nothing; the embedded fleet_agents floor beneath it still provisions, and both layers report rows to the capability manifest. Reviewed when this row moved off the provision_agent_definitions_from_root key (same plan, Phase 6). | — (no CAPABILITY_SPECS row) |
+| `src/agent_runtime.rs` | `provision_agent_definitions_with_root` | `"agent_runtime: no qontinui-root resolved; skipping .claude/agents \` | 1 | fallback_correct — The no-root arm of agent-definition provisioning: with no qontinui-root it warns, records a capability_manifest Rung::Unresolved 'agent_definitions' row naming what was skipped (the normal state on a published install), still runs the retirement pass, and lets the spawn proceed. The embedded fleet_agents floor supplies the definitions there. Reviewed when these rows moved off the provision_agent_definitions key (plan 2026-11-06-what-the-fleet-records-and-advertises-matches-what-actually-ran Phase 6). | — (no CAPABILITY_SPECS row) |
+| `src/agent_runtime.rs` | `provision_agent_definitions_with_root` | `"no qontinui-root resolved, so <root>/qontinui-claude-config/.claude/agents \` | 1 | fallback_correct — The no-root arm of agent-definition provisioning: with no qontinui-root it warns, records a capability_manifest Rung::Unresolved 'agent_definitions' row naming what was skipped (the normal state on a published install), still runs the retirement pass, and lets the spawn proceed. The embedded fleet_agents floor supplies the definitions there. Reviewed when these rows moved off the provision_agent_definitions key (plan 2026-11-06-what-the-fleet-records-and-advertises-matches-what-actually-ran Phase 6). | — (no CAPABILITY_SPECS row) |
 | `src/agent_runtime.rs` | `run_condition_check_terminal` | `let reason = "no QONTINUI_ROOT resolved — nowhere to run the check from";` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/agent_skills/self_path.rs` | `self_path_hit` | `"reaches its own tree through a 'qontinui-claude-config' checkout".to_string(),` | 1 | unreviewed — Surfaced by fleet-nouns.toml (A6); not yet triaged. | — (no CAPABILITY_SPECS row) |
 | `src/agent_skills/self_path.rs` | `static CONFIG_REPO_CLAUDE_RE` | `Lazy::new(\|\| Regex::new(r"qontinui-claude-config[/\\]+\.claude\b").expect("arm A regex"));` | 1 | unreviewed — Surfaced by fleet-nouns.toml (A6); not yet triaged. | — (no CAPABILITY_SPECS row) |
@@ -48,6 +48,7 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `src/capability_manifest.rs` | `const CAPABILITY_SPECS` | `'<workspace-root>/qontinui-claude-config/.claude/agents/*.md' off \` | 2 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/capability_manifest.rs` | `const CAPABILITY_SPECS` | `copy is a no-op that logs \"no qontinui-root resolved; skipping \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/capability_manifest.rs` | `const CAPABILITY_SPECS` | `description: "Import of '<workspace-root>/qontinui-claude-config/.claude/commands/*.md' \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
+| `src/capability_manifest.rs` | `const CAPABILITY_SPECS` | `qontinui-claude-config's hourly 'fleet-agents-parity' gate \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/check_executor/command_builder.rs` | `build_devtools_command` | `Ok(("qontinui-devtools".to_string(), args))` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/ci_node/admission.rs` | `start_build` | `"QONTINUI_ROOT not resolvable on this device".to_string(),` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/commands/config.rs` | `get_workspace_paths_impl` | `.join("qontinui-claude-config")` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
@@ -208,7 +209,7 @@ _No hits._
 | `src/commands/setup_wizard.rs` | `const WINDOWS_MULTI_ACCOUNT_ROOT` | `const WINDOWS_MULTI_ACCOUNT_ROOT: &str = "C:\\claude";` | 1 | fallback_correct — Probes the fleet's C:\claude multi-account convention, read only on the Windows discovery layout (DiscoveryLayout); an absent dir reads as no accounts. Elsewhere the configured roster, CLAUDE_CONFIG_DIR and ~/.claude apply. Moved from the discover_claude_config_dirs key when the literal became this const (qontinui-runner#2544); same disposition. |
 | `src/mcp/test_fixtures.rs` | `const DEFAULT_TEST_CONFIG_DIR` | `const DEFAULT_TEST_CONFIG_DIR: &str = "C:\\claude\\.claude-test-fixture";` | 1 | dev_only_surface — Debug-gated test-fixture injection endpoints for manual UI testing. |
 | `src/projects/snapshot.rs` | `const NOISE_PREFIXES` | `const NOISE_PREFIXES: [&str; 1] = ["c:\\claude\\"];` | 1 | fallback_correct — Filters the operator's C:\claude agent-scratch rows out of project attribution; on another box it filters nothing, which only leaves some noise rows in the view. |
-| `src/session_archive/discovery.rs` | `discover_account_homes_from_env` | `Some(PathBuf::from("C:\\claude")),` | 1 | fallback_correct — Probes C:/claude behind is_dir() on every platform, per its own doc comment; false everywhere else. |
+| `src/session_archive/discovery.rs` | `claude_root_for` | `Some(PathBuf::from("C:\\claude"))` | 1 | fallback_correct — The Windows arm of the account-home scan root (the fleet's C:/claude layout); every other OS scans $HOME instead (plan 2026-10-01-a-commit-author-session-is-unreachable-because-every-session-roster-is-per-account Phase 1). |
 | `src/step_output/script_emitter.rs` | `build_prompt_split` | `"outputPreview: \"# local overrides\\nHOME=/home/jq\\nPATH=/usr/local/bin:/usr/bin:/bin\\nLANG=en_US.UTF-8\\nSHELL=/bin/bash\\nrecent_fil...` | 1 | fallback_correct — A worked example inside an AI prompt (HOME=/home/jq), not a path the runner reads. |
 
 ## `fleet_host_name` (0 rows)
@@ -258,7 +259,7 @@ _No hits._
 | `src/plans_dir_migration.rs` | `persist_env_plans_dir` | `let existing = get_setting::<PathSettings>().plans_dir;` | 1 | unreviewed |
 | `src/plans_dir_migration.rs` | `persist_env_plans_dir` | `update_setting::<PathSettings, _>(\|paths\| paths.plans_dir = Some(value.clone()))?;` | 1 | unreviewed |
 
-## `os_bound_tooling` (100 rows)
+## `os_bound_tooling` (103 rows)
 
 | file | symbol | excerpt | n | disposition |
 |---|---|---|---:|---|
@@ -320,9 +321,12 @@ _No hits._
 | `src/playwright/executor.rs` | `run_script_inline` | `"Running inline Playwright via cmd.exe in dir {}: {}",` | 1 | unreviewed |
 | `src/playwright/executor.rs` | `run_script_inline` | `.map_err(\|e\| format!("Failed to execute playwright via cmd.exe: {}", e))?` | 1 | unreviewed |
 | `src/process_capture/manager.rs` | `expected_node_bin` | `.or_else(\|\| after.strip_suffix(".ps1"))` | 1 | unreviewed |
+| `src/process_capture/process_tree.rs` | `command_lines_for_pids_powershell` | `cfg(windows)-only fn 'command_lines_for_pids_powershell' has no cfg(not(windows)) sibling in this file` | 1 | fallback_correct — The Windows-only WMI command-line query, reached only through process_table's circuit when the in-process sysinfo cmd() read fails. Unix reads /proc/<pid>/cmdline in-process. |
 | `src/process_capture/process_tree.rs` | `parse_command_lines_json` | `cfg(windows)-only fn 'parse_command_lines_json' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/process_capture/process_tree.rs` | `parse_powershell_snapshot` | `cfg(windows)-only fn 'parse_powershell_snapshot' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/process_capture/process_tree.rs` | `parse_wmi_creation_date` | `cfg(windows)-only fn 'parse_wmi_creation_date' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
+| `src/process_capture/process_tree.rs` | `port_owner_pid_powershell` | `cfg(windows)-only fn 'port_owner_pid_powershell' has no cfg(not(windows)) sibling in this file` | 1 | fallback_correct — The Windows-only Get-NetTCPConnection query, reached only through process_table's circuit when the in-process GetExtendedTcpTable listener read fails. Unix keeps its own lsof port_owner_pid. |
+| `src/process_capture/process_tree.rs` | `powershell_snapshot` | `cfg(windows)-only fn 'powershell_snapshot' has no cfg(not(windows)) sibling in this file` | 1 | fallback_correct — The Windows-only PowerShell/WMI snapshot, reached only through process_table's circuit when the in-process sysinfo walk fails. Unix reads /proc in-process and has no external snapshot fallback. |
 | `src/process_helpers.rs` | `ChildTreeGuard::attach_raw` | `cfg(windows)-only fn 'attach_raw' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/process_helpers.rs` | `cmd_no_window` | `no_window("cmd.exe")` | 1 | unreviewed |
 | `src/process_helpers.rs` | `tokio_cmd_no_window` | `tokio_no_window("cmd.exe")` | 1 | unreviewed |
