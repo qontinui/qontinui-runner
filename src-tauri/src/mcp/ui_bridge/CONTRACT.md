@@ -456,14 +456,32 @@ Two thread-through styles, mirroring the `tabId` split:
   each evaluates only a RESOLUTION expression (`element_path_resolve_js`), then
   dispatches the mutation through `execute_action` (`type`, `click`) via
   `ui_bridge_request_sync_in_window` with the same label, so the SDK executor
-  performs it and every executor gate applies. The click-by routes used to
-  click inside the evaluated script (`el.click()`), which no gate saw, so a click
-  on an element under a modal answered `clicked: true`. Now an SDK refusal (a
-  disabled target, one that is not visible, one another element covers) is a
-  4xx that keeps the SDK's `failureDetails` under `data`. A click the executor
-  performed answers `{clicked: true, tag, text, index, totalMatches, selector}`
-  plus the SDK's `durationMs`. Their `/ui-bridge/sdk/…` twins fall back to these
-  same handlers when no SDK app is connected. For `type-into`, the SDK's
+  performs it and every executor gate applies (`resolve_then_act`).
+  The resolution marks the node it found with a one-shot `data-qontinui-target`
+  attribute, and the action is aimed at that marker, not at a path the second
+  round trip would re-resolve (content inserted above the target, or a
+  virtualized list moving its rows after the scroll, can put another node at
+  the path by then). The marker is removed again on every path. So the action
+  reaches the resolved node or none:
+  - a target that left the page between the steps is an `ELEMENT_STALE` 4xx with
+    `error_detail.context.action_dispatched: false`;
+  - a reply showing the SDK reached its target some other way than through the
+    marker (its `elementResolution.strategy` is not `element-identifier`) is an
+    `ELEMENT_STALE` 4xx with `action_dispatched: true`, never a success. The
+    SDK's success reply carries no tag, id or `data-testid` of the node it acted
+    on, so that strategy is the identity it can report;
+  - the SDK names the target by the marker's selector, which denotes nothing
+    once removed, so every string of its reply names it by the reported
+    `selector` instead.
+
+  The click-by routes used to click inside the evaluated script (`el.click()`),
+  which no gate saw, so a click on an element under a modal answered
+  `clicked: true`. Now an SDK refusal (a disabled target, one that is not
+  visible, one another element covers) is a 4xx that keeps the SDK's
+  `failureDetails` under `data`. A click the executor performed answers
+  `{clicked: true, tag, text, index, totalMatches, selector}` plus the SDK's
+  `durationMs`. Their `/ui-bridge/sdk/…` twins fall back to these same
+  handlers when no SDK app is connected. For `type-into`, the SDK's
   `applyValueMutation` stays the single implementation of typing. `text` is
   required and must be a string (no `""` default), a miss is HTTP 400 rather
   than a 200 carrying `typed: false`, and the success payload is the SDK's
