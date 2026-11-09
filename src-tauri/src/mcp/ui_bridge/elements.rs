@@ -8726,6 +8726,29 @@ mod click_by_routes_tests {
         );
     }
 
+    /// click-by-text splices the caller's `tag` into a quoted
+    /// `querySelectorAll('…')` of a script the runner builds and evaluates.
+    /// Spliced raw, a quote in it would close that string, and the rest would
+    /// run as the caller's own code without the guard `page/evaluate` applies
+    /// to caller scripts (coord finding f82377b2). The tag is escaped like the
+    /// text, so a hostile one stays inside its selector string.
+    #[test]
+    fn click_by_text_escapes_a_hostile_tag() {
+        let hostile = "*'),fetch('/x'),document.querySelectorAll('*";
+        let escaped = r"querySelectorAll('*\'),fetch(\'/x\'),document.querySelectorAll(\'*')";
+        for exact in [true, false] {
+            let expr = click_by_text_find_expr("Save", hostile, exact);
+            assert!(
+                expr.contains(escaped),
+                "the tag must stay inside its selector string: {expr}"
+            );
+            assert!(
+                !expr.contains("'),fetch('"),
+                "no quote in the tag may close the selector string: {expr}"
+            );
+        }
+    }
+
     #[test]
     fn click_by_route_clicks_the_marked_node_through_the_sdk_executor() {
         let payload = marked_action_payload(MARKER, click_action());
