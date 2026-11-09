@@ -1813,23 +1813,34 @@ mod tests {
         );
     }
 
-    /// The response layer: JSON, text and event-stream bodies come back with
-    /// the mask where the value was. A JSON body whose parse hides the value
-    /// (a duplicate key) is scrubbed as bytes; an event whose value spans two
-    /// `data:` lines is scrubbed as one value. A body carrying no held value
-    /// passes byte for byte.
+    /// GET `path` from `app`, the body as text.
+    async fn fetch(app: &axum::Router, path: &'static str) -> String {
+        use tower::ServiceExt;
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get(path)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// The response layer on a buffered body: JSON and text come back with
+    /// the mask where the value was, naming no ref. A JSON body whose parse
+    /// hides the value (a duplicate key keeps only its last value) is
+    /// scrubbed as bytes. A body carrying no held value passes byte for byte.
     #[tokio::test]
     async fn every_sdk_response_body_is_scrubbed_while_a_secret_is_held() {
-        use axum::response::sse::{Event, Sse};
         use axum::routing::get;
-        use tower::ServiceExt;
 
         const SECRET: &str = "mw-fixture-pa\"ss-Mw1";
-        const SPLIT: &str = "mw-split-first\nmw-split-second-Mw2";
-        let _held = hold(
-            "run-middleware",
-            &[("cs-mw-pw", SECRET), ("cs-mw-split", SPLIT)],
-        );
+        let _held = hold("run-middleware", &[("cs-mw-pw", SECRET)]);
         let app = axum::Router::new()
             .route(
                 "/json",
@@ -1848,6 +1859,50 @@ mod tests {
                 }),
             )
             .route(
+                "/clean",
+                get(|| async {
+                    (
+                        [(header::CONTENT_TYPE, "application/json")],
+                        "{\n  \"pretty\": true\n}",
+                    )
+                }),
+            )
+            .layer(axum::middleware::from_fn(scrub_sdk_responses));
+        for path in ["/json", "/text", "/duplicate-key"] {
+            let body = fetch(&app, path).await;
+            assert!(
+                !body.contains(SECRET) && !body.contains(&json_escaped(SECRET)),
+                "{path} must not carry the value: {body}"
+            );
+            assert!(
+                body.contains(REDACTED) && !body.contains("cs-mw"),
+                "{path}: the mask stands where the value was, naming no ref: {body}"
+            );
+        }
+        assert_eq!(
+            fetch(&app, "/clean").await,
+            "{\n  \"pretty\": true\n}",
+            "a body carrying no held value is never re-serialized"
+        );
+    }
+
+    /// The response layer on an event stream: each event is scrubbed as it
+    /// flows, JSON data field by field and other data as text. An event's
+    /// `data:` lines are one value (`Event::data` splits a value at its
+    /// newlines), so a held value spanning two of them is still caught.
+    #[tokio::test]
+    async fn every_event_stream_is_scrubbed_event_by_event_while_a_secret_is_held() {
+        use axum::response::sse::{Event, Sse};
+        use axum::routing::get;
+
+        const SECRET: &str = "sse-fixture-pa\"ss-Ss1";
+        const SPLIT: &str = "sse-split-first\nsse-split-second-Ss2";
+        let _held = hold(
+            "run-event-stream",
+            &[("cs-sse-pw", SECRET), ("cs-sse-split", SPLIT)],
+        );
+        let app = axum::Router::new()
+            .route(
                 "/sse",
                 get(|| async {
                     Sse::new(futures_util::stream::iter([
@@ -1859,65 +1914,30 @@ mod tests {
                     ]))
                 }),
             )
-            .route(
-                "/clean",
-                get(|| async {
-                    (
-                        [(header::CONTENT_TYPE, "application/json")],
-                        "{\n  \"pretty\": true\n}",
-                    )
-                }),
-            )
             .layer(axum::middleware::from_fn(scrub_sdk_responses));
-
-        let fetch = |path: &'static str| {
-            let app = app.clone();
-            async move {
-                let response = app
-                    .oneshot(
-                        axum::http::Request::get(path)
-                            .body(Body::empty())
-                            .expect("request"),
-                    )
-                    .await
-                    .expect("response");
-                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-                    .await
-                    .expect("body");
-                String::from_utf8_lossy(&bytes).into_owned()
-            }
-        };
-        for path in ["/json", "/text", "/duplicate-key", "/sse"] {
-            let body = fetch(path).await;
-            assert!(
-                !body.contains(SECRET) && !body.contains(&json_escaped(SECRET)),
-                "{path} must not carry the value: {body}"
-            );
-            assert!(
-                body.contains(REDACTED) && !body.contains("cs-mw"),
-                "{path}: the mask stands where the value was, naming no ref: {body}"
-            );
-        }
-        let events = fetch("/sse").await;
+        let events = fetch(&app, "/sse").await;
         assert!(
-            !events.contains("mw-split-second-Mw2") && !events.contains("mw-split-first"),
+            !events.contains(SECRET) && !events.contains(&json_escaped(SECRET)),
+            "the stream must not carry the value: {events}"
+        );
+        assert!(
+            !events.contains("sse-split-second-Ss2") && !events.contains("sse-split-first"),
             "a value split across data lines must not survive: {events}"
         );
-        assert!(events.contains("data: split {{secret:*}}"), "{events}");
-        assert_eq!(
-            fetch("/clean").await,
-            "{\n  \"pretty\": true\n}",
-            "a body carrying no held value is never re-serialized"
+        assert!(
+            events.contains("data: {\"value\":\"{{secret:*}}\"}")
+                && events.contains("data: raw {{secret:*}}")
+                && events.contains("data: split {{secret:*}}")
+                && !events.contains("cs-sse"),
+            "each event carries the mask, naming no ref: {events}"
         );
     }
 
     /// A held map lives exactly as long as its session: released when its
-    /// registration drops, when its PTY exits (read through a real terminal
-    /// manager, as production reads it), and at its hold TTL. Past its
-    /// substitution TTL it substitutes nothing, but its value is still
-    /// scrubbed.
+    /// registration drops, and when its PTY exits (read through a real
+    /// terminal manager, as production reads it).
     #[tokio::test]
-    async fn a_held_map_is_released_on_drop_at_pty_exit_and_at_its_ttl() {
+    async fn a_held_map_is_released_on_drop_and_at_pty_exit() {
         let dropped = hold("run-life-drop", &[("cs-life-drop", "life-drop-Lf1")]);
         assert_eq!(
             resolve("cs-life-drop", Some(&connected())),
@@ -1946,7 +1966,13 @@ mod tests {
         );
         pane.set_alive_for_test(false);
         assert!(released("cs-life-pty").await, "released once the PTY exits");
+    }
 
+    /// Past its substitution TTL a map substitutes nothing, but its value is
+    /// still scrubbed while it is held: a session that outlives the window
+    /// can still read a page showing what it typed.
+    #[tokio::test]
+    async fn a_map_past_its_substitution_ttl_substitutes_nothing_but_is_still_scrubbed() {
         let lapsed = register_for(
             "run-life-sub",
             TARGET,
@@ -1955,6 +1981,11 @@ mod tests {
             Duration::from_secs(60),
         )
         .expect("held");
+        assert_eq!(
+            resolve("cs-life-sub", Some(&connected())),
+            Ok("life-sub-Lf4".to_string()),
+            "anti-vacuity: substituted inside its window"
+        );
         tokio::time::sleep(Duration::from_millis(40)).await;
         assert_eq!(
             resolve("cs-life-sub", Some(&connected())),
@@ -1970,7 +2001,12 @@ mod tests {
             "and its value is still scrubbed while it is held"
         );
         drop(lapsed);
+    }
 
+    /// A map is released at its hold TTL whatever its PTY does: the backstop
+    /// for an exit nobody observed.
+    #[tokio::test]
+    async fn a_map_is_released_at_its_hold_ttl() {
         let short = register_for(
             "run-life-ttl",
             TARGET,
