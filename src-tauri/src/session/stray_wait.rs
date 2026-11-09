@@ -3090,7 +3090,19 @@ mod tests {
                 let table = live::read_table().unwrap();
                 stray_verdict(&table, stray.pid, &live::LiveFacts::new(), 0)
             };
-            let verdict = read();
+            // The loop forks `pgrep` and `sleep` every second, and a child that has
+            // exited but is not yet reaped reads with an EMPTY argv, which the
+            // classifier rightly will not call harmless ("runs "). That is a sample
+            // of the loop between steps, not a verdict on it, so read until a
+            // sample lands outside that window (bounded, like `wait_for_argv`).
+            let mut verdict = read();
+            for _ in 0..100 {
+                if verdict.stray {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+                verdict = read();
+            }
             assert!(verdict.stray, "{verdict:?}");
             assert_eq!(verdict.class.as_deref(), Some("a"));
 
@@ -3098,14 +3110,19 @@ mod tests {
             let target = spawn(&sv(&["bash", "-c", "sleep 3600; :", &token]), 0);
             let target = Reaped(target);
             wait_for_argv(target.0.id(), &token);
-            let verdict = read();
+            // Same window as above: an unreaped child reads "runs " before the
+            // classifier ever reaches the live-pid wait.
+            let waits_on = format!("waits on live pid {}", target.0.id());
+            let mut verdict = read();
+            for _ in 0..100 {
+                if !verdict.stray && verdict.why.starts_with(&waits_on) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+                verdict = read();
+            }
             assert!(!verdict.stray, "{verdict:?}");
-            assert!(
-                verdict
-                    .why
-                    .starts_with(&format!("waits on live pid {}", target.0.id())),
-                "{verdict:?}"
-            );
+            assert!(verdict.why.starts_with(&waits_on), "{verdict:?}");
             drop(target);
 
             let lines = live::end(std::slice::from_ref(&stray), 0, Duration::from_secs(2));
