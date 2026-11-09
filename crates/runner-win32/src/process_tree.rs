@@ -169,6 +169,10 @@ pub fn walk<T: ProcessTable>(
         root_exited: table.has_exited(root),
         ..TreeKillReport::default()
     };
+    // MUTANT: an exited root returns before the first snapshot.
+    if report.root_exited {
+        return Ok(report);
+    }
     // Every member found so far, WITH its handle: held for the whole call.
     let mut members: Vec<(u32, u64, T::Handle)> = Vec::new();
     let mut root_signalled = report.root_exited;
