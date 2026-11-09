@@ -8,8 +8,8 @@
 //! Phase-0 probe PROVED that a `SessionStart` hook supplied ONLY via
 //! `claude --settings <file>` fires on both, additively — Claude MERGES the
 //! `--settings` file's hooks on top of any `~/.claude` config WITHOUT writing
-//! to it. So the entire delivery is SIX runner-owned files in the runner's OWN
-//! app-data dir (`~/.qontinui/runner/session-restore/`) — five bundled scripts
+//! to it. So the entire delivery is SEVEN runner-owned files in the runner's OWN
+//! app-data dir (`~/.qontinui/runner/session-restore/`) — six bundled scripts
 //! and the one `--settings` carrier that registers them ([`hook_files`] is the
 //! roster):
 //!
@@ -1410,7 +1410,7 @@ pub fn session_restore_dir() -> PathBuf {
 /// script is marked executable on Unix.
 ///
 /// CACHED PER (`base_dir`, [`StopHookRegistration`], [`LifecycleHooks`])
-/// (Phase 6, B2). The five SCRIPTS are byte-identical for a given `base_dir`
+/// (Phase 6, B2). The six SCRIPTS are byte-identical for a given `base_dir`
 /// (they are `include_str!`'d constants), and the settings file is a function
 /// of `base_dir` AND both variants — each pair writes a DIFFERENT filename with
 /// different content, so the cache carries the variants both to key the right
@@ -1897,7 +1897,7 @@ static MATERIALIZED: once_cell::sync::Lazy<
 /// Every file a [`materialize`] under (`reg`, `lifecycle`) is responsible for,
 /// in `base_dir`.
 ///
-/// The five SCRIPTS are variant-INDEPENDENT (they are written unconditionally
+/// The six SCRIPTS are variant-INDEPENDENT (they are written unconditionally
 /// — registration is gated, materialization is not), so both variants leave all
 /// five on disk. The SETTINGS entry FOLLOWS THE VARIANT, so the existence
 /// check below validates the file this variant actually delivers rather than
@@ -1997,7 +1997,7 @@ mod tests {
         assert!(settings_args_from(None).is_empty());
     }
 
-    /// Everything that must hold for BOTH variants: all five scripts on disk,
+    /// Everything that must hold for BOTH variants: all six scripts on disk,
     /// SessionStart + PreCompact + PermissionRequest registered and pointing at
     /// them, no
     /// unsubstituted placeholders, `permissions.allow` intact, and nothing
@@ -2015,7 +2015,7 @@ mod tests {
             reg.settings_name()
         );
 
-        // All five scripts exist alongside it — registration is gated,
+        // All six scripts exist alongside it — registration is gated,
         // MATERIALIZATION is not.
         let script_path = tmp.join(HOOK_SCRIPT_NAME);
         let stop_script_path = tmp.join(STOP_HOOK_SCRIPT_NAME);
@@ -2383,7 +2383,7 @@ mod tests {
             "another instance's write cannot disarm this instance's settings"
         );
 
-        // Both variants leave all five SCRIPTS on disk (materialization is not
+        // Both variants leave all six SCRIPTS on disk (materialization is not
         // gated, only registration is).
         for name in [
             HOOK_SCRIPT_NAME,
@@ -2391,6 +2391,7 @@ mod tests {
             PRECOMPACT_HOOK_SCRIPT_NAME,
             POLICY_HOOK_SCRIPT_NAME,
             PERMISSION_REQUEST_HOOK_SCRIPT_NAME,
+            SESSION_END_HOOK_SCRIPT_NAME,
         ] {
             assert!(tmp.path().join(name).exists(), "{name} materialized");
         }

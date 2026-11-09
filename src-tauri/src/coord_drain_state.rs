@@ -1007,7 +1007,12 @@ fn read_locked(
         inner.last_local_hold,
         local,
     );
-    inner.last_local_hold = Some(local);
+    // Recorded only once a fold has run: nothing is announced before the first
+    // fold, and a hold seen by a pre-fold reader must not make the next read
+    // announce the placeholder state in the boot fold's place.
+    if inner.folded_once {
+        inner.last_local_hold = Some(local);
+    }
     if emit {
         inner.last_emitted = Some(state.clone());
         if autonomous_allowed(&state, inner.dispatch_role) && !local {
@@ -1254,6 +1259,9 @@ fn fold_locked(
     inner.folded_once = true;
     inner.last_fold = now;
     inner.last_fold_at = now_utc;
+    // The hold this fold saw is the baseline the next read's hold edge
+    // compares against.
+    inner.last_local_hold = Some(local);
     let after = current_at(inner, now, now_utc, stale_after);
     let changed = inner
         .last_emitted
@@ -1354,7 +1362,11 @@ pub fn record_deferral(origin: SpawnOrigin, key: &str) {
 /// the restart prepare's runner-local hold lifting — which would otherwise
 /// be seen only on the next heartbeat-interval re-check.
 pub fn nudge_waiters() {
-    global().tx.send_replace(current());
+    // `current()` publishes any new episode itself, under the lock. The wake
+    // here must NOT replace the value: a value read and then published outside
+    // the lock can overwrite a newer state a fold published in between.
+    let _ = current();
+    global().tx.send_modify(|_| {});
     emit_snapshot();
 }
 
@@ -2234,7 +2246,7 @@ mod tests {
         let mut inner = inner_read_clear_at(base);
         let (now, now_utc) = after(base, 600);
         assert!(matches!(
-            current_at(&inner, now, now_utc, STALE, false),
+            current_at(&inner, now, now_utc, STALE),
             CoordDrainState::Unknown { .. }
         ));
 
@@ -2268,7 +2280,7 @@ mod tests {
         let mut inner = inner_read_clear_at(base);
         let (now, now_utc) = after(base, 600);
         // A reader saw the silence first, so it was announced.
-        inner.last_emitted = Some(current_at(&inner, now, now_utc, STALE, false));
+        inner.last_emitted = Some(current_at(&inner, now, now_utc, STALE));
 
         let (t, state) = fold_locked(
             &mut inner,
@@ -2290,7 +2302,7 @@ mod tests {
         let base = Instant::now();
         let mut inner = inner_read_clear_at(base);
         let (now, now_utc) = after(base, 600);
-        inner.last_emitted = Some(current_at(&inner, now, now_utc, STALE, false));
+        inner.last_emitted = Some(current_at(&inner, now, now_utc, STALE));
 
         let (t, state) = fold_locked(
             &mut inner,
@@ -2552,6 +2564,11 @@ mod tests {
         fresh.last_emitted = None;
         let (now, now_utc) = after(base, 100);
         assert!(!read_locked(&mut fresh, now, now_utc, STALE, false).1);
+        // Nor does a restart-prep hold that appears before the first fold.
+        fresh.folded_once = false;
+        assert!(!read_locked(&mut fresh, now, now_utc, STALE, true).1);
+        assert!(!read_locked(&mut fresh, now, now_utc, STALE, false).1);
+        assert!(!read_locked(&mut fresh, now, now_utc, STALE, true).1);
     }
 
     #[test]
