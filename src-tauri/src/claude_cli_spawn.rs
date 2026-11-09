@@ -250,6 +250,74 @@ pub(crate) async fn spawn_tokio_with_retry(
     .await
 }
 
+/// The absolute, launchable `claude` for a PTY `--resume` respawn — NEVER the
+/// bare name.
+///
+/// Plan `2026-10-20-account-migration-respawn-dies-during-cli-reinstall-churn`
+/// D3.1. The resume seam (`terminal::account_migration::spawn_resumed_pane`)
+/// execs its argv head directly in a fresh PTY. When the PATH walk misses — the
+/// CLI's npm reinstall has `bin/claude` moved aside, or only its placeholder
+/// stub is in place — [`crate::agent_runtime::resolve_claude_bin`] falls back to
+/// the bare `claude`, which on the pane's own PATH finds the identity shim
+/// first; the shim's bounded wait misses too, and the resumed pane exits 127
+/// seconds after a spawn that "succeeded". Here a miss is a MISS
+/// ([`crate::agent_runtime::try_resolve_launchable_claude_bin`]): it is retried
+/// on [`RETRY_DELAYS`], each attempt off the async worker (the resolver stats
+/// the filesystem), and a persistent miss is a typed
+/// `claude_cli_unavailable:not_found` error the callers already handle as a
+/// failed spawn.
+pub(crate) async fn resolve_resume_claude_bin() -> Result<String, String> {
+    resolve_with_retry(
+        &RETRY_DELAYS,
+        || async {
+            qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(
+                crate::agent_runtime::try_resolve_launchable_claude_bin,
+            )
+            .await
+            .ok()
+            .flatten()
+        },
+        tokio::time::sleep,
+    )
+    .await
+}
+
+/// The loop behind [`resolve_resume_claude_bin`], its effects injected so it is
+/// testable without PATH or a clock: `resolve_once` (`None` = a miss), then
+/// `sleep(delays[i])` between attempts — `delays.len() + 1` attempts in all.
+pub(crate) async fn resolve_with_retry<R, RF, S, SF>(
+    delays: &[Duration],
+    mut resolve_once: R,
+    mut sleep: S,
+) -> Result<String, String>
+where
+    R: FnMut() -> RF,
+    RF: Future<Output = Option<String>>,
+    S: FnMut(Duration) -> SF,
+    SF: Future<Output = ()>,
+{
+    for attempt in 0..=delays.len() {
+        if let Some(delay) = attempt.checked_sub(1).and_then(|i| delays.get(i)) {
+            sleep(*delay).await;
+        }
+        if let Some(path) = resolve_once().await {
+            return Ok(path);
+        }
+        if attempt < delays.len() {
+            tracing::info!(
+                attempt = attempt + 1,
+                "claude_cli_spawn: no launchable `claude` resolved for a --resume respawn — \
+                 retrying after the next delay"
+            );
+        }
+    }
+    Err(format!(
+        "{CLI_UNAVAILABLE_HEAD}not_found — no launchable `claude` on the runner's PATH \
+         after {} attempts; the resume is refused rather than launched through the bare name",
+        delays.len() + 1
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,6 +335,52 @@ mod tests {
             log.borrow_mut().push(d);
             std::future::ready(())
         }
+    }
+
+    /// A `--resume` respawn's binary: a miss is retried on the budget and the
+    /// first hit is returned (plan
+    /// 2026-10-20-account-migration-respawn-dies-during-cli-reinstall-churn D3.1).
+    #[tokio::test]
+    async fn resume_bin_miss_miss_hit_returns_the_absolute_path() {
+        let calls = RefCell::new(0u32);
+        let slept = RefCell::new(Vec::new());
+        let got = resolve_with_retry(
+            &RETRY_DELAYS,
+            || {
+                *calls.borrow_mut() += 1;
+                let n = *calls.borrow();
+                std::future::ready((n >= 3).then(|| "/opt/node/bin/claude".to_string()))
+            },
+            recorder(&slept),
+        )
+        .await;
+        assert_eq!(got.as_deref(), Ok("/opt/node/bin/claude"));
+        assert_eq!(*calls.borrow(), 3);
+        assert_eq!(*slept.borrow(), RETRY_DELAYS[..2].to_vec());
+    }
+
+    /// A persistent miss is a typed `claude_cli_unavailable:not_found` error
+    /// after every attempt — never the bare name handed to the PTY.
+    #[tokio::test]
+    async fn resume_bin_persistent_miss_is_a_typed_error_not_the_bare_name() {
+        let calls = RefCell::new(0u32);
+        let slept = RefCell::new(Vec::new());
+        let err = resolve_with_retry(
+            &RETRY_DELAYS,
+            || {
+                *calls.borrow_mut() += 1;
+                std::future::ready(None)
+            },
+            recorder(&slept),
+        )
+        .await
+        .expect_err("a persistent miss");
+        assert!(
+            err.starts_with(&format!("{CLI_UNAVAILABLE_HEAD}not_found")),
+            "{err}"
+        );
+        assert_eq!(*calls.borrow(), RETRY_DELAYS.len() as u32 + 1);
+        assert_eq!(*slept.borrow(), RETRY_DELAYS.to_vec());
     }
 
     #[tokio::test]

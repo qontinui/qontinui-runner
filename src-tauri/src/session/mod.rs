@@ -68,6 +68,7 @@ pub mod create; // Remote-CREATE grants: the `create_request` directive arm + de
 pub mod dual_write;
 pub mod handoff;
 pub mod identity_stamp; // Reports every session id this machine can resolve (account root + names, live or ended) to coord's POST /coord/session-identity/:device_id (plan 2026-10-19-session-lookup-by-name-shows-claude-account-in-web, Phase 2)
+pub mod in_flight; // The ONE session-scope in-flight registry — migration, resume door and respawn receiver; held by the lifecycle poll (plan 2026-10-20-account-migration-respawn-dies-during-cli-reinstall-churn, Phase 4)
 pub mod intent;
 pub mod local_store;
 pub mod observation_epoch; // The last instant the liveness poll could SEE the process table — bounds open-row restore admission (plan 2026-10-28-force-exited-runner-strands-open-sessions-out-of-the-restore-set, Phase 2)

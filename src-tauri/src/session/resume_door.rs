@@ -25,9 +25,11 @@
 //!
 //! ## Why a call cannot double-spawn
 //!
-//! Three independent guards sit between a request and a spawn: a per-session
-//! in-flight set (two concurrent calls naming one id: the second is
-//! `skipped(in_flight)`), a process-table read that refuses an id some live
+//! Three independent guards sit between a request and a spawn: the shared
+//! session-scope in-flight registry ([`super::in_flight`]; two concurrent calls
+//! naming one id: the second is `skipped(in_flight)`, and a session an account
+//! migration or the respawn receiver is moving is `skipped(in_flight(<who>))`),
+//! a process-table read that refuses an id some live
 //! `claude` already holds (`skipped(live_process)`), and the batch itself runs
 //! in a DETACHED task, so a caller that disconnects mid-batch neither cancels
 //! the remaining ids nor leaves a half-verified spawn behind — every id still
@@ -36,7 +38,7 @@
 //! ## Per-id flow ([`resume_one`])
 //!
 //! 0. no other call is already resuming the id, and no live `claude` process
-//!    already holds it ([`InFlight`], [`live_holder`]);
+//!    already holds it ([`claim_for_door`], [`live_holder`]);
 //! 1. the id is well-formed, has a lifecycle row, the row is `closed`, not
 //!    marked finished, owned by the claude provider, with a known config dir and
 //!    a cwd that still exists;
@@ -433,33 +435,20 @@ fn config_dir_of_pid(_pid: u32) -> Option<String> {
 // Double-spawn guards
 // ---------------------------------------------------------------------------
 
-/// Session ids a call is resuming RIGHT NOW. Process-wide: two concurrent
-/// requests naming one id would otherwise each pass the (read-only)
-/// preconditions and each spawn.
-static IN_FLIGHT: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
-    std::sync::LazyLock::new(Default::default);
-
-/// RAII claim on one id in [`IN_FLIGHT`]; released on drop, including on a
-/// panic or a cancelled future.
-struct InFlight(String);
-
-impl InFlight {
-    /// `None` when another call already holds `id`.
-    fn claim(id: &str) -> Option<Self> {
-        let mut g = IN_FLIGHT
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        g.insert(id.to_string()).then(|| Self(id.to_string()))
-    }
-}
-
-impl Drop for InFlight {
-    fn drop(&mut self) {
-        IN_FLIGHT
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&self.0);
-    }
+/// Claim `id` in the shared session-scope in-flight registry
+/// ([`super::in_flight`]) for the door, held through spawn AND verify. Two
+/// concurrent door calls naming one id: the second is `skipped(in_flight)`. A
+/// session another mover holds — an account migration mid-proof, the respawn
+/// receiver — is `skipped(in_flight(<holder>))`: resuming it would put a second
+/// process on one transcript.
+fn claim_for_door(id: &str) -> Result<super::in_flight::SessionInFlight, String> {
+    super::in_flight::SessionInFlight::claim(id, "resume-door").map_err(|holder| {
+        if holder == "resume-door" {
+            "in_flight".to_string()
+        } else {
+            format!("in_flight({holder})")
+        }
+    })
 }
 
 /// Pure: the pid of a `claude` among `procs` (`(pid, cmdline)`) that is
@@ -619,9 +608,10 @@ async fn resume_one(
     store: &SessionLifecycleStore,
     cand: Candidate,
 ) -> ResumeRow {
-    // One call per id at a time, held through spawn AND verify.
-    let Some(_in_flight) = InFlight::claim(&cand.id) else {
-        return ResumeRow::skipped(&cand.id, "in_flight");
+    // One mover per id at a time, held through spawn AND verify.
+    let _in_flight = match claim_for_door(&cand.id) {
+        Ok(claim) => claim,
+        Err(why) => return ResumeRow::skipped(&cand.id, why),
     };
     // Under a model gateway the resumed pane runs with the gateway's
     // CLAUDE_CONFIG_DIR (finalize_child_env pins it), where this session's
@@ -657,6 +647,14 @@ async fn resume_one(
         DrainGate::Allow => DrainGate::Allow,
         deferred => deferred,
     };
+    // The ABSOLUTE binary, retried, never the bare name (whose pane can find
+    // the identity shim first and exit 127 mid CLI-reinstall). Resolved BEFORE
+    // `admit` consumes a cap slot, so a CLI that stays missing spends no budget
+    // and the id is a pre-spawn skip.
+    let claude_bin = match crate::claude_cli_spawn::resolve_resume_claude_bin().await {
+        Ok(bin) => bin,
+        Err(e) => return ResumeRow::skipped(&cand.id, e),
+    };
     let now_ms = chrono::Utc::now().timestamp_millis();
     if let Err(why) = admit(gate, || {
         crate::terminal::account_migration::migration_cap_permits(&cand.id, now_ms)
@@ -690,6 +688,7 @@ async fn resume_one(
                 &tm,
                 &registry,
                 crate::terminal::account_migration::ResumeSpawn {
+                    claude_bin,
                     claude_session_id: &cand.id,
                     working_dir: &cand.working_dir,
                     model_transcript,
@@ -1074,11 +1073,32 @@ mod tests {
     #[test]
     fn a_second_claim_on_one_id_is_refused_until_the_first_is_released() {
         let id = "in-flight-test-3f2a-resume-door";
-        let first = InFlight::claim(id).expect("first claim");
-        assert!(InFlight::claim(id).is_none(), "concurrent call must lose");
-        assert!(InFlight::claim("another-id-resume-door").is_some());
+        let first = claim_for_door(id).expect("first claim");
+        assert_eq!(
+            claim_for_door(id).unwrap_err(),
+            "in_flight",
+            "concurrent call must lose"
+        );
+        assert!(claim_for_door("another-id-resume-door").is_ok());
         drop(first);
-        assert!(InFlight::claim(id).is_some(), "released on drop");
+        assert!(claim_for_door(id).is_ok(), "released on drop");
+    }
+
+    /// A resume-door call naming a session an account migration is moving is
+    /// refused, naming the holder — one mover per Claude session (plan
+    /// 2026-10-20-account-migration-respawn-dies-during-cli-reinstall-churn,
+    /// Phase 4).
+    #[test]
+    fn a_door_call_for_a_migrating_session_is_refused_naming_the_mover() {
+        let id = "in-flight-test-door-vs-migration";
+        let migration =
+            super::super::in_flight::SessionInFlight::claim(id, "account-migration").expect("free");
+        assert_eq!(
+            claim_for_door(id).unwrap_err(),
+            "in_flight(account-migration)"
+        );
+        drop(migration);
+        assert!(claim_for_door(id).is_ok());
     }
 
     #[test]

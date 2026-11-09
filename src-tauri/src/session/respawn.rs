@@ -188,6 +188,11 @@ pub enum RespawnError {
     Transcript(String),
     #[error("respawn spawn failed: {0}")]
     Spawn(String),
+    /// Another mover (an account migration, the resume door) holds this
+    /// Claude session right now ([`super::in_flight`]). The coord row stays
+    /// pending, so the next push or catch-up retries it.
+    #[error("{0} is already moving this Claude session — left for retry")]
+    InFlight(&'static str),
     #[error("the Tauri app handle is not available — cannot spawn a PTY")]
     NoAppHandle,
     /// Coord's device drain deferred this respawn. Not a failure: the durable
@@ -695,6 +700,12 @@ async fn materialize(
         .ok_or(RespawnError::NoClaudeSession(respawn.source_session_id))?
         .to_string();
 
+    // 1b. One mover per Claude session (the shared in-flight registry), held
+    //     through the spawn and the claim re-acquire.
+    let _in_flight =
+        super::in_flight::SessionInFlight::claim(&claude_session_id, "respawn-receiver")
+            .map_err(RespawnError::InFlight)?;
+
     // 2. 🔒 The pin. Fails loud; never degrades to rotation.
     let config_dir = resolve_target_config_dir(respawn.account.as_deref())?;
 
@@ -741,6 +752,14 @@ async fn materialize(
         return Err(RespawnError::NoTranscript(claude_session_id));
     }
 
+    // 4b. The ABSOLUTE binary, retried, never the bare name (whose pane can
+    //     find the identity shim first and exit 127 mid CLI-reinstall).
+    //     Resolved BEFORE step 5 consumes a cap slot: a CLI that stays missing
+    //     must not spend the budget on a respawn that never launches.
+    let claude_bin = crate::claude_cli_spawn::resolve_resume_claude_bin()
+        .await
+        .map_err(RespawnError::Spawn)?;
+
     // 5. The per-session account-hop budget, shared with the automatic
     //    migration path — `MIGRATION_CAP` (3) per Claude session per 24h. A
     //    respawn is another account hop for the same session, so it draws on the
@@ -782,6 +801,7 @@ async fn materialize(
         &terminal_manager,
         &session_registry,
         crate::terminal::account_migration::ResumeSpawn {
+            claude_bin,
             claude_session_id: &claude_session_id,
             working_dir: &working_dir,
             model_transcript,
