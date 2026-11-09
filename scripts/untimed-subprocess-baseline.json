@@ -181,20 +181,6 @@
       "reason": "One ffmpeg frame-extraction pass per verification request, bounded by `-frames:v`. Agent-initiated, never on a timer; a transcode of a long trace legitimately takes minutes."
     },
     {
-      "site": "src-tauri/src/mcp/trace_verification.rs::run_deterministic_verification",
-      "waits": [
-        "cargo",
-        "cmd",
-        "sh"
-      ],
-      "reason_covers_waits": [
-        "cargo",
-        "cmd",
-        "sh"
-      ],
-      "reason": "Runs the workspace's own build — `npm run build` via `cmd /C` on Windows and `sh -c` elsewhere, plus `cargo check` when a Cargo.toml is present. Unbounded by nature, and the point of the check is to let it finish. One pass per agent-initiated verification request."
-    },
-    {
       "site": "src-tauri/src/orchestrator/hooks.rs::HookExecutor::execute_command",
       "waits": [
         "cmd"
@@ -203,20 +189,6 @@
         "cmd"
       ],
       "reason": "Executes a user-authored orchestrator hook command through `cmd /C`. Its runtime is whatever the operator's script does; a blanket budget here would silently truncate hooks. Fires per task-run lifecycle event, not on a timer."
-    },
-    {
-      "site": "src-tauri/src/orchestrator/verification.rs::DeterministicVerifier::run_command",
-      "waits": [
-        "cmd",
-        "dyn:bash_path",
-        "sh"
-      ],
-      "reason_covers_waits": [
-        "cmd",
-        "dyn:bash_path",
-        "sh"
-      ],
-      "reason": "Executes a user-authored verification command (build/test/lint) through whichever shell the platform resolves to — a discovered `bash_path`, `cmd /C`, or `sh -c` — with a runtime that is legitimately unbounded. Budget belongs to the verification step's own config. One pass per orchestrator iteration, driven by task progress rather than a clock."
     },
     {
       "site": "src-tauri/src/playwright/executor.rs::run_script",

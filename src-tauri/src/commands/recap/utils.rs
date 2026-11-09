@@ -176,10 +176,13 @@ pub fn get_stage_display_name(stage: &str) -> String {
     .to_string()
 }
 
-/// Map TaskState names (from orchestrator) to UI stage names.
+/// Map recorded state names to UI stage names.
 ///
 /// Handles both:
-/// - TaskState enum names (e.g., "execution", "deterministic_verification")
+/// - the snake_case names of the deleted orchestrator `TaskState` (e.g.,
+///   "execution", "deterministic_verification"). Nothing ever recorded them:
+///   that state machine was never constructed outside its tests, so these
+///   arms are inert
 /// - Direct stage names from transitions (e.g., "setup", "verification", "agentic")
 pub fn map_state_to_stage(state: &str) -> Option<&'static str> {
     match state {
@@ -188,7 +191,7 @@ pub fn map_state_to_stage(state: &str) -> Option<&'static str> {
         "verification" => Some("verification"),
         "agentic" => Some("agentic"),
         "completion" => Some("completion"),
-        // TaskState enum mappings (legacy)
+        // The deleted orchestrator TaskState's names (never recorded; inert)
         "planning" => Some("setup"),
         "execution" => Some("agentic"),
         "deterministic_verification" => Some("verification"),
