@@ -9268,7 +9268,7 @@ async fn acquire_continuation_workdir(
         }
     }
 
-    // Fallback: the WORKSPACE ROOT, and only then a canonical checkout.
+    // Fallback: the WORKSPACE ROOT.
     //
     // Phase 3 of `2026-08-20-worktree-spawn-autonomy-and-trust-preconditions`
     // flips this priority. It used to be "canonical checkout of the first repo,
@@ -9301,9 +9301,9 @@ async fn acquire_continuation_workdir(
     //
     // This is a DEFAULT, not a pin: the `acquire` arm above already wins
     // whenever worktree mode resolves one, and that is the explicit-cwd path.
-    // The canonical checkout stays as the last resort rather than being deleted,
-    // because on a box where the workspace root does not resolve it is still
-    // better than refusing the continuation outright.
+    // There is no canonical-checkout last resort: the canonical checkout is
+    // resolved from the same workspace root (see `continuation_fallback_workdir`),
+    // so it could never answer when the root did not.
     //
     // Extracted into a pure resolver for the reason `headless_continuation_bound_port`
     // right below states: a priority order expressed as a literal at a call site
@@ -9323,7 +9323,6 @@ async fn acquire_continuation_workdir(
         crate::workspace_paths::require_workspace_root(),
         repos,
         crate::agent_worktree::canonical_paths::has_foreign_owner,
-        crate::agent_worktree::canonical_paths::default_canonical_path,
         crate::agent_worktree::canonical_paths::resolve_checkout,
         &no_worktree_because,
     )
@@ -9433,10 +9432,10 @@ use crate::agent_worktree::NO_ISOLATED_WORKTREE;
 ///
 /// - no repos → the workspace root, else `root`'s own error (the shared
 ///   `WorkspaceRootUnresolved` sentence, which names the next action);
-/// - a `qontinui/*` or bare-slug repo → EXACTLY the pre-existing order: the
+/// - a `qontinui/*` or bare-slug repo → the
 ///   workspace root (Phase 3 of
 ///   `2026-08-20-worktree-spawn-autonomy-and-trust-preconditions` — the trusted,
-///   non-shared cwd), else its canonical checkout, else `root`'s error. Unverified on
+///   non-shared cwd), else `root`'s error. Unverified on
 ///   purpose: a fork-origin clone or a box holding a subset of the repos must
 ///   keep working as it did;
 /// - a repo with any other owner whose VERIFIED checkout is under the root →
@@ -9453,13 +9452,16 @@ use crate::agent_worktree::NO_ISOLATED_WORKTREE;
 /// - no verified checkout at all → `Err` with the resolver's
 ///   `workdir_not_a_checkout` detail.
 ///
+/// There is no canonical-checkout fallback for a missing root: the canonical
+/// checkout is resolved from the same root (`default_canonical_path` calls
+/// `require_workspace_root`), so it could never answer when the root did not.
+///
 /// Every resolver is INJECTED so the order is asserted against synthetic paths
 /// rather than against whatever this machine happens to have on disk.
 fn continuation_fallback_workdir<E: std::fmt::Display>(
     root: Result<std::path::PathBuf, String>,
     repos: &[String],
     foreign_owner: impl Fn(&str) -> bool,
-    canonical: impl Fn(&str) -> Result<std::path::PathBuf, String>,
     resolve_checkout: impl Fn(&str) -> Result<std::path::PathBuf, E>,
     no_worktree_because: &str,
 ) -> Result<String, String> {
@@ -9468,10 +9470,7 @@ fn continuation_fallback_workdir<E: std::fmt::Display>(
         return root.map(|p| lossy(&p));
     };
     if !foreign_owner(repo) {
-        return match root {
-            Ok(root) => Ok(lossy(&root)),
-            Err(unresolved) => canonical(repo).map(|p| lossy(&p)).map_err(|_| unresolved),
-        };
+        return root.map(|p| lossy(&p));
     }
     let checkout = resolve_checkout(repo).map_err(|e| e.to_string())?;
     match root {
@@ -17174,65 +17173,32 @@ mod tests {
     fn a_qontinui_continuation_keeps_the_root_first_order_unverified() {
         let root = std::path::PathBuf::from("D:/qontinui-root");
         let repos = vec!["qontinui/qontinui-runner".to_string()];
-        let canonical = |r: &str| {
-            Ok(std::path::PathBuf::from(format!(
-                "D:/qontinui-root/{}",
-                r.rsplit('/').next().unwrap()
-            )))
-        };
         let refuse = |_: &str| Err::<std::path::PathBuf, _>("verification must not run");
         let foreign = crate::agent_worktree::canonical_paths::has_foreign_owner;
 
         assert_eq!(
-            continuation_fallback_workdir(
-                Ok(root.clone()),
-                &repos,
-                foreign,
-                canonical,
-                refuse,
-                "off"
-            ),
+            continuation_fallback_workdir(Ok(root.clone()), &repos, foreign, refuse, "off"),
             Ok("D:/qontinui-root".to_string()),
             "the root wins, and a failing verifier is never consulted"
         );
         assert_eq!(
-            continuation_fallback_workdir(Ok(root), &[], foreign, canonical, refuse, "off"),
+            continuation_fallback_workdir(Ok(root), &[], foreign, refuse, "off"),
             Ok("D:/qontinui-root".to_string())
         );
-        // No root: the canonical checkout survives as the last resort.
-        assert_eq!(
-            continuation_fallback_workdir(
-                Err(UNRESOLVED.to_string()),
-                &repos,
-                foreign,
-                canonical,
-                refuse,
-                "off"
-            ),
-            Ok("D:/qontinui-root/qontinui-runner".to_string())
-        );
-        // Nothing left: the refusal is the root's own sentence, verbatim, so it
+        // No root: the refusal is the root's own sentence, verbatim, so it
         // names the next action rather than a variable the operator never set.
         assert_eq!(
             continuation_fallback_workdir(
                 Err(UNRESOLVED.to_string()),
                 &repos,
                 foreign,
-                |_: &str| Err("no root".to_string()),
                 refuse,
                 "off"
             ),
             Err(UNRESOLVED.to_string())
         );
         assert_eq!(
-            continuation_fallback_workdir(
-                Err(UNRESOLVED.to_string()),
-                &[],
-                foreign,
-                canonical,
-                refuse,
-                "off"
-            ),
+            continuation_fallback_workdir(Err(UNRESOLVED.to_string()), &[], foreign, refuse, "off"),
             Err(UNRESOLVED.to_string())
         );
     }
@@ -17249,14 +17215,12 @@ mod tests {
         let root = std::path::PathBuf::from("D:/qontinui-root");
         let repos = vec!["portofino-pizzeria/backend".to_string()];
         let foreign = crate::agent_worktree::canonical_paths::has_foreign_owner;
-        let canonical = |_: &str| Err("the layout rule must not be used".to_string());
         let resolve =
             |_: &str| Ok::<_, String>(std::path::PathBuf::from("D:/portofino-pizzeria/backend"));
         let err = continuation_fallback_workdir(
             Ok(root.clone()),
             &repos,
             foreign,
-            canonical,
             resolve,
             "worktree acquire failed: claim already held",
         )
@@ -17271,7 +17235,6 @@ mod tests {
             Err(UNRESOLVED.to_string()),
             &repos,
             foreign,
-            canonical,
             resolve,
             "off",
         )
@@ -17283,28 +17246,13 @@ mod tests {
         // A foreign repo whose verified checkout IS under the root → the root.
         let under = |_: &str| Ok::<_, String>(std::path::PathBuf::from("D:/qontinui-root/backend"));
         assert_eq!(
-            continuation_fallback_workdir(
-                Ok(root.clone()),
-                &repos,
-                foreign,
-                canonical,
-                under,
-                "off"
-            ),
+            continuation_fallback_workdir(Ok(root.clone()), &repos, foreign, under, "off"),
             Ok("D:/qontinui-root".to_string())
         );
         // A sibling of the root sharing its prefix is NOT under it.
         let sibling =
             |_: &str| Ok::<_, String>(std::path::PathBuf::from("D:/qontinui-root-old/backend"));
-        assert!(continuation_fallback_workdir(
-            Ok(root),
-            &repos,
-            foreign,
-            canonical,
-            sibling,
-            "off"
-        )
-        .is_err());
+        assert!(continuation_fallback_workdir(Ok(root), &repos, foreign, sibling, "off").is_err());
     }
 
     /// No verified checkout anywhere → refused, carrying the resolver's typed
@@ -17331,7 +17279,6 @@ mod tests {
             Ok(std::path::PathBuf::from("D:/qontinui-root")),
             &repos,
             crate::agent_worktree::canonical_paths::has_foreign_owner,
-            |_: &str| Ok(std::path::PathBuf::from("D:/qontinui-root/mobile")),
             resolve,
             "off",
         )
