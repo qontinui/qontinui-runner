@@ -6,7 +6,7 @@
 //! Extracted modules:
 //! - `ai_session` - AI session management (stop/restart/run_prompt)
 //! - `playwright_collection` - Playwright state collector
-//! - `trace_verification` - Trace extraction & worker-signal parsing
+//! - `trace_verification` - Trace and video extraction
 //! - `backup_restore` - Backup/restore endpoints
 //! - `auto_continue` - Auto-continue settings & supervisor checks
 
@@ -1514,7 +1514,7 @@ if __name__ == "__main__":
 
 // Backup/restore handlers moved to crate::mcp::backup_restore
 
-// Trace, worker-signal, and media utilities moved to crate::mcp::trace_verification
+// Trace and media utilities moved to crate::mcp::trace_verification
 
 /// Information about a single active session
 #[derive(Debug, Clone, Serialize)]

@@ -1,11 +1,8 @@
-//! Trace & Worker-Signal Utilities
+//! Trace Utilities
 //!
-//! Contains functions for extracting trace/video data and parsing worker output signals.
+//! Contains functions for extracting trace and video data for analysis.
 
-use regex::Regex;
 use tracing::{info, warn};
-
-use crate::orchestrator::{WorkerSignal, WorkerSignalExt};
 
 // ============================================================================
 // Trace and Video Extraction Utilities
@@ -198,101 +195,4 @@ pub fn collect_images_for_analysis(
     }
 
     (all_images, trace_timeline)
-}
-
-// ============================================================================
-// Worker Output Signal Parsing
-// ============================================================================
-
-/// Result of parsing worker output for signals
-#[derive(Debug, Clone)]
-pub enum WorkerOutputSignal {
-    /// Worker signals work is complete, ready for verification
-    WorkComplete { reason: Option<String> },
-    /// Worker requests replan
-    NeedReplan { reason: String },
-    /// Legacy task complete marker (deprecated but still supported)
-    TaskComplete,
-    /// No signal found, worker continues
-    Continue,
-}
-
-/// Parse worker output for orchestrator signals
-/// This is the primary signal detection used by the orchestrator architecture
-pub fn parse_worker_output_signal(output: &str) -> WorkerOutputSignal {
-    // First check for the new orchestrator signals
-    if let Some(signal) = WorkerSignal::parse_from_output(output) {
-        match signal {
-            WorkerSignal::WorkComplete { reason } => {
-                info!("Worker signal detected: [WORK_COMPLETE]");
-                return WorkerOutputSignal::WorkComplete { reason };
-            }
-            WorkerSignal::NeedReplan { reason } => {
-                info!("Worker signal detected: [NEED_REPLAN] - {}", reason);
-                return WorkerOutputSignal::NeedReplan { reason };
-            }
-            WorkerSignal::Finding(_) => {
-                // Findings don't terminate the loop, they're just recorded
-            }
-            WorkerSignal::Continue => {}
-        }
-    }
-
-    // Check for legacy TASK_COMPLETE marker (deprecated but supported for backward compatibility)
-    let output_upper = output.to_uppercase();
-    let legacy_markers = [
-        "[TASK_COMPLETE]",
-        "[GOAL_COMPLETE]",
-        "[GOAL_ACHIEVED]",
-        "[STOP_SESSION]",
-        "[SESSION_COMPLETE]",
-    ];
-
-    for marker in &legacy_markers {
-        if output_upper.contains(marker) {
-            info!(
-                "Legacy completion marker detected: {} - treating as WORK_COMPLETE",
-                marker
-            );
-            // Treat legacy markers as WORK_COMPLETE so verification still runs
-            return WorkerOutputSignal::WorkComplete {
-                reason: Some(format!("Legacy marker: {}", marker)),
-            };
-        }
-    }
-
-    // Check for structured completion patterns
-    let completion_patterns = [
-        r#""goal_achieved":\s*true"#,
-        r#""goal_achieved": true"#,
-        r#"goal_achieved:\s*true"#,
-        r#""status":\s*"complete""#,
-        r#"status:\s*"complete""#,
-    ];
-
-    for pattern in &completion_patterns {
-        if let Ok(re) = Regex::new(pattern) {
-            if re.is_match(output) {
-                info!(
-                    "Goal completion pattern detected: {} - treating as WORK_COMPLETE",
-                    pattern
-                );
-                return WorkerOutputSignal::WorkComplete {
-                    reason: Some(format!("Pattern match: {}", pattern)),
-                };
-            }
-        }
-    }
-
-    WorkerOutputSignal::Continue
-}
-
-/// Check if AI output contains goal completion markers
-/// Returns true if any marker indicates the goal has been achieved
-/// NOTE: This is kept for backward compatibility but parse_worker_output_signal should be preferred
-pub fn check_goal_completion_markers(output: &str) -> bool {
-    matches!(
-        parse_worker_output_signal(output),
-        WorkerOutputSignal::WorkComplete { .. } | WorkerOutputSignal::TaskComplete
-    )
 }
