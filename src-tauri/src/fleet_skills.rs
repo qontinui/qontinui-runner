@@ -1556,6 +1556,13 @@ mod tests {
             "an override-only file is outside the roster, so it is written; got {:?}",
             out.skipped
         );
+        assert!(
+            out.skipped
+                .iter()
+                .any(|s| s.reason == crate::capability_manifest::SkipReason::RootVersioned),
+            "the checkout must read as versioned, or this test proves nothing; got {:?}",
+            out.skipped
+        );
     }
 
     /// The other half: a checkout tracking only an embedded SIDECAR that an
