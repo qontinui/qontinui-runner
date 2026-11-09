@@ -435,9 +435,9 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
                     // every `acquire_for_terminal` door; the context's Drop then
                     // releases its claims.
                     if let Some(ctx) = isolated_ctx.as_ref() {
-                        ctx.report_unspawned("tauri_proxy terminal_create", &e);
+                        ctx.report_unspawned("tauri_proxy terminal_create", &e.message);
                     }
-                    TauriInvokeResponse::spawn_failed(e)
+                    TauriInvokeResponse::spawn_failed(e.message)
                 }
             }
         }

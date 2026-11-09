@@ -28,6 +28,57 @@
 use axum::http::StatusCode;
 use serde_json::Value;
 
+/// A failed `TerminalManager::create`, typed by whether a child process may
+/// already have started in the session's working directory (plan
+/// `2026-11-08-a-spawn-refused-after-its-worktree-allocation-leaves-the-tree-on-disk`,
+/// Why #5 and D1).
+///
+/// `child_started == false` only when the failure came BEFORE the child spawn:
+/// the resource guard, the spawn-tenant identity seam, the trust gate, the
+/// in-flight claim, or the PTY open. Everything after it — the pane's reader or
+/// writer, and a poisoned sessions lock after a fully built session — is
+/// `true`, because the child may outlive the reported failure. A door may
+/// remove the tree it allocated only on `false`.
+///
+/// `message` is the text the door answers with, verbatim: every refusal prefix
+/// [`spawn_refusal_code`] classifies survives unchanged. `Display` prints it
+/// alone, so a caller that only stringifies the error is unaffected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SpawnFailure {
+    pub(crate) child_started: bool,
+    pub(crate) message: String,
+}
+
+impl SpawnFailure {
+    /// A failure before any child process existed.
+    pub(crate) fn before_child(message: impl Into<String>) -> Self {
+        Self {
+            child_started: false,
+            message: message.into(),
+        }
+    }
+
+    /// A failure after the child spawn — a child may hold the working dir.
+    pub(crate) fn after_child(message: impl Into<String>) -> Self {
+        Self {
+            child_started: true,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for SpawnFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl From<SpawnFailure> for String {
+    fn from(failure: SpawnFailure) -> Self {
+        failure.message
+    }
+}
+
 /// The `<kind>` of a `terminal:tenant_<kind>:` spawn-tenant refusal text, or
 /// `None` for any other text.
 pub(crate) fn spawn_tenant_refusal_kind(text: &str) -> Option<&str> {
