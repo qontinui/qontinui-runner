@@ -227,46 +227,13 @@ impl Drop for IsolatedEditContext {
 
 impl IsolatedEditContext {
     /// Report that the spawn this context was allocated for failed, from
-    /// `door` with `error`. Called on the failure arm of every
-    /// [`acquire_for_terminal`] door (plan
+    /// `door` with `error`, through `post` — the report half of
+    /// [`Self::remove_unspawned`], which runs it after the removal (plan
     /// `2026-11-08-a-spawn-refused-after-its-worktree-allocation-leaves-the-tree-on-disk`,
-    /// Phase 0).
+    /// Phases 0-2). coord moves the allocation's rows from `allocated` to
+    /// `abandoned`, so it stops counting as live; the disk is
+    /// [`Self::remove_unspawned`]'s business, not this report's.
     ///
-    /// The context's `Drop` releases its claims, not the worktree on disk. A
-    /// context exists only when the call allocated (the reuse arm of
-    /// [`acquire_for_terminal`] returns none). This posts the failed spawn on
-    /// the allocation, as the gate continuation path does: coord moves its rows
-    /// from `allocated` to `abandoned`, so the allocation stops counting as
-    /// live. That is a ledger fact only. Removing the tree from disk is not
-    /// authorized by `abandoned`, so the tree can still remain.
-    ///
-    /// Detached and best-effort: one attempt, and none at all on a runner with
-    /// no connected coord base (the reporter logs that), so the door's answer
-    /// never waits on coord. Spawned under the same
-    /// `tokio::runtime::Handle::try_current()` guard `Drop` uses, so a call
-    /// outside a runtime logs and posts nothing rather than panicking.
-    ///
-    /// A door whose failure may come AFTER a child started in the tree (the
-    /// Tauri command's join error — a panic inside `create`) must not call
-    /// this: a live session may hold the allocation.
-    pub(crate) fn report_unspawned(&self, door: &str, error: &str) {
-        let door_name = door.to_string();
-        self.report_unspawned_with(door, error, move |agent_id, reason| {
-            match tokio::runtime::Handle::try_current() {
-                Ok(handle) => {
-                    handle.spawn(async move {
-                        crate::agent_runtime::report_terminal_spawn_failed(agent_id, &reason).await;
-                    });
-                }
-                Err(_) => warn!(
-                    "{door_name}: no async runtime to report allocation {agent_id} \
-                     spawn-failed on; it stays `allocated` until reclaim finds it"
-                ),
-            }
-        });
-    }
-
-    /// [`Self::report_unspawned`] with the poster injected — the test seam.
     /// Logs each worktree, then calls `post` once with the allocation's agent
     /// id and the error, and returns `true`; an `agent_id` that is not a uuid
     /// posts nothing, logs, and returns `false`.

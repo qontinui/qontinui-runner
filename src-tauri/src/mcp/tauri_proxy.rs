@@ -431,11 +431,16 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
                     TauriInvokeResponse::ok(serde_json::to_value(&info).unwrap_or(Value::Null))
                 }
                 Err(e) => {
-                    // The allocation (if this call made one) is reported, as on
-                    // every `acquire_for_terminal` door; the context's Drop then
-                    // releases its claims.
-                    if let Some(ctx) = isolated_ctx.as_ref() {
-                        ctx.report_unspawned("tauri_proxy terminal_create", &e.message);
+                    // The allocation (if this call made one) has its fresh tree
+                    // removed when no child started and it holds nothing, and is
+                    // reported spawn-failed, as on every `acquire_for_terminal`
+                    // door; the context's Drop then releases its claims.
+                    if let Some(ctx) = isolated_ctx {
+                        ctx.remove_unspawned(
+                            "tauri_proxy terminal_create",
+                            e.child_started,
+                            &e.message,
+                        );
                     }
                     TauriInvokeResponse::spawn_failed(e.message)
                 }
