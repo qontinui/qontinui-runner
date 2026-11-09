@@ -2777,6 +2777,7 @@ mod tests {
         let roster = [
             SkipReason::GitTracked,
             SkipReason::ProbeUnknownInRepo,
+            SkipReason::RootVersioned,
             SkipReason::WriteFailed(String::new()),
             SkipReason::Unresolved(String::new()),
             SkipReason::Rejected(String::new()),
@@ -2786,6 +2787,7 @@ mod tests {
             match reason {
                 SkipReason::GitTracked
                 | SkipReason::ProbeUnknownInRepo
+                | SkipReason::RootVersioned
                 | SkipReason::WriteFailed(_)
                 | SkipReason::Unresolved(_)
                 | SkipReason::Rejected(_)

@@ -15,9 +15,38 @@
 //! blocks a pull, muddies a diff, and can be committed by an agent that never
 //! touched the file.
 //!
-//! So: **existing + tracked ⇒ skip.** Untracked or absent ⇒ write, as before.
+//! So: **existing + tracked ⇒ skip.** Untracked or absent ⇒ write, as before —
+//! EXCEPT an absent, untracked path in a checkout that versions the provisioned
+//! tree (see "A checkout that versions the provisioned tree" below).
 //! Unknown ⇒ write, too — EXCEPT inside a repository (see "UNKNOWN inside a
 //! repository" below).
+//!
+//! ## A checkout that versions the provisioned tree: do not create new paths
+//!
+//! When the probe answered and the repository tracks at least one path under
+//! the probed root — the provisioned tree root itself (`.claude/commands`,
+//! `.claude/skills` as a whole, `.claude/agents`), never a per-skill directory —
+//! an ABSENT destination the repository does not track is skipped
+//! ([`SkipReason::RootVersioned`]). That checkout owns the tree; a path absent
+//! from it is one its own history has not delivered YET. Writing it creates an
+//! untracked file at a path upstream ADDS, and `git merge --ff-only` /
+//! `git pull --ff-only` then refuse the fast-forward over it even when its bytes
+//! are identical — so the checkout stops advancing, stays behind, and the next
+//! spawn writes the path again (plan
+//! `2026-11-09-a-provisioned-copy-of-an-upstream-added-file-wedges-the-served-checkout-fast-forward`).
+//! Keying on the tree root, not on a skill directory, is what also stops a whole
+//! upstream-added skill DIRECTORY being written into a stale tree.
+//!
+//! - A tracked path the user DELETED keeps today's write (below).
+//! - A repository that versions none of the provisioned tree (every agent
+//!   worktree of a product repo) is unaffected: its set is empty, so every
+//!   absent path is written as before.
+//! - **The cost, stated:** a repository that tracks even ONE path under a
+//!   provisioned root — say a single repo-local command — receives no bundled
+//!   unit it does not track itself under that root. The rule cannot tell "this
+//!   repo is the canonical source" from "this repo authored one of its own"; the
+//!   skip is recorded per unit in the `[provisioned: …]` ledger as
+//!   `skipped-root-versioned`, so it is never silent.
 //!
 //! ## Which repos this actually changes
 //!
@@ -247,6 +276,14 @@ impl TrackedPaths {
         self.unknown_in_repo
     }
 
+    /// True iff the probe ANSWERED and the repository tracks at least one path
+    /// under the probed root, i.e. the checkout versions the provisioned tree
+    /// itself. Never true for an UNKNOWN probe: its set is empty by
+    /// construction, so that arm keeps its own rule.
+    pub(crate) fn is_root_versioned(&self) -> bool {
+        !self.unknown_in_repo && !self.relative.is_empty()
+    }
+
     /// True iff git tracks `relative` (a path relative to the probed root).
     pub(crate) fn contains(&self, relative: &Path) -> bool {
         self.relative.contains(relative)
@@ -269,8 +306,18 @@ impl TrackedPaths {
     /// When the probe was UNKNOWN inside a repository, every EXISTING `dst` is
     /// skipped whether or not it is tracked: nothing could say it is safe to
     /// overwrite. An absent `dst` is still written.
+    ///
+    /// One more skip applies to an ABSENT `dst`: when the probe answered and
+    /// the repository tracks at least one path under the probed root (it
+    /// VERSIONS the provisioned tree), an absent path it does not track is
+    /// skipped ([`SkipReason::RootVersioned`]) — see the module doc's "A
+    /// checkout that versions the provisioned tree" section. A tracked path
+    /// that was deleted is still written, as above.
     pub(crate) fn skip_reason(&self, dst: &Path, relative: &Path) -> Option<SkipReason> {
         if !dst.exists() {
+            if self.is_root_versioned() && !self.contains(relative) {
+                return Some(SkipReason::RootVersioned);
+            }
             return None;
         }
         if self.contains(relative) {
@@ -721,6 +768,99 @@ mod tests {
         assert!(
             tracked.skip_reason(&f, Path::new("gone.md")).is_none(),
             "but with no file on disk there is nothing to clobber, so we write"
+        );
+    }
+
+    /// Plan `2026-11-09-a-provisioned-copy-of-an-upstream-added-file-wedges-the-served-checkout-fast-forward`
+    /// Phase 2, arm 1: an ABSENT path the repository does not track, in a
+    /// checkout that tracks something under the probed root, is NOT created —
+    /// creating it is what wedges that checkout's fast-forward when upstream
+    /// later adds the same path. Includes a path inside a directory the
+    /// repository has never seen (an upstream-added skill DIRECTORY).
+    #[test]
+    fn an_absent_untracked_path_in_a_root_versioned_repo_is_skipped() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        git_init(tmp.path());
+        let owned = tmp.path().join("owned.md");
+        std::fs::write(&owned, b"body").unwrap();
+        git_add(tmp.path(), &owned);
+
+        let tracked = TrackedPaths::probe(tmp.path());
+        assert!(tracked.is_root_versioned());
+        let added = tmp.path().join("upstream-added.md");
+        assert_eq!(
+            tracked.skip_reason(&added, Path::new("upstream-added.md")),
+            Some(SkipReason::RootVersioned)
+        );
+        let in_new_dir = PathBuf::from("new-skill").join("helper.sh");
+        assert_eq!(
+            tracked.skip_reason(&tmp.path().join(&in_new_dir), &in_new_dir),
+            Some(SkipReason::RootVersioned),
+            "a whole upstream-added directory must not be created either"
+        );
+        assert!(!added.exists());
+    }
+
+    /// Phase 2, arm 2: in that same root-versioned repo a tracked path the user
+    /// DELETED keeps today's write — the new skip is for paths the repository
+    /// does not track, never for its own deleted ones.
+    #[test]
+    fn a_tracked_but_deleted_path_in_a_root_versioned_repo_is_written() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        git_init(tmp.path());
+        let keep = tmp.path().join("keep.md");
+        let gone = tmp.path().join("gone.md");
+        std::fs::write(&keep, b"body").unwrap();
+        std::fs::write(&gone, b"body").unwrap();
+        git_add(tmp.path(), &keep);
+        git_add(tmp.path(), &gone);
+        std::fs::remove_file(&gone).unwrap();
+
+        let tracked = TrackedPaths::probe(tmp.path());
+        assert!(tracked.is_root_versioned());
+        assert_eq!(tracked.skip_reason(&gone, Path::new("gone.md")), None);
+    }
+
+    /// Phase 2, arm 3: a repository that tracks NOTHING under the probed root
+    /// (every product repo's agent worktree) still receives every absent path.
+    /// The probe ANSWERS here (an empty listing, exit 0) — unlike a plain
+    /// directory outside any repository — so this is the arm that proves the
+    /// skip keys on what is tracked, not on being in a repository.
+    #[test]
+    fn an_absent_path_in_an_unversioned_repo_is_written() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        git_init(tmp.path());
+        let elsewhere = tmp.path().join("README.md");
+        std::fs::write(&elsewhere, b"body").unwrap();
+        git_add(tmp.path(), &elsewhere);
+        let root = tmp.path().join(".claude").join("commands");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let tracked = TrackedPaths::probe(&root);
+        assert!(!tracked.is_unknown_in_repo(), "the probe answered");
+        assert!(!tracked.is_root_versioned());
+        assert_eq!(
+            tracked.skip_reason(&root.join("vet-plan.md"), Path::new("vet-plan.md")),
+            None
+        );
+    }
+
+    /// An UNKNOWN probe is never root-versioned: its set is empty, and that arm
+    /// keeps its own rule (an absent destination is still written).
+    #[test]
+    fn an_unknown_probe_is_never_root_versioned() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join(".git"),
+            b"gitdir: /nonexistent/qontinui-provision-guard-root-versioned-test\n",
+        )
+        .unwrap();
+        let tracked = TrackedPaths::probe(tmp.path());
+        assert!(tracked.is_unknown_in_repo());
+        assert!(!tracked.is_root_versioned());
+        assert_eq!(
+            tracked.skip_reason(&tmp.path().join("absent.md"), Path::new("absent.md")),
+            None
         );
     }
 
