@@ -8252,15 +8252,16 @@ fn classify_pty_spawn_error(e: &str) -> (String, SpawnPhase) {
     }
 }
 
-/// `POST /terminals`' report of a spawn that failed AFTER its worktree was
-/// allocated. Coord moves the allocation's rows from `allocated` to
-/// `abandoned`, so the allocation stops counting as live. That is a ledger fact:
+/// A terminal door's report of a spawn that failed AFTER its worktree was
+/// allocated — every `acquire_for_terminal` door, through
+/// [`crate::agent_worktree::isolated_edit::IsolatedEditContext::report_unspawned`].
+/// Coord moves the allocation's rows from `allocated` to `abandoned`, so the allocation stops counting as live. That is a ledger fact:
 /// it does not remove the tree from disk. Best-effort, like every caller of
 /// [`report_spawn_failed_in_phase`]: one attempt, and nothing is posted on a
 /// runner with no connected coord base. The failure is classified the way the
 /// condition-check path classifies a PTY-seam failure
 /// ([`classify_pty_spawn_error`]), so a trust-gate block posts as `blocked`.
-pub(crate) async fn report_http_terminal_spawn_failed(agent_id: uuid::Uuid, error: &str) {
+pub(crate) async fn report_terminal_spawn_failed(agent_id: uuid::Uuid, error: &str) {
     let (reason, phase) = classify_pty_spawn_error(error);
     report_spawn_failed_in_phase(agent_id, &reason, None, 0, None, phase).await;
 }
