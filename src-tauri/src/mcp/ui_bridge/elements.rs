@@ -4027,6 +4027,77 @@ pub async fn ui_bridge_find_handler(
 // Convenience endpoints — app-agnostic DOM interaction helpers
 // =========================================================================
 
+/// The script `page/find-by-text` evaluates: the visible `tag` elements whose
+/// trimmed text equals `text` case-sensitively (`exact`), or else contains it
+/// case-insensitively, as a JSON array. Both caller values enter the script
+/// only as single-quoted string data, `\` and `'` escaped, so neither can close
+/// its literal and splice code. That is the invariant the unguarded fallback
+/// of `evaluate_js_expression` (helpers.rs) relies on.
+fn find_by_text_js(text: &str, tag: &str, exact: bool) -> String {
+    let escaped_text = text.replace('\\', "\\\\").replace('\'', "\\'");
+    let escaped_tag = tag.replace('\\', "\\\\").replace('\'', "\\'");
+    let match_expr = if exact {
+        format!("el.textContent.trim() === '{}'", escaped_text)
+    } else {
+        format!(
+            "el.textContent.trim().toLowerCase().includes('{}')",
+            escaped_text.to_lowercase()
+        )
+    };
+
+    format!(
+        r#"JSON.stringify(Array.from(document.querySelectorAll('{tag}'))
+            .filter(el => el.offsetParent !== null && {match_expr})
+            .map((el, i) => ({{
+                index: i,
+                tag: el.tagName,
+                text: el.textContent.trim().slice(0, 100),
+                id: el.id || null,
+                disabled: el.disabled || false,
+                visible: el.offsetParent !== null,
+                rect: (() => {{ const r = el.getBoundingClientRect(); return {{ x: Math.round(r.x), y: Math.round(r.y), width: Math.round(r.width), height: Math.round(r.height) }}; }})()
+            }})))"#,
+        tag = escaped_tag,
+        match_expr = match_expr
+    )
+}
+
+#[cfg(test)]
+mod find_by_text_js_tests {
+    use super::find_by_text_js;
+
+    /// A caller's `tag` enters the script as escaped string data, exactly as
+    /// `text` does. A tag that tries to close its `querySelectorAll('...')`
+    /// literal and call `fetch` stays inside the literal, and so does a
+    /// trailing backslash that would otherwise escape the closing quote.
+    #[test]
+    fn a_hostile_tag_stays_inside_its_string_literal() {
+        for exact in [true, false] {
+            let js = find_by_text_js(
+                "Submit",
+                "*'),fetch('/x'),document.querySelectorAll('*",
+                exact,
+            );
+            assert!(
+                js.contains(
+                    r"querySelectorAll('*\'),fetch(\'/x\'),document.querySelectorAll(\'*')"
+                ),
+                "the tag must sit escaped inside its literal, got: {js}"
+            );
+            assert!(
+                !js.contains("'),fetch('"),
+                "the tag must not close its literal and splice a call, got: {js}"
+            );
+
+            let js = find_by_text_js("Submit", r"button\", exact);
+            assert!(
+                js.contains(r"querySelectorAll('button\\')"),
+                "a trailing backslash in the tag must be escaped, got: {js}"
+            );
+        }
+    }
+}
+
 /// Find elements by visible text content.
 /// POST /ui-bridge/control/page/find-by-text
 /// Body: { "text": "Submit", "tag": "button", "exact": true }
@@ -4045,31 +4116,7 @@ pub async fn ui_bridge_find_by_text_handler(
         ));
     }
 
-    let escaped_text = text.replace('\\', "\\\\").replace('\'', "\\'");
-    let match_expr = if exact {
-        format!("el.textContent.trim() === '{}'", escaped_text)
-    } else {
-        format!(
-            "el.textContent.trim().toLowerCase().includes('{}')",
-            escaped_text.to_lowercase()
-        )
-    };
-
-    let js = format!(
-        r#"JSON.stringify(Array.from(document.querySelectorAll('{tag}'))
-            .filter(el => el.offsetParent !== null && {match_expr})
-            .map((el, i) => ({{
-                index: i,
-                tag: el.tagName,
-                text: el.textContent.trim().slice(0, 100),
-                id: el.id || null,
-                disabled: el.disabled || false,
-                visible: el.offsetParent !== null,
-                rect: (() => {{ const r = el.getBoundingClientRect(); return {{ x: Math.round(r.x), y: Math.round(r.y), width: Math.round(r.width), height: Math.round(r.height) }}; }})()
-            }})))"#,
-        tag = tag,
-        match_expr = match_expr
-    );
+    let js = find_by_text_js(text, tag, exact);
 
     // Optional `windowLabel` scopes the read to a pop-out window (Phase 4 of
     // plan 2026-06-07-multi-window-sdk-automation); omit -> main window.
