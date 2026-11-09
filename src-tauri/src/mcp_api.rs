@@ -89,8 +89,6 @@ mod serve;
 
 use drain::drain_handler;
 pub(crate) use serve::lan_reachable_for_bound_addr;
-#[cfg(test)]
-use serve::not_found_message;
 use serve::{not_found_handler, runner_panic_handler, try_bind_port};
 
 /// Every source file of the `mcp_api` module, as `(path relative to src/, text)`:
@@ -23761,7 +23759,7 @@ mod envelope_coverage_tests {
 /// file's source.
 #[cfg(test)]
 mod oauth_dcr_surface_absent_tests {
-    use super::{not_found_handler, not_found_message};
+    use super::{not_found_handler, serve::not_found_message};
     use axum::{body::Body, http::Method, http::Request, Router};
     use tower::ServiceExt;
 
