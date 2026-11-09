@@ -35,6 +35,7 @@ pub mod pane_io;
 pub mod pane_output;
 pub mod phantom_turn;
 pub mod remote_pane_io;
+pub mod respawn_liveness; // Is the resumed CLI alive? The proof + retry-then-rollback every `--resume` respawn passes (plan 2026-10-20-account-migration-respawn-dies-during-cli-reinstall-churn, Phase 4)
 mod scan_gate;
 pub mod scan_interval;
 pub mod session;

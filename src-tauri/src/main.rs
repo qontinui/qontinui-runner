@@ -4653,8 +4653,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
                     use session::session_lifecycle_store::{
                         boot_restore_hold, boot_restore_phase, carries_boot_restore_hold, classify,
-                        close_reason_for_dead_shell, hold_for_withheld_boot_restore,
-                        match_live_terminal, PollAction, WorkerPlane,
+                        close_reason_for_dead_shell, match_live_terminal, PollAction, WorkerPlane,
                     };
 
                     // Reference instant for `claude_present_in_inclusive_subtree`'s
@@ -5118,7 +5117,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                             // restore — never closed `no-terminal` meanwhile.
                             let adoption_pending =
                                 terminal::holder_boot_sweep::adoption_pending(&rec.terminal_id);
-                            let action = hold_for_withheld_boot_restore(
+                            // A respawn (account migration, resume door,
+                            // respawn receiver) is proving this session's new
+                            // pane alive or rolling it back: its row may sit
+                            // on a pane whose child already exited, and a
+                            // close here would destroy what the retry or the
+                            // rollback rebinds (plan
+                            // 2026-10-20-account-migration-respawn-dies-during-cli-reinstall-churn).
+                            let action = session::in_flight::hold_poll_action(
                                 classify(
                                     live_is_alive,
                                     claude_present,
@@ -5130,6 +5136,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                     worker_plane,
                                 ),
                                 held || adoption_pending,
+                                &rec.claude_session_id,
                             );
                             if adoption_pending && action == PollAction::Skip {
                                 consecutive_no_match.remove(&rec.claude_session_id);

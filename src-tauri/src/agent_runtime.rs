@@ -1191,16 +1191,43 @@ fn launchable_or_bare(resolved: String) -> String {
 /// head of each candidate — callers on an async task must run this via
 /// `spawn_blocking`.
 pub(crate) fn resolve_claude_bin() -> String {
+    try_resolve_claude_bin_in(std::env::var_os("PATH").as_deref()).unwrap_or_else(claude_bin_path)
+}
+
+/// [`resolve_claude_bin`] WITHOUT its bare-name fallback, and with
+/// [`launchable_or_bare`]'s execute-bit check folded in: `None` when no
+/// launchable `claude` resolves — nothing on PATH, only npm's placeholder stub,
+/// or a resolved file that is not executable. An explicit absolute
+/// `QONTINUI_CLAUDE_BIN` override is passed through unjudged.
+///
+/// For a caller that must never hand the PTY the bare name: a `--resume`
+/// respawn whose bare `claude` finds the identity shim first on the pane's
+/// PATH, misses again inside the shim's bounded wait during a CLI reinstall,
+/// and exits 127 — the lost-session shape of plan
+/// `2026-10-20-account-migration-respawn-dies-during-cli-reinstall-churn`
+/// (D3.1). [`crate::claude_cli_spawn::resolve_resume_claude_bin`] retries it.
+/// Blocking, like [`resolve_claude_bin`].
+pub(crate) fn try_resolve_launchable_claude_bin() -> Option<String> {
+    let bare = claude_bin_path();
+    let resolved = try_resolve_claude_bin_in(std::env::var_os("PATH").as_deref())?;
+    if std::path::Path::new(&bare).is_absolute() {
+        return Some(resolved);
+    }
+    // `launchable_or_bare` answers the bare name for a non-executable file.
+    let launchable = launchable_or_bare(resolved);
+    (launchable != bare).then_some(launchable)
+}
+
+/// The PATH walk behind [`resolve_claude_bin`], over an explicit `path` value
+/// (testable without replacing the process PATH). `None` on a miss.
+fn try_resolve_claude_bin_in(path: Option<&std::ffi::OsStr>) -> Option<String> {
     let bare = claude_bin_path();
     // An explicit `QONTINUI_CLAUDE_BIN` override (or any absolute path) is
     // launchable as-is — no PATH search, no shim shadowing.
     if std::path::Path::new(&bare).is_absolute() {
-        return bare;
+        return Some(bare);
     }
-    let path = match std::env::var_os("PATH") {
-        Some(p) => p,
-        None => return bare,
-    };
+    let path = path?;
     // Skip every qontinui shim/identity dir — ours or one inherited from
     // another session. They hold the extensionless script that triggers os
     // error 193 under a direct `CreateProcessW`, and a shim is never the real
@@ -1216,7 +1243,7 @@ pub(crate) fn resolve_claude_bin() -> String {
     // Only extensions CreateProcessW can natively launch — see doc comment.
     #[cfg(windows)]
     let exts: &[&str] = &[".exe", ".com"];
-    for dir in std::env::split_paths(&path) {
+    for dir in std::env::split_paths(path) {
         if is_qontinui_shim_dir(&dir) || is_persistent_identity_dir_in(&dir, persistent.as_deref())
         {
             continue;
@@ -1226,7 +1253,7 @@ pub(crate) fn resolve_claude_bin() -> String {
             for ext in exts {
                 let cand = dir.join(format!("{bare}{ext}"));
                 if cand.is_file() {
-                    return cand.to_string_lossy().into_owned();
+                    return Some(cand.to_string_lossy().into_owned());
                 }
             }
         }
@@ -1235,11 +1262,11 @@ pub(crate) fn resolve_claude_bin() -> String {
             use qontinui_runner_lib::intercept_core::npm_placeholder::is_npm_placeholder;
             let cand = dir.join(&bare);
             if cand.is_file() && !is_npm_placeholder(&cand) {
-                return cand.to_string_lossy().into_owned();
+                return Some(cand.to_string_lossy().into_owned());
             }
         }
     }
-    bare
+    None
 }
 
 // =============================================================================
@@ -4982,12 +5009,14 @@ pub(crate) struct CarriedContinuation {
 /// exit between the lift and the re-pin* — is a **reviewer obligation, not a
 /// compiler-checked one**. `#[must_use]` does not cover it: the permit IS used
 /// (it is bound at the lift), so inserting a `?` or a `return Err(..)` between
-/// the lift and `match spawned` drops it on the way out, releases the anchor,
+/// the lift and the `carried_continuation.settle` call (the migration wraps
+/// the permit in `respawn_liveness::OwedSettle`, which turns such an exit into a
+/// `warn!` and a re-pin onto the old terminal) drops it on the way out, releases the anchor,
 /// and silently reopens this window with **no compiler warning, no clippy
-/// lint, and no failing test** — none of the tests calls `migrate_session`.
+/// lint, and no failing test** — none of the tests calls `confirm_migration`.
 /// A `let (carried, _) = …` or `let Some((c, _permit)) = …` is the same silent
 /// drop. Both ends of the window in
-/// [`crate::terminal::account_migration::migrate_session`] carry a `GUARD:`
+/// `crate::terminal::account_migration::confirm_migration` carry a `GUARD:`
 /// marker comment so the span is greppable; keep them there.
 pub(crate) fn take_continuation_registration(
     terminal_id: &str,
@@ -15936,6 +15965,85 @@ mod tests {
         assert_eq!(non_exec, "claude");
         assert_eq!(exec, f.to_string_lossy());
         assert_eq!(missing, "claude");
+    }
+
+    /// The strict resolver a `--resume` respawn uses answers `None` on a miss —
+    /// nothing on PATH, or only npm's placeholder stub — where
+    /// [`resolve_claude_bin`] hands back the bare name (plan
+    /// 2026-10-20-account-migration-respawn-dies-during-cli-reinstall-churn D3.1).
+    #[cfg(unix)]
+    #[test]
+    fn try_resolve_claude_bin_is_none_on_a_miss_never_the_bare_name() {
+        use std::os::unix::fs::PermissionsExt;
+        let _env_lock = env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&["QONTINUI_CLAUDE_BIN"]);
+        std::env::remove_var("QONTINUI_CLAUDE_BIN");
+        let tmp = tempfile::tempdir().unwrap();
+        let empty = tmp.path().join("empty");
+        let stub_dir = tmp.path().join("stub");
+        let real_dir = tmp.path().join("real");
+        for d in [&empty, &stub_dir, &real_dir] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let stub = stub_dir.join("claude");
+        std::fs::write(
+            &stub,
+            "echo \"Error: claude native binary not installed.\" >&2\nexit 1\n",
+        )
+        .unwrap();
+        let real = real_dir.join("claude");
+        std::fs::write(&real, "#!/bin/sh\n").unwrap();
+        for f in [&stub, &real] {
+            std::fs::set_permissions(f, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let path_of = |dirs: &[&std::path::PathBuf]| std::env::join_paths(dirs).unwrap();
+        let (only_empty, stub_only, stub_then_real) = (
+            path_of(&[&empty]),
+            path_of(&[&empty, &stub_dir]),
+            path_of(&[&stub_dir, &real_dir]),
+        );
+        assert_eq!(try_resolve_claude_bin_in(None), None, "no PATH at all");
+        assert_eq!(
+            try_resolve_claude_bin_in(Some(only_empty.as_os_str())),
+            None
+        );
+        assert_eq!(
+            try_resolve_claude_bin_in(Some(stub_only.as_os_str())),
+            None,
+            "the placeholder stub alone is a miss"
+        );
+        assert_eq!(
+            try_resolve_claude_bin_in(Some(stub_then_real.as_os_str())).as_deref(),
+            Some(&*real.to_string_lossy())
+        );
+        std::env::set_var("QONTINUI_CLAUDE_BIN", "/an/absolute/override");
+        assert_eq!(
+            try_resolve_claude_bin_in(Some(only_empty.as_os_str())).as_deref(),
+            Some("/an/absolute/override"),
+            "an absolute override is passed through"
+        );
+    }
+
+    /// A resolved but NON-executable `claude` is a miss for the strict
+    /// resolver (where [`launchable_or_bare`] falls back to the bare name).
+    #[cfg(unix)]
+    #[test]
+    fn try_resolve_launchable_claude_bin_refuses_a_non_executable_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let _env_lock = env_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let bin = bin_dir.join("claude");
+        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let _env = ClaudeBinEnv::prepend(std::slice::from_ref(&bin_dir));
+        assert_eq!(try_resolve_launchable_claude_bin(), None);
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            try_resolve_launchable_claude_bin().as_deref(),
+            Some(&*bin.to_string_lossy())
+        );
     }
 
     #[test]
