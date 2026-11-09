@@ -117,6 +117,9 @@ impl SpawnGroup {
         if name.starts_with("check-") {
             return Self::Check;
         }
+        if FIXER_NAME_PREFIXES.iter().any(|p| name.starts_with(p)) {
+            return Self::Fixer;
+        }
         // Coord's generic names end in a free-form subject (a file stem), so a
         // `resume-…-steward` names a resource, not a steward session.
         let coord_generic = name.starts_with("pr-") || name.starts_with("resume-");
@@ -148,6 +151,15 @@ impl SpawnGroup {
 pub(crate) fn is_spawn_group_page(page_id: &str) -> bool {
     SpawnGroup::ALL.iter().any(|g| g.owns_page(page_id))
 }
+
+/// The name prefixes coord's fixer lanes stamp on a launch (plan
+/// `2026-11-08-coord-fixers-open-terminal-tabs-and-spawn-kinds-are-capped`, the
+/// wire-contract table): `fix-<repo>#<pr>` (pr_fix), `shepherd-<repo>#<pr>`
+/// (the unlandable-PR shepherd tiers), `review-<repo>#<pr>` (escalate-review),
+/// `red-main-<repo>` (the red-main fixer) and `respond-…` (the red-main and
+/// admission-stall responders). Like `post-merge-` / `impl-` / `check-` these
+/// are SPECIFIC names, so they decide before the prompt is read.
+const FIXER_NAME_PREFIXES: [&str; 5] = ["fix-", "shepherd-", "review-", "red-main-", "respond-"];
 
 /// Skills whose session is a one-shot repair.
 fn is_fixer_skill(skill: &str) -> bool {
@@ -307,6 +319,49 @@ mod tests {
             assert_eq!(SpawnGroup::classify(Some(name), None), want, "{name}");
         }
         assert_eq!(SpawnGroup::classify(None, None), SpawnGroup::Spawned);
+    }
+
+    #[test]
+    fn coord_fixer_lane_names_are_fixers() {
+        // One name per lane in the plan's wire-contract table.
+        for name in [
+            "fix-runner#1863",
+            "shepherd-coord#42",
+            "review-web#7",
+            "red-main-runner",
+            "respond-red-main-coord",
+            "respond-stall-runner",
+        ] {
+            assert_eq!(
+                SpawnGroup::classify(Some(name), None),
+                SpawnGroup::Fixer,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_fixer_name_is_not_overridden_by_the_prompt() {
+        // Name first: a fixer whose brief opens with a steward or PR skill is
+        // still a fixer, and a fixer name ending in `-steward` is not a steward.
+        assert_eq!(
+            SpawnGroup::classify(Some("shepherd-runner#9"), Some("/babysit-prs 9")),
+            SpawnGroup::Fixer
+        );
+        assert_eq!(
+            SpawnGroup::classify(Some("fix-merge-train-steward"), Some("/cleanup-steward")),
+            SpawnGroup::Fixer
+        );
+        // The prefix must be the whole leading word: `prefix-` names are not
+        // fixers, and neither are names that merely contain a fixer word.
+        assert_eq!(
+            SpawnGroup::classify(Some("prefix-thing"), None),
+            SpawnGroup::Spawned
+        );
+        assert_eq!(
+            SpawnGroup::classify(Some("resume-fix-red-main"), None),
+            SpawnGroup::Resume
+        );
     }
 
     #[test]

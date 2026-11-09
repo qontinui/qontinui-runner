@@ -41,6 +41,7 @@
 #               or launches nothing. detail = why (non-empty).
 
 agent_runtime.rs | run_agent_subprocess | autonomous | spawn_run_task > run_agent_subprocess
+agent_runtime.rs | run_agent_terminal | autonomous | spawn_run_task > run_agent_subprocess > run_agent_terminal
 agent_runtime.rs | run_condition_check_terminal | autonomous | run_condition_check_terminal
 agent_runtime.rs | run_continuation_headless | autonomous | run_gate_continuation_inner > run_continuation_headless
 agent_runtime.rs | run_continuation_terminal | autonomous | run_gate_continuation_inner

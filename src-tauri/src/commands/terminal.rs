@@ -2743,6 +2743,10 @@ pub(crate) fn create_terminal_session_backend(
                             "gate-continuation terminal exit hook: coord session close failed"
                         );
                     }
+                    // A coord launch running in this pane (plan
+                    // 2026-11-08-coord-fixers-open-terminal-tabs-and-spawn-kinds-are-capped)
+                    // ends its run task, heartbeat and agent token with the tab.
+                    crate::agent_runtime::notify_agent_terminal_exit(&exited_terminal_id, exit);
                     crate::agent_runtime::notify_continuation_terminal_exit(
                         &exited_terminal_id,
                         exit_rt_handle.as_ref(),
