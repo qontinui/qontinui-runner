@@ -10644,7 +10644,11 @@ fn provision_agent_definitions_retiring(
     // outside the roster and is written even in a versioned checkout. When the
     // source probe cannot answer inside a repository, every overlay name stays
     // in the roster: withholding is the safe side, since writing an
-    // upstream-added one is exactly the fast-forward wedge.
+    // upstream-added one is exactly the fast-forward wedge. The cost, stated:
+    // that wider roster also decides versioning, so a checkout tracking only a
+    // repo-local agent whose name collides with an untracked overlay file reads
+    // as versioned while the source probe is UNKNOWN, and withholds its absent
+    // embedded agents for that pass.
     let overlay_tracked = crate::provision_guard::TrackedPaths::probe(&src_dir);
     let embedded_names = crate::fleet_agents::embedded_agent_names();
     let tracked = crate::provision_guard::TrackedPaths::probe(&dst_dir).versioning(
