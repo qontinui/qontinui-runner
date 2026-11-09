@@ -134,6 +134,7 @@ impl CloudTransport {
             .local_addr()
             .map_err(|e| TransportError::ProxyBindFailed(e.to_string()))?
             .port();
+        super::mark_off_machine_forwarder(local_port);
 
         info!(
             "[cloud-transport] Tunnel for {} listening on 127.0.0.1:{}",
@@ -274,8 +275,8 @@ impl CloudTransport {
                     }
 
                     // Shutdown signal
-                    _ = shutdown_rx.changed() => {
-                        if *shutdown_rx.borrow() {
+                    changed = shutdown_rx.changed() => {
+                        if changed.is_err() || *shutdown_rx.borrow() {
                             info!("[cloud-transport] Shutdown signal received");
                             break;
                         }
@@ -311,8 +312,8 @@ impl CloudTransport {
                             }
                         }
                     }
-                    _ = shutdown_rx2.changed() => {
-                        if *shutdown_rx2.borrow() {
+                    changed = shutdown_rx2.changed() => {
+                        if changed.is_err() || *shutdown_rx2.borrow() {
                             break;
                         }
                     }
@@ -326,10 +327,20 @@ impl CloudTransport {
             task_handle,
         };
 
-        self.tunnels
+        let replaced = self
+            .tunnels
             .lock()
             .await
             .insert(device_id.to_string(), handle);
+        if let Some(replaced) = replaced {
+            info!("[cloud-transport] Replacing tunnel for {}", device_id);
+            // In a task of its own: a stalled relay must not park the caller's poll.
+            tokio::spawn(async move {
+                let replaced_port = replaced.local_port;
+                replaced.shutdown().await;
+                super::unmark_off_machine_forwarder(replaced_port);
+            });
+        }
 
         Ok(local_port)
     }
@@ -339,7 +350,9 @@ impl CloudTransport {
         let handle = self.tunnels.lock().await.remove(device_id);
         if let Some(h) = handle {
             info!("[cloud-transport] Closing tunnel for {}", device_id);
+            let local_port = h.local_port;
             h.shutdown().await;
+            super::unmark_off_machine_forwarder(local_port);
         }
     }
 
@@ -348,7 +361,9 @@ impl CloudTransport {
         let handles: Vec<(String, TunnelHandle)> = self.tunnels.lock().await.drain().collect();
         for (device_id, handle) in handles {
             info!("[cloud-transport] Closing tunnel for {}", device_id);
+            let local_port = handle.local_port;
             handle.shutdown().await;
+            super::unmark_off_machine_forwarder(local_port);
         }
     }
 }
@@ -610,6 +625,7 @@ mod tests {
             .await
             .expect("tunnel opens against the local relay");
         drop(guard);
+        let _forget = crate::mcp::transport::ForgetForwarder(local_port);
         assert!(local_port > 0);
         assert_eq!(
             saw_token.lock().unwrap().as_deref(),
@@ -629,6 +645,87 @@ mod tests {
             "token leaked: {logs:?}"
         );
         assert!(!logs.contains("token="), "a token query leaked: {logs:?}");
+    }
+
+    /// A relay that accepts any number of tunnels and reads them until they end.
+    async fn spawn_relay() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    if let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await {
+                        while let Some(Ok(_)) = ws.next().await {}
+                    }
+                });
+            }
+        });
+        format!("http://127.0.0.1:{relay_port}")
+    }
+
+    /// A tunnel's port is marked for as long as the tunnel exists, and closing
+    /// the tunnel gives the port back.
+    #[tokio::test]
+    async fn a_tunnel_port_is_a_forwarder_until_the_tunnel_closes() {
+        let transport = CloudTransport::new(spawn_relay().await);
+        let local_port = transport
+            .open_tunnel("device-under-test", "token")
+            .await
+            .expect("tunnel opens against the local relay");
+        assert!(crate::mcp::transport::is_off_machine_forwarder(local_port));
+
+        transport.close_tunnel("device-under-test").await;
+        assert!(!crate::mcp::transport::is_off_machine_forwarder(local_port));
+    }
+
+    /// Reopening a device's tunnel closes the old one, whose port stops being a
+    /// forwarder. The scanner reopens after a device is removed and comes back.
+    #[tokio::test]
+    async fn reopening_a_tunnel_closes_the_one_it_replaces() {
+        let transport = CloudTransport::new(spawn_relay().await);
+        let first = transport
+            .open_tunnel("device-under-test", "token")
+            .await
+            .expect("first tunnel");
+        let second = transport
+            .open_tunnel("device-under-test", "token")
+            .await
+            .expect("second tunnel");
+        let _forget = crate::mcp::transport::ForgetForwarder(second);
+
+        assert!(crate::mcp::transport::is_off_machine_forwarder(second));
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while crate::mcp::transport::is_off_machine_forwarder(first) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the replaced tunnel closes in the background");
+    }
+
+    /// Dropping the handle stops the tunnel, as `TunnelHandle` documents: the
+    /// listener closes rather than the tasks spinning on a dead shutdown channel.
+    #[tokio::test]
+    async fn a_dropped_tunnel_handle_stops_the_tunnel() {
+        let transport = CloudTransport::new(spawn_relay().await);
+        let local_port = transport
+            .open_tunnel("device-under-test", "token")
+            .await
+            .expect("tunnel opens against the local relay");
+        // Forgotten while the port is still bound, so no peer is handed it marked.
+        crate::mcp::transport::unmark_off_machine_forwarder(local_port);
+        drop(transport);
+
+        let refused = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while tokio::net::TcpStream::connect(("127.0.0.1", local_port))
+                .await
+                .is_ok()
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(refused.is_ok(), "the tunnel's listener stayed open");
     }
 
     #[test]
