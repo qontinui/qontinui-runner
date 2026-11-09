@@ -161,12 +161,15 @@ fn spawn_precheck_or_invoke_error(
 }
 
 /// The `terminal_create` proxy's spawn-tenant admission: the shared
-/// [`crate::commands::terminal::admit_spawn_tenant`], answered as the invoke
-/// error a refused `terminal_create` command would return.
+/// [`crate::commands::terminal::admit_spawn_tenant`], answered through the
+/// same typed path the failed-create arm uses
+/// ([`TauriInvokeResponse::spawn_failed`]) — so a `terminal:tenant_<kind>:`
+/// refusal carries `TERMINAL_TENANT_<KIND>` and its status whichever gate gave
+/// it, the precheck here or the identity seam inside the spawn.
 fn spawn_tenant_or_invoke_error(
     raw: Option<&str>,
 ) -> Result<Option<uuid::Uuid>, TauriInvokeResponse> {
-    crate::commands::terminal::admit_spawn_tenant(raw).map_err(TauriInvokeResponse::err)
+    crate::commands::terminal::admit_spawn_tenant(raw).map_err(TauriInvokeResponse::spawn_failed)
 }
 
 impl TauriInvokeResponse {
@@ -726,8 +729,17 @@ mod spawn_tenant_tests {
         let refusal =
             spawn_tenant_or_invoke_error(Some(&b.to_string())).expect_err("unpaired → refused");
         assert!(!refusal.success);
+        assert_eq!(refusal.code.as_deref(), Some("TERMINAL_TENANT_NOT_PAIRED"));
+        assert_eq!(refusal.status, Some(StatusCode::BAD_REQUEST));
         let error = refusal.error.unwrap_or_default();
         assert!(error.starts_with("terminal:tenant_not_paired:"), "{error}");
+        // The same text through the failed-create arm gives the same answer.
+        let via_create = TauriInvokeResponse::spawn_failed(error.clone());
+        assert_eq!(
+            via_create.code.as_deref(),
+            Some("TERMINAL_TENANT_NOT_PAIRED")
+        );
+        assert_eq!(via_create.status, Some(StatusCode::BAD_REQUEST));
         assert_eq!(
             spawn_tenant_or_invoke_error(Some(&a.to_string())).ok(),
             Some(Some(a))

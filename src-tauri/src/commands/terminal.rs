@@ -66,6 +66,11 @@ pub(crate) fn admit_spawn_tenant(raw: Option<&str>) -> Result<Option<uuid::Uuid>
 ///   allocation (if this call made one) is taken out of `isolated_ctx` and
 ///   handed to `remove` with the failure, whose `child_started` decides
 ///   whether its tree may be removed, as on every `acquire_for_terminal` door.
+///   Not every create error is pre-child: `create`'s "Sessions lock poisoned"
+///   comes AFTER a successful spawn (the child is running and a `LocalPty` has
+///   no kill on drop), so it is typed `child_started = true` and the tree is
+///   kept and only reported — the same as a reader/writer failure in
+///   `spawn_with_io`.
 /// - A **join error** is a panic inside `create`, which may come after
 ///   `sessions.insert` — a live session may hold the tree — so it is logged,
 ///   the context is left in place, and nothing is removed or reported (plan

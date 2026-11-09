@@ -153,7 +153,11 @@ pub(crate) fn relay_spawn_failed_frame(error: &str, data: &Value, echo_remote: b
         frame["code"] = Value::String(code);
     }
     if echo_remote {
-        frame["remote"] = crate::mcp::remote_terminal::remote_echo(data);
+        let remote = crate::mcp::remote_terminal::remote_echo(data);
+        // Top-level `grant_jti` from the remote block, as the relay's other
+        // remote refusal and lifecycle frames carry it (`terminal_ended_frame`).
+        frame["grant_jti"] = remote["grant_jti"].clone();
+        frame["remote"] = remote;
     }
     frame
 }
@@ -315,6 +319,10 @@ mod tests {
             assert_eq!(frame["code"], code);
             assert_eq!(frame["remote"]["grant_jti"], "jti-9");
             assert_eq!(
+                frame["grant_jti"], "jti-9",
+                "top-level grant_jti, as sibling frames"
+            );
+            assert_eq!(
                 refused(&local),
                 relay_spawn_failed_frame(&text, &local, false)
             );
@@ -335,30 +343,265 @@ mod tests {
         }
     }
 
-    /// The production half of a source file with every `//` line blanked, so a
-    /// comment naming a guard cannot satisfy the check.
-    fn production_code_lines(src: &str) -> Vec<String> {
-        let prod = src.split("\n#[cfg(test)]\nmod ").next().unwrap_or(src);
-        prod.lines()
-            .map(|l| {
-                if l.trim_start().starts_with("//") {
-                    String::new()
-                } else {
-                    l.to_string()
-                }
-            })
-            .collect()
+    /// Counts the CODE braces of Rust source fed to it line by line — skipping
+    /// `//` and nested `/* */` comments, string literals (escapes included),
+    /// raw strings (`r"…"`, `r#"…"#`, spanning lines), and char literals, while
+    /// leaving lifetimes (`'a`) alone. Not a Rust lexer: enough of one that a
+    /// brace inside a format string or a doc example cannot move the depth,
+    /// which a plain `{`/`}` count did — it ran `terminal/mod.rs`'s test module
+    /// to end of file, so a door appended after it read as test code.
+    #[derive(Default)]
+    struct BraceLexer {
+        block_comment: u32,
+        in_str: bool,
+        raw_hashes: Option<usize>,
     }
 
-    /// A top-level item line opening a function (`fn`, `pub fn`, `async fn`,
-    /// `pub(crate) async fn`, …).
-    fn opens_top_level_fn(line: &str) -> bool {
-        !line.starts_with(char::is_whitespace)
-            && line.contains("fn ")
-            && (line.starts_with("fn ")
-                || line.starts_with("pub")
-                || line.starts_with("async fn ")
-                || line.starts_with("unsafe fn "))
+    impl BraceLexer {
+        /// `(opening, closing)` code braces on `line`.
+        fn feed(&mut self, line: &str) -> (i64, i64) {
+            let b = line.as_bytes();
+            let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+            let (mut open, mut close) = (0i64, 0i64);
+            let mut i = 0;
+            while i < b.len() {
+                if self.block_comment > 0 {
+                    if b[i..].starts_with(b"*/") {
+                        self.block_comment -= 1;
+                        i += 2;
+                    } else if b[i..].starts_with(b"/*") {
+                        self.block_comment += 1;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                    continue;
+                }
+                if let Some(h) = self.raw_hashes {
+                    if b[i] == b'"'
+                        && b.len() > i + h
+                        && b[i + 1..=i + h].iter().all(|&c| c == b'#')
+                    {
+                        self.raw_hashes = None;
+                        i += 1 + h;
+                    } else {
+                        i += 1;
+                    }
+                    continue;
+                }
+                if self.in_str {
+                    match b[i] {
+                        b'\\' => i += 2,
+                        b'"' => {
+                            self.in_str = false;
+                            i += 1;
+                        }
+                        _ => i += 1,
+                    }
+                    continue;
+                }
+                match b[i] {
+                    b'/' if b[i..].starts_with(b"//") => break,
+                    b'/' if b[i..].starts_with(b"/*") => {
+                        self.block_comment += 1;
+                        i += 2;
+                    }
+                    b'r' if (i == 0
+                        || !ident(b[i - 1])
+                        || (b[i - 1] == b'b' && (i < 2 || !ident(b[i - 2])))) =>
+                    {
+                        let hashes = b[i + 1..].iter().take_while(|&&c| c == b'#').count();
+                        if b.get(i + 1 + hashes) == Some(&b'"') {
+                            self.raw_hashes = Some(hashes);
+                            i += 2 + hashes;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    b'"' => {
+                        self.in_str = true;
+                        i += 1;
+                    }
+                    b'\'' => {
+                        // A char literal ('x', '\n', '\u{..}', a multi-byte
+                        // char) closes within a few bytes; a lifetime does not.
+                        let close_at = if b.get(i + 1) == Some(&b'\\') {
+                            b[i + 2..]
+                                .iter()
+                                .position(|&c| c == b'\'')
+                                .map(|p| i + 2 + p)
+                        } else {
+                            let width = match b.get(i + 1) {
+                                Some(&c) if c >= 0xF0 => 4,
+                                Some(&c) if c >= 0xE0 => 3,
+                                Some(&c) if c >= 0xC0 => 2,
+                                _ => 1,
+                            };
+                            (b.get(i + 1 + width) == Some(&b'\'')).then_some(i + 1 + width)
+                        };
+                        i = close_at.map_or(i + 1, |c| c + 1);
+                    }
+                    b'{' => {
+                        open += 1;
+                        i += 1;
+                    }
+                    b'}' => {
+                        close += 1;
+                        i += 1;
+                    }
+                    _ => i += 1,
+                }
+            }
+            (open, close)
+        }
+    }
+
+    /// A source file split for the scan: every line kept at its own index (so
+    /// a site's line number is true), with `//` lines blanked — a comment
+    /// naming a guard cannot satisfy the check — and the BODY of every
+    /// `#[cfg(test)] mod x { … }` block blanked into `test_lines`. Only a block
+    /// is skipped: a `#[cfg(test)] mod x;` DECLARATION hides nothing, and the
+    /// production code below it is scanned (it used to truncate the file at
+    /// the first `#[cfg(test)]\nmod `, which also matched a declaration and
+    /// hid the rest of nine files, `main.rs` among them).
+    ///
+    /// A skipped block must close on a line that is exactly `}` at the `mod`
+    /// line's own indentation; anything else is a lost brace count, recorded in
+    /// `errors` so the scan fails loudly instead of hiding production code.
+    struct ScannedSource {
+        production: Vec<String>,
+        test_lines: Vec<String>,
+        errors: Vec<String>,
+    }
+
+    fn scan_source(src: &str) -> ScannedSource {
+        let lines: Vec<&str> = src.lines().collect();
+        let mut production = Vec::with_capacity(lines.len());
+        let mut test_lines = Vec::new();
+        let mut errors = Vec::new();
+        let mut i = 0;
+        while i < lines.len() {
+            let opens_test_block = lines[i].trim() == "#[cfg(test)]"
+                && lines[i + 1..]
+                    .iter()
+                    .find(|l| !l.trim().is_empty() && !l.trim_start().starts_with("#["))
+                    .is_some_and(|l| {
+                        let t = l.trim();
+                        (t.starts_with("mod ")
+                            || t.starts_with("pub mod ")
+                            || t.starts_with("pub(crate) mod "))
+                            && t.ends_with('{')
+                    });
+            if opens_test_block {
+                // Blank from the attribute through the block's closing brace.
+                let attr_line = i + 1;
+                let indent = lines[i].len() - lines[i].trim_start().len();
+                let mut lexer = BraceLexer::default();
+                let mut depth = 0i64;
+                let mut opened = false;
+                let mut closed_on = None;
+                while i < lines.len() {
+                    test_lines.push(lines[i].to_string());
+                    production.push(String::new());
+                    let (open, close) = lexer.feed(lines[i]);
+                    depth += open - close;
+                    opened |= open > 0;
+                    i += 1;
+                    if opened && depth <= 0 {
+                        closed_on = Some(lines[i - 1]);
+                        break;
+                    }
+                }
+                let expected = format!("{}}}", " ".repeat(indent));
+                if closed_on != Some(expected.as_str()) {
+                    errors.push(format!(
+                        "the #[cfg(test)] block at line {attr_line} closed on {closed_on:?}, \
+                         not a bare `}}` at its own indentation — the brace count is lost"
+                    ));
+                }
+                continue;
+            }
+            let l = lines[i];
+            production.push(if l.trim_start().starts_with("//") {
+                String::new()
+            } else {
+                l.to_string()
+            });
+            i += 1;
+        }
+        ScannedSource {
+            production,
+            test_lines,
+            errors,
+        }
+    }
+
+    /// Does `line` open a function item, at ANY indentation (a free fn, or a
+    /// method inside an `impl`)? `fn`, optionally after `pub`/`pub(..)`,
+    /// `const`, `async`, `unsafe` and `extern "…"`.
+    fn opens_fn(line: &str) -> bool {
+        let mut rest = line.trim_start();
+        loop {
+            let before = rest;
+            for q in [
+                "pub(crate) ",
+                "pub(super) ",
+                "pub ",
+                "const ",
+                "async ",
+                "unsafe ",
+            ] {
+                if let Some(r) = rest.strip_prefix(q) {
+                    rest = r.trim_start();
+                }
+            }
+            if let Some(r) = rest.strip_prefix("extern ") {
+                rest = r.trim_start();
+                if let Some(abi) = rest.strip_prefix('"') {
+                    rest = abi.split_once('"').map_or("", |(_, r)| r).trim_start();
+                }
+            }
+            if rest == before {
+                break;
+            }
+        }
+        rest.strip_prefix("fn ")
+            .is_some_and(|r| r.starts_with(|c: char| c.is_alphabetic() || c == '_'))
+    }
+
+    /// The body span `[start, end]` of the function enclosing line `idx`: the
+    /// nearest `fn` opener above it, at any indentation, whose braces —
+    /// matched from its opening line — have not closed before `idx`. `None`
+    /// when no enclosing fn exists.
+    fn enclosing_fn(lines: &[String], idx: usize) -> Option<(usize, usize)> {
+        for start in (0..=idx).rev() {
+            if !opens_fn(&lines[start]) {
+                continue;
+            }
+            let mut lexer = BraceLexer::default();
+            let mut depth = 0i64;
+            let mut opened = false;
+            for (end, line) in lines.iter().enumerate().skip(start) {
+                let (open, close) = lexer.feed(line);
+                depth += open - close;
+                opened |= open > 0;
+                if opened && depth <= 0 {
+                    if end >= idx {
+                        return Some((start, end));
+                    }
+                    break;
+                }
+                if !opened && line.trim_end().ends_with(';') {
+                    break; // a bodyless declaration (trait method)
+                }
+            }
+        }
+        None
+    }
+
+    /// The production lines of `src` (see [`scan_source`]).
+    fn production_code_lines(src: &str) -> Vec<String> {
+        scan_source(src).production
     }
 
     /// Plan `2026-11-08-…-leaves-the-tree-on-disk` Phases 0 and 2: every call site of
@@ -369,6 +612,16 @@ mod tests {
     /// failure arm (coord otherwise keeps the failed allocation `allocated`).
     /// Enumerated from the source, so a new door is covered the moment it
     /// appears [policy: testing/coverage-is-enumerated-not-salient].
+    ///
+    /// What it checks is PRESENCE IN THE ENCLOSING FN, not arm precision: the
+    /// precheck must appear between the enclosing fn's opening line and the
+    /// allocation, and `remove_unspawned(` between the allocation and that fn's
+    /// closing brace. The enclosing fn is found at ANY indentation (a door in an
+    /// `impl` method is bound by its own braces, never by an unrelated top-level
+    /// fn above it), and only `#[cfg(test)] mod x { … }` BLOCKS are skipped — a
+    /// `#[cfg(test)] mod x;` declaration hides no production code. As a check
+    /// on the scan itself, every file's raw count of calls must equal the
+    /// production calls scanned plus the ones inside skipped test blocks.
     #[test]
     fn every_acquire_for_terminal_door_prechecks_and_removes_an_unspawned_allocation() {
         // Spelled in two halves so this test's own source is never a match.
@@ -383,9 +636,26 @@ mod tests {
         let mut failures = Vec::new();
         for file in &files {
             let src = std::fs::read_to_string(file).expect("read source");
-            let lines = production_code_lines(&src);
+            let scanned = scan_source(&src);
+            for e in &scanned.errors {
+                failures.push(format!("{}: {e}", file.display()));
+            }
+            let lines = scanned.production;
+            let is_call = |l: &str| {
+                !l.trim_start().starts_with("//") && l.contains(call) && !l.contains(definition)
+            };
+            let raw = src.lines().filter(|l| is_call(l)).count();
+            let in_tests = scanned.test_lines.iter().filter(|l| is_call(l)).count();
+            let in_production = lines.iter().filter(|l| is_call(l)).count();
+            assert_eq!(
+                raw,
+                in_production + in_tests,
+                "{}: the scan lost a call site (raw {raw}, production {in_production}, \
+                 test blocks {in_tests})",
+                file.display()
+            );
             for (idx, line) in lines.iter().enumerate() {
-                if !line.contains(call) || line.contains(definition) {
+                if !is_call(line) {
                     continue;
                 }
                 let rel = file
@@ -394,14 +664,12 @@ mod tests {
                     .display()
                     .to_string();
                 let site = format!("{rel}:{}", idx + 1);
-                let start = (0..idx).rev().find(|&i| opens_top_level_fn(&lines[i]));
-                let end = (idx..lines.len()).find(|&i| lines[i] == "}");
-                let (Some(start), Some(end)) = (start, end) else {
-                    failures.push(format!("{site}: no enclosing top-level fn found"));
+                let Some((start, end)) = enclosing_fn(&lines, idx) else {
+                    failures.push(format!("{site}: no enclosing fn found"));
                     continue;
                 };
                 let before = lines[start..idx].join("\n");
-                let after = lines[idx..end].join("\n");
+                let after = lines[idx..=end].join("\n");
                 if !before.contains("precheck_spawn(") {
                     failures.push(format!(
                         "{site}: no `precheck_spawn(` before the allocation in `{}`",
