@@ -73,11 +73,35 @@ Review code changes for:
 A review READS. It never stops, kills or signals a process it did not start,
 and that includes cleanup at the end; nor does it delete a file it did not
 create. Prefer foreground commands under a `timeout`, so nothing is left to
-clean up. When you must background something, print its PID as you start it
-(`cmd >"$SCRATCH/job.log" 2>&1 & echo "pid=$!"`, since each Bash call is a
-fresh shell and `$!` does not survive to the next one; the redirect keeps the
-job off the tool's own output). Before signalling that recorded PID, confirm
-`ps -p <pid> -o args=` still shows your command, because a PID can be reused. Never kill by name or
+clean up.
+
+**Any experiment that starts a background process, or loops over a spawn,
+runs inside ONE owner-bound launcher:**
+`python3 <ccfg>/scripts/owned-run.py --max-runtime <s> -- bash -c '…'`
+(`<ccfg>` is the checkout that carries `scripts/owned-run.py`). That makes the whole tree a
+child of a subreaper, so it is torn down with the experiment, the deadline or
+the session, `setsid` escapees included (a SIGKILL of the launcher itself
+reaches only its group leader; let it end on its own bound). A recorded `$!` is NOT enough:
+under job control (`set -m`) util-linux `setsid` FORKS, so `$!` names a parent
+that has already exited while the real process runs on in a new session. On
+2026-10-31 a reviewer testing an EXIT-trap claim leaked 250 infinite
+`while :; do /bin/true; done` loops that way; the box sat at load 285 on 48
+cores for a day (plan `2026-11-02-a-cpu-burning-orphan-loop-on-linux-runs-unseen`).
+If you still record a PID for a single foreground-able job, print it as you
+start it (`cmd >"$SCRATCH/job.log" 2>&1 & echo "pid=$!"`, since each Bash call
+is a fresh shell), and before signalling it confirm `ps -p <pid> -o args=` still
+shows your command, because a PID can be reused.
+
+**An experiment that leaves survivors is not a result.** If its output reports
+survivors (a `left=N` style count above 0), or any process it started is still
+running, stop the ones you can name by a PID you recorded, or find by a parent PID you
+recorded (never 1 and never a `systemd`: a `setsid` escapee is reparented there,
+so "its parent" becomes every orphan on the box) or by a unique token you minted
+yourself and read back from each candidate's own cmdline before signalling it
+(a token scan is allowed; `pkill -f <token>` is not), and report the survivor
+count as a finding.
+Never hunt survivors with a box-wide name or pattern count. Those are processes YOU
+started, so this does not loosen the rule below. Never kill by name or
 pattern: no `pkill`, no `killall`, no `kill $(pgrep …)`, no `taskkill /IM`. The
 box you review on runs many sessions at once. A pattern like `pkill -f cargo`
 or `pkill -f nextest` matches their builds and test runs too, and `node`

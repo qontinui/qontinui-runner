@@ -35,6 +35,22 @@ produced it.
   recollection of it — to `/create-plan`. This shape is not forwarded
   verbatim: the prompt Step 1 forwards is built from the head.
 
+  **To pick a dossier**, ask the dossier query door:
+  `coord_list_dossiers(readiness=ready_for_pvi, remediation_state=none,
+  sort=recurrence_count, order=desc, limit=…)`. If the MCP tool is not
+  callable, use the HTTP twin
+  `GET https://coord.qontinui.io/coord/agent-dossiers?readiness=ready_for_pvi&remediation_state=none&sort=recurrence_count&order=desc`
+  with a device JWT. The answer lists the most-recurring dossiers that have no
+  remediation plan yet. `remediation_state` is joined live to coord's work
+  units, so a dossier whose plan is already in flight is not listed. Read
+  `available` before trusting zero rows, and follow `next_cursor` to null
+  before you call the list complete. **That list alone is PARTIAL.** A dossier
+  whose ledger names a plan coord cannot classify (an unmapped `live_status`
+  such as `""` or `done`, or no work unit) rolls up `remediation_state=unknown`
+  and is not in it. Walk the same query again with `remediation_state=unknown`
+  and list those rows separately, labelled UNKNOWN; Step 0 verifies their plans
+  on `origin/main` before any of them is picked.
+
 ## Plan directories
 
 This command does not resolve plan directories itself — `/create-plan` owns that,
@@ -193,8 +209,8 @@ the subagent reports.
 
 ### Step 0 — Preflight: is this prompt already resolved?
 
-**Run this before spawning anything.** It is two file reads (two store probes,
-for a dossier) and it prevents the
+**Run this before spawning anything.** It is two file reads, or for a dossier
+the door read and the full-row read with a labelled memory fallback, and it prevents the
 most expensive failure this command has: writing a fresh plan for work that
 already shipped.
 
@@ -209,17 +225,51 @@ checks — a dossier is neither a file nor free text, and it carries its own
 record of what has already been tried. Resolve the **live head**, in this
 order, and stop at the first that answers:
 
-1. `coord_recent_findings(topic="dossier:<slug>", kind="dossier")` — HTTP twin
-   `GET /coord/agent-findings?topic=dossier:<slug>&kind=dossier`. Read
-   `available` before `count`. A head here is authoritative.
-2. On the **kind rejection** (`kind` refused as an unknown argument, or a
-   `kind="dossier"` write answering `invalid kind` — the serving coord predates plan
-   `2026-08-25-dossiers-durable-issue-files-for-recurring-defects` Phase 2;
-   say so) **or an empty answer**, the memory key:
+1. **The dossier query door** — `coord_list_dossiers(slug="<slug>", limit=1)`.
+   It answers one row per slug: the newest live `kind=dossier` row, as a
+   summary with the LIVE `remediation_state`. If the MCP tool is not callable,
+   use its HTTP twin with a device JWT:
+   `GET https://coord.qontinui.io/coord/agent-dossiers?slug=<slug>&limit=1`.
+   The runner's coord-mcp proxy forwards this tool only once
+   qontinui-runner#2532 (landed 2026-11-04 as `5f39c6027`) is in the box's
+   running build, and a box reaches it only when its runner is rebuilt. On an
+   older build it answers METHOD_NOT_ALLOWED. That is the
+   runner's allowlist, not a missing door.
+   Read `available` before `count`. `available: false`, or zero rows, is
+   UNKNOWN, not "no such dossier". **`available: false` ends the lookup at
+   UNKNOWN:** the door serves an empty page in that state, which is NOT the
+   zero-row answer the memory fallback below is for. Report the head as UNKNOWN
+   and do not author a plan; a memory hit found afterwards is not the head,
+   because a migrated finding head the door could not read may supersede it.
+   **The row is the head only if its `title` starts `DOSSIER <slug> `.** The
+   door has no title filter. A steward `RETRACTED` pointer, or a stray
+   `kind=dossier` `DOSSIER-CONTRIB`, can be the newest row for the slug, and
+   either one rolls up `remediation_state: none`. When the title does not
+   match, treat the head as UNKNOWN and find it with the full-row read below.
+   **The summary is not the whole head.** It carries no `artifact_refs`
+   (`evidence`, `exit_criterion`, the raw ledger), and Step 1 forwards those
+   verbatim, as does the fold-back. So read the full row as well:
+   `coord_recent_findings(topic="dossier:<slug>", kind="dossier")`, selecting
+   the door's `finding_id`, or the newest row whose title starts
+   `DOSSIER <slug> ` when the door's row was not a head. Forward and fold from
+   that row. **Say in your Step 0 output which door resolved the head.**
+2. **Labelled FALLBACK — the memory key.** It is used only when the door
+   answered `available: true` with zero rows, or no door answered at all
+   (never on `available: false` — item 1), and it is retired by plan
+   `2026-10-03-dossier-query-door-filters-sort-cursor` Phase 8 once no live
+   memory heads remain. Some slugs still have a head that lives only in memory
+   (not yet migrated to a finding):
    `coord_memory_search(query_text="DOSSIER <slug>", kinds=["mental_model"])`,
    taking the newest `created_at` among live rows whose title begins exactly
    `DOSSIER <slug> —` — a `DOSSIER-CONTRIB` / `DOSSIER-DELTA` row is never the
-   head. `coord_memory_search` is full-text only (read `vector_arm`), so add at
+   head, and **neither is a migration pointer titled
+   `DOSSIER <slug> — MOVED to finding <finding_id>`**: its title carries the
+   head key, but it records that the head now lives in the findings store.
+   Exclude it from the head pick, and read the finding it names with
+   `coord_recent_findings(finding_id="<finding_id>")` (follow `superseded_by`
+   on an empty page) — that finding, not the pointer, is the head, and a door
+   that returned no row for it is a door fault to report, not a memory head.
+   `coord_memory_search` is full-text only (read `vector_arm`), so add at
    least two probes in the issue's own words, as `/unattended` 2b-bis requires.
 3. **An empty answer from every probe is UNKNOWN, not "no such dossier".**
    Pair it with `coord_memory_overview` and read `live_row_count` before
@@ -229,13 +279,37 @@ order, and stop at the first that answers:
    the probes you ran and their answers, and do not author a plan against a
    dossier you could not read.
 
-Then read the head's `artifact_refs.remediations` (a finding head) or its
-ledger prose (a memory head). **If it already names a plan for this slug whose
-status is not SHIPPED / SUPERSEDED / OBSOLETE, that is the same-stem hit this
-preflight exists to catch**: route to that plan via the disposition below and
-do not author a second. Verify that plan's status against `origin/main` — the
-dossier's copy of it can lag — and treat a `held: true` remediation as still
-open. A SHIPPED remediation is *not* a hit: it is prior art the plan must
+Then read the remediation state. For a head from the door, read the row's
+`remediation_state` and each `remediations[].live_status`. These are LIVE: coord
+joins each plan the ledger names to its work unit at read time. **An entry's
+`live_status` classifies ONLY when, after trimming whitespace, it is in coord's mapped table**
+(`live_class` in `qontinui-coord/crates/coord/src/findings/dossiers.rs`):
+`in_progress`; `vetted` or `ready`; `draft`; `shipped`; `superseded` or
+`obsolete`. **Every other value is UNKNOWN** — `null`, the empty string `""`,
+`done`, `landed`, `tier3_dispatched`, or any string not listed — because
+`coord.work_units.status` is an open vocabulary. Never read an unmapped value
+as shipped or as in flight; verify that plan against `origin/main` as for an
+`unknown` roll-up below. Checking only for `null` sends a `""` entry down the
+shipped path (measured 2026-11-02: `runner-prepush-gate-misscoped-and-cold-target`,
+finding `d284868f`). Do not parse
+`artifact_refs.remediations[].status`. That is the ledger's free text, and it
+lags. For a memory head (the fallback), read its ledger prose and verify each
+plan it names against `origin/main` yourself, because that copy lags. Treat
+the state the same way for a head you found through the full-row read because
+the door's row was not a head. There is no live roll-up for it, so treat its
+remediation state as UNKNOWN. Before authoring, verify each plan its ledger
+names against that plan's coord work unit or against `origin/main`. The roll-up reads:
+`none` means no plan yet; `draft`, `vetted` or `in_progress` means a plan is in
+flight; `shipped` or `closed` means every named plan is terminal. `unknown` means
+that no plan is in flight and at least one named plan could not be classified.
+That happens when the plan has no work unit in your tenant, when its live status
+is unmapped, or when the ledger is unreadable. An `unknown` row is never
+`none`: verify those plans on `origin/main` before you author anything. **If a
+remediation is in flight (`draft` / `vetted` / `in_progress`), that is the
+same-stem hit this preflight exists to catch**: route to that plan via the
+disposition below and do not author a second. Treat a `held: true` remediation
+as still open. The roll-up does not count `held`, so read it on each entry. A
+SHIPPED remediation is *not* a hit: it is prior art the plan must
 account for (Step 1). An `IN PROGRESS` remediation IS a hit, and the one that
 needs care: a live peer may hold it. That stamp is CONDITIONALLY overwritable
 only under `/vet-plan`'s own rule for an `IN PROGRESS` stamp, which this skill
