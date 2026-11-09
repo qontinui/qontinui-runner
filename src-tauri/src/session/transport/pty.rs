@@ -94,7 +94,7 @@ impl Transport for PtyTransport {
                 // `SessionIntent` carries no spawn origin.
                 crate::coord_drain_state::SpawnOrigin::Unknown,
             )
-            .map_err(TransportError::Runtime)?;
+            .map_err(|e| TransportError::Runtime(e.message))?;
 
         Ok(TransportHandle::Pty {
             terminal_id: info.id,

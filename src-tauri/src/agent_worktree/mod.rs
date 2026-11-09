@@ -77,6 +77,7 @@ pub mod maintenance_executor;
 pub mod on_demand;
 pub mod orphan_target_reaper;
 pub mod reclaim;
+pub(crate) mod remove_unspawned;
 pub(crate) mod retire_abandoned;
 pub mod session_env;
 pub(crate) mod sibling_store;
