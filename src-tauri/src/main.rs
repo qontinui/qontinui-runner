@@ -4392,10 +4392,15 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         tm.upgrade()?.coord_session_id_for_pinned(csid)
                     });
                     let reg = std::sync::Arc::downgrade(&ai_coord_registrar);
+                    // `on_terminal_coord_bind` re-points the registrar's
+                    // binding for the pinned id at the new row BEFORE it
+                    // delivers owed marks, so a respawned or migrated pane's
+                    // finish goes to its live row (plan
+                    // `2026-11-07-a-runner-finish-is-addressed-to-a-stale-coord-row-after-a-pane-respawn`).
                     term_for_session.attach_coord_bind_observer(
                         move |pinned, terminal_id, coord_id| {
                             if let Some(r) = reg.upgrade() {
-                                r.deliver_owed_finish(pinned, terminal_id, coord_id);
+                                r.on_terminal_coord_bind(pinned, terminal_id, coord_id);
                             }
                         },
                     );

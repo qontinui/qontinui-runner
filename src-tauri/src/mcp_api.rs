@@ -2713,6 +2713,13 @@ async fn health(
         // sessions close means coord is refusing the POSTs.
         "agent_log_emitter_agents":
             crate::claude_session::coord_register::agent_log_emitter_agents(),
+        // How many row resolutions found the registrar's binding and the live
+        // terminal's DIFFERENT for one harness id and took the terminal's
+        // (plan 2026-11-07-a-runner-finish-is-addressed-to-a-stale-coord-row-
+        // after-a-pane-respawn). A climbing count means a pane was re-bound
+        // without the registrar following it.
+        "registrarTerminalRowDisagreements":
+            crate::claude_session::coord_register::registrar_terminal_row_disagreements(),
         // Browser-origin guard (plan 2026-09-17-runner-loopback-api-accepts-
         // any-origin): kill-switch state, route-policy mode, per-class refusal
         // and shadow counts, and the last 20 non-admit tuples — withheld from a
@@ -21711,6 +21718,28 @@ mod coord_provision_session_gate_tests {
         assert_eq!(
             provenance["build"]["profile"],
             qontinui_runner_lib::build_provenance::build_profile_json()
+        );
+    }
+
+    /// Plan `2026-11-07-a-runner-finish-is-addressed-to-a-stale-coord-row-after-a-pane-respawn`
+    /// Phase 1: `/health` serves the registrar/terminal row-disagreement count
+    /// (same source-scan technique as the tests around it).
+    #[test]
+    fn the_health_handler_emits_the_registrar_terminal_row_disagreements() {
+        let region = crate::mcp_api::mcp_api_item_source("async fn health(")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            region.contains("\"registrarTerminalRowDisagreements\":"),
+            "{region}"
+        );
+        assert!(
+            region.contains(
+                "crate::claude_session::coord_register::registrar_terminal_row_disagreements()"
+            ),
+            "{region}"
         );
     }
 

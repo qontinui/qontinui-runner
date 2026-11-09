@@ -112,6 +112,11 @@ struct WireRow {
     /// the key is not unique). Absent on a coord that predates the field.
     #[serde(default)]
     coord_session_id: Option<String>,
+    /// That row's LIVENESS axis (`expected` | `active` | `pending_resolution` |
+    /// `stale` | `closed`), orthogonal to the work axis. Absent on a coord
+    /// that predates the field.
+    #[serde(default)]
+    state: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -548,7 +553,12 @@ pub async fn fetch(ids: &[String]) -> StatusFetch {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RowResolution {
     /// coord has a row for this id; this is the latest one (adopt it).
-    Existing(uuid::Uuid),
+    /// `state` is that row's liveness axis as coord served it (`active`,
+    /// `closed`, ...); `None` on a coord that predates the field.
+    Existing {
+        id: uuid::Uuid,
+        state: Option<String>,
+    },
     /// coord resolved NO session for this id in this tenant — the one answer
     /// that licenses minting a fresh row.
     Unknown,
@@ -572,7 +582,10 @@ fn resolution_from_body(body: &WireResponse, csid: &str) -> RowResolution {
             .as_deref()
             .and_then(|s| uuid::Uuid::parse_str(s.trim()).ok())
         {
-            Some(id) => RowResolution::Existing(id),
+            Some(id) => RowResolution::Existing {
+                id,
+                state: row.state.clone(),
+            },
             None => RowResolution::Unresolved(
                 "coord answered a row without a parseable coord_session_id \
                  (a coord that predates the field)"
@@ -624,7 +637,23 @@ mod tests {
         }));
         assert_eq!(
             resolution_from_body(&b, "sid"),
-            RowResolution::Existing(uuid::Uuid::parse_str(ROW).unwrap())
+            RowResolution::Existing {
+                id: uuid::Uuid::parse_str(ROW).unwrap(),
+                state: None,
+            }
+        );
+        // The row's liveness state rides along when coord serves it.
+        let closed = body(serde_json::json!({
+            "statuses": {"sid": {"session_status": null, "coord_session_id": ROW, "state": "closed"}},
+            "unknown": [], "invalid": [], "accepted": 1, "truncated": false,
+            "sessionBridgeColumnPresent": true
+        }));
+        assert_eq!(
+            resolution_from_body(&closed, "sid"),
+            RowResolution::Existing {
+                id: uuid::Uuid::parse_str(ROW).unwrap(),
+                state: Some("closed".to_string()),
+            }
         );
     }
 
