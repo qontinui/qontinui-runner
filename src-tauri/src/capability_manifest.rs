@@ -758,9 +758,17 @@ pub const CAPABILITY_SPECS: &[CapabilitySpec] = &[
                       qontinui-claude-config's hourly `fleet-agents-parity` gate \
                       (`agent-bundle-parity.sh`) checks that the two repositories' \
                       default branches agree, not this disk against this binary. When \
-                      the root does not resolve the \
-                      copy is a no-op that logs \"no qontinui-root resolved; skipping \
-                      .claude/agents\" and continues.",
+                      the root does not resolve there is no checkout copy: this row reads \
+                      `unresolved` and names the embedded default(s) that stand in, and \
+                      the `fleet_agents` floor is still written. The same row carries \
+                      the RETIREMENT pass over `.claude/agents`, in either arm: its detail \
+                      names `removed <unit>` for a shipped copy it deleted, \
+                      `retired but kept: <unit> (<reason>)` for a deliberate keep (locally \
+                      modified, or tracked by the repository), and \
+                      `not overlaid (retired): <unit>` for a retired definition the \
+                      checkout still holds; a copy it could not remove is in the note \
+                      as `retired unit(s) the pass could not remove, which may still \
+                      resolve`, and degrades the row.",
         expected_rungs: &[Rung::OperatorCheckout, Rung::Unresolved],
         anchor: "agent_runtime::provision_agent_definitions_from_root",
     },
@@ -1317,8 +1325,8 @@ impl ProvisionReport {
         self.rung = rung;
     }
 
-    /// True when every expected unit was written, nothing was skipped, and no
-    /// retired unit the pass meant to remove is still on disk.
+    /// True when every expected unit was written, nothing was skipped, and the
+    /// pass left no retained retired unit whose reason `is_failure()`.
     #[must_use]
     pub fn is_complete(&self) -> bool {
         self.skipped.is_empty()
@@ -1326,8 +1334,8 @@ impl ProvisionReport {
             && !self.retained_retired.iter().any(|r| r.reason.is_failure())
     }
 
-    /// True when this pass delivered less than its roster, or left a retired
-    /// unit on disk that it meant to remove — the states that used to be
+    /// True when this pass delivered less than its roster, or left a retained
+    /// retired unit whose reason `is_failure()` — the states that used to be
     /// invisible.
     #[must_use]
     pub fn is_degraded(&self) -> bool {
@@ -1384,8 +1392,9 @@ impl ProvisionReport {
     /// The skipped units land in [`CapabilityObservation::note`] WITH their
     /// reasons, so a manifest read on an operator's machine states what the
     /// session did not get and why — which is the entire deliverable of this
-    /// phase. A retired unit the pass meant to remove and could not lands in the
-    /// note too; removed units and deliberate keeps land in the detail.
+    /// phase. A retained retired unit whose reason `is_failure()` lands in the
+    /// note too; removed units and deliberate keeps (a retained retired unit
+    /// whose reason is not a failure) land in the detail.
     #[must_use]
     pub fn observation(&self) -> CapabilityObservation {
         let mut detail = format!("wrote {}/{} unit(s)", self.written, self.expected);
@@ -1469,7 +1478,8 @@ pub struct SessionProvisionLedger {
 }
 
 impl SessionProvisionLedger {
-    /// The reports for passes that delivered less than their roster.
+    /// The reports for passes that delivered less than their roster, or left a
+    /// retained retired unit whose reason `is_failure()`.
     #[must_use]
     pub fn degraded(&self) -> Vec<&ProvisionReport> {
         self.reports.iter().filter(|r| r.is_degraded()).collect()
@@ -2124,9 +2134,9 @@ pub fn render_manifest_doc() -> String {
          --capability-manifest-doc > docs/runner-capabilities.md`. NOT from PowerShell, \
          whose `>` writes UTF-16 or a BOM that `include_str!` cannot read at all. The \
          source of truth is `CAPABILITY_SPECS` in \
-         `src-tauri/src/capability_manifest.rs`, and \
-         `.github/workflows/capability-manifest-fresh.yml` fails any PR whose checked-in \
-         copy differs from a fresh render. -->\n\n",
+         `src-tauri/src/capability_manifest.rs`, and the runner test \
+         `the_checked_in_capability_doc_matches_a_fresh_render` (in `src-tauri/src/main.rs`) \
+         fails any change whose checked-in copy differs from a fresh render. -->\n\n",
     );
     out.push_str(&format!("Manifest schema version: `{SCHEMA_VERSION}`.\n\n"));
 
@@ -2736,7 +2746,7 @@ mod tests {
 
     /// The `unresolved` constructor is the shape that replaces a lone `warn!` on
     /// a resolver that found no source at all — `agent_runtime`'s "no
-    /// qontinui-root resolved; skipping .claude/agents" and `slash_commands`'
+    /// qontinui-root resolved; no checkout overlay" and `slash_commands`'
     /// missing-checkout error.
     #[test]
     fn an_unresolved_pass_states_the_rung_and_the_reason() {
@@ -2865,6 +2875,36 @@ mod tests {
             .is_some_and(|n| n.contains("bundled_resources::resolve_with_rung")));
 
         reset_provision_store();
+    }
+
+    /// A runner with no workspace root records the embedded floor it wrote as
+    /// a `fleet_agents` row on rung `embedded`, in the session's ledger, beside
+    /// the checkout layer's `unresolved` row. Lives here rather than in
+    /// `agent_runtime::tests` because it reads the PROCESS-WIDE store, which
+    /// only this module's `store_lock` serializes against the tests that reset
+    /// or flood it.
+    #[test]
+    fn the_no_root_arm_records_the_embedded_floor_in_the_ledger() {
+        let _guard = store_lock();
+        let wt = tempfile::tempdir().unwrap();
+        let workdir = wt.path().to_string_lossy().into_owned();
+
+        let returned = crate::agent_runtime::provision_agent_definitions_no_root(
+            &workdir,
+            crate::fleet_agents::RETIRED_AGENTS,
+        );
+
+        let ledger = session_provision_ledger(&workdir).expect("the floor was recorded");
+        let floor = ledger
+            .reports
+            .iter()
+            .find(|r| r.capability == "fleet_agents")
+            .unwrap_or_else(|| panic!("no fleet_agents row: {}", ledger.render()));
+        assert_eq!(floor.rung, Rung::Embedded, "{}", floor.summary());
+        assert_eq!(floor.written, crate::fleet_agents::embedded_agent_count());
+        assert!(floor.is_complete(), "{}", floor.summary());
+        assert_eq!(returned.capability, "agent_definitions");
+        assert_eq!(returned.rung, Rung::Unresolved);
     }
 
     /// The ledger is bounded: a long-lived runner spawns thousands of sessions,

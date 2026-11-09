@@ -1091,8 +1091,8 @@ enum ManifestMode {
     Json,
     /// `--capability-manifest-doc` — the GENERATED roster checked in at
     /// `docs/runner-capabilities.md`. A pure function of `CAPABILITY_SPECS`
-    /// and `Rung::ALL`, carrying no runtime value, which is what lets
-    /// `.github/workflows/capability-manifest-fresh.yml` gate it.
+    /// and `Rung::ALL`, carrying no runtime value, which is what lets the test
+    /// `the_checked_in_capability_doc_matches_a_fresh_render` below gate it.
     Doc,
 }
 
@@ -1152,7 +1152,7 @@ fn render_manifest_mode(
 /// on a published install may be entirely correct for that machine, and it is
 /// Phase 5's comparator — diffing two manifests — that decides whether a
 /// difference is a defect. A non-zero exit here would make every consumer
-/// (including the freshness workflow) treat an honest report as a failure.
+/// treat an honest report as a failure.
 ///
 /// The doc mode writes to stdout with no BOM, which is what lets
 /// `qontinui-runner --capability-manifest-doc > docs/runner-capabilities.md`

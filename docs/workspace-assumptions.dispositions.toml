@@ -34,7 +34,12 @@
 # `const CAPABILITY_SPECS` key. The three moved rows are now reviewed
 # (fallback_correct, below); the CAPABILITY_SPECS prose row stays unreviewed
 # with its key's siblings. 230 rendered - 3 reviewed = 227. A fall, held.
-unreviewed_ceiling = 227
+# 227 -> 226 (plan 2026-11-07-a-runner-with-no-workspace-root-provisions-no-subagents
+# Phase 1): the `agent_definitions` CAPABILITY_SPECS prose no longer quotes the
+# "no qontinui-root resolved; skipping" log line (the no-root arm now writes the
+# floor, and the description says so), so that unreviewed row is gone. The two
+# reviewed no-root rows moved onto provision_agent_definitions_no_root. A fall, held.
+unreviewed_ceiling = 226
 
 # First triage pass (plan 2026-09-20-published-runner-parity-count-comes-from-a-run-not-from-reports Phase 4):
 # every supervisor_dependency, tenant_literal and machine_path key. The
@@ -473,11 +478,11 @@ note = "Surfaced by fleet-nouns.toml (A6); not yet triaged."
 [[disposition]]
 class = "repo_layout"
 file = "src/agent_runtime.rs"
-symbol = "provision_agent_definitions_with_root"
+symbol = "provision_agent_definitions_no_root"
 disposition = "fallback_correct"
-note = "The no-root arm of agent-definition provisioning: with no qontinui-root it warns, records a capability_manifest Rung::Unresolved `agent_definitions` row naming what was skipped (the normal state on a published install), still runs the retirement pass, and lets the spawn proceed. The embedded fleet_agents floor supplies the definitions there. Reviewed when these rows moved off the provision_agent_definitions key (plan 2026-11-06-what-the-fleet-records-and-advertises-matches-what-actually-ran Phase 6)."
+note = "The no-root arm of agent-definition provisioning: with no qontinui-root there is no checkout overlay, so it writes the embedded fleet_agents floor (code-reviewer included) and records it as its own ledger row, records a capability_manifest Rung::Unresolved `agent_definitions` row naming the embedded defaults that stand in (the normal state on a published install), runs the retirement pass with the same keep decision, and lets the spawn proceed. Re-reviewed when the arm moved off provision_agent_definitions_with_root and gained the floor (plan 2026-11-07-a-runner-with-no-workspace-root-provisions-no-subagents Phase 1)."
 reviewed = [
-    '"agent_runtime: no qontinui-root resolved; skipping .claude/agents \',
+    '"agent_runtime: no qontinui-root resolved; no checkout overlay for \',
     '"no qontinui-root resolved, so <root>/qontinui-claude-config/.claude/agents \',
 ]
 

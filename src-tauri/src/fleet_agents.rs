@@ -264,13 +264,42 @@ pub(crate) fn remove_retired_agents(
     retired: &[&str],
     report: &mut ProvisionReport,
 ) {
+    remove_retired_agents_resolving(workdir, keep, retired, report, |p| p.canonicalize());
+}
+
+/// [`remove_retired_agents`] with the path resolver passed in, so a test can
+/// make the final-path query fail with an error other than NotFound — which no
+/// portable filesystem fixture produces on demand.
+///
+/// Only a NotFound means "no agents directory, so nothing retired can be on
+/// disk". Any other resolution failure leaves the pass unable to tell whether
+/// the directory is the workdir's own, so it removes nothing and records every
+/// retired copy that is visibly there as [`RetainedReason::ReadFailed`] — except
+/// one `keep` covers, which is recorded as the deliberate keep it is
+/// ([`RetainedReason::KeptByRepository`]), since keeping needs no resolution. A
+/// pass that returned silently would read complete while a retired copy may
+/// still resolve.
+fn remove_retired_agents_resolving(
+    workdir: &Path,
+    keep: &KeepDecisions,
+    retired: &[&str],
+    report: &mut ProvisionReport,
+    resolve: impl Fn(&Path) -> std::io::Result<std::path::PathBuf>,
+) {
     let dst_dir = workdir.join(".claude").join("agents");
-    let linked = match (dst_dir.canonicalize(), workdir.canonicalize()) {
+    let linked: Result<Option<String>, String> = match (resolve(&dst_dir), resolve(workdir)) {
         (Ok(dst), Ok(root)) => {
-            (dst != root.join(".claude").join("agents")).then(|| dst.display().to_string())
+            Ok((dst != root.join(".claude").join("agents")).then(|| dst.display().to_string()))
         }
         // No agents directory: nothing retired can be on disk.
-        _ => return,
+        (Err(e), _) | (Ok(_), Err(e)) if e.kind() == std::io::ErrorKind::NotFound => return,
+        (Err(e), _) | (Ok(_), Err(e)) => {
+            tracing::warn!(
+                "fleet_agents: could not resolve {}, so no retired definition is removed: {e}",
+                dst_dir.display()
+            );
+            Err(format!("could not resolve .claude/agents: {e}"))
+        }
     };
     for line in retired {
         let (name, shipped) = parse_retired_line(line);
@@ -286,6 +315,8 @@ pub(crate) fn remove_retired_agents(
             continue;
         }
         let path = dst_dir.join(name);
+        // A deliberate keep is labelled as one even when the directory could
+        // not be resolved: keeping deletes nothing, so it needs no resolution.
         if let Some(reason) = keep.reason(name) {
             if std::fs::symlink_metadata(&path).is_ok() {
                 tracing::info!(
@@ -300,6 +331,15 @@ pub(crate) fn remove_retired_agents(
             }
             continue;
         }
+        let linked = match &linked {
+            Ok(linked) => linked,
+            Err(why) => {
+                if std::fs::symlink_metadata(&path).is_ok() {
+                    report.record_retained_retired(name, RetainedReason::ReadFailed(why.clone()));
+                }
+                continue;
+            }
+        };
         let bytes = match std::fs::read(&path) {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
@@ -324,7 +364,7 @@ pub(crate) fn remove_retired_agents(
                 continue;
             }
         };
-        if let Some(resolved) = &linked {
+        if let Some(resolved) = linked {
             tracing::warn!(
                 "fleet_agents: keeping retired {} — .claude/agents is reached through a \
                  symlink, to {resolved}",
@@ -607,5 +647,112 @@ mod tests {
             "an unmatched CRLF copy reports its raw blob, not the folded one"
         );
         assert_eq!(fold_crlf(b"a\r\nb\rc\r\n"), b"a\nb\rc\n".to_vec());
+    }
+
+    /// A final-path query that fails with anything but NotFound is not "no
+    /// agents directory": the pass removes nothing and names each retired copy
+    /// still visibly there as a read failure, so it reads degraded instead of
+    /// complete. The resolver is injected because no portable fixture makes
+    /// `canonicalize` fail that way on demand.
+    #[test]
+    fn a_non_notfound_resolution_failure_keeps_and_names_retired_copies() {
+        let body = "# a body this binary once shipped\n";
+        let line = format!(
+            "retired-agent.md {}",
+            crate::provenance::git_blob_id(body.as_bytes())
+        );
+        let wt = tempfile::tempdir().unwrap();
+        let dst = wt.path().join(".claude").join("agents");
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::write(dst.join("retired-agent.md"), body).unwrap();
+        let fresh = || {
+            ProvisionReport::new(
+                "agent_definitions",
+                0,
+                capability_manifest::Rung::OperatorCheckout,
+            )
+        };
+
+        let mut report = fresh();
+        remove_retired_agents_resolving(
+            wt.path(),
+            &KeepDecisions::default(),
+            &[
+                line.as_str(),
+                "absent.md 0000000000000000000000000000000000000000",
+            ],
+            &mut report,
+            |_| Err(std::io::Error::other("injected")),
+        );
+        assert!(dst.join("retired-agent.md").is_file(), "nothing is removed");
+        assert!(report.removed.is_empty());
+        assert_eq!(
+            report.retained_retired,
+            vec![capability_manifest::RetainedRetiredUnit {
+                unit: "retired-agent.md".to_string(),
+                reason: RetainedReason::ReadFailed(
+                    "could not resolve .claude/agents: injected".to_string()
+                ),
+            }],
+            "only the copy that is there is named; an absent one is not"
+        );
+        assert!(!report.is_complete(), "{}", report.summary());
+
+        // A copy the repository tracks is labelled as the deliberate keep it
+        // is, even when resolution fails, rather than as a read failure.
+        {
+            use crate::provision_guard::test_support::{git_add, git_init};
+            let repo = tempfile::tempdir().unwrap();
+            let tracked_dst = repo.path().join(".claude").join("agents");
+            std::fs::create_dir_all(&tracked_dst).unwrap();
+            std::fs::write(tracked_dst.join("retired-agent.md"), body).unwrap();
+            git_init(repo.path());
+            git_add(repo.path(), Path::new(".claude/agents/retired-agent.md"));
+            let tracked = crate::provision_guard::TrackedPaths::probe(&tracked_dst);
+            let keep = KeepDecisions::decide(&tracked, &tracked_dst, ["retired-agent.md"]);
+            assert!(
+                keep.reason("retired-agent.md").is_some(),
+                "fixture is tracked"
+            );
+            let mut report = fresh();
+            remove_retired_agents_resolving(
+                repo.path(),
+                &keep,
+                &[line.as_str()],
+                &mut report,
+                |_| Err(std::io::Error::other("injected")),
+            );
+            assert!(tracked_dst.join("retired-agent.md").is_file());
+            assert_eq!(report.retained_retired.len(), 1, "{}", report.summary());
+            assert!(
+                matches!(
+                    report.retained_retired[0].reason,
+                    RetainedReason::KeptByRepository(_)
+                ),
+                "{}",
+                report.summary()
+            );
+        }
+
+        // NotFound is still the quiet "nothing can be on disk" arm.
+        let mut report = fresh();
+        remove_retired_agents_resolving(
+            wt.path(),
+            &KeepDecisions::default(),
+            &[line.as_str()],
+            &mut report,
+            |_| Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+        );
+        assert!(report.removed.is_empty() && report.retained_retired.is_empty());
+
+        // And the real resolver still removes the shipped copy.
+        let mut report = fresh();
+        remove_retired_agents(
+            wt.path(),
+            &KeepDecisions::default(),
+            &[line.as_str()],
+            &mut report,
+        );
+        assert_eq!(report.removed.len(), 1, "{}", report.summary());
     }
 }
