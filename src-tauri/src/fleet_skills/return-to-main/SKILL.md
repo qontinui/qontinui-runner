@@ -554,9 +554,51 @@ What blocks a repo, as the check decides it (the class and reason are in each
 
 - a session **working** (census activity `working`, or `unknown` — never
   quiet) whose touch-ledger touches within the touch window (6 h) name R, or
-  are unattributed, or cannot be attributed at all (no session id, no ledger
-  for it, no ledger directory on this box) — so on a box where the touch-ledger
-  hook is not installed yet, every working session blocks every repo;
+  cannot be attributed at all (no session id, no ledger for it, no ledger
+  directory on this box) — so on a box where the touch-ledger hook is not
+  installed yet, every working session blocks every repo;
+- an **unattributed** touch by such a session within the window. A SPECIFIC
+  one — it names somewhere the ledger cannot: an unresolvable `cd` / `-C` /
+  `--manifest-path` / `--prefix` / `--directory` / `--cwd` target, an
+  Edit/Write path it cannot resolve, an unreadable envelope, an unresolved
+  workspace root — blocks every repo. Under `checkout-ff`, GENERIC ones only
+  (the no-path marker, a `"generic":true` `$` argument) block the session's
+  touched and cwd repos plus each R whose own ref records moved inside the
+  window — HEAD's log, the log of the branch HEAD names and the stash log (by
+  entry time or file mtime, whichever is later), and HEAD, the loose
+  `refs/stash` (`update-ref refs/stash` logs nothing when `refs/stash` has no
+  log yet, unless `--create-reflog` or `core.logAllRefUpdates=always`) and
+  that branch's loose ref — or, with none, packed-refs and the directory a
+  loose ref was unlinked from (by mtime) — or whose tree has a change written
+  inside it, a tracked change or an untracked file (an ignored file never
+  counts), dated by the index's, a dirty path's — an untracked file's exactly
+  as a tracked one's — or a deleted path's parent's mtime or ctime, whichever
+  is later, so on POSIX `cp -p`, `touch -d` or `chmod` still count and an old
+  dirty tree stays QUIET, untracked files included; on Windows, where
+  `st_ctime` is the creation time and dates none of them, ANY change blocks,
+  an untracked file included, however old — or where any of that cannot be
+  read (UNKNOWN, never "no move"): a GENERIC line can hide a ref move or a
+  write into the tree (`GIT_DIR=`, `--git-dir=`, `-c core.worktree=`,
+  `xargs {}`, a script, `cp $W/x $R/x`), and `checkout-ff` QUIET also gates
+  the residue restore below, which reverts tracked files and unlinks each
+  untracked file byte-identical to the upstream tip, even in a tree with no
+  tracked change. Every untracked file counts, not only one at a path the
+  last-fetched tip has (the sweep fetches before it restores), so one that
+  something keeps writing — a log nothing ignores — keeps R BUSY while such a
+  session works. The tree is read by a `git status --untracked-files=all`
+  that takes no optional lock and consults no file-system monitor
+  (`core.fsmonitor=false`). Residual: the `.git` internals are read by mtime
+  and entries only, so one rewritten with a preserved or backdated mtime and
+  no log entry is not seen; a stash deleted outright (`git stash clear`, or a
+  drop of its last entry) leaves nothing to read, and the sweep never touches
+  a stash; that `git status` runs any clean filter configured for a stat-dirty
+  tracked file (git-lfs's among them), which may write its own store (git-lfs
+  writes `.git/lfs/objects`); and a long-running READER of R that the
+  ledger saw only through a `$` path no longer makes R BUSY (a read writes no
+  ref record and no tracked change, so a fast-forward can change files under
+  it). A ledger reader that serves no `specific_*` keeps the old rule (any
+  unattributed touch in the window blocks every repo), and so does
+  `checkout-return`, unchanged;
 - a build that reads R's working tree (sourced in R, or a path dependency lands
   in R), a fresh cargo-guard lock or supervisor slot for R, a git lock in R, a
   runner AI session whose cwd or worktree names R;
