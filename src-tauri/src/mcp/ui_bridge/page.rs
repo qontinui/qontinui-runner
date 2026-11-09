@@ -189,10 +189,11 @@ pub struct PageEvaluateRequest {
     /// success envelope carrying no data.
     #[serde(default)]
     pub await_promise: bool,
-    /// EXPLICIT opt-in. When true, the frontend evaluate handler relaxes
-    /// only the four network-related blocks (fetch / XMLHttpRequest /
-    /// sendBeacon / WebSocket) so test assertions can hit runner APIs
-    /// directly. Structural code-injection blocks stay in force regardless.
+    /// EXPLICIT opt-in. When true, the evaluate gate relaxes only the four
+    /// network-related blocks (fetch / XMLHttpRequest / sendBeacon /
+    /// WebSocket) so test assertions can hit runner APIs directly — in the
+    /// frontend evaluate handler and in the direct-eval fallback alike.
+    /// Structural code-injection blocks stay in force regardless.
     #[serde(default)]
     pub allow_network_requests: Option<bool>,
     /// Optional target pop-out window (`{ "windowLabel": "term-1" }`),
@@ -1840,14 +1841,10 @@ async fn page_evaluate_inner(
                 // (useUIBridgeEvaluateHandler / usePageEvents) emits a
                 // distinctive "Expression rejected: contains prohibited
                 // pattern (<regex.source>)" message when the static
-                // blocklist matches. Surface a workaround `hint` so callers
-                // can recover without scraping the regex source.
-                let hint = static_guard_hint(&error_msg);
-                let mut body = api_error(format!("JS evaluation error: {}", error_msg));
-                if let Some(h) = hint {
-                    body.hint = Some(serde_json::Value::String(h));
-                }
-                return Err((StatusCode::BAD_REQUEST, Json(body)));
+                // blocklist matches. `evaluation_error` surfaces a recovery
+                // `hint` so callers can recover without scraping the regex
+                // source.
+                return Err(evaluation_error(&error_msg));
             }
             Ok(Json(ApiResponse::success(data)))
         }
@@ -1881,47 +1878,262 @@ async fn page_evaluate_inner(
                 ipc_err
             );
 
-            match direct_webview_evaluate_with_result(
-                &state,
-                &expression,
-                timeout_ms,
-                await_promise,
+            let state_ref = &state;
+            let expression_ref = expression.as_str();
+            direct_eval_fallback(
+                expression_ref,
+                allow_network_requests,
+                &ipc_err,
+                move || {
+                    direct_webview_evaluate_with_result(
+                        state_ref,
+                        expression_ref,
+                        timeout_ms,
+                        await_promise,
+                    )
+                },
             )
             .await
-            {
-                Ok(result) => {
-                    // Direct-eval fallback: build the {value, type} shape
-                    // here, since this path never reached the frontend
-                    // handler that would otherwise produce it. `result` is a
-                    // JSON-encoded string (direct_webview_evaluate_with_result
-                    // sends the serialised value back over HTTP) — parse it
-                    // before classifying so null/objects/arrays get the
-                    // correct discriminator. The fallback must not report a
-                    // DIFFERENT envelope than the tagged path: a caller can't
-                    // tell which one served it.
-                    let parsed: serde_json::Value = serde_json::from_str(&result)
-                        .unwrap_or_else(|_| serde_json::Value::String(result.clone()));
-                    let (value, type_name) = classify_direct_eval_value(parsed);
-                    Ok(Json(ApiResponse::success(serde_json::json!({
-                        "value": value,
-                        "type": type_name,
-                        "source": "direct_eval",
-                    }))))
+        }
+    }
+}
+
+/// The `.source` of every pattern in the frontend evaluate gate
+/// (`src/hooks/ui-bridge-events/utils.ts`): `PAGE_EVALUATE_STRUCTURAL_PATTERNS`,
+/// which every evaluate enforces. Kept in the gate's order, so the first match
+/// here is the pattern the gate itself would name. The tests read the list back
+/// out of `utils.ts` and fail when the two differ.
+const EVALUATE_STRUCTURAL_PATTERN_SOURCES: [&str; 14] = [
+    r"\bimport\s*\(",
+    r"\brequire\s*\(",
+    r"\b__proto__\b",
+    r"\bconstructor\s*\[",
+    r"\beval\s*\(",
+    r"\bnew\s+Function\b",
+    r"\bdocument\.cookie\b",
+    r"\bwindow\.open\b",
+    r"\bwindow\.location\.(assign|replace|reload)\b",
+    r"\bwindow\.location\s*=",
+    r"\blocation\.(assign|replace|reload)\b",
+    r"\bhistory\.go\s*\(\s*0?\s*\)",
+    r#"\blocation\s*=\s*["'`]"#,
+    r"\bcrypto\.subtle\b",
+];
+
+/// The `.source` of every pattern in `PAGE_EVALUATE_NETWORK_PATTERNS`, the
+/// ones a request lifts with `allowNetworkRequests: true`, in the gate's
+/// order. Pinned to `utils.ts` by the same test.
+const EVALUATE_NETWORK_PATTERN_SOURCES: [&str; 4] = [
+    r"\bfetch\s*\(",
+    r"\bXMLHttpRequest\b",
+    r"\bnavigator\.sendBeacon\b",
+    r"\bWebSocket\b",
+];
+
+/// Both gate lists compiled, structural first as the gate checks them, each
+/// with whether `allowNetworkRequests` lifts it. Every source is a constant
+/// that the tests compile one by one, so the panic below cannot fire in a
+/// build whose tests pass.
+static EVALUATE_GATE: std::sync::LazyLock<Vec<(&'static str, bool, regex::Regex)>> =
+    std::sync::LazyLock::new(|| {
+        let structural = EVALUATE_STRUCTURAL_PATTERN_SOURCES
+            .iter()
+            .map(|source| (*source, false));
+        let network = EVALUATE_NETWORK_PATTERN_SOURCES
+            .iter()
+            .map(|source| (*source, true));
+        structural
+            .chain(network)
+            .map(|(source, lifted)| {
+                let pattern = compile_js_regex_source(source).unwrap_or_else(|e| panic!("{e}"));
+                (source, lifted, pattern)
+            })
+            .collect()
+    });
+
+/// Every code point JS's `\s` matches, written as the members of a Rust
+/// character class: ECMAScript WhiteSpace (TAB, VT, FF, SPACE, NBSP, U+FEFF
+/// and every `Zs` code point) and LineTerminator (LF, CR, U+2028, U+2029),
+/// the 25 code points V8 reports for `/\s/`. Rust's `\s` is Unicode
+/// `White_Space` instead, which lacks U+FEFF and adds U+0085, so the
+/// translation never emits it.
+const JS_WHITESPACE_CLASS_MEMBERS: &str = concat!(
+    r"\t\n\x0B\x0C\r\x20\x{A0}\x{1680}\x{2000}-\x{200A}",
+    r"\x{2028}\x{2029}\x{202F}\x{205F}\x{3000}\x{FEFF}",
+);
+
+/// Compile a flag-free JS regex `.source`, which every gate pattern is, into a
+/// Rust regex that matches exactly what the JS one matches.
+///
+/// Two escapes the gate uses mean something else in Rust and are translated:
+/// JS `\b` is an ASCII word boundary (Rust's is Unicode-aware), and JS `\s` is
+/// [`JS_WHITESPACE_CLASS_MEMBERS`]. `\t`, `\n`, `\v`, `\f`, `\r`, an escaped
+/// ASCII punctuation character other than `<` and `>`, and every unescaped
+/// character not named below mean the same in both engines and pass through.
+/// Anything else whose Rust meaning differs is refused with an `Err` naming
+/// it, so a pattern added to the gate with one fails the tests instead of
+/// matching differently here than in the frontend: any other escape (`\w`,
+/// `\d`, `\S`, `\B`, `\<`, `\p`, …), `\b` inside a class (a backspace in JS),
+/// an unescaped `.` (JS's also stops at CR, U+2028 and U+2029), a brace, a
+/// `(?` group other than `(?:`, and inside a class a `[`, a doubled `&`, `-`
+/// or `~` (set operators in Rust) or a leading `]` (an empty class in JS).
+fn compile_js_regex_source(source: &str) -> Result<regex::Regex, String> {
+    let unsupported = |what: &str| {
+        format!(
+            "evaluate gate pattern `{source}` uses {what}, whose JS meaning \
+             compile_js_regex_source does not reproduce"
+        )
+    };
+    let chars: Vec<char> = source.chars().collect();
+    let mut rust = String::with_capacity(source.len() + 64);
+    let mut in_class = false;
+    let mut i = 0;
+    while let Some(&c) = chars.get(i) {
+        let next = chars.get(i + 1).copied();
+        match c {
+            '\\' => {
+                match next {
+                    Some('b') if !in_class => rust.push_str(r"(?-u:\b)"),
+                    Some('s') if in_class => rust.push_str(JS_WHITESPACE_CLASS_MEMBERS),
+                    Some('s') => {
+                        rust.push('[');
+                        rust.push_str(JS_WHITESPACE_CLASS_MEMBERS);
+                        rust.push(']');
+                    }
+                    Some(escaped @ ('t' | 'n' | 'v' | 'f' | 'r')) => {
+                        rust.push('\\');
+                        rust.push(escaped);
+                    }
+                    Some(escaped)
+                        if escaped.is_ascii_punctuation() && !matches!(escaped, '<' | '>') =>
+                    {
+                        rust.push('\\');
+                        rust.push(escaped);
+                    }
+                    Some(escaped) if in_class => {
+                        return Err(unsupported(&format!(
+                            "the escape `\\{escaped}` inside a class"
+                        )));
+                    }
+                    Some(escaped) => {
+                        return Err(unsupported(&format!("the escape `\\{escaped}`")));
+                    }
+                    None => return Err(unsupported("a trailing backslash")),
                 }
-                Err(direct_err) => {
-                    error!(
-                        "UI Bridge API: Both IPC and direct eval failed. IPC: {}, Direct: {}",
-                        ipc_err, direct_err
-                    );
-                    Err((
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(api_error(format!(
-                            "IPC: {}. Direct eval: {}",
-                            ipc_err, direct_err
-                        ))),
-                    ))
-                }
+                i += 2;
+                continue;
             }
+            '[' if in_class => return Err(unsupported("a `[` inside a class")),
+            '[' => {
+                in_class = true;
+                rust.push('[');
+                i += 1;
+                if chars.get(i) == Some(&'^') {
+                    rust.push('^');
+                    i += 1;
+                }
+                if chars.get(i) == Some(&']') {
+                    return Err(unsupported("a class that opens with `]`"));
+                }
+                continue;
+            }
+            ']' if in_class => in_class = false,
+            '&' | '-' | '~' if in_class && next == Some(c) => {
+                return Err(unsupported(&format!("`{c}{c}` inside a class")));
+            }
+            '.' if !in_class => return Err(unsupported("an unescaped `.`")),
+            '{' | '}' if !in_class => return Err(unsupported(&format!("a `{c}`"))),
+            '(' if !in_class && next == Some('?') && chars.get(i + 2) != Some(&':') => {
+                return Err(unsupported("a `(?` group other than `(?:`"));
+            }
+            _ => {}
+        }
+        rust.push(c);
+        i += 1;
+    }
+    regex::Regex::new(&rust)
+        .map_err(|e| format!("evaluate gate pattern `{source}` does not compile as `{rust}`: {e}"))
+}
+
+/// Rust twin of the frontend's `checkEvaluateBlocklist`: the `.source` of the
+/// first gate pattern `expression` matches, in the gate's own order, or `None`
+/// when the gate would let it run. `allow_network_requests` lifts the network
+/// patterns and nothing else, as it does there.
+fn evaluate_gate_match(expression: &str, allow_network_requests: bool) -> Option<&'static str> {
+    EVALUATE_GATE
+        .iter()
+        .filter(|(_, lifted, _)| !(allow_network_requests && *lifted))
+        .find(|(_, _, pattern)| pattern.is_match(expression))
+        .map(|(source, _, _)| *source)
+}
+
+/// The error answer for an evaluation the page refused or failed: the message
+/// under a `JS evaluation error:` prefix, plus the recovery `hint` when the
+/// failure is a static-guard rejection. The frontend gate's refusal and the
+/// direct-eval fallback's refusal both come through here, so a caller cannot
+/// tell which path refused.
+fn evaluation_error(error_msg: &str) -> (StatusCode, Json<ApiResponse<()>>) {
+    let mut body = api_error(format!("JS evaluation error: {}", error_msg));
+    body.hint = static_guard_hint(error_msg).map(serde_json::Value::String);
+    (StatusCode::BAD_REQUEST, Json(body))
+}
+
+/// The main-window direct-eval fallback of [`page_evaluate_inner`], behind the
+/// evaluate gate. The direct eval runs the caller's expression as a bare
+/// `eval()` that the frontend gate never sees, so without this check every
+/// guarded expression ran unguarded whenever the IPC call failed. An
+/// expression the gate refuses gets the frontend's own refusal, and `run` (the
+/// direct WebView eval in production) is never called for it.
+async fn direct_eval_fallback<F, Fut>(
+    expression: &str,
+    allow_network_requests: bool,
+    ipc_err: &str,
+    run: F,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<String, String>>,
+{
+    if let Some(source) = evaluate_gate_match(expression, allow_network_requests) {
+        info!(
+            "UI Bridge API: direct-eval fallback refused an expression the evaluate gate blocks ({})",
+            source
+        );
+        return Err(evaluation_error(&format!(
+            "Expression rejected: contains prohibited pattern ({source})"
+        )));
+    }
+    match run().await {
+        Ok(result) => {
+            // Direct-eval fallback: build the {value, type} shape here, since
+            // this path never reached the frontend handler that would
+            // otherwise produce it. `result` is a JSON-encoded string
+            // (direct_webview_evaluate_with_result sends the serialised value
+            // back over HTTP) — parse it before classifying so
+            // null/objects/arrays get the correct discriminator. The fallback
+            // must not report a DIFFERENT envelope than the tagged path: a
+            // caller can't tell which one served it.
+            let parsed: serde_json::Value = serde_json::from_str(&result)
+                .unwrap_or_else(|_| serde_json::Value::String(result.clone()));
+            let (value, type_name) = classify_direct_eval_value(parsed);
+            Ok(Json(ApiResponse::success(serde_json::json!({
+                "value": value,
+                "type": type_name,
+                "source": "direct_eval",
+            }))))
+        }
+        Err(direct_err) => {
+            error!(
+                "UI Bridge API: Both IPC and direct eval failed. IPC: {}, Direct: {}",
+                ipc_err, direct_err
+            );
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!(
+                    "IPC: {}. Direct eval: {}",
+                    ipc_err, direct_err
+                ))),
+            ))
         }
     }
 }
@@ -1949,18 +2161,6 @@ fn static_guard_hint(error_msg: &str) -> Option<String> {
     if !error_msg.contains("Expression rejected: contains prohibited pattern") {
         return None;
     }
-    // The `.source` of every pattern in the frontend gate's
-    // `PAGE_EVALUATE_NETWORK_PATTERNS` (`src/hooks/ui-bridge-events/utils.ts`):
-    // the patterns `allowNetworkRequests: true` lifts. The gate puts the
-    // matched source between parentheses in its message. The tests read both
-    // of the gate's pattern lists, so a pattern added there without a route
-    // here goes red.
-    const NETWORK_PATTERN_SOURCES: [&str; 4] = [
-        "\\bfetch\\s*\\(",
-        "\\bXMLHttpRequest\\b",
-        "\\bnavigator\\.sendBeacon\\b",
-        "\\bWebSocket\\b",
-    ];
     // A network rejection is the most-frequently-tripped guard for AI agents
     // (they reach for fetch() as the simplest "make a request" primitive), so
     // every network pattern gets one targeted hint. The hint names only the
@@ -1973,8 +2173,9 @@ fn static_guard_hint(error_msg: &str) -> Option<String> {
     // never user evidence (plan
     // 2026-11-06-a-ui-action-counts-as-user-evidence-only-when-a-user-could-have-performed-it,
     // B-D4). ui-bridge `docs-site/docs/api/runner-features.md` quotes this
-    // text verbatim; change both together.
-    if NETWORK_PATTERN_SOURCES
+    // text verbatim; change both together. Both gate paths put the matched
+    // pattern's source between parentheses in the message.
+    if EVALUATE_NETWORK_PATTERN_SOURCES
         .iter()
         .any(|source| error_msg.contains(&format!("({source})")))
     {
@@ -1999,7 +2200,12 @@ fn static_guard_hint(error_msg: &str) -> Option<String> {
 
 #[cfg(test)]
 mod static_guard_hint_tests {
-    use super::static_guard_hint;
+    use super::{
+        compile_js_regex_source, direct_eval_fallback, evaluate_gate_match, static_guard_hint,
+        EVALUATE_NETWORK_PATTERN_SOURCES, EVALUATE_STRUCTURAL_PATTERN_SOURCES,
+    };
+    use axum::http::StatusCode;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     /// The frontend gate whose rejections `static_guard_hint` answers. It is
     /// the other side of this boundary, so it is read at compile time rather
@@ -2168,6 +2374,208 @@ mod static_guard_hint_tests {
         assert!(static_guard_hint("ReferenceError: foo is not defined").is_none());
         assert!(static_guard_hint("TypeError: undefined").is_none());
         assert!(static_guard_hint("").is_none());
+    }
+
+    /// The gate the direct-eval fallback enforces is the frontend's gate,
+    /// pattern for pattern and in order: a pattern added, removed, edited or
+    /// reordered on either side turns this red.
+    #[test]
+    fn the_fallback_gate_lists_match_the_frontend_gate() {
+        assert_eq!(
+            gate_pattern_sources("PAGE_EVALUATE_STRUCTURAL_PATTERNS"),
+            EVALUATE_STRUCTURAL_PATTERN_SOURCES,
+            "the Rust structural list must be utils.ts's PAGE_EVALUATE_STRUCTURAL_PATTERNS"
+        );
+        assert_eq!(
+            gate_pattern_sources("PAGE_EVALUATE_NETWORK_PATTERNS"),
+            EVALUATE_NETWORK_PATTERN_SOURCES,
+            "the Rust network list must be utils.ts's PAGE_EVALUATE_NETWORK_PATTERNS"
+        );
+    }
+
+    /// The Rust gate answers what the frontend's `checkEvaluateBlocklist`
+    /// answers: the first match in the gate's order, the network patterns
+    /// lifted by the opt-in and nothing else, JS's ASCII `\b` (so `é` before
+    /// `fetch` is a boundary, as in JS) and JS's `\s`, which takes U+FEFF and
+    /// not U+0085 (Rust's own `\s` is the reverse). Every expected value is
+    /// what the gate's lists answer in V8 (node v24.19.0).
+    #[test]
+    fn the_fallback_gate_matches_like_the_frontend_gate() {
+        let fetch = r"\bfetch\s*\(";
+        let eval = r"\beval\s*\(";
+        for (expression, allow_network_requests, expected) in [
+            ("fetch\u{85}('/x')", false, None),
+            ("history.go(\u{85})", false, None),
+            ("fetch('/api/x')", false, Some(fetch)),
+            ("fetch('/api/x')", true, None),
+            ("new XMLHttpRequest()", false, Some(r"\bXMLHttpRequest\b")),
+            (
+                "navigator.sendBeacon('/x', d)",
+                false,
+                Some(r"\bnavigator\.sendBeacon\b"),
+            ),
+            ("new WebSocket('ws://x')", true, None),
+            ("eval('1')", true, Some(eval)),
+            ("eval(fetch('/x'))", false, Some(eval)),
+            (
+                "location = 'https://x'",
+                false,
+                Some(r#"\blocation\s*=\s*["'`]"#),
+            ),
+            ("history.go()", false, Some(r"\bhistory\.go\s*\(\s*0?\s*\)")),
+            ("document.title", false, None),
+            ("prefetch(1)", false, None),
+            ("\u{e9}fetch(1)", false, Some(fetch)),
+            ("fetch\u{feff}('/x')", false, Some(fetch)),
+        ] {
+            assert_eq!(
+                evaluate_gate_match(expression, allow_network_requests),
+                expected,
+                "{expression:?} with allowNetworkRequests={allow_network_requests}"
+            );
+        }
+    }
+
+    /// JS's `\s` translates to exactly the code points JS's `\s` matches,
+    /// checked over every code point for the escape and for its in-class
+    /// form: the 25 V8 reports for `/\s/` (node v24.19.0), with U+FEFF and
+    /// without U+0085, where Rust's own `\s` differs both ways.
+    #[test]
+    fn the_translated_whitespace_is_exactly_js_whitespace() {
+        const JS_WHITESPACE: [u32; 25] = [
+            0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x20, 0xA0, 0x1680, 0x2000, 0x2001, 0x2002, 0x2003,
+            0x2004, 0x2005, 0x2006, 0x2007, 0x2008, 0x2009, 0x200A, 0x2028, 0x2029, 0x202F, 0x205F,
+            0x3000, 0xFEFF,
+        ];
+        for source in [r"^\s$", r"^[\s]$"] {
+            let whitespace = compile_js_regex_source(source)
+                .unwrap_or_else(|e| panic!("the whitespace class must compile: {e}"));
+            let mut buf = [0u8; 4];
+            let matched: Vec<u32> = (0..=0x10FFFF_u32)
+                .filter_map(char::from_u32)
+                .filter(|c| whitespace.is_match(c.encode_utf8(&mut buf)))
+                .map(u32::from)
+                .collect();
+            assert_eq!(
+                matched, JS_WHITESPACE,
+                "{source} must match exactly the code points JS's \\s matches"
+            );
+        }
+    }
+
+    /// Every gate pattern compiles through the translator, and the translator
+    /// refuses each construct whose Rust meaning differs from its JS one and
+    /// that it does not translate, rather than passing it through. A pattern
+    /// added to the gate that uses one therefore turns this red instead of
+    /// matching one way in the frontend and another on the fallback.
+    #[test]
+    fn the_translator_compiles_the_gate_and_refuses_what_it_cannot_reproduce() {
+        for source in EVALUATE_STRUCTURAL_PATTERN_SOURCES
+            .iter()
+            .chain(EVALUATE_NETWORK_PATTERN_SOURCES.iter())
+        {
+            if let Err(e) = compile_js_regex_source(source) {
+                panic!("gate pattern {source} must compile: {e}");
+            }
+        }
+        for source in [
+            r"\(\)\.\[\]\/",
+            r"\t\n\v\f\r",
+            r#"["'`]"#,
+            r"(?:a|b)",
+            r"[a-z]",
+        ] {
+            if let Err(e) = compile_js_regex_source(source) {
+                panic!("{source} means the same in both engines and must compile: {e}");
+            }
+        }
+        for source in [
+            r"\w", r"\W", r"\d", r"\D", r"\S", r"\B", r"\<", r"\>", r"\p{L}", r"\1", r"\é",
+            r"[\b]", "a\\", r"a.b", r"a{2}", r"(?i:a)", r"(?=a)", r"[[a]]", r"[a&&b]", r"[a--b]",
+            r"[a~~b]", r"[]a]", r"[^]a]",
+        ] {
+            assert!(
+                compile_js_regex_source(source).is_err(),
+                "{source} must be refused: its Rust meaning differs from its JS one"
+            );
+        }
+    }
+
+    /// The direct-eval fallback refuses what the gate refuses, with the
+    /// frontend's own message and hint, and never runs it. `run` stands in for
+    /// the direct WebView eval and records whether it was called.
+    #[tokio::test]
+    async fn the_direct_eval_fallback_refuses_a_guarded_expression_without_running_it() {
+        let ran = AtomicBool::new(false);
+        let ran_ref = &ran;
+        let outcome = direct_eval_fallback(
+            "fetch('/api/x')",
+            false,
+            "IPC timed out",
+            move || async move {
+                ran_ref.store(true, Ordering::SeqCst);
+                Ok("1".to_string())
+            },
+        )
+        .await;
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "a refused expression must never reach the direct eval"
+        );
+        let (status, axum::Json(body)) = match outcome {
+            Ok(_) => panic!("a guarded expression must be refused on the fallback"),
+            Err(refusal) => refusal,
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body.error.as_deref(),
+            Some(
+                "JS evaluation error: Expression rejected: contains prohibited pattern \
+                 (\\bfetch\\s*\\()"
+            ),
+            "the fallback must refuse with the frontend gate's own message"
+        );
+        let hint = static_guard_hint(&rejection("\\bfetch\\s*\\(")).expect("the network hint");
+        assert_eq!(
+            body.hint,
+            Some(serde_json::Value::String(hint)),
+            "the fallback's refusal must carry the frontend refusal's hint"
+        );
+    }
+
+    /// What the gate lets through still runs on the fallback: an unguarded
+    /// expression, and a network call the request opted into. A structural
+    /// pattern stays refused even with the opt-in.
+    #[tokio::test]
+    async fn the_direct_eval_fallback_runs_what_the_gate_allows() {
+        for (expression, allow_network_requests, runs) in [
+            ("document.title", false, true),
+            ("fetch('/api/x')", true, true),
+            ("eval('1')", true, false),
+        ] {
+            let ran = AtomicBool::new(false);
+            let ran_ref = &ran;
+            let outcome = direct_eval_fallback(
+                expression,
+                allow_network_requests,
+                "IPC timed out",
+                move || async move {
+                    ran_ref.store(true, Ordering::SeqCst);
+                    Ok("\"ok\"".to_string())
+                },
+            )
+            .await;
+            assert_eq!(
+                ran.load(Ordering::SeqCst),
+                runs,
+                "{expression:?} with allowNetworkRequests={allow_network_requests}: ran"
+            );
+            assert_eq!(
+                outcome.is_ok(),
+                runs,
+                "{expression:?} with allowNetworkRequests={allow_network_requests}: answered Ok"
+            );
+        }
     }
 }
 
