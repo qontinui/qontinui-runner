@@ -461,17 +461,23 @@ pub(crate) fn provision_fleet_skills_into(
         .iter()
         .map(|skill| SkillSource::choose(skill, canonical))
         .collect();
-    // Versioned iff the repo tracks a file this pass would write, never merely
-    // "anything under .claude/skills" — a repo-local skill of the repo's own
-    // does not make it the bundle's source (provision_guard module doc).
+    // Versioned iff the repo tracks a file this pass would write for a BUILTIN
+    // skill, never merely "anything under .claude/skills" — a repo-local skill
+    // of the repo's own does not make it the bundle's source, and an
+    // account-only skill is a path no commit of the repo will ever add, so it
+    // is outside the roster the skip is confined to (provision_guard module doc).
     let tracked = crate::provision_guard::TrackedPaths::probe(skills_dir).versioning(
-        resolved.iter().zip(&sources).flat_map(|(skill, source)| {
-            source
-                .files()
-                .keys()
-                .map(|rel| Path::new(skill.dir_name()).join(rel))
-                .collect::<Vec<_>>()
-        }),
+        resolved
+            .iter()
+            .zip(&sources)
+            .filter(|(skill, _)| registry.is_builtin(&skill.name))
+            .flat_map(|(skill, source)| {
+                source
+                    .files()
+                    .keys()
+                    .map(|rel| Path::new(skill.dir_name()).join(rel))
+                    .collect::<Vec<_>>()
+            }),
     );
     let canonical_skills = sources
         .iter()
@@ -1444,6 +1450,72 @@ mod tests {
         let accepted = registry.set_overrides(units, AgentSkillSource::Served);
         assert!(accepted > 0, "the fixture's units must all validate");
         registry
+    }
+
+    /// A repository that tracks only a skill of its OWN (qontinui-studio tracks
+    /// `.claude/skills/launch-kit/`) does not version the bundle: every
+    /// embedded skill is still written and nothing is skipped.
+    #[test]
+    fn a_repo_tracking_only_its_own_skill_still_gets_every_bundled_one() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let skills_dir = tmp.path().join(".claude").join("skills");
+        std::fs::create_dir_all(skills_dir.join("launch-kit")).unwrap();
+        crate::provision_guard::test_support::git_init(tmp.path());
+        let own = skills_dir.join("launch-kit").join(SKILL_MANIFEST);
+        std::fs::write(&own, b"# the repo's own skill\n").unwrap();
+        crate::provision_guard::test_support::git_add(tmp.path(), &own);
+
+        let out = provision_fleet_skills_into(&skills_dir, &AgentSkillRegistry::new(), None)
+            .expect("provision");
+
+        assert!(out.skipped.is_empty(), "got {:?}", out.skipped);
+        for skill in embedded_skills() {
+            assert!(
+                skills_dir.join(&skill.name).join(SKILL_MANIFEST).exists(),
+                "{} must still be provisioned",
+                skill.name
+            );
+        }
+    }
+
+    /// In a checkout that versions `.claude/skills`, an ACCOUNT skill with no
+    /// embedded counterpart is outside the roster — no commit of the repo will
+    /// ever add it — so it is written, while an absent builtin is withheld.
+    #[test]
+    fn an_account_only_skill_is_still_written_in_a_root_versioned_checkout() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let skills_dir = tmp.path().join(".claude").join("skills");
+        std::fs::create_dir_all(skills_dir.join("coord-revive")).unwrap();
+        crate::provision_guard::test_support::git_init(tmp.path());
+        let tracked = skills_dir.join("coord-revive").join(SKILL_MANIFEST);
+        std::fs::write(&tracked, b"# the repo's own skill\n").unwrap();
+        crate::provision_guard::test_support::git_add(tmp.path(), &tracked);
+
+        let novel = "account-only-skill";
+        assert!(embedded_skills().iter().all(|s| s.name != novel));
+        let registry = registry_with(vec![skill_unit(
+            novel,
+            bundle(&[("SKILL.md", "# my own skill\n")]),
+        )]);
+        let out = provision_fleet_skills_into(&skills_dir, &registry, None).expect("provision");
+
+        assert!(
+            skills_dir.join(novel).join(SKILL_MANIFEST).exists(),
+            "the account-only skill is written"
+        );
+        assert!(
+            !out.skipped.iter().any(|s| s.unit.starts_with(novel)),
+            "got {:?}",
+            out.skipped
+        );
+        let absent_builtin = embedded_skills()
+            .into_iter()
+            .find(|s| s.name != "coord-revive")
+            .expect("a second embedded skill");
+        assert!(
+            !skills_dir.join(&absent_builtin.name).exists(),
+            "an absent builtin is still withheld in a versioned checkout"
+        );
     }
 
     /// A served override REPLACES the embedded default of the same name: the

@@ -524,6 +524,13 @@ impl AgentSkillRegistry {
     }
 
     /// How many defaults are embedded in this binary.
+    /// True iff `name` is a builtin skill — one this binary embeds, so the
+    /// repository that vendors it can add the same path upstream. An
+    /// account-only skill is not, and `provision_guard` never withholds it.
+    pub fn is_builtin(&self, name: &str) -> bool {
+        self.builtin.iter().any(|b| b.name == name)
+    }
+
     pub fn builtin_count(&self) -> usize {
         self.builtin.len()
     }
