@@ -1,0 +1,483 @@
+# CI TARGET MAP — which files each CI job AS RUN observes. Read by coord's
+# overlap counterfactual (plan
+# 2026-11-08-coord-lands-one-candidate-per-repo-where-a-file-overlap-gate-would-admit-parallel-units,
+# Phase 1a/1b). It changes NO CI behaviour; it describes it.
+#
+# ---------------------------------------------------------------------------
+# SEMANTICS (the coord reader implements exactly this — do not reinterpret)
+#
+# - Paths are repo-relative globset patterns (`**` allowed).
+# - A unit (a set of changed files) TOUCHES target T iff any of its files
+#   matches a pattern in T.observes.
+# - A file matching `global`, or matching NO target's `observes`, touches
+#   EVERY target (conservative: an unmapped file is never "disjoint").
+# - Two units are TARGET-DISJOINT iff their touched-target sets are disjoint.
+# - Every verdict records the lowercase hex sha256 of this file's bytes.
+#
+# ---------------------------------------------------------------------------
+# WHAT IS CLAIMED, EXACTLY. Each target's `observes` is meant to be a
+# SUPERSET of that job's dependency closure in the sense of Definition 1 of
+# qontinui-research theory/merging-modularity.md (Obs∩Obs, plus Dep∩F in both
+# directions; global units observed by every target). The closure was
+# derived BY READING, not by a tool: no build-graph extractor was run, so a
+# read this derivation missed is a soundness gap, not a design decision.
+# Where a job's closure could not be bounded below the whole tree, the
+# target says `**`. Read at qontinui-runner origin/main bf090571b
+# (2026-11-15) from:
+#   - .github/workflows/*.yml — every job that runs on a `pull_request` to
+#     main or on a `merge-candidate*/**` push (coord's merge predicate
+#     observes EVERY check, not only the `main-merge-gates` ruleset contexts,
+#     so each such job is a target), mirroring each workflow's `paths:`
+#     filter as the target's roots;
+#   - .qontinui/ci.toml (the ci_node mirror of ci.yml's `test` job);
+#   - Cargo / package manifests, build.rs, tauri.conf.json, vite and vitest
+#     config, and the compile-time reads (`include_str!`, `include_bytes!`,
+#     `include_dir!`, `tauri::generate_context!`), JS/TS imports and
+#     literal-path test reads that reach outside the compiling package.
+#
+# WHOLE-TREE OBSERVERS: EVERY JOB THAT RUNS A VITE BUILD. src/index.css
+# imports "tailwindcss" with no `source()`, and vite.config.ts sets no
+# `root`, so @tailwindcss/vite's automatic source detection scans every
+# non-gitignored file under the repo root for class candidates (measured
+# with @tailwindcss/oxide's Scanner on a 2026-11-15 working tree at 5230 files, .pre-commit-hooks/**,
+# .gitleaks.toml and docs/ included). Any tracked file can therefore change
+# the emitted CSS, hence ../dist, hence what `tauri::generate_context!`
+# embeds. Every job that runs `pnpm run build` (or `tauri build`, whose
+# beforeBuildCommand runs it) observes `**`: `test`, `clippy-windows`,
+# `clippy-tiers:clippy-diff`, `stacked-pr-fastlane` and
+# `published-parity:negative-control`. Narrowing them needs a CI-side change
+# (an explicit Tailwind `source()`), not an edit here.
+#
+# Jobs that compile src-tauri WITHOUT a vite build (onboarding-doc-fresh's
+# coord_doctor run, qontinui-types-drift's export_schemas build) embed the
+# placeholder dist build.rs provisions, so their closure is the Rust compile
+# set: src-tauri/**, crates/**, vendor/**, the compile-time includes
+# (specs/pages, examples/, atlas/schema.hcl, docs/runner-config-layers.md,
+# scripts/*), and src/** — build.rs reads src/components/app/tab-types.ts
+# and src/components/app/useAppNavigation.ts.
+#
+# THE OUTCOME THIS MAP ENCODES. `test` observes the whole tree, so every
+# unit touches it and no two units are target-disjoint (zeta_target 1.0).
+# Only a CI-structure change (bounding Tailwind's scan, and then splitting
+# what `test` compiles) could open a lane.
+#
+# DIFF-LOCAL CHECKS. gitleaks (`--log-opts base..head`), forbid-runner-schema
+# (a pathspec over the PR's changed files) and bot-owned-paths judge each
+# change's OWN diff; their verdict on a composition is the OR of the parts'
+# verdicts, so they create no sharing. They observe only their own config.
+#
+# MAINTENANCE. This map must be updated in the same PR whenever a CI job is
+# added, removed or re-scoped (a new workflow, a changed `paths:` filter, a
+# new compile-time, import or test-time read outside the compiling package).
+# A stale map is unsound in one direction only: a path a target observes but
+# that the map lists ONLY under a different target. Omitting a path entirely
+# is safe (it touches every target).
+# ---------------------------------------------------------------------------
+
+version = 1
+
+# Files observed by EVERY target: workspace manifests, lockfiles, toolchain,
+# the shared CI workflow/actions/pins every gating job runs through, and the
+# CI declarations themselves (including this map).
+global = [
+  "Cargo.toml",
+  "Cargo.lock",
+  "rust-toolchain.toml",
+  "clippy.toml",
+  "package.json",
+  "pnpm-lock.yaml",
+  ".npmrc",
+  ".gitattributes",
+  ".github/workflows/ci.yml",
+  ".github/actions/**",
+  ".github/scripts/**",
+  ".github/sibling-pins.conf",
+  ".qontinui/ci.toml",
+  ".qontinui/ci-requirements.toml",
+  ".qontinui/ci-targets.toml",
+]
+
+# ---------------------------------------------------------------------------
+# ci.yml — the gating workflow (no `paths:` filter on pull_request; also runs
+# on merge-candidate/** pushes)
+# ---------------------------------------------------------------------------
+
+[[targets]]
+# test (ubuntu-22.04) + test (windows-latest): CI-tooling node tests, purge
+# script, pnpm install/lint/effect-fixture/typecheck/vitest/BUILD, cargo fmt,
+# clippy (ubuntu), cargo test -p qontinui-runner -p session-lifecycle (dist
+# embedded), the Windows PS 5.1 contract smokes and the CI-integrity guard.
+# Whole tree: the vite build's Tailwind scan (header). Known reads beyond
+# the scan, for when that is bounded: src/**, src-tauri/**, crates/**,
+# vendor/**, icons/**, specs/**, examples/**, atlas/**, scripts/**, tests/**,
+# python-bridge/**, python/**, .github/workflows/** (workflow_paths_
+# self_inclusion.rs), docs/runner-config-layers.md, docs/workspace-
+# assumptions.{json,md} and docs/workspace-assumptions.dispositions.toml
+# (workspace_assumptions_are_enumerated.rs), and the frontend config files.
+name = "test"
+observes = [
+  "**",
+]
+
+[[targets]]
+# Clippy (windows): pnpm build (dist for generate_context!; vite.config.ts
+# imports scripts/frontend-provenance.mjs) + cargo clippy --all-targets.
+# Whole tree: the vite build's Tailwind scan (header).
+name = "clippy-windows"
+observes = [
+  "**",
+]
+
+[[targets]]
+# Holder crates (ubuntu-latest + windows-latest): cargo test -p
+# qontinui-pty-holder -p qontinui-runner-win32; clippy -p qontinui-pty-holder.
+name = "holder-crates"
+observes = [
+  "crates/pty-holder/**",
+  "crates/runner-win32/**",
+  "vendor/**",
+]
+
+[[targets]]
+# Frontend unit tests (vitest; vitest.config.ts has no Tailwind plugin, so no
+# whole-tree scan): src/** plus the files its tests import or read.
+name = "frontend-tests"
+observes = [
+  "src/**",
+  "index.html",
+  "*.html",
+  "vitest.config.ts",
+  "vite.config.ts",
+  "tsconfig.json",
+  "tsconfig.node.json",
+  # imported by src/components/terminal/transportCorpus.ts
+  "scripts/tui-repaint-generator.mjs",
+  "scripts/tui-repaint-generator.d.mts",
+  # read by src/specs/specs.compile.test.ts
+  "specs/pages/**",
+  # literal-path reads by *.test.ts
+  "src-tauri/src/mcp/ui_bridge/set_tab_readback.js",
+  "src-tauri/src/resource_guard.rs",
+  "src-tauri/src/ci_node/settings_directive.rs",
+  "src-tauri/src/session/session_lifecycle_store.rs",
+  "src-tauri/src/commands/web_integration.rs",
+]
+
+[[targets]]
+# seam-gate: three grep anchors on the test-fixtures cfg gate.
+name = "seam-gate"
+observes = [
+  "src-tauri/src/mcp/test_fixtures.rs",
+  "src-tauri/src/mcp/mod.rs",
+  "src-tauri/src/mcp_api.rs",
+]
+
+[[targets]]
+# security: cargo audit over Cargo.lock, pnpm audit (non-gating) — both global.
+name = "security"
+observes = ["Cargo.lock", "pnpm-lock.yaml"]
+
+[[targets]]
+# route: runner-pool routing for the test job.
+name = "route"
+observes = [".github/scripts/route-ci-lane.py"]
+
+[[targets]]
+# route-windows: Windows pool routing (merge-candidate push only).
+name = "route-windows"
+observes = [".github/scripts/route-ci-lane.py"]
+
+# ---------------------------------------------------------------------------
+# Unfiltered companion workflows
+# ---------------------------------------------------------------------------
+
+[[targets]]
+# ci-integrity (pull_request_target, paths .github/workflows/**,
+# .github/actions/**, scripts/check_untimed_subprocess.py).
+name = "ci-integrity:guard-gating-workflows"
+observes = [
+  ".github/workflows/**",
+  ".github/actions/**",
+  "scripts/check_untimed_subprocess.py",
+]
+
+[[targets]]
+# forbid-untimed-subprocess: scans the in-repo crates linked into the runner
+# binary (roots from src-tauri/Cargo.toml's path deps) against its baseline.
+name = "forbid-untimed-subprocess"
+observes = [
+  "scripts/check_untimed_subprocess.py",
+  "scripts/untimed-subprocess-baseline.json",
+  "src-tauri/Cargo.toml",
+  "src-tauri/src/**",
+  "src-tauri/clorinde/**",
+  "crates/**",
+  ".github/workflows/forbid-untimed-subprocess.yml",
+]
+
+[[targets]]
+# ci-rerun-on-declaration (pull_request to main): re-fires required CI when a
+# sibling declaration or base retarget arrives; reads PR metadata only.
+name = "ci-rerun-on-declaration"
+observes = [".github/workflows/ci-rerun-on-declaration.yml"]
+
+[[targets]]
+# forbid-runner-schema: a pathspec over the PR's own changed files (diff-local).
+name = "forbid-runner-schema"
+observes = [".github/workflows/forbid-runner-schema.yml"]
+
+[[targets]]
+# gitleaks over base..head (diff-local).
+name = "secret-scan:gitleaks"
+observes = [".gitleaks.toml", ".github/workflows/secret-scan.yml"]
+
+[[targets]]
+# bot-owned-paths (advisory): judges the PR's own paths (diff-local).
+name = "bot-owned-paths"
+observes = [
+  "scripts/ci/bot-owned-paths.sh",
+  ".github/workflows/bot-owned-paths.yml",
+]
+
+[[targets]]
+# bot-owned-paths-selftest (unfiltered): the script's own test suite.
+name = "bot-owned-paths-selftest"
+observes = [
+  "scripts/ci/bot-owned-paths.sh",
+  "scripts/ci/bot-owned-paths-test.sh",
+  ".github/workflows/bot-owned-paths-selftest.yml",
+]
+
+[[targets]]
+# clippy-tiers: clippy-diff (advisory; pnpm build + cargo clippy).
+# Whole tree: the vite build's Tailwind scan (header).
+name = "clippy-tiers:clippy-diff"
+observes = [
+  "**",
+]
+
+[[targets]]
+# onboarding-doc-fresh: detect on coord_doctor sources + the doc; verify
+# cargo-runs the coord_doctor bin (the src-tauri compile set, no vite build).
+name = "onboarding-doc-fresh"
+observes = [
+  "docs/runner-onboarding.md",
+  "src-tauri/**",
+  "crates/**",
+  "vendor/**",
+  "src/**",
+  "specs/**",
+  "examples/**",
+  "atlas/**",
+  "docs/runner-config-layers.md",
+  "scripts/**",
+  ".github/workflows/onboarding-doc-fresh.yml",
+]
+
+[[targets]]
+# clorinde-bindings-fresh: detect + regenerate bindings from atlas + queries.
+name = "clorinde-bindings-fresh"
+observes = [
+  "src-tauri/queries/**",
+  "src-tauri/clorinde.toml",
+  "src-tauri/clorinde/**",
+  "src-tauri/schema.pg.sql.generated",
+  "atlas/**",
+  ".github/workflows/clorinde-bindings-fresh.yml",
+]
+
+[[targets]]
+# schema-pg-sql-fresh: detect + regenerate schema.pg.sql from atlas.
+name = "schema-pg-sql-fresh"
+observes = [
+  "src-tauri/queries/**",
+  "src-tauri/schema.pg.sql.generated",
+  "src-tauri/scripts/regenerate_schema_pg_sql.sh",
+  "atlas/**",
+  ".github/workflows/schema-pg-sql-fresh.yml",
+]
+
+[[targets]]
+# schemas-pair-follow: `detect` on a pull_request (reads PR metadata only).
+name = "schemas-pair-follow:detect"
+observes = [".github/workflows/schemas-pair-follow.yml", "scripts/schemas-pair-follow.sh"]
+
+[[targets]]
+# stacked-pr-fastlane: scope + rust-fast (pnpm build + fmt + clippy) /
+# frontend-fast (stacked PRs). Whole tree: rust-fast's vite build (header).
+name = "stacked-pr-fastlane"
+observes = [
+  "**",
+]
+
+# ---------------------------------------------------------------------------
+# Path-filtered workflows: the `paths:` filter is the target's root set; the
+# listed scripts/tests are what the job executes.
+# ---------------------------------------------------------------------------
+
+[[targets]]
+name = "python-executor-command-table"
+observes = [
+  "python-bridge/**",
+  "src-tauri/src/**",
+  # pytest runs from python-bridge/ (working-directory), so its tests are
+  # python-bridge/tests/*, already under python-bridge/**.
+  ".github/workflows/python-executor-command-table.yml",
+]
+
+[[targets]]
+# gen-events-hook-suites: runs four .pre-commit-hooks/*-test.sh suites over
+# synthetic repos; its paths filter is the root set. The drift-attribution
+# suite names src-tauri/scripts/generate_types.sh.
+name = "gen-events-hook-suites"
+observes = [
+  ".pre-commit-hooks/**",
+  "src-tauri/src/**",
+  "src-tauri/build.rs",
+  "src-tauri/clorinde/**",
+  "src-tauri/scripts/generate_types.sh",
+  "crates/**",
+  "vendor/**",
+  "**/Cargo.toml",
+  ".github/workflows/gen-events-hook-suites.yml",
+]
+
+[[targets]]
+# qontinui-types-drift: generate_types.sh cargo-builds export_schemas, i.e.
+# the whole src-tauri package (no vite build).
+name = "qontinui-types-drift:check-drift"
+observes = [
+  "src-tauri/scripts/generate_types.sh",
+  "src-tauri/**",
+  "crates/**",
+  "vendor/**",
+  "src/**",
+  "specs/**",
+  "examples/**",
+  "atlas/**",
+  "docs/runner-config-layers.md",
+  "scripts/**",
+  ".github/workflows/qontinui-types-drift.yml",
+]
+
+[[targets]]
+# published-parity negative-control (PRs): pnpm tauri build --debug, whose
+# beforeBuildCommand runs the vite build. Whole tree (header).
+name = "published-parity:negative-control"
+observes = [
+  "**",
+]
+
+[[targets]]
+name = "atlas-schema-check"
+observes = ["atlas/**", ".github/workflows/atlas-schema-check.yml"]
+
+[[targets]]
+# `**/*.psm1` mirrors the workflow's own filter; no .psm1 is tracked today.
+name = "powershell-parse"
+observes = ["**/*.ps1", "**/*.psm1", ".github/workflows/powershell-parse.yml"]
+
+[[targets]]
+name = "forbid-sibling-clone"
+observes = [".github/**"]
+
+[[targets]]
+name = "ci-timeout-marker-selftest"
+observes = [".github/workflows/**", "scripts/tests/test_ci_timeout_marker.py"]
+
+[[targets]]
+name = "advisory-red-detector:selftest"
+observes = [
+  "scripts/detect-schedule-red-streaks.sh",
+  "scripts/tests/test_schedule_red_streak_detector.sh",
+  "scripts/tests/fixtures/schedule-red-streaks/**",
+  "scripts/lib/bound-hit-signature.jq",
+  "scripts/tests/fixtures/bound-hit-signature/**",
+  ".github/workflows/advisory-red-detector.yml",
+]
+
+[[targets]]
+name = "audit-ignore-review:unit-tests"
+observes = [
+  "scripts/ci-audit-ignore-review.mjs",
+  "scripts/__tests__/ci-audit-ignore-review.test.mjs",
+  ".github/workflows/audit-ignore-review.yml",
+]
+
+[[targets]]
+name = "benchmark-ipc-selftest"
+observes = [
+  "scripts/benchmark-ipc.py",
+  "scripts/tests/test_benchmark_ipc.py",
+  ".github/workflows/benchmark-ipc-selftest.yml",
+]
+
+[[targets]]
+name = "checkout-sibling-tests"
+observes = [
+  "scripts/tests/test_checkout_sibling_resolve.sh",
+  ".github/workflows/checkout-sibling-tests.yml",
+]
+
+[[targets]]
+name = "flake-escalation:unit-tests"
+observes = [
+  "scripts/ci-flake-escalate.mjs",
+  "scripts/ci-flake-analyze.mjs",
+  "scripts/__tests__/ci-flake-escalate.test.mjs",
+  ".github/workflows/flake-escalation.yml",
+]
+
+[[targets]]
+name = "oom-signature-tests"
+observes = [
+  "scripts/ci/oom-signature.sh",
+  "scripts/tests/test_oom_signature.sh",
+  "scripts/tests/fixtures/oom-signature/**",
+  ".github/workflows/oom-signature-tests.yml",
+]
+
+[[targets]]
+name = "qontinui-types-drift-wait-tests"
+observes = [
+  "scripts/tests/qontinui-types-drift-wait/**",
+  ".github/workflows/qontinui-types-drift.yml",
+  ".github/workflows/qontinui-types-drift-wait-audit.yml",
+  ".github/workflows/qontinui-types-drift-wait-tests.yml",
+]
+
+[[targets]]
+name = "resource-report-tests"
+observes = [
+  "scripts/ci/resource-report.sh",
+  "scripts/ci/resource-report-windows.ps1",
+  "scripts/tests/test_resource_report.sh",
+  "scripts/tests/fixtures/resource-report/**",
+  ".github/workflows/resource-report-tests.yml",
+]
+
+[[targets]]
+name = "schema-pg-sql-freshness-nightly:selftest"
+observes = [
+  "scripts/tests/test_schema_pr_step_guards.sh",
+  "scripts/ci/ready-bot-draft-pr.sh",
+  "scripts/tests/test_ready_bot_draft_pr.sh",
+  ".github/workflows/schema-pg-sql-freshness-nightly.yml",
+]
+
+[[targets]]
+name = "schemas-pair-follow-tests"
+observes = [
+  "scripts/schemas-pair-follow.sh",
+  "scripts/tests/schemas-pair-follow/**",
+  ".github/workflows/schemas-pair-follow.yml",
+  ".github/workflows/schemas-pair-follow-tests.yml",
+]
+
+[[targets]]
+name = "sibling-pin-bump"
+observes = [
+  "scripts/tests/test_pin_bump_pr_step.sh",
+  "scripts/ci/ready-bot-draft-pr.sh",
+  ".github/workflows/sibling-pin-bump.yml",
+]
