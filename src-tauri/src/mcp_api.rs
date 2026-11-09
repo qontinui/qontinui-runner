@@ -6056,7 +6056,7 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 /// a typed outcome (`dispatched` / `no_capable_device` /
 /// `capable_but_unavailable` / `vetoed` / `unknown`). It grants nothing new:
 /// `coord_register_gate`, already allowed here, carries the same spawn power
-/// (a `time_elapsed` gate with a `run_skill` continuation). coord refuses it to
+/// (a `time_elapsed` gate with a `run_skill` continuation). The coord half refuses it to
 /// an anonymously minted bootstrap credential on its own side. Forwarding it
 /// ahead of the coord half landing is harmless (coord answers an unknown tool).
 ///
