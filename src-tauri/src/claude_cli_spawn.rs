@@ -229,6 +229,34 @@ pub(crate) fn transient_kind_for_spawn(
     Some(kind)
 }
 
+/// How long a CLI spawn waits out a runner-owned CLI install before spawning
+/// anyway. An install that outlives it is logged, and the spawn's own retry
+/// budget then applies as it would to any other transient failure.
+pub(crate) const CLI_UPDATE_WAIT: Duration = Duration::from_secs(120);
+
+/// Returns once no runner-owned CLI install is in progress
+/// ([`crate::claude_cli_update`]), or after [`CLI_UPDATE_WAIT`]. Headless
+/// spawns through [`spawn_tokio_with_retry`] call this first, so an install the
+/// runner chose does not race them; PTY panes and the `--resume` seam do not
+/// wait yet (plan
+/// `2026-10-20-account-migration-respawn-dies-during-cli-reinstall-churn`,
+/// Phase 2).
+pub(crate) async fn await_cli_update_quiescent() {
+    use crate::claude_cli_update::{wait_if_updating, UpdateWait};
+    match wait_if_updating(CLI_UPDATE_WAIT).await {
+        UpdateWait::NotUpdating => {}
+        UpdateWait::Finished(waited) => {
+            tracing::info!(?waited, "claude_cli_spawn: waited out a runner CLI install");
+        }
+        UpdateWait::TimedOut(waited) => {
+            warn!(
+                ?waited,
+                "claude_cli_spawn: a runner CLI install is still running — spawning anyway"
+            );
+        }
+    }
+}
+
 /// Spawn `cmd`, retrying a transient CLI launch failure per [`RETRY_DELAYS`].
 ///
 /// A `tokio::process::Command` can be spawned more than once, and each spawn
@@ -241,6 +269,7 @@ pub(crate) async fn spawn_tokio_with_retry(
     cmd: &mut tokio::process::Command,
     workdir: Option<&Path>,
 ) -> Result<tokio::process::Child, CliSpawnFailure> {
+    await_cli_update_quiescent().await;
     retry_transient_spawn(
         &RETRY_DELAYS,
         || cmd.spawn(),

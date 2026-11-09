@@ -869,6 +869,38 @@ export function ClaudeCliSection({
             </div>
           )}
 
+          <div className="space-y-2 pt-2">
+            <span className="text-[10px] font-medium text-muted-foreground uppercase tracking-wide">
+              CLI Updates
+            </span>
+            <label className="flex items-start gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={settings.claude_cli.runner_manages_cli_updates ?? true}
+                onChange={(e) =>
+                  setSettings((prev) => ({
+                    ...prev,
+                    claude_cli: {
+                      ...prev.claude_cli,
+                      runner_manages_cli_updates: e.target.checked,
+                    },
+                  }))
+                }
+                className="mt-0.5 accent-primary"
+              />
+              <span>
+                <span className="text-xs font-medium block">Runner manages Claude CLI updates</span>
+                <span className="text-[10px] text-muted-foreground block">
+                  For an npm-global Claude Code install on Linux or macOS, the runner installs each
+                  new release once, when it is published. Sessions the runner starts never update
+                  themselves, so with this off, or on any other install, they stay on the installed
+                  version until you run claude update. Your own opt-outs (DISABLE_AUTOUPDATER,
+                  DISABLE_UPDATES, autoUpdates: false) always win.
+                </span>
+              </span>
+            </label>
+          </div>
+
           {settings.claude_cli.account_selection_mode === "manual" && (
             <div className="space-y-1">
               {selectionFleetManaged && (
