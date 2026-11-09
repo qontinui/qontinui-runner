@@ -747,31 +747,48 @@ mod tests {
         );
     }
 
-    /// The back-off must not cost delivery once coord answers again: every
-    /// line queued during the failure is POSTed after recovery.
+    /// The back-off must not cost delivery once coord answers again: while
+    /// the step is still writing (channel open), the FLUSH_INTERVAL retry
+    /// delivers every line queued during the failure, in order.
     #[tokio::test(start_paused = true)]
-    async fn lines_queued_during_a_failure_are_delivered_after_recovery() {
+    async fn lines_queued_during_a_failure_are_delivered_by_the_interval_retry() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let (tx, rx) = mpsc::unbounded_channel::<String>();
-        for i in 0..1_200 {
-            tx.send(format!("line {i}")).unwrap();
-        }
-        drop(tx);
         let calls = Arc::new(AtomicUsize::new(0));
         let delivered = Arc::new(Mutex::new(Vec::<String>::new()));
         let (c, d) = (calls.clone(), delivered.clone());
-        run_flusher(rx, "test-dispatch", move |batch, _seq| {
-            let first = c.fetch_add(1, Ordering::SeqCst) == 0;
-            if !first {
-                d.lock().unwrap().extend(batch);
-            }
-            async move { !first }
-        })
-        .await;
-        let got = delivered.lock().unwrap();
-        assert_eq!(got.len(), 1_200, "every queued line is delivered");
-        assert_eq!(got.first().map(String::as_str), Some("line 0"));
-        assert_eq!(got.last().map(String::as_str), Some("line 1199"));
+        let flusher = tokio::spawn(async move {
+            run_flusher(rx, "test-dispatch", move |batch, _seq| {
+                let first = c.fetch_add(1, Ordering::SeqCst) == 0;
+                if !first {
+                    d.lock().unwrap().extend(batch);
+                }
+                async move { !first }
+            })
+            .await;
+        });
+        for i in 0..1_200 {
+            tx.send(format!("line {i}")).unwrap();
+        }
+        // Paused clock: this sleep lets the flusher take every line, fail its
+        // first POST, then retry on each FLUSH_INTERVAL deadline (all earlier
+        // than ours) — 500 lines per POST, so three retries — all before the
+        // channel closes.
+        tokio::time::sleep(FLUSH_INTERVAL * 5).await;
+        {
+            let got = delivered.lock().unwrap();
+            assert_eq!(
+                got.len(),
+                1_200,
+                "the interval retry delivers the backlog while the step still writes \
+                 ({} POSTs)",
+                calls.load(Ordering::SeqCst)
+            );
+            assert_eq!(got.first().map(String::as_str), Some("line 0"));
+            assert_eq!(got.last().map(String::as_str), Some("line 1199"));
+        }
+        drop(tx);
+        flusher.await.unwrap();
     }
 
     #[test]
