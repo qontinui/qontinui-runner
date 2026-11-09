@@ -523,7 +523,6 @@ impl AgentSkillRegistry {
             .or_else(|| self.builtin.iter().find(|s| s.name == name))
     }
 
-    /// How many defaults are embedded in this binary.
     /// True iff `name` is a builtin skill — one this binary embeds, so the
     /// repository that vendors it can add the same path upstream. An
     /// account-only skill is not, and `provision_guard` never withholds it.
@@ -531,6 +530,13 @@ impl AgentSkillRegistry {
         self.builtin.iter().any(|b| b.name == name)
     }
 
+    /// The embedded default named `name`, whatever overrides it — its files are
+    /// the paths the vendoring repository's history can add.
+    pub fn builtin(&self, name: &str) -> Option<&ResolvedSkill> {
+        self.builtin.iter().find(|b| b.name == name)
+    }
+
+    /// How many defaults are embedded in this binary.
     pub fn builtin_count(&self) -> usize {
         self.builtin.len()
     }

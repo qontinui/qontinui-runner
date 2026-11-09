@@ -10889,14 +10889,19 @@ fn provision_agent_definitions_retiring(
     // The roster is what a commit of the repo can add: the embedded names, and
     // the overlay names the overlay's SOURCE checkout tracks. An untracked
     // local `.md` in that checkout is a path no commit will deliver, so it is
-    // outside the roster and is written even in a versioned checkout.
+    // outside the roster and is written even in a versioned checkout. When the
+    // source probe cannot answer inside a repository, every overlay name stays
+    // in the roster: withholding is the safe side, since writing an
+    // upstream-added one is exactly the fast-forward wedge.
     let overlay_tracked = crate::provision_guard::TrackedPaths::probe(&src_dir);
     let embedded_names = crate::fleet_agents::embedded_agent_names();
     let tracked = crate::provision_guard::TrackedPaths::probe(&dst_dir).versioning(
         written_names
             .iter()
             .filter(|n| {
-                embedded_names.contains(n) || overlay_tracked.contains(Path::new(n.as_str()))
+                embedded_names.contains(n)
+                    || overlay_tracked.is_unknown_in_repo()
+                    || overlay_tracked.contains(Path::new(n.as_str()))
             })
             .map(PathBuf::from),
     );
@@ -15710,6 +15715,50 @@ mod tests {
                 .iter()
                 .any(|s| s.unit == "overlay-only.md" && s.reason.wire() == "root_versioned"),
             "the overlay records the skip as root_versioned, got {:?}",
+            report.skipped
+        );
+    }
+
+    /// When the probe of the overlay's SOURCE checkout cannot answer inside a
+    /// repository, every overlay name stays in the roster: in a versioned
+    /// checkout an overlay file is then withheld rather than written, since
+    /// writing an upstream-added one is the fast-forward wedge itself.
+    #[test]
+    fn provision_agent_defs_withhold_overlay_when_the_source_probe_is_unknown() {
+        use crate::provision_guard::test_support::{git_add, git_init};
+
+        let root = tempfile::tempdir().unwrap();
+        let primary = root.path().join("qontinui-claude-config");
+        let src = primary.join(".claude").join("agents");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            primary.join(".git"),
+            b"gitdir: /nonexistent/qontinui-agent-overlay-unknown-probe-test\n",
+        )
+        .unwrap();
+        std::fs::write(src.join("overlay-unknown.md"), "# PRIMARY overlay").unwrap();
+
+        let embedded = crate::fleet_agents::embedded_agent_names();
+        let wt = tempfile::tempdir().unwrap();
+        git_init(wt.path());
+        let dst = wt.path().join(".claude").join("agents");
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::write(dst.join(&embedded[0]), "# WORKTREE's own").unwrap();
+        git_add(wt.path(), &dst.join(&embedded[0]));
+
+        let wt_cwd = wt.path().to_string_lossy().into_owned();
+        let report = provision_agent_definitions_from_root(root.path(), &wt_cwd);
+
+        assert!(
+            !dst.join("overlay-unknown.md").exists(),
+            "an UNKNOWN source probe must not let the overlay create an untracked file"
+        );
+        assert!(
+            report
+                .skipped
+                .iter()
+                .any(|s| s.unit == "overlay-unknown.md" && s.reason.wire() == "root_versioned"),
+            "got {:?}",
             report.skipped
         );
     }
