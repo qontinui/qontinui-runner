@@ -5,8 +5,9 @@
 //! 2. **`.qontinui/contexts/` directory** — markdown files in the project root
 //!
 //! The directory-based approach follows the same pattern as `.qontinui/constitution.md`
-//! and `.qontinui/constraints.toml`. Each `.md` file becomes a context with its
-//! filename as the name and optional YAML frontmatter for metadata.
+//! and `.qontinui/constraints.toml`. Each `.md` file becomes a context, with
+//! optional YAML frontmatter for metadata. Its name is the frontmatter `name`
+//! when set, and the filename stem otherwise.
 
 #![allow(dead_code)]
 
@@ -146,6 +147,7 @@ pub fn create_project_context(
 ///
 /// ```markdown
 /// ---
+/// name: API Design Guidelines
 /// category: architecture
 /// tags: [api, rest, endpoints]
 /// autoInclude:
@@ -157,7 +159,8 @@ pub fn create_project_context(
 /// ```
 ///
 /// If no frontmatter is present, the entire file is used as content.
-/// The context name is derived from the filename (e.g., `api-guidelines.md` → "api-guidelines").
+/// The context name is the frontmatter `name` when set ("API Design Guidelines"
+/// above), and otherwise the filename stem (`api-guidelines.md` → "api-guidelines").
 /// Context IDs are deterministic: `proj-ctx-{filename_stem}` so they remain stable across loads.
 pub fn load_project_contexts_from_dir(project_path: &str) -> Vec<Context> {
     // Canonical Qontinui-native source.
