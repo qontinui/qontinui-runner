@@ -443,6 +443,34 @@ mod nothing_checked_tests {
         assert!(setup.all_passed);
     }
 
+    /// A non-empty VERIFICATION batch with no required step is not all_passed
+    /// either. A gate runs (through `execute_single_step`, which touches no
+    /// database) and succeeds, and it checks nothing.
+    #[tokio::test]
+    async fn the_batch_executor_does_not_pass_a_verification_batch_that_checks_nothing() {
+        let app_state = crate::AppState::new_for_test();
+        let config_storage = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::config_storage::ConfigStorage::new_degraded(),
+        ));
+        let gate_only = super::execute_steps_batch(
+            &app_state,
+            &config_storage,
+            r#"[{"type":"gate","name":"all"}]"#,
+            "verification",
+            Some(1),
+            "exec-durable-gate",
+            None,
+        )
+        .await;
+        assert_eq!(gate_only.step_results.len(), 1);
+        assert!(
+            gate_only.step_results[0].success,
+            "the gate itself ran and succeeded"
+        );
+        assert!(!gate_only.all_passed);
+        assert!(gate_only.success, "the phase ran; it checked nothing");
+    }
+
     /// The control: a setup or completion phase with nothing to do succeeded.
     #[test]
     fn an_empty_setup_or_completion_batch_still_succeeds() {
