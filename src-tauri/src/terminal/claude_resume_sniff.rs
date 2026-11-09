@@ -173,6 +173,8 @@ pub(crate) fn apply_typed_resume_effects(
                 gate_id: None,
                 gate_consuming_device_id: None,
                 gate_bound_boot_ms: None,
+                spawn: None,
+                run: Default::default(),
             });
             info!(
                 terminal_id = %terminal_id,

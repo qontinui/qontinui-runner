@@ -353,6 +353,23 @@ pub(crate) async fn launch(
         spec.timeout.as_secs()
     );
 
+    // Run ledger (plan 2026-10-23-session-duration-by-work-type-and-per-device-
+    // session-load, Phase 4): a scheduled headless session pinned to
+    // `session_id` — no lifecycle record, so its run rides the agentic ledger
+    // from here to the child's exit (or its timeout kill).
+    crate::session::run_record_emitter::agentic_headless_start(
+        &session_id,
+        crate::session::run_record_emitter::SpawnFacts::new(
+            crate::coord_drain_state::SpawnOrigin::Scheduler,
+        )
+        .spawn_kind("scheduler_remote_agent")
+        .skill(crate::session::run_record_emitter::skill_of_prompt(
+            &spec.prompt,
+        )),
+        crate::session::run_record_emitter::headless_run_tenant(&workdir_s).await,
+    );
+    let run_key = session_id.clone();
+
     let log_path = scheduler_logs_root().map(|d| d.join(format!("{}.log", spec.execution_id)));
     let pump_log = log_path.clone();
     let stdout = child.stdout.take();
@@ -393,6 +410,7 @@ pub(crate) async fn launch(
                 (Ok(None), true)
             }
         };
+        crate::session::run_record_emitter::agentic_process_exited(&run_key);
         // Let the pump drain what the child wrote before it died.
         let _ = tokio::time::timeout(Duration::from_secs(5), pump).await;
         if let Some(p) = pid {
