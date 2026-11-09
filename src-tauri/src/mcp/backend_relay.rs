@@ -6032,10 +6032,10 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
                 // every `acquire_for_terminal` door; the context's Drop then
                 // releases its claims.
                 if let Some(ctx) = isolated_ctx.as_ref() {
-                    ctx.report_unspawned("backend_relay terminal_create", &e);
+                    ctx.report_unspawned("backend_relay terminal_create", &e.message);
                 }
                 Some(crate::terminal::spawn_refusal::relay_spawn_failed_frame(
-                    &e,
+                    &e.message,
                     data,
                     admitted.is_some(),
                 ))

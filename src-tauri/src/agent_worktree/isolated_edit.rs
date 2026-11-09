@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
 use super::acquire_retry::RetryDeadline;
+use super::remove_unspawned::{RemovalReport, TreeProvenance, UnspawnedBase};
 use super::{
     allocate_and_materialize_with_claim, release_claim_best_effort, spawn_heartbeat_task,
     worktree_mode_enabled, ActiveClaim, AllocateError, ClaimHeartbeatHandle, MaterializeOutcome,
@@ -89,6 +90,16 @@ pub struct IsolatedEditContext {
     // Kept so a grow call ([`IsolatedEditContext::acquire_additional`])
     // allocates under the same tenant the first allocate did.
     spawn_tenant: Option<uuid::Uuid>,
+
+    // How each worktree was placed, keyed by `worktree_resource_key(path)` —
+    // recorded from the materialize outcome (plan
+    // `2026-11-08-a-spawn-refused-after-its-worktree-allocation-leaves-the-tree-on-disk`
+    // D1). A worktree with no entry reads `Unrecorded` and is never removed.
+    provenance: HashMap<String, TreeProvenance>,
+
+    // Worktrees `remove_unspawned` took off disk. `Drop`'s fs-observer push
+    // and edit-effect verify skip them: both would read a tree that is gone.
+    removed_worktrees: Vec<PathBuf>,
 }
 
 impl Drop for IsolatedEditContext {
@@ -111,9 +122,17 @@ impl Drop for IsolatedEditContext {
         // observations under one tenant and its verify under another.
         let tenant = crate::session::session_tenant_scope(self.session_id());
 
+        // A tree `remove_unspawned` removed has nothing to observe or verify.
+        let removed = std::mem::take(&mut self.removed_worktrees);
+        let on_disk = |w: &&MaterializedWorktree| {
+            !removed
+                .iter()
+                .any(|r| super::canonical_paths::paths_equal(r, &w.worktree_path))
+        };
+
         if super::fs_observer::fs_observer_enabled() {
             let correlation_id = Some(uuid::Uuid::new_v4());
-            for w in &self.worktrees {
+            for w in self.worktrees.iter().filter(on_disk) {
                 super::fs_observer::spawn_push_worktree_observations(
                     self.coord_http_base.clone(),
                     w.worktree_path.clone(),
@@ -134,7 +153,7 @@ impl Drop for IsolatedEditContext {
         // (default off, flips with `QONTINUI_FS_OBSERVER_ENABLED` once quiet)
         // and drop-safe: it spawns onto the current runtime, never blocking
         // `Drop` — same mechanism the fs_observations push uses.
-        for w in &self.worktrees {
+        for w in self.worktrees.iter().filter(on_disk) {
             super::edit_effect_loop::spawn_verify(
                 self.coord_http_base.clone(),
                 w.worktree_path.clone(),
@@ -282,6 +301,98 @@ impl IsolatedEditContext {
         }
     }
 
+    /// Remove the trees this allocation made for a spawn that failed from
+    /// `door` with `error`, when they prove they hold nothing, then report the
+    /// failed spawn ONCE for the allocation — whether or not anything was
+    /// removed (plan
+    /// `2026-11-08-a-spawn-refused-after-its-worktree-allocation-leaves-the-tree-on-disk`,
+    /// Phase 1). The conjuncts a tree must pass are
+    /// [`super::remove_unspawned`]'s; `child_started` is the typed answer of the
+    /// failed create ([`crate::terminal::spawn_refusal::SpawnFailure`]), and a
+    /// `true` there keeps every tree and only reports.
+    ///
+    /// Consumes the context: its `Drop` still releases the claims — AFTER the
+    /// removal, so the trees stay claimed while they are judged — and skips the
+    /// fs-observer push and edit-effect verify for every removed tree.
+    ///
+    /// Detached, so the door's answer never waits on git: the removal and then
+    /// the report run on the current Tokio runtime, in that order, so the ledger
+    /// agrees with the disk. Outside a runtime nothing is removed and nothing is
+    /// posted; the context is dropped and the log says so.
+    pub(crate) fn remove_unspawned(self, door: &str, child_started: bool, error: &str) {
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                let (door, error) = (door.to_string(), error.to_string());
+                handle.spawn(async move {
+                    self.remove_unspawned_with(
+                        &door,
+                        child_started,
+                        &error,
+                        |agent_id, reason| {
+                            tokio::spawn(async move {
+                                crate::agent_runtime::report_terminal_spawn_failed(
+                                    agent_id, &reason,
+                                )
+                                .await;
+                            });
+                        },
+                        super::canonical_paths::allocated_worktree_for_path,
+                    )
+                    .await;
+                });
+            }
+            Err(_) => warn!(
+                "{door}: no async runtime to remove or report allocation {} on; its \
+                 worktree stays until reclaim finds it",
+                self.agent_id
+            ),
+        }
+    }
+
+    /// [`Self::remove_unspawned`] awaited in place, with the poster and the
+    /// allocation-root resolver injected — the test seam. Returns what the
+    /// removal did to each tree.
+    pub(crate) async fn remove_unspawned_with<F>(
+        mut self,
+        door: &str,
+        child_started: bool,
+        error: &str,
+        post: impl FnOnce(uuid::Uuid, String),
+        allocated_root: F,
+    ) -> RemovalReport
+    where
+        F: Fn(&Path) -> Option<PathBuf> + Clone + Send + 'static,
+    {
+        let report = super::remove_unspawned::remove_unspawned_trees_with(
+            &self.agent_id,
+            self.unspawned_bases(),
+            child_started,
+            error,
+            allocated_root,
+        )
+        .await;
+        self.removed_worktrees = report.removed_paths();
+        self.report_unspawned_with(door, error, post);
+        report
+    }
+
+    /// Every worktree of this context as the removal judges it: its path, the
+    /// `parent_sha` coord recorded for it, and how it was placed.
+    pub(crate) fn unspawned_bases(&self) -> Vec<UnspawnedBase> {
+        self.worktrees
+            .iter()
+            .map(|w| UnspawnedBase {
+                worktree_path: w.worktree_path.clone(),
+                parent_sha: w.parent_sha.clone(),
+                provenance: self
+                    .provenance
+                    .get(&super::worktree_resource_key(&w.worktree_path))
+                    .cloned()
+                    .unwrap_or(TreeProvenance::Unrecorded),
+            })
+            .collect()
+    }
+
     /// Grow primitive (Phase 1c, plan
     /// 2026-06-06-session-scoped-multi-repo-workspace-coordination):
     /// materialize ONE more repo's worktree, acquire its `kind=worktree`
@@ -317,7 +428,7 @@ impl IsolatedEditContext {
 
         let repos = [repo.to_string()];
         let session_id = self.session_id();
-        let mut result = materialize_repos(
+        let (mut result, placed) = materialize_repos(
             &self.coord_http_base,
             self.device_id,
             &repos,
@@ -352,6 +463,8 @@ impl IsolatedEditContext {
             self.extra_cred_agent_ids.push(result.agent_id.clone());
         }
         self.active_claims.append(&mut result.active_claims);
+        self.provenance
+            .extend(provenance_by_path(&result.worktrees, placed));
         self.worktrees.append(&mut result.worktrees);
         Ok(())
     }
@@ -508,7 +621,7 @@ pub async fn acquire(
     // One deadline for the whole acquire, computed before the allocate (D3).
     let deadline = RetryDeadline::from_budget(req.transport_retry, tokio::time::Instant::now());
 
-    let result = materialize_repos(
+    let (result, placed) = materialize_repos(
         &coord_http_base,
         device_id,
         &repos,
@@ -557,6 +670,7 @@ pub async fn acquire(
         );
     }
 
+    let provenance = provenance_by_path(&result.worktrees, placed);
     Ok(Some(IsolatedEditContext {
         agent_id: result.agent_id,
         worktrees: result.worktrees,
@@ -568,9 +682,23 @@ pub async fn acquire(
         edit_loop_stash,
         edit_loop_correlation_id,
         edit_loop_declared_paths,
+        provenance,
+        removed_worktrees: Vec::new(),
         extra_cred_agent_ids: Vec::new(),
         spawn_tenant: req.spawn_tenant,
     }))
+}
+
+/// Key each worktree's placement by its path (see `IsolatedEditContext::provenance`).
+fn provenance_by_path(
+    worktrees: &[MaterializedWorktree],
+    placed: Vec<TreeProvenance>,
+) -> HashMap<String, TreeProvenance> {
+    worktrees
+        .iter()
+        .zip(placed)
+        .map(|(w, p)| (super::worktree_resource_key(&w.worktree_path), p))
+        .collect()
 }
 
 /// Resolve canonical paths + parent SHAs for `repos`, call
@@ -603,7 +731,7 @@ async fn materialize_repos(
     shared_branch: SharedBranchPolicy,
     edit_siblings: &[String],
     deadline: RetryDeadline,
-) -> Result<super::AllocateResult, AllocateError> {
+) -> Result<(super::AllocateResult, Vec<TreeProvenance>), AllocateError> {
     let mut canonical_paths: HashMap<String, PathBuf> = HashMap::with_capacity(repos.len());
     for repo in repos {
         // A repo outside the workspace root is materialized only from a
@@ -709,27 +837,51 @@ async fn materialize_repos(
     };
 
     match outcome {
-        MaterializeOutcome::Worktrees(r) => Ok(r),
-        MaterializeOutcome::SharedBranch(sb) => Ok(super::AllocateResult {
-            agent_id: sb.agent_id,
-            worktrees: sb
-                .branches
-                .into_iter()
-                .map(|b| MaterializedWorktree {
-                    repo: b.repo,
-                    branch: b.branch,
-                    parent_sha: b.parent_sha,
-                    worktree_path: b.checkout_path,
-                    push_ref: b.push_ref,
-                    parent_sha_provenance: b.parent_sha_provenance,
+        MaterializeOutcome::Worktrees(r) => {
+            // Each a `git worktree add` this call ran. The canonical checkout is
+            // the one it was cut from: the requested repos' from the map above,
+            // a declared sibling's through the same door `mod.rs` cuts it with.
+            let placed = r
+                .worktrees
+                .iter()
+                .map(|w| {
+                    canonical_paths
+                        .get(&w.repo)
+                        .cloned()
+                        .or_else(|| super::canonical_paths::worktree_source_checkout(&w.repo).ok())
+                        .map_or(TreeProvenance::Unrecorded, |canonical| {
+                            TreeProvenance::FreshWorktree { canonical }
+                        })
                 })
-                .collect(),
-            token: sb.token,
-            token_jti: sb.token_jti,
-            token_exp: sb.token_exp,
-            active_claims: sb.active_claims,
-            sibling_notes: sb.sibling_notes,
-        }),
+                .collect();
+            Ok((r, placed))
+        }
+        MaterializeOutcome::SharedBranch(sb) => {
+            let placed = vec![TreeProvenance::SharedBranch; sb.branches.len()];
+            Ok((
+                super::AllocateResult {
+                    agent_id: sb.agent_id,
+                    worktrees: sb
+                        .branches
+                        .into_iter()
+                        .map(|b| MaterializedWorktree {
+                            repo: b.repo,
+                            branch: b.branch,
+                            parent_sha: b.parent_sha,
+                            worktree_path: b.checkout_path,
+                            push_ref: b.push_ref,
+                            parent_sha_provenance: b.parent_sha_provenance,
+                        })
+                        .collect(),
+                    token: sb.token,
+                    token_jti: sb.token_jti,
+                    token_exp: sb.token_exp,
+                    active_claims: sb.active_claims,
+                    sibling_notes: sb.sibling_notes,
+                },
+                placed,
+            ))
+        }
         MaterializeOutcome::Wait(w) => Err(AllocateError::Wait(w)),
     }
 }
@@ -1523,7 +1675,15 @@ impl IsolatedEditContext {
             edit_loop_declared_paths: Vec::new(),
             extra_cred_agent_ids: Vec::new(),
             spawn_tenant: None,
+            provenance: HashMap::new(),
+            removed_worktrees: Vec::new(),
         }
+    }
+
+    /// Test-only: record how a worktree was placed, as `materialize_repos` does.
+    pub(crate) fn set_provenance_for_test(&mut self, path: &Path, provenance: TreeProvenance) {
+        self.provenance
+            .insert(super::worktree_resource_key(path), provenance);
     }
 
     /// Test-only view of the credential-install ids `Drop` will tear down:

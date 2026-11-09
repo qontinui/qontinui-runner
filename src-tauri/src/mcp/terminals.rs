@@ -535,9 +535,9 @@ pub async fn create_terminal_handler(
             // the report moves the allocation out of `allocated` in coord's
             // ledger — see `IsolatedEditContext::report_unspawned`.
             if let Some(ctx) = isolated_ctx.as_ref() {
-                ctx.report_unspawned("HTTP POST /terminals", &e);
+                ctx.report_unspawned("HTTP POST /terminals", &e.message);
             }
-            Err(terminal_spawn_failed(e))
+            Err(terminal_spawn_failed(e.message))
         }
     }
 }

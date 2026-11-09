@@ -74,7 +74,7 @@ pub(crate) fn admit_spawn_tenant(raw: Option<&str>) -> Result<Option<uuid::Uuid>
 /// `report` is the seam the tests drive; the command passes
 /// [`crate::agent_worktree::isolated_edit::IsolatedEditContext::report_unspawned`].
 pub(crate) fn settle_terminal_spawn<T>(
-    joined: Result<Result<T, String>, tokio::task::JoinError>,
+    joined: Result<Result<T, crate::terminal::spawn_refusal::SpawnFailure>, tokio::task::JoinError>,
     isolated_ctx: Option<&crate::agent_worktree::isolated_edit::IsolatedEditContext>,
     report: impl FnOnce(&crate::agent_worktree::isolated_edit::IsolatedEditContext, &str),
 ) -> Result<T, String> {
@@ -82,9 +82,9 @@ pub(crate) fn settle_terminal_spawn<T>(
         Ok(Ok(info)) => Ok(info),
         Ok(Err(e)) => {
             if let Some(ctx) = isolated_ctx {
-                report(ctx, &e);
+                report(ctx, &e.message);
             }
-            Err(e)
+            Err(e.message)
         }
         Err(join) => {
             if let Some(ctx) = isolated_ctx {
@@ -3478,8 +3478,14 @@ mod tests {
             });
         };
 
-        let created: Result<Result<(), String>, tokio::task::JoinError> =
-            Ok(Err("Failed to open PTY: out of ptys".to_string()));
+        let created: Result<
+            Result<(), crate::terminal::spawn_refusal::SpawnFailure>,
+            tokio::task::JoinError,
+        > = Ok(Err(
+            crate::terminal::spawn_refusal::SpawnFailure::before_child(
+                "Failed to open PTY: out of ptys",
+            ),
+        ));
         assert_eq!(
             settle_terminal_spawn(created, Some(&ctx), report),
             Err("Failed to open PTY: out of ptys".to_string())

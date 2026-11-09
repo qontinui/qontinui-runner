@@ -46,7 +46,7 @@ pub(crate) const RUNNER_SCAFFOLDING: &[&str] = &[".claude", ".coord-mcp-status",
 
 /// Strip git's quoting from a porcelain path. git quotes paths containing
 /// spaces or unusual bytes (`?? "a b.txt"`); ordinary paths are bare.
-fn unquote(path: &str) -> &str {
+pub(crate) fn unquote(path: &str) -> &str {
     path.strip_prefix('"')
         .and_then(|p| p.strip_suffix('"'))
         .unwrap_or(path)
@@ -58,7 +58,7 @@ fn unquote(path: &str) -> &str {
 /// directory (`.claude/agents/foo.md`, and the bare-directory form `.claude/`
 /// git emits when the whole dir is untracked). Deliberately NOT a plain
 /// `starts_with`, so a sibling like `.mcp.json.bak` stays dirty.
-fn is_scaffolding_path(path: &str) -> bool {
+pub(crate) fn is_scaffolding_path(path: &str) -> bool {
     let p = path.replace('\\', "/");
     let p = p.trim_end_matches('/');
     RUNNER_SCAFFOLDING
