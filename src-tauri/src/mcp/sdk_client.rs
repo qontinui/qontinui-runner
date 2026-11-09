@@ -1828,7 +1828,16 @@ async fn active_app_origin(state: &Arc<ApiState>) -> Option<crate::mcp::origin_g
             .map(|entry| entry.transport),
         Some(AppTransport::Websocket)
     );
-    destination_origin(&*state.sdk_connection.lock().await, relay_routed)
+    let manager = state.sdk_connection.lock().await;
+    // The registry was read for THIS app id: a connection switched since then
+    // is another destination, so it is vouched for by nothing.
+    let still_active = manager
+        .active_connection()
+        .is_some_and(|conn| conn.app_info.app_id == app_id);
+    if !still_active {
+        return None;
+    }
+    destination_origin(&manager, relay_routed)
 }
 
 /// The WebSocket payload and HTTP body the APP receives for an element action.
