@@ -17,9 +17,8 @@
 //! single POST would most likely fail for the very rows that need it. The
 //! first attempt is immediate; later ones follow the acquire's delay helper
 //! starting at 30 s, capped at 5 min, inside a 30 min budget. A typed answer
-//! (retired, refused, no row, an unreadable answer, a coord that does not
-//! implement the flag) ends
-//! the loop. A runner exit drops the task and the row ages out as before.
+//! (retired, already retired by a sibling's POST, refused, no row, an
+//! unreadable answer, a coord that does not implement the flag) ends the loop. A runner exit drops the task and the row ages out as before.
 //!
 //! No directory is removed here: `abandoned` grants no disk authority, and the
 //! existing unwind only releases claims. Disk stays with reclaim.
@@ -91,9 +90,15 @@ pub(crate) fn retire_body(row: &RetireRow) -> serde_json::Value {
 /// `AgentDoneOutcome` in its `agent_worktrees.rs`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RetireOutcome {
-    /// HTTP 200 with `abandoned` above 0. A shortfall reason beside it
-    /// (a partial retire across several matched rows) is kept for the log.
-    Retired { shortfall: Option<String> },
+    /// HTTP 200 with `abandoned` above 0. A reason beside it (a partial retire
+    /// across several matched rows, or more rows than predicted) is kept for
+    /// the log.
+    Retired { reason: Option<String> },
+    /// HTTP 200 moving nothing because every matched row already reads
+    /// `abandoned`. Coord matches on path OR branch, and a declared sibling
+    /// shares its allocation's branch, so the first row's POST retires the
+    /// sibling too and the sibling's own POST lands here.
+    AlreadyRetired,
     /// HTTP 200 with `abandoned: 0` and coord's reason (`no_retirable_row`,
     /// `census_silent_for_device`, a sighting inside the window, …).
     Refused(String),
@@ -115,9 +120,16 @@ pub(crate) enum RetireOutcome {
 /// the census-gated UPDATE erroring (Postgres), and a misconfigured census
 /// window. In the first two coord moved nothing because it was failing, which
 /// is the outage this loop exists to ride out. A misconfigured window is a
-/// configuration no retry inside the budget changes.
+/// configuration no retry inside the budget changes. `census_silent_for_device`
+/// is retried only in its arm where coord FAILED TO STORE this device's census
+/// POST: that is coord's store failing too. Its other arm (no recent census
+/// from this device) is about the device and stays final.
+///
+/// The split reads coord's prose, because coord serves no typed refusal code;
+/// a reworded sentence costs at most the 30 min budget of retries.
 fn coord_failed_to_decide(reason: &str) -> bool {
-    reason.starts_with("retire_failed_closed:") && !reason.contains("census presence window")
+    (reason.starts_with("retire_failed_closed:") && !reason.contains("census presence window"))
+        || (reason.starts_with("census_silent_for_device") && reason.contains("FAILED TO STORE"))
 }
 
 /// Classify one fully read retire response. `Err` is a transient answer worth
@@ -172,10 +184,17 @@ pub(crate) fn classify_retire_response(
             None => return Ok(RetireOutcome::Unreadable(one_line(body_text))),
         },
     };
+    let all_abandoned = v
+        .get("statuses")
+        .and_then(|s| s.as_array())
+        .is_some_and(|s| !s.is_empty() && s.iter().all(|x| x.as_str() == Some("abandoned")));
     Ok(match (abandoned, refused) {
-        (Some(n), shortfall) if n > 0 => RetireOutcome::Retired {
-            shortfall: shortfall.map(|r| one_line(&r)),
+        (Some(n), reason) if n > 0 => RetireOutcome::Retired {
+            reason: reason.map(|r| one_line(&r)),
         },
+        (Some(_), Some(reason)) if reason.starts_with("no_retirable_row") && all_abandoned => {
+            RetireOutcome::AlreadyRetired
+        }
         (Some(_), Some(reason)) => RetireOutcome::Refused(one_line(&reason)),
         (Some(_), None) => {
             RetireOutcome::Refused("coord moved no row and named no reason".to_string())
@@ -261,12 +280,18 @@ pub(crate) async fn retire_rows(
         )
         .await;
         match &r {
-            Ok(RetireOutcome::Retired { shortfall }) => info!(
+            Ok(RetireOutcome::Retired { reason }) => info!(
                 agent_id = %agent_id,
                 repo = %row.repo,
                 worktree_path = %row.worktree_path,
-                shortfall = ?shortfall,
+                reason = ?reason,
                 "abandoned allocation retired: row now reads abandoned on coord's ledger"
+            ),
+            Ok(RetireOutcome::AlreadyRetired) => info!(
+                agent_id = %agent_id,
+                repo = %row.repo,
+                worktree_path = %row.worktree_path,
+                "abandoned allocation already retired: every matched row reads abandoned"
             ),
             Ok(other) => warn!(
                 agent_id = %agent_id,
@@ -355,22 +380,22 @@ mod tests {
             ok(
                 r#"{"matched":1,"trigger_signal":"agent_done","statuses":["allocated"],"abandoned":1,"abandon_refused":null,"note":"retired"}"#
             ),
-            Ok(RetireOutcome::Retired { shortfall: None })
+            Ok(RetireOutcome::Retired { reason: None })
         );
         assert_eq!(
             ok(
                 r#"{"matched":2,"statuses":["allocated","allocated"],"abandoned":1,"abandon_refused":"retire_shortfall: 1 of 2 predicted row(s) moved"}"#
             ),
             Ok(RetireOutcome::Retired {
-                shortfall: Some("retire_shortfall: 1 of 2 predicted row(s) moved".into())
+                reason: Some("retire_shortfall: 1 of 2 predicted row(s) moved".into())
             })
         );
         assert_eq!(
             ok(
-                r#"{"matched":1,"statuses":["abandoned"],"abandoned":0,"abandon_refused":"no_retirable_row: statuses [abandoned]"}"#
+                r#"{"matched":1,"statuses":["merged"],"abandoned":0,"abandon_refused":"no_retirable_row: statuses [merged]"}"#
             ),
             Ok(RetireOutcome::Refused(
-                "no_retirable_row: statuses [abandoned]".into()
+                "no_retirable_row: statuses [merged]".into()
             ))
         );
         assert_eq!(
@@ -401,6 +426,26 @@ mod tests {
             Ok(RetireOutcome::Rejected(_))
         ));
         assert!(classify_retire_response(StatusCode::SERVICE_UNAVAILABLE, "down").is_err());
+    }
+
+    /// A declared sibling's POST after its allocation's first row retired both:
+    /// coord matched them by branch and both already read abandoned.
+    #[test]
+    fn a_sibling_already_retired_by_the_first_post_reads_already_retired() {
+        let ok = |b: &str| classify_retire_response(StatusCode::OK, b);
+        assert_eq!(
+            ok(
+                r#"{"matched":2,"statuses":["abandoned","abandoned"],"abandoned":0,"abandon_refused":"no_retirable_row: statuses [\"abandoned\", \"abandoned\"]"}"#
+            ),
+            Ok(RetireOutcome::AlreadyRetired)
+        );
+        // A row that is still live keeps the refusal.
+        assert!(matches!(
+            ok(
+                r#"{"matched":2,"statuses":["abandoned","merged"],"abandoned":0,"abandon_refused":"no_retirable_row: statuses [\"abandoned\", \"merged\"]"}"#
+            ),
+            Ok(RetireOutcome::Refused(_))
+        ));
     }
 
     /// The field this module used to read. Coord has never sent it, so a body
@@ -434,6 +479,17 @@ mod tests {
             let cause = classify_retire_response(StatusCode::OK, &body.to_string()).unwrap_err();
             assert!(cause.contains("retire_failed_closed"), "{cause}");
         }
+        // Coord failing to store this device's census is coord's store failing.
+        let body = serde_json::json!({"matched": 1, "abandoned": 0, "abandon_refused":
+            "census_silent_for_device: a census POST from this device arrived and coord FAILED TO STORE it"});
+        assert!(classify_retire_response(StatusCode::OK, &body.to_string()).is_err());
+        // No recent census from the device is about the device: final.
+        let body = serde_json::json!({"matched": 1, "abandoned": 0, "abandon_refused":
+            "census_silent_for_device: coord cannot establish that this device's census was seen"});
+        assert!(matches!(
+            classify_retire_response(StatusCode::OK, &body.to_string()),
+            Ok(RetireOutcome::Refused(_))
+        ));
         // The same prefix on a misconfigured window is a configuration: final.
         let body = serde_json::json!({"matched": 1, "abandoned": 0, "abandon_refused":
             "retire_failed_closed: census presence window is <= 0 (0s); the gate cannot be evaluated"});
@@ -473,12 +529,12 @@ mod tests {
                 (503, "{}".to_string()),
                 (
                     200,
-                    r#"{"matched":1,"abandoned":0,"persisted":false,"note":"stamp deferred"}"#
+                    r#"{"matched":0,"statuses":[],"abandoned":0,"persisted":false,"note":"stamp deferred (transient PG error or pre-migration column)"}"#
                         .to_string(),
                 ),
                 (
                     200,
-                    r#"{"matched":1,"abandoned":0,"abandon_refused":"x"}"#.to_string(),
+                    r#"{"matched":1,"statuses":["allocated"],"abandoned":0,"abandon_refused":"census_silent_for_device: coord cannot establish that this device's census was seen"}"#.to_string(),
                 ),
             ],
         )])

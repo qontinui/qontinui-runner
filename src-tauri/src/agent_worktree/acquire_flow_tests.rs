@@ -368,7 +368,7 @@ async fn a_refused_or_failing_retire_never_changes_the_returned_error() {
     for done in [
         (
             200,
-            r#"{"matched":1,"abandoned":0,"abandon_refused":"census_dirty"}"#.to_string(),
+            r#"{"matched":1,"statuses":["allocated"],"abandoned":0,"abandon_refused":"retire_shortfall: 0 of 1 predicted row(s) moved"}"#.to_string(),
         ),
         (404, "{}".to_string()),
         (503, "{}".to_string()),
