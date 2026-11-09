@@ -298,7 +298,25 @@ bash <path-to-this-skill-dir>/coord-revive.sh call coord_memory_search '{"query_
   filesystem), the four `STDIO_*` verdicts above, `COORD_MCP_PROXY_UNAUTHORIZED` (below),
   `CONNECT_REFUSED` / `TIMEOUT` / the classifier's other verdicts; `4` usage
   (arguments must be ONE JSON **object**, parsed and refused locally before any
-  request is sent).
+  request is sent); `6` **`CARRIED_ANSWER_UNREAD`** — the request was sent and
+  the door answered, but this box could not store the answer or its status
+  (curl exit 23, or a lost `-w` status write: a full or nearly full `TMPDIR`).
+  The call **may have been applied**: read the state it would have written
+  before re-issuing, never blindly re-send a non-idempotent write. `7` nothing
+  left this box because of a LOCAL fault — `NOT_STARTED_LOCAL_RESOURCE` (the
+  verb could not stage its own request, status, error or shim-output file),
+  `AUTH_HEADER_STAGING_FAILED` on the proxy path (its header file; on the stdio
+  path that verdict is the shim's own exit 4 above and falls back to a proxy
+  entry when one exists, else exits `1`), or `CONFIG_UNREADABLE` (the
+  NEAREST `.mcp.json` is present but this run could not read it — not
+  readable, or a scratch-file write failed while reading its entry; the walk
+  stops there instead of answering for a further config). Re-issuing after a
+  `7` is safe. A `METHOD_NOT_ALLOWED` verdict prints `cause=<token>
+  status=<http> remedy=…`: `cause` is one `[a-z_]` token or `invalid` (body
+  text never shapes the line), and `status` lets a caller require the runner's
+  own `403`. Plan
+  `2026-11-08-coord-revive-call-misreports-carried-requests-and-copies-body-text-into-its-verdict`;
+  suite `call-verdict-honesty-test.sh`.
 - **An interrupted verb still answers — `INTERRUPTED`, exits `143` / `130` /
   `129`.** A TERM, INT or HUP that lands before the verdict (a caller's
   `timeout`, a Ctrl-C, a closed terminal) prints ONE line on stderr instead of
@@ -1367,9 +1385,10 @@ door to re-issue a write over.** This rung hands back a *bearer*; spend it on
 `$COORD_HTTP_URL/mcp` (coord tools by name) or on the device-authed hand-written
 `/coord/…` REST routes, which `/gate`'s **write-forwarder REST** rung spells
 out. `$COORD_HTTP_URL/mcp` **does** accept it — as `principal_kind: agent`,
-not `device` (measured 2026-09-26 with `coord_work_unit_refresh_citations`, and
-2026-10-02 with `coord_query_identity` and `coord_work_unit_list_citations`, each
-HTTP 200 `isError:false`). This section used to say the opposite ("not carried
+not `device` (measured 2026-10-02 with `coord_query_identity` and
+`coord_work_unit_list_citations`, each HTTP 200 `isError:false`; a 2026-09-26
+measurement used `coord_work_unit_refresh_citations`, which coord has refused
+to this principal since qontinui-coord#3363 landed on 2026-10-18). This section used to say the opposite ("not carried
 onto `/mcp`: that door's device-JWT-only constraint is unchanged"); no such
 constraint answers today. Which tools that principal may call is `tools/list`'s
 answer over the same bearer, never this page's. The bootstrap token is an **agent** principal minted against

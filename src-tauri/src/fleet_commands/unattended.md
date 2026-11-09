@@ -167,12 +167,30 @@ Enumerate what this session actually did. Sources, in order of trustworthiness:
    `/implement-plan` Step 6 item 3, which is the durable store for this class.
 6. **On-disk-only state** — what exists only on this box's disk dies with the
    session, and source 1 reads the committed tree only. First enumerate the
-   TREES: this session's coord allocations (`coord_session_worktrees`), every
-   repo source 1 walks, and any other path the transcript shows this session
-   editing. Then run these checks per tree. Each check is scoped to THAT tree.
-   `refs/heads` and `refs/stash` are one store shared by every linked worktree
-   of a repo, so `git log --branches` and a bare `git stash list` report peers'
-   branches and stashes as yours.
+   TREES: this session's coord allocations, every repo source 1 walks, and any
+   other path the transcript shows this session editing. Read the allocations
+   as the union of two sources:
+   - the `allocate-worktree.sh` output lines in this session's WHOLE transcript:
+     `<config-dir>/projects/*/$CLAUDE_CODE_SESSION_ID.jsonl`, the subagent files
+     beside it (`<id>/subagents/*.jsonl`), and any earlier file a resume
+     continued from. A subagent's allocation can be filed with no session id,
+     so the coord read below cannot show it;
+   - `coord_session_worktrees` in KEYED mode
+     (`{"claude_code_session_ids":["<this session's id>"]}`, no other argument).
+     Take the rows from whichever of `sessions[]` or `unknown[]` holds the id.
+     An unfiltered read is the wrong read: it is the tenant's first page, so it
+     says nothing about this session. A reply with no `claudeCodeSessionIds`
+     echo came from a coord that ignored the key, so use the output lines alone.
+
+   Find a row's tree with
+   `git -C <a checkout of that repo> worktree list --porcelain`: the worktree
+   whose path holds the agent id from the row's `worktreePath` (a session can
+   switch its tree to another branch), else the one on the row's branch, unless
+   its path holds another allocation's agent id, which makes it a peer's tree.
+   `worktreePath` is a spelling, not a location: a runner-spawned session's own
+   tree usually lives under `qontinui-worktrees/` while its row says
+   `agent-worktrees/`. Then run these checks per tree. Each check is scoped to
+   THAT tree.
 
    **A tree that is not one of this session's coord allocations is SHARED**
    (a primary checkout, or a peer's tree). Its local `main` routinely holds a
@@ -1600,8 +1618,9 @@ changing it.** `GET /coord/alerts` accepts a device JWT; coord#1601 (`61a107be`,
 Phase 2/G2 of the plan above) added a machine arm so a device principal could
 read the infra class, scoped to a closed kind allowlist
 (`FLEET_INFRA_MACHINE_KINDS`) AND the no-device/no-tenant/no-repo shape. But the
-arm is gated `!strict_tenant` in BOTH `build_get_alerts_query` and
-`fleet_health_rollup_sql`, and production runs `COORD_ALERTS_TENANT_STRICT=1`
+arm is gated `!strict_tenant` in `alerts_scope_predicate_sql`, the one predicate
+`build_get_alerts_query` and `fleet_health_rollup_sql` both compose since
+qontinui-coord `6d2a862a2`, and production runs `COORD_ALERTS_TENANT_STRICT=1`
 — measured 2026-08-25 against the running service `qontinui-staging-coord:857`,
 and there is no separate staging. So the arm never fires in the only environment
 that exists, and infra-scoped alerts remain unreadable from an ordinary tenant's
@@ -1693,12 +1712,23 @@ DESPITE remediation, and recurrence is a property of a collection.**
 
 **The rule.** Before filing a finding for an environmental condition, check
 whether it is the Nth occurrence — and find the dossier's **head** by its key,
-not by its phrasing:
+not by its phrasing. That is ONE call to the dossier query door (plan
+`2026-10-03-dossier-query-door-filters-sort-cursor`). It returns one row per
+slug, the newest live `kind=dossier` row, as a summary with no body:
 
 ```
-coord_recent_findings(topic="dossier:<slug>", kind="dossier")   # the live head — PRIMARY
-#   HTTP twin: GET /coord/agent-findings?topic=dossier:<slug>&kind=dossier
-coord_memory_search(query_text="DOSSIER <slug>", kinds=["mental_model"])   # the literal KEY — fallback
+coord_list_dossiers(slug="<slug>")          # the live head, by its exact slug — PRIMARY
+coord_list_dossiers(q="<a word of the issue>")   # no slug yet: substring over slug AND title
+#   HTTP twin (device JWT), for when the MCP tool is not callable:
+#   GET https://coord.qontinui.io/coord/agent-dossiers?slug=<slug>   (or ?q=<text>)
+#   The runner's coord-mcp proxy forwards the tool from qontinui-runner#2532
+#   (landed 2026-11-04 as 5f39c6027) once the box's runner is rebuilt onto it. On
+#   an older build, METHOD_NOT_ALLOWED there is the runner's allowlist, not a missing door.
+#   A row is the HEAD only if its title starts `DOSSIER <slug> ` -- the door has
+#   no title filter, so a RETRACTED pointer can be the newest row for the slug.
+# FALLBACK, labelled — a head that still lives only in MEMORY (retired by that
+# plan's Phase 8 once no live memory head remains):
+coord_memory_search(query_text="DOSSIER <slug>", kinds=["mental_model"])   # the literal KEY
 coord_memory_search(query_text="<the condition in its own words>")
 coord_memory_search(query_text="<the condition, phrased a second way>")
 
@@ -1706,19 +1736,61 @@ coord_memory_search(query_text="<the condition, phrased a second way>")
 # `.get(...)`: coord_memory_search has NO `count` and its rows are `hits`.
 W=<workspace-root>/qontinui-claude-config; . "$W/scripts/lib/envelope.sh"
 REVIVE="$W/.claude/skills/coord-revive/coord-revive.sh"; R=$(mktemp -d)
-bash "$REVIVE" call coord_recent_findings '{"topic":"dossier:<slug>","kind":"dossier","limit":5}' > "$R/f"
-envelope_mcp_body coord_recent_findings "$R/f" > "$R/fb"
-if [ "$(envelope_require coord_recent_findings available "$R/fb")" = true ]; then
-  envelope_collection coord_recent_findings findings "$R/fb"   # the head(s); `count` must equal the rows
-else echo "UNKNOWN: findings store unavailable or unread - never \"no head\""; fi
-# Three probes, each ending HIT / MISS / UNKNOWN - never a bare zero.
+# DOOR is carried into the memory loop below:
+#   unreached   - no dossier door answered usably (not callable, or an error/non-JSON
+#                 envelope such as the proxy's METHOD_NOT_ALLOWED): the labelled memory
+#                 fallback IS the lookup of record, under the title-prefix and MOVED rules
+#   unavailable - a door answered `available: false`: no memory hit is the head
+#   row | candidates | miss - the door answered; see each branch
+DOOR=unreached
+if ! bash "$REVIVE" call coord_list_dossiers '{"slug":"<slug>"}' > "$R/f"; then
+  echo "UNKNOWN (door): coord_list_dossiers not callable here - read GET https://coord.qontinui.io/coord/agent-dossiers?slug=<slug> with a device JWT"
+  echo "  axes: hosts=<the .mcp.json proxy> prefixes=tools/call credentials=proxy-nonce unprobed=coord.qontinui.io,api.qontinui.io"
+elif ! envelope_mcp_body coord_list_dossiers "$R/f" > "$R/fb"; then
+  echo "UNKNOWN (envelope): the tool answered an error or a non-JSON body - read its stderr reason above; a refusal names the bad parameter"
+elif [ "$(envelope_require coord_list_dossiers available "$R/fb")" != true ]; then
+  DOOR=unavailable; echo "UNKNOWN: dossier store unavailable or unread - never \"no head\", and NOT a route into the memory probes as a miss"
+else
+  D=$(envelope_collection coord_list_dossiers dossiers "$R/fb")   # `count` must equal the rows
+  if [ -z "$D" ]; then echo "UNKNOWN (envelope): rows unreadable"
+  elif [ "$D" = "[]" ]; then
+    # An empty slug answer is not yet a MISS: slugs drift (`stale-checkouts` beside
+    # `stale-shared-checkouts`). Retry by substring over slug AND title first.
+    if ! bash "$REVIVE" call coord_list_dossiers '{"q":"<a word of the issue>"}' > "$R/q"; then
+      echo "UNKNOWN (door): q= retry not callable - never a MISS"
+    elif ! envelope_mcp_body coord_list_dossiers "$R/q" > "$R/qb"; then
+      echo "UNKNOWN (envelope): q= retry answered an error or a non-JSON body - never a MISS"
+    elif [ "$(envelope_require coord_list_dossiers available "$R/qb")" != true ]; then
+      DOOR=unavailable; echo "UNKNOWN: q= retry says the dossier store is unavailable - never a MISS"
+    else
+      DQ=$(envelope_collection coord_list_dossiers dossiers "$R/qb")
+      if [ -z "$DQ" ]; then echo "UNKNOWN (envelope): q= rows unreadable - never a MISS"
+      elif [ "$DQ" = "[]" ]; then DOOR=miss; echo "MISS (no migrated head: slug= and q= both empty) - the memory probes below still run"
+      else DOOR=candidates; printf '%s\n' "$DQ"
+        echo "CANDIDATES by q= - each is a head only if its title starts 'DOSSIER <its slug> ' (a RETRACTED or DOSSIER-CONTRIB row can be newest). A matching head is the one to UPDATE; if you reject every candidate as a different issue, that is the door's MISS."; fi
+    fi
+  else DOOR=row; printf '%s\n' "$D"; echo "HEAD only if its title starts 'DOSSIER <slug> ' - else UNKNOWN: read coord_recent_findings(topic=\"dossier:<slug>\",kind=\"dossier\")"; fi   # envelope-ok: an instruction string, not a call
+fi
+# FALLBACK (memory-resident heads): three probes, each ending HIT / MISS / UNKNOWN - never a bare zero.
 for Q in '{"query_text":"DOSSIER <slug>","kinds":["mental_model"],"limit":50}' \
          '{"query_text":"<the condition in its own words>","limit":50}' \
          '{"query_text":"<the condition, phrased a second way>","limit":50}'; do
   bash "$REVIVE" call coord_memory_search "$Q" > "$R/m" || { echo "UNKNOWN (door): $Q"; continue; }
   H=$(envelope_mcp_body coord_memory_search "$R/m" | envelope_require coord_memory_search hits -) \
     || { echo "UNKNOWN (envelope): $Q"; continue; }
-  [ "$H" != "[]" ] && { echo "HIT: $Q"; printf '%s\n' "$H"; continue; }
+  if [ "$H" != "[]" ]; then
+    echo "HIT (door=$DOOR): $Q"; printf '%s\n' "$H"
+    # A `DOSSIER <slug> — MOVED to finding <id>` row is a migration POINTER, never a
+    # head: read the finding it names. With door=row (once its title passed) the
+    # finding is the head and these rows only feed CONTRIB/DELTA merging; with
+    # door=unavailable NO hit is a head; with door=unreached a hit whose title
+    # starts `DOSSIER <slug> —` (and is not a pointer) is the labelled fallback head.
+    printf '%s\n' "$H" | grep -qE -- '"title": ?"DOSSIER [^"]*— MOVED to finding ' \
+      && echo "  POINTER row(s) above: not a head - read coord_recent_findings(finding_id=<the id it names>)"   # envelope-ok: an instruction string, not a call
+    [ "$DOOR" = unavailable ] && echo "  door answered available:false - no memory hit is the head; report the head as UNKNOWN"
+    [ "$DOOR" = unreached ] && echo "  no dossier door answered - this is the LABELLED FALLBACK; say so in your output"
+    continue
+  fi
   # An empty `hits` is a hypothesis. It is a MISS only beside a populated store
   # (this response's own `live_row_count`) AND a common-word control query that
   # returns rows through the same door; anything else is UNKNOWN.
@@ -1733,27 +1805,36 @@ for Q in '{"query_text":"DOSSIER <slug>","kinds":["mental_model"],"limit":50}' \
   bash "$REVIVE" call coord_memory_search '{"query_text":"dossier","limit":1}' > "$R/c"
   C=$(envelope_mcp_body coord_memory_search "$R/c" | envelope_require coord_memory_search hits -)
   if [ "${L:-0}" -gt 0 ] 2>/dev/null && [ -n "$C" ] && [ "$C" != "[]" ]; then echo "MISS (vector_arm=${V:-unread}): $Q"
+    echo "  axes: hosts=<the .mcp.json proxy> prefixes=tools/call credentials=proxy-nonce unprobed=coord.qontinui.io,api.qontinui.io"
   else echo "UNKNOWN (live_row_count=${L:-unread}, vector_arm=${V:-unread}, control=${C:-unread}): $Q"; fi
 done
 rm -rf "$R"
 ```
 
-**The finding is the primary store; memory is the fallback.** When the first
-probe returns a head, **that head is authoritative** — still run the memory
+**The finding is the primary store; memory is the fallback.** The door's
+`MISS` line is printed only after BOTH the `slug=` read and the `q=` retry came
+back empty with `available: true`; a `slug=` zero on its own is never a MISS.
+`available: false` on either read is UNKNOWN and is not a route into the memory
+probes as if it were a miss — a migrated finding head the door could not read
+may exist. A memory row titled `DOSSIER <slug> — MOVED to finding <finding_id>`
+is a migration pointer, **never a head**, although its title carries the key:
+read the finding it names (`coord_recent_findings(finding_id="<finding_id>")`,
+following `superseded_by` on an empty page) and treat that as the head. When the door
+returns a head, **that head is authoritative** — still run the memory
 probes, but only to pick up `DOSSIER-CONTRIB` / `DOSSIER-DELTA` rows not yet
 merged into it, never to second-guess the finding. The memory probes are the
 lookup of record in exactly ONE case: the slug's head still lives in
-memory — not yet migrated; plan
-`2026-08-25-dossiers-durable-issue-files-for-recurring-defects` Phase 4
-migrates one per closeout, so expect this for a while.
+memory — not yet migrated (plan
+`2026-10-03-dossier-query-door-filters-sort-cursor` Phase 6 migrated the bulk;
+a residue remains until its Phase 8 retires this fallback).
 
 **The "serving coord rejects the `dossier` kind" hedge is DELETED, because the
 capability SHIPPED.** Verified on qontinui-coord `origin/main` `967f8474`
 (2026-09-07): `dossier` is in `FINDING_KINDS`, `DOSSIER_TTL` is `100 years`
 selected by `ttl_for_kind`, and `recent()` takes a `kind` filter. Measured live
 the same day: `kind="dossier"` with no other filter returns **25 heads, exactly
-one per slug**. So the findings probe above is the primary lookup on every
-current box, and a session that skips it because a document warned the door
+one per slug**. So the findings store, read through the dossier door above, is
+the primary lookup on every current box, and a session that skips it because a document warned the door
 might refuse the kind is skipping a working door — which is what a live hedge
 against a shipped capability costs. If a future box genuinely refuses, that is a
 version fact to report and measure, not a branch to pre-write here.
@@ -1762,8 +1843,10 @@ version fact to report and measure, not a branch to pre-write here.
 `DOSSIER <slug> — <issue statement>`. A contribution or a delta MUST NOT start
 with `DOSSIER <slug>` — title it `DOSSIER-CONTRIB <slug> — …` or
 `DOSSIER-DELTA <slug> — …`. **And a contribution is never `kind="dossier"`.**
-That kind is what `coord_recent_findings(kind="dossier")` lists as HEADS, so a
-`DOSSIER-CONTRIB` posted with it reads as a second live head on the slug — the
+That kind is what `coord_recent_findings(kind="dossier")` lists as HEADS. The
+dossier door is worse: it keeps only the newest `kind=dossier` row per slug, so
+such a CONTRIB can HIDE the head. A `DOSSIER-CONTRIB` posted with it reads as a
+second live head on the slug — the
 accretion this step exists to stop (measured 2026-09-12: finding `0cda45a8`,
 occurrence 19, listed beside the head `e1108168` until it was folded). Post a
 contribution as `kind="gotcha"` (or `"status"`), with the slug in `topic`, and
@@ -1781,17 +1864,20 @@ prefix rule is what makes the head the only row whose title starts with
 **full-text only** unless the call carries a query vector — read its
 `vector_arm` (`skipped_no_embedding` is the normal case) — so run **at least
 three differently-phrased probes, one of them the literal key above** — the
-recipe's loop does, and only its `MISS` line is "no dossier"; the dossier
-`0585cd3f` records why one probe is never enough.
+recipe's loop does. "No dossier" needs a `MISS` from the door (after its `q=`
+retry) AND a `MISS` from every memory probe; the dossier `0585cd3f` records why
+one probe is never enough.
 
-**Resolution path once it lands.** Plan
-`2026-09-02-steering-layers-unreadable-without-a-credential` Phase 2 adds a
-server-side `title_prefix` argument to `coord_memory_search` (qontinui-web
-first, then coord — a coord that sends it to an older web 422s). Head
-resolution then becomes one call: `coord_memory_search(query_text="DOSSIER
-<slug>", kinds=["mental_model"], title_prefix="DOSSIER <slug> —")`, newest
-`created_at` first among live rows. Until the tool advertises the argument,
-an unknown-argument call is rejected — fall back to the interim rule above.
+**Head resolution is the dossier door, not memory search.** The primary
+lookup is already one call, `coord_list_dossiers(slug="<slug>")` (plus its
+`q=` retry), as the recipe above runs it. A server-side `title_prefix`
+argument to `coord_memory_search` (plan
+`2026-09-02-steering-layers-unreadable-without-a-credential` Phase 2) would
+only tighten the memory FALLBACK for heads not yet migrated, and that fallback
+is retired by plan `2026-10-03-dossier-query-door-filters-sort-cursor` Phase 8.
+Until the tool advertises the argument, an unknown-argument call is rejected —
+keep to the interim rule above for the fallback, and even with it a
+`MOVED to finding` pointer row is excluded from the head pick.
 
 **The supersede half is delivered elsewhere.** `coord_memory_supersede` — the
 door that lets a head be corrected in place — is owned by
@@ -1802,13 +1888,13 @@ governs **memory-resident** heads; a head that is already a finding is
 superseded with `coord_post_finding(supersedes=…)`, which is live on every box
 today — see the update rule below.
 
-The first of those probes has the HTTP twin and the `available` bit described under
-"Probe before you re-derive" (`GET /coord/agent-findings?topic=dossier:<slug>&kind=dossier`);
+The door call carries the `available` bit (HTTP twin
+`GET https://coord.qontinui.io/coord/agent-dossiers?slug=<slug>`);
 `available: false` here means you do not know whether a dossier exists, which is
-not the same as knowing there is none. Read it through the envelope helper — its
-docstring names this door's order, `available` before the collection — and treat
+not the same as knowing there is none. Read `available` before `count` — the
+recipe above does, through the envelope helper — and treat
 **every empty answer — from either store — as UNKNOWN, never as "no dossier"**: a
-`count: 0` from the finding probe says only that no *migrated* head exists, so
+`count: 0` from the door says only that no *migrated* head exists, so
 the memory probes still run.
 
 The memory probes carry the same caveat, from a different cause. A
@@ -1857,7 +1943,8 @@ artifact_refs = {                          # the STRUCTURED ledger (plan §4.1)
   "recurrence_count": <N>,
   "first_seen":       "<YYYY-MM-DD>",
   "last_seen":        "<YYYY-MM-DD>",
-  "readiness":        "accumulating" | "ready_for_pvi" | "in_remediation" | "closed",
+  "readiness":        "accumulating" | "ready_for_pvi" | "pvi_in_flight" | "in_remediation"
+                      | "remediated" | "remediated-pending-verification" | "closed" | "needs_evidence",
   "evidence":         { "memories": [<ids>], "findings": [<ids>] },
   "remediations":     [ { "plan": "<stem>", "status": "<that plan's status>", "held": false } ],
   "exit_criterion":   "<what would close it>"
@@ -1867,11 +1954,24 @@ body          = the synthesis: the issue; why it keeps winning; the evidence
                 candidate directions for /pvi; and the explicit exit criterion
 ```
 
+`readiness` is coord's registered vocabulary (`DOSSIER_READINESS`; the eight
+canonical values above). A post with any other string is stored as written but
+answers a `warnings[]` entry `unregistered_dossier_readiness` that lists the
+registered set and its legacy spellings. Read that warning, and use the
+canonical spelling on the next fold. `coord_list_dossiers`'s
+`facets.readiness` shows the values that live heads actually carry.
+
 `artifact_refs` is the structured ledger and `body` is the prose one — write
-**both, always**. `artifact_refs` is already in the findings read projection,
-so *"which issues recur most despite shipped fixes?"* is answerable from
-`coord_recent_findings(kind="dossier")` — every live head, client-sorted on
-`recurrence_count` — without opening a body; and the `evidence` arrays carry
+**both, always**. The dossier query door reads `artifact_refs` server-side, so
+*"which issues recur most despite shipped fixes?"* is two walks of one query:
+`coord_list_dossiers(sort=recurrence_count, order=desc, remediation_state=shipped)`
+AND the same with `remediation_state=unknown`. Follow `next_cursor` until it is
+null on each, and do not open any body. The second walk is not optional: one
+entry coord cannot classify (a `live_status` of `""`, `done`, `landed`, …, or a
+plan with no work unit) rolls a head up as `unknown` even when every other
+remediation shipped — measured 2026-11-02, `stale-shared-checkouts-read-as-defects`
+(finding `d284868f`). List the `unknown` rows separately and labelled UNKNOWN;
+an answer from the `shipped` walk alone is PARTIAL and must say so. The `evidence` arrays carry
 ids while the prose rows carry claims, so the day-15 expiry of a cited
 finding loses a pointer, never the claim. `topic` has **no uniqueness
 constraint** (plan §4.1): nothing in coord stops two sessions spelling one
@@ -1948,8 +2048,8 @@ titled `DOSSIER-CONTRIB <slug> — …` so it never impersonates the head.
 **The mechanism.** Post a **new** head with the merged synthesis and
 `supersedes=<the prior head's finding_id>`; `recent()` returns only the live
 head of a `supersedes` chain (`NOT EXISTS (… s.supersedes = f.finding_id)`, in
-SQL), so the next `coord_recent_findings(topic="dossier:<slug>",
-kind="dossier")` yields exactly the new head and the old one stays as history.
+SQL), so the next `coord_list_dossiers(slug="<slug>")` yields exactly the new
+head and the old one stays as history.
 Bump `recurrence_count`, move `last_seen`, add this occurrence's `finding_id`
 to `artifact_refs.evidence.findings` **and** as a dated prose row in the body.
 Never re-post the old body with a line appended — merge.
@@ -2089,17 +2189,44 @@ UNKNOWN, and is recorded as UNKNOWN rather than as the old answer.
      `POST https://coord.qontinui.io/mcp`, with `-H @<that file>`,
      `Content-Type: application/json` and
      `Accept: application/json, text/event-stream`. That door was measured
-     carrying `coord_memory_record` on 2026-09-21 (memory `d06de56c`). Read
-     back by id over the same door, under the rule below. This arm is
+     carrying `coord_memory_record` on 2026-09-21 (memory `d06de56c`).
+     ⚠️ **It no longer does.** The scoping first written as
+     qontinui-coord#3146 landed on coord `origin/main` on 2026-10-18 as
+     #3363's route-around rebuild (`6b604d803`, stack tip `40498d7ab`); it
+     scopes an anonymously minted credential, and `coord_memory_record` is
+     in its `BOOTSTRAP_DENIED_TOOLS`. The refusal arrives as a
+     SUCCESSFUL JSON-RPC `result` — there is no top-level `.error` — with
+     `result.isError: true` and `result.structuredContent.error ==
+     "tool_not_available_to_principal"` (`tool_exists: true`,
+     `principal_kind: "agent"`). Classify on that code, not on the prose:
+     since qontinui-coord#3852 (`f50fd538c`, live in the serving build
+     `79429fa20` as of 2026-11-08) coord's `masked_projection` gives a
+     doorless `BOOTSTRAP_DENIED_TOOLS` entry such as `coord_memory_record`
+     the sentence "… this credential was minted without proof of device
+     possession and is limited to the bootstrap reads and closeout writes on
+     every door", but a coord predating it sends the generic sentence beginning
+     "`coord_memory_record` exists but is NOT on this caller's MCP allow-set
+     (principal_kind=agent) — and no HTTP route is registered as serving the
+     same core". That code alone is returned for ANY masked tool; on THIS arm — the bearer is an
+     anonymous mint by construction — it is the anonymous-mint boundary: a
+     classification refusal, not a payload error and not a dead door. Do not
+     re-send it, and do not file it as a coord defect: this arm is closed for
+     memory writes. Go to step 5's local file and stamp
+     `metadata.coord_fallback: <YYYY-MM-DD> l5-refused` rather than
+     `no-door`, so the backfill can tell the two apart. Plan
+     `2026-09-23-anonymous-agent-credential-mint-can-act-as-any-registered-device`
+     Phase 3b, which would admit this tool to an anonymous mint with the
+     sender labelled unproven, has not landed. Until it does, the refusal
+     stands. Read back by id over the same door, under the rule below,
+     only when the write was accepted. This arm is
      hand-run: `coord-revive.sh call` runs over a `.mcp.json` nonce and never
      mints, so it does not reach L5. Step 3's web API is no fallback here
-     either. It answers this token 401 because the token has no `user_id`
-     claim (measured on the list route), so before `coord_memory_get` an L5
-     session had no read-back at all.
-  5. **`DEAD`** — and only then — a topic file plus a **one-line** `MEMORY.md`
-     index entry (one target per line, as plain index hygiene), with
-     frontmatter `metadata.coord_fallback: <YYYY-MM-DD> no-door` so a backfill
-     can grep for it. That file is a **single-machine, single-project record
+     either: it answers this token 401 (no `user_id` claim).
+  5. **`DEAD`** — or step 4's classification refusal — and only then: a
+     topic file plus a **one-line** `MEMORY.md` index entry (one target per
+     line, as plain index hygiene), with frontmatter
+     `metadata.coord_fallback: <YYYY-MM-DD> no-door` — or `l5-refused` when
+     step 4's refusal sent you here — so a backfill can grep for it. That file is a **single-machine, single-project record
      with no path into coord**: the cross-account sync was retired (Phase 3b of
      `2026-07-26-claude-session-memory-cutover-to-coord`), so nothing carries
      it anywhere. It is readable on this box only, and invisible to every
@@ -2907,7 +3034,7 @@ or, when both variables were absent:
 
 ---
 
-## Step 4.9 — Safe to close?
+## Step 4.9 — Closeout verdict
 
 Step 2's conversions commit and push, which changes the answer Step 1 source 6
 gave. So re-run source 6's checks on every tree now, then declare the hand-offs,
@@ -2926,15 +3053,28 @@ Precedence is fail-closed, highest first:
 unreadable enumeration is `UNKNOWN`. Peer state in a shared tree (source 6) gets one
 informational line, `  peer state (not this session's): <tree>: <what>`,
 under the headline. It never changes the headline. Every headline ends with
-`; hand-off declared for <m>` and, when any declaration failed,
-`; NOT declared for <j>: <tree> (<exit / reason>)`. A failed declaration leaves
-a slot held and loses nothing, so it never changes the headline.
+`; hand-off declared for <m>`, and nothing is ever appended after it. Each
+failed declaration gets its own line under the headline instead,
+`  hand-off not declared: <tree> (<exit / reason>)`, because a negation on the
+headline line reads as a veto of the whole message to `/close-finished-sessions`.
+A failed declaration leaves a slot held and loses nothing, so it never changes
+the headline.
 
 The verdict is the operator's signal to exit. A `NOT SAFE` or `UNKNOWN` line
 names what to resolve first. It never blocks the operator from closing; it
 does block the finished record (Step 5's gate). **Re-print the
 verdict line as the LAST line of this command's output**, after Step 5's line,
 because that is where an operator looks before closing.
+
+The headline line and its re-print are the only places this command's output
+states the closeout verdict (Step 5's UNFINISHED line names `NOT SAFE` or
+`UNKNOWN`, never the phrase). Do not restate it in a bullet, in bold or inside a
+sentence, and write the headline exactly as the grammar above gives it, on its
+own line with no label in front of it:
+`/close-finished-sessions` reads a negated, conditional, hedged or questioned
+use of the verdict phrase anywhere in the final message as a veto of the whole
+message, and the `NOT SAFE` headline is the only veto this command means to
+emit.
 
 ### The hand-off declaration — Step 4.9's last action, per tree
 
@@ -2962,7 +3102,7 @@ output lines:
 |---|---|
 | `declared matched=<n> trigger_signal=agent_done` | counts toward `hand-off declared for <m>`; `matched>=1` is the real check (coord echoes `agent_done` as a constant) |
 | `nothing-to-declare` (`allocate-worktree.sh` exit 5) | a shared checkout or a hand-made worktree; not a failure, not counted |
-| `FAILED` (exit 6 / 7) or `UNKNOWN` | a `NOT declared for` entry |
+| `FAILED` (exit 6 / 7) or `UNKNOWN` | a `hand-off not declared` line under the headline |
 
 **What the declaration means — say this, and no more:** the tree stops counting
 toward the device worktree cap once coord's hand-off slot relief lands (pending
@@ -2982,6 +3122,71 @@ complete.
 > subagent inherits its parent's session id and cannot be told apart
 > mechanically (Step 5's subagent arm). A tree the parent allocated is the
 > parent's to hand off, and the parent may still be working in it.
+
+---
+
+## Step 4.9b — leave the subproject's note
+
+coord groups the sessions, gates, work units and PRs that serve one piece of
+work into a **subproject**, whose page says whether anything is still moving it
+(`knowledge-base/qontinui-specific/subprojects.md`). The one part of that page
+a session authors is the subproject's `next_steps_note`: what remains, and the
+single next action. This step runs after Step 4.9's verdict and before Step 5,
+and it writes the note whether or not Step 5 then finishes the session, because
+a session left unfinished is the one whose note matters most.
+
+> ⚠️ **In a SUBAGENT, write nothing.** The agent door takes its caller from the
+> verified `X-Coord-Caller-Session` header, and a subagent's header carries the
+> PARENT's inherited id (Step 5's subagent arm says why the two contexts cannot
+> be told apart), so its note would replace the parent's under the parent's
+> name. Render it as its own row and continue:
+>
+> > **Subproject note — OWED BY THE PARENT.** This `/unattended` ran in a
+> > subagent context; the parent's own `/unattended` writes the note.
+
+**Do not form a second judgement here.** The note projects what this command
+has already decided. Compose one short paragraph from it:
+
+- every IMPEDED, RECEIPTED-UNVERIFIED and residual DROPPED item from Step 1's
+  classification as Step 2 left it, with what blocks it;
+- every tree Step 4.9 named `NOT SAFE` or `UNKNOWN`, with what exists only on
+  disk there or why it could not be checked;
+- every WATCHED item with the `gate_id` that watches it, so a reader sees that
+  no session owes it;
+- every RECORDED item that went to the plan corpus as deferred work (Step 2d,
+  Step 3c), by its plan slug;
+- then `Next action:` and the one action, naming who takes it: the first owed
+  item's remedy, or `none` and what fires next when nothing above is owed.
+
+Then follow `/finish-session` Part A step 4 from its "Read, re-read, write,
+read back" paragraph on, with this paragraph as the note: its read of the
+current note (keep every item that note names which this session cannot show
+resolved), its re-read just before the write, its write through
+`coord_subproject_update` (the native tool, else `coord-revive.sh call`), its
+read-back through `coord_subproject_get`, and its outcome table. The recipe
+lives there, once; do not copy it here. That step's own skip rule covers
+`/finish-session` entered from Step 5 below, so the note is written once, here.
+
+**Best-effort, never blocking.** A tool the serving build does not carry yet
+(the runner proxy's `METHOD_NOT_ALLOWED` until its allowlist names the
+subproject tools, then coord's `unknown tool` error until its build serves
+them), a `schema_migration_pending`, a `caller_session_unproven` or a dead
+transport records its code and moves on to Step 5. None of them changes the
+classification, the work verdict, Step 4.9's verdict or Step 5's gate. Add one
+line to the Step 4 report, after the continuation outcome:
+
+> **Subproject note:** next_steps_note written — subproject `<id>`, read back.
+
+or, when it did not land:
+
+> **Subproject note:** next_steps_note NOT written: `<code>`.
+
+The code is a refusal code or an exit, never the note's text. Never paste the
+note into the report, and spell it `next_steps_note`, never "next step" or
+"next steps": `/close-finished-sessions` reads the end of the final message
+for wording that says work remains or asks the operator to act ("next step"
+among it, and either spelling in the policy footer), and a note is made of
+that wording on purpose.
 
 ---
 
@@ -3134,9 +3339,17 @@ POST http://127.0.0.1:9876/sessions/<your-own-harness-session-id>/finish
 Its answer is read by `/finish-session` Part B Step 1's table, not by its
 status line, branching on `changed` first. `changed: "marker"` with
 `coord.queued: true`, read back `finishSynced: true` (after the table's
-wait-and-re-read when the first read-back shows the write re-queued), is done,
-and so is a `"none"` / `"reason_only"` with `finishSynced: true` (already
-finished and synced). `"reason_only"` comes only from a runner build predating
+wait-and-re-read when the first read-back shows the write re-queued), and a
+`"none"` / `"reason_only"` with `finishSynced: true` read back (already
+finished), mean only that the runner says coord ACKed — confirm with `/finish-session`'s coord
+bullet of *Read back before you report*; on `session_status` null or not
+`finished`, run its Step 2's (or Step 3's) write and re-read, and if its Step 2 is
+refused its Part A step 1b runner-hosted arm applies (dossier
+`finish-synced-true-while-coord-unfinished`). On a runner build whose read-back
+carries `coord.observed.sessionStatus`, `"finished"` there is done by itself.
+As the answer to the finish POST itself, a `"none"` / `"reason_only"` with
+`finishSynced: true` means the runner sent coord nothing this time, and the table
+sends it on to Step 2. `"reason_only"` comes only from a runner build predating
 plan
 `2026-10-23-coord-records-a-session-finished-but-not-when-so-a-revival-cannot-be-told-from-a-re-finish`
 Phase 3. A build carrying that phase answers a reasoned re-finish with
@@ -3283,14 +3496,19 @@ at `07a192bae`, until qontinui-coord#2608 lands): *"If you
 **On the authorization verdict, BIND FIRST — this is a CHECKED step, not
 prose.** When either refusal came back for your own `$CLAUDE_CODE_SESSION_ID`,
 first make sure the runner rung above was tried if you are runner-hosted. A
-`coord.queued: true` there, read back `finishSynced: true`, settles the coord
-half with no bind and no fork risk. Otherwise run `/finish-session` Part A
+`coord.queued: true` there, read back `finishSynced: true` and confirmed by
+`/finish-session`'s coord read-back (`session_status: "finished"`, or
+`coord.observed.sessionStatus: "finished"` on a build carrying it), settles the
+coord half with no bind and no fork risk. Otherwise run `/finish-session` Part A
 step 1b before writing any outcome line. In one
 line: branch on `$QONTINUI_RUNNER_CONTEXT` (empty: call
 `coord_bind_self_session` with `create_if_absent: true`, read `unbound_sibling_rows`
 in the answer and name a non-zero value as a possible fork; non-empty: do NOT
 create — the runner binds its own row, as Step 4.9 says — and report the session
-not finished, runner-hosted, own row unbound). Never bind a row picked out of
+not finished, runner-hosted, own row unbound, unless Step 1 answered `"none"` /
+`"reason_only"` with `finishSynced: true` to the finish POST itself, where step 1b
+says what to report).
+Never bind a row picked out of
 `coord_orient`'s `session_activity` — those rows carry no harness id, so a pick
 can bind a PEER. Read the binding back with `coord_orient`
 (`your_session.coord_session_id` non-null), re-run Step 4.9's
