@@ -904,8 +904,7 @@ mod tests {
         // ApprovalGate → Complete(ApprovalAborted) | AdvanceIteration
         // AdvanceIteration → CheckPreconditions (loop back)
         //
-        // Total: 12 states and 10 completion reasons. The tenth, the
-        // nothing-checked exit, is covered by its own tests above.
+        // Total: 12 states and 10 completion reasons.
         // This test verifies the enum variants match.
 
         let completion_variants = [
@@ -923,8 +922,9 @@ mod tests {
                 elapsed_ms: 30000,
             },
             CompletionReason::FixAttemptsExhausted { fix_attempts: 3 },
+            CompletionReason::NoVerificationSteps,
         ];
-        assert_eq!(completion_variants.len(), 9);
+        assert_eq!(completion_variants.len(), 10);
 
         // Each completion reason must produce a valid LoopResult
         let ctx = make_test_context(1);

@@ -272,8 +272,9 @@ impl LoopController {
             }
         }
 
-        // Worktree finalizer: drained AFTER the stack has executed, unconditional
-        // when a rollback policy is active. Keeping worktree removal out-of-stack
+        // Worktree finalizer: drained AFTER the stack has executed, whenever the
+        // compensation runs (`compensate`: a rollback policy is active and the
+        // exit refuted the work). Keeping worktree removal out-of-stack
         // avoids two failure modes: (1) LastGood leaking the worktree by only
         // running the per-iteration resets, and (2) crash-resume trying to
         // git-reset a path that was already removed.

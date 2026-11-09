@@ -416,4 +416,33 @@ mod nothing_to_verify_tests {
         assert!(result.step_results.is_empty());
         assert!(!result.critical_failure);
     }
+
+    /// The targeted arm, entered where the multi-agent fixer enters it: when no
+    /// index names a step, nothing runs, nothing is checked, and the phase does
+    /// not pass. The executor is built over an in-memory `AppState` (no
+    /// database, disk or network), as the step executor's own tests build it.
+    #[tokio::test]
+    async fn a_targeted_verification_that_selects_no_step_does_not_pass() {
+        let app_state = crate::AppState::new_for_test();
+        let executor = super::VerificationExecutor {
+            app_state: app_state.clone(),
+            executor: super::StepExecutor::new(
+                app_state,
+                std::sync::Arc::new(tokio::sync::Mutex::new(super::ConfigStorage::new_degraded())),
+            ),
+        };
+        let gate = super::ExecutionStepConfig {
+            step_type: "gate".to_string(),
+            phase: Some("verification".to_string()),
+            ..Default::default()
+        };
+        for (steps, indices) in [(vec![], vec![]), (vec![gate], vec![7])] {
+            let result = executor
+                .run_targeted_verification(&steps, &indices, "exec-targeted", 2, "wf")
+                .await;
+            assert!(!result.all_passed, "indices {indices:?}");
+            assert_eq!(result.total_steps, 0);
+            assert!(result.step_results.is_empty());
+        }
+    }
 }
