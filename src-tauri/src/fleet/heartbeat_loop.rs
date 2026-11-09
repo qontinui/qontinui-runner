@@ -330,7 +330,7 @@ impl HeartbeatLoopStats {
 /// said about this device's drain, or why no register was sent.
 pub(crate) fn outcome_status(outcome: &HeartbeatOutcome) -> String {
     match outcome {
-        HeartbeatOutcome::Registered { drain } => match drain {
+        HeartbeatOutcome::Registered { drain, .. } => match drain {
             DrainObservation::Clear => "registered/clear".into(),
             DrainObservation::Drained { .. } => "registered/DRAINED".into(),
             DrainObservation::Unreadable => "registered/drain_unreadable".into(),
@@ -484,6 +484,7 @@ mod tests {
     fn clear() -> HeartbeatOutcome {
         HeartbeatOutcome::Registered {
             drain: DrainObservation::Clear,
+            dispatch_role: None,
         }
     }
 
@@ -720,6 +721,7 @@ mod tests {
                 until: None,
                 reason: None,
             },
+            dispatch_role: None,
         };
         assert_eq!(outcome_status(&drained), "registered/DRAINED");
         assert_eq!(outcome_status(&clear()), "registered/clear");
