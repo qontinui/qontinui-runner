@@ -469,6 +469,9 @@ pub(crate) fn provision_fleet_skills_into(
     // The roster for a builtin is its EMBEDDED and CANONICAL file lists, never
     // the resolved source's: an account override's extra file is a path no
     // commit adds, and a sidecar the override drops is still one a commit can.
+    // Before the first canonical refresh the roster is embedded-only, so a file
+    // the vendoring repo added after this binary was built, which an override
+    // happens to carry too, is written in that window — narrow, and stated.
     let mut roster: Vec<std::path::PathBuf> = Vec::new();
     for skill in &resolved {
         let Some(builtin) = registry.builtin(&skill.name) else {
@@ -1520,6 +1523,74 @@ mod tests {
         assert!(
             !skills_dir.join(&absent_builtin.name).exists(),
             "an absent builtin is still withheld in a versioned checkout"
+        );
+    }
+
+    /// A builtin's roster is its EMBEDDED (and canonical) file list, not the
+    /// account override's: an override's extra file is a path no commit adds,
+    /// so it is written in a versioned checkout.
+    #[test]
+    fn an_override_extra_file_of_a_builtin_is_written_in_a_root_versioned_checkout() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let skills_dir = tmp.path().join(".claude").join("skills");
+        std::fs::create_dir_all(skills_dir.join("coord-revive")).unwrap();
+        crate::provision_guard::test_support::git_init(tmp.path());
+        let tracked = skills_dir.join("coord-revive").join(SKILL_MANIFEST);
+        std::fs::write(&tracked, b"# the repo's own skill\n").unwrap();
+        crate::provision_guard::test_support::git_add(tmp.path(), &tracked);
+
+        let registry = registry_with(vec![skill_unit(
+            "coord-revive",
+            bundle(&[
+                ("SKILL.md", "# my own coord-revive\n"),
+                ("override-extra.sh", "echo extra\n"),
+            ]),
+        )]);
+        let out = provision_fleet_skills_into(&skills_dir, &registry, None).expect("provision");
+
+        assert!(
+            skills_dir
+                .join("coord-revive")
+                .join("override-extra.sh")
+                .exists(),
+            "an override-only file is outside the roster, so it is written; got {:?}",
+            out.skipped
+        );
+    }
+
+    /// The other half: a checkout tracking only an embedded SIDECAR that an
+    /// account override drops still versions the tree — the roster is the
+    /// embedded file list — so absent builtins are withheld there.
+    #[test]
+    fn a_tracked_sidecar_an_override_drops_still_marks_the_checkout_versioned() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let skills_dir = tmp.path().join(".claude").join("skills");
+        std::fs::create_dir_all(skills_dir.join("coord-revive")).unwrap();
+        crate::provision_guard::test_support::git_init(tmp.path());
+        let sidecar = skills_dir.join("coord-revive").join("coord-revive.sh");
+        std::fs::write(&sidecar, b"#!/bin/sh\n").unwrap();
+        crate::provision_guard::test_support::git_add(tmp.path(), &sidecar);
+
+        let registry = registry_with(vec![skill_unit(
+            "coord-revive",
+            bundle(&[("SKILL.md", "# my own coord-revive\n")]),
+        )]);
+        let out = provision_fleet_skills_into(&skills_dir, &registry, None).expect("provision");
+
+        let absent_builtin = embedded_skills()
+            .into_iter()
+            .find(|s| s.name != "coord-revive")
+            .expect("a second embedded skill");
+        assert!(
+            !skills_dir.join(&absent_builtin.name).exists(),
+            "the checkout versions the tree through the sidecar, so an absent builtin is withheld"
+        );
+        assert!(
+            out.skipped
+                .iter()
+                .any(|s| s.reason == crate::capability_manifest::SkipReason::RootVersioned),
+            "got {:?}",
+            out.skipped
         );
     }
 
