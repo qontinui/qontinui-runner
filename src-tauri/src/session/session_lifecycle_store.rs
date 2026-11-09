@@ -110,14 +110,23 @@ pub fn snapshot_history_path() -> PathBuf {
 const CLOSED_RETENTION_MS: i64 = 86_400_000;
 /// Open records not seen for this long are pruned (7d in millis).
 const OPEN_STALE_MS: i64 = 604_800_000;
-/// A record closed with reason `"pty-exit"` (its PTY died — e.g. a graceful
-/// runner restart firing `handleExit` on every live PTY) is still restorable
+/// A record closed with reason `"pty-exit"` (its PTY died) is still restorable
 /// when it closed within this long of the registry's LAST MOMENT OF LIFE (the
 /// restore anchor — see [`restore_admissible`]), NOT of wall-clock now: a
 /// graceful stop stamps every close at the shutdown instant, so a rebuild of
 /// any length still restores them. A close further back than the window, or
 /// any other close reason (explicit user close), is NOT restorable. 10 minutes
 /// in millis.
+///
+/// A runner shutdown no longer writes these rows: `TerminalManager::close_all`
+/// latches shutdown, and `terminal_session_record_close` then refuses a
+/// `pty-exit`, so a shutdown leaves its rows `open` by construction. Before the
+/// latch the webview's `handleExit` could close every live PTY's row at the
+/// shutdown instant (plan
+/// `2026-10-28-force-exited-runner-restore-set-follow-ups` Phase 2's verdict,
+/// coord finding `9d26f909`), which is
+/// why a close stamped that way is still admitted here: rows written by a
+/// pre-latch runner are in the store.
 const RESTORABLE_PTY_EXIT_MS: i64 = 600_000;
 /// A record closed with reason `"poll-dead"` (the liveness poll saw a live
 /// shell with zero descendants for several consecutive idle ticks) is still
@@ -1874,6 +1883,28 @@ impl SessionLifecycleStore {
             .lock()
             .map(|s| s.len())
             .unwrap_or(0)
+    }
+
+    /// [`Self::record_close_checked`] behind the runner-shutdown latch. While
+    /// `shutting_down` (`TerminalManager::close_all` has begun), a `pty-exit`
+    /// close is refused with [`CloseOutcome::IgnoredDuringShutdown`] and the row
+    /// is left untouched: the runner's own teardown killed that PTY, so the
+    /// session did not end, and a row's state after a shutdown is decided by the
+    /// backend rather than by webview timing. `explicit` and `poll-dead` closes
+    /// are unaffected.
+    pub fn record_close_gated(
+        &self,
+        shutting_down: bool,
+        claude_session_id: &str,
+        terminal_id: Option<&str>,
+        reason: &str,
+    ) -> CloseOutcome {
+        if shutting_down && reason == "pty-exit" {
+            return CloseOutcome::IgnoredDuringShutdown {
+                claude_session_id: claude_session_id.to_string(),
+            };
+        }
+        self.record_close_checked(claude_session_id, terminal_id, reason)
     }
 
     /// Close the record the caller's TERMINAL actually owns, not merely the one
@@ -4066,6 +4097,14 @@ pub enum CloseOutcome {
         requested: String,
         terminal_id: String,
     },
+    /// The runner is shutting down and the close was a `pty-exit`: refused
+    /// before the store was consulted, so the row stays as it was (`open`).
+    /// The PTY died because the runner is killing it, not because the session
+    /// ended, and a row's state after a shutdown must not depend on whether the
+    /// webview could still deliver this call. Nothing mutated, no observer
+    /// fired; not a failure.
+    #[serde(rename_all = "camelCase")]
+    IgnoredDuringShutdown { claude_session_id: String },
     /// Neither the requested `claude_session_id` nor the caller's terminal
     /// resolves to an open record. Nothing mutated, no observer fired.
     #[serde(rename_all = "camelCase")]
@@ -6922,6 +6961,58 @@ mod tests {
             "term-moved",
             "a later non-empty terminal_id updates the binding"
         );
+    }
+
+    /// Phase 6 of plan `2026-10-28-force-exited-runner-restore-set-follow-ups`:
+    /// while the runner is shutting down a `pty-exit` close is refused and the
+    /// row stays `open`; `explicit` and `poll-dead` still close; a `pty-exit`
+    /// before the latch still closes; and the same refused call twice answers
+    /// the same.
+    #[test]
+    fn record_close_gated_refuses_only_pty_exit_during_shutdown() {
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        for id in ["a", "b", "c", "d"] {
+            store.record_open(auth_on(id, &format!("term-{id}")));
+        }
+
+        let before = store.record_close_gated(false, "a", Some("term-a"), "pty-exit");
+        assert_eq!(
+            before,
+            CloseOutcome::Closed {
+                claude_session_id: "a".to_string()
+            }
+        );
+        assert_eq!(store.get("a").unwrap().state, "closed");
+
+        let refused = CloseOutcome::IgnoredDuringShutdown {
+            claude_session_id: "b".to_string(),
+        };
+        assert_eq!(
+            store.record_close_gated(true, "b", Some("term-b"), "pty-exit"),
+            refused
+        );
+        assert_eq!(
+            store.record_close_gated(true, "b", Some("term-b"), "pty-exit"),
+            refused
+        );
+        let b = store.get("b").unwrap();
+        assert_eq!(b.state, "open");
+        assert!(b.close_reason.is_none());
+
+        for (id, reason) in [("c", "explicit"), ("d", "poll-dead")] {
+            let out = store.record_close_gated(true, id, Some(&format!("term-{id}")), reason);
+            assert_eq!(
+                out,
+                CloseOutcome::Closed {
+                    claude_session_id: id.to_string()
+                }
+            );
+            assert_eq!(store.get(id).unwrap().close_reason.as_deref(), Some(reason));
+        }
+
+        store.record_close_gated(false, "b", Some("term-b"), "pty-exit");
+        assert_eq!(store.get("b").unwrap().state, "closed");
     }
 
     /// Part C: `repair_terminal_id_collisions` collapses N `open` rows sharing

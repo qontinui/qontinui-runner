@@ -1619,11 +1619,17 @@ pub fn terminal_session_clear_restore_pending(
 #[tauri::command]
 pub fn terminal_session_record_close(
     store: tauri::State<'_, Arc<SessionLifecycleStore>>,
+    terminal_manager: tauri::State<'_, Arc<TerminalManager>>,
     claude_session_id: String,
     terminal_id: Option<String>,
     reason: String,
 ) -> Result<CommandResponse, String> {
-    let outcome = store.record_close_checked(&claude_session_id, terminal_id.as_deref(), &reason);
+    let outcome = store.record_close_gated(
+        terminal_manager.is_shutting_down(),
+        &claude_session_id,
+        terminal_id.as_deref(),
+        &reason,
+    );
     Ok(close_outcome_response(&outcome))
 }
 
@@ -3187,6 +3193,9 @@ mod tests {
                 candidates: vec!["b".to_string(), "c".to_string()],
             },
             CloseOutcome::AlreadyClosed {
+                claude_session_id: "s".to_string(),
+            },
+            CloseOutcome::IgnoredDuringShutdown {
                 claude_session_id: "s".to_string(),
             },
             CloseOutcome::TerminalSuperseded {
