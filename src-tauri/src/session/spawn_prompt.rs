@@ -947,7 +947,6 @@ mod tests {
 #[cfg(all(test, unix))]
 mod script_tests {
     use crate::process_helpers::output_with_timeout;
-    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use std::process::Command;
     use std::time::Duration;
@@ -960,20 +959,6 @@ mod script_tests {
     /// [`crate::process_helpers::output_with_timeout`], so expiry kills the
     /// whole process tree and returns an error.
     const SCRIPT_BUDGET: Duration = Duration::from_secs(30);
-
-    /// Serialises "write an executable, then spawn". `Command` forks, and a
-    /// forked child inherits every fd open at that moment — including another
-    /// thread's still-open write handle on the script IT is about to run,
-    /// which then fails to start with ETXTBSY. Cheap: these are sub-second
-    /// shell runs.
-    static EXE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Take [`EXE_LOCK`], surviving a poisoned mutex so one failing test
-    /// reports its own assertion instead of cascading into the rest.
-    // test-lock: standalone — module-private; its holders take no other test lock and never take `env_lock` or any other test lock
-    fn exe_guard() -> std::sync::MutexGuard<'static, ()> {
-        EXE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
-    }
 
     const BASH_INTEGRATION: &str = include_str!("../../resources/shell-integration.bash");
     const ZSH_INTEGRATION: &str = include_str!("../../resources/shell-integration.zsh");
@@ -999,8 +984,7 @@ mod script_tests {
     }
 
     fn write_exe(path: &Path, body: &str) {
-        std::fs::write(path, body).unwrap();
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_exec_script::write_executable_script(path, body);
     }
 
     /// A fake `claude` on PATH that records its argv (one per line) and the
@@ -1021,7 +1005,6 @@ mod script_tests {
 
     /// Run a posix wrapper block under bash with `envs`, then `claude <args>`.
     fn run_wrapper(block: &str, envs: &[(&str, &str)], args: &str) -> String {
-        let _serial = exe_guard();
         let tmp = tempfile::tempdir().unwrap();
         let out = fake_claude(tmp.path());
         let script = tmp.path().join("wrapper.sh");
@@ -1243,7 +1226,6 @@ mod script_tests {
         reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
     )]
     fn powershell_wrapper_uses_the_file_carrier_only_when_the_file_exists() {
-        let _serial = exe_guard();
         if Command::new("pwsh").arg("-v").output().is_err() {
             eprintln!("skipping: pwsh not on PATH");
             return;
@@ -1363,7 +1345,6 @@ mod script_tests {
     /// Run the rendered bash identity shim as `claude <args>` with the marker
     /// pair set, against a fake real `claude` further down PATH.
     fn run_identity_shim(delivered_file: &str, args: &[&str]) -> String {
-        let _serial = exe_guard();
         let tmp = tempfile::tempdir().unwrap();
         let shim_dir = tmp.path().join("shim");
         let real_dir = tmp.path().join("real");
@@ -1450,7 +1431,6 @@ mod script_tests {
     /// Run the bundled policy hook against a fake `curl` that echoes every
     /// argument it was given, one per line, and return those lines.
     fn hook_curl_args(sha: Option<&str>) -> Vec<String> {
-        let _serial = exe_guard();
         let tmp = tempfile::tempdir().unwrap();
         write_exe(
             &tmp.path().join("curl"),
@@ -1626,7 +1606,6 @@ mod script_tests {
         envs: &[(&str, &str)],
         interpreters: &[&str],
     ) -> HookRun {
-        let _serial = exe_guard();
         let tmp = tempfile::tempdir().unwrap();
         let argv = tmp.path().join("curl-argv.txt");
         let (bin, bash) = isolated_bin(
@@ -1838,7 +1817,6 @@ mod script_tests {
     /// Run the bundled Stop hook against a fake `curl` answering `verdict`,
     /// and return what the hook printed on stdout.
     fn run_stop_hook(verdict: &str, interpreters: &[&str]) -> String {
-        let _serial = exe_guard();
         let tmp = tempfile::tempdir().unwrap();
         let (bin, bash) = isolated_bin(
             tmp.path(),
@@ -1934,7 +1912,6 @@ mod script_tests {
     /// parser at all (the hook must need none). `bin_setup` populates the bin
     /// dir: a fake curl, the real one, or nothing.
     fn run_pr_hook(envs: &[(&str, &str)], bin_setup: impl FnOnce(&Path, &Path)) -> PrRun {
-        let _serial = exe_guard();
         let tmp = tempfile::tempdir().unwrap();
         let bin = tmp.path().join("bin");
         std::fs::create_dir(&bin).unwrap();
@@ -2742,7 +2719,6 @@ mod script_tests {
     #[test]
     fn no_hook_blocks_on_a_stdin_that_never_reaches_eof() {
         const WEDGE_BUDGET: Duration = Duration::from_secs(12);
-        let _serial = exe_guard();
         for (name, script) in [
             ("claude_policy_hook.sh", POLICY_HOOK),
             ("claude_session_hook.sh", SESSION_HOOK),

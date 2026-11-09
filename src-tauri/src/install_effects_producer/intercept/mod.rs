@@ -309,14 +309,10 @@ mod tests {
         let bash_tmpl = include_str!("../../../resources/intercept/shim.bash");
         let rendered = shim_materializer::render_for_test(bash_tmpl, classify::ShimTool::Npm, dir);
         let shim = dir.join("npm");
+        #[cfg(windows)]
         std::fs::write(&shim, rendered).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut p = std::fs::metadata(&shim).unwrap().permissions();
-            p.set_mode(0o755);
-            std::fs::set_permissions(&shim, p).unwrap();
-        }
+        #[cfg(not(windows))]
+        crate::test_exec_script::write_executable_script(&shim, &rendered);
         shim
     }
 
@@ -330,14 +326,10 @@ mod tests {
             marker.display()
         );
         let p = real_bin.join("npm");
+        #[cfg(windows)]
         std::fs::write(&p, body).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&p).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&p, perms).unwrap();
-        }
+        #[cfg(not(windows))]
+        crate::test_exec_script::write_executable_script(&p, &body);
     }
 
     #[test]

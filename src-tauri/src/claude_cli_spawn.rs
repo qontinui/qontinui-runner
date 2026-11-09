@@ -410,26 +410,23 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_real_spawn_succeeds_once_the_binary_reappears() {
-        use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
         let bin = tmp.path().join("claude");
         let mut cmd = tokio::process::Command::new(&bin);
         cmd.stdout(std::process::Stdio::null());
         let bin_for_sleep = bin.clone();
         let child = retry_transient_spawn(
-            // More than one retry: a sibling test thread's fork can briefly
-            // hold the freshly written file open (ETXTBSY), itself a transient.
+            // The script is written through the shared ETXTBSY-safe writer, so
+            // the retries here only absorb the binary's absence.
             &[Duration::from_millis(50); 5],
             || cmd.spawn(),
             transient_kind,
             move |d| {
                 if !bin_for_sleep.exists() {
-                    std::fs::write(&bin_for_sleep, "#!/bin/sh\nexit 0\n").unwrap();
-                    std::fs::set_permissions(
+                    crate::test_exec_script::write_executable_script(
                         &bin_for_sleep,
-                        std::fs::Permissions::from_mode(0o755),
-                    )
-                    .unwrap();
+                        "#!/bin/sh\nexit 0\n",
+                    );
                 }
                 std::thread::sleep(d);
                 std::future::ready(())

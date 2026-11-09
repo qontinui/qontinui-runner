@@ -2091,10 +2091,7 @@ mod tests {
     fn an_ls_files_killed_at_the_budget_is_timed_out() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let script = tmp.path().join("slow-git");
-        crate::canonical_corpus::test_support::executable_script(
-            &script,
-            "#!/bin/sh\nexec sleep 5\n",
-        );
+        crate::test_exec_script::write_executable_script(&script, "#!/bin/sh\nexec sleep 5\n");
         let git = Git::new(script.as_os_str(), Duration::from_millis(200));
         let checkout = repo_at(tmp.path(), Probe::Measured(vec![]));
         assert_eq!(
@@ -2152,10 +2149,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(tmp.path().join(".claude")).unwrap();
         let script = tmp.path().join("slow-git");
-        crate::canonical_corpus::test_support::executable_script(
-            &script,
-            "#!/bin/sh\nexec sleep 5\n",
-        );
+        crate::test_exec_script::write_executable_script(&script, "#!/bin/sh\nexec sleep 5\n");
 
         let budget = Duration::from_millis(200);
         let started = Instant::now();
@@ -2190,7 +2184,7 @@ mod tests {
         let tmp = checkout_with_bundle();
         let dir = tempfile::tempdir().expect("tempdir");
         let script = dir.path().join("slow-git");
-        crate::canonical_corpus::test_support::executable_script(
+        crate::test_exec_script::write_executable_script(
             &script,
             "#!/bin/sh\nsleep 0.15\nexec git \"$@\"\n",
         );
@@ -2698,10 +2692,7 @@ mod tests {
     fn the_outer_wall_collects_a_measurement_whose_git_was_killed() {
         let tmp = checkout_with_bundle();
         let script = tmp.path().join("hung-git");
-        crate::canonical_corpus::test_support::executable_script(
-            &script,
-            "#!/bin/sh\nexec sleep 5\n",
-        );
+        crate::test_exec_script::write_executable_script(&script, "#!/bin/sh\nexec sleep 5\n");
         let budget = Duration::from_millis(300);
         let deadline = Instant::now() + budget;
         let workdir = tmp.path().to_path_buf();

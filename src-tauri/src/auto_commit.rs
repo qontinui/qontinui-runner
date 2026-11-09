@@ -470,21 +470,15 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn failing_pre_commit_hook_yields_err_and_no_commit() {
-        use std::os::unix::fs::PermissionsExt;
-
         let (_dir, repo) = init_repo();
         let before = head_hash(&repo);
         let before_count = commit_count(&repo);
 
         let hook_path = repo.join(".git").join("hooks").join("pre-commit");
-        fs::write(
+        crate::test_exec_script::write_executable_script(
             &hook_path,
             "#!/bin/sh\necho 'pre-commit refused' >&2\nexit 1\n",
-        )
-        .unwrap();
-        let mut perms = fs::metadata(&hook_path).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&hook_path, perms).unwrap();
+        );
 
         fs::write(repo.join("hooked.txt"), "x\n").unwrap();
 

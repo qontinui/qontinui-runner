@@ -2439,22 +2439,19 @@ const REAL_DIR_NAME: &str = "the-real-qontinui-identity-qontinui-shim-tool";
 #[cfg(all(test, unix))]
 mod resolve_wait_tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
     use std::time::{Duration, Instant};
 
-    /// Writing an executable while another test thread forks can leave the
-    /// write fd open in the child and make the exec fail `ETXTBSY`; serialize.
-    static EXE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     const BUDGET: Duration = Duration::from_secs(40);
 
-    /// Write `body` as an executable at `path`, atomically (temp + rename) so a
-    /// concurrently scanning shim never sees a half-written file.
+    /// Write `body` as an executable at `path`. A concurrently scanning shim
+    /// never sees a half-written file: the body is written to a sibling
+    /// `.partial` name the shim never scans, then renamed into place. The
+    /// rename is safe against ETXTBSY because the only write fd lived in the
+    /// helper's child `sh`, which is reaped before the rename.
     fn write_exe(path: &Path, body: &str) {
         let tmp = path.with_extension("partial");
-        std::fs::write(&tmp, body).unwrap();
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_exec_script::write_executable_script(&tmp, body);
         std::fs::rename(&tmp, path).unwrap();
     }
 
@@ -2505,7 +2502,6 @@ mod resolve_wait_tests {
         if system_claude_present() {
             return;
         }
-        let _serial = EXE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let (shim_dir, real_dir) = (tmp.path().join("shim"), tmp.path().join("real"));
         std::fs::create_dir_all(&shim_dir).unwrap();
@@ -2556,7 +2552,6 @@ mod resolve_wait_tests {
             eprintln!("SKIP: no /bin/sleep or /usr/bin/sleep for the fake sleep to exec");
             return;
         };
-        let _serial = EXE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let (shim_dir, real_dir) = (tmp.path().join("shim"), tmp.path().join("real"));
         std::fs::create_dir_all(&shim_dir).unwrap();
@@ -2599,7 +2594,6 @@ mod resolve_wait_tests {
         if system_claude_present() {
             return;
         }
-        let _serial = EXE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let (shim_dir, real_dir) = (tmp.path().join("shim"), tmp.path().join("real"));
         std::fs::create_dir_all(&shim_dir).unwrap();
@@ -2629,7 +2623,6 @@ mod resolve_wait_tests {
         if system_claude_present() {
             return;
         }
-        let _serial = EXE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let (shim_dir, real_dir) = (tmp.path().join("shim"), tmp.path().join("real"));
         std::fs::create_dir_all(&shim_dir).unwrap();
@@ -2662,7 +2655,6 @@ mod resolve_wait_tests {
     /// The argv the real tool receives when the shim is launched with `args`
     /// and the pin set, and with the settings and mcp-config env when `hook_env`.
     fn identity_argv_seen_by_real_tool(args: &[&str], hook_env: bool) -> Vec<String> {
-        let _serial = EXE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let (shim_dir, real_dir) = (tmp.path().join("shim"), tmp.path().join("real"));
         std::fs::create_dir_all(&shim_dir).unwrap();
@@ -2777,7 +2769,6 @@ mod resolve_wait_tests {
         if system_claude_present() {
             return;
         }
-        let _serial = EXE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let (shim_dir, real_dir) = (tmp.path().join("shim"), tmp.path().join("real"));
         std::fs::create_dir_all(&shim_dir).unwrap();
@@ -2805,7 +2796,6 @@ mod resolve_wait_tests {
         if system_claude_present() {
             return;
         }
-        let _serial = EXE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let (shim_dir, real_dir) = (tmp.path().join("shim"), tmp.path().join("real"));
         std::fs::create_dir_all(&shim_dir).unwrap();
@@ -2831,7 +2821,6 @@ mod resolve_wait_tests {
     /// fall-through, with the diagnostic, and propagates `not found` (127).
     #[test]
     fn install_shim_unresolved_tool_reports_and_exits_127() {
-        let _serial = EXE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let (shim_dir, empty_dir) = (tmp.path().join("shim"), tmp.path().join("empty"));
         std::fs::create_dir_all(&shim_dir).unwrap();
