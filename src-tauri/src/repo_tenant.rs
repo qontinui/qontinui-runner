@@ -2047,7 +2047,7 @@ mod tests {
     fn github_checkout() -> Option<tempfile::TempDir> {
         let d = tempfile::tempdir().unwrap();
         let run = |args: &[&str]| {
-            std::process::Command::new("git")
+            crate::process_helpers::no_window("git")
                 .args(args)
                 .current_dir(d.path())
                 .status()

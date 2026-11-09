@@ -2419,7 +2419,7 @@ mod tests {
     /// so these cases need actual repositories, not just a `.git` directory.
     fn git_init(dir: &std::path::Path) -> bool {
         std::fs::create_dir_all(dir).unwrap();
-        std::process::Command::new("git")
+        crate::process_helpers::no_window("git")
             .args(["init", "-q"])
             .current_dir(dir)
             .status()
@@ -2483,7 +2483,7 @@ mod tests {
 
     /// Run a git subcommand in `dir`; `false` if git is unavailable or it fails.
     fn git_in(dir: &std::path::Path, args: &[&str]) -> bool {
-        std::process::Command::new("git")
+        crate::process_helpers::no_window("git")
             .args(args)
             .current_dir(dir)
             .status()

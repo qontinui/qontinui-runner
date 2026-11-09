@@ -1030,7 +1030,7 @@ const COORD_MCP_DELIBERATE_EXCLUSION_PREFIXES: &[&str] = &["coord_onboard"];
     /// Run fixture `git <args>` in `repo` (fixed identity, no signing, no
     /// hooks), returning trimmed stdout; panics on failure.
     fn fixture_git(repo: &Path, args: &[&str]) -> String {
-        let mut cmd = std::process::Command::new("git");
+        let mut cmd = crate::process_helpers::no_window("git");
         cmd.args([
             "-c",
             "user.name=fixture",
@@ -1043,10 +1043,6 @@ const COORD_MCP_DELIBERATE_EXCLUSION_PREFIXES: &[&str] = &["coord_onboard"];
         ])
         .args(args)
         .current_dir(repo);
-        // Run under a git hook (or any caller that exported them), these
-        // would point the fixture's git at the CALLER's repo and index
-        // instead of the tempdir — the same scrub production applies.
-        qontinui_runner_lib::git_posture::scrub_repo_local_git_env(&mut cmd);
         let out = cmd.output().expect("git runs");
         assert!(out.status.success(), "git {args:?}: {out:?}");
         String::from_utf8_lossy(&out.stdout).trim().to_string()
@@ -1195,6 +1191,8 @@ const COORD_MCP_DELIBERATE_EXCLUSION_PREFIXES: &[&str] = &["coord_onboard"];
         let (decoy, decoy_sha) = git_fixture(&[("a.txt", "decoy\n")]);
         assert_ne!(target_sha, decoy_sha);
         let head = |scrub: bool| {
+            // git-env-ok: the scrub is the variable under test, so this must
+            // start unscrubbed and apply it only when `scrub` is true.
             let mut cmd = std::process::Command::new("git");
             cmd.args(["rev-parse", "HEAD"])
                 .current_dir(target.path())
@@ -1241,6 +1239,7 @@ const COORD_MCP_DELIBERATE_EXCLUSION_PREFIXES: &[&str] = &["coord_onboard"];
         // Control: a raw, UNscrubbed git (the production posture now scrubs
         // at construction), in the same `current_dir`, answers for the
         // inherited decoy.
+        // git-env-ok: unscrubbed control proving the child inherited the decoy GIT_DIR.
         let out = std::process::Command::new("git")
             .args(["rev-parse", "HEAD"])
             .current_dir(target)

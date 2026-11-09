@@ -460,16 +460,21 @@ pub(crate) mod test_support {
     //! `git add`.
 
     use std::path::Path;
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
 
     /// Initialise a real repo in `dir` (quiet, no global config dependence).
+    ///
+    /// Built through [`crate::process_helpers::no_window`], which strips the
+    /// repo-local git environment (`GIT_DIR`, `GIT_INDEX_FILE`, ...): a test run
+    /// from inside a git hook inherits the hook's, and would otherwise act on
+    /// the hook's repository instead of `dir`.
     pub(crate) fn git_init(dir: &Path) {
         for args in [
             vec!["init", "--quiet"],
             vec!["config", "user.email", "t@example.com"],
             vec!["config", "user.name", "t"],
         ] {
-            let ok = Command::new("git")
+            let ok = crate::process_helpers::no_window("git")
                 .arg("-C")
                 .arg(dir)
                 .args(&args)
@@ -482,8 +487,10 @@ pub(crate) mod test_support {
         }
     }
 
+    /// Stage `path` in `dir`'s index, with the same scrubbed environment as
+    /// [`git_init`].
     pub(crate) fn git_add(dir: &Path, path: &Path) {
-        let ok = Command::new("git")
+        let ok = crate::process_helpers::no_window("git")
             .arg("-C")
             .arg(dir)
             .arg("add")
@@ -504,7 +511,9 @@ pub(crate) mod test_support {
     /// decay into a duplicate of the untracked-file test and still pass, leaving
     /// the arm it names unverified.
     pub(crate) fn assert_not_in_any_repo(dir: &Path) {
-        let inside = Command::new("git")
+        // Scrubbed like the two above: an inherited `GIT_DIR` would answer for
+        // the hook's repository, not for `dir`.
+        let inside = crate::process_helpers::no_window("git")
             .arg("-C")
             .arg(dir)
             .arg("rev-parse")
@@ -777,5 +786,195 @@ mod tests {
             first_stderr_line(long.as_bytes()).chars().count(),
             PROBE_STDERR_MAX_CHARS
         );
+    }
+
+    /// Suite-level control: the crate's shared git test fixtures, run under the
+    /// environment a linked-worktree pre-commit hook exports (an absolute
+    /// `GIT_DIR` plus `GIT_INDEX_FILE`), act on their own tempdir repositories
+    /// and leave the hook's repository byte-identical.
+    ///
+    /// Hosted here because the re-exec harness
+    /// ([`crate::git_trunk::inherited_git_dir_reexec`]) is bin-only and this
+    /// module's fixtures have the widest fan-out. Module-private helpers are
+    /// covered by the raw-git-spawn guard, not by this control.
+    mod shared_fixture_control {
+        use std::path::{Path, PathBuf};
+
+        use crate::git_trunk::inherited_git_dir_reexec::{
+            assert_inherited_git_dir, child_input, repo_with_origin_main, run_child,
+            ASSERTED_MARKER,
+        };
+
+        /// Run git through the chokepoint (repo-local environment stripped) in
+        /// `dir`, returning trimmed stdout; panics on a non-zero exit.
+        fn scrubbed_git(dir: &Path, args: &[&str]) -> String {
+            let out = crate::process_helpers::no_window("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .expect("run git");
+            assert!(
+                out.status.success(),
+                "git -C {} {args:?} failed: {}",
+                dir.display(),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+
+        /// Every file under `root`, as sorted paths relative to it.
+        fn sorted_files(root: &Path) -> Vec<PathBuf> {
+            fn walk(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
+                for entry in std::fs::read_dir(dir).expect("read_dir") {
+                    let path = entry.expect("dir entry").path();
+                    if path.is_dir() {
+                        walk(root, &path, out);
+                    } else {
+                        out.push(path.strip_prefix(root).expect("under root").to_path_buf());
+                    }
+                }
+            }
+            let mut out = Vec::new();
+            walk(root, root, &mut out);
+            out.sort();
+            out
+        }
+
+        /// The decoy's observable repository state.
+        #[derive(Debug, PartialEq, Eq)]
+        struct RepoSnapshot {
+            index: Vec<u8>,
+            config: Vec<u8>,
+            head: Vec<u8>,
+            refs: String,
+            objects: Vec<PathBuf>,
+        }
+
+        fn snapshot(repo: &Path) -> RepoSnapshot {
+            let git_dir = repo.join(".git");
+            let read = |name: &str| {
+                std::fs::read(git_dir.join(name)).unwrap_or_else(|e| panic!("read .git/{name}: {e}"))
+            };
+            RepoSnapshot {
+                index: read("index"),
+                config: read("config"),
+                head: read("HEAD"),
+                refs: scrubbed_git(repo, &["for-each-ref"]),
+                objects: sorted_files(&git_dir.join("objects")),
+            }
+        }
+
+        /// Asserts `dir` is the top level of its OWN repository, not a path
+        /// resolved through someone else's `GIT_DIR`.
+        fn assert_own_repo(dir: &Path) {
+            assert!(dir.join(".git").is_dir(), "{} has no .git of its own", dir.display());
+            let top = scrubbed_git(dir, &["rev-parse", "--show-toplevel"]);
+            assert_eq!(
+                std::fs::canonicalize(&top).expect("canonicalize toplevel"),
+                std::fs::canonicalize(dir).expect("canonicalize dir"),
+                "{} is not the top level of its own repository",
+                dir.display()
+            );
+        }
+
+        fn assert_staged(dir: &Path, file: &str) {
+            let listed = scrubbed_git(dir, &["ls-files"]);
+            assert!(
+                listed.lines().any(|l| l == file),
+                "{file} is not staged in {}'s own index (ls-files: {listed:?})",
+                dir.display()
+            );
+        }
+
+        fn assert_head_is_a_commit(dir: &Path) {
+            let kind = scrubbed_git(dir, &["cat-file", "-t", "HEAD"]);
+            assert_eq!(kind, "commit", "{}'s own HEAD must resolve to a commit", dir.display());
+        }
+
+        #[test]
+        fn shared_git_fixtures_leave_an_inherited_git_dir_repo_untouched() {
+            let decoy = repo_with_origin_main(false);
+            let decoy_index = decoy.path().join(".git/index");
+            let before = snapshot(decoy.path());
+
+            run_child(
+                module_path!(),
+                "shared_git_fixtures_child",
+                &decoy.path().join(".git"),
+                &[("GIT_INDEX_FILE", decoy_index.as_os_str())],
+            );
+
+            let after = snapshot(decoy.path());
+            assert_eq!(
+                before.index, after.index,
+                "a shared fixture rewrote the inherited GIT_INDEX_FILE (decoy .git/index)"
+            );
+            assert_eq!(
+                before.config, after.config,
+                "a shared fixture wrote the inherited GIT_DIR's config (decoy .git/config)"
+            );
+            assert_eq!(
+                before.head, after.head,
+                "a shared fixture moved the inherited GIT_DIR's HEAD"
+            );
+            assert_eq!(
+                before.refs, after.refs,
+                "a shared fixture wrote a ref in the inherited GIT_DIR"
+            );
+            assert_eq!(
+                before.objects, after.objects,
+                "a shared fixture wrote objects into the inherited GIT_DIR"
+            );
+        }
+
+        #[test]
+        #[ignore = "re-executed by shared_git_fixtures_leave_an_inherited_git_dir_repo_untouched"]
+        fn shared_git_fixtures_child() {
+            let Some(decoy_git_dir) = child_input("GIT_DIR") else {
+                return;
+            };
+            assert_inherited_git_dir(&decoy_git_dir);
+
+            // provision_guard::test_support
+            use crate::provision_guard::test_support::{assert_not_in_any_repo, git_add, git_init};
+            let plain = tempfile::tempdir().expect("tempdir");
+            assert_not_in_any_repo(plain.path());
+
+            let pg = tempfile::tempdir().expect("tempdir");
+            git_init(pg.path());
+            let pg_file = pg.path().join("pg.txt");
+            std::fs::write(&pg_file, b"provision_guard").expect("write");
+            git_add(pg.path(), &pg_file);
+            assert_own_repo(pg.path());
+            assert_staged(pg.path(), "pg.txt");
+
+            // canonical_corpus::test_support::git
+            use crate::canonical_corpus::test_support::git as corpus_git;
+            let cc = tempfile::tempdir().expect("tempdir");
+            corpus_git(cc.path(), &["init", "-q"]);
+            std::fs::write(cc.path().join("cc.txt"), b"canonical_corpus").expect("write");
+            corpus_git(cc.path(), &["add", "cc.txt"]);
+            corpus_git(cc.path(), &["commit", "-q", "-m", "cc"]);
+            assert_own_repo(cc.path());
+            assert_head_is_a_commit(cc.path());
+            assert_staged(cc.path(), "cc.txt");
+
+            // claude_session::trust_gate::test_fixtures::git
+            use crate::claude_session::trust_gate::test_fixtures::git as trust_git;
+            let tg = tempfile::tempdir().expect("tempdir");
+            trust_git(tg.path(), &["init", "-q"]);
+            std::fs::write(tg.path().join("tg.txt"), b"trust_gate").expect("write");
+            trust_git(tg.path(), &["add", "tg.txt"]);
+            trust_git(
+                tg.path(),
+                &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "tg"],
+            );
+            assert_own_repo(tg.path());
+            assert_head_is_a_commit(tg.path());
+            assert_staged(tg.path(), "tg.txt");
+
+            println!("{ASSERTED_MARKER}");
+        }
     }
 }

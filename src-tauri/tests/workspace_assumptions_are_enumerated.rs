@@ -1680,15 +1680,12 @@ fn check_ceiling(fresh: &[Row], checked: &[Row], ceiling: usize) -> Result<(), S
 /// A `git` invocation in `repo` with the repository-selecting variables an
 /// enclosing hook or worktree may export removed, so `current_dir` is
 /// authoritative (the same hazard `fleet_skills/.../lib/git-scope.sh` names).
+/// `no_window` strips the whole `REPO_LOCAL_GIT_ENV` set; `GIT_NAMESPACE` is
+/// not on that list (it scopes refs rather than locating a repository), so it
+/// is still removed here to keep `origin/main` / `main` resolving unscoped.
 fn git_in(repo: &Path, args: &[&str]) -> Result<String, String> {
-    let out = std::process::Command::new("git")
+    let out = qontinui_runner_lib::process_helpers::no_window("git")
         .current_dir(repo)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .env_remove("GIT_COMMON_DIR")
-        .env_remove("GIT_OBJECT_DIRECTORY")
-        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
         .env_remove("GIT_NAMESPACE")
         .args(args)
         .output()

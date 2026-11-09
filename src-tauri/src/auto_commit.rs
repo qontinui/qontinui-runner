@@ -210,7 +210,6 @@ fn has_staged_diff_for(cwd: &Path, paths: &[&str]) -> Result<bool, String> {
 mod tests {
     use super::*;
     use std::fs;
-    use std::process::Command;
     use tempfile::TempDir;
 
     /// Create a temporary git repo with one initial commit so HEAD is valid.
@@ -237,7 +236,7 @@ mod tests {
     }
 
     fn run(cwd: &Path, args: &[&str]) -> String {
-        let out = Command::new("git")
+        let out = crate::process_helpers::no_window("git")
             .args(args)
             .current_dir(cwd)
             .output()
@@ -254,7 +253,7 @@ mod tests {
     }
 
     fn try_run(cwd: &Path, args: &[&str]) -> (bool, String, String) {
-        let out = Command::new("git")
+        let out = crate::process_helpers::no_window("git")
             .args(args)
             .current_dir(cwd)
             .output()

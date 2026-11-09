@@ -1166,7 +1166,7 @@ pub(crate) mod test_support {
     /// signing config or locale, and with the caller's repository
     /// environment removed.
     pub(crate) fn git(dir: &Path, args: &[&str]) -> String {
-        let out = Command::new("git")
+        let out = crate::process_helpers::no_window("git")
             .arg("-C")
             .arg(dir)
             .args([
@@ -1180,9 +1180,6 @@ pub(crate) mod test_support {
                 "user.name=t",
             ])
             .args(args)
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_INDEX_FILE")
             .env("LC_ALL", "C")
             .stdin(Stdio::null())
             .output()
@@ -1323,7 +1320,7 @@ mod tests {
         );
         let count = git(&git_dir, &["rev-list", "--count", &first.sha]);
         assert_eq!(count.trim(), "1", "only the tip commit is held");
-        let has_parent = std::process::Command::new("git")
+        let has_parent = crate::process_helpers::no_window("git")
             .arg("--git-dir")
             .arg(&git_dir)
             .args(["cat-file", "-e", parent.trim()])

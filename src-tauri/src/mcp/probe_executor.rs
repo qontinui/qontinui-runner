@@ -700,6 +700,8 @@ mod tests {
 
         // Control: a raw, UNscrubbed `git -C <target> cherry` answers for the
         // inherited decoy, which has nothing unpushed.
+        // git-env-ok: this control must inherit the decoy GIT_DIR unscrubbed, to prove
+        // the probe's own read is what ignores it.
         let out = std::process::Command::new("git")
             .arg("-C")
             .arg(&target)

@@ -11053,7 +11053,7 @@ mod egress_tests {
         let root = base.join("repo");
         let wt = base.join("wt-b");
         let git = |dir: &std::path::Path, args: &[&str]| {
-            let out = std::process::Command::new("git")
+            let out = crate::process_helpers::no_window("git")
                 .arg("-C")
                 .arg(dir)
                 .args(["-c", "user.email=t@example.invalid", "-c", "user.name=t"])
@@ -11168,7 +11168,7 @@ mod egress_tests {
     fn git_repo_with_worktrees(base: &std::path::Path, branches: &[&str]) -> std::path::PathBuf {
         let root = base.join("repo");
         let git = |dir: &std::path::Path, args: &[&str]| {
-            let out = std::process::Command::new("git")
+            let out = crate::process_helpers::no_window("git")
                 .arg("-C")
                 .arg(dir)
                 .args(["-c", "user.email=t@example.invalid", "-c", "user.name=t"])

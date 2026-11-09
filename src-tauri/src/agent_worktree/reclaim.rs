@@ -2078,21 +2078,12 @@ pub(in crate::agent_worktree) mod tests {
     const PROBE_BUDGET: Duration = Duration::from_secs(30);
 
     /// A `git` command that cannot reach an outer repository: an inherited
-    /// `GIT_DIR` / `GIT_WORK_TREE` / `GIT_INDEX_FILE` / object-directory
-    /// override (a test run from a git hook exports them) overrides `-C`, and would point `init`/`add` at the
-    /// enclosing repo instead of the temp dir.
+    /// repository-local override (`GIT_DIR`, `GIT_INDEX_FILE`, …, which a test
+    /// run from a git hook exports) overrides `-C` and would point `init`/`add`
+    /// at the enclosing repo instead of the temp dir. `no_window` scrubs every
+    /// `REPO_LOCAL_GIT_ENV` name; this adds only the system-config isolation.
     pub(in crate::agent_worktree) fn hermetic_git() -> std::process::Command {
-        let mut cmd = std::process::Command::new("git");
-        for key in [
-            "GIT_DIR",
-            "GIT_WORK_TREE",
-            "GIT_INDEX_FILE",
-            "GIT_COMMON_DIR",
-            "GIT_OBJECT_DIRECTORY",
-            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-        ] {
-            cmd.env_remove(key);
-        }
+        let mut cmd = crate::process_helpers::no_window("git");
         cmd.env("GIT_CONFIG_NOSYSTEM", "1");
         cmd
     }

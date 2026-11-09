@@ -513,7 +513,7 @@ mod tests {
     #[test]
     fn process_deadline_a_fast_child_completes_with_its_output() {
         let _serial = serial();
-        let mut cmd = Command::new("git");
+        let mut cmd = crate::process_helpers::no_window("git");
         cmd.arg("--version");
         let run = run_with_deadline_detailed(cmd, Instant::now() + Duration::from_secs(20))
             .expect("git runs");

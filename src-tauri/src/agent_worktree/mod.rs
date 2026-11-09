@@ -3033,6 +3033,16 @@ pub fn coord_ws_to_http(coord_url: &str) -> String {
 mod tests {
     use super::*;
 
+    /// A `git -C <dir>` command for the fixtures below, built through the
+    /// runner's chokepoint so an inherited repository-local env (`GIT_DIR`,
+    /// `GIT_INDEX_FILE`, … — exported when the suite runs from a git hook)
+    /// cannot point it at the caller's repository instead of `dir`.
+    fn git_in(dir: impl AsRef<std::path::Path>) -> std::process::Command {
+        let mut cmd = crate::process_helpers::no_window("git");
+        cmd.arg("-C").arg(dir.as_ref());
+        cmd
+    }
+
     /// coord#2779 added `sibling_notes`; the runner must decode it (so it can
     /// log it) and must still decode a coord that predates it.
     #[test]
@@ -3351,13 +3361,12 @@ mod tests {
         // on a feature branch and assert the resolver still returns `main`,
         // and that `resolve_origin_default_sha` returns origin/main's tip
         // (not the feature tip).
-        use std::process::Command;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path();
         let p = path.to_str().unwrap();
         let git = |args: &[&str]| {
-            let out = Command::new("git")
-                .args([&["-C", p], args].concat())
+            let out = git_in(p)
+                .args(args)
                 .output()
                 .unwrap();
             assert!(
@@ -3373,8 +3382,8 @@ mod tests {
         git(&["add", "a.txt"]);
         git(&["commit", "-q", "-m", "c1"]);
         let main_sha = String::from_utf8(
-            Command::new("git")
-                .args(["-C", p, "rev-parse", "HEAD"])
+            git_in(p)
+                .args(["rev-parse", "HEAD"])
                 .output()
                 .unwrap()
                 .stdout,
@@ -3400,8 +3409,8 @@ mod tests {
         git(&["add", "b.txt"]);
         git(&["commit", "-q", "-m", "c2"]);
         let feature_sha = String::from_utf8(
-            Command::new("git")
-                .args(["-C", p, "rev-parse", "HEAD"])
+            git_in(p)
+                .args(["rev-parse", "HEAD"])
                 .output()
                 .unwrap()
                 .stdout,
@@ -3425,12 +3434,11 @@ mod tests {
     fn resolve_local_default_branch_falls_back_to_main() {
         // No origin/HEAD ref (fresh local-only repo) → the resolver must
         // fall back to "main" rather than erroring.
-        use std::process::Command;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path();
         let p = path.to_str().unwrap();
-        Command::new("git")
-            .args(["-C", p, "init", "-q", "-b", "trunk"])
+        git_in(p)
+            .args(["init", "-q", "-b", "trunk"])
             .output()
             .unwrap();
         assert_eq!(resolve_local_default_branch(path), "main");
@@ -4229,12 +4237,10 @@ mod tests {
 
     #[test]
     fn checkout_shared_branches_rolls_back_on_a_later_failure() {
-        use std::process::Command;
         let init = |dir: &std::path::Path| -> String {
             let git = |args: &[&str]| {
-                let out = Command::new("git")
+                let out = git_in(dir)
                     .args(args)
-                    .current_dir(dir)
                     .output()
                     .unwrap();
                 assert!(out.status.success(), "git {args:?}: {out:?}");
@@ -4284,11 +4290,9 @@ mod tests {
 
     #[test]
     fn checkout_shared_branches_rollback_keeps_a_branch_that_already_existed() {
-        use std::process::Command;
         let git = |dir: &std::path::Path, args: &[&str]| {
-            let out = Command::new("git")
+            let out = git_in(dir)
                 .args(args)
-                .current_dir(dir)
                 .output()
                 .unwrap();
             assert!(out.status.success(), "git {args:?}: {out:?}");
@@ -4337,13 +4341,12 @@ mod tests {
 
     #[test]
     fn checkout_shared_branch_bails_on_dirty_tree() {
-        use std::process::Command;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path();
         let p = path.to_str().unwrap();
         let git = |args: &[&str]| {
-            let out = Command::new("git")
-                .args([&["-C", p], args].concat())
+            let out = git_in(p)
+                .args(args)
                 .output()
                 .unwrap();
             assert!(out.status.success(), "git {args:?} failed");
@@ -4355,8 +4358,8 @@ mod tests {
         git(&["add", "a.txt"]);
         git(&["commit", "-q", "-m", "c1"]);
         let parent = String::from_utf8(
-            Command::new("git")
-                .args(["-C", p, "rev-parse", "HEAD"])
+            git_in(p)
+                .args(["rev-parse", "HEAD"])
                 .output()
                 .unwrap()
                 .stdout,
@@ -4367,8 +4370,8 @@ mod tests {
         // Clean tree on `main`, switching to a NEW branch → allowed.
         assert!(checkout_shared_branch(path, "agent/clean", parent).is_ok());
         // Switch back to main so the next case starts off-target.
-        Command::new("git")
-            .args(["-C", p, "checkout", "-q", "main"])
+        git_in(p)
+            .args(["checkout", "-q", "main"])
             .output()
             .unwrap();
 
