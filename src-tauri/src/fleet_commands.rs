@@ -801,20 +801,24 @@ mod tests {
         let registry = AgentCommandRegistry::new();
         let out = provision_fleet_commands_into(&commands_dir, &registry).expect("provision");
 
-        assert_eq!(out.skipped.len(), 1, "the tracked file should be skipped");
         // The REASON is the deliverable: a bare count is the same unreadable
         // signal the `warn!` this report replaces already was.
+        let tracked_skip = out
+            .skipped
+            .iter()
+            .find(|s| s.unit == format!("{tracked_name}.md"))
+            .expect("the tracked file is skipped");
         assert_eq!(
-            out.skipped[0].reason,
+            tracked_skip.reason,
             crate::capability_manifest::SkipReason::GitTracked
         );
-        assert_eq!(out.skipped[0].unit, format!("{tracked_name}.md"));
         assert!(out.is_degraded(), "a skipped unit means the pass degraded");
-        assert_eq!(
-            out.written,
-            FLEET_COMMANDS.len() - 1,
-            "every OTHER command should still be written"
-        );
+        // The repo now VERSIONS `.claude/commands`, so every OTHER command is
+        // absent and untracked there and is not created (plan
+        // 2026-11-09-a-provisioned-copy-of-an-upstream-added-file-wedges-the-served-checkout-fast-forward
+        // Phase 2) — see `an_upstream_added_command_is_not_created_in_a_root_versioned_checkout`.
+        assert_eq!(out.skipped.len(), FLEET_COMMANDS.len());
+        assert_eq!(out.written, 0);
         assert_eq!(
             std::fs::read_to_string(&tracked).unwrap(),
             "# the repo's own body\n",
@@ -865,6 +869,52 @@ mod tests {
             FLEET_COMMANDS.len() - 1,
             "every absent command is still written"
         );
+    }
+
+    /// Plan `2026-11-09-a-provisioned-copy-of-an-upstream-added-file-wedges-the-served-checkout-fast-forward`
+    /// Phase 2, entering where a session spawn enters: a STALE claude-config
+    /// checkout tracks every bundled command but one, which upstream added
+    /// after this checkout's HEAD. Writing that one as an untracked file is what
+    /// wedged the checkout's `git merge --ff-only` (git refuses an untracked file
+    /// at an incoming path even when its bytes are identical), so it must not
+    /// be created; a command the checkout tracks but the user deleted is still
+    /// written, as before.
+    #[test]
+    fn an_upstream_added_command_is_not_created_in_a_root_versioned_checkout() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let commands_dir = tmp.path().join(".claude").join("commands");
+        std::fs::create_dir_all(&commands_dir).unwrap();
+        crate::provision_guard::test_support::git_init(tmp.path());
+
+        assert!(FLEET_COMMANDS.len() >= 3, "fixture needs three commands");
+        let (added, _) = FLEET_COMMANDS[0];
+        let (deleted, deleted_body) = FLEET_COMMANDS[1];
+        for (name, _) in &FLEET_COMMANDS[1..] {
+            let dst = commands_dir.join(format!("{name}.md"));
+            std::fs::write(&dst, format!("# repo body for {name}\n")).unwrap();
+            crate::provision_guard::test_support::git_add(tmp.path(), &dst);
+        }
+        std::fs::remove_file(commands_dir.join(format!("{deleted}.md"))).unwrap();
+
+        let out = provision_fleet_commands_into(&commands_dir, &AgentCommandRegistry::new())
+            .expect("provision");
+
+        assert!(
+            !commands_dir.join(format!("{added}.md")).exists(),
+            "an upstream-added command must not be created in a checkout that versions the tree"
+        );
+        assert!(
+            out.skipped.iter().any(|s| s.unit == format!("{added}.md")
+                && s.reason == crate::capability_manifest::SkipReason::RootVersioned),
+            "the skip is recorded as root_versioned, got {:?}",
+            out.skipped
+        );
+        assert_eq!(
+            std::fs::read_to_string(commands_dir.join(format!("{deleted}.md"))).unwrap(),
+            deleted_body,
+            "a tracked-but-deleted command is still written"
+        );
+        assert_eq!(out.written, 1, "only the tracked-but-deleted one");
     }
 
     /// The blast radius the module doc names: a checkout that tracks EVERY
@@ -943,7 +993,12 @@ mod tests {
 
         let out = provision_fleet_commands_into(&commands_dir, &registry).expect("provision");
 
-        assert_eq!(out.skipped.len(), 1);
+        assert!(
+            out.skipped.iter().any(|s| s.unit == format!("{name}.md")
+                && s.reason == crate::capability_manifest::SkipReason::GitTracked),
+            "the overridden command is skipped as tracked, got {:?}",
+            out.skipped
+        );
         assert_eq!(
             std::fs::read_to_string(&dst).unwrap(),
             "# the repo's own body\n",
