@@ -8479,9 +8479,13 @@ fn classify_pty_spawn_error(e: &str) -> (String, SpawnPhase) {
 
 /// A terminal door's report of a spawn that failed AFTER its worktree was
 /// allocated — every `acquire_for_terminal` door, through
-/// [`crate::agent_worktree::isolated_edit::IsolatedEditContext::report_unspawned`].
-/// Coord moves the allocation's rows from `allocated` to `abandoned`, so the allocation stops counting as live. That is a ledger fact:
-/// it does not remove the tree from disk. Best-effort, like every caller of
+/// [`crate::agent_worktree::isolated_edit::IsolatedEditContext::remove_unspawned`],
+/// which first removes the fresh tree from disk when no child started and it
+/// holds nothing, and then posts this. Coord moves the allocation's rows from
+/// `allocated` to `abandoned`, so the allocation stops counting as live. That
+/// is a ledger fact: the disk half is the runner's removal, never coord's
+/// `abandoned` (plan
+/// `2026-11-08-a-spawn-refused-after-its-worktree-allocation-leaves-the-tree-on-disk`). Best-effort, like every caller of
 /// [`report_spawn_failed_in_phase`]: one attempt, and nothing is posted on a
 /// runner with no connected coord base. The failure is classified the way the
 /// condition-check path classifies a PTY-seam failure

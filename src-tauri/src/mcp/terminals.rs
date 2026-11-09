@@ -531,11 +531,13 @@ pub async fn create_terminal_handler(
         }
         Err(e) => {
             // A context exists only when this call allocated (the reuse arm of
-            // `acquire_for_terminal` returns none). Its Drop releases the claims;
-            // the report moves the allocation out of `allocated` in coord's
-            // ledger — see `IsolatedEditContext::report_unspawned`.
-            if let Some(ctx) = isolated_ctx.as_ref() {
-                ctx.report_unspawned("HTTP POST /terminals", &e.message);
+            // `acquire_for_terminal` returns none). `remove_unspawned` removes
+            // the fresh tree from disk when no child started and it holds
+            // nothing, then reports the allocation spawn-failed once, which moves
+            // it out of `allocated` in coord's ledger; the context's Drop
+            // releases the claims. See `IsolatedEditContext::remove_unspawned`.
+            if let Some(ctx) = isolated_ctx {
+                ctx.remove_unspawned("HTTP POST /terminals", e.child_started, &e.message);
             }
             Err(terminal_spawn_failed(e.message))
         }

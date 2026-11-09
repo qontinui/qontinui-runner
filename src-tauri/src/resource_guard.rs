@@ -2884,10 +2884,12 @@ pub(crate) fn admit_spawn(
 /// isolated git worktree first: under `QONTINUI_AGENT_WORKTREE_MODE`,
 /// `acquire_for_terminal` runs a `git worktree add`, takes a coord claim, starts
 /// a heartbeat task and shells out to `git config` for the credential helper. On
-/// a CRITICAL refusal all of that is thrown away, and `IsolatedEditContext::Drop`
-/// releases the claim but does NOT remove the materialized worktree — so every
-/// refusal leaks a directory, and the operator's "Start anyway" retry materializes
-/// a second one. Refusing before the acquisition costs one
+/// a CRITICAL refusal all of that is thrown away. `IsolatedEditContext::Drop`
+/// releases the claim but does not remove the materialized worktree; the door's
+/// `IsolatedEditContext::remove_unspawned` takes a pre-child refusal's fresh,
+/// empty tree back off disk, but only after a `git worktree add` and a removal
+/// both ran — and the operator's "Start anyway" retry materializes a second
+/// one. Refusing before the acquisition costs one
 /// `GlobalMemoryStatusEx` call plus — at most once per
 /// [`crate::health_monitor::THREAD_READING_TTL`], and in practice never here,
 /// because [`admit_spawn`] takes the same reading milliseconds later — one
