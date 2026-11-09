@@ -19,6 +19,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const ACTING = "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a";
 // Per-test switch for the device's multi-tenant flag (`useTenant().showSwitcher`).
 const tenantFlag = vi.hoisted(() => ({ showSwitcher: true }));
+// Per-test switch for whether the runner sent `tenancy.display` (an older
+// runner, or a read that has not projected one, sends none).
+const displayFlag = vi.hoisted(() => ({ sent: true }));
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(() => new Promise(() => {})) }));
 vi.mock("@/contexts/TenantContext", () => ({
@@ -39,7 +42,9 @@ vi.mock("./useSessionInfo", async (orig) => ({
               divergence: "agree",
               credential: { status: "resolved", tenantId: ACTING },
               dataPlane: { status: "resolved", tenantId: ACTING },
-              display: { status: "resolved", tenantId: ACTING, source: "credential" },
+              display: displayFlag.sent
+                ? { status: "resolved", tenantId: ACTING, source: "credential" }
+                : null,
             },
           },
   }),
@@ -52,6 +57,7 @@ let root: Root;
 
 beforeEach(() => {
   tenantFlag.showSwitcher = true;
+  displayFlag.sent = true;
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
   container = document.createElement("div");
   document.body.appendChild(container);
@@ -118,12 +124,18 @@ describe("TenantBadge display attributes on the rendered element", () => {
     expect(badge?.getAttribute("data-tenant-acting")).toBe(ACTING);
   });
 
-  it("states no display for a badge with no Claude session", () => {
+  it("states no display when the runner sent none, rather than inventing one", () => {
+    // A stamped session: the badge renders from its stamp, and a tenancy block
+    // IS read — it simply carries no display, so no display attribute may appear.
+    displayFlag.sent = false;
     act(() => {
-      root.render(createElement(TenantBadge, { tenantId: ACTING, zoneIndex: 0 }));
+      root.render(
+        createElement(TenantBadge, { tenantId: ACTING, claudeSessionId: "sess-0", zoneIndex: 0 }),
+      );
     });
     const badge = container.querySelector('[data-ui-bridge-id="terminal-tenant-badge-0"]');
-    expect(badge).not.toBeNull();
+    expect(badge?.getAttribute("data-tenant-id")).toBe(ACTING);
+    expect(badge?.getAttribute("data-tenant-credential")).toBe(ACTING);
     expect(badge?.hasAttribute("data-tenant-display-status")).toBe(false);
     expect(badge?.hasAttribute("data-tenant-display-source")).toBe(false);
     expect(badge?.hasAttribute("data-tenant-acting")).toBe(false);
