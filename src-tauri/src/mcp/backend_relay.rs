@@ -5623,6 +5623,12 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
     // the drain gate, before the grant gate, so a refusal spends no create
     // grant. `false`: the relay never overrides the floor (see its create
     // call). Answered with the failed-create arm's own typed frame.
+    //
+    // Accepted consequence: because this runs before the grant gate, a frame
+    // that would NOT have been admitted (an unknown or foreign grant) now sees
+    // the CRITICAL refusal text — box headroom and floor — instead of the grant
+    // refusal. The drain gate above already answers unadmitted frames the same
+    // way; it is deliberate here so a refusal never spends a create grant.
     if let Err(frame) = crate::terminal::spawn_refusal::relay_precheck(
         || crate::resource_guard::precheck_spawn("terminal session", false),
         data,
