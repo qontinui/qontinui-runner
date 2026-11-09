@@ -112,6 +112,11 @@ struct WireRow {
     /// the key is not unique). Absent on a coord that predates the field.
     #[serde(default)]
     coord_session_id: Option<String>,
+    /// That row's LIVENESS axis (`expected` | `active` | `pending_resolution` |
+    /// `stale` | `closed`), orthogonal to the work axis. Absent on a coord
+    /// that predates the field.
+    #[serde(default)]
+    state: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
