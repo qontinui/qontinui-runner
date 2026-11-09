@@ -2021,6 +2021,7 @@ mod tests {
             deferred_capped: false,
             last_emitted: Some(CoordDrainState::Clear),
             folded_once: true,
+            dispatch_role: None,
         }
     }
 
