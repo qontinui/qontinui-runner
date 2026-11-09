@@ -207,6 +207,81 @@ impl Drop for IsolatedEditContext {
 }
 
 impl IsolatedEditContext {
+    /// Report that the spawn this context was allocated for failed, from
+    /// `door` with `error`. Called on the failure arm of every
+    /// [`acquire_for_terminal`] door (plan
+    /// `2026-11-08-a-spawn-refused-after-its-worktree-allocation-leaves-the-tree-on-disk`,
+    /// Phase 0).
+    ///
+    /// The context's `Drop` releases its claims, not the worktree on disk. A
+    /// context exists only when the call allocated (the reuse arm of
+    /// [`acquire_for_terminal`] returns none). This posts the failed spawn on
+    /// the allocation, as the gate continuation path does: coord moves its rows
+    /// from `allocated` to `abandoned`, so the allocation stops counting as
+    /// live. That is a ledger fact only. Removing the tree from disk is not
+    /// authorized by `abandoned`, so the tree can still remain.
+    ///
+    /// Detached and best-effort: one attempt, and none at all on a runner with
+    /// no connected coord base (the reporter logs that), so the door's answer
+    /// never waits on coord. Spawned under the same
+    /// `tokio::runtime::Handle::try_current()` guard `Drop` uses, so a call
+    /// outside a runtime logs and posts nothing rather than panicking.
+    ///
+    /// A door whose failure may come AFTER a child started in the tree (the
+    /// Tauri command's join error — a panic inside `create`) must not call
+    /// this: a live session may hold the allocation.
+    pub(crate) fn report_unspawned(&self, door: &str, error: &str) {
+        let door_name = door.to_string();
+        self.report_unspawned_with(door, error, move |agent_id, reason| {
+            match tokio::runtime::Handle::try_current() {
+                Ok(handle) => {
+                    handle.spawn(async move {
+                        crate::agent_runtime::report_terminal_spawn_failed(agent_id, &reason).await;
+                    });
+                }
+                Err(_) => warn!(
+                    "{door_name}: no async runtime to report allocation {agent_id} \
+                     spawn-failed on; it stays `allocated` until reclaim finds it"
+                ),
+            }
+        });
+    }
+
+    /// [`Self::report_unspawned`] with the poster injected — the test seam.
+    /// Logs each worktree, then calls `post` once with the allocation's agent
+    /// id and the error, and returns `true`; an `agent_id` that is not a uuid
+    /// posts nothing, logs, and returns `false`.
+    pub(crate) fn report_unspawned_with(
+        &self,
+        door: &str,
+        error: &str,
+        post: impl FnOnce(uuid::Uuid, String),
+    ) -> bool {
+        for worktree in &self.worktrees {
+            warn!(
+                "{door}: terminal create failed after allocation {} ({} at {}); \
+                 reporting it abandoned, best-effort",
+                self.agent_id,
+                worktree.repo,
+                worktree.worktree_path.display()
+            );
+        }
+        match uuid::Uuid::parse_str(&self.agent_id) {
+            Ok(agent_id) => {
+                post(agent_id, error.to_string());
+                true
+            }
+            Err(_) => {
+                warn!(
+                    "{door}: allocation agent_id {:?} is not a uuid; nothing is reported, \
+                     and its worktree stays until reclaim finds it",
+                    self.agent_id
+                );
+                false
+            }
+        }
+    }
+
     /// Grow primitive (Phase 1c, plan
     /// 2026-06-06-session-scoped-multi-repo-workspace-coordination):
     /// materialize ONE more repo's worktree, acquire its `kind=worktree`
@@ -2181,5 +2256,35 @@ mod tests {
         // Non-async test: drain before drop.
         ctx.active_claims.clear();
         ctx.worktrees.clear();
+    }
+
+    /// Plan `2026-11-08-…-leaves-the-tree-on-disk` Phase 0: an allocation
+    /// whose agent id is not a uuid cannot be keyed to coord's
+    /// `POST /agents/:id/spawn-failed`, so the report posts NOTHING and says so
+    /// in the log; a uuid agent id posts exactly once.
+    #[test]
+    fn a_non_uuid_agent_id_reports_nothing_and_logs_it() {
+        let (wt, _) = repo_fixture_at("qontinui-runner", PathBuf::from("/wt/x/qontinui-runner"));
+        let ctx = IsolatedEditContext::for_test_with_agent_id(
+            "not-a-uuid".to_string(),
+            vec![wt],
+            Vec::new(),
+        );
+        let mut posts = 0;
+        let (reported, logs) = crate::resource_guard::capture_logs(|| {
+            ctx.report_unspawned_with("test door", "refused", |_, _| posts += 1)
+        });
+        assert!(!reported);
+        assert_eq!(posts, 0, "a non-uuid agent id posts nothing");
+        assert!(
+            logs.contains("allocation agent_id \"not-a-uuid\" is not a uuid"),
+            "{logs}"
+        );
+
+        let id = uuid::Uuid::from_u128(0x5A5A);
+        let ctx = IsolatedEditContext::for_test_with_agent_id(id.to_string(), vec![], vec![]);
+        let mut posted = Vec::new();
+        assert!(ctx.report_unspawned_with("test door", "refused", |a, e| posted.push((a, e))));
+        assert_eq!(posted, vec![(id, "refused".to_string())]);
     }
 }

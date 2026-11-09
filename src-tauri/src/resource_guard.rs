@@ -3394,6 +3394,19 @@ where
     })
 }
 
+/// Test-only: the exact refusal text [`precheck_spawn`] and [`admit_spawn`]
+/// return on a CRITICAL verdict, produced by the real [`evaluate`] →
+/// [`critical_refusal`] pair over the shipped defaults with no free commit at
+/// all. For the doors that type this refusal, so a reworded producer cannot
+/// drift away from their answer silently.
+#[cfg(test)]
+pub(crate) fn critical_refusal_fixture(what: &str) -> String {
+    match evaluate("host", Some(0), &SessionGuardSettings::default()) {
+        SpawnGate::Critical(observation) => critical_refusal(what, &observation),
+        other => panic!("zero free commit must be CRITICAL under the defaults, got {other:?}"),
+    }
+}
+
 /// Test-only: run `f` with a scoped `tracing` subscriber and return what it
 /// logged at INFO and above. Scoped (`with_default`) rather than global because
 /// the harness runs tests in parallel and a global subscriber can be set once.
