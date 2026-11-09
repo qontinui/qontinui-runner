@@ -752,6 +752,11 @@ mod tests {
             c
         };
         cmd.env("TERM", "xterm-256color");
+        // An explicit cwd (coord finding d61a9247): without one portable-pty
+        // starts the child in the `USERPROFILE`/`$HOME` the builder captured,
+        // which a concurrent `IsolatedAmbient` points at a temp dir it deletes
+        // on drop, so the spawn fails or the shell refuses to run.
+        cmd.cwd(std::env::temp_dir());
         // Seed a credential so the seal is exercised on the production path,
         // not only in the unit test above.
         for name in crate::terminal::CREDENTIAL_VALUE_ENV_VARS {
@@ -830,6 +835,11 @@ mod tests {
             c
         };
         cmd.env("TERM", "xterm-256color");
+        // An explicit cwd (coord finding d61a9247): without one portable-pty
+        // starts the child in the `USERPROFILE`/`$HOME` the builder captured,
+        // which a concurrent `IsolatedAmbient` points at a temp dir it deletes
+        // on drop, so the spawn fails or the shell refuses to run.
+        cmd.cwd(std::env::temp_dir());
 
         let pane: Arc<dyn PaneIo> = Arc::new(
             LocalPty::open("paneio-exit-code-test", 80, 24)
