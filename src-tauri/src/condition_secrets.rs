@@ -2375,10 +2375,10 @@ mod tests {
         assert!(at("let active_origin = active_app_origin(&state).await;") < payloads);
         assert!(payloads < dispatch);
         // rustfmt wraps the refused arm in a block, so the arm and the refusal
-        // it answers with are pinned apart.
+        // it answers with are pinned apart, in order.
         let refused_arm = at("Err(refused) =>");
-        assert!(payloads < refused_arm && refused_arm < dispatch);
-        assert!(at("refused_action(&refused, \"the action was not dispatched\")") < dispatch);
+        let answer = at("refused_action(&refused, \"the action was not dispatched\")");
+        assert!(payloads < refused_arm && refused_arm < answer && answer < dispatch);
         let refusal = at("crate::condition_secrets::ipc_refusal(&body)");
         assert!(at("ipc_fallback_refusal(&e") < refusal);
         assert!(refusal < at("ui_bridge_request_sync("));
