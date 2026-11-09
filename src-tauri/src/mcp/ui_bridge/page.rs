@@ -1975,8 +1975,13 @@ const JS_WHITESPACE_CLASS_MEMBERS: &str = concat!(
 /// matching differently here than in the frontend: any other escape (`\w`,
 /// `\d`, `\S`, `\B`, `\<`, `\p`, …), `\b` inside a class (a backspace in JS),
 /// an unescaped `.` (JS's also stops at CR, U+2028 and U+2029), a brace, a
-/// `(?` group other than `(?:`, and inside a class a `[`, a doubled `&`, `-`
-/// or `~` (set operators in Rust) or a leading `]` (an empty class in JS).
+/// `(?` group other than `(?:`, inside a class a `[`, a doubled `&`, `-` or
+/// `~` (set operators in Rust), a leading `]` (an empty class in JS) or a `-`
+/// next to `\s` (JS reads `[\t-\s]` as three atoms, the translation would
+/// read a range), a negated class `[^`, and any non-ASCII character. The last
+/// two because JS without the `u` flag matches UTF-16 code units and Rust
+/// whole characters, so they differ on astral input: `/a[^b][^b]c/` matches
+/// "a", U+1F600, "c" in JS and not in Rust.
 fn compile_js_regex_source(source: &str) -> Result<regex::Regex, String> {
     let unsupported = |what: &str| {
         format!(
@@ -1989,11 +1994,20 @@ fn compile_js_regex_source(source: &str) -> Result<regex::Regex, String> {
     let mut in_class = false;
     let mut i = 0;
     while let Some(&c) = chars.get(i) {
+        if !c.is_ascii() {
+            return Err(unsupported(&format!("the non-ASCII character `{c}`")));
+        }
+        let prev = i.checked_sub(1).and_then(|p| chars.get(p)).copied();
         let next = chars.get(i + 1).copied();
         match c {
             '\\' => {
                 match next {
                     Some('b') if !in_class => rust.push_str(r"(?-u:\b)"),
+                    Some('s')
+                        if in_class && (prev == Some('-') || chars.get(i + 2) == Some(&'-')) =>
+                    {
+                        return Err(unsupported("a `-` next to `\\s` inside a class"));
+                    }
                     Some('s') if in_class => rust.push_str(JS_WHITESPACE_CLASS_MEMBERS),
                     Some('s') => {
                         rust.push('[');
@@ -2029,8 +2043,7 @@ fn compile_js_regex_source(source: &str) -> Result<regex::Regex, String> {
                 rust.push('[');
                 i += 1;
                 if chars.get(i) == Some(&'^') {
-                    rust.push('^');
-                    i += 1;
+                    return Err(unsupported("a negated class `[^`"));
                 }
                 if chars.get(i) == Some(&']') {
                     return Err(unsupported("a class that opens with `]`"));
@@ -2079,11 +2092,15 @@ fn evaluation_error(error_msg: &str) -> (StatusCode, Json<ApiResponse<()>>) {
 }
 
 /// The main-window direct-eval fallback of [`page_evaluate_inner`], behind the
-/// evaluate gate. The direct eval runs the caller's expression as a bare
+/// evaluate gate. The direct eval hands the caller's expression to a bare
 /// `eval()` that the frontend gate never sees, so without this check every
-/// guarded expression ran unguarded whenever the IPC call failed. An
-/// expression the gate refuses gets the frontend's own refusal, and `run` (the
-/// direct WebView eval in production) is never called for it.
+/// guarded expression was handed to an unguarded `eval()` whenever the IPC
+/// call failed. Whether that eval then runs depends on the page's CSP: the
+/// bundled `script-src 'self'` refused it on WebKitGTK, measured 2026-09-23
+/// (plan 2026-08-30-every-runner-credential-door-goes-through-one-csp-forbidden-eval,
+/// lines 596-600), and it is unmeasured on WebView2. An expression the gate
+/// refuses gets the frontend's own refusal, and `run` (the direct WebView eval
+/// in production) is never called for it.
 async fn direct_eval_fallback<F, Fut>(
     expression: &str,
     allow_network_requests: bool,
@@ -2467,7 +2484,9 @@ mod static_guard_hint_tests {
     /// refuses each construct whose Rust meaning differs from its JS one and
     /// that it does not translate, rather than passing it through. A pattern
     /// added to the gate that uses one therefore turns this red instead of
-    /// matching one way in the frontend and another on the fallback.
+    /// matching one way in the frontend and another on the fallback. The
+    /// refusal list holds one instance of each refused construct, and a
+    /// failure names every one that compiled, not just the first.
     #[test]
     fn the_translator_compiles_the_gate_and_refuses_what_it_cannot_reproduce() {
         for source in EVALUATE_STRUCTURAL_PATTERN_SOURCES
@@ -2489,16 +2508,94 @@ mod static_guard_hint_tests {
                 panic!("{source} means the same in both engines and must compile: {e}");
             }
         }
-        for source in [
-            r"\w", r"\W", r"\d", r"\D", r"\S", r"\B", r"\<", r"\>", r"\p{L}", r"\1", r"\é",
-            r"[\b]", "a\\", r"a.b", r"a{2}", r"(?i:a)", r"(?=a)", r"[[a]]", r"[a&&b]", r"[a--b]",
-            r"[a~~b]", r"[]a]", r"[^]a]",
-        ] {
-            assert!(
-                compile_js_regex_source(source).is_err(),
-                "{source} must be refused: its Rust meaning differs from its JS one"
-            );
+        let compiled: Vec<&str> = [
+            r"\w",
+            r"\W",
+            r"\d",
+            r"\D",
+            r"\S",
+            r"\B",
+            r"\<",
+            r"\>",
+            r"\p{L}",
+            r"\1",
+            r"\é",
+            r"[\b]",
+            "a\\",
+            r"a.b",
+            r"a{2}",
+            r"(?i:a)",
+            r"(?=a)",
+            r"[[a]]",
+            r"[a&&b]",
+            r"[a--b]",
+            r"[a~~b]",
+            r"[]a]",
+            r"[^]a]",
+            r"[^a]",
+            "a\u{1F600}c",
+            r"[\t-\s]",
+            r"[\s-]",
+        ]
+        .into_iter()
+        .filter(|source| compile_js_regex_source(source).is_ok())
+        .collect();
+        assert!(
+            compiled.is_empty(),
+            "each of these must be refused, its Rust meaning differs from its JS one: {compiled:?}"
+        );
+    }
+
+    /// `source` without its top-level `#[cfg(test)] mod … { … }` blocks. Each
+    /// opens at column 0 and, formatted by rustfmt, closes at the first line
+    /// after it that is a lone `}`.
+    fn strip_test_modules(source: &str) -> String {
+        let mut production = String::with_capacity(source.len());
+        let mut rest = source;
+        while let Some((before, after)) = rest.split_once("#[cfg(test)]\nmod ") {
+            production.push_str(before);
+            rest = after.split_once("\n}\n").map_or("", |(_, tail)| tail);
         }
+        production.push_str(rest);
+        production
+    }
+
+    /// The direct WebView eval is reached only through its gate. Outside its
+    /// test modules this file calls it exactly twice, in the closure
+    /// `page_evaluate_inner` hands `direct_eval_fallback` and in set-tab's
+    /// runner-built script, and `page_evaluate_inner`'s IPC-error branch
+    /// reaches it only inside its `direct_eval_fallback` call. Reverting that
+    /// branch to a direct call, or adding another direct call to this file,
+    /// turns this red. The needles are built with `concat!`, so this test's
+    /// own text never matches them.
+    #[test]
+    fn the_direct_eval_is_reached_only_through_the_gated_fallback() {
+        const PAGE_RS: &str = include_str!("page.rs");
+        const DIRECT_EVAL: &str = concat!("direct_webview_evaluate_", "with_result(");
+        const GATED_FALLBACK: &str = concat!("direct_eval_", "fallback(");
+        assert_eq!(
+            strip_test_modules(PAGE_RS).matches(DIRECT_EVAL).count(),
+            2,
+            "outside its test modules page.rs must call the direct eval exactly twice: \
+             the closure page_evaluate_inner hands direct_eval_fallback, and set-tab"
+        );
+        let (_, inner) = PAGE_RS
+            .split_once(concat!("async fn page_evaluate_", "inner("))
+            .expect("page.rs no longer defines page_evaluate_inner");
+        let inner = inner.split_once("\n}\n").map_or(inner, |(body, _)| body);
+        let (_, ipc_error_branch) = inner
+            .split_once("Err(ipc_err) =>")
+            .expect("page_evaluate_inner no longer has an `Err(ipc_err) =>` branch");
+        let fallback_at = ipc_error_branch
+            .find(GATED_FALLBACK)
+            .expect("page_evaluate_inner's IPC-error branch must call direct_eval_fallback");
+        assert!(
+            ipc_error_branch
+                .find(DIRECT_EVAL)
+                .is_none_or(|direct_at| direct_at > fallback_at),
+            "page_evaluate_inner's IPC-error branch must reach the direct eval only inside \
+             its direct_eval_fallback call"
+        );
     }
 
     /// The direct-eval fallback refuses what the gate refuses, with the
