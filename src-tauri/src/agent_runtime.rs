@@ -10599,7 +10599,7 @@ async fn run_agent_terminal(
         .and_then(crate::claude_session::launch_spec::sanitize_session_name);
     let title = spawn_name.clone().unwrap_or_else(|| {
         let id = agent_id.to_string();
-        format!("coord agent {}", &id[..8])
+        format!("coord agent {}", id.get(..8).unwrap_or(&id))
     });
 
     // The account the headless child would run under: the per-spawn pin when
