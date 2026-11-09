@@ -12378,12 +12378,20 @@ mod tests {
             // (one deferral stamp per row) reads as wedged and the backstop
             // pulls the list a second time beside it.
             let poll_body = replay_prod_fn_body(prod, &format!("async fn {poll}("));
+            // Cut at the loop's own closing brace (column 4), so a note moved
+            // to after the loop, one step per poll instead of per row, fails.
+            // The newline is appended because a loop that is the fn's last
+            // statement ends the extracted body with no newline after its `}`.
             let (_, rows) = poll_body
                 .split_once("for row in body.pending {")
                 .unwrap_or_else(|| panic!("{poll} loops over its rows"));
+            let rows = format!("{rows}\n");
+            let (loop_body, _) = rows
+                .split_once("\n    }\n")
+                .unwrap_or_else(|| panic!("{poll}'s row loop ends"));
             assert!(
-                rows.contains("PENDING_REPLAY.note_progress();"),
-                "{poll} notes a step per row: {rows}"
+                loop_body.contains("PENDING_REPLAY.note_progress();"),
+                "{poll} notes a step per row: {loop_body}"
             );
         }
         assert!(
