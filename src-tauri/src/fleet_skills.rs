@@ -466,19 +466,24 @@ pub(crate) fn provision_fleet_skills_into(
     // of the repo's own does not make it the bundle's source, and an
     // account-only skill is a path no commit of the repo will ever add, so it
     // is outside the roster the skip is confined to (provision_guard module doc).
-    let tracked = crate::provision_guard::TrackedPaths::probe(skills_dir).versioning(
-        resolved
-            .iter()
-            .zip(&sources)
-            .filter(|(skill, _)| registry.is_builtin(&skill.name))
-            .flat_map(|(skill, source)| {
-                source
-                    .files()
-                    .keys()
-                    .map(|rel| Path::new(skill.dir_name()).join(rel))
-                    .collect::<Vec<_>>()
-            }),
-    );
+    // The roster for a builtin is its EMBEDDED and CANONICAL file lists, never
+    // the resolved source's: an account override's extra file is a path no
+    // commit adds, and a sidecar the override drops is still one a commit can.
+    let mut roster: Vec<std::path::PathBuf> = Vec::new();
+    for skill in &resolved {
+        let Some(builtin) = registry.builtin(&skill.name) else {
+            continue;
+        };
+        let mut rels: std::collections::BTreeSet<&String> = builtin.files.keys().collect();
+        if let Some(c) = canonical.and_then(|c| c.skills.get(&skill.name)) {
+            rels.extend(c.files.keys());
+        }
+        roster.extend(
+            rels.into_iter()
+                .map(|rel| Path::new(skill.dir_name()).join(rel)),
+        );
+    }
+    let tracked = crate::provision_guard::TrackedPaths::probe(skills_dir).versioning(roster);
     let canonical_skills = sources
         .iter()
         .filter(|s| matches!(s, SkillSource::Canonical { .. }))
