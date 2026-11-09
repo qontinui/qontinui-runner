@@ -2954,10 +2954,13 @@ pub(crate) fn binding_gaps() -> BindingGapReport {
 //
 // Tauri `emit` has no replay and nothing guarantees a listener at emit time,
 // so an ask that exists only as an event is spent on nobody. The persisted
-// lapse record (`binding_gap_asks.json`) IS the ask: it carries the reason,
-// [`open_binding_gap_asks`] serves it to the UI by pull
-// (`get_binding_gap_asks`), and [`AUTONOMY_BINDING_GAP_EVENT`] is only a
-// nudge to re-read.
+// lapse record (`binding_gap_asks.json`, a [`GapAskRecord`] per tenant in an
+// open lapse) IS the ask: [`open_binding_gap_asks`] serves the opened asks
+// that still hold to the UI by pull (`get_binding_gap_asks`), and
+// [`AUTONOMY_BINDING_GAP_EVENT`] is only a nudge to re-read. Of the ask's
+// reason, the record holds only the seed attempt's outcome sentence, when
+// there was one. [`binding_gap_ask_reason`] builds the reason from today's
+// [`BINDING_GAP_ASK_REASON`] and that sentence each time the ask is served.
 //
 // ## And never on UNKNOWN, nor on a sidecar too stale to act on
 //
@@ -2999,8 +3002,10 @@ pub(crate) const BINDING_GAP_PAIR_CAVEAT: &str = "pairing binds this tenant to t
 
 /// The ask's operator-facing reason: today's [`BINDING_GAP_ASK_REASON`],
 /// plus what this lapse's seed attempt came to when there was one. Built each
-/// time the ask is shown rather than stored, so correcting the text corrects
-/// asks that are already open.
+/// time the ask is shown rather than stored, so correcting
+/// [`BINDING_GAP_ASK_REASON`] corrects asks that are already open. The
+/// `seed_outcome` sentence is stored on the record, so it keeps the wording of
+/// the build that ran the seed.
 pub(crate) fn binding_gap_ask_reason(seed_outcome: &str) -> String {
     if seed_outcome.is_empty() {
         BINDING_GAP_ASK_REASON.to_string()
@@ -3021,8 +3026,10 @@ pub(crate) fn binding_gap_ask_reason(seed_outcome: &str) -> String {
 ///
 /// Unknown fields are ignored on read, so a record written by an older build
 /// (which also carried `mint_attempted`, or a stored `reason`) still loads.
-/// The reason is not stored: [`binding_gap_ask_reason`] builds it when the
-/// ask is shown, so an ask opened by an older build shows today's text.
+/// The full reason is not stored: [`binding_gap_ask_reason`] builds it when
+/// the ask is shown, so an ask opened by an older build shows today's
+/// [`BINDING_GAP_ASK_REASON`], followed by its stored `seed_outcome` when it
+/// has one.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct GapAskRecord {
     /// True once the ask for this tenant in this lapse has been RECORDED —
@@ -13367,7 +13374,8 @@ mod tenant_slot_refresh_tests {
     /// The lapse record round-trips, a corrupt one fails SOFT toward "nobody
     /// asked yet", and a record written by an older build (one that carried
     /// `mint_attempted`, or a stored `reason` with since-corrected text) still
-    /// loads and serves TODAY's reason.
+    /// loads and serves TODAY's [`BINDING_GAP_ASK_REASON`] in place of that
+    /// stored `reason`, followed by the record's own `seed_outcome`.
     #[test]
     fn a_corrupt_or_legacy_lapse_record_fails_soft() {
         let path = gap_state_path("corrupt");
@@ -13409,7 +13417,8 @@ mod tenant_slot_refresh_tests {
         assert_eq!(
             open[0]["reason"],
             serde_json::json!(binding_gap_ask_reason("refused")),
-            "an open ask shows today's reason, not the text stored by the build that opened it"
+            "an open ask shows today's BINDING_GAP_ASK_REASON, not the reason stored by the \
+             build that opened it"
         );
     }
 
