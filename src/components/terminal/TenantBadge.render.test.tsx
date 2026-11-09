@@ -104,6 +104,33 @@ describe("TenantBadge per-zone identity", () => {
 });
 
 /**
+ * The display attributes (`tenantBadgeDisplayAttrs`) reach the REAL element on
+ * the per-zone badge. Their arms are unit-tested in `TenantBadge.test.ts`;
+ * this pins the spread itself, which a unit test of the helper cannot see. A
+ * UI Bridge read compares these, not the prose `title`.
+ */
+describe("TenantBadge display attributes on the rendered element", () => {
+  it("states the resolved display, and the acting tenant it did not take from the stamp", () => {
+    renderZones();
+    const badge = container.querySelector('[data-ui-bridge-id="terminal-tenant-badge-0"]');
+    expect(badge?.getAttribute("data-tenant-display-status")).toBe("resolved");
+    expect(badge?.getAttribute("data-tenant-display-source")).toBe("credential");
+    expect(badge?.getAttribute("data-tenant-acting")).toBe(ACTING);
+  });
+
+  it("states no display for a badge with no Claude session", () => {
+    act(() => {
+      root.render(createElement(TenantBadge, { tenantId: ACTING, zoneIndex: 0 }));
+    });
+    const badge = container.querySelector('[data-ui-bridge-id="terminal-tenant-badge-0"]');
+    expect(badge).not.toBeNull();
+    expect(badge?.hasAttribute("data-tenant-display-status")).toBe(false);
+    expect(badge?.hasAttribute("data-tenant-display-source")).toBe(false);
+    expect(badge?.hasAttribute("data-tenant-acting")).toBe(false);
+  });
+});
+
+/**
  * The no-session chain the single-zone strip relies on (plan D2): a stamped
  * plain shell has no Claude session, so the badge has no tenancy to read and
  * must render from its spawn stamp alone — and only on a multi-tenant device.
