@@ -7563,7 +7563,9 @@ async fn handle_page_evaluate(
 /// handler, in the SDK route's JSON envelope: the handler's body on success,
 /// and on an error its body with a 4xx tagged as a runner rejection
 /// (`failure_origin: "runner"`), so the journey ledger records nothing for it
-/// (e1), the control routes' own 4xx rule.
+/// (e1), the control routes' own 4xx rule. A 4xx that reports its action
+/// performed (`error_detail.context.action_dispatched: true`) is not tagged,
+/// which is that rule's exception too (`tag_runner_rejection`).
 fn runner_route_answer<E: Serialize>(
     result: Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<E>>)>,
 ) -> Json<serde_json::Value> {
@@ -8697,7 +8699,7 @@ mod tests {
     /// it delegates to the canonical `/control/page/click-by-*` handler and
     /// never emits the `click_by_text` / `click_by_selector` bridge messages,
     /// whose webview handlers ran a raw `el.click()` that no executor gate saw
-    /// (a click under a modal answered `clicked: true`). Proved from source,
+    /// (a click on a disabled button answered `clicked: true`). Proved from source,
     /// like `gated_handlers_ask_before_falling_back_to_ipc`.
     #[test]
     fn click_by_fallbacks_click_through_the_sdk_executor() {

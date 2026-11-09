@@ -1799,6 +1799,32 @@ mod wrap_ipc_result_tests {
         assert_eq!(effective_window_label("term-1"), "term-1");
     }
 
+    /// The test above holds only if the dispatch applies the rule: the
+    /// normalization must be the first statement of
+    /// `ui_bridge_request_sync_in_window`, so no later step (the readiness
+    /// wait, the pending key, the emit) sees the raw label. Proved from
+    /// source, as `click_by_fallbacks_click_through_the_sdk_executor` proves
+    /// its handlers' dispatch: driving the function needs a live webview.
+    #[test]
+    fn the_window_dispatch_normalizes_its_label_before_anything_else() {
+        let body = include_str!("request.rs")
+            .split("\npub async fn ui_bridge_request_sync_in_window(")
+            .nth(1)
+            .expect("ui_bridge_request_sync_in_window is defined in request.rs")
+            .split_once(") -> Result<serde_json::Value, String> {\n")
+            .map(|(_signature, body)| body)
+            .expect("its signature ends where it did");
+        let first_statement = body
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty() && !line.starts_with("//"));
+        assert_eq!(
+            first_statement,
+            Some("let window_label = effective_window_label(window_label);"),
+            "an empty label must address the main window before any step reads it"
+        );
+    }
+
     #[test]
     fn split_target_window_defaults_to_main_when_absent() {
         // No windowLabel → main, payload untouched (single-window default).

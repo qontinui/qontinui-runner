@@ -461,7 +461,11 @@ Two thread-through styles, mirroring the `tabId` split:
   attribute, and the action is aimed at that marker, not at a path the second
   round trip would re-resolve (content inserted above the target, or a
   virtualized list moving its rows after the scroll, can put another node at
-  the path by then). The marker is removed again on every path. So the action
+  the path by then). The marker is removed again on every path the handler
+  completes. A request abandoned mid-flight (the client disconnected) removes
+  nothing, and a resolution script the webview runs after the runner stopped
+  waiting for it can set its marker after the removal ran; the marker left
+  behind is inert, since no other request uses its value. So the action
   reaches the resolved node or none:
   - a target that left the page between the steps is an `ELEMENT_STALE` 4xx with
     `error_detail.context.action_dispatched: false`;
@@ -469,16 +473,26 @@ Two thread-through styles, mirroring the `tabId` split:
     marker (its `elementResolution.strategy` is not `element-identifier`) is an
     `ELEMENT_STALE` 4xx with `action_dispatched: true`, never a success. The
     SDK's success reply carries no tag, id or `data-testid` of the node it acted
-    on, so that strategy is the identity it can report;
+    on, so that strategy is the identity it can report. The journey ledger
+    records this 4xx, unlike the routes' others, as an attempted action that
+    failed (an `error` edge), on the control route and on its SDK twin's
+    fallback;
   - the SDK names the target by the marker's selector, which denotes nothing
     once removed, so every string of its reply names it by the reported
     `selector` instead.
 
   The click-by routes used to click inside the evaluated script (`el.click()`),
-  which no gate saw, so a click on an element under a modal answered
-  `clicked: true`. Now an SDK refusal (a disabled target, one that is not
-  visible, one another element covers) is a 4xx that keeps the SDK's
-  `failureDetails` under `data`. A click the executor performed answers
+  which no gate saw, so a click on a disabled button answered
+  `clicked: true`. Now a click the SDK executor refuses is a 4xx that keeps the
+  SDK's `failureDetails` under `data`. Its `error_detail.code` is
+  `ACTION_FAILED` (`RESNAPSHOT`) wherever the runner's message classifier
+  derives nothing more specific, the element route's code for the same
+  refusal; the same holds for a `type` the SDK refuses. In the pinned SDK
+  (0.36.0) the executor refuses a disabled target (the `disabled` property,
+  `aria-disabled`, `pointer-events: none`) and one that is not visible.
+  **A target another element covers is not refused yet:** until the SDK's
+  occlusion gate (its Phase 4) ships and the runner's pin moves (plan Phase 8),
+  a covered click still answers `clicked: true`. A click the executor performed answers
   `{clicked: true, tag, text, index, totalMatches, selector}` plus the SDK's
   `durationMs` and `consoleErrors`. Their `/ui-bridge/sdk/…` twins fall back to
   these same handlers when no SDK app is connected. For `type-into`, the SDK's

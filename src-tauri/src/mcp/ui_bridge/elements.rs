@@ -971,9 +971,10 @@ type ActionResult = Result<
 ///
 /// It keeps the failure payload ([`wrap_ipc_result_keeping_failure_data`]).
 /// An SDK `{success: false}` carries its whole diagnosis there:
-/// `failureDetails` (the canonical `errorCode`, the covering element
-/// `occludedBy` / `occludedPct` of a refused click, the recovery suggestions)
-/// and a failed `hoverClick`'s `forcedHover`. The flat [`wrap_ipc_result`]
+/// `failureDetails` (the canonical `errorCode`, the recovery suggestions and,
+/// once the SDK's occlusion gate ships, the covering element `occludedBy` /
+/// `occludedPct` of a refused click) and a failed `hoverClick`'s
+/// `forcedHover`. The flat [`wrap_ipc_result`]
 /// these routes used to call dropped all of it, so the caller got only the
 /// code the runner re-derives from the message. That code is unchanged: both
 /// wraps classify the same verdict, and only the `data` sibling differs.
@@ -4217,8 +4218,8 @@ pub(crate) async fn ui_bridge_click_by_selector_handler_dispatch(
 }
 
 /// The candidates `click-by-text` resolves among, in document order: the
-/// visible `tag` elements whose trimmed text equals `text` (`exact`) or
-/// contains it, case-insensitively.
+/// visible `tag` elements whose trimmed text equals `text` case-sensitively
+/// (`exact`), or else contains it case-insensitively.
 fn click_by_text_find_expr(text: &str, tag: &str, exact: bool) -> String {
     let escaped_text = text.replace('\\', "\\\\").replace('\'', "\\'");
     let escaped_tag = tag.replace('\\', "\\\\").replace('\'', "\\'");
@@ -4246,8 +4247,12 @@ fn click_by_selector_find_expr(selector: &str) -> String {
 }
 
 /// The action a click-by route asks the SDK executor for: the `click` the
-/// element route sends, so the executor's gates (a disabled target, one that is
-/// not visible, one another element covers) apply exactly as they do there.
+/// element route sends, so the executor's click gates apply exactly as they do
+/// there. In the pinned SDK (0.36.0) they refuse a disabled target (the
+/// `disabled` property, `aria-disabled`, `pointer-events: none`) and one that is
+/// not visible. They do not refuse a target another element covers: until the
+/// SDK's occlusion gate (its Phase 4) ships and the runner's pin moves (plan
+/// Phase 8), a covered click still answers `clicked: true`.
 fn click_action() -> serde_json::Value {
     serde_json::json!({ "action": "click" })
 }
@@ -4258,10 +4263,11 @@ fn click_action() -> serde_json::Value {
 /// the same three steps `type-into` takes.
 ///
 /// The routes used to click inside the evaluated script itself (`el.click()`),
-/// where no executor gate ever ran: a click on an element under a modal
-/// answered `clicked: true`. A resolved miss is still the documented HTTP 200
-/// carrying `clicked: false` (CONTRACT.md, "Still open"). An SDK refusal is a
-/// 4xx that keeps the SDK's `failureDetails` ([`click_by_response`]).
+/// where no executor gate ever ran: a click on a disabled button answered
+/// `clicked: true`. A resolved miss is still the documented HTTP 200
+/// carrying `clicked: false` (CONTRACT.md, "Still open"). An SDK refusal (which
+/// clicks the SDK refuses is [`click_action`]'s to say) is a 4xx that keeps the
+/// SDK's `failureDetails` ([`click_by_response`]).
 async fn click_resolved_element(
     state: &Arc<ApiState>,
     route: &str,
@@ -4622,6 +4628,18 @@ impl MarkedTarget {
             _ => format!("{tag} at {selector}"),
         }
     }
+
+    /// The target as a typed failure's `error_detail.context.resolved` names
+    /// it: what step 1 found, and the selector the route reports.
+    fn context_record(&self) -> serde_json::Value {
+        serde_json::json!({
+            "tag": self.resolved.get("tag"),
+            "id": self.resolved.get("id"),
+            "testId": self.resolved.get("testId"),
+            "text": self.resolved.get("text"),
+            "selector": self.reported_selector(),
+        })
+    }
 }
 
 /// How the first two steps of a two-step page route ended.
@@ -4643,11 +4661,15 @@ enum ResolvedAction {
 ///    ([`element_path_resolve_js`] with a [`new_target_marker`]).
 /// 2. Send `action` to the SDK executor, aimed at the marked node
 ///    ([`marked_action_payload`]), so every executor gate applies.
-/// 3. Release the marker ([`release_target_marker`]) on every path once step 1
-///    was attempted: a hit, a miss, an evaluation that failed or answered
-///    something unparseable, and whatever step 2 answered. A miss marks
-///    nothing, but releasing after it costs one evaluation and spares every
-///    path an argument about how far the script got.
+/// 3. Release the marker ([`release_target_marker`]) on every path the handler
+///    completes once step 1 was attempted: a hit, a miss, an evaluation that
+///    failed or answered something unparseable, and whatever step 2 answered.
+///    A miss marks nothing, but releasing after it costs one evaluation and
+///    spares every path an argument about how far the script got. A handler
+///    that does not complete (its future dropped when the client disconnects)
+///    releases nothing, and a resolution script the webview runs after the
+///    runner stopped waiting for it can set its marker after the release ran.
+///    Either leaves an inert marker behind ([`release_target_marker`]).
 async fn resolve_then_act(
     state: &Arc<ApiState>,
     route: &str,
@@ -4751,7 +4773,8 @@ enum StaleTarget {
 /// action performed on that node, or the route's typed 4xx.
 ///
 /// - The reply goes through [`wrap_element_action_ipc`], so an SDK refusal is a
-///   4xx that keeps the SDK's `failureDetails` under `data`.
+///   4xx that keeps the SDK's `failureDetails` under `data`, coded the way the
+///   element route codes the same refusal ([`refused_action_failure`]).
 /// - The SDK names the target by the marker's selector, which denotes nothing
 ///   once the marker is released. Every string of its reply names the target
 ///   by the reported selector instead, as the route's own answer does.
@@ -4795,7 +4818,7 @@ fn marked_action_outcome(
                     body.data,
                 ))
             } else {
-                Err((status, Json(body)))
+                Err(refused_action_failure(route, action, target, status, body))
             }
         }
         Ok(Json(performed)) => {
@@ -4816,6 +4839,52 @@ fn marked_action_outcome(
             }
         }
     }
+}
+
+/// An SDK refusal on a two-step page route, coded the way the element route
+/// codes the same refusal ([`as_action_failure`]).
+///
+/// The runner's message classifier (`classify_transport_error`) recognises none
+/// of the SDK's refusal prose (`UB-ELEM-DISABLED`'s "element is disabled …",
+/// `UB-ELEM-NOT-VISIBLE`'s, a `type` aimed at a non-input element), so the wrap
+/// codes such a refusal `INTERNAL_ERROR` at HTTP 400, a runner fault, which it is
+/// not. At HTTP 400 that code is re-coded `ACTION_FAILED`, with its `RESNAPSHOT`
+/// recovery; a code the classifier did derive is kept. `error_detail.context`
+/// gains the route, the requested action and the resolved target. The SDK's
+/// payload stays under `data`. Any other status (the webview never answered, or
+/// a dependency answered badly) is returned unchanged, as the element route
+/// leaves it.
+fn refused_action_failure(
+    route: &str,
+    action: &str,
+    target: &MarkedTarget,
+    status: StatusCode,
+    mut body: ApiResponse<serde_json::Value>,
+) -> (StatusCode, Json<ApiResponse<serde_json::Value>>) {
+    if status == StatusCode::BAD_REQUEST {
+        if let Some(mut detail) = body.error_detail.take() {
+            if matches!(detail.code, super::types::UiBridgeErrorCode::InternalError) {
+                detail.code = super::types::UiBridgeErrorCode::ActionFailed;
+                detail.recovery = Some(super::types::recovery_hint_for(&detail.code));
+            }
+            let mut context = match detail.context.take() {
+                Some(serde_json::Value::Object(map)) => map,
+                _ => serde_json::Map::new(),
+            };
+            context
+                .entry("route")
+                .or_insert_with(|| serde_json::Value::String(route.to_string()));
+            context
+                .entry("requested_action")
+                .or_insert_with(|| serde_json::Value::String(action.to_string()));
+            context
+                .entry("resolved")
+                .or_insert_with(|| target.context_record());
+            detail.context = Some(serde_json::Value::Object(context));
+            body.error_detail = Some(detail);
+        }
+    }
+    (status, Json(body))
 }
 
 /// The typed 4xx of [`marked_action_outcome`]: `ELEMENT_STALE`, its message
@@ -4848,18 +4917,11 @@ fn stale_target_failure(
             Some(strategy),
         ),
     };
-    let resolved = &target.resolved;
     let mut context = serde_json::json!({
         "route": route,
         "requested_action": action,
         "action_dispatched": dispatched,
-        "resolved": {
-            "tag": resolved.get("tag"),
-            "id": resolved.get("id"),
-            "testId": resolved.get("testId"),
-            "text": resolved.get("text"),
-            "selector": target.reported_selector(),
-        },
+        "resolved": target.context_record(),
     });
     if let Some(strategy) = strategy {
         context["sdk_resolution_strategy"] = serde_json::Value::String(strategy);
@@ -5975,6 +6037,42 @@ mod type_into_tests {
         assert!(
             !js.contains("setAttribute"),
             "the release sets nothing: {js}"
+        );
+    }
+
+    /// `resolve_then_act` releases the marker on every path it completes: its
+    /// top-level statements are steps 1 and 2 with no `?` that could leave the
+    /// function before the release, then the release itself, unconditional, then
+    /// the outcome. Proved from source, as `click_by_fallbacks_click_through_the_sdk_executor`
+    /// proves its handlers' dispatch: the steps need a live webview.
+    #[test]
+    fn resolve_then_act_releases_the_marker_on_every_path_it_completes() {
+        let body = include_str!("elements.rs")
+            .split("\nasync fn resolve_then_act(")
+            .nth(1)
+            .expect("resolve_then_act is defined in elements.rs")
+            .split("\n}\n")
+            .next()
+            .unwrap_or_default()
+            .split_once(")> {\n")
+            .map(|(_signature, body)| body)
+            .expect("resolve_then_act's signature ends where it did");
+        let top_level: Vec<&str> = body
+            .lines()
+            .filter(|line| line.starts_with("    ") && !line.starts_with("     "))
+            .map(str::trim)
+            .collect();
+        assert_eq!(
+            top_level,
+            [
+                "let marker = new_target_marker();",
+                "let outcome = resolve_mark_and_act(",
+                ")",
+                ".await;",
+                "release_target_marker(state, route, &marker, window_label).await;",
+                "outcome",
+            ],
+            "resolve_then_act must release unconditionally between steps 1-2 and the return"
         );
     }
 
@@ -7980,10 +8078,10 @@ mod element_action_failure_payload_tests {
     //! the same `execute_action` IPC.
     //!
     //! Both routes used to flatten that reply through `wrap_ipc_result`, which
-    //! drops it: `failureDetails` (the SDK's canonical `errorCode`, the element
-    //! covering a refused click, the recovery suggestions) never reached the
-    //! caller, and the only code left was the one the runner re-derives from
-    //! the message.
+    //! drops it: `failureDetails` (the SDK's canonical `errorCode`, the recovery
+    //! suggestions and, once the SDK's occlusion gate ships, the element
+    //! covering a refused click) never reached the caller, and the only code
+    //! left was the one the runner re-derives from the message.
     //!
     //! The routes need an `ApiState` (a live Tauri `AppHandle`) that no unit
     //! test can build, so these tests enter at the seam both routes send every
@@ -8013,10 +8111,14 @@ mod element_action_failure_payload_tests {
         })
     }
 
-    /// The SDK executor's response to a click it refused because another
-    /// element covers every sampled point of the target (Phase 4:
-    /// `buildActionFailureDetails('UB-ELEM-BLOCKED', …)` with `occludedBy` and
-    /// `occludedPct`). Shaped like the executor's failure return and the SDK's
+    /// The response the SDK executor will give, once its occlusion gate
+    /// (ui-bridge Phase 4) ships, to a click it refuses because another element
+    /// covers every sampled point of the target
+    /// (`buildActionFailureDetails('UB-ELEM-BLOCKED', …)` with `occludedBy` and
+    /// `occludedPct`). The pinned 0.36.0 has no such gate and performs that
+    /// click; the wrap forwards whatever `failureDetails` the SDK sends, so this
+    /// is the payload it will carry once the gate ships. Shaped like the
+    /// executor's failure return and the SDK's
     /// `ActionFailureDetails` (`core/types.ts`), with the catalog's recovery
     /// template for the code (`diagnostics/codes.json`, its "Close the modal or
     /// popup" entry without the `command` the plan's B-D10 drops).
@@ -8166,6 +8268,18 @@ mod element_action_failure_payload_tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         let wire = serde_json::to_value(&body).unwrap();
         assert_eq!(wire["error"], json!(message), "{wire}");
+        // An action failure, as the element route codes the same refusal, never
+        // the classifier's `INTERNAL_ERROR` fallthrough for prose it does not know.
+        assert_eq!(
+            wire.pointer("/error_detail/code"),
+            Some(&json!("ACTION_FAILED")),
+            "{wire}"
+        );
+        assert_eq!(
+            wire.pointer("/error_detail/context/route"),
+            Some(&json!("type-into")),
+            "{wire}"
+        );
         assert_eq!(
             wire.pointer("/data/failureDetails/errorCode"),
             Some(&json!("UB-ACTION-FAILED")),
@@ -8191,8 +8305,10 @@ mod click_by_routes_tests {
     //! click THROUGH THE SDK EXECUTOR (plan
     //! `2026-11-06-a-ui-action-counts-as-user-evidence-only-when-a-user-could-have-performed-it`).
     //! They used to click inside the evaluated script (`el.click()`), where no
-    //! executor gate ran, so a click on a disabled button or on one under a
-    //! modal answered `clicked: true`: user evidence no user could produce.
+    //! executor gate ran, so a click on a disabled button answered
+    //! `clicked: true`: user evidence no user could produce. (A target another
+    //! element covers is refused only once the SDK's occlusion gate ships and
+    //! the runner's pin moves; `covered_refusal` is the answer it will give.)
     //!
     //! The click is aimed at the node the resolution step MARKED, not at a path
     //! re-resolved in the click's own IPC round trip, and a reply showing the
@@ -8206,7 +8322,7 @@ mod click_by_routes_tests {
     use super::{
         click_action, click_by_miss, click_by_response, click_by_selector_find_expr,
         click_by_text_find_expr, element_path_resolve_js, marked_action_payload, Json,
-        MarkedTarget,
+        MarkedTarget, StatusCode,
     };
     use crate::mcp::ui_bridge::request::extract_response_data;
     use serde_json::json;
@@ -8286,8 +8402,10 @@ mod click_by_routes_tests {
         })
     }
 
-    /// The executor's refusal of a click on a button another element covers at
-    /// every sampled point (`UB-ELEM-BLOCKED`, the plan's Phase 4).
+    /// The refusal the executor will give, once the SDK's occlusion gate
+    /// (ui-bridge Phase 4) ships and the runner's pin moves (plan Phase 8), of a
+    /// click on a button another element covers at every sampled point
+    /// (`UB-ELEM-BLOCKED`). The pinned 0.36.0 performs that click.
     fn covered_refusal() -> serde_json::Value {
         let message = format!(
             "Element '{MARKER_SELECTOR}' is blocked: div#modal-overlay covers every sampled point"
@@ -8397,6 +8515,54 @@ mod click_by_routes_tests {
             .unwrap()
             .to_string()
             .contains("\"clicked\":true"));
+    }
+
+    /// An SDK refusal is an action failure, coded the way the element route
+    /// codes the same refusal (`as_action_failure`). The runner's message
+    /// classifier knows none of the SDK's refusal prose, so the wrap hands the
+    /// route `INTERNAL_ERROR`, a runner fault; the route answers
+    /// `ACTION_FAILED` with the `RESNAPSHOT` recovery, the resolved target in
+    /// `error_detail.context`, and the SDK's payload still under `data`.
+    #[test]
+    fn click_by_route_answers_an_sdk_refusal_as_action_failed() {
+        let (status, Json(body)) = click_by_response(
+            "click-by-selector",
+            &save_button(),
+            sdk_reply(disabled_refusal()),
+        )
+        .expect_err("a click the SDK refused is a failure");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let wire = serde_json::to_value(&body).unwrap();
+        assert_eq!(
+            wire.pointer("/error_detail/code"),
+            Some(&json!("ACTION_FAILED")),
+            "{wire}"
+        );
+        assert_eq!(
+            wire.pointer("/error_detail/recovery"),
+            Some(&json!("RESNAPSHOT")),
+            "{wire}"
+        );
+        let context = &wire["error_detail"]["context"];
+        assert_eq!(context["route"], json!("click-by-selector"), "{wire}");
+        assert_eq!(context["requested_action"], json!("click"), "{wire}");
+        assert_eq!(context["resolved"]["selector"], json!("#save"), "{wire}");
+        assert_eq!(context["resolved"]["tag"], json!("BUTTON"), "{wire}");
+        assert!(
+            context.get("action_dispatched").is_none(),
+            "a refusal claims nothing about what reached the UI: {wire}"
+        );
+        // The SDK's own message and diagnosis are the caller's to read.
+        assert_eq!(
+            wire["error"],
+            json!("element is disabled (disabled attribute); click was not dispatched"),
+            "{wire}"
+        );
+        assert_eq!(
+            wire.pointer("/data/failureDetails/errorCode"),
+            Some(&json!("UB-ELEM-DISABLED")),
+            "{wire}"
+        );
     }
 
     #[test]
