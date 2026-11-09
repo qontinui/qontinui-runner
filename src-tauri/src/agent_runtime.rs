@@ -1514,12 +1514,16 @@ async fn connect_and_pump(
     // (see [`KEEPALIVE_INTERVAL_SECS`]) would be running against this replay, and
     // not `ws.next()`, so live frames would wait behind it. A frame and a poll
     // racing for one gate is the ordinary case the in-process claim already
-    // arbitrates, and the capacity-kick re-poll spawns this same pair.
+    // arbitrates.
     //
-    // Coalesced across reconnects ([`start_connect_replay`]): a WS flap that
-    // reconnects while a replay is still running asks it for one more pass
+    // Coalesced with every other trigger ([`request_pending_replay`]): a WS flap
+    // that reconnects while a replay is still running asks it for one more pass
     // instead of stacking a second pull of the same list on one slow link.
-    start_connect_replay(device_id);
+    request_pending_replay(
+        device_id,
+        ReplayTrigger::Connect,
+        &tokio::runtime::Handle::current(),
+    );
 
     let mut keepalive = tokio::time::interval(Duration::from_secs(KEEPALIVE_INTERVAL_SECS));
     keepalive.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -4484,10 +4488,15 @@ impl Drop for AnchorReservation {
 /// exited by the time `spawned` was posted.
 ///
 /// Drops the exited terminal from the live continuation registry and — only if
-/// it WAS a registered continuation session — kicks an immediate
-/// [`poll_pending_continuations`] so a previously-deferred (load-pressure) continuation
-/// drains promptly into the freed slot instead of waiting for an unrelated WS
-/// reconnect.
+/// it WAS a registered continuation session — asks for an immediate
+/// pending-list replay ([`request_pending_replay`]) so a previously-deferred
+/// (load-pressure) continuation drains promptly into the freed slot instead of
+/// waiting for an unrelated WS reconnect. When a replay is already running,
+/// the request is one more pass after it, so the drain waits out the rest of
+/// that pass rather than racing it with a second pull of the same list. That
+/// is usually one pull (bounded at [`PENDING_LIST_FETCH_TIMEOUT`]) and its rows,
+/// but a pass that stamps a deferral on every row of a long refused backlog can
+/// run for minutes.
 ///
 /// **Ordinary operator tabs never trigger a poll.** An operator tab is not in
 /// the continuation registry, so the deregister below misses and this returns
@@ -4562,10 +4571,9 @@ pub(crate) fn notify_continuation_terminal_exit(
     let Some(device_id) = local_device_id else {
         return;
     };
-    handle.spawn(async move {
-        poll_pending_continuations(device_id).await;
-        poll_pending_unit_dispatches(device_id).await;
-    });
+    // Coalesced: a burst of exits asks a running replay for one more pass, which
+    // starts after this slot freed, instead of each pulling the whole list.
+    request_pending_replay(device_id, ReplayTrigger::CapacityFreed, handle);
 }
 
 /// Fire the runner-side work-outcome fallback for one ended continuation, if it
@@ -5151,17 +5159,40 @@ async fn continuation_backstop_poll_loop(device_id: uuid::Uuid) {
     let secs = continuation_backstop_poll_secs();
     let mut interval = tokio::time::interval(Duration::from_secs(secs));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // Skip the immediate first tick — the WS-connect catch-up poll
-    // (`poll_pending_continuations` on connect) covers startup.
+    // Skip the immediate first tick — the WS-connect replay covers startup.
     interval.tick().await;
+    let wedged_after = Duration::from_secs(secs).max(REPLAY_WEDGED_AFTER);
     loop {
         interval.tick().await;
         debug!(
             "agent_runtime: backstop poll firing (every {secs}s, always armed) \
              for device_id={device_id}"
         );
-        poll_pending_continuations(device_id).await;
-        poll_pending_unit_dispatches(device_id).await;
+        // Through the coalescer, then wait (bounded) for the replay to go idle,
+        // so a slow replay delays the next tick rather than stacking requests.
+        let progress_before = PENDING_REPLAY.progress();
+        request_pending_replay(
+            device_id,
+            ReplayTrigger::Backstop,
+            &tokio::runtime::Handle::current(),
+        );
+        let settled = tokio::time::timeout(wedged_after, PENDING_REPLAY.idle())
+            .await
+            .is_ok();
+        // The wedge arm. Every other trigger shares the coalescer's state, so a
+        // replay that never ends would silence them all; the backstop stays an
+        // independent safety net by running a pass itself when the replay has
+        // completed no step (no pull, no row, no pass) in the whole wait. A
+        // replay that is slow but stepping, e.g. one stamping a deferral on
+        // every row of a long refused list, is left alone.
+        if replay_wedged(settled, progress_before, PENDING_REPLAY.progress()) {
+            warn!(
+                "agent_runtime: the pending-list replay made no progress in {}s; the \
+                 backstop runs a pass itself for device_id={device_id}",
+                wedged_after.as_secs()
+            );
+            pending_list_pass(device_id).await;
+        }
     }
 }
 
@@ -5624,98 +5655,272 @@ enum DispatchOutcome {
 /// still only a missed poll, retried on the next tick.
 const PENDING_LIST_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Coalesces the on-connect replay across reconnects. A WS flap reconnects on a
-/// 2 s doubling backoff. Unguarded, each connect would start its own pull of the
+/// Coalesces every pull of the pending lists into one replay at a time. A WS
+/// flap reconnects on a 2 s doubling backoff, a burst of continuation exits
+/// kicks one re-poll each, and the backstop and runtime-ready catch-up tick on
+/// their own clocks. Unguarded, each of those would start its own pull of the
 /// same list: the pulls split one slow link, each is more likely to hit the
 /// bound, and the last to finish (possibly a `fetch_failed` one) overwrites
 /// coord's per-device poll report. A plain skip would be worse: a row coord
-/// dispatched while the WS was down is missing from the list a running replay
-/// already took, so a connect that arrives mid-replay asks for one more pass
-/// rather than none.
+/// dispatched (or a slot that freed) after a running replay took its list is
+/// missing from that list, so a request that arrives mid-replay asks for one
+/// more pass rather than none.
 ///
-/// Only the on-connect replay goes through it. The backstop loop, the
-/// capacity-kick re-poll and the runtime-ready catch-up still call the polls
-/// directly and can overlap a replay, as they always could.
+/// Every trigger goes through it ([`request_pending_replay`]), so the two polls
+/// never run concurrently with themselves. The one exception is the backstop's
+/// wedge arm ([`continuation_backstop_poll_loop`]), which runs a pass itself
+/// when the coalesced replay has made no progress for [`REPLAY_WEDGED_AFTER`].
+///
+/// One atomic state word, so every transition is a single atomic step:
+/// [`Self::IDLE`] (no replay), [`Self::RUNNING`] (a replay is running and owes
+/// no pass) and [`Self::OWED`] (a replay is running, or is being started, and
+/// owes a pass). The ordering is SeqCst throughout: a request that lands
+/// between the replay's last `take_pass` and its `release` is kept only because
+/// `release` sees it.
 struct ReplayCoalescer {
-    in_flight: std::sync::atomic::AtomicBool,
-    rerun: std::sync::atomic::AtomicBool,
+    state: std::sync::atomic::AtomicU8,
+    /// Woken when a replay ends (released or abandoned), for [`Self::idle`].
+    ended: tokio::sync::Notify,
+    /// Steps completed so far: each pull, each row, each pass. The backstop
+    /// reads it to tell a replay that is slow (still stepping) from one that is
+    /// wedged (no step in a whole wait).
+    progress: std::sync::atomic::AtomicU64,
 }
 
 impl ReplayCoalescer {
+    const IDLE: u8 = 0;
+    const RUNNING: u8 = 1;
+    const OWED: u8 = 2;
+
     const fn new() -> Self {
         Self {
-            in_flight: std::sync::atomic::AtomicBool::new(false),
-            rerun: std::sync::atomic::AtomicBool::new(false),
+            state: std::sync::atomic::AtomicU8::new(Self::IDLE),
+            ended: tokio::sync::Notify::const_new(),
+            progress: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
-    /// A connect asks for a replay. `true`: the caller starts one. `false`: one
-    /// is running, and it will make another pass for this request.
+    /// The running replay completed a step (a pull, a row, a pass).
+    fn note_progress(&self) {
+        self.progress.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// How many steps have completed, for comparing across a wait.
+    fn progress(&self) -> u64 {
+        self.progress.load(Ordering::SeqCst)
+    }
+
+    /// A trigger asks for a replay. `true`: none was running, and the caller
+    /// starts one (which owes this pass). `false`: one is running, and it will
+    /// make another pass for this request.
     fn request(&self) -> bool {
-        self.rerun.store(true, Ordering::SeqCst);
-        self.in_flight
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
+        self.state.swap(Self::OWED, Ordering::SeqCst) == Self::IDLE
     }
 
     /// The running replay asks whether a pass is owed (and consumes the request).
     fn take_pass(&self) -> bool {
-        self.rerun.swap(false, Ordering::SeqCst)
+        self.state
+            .compare_exchange(
+                Self::OWED,
+                Self::RUNNING,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
     }
 
-    /// The running replay found no pass owed. It releases the flag and then looks
-    /// once more: a request made after its last `take_pass` found the flag still
-    /// held and returned `false`, so it must not be dropped. `true`: the replay
-    /// took the flag back and keeps running.
+    /// The running replay found no pass owed and ends, unless a request landed
+    /// after its last `take_pass`: then the state is `OWED`, the replay keeps
+    /// running (`true`) and makes that pass.
     fn release(&self) -> bool {
-        self.in_flight.store(false, Ordering::SeqCst);
-        self.rerun.load(Ordering::SeqCst)
-            && self
-                .in_flight
-                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
+        match self.state.compare_exchange(
+            Self::RUNNING,
+            Self::IDLE,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => {
+                self.ended.notify_waiters();
+                false
+            }
+            Err(Self::OWED) => true,
+            // Only the running replay releases or abandons, so `IDLE` here is
+            // unreachable; ending is the safe reading of it.
+            Err(_) => {
+                self.ended.notify_waiters();
+                false
+            }
+        }
     }
 
-    /// A replay that panicked gives the flag up, so the next connect can start one.
-    fn abandon(&self) {
-        self.in_flight.store(false, Ordering::SeqCst);
+    /// A replay that panicked, or that the runtime dropped before or while it
+    /// ran, gives the state up so the next request can start one. A pass it
+    /// still owed is dropped with it and its waiters are released: the next
+    /// request, from any trigger, runs it. Returns whether a pass was owed.
+    fn abandon(&self) -> bool {
+        let owed = self.state.swap(Self::IDLE, Ordering::SeqCst) == Self::OWED;
+        self.ended.notify_waiters();
+        owed
+    }
+
+    /// Resolves once no replay is running and no pass is owed: at once when
+    /// that already holds, else when the running replay ends after every extra
+    /// pass a request asked it for. So a trigger that requested a pass and then
+    /// waits here resumes after a pass that started after its request has
+    /// completed, or after the replay was abandoned.
+    async fn idle(&self) {
+        loop {
+            // Registered before the state is read, so an end between the read
+            // and the await still wakes this waiter.
+            let ended = self.ended.notified();
+            let mut ended = std::pin::pin!(ended);
+            ended.as_mut().enable();
+            if self.state.load(Ordering::SeqCst) == Self::IDLE {
+                return;
+            }
+            ended.await;
+        }
     }
 }
 
-static CONNECT_REPLAY: ReplayCoalescer = ReplayCoalescer::new();
+/// The backstop's wedge decision: its bounded wait for the replay ran out
+/// (`settled` false) and the replay completed no step across the whole wait.
+/// A replay that is slow but stepping, or that went idle, is not wedged.
+fn replay_wedged(settled: bool, progress_before: u64, progress_after: u64) -> bool {
+    !settled && progress_before == progress_after
+}
 
-/// Replay what coord persisted while this runner was disconnected: the
-/// gate-continuation list, then the work-unit dispatches. SPAWNED, never
-/// awaited by the pump, and coalesced through [`CONNECT_REPLAY`].
-fn start_connect_replay(device_id: uuid::Uuid) {
-    if !CONNECT_REPLAY.request() {
-        debug!(
-            "agent_runtime: on-connect replay for device_id={device_id} coalesced into the \
-             one still running (it makes another pass)"
-        );
-        return;
+/// Run `pass` through `coalescer` on `handle`: start a replay task when none is
+/// running (`true`), else ask the running one for another pass (`false`). The
+/// replay loops until no pass is owed, counting each completed pass.
+///
+/// The abandon guard is built BEFORE the spawn and moved into the task, so it
+/// drops (and gives the flag up) however the task ends: a panicking pass, a
+/// task dropped at runtime shutdown, and a task the runtime drops without ever
+/// polling it because it was already shutting down. Built inside the task, that
+/// last case would leave the state running for the life of the process, and every
+/// later request would fold into a replay that does not exist.
+fn spawn_coalesced_replay<F, Fut>(
+    coalescer: &'static ReplayCoalescer,
+    handle: &tokio::runtime::Handle,
+    pass: F,
+) -> bool
+where
+    F: Fn() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send,
+{
+    if !coalescer.request() {
+        return false;
     }
-    tokio::spawn(async move {
-        // Gives the flag up when the task unwinds (a poll panicked) or is dropped
-        // at runtime shutdown; a normal exit releases it below instead.
-        struct AbandonOnPanic;
-        impl Drop for AbandonOnPanic {
-            fn drop(&mut self) {
-                CONNECT_REPLAY.abandon();
+    struct AbandonOnDrop(&'static ReplayCoalescer);
+    impl Drop for AbandonOnDrop {
+        fn drop(&mut self) {
+            if self.0.abandon() {
+                warn!(
+                    "agent_runtime: a pending-list replay ended without making a pass it owed \
+                     (a pass panicked, or the runtime dropped the task); the next request runs it"
+                );
             }
         }
-        let on_panic = AbandonOnPanic;
+    }
+    let guard = AbandonOnDrop(coalescer);
+    handle.spawn(async move {
         loop {
-            while CONNECT_REPLAY.take_pass() {
-                poll_pending_continuations(device_id).await;
-                poll_pending_unit_dispatches(device_id).await;
+            while coalescer.take_pass() {
+                pass().await;
+                coalescer.note_progress();
             }
-            if !CONNECT_REPLAY.release() {
+            if !coalescer.release() {
                 break;
             }
         }
-        std::mem::forget(on_panic);
+        // A normal end released the flag above; nothing left to abandon.
+        std::mem::forget(guard);
     });
+    true
+}
+
+/// The one coalescer every pending-list trigger goes through.
+static PENDING_REPLAY: ReplayCoalescer = ReplayCoalescer::new();
+
+/// What asked for a pending-list replay, named in its log lines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplayTrigger {
+    /// A fresh WS connect: what coord persisted while the WS was down.
+    Connect,
+    /// The periodic backstop tick ([`continuation_backstop_poll_loop`]).
+    Backstop,
+    /// A continuation terminal exited and freed a slot
+    /// ([`notify_continuation_terminal_exit`]).
+    CapacityFreed,
+    /// The presentation runtime became ready ([`spawn_runtime_ready_catch_up`]).
+    RuntimeReady,
+}
+
+impl ReplayTrigger {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Connect => "on-connect",
+            Self::Backstop => "backstop",
+            Self::CapacityFreed => "capacity-freed",
+            Self::RuntimeReady => "runtime-ready",
+        }
+    }
+}
+
+/// One pass over the pending lists: the gate-continuation list, then the
+/// work-unit dispatches. The only place either poll is called; every caller goes
+/// through [`request_pending_replay`], except the backstop's wedge arm.
+///
+/// Each poll, and each row inside one, notes a step on [`PENDING_REPLAY`], so
+/// the backstop's wedge decision reads a long pass that is still stepping as
+/// slow, not stuck.
+async fn pending_list_pass(device_id: uuid::Uuid) {
+    poll_pending_continuations(device_id).await;
+    PENDING_REPLAY.note_progress();
+    poll_pending_unit_dispatches(device_id).await;
+}
+
+/// How long a trigger waits for the pass it asked for, and how long the
+/// backstop waits before it treats a replay that has made NO progress as
+/// wedged. A pass can legitimately run for minutes: the first pass after boot,
+/// and the first each hour, stamps a deferral (a 5 s-bounded POST) on every row
+/// the registry or a drain refuses, and a backlog runs to hundreds of rows. But
+/// it steps at least once per pull (bounded at [`PENDING_LIST_FETCH_TIMEOUT`])
+/// and once per row, so a replay with no step in ten fetch bounds is stuck.
+const REPLAY_WEDGED_AFTER: Duration =
+    Duration::from_secs(10 * PENDING_LIST_FETCH_TIMEOUT.as_secs());
+
+/// Ask for a [`pending_list_pass`]. SPAWNED on `handle`, never awaited by the
+/// caller, and coalesced through [`PENDING_REPLAY`]: when a replay is already
+/// running this asks it for one more pass and returns, and that pass starts
+/// once the running one ends. A caller that needs the pass to have run awaits
+/// [`ReplayCoalescer::idle`] on [`PENDING_REPLAY`] afterwards, bounded by
+/// [`REPLAY_WEDGED_AFTER`].
+///
+/// `handle` rather than `tokio::spawn`: the capacity-freed trigger fires on the
+/// PTY waiter's bare OS thread, which has no runtime context.
+///
+/// A coalesced request is served under the running replay's `device_id`. Every
+/// trigger names this runner's one device: [`spawn_runtime`] reads
+/// `machine.json` once for the pump, the backstop and the catch-up, and the
+/// capacity-freed trigger reads the same file.
+fn request_pending_replay(
+    device_id: uuid::Uuid,
+    trigger: ReplayTrigger,
+    handle: &tokio::runtime::Handle,
+) {
+    let trigger = trigger.label();
+    if spawn_coalesced_replay(&PENDING_REPLAY, handle, move || {
+        pending_list_pass(device_id)
+    }) {
+        debug!("agent_runtime: {trigger} pending-list replay starting for device_id={device_id}");
+    } else {
+        debug!(
+            "agent_runtime: {trigger} pending-list replay for device_id={device_id} coalesced \
+             into the one still running (it makes another pass)"
+        );
+    }
 }
 
 /// Why a pending-list pull failed. A non-2xx status is kept as a status so a
@@ -5825,6 +6030,7 @@ async fn poll_pending_continuations(device_id: uuid::Uuid) {
     for row in body.pending {
         let (payload, delivery) = poll_row_delivery(row, listed_epoch);
         counts.record(dispatch_gate_continuation(payload, device_id, delivery).await);
+        PENDING_REPLAY.note_progress();
     }
     post_continuation_poll_report(device_id, counts).await;
 }
@@ -6099,6 +6305,7 @@ async fn poll_pending_unit_dispatches(device_id: uuid::Uuid) {
         // A unit dispatch has no gate-level re-delivery counter, so it is
         // keyed on its payload exactly like a WS frame.
         let _ = dispatch_gate_continuation(payload, device_id, ContinuationDelivery::Payload).await;
+        PENDING_REPLAY.note_progress();
     }
 }
 
@@ -6569,12 +6776,20 @@ fn spawn_runtime_ready_catch_up(device_id: uuid::Uuid) {
             // the first poll lands (that poll then skips it as already
             // dispatched), and a single GET can fail on a box still busy
             // booting. Unit dispatches are deferred by the same verdict.
+            //
+            // Each through the coalescer, waiting (bounded) for the pass it asked
+            // for before the spacing starts, so these stay several distinct
+            // passes even when the on-connect replay is running at the same time.
             for attempt in 0..RUNTIME_READY_CATCH_UP_POLLS {
                 if attempt > 0 {
                     tokio::time::sleep(RUNTIME_READY_CATCH_UP_SPACING).await;
                 }
-                poll_pending_continuations(device_id).await;
-                poll_pending_unit_dispatches(device_id).await;
+                request_pending_replay(
+                    device_id,
+                    ReplayTrigger::RuntimeReady,
+                    &tokio::runtime::Handle::current(),
+                );
+                let _ = tokio::time::timeout(REPLAY_WEDGED_AFTER, PENDING_REPLAY.idle()).await;
             }
         }
         std::future::pending::<()>().await;
@@ -12099,14 +12314,11 @@ mod tests {
     /// fetch bound against the ALB's ~60 s idle timer. A behavioural test would
     /// need a live WS peer, so this pins the wiring in the source, as
     /// `the_live_pre_checks_read_both_resource_lanes` does: the pump, up to its
-    /// `loop {`, starts the replay and awaits no poll, and the replay spawns both
-    /// polls inside its task, coalesced through `CONNECT_REPLAY`.
+    /// `loop {`, starts the replay and awaits no poll, and the replay spawns its
+    /// pass inside its task, coalesced through `PENDING_REPLAY`.
     #[test]
     fn the_pending_list_replay_on_connect_is_spawned_not_awaited() {
-        let source = include_str!("agent_runtime.rs");
-        let (prod, _) = source
-            .split_once("#[cfg(test)]\nmod tests")
-            .expect("the test module marker");
+        let prod = replay_prod_source();
         let (_, pump) = prod
             .split_once("async fn connect_and_pump(")
             .expect("connect_and_pump exists");
@@ -12114,35 +12326,57 @@ mod tests {
             .split_once("\n    loop {")
             .expect("the pump has its loop");
         assert!(
-            before_loop.contains("start_connect_replay(device_id);"),
+            before_loop.contains("request_pending_replay(")
+                && before_loop.contains("ReplayTrigger::Connect"),
             "the pump starts the replay: {before_loop}"
         );
         assert!(
-            !before_loop.contains("poll_pending_"),
+            !before_loop.contains("poll_pending_")
+                && !before_loop.contains("pending_list_pass(")
+                && !before_loop.contains(".idle()"),
             "a poll awaited by the pump holds it up: {before_loop}"
         );
-        let (_, starter) = prod
-            .split_once("fn start_connect_replay(")
-            .expect("start_connect_replay exists");
-        let (starter, _) = starter
-            .split_once("\n}\n")
-            .expect("the starter's body ends");
-        let (before_spawn, spawned) = starter
-            .split_once("tokio::spawn(async move {")
+        let starter = replay_prod_fn_body(prod, "fn request_pending_replay(");
+        assert!(
+            starter.contains("spawn_coalesced_replay(&PENDING_REPLAY")
+                && starter.contains("pending_list_pass(device_id)"),
+            "the replay is coalesced across triggers: {starter}"
+        );
+        let spawner = replay_prod_fn_body(prod, "fn spawn_coalesced_replay<");
+        let (before_spawn, spawned) = spawner
+            .split_once("handle.spawn(async move {")
             .expect("the replay is spawned");
         assert!(
-            before_spawn.contains("CONNECT_REPLAY.request()"),
-            "the replay is coalesced across reconnects: {before_spawn}"
-        );
-        assert!(!before_spawn.contains("poll_pending_"), "{before_spawn}");
-        assert!(
-            spawned.contains("poll_pending_continuations(device_id).await"),
-            "{spawned}"
+            before_spawn.contains("coalescer.request()"),
+            "the replay is coalesced: {before_spawn}"
         );
         assert!(
-            spawned.contains("poll_pending_unit_dispatches(device_id).await"),
-            "{spawned}"
+            before_spawn.contains("let guard = AbandonOnDrop(coalescer);"),
+            "the abandon guard is built before the spawn, so a task dropped unpolled \
+             still gives the flag up: {before_spawn}"
         );
+        assert!(!before_spawn.contains("pass()"), "{before_spawn}");
+        assert!(spawned.contains("pass().await"), "{spawned}");
+    }
+
+    /// The production half of this file, for the source pins below.
+    fn replay_prod_source() -> &'static str {
+        let source = include_str!("agent_runtime.rs");
+        source
+            .split_once("#[cfg(test)]\nmod tests")
+            .expect("the test module marker")
+            .0
+    }
+
+    /// The body of the first production fn whose text starts with `signature`,
+    /// up to its closing brace at column 0.
+    fn replay_prod_fn_body<'a>(prod: &'a str, signature: &str) -> &'a str {
+        let (_, rest) = prod
+            .split_once(signature)
+            .unwrap_or_else(|| panic!("{signature} exists"));
+        rest.split_once("\n}\n")
+            .unwrap_or_else(|| panic!("{signature}'s body ends"))
+            .0
     }
 
     /// A connect that arrives while a replay runs asks it for one more pass, and
@@ -12179,6 +12413,313 @@ mod tests {
         assert!(c.request());
         c.abandon();
         assert!(c.request(), "a panicked replay gives the flag up");
+    }
+
+    /// Every pull of the pending lists goes through the one coalescer. The two
+    /// polls are called in exactly one place, `pending_list_pass`. That pass is
+    /// called from the coalesced replay and from the backstop's wedge arm, and
+    /// nowhere else. Each trigger function asks for a replay under its own
+    /// trigger, and the two that wait for their pass wait (bounded) on `idle()`.
+    /// A trigger that called a poll directly again would put a second pull of the
+    /// same list on a slow link beside a running replay, which is what #2741's
+    /// coalescer exists to stop. Pinned in the source for the reason the test
+    /// above gives. The call counts match any `name(` call, whatever its
+    /// argument, less the `fn name(` definition; every doc comment here names
+    /// these fns in the bracket-link form, which has no `(`.
+    #[test]
+    fn every_pending_list_trigger_goes_through_the_coalescer() {
+        let prod = replay_prod_source();
+        let calls = |name: &str| {
+            prod.matches(&format!("{name}(")).count() - prod.matches(&format!("fn {name}(")).count()
+        };
+        let pass = replay_prod_fn_body(prod, "async fn pending_list_pass(");
+        for poll in ["poll_pending_continuations", "poll_pending_unit_dispatches"] {
+            assert_eq!(calls(poll), 1, "{poll} is called outside pending_list_pass");
+            assert!(
+                pass.contains(&format!("{poll}(device_id).await")),
+                "{poll} runs inside pending_list_pass"
+            );
+            // The wedge decision reads a slow pass as alive only because each
+            // row of each poll notes a step; without it a long refused backlog
+            // (one deferral stamp per row) reads as wedged and the backstop
+            // pulls the list a second time beside it.
+            let poll_body = replay_prod_fn_body(prod, &format!("async fn {poll}("));
+            let (_, rows) = poll_body
+                .split_once("for row in body.pending {")
+                .unwrap_or_else(|| panic!("{poll} loops over its rows"));
+            assert!(
+                rows.contains("PENDING_REPLAY.note_progress();"),
+                "{poll} notes a step per row: {rows}"
+            );
+        }
+        assert!(
+            pass.contains("PENDING_REPLAY.note_progress();"),
+            "pending_list_pass notes a step between its polls: {pass}"
+        );
+        assert_eq!(
+            calls("pending_list_pass"),
+            2,
+            "pending_list_pass runs only from the coalesced replay and the backstop's wedge arm"
+        );
+        assert!(
+            replay_prod_fn_body(prod, "fn request_pending_replay(")
+                .contains("pending_list_pass(device_id)"),
+            "the coalesced replay runs the pass"
+        );
+
+        let backstop = replay_prod_fn_body(prod, "async fn continuation_backstop_poll_loop(");
+        for wiring in [
+            "ReplayTrigger::Backstop",
+            "tokio::time::timeout(wedged_after, PENDING_REPLAY.idle())",
+            "replay_wedged(settled, progress_before, PENDING_REPLAY.progress())",
+            "pending_list_pass(device_id).await",
+        ] {
+            assert!(
+                backstop.contains(wiring),
+                "backstop lacks {wiring}: {backstop}"
+            );
+        }
+        let exit = replay_prod_fn_body(prod, "pub(crate) fn notify_continuation_terminal_exit(");
+        assert!(
+            exit.contains(
+                "request_pending_replay(device_id, ReplayTrigger::CapacityFreed, handle)"
+            ),
+            "the capacity-freed trigger asks for a replay: {exit}"
+        );
+        assert!(!exit.contains("pending_list_pass("), "{exit}");
+        let catch_up = replay_prod_fn_body(prod, "fn spawn_runtime_ready_catch_up(");
+        for wiring in [
+            "ReplayTrigger::RuntimeReady",
+            "tokio::time::timeout(REPLAY_WEDGED_AFTER, PENDING_REPLAY.idle())",
+        ] {
+            assert!(
+                catch_up.contains(wiring),
+                "catch-up lacks {wiring}: {catch_up}"
+            );
+        }
+        assert!(!catch_up.contains("pending_list_pass("), "{catch_up}");
+    }
+
+    /// A gate a test pass waits on, opened one pass at a time.
+    struct PassGate {
+        started: std::sync::atomic::AtomicUsize,
+        open: tokio::sync::Semaphore,
+    }
+
+    impl PassGate {
+        fn leak() -> &'static Self {
+            Box::leak(Box::new(Self {
+                started: std::sync::atomic::AtomicUsize::new(0),
+                open: tokio::sync::Semaphore::new(0),
+            }))
+        }
+
+        async fn pass(&'static self) {
+            self.started
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.open.acquire().await.expect("gate open").forget();
+        }
+
+        fn started(&self) -> usize {
+            self.started.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        async fn wait_started(&self, n: usize) {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while self.started() < n {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("pass {n} never started (started {})", self.started()));
+        }
+    }
+
+    fn leak_coalescer() -> &'static super::ReplayCoalescer {
+        Box::leak(Box::new(super::ReplayCoalescer::new()))
+    }
+
+    /// The real replay loop: requests made while a pass runs (a burst of exits,
+    /// a backstop tick) fold into ONE extra pass that starts after the running
+    /// one, never into a concurrent one, and a waiter on `idle()` resumes only
+    /// after that extra pass completes.
+    #[tokio::test]
+    async fn requests_during_a_pass_fold_into_one_later_pass_never_a_concurrent_one() {
+        let c = leak_coalescer();
+        let gate = PassGate::leak();
+        let handle = tokio::runtime::Handle::current();
+        let start = || super::spawn_coalesced_replay(c, &handle, move || gate.pass());
+
+        assert!(start(), "the first request starts the replay");
+        gate.wait_started(1).await;
+        assert!(!start(), "coalesced");
+        assert!(!start(), "coalesced");
+        let waiter = tokio::spawn(c.idle());
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(gate.started(), 1, "no concurrent pass");
+
+        gate.open.add_permits(1);
+        gate.wait_started(2).await;
+        assert!(!waiter.is_finished(), "the owed pass is still running");
+        gate.open.add_permits(1);
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+            .await
+            .expect("idle once the owed pass completes")
+            .expect("the waiter task");
+        assert_eq!(gate.started(), 2, "two requests, one extra pass");
+        assert_eq!(c.progress(), 2, "one step per completed pass");
+    }
+
+    /// A replay task the runtime drops without ever polling it (spawned onto a
+    /// runtime already shut down) still gives the flag up, so the next request
+    /// starts a replay instead of folding into one that does not exist.
+    #[tokio::test]
+    async fn a_replay_dropped_before_it_ran_gives_the_flag_up() {
+        let c = leak_coalescer();
+        // Built and dropped on a plain thread: a runtime cannot be dropped from
+        // inside this test's async context.
+        let dead_handle = std::thread::spawn(|| {
+            let dead = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("a runtime");
+            let handle = dead.handle().clone();
+            drop(dead);
+            handle
+        })
+        .join()
+        .expect("the runtime thread");
+        assert!(super::spawn_coalesced_replay(c, &dead_handle, || async {}));
+        tokio::time::timeout(std::time::Duration::from_secs(5), c.idle())
+            .await
+            .expect("the dropped task gave the flag up");
+        assert!(
+            c.request(),
+            "the next request starts a replay, not a fold into a dead one"
+        );
+    }
+
+    /// A pass that panics gives the flag up and releases waiters, and a request
+    /// after it starts a fresh replay.
+    #[tokio::test]
+    async fn a_panicking_pass_gives_the_flag_up_and_releases_waiters() {
+        let c = leak_coalescer();
+        let handle = tokio::runtime::Handle::current();
+        assert!(super::spawn_coalesced_replay(c, &handle, || async {
+            panic!("a pass panicked (expected by this test)");
+        }));
+        tokio::time::timeout(std::time::Duration::from_secs(5), c.idle())
+            .await
+            .expect("the panicked replay gave the flag up");
+        let gate = PassGate::leak();
+        assert!(super::spawn_coalesced_replay(c, &handle, move || gate.pass()));
+        gate.wait_started(1).await;
+        gate.open.add_permits(1);
+        tokio::time::timeout(std::time::Duration::from_secs(5), c.idle())
+            .await
+            .expect("the fresh replay ends");
+    }
+
+    /// A pass that is owed but not yet taken keeps `idle()` waiting, exactly as
+    /// one that is running does: a trigger that requested a pass resumes only
+    /// after the replay releases with nothing owed, including a pass a late
+    /// request asked for after the replay's last `take_pass`.
+    #[tokio::test]
+    async fn idle_waits_while_a_pass_is_owed_not_only_while_one_runs() {
+        let c = leak_coalescer();
+        let settle = std::time::Duration::from_millis(50);
+        assert!(c.request(), "a replay is being started and owes a pass");
+        let waiter = tokio::spawn(c.idle());
+        tokio::time::sleep(settle).await;
+        assert!(!waiter.is_finished(), "owed but not yet taken: not idle");
+        assert!(c.take_pass());
+        assert!(!c.take_pass(), "the replay's last take_pass finds nothing");
+        assert!(!c.request(), "a late request folds in");
+        assert!(c.release(), "the late request keeps the replay running");
+        tokio::time::sleep(settle).await;
+        assert!(
+            !waiter.is_finished(),
+            "resumed before the late request's pass had run"
+        );
+        assert!(c.take_pass());
+        assert!(!c.release());
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+            .await
+            .expect("resumes once the owed pass completed")
+            .expect("the waiter task");
+    }
+
+    /// The backstop runs a pass beside the coalesced replay only when its whole
+    /// bounded wait ran out with no step taken. A replay that is slow but still
+    /// stepping (a long refused backlog, one deferral stamp per row) or that
+    /// went idle is left alone. And the wait is long enough that a healthy pass
+    /// steps many times inside it: one pull bound is the longest gap between
+    /// steps.
+    #[test]
+    fn the_backstop_runs_its_own_pass_only_when_the_replay_made_no_progress() {
+        assert!(
+            super::replay_wedged(false, 7, 7),
+            "timed out, no step: wedged"
+        );
+        assert!(
+            !super::replay_wedged(false, 7, 9),
+            "timed out but stepping: slow, not wedged"
+        );
+        assert!(!super::replay_wedged(true, 7, 7), "went idle: not wedged");
+        assert!(!super::replay_wedged(true, 7, 9));
+        assert!(
+            super::REPLAY_WEDGED_AFTER >= 5 * super::PENDING_LIST_FETCH_TIMEOUT,
+            "the wedge bound must clear several pull bounds"
+        );
+    }
+
+    /// A trigger that waits for the pass it asked for (the backstop and the
+    /// runtime-ready catch-up) resumes when the replay ends, by release or by
+    /// panic, and not while it is still running, including when it keeps
+    /// running for a pass a later request asked for.
+    #[tokio::test]
+    async fn a_trigger_waiting_for_its_pass_resumes_when_the_replay_ends() {
+        use std::time::Duration;
+        let c: &'static super::ReplayCoalescer = Box::leak(Box::new(super::ReplayCoalescer::new()));
+        let settle = Duration::from_millis(50);
+        let bound = Duration::from_secs(5);
+
+        tokio::time::timeout(bound, c.idle())
+            .await
+            .expect("no replay running: idle at once");
+
+        assert!(c.request());
+        let waiter = tokio::spawn(c.idle());
+        tokio::time::sleep(settle).await;
+        assert!(!waiter.is_finished(), "a running replay is not idle");
+        assert!(c.take_pass());
+        assert!(!c.request(), "a request after the last take_pass");
+        assert!(c.release(), "the replay takes the flag back");
+        tokio::time::sleep(settle).await;
+        assert!(
+            !waiter.is_finished(),
+            "still running for the pass that request asked for"
+        );
+        assert!(c.take_pass());
+        assert!(!c.take_pass());
+        assert!(!c.release(), "nothing owed: the replay ends");
+        tokio::time::timeout(bound, waiter)
+            .await
+            .expect("woken when the replay ends")
+            .expect("the waiter task");
+
+        assert!(c.request());
+        let waiter = tokio::spawn(c.idle());
+        tokio::time::sleep(settle).await;
+        assert!(!waiter.is_finished());
+        assert!(
+            c.abandon(),
+            "the pass that request asked for was still owed"
+        );
+        tokio::time::timeout(bound, waiter)
+            .await
+            .expect("woken when a panicked replay gives the flag up")
+            .expect("the waiter task");
+        assert!(!c.abandon(), "abandon dropped the owed pass with it");
     }
 
     /// A complete body that does not decode is a contract break, and reads as
