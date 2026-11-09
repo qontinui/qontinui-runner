@@ -26,6 +26,12 @@ checkable examples:
 `qontinui-claude-config/knowledge-base/qontinui-specific/ui-bridge.md` →
 "The UI Bridge Is the Only Frontend-Inspection Tool".
 
+**Comparing the runner against the web frontend?** Each surface resolves its own
+`@qontinui/ui-bridge` minor, and a skew between them has already produced a
+false finding. Before you attribute a difference to either app, confirm that
+both resolve the same minor. The check and its exit codes are in `ui-bridge.md`
+→ "Version agreement between the two mandated surfaces".
+
 ## Endpoints
 
 | Application | UI Bridge Base URL |
@@ -130,7 +136,12 @@ curl -s -X POST $BASE/vision/capture \
 # Annotate a captured frame with overlay rectangles + labels
 curl -s -X POST $BASE/vision/annotate \
   -H "Content-Type: application/json" \
-  -d '{"annotations":[{"rect":{"x":10,"y":10,"width":100,"height":40},"label":"target"}]}'
+  -d '{"annotations":[{"region":{"x":10,"y":10,"w":100,"h":40},"label":"target"}]}'
+
+# Same capture, with the encoded bytes inline as base64 (saves the GET below)
+curl -s -X POST $BASE/vision/capture \
+  -H "Content-Type: application/json" \
+  -d '{"contract": "claude", "inline": true}'
 ```
 
 Both endpoints return:
@@ -139,8 +150,9 @@ Both endpoints return:
 {
   "success": true,
   "data": {
-    "path":     "tmp_vision_cache/<sha256>.jpeg",  // file on disk under runner CWD
-    "sha256":   "<64 hex chars>",
+    "url":      "/ui-bridge/vision/cache/<sha256>", // relative HTTP path to the bytes
+    "base64":   "...",             // only when the request set "inline": true
+    "sha256":   "<64 hex chars>",  // hash of the cache KEY, not of the image bytes
     "width":    1920,
     "height":   1080,
     "bytes":    214567,
@@ -150,8 +162,10 @@ Both endpoints return:
 }
 ```
 
-If you need the bytes in your shell (e.g. to base64-encode or save to a
-known path), follow up with the cache stream endpoint:
+The response never names a host file path. To get the bytes, either set
+`"inline": true` (over the runner's fixed 5 MiB inline cap it answers HTTP 413
+`INLINE_TOO_LARGE`, whose `hint` carries `url`, `bytes` and `maxBytes`), or fetch `url` against
+the runner origin you called:
 
 ```bash
 # Stream the raw bytes as image/jpeg|webp|png
