@@ -4051,8 +4051,11 @@ mod find_by_text_js_tests {
 
     /// A caller's `tag` enters the script as escaped string data, exactly as
     /// `text` does. A tag that tries to close its `querySelectorAll('...')`
-    /// literal and call `fetch` stays inside the literal, and so does a
-    /// trailing backslash that would otherwise escape the closing quote.
+    /// literal and call `fetch` stays inside the literal. So does one that
+    /// puts a backslash before that quote, which only the backslash doubling
+    /// catches: without it, `\'` becomes `\\'`, an escaped backslash and then
+    /// a quote that closes the literal. And so does a trailing backslash that
+    /// would otherwise escape the closing quote.
     #[test]
     fn a_hostile_tag_stays_inside_its_string_literal() {
         for exact in [true, false] {
@@ -4070,6 +4073,25 @@ mod find_by_text_js_tests {
             assert!(
                 !js.contains("'),fetch('"),
                 "the tag must not close its literal and splice a call, got: {js}"
+            );
+
+            // The absence check is anchored at the literal's opening quote:
+            // the bare `\\'),fetch(` also occurs inside the correctly escaped
+            // `*\\\'),fetch(`.
+            let js = find_by_text_js(
+                "Submit",
+                r"*\'),fetch('/x'),document.querySelectorAll('*",
+                exact,
+            );
+            assert!(
+                js.contains(
+                    r"querySelectorAll('*\\\'),fetch(\'/x\'),document.querySelectorAll(\'*')"
+                ),
+                "a backslash before the quote must be escaped too, got: {js}"
+            );
+            assert!(
+                !js.contains(r"querySelectorAll('*\\'),fetch("),
+                "a backslash before the quote must not let the quote close its literal, got: {js}"
             );
 
             let js = find_by_text_js("Submit", r"button\", exact);
