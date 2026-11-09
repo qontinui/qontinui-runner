@@ -363,6 +363,9 @@ const READ_TOOLS: &[&str] = &[
     "coord_build_info",
     "coord_can",
     "coord_change_conflict",
+    // The condition-runs read (twin `GET /coord/agent-condition-runs`); no read
+    // prefix covers it, so without this it reads as a write.
+    "coord_condition_runs",
     "coord_conflict_check",
     "coord_diagnose",
     "coord_diff_impact",
@@ -969,6 +972,11 @@ mod tests {
         // siblings (`coord_memory_record` / `_supersede`) stay writes.
         assert_eq!(
             operation_for_call("tools/call", Some("coord_memory_get")),
+            OPERATION_READ
+        );
+        // The condition-runs read matches no read prefix either.
+        assert_eq!(
+            operation_for_call("tools/call", Some("coord_condition_runs")),
             OPERATION_READ
         );
         assert_eq!(
