@@ -210,8 +210,11 @@ pub fn consume_marker_after(outcome: &crate::session::session_lifecycle_store::C
         CloseOutcome::Closed { claude_session_id } => forget_session_end(claude_session_id),
         CloseOutcome::Redirected { closed, .. }
         | CloseOutcome::RedirectedAmbiguous { closed, .. } => forget_session_end(closed),
+        // A close refused behind the shutdown latch left the row open, so the
+        // session's deliberate-end report (if any) is kept for the next close.
         CloseOutcome::AlreadyClosed { .. }
         | CloseOutcome::TerminalSuperseded { .. }
+        | CloseOutcome::IgnoredDuringShutdown { .. }
         | CloseOutcome::NotFound { .. } => {}
     }
 }
