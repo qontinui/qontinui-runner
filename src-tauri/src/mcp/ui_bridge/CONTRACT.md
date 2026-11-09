@@ -480,13 +480,14 @@ Two thread-through styles, mirroring the `tabId` split:
   visible, one another element covers) is a 4xx that keeps the SDK's
   `failureDetails` under `data`. A click the executor performed answers
   `{clicked: true, tag, text, index, totalMatches, selector}` plus the SDK's
-  `durationMs`. Their `/ui-bridge/sdk/…` twins fall back to these same
-  handlers when no SDK app is connected. For `type-into`, the SDK's
+  `durationMs` and `consoleErrors`. Their `/ui-bridge/sdk/…` twins fall back to
+  these same handlers when no SDK app is connected. For `type-into`, the SDK's
   `applyValueMutation` stays the single implementation of typing. `text` is
   required and must be a string (no `""` default), a miss is HTTP 400 rather
   than a 200 carrying `typed: false`, and the success payload is the SDK's
-  declared `{typed, element}` plus `index` — the old `valueLength` field is
-  gone; read a value back with `POST /control/page/read-value`.
+  declared `{typed, element}` plus `index`, `durationMs` and `consoleErrors` —
+  the old `valueLength` field is gone; read a value back with
+  `POST /control/page/read-value`.
   Every member of this family (plus `POST /control/page/summary`) parses the
   evaluated result through `helpers::parse_eval_result`. **An unparseable
   result is HTTP 500**, naming the route and echoing the offending text — it
