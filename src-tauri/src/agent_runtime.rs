@@ -8867,7 +8867,8 @@ async fn run_condition_check_terminal(
     // PTY-exit watcher (`crate::condition_secrets`, plan
     // 2026-11-06-a-regression-test-run-is-judged-by-what-it-covered-and-a-silent-run-reads-unknown
     // Phase 13).
-    let held_secrets = crate::condition_secrets::register(&payload.run_id, &payload.secrets);
+    let held_secrets =
+        crate::condition_secrets::register(&payload.run_id, &payload.target_url, &payload.secrets);
 
     let result = crate::commands::terminal::create_tracked_terminal_session_backend(
         &terminal_manager,
@@ -8936,6 +8937,9 @@ async fn run_condition_check_terminal(
                          {reason}",
                         payload.run_id
                     );
+                    // No session started, so nothing will type the secrets:
+                    // release them before the report's round trip.
+                    drop(held_secrets);
                     // Safe to spend the single-shot report token: no session
                     // started, so nothing is left that could have wanted it.
                     report_condition_run_failed(&payload, format!("spawn_failed: {reason}")).await;
@@ -8952,6 +8956,9 @@ async fn run_condition_check_terminal(
             let (reason, _phase) = classify_pty_spawn_error(&e);
             let reason = format!("condition-check {reason}");
             warn!("agent_runtime: {reason}");
+            // The PTY was never created: release the secrets before the
+            // report's round trip.
+            drop(held_secrets);
             report_condition_run_failed(&payload, format!("spawn_failed: {reason}")).await;
             Err(anyhow::anyhow!(reason))
         }
@@ -12868,9 +12875,12 @@ mod tests {
     }
 
     /// The frame coord sends since qontinui-coord#3856 (its `spawn_frame`, in
-    /// `qontinui-coord/crates/coord/src/conditions/dispatch.rs`): eight keys,
-    /// `report_token` among them. Through the production envelope parser the
-    /// explicit field lands, and it wins over the token the prompt also carries.
+    /// `qontinui-coord/crates/coord/src/conditions/dispatch.rs`): eight keys
+    /// for a group with a name (coord omits `condition_name` for a blank one),
+    /// `report_token` among them. Coord's fanout carries the frame as a JSON
+    /// STRING in the envelope's `payload`; the object form is read too.
+    /// Through the production envelope parser the explicit field lands, and it
+    /// wins over the token the prompt also carries.
     #[test]
     fn condition_check_payload_reads_the_report_token_coord_sends_as_its_own_key() {
         let field_token = uuid::Uuid::from_bytes([6; 16]).simple().to_string();
@@ -12885,20 +12895,22 @@ mod tests {
             "presentation": "terminal",
             "condition_name": "login works",
         });
-        let envelope = serde_json::json!({ "payload": frame });
-        let payload =
-            parse_condition_check_payload(&envelope).expect("coord's eight-key frame parses");
-        assert_eq!(payload.report_token.as_deref(), Some(field_token.as_str()));
-        assert_eq!(
-            condition_report_token(&payload).as_deref(),
-            Some(field_token.as_str()),
-            "the explicit field wins over the prompt's token"
-        );
+        for inner in [serde_json::Value::String(frame.to_string()), frame.clone()] {
+            let envelope = serde_json::json!({ "payload": inner });
+            let payload =
+                parse_condition_check_payload(&envelope).expect("coord's eight-key frame parses");
+            assert_eq!(payload.report_token.as_deref(), Some(field_token.as_str()));
+            assert_eq!(
+                condition_report_token(&payload).as_deref(),
+                Some(field_token.as_str()),
+                "the explicit field wins over the prompt's token"
+            );
+            assert_eq!(payload.condition_name.as_deref(), Some("login works"));
+        }
         assert_ne!(
             field_token, prompt_token,
             "anti-vacuity: the two tokens differ"
         );
-        assert_eq!(payload.condition_name.as_deref(), Some("login works"));
     }
 
     // =======================================================================

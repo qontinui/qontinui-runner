@@ -1287,6 +1287,15 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/ui-bridge/apps/forward-device", post(forward_device))
         .route("/ui-bridge/ios/forward", post(ios_forward))
         .route("/ui-bridge/control/wait-for-app", post(wait_for_app))
+        // `dispatch` answers with the app's own response, so while a
+        // condition-check session holds a secret no response here carries it
+        // (`crate::condition_secrets`, plan
+        // 2026-11-06-a-regression-test-run-is-judged-by-what-it-covered-and-a-silent-run-reads-unknown
+        // Phase 13). LAST, because `Router::layer` wraps only the routes
+        // registered before it.
+        .layer(axum::middleware::from_fn(
+            crate::condition_secrets::scrub_sdk_responses,
+        ))
 }
 
 // ============================================================================

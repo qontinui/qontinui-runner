@@ -1751,20 +1751,32 @@ fn slow_host_probes() -> SlowHostProbes {
 /// BLOCKS: the heartbeat assembles its capability base
 /// ([`heartbeat_device_capabilities`], which reaches this) on the blocking pool.
 fn host_capabilities() -> Vec<String> {
-    let slow = slow_host_probes();
-    let webview = webview_runtime_available();
-    let mut caps = build_host_capabilities(
+    let mut caps = assemble_host_capabilities(
         current_os_label(),
-        slow.powershell,
-        slow.docker,
-        webview,
+        slow_host_probes(),
+        webview_runtime_available(),
         host_mem_total_bytes(),
     );
+    caps.extend(imagegen_probe::capability_tokens());
+    caps
+}
+
+/// [`host_capabilities`] minus the image probe, from the probes' results:
+/// the [`build_host_capabilities`] set plus the condition-check token, which
+/// two of the probes decide together. Pure, so a test can hand it every
+/// combination a real host produces.
+fn assemble_host_capabilities(
+    os: &str,
+    slow: SlowHostProbes,
+    webview: bool,
+    mem_total_bytes: Option<u64>,
+) -> Vec<String> {
+    let mut caps =
+        build_host_capabilities(os, slow.powershell, slow.docker, webview, mem_total_bytes);
     caps.extend(condition_secret_substitution_capability(
         webview,
         slow.claude,
     ));
-    caps.extend(imagegen_probe::capability_tokens());
     caps
 }
 
@@ -1992,10 +2004,12 @@ fn build_host_capabilities(
 /// secret-bearing condition group, with nothing red on either side.
 pub const CONDITION_SECRET_SUBSTITUTION_CAPABILITY: &str = "condition:secret_substitution";
 
-/// `Some(token)` exactly when this runner can launch a condition-check
-/// session: a webview runtime to host its visible terminal (the first thing
-/// `agent_runtime::run_condition_check_terminal` needs) AND a `claude` that
-/// resolves to a launchable executable. Fail-closed like
+/// `Some(token)` when this runner has what a condition-check session needs
+/// from its host: a webview runtime to host its visible terminal (the first
+/// thing `agent_runtime::run_condition_check_terminal` needs) AND a `claude`
+/// that resolves to a launchable executable. Necessary, not sufficient: a
+/// launch also needs spawn authorization, a signed-in account and a workspace
+/// root, which this host fact does not see. Fail-closed like
 /// [`webview_runtime_available`]: advertising falsely sends a run carrying
 /// secrets to a device that then cannot spawn its session; not advertising
 /// only moves the run elsewhere, or reads it `unknown`. Pure.
@@ -2005,15 +2019,37 @@ fn condition_secret_substitution_capability(webview: bool, claude: bool) -> Opti
 
 /// True when `claude` resolves to the absolute path of an existing,
 /// launchable executable: what a condition-check spawn execs
-/// (`agent_runtime::resolve_claude_bin`, then the execute-bit check of
-/// `agent_runtime::launchable_or_bare`). A miss falls back to the bare name
-/// there, which is not a launch this runner can vouch for. Stats PATH, so it
-/// is cached behind `HOST_PROBE_TTL` with the other slow probes.
+/// (`agent_runtime::resolve_claude_bin`, then `agent_runtime::launchable_or_bare`).
+/// A miss falls back to the bare name there, which is not a launch this runner
+/// can vouch for; so does an explicit `QONTINUI_CLAUDE_BIN` that names a file
+/// without its execute bit, which `launchable_or_bare` hands back as it is.
+/// Stats PATH, so it is cached behind `HOST_PROBE_TTL` with the other slow
+/// probes.
 fn claude_launchable() -> bool {
-    let resolved =
-        crate::agent_runtime::launchable_or_bare(crate::agent_runtime::resolve_claude_bin());
-    let path = std::path::Path::new(&resolved);
-    path.is_absolute() && path.is_file()
+    is_launchable_file(std::path::Path::new(
+        &crate::agent_runtime::launchable_or_bare(crate::agent_runtime::resolve_claude_bin()),
+    ))
+}
+
+/// An absolute path to a regular file that, on unix, carries an execute bit.
+fn is_launchable_file(path: &std::path::Path) -> bool {
+    if !path.is_absolute() {
+        return false;
+    }
+    std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file() && has_execute_bit(&metadata))
+}
+
+#[cfg(unix)]
+fn has_execute_bit(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    metadata.permissions().mode() & 0o111 != 0
+}
+
+/// Windows has no execute bit: what launches is decided by the extension,
+/// which `agent_runtime::resolve_claude_bin`'s PATH walk restricts.
+#[cfg(not(unix))]
+fn has_execute_bit(_metadata: &std::fs::Metadata) -> bool {
+    true
 }
 
 /// Prefix of the per-repo CI allowlist token: one `ci_repo:<entry>` per
@@ -9435,15 +9471,54 @@ mod tests {",
                 "webview={webview} claude={claude}: no condition-check session can launch"
             );
         }
-        // A unit-test process holds no Tauri runtime, so the precondition
-        // fails here whatever PATH holds, and the assembled set must not
-        // carry the token.
+        // The assembled set reads BOTH probes: every combination a host can
+        // produce, through the same assembly `host_capabilities` runs.
+        for (webview, claude) in [(true, true), (true, false), (false, true), (false, false)] {
+            let slow = SlowHostProbes {
+                powershell: false,
+                docker: false,
+                claude,
+            };
+            assert_eq!(
+                assemble_host_capabilities("linux", slow, webview, None)
+                    .iter()
+                    .any(|c| c == CONDITION_SECRET_SUBSTITUTION_CAPABILITY),
+                webview && claude,
+                "webview={webview} claude={claude}"
+            );
+        }
+        // A unit-test process holds no Tauri runtime, so the live set must not
+        // carry the token whatever PATH holds.
         assert!(!webview_runtime_available());
         assert!(
             !host_capabilities()
                 .iter()
                 .any(|c| c == CONDITION_SECRET_SUBSTITUTION_CAPABILITY),
             "the token was advertised by a runner that cannot launch a condition check"
+        );
+    }
+
+    /// `claude` counts as launchable only when it is an absolute, regular,
+    /// executable file: a non-executable `QONTINUI_CLAUDE_BIN` is handed back
+    /// as it is by `launchable_or_bare`, and a launch of it would fail.
+    #[cfg(unix)]
+    #[test]
+    fn condition_secrets_a_claude_without_its_execute_bit_is_not_launchable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let bin = dir.path().join("claude");
+        std::fs::write(&bin, "#!/bin/sh\n").expect("written");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o644)).expect("mode");
+        assert!(!is_launchable_file(&bin), "no execute bit");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("mode");
+        assert!(
+            is_launchable_file(&bin),
+            "anti-vacuity: an executable file is"
+        );
+        assert!(!is_launchable_file(dir.path()), "a directory is not");
+        assert!(
+            !is_launchable_file(std::path::Path::new("claude")),
+            "a bare name is not"
         );
     }
 
