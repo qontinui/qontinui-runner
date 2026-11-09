@@ -242,8 +242,8 @@ The regular \`page/evaluate\` endpoint also gained a **direct WebView fallback**
     },
     {
       id: "builtin-skill",
-      title: "The First Builtin Skill",
-      content: `The system ships with one builtin skill: **UI Bridge Health Verify**. It's a 3-step verification template, all DOM reads over IPC (no screen capture, so the window does not need focus):
+      title: "A Builtin Skill Example",
+      content: `The system ships with a library of builtin skills (shell commands, lint, tests, UI Bridge checks and more). One example is **UI Bridge Health Verify**. It's a 3-step verification template, all DOM reads over IPC (no screen capture, so the window does not need focus):
 
 1. **Discover Elements** — forces UI Bridge element discovery
 2. **Snapshot & Count** — verifies element count meets a minimum threshold

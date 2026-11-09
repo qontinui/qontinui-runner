@@ -53,6 +53,7 @@ pub(crate) mod services;
 pub(crate) mod settings_directive;
 pub(crate) mod sibling;
 mod sibling_git_env;
+pub(crate) mod step_env;
 pub(crate) mod subscription;
 pub(crate) mod tools;
 

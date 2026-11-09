@@ -1462,6 +1462,7 @@ mod tests {
                 index: 1,
                 name: "Phase 1 — x".to_string(),
             }],
+            repos: vec![],
             source_path: format!("plans/{slug}.md"),
             content: String::new(),
         }

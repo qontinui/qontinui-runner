@@ -3339,7 +3339,10 @@ pub fn collect_claude_accounts() -> Option<Section> {
 ///
 /// SECRET-SAFETY INVARIANT (pinned by `secret_safety_claude_accounts_*`): this
 /// function NEVER opens `.credentials.json` (or `.claude.json`) — it emits only
-/// names/topology and `present`/`absent` EXISTENCE flags.
+/// names/topology and `present`/`absent` flags. The one credential it reads is
+/// an account's long-lived `CLAUDE_CODE_OAUTH_TOKEN` in `settings.json`, and
+/// only through `claude_oauth_token::from_config_dir` to decide that flag; the
+/// value never reaches the section.
 fn collect_claude_accounts_from(
     config_root: &Path,
     profiles_text: Option<&str>,
@@ -3403,10 +3406,16 @@ fn collect_claude_accounts_from(
     let names: Vec<&str> = pairs.iter().map(|(n, _)| n.as_str()).collect();
     put(&mut section, "accounts", names.join(","));
 
-    // auth_<name>: EXISTENCE of <config_dir>/.credentials.json — NEVER opened.
+    // auth_<name>: whether the account can log in — EXISTENCE of
+    // <config_dir>/.credentials.json (NEVER opened), or a usable long-lived
+    // `claude setup-token` token in its settings.json (the value is read only
+    // to test its shape and is never emitted). An account holding only such a
+    // token is logged in, so reporting it `absent` would be a false drift.
     for (name, dir) in &pairs {
         let creds = Path::new(dir).join(".credentials.json");
-        let flag = if creds.exists() { "present" } else { "absent" };
+        let logged_in =
+            creds.exists() || crate::claude_oauth_token::from_config_dir(Path::new(dir)).is_some();
+        let flag = if logged_in { "present" } else { "absent" };
         put(&mut section, &format!("auth_{name}"), flag);
     }
 
@@ -6808,6 +6817,58 @@ dependencies = [
             !json.contains("access_token"),
             "credential file contents leaked: {json}"
         );
+    }
+
+    /// An account holding ONLY a long-lived `claude setup-token` token (no
+    /// `.credentials.json`) is logged in, so it reports `present` — and the
+    /// token value appears nowhere in the section. A placeholder that is not a
+    /// Claude OAuth token still reports `absent`.
+    #[test]
+    fn secret_safety_claude_accounts_long_lived_token_is_present_and_never_leaks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let runner = root.join("com.qontinui.runner");
+
+        let token = "sk-ant-oat01-SUPERSECRET-LONG-LIVED";
+        let tok_acct = root.join(".claude-tokenacct");
+        std::fs::create_dir_all(&tok_acct).unwrap();
+        std::fs::write(
+            tok_acct.join("settings.json"),
+            format!("{{\"env\":{{\"CLAUDE_CODE_OAUTH_TOKEN\":\"{token}\"}}}}"),
+        )
+        .unwrap();
+        let placeholder_acct = root.join(".claude-placeholder");
+        std::fs::create_dir_all(&placeholder_acct).unwrap();
+        std::fs::write(
+            placeholder_acct.join("settings.json"),
+            "{\"env\":{\"CLAUDE_CODE_OAUTH_TOKEN\":\"REPLACE_ME\"}}",
+        )
+        .unwrap();
+
+        write_roster(
+            &runner,
+            &format!(
+                "{{\"claude_config_dirs\":[{:?},{:?}]}}",
+                tok_acct.to_string_lossy(),
+                placeholder_acct.to_string_lossy()
+            ),
+        );
+
+        let section = collect_claude_accounts_from(root, None, None).expect("section present");
+        let json = serde_json::to_string(&section).unwrap();
+
+        assert_eq!(
+            section.get("auth_tokenacct").and_then(|v| v.as_str()),
+            Some("present"),
+            "a token-only account is logged in: {json}"
+        );
+        assert_eq!(
+            section.get("auth_placeholder").and_then(|v| v.as_str()),
+            Some("absent"),
+            "a placeholder is not a login: {json}"
+        );
+        assert!(!json.contains(token), "long-lived token leaked: {json}");
+        assert!(!json.contains("sk-ant-oat"), "token prefix leaked: {json}");
     }
 
     /// Behavior: sorted stripped names, correct mode, auth presence reflects the

@@ -45,7 +45,7 @@
 //! through the lifecycle Closer's guard instead.
 //!
 //! Time is MONOTONIC (`tokio::time::Instant`) throughout, so a wall-clock step
-//! can neither reap early nor make the single scheduled sweep miss its row.
+//! can neither reap early nor make the scheduled sweep miss its row.
 //! The decision is the pure [`decide`]; the table and the sweep are thin
 //! wrappers so the whole rule is testable without a `TerminalManager`.
 
@@ -189,6 +189,116 @@ struct Armed {
     /// `false` for an attach marker whose `arm` has not arrived yet. Only
     /// armed rows are ever reaped.
     armed: bool,
+    /// How many create-grant closes are ADMITTED and not yet finished
+    /// ([`RemoteCreateReaper::claim_create_close`] increments it; dropping the
+    /// [`CreateCloseClaim`] decrements it, whatever the close did — including a
+    /// cancelled task). While it is non-zero no attach grant may bind the
+    /// terminal ([`RemoteCreateReaper::bind_attach`]): a close is committed, and
+    /// an attach that slipped in would be killed by it.
+    ///
+    /// A COUNT, not a flag (re-review findings 1a/1b): with a flag, one close's
+    /// outcome had to decide whether to clear a mark another in-flight close
+    /// still relied on — and whichever rule it picked either stranded the mark
+    /// (nobody left to clear it) or cleared it under a close about to run.
+    create_closes_in_flight: u32,
+    /// Sticky: some create-grant close reported the terminal `ended` or
+    /// `not_found`. Nothing may attach to it afterwards.
+    closed_under_create: bool,
+}
+
+/// [`RemoteCreateReaper::bind_attach`] refused: the terminal's create grant has
+/// already been admitted to close it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClosingUnderCreateGrant;
+
+impl Armed {
+    /// An admitted create-grant close is in flight, or one closed the terminal.
+    fn closing_under_create(&self) -> bool {
+        self.create_closes_in_flight > 0 || self.closed_under_create
+    }
+}
+
+/// One admitted create-grant close of one terminal: the claim
+/// [`RemoteCreateReaper::claim_create_close`] hands back, and the ONLY thing
+/// that ends it. Dropping it — on every return path, on a panic, and when the
+/// task running the close is cancelled — decrements the in-flight count, so an
+/// admitted close can never leave the terminal unattachable with nobody left
+/// to clear it. [`Self::settle`] also records the close's outcome.
+#[derive(Debug)]
+pub struct CreateCloseClaim<'a> {
+    reaper: &'a RemoteCreateReaper,
+    terminal_id: String,
+    closed: bool,
+}
+
+impl CreateCloseClaim<'_> {
+    /// The terminal this claim is for.
+    pub fn terminal_id(&self) -> &str {
+        &self.terminal_id
+    }
+
+    /// End the claim with the close's outcome: `closed` when the close reported
+    /// the terminal `ended` or `not_found`, which makes the terminal
+    /// unattachable for good. Any other outcome only ends this claim.
+    pub fn settle(mut self, closed: bool) {
+        self.closed = closed;
+    }
+}
+
+impl Drop for CreateCloseClaim<'_> {
+    fn drop(&mut self) {
+        // The row cannot vanish under a live claim: `take_due` KEEPS a row whose
+        // count is non-zero (re-review 3), the sweep is the only remover of an
+        // armed row, and `arm` runs before the create's reply, so before any
+        // claim exists. A missing row here would be a broken invariant; it has
+        // nothing to decrement either way.
+        if let Some(row) = self.reaper.table().get_mut(&self.terminal_id) {
+            // Not while unwinding: a second panic in a destructor aborts.
+            if !std::thread::panicking() {
+                debug_assert!(
+                    row.create_closes_in_flight > 0,
+                    "a live CreateCloseClaim implies a counted close"
+                );
+            }
+            row.create_closes_in_flight = row.create_closes_in_flight.saturating_sub(1);
+            if self.closed {
+                row.closed_under_create = true;
+            }
+        }
+    }
+}
+
+/// Run one admitted create-grant close: `end` is the close's driver, and its
+/// verdict settles `claim` — `ended` / `not_found` mark the terminal closed,
+/// anything else only ends the claim. The claim is dropped however this future
+/// ends, cancellation and a panicking driver included.
+///
+/// **`unknown` ends the claim WITHOUT marking the terminal closed** — the
+/// reverse of 2390b7541, which kept the mark on `unknown`. The mark exists to
+/// stop an attach binding while a close may still kill the terminal, and by the
+/// time a verdict exists no close from this claim is still acting: every
+/// `unknown` the driver returns is produced after its own attempt has finished
+/// (a close task that failed to join, a graceful exit whose effect was not
+/// observed), and `end_under_create_grant`'s task is never aborted mid-drive.
+/// So an `unknown` terminal is either already gone, and an attach to it cannot
+/// bind, or still running with nothing left to kill it but the deadline sweep,
+/// which spares an attached terminal. Keeping it unattachable would only strand
+/// it.
+pub async fn run_create_close<F, Fut>(
+    claim: CreateCloseClaim<'_>,
+    end: F,
+) -> crate::mcp::remote_terminal::EndVerdict
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = crate::mcp::remote_terminal::EndVerdict>,
+{
+    use crate::mcp::remote_terminal::EndOutcome;
+    let verdict = end().await;
+    claim.settle(matches!(
+        verdict.outcome,
+        EndOutcome::Ended | EndOutcome::NotFound
+    ));
+    verdict
 }
 
 /// One terminal the sweep decided to close.
@@ -203,6 +313,13 @@ pub struct Reaped {
 pub struct RemoteCreateReaper {
     deadline: Duration,
     armed: Mutex<HashMap<String, Armed>>,
+}
+
+impl Default for RemoteCreateReaper {
+    /// A table with the production deadline.
+    fn default() -> Self {
+        Self::new(REMOTE_CREATE_ATTACH_DEADLINE)
+    }
 }
 
 impl RemoteCreateReaper {
@@ -236,6 +353,8 @@ impl RemoteCreateReaper {
                 coord_session_id,
                 ever_attached: attached_already,
                 armed: true,
+                create_closes_in_flight: 0,
+                closed_under_create: false,
             },
         );
     }
@@ -250,8 +369,16 @@ impl RemoteCreateReaper {
     /// here: an arm that races its own attach arrives within seconds, not
     /// minutes.
     pub fn mark_attached(&self, terminal_id: &str, now: Instant) {
-        let deadline = self.deadline;
-        let mut table = self.table();
+        Self::mark_attached_in(&mut self.table(), self.deadline, terminal_id, now);
+    }
+
+    /// [`Self::mark_attached`] on a table the caller already holds.
+    fn mark_attached_in(
+        table: &mut HashMap<String, Armed>,
+        deadline: Duration,
+        terminal_id: &str,
+        now: Instant,
+    ) {
         table
             .retain(|_, row| row.armed || now.saturating_duration_since(row.created_at) < deadline);
         table
@@ -262,7 +389,117 @@ impl RemoteCreateReaper {
                 coord_session_id: None,
                 ever_attached: true,
                 armed: false,
+                create_closes_in_flight: 0,
+                closed_under_create: false,
             });
+    }
+
+    /// Bind an attach grant to `terminal_id` and record the attach, as ONE step
+    /// under this table's lock — the attach half of the create-grant close's
+    /// atomicity (review finding 1 on plan
+    /// `2026-09-23-remote-create-residuals-after-coord-registration-confirm`
+    /// Phase 2).
+    ///
+    /// `bind` is the attach table's own bind (`RemoteAttachGrants::bind`). It
+    /// runs only when no create-grant close has been admitted for the terminal,
+    /// and a successful bind marks the terminal attached before the lock is
+    /// released. [`Self::claim_create_close`] takes the same lock, so exactly one
+    /// order is observable: the close was admitted first, and this refuses
+    /// [`ClosingUnderCreateGrant`] without binding anything; or the bind came
+    /// first, and the close reads the terminal as attached and is refused.
+    ///
+    /// `Ok(false)` is `bind`'s own refusal (bound elsewhere); nothing is marked.
+    ///
+    /// Lock order: this table, then the attach table inside `bind`. The claim
+    /// takes them in the same order.
+    pub fn bind_attach<F>(
+        &self,
+        terminal_id: &str,
+        now: Instant,
+        bind: F,
+    ) -> Result<bool, ClosingUnderCreateGrant>
+    where
+        F: FnOnce() -> bool,
+    {
+        let mut table = self.table();
+        if table
+            .get(terminal_id)
+            .is_some_and(Armed::closing_under_create)
+        {
+            return Err(ClosingUnderCreateGrant);
+        }
+        if !bind() {
+            return Ok(false);
+        }
+        Self::mark_attached_in(&mut table, self.deadline, terminal_id, now);
+        Ok(true)
+    }
+
+    /// Admit a create grant's close of `terminal_id`, and commit to it: check
+    /// that no attach grant ever bound the terminal and count the close in, under
+    /// one lock, so no attach can bind it in between (see [`Self::bind_attach`]).
+    ///
+    /// `Some` only when the row is armed, never attached, AND `bound_now` reads
+    /// the attach table and finds no live binding. `bound_now` answering `Err`
+    /// (the attach table could not be read) refuses — fail closed. A retry of an
+    /// admitted close is admitted again and counted separately.
+    ///
+    /// The returned [`CreateCloseClaim`] keeps the terminal unattachable until
+    /// it is dropped. No row refuses, for the reasons [`Self::was_ever_attached`]
+    /// gives.
+    pub fn claim_create_close<F>(
+        &self,
+        terminal_id: &str,
+        bound_now: F,
+    ) -> Option<CreateCloseClaim<'_>>
+    where
+        F: FnOnce() -> Result<bool, ()>,
+    {
+        let mut table = self.table();
+        let row = table.get_mut(terminal_id)?;
+        if !row.armed || row.ever_attached {
+            return None;
+        }
+        if bound_now() != Ok(false) {
+            return None;
+        }
+        row.create_closes_in_flight = row.create_closes_in_flight.saturating_add(1);
+        Some(CreateCloseClaim {
+            reaper: self,
+            terminal_id: terminal_id.to_string(),
+            closed: false,
+        })
+    }
+
+    /// Is `terminal_id` closing (or closed) under a create grant, so an attach
+    /// would be refused?
+    pub fn is_closing_under_create(&self, terminal_id: &str) -> bool {
+        self.table()
+            .get(terminal_id)
+            .is_some_and(Armed::closing_under_create)
+    }
+
+    /// May a create grant still close `terminal_id`? Only a row that is armed and
+    /// not yet attached says "never attached".
+    ///
+    /// Fails CLOSED on no row. Absence is also the correct answer rather than
+    /// only the safe one: an attached terminal loses its row, because
+    /// [`Self::take_due`] drops a `Keep` row and an unarmed marker ages out, so
+    /// "no row" covers attached-and-disarmed as well as local terminals this
+    /// table never armed. A reaped terminal is gone anyway.
+    pub fn was_ever_attached(&self, terminal_id: &str) -> bool {
+        !self
+            .table()
+            .get(terminal_id)
+            .is_some_and(|row| row.armed && !row.ever_attached)
+    }
+
+    /// How many admitted create-grant closes of `terminal_id` are in flight.
+    #[cfg(test)]
+    pub fn create_closes_in_flight(&self, terminal_id: &str) -> u32 {
+        self.table()
+            .get(terminal_id)
+            .map_or(0, |row| row.create_closes_in_flight)
     }
 
     /// Apply [`decide`] to every armed terminal: `Reap` rows are removed and
@@ -275,6 +512,19 @@ impl RemoteCreateReaper {
             if !row.armed {
                 return now.saturating_duration_since(row.created_at) < deadline;
             }
+            // An admitted create close is still in flight: KEEP the row, never
+            // reap it. Removing it would leave `bind_attach` nothing to refuse
+            // on, so an attach could bind and the in-flight forced close then
+            // kill it (re-review 3). `arm_and_schedule` sweeps again later.
+            if row.create_closes_in_flight > 0 {
+                return true;
+            }
+            // A row a create close marked CLOSED (`ended` / `not_found`) past its
+            // deadline is reaped like any never-attached row: `close_through`
+            // re-checks the terminal and finds it gone, and with the terminal
+            // gone an attach cannot bind (no local terminal hosts its session),
+            // so dropping the sticky bit opens nothing. Before the deadline it
+            // waits, closed bit and all.
             match decide(row.created_at, row.ever_attached, now, deadline) {
                 ReapDecision::Wait => true,
                 ReapDecision::Keep => false,
@@ -351,8 +601,10 @@ where
     due
 }
 
-/// Arm `terminal_id` on `reaper` now and schedule the sweep that runs once its
-/// deadline has passed.
+/// Arm `terminal_id` on `reaper` now and schedule its sweep: first once the
+/// deadline has passed, then again every [`CREATE_CLOSE_RESWEEP`] for as long as
+/// the row is still in the table, armed and never attached — which after the
+/// deadline means `take_due` kept it for an in-flight create close.
 pub fn arm_and_schedule<F, Fut>(
     reaper: Arc<RemoteCreateReaper>,
     terminal_id: &str,
@@ -360,17 +612,40 @@ pub fn arm_and_schedule<F, Fut>(
     close: F,
 ) -> tokio::task::JoinHandle<Vec<Reaped>>
 where
-    F: Fn(String) -> Fut + Send + 'static,
+    // `Sync`: the re-sweep loop holds `&close` across an await.
+    F: Fn(String) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<CloseOutcome, String>> + Send,
 {
     let armed_at = Instant::now();
     reaper.arm(terminal_id, coord_session_id, armed_at);
-    let wake_at = armed_at + reaper.deadline;
+    let mut wake_at = armed_at + reaper.deadline;
+    let terminal_id = terminal_id.to_string();
     tokio::spawn(async move {
-        tokio::time::sleep_until(wake_at).await;
-        sweep(&reaper, Instant::now(), close).await
+        let mut reaped = Vec::new();
+        loop {
+            tokio::time::sleep_until(wake_at).await;
+            reaped.extend(sweep(&reaper, Instant::now(), &close).await);
+            // Decide on the TABLE, not on why the row was kept: `sweep` awaits
+            // other rows' closes after `take_due`, and a claim on this row can
+            // drop in that window, so "is a close still in flight?" read here
+            // may already say no for a row `take_due` kept (final review). Stop
+            // only once the row is gone (reaped, or never armed) or attached
+            // (owned) — `was_ever_attached` answers true for both. Anything still
+            // armed and unattached is looked at again. Bounded: `take_due` keeps
+            // a due row only while a close's claim lives, and a claim ends with
+            // its close's own drive.
+            if reaper.was_ever_attached(&terminal_id) {
+                break reaped;
+            }
+            wake_at = Instant::now() + CREATE_CLOSE_RESWEEP;
+        }
     })
 }
+
+/// How soon the scheduled sweep looks again at a due terminal it kept because
+/// a create close was still in flight. Must be non-zero: the re-sweep loop
+/// would otherwise spin without ever letting the clock advance.
+pub const CREATE_CLOSE_RESWEEP: Duration = Duration::from_secs(30);
 
 static REAPER: OnceLock<Arc<RemoteCreateReaper>> = OnceLock::new();
 
@@ -486,11 +761,6 @@ pub fn arm_remote_created(
     arm_with_target(reaper(), tm, terminal_id, coord_session_id);
 }
 
-/// Record that an attach grant was bound to `terminal_id` (process-wide).
-pub fn mark_attached(terminal_id: &str) {
-    reaper().mark_attached(terminal_id, Instant::now());
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -499,7 +769,8 @@ mod tests {
     const N: Duration = REMOTE_CREATE_ATTACH_DEADLINE;
     const SEC: Duration = Duration::from_secs(1);
 
-    type Close = Box<dyn Fn(String) -> std::future::Ready<Result<CloseOutcome, String>> + Send>;
+    type Close =
+        Box<dyn Fn(String) -> std::future::Ready<Result<CloseOutcome, String>> + Send + Sync>;
 
     fn recorder() -> (Arc<Mutex<Vec<String>>>, Close) {
         let closed = Arc::new(Mutex::new(Vec::new()));
@@ -625,6 +896,174 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
+    // ---- re-review 3: the deadline sweep keeps a row a create close holds ----
+
+    /// A claim admitted before the deadline keeps its row across `take_due`, so
+    /// an attach is still refused and the in-flight forced close cannot kill a
+    /// terminal that attached after the row was dropped. Once the claim ends,
+    /// the row is due as usual.
+    #[test]
+    fn take_due_keeps_a_row_with_a_create_close_in_flight() {
+        let t0 = Instant::now();
+        let reaper = RemoteCreateReaper::new(N);
+        reaper.arm("term", None, t0);
+        let claim = reaper
+            .claim_create_close("term", || Ok(false))
+            .expect("admitted");
+
+        assert!(reaper.take_due(t0 + N).is_empty(), "held, not reaped");
+        assert!(reaper.has_row("term"), "the row is kept");
+        assert!(reaper.is_closing_under_create("term"));
+        let mut bound = false;
+        assert_eq!(
+            reaper.bind_attach("term", t0 + N, || {
+                bound = true;
+                true
+            }),
+            Err(ClosingUnderCreateGrant),
+            "the attach is refused"
+        );
+        assert!(!bound, "and never reaches the attach table");
+
+        drop(claim);
+        assert!(!reaper.is_closing_under_create("term"));
+        assert_eq!(reaper.take_due(t0 + N).len(), 1, "due once the close ended");
+    }
+
+    /// A row a close marked CLOSED waits before its deadline with the sticky bit
+    /// intact, and is reaped (dropped) at the deadline — where `close_through`
+    /// finds the terminal gone, so no attach can bind it afterwards anyway.
+    #[test]
+    fn a_closed_row_stays_closed_until_its_deadline_then_is_reaped() {
+        let t0 = Instant::now();
+        let reaper = RemoteCreateReaper::new(N);
+        reaper.arm("term", None, t0);
+        reaper
+            .claim_create_close("term", || Ok(false))
+            .expect("admitted")
+            .settle(true);
+        assert!(reaper.take_due(t0 + N - SEC).is_empty());
+        assert!(reaper.is_closing_under_create("term"), "still closed");
+        assert_eq!(reaper.take_due(t0 + N).len(), 1);
+    }
+
+    /// The scheduled path holds the due row while a close is in flight and
+    /// sweeps again exactly [`CREATE_CLOSE_RESWEEP`] later, reaping once the claim
+    /// has ended: not finished at +29 s, finished by +31 s.
+    #[tokio::test(start_paused = true)]
+    async fn the_scheduled_sweep_looks_again_after_a_held_row() {
+        // Fails fast rather than hanging: at zero the loop would spin and the
+        // paused clock would never advance.
+        assert!(CREATE_CLOSE_RESWEEP >= Duration::from_secs(1));
+        assert_eq!(CREATE_CLOSE_RESWEEP, Duration::from_secs(30));
+        let start = Instant::now();
+        let reaper = Arc::new(RemoteCreateReaper::new(N));
+        let (closed, close) = recorder();
+        let mut handle = arm_and_schedule(reaper.clone(), "term-held", None, close);
+        let claim = reaper
+            .claim_create_close("term-held", || Ok(false))
+            .expect("admitted");
+
+        tokio::time::sleep_until(start + N + SEC).await;
+        assert!(closed.lock().unwrap().is_empty(), "held at the deadline");
+        assert!(reaper.has_row("term-held"));
+        assert!(!handle.is_finished(), "the sweep will look again");
+
+        drop(claim);
+        tokio::time::sleep_until(start + N + 29 * SEC).await;
+        assert!(!handle.is_finished(), "no re-sweep before the cadence");
+        assert!(closed.lock().unwrap().is_empty());
+
+        let reaped = tokio::time::timeout(2 * SEC, &mut handle)
+            .await
+            .expect("re-swept by +30 s")
+            .unwrap();
+        assert_eq!(reaped.len(), 1);
+        assert_eq!(*closed.lock().unwrap(), vec!["term-held".to_string()]);
+        assert!(start.elapsed() >= N + CREATE_CLOSE_RESWEEP);
+    }
+
+    /// Final review: the claim on the held row drops WHILE the sweep is still
+    /// awaiting another row's close, i.e. between `take_due` keeping the row and
+    /// the loop deciding whether to look again. The loop must still look again
+    /// (it decides on the table: armed and unattached), and reap the row on its
+    /// next pass instead of abandoning it past its deadline.
+    #[tokio::test(start_paused = true)]
+    async fn a_claim_dropped_during_the_sweep_still_gets_its_row_reaped() {
+        let start = Instant::now();
+        let reaper = Arc::new(RemoteCreateReaper::new(N));
+        // A 'static view of the same reaper, so the claim can live in the
+        // close callback (a test-only leak).
+        let leaked: &'static RemoteCreateReaper = Box::leak(Box::new(reaper.clone()));
+        // Another due row, armed with no task of its own, so the held row's task
+        // is the one that sweeps it — and its close is where the claim drops.
+        reaper.arm("term-other", None, start);
+        let claim = Arc::new(Mutex::new(None::<CreateCloseClaim<'static>>));
+        let closed = Arc::new(Mutex::new(Vec::new()));
+        let (seen, slot) = (closed.clone(), claim.clone());
+        let close = move |id: String| {
+            if id == "term-other" {
+                drop(slot.lock().unwrap().take());
+            }
+            seen.lock().unwrap().push(id);
+            std::future::ready(Ok(CloseOutcome::Closed))
+        };
+        let handle = arm_and_schedule(reaper.clone(), "term-held", None, close);
+        *claim.lock().unwrap() = Some(
+            leaked
+                .claim_create_close("term-held", || Ok(false))
+                .expect("admitted"),
+        );
+
+        tokio::time::sleep_until(start + N + SEC).await;
+        assert_eq!(*closed.lock().unwrap(), vec!["term-other".to_string()]);
+        assert!(claim.lock().unwrap().is_none(), "dropped during the sweep");
+        assert!(reaper.has_row("term-held"), "kept by take_due");
+        assert!(
+            !handle.is_finished(),
+            "the loop must not abandon an armed, unattached row"
+        );
+
+        let reaped = tokio::time::timeout(CREATE_CLOSE_RESWEEP + SEC, handle)
+            .await
+            .expect("reaped on the next pass")
+            .unwrap();
+        assert_eq!(
+            reaped
+                .iter()
+                .map(|r| r.terminal_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["term-other", "term-held"]
+        );
+        assert!(!reaper.has_row("term-held"));
+    }
+
+    /// Nit 3: a driver that PANICS unwinds through `run_create_close` and the
+    /// claim still decrements — the terminal is attachable again.
+    #[tokio::test]
+    async fn a_panicking_close_driver_still_decrements_the_count() {
+        fn driver_panics() -> crate::mcp::remote_terminal::EndVerdict {
+            panic!("the close driver panicked")
+        }
+        let reaper = Arc::new(RemoteCreateReaper::new(N));
+        reaper.arm("term", None, Instant::now());
+        let r = reaper.clone();
+        let task = tokio::spawn(async move {
+            let claim = r
+                .claim_create_close("term", || Ok(false))
+                .expect("admitted");
+            assert_eq!(r.create_closes_in_flight("term"), 1);
+            run_create_close(claim, || async { driver_panics() }).await
+        });
+        assert!(task.await.expect_err("the driver panicked").is_panic());
+        assert_eq!(reaper.create_closes_in_flight("term"), 0);
+        assert!(!reaper.is_closing_under_create("term"));
+        assert_eq!(
+            reaper.bind_attach("term", Instant::now(), || true),
+            Ok(true)
+        );
+    }
+
     /// The scheduled path end to end on a paused tokio clock: arming schedules
     /// a sweep that fires at `N` and closes the never-attached terminal.
     #[tokio::test(start_paused = true)]
@@ -693,6 +1132,82 @@ mod tests {
         // So does a sweep.
         assert!(reaper.take_due(t0 + 3 * N).is_empty());
         assert!(!reaper.has_row("local-2"));
+    }
+
+    /// Every row state, including the one that matters most: mark_attached on
+    /// an armed row keeps the row until the sweep disarms it, and from then on
+    /// the attached terminal has NO row, which must still read as attached.
+    #[test]
+    fn ever_attached_reads_true_for_everything_but_an_armed_never_attached_row() {
+        let t0 = Instant::now();
+        let reaper = RemoteCreateReaper::new(N);
+
+        assert!(
+            reaper.was_ever_attached("never-armed"),
+            "no row fails closed"
+        );
+
+        reaper.arm("term", None, t0);
+        assert!(!reaper.was_ever_attached("term"));
+
+        reaper.mark_attached("term", t0);
+        assert!(reaper.has_row("term"), "the row survives the mark");
+        assert!(reaper.was_ever_attached("term"));
+
+        assert!(reaper.take_due(t0 + N).is_empty());
+        assert!(!reaper.has_row("term"), "the sweep disarms it");
+        assert!(
+            reaper.was_ever_attached("term"),
+            "disarmed is still attached"
+        );
+
+        reaper.mark_attached("marker", t0);
+        assert!(reaper.was_ever_attached("marker"));
+
+        reaper.arm("orphan", None, t0);
+        assert_eq!(reaper.take_due(t0 + 2 * N).len(), 1);
+        assert!(
+            reaper.was_ever_attached("orphan"),
+            "reaped: refused, not admitted"
+        );
+    }
+
+    /// A create grant's close leaves the terminal's armed row behind, by design:
+    /// at the deadline the sweep finds the terminal already gone and does nothing
+    /// worse than note it, once. Exercises the REAL manager's answer.
+    #[tokio::test]
+    async fn a_row_whose_terminal_a_create_grant_already_closed_sweeps_as_already_gone() {
+        let tm = Arc::new(crate::terminal::TerminalManager::new());
+        let session =
+            crate::terminal::session::tests::make_test_session(Arc::new(Mutex::new(Vec::new())));
+        tm.insert_for_test("term-closed", Arc::new(session));
+        let t0 = Instant::now();
+        let reaper = RemoteCreateReaper::new(N);
+        reaper.arm("term-closed", None, t0);
+
+        // The create grant's close is a forced end, whose driver lands on
+        // `TerminalManager::close` — not on `close_through`, whose probe would
+        // HOLD this pid-less test pane as unprovable.
+        tm.close("term-closed")
+            .expect("the create grant's forced close");
+        assert!(tm.get("term-closed").is_none(), "the pane is gone");
+
+        let outcomes = Arc::new(Mutex::new(Vec::new()));
+        let seen = outcomes.clone();
+        let close = move |id: String| {
+            let (target, seen) = (tm.clone(), seen.clone());
+            async move {
+                let outcome = close_through(target, id).await;
+                seen.lock().unwrap().push(outcome.clone());
+                outcome
+            }
+        };
+        assert_eq!(sweep(&reaper, t0 + N, &close).await.len(), 1);
+        assert!(sweep(&reaper, t0 + 2 * N, &close).await.is_empty());
+        assert_eq!(
+            *outcomes.lock().unwrap(),
+            vec![Ok(CloseOutcome::AlreadyGone)]
+        );
     }
 
     /// A test `ReapTarget` that behaves like a manager whose terminal carries
@@ -990,16 +1505,32 @@ mod tests {
         let (_, attach) = src
             .split_once("async fn handle_terminal_attach(")
             .expect("handle_terminal_attach");
+        // The mark now rides the bind itself, under the reaper's lock
+        // (`RemoteCreateReaper::bind_attach`), so the handler must hand the
+        // process-wide reaper to the gate that binds.
+        let reaper = attach
+            .find("let reaper = crate::mcp::remote_create_reaper::reaper();")
+            .expect("handle_terminal_attach must take the process-wide reaper");
+        let passed = attach
+            .find("admit_terminal_attach(\n            grants(),\n            &reaper,")
+            .expect("handle_terminal_attach must bind through the reaper");
         let gate = attach.find("match gate()").expect("attach gate");
-        let mark = attach
-            .find("remote_create_reaper::mark_attached(&terminal_id)")
-            .expect("handle_terminal_attach must mark the bound terminal attached");
         let flow = attach
             .find("flow_gates().remove(&block.grant_jti)")
             .expect("flow gate reset");
+        assert!(reaper < passed && passed < gate && gate < flow);
+
+        const TERMINAL_SRC: &str = include_str!("remote_terminal.rs");
+        let (_, admit) = TERMINAL_SRC
+            .split_once("pub fn admit_terminal_attach<")
+            .expect("admit_terminal_attach");
+        let admit = admit
+            .split_once("\n}\n")
+            .expect("end of admit_terminal_attach")
+            .0;
         assert!(
-            gate < mark && mark < flow,
-            "mark after the bind, in the same handler"
+            admit.contains("reaper.bind_attach(") && !admit.contains("if !grants.bind("),
+            "the attach bind must go through the reaper, never around it"
         );
     }
 }

@@ -103,6 +103,21 @@ const SCANNER_OWNED_KEYS: &[ScannerKey] = &[
         name: "phases",
         absent_rule: AbsentRule::OmitWhenAbsent,
     },
+    // The plan file's `Repo(s):` / `Repos:` line (`body_push::extract_repos`).
+    // `repos` has OTHER writers: sessions hand-write `metadata.repos` with
+    // `coord_work_unit_upsert`, in both `qontinui/<repo>` and bare spellings
+    // (measured on stored plan-backed units by plan
+    // `2026-11-02-plan-backed-work-units-carry-no-repos-so-coords-repo-readers-read-empty`). So it
+    // is OmitWhenAbsent, never DeleteWhenAbsent: a plan with no `Repo(s):`
+    // line (most of the corpus) leaves a hand-written list alone, while a plan
+    // that declares one overwrites it — the roster's documented precedence.
+    // coord reads it in `project_state.rs` (one-screen grouping) and
+    // `next_step.rs` `resolve_plan_repos` (continuation worktrees). Plan
+    // `2026-11-02-plan-backed-work-units-carry-no-repos-so-coords-repo-readers-read-empty` D3.
+    ScannerKey {
+        name: "repos",
+        absent_rule: AbsentRule::OmitWhenAbsent,
+    },
 ];
 
 /// True when the parser saw a declaration for `key` and rejected it. The two
@@ -142,6 +157,9 @@ fn build_metadata(u: &ParsedWorkUnit) -> Map<String, Value> {
     }
     if let Some(item) = &u.initiative_item {
         m.insert("initiative_item".to_string(), Value::String(item.clone()));
+    }
+    if !u.repos.is_empty() {
+        m.insert("repos".to_string(), serde_json::json!(u.repos));
     }
     m
 }
@@ -231,6 +249,7 @@ mod tests {
             initiative_item: None,
             initiative_item_rejected: None,
             phases: vec![phase(1)],
+            repos: vec![],
             source_path: format!("plans/{slug}.md"),
             content: String::new(),
         }
@@ -608,13 +627,16 @@ mod tests {
             for rejected in [false, true] {
                 for phases in [&[][..], &[1u32, 2][..]] {
                     for deps in [vec![], vec!["a".to_string()]] {
-                        out.push(ParsedWorkUnit {
-                            area: area.map(str::to_string),
-                            area_rejected: rejected
-                                .then(|| HeaderRejection::NotKebab("X".to_string())),
-                            depends_on: deps,
-                            ..phases_unit("s", phases)
-                        });
+                        for repos in [vec![], vec!["qontinui-coord".to_string()]] {
+                            out.push(ParsedWorkUnit {
+                                area: area.map(str::to_string),
+                                area_rejected: rejected
+                                    .then(|| HeaderRejection::NotKebab("X".to_string())),
+                                depends_on: deps.clone(),
+                                repos,
+                                ..phases_unit("s", phases)
+                            });
+                        }
                     }
                 }
             }
@@ -676,7 +698,12 @@ mod tests {
                             assert!(present, "`{}` sent as value or null: {active}", key.name)
                         }
                     }
-                    AbsentRule::OmitWhenAbsent => {}
+                    AbsentRule::OmitWhenAbsent => assert_eq!(
+                        present,
+                        build_metadata(&u).contains_key(key.name),
+                        "`{}` is sent exactly when the file supplies it: {active}",
+                        key.name
+                    ),
                 }
             }
             assert_eq!(archive["archive_path"], serde_json::json!(u.source_path));
@@ -752,6 +779,12 @@ mod tests {
         if let Some(area) = &u.area {
             m["area"] = Value::String(area.clone());
         }
+        // Not in the frozen arms: `repos` postdates them. Passed through so a
+        // unit that declares repos compares exactly on every OTHER key, and
+        // T5 still runs over the roster's `repos` dimension.
+        if !u.repos.is_empty() {
+            m["repos"] = serde_json::json!(u.repos);
+        }
         if !u.phases.is_empty() {
             return (Some(m), None);
         }
@@ -800,7 +833,7 @@ mod tests {
                 compared += 1;
             }
         }
-        assert_eq!(compared, 8 * stored_states.len());
+        assert_eq!(compared, 16 * stored_states.len());
     }
 
     // ---- Moved from push.rs, rewritten against the patches ----------------
@@ -976,5 +1009,116 @@ mod tests {
             );
             assert_eq!(stored["phase_vets"], serde_json::json!(["x"]), "{arm:?}");
         }
+    }
+
+    // ---- repos (plan 2026-11-02-…-repo-readers-read-empty, Phase 2) ----------
+
+    /// D3: a session hand-writes `metadata.repos`; a scan of a plan with NO
+    /// `Repo(s):` line keeps it, in every arm. The active patch omits the key.
+    /// Fails under `AbsentRule::DeleteWhenAbsent` (the patch would send
+    /// `repos: null` and coord's merge would delete the hand-written list).
+    #[tokio::test]
+    async fn a_session_written_repos_survives_a_scan_of_a_plan_with_no_repo_line() {
+        for arm in ARMS {
+            for phases in [&[1u32][..], &[][..]] {
+                let model = CoordMetadataModel::default();
+                let u = phases_unit("s", phases);
+                assert!(u.repos.is_empty());
+                scan(&model, &u, Arm::Create).await;
+                model.session_patch(
+                    "s",
+                    serde_json::json!({"repos": ["qontinui/qontinui-runner", "qontinui-coord"]}),
+                );
+                assert!(
+                    !active_dir_patch(&u)
+                        .as_object()
+                        .unwrap()
+                        .contains_key("repos"),
+                    "no declaration, no `repos` on the patch"
+                );
+                scan(&model, &u, arm).await;
+                assert_eq!(
+                    model.stored("s")["repos"],
+                    serde_json::json!(["qontinui/qontinui-runner", "qontinui-coord"]),
+                    "{arm:?}, phases {phases:?}: hand-written repos kept"
+                );
+            }
+        }
+    }
+
+    /// A plan that DECLARES `Repo(s):` emits `repos`, so the plan file wins
+    /// over a hand-written value — the roster's documented precedence. Never
+    /// on the archive patch (OmitWhenAbsent keys do not ride it).
+    #[tokio::test]
+    async fn a_repo_declaration_overwrites_a_hand_written_repos() {
+        for arm in ARMS {
+            let model = CoordMetadataModel::default();
+            let first = phases_unit("s", &[1]);
+            scan(&model, &first, Arm::Create).await;
+            model.session_patch("s", serde_json::json!({"repos": ["no", "so"]}));
+            let declared = ParsedWorkUnit {
+                repos: vec!["qontinui-runner".to_string(), "qontinui-coord".to_string()],
+                ..phases_unit("s", &[1])
+            };
+            scan(&model, &declared, arm).await;
+            assert_eq!(
+                model.stored("s")["repos"],
+                serde_json::json!(["qontinui-runner", "qontinui-coord"]),
+                "{arm:?}: the declaration overwrites"
+            );
+            assert!(!archive_dir_patch(&declared)
+                .as_object()
+                .unwrap()
+                .contains_key("repos"));
+        }
+    }
+
+    /// Through the real parser: a census-prose `Repo(s):` line puts only repo
+    /// names in the emitted metadata — no `no`, `so`, `main`, owner prefix or
+    /// trailing punctuation.
+    #[test]
+    fn census_prose_repo_lines_emit_only_repo_names() {
+        use super::super::parser::{parse_work_unit, PlanConvention};
+        let cases: [(&str, &[&str]); 4] = [
+            (
+                "> **Status: VETTED 2026-11-05.**\n> **Repo(s):** qontinui-coord only — no web migration, no schema change\n",
+                &["qontinui-coord"],
+            ),
+            (
+                "> **Repo(s):** `qontinui/qontinui-web` and `qontinui/qontinui-coord`. Two repos, two PRs.\n",
+                &["qontinui-web", "qontinui-coord"],
+            ),
+            (
+                "**Repo(s):** qontinui-coord (all phases). qontinui-web / qontinui-runner are read for a consumer census only (Phase 4), not modified.\n",
+                &["qontinui-coord"],
+            ),
+            (
+                "> **Repo(s):** `qontinui-runner` only. CI-only change: no Rust, no TypeScript, no migration, no DDL.\n",
+                &["qontinui-runner"],
+            ),
+        ];
+        for (body, want) in cases {
+            let u = parse_work_unit(
+                "s",
+                "plans/s.md",
+                &format!("# T\n\n{body}"),
+                &PlanConvention::operator_default(),
+            );
+            assert_eq!(
+                active_dir_patch(&u)["repos"],
+                serde_json::json!(want),
+                "{body}"
+            );
+        }
+        let none = parse_work_unit(
+            "s",
+            "plans/s.md",
+            "# T\n\nno repo line\n",
+            &PlanConvention::operator_default(),
+        );
+        assert!(!active_dir_patch(&none)
+            .as_object()
+            .unwrap()
+            .contains_key("repos"));
     }
 }

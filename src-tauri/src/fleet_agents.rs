@@ -27,8 +27,9 @@
 //! [`provision_agent_definitions_from_root`] now writes these embedded defaults
 //! FIRST and then overlays any checkout copies on top. An operator editing
 //! `qontinui-claude-config/.claude/agents/*.md` keeps the live-edit workflow
-//! they have today, byte for byte; a device with no checkout gets the embedded
-//! set instead of nothing.
+//! they have today, byte for byte (a RETIRED definition excepted: the overlay
+//! never delivers one); a device with no checkout gets the embedded set instead
+//! of nothing.
 //!
 //! **Both layers yield to the destination's own repository.** A definition the
 //! enclosing repo tracks is kept as it is, and so is an existing one when the
@@ -51,9 +52,24 @@
 //! carried config edits across: from the bundle's creation (`0245c2e96`,
 //! 2026-08-28) to its first full re-sync, `merge-specialist.md` drifted ~700
 //! lines and kept telling runner-provisioned specialists about a coord executor
-//! that no longer acts on their decision (coord finding `491c906f`). Unlike the
-//! skills bundle, no publish-cycle or CI parity check covers this directory
-//! yet, so a re-sync is still a hand carry.
+//! that no longer acts on their decision (coord finding `491c906f`). That gap
+//! is closed in `qontinui-claude-config`: `scripts/fleet-bundle-sync.sh`
+//! carries this directory from its source (it joined the sync's bundle pairs on
+//! 2026-09-24), and `.github/workflows/fleet-agents-parity.yml` gates it hourly
+//! through `scripts/agent-bundle-parity.sh` (ccfg#1152). Until 2026-11-07 this
+//! paragraph still said no check covered it.
+//!
+//! ## Retiring a definition starts here
+//!
+//! Neither of those deletes anything. The sync never removes a bundled file,
+//! and the gate reads a bundled file with no source as a `SOURCE_ABSENT`
+//! violation, so a definition leaves this directory FIRST (`git rm` its `.md`
+//! and add its line to [`RETIRED_AGENTS`]) and its source second. `git rm`
+//! stops it shipping, but a copy this binary, an older one or a checkout
+//! overlay already wrote stays in every workdir it reached.
+//! [`remove_retired_agents`] removes that copy on the next provisioning pass,
+//! when its git blob id is one the definition shipped as. A copy with any other
+//! blob is somebody's edit, so it is kept.
 //!
 //! Because they ship to every fleet device they must stay free of any one
 //! operator's absolute paths — see
@@ -63,7 +79,7 @@ use std::path::Path;
 
 use include_dir::{include_dir, Dir};
 
-use crate::capability_manifest::{self, ProvisionReport, SkipReason};
+use crate::capability_manifest::{self, ProvisionReport, RetainedReason, SkipReason};
 use crate::provision_guard::KeepDecisions;
 
 /// The embedded subagent definitions. A flat directory of `*.md`, matching what
@@ -88,6 +104,11 @@ static FLEET_AGENTS: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/src/fleet_agent
 ///
 /// Only `*.md` at the top level is written — the same filter the checkout copy
 /// applies, so the two layers cannot disagree about what counts as a definition.
+///
+/// It removes nothing, and neither layer writes a RETIRED name: none is
+/// bundled, and the checkout overlay skips them. Removing a copy an older binary
+/// left is [`remove_retired_agents`]'s job, which the caller runs after both
+/// layers.
 ///
 /// **The report changes no behaviour.** This function was fail-soft from its
 /// caller's side already (`agent_runtime` catches the `Err`, warns, and
@@ -126,7 +147,7 @@ pub(crate) fn provision_fleet_agents_into(
             continue;
         }
         // Per-file rather than `?`: one unwritable definition must not cost the
-        // session the other four, and it must be NAMED rather than aborting the
+        // session the others, and it must be NAMED rather than aborting the
         // pass at whatever point it happened to reach.
         match std::fs::write(dst_dir.join(name), file.contents()) {
             Ok(()) => out.record_written(),
@@ -157,6 +178,212 @@ pub(crate) fn embedded_agent_count() -> usize {
         .files()
         .filter(|f| f.path().extension().and_then(|e| e.to_str()) == Some("md"))
         .count()
+}
+
+/// Every subagent definition this binary has RETIRED. One line per file: the
+/// file name with its `.md`, then every git blob id the file ever shipped as,
+/// separated by single spaces. The installer's half of the same retirement, the
+/// qontinui-claude-config PR that deletes the source file, will give
+/// `scripts/install-agents.sh` a `RETIRED_AGENTS` table of the same shape, with
+/// a file's line byte-identical to the one here.
+///
+/// A line lists the blobs of the SOURCE's whole history, not only the ones this
+/// directory bundled, because an older binary's checkout overlay copied from the
+/// source and a workdir can hold any of them, including a blob that only ever sat on an
+/// open PR's branch a checkout was standing on. A line only grows: the bundle sync never
+/// re-adds a deleted file, so a blob that ships after the line is written is
+/// never learned here.
+pub(crate) const RETIRED_AGENTS: &[&str] = &[
+    // Retired by plan
+    // 2026-11-06-what-the-fleet-records-and-advertises-matches-what-actually-ran,
+    // Phase 6: nothing dispatched it, and its body contradicted served policy
+    // (`testing` coverage-is-enumerated-not-salient and a-test-must-be-able-to-fail;
+    // `escalation-bar` escalation-closed-list).
+    // The first five blobs are its whole history on qontinui-claude-config main,
+    // of which this directory shipped 8c23f14a, d80c5d1d and 3908f6b9. The last
+    // two are its blobs at the two commits (c0648db7, 4a60b2d4f3d4) of
+    // qontinui-claude-config#2413, which was open and editing it when it was
+    // retired.
+    "test-generator.md 3908f6b9811fea0b8f7bc68f7d0bf9022015a537 d80c5d1d620bb8f9e2acdd756eadc22b624794a0 8c23f14a7cbaaf04d35f68ad13745242f91012b6 d8d6673b504bb9f37155ec0acecb8fc02859ae95 7b5318b48ebfaaeaba1aaff7d86f99c0bbb07535 0bb59a9cea7f0a8c598f648e40f27300bcda9dde 7b6360157dc99a9c86919343a0cc3a65b8ee6091",
+];
+
+/// `line` split into its file name and the blob ids after it.
+fn parse_retired_line(line: &str) -> (&str, Vec<&str>) {
+    let mut fields = line.split(' ');
+    let name = fields.next().unwrap_or_default();
+    (name, fields.collect())
+}
+
+/// File names of the definitions `retired` lists. They are candidates
+/// [`KeepDecisions::decide`] must be asked about, so a retired copy the
+/// enclosing repository tracks is kept like any other tracked definition.
+pub(crate) fn retired_agent_names(retired: &[&str]) -> Vec<String> {
+    retired
+        .iter()
+        .map(|line| parse_retired_line(line).0.to_string())
+        .collect()
+}
+
+/// Remove from `<workdir>/.claude/agents` every definition `retired` lists
+/// whose copy on disk is a blob it shipped as, and record each removal on
+/// `report`.
+///
+/// Only the workdir's own files are ever removed: when `.claude` or
+/// `.claude/agents` is reached through a symlink (the directory does not
+/// canonicalize to `<canonical workdir>/.claude/agents`), a shipped copy there
+/// is kept and recorded as [`RetainedReason::LinkedElsewhere`]. The workspace
+/// root's `.claude` is such a link into qontinui-claude-config, whose copies
+/// are that repository's own.
+///
+/// What stays, by arm:
+/// - **absent**: nothing to do;
+/// - **kept by `keep`**: a copy the enclosing repository tracks, or one that
+///   existed when the tracked-file probe could not answer inside a repository,
+///   stays exactly as both provisioning layers keep it (`keep` was decided
+///   before either layer wrote), and is recorded as
+///   [`RetainedReason::KeptByRepository`];
+/// - **any other blob**: somebody edited it, so it is kept, logged and
+///   recorded as [`RetainedReason::LocallyModified`]. That is the
+///   own-files-only rule `install-agents.sh --uninstall` applies;
+/// - **unreadable or unremovable**: kept, and recorded as
+///   [`RetainedReason::ReadFailed`] / [`RetainedReason::RemoveFailed`], so the
+///   pass reads degraded and names a retired definition that may still resolve. A
+///   copy that vanishes between the read and the removal (a concurrent pass
+///   into the same workdir) is already gone and is not recorded.
+///
+/// A blob is matched on the bytes as they are and on the same bytes with CRLF
+/// folded to LF. A checkout with `core.autocrlf=true` holds a CRLF copy of a
+/// blob git stores as LF, and that copy is the shipped content, not an edit
+/// (`agent-bundle-parity.sh` compares through the same fold).
+///
+/// It never fails and never panics: a pass that could not finish still leaves
+/// the spawn running, as with both layers before it.
+pub(crate) fn remove_retired_agents(
+    workdir: &Path,
+    keep: &KeepDecisions,
+    retired: &[&str],
+    report: &mut ProvisionReport,
+) {
+    let dst_dir = workdir.join(".claude").join("agents");
+    let linked = match (dst_dir.canonicalize(), workdir.canonicalize()) {
+        (Ok(dst), Ok(root)) => {
+            (dst != root.join(".claude").join("agents")).then(|| dst.display().to_string())
+        }
+        // No agents directory: nothing retired can be on disk.
+        _ => return,
+    };
+    for line in retired {
+        let (name, shipped) = parse_retired_line(line);
+        // This function deletes files, so it trusts no name: exactly one plain
+        // path component, or nothing happens (a `C:x.md` or `../x.md` would
+        // otherwise make `join` leave the agents directory).
+        let mut components = Path::new(name).components();
+        if !matches!(
+            (components.next(), components.next()),
+            (Some(std::path::Component::Normal(_)), None)
+        ) {
+            tracing::warn!("fleet_agents: ignoring retired entry {name:?}: not a plain file name");
+            continue;
+        }
+        let path = dst_dir.join(name);
+        if let Some(reason) = keep.reason(name) {
+            if std::fs::symlink_metadata(&path).is_ok() {
+                tracing::info!(
+                    "fleet_agents: keeping retired {} as it is on disk — {}",
+                    path.display(),
+                    reason.describe()
+                );
+                report.record_retained_retired(
+                    name,
+                    RetainedReason::KeptByRepository(reason.wire().to_string()),
+                );
+            }
+            continue;
+        }
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                tracing::warn!(
+                    "fleet_agents: could not read retired {}, so it is kept: {e}",
+                    path.display()
+                );
+                report.record_retained_retired(name, RetainedReason::ReadFailed(e.to_string()));
+                continue;
+            }
+        };
+        let blob = match shipped_blob(&bytes, &shipped) {
+            Ok(blob) => blob,
+            Err(own) => {
+                tracing::warn!(
+                    "fleet_agents: keeping retired {} — locally modified (blob {own} is not \
+                     one it shipped as)",
+                    path.display()
+                );
+                report.record_retained_retired(name, RetainedReason::LocallyModified(own));
+                continue;
+            }
+        };
+        if let Some(resolved) = &linked {
+            tracing::warn!(
+                "fleet_agents: keeping retired {} — .claude/agents is reached through a \
+                 symlink, to {resolved}",
+                path.display()
+            );
+            report.record_retained_retired(name, RetainedReason::LinkedElsewhere(resolved.clone()));
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                tracing::info!(
+                    "fleet_agents: removed retired {} (blob {blob}, one it shipped as)",
+                    path.display()
+                );
+                report.record_removed(name, blob);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                tracing::info!(
+                    "fleet_agents: retired {} was already removed by a concurrent pass",
+                    path.display()
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "fleet_agents: could not remove retired {}: {e}",
+                    path.display()
+                );
+                report.record_retained_retired(name, RetainedReason::RemoveFailed(e.to_string()));
+            }
+        }
+    }
+}
+
+/// The blob in `shipped` that `bytes` is, as they are or with CRLF folded to
+/// LF; otherwise `Err` carrying the bytes' own blob id, for the record.
+fn shipped_blob(bytes: &[u8], shipped: &[&str]) -> Result<String, String> {
+    let raw = crate::provenance::git_blob_id(bytes);
+    if shipped.contains(&raw.as_str()) {
+        return Ok(raw);
+    }
+    if bytes.windows(2).any(|pair| pair == b"\r\n") {
+        let folded = crate::provenance::git_blob_id(&fold_crlf(bytes));
+        if shipped.contains(&folded.as_str()) {
+            return Ok(folded);
+        }
+    }
+    Err(raw)
+}
+
+/// `bytes` with every CRLF pair folded to LF. A lone CR is kept.
+fn fold_crlf(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'\r' && bytes.get(i + 1) == Some(&b'\n') {
+            continue;
+        }
+        out.push(b);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -294,5 +521,91 @@ mod tests {
              this subagent specifically, so dropping it from the bundle silently makes \
              that policy unsatisfiable on a checkout-less device"
         );
+    }
+
+    /// The `test-generator.md` line is pinned byte for byte, because a blob
+    /// dropped from it would leave that version's copies on disk forever. The
+    /// qontinui-claude-config PR that deletes the source will give
+    /// `scripts/install-agents.sh` the same line.
+    #[test]
+    fn the_retired_table_carries_every_blob_test_generator_shipped_as() {
+        assert_eq!(
+            RETIRED_AGENTS,
+            &[
+                "test-generator.md 3908f6b9811fea0b8f7bc68f7d0bf9022015a537 \
+               d80c5d1d620bb8f9e2acdd756eadc22b624794a0 \
+               8c23f14a7cbaaf04d35f68ad13745242f91012b6 \
+               d8d6673b504bb9f37155ec0acecb8fc02859ae95 \
+               7b5318b48ebfaaeaba1aaff7d86f99c0bbb07535 \
+               0bb59a9cea7f0a8c598f648e40f27300bcda9dde \
+               7b6360157dc99a9c86919343a0cc3a65b8ee6091"
+            ]
+        );
+        assert_eq!(
+            retired_agent_names(RETIRED_AGENTS),
+            vec!["test-generator.md".to_string()]
+        );
+    }
+
+    /// Every line parses into a top-level `.md` name and at least one full,
+    /// lowercase blob id, and no retired name is still bundled: a bundled one
+    /// would be written by the floor and removed again on every pass.
+    #[test]
+    fn every_retired_line_is_well_formed_and_no_longer_bundled() {
+        assert!(!RETIRED_AGENTS.is_empty(), "the table guard went stale");
+        let bundled = embedded_agent_names();
+        for line in RETIRED_AGENTS {
+            let (name, blobs) = parse_retired_line(line);
+            assert!(
+                name.ends_with(".md") && !name.contains('/') && !name.contains('\\'),
+                "retired name {name:?} is not a top-level definition file"
+            );
+            assert!(
+                !blobs.is_empty(),
+                "{name}: a line with no blob removes nothing"
+            );
+            for blob in &blobs {
+                assert!(
+                    blob.len() == 40
+                        && blob
+                            .chars()
+                            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+                    "{name}: {blob:?} is not a full lowercase git blob id"
+                );
+            }
+            assert!(
+                !bundled.iter().any(|b| b == name),
+                "{name} is retired but still bundled in src-tauri/src/fleet_agents/"
+            );
+        }
+    }
+
+    /// A blob matches on the bytes as they are and on the CRLF-folded bytes
+    /// (an autocrlf checkout's copy of an LF blob), and on nothing else. A lone
+    /// CR is content, not a line ending, so folding keeps it.
+    #[test]
+    fn a_shipped_blob_matches_as_written_or_with_crlf_folded_and_nothing_else() {
+        let lf = b"---\nname: x\n---\nbody\n".as_slice();
+        let lf_blob = crate::provenance::git_blob_id(lf);
+        let shipped = [lf_blob.as_str()];
+        assert_eq!(shipped_blob(lf, &shipped), Ok(lf_blob.clone()));
+        let crlf = b"---\r\nname: x\r\n---\r\nbody\r\n".as_slice();
+        assert_eq!(
+            shipped_blob(crlf, &shipped),
+            Ok(lf_blob.clone()),
+            "an autocrlf copy of a shipped LF blob is the shipped content"
+        );
+        let edited = b"---\nname: x\n---\nedited\n".as_slice();
+        assert_eq!(
+            shipped_blob(edited, &shipped),
+            Err(crate::provenance::git_blob_id(edited)),
+            "an edited copy reports its own blob"
+        );
+        assert_eq!(
+            shipped_blob(crlf, &[]),
+            Err(crate::provenance::git_blob_id(crlf)),
+            "an unmatched CRLF copy reports its raw blob, not the folded one"
+        );
+        assert_eq!(fold_crlf(b"a\r\nb\rc\r\n"), b"a\nb\rc\n".to_vec());
     }
 }

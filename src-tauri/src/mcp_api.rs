@@ -5549,20 +5549,23 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 /// operator: "agents should have all drain tools"; evidence finding
 /// `f802311d-aef5-40e8-a5f8-4bd3a554b37e`) makes handing them to every agent
 /// the intent, so that rationale no longer holds. coord's half of the decision
-/// puts all five on `DEVICE_DEFAULT_TOOLS`; it is NOT on coord `origin/main` as
-/// of this change (`DEVICE_FLOOR_PRIVILEGED_EXCLUSIONS` still fences the four
-/// writes off the device floor). coord stays the gate on who may call them; what bounds
+/// puts all five on `DEVICE_DEFAULT_TOOLS` and takes the four writes out of
+/// `DEVICE_FLOOR_PRIVILEGED_EXCLUSIONS`; it landed on coord `main` as
+/// qontinui-coord#3729 (`b0b01bc1d`), after this list's change. Landed is not
+/// served: a coord deployment predating it still fences the four writes off the
+/// device floor. coord stays the gate on who may call them; what bounds
 /// a call is coord's, unchanged from `decision_record/fleet-drain-agent-authority`:
 /// the ownership floor (the device is in the caller's tenant), the redacted
 /// `drained_by`, an unreadable drain set never reading `Clear`, and the mandatory
 /// `until`, so every drain is reversible and self-expiring. Prefer a lane-scoped
 /// drain (`lanes: ["agent"]`) when only spawns need holding, so CI keeps running.
-/// Forwarding ahead of coord's floor change: until it lands, coord itself
-/// refuses a device principal and an agent curated by a role template, while a
-/// row-less (un-curated) agent, whose catalog is coord's whole surface, gains
-/// the levers at once. That is the outcome the decision intends, not a leak.
-/// Until then a device's `tools/list` will not advertise the four writes, so
-/// they show in `coordMcpForwardedUnadvertised`; that is expected, not drift.
+/// Against such a pre-#3729 coord, coord itself refuses a device principal and
+/// an agent curated by a role template, while a row-less (un-curated) agent,
+/// whose catalog is coord's whole surface, holds the levers regardless. That is
+/// the outcome the decision intends, not a leak. On that coord a device's
+/// `tools/list` does not advertise the four writes, so they show in
+/// `coordMcpForwardedUnadvertised`; that is a coord-deployment lag, not drift
+/// here, and it should clear once the serving coord contains `b0b01bc1d`.
 ///
 /// LOAD-BEARING, do not strip as "reads nobody uses": `coord_list_prompt_documents`
 /// and `coord_get_prompt_document` are how the fleet reads served POLICY, and the
@@ -11532,6 +11535,7 @@ struct ProvisionSessionBody {
 /// | Status | `code` | Meaning |
 /// |---|---|---|
 /// | 400 | `COORD_MCP_PROVISION_INVALID_BODY` | body is not `{cwd:String, tenant?:Uuid}` — `tenant_id` is accepted as an alias for `tenant`; a non-UUID tenant, both spellings at once, and any other key all land here |
+/// | 400 | `INVALID_UTF8` | body is not UTF-8 (e.g. a non-ASCII `cwd` sent by Git Bash `curl -d` in the ANSI code page); the message names the encoding remedy |
 /// | 400 | `COORD_MCP_PROVISION_INVALID_CWD` | `cwd` empty or not an existing dir |
 /// | 403 | `COORD_MCP_PROVISION_NO_HANDSHAKE` | no (or empty) `X-Qontinui-Loopback-Key` header |
 /// | 403 | `COORD_MCP_PROVISION_HANDSHAKE_MISMATCH` | handshake presented, not this runner start's key |
@@ -11608,6 +11612,13 @@ fn provision_session_after_gate(body: &[u8]) -> axum::response::Response {
     let req: ProvisionSessionBody = match serde_json::from_slice(body) {
         Ok(r) => r,
         Err(e) => {
+            // A `cwd` under a non-ASCII Windows profile dir, sent by Git Bash
+            // `curl -d`, arrives in the ANSI code page — an ENCODING problem,
+            // not a shape one. Same diagnosis as every other JSON door
+            // (`envelope::invalid_utf8_message`).
+            if let Some(msg) = crate::mcp::envelope::invalid_utf8_message(&e.to_string()) {
+                return crate::mcp::envelope::envelope_400_invalid_utf8(msg).into_response();
+            }
             return provision_refusal(
                 axum::http::StatusCode::BAD_REQUEST,
                 "COORD_MCP_PROVISION_INVALID_BODY",
@@ -11870,6 +11881,14 @@ async fn vcs_create_pull_request_handler(
     let req: VcsPullRequestBody = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(e) => {
+            // A body that is not UTF-8 is an ENCODING problem, not a shape
+            // one — the same diagnosis the `Json<T>` extractor paths and the
+            // plan-library write door give (`envelope::invalid_utf8_message`).
+            // PR bodies are full of em dashes, which Git Bash curl sends as
+            // the single ANSI byte `0x97`.
+            if let Some(msg) = crate::mcp::envelope::invalid_utf8_message(&e.to_string()) {
+                return crate::mcp::envelope::envelope_400_invalid_utf8(msg).into_response();
+            }
             return (
                 axum::http::StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({
@@ -21327,6 +21346,22 @@ mod coord_provision_session_gate_tests {
         }
     }
 
+    /// A body that is not UTF-8 — a non-ASCII `cwd` Git Bash curl sent in the
+    /// ANSI code page (`0xE9` for `é`) — answers `INVALID_UTF8` with the
+    /// encoding remedy, not `COORD_MCP_PROVISION_INVALID_BODY`.
+    #[tokio::test]
+    async fn a_non_utf8_body_is_invalid_utf8_not_invalid_body() {
+        let _amb = crate::test_env::isolated_ambient();
+        let resp = super::provision_session_after_gate(b"{\"cwd\":\"C:/Users/Jos\xe9\"}");
+        assert_eq!(resp.status(), 400);
+        let v = body_json(resp).await;
+        assert_eq!(v["code"], "INVALID_UTF8");
+        assert!(v["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("request body is not valid UTF-8"));
+    }
+
     /// The route-level half of `659b574a`: the measured defect was
     /// `{"cwd", "tenant_id": <unpaired>}` answering **200** with a document
     /// minted on the default slot. Through the post-gate half it must now be the
@@ -23103,6 +23138,39 @@ mod vcs_pr_proxy_tests {
         assert_eq!(resp.status(), 401);
         let v = body_json(resp).await;
         assert_eq!(v["code"], "VCS_PR_PROXY_UNAUTHORIZED");
+    }
+
+    /// A PR body that is not UTF-8 (the `0x97` em dash Git Bash curl sends)
+    /// answers `INVALID_UTF8` with the encoding remedy, not the generic
+    /// `VCS_PR_PROXY_BAD_REQUEST` deserialize text.
+    #[tokio::test]
+    async fn non_utf8_pr_body_answers_invalid_utf8() {
+        let _amb = crate::test_env::isolated_ambient();
+        let nonce = crate::coord_mcp::register_agent_proxy_nonce(
+            "/tmp/vcs-pr-proxy-invalid-utf8-test",
+            uuid::Uuid::new_v4(),
+        );
+        let resp = vcs_router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/vcs/pull-requests")
+                    .header("X-Coord-Mcp-Proxy-Key", &nonce)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        &b"{\"repo\":\"a/b\",\"head\":\"h\",\"title\":\"a \x97 b\"}"[..],
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        let v = body_json(resp).await;
+        assert_eq!(v["code"], "INVALID_UTF8");
+        assert!(v["error"]
+            .as_str()
+            .unwrap()
+            .contains("request body is not valid UTF-8"));
     }
 
     /// An AGENT-bound nonce is ACCEPTED by the principal gate (coord-spawned
