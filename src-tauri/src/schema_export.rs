@@ -614,9 +614,6 @@ pub fn export_all_schemas() -> Value {
     add!("LLMCostSummary", qe::LLMCostSummary);
     add!("CostTrendDataPoint", qe::CostTrendDataPoint);
     add!("CostTrendResponse", qe::CostTrendResponse);
-    add!("HistoricalActionQuery", qe::HistoricalActionQuery);
-    add!("HistoricalActionResult", qe::HistoricalActionResult);
-    add!("PlaybackFrameRequest", qe::PlaybackFrameRequest);
 
     // ── qontinui-types: state_machine (Session 4d) ──
     add!("StandardActionType", qsm::StandardActionType);
