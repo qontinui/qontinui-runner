@@ -1641,6 +1641,15 @@
     },
     {
       "class": "repo_layout",
+      "file": "src/ci_node/ops.rs",
+      "symbol": "const DEFAULT_OPS_REPO",
+      "excerpt": "const DEFAULT_OPS_REPO: &str = \"qontinui/qontinui-claude-config\";",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "Default repo for the D4 ops-lane script allowlist; overridden by OPS_REPO_ENV, and the lane is dark unless coord enables it."
+    },
+    {
+      "class": "repo_layout",
       "file": "src/commands/config.rs",
       "symbol": "get_workspace_paths_impl",
       "excerpt": ".join(\"qontinui-claude-config\")",
