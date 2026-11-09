@@ -507,7 +507,9 @@ mod lifecycle_carrier_tests {
         assert_eq!(v["env"][DISABLE_AUTOUPDATER_ENV], "1");
         assert_eq!(v["env"]["KEEP"], "x");
         let bad_env = format!(r#"{{{base},"env":[]}}"#);
-        assert!(build_settings(&bad_env, p, p, p, p, p, p, StopHookRegistration::Omitted).is_none());
+        assert!(
+            build_settings(&bad_env, p, p, p, p, p, p, StopHookRegistration::Omitted).is_none()
+        );
         // An http entry in the COMMAND template would be written whatever the
         // route gate says, so it is malformed there. The entry also carries a
         // resolvable `command`, so the http guard is the ONLY thing that
@@ -522,9 +524,17 @@ mod lifecycle_carrier_tests {
         };
         let with_http = stop_entry("http");
         assert!(serde_json::from_str::<serde_json::Value>(&with_http).is_ok());
-        assert!(
-            build_settings(&with_http, p, p, p, p, p, p, StopHookRegistration::Registered).is_none()
-        );
+        assert!(build_settings(
+            &with_http,
+            p,
+            p,
+            p,
+            p,
+            p,
+            p,
+            StopHookRegistration::Registered
+        )
+        .is_none());
         assert!(build_settings(
             &stop_entry("command"),
             p,
@@ -741,8 +751,17 @@ mod lifecycle_carrier_tests {
     #[test]
     fn a_malformed_lifecycle_template_fails_open() {
         let p = Path::new("/x/s.sh");
-        let built =
-            build_settings(HOOK_SETTINGS, p, p, p, p, p, p, StopHookRegistration::Omitted).unwrap();
+        let built = build_settings(
+            HOOK_SETTINGS,
+            p,
+            p,
+            p,
+            p,
+            p,
+            p,
+            StopHookRegistration::Omitted,
+        )
+        .unwrap();
         let entry = |url: &str, on_failure: &str, kind: &str| {
             format!(r#"{{"type":"{kind}","url":"{url}","onFailure":"{on_failure}"}}"#)
         };
@@ -2699,7 +2718,8 @@ mod tests {
         ];
         for (name, template) in bad_stop_only {
             assert!(
-                build_settings(template, p, p, p, p, p, p, StopHookRegistration::Registered).is_none(),
+                build_settings(template, p, p, p, p, p, p, StopHookRegistration::Registered)
+                    .is_none(),
                 "{name} must fail open when the Stop hook is being registered"
             );
             let out = build_settings(template, p, p, p, p, p, p, StopHookRegistration::Omitted)
