@@ -940,14 +940,21 @@ pub(crate) fn is_action_advertised(action: &str, supported: &Option<Vec<String>>
 }
 
 /// True only for a recovery that actually did something and worked: a command
-/// was chosen AND the original action succeeded on the retry.
+/// was chosen AND the original action's retry read `succeeded`.
 ///
 /// `recovered:true` with `command_chosen:None` is the shape the LLM fallback
 /// used to produce — it asserted a recovery while admitting no recovery step
 /// was selected. That is not a recovery, so the caller must see the ORIGINAL
 /// failure, not a synthesized verdict about it.
+///
+/// `retry_outcome` is read beside `recovered` instead of trusting the two to
+/// agree. `RecoveryOutcome::record_retry` keeps them in step in production,
+/// but both are `pub` fields that a struct literal can set apart, and a
+/// `recovered: true` beside an `indeterminate` retry must not answer HTTP 200.
 pub(crate) fn recovery_is_genuine(recovery: &super::recovery_executor::RecoveryOutcome) -> bool {
-    recovery.recovered && recovery.command_chosen.is_some()
+    recovery.recovered
+        && recovery.retry_outcome == super::recovery_executor::RetryOutcome::Succeeded
+        && recovery.command_chosen.is_some()
 }
 
 /// Alias for the `execute_action` handler's own return type — the value that
@@ -2064,6 +2071,7 @@ async fn execute_action_dispatch(
                 result = Ok(Json(ok));
             } else {
                 warn!(
+                    retry_outcome = ?recovery.retry_outcome,
                     "execute_action: RecoveryExecutor could not recover element {} \
                      (code={:?}, recovered={}, command={:?}) — surfacing the original failure",
                     id, recovery.error_code, recovery.recovered, recovery.command_chosen
@@ -7083,6 +7091,32 @@ mod action_not_supported_tests {
         );
         assert!(!recovery_is_genuine(&mk(false, Some("scroll_into_view"))));
         assert!(!recovery_is_genuine(&mk(false, None)));
+    }
+
+    /// `recovered` alone is not trusted. A `recovered: true` beside a retry
+    /// that did not read `succeeded` (the two fields set apart, as a struct
+    /// literal can) is not a recovery, so the route surfaces the original
+    /// failure instead of answering HTTP 200.
+    #[test]
+    fn recovered_beside_a_retry_that_did_not_succeed_is_not_a_recovery() {
+        for retry_outcome in [
+            RetryOutcome::Failed,
+            RetryOutcome::Indeterminate,
+            RetryOutcome::NotRetried,
+        ] {
+            let outcome = RecoveryOutcome {
+                recovered: true,
+                retry_outcome,
+                via: RecoveryVia::StructuredCommand,
+                command_chosen: Some("scroll_into_view".to_string()),
+                error_code: None,
+                result: None,
+            };
+            assert!(
+                !recovery_is_genuine(&outcome),
+                "recovered:true beside retryOutcome {retry_outcome:?} must not count as a recovery"
+            );
+        }
     }
 
     /// THE iteration-9 defect: a genuine post-dispatch FAILURE was relabelled
