@@ -29,10 +29,10 @@
 //! session-scope in-flight registry ([`super::in_flight`]; two concurrent calls
 //! naming one id: the second is `skipped(in_flight)`, and a session an account
 //! migration or the respawn receiver is moving is `skipped(in_flight(<who>))`),
-//! a process-table read that refuses an id some live
-//! `claude` already holds (`skipped(live_process)`), and the batch itself runs
-//! in a DETACHED task, so a caller that disconnects mid-batch neither cancels
-//! the remaining ids nor leaves a half-verified spawn behind — every id still
+//! a process-table read that refuses an id some live `claude` already holds
+//! (`skipped(live_process)`), and the batch itself runs in a DETACHED task, so
+//! a caller that disconnects mid-batch neither cancels the remaining ids nor
+//! leaves a half-verified spawn behind — every id still
 //! gets its verdict, in the log if nobody is waiting for the response.
 //!
 //! ## Per-id flow ([`resume_one`])
@@ -50,7 +50,10 @@
 //! 4. the per-session account-hop budget, `MIGRATION_CAP`, shared with the
 //!    automatic migration and the respawn receiver (checked last, immediately
 //!    before the spawn, because the check consumes a slot);
-//! 5. spawn, then VERIFY BY READING THE PROCESS: exactly one `claude --resume
+//! 5. spawn, PROVE the resumed CLI alive (running and painting,
+//!    [`crate::terminal::respawn_liveness`]; a pane that dies is retried, and an
+//!    id whose every attempt died is `failed(respawn-died: …)`), then VERIFY BY
+//!    READING THE PROCESS: exactly one `claude --resume
 //!    <id>` under the new pane, whose cwd and `CLAUDE_CONFIG_DIR` (where the
 //!    platform exposes them) are the ones the row recorded.
 //!
@@ -608,7 +611,7 @@ async fn resume_one(
     store: &SessionLifecycleStore,
     cand: Candidate,
 ) -> ResumeRow {
-    // One mover per id at a time, held through spawn AND verify.
+    // One mover per id at a time, held through spawn, proof AND verify.
     let _in_flight = match claim_for_door(&cand.id) {
         Ok(claim) => claim,
         Err(why) => return ResumeRow::skipped(&cand.id, why),
@@ -647,11 +650,11 @@ async fn resume_one(
         DrainGate::Allow => DrainGate::Allow,
         deferred => deferred,
     };
-    // The ABSOLUTE binary, retried, never the bare name (whose pane can find
-    // the identity shim first and exit 127 mid CLI-reinstall). Resolved BEFORE
-    // `admit` consumes a cap slot, so a CLI that stays missing spends no budget
-    // and the id is a pre-spawn skip.
-    let claude_bin = match crate::claude_cli_spawn::resolve_resume_claude_bin().await {
+    // A launchable ABSOLUTE `claude` must resolve (retried, never the bare
+    // name) BEFORE `admit` consumes a cap slot, so a CLI that stays missing
+    // spends no budget and the id is a pre-spawn skip. The first spawn uses
+    // this path; each retry resolves again.
+    let first_bin = match crate::claude_cli_spawn::resolve_resume_claude_bin().await {
         Ok(bin) => bin,
         Err(e) => return ResumeRow::skipped(&cand.id, e),
     };
@@ -675,8 +678,125 @@ async fn resume_one(
     ) {
         info!(id = %cand.id, "resume_door: released the closed row's settled gate identity");
     }
-    let spawn = {
-        let (app, tm, registry, cand) = (app.clone(), tm.clone(), registry.clone(), cand.clone());
+    // Spawn, then PROVE the resumed CLI alive (running and painting) before
+    // the process read below — a child that exits before painting is retried,
+    // and when every attempt dies the dead pane is closed and the id reported
+    // failed, never resumed.
+    let mut effects = DoorRespawn {
+        first_bin: Some(first_bin),
+        app: app.clone(),
+        tm: tm.clone(),
+        registry: registry.clone(),
+        cand: cand.clone(),
+    };
+    let outcome = crate::terminal::respawn_liveness::confirm_respawn(
+        &mut effects,
+        store,
+        None,
+        crate::terminal::respawn_liveness::MAX_RESPAWN_ATTEMPTS,
+    )
+    .await;
+    let terminal_id = match proven_terminal(&cand.id, outcome) {
+        Ok(terminal_id) => terminal_id,
+        Err(row) => return *row,
+    };
+    match verify(tm, &cand, &terminal_id).await {
+        Ok(ev) => ResumeRow::resumed(&cand.id, ev),
+        Err(reason) => ResumeRow::failed(
+            &cand.id,
+            reason,
+            Some(ProcessEvidence {
+                terminal_id,
+                pid: None,
+                cmdline: None,
+                cwd: None,
+                claude_config_dir: None,
+            }),
+        ),
+    }
+}
+
+/// Pure: the terminal a proven respawn landed on, or the id's `failed` row.
+/// Only [`RespawnOutcome::Alive`] proceeds to the process read; a death is
+/// `failed(respawn-died: …)`, never `resumed`.
+fn proven_terminal(
+    id: &str,
+    outcome: crate::terminal::respawn_liveness::RespawnOutcome,
+) -> Result<String, Box<ResumeRow>> {
+    use crate::terminal::respawn_liveness::RespawnOutcome;
+    match outcome {
+        RespawnOutcome::Alive { terminal_id, .. } => Ok(terminal_id),
+        RespawnOutcome::NotSpawned(e) => {
+            Err(Box::new(ResumeRow::failed(id, format!("spawn: {e}"), None)))
+        }
+        // Only a migration (which has an old pane) rolls back; never here.
+        RespawnOutcome::UnconfirmedRolledBack { .. } => Err(Box::new(ResumeRow::failed(
+            id,
+            "resumed_cli_never_painted",
+            None,
+        ))),
+        // The user closed the pane while it was being proven: their answer,
+        // not a failure to retry.
+        // An old-pane close is a migration's only (`old: None` here), so the
+        // second arm never fires; it reads the same as a user close.
+        RespawnOutcome::ClosedByUser { .. } | RespawnOutcome::OldPaneClosed { .. } => {
+            Err(Box::new(ResumeRow::failed(id, "closed_by_user", None)))
+        }
+        RespawnOutcome::Died {
+            exit_code,
+            attempts,
+            ..
+        } => Err(Box::new(ResumeRow::failed(
+            id,
+            RespawnOutcome::died_reason(exit_code, attempts),
+            None,
+        ))),
+        // The pane is LEFT RUNNING (it keeps the row): a caller must not read
+        // this as "nothing running".
+        RespawnOutcome::Unconfirmed { terminal_id } => Err(Box::new(ResumeRow::failed(
+            id,
+            "respawn-unconfirmed: running, never painted",
+            Some(ProcessEvidence {
+                terminal_id,
+                pid: None,
+                cmdline: None,
+                cwd: None,
+                claude_config_dir: None,
+            }),
+        ))),
+    }
+}
+
+/// The door's side of
+/// [`crate::terminal::respawn_liveness::RespawnEffects`]: one resumed pane under
+/// the row's own account, spawned off the async worker.
+struct DoorRespawn {
+    /// The binary resolved before the cap slot was spent, for the first spawn.
+    first_bin: Option<String>,
+    app: tauri::AppHandle,
+    tm: Arc<TerminalManager>,
+    registry: Arc<SessionRegistry>,
+    cand: Candidate,
+}
+
+impl crate::terminal::respawn_liveness::RespawnEffects for DoorRespawn {
+    fn claude_session_id(&self) -> &str {
+        &self.cand.id
+    }
+
+    async fn spawn_next(&mut self) -> Result<String, String> {
+        // The async pre-step: the ABSOLUTE binary, retried, never bare — the
+        // one resolved before the cap check for the first spawn.
+        let claude_bin = match self.first_bin.take() {
+            Some(bin) => bin,
+            None => crate::claude_cli_spawn::resolve_resume_claude_bin().await?,
+        };
+        let (app, tm, registry, cand) = (
+            self.app.clone(),
+            self.tm.clone(),
+            self.registry.clone(),
+            self.cand.clone(),
+        );
         tokio::task::spawn_blocking(move || {
             let model_transcript = crate::terminal::transcript::session_transcript_path(
                 Path::new(&cand.config_dir),
@@ -718,25 +838,30 @@ async fn resume_one(
             )
         })
         .await
-    };
-    let terminal_id = match spawn {
-        Ok(Ok((terminal_id, _coord_id))) => terminal_id,
-        Ok(Err(e)) => return ResumeRow::failed(&cand.id, format!("spawn: {e}"), None),
-        Err(e) => return ResumeRow::failed(&cand.id, format!("spawn_task: {e}"), None),
-    };
-    match verify(tm, &cand, &terminal_id).await {
-        Ok(ev) => ResumeRow::resumed(&cand.id, ev),
-        Err(reason) => ResumeRow::failed(
-            &cand.id,
-            reason,
-            Some(ProcessEvidence {
-                terminal_id,
-                pid: None,
-                cmdline: None,
-                cwd: None,
-                claude_config_dir: None,
-            }),
-        ),
+        .map_err(|e| format!("spawn_task: {e}"))?
+        .map(|(terminal_id, _coord_id)| terminal_id)
+    }
+
+    async fn await_liveness(
+        &mut self,
+        terminal_id: &str,
+    ) -> crate::terminal::respawn_liveness::LivenessVerdict {
+        crate::terminal::respawn_liveness::await_resumed_cli(
+            &self.tm,
+            terminal_id,
+            crate::terminal::respawn_liveness::RESUME_LIVENESS_DEADLINE,
+        )
+        .await
+    }
+
+    async fn pause_before_retry(&mut self, retry: usize) {
+        tokio::time::sleep(crate::terminal::respawn_liveness::retry_delay(retry)).await;
+    }
+
+    fn panes(&self) -> std::sync::Arc<dyn crate::terminal::respawn_liveness::PaneOps> {
+        std::sync::Arc::new(crate::terminal::respawn_liveness::ManagerPanes(
+            std::sync::Arc::clone(&self.tm),
+        ))
     }
 }
 
@@ -1099,6 +1224,51 @@ mod tests {
         );
         drop(migration);
         assert!(claim_for_door(id).is_ok());
+    }
+
+    /// The door reports a respawn whose every attempt died as `failed`, with
+    /// the typed reason — never `resumed` — and only `Alive` reaches the
+    /// process read.
+    #[test]
+    fn the_door_reports_failure_on_died_and_proceeds_only_on_alive() {
+        use crate::terminal::respawn_liveness::RespawnOutcome;
+        let died = proven_terminal(
+            ID,
+            RespawnOutcome::Died {
+                exit_code: Some(127),
+                attempts: 3,
+                retry_spawn_error: None,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(died.outcome, "failed");
+        assert_eq!(
+            died.verdict,
+            "failed(respawn-died: exit 127 after 3 attempts)"
+        );
+        let unconfirmed = proven_terminal(
+            ID,
+            RespawnOutcome::Unconfirmed {
+                terminal_id: "t2".into(),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            unconfirmed.reason.as_deref(),
+            Some("respawn-unconfirmed: running, never painted"),
+            "the pane is left running, and the reason must say so"
+        );
+        assert_eq!(
+            proven_terminal(
+                ID,
+                RespawnOutcome::Alive {
+                    terminal_id: "t3".into(),
+                    attempts: 2
+                }
+            )
+            .unwrap(),
+            "t3"
+        );
     }
 
     #[test]
