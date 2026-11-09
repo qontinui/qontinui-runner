@@ -21,7 +21,7 @@ import { TerminalFindBar } from "./TerminalFindBar";
 import { paintGrid, type GridSnapshot } from "./paintGrid";
 import { getTerminalDebug, recordPaintGrid } from "./terminalDebug";
 import { instanceStorage } from "@/lib/instance-storage";
-import { writeClipboard } from "@/lib/clipboard";
+import { readClipboard, writeClipboard } from "@/lib/clipboard";
 import { consumeInputChunk } from "./consumeInputChunk";
 import { preparePasteData } from "./preparePaste";
 import { claimPasteChord } from "./pasteChord";
@@ -1065,8 +1065,10 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
           // listener would otherwise write the same text a second time (see
           // `pasteChord.ts`).
           if (claimPasteChord(event)) {
-            navigator.clipboard
-              .readText()
+            // Native read (see readClipboard) — navigator.clipboard.readText()
+            // rejects in the webview without focus/permission, and on Linux
+            // that left Ctrl+V pasting nothing at all.
+            readClipboard()
               .then((text) => {
                 if (text) {
                   // Write directly to PTY. Run the clipboard text through the
@@ -1184,15 +1186,16 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
           }
           // No selection → paste, mirroring the Ctrl+V path (bracketed-paste +
           // newline normalization; see `preparePaste.ts`).
-          navigator.clipboard
-            .readText()
+          readClipboard()
             .then((text) => {
               if (!text) return;
               const prepared = preparePasteData(text, b.bracketedPasteMode);
               const bytes = encoder.encode(prepared);
               invoke("terminal_write", { terminalId, data: uint8ToBase64(bytes) }).catch(() => {});
             })
-            .catch(() => {});
+            .catch((err: unknown) => {
+              console.warn("[terminal] right-click clipboard read failed; nothing pasted", err);
+            });
         };
         container.addEventListener("contextmenu", contextMenuCopyPaste);
 
@@ -1767,7 +1770,7 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
               handler: async () => {
                 // A REJECTED read throws CLIPBOARD_READ_FAILED; only a genuinely
                 // empty clipboard is the zero-byte success below.
-                const text = await readClipboardForPaste();
+                const text = await readClipboardForPaste(readClipboard);
                 if (!text) return { success: true, bytes: 0 };
                 // Same bracketed-paste + newline normalization as the Ctrl+V
                 // path (see `preparePaste.ts`).

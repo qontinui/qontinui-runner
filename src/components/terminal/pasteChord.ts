@@ -18,7 +18,7 @@
  * firing, which refuses the duplicate at the earliest point.
  *
  * The cost: the native paste was also an accidental FALLBACK. When
- * `navigator.clipboard.readText()` rejects, this keystroke now pastes nothing,
+ * the clipboard read (`readClipboard`: native, then `navigator.clipboard`) fails, this keystroke now pastes nothing,
  * so the handler logs that rejection rather than swallowing it.
  *
  * Other native paste routes (Ctrl+Shift+V, Shift+Insert, the Edit menu) are
