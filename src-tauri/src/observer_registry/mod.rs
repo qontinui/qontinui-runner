@@ -294,6 +294,7 @@ mod tests {
             transport_kind: None,
             physical_device_id: None,
             activated_by: None,
+            bearer: crate::mcp::sdk_client::ConnectionBearer::Absent,
         }
     }
 

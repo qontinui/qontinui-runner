@@ -203,28 +203,7 @@ impl IosTransport {
     /// Open a local TCP forward for a device port. Returns the local port.
     pub async fn forward_port(&self, udid: &str, device_port: u16) -> Result<u16, TransportError> {
         let port = self.start_service().await?;
-        let url = format!("http://127.0.0.1:{port}/forward");
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .build()
-            .map_err(|e| TransportError::IosSidecar(e.to_string()))?;
-        let body = serde_json::json!({ "udid": udid, "devicePort": device_port });
-        let resp: ForwardResponse = client
-            .post(&url)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| TransportError::ForwardFailed {
-                device_id: udid.to_string(),
-                reason: e.to_string(),
-            })?
-            .json()
-            .await
-            .map_err(|e| TransportError::ForwardFailed {
-                device_id: udid.to_string(),
-                reason: format!("decode: {e}"),
-            })?;
-        Ok(resp.local_port)
+        request_forward(port, udid, device_port).await
     }
 
     /// Initiate pairing (triggers the 'Trust this computer' dialog).
@@ -244,6 +223,39 @@ impl Default for IosTransport {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Ask the sidecar on `sidecar_port` to forward `device_port`.
+async fn request_forward(
+    sidecar_port: u16,
+    udid: &str,
+    device_port: u16,
+) -> Result<u16, TransportError> {
+    let url = format!("http://127.0.0.1:{sidecar_port}/forward");
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| TransportError::IosSidecar(e.to_string()))?;
+    let body = serde_json::json!({ "udid": udid, "devicePort": device_port });
+    let resp: ForwardResponse = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| TransportError::ForwardFailed {
+            device_id: udid.to_string(),
+            reason: e.to_string(),
+        })?
+        .json()
+        .await
+        .map_err(|e| TransportError::ForwardFailed {
+            device_id: udid.to_string(),
+            reason: format!("decode: {e}"),
+        })?;
+    // The far end is the phone. The sidecar has no close call, so the mark stays
+    // until the process ends, even past `stop_service`. That fails closed.
+    super::mark_off_machine_forwarder(resp.local_port);
+    Ok(resp.local_port)
 }
 
 // ----------------------------------------------------------------------------
@@ -303,4 +315,37 @@ fn resolve_python_bin() -> PathBuf {
     } else {
         "python3"
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::request_forward;
+    use crate::mcp::transport::{is_off_machine_forwarder, ForgetForwarder};
+
+    /// The port the sidecar hands back is marked before any caller sees it. The
+    /// port is held bound so no peer test can be handed it.
+    #[tokio::test]
+    async fn a_forward_port_from_the_sidecar_is_an_off_machine_forwarder() {
+        let held = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let forward_port = held.local_addr().expect("local addr").port();
+        let _forget = ForgetForwarder(forward_port);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let sidecar_port = listener.local_addr().unwrap().port();
+        let sidecar = axum::Router::new().route(
+            "/forward",
+            axum::routing::post(move || async move {
+                axum::Json(serde_json::json!({ "localPort": forward_port }))
+            }),
+        );
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, sidecar).await;
+        });
+
+        let opened = request_forward(sidecar_port, "udid-under-test", 9876)
+            .await
+            .expect("the sidecar answers");
+        assert_eq!(opened, forward_port);
+        assert!(is_off_machine_forwarder(forward_port));
+    }
 }
