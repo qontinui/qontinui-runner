@@ -8726,25 +8726,69 @@ mod click_by_routes_tests {
         );
     }
 
+    /// Hostile values for a caller value spliced into a quoted
+    /// `querySelectorAll('…')`. Each case is: the value; the splice that keeps
+    /// it one string; and the splice a broken escape produces, which closes the
+    /// string early.
+    ///
+    /// The escape has two halves, and each case pins one of them:
+    /// - A bare quote is kept inside by escaping the quote.
+    /// - A quote behind a backslash is kept inside by doubling the backslash.
+    ///   Escaping the quote alone turns `\'` into `\\'`, an escaped backslash
+    ///   followed by a quote that closes the string.
+    fn hostile_selector_cases() -> [(&'static str, &'static str, &'static str); 2] {
+        [
+            (
+                "*'),fetch('/x'),document.querySelectorAll('*",
+                r"querySelectorAll('*\'),fetch(\'/x\'),document.querySelectorAll(\'*')",
+                "'),fetch('",
+            ),
+            (
+                r"*\'),fetch('/x'),document.querySelectorAll('*",
+                r"querySelectorAll('*\\\'),fetch(\'/x\'),document.querySelectorAll(\'*')",
+                r"('*\\'),fetch(",
+            ),
+        ]
+    }
+
     /// click-by-text splices the caller's `tag` into a quoted
     /// `querySelectorAll('…')` of a script the runner builds and evaluates.
     /// Spliced raw, a quote in it would close that string, and the rest would
     /// run as the caller's own code without the guard `page/evaluate` applies
     /// to caller scripts (coord finding f82377b2). The tag is escaped like the
-    /// text, so a hostile one stays inside its selector string.
+    /// text, so a hostile one stays inside its selector string. Both halves of
+    /// the escape are pinned (`hostile_selector_cases`).
     #[test]
     fn click_by_text_escapes_a_hostile_tag() {
-        let hostile = "*'),fetch('/x'),document.querySelectorAll('*";
-        let escaped = r"querySelectorAll('*\'),fetch(\'/x\'),document.querySelectorAll(\'*')";
-        for exact in [true, false] {
-            let expr = click_by_text_find_expr("Save", hostile, exact);
+        for (hostile, escaped, early_close) in hostile_selector_cases() {
+            for exact in [true, false] {
+                let expr = click_by_text_find_expr("Save", hostile, exact);
+                assert!(
+                    expr.contains(escaped),
+                    "the tag must stay inside its selector string: {expr}"
+                );
+                assert!(
+                    !expr.contains(early_close),
+                    "no quote in the tag may close the selector string: {expr}"
+                );
+            }
+        }
+    }
+
+    /// click-by-selector splices the caller's `selector` into the same kind of
+    /// quoted `querySelectorAll('…')`, so a hostile one is held to both halves
+    /// of the escape the same way.
+    #[test]
+    fn click_by_selector_escapes_a_hostile_selector() {
+        for (hostile, escaped, early_close) in hostile_selector_cases() {
+            let expr = click_by_selector_find_expr(hostile);
             assert!(
                 expr.contains(escaped),
-                "the tag must stay inside its selector string: {expr}"
+                "the selector must stay inside its string: {expr}"
             );
             assert!(
-                !expr.contains("'),fetch('"),
-                "no quote in the tag may close the selector string: {expr}"
+                !expr.contains(early_close),
+                "no quote in the selector may close its string: {expr}"
             );
         }
     }
