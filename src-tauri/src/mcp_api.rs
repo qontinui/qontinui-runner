@@ -6166,6 +6166,11 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_is_merge_safe",
     "coord_land_provenance_backfill",
     "coord_layering_triage",
+    // Plan 2026-10-09-coord-knows-which-box-holds-which-credential Phase 3:
+    // the credential-probe catalogue read (twin `GET
+    // /coord/devices/credential-probes`), granted to device agents by
+    // qontinui-coord#3926. Forwarding it before that lands is harmless.
+    "coord_list_credential_probe_specs",
     // Plan 2026-10-03-dossier-query-door-filters-sort-cursor Phase 4: the
     // dossier query door (twin `GET /coord/agent-dossiers`), read-only. coord's
     // `agent_tool_access::DEVICE_DEFAULT_TOOLS` grants it; without this entry a
@@ -18313,6 +18318,32 @@ mod coord_mcp_body_gate_tests {
             COORD_MCP_ALLOWED_TOOLS.windows(2).all(|w| w[0] < w[1]),
             "COORD_MCP_ALLOWED_TOOLS must be sorted + deduped"
         );
+    }
+
+    /// Plan `2026-10-09-coord-knows-which-box-holds-which-credential` Phase 3:
+    /// the credential-probe catalogue read forwards, in sorted position, and
+    /// the comment above it does not hide it from the source-text parse.
+    #[test]
+    fn coord_list_credential_probe_specs_is_allowed_and_parses_from_source() {
+        assert!(coord_mcp_tool_is_allowed("coord_list_credential_probe_specs"));
+        assert!(
+            COORD_MCP_ALLOWED_TOOLS
+                .binary_search(&"coord_list_credential_probe_specs")
+                .is_ok(),
+            "membership is a binary_search, so the entry must sit in sorted position"
+        );
+        let parsed = working_tree_tool_policy();
+        assert_eq!(
+            parsed
+                .allowed
+                .iter()
+                .filter(|t| t.as_str() == "coord_list_credential_probe_specs")
+                .count(),
+            1,
+            "the parser must read the entry exactly once: {:?}",
+            parsed.allowed
+        );
+        assert_eq!(parsed.allowed.len(), COORD_MCP_ALLOWED_TOOLS.len());
     }
 
     /// Plan `2026-10-09-coord-knows-which-box-holds-which-credential` Phase 5:
