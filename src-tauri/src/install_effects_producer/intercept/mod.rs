@@ -111,6 +111,14 @@ pub mod gate;
 pub mod precontext;
 pub mod shim_materializer;
 
+/// The bash identity shim's launch-failure beacon, run against a loopback
+/// listener (plan `2026-11-10-migration-holds-for-missing-claude-cli`, Phase 2).
+#[cfg(all(test, unix))]
+mod identity_shim_launch_failure_tests;
+/// The one harness every test that RUNS a rendered bash shim shares.
+#[cfg(all(test, unix))]
+pub(crate) mod shim_test_support;
+
 use std::sync::atomic::{AtomicU16, Ordering};
 
 /// Process-global bound runner API port for the interception shim loopback.

@@ -1324,6 +1324,14 @@ pub fn render_identity_for_test(tool: &str, shim_dir: &Path) -> String {
     render_identity(IDENTITY_SHIM_BASH, tool, shim_dir)
 }
 
+/// [`render_identity_for_test`] over a template `body` other than the
+/// compiled-in one — a mutated copy, for a mutation check that must not need a
+/// rebuild (see `shim_test_support`).
+#[cfg(test)]
+pub fn render_identity_body_for_test(body: &str, tool: &str, shim_dir: &Path) -> String {
+    render_identity(body, tool, shim_dir)
+}
+
 /// Write the platform-appropriate identity shim file(s) for `tool`
 /// (`claude`/`gemini`) into `dir`. Mirrors [`write_shims_for`]: always an
 /// extensionless script (Git Bash + Unix); on Windows ALSO a `.cmd` AND a copy
@@ -2439,24 +2447,13 @@ const REAL_DIR_NAME: &str = "the-real-qontinui-identity-qontinui-shim-tool";
 #[cfg(all(test, unix))]
 mod resolve_wait_tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
+    use crate::install_effects_producer::intercept::shim_test_support::{
+        bash, identity_cmd, write_exe, EXE_LOCK,
+    };
     use std::process::Command;
     use std::time::{Duration, Instant};
 
-    /// Writing an executable while another test thread forks can leave the
-    /// write fd open in the child and make the exec fail `ETXTBSY`; serialize.
-    static EXE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     const BUDGET: Duration = Duration::from_secs(40);
-
-    /// Write `body` as an executable at `path`, atomically (temp + rename) so a
-    /// concurrently scanning shim never sees a half-written file.
-    fn write_exe(path: &Path, body: &str) {
-        let tmp = path.with_extension("partial");
-        std::fs::write(&tmp, body).unwrap();
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
-        std::fs::rename(&tmp, path).unwrap();
-    }
 
     /// A real `claude` that records it ran.
     fn fake_claude_body(marker: &Path) -> String {
@@ -2469,35 +2466,6 @@ mod resolve_wait_tests {
         ["/usr/bin/claude", "/bin/claude"]
             .iter()
             .any(|p| Path::new(p).exists())
-    }
-
-    /// `bash` by ABSOLUTE path: these tests clear the env and set a PATH that
-    /// may hold no bash, and `Command` resolves a bare program name against
-    /// the CHILD's PATH once one is set.
-    fn bash() -> &'static str {
-        ["/bin/bash", "/usr/bin/bash", "/usr/local/bin/bash"]
-            .into_iter()
-            .find(|p| Path::new(p).exists())
-            .unwrap_or("/bin/bash")
-    }
-
-    fn identity_cmd(shim_dir: &Path, real_dir: &Path, wait: &str) -> Command {
-        let shim = shim_dir.join("claude");
-        write_exe(&shim, &render_identity_for_test("claude", shim_dir));
-        let mut cmd = Command::new(bash());
-        cmd.arg(&shim)
-            .arg("--version")
-            .env_clear()
-            .env(
-                "PATH",
-                format!(
-                    "{}:{}:/usr/bin:/bin",
-                    shim_dir.display(),
-                    real_dir.display()
-                ),
-            )
-            .env("QONTINUI_SHIM_RESOLVE_WAIT_SECS", wait);
-        cmd
     }
 
     #[test]

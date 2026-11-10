@@ -132,7 +132,10 @@ pub fn routes() -> Router<Arc<ApiState>> {
         // POSTs one line here on EVERY invocation — INCLUDING the don't-double-pin
         // passthrough branch where it sends no session-open — so a rebuild's logs
         // reveal whether the shim actually ran for a given terminal and whether it
-        // will deliver `--session-id` / `--settings`. Log-only; no store write.
+        // will deliver `--session-id` / `--settings`. No store write: a launch
+        // failure (`resolve-failed` / `exec-failed`) is also kept in the
+        // in-memory `terminal::launch_failure` registry; every other event is
+        // log-only.
         .route("/control/shim-beacon", post(post_shim_beacon))
         // Session-restore health probe (phantom-id plan B7): the one call that
         // answers "can these sessions actually be restored?", joining the
@@ -1119,7 +1122,9 @@ async fn post_sessions_ledger_capture(
 /// Body of `POST /control/shim-beacon` — a fire-and-forget diagnostic the
 /// identity shim POSTs on every invocation so shim execution is observable in
 /// the runner logs (does the shim run for organic sessions? does it deliver
-/// `--settings`?). Every field is optional/loose — this is a log line, not data.
+/// `--settings`?). Every field is optional/loose — a log line, except for the
+/// two launch-failure events, whose `detail` flags the runner records
+/// ([`crate::terminal::launch_failure`]).
 #[derive(Debug, serde::Deserialize)]
 pub struct ShimBeaconRequest {
     #[serde(default)]
@@ -1137,22 +1142,58 @@ pub struct ShimBeaconRequest {
     pub detail: Option<String>,
 }
 
-/// `POST /control/shim-beacon`. Log-only: emits one INFO line so a rebuild's
-/// logs reveal exactly which terminals invoked the identity shim and with what
-/// pin/settings decision. Never touches the store; always 200 (never wedges the
-/// provider's startup).
+/// `POST /control/shim-beacon`. Never touches the session store; always 200
+/// (never wedges the provider's startup). See [`note_shim_beacon`].
 async fn post_shim_beacon(Json(req): Json<ShimBeaconRequest>) -> Json<ApiResponse<()>> {
-    info!(
-        terminal_id = %req.terminal_id.as_deref().unwrap_or("?"),
-        tool = %req.tool.as_deref().unwrap_or("?"),
-        event = %req.event.as_deref().unwrap_or("invoked"),
-        // Only the pre-`surface` script shims omit the field, so absent means
-        // a `.bash`/`.cmd` surface (the exe stub always sends "exe").
-        surface = %req.surface.as_deref().unwrap_or("script"),
-        detail = %req.detail.as_deref().unwrap_or(""),
-        "control/shim-beacon: identity shim invoked"
+    note_shim_beacon(
+        crate::terminal::launch_failure::registry(),
+        &req,
+        chrono::Utc::now().timestamp_millis(),
     );
     Json(ApiResponse::success(()))
+}
+
+/// The body of [`post_shim_beacon`]. Every beacon is logged, so a rebuild's
+/// logs reveal exactly which terminals invoked the identity shim and with what
+/// pin/settings decision. A LAUNCH FAILURE — the shim gave up on the real
+/// `claude` (`resolve-failed`) or could not exec it (`exec-failed`) — is also
+/// recorded against its terminal in `registry`, and logged at WARN under a line
+/// of its own (plan `2026-11-10-migration-holds-for-missing-claude-cli`,
+/// Phase 2). Returns what was recorded; every other event is log-only.
+pub(crate) fn note_shim_beacon(
+    registry: &crate::terminal::launch_failure::LaunchFailureRegistry,
+    req: &ShimBeaconRequest,
+    now_ms: i64,
+) -> Option<crate::terminal::launch_failure::LaunchFailure> {
+    let terminal_id = req.terminal_id.as_deref().unwrap_or("?");
+    let tool = req.tool.as_deref().unwrap_or("?");
+    let event = req.event.as_deref().unwrap_or("invoked");
+    // Only the pre-`surface` script shims omit the field, so absent means a
+    // `.bash`/`.cmd` surface (the exe stub always sends "exe").
+    let surface = req.surface.as_deref().unwrap_or("script");
+    let detail = req.detail.as_deref().unwrap_or("");
+    if !crate::terminal::launch_failure::is_launch_failure_event(event) {
+        info!(
+            terminal_id = %terminal_id,
+            tool = %tool,
+            event = %event,
+            surface = %surface,
+            detail = %detail,
+            "control/shim-beacon: identity shim invoked"
+        );
+        return None;
+    }
+    let recorded = registry.record_beacon(req.terminal_id.as_deref(), event, detail, now_ms);
+    warn!(
+        terminal_id = %terminal_id,
+        tool = %tool,
+        event = %event,
+        surface = %surface,
+        detail = %detail,
+        recorded = recorded.is_some(),
+        "control/shim-beacon: identity shim could not launch claude"
+    );
+    recorded
 }
 
 /// Convert an MSYS/Git-Bash drive path (`/d/foo/bar`) to its Windows form
