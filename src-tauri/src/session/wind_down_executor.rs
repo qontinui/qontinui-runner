@@ -3464,6 +3464,7 @@ mod tests {
                 spawn_device_default: None,
                 adopted_from: None,
                 last_session_start_at: None,
+                last_alive_at: None,
                 gate_id: None,
                 gate_consuming_device_id: None,
                 gate_bound_boot_ms: None,

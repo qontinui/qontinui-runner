@@ -19,6 +19,10 @@ import type { PastSession } from "./usePastSessions";
  * copy: `unfinishedSessions.test.ts` reads the Rust constant and fails when the
  * two disagree, so a reason added there cannot leave this list offering a
  * Resume for a session the runner deliberately does not restore.
+ *
+ * `launch-failed` is deliberately ABSENT, like `poll-dead`: the Claude CLI
+ * never started in that pane, so the conversation is exactly as it was and the
+ * session stays resumable.
  */
 export const NON_RESTORABLE_CLOSE_REASONS: ReadonlySet<string> = new Set([
   "no-terminal",
