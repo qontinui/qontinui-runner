@@ -882,7 +882,8 @@ mod tests {
         let take_back = at("delete_unified_workflow(");
         let wait = at("await_run_output(");
         assert!(
-            body[wait..].contains("claim.as_ref()"),
+            body.get(wait..)
+                .is_some_and(|rest| rest.contains("claim.as_ref()")),
             "the run is bound to the execute's proposal claim"
         );
         assert!(

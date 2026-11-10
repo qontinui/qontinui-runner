@@ -1802,9 +1802,10 @@ mod tests {
         );
         // The arm must also RETURN its answer: without the `return`, it would
         // fall through to the count and answer `landed-in-pending`.
-        let arm = staged + find_in(&claimed[staged..], "Ok(false) =>", "the stage match");
-        let arm_end = arm + find_in(&claimed[arm..], "Err(", "the stage match");
-        let lost_arm = &claimed[arm..arm_end];
+        let tail = |from: usize| claimed.get(from..).expect("a char boundary");
+        let arm = staged + find_in(tail(staged), "Ok(false) =>", "the stage match");
+        let arm_end = arm + find_in(tail(arm), "Err(", "the stage match");
+        let lost_arm = claimed.get(arm..arm_end).expect("a char boundary");
         assert!(
             lost_arm.contains("\"claim-lost\"") && lost_arm.contains("return ("),
             "the claim-lost arm returns its answer:\n{lost_arm}"
