@@ -231,10 +231,15 @@ no peer can see, which is precisely the failure this precondition exists to
 prevent. Publish it with:
 
 ```bash
-bash <workspace-root>/qontinui-claude-config/scripts/land-plan-stamp.sh \
+bash <workspace-root>/qontinui-claude-config/scripts/land-plan-stamp.sh --based-on new \
   "<plans-repo-root>" "<repo-relative plan path>" "<local plan file>" \
   "docs: add <plan-stem> (DRAFT)"
 ```
+
+`--based-on new` asserts the file is not on origin yet; exit 7 (STALE BASE)
+means it is, so the local untracked copy is not the plan peers read — vet the
+origin copy instead (`_status-writers.md` → "Publishing a stamp — the
+compare-and-swap").
 
 The helper is the one implementation of what this step used to spell out by
 hand: it fetches the default branch with an explicit refspec, builds the commit
@@ -636,7 +641,7 @@ verdict on its **exit code**: `LIVE` (0), `STALE` (3), `DEAD` (4), `STOLEN` (5),
 `LAPSED` (7), `EMPTY` (8), `MAX_RUNTIME` (9 — the loop ended on its own
 runtime bound: the `--max-runtime` cap with the owner's liveness UNKNOWN, or the
 `--max-runtime-hard` ceiling; not a coord verdict; re-`add` then `start`),
-`OWNER_GONE` (11 — the owning session died and the loop released every row).
+`OWNER_GONE` (11 — the owning session is gone: its pid died, its transcript went idle or missing, or coord closed or finished the session; the loop released every row).
 
 ```bash
 bash <workspace-root>/qontinui-claude-config/scripts/coord-claim-heartbeat.sh status --ledger "$CLAIM_LEDGER"
@@ -1080,7 +1085,10 @@ states that legitimately stop the lifecycle must stop it here too:
   4. `phases_declared` is **not `null`**
   5. `phases_remaining == []` — the LITERAL empty list, never `null`
   6. that `[]` is **corroborated by the same response** (the corroboration rule
-     below)
+     below: a non-empty `phases_declared_indices`, and either
+     `phases_complete_scope` the literal `true` or every declared index covered
+     by `phases_delivered` or by a resolved `phases_attested` entry, with at
+     least one declared index in `phases_delivered`)
   7. `evidence_gaps` carries no `NO PHASE ATTRIBUTION` entry
 
   **Before routing to closeout, retire this run's net.** If Step 2's `/vet-plan`
@@ -1141,7 +1149,7 @@ states that legitimately stop the lifecycle must stop it here too:
   tenant (each printed `bearer <tenant>=<path>`,
   `POST https://coord.qontinui.io/mcp`, `-H "@<path>"`), classify each answer
   by its RESPONSE SHAPE with `/vet-plan` §0.25's shape table (a not-found body
-  or a clean arm-5 body is `clear`; a body meeting all seven conjuncts — `shipped: true` ∧ `evidence_complete: true` ∧ no top-level `merged_degraded_reason` ∧ `phases_declared` not `null` ∧ `phases_remaining` the LITERAL `[]` ∧ that `[]` corroborated by the same response ∧ no `NO PHASE ATTRIBUTION` gap — is `found`; any body carrying a top-level
+  or a clean arm-5 body is `clear`; a body meeting all seven conjuncts — `shipped: true` ∧ `evidence_complete: true` ∧ no top-level `merged_degraded_reason` ∧ `phases_declared` not `null` ∧ `phases_remaining` the LITERAL `[]` ∧ that `[]` corroborated by the same response (a non-empty `phases_declared_indices`, and either `phases_complete_scope` the literal `true` or every declared index in `phases_delivered` or in a resolved `phases_attested` entry, with at least one declared index in `phases_delivered`) ∧ no `NO PHASE ATTRIBUTION` gap — is `found`; any body carrying a top-level
   `merged_degraded_reason` is `unknown` whatever else it says; anything else or no answer is `unknown` — by shape, not by the arm
   rows, whose recon conjunct applies only to the folded result), and fold with
   `recon-tenant.sh --union --tenants <…> --set <h>`. `FOUND` is the closeout STOP above, and it wins over
@@ -1176,10 +1184,15 @@ states that legitimately stop the lifecycle must stop it here too:
 
   > ⚠️ **The corroboration rule — what entitles a literal `[]` to stop.** The
   > literal `[]` may stop **only when the same response corroborates it**:
-  > `phases_declared_indices` is non-empty and every index in it also appears in
-  > `phases_delivered`. When `phases_declared_indices` is non-empty and
-  > `phases_delivered` does not cover it, `[]` contradicts its own neighbours —
-  > coord is claiming nothing remains while not having attributed every declared
+  > `phases_declared_indices` is non-empty, and **either**
+  > `phases_complete_scope` is the literal `true` **or** `phases_delivered` names at least one declared index and
+  > every declared index is **covered** — it appears in `phases_delivered`,
+  > **or** it appears in `phases_attested` **and** `phase_attestations` carries
+  > an entry with that `phase_index` whose `resolution` is `"resolved"`. When
+  > `phases_complete_scope` is not `true`,
+  > `phases_declared_indices` is non-empty and that union does not cover it,
+  > `[]` contradicts its own neighbours — coord is claiming nothing remains while
+  > neither a landed attribution nor a live attestation covers every declared
   > phase — so read
   > it as UNKNOWN and fall through. An EMPTY `phases_declared_indices` is not
   > corroboration either: there is nothing for the `[]` to be the answer to, so
@@ -1188,10 +1201,46 @@ states that legitimately stop the lifecycle must stop it here too:
   > establish (the coord-fix plan is `2026-09-18-coord-fabricates-a-phase-declaration-and-silences-its-own-gap`
   > throughout this arm — not the plan you are running).
   >
+  > **The attested arm, and its bounds — the same rule as `/vet-plan` §0.25.** A
+  > phase whose output is not a PR (an evidence record, a measurement, a
+  > decision) is closed by a phase attestation, and coord serves it as
+  > `phases_attested` beside `phase_attestations` (only `resolution:
+  > "resolved"` rows reach the former). coord unions it into `phases_remaining`
+  > and `shipped`, and served policy `finished-criteria` counts an attested phase
+  > as finished — so a PR-only test left such a plan at UNKNOWN forever (coord
+  > finding `426553fc`). An index without a matching `resolved` row, a
+  > `retracted` / `vanished` / `unreadable` row with no `resolved` row beside it
+  > for that index, a missing or malformed `phase_attestations`, an attested index outside the declaration, or a coord
+  > serving no `phases_attested` at all, contributes NOTHING — the phase stays
+  > uncovered, which is UNKNOWN, never permission. At least one DECLARED index
+  > must appear in `phases_delivered`, so a stop never rests on attestations
+  > alone — and it must be a declared one, because coord does not clip
+  > `phases_delivered` to the declaration: a PR scoped to an undeclared phase
+  > (an off-by-one between 0- and 1-based numbering) leaves it non-empty while no
+  > declared phase has a landed PR. Erring that way is a false negative that
+  > falls through to the stamp arms, which still guard. `PHASE
+  > ATTESTED WITHOUT A PR` in `evidence_gaps` is a disclosure, not a blocker —
+  > conjunct 7 names `NO PHASE ATTRIBUTION` only.
+  >
+  > **`phases_complete_scope: true` satisfies the coverage half by itself** (a
+  > non-empty `phases_declared_indices` is still required). coord (on a coord carrying the `phases_complete_scope` change — the qontinui-coord PR is pending)
+  > serves it `true` only when a LANDED, non-document citation's `Plan:`
+  > marker declared `delivers: complete` — a landed PR attributed the whole
+  > plan, so the stop still rests on a PR, not on attestations. Its residue —
+  > an author over-declaring `complete` — is the same trust as a wrongly scoped
+  > `phases:` marker, and the "bound, not a proof" paragraph below covers it.
+  > Only the literal `true` counts: a coord serving no `phases_complete_scope`
+  > (one predating that field) keeps the stricter reading above, so an ABSENT
+  > field is never read as `true`.
+  >
   > **This test is deliberately BUILD-INDEPENDENT, and that is why it is the
   > test.** `phases_declared_indices` and `phases_delivered` are already served
   > beside `phases_remaining` by the coord build running today, so the rule needs
-  > no deployment tell — no version probe, no "has the nullable contract reached
+  > no deployment tell (the attested arm is additive: a build serving no
+  > `phases_attested` reduces the union to `phases_delivered`, the old, stricter
+  > answer; the complete-scope branch is additive too: on a coord serving no
+  > `phases_complete_scope` it never fires and the test reduces to its prior
+  > reading) — no version probe, no "has the nullable contract reached
   > this tenant yet" question you would have to answer before you could read the
   > field at all. It returns the same verdict on a PRE-contract coord (which
   > spells every non-established state `[]`) and on a post-contract one (which
@@ -1211,13 +1260,13 @@ states that legitimately stop the lifecycle must stop it here too:
   >
   > **What the rule costs — stated so you do not "fix" it.** A genuinely
   > complete unit whose completeness was asserted some OTHER way fails
-  > corroboration and falls through to the stamp arms instead of stopping.
-  > **Two spellings, and the SECOND is the larger population today.** One: a
-  > citation declaring `complete`, which satisfies coord's coverage gate for a
-  > plan of any length while attributing no index at all, so `phases_delivered`
-  > stays empty. Two: landed citations carrying **no phase scope at all**, which
-  > leaves `phases_delivered` empty the same way. For a declaration of two or
-  > more phases that second spelling costs nothing new — coord raises the
+  > corroboration and falls through to the stamp arms instead of stopping. (A
+  > phase closed by a resolved attestation is no longer one of those ways, and
+  > nor is a landed citation declaring `complete`, which `phases_complete_scope`
+  > now carries.)
+  > **One spelling remains:** landed citations carrying **no phase scope at
+  > all**, which leaves `phases_delivered` empty. For a declaration of two or
+  > more phases that spelling costs nothing new — coord raises the
   > `NO PHASE ATTRIBUTION` gap there and the gap conjunct already blocked the
   > stop. It bites on a **single-phase declaration**, where that gap is
   > withheld on the build serving today (coord's Gap-5 arm requires
@@ -1263,9 +1312,10 @@ states that legitimately stop the lifecycle must stop it here too:
   > two spellings and both count as total — every declared index carries a
   > landed attribution, or **a single landed citation declared `complete`**,
   > which satisfies coord's coverage gate whatever the declared count is. The
-  > corroboration rule above is what separates them: only the first spelling can
-  > corroborate itself, and the `complete` spelling deliberately falls through
-  > (see "What the rule costs"). Under the nullable contract *(plan
+  > corroboration rule above is what separates them: the first spelling
+  > corroborates through `phases_delivered`, the `complete` spelling through
+  > `phases_complete_scope: true` (absent on an older coord, where it falls
+  > through to the stamp arms). Under the nullable contract *(plan
   > `2026-09-18-coord-fabricates-a-phase-declaration-and-silences-its-own-gap`,
   > Phase 3)* the first three render **`null`** — coord could not establish the
   > phase axis — and only the fourth renders **`[]`**: coord looked and nothing
@@ -1340,7 +1390,9 @@ states that legitimately stop the lifecycle must stop it here too:
   > Constructible today: the same phantom `{1}` plus one landed citation whose
   > marker carries `phases: 1` gives `phases_declared_indices: [1]` ⊆
   > `phases_delivered: [1]`, `phases_remaining: []` and no gap — **corroborated,
-  > and it STOPs**, on a plan with phases outstanding. Same shape for any
+  > and it STOPs**, on a plan with phases outstanding. An attestation on a
+  > wrong-but-declared index corroborates the same way (the attest door requires
+  > `phase_index` to be one of `phases_declared_indices`). Same shape for any
   > thinly-parsed multi-phase plan whose single landed PR cites the one index
   > that was parsed. It is rare today only because phase attribution is rare,
   > and the direction of travel is to make attribution common. That residue is
@@ -1481,7 +1533,7 @@ no session. Run the same script `/implement-plan` Step 4.7 runs — it is one
 implementation, invoked from two places, not a second copy of the check:
 
 ```bash
-bash <workspace-root>/qontinui-claude-config/scripts/review-arm-corroborate.sh --artifact "$ARM_FILE" --tree-root <the worktree the implement half reviewed>
+bash <workspace-root>/qontinui-claude-config/scripts/review-arm-corroborate.sh --artifact "$ARM_FILE" --tree-root <a live worktree of the repo named like the reviewed checkout>
 ```
 
 **Run it in the background.** Door calls and tree re-measures are serial, each bounded by `REVIEW_ARM_CORROBORATE_TIMEOUT` (default 600 s), so a run can take up to (N+1+T) × that budget (N PRs, the coverage call, T checkouts re-measured). Start it with the Bash tool's `run_in_background` (or watch it with Monitor) and read the verdict line when it exits — a foreground call under the tool's 120 s / 600 s timeout is killed with no verdict.
@@ -1516,10 +1568,23 @@ Branch on its exit code, exactly as Step 4.7 documents it:
   row's detail names the budgets involved and the elapsed time), the card reads `confidence:
   unknown`, the artifact predates `reviewed_head_sha`
   (`unknown_no_reviewed_head`) or `reviewed_tree` (`unknown_no_reviewed_tree`),
-  or the tree could not be compared at all (`unknown_tree`: the producer
-  refused, a field carries the unresolved sentinel, or the two lines name
-  different checkouts — two unresolved measurements are string-equal and must
-  never compare SAME). Report *"corroboration
+  or the tree could not be compared (`unknown_tree`; the row's detail names
+  which), for example: no `--tree-root` covers the row's repo (the `$PWD`
+  default from a subdirectory, or from a directory not named like the
+  reviewed checkout, leaves every row here);
+  no worktree stood at the reviewed head at the recorded time — reaped, or
+  never offered, and a same-named checkout is never treated as a substitute;
+  ANY candidate worktree's HEAD reflog cannot answer (logging off, an
+  unreadable or gapped log, a gc-emptied log on a worktree standing at the
+  reviewed head or a newer commit, a review older than the reflog expiry)
+  or a root git could not list, which blocks the row even when the reviewed
+  worktree is intact; the row's `measured=` time or its `reviewed_tree` line
+  cannot be parsed; two or more were bound and now disagree; the producer
+  refused or timed out; or a line carries the unresolved sentinel — two
+  unresolved measurements are string-equal and must never compare SAME).
+  One `--tree-root` per repo is enough (repeat it per repo, each a checkout's top
+  directory named like the reviewed checkout); you do not need to offer the specific
+  worktree a row was reviewed in. Report *"corroboration
   UNKNOWN"* with the row's detail, never "corroborated"
   [policy: `verification-and-evidence` `silent-empty-is-unknown`,
   `unknown-must-not-render-as-a-default`]. UNKNOWN does not by itself make the

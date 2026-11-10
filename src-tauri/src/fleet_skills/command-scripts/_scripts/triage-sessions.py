@@ -5,7 +5,7 @@ each page's grid, nudge the stopped ones.
 
 Usage: triage-sessions.py [--act] [--skip STEP[,STEP..]] [--max-name N]
                           [--max-nudge N] [--name-timeout S] [--idle-min N]
-                          [--cooldown-hours H] [--include-closeout]
+                          [--cooldown-hours H]
                           [--only ID[,ID..]] [--tab NAME ...] [--port N]
        triage-sessions.py --selftest
 
@@ -19,8 +19,12 @@ names are read from the runner webview's page list; a name no tab carries is
 refused (exit 2) rather than skipped, as is a blank name, and an unreadable
 page list for the runner on --port is UNKNOWN (exit 3). With --only as well, a terminal must satisfy both. With --act the steps run in this order:
 
-  close   close-finished-sessions.py --close: closes FINISHED and
-          EXITED-FINISHED tabs (re-screened and read back by that script).
+  close   close-finished-sessions.py --close: closes that script's CLOSABLE
+          tabs, FINISHED (a session coord reads finished) and EXITED-FINISHED,
+          each re-screened and read back by that script. The report predicts
+          from the same set, read off the same screen. Then, in every mode,
+          the finished rows a screen rule holds, with their finish_stranded
+          code (cfs.print_stranded).
   limit   for each LIMITED session (stopped by an account usage limit): type
           /next-move. It reaches the exhausted account, Claude prints its limit
           message, and the runner resumes the session in a new pane under
@@ -35,13 +39,24 @@ page list for the runner on --port is UNKNOWN (exit 3). With --only as well, a t
           un-nudged session's "work remains" message would be replaced.
   layout  runner-layout.py fit --trim-only over every page (under --only or
           --tab, the pages holding those terminals): shrinks each grid to fit its
-          remaining tabs, since the runner grows a grid by itself but never
-          shrinks one.
+          remaining tabs, since a runner older than auto-trim grows a grid by
+          itself but never shrinks one. A page in tmux work mode is skipped, not re-gridded, and
+          so is a page whose runner reports it chose the layout itself (it
+          trims those on close) or that the operator chose (layoutOrigin).
+          Without --act the preview passes the close step's would-close
+          terminals as --assume-closed (layout_argv), so it names the trims an
+          act pass makes after its closes; none when the close step is skipped.
   nudge   nudge-stopped-sessions.py --send: types /next-move into each STOPPED
           row. A session named in this run just finished a turn, so it reads
           BUSY to the idle floor; it is nudged in a second pass limited to the
           named rows with the idle floor off (every other check still runs).
-          STUCK and CONTRADICTED rows are listed and never nudged.
+          STUCK rows, and HELD rows carrying a finish_stranded code, are
+          listed and never nudged (operator_rows). A finish the session's own
+          record contradicts (CONTRADICTED) is listed and nudged, so /next-move
+          reconciles it.
+
+While an operator restart prepare is `preparing` or `ready`, limit, name and
+nudge are held (typing_steps_held) and an unreadable restart_prep refuses --act.
 
 After typing into a pane (/name, /next-move) the script watches it. A prompt
 that reaches an exhausted account makes the runner move the session to another
@@ -141,10 +156,16 @@ def ready_to_type(tid, idle_min, cooldown_h, own, want="STOPPED"):
     moving = cfs.output_moving(tid)
     if moving is not False:
         return False, "terminal output still moving" if moving else "terminal output could not be sampled", tx
+    # A prepare can start after the pass's own read. This read can take seconds,
+    # so it comes before the prompt look below, which must stay the last thing here.
+    prep, prep_text = cfs.prepare_status()
+    if prep != "clear":
+        return False, f"re-screen: {prep_text}", tx
     # submit-prompt pastes onto whatever the input box holds, so a draft typed
-    # during the re-screen must not ride along.
+    # during the re-screen must not ride along. The replay wraps at the pane's
+    # width, as the screen's does, or a Windows idle prompt reads as a draft.
     raw = cfs.raw_tail(tid)
-    state, typed = cfs.prompt_state(raw) if raw is not None else ("unknown", "screen unreadable")
+    state, typed = cfs.prompt_state(raw, cols=cfs.wrap_cols(t)) if raw is not None else ("unknown", "screen unreadable")
     if state != "empty":
         return False, f"input prompt not empty just before the send ({state}: {str(typed)[:50]!r})", tx
     return True, "", tx
@@ -212,17 +233,32 @@ def screen_text(tid, chars=3000):
     return None if raw is None else cfs.ANSI_RE.sub("", raw)[-chars:]
 
 
+# {terminal id: keystroke writes attempted}, counted BEFORE each POST, so a write
+# that raised still counts: it may have reached the pane. aftercare ends a pane
+# whose look raised after it typed (Esc on a limit menu, 0 on a survey), rather
+# than look again and type a second time into a session this run does not own.
+KEYS_WRITTEN = {}
+
+
 def write_keys(tid, keys):
-    """Write raw keystrokes into a pane."""
+    """Write raw keystrokes into a pane, counted in KEYS_WRITTEN first."""
+    KEYS_WRITTEN[tid] = KEYS_WRITTEN.get(tid, 0) + 1
+    post_keys(tid, keys)
+
+
+def post_keys(tid, keys):
+    """The runner's POST /terminals/{id}/write, the keys base64-encoded."""
     req = urllib.request.Request(f"{cfs.API}/terminals/{tid}/write", method="POST",
                                  data=json.dumps({"data": base64.b64encode(keys).decode()}).encode(),
                                  headers={"Content-Type": "application/json"})
     urllib.request.urlopen(req, timeout=20).read()
 
 
-def session_id(tid):
-    """The Claude session id the runner registry records for a pane."""
-    return (cfs.open_rows().get(tid) or {}).get("claudeSessionId") or ""
+def session_id(rows, tid):
+    """The Claude session id a registry read (cfs.open_rows()) records for a
+    pane, or "". The caller reads the registry once for all its panes: a
+    registry read is slow on a loaded runner."""
+    return (rows.get(tid) or {}).get("claudeSessionId") or ""
 
 
 def successor(sid, gone, wait_s=30):
@@ -249,6 +285,9 @@ def await_handoff(tid, sid, wait_s=30):
             return (True, f"the runner resumed the session in pane {new[:8]} under another account") if new else \
                 (False, "the pane closed, but no other pane holds its session")
     if limit_menu_open(screen_text(tid) or ""):
+        # Same guard as hand_off_limited: under a prepare, leave the pane alone.
+        if cfs.prepare_status()[0] != "clear":
+            return False, "the runner did not move the session; its usage-limit menu was left open because a restart prepare is in force"
         write_keys(tid, b"\x1b")
         return False, "the runner did not move the session; its usage-limit menu was dismissed with Esc, no option chosen"
     return False, "the runner did not move the session"
@@ -265,7 +304,9 @@ def hand_off_limited(targets, a, own, outcomes=None):
     outcomes = {} if outcomes is None else outcomes
     for r in targets:
         tid = r["terminalId"]
-        if limit_menu_open(screen_text(tid) or ""):  # a menu left open holds the prompt
+        # A menu left open holds the prompt. Under a prepare, leave the pane
+        # alone: ready_to_type refuses the row just below.
+        if limit_menu_open(screen_text(tid) or "") and cfs.prepare_status()[0] == "clear":
             write_keys(tid, b"\x1b")
             time.sleep(1)
         ok, msg, _ = ready_to_type(tid, a.idle_min, a.cooldown_hours, own, want="LIMITED")
@@ -280,72 +321,191 @@ def hand_off_limited(targets, a, own, outcomes=None):
         outcomes[tid] = "sent_unconfirmed"  # until aftercare reads the handoff back
         print(f"  SENT    {tid[:8]}  {r['name'][:50]} - /next-move")
         sent.append(tid)
-    return failures + aftercare(sent, a, own, wait_s=90, report_running=True, outcomes=outcomes)
+    # Each pane's session as the screen read it, before any handoff moved it.
+    return failures + aftercare(sent, a, own, wait_s=90, limited=True, outcomes=outcomes,
+                                sids={r["terminalId"]: r.get("claudeSessionId") for r in targets})
 
 
-def aftercare(tids, a, own, wait_s=60, report_running=False, outcomes=None):
-    """Watch panes this run just typed into. A pane that closes with its session
-    in a new pane was moved by the runner to another account (HANDED); one
-    whose limit menu stays open was not, and the menu is dismissed with Esc.
-    An "Unknown command: /next-move" reply gets the command from origin/main.
-    A redirected pane stays watched, since the redirect is a prompt too and can
-    open the limit menu. A pane drops out once its turn is visibly running, it
-    closes, or it was handled. Returns the count of panes whose handling did
-    not complete. `outcomes`, when given, receives the pass-ledger outcome of
-    each pane it settles (a pane still pending at the deadline is left as it was)."""
+def answered_unknown(text):
+    """True when the pane answered its last /next-move with "Unknown command".
+    The reply is searched for after the last /next-move echo, not in a fixed
+    window at the screen's end: the input box and status lines Claude Code
+    redraws below the reply can run past any such window on a wide pane, and a
+    reply left from an earlier /next-move must not read as this one's. Pure.
+    Plan 2026-11-07-triage-sessions-ten-gaps-from-an-every-page-act-run, Phase 5."""
+    reply = text.rfind(UNKNOWN_NEXT_MOVE)
+    if reply < 0:
+        return False
+    echo = text.replace(UNKNOWN_NEXT_MOVE, "\0" * len(UNKNOWN_NEXT_MOVE)).rfind("/next-move")
+    return echo < reply
+
+
+def running_now(text):
+    """cfs.running_turn, over the text after the last Unknown command reply when
+    there is one: that reply ends no turn, so a spinner older than it is not a
+    turn running now. Pure."""
+    reply = text.rfind(UNKNOWN_NEXT_MOVE)
+    return cfs.running_turn(text if reply < 0 else text[reply + len(UNKNOWN_NEXT_MOVE):])
+
+
+def last_screen_state(text):
+    """A short description of a pane's last screen, for a PENDING row. Pure."""
+    if text is None:
+        return "no screen read"
+    lines = [ln.strip() for ln in text.splitlines() if set(ln.strip()) - set("\u2500\u2501 ")]
+    # ascii(): the row prints to whatever console runs this, cp1252 included.
+    return f"last screen line {ascii(lines[-1][:80])}" if lines else "screen blank"
+
+
+def aftercare(tids, a, own, wait_s=60, limited=False, outcomes=None, sids=None, watch=None):
+    """Watch panes this run just typed into, and print one row for each. A pane
+    that closes with its session in a new pane was moved by the runner to
+    another account (HANDED); one that closes with its session nowhere is GONE;
+    one whose limit menu stays open was not moved, and the menu is dismissed
+    with Esc (FAILED). An "Unknown command: /next-move" reply gets the command
+    from origin/main (REDIRECT). A redirected pane stays watched, since the
+    redirect is a prompt too and can open the limit menu. A pane drops out once
+    its turn is visibly running (WORKING; under `limited` the panes were
+    LIMITED, so that also means the account has capacity again), it closes, or
+    it was handled.
+
+    `sids` maps a pane to the Claude session the caller's screen read for it (a
+    screen row's claudeSessionId), so a pane the runner moves after its send is
+    still followed to its new pane. One registry read fills any pane `sids`
+    lacks. The deadline starts after that read, and a sweep that starts always
+    finishes, so every pane is looked at at least once however slow the reads
+    are. A pane still pending at the deadline gets a PENDING row. A look that
+    raises is retried at the next sweep, unless it had already typed into the
+    pane (KEYS_WRITTEN): that pane ends FAILED, so nothing is typed into it twice.
+
+    Returns the count of panes whose handling did not complete, PENDING ones
+    included. `outcomes`, when given, receives the pass-ledger outcome of each
+    pane; a PENDING pane stays sent_unconfirmed. `watch`, when given, receives
+    each pane's watch rows as {"verdict", "message"[, "redirected"]}: the nudge
+    step merges them into its helper's own --rows-out row (merge_watch), never
+    into the outcome."""
     outcomes = {} if outcomes is None else outcomes
-    pending, redirected, failures, deadline = set(tids), set(), 0, time.time() + wait_s
-    sids = {tid: session_id(tid) for tid in tids}
-    while pending and time.time() < deadline:
+    watch = {} if watch is None else watch
+    pending = dict.fromkeys(tids)  # ordered: the rows come out in the order the panes were sent
+    given = sids or {}
+    sids = {tid: given.get(tid) or "" for tid in pending}
+    if not all(sids.values()):
+        try:
+            rows = cfs.open_rows()
+        except Exception:  # http.client's too: such a pane is still watched by its screen
+            rows = {}
+        sids.update({tid: session_id(rows, tid) for tid, sid in sids.items() if not sid})
+    redirected, failures, swept, errors, last = set(), 0, False, {}, {}
+    start = time.time()
+
+    def seen(tid, verdict, msg):  # the watch row this pane ended on, for merge_watch
+        watch[tid] = dict({"verdict": verdict, "message": msg[:300]}, **({"redirected": True} if tid in redirected
+                                                                          else {}))
+    deadline = start + wait_s
+    while pending and (not swept or time.time() < deadline):
+        swept = True
         time.sleep(5)
-        listed = {t["id"] for t in cfs.terminals()}
-        for tid in sorted(pending):
-            if tid not in listed:
-                new = successor(sids[tid], tid)
-                failures += not new
-                outcomes[tid] = "done" if new else "failed"
-                print(f"  HANDED  {tid[:8]}  - the runner resumed the session in pane {new[:8]} under another account"
-                      if new else f"  GONE    {tid[:8]}  - the pane closed, and no other pane holds its session")
-                pending.discard(tid)
-                continue
-            text = screen_text(tid)
-            if text is None:
-                continue
-            if limit_menu_open(text):
-                handed, msg = await_handoff(tid, sids[tid])
-                failures += not handed
-                outcomes[tid] = "done" if handed else "failed"
-                print(f"  {'HANDED ' if handed else 'FAILED '} {tid[:8]}  - {msg}")
-                pending.discard(tid)
-            elif UNKNOWN_NEXT_MOVE in text[-600:] and tid not in redirected:
-                ok, msg = ready_for_redirect(tid)
-                if ok:
-                    _, err = submit(tid, NEXT_MOVE_FROM_MAIN)
-                    ok, msg = not err, err
-                failures += not ok
-                print(f"  {'REDIRECT' if ok else 'FAILED  '} {tid[:8]}  - "
-                      + ("no /next-move here; asked it to run the one on qontinui-claude-config origin/main"
-                         if ok else f"no /next-move here, and the redirect was not sent: {msg}"))
-                if ok:
-                    redirected.add(tid)
-                    deadline = max(deadline, time.time() + 30)
-                else:
+        try:
+            listed = {t["id"]: t for t in cfs.terminals()}
+        except Exception:  # http.client's too: this sweep reads the screens only
+            listed = None
+        for tid in list(pending):
+            # A look whose read raises keeps the pane for the next sweep, and its
+            # PENDING row names the failure; one pane never ends the others' watch.
+            # A look that raised AFTER it typed into the pane ends it FAILED instead:
+            # looking again could type into it a second time.
+            errors.pop(tid, None)
+            typed = KEYS_WRITTEN.get(tid, 0)
+            try:
+                if listed is not None and tid not in listed:
+                    new = successor(sids[tid], tid)
+                    failures += not new
+                    outcomes[tid] = "done" if new else "failed" if sids[tid] else "unknown"
+                    if new:
+                        msg = f"the runner resumed the session in pane {new[:8]} under another account"
+                    elif sids[tid]:
+                        msg = "the pane closed, and no other pane holds its session"
+                    else:
+                        msg = "the pane closed; its session id is unknown, so no other pane could be checked for it"
+                    print(f"  {'HANDED ' if new else 'GONE   '} {tid[:8]}  - {msg}")
+                    seen(tid, "HANDED" if new else "GONE", msg)
+                    del pending[tid]
+                    continue
+                text = screen_text(tid)
+                if text is None:
+                    continue
+                last[tid] = text
+                if limit_menu_open(text):
+                    handed, msg = await_handoff(tid, sids[tid])
+                    failures += not handed
+                    outcomes[tid] = "done" if handed else "failed"
+                    print(f"  {'HANDED ' if handed else 'FAILED '} {tid[:8]}  - {msg}")
+                    seen(tid, "HANDED" if handed else "FAILED", msg)
+                    del pending[tid]
+                elif tid not in redirected and answered_unknown(text):
+                    if listed is None:
+                        # The redirect's prompt check replays the pane at its width,
+                        # which only its /terminals row gives: the next sweep retries.
+                        errors[tid] = "the /terminals read failed, so the redirect's prompt check could not run"
+                        continue
+                    ok, msg = ready_for_redirect(tid, listed[tid])
+                    if ok:
+                        _, err = submit(tid, NEXT_MOVE_FROM_MAIN)
+                        ok, msg = not err, err
+                    failures += not ok
+                    print(f"  {'REDIRECT' if ok else 'FAILED  '} {tid[:8]}  - "
+                          + ("no /next-move here; asked it to run the one on qontinui-claude-config origin/main"
+                             if ok else f"no /next-move here, and the redirect was not sent: {msg}"))
+                    if ok:
+                        redirected.add(tid)
+                        deadline = max(deadline, time.time() + 30)
+                    else:
+                        outcomes[tid] = "failed"
+                        seen(tid, "FAILED", f"no /next-move here, and the redirect was not sent: {msg}")
+                        del pending[tid]
+                elif running_now(text):
+                    outcomes[tid] = "done"  # the prompt reached a session that is now working
+                    msg = "the prompt started a turn" + (": this account has capacity again" if limited else "")
+                    print(f"  WORKING {tid[:8]}  - {msg}")
+                    seen(tid, "WORKING", msg)
+                    del pending[tid]
+            except Exception as e:  # http.client's too
+                err = f"{type(e).__name__}: {str(e)[:80]}"
+                if KEYS_WRITTEN.get(tid, 0) > typed:
+                    failures += 1
                     outcomes[tid] = "failed"
-                    pending.discard(tid)
-            elif cfs.running_turn(text):
-                outcomes[tid] = "done"  # the prompt reached a session that is now working
-                if report_running:
-                    print(f"  WORKING {tid[:8]}  - the prompt started a turn: this account has capacity again")
-                pending.discard(tid)
+                    msg = (f"a look raised after it typed into the pane ({err}); not looked at again, so nothing "
+                           "is typed twice: read the pane with --report")
+                    print(f"  FAILED  {tid[:8]}  - {msg}")
+                    seen(tid, "FAILED", msg)
+                    del pending[tid]
+                else:
+                    errors[tid] = err
+    waited = round(time.time() - start)
+    for tid in pending:
+        failures += 1
+        outcomes.setdefault(tid, "sent_unconfirmed")
+        saw = ("redirected, then no HANDED, FAILED or WORKING" if tid in redirected
+               else "no HANDED, REDIRECT, FAILED or WORKING")
+        why = f" (its last look failed: {errors[tid]})" if tid in errors else ""
+        msg = (f"{saw} reading within {waited} s{why}; {last_screen_state(last.get(tid))}; read the pane again "
+               "with --report")
+        print(f"  PENDING {tid[:8]}  - {msg}")
+        seen(tid, "PENDING", msg)
     return failures
 
 
-def ready_for_redirect(tid):
+def ready_for_redirect(tid, term):
     """(ok, why) for typing the redirect. The full re-screen cannot be used:
     "Unknown command" ends no turn, so the spinner line above it still reads as
     a running turn. Instead the reply must be the last thing on screen, the
     output still, and the prompt empty. Claude's optional session survey can
-    print after the reply; it is dismissed with 0 first."""
+    print after the reply; it is dismissed with 0 first. A prepare that started
+    since the prompt this follows stops it before any key reaches the pane.
+    `term` is the pane's /terminals row: the prompt is replayed at its width."""
+    prep, prep_text = cfs.prepare_status()
+    if prep != "clear":
+        return False, prep_text
     text = screen_text(tid) or ""
     if SURVEY in text[text.rfind(UNKNOWN_NEXT_MOVE):]:
         write_keys(tid, b"0")
@@ -358,22 +518,90 @@ def ready_for_redirect(tid):
     moving = cfs.output_moving(tid)
     if moving is not False:
         return False, "terminal output still moving" if moving else "terminal output could not be sampled"
+    prep, prep_text = cfs.prepare_status()  # the survey wait and the sample above took seconds
+    if prep != "clear":
+        return False, prep_text
     raw = cfs.raw_tail(tid)
-    state, typed = cfs.prompt_state(raw) if raw is not None else ("unknown", "screen unreadable")
+    state, typed = (cfs.prompt_state(raw, cols=cfs.wrap_cols(term)) if raw is not None
+                    else ("unknown", "screen unreadable"))
     if state != "empty":
         return False, f"input prompt not empty ({state}: {str(typed)[:50]!r})"
     return True, ""
 
 
-def tids_in(out, prefix_labels):
-    """Full terminal ids of the rows a helper's output reports under labels."""
-    ids = {t["id"] for t in cfs.terminals()}
-    found = []
+def nudged_panes(rows_path, out, res):
+    """(full terminal ids, unresolved id prefixes) of the panes one
+    nudge-stopped-sessions.py --send run typed /next-move into, in the order it
+    sent them. Its --rows-out file names each send's full id at send time
+    (action nudge, outcome done or sent_unconfirmed), so a pane the runner
+    moved since still reaches the watch. That file's writer warns and never
+    raises, so a NUDGED or SENT? line whose row is missing is matched against
+    this pass's screen rows instead; a prefix neither resolves is returned
+    unresolved. Reads no runner door."""
+    events, _ = read_rows_file(rows_path) if rows_path else ([], 0)
+    sent = [ev["terminal_id"] for ev in events if ev.get("action") == "nudge" and isinstance(ev.get("terminal_id"), str)
+            and ev.get("action_outcome") in ("done", "sent_unconfirmed")]
+    screened = [r["terminalId"] for r in res]
+    unresolved = []
     for line in out.splitlines():
         parts = line.split()
-        if len(parts) >= 2 and parts[0] in prefix_labels:
-            found += [i for i in ids if i.startswith(parts[1])]
-    return found
+        if len(parts) < 2 or parts[0] not in ("NUDGED", "SENT?") or any(t.startswith(parts[1]) for t in sent):
+            continue
+        hits = [t for t in screened if t.startswith(parts[1])]
+        if len(hits) == 1:
+            sent.append(hits[0])
+        else:
+            unresolved.append(parts[1])
+    return list(dict.fromkeys(sent)), unresolved
+
+
+def watch_nudged(rows_out, out, res, a, own):
+    """aftercare() over the panes one nudge helper run sent /next-move to
+    (nudged_panes), each with the Claude session this pass's screen read for
+    it. `rows_out` is the --rows-out argument the run was given. A sent pane
+    whose full id cannot be resolved cannot be watched, so it gets a PENDING row
+    saying so. Returns the count that did not complete."""
+    tids, unresolved = nudged_panes(rows_out[1] if len(rows_out) == 2 else None, out, res)
+    for prefix in unresolved:
+        print(f"  PENDING {prefix[:8]}  - sent, but neither its --rows-out row nor this pass's screen gives its full "
+              "terminal id, so it was not watched; read the pane again with --report")
+    watch = {}
+    failures = aftercare(tids, a, own, sids={r["terminalId"]: r.get("claudeSessionId") for r in res}, watch=watch)
+    merge_watch(rows_out, watch)
+    return len(unresolved) + failures
+
+
+def merge_watch(rows_out, watch):
+    """Merge each pane's watch row into the nudge helper's own --rows-out row as
+    detail.watch, rewriting that file. The row's action_outcome is never
+    touched: apply_events lets the last event win, so a PENDING written as an
+    outcome would overwrite the helper's read-back `done`. `rows_out` is the
+    --rows-out argument pair the helper was given; nothing to merge, no file."""
+    if len(rows_out) != 2 or not watch:
+        return
+    path = rows_out[1]
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return
+    out = []
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except ValueError:
+            out.append(line)
+            continue
+        if isinstance(row, dict) and row.get("action") == "nudge" and row.get("terminal_id") in watch \
+                and isinstance(row.get("detail"), dict):
+            row["detail"] = dict(row["detail"], watch=watch[row["terminal_id"]])
+            line = json.dumps(row, separators=(",", ":"))
+        out.append(line)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("".join(ln + "\n" for ln in out))
+    except OSError as e:
+        print(f"WARNING: --rows-out {path}: the watch rows were not merged ({e})", file=sys.stderr)
 
 
 # ---------------------------------------------------------------- names
@@ -508,7 +736,7 @@ def custom_title(path):
     ai-title, so it cannot say whether a session was ever named."""
     title = None
     try:
-        with open(path, errors="replace") as f:
+        with open(path, encoding="utf-8", errors="replace") as f:
             for line in f:
                 if '"custom-title"' not in line:
                     continue
@@ -535,15 +763,17 @@ def suggested_name(text):
     return name
 
 
-def turn_done(tid, path, sent_ms):
+def turn_done(tid, term, row, sent_ms):
     """(done, final_text): the reply to a prompt sent at `sent_ms` is written
-    and the pane is back at an empty, idle prompt."""
-    row = cfs.open_rows().get(tid)
+    and the pane is back at an empty, idle prompt. `term` and `row` are the
+    pane's rows in the name poll's /terminals and registry reads for this
+    round; the prompt is replayed at the /terminals row's width."""
     tx = cfs.transcript_facts(row) if row else None
     if not tx or not tx.get("final_text_at") or tx["final_text_at"] < sent_ms or tx.get("pending_tool"):
         return False, ""
     raw = cfs.raw_tail(tid)
-    if raw is None or cfs.running_turn(cfs.ANSI_RE.sub("", raw)) or cfs.prompt_state(raw)[0] != "empty":
+    if raw is None or cfs.running_turn(cfs.ANSI_RE.sub("", raw)) or \
+            cfs.prompt_state(raw, cols=cfs.wrap_cols(term))[0] != "empty":
         return False, ""
     return True, tx.get("final_text") or ""
 
@@ -603,12 +833,23 @@ def name_sessions(targets, a, own):
             print(f"  {'SENT?  ' if posted else 'SKIPPED'} {tid[:8]}  {r['name'][:50]} - /name: {err}")
             continue
         sent[tid] = (at, tx["path"], r)
-    named, ran, deadline = [], set(), time.time() + a.name_timeout
+    named, ran, deadline, read_err = [], set(), time.time() + a.name_timeout, None
     while sent and time.time() < deadline:
         time.sleep(5)
+        # One /terminals read and one registry read per round, shared by every
+        # pane: a registry read is slow on a loaded runner, so a read per pane
+        # could outlast --name-timeout. A round whose read fails is read
+        # again on the next one.
+        try:
+            terms = {t["id"]: t for t in cfs.terminals()}
+            rows = cfs.open_rows()
+        except Exception as e:  # http.client's too
+            read_err = e
+            continue
+        read_err = None
         for tid, (at, path, r) in list(sent.items()):
             try:
-                result = poll_one(tid, at, path, r, ran, a, own)
+                result = poll_one(tid, at, path, r, ran, a, own, terms, rows)
             except Exception as e:  # http.client's too: reported SENT?, and the run goes on
                 result = ("SENT?  ", r["name"], f"/name was typed; a runner read failed before the title was read back: {e}")
             if result is None:
@@ -620,24 +861,28 @@ def name_sessions(targets, a, own):
             print(f"  {label} {tid[:8]}  {shown[:50]} - {msg}")
     for tid, (_, _, r) in sent.items():
         failures += 1
-        print(f"  SENT?   {tid[:8]}  {r['name'][:50]} - /name still running after {a.name_timeout}s, or waiting "
-              "at a dialog; not renamed")
+        why = (f"/name still running after {a.name_timeout}s, or waiting at a dialog" if read_err is None else
+               f"/name was typed; the runner could not be read before the title was read back ({str(read_err)[:120]})")
+        print(f"  SENT?   {tid[:8]}  {r['name'][:50]} - {why}; not renamed")
     return named, failures
 
 
-def poll_one(tid, at, path, r, ran, a, own):
-    """One look at a session /name was typed into. None while it is still
-    working; otherwise (label, name shown, message), after typing the /rename
-    when the reply suggested one. A usage-limit menu means the runner should
-    move the session to another account; that is waited for, never chosen."""
-    if not any(t["id"] == tid for t in cfs.terminals()):
+def poll_one(tid, at, path, r, ran, a, own, terms, rows):
+    """One look at a session /name was typed into. `terms` ({id: /terminals
+    row}) and `rows` (the registry) are the round's reads, shared by every pane
+    it polls. None while it is still working; otherwise (label, name shown,
+    message), after typing the /rename when the reply suggested one. A
+    usage-limit menu means the runner should move the session to another
+    account; that is waited for, never chosen."""
+    if tid not in terms:
         return "GONE   ", r["name"], "the pane closed while /name ran"
     text = screen_text(tid)
     if limit_menu_open(text):
-        handed, msg = await_handoff(tid, session_id(tid))
+        # The session the screen read for the pane, as the watch after a send uses.
+        handed, msg = await_handoff(tid, r.get("claudeSessionId") or session_id(rows, tid))
         return ("HANDED " if handed else "FAILED "), r["name"], msg
     if tid not in ran:
-        row = cfs.open_rows().get(tid)
+        row = rows.get(tid)
         tx = cfs.transcript_facts(row) if row else None
         p_at, text = (tx or {}).get("last_prompt"), (tx or {}).get("last_prompt_text") or ""
         if p_at and p_at >= at - 1000 and NAME_RAN.search(text):
@@ -645,7 +890,7 @@ def poll_one(tid, at, path, r, ran, a, own):
         elif time.time() * 1000 - at > 60000:
             return "SENT?  ", r["name"], "/name did not run within 60s"
         return None
-    done, reply = turn_done(tid, path, at)
+    done, reply = turn_done(tid, terms[tid], rows.get(tid), at)
     if not done:
         return None
     # /name queues `/rename <name>` into its own pane, which Claude Code runs
@@ -697,7 +942,7 @@ def tab_pages(pages, names):
 def run_helper(script, args):
     """Run a helper beside this file, echo its output, return (exit, stdout)."""
     p = subprocess.run([sys.executable, os.path.join(_here, script), *args],
-                       capture_output=True, text=True)
+                       capture_output=True, text=True, encoding="utf-8", errors="replace")
     for line in (p.stdout + p.stderr).splitlines():
         print("  " + line)
     return p.returncode, p.stdout
@@ -708,17 +953,199 @@ def common(a):
             + (["--port", a.port] if a.port else []))
 
 
+CLOSE_REFUSED_UNREADABLE = ("close-finished-sessions.py --close will refuse: GET /restart-readiness is unreadable, "
+                            "so nothing closes")
+
+
+def would_close(res, ready_err=None):
+    """The rows close-finished-sessions.py --close would close at screen time:
+    each row's close-screen verdict (nss.screen keeps it as r["screen"]) in that
+    script's own CLOSABLE set, so the report predicts what the closer does.
+    With readiness unreadable (`ready_err` set) the closer refuses --close
+    outright, EXITED-FINISHED rows included, so none would close."""
+    return [] if ready_err else [r for r in res if r["screen"] in cfs.CLOSABLE]
+
+
+def list_custody(res):
+    """Print, for the operator, each row the close screen read CUSTODY: finished,
+    but its directory is not a linked worktree (a primary checkout, the workspace
+    root, no repository) or could not be read (served finished-criteria condition
+    3). No step closes or nudges such a row, so the close step names every one,
+    as the nudge step names STUCK, in report and act mode alike."""
+    for r in res:
+        if r["screen"] == "CUSTODY":
+            why = next((x for x in r.get("reasons") or [] if x.startswith("custody")), "; ".join(r.get("reasons") or []))
+            print(f"  CUSTODY      {r['terminalId'][:8]}  {r['tab']:<14.14}  {r['name'][:50]} - {why[:160]}; "
+                  "for the operator")
+
+
+def operator_rows(res):
+    """(label, row) for each row the nudge step lists before it sends: STUCK and
+    a HELD row carrying a finish_stranded code (a finished session a screen
+    rule holds, cfs.stranded_code), which are never nudged and are for the
+    operator, and CONTRADICTED, which is nudged so /next-move reconciles it.
+    Pure."""
+    out = []
+    for r in res:
+        if r["verdict"] == "STUCK":
+            out.append(("STUCK", r))
+        elif r["verdict"] == "HELD" and r.get("reason_code"):
+            out.append(("HELD", r))
+        elif r["verdict"] == "STOPPED" and r.get("screen") == "CONTRADICTED":
+            out.append(("CONTRADICTED", r))
+    return out
+
+
+def layout_argv(a, pages, res, skip, ready_err=None):
+    """The layout step's argv for runner-layout.py. In report mode it previews
+    the trim after this run's own predicted closes: the close step's would-close
+    terminals (would_close) go in as --assume-closed. An act pass passes none
+    (its close step has already run, so /terminals lists only what is left),
+    and neither does a pass whose close step is skipped, which closes nothing.
+    Nor does a pass whose readiness read failed (`ready_err`): the closer would
+    refuse. `pages` is the page ids under --only (empty: every page). Plan
+    2026-11-07-triage-sessions-ten-gaps-from-an-every-page-act-run, Phase 7."""
+    where = ["--page", ",".join(pages)] if pages else ["--all-pages"]
+    closing = [] if a.act or "close" in skip else [r["terminalId"] for r in would_close(res, ready_err)]
+    return (["fit", *where, "--trim-only"] + ([] if a.act else ["--dry-run"])
+            + (["--assume-closed", ",".join(closing)] if closing else []) + (["--port", a.port] if a.port else []))
+
+
+def close_argv(a, rows_out=()):
+    """The close step's argv for close-finished-sessions.py. The selftest parses
+    it with that script's own parser (cfs.build_parser), so a flag the helper
+    does not take fails CI here instead of the first acting pass."""
+    return ["--close"] + common(a) + list(rows_out)
+
+
 # Everything this script calls on its two imported siblings. The selftest
 # checks they still exist, so a rename there fails CI here rather than at the
 # first --act run.
 USES_NSS = ("judge", "row_facts", "screen", "external_signals", "STOPPED_FROM")
-USES_CFS = ("API", "ANSI_RE", "EnvelopeUnknown", "READ_ERRORS", "classify", "load", "open_rows", "output_moving",
-            "page_names", "proc_table", "prompt_state", "raw_tail", "read", "readiness", "running_turn", "terminals",
-            "transcript_facts")
+USES_CFS = ("API", "ANSI_RE", "CLOSABLE", "print_stranded", "EnvelopeUnknown", "READ_ERRORS", "build_parser", "classify",
+            "git_rev_parse_dirs", "live_session_ids", "load", "open_rows", "output_moving", "page_names",
+            "prepare_status", "proc_facts", "proc_table", "prompt_state", "raw_tail", "read", "readiness",
+            "running_turn", "finish_since", "terminals", "transcript_facts", "wrap_cols")
+
+
+def selftest_prepare_hold():
+    """main() --act under each prepare verdict, every door stubbed and nothing
+    able to type; then ready_to_type under a prepare that started mid-run.
+    Returns the number of failures."""
+    import contextlib
+    import io
+    g = globals()
+    failures = 0
+    # nss.screen keeps every row's close-screen verdict as "screen"; the close step reads it.
+    limited = {"terminalId": "l1", "verdict": "LIMITED", "screen": "LIMITED", "tab": "x", "name": "n", "reasons": []}
+    stopped = {"terminalId": "s1", "verdict": "STOPPED", "screen": "ACTIVE", "tab": "x", "name": "n", "reasons": []}
+    class Recorder:
+        def __getattr__(self, _name):
+            return lambda *a, **k: []
+    keys_g = ("PASS", "run_helper", "hand_off_limited", "name_sessions", "aftercare", "custom_title", "screen_text",
+              "write_keys", "ready_to_type", "limit_menu_open")
+    keys_cfs = ("prepare_status", "terminals", "open_rows", "transcript_facts", "readiness", "classify", "proc_table",
+                "output_moving", "raw_tail")
+    keys_nss = ("screen", "external_signals", "judge", "row_facts")
+    saved_g = {k: g[k] for k in keys_g}
+    saved_cfs = {k: getattr(cfs, k) for k in keys_cfs}
+    saved_nss = {k: getattr(nss, k) for k in keys_nss}
+    saved_argv = sys.argv
+    acted = []
+    try:
+        g["PASS"] = Recorder()
+        g["run_helper"] = lambda script, args: (acted.append(script.split("-")[0]) or (0, ""))
+        g["hand_off_limited"] = lambda *a, **k: (acted.append("limit") or 0)
+        g["name_sessions"] = lambda *a, **k: (acted.append("name") or ([], 0))
+        g["aftercare"] = lambda *a, **k: 0
+        g["custom_title"] = lambda path: None
+        cfs.terminals = lambda: []
+        cfs.open_rows = lambda: {"s1": {}}
+        cfs.transcript_facts = lambda row: {"path": "p"}
+        nss.screen = lambda *a, **k: ([limited, stopped], [], None)
+        for prep, want_rc, want in ((("held", "held text"), 0, ["close"]),
+                                    (("unknown", "unknown text"), 3, []),
+                                    (("clear", ""), 0, ["close", "limit", "name", "nudge"])):
+            acted.clear()
+            cfs.prepare_status = lambda prep=prep: prep
+            sys.argv = ["triage-sessions.py", "--act", "--skip", "layout"]
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                rc = main()
+            if rc != want_rc or acted != want:
+                print(f"FAIL main --act under prepare {prep[0]}: rc {rc}, acted {acted}; want rc {want_rc}, {want}")
+                failures += 1
+        # ready_to_type: a prepare that started after the pass's read stops it
+        # before the final prompt look, whichever verdict the row is wanted in.
+        cfs.terminals = lambda: [{"id": "t1"}]
+        cfs.readiness = lambda: ({}, None)
+        cfs.open_rows = lambda: {"t1": {}}
+        cfs.classify = lambda *a: ("ACTIVE", [])
+        cfs.proc_table = lambda: {}
+        cfs.transcript_facts = lambda row: None
+        nss.external_signals = lambda *a: None
+        nss.row_facts = lambda *a: {}
+        cfs.prepare_status = lambda: ("held", "held text")
+        cfs.output_moving = lambda tid: False
+        def tail(tid):
+            raise AssertionError("the final prompt look reached under a held prepare")
+        cfs.raw_tail = tail
+        for want in ("STOPPED", "LIMITED"):
+            nss.judge = lambda *a, want=want: (want, [])
+            ok, msg, _ = ready_to_type("t1", 0, 48, "", want=want)
+            if ok or "held text" not in msg:
+                print(f"FAIL ready_to_type({want}) under a mid-run prepare: {ok} {msg!r}")
+                failures += 1
+        # No key reaches a pane under a prepare: not the redirect's survey key,
+        # and not the Esc the limit step sends to an open menu.
+        keys = []
+        g["write_keys"] = lambda tid, data: keys.append(data)
+        g["screen_text"] = lambda tid: UNKNOWN_NEXT_MOVE + " " + SURVEY
+        ok, msg = ready_for_redirect("t1", {"id": "t1"})
+        if ok or "held text" not in msg or keys:
+            print(f"FAIL ready_for_redirect under a prepare: {ok} {msg!r}, keys {keys}")
+            failures += 1
+        # A prepare that starts between the redirect's two reads stops it too.
+        reads = iter([("clear", ""), ("held", "held text")])
+        cfs.prepare_status = lambda: next(reads)
+        g["screen_text"] = lambda tid: UNKNOWN_NEXT_MOVE
+        ok, msg = ready_for_redirect("t1", {"id": "t1"})
+        if ok or "held text" not in msg:
+            print(f"FAIL ready_for_redirect under a prepare started mid-check: {ok} {msg!r}")
+            failures += 1
+        cfs.prepare_status = lambda: ("held", "held text")
+        g["screen_text"] = lambda tid: UNKNOWN_NEXT_MOVE + " " + SURVEY
+        g["limit_menu_open"] = lambda text: True
+        g["ready_to_type"] = lambda *a, **k: (False, "held text", None)
+        with contextlib.redirect_stdout(io.StringIO()):
+            saved_g["hand_off_limited"]([limited], argparse.Namespace(idle_min=0, cooldown_hours=48), "")
+        if keys:
+            print(f"FAIL hand_off_limited sent keys under a prepare: {keys}")
+            failures += 1
+    finally:
+        sys.argv = saved_argv
+        g.update(saved_g)
+        for k, v in saved_cfs.items():
+            setattr(cfs, k, v)
+        for k, v in saved_nss.items():
+            setattr(nss, k, v)
+    return failures
+
+
+def typing_steps_held(prep, skip):
+    """The steps a restart prepare holds, in run order. Pure. These three type
+    into a pane: /next-move would end a paused session's pause, and on a LIMITED
+    row it would hand the session to another account, which the prepare promises
+    not to do. Closing finished tabs and trimming grids type nothing."""
+    return [s for s in ("limit", "name", "nudge") if s not in skip] if prep == "held" else []
 
 
 def selftest():
     failures = 0
+    for prep, skip, want in (("held", set(), ["limit", "name", "nudge"]), ("held", {"name"}, ["limit", "nudge"]),
+                             ("clear", set(), []), ("unknown", set(), [])):
+        if typing_steps_held(prep, skip) != want:
+            print(f"FAIL typing_steps_held({prep!r}, {skip!r}) = {typing_steps_held(prep, skip)}, want {want}")
+            failures += 1
     for mod, names in ((nss, USES_NSS), (cfs, USES_CFS)):
         for missing in [n for n in names if not hasattr(mod, n)]:
             print(f"FAIL {mod.__name__}.{missing} no longer exists")
@@ -839,8 +1266,17 @@ def selftest():
     if any(p != "/health" for p in paths):
         print(f"FAIL auto_accept_dial read {sorted(set(paths))}, want only /health")
         failures += 1
+    failures += selftest_prepare_hold()
     step_failures, steps = selftest_name_sessions()
     failures += step_failures
+    close_failures, close_rows, close_argvs, listings = selftest_close_step()
+    failures += close_failures
+    watch_failures, watch_cells = watch_selftest()
+    failures += watch_failures
+    reply_failures, reply_cells = reply_selftest()
+    failures += reply_failures
+    width_failures, width_cells = width_selftest()
+    failures += width_failures
     cases = [
         ("```\n/rename 614,615 headless agent provisioning\n```\nDerived from #614.",
          "614,615 headless agent provisioning"),
@@ -873,7 +1309,9 @@ def selftest():
             failures += 1
     print(f"selftest: {len(cases)} name cases, {len(modes)} mode cases, {len(holds)} hold cases, "
           f"{len(reads)} dial reads, {len(sessions) + 1} session holds, {steps} name-step runs, "
-          f"{len(tabs)} tab cases, {failures} failure(s)")
+          f"{len(tabs)} tab cases, {close_rows} close-prediction rows, {close_argvs} close-argv parses, "
+          f"{listings} listing checks (custody x2, held section, nudge x2), {watch_cells} watch cells, {reply_cells} reply/merge cells, {width_cells} prompt-width cells, "
+          f"{failures} failure(s)")
     return 1 if failures else 0
 
 
@@ -989,9 +1427,781 @@ def selftest_name_sessions():
     return failures, len(runs)
 
 
-def main():
-    if "--selftest" in sys.argv[1:]:
-        return selftest()
+def selftest_close_step():
+    """The close step against close-finished-sessions.py itself (plan Phase 2,
+    N2 and D2). Its report names exactly the rows that script's --close would
+    close - each row's close-screen verdict in cfs.CLOSABLE - and none of them is
+    a row coord does not read finished (a closeout phrase, a nothing-owed footer,
+    a runner mark beside waiting_human, working or no status). Its acting header
+    names the screen-time count, and the argv it runs the helper with parses with
+    that script's own parser, for every option this script takes. The verdicts
+    come from cfs.classify over stubbed reads (no runner, no process table), and
+    main() runs with every door stubbed and nothing able to close or type.
+    The close step names each CUSTODY row for the operator in both modes, and
+    the nudge step's listing names a contradicted finish as nudged, and STUCK
+    for the operator. Returns (failures, rows, argv parses, listing checks)."""
+    import contextlib
+    import io
+    failures = 0
+    g = globals()
+    now = time.time() * 1000
+    m = 60000
+    idle = {"final_text": "Fixed the bug and pushed it.", "final_text_at": now - 60 * m,
+            "last_prompt": now - 62 * m, "last_prompt_text": "fix the bug", "last_asst": now - 60 * m,
+            "last_activity": now - 60 * m, "pending_tool": False, "last_turn_open": now - 62 * m,
+            "last_turn_open_text": "fix the bug", "task_prompts": 1, "cwd": cfs.LINKED_CWD}
+    shut = dict(idle, final_text="PR #3 landed.\n\nSAFE TO CLOSE")
+    footer = dict(idle, final_text="Done.\n\n**POLICY_COMPLIANCE**\n- **Final state:** this session owes nothing.")
+    mark = {"finished": True, "finishedAt": int(now - 61 * m)}
+    by_time = {"sessionStatus": "finished", "sessionStatusSince": int(now - 61 * m)}
+    table = [  # (terminal id, claude alive, registry row, readiness row, transcript, closable under the policy)
+        ("c0000001", True, {}, by_time, idle, True),
+        ("c0000002", True, mark, {"sessionStatus": "finished"}, idle, True),
+        ("c0000003", False, mark, {}, idle, True),  # claude has exited: EXITED-FINISHED
+        ("c0000004", True, {}, {"sessionStatus": "working"}, shut, False),
+        ("c0000005", True, {}, {"sessionStatus": "waiting_human"}, shut, False),
+        ("c0000006", True, {}, {}, footer, False),
+        ("c0000007", True, mark, {"sessionStatus": "waiting_human"}, idle, False),
+        ("c0000008", True, mark, {"sessionStatus": "working"}, idle, False),
+        ("c0000009", True, mark, {}, idle, False),
+        ("c0000010", True, {}, by_time, dict(idle, cwd="/w/repo"), False),  # a primary checkout: CUSTODY
+        # a turn inside coord's 1 s stamp band: close keeps it, nudge holds it (finish_stranded.in_band)
+        ("c0000011", True, {}, {"sessionStatus": "finished", "sessionStatusSince": int(now - 62 * m) + 500}, idle,
+         False),
+    ]
+    txs = {f"s-{tid}": tx for tid, _, _, _, tx, _ in table}
+    stubs = {"proc_facts": lambda tbl, pid, windows=None: ([11], [], []),
+             "live_session_ids": lambda claudes: set(txs), "raw_tail": lambda tid, chars=30000: "screen",
+             "running_turn": lambda text: False, "prompt_state": lambda raw, *, cols: ("empty", ""),
+             "transcript_facts": lambda row: dict(txs[row["claudeSessionId"]]),
+             "git_rev_parse_dirs": cfs.fake_git_dirs}  # the custody probe: no git runs
+    saved_cfs = {k: getattr(cfs, k) for k in list(stubs) + ["terminals", "open_rows", "prepare_status", "API"]}
+    saved_g = {k: g[k] for k in ("PASS", "run_helper")}
+    saved_screen, saved_argv = nss.screen, sys.argv
+
+    class Recorder:
+        def __getattr__(self, _name):
+            return lambda *a, **k: []
+    res = []
+    try:
+        for k, v in stubs.items():
+            setattr(cfs, k, v)
+        ready = {f"s-{tid}": rp for tid, _, _, rp, _, _ in table}
+        for tid, alive, row, rp, tx, _ in table:
+            reg = dict(row, claudeSessionId=f"s-{tid}")
+            term = {"id": tid, "isAlive": alive, "pid": 10 if alive else 99}
+            verdict, why = cfs.classify(term, reg, {10: (1, ["bash"])}, 15, "", ready)
+            code, why = cfs.coded_row(why, None)  # as cfs.screen_all lifts it
+            judged, reasons = nss.judge(verdict, why, nss.row_facts(reg, ready), tx, now, None)
+            res.append({"terminalId": tid, "verdict": judged, "screen": verdict, "reasons": reasons, "name": tid,
+                        "tab": "t", "account": "a", "claudeSessionId": f"s-{tid}", "reason_code": code})
+        policy = {tid for tid, _, _, _, _, ok in table if ok}
+        closer = {r["terminalId"] for r in res if r["screen"] in cfs.CLOSABLE}  # what --close targets
+        if closer != policy:
+            print(f"FAIL close screen: --close would target {sorted(closer)}; only {sorted(policy)} are finished in "
+                  f"coord (or exited): {[(r['terminalId'], r['screen']) for r in res]}")
+            failures += 1
+        g["PASS"], cfs.terminals, cfs.open_rows = Recorder(), lambda: [], lambda: {}
+        cfs.prepare_status = lambda: ("clear", "")
+        nss.screen = lambda *a, **k: ([dict(r) for r in res], [], None)
+        out = io.StringIO()
+        sys.argv = ["triage-sessions.py", "--skip", "limit,name,layout,nudge"]
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            main()
+        said = [ln.split() for ln in out.getvalue().splitlines() if ln.strip().startswith("would close ")]
+        named = {w[2] for w in said}
+        if named != closer or any(w[-1] != f"({next(r['screen'] for r in res if r['terminalId'] == w[2])})"
+                                  for w in said):
+            print(f"FAIL close report: would close {sorted(named)}, the closer's own screen closes {sorted(closer)}: "
+                  f"{out.getvalue()!r}")
+            failures += 1
+        # A CUSTODY row (c0000010, a primary checkout) is named for the operator in both modes: no step
+        # closes or nudges it.
+        custody = {r["terminalId"] for r in res if r["screen"] == "CUSTODY"}
+
+        def custody_listed(text):
+            return {ln.split()[1] for ln in text.splitlines() if ln.strip().startswith("CUSTODY ")
+                    and "custody: not a linked worktree" in ln and ln.rstrip().endswith("; for the operator")}
+        if custody != {"c0000010"} or custody_listed(out.getvalue()) != custody:
+            print(f"FAIL close report: CUSTODY rows {sorted(custody)}, named for the operator "
+                  f"{sorted(custody_listed(out.getvalue()))}: {out.getvalue()!r}")
+            failures += 1
+        # Plan 2026-11-07-triage-sessions-ten-gaps-from-an-every-page-act-run Phase 2: after == close, the
+        # finished rows a screen rule holds, each with its finish_stranded code; no uncoded row.
+        coded = {r["terminalId"]: r["reason_code"] for r in res if r.get("reason_code")}
+        want_coded = {"c0000007": "finish_stranded.coord_status", "c0000008": "finish_stranded.coord_status",
+                      "c0000011": "finish_stranded.in_band"}
+        held = out.getvalue().split(f"== FINISHED, HELD BY A SCREEN RULE (not closed): {len(want_coded)}\n", 1)
+        shown = {ln.split()[0]: ln for ln in (held[1].splitlines() if len(held) == 2 else []) if ln.startswith("  c")}
+        if coded != want_coded or set(shown) != set(want_coded) or not all(
+                f"] {code}: " in held[1] for code in want_coded.values()):
+            print(f"FAIL close report: the held section lists {sorted(shown)}, coded {coded}; want {want_coded}: "
+                  f"{out.getvalue()!r}")
+            failures += 1
+        # Acting: the header names the screen-time count, and the helper's argv is one it accepts.
+        ran = []
+        g["run_helper"] = lambda script, args: ran.append((script, list(args))) or (0, "")
+        out = io.StringIO()
+        sys.argv = ["triage-sessions.py", "--act", "--skip", "limit,name,layout,nudge", "--only", "c0", "--port",
+                    "9877", "--idle-min", "7"]
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            main()
+        if f"== close ({len(closer)} closable at screen time; close-finished-sessions.py re-screens each row " \
+                "before its DELETE)" not in out.getvalue() or [s for s, _ in ran] != ["close-finished-sessions.py"]:
+            print(f"FAIL close --act: header or helper run wrong: {out.getvalue()!r} {ran}")
+            failures += 1
+        if custody_listed(out.getvalue()) != custody:
+            print(f"FAIL close --act: CUSTODY rows {sorted(custody)}, named for the operator "
+                  f"{sorted(custody_listed(out.getvalue()))}: {out.getvalue()!r}")
+            failures += 1
+        # Every option this script takes, set at once, still builds an argv the helper's parser accepts.
+        ap = build_parser()
+        every = []
+        for act in ap._actions:
+            flag = next((o for o in act.option_strings if o.startswith("--")), None)
+            if flag and flag != "--help":
+                every += [flag] if act.nargs == 0 else [flag, "1" if act.type in (int, float) else "x"]
+        argvs = [args for _, args in ran] + [close_argv(ap.parse_args(every), ["--rows-out", "rows.jsonl"])]
+        for args in argvs:
+            try:
+                with contextlib.redirect_stderr(io.StringIO()):
+                    cfs.build_parser().parse_args(args)
+            except SystemExit:
+                print(f"FAIL close step argv {args} is refused by close-finished-sessions.py's own parser")
+                failures += 1
+        # The nudge step's listing (plan Phase 6): a finish the session's own record contradicts is listed
+        # as nudged, so /next-move reconciles it; only STUCK is left for the operator.
+        stuck = {"terminalId": "c0000099", "verdict": "STUCK", "screen": "ACTIVE", "name": "stuck", "tab": "t",
+                 "account": "a", "reasons": ["3 /next-move nudges in a row made no progress"]}
+        nss.screen = lambda *a, **k: ([dict(r) for r in res] + [dict(stuck)], [], None)
+        out = io.StringIO()
+        sys.argv = ["triage-sessions.py", "--skip", "close,limit,name,layout"]
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            main()
+        lines = [ln.split() for ln in out.getvalue().splitlines()]
+        contradicted = {r["terminalId"] for r in res if r["screen"] == "CONTRADICTED" and r["verdict"] == "STOPPED"}
+        listed = {w[1] for w in lines if w[:1] == ["CONTRADICTED"] and "nudged:" in w}
+        nudged = {w[2] for w in lines if w[:2] == ["would", "nudge"]}
+        if not contradicted or listed != contradicted or not contradicted <= nudged or \
+                not any(w[:2] == ["STUCK", "c0000099"] for w in lines) or "c0000099" in nudged:
+            print(f"FAIL nudge listing: contradicted {sorted(contradicted)}, listed as nudged {sorted(listed)}, "
+                  f"would nudge {sorted(nudged)}: {out.getvalue()!r}")
+            failures += 1
+        # Phase 2: a HELD row carrying a finish_stranded code is listed for the operator, with its code, and
+        # never nudged; an uncoded HELD row is not listed.
+        held_coded = {r["terminalId"] for r in res if r["verdict"] == "HELD" and r.get("reason_code")}
+        listed_held = {w[1] for w in lines if w[:1] == ["HELD"] and any(x.startswith("finish_stranded.") for x in w)}
+        uncoded_held = {r["terminalId"] for r in res if r["verdict"] == "HELD" and not r.get("reason_code")}
+        if held_coded != {"c0000007", "c0000011"} or listed_held != held_coded or held_coded & nudged \
+                or any(w[:1] == ["HELD"] and w[1] in uncoded_held for w in lines):
+            print(f"FAIL nudge listing: coded HELD {sorted(held_coded)}, listed {sorted(listed_held)}, uncoded HELD "
+                  f"{sorted(uncoded_held)}: {out.getvalue()!r}")
+            failures += 1
+    finally:
+        sys.argv = saved_argv
+        nss.screen = saved_screen
+        g.update(saved_g)
+        for k, v in saved_cfs.items():
+            setattr(cfs, k, v)
+    failures += layout_step_selftest(res)
+    return failures, len(table), len(argvs), 5
+
+
+def layout_step_selftest(res):
+    """Plan 2026-11-07-triage-sessions-ten-gaps-from-an-every-page-act-run
+    Phase 7: the layout step's argv, through main() with every door stubbed. In
+    report mode it carries the close step's would-close terminals as
+    --assume-closed; with --skip close, and in an act pass, it carries none; and
+    --assume-closed only ever rides a --dry-run, which runner-layout.py requires.
+    Returns failures."""
+    import contextlib
+    import io
+    failures = 0
+    g = globals()
+    closer = [r["terminalId"] for r in res if r["screen"] in cfs.CLOSABLE]
+    saved_g = {k: g[k] for k in ("PASS", "run_helper")}
+    saved_cfs = {k: getattr(cfs, k) for k in ("terminals", "open_rows", "prepare_status", "API")}
+    saved_screen, saved_argv = nss.screen, sys.argv
+
+    class Recorder:
+        def __getattr__(self, _name):
+            return lambda *a, **k: []
+    try:
+        g["PASS"], cfs.terminals, cfs.open_rows = Recorder(), lambda: [], lambda: {}
+        cfs.prepare_status = lambda: ("clear", "")
+        cfs.API = "http://127.0.0.1:9"
+        for argv, want, err in ((["--skip", "limit,name,nudge"], closer, None),  # report mode, close step on
+                                (["--skip", "close,limit,name,nudge"], [], None),  # close skipped: nothing closes
+                                (["--act", "--skip", "limit,name,nudge"], [], None),  # act: its closes already ran
+                                # readiness unreadable: the closer refuses --close, so nothing would close
+                                (["--skip", "limit,name,nudge"], [], "GET /restart-readiness: timed out")):
+            nss.screen = lambda *a, err=err, **k: ([dict(r) for r in res], [], err)
+            ran = []
+            g["run_helper"] = lambda script, args: ran.append((script, list(args))) or (0, "")
+            sys.argv = ["triage-sessions.py"] + argv
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                main()
+            layout = [args for script, args in ran if script == "runner-layout.py"]
+            got = []
+            if layout and "--assume-closed" in layout[0]:
+                got = layout[0][layout[0].index("--assume-closed") + 1].split(",")
+            if not closer or len(layout) != 1 or sorted(got) != sorted(want) \
+                    or ("--assume-closed" in layout[0] and "--dry-run" not in layout[0]):
+                print(f"FAIL layout step argv under {argv} (readiness error {err!r}): {layout}; "
+                      f"want --assume-closed {sorted(want)}")
+                failures += 1
+            text = out.getvalue()
+            if err and ("== close (0 closable)" not in text or CLOSE_REFUSED_UNREADABLE not in text
+                        or "would close " in text):
+                print(f"FAIL close report with readiness unreadable: {text!r}")
+                failures += 1
+    finally:
+        sys.argv = saved_argv
+        nss.screen = saved_screen
+        g.update(saved_g)
+        for k, v in saved_cfs.items():
+            setattr(cfs, k, v)
+    return failures
+
+
+class FakeClock:
+    """time.time() and time.sleep() for the watch selftest: a sleep moves the
+    clock instead of waiting, so a 60 s watch deadline passes in no real time."""
+
+    def __init__(self, now=1_800_000_000.0):
+        self.now = now
+
+    def time(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+
+WATCH_LABELS = ("HANDED", "GONE", "FAILED", "REDIRECT", "WORKING", "PENDING")
+
+
+def watch_rows(text):
+    """{8-character pane id: [watch row labels, in order]} in printed output."""
+    rows = {}
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0] in WATCH_LABELS:
+            rows.setdefault(parts[1], []).append(parts[0])
+    return rows
+
+
+def watch_selftest():
+    """The watch after a limit or nudge send, driven through main() --act, and
+    the name step's poll, driven through name_sessions(). Every runner door is
+    stubbed, cfs.API points at a closed port as a backstop, and the clock is
+    fake, so nothing reaches a runner and no real time passes. Returns
+    (failures, cells)."""
+    import contextlib
+    import http.client
+    import io
+    g = globals()
+    bad = []
+    real_aftercare = aftercare
+    keys_g = ("PASS", "run_helper", "submit", "write_keys", "post_keys", "ready_to_type", "custom_title", "aftercare",
+              "time")
+    keys_cfs = ("API", "terminals", "open_rows", "raw_tail", "prepare_status", "readiness", "transcript_facts",
+                "output_moving", "prompt_state", "read", "page_names")
+    saved_g = {k: g[k] for k in keys_g}
+    saved_cfs = {k: getattr(cfs, k) for k in keys_cfs}
+    saved_screen, saved_argv = nss.screen, sys.argv
+    tmp = tempfile.mkdtemp(prefix="triage-watch-")
+    working, idle = "\u273b Working\u2026 (esc to interrupt)", "\u276f "
+    unknown = "\u276f /next-move\n  " + UNKNOWN_NEXT_MOVE + "\n"
+    outcome_of = {"NUDGED": "done", "SENT?": "sent_unconfirmed", "SKIPPED": "skipped"}
+    clock = FakeClock()
+
+    class Rec:
+        """PASS for these runs: real --rows-out paths, the limit step's outcomes kept, nothing recorded."""
+
+        def __init__(self):
+            self.dir, self.n, self.limit = tempfile.mkdtemp(dir=tmp), 0, None
+
+        def rows_out(self, step):
+            self.n += 1
+            return ["--rows-out", os.path.join(self.dir, f"{self.n}-{step}.jsonl")]
+
+        def handed_off(self, _targets, outcomes):
+            self.limit = dict(outcomes)
+
+        def __getattr__(self, _name):
+            return lambda *a, **k: None
+
+    def screen_rows(verdict, panes):
+        return [{"terminalId": t, "verdict": verdict, "tab": "tab", "name": t, "reasons": [], "account": "acct",
+                 "claudeSessionId": sid} for t, sid in panes]
+
+    def act(step, res, listed, registry, screens, sends=(), written=None, slow=0.0):
+        """main() --act with every step but `step` skipped, over the screen rows
+        `res`. Once the step has sent, /terminals lists `listed`, the registry
+        holds `registry` ({pane: session}) and each registry read moves the
+        clock `slow` s. For nudge, the stubbed helper prints a row per
+        (pane, label) in `sends` and writes the --rows-out row of the panes in
+        `written` (default: all of them). Returns (exit code, output, reads by
+        (phase, door), screen reads per pane once the watch began, prompts
+        typed, keys written, the limit step's outcomes)."""
+        state = {"phase": "screen"}  # -> "step" at main's prepare read, -> "watch" when aftercare starts
+        reads, looked, typed, keyed, rec = {}, {}, [], [], Rec()
+        rows_written = {t for t, _ in sends} if written is None else written
+
+        def count(door):
+            reads[(state["phase"], door)] = reads.get((state["phase"], door), 0) + 1
+
+        def terminals():
+            count("terminals")
+            return [{"id": t} for t in listed]
+
+        def open_rows():
+            count("open_rows")
+            clock.sleep(slow)
+            return {t: {"claudeSessionId": sid} for t, sid in registry.items()}
+
+        def prepare():
+            state["phase"] = "step" if state["phase"] == "screen" else state["phase"]
+            return "clear", ""
+
+        def tail(tid, chars=30000):
+            shown = screens.get(tid)
+            if isinstance(shown, list):  # one screen per look once the watch began, the last one kept
+                shown = shown[min(looked.get(tid, 0), len(shown) - 1)]
+            if state["phase"] == "watch":
+                looked[tid] = looked.get(tid, 0) + 1
+                if isinstance(shown, Exception):  # a read the watch's own look must survive
+                    raise shown
+            return None if isinstance(shown, Exception) else shown
+
+        def watched(*args, **kw):
+            state["phase"] = "watch"
+            return real_aftercare(*args, **kw)
+
+        def helper(script, args):
+            if not script.startswith("nudge-stopped-sessions"):
+                raise AssertionError(f"{script} ran in a watch cell")
+            path = args[args.index("--rows-out") + 1]
+            for tid, label in sends:
+                if tid in rows_written:
+                    cfs.append_rows_out(path, {"terminal_id": tid, "action": "nudge",
+                                               "action_outcome": outcome_of[label], "detail": {}})
+            return 0, "".join(f"  {label:<7} {tid[:8]}  tab             acct           {tid} - selftest\n"
+                              for tid, label in sends)
+
+        cfs.terminals, cfs.open_rows, cfs.prepare_status, cfs.raw_tail = terminals, open_rows, prepare, tail
+        g["PASS"], g["run_helper"], g["aftercare"] = rec, helper, watched
+        g["submit"] = lambda tid, message: typed.append((tid, message)) or (True, "")
+        g["write_keys"] = lambda tid, keys: keyed.append((tid, keys))
+        nss.screen = lambda *_a, **_k: ([dict(r) for r in res], [], None)
+        sys.argv = ["triage-sessions.py", "--act", "--skip", ",".join(s for s in STEPS if s != step)]
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            try:
+                rc = main()
+            except Exception as e:  # reported as this cell's exit, so the cells after it still run
+                rc = f"main() raised {type(e).__name__}: {e}"
+        return rc, out.getvalue(), reads, looked, typed, keyed, rec.limit
+
+    cells = 0
+    try:
+        cfs.API = "http://127.0.0.1:9"
+        cfs.readiness = lambda: ({}, None)
+        cfs.transcript_facts = lambda row: None
+        cfs.output_moving = lambda tid, seconds=3: False
+        cfs.prompt_state = lambda raw, *, cols: ("empty", "")  # keyword-only, like the real one
+        cfs.page_names = lambda: {}
+
+        def no_read(*_a, **_k):
+            raise AssertionError("a watch cell read GET /health")
+        cfs.read = no_read
+        g["ready_to_type"] = lambda tid, *_a, **_k: (True, "", None)
+        g["time"] = clock
+        # A slow registry: each read takes longer than the watch's wait split
+        # over the batch. Every sent pane is still looked at and gets exactly one
+        # row, the first one's turn showing only at its second look, so the wait
+        # counts from after the setup read; the session ids come from the screen,
+        # so setup reads the registry once for the panes the screen gave none, and
+        # not at all when it gave every one; and no /terminals read resolves the
+        # sent panes after the batch.
+        for step, n, from_screen in (("nudge", 0, False), ("nudge", 1, False), ("nudge", 13, False),
+                                     ("nudge", 13, True), ("limit", 0, False), ("limit", 1, False),
+                                     ("limit", 13, False)):
+            cells += 1
+            case = f"slow registry, {step} batch of {n}" + (" with screen ids" if from_screen else "")
+            wait = 60 if step == "nudge" else 90
+            ids = [f"w{i:07d}-{step}" for i in range(n)]
+            res = screen_rows("STOPPED" if step == "nudge" else "LIMITED",
+                              [(t, f"s-{t}" if from_screen else None) for t in ids])
+            screens = dict.fromkeys(ids, working)
+            screens.update({t: [idle, working] for t in ids[:1]})
+            rc, text, reads, looked, typed, keyed, _ = act(
+                step, res, listed=ids, registry={t: f"s-{t}" for t in ids}, screens=screens,
+                sends=[(t, "NUDGED") for t in ids], slow=wait / max(n, 1) + 1)
+            rows, setup = watch_rows(text), reads.get(("watch", "open_rows"), 0)
+            want_setup = 1 if n and not from_screen else 0
+            if rows != {t[:8]: ["WORKING"] for t in ids} or any(looked.get(t, 0) < 1 for t in ids):
+                bad.append(f"{case}: watch rows {rows}, screens read {looked}; want one WORKING row per pane, "
+                           "each pane looked at")
+            if setup != want_setup or reads.get(("step", "terminals"), 0) or rc or keyed:
+                bad.append(f"{case}: setup read the registry {setup} time(s) (want {want_setup}), /terminals "
+                           f"{reads.get(('step', 'terminals'), 0)} time(s) after the sends (want 0), exit {rc}, "
+                           f"keys {keyed}")
+        # One sweep always runs and always finishes: a watch with no time left
+        # still looks at every pane once.
+        cells += 1
+        zero = [f"z{i:07d}-zero" for i in range(2)]
+        cfs.terminals = lambda: [{"id": t} for t in zero]
+        cfs.open_rows = lambda: {t: {"claudeSessionId": f"s-{t}"} for t in zero}
+        cfs.raw_tail = lambda tid, chars=30000: working
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            left = real_aftercare(zero, argparse.Namespace(), "", wait_s=0)
+        if watch_rows(out.getvalue()) != {t[:8]: ["WORKING"] for t in zero} or left:
+            bad.append(f"a watch with no time left: rows {watch_rows(out.getvalue())}, {left} not completed; "
+                       "want one sweep over every pane")
+        # A pane the runner moved after its send, and one that closed: both
+        # reach the watch, and the screen's session id finds the moved one's
+        # new pane (HANDED); nothing holds the other's (GONE). A closed pane
+        # whose session id neither the screen nor the registry knows is GONE
+        # with that said, not "no other pane holds its session".
+        for step in ("nudge", "limit"):
+            cells += 1
+            moved, gone, stay, new, orphan = (f"{c}0000001-{step}" for c in "mgsno")
+            res = screen_rows("STOPPED" if step == "nudge" else "LIMITED",
+                              [(moved, "s-moved"), (gone, "s-gone"), (stay, "s-stay"), (orphan, None)])
+            rc, text, reads, looked, typed, keyed, outcomes = act(
+                step, res, listed=[stay, new], registry={new: "s-moved", stay: "s-stay"},
+                screens={stay: working, new: working}, sends=[(t, "NUDGED") for t in (moved, gone, stay, orphan)])
+            rows, lines = watch_rows(text), text.splitlines()
+            said = (any(ln.startswith(f"  HANDED  {moved[:8]}") and f"pane {new[:8]}" in ln for ln in lines)
+                    and any(ln.startswith(f"  GONE    {gone[:8]}") and "no other pane holds" in ln for ln in lines)
+                    and any(ln.startswith(f"  GONE    {orphan[:8]}") and "session id is unknown" in ln for ln in lines))
+            if rows != {moved[:8]: ["HANDED"], gone[:8]: ["GONE"], stay[:8]: ["WORKING"], orphan[:8]: ["GONE"]} \
+                    or not said:
+                bad.append(f"moved mid-batch, {step}: watch rows {rows}; want HANDED to {new[:8]}, GONE, WORKING, "
+                           f"GONE (session id unknown): {lines}")
+            if step == "limit" and outcomes != {moved: "done", gone: "failed", stay: "done", orphan: "unknown"}:
+                bad.append(f"moved mid-batch, limit: outcomes {outcomes}")
+        # A pane that never resolves reads PENDING at the deadline, counted as
+        # not completed with its outcome left sent_unconfirmed; so does a pane
+        # whose redirect was typed and that then showed nothing more.
+        for step in ("nudge", "limit"):
+            cells += 1
+            quiet, asked = f"q0000001-{step}", f"u0000001-{step}"
+            res = screen_rows("STOPPED" if step == "nudge" else "LIMITED", [(quiet, "s-quiet"), (asked, "s-asked")])
+            rc, text, reads, looked, typed, keyed, outcomes = act(
+                step, res, listed=[quiet, asked], registry={quiet: "s-quiet", asked: "s-asked"},
+                screens={quiet: idle, asked: unknown}, sends=[(quiet, "NUDGED"), (asked, "NUDGED")])
+            lines, rows = text.splitlines(), watch_rows(text)
+            said = (any(ln.startswith(f"  PENDING {quiet[:8]}  - no HANDED, REDIRECT, FAILED or WORKING reading "
+                                      "within ") and ln.endswith("read the pane again with --report") for ln in lines)
+                    and any(ln.startswith(f"  PENDING {asked[:8]}  - redirected, then no HANDED, FAILED or WORKING")
+                            for ln in lines))
+            redirects = [t for t, m in typed if m == NEXT_MOVE_FROM_MAIN]
+            if rows != {quiet[:8]: ["PENDING"], asked[:8]: ["REDIRECT", "PENDING"]} or not said or rc != 1 \
+                    or redirects != [asked]:
+                bad.append(f"never resolves, {step}: watch rows {rows}, exit {rc}, redirected {redirects}: {lines}")
+            if step == "limit" and outcomes != {quiet: "sent_unconfirmed", asked: "sent_unconfirmed"}:
+                bad.append(f"never resolves, limit: outcomes {outcomes}, want both sent_unconfirmed")
+        # A look whose read raises (a torn body, which raw_tail does not catch)
+        # keeps the pane for the next sweep and never ends the others' watch;
+        # a pane whose every look fails reads PENDING, naming the failure.
+        cells += 1
+        once, always, fine = "e0000001-raise", "e0000002-raise", "e0000003-raise"
+        torn = http.client.IncompleteRead(b"{")
+        res = screen_rows("STOPPED", [(once, "s-1"), (always, "s-2"), (fine, "s-3")])
+        rc, text, reads, looked, typed, keyed, _ = act(
+            "nudge", res, listed=[once, always, fine], registry={once: "s-1", always: "s-2", fine: "s-3"},
+            screens={once: [torn, working], always: [torn], fine: working},
+            sends=[(t, "NUDGED") for t in (once, always, fine)])
+        rows = watch_rows(text)
+        if rows != {once[:8]: ["WORKING"], always[:8]: ["PENDING"], fine[:8]: ["WORKING"]} or rc != 1 \
+                or not any(ln.startswith(f"  PENDING {always[:8]}") and "its last look failed: IncompleteRead" in ln
+                           for ln in text.splitlines()):
+            bad.append(f"a look that raises: watch rows {rows}, exit {rc}")
+        # A look that raised AFTER it typed into the pane - the survey's 0 before a redirect, then a torn
+        # screen read; the Esc on a limit menu the runner did not move, whose reply was torn - ends the pane
+        # FAILED, naming the failure, and the pane is never looked at again, so nothing is typed twice. The
+        # real write_keys runs and counts each write; only its POST is stubbed.
+        cells += 1
+        sv, mn, fine = "v0000001-typed", "m0000001-typed", "f0000001-typed"
+        menu = ("You've hit your weekly limit\nWhat do you want to do?\n  \u276f1. Stop and wait for limit to reset\n"
+                "   2. Resume when the limit resets\n Enter to confirm \u00b7 Esc to cancel")
+        posted, seen = [], {}
+
+        def typed_tail(tid, chars=30000):
+            seen[tid] = seen.get(tid, 0) + 1
+            if tid == sv and seen[tid] == 3:  # the survey check's re-read, after its 0 went out
+                raise http.client.IncompleteRead(b"{")
+            return {sv: unknown + "  " + SURVEY + "\n", mn: menu, fine: working}[tid]
+
+        def post(tid, keys):
+            posted.append((tid, keys))
+            if keys == b"\x1b":  # the Esc reached the runner, and its reply did not come back
+                raise http.client.IncompleteRead(b"{")
+        g["write_keys"], g["post_keys"] = saved_g["write_keys"], post
+        cfs.terminals = lambda: [{"id": t} for t in (sv, mn, fine)]
+        cfs.raw_tail = typed_tail
+        cfs.prepare_status = lambda: ("clear", "")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            left = real_aftercare([sv, mn, fine], argparse.Namespace(), "", wait_s=60,
+                                  sids={sv: "s-v", mn: "s-m", fine: "s-f"})
+        rows, lines = watch_rows(out.getvalue()), out.getvalue().splitlines()
+        if rows != {sv[:8]: ["FAILED"], mn[:8]: ["FAILED"], fine[:8]: ["WORKING"]} or left != 2 \
+                or posted != [(sv, b"0"), (mn, b"\x1b")] \
+                or not all(any(ln.startswith(f"  FAILED  {t[:8]}") and "raised after it typed" in ln
+                               and "IncompleteRead" in ln for ln in lines) for t in (sv, mn)):
+            bad.append(f"a look that raises after typing: watch rows {rows}, {left} not completed, keys posted "
+                       f"{posted}; want FAILED, FAILED, WORKING with one 0 and one Esc: {lines}")
+        g["post_keys"] = saved_g["post_keys"]
+        # The sent panes come from the nudge helper's --rows-out rows, so a pane
+        # this pass's screen never listed is watched too. That file's writer
+        # warns and never raises: a sent pane with no row is matched by its
+        # printed prefix against the screen rows; a skipped row is never
+        # watched; a prefix nothing resolves reads PENDING.
+        cells += 1
+        a1, b1, x1, y1, k1 = "a0000001-out", "b0000001-out", "x0000001-out", "y0000001-out", "k0000001-out"
+        res = screen_rows("STOPPED", [(a1, "s-a"), (b1, "s-b"), (k1, "s-k")])
+        rc, text, reads, looked, typed, keyed, _ = act(
+            "nudge", res, listed=[a1, b1, x1, y1, k1],
+            registry={a1: "s-a", b1: "s-b", x1: "s-x", y1: "s-y", k1: "s-k"},
+            screens=dict.fromkeys((a1, b1, x1, y1, k1), working),
+            sends=[(a1, "NUDGED"), (b1, "SENT?"), (x1, "NUDGED"), (y1, "NUDGED"), (k1, "SKIPPED")],
+            written={a1, y1, k1})
+        rows = watch_rows(text)
+        if rows != {a1[:8]: ["WORKING"], b1[:8]: ["WORKING"], x1[:8]: ["PENDING"], y1[:8]: ["WORKING"]} or rc != 1 \
+                or not any(ln.startswith(f"  PENDING {x1[:8]}") and "not watched" in ln for ln in text.splitlines()):
+            bad.append(f"sent panes from --rows-out, a row lost: watch rows {rows}, exit {rc}")
+        # The name step's poll: one /terminals read and one registry read per
+        # round, for every pane. Two rounds over three panes: /name runs in the
+        # first, the reply and title read back in the second.
+        cells += 1
+        names = [f"n{i:07d}-name" for i in range(3)]
+        polled = {"terminals": 0, "open_rows": 0}
+
+        def count_terminals():
+            polled["terminals"] += 1
+            return [{"id": t} for t in names]
+
+        def count_rows():
+            polled["open_rows"] += 1
+            return {t: {"claudeSessionId": f"s-{t}"} for t in names}
+        cfs.terminals, cfs.open_rows = count_terminals, count_rows
+        cfs.raw_tail = lambda tid, chars=30000: "\u23f5\u23f5 bypass permissions on (shift+tab to cycle)"
+        cfs.read = lambda path, key, timeout=60: {"success": True,
+                                                  "data": {"permissionAutoAccept": {"answered": True, "level": "on"}}}
+        cfs.transcript_facts = lambda row: {"path": "p", "last_prompt": 10 ** 13, "final_text_at": 10 ** 13,
+                                            "last_prompt_text": "<command-name>/name</command-name>",
+                                            "final_text": "named"}
+        g["ready_to_type"] = lambda tid, *_a, **_k: (True, "", {"path": f"{tid}.jsonl"})
+        g["submit"] = lambda tid, message: (True, "")
+        g["custom_title"] = lambda path: "a title"
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            got, n_failed = name_sessions([{"terminalId": t, "name": t, "claudeSessionId": f"s-{t}"} for t in names],
+                                          argparse.Namespace(idle_min=15, cooldown_hours=None, name_timeout=10), "")
+        if got != names or n_failed or polled != {"terminals": 2, "open_rows": 2}:
+            bad.append(f"name poll over {len(names)} panes in 2 rounds: named {got}, {n_failed} failed, reads "
+                       f"{polled}; want all named and one /terminals and one registry read per round")
+    except Exception as e:  # a cell that raises is a failure, never a crash of the selftest
+        bad.append(f"watch selftest raised {type(e).__name__}: {e}")
+    finally:
+        sys.argv, nss.screen = saved_argv, saved_screen
+        g.update(saved_g)
+        for k, v in saved_cfs.items():
+            setattr(cfs, k, v)
+        shutil.rmtree(tmp, ignore_errors=True)
+    for b in bad:
+        print("FAIL " + b)
+    return len(bad), cells
+
+
+def reply_selftest():
+    """Plan 2026-11-07-triage-sessions-ten-gaps-from-an-every-page-act-run Phase 5:
+    the watch reads an "Unknown command" reply wherever it sits after the last
+    /next-move echo, a spinner older than that reply is not a running turn, a
+    PENDING row names the pane's last screen line, and the nudge step's watch
+    rows ride the helper's own --rows-out row as detail.watch without touching
+    its outcome. The fixtures are SYNTHESIZED (no temporary runner was used: no
+    live reproduction). Returns (failures, cells)."""
+    import contextlib
+    import io
+    bad, cells = [], 0
+    rule = "─" * 220
+    chrome = f"\n{rule}\n❯ \n{rule}\n  ⏵⏵ bypass permissions on (shift+tab to cycle)\n"
+    # SYNTHESIZED: a wide pane whose input box and status line, redrawn below the reply, put the reply more
+    # than 600 characters from the end of the screen.
+    wide = "✻ Worked for 2m 3s\n\n❯ /next-move\n  ⎿  " + UNKNOWN_NEXT_MOVE + "\n" + chrome * 2
+    # SYNTHESIZED: a spinner frame redrawn after the last turn end and before the reply.
+    stale = ("✻ Worked for 2m 3s\n✢ Thinking… (esc to interrupt)\n\n❯ /next-move\n  ⎿  "
+             + UNKNOWN_NEXT_MOVE + "\n" + chrome)
+    # an earlier /next-move's reply, then a new /next-move echo with no reply yet
+    again = "❯ /next-move\n  ⎿  " + UNKNOWN_NEXT_MOVE + "\n❯ /next-move\n" + chrome
+    for text, want in ((wide, True), (stale, True), (again, False), (chrome, False)):
+        cells += 1
+        if answered_unknown(text) != want:
+            bad.append(f"answered_unknown({text[:40]!r}...) = {answered_unknown(text)}, want {want}")
+    cells += 1
+    if UNKNOWN_NEXT_MOVE in wide[-600:]:
+        bad.append("the wide fixture must put the reply outside the last 600 characters")
+    for text, want in ((stale, False), (stale + "✢ Thinking… (esc to interrupt)\n", True),
+                       ("✢ Thinking… (esc to interrupt)\n", True)):
+        cells += 1
+        if running_now(text) != want:
+            bad.append(f"running_now({text[-50:]!r}) = {running_now(text)}, want {want}")
+    for text, want in ((None, "no screen read"), (chrome, "last screen line '\\u23f5\\u23f5 bypass permissions on "
+                                                          "(shift+tab to cycle)'"), ("\n \n", "screen blank")):
+        cells += 1
+        if last_screen_state(text) != want:
+            bad.append(f"last_screen_state({text!r:.30}) = {last_screen_state(text)!r}, want {want!r}")
+    # The watch over the wide and stale-spinner fixtures: one REDIRECT each (never WORKING), then PENDING
+    # naming the last screen line, and the watch rows recorded for merge_watch. Every door is stubbed and the
+    # clock is fake.
+    g = globals()
+    for label, screen in (("wide", wide), ("stale", stale)):
+        saved_g = {k: g[k] for k in ("ready_for_redirect", "submit", "time", "limit_menu_open")}
+        saved_cfs = {k: getattr(cfs, k) for k in ("terminals", "raw_tail", "open_rows")}
+        tid = f"r0000001-{label}"
+        try:
+            g["time"] = FakeClock()
+            g["ready_for_redirect"] = lambda t, term: (True, "")
+            typed = []
+            g["submit"] = lambda t, message, typed=typed: typed.append((t, message)) or (True, "")
+            cfs.terminals = lambda tid=tid: [{"id": tid}]
+            cfs.raw_tail = lambda t, chars=30000, screen=screen: screen
+            cfs.open_rows = lambda tid=tid: {tid: {"claudeSessionId": "s-r"}}
+            out, watch = io.StringIO(), {}
+            with contextlib.redirect_stdout(out):
+                left = aftercare([tid], argparse.Namespace(), "", sids={tid: "s-r"}, watch=watch)
+        finally:
+            g.update(saved_g)
+            for k, v in saved_cfs.items():
+                setattr(cfs, k, v)
+        cells += 1
+        pending = [ln for ln in out.getvalue().splitlines() if ln.startswith(f"  PENDING {tid[:8]}")]
+        if watch_rows(out.getvalue()) != {tid[:8]: ["REDIRECT", "PENDING"]} or left != 1 \
+                or typed != [(tid, NEXT_MOVE_FROM_MAIN)] or not pending or "last screen line" not in pending[0] \
+                or watch.get(tid, {}).get("verdict") != "PENDING" or watch[tid].get("redirected") is not True:
+            bad.append(f"the {label} Unknown command reply: rows {watch_rows(out.getvalue())}, left {left}, typed "
+                       f"{typed}, watch {watch}: {out.getvalue()!r}")
+    # merge_watch: the watch row lands in the helper's own nudge row as detail.watch; its outcome is untouched.
+    cells += 1
+    tmp = tempfile.mkdtemp(prefix="triage-merge-")
+    path = os.path.join(tmp, "nudge.jsonl")
+    try:
+        cfs.append_rows_out(path, {"terminal_id": tid, "action": "nudge", "action_outcome": "done",
+                                   "detail": {"sent": True}})
+        cfs.append_rows_out(path, {"terminal_id": "other", "action": "nudge", "action_outcome": "skipped",
+                                   "detail": {}})
+        merge_watch(["--rows-out", path], {tid: {"verdict": "PENDING", "message": "x"}})
+        rows, dropped = read_rows_file(path)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    by = {r["terminal_id"]: r for r in rows}
+    if dropped or by[tid]["action_outcome"] != "done" or by[tid]["detail"] != {
+            "sent": True, "watch": {"verdict": "PENDING", "message": "x"}} or "watch" in by["other"]["detail"]:
+        bad.append(f"merge_watch: rows {rows}, dropped {dropped}")
+    for b in bad:
+        print("FAIL " + b)
+    return len(bad), cells
+
+
+def width_selftest():
+    """The prompt reads around triage's sends (plan Phase 7, D3), over the
+    SYNTHETIC idle Windows pane cfs.IDLE_CONPTY_PROMPT_SCREEN, whose empty prompt
+    reads empty only when replayed at the pane's width: ready_to_type before a
+    send, turn_done in the name poll and ready_for_redirect in the watch, each
+    through the real cfs.prompt_state with wrap_cols held on its Windows arm,
+    so no cell depends on the host. Then the watch's redirect, which needs the
+    pane's /terminals row: a sweep whose /terminals read fails types nothing and
+    the next sweep redirects; when every read fails the pane reads PENDING and
+    says why. Every door is stubbed, submit only records, cfs.API points at a
+    closed port as a backstop, and the clock is fake. Returns (failures, cells)."""
+    import contextlib
+    import io
+    g = globals()
+    bad, cells, typed = [], 0, []
+    idle, cols = cfs.IDLE_CONPTY_PROMPT_SCREEN, cfs.CONPTY_FIXTURE_COLS
+    term = {"id": "w0000001-width", "cols": cols}
+    tid, real_wrap = term["id"], cfs.wrap_cols
+    keys_cfs = ("API", "terminals", "readiness", "open_rows", "classify", "proc_table", "transcript_facts",
+                "output_moving", "prepare_status", "raw_tail", "wrap_cols")
+    keys_nss = ("external_signals", "judge", "row_facts")
+    keys_g = ("screen_text", "submit", "write_keys", "time")
+    saved_cfs = {k: getattr(cfs, k) for k in keys_cfs}
+    saved_nss = {k: getattr(nss, k) for k in keys_nss}
+    saved_g = {k: g[k] for k in keys_g}
+    try:
+        cfs.API = "http://127.0.0.1:9"
+        cfs.terminals = lambda: [term]
+        cfs.readiness = lambda: ({}, None)
+        cfs.open_rows = lambda: {tid: {"claudeSessionId": "s-width"}}
+        cfs.classify = lambda *a: ("ACTIVE", [])
+        cfs.proc_table = lambda: {}
+        cfs.transcript_facts = lambda row: {"path": "p", "final_text_at": 2, "final_text": "named",
+                                            "pending_tool": False}
+        cfs.output_moving = lambda tid, seconds=3: False
+        cfs.prepare_status = lambda: ("clear", "")
+        cfs.raw_tail = lambda tid, chars=30000: idle
+        cfs.wrap_cols = lambda t, windows=None: real_wrap(t, windows=True)
+        nss.external_signals = lambda *a, **k: None
+        nss.row_facts = lambda *a: {}
+        nss.judge = lambda *a: ("STOPPED", [])
+        g["screen_text"] = lambda tid, chars=3000: "\u276f /next-move\n  " + UNKNOWN_NEXT_MOVE + "\n"
+        g["submit"] = lambda tid, message: typed.append((tid, message)) or (True, "")
+        g["write_keys"] = lambda tid, keys: bad.append(f"a width cell wrote {keys!r} into {tid}")
+        for name, call, want in (
+                ("ready_to_type", lambda: ready_to_type(tid, 0, 48, "")[:2], (True, "")),
+                ("turn_done", lambda: turn_done(tid, term, {"claudeSessionId": "s-width"}, 1), (True, "named")),
+                ("ready_for_redirect", lambda: ready_for_redirect(tid, term), (True, ""))):
+            cells += 1
+            try:
+                got = call()
+            except Exception as e:  # a width passed by position raises TypeError: a failure, never a crash
+                got = f"raised {type(e).__name__}: {e}"
+            if got != want:
+                bad.append(f"{name} over an idle Windows pane read at its width = {got!r}, want {want!r}")
+        # The watch's redirect: the pane's row comes from the sweep's own /terminals read.
+        for fails, want_typed, want_rows in ((1, [(tid, NEXT_MOVE_FROM_MAIN)], ["REDIRECT", "PENDING"]),
+                                             (10 ** 6, [], ["PENDING"])):
+            cells += 1
+            typed.clear()
+            reads = []
+
+            def terminals(fails=fails, reads=reads):
+                reads.append(1)
+                if len(reads) <= fails:
+                    raise urllib.error.URLError("selftest: refused")
+                return [term]
+            cfs.terminals, g["time"] = terminals, FakeClock()
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                left = aftercare([tid], argparse.Namespace(), "", sids={tid: "s-width"})
+            rows = watch_rows(out.getvalue()).get(tid[:8], [])
+            why = "the /terminals read failed, so the redirect's prompt check could not run"
+            if typed != want_typed or rows != want_rows or left != 1 or \
+                    (not want_typed and why not in out.getvalue()):
+                bad.append(f"a watch whose first {fails} /terminals read(s) fail: typed {typed}, rows {rows}, "
+                           f"{left} not completed; want {want_typed}, {want_rows}: {out.getvalue()!r}")
+    finally:
+        g.update(saved_g)
+        for k, v in saved_cfs.items():
+            setattr(cfs, k, v)
+        for k, v in saved_nss.items():
+            setattr(nss, k, v)
+    for b in bad:
+        print("FAIL " + b)
+    return len(bad), cells
+
+
+def build_parser():
+    """This script's argument parser (--selftest is read before it). The
+    selftest sets every option it takes and parses the close step's argv with
+    close-finished-sessions.py's own parser."""
     ap = argparse.ArgumentParser()
     ap.add_argument("--act", action="store_true", help="run the steps; without it, report only")
     ap.add_argument("--skip", default="", help=f"comma-separated steps to leave out: {', '.join(STEPS)}")
@@ -1001,12 +2211,22 @@ def main():
     ap.add_argument("--idle-min", type=int, default=15)
     ap.add_argument("--cooldown-hours", type=float, default=None,
                     help="the nudge step's backstop hours (default: nudge-stopped-sessions.py's own)")
-    ap.add_argument("--include-closeout", action="store_true", help="also close CLOSEOUT rows")
     ap.add_argument("--only", default="", help="terminal id prefixes to limit every step to (layout: the pages holding them)")
     ap.add_argument("--tab", action="append", default=[], metavar="NAME",
                     help="limit every step to the sessions in the Terminal-page tab(s) of this name; repeatable")
     ap.add_argument("--port", help="runner API port (default $QONTINUI_RUNNER_API_PORT or 9876)")
-    a = ap.parse_args()
+    return ap
+
+
+def main():
+    for stream in (sys.stdout, sys.stderr):  # a piped Windows console is cp1252
+        try:
+            stream.reconfigure(encoding="utf-8", errors="backslashreplace")
+        except (AttributeError, ValueError, OSError):
+            pass
+    if "--selftest" in sys.argv[1:]:
+        return selftest()
+    a = build_parser().parse_args()
     skip = {s for s in a.skip.split(",") if s}
     if skip - set(STEPS):
         print(f"unknown step(s): {', '.join(sorted(skip - set(STEPS)))}", file=sys.stderr)
@@ -1048,6 +2268,7 @@ def main():
                   "nothing to triage")
             return 0
         a.only = ",".join(ids)
+    PASS.screening()
     try:
         terms = [t for t in cfs.terminals() if any(t["id"].startswith(o) for o in a.only.split(",") if o)]
         res, warnings, ready_err = nss.screen(a.idle_min, [o for o in a.only.split(",") if o], a.cooldown_hours,
@@ -1066,22 +2287,40 @@ def main():
     if a.act and ready_err:
         print("UNKNOWN: --act refused - GET /restart-readiness could not be read", file=sys.stderr)
         return 3
+    prep, prep_text = cfs.prepare_status()
+    if prep != "clear":
+        print("WARNING: " + prep_text)
+    if a.act and prep == "unknown":
+        print(f"UNKNOWN: --act refused - {prep_text}", file=sys.stderr)
+        return 3
+    for step in typing_steps_held(prep, skip):
+        print(f"\n== {step} (held: a restart prepare is in force, so this step types into nothing)")
+        PASS.step(step, held="restart prepare in force")
+        skip.add(step)
 
     failed = 0
-    closable = {"FINISHED", "EXITED-FINISHED"} | ({"CLOSEOUT"} if a.include_closeout else set())
     if "close" not in skip:
-        print(f"\n== close ({sum(r['verdict'] in closable for r in res)} closable)")
-        PASS.step("close", candidates=sum(r["verdict"] in closable for r in res))
+        # The prediction is the closer's own: the close screen's verdict against its CLOSABLE set.
+        closable = would_close(res, ready_err)
+        PASS.step("close", candidates=len(closable))
         if a.act:
-            code, _ = run_helper("close-finished-sessions.py",
-                                 ["--close"] + (["--include-closeout"] if a.include_closeout else []) + common(a)
-                                 + PASS.rows_out("close"))
+            print(f"\n== close ({len(closable)} closable at screen time; close-finished-sessions.py re-screens "
+                  "each row before its DELETE)")
+        else:
+            print(f"\n== close ({len(closable)} closable)")
+            if ready_err:
+                print("  " + CLOSE_REFUSED_UNREADABLE)
+        list_custody(res)
+        if a.act:
+            code, _ = run_helper("close-finished-sessions.py", close_argv(a, PASS.rows_out("close")))
             failed += code != 0
             PASS.step("close", exit=code)
         else:
-            for r in res:
-                if r["verdict"] in closable:
-                    print(f"  would close {r['terminalId'][:8]}  {r['tab']:<14.14}  {r['name'][:50]}")
+            for r in closable:
+                print(f"  would close {r['terminalId'][:8]}  {r['tab']:<14.14}  {r['name'][:50]} ({r['screen']})")
+        # Structurally finished rows a screen rule holds, with their finish_stranded
+        # code: the close helper's own section, over the same screened rows.
+        cfs.print_stranded(res)
 
     if "limit" not in skip:
         limited = [r for r in res if r["verdict"] == "LIMITED"]
@@ -1127,22 +2366,22 @@ def main():
         if a.only and not pages:
             print("  no page holds a terminal --only names; nothing to trim")
         else:
-            where = ["--page", ",".join(pages)] if a.only else ["--all-pages"]
-            code, _ = run_helper("runner-layout.py", ["fit", *where, "--trim-only"]
-                                 + ([] if a.act else ["--dry-run"]) + (["--port", a.port] if a.port else []))
+            code, _ = run_helper("runner-layout.py", layout_argv(a, pages if a.only else [], res, skip, ready_err))
             failed += code != 0
             PASS.step("layout", pages=len(pages) if a.only else "all", exit=code)
 
     if "nudge" not in skip:
         print(f"\n== nudge ({counts.get('STOPPED', 0)} STOPPED)")
         PASS.step("nudge", candidates=counts.get("STOPPED", 0))
-        # Never nudged: for the operator. STUCK is a session /next-move could not
-        # move three times running; CONTRADICTED is a finished session whose
-        # final message says work remains.
-        for r in res:
-            if r["verdict"] in ("STUCK", "CONTRADICTED"):
-                print(f"  {r['verdict']:<12} {r['terminalId'][:8]}  {r['tab']:<14.14}  {r['name'][:50]} - "
-                      f"{'; '.join(r['reasons'])[:160]}")
+        # Listed first. STUCK, a session /next-move could not move three times
+        # running, is for the operator and never nudged, and so is a HELD row whose
+        # finish a screen rule holds (its finish_stranded code). CONTRADICTED, a
+        # finish the session's own record contradicts (the close screen's verdict),
+        # is nudged, so /next-move reconciles the two signals.
+        for label, r in operator_rows(res):
+            code = f"{r['reason_code']} " if label == "HELD" else ""
+            print(f"  {label:<12} {r['terminalId'][:8]}  {r['tab']:<14.14}  {r['name'][:50]} - "
+                  f"{'nudged: ' if label == 'CONTRADICTED' else ''}{code}{'; '.join(r['reasons'])[:160]}")
         if a.act:
             cap = ["--cooldown-hours", str(a.cooldown_hours)] if a.cooldown_hours is not None else []
             port = ["--port", a.port] if a.port else []
@@ -1154,21 +2393,23 @@ def main():
             # idle floor (their /next-move turn has just started) and skips them.
             if named:
                 print("  -- the sessions named above, with the idle floor off")
+                rows_out = PASS.rows_out("nudge")  # the watch reads the sent panes' full ids from it
                 code, out = run_helper("nudge-stopped-sessions.py",
                                        ["--send", "--only", ",".join(named), "--idle-min", "0"] + cap + port
-                                       + PASS.rows_out("nudge"))
+                                       + rows_out)
                 failed += code != 0
                 sends = sum(line.startswith(("  NUDGED", "  SENT?")) for line in out.splitlines())
-                failed += aftercare(tids_in(out, {"NUDGED", "SENT?"}), a, own) > 0
+                failed += watch_nudged(rows_out, out, res, a, own) > 0
             left = a.max_nudge - sends if a.max_nudge else 0
             if not a.max_nudge or left > 0:
                 if named:
                     print("  -- every other STOPPED session")
+                rows_out = PASS.rows_out("nudge")
                 code, out = run_helper("nudge-stopped-sessions.py",
                                        ["--send"] + cap + common(a) + (["--max", str(left)] if a.max_nudge else [])
-                                       + PASS.rows_out("nudge"))
+                                       + rows_out)
                 failed += code != 0
-                failed += aftercare(tids_in(out, {"NUDGED", "SENT?"}), a, own) > 0
+                failed += watch_nudged(rows_out, out, res, a, own) > 0
         else:
             for r in res:
                 if r["verdict"] == "STOPPED":
@@ -1189,7 +2430,8 @@ STEP_ACTIONS = {"close": "close", "limit": "limit_handoff", "name": "name", "nud
 ACTIONS = set(STEP_ACTIONS.values()) | {"layout"}
 OUTCOMES = ("done", "sent_unconfirmed", "skipped", "failed", "unknown")
 VERDICT_RE = re.compile(r"^[A-Z][A-Z-]*$")
-# Verdicts whose runner finished marker is the time the row has been in that state since.
+# Verdicts whose finish time (coord's, else the runner marker's) is the time the
+# row has been in that state since.
 SINCE_FINISHED = {"FINISHED", "EXITED-FINISHED"}
 TEXT_MAX = 256
 REASONS_MAX, REASON_CHARS = 3, 160
@@ -1247,13 +2489,27 @@ def _text(value):
 
 def pass_row(r, observed_at):
     """The coord.overlord_pass_rows row for one screened terminal `r` (a row of
-    nss.screen()), before any step acted on it. Pure. Reason codes are not
-    emitted yet: the prose reasons ride in detail.reasons."""
+    nss.screen()), before any step acted on it. Pure, apart from the clock
+    finish_since reads for its plausibility bound. Reason codes are not emitted
+    yet: the prose reasons ride in detail.reasons.
+
+    state_since_ms prefers coord's finish time, as close-finished-sessions does:
+    a finish made through coord alone leaves no runner marker, and a re-finish on
+    a runner build predating the restamp leaves the marker at the first finish.
+    It is read only while coord's status IS finished, because sessionStatusSince
+    dates whatever status the row is in, and a row FINISHED on the runner marker
+    alone may read `working` there. It is cfs.finish_since, so a stamp still
+    ahead of this clock proves skew and is not used, the same rule as classify.
+    An EXITED-FINISHED row has left /restart-readiness, so it carries no coord
+    time and the marker dates it."""
     sid, fin, verdict = r.get("claudeSessionId"), r.get("finishedAt"), r["verdict"]
     since = None
-    if verdict in SINCE_FINISHED and isinstance(fin, (int, float)) and not isinstance(fin, bool) and fin > 0:
-        since = int(fin)
+    if verdict in SINCE_FINISHED:
+        since = cfs.finish_since(r, r.get("sessionStatus") == "finished")
+        if since is None and isinstance(fin, (int, float)) and not isinstance(fin, bool) and fin > 0:
+            since = int(fin)
     screen = r.get("screen")
+    progress = r.get("progress_since_nudge")
     return {
         "terminal_id": r["terminalId"],
         "observed_at": observed_at,
@@ -1265,7 +2521,7 @@ def pass_row(r, observed_at):
         "verdict": verdict,
         "reason_codes": [],
         "state_since_ms": since,
-        "progress_since_nudge": None,
+        "progress_since_nudge": progress if isinstance(progress, bool) else None,
         "action": "none",
         "action_outcome": None,
         "detail": {"reasons": [str(x)[:REASON_CHARS] for x in (r.get("reasons") or [])[:REASONS_MAX]]},
@@ -1362,10 +2618,11 @@ def overlord_versions(runner_sha):
 
 
 def runner_build():
-    """The runner's gitSha from /health, or None when it cannot be read."""
+    """The runner's gitSha from /health, or None when it cannot be read. Never
+    raises: the ledger must not take the run down with it."""
     try:
         sha = cfs.read("/health", "data.gitSha", timeout=20)
-    except cfs.READ_ERRORS:
+    except Exception:  # noqa: BLE001 - READ_ERRORS leaves out a response cut mid-read
         return None
     return sha if isinstance(sha, str) and sha else None
 
@@ -1579,6 +2836,7 @@ class PassRecorder:
     def __init__(self):
         self.doc = None
         self.res = None
+        self.build_before = self.screened_build = None
         self.events = []  # ("rows", step, [acted rows]) or ("file", step, path), in the order the steps ran
         self.steps = {}
         self.lock = None
@@ -1615,8 +2873,18 @@ class PassRecorder:
             return LOCK_BUSY
         return None
 
+    def screening(self):
+        """Call before the screen: see screened()."""
+        self.build_before = runner_build()
+
     def screened(self, res):
+        """The flow metrics compare a pass's build across passes to tell a close
+        from a restart, so the build recorded is the one the rows were screened
+        on: read on both sides of the screen, and None (unknown) when a restart
+        moved it during the screen or a read failed."""
         self.res = res
+        after = runner_build()
+        self.screened_build = after if after == self.build_before else None
 
     def step(self, name, **facts):
         self.steps.setdefault(name, {}).update(facts)
@@ -1670,7 +2938,7 @@ class PassRecorder:
         counts = step_tallies(self.steps, events)
         if dropped:
             counts["ledger"] = {"rows_dropped": dropped}
-        build = runner_build() if build is None else build
+        build = self.screened_build if build is None else build
         return dict(self.doc, runner_build=build,
                     ended_at=rfc3339(now or dt.datetime.now(dt.timezone.utc)), exit_code=code,
                     step_counts=counts, verdict_histogram=histogram,
@@ -1754,6 +3022,7 @@ def ledger_selftest():
     fallback. Reads nothing live and types nothing."""
     import contextlib
     import io
+    globals()["runner_build"] = lambda: None  # the process exits after this selftest
     bad = []
     sid = "0f2a1b3c-4d5e-4f60-8a7b-9c0d1e2f3a4b"
     res = [
@@ -1772,11 +3041,36 @@ def ledger_selftest():
             "detail": {"reasons": ["a", "b", "c"]}, "observed_at": "2026-10-24T00:00:00.000Z"}
     if row != want:
         bad.append(f"pass_row(STOPPED) = {row}")
+    for given, want_progress in [(True, True), (False, False), (None, None), ("yes", None)]:
+        got = pass_row(dict(res[0], progress_since_nudge=given), "x")["progress_since_nudge"]
+        if got is not want_progress:
+            bad.append(f"pass_row(progress_since_nudge={given!r}) = {got!r}")
     fin, held = pass_row(res[1], "x"), pass_row(res[2], "x")
     if (fin["claude_session_id"], fin["account"], fin["state_since_ms"]) != (None, None, 1761270000000):
         bad.append(f"pass_row(FINISHED) = {fin}")
     if (held["state_since_ms"], held["session_name"]) != (None, None):
         bad.append(f"pass_row(HELD) keeps finishedAt or an empty name: {held}")
+    # state_since_ms against coord's finish time: (row overrides, want).
+    marker, coord_at = 1761270000000, 1761280000000
+    since_cases = [
+        ({"sessionStatus": "finished", "sessionStatusSince": coord_at}, coord_at),  # newer than the marker: coord's
+        ({"sessionStatus": "finished", "sessionStatusSince": marker - 5}, marker - 5),  # older: still coord's
+        ({"sessionStatus": "finished", "sessionStatusSince": coord_at, "finishedAt": None}, coord_at),  # coord-only
+        ({"sessionStatus": "working", "sessionStatusSince": coord_at}, marker),  # it dates `working`, not the finish
+        ({"sessionStatus": "working", "sessionStatusSince": coord_at, "finishedAt": None}, None),
+        ({"sessionStatus": "finished"}, marker),  # a runner build serving no time
+        ({"sessionStatus": "finished", "sessionStatusSince": None, "finishedAt": None}, None),
+        ({"sessionStatus": "finished", "sessionStatusSince": 7}, marker),  # status_since reads it as UNKNOWN
+        ({"sessionStatus": "finished", "sessionStatusSince": True, "finishedAt": None}, None),
+        ({"sessionStatus": "finished", "sessionStatusSince": int(time.time() * 1000) + 60000}, marker),  # ahead: skew
+        ({"sessionStatus": None, "sessionStatusSince": None, "verdict": "EXITED-FINISHED"}, marker),  # its live shape
+        ({"sessionStatus": "finished", "sessionStatusSince": coord_at, "verdict": "HELD"}, None),  # not in SINCE_FINISHED
+        ({"sessionStatus": "finished", "sessionStatusSince": coord_at, "verdict": "REVIVED"}, None),
+    ]
+    for over, want_since in since_cases:
+        got_since = pass_row(dict(res[1], **over), "x")["state_since_ms"]
+        if got_since != want_since:
+            bad.append(f"pass_row state_since_ms over {over} = {got_since}, want {want_since}")
 
     # The recorder over those screens: the last acting step names a row's action.
     rec = PassRecorder()
@@ -1819,6 +3113,20 @@ def ledger_selftest():
             (doc["step_counts"]["ledger"], {"rows_dropped": 3}),  # the bad line, t-gone, the unknown action
             (len(doc["rows"]), 3),
         ]
+        # The build recorded is the one the rows were screened on, even when a
+        # restart moved the runner before the pass was written; a restart during
+        # the screen, or a failed read, leaves it unknown.
+        real_build = runner_build
+        try:
+            for before, after, want_build in [("a", "a", "a"), ("a", "b", None), (None, "a", None), ("a", None, None)]:
+                globals()["runner_build"] = lambda v=before: v
+                rec.screening()
+                globals()["runner_build"] = lambda v=after: v
+                rec.screened(res)
+                globals()["runner_build"] = lambda: "at-end"
+                checks.append((rec.build(1, now=when, versions={})["runner_build"], want_build))
+        finally:
+            globals()["runner_build"] = real_build
         for got, exp in checks:
             if got != exp:
                 bad.append(f"build(): {got!r}, want {exp!r}")
@@ -1995,7 +3303,7 @@ def ledger_selftest():
     bad += direct_door_selftest()
     for b in bad:
         print("FAIL: " + b)
-    print(f"ledger selftest: 3 row cases, {len(checks)} build checks, 3 lock cases, {len(writers) + 2} never-raises "
+    print(f"ledger selftest: {3 + len(since_cases)} row cases, {len(checks)} build checks, 3 lock cases, {len(writers) + 2} never-raises "
           f"cases, outcome mappings, {len(fallback) + 1} door cases, coord-revive wording pins, 3 device-JWT cases, "
           f"7 /mcp door cases, {len(bad)} failure(s)")
     return 1 if bad else 0
@@ -2043,7 +3351,7 @@ def outcome_selftest():
         g["ready_to_type"] = lambda tid, *_a, **_k: (tid != "l-held", "held at re-screen", None)
         g["submit"] = lambda tid, msg: (tid != "l-refused", "submit-prompt answered 500" if tid == "l-refused" else "")
 
-        def after(tids, a, own, wait_s=60, report_running=False, outcomes=None):
+        def after(tids, a, own, outcomes=None, **_k):
             outcomes["l-handed"] = "done"
             return 0
         g["aftercare"] = after
