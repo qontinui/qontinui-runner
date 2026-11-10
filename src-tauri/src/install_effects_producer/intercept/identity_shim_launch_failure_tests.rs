@@ -32,6 +32,9 @@ const BEACON_PATH: &str = "/control/shim-beacon";
 const INVOKED_BODY: &str = r#"{"terminal_id":"term-launch","tool":"claude","event":"invoked","detail":"user_session_id=true settings=true mcp_config=false pinned=true"}"#;
 const RESOLVE_FAILED_BODY: &str = r#"{"terminal_id":"term-launch","tool":"claude","event":"resolve-failed","detail":"waited=1 stub=false settings=true user_session_id=true"}"#;
 const EXEC_FAILED_BODY: &str = r#"{"terminal_id":"term-launch","tool":"claude","event":"exec-failed","detail":"status=126 waited=1 settings=true user_session_id=true"}"#;
+/// The same two beacons from a shim that delivers NO SessionStart hook.
+const INVOKED_NO_HOOK_BODY: &str = r#"{"terminal_id":"term-launch","tool":"claude","event":"invoked","detail":"user_session_id=true settings=false mcp_config=false pinned=true"}"#;
+const RESOLVE_FAILED_NO_HOOK_BODY: &str = r#"{"terminal_id":"term-launch","tool":"claude","event":"resolve-failed","detail":"waited=1 stub=false settings=false user_session_id=true"}"#;
 
 /// One request the listener received: its path and its body, verbatim.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -216,6 +219,12 @@ impl ShimRun {
 /// wait. `nested` sets an INHERITED recursion guard, as a `claude` started
 /// inside another `claude` has.
 fn run_shim(real: Real, nested: bool) -> ShimRun {
+    run_shim_with(real, nested, true)
+}
+
+/// [`run_shim`], with the SessionStart hook's settings file delivered
+/// (`QONTINUI_CLAUDE_HOOK_SETTINGS`) only when `hook` is set.
+fn run_shim_with(real: Real, nested: bool, hook: bool) -> ShimRun {
     let _serial = EXE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let tmp = tempfile::tempdir().unwrap();
     let (shim_dir, real_dir) = (tmp.path().join("shim"), tmp.path().join("real"));
@@ -249,8 +258,10 @@ fn run_shim(real: Real, nested: bool) -> ShimRun {
     cmd.current_dir(tmp.path())
         .env("QONTINUI_INSTALL_INTERCEPT_PORT", listener.port.to_string())
         .env("QONTINUI_TERMINAL_ID", "term-launch")
-        .env("QONTINUI_PINNED_SESSION_ID", "pin-1")
-        .env("QONTINUI_CLAUDE_HOOK_SETTINGS", &settings);
+        .env("QONTINUI_PINNED_SESSION_ID", "pin-1");
+    if hook {
+        cmd.env("QONTINUI_CLAUDE_HOOK_SETTINGS", &settings);
+    }
     if nested {
         cmd.env("QONTINUI_INSTALL_INTERCEPT_GUARD", "1");
     }
@@ -302,6 +313,22 @@ fn resolve_failed_is_reported_before_the_fall_through() {
     };
     assert_eq!(noted.as_ref(), Some(&expected));
     assert_eq!(registry.get("term-launch", 1_000), Some(expected));
+}
+
+/// A shim that delivers NO SessionStart hook (no `QONTINUI_CLAUDE_HOOK_SETTINGS`)
+/// reports `settings=false` on its failure beacon, as on its `invoked` one --
+/// the flag the `launch-failed` decider requires before it may read "no CLI
+/// ever started here" from the row's hook stamp. A quoted `"${a[@]+set}"`
+/// expands to no word at all for an empty array, which left `[ -n ]` (always
+/// true), so the failure beacon claimed a hook the shim never delivered.
+#[test]
+fn a_launch_failure_without_the_hook_reports_settings_false() {
+    let run = run_shim_with(Real::Absent, false, false);
+    assert_eq!(run.code, Some(127), "{}", run.stderr);
+    assert_eq!(
+        run.beacon_bodies(),
+        [INVOKED_NO_HOOK_BODY, RESOLVE_FAILED_NO_HOOK_BODY]
+    );
 }
 
 /// The resolved `claude` will not exec (no exec bit): the shim retries for its
