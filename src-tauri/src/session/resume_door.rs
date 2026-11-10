@@ -134,6 +134,13 @@ use crate::terminal::TerminalManager;
 /// passes the operator origin instead.
 pub const HTTP_ORIGIN: SpawnOrigin = SpawnOrigin::Respawn;
 
+/// The origin a resumed pane is SURFACED as (`ResumeSpawn::origin`: whether
+/// its tab is selected, [`crate::terminal::focus_coalescer`]). Deliberately
+/// not the gate origin `resume_one` is handed: a resume never takes the
+/// operator's view, whichever door asked for it. Named here so `resume_one`
+/// itself carries no literal origin (its guard test reads the body).
+const RESUME_SURFACE_ORIGIN: SpawnOrigin = SpawnOrigin::BootResume;
+
 /// Most ids one call will act on. Each resume is verified by a process read, so
 /// an unbounded batch would pin the request for minutes.
 pub const MAX_IDS: usize = 50;
@@ -1023,7 +1030,7 @@ async fn resume_one(
                     // reports it if `record_pinned_session_open` adopts the
                     // reopen under D3.
                     gate_identity: None,
-                    origin: crate::coord_drain_state::SpawnOrigin::BootResume,
+                    origin: RESUME_SURFACE_ORIGIN,
                 },
             )
         })

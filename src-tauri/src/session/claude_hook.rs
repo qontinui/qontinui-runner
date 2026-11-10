@@ -2892,7 +2892,8 @@ mod tests {
         }
 
         // The DARK variant drops `Stop` and nothing else — in particular it
-        // keeps `PermissionRequest` (D6: not a variant dimension).
+        // keeps `PermissionRequest` (D6: not a variant dimension) and the
+        // deliberate-end `SessionEnd` report, which is not a Stop concern.
         let dark = build_settings(
             HOOK_SETTINGS,
             session,
@@ -2914,8 +2915,8 @@ mod tests {
         dark_events.sort_unstable();
         assert_eq!(
             dark_events,
-            ["PermissionRequest", "PreCompact", "SessionStart"],
-            "the dark variant registers PermissionRequest too"
+            ["PermissionRequest", "PreCompact", "SessionEnd", "SessionStart"],
+            "the dark variant registers PermissionRequest and SessionEnd too"
         );
 
         assert_eq!(

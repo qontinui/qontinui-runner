@@ -2565,8 +2565,11 @@ mod tests {
         fresh.last_emitted = None;
         let (now, now_utc) = after(base, 100);
         assert!(!read_locked(&mut fresh, now, now_utc, STALE, false).1);
-        // Nor does a restart-prep hold that appears before the first fold.
+        // Nor does a restart-prep hold that appears before the first fold. A
+        // pre-fold cache has never recorded a hold (`last_local_hold` is set
+        // only once `folded_once`), so reset both to that reachable state.
         fresh.folded_once = false;
+        fresh.last_local_hold = None;
         assert!(!read_locked(&mut fresh, now, now_utc, STALE, true).1);
         assert!(!read_locked(&mut fresh, now, now_utc, STALE, false).1);
         assert!(!read_locked(&mut fresh, now, now_utc, STALE, true).1);

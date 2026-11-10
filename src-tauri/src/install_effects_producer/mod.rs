@@ -2937,7 +2937,7 @@ mod tests {
             id,
             "prompt_input_exit"
         ));
-        record_session_open_into(&store, &session_open_req("term-77", id), "claude");
+        record_session_open_into(&store, &session_open_req("term-77", id), "claude", None);
         assert!(!crate::session::claude_ended_watch::deliberate_end(id));
     }
 
