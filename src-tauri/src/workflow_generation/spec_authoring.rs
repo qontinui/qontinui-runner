@@ -5,7 +5,9 @@
 //! Composition only — every step calls an existing primitive:
 //! - skeleton projection: `state_discovery_artifacts` -> `IrPageSpec`
 //! - prompt priming: `meta_workflow::build_spec_priming_context`
-//! - AI fill-in: `meta_workflow::build_meta_workflow_template`
+//! - AI fill-in: `meta_workflow::build_meta_workflow_template`, run by
+//!   `meta_workflow_run::execute_meta_workflow_blocking` (authorized, through
+//!   the in-process spawn door, polled to a terminal state)
 //! - validation: `spec_api::handlers::post_author` (with the new gates)
 //!
 //! Stream E (Flywheel) — gated behind the `spec-authoring` Cargo feature.
@@ -15,15 +17,16 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::coord_drain_state::SpawnOrigin;
 use crate::database::pg::PgDb;
 use crate::spec_api::types::{
     IrElementCriteria, IrPageSpec, IrProvenance, IrState, IrTransition, ProposalStatus,
 };
+pub use crate::workflow_generation::meta_workflow_run::MetaWorkflowError;
 
 // ---------------------------------------------------------------------------
 // Public surface
@@ -136,9 +139,21 @@ pub enum AuthoringError {
     /// Meta-workflow returned but the result failed structural validation.
     #[error("malformed AI output: {0}")]
     MalformedAiOutput(String),
-    /// Bridge / AI provider error.
+    /// Bridge / AI provider error, or a meta-workflow run that failed, was
+    /// stopped or overran its deadline.
     #[error("AI dispatch failed: {0}")]
     AiDispatchFailed(String),
+    /// The execute was not admitted: coord has drained this device, or its
+    /// drain state is unknown, and the execute is autonomous. NOT an authoring
+    /// failure: nothing was spawned, and the proposal waits for the drain to
+    /// lift. `code` is coord's 409 vocabulary (`device_drained` /
+    /// `drain_unreadable`).
+    #[error("spawn deferred by the device drain ({code}): {reason}")]
+    SpawnDeferred { code: &'static str, reason: String },
+    /// The agent registry refused the execute's `standing_continuation`
+    /// spawn. NOT an authoring failure: nothing was spawned.
+    #[error("spawn not authorized: {0}")]
+    SpawnNotAuthorized(String),
     /// Drift mode: existing spec couldn't be read.
     #[error("existing spec missing: {0}")]
     ExistingSpecMissing(String),
@@ -147,10 +162,26 @@ pub enum AuthoringError {
     Database(String),
 }
 
+impl From<MetaWorkflowError> for AuthoringError {
+    /// A run that was never admitted keeps its own variant, so the execute
+    /// handler can put the proposal back in the queue instead of failing it.
+    fn from(e: MetaWorkflowError) -> Self {
+        match e {
+            MetaWorkflowError::Deferred { code, reason } => {
+                AuthoringError::SpawnDeferred { code, reason }
+            }
+            MetaWorkflowError::NotAuthorized(reason) => AuthoringError::SpawnNotAuthorized(reason),
+            MetaWorkflowError::Failed(reason) => AuthoringError::AiDispatchFailed(reason),
+        }
+    }
+}
+
 /// Top-level entrypoint. `proposals.rs` calls this from the execute handler.
 ///
 /// `app_id` scopes every spec read/write to the owning app (spec-multi-app
-/// Stream C). Runs the appropriate authoring flavor and returns either a
+/// Stream C). `origin` is who asked for the execute: the drain and the agent
+/// registry judge the meta-workflow spawn under it (an HTTP caller is
+/// `Unknown`). Runs the appropriate authoring flavor and returns either a
 /// candidate `IrPageSpec` (still un-validated — the validator gates are
 /// layered on top by the proposals handler) or a structured error.
 pub async fn author_candidate(
@@ -158,9 +189,16 @@ pub async fn author_candidate(
     app_state: Arc<crate::commands::AppState>,
     app_id: &str,
     mode: AuthoringMode,
+    origin: SpawnOrigin,
 ) -> Result<AuthoringOutcome, AuthoringError> {
-    author_candidate_with_executor(pg_db, app_state, app_id, mode, &DefaultMetaWorkflowExecutor)
-        .await
+    author_candidate_with_executor(
+        pg_db,
+        app_state,
+        app_id,
+        mode,
+        &DefaultMetaWorkflowExecutor { origin },
+    )
+    .await
 }
 
 /// Test seam: same as [`author_candidate`] but takes an explicit
@@ -1099,7 +1137,7 @@ async fn ai_fill_skeleton(
     let run_result = executor
         .execute(app_state.clone(), pg_db.clone(), meta_wf)
         .await
-        .map_err(AuthoringError::AiDispatchFailed)?;
+        .map_err(AuthoringError::from)?;
 
     let mut filled: IrPageSpec =
         parse_meta_workflow_output(&run_result).map_err(AuthoringError::MalformedAiOutput)?;
@@ -1290,7 +1328,7 @@ async fn author_patch(
     let run_result = executor
         .execute(app_state.clone(), pg_db.clone(), meta_wf)
         .await
-        .map_err(AuthoringError::AiDispatchFailed)?;
+        .map_err(AuthoringError::from)?;
 
     let patch: IrPatch =
         parse_patch_output(&run_result).map_err(AuthoringError::MalformedAiOutput)?;
@@ -1437,9 +1475,9 @@ pub(crate) fn merge_patch_into_ir(
 // ---------------------------------------------------------------------------
 
 /// Pluggable executor for the meta-workflow. Production uses
-/// [`DefaultMetaWorkflowExecutor`], which persists the workflow + creates
-/// a task run + polls it to terminal status. Tests substitute a canned
-/// implementation so they don't need a live PG / AI provider.
+/// [`DefaultMetaWorkflowExecutor`], which runs it through
+/// `meta_workflow_run::execute_meta_workflow_blocking`. Tests substitute a
+/// canned implementation so they need no live PG, AI provider or Tauri app.
 #[async_trait::async_trait]
 pub trait MetaWorkflowExecutor: Send + Sync {
     async fn execute(
@@ -1447,105 +1485,32 @@ pub trait MetaWorkflowExecutor: Send + Sync {
         app_state: Arc<crate::commands::AppState>,
         pg_db: Arc<PgDb>,
         meta_wf: crate::unified_workflows::UnifiedWorkflow,
-    ) -> Result<serde_json::Value, String>;
+    ) -> Result<serde_json::Value, MetaWorkflowError>;
 }
 
-/// Default production executor. Mirrors the persistence path in
-/// `mcp::unified_workflows::generate_unified_workflow_async_handler` — persist
-/// the workflow, create a task run, then poll until terminal. Returns the
-/// final accumulated output blob as a `serde_json::Value`.
-pub struct DefaultMetaWorkflowExecutor;
+/// Default production executor: authorize the spawn under `origin`, start the
+/// meta-workflow through the in-process spawn door and wait for the task run
+/// the door created. See [`crate::workflow_generation::meta_workflow_run`].
+pub struct DefaultMetaWorkflowExecutor {
+    /// Who asked for the execute. The drain and the agent registry judge the
+    /// spawn under it.
+    pub origin: SpawnOrigin,
+}
 
 #[async_trait::async_trait]
 impl MetaWorkflowExecutor for DefaultMetaWorkflowExecutor {
     async fn execute(
         &self,
-        app_state: Arc<crate::commands::AppState>,
+        _app_state: Arc<crate::commands::AppState>,
         pg_db: Arc<PgDb>,
         meta_wf: crate::unified_workflows::UnifiedWorkflow,
-    ) -> Result<serde_json::Value, String> {
-        execute_meta_workflow_blocking(app_state, pg_db, meta_wf).await
-    }
-}
-
-/// Persist the meta-workflow, create a task run, poll until terminal, return
-/// the accumulated output blob as a `serde_json::Value`.
-///
-/// Terminal task statuses are `complete` / `failed` / `stopped` (see
-/// `database::types::TaskRun::status`). Polls every 2s; 120s overall timeout
-/// (long enough for the meta-workflow's 4-phase cycle, short enough that a
-/// stuck proposal surfaces in the nightly cadence).
-pub(crate) async fn execute_meta_workflow_blocking(
-    app_state: Arc<crate::commands::AppState>,
-    pg_db: Arc<PgDb>,
-    meta_wf: crate::unified_workflows::UnifiedWorkflow,
-) -> Result<serde_json::Value, String> {
-    use crate::database::types::CreateTaskRunInput;
-    use crate::unified_workflows::UnifiedWorkflowExt;
-
-    let mut create_request = crate::unified_workflows::unified_workflow_to_create_request(&meta_wf);
-    create_request.generated_by_task_run_id = None;
-
-    let saved = pg_db
-        .create_unified_workflow(&create_request)
+    ) -> Result<serde_json::Value, MetaWorkflowError> {
+        crate::workflow_generation::meta_workflow_run::execute_meta_workflow_blocking(
+            pg_db,
+            meta_wf,
+            self.origin,
+        )
         .await
-        .map_err(|e| format!("create_unified_workflow: {}", e))?;
-
-    let task_run_id = uuid::Uuid::new_v4().to_string();
-    let simple_prompt: String = saved
-        .agentic_steps
-        .iter()
-        .filter_map(|step| step.get("content").and_then(|v| v.as_str()))
-        .collect::<Vec<_>>()
-        .join("\n\n---\n\n");
-    let port = app_state
-        .api_port
-        .load(std::sync::atomic::Ordering::Relaxed);
-
-    let task_run_input = CreateTaskRunInput::new(&task_run_id, &saved.name)
-        .with_task_type("ai")
-        .with_prompt(&simple_prompt)
-        .with_workflow_type("unified")
-        .with_workflow_name(&saved.name)
-        .with_workflow_id(&saved.id)
-        .with_max_sessions(saved.iter_cap())
-        .with_auto_continue(true)
-        .with_runner_port(port);
-
-    pg_db
-        .create_task_run(&task_run_input)
-        .await
-        .map_err(|e| format!("create_task_run: {}", e))?;
-
-    // Poll for terminal status.
-    let deadline = std::time::Instant::now() + Duration::from_secs(120);
-    let mut interval = tokio::time::interval(Duration::from_secs(2));
-    // Skip the immediate first tick — the task was just created.
-    interval.tick().await;
-    loop {
-        if std::time::Instant::now() > deadline {
-            return Err(format!("meta-workflow task run {} timed out", task_run_id));
-        }
-        interval.tick().await;
-        let task = pg_db
-            .get_task_run(&task_run_id)
-            .await
-            .map_err(|e| format!("get_task_run: {}", e))?
-            .ok_or_else(|| format!("task run {} disappeared", task_run_id))?;
-        if matches!(task.status.as_str(), "complete" | "failed" | "stopped") {
-            if task.status == "failed" {
-                return Err(task
-                    .error_message
-                    .unwrap_or_else(|| "meta-workflow failed (no error message)".to_string()));
-            }
-            // Parse the output_log as JSON when possible; otherwise return
-            // it wrapped as a string blob so the parser can search for
-            // common envelope keys.
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&task.output_log) {
-                return Ok(parsed);
-            }
-            return Ok(serde_json::json!({ "output_log": task.output_log }));
-        }
     }
 }
 
@@ -2414,9 +2379,36 @@ mod tests {
             _app_state: Arc<crate::commands::AppState>,
             _pg_db: Arc<PgDb>,
             _meta_wf: crate::unified_workflows::UnifiedWorkflow,
-        ) -> Result<serde_json::Value, String> {
-            Err("simulated bridge error".to_string())
+        ) -> Result<serde_json::Value, MetaWorkflowError> {
+            Err(MetaWorkflowError::Failed(
+                "simulated bridge error".to_string(),
+            ))
         }
+    }
+
+    /// A run that was never admitted keeps its own variant (the execute
+    /// handler re-queues the proposal for it); only a run that started and
+    /// failed is an AI dispatch failure.
+    #[test]
+    fn a_run_error_maps_to_the_authoring_error_the_execute_handler_branches_on() {
+        assert!(matches!(
+            AuthoringError::from(MetaWorkflowError::Deferred {
+                code: "device_drained",
+                reason: "drained".into(),
+            }),
+            AuthoringError::SpawnDeferred {
+                code: "device_drained",
+                ref reason,
+            } if reason == "drained"
+        ));
+        assert!(matches!(
+            AuthoringError::from(MetaWorkflowError::NotAuthorized("deny: off".into())),
+            AuthoringError::SpawnNotAuthorized(ref r) if r == "deny: off"
+        ));
+        assert!(matches!(
+            AuthoringError::from(MetaWorkflowError::Failed("boom".into())),
+            AuthoringError::AiDispatchFailed(ref r) if r == "boom"
+        ));
     }
 
     /// Construct an output blob that omits the `version` field, so

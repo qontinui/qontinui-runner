@@ -237,6 +237,20 @@ pub enum DeferClass {
 }
 
 impl DeferClass {
+    /// Every class, in declaration order.
+    pub const ALL: [DeferClass; 3] = [
+        DeferClass::Drained,
+        DeferClass::Unknown,
+        DeferClass::RoleClosed,
+    ];
+
+    /// The class whose [`Self::code`] is `code` — the reading a caller of a
+    /// spawn door needs to tell the door's drain deferral (a 409 whose body
+    /// carries this code) from any other refusal.
+    pub fn from_code(code: &str) -> Option<DeferClass> {
+        Self::ALL.into_iter().find(|class| class.code() == code)
+    }
+
     /// The refusal code, matching coord's own 409 vocabulary (contract C5).
     pub fn code(self) -> &'static str {
         match self {
@@ -1653,6 +1667,23 @@ pub(crate) static ROLE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::c
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A refusal body's code reads back as the class that wrote it, for every
+    /// class. The match is exhaustive, so a new class does not compile here
+    /// until it is placed in `ALL` — the list `from_code` searches.
+    #[test]
+    fn every_defer_class_round_trips_through_its_code() {
+        for class in DeferClass::ALL {
+            let slot = match class {
+                DeferClass::Drained => 0,
+                DeferClass::Unknown => 1,
+                DeferClass::RoleClosed => 2,
+            };
+            assert_eq!(DeferClass::ALL[slot], class);
+            assert_eq!(DeferClass::from_code(class.code()), Some(class));
+        }
+        assert_eq!(DeferClass::from_code("device_busy"), None);
+    }
 
     fn t0() -> DateTime<Utc> {
         DateTime::parse_from_rfc3339("2026-09-14T10:00:00Z")

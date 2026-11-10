@@ -1012,6 +1012,7 @@ CREATE TABLE atlas_managed.spec_proposals (
     last_error text,
     candidate_ir jsonb,
     metadata jsonb DEFAULT '{}'::jsonb NOT NULL,
+    app_id text NOT NULL,
     CONSTRAINT spec_proposals_kind_chk CHECK ((kind = ANY (ARRAY['fullPage'::text, 'patch'::text])))
 );
 
@@ -24356,10 +24357,10 @@ CREATE INDEX regression_suites_ir_doc_id_idx ON atlas_managed.regression_suites 
 
 
 --
--- Name: spec_proposals_kind_target_uniq; Type: INDEX; Schema: atlas_managed; Owner: -
+-- Name: spec_proposals_app_kind_target_uniq; Type: INDEX; Schema: atlas_managed; Owner: -
 --
 
-CREATE UNIQUE INDEX spec_proposals_kind_target_uniq ON atlas_managed.spec_proposals USING btree (kind, COALESCE(pathname, spec_id));
+CREATE UNIQUE INDEX spec_proposals_app_kind_target_uniq ON atlas_managed.spec_proposals USING btree (app_id, kind, COALESCE(pathname, spec_id));
 
 
 --

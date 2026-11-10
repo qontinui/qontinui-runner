@@ -1,26 +1,40 @@
 //! Spec proposals — Stream E (Flywheel) coverage-growth queue.
 //!
-//! Four endpoints, mounted under `/spec/proposals/...` when the
-//! `spec-authoring` feature is enabled:
+//! Four per-app endpoints, mounted under `/apps/{app_id}/spec/proposals/...`
+//! when the `spec-authoring` feature is enabled (it is in `default`), plus the
+//! process-wide `GET /spec/proposals/metrics`. Every row belongs to the app
+//! whose scan queued it (`spec_proposals.app_id`), and each endpoint reads and
+//! writes only its own app's rows:
 //!
-//! - `POST /spec/proposals/scan` — discovers eligible `fullPage` candidates
+//! - `POST .../scan` — discovers eligible `fullPage` candidates
 //!   (un-spec'd pathnames with ≥ N observations in the lookback window) and
 //!   `patch` candidates (drift-flagged specs), inserts them into
-//!   `atlas_managed.spec_proposals` with `status = 'queued'`.
-//! - `POST /spec/proposals/{id}/execute` — drives one queued proposal through
+//!   `atlas_managed.spec_proposals` with `status = 'queued'`, and first puts
+//!   back in the queue any proposal left `inFlight` by an execute that died
+//!   (`requeuedStale`).
+//! - `POST .../{id}/execute` — drives one queued proposal through
 //!   `spec_authoring::author_candidate` then `validator::validate_candidate`
 //!   (Step 8 — distinctness → round-trip → coverage → b-green) and lands
 //!   the candidate in `_pending/` via `storage::write_pending_ir` (Step 9).
-//!   On validator rejection the structured `ValidatorError` reason + detail
-//!   is persisted to `spec_proposals.last_error` and returned as `outcome:
+//!   Authoring runs an AI meta-workflow on the user's account, so only a
+//!   `queued` proposal is executed (`queued → inFlight` is one
+//!   compare-and-set; anything else answers 409 `proposal-not-queued`), and
+//!   the run is authorized first: when coord's device drain defers it, or the
+//!   agent registry refuses it, nothing is spawned, the proposal goes back to
+//!   `queued` and the answer is `outcome: "skipped"`. An execute whose caller
+//!   goes away before its outcome is written also puts the proposal back in
+//!   the queue; one that died with its runner is re-queued by the next scan,
+//!   once it is older than any execute can run. On validator rejection
+//!   the structured `ValidatorError` reason + detail is persisted to
+//!   `spec_proposals.last_error` and returned as `outcome:
 //!   "validator-rejected"`. Authoring failures stay distinct and surface as
 //!   `outcome: "authoring-failed"`.
-//! - `POST /spec/proposals/sweep-pending` — Step 9's 2-green sweep. Re-runs
+//! - `POST .../sweep-pending` — Step 9's 2-green sweep. Re-runs
 //!   gate-3 (B-green) against every `pendingPromotion` row; on Ok bumps
 //!   `consecutive_greens` and promotes at ≥ 2; on `BExecutionRed` demotes
 //!   immediately back to `queued`; on infra error (snapshot fetch failed
 //!   etc.) only `last_attempt_at` moves.
-//! - `GET /spec/proposals` — paginated list of all proposal rows.
+//! - `GET /apps/{app_id}/spec/proposals` — paginated list of the app's rows.
 //!
 //! See `qontinui-dev-notes/spec-check-v1/05-flywheel.md` Steps 6–9 for the
 //! design context; the SQL trigger query is verbatim from the plan
@@ -38,7 +52,9 @@ use serde_json::json;
 use tracing::{debug, info, warn};
 
 use crate::commands::spec_drift::RegisteredElement;
+use crate::coord_drain_state::SpawnOrigin;
 use crate::database::pg::spec_proposals::SpecProposalRow;
+use crate::database::pg::PgDb;
 use crate::mcp::types::ApiState;
 use crate::spec_api::apps::AppErrorExt;
 use crate::spec_api::events;
@@ -96,7 +112,7 @@ fn metric_consecutive_greens_max(value: i32) {
 }
 
 // =============================================================================
-// Scan endpoint — POST /spec/proposals/scan
+// Scan endpoint — POST /apps/{app_id}/spec/proposals/scan
 // =============================================================================
 
 /// Default knobs for `/spec/proposals/scan`. All tunable via the request
@@ -143,6 +159,27 @@ pub async fn post_scan(
         Err(e) => return e.into_app_response(),
     };
 
+    // ---- Executes that died -----------------------------------------------
+    // An execute that died with its runner leaves its proposal `inFlight`,
+    // and nothing else would ever pick that row up: the dedup index keeps the
+    // target from being queued again. No execute runs longer than
+    // `stale_in_flight_after`, so an older `inFlight` row goes back in the
+    // queue here, at the queue's intake. `None` when the re-queue failed: how
+    // many it would have taken is unknown, not zero.
+    let stale_after = stale_in_flight_after(
+        crate::workflow_generation::meta_workflow_run::configured_execute_timeout(),
+    );
+    let requeued_stale = match pg_db
+        .requeue_stale_in_flight_proposals(&app_id, stale_after.as_secs_f64(), STALE_EXECUTE_ERROR)
+        .await
+    {
+        Ok(n) => Some(n),
+        Err(e) => {
+            warn!("post_scan: requeue_stale_in_flight_proposals failed: {}", e);
+            None
+        }
+    };
+
     // ---- Full-page branch -------------------------------------------------
     let full_page_rows = match query_eligible_pathnames(&pg_db, lookback, min_obs, limit).await {
         Ok(rows) => rows,
@@ -184,6 +221,7 @@ pub async fn post_scan(
         match pg_db
             .insert_proposal(
                 &proposal_id,
+                &app_id,
                 "fullPage",
                 Some(&pathname),
                 None,
@@ -235,6 +273,7 @@ pub async fn post_scan(
                 match pg_db
                     .insert_proposal(
                         &proposal_id,
+                        &app_id,
                         "patch",
                         None,
                         Some(&target_spec_id),
@@ -283,10 +322,11 @@ pub async fn post_scan(
     }
 
     info!(
-        "post_scan: scanned_pathnames={} scanned_drift_reports={} queued={}",
+        "post_scan: scanned_pathnames={} scanned_drift_reports={} queued={} requeued_stale={:?}",
         scanned_pathnames,
         scanned_drift_reports,
-        queued.len()
+        queued.len(),
+        requeued_stale
     );
 
     (
@@ -296,6 +336,7 @@ pub async fn post_scan(
             "scannedPathnames": scanned_pathnames,
             "scannedDriftReports": scanned_drift_reports,
             "queuedProposals": queued,
+            "requeuedStale": requeued_stale,
             "reason": reason,
         })),
     )
@@ -351,12 +392,28 @@ async fn query_eligible_pathnames(
 }
 
 // =============================================================================
-// Execute endpoint — POST /spec/proposals/{id}/execute
+// Execute endpoint — POST /apps/{app_id}/spec/proposals/{id}/execute
 // =============================================================================
 
+/// `POST /apps/{app_id}/spec/proposals/{id}/execute`. An HTTP caller — a
+/// script, an agent, a UI-Bridge-driven call — is autonomous (`unknown`) under
+/// coord's device drain, as at every other spawn door.
 pub async fn post_execute(
     AxPath((app_id, id)): AxPath<(String, String)>,
     State(state): State<Arc<ApiState>>,
+) -> Response {
+    execute_proposal(state, app_id, id, SpawnOrigin::Unknown).await
+}
+
+/// Execute `app_id`'s proposal `id` on behalf of `origin`. The AI meta-workflow
+/// that authoring runs is spawned under `origin`: the device drain and the
+/// agent registry judge it there, and a spawn they do not admit leaves the
+/// proposal `queued` (see [`execute_skip`]).
+pub async fn execute_proposal(
+    state: Arc<ApiState>,
+    app_id: String,
+    id: String,
+    origin: SpawnOrigin,
 ) -> Response {
     let pg_db = state.app_state.pg_db.clone();
     let app_state = state.app_state.clone();
@@ -366,7 +423,7 @@ pub async fn post_execute(
     };
 
     // Look up the proposal.
-    let row = match pg_db.find_proposal_by_id(&id).await {
+    let row = match pg_db.find_proposal_by_id(&app_id, &id).await {
         Ok(Some(row)) => row,
         Ok(None) => {
             return (
@@ -391,16 +448,54 @@ pub async fn post_execute(
         }
     };
 
-    // Transition to inFlight (best-effort; ignore errors so we still try to
-    // author rather than wedging the queue).
-    if let Err(e) = pg_db.update_proposal_status(&row.id, "inFlight").await {
-        warn!(
-            "post_execute: update_proposal_status (inFlight) failed: {}",
-            e
-        );
+    // Claim it: `queued → inFlight` as one compare-and-set. Authoring starts
+    // a paid AI run, so a retry, a concurrent execute, or an execute of a
+    // proposal already past the queue must not start another.
+    match pg_db.claim_proposal_for_execute(&app_id, &row.id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(SpecError::with_detail(
+                    "proposal-not-queued",
+                    json!({ "proposalId": row.id }),
+                )),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            warn!("post_execute: claim_proposal_for_execute failed: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(SpecError::with_detail(
+                    "proposal-claim-failed",
+                    json!({ "proposalId": row.id, "error": e }),
+                )),
+            )
+                .into_response();
+        }
     }
-    let _ = pg_db.update_proposal_attempt_only(&row.id).await;
 
+    // Every return of `execute_claimed` writes the proposal's next status. If
+    // this future is dropped first (the HTTP client hung up during the run),
+    // the guard puts the proposal back in the queue rather than leave it
+    // `inFlight`, where nothing would pick it up.
+    let requeue = RequeueOnDrop::armed(pg_db.clone(), row.id.clone());
+    let response = execute_claimed(pg_db, app_state, root, app_id, row, origin).await;
+    requeue.disarm();
+    response
+}
+
+/// The execute after its claim: author the candidate, validate it, and stage
+/// it. Every return writes the proposal's next status.
+async fn execute_claimed(
+    pg_db: Arc<PgDb>,
+    app_state: Arc<crate::commands::AppState>,
+    root: std::path::PathBuf,
+    app_id: String,
+    row: SpecProposalRow,
+    origin: SpawnOrigin,
+) -> Response {
     // Build the authoring mode from the row shape.
     let mode = match row.kind.as_str() {
         "fullPage" => {
@@ -498,11 +593,41 @@ pub async fn post_execute(
         app_state,
         &app_id,
         mode,
+        origin,
     )
     .await
     {
         Ok(o) => o,
         Err(e) => {
+            if let Some((status, reason, code)) = execute_skip(&e) {
+                // Nothing was spawned: the drain deferred the run or the
+                // registry refused it. The proposal is not failed; it goes
+                // back to the queue for a later execute.
+                if let Err(err) = pg_db.update_proposal_status(&row.id, "queued").await {
+                    warn!(
+                        "post_execute: re-queue after a skipped execute failed: {}",
+                        err
+                    );
+                }
+                info!(
+                    "post_execute: proposal {} skipped ({}): {}",
+                    row.id,
+                    reason,
+                    authoring_error_detail(&e)
+                );
+                return (
+                    status,
+                    Json(json!({
+                        "ok": false,
+                        "proposalId": row.id,
+                        "outcome": "skipped",
+                        "reason": reason,
+                        "code": code,
+                        "detail": authoring_error_detail(&e),
+                    })),
+                )
+                    .into_response();
+            }
             let reason = authoring_error_reason(&e);
             let detail = authoring_error_detail(&e);
             let _ = pg_db
@@ -644,6 +769,101 @@ pub async fn post_execute(
         .into_response()
 }
 
+/// `last_error` for a proposal whose execute went away before writing its
+/// outcome.
+pub(crate) const ABANDONED_EXECUTE_ERROR: &str =
+    "abandoned: the execute's caller went away before its outcome was written";
+
+/// `last_error` for a proposal left `inFlight` longer than any execute runs.
+pub(crate) const STALE_EXECUTE_ERROR: &str =
+    "abandoned: inFlight longer than any execute runs (its runner likely died)";
+
+/// How much longer than its run's deadline an execute may take: authorizing,
+/// starting the run, then validating and staging its candidate.
+const STALE_IN_FLIGHT_MARGIN: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// PURE: how long a proposal must have been `inFlight` before the scan takes
+/// it for an execute that died: the run deadline plus
+/// [`STALE_IN_FLIGHT_MARGIN`].
+pub(crate) fn stale_in_flight_after(execute_timeout: std::time::Duration) -> std::time::Duration {
+    execute_timeout + STALE_IN_FLIGHT_MARGIN
+}
+
+/// Where an abandoned execute's proposal goes back to the queue: [`PgDb`] in
+/// production, a recording queue in tests.
+#[async_trait::async_trait]
+pub(crate) trait ProposalRequeue: Send + Sync {
+    /// Re-queue `id` with `last_error` while it is still `inFlight`.
+    async fn requeue_in_flight(&self, id: &str, last_error: &str) -> Result<bool, String>;
+}
+
+#[async_trait::async_trait]
+impl ProposalRequeue for PgDb {
+    async fn requeue_in_flight(&self, id: &str, last_error: &str) -> Result<bool, String> {
+        self.requeue_in_flight_proposal(id, last_error).await
+    }
+}
+
+/// Puts a claimed proposal back in the queue if the execute holding it is
+/// dropped before it writes the proposal's outcome. Disarmed once it has.
+struct RequeueOnDrop {
+    queue: Arc<dyn ProposalRequeue>,
+    proposal_id: String,
+    armed: bool,
+}
+
+impl RequeueOnDrop {
+    fn armed(queue: Arc<dyn ProposalRequeue>, proposal_id: String) -> Self {
+        Self {
+            queue,
+            proposal_id,
+            armed: true,
+        }
+    }
+
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RequeueOnDrop {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let proposal_id = std::mem::take(&mut self.proposal_id);
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            warn!(
+                "post_execute: proposal {} abandoned outside a tokio runtime; it stays inFlight \
+                 until a scan finds it stale",
+                proposal_id
+            );
+            return;
+        };
+        let queue = self.queue.clone();
+        handle.spawn(async move {
+            match queue
+                .requeue_in_flight(&proposal_id, ABANDONED_EXECUTE_ERROR)
+                .await
+            {
+                Ok(true) => info!(
+                    "post_execute: proposal {} abandoned; re-queued",
+                    proposal_id
+                ),
+                Ok(false) => info!(
+                    "post_execute: proposal {} abandoned after it left inFlight; left as it was",
+                    proposal_id
+                ),
+                Err(e) => warn!(
+                    "post_execute: proposal {} abandoned; re-queueing it failed (a scan will, \
+                     once it is stale): {}",
+                    proposal_id, e
+                ),
+            }
+        });
+    }
+}
+
 fn authoring_error_reason(
     e: &crate::workflow_generation::spec_authoring::AuthoringError,
 ) -> &'static str {
@@ -657,8 +877,26 @@ fn authoring_error_reason(
         ObservedButUnclustered { .. } => "observed-but-unclustered",
         MalformedAiOutput(_) => "malformed-ai-output",
         AiDispatchFailed(_) => "ai-dispatch-failed",
+        SpawnDeferred { .. } => "spawn-deferred",
+        SpawnNotAuthorized(_) => "spawn-not-authorized",
         ExistingSpecMissing(_) => "existing-spec-missing",
         Database(_) => "database-error",
+    }
+}
+
+/// PURE: an execute that was never admitted — `(HTTP status, outcome reason,
+/// drain code)` — or `None` for every real authoring outcome. The device
+/// drain's deferral answers 409 with coord's drain code, as every spawn door
+/// does under a drain; a registry refusal answers 403. The reasons are the
+/// flywheel's `skipped:` vocabulary (`drained`, `not-authorized`).
+fn execute_skip(
+    e: &crate::workflow_generation::spec_authoring::AuthoringError,
+) -> Option<(StatusCode, &'static str, Option<&'static str>)> {
+    use crate::workflow_generation::spec_authoring::AuthoringError::*;
+    match e {
+        SpawnDeferred { code, .. } => Some((StatusCode::CONFLICT, "drained", Some(*code))),
+        SpawnNotAuthorized(_) => Some((StatusCode::FORBIDDEN, "not-authorized", None)),
+        _ => None,
     }
 }
 
@@ -706,19 +944,30 @@ fn authoring_error_detail(
         ),
         MalformedAiOutput(s) => format!("malformed AI output: {}", s),
         AiDispatchFailed(s) => format!("AI dispatch failed: {}", s),
+        SpawnDeferred { code, reason } => format!(
+            "the meta-workflow spawn was deferred by coord's device drain ({}): {}",
+            code, reason
+        ),
+        SpawnNotAuthorized(s) => format!(
+            "the agent registry did not authorize the meta-workflow spawn: {}",
+            s
+        ),
         ExistingSpecMissing(s) => format!("existing spec missing: {}", s),
         Database(s) => format!("database error: {}", s),
     }
 }
 
 // =============================================================================
-// Sweep-pending endpoint — POST /spec/proposals/sweep-pending
+// Sweep-pending endpoint — POST /apps/{app_id}/spec/proposals/sweep-pending
 // =============================================================================
 //
-// Drives the 2-green promotion (and single-red demotion) of every proposal in
-// `status = 'pendingPromotion'`. Invoked by the supervisor cron (Step 10) on
-// the nightly cadence; also usable as a manual ergonomic. Per Step 9 of
-// `05-flywheel.md`:
+// Drives the 2-green promotion (and single-red demotion) of every one of the
+// app's proposals in `status = 'pendingPromotion'` — only that app's rows,
+// against that app's specs root and page locks. Nothing schedules it today:
+// qontinui-supervisor#297 deleted the supervisor's nightly cron, and a
+// runner-side schedule is owed by plan
+// `2026-11-09-the-spec-flywheel-authors-a-spec-candidate-before-the-runner-schedules-it`,
+// Phase 4. Usable as a manual call. Per Step 9 of `05-flywheel.md`:
 //
 //   - Re-runs ONLY gate-3 (B-execution-green). Gates 1 + 2 are pure
 //     properties of the candidate IR and don't change between sweeps.
@@ -746,7 +995,7 @@ pub async fn post_sweep_pending(
     };
 
     let rows = match pg_db
-        .list_proposals_by_status("pendingPromotion", SWEEP_BATCH_LIMIT)
+        .list_proposals_by_status(&app_id, "pendingPromotion", SWEEP_BATCH_LIMIT)
         .await
     {
         Ok(r) => r,
@@ -973,7 +1222,7 @@ pub async fn post_sweep_pending(
 }
 
 // =============================================================================
-// List endpoint — GET /spec/proposals
+// List endpoint — GET /apps/{app_id}/spec/proposals
 // =============================================================================
 
 #[derive(Debug, Deserialize, Default)]
@@ -1030,7 +1279,7 @@ pub async fn get_list(
         return e.into_app_response();
     }
 
-    match pg_db.list_proposals(limit, offset).await {
+    match pg_db.list_proposals(&app_id, limit, offset).await {
         Ok(rows) => {
             let items: Vec<ProposalListItem> = rows.into_iter().map(Into::into).collect();
             (
@@ -1187,6 +1436,118 @@ fn infer_target_spec_id(_app_id: &str, elem: &RegisteredElement) -> Option<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An execute whose spawn was never admitted is `skipped` (the proposal is
+    /// re-queued, nothing was spawned), with the status every spawn door uses
+    /// for the same refusal. Every real authoring outcome is not a skip.
+    #[test]
+    fn a_spawn_that_was_never_admitted_is_skipped_not_failed() {
+        use crate::workflow_generation::spec_authoring::AuthoringError;
+        for code in ["device_drained", "drain_unreadable"] {
+            assert_eq!(
+                execute_skip(&AuthoringError::SpawnDeferred {
+                    code,
+                    reason: "drained".into(),
+                }),
+                Some((StatusCode::CONFLICT, "drained", Some(code)))
+            );
+        }
+        assert_eq!(
+            execute_skip(&AuthoringError::SpawnNotAuthorized("deny: off".into())),
+            Some((StatusCode::FORBIDDEN, "not-authorized", None))
+        );
+        for authored in [
+            AuthoringError::AiDispatchFailed("timed out".into()),
+            AuthoringError::MalformedAiOutput("not an IR".into()),
+            AuthoringError::EmptyArtifact,
+            AuthoringError::Database("down".into()),
+        ] {
+            assert_eq!(execute_skip(&authored), None, "{authored}");
+        }
+    }
+
+    /// The scan takes a proposal for a dead execute's only after any execute
+    /// would have finished: the run's whole deadline, plus a margin for the
+    /// work around the run.
+    #[test]
+    fn a_proposal_is_stale_only_after_any_execute_would_have_finished() {
+        let hour = std::time::Duration::from_secs(3600);
+        assert_eq!(
+            stale_in_flight_after(hour),
+            hour + std::time::Duration::from_secs(15 * 60)
+        );
+        assert!(stale_in_flight_after(std::time::Duration::ZERO) > std::time::Duration::ZERO);
+    }
+
+    /// Records every re-queue it is asked for.
+    #[derive(Default)]
+    struct RecordingQueue {
+        requeued: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ProposalRequeue for RecordingQueue {
+        async fn requeue_in_flight(&self, id: &str, last_error: &str) -> Result<bool, String> {
+            self.requeued
+                .lock()
+                .unwrap()
+                .push((id.to_string(), last_error.to_string()));
+            Ok(true)
+        }
+    }
+
+    /// An execute dropped while it holds its claim puts the proposal back in
+    /// the queue; one that finished (and disarmed the guard) does not.
+    #[tokio::test]
+    async fn an_execute_dropped_before_its_outcome_requeues_its_proposal() {
+        let queue = Arc::new(RecordingQueue::default());
+        drop(RequeueOnDrop::armed(queue.clone(), "prop_dropped".into()));
+        RequeueOnDrop::armed(queue.clone(), "prop_finished".into()).disarm();
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            *queue.requeued.lock().unwrap(),
+            vec![(
+                "prop_dropped".to_string(),
+                ABANDONED_EXECUTE_ERROR.to_string()
+            )]
+        );
+    }
+
+    /// The execute claims before it can spawn, arms the guard on the claim,
+    /// and disarms it only once the claimed work has returned. The PG tests
+    /// prove each step; this proves the order, which they cannot see.
+    #[test]
+    fn the_execute_claims_then_guards_then_authors() {
+        let src = include_str!("proposals.rs");
+        let body = |name: &str| {
+            let (_, rest) = src
+                .split_once(name)
+                .unwrap_or_else(|| panic!("{name} is defined"));
+            rest.split_once("\n}\n").expect("the fn body ends").0
+        };
+        let execute = body("pub async fn execute_proposal(");
+        let at = |needle: &str| {
+            execute
+                .find(needle)
+                .unwrap_or_else(|| panic!("`{needle}` is missing from execute_proposal"))
+        };
+        let claim = at("claim_proposal_for_execute(");
+        let arm = at("RequeueOnDrop::armed(");
+        let work = at("execute_claimed(");
+        let disarm = at("requeue.disarm()");
+        assert!(
+            claim < arm && arm < work && work < disarm,
+            "order must be claim -> arm -> execute_claimed -> disarm \
+             (found {claim}, {arm}, {work}, {disarm})"
+        );
+        assert!(
+            !execute.contains("author_candidate("),
+            "authoring happens only in execute_claimed, after the claim"
+        );
+        assert!(body("async fn execute_claimed(").contains("author_candidate("));
+    }
 
     #[test]
     fn mint_proposal_id_shape() {
@@ -1478,52 +1839,243 @@ mod tests {
             (guard, db)
         }
 
-        #[tokio::test(flavor = "multi_thread")]
-        async fn insert_dedupes_on_kind_and_target() {
-            let (_guard, db) = fresh_db().await;
-            let first = db
-                .insert_proposal(
-                    "prop_test_one",
-                    "fullPage",
-                    Some("/foo"),
-                    None,
-                    "queued",
-                    &serde_json::json!({}),
-                )
-                .await
-                .expect("first insert");
-            assert!(first, "first insert should succeed");
-            let second = db
-                .insert_proposal(
-                    "prop_test_two",
-                    "fullPage",
-                    Some("/foo"),
-                    None,
-                    "queued",
-                    &serde_json::json!({}),
-                )
-                .await
-                .expect("second insert");
-            assert!(!second, "second insert should be deduped");
-        }
-
-        #[tokio::test(flavor = "multi_thread")]
-        async fn list_round_trips_inserted_rows() {
-            let (_guard, db) = fresh_db().await;
+        async fn queue(db: &PgDb, id: &str, app_id: &str, pathname: &str) -> bool {
             db.insert_proposal(
-                "prop_test_list",
+                id,
+                app_id,
                 "fullPage",
-                Some("/bar"),
+                Some(pathname),
                 None,
                 "queued",
                 &serde_json::json!({}),
             )
             .await
-            .expect("insert");
-            let rows = db.list_proposals(10, 0).await.expect("list");
+            .expect("insert_proposal")
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn insert_dedupes_on_kind_and_target() {
+            let (_guard, db) = fresh_db().await;
+            assert!(
+                queue(&db, "prop_test_one", "app-a", "/foo").await,
+                "first insert"
+            );
+            assert!(
+                !queue(&db, "prop_test_two", "app-a", "/foo").await,
+                "the same app queuing the same target again is deduped"
+            );
+        }
+
+        /// The dedup index carries `app_id`: two apps may each queue the same
+        /// page label, and each still dedupes against itself.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn the_same_target_queues_once_per_app() {
+            let (_guard, db) = fresh_db().await;
+            assert!(queue(&db, "prop_a", "app-a", "/same").await);
+            assert!(
+                queue(&db, "prop_b", "app-b", "/same").await,
+                "another app's row must not dedupe this app's proposal"
+            );
+            assert!(!queue(&db, "prop_b2", "app-b", "/same").await);
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn list_round_trips_inserted_rows() {
+            let (_guard, db) = fresh_db().await;
+            assert!(queue(&db, "prop_test_list", "app-a", "/bar").await);
+            let rows = db.list_proposals("app-a", 10, 0).await.expect("list");
             assert!(rows
                 .iter()
-                .any(|r| r.id == "prop_test_list" && r.status == "queued"));
+                .any(|r| r.id == "prop_test_list" && r.status == "queued" && r.app_id == "app-a"));
+        }
+
+        /// list, list-by-status (the sweep's reader) and find (the execute
+        /// handler's lookup) see only the asking app's rows.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn every_read_is_scoped_to_the_asking_app() {
+            let (_guard, db) = fresh_db().await;
+            assert!(queue(&db, "prop_mine", "app-a", "/mine").await);
+            assert!(queue(&db, "prop_theirs", "app-b", "/theirs").await);
+            for id in ["prop_mine", "prop_theirs"] {
+                db.update_proposal_status(id, "pendingPromotion")
+                    .await
+                    .expect("status");
+            }
+
+            let listed: Vec<String> = db
+                .list_proposals("app-a", 50, 0)
+                .await
+                .expect("list")
+                .into_iter()
+                .map(|r| r.id)
+                .collect();
+            assert_eq!(listed, vec!["prop_mine".to_string()]);
+
+            let pending: Vec<String> = db
+                .list_proposals_by_status("app-a", "pendingPromotion", 50)
+                .await
+                .expect("list_by_status")
+                .into_iter()
+                .map(|r| r.id)
+                .collect();
+            assert_eq!(pending, vec!["prop_mine".to_string()]);
+
+            assert!(db
+                .find_proposal_by_id("app-a", "prop_mine")
+                .await
+                .expect("find")
+                .is_some());
+            assert!(
+                db.find_proposal_by_id("app-a", "prop_theirs")
+                    .await
+                    .expect("find")
+                    .is_none(),
+                "another app's proposal is not this app's to execute"
+            );
+        }
+
+        async fn status_of(db: &PgDb, app_id: &str, id: &str) -> (String, Option<String>) {
+            let row = db
+                .find_proposal_by_id(app_id, id)
+                .await
+                .expect("find")
+                .expect("the row exists");
+            (row.status, row.last_error)
+        }
+
+        /// The execute's claim is one compare-and-set: only a queued row of
+        /// the asking app moves to `inFlight`, and only once.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn an_execute_claims_only_a_queued_proposal_of_its_own_app() {
+            let (_guard, db) = fresh_db().await;
+            assert!(queue(&db, "prop_claim", "app-a", "/claim").await);
+            assert!(
+                !db.claim_proposal_for_execute("app-b", "prop_claim")
+                    .await
+                    .expect("claim"),
+                "another app cannot claim this app's proposal"
+            );
+            assert_eq!(status_of(&db, "app-a", "prop_claim").await.0, "queued");
+
+            assert!(db
+                .claim_proposal_for_execute("app-a", "prop_claim")
+                .await
+                .expect("claim"));
+            let row = db
+                .find_proposal_by_id("app-a", "prop_claim")
+                .await
+                .expect("find")
+                .expect("row");
+            assert_eq!(row.status, "inFlight");
+            assert!(
+                row.last_attempt_at.is_some(),
+                "the claim stamps the attempt"
+            );
+
+            assert!(
+                !db.claim_proposal_for_execute("app-a", "prop_claim")
+                    .await
+                    .expect("claim"),
+                "a second execute of an inFlight proposal starts no second run"
+            );
+            db.update_proposal_status("prop_claim", "pendingPromotion")
+                .await
+                .expect("status");
+            assert!(
+                !db.claim_proposal_for_execute("app-a", "prop_claim")
+                    .await
+                    .expect("claim"),
+                "a proposal past the queue is not executed again"
+            );
+        }
+
+        /// The abandoned-execute guard re-queues a row only while it is still
+        /// `inFlight`: an outcome written first is never undone.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn an_abandoned_execute_requeues_only_a_row_still_in_flight() {
+            let (_guard, db) = fresh_db().await;
+            assert!(queue(&db, "prop_gone", "app-a", "/gone").await);
+            assert!(db
+                .claim_proposal_for_execute("app-a", "prop_gone")
+                .await
+                .expect("claim"));
+            assert!(db
+                .requeue_in_flight_proposal("prop_gone", ABANDONED_EXECUTE_ERROR)
+                .await
+                .expect("requeue"));
+            assert_eq!(
+                status_of(&db, "app-a", "prop_gone").await,
+                (
+                    "queued".to_string(),
+                    Some(ABANDONED_EXECUTE_ERROR.to_string())
+                )
+            );
+
+            assert!(db
+                .claim_proposal_for_execute("app-a", "prop_gone")
+                .await
+                .expect("claim"));
+            db.update_proposal_status_with_error("prop_gone", "failed", "builder step failed")
+                .await
+                .expect("fail");
+            assert!(
+                !db.requeue_in_flight_proposal("prop_gone", ABANDONED_EXECUTE_ERROR)
+                    .await
+                    .expect("requeue"),
+                "a failed outcome is left as it was"
+            );
+            assert_eq!(
+                status_of(&db, "app-a", "prop_gone").await,
+                (
+                    "failed".to_string(),
+                    Some("builder step failed".to_string())
+                )
+            );
+        }
+
+        /// The scan re-queues the asking app's `inFlight` rows older than the
+        /// stale bound, and nothing else.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn the_scan_requeues_only_its_apps_stale_in_flight_rows() {
+            let (_guard, db) = fresh_db().await;
+            for (id, app, target) in [
+                ("prop_stale", "app-a", "/stale"),
+                ("prop_fresh", "app-a", "/fresh"),
+                ("prop_other", "app-b", "/other"),
+            ] {
+                assert!(queue(&db, id, app, target).await);
+                assert!(db.claim_proposal_for_execute(app, id).await.expect("claim"));
+            }
+            let conn = db.pool().get().await.expect("pg conn");
+            conn.execute(
+                "UPDATE atlas_managed.spec_proposals \
+                 SET last_attempt_at = now() - interval '2 hours' \
+                 WHERE id IN ('prop_stale', 'prop_other')",
+                &[],
+            )
+            .await
+            .expect("age two claims");
+            drop(conn);
+
+            let requeued = db
+                .requeue_stale_in_flight_proposals("app-a", 3600.0, STALE_EXECUTE_ERROR)
+                .await
+                .expect("requeue stale");
+            assert_eq!(requeued, 1);
+            assert_eq!(
+                status_of(&db, "app-a", "prop_stale").await,
+                ("queued".to_string(), Some(STALE_EXECUTE_ERROR.to_string()))
+            );
+            assert_eq!(
+                status_of(&db, "app-a", "prop_fresh").await.0,
+                "inFlight",
+                "an execute still within its bound keeps its claim"
+            );
+            assert_eq!(
+                status_of(&db, "app-b", "prop_other").await.0,
+                "inFlight",
+                "another app's stale row is that app's scan's to re-queue"
+            );
         }
     }
 
@@ -1606,6 +2158,7 @@ mod tests {
             let proposal_id = unique_id("e9-prop");
             pg.insert_proposal(
                 &proposal_id,
+                &app_id,
                 "fullPage",
                 Some("/e9-test"),
                 None,

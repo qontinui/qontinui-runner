@@ -1186,6 +1186,56 @@ impl PgDb {
         .await
         .map_err(|e| format!("Stream E.1 proposal_events.app_id self-heal failed: {}", e))?;
 
+        // atlas_managed.spec_proposals gains `app_id` (plan
+        // `2026-11-06-what-the-fleet-records-and-advertises-matches-what-actually-ran`,
+        // Phase 3): every proposal belongs to the app whose scan queued it, and
+        // the sweep, list, execute lookup and dedup index are scoped by it.
+        // Before it, `post_sweep_pending` swept EVERY app's pending rows with the
+        // requesting app's specs root and page locks.
+        //
+        // Same shape and same reasoning as the proposal_events block above: Atlas
+        // owns the CREATE TABLE, this self-heal owns the column on a database
+        // created before it. Legacy rows carry no app and are filed under the
+        // bootstrap app id `qontinui-runner`, as proposal_events' were. The
+        // dedup index moves to `(app_id, kind, COALESCE(pathname, spec_id))` —
+        // a new name, so the swap is two idempotent statements; legacy rows
+        // were unique without `app_id`, so they stay unique with it. Gated on
+        // the table existing (a database Atlas never touched is untouched) AND
+        // on there being something to heal: `app_id` missing or nullable, the
+        // old index still there, or the new one not yet. The block takes an
+        // ACCESS EXCLUSIVE lock and runs DDL, so, as with the
+        // `scheduled_tasks.conditions` heal above, on every boot after the
+        // first it must not run at all.
+        conn.batch_execute(
+            "DO $$
+             BEGIN
+               IF EXISTS (
+                 SELECT 1 FROM information_schema.tables
+                 WHERE table_schema = 'atlas_managed' AND table_name = 'spec_proposals'
+               ) AND (
+                 NOT EXISTS (
+                   SELECT 1 FROM information_schema.columns
+                   WHERE table_schema = 'atlas_managed' AND table_name = 'spec_proposals'
+                     AND column_name = 'app_id' AND is_nullable = 'NO'
+                 )
+                 OR to_regclass('atlas_managed.spec_proposals_kind_target_uniq') IS NOT NULL
+                 OR to_regclass('atlas_managed.spec_proposals_app_kind_target_uniq') IS NULL
+               ) THEN
+                 LOCK TABLE atlas_managed.spec_proposals IN ACCESS EXCLUSIVE MODE;
+                 ALTER TABLE atlas_managed.spec_proposals
+                     ADD COLUMN IF NOT EXISTS app_id TEXT;
+                 UPDATE atlas_managed.spec_proposals SET app_id = 'qontinui-runner'
+                     WHERE app_id IS NULL;
+                 ALTER TABLE atlas_managed.spec_proposals ALTER COLUMN app_id SET NOT NULL;
+                 CREATE UNIQUE INDEX IF NOT EXISTS spec_proposals_app_kind_target_uniq
+                     ON atlas_managed.spec_proposals (app_id, kind, (COALESCE(pathname, spec_id)));
+                 DROP INDEX IF EXISTS atlas_managed.spec_proposals_kind_target_uniq;
+               END IF;
+             END $$;",
+        )
+        .await
+        .map_err(|e| format!("spec_proposals.app_id self-heal failed: {}", e))?;
+
         // Approach-D Conductor/Engine Phase 1 — runner-owned `orchestration`
         // schema (durable run + subtask DAG ledger).
         //

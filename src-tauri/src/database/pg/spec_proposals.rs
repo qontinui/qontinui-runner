@@ -9,9 +9,18 @@
 //! Lifecycle (`status` column) is driven by Stream E:
 //!   queued → inFlight → pendingValidation → pendingPromotion → promoted
 //!                                                                    failed
-//! See `spec_api/proposals.rs` for the execution handler that transitions
-//! `queued → inFlight → pendingPromotion | failed` and the supervisor cron
-//! (Step 10) for `pendingPromotion → promoted` after 2 consecutive greens.
+//! See `spec_api/proposals.rs`: the execute handler claims a `queued` row
+//! (`queued → inFlight`, one compare-and-set) and moves it on to
+//! `pendingPromotion | failed`, or back to `queued` when the device drain or
+//! the agent registry does not admit the run, or when the execute is
+//! abandoned before its outcome is written. The scan re-queues a row left
+//! `inFlight` by an execute that died. The sweep-pending handler moves
+//! `pendingPromotion → promoted` after 2 consecutive greens.
+//!
+//! Every row belongs to ONE app (`app_id`, the registry id the scan ran for),
+//! and every read here is scoped to it: an app's sweep, list and execute never
+//! see another app's rows, and the dedup index includes it, so two apps may
+//! queue the same page label.
 
 use super::PgDb;
 use serde::{Deserialize, Serialize};
@@ -29,6 +38,8 @@ pub(crate) static SPEC_PROPOSALS_TEST_LOCK: tokio::sync::Mutex<()> =
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpecProposalRow {
     pub id: String,
+    /// The app whose scan queued this row (`project.apps.app_id`).
+    pub app_id: String,
     pub kind: String,
     pub pathname: Option<String>,
     pub spec_id: Option<String>,
@@ -46,16 +57,19 @@ impl PgDb {
     // Writes
     // -------------------------------------------------------------------------
 
-    /// Insert a new proposal row. Returns `Ok(true)` if a row was inserted,
-    /// `Ok(false)` if the unique-on-(kind, COALESCE(pathname, spec_id))
-    /// constraint suppressed the insert via `ON CONFLICT DO NOTHING`.
+    /// Insert a new proposal row for `app_id`. Returns `Ok(true)` if a row was
+    /// inserted, `Ok(false)` if the unique-on-(app_id, kind,
+    /// COALESCE(pathname, spec_id)) index suppressed the insert via
+    /// `ON CONFLICT DO NOTHING`.
     ///
     /// `kind` must be `"fullPage"` or `"patch"`; the CHECK constraint enforces
     /// this server-side, but callers should validate upstream so the rejection
     /// surfaces as a structured `SpecError` rather than a raw PG error.
+    #[allow(clippy::too_many_arguments)]
     pub async fn insert_proposal(
         &self,
         id: &str,
+        app_id: &str,
         kind: &str,
         pathname: Option<&str>,
         spec_id: Option<&str>,
@@ -69,18 +83,18 @@ impl PgDb {
             .map_err(|e| format!("PG pool error: {}", e))?;
 
         // ON CONFLICT DO NOTHING with no target catches both the PK and the
-        // unique `spec_proposals_kind_target_uniq` index. The PK is a fresh
+        // unique `spec_proposals_app_kind_target_uniq` index. The PK is a fresh
         // UUIDv7-shaped id from `mint_proposal_id` so PK collisions are
         // effectively zero — the only realistic conflict is the unique
         // dedup index, which is the intended swallow.
         let rows_affected = conn
             .execute(
                 r#"
-                INSERT INTO atlas_managed.spec_proposals (id, kind, pathname, spec_id, status, metadata)
-                VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+                INSERT INTO atlas_managed.spec_proposals (id, app_id, kind, pathname, spec_id, status, metadata)
+                VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
                 ON CONFLICT DO NOTHING
                 "#,
-                &[&id, &kind, &pathname, &spec_id, &status, metadata],
+                &[&id, &app_id, &kind, &pathname, &spec_id, &status, metadata],
             )
             .await
             .map_err(|e| crate::database::pg::pg_err("PG insert_proposal", &e))?;
@@ -106,8 +120,9 @@ impl PgDb {
         Ok(())
     }
 
-    /// Mark an attempt without changing status — used to record the start of
-    /// an execute call before authoring kicks off.
+    /// Mark an attempt without changing status. The sweep stamps each pass
+    /// over a pending proposal with it; an execute's claim stamps its own
+    /// ([`Self::claim_proposal_for_execute`]).
     pub async fn update_proposal_attempt_only(&self, id: &str) -> Result<(), String> {
         let conn = self
             .pool
@@ -197,12 +212,97 @@ impl PgDb {
         Ok(())
     }
 
+    /// Claim `app_id`'s proposal `id` for an execute: `queued → inFlight`, with
+    /// `last_attempt_at` stamped, as ONE compare-and-set. `Ok(false)` means the
+    /// row is not `queued` (or not this app's), and nothing was written. An
+    /// execute starts a paid AI run, so two executes of one proposal, or an
+    /// execute of a proposal already past the queue, must not both get here.
+    pub async fn claim_proposal_for_execute(&self, app_id: &str, id: &str) -> Result<bool, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let claimed = conn
+            .execute(
+                r#"UPDATE atlas_managed.spec_proposals
+                   SET status = 'inFlight',
+                       last_attempt_at = now()
+                   WHERE id = $1 AND app_id = $2 AND status = 'queued'"#,
+                &[&id, &app_id],
+            )
+            .await
+            .map_err(|e| crate::database::pg::pg_err("PG claim_proposal_for_execute", &e))?;
+        Ok(claimed == 1)
+    }
+
+    /// Put proposal `id` back in the queue with `last_error`, but only while
+    /// it is still `inFlight`: an execute that went away before writing its
+    /// outcome. A row something has since moved on is left alone. Returns
+    /// whether a row was re-queued.
+    pub async fn requeue_in_flight_proposal(
+        &self,
+        id: &str,
+        last_error: &str,
+    ) -> Result<bool, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let requeued = conn
+            .execute(
+                r#"UPDATE atlas_managed.spec_proposals
+                   SET status = 'queued',
+                       last_error = $2
+                   WHERE id = $1 AND status = 'inFlight'"#,
+                &[&id, &last_error],
+            )
+            .await
+            .map_err(|e| crate::database::pg::pg_err("PG requeue_in_flight_proposal", &e))?;
+        Ok(requeued == 1)
+    }
+
+    /// Put every one of `app_id`'s proposals that has been `inFlight` for
+    /// longer than `older_than_secs` back in the queue with `last_error`. No
+    /// execute of this process lasts that long, so such a row was left by an
+    /// execute that died with its runner. Returns how many rows were re-queued.
+    pub async fn requeue_stale_in_flight_proposals(
+        &self,
+        app_id: &str,
+        older_than_secs: f64,
+        last_error: &str,
+    ) -> Result<u64, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        conn.execute(
+            r#"UPDATE atlas_managed.spec_proposals
+               SET status = 'queued',
+                   last_error = $3
+               WHERE app_id = $1
+                 AND status = 'inFlight'
+                 AND (last_attempt_at IS NULL
+                      OR last_attempt_at < now() - make_interval(secs => $2))"#,
+            &[&app_id, &older_than_secs, &last_error],
+        )
+        .await
+        .map_err(|e| crate::database::pg::pg_err("PG requeue_stale_in_flight_proposals", &e))
+    }
+
     // -------------------------------------------------------------------------
     // Reads
     // -------------------------------------------------------------------------
 
-    /// Fetch a single proposal by id. Returns `Ok(None)` if missing.
-    pub async fn find_proposal_by_id(&self, id: &str) -> Result<Option<SpecProposalRow>, String> {
+    /// Fetch `app_id`'s proposal `id`. Returns `Ok(None)` if it is missing or
+    /// belongs to another app.
+    pub async fn find_proposal_by_id(
+        &self,
+        app_id: &str,
+        id: &str,
+    ) -> Result<Option<SpecProposalRow>, String> {
         let conn = self
             .pool
             .get()
@@ -213,6 +313,7 @@ impl PgDb {
                 r#"
                 SELECT
                     id,
+                    app_id,
                     kind,
                     pathname,
                     spec_id,
@@ -224,9 +325,9 @@ impl PgDb {
                     candidate_ir,
                     metadata
                 FROM atlas_managed.spec_proposals
-                WHERE id = $1
+                WHERE id = $1 AND app_id = $2
                 "#,
-                &[&id],
+                &[&id, &app_id],
             )
             .await
             .map_err(|e| crate::database::pg::pg_err("PG find_proposal_by_id", &e))?;
@@ -234,9 +335,11 @@ impl PgDb {
         Ok(rows.first().map(row_to_proposal))
     }
 
-    /// Paginated list of proposals, ordered by `created_at DESC, id`.
+    /// Paginated list of `app_id`'s proposals, ordered by
+    /// `created_at DESC, id`.
     pub async fn list_proposals(
         &self,
+        app_id: &str,
         limit: i64,
         offset: i64,
     ) -> Result<Vec<SpecProposalRow>, String> {
@@ -252,6 +355,7 @@ impl PgDb {
                 r#"
                 SELECT
                     id,
+                    app_id,
                     kind,
                     pathname,
                     spec_id,
@@ -263,10 +367,11 @@ impl PgDb {
                     candidate_ir,
                     metadata
                 FROM atlas_managed.spec_proposals
+                WHERE app_id = $1
                 ORDER BY created_at DESC, id
-                LIMIT $1 OFFSET $2
+                LIMIT $2 OFFSET $3
                 "#,
-                &[&lim, &off],
+                &[&app_id, &lim, &off],
             )
             .await
             .map_err(|e| crate::database::pg::pg_err("PG list_proposals", &e))?;
@@ -274,11 +379,11 @@ impl PgDb {
         Ok(rows.iter().map(row_to_proposal).collect())
     }
 
-    /// Proposals filtered by a single status value, ordered by
-    /// `created_at DESC`. Used by the supervisor cron to find
-    /// `pendingPromotion` candidates.
+    /// `app_id`'s proposals in a single status, ordered by `created_at DESC`.
+    /// The sweep-pending handler reads its `pendingPromotion` candidates here.
     pub async fn list_proposals_by_status(
         &self,
+        app_id: &str,
         status: &str,
         limit: i64,
     ) -> Result<Vec<SpecProposalRow>, String> {
@@ -293,6 +398,7 @@ impl PgDb {
                 r#"
                 SELECT
                     id,
+                    app_id,
                     kind,
                     pathname,
                     spec_id,
@@ -304,11 +410,11 @@ impl PgDb {
                     candidate_ir,
                     metadata
                 FROM atlas_managed.spec_proposals
-                WHERE status = $1
+                WHERE app_id = $1 AND status = $2
                 ORDER BY created_at DESC, id
-                LIMIT $2
+                LIMIT $3
                 "#,
-                &[&status, &lim],
+                &[&app_id, &status, &lim],
             )
             .await
             .map_err(|e| crate::database::pg::pg_err("PG list_proposals_by_status", &e))?;
@@ -324,15 +430,16 @@ impl PgDb {
 fn row_to_proposal(r: &tokio_postgres::Row) -> SpecProposalRow {
     SpecProposalRow {
         id: r.get(0),
-        kind: r.get(1),
-        pathname: r.get(2),
-        spec_id: r.get(3),
-        status: r.get(4),
-        created_at: r.get(5),
-        last_attempt_at: r.get(6),
-        consecutive_greens: r.get(7),
-        last_error: r.get(8),
-        candidate_ir: r.get(9),
-        metadata: r.get(10),
+        app_id: r.get(1),
+        kind: r.get(2),
+        pathname: r.get(3),
+        spec_id: r.get(4),
+        status: r.get(5),
+        created_at: r.get(6),
+        last_attempt_at: r.get(7),
+        consecutive_greens: r.get(8),
+        last_error: r.get(9),
+        candidate_ir: r.get(10),
+        metadata: r.get(11),
     }
 }

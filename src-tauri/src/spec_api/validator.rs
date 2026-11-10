@@ -262,7 +262,7 @@ fn first_failing_assertion(result: &SpecCheckResult) -> Option<(String, String)>
 ///
 /// `pathname` is forwarded to the SDK as the `route` field on
 /// `BridgeFingerprint` so downstream `SpecCheckResult.fingerprint` carries
-/// it; we do NOT navigate the connected app here. The flywheel cron either
+/// it; we do NOT navigate the connected app here. A flywheel caller either
 /// (a) trusts the user has the app on the right page, or (b) extends this
 /// helper later to pre-dispatch a `/ui-bridge/sdk/navigate` call. v1.0 ships
 /// (a) per the plan's "optional" framing in § Step 8 step 2.
@@ -341,8 +341,8 @@ async fn fetch_live_snapshot(
 
     // 3. Dispatch `getControlSnapshot`. For WS-transport apps the dispatcher
     //    sends the action over the active socket; for HTTP-transport apps
-    //    it issues a GET to `/control/snapshot`. The flywheel cron is
-    //    indifferent — either way we get back a raw JSON snapshot value.
+    //    it issues a GET to `/control/snapshot`. Either way we get back a
+    //    raw JSON snapshot value.
     let payload = json!({});
     let raw = match dispatcher
         .dispatch(
@@ -372,9 +372,7 @@ async fn fetch_live_snapshot(
     };
 
     // 5. Wrap into a typed `UIBridgeSnapshot` (+ fingerprint, snapshot_id,
-    //    content_sha256 — the latter three are discarded here; the
-    //    flywheel cron records them at a higher layer when it persists
-    //    sweep results).
+    //    content_sha256 — the latter three are discarded here).
     let (snapshot, _fp, _id, _hash) = spec_check::wrap_snapshot(
         inner,
         app_id,

@@ -36,6 +36,13 @@
 //!   is a separate control — the twins must not be reachable by an automation,
 //!   which `every_operator_site_is_a_tauri_command` now asserts against the UI
 //!   Bridge allowlist rather than by inspecting origins.
+//! * The one door call this scan DOES see is the in-process one,
+//!   `operator_doors::call_door_in_process(path, body, origin)`: its caller
+//!   chooses the origin, so every caller is a site and declares how it gates
+//!   (plan `2026-11-06-what-the-fleet-records-and-advertises-matches-what-actually-ran`,
+//!   Phase 3, which added the spec flywheel's execute as a second caller beside
+//!   the scheduler's launch). A direct call of a door core (`run_unified_workflow(`)
+//!   with a caller-chosen origin is still not seen.
 //! * Only `helper` rows propagate to their callers. An `operator` or `exempt`
 //!   wrapper around an already-gated door gets no row of its own, so a wrapper
 //!   that widened its door's reach would not be flagged here.
@@ -256,6 +263,9 @@ fn primitive_families() -> Vec<(&'static str, Vec<Regex>)> {
                 r"\bspawn_sequence_with_panic_guard\s*\(",
             ],
         ),
+        // A spawn door called in-process, under an origin its caller chooses
+        // (see the module's limits).
+        fam("in-process door", &[r"\bcall_door_in_process\s*\("]),
     ]
 }
 

@@ -275,6 +275,15 @@ mod tests {
         assert_eq!(unified_workflow_run_id("/prompts/run"), None);
     }
 
+    /// The spec flywheel's execute starts its meta-workflow through this
+    /// router: the path it builds must be one the router routes.
+    #[cfg(feature = "spec-authoring")]
+    #[test]
+    fn the_spec_execute_run_path_is_routed_in_process() {
+        let path = crate::workflow_generation::meta_workflow_run::run_door_path("wf-1");
+        assert_eq!(unified_workflow_run_id(&path), Some("wf-1"));
+    }
+
     #[test]
     fn the_twins_are_not_reachable_through_the_ui_bridge_allowlist() {
         // Derived from the ROSTER, not from a hardcoded list. The list this
