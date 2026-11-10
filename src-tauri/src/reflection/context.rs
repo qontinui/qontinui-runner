@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::reflection::types::ReflectionFix;
+use crate::reflection::types::{describe_effectiveness_evidence, ReflectionFix};
 use crate::str_utils::truncate_str;
 
 /// Status label and sort priority for display grouping.
@@ -102,7 +102,12 @@ pub fn build_already_tried_summary(fixes: &[ReflectionFix]) -> String {
                     let evidence = fix
                         .effectiveness_evidence
                         .as_deref()
-                        .map(|e| format!(" -- Reason: {}", truncate_str(e, 150)))
+                        .map(|e| {
+                            format!(
+                                " -- Reason: {}",
+                                truncate_str(&describe_effectiveness_evidence(e), 300)
+                            )
+                        })
                         .unwrap_or_default();
                     output.push_str(&format!("- [{}] {}{}\n", label, desc, evidence));
                     if let Some(ref reasoning) = fix.reasoning {
@@ -126,7 +131,12 @@ pub fn build_already_tried_summary(fixes: &[ReflectionFix]) -> String {
                     let evidence = fix
                         .effectiveness_evidence
                         .as_deref()
-                        .map(|e| format!(" -- Caused: {}", truncate_str(e, 150)))
+                        .map(|e| {
+                            format!(
+                                " -- Caused: {}",
+                                truncate_str(&describe_effectiveness_evidence(e), 300)
+                            )
+                        })
                         .unwrap_or_default();
                     output.push_str(&format!("- [{}] {}{}\n", label, desc, evidence));
                     if let Some(ref reasoning) = fix.reasoning {
@@ -248,6 +258,23 @@ mod tests {
             project_path: None,
             applicability_context: None,
         }
+    }
+
+    #[test]
+    fn evaluator_evidence_reaches_the_ai_as_its_counts_not_truncated_json() {
+        let raw = r#"{"verdict":"ineffective","window":"task_runs.completed_at > reflection_fixes.applied_at","later_runs":5,"min_later_runs":3,"source_finding":true,"source_signature_known":true,"recurrences":2,"new_signature_peak_runs":0,"min_later_runs_for_regression":2}"#;
+        let fixes = vec![make_fix(
+            "context_addition",
+            "Add retry hint",
+            Some("ineffective"),
+            Some(raw),
+        )];
+        let result = build_already_tried_summary(&fixes);
+        assert!(
+            result.contains("the source finding recurred in 2 of them"),
+            "{result}"
+        );
+        assert!(!result.contains("\"verdict\""), "{result}");
     }
 
     #[test]

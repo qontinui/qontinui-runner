@@ -32,6 +32,7 @@ import {
 } from "lucide-react";
 import type { Finding, FindingSeverity } from "@/types/findings";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
+import { describeEffectivenessEvidence } from "@/lib/reflectionEvidence";
 import { createLogger } from "@/lib/logger";
 
 const logger = createLogger("KnowledgeTab");
@@ -524,7 +525,7 @@ export function KnowledgeTab({ taskRunId }: KnowledgeTabProps) {
                               Effectiveness evidence:
                             </span>
                             <p className="text-sm text-foreground/70 mt-0.5">
-                              {fix.effectiveness_evidence}
+                              {describeEffectivenessEvidence(fix.effectiveness_evidence)}
                             </p>
                           </div>
                         )}
