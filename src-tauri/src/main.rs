@@ -4665,8 +4665,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
                     use session::session_lifecycle_store::{
                         boot_restore_hold, boot_restore_phase, carries_boot_restore_hold, classify,
-                        close_reason_for_dead_shell, hold_for_withheld_boot_restore,
-                        match_live_terminal, PollAction, WorkerPlane,
+                        hold_for_withheld_boot_restore, match_live_terminal, PollAction,
+                        WorkerPlane,
                     };
 
                     // Reference instant for `claude_present_in_inclusive_subtree`'s
@@ -5197,53 +5197,21 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                     );
                                 }
                                 PollAction::Close => {
-                                    // A bare shell whose last restore already
-                                    // landed `terminal-only` never hosted a
-                                    // conversation in this generation and never
-                                    // will; closing it `"poll-dead"` (restorable)
-                                    // would hand the next restore pass the same
-                                    // unresumable record, recreating the same
-                                    // blank terminal forever. See
-                                    // `close_reason_for_dead_shell`.
-                                    let proposed =
-                                        close_reason_for_dead_shell(rec.restore_tier.as_deref());
-                                    // A pane whose Claude CLI never launched
-                                    // closes `launch-failed` instead (plan
-                                    // 2026-11-10-migration-holds-for-missing-
-                                    // claude-cli, D3). Its spawn time is read
-                                    // from an EXACT terminal-id match only: the
-                                    // (page, title, dir) fallback above can
-                                    // name another terminal.
-                                    let terminal_created_at_ms = live_by_id
-                                        .get(rec.terminal_id.as_str())
-                                        .and_then(|t| i64::try_from(t.created_at).ok());
-                                    let now_ms = chrono::Utc::now().timestamp_millis();
-                                    let launch = terminal::launch_failure::registry();
-                                    let verdict =
-                                        launch.verdict(proposed, rec, terminal_created_at_ms, now_ms);
-                                    let reason = verdict.reason;
-                                    let outcome = poll_lifecycle_store.record_close_checked(
-                                        &rec.claude_session_id,
-                                        None,
-                                        reason,
+                                    // `terminal-only-idle` for a tile already
+                                    // restored honestly empty, `launch-failed`
+                                    // for a pane whose Claude CLI never launched
+                                    // (plan 2026-11-10-migration-holds-for-
+                                    // missing-claude-cli, D3), else `poll-dead`.
+                                    // See `close_dead_row`.
+                                    terminal::launch_failure::close_dead_row(
+                                        &poll_lifecycle_store,
+                                        terminal::launch_failure::registry(),
+                                        rec,
+                                        &live_by_id,
+                                        chrono::Utc::now().timestamp_millis(),
                                     );
-                                    let launch_failed = launch.settle(&verdict, &outcome, now_ms);
                                     consecutive_dead.remove(&rec.claude_session_id);
                                     consecutive_no_match.remove(&rec.claude_session_id);
-                                    if launch_failed {
-                                        tracing::info!(
-                                            claude_session = %rec.claude_session_id,
-                                            reason = %reason,
-                                            detail = %verdict.evidence.as_deref().unwrap_or(""),
-                                            "session lifecycle poll: closing session whose CLI never launched"
-                                        );
-                                    } else {
-                                        tracing::info!(
-                                            claude_session = %rec.claude_session_id,
-                                            reason = %reason,
-                                            "session lifecycle poll: closing dead session"
-                                        );
-                                    }
                                 }
                                 PollAction::CloseNeverStarted => {
                                     // Provisional record, provider never

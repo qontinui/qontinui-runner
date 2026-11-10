@@ -3565,6 +3565,40 @@ mod tests {
         assert!(matches!(user, CloseOutcome::Closed { .. }), "{user:?}");
     }
 
+    /// A `pty-exit` close of a terminal this manager no longer holds has no
+    /// spawn time to read, so D3 condition 2 ("no CLI started in this pane")
+    /// cannot be read either: even a pane whose shim reported a resume-shaped
+    /// launch failure keeps `pty-exit`, because a cause is never asserted on
+    /// weaker evidence than its rule names.
+    #[test]
+    fn record_close_for_keeps_pty_exit_when_the_terminal_is_gone() {
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
+        let tag = uuid::Uuid::new_v4();
+        let (id, term) = (format!("sess-gone-{tag}"), format!("term-gone-{tag}"));
+        let mut r = restore_candidate_record(&id);
+        r.terminal_id = term.clone();
+        // Hook-stamped long before any pane this manager could hold.
+        r.last_session_start_at = Some(1);
+        store.record_open(r);
+        crate::terminal::launch_failure::registry().record_beacon(
+            Some(term.as_str()),
+            "resolve-failed",
+            "waited=10 stub=false settings=true user_session_id=true",
+            chrono::Utc::now().timestamp_millis() - 5_000,
+        );
+        let tm = TerminalManager::new();
+        assert!(tm.get(&term).is_none(), "the pane is gone from the manager");
+
+        let out = record_close_for(&tm, &store, &id, Some(term.as_str()), "pty-exit");
+        assert!(matches!(out, CloseOutcome::Closed { .. }), "{out:?}");
+        assert_eq!(
+            store.get(&id).unwrap().close_reason.as_deref(),
+            Some("pty-exit")
+        );
+    }
+
     fn restore_candidate_record(id: &str) -> TerminalSessionRecord {
         TerminalSessionRecord {
             claude_session_id: id.to_string(),
