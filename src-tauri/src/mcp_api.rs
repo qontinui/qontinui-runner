@@ -18325,7 +18325,9 @@ mod coord_mcp_body_gate_tests {
     /// the comment above it does not hide it from the source-text parse.
     #[test]
     fn coord_list_credential_probe_specs_is_allowed_and_parses_from_source() {
-        assert!(coord_mcp_tool_is_allowed("coord_list_credential_probe_specs"));
+        assert!(coord_mcp_tool_is_allowed(
+            "coord_list_credential_probe_specs"
+        ));
         assert!(
             COORD_MCP_ALLOWED_TOOLS
                 .binary_search(&"coord_list_credential_probe_specs")
