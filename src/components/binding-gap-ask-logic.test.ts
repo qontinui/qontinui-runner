@@ -11,11 +11,11 @@ const T = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
 const raw = {
   tenant_id: T,
   detector: "binding_gaps",
-  reason: "no headless path can seed this tenant's credential safely",
+  reason: "this tenant's credential was not seeded automatically",
   message: `This device is bound to tenant ${T} but holds no credential for it.`,
   cta: "device_pair_tenant",
   command: `qontinui_profile device pair --tenant-id ${T}`,
-  caveat: "pairing also makes this tenant the device's home tenant",
+  caveat: "pairing binds this tenant to this device",
   first_seen: 1800000000,
 };
 

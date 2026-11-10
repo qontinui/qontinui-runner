@@ -85,10 +85,17 @@ export function newestSurfacedTabId(
   prevTabIds: ReadonlySet<string>,
   tabs: readonly { id: string; coalesced?: boolean }[],
 ): string | null {
-  return newestAddedTabId(
-    prevTabIds,
-    tabs.filter((t) => !t.coalesced).map((t) => t.id),
-  );
+  return newestAddedTabId(prevTabIds, surfacedTabIds(tabs));
+}
+
+/**
+ * The ids of the tabs allowed to take the focus (not `coalesced`), in order.
+ * ZoneGrid keeps this as its baseline rather than every tab id, so a tab that
+ * stops being `coalesced` (a re-sync-added tab whose late `terminal-created`
+ * said to surface it) counts as newly surfaced and is routed then.
+ */
+export function surfacedTabIds(tabs: readonly { id: string; coalesced?: boolean }[]): string[] {
+  return tabs.filter((t) => !t.coalesced).map((t) => t.id);
 }
 
 /**

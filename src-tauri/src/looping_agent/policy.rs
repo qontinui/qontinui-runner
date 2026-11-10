@@ -51,6 +51,12 @@ pub enum Action {
     /// Close the live tab's PTY and respawn fresh (same registry row, fresh
     /// `--session-id`, prompt = "read your journal and continue").
     Relaunch(RelaunchReason),
+    /// Close the live tab of an agent that holds no slot while every slot is
+    /// held by a live peer. Produced ONLY by
+    /// [`crate::looping_agent::lease::displacement_action`] — [`decide`] never
+    /// returns it (plan `2026-11-05-looping-agent-slot-lease-tracks-tab-liveness`,
+    /// D5).
+    Retire,
 }
 
 /// Everything [`decide`] needs, pre-observed by the impure glue.
@@ -484,6 +490,35 @@ mod tests {
         // No terminal, record closed/absent: confidently dead.
         assert_eq!(resolve_liveness(Absent, false, Absent), Liveness::Dead);
         assert_eq!(resolve_liveness(Absent, false, Running), Liveness::Dead);
+    }
+
+    /// `Retire` comes only from the lease layer's displacement rewrite: an
+    /// exhaustive sweep over the boolean axes of [`TickInput`] never yields it.
+    #[test]
+    fn decide_never_produces_retire() {
+        for bits in 0u32..(1 << 9) {
+            let b = |n: u32| bits & (1 << n) != 0;
+            let i = TickInput {
+                enabled: b(0),
+                desired_running: b(1),
+                tab_alive: b(2),
+                ever_spawned: b(3),
+                spawn_backoff_elapsed: b(4),
+                spawn_grace_elapsed: b(5),
+                idle: b(6),
+                context_low: b(7),
+                cadence_elapsed: b(8),
+                ..base()
+            };
+            for (cycles, k) in [(0, 0), (1, 8), (8, 8), (99, 8)] {
+                let i = TickInput {
+                    cycles_since_relaunch: cycles,
+                    relaunch_every_cycles: k,
+                    ..i
+                };
+                assert_ne!(decide(&i), Action::Retire, "{i:?}");
+            }
+        }
     }
 
     /// Coord finding `9089767f`: a registered tab whose `claude` exited must

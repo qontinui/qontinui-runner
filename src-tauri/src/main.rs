@@ -5286,21 +5286,30 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         // store / cmdline / snapshot op inside swallows its own
                         // errors, so a failure degrades to "bound nothing this
                         // tick", never a panic that would break the liveness loop.
-                        if needs_reconcile {
-                            let live_ptys: Vec<session::reconcile::LivePty> = live
-                                .iter()
-                                .map(|i| session::reconcile::LivePty {
-                                    terminal_id: i.id.clone(),
-                                    pid: i.pid,
-                                    working_dir: i.working_dir.clone(),
-                                    page_id: i.page_id.clone(),
-                                    title: i.title.clone(),
-                                    // run_reconcile_pass resolves the claude
-                                    // anchor from the snapshot it is handed.
-                                    ai_pid: None,
-                                    ai_start_unix: None,
-                                })
-                                .collect();
+                        // The tick's live PTYs, projected once for the bind
+                        // pass, the provider-registry read and the title pass.
+                        let live_ptys: Vec<session::reconcile::LivePty> = live
+                            .iter()
+                            .map(|i| session::reconcile::LivePty {
+                                terminal_id: i.id.clone(),
+                                pid: i.pid,
+                                working_dir: i.working_dir.clone(),
+                                page_id: i.page_id.clone(),
+                                title: i.title.clone(),
+                                // Each pass resolves the claude anchor from
+                                // the snapshot it is handed.
+                                ai_pid: None,
+                                ai_start_unix: None,
+                            })
+                            .collect();
+                        // The provider's own `<pid>.json` rows for every live
+                        // anchor, read ONCE per tick on the blocking pool (plan
+                        // 2026-10-23-a-hookless-resume-…, Phase 1b). A valid
+                        // row pre-empts the rung-2 argv id and re-keys the
+                        // pane's coord row; anything else re-keys nothing.
+                        let provider_rows =
+                            session::reconcile::compute_provider_rows(&live_ptys, &snap).await;
+                        let actions = if needs_reconcile {
                             let actions = session::reconcile::run_reconcile_pass(
                                 &poll_lifecycle_store,
                                 &live_ptys,
@@ -5309,21 +5318,18 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                             )
                             .await;
                             emit_session_bound(&poll_app_handle, &actions);
-                            // Rung-2 binds re-key the pane's coord row (plan
-                            // 2026-10-23-a-hookless-resume-…, Phase 1a).
-                            session::coord_identity::apply_reconcile_tick_in_app(
-                                &poll_app_handle,
-                                &actions,
-                            );
+                            actions
                         } else {
-                            // No pass this tick, but a refused re-key still
-                            // has to be restored (and, for the hook / R2
-                            // sources, re-queued) on the tick cadence.
-                            session::coord_identity::apply_reconcile_tick_in_app(
-                                &poll_app_handle,
-                                &[],
-                            );
-                        }
+                            Vec::new()
+                        };
+                        // Re-keys the pane's coord row: the provider row first,
+                        // rung 2 only where the anchor has no valid row (and
+                        // restores any refused re-key on the tick cadence).
+                        session::coord_identity::apply_reconcile_tick_in_app(
+                            &poll_app_handle,
+                            &actions,
+                            &provider_rows,
+                        );
 
                         // Title convergence (phantom-id plan B6). An in-Claude
                         // `/rename` emits NO OSC-0 title, so the runner's rename
@@ -5337,21 +5343,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         // and confirmed — which is exactly the state a session
                         // gets renamed in. Gating this on it would mean it never
                         // ran. Reuses this tick's `snap`; fail-open.
-                        let live_for_titles: Vec<session::reconcile::LivePty> = live
-                            .iter()
-                            .map(|i| session::reconcile::LivePty {
-                                terminal_id: i.id.clone(),
-                                pid: i.pid,
-                                working_dir: i.working_dir.clone(),
-                                page_id: i.page_id.clone(),
-                                title: i.title.clone(),
-                                ai_pid: None,
-                                ai_start_unix: None,
-                            })
-                            .collect();
                         session::reconcile::refresh_titles_pass(
                             &poll_lifecycle_store,
-                            &live_for_titles,
+                            &live_ptys,
                             &snap,
                         );
 
@@ -5392,12 +5386,20 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                             ai_start_unix: None,
                         })
                         .collect();
+                    // The boot pass reads the provider rows too, so a pane whose
+                    // claude was resumed before this runner started is re-keyed
+                    // from its own registry file, not its stale argv.
+                    let boot_snap =
+                        crate::process_capture::process_tree::snapshot_process_table_public().await;
+                    let provider_rows =
+                        session::reconcile::compute_provider_rows(&live, &boot_snap).await;
                     let actions =
                         session::reconcile::run_at_boot(&reconcile_lifecycle_store, live).await;
                     emit_session_bound(&reconcile_app_handle, &actions);
                     session::coord_identity::apply_reconcile_tick_in_app(
                         &reconcile_app_handle,
                         &actions,
+                        &provider_rows,
                     );
                 });
 
@@ -6216,11 +6218,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // skips dev-service injection for this boot and says so. It
                 // cannot silently inject services rooted at a fabricated path.
                 if dev_services::is_dev_mode() {
-                    if let Some(workspace) = crate::workspace_paths::workspace_root() {
+                    // Resolved once: the success arm uses the path, the failure
+                    // arm renders the shared sentence from the same resolution.
+                    let workspace_root = crate::workspace_paths::require_workspace_root();
+                    if let Ok(workspace) = &workspace_root {
                         let mutated =
-                            dev_services::upgrade_and_dedupe_configs(&mut configs, &workspace);
+                            dev_services::upgrade_and_dedupe_configs(&mut configs, workspace);
 
-                        let missing = dev_services::get_missing_dev_services(&workspace, &configs);
+                        let missing = dev_services::get_missing_dev_services(workspace, &configs);
                         let injected = !missing.is_empty();
                         if injected {
                             info!(
@@ -6248,12 +6253,12 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                 info!("Dev-mode: persisted upgraded/deduped/injected configs to settings");
                             }
                         }
-                    } else {
+                    } else if let Err(why) = &workspace_root {
                         warn!(
                             "Dev-mode: no Qontinui workspace root resolves, so the default \
                              dev services (Docker/backend/frontend/embedding) were NOT \
-                             injected. Set $QONTINUI_ROOT (or `paths.workspace_root`) to \
-                             the directory holding the repo checkouts. \
+                             injected. {why} Dev services are injected at boot, so a \
+                             change takes effect at the next runner start. \
                              `workspace_paths` has already logged which probe was rejected."
                         );
                     }

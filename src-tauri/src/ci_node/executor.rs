@@ -1103,15 +1103,46 @@ async fn run_step(
 }
 
 /// Per-line pump for one stream.
+///
+/// Reads the bytes up to each `\n` and renders them lossily, so a line that
+/// is not valid UTF-8 shows with U+FFFD in place of the bad bytes and the
+/// pump goes on. (`lines()` returns `InvalidData` there: the pump ended, the
+/// rest of the log was dropped silently, and a step still writing met a
+/// closed read end and died of SIGPIPE, exit 141.) A final line with no
+/// trailing `\n` is still logged. Any other read error is logged once, and
+/// the rest of the stream is drained unlogged so the writer is never cut off.
 async fn pump_lines<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
     stream: R,
     pusher: LinePusher,
     step_name: String,
     stream_tag: &'static str,
 ) {
-    let mut lines = BufReader::new(stream).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
-        pusher.push(&format!("[{step_name}:{stream_tag}] {line}"));
+    let mut reader = BufReader::new(stream);
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf).await {
+            Ok(0) => break,
+            Ok(_) => {
+                if buf.last() == Some(&b'\n') {
+                    buf.pop();
+                    if buf.last() == Some(&b'\r') {
+                        buf.pop();
+                    }
+                }
+                let line = String::from_utf8_lossy(&buf);
+                pusher.push(&format!("[{step_name}:{stream_tag}] {line}"));
+            }
+            Err(e) => {
+                pusher.push(&format!(
+                    "[ci-node] step {step_name} {stream_tag} read error: {e}"
+                ));
+                // Keep draining so a step still writing is never cut off by a
+                // closed read end (SIGPIPE); what it writes now is discarded.
+                let _ = tokio::io::copy(&mut reader, &mut tokio::io::sink()).await;
+                break;
+            }
+        }
     }
 }
 
@@ -2132,6 +2163,111 @@ fn tokio_no_window(program: &str) {}
             ],
             "the scan missed a direct call, or counted a comment, a literal, a definition or a \
              lookalike name"
+        );
+    }
+
+    /// Run one step through `run_step` with a fresh fixture and a tail-only
+    /// sink, and return its outcome and the sink's tail. Tail-only, not a
+    /// dead-port sink: with no device JWT the dead-port flusher waits out the
+    /// re-mint window once per line past `FLUSH_MAX_LINES`, which a 40000-line
+    /// step turns into hours of `finish()`.
+    #[cfg(unix)]
+    async fn run_one_probe_step(dispatch_id: &str, step: CiStep) -> (StepOutcome, String) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let dispatch_root = super::super::checkout::ci_dispatch_root(root, dispatch_id);
+        let worktree =
+            super::super::checkout::ci_worktree_path(root, dispatch_id, "qontinui/qontinui-runner");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let dispatch_env = DispatchEnv::build(
+            1,
+            1,
+            &root.join(".ci-target").join("qontinui-runner"),
+            &[],
+            &[],
+        );
+        let cancel = CancellationToken::new();
+        let sink = ProgressSink::tail_only();
+        // Inside the lock: cgroup discovery reads `QONTINUI_CI_CGROUP_ROOT`.
+        let ci_job = {
+            let _env = crate::test_env::env_lock();
+            CiJob::create(dispatch_id)
+        };
+        let outcome = run_step(
+            &step,
+            &dispatch_env,
+            &dispatch_root,
+            0,
+            &worktree,
+            &ci_job,
+            &sink,
+            &cancel,
+        )
+        .await;
+        let tail = sink.finish().await;
+        (outcome, tail)
+    }
+
+    /// Arming sentinel for the output pump: a line that is not valid UTF-8
+    /// shows in the log with U+FFFD in place of the bad byte, and every line
+    /// after it is still logged. The old `lines()` pump ended at the first
+    /// such line and dropped the rest of the step's output silently.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_non_utf8_line_shows_as_a_replacement_character_and_the_log_goes_on() {
+        let (outcome, tail) = run_one_probe_step(
+            "non-utf8-line",
+            probe_step(
+                "bytes",
+                vec!["printf".to_string(), r"a\n\377\nb\n".to_string()],
+            ),
+        )
+        .await;
+        let out = step_out(&tail, "bytes");
+        assert_eq!(outcome, StepOutcome::Success, "{tail}");
+        assert_eq!(out, ["a", "\u{FFFD}", "b"], "{tail}");
+    }
+
+    /// A step that keeps writing past a non-UTF-8 line, well beyond the pipe
+    /// buffer, still succeeds and its log runs to its last line: the pump keeps
+    /// draining the pipe, so the writer is never cut off by a closed read end
+    /// (the old pump's exit was SIGPIPE, 141). The tail ring keeps only
+    /// `LOG_TAIL_CAP_BYTES`, so neither the line count nor the first line is
+    /// asserted.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_step_writing_past_a_non_utf8_line_succeeds_to_its_last_line() {
+        let (outcome, tail) = run_one_probe_step(
+            "non-utf8-flood",
+            probe_step(
+                "flood",
+                vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    r"printf 'x\377\n'; seq 1 40000".to_string(),
+                ],
+            ),
+        )
+        .await;
+        let out = step_out(&tail, "flood");
+        let ci_node: Vec<&str> = tail
+            .lines()
+            .filter(|l| l.starts_with("[ci-node]"))
+            .collect();
+        assert_eq!(
+            outcome,
+            StepOutcome::Success,
+            "last: {:?}, ci-node lines: {ci_node:#?}",
+            out.last()
+        );
+        assert_eq!(
+            out.last().map(String::as_str),
+            Some("40000"),
+            "{ci_node:#?}"
+        );
+        assert!(
+            tail.lines().all(|l| !l.contains("read error")),
+            "{ci_node:#?}"
         );
     }
 }

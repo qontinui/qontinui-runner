@@ -3,6 +3,7 @@
 //! Follows the same HashMap-based manager pattern as `claude_session::SessionManager`.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use tauri::{AppHandle, Emitter};
@@ -71,6 +72,18 @@ pub struct TerminalManager {
     /// build can insert over another (orphaning a session, unlisted but
     /// running), and the boot sweep skips them.
     in_flight: Mutex<HashSet<String>>,
+    /// The runner-shutdown latch: set at the top of [`Self::close_all`],
+    /// before anything is drained or killed. While set,
+    /// `terminal_session_record_close` refuses a `pty-exit` close, so a
+    /// lifecycle row's state after a runner shutdown is decided HERE — by the
+    /// backend — and never by whether the webview could still service an
+    /// `invoke` (plan `2026-10-28-force-exited-runner-restore-set-follow-ups`,
+    /// Phase 6).
+    ///
+    /// It is never cleared: `close_all` runs only on the way to process exit.
+    /// The known cost is that a PTY the user ends during the teardown window
+    /// also leaves its row `open`, which restores it — the safe direction.
+    shutting_down: AtomicBool,
 }
 
 /// Why [`TerminalManager::adopt_holder_pane`] adopted nothing.
@@ -302,6 +315,7 @@ impl TerminalManager {
             remote_panes: Mutex::new(HashMap::new()),
             coord_bind_observer: OnceLock::new(),
             in_flight: Mutex::new(HashSet::new()),
+            shutting_down: AtomicBool::new(false),
         }
     }
 
@@ -860,6 +874,20 @@ impl TerminalManager {
         page_id.unwrap_or_else(|| super::page_placement::pick_page_for_new_session(self, store))
     }
 
+    /// The grid page the LIVE pane `id` sits on right now, or `None` when no
+    /// such pane is held or its process has exited.
+    ///
+    /// This is the page `GET /terminals` reports, and the one a lifecycle
+    /// record bound to the pane must carry: a rebind or a SessionStart hook
+    /// that keeps a prior record's page instead leaves `/sessions/history`
+    /// naming a page the pane is not on. A dead pane answers `None` so callers
+    /// fall back to what they knew before rather than trusting a corpse.
+    pub fn live_page_of(&self, id: &str) -> Option<String> {
+        self.get(id)
+            .filter(|session| session.is_alive())
+            .map(|session| session.page_id())
+    }
+
     /// Test seam: mark `id` as being built, as `create` does for the length
     /// of a spawn.
     #[cfg(test)]
@@ -1023,12 +1051,23 @@ impl TerminalManager {
     /// pane holding a live `claude`. A bare shell pane still answers
     /// `NoLiveClaude`, as before. See [`crate::terminal::close_authority`].
     ///
+    /// **`exempt`** (plan
+    /// `2026-11-08-wind-down-exempts-proven-strays-from-graceful-exit-child-refusal`):
+    /// the child-gate policy. A direct child of the `claude` it admits — today
+    /// only a recorded stray wait loop re-proven stray at the probe — is not
+    /// counted against the close. It never moves the check above, and every
+    /// caller but the wind-down `finished_close` arm passes
+    /// [`ChildExemptions::none`]. The close-time re-probe below counts nothing
+    /// and takes none.
+    ///
     /// [`CloseAuthority`]: crate::terminal::close_authority::CloseAuthority
+    /// [`ChildExemptions::none`]: crate::terminal::graceful_exit::ChildExemptions::none
     pub async fn graceful_exit(
         self: &std::sync::Arc<Self>,
         id: &str,
         deadline: std::time::Duration,
         authority: Option<crate::terminal::close_authority::CloseAuthority>,
+        exempt: crate::terminal::graceful_exit::ChildExemptions,
     ) -> Result<crate::terminal::graceful_exit::GracefulExitOutcome, String> {
         let session = self
             .get(id)
@@ -1112,6 +1151,7 @@ impl TerminalManager {
                 }
                 },
                 authority,
+                exempt,
             )
             .await)
     }
@@ -1236,6 +1276,11 @@ impl TerminalManager {
         pairs
     }
 
+    /// Whether [`Self::close_all`] has begun. Monotonic: once true it stays true.
+    pub fn is_shutting_down(&self) -> bool {
+        self.shutting_down.load(Ordering::SeqCst)
+    }
+
     /// Close all terminal sessions, under a GLOBAL deadline. Called on app
     /// shutdown.
     ///
@@ -1259,6 +1304,9 @@ impl TerminalManager {
     /// Phase 3).
     #[must_use = "the result says whether the teardown finished; the shutdown marker records it"]
     pub fn close_all(&self, deadline: std::time::Instant) -> bool {
+        // Before anything is drained or killed, so no `pty-exit` caused by
+        // this teardown can reach the lifecycle store as a close.
+        self.shutting_down.store(true, Ordering::SeqCst);
         let sessions: Vec<Arc<TerminalSession>> = {
             match self.sessions.lock() {
                 Ok(mut s) => s.drain().map(|(_, v)| v).collect(),
@@ -1539,6 +1587,38 @@ mod tests {
         assert!(tm.remote_pane("close-all-tab").is_none());
     }
 
+    /// `close_all` latches shutdown on every call, even an empty teardown, and
+    /// the latch is monotonic.
+    #[test]
+    fn close_all_latches_on_any_call_and_never_unlatches() {
+        let tm = TerminalManager::new();
+        assert!(!tm.is_shutting_down());
+        let _ = tm.close_all(std::time::Instant::now());
+        assert!(tm.is_shutting_down(), "even an empty teardown latches");
+        let _ = tm.close_all(std::time::Instant::now());
+        assert!(tm.is_shutting_down(), "monotonic: nothing un-latches it");
+    }
+
+    /// The latch is set BEFORE the sessions map is read: even a `close_all`
+    /// that bails on a poisoned lock, draining and killing nothing, has
+    /// latched. A latch moved below the drain would miss this case.
+    #[test]
+    fn close_all_latches_before_reading_the_sessions_map() {
+        let tm = std::sync::Arc::new(TerminalManager::new());
+        let poisoner = std::sync::Arc::clone(&tm);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.sessions.lock().unwrap();
+            panic!("poison the sessions lock");
+        })
+        .join();
+        assert!(tm.sessions.is_poisoned());
+        assert!(
+            !tm.close_all(std::time::Instant::now()),
+            "poisoned teardown reports unfinished"
+        );
+        assert!(tm.is_shutting_down(), "latched before the poisoned read");
+    }
+
     /// `close_all` reports whether the teardown FINISHED, which `run_teardown`
     /// records as the shutdown marker's `teardown_complete` (plan
     /// `2026-10-28-force-exited-runner-strands-open-sessions-out-of-the-restore-set`,
@@ -1593,7 +1673,12 @@ mod tests {
         tm.insert_for_test("live-claude", pane.session.clone());
 
         let outcome = tm
-            .graceful_exit("live-claude", std::time::Duration::from_secs(60), None)
+            .graceful_exit(
+                "live-claude",
+                std::time::Duration::from_secs(60),
+                None,
+                crate::terminal::graceful_exit::ChildExemptions::none(),
+            )
             .await
             .expect("the pane is registered");
 
@@ -1609,6 +1694,64 @@ mod tests {
             tm.get("live-claude").is_some(),
             "a refused close must leave the pane registered"
         );
+    }
+
+    /// The child-gate policy survives `TerminalManager::graceful_exit` →
+    /// `graceful_exit_then` → the probe (plan
+    /// `2026-11-08-wind-down-exempts-proven-strays-from-graceful-exit-child-refusal`).
+    /// A pane whose `claude` has ONE direct child, presented an authority: with
+    /// that child admitted it gets past the child gate (and, since the scripted
+    /// `claude` never leaves, `/exit` is typed and the exit is stuck, nothing
+    /// killed); with no exemptions it is refused for the child, nothing typed.
+    #[tokio::test(start_paused = true)]
+    async fn graceful_exit_forwards_child_exemptions_to_the_child_gate() {
+        use crate::terminal::close_authority::CloseAuthority;
+        use crate::terminal::graceful_exit::{ChildExemptions, GracefulExitOutcome};
+        use std::sync::Arc;
+
+        const CHILD: u32 = 5151;
+
+        let tm = Arc::new(TerminalManager::new());
+        let admitted = crate::terminal::session::tests::live_claude_pane_with_child(CHILD);
+        tm.insert_for_test("admitted", admitted.session.clone());
+        let outcome = tm
+            .graceful_exit(
+                "admitted",
+                std::time::Duration::from_secs(60),
+                Some(CloseAuthority::for_test()),
+                ChildExemptions::admit_for_test(CHILD),
+            )
+            .await
+            .expect("the pane is registered");
+        assert!(
+            matches!(outcome, GracefulExitOutcome::ExitStuck { .. }),
+            "an admitted only child must pass the child gate: {outcome:?}"
+        );
+        assert_eq!(admitted.typed(), b"/exit\r");
+        assert_eq!(admitted.kills(), 0);
+        assert!(tm.get("admitted").is_some());
+
+        let counted = crate::terminal::session::tests::live_claude_pane_with_child(CHILD);
+        tm.insert_for_test("counted", counted.session.clone());
+        let outcome = tm
+            .graceful_exit(
+                "counted",
+                std::time::Duration::from_secs(60),
+                Some(CloseAuthority::for_test()),
+                ChildExemptions::none(),
+            )
+            .await
+            .expect("the pane is registered");
+        match &outcome {
+            GracefulExitOutcome::Refused { reason, .. } => assert_eq!(
+                reason, "the claude process has 1 child process(es) attached",
+                "no exemption: the child counts and nothing is named"
+            ),
+            other => panic!("expected the child refusal, got {other:?}"),
+        }
+        assert!(counted.typed().is_empty(), "typed into a live claude");
+        assert_eq!(counted.kills(), 0);
+        assert!(tm.get("counted").is_some());
     }
 
     fn account_with(projects: serde_json::Value) -> tempfile::TempDir {

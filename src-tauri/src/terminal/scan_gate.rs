@@ -45,7 +45,8 @@
 //!   is *still frozen on screen* no longer re-fires the hint every 300 s. That
 //!   is the intended reading of the debounce (one hint per appearance), and a
 //!   genuinely new appearance is always followed by a bump of the counter that
-//!   painted it.
+//!   painted it. The one screen it must not skip is a match the debounce has
+//!   just suppressed, which [`ScanGate::forget`] keeps due until it can fire.
 //!
 //! Reading the counter *before* rendering is safe in both directions: a stale
 //! read (the bump lands after the load) costs one deferred scan on the next
@@ -97,6 +98,12 @@ impl ScanGate {
         }
     }
 
+    /// Make `terminal_id` due for a scan on the next tick, whatever its counter
+    /// reads.
+    pub(super) fn forget(&mut self, terminal_id: &str) {
+        self.seen.remove(terminal_id);
+    }
+
     /// Drop watermarks for terminals that have gone away.
     pub(super) fn retain_live(&mut self, live: &HashSet<&String>) {
         self.seen.retain(|tid, _| live.contains(tid));
@@ -112,6 +119,15 @@ mod tests {
         let mut gate = ScanGate::new();
         assert!(gate.should_scan("t1", 0));
         assert!(gate.should_scan("t2", 4096));
+    }
+
+    #[test]
+    fn forgetting_makes_an_unchanged_counter_due_once() {
+        let mut gate = ScanGate::new();
+        assert!(gate.should_scan("t1", 100));
+        gate.forget("t1");
+        assert!(gate.should_scan("t1", 100));
+        assert!(!gate.should_scan("t1", 100));
     }
 
     #[test]

@@ -6,11 +6,13 @@ use axum::{extract::State, routing::post, Json, Router};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::mcp::types::{ApiResponse, ApiState};
 use crate::str_utils::truncate_str_ellipsis;
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
+use qontinui_types::paths::{SiblingCheckoutAbsent, SiblingFallback, WorkspaceRootUnresolved};
+use qontinui_types::refusal::RefusalCode;
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -161,23 +163,10 @@ async fn handle_scan(
     // machine that is not the author's, that scanned a directory which does not
     // exist and answered 200 with an empty surface — a wrong answer wearing a
     // success code. An unresolvable root is UNKNOWN, so say so.
-    let project_root = find_project_root().ok_or_else(|| {
+    let project_root = find_project_root().map_err(|missing| {
         (
             axum::http::StatusCode::UNPROCESSABLE_ENTITY,
-            Json(ApiResponse {
-                success: false,
-                data: None,
-                error: Some(
-                    "Cannot locate the qontinui-runner checkout to scan. Set $QONTINUI_ROOT \
-                     to the directory holding the Qontinui repo checkouts, or run the runner \
-                     from inside a checkout."
-                        .to_string(),
-                ),
-                error_detail: None,
-                hint: None,
-                code: None,
-                suggestions: None,
-            }),
+            Json(scan_root_missing_response(missing)),
         )
     })?;
 
@@ -229,7 +218,7 @@ async fn handle_scan(
 
 // ─── Project root discovery ──────────────────────────────────────────────────
 
-fn find_project_root() -> Option<PathBuf> {
+fn find_project_root() -> Result<PathBuf, ScanRootMissing> {
     // Try walking up from the current exe location
     if let Ok(exe) = std::env::current_exe() {
         let mut cur = exe.clone();
@@ -238,7 +227,7 @@ fn find_project_root() -> Option<PathBuf> {
                 break;
             }
             if cur.join("src-tauri").join("Cargo.toml").exists() && cur.join("src").exists() {
-                return Some(cur);
+                return Ok(cur);
             }
         }
     }
@@ -247,7 +236,7 @@ fn find_project_root() -> Option<PathBuf> {
         let mut cur = cwd;
         for _ in 0..6 {
             if cur.join("src-tauri").join("Cargo.toml").exists() && cur.join("src").exists() {
-                return Some(cur);
+                return Ok(cur);
             }
             if !cur.pop() {
                 break;
@@ -261,14 +250,69 @@ fn find_project_root() -> Option<PathBuf> {
     // machine layout, baked into a shipped route. `runner_workspace_root` answers
     // the same question portably: `$QONTINUI_ROOT`, then `$QONTINUI_WORKSPACE_ROOT`,
     // then the `paths.workspace_root` setting, then this executable's ancestry.
-    // Discovery surface, so it degrades to `None` and the caller reports an
-    // actionable failure rather than scanning a fabricated directory.
-    let root = crate::workspace_paths::runner_workspace_root().into_root()?;
+    // An unresolved root is a typed miss the caller refuses with, never a
+    // fabricated directory to scan. The full probe order is logged here because
+    // the refusal sentence deliberately omits it.
+    let root = crate::workspace_paths::runner_workspace_root()
+        .require()
+        .map_err(|unresolved| {
+            warn!(
+                "api-surface: workspace root unresolved — {}",
+                unresolved.detail()
+            );
+            ScanRootMissing::RootUnresolved(unresolved)
+        })?;
     let candidate = root.join("qontinui-runner");
     if candidate.join("src-tauri").join("Cargo.toml").exists() {
-        return Some(candidate);
+        return Ok(candidate);
     }
-    None
+    Err(ScanRootMissing::CheckoutAbsent)
+}
+
+/// Why the scan route found no runner checkout to read. The two cases take
+/// different refusals because they have different next actions.
+enum ScanRootMissing {
+    /// No workspace root resolved, so the last-resort lookup had nowhere to
+    /// look. The shared sentence names the "Workspace root" setting, which this
+    /// in-process route does read.
+    RootUnresolved(WorkspaceRootUnresolved),
+    /// A workspace root resolved but holds no `qontinui-runner` checkout. The
+    /// route scans the runner's own source and an installed runner ships none,
+    /// so this is the unsupported arm: no embedded copy can answer.
+    CheckoutAbsent,
+}
+
+/// Why this route needs a checkout, and where it looks for one. It travels as
+/// the response's `hint` beside either refusal, so an installed runner (which
+/// usually takes the unresolved-root arm) learns that configuring a root alone
+/// will not make the scan work.
+const RUNNER_CHECKOUT_HINT: &str =
+    "This scan reads the runner's own source code, which only a development \
+     checkout has. On a development machine, set the \"Workspace root\" setting \
+     to the folder that holds the qontinui-runner checkout, or start the runner \
+     from inside that checkout.";
+
+/// The 422 body for a scan with no checkout to read: the shared refusal
+/// sentence, its stable code, and [`RUNNER_CHECKOUT_HINT`].
+fn scan_root_missing_response(missing: ScanRootMissing) -> ApiResponse<()> {
+    let (error, code) = match missing {
+        ScanRootMissing::RootUnresolved(unresolved) => {
+            (unresolved.to_string(), RefusalCode::WorkspaceRootUnresolved)
+        }
+        ScanRootMissing::CheckoutAbsent => (
+            SiblingCheckoutAbsent::new("qontinui-runner", SiblingFallback::Unsupported).to_string(),
+            RefusalCode::SiblingCheckoutAbsent,
+        ),
+    };
+    ApiResponse {
+        success: false,
+        data: None,
+        error: Some(error),
+        error_detail: None,
+        hint: Some(serde_json::Value::String(RUNNER_CHECKOUT_HINT.to_string())),
+        code: Some(code.as_str().to_string()),
+        suggestions: None,
+    }
 }
 
 // ─── Core scanner ────────────────────────────────────────────────────────────
@@ -1296,4 +1340,57 @@ fn extract_quoted_string(s: &str) -> Option<String> {
     let start = s.find(quote)? + 1;
     let end = s[start..].find(quote)? + start;
     Some(s[start..end].to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{scan_root_missing_response, ScanRootMissing, RUNNER_CHECKOUT_HINT};
+    use qontinui_types::paths::{RejectedRoot, RootRejection, RootSource, WorkspaceRootUnresolved};
+
+    fn hint_of(body: &crate::mcp::types::ApiResponse<()>) -> String {
+        body.hint
+            .as_ref()
+            .and_then(|h| h.as_str())
+            .expect("a string hint")
+            .to_owned()
+    }
+
+    /// A runner whose workspace root resolved without a runner checkout under
+    /// it: no source to scan, so the capability is unsupported.
+    #[test]
+    fn a_root_without_a_runner_checkout_refuses_as_unsupported() {
+        let body = scan_root_missing_response(ScanRootMissing::CheckoutAbsent);
+        assert!(!body.success);
+        assert_eq!(body.code.as_deref(), Some("sibling_checkout_absent"));
+        let error = body.error.clone().expect("an error sentence");
+        assert!(error.contains("(qontinui-runner)"), "{error}");
+        assert!(
+            error.contains("not supported in this installation"),
+            "{error}"
+        );
+        assert_eq!(hint_of(&body), RUNNER_CHECKOUT_HINT);
+        for said in [error.as_str(), RUNNER_CHECKOUT_HINT] {
+            assert!(!said.contains("QONTINUI_ROOT"), "{said}");
+        }
+    }
+
+    /// With no root at all the refusal is the shared workspace-root sentence,
+    /// whose next action (the "Workspace root" setting) this route does read.
+    /// This is the arm an unconfigured installed runner usually takes, which is
+    /// why the hint, not the sentence, carries the reason a checkout is needed.
+    #[test]
+    fn an_unresolved_root_refuses_with_the_shared_workspace_root_sentence() {
+        let unresolved = WorkspaceRootUnresolved {
+            rejected: RejectedRoot {
+                source: RootSource::Probes,
+                reason: RootRejection::NothingConfigured,
+            },
+        };
+        let body = scan_root_missing_response(ScanRootMissing::RootUnresolved(unresolved));
+        assert!(!body.success);
+        assert_eq!(body.code.as_deref(), Some("workspace_root_unresolved"));
+        assert_eq!(body.error.as_deref(), Some(unresolved.to_string().as_str()));
+        assert_eq!(hint_of(&body), RUNNER_CHECKOUT_HINT);
+        assert!(!unresolved.to_string().contains("QONTINUI_ROOT"));
+    }
 }

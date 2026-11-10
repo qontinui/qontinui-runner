@@ -47,6 +47,9 @@
 //! hold + tab dead past the orphan grace ────────────────────> release (a peer
 //!                                                              can fill it)
 //! hold + slot index >= a coord-lowered count ───────────────> release, re-walk
+//! no hold + every slot held for the whole displacement
+//!   window + our live unslotted tab ────────────────────────> no nudges, then
+//!                                                              retire at idle
 //! ```
 //!
 //! ## The hold tracks the tab
@@ -281,6 +284,144 @@ pub fn walk_verdict(outcomes: &[(u32, AcquireOutcome)]) -> WalkVerdict {
     WalkVerdict::AllHeld
 }
 
+// -- Displacement: a live tab whose runner holds no slot (pathology B) --------
+
+/// Minimum consecutive authoritative `held` walks before a displacement is
+/// confirmed. Conservative during rollout: an OLD runner may still renew a
+/// slot over a dead tab, and only the window below protects against that.
+pub const DISPLACED_MIN_HELD_TICKS: u32 = 6;
+
+/// How long every slot must have answered `held` before an unslotted live tab
+/// is retired: `max(2 × TTL, orphan_grace + TTL)` — 420 s at the default
+/// policy.
+///
+/// * `≥ 2 × TTL`: a key answered `held` for longer than its PX must have been
+///   written (renewed or re-acquired) inside the window, so the holder is a
+///   live supervisor, not the leftover of one that crashed.
+/// * `> orphan_grace + TTL`: a holder sitting over a DEAD tab releases at its
+///   orphan grace ([`hold_decision`]), and even a lost release lapses one TTL
+///   later. So a holder whose tab is dead has always freed the slot before a
+///   peer could confirm — the peer adopts it with its existing tab instead of
+///   retiring the only live shepherd in the tenant.
+pub fn displacement_confirm_ms(spawn_grace_secs: u64) -> i64 {
+    let ttl_ms = LEASE_TTL_SECS * 1000;
+    (2 * ttl_ms).max(orphan_grace_ms(spawn_grace_secs).saturating_add(ttl_ms))
+}
+
+/// The displacement memo for one agent: since when, and over how many walks,
+/// every slot has answered `held` while our tab was live. In memory only,
+/// like the held-slot memo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Displacement {
+    pub since_ms: i64,
+    pub held_ticks: u32,
+}
+
+/// The displacement transition. A memo exists only while the agent is
+/// running under a COORD count, its tab is `Live`, and this tick's walk was
+/// `AllHeld`. Every other observation — an acquire, an unavailable coord, a
+/// missing identity, a tab that is not live, a local-registry count, a
+/// stopped agent, a tick that did not walk — resets it. That is the fail-safe
+/// direction: an outage of any length restores the nudges and can never build
+/// toward a retirement.
+pub fn next_displacement(
+    prev: Option<Displacement>,
+    walk: WalkVerdict,
+    obs: &LeaseTickObs,
+    running: bool,
+) -> Option<Displacement> {
+    let displaced = running
+        && obs.source == DesiredSource::Coord
+        && obs.liveness == Liveness::Live
+        && walk == WalkVerdict::AllHeld;
+    if !displaced {
+        return None;
+    }
+    Some(match prev {
+        Some(d) => Displacement {
+            since_ms: d.since_ms,
+            held_ticks: d.held_ticks.saturating_add(1),
+        },
+        None => Displacement {
+            since_ms: obs.now_ms,
+            held_ticks: 1,
+        },
+    })
+}
+
+/// How displaced an agent is this tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Displaced {
+    /// No memo: status quo, nudges pass.
+    NotDisplaced,
+    /// Coord says every slot is held by someone else, not yet for long enough
+    /// to act on. No new cycle is started on the tab.
+    Suspected,
+    /// Held by others for the whole [`displacement_confirm_ms`] window AND at
+    /// least [`DISPLACED_MIN_HELD_TICKS`] walks: retire the tab at idle.
+    Confirmed,
+}
+
+impl Displaced {
+    /// Stable lowercase label for logs and the status snapshot.
+    pub fn label(self) -> &'static str {
+        match self {
+            Displaced::NotDisplaced => "not_displaced",
+            Displaced::Suspected => "suspected",
+            Displaced::Confirmed => "confirmed",
+        }
+    }
+}
+
+/// The displacement verdict. `Confirmed` needs BOTH the window and the tick
+/// count; a clock that runs backwards never confirms.
+pub fn displaced_verdict(
+    d: Option<&Displacement>,
+    now_ms: i64,
+    spawn_grace_secs: u64,
+) -> Displaced {
+    match d {
+        None => Displaced::NotDisplaced,
+        Some(d)
+            if now_ms.saturating_sub(d.since_ms) >= displacement_confirm_ms(spawn_grace_secs)
+                && d.held_ticks >= DISPLACED_MIN_HELD_TICKS =>
+        {
+            Displaced::Confirmed
+        }
+        Some(_) => Displaced::Suspected,
+    }
+}
+
+/// The displacement rewrite of one tick's action, applied LAST (after
+/// [`gate_action`], the drain rewrite and the agent-registry rewrite), so
+/// nothing downstream can turn a `Retire` back into a `Nudge`.
+///
+/// This — not [`gate_action`] — is where `Nudge` is gated: it receives coord's
+/// AUTHORITATIVE verdict, where `gate_action` sees only a bool that cannot
+/// tell "coord said held" from "coord was unreachable".
+///
+/// * `NotDisplaced` → the action, unchanged.
+/// * `Suspected` → `Nudge` becomes `None` (a turn already in progress runs to
+///   its end; no new one starts); everything else is unchanged.
+/// * `Confirmed` → `Retire` on a quiescent tick (turn complete, past the spawn
+///   grace), `None` otherwise — never mid-turn.
+pub fn displacement_action(action: Action, displaced: Displaced, quiescent: bool) -> Action {
+    match displaced {
+        Displaced::NotDisplaced => action,
+        Displaced::Suspected => match action {
+            Action::Nudge => Action::None,
+            other => other,
+        },
+        Displaced::Confirmed => {
+            if quiescent {
+                Action::Retire
+            } else {
+                Action::None
+            }
+        }
+    }
+}
+
 /// What the lease reconcile reports to the supervisor for one tick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LeaseTick {
@@ -351,7 +492,9 @@ pub fn candidate_slots(slots: u32, held: Option<u32>) -> Vec<u32> {
 ///   session or, worse, close a shepherd and fail to bring it back.
 /// * [`Action::Nudge`] / [`Action::None`] — drive an already-licensed tab and
 ///   create nothing. Ungated, so a coord blip mid-cycle can't wedge a live
-///   shepherd's cadence.
+///   shepherd's cadence. The AUTHORITATIVE nudge gate — coord said every slot
+///   is held by someone else — is [`displacement_action`], not this.
+/// * [`Action::Retire`] — closes a tab; creates nothing. Passes through.
 pub fn gate_action(action: Action, holds_lease: bool) -> Action {
     if holds_lease {
         return action;
@@ -483,7 +626,8 @@ mod tests {
     #[test]
     fn non_creating_actions_are_never_gated() {
         // A live shepherd's cadence must not wedge just because a lease call
-        // failed this tick.
+        // failed this tick. (The authoritative-only nudge gate is
+        // `displacement_action`.)
         assert_eq!(gate_action(Action::Nudge, false), Action::Nudge);
         assert_eq!(gate_action(Action::None, false), Action::None);
     }
@@ -982,8 +1126,10 @@ mod tests {
         failures: u32,
         next_spawn_at: i64,
         last_orphan_release: Option<i64>,
+        displacement: Option<Displacement>,
         spawns: u32,
         nudges: u32,
+        retires: u32,
         releases: Vec<(i64, ReleaseReason)>,
     }
 
@@ -1000,8 +1146,10 @@ mod tests {
                 failures: 0,
                 next_spawn_at: 0,
                 last_orphan_release: None,
+                displacement: None,
                 spawns: 0,
                 nudges: 0,
+                retires: 0,
                 releases: Vec::new(),
             }
         }
@@ -1029,12 +1177,14 @@ mod tests {
     struct SimTick {
         action: Action,
         walk: WalkVerdict,
+        displaced: Displaced,
     }
 
     /// One supervisor tick over the PURE core, composed in the order the real
     /// supervisor composes it: liveness first; `hold_decision`, then the
-    /// heartbeat; `acquire_permitted`, then the walk and its verdict; then
-    /// `decide` → `gate_action`; then the action is applied to the tab.
+    /// heartbeat; `acquire_permitted`, then the walk and its verdict;
+    /// `next_displacement`; then `decide` → `gate_action` →
+    /// `displacement_action`; then the action is applied to the tab.
     fn sim_tick(
         coord: &mut SimCoord,
         r: &mut SimRunner,
@@ -1116,6 +1266,10 @@ mod tests {
             }
         }
 
+        // -- Displacement. --
+        r.displacement = next_displacement(r.displacement, walk, &o, true);
+        let displaced = displaced_verdict(r.displacement.as_ref(), now, GRACE_SECS);
+
         // -- Decide → gate. --
         let input = policy::TickInput {
             enabled: true,
@@ -1131,13 +1285,12 @@ mod tests {
             relaunch_every_cycles: 1_000,
         };
         let action = gate_action(policy::decide(&input), holds);
-        if !r.authz && matches!(action, Action::Spawn(_) | Action::Relaunch(_)) {
-            // The supervisor's Phase 4c rewrite.
-            return SimTick {
-                action: Action::None,
-                walk,
-            };
-        }
+        let action = if !r.authz && matches!(action, Action::Spawn(_) | Action::Relaunch(_)) {
+            Action::None // the supervisor's Phase 4c rewrite
+        } else {
+            action
+        };
+        let action = displacement_action(action, displaced, r.idle && grace_elapsed);
 
         // -- Act. --
         match action {
@@ -1153,9 +1306,18 @@ mod tests {
                 }
             },
             Action::Nudge => r.nudges += 1,
+            Action::Retire => {
+                r.tab = Liveness::Dead;
+                r.displacement = None;
+                r.retires += 1;
+            }
             Action::None | Action::Relaunch(_) => {}
         }
-        SimTick { action, walk }
+        SimTick {
+            action,
+            walk,
+            displaced,
+        }
     }
 
     fn slotted_live_tabs(runners: &[&SimRunner]) -> usize {
@@ -1353,5 +1515,420 @@ mod tests {
             2 * TICK_MS,
         );
         assert!(r2.releases.is_empty() && r2.held.is_some());
+    }
+
+    // -- Displacement (pathology B) ------------------------------------------
+
+    const ALL_ACTIONS: [Action; 7] = [
+        Action::None,
+        Action::Spawn(SpawnReason::FirstSpawn),
+        Action::Spawn(SpawnReason::DeathRespawn),
+        Action::Nudge,
+        Action::Relaunch(RelaunchReason::ContextLow),
+        Action::Relaunch(RelaunchReason::CycleBudget),
+        Action::Retire,
+    ];
+
+    fn window() -> i64 {
+        displacement_confirm_ms(GRACE_SECS)
+    }
+
+    #[test]
+    fn the_confirmation_window_outlasts_two_ttls_and_a_dead_tab_holders_grace() {
+        assert_eq!(window(), 420_000);
+        assert!(window() >= 2 * TTL_MS);
+        assert!(window() >= orphan_grace_ms(GRACE_SECS) + TTL_MS);
+        assert!(DISPLACED_MIN_HELD_TICKS >= 6);
+    }
+
+    #[test]
+    fn displacement_starts_only_on_all_held_with_a_live_tab_under_a_coord_count() {
+        let o = obs(7_000, Liveness::Live);
+        let prev = Some(Displacement {
+            since_ms: 0,
+            held_ticks: 3,
+        });
+        assert_eq!(
+            next_displacement(None, WalkVerdict::AllHeld, &o, true),
+            Some(Displacement {
+                since_ms: 7_000,
+                held_ticks: 1
+            })
+        );
+        assert_eq!(
+            next_displacement(prev, WalkVerdict::AllHeld, &o, true),
+            Some(Displacement {
+                since_ms: 0,
+                held_ticks: 4
+            })
+        );
+        // Each axis perturbed alone resets the memo.
+        for walk in [
+            WalkVerdict::Acquired { slot: 0 },
+            WalkVerdict::Unavailable,
+            WalkVerdict::NotWalked,
+        ] {
+            assert_eq!(next_displacement(prev, walk, &o, true), None, "{walk:?}");
+        }
+        for l in [Liveness::PendingRestore, Liveness::Dead, Liveness::Exited] {
+            let o = obs(7_000, l);
+            assert_eq!(
+                next_displacement(prev, WalkVerdict::AllHeld, &o, true),
+                None,
+                "{l:?}"
+            );
+        }
+        let local = LeaseTickObs {
+            source: DesiredSource::LocalRegistry,
+            ..o
+        };
+        assert_eq!(
+            next_displacement(prev, WalkVerdict::AllHeld, &local, true),
+            None
+        );
+        assert_eq!(
+            next_displacement(prev, WalkVerdict::AllHeld, &o, false),
+            None
+        );
+    }
+
+    #[test]
+    fn an_unavailable_tick_resets_a_displacement_in_progress() {
+        let almost = Some(Displacement {
+            since_ms: 0,
+            held_ticks: DISPLACED_MIN_HELD_TICKS - 1,
+        });
+        let now = window() - 1;
+        let o = obs(now, Liveness::Live);
+        let d = next_displacement(almost, WalkVerdict::Unavailable, &o, true);
+        assert_eq!(d, None);
+        let o = obs(now + TICK_MS, Liveness::Live);
+        assert_eq!(
+            next_displacement(d, WalkVerdict::AllHeld, &o, true),
+            Some(Displacement {
+                since_ms: now + TICK_MS,
+                held_ticks: 1
+            }),
+            "the window restarts from zero"
+        );
+    }
+
+    #[test]
+    fn confirmation_needs_both_the_window_and_k_ticks() {
+        let w = window();
+        let d = |held_ticks| Displacement {
+            since_ms: 0,
+            held_ticks,
+        };
+        let k = DISPLACED_MIN_HELD_TICKS;
+        assert_eq!(
+            displaced_verdict(None, w, GRACE_SECS),
+            Displaced::NotDisplaced
+        );
+        assert_eq!(
+            displaced_verdict(Some(&d(k - 1)), w, GRACE_SECS),
+            Displaced::Suspected,
+            "window elapsed, too few ticks"
+        );
+        assert_eq!(
+            displaced_verdict(Some(&d(k)), w - 1, GRACE_SECS),
+            Displaced::Suspected,
+            "enough ticks, inside the window"
+        );
+        assert_eq!(
+            displaced_verdict(Some(&d(k)), w, GRACE_SECS),
+            Displaced::Confirmed
+        );
+        // A clock that runs backwards never confirms.
+        let future = Displacement {
+            since_ms: 10 * w,
+            held_ticks: 1_000,
+        };
+        assert_eq!(
+            displaced_verdict(Some(&future), 0, GRACE_SECS),
+            Displaced::Suspected
+        );
+    }
+
+    #[test]
+    fn displacement_action_rewrites() {
+        for a in ALL_ACTIONS {
+            assert_eq!(displacement_action(a, Displaced::NotDisplaced, true), a);
+            assert_eq!(displacement_action(a, Displaced::NotDisplaced, false), a);
+            let suspected = displacement_action(a, Displaced::Suspected, true);
+            if a == Action::Nudge {
+                assert_eq!(suspected, Action::None, "no new cycle on an unslotted tab");
+            } else {
+                assert_eq!(suspected, a);
+            }
+            assert_eq!(
+                displacement_action(a, Displaced::Confirmed, true),
+                Action::Retire
+            );
+            assert_eq!(
+                displacement_action(a, Displaced::Confirmed, false),
+                Action::None,
+                "never mid-turn"
+            );
+        }
+    }
+
+    // -- Displacement fleet simulations ---------------------------------------
+
+    fn live_tabs(runners: &[&SimRunner]) -> usize {
+        runners.iter().filter(|r| r.live_tab()).count()
+    }
+
+    /// S2: an unslotted live tab stops being nudged on its first authoritative
+    /// `held` walk, and is retired at the first quiescent tick once the window
+    /// and the tick count are both met. A busy stretch of N ticks across the
+    /// confirmation point delays the retire by exactly N ticks.
+    #[test]
+    fn an_unslotted_live_tab_retires_after_k_held_ticks_over_the_window() {
+        fn run(busy_ticks: i64) -> (i64, SimRunner, SimRunner) {
+            let mut coord = SimCoord::new();
+            coord.owners.insert(key(0), ("r0".into(), TTL_MS));
+            let mut r0 = SimRunner::new("r0", Liveness::Live, SpawnBehavior::Ok).holding(0, 0);
+            let mut r1 = SimRunner::new("r1", Liveness::Live, SpawnBehavior::Ok);
+            let mut now = 0;
+            loop {
+                r1.idle = !(window()..window() + busy_ticks * TICK_MS).contains(&now);
+                let t0 = sim_tick(&mut coord, &mut r0, 1, DesiredSource::Coord, now);
+                let t1 = sim_tick(&mut coord, &mut r1, 1, DesiredSource::Coord, now);
+                assert_eq!(
+                    t0.action,
+                    Action::Nudge,
+                    "the slotted shepherd is untouched"
+                );
+                if now == 0 {
+                    assert_eq!(t1.displaced, Displaced::Suspected, "from the first tick");
+                }
+                if t1.action == Action::Retire {
+                    return (now, r0, r1);
+                }
+                assert_eq!(t1.action, Action::None, "never nudged while displaced");
+                now += TICK_MS;
+                assert!(now < 10 * window(), "never retired");
+            }
+        }
+        let (at, r0, r1) = run(0);
+        assert_eq!(at, window(), "retired at the first tick past the window");
+        assert_eq!(r1.nudges, 0);
+        assert_eq!(live_tabs(&[&r0, &r1]), 1);
+        assert!(r0.live_tab() && r0.held.is_some());
+        let (busy_at, _, _) = run(4);
+        assert_eq!(
+            busy_at,
+            at + 4 * TICK_MS,
+            "a busy tab is never closed mid-turn"
+        );
+    }
+
+    /// S3: a coord outage never builds toward a retire, and restarts the
+    /// confirmation window from zero when it ends.
+    #[test]
+    fn a_coord_outage_never_releases_and_never_retires() {
+        let mut coord = SimCoord::new();
+        coord.owners.insert(key(0), ("r0".into(), TTL_MS));
+        let mut r0 = SimRunner::new("r0", Liveness::Live, SpawnBehavior::Ok).holding(0, 0);
+        let mut r1 = SimRunner::new("r1", Liveness::Live, SpawnBehavior::Ok);
+        let mut r2 = SimRunner::new("r2", Liveness::Dead, SpawnBehavior::Ok);
+        let mut tick = |coord: &mut SimCoord, now| {
+            sim_tick(coord, &mut r0, 1, DesiredSource::Coord, now);
+            let t1 = sim_tick(coord, &mut r1, 1, DesiredSource::Coord, now);
+            sim_tick(coord, &mut r2, 1, DesiredSource::Coord, now);
+            t1
+        };
+        // A displacement builds to one tick short of confirmation…
+        let mut now = 0;
+        while now < window() - TICK_MS {
+            assert_eq!(tick(&mut coord, now).displaced, Displaced::Suspected);
+            now += TICK_MS;
+        }
+        // …then coord goes dark for ten TTLs.
+        coord.outage = true;
+        let outage_end = now + 10 * TTL_MS;
+        while now < outage_end {
+            let t1 = tick(&mut coord, now);
+            assert_eq!(t1.displaced, Displaced::NotDisplaced, "status quo");
+            assert_eq!(t1.action, Action::Nudge, "nudges pass during an outage");
+            now += TICK_MS;
+        }
+        coord.outage = false;
+        // The window restarts from zero at the first authoritative tick.
+        let restart = now;
+        loop {
+            let t1 = tick(&mut coord, now);
+            if t1.action == Action::Retire {
+                break;
+            }
+            assert_eq!(t1.displaced, Displaced::Suspected, "t={now}");
+            now += TICK_MS;
+        }
+        assert_eq!(now, restart + window());
+        assert!(r0.held.is_some() && r0.releases.is_empty());
+        assert_eq!(r0.spawns + r1.spawns + r2.spawns, 0, "nobody spawned");
+    }
+
+    /// S4: a runner restarted within the TTL renews its own slot and adopts
+    /// its restored tab: no displacement, no retire, no spawn.
+    #[test]
+    fn a_restart_within_the_ttl_keeps_the_slot_and_the_tab() {
+        let mut coord = SimCoord::new();
+        let mut r0 = SimRunner::new("r0", Liveness::Live, SpawnBehavior::Ok);
+        let mut r1 = SimRunner::new("r1", Liveness::Dead, SpawnBehavior::Ok);
+        let t = sim_tick(&mut coord, &mut r0, 1, DesiredSource::Coord, 0);
+        assert_eq!(t.walk, WalkVerdict::Acquired { slot: 0 });
+        // Restart: the memos are gone; boot settle (45 s) + 30 s of restore.
+        r0.held = None;
+        r0.displacement = None;
+        let back = 45_000 + 30_000;
+        let mut now = TICK_MS;
+        while now < back {
+            sim_tick(&mut coord, &mut r1, 1, DesiredSource::Coord, now);
+            now += TICK_MS;
+        }
+        let t = sim_tick(&mut coord, &mut r0, 1, DesiredSource::Coord, now);
+        assert_eq!(t.walk, WalkVerdict::Acquired { slot: 0 }, "renewed");
+        for _ in 0..200 {
+            now += TICK_MS;
+            let t0 = sim_tick(&mut coord, &mut r0, 1, DesiredSource::Coord, now);
+            sim_tick(&mut coord, &mut r1, 1, DesiredSource::Coord, now);
+            assert_eq!(t0.displaced, Displaced::NotDisplaced);
+            assert_ne!(t0.action, Action::Retire);
+        }
+        assert_eq!(r0.spawns + r1.spawns, 0, "the restored tab was adopted");
+        assert_eq!(r0.retires, 0);
+    }
+
+    /// S5: a runner dark for longer than the TTL loses its slot to a peer that
+    /// spawns; when it returns with its restored tab, that tab is retired
+    /// after the window. Never more than two live tabs, and exactly one at
+    /// the end.
+    #[test]
+    fn a_restart_beyond_the_ttl_ends_with_exactly_one_shepherd() {
+        let mut coord = SimCoord::new();
+        let mut r0 = SimRunner::new("r0", Liveness::Live, SpawnBehavior::Ok);
+        let mut r1 = SimRunner::new("r1", Liveness::Dead, SpawnBehavior::Ok);
+        sim_tick(&mut coord, &mut r0, 1, DesiredSource::Coord, 0);
+        sim_tick(&mut coord, &mut r1, 1, DesiredSource::Coord, 0);
+        r0.held = None;
+        r0.displacement = None;
+        let back = TTL_MS + 30_000;
+        let mut now = TICK_MS;
+        let mut returned_at = None;
+        let mut retired_at = None;
+        while now < back + 3 * window() {
+            if now >= back {
+                let t0 = sim_tick(&mut coord, &mut r0, 1, DesiredSource::Coord, now);
+                returned_at.get_or_insert(now);
+                if t0.action == Action::Retire {
+                    retired_at = Some(now);
+                }
+            }
+            sim_tick(&mut coord, &mut r1, 1, DesiredSource::Coord, now);
+            assert!(live_tabs(&[&r0, &r1]) <= 2, "t={now}");
+            now += TICK_MS;
+        }
+        assert_eq!(r1.spawns, 1, "the peer filled the lapsed slot");
+        assert_eq!(retired_at, Some(returned_at.unwrap() + window()));
+        assert_eq!(live_tabs(&[&r0, &r1]), 1);
+        assert_eq!(slotted_live_tabs(&[&r0, &r1]), 1);
+        assert_eq!(
+            coord.owners.values().filter(|(_, exp)| *exp > now).count(),
+            1,
+            "exactly one slot held"
+        );
+    }
+
+    /// S6: the 2026-11-05 fleet — three live tabs, count 1, one slotted.
+    #[test]
+    fn the_2026_11_05_fleet_converges_to_one() {
+        let mut coord = SimCoord::new();
+        coord.owners.insert(key(0), ("r0".into(), TTL_MS));
+        let mut r0 = SimRunner::new("r0", Liveness::Live, SpawnBehavior::Ok).holding(0, 0);
+        let mut r1 = SimRunner::new("r1", Liveness::Live, SpawnBehavior::Ok);
+        let mut r2 = SimRunner::new("r2", Liveness::Live, SpawnBehavior::Ok);
+        let mut now = 0;
+        while now <= 2 * window() {
+            let t0 = sim_tick(&mut coord, &mut r0, 1, DesiredSource::Coord, now);
+            assert_eq!(
+                t0.action,
+                Action::Nudge,
+                "the slotted shepherd is untouched"
+            );
+            sim_tick(&mut coord, &mut r1, 1, DesiredSource::Coord, now);
+            sim_tick(&mut coord, &mut r2, 1, DesiredSource::Coord, now);
+            now += TICK_MS;
+        }
+        assert_eq!((r1.retires, r2.retires), (1, 1));
+        assert_eq!(live_tabs(&[&r0, &r1, &r2]), 1);
+        assert!(r0.live_tab() && r0.held.is_some() && r0.retires == 0);
+        assert_eq!(r0.spawns + r1.spawns + r2.spawns, 0);
+    }
+
+    /// S7: the 2026-11-03 fleet — the holder's tab is dead and its spawns
+    /// fail; a peer runs a live unslotted tab. The peer is held quiet until the
+    /// holder's grace passes, then ADOPTS the freed slot with its existing tab:
+    /// no new spawn, no retire, nudges resume.
+    #[test]
+    fn the_2026_11_03_fleet_converges_without_a_new_spawn() {
+        let mut coord = SimCoord::new();
+        coord.owners.insert(key(0), ("r0".into(), TTL_MS));
+        let mut r0 = SimRunner::new("r0", Liveness::Dead, SpawnBehavior::Fails).holding(0, 0);
+        let mut r1 = SimRunner::new("r1", Liveness::Live, SpawnBehavior::Ok);
+        let grace = orphan_grace_ms(GRACE_SECS);
+        let mut now = 0;
+        while now < grace {
+            sim_tick(&mut coord, &mut r0, 1, DesiredSource::Coord, now);
+            let t1 = sim_tick(&mut coord, &mut r1, 1, DesiredSource::Coord, now);
+            assert_eq!(t1.displaced, Displaced::Suspected, "t={now}");
+            assert_eq!(t1.action, Action::None, "no nudges while displaced");
+            now += TICK_MS;
+        }
+        sim_tick(&mut coord, &mut r0, 1, DesiredSource::Coord, now);
+        assert_eq!(r0.releases, vec![(grace, ReleaseReason::TabNotAlive)]);
+        let t1 = sim_tick(&mut coord, &mut r1, 1, DesiredSource::Coord, now);
+        assert_eq!(t1.walk, WalkVerdict::Acquired { slot: 0 }, "adopted");
+        assert_eq!(t1.displaced, Displaced::NotDisplaced);
+        assert_eq!(t1.action, Action::Nudge, "nudges resume");
+        for _ in 0..200 {
+            now += TICK_MS;
+            sim_tick(&mut coord, &mut r0, 1, DesiredSource::Coord, now);
+            sim_tick(&mut coord, &mut r1, 1, DesiredSource::Coord, now);
+        }
+        assert_eq!(r1.spawns + r1.retires, 0, "kept its existing tab");
+        assert_eq!(slotted_live_tabs(&[&r0, &r1]), 1);
+        assert!(r1.held.is_some() && r0.held.is_none());
+    }
+
+    /// S11: coord lowers the count 2 → 1. The holder of slot 1 releases it,
+    /// finds slot 0 held, and its tab is retired after the window.
+    #[test]
+    fn lowering_the_count_converges() {
+        let mut coord = SimCoord::new();
+        coord.owners.insert(key(0), ("r0".into(), TTL_MS));
+        coord.owners.insert(key(1), ("r1".into(), TTL_MS));
+        let mut r0 = SimRunner::new("r0", Liveness::Live, SpawnBehavior::Ok).holding(0, 0);
+        let mut r1 = SimRunner::new("r1", Liveness::Live, SpawnBehavior::Ok).holding(1, 0);
+        sim_tick(&mut coord, &mut r0, 2, DesiredSource::Coord, 0);
+        sim_tick(&mut coord, &mut r1, 2, DesiredSource::Coord, 0);
+        let mut now = TICK_MS;
+        let mut retired_at = None;
+        while now < 3 * window() {
+            sim_tick(&mut coord, &mut r0, 1, DesiredSource::Coord, now);
+            let t1 = sim_tick(&mut coord, &mut r1, 1, DesiredSource::Coord, now);
+            if now == TICK_MS {
+                assert_eq!(t1.displaced, Displaced::Suspected);
+            }
+            if t1.action == Action::Retire {
+                retired_at = Some(now);
+            }
+            now += TICK_MS;
+        }
+        assert_eq!(r1.releases, vec![(TICK_MS, ReleaseReason::OutOfRange)]);
+        assert_eq!(retired_at, Some(TICK_MS + window()));
+        assert_eq!(live_tabs(&[&r0, &r1]), 1);
+        assert_eq!(slotted_live_tabs(&[&r0, &r1]), 1);
     }
 }

@@ -303,7 +303,7 @@ async fn a_post_allocate_unwind_retires_coords_rows_and_keeps_its_error() {
         (ALLOCATE, vec![shared_branch_answer()]),
         (
             DONE,
-            vec![(200, r#"{"matched":1,"status":"abandoned"}"#.to_string())],
+            vec![(200, r#"{"matched":1,"trigger_signal":"agent_done","statuses":["allocated"],"abandoned":1,"abandon_refused":null,"note":"retired"}"#.to_string())],
         ),
     ])
     .await;
@@ -318,7 +318,6 @@ async fn a_post_allocate_unwind_retires_coords_rows_and_keeps_its_error() {
         coord.bodies(DONE),
         vec![serde_json::json!({
             "worktree_path": "agent-worktrees/agent-sb/qontinui-runner",
-            "branch": "agent/x/shared",
             "abandoned": true,
         })]
     );
@@ -342,7 +341,7 @@ async fn a_post_allocate_claim_conflict_retires() {
         ),
         (
             DONE,
-            vec![(200, r#"{"matched":1,"status":"abandoned"}"#.to_string())],
+            vec![(200, r#"{"matched":1,"trigger_signal":"agent_done","statuses":["allocated"],"abandoned":1,"abandon_refused":null,"note":"retired"}"#.to_string())],
         ),
     ])
     .await;
@@ -362,7 +361,7 @@ async fn a_refused_or_failing_retire_never_changes_the_returned_error() {
     for done in [
         (
             200,
-            r#"{"status":"allocated","abandon_refused":"census_dirty"}"#.to_string(),
+            r#"{"matched":1,"trigger_signal":"agent_done","statuses":["allocated"],"abandoned":0,"abandon_refused":"retire_shortfall: 0 of 1 predicted row(s) moved","note":"x"}"#.to_string(),
         ),
         (404, "{}".to_string()),
         (503, "{}".to_string()),
