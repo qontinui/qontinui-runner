@@ -1391,6 +1391,7 @@ pub fn terminal_session_record_open(
         spawn_device_default: None,
         adopted_from: None,
         last_session_start_at: None,
+        last_alive_at: None,
         gate_id: None,
         gate_consuming_device_id: None,
         gate_bound_boot_ms: None,
@@ -1705,6 +1706,11 @@ pub fn terminal_session_record_close(
 /// manager's shutdown latch, so a `pty-exit` that arrives after
 /// [`TerminalManager::close_all`] began leaves its row as it was (plan
 /// `2026-10-28-force-exited-runner-restore-set-follow-ups`, Phase 6).
+///
+/// The named terminal's spawn time goes along for the `launch-failed` close
+/// rule (plan `2026-11-10-migration-holds-for-missing-claude-cli`, D3), read
+/// from an EXACT terminal-id match only. A terminal this manager no longer
+/// holds reads `None`, which keeps the reason as sent.
 pub(crate) fn record_close_for(
     terminal_manager: &TerminalManager,
     store: &SessionLifecycleStore,
@@ -1712,11 +1718,15 @@ pub(crate) fn record_close_for(
     terminal_id: Option<&str>,
     reason: &str,
 ) -> CloseOutcome {
+    let terminal_created_at_ms = terminal_id
+        .and_then(|t| terminal_manager.get(t))
+        .and_then(|session| i64::try_from(session.info().created_at).ok());
     store.record_close_gated(
         terminal_manager.is_shutting_down(),
         claude_session_id,
         terminal_id,
         reason,
+        terminal_created_at_ms,
     )
 }
 
@@ -3107,6 +3117,7 @@ async fn poll_and_record_session<F>(
                 spawn_device_default: None,
                 adopted_from: None,
                 last_session_start_at: None,
+                last_alive_at: None,
                 gate_id: gate_id.clone(),
                 gate_consuming_device_id: gate_consuming_device_id.clone(),
                 gate_bound_boot_ms,
@@ -3208,6 +3219,7 @@ pub(crate) fn record_pinned_session_open(
         spawn_device_default: None,
         adopted_from: None,
         last_session_start_at: None,
+        last_alive_at: None,
         gate_id,
         gate_consuming_device_id,
         gate_bound_boot_ms,
@@ -3591,6 +3603,7 @@ mod tests {
             spawn_device_default: None,
             adopted_from: None,
             last_session_start_at: None,
+            last_alive_at: None,
             gate_id: None,
             gate_consuming_device_id: None,
             gate_bound_boot_ms: None,

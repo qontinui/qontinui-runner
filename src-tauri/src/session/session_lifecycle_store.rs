@@ -115,8 +115,9 @@ const OPEN_STALE_MS: i64 = 604_800_000;
 /// restore anchor — see [`restore_admissible`]), NOT of wall-clock now: a
 /// graceful stop stamps every close at the shutdown instant, so a rebuild of
 /// any length still restores them. A close further back than the window, or
-/// any other close reason (explicit user close), is NOT restorable. 10 minutes
-/// in millis.
+/// a reason outside the restorable three (`pty-exit`, `poll-dead`,
+/// `launch-failed`) — an explicit user close, say — is NOT restorable. 10
+/// minutes in millis.
 ///
 /// A runner shutdown no longer writes these rows: `TerminalManager::close_all`
 /// latches shutdown, and `terminal_session_record_close` then refuses a
@@ -139,6 +140,12 @@ const RESTORABLE_PTY_EXIT_MS: i64 = 600_000;
 /// NOT restorable (a genuinely abandoned session should not resurrect days
 /// later). 10 minutes in millis.
 const RESTORABLE_POLL_DEAD_MS: i64 = 600_000;
+/// A record closed with reason `"launch-failed"` (its pane's Claude CLI never
+/// launched, [`crate::terminal::launch_failure`]) is restorable within this
+/// long of the restore anchor, exactly like `"poll-dead"`: nothing ran, so the
+/// conversation is as it was, and an immediate restart should bring it back.
+/// 10 minutes in millis.
+const RESTORABLE_LAUNCH_FAILED_MS: i64 = 600_000;
 /// Anchored-recency grace for `state == "open"` rows in
 /// [`SessionLifecycleStore::restorable_records`]. An open row is restorable
 /// iff `anchor - last_seen_at <= grace`, where `anchor` is the EARLIER of
@@ -925,6 +932,16 @@ pub struct TerminalSessionRecord {
     /// a restart. `None` = no hook seen, or the record predates the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_session_start_at: Option<i64>,
+    /// Unix millis of the last liveness-poll tick that found a live Claude in
+    /// this session's terminal: the poll's `KeepAlive`, through
+    /// [`SessionLifecycleStore::touch`], its one writer. PROCESS liveness,
+    /// which `last_seen_at` is not: [`SessionLifecycleStore::record_open`]
+    /// bumps that on a re-open that proves nothing ran, and never writes this.
+    /// Read by the `launch-failed` close rule
+    /// ([`crate::terminal::launch_failure`], D3 condition 3). `None` = never
+    /// seen alive by the poll, or the record predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_alive_at: Option<i64>,
     /// The `coord.gates` row this session is a continuation of — the same value
     /// injected into its PTY as `QONTINUI_GATE_ID` (plan
     /// `2026-10-03-a-runner-crash-leaves-its-continuations-spawned-forever-…`,
@@ -963,15 +980,17 @@ pub struct TerminalSessionRecord {
 }
 
 /// Close reasons after which a record is FINAL — never resumed by a boot
-/// restore (`restorable_records` grace-matches only `pty-exit` / `poll-dead`).
+/// restore (`restorable_records` grace-matches only `pty-exit` / `poll-dead` /
+/// `launch-failed`).
 /// `terminal-only-idle` ([`close_reason_for_dead_shell`]) is one of them: it
 /// exists precisely so that the next restore pass does NOT pick the record up.
 ///
 /// A gate continuation whose record closes with one of these, and whose gate
 /// was bound by a PRIOR process generation, has no producer left that could
 /// report its outcome; the close observer reports it `work_unreported`
-/// (see [`runner_restart_unreported_report`]). `poll-dead` is deliberately
-/// ABSENT: it is restorable, so the session may still be resumed.
+/// (see [`runner_restart_unreported_report`]). `poll-dead` and `launch-failed`
+/// are deliberately ABSENT: both are restorable, so the session may still be
+/// resumed.
 pub const NON_RESTORABLE_CLOSE_REASONS: &[&str] =
     &["no-terminal", "never-started", "terminal-only-idle"];
 
@@ -1754,6 +1773,9 @@ impl SessionLifecycleStore {
             restore_tier: non_empty(rec.restore_tier),
             gate_id: non_empty(rec.gate_id),
             gate_consuming_device_id: non_empty(rec.gate_consuming_device_id),
+            // Liveness is the poll's to record (`touch`), never a re-record's:
+            // a re-open proves nothing ran (the `launch-failed` rule, D3).
+            last_alive_at: None,
             ..rec
         };
         let now = Utc::now().timestamp_millis();
@@ -2092,19 +2114,58 @@ impl SessionLifecycleStore {
     /// session did not end, and a row's state after a shutdown is decided by the
     /// backend rather than by webview timing. `explicit` and `poll-dead` closes
     /// are unaffected.
+    ///
+    /// A death close of a pane whose Claude CLI never launched records
+    /// `launch-failed` instead ([`crate::terminal::launch_failure`], D3),
+    /// decided only AFTER the refusal above: rewriting the reason first would
+    /// let a shutdown's `pty-exit` through and close rows a shutdown must leave
+    /// open. `terminal_created_at_ms` is the caller's terminal's spawn time,
+    /// from an exact terminal-id match, or `None`.
     pub fn record_close_gated(
         &self,
         shutting_down: bool,
         claude_session_id: &str,
         terminal_id: Option<&str>,
         reason: &str,
+        terminal_created_at_ms: Option<i64>,
     ) -> CloseOutcome {
         if shutting_down && reason == "pty-exit" {
             return CloseOutcome::IgnoredDuringShutdown {
                 claude_session_id: claude_session_id.to_string(),
             };
         }
-        self.record_close_checked(claude_session_id, terminal_id, reason)
+        let Some(target) = self.open_close_target(claude_session_id, terminal_id) else {
+            return self.record_close_checked(claude_session_id, terminal_id, reason);
+        };
+        let launch = crate::terminal::launch_failure::registry();
+        let now_ms = Utc::now().timestamp_millis();
+        let verdict = launch.verdict(reason, &target, terminal_created_at_ms, now_ms);
+        let outcome = self.record_close_checked(claude_session_id, terminal_id, verdict.reason);
+        if launch.settle(&verdict, &outcome, now_ms) {
+            info!(
+                claude_session_id = %target.claude_session_id,
+                terminal_id = %target.terminal_id,
+                proposed = %reason,
+                reason = %verdict.reason,
+                detail = %verdict.evidence.as_deref().unwrap_or(""),
+                "session-close: closing session whose CLI never launched"
+            );
+        }
+        outcome
+    }
+
+    /// The OPEN row a close of (`claude_session_id`, `terminal_id`) would
+    /// close — [`resolve_close_target`]'s own choice — or `None` when it would
+    /// close nothing.
+    fn open_close_target(
+        &self,
+        claude_session_id: &str,
+        terminal_id: Option<&str>,
+    ) -> Option<TerminalSessionRecord> {
+        let expect = terminal_id.map(str::trim).filter(|t| !t.is_empty());
+        let m = self.map.lock().ok()?;
+        let (target, _) = resolve_close_target(&m, claude_session_id, expect);
+        target.and_then(|t| m.get(&t).cloned())
     }
 
     /// Close the record the caller's TERMINAL actually owns, not merely the one
@@ -2482,7 +2543,9 @@ impl SessionLifecycleStore {
         held
     }
 
-    /// Bump `last_seen_at` on a present session. No-op (no write) if absent.
+    /// Bump `last_seen_at` on a present session, and stamp `last_alive_at`:
+    /// the liveness poll's `KeepAlive` is the one production caller, so a touch
+    /// is the poll having SEEN a live Claude there. No-op (no write) if absent.
     pub fn touch(&self, claude_session_id: &str) {
         let now = Utc::now().timestamp_millis();
         let mut m = match self.map.lock() {
@@ -2495,6 +2558,7 @@ impl SessionLifecycleStore {
         let touched = match m.get_mut(claude_session_id) {
             Some(rec) => {
                 rec.last_seen_at = now;
+                rec.last_alive_at = Some(now);
                 rec.clone()
             }
             None => return,
@@ -3840,12 +3904,17 @@ impl SessionLifecycleStore {
     ///   (the liveness poll closed an idle-but-live shell) that closed within
     ///   the [`RESTORABLE_POLL_DEAD_MS`] grace window of the anchor — a poll-dead close is
     ///   uncertain (the shell pty was still alive), so an immediate restart
-    ///   should bring the session back rather than silently drop it.
+    ///   should bring the session back rather than silently drop it, PLUS
+    /// - every `state == "closed"` record whose `close_reason == "launch-failed"`
+    ///   (its pane's Claude CLI never launched) that closed within the
+    ///   [`RESTORABLE_LAUNCH_FAILED_MS`] grace window of the anchor — nothing
+    ///   ran, so it restores exactly like a `poll-dead` close.
     ///
     /// Records closed for any other reason (explicit user close, the poll's
-    /// `"no-terminal"` orphan close), or `pty-exit` / `poll-dead` closes older
-    /// than their grace windows, are excluded — a user who closes a tab does
-    /// not want it resurrected, and a long-dead close is stale.
+    /// `"no-terminal"` orphan close), or `pty-exit` / `poll-dead` /
+    /// `launch-failed` closes older than their grace windows, are excluded — a
+    /// user who closes a tab does not want it resurrected, and a long-dead close
+    /// is stale.
     ///
     /// The liveness arms live in [`restore_admissible`] (shared with the
     /// ledger roster, [`Self::roster_records`]); this method adds only the
@@ -4997,6 +5066,7 @@ fn boot_restore_needs_account(r: &TerminalSessionRecord, probe: &dyn TranscriptP
 ///   boot IS the prior anchor, so a rebuild of any length restores them while a
 ///   close long before shutdown stays excluded;
 /// - closed `poll-dead`: `anchor - closed_at <= RESTORABLE_POLL_DEAD_MS`;
+/// - closed `launch-failed`: `anchor - closed_at <= RESTORABLE_LAUNCH_FAILED_MS`;
 /// - every other close reason (explicit user close, the poll's `no-terminal`
 ///   orphan close): never.
 ///
@@ -5027,6 +5097,7 @@ fn restore_admissible(r: &TerminalSessionRecord, anchors: &RestoreAnchors, now_m
         let grace = match r.close_reason.as_deref() {
             Some("pty-exit") => RESTORABLE_PTY_EXIT_MS,
             Some("poll-dead") => RESTORABLE_POLL_DEAD_MS,
+            Some(crate::terminal::launch_failure::LAUNCH_FAILED) => RESTORABLE_LAUNCH_FAILED_MS,
             _ => return false,
         };
         return match r.closed_at {
@@ -5909,10 +5980,13 @@ pub fn poll_holds_unmatched_row(
 /// untouched. Pure + exported so the mapping is unit-testable without the
 /// poll loop.
 ///
-/// Any reason other than `"poll-dead"` / `"pty-exit"` is automatically
-/// excluded from `restorable_records`'s grace window (it matches those two
-/// strings by name and falls through to "not restorable" otherwise), so
-/// picking a new honest reason here needs no matching change there.
+/// Any reason other than `"poll-dead"` / `"pty-exit"` / `"launch-failed"` is
+/// automatically excluded from `restorable_records`'s grace window (it matches
+/// those strings by name and falls through to "not restorable" otherwise), so
+/// picking a new honest reason here needs no matching change there. The poll
+/// hands this function's `"poll-dead"` to the `launch-failed` rule
+/// ([`crate::terminal::launch_failure`]), which may rewrite it; it never
+/// rewrites `"terminal-only-idle"`.
 pub fn close_reason_for_dead_shell(restore_tier: Option<&str>) -> &'static str {
     if restore_tier == Some(RESTORE_TIER_TERMINAL_ONLY) {
         "terminal-only-idle"
@@ -5962,6 +6036,7 @@ pub(crate) fn test_open_record(id: &str) -> TerminalSessionRecord {
         spawn_device_default: None,
         adopted_from: None,
         last_session_start_at: None,
+        last_alive_at: None,
         gate_id: None,
         gate_consuming_device_id: None,
         gate_bound_boot_ms: None,
@@ -6195,6 +6270,7 @@ mod tests {
             spawn_device_default: None,
             adopted_from: None,
             last_session_start_at: None,
+            last_alive_at: None,
             gate_id: None,
             gate_consuming_device_id: None,
             gate_bound_boot_ms: None,
@@ -7501,7 +7577,7 @@ mod tests {
             store.record_open(auth_on(id, &format!("term-{id}")));
         }
 
-        let before = store.record_close_gated(false, "a", Some("term-a"), "pty-exit");
+        let before = store.record_close_gated(false, "a", Some("term-a"), "pty-exit", None);
         assert_eq!(
             before,
             CloseOutcome::Closed {
@@ -7514,11 +7590,11 @@ mod tests {
             claude_session_id: "b".to_string(),
         };
         assert_eq!(
-            store.record_close_gated(true, "b", Some("term-b"), "pty-exit"),
+            store.record_close_gated(true, "b", Some("term-b"), "pty-exit", None),
             refused
         );
         assert_eq!(
-            store.record_close_gated(true, "b", Some("term-b"), "pty-exit"),
+            store.record_close_gated(true, "b", Some("term-b"), "pty-exit", None),
             refused
         );
         let b = store.get("b").unwrap();
@@ -7526,7 +7602,7 @@ mod tests {
         assert!(b.close_reason.is_none());
 
         for (id, reason) in [("c", "explicit"), ("d", "poll-dead")] {
-            let out = store.record_close_gated(true, id, Some(&format!("term-{id}")), reason);
+            let out = store.record_close_gated(true, id, Some(&format!("term-{id}")), reason, None);
             assert_eq!(
                 out,
                 CloseOutcome::Closed {
@@ -7536,7 +7612,7 @@ mod tests {
             assert_eq!(store.get(id).unwrap().close_reason.as_deref(), Some(reason));
         }
 
-        store.record_close_gated(false, "b", Some("term-b"), "pty-exit");
+        store.record_close_gated(false, "b", Some("term-b"), "pty-exit", None);
         assert_eq!(store.get("b").unwrap().state, "closed");
     }
 
@@ -10287,6 +10363,7 @@ mod tests {
             spawn_device_default: None,
             adopted_from: None,
             last_session_start_at: None,
+            last_alive_at: None,
             gate_id: None,
             gate_consuming_device_id: None,
             gate_bound_boot_ms: None,

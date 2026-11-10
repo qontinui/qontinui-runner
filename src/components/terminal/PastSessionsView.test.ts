@@ -28,6 +28,7 @@ import {
   PAST_SESSIONS_VIEW_ELEMENT,
   PAST_SESSION_CARD_ELEMENT,
   UNNAMED_PAST_SESSION,
+  closeReasonLabel,
   groupByCohort,
   pastSessionCopyId,
   pastSessionDisplayName,
@@ -299,5 +300,37 @@ describe("past-session rows — restore verdict + row registration", () => {
   it("renders the verdict into the row rather than only carrying it", () => {
     expect(SOURCE).toContain("pastSessionRestoreBadge(session.restoreStatus)");
     expect(SOURCE).toContain("{restoreBadge}");
+  });
+});
+
+describe("closeReasonLabel", () => {
+  it("names a launch failure in words", () => {
+    expect(closeReasonLabel("launch-failed")).toBe(
+      "launch failed — the Claude CLI could not be started",
+    );
+  });
+
+  it("renders every other reason exactly as the backend wrote it", () => {
+    for (const reason of [
+      "poll-dead",
+      "pty-exit",
+      "explicit",
+      "never-started",
+      "no-terminal",
+      "terminal-only-idle",
+      "superseded-terminal-reuse",
+      // An inherited Object property must not read as a label.
+      "toString",
+      "",
+    ]) {
+      expect(closeReasonLabel(reason)).toBe(reason);
+    }
+  });
+
+  it("is the only way a close reason reaches a card", () => {
+    // Both the state dot's tooltip and the state chip render the reason; a raw
+    // interpolation left behind would show `launch-failed` unexplained.
+    expect(SOURCE).not.toMatch(/\$\{session\.closeReason\}/);
+    expect(SOURCE.match(/closeReasonLabel\(session\.closeReason\)/g)).toHaveLength(2);
   });
 });
