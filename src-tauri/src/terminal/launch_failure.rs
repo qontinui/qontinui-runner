@@ -37,20 +37,30 @@
 //! The re-close rule: `record_open` clears a row's close reason when it
 //! re-opens it, so this registry also remembers, per session, when this
 //! process closed its row `launch-failed`. Closed again with no hook stamp and
-//! no liveness since, the row keeps `launch-failed`.
+//! no liveness since, the row keeps `launch-failed`. Its window for a wrong
+//! label is narrow: a `launch-failed` session resumed in a pane that delivers no
+//! SessionStart hook, whose CLI then runs and dies before the poll's first
+//! KeepAlive tick, re-closes `launch-failed` — still restorable, so only the
+//! reason's wording is wrong.
 //!
 //! Every other proposed reason passes through untouched, so a non-restorable
 //! close (`terminal-only-idle`, `never-started`, `no-terminal`, an explicit
 //! close) is never rewritten. Two writers apply the verdict: the lifecycle
-//! poll's `Close` arm (`main.rs`) and the frontend's `pty-exit` close, inside
-//! `SessionLifecycleStore::record_close_gated` AFTER its shutdown refusal.
+//! poll's `Close` arm, through [`close_dead_row`], and the frontend's
+//! `pty-exit` close, inside `SessionLifecycleStore::record_close_gated` AFTER
+//! its shutdown refusal.
 
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
 use lru::LruCache;
+use tracing::info;
 
-use crate::session::session_lifecycle_store::{CloseOutcome, TerminalSessionRecord};
+use crate::session::session_lifecycle_store::{
+    close_reason_for_dead_shell, CloseOutcome, SessionLifecycleStore, TerminalSessionRecord,
+};
+use crate::terminal::types::TerminalInfo;
 
 /// The shim gave up waiting for a launchable `claude` and is falling through
 /// to dispatch the bare name.
@@ -349,6 +359,47 @@ fn fresh<V: Clone>(
         return None;
     }
     cache.get(key).cloned()
+}
+
+/// The lifecycle poll's `Close` arm for one row: the session in its terminal
+/// is dead (or the shell has lost its Claude for the full debounce), so close
+/// the row with the reason D3 decides, and log it.
+///
+/// The proposal is [`close_reason_for_dead_shell`]'s: `terminal-only-idle` for
+/// a tile already restored honestly empty, which no evidence rewrites, else
+/// `poll-dead`. `live_by_id` is the poll's index of this tick's live terminals
+/// by id, and the pane's spawn time is read from it for the row's OWN
+/// `terminal_id` only -- never through the `(page, title, dir)` fallback the
+/// poll may have matched the row by, which can name another terminal. Returns
+/// the reason recorded and the close's outcome.
+pub fn close_dead_row(
+    store: &SessionLifecycleStore,
+    registry: &LaunchFailureRegistry,
+    rec: &TerminalSessionRecord,
+    live_by_id: &HashMap<&str, &TerminalInfo>,
+    now_ms: i64,
+) -> (&'static str, CloseOutcome) {
+    let proposed = close_reason_for_dead_shell(rec.restore_tier.as_deref());
+    let terminal_created_at_ms = live_by_id
+        .get(rec.terminal_id.as_str())
+        .and_then(|t| i64::try_from(t.created_at).ok());
+    let verdict = registry.verdict(proposed, rec, terminal_created_at_ms, now_ms);
+    let outcome = store.record_close_checked(&rec.claude_session_id, None, verdict.reason);
+    if registry.settle(&verdict, &outcome, now_ms) {
+        info!(
+            claude_session = %rec.claude_session_id,
+            reason = %verdict.reason,
+            detail = %verdict.evidence.as_deref().unwrap_or(""),
+            "session lifecycle poll: closing session whose CLI never launched"
+        );
+    } else {
+        info!(
+            claude_session = %rec.claude_session_id,
+            reason = %verdict.reason,
+            "session lifecycle poll: closing dead session"
+        );
+    }
+    (verdict.reason, outcome)
 }
 
 static REGISTRY: LazyLock<LaunchFailureRegistry> = LazyLock::new(LaunchFailureRegistry::new);
@@ -799,6 +850,89 @@ mod tests {
         registry.settle(&verdict, &outcome, second_at);
         assert_eq!(
             store.get(id).unwrap().close_reason.as_deref(),
+            Some("launch-failed")
+        );
+    }
+
+    /// A live terminal in the poll's index, as `TerminalManager::list` reports it.
+    fn live_terminal(
+        id: &str,
+        page_id: &str,
+        title: &str,
+        dir: &str,
+        created_at: i64,
+    ) -> TerminalInfo {
+        TerminalInfo {
+            id: id.to_string(),
+            title: title.to_string(),
+            pid: None,
+            cols: 80,
+            rows: 24,
+            working_dir: dir.to_string(),
+            is_alive: false,
+            exit_code: Some(127),
+            created_at: u64::try_from(created_at).unwrap(),
+            total_bytes_produced: 0,
+            page_id: page_id.to_string(),
+        }
+    }
+
+    /// The poll's close reads the pane's spawn time from the row's OWN terminal
+    /// id only. Row A's own terminal is gone, and the poll matched it through
+    /// its `(page, title, dir)` fallback to live terminal B. B's spawn time
+    /// would satisfy D3 condition 2, but it is another pane's: A closes
+    /// `poll-dead`. Row C, whose own terminal is in the index with the same
+    /// evidence, closes `launch-failed`, so A's result is not for want of it.
+    #[test]
+    fn the_poll_reads_the_spawn_time_from_the_rows_own_terminal_only() {
+        let _amb = crate::test_env::isolated_ambient();
+        let (_dir, store) = open_store();
+        let registry = LaunchFailureRegistry::new();
+        let now = chrono::Utc::now().timestamp_millis();
+        let created = now - 60_000;
+        for (id, term) in [("sess-a", "term-a"), ("sess-c", "term-c")] {
+            store.record_open(TerminalSessionRecord {
+                page_id: "page-1".to_string(),
+                title: Some(format!("Claude {id}")),
+                working_dir: Some("/w".to_string()),
+                ..resumed_row(id, term, created - 3_600_000)
+            });
+            registry.record_beacon(Some(term), "resolve-failed", RESUME_FAILED, created + 9_624);
+        }
+        let b = live_terminal("term-b", "page-1", "Claude sess-a", "/w", created);
+        let c = live_terminal("term-c", "page-1", "Claude sess-c", "/w", created);
+        let live_by_id: HashMap<&str, &TerminalInfo> =
+            [("term-b", &b), ("term-c", &c)].into_iter().collect();
+
+        let (reason, outcome) = close_dead_row(
+            &store,
+            &registry,
+            &store.get("sess-a").unwrap(),
+            &live_by_id,
+            now,
+        );
+        assert_eq!(reason, "poll-dead");
+        assert_eq!(
+            outcome,
+            CloseOutcome::Closed {
+                claude_session_id: "sess-a".to_string()
+            }
+        );
+        assert_eq!(
+            store.get("sess-a").unwrap().close_reason.as_deref(),
+            Some("poll-dead")
+        );
+
+        let (reason, _) = close_dead_row(
+            &store,
+            &registry,
+            &store.get("sess-c").unwrap(),
+            &live_by_id,
+            now,
+        );
+        assert_eq!(reason, "launch-failed");
+        assert_eq!(
+            store.get("sess-c").unwrap().close_reason.as_deref(),
             Some("launch-failed")
         );
     }
