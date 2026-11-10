@@ -2915,7 +2915,12 @@ mod tests {
         dark_events.sort_unstable();
         assert_eq!(
             dark_events,
-            ["PermissionRequest", "PreCompact", "SessionEnd", "SessionStart"],
+            [
+                "PermissionRequest",
+                "PreCompact",
+                "SessionEnd",
+                "SessionStart"
+            ],
             "the dark variant registers PermissionRequest and SessionEnd too"
         );
 
