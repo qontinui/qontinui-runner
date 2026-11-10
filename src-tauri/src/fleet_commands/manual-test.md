@@ -298,6 +298,13 @@ Rows 2 and 3 are not rivals: row 2 gives you a *tab*, row 3 gives you a
 *verdict*. If you are verifying your own UI change and then tearing down, you
 want row 3.
 
+**Before a cross-surface verdict** (a finding that the runner and web disagree,
+or a check that one of them regressed against the other), confirm that both
+resolve the same UI Bridge minor. If they do not, the difference you are about
+to report may come from the SDK and not from either app. The check and its exit
+codes are in the UI Bridge reference (`ui-bridge.md`) → "Version agreement
+between the two mandated surfaces".
+
 ### The own-runner arm — READ-ONLY on your live runner
 
 Take it only when your deployment **has no spawner** (declare `SPAWNER_NONE=1`),
@@ -366,20 +373,56 @@ capture the element snapshot, normalize it with qontinui-web's own shipped
 `normalize.ts`, and run the `vision-audit` analyzer **built from the SHA
 `qontinui-web/style-gate.lock` pins**.
 
+**State an expectation for each captured state before the run.** Pass one
+`--expect <capture-id>=<text>` per state you are checking, naming text a user
+must be able to read there. The arm records every one, stamped `recordedAt`,
+before the browser launches, and judges the run against that record: an
+expectation is met only when an element whose text in that capture contains
+the text (case-sensitive) is one a user could read: on screen, uncovered and
+untruncated. Those are the three conditions of Phase 5's **Complete
+verification (binding)** rule:
+
+- `state.visible === true`, the SDK's own hit-test verdict. Never the
+  element-level `visible`: the SDK sets that from the bounding box alone, so
+  it reads `true` for any laid-out element, covered or off-screen.
+- No `state.occludedBy`. The SDK still calls a partly covered element visible.
+- Not truncated: `state.scrollWidth <= state.clientWidth`, where the SDK
+  measured both widths.
+
+An element that straddles the viewport edge is judged by those of the SDK's
+sample points that fall inside the viewport (only its centre for an element
+under 48 px on both axes), so text in its off-screen part is not judged, and
+when none of its sample points is on screen the SDK reports it visible without
+any hit-test. So scroll an element below the fold into view
+with a `--step` before its capture. An unmet one exits **2** with an `expectation_unmet` finding in that
+capture's `expectationFindings`, naming any element that carried the text and
+why it did not count. A malformed `--expect`, or one naming a capture id the
+run never takes, exits **1** before the browser launches. The capture ids:
+with neither `--step` nor `--capture` the one capture is `page`. Otherwise
+they are each `--capture <id>` in order, after `initial` when there is a
+`--step` (unless `--no-initial`), and `final` is added only after a `--step`
+when no `--capture` is named. `--expect` is not `--expect-selector`, which only
+waits for an element before capturing and judges nothing.
+
 ```bash
 # A page that ships ZERO UI Bridge code is fine — the engine is injected.
-bash qontinui-claude-config/scripts/verify-page-verdict.sh --url "$TARGET_URL"
+# $EXPECTED: text a user must read on the page, written down before the run.
+bash qontinui-claude-config/scripts/verify-page-verdict.sh --url "$TARGET_URL" \
+  --expect "page=$EXPECTED"
 
 # A state only reachable by clicking. --step and --capture interleave IN ORDER,
 # so one page load yields several audited states; an `initial` capture is taken
 # before the first step automatically, so the effect of a click is demonstrable
-# rather than asserted.
+# rather than asserted. Each --expect states, before the run, what a user must
+# read in one captured state.
 bash qontinui-claude-config/scripts/verify-page-verdict.sh \
   --url "$TARGET_URL" \
   --step 'executeElementAction {"id":"dom-open-roster","request":{"action":"click"}}' \
   --capture after-open \
   --step 'executeElementAction {"id":"dom-expand-details","request":{"action":"click"}}' \
-  --capture after-expand
+  --capture after-expand \
+  --expect 'after-open=Roster' \
+  --expect 'after-expand=Details'
 ```
 
 Machine JSON on stdout, human summary on stderr, and **distinct exit codes** —
@@ -387,9 +430,10 @@ read the status, do not just grep the JSON:
 
 | Exit | Meaning |
 |---|---|
-| `0` | PASS |
-| `2` | **GATE FAILED** — real findings, each naming the offending element ids |
-| `3` | **CAPTURE FAILURE** — the page was never observed, or a step could not be performed. This is never a pass. |
+| `0` | PASS — no gated finding at or above `--fail-on`, and every `--expect` met |
+| `1` | usage error — a bad argument, a malformed `--expect`, or an `--expect` naming a capture the run never takes, each refused before the browser launches; or, after the capture, an analyzer usage or parse error (an assertion missing its `elements` field among them) or an unreadable frame decision |
+| `2` | **GATE FAILED** — real findings in `captures[].gatedFindings`, each naming the offending element ids; or an unmet `--expect`: an `expectation_unmet` finding in that capture's `expectationFindings` (its `elements` is empty when no element carried the text) and `met: false` on its entry in the document's `expectations` |
+| `3` | **CAPTURE FAILURE** — the page was never observed, or a step could not be performed, or an `--expect` names a state that was never captured. This is never a pass. |
 | `4` | no `vision-audit` at the pinned SHA (the error prints the build command) |
 | `127` | local environment fault |
 
@@ -1364,10 +1408,39 @@ Using the application's UI, attempt to perform meaningful tasks. Choose tasks ba
 - Check task run details
 
 ### General approach:
+Keep a running log of what worked and what didn't — the report is written from
+it, and the steps below write into it. For each action:
 1. **Before each action:** Snapshot to know the current state
-2. **Perform the action** via UI Bridge interaction endpoints
-3. **After each action:** Wait, re-snapshot, verify the expected change occurred
-4. **Track what worked and what didn't** — keep a running log
+2. **State the expected change before the action.** Write the UTC time and
+   `Expect: <observable change>` into the run log — which element changes, and
+   what it will read or show — before you act, e.g.
+   `2026-11-07T10:42:05Z Expect: the Save button reads "Saved" and the list shows 4 rows`
+   (`date -u +%Y-%m-%dT%H:%M:%SZ` prints the time). One written after the
+   re-snapshot is not an expectation: it can only agree with what you saw.
+3. **Perform the action** via UI Bridge interaction endpoints
+4. **After each action:** Wait, re-snapshot, and compare with the stated
+   expectation. An unmet expectation is FAIL for that action; if the
+   expectation itself was wrong rather than the app, say so in the report and
+   write a new `Expect:` line before acting again — never edit the earlier one.
+   An action with no `Expect:` line before it is UNVERIFIED. Neither is ever
+   PASS.
+5. **For a state-changing action, read the business state back** — beside the
+   UI check, never instead of it — through a door the UI did not use: a coord
+   twin read; the web or coord HTTP API with this session's own device
+   credential, where the route accepts one; the runner's
+   `POST /ui-bridge/specs/verify-api` for a spec's `apiAssertions`; or a
+   read-only query on the job-owned or local hermetic database, its container
+   resolved first, never a guessed port. An in-page `fetch` or `page/evaluate`
+   runs in the page's own session and is never such a door. Log one line for
+   the action: `business layer: <door> read <value>`, or
+   `business layer: UNTESTED (<why>)` when nothing was read back — no door
+   applies, or it answered 401. A credential goes in a mode-600 header file
+   passed as `curl -H @<file>` (`mktemp` creates one 0600), never on argv and
+   never echoed. The read-back says whether the value the UI displays is TRUE.
+   A read-back that contradicts what the UI shows FAILs the action: the UI
+   displayed a false value. One that agrees adds nothing to a PASS, which
+   Phase 5's **Complete verification (binding)** rule keeps on the UI
+   surface, and an `UNTESTED` one leaves the UI verdict as it stands.
 
 If `$ARGUMENTS` specifies a particular area or task to test, focus on that. Otherwise, exercise as many features as practical.
 
@@ -1645,9 +1718,29 @@ For each task attempted, report:
 ### Task: [Description]
 - **Target:** Runner UI / Web Frontend
 - **Steps taken:** [numbered list of UI Bridge interactions]
+- **Actuation:** [per action, the `actuation` the response served (`path`, `userEquivalent`) and any `UB-ELEM-BLOCKED` refusal — or `actuation: not served by this SDK build`]
+- **Business layer:** [per state-changing action, its `business layer:` line — what the door read back, or `UNTESTED (<why>)`; a read-back that contradicts the UI makes **Result** FAIL]
 - **Result:** PASS / FAIL / PARTIAL / BLOCKED
 - **Notes:** [what happened, any unexpected behavior]
 ```
+
+**Cite how each action actuated.** For every action, quote the `actuation` its
+response served (`path`, `userEquivalent`) and any `UB-ELEM-BLOCKED` refusal
+(`failureDetails.errorCode`, with the `occludedBy` it names), where the surface
+serves them. An action whose `userEquivalent` is `false` — a programmatic value
+write, a forced hover — is not something a user did, and is not user evidence.
+A response with no `actuation` field is reported as
+`actuation: not served by this SDK build`, which reads UNKNOWN and is never
+user evidence either. **No released SDK serves `actuation` or emits
+`UB-ELEM-BLOCKED` yet.** Plan
+`2026-11-06-a-ui-action-counts-as-user-evidence-only-when-a-user-could-have-performed-it`
+adds them in its Phases 4–5 and releases them in its Phase 7, so until then
+every response takes that fallback. What today's executor does serve is its
+refusal of a click on an element that is not visible, `UB-ELEM-NOT-VISIBLE`
+with the element's `visibilityReason`; quote it where it appears. After that
+release the fallback stays for every surface without the field: the mobile
+app's bridge (`$MOBILE_BASE`) embeds `@qontinui/ui-bridge-native`, which
+serves no `actuation`, and neither does an app on an older SDK release.
 
 ### Cross-Page Journey
 
