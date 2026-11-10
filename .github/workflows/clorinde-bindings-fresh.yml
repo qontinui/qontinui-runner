@@ -92,7 +92,8 @@ jobs:
     # reads git, and it now runs on a persistent self-hosted runner.
     permissions:
       contents: read
-    runs-on: ${{ fromJSON(((vars.RUNNER_CI_LANE_CLORINDE_BINDINGS_FRESH || vars.RUNNER_CI_LIGHT_LANE) == 'self-hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && '["self-hosted","Linux","X64","qontinui-host-nawa","qontinui"]' || '"ubuntu-latest"') }}
+    # coord-pools: [self-hosted, Linux, X64, qontinui-host-nawa, qontinui, ram-2g] | [ubuntu-latest]
+    runs-on: ${{ fromJSON(((vars.RUNNER_CI_LANE_CLORINDE_BINDINGS_FRESH || vars.RUNNER_CI_LIGHT_LANE) == 'self-hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && '["self-hosted","Linux","X64","qontinui-host-nawa","qontinui","ram-2g"]' || '"ubuntu-latest"') }}
     outputs:
       bindings_relevant: ${{ steps.changes.outputs.bindings_relevant }}
     steps:
@@ -446,7 +447,8 @@ jobs:
     # reads git, and it now runs on a persistent self-hosted runner.
     permissions:
       contents: read
-    runs-on: ${{ fromJSON(((vars.RUNNER_CI_LANE_CLORINDE_BINDINGS_FRESH || vars.RUNNER_CI_LIGHT_LANE) == 'self-hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && '["self-hosted","Linux","X64","qontinui-host-nawa","qontinui"]' || '"ubuntu-latest"') }}
+    # coord-pools: [self-hosted, Linux, X64, qontinui-host-nawa, qontinui, ram-2g] | [ubuntu-latest]
+    runs-on: ${{ fromJSON(((vars.RUNNER_CI_LANE_CLORINDE_BINDINGS_FRESH || vars.RUNNER_CI_LIGHT_LANE) == 'self-hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && '["self-hosted","Linux","X64","qontinui-host-nawa","qontinui","ram-2g"]' || '"ubuntu-latest"') }}
     steps:
       - name: Aggregate verification result
         shell: bash
