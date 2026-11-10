@@ -434,7 +434,7 @@ export interface BoundedWalk<P extends BoundedReadMeta, R> {
   hasMore: boolean;
 }
 
-function mergeWalk<P extends BoundedReadMeta, R>(
+export function mergeWalk<P extends BoundedReadMeta, R>(
   pages: P[] | undefined,
   rowsOf: (page: P) => R[],
 ): BoundedWalk<P, R> | null {

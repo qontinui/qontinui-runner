@@ -26,7 +26,14 @@
 //!
 //!    Past the authority: more than one `claude` (a nested one would not
 //!    leave with `/exit`), or a `claude` with child processes attached →
-//!    `Refused`.
+//!    `Refused`. A direct child the caller's [`ChildExemptions`] admits is not
+//!    counted: today only a [`ChildExemption::ProvenStray`] the close recorded,
+//!    re-proven stray at this probe (`stray_wait::reprove_strays`: same pid,
+//!    start ticks and argv, and a fresh verdict of the same class). It fails
+//!    closed, and the refusal names any child it left out (plan
+//!    `2026-11-08-wind-down-exempts-proven-strays-from-graceful-exit-child-refusal`).
+//!    Only the FIRST probe applies exemptions; it is the one whose child count
+//!    this gate reads.
 //! 2. **Check the screen** ([`exit_prompt_ready`]): the cursor sits at the
 //!    start of an empty `❯` input line, the screen looks idle, and no dialog is
 //!    showing. Otherwise `Refused` — typing `\r` into a permission dialog would
@@ -405,8 +412,13 @@ pub struct ProcIdentity {
 pub struct PaneProcesses {
     /// `claude` processes in the pane's subtree, top-level first.
     pub subtree_claude: Vec<ProcIdentity>,
-    /// Child processes of the top-level `claude` (0 when there is none).
+    /// Child processes of the top-level `claude` that COUNT against the close
+    /// (0 when there is none): every direct child except those in
+    /// [`Self::exempted_children`].
     pub top_level_children: usize,
+    /// Direct children of the top-level `claude` an exemption admitted, sorted.
+    /// Empty unless the probe was given [`ChildExemptions`].
+    pub exempted_children: Vec<u32>,
     /// Of the identities asked about, those alive ANYWHERE in the table.
     pub tracked_alive: Vec<ProcIdentity>,
 }
@@ -433,11 +445,26 @@ pub fn alive_in(snapshot: &ProcessSnapshot, id: ProcIdentity) -> bool {
     id.started_at <= 0 || now_start <= 0 || now_start == id.started_at
 }
 
-/// Pure probe over one snapshot of the whole process table.
+/// Pure probe over one snapshot of the whole process table, every child
+/// counted. [`probe_from_snapshot_exempting`] with nothing admitted.
 pub fn probe_from_snapshot(
     root_pid: u32,
     snapshot: &ProcessSnapshot,
     tracked: &[ProcIdentity],
+) -> ClaudeProbe {
+    probe_from_snapshot_exempting(root_pid, snapshot, tracked, &BTreeSet::new())
+}
+
+/// Pure probe over one snapshot of the whole process table. A DIRECT child of
+/// the top-level `claude` whose pid is in `admitted` is left out of
+/// `top_level_children` and listed in `exempted_children` instead. A pid in
+/// `admitted` that is not such a child (a grandchild, an unrelated process)
+/// changes nothing.
+pub fn probe_from_snapshot_exempting(
+    root_pid: u32,
+    snapshot: &ProcessSnapshot,
+    tracked: &[ProcIdentity],
+    admitted: &BTreeSet<u32>,
 ) -> ClaudeProbe {
     if snapshot.parent_map.is_empty() {
         return ClaudeProbe::Unreadable(
@@ -460,10 +487,18 @@ pub fn probe_from_snapshot(
         .collect();
     // Inclusive-subtree order is root first, then breadth-first, so the first
     // `claude` has no `claude` ancestor inside the pane.
-    let top_level_children = pids
-        .first()
-        .and_then(|pid| snapshot.parent_map.get(pid))
-        .map_or(0, Vec::len);
+    let children = top_claude_children(&pids, snapshot);
+    let mut exempted_children: Vec<u32> = children
+        .iter()
+        .copied()
+        .filter(|pid| admitted.contains(pid))
+        .collect();
+    exempted_children.sort_unstable();
+    exempted_children.dedup();
+    let top_level_children = children
+        .iter()
+        .filter(|pid| !admitted.contains(pid))
+        .count();
     let tracked_alive = tracked
         .iter()
         .copied()
@@ -472,13 +507,162 @@ pub fn probe_from_snapshot(
     ClaudeProbe::Readable(PaneProcesses {
         subtree_claude,
         top_level_children,
+        exempted_children,
         tracked_alive,
     })
 }
 
+/// The direct children of the first (top-level) `claude` in `claude_pids`,
+/// which is in inclusive-subtree order. Empty when there is no `claude`.
+fn top_claude_children(claude_pids: &[u32], snapshot: &ProcessSnapshot) -> Vec<u32> {
+    claude_pids
+        .first()
+        .and_then(|pid| snapshot.parent_map.get(pid))
+        .cloned()
+        .unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------
+// Child exemptions
+// ---------------------------------------------------------------------------
+
+/// One reason a direct child of the top-level `claude` may be left out of the
+/// child gate's count. Each variant must be RE-PROVEN at the probe; holding one
+/// is a claim, not an admission.
+///
+/// Plan `2026-11-04-runner-finished-close-closes-nothing-on-any-box` Phase 2b
+/// adds its shim / pump class here, beside the stray.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChildExemption {
+    /// A stray wait loop the close recorded on its own pass
+    /// ([`crate::session::stray_wait::record_strays`]). Admitted only while
+    /// [`crate::session::stray_wait::reprove_strays`] keeps it.
+    ProvenStray(crate::session::stray_wait::RecordedStray),
+    /// Test-only: admits this pid, unproven, when it is a direct child. Lets a
+    /// wiring test prove the exemptions reach the probe with no real process.
+    #[cfg(test)]
+    AdmitForTest(u32),
+    /// Test-only: admits nothing, and counts each [`ChildExemptions::admitted`]
+    /// call it is consulted in. Lets a test pin WHICH probes apply exemptions.
+    #[cfg(test)]
+    CountAdmissions(AdmissionCounter),
+}
+
+/// Test-only: a shared count of [`ChildExemptions::admitted`] calls. Two
+/// counters are equal only when they are the same counter.
+#[cfg(test)]
+#[derive(Debug, Clone, Default)]
+pub(crate) struct AdmissionCounter(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+#[cfg(test)]
+impl AdmissionCounter {
+    pub(crate) fn count(&self) -> usize {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[cfg(test)]
+impl PartialEq for AdmissionCounter {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+#[cfg(test)]
+impl Eq for AdmissionCounter {}
+
+/// The child-gate policy a graceful-exit caller presents. [`Self::none`] is
+/// every child counted, which is what every caller but the wind-down
+/// `finished_close` arm passes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChildExemptions(Vec<ChildExemption>);
+
+impl ChildExemptions {
+    /// No exemption: every child counts.
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Test-only: admit `pid`, unproven, when it is a direct child.
+    #[cfg(test)]
+    pub(crate) fn admit_for_test(pid: u32) -> Self {
+        Self(vec![ChildExemption::AdmitForTest(pid)])
+    }
+
+    /// Test-only: exactly these exemptions.
+    #[cfg(test)]
+    pub(crate) fn for_test(exemptions: Vec<ChildExemption>) -> Self {
+        Self(exemptions)
+    }
+
+    /// One [`ChildExemption::ProvenStray`] per recorded stray.
+    pub fn from_strays(strays: Vec<crate::session::stray_wait::RecordedStray>) -> Self {
+        Self(
+            strays
+                .into_iter()
+                .map(ChildExemption::ProvenStray)
+                .collect(),
+        )
+    }
+
+    /// Of `children` (the top-level `claude`'s direct children), the pids an
+    /// exemption admits NOW. A `ProvenStray` is re-proven only when its pid is
+    /// among `children`, and admitted only when the re-proof keeps it, so
+    /// anything unprovable (an unreadable table, a reused pid, a changed argv,
+    /// a re-proof past its budget, a non-Linux host) is counted.
+    pub async fn admitted(&self, children: &[u32]) -> BTreeSet<u32> {
+        let mut admitted = BTreeSet::new();
+        let mut strays = Vec::new();
+        for exemption in &self.0 {
+            match exemption {
+                ChildExemption::ProvenStray(stray) => {
+                    if children.contains(&stray.pid) {
+                        strays.push(stray.clone());
+                    }
+                }
+                #[cfg(test)]
+                ChildExemption::AdmitForTest(pid) => {
+                    if children.contains(pid) {
+                        admitted.insert(*pid);
+                    }
+                }
+                #[cfg(test)]
+                ChildExemption::CountAdmissions(counter) => {
+                    counter.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        }
+        if !strays.is_empty() {
+            admitted.extend(
+                crate::session::stray_wait::reprove_strays(strays)
+                    .await
+                    .into_iter()
+                    .map(|stray| stray.pid)
+                    .filter(|pid| children.contains(pid)),
+            );
+        }
+        admitted
+    }
+}
+
 /// Probe the pane rooted at `root_pid` against a fresh snapshot of the whole
-/// process table.
+/// process table, every child counted.
 pub async fn probe_claude_under(root_pid: Option<u32>, tracked: Vec<ProcIdentity>) -> ClaudeProbe {
+    probe_claude_under_exempting(root_pid, tracked, &ChildExemptions::none()).await
+}
+
+/// [`probe_claude_under`], leaving out each direct child of the top-level
+/// `claude` that `exempt` admits on this snapshot. With no exemptions it reads
+/// the table exactly as `probe_claude_under` always has.
+pub async fn probe_claude_under_exempting(
+    root_pid: Option<u32>,
+    tracked: Vec<ProcIdentity>,
+    exempt: &ChildExemptions,
+) -> ClaudeProbe {
     let Some(root) = root_pid else {
         return ClaudeProbe::Unreadable(
             "the pane has no local process id (a remote pane), so its subtree cannot be observed"
@@ -489,12 +673,26 @@ pub async fn probe_claude_under(root_pid: Option<u32>, tracked: Vec<ProcIdentity
     // pid no real process can hold reads its scripted view instead of the OS
     // table. Every real pid falls through to the snapshot below.
     #[cfg(test)]
-    if let Some(scripted) = fake_process_table::probe(root, &tracked) {
-        return scripted;
+    if let Some(children) = fake_process_table::children(root) {
+        let admitted = if exempt.is_empty() {
+            BTreeSet::new()
+        } else {
+            exempt.admitted(&children).await
+        };
+        if let Some(scripted) = fake_process_table::probe(root, &tracked, &admitted) {
+            return scripted;
+        }
     }
     // Never the memo: two consecutive "gone" probes must be two observations.
     let snapshot = crate::process_capture::process_tree::snapshot_process_table_fresh().await;
-    probe_from_snapshot(root, &snapshot, &tracked)
+    if exempt.is_empty() {
+        return probe_from_snapshot(root, &snapshot, &tracked);
+    }
+    let pids = claude_pids_in_inclusive_subtree(root, &snapshot);
+    let admitted = exempt
+        .admitted(&top_claude_children(&pids, &snapshot))
+        .await;
+    probe_from_snapshot_exempting(root, &snapshot, &tracked, &admitted)
 }
 
 // ---------------------------------------------------------------------------
@@ -700,9 +898,18 @@ where
         };
     }
     if initial.top_level_children > 0 {
+        let exempted = if initial.exempted_children.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "; {} proven stray wait loop(s) not counted: {:?}",
+                initial.exempted_children.len(),
+                initial.exempted_children
+            )
+        };
         return GracefulExitOutcome::Refused {
             reason: format!(
-                "the claude process has {} child process(es) attached",
+                "the claude process has {} child process(es) attached{exempted}",
                 initial.top_level_children
             ),
             claude_pids,
@@ -832,7 +1039,7 @@ where
 #[cfg(test)]
 pub(crate) mod fake_process_table {
     use super::{ClaudeProbe, PaneProcesses, ProcIdentity};
-    use std::collections::HashMap;
+    use std::collections::{BTreeSet, HashMap};
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::{Mutex, OnceLock, PoisonError};
 
@@ -843,8 +1050,19 @@ pub(crate) mod fake_process_table {
 
     static NEXT_PID: AtomicU32 = AtomicU32::new(FAKE_PID_BASE);
 
-    fn table() -> &'static Mutex<HashMap<u32, PaneProcesses>> {
-        static TABLE: OnceLock<Mutex<HashMap<u32, PaneProcesses>>> = OnceLock::new();
+    /// A registered pane: its scripted view, and optionally the pids of the
+    /// top-level `claude`'s direct children.
+    #[derive(Debug, Clone)]
+    struct Entry {
+        view: PaneProcesses,
+        /// `None`: the view's own `top_level_children` stands, exemptions
+        /// admit nothing. `Some`: the child count is derived from these pids,
+        /// less those an exemption admits.
+        children: Option<Vec<u32>>,
+    }
+
+    fn table() -> &'static Mutex<HashMap<u32, Entry>> {
+        static TABLE: OnceLock<Mutex<HashMap<u32, Entry>>> = OnceLock::new();
         TABLE.get_or_init(Mutex::default)
     }
 
@@ -864,22 +1082,57 @@ pub(crate) mod fake_process_table {
         }
     }
 
-    /// Register a pane whose every probe reads `view`, under a fresh fake root
-    /// pid.
-    pub(crate) fn register(view: PaneProcesses) -> FakePane {
+    fn insert(entry: Entry) -> FakePane {
         let root_pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
         table()
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert(root_pid, view);
+            .insert(root_pid, entry);
         FakePane { root_pid }
+    }
+
+    /// Register a pane whose every probe reads `view`, under a fresh fake root
+    /// pid.
+    pub(crate) fn register(view: PaneProcesses) -> FakePane {
+        insert(Entry {
+            view,
+            children: None,
+        })
+    }
+
+    /// Register a pane whose top-level `claude` has exactly the direct
+    /// children `children`. Each probe counts those an exemption does not
+    /// admit, and lists the admitted ones as `exempted_children`; the view's
+    /// own `top_level_children` and `exempted_children` are ignored.
+    pub(crate) fn register_with_children(view: PaneProcesses, children: Vec<u32>) -> FakePane {
+        insert(Entry {
+            view,
+            children: Some(children),
+        })
+    }
+
+    /// The registered direct children of `root_pid`'s top-level `claude`
+    /// (empty when the pane registered none), or `None` for any pid nobody
+    /// registered (every real one).
+    pub(super) fn children(root_pid: u32) -> Option<Vec<u32>> {
+        table()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&root_pid)
+            .map(|entry| entry.children.clone().unwrap_or_default())
     }
 
     /// The scripted probe for `root_pid`, or `None` for any pid nobody
     /// registered (every real one). Of the identities asked about, those the
-    /// view holds (in its subtree or as alive elsewhere) read alive.
-    pub(super) fn probe(root_pid: u32, tracked: &[ProcIdentity]) -> Option<ClaudeProbe> {
-        let view = table()
+    /// view holds (in its subtree or as alive elsewhere) read alive. For a pane
+    /// registered with children, `admitted` is applied to them as the pure
+    /// probe applies it to a real table.
+    pub(super) fn probe(
+        root_pid: u32,
+        tracked: &[ProcIdentity],
+        admitted: &BTreeSet<u32>,
+    ) -> Option<ClaudeProbe> {
+        let Entry { view, children } = table()
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get(&root_pid)?
@@ -889,8 +1142,27 @@ pub(crate) mod fake_process_table {
             .copied()
             .filter(|id| view.subtree_claude.contains(id) || view.tracked_alive.contains(id))
             .collect();
+        let (top_level_children, exempted_children) = match children {
+            None => (view.top_level_children, view.exempted_children.clone()),
+            Some(children) => {
+                let mut exempted: Vec<u32> = children
+                    .iter()
+                    .copied()
+                    .filter(|pid| admitted.contains(pid))
+                    .collect();
+                exempted.sort_unstable();
+                exempted.dedup();
+                let counted = children
+                    .iter()
+                    .filter(|pid| !admitted.contains(pid))
+                    .count();
+                (counted, exempted)
+            }
+        };
         Some(ClaudeProbe::Readable(PaneProcesses {
             tracked_alive,
+            top_level_children,
+            exempted_children,
             ..view
         }))
     }
@@ -1434,6 +1706,260 @@ mod tests {
         assert!(!alive_in(&snap, id(4242, 20)));
     }
 
+    // ---- child exemptions (plan 2026-11-08-wind-down-exempts-proven-strays-
+    //      from-graceful-exit-child-refusal) ------------------------------------
+
+    /// root 100 (shell) -> 200 (claude) -> each of `children` ; unrelated 300.
+    fn claude_with_children(children: &[u32]) -> ProcessSnapshot {
+        let mut entries = vec![
+            (100, 1, "bash", 10),
+            (200, 100, "claude", 20),
+            (300, 1, "sshd", 5),
+        ];
+        entries.extend(children.iter().map(|&pid| (pid, 200, "bash", 30)));
+        snapshot(&entries)
+    }
+
+    fn view_of(probe: ClaudeProbe) -> PaneProcesses {
+        match probe {
+            ClaudeProbe::Readable(view) => view,
+            ClaudeProbe::Unreadable(why) => panic!("unreadable: {why}"),
+        }
+    }
+
+    fn set(pids: &[u32]) -> BTreeSet<u32> {
+        pids.iter().copied().collect()
+    }
+
+    #[test]
+    fn an_admitted_only_child_is_not_counted_and_is_named() {
+        let snap = claude_with_children(&[210]);
+        let view = view_of(probe_from_snapshot_exempting(100, &snap, &[], &set(&[210])));
+        assert_eq!(view.top_level_children, 0);
+        assert_eq!(view.exempted_children, vec![210]);
+        assert_eq!(view.subtree_claude, vec![id(200, 20)]);
+    }
+
+    #[test]
+    fn an_admitted_child_beside_a_real_one_still_leaves_one_counted() {
+        let snap = claude_with_children(&[211, 210]);
+        let view = view_of(probe_from_snapshot_exempting(100, &snap, &[], &set(&[210])));
+        assert_eq!(view.top_level_children, 1);
+        assert_eq!(view.exempted_children, vec![210]);
+    }
+
+    #[test]
+    fn nothing_admitted_counts_every_child_as_before() {
+        let snap = claude_with_children(&[210, 211]);
+        let exempting = view_of(probe_from_snapshot_exempting(
+            100,
+            &snap,
+            &[id(200, 20)],
+            &BTreeSet::new(),
+        ));
+        assert_eq!(exempting.top_level_children, 2);
+        assert!(exempting.exempted_children.is_empty());
+        assert_eq!(
+            probe_from_snapshot(100, &snap, &[id(200, 20)]),
+            ClaudeProbe::Readable(exempting),
+            "the unexempting probe is the exempting one with an empty set"
+        );
+    }
+
+    #[test]
+    fn an_admitted_pid_that_is_not_a_direct_child_changes_nothing() {
+        // 210 is a child of claude; 220 is ITS child (a grandchild of claude);
+        // 300 is unrelated; 200 is the claude itself.
+        let mut snap = claude_with_children(&[210]);
+        snap.parent_map.entry(210).or_default().push(220);
+        snap.creation_times.insert(220, 31);
+        snap.names.insert(220, "sleep".to_string());
+        let view = view_of(probe_from_snapshot_exempting(
+            100,
+            &snap,
+            &[],
+            &set(&[220, 300, 200, 100]),
+        ));
+        assert_eq!(view.top_level_children, 1);
+        assert!(view.exempted_children.is_empty());
+    }
+
+    #[tokio::test]
+    async fn exemptions_admit_only_a_direct_child_they_name() {
+        let exempt = ChildExemptions(vec![
+            ChildExemption::AdmitForTest(210),
+            ChildExemption::AdmitForTest(999),
+        ]);
+        assert_eq!(exempt.admitted(&[210, 211]).await, set(&[210]));
+        assert!(ChildExemptions::none().admitted(&[210]).await.is_empty());
+        assert!(ChildExemptions::none().is_empty());
+        // A recorded stray whose pid is not among the children is not
+        // admitted. (This pid could not re-prove either; the live twin in
+        // `stray_wait`'s `reprove_keeps_only_…` test uses one that would.)
+        let stray = crate::session::stray_wait::RecordedStray {
+            pid: 4_000_000_002,
+            start: 1,
+            argv: vec!["bash".to_string()],
+            class: "a".to_string(),
+        };
+        let strays = ChildExemptions::from_strays(vec![stray.clone()]);
+        assert!(!strays.is_empty());
+        assert_eq!(
+            strays,
+            ChildExemptions(vec![ChildExemption::ProvenStray(stray)])
+        );
+        assert!(strays.admitted(&[210, 211]).await.is_empty());
+        assert!(ChildExemptions::from_strays(Vec::new()).is_empty());
+    }
+
+    /// A probe over the PURE exempting probe: the first call reads `first`
+    /// with `admitted` applied (the one exemption-bearing call); every later
+    /// call reads a table with no claude in it.
+    fn exempting_probe(
+        first: ProcessSnapshot,
+        admitted: BTreeSet<u32>,
+        log: Log,
+    ) -> impl FnMut(Vec<ProcIdentity>) -> std::future::Ready<ClaudeProbe> {
+        let mut calls = 0usize;
+        let gone = snapshot(&[(100, 1, "bash", 10), (300, 1, "sshd", 5)]);
+        move |tracked| {
+            calls += 1;
+            log.lock()
+                .unwrap()
+                .push(format!("probe(tracked={})", tracked.len()));
+            std::future::ready(if calls == 1 {
+                probe_from_snapshot_exempting(100, &first, &tracked, &admitted)
+            } else {
+                probe_from_snapshot(100, &gone, &tracked)
+            })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_claude_whose_only_child_is_an_admitted_stray_passes_the_child_gate() {
+        let log: Log = Arc::default();
+        let pane = FakePane::new(empty_prompt(), true);
+        let outcome = drive_graceful_exit(
+            pane.write(log.clone()),
+            pane.screen(),
+            exempting_probe(claude_with_children(&[210]), set(&[210]), log.clone()),
+            recording_close(log.clone()),
+            timing(),
+            Some(CloseAuthority::for_test()),
+        )
+        .await;
+        assert!(
+            matches!(outcome, GracefulExitOutcome::Exited { ref claude_pids, .. } if *claude_pids == vec![200]),
+            "{outcome:?}"
+        );
+        assert_eq!(pane.typed.lock().unwrap().as_slice(), b"/exit\r");
+        let log = entries(&log);
+        assert_eq!(
+            &log[..3],
+            ["probe(tracked=0)", "write:\"/exit\"", "write:\"\\r\""]
+        );
+        assert_eq!(log.last().map(String::as_str), Some("close"));
+    }
+
+    /// The same stray-only pane at a screen that is not ready: the child gate
+    /// is passed, and it is the SCREEN check that refuses, typing nothing.
+    #[tokio::test(start_paused = true)]
+    async fn past_the_child_gate_the_screen_check_still_decides() {
+        let log: Log = Arc::default();
+        let pane = FakePane::new(draft_prompt(), true);
+        let outcome = drive_graceful_exit(
+            pane.write(log.clone()),
+            pane.screen(),
+            exempting_probe(claude_with_children(&[210]), set(&[210]), log.clone()),
+            recording_close(log.clone()),
+            timing(),
+            Some(CloseAuthority::for_test()),
+        )
+        .await;
+        match &outcome {
+            GracefulExitOutcome::Refused { reason, .. } => {
+                assert!(reason.contains("not at an empty prompt"), "{reason}")
+            }
+            other => panic!("expected the screen refusal, got {other:?}"),
+        }
+        assert!(pane.typed.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_child_that_is_not_admitted_still_refuses_and_writes_nothing() {
+        let log: Log = Arc::default();
+        let pane = FakePane::new(empty_prompt(), true);
+        let outcome = drive_graceful_exit(
+            pane.write(log.clone()),
+            pane.screen(),
+            exempting_probe(claude_with_children(&[210, 211]), set(&[210]), log.clone()),
+            recording_close(log.clone()),
+            timing(),
+            Some(CloseAuthority::for_test()),
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            GracefulExitOutcome::Refused {
+                reason: "the claude process has 1 child process(es) attached; 1 proven stray \
+                         wait loop(s) not counted: [210]"
+                    .to_string(),
+                claude_pids: vec![200],
+            }
+        );
+        assert!(
+            pane.typed.lock().unwrap().is_empty(),
+            "typed into a live claude"
+        );
+        assert_eq!(entries(&log), vec!["probe(tracked=0)"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_admitted_stray_does_not_get_past_a_missing_authority() {
+        let log: Log = Arc::default();
+        let pane = FakePane::new(empty_prompt(), true);
+        let outcome = drive_graceful_exit(
+            pane.write(log.clone()),
+            pane.screen(),
+            exempting_probe(claude_with_children(&[210]), set(&[210]), log.clone()),
+            recording_close(log.clone()),
+            timing(),
+            None,
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            GracefulExitOutcome::NoCloseAuthority {
+                claude_pids: vec![200]
+            }
+        );
+        assert!(pane.typed.lock().unwrap().is_empty());
+        assert_eq!(entries(&log), vec!["probe(tracked=0)"]);
+    }
+
+    /// The scripted table applies exemptions only to a pane that registered
+    /// its children, and only through the exempting probe.
+    #[tokio::test]
+    async fn a_scripted_pane_with_children_applies_exemptions() {
+        let pane = fake_process_table::register_with_children(
+            PaneProcesses {
+                subtree_claude: vec![CLAUDE],
+                top_level_children: 0,
+                exempted_children: Vec::new(),
+                tracked_alive: Vec::new(),
+            },
+            vec![77, 78],
+        );
+        let root = Some(pane.root_pid);
+        let counted = view_of(probe_claude_under(root, Vec::new()).await);
+        assert_eq!(counted.top_level_children, 2);
+        assert!(counted.exempted_children.is_empty());
+        let exempt = ChildExemptions(vec![ChildExemption::AdmitForTest(78)]);
+        let exempted = view_of(probe_claude_under_exempting(root, Vec::new(), &exempt).await);
+        assert_eq!(exempted.top_level_children, 1);
+        assert_eq!(exempted.exempted_children, vec![78]);
+    }
+
     // ---- driver --------------------------------------------------------------
 
     type Log = Arc<Mutex<Vec<String>>>;
@@ -1451,6 +1977,7 @@ mod tests {
         ClaudeProbe::Readable(PaneProcesses {
             subtree_claude: subtree.to_vec(),
             top_level_children: children,
+            exempted_children: Vec::new(),
             tracked_alive: alive.to_vec(),
         })
     }
@@ -1989,6 +2516,7 @@ mod tests {
         let pane = fake_process_table::register(PaneProcesses {
             subtree_claude: vec![CLAUDE],
             top_level_children: 0,
+            exempted_children: Vec::new(),
             tracked_alive: Vec::new(),
         });
         let root = pane.root_pid;
@@ -1997,7 +2525,8 @@ mod tests {
             readable(&[CLAUDE], 0, &[CLAUDE])
         );
         drop(pane);
-        assert!(fake_process_table::probe(root, &[]).is_none());
+        assert!(fake_process_table::probe(root, &[], &BTreeSet::new()).is_none());
+        assert!(fake_process_table::children(root).is_none());
     }
 
     #[tokio::test(start_paused = true)]

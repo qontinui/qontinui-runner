@@ -5,6 +5,7 @@ import {
   focusedTabIdFor,
   newestAddedTabId,
   newestSurfacedTabId,
+  surfacedTabIds,
   zoneForTab,
   FLOW_SCROLL_INTO_VIEW_OPTS,
 } from "./flowScrollRouting";
@@ -83,11 +84,26 @@ describe("newestSurfacedTabId", () => {
     expect(newestSurfacedTabId(new Set(["a"]), [{ id: "a" }, { id: "b" }])).toBe("b");
   });
 
+  it("routes a tab whose late verdict flips it to surfaced, against a surfaced baseline", () => {
+    const before = [{ id: "a" }, { id: "r", coalesced: true }];
+    const prev = new Set(surfacedTabIds(before));
+    expect(prev.has("r")).toBe(false);
+    expect(newestSurfacedTabId(prev, [{ id: "a" }, { id: "r" }])).toBe("r");
+  });
+
+  it("surfacedTabIds keeps order and drops coalesced tabs", () => {
+    expect(surfacedTabIds([{ id: "a" }, { id: "b", coalesced: true }, { id: "c" }])).toEqual([
+      "a",
+      "c",
+    ]);
+  });
+
   // No test here drives ZoneGrid's effect, so this pin is what stops it going
   // back to a routing that ignores the verdict.
   it("is what ZoneGrid routes new-tab focus through", () => {
     const zoneGrid = readFileSync(new URL("./ZoneGrid.tsx", import.meta.url), "utf8");
     expect(zoneGrid).toContain("newestSurfacedTabId(prev, tabs)");
+    expect(zoneGrid).toContain("const currentIds = surfacedTabIds(tabs);");
     expect(zoneGrid).not.toContain("newestAddedTabId(");
   });
 });

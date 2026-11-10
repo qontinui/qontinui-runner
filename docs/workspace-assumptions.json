@@ -1718,14 +1718,6 @@
     {
       "class": "repo_layout",
       "file": "src/database/pg/apps.rs",
-      "symbol": "bootstrap_dev_apps",
-      "excerpt": "resolved, so no dev apps were registered. Set $QONTINUI_ROOT (or the \\",
-      "count": 1,
-      "disposition": "unreviewed"
-    },
-    {
-      "class": "repo_layout",
-      "file": "src/database/pg/apps.rs",
       "symbol": "const DEV_SIBLING_APPS",
       "excerpt": "\"qontinui-supervisor\",",
       "count": 1,
@@ -1750,10 +1742,11 @@
     {
       "class": "repo_layout",
       "file": "src/env_agent/apply_repos.rs",
-      "symbol": "apply_section_with",
-      "excerpt": "\"Set $QONTINUI_ROOT, or the runner's `paths.workspace_root` setting, to the \\",
+      "symbol": "const CLI_UNRESOLVED_ROOT_NOTE",
+      "excerpt": "$QONTINUI_ROOT to the folder that holds the repo checkouts, then re-run.\";",
       "count": 1,
-      "disposition": "unreviewed"
+      "disposition": "unreviewed",
+      "note": "Acknowledged, not triaged. A standalone `env apply --section repos` exits before the runner publishes its settings door (collectors::workspace_root_reads_setting), so it cannot read the Workspace root setting and $QONTINUI_ROOT is the true next action there; the in-runner arm renders the shared WorkspaceRootUnresolved sentence instead. Left unreviewed because whether `env apply` is a dev_only_surface is a disposition call this change does not make."
     },
     {
       "class": "repo_layout",
@@ -1873,22 +1866,6 @@
     },
     {
       "class": "repo_layout",
-      "file": "src/main.rs",
-      "symbol": "run_app",
-      "excerpt": "injected. Set $QONTINUI_ROOT (or `paths.workspace_root`) to \\",
-      "count": 1,
-      "disposition": "unreviewed"
-    },
-    {
-      "class": "repo_layout",
-      "file": "src/mcp/api_surface.rs",
-      "symbol": "handle_scan",
-      "excerpt": "\"Cannot locate the qontinui-runner checkout to scan. Set $QONTINUI_ROOT \\",
-      "count": 1,
-      "disposition": "unreviewed"
-    },
-    {
-      "class": "repo_layout",
       "file": "src/mcp/plan_library.rs",
       "symbol": "const WRITE_CONTRACT",
       "excerpt": "with (a runner scan uses `<repo>/<dir>`, e.g. `qontinui-dev-notes/prompts`). \\",
@@ -1915,14 +1892,6 @@
     },
     {
       "class": "repo_layout",
-      "file": "src/mcp/task_runs.rs",
-      "symbol": "migrate_task_run_logs",
-      "excerpt": "Set $QONTINUI_ROOT (or the `paths.workspace_root` setting) to the \\",
-      "count": 1,
-      "disposition": "unreviewed"
-    },
-    {
-      "class": "repo_layout",
       "file": "src/online_learning/context.rs",
       "symbol": "normalize_domain",
       "excerpt": "if lower.contains(\"frontend\") || lower.contains(\"ui-bridge\") {",
@@ -1942,22 +1911,6 @@
       "file": "src/planning_bridge.rs",
       "symbol": "const HTN_SRC_REPOS",
       "excerpt": "const HTN_SRC_REPOS: [&str; 2] = [\"qontinui\", \"multistate\"];",
-      "count": 1,
-      "disposition": "unreviewed"
-    },
-    {
-      "class": "repo_layout",
-      "file": "src/planning_bridge.rs",
-      "symbol": "execute_htn_attempt",
-      "excerpt": "$QONTINUI_ROOT to the directory holding the repo checkouts if the \\",
-      "count": 1,
-      "disposition": "unreviewed"
-    },
-    {
-      "class": "repo_layout",
-      "file": "src/planning_bridge.rs",
-      "symbol": "execute_htn_attempt",
-      "excerpt": "is already installed for this interpreter. Set $QONTINUI_ROOT to the \\",
       "count": 1,
       "disposition": "unreviewed"
     },

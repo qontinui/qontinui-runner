@@ -178,7 +178,10 @@ pub struct LivePid {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RawRecord {
+    #[serde(default, deserialize_with = "lenient_pid")]
     pid: Option<u32>,
+    #[serde(default, deserialize_with = "lenient_string")]
+    pid_domain: Option<String>,
     session_id: Option<String>,
     cwd: Option<String>,
     status: Option<String>,
@@ -187,6 +190,25 @@ struct RawRecord {
     /// A string on every record seen; a number is accepted too, since the
     /// comparison is textual against `/proc` either way.
     proc_start: Option<serde_json::Value>,
+}
+
+/// A pid written as a number or as a decimal string; anything else (including
+/// a wrong type) reads as "not stated" rather than failing the whole file.
+fn lenient_pid<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u32>, D::Error> {
+    Ok(match serde_json::Value::deserialize(d)? {
+        serde_json::Value::Number(n) => n.as_u64().and_then(|v| u32::try_from(v).ok()),
+        serde_json::Value::String(s) => s.trim().parse().ok(),
+        _ => None,
+    })
+}
+
+/// A string-or-number field read as text; any other type reads as absent.
+fn lenient_string<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    Ok(match serde_json::Value::deserialize(d)? {
+        serde_json::Value::String(s) => Some(s),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    })
 }
 
 impl RawRecord {
@@ -458,6 +480,203 @@ fn read_one(
         }
     }
     RecordReading::Parsed(ev)
+}
+
+// ---------------------------------------------------------------------------
+// Provider-row validity — the ONE rule for "does this `<pid>.json` describe the
+// process that holds `pid` now?" (plan
+// `2026-10-23-a-hookless-resume-in-a-runner-pane-leaves-the-session-with-no-active-coord-row`,
+// D5 (iii)). The coord re-key reads it STRICT; `restart_readiness` keeps the
+// lenient classification above.
+// ---------------------------------------------------------------------------
+
+/// What the provider's registry says about one anchor pid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderRowValidity {
+    /// Exactly one session id is named by every valid row.
+    Valid {
+        session_id: String,
+        config_dir: PathBuf,
+    },
+    /// Every row read belongs to an earlier holder of the pid.
+    Stale,
+    /// No row, an unreadable or unrecognised one, or valid rows that disagree:
+    /// nothing may be re-keyed from it.
+    Unknown,
+}
+
+/// Whether a check that cannot be made counts against a row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValidityMode {
+    /// A row no check can reach is accepted on its `pid` match alone.
+    Lenient,
+    /// A row no check can reach is [`ProviderRowValidity::Unknown`].
+    Strict,
+}
+
+/// The live process's own clocks, from one snapshot / `/proc` read.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PidClock {
+    /// Creation time as epoch SECONDS (`ProcessSnapshot::creation_times`);
+    /// `None` when unknown (the snapshot stores `0` for that).
+    pub creation_secs: Option<i64>,
+    /// Fresh `/proc/<pid>/stat` field 22 (Linux).
+    pub proc_start_ticks: Option<String>,
+    /// `/proc/stat` `btime` and `CLK_TCK` (Linux).
+    pub btime: Option<i64>,
+    pub clk_tck: Option<i64>,
+}
+
+const FILETIME_UNIX_EPOCH_SECS: i64 = 11_644_473_600;
+/// Seconds of slack between a FILETIME `procStart` and the snapshot's
+/// second-granular creation time.
+const FILETIME_SLACK_SECS: i64 = 1;
+
+/// Does `raw` describe the process holding `pid` NOW, by its `pidDomain`?
+/// `Some(false)` is a positive mismatch; `None` is "this domain's check cannot
+/// be made" (unknown domain, malformed or absent `procStart`, no clock).
+fn domain_check(raw: &RawRecord, clock: &PidClock) -> Option<bool> {
+    let domain = raw.pid_domain.as_deref()?;
+    let proc_start = raw.proc_start()?;
+    let value: u64 = proc_start.parse().ok()?;
+    if domain.starts_with("win32:") {
+        let creation = clock.creation_secs?;
+        let secs = i64::try_from(value / 10_000_000).ok()? - FILETIME_UNIX_EPOCH_SECS;
+        return Some((secs - creation).abs() <= FILETIME_SLACK_SECS);
+    }
+    if domain.starts_with("linux:") {
+        // The fresh `/proc/<pid>/stat` read is decisive whenever it is
+        // available; the btime formula is only the fallback for a failed read.
+        if let Some(actual) = clock.proc_start_ticks.as_deref() {
+            // A garbled `/proc` token says nothing: Unknown, never a mismatch.
+            return actual.trim().parse::<u64>().ok().map(|a| a == value);
+        }
+        let (btime, tck, creation) = (clock.btime?, clock.clk_tck?, clock.creation_secs?);
+        if tck <= 0 {
+            return None;
+        }
+        // An out-of-range `procStart` or overflowing arithmetic is Unknown, not
+        // a decisive mismatch.
+        let secs = btime.checked_add(i64::try_from(value).ok()? / tck)?;
+        return Some(secs == creation);
+    }
+    None
+}
+
+/// Judge the provider rows found for anchor `pid`. `files` is every
+/// `(config_dir, file body)` read for `<pid>.json` across ALL config dirs.
+///
+/// Only valid rows count: a stale reused-pid file in one dir never masks the
+/// live one in another, and two valid rows naming different ids are
+/// [`ProviderRowValidity::Unknown`]. A row is valid only when the file's `pid`
+/// equals the anchor pid (the file name) and the clock chosen by its
+/// `pidDomain` matches the live process.
+pub fn provider_row_validity(
+    pid: u32,
+    files: &[(PathBuf, String)],
+    clock: &PidClock,
+    mode: ValidityMode,
+) -> ProviderRowValidity {
+    let mut valid: Vec<(String, &PathBuf)> = Vec::new();
+    let (mut stale, mut unknown) = (false, false);
+    for (dir, body) in files {
+        let Ok(raw) = serde_json::from_str::<RawRecord>(body) else {
+            unknown = true;
+            continue;
+        };
+        if raw.pid != Some(pid) {
+            unknown = true;
+            continue;
+        }
+        let verdict = match domain_check(&raw, clock) {
+            Some(v) => Some(v),
+            None if mode == ValidityMode::Strict => None,
+            None => Some(
+                same_process(
+                    &raw,
+                    LivePid {
+                        pid,
+                        process_started_ms: clock.creation_secs.map(|s| s * 1000),
+                    },
+                    &|_| clock.proc_start_ticks.clone(),
+                )
+                .unwrap_or(true),
+            ),
+        };
+        match verdict {
+            Some(true) => match raw.session_id.filter(|s| !s.trim().is_empty()) {
+                Some(id) => valid.push((id, dir)),
+                None => unknown = true,
+            },
+            Some(false) => stale = true,
+            None => unknown = true,
+        }
+    }
+    if let Some((first, dir)) = valid.first() {
+        if valid.iter().any(|(id, _)| id != first) {
+            return ProviderRowValidity::Unknown;
+        }
+        return ProviderRowValidity::Valid {
+            session_id: first.clone(),
+            config_dir: (*dir).clone(),
+        };
+    }
+    if unknown || !stale {
+        ProviderRowValidity::Unknown
+    } else {
+        ProviderRowValidity::Stale
+    }
+}
+
+/// `/proc/stat` `btime` and `CLK_TCK`; `(None, None)` off Linux.
+fn linux_clock_constants() -> (Option<i64>, Option<i64>) {
+    #[cfg(target_os = "linux")]
+    {
+        let btime = std::fs::read_to_string("/proc/stat").ok().and_then(|s| {
+            s.lines()
+                .find_map(|l| l.strip_prefix("btime ")?.trim().parse().ok())
+        });
+        // SAFETY: sysconf has no preconditions.
+        let tck = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+        (btime, (tck > 0).then_some(i64::from(tck)))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        (None, None)
+    }
+}
+
+/// STRICT [`provider_row_validity`] for each `(anchor pid, creation secs)`,
+/// reading `<dir>/sessions/<pid>.json` in EVERY config dir. Blocking file I/O —
+/// call it off the async executor.
+pub fn read_provider_rows(
+    config_dirs: &[PathBuf],
+    anchors: &[(u32, Option<i64>)],
+) -> HashMap<u32, ProviderRowValidity> {
+    let (btime, clk_tck) = linux_clock_constants();
+    anchors
+        .iter()
+        .map(|&(pid, creation)| {
+            let files: Vec<(PathBuf, String)> = config_dirs
+                .iter()
+                .filter_map(|dir| {
+                    std::fs::read_to_string(dir.join("sessions").join(format!("{pid}.json")))
+                        .ok()
+                        .map(|body| (dir.clone(), body))
+                })
+                .collect();
+            let clock = PidClock {
+                creation_secs: creation.filter(|&s| s > 0),
+                proc_start_ticks: proc_start_ticks(pid),
+                btime,
+                clk_tck,
+            };
+            (
+                pid,
+                provider_row_validity(pid, &files, &clock, ValidityMode::Strict),
+            )
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -928,6 +1147,272 @@ mod tests {
         // A short tail starting mid-file drops its partial first line.
         let short = read_tail_lossy(&path, 30).unwrap();
         assert!(!short.contains("timestamp"), "{short:?}");
+    }
+
+    // ---- provider_row_validity -------------------------------------------
+
+    const CREATED: i64 = 1_790_000_000;
+    const ID_A: &str = "44348633-0000-4000-8000-00000000000a";
+    const ID_B: &str = "3c37caf2-0000-4000-8000-00000000000b";
+
+    fn filetime(secs: i64) -> u64 {
+        ((secs + 11_644_473_600) as u64) * 10_000_000
+    }
+
+    fn win_row(pid: u32, id: &str, created: i64) -> String {
+        format!(
+            r#"{{"pid":{pid},"sessionId":"{id}","procStart":"{}","pidDomain":"win32:x","status":"idle"}}"#,
+            filetime(created)
+        )
+    }
+
+    fn linux_row(pid: u32, id: &str, ticks: u64) -> String {
+        format!(
+            r#"{{"pid":{pid},"sessionId":"{id}","procStart":"{ticks}","pidDomain":"linux:x","status":"idle"}}"#
+        )
+    }
+
+    fn dir(n: &str) -> PathBuf {
+        PathBuf::from(n)
+    }
+
+    fn win_clock() -> PidClock {
+        PidClock {
+            creation_secs: Some(CREATED),
+            ..PidClock::default()
+        }
+    }
+
+    /// btime 1_000_000, CLK_TCK 100: ticks 5_000_000 => +50_000 s.
+    fn linux_clock(ticks: u64) -> PidClock {
+        PidClock {
+            creation_secs: Some(1_000_000 + (ticks / 100) as i64),
+            proc_start_ticks: Some(ticks.to_string()),
+            btime: Some(1_000_000),
+            clk_tck: Some(100),
+        }
+    }
+
+    fn valid(id: &str, d: &str) -> ProviderRowValidity {
+        ProviderRowValidity::Valid {
+            session_id: id.into(),
+            config_dir: dir(d),
+        }
+    }
+
+    #[test]
+    fn a_win32_filetime_row_is_valid_and_a_reused_pid_twin_is_stale() {
+        let ok = provider_row_validity(
+            31524,
+            &[(dir("a"), win_row(31524, ID_A, CREATED))],
+            &win_clock(),
+            ValidityMode::Strict,
+        );
+        assert_eq!(ok, valid(ID_A, "a"));
+        // Within the 1 s slack.
+        let near = provider_row_validity(
+            31524,
+            &[(dir("a"), win_row(31524, ID_A, CREATED + 1))],
+            &win_clock(),
+            ValidityMode::Strict,
+        );
+        assert_eq!(near, valid(ID_A, "a"));
+        // The earlier holder of the pid started an hour before.
+        let twin = provider_row_validity(
+            31524,
+            &[(dir("a"), win_row(31524, ID_A, CREATED - 3600))],
+            &win_clock(),
+            ValidityMode::Strict,
+        );
+        assert_eq!(twin, ProviderRowValidity::Stale);
+    }
+
+    #[test]
+    fn a_linux_start_ticks_row_is_valid_and_a_reused_pid_twin_is_stale() {
+        let ticks = 5_000_000;
+        let ok = provider_row_validity(
+            7,
+            &[(dir("a"), linux_row(7, ID_A, ticks))],
+            &linux_clock(ticks),
+            ValidityMode::Strict,
+        );
+        assert_eq!(ok, valid(ID_A, "a"));
+        let twin = provider_row_validity(
+            7,
+            &[(dir("a"), linux_row(7, ID_A, ticks - 123_456))],
+            &linux_clock(ticks),
+            ValidityMode::Strict,
+        );
+        assert_eq!(twin, ProviderRowValidity::Stale);
+        // Only the btime formula reachable (the /proc read failed): it decides.
+        let mut clock = linux_clock(ticks);
+        clock.proc_start_ticks = None;
+        assert_eq!(
+            provider_row_validity(
+                7,
+                &[(dir("a"), linux_row(7, ID_A, ticks))],
+                &clock,
+                ValidityMode::Strict
+            ),
+            valid(ID_A, "a")
+        );
+        assert_eq!(
+            provider_row_validity(
+                7,
+                &[(dir("a"), linux_row(7, ID_A, ticks - 123_456))],
+                &clock,
+                ValidityMode::Strict
+            ),
+            ProviderRowValidity::Stale
+        );
+    }
+
+    #[test]
+    fn a_proc_ticks_mismatch_is_decisive_even_when_the_btime_formula_would_pass() {
+        let ticks = 5_000_000;
+        let mut clock = linux_clock(ticks);
+        // creation/btime agree with the row, but the fresh /proc read does not.
+        clock.proc_start_ticks = Some((ticks - 1).to_string());
+        assert_eq!(
+            provider_row_validity(
+                7,
+                &[(dir("a"), linux_row(7, ID_A, ticks))],
+                &clock,
+                ValidityMode::Strict
+            ),
+            ProviderRowValidity::Stale
+        );
+    }
+
+    #[test]
+    fn a_garbled_proc_token_or_an_out_of_range_start_is_unknown_never_stale() {
+        let ticks = 5_000_000;
+        // `/proc` read present but not a number.
+        let mut clock = linux_clock(ticks);
+        clock.proc_start_ticks = Some("12x".into());
+        assert_eq!(
+            provider_row_validity(
+                7,
+                &[(dir("a"), linux_row(7, ID_A, ticks))],
+                &clock,
+                ValidityMode::Strict
+            ),
+            ProviderRowValidity::Unknown
+        );
+        // btime fallback: procStart beyond i64.
+        let mut fallback = linux_clock(ticks);
+        fallback.proc_start_ticks = None;
+        assert_eq!(
+            provider_row_validity(
+                7,
+                &[(dir("a"), linux_row(7, ID_A, u64::MAX))],
+                &fallback,
+                ValidityMode::Strict
+            ),
+            ProviderRowValidity::Unknown
+        );
+        // btime fallback: the addition overflows.
+        fallback.btime = Some(i64::MAX);
+        assert_eq!(
+            provider_row_validity(
+                7,
+                &[(dir("a"), linux_row(7, ID_A, ticks))],
+                &fallback,
+                ValidityMode::Strict
+            ),
+            ProviderRowValidity::Unknown
+        );
+    }
+
+    #[test]
+    fn a_stale_row_in_an_earlier_dir_does_not_mask_the_valid_one() {
+        let ticks = 5_000_000;
+        let got = provider_row_validity(
+            7,
+            &[
+                (dir("tio"), linux_row(7, ID_B, ticks - 999)),
+                (dir("pak"), linux_row(7, ID_A, ticks)),
+            ],
+            &linux_clock(ticks),
+            ValidityMode::Strict,
+        );
+        assert_eq!(got, valid(ID_A, "pak"));
+    }
+
+    #[test]
+    fn two_valid_rows_that_disagree_are_unknown() {
+        let ticks = 5_000_000;
+        let got = provider_row_validity(
+            7,
+            &[
+                (dir("a"), linux_row(7, ID_A, ticks)),
+                (dir("b"), linux_row(7, ID_B, ticks)),
+            ],
+            &linux_clock(ticks),
+            ValidityMode::Strict,
+        );
+        assert_eq!(got, ProviderRowValidity::Unknown);
+    }
+
+    #[test]
+    fn strict_mode_refuses_what_it_cannot_check_and_lenient_accepts_it() {
+        let no_domain = format!(r#"{{"pid":7,"sessionId":"{ID_A}","procStart":"5000000"}}"#);
+        let files = [(dir("a"), no_domain)];
+        let clock = PidClock::default();
+        assert_eq!(
+            provider_row_validity(7, &files, &clock, ValidityMode::Strict),
+            ProviderRowValidity::Unknown
+        );
+        assert_eq!(
+            provider_row_validity(7, &files, &clock, ValidityMode::Lenient),
+            valid(ID_A, "a")
+        );
+        // An unrecognised domain, a malformed procStart, a wrong file pid and
+        // garbage are all Unknown in strict mode.
+        for body in [
+            r#"{"pid":7,"sessionId":"x","procStart":"5000000","pidDomain":"darwin:1"}"#,
+            r#"{"pid":7,"sessionId":"x","procStart":"abc","pidDomain":"linux:1"}"#,
+            r#"{"pid":8,"sessionId":"x","procStart":"5000000","pidDomain":"linux:1"}"#,
+            "not json",
+        ] {
+            assert_eq!(
+                provider_row_validity(
+                    7,
+                    &[(dir("a"), body.to_string())],
+                    &linux_clock(5_000_000),
+                    ValidityMode::Strict
+                ),
+                ProviderRowValidity::Unknown,
+                "{body}"
+            );
+        }
+        // No clock at all for a win32 row: unreachable => Unknown.
+        assert_eq!(
+            provider_row_validity(
+                31524,
+                &[(dir("a"), win_row(31524, ID_A, CREATED))],
+                &PidClock::default(),
+                ValidityMode::Strict
+            ),
+            ProviderRowValidity::Unknown
+        );
+    }
+
+    #[test]
+    fn the_pid_may_be_a_string_in_the_file() {
+        let body = format!(
+            r#"{{"pid":"31524","sessionId":"{ID_A}","procStart":"{}","pidDomain":"win32:x"}}"#,
+            filetime(CREATED)
+        );
+        assert_eq!(
+            provider_row_validity(
+                31524,
+                &[(dir("a"), body)],
+                &win_clock(),
+                ValidityMode::Strict
+            ),
+            valid(ID_A, "a")
+        );
     }
 
     #[test]

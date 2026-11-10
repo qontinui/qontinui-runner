@@ -11890,6 +11890,98 @@ mod tests {
             assert_eq!(n, 1, "no second re-key PATCH");
         }
 
+        /// ARMING (Phase 1b): the tick composition with the provider-registry
+        /// source. A live PTY whose argv names LIVE (rung 2) but whose provider
+        /// file — read from disk through the real validity rule — says the
+        /// process now runs PREV_BOOT. Asserts on the PATCH coord received and
+        /// on the counted `provider_registry` outcome.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn arming_the_tick_composition_lands_a_provider_registry_rekey_in_coord() {
+            use crate::session::coord_identity::apply_reconcile_tick_with;
+            use crate::session::reconcile::compute_provider_rows_blocking;
+            let _amb = crate::test_env::isolated_ambient();
+            let (reg, coord, _outbox, rec, dir) = harness().await;
+            let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+            let row = reg
+                .register_external_with_lineage(make_test_intent(), None, Some(PIN.into()))
+                .unwrap();
+            // The fake provider index: <cfg>/sessions/31524.json, win32 domain.
+            let created: i64 = 1_790_000_000;
+            let ft = ((created + 11_644_473_600) as u64) * 10_000_000;
+            let cfg = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(cfg.path().join("sessions")).unwrap();
+            std::fs::write(
+                cfg.path().join("sessions").join("31524.json"),
+                format!(
+                    r#"{{"pid":31524,"sessionId":"{PREV_BOOT}","procStart":"{ft}","pidDomain":"win32:{ft}","status":"idle"}}"#
+                ),
+            )
+            .unwrap();
+            let snap = crate::process_capture::process_tree::ProcessSnapshot {
+                stale: false,
+                parent_map: HashMap::from([(1, vec![31524])]),
+                creation_times: HashMap::from([(31524, created)]),
+                ..Default::default()
+            };
+            let live = vec![LivePty {
+                terminal_id: "pane-1".into(),
+                pid: Some(1),
+                working_dir: "/repo".into(),
+                page_id: "p".into(),
+                title: "t".into(),
+                ai_pid: Some(31524),
+                ai_start_unix: Some(created),
+            }];
+            let cmdlines: HashMap<u32, String> = [(31524u32, LIVE.to_string())].into();
+            let tick = |store: &SessionLifecycleStore| {
+                let rows =
+                    compute_provider_rows_blocking(&live, &snap, || vec![cfg.path().to_path_buf()]);
+                let actions = run_reconcile(
+                    store,
+                    &live,
+                    &snap,
+                    &PrescannedTranscriptIndex::default(),
+                    &cmdlines,
+                );
+                apply_reconcile_tick_with(&reg, &actions, &rows, |t| {
+                    (t == "pane-1").then_some(row)
+                });
+            };
+            tick(&store);
+            coord.drain_once_for_test().await;
+            {
+                let g = rec.lock().await;
+                let rekeys: Vec<&JsonValue> = g
+                    .patches
+                    .iter()
+                    .filter(|(id, b)| *id == row && b.get("claude_code_session_id").is_some())
+                    .map(|(_, b)| b)
+                    .collect();
+                assert_eq!(
+                    rekeys,
+                    vec![&json!({"claude_code_session_id": PREV_BOOT, "heartbeat": true})],
+                    "coord must receive exactly one re-key PATCH, to the provider's id"
+                );
+            }
+            assert_eq!(
+                coord.rekeys().counts(RekeySource::ProviderRegistry).landed,
+                1
+            );
+            assert_eq!(coord.rekeys().counts(RekeySource::Rung2).queued, 0);
+            assert_eq!(coord.rekeys().last_landed(row).as_deref(), Some(PREV_BOOT));
+
+            tick(&store);
+            coord.drain_once_for_test().await;
+            let n = rec
+                .lock()
+                .await
+                .patches
+                .iter()
+                .filter(|(id, b)| *id == row && b.get("claude_code_session_id").is_some())
+                .count();
+            assert_eq!(n, 1, "no second re-key PATCH");
+        }
+
         /// ARMING, the CONFIRMED arm: a transcript for the argv's id is on disk,
         /// so the first pass binds confirmed and every later pass answers
         /// `LeaveAlone`. No bind will ever re-supply the id, so a refusal has to

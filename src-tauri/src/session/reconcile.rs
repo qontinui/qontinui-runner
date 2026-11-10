@@ -75,6 +75,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::process_capture::process_tree::ProcessSnapshot;
+use crate::session::claude_activity::{read_provider_rows, ProviderRowValidity};
 use crate::session::session_lifecycle_store::{
     SessionLifecycleStore, TerminalSessionRecord, DEFAULT_PROVIDER, ORIGIN_AUTHORITATIVE,
     ORIGIN_OBSERVED, ORIGIN_RECONCILED, UNZONED_ZONE_INDEX,
@@ -968,7 +969,11 @@ impl ProviderSessionIndex for DiskProviderSessionIndex {
             let Ok(parsed) = serde_json::from_str::<ProviderSessionFile>(&raw) else {
                 continue;
             };
-            let session_id = parsed.session_id.filter(|s| !s.trim().is_empty())?;
+            // An empty id in THIS dir's file must not end the search of the
+            // remaining dirs (a stale file would mask the live one).
+            let Some(session_id) = parsed.session_id.filter(|s| !s.trim().is_empty()) else {
+                continue;
+            };
             return Some(ProviderSessionMeta {
                 session_id,
                 name: parsed.name.filter(|n| !n.trim().is_empty()),
@@ -996,6 +1001,7 @@ pub fn decide_title_refresh(
 ) -> Option<String> {
     let meta = meta?;
     if meta.session_id != rec.claude_session_id {
+        note_title_refresh_mismatch(&rec.terminal_id, &meta.session_id, &rec.claude_session_id);
         return None;
     }
     let name = meta.name.as_deref()?.trim();
@@ -1003,6 +1009,29 @@ pub fn decide_title_refresh(
         return None;
     }
     Some(name.to_string())
+}
+
+/// Log, at `info!` and ONCE per (terminal, provider id), that the provider's
+/// live file names a different session than the lifecycle record. It was a
+/// silent drop; it is the observation that the pane's claude now runs another
+/// id, which the coord re-key (`provider_registry`) acts on.
+fn note_title_refresh_mismatch(terminal_id: &str, provider_id: &str, record_id: &str) {
+    static SEEN: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashSet<(String, String)>>,
+    > = std::sync::OnceLock::new();
+    let seen = SEEN.get_or_init(Default::default);
+    let first = seen
+        .lock()
+        .map(|mut set| set.insert((terminal_id.to_string(), provider_id.to_string())))
+        .unwrap_or(false);
+    if first {
+        tracing::info!(
+            terminal_id = %terminal_id,
+            provider_session = %provider_id,
+            record_session = %record_id,
+            "session reconcile: the provider's live session id differs from the lifecycle record's — title not refreshed"
+        );
+    }
 }
 
 /// One title the pass refreshed — returned for logging/tests.
@@ -1079,6 +1108,119 @@ pub fn refresh_titles_pass(
 ) -> Vec<TitleRefresh> {
     let live = anchor_live_ptys(live, snapshot);
     refresh_titles(store, &live, &DiskProviderSessionIndex::discover())
+}
+
+/// The valid provider-registry rows of ONE tick, keyed by terminal id: the
+/// STRICT [`provider_row_validity`](crate::session::claude_activity::provider_row_validity)
+/// verdict for each live PTY's claude anchor pid. Computed once per tick (off
+/// the async executor) and handed to the bind pass's rung-2 pre-emption and to
+/// the coord re-key, so both read the same answer.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ProviderRows {
+    by_terminal: HashMap<String, ProviderEntry>,
+}
+
+/// One terminal's verdict with the anchor it was read for (pid + creation
+/// time), so a caller can tell "the same process, read again" from "a new one".
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProviderEntry {
+    anchor: (u32, Option<i64>),
+    verdict: ProviderRowValidity,
+}
+
+impl ProviderRows {
+    /// Rows with no anchor information (pid 0, creation unknown).
+    pub fn from_pairs(pairs: impl IntoIterator<Item = (String, ProviderRowValidity)>) -> Self {
+        Self::from_entries(pairs.into_iter().map(|(t, v)| (t, (0, None), v)))
+    }
+
+    pub fn from_entries(
+        entries: impl IntoIterator<Item = (String, (u32, Option<i64>), ProviderRowValidity)>,
+    ) -> Self {
+        Self {
+            by_terminal: entries
+                .into_iter()
+                .map(|(t, anchor, verdict)| (t, ProviderEntry { anchor, verdict }))
+                .collect(),
+        }
+    }
+
+    /// The session id this terminal's anchor provably runs, if any.
+    pub fn valid_id(&self, terminal_id: &str) -> Option<&str> {
+        match &self.by_terminal.get(terminal_id)?.verdict {
+            ProviderRowValidity::Valid { session_id, .. } => Some(session_id),
+            _ => None,
+        }
+    }
+
+    pub fn has_valid(&self, terminal_id: &str) -> bool {
+        self.valid_id(terminal_id).is_some()
+    }
+
+    /// Every `(terminal id, valid session id)`, in no particular order.
+    pub fn valid(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.by_terminal
+            .keys()
+            .filter_map(|t| self.valid_id(t).map(|id| (t.as_str(), id)))
+    }
+
+    /// Every `(terminal id, anchor, verdict)` read this tick.
+    pub fn entries(
+        &self,
+    ) -> impl Iterator<Item = (&str, (u32, Option<i64>), &ProviderRowValidity)> {
+        self.by_terminal
+            .iter()
+            .map(|(t, e)| (t.as_str(), e.anchor, &e.verdict))
+    }
+}
+
+/// Blocking: resolve anchors from `snapshot` and read every config dir's file
+/// for each anchor pid. An unknown snapshot anchors nothing. `config_dirs` is
+/// only called when at least one anchor exists, so a tick with no claude pane
+/// does no directory discovery.
+pub fn compute_provider_rows_blocking(
+    live: &[LivePty],
+    snapshot: &ProcessSnapshot,
+    config_dirs: impl FnOnce() -> Vec<PathBuf>,
+) -> ProviderRows {
+    let anchored = anchor_live_ptys(live, snapshot);
+    let pids: Vec<(u32, Option<i64>)> = anchored
+        .iter()
+        .filter_map(|p| {
+            let pid = p.ai_pid?;
+            Some((pid, snapshot.creation_times.get(&pid).copied()))
+        })
+        .collect();
+    if pids.is_empty() {
+        return ProviderRows::default();
+    }
+    let verdicts = read_provider_rows(&config_dirs(), &pids);
+    ProviderRows::from_entries(anchored.iter().filter_map(|p| {
+        let pid = p.ai_pid?;
+        let verdict = verdicts.get(&pid)?.clone();
+        let creation = snapshot
+            .creation_times
+            .get(&pid)
+            .copied()
+            .filter(|&s| s > 0);
+        Some((p.terminal_id.clone(), (pid, creation), verdict))
+    }))
+}
+
+/// [`compute_provider_rows_blocking`] on the blocking pool. A join failure
+/// reads as "no valid rows": rung 2 stays the fallback and nothing is re-keyed
+/// from the registry.
+pub async fn compute_provider_rows(live: &[LivePty], snapshot: &ProcessSnapshot) -> ProviderRows {
+    let (live, snapshot) = (live.to_vec(), snapshot.clone());
+    spawn_blocking_tracked(move || {
+        compute_provider_rows_blocking(
+            &live,
+            &snapshot,
+            crate::terminal::transcript::find_claude_config_dirs,
+        )
+    })
+    .await
+    .unwrap_or_default()
 }
 
 /// Parse an ISO-8601 timestamp into Unix epoch seconds (best-effort).
@@ -1703,6 +1845,79 @@ mod tests {
             decide_title_refresh(&rec, Some(&meta("sess-1", Some("qontinui")))),
             None
         );
+    }
+
+    /// The provider file carrying the new keys (`pid`, `procStart`,
+    /// `pidDomain`) still feeds the title refresh: the name is adopted.
+    #[test]
+    fn title_refresh_still_adopts_a_name_from_a_file_with_the_new_keys() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("sessions")).unwrap();
+        std::fs::write(
+            dir.path().join("sessions").join("4242.json"),
+            r#"{"pid":"4242","sessionId":"sess-1","name":"renamed","procStart":134372341332109841,"pidDomain":"win32:134372341332109841","status":"idle"}"#,
+        )
+        .unwrap();
+        // An empty-id file in an EARLIER dir must not end the search.
+        let early = tempdir().unwrap();
+        std::fs::create_dir_all(early.path().join("sessions")).unwrap();
+        std::fs::write(
+            early.path().join("sessions").join("4242.json"),
+            r#"{"pid":4242,"sessionId":""}"#,
+        )
+        .unwrap();
+        let store_dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(store_dir.path().join("s.json")).unwrap();
+        store.record_open(title_rec("sess-1", "term-1", Some("qontinui")));
+        let index = DiskProviderSessionIndex {
+            config_dirs: vec![early.path().to_path_buf(), dir.path().to_path_buf()],
+        };
+        let refreshed = refresh_titles(
+            &store,
+            &[pty_anchored("term-1", 4242, 1_000, "C:/repo")],
+            &index,
+        );
+        assert_eq!(refreshed.len(), 1, "{refreshed:?}");
+        assert_eq!(refreshed[0].title, "renamed");
+    }
+
+    fn rows_fixture(created: i64, file_created: i64) -> (tempfile::TempDir, ProviderRows) {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("sessions")).unwrap();
+        let ft = ((file_created + 11_644_473_600) as u64) * 10_000_000;
+        std::fs::write(
+            dir.path().join("sessions").join("31524.json"),
+            format!(
+                r#"{{"pid":31524,"sessionId":"44348633-0000-4000-8000-000000000002","procStart":"{ft}","pidDomain":"win32:{ft}","status":"idle"}}"#
+            ),
+        )
+        .unwrap();
+        let snap = ProcessSnapshot {
+            stale: false,
+            parent_map: HashMap::from([(1, vec![31524])]),
+            creation_times: HashMap::from([(31524, created)]),
+            ..Default::default()
+        };
+        let rows = compute_provider_rows_blocking(
+            &[pty_anchored("term-1", 31524, created, "C:/repo")],
+            &snap,
+            || vec![dir.path().to_path_buf()],
+        );
+        (dir, rows)
+    }
+
+    /// The disk read: a win32 row matching the anchor's creation time is valid;
+    /// the same file read against a pid reused after it is not.
+    #[test]
+    fn provider_rows_are_read_per_anchor_and_a_reused_pid_is_rejected() {
+        let (_d, rows) = rows_fixture(1_790_000_000, 1_790_000_000);
+        assert_eq!(
+            rows.valid_id("term-1"),
+            Some("44348633-0000-4000-8000-000000000002")
+        );
+        let (_d, rows) = rows_fixture(1_790_000_000, 1_790_000_000 - 7200);
+        assert_eq!(rows.valid_id("term-1"), None);
+        assert_eq!(rows.valid().count(), 0);
     }
 
     /// B6 end-to-end over the store: `refresh_titles` routes the provider name

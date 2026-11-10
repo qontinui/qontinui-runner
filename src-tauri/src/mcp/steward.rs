@@ -1455,6 +1455,7 @@ pub(crate) async fn stop_at_boundary(
             terminal_id,
             crate::terminal::graceful_exit::DEFAULT_DEADLINE,
             None,
+            crate::terminal::graceful_exit::ChildExemptions::none(),
         )
         .await
         .map_err(|e| {

@@ -4954,20 +4954,37 @@ impl TerminalSession {
     /// `authority` is the caller's close authority, checked once the probe has
     /// found a live `claude` and before any byte is typed. See
     /// [`crate::terminal::close_authority`].
+    ///
+    /// `exempt` is the child-gate policy: the direct children of the `claude`
+    /// it admits are not counted against the close. It reaches the FIRST probe
+    /// only, the one whose child count the gate reads; every later probe
+    /// (the wait for `claude` to leave) counts nothing and needs none.
     pub(super) async fn graceful_exit_then<C, CF>(
         &self,
         deadline: std::time::Duration,
         close_tab: C,
         authority: Option<crate::terminal::close_authority::CloseAuthority>,
+        exempt: crate::terminal::graceful_exit::ChildExemptions,
     ) -> crate::terminal::graceful_exit::GracefulExitOutcome
     where
         C: FnOnce() -> CF,
         CF: std::future::Future<Output = crate::terminal::graceful_exit::CloseTabResult>,
     {
         let root = self.child_pid;
+        let mut first = Some(exempt);
         self.graceful_exit_driven(
             crate::terminal::graceful_exit::ExitTiming::with_deadline(deadline),
-            move |tracked| crate::terminal::graceful_exit::probe_claude_under(root, tracked),
+            move |tracked| {
+                let exempt = first
+                    .take()
+                    .unwrap_or_else(crate::terminal::graceful_exit::ChildExemptions::none);
+                async move {
+                    crate::terminal::graceful_exit::probe_claude_under_exempting(
+                        root, tracked, &exempt,
+                    )
+                    .await
+                }
+            },
             close_tab,
             authority,
         )
@@ -6238,16 +6255,21 @@ pub(crate) mod tests {
         }
     }
 
+    /// `children`: the direct children of the top-level `claude`, each counted
+    /// against a close unless the caller's exemptions admit it.
     fn scripted_pane(
         subtree_claude: Vec<crate::terminal::graceful_exit::ProcIdentity>,
+        children: Vec<u32>,
     ) -> ScriptedPane {
         let claude_pids = subtree_claude.iter().map(|id| id.pid).collect();
-        let scripted = crate::terminal::graceful_exit::fake_process_table::register(
+        let scripted = crate::terminal::graceful_exit::fake_process_table::register_with_children(
             crate::terminal::graceful_exit::PaneProcesses {
                 subtree_claude,
                 top_level_children: 0,
+                exempted_children: Vec::new(),
                 tracked_alive: Vec::new(),
             },
+            children,
         );
         let (session, io, typed) = live_prompt_parts(EMPTY_PROMPT, true, Some(scripted.root_pid));
         ScriptedPane {
@@ -6261,15 +6283,30 @@ pub(crate) mod tests {
 
     /// One live `claude`, ZERO children — see [`ScriptedPane`].
     pub(crate) fn live_claude_pane() -> ScriptedPane {
-        scripted_pane(vec![crate::terminal::graceful_exit::ProcIdentity {
-            pid: 4242,
-            started_at: 1_000,
-        }])
+        scripted_pane(
+            vec![crate::terminal::graceful_exit::ProcIdentity {
+                pid: 4242,
+                started_at: 1_000,
+            }],
+            Vec::new(),
+        )
+    }
+
+    /// One live `claude` whose ONLY direct child is `child` — refused for its
+    /// child unless the caller's exemptions admit it. See [`ScriptedPane`].
+    pub(crate) fn live_claude_pane_with_child(child: u32) -> ScriptedPane {
+        scripted_pane(
+            vec![crate::terminal::graceful_exit::ProcIdentity {
+                pid: 4242,
+                started_at: 1_000,
+            }],
+            vec![child],
+        )
     }
 
     /// No `claude` in the pane: a bare shell — see [`ScriptedPane`].
     pub(crate) fn bare_shell_pane() -> ScriptedPane {
-        scripted_pane(Vec::new())
+        scripted_pane(Vec::new(), Vec::new())
     }
 
     const EMPTY_PROMPT: &str = "done.\r\n\u{276f} ";
@@ -6297,6 +6334,7 @@ pub(crate) mod tests {
             crate::terminal::graceful_exit::PaneProcesses {
                 subtree_claude: subtree.to_vec(),
                 top_level_children: 0,
+                exempted_children: Vec::new(),
                 tracked_alive: alive.to_vec(),
             },
         )
@@ -6377,6 +6415,7 @@ pub(crate) mod tests {
                     crate::terminal::graceful_exit::CloseTabResult::Closed
                 },
                 None,
+                crate::terminal::graceful_exit::ChildExemptions::none(),
             )
             .await;
 
@@ -6390,6 +6429,56 @@ pub(crate) mod tests {
         assert!(!closed.load(Ordering::SeqCst), "the close was reached");
         assert_eq!(pane.kills(), 0);
         assert!(pane.session.is_alive());
+    }
+
+    /// The child-gate exemptions reach the FIRST probe only: the one whose child
+    /// count the gate reads. The wait loop that follows probes many more times
+    /// (the scripted `claude` never leaves, so the run ends `ExitStuck` at the
+    /// deadline after a probe every poll interval) and must consult the
+    /// exemptions — which, for a stray, is a `/proc` re-proof — not once more.
+    #[tokio::test(start_paused = true)]
+    async fn graceful_exit_then_applies_exemptions_on_the_first_probe_only() {
+        use crate::terminal::graceful_exit::{
+            AdmissionCounter, ChildExemption, ChildExemptions, GracefulExitOutcome,
+        };
+
+        const CHILD: u32 = 5252;
+        let pane = live_claude_pane_with_child(CHILD);
+        let counter = AdmissionCounter::default();
+        let closed = Arc::new(AtomicBool::new(false));
+        let closed_flag = Arc::clone(&closed);
+        let outcome = pane
+            .session
+            .graceful_exit_then(
+                Duration::from_secs(60),
+                move || async move {
+                    closed_flag.store(true, Ordering::SeqCst);
+                    crate::terminal::graceful_exit::CloseTabResult::Closed
+                },
+                Some(crate::terminal::close_authority::CloseAuthority::for_test()),
+                ChildExemptions::for_test(vec![
+                    ChildExemption::AdmitForTest(CHILD),
+                    ChildExemption::CountAdmissions(counter.clone()),
+                ]),
+            )
+            .await;
+
+        // Past the child gate (the admitted child), `/exit` typed, then a full
+        // deadline of wait probes.
+        match &outcome {
+            GracefulExitOutcome::ExitStuck { waited_ms, .. } => {
+                assert!(*waited_ms >= 60_000, "{outcome:?}")
+            }
+            other => panic!("expected ExitStuck past the child gate, got {other:?}"),
+        }
+        assert_eq!(pane.typed(), b"/exit\r");
+        assert_eq!(
+            counter.count(),
+            1,
+            "the exemptions were consulted on a probe other than the first"
+        );
+        assert!(!closed.load(Ordering::SeqCst));
+        assert_eq!(pane.kills(), 0);
     }
 
     #[tokio::test(start_paused = true)]
