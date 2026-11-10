@@ -33,6 +33,7 @@ import {
   Sparkles,
   Repeat,
 } from "lucide-react";
+import { loopVerdict, NOTHING_VERIFIED_LABEL } from "@/lib/loop-result-verdict";
 import type { Finding, FindingSeverity } from "../../types/findings";
 import { findingsTracker, getVisibleCategories, aiDataService } from "../../services";
 import { useRunSelectionOptional } from "../../contexts/RunSelectionContext";
@@ -285,6 +286,8 @@ export function ExecutionSummaryTab() {
     );
   }
 
+  const runLoopVerdict = selectedRun?.loop_result ? loopVerdict(selectedRun.loop_result) : null;
+
   return (
     <div className="h-full flex flex-col overflow-hidden">
       {/* Header */}
@@ -408,11 +411,13 @@ export function ExecutionSummaryTab() {
       {selectedRun?.loop_result && (
         <div
           className={`shrink-0 border-b border-border p-4 space-y-3 ${
-            selectedRun.loop_result.verification_passed
+            runLoopVerdict === "passed"
               ? "bg-green-500/5"
-              : selectedRun.loop_result.critical_failure
+              : runLoopVerdict === "critical_failure"
                 ? "bg-red-500/5"
-                : "bg-amber-500/5"
+                : runLoopVerdict === "nothing_verified"
+                  ? "bg-muted/30"
+                  : "bg-amber-500/5"
           }`}
         >
           <div className="flex items-center justify-between">
@@ -421,22 +426,25 @@ export function ExecutionSummaryTab() {
               <h3 className="font-medium text-foreground">Execution Loop</h3>
               <span
                 className={`px-2 py-0.5 text-xs rounded ${
-                  selectedRun.loop_result.verification_passed
+                  runLoopVerdict === "passed"
                     ? `${getStatusColors("success").bg} ${getStatusColors("success").text}`
-                    : selectedRun.loop_result.critical_failure
+                    : runLoopVerdict === "critical_failure"
                       ? `${getStatusColors("error").bg} ${getStatusColors("error").text}`
-                      : `${getAccentColors("amber").bg} ${getAccentColors("amber").text}`
+                      : runLoopVerdict === "nothing_verified"
+                        ? "bg-muted text-muted-foreground"
+                        : `${getAccentColors("amber").bg} ${getAccentColors("amber").text}`
                 }`}
               >
-                {selectedRun.loop_result.verification_passed
-                  ? "Passed"
-                  : selectedRun.loop_result.critical_failure
-                    ? "Critical Failure"
-                    : selectedRun.loop_result.was_stopped
-                      ? "Stopped"
-                      : selectedRun.loop_result.max_iterations_reached
-                        ? "Max Iterations"
-                        : "Failed"}
+                {
+                  {
+                    passed: "Passed",
+                    critical_failure: "Critical Failure",
+                    stopped: "Stopped",
+                    nothing_verified: NOTHING_VERIFIED_LABEL,
+                    max_iterations: "Max Iterations",
+                    failed: "Failed",
+                  }[loopVerdict(selectedRun.loop_result)]
+                }
               </span>
             </div>
             <span className="text-sm text-muted-foreground">
