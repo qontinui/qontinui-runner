@@ -638,6 +638,78 @@ impl AppState {
     }
 }
 
+#[cfg(test)]
+impl AppState {
+    /// An in-memory `AppState` for tests that need a real `StepExecutor`
+    /// (whose constructors take an `Arc<AppState>`). Hermetic: nothing here
+    /// touches the disk, the network or a process-global — the database is
+    /// `PgDb::new_noop_for_test` (every query errors), `LocalStorage` is built
+    /// without `LocalStorage::new` (which creates directories), and no global
+    /// (`PgDb::set_global`, `WorkingRepresentationCache::set_global`) is set.
+    pub(crate) fn new_for_test() -> Arc<Self> {
+        let unused_dir = std::env::temp_dir().join("qontinui-app-state-for-test-unused");
+        Arc::new(Self {
+            bridge_manager: TokioMutex::new(None),
+            extraction_executor: Mutex::new(None),
+            sdk_connection: Arc::new(TokioMutex::new(
+                crate::mcp::sdk_client::SdkConnectionManager::new(),
+            )),
+            exploration_cancel: Arc::new(TokioMutex::new(None)),
+            current_config: Mutex::new(None),
+            display_processor: Arc::new(TokioMutex::new(DisplayProcessor::new())),
+            local_storage: Arc::new(Mutex::new(LocalStorage {
+                config: crate::storage::StorageConfig {
+                    screenshot_path: unused_dir.join("screenshots"),
+                    video_path: unused_dir.join("videos"),
+                    max_screenshot_mb: 0,
+                    max_video_mb: 0,
+                    auto_cleanup: false,
+                },
+            })),
+            video_recorder: Arc::new(Mutex::new(VideoRecordingService::new())),
+            event_broadcast: broadcast::channel(16).0,
+            pg_db: PgDb::new_noop_for_test(),
+            run_recording_handler: Arc::new(RunRecordingHandler::new()),
+            mcp_client_manager: TokioMutex::new(McpClientManager::new()),
+            error_monitor_handle: TokioMutex::new(None),
+            doctor_handle: TokioMutex::new(None),
+            url_lock_manager: Arc::new(UrlLockManager::new()),
+            file_registry_manager: Arc::new(FileRegistryManager::new()),
+            file_lock_manager: Arc::new(FileLockManager::new()),
+            touch_events_tx: broadcast::channel(16).0,
+            ui_bridge_failure_tracker: UiBridgeFailureTracker::new(),
+            process_capture_manager: TokioMutex::new(None),
+            api_ready: AtomicBool::new(false),
+            frontend_ready: AtomicBool::new(false),
+            ui_bridge_last_pong: Arc::new(AtomicU64::new(0)),
+            api_port: AtomicU16::new(0),
+            api_lan_bound: AtomicBool::new(false),
+            ai_pid_tracker: Arc::new(Mutex::new(Vec::new())),
+            canvas_state: Arc::new(tokio::sync::RwLock::new(
+                crate::mcp::canvas::CanvasState::new(),
+            )),
+            orchestration_loops: Arc::new(TokioMutex::new(
+                crate::orchestration_loop::loop_engine::MultiLoopManager::new(),
+            )),
+            container_executor: TokioMutex::new(None),
+            run_cost_trackers: TokioMutex::new(HashMap::new()),
+            working_representation_cache: Arc::new(
+                crate::memory::working_representation::WorkingRepresentationCache::new(),
+            ),
+            server_mode: Arc::new(tokio::sync::RwLock::new(None)),
+            ui_error: Arc::new(crate::ui_error::UiErrorState::new()),
+            crash_dumps: Arc::new(crate::crash_dumps::CrashDumpState::new()),
+            usb_transport: Arc::new(tokio::sync::OnceCell::new()),
+            app_registry: Arc::new(tokio::sync::OnceCell::new()),
+            app_dispatcher: Arc::new(tokio::sync::OnceCell::new()),
+            wrapper_state: Arc::new(tokio::sync::OnceCell::new()),
+            prehydration_cache: Arc::new(
+                crate::unified_workflow_executor::prehydration::PrehydrationCache::new(),
+            ),
+        })
+    }
+}
+
 /// Standard response structure for command handlers.
 ///
 /// Provides a consistent response format across all commands with:

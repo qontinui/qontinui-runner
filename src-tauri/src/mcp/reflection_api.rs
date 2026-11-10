@@ -24,8 +24,8 @@ use crate::reflection::storage::ReflectionRunSummary;
 use crate::reflection::trends::{self, ComponentTrend, EffectivenessOverTime, WorkflowTrends};
 use crate::reflection::trigger::ConvergenceStatus;
 use crate::reflection::types::{
-    CreateReflectionFixInput, EffectivenessReport, ReflectionFix, UpdateEffectivenessInput,
-    UpdateFixStatusInput,
+    CreateReflectionFixInput, EffectivenessReport, FixEffectiveness, ReflectionFix,
+    UpdateEffectivenessInput, UpdateFixStatusInput,
 };
 
 /// Query parameters for listing reflection fixes.
@@ -373,39 +373,48 @@ pub async fn evaluate_fixes_handler(
     Query(query): Query<EvaluateQuery>,
 ) -> Result<Json<ApiResponse<EvaluateResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
     let wf_name = query.workflow_name.clone();
-    let results = state
-        .app_state
-        .pg_db
-        .evaluate_pending_fixes(&wf_name)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!("Failed to evaluate fixes: {}", e))),
-            )
-        })?;
+    let evaluated = state.app_state.pg_db.evaluate_pending_fixes(&wf_name).await;
 
-    let evaluated_count = results.len() as u32;
-    let effective_count = results
-        .iter()
-        .filter(|r| r.effectiveness.as_deref() == Some("effective"))
-        .count() as u32;
+    // Batch effectiveness evaluation changes graph weights, and so does its
+    // re-queue, which can withdraw an `effective` stamp in a call that writes
+    // no verdict at all, or that fails after the re-queue committed.
+    crate::mcp::graph_api::invalidate_graph_cache(&state, "evaluate_fixes").await;
 
-    // Batch effectiveness evaluation changes graph weights
-    if evaluated_count > 0 {
-        crate::mcp::graph_api::invalidate_graph_cache(&state, "evaluate_fixes").await;
-    }
-
-    Ok(Json(ApiResponse::success(EvaluateResponse {
-        evaluated_count,
-        effective_count,
-    })))
+    let results = evaluated.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Failed to evaluate fixes: {}", e))),
+        )
+    })?;
+    Ok(Json(ApiResponse::success(EvaluateResponse::from_written(
+        &results,
+    ))))
 }
 
 #[derive(Debug, Serialize)]
 pub struct EvaluateResponse {
     pub evaluated_count: u32,
     pub effective_count: u32,
+}
+
+impl EvaluateResponse {
+    /// The counts over the rows `evaluate_pending_fixes` WROTE — it returns only
+    /// those, each with the effectiveness it wrote. A pending fix left
+    /// unevaluated (too little exposure, or an unreadable count) is in neither
+    /// count. Before plan
+    /// 2026-11-06-a-product-workflow-verification-with-nothing-to-check-never-reports-passed
+    /// Phase 4, every pending row read was counted as evaluated, and
+    /// `effective_count` counted rows whose effectiveness was still NULL.
+    fn from_written(written: &[ReflectionFix]) -> Self {
+        let effective = FixEffectiveness::Effective.as_str();
+        Self {
+            evaluated_count: written.len() as u32,
+            effective_count: written
+                .iter()
+                .filter(|fix| fix.effectiveness.as_deref() == Some(effective))
+                .count() as u32,
+        }
+    }
 }
 
 // =============================================================================
@@ -1198,4 +1207,55 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
             "/reflection/trends/effectiveness",
             get(effectiveness_trend_handler),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A row as `evaluate_pending_fixes` returns it: written, with its verdict.
+    fn written(id: &str, effectiveness: &str) -> ReflectionFix {
+        ReflectionFix {
+            id: id.to_string(),
+            source_task_run_id: "run-0".to_string(),
+            reflection_task_run_id: "reflection-0".to_string(),
+            source_finding_id: None,
+            source_knowledge_id: None,
+            fix_type: "context_addition".to_string(),
+            fix_description: "fixture".to_string(),
+            file_changed: None,
+            old_value: None,
+            new_value: None,
+            confidence: "medium".to_string(),
+            content_hash: None,
+            status: "applied".to_string(),
+            effectiveness: Some(effectiveness.to_string()),
+            effectiveness_evidence: Some("{}".to_string()),
+            applied_at: "2026-01-10 00:00:00+00".to_string(),
+            evaluated_at: Some("2026-01-16 00:00:00+00".to_string()),
+            created_at: "2026-01-10 00:00:00+00".to_string(),
+            source_agent: None,
+            reasoning: None,
+            alternatives_considered: None,
+            reflection_scope: None,
+            project_path: None,
+            applicability_context: None,
+        }
+    }
+
+    #[test]
+    fn evaluate_response_counts_only_the_rows_written() {
+        let none = EvaluateResponse::from_written(&[]);
+        assert_eq!((none.evaluated_count, none.effective_count), (0, 0));
+        let one = EvaluateResponse::from_written(&[written("a", "effective")]);
+        assert_eq!((one.evaluated_count, one.effective_count), (1, 1));
+        let many = EvaluateResponse::from_written(&[
+            written("a", "effective"),
+            written("b", "ineffective"),
+            written("c", "inconclusive"),
+            written("d", "caused_regression"),
+            written("e", "effective"),
+        ]);
+        assert_eq!((many.evaluated_count, many.effective_count), (5, 2));
+    }
 }

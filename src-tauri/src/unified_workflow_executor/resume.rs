@@ -164,6 +164,34 @@ fn persisted_any_passed(state_data: Option<&str>) -> PersistedAnyPassed {
     }
 }
 
+/// What a state row says about the run's `NoVerificationSteps` latch: the
+/// `any_checked_nothing` key `persist_workflow_state` stamps on every row it
+/// writes (`UnifiedWorkflowState::with_checked_nothing`).
+///
+/// The safe default is the OPPOSITE of `any_passed`'s. A latch read as `false`
+/// lets a later passing stage report the workflow passed, so a row whose
+/// verdict cannot be read reads LATCHED: an unknown never adopts a pass. That
+/// covers NULL `state_data`, JSON that does not parse, a non-object, and a
+/// present key with a non-boolean value. Only a well-formed row that genuinely
+/// has no key reads `false`. Such a row was either written before the latch
+/// existed (a closed population, read as it always was) or is a state that
+/// carries no accumulator.
+fn checked_nothing_from_state_data(state_data: Option<&str>) -> bool {
+    let Some(data) = state_data else {
+        return true;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
+        return true;
+    };
+    let Some(object) = value.as_object() else {
+        return true;
+    };
+    match object.get("any_checked_nothing") {
+        None => false,
+        Some(latch) => latch.as_bool().unwrap_or(true),
+    }
+}
+
 /// Extract `approval_id` from a serialized `UnifiedWorkflowState::ApprovalPending`.
 fn approval_id_from_state_data(state_data: Option<&str>) -> String {
     state_data
@@ -600,6 +628,28 @@ impl ResumeManager {
             &|| self.load_checkpoints(execution_id),
             &|| self.legacy_resume_point(execution_id),
         )
+    }
+
+    /// Whether a stage before the resume point ended `NoVerificationSteps`:
+    /// the run's latch, read from the same state row `determine_resume_point`
+    /// reads.
+    ///
+    /// The row is admissible on exactly that function's terms. A composed-run
+    /// child never reads it, since it is shared with the child's siblings, and
+    /// a row of another workflow type is not this run's. Both answer `false`,
+    /// as their resume point does not come from the row either.
+    /// `run_inner` applies the answer only to a resume that is not a fresh
+    /// start: a fresh start re-runs every stage and inherits nothing.
+    pub fn prior_stages_checked_nothing(&self, execution_id: &str) -> bool {
+        if is_sequence_child(execution_id) {
+            return false;
+        }
+        match self.load_state_record(execution_id) {
+            Some(record) if record.workflow_type == UNIFIED_WORKFLOW_TYPE => {
+                checked_nothing_from_state_data(record.state_data.as_deref())
+            }
+            _ => false,
+        }
     }
 
     /// Pure resume decision: pick the source, then derive the point.
@@ -2540,5 +2590,54 @@ mod tests {
         ] {
             assert!(!v.reason().is_empty());
         }
+    }
+}
+
+#[cfg(test)]
+mod checked_nothing_latch_tests {
+    use super::checked_nothing_from_state_data;
+    use crate::unified_workflow_executor::states::UnifiedWorkflowState;
+
+    #[test]
+    fn a_stamped_row_reads_its_latch() {
+        assert!(checked_nothing_from_state_data(Some(
+            r#"{"type":"stage_complete","stage_index":1,"any_passed":true,"any_checked_nothing":true}"#
+        )));
+        assert!(!checked_nothing_from_state_data(Some(
+            r#"{"type":"stage_complete","stage_index":1,"any_passed":true,"any_checked_nothing":false}"#
+        )));
+    }
+
+    /// A well-formed row with no key: written before the latch existed, or a
+    /// state that carries no accumulator.
+    #[test]
+    fn a_row_without_the_key_reads_unlatched() {
+        assert!(!checked_nothing_from_state_data(Some(
+            r#"{"type":"stage_complete","stage_index":1,"any_passed":true}"#
+        )));
+        assert!(!checked_nothing_from_state_data(Some(
+            r#"{"type":"created"}"#
+        )));
+    }
+
+    /// A row whose verdict cannot be read never lets a later stage report a pass.
+    #[test]
+    fn an_unreadable_row_reads_latched() {
+        assert!(checked_nothing_from_state_data(None));
+        assert!(checked_nothing_from_state_data(Some("not json")));
+        assert!(checked_nothing_from_state_data(Some("[1,2]")));
+        assert!(checked_nothing_from_state_data(Some(
+            r#"{"type":"stage_complete","stage_index":1,"any_checked_nothing":"yes"}"#
+        )));
+    }
+
+    /// The writer and the reader agree on the key.
+    #[test]
+    fn a_stamped_state_round_trips_through_the_reader() {
+        let state = UnifiedWorkflowState::verification_running(2, Some(1), true);
+        let stamped = serde_json::to_string(&state.clone().with_checked_nothing(true)).unwrap();
+        let unstamped = serde_json::to_string(&state).unwrap();
+        assert!(checked_nothing_from_state_data(Some(&stamped)));
+        assert!(!checked_nothing_from_state_data(Some(&unstamped)));
     }
 }
