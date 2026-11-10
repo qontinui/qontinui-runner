@@ -7,24 +7,28 @@
 //! writes only its own app's rows:
 //!
 //! - `POST .../scan` — discovers eligible `fullPage` candidates
-//!   (un-spec'd pathnames with ≥ N observations in the lookback window) and
-//!   `patch` candidates (drift-flagged specs), inserts them into
+//!   (un-spec'd pathnames with ≥ N of THIS app's observations in the lookback
+//!   window) and `patch` candidates (drift-flagged specs), inserts them into
 //!   `atlas_managed.spec_proposals` with `status = 'queued'`, and first puts
-//!   back in the queue any proposal left `inFlight` by an execute that died
-//!   (`requeuedStale`).
+//!   back in the queue any proposal whose execute died holding it
+//!   (`requeuedStale`), stopping the task run that execute recorded
+//!   (`stoppedStaleRuns`).
 //! - `POST .../{id}/execute` — drives one queued proposal through
 //!   `spec_authoring::author_candidate` then `validator::validate_candidate`
 //!   (Step 8 — distinctness → round-trip → coverage → b-green) and lands
 //!   the candidate in `_pending/` via `storage::write_pending_ir` (Step 9).
 //!   Authoring runs an AI meta-workflow on the user's account, so only a
 //!   `queued` proposal is executed (`queued → inFlight` is one
-//!   compare-and-set; anything else answers 409 `proposal-not-queued`), and
-//!   the run is authorized first: when coord's device drain defers it, or the
-//!   agent registry refuses it, nothing is spawned, the proposal goes back to
-//!   `queued` and the answer is `outcome: "skipped"`. An execute whose caller
-//!   goes away before its outcome is written also puts the proposal back in
-//!   the queue; one that died with its runner is re-queued by the next scan,
-//!   once it is older than any execute can run. On validator rejection
+//!   compare-and-set that writes a claim token; anything else answers 409
+//!   `proposal-not-queued`), and the run is authorized first: when coord's
+//!   device drain defers it, or the agent registry refuses it, nothing is
+//!   spawned, the proposal goes back to `queued` and the answer is
+//!   `outcome: "skipped"`. Every write the execute makes to the row matches
+//!   its claim token. An execute whose caller goes away before its outcome is
+//!   written also puts the proposal back in the queue; one that died with its
+//!   runner is re-queued by the next scan once its claim has outlived the
+//!   claimant's own bound, and the task run it recorded is stopped. On
+//!   validator rejection
 //!   the structured `ValidatorError` reason + detail is persisted to
 //!   `spec_proposals.last_error` and returned as `outcome:
 //!   "validator-rejected"`. Authoring failures stay distinct and surface as
@@ -162,39 +166,50 @@ pub async fn post_scan(
     // ---- Executes that died -----------------------------------------------
     // An execute that died with its runner leaves its proposal `inFlight`,
     // and nothing else would ever pick that row up: the dedup index keeps the
-    // target from being queued again. No execute runs longer than
-    // `stale_in_flight_after`, so an older `inFlight` row goes back in the
-    // queue here, at the queue's intake. `None` when the re-queue failed: how
-    // many it would have taken is unknown, not zero.
-    let stale_after = stale_in_flight_after(
+    // target from being queued again. A claim records its claimant's own
+    // bound on how long it may hold the row (`stale_in_flight_after` of THAT
+    // process's execute timeout), so a row held longer than that goes back in
+    // the queue here, at the queue's intake, and the task run its execute
+    // recorded is stopped. This process's bound applies only to a row whose
+    // claim recorded none. `None` when the re-queue failed: how many it would
+    // have taken is unknown, not zero.
+    let fallback_stale_after = stale_in_flight_after(
         crate::workflow_generation::meta_workflow_run::configured_execute_timeout(),
     );
-    let requeued_stale = match pg_db
-        .requeue_stale_in_flight_proposals(&app_id, stale_after.as_secs_f64(), STALE_EXECUTE_ERROR)
+    let stale = match pg_db
+        .requeue_stale_in_flight_proposals(
+            &app_id,
+            fallback_stale_after,
+            STALE_EXECUTE_ERROR,
+            STALE_RUN_STOP_REASON,
+        )
         .await
     {
-        Ok(n) => Some(n),
+        Ok(stale) => Some(stale),
         Err(e) => {
             warn!("post_scan: requeue_stale_in_flight_proposals failed: {}", e);
             None
         }
     };
+    let requeued_stale = stale.map(|s| s.requeued);
+    let stopped_stale_runs = stale.map(|s| s.runs_stopped);
 
     // ---- Full-page branch -------------------------------------------------
-    let full_page_rows = match query_eligible_pathnames(&pg_db, lookback, min_obs, limit).await {
-        Ok(rows) => rows,
-        Err(e) => {
-            warn!("post_scan: query_eligible_pathnames failed: {}", e);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(SpecError::with_detail(
-                    "scan-query-failed",
-                    json!({ "branch": "fullPage", "error": e }),
-                )),
-            )
-                .into_response();
-        }
-    };
+    let full_page_rows =
+        match query_eligible_pathnames(&pg_db, &app_id, lookback, min_obs, limit).await {
+            Ok(rows) => rows,
+            Err(e) => {
+                warn!("post_scan: query_eligible_pathnames failed: {}", e);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(SpecError::with_detail(
+                        "scan-query-failed",
+                        json!({ "branch": "fullPage", "error": e }),
+                    )),
+                )
+                    .into_response();
+            }
+        };
 
     // Compare page labels to spec ids directly. Both sides are now the same
     // slug space (`storage::list_pages` returns spec ids; the scan groups by
@@ -322,11 +337,12 @@ pub async fn post_scan(
     }
 
     info!(
-        "post_scan: scanned_pathnames={} scanned_drift_reports={} queued={} requeued_stale={:?}",
+        "post_scan: scanned_pathnames={} scanned_drift_reports={} queued={} requeued_stale={:?} stopped_stale_runs={:?}",
         scanned_pathnames,
         scanned_drift_reports,
         queued.len(),
-        requeued_stale
+        requeued_stale,
+        stopped_stale_runs
     );
 
     (
@@ -337,40 +353,52 @@ pub async fn post_scan(
             "scannedDriftReports": scanned_drift_reports,
             "queuedProposals": queued,
             "requeuedStale": requeued_stale,
+            "stoppedStaleRuns": stopped_stale_runs,
             "reason": reason,
         })),
     )
         .into_response()
 }
 
-/// Find pages with enough observations to be worth authoring a spec for.
-/// Returns page labels sorted by observation count desc, capped at `limit`.
+/// Whether `co_occurrence_observations` has the `app_id` column capture writes
+/// (qontinui-web migration `appid_01_co_occurrence_app_id`). Asked per scan, a
+/// catalog read: a scan is rare, and an answer cached per process would pin
+/// whichever database a test process reached first.
+const OBSERVATION_APP_ID_COLUMN_SQL: &str = r#"SELECT EXISTS (
+    SELECT 1 FROM pg_attribute
+    WHERE attrelid = to_regclass('co_occurrence_observations')
+      AND attname = 'app_id'
+      AND attnum > 0
+      AND NOT attisdropped)"#;
+
+/// The page labels `app_id`'s scan may queue: labels its own observations
+/// carry at least `$2` times in the lookback window.
 ///
-/// Groups by the `spec_id` label `state_discovery::capture` writes, NOT by
-/// `snapshot_metadata->>'pathname'` as `05-flywheel.md` § Step 7 originally
-/// specified. The pathname is structurally `/` for every view of a desktop
-/// SPA, so grouping by it yielded exactly one candidate whose label resolved
-/// to `root` — a page capture never labels. Producer and consumer disagreed
-/// on the key, and every proposal died with no active states. Grouping by the
-/// same column the selection side reads keeps the two ends in one namespace.
-#[expect(
-    clippy::disallowed_methods,
-    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
-)]
-async fn query_eligible_pathnames(
-    pg_db: &crate::database::pg::PgDb,
-    lookback_days: i32,
-    min_observations: i32,
-    limit: i64,
-) -> Result<Vec<String>, String> {
-    let conn = pg_db
-        .pool()
-        .get()
-        .await
-        .map_err(|e| format!("PG pool error: {}", e))?;
-    let rows = conn
-        .query(
-            r#"
+/// An observation belongs to the app capture attributed it to. One capture
+/// could not attribute (`app_id` NULL, an observation older than attribution
+/// or one whose app was not registered) belongs to the bootstrap app,
+/// [`storage::RUNNER_APP_ID`], as a proposal from before `spec_proposals`
+/// carried an app is filed under it (`PgDb::verify_and_provision`). `$5` says
+/// whether the scanning app is that one.
+const ELIGIBLE_PAGE_LABELS_SQL: &str = r#"
+            SELECT
+                spec_id AS page_label,
+                COUNT(*) AS obs
+            FROM co_occurrence_observations
+            WHERE captured_at >= now() - ($1::int || ' days')::interval
+              AND invalidated_at IS NULL
+              AND spec_id IS NOT NULL
+              AND (app_id = $4 OR (app_id IS NULL AND $5::bool))
+            GROUP BY spec_id
+            HAVING COUNT(*) >= $2
+            ORDER BY obs DESC
+            LIMIT $3
+            "#;
+
+/// [`ELIGIBLE_PAGE_LABELS_SQL`] for a database whose observations carry no
+/// `app_id` column. Every observation there is unattributed, so it is the
+/// bootstrap app's alone, and only that app's scan runs this.
+const ELIGIBLE_PAGE_LABELS_UNATTRIBUTED_SQL: &str = r#"
             SELECT
                 spec_id AS page_label,
                 COUNT(*) AS obs
@@ -382,13 +410,69 @@ async fn query_eligible_pathnames(
             HAVING COUNT(*) >= $2
             ORDER BY obs DESC
             LIMIT $3
-            "#,
-            &[&lookback_days, &(min_observations as i64), &limit],
+            "#;
+
+/// Find pages with enough observations to be worth authoring a spec for.
+/// Returns page labels sorted by observation count desc, capped at `limit`.
+///
+/// Groups by the `spec_id` label `state_discovery::capture` writes, NOT by
+/// `snapshot_metadata->>'pathname'` as `05-flywheel.md` § Step 7 originally
+/// specified. The pathname is structurally `/` for every view of a desktop
+/// SPA, so grouping by it yielded exactly one candidate whose label resolved
+/// to `root` — a page capture never labels. Producer and consumer disagreed
+/// on the key, and every proposal died with no active states. Grouping by the
+/// same column the selection side reads keeps the two ends in one namespace.
+///
+/// `app_id`'s scan reads only `app_id`'s observations
+/// ([`ELIGIBLE_PAGE_LABELS_SQL`]). Every queued proposal starts a paid
+/// authoring run, and the dedup index is per app, so reading every app's
+/// observations would queue each label once per registered app.
+pub(crate) async fn query_eligible_pathnames(
+    pg_db: &crate::database::pg::PgDb,
+    app_id: &str,
+    lookback_days: i32,
+    min_observations: i32,
+    limit: i64,
+) -> Result<Vec<String>, String> {
+    let conn = pg_db
+        .pool()
+        .get()
+        .await
+        .map_err(|e| format!("PG pool error: {}", e))?;
+    let bootstrap_app = app_id == storage::RUNNER_APP_ID;
+    let attributed: bool = conn
+        .query_one(OBSERVATION_APP_ID_COLUMN_SQL, &[])
+        .await
+        .and_then(|row| row.try_get(0))
+        .map_err(|e| format!("PG query_eligible_pathnames (app_id column probe): {}", e))?;
+    let min_observations = min_observations as i64;
+    let rows = if attributed {
+        conn.query(
+            ELIGIBLE_PAGE_LABELS_SQL,
+            &[
+                &lookback_days,
+                &min_observations,
+                &limit,
+                &app_id,
+                &bootstrap_app,
+            ],
         )
         .await
-        .map_err(|e| format!("PG query_eligible_pathnames: {}", e))?;
+    } else if bootstrap_app {
+        conn.query(
+            ELIGIBLE_PAGE_LABELS_UNATTRIBUTED_SQL,
+            &[&lookback_days, &min_observations, &limit],
+        )
+        .await
+    } else {
+        return Ok(Vec::new());
+    }
+    .map_err(|e| format!("PG query_eligible_pathnames: {}", e))?;
 
-    Ok(rows.iter().map(|r| r.get::<usize, String>(0)).collect())
+    rows.iter()
+        .map(|r| r.try_get::<usize, String>(0))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("PG query_eligible_pathnames (page_label): {}", e))
 }
 
 // =============================================================================
@@ -448,12 +532,19 @@ pub async fn execute_proposal(
         }
     };
 
-    // Claim it: `queued → inFlight` as one compare-and-set. Authoring starts
-    // a paid AI run, so a retry, a concurrent execute, or an execute of a
-    // proposal already past the queue must not start another.
-    match pg_db.claim_proposal_for_execute(&app_id, &row.id).await {
-        Ok(true) => {}
-        Ok(false) => {
+    // Claim it: `queued → inFlight` as one compare-and-set, which writes a
+    // claim token and this process's bound on how long it may hold the row.
+    // Authoring starts a paid AI run, so a retry, a concurrent execute, or an
+    // execute of a proposal already past the queue must not start another.
+    let stale_after = stale_in_flight_after(
+        crate::workflow_generation::meta_workflow_run::configured_execute_timeout(),
+    );
+    let token = match pg_db
+        .claim_proposal_for_execute(&app_id, &row.id, stale_after)
+        .await
+    {
+        Ok(Some(token)) => token,
+        Ok(None) => {
             return (
                 StatusCode::CONFLICT,
                 Json(SpecError::with_detail(
@@ -474,20 +565,93 @@ pub async fn execute_proposal(
             )
                 .into_response();
         }
-    }
+    };
+    let claim = HeldClaim {
+        pg_db: pg_db.clone(),
+        proposal_id: row.id.clone(),
+        token,
+    };
 
     // Every return of `execute_claimed` writes the proposal's next status. If
     // this future is dropped first (the HTTP client hung up during the run),
     // the guard puts the proposal back in the queue rather than leave it
     // `inFlight`, where nothing would pick it up.
-    let requeue = RequeueOnDrop::armed(pg_db.clone(), row.id.clone());
-    let response = execute_claimed(pg_db, app_state, root, app_id, row, origin).await;
+    let requeue = RequeueOnDrop::armed(
+        pg_db.clone(),
+        claim.proposal_id.clone(),
+        claim.token.clone(),
+    );
+    let response = execute_claimed(pg_db, app_state, root, app_id, row, origin, &claim).await;
     requeue.disarm();
     response
 }
 
+/// The claim an execute holds on its proposal
+/// (`PgDb::claim_proposal_for_execute`). Every write the execute makes to the
+/// row goes through it, and lands only while the claim is still held: once a
+/// scan has taken the row back as stale, and another execute may hold it, this
+/// execute's writes change nothing.
+struct HeldClaim {
+    pg_db: Arc<PgDb>,
+    proposal_id: String,
+    token: String,
+}
+
+impl HeldClaim {
+    /// The claim as the executor records its run on it.
+    fn run_claim(&self) -> crate::workflow_generation::spec_authoring::RunClaim {
+        crate::workflow_generation::spec_authoring::RunClaim {
+            proposal_id: self.proposal_id.clone(),
+            token: self.token.clone(),
+        }
+    }
+
+    /// Settle the proposal `failed` with `last_error`.
+    async fn fail(&self, last_error: &str) {
+        let written = self
+            .pg_db
+            .fail_claimed_proposal(&self.proposal_id, &self.token, last_error)
+            .await;
+        report_settle(&self.proposal_id, "failed", written);
+    }
+
+    /// Settle the proposal `pendingPromotion` with its authored candidate.
+    /// `Ok(false)` means the claim is no longer held, and nothing was written:
+    /// the execute's caller is told, because its outcome was not recorded.
+    async fn stage(&self, candidate_ir: &serde_json::Value) -> Result<bool, String> {
+        self.pg_db
+            .stage_claimed_proposal(&self.proposal_id, &self.token, candidate_ir)
+            .await
+    }
+
+    /// Put the proposal back in the queue, keeping its `last_error`.
+    async fn requeue(&self) {
+        let written = self
+            .pg_db
+            .requeue_claimed_proposal(&self.proposal_id, &self.token, None)
+            .await;
+        report_settle(&self.proposal_id, "queued", written);
+    }
+}
+
+/// Log a claimed write that did not land.
+fn report_settle(proposal_id: &str, status: &str, written: Result<bool, String>) {
+    match written {
+        Ok(true) => {}
+        Ok(false) => warn!(
+            "post_execute: proposal {} was not set {}: its claim is no longer held \
+             (a scan took it back as stale)",
+            proposal_id, status
+        ),
+        Err(e) => warn!(
+            "post_execute: setting proposal {} {} failed: {}",
+            proposal_id, status, e
+        ),
+    }
+}
+
 /// The execute after its claim: author the candidate, validate it, and stage
-/// it. Every return writes the proposal's next status.
+/// it. Every return writes the proposal's next status through `claim`.
 async fn execute_claimed(
     pg_db: Arc<PgDb>,
     app_state: Arc<crate::commands::AppState>,
@@ -495,6 +659,7 @@ async fn execute_claimed(
     app_id: String,
     row: SpecProposalRow,
     origin: SpawnOrigin,
+    claim: &HeldClaim,
 ) -> Response {
     // Build the authoring mode from the row shape.
     let mode = match row.kind.as_str() {
@@ -503,9 +668,7 @@ async fn execute_claimed(
                 Some(p) => p,
                 None => {
                     let msg = "fullPage proposal missing pathname".to_string();
-                    let _ = pg_db
-                        .update_proposal_status_with_error(&row.id, "failed", &msg)
-                        .await;
+                    claim.fail(&msg).await;
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         Json(SpecError::with_detail(
@@ -523,9 +686,7 @@ async fn execute_claimed(
                 Some(s) => s,
                 None => {
                     let msg = "patch proposal missing spec_id".to_string();
-                    let _ = pg_db
-                        .update_proposal_status_with_error(&row.id, "failed", &msg)
-                        .await;
+                    claim.fail(&msg).await;
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         Json(SpecError::with_detail(
@@ -547,9 +708,7 @@ async fn execute_claimed(
                 {
                     Ok(d) => d,
                     Err(e) => {
-                        let _ = pg_db
-                            .update_proposal_status_with_error(&row.id, "failed", &e)
-                            .await;
+                        claim.fail(&e).await;
                         return (
                             StatusCode::OK,
                             Json(json!({
@@ -570,9 +729,7 @@ async fn execute_claimed(
         }
         other => {
             let msg = format!("unknown proposal kind: {}", other);
-            let _ = pg_db
-                .update_proposal_status_with_error(&row.id, "failed", &msg)
-                .await;
+            claim.fail(&msg).await;
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(SpecError::with_detail(
@@ -594,6 +751,7 @@ async fn execute_claimed(
         &app_id,
         mode,
         origin,
+        Some(claim.run_claim()),
     )
     .await
     {
@@ -603,12 +761,7 @@ async fn execute_claimed(
                 // Nothing was spawned: the drain deferred the run or the
                 // registry refused it. The proposal is not failed; it goes
                 // back to the queue for a later execute.
-                if let Err(err) = pg_db.update_proposal_status(&row.id, "queued").await {
-                    warn!(
-                        "post_execute: re-queue after a skipped execute failed: {}",
-                        err
-                    );
-                }
+                claim.requeue().await;
                 info!(
                     "post_execute: proposal {} skipped ({}): {}",
                     row.id,
@@ -630,9 +783,7 @@ async fn execute_claimed(
             }
             let reason = authoring_error_reason(&e);
             let detail = authoring_error_detail(&e);
-            let _ = pg_db
-                .update_proposal_status_with_error(&row.id, "failed", &detail)
-                .await;
+            claim.fail(&detail).await;
             metric_executed_inc("authoring-failed");
             return (
                 StatusCode::OK,
@@ -667,9 +818,7 @@ async fn execute_claimed(
     {
         let reason = crate::spec_api::validator::validator_error_reason(&verr);
         let detail = crate::spec_api::validator::validator_error_detail(&verr);
-        let _ = pg_db
-            .update_proposal_status_with_error(&row.id, "failed", &detail)
-            .await;
+        claim.fail(&detail).await;
         metric_executed_inc("validator-rejected");
         warn!(
             "post_execute: validator rejected proposal {}: {} — {}",
@@ -697,9 +846,7 @@ async fn execute_claimed(
         let _guard = match storage::page_lock(&root, &outcome.candidate.id) {
             Ok(g) => g,
             Err(e) => {
-                let _ = pg_db
-                    .update_proposal_status_with_error(&row.id, "failed", &e)
-                    .await;
+                claim.fail(&e).await;
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(SpecError::with_detail(
@@ -713,9 +860,7 @@ async fn execute_claimed(
         match storage::write_pending_ir(&root, &app_id, &outcome.candidate) {
             Ok(p) => p.display().to_string(),
             Err(e) => {
-                let _ = pg_db
-                    .update_proposal_status_with_error(&row.id, "failed", &e)
-                    .await;
+                claim.fail(&e).await;
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(SpecError::with_detail(
@@ -735,9 +880,7 @@ async fn execute_claimed(
         Err(e) => {
             warn!("post_execute: serialize candidate failed: {}", e);
             let msg = format!("serialize candidate: {}", e);
-            let _ = pg_db
-                .update_proposal_status_with_error(&row.id, "failed", &msg)
-                .await;
+            claim.fail(&msg).await;
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(SpecError::with_detail(
@@ -748,11 +891,43 @@ async fn execute_claimed(
                 .into_response();
         }
     };
-    if let Err(e) = pg_db
-        .update_proposal_candidate_ir(&row.id, "pendingPromotion", &candidate_json)
-        .await
-    {
-        warn!("post_execute: update_proposal_candidate_ir failed: {}", e);
+    match claim.stage(&candidate_json).await {
+        Ok(true) => {}
+        Ok(false) => {
+            // A scan took the proposal back as stale while this execute was
+            // still working: the row is the next execute's now, so this
+            // outcome is not recorded, and is not counted.
+            warn!(
+                "post_execute: proposal {} lost its claim before its candidate was recorded",
+                row.id
+            );
+            return (
+                StatusCode::OK,
+                Json(json!({
+                    "ok": false,
+                    "proposalId": row.id,
+                    "outcome": "claim-lost",
+                    "stagedPath": staged_path,
+                    "detail": "the proposal's claim was taken back as stale before its \
+                               candidate was recorded; the staged file is not its outcome",
+                })),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            warn!(
+                "post_execute: recording proposal {}'s candidate failed: {}",
+                row.id, e
+            );
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(SpecError::with_detail(
+                    "proposal-outcome-not-recorded",
+                    json!({ "proposalId": row.id, "stagedPath": staged_path, "error": e }),
+                )),
+            )
+                .into_response();
+        }
     }
 
     metric_executed_inc("promoted");
@@ -774,17 +949,22 @@ async fn execute_claimed(
 pub(crate) const ABANDONED_EXECUTE_ERROR: &str =
     "abandoned: the execute's caller went away before its outcome was written";
 
-/// `last_error` for a proposal left `inFlight` longer than any execute runs.
+/// `last_error` for a proposal whose claim outlived its claimant's own bound.
 pub(crate) const STALE_EXECUTE_ERROR: &str =
-    "abandoned: inFlight longer than any execute runs (its runner likely died)";
+    "abandoned: inFlight longer than its execute's own bound (its runner likely died)";
+
+/// The `stopped` reason written on the task run a stale claim recorded.
+pub(crate) const STALE_RUN_STOP_REASON: &str =
+    "spec execute: its proposal claim went stale, nobody waiting";
 
 /// How much longer than its run's deadline an execute may take: authorizing,
 /// starting the run, then validating and staging its candidate.
 const STALE_IN_FLIGHT_MARGIN: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
-/// PURE: how long a proposal must have been `inFlight` before the scan takes
-/// it for an execute that died: the run deadline plus
-/// [`STALE_IN_FLIGHT_MARGIN`].
+/// PURE: how long an execute may hold its proposal `inFlight` before a scan
+/// takes it for an execute that died: the run deadline plus
+/// [`STALE_IN_FLIGHT_MARGIN`]. The claim records it, so it is the claimant's
+/// own bound that decides, whichever process scans.
 pub(crate) fn stale_in_flight_after(execute_timeout: std::time::Duration) -> std::time::Duration {
     execute_timeout + STALE_IN_FLIGHT_MARGIN
 }
@@ -793,14 +973,26 @@ pub(crate) fn stale_in_flight_after(execute_timeout: std::time::Duration) -> std
 /// production, a recording queue in tests.
 #[async_trait::async_trait]
 pub(crate) trait ProposalRequeue: Send + Sync {
-    /// Re-queue `id` with `last_error` while it is still `inFlight`.
-    async fn requeue_in_flight(&self, id: &str, last_error: &str) -> Result<bool, String>;
+    /// Re-queue `id` with `last_error` while the claim with `token` is still
+    /// held.
+    async fn requeue_claimed(
+        &self,
+        id: &str,
+        token: &str,
+        last_error: &str,
+    ) -> Result<bool, String>;
 }
 
 #[async_trait::async_trait]
 impl ProposalRequeue for PgDb {
-    async fn requeue_in_flight(&self, id: &str, last_error: &str) -> Result<bool, String> {
-        self.requeue_in_flight_proposal(id, last_error).await
+    async fn requeue_claimed(
+        &self,
+        id: &str,
+        token: &str,
+        last_error: &str,
+    ) -> Result<bool, String> {
+        self.requeue_claimed_proposal(id, token, Some(last_error))
+            .await
     }
 }
 
@@ -809,14 +1001,16 @@ impl ProposalRequeue for PgDb {
 struct RequeueOnDrop {
     queue: Arc<dyn ProposalRequeue>,
     proposal_id: String,
+    token: String,
     armed: bool,
 }
 
 impl RequeueOnDrop {
-    fn armed(queue: Arc<dyn ProposalRequeue>, proposal_id: String) -> Self {
+    fn armed(queue: Arc<dyn ProposalRequeue>, proposal_id: String, token: String) -> Self {
         Self {
             queue,
             proposal_id,
+            token,
             armed: true,
         }
     }
@@ -832,6 +1026,7 @@ impl Drop for RequeueOnDrop {
             return;
         }
         let proposal_id = std::mem::take(&mut self.proposal_id);
+        let token = std::mem::take(&mut self.token);
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             warn!(
                 "post_execute: proposal {} abandoned outside a tokio runtime; it stays inFlight \
@@ -843,7 +1038,7 @@ impl Drop for RequeueOnDrop {
         let queue = self.queue.clone();
         handle.spawn(async move {
             match queue
-                .requeue_in_flight(&proposal_id, ABANDONED_EXECUTE_ERROR)
+                .requeue_claimed(&proposal_id, &token, ABANDONED_EXECUTE_ERROR)
                 .await
             {
                 Ok(true) => info!(
@@ -851,7 +1046,8 @@ impl Drop for RequeueOnDrop {
                     proposal_id
                 ),
                 Ok(false) => info!(
-                    "post_execute: proposal {} abandoned after it left inFlight; left as it was",
+                    "post_execute: proposal {} abandoned after its claim was released; left \
+                     as it was",
                     proposal_id
                 ),
                 Err(e) => warn!(
@@ -1482,27 +1678,38 @@ mod tests {
     /// Records every re-queue it is asked for.
     #[derive(Default)]
     struct RecordingQueue {
-        requeued: std::sync::Mutex<Vec<(String, String)>>,
+        requeued: std::sync::Mutex<Vec<(String, String, String)>>,
     }
 
     #[async_trait::async_trait]
     impl ProposalRequeue for RecordingQueue {
-        async fn requeue_in_flight(&self, id: &str, last_error: &str) -> Result<bool, String> {
-            self.requeued
-                .lock()
-                .unwrap()
-                .push((id.to_string(), last_error.to_string()));
+        async fn requeue_claimed(
+            &self,
+            id: &str,
+            token: &str,
+            last_error: &str,
+        ) -> Result<bool, String> {
+            self.requeued.lock().unwrap().push((
+                id.to_string(),
+                token.to_string(),
+                last_error.to_string(),
+            ));
             Ok(true)
         }
     }
 
     /// An execute dropped while it holds its claim puts the proposal back in
-    /// the queue; one that finished (and disarmed the guard) does not.
+    /// the queue under that claim's token; one that finished (and disarmed the
+    /// guard) does not.
     #[tokio::test]
     async fn an_execute_dropped_before_its_outcome_requeues_its_proposal() {
         let queue = Arc::new(RecordingQueue::default());
-        drop(RequeueOnDrop::armed(queue.clone(), "prop_dropped".into()));
-        RequeueOnDrop::armed(queue.clone(), "prop_finished".into()).disarm();
+        drop(RequeueOnDrop::armed(
+            queue.clone(),
+            "prop_dropped".into(),
+            "claim-1".into(),
+        ));
+        RequeueOnDrop::armed(queue.clone(), "prop_finished".into(), "claim-2".into()).disarm();
         for _ in 0..4 {
             tokio::task::yield_now().await;
         }
@@ -1510,9 +1717,27 @@ mod tests {
             *queue.requeued.lock().unwrap(),
             vec![(
                 "prop_dropped".to_string(),
+                "claim-1".to_string(),
                 ABANDONED_EXECUTE_ERROR.to_string()
             )]
         );
+    }
+
+    /// The body of the fn whose signature starts with `name`, read from this
+    /// file's own source: the execute handlers take an `ApiState`, which holds
+    /// a `tauri::AppHandle` no test can build, so their wiring is pinned by
+    /// reading it.
+    fn fn_body(name: &str) -> &'static str {
+        let src: &'static str = include_str!("proposals.rs");
+        let (_, rest) = src
+            .split_once(name)
+            .unwrap_or_else(|| panic!("{name} is defined"));
+        rest.split_once("\n}\n").expect("the fn body ends").0
+    }
+
+    fn find_in(body: &str, needle: &str, name: &str) -> usize {
+        body.find(needle)
+            .unwrap_or_else(|| panic!("`{needle}` is missing from {name}"))
     }
 
     /// The execute claims before it can spawn, arms the guard on the claim,
@@ -1520,19 +1745,8 @@ mod tests {
     /// prove each step; this proves the order, which they cannot see.
     #[test]
     fn the_execute_claims_then_guards_then_authors() {
-        let src = include_str!("proposals.rs");
-        let body = |name: &str| {
-            let (_, rest) = src
-                .split_once(name)
-                .unwrap_or_else(|| panic!("{name} is defined"));
-            rest.split_once("\n}\n").expect("the fn body ends").0
-        };
-        let execute = body("pub async fn execute_proposal(");
-        let at = |needle: &str| {
-            execute
-                .find(needle)
-                .unwrap_or_else(|| panic!("`{needle}` is missing from execute_proposal"))
-        };
+        let execute = fn_body("pub async fn execute_proposal(");
+        let at = |needle: &str| find_in(execute, needle, "execute_proposal");
         let claim = at("claim_proposal_for_execute(");
         let arm = at("RequeueOnDrop::armed(");
         let work = at("execute_claimed(");
@@ -1546,7 +1760,55 @@ mod tests {
             !execute.contains("author_candidate("),
             "authoring happens only in execute_claimed, after the claim"
         );
-        assert!(body("async fn execute_claimed(").contains("author_candidate("));
+        assert!(fn_body("async fn execute_claimed(").contains("author_candidate("));
+    }
+
+    /// Everything `execute_claimed` writes to its proposal goes through the
+    /// claim it holds, and the run it starts is recorded on that claim. An
+    /// unfenced write would let an execute whose claim a scan took back
+    /// overwrite the next execute's state.
+    #[test]
+    fn the_claimed_execute_writes_only_through_its_claim() {
+        let claimed = fn_body("async fn execute_claimed(");
+        assert!(
+            claimed.contains("Some(claim.run_claim())"),
+            "the executor records its run on the execute's claim"
+        );
+        for unfenced in [
+            "update_proposal_status(",
+            "update_proposal_status_with_error(",
+            "pg_db.update_",
+        ] {
+            assert!(
+                !claimed.contains(unfenced),
+                "execute_claimed writes its proposal only through its claim; found `{unfenced}`"
+            );
+        }
+    }
+
+    /// A candidate whose claim was taken back before it was recorded answers
+    /// `claim-lost`, and only a recorded candidate is counted as promoted.
+    #[test]
+    fn a_candidate_whose_claim_was_lost_is_not_counted() {
+        let claimed = fn_body("async fn execute_claimed(");
+        let at = |needle: &str| find_in(claimed, needle, "execute_claimed");
+        let staged = at("claim.stage(");
+        let lost = at("\"claim-lost\"");
+        let counted = at("metric_executed_inc(\"promoted\")");
+        assert!(
+            staged < lost && lost < counted,
+            "a candidate whose claim was lost answers claim-lost before anything counts it \
+             promoted (found {staged}, {lost}, {counted})"
+        );
+        // The arm must also RETURN its answer: without the `return`, it would
+        // fall through to the count and answer `landed-in-pending`.
+        let arm = staged + find_in(&claimed[staged..], "Ok(false) =>", "the stage match");
+        let arm_end = arm + find_in(&claimed[arm..], "Err(", "the stage match");
+        let lost_arm = &claimed[arm..arm_end];
+        assert!(
+            lost_arm.contains("\"claim-lost\"") && lost_arm.contains("return ("),
+            "the claim-lost arm returns its answer:\n{lost_arm}"
+        );
     }
 
     #[test]
@@ -1943,87 +2205,149 @@ mod tests {
             (row.status, row.last_error)
         }
 
+        const HOUR: std::time::Duration = std::time::Duration::from_secs(3600);
+
+        async fn claim(
+            db: &PgDb,
+            app_id: &str,
+            id: &str,
+            bound: std::time::Duration,
+        ) -> Option<String> {
+            db.claim_proposal_for_execute(app_id, id, bound)
+                .await
+                .expect("claim")
+        }
+
+        async fn row_of(db: &PgDb, app_id: &str, id: &str) -> SpecProposalRow {
+            db.find_proposal_by_id(app_id, id)
+                .await
+                .expect("find")
+                .expect("the row exists")
+        }
+
+        /// Backdate the claims on `ids` by two hours.
+        async fn age_claims(db: &PgDb, ids: &[&str]) {
+            let conn = db.pool().get().await.expect("pg conn");
+            let ids: Vec<String> = ids.iter().map(|s| s.to_string()).collect();
+            conn.execute(
+                "UPDATE atlas_managed.spec_proposals \
+                 SET last_attempt_at = now() - interval '2 hours' \
+                 WHERE id = ANY($1)",
+                &[&ids],
+            )
+            .await
+            .expect("age the claims");
+        }
+
         /// The execute's claim is one compare-and-set: only a queued row of
-        /// the asking app moves to `inFlight`, and only once.
+        /// the asking app moves to `inFlight`, and only once. It records its
+        /// token and its claimant's own bound in `metadata.execute`.
         #[tokio::test(flavor = "multi_thread")]
         async fn an_execute_claims_only_a_queued_proposal_of_its_own_app() {
             let (_guard, db) = fresh_db().await;
             assert!(queue(&db, "prop_claim", "app-a", "/claim").await);
             assert!(
-                !db.claim_proposal_for_execute("app-b", "prop_claim")
-                    .await
-                    .expect("claim"),
+                claim(&db, "app-b", "prop_claim", HOUR).await.is_none(),
                 "another app cannot claim this app's proposal"
             );
             assert_eq!(status_of(&db, "app-a", "prop_claim").await.0, "queued");
 
-            assert!(db
-                .claim_proposal_for_execute("app-a", "prop_claim")
+            let token = claim(&db, "app-a", "prop_claim", HOUR)
                 .await
-                .expect("claim"));
-            let row = db
-                .find_proposal_by_id("app-a", "prop_claim")
-                .await
-                .expect("find")
-                .expect("row");
+                .expect("a queued proposal is claimed");
+            let row = row_of(&db, "app-a", "prop_claim").await;
             assert_eq!(row.status, "inFlight");
             assert!(
                 row.last_attempt_at.is_some(),
                 "the claim stamps the attempt"
             );
+            assert_eq!(
+                row.metadata["execute"]["claim"].as_str(),
+                Some(token.as_str()),
+                "the claim records its token"
+            );
+            assert_eq!(
+                row.metadata["execute"]["staleAfterSecs"].as_f64(),
+                Some(3600.0),
+                "and its claimant's own bound"
+            );
 
             assert!(
-                !db.claim_proposal_for_execute("app-a", "prop_claim")
-                    .await
-                    .expect("claim"),
+                claim(&db, "app-a", "prop_claim", HOUR).await.is_none(),
                 "a second execute of an inFlight proposal starts no second run"
             );
             db.update_proposal_status("prop_claim", "pendingPromotion")
                 .await
                 .expect("status");
             assert!(
-                !db.claim_proposal_for_execute("app-a", "prop_claim")
-                    .await
-                    .expect("claim"),
+                claim(&db, "app-a", "prop_claim", HOUR).await.is_none(),
                 "a proposal past the queue is not executed again"
             );
         }
 
-        /// The abandoned-execute guard re-queues a row only while it is still
-        /// `inFlight`: an outcome written first is never undone.
+        /// Every write an execute makes to its proposal lands only while its
+        /// claim is held: a write under any other token changes nothing, the
+        /// abandoned-execute re-queue releases the claim, a released claim's
+        /// late outcome is not written over the next execute's claim, and a
+        /// written outcome is never undone.
         #[tokio::test(flavor = "multi_thread")]
-        async fn an_abandoned_execute_requeues_only_a_row_still_in_flight() {
+        async fn a_claimed_write_lands_only_while_its_claim_is_held() {
             let (_guard, db) = fresh_db().await;
             assert!(queue(&db, "prop_gone", "app-a", "/gone").await);
-            assert!(db
-                .claim_proposal_for_execute("app-a", "prop_gone")
-                .await
-                .expect("claim"));
-            assert!(db
-                .requeue_in_flight_proposal("prop_gone", ABANDONED_EXECUTE_ERROR)
+            let first = claim(&db, "app-a", "prop_gone", HOUR).await.expect("claim");
+
+            let candidate = serde_json::json!({ "id": "page" });
+            assert!(!db
+                .requeue_claimed_proposal(
+                    "prop_gone",
+                    "not-the-claim",
+                    Some(ABANDONED_EXECUTE_ERROR)
+                )
                 .await
                 .expect("requeue"));
+            assert!(!db
+                .fail_claimed_proposal("prop_gone", "not-the-claim", "x")
+                .await
+                .expect("fail"));
+            assert!(!db
+                .stage_claimed_proposal("prop_gone", "not-the-claim", &candidate)
+                .await
+                .expect("stage"));
             assert_eq!(
                 status_of(&db, "app-a", "prop_gone").await,
-                (
-                    "queued".to_string(),
-                    Some(ABANDONED_EXECUTE_ERROR.to_string())
-                )
+                ("inFlight".to_string(), None),
+                "a write under another token changes nothing"
             );
 
             assert!(db
-                .claim_proposal_for_execute("app-a", "prop_gone")
+                .requeue_claimed_proposal("prop_gone", &first, Some(ABANDONED_EXECUTE_ERROR))
                 .await
-                .expect("claim"));
-            db.update_proposal_status_with_error("prop_gone", "failed", "builder step failed")
-                .await
-                .expect("fail");
-            assert!(
-                !db.requeue_in_flight_proposal("prop_gone", ABANDONED_EXECUTE_ERROR)
-                    .await
-                    .expect("requeue"),
-                "a failed outcome is left as it was"
+                .expect("requeue"));
+            let row = row_of(&db, "app-a", "prop_gone").await;
+            assert_eq!(
+                (row.status.as_str(), row.last_error.as_deref()),
+                ("queued", Some(ABANDONED_EXECUTE_ERROR))
             );
+            assert!(
+                row.metadata.get("execute").is_none(),
+                "the re-queue releases the claim: {}",
+                row.metadata
+            );
+
+            let next = claim(&db, "app-a", "prop_gone", HOUR)
+                .await
+                .expect("claimed again");
+            assert!(
+                !db.fail_claimed_proposal("prop_gone", &first, "late outcome of the first execute")
+                    .await
+                    .expect("fail"),
+                "a released claim's late outcome is not written over the next claim"
+            );
+            assert_eq!(status_of(&db, "app-a", "prop_gone").await.0, "inFlight");
+            assert!(db
+                .fail_claimed_proposal("prop_gone", &next, "builder step failed")
+                .await
+                .expect("fail"));
             assert_eq!(
                 status_of(&db, "app-a", "prop_gone").await,
                 (
@@ -2031,40 +2355,81 @@ mod tests {
                     Some("builder step failed".to_string())
                 )
             );
+            assert!(
+                !db.requeue_claimed_proposal("prop_gone", &next, Some(ABANDONED_EXECUTE_ERROR))
+                    .await
+                    .expect("requeue"),
+                "a written outcome is never undone"
+            );
+
+            assert!(queue(&db, "prop_staged", "app-a", "/staged").await);
+            let staged = claim(&db, "app-a", "prop_staged", HOUR)
+                .await
+                .expect("claim");
+            assert!(db
+                .stage_claimed_proposal("prop_staged", &staged, &candidate)
+                .await
+                .expect("stage"));
+            let row = row_of(&db, "app-a", "prop_staged").await;
+            assert_eq!(row.status, "pendingPromotion");
+            assert_eq!(row.candidate_ir, Some(candidate));
+            assert!(row.metadata.get("execute").is_none());
         }
 
-        /// The scan re-queues the asking app's `inFlight` rows older than the
-        /// stale bound, and nothing else.
+        /// The scan re-queues the asking app's claims that have outlived
+        /// their CLAIMANT's own bound, and nothing else. This scanner's
+        /// bound (one hour) applies only to a claim that recorded none.
         #[tokio::test(flavor = "multi_thread")]
-        async fn the_scan_requeues_only_its_apps_stale_in_flight_rows() {
+        async fn the_scan_requeues_only_its_apps_stale_claims() {
             let (_guard, db) = fresh_db().await;
-            for (id, app, target) in [
-                ("prop_stale", "app-a", "/stale"),
-                ("prop_fresh", "app-a", "/fresh"),
-                ("prop_other", "app-b", "/other"),
+            for (id, app, target, bound) in [
+                ("prop_stale", "app-a", "/stale", HOUR),
+                ("prop_long", "app-a", "/long", 3 * HOUR),
+                ("prop_fresh", "app-a", "/fresh", HOUR),
+                ("prop_legacy", "app-a", "/legacy", HOUR),
+                ("prop_other", "app-b", "/other", HOUR),
             ] {
                 assert!(queue(&db, id, app, target).await);
-                assert!(db.claim_proposal_for_execute(app, id).await.expect("claim"));
+                assert!(claim(&db, app, id, bound).await.is_some());
             }
+            age_claims(
+                &db,
+                &["prop_stale", "prop_long", "prop_legacy", "prop_other"],
+            )
+            .await;
             let conn = db.pool().get().await.expect("pg conn");
             conn.execute(
-                "UPDATE atlas_managed.spec_proposals \
-                 SET last_attempt_at = now() - interval '2 hours' \
-                 WHERE id IN ('prop_stale', 'prop_other')",
+                "UPDATE atlas_managed.spec_proposals SET metadata = metadata - 'execute' \
+                 WHERE id = 'prop_legacy'",
                 &[],
             )
             .await
-            .expect("age two claims");
+            .expect("a claim from before claims recorded a bound");
             drop(conn);
 
-            let requeued = db
-                .requeue_stale_in_flight_proposals("app-a", 3600.0, STALE_EXECUTE_ERROR)
+            let stale = db
+                .requeue_stale_in_flight_proposals(
+                    "app-a",
+                    HOUR,
+                    STALE_EXECUTE_ERROR,
+                    STALE_RUN_STOP_REASON,
+                )
                 .await
                 .expect("requeue stale");
-            assert_eq!(requeued, 1);
+            assert_eq!(stale.requeued, 2, "{stale:?}");
             assert_eq!(
                 status_of(&db, "app-a", "prop_stale").await,
                 ("queued".to_string(), Some(STALE_EXECUTE_ERROR.to_string()))
+            );
+            assert_eq!(
+                status_of(&db, "app-a", "prop_legacy").await.0,
+                "queued",
+                "a claim with no recorded bound is judged by the scanner's"
+            );
+            assert_eq!(
+                status_of(&db, "app-a", "prop_long").await.0,
+                "inFlight",
+                "a claimant's own longer bound governs, whichever process scans"
             );
             assert_eq!(
                 status_of(&db, "app-a", "prop_fresh").await.0,
@@ -2076,6 +2441,143 @@ mod tests {
                 "inFlight",
                 "another app's stale row is that app's scan's to re-queue"
             );
+        }
+
+        /// A run is recorded on a claim only while the claim is held, and the
+        /// scan that finds that claim stale stops the run unless it has
+        /// finished, then releases the claim.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn the_scan_stops_the_run_a_stale_claim_recorded() {
+            use crate::database::types::CreateTaskRunInput;
+            let (_guard, db) = fresh_db().await;
+            let going = format!("spec-run-going-{}", uuid::Uuid::new_v4());
+            let done = format!("spec-run-done-{}", uuid::Uuid::new_v4());
+            for id in [&going, &done] {
+                db.create_task_run(&CreateTaskRunInput::new(id.clone(), "spec execute run"))
+                    .await
+                    .expect("create_task_run");
+            }
+            db.complete_task_run(&done).await.expect("complete");
+
+            assert!(queue(&db, "prop_run_going", "app-a", "/going").await);
+            assert!(queue(&db, "prop_run_done", "app-a", "/done").await);
+            let g = claim(&db, "app-a", "prop_run_going", HOUR)
+                .await
+                .expect("claim");
+            let d = claim(&db, "app-a", "prop_run_done", HOUR)
+                .await
+                .expect("claim");
+            assert!(
+                !db.record_execute_run("prop_run_going", "not-the-claim", &going)
+                    .await
+                    .expect("record"),
+                "a run is recorded only under the held claim"
+            );
+            assert!(db
+                .record_execute_run("prop_run_going", &g, &going)
+                .await
+                .expect("record"));
+            assert!(db
+                .record_execute_run("prop_run_done", &d, &done)
+                .await
+                .expect("record"));
+            assert_eq!(
+                row_of(&db, "app-a", "prop_run_going").await.metadata["execute"]["taskRunId"]
+                    .as_str(),
+                Some(going.as_str())
+            );
+
+            age_claims(&db, &["prop_run_going", "prop_run_done"]).await;
+            let stale = db
+                .requeue_stale_in_flight_proposals(
+                    "app-a",
+                    HOUR,
+                    STALE_EXECUTE_ERROR,
+                    STALE_RUN_STOP_REASON,
+                )
+                .await
+                .expect("requeue stale");
+            assert_eq!(
+                stale,
+                crate::database::pg::spec_proposals::StaleRequeue {
+                    requeued: 2,
+                    runs_stopped: 1
+                }
+            );
+            assert_eq!(
+                db.get_task_run_status(&going).await.expect("status"),
+                Some((
+                    "stopped".to_string(),
+                    Some(STALE_RUN_STOP_REASON.to_string())
+                ))
+            );
+            assert_eq!(
+                db.get_task_run_status(&done).await.expect("status"),
+                Some(("complete".to_string(), None)),
+                "a finished run is left as it was"
+            );
+            assert!(
+                !db.fail_claimed_proposal("prop_run_going", &g, "late")
+                    .await
+                    .expect("fail"),
+                "the dead execute's claim is released"
+            );
+            for id in [&going, &done] {
+                db.delete_task_run(id).await.expect("cleanup");
+            }
+        }
+
+        /// A scan reads only its own app's observations. Unattributed ones
+        /// (`app_id` NULL) are the bootstrap app's, as legacy proposals are.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn the_scan_reads_only_its_apps_observations() {
+            let (_guard, db) = fresh_db().await;
+            let tag = uuid::Uuid::new_v4().simple().to_string();
+            let mine = format!("scan-mine-{tag}");
+            let theirs = format!("scan-theirs-{tag}");
+            let unattributed = format!("scan-unattributed-{tag}");
+            let conn = db.pool().get().await.expect("pg conn");
+            for (label, app) in [
+                (&mine, Some("app-a")),
+                (&theirs, Some("app-b")),
+                (&unattributed, None),
+            ] {
+                for _ in 0..2 {
+                    conn.execute(
+                        "INSERT INTO co_occurrence_observations (id, spec_id, fingerprints, app_id) \
+                         VALUES (gen_random_uuid(), $1, '[]'::jsonb, $2)",
+                        &[label, &app],
+                    )
+                    .await
+                    .expect("observation");
+                }
+            }
+
+            let a = query_eligible_pathnames(&db, "app-a", 1, 2, 100_000)
+                .await
+                .expect("app-a's scan");
+            assert!(a.contains(&mine), "{a:?}");
+            assert!(
+                !a.contains(&theirs),
+                "another app's page is not queued: {a:?}"
+            );
+            assert!(!a.contains(&unattributed), "{a:?}");
+            let bootstrap = query_eligible_pathnames(&db, storage::RUNNER_APP_ID, 1, 2, 100_000)
+                .await
+                .expect("the bootstrap app's scan");
+            assert!(bootstrap.contains(&unattributed), "{bootstrap:?}");
+            assert!(
+                !bootstrap.contains(&mine) && !bootstrap.contains(&theirs),
+                "{bootstrap:?}"
+            );
+
+            let labels = vec![mine, theirs, unattributed];
+            conn.execute(
+                "DELETE FROM co_occurrence_observations WHERE spec_id = ANY($1)",
+                &[&labels],
+            )
+            .await
+            .expect("cleanup");
         }
     }
 

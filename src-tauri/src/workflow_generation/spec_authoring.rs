@@ -26,7 +26,7 @@ use crate::database::pg::PgDb;
 use crate::spec_api::types::{
     IrElementCriteria, IrPageSpec, IrProvenance, IrState, IrTransition, ProposalStatus,
 };
-pub use crate::workflow_generation::meta_workflow_run::MetaWorkflowError;
+pub use crate::workflow_generation::meta_workflow_run::{MetaWorkflowError, RunClaim};
 
 // ---------------------------------------------------------------------------
 // Public surface
@@ -181,7 +181,8 @@ impl From<MetaWorkflowError> for AuthoringError {
 /// `app_id` scopes every spec read/write to the owning app (spec-multi-app
 /// Stream C). `origin` is who asked for the execute: the drain and the agent
 /// registry judge the meta-workflow spawn under it (an HTTP caller is
-/// `Unknown`). Runs the appropriate authoring flavor and returns either a
+/// `Unknown`). `claim` is the proposal claim the execute holds; the run is
+/// recorded on it. Runs the appropriate authoring flavor and returns either a
 /// candidate `IrPageSpec` (still un-validated — the validator gates are
 /// layered on top by the proposals handler) or a structured error.
 pub async fn author_candidate(
@@ -190,13 +191,14 @@ pub async fn author_candidate(
     app_id: &str,
     mode: AuthoringMode,
     origin: SpawnOrigin,
+    claim: Option<RunClaim>,
 ) -> Result<AuthoringOutcome, AuthoringError> {
     author_candidate_with_executor(
         pg_db,
         app_state,
         app_id,
         mode,
-        &DefaultMetaWorkflowExecutor { origin },
+        &DefaultMetaWorkflowExecutor { origin, claim },
     )
     .await
 }
@@ -1489,12 +1491,16 @@ pub trait MetaWorkflowExecutor: Send + Sync {
 }
 
 /// Default production executor: authorize the spawn under `origin`, start the
-/// meta-workflow through the in-process spawn door and wait for the task run
-/// the door created. See [`crate::workflow_generation::meta_workflow_run`].
+/// meta-workflow through the in-process spawn door, bind the task run the door
+/// created to `claim`, and wait for it. See
+/// [`crate::workflow_generation::meta_workflow_run`].
 pub struct DefaultMetaWorkflowExecutor {
     /// Who asked for the execute. The drain and the agent registry judge the
     /// spawn under it.
     pub origin: SpawnOrigin,
+    /// The proposal claim the execute holds, when it holds one. The run is
+    /// recorded on it, so a scan that finds the claim stale stops the run.
+    pub claim: Option<RunClaim>,
 }
 
 #[async_trait::async_trait]
@@ -1509,6 +1515,7 @@ impl MetaWorkflowExecutor for DefaultMetaWorkflowExecutor {
             pg_db,
             meta_wf,
             self.origin,
+            self.claim.clone(),
         )
         .await
     }

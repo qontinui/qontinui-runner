@@ -160,9 +160,9 @@ pub async fn validate_candidate(
 }
 
 /// Standalone entry point for the gate-4 B-green check. Exposed so Step 9's
-/// sweep handler (re-running gate 4 nightly on `_pending/` candidates) can
-/// call it directly without re-running gates 1-3 (those are pure properties
-/// of the candidate IR and don't change between sweeps).
+/// sweep handler (re-running gate 4 on `_pending/` candidates each time it is
+/// called) can call it directly without re-running gates 1-3 (those are pure
+/// properties of the candidate IR and don't change between sweeps).
 pub async fn gate_b_execution_green(
     app_state: Arc<crate::commands::AppState>,
     candidate: &IrPageSpec,

@@ -510,19 +510,24 @@ impl PgDb {
         Ok(())
     }
 
-    /// Get task run output.
+    /// Get task run output. A run with no row reads as an empty log; a caller
+    /// that must tell the two apart reads [`Self::get_task_output_opt`].
     pub async fn get_task_output(&self, id: &str) -> Result<String, String> {
+        Ok(self.get_task_output_opt(id).await?.unwrap_or_default())
+    }
+
+    /// Get task run output, or `None` when there is no such run.
+    pub async fn get_task_output_opt(&self, id: &str) -> Result<Option<String>, String> {
         let conn = self
             .pool
             .get()
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
-        let output = qontinui_db::queries::task_runs::get_task_output()
+        qontinui_db::queries::task_runs::get_task_output()
             .bind(&conn, &id)
             .opt()
             .await
-            .map_err(|e| crate::database::pg::pg_err("PG get_task_output", &e))?;
-        Ok(output.unwrap_or_default())
+            .map_err(|e| crate::database::pg::pg_err("PG get_task_output", &e))
     }
 
     /// Update task run name.

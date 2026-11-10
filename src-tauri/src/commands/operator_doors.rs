@@ -105,8 +105,12 @@ fn api_state(app_handle: &tauri::AppHandle) -> Result<Arc<ApiState>, String> {
         .ok_or_else(|| "the runner API is not up yet — try again in a moment".to_string())
 }
 
-/// Call a spawn door in-process with `origin`, from a path and JSON body — for
-/// the scheduler's operator "Run now", whose launchers address doors by path.
+/// Call a spawn door in-process with `origin`, from a path and JSON body.
+/// The caller chooses the origin, so each caller gates its own spawn (and is
+/// listed in `runner_spawn_sites.txt`): the scheduler's operator "Run now",
+/// whose launchers address doors by path, and the spec flywheel's execute
+/// (`workflow_generation::meta_workflow_run`), an autonomous caller that asks
+/// `authorize_spawn` before it calls.
 pub async fn call_door_in_process(
     path: &str,
     body: serde_json::Value,

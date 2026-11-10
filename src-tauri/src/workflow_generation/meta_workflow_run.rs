@@ -9,7 +9,7 @@
 //! `running` orphan, which a runner restart could then resume
 //! (`startup_resume.rs`) outside any authorization.
 //!
-//! [`execute_meta_workflow_blocking`] now does three things, in order:
+//! [`execute_meta_workflow_blocking`] now does four things, in order:
 //!
 //! 1. **It asks first, before anything is written.** One call,
 //!    [`authorize_spawn`](crate::agent_authorization::authorize_spawn) for the
@@ -27,8 +27,19 @@
 //!    and the scheduler start workflows through, so the run gets the same
 //!    launch as any other workflow run (DAG driver, Restate or the loop
 //!    controller). The task run polled below is the one the door created, and
-//!    the door's own drain gate judges the same origin again.
-//! 3. **It waits for that run, then stops it if it overstays.** It polls the
+//!    the door's own drain gate judges the same origin again. The door call
+//!    runs in a task of its own, which hands the started run over already
+//!    guarded ([`StopOnDrop`]): an execute dropped while the door call is in
+//!    flight stops the run the door then starts. A door that starts nothing
+//!    leaves nothing behind: the persisted meta-workflow is deleted again.
+//! 3. **It binds the run to the execute.** It records the run on the
+//!    proposal's claim, so a scan that later finds the claim stale stops the
+//!    run, and it turns the run's `auto_continue` off, so a runner restart
+//!    records the interrupted run `failed` instead of resuming it outside this
+//!    execute's authorization with nobody reading its output. Both are retried
+//!    at every poll until they land. A claim lost before the run is recorded on
+//!    it (a scan took the proposal back) stops the run at once.
+//! 4. **It waits for that run, then stops it if it overstays.** It polls the
 //!    run's status until the run has finished, for at most
 //!    [`EXECUTE_TIMEOUT_ENV`] seconds (default one hour), and reads the run's
 //!    output once, when it has. A run still going at the deadline is marked
@@ -74,6 +85,20 @@ pub(crate) const DEADLINE_STOP_REASON: &str = "spec execute: past its deadline, 
 
 /// The `stopped` reason written when the execute waiting on a run went away.
 pub(crate) const ABANDONED_STOP_REASON: &str = "spec execute: abandoned by its caller";
+
+/// The `stopped` reason written when the execute's claim on its proposal was
+/// lost before its run could be recorded on it: a scan put the proposal back
+/// in the queue, so this run's outcome would be written nowhere.
+pub(crate) const CLAIM_LOST_STOP_REASON: &str =
+    "spec execute: its proposal claim was lost, nobody will record the outcome";
+
+/// The proposal an execute's run belongs to, and the claim token the execute
+/// holds on it (`PgDb::claim_proposal_for_execute`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunClaim {
+    pub proposal_id: String,
+    pub token: String,
+}
 
 /// Why a meta-workflow run returned no output.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -232,17 +257,40 @@ pub(crate) struct RunStatus {
     pub error_message: Option<String>,
 }
 
-/// Where the poll reads a task run and how it stops one: [`PgDb`] in
-/// production, a scripted ledger in tests.
+/// Whether an execute's run is now recorded on the proposal claim it holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClaimRecord {
+    /// Recorded: a scan that later finds the claim stale stops this run.
+    Recorded,
+    /// The claim is no longer held: a scan put the proposal back in the queue,
+    /// so nothing will record this run's outcome.
+    Lost,
+}
+
+/// Where the poll reads a task run, binds it to its execute, and stops it:
+/// [`PgDb`] in production, a scripted ledger in tests.
 #[async_trait::async_trait]
 pub(crate) trait RunLedger: Send + Sync {
     /// The run's status, or `None` when its row is gone.
     async fn status(&self, task_run_id: &str) -> Result<Option<RunStatus>, String>;
-    /// The run's output log.
-    async fn output(&self, task_run_id: &str) -> Result<String, String>;
+    /// The run's output log, or `None` when its row is gone.
+    async fn output(&self, task_run_id: &str) -> Result<Option<String>, String>;
     /// Mark the run `stopped`, unless it has already finished. `Ok(false)`
     /// means it had, and its row was left as it was.
     async fn stop_if_unfinished(&self, task_run_id: &str, reason: &str) -> Result<bool, String>;
+    /// Record the run on the proposal claim its execute holds.
+    async fn record_on_claim(
+        &self,
+        claim: &RunClaim,
+        task_run_id: &str,
+    ) -> Result<ClaimRecord, String>;
+    /// Turn the run's `auto_continue` off. A runner restart then records the
+    /// interrupted run `failed` (`startup_resume.rs`) instead of resuming it
+    /// with nobody waiting for its output. No executor reads `auto_continue`
+    /// while a run is going (startup resume, and chat resume for chat rows,
+    /// act on it only at boot; the task-run API and GraphQL only report it),
+    /// so the running run is unaffected.
+    async fn disable_resume(&self, task_run_id: &str) -> Result<(), String>;
 }
 
 #[async_trait::async_trait]
@@ -257,12 +305,31 @@ impl RunLedger for PgDb {
             }))
     }
 
-    async fn output(&self, task_run_id: &str) -> Result<String, String> {
-        self.get_task_output(task_run_id).await
+    async fn output(&self, task_run_id: &str) -> Result<Option<String>, String> {
+        self.get_task_output_opt(task_run_id).await
     }
 
     async fn stop_if_unfinished(&self, task_run_id: &str, reason: &str) -> Result<bool, String> {
         self.stop_task_run_if_unfinished(task_run_id, reason).await
+    }
+
+    async fn record_on_claim(
+        &self,
+        claim: &RunClaim,
+        task_run_id: &str,
+    ) -> Result<ClaimRecord, String> {
+        let held = self
+            .record_execute_run(&claim.proposal_id, &claim.token, task_run_id)
+            .await?;
+        Ok(if held {
+            ClaimRecord::Recorded
+        } else {
+            ClaimRecord::Lost
+        })
+    }
+
+    async fn disable_resume(&self, task_run_id: &str) -> Result<(), String> {
+        self.set_task_auto_continue(task_run_id, false).await
     }
 }
 
@@ -270,10 +337,26 @@ impl RunLedger for PgDb {
 /// whose caller went away must not leave its run spending the user's AI
 /// account with nobody waiting for the output. A run that finished before the
 /// stop reached it is left as it is.
-struct StopOnDrop {
+pub(crate) struct StopOnDrop {
     ledger: Arc<dyn RunLedger>,
     task_run_id: String,
     armed: bool,
+}
+
+impl StopOnDrop {
+    /// Guard `task_run_id`, armed.
+    pub(crate) fn armed(ledger: Arc<dyn RunLedger>, task_run_id: String) -> Self {
+        Self {
+            ledger,
+            task_run_id,
+            armed: true,
+        }
+    }
+
+    /// The run this guard watches.
+    pub(crate) fn task_run_id(&self) -> &str {
+        &self.task_run_id
+    }
 }
 
 impl Drop for StopOnDrop {
@@ -333,31 +416,73 @@ fn vanished(task_run_id: &str) -> MetaWorkflowError {
     MetaWorkflowError::Failed(format!("meta-workflow task run {task_run_id} disappeared"))
 }
 
-/// Wait for `task_run_id` to finish, reading its status every `interval`, for
-/// at most `timeout`. The run's output is read once, when it has completed.
-/// The run is stopped if it is still going at the deadline, and also if this
-/// future is dropped first.
+/// Wait for the run `guard` watches to finish, reading its status every
+/// `interval`, for at most `timeout`. The run's output is read once, when it
+/// has completed. The run is stopped if it is still going at the deadline, and
+/// also if this future is dropped first (the guard's job).
+///
+/// Before each wait the run is bound to its execute until both writes have
+/// landed: it is recorded on `claim`, and its `auto_continue` is turned off.
+/// A claim found lost stops the run and fails the execute at once.
 ///
 /// A failed read is retried until the deadline: one PG hiccup is no reason to
 /// abandon a run that is still working, or to report a completed run's output
 /// as empty. A row that has vanished is a failure with nothing left to stop.
 pub(crate) async fn await_run_output(
     ledger: Arc<dyn RunLedger>,
-    task_run_id: &str,
+    guard: StopOnDrop,
+    claim: Option<&RunClaim>,
     timeout: Duration,
     interval: Duration,
 ) -> Result<serde_json::Value, MetaWorkflowError> {
-    let mut guard = StopOnDrop {
-        ledger: ledger.clone(),
-        task_run_id: task_run_id.to_string(),
-        armed: true,
-    };
+    let mut guard = guard;
+    let task_run_id = guard.task_run_id().to_string();
+    let task_run_id = task_run_id.as_str();
+    let mut recorded = claim.is_none();
+    let mut resume_off = false;
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
+        if let (false, Some(claim)) = (recorded, claim) {
+            match ledger.record_on_claim(claim, task_run_id).await {
+                Ok(ClaimRecord::Recorded) => recorded = true,
+                Ok(ClaimRecord::Lost) => {
+                    match ledger
+                        .stop_if_unfinished(task_run_id, CLAIM_LOST_STOP_REASON)
+                        .await
+                    {
+                        Ok(_) => guard.armed = false,
+                        Err(e) => warn!(
+                            task_run_id,
+                            "stopping a spec execute run whose claim was lost failed \
+                             (its guard tries again): {e}"
+                        ),
+                    }
+                    return Err(MetaWorkflowError::Failed(format!(
+                        "the claim on proposal {} was lost before meta-workflow task run \
+                         {task_run_id} was recorded on it, so the run was stopped",
+                        claim.proposal_id
+                    )));
+                }
+                Err(e) => warn!(
+                    task_run_id,
+                    "recording a spec execute run on its proposal failed, retrying: {e}"
+                ),
+            }
+        }
+        if !resume_off {
+            match ledger.disable_resume(task_run_id).await {
+                Ok(()) => resume_off = true,
+                Err(e) => warn!(
+                    task_run_id,
+                    "turning a spec execute run's auto_continue off failed, retrying: {e}"
+                ),
+            }
+        }
         let now = tokio::time::Instant::now();
         if now >= deadline {
-            let out = at_deadline(ledger.as_ref(), task_run_id, timeout).await;
-            guard.armed = false;
+            let (out, settled) = at_deadline(ledger.as_ref(), task_run_id, timeout).await;
+            // A stop that failed leaves the guard armed: dropping it asks again.
+            guard.armed = !settled;
             return out;
         }
         tokio::time::sleep(interval.min(deadline - now)).await;
@@ -378,9 +503,13 @@ pub(crate) async fn await_run_output(
         match run_state(&status.status) {
             RunState::Running => continue,
             RunState::Complete => match ledger.output(task_run_id).await {
-                Ok(output_log) => {
+                Ok(Some(output_log)) => {
                     guard.armed = false;
                     return Ok(run_output(&output_log));
+                }
+                Ok(None) => {
+                    guard.armed = false;
+                    return Err(vanished(task_run_id));
                 }
                 Err(e) => {
                     warn!(
@@ -403,12 +532,15 @@ pub(crate) async fn await_run_output(
 }
 
 /// The deadline has passed. Stop the run, unless it finished since it was
-/// last read; then it answers what it finished with, read once.
+/// last read; then it answers what it finished with, read once. The `bool` is
+/// whether the run is settled: stopped, or found finished. It is `false` only
+/// when the stop itself failed, so the caller's guard stays armed and asks
+/// again.
 async fn at_deadline(
     ledger: &dyn RunLedger,
     task_run_id: &str,
     timeout: Duration,
-) -> Result<serde_json::Value, MetaWorkflowError> {
+) -> (Result<serde_json::Value, MetaWorkflowError>, bool) {
     let overdue = format!(
         "meta-workflow task run {task_run_id} was still running after {}s",
         timeout.as_secs()
@@ -417,48 +549,122 @@ async fn at_deadline(
         .stop_if_unfinished(task_run_id, DEADLINE_STOP_REASON)
         .await
     {
-        Ok(true) => Err(MetaWorkflowError::Failed(format!(
-            "{overdue} and was stopped"
-        ))),
+        Ok(true) => (
+            Err(MetaWorkflowError::Failed(format!(
+                "{overdue} and was stopped"
+            ))),
+            true,
+        ),
         Err(e) => {
             warn!(
                 task_run_id,
                 "stopping an overdue spec execute run failed: {e}"
             );
-            Err(MetaWorkflowError::Failed(format!(
-                "{overdue}; stopping it failed: {e}"
-            )))
-        }
-        Ok(false) => {
-            let read_failed = |e: String| {
-                MetaWorkflowError::Failed(format!(
-                    "meta-workflow task run {task_run_id} finished at its deadline, but reading it failed: {e}"
-                ))
-            };
-            let status = ledger
-                .status(task_run_id)
-                .await
-                .map_err(read_failed)?
-                .ok_or_else(|| vanished(task_run_id))?;
-            match run_state(&status.status) {
-                RunState::Complete => ledger
-                    .output(task_run_id)
-                    .await
-                    .map(|output_log| run_output(&output_log))
-                    .map_err(read_failed),
-                RunState::Failed => Err(unsuccessful(task_run_id, false, status.error_message)),
-                RunState::Stopped => Err(unsuccessful(task_run_id, true, status.error_message)),
-                RunState::Running => Err(MetaWorkflowError::Failed(format!(
-                    "{overdue}; the stop found it finished, yet it now reads `{}`",
-                    status.status
+            (
+                Err(MetaWorkflowError::Failed(format!(
+                    "{overdue}; stopping it failed: {e}"
                 ))),
-            }
+                false,
+            )
         }
+        Ok(false) => (
+            finished_at_deadline(ledger, task_run_id, &overdue).await,
+            true,
+        ),
     }
 }
 
-/// Run `meta_wf` on behalf of `origin` and return its output. See the module
-/// docs for the three steps.
+/// A run the deadline's stop found already finished: what it finished with,
+/// read once.
+async fn finished_at_deadline(
+    ledger: &dyn RunLedger,
+    task_run_id: &str,
+    overdue: &str,
+) -> Result<serde_json::Value, MetaWorkflowError> {
+    let read_failed = |e: String| {
+        MetaWorkflowError::Failed(format!(
+            "meta-workflow task run {task_run_id} finished at its deadline, but reading it failed: {e}"
+        ))
+    };
+    let status = ledger
+        .status(task_run_id)
+        .await
+        .map_err(read_failed)?
+        .ok_or_else(|| vanished(task_run_id))?;
+    match run_state(&status.status) {
+        RunState::Complete => ledger
+            .output(task_run_id)
+            .await
+            .map_err(read_failed)?
+            .map(|output_log| run_output(&output_log))
+            .ok_or_else(|| vanished(task_run_id)),
+        RunState::Failed => Err(unsuccessful(task_run_id, false, status.error_message)),
+        RunState::Stopped => Err(unsuccessful(task_run_id, true, status.error_message)),
+        RunState::Running => Err(MetaWorkflowError::Failed(format!(
+            "{overdue}; the stop found it finished, yet it now reads `{}`",
+            status.status
+        ))),
+    }
+}
+
+/// Why the run door produced no run to wait for.
+#[derive(Debug)]
+pub(crate) struct NotStarted {
+    pub error: MetaWorkflowError,
+    /// The door refused or could not be called, so it started nothing and
+    /// nothing persisted for it is in use. False when it answered 200 without
+    /// naming its run, or never answered: a run may exist that nobody watches.
+    pub nothing_started: bool,
+}
+
+/// Start a run through `door` (the in-process run door's call) and return the
+/// run it started, guarded.
+///
+/// The door call runs in a task of its own, which builds the guard the moment
+/// the door names its run and hands it over through a channel. So an execute
+/// dropped while the door call is in flight cannot leave a started run
+/// unguarded: the send to a dropped receiver fails and the guard drops in that
+/// task, or the guard waits in the channel and drops with it. Either way the
+/// run is stopped.
+pub(crate) async fn start_run<F>(
+    ledger: Arc<dyn RunLedger>,
+    door: F,
+) -> Result<StopOnDrop, NotStarted>
+where
+    F: std::future::Future<Output = Result<DoorReply, String>> + Send + 'static,
+{
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let started = match door.await {
+            Err(e) => Err(NotStarted {
+                error: MetaWorkflowError::Failed(e),
+                nothing_started: true,
+            }),
+            Ok(reply) => match started_task_run(&reply) {
+                Ok(task_run_id) => Ok(StopOnDrop::armed(ledger, task_run_id)),
+                Err(error) => Err(NotStarted {
+                    error,
+                    nothing_started: reply.status != 200,
+                }),
+            },
+        };
+        // A send to an execute that has gone away hands the value back, and
+        // the guard inside it drops here, stopping the run.
+        let _ = tx.send(started);
+    });
+    rx.await.unwrap_or_else(|_| {
+        Err(NotStarted {
+            error: MetaWorkflowError::Failed(
+                "the run door's task ended without answering".to_string(),
+            ),
+            nothing_started: false,
+        })
+    })
+}
+
+/// Run `meta_wf` on behalf of `origin` and return its output. `claim` is the
+/// proposal claim the execute holds, when it holds one. See the module docs for
+/// the four steps.
 ///
 /// Listed in `runner_spawn_sites.txt` as an autonomous spawn site: it calls the
 /// in-process spawn door, and it branches on `authorize_spawn` before anything
@@ -467,6 +673,7 @@ pub(crate) async fn execute_meta_workflow_blocking(
     pg_db: Arc<PgDb>,
     meta_wf: crate::unified_workflows::UnifiedWorkflow,
     origin: SpawnOrigin,
+    claim: Option<RunClaim>,
 ) -> Result<serde_json::Value, MetaWorkflowError> {
     let decision = crate::agent_authorization::authorize_spawn(
         None,
@@ -486,24 +693,45 @@ pub(crate) async fn execute_meta_workflow_blocking(
         .await
         .map_err(|e| MetaWorkflowError::Failed(format!("create_unified_workflow: {e}")))?;
 
-    let reply = crate::commands::operator_doors::call_door_in_process(
-        &run_door_path(&saved.id),
-        run_door_body(),
-        origin,
-    )
-    .await
-    .map_err(MetaWorkflowError::Failed)?;
-    let task_run_id = started_task_run(&reply)?;
+    let path = run_door_path(&saved.id);
+    let started = start_run(pg_db.clone(), async move {
+        crate::commands::operator_doors::call_door_in_process(&path, run_door_body(), origin).await
+    })
+    .await;
+    let guard = match started {
+        Ok(guard) => guard,
+        Err(not_started) => {
+            if not_started.nothing_started {
+                // The door started nothing: take back the meta-workflow
+                // persisted for it.
+                if let Err(e) = pg_db.delete_unified_workflow(&saved.id).await {
+                    warn!(
+                        meta_workflow_id = %saved.id,
+                        "spec execute: the run door started nothing; deleting its meta-workflow failed: {e}"
+                    );
+                }
+            } else {
+                warn!(
+                    meta_workflow_id = %saved.id,
+                    "spec execute: the run door did not name a run, so a run it may have \
+                     started is unwatched: {}",
+                    not_started.error
+                );
+            }
+            return Err(not_started.error);
+        }
+    };
     info!(
         meta_workflow_id = %saved.id,
-        task_run_id = %task_run_id,
+        task_run_id = %guard.task_run_id(),
         origin = %origin,
         "spec execute: meta-workflow run started"
     );
 
     await_run_output(
         pg_db,
-        &task_run_id,
+        guard,
+        claim.as_ref(),
         configured_execute_timeout(),
         POLL_INTERVAL,
     )
@@ -617,6 +845,7 @@ mod tests {
             PgDb::new_noop_for_test(),
             meta_wf,
             SpawnOrigin::Unknown,
+            None,
         )
         .await;
         match out {
@@ -650,10 +879,17 @@ mod tests {
         let admit = at("admission(&decision)?");
         let persist = at("create_unified_workflow(");
         let start = at("call_door_in_process(");
+        let take_back = at("delete_unified_workflow(");
+        let wait = at("await_run_output(");
         assert!(
-            gate < admit && admit < persist && persist < start,
-            "order must be authorize_spawn -> admission -> persist -> start \
-             (found {gate}, {admit}, {persist}, {start})"
+            body[wait..].contains("claim.as_ref()"),
+            "the run is bound to the execute's proposal claim"
+        );
+        assert!(
+            gate < admit && admit < persist && persist < start && start < take_back,
+            "order must be authorize_spawn -> admission -> persist -> start, and a door \
+             that started nothing takes the persisted meta-workflow back \
+             (found {gate}, {admit}, {persist}, {start}, {take_back})"
         );
     }
 
@@ -798,14 +1034,17 @@ mod tests {
     // await_run_output — a scripted ledger
     // -----------------------------------------------------------------
 
-    /// Answers `status` and `output` from scripts (the last answer of each
-    /// repeats once its script runs out) and records every stop it is asked
-    /// for, with whether it stopped anything. A stop is conditional, as the
-    /// SQL is: it stops the run only while the status script's current answer
-    /// is a run still going.
+    /// Answers `status`, `output`, `record_on_claim` and `disable_resume` from
+    /// scripts (the last answer of each repeats once its script runs out),
+    /// records every stop it is asked for with whether it stopped anything,
+    /// and logs every call in order. A stop is conditional, as the SQL is: it
+    /// stops the run only while the status script's current answer is a run
+    /// still going.
     struct ScriptedLedger {
         statuses: Mutex<VecDeque<Result<Option<RunStatus>, String>>>,
-        outputs: Mutex<VecDeque<Result<String, String>>>,
+        outputs: Mutex<VecDeque<Result<Option<String>, String>>>,
+        claim_records: Mutex<VecDeque<Result<ClaimRecord, String>>>,
+        resume_answers: Mutex<VecDeque<Result<(), String>>>,
         output_reads: Mutex<usize>,
         /// When set, the run finishes just before any stop reaches it: the
         /// stop changes nothing, and every later status read sees this.
@@ -813,22 +1052,36 @@ mod tests {
         /// When set, every stop fails with it.
         stop_error: Option<String>,
         stops: Mutex<Vec<(String, String, bool)>>,
+        calls: Mutex<Vec<&'static str>>,
     }
 
     impl ScriptedLedger {
         fn new(statuses: Vec<Result<Option<RunStatus>, String>>) -> Self {
             Self {
                 statuses: Mutex::new(statuses.into()),
-                outputs: Mutex::new(VecDeque::from([Ok(String::new())])),
+                outputs: Mutex::new(VecDeque::from([Ok(Some(String::new()))])),
+                claim_records: Mutex::new(VecDeque::from([Ok(ClaimRecord::Recorded)])),
+                resume_answers: Mutex::new(VecDeque::from([Ok(())])),
                 output_reads: Mutex::new(0),
                 finishes_first: Mutex::new(None),
                 stop_error: None,
                 stops: Mutex::new(Vec::new()),
+                calls: Mutex::new(Vec::new()),
             }
         }
 
-        fn outputs(mut self, outputs: Vec<Result<String, String>>) -> Self {
+        fn outputs(mut self, outputs: Vec<Result<Option<String>, String>>) -> Self {
             self.outputs = Mutex::new(outputs.into());
+            self
+        }
+
+        fn claim_records(mut self, answers: Vec<Result<ClaimRecord, String>>) -> Self {
+            self.claim_records = Mutex::new(answers.into());
+            self
+        }
+
+        fn resume_answers(mut self, answers: Vec<Result<(), String>>) -> Self {
+            self.resume_answers = Mutex::new(answers.into());
             self
         }
 
@@ -856,6 +1109,18 @@ mod tests {
         fn output_reads(&self) -> usize {
             *self.output_reads.lock().unwrap()
         }
+
+        fn calls(&self) -> Vec<&'static str> {
+            self.calls.lock().unwrap().clone()
+        }
+
+        fn called(&self, name: &'static str) -> usize {
+            self.calls().iter().filter(|c| **c == name).count()
+        }
+
+        fn log(&self, name: &'static str) {
+            self.calls.lock().unwrap().push(name);
+        }
     }
 
     fn next<T: Clone>(script: &Mutex<VecDeque<T>>) -> T {
@@ -870,10 +1135,12 @@ mod tests {
     #[async_trait::async_trait]
     impl RunLedger for ScriptedLedger {
         async fn status(&self, _task_run_id: &str) -> Result<Option<RunStatus>, String> {
+            self.log("status");
             next(&self.statuses)
         }
 
-        async fn output(&self, _task_run_id: &str) -> Result<String, String> {
+        async fn output(&self, _task_run_id: &str) -> Result<Option<String>, String> {
+            self.log("output");
             *self.output_reads.lock().unwrap() += 1;
             next(&self.outputs)
         }
@@ -883,6 +1150,7 @@ mod tests {
             task_run_id: &str,
             reason: &str,
         ) -> Result<bool, String> {
+            self.log("stop");
             if let Some(e) = &self.stop_error {
                 return Err(e.clone());
             }
@@ -903,6 +1171,20 @@ mod tests {
                 .push((task_run_id.to_string(), reason.to_string(), stopped));
             Ok(stopped)
         }
+
+        async fn record_on_claim(
+            &self,
+            _claim: &RunClaim,
+            _task_run_id: &str,
+        ) -> Result<ClaimRecord, String> {
+            self.log("record");
+            next(&self.claim_records)
+        }
+
+        async fn disable_resume(&self, _task_run_id: &str) -> Result<(), String> {
+            self.log("resume-off");
+            next(&self.resume_answers)
+        }
     }
 
     fn status(status: &str, error: Option<&str>) -> Result<Option<RunStatus>, String> {
@@ -912,8 +1194,37 @@ mod tests {
         }))
     }
 
+    fn output(text: &str) -> Result<Option<String>, String> {
+        Ok(Some(text.to_string()))
+    }
+
     const TIMEOUT: Duration = Duration::from_secs(60);
     const EVERY: Duration = Duration::from_secs(5);
+
+    /// `await_run_output` on `task_run_id`, guarded, with no proposal claim.
+    fn wait(
+        ledger: &Arc<ScriptedLedger>,
+        task_run_id: &str,
+    ) -> impl std::future::Future<Output = Result<serde_json::Value, MetaWorkflowError>> {
+        let ledger: Arc<dyn RunLedger> = ledger.clone();
+        let guard = StopOnDrop::armed(ledger.clone(), task_run_id.to_string());
+        async move { await_run_output(ledger, guard, None, TIMEOUT, EVERY).await }
+    }
+
+    /// `await_run_output` on `task_run_id`, guarded, for an execute holding
+    /// proposal claim `prop-1`.
+    fn wait_claimed(
+        ledger: &Arc<ScriptedLedger>,
+        task_run_id: &str,
+    ) -> impl std::future::Future<Output = Result<serde_json::Value, MetaWorkflowError>> {
+        let ledger: Arc<dyn RunLedger> = ledger.clone();
+        let guard = StopOnDrop::armed(ledger.clone(), task_run_id.to_string());
+        let claim = RunClaim {
+            proposal_id: "prop-1".into(),
+            token: "claim-1".into(),
+        };
+        async move { await_run_output(ledger, guard, Some(&claim), TIMEOUT, EVERY).await }
+    }
 
     #[tokio::test(start_paused = true)]
     async fn a_completed_run_returns_its_output_read_once_and_is_not_stopped() {
@@ -922,9 +1233,9 @@ mod tests {
             status("running", None),
             status("complete", None),
         ])
-        .outputs(vec![Ok(r#"{"id":"page"}"#.into())])
+        .outputs(vec![output(r#"{"id":"page"}"#)])
         .arc();
-        let out = await_run_output(ledger.clone(), "tr-1", TIMEOUT, EVERY).await;
+        let out = wait(&ledger, "tr-1").await;
         assert_eq!(out, Ok(serde_json::json!({ "id": "page" })));
         assert_eq!(
             ledger.output_reads(),
@@ -938,9 +1249,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_dag_completed_run_counts_as_finished() {
         let ledger = ScriptedLedger::new(vec![status("completed", None)])
-            .outputs(vec![Ok("plain text".into())])
+            .outputs(vec![output("plain text")])
             .arc();
-        let out = await_run_output(ledger.clone(), "tr-1", TIMEOUT, EVERY).await;
+        let out = wait(&ledger, "tr-1").await;
         assert_eq!(out, Ok(serde_json::json!({ "output_log": "plain text" })));
     }
 
@@ -949,10 +1260,10 @@ mod tests {
         let ledger = ScriptedLedger::new(vec![status("complete", None)])
             .outputs(vec![
                 Err("PG pool error: timed out".into()),
-                Ok(r#"{"ok":true}"#.into()),
+                output(r#"{"ok":true}"#),
             ])
             .arc();
-        let out = await_run_output(ledger.clone(), "tr-1", TIMEOUT, EVERY).await;
+        let out = wait(&ledger, "tr-1").await;
         assert_eq!(out, Ok(serde_json::json!({ "ok": true })));
         assert_eq!(ledger.output_reads(), 2);
     }
@@ -962,7 +1273,7 @@ mod tests {
         let ledger = ScriptedLedger::new(vec![status("complete", None)])
             .outputs(vec![Err("PG pool error: timed out".into())])
             .arc();
-        let out = await_run_output(ledger.clone(), "tr-1", TIMEOUT, EVERY).await;
+        let out = wait(&ledger, "tr-1").await;
         assert_eq!(
             out,
             Err(MetaWorkflowError::Failed(
@@ -982,7 +1293,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_failed_run_returns_its_error_message() {
         let ledger = ScriptedLedger::new(vec![status("failed", Some("builder step failed"))]).arc();
-        let out = await_run_output(ledger.clone(), "tr-1", TIMEOUT, EVERY).await;
+        let out = wait(&ledger, "tr-1").await;
         assert_eq!(
             out,
             Err(MetaWorkflowError::Failed("builder step failed".into()))
@@ -995,7 +1306,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_stopped_run_is_a_failure_naming_the_stop() {
         let ledger = ScriptedLedger::new(vec![status("stopped", Some("User stopped"))]).arc();
-        let out = await_run_output(ledger.clone(), "tr-1", TIMEOUT, EVERY).await;
+        let out = wait(&ledger, "tr-1").await;
         assert_eq!(
             out,
             Err(MetaWorkflowError::Failed(
@@ -1012,7 +1323,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_run_still_going_at_the_deadline_is_stopped() {
         let ledger = ScriptedLedger::new(vec![status("running", None)]).arc();
-        let out = await_run_output(ledger.clone(), "tr-1", TIMEOUT, EVERY).await;
+        let out = wait(&ledger, "tr-1").await;
         assert_eq!(
             out,
             Err(MetaWorkflowError::Failed(
@@ -1031,9 +1342,9 @@ mod tests {
     async fn a_run_that_completes_as_its_deadline_passes_returns_its_output() {
         let ledger = ScriptedLedger::new(vec![status("running", None)])
             .finishing_first("complete", None)
-            .outputs(vec![Ok(r#"{"id":"late"}"#.into())])
+            .outputs(vec![output(r#"{"id":"late"}"#)])
             .arc();
-        let out = await_run_output(ledger.clone(), "tr-1", TIMEOUT, EVERY).await;
+        let out = wait(&ledger, "tr-1").await;
         assert_eq!(out, Ok(serde_json::json!({ "id": "late" })));
         tokio::task::yield_now().await;
         assert_eq!(
@@ -1048,7 +1359,7 @@ mod tests {
         let ledger = ScriptedLedger::new(vec![status("running", None)])
             .finishing_first("failed", Some("builder step failed"))
             .arc();
-        let out = await_run_output(ledger.clone(), "tr-1", TIMEOUT, EVERY).await;
+        let out = wait(&ledger, "tr-1").await;
         assert_eq!(
             out,
             Err(MetaWorkflowError::Failed("builder step failed".into()))
@@ -1060,7 +1371,7 @@ mod tests {
         let ledger = ScriptedLedger::new(vec![status("running", None)])
             .failing_stops("PG pool error: timed out")
             .arc();
-        let out = await_run_output(ledger.clone(), "tr-1", TIMEOUT, EVERY).await;
+        let out = wait(&ledger, "tr-1").await;
         assert_eq!(
             out,
             Err(MetaWorkflowError::Failed(
@@ -1069,12 +1380,18 @@ mod tests {
                     .into()
             ))
         );
+        tokio::task::yield_now().await;
+        assert_eq!(
+            ledger.called("stop"),
+            2,
+            "a stop that failed leaves the guard armed, and it asks again"
+        );
     }
 
     #[tokio::test(start_paused = true)]
     async fn a_vanished_run_fails_with_nothing_to_stop() {
         let ledger = ScriptedLedger::new(vec![Ok(None)]).arc();
-        let out = await_run_output(ledger.clone(), "tr-1", TIMEOUT, EVERY).await;
+        let out = wait(&ledger, "tr-1").await;
         assert_eq!(
             out,
             Err(MetaWorkflowError::Failed(
@@ -1091,16 +1408,16 @@ mod tests {
             Err("PG pool error: timed out".into()),
             status("complete", None),
         ])
-        .outputs(vec![Ok(r#"{"ok":true}"#.into())])
+        .outputs(vec![output(r#"{"ok":true}"#)])
         .arc();
-        let out = await_run_output(ledger.clone(), "tr-1", TIMEOUT, EVERY).await;
+        let out = wait(&ledger, "tr-1").await;
         assert_eq!(out, Ok(serde_json::json!({ "ok": true })));
     }
 
     #[tokio::test(start_paused = true)]
     async fn an_execute_dropped_mid_poll_stops_its_run() {
         let ledger = ScriptedLedger::new(vec![status("running", None)]).arc();
-        let poll = await_run_output(ledger.clone(), "tr-9", TIMEOUT, EVERY);
+        let poll = wait(&ledger, "tr-9");
         // Let the poll read the run at least once, then abandon it the way an
         // HTTP client hanging up drops its handler future.
         let raced = tokio::time::timeout(Duration::from_secs(12), poll).await;
@@ -1117,7 +1434,7 @@ mod tests {
         let ledger = ScriptedLedger::new(vec![status("running", None)])
             .finishing_first("complete", None)
             .arc();
-        let poll = await_run_output(ledger.clone(), "tr-9", TIMEOUT, EVERY);
+        let poll = wait(&ledger, "tr-9");
         let raced = tokio::time::timeout(Duration::from_secs(12), poll).await;
         assert!(raced.is_err(), "the poll was still waiting when dropped");
         tokio::task::yield_now().await;
@@ -1125,6 +1442,223 @@ mod tests {
             ledger.stops(),
             vec![("tr-9".to_string(), ABANDONED_STOP_REASON.to_string(), false)],
             "the guard's stop is conditional: a run that finished first keeps its status"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // binding the run to its execute
+    // -----------------------------------------------------------------
+
+    /// Before the poll first waits, the run is recorded on the execute's
+    /// proposal claim and its `auto_continue` is turned off, each once.
+    #[tokio::test(start_paused = true)]
+    async fn the_run_is_bound_to_its_execute_before_the_poll_waits() {
+        let ledger = ScriptedLedger::new(vec![status("complete", None)])
+            .outputs(vec![output("{}")])
+            .arc();
+        let out = wait_claimed(&ledger, "tr-1").await;
+        assert_eq!(out, Ok(serde_json::json!({})));
+        assert_eq!(
+            ledger.calls(),
+            vec!["record", "resume-off", "status", "output"],
+            "bound first, once, then polled"
+        );
+    }
+
+    /// A bind write that fails is retried at the next poll, until it lands.
+    #[tokio::test(start_paused = true)]
+    async fn a_bind_that_fails_is_retried_until_it_lands() {
+        let ledger = ScriptedLedger::new(vec![
+            status("running", None),
+            status("running", None),
+            status("complete", None),
+        ])
+        .claim_records(vec![
+            Err("PG pool error: timed out".into()),
+            Ok(ClaimRecord::Recorded),
+        ])
+        .resume_answers(vec![
+            Err("PG pool error: timed out".into()),
+            Err("PG pool error: timed out".into()),
+            Ok(()),
+        ])
+        .outputs(vec![output("{}")])
+        .arc();
+        let out = wait_claimed(&ledger, "tr-1").await;
+        assert_eq!(out, Ok(serde_json::json!({})));
+        assert_eq!(ledger.called("record"), 2);
+        assert_eq!(ledger.called("resume-off"), 3);
+    }
+
+    /// With no proposal claim there is nothing to record the run on; its
+    /// `auto_continue` is still turned off.
+    #[tokio::test(start_paused = true)]
+    async fn a_run_with_no_claim_is_still_made_non_resumable() {
+        let ledger = ScriptedLedger::new(vec![status("complete", None)])
+            .outputs(vec![output("{}")])
+            .arc();
+        let out = wait(&ledger, "tr-1").await;
+        assert_eq!(out, Ok(serde_json::json!({})));
+        assert_eq!(ledger.called("record"), 0);
+        assert_eq!(ledger.called("resume-off"), 1);
+    }
+
+    /// A claim lost before the run is recorded on it (a scan took the
+    /// proposal back) stops the run and fails the execute at once: nothing
+    /// would record its outcome.
+    #[tokio::test(start_paused = true)]
+    async fn a_lost_claim_stops_the_run_and_fails_the_execute() {
+        let ledger = ScriptedLedger::new(vec![status("running", None)])
+            .claim_records(vec![Ok(ClaimRecord::Lost)])
+            .arc();
+        let out = wait_claimed(&ledger, "tr-1").await;
+        match out {
+            Err(MetaWorkflowError::Failed(m)) => {
+                assert!(m.contains("the claim on proposal prop-1 was lost"), "{m}")
+            }
+            other => panic!("a lost claim fails the execute; got {other:?}"),
+        }
+        tokio::task::yield_now().await;
+        assert_eq!(
+            ledger.stops(),
+            vec![("tr-1".to_string(), CLAIM_LOST_STOP_REASON.to_string(), true)],
+            "stopped once, for the lost claim, not again by the guard"
+        );
+        assert_eq!(
+            ledger.called("status"),
+            0,
+            "a run nobody will record is not waited on"
+        );
+    }
+
+    /// A completed run whose row is gone by the time its output is read is a
+    /// run that disappeared, never an empty output.
+    #[tokio::test(start_paused = true)]
+    async fn a_run_gone_before_its_output_is_read_is_not_empty_output() {
+        let ledger = ScriptedLedger::new(vec![status("complete", None)])
+            .outputs(vec![Ok(None)])
+            .arc();
+        let out = wait(&ledger, "tr-1").await;
+        assert_eq!(
+            out,
+            Err(MetaWorkflowError::Failed(
+                "meta-workflow task run tr-1 disappeared".into()
+            ))
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // start_run — the door call's own task
+    // -----------------------------------------------------------------
+
+    fn named_run(task_run_id: &str) -> Result<DoorReply, String> {
+        Ok(DoorReply {
+            status: 200,
+            body: serde_json::json!({ "success": true, "data": { "task_run_id": task_run_id } }),
+        })
+    }
+
+    /// The run the door starts is handed over guarded: dropping the guard
+    /// stops it.
+    #[tokio::test(start_paused = true)]
+    async fn a_started_run_is_handed_over_guarded() {
+        let ledger = ScriptedLedger::new(vec![status("running", None)]).arc();
+        let started = start_run(ledger.clone(), async { named_run("tr-1") }).await;
+        let guard = match started {
+            Ok(guard) => guard,
+            Err(not_started) => panic!("the door named its run: {not_started:?}"),
+        };
+        assert_eq!(guard.task_run_id(), "tr-1");
+        drop(guard);
+        tokio::task::yield_now().await;
+        assert_eq!(
+            ledger.stops(),
+            vec![("tr-1".to_string(), ABANDONED_STOP_REASON.to_string(), true)]
+        );
+    }
+
+    /// An execute dropped while the door call is in flight cannot leave the
+    /// run the door then starts unguarded: it is stopped.
+    #[tokio::test(start_paused = true)]
+    async fn a_run_started_after_its_execute_was_dropped_is_stopped() {
+        let ledger = ScriptedLedger::new(vec![status("running", None)]).arc();
+        let door = async {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            named_run("tr-late")
+        };
+        let raced =
+            tokio::time::timeout(Duration::from_secs(1), start_run(ledger.clone(), door)).await;
+        assert!(
+            raced.is_err(),
+            "the execute went away while the door call was in flight"
+        );
+        assert!(
+            ledger.stops().is_empty(),
+            "nothing to stop before the door answers"
+        );
+        tokio::time::sleep(Duration::from_secs(20)).await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            ledger.stops(),
+            vec![(
+                "tr-late".to_string(),
+                ABANDONED_STOP_REASON.to_string(),
+                true
+            )]
+        );
+    }
+
+    /// The door says whether it started nothing: a refusal or an unreachable
+    /// door started nothing, while a 200 that names no run may have started
+    /// one.
+    #[tokio::test(start_paused = true)]
+    async fn the_door_says_whether_it_started_nothing() {
+        let ledger: Arc<dyn RunLedger> = ScriptedLedger::new(vec![status("running", None)]).arc();
+        let refused = start_run(ledger.clone(), async {
+            Ok(from_the_door(Err((
+                StatusCode::NOT_FOUND,
+                Json(api_error("Unified workflow not found: wf-1")),
+            ))))
+        })
+        .await
+        .err()
+        .expect("a refusal starts no run");
+        assert!(refused.nothing_started);
+        let drained = start_run(ledger.clone(), async {
+            Ok(from_the_door(Err((
+                StatusCode::CONFLICT,
+                Json(api_refusal(
+                    "coord has drained this device",
+                    DeferClass::Drained,
+                )),
+            ))))
+        })
+        .await
+        .err()
+        .expect("a drain refusal starts no run");
+        assert!(drained.nothing_started);
+        assert!(matches!(drained.error, MetaWorkflowError::Deferred { .. }));
+        let unreachable = start_run(ledger.clone(), async {
+            Err("no Tauri app handle — cannot call the door in-process".to_string())
+        })
+        .await
+        .err()
+        .expect("an unreachable door starts no run");
+        assert!(unreachable.nothing_started);
+        let unnamed = start_run(ledger.clone(), async {
+            Ok(DoorReply {
+                status: 200,
+                body: serde_json::json!({ "success": true }),
+            })
+        })
+        .await
+        .err()
+        .expect("a 200 with no run is not a run to wait on");
+        assert!(
+            !unnamed.nothing_started,
+            "a 200 that names no run may have started one"
         );
     }
 }

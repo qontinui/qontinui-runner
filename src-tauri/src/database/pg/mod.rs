@@ -1206,35 +1206,9 @@ impl PgDb {
         // ACCESS EXCLUSIVE lock and runs DDL, so, as with the
         // `scheduled_tasks.conditions` heal above, on every boot after the
         // first it must not run at all.
-        conn.batch_execute(
-            "DO $$
-             BEGIN
-               IF EXISTS (
-                 SELECT 1 FROM information_schema.tables
-                 WHERE table_schema = 'atlas_managed' AND table_name = 'spec_proposals'
-               ) AND (
-                 NOT EXISTS (
-                   SELECT 1 FROM information_schema.columns
-                   WHERE table_schema = 'atlas_managed' AND table_name = 'spec_proposals'
-                     AND column_name = 'app_id' AND is_nullable = 'NO'
-                 )
-                 OR to_regclass('atlas_managed.spec_proposals_kind_target_uniq') IS NOT NULL
-                 OR to_regclass('atlas_managed.spec_proposals_app_kind_target_uniq') IS NULL
-               ) THEN
-                 LOCK TABLE atlas_managed.spec_proposals IN ACCESS EXCLUSIVE MODE;
-                 ALTER TABLE atlas_managed.spec_proposals
-                     ADD COLUMN IF NOT EXISTS app_id TEXT;
-                 UPDATE atlas_managed.spec_proposals SET app_id = 'qontinui-runner'
-                     WHERE app_id IS NULL;
-                 ALTER TABLE atlas_managed.spec_proposals ALTER COLUMN app_id SET NOT NULL;
-                 CREATE UNIQUE INDEX IF NOT EXISTS spec_proposals_app_kind_target_uniq
-                     ON atlas_managed.spec_proposals (app_id, kind, (COALESCE(pathname, spec_id)));
-                 DROP INDEX IF EXISTS atlas_managed.spec_proposals_kind_target_uniq;
-               END IF;
-             END $$;",
-        )
-        .await
-        .map_err(|e| format!("spec_proposals.app_id self-heal failed: {}", e))?;
+        conn.batch_execute(&spec_proposals_app_id_heal_sql("atlas_managed"))
+            .await
+            .map_err(|e| format!("spec_proposals.app_id self-heal failed: {}", e))?;
 
         // Approach-D Conductor/Engine Phase 1 — runner-owned `orchestration`
         // schema (durable run + subtask DAG ledger).
@@ -1534,6 +1508,151 @@ impl PgDb {
         std::sync::Arc::new(Self {
             pool: GuardedPool::new(pool),
         })
+    }
+}
+
+/// The `spec_proposals.app_id` self-heal `verify_and_provision` runs (see the
+/// comment there), for the `spec_proposals` table in `schema`. Production
+/// heals `atlas_managed`; a test heals a scratch schema built in the legacy
+/// shape. `schema` is an internal identifier, never caller input.
+///
+/// Gated on the table existing AND on there being something to heal (`app_id`
+/// missing or nullable, the old dedup index still there, or the new one not
+/// yet): the healing branch takes an ACCESS EXCLUSIVE lock, so a boot that
+/// finds nothing to heal must not run it.
+pub(crate) fn spec_proposals_app_id_heal_sql(schema: &str) -> String {
+    format!(
+        "DO $$
+         BEGIN
+           IF EXISTS (
+             SELECT 1 FROM information_schema.tables
+             WHERE table_schema = '{schema}' AND table_name = 'spec_proposals'
+           ) AND (
+             NOT EXISTS (
+               SELECT 1 FROM information_schema.columns
+               WHERE table_schema = '{schema}' AND table_name = 'spec_proposals'
+                 AND column_name = 'app_id' AND is_nullable = 'NO'
+             )
+             OR to_regclass('{schema}.spec_proposals_kind_target_uniq') IS NOT NULL
+             OR to_regclass('{schema}.spec_proposals_app_kind_target_uniq') IS NULL
+           ) THEN
+             LOCK TABLE {schema}.spec_proposals IN ACCESS EXCLUSIVE MODE;
+             ALTER TABLE {schema}.spec_proposals
+                 ADD COLUMN IF NOT EXISTS app_id TEXT;
+             UPDATE {schema}.spec_proposals SET app_id = 'qontinui-runner'
+                 WHERE app_id IS NULL;
+             ALTER TABLE {schema}.spec_proposals ALTER COLUMN app_id SET NOT NULL;
+             CREATE UNIQUE INDEX IF NOT EXISTS spec_proposals_app_kind_target_uniq
+                 ON {schema}.spec_proposals (app_id, kind, (COALESCE(pathname, spec_id)));
+             DROP INDEX IF EXISTS {schema}.spec_proposals_kind_target_uniq;
+           END IF;
+         END $$;"
+    )
+}
+
+/// The `spec_proposals.app_id` self-heal against a scratch schema built in the
+/// legacy shape (no `app_id`, the old dedup index), in the database
+/// `DATABASE_URL` names.
+#[cfg(all(test, feature = "pg_integration_tests"))]
+mod spec_proposals_heal_tests {
+    use super::{spec_proposals_app_id_heal_sql, PgDb};
+
+    /// The first boot files every legacy row under the bootstrap app, makes
+    /// the column NOT NULL and swaps the dedup index. A second boot finds
+    /// nothing to heal and takes no lock: it finishes under a 2 s
+    /// `lock_timeout` while another connection holds ACCESS SHARE on the table.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_heal_files_legacy_rows_once_then_takes_no_lock() {
+        let db = PgDb::new_for_test().await;
+        let schema = format!("heal_test_{}", uuid::Uuid::new_v4().simple());
+        let conn = db.pool().get().await.expect("pg conn");
+        conn.batch_execute(&format!(
+            "CREATE SCHEMA {schema};
+             CREATE TABLE {schema}.spec_proposals (
+                 id TEXT PRIMARY KEY, kind TEXT NOT NULL, pathname TEXT,
+                 spec_id TEXT, status TEXT NOT NULL);
+             CREATE UNIQUE INDEX spec_proposals_kind_target_uniq
+                 ON {schema}.spec_proposals (kind, (COALESCE(pathname, spec_id)));
+             INSERT INTO {schema}.spec_proposals (id, kind, pathname, status)
+                 VALUES ('legacy-1', 'fullPage', '/a', 'queued');
+             INSERT INTO {schema}.spec_proposals (id, kind, spec_id, status)
+                 VALUES ('legacy-2', 'patch', 's', 'queued');"
+        ))
+        .await
+        .expect("legacy-shaped table");
+
+        let heal = spec_proposals_app_id_heal_sql(&schema);
+        conn.batch_execute(&heal)
+            .await
+            .expect("the first boot heals");
+
+        let filed: String = conn
+            .query_one(
+                &format!(
+                    "SELECT string_agg(id || '=' || app_id, ',' ORDER BY id) \
+                     FROM {schema}.spec_proposals"
+                ),
+                &[],
+            )
+            .await
+            .and_then(|r| r.try_get(0))
+            .expect("rows");
+        assert_eq!(filed, "legacy-1=qontinui-runner,legacy-2=qontinui-runner");
+        let nullable: String = conn
+            .query_one(
+                "SELECT is_nullable FROM information_schema.columns \
+                 WHERE table_schema = $1 AND table_name = 'spec_proposals' \
+                   AND column_name = 'app_id'",
+                &[&schema],
+            )
+            .await
+            .and_then(|r| r.try_get(0))
+            .expect("app_id column");
+        assert_eq!(nullable, "NO");
+        let indexes: Vec<String> = conn
+            .query(
+                "SELECT indexdef FROM pg_indexes WHERE schemaname = $1 \
+                   AND tablename = 'spec_proposals' AND indexname LIKE 'spec_proposals_%' \
+                 ORDER BY indexname",
+                &[&schema],
+            )
+            .await
+            .expect("indexes")
+            .iter()
+            .map(|r| r.try_get(0).expect("indexdef"))
+            .collect();
+        assert_eq!(indexes.len(), 2, "{indexes:?}");
+        assert!(
+            indexes
+                .iter()
+                .any(|d| d.contains("spec_proposals_app_kind_target_uniq")
+                    && d.contains("(app_id, kind, COALESCE(pathname, spec_id))")),
+            "{indexes:?}"
+        );
+        assert!(
+            !indexes
+                .iter()
+                .any(|d| d.contains("spec_proposals_kind_target_uniq")),
+            "the old dedup index is dropped: {indexes:?}"
+        );
+
+        let holder = db.pool().get().await.expect("a second pg conn");
+        holder
+            .batch_execute(&format!(
+                "BEGIN; LOCK TABLE {schema}.spec_proposals IN ACCESS SHARE MODE;"
+            ))
+            .await
+            .expect("hold ACCESS SHARE");
+        let second = conn
+            .batch_execute(&format!("SET lock_timeout = '2s'; {heal}"))
+            .await;
+        holder.batch_execute("COMMIT;").await.expect("release");
+        conn.batch_execute(&format!(
+            "RESET lock_timeout; DROP SCHEMA {schema} CASCADE;"
+        ))
+        .await
+        .expect("cleanup");
+        second.expect("a second boot finds nothing to heal and waits on no lock");
     }
 }
 
