@@ -29,8 +29,9 @@ states what replaced it.
 
 ⚠️ **Since 2026-10-24 the expedited door comes before that merge, wherever it
 serves the PR.** Served policy `git-operations` `expedited-land-request`
-(operator-approved 2026-10-24, finding `df77afe8`) lets the authoring session
-ASK coord to land a red-main remedy. Coord re-derives every condition and lands
+(operator-approved 2026-10-24, finding `df77afe8`) lets an agent ASK coord to
+land a red-main remedy, and coord's door accepts the request only from the PR's
+authoring session. Coord re-derives every condition and lands
 the PR itself. Where that door served the PR, it comes before Step 6's direct
 merge, under the recovery condition the clause names. Otherwise, Step 6 is
 unchanged. Step 5a carries the procedure.
@@ -142,9 +143,13 @@ pr-session-finished-when-prs-initially-green]: checks still running on the last
 push no longer hold the session open):
 
 - Checks still `pending` — `pr-checks.sh` reports `queued` and `in_progress`
-  alike as `pending`. Coord observes their results by webhook and pushes a
-  later red to the author: its `ci_rework` prompt to a live author, its
-  `pr_fix` fixer lane for a dead one. Waiting for them is not owed work.
+  alike as `pending`, and `pending=` also counts a workflow run that has not
+  created its jobs yet (or sits between a `needs:` job and its dependents), so
+  `pending=1` beside all-settled rows is a workflow still to start, not a
+  settled head; `pr-checks.sh runs <owner/repo> <n>` names it. Coord observes
+  their results by webhook and pushes a later red to the author: its
+  `ci_rework` prompt to a live author, its `pr_fix` fixer lane for a dead one.
+  Waiting for them is not owed work.
 - `first_fully_green_at` was stamped at least once on that head. A later red
   flip, or a red that appeared because `main` moved, does not un-green it for
   this test. The stamp's reset rule below serves Step 4's clock, not this exit.
@@ -328,6 +333,16 @@ Only once the classification says “real” do you read the failing run log
   network, a self-hosted runner losing its GitHub session mid-job):
   `gh run rerun <id> --failed`. At most 2 reruns per head before treating as
   real.
+
+  ⚠️ **`--failed`, never `--job`.** A run's check rows are its LATEST attempt's,
+  so re-running one job of a run that also carries a required check can delete
+  that check's green row: measured once, on `qontinui-coord#3551`, and it held
+  the PR about 4 h. A `--failed` re-run also makes a new attempt; no case of one
+  deleting a green row is recorded, which is not proof it cannot. An orphaned
+  advisory job beside a green required one is left alone, or handled by a fresh
+  head. Read the run's job list before any re-run. Diagnosis and recovery:
+  `/merge-train-steward` (where your deployment provides it), its *A required
+  check VANISHED* row.
 
   ⚠️ **Identify this class from the job's STEPS — `cancelled` is the minority
   shape.** Most infra kills on this fleet arrive as `conclusion: failure`, which
@@ -578,9 +593,14 @@ the gap either — `mergeable: MERGEABLE` reports the absence of a textual
 conflict, never the satisfaction of a required-check ruleset. Treat "required
 context missing/never reported" as its own stuck class here, distinct from
 both **red CI** (Step 3) and **green but stuck for some other reason** (queue,
-stacked dependency, coord itself wedged — the rest of 4d's table): it is 4d's
-`required-checks-missing` row, and it is a **Legitimate hold**, never a lesser
-severity than a visible red — a PR can carry zero failing checks and still be
+stacked dependency, coord itself wedged — the rest of 4d's table). The block
+code alone does not settle the row. `required-checks-missing` is that row of 4d,
+a **Legitimate hold**. `merge-state-unsettled` is Transient while young; past the
+dwell it is the phantom arm of 4d's **Coord defect** row, except that a context
+whose workflow died at `startup_failure` or never triggered on this head is a
+**Legitimate hold**, by the two causes named below. Any other code, such as
+`ci-pending`, is not settled by this split. Whatever the code, it is never a
+lesser severity than a visible red — a PR can carry zero failing checks and still be
 unmergeable. Where coord's PR-status surface (`coord_pr_status` / `/pr-status`)
 is available, a `blockers` entry naming an unestablished required-check state
 is the actionable signal here (a companion coord change is adding this
@@ -588,9 +608,23 @@ wording); treat it with the same urgency as a red check, not lower, since
 `gh pr checks` alone will never surface it. Once the missing context is
 identified, `startup_failure` (the workflow started and died) and "never
 triggered" (the trigger/path filter excludes this branch) are different,
-actionable causes — re-run the workflow for the former, fix the
-trigger/path filter for the latter — name which one you found rather than
-treating them as interchangeable.
+actionable causes — name which one you found rather than treating them as
+interchangeable. Fix the trigger/path filter for the latter. For the former,
+**do not re-run, `--failed` included**: the default is to move the head. The one
+exception is a single full re-run (`gh run rerun <id> -R <repo>`, outside Step
+3's 2-rerun bound) of a PR-head run whose latest attempt is `startup_failure`
+with zero jobs, after an earlier attempt of that same run dispatched jobs that
+ran steps. Read each attempt's jobs
+(`GET repos/<r>/actions/runs/<id>/attempts/<n>/jobs`) to test that. Every other
+shape stays un-re-run: the re-run is one-way on an undispatched run, and whether
+`startup_failure` behaves the same is deliberately unmeasured
+(`/merge-train-steward`, where your deployment provides it: the NEVER DISPATCHED
+section and the *A required check VANISHED* and *Runs EXIST but none of them can
+ever conclude* rows). Move the head only on a branch this session owns, otherwise
+hand back to the author; run the carries-the-push check under **Real failure**
+first, and Step 4a.5 if the push is a rebase. If the new head also ends in
+`startup_failure`, treat the cause as not per-run: stop pushing, read the workflow file
+and the run's annotations, and report the PR `blocked-legitimate`.
 
 **4a. GitHub-side sanity** — `gh pr view --json isDraft,mergeable,mergeStateStatus,labels`:
 draft, DIRTY (textual conflict → rebase it yourself), or a `coord:blocked` /
@@ -673,9 +707,39 @@ error, not a missing door.
 | Class | Codes / signals | Action |
 |---|---|---|
 | **Transient — wait** | `ci-pending` (**only once you have PROVEN CI actually fired — see the note under this table**), `below-green-dwell`, `merge-state-unsettled` (young), in-flight proposal in `/merge/queue` | Nothing. Reset no clocks; check again next poll. |
-| **Legitimate hold — fix the cause, NEVER bypass** | `ci-not-green`, `main-red` (except on the red-main fix PR itself, labelled `coord:red-main-fix`: it is the one PR that cannot pass a red main, so ask coord's expedited door for it first (Step 5a). Where the door did not serve it, in parallel with the door and unchanged, `scripts/agent-direct-merge.sh` may merge it as before, under `direct-merge-with-notification`. Where it did serve it, the script may merge it only under Step 5a's recovery condition), `main-status-unknown`, `not-open`, `required-checks-missing`, `behind-main-or-unstable` (DIRTY), `auto-merge-disabled`, `dry-run-mode`, `escalate-path-matched`, `has-cross-repo-dependency` via `stacked-on` with parent still open | Fix in-session (rebase, fix CI). For `escalate-path-matched`, read what coord is actually waiting on and fix THAT — see the note under this table; never route around it (no recovery merge, no override you arrange yourself). ⚠️ For `ci-not-green` **and `main-red` alike, run Step 3's step-level classifier on the failed job FIRST**: a Tier-1/2/T kill is not a cause to fix, it is a re-run — of main's own run in the `main-red` case — and it will **never** self-heal on its own. A `main-red` hold is a legitimate hold either way, but the remedy is not the same one. |
-| **Coord defect — recover + remediate** | `has-cross-repo-dependency` where the labeled PR is the UPSTREAM of the edge (`coord:upstream-of=` deadlock — engine parent-resolution inverted); `unlandable_cycle` spinning (cycles > ~5) with all members green; `merge-state-unsettled` dwell > 2× threshold on a fully-green head (phantom required-context wedge, coord#638); latest hydration `head_sha` ≠ current head for > 1h (stale ingest); predicate `result: pass` with no landing and no queue entry for > 1h; `has-blocking-label` on a live PR (retired code — should be extinct) | Step 5 → 6. |
+| **Legitimate hold — fix the cause, NEVER bypass** | `ci-not-green`, `main-red` (except on the red-main fix PR itself, labelled `coord:red-main-fix`: it is the one PR that cannot pass a red main, so ask coord's expedited door for it first (Step 5a). Where the door did not serve it, in parallel with the door and unchanged, `scripts/agent-direct-merge.sh` may merge it as before, under `direct-merge-with-notification`. Where it did serve it, the script may merge it only under Step 5a's recovery condition), `main-status-unknown`, `not-open`, `required-checks-missing`, `behind-main-or-unstable` (DIRTY), `auto-merge-disabled`, `dry-run-mode`, `escalate-path-matched`, `has-cross-repo-dependency` via `stacked-on` with parent still open, `has-cross-repo-dependency` whose detail reads `waits-on:<repo>#<n> (declared upstream via that PR's coord:upstream-of label; …)`, `dependency-upstream-closed` (both: see the `waits-on:` note under this table) | Fix in-session (rebase, fix CI). For `escalate-path-matched`, read what coord is actually waiting on and fix THAT — see the note under this table; never route around it (no recovery merge, no override you arrange yourself). ⚠️ For `ci-not-green` **and `main-red` alike, run Step 3's step-level classifier on the failed job FIRST**: a Tier-1/2/T kill is not a cause to fix, it is a re-run — of main's own run in the `main-red` case — and it will **never** self-heal on its own. A `main-red` hold is a legitimate hold either way, but the remedy is not the same one. |
+| **Coord defect — recover + remediate** | `unlandable_cycle` spinning (cycles > ~5) with all members green; `merge-state-unsettled` dwell > 2× threshold on a fully-green head (phantom required-context wedge, coord#638 — **unless the missing required context's workflow DID run on this head and that run's latest attempt is a 0-job `startup_failure`, or the workflow never triggered on this head because its own `on:` filter excludes it: that is no coord defect but a Legitimate hold, so follow the matching arm of Step 4's preamble**); latest hydration `head_sha` ≠ current head for > 1h (stale ingest); predicate `result: pass` with no landing and no queue entry for > 1h; `has-blocking-label` on a live PR (retired code — should be extinct) | Step 5 → 6. |
 | **Coord down** | no leader across 4–8 health samples, **and** `bash <session-workdir>/.claude/skills/coord-revive/coord-revive.sh --floor-claim` printed a `FLOOR-CLAIM:` block reading `verdict=FLOOR` — paste it into the report. `verdict=UNKNOWN` (exit 5: sampled under this box's own load) is NOT this class; wait for the builds to finish and sample again | Step 6 directly — the merge through `scripts/agent-direct-merge.sh`; expect exit 5 (merged, notify later) while coord is down. |
+
+**A `waits-on:` from an upstream's `coord:upstream-of=` label is a hold,
+never a coord defect.** The label on `<repo>#<n>` orders this PR after it.
+The labeled upstream never shows a code for its own `upstream-of` label,
+which is Neutral. Read this PR's `coord_pr_status` → `dep_edges` entry for
+the upstream (`kind: "upstream_of"`, `self_waits: true`):
+
+- **Upstream open:** shepherd `<repo>#<n>`. This PR lands after it.
+- **Upstream closed without landing** (`parent_state: closed`,
+  `satisfied` not `true`; the code and the detail do not change): coord keeps it
+  as a parent on purpose, fail-closed. `dependency-upstream-closed` reports
+  the same state for a closed `stacked-on`/`downstream-of` parent. Re-anchor
+  the label onto the successor PR or, when the dependency is obsolete, drop
+  it. Either way, remove it from `<repo>#<n>` with Step 5 lever 2's
+  mechanics: setting it on the successor alone leaves this PR stranded. For
+  `dependency-upstream-closed` the label sits on this PR instead. Removing
+  it on GitHub, plus any `Coord-Downstream-Of:` / `Coord-Stacked-On:` body
+  line, is enough for a `downstream-of`, because hydration then prunes that
+  row from every source after a grace window. A `stacked-on` also leaves an
+  edge this PR owns, and hydration does not re-sync it, so afterwards fire
+  one `pull_request` event on THIS PR (lever 3's no-op label touch).
+- **The two PRs wait on each other:** the declarations contradict. Usually
+  one PR carries both `coord:upstream-of=X` and `coord:downstream-of=X`, and
+  its card shows `direction_conflict: true`. Two `downstream-of` labels naming
+  each other also deadlock, and no flag shows it. Remove the wrong one, an
+  `upstream-of` with lever 2's mechanics, a `downstream-of` as just
+  described.
+
+Never recover-merge past any of these. Step 6's `--override-gate` is not a
+remedy for a declared ordering.
 
 **`escalate-path-matched` is a hold with a named pending gate — read it before
 deciding who acts.** `coord_pr_merge_verdict {repo, pr_number}` returns an
@@ -795,25 +859,91 @@ at the land seam** is the same case seen from the train. One PR can carry hits w
   was written; whether a retry helps is decided by its cause, never assumed —
   the HTTP twin's JSON body carries `cause` and `retryable`, while over MCP
   the refusal is the one line `<code>: <message>`, whose message says
-  `retryable` or `not retryable` and names the cause in prose). Of its
-  causes, only `fetch_failed` whose last read failed transiently answers
-  `retryable: true`: resubmit, and on a cool-down (the body's
-  `cooldown_until`) resubmit the SAME bundle unchanged when the message says.
+  `retryable` or `not retryable` and names the cause in prose). Two of its
+  causes, `patch_unavailable` and `not_in_listing`, read differently on a
+  coord build that serves the mirror change (the coord PR citing plan
+  `2026-11-03-escalate-evidence-mirror-grounds-patchless-files`; see the
+  next paragraph). On a build without it, only `fetch_failed` whose last read
+  failed transiently answers `retryable: true`: resubmit, and on a cool-down
+  (the body's `cooldown_until`) resubmit the SAME bundle unchanged when the
+  message says.
   Every other cause comes back unchanged on resubmission. A file refused
   `no_quotable_lines` whose changed lines are all short, at least one holding
   a letter or digit, grounds only by step 3's whole-line quote once a build
   serving qontinui-coord#3435 is live; until then no bundle clears it, so the
   PR is `blocked-legitimate` (the coord fix is in flight), or, if it cannot
-  wait, ask the operator as below. `not_in_listing` is GitHub's 3,000-file
-  listing cap — split the PR.
+  wait, ask the operator as below. On a build without the mirror change,
+  `not_in_listing` is GitHub's 3,000-file listing cap — split the PR.
   A non-retryable `fetch_failed` means coord could not read the diff at all
   (`unified_cause` / `files_api_cause`, or the message, name the failed read;
-  nothing in your bundle caused it). That, `patch_unavailable`
-  (binary, or the file's own diff too large), `not_in_diff`,
-  `ambiguous_section`, and a `no_quotable_lines` file with nothing to quote
-  (binary, rename, mode change, punctuation only) leave no disclosure that can
-  ground the hit — ask the operator for the override with a recommendation
-  (closed-list item 2), naming the failed read where that is the cause.
+  nothing in your bundle caused it). That, `patch_unavailable` on a build
+  without the mirror change (binary, or the file's own diff too large),
+  `not_in_diff`, `ambiguous_section`, and a `no_quotable_lines` file with
+  nothing to quote (binary, rename, mode change, punctuation only) leave no
+  disclosure that can ground the hit — ask the operator for the override with
+  a recommendation (closed-list item 2), naming the failed read where that is
+  the cause.
+
+  **On a coord build that serves the mirror change, a file GitHub serves no
+  patch for is grounded on coord's own mirror: `patch_unavailable` or
+  `not_in_listing` alone sends it to neither the operator nor a split.**
+  GitHub serves no `patch` for a file whose own diff is too large or that
+  falls past the PR's cumulative diff limit, and its listing stops at 3,000
+  files. A build serving the coord PR citing plan
+  `2026-11-03-escalate-evidence-mirror-grounds-patchless-files` reads such a
+  file's section from coord's bare mirror instead — the PR's pinned head
+  against its merge base, in GitHub's patch format — and grounds the
+  disclosure on it by step 3's rules, unchanged. On such a build:
+
+  - Quote the file from its section of the whole read
+    `git fetch origin <base> && git diff --unified=3 --inter-hunk-context=1 --find-renames -l1000 origin/<base>...<head>`
+    (`git fetch origin pull/<n>/head` first when your clone lacks `<head>`).
+    For a file whose changed lines are all short, name the `@@` range THAT
+    command prints: git's default `--inter-hunk-context=0` splits hunks
+    GitHub fuses, so a range copied from it can differ, and a range that
+    differs is refused. The exception is a section coord grounded during
+    its own GitHub cool-down: it reads at `--inter-hunk-context=0`, so a
+    refusal there names that command, and you quote from it. Read the PR
+    whole; never narrow a renamed file to
+    `-- <path>` alone, which turns it into a whole-file add — use
+    `-- <previous path> <path>`. `coord_submit_escalate_evidence`'s own
+    description says the same on such a build.
+  - Read `patch_unavailable` / `not_in_listing` together with their `mirror`
+    field, the code naming why coord's mirror could not stand in for that
+    file: the HTTP twin's body carries it beside `cause`, and the MCP line's
+    message names it. `retryable` is derived from that code, so resubmit on
+    `retryable: true` — the transient codes `no_mirror` (coord has begun a
+    background clone, which can take minutes), `fetch_failed`,
+    `fetch_timed_out` and `diff_failed` (coord's own git against its mirror,
+    not a GitHub read), and `busy` (another grounding holds coord's permit).
+    `head_absent` is `retryable: true` as well, but resubmit only after
+    re-reading the head, as the next bullet says; if `head_sha` is unchanged,
+    the same bundle is the right resubmission.
+  - On `mirror: head_absent`, coord's fresh fetch lacks the head you named:
+    GitHub's pull ref lags, or the head moved. Re-read `coord_pr_status` and
+    resubmit at its `head_sha` (a head that moved needs steps 1-3 again).
+    Never ask the operator for it.
+  - Ask the operator only when `mirror` names a non-retryable miss (for
+    example `too_large`, `disagrees_with_github` or `not_in_mirror_diff`), and
+    name that code in the ask — closed-list item 2, with a recommendation.
+  - A `disclosure_not_grounded` or `no_quotable_lines` refusal carrying
+    `section_source: "mirror"` was judged against the mirror's section; its
+    message names the command and the `merge_base` coord read, so re-quote
+    from that output. A binary file's mirror section still offers nothing to
+    quote, so it stays the operator's, as above.
+
+  Whether the serving build has the mirror change: that coord PR's land
+  commit — or that of a PR adopting it (`coord_pr_status` `merge_commit`, once
+  `land_stamp` reads `terminal` or `current_head`;
+  coord's work-unit citation list for that plan stem names the PR) — must be
+  an ancestor of the `build_sha` that `GET https://coord.qontinui.io/health`
+  serves, read with `git merge-base --is-ancestor <merge_commit> <build_sha>`
+  exactly as for #3435 above (exit 0 it is, 1 it is not, 128 UNKNOWN). No
+  build has it until that PR, or a PR adopting it, lands. The refusal tells
+  too, one way only: a `patch_unavailable` / `not_in_listing` refusal that
+  carries a `mirror` code came from a build with it. One without the code
+  settles nothing — read the build as above.
+
   Verify by read — re-read `coord_pr_merge_verdict` — never by the call's own
   success.
 - **A migration the classifier rejected** — two remedies, and the choice is
@@ -926,9 +1056,47 @@ Try cheapest-first; give each one ~2 poll cycles to take effect:
 1. **Force re-evaluation**: `POST /pr-merge/prs/<owner>/<repo>/<pr>/reevaluate`
    (same bearer) — runs one predicate eval immediately. Cures stale snapshots.
 2. **Remove the defective input** when the diagnosis identifies one — e.g.
-   the `coord:upstream-of` deadlock is broken by removing that label from the
-   upstream PR (ordering usually survives via the dep edge until the next label
-   sync, and the upstream lands first anyway). Remove it over the REST labels
+   a `coord:upstream-of=` label that 4d's `waits-on:` note found obsolete or
+   contradictory is retracted from the upstream PR (once coord re-syncs that
+   PR's edges, the `upstream_of` edge is gone and the PR the label names
+   stops waiting on it).
+
+   ⚠️ **First read which coord rows declare it, and each row's `source`:**
+   `coord_pr_status(repo, number)` on the upstream PR → `labels` (`labels:
+   null` is UNKNOWN, not "no row"). Read every `coord:upstream-of=` row whose
+   value names the downstream PR, in any spelling: a short `<repo>#<n>`
+   (which takes the upstream's owner), an owner-qualified one and a body
+   trailer can each declare the same edge. The
+   dependency graph derives edges from labels of any source, so the edge
+   stands until every such row is gone. Coord's GitHub-label reconcile
+   (webhook and hydration) deletes `github` rows only, and hydration's
+   source-agnostic dependency prune covers only `coord:stacked-on=` and
+   `coord:downstream-of=`. Each source therefore needs its own remedy:
+
+   - `source: github`: the GitHub DELETE below; the `unlabeled` webhook then
+     re-syncs the edges. If the body also carries a `Coord-Upstream-Of:` line
+     for the same PR, that same webhook re-inserts the label as
+     `coord_trailer`, so take the line out first. Follow the next arm only
+     when the read already shows a `coord_trailer` row.
+   - `source: coord_trailer` (a `Coord-Upstream-Of:` line in the PR body):
+     take the line out of the body, because every webhook re-inserts a
+     trailer row the body still declares. No sanctioned agent door deletes
+     the row itself. It needs the operator's admin-gated
+     `DELETE /pr-merge/labels/<owner>/<repo>/<pr>/<label>` (`<label>`
+     `@uri`-encoded, as below; `.claude/skills/coord-pr-label/SKILL.md` →
+     "Removing a label you set" lists it), so surface it to the operator
+     with that recommendation. That DELETE does not re-sync edges, so
+     afterwards fire one `pull_request` event on the upstream PR with lever
+     3's no-op label touch.
+   - `source: coord_skill` (what `/coord-pr-label` writes): retract it
+     through coord's label door, `.claude/skills/coord-pr-label/SKILL.md` →
+     "Removing a label you set". That door is replace mode, which deletes
+     every `coord_skill` row on the PR that you leave out, so post every other
+     `coord_skill` label as the keep set, and read its caveats first. It
+     re-syncs the edges itself and strips the GitHub label, except a label
+     set in the short `<repo>#<n>` form (its caveats say why).
+
+   Remove a `github` label over the REST labels
    route, **not with `gh pr edit --remove-label`**, which cannot run here at
    all: `gh pr edit` prefetches `repository.pullRequest.projectCards` over
    GraphQL, GitHub refuses that under the Projects-classic sunset, and it exits
@@ -953,6 +1121,29 @@ Try cheapest-first; give each one ~2 poll cycles to take effect:
    for `PATCH .../issues/<n>` with a `labels` array instead — that route
    **replaces the whole label set**, stripping every other `coord:*` edge on
    the PR, which is the same clobber hazard `-f body=` carries on the body.
+
+   Then read it back:
+   - GitHub's labels on the upstream PR: run the DELETE above if the label is
+     still there.
+   - `coord_pr_status` on the upstream PR: `labels` holds no row naming the
+     downstream `<repo>#<n>`.
+   - `coord_pr_status` on the PR the label names: `dep_edges` holds no entry
+     with `kind: "upstream_of"`, `self_waits: true` and `other` = the
+     upstream's owner-qualified `<owner>/<repo>#<n>`. If one remains with
+     `source: "label"`, that PR carries its own `coord:downstream-of=` for the
+     upstream, which also holds it. An empty `dep_edges` is not evidence: the
+     field reads `[]` when coord could not read it.
+
+   Then run lever 1's reevaluate on the named PR and read the newest
+   `predicate_eval` (Step 4c): the confirmation is a detail that no longer
+   reads `waits-on:<the upstream> (declared upstream via …`. If it still does,
+   fire one `pull_request` event on the UPSTREAM PR with lever 3's no-op label
+   touch (the edge belongs to the upstream, and hydration never re-syncs
+   edges), then reevaluate again. A `waits-on:` that now says `(derived
+   migration stack: …` is a derived alembic ordering, not this edge. The same
+   touch clears an orphaned edge, one with no declaring row
+   left: fire it on the PR that owns the edge, the upstream for
+   `kind: "upstream_of"` and this PR for `kind: "stacked_on"`.
 3. **Fresh hydration**: a no-op label touch, or a new head push if you have a
    legitimate commit to add (never an empty commit just to poke coord). A head
    push here is subject to the same carries-the-push check as Step 3's —
@@ -1036,7 +1227,7 @@ and `land_unknown`.
 | `pr_side` | Fix the PR, then ask again for the new head. |
 | `rate_concurrency` | Re-ask only after `retry_after_secs`, or after `detail.until` for `breaker_open`. For `pr_busy`, read back the request it names. Where `refusal.body` says to use the ordinary train, do that. |
 | `refusal.code` `shadow` before admission | The lever is not live, so it served nothing. Step 6 applies unchanged and in parallel. |
-| `proposal_voided{shadow}`, after `admitted` | Under the clause's literal wording this counts as served. Follow coord's `rate_concurrency` guidance: ask again once the switch is `on`. The shadow carve-out is a POLICY_GAP filed for the operator (finding `9bce99e6`). Do not settle it here. |
+| `proposal_voided{shadow}`, after `admitted` | A shadow-mode evaluation never served the PR, whatever row it left. The clause says so since its 2026-10-25 amendment (finding `018b7341`, settling the gap filed as `9bce99e6`). Step 6 applies unchanged and in parallel. Ask the door again once the switch is `on` if you still want the expedited path. A re-ask that goes live puts the PR back under the "Still live" row, so do not run Step 6's merge while it is live. |
 | `never`: `requester_unresolved`, `credential_lacks_possession` | Fix the request exactly as `refusal.body` tells you, for example by correcting the session header, and send it again. Do this only where the body says to. A resend with a corrected session id is a new request, not a retry: coord marks the code non-retryable only on the same transport and header. |
 | `never`: `author_unresolved` | Wait for the branch to be bound, as `refusal.body` says, then ask again. |
 | `never`: any other code (`disabled` included), `trigger_side`, `scope` | Not served. Step 6 applies unchanged. |
@@ -1079,7 +1270,7 @@ you observed, not a cause you guessed.
 
 **Where the clause's own words leave a case open, it is a gap in the clause,
 not in this page.** Read it the stricter way, and record the gap. The shadow
-case above is one instance.
+case above was one instance, until the operator settled it in the clause.
 
 ## Step 6 — Admin-merge (recovery path only)
 
@@ -1113,10 +1304,14 @@ case above is one instance.
 >
 > It reads coord's gate code from the merge-gate check's title and checks it
 > against an allowlist. `none` proceeds; `main-red` only on the PR labelled
-> `coord:red-main-fix`; the coord-defect codes of 4d (`has-cross-repo-dependency`,
-> `merge-state-unsettled`, `unlandable_cycle`, or no gate check at all when coord
-> is down) only with `--override-gate`, which is recorded in the notification;
-> `escalate-path-matched` and every other code refuse, flag or no flag.
+> `coord:red-main-fix`; the codes the script admits as coord defects
+> (`has-cross-repo-dependency`, `merge-state-unsettled`, or no gate check at
+> all when coord is down) only with `--override-gate`, which is recorded in
+> the notification;
+> `escalate-path-matched` and every other code refuse, flag or no flag. 4d
+> classes no `has-cross-repo-dependency` or `dependency-upstream-closed` as a
+> coord defect, so `--override-gate` is never a diagnosed remedy for them,
+> even though the allowlist admits `has-cross-repo-dependency`.
 >
 > **The raw spellings stay denied, so do not route around the door.**
 > `gh pr merge` (settings deny, PR #328) and the `gh api` REST and GraphQL
@@ -1463,7 +1658,7 @@ an admin-merge happened — produces a plan so the defect class dies:
   and exit 0, 5 or 6) or `handed-to-operator` (exit 4, GitHub refused). Exit 5 is
   a merge whose notification is still owed. Both the PR audit comment (Step 6
   item 1) and the exit report say which.
-- **Bounded loops.** Max 3 CI-fix rounds per PR, 2 infra reruns per head,
+- **Bounded loops.** Max 3 CI-fix rounds per PR, 2 infra reruns per head (plus the one recovery re-run in Step 4's preamble),
   one remediation plan per defect class per run (dedupe: if `$QONTINUI_PLANS_DIR`
   already has a plan for this defect class, reference it instead of writing a
   twin; check before writing). **The directory is not the surface of record** — discovery
