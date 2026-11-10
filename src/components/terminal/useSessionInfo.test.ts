@@ -1186,9 +1186,85 @@ describe("tenantRow — the acting tenant, never the spawn stamp", () => {
     );
   });
 
+  it("does not claim membership on a multi-bound device when it is unknown", () => {
+    const row = tenantRow(tenancyWith(display({ actingInBoundSet: null })));
+    expect(row.display).toBe("c231d9da · via credential · 4 bound, membership unknown");
+  });
+
+  it("does not let a single binding's withheld marker claim an unknown membership", () => {
+    const row = tenantRow(
+      tenancyWith(
+        display({
+          bound: { status: "measured", tenantIds: [QONTINUI], reason: null },
+          multiBound: false,
+          actingInBoundSet: null,
+        }),
+      ),
+    );
+    expect(row.display).toBe("c231d9da · via credential · 1 bound, membership unknown");
+  });
+
+  it("names an empty binding store whatever membership claims", () => {
+    const row = tenantRow(
+      tenancyWith(
+        display({
+          bound: { status: "measured", tenantIds: [], reason: null },
+          multiBound: false,
+          actingInBoundSet: null,
+        }),
+      ),
+    );
+    expect(row.display).toBe("c231d9da · via credential · this runner has no bound tenants");
+  });
+
   it("says when the acting tenant is outside the bound set", () => {
     const row = tenantRow(tenancyWith(display({ actingInBoundSet: false })));
     expect(row.display).toBe("c231d9da · via credential · not among 4 bound");
+  });
+
+  it("says so on a single binding too, where nothing else marks the row", () => {
+    const row = tenantRow(
+      tenancyWith(
+        display({
+          bound: { status: "measured", tenantIds: [MERYTS], reason: null },
+          multiBound: false,
+          actingInBoundSet: false,
+        }),
+      ),
+    );
+    expect(row.display).toBe("c231d9da · via credential · not among 1 bound");
+  });
+
+  it("names an empty binding store as that, not as a membership fault", () => {
+    const row = tenantRow(
+      tenancyWith(
+        display({
+          bound: { status: "measured", tenantIds: [], reason: null },
+          multiBound: false,
+          actingInBoundSet: false,
+        }),
+      ),
+    );
+    expect(row.display).toBe("c231d9da · via credential · this runner has no bound tenants");
+  });
+
+  it("says a stamp-only tenant is outside a single binding, still labelled as a stamp", () => {
+    const row = tenantRow(
+      tenancyWith(
+        display({
+          status: "stamp_only",
+          source: "row_stamp",
+          reason: "nonce_not_live",
+          bound: { status: "measured", tenantIds: [MERYTS], reason: null },
+          multiBound: false,
+          actingInBoundSet: false,
+        }),
+        QONTINUI,
+      ),
+    );
+    expect(row.display).toBe(
+      "c231d9da · spawn stamp only — acting tenant not observed · not among 1 bound",
+    );
   });
 
   it("labels a default-slot credential as the device default binding", () => {

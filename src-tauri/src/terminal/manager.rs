@@ -874,6 +874,20 @@ impl TerminalManager {
         page_id.unwrap_or_else(|| super::page_placement::pick_page_for_new_session(self, store))
     }
 
+    /// The grid page the LIVE pane `id` sits on right now, or `None` when no
+    /// such pane is held or its process has exited.
+    ///
+    /// This is the page `GET /terminals` reports, and the one a lifecycle
+    /// record bound to the pane must carry: a rebind or a SessionStart hook
+    /// that keeps a prior record's page instead leaves `/sessions/history`
+    /// naming a page the pane is not on. A dead pane answers `None` so callers
+    /// fall back to what they knew before rather than trusting a corpse.
+    pub fn live_page_of(&self, id: &str) -> Option<String> {
+        self.get(id)
+            .filter(|session| session.is_alive())
+            .map(|session| session.page_id())
+    }
+
     /// Test seam: mark `id` as being built, as `create` does for the length
     /// of a spawn.
     #[cfg(test)]

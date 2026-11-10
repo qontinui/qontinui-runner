@@ -29,6 +29,9 @@
  */
 
 /** The action id agents invoke on the `terminal-page` component. */
+import type { EffectSignature } from "@qontinui/ui-bridge";
+import { CREATE_PLAIN_TERMINAL_SIGNATURE } from "./terminalPageSignatures";
+
 export const CREATE_PLAIN_TERMINAL_ACTION_ID = "create-plain-terminal";
 
 /** Minimal shape of a UI Bridge component action (matches the SDK's ComponentActionDef). */
@@ -48,6 +51,8 @@ export interface PlainTerminalActionDef {
    * dropped annotation here even if that walk is ever taught to skip factories.
    */
   effect: "read" | "write" | "destructive";
+  /** Effect-calculus prediction — see `./terminalPageSignatures.ts`. */
+  signature?: EffectSignature;
   handler: (params?: unknown) => Promise<{ success: boolean; tab_id: string | null }>;
 }
 
@@ -74,6 +79,7 @@ export function buildCreatePlainTerminalAction(
     // `terminal-page.create-terminal`; contrast `create-with-command`, which
     // auto-types an unbounded command and is `destructive`.
     effect: "write",
+    signature: CREATE_PLAIN_TERMINAL_SIGNATURE,
     handler: async () => {
       const tabId = await createAndAssignTerminal();
       return { success: Boolean(tabId), tab_id: tabId ?? null };
