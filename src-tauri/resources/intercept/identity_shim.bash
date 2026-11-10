@@ -209,9 +209,11 @@ notify_launch_failure() {
 # `set -u` safe on purpose: the guard passthrough reaches report_unresolved
 # before SETTINGS_ARGS and user_chose_session are assigned, and a plain
 # expansion of either there would abort the shim before its fall-through exec.
+# `[*]`, never `[@]`: a quoted "${a[@]+set}" expands to ZERO words when the
+# array is unset or empty, which leaves `[ -n ]` -- one argument, always true.
 launch_failure_flags() {
   local settings=false user_chose=false
-  [ -n "${SETTINGS_ARGS[@]+set}" ] && settings=true
+  [ -n "${SETTINGS_ARGS[*]+set}" ] && settings=true
   [ "${user_chose_session:-0}" = "1" ] && user_chose=true
   printf 'settings=%s user_session_id=%s' "$settings" "$user_chose"
 }
