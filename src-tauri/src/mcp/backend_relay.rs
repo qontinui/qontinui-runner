@@ -5917,6 +5917,7 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
         let registration_dir = working_dir.clone();
         let registration_repo = effective_intent_repo.clone();
 
+        // door-scan: spawn — the door's real spawn; the context is in hand until here.
         match tm.create(
             title,
             working_dir,

@@ -8140,6 +8140,7 @@ async fn run_continuation_terminal(
                 let reason = "continuation pane was closed before the session started".to_string();
                 warn!("agent_runtime: gate-continuation terminal_id={terminal_id}: {reason}");
                 report_spawn_failed(agent_id, &reason, None, attempt.saturating_sub(1), None).await;
+                // door-scan: kept — the pane ran a child; its close already released the claim
                 return Err(anyhow::anyhow!(reason));
             }
             ContinuationStart::NeverStarted(evidence) => {
@@ -8178,6 +8179,7 @@ async fn run_continuation_terminal(
                     claude_bin = spawn_blocking_tracked(resolve_claude_bin)
                         .await
                         .unwrap_or_else(|_| claude_bin_path());
+                    // door-scan: kept — the context was taken back off the dead pane for the retry
                     continue;
                 }
                 let reason = format!("never started ({attempt} attempts): {detail}");
@@ -8191,6 +8193,7 @@ async fn run_continuation_terminal(
                 )
                 .await;
                 // `reservation` drops on this return and releases the anchor.
+                // door-scan: kept — never-started attempts ran a child in this tree; the context is parked on its pane
                 return Err(anyhow::anyhow!(reason));
             }
             ContinuationStart::Started { pty_alive } => {
@@ -8232,6 +8235,7 @@ async fn run_continuation_terminal(
                 emit_terminal_focus_request(&app, &terminal_id, continuation_spawn_origin(payload));
                 report_spawn_complete(agent_id, None, Some("gate continuation (terminal)"), None)
                     .await;
+                // door-scan: spawned — the started session holds the context
                 return Ok(TerminalStart {
                     session_id: attempt_session_id,
                     exited_terminal: exited.then_some(terminal_id),
@@ -10408,6 +10412,7 @@ async fn run_agent_subprocess(
     let primary_wt = payload
         .worktrees
         .first()
+        // door-scan: nothing added — a payload with no worktrees materialized none
         .ok_or_else(|| anyhow::anyhow!("no worktrees allocated"))?
         .worktree_path
         .clone();
@@ -10692,6 +10697,7 @@ async fn run_agent_subprocess(
         // Clean exit was already reported via spawn-complete; nothing
         // more to send. The runner can release the claim explicitly via
         // a follow-up POST if desired.
+        // door-scan: kept — a child ran and exited cleanly
         return Ok(());
     }
 
@@ -22784,6 +22790,87 @@ mod unspawned_door_tests {
             parent_sha: "abc".to_string(),
             provenance: TreeProvenance::Unrecorded,
         }
+    }
+
+    /// Review A8a, behavioural: `run_continuation_terminal`'s first exit (no
+    /// Tauri AppHandle — every unit test's state) runs before any create, so it
+    /// takes the continuation's fresh tree back off disk through the REAL
+    /// remover and resolver, with the workspace root pointed at a temp dir.
+    /// The remaining early exits need a live Tauri app; each is held to its
+    /// own removal by `every_other_allocating_door_removes_an_unspawned_allocation`.
+    #[tokio::test]
+    async fn a_continuation_refused_before_its_create_removes_its_fresh_tree() {
+        let _amb = crate::test_env::isolated_ambient();
+        assert!(
+            crate::tauri_app_handle::current().is_none(),
+            "this exit is the no-AppHandle one"
+        );
+        let ws = crate::workspace_paths::runner_workspace_root()
+            .into_root()
+            .expect("the isolated ambient workspace root");
+        let canonical = ws.join("canon");
+        std::fs::create_dir_all(&canonical).unwrap();
+        git(&canonical, &["init", "-q", "-b", "main"]);
+        std::fs::write(canonical.join("README.md"), "hi\n").unwrap();
+        git(&canonical, &["add", "README.md"]);
+        git(&canonical, &["commit", "-q", "-m", "init"]);
+        let sha = git(&canonical, &["rev-parse", "HEAD"]);
+        let agent_id = uuid::Uuid::new_v4();
+        let tree = crate::agent_worktree::canonical_paths::agent_worktree_root(&canonical)
+            .join(agent_id.to_string())
+            .join("canon");
+        let branch = format!("agent/{agent_id}-canon");
+        git(
+            &canonical,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                &branch,
+                tree.to_str().unwrap(),
+                &sha,
+            ],
+        );
+        let mut ctx = IsolatedEditContext::for_test_with_agent_id(
+            agent_id.to_string(),
+            vec![crate::agent_worktree::MaterializedWorktree {
+                repo: "canon".to_string(),
+                branch,
+                parent_sha: sha,
+                worktree_path: tree.clone(),
+                push_ref: String::new(),
+                parent_sha_provenance: Default::default(),
+            }],
+            Vec::new(),
+        );
+        ctx.set_provenance_for_test(
+            &tree,
+            TreeProvenance::FreshWorktree {
+                canonical: canonical.clone(),
+            },
+        );
+        let payload: GateContinuationPayload = serde_json::from_value(serde_json::json!({
+            "target_device_id": "55555555-5555-5555-5555-555555555555",
+            "initial_prompt": "p",
+            "source": GATE_CONTINUATION_SOURCE,
+        }))
+        .expect("a minimal continuation frame");
+
+        let res = run_continuation_terminal(
+            agent_id,
+            &tree.to_string_lossy(),
+            &payload,
+            uuid::Uuid::new_v4(),
+            Some(ctx),
+            AnchorReservation::none(),
+            uuid::Uuid::new_v4(),
+            None,
+        )
+        .await;
+
+        assert!(res.is_err(), "no AppHandle refuses the continuation");
+        assert!(!tree.exists(), "the fresh, unspawned tree was removed");
     }
 
     /// A launch whose every attempt failed before a child hands every added

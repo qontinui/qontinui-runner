@@ -500,6 +500,7 @@ pub async fn create_terminal_handler(
         Some(extra_env_vec)
     };
 
+    // door-scan: spawn — the door's real spawn; the context is in hand until here.
     match terminal_manager.create(
         request.title,
         working_dir,

@@ -399,6 +399,7 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
                 spawn_tenant_key.as_deref(),
             );
 
+            // door-scan: spawn — the door's real spawn; the context is in hand until here.
             match tm.create(
                 a.title,
                 working_dir,
