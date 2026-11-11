@@ -4618,7 +4618,15 @@ pub(crate) fn resolve_settings_path() -> Result<PathBuf, String> {
 
 /// [`resolve_settings_path`] **plus** the `create_dir_all` of its parent — for
 /// callers about to write the file ([`save_settings`]).
+///
+/// In a test binary a thread holding no `env_lock` is refused here, BEFORE the
+/// `create_dir_all`, so a refused write creates nothing
+/// ([`qontinui_runner_lib::env_write_gate`]).
 pub(crate) fn get_settings_path() -> Result<PathBuf, String> {
+    qontinui_runner_lib::env_write_gate::check(
+        "settings::get_settings_path",
+        resolve_settings_path().ok().as_deref(),
+    )?;
     let (dir, _config_dir_source) = get_config_dir()?;
     Ok(dir.join(SETTINGS_FILE))
 }
@@ -5268,7 +5276,16 @@ pub fn load_settings_full() -> LoadedSettings {
             );
         }
     }
-    if should_persist_migration(needs_persist, is_secondary, provenance) {
+    // The env-write gate beside the pure predicate: in a test binary, a thread
+    // holding no `env_lock` skips the persist quietly (the gate reports it), so
+    // a FreshInstall load cannot write into another test's fixture.
+    if should_persist_migration(needs_persist, is_secondary, provenance)
+        && qontinui_runner_lib::env_write_gate::check(
+            "settings::load_settings_full",
+            resolve_settings_path().ok().as_deref(),
+        )
+        .is_ok()
+    {
         let to_persist = document_to_persist(&on_disk, &settings, tier_migration);
         if let Err(e) = save_settings(&to_persist) {
             error!("Failed to persist tier/local_user_id migration: {}", e);
@@ -5360,6 +5377,12 @@ pub fn update_settings<F>(mutate: F) -> Result<(), String>
 where
     F: FnOnce(&mut Settings),
 {
+    // Gated before the read, so a refused update neither reads nor writes
+    // ([`qontinui_runner_lib::env_write_gate`]).
+    qontinui_runner_lib::env_write_gate::check(
+        "settings::update_settings",
+        resolve_settings_path().ok().as_deref(),
+    )?;
     let loaded = read_settings_from_disk();
     if !loaded.is_authoritative() {
         let msg = loaded.unreadable_message();

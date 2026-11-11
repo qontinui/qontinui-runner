@@ -1626,9 +1626,12 @@ pub struct TierEdit {
 ///
 /// The path comes back so a caller can NAME the file it wrote; a bare "promoted"
 /// message is unfalsifiable, and this writer resolves its path from the process
-/// env.
+/// env — which is why a test-binary thread holding no `env_lock` is refused here
+/// ([`crate::env_write_gate`]).
 pub fn promote_tier_to_account() -> Result<(TierWrite, PathBuf)> {
     let (path, source) = settings_json_path();
+    crate::env_write_gate::check("profiles::promote_tier_to_account", path.as_deref())
+        .map_err(|refused| anyhow!(refused))?;
     let path =
         path.ok_or_else(|| anyhow!("cannot resolve settings.json path (source: {source})"))?;
     let outcome =

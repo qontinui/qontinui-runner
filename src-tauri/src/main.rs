@@ -384,6 +384,11 @@ mod tier_matrix_tests;
 // Plan `2026-08-25-runner-test-suite-env-isolation` Phase 2.
 #[cfg(test)]
 mod env_write_lock_guard;
+// Door-level tests for the lib's `env_write_gate`: a thread holding no
+// `env_lock` cannot write an env-resolved settings file into a live fixture.
+// Plan `2026-11-11-unguarded-test-threads-write-settings-json-into-a-live-fixtures-config-dir`.
+#[cfg(test)]
+mod env_write_gate_door_tests;
 // Source invariant: every test-lock constructor takes `env_lock()` FIRST (a
 // child of the env lock in the test-lock hierarchy) or is marked and audited
 // standalone, so no two test locks can be taken in opposite orders and hang
