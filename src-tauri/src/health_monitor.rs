@@ -2154,7 +2154,10 @@ mod tests {
         assert!(!at.memory_warning, "exactly 8 GiB must not warn");
         let over = HealthStatus::from_metrics(&metrics_with_memory(8 * GIB + 1024 * 1024));
         assert!(over.memory_warning, "8 GiB + 1 MiB must warn");
-        assert!(!over.healthy, "a memory warning must mark the runner unhealthy");
+        assert!(
+            !over.healthy,
+            "a memory warning must mark the runner unhealthy"
+        );
     }
 
     // sysinfo's per-process introspection (memory + thread count) returns 0
