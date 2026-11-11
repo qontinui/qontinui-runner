@@ -677,16 +677,14 @@ pub async fn dispatch_subtask(
         );
         let session = match spawned {
             Ok(session) => Arc::new(session),
-            Err(message) => {
+            Err(failure) => {
                 // door-scan: handed back — the failure carries the context to settle_worker_spawn
                 return Err(WorkerSpawnFailure {
-                    message,
-                    // `ClaudeSession::spawn` answers text, and fails both before
-                    // its child (refusals, a settings-file write, the process
-                    // spawn) and after it (stdin take, the init handshake). It
-                    // cannot tell which, so the tree is treated as one a child
-                    // may have run in: kept, and the allocation reported.
-                    child_started: true,
+                    // `ClaudeSession::spawn`'s typed failure: a refusal before
+                    // the CLI process existed lets the remover take a fresh,
+                    // empty tree back; one after it keeps the tree (reported).
+                    child_started: failure.child_started,
+                    message: failure.message,
                     ctx: isolated_ctx.map(Box::new),
                 });
             }

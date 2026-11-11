@@ -618,7 +618,7 @@ pub async fn create_ai_session(
             }
             Err(e) => {
                 warn!("Failed to spawn AI session: {}", e);
-                Err(e)
+                Err(e.message)
             }
         }
     });
@@ -2110,18 +2110,18 @@ pub async fn resume_ai_sessions(
                 Some(&cli_session_ctx),
                 agent_log_emitter, // Phase 1b/1c agent_logs emitter (None unless gated)
             );
-            // Every failure from here on hands the re-acquired context back
-            // with `child_started = true`: `ClaudeSession::spawn` answers text
-            // and fails both before and after its child (it cannot tell which),
-            // and register / the initial prompt run against a live CLI. So the
-            // tree is kept and the allocation reported, never removed.
+            // Every failure from here on hands the re-acquired context back.
+            // `ClaudeSession::spawn`'s typed failure says which side of the CLI
+            // process it came from, so a pre-child refusal there lets the
+            // remover take a fresh, empty tree back; register / the initial
+            // prompt run against a live CLI, so those keep it (report only).
             let session = match session {
                 Ok(session) => Arc::new(session),
                 Err(e) => {
                     // door-scan: handed back — the failure carries the context to settle_resume_spawn
                     return Err(ResumeSpawnFailure {
-                        message: format!("spawn failed: {}", e),
-                        child_started: true,
+                        message: format!("spawn failed: {}", e.message),
+                        child_started: e.child_started,
                         ctx: reacquired_ctx_for_spawn.map(Box::new),
                     });
                 }
