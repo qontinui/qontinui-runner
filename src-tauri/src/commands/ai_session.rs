@@ -1724,7 +1724,8 @@ const RESUME_DOOR: &str = "AI session resume";
 struct ResumeSpawnFailure {
     message: String,
     child_started: bool,
-    ctx: Option<crate::agent_worktree::isolated_edit::IsolatedEditContext>,
+    /// Boxed: the context is large and rides only the failure arm.
+    ctx: Option<Box<crate::agent_worktree::isolated_edit::IsolatedEditContext>>,
 }
 
 /// Settle a resumed session's blocking spawn (plan
@@ -1743,7 +1744,7 @@ fn settle_resume_spawn(
         Ok(Ok(())) => Ok(Ok(())),
         Ok(Err(failure)) => {
             if let Some(ctx) = failure.ctx {
-                remove(ctx, failure.child_started, &failure.message);
+                remove(*ctx, failure.child_started, &failure.message);
             }
             Ok(Err(failure.message))
         }
@@ -2102,7 +2103,7 @@ pub async fn resume_ai_sessions(
                     return Err(ResumeSpawnFailure {
                         message: format!("spawn failed: {}", e),
                         child_started: true,
-                        ctx: reacquired_ctx_for_spawn,
+                        ctx: reacquired_ctx_for_spawn.map(Box::new),
                     })
                 }
             };
@@ -2111,7 +2112,7 @@ pub async fn resume_ai_sessions(
                 return Err(ResumeSpawnFailure {
                     message: format!("register failed: {}", e),
                     child_started: true,
-                    ctx: reacquired_ctx_for_spawn,
+                    ctx: reacquired_ctx_for_spawn.map(Box::new),
                 });
             }
 
@@ -2140,7 +2141,7 @@ pub async fn resume_ai_sessions(
                         message: format!("send_initial_prompt failed: {}", e),
                         child_started: true,
                         // Parked above; taken back so the remover reports it.
-                        ctx: session.take_isolated_edit_ctx(),
+                        ctx: session.take_isolated_edit_ctx().map(Box::new),
                     });
                 }
             }
@@ -2718,7 +2719,7 @@ mod resume_unspawned_tests {
             let joined = Ok(Err(ResumeSpawnFailure {
                 message: "spawn failed: boom".to_string(),
                 child_started,
-                ctx: ctx(),
+                ctx: ctx().map(Box::new),
             }));
             let out = settle_resume_spawn(joined, |c, started, msg| {
                 handed.push((c.agent_id.clone(), started, msg.to_string()))

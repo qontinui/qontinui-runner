@@ -1241,8 +1241,63 @@ pub fn cleanup_credential_helper(session_id: &str) {
 /// hazard `IsolatedEditContext::drop` already guards its claim-release spawn
 /// against. A detached `std::thread` needs no runtime (unlike `tokio::spawn`,
 /// which itself panics outside one) and contains any panic to itself.
+///
+/// An install still in flight for `session_id` ([`track_install`]) is waited
+/// for first, on the current Tokio runtime, so the cleanup never runs ahead
+/// of it. Outside a runtime the install is aborted instead (it cannot be
+/// awaited from a `Drop`), then the cleanup runs.
 pub fn spawn_cleanup_credential_helper(session_id: String) {
+    let pending = take_installs(&session_id);
+    if !pending.is_empty() {
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                for install in pending {
+                    let _ = install.await;
+                }
+                std::thread::spawn(move || cleanup_credential_helper(&session_id));
+            });
+            return;
+        }
+        for install in &pending {
+            install.abort();
+        }
+    }
     std::thread::spawn(move || cleanup_credential_helper(&session_id));
+}
+
+/// In-flight credential-helper installs, keyed by the agent id they install
+/// under — the same key [`spawn_cleanup_credential_helper`] tears down.
+fn installs() -> &'static Mutex<HashMap<String, Vec<tokio::task::JoinHandle<()>>>> {
+    static INSTALLS: OnceLock<Mutex<HashMap<String, Vec<tokio::task::JoinHandle<()>>>>> =
+        OnceLock::new();
+    INSTALLS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Record a detached install for `session_id`, so a later removal or cleanup
+/// can wait for it ([`settle_installs`], [`spawn_cleanup_credential_helper`]).
+/// Finished installs already recorded for the id are dropped on the way.
+pub(crate) fn track_install(session_id: &str, install: tokio::task::JoinHandle<()>) {
+    let mut g = installs().lock().unwrap_or_else(|p| p.into_inner());
+    let list = g.entry(session_id.to_string()).or_default();
+    list.retain(|h| !h.is_finished());
+    list.push(install);
+}
+
+fn take_installs(session_id: &str) -> Vec<tokio::task::JoinHandle<()>> {
+    installs()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(session_id)
+        .unwrap_or_default()
+}
+
+/// Wait for every install still in flight for `session_id`. Called before an
+/// unspawned allocation's trees are removed, so the install's writes land
+/// before (and its credential is torn down after) the removal.
+pub(crate) async fn settle_installs(session_id: &str) {
+    for install in take_installs(session_id) {
+        let _ = install.await;
+    }
 }
 
 /// Delete stale credential config files (and orphaned `.tmp-*` siblings from

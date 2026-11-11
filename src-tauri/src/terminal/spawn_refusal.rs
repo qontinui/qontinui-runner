@@ -358,6 +358,12 @@ mod tests {
     }
 
     impl BraceLexer {
+        /// Is the lexer between tokens — not inside a comment or string — at
+        /// the start of the next line?
+        fn in_code(&self) -> bool {
+            self.block_comment == 0 && !self.in_str && self.raw_hashes.is_none()
+        }
+
         /// `(opening, closing)` code braces on `line`.
         fn feed(&mut self, line: &str) -> (i64, i64) {
             let b = line.as_bytes();
@@ -501,6 +507,21 @@ mod tests {
                 let mut opened = false;
                 let mut closed_on = None;
                 while i < lines.len() {
+                    // Independent of the brace count it guards: inside the
+                    // block, code sits deeper than the `mod` line. An ITEM at
+                    // the block's own indentation (or shallower) means the count
+                    // ran past the module and is hiding production code — even
+                    // when it later closes on a bare `}`.
+                    if opened && depth > 0 && lexer.in_code() && item_at_or_above(lines[i], indent)
+                    {
+                        errors.push(format!(
+                            "line {}: `{}` sits at the indentation of the #[cfg(test)] block \
+                             opened at line {attr_line} but inside its brace count — the count \
+                             is lost and production code would be hidden",
+                            i + 1,
+                            lines[i].trim()
+                        ));
+                    }
                     test_lines.push(lines[i].to_string());
                     production.push(String::new());
                     let (open, close) = lexer.feed(lines[i]);
@@ -534,6 +555,42 @@ mod tests {
             test_lines,
             errors,
         }
+    }
+
+    /// Does `line` start a Rust item at indentation `indent` or shallower?
+    fn item_at_or_above(line: &str, indent: usize) -> bool {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || line.len() - trimmed.len() > indent {
+            return false;
+        }
+        let mut rest = trimmed;
+        for q in ["pub(crate) ", "pub(super) ", "pub ", "async ", "unsafe "] {
+            rest = rest.strip_prefix(q).unwrap_or(rest);
+        }
+        [
+            "fn ", "impl", "mod ", "struct ", "enum ", "trait ", "use ", "const ", "static ",
+            "type ", "#[",
+        ]
+        .iter()
+        .any(|k| rest.starts_with(k))
+    }
+
+    /// The independent check on a skipped test block: an item at the block's
+    /// own indentation inside it is reported, though the block still closes on
+    /// a bare `}` (so the close check alone would pass).
+    #[test]
+    fn a_test_block_that_swallows_a_production_item_is_a_scan_error() {
+        let src = "#[cfg(test)]\nmod tests {\n    fn a() {\n    }\nfn leaked() {\n}\n}\n";
+        let scanned = scan_source(src);
+        assert!(
+            scanned.errors.iter().any(|e| e.contains("fn leaked")),
+            "{:?}",
+            scanned.errors
+        );
+        let ok = "#[cfg(test)]\nmod tests {\n    fn a() {\n    }\n}\nfn prod() {}\n";
+        let scanned = scan_source(ok);
+        assert!(scanned.errors.is_empty(), "{:?}", scanned.errors);
+        assert_eq!(scanned.production[5], "fn prod() {}");
     }
 
     /// Does `line` open a function item, at ANY indentation (a free fn, or a
@@ -619,9 +676,14 @@ mod tests {
     /// closing brace. The enclosing fn is found at ANY indentation (a door in an
     /// `impl` method is bound by its own braces, never by an unrelated top-level
     /// fn above it), and only `#[cfg(test)] mod x { … }` BLOCKS are skipped — a
-    /// `#[cfg(test)] mod x;` declaration hides no production code. As a check
-    /// on the scan itself, every file's raw count of calls must equal the
-    /// production calls scanned plus the ones inside skipped test blocks.
+    /// `#[cfg(test)] mod x;` declaration hides no production code; a skipped
+    /// block that swallows an item at its own indentation is a scan error
+    /// ([`scan_source`]).
+    ///
+    /// Between the allocation and the door's first spawn (`.create(` or
+    /// `spawn_blocking`), no line may leave the fn early (`return Err`, a `?`):
+    /// such an exit drops the context, leaving the fresh tree on disk with no
+    /// spawn-failed report — the shape POST /terminals' account resolution had.
     #[test]
     fn every_acquire_for_terminal_door_prechecks_and_removes_an_unspawned_allocation() {
         // Spelled in two halves so this test's own source is never a match.
@@ -644,16 +706,6 @@ mod tests {
             let is_call = |l: &str| {
                 !l.trim_start().starts_with("//") && l.contains(call) && !l.contains(definition)
             };
-            let raw = src.lines().filter(|l| is_call(l)).count();
-            let in_tests = scanned.test_lines.iter().filter(|l| is_call(l)).count();
-            let in_production = lines.iter().filter(|l| is_call(l)).count();
-            assert_eq!(
-                raw,
-                in_production + in_tests,
-                "{}: the scan lost a call site (raw {raw}, production {in_production}, \
-                 test blocks {in_tests})",
-                file.display()
-            );
             for (idx, line) in lines.iter().enumerate() {
                 if !is_call(line) {
                     continue;
@@ -675,6 +727,32 @@ mod tests {
                         "{site}: no `precheck_spawn(` before the allocation in `{}`",
                         lines[start].trim()
                     ));
+                }
+                let spawn_at = (idx + 1..=end).find(|&i| {
+                    lines[i].contains(".create(") || lines[i].contains("spawn_blocking")
+                });
+                match spawn_at {
+                    None => failures.push(format!(
+                        "{site}: no spawn (`.create(` / `spawn_blocking`) after the allocation"
+                    )),
+                    Some(spawn) => {
+                        for (i, l) in lines.iter().enumerate().take(spawn).skip(idx + 1) {
+                            let code = l.trim_end();
+                            if code.contains("return Err")
+                                || code.ends_with("?;")
+                                || code.ends_with('?')
+                                || code.contains(")?.")
+                            {
+                                failures.push(format!(
+                                    "{rel}:{}: an early exit between the allocation (line {}) \
+                                     and the spawn drops the context: `{}`",
+                                    i + 1,
+                                    idx + 1,
+                                    code.trim()
+                                ));
+                            }
+                        }
+                    }
                 }
                 if !after.contains("remove_unspawned(") {
                     failures.push(format!(

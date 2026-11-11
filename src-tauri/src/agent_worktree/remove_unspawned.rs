@@ -174,6 +174,12 @@ pub(crate) async fn remove_unspawned_trees_with<F>(
 where
     F: Fn(&Path) -> Option<PathBuf> + Clone + Send + 'static,
 {
+    // A credential-helper install `materialize` detached for this allocation
+    // may still be running: let it finish BEFORE the trees are judged, or a
+    // fast refusal removes the tree and runs the context's credential cleanup
+    // ahead of the install, which then registers a token file and a refresh
+    // loop nothing will ever reap.
+    crate::credential_helper::settle_installs(agent_id).await;
     let mut trees = Vec::with_capacity(bases.len());
     for base in bases {
         let path = base.worktree_path.clone();
@@ -186,12 +192,6 @@ where
                     "remove_unspawned: removed the fresh, empty worktree of a spawn refused \
                      before its child started ({reason})"
                 );
-                // The coord-mcp proxy nonce provisioned into the tree's
-                // `.mcp.json` is keyed by the workdir string the provisioning
-                // chokepoint minted under — the worktree path's lossy string.
-                // Its only other reaper fires on SESSION close, which a spawn
-                // that never started never reaches.
-                crate::coord_mcp::evict_proxy_nonces_for_workdir(&path.to_string_lossy());
             }
             TreeOutcome::Kept(why) => warn!(
                 agent_id = %agent_id,
@@ -266,7 +266,17 @@ where
     let _serialized = lock.lock().await;
     let agent_id = agent_id.to_string();
     tokio::task::spawn_blocking(move || {
-        judge_and_remove(&agent_id, &base, &canonical, &allocated_root)
+        let outcome = judge_and_remove(&agent_id, &base, &canonical, &allocated_root);
+        if outcome == TreeOutcome::Removed {
+            // The coord-mcp proxy nonce provisioned into the tree's `.mcp.json`
+            // is keyed by the workdir string the provisioning chokepoint minted
+            // under — the worktree path's lossy string. Its only other reaper
+            // fires on SESSION close, which a spawn that never started never
+            // reaches. Evicted here, on the blocking pool, because eviction
+            // rewrites a file synchronously.
+            crate::coord_mcp::evict_proxy_nonces_for_workdir(&base.worktree_path.to_string_lossy());
+        }
+        outcome
     })
     .await
     .unwrap_or_else(|e| TreeOutcome::Kept(KeepReason::RemoveFailed(format!("task failed: {e}"))))
@@ -321,39 +331,86 @@ fn judge_and_remove(
     if !verdict.permits_removal() {
         return TreeOutcome::Kept(KeepReason::Dirty(verdict));
     }
+    // The branch `git worktree add -b` cut for this tree, read while the tree
+    // still exists; deleted (safely) after a successful remove.
+    let branch = git_stdout(
+        path,
+        &["symbolic-ref", "--short", "-q", "HEAD"],
+        "remove_unspawned: branch",
+    )
+    .ok()
+    .map(|b| b.trim().to_string())
+    .filter(|b| !b.is_empty());
+
     if let Err(e) = delete_scaffolding(path) {
         return TreeOutcome::Kept(KeepReason::Scaffolding(e));
     }
-    match git_stdout(
-        path,
-        &["status", "--porcelain"],
-        "remove_unspawned: re-probe",
-    ) {
+    // From here the runner's scaffolding is GONE from the kept tree: every
+    // keep reason below says so, so nobody reads a kept tree's missing
+    // `.mcp.json` / `.claude/` as a provisioning fault.
+    const DELETED: &str = "runner scaffolding already deleted";
+    match git_stdout(path, PORCELAIN_ALL, "remove_unspawned: re-probe") {
         Ok(p) if p.trim().is_empty() => {}
         Ok(p) => {
             return TreeOutcome::Kept(KeepReason::Scaffolding(format!(
-                "not porcelain-empty after the scaffolding was removed: {}",
+                "{DELETED}; not porcelain-empty afterwards: {}",
                 p.trim()
             )))
         }
         Err(e) => {
             return TreeOutcome::Kept(KeepReason::Scaffolding(format!(
-                "re-probe did not answer: {e}"
+                "{DELETED}; the re-probe did not answer: {e}"
             )))
         }
     }
 
     // The removal — never `--force`.
     let Some(path_str) = path.to_str() else {
-        return TreeOutcome::Kept(KeepReason::RemoveFailed("path is not UTF-8".into()));
+        return TreeOutcome::Kept(KeepReason::RemoveFailed(format!(
+            "{DELETED}; path is not UTF-8"
+        )));
     };
-    match git_stdout(
+    if let Err(e) = git_stdout(
         canonical,
         &["worktree", "remove", path_str],
         "remove_unspawned: worktree remove",
     ) {
-        Ok(_) => TreeOutcome::Removed,
-        Err(e) => TreeOutcome::Kept(KeepReason::RemoveFailed(e)),
+        return TreeOutcome::Kept(KeepReason::RemoveFailed(format!("{DELETED}; {e}")));
+    }
+    if let Some(branch) = branch {
+        delete_agent_branch(canonical, &branch);
+    }
+    TreeOutcome::Removed
+}
+
+/// `git status` porcelain with EVERY untracked file listed, whatever the
+/// repo's `status.showUntrackedFiles` says — `no` would otherwise hide an
+/// operator's untracked file from the "must read empty" check. Ignored files
+/// are deliberately not listed: the runner's own provisioning includes
+/// ignored entries in some repos, and the dirty probe has already judged the
+/// tree.
+const PORCELAIN_ALL: &[&str] = &["status", "--porcelain", "--untracked-files=all"];
+
+/// Safe-delete the agent branch a removed tree was on: `git branch -d`, never
+/// `-D`, so a branch with commits not merged anywhere survives; only an
+/// `agent/…` branch is touched. Runs under the caller's materialize lock. A
+/// refusal is logged, never an error — the tree is already gone.
+fn delete_agent_branch(canonical: &Path, branch: &str) {
+    if !branch.starts_with("agent/") {
+        info!(branch = %branch, "remove_unspawned: not an agent/ branch — left in place");
+        return;
+    }
+    match git_stdout(
+        canonical,
+        &["branch", "-d", branch],
+        "remove_unspawned: branch -d",
+    ) {
+        Ok(_) => info!(branch = %branch, "remove_unspawned: deleted the removed tree's branch"),
+        Err(e) => warn!(
+            branch = %branch,
+            "remove_unspawned: `git branch -d` refused the removed tree's branch — left in \
+             place: {e}"
+        ),
     }
 }
 
@@ -375,11 +432,7 @@ fn git_stdout(dir: &Path, args: &[&str], label: &str) -> Result<String, String> 
 /// scaffolding. Any other entry is an error: the dirty probe read the tree
 /// clean a moment ago, so one now means something wrote into it.
 fn delete_scaffolding(tree: &Path) -> Result<(), String> {
-    let porcelain = git_stdout(
-        tree,
-        &["status", "--porcelain"],
-        "remove_unspawned: scaffolding listing",
-    )?;
+    let porcelain = git_stdout(tree, PORCELAIN_ALL, "remove_unspawned: scaffolding listing")?;
     let mut targets = Vec::new();
     for line in porcelain.lines() {
         let line = line.trim_end_matches(['\r', '\n']);
