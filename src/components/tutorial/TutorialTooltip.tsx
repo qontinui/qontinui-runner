@@ -10,6 +10,7 @@ import { X, ChevronLeft, ChevronRight, Check, Loader2, CheckCircle2 } from "luci
 import type { TooltipPosition } from "../../types/tutorial";
 import { cn } from "../../lib/utils";
 import { getAccentColors } from "@/design-system";
+import { TutorialStepBody } from "./TutorialStepBody";
 
 interface TutorialTooltipProps {
   /** CSS selector or data-tutorial-id to position near */
@@ -18,8 +19,14 @@ interface TutorialTooltipProps {
   /** Tooltip title */
   title: string;
 
-  /** Tooltip content */
+  /** Tooltip content, as markdown */
   content: string;
+
+  /** Optional longer explanation, as markdown */
+  details?: string;
+
+  /** Optional tips */
+  tips?: string[];
 
   /** Position relative to target */
   position?: TooltipPosition;
@@ -152,6 +159,8 @@ export function TutorialTooltip({
   targetSelector,
   title,
   content,
+  details,
+  tips,
   position = "bottom",
   currentStep = 1,
   totalSteps = 1,
@@ -210,7 +219,7 @@ export function TutorialTooltip({
     if (tooltipRef.current) {
       setTooltipHeight(tooltipRef.current.offsetHeight);
     }
-  }, [title, content, action]);
+  }, [title, content, details, tips, action]);
 
   // Update position on mount and when dependencies change
   useEffect(() => {
@@ -311,7 +320,7 @@ export function TutorialTooltip({
       {/* Content */}
       <div className="p-4 space-y-3">
         <h3 className="font-semibold text-foreground">{title}</h3>
-        <p className="text-sm text-muted-foreground leading-relaxed">{content}</p>
+        <TutorialStepBody content={content} details={details} tips={tips} />
 
         {action && (
           <div
