@@ -12,6 +12,7 @@ import { useTutorialKeyboard } from "../../hooks/useTutorialKeyboard";
 import { useTutorialEvents } from "../../hooks/useTutorialEvents";
 import { SpotlightOverlay } from "./SpotlightOverlay";
 import { TutorialTooltip } from "./TutorialTooltip";
+import { TutorialStepBody } from "./TutorialStepBody";
 import { cn } from "../../lib/utils";
 import { getAccentColors } from "@/design-system";
 import { createLogger } from "@/lib/logger";
@@ -24,6 +25,8 @@ const logger = createLogger("ContextualTutorial");
 function CenteredTooltip({
   title,
   content,
+  details,
+  tips,
   action,
   currentStep,
   totalSteps,
@@ -41,6 +44,8 @@ function CenteredTooltip({
 }: {
   title: string;
   content: string;
+  details?: string;
+  tips?: string[];
   action?: string;
   currentStep: number;
   totalSteps: number;
@@ -91,9 +96,7 @@ function CenteredTooltip({
         {/* Content */}
         <div className="p-4 space-y-3">
           <h3 className="font-semibold text-foreground text-lg">{title}</h3>
-          <div className="text-sm text-muted-foreground leading-relaxed whitespace-pre-line">
-            {content}
-          </div>
+          <TutorialStepBody content={content} details={details} tips={tips} />
 
           {action && (
             <div
@@ -434,6 +437,8 @@ export function ContextualTutorial() {
         <CenteredTooltip
           title={currentStep.title}
           content={currentStep.content}
+          details={currentStep.details}
+          tips={currentStep.tips}
           action={currentStep.action}
           currentStep={currentStepIndex + 1}
           totalSteps={totalSteps}
@@ -454,6 +459,8 @@ export function ContextualTutorial() {
           targetSelector={targetSelector}
           title={currentStep.title}
           content={currentStep.content}
+          details={currentStep.details}
+          tips={currentStep.tips}
           position={tooltipPosition}
           currentStep={currentStepIndex + 1}
           totalSteps={totalSteps}
