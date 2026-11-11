@@ -3209,8 +3209,6 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::global_log_sources::find_log_sources_with_ai,
             commands::global_log_sources::get_global_log_sources,
             commands::global_log_sources::migrate_project_sources_to_global,
-            commands::global_log_sources::read_global_log_sources,
-            commands::global_log_sources::read_log_sources_by_profile,
             commands::global_log_sources::save_global_log_sources,
             commands::global_log_sources::select_log_sources_for_context,
             commands::global_log_sources::set_default_log_source_profile,
