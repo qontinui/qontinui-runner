@@ -181,11 +181,19 @@ fn save_to(path: &Path, file: &ClaudeAccountsFile) -> Result<(), String> {
         .map_err(|e| format!("Failed to write {}: {}", path.display(), e))
 }
 
+/// [`claude_accounts_file_path`] for a WRITE through `door`: the path resolves
+/// from the process env, so in a test binary a thread holding no `env_lock` is
+/// refused first ([`qontinui_runner_lib::env_write_gate`]) — every env-resolving
+/// roster writer comes through here. Path-explicit [`save_to`] is not gated.
+fn roster_path_for_write(door: &'static str) -> Result<PathBuf, String> {
+    let path = claude_accounts_file_path();
+    qontinui_runner_lib::env_write_gate::check(door, path.as_deref())?;
+    path.ok_or_else(|| "Failed to resolve config directory for claude-accounts.json".to_string())
+}
+
 /// Atomically persist the roster to the canonical machine-global path.
 pub fn save(file: &ClaudeAccountsFile) -> Result<(), String> {
-    let path = claude_accounts_file_path()
-        .ok_or_else(|| "Failed to resolve config directory for claude-accounts.json".to_string())?;
-    save_to(&path, file)
+    save_to(&roster_path_for_write("claude_accounts::save")?, file)
 }
 
 /// One-shot best-effort migration: when `claude-accounts.json` is ABSENT but
@@ -273,12 +281,15 @@ fn migrate_seed(accounts_path: &Path, unscoped_settings: &Path) -> bool {
 
 /// Load the machine-global roster, running the one-shot migration first
 /// (at most once per process — `load_settings` calls this on every load).
+/// The seed is an env-resolved roster write, so a test-binary thread holding no
+/// `env_lock` skips it ([`roster_path_for_write`]).
 pub fn load_with_migration() -> Option<ClaudeAccountsFile> {
     static MIGRATE_ONCE: std::sync::Once = std::sync::Once::new();
     MIGRATE_ONCE.call_once(|| {
-        if let (Some(accounts), Some(settings)) =
-            (claude_accounts_file_path(), unscoped_settings_path())
-        {
+        if let (Ok(accounts), Some(settings)) = (
+            roster_path_for_write("claude_accounts::load_with_migration"),
+            unscoped_settings_path(),
+        ) {
             migrate_seed(&accounts, &settings);
         }
     });
@@ -467,9 +478,10 @@ pub fn effective_selection_with_fleet() -> (
 /// not `Default` — so the first single-field write doesn't drop sibling
 /// roster fields that so far only lived in a per-instance settings.json.
 pub fn update(mutate: impl FnOnce(&mut ClaudeAccountsFile)) -> Result<(), String> {
+    let path = roster_path_for_write("claude_accounts::update")?;
     let mut file = load_with_migration().unwrap_or_else(roster_from_current_settings);
     mutate(&mut file);
-    save(&file)
+    save_to(&path, &file)
 }
 
 /// `true` when the roster file at `path` EXISTS but cannot be read or parsed.
@@ -493,8 +505,7 @@ pub fn is_unreadable(path: &Path) -> bool {
 /// path, is skipped. Returns how many were added; nothing is written when that
 /// is zero. Refuses, writing nothing, when the file exists but cannot be read.
 pub fn append_config_dirs(dirs: &[String]) -> Result<usize, String> {
-    let path = claude_accounts_file_path()
-        .ok_or_else(|| "Failed to resolve config directory for claude-accounts.json".to_string())?;
+    let path = roster_path_for_write("claude_accounts::append_config_dirs")?;
     append_config_dirs_at(&path, dirs, || {
         load_with_migration().unwrap_or_else(roster_from_current_settings)
     })

@@ -27,6 +27,12 @@ pub mod accessibility;
 // fails an unguarded test read by NAME instead of by assertion mismatch.
 // Plan `2026-09-03-runner-tests-read-ambient-machine-state`.
 pub mod ambient;
+// The test-binary gate on env-resolved settings writes: a thread holding no
+// `env_lock` may not write a settings file into whatever directory the process
+// environment names — another test's fixture. Compiled to `Ok(())` outside a
+// test binary. Plan
+// `2026-11-11-unguarded-test-threads-write-settings-json-into-a-live-fixtures-config-dir`.
+pub mod env_write_gate;
 // Pure install-interception core (classify + gate + wire types), shared by the
 // `qontinui-runner` bin (via `install_effects_producer::intercept`) AND the
 // standalone `qontinui-shim` Windows `.exe` shadow stub. Lifted into the lib
