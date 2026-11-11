@@ -81,6 +81,7 @@ use super::session_lifecycle_store::{SessionLifecycleStore, TerminalSessionRecor
 use super::SessionRegistry;
 use crate::coord_drain_state::{DrainGate, SpawnOrigin};
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
+use crate::process_capture::process_tree::config_dir_of_pid;
 use crate::terminal::TerminalManager;
 
 /// Most ids one call will act on. Each resume is verified by a process read, so
@@ -410,23 +411,6 @@ fn same_path_with(a: &str, b: &str, case_insensitive: bool) -> bool {
         }
     };
     norm(a) == norm(b)
-}
-
-/// `CLAUDE_CONFIG_DIR` of a live process. Linux only (`/proc/<pid>/environ`);
-/// elsewhere `None`, which is "could not say", never a match.
-#[cfg(target_os = "linux")]
-fn config_dir_of_pid(pid: u32) -> Option<String> {
-    let bytes = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
-    bytes
-        .split(|b| *b == 0)
-        .filter_map(|kv| std::str::from_utf8(kv).ok())
-        .find_map(|kv| kv.strip_prefix("CLAUDE_CONFIG_DIR=").map(str::to_string))
-        .filter(|s| !s.is_empty())
-}
-
-#[cfg(not(target_os = "linux"))]
-fn config_dir_of_pid(_pid: u32) -> Option<String> {
-    None
 }
 
 // ---------------------------------------------------------------------------
