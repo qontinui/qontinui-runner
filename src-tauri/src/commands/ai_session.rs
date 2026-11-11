@@ -1728,6 +1728,20 @@ struct ResumeSpawnFailure {
     ctx: Option<Box<crate::agent_worktree::isolated_edit::IsolatedEditContext>>,
 }
 
+/// A resume refused BEFORE any spawn was attempted: no child ran in the
+/// re-acquired tree, so it is handed to `remove` with `child_started = false`
+/// (the remover still keeps a tree a restored WIP made dirty). `None` — no
+/// worktree was re-acquired — hands nothing over.
+fn abandon_before_resume_spawn(
+    ctx: Option<crate::agent_worktree::isolated_edit::IsolatedEditContext>,
+    reason: &str,
+    remove: impl FnOnce(crate::agent_worktree::isolated_edit::IsolatedEditContext, bool, &str),
+) {
+    if let Some(ctx) = ctx {
+        remove(ctx, false, reason);
+    }
+}
+
 /// Settle a resumed session's blocking spawn (plan
 /// `2026-11-08-a-spawn-refused-after-its-worktree-allocation-leaves-the-tree-on-disk`,
 /// Phase 3): a spawn failure hands the context it carries to `remove` with its
@@ -1997,9 +2011,13 @@ pub async fn resume_ai_sessions(
                 // allocation reported, instead of dropping it on disk (plan
                 // `2026-11-08-a-spawn-refused-after-its-worktree-allocation-leaves-the-tree-on-disk`,
                 // Phase 3).
-                if let Some(ctx) = reacquired_ctx {
-                    ctx.remove_unspawned(RESUME_DOOR, false, "empty replay prompt");
-                }
+                abandon_before_resume_spawn(
+                    reacquired_ctx,
+                    "empty replay prompt",
+                    |ctx, child_started, reason| {
+                        ctx.remove_unspawned(RESUME_DOOR, child_started, reason)
+                    },
+                );
                 mark_failed(
                     task_run_id.clone(),
                     "empty replay prompt".to_string(),
@@ -2100,15 +2118,17 @@ pub async fn resume_ai_sessions(
             let session = match session {
                 Ok(session) => Arc::new(session),
                 Err(e) => {
+                    // door-scan: handed back — the failure carries the context to settle_resume_spawn
                     return Err(ResumeSpawnFailure {
                         message: format!("spawn failed: {}", e),
                         child_started: true,
                         ctx: reacquired_ctx_for_spawn.map(Box::new),
-                    })
+                    });
                 }
             };
 
             if let Err(e) = sm.register(&trid, session.clone()) {
+                // door-scan: handed back — the failure carries the context to settle_resume_spawn
                 return Err(ResumeSpawnFailure {
                     message: format!("register failed: {}", e),
                     child_started: true,
@@ -2137,6 +2157,7 @@ pub async fn resume_ai_sessions(
             // replay won't double-count.
             if let Some(prompt) = initial_for_spawn.as_deref() {
                 if let Err(e) = session.send_initial_prompt(prompt) {
+                    // door-scan: handed back — the failure carries the context to settle_resume_spawn
                     return Err(ResumeSpawnFailure {
                         message: format!("send_initial_prompt failed: {}", e),
                         child_started: true,
@@ -2755,5 +2776,27 @@ mod resume_unspawned_tests {
         let out = settle_resume_spawn(Err(join), |_, _, _| calls += 1);
         assert!(out.is_err());
         assert_eq!(calls, 0, "a join error hands nothing over");
+    }
+
+    /// Plan Phase 3 (review A8c): the resume's empty-replay refusal comes
+    /// before any spawn, so it hands the re-acquired context to the remover
+    /// with `child_started = false`, once.
+    #[test]
+    fn an_empty_replay_refusal_hands_the_tree_to_the_remover_as_unspawned() {
+        let mut handed = Vec::new();
+        abandon_before_resume_spawn(ctx(), "empty replay prompt", |c, started, why| {
+            handed.push((c.agent_id.clone(), started, why.to_string()))
+        });
+        assert_eq!(
+            handed,
+            vec![(
+                "6f1c2a7e-0000-4000-8000-00000000beef".to_string(),
+                false,
+                "empty replay prompt".to_string()
+            )]
+        );
+        let mut calls = 0;
+        abandon_before_resume_spawn(None, "x", |_, _, _| calls += 1);
+        assert_eq!(calls, 0);
     }
 }

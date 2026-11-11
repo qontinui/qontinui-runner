@@ -696,3 +696,140 @@ async fn the_removal_waits_for_an_in_flight_credential_install() {
     );
     assert_eq!(only_outcome(&report), &TreeOutcome::Removed);
 }
+
+/// Review A8b: `git branch -d` refuses a branch whose tip the canonical HEAD
+/// does not contain — here the allocation was cut from a side commit — so the
+/// tree is removed and its branch SURVIVES (logged, not an error).
+#[tokio::test]
+async fn an_unmerged_agent_branch_survives_the_removal() {
+    let fx = Fixture::new();
+    let id = agent();
+    git(&fx.canonical, &["checkout", "-q", "-b", "side"]);
+    std::fs::write(fx.canonical.join("side.txt"), "side\n").unwrap();
+    git(&fx.canonical, &["add", "side.txt"]);
+    git(&fx.canonical, &["commit", "-q", "-m", "side"]);
+    let side_sha = git(&fx.canonical, &["rev-parse", "HEAD"]);
+    git(&fx.canonical, &["checkout", "-q", "main"]);
+    let tree = fx.worktree_root.join(&id).join("canon");
+    let branch = format!("agent/{id}-canon");
+    git(
+        &fx.canonical,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            &branch,
+            tree.to_str().unwrap(),
+            &side_sha,
+        ],
+    );
+    let base = UnspawnedBase {
+        worktree_path: tree.clone(),
+        parent_sha: side_sha,
+        provenance: TreeProvenance::FreshWorktree {
+            canonical: fx.canonical.clone(),
+        },
+    };
+
+    let report = run(&fx, &id, vec![base], false).await;
+
+    assert_eq!(only_outcome(&report), &TreeOutcome::Removed);
+    assert!(!tree.exists());
+    assert!(
+        !git(&fx.canonical, &["branch", "--list", &branch]).is_empty(),
+        "`branch -d` refused the unmerged branch, so it survives"
+    );
+}
+
+/// Review A7: an IGNORED path that is not scaffolding keeps the tree with a
+/// typed reason — `git worktree remove` would have deleted it silently.
+#[tokio::test]
+async fn an_ignored_non_scaffolding_file_keeps_the_tree() {
+    let fx = Fixture::new();
+    let id = agent();
+    let tree = fx.allocate(&id, "canon");
+    std::fs::create_dir_all(fx.canonical.join(".git/info")).unwrap();
+    std::fs::write(fx.canonical.join(".git/info/exclude"), "*.log\n").unwrap();
+    provision_scaffolding(&tree);
+    std::fs::write(tree.join("build.log"), "operator output\n").unwrap();
+
+    let report = run(&fx, &id, vec![fx.fresh(&tree)], false).await;
+
+    assert_eq!(
+        only_outcome(&report),
+        &TreeOutcome::Kept(KeepReason::IgnoredContent("build.log".to_string()))
+    );
+    assert!(tree.join("build.log").exists());
+}
+
+/// Review A7, the other side: the scaffolding's OWN ignored entry (a
+/// `.mcp.json` the repo excludes) is deleted like an untracked one, and the
+/// tree goes.
+#[tokio::test]
+async fn an_ignored_scaffolding_entry_is_deleted_and_the_tree_removed() {
+    let fx = Fixture::new();
+    let id = agent();
+    let tree = fx.allocate(&id, "canon");
+    std::fs::create_dir_all(fx.canonical.join(".git/info")).unwrap();
+    std::fs::write(fx.canonical.join(".git/info/exclude"), ".mcp.json\n").unwrap();
+    provision_scaffolding(&tree);
+    assert!(git(&tree, &["status", "--porcelain", "--ignored"]).contains("!! .mcp.json"));
+
+    let report = run(&fx, &id, vec![fx.fresh(&tree)], false).await;
+
+    assert_eq!(only_outcome(&report), &TreeOutcome::Removed);
+}
+
+/// Review A5: an install past the bound is aborted (it was at an await
+/// point, so the abort lands) and the removal proceeds.
+#[tokio::test]
+async fn an_install_past_the_bound_is_aborted_and_the_removal_proceeds() {
+    let fx = Fixture::new();
+    let id = agent();
+    let tree = fx.allocate(&id, "canon");
+    crate::credential_helper::track_install(
+        &id,
+        tokio::spawn(tokio::time::sleep(std::time::Duration::from_secs(3600))),
+    );
+    let report = remove_unspawned_trees_bounded(
+        &id,
+        vec![fx.fresh(&tree)],
+        false,
+        "test refusal",
+        fx.resolver(),
+        std::time::Duration::from_millis(100),
+    )
+    .await;
+    assert_eq!(only_outcome(&report), &TreeOutcome::Removed);
+}
+
+/// Review A5: an install the abort cannot stop (blocked between await
+/// points) keeps every tree with a typed reason — the removal never runs
+/// under a live install.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_install_that_will_not_stop_keeps_every_tree() {
+    let fx = Fixture::new();
+    let id = agent();
+    let tree = fx.allocate(&id, "canon");
+    crate::credential_helper::track_install(
+        &id,
+        tokio::spawn(async {
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+        }),
+    );
+    let report = remove_unspawned_trees_bounded(
+        &id,
+        vec![fx.fresh(&tree)],
+        false,
+        "test refusal",
+        fx.resolver(),
+        std::time::Duration::from_millis(100),
+    )
+    .await;
+    assert_eq!(
+        only_outcome(&report),
+        &TreeOutcome::Kept(KeepReason::CredentialInstallUnsettled)
+    );
+    assert!(tree.exists());
+}

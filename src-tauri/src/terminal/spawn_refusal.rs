@@ -355,6 +355,9 @@ mod tests {
         block_comment: u32,
         in_str: bool,
         raw_hashes: Option<usize>,
+        /// When set, [`Self::feed`] also collects the line's CODE bytes —
+        /// string, char and comment contents dropped ([`Self::code_of`]).
+        out: Option<Vec<u8>>,
     }
 
     impl BraceLexer {
@@ -362,6 +365,20 @@ mod tests {
         /// the start of the next line?
         fn in_code(&self) -> bool {
             self.block_comment == 0 && !self.in_str && self.raw_hashes.is_none()
+        }
+
+        /// `line` with string, char-literal and comment contents removed, so a
+        /// `?` in a format string or a `return` in a comment is not code.
+        fn code_of(&mut self, line: &str) -> String {
+            self.out = Some(Vec::new());
+            self.feed(line);
+            String::from_utf8_lossy(&self.out.take().unwrap_or_default()).into_owned()
+        }
+
+        fn emit(&mut self, bytes: &[u8]) {
+            if let Some(out) = self.out.as_mut() {
+                out.extend_from_slice(bytes);
+            }
         }
 
         /// `(opening, closing)` code braces on `line`.
@@ -419,13 +436,16 @@ mod tests {
                         let hashes = b[i + 1..].iter().take_while(|&&c| c == b'#').count();
                         if b.get(i + 1 + hashes) == Some(&b'"') {
                             self.raw_hashes = Some(hashes);
+                            self.emit(b"\"\"");
                             i += 2 + hashes;
                         } else {
+                            self.emit(b"r");
                             i += 1;
                         }
                     }
                     b'"' => {
                         self.in_str = true;
+                        self.emit(b"\"\"");
                         i += 1;
                     }
                     b'\'' => {
@@ -445,17 +465,25 @@ mod tests {
                             };
                             (b.get(i + 1 + width) == Some(&b'\'')).then_some(i + 1 + width)
                         };
+                        // A char literal is emitted as `''`; a lifetime keeps
+                        // its tick (its name follows as ordinary code).
+                        self.emit(if close_at.is_some() { b"''" } else { b"'" });
                         i = close_at.map_or(i + 1, |c| c + 1);
                     }
                     b'{' => {
                         open += 1;
+                        self.emit(b"{");
                         i += 1;
                     }
                     b'}' => {
                         close += 1;
+                        self.emit(b"}");
                         i += 1;
                     }
-                    _ => i += 1,
+                    c => {
+                        self.emit(&[c]);
+                        i += 1;
+                    }
                 }
             }
             (open, close)
@@ -555,6 +583,148 @@ mod tests {
             test_lines,
             errors,
         }
+    }
+
+    /// The marker comment a door places on its real spawn call.
+    const SPAWN_MARKER: &str = "door-scan: spawn";
+
+    /// The CODE of each line — string, char-literal and comment contents
+    /// dropped — lexed in order, so state carries across lines.
+    fn code_lines(lines: &[String]) -> Vec<String> {
+        let mut lexer = BraceLexer::default();
+        lines.iter().map(|l| lexer.code_of(l)).collect()
+    }
+
+    /// The lines strictly between `from` and `to` whose code can leave the
+    /// enclosing fn early: any `return` or `continue` keyword, or any `?`.
+    fn early_exits(code: &[String], from: usize, to: usize) -> Vec<usize> {
+        let word = |l: &str, w: &str| {
+            l.match_indices(w).any(|(i, _)| {
+                let ident = |c: char| c.is_alphanumeric() || c == '_';
+                !l.get(..i)
+                    .and_then(|h| h.chars().next_back())
+                    .is_some_and(ident)
+                    && !l
+                        .get(i + w.len()..)
+                        .and_then(|t| t.chars().next())
+                        .is_some_and(ident)
+            })
+        };
+        (from + 1..to.min(code.len()))
+            .filter(|&i| {
+                let l = &code[i];
+                l.contains('?') || word(l, "return") || word(l, "continue")
+            })
+            .collect()
+    }
+
+    /// The window check catches what it must and nothing in strings: a
+    /// `return Ok(..)` and a `?` are exits; a `?` inside a format string is not.
+    #[test]
+    fn an_injected_return_ok_in_the_spawn_window_is_an_early_exit() {
+        let lines: Vec<String> = [
+            "    let (wd, ctx) = acquire_for_terminal(a, b).await;",
+            "    return Ok(Json(x));",
+            "    let y = format!(\"{a:?} return\");",
+            "    let z = f()?;",
+            "    // a comment saying return? is not code",
+            "    // door-scan: spawn",
+            "    match tm.create(",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(early_exits(&code_lines(&lines), 0, 5), vec![1, 3]);
+    }
+
+    /// An exit after the anchor with no removal since the previous exit is
+    /// reported; one removal earlier in the fn does not cover a later exit.
+    #[test]
+    fn every_door_exit_needs_its_own_removal() {
+        let src = "fn door() {\n    let ctx = acquire();\n    if a {\n        \
+                   remove_unspawned(ctx);\n        return Err(1);\n    }\n    if b {\n        \
+                   return Err(2);\n    }\n    if c {\n        // door-scan: kept, a child ran\n\
+                   \x20       return Err(3);\n    }\n}\n";
+        let raw: Vec<String> = src.lines().map(str::to_string).collect();
+        let found = unremoved_exits("x.rs", &raw, "door", Some("acquire("));
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].contains("Err(2)"), "{found:?}");
+    }
+
+    /// The production lines when each skipped test block is ended by
+    /// INDENTATION alone — the first bare `}` at the `mod` line's own
+    /// indentation — with no brace lexing at all.
+    fn indent_production(src: &str) -> Vec<String> {
+        let lines: Vec<&str> = src.lines().collect();
+        let mut out: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+        let mut i = 0;
+        while i < lines.len() {
+            let is_attr = lines[i].trim() == "#[cfg(test)]";
+            let mod_at = is_attr
+                .then(|| {
+                    (i + 1..lines.len()).find(|&j| {
+                        !lines[j].trim().is_empty() && !lines[j].trim_start().starts_with("#[")
+                    })
+                })
+                .flatten()
+                .filter(|&j| {
+                    let t = lines[j].trim();
+                    (t.starts_with("mod ")
+                        || t.starts_with("pub mod ")
+                        || t.starts_with("pub(crate) mod "))
+                        && t.ends_with('{')
+                });
+            if let Some(m) = mod_at {
+                let indent = lines[i].len() - lines[i].trim_start().len();
+                let closer = format!("{}}}", " ".repeat(indent));
+                let end = (m + 1..lines.len())
+                    .find(|&j| lines[j] == closer)
+                    .unwrap_or(lines.len() - 1);
+                for line in out.iter_mut().take(end + 1).skip(i) {
+                    line.clear();
+                }
+                i = end + 1;
+                continue;
+            }
+            i += 1;
+        }
+        out
+    }
+
+    /// A self-check on the scan that does not hold by construction: the
+    /// number of production call sites under the LEXER's test-block spans
+    /// must equal the number under INDENTATION-derived spans. A lexer that
+    /// lost its count and swallowed code (through to end of file, say) hides
+    /// call sites the indentation still shows as production.
+    fn partition_disagreement(
+        src: &str,
+        lexed_production: &[String],
+        is_call: impl Fn(&str) -> bool,
+    ) -> Option<String> {
+        let lexed = lexed_production.iter().filter(|l| is_call(l)).count();
+        let indented = indent_production(src).iter().filter(|l| is_call(l)).count();
+        (lexed != indented).then(|| {
+            format!(
+                "the lexer counts {lexed} production call site(s) but the indentation counts \
+                 {indented} — a skipped test block's span is wrong"
+            )
+        })
+    }
+
+    /// The partition self-check can fire: here a lone `}` at column 0 inside
+    /// a raw string ends the block early by indentation while the lexer
+    /// (correctly) keeps going, so the two counts of `target(` disagree.
+    #[test]
+    fn the_partition_self_check_fires_when_the_two_spans_disagree() {
+        let src = "#[cfg(test)]\nmod tests {\n    const S: &str = r#\"\n}\n\"#;\n    \
+                   fn t() { target(); }\n}\nfn prod() { target(); }\n";
+        let lexed = scan_source(src).production;
+        let msg = partition_disagreement(src, &lexed, |l| l.contains("target("));
+        assert!(msg.is_some(), "the two spans disagree on this source");
+        let agree =
+            "#[cfg(test)]\nmod tests {\n    fn t() { target(); }\n}\nfn prod() { target(); }\n";
+        let lexed = scan_source(agree).production;
+        assert!(partition_disagreement(agree, &lexed, |l| l.contains("target(")).is_none());
     }
 
     /// Does `line` start a Rust item at indentation `indent` or shallower?
@@ -706,6 +876,10 @@ mod tests {
             let is_call = |l: &str| {
                 !l.trim_start().starts_with("//") && l.contains(call) && !l.contains(definition)
             };
+            failures.extend(
+                partition_disagreement(&src, &lines, |l| is_call(l))
+                    .map(|e| format!("{}: {e}", file.display())),
+            );
             for (idx, line) in lines.iter().enumerate() {
                 if !is_call(line) {
                     continue;
@@ -728,29 +902,23 @@ mod tests {
                         lines[start].trim()
                     ));
                 }
-                let spawn_at = (idx + 1..=end).find(|&i| {
-                    lines[i].contains(".create(") || lines[i].contains("spawn_blocking")
-                });
-                match spawn_at {
+                let raw: Vec<&str> = src.lines().collect();
+                let marker = (idx + 1..=end).find(|&i| raw[i].contains(SPAWN_MARKER));
+                match marker {
                     None => failures.push(format!(
-                        "{site}: no spawn (`.create(` / `spawn_blocking`) after the allocation"
+                        "{site}: no `{SPAWN_MARKER}` marker on the door's real spawn after the \
+                         allocation"
                     )),
                     Some(spawn) => {
-                        for (i, l) in lines.iter().enumerate().take(spawn).skip(idx + 1) {
-                            let code = l.trim_end();
-                            if code.contains("return Err")
-                                || code.ends_with("?;")
-                                || code.ends_with('?')
-                                || code.contains(")?.")
-                            {
-                                failures.push(format!(
-                                    "{rel}:{}: an early exit between the allocation (line {}) \
-                                     and the spawn drops the context: `{}`",
-                                    i + 1,
-                                    idx + 1,
-                                    code.trim()
-                                ));
-                            }
+                        let code = code_lines(&lines);
+                        for i in early_exits(&code, idx, spawn) {
+                            failures.push(format!(
+                                "{rel}:{}: an early exit between the allocation (line {}) \
+                                 and the spawn drops the context: `{}`",
+                                i + 1,
+                                idx + 1,
+                                lines[i].trim()
+                            ));
                         }
                     }
                 }
@@ -955,7 +1123,94 @@ mod tests {
         for (file, name, token) in indirect.iter().chain(helpers) {
             failures.extend(require(file, name, token));
         }
+
+        // Every early exit a door fn can take once it holds the allocation
+        // must hand it to the remover itself — a removal call (or a settle seam
+        // that makes one) between the previous exit and this one — or carry a
+        // `door-scan:` marker saying why the tree is legitimately kept there.
+        // One removal call somewhere in the body is not enough.
+        let exit_doors: &[(&str, &str, Option<&str>)] = &[
+            ("agent_runtime.rs", "run_continuation_terminal", None),
+            ("agent_runtime.rs", "run_continuation_headless", None),
+            (
+                "agent_runtime.rs",
+                "run_agent_subprocess",
+                Some(concat!("materialize_worktrees", "(")),
+            ),
+            (
+                "orchestration_loop/ai_session_executor.rs",
+                "dispatch_subtask",
+                Some(concat!("acquire_for_worker", "(")),
+            ),
+            (
+                "commands/ai_session.rs",
+                "resume_ai_sessions",
+                Some("reacquire_and_restore_session_worktree("),
+            ),
+        ];
+        for (file, name, anchor) in exit_doors {
+            let raw_src = std::fs::read_to_string(root.join(file)).expect("read source");
+            let raw: Vec<String> = raw_src.lines().map(str::to_string).collect();
+            failures.extend(unremoved_exits(file, &raw, name, *anchor));
+        }
         assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// The calls that hand an unspawned allocation to the remover.
+    const REMOVAL_TOKENS: &[&str] = &[
+        "remove_unspawned(",
+        "remove_unspawned_unreported(",
+        "remove_unspawned_continuation(",
+        "remove_unspawned_launch_trees(",
+        "remove_unspawned_trees(",
+        "settle_worker_spawn(",
+        "settle_resume_spawn(",
+    ];
+
+    /// Each early exit of fn `name` after `anchor` (the fn's start when
+    /// `None`) with neither a removal call in its CODE since the previous exit
+    /// nor a `door-scan:` marker comment there.
+    fn unremoved_exits(
+        file: &str,
+        raw: &[String],
+        name: &str,
+        anchor: Option<&str>,
+    ) -> Vec<String> {
+        let production = production_code_lines(&raw.join("\n"));
+        let Some(open) = production
+            .iter()
+            .position(|l| opens_fn(l) && fn_name(l) == name)
+        else {
+            return vec![format!("{file}: door fn `{name}` not found")];
+        };
+        let Some((start, end)) = enclosing_fn(&production, open) else {
+            return vec![format!("{file}: door fn `{name}` has no body")];
+        };
+        let from = match anchor {
+            None => start,
+            Some(a) => match (start..=end).find(|&i| production[i].contains(a)) {
+                Some(i) => i,
+                None => return vec![format!("{file}: `{name}` no longer calls `{a}`")],
+            },
+        };
+        let code = code_lines(&production);
+        let mut out = Vec::new();
+        let mut since = from;
+        for e in early_exits(&code, from, end + 1) {
+            let removed = (since..=e).any(|i| REMOVAL_TOKENS.iter().any(|t| code[i].contains(t)));
+            let declared = (since..=e).any(|i| raw[i].contains("door-scan:"));
+            if !removed && !declared {
+                out.push(format!(
+                    "{file}:{}: `{name}` can leave here holding the allocation with no removal \
+                     since line {} and no `door-scan:` marker: `{}`",
+                    e + 1,
+                    since + 1,
+                    production[e].trim()
+                ));
+            }
+            since = e + 1;
+        }
+        out
     }
 
     /// The relay's precheck sits BEFORE its grant gate, as the drain gate does,

@@ -611,6 +611,7 @@ pub async fn dispatch_subtask(
                             refusal.error.clone(),
                         );
                     }
+                    // door-scan: nothing allocated — the acquire itself failed
                     return Err(refusal.error);
                 }
             }
@@ -677,6 +678,7 @@ pub async fn dispatch_subtask(
         let session = match spawned {
             Ok(session) => Arc::new(session),
             Err(message) => {
+                // door-scan: handed back — the failure carries the context to settle_worker_spawn
                 return Err(WorkerSpawnFailure {
                     message,
                     // `ClaudeSession::spawn` answers text, and fails both before
@@ -706,6 +708,7 @@ pub async fn dispatch_subtask(
         if let Err(e) = session_mgr.register(&trid, session.clone()) {
             let ctx = session.take_isolated_edit_ctx();
             let _ = session.close();
+            // door-scan: handed back — the failure carries the context to settle_worker_spawn
             return Err(WorkerSpawnFailure {
                 message: format!(
                     "dispatch_subtask: register session: {e} (the spawned CLI was closed)"
@@ -720,6 +723,7 @@ pub async fn dispatch_subtask(
             session_mgr.remove(&trid);
             let ctx = session.take_isolated_edit_ctx();
             let _ = session.close();
+            // door-scan: handed back — the failure carries the context to settle_worker_spawn
             return Err(WorkerSpawnFailure {
                 message: format!(
                     "dispatch_subtask: send brief: {e} (the spawned CLI was closed and \
@@ -855,6 +859,7 @@ pub async fn dispatch_subtask(
         // about it. It would hold a worktree claim and a CLI process until the
         // runner exits, while the next tick spawns its replacement.
         let torn = teardown_unbound_worker(app_handle, task_run_id);
+        // door-scan: kept — post-child: the live worker was torn down
         return Err(DispatchError::Failed(format!(
             "dispatch_subtask: persist task_run_id/Working: {e} — the live worker was torn \
              down ({torn}), so a retry re-dispatches rather than duplicating it"

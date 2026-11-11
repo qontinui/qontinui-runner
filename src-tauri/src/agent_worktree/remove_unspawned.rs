@@ -98,6 +98,12 @@ pub(crate) enum KeepReason {
     Scaffolding(String),
     /// `git worktree remove` (no `--force`) refused or did not answer.
     RemoveFailed(String),
+    /// An IGNORED path that is not runner scaffolding: `git worktree remove`
+    /// would delete it silently, so the tree is kept.
+    IgnoredContent(String),
+    /// A credential-helper install for this allocation was still running after
+    /// the bounded wait and an abort; judging the tree under it is not safe.
+    CredentialInstallUnsettled,
 }
 
 /// The answer for one tree.
@@ -174,16 +180,48 @@ pub(crate) async fn remove_unspawned_trees_with<F>(
 where
     F: Fn(&Path) -> Option<PathBuf> + Clone + Send + 'static,
 {
+    remove_unspawned_trees_bounded(
+        agent_id,
+        bases,
+        child_started,
+        reason,
+        allocated_root,
+        INSTALL_SETTLE_BOUND,
+    )
+    .await
+}
+
+/// How long the removal waits for an in-flight credential-helper install
+/// (each wait, and again after an abort) — its coord fetches are network I/O.
+const INSTALL_SETTLE_BOUND: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// [`remove_unspawned_trees_with`] with the install-settle bound injected.
+pub(crate) async fn remove_unspawned_trees_bounded<F>(
+    agent_id: &str,
+    bases: Vec<UnspawnedBase>,
+    child_started: bool,
+    reason: &str,
+    allocated_root: F,
+    settle_bound: std::time::Duration,
+) -> RemovalReport
+where
+    F: Fn(&Path) -> Option<PathBuf> + Clone + Send + 'static,
+{
     // A credential-helper install `materialize` detached for this allocation
-    // may still be running: let it finish BEFORE the trees are judged, or a
-    // fast refusal removes the tree and runs the context's credential cleanup
-    // ahead of the install, which then registers a token file and a refresh
-    // loop nothing will ever reap.
-    crate::credential_helper::settle_installs(agent_id).await;
+    // may still be running: let it finish (bounded) BEFORE the trees are
+    // judged, or a fast refusal removes the tree and runs the context's
+    // credential cleanup ahead of the install, which then registers a token
+    // file and a refresh loop nothing will ever reap. One that outlives the
+    // bound is aborted; if even the abort does not land, every tree is KEPT.
+    let settled = crate::credential_helper::settle_installs(agent_id, settle_bound).await;
     let mut trees = Vec::with_capacity(bases.len());
     for base in bases {
         let path = base.worktree_path.clone();
-        let outcome = judge_one(agent_id, base, child_started, allocated_root.clone()).await;
+        let outcome = if settled {
+            judge_one(agent_id, base, child_started, allocated_root.clone()).await
+        } else {
+            TreeOutcome::Kept(KeepReason::CredentialInstallUnsettled)
+        };
         match &outcome {
             TreeOutcome::Removed => {
                 info!(
@@ -232,6 +270,14 @@ fn describe(why: &KeepReason) -> String {
         KeepReason::Dirty(v) => format!("the dirty probe read {v:?}, not Clean"),
         KeepReason::Scaffolding(d) => format!("runner scaffolding cleanup: {d}"),
         KeepReason::RemoveFailed(e) => format!("`git worktree remove` (no --force) refused: {e}"),
+        KeepReason::IgnoredContent(e) => {
+            format!("an ignored path that is not runner scaffolding would be lost: {e}")
+        }
+        KeepReason::CredentialInstallUnsettled => {
+            "a credential-helper install for this allocation was still running after the bounded \
+             wait and an abort"
+                .into()
+        }
     }
 }
 
@@ -343,7 +389,7 @@ fn judge_and_remove(
     .filter(|b| !b.is_empty());
 
     if let Err(e) = delete_scaffolding(path) {
-        return TreeOutcome::Kept(KeepReason::Scaffolding(e));
+        return TreeOutcome::Kept(e);
     }
     // From here the runner's scaffolding is GONE from the kept tree: every
     // keep reason below says so, so nobody reads a kept tree's missing
@@ -385,11 +431,16 @@ fn judge_and_remove(
 
 /// `git status` porcelain with EVERY untracked file listed, whatever the
 /// repo's `status.showUntrackedFiles` says — `no` would otherwise hide an
-/// operator's untracked file from the "must read empty" check. Ignored files
-/// are deliberately not listed: the runner's own provisioning includes
-/// ignored entries in some repos, and the dirty probe has already judged the
-/// tree.
-const PORCELAIN_ALL: &[&str] = &["status", "--porcelain", "--untracked-files=all"];
+/// operator's untracked file from the "must read empty" check — and every
+/// IGNORED path too (`!!`), because `git worktree remove` deletes ignored
+/// content without asking. Only the scaffolding's own ignored entries (a
+/// `.mcp.json` the runner excludes, say) are deleted; any other is a keep.
+const PORCELAIN_ALL: &[&str] = &[
+    "status",
+    "--porcelain",
+    "--untracked-files=all",
+    "--ignored",
+];
 
 /// Safe-delete the agent branch a removed tree was on: `git branch -d`, never
 /// `-D`, so a branch with commits not merged anywhere survives; only an
@@ -428,22 +479,37 @@ fn git_stdout(dir: &Path, args: &[&str], label: &str) -> Result<String, String> 
     }
 }
 
-/// Delete exactly the untracked (`??`) porcelain entries that are runner
-/// scaffolding. Any other entry is an error: the dirty probe read the tree
-/// clean a moment ago, so one now means something wrote into it.
-fn delete_scaffolding(tree: &Path) -> Result<(), String> {
-    let porcelain = git_stdout(tree, PORCELAIN_ALL, "remove_unspawned: scaffolding listing")?;
+/// Delete exactly the untracked (`??`) and ignored (`!!`) porcelain entries
+/// that are runner scaffolding. Any other entry keeps the tree: an ignored
+/// one as [`KeepReason::IgnoredContent`], anything else as
+/// [`KeepReason::Scaffolding`] — the dirty probe read the tree clean a moment
+/// ago, so one now means something wrote into it.
+fn delete_scaffolding(tree: &Path) -> Result<(), KeepReason> {
+    let porcelain = git_stdout(tree, PORCELAIN_ALL, "remove_unspawned: scaffolding listing")
+        .map_err(KeepReason::Scaffolding)?;
     let mut targets = Vec::new();
     for line in porcelain.lines() {
         let line = line.trim_end_matches(['\r', '\n']);
         if line.trim().is_empty() {
             continue;
         }
-        let entry = line
-            .strip_prefix("?? ")
-            .map(|rest| super::dirty::unquote(rest.trim()))
-            .filter(|p| super::dirty::is_scaffolding_path(p))
-            .ok_or_else(|| format!("unexpected porcelain entry {line:?}"))?;
+        let (ignored, rest) = match (line.strip_prefix("?? "), line.strip_prefix("!! ")) {
+            (Some(rest), _) => (false, rest),
+            (None, Some(rest)) => (true, rest),
+            (None, None) => {
+                return Err(KeepReason::Scaffolding(format!(
+                    "unexpected porcelain entry {line:?}"
+                )))
+            }
+        };
+        let entry = super::dirty::unquote(rest.trim());
+        if !super::dirty::is_scaffolding_path(entry) {
+            return Err(if ignored {
+                KeepReason::IgnoredContent(entry.to_string())
+            } else {
+                KeepReason::Scaffolding(format!("unexpected porcelain entry {line:?}"))
+            });
+        }
         let rel = Path::new(entry.trim_end_matches(['/', '\\']));
         // `is_scaffolding_path` is a prefix test: `.claude/../x` would pass it.
         // Only plain relative components may name what is deleted.
@@ -451,7 +517,9 @@ fn delete_scaffolding(tree: &Path) -> Result<(), String> {
             .components()
             .all(|c| matches!(c, std::path::Component::Normal(_)))
         {
-            return Err(format!("refusing a non-plain scaffolding path {entry:?}"));
+            return Err(KeepReason::Scaffolding(format!(
+                "refusing a non-plain scaffolding path {entry:?}"
+            )));
         }
         targets.push(tree.join(rel));
     }
@@ -463,7 +531,9 @@ fn delete_scaffolding(tree: &Path) -> Result<(), String> {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e),
         };
-        removed.map_err(|e| format!("could not delete {}: {e}", target.display()))?;
+        removed.map_err(|e| {
+            KeepReason::Scaffolding(format!("could not delete {}: {e}", target.display()))
+        })?;
     }
     Ok(())
 }
