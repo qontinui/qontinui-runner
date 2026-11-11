@@ -136,20 +136,27 @@ fn is_ident(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
+/// `s[from..]` without the panicking string index (`clippy::string_slice` is
+/// denied crate-wide). Every offset passed here sits just past an ASCII match,
+/// so it is a char boundary; an out-of-range or mid-char offset yields `""`.
+fn tail(s: &str, from: usize) -> &str {
+    s.get(from..).unwrap_or("")
+}
+
 /// Byte offsets (of the `set`) of every forbidden sentence in normalized text.
 fn hits(text: &str) -> Vec<usize> {
     let lower = text.to_ascii_lowercase();
     let b = lower.as_bytes();
     let mut found = Vec::new();
     let mut from = 0;
-    while let Some(i) = lower[from..].find("set") {
+    while let Some(i) = tail(&lower, from).find("set") {
         let at = from + i;
         from = at + 3;
         if at > 0 && is_ident(b[at - 1]) {
             continue;
         }
         let mut j = at + 3;
-        if lower[j..].starts_with("ting") {
+        if tail(&lower, j).starts_with("ting") {
             j += 4;
         }
         if j < b.len() && is_ident(b[j]) {
@@ -162,14 +169,14 @@ fn hits(text: &str) -> Vec<usize> {
             j
         };
         j = skip_sep(j);
-        if lower[j..].starts_with("the ") {
+        if tail(&lower, j).starts_with("the ") {
             j = skip_sep(j + 4);
         }
         if j < b.len() && b[j] == b'$' {
             j = skip_sep(j + 1);
         }
         for name in ["qontinui_root_env", "qontinui_root"] {
-            if lower[j..].starts_with(name) {
+            if tail(&lower, j).starts_with(name) {
                 let end = j + name.len();
                 if end >= b.len() || !is_ident(b[end]) {
                     found.push(at);
@@ -184,7 +191,7 @@ fn hits(text: &str) -> Vec<usize> {
 /// The byte range of the exempt constant's declaration, up to its `;`.
 fn exempt_range(text: &str) -> Option<std::ops::Range<usize>> {
     let start = text.find(EXEMPT_CONST)?;
-    let end = start + text[start..].find(';')?;
+    let end = start + tail(text, start).find(';')?;
     Some(start..end)
 }
 
@@ -230,7 +237,7 @@ fn runner_text_never_says_set_qontinui_root() {
                 exemption_used = true;
                 continue;
             }
-            let snippet: String = text[at..].chars().take(100).collect();
+            let snippet: String = tail(&text, at).chars().take(100).collect();
             offenders.push(format!("{rel}: {snippet}"));
         }
     }
