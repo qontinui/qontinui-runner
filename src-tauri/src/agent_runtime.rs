@@ -791,13 +791,14 @@ pub struct ConditionCheckPayload {
     /// `POST /coord/condition-runs/{run_id}/report` — the ONLY credential that
     /// route accepts (it is public; a device JWT 403s there).
     ///
-    /// `Option` because coord does not put it in the frame today: it embeds the
-    /// token in [`Self::initial_prompt`] for the spawned agent to curl with. The
-    /// runner needs it too, so that a spawn which never happens can still report
-    /// the run terminal instead of leaving it `running` forever — see
-    /// [`report_condition_run_failed`]. Until coord promotes it to a field,
-    /// [`condition_report_token`] recovers it from the prompt; when coord does,
-    /// this field wins with no further change here.
+    /// Coord sends it as its own frame key since qontinui-coord#3856, and also
+    /// embeds it in [`Self::initial_prompt`] for the spawned agent to curl with.
+    /// The runner needs it too, so that a spawn which never happens can still
+    /// report the run terminal instead of leaving it `running` forever — see
+    /// [`report_condition_run_failed`]. `Option` because a coord build that
+    /// predates #3856 sends no such key: [`condition_report_token`] then
+    /// recovers the token from the prompt, and this field wins whenever it is
+    /// present.
     #[serde(default)]
     pub report_token: Option<String>,
     /// Human name of the condition being checked, when coord supplies one.
@@ -805,6 +806,13 @@ pub struct ConditionCheckPayload {
     /// label and no `--name`.
     #[serde(default)]
     pub condition_name: Option<String>,
+    /// The frame's `secrets` key: `ref -> value` for each `{{secret:<ref>}}`
+    /// placeholder coord rendered into [`Self::initial_prompt`] in place of a
+    /// credential. Held for this session and typed only by the SDK `type`
+    /// action ([`crate::condition_secrets`]); empty from a coord that renders
+    /// no placeholders.
+    #[serde(default)]
+    pub secrets: crate::condition_secrets::FrameSecrets,
 }
 
 /// Redacting `Debug`, deliberately not derived.
@@ -815,7 +823,8 @@ pub struct ConditionCheckPayload {
 /// `auth_setup` recipe, i.e. whatever login secret the tenant stored for the
 /// target app. Nothing formats this struct today; a derive would make the next
 /// `{:?}` in a log line leak both without anyone noticing. `initial_prompt` is
-/// reported as a LENGTH so it stays diagnosable without being quotable.
+/// reported as a LENGTH so it stays diagnosable without being quotable, and
+/// `secrets` (the values coord moves OUT of the prompt) as counts only.
 impl std::fmt::Debug for ConditionCheckPayload {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ConditionCheckPayload")
@@ -839,6 +848,7 @@ impl std::fmt::Debug for ConditionCheckPayload {
                     }
                 ),
             )
+            .field("secrets", &self.secrets)
             .finish()
     }
 }
@@ -8545,8 +8555,9 @@ const CONDITION_REPORT_BEARER_MARKER: &str = "Authorization: Bearer ";
 ///
 /// Two rungs, in order:
 ///
-/// 1. [`ConditionCheckPayload::report_token`] — the explicit wire field. Coord
-///    does not send it today; when it does, nothing else here changes.
+/// 1. [`ConditionCheckPayload::report_token`] — the explicit wire field, which
+///    coord sends since qontinui-coord#3856. A coord build that predates it
+///    sends none, and rung 2 answers.
 /// 2. The token coord embedded in `initial_prompt`. The prompt builder writes
 ///    it as `Authorization: Bearer <token>`, twice — once as a header
 ///    instruction, once inside the example curl.
@@ -9065,6 +9076,15 @@ async fn run_condition_check_terminal(
     // sync trust gate decides on the tenant's word, not a cold cache.
     crate::claude_session::trust_gate::warm_dial().await;
 
+    // The frame's secrets, held from before the PTY exists so the session's
+    // first `type` action can substitute. Every return below drops the
+    // registration and releases them; a started session hands it to the
+    // PTY-exit watcher (`crate::condition_secrets`, plan
+    // 2026-11-06-a-regression-test-run-is-judged-by-what-it-covered-and-a-silent-run-reads-unknown
+    // Phase 13).
+    let held_secrets =
+        crate::condition_secrets::register(&payload.run_id, &payload.target_url, &payload.secrets);
+
     let result = crate::commands::terminal::create_tracked_terminal_session_backend(
         &terminal_manager,
         &session_registry,
@@ -9107,7 +9127,14 @@ async fn run_condition_check_terminal(
             let started =
                 await_continuation_start(&terminal_manager, &terminal_id, &transcript_paths).await;
             match condition_check_never_started_reason(&started) {
-                None => Ok(()),
+                None => {
+                    crate::condition_secrets::release_at_pty_exit(
+                        held_secrets,
+                        &terminal_manager,
+                        &terminal_id,
+                    );
+                    Ok(())
+                }
                 Some(reason) => {
                     // A pane that died within ~100 ms can exit before its coord
                     // session id was set, so its exit hook never closed the
@@ -9125,6 +9152,9 @@ async fn run_condition_check_terminal(
                          {reason}",
                         payload.run_id
                     );
+                    // No session started, so nothing will type the secrets:
+                    // release them before the report's round trip.
+                    drop(held_secrets);
                     // Safe to spend the single-shot report token: no session
                     // started, so nothing is left that could have wanted it.
                     report_condition_run_failed(&payload, format!("spawn_failed: {reason}")).await;
@@ -9141,6 +9171,9 @@ async fn run_condition_check_terminal(
             let (reason, _phase) = classify_pty_spawn_error(&e);
             let reason = format!("condition-check {reason}");
             warn!("agent_runtime: {reason}");
+            // The PTY was never created: release the secrets before the
+            // report's round trip.
+            drop(held_secrets);
             report_condition_run_failed(&payload, format!("spawn_failed: {reason}")).await;
             Err(anyhow::anyhow!(reason))
         }
@@ -13122,6 +13155,7 @@ mod tests {
             source: CONDITION_CHECK_SOURCE.to_string(),
             report_token: report_token.map(|s| s.to_string()),
             condition_name: None,
+            secrets: Default::default(),
         }
     }
 
@@ -13302,9 +13336,10 @@ mod tests {
     }
 
     /// The struct holds the credential in TWO fields — `report_token`, and
-    /// `initial_prompt`, which is where coord actually ships it today and which
-    /// also embeds the operator's `auth_setup` secret. A derived `Debug` would
-    /// put both in the next log line that formats a payload.
+    /// `initial_prompt`, where coord also ships it (and where a coord build
+    /// that predates qontinui-coord#3856 ships it alone), and which also embeds
+    /// the operator's `auth_setup` secret. A derived `Debug` would put both in
+    /// the next log line that formats a payload.
     #[test]
     fn condition_check_payload_debug_redacts_both_credential_carriers() {
         let token = "9f1c4b2ad0e34f7a8b6c5d4e3f2a1b09";
@@ -13366,10 +13401,10 @@ mod tests {
         );
     }
 
-    /// A condition-check frame from a coord that does not send `report_token`
-    /// must still deserialize (the field is `#[serde(default)]`), and the frame
-    /// coord sends today must land with `report_token: None` so the prompt rung
-    /// is the one that runs.
+    /// A condition-check frame from a coord build that predates
+    /// qontinui-coord#3856, which sends no `report_token` key, must still
+    /// deserialize (the field is `#[serde(default)]`) and land with
+    /// `report_token: None`, so the prompt rung is the one that runs.
     #[test]
     fn condition_check_payload_tolerates_a_coord_without_the_token_field() {
         let frame = serde_json::json!({
@@ -13385,6 +13420,45 @@ mod tests {
         assert_eq!(
             condition_report_token(&payload).as_deref(),
             Some("deadbeefdeadbeefdeadbeefdeadbeef")
+        );
+    }
+
+    /// The frame coord sends since qontinui-coord#3856 (its `spawn_frame`, in
+    /// `qontinui-coord/crates/coord/src/conditions/dispatch.rs`): eight keys
+    /// for a group with a name (coord omits `condition_name` for a blank one),
+    /// `report_token` among them. Coord's fanout carries the frame as a JSON
+    /// STRING in the envelope's `payload`; the object form is read too.
+    /// Through the production envelope parser the explicit field lands, and it
+    /// wins over the token the prompt also carries.
+    #[test]
+    fn condition_check_payload_reads_the_report_token_coord_sends_as_its_own_key() {
+        let field_token = uuid::Uuid::from_bytes([6; 16]).simple().to_string();
+        let prompt_token = uuid::Uuid::from_bytes([7; 16]).simple().to_string();
+        let frame = serde_json::json!({
+            "source": "condition_check",
+            "run_id": "018f0000-0000-7000-8000-000000000000",
+            "target_device_id": "018f0000-0000-7000-8000-000000000001",
+            "target_url": "http://localhost:3001",
+            "initial_prompt": format!("Authorization: Bearer {prompt_token}\n"),
+            "report_token": field_token,
+            "presentation": "terminal",
+            "condition_name": "login works",
+        });
+        for inner in [serde_json::Value::String(frame.to_string()), frame.clone()] {
+            let envelope = serde_json::json!({ "payload": inner });
+            let payload =
+                parse_condition_check_payload(&envelope).expect("coord's eight-key frame parses");
+            assert_eq!(payload.report_token.as_deref(), Some(field_token.as_str()));
+            assert_eq!(
+                condition_report_token(&payload).as_deref(),
+                Some(field_token.as_str()),
+                "the explicit field wins over the prompt's token"
+            );
+            assert_eq!(payload.condition_name.as_deref(), Some("login works"));
+        }
+        assert_ne!(
+            field_token, prompt_token,
+            "anti-vacuity: the two tokens differ"
         );
     }
 
