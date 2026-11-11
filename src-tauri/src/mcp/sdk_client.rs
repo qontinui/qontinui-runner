@@ -10553,3 +10553,46 @@ mod sdk_element_fallback_wire_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod sdk_element_fallback_source_guard {
+    //! The handler's IPC fallback must dispatch exactly what
+    //! `action_wire::sdk_fallback_payload` returns. The handler needs an
+    //! `ApiState` with a Tauri app handle, so this guards its source: it fails
+    //! if the fallback goes back to hand-rebuilding the four-field envelope.
+    fn handler_source() -> &'static str {
+        const SRC: &str = include_str!("sdk_client.rs");
+        let start = SRC
+            .find("async fn handle_element_action(")
+            .expect("handle_element_action present");
+        let end = SRC[start..]
+            .find("\nasync fn ")
+            .expect("another handler follows")
+            + start;
+        &SRC[start..end]
+    }
+
+    #[test]
+    fn the_fallback_dispatches_the_action_wire_payload() {
+        let src = handler_source();
+        assert!(src.contains("action_wire::sdk_fallback_payload("), "{src}");
+        assert!(
+            src.contains("ui_bridge_request_sync(&state, \"execute_action\", payload)"),
+            "{src}"
+        );
+    }
+
+    #[test]
+    fn the_fallback_does_not_rebuild_the_envelope_by_hand() {
+        let src = handler_source();
+        for forbidden in [
+            "\"waitOptions\"",
+            "\"verifyEffect\"",
+            "\"elementId\": id",
+            "wait_options",
+            "verify_effect",
+        ] {
+            assert!(!src.contains(forbidden), "fallback reintroduced `{forbidden}`");
+        }
+    }
+}

@@ -496,10 +496,7 @@ async fn ui_bridge_navigate_and_wait_handler_dispatch(
     ) {
         Ok(payload) => payload,
         Err(missing) => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(api_error(missing.message())),
-            ))
+            return Err((StatusCode::BAD_REQUEST, Json(missing.error_response())))
         }
     };
     match ui_bridge_request_sync(&state, "execute_action", action_payload).await {
@@ -539,7 +536,10 @@ async fn ui_bridge_navigate_and_wait_handler_dispatch(
         let count = match ui_bridge_request_sync(
             &state,
             "discover",
-            serde_json::json!({"interactive_only": false}),
+            super::action_wire::navigate_and_wait_window_payload(
+                serde_json::json!({"interactive_only": false}),
+                &req.action_extra,
+            ),
         )
         .await
         {
@@ -567,7 +567,15 @@ async fn ui_bridge_navigate_and_wait_handler_dispatch(
     }
 
     // 4. Return fresh snapshot
-    let snapshot = ui_bridge_request_sync(&state, "get_snapshot", serde_json::json!({})).await;
+    let snapshot = ui_bridge_request_sync(
+        &state,
+        "get_snapshot",
+        super::action_wire::navigate_and_wait_window_payload(
+            serde_json::json!({}),
+            &req.action_extra,
+        ),
+    )
+    .await;
 
     match snapshot {
         Ok(mut data) => {
@@ -4399,5 +4407,29 @@ mod navigate_and_wait_wire_tests {
         assert!(payload.pointer("/action/waitForStableMs").is_none());
         assert!(payload.pointer("/action/timeoutMs").is_none());
         assert!(payload.pointer("/action/elementId").is_none());
+    }
+}
+
+#[cfg(test)]
+mod navigate_and_wait_window_guard {
+    //! The handler's stability poll and final snapshot must read the window the
+    //! action ran in. The handler needs an `ApiState` with a Tauri app handle,
+    //! so this guards its source.
+    #[test]
+    fn follow_up_reads_go_through_the_window_payload_builder() {
+        const SRC: &str = include_str!("page.rs");
+        let start = SRC
+            .find("async fn ui_bridge_navigate_and_wait_handler_dispatch(")
+            .expect("handler present");
+        let end = SRC[start..].find("\n/// ").expect("next item") + start;
+        let handler = &SRC[start..end];
+        for request_type in ["\"discover\"", "\"get_snapshot\""] {
+            let at = handler.find(request_type).expect("request present");
+            let call = &handler[at..(at + 220).min(handler.len())];
+            assert!(
+                call.contains("navigate_and_wait_window_payload("),
+                "{request_type} is not window-targeted: {call}"
+            );
+        }
     }
 }

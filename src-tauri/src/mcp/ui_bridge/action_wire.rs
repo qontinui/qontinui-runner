@@ -55,9 +55,23 @@ impl ActionMissing {
     /// The human-readable refusal, naming the field and what it held.
     pub(crate) fn message(&self) -> String {
         format!(
-            "{ACTION_MISSING_CODE}: the request names no action; `action` must be a              non-empty string (found {}). Nothing was dispatched.",
+            "{ACTION_MISSING_CODE}: the request names no action; `action` must be a non-empty string (found {}). Nothing was dispatched.",
             self.found
         )
+    }
+
+    /// The refusal as an HTTP error envelope carrying the typed `code`, for
+    /// routes whose error arm is `ApiResponse<()>` (navigate-and-wait).
+    pub(crate) fn error_response(&self) -> crate::mcp::types::ApiResponse<()> {
+        crate::mcp::types::ApiResponse {
+            success: false,
+            data: None,
+            error: Some(self.message()),
+            error_detail: None,
+            hint: None,
+            code: Some(ACTION_MISSING_CODE.to_string()),
+            suggestions: None,
+        }
     }
 
     /// The refusal as an action response (`success: false` plus the typed
@@ -249,6 +263,32 @@ pub(crate) fn navigate_and_wait_payload(
         params.cloned().unwrap_or_else(|| json!({})),
     );
     element_action_payload(element_id, Value::Object(envelope))
+}
+
+/// Stamp navigate-and-wait's `windowLabel` (if the body carried one) onto a
+/// follow-up IPC payload (`discover`, `get_snapshot`). The action runs in the
+/// addressed pop-out window, so the stability poll and the snapshot have to
+/// read the same window, not the main one.
+pub(crate) fn navigate_and_wait_window_payload(base: Value, rest: &Map<String, Value>) -> Value {
+    let label = rest
+        .get(TARGET_WINDOW_FIELD)
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+    target_window_payload(base, label)
+}
+
+/// The route and body a workflow `element_action` step sends, built in one
+/// place so the step posts exactly this and nothing else.
+pub(crate) fn element_action_request(
+    base_url: &str,
+    snapshot_target: Option<&str>,
+    element_id: &str,
+    target: &Value,
+) -> Result<(String, Value), String> {
+    Ok((
+        element_action_endpoint(base_url, snapshot_target, element_id)?,
+        step_element_action_body(target),
+    ))
 }
 
 /// The route a workflow `element_action` step posts to, for the snapshot target
@@ -938,5 +978,87 @@ mod action_missing_tests {
             "empty",
             navigate_and_wait_payload("e1", "", None, &serde_json::Map::new()),
         );
+    }
+}
+
+#[cfg(test)]
+mod review_fix_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn the_action_missing_message_is_one_exact_sentence() {
+        let err = require_action_name(&json!({"action": null})).unwrap_err();
+        assert_eq!(
+            err.message(),
+            "action_missing: the request names no action; `action` must be a non-empty string (found null). Nothing was dispatched."
+        );
+        let err = require_action_name(&json!({})).unwrap_err();
+        assert_eq!(
+            err.message(),
+            "action_missing: the request names no action; `action` must be a non-empty string (found no `action` key). Nothing was dispatched."
+        );
+    }
+
+    #[test]
+    fn the_http_error_envelope_carries_the_typed_code() {
+        let env = require_action_name(&json!({})).unwrap_err().error_response();
+        assert!(!env.success);
+        assert_eq!(env.code.as_deref(), Some("action_missing"));
+        assert!(env.error.unwrap().starts_with("action_missing:"));
+    }
+
+    #[test]
+    fn navigate_and_wait_follow_up_reads_target_the_actions_window() {
+        let mut rest = Map::new();
+        rest.insert("windowLabel".into(), json!("term-1"));
+        for base in [json!({"interactive_only": false}), json!({})] {
+            let p = navigate_and_wait_window_payload(base, &rest);
+            assert_eq!(p["windowLabel"], json!("term-1"), "{p}");
+        }
+        // The action payload itself carries it at the root too.
+        let action = navigate_and_wait_payload("e1", "click", None, &rest).unwrap();
+        assert_eq!(action["windowLabel"], json!("term-1"));
+    }
+
+    #[test]
+    fn navigate_and_wait_follow_up_reads_stay_unrouted_for_main_or_absent() {
+        let mut main = Map::new();
+        main.insert("windowLabel".into(), json!("main"));
+        let mut empty = Map::new();
+        empty.insert("windowLabel".into(), json!(""));
+        for rest in [Map::new(), main, empty] {
+            let p = navigate_and_wait_window_payload(json!({"x": 1}), &rest);
+            assert!(p.get("windowLabel").is_none(), "{p}");
+        }
+    }
+
+    #[test]
+    fn the_step_request_is_the_singular_route_and_the_whole_target() {
+        let target = json!({
+            "criteria": {"textContent": "Save"},
+            "action": "type",
+            "params": {"text": "hi"},
+            "verifyEffect": {"mode": "strict"},
+            "unknownFutureOptIn": {"nested": ["value"]}
+        });
+        let (url, body) = element_action_request(
+            "http://127.0.0.1:9876/ui-bridge",
+            Some("sdk"),
+            "e1",
+            &target,
+        )
+        .unwrap();
+        assert_eq!(url, "http://127.0.0.1:9876/ui-bridge/sdk/element/e1/action");
+        assert_eq!(
+            body,
+            json!({
+                "action": "type",
+                "params": {"text": "hi"},
+                "verifyEffect": {"mode": "strict"},
+                "unknownFutureOptIn": {"nested": ["value"]}
+            })
+        );
+        assert!(!url.contains("/elements/"));
     }
 }
