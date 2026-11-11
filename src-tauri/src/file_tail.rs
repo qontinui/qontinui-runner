@@ -98,14 +98,19 @@ impl LineTail {
 pub fn read_tail_lossy(path: &Path, max: u64) -> Option<String> {
     let mut file = File::open(path).ok()?;
     let len = file.metadata().ok()?.len();
+    read_tail_lossy_from(&mut file, len, max).ok()
+}
+
+/// [`read_tail_lossy`] over any seekable source `len` bytes long.
+fn read_tail_lossy_from<R: Read + Seek>(src: &mut R, len: u64, max: u64) -> io::Result<String> {
     let start = len.saturating_sub(max);
-    let window = read_range(&mut file, start, len - start).ok()?;
+    let window = read_range(src, start, len - start)?;
     let text = if start == 0 {
         &window[..]
     } else {
         after_first_newline(&window).unwrap_or_default()
     };
-    Some(String::from_utf8_lossy(text).into_owned())
+    Ok(String::from_utf8_lossy(text).into_owned())
 }
 
 /// The last `n` lines of `path`, reading at most `cap` bytes of it. See
@@ -136,11 +141,16 @@ pub fn tail_lines_from<R: Read + Seek>(
     // `first < widest` implies `start > 0`: the first window is a strict tail.
     if first < widest && lines_after_partial(&window) < n {
         let wide_start = len - widest;
-        let mut wide = read_range(src, wide_start, start - wide_start)?;
+        let front = start - wide_start;
+        // Sized for the whole widened read up front, so joining the first
+        // window on never reallocates past `cap`.
+        let mut wide = Vec::with_capacity(usize::try_from(widest).unwrap_or(0));
+        src.seek(SeekFrom::Start(wide_start))?;
+        src.by_ref().take(front).read_to_end(&mut wide)?;
         // A short read means the source shrank (rotated or truncated) between
         // the two reads. Joining it on would splice two different files, so the
         // first window stands on its own.
-        if wide.len() as u64 == start - wide_start {
+        if wide.len() as u64 == front {
             wide.extend_from_slice(&window);
             return Ok(LineTail::of_window(&wide, wide_start, n, len));
         }
@@ -466,5 +476,78 @@ mod tests {
             Some("aaaa\nbbbb\ncc\u{FFFD}cc\n")
         );
         assert_eq!(read_tail_lossy(&dir.path().join("absent"), 8), None);
+    }
+
+    /// The length is fixed when the source is opened: bytes appended after
+    /// that are never read, by the first window or by the widened read.
+    #[test]
+    fn bytes_appended_after_open_are_never_read() {
+        let mut bytes = b"one\ntwo\n".to_vec();
+        let opened = bytes.len() as u64;
+        bytes.extend_from_slice(b"appended\n");
+        let tail = tail_lines_from(&mut Cursor::new(&bytes), opened, 10, LOG_TAIL_CAP).unwrap();
+        assert_eq!(tail.lines, ["one", "two"]);
+
+        // Widened: 10 lines of 10 000 bytes, a first window too small for 10.
+        let mut log = CountingLog::new(1_000, 10_000);
+        let opened = 100 * 10_000;
+        let tail = tail_lines_from(&mut log, opened, 10, LOG_TAIL_CAP).unwrap();
+        let want: Vec<String> = (90..100).map(|k| log.line(k)).collect();
+        assert_eq!(tail.lines, want);
+        assert_eq!(log.seeks, 2, "the reader must have widened");
+        assert_eq!(
+            tail.total_lines,
+            Some(100),
+            "the 900 appended lines are not counted"
+        );
+        assert_eq!(
+            log.bytes_read, opened,
+            "the opened length, and not a byte past it"
+        );
+
+        // `bytes` still carries the appended line; 8 is "one\ntwo\n".
+        let lossy = read_tail_lossy_from(&mut Cursor::new(&bytes), 8, 1024).unwrap();
+        assert_eq!(lossy, "one\ntwo\n");
+    }
+
+    /// A source that shrinks between the two reads (rotated or truncated) is
+    /// never spliced: the first window's tail stands on its own.
+    #[test]
+    fn a_source_that_shrinks_between_reads_is_not_spliced() {
+        struct Shrinking {
+            inner: Cursor<Vec<u8>>,
+            seeks: u32,
+            shrink_to: usize,
+        }
+        impl Read for Shrinking {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                self.inner.read(buf)
+            }
+        }
+        impl Seek for Shrinking {
+            fn seek(&mut self, to: SeekFrom) -> io::Result<u64> {
+                self.seeks += 1;
+                if self.seeks == 2 {
+                    self.inner.get_mut().truncate(self.shrink_to);
+                }
+                self.inner.seek(to)
+            }
+        }
+        // 200 lines of 1 000 bytes: the 64 KiB first window holds ~65 lines,
+        // fewer than the 100 asked for, so the reader widens.
+        let line = |k: usize| format!("{k:0>999}\n");
+        let bytes: Vec<u8> = (0..200).flat_map(|k| line(k).into_bytes()).collect();
+        let len = bytes.len() as u64;
+        let mut src = Shrinking {
+            inner: Cursor::new(bytes.clone()),
+            seeks: 0,
+            shrink_to: 1_000,
+        };
+        let shrunk = tail_lines_from(&mut src, len, 100, LOG_TAIL_CAP).unwrap();
+        assert_eq!(src.seeks, 2, "the reader must have tried to widen");
+        let first_only =
+            tail_lines_from(&mut Cursor::new(&bytes), len, 100, TAIL_FIRST_WINDOW).unwrap();
+        assert_eq!(shrunk.lines, first_only.lines);
+        assert!(shrunk.lines.len() < 100);
     }
 }
