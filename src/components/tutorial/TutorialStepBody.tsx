@@ -10,8 +10,10 @@
  * text becomes UI.
  */
 
-import ReactMarkdown from "react-markdown";
+import type { ReactNode } from "react";
+import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { Lightbulb } from "lucide-react";
 import { cn } from "../../lib/utils";
 
@@ -23,16 +25,49 @@ const MARKDOWN_CLASSES = cn(
   "[&_pre]:overflow-x-auto [&_pre]:rounded-md [&_pre]:bg-muted [&_pre]:p-2",
   "[&_pre_code]:bg-transparent [&_pre_code]:p-0",
   "[&_ul]:list-disc [&_ul]:pl-5 [&_ol]:list-decimal [&_ol]:pl-5",
-  "[&_table]:w-full [&_table]:text-xs [&_th]:text-left [&_th]:font-semibold",
+  "[&_table]:text-xs [&_th]:text-left [&_th]:font-semibold",
   "[&_th]:border-b [&_th]:border-border [&_td]:border-b [&_td]:border-border/50",
   "[&_th]:py-1 [&_td]:py-1 [&_th]:pr-2 [&_td]:pr-2",
   "[&_a]:text-primary [&_a]:underline",
 );
 
+/**
+ * A link opens in the system browser. A plain `<a href>` in the Tauri webview
+ * would load the page in place of the app, mid-tutorial.
+ */
+function ExternalLink({ href, children }: { href?: string; children?: ReactNode }) {
+  return (
+    <a
+      href={href}
+      onClick={(e) => {
+        e.preventDefault();
+        if (href) void openUrl(href).catch((err) => console.error("Failed to open link:", err));
+      }}
+    >
+      {children}
+    </a>
+  );
+}
+
+/** A table scrolls sideways rather than overflowing the tooltip. */
+function ScrollTable({ children }: { children?: ReactNode }) {
+  return (
+    <div className="overflow-x-auto">
+      <table className="min-w-full">{children}</table>
+    </div>
+  );
+}
+
+/** Raw HTML stays off: no rehype-raw, since explain-mode content is AI-written. */
+const COMPONENTS: Components = { a: ExternalLink, table: ScrollTable };
+const INLINE_COMPONENTS: Components = { ...COMPONENTS, p: "span" };
+
 function StepMarkdown({ text, testId }: { text: string; testId: string }) {
   return (
     <div className={MARKDOWN_CLASSES} data-testid={testId}>
-      <ReactMarkdown remarkPlugins={[remarkGfm]}>{text}</ReactMarkdown>
+      <ReactMarkdown remarkPlugins={[remarkGfm]} components={COMPONENTS}>
+        {text}
+      </ReactMarkdown>
     </div>
   );
 }
@@ -53,7 +88,7 @@ export function TutorialStepBody({ content, details, tips }: TutorialStepBodyPro
       <StepMarkdown text={content} testId="tutorial-step-content" />
 
       {details && details.trim() !== "" && (
-        <details className="group rounded-lg border border-border/50 bg-muted/20">
+        <details className="rounded-lg border border-border/50 bg-muted/20">
           <summary className="cursor-pointer select-none px-3 py-2 text-xs font-medium text-foreground">
             More details
           </summary>
@@ -75,7 +110,7 @@ export function TutorialStepBody({ content, details, tips }: TutorialStepBodyPro
           <ul className={cn(MARKDOWN_CLASSES, "list-disc pl-5")}>
             {shownTips.map((tip, i) => (
               <li key={i}>
-                <ReactMarkdown remarkPlugins={[remarkGfm]} components={{ p: "span" }}>
+                <ReactMarkdown remarkPlugins={[remarkGfm]} components={INLINE_COMPONENTS}>
                   {tip}
                 </ReactMarkdown>
               </li>

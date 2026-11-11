@@ -22,7 +22,7 @@ const logger = createLogger("ContextualTutorial");
 /**
  * CenteredTooltip - Simple centered modal for steps without a target
  */
-function CenteredTooltip({
+export function CenteredTooltip({
   title,
   content,
   details,
@@ -66,7 +66,7 @@ function CenteredTooltip({
       <div
         className={cn(
           "bg-card border border-border rounded-xl shadow-2xl",
-          "w-[90vw] max-w-md",
+          "w-[90vw] max-w-md max-h-[calc(100vh-32px)] overflow-y-auto",
           "tutorial-scale-in",
         )}
       >
