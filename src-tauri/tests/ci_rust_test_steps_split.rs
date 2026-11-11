@@ -732,6 +732,70 @@ fn no_step_after_the_build_half_invokes_cargo_again() {
     );
 }
 
+/// The session-lifecycle kernel crate (plan
+/// `2026-10-28-one-session-lifecycle-authority`, Phase 37) is a separate
+/// workspace member, so `cd src-tauri && cargo fmt` and `cargo clippy` reach
+/// none of it. Its format check and its clippy run must therefore be named in
+/// the REQUIRED `test` job, the clippy one in the ubuntu `Clippy check` step
+/// that is that job's blocking clippy, with `--all-targets` (the crate is
+/// mostly its tests) and `-D warnings` (its own `[lints]` table's warn tiers
+/// are the bar). The Phase 2a review found the clippy run in `holder-crates`,
+/// a job nothing requires, where a red would have blocked no merge; it must
+/// not drift back there.
+#[test]
+fn the_session_lifecycle_kernel_is_formatted_and_linted_in_the_required_job() {
+    const FMT: &str = "Format Rust code check";
+    const CLIPPY: &str = "Clippy check";
+    const CLIPPY_LINE: &str = "cargo clippy -p session-lifecycle --all-targets -- -D warnings";
+    let doc = ci_workflow();
+    let steps = job_steps(&doc, "test");
+
+    let fmt = command_lines(find_step(&steps, FMT), FMT);
+    assert!(
+        fmt.lines()
+            .any(|l| l.trim() == "cargo fmt -p session-lifecycle -- --check"),
+        "`{FMT}` must check the session-lifecycle crate's formatting: `cargo fmt` \
+         from src-tauri does not reach a sibling workspace member. Body was:\n{fmt}"
+    );
+
+    let clippy = find_step(&steps, CLIPPY);
+    let gate = clippy
+        .get("if")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    assert!(
+        gate.contains("matrix.platform == 'ubuntu-22.04'"),
+        "`{CLIPPY}` is the ubuntu leg's blocking clippy; its gate changed to `{gate}`"
+    );
+    let body = command_lines(clippy, CLIPPY);
+    assert!(
+        body.lines().any(|l| l.trim() == CLIPPY_LINE),
+        "`{CLIPPY}` in the required `test` job must run `{CLIPPY_LINE}`. Body \
+         was:\n{body}"
+    );
+
+    let elsewhere: Vec<String> = ["holder-crates", "clippy-windows"]
+        .into_iter()
+        .flat_map(|job| {
+            job_steps(&doc, job)
+                .into_iter()
+                .filter(|s| s.get("run").is_some())
+                .filter_map(move |s| {
+                    let label = step_name(&s).unwrap_or("<unnamed>").to_string();
+                    command_lines(&s, &label)
+                        .contains("-p session-lifecycle")
+                        .then(|| format!("{job}: {label}"))
+                })
+        })
+        .collect();
+    assert!(
+        elsewhere.is_empty(),
+        "the session-lifecycle crate is linted in the required `test` job; a \
+         second copy elsewhere is how it ended up gated by a job nothing \
+         requires: {elsewhere:?}"
+    );
+}
+
 /// Plan `2026-10-27-coord-routes-ci-jobs-by-runner-capability` Phase 1: an
 /// out-of-memory Rust test step is annotated as CAPACITY, in the title coord
 /// reads as "not a verdict on this PR". The matching itself is fixture-tested
