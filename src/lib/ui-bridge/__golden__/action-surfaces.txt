@@ -4,8 +4,8 @@
 #   pnpm exec vitest run src/lib/ui-bridge/actionSurfaces.enforcement.test.ts
 # after setting UPDATE_ACTION_SURFACE_GOLDEN=1.
 #
-# total: 201
-#   guarded: 25
+# total: 202
+#   guarded: 26
 #   literal: 74
 #   registry: 45
 #   delegated: 9
@@ -52,6 +52,7 @@ src/components/projects/ProjectDetail.tsx	literal	component	work-on-it	schema=no
 src/components/projects/ProjectEmptyState.tsx	literal	component	choose-folder	schema=no	arity=0	effect=write
 src/components/projects/ProjectsPage.tsx	literal	component	find-on-disk	schema=no	arity=0	effect=write
 src/components/projects/ProjectsPage.tsx	literal	component	refresh	schema=no	arity=0	effect=read
+src/components/settings/AiSettings.tsx	guarded	component	set-runner-manages-cli-updates	schema=yes	arity=-	effect=write
 src/components/settings/Settings.tsx	literal	component	save	schema=no	arity=0	effect=write
 src/components/settings/Settings.tsx	literal	component	reset	schema=no	arity=0	effect=write
 src/components/settings/Settings.tsx	guarded	component	switch-tab	schema=yes	arity=-	effect=write
