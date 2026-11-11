@@ -654,31 +654,15 @@ mod tests {
     //! `#[cfg(test)] mod tests {}` pattern matches every other PG CRUD
     //! module (e.g. `pg/session_touched_files.rs`).
     //!
-    //! Run locally with a running PG:
-    //!   DATABASE_URL=postgres://qontinui_user:PASSWORD@localhost:5433/qontinui_db \
-    //!     cargo test --bin qontinui-runner -- --ignored apps:: --test-threads=1
-    //!
-    //! `--test-threads=1` keeps the registry mutations serial. Per-test
-    //! unique slugs (helper `unique_app_id`) prevent rows from colliding
-    //! when reruns leave stale state; each test calls `cleanup_app` at the
-    //! end to keep the shared dev DB tidy.
+    //! Each test gets a FRESH database of its own from `PgDb::new_for_test()`:
+    //! the runner's bundled PostgreSQL, booted once per test process by
+    //! `embedded_pg::test_harness` and cloned per test from a template that
+    //! `PgDb::new` provisioned. So these run in every `cargo test` and on both
+    //! CI legs, need no external server, run in parallel, and cannot see each
+    //! other's rows — the database is dropped with its `PgDb`.
 
     use super::*;
     use crate::spec_api::storage;
-
-    /// Async PgDb constructor for tests. The sibling `PgDb::new_blocking_for_test()`
-    /// helper used by other `pg/*` test modules calls `rt.block_on()` which
-    /// panics under `#[tokio::test]`'s active runtime — known pre-existing
-    /// bug across the codebase. This async-native helper sidesteps the
-    /// double-runtime conflict.
-    async fn test_pg() -> PgDb {
-        let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-            "postgres://qontinui_user:qontinui_password@localhost:5433/qontinui_db".to_string()
-        });
-        PgDb::new(&url)
-            .await
-            .expect("PgDb::new for app_registry tests")
-    }
 
     fn unique_app_id(label: &str) -> String {
         let nanos = std::time::SystemTime::now()
@@ -703,10 +687,6 @@ mod tests {
         )
     }
 
-    async fn cleanup_app(pg: &PgDb, app_id: &str) {
-        let _ = pg.delete_app(app_id).await;
-    }
-
     /// An all-`None` `UpdateAppRequest` to mutate per test.
     ///
     /// `UpdateAppRequest` has no `Default` derive, and adding one to
@@ -725,7 +705,7 @@ mod tests {
         }
     }
 
-    // ---- normalize_command (pure — runs in CI, unlike the DB-gated tests) ----
+    // ---- normalize_command (pure) ----
 
     #[test]
     fn normalize_command_absent_leaves_column_alone() {
@@ -771,16 +751,15 @@ mod tests {
         }
     }
 
-    /// DB-gated: prove all THREE update states against real SQL.
+    /// Against real SQL: prove all THREE update states.
     ///
     /// The `CASE WHEN $n THEN ... ELSE column END` rewrite is exactly what a
     /// struct-level test cannot cover — and the previous `COALESCE` shape gets
     /// the "clear" case wrong while looking correct, because `COALESCE` falls
     /// through only on NULL and `''` is not NULL.
     #[tokio::test]
-    #[ignore = "requires PG via DATABASE_URL"]
     async fn update_app_command_leave_clear_and_set() {
-        let pg = test_pg().await;
+        let pg = PgDb::new_for_test().await;
         let tmp = tempfile::tempdir().expect("tempdir");
         let app_id = unique_app_id("cmd");
         pg.insert_app(&register_request(&app_id, &tmp))
@@ -834,24 +813,26 @@ mod tests {
         };
         let app = pg.update_app(&app_id, &retrim).await.expect("re-set");
         assert_eq!(app.build_command.as_deref(), Some("make"));
-
-        cleanup_app(&pg, &app_id).await;
     }
 
+    /// A database of its own makes the registry's starting state exact: the one
+    /// row `PgDb::new` writes for this runner (`ensure_self_registered`), and
+    /// nothing else.
     #[tokio::test]
-    #[ignore = "requires PG via DATABASE_URL"]
-    async fn list_apps_empty_returns_empty_vec() {
-        // Shared dev DB: assert shape (Vec<App>, no error) rather than zero
-        // rows — other tests may have rows in flight on the same DB.
-        let pg = test_pg().await;
+    async fn list_apps_on_a_fresh_database_lists_only_the_runners_own_row() {
+        let pg = PgDb::new_for_test().await;
         let apps = pg.list_apps().await.expect("list_apps must not error");
-        assert!(apps.iter().all(|a| !a.app_id.is_empty()));
+        let ids: Vec<&str> = apps.iter().map(|a| a.app_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![RUNNER_APP_ID],
+            "a fresh registry should hold only the runner's self-registration"
+        );
     }
 
     #[tokio::test]
-    #[ignore = "requires PG via DATABASE_URL"]
     async fn register_app_with_invalid_slug_returns_invalid_app_id() {
-        let pg = test_pg().await;
+        let pg = PgDb::new_for_test().await;
         let tmp = tempfile::tempdir().unwrap();
         let mut req = register_request("ignored", &tmp);
         req.app_id = "Has_Underscore_And_Caps".into();
@@ -867,9 +848,8 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires PG via DATABASE_URL"]
     async fn register_app_with_missing_repo_root_returns_invalid_repo_root() {
-        let pg = test_pg().await;
+        let pg = PgDb::new_for_test().await;
         let app_id = unique_app_id("missing-root");
         let bogus_root = format!(
             "{}/does/not/exist/{}",
@@ -887,13 +867,11 @@ mod tests {
             "expected InvalidRepoRoot; got {:?}",
             err
         );
-        cleanup_app(&pg, &app_id).await;
     }
 
     #[tokio::test]
-    #[ignore = "requires PG via DATABASE_URL"]
     async fn register_app_then_get_app_round_trips() {
-        let pg = test_pg().await;
+        let pg = PgDb::new_for_test().await;
         let app_id = unique_app_id("round-trip");
         let tmp = tempfile::tempdir().unwrap();
         let req = register_request(&app_id, &tmp);
@@ -916,14 +894,11 @@ mod tests {
             .expect("row must exist");
         assert_eq!(read.app_id, app_id);
         assert_eq!(read.repo_root, req.repo_root);
-
-        cleanup_app(&pg, &app_id).await;
     }
 
     #[tokio::test]
-    #[ignore = "requires PG via DATABASE_URL"]
     async fn register_app_duplicate_returns_already_registered() {
-        let pg = test_pg().await;
+        let pg = PgDb::new_for_test().await;
         let app_id = unique_app_id("dup");
         let tmp = tempfile::tempdir().unwrap();
         let req = register_request(&app_id, &tmp);
@@ -938,14 +913,11 @@ mod tests {
             "expected AlreadyRegistered; got {:?}",
             err
         );
-
-        cleanup_app(&pg, &app_id).await;
     }
 
     #[tokio::test]
-    #[ignore = "requires PG via DATABASE_URL"]
     async fn update_app_changes_ui_bridge_url() {
-        let pg = test_pg().await;
+        let pg = PgDb::new_for_test().await;
         let app_id = unique_app_id("update");
         let tmp = tempfile::tempdir().unwrap();
         let req = register_request(&app_id, &tmp);
@@ -974,14 +946,11 @@ mod tests {
             .expect("get_app")
             .expect("present");
         assert_eq!(read.ui_bridge_url, new_url);
-
-        cleanup_app(&pg, &app_id).await;
     }
 
     #[tokio::test]
-    #[ignore = "requires PG via DATABASE_URL"]
     async fn update_app_changes_auth_required_and_thresholds() {
-        let pg = test_pg().await;
+        let pg = PgDb::new_for_test().await;
         let app_id = unique_app_id("update-auth");
         let tmp = tempfile::tempdir().unwrap();
         let req = register_request(&app_id, &tmp);
@@ -1004,14 +973,11 @@ mod tests {
         assert!(updated.auth_required);
         assert_eq!(updated.red_threshold, 0.55);
         assert_eq!(updated.yellow_threshold, 0.85);
-
-        cleanup_app(&pg, &app_id).await;
     }
 
     #[tokio::test]
-    #[ignore = "requires PG via DATABASE_URL"]
     async fn delete_app_removes_row_does_not_touch_disk() {
-        let pg = test_pg().await;
+        let pg = PgDb::new_for_test().await;
         let app_id = unique_app_id("delete");
         let tmp = tempfile::tempdir().unwrap();
         let req = register_request(&app_id, &tmp);
@@ -1037,9 +1003,8 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires PG via DATABASE_URL"]
     async fn touch_app_bumps_last_seen_at_ms() {
-        let pg = test_pg().await;
+        let pg = PgDb::new_for_test().await;
         let app_id = unique_app_id("touch");
         let tmp = tempfile::tempdir().unwrap();
         let req = register_request(&app_id, &tmp);
@@ -1060,14 +1025,11 @@ mod tests {
             inserted.last_seen_at_ms,
             read.last_seen_at_ms
         );
-
-        cleanup_app(&pg, &app_id).await;
     }
 
     #[tokio::test]
-    #[ignore = "requires PG via DATABASE_URL"]
     async fn resolve_specs_root_returns_repo_root_plus_specs() {
-        let pg = test_pg().await;
+        let pg = PgDb::new_for_test().await;
         let app_id = unique_app_id("resolve-ok");
         let tmp = tempfile::tempdir().unwrap();
 
@@ -1086,14 +1048,11 @@ mod tests {
         let expected = specs_dir.canonicalize().unwrap_or(specs_dir);
         let got = resolved.canonicalize().unwrap_or(resolved);
         assert_eq!(got, expected);
-
-        cleanup_app(&pg, &app_id).await;
     }
 
     #[tokio::test]
-    #[ignore = "requires PG via DATABASE_URL"]
     async fn resolve_specs_root_for_unknown_app_returns_not_registered() {
-        let pg = test_pg().await;
+        let pg = PgDb::new_for_test().await;
         let ghost_id = unique_app_id("ghost");
         let err = storage::resolve_specs_root(&pg, &ghost_id)
             .await

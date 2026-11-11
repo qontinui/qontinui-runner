@@ -568,9 +568,44 @@ fn force_c_locale_messages(pg_config: &mut tokio_postgres::Config) {
 /// runner's PG circuit breaker ([`GuardedPool`]).
 pub struct PgDb {
     pool: GuardedPool,
+    /// A test `PgDb`'s own harness database, held so it lives exactly as long
+    /// as the `PgDb` and is dropped with it. After `pool`, so the pool and its
+    /// connections go first.
+    #[cfg(test)]
+    test_database: Option<crate::embedded_pg::test_harness::TestDatabase>,
+}
+
+/// The harness template every test `PgDb` is cloned from: the canonical schema
+/// plus everything [`PgDb::new`] self-provisions on top of it
+/// ([`PgDb::verify_and_provision`]: the runner-authored `project.*` and
+/// `orchestration.*` tables, the self-heal columns and indexes, and this
+/// runner's own `project.apps` row), provisioned once per test process. The
+/// library harness cannot call `PgDb::new` — `PgDb` lives in this crate — so it
+/// is handed in as the template's provisioning step, and a test database
+/// matches what `PgDb::new` leaves on a fresh bundled cluster.
+#[cfg(test)]
+static PGDB_TEST_TEMPLATE: crate::embedded_pg::test_harness::DerivedTemplate =
+    crate::embedded_pg::test_harness::DerivedTemplate::new("pgdb", provision_pgdb_test_template);
+
+/// [`PGDB_TEST_TEMPLATE`]'s provisioning step: `PgDb::new` against the
+/// template, whose pool is dropped — closing its connections — before it
+/// returns.
+#[cfg(test)]
+fn provision_pgdb_test_template(url: String) -> crate::embedded_pg::test_harness::ProvisionFuture {
+    Box::pin(async move { PgDb::new(&url).await.map(drop) })
 }
 
 impl PgDb {
+    /// The one place a `PgDb` value is assembled, so the test-only field has a
+    /// single spelling.
+    fn from_pool(pool: GuardedPool) -> Self {
+        Self {
+            pool,
+            #[cfg(test)]
+            test_database: None,
+        }
+    }
+
     /// Set the global PgDb instance. Call once during app initialization.
     /// Warns and ignores if called more than once.
     pub fn set_global(pg_db: Arc<PgDb>) {
@@ -699,7 +734,7 @@ impl PgDb {
                 }
             },
         ));
-        Ok(Self { pool })
+        Ok(Self::from_pool(pool))
     }
 
     /// Connect to PostgreSQL using the given connection string.
@@ -710,7 +745,7 @@ impl PgDb {
     /// Returns `Err` if the connection string is invalid or initial connectivity fails.
     pub async fn new(database_url: &str) -> Result<Self, String> {
         let pool = Self::build_pool(database_url)?;
-        let db = Self { pool };
+        let db = Self::from_pool(pool);
         db.verify_and_provision().await?;
         Ok(db)
     }
@@ -1431,39 +1466,45 @@ impl PgDb {
         &self.pool
     }
 
-    /// The PG fixture URL for tests: `DATABASE_URL`, else the local default.
-    #[cfg(test)]
-    fn test_database_url() -> String {
-        std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://localhost:5432/qontinui_test".to_string())
-    }
-
-    /// Blocking helper for SYNCHRONOUS (`#[test]`) tests: create a PgDb using
-    /// DATABASE_URL. Panics if PG is not available. It builds its own tokio
-    /// runtime, so calling it from inside a `#[tokio::test]` body panics with
-    /// "Cannot start a runtime from within a runtime" — use
-    /// [`new_for_test`](Self::new_for_test) there.
-    #[cfg(test)]
-    #[expect(
-        clippy::disallowed_types,
-        reason = "owned tokio Runtime predates the disallowed_types gate — dropping one from an async context panics; hold a Handle or use tauri::async_runtime; plan 2026-09-12-residual-work-from-the-april-2026-plan-audit"
-    )]
-    pub fn new_blocking_for_test() -> std::sync::Arc<Self> {
-        let url = Self::test_database_url();
-        let rt = tokio::runtime::Runtime::new().expect("tokio runtime for test");
-        std::sync::Arc::new(
-            rt.block_on(Self::new(&url))
-                .expect("PgDb connection for test"),
-        )
-    }
-
-    /// Async twin of [`new_blocking_for_test`](Self::new_blocking_for_test)
-    /// for `#[tokio::test]` bodies: connects on the test's own runtime.
-    /// Panics if PG is not available.
+    /// A `PgDb` on a FRESH database of its own, for an async (`#[tokio::test]`)
+    /// test. The database comes from the test harness
+    /// ([`crate::embedded_pg::test_harness`]): the runner's bundled PostgreSQL,
+    /// booted once per test process, cloned from [`PGDB_TEST_TEMPLATE`] — the
+    /// full schema plus what [`PgDb::new`] self-provisions. It is dropped with
+    /// the returned `PgDb`.
+    ///
+    /// Panics with the harness's boot error when the cluster cannot start: a
+    /// database test that cannot get its database fails; it is never skipped.
     #[cfg(test)]
     pub async fn new_for_test() -> std::sync::Arc<Self> {
-        let url = Self::test_database_url();
-        std::sync::Arc::new(Self::new(&url).await.expect("PgDb connection for test"))
+        let database =
+            crate::embedded_pg::test_harness::fresh_database_from(&PGDB_TEST_TEMPLATE).await;
+        std::sync::Arc::new(Self::for_test_database(database))
+    }
+
+    /// [`new_for_test`](Self::new_for_test) for a SYNCHRONOUS (`#[test]`)
+    /// test — and safe inside a `#[tokio::test]` too: the database is made on
+    /// the harness's own runtime thread, and building the pool does no I/O, so
+    /// no runtime is nested. The pool connects lazily, on whichever runtime the
+    /// test then drives it from.
+    #[cfg(test)]
+    pub fn new_blocking_for_test() -> std::sync::Arc<Self> {
+        let database =
+            crate::embedded_pg::test_harness::fresh_database_from_blocking(&PGDB_TEST_TEMPLATE);
+        std::sync::Arc::new(Self::for_test_database(database))
+    }
+
+    /// A `PgDb` on `database`, which [`PGDB_TEST_TEMPLATE`] already
+    /// provisioned — so it builds the pool only, and does not re-run
+    /// [`verify_and_provision`](Self::verify_and_provision) per test.
+    #[cfg(test)]
+    fn for_test_database(database: crate::embedded_pg::test_harness::TestDatabase) -> Self {
+        let pool = Self::build_pool(database.url())
+            .unwrap_or_else(|e| panic!("PgDb pool for the test database {}: {e}", database.name()));
+        Self {
+            pool,
+            test_database: Some(database),
+        }
     }
 
     /// Test-only: create a PgDb with a pool that will error on any actual
@@ -1481,9 +1522,95 @@ impl PgDb {
         let pool = cfg
             .create_pool(Some(Runtime::Tokio1), tokio_postgres::NoTls)
             .expect("noop pool creation should not fail (no connection attempted)");
-        std::sync::Arc::new(Self {
-            pool: GuardedPool::new(pool),
-        })
+        std::sync::Arc::new(Self::from_pool(GuardedPool::new(pool)))
+    }
+}
+
+#[cfg(test)]
+mod test_seam_tests {
+    //! The `PgDb` test seam, against the real bundled cluster the harness
+    //! boots.
+
+    use super::{PgDb, REHOMED_MACHINE_LOCAL_TABLES};
+
+    async fn relation_exists(pg: &PgDb, relation: &str) -> bool {
+        let conn = pg
+            .pool()
+            .get()
+            .await
+            .expect("checkout on the test database");
+        conn.query_one("SELECT to_regclass($1) IS NOT NULL", &[&relation])
+            .await
+            .and_then(|row| row.try_get(0))
+            .unwrap_or_else(|e| panic!("probe {relation}: {e}"))
+    }
+
+    /// A test `PgDb`'s database carries what `PgDb::new` self-provisions — not
+    /// only the schema file's tables. Every relation probed here is absent from
+    /// `schema.pg.sql.generated` (the re-homed machine-local tables exist there
+    /// only as `coord.*`), so each is present only because the template was
+    /// provisioned by `PgDb::new`.
+    #[tokio::test]
+    async fn a_test_pgdb_carries_the_self_provisioned_tables() {
+        let pg = PgDb::new_for_test().await;
+        let rehomed = REHOMED_MACHINE_LOCAL_TABLES
+            .iter()
+            .map(|table| format!("project.{table}"));
+        let self_healed = [
+            "project.session_prs",
+            "project.session_review_hunks",
+            "project.session_review_notes",
+            "orchestration.runs",
+            "orchestration.subtasks",
+        ]
+        .into_iter()
+        .map(str::to_string);
+        for relation in self_healed.chain(rehomed) {
+            assert!(
+                relation_exists(&pg, &relation).await,
+                "{relation} is missing: the PgDb test template was not provisioned by PgDb::new"
+            );
+        }
+    }
+
+    /// The blocking seam is safe inside a runtime — the nested-runtime panic
+    /// its old body had (`task_runs.rs` hit it) cannot happen.
+    #[tokio::test]
+    async fn new_blocking_for_test_is_safe_inside_a_runtime() {
+        let pg = PgDb::new_blocking_for_test();
+        assert!(relation_exists(&pg, "project.apps").await);
+    }
+
+    /// The blocking seam still serves a synchronous test, which drives the
+    /// pool from a runtime of its own.
+    #[test]
+    fn new_blocking_for_test_serves_a_synchronous_test() {
+        let pg = PgDb::new_blocking_for_test();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime for the synchronous test");
+        assert!(runtime.block_on(relation_exists(&pg, "project.apps")));
+    }
+
+    /// Each test `PgDb` is its own database: a row written through one is not
+    /// visible through the next.
+    #[tokio::test]
+    async fn two_test_pgdbs_do_not_share_rows() {
+        let first = PgDb::new_for_test().await;
+        let second = PgDb::new_for_test().await;
+        let writer = first.pool().get().await.expect("checkout");
+        writer
+            .batch_execute(
+                "CREATE TABLE public.seam_isolation_probe (marker text); \
+                 INSERT INTO public.seam_isolation_probe VALUES ('first')",
+            )
+            .await
+            .expect("write through the first test PgDb");
+        assert!(
+            !relation_exists(&second, "public.seam_isolation_probe").await,
+            "a table written through one test PgDb is visible through another"
+        );
     }
 }
 

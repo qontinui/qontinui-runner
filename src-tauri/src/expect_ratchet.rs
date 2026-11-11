@@ -167,7 +167,7 @@ mod tests {
         Ratchet {
             lint: "clippy::disallowed_types",
             expect_needle: "#[expect(clippy::disallowed_types",
-            baseline: 10,
+            baseline: 9,
             gate_wiring: &[
                 ("clippy.toml", "disallowed-types"),
                 ("clippy.toml", "tokio::runtime::Runtime"),
