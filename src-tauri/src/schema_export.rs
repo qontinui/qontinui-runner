@@ -522,6 +522,10 @@ pub fn export_all_schemas() -> Value {
     add!("TerminalInfo", qtm::TerminalInfo);
     add!("TerminalOutputEvent", qtm::TerminalOutputEvent);
     add!("TerminalExitEvent", qtm::TerminalExitEvent);
+    add!("TerminalLayout", qtm::TerminalLayout);
+    add!("TerminalLayoutRunner", qtm::TerminalLayoutRunner);
+    add!("TerminalLayoutPage", qtm::TerminalLayoutPage);
+    add!("TerminalLayoutSession", qtm::TerminalLayoutSession);
 
     // ── runner-local: findings (Tauri `finding_detected` / `finding_resolved`
     // payloads). Distinct from `qontinui_types::verification::Finding`
@@ -1108,8 +1112,21 @@ mod tests {
         // RecurringAgentStatusReport — plan
         // 2026-10-29-recurring-agents-declared-in-coord-reconciled-by-runner
         // Phase 4a) = 624.
-        // The codegen's "Processing N top-level types" line should read 624 here.
-        assert_eq!(obj.len(), 624, "Expected 624 schema entries");
+        // + the 4 terminal-layout types (TerminalLayout, TerminalLayoutRunner,
+        // TerminalLayoutPage, TerminalLayoutSession — the GET /terminal-layout
+        // body, plan
+        // 2026-11-08-save-per-tab-runner-session-lists-on-sessions-page-kept-14-days
+        // Phase 1) = 628.
+        // The codegen's "Processing N top-level types" line should read 628 here.
+        assert_eq!(obj.len(), 628, "Expected 628 schema entries");
+        for layout in [
+            "TerminalLayout",
+            "TerminalLayoutRunner",
+            "TerminalLayoutPage",
+            "TerminalLayoutSession",
+        ] {
+            assert!(obj.contains_key(layout), "Missing {layout} schema");
+        }
         for recurring in [
             "ManagedBy",
             "RecurringAgentTarget",

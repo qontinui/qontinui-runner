@@ -624,7 +624,9 @@ pub const SPAWN_NAME_EVENT: &str = "terminal-spawn-name";
 /// NOT carry a Claude session id), returns `sessionIdsByTerminal`: a
 /// `{ terminal_id -> { claudeSessionId, configDir } }` map derived from the
 /// durable [`SessionLifecycleStore`]'s `terminal_id -> claude_session_id`
-/// index ([`SessionLifecycleStore::find_confirmed_open_by_terminal`]).
+/// index ([`SessionLifecycleStore::find_confirmed_open_by_terminal`]),
+/// through the join `GET /terminal-layout` shares
+/// ([`crate::terminal::layout::join_terminals`]).
 ///
 /// This is what lets the frontend attach `claudeSessionId` to a RECONNECTED
 /// tab. The per-session PR dropdown (and anything else session-scoped) gates
@@ -648,35 +650,43 @@ pub fn terminal_list(
     app: tauri::AppHandle,
     terminal_manager: tauri::State<'_, Arc<TerminalManager>>,
 ) -> Result<CommandResponse, String> {
-    let terminals = terminal_manager.list();
+    // The shared join: each terminal with its spawn name and its CONFIRMED
+    // open record. With no store managed, no terminal has a session id.
+    let store = app.try_state::<Arc<SessionLifecycleStore>>();
+    let joined = crate::terminal::layout::join_terminals(
+        terminal_manager.list(),
+        store.as_deref().map(Arc::as_ref),
+        |id| terminal_manager.get(id).and_then(|s| s.spawn_name()),
+    );
 
     // `{ terminal_id -> spawnName }` for runner-spawned sessions, so a
     // reconnecting webview that missed `terminal-spawn-name` still gets it.
-    let spawn_names_by_terminal: serde_json::Map<String, serde_json::Value> = terminals
+    let spawn_names_by_terminal: serde_json::Map<String, serde_json::Value> = joined
         .iter()
-        .filter_map(|info| {
-            terminal_manager
-                .get(&info.id)
-                .and_then(|s| s.spawn_name())
-                .map(|n| (info.id.clone(), serde_json::Value::String(n)))
+        .filter_map(|j| {
+            j.spawn_name
+                .clone()
+                .map(|n| (j.info.id.clone(), serde_json::Value::String(n)))
         })
         .collect();
 
-    let mut session_ids_by_terminal = serde_json::Map::new();
-    if let Some(store) = app.try_state::<Arc<SessionLifecycleStore>>() {
-        for info in &terminals {
-            if let Some(rec) = store.find_confirmed_open_by_terminal(&info.id) {
-                session_ids_by_terminal.insert(
-                    info.id.clone(),
+    let session_ids_by_terminal: serde_json::Map<String, serde_json::Value> = joined
+        .iter()
+        .filter_map(|j| {
+            j.session.as_ref().map(|rec| {
+                (
+                    j.info.id.clone(),
                     serde_json::json!({
                         "claudeSessionId": rec.claude_session_id,
                         "configDir": rec.config_dir,
                     }),
-                );
-            }
-        }
-    }
+                )
+            })
+        })
+        .collect();
 
+    let terminals: Vec<&crate::terminal::types::TerminalInfo> =
+        joined.iter().map(|j| &j.info).collect();
     Ok(CommandResponse {
         success: true,
         message: None,

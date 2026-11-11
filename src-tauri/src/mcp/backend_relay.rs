@@ -1811,6 +1811,18 @@ where
     info!("Backend relay writer: all lanes closed, writer task ending");
 }
 
+/// The name an instance launched without `QONTINUI_INSTANCE_NAME` reports.
+pub(crate) const UNNAMED_INSTANCE_NAME: &str = "primary";
+
+/// The instance name this runner reports for itself: the `runner_info` `name`
+/// it registers under on the relay socket, and `GET /terminal-layout`'s
+/// `runner.instanceName` (so a saved capture names the runner the web already
+/// lists). `QONTINUI_INSTANCE_NAME` when set (`crate::instance::instance_name`),
+/// else [`UNNAMED_INSTANCE_NAME`].
+pub(crate) fn reported_instance_name(instance_name: Option<String>) -> String {
+    instance_name.unwrap_or_else(|| UNNAMED_INSTANCE_NAME.to_string())
+}
+
 /// Send the initial `runner_info` payload. The backend uses this to upsert
 /// the `runners` row keyed by (user_id, name) and replies with `connected`.
 ///
@@ -1863,7 +1875,7 @@ where
     );
 
     let runner_info = build_runner_info(
-        instance_name.unwrap_or_else(|| "primary".to_string()),
+        reported_instance_name(instance_name),
         hostname,
         port,
         capabilities,
@@ -3673,6 +3685,7 @@ fn http_relay_error(request_id: &Value, status: u16, message: &str) -> Value {
 /// | `GET /state-explorer/{run_id}` | terminal stream, that run's tenant (else strictest), refuse |
 /// | `GET/PUT /settings/*`, `POST /settings/*` | none — settings |
 /// | `GET /analytics/*` | none — usage counters |
+/// | `GET /terminal-layout` | terminal stream, per record (the session row's terminal → its lifecycle record's `tenant_id`, [`crate::egress::terminal_session_tenant`]; the strictest bound tenant when it cannot be attributed), redact `title` (→ `null`, `titleWithheld: true`) — a terminal title is PTY-derived (OSC 0/2); ids, accounts, names, tab labels and finished markers pass. Matched in [`relay_content_route`], like the other per-record rows |
 ///
 /// A run id resolves through [`crate::egress::task_run_session_tenant`]; an
 /// id this runner did not register is judged by the strictest bound tenant.
@@ -3755,17 +3768,24 @@ fn egress_off_http_response(request_id: &Value, flow: crate::egress::Flow) -> Va
 /// - `GET /task-runs`, `/task-runs/running`, `/task-runs/{id}`: `TaskRun`
 ///   (`output_log` is the full accumulated output);
 /// - `GET /findings/task/{task_run_id}`: the run's findings;
-/// - `GET /hitl/pending`: deferred questions, each naming its run.
+/// - `GET /hitl/pending`: deferred questions, each naming its run;
+/// - `GET /terminal-layout`: one row per terminal, whose `title` is set by
+///   the program in the terminal (OSC 0/2 in its PTY output). A row is judged
+///   by its TERMINAL's session tenant, not a run's
+///   ([`crate::egress::terminal_session_tenant`]), and a withheld title reads
+///   `title: null, titleWithheld: true` — the field the wire type
+///   (`qontinui_types::terminal::TerminalLayoutSession`) declares for it.
 ///
 /// The streamed reads (`/output`, `/session-state`, `/events`,
 /// `/processes/{id}/output`) are refused outright by
 /// [`http_request_egress_refusal`]. The other allowed reads carry no
-/// per-run session content.
+/// per-session content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RelayContentRoute {
     TaskRuns,
     Findings,
     Hitl,
+    TerminalLayout,
 }
 
 impl RelayContentRoute {
@@ -3796,28 +3816,89 @@ impl RelayContentRoute {
                 "auto_decision_detail",
                 "reviewer_comment",
             ],
+            RelayContentRoute::TerminalLayout => &["title"],
         }
     }
 
-    /// The run a JSON object on this route is a record of, if it is one.
-    /// `path_run` is the run id the path names (`/findings/task/{id}`,
-    /// `/task-runs/{id}`).
-    /// `Some(run)` when the object is a record of this route — `run` being
-    /// its run id, or `None` when the record carries none (e.g. a question
-    /// with a NULL `task_run_id`), which is judged by the strictest bound
-    /// tenant rather than skipped. `None` = not a record.
-    fn record_run<'a>(
+    /// Withhold this route's content fields from `obj`, a record whose
+    /// session's tenant refuses terminal streaming. Returns whether the body
+    /// changed.
+    ///
+    /// The run routes blank each non-null content field (`output_log` to `""`,
+    /// which clients read as a string, the rest to `null`) and list them in
+    /// `egress_redacted`, so a client can tell a refusal from an empty run.
+    /// A layout row instead says so in its own typed field: `title` becomes
+    /// `null` and `titleWithheld` `true` — set whether or not the row had a
+    /// title, so the flag reads "the gate refused this row" and a reader
+    /// cannot learn from it which terminals had one.
+    fn withhold(self, obj: &mut serde_json::Map<String, Value>) -> bool {
+        if self == RelayContentRoute::TerminalLayout {
+            let mut changed = false;
+            for field in self.content_fields() {
+                if obj.get(*field).is_some_and(|v| !v.is_null()) {
+                    obj.insert((*field).to_string(), Value::Null);
+                    changed = true;
+                }
+            }
+            if obj.get("titleWithheld") != Some(&Value::Bool(true)) {
+                obj.insert("titleWithheld".to_string(), Value::Bool(true));
+                changed = true;
+            }
+            return changed;
+        }
+        let mut blanked = Vec::new();
+        for field in self.content_fields() {
+            if let Some(v) = obj.get_mut(*field) {
+                if v.is_null() {
+                    continue;
+                }
+                *v = if *field == "output_log" {
+                    Value::String(String::new())
+                } else {
+                    Value::Null
+                };
+                blanked.push(*field);
+            }
+        }
+        if blanked.is_empty() {
+            return false;
+        }
+        obj.insert("egress_redacted".to_string(), serde_json::json!(blanked));
+        true
+    }
+
+    /// The session scope a JSON object on this route is judged in, if the
+    /// object is a record of the route. `path_run` is the run id the path
+    /// names (`/findings/task/{id}`, `/task-runs/{id}`).
+    ///
+    /// `Some(scope)` when the object is a record: a run record in its run's
+    /// tenant ([`crate::egress::task_run_session_tenant`]), a layout row in
+    /// its terminal's ([`crate::egress::terminal_session_tenant`]). A record
+    /// that names no run or terminal (e.g. a question with a NULL
+    /// `task_run_id`) is [`crate::egress::SessionScope::Unresolved`] — judged
+    /// by the strictest bound tenant, never skipped. `None` = not a record.
+    fn record_scope(
         self,
-        obj: &'a serde_json::Map<String, Value>,
-        path_run: Option<&'a str>,
-    ) -> Option<Option<&'a str>> {
+        obj: &serde_json::Map<String, Value>,
+        path_run: Option<&str>,
+    ) -> Option<crate::egress::SessionScope> {
+        use crate::egress::{task_run_session_tenant, terminal_session_tenant, SessionScope};
         let field = |k: &str| obj.get(k).and_then(Value::as_str).filter(|v| !v.is_empty());
+        let by_run =
+            |run: Option<&str>| run.map_or(SessionScope::Unresolved, task_run_session_tenant);
         match self {
-            RelayContentRoute::TaskRuns => obj.contains_key("output_log").then(|| field("id")),
+            RelayContentRoute::TaskRuns => {
+                obj.contains_key("output_log").then(|| by_run(field("id")))
+            }
             RelayContentRoute::Findings => (obj.contains_key("signatureHash")
                 || obj.contains_key("taskRunId"))
-            .then(|| field("taskRunId").or(path_run)),
-            RelayContentRoute::Hitl => obj.contains_key("question").then(|| field("task_run_id")),
+            .then(|| by_run(field("taskRunId").or(path_run))),
+            RelayContentRoute::Hitl => obj
+                .contains_key("question")
+                .then(|| by_run(field("task_run_id"))),
+            RelayContentRoute::TerminalLayout => obj.contains_key("terminalId").then(|| {
+                field("terminalId").map_or(SessionScope::Unresolved, terminal_session_tenant)
+            }),
         }
     }
 }
@@ -3832,18 +3913,11 @@ fn relay_content_route(raw_path: &str) -> Option<(RelayContentRoute, Option<Stri
             Some((RelayContentRoute::Findings, Some(id.clone())))
         }
         [r, p] if r == "hitl" && p == "pending" => Some((RelayContentRoute::Hitl, None)),
+        [r] if r == "terminal-layout" => Some((RelayContentRoute::TerminalLayout, None)),
         _ => None,
     }
 }
 
-/// C2: blank the session content of every run record in an `http_request`
-/// response whose run's tenant has `egress_terminal_stream` off (a run whose
-/// tenant cannot be established is judged by the strictest bound tenant).
-/// Each blanked field becomes `""` (`output_log`, which clients read as a
-/// string) or `null`, and the record gains `egress_redacted: [fields]`, so a
-/// client can tell a refusal from an empty run. `None` = the body is left
-/// exactly as the local API produced it (not a content route, not JSON, or
-/// nothing to blank).
 /// What [`redact_relay_content`] decided for one response body.
 #[derive(Debug, PartialEq, Eq)]
 enum RelayContent {
@@ -3855,6 +3929,18 @@ enum RelayContent {
     Refuse,
 }
 
+/// C2: blank the session content of every record in an `http_request`
+/// response whose session's tenant has `egress_terminal_stream` off (a record
+/// whose tenant cannot be established is judged by the strictest bound
+/// tenant). On the run routes each blanked field becomes `""` (`output_log`,
+/// which clients read as a string) or `null`, and the record gains
+/// `egress_redacted: [fields]`, so a client can tell a refusal from an empty
+/// run; a `/terminal-layout` row reads `title: null, titleWithheld: true`
+/// instead ([`RelayContentRoute::withhold`]). [`RelayContent::Keep`] = the
+/// body is left exactly as the local API produced it (not a content route, or
+/// nothing to blank). A content route's body that is not JSON is kept only
+/// when even the strictest bound tenant permits, else
+/// [`RelayContent::Refuse`].
 fn redact_relay_content(raw_path: &str, body: &[u8]) -> RelayContent {
     let Some((route, path_run)) = relay_content_route(raw_path) else {
         return RelayContent::Keep;
@@ -3895,33 +3981,13 @@ fn redact_value(
             }
         }
         Value::Object(obj) => {
-            if let Some(run) = route.record_run(obj, path_run) {
-                let scope = run.map_or(
-                    crate::egress::SessionScope::Unresolved,
-                    crate::egress::task_run_session_tenant,
-                );
+            if let Some(scope) = route.record_scope(obj, path_run) {
                 if !crate::egress::permit_or_count_session(
                     crate::egress::Flow::TerminalStream,
                     scope,
-                ) {
-                    let mut blanked = Vec::new();
-                    for field in route.content_fields() {
-                        if let Some(v) = obj.get_mut(*field) {
-                            if v.is_null() {
-                                continue;
-                            }
-                            *v = if *field == "output_log" {
-                                Value::String(String::new())
-                            } else {
-                                Value::Null
-                            };
-                            blanked.push(*field);
-                        }
-                    }
-                    if !blanked.is_empty() {
-                        obj.insert("egress_redacted".to_string(), serde_json::json!(blanked));
-                        *changed = true;
-                    }
+                ) && route.withhold(obj)
+                {
+                    *changed = true;
                 }
             }
             for (_, v) in obj.iter_mut() {
@@ -7906,6 +7972,8 @@ mod tests {
             // qontinui-web: the console's UI Bridge dashboard (`relayReads.ts`).
             ("GET", "/ui-bridge/control/components"),
             ("POST", "/ui-bridge/control/page-health"),
+            // qontinui-web: the saved-session-lists capture.
+            ("GET", "/terminal-layout"),
             // qontinui-mobile in remote mode: its whole API surface rides
             // this arm, so a sample from across its domain clients.
             ("GET", "/status"),
@@ -11011,6 +11079,267 @@ mod egress_tests {
             "the loopback stub's own answer: {reply}"
         );
         assert!(counter.wait_for(1, Duration::from_secs(5)) >= 1);
+    }
+
+    // Plan 2026-11-08-save-per-tab-runner-session-lists-on-sessions-page-kept-14-days,
+    // Phase 1: qontinui-web's saved-session-lists capture relays
+    // `GET /terminal-layout`. Each test enters through the relay's own core,
+    // `relay_http_to_base` (the `http_request` arm, path verdict included),
+    // against a loopback stub serving a literal wire body that every answer is
+    // deserialized back through the qontinui-schemas `TerminalLayout` type, so
+    // the gate is pinned to the wire type's field names. The title of each
+    // session row is judged by that row's terminal's session tenant.
+
+    /// The tenant the layout tests refuse or permit terminal streaming for.
+    const LAYOUT_TENANT: u128 = 0x7e7a_0020;
+
+    /// A literal `/terminal-layout` wire body in the qontinui-schemas
+    /// `TerminalLayout` shape: a confirmed, finished session (`t-claude`), a
+    /// plain shell with no confirmed record (`t-shell`) and an untitled
+    /// terminal (`t-untitled`), on two registered tabs. Every title starts
+    /// `SECRET`. It is written out rather than produced by
+    /// `terminal::layout::build_layout`, so these tests enter ONLY through the
+    /// relay (`relay_http_to_base`) and never on the builder's producer side;
+    /// `terminal::layout::tests` pin the builder, and `relayed_layout`
+    /// deserializes every answer back through the wire type.
+    fn layout_body() -> String {
+        let no_session = |terminal_id: &str, title: Option<&str>| {
+            serde_json::json!({
+                "terminalId": terminal_id,
+                "title": title,
+                "titleWithheld": false,
+                "isAlive": true,
+                "spawnName": null,
+                "claudeSessionId": null,
+                "accountLabel": null,
+                "sessionName": null,
+                "zoneIndex": null,
+                "finished": null,
+                "finishedAt": null,
+                "finishReason": null,
+            })
+        };
+        serde_json::json!({
+            "runner": {
+                "instanceName": UNNAMED_INSTANCE_NAME,
+                "port": 1,
+                "buildId": "build-1",
+                "deviceId": "device-1",
+            },
+            "labelsRegistered": true,
+            "capturedAt": "2026-11-08T09:00:00.000Z",
+            "pages": [
+                {
+                    "pageId": "p-work",
+                    "label": "Work",
+                    "order": 0,
+                    "sessions": [{
+                        "terminalId": "t-claude",
+                        "title": "SECRET claude title",
+                        "titleWithheld": false,
+                        "isAlive": true,
+                        "spawnName": "1234 fix the relay",
+                        "claudeSessionId": "11111111-2222-3333-4444-555555555555",
+                        "accountLabel": "hotmail",
+                        "sessionName": "1234 fix the relay",
+                        "zoneIndex": 2,
+                        "finished": true,
+                        "finishedAt": "2026-11-08T09:00:00.000Z",
+                        "finishReason": "unattended: all landed",
+                    }],
+                },
+                {
+                    "pageId": "p-shells",
+                    "label": "Shells",
+                    "order": 1,
+                    "sessions": [
+                        no_session("t-shell", Some("SECRET shell title")),
+                        no_session("t-untitled", None),
+                    ],
+                },
+            ],
+        })
+        .to_string()
+    }
+
+    /// Relay one `GET /terminal-layout` to `server` and decode what the
+    /// relay answered.
+    async fn relayed_layout(
+        server: &RecordingServer,
+    ) -> (Vec<u8>, qontinui_types::terminal::TerminalLayout) {
+        relayed_layout_at(server, "/terminal-layout").await
+    }
+
+    /// [`relayed_layout`] with the frame's path spelled as `path`.
+    async fn relayed_layout_at(
+        server: &RecordingServer,
+        path: &str,
+    ) -> (Vec<u8>, qontinui_types::terminal::TerminalLayout) {
+        let reply = relay_http_to_base(&server.base, &dashboard_frame("GET", path)).await;
+        assert_eq!(
+            reply["status"], 200,
+            "the layout is never refused outright: {reply}"
+        );
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(reply["body_b64"].as_str().expect("a body"))
+            .expect("valid base64");
+        let layout = serde_json::from_slice(&bytes).expect("the relayed body is a TerminalLayout");
+        (bytes, layout)
+    }
+
+    fn layout_row<'a>(
+        layout: &'a qontinui_types::terminal::TerminalLayout,
+        terminal_id: &str,
+    ) -> &'a qontinui_types::terminal::TerminalLayoutSession {
+        layout
+            .pages
+            .iter()
+            .flat_map(|p| p.sessions.iter())
+            .find(|s| s.terminal_id == terminal_id)
+            .unwrap_or_else(|| panic!("{terminal_id} is missing from the relayed layout"))
+    }
+
+    /// **The Phase 1 arming proof.** A relayed `GET /terminal-layout` is
+    /// carried (no 403: it is on `RELAY_ALLOWED`) and its titles follow each
+    /// session's tenant BOTH ways:
+    ///
+    /// - streaming OFF for `t-claude`'s tenant: its title is `null` with
+    ///   `titleWithheld: true` — and so is the untitled terminal's flag on the
+    ///   same tenant — while its id, account, name, zone, finished marker and
+    ///   the tab labels all pass, and the device-default shell keeps its title;
+    /// - the same tenant flipped ON: nothing is withheld and the body is
+    ///   forwarded byte for byte as the local API produced it.
+    ///
+    /// Fails if the route leaves `RELAY_ALLOWED` (a 403), joins the outright
+    /// refusals (a 409), drops out of `relay_content_route` (the title passes
+    /// while off), or is gated per response instead of per row.
+    #[tokio::test]
+    async fn a_relayed_terminal_layout_withholds_each_title_by_its_sessions_tenant_both_ways() {
+        use crate::egress::test_support::{fake_session_tenant, pin_for};
+        use crate::egress::SessionScope;
+        let tenant = uuid::Uuid::from_u128(LAYOUT_TENANT);
+        let _on = pin(Flow::TerminalStream, Level::On);
+        let _claude = fake_session_tenant("t-claude", SessionScope::Tenant(tenant));
+        let _untitled = fake_session_tenant("t-untitled", SessionScope::Tenant(tenant));
+        let _shell = fake_session_tenant("t-shell", SessionScope::DeviceDefault);
+        let body = layout_body();
+        let server = RecordingServer::start(body.clone());
+
+        // Streaming OFF for the tenant.
+        let refuse = pin_for(Flow::TerminalStream, tenant, Level::Off);
+        let (bytes, layout) = relayed_layout(&server).await;
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(!text.contains("SECRET claude title"), "{text}");
+        let claude = layout_row(&layout, "t-claude");
+        assert_eq!(claude.title, None);
+        assert!(claude.title_withheld);
+        assert_eq!(
+            claude.claude_session_id.as_deref(),
+            Some("11111111-2222-3333-4444-555555555555")
+        );
+        assert_eq!(claude.account_label.as_deref(), Some("hotmail"));
+        assert_eq!(claude.session_name.as_deref(), Some("1234 fix the relay"));
+        assert_eq!(claude.spawn_name.as_deref(), Some("1234 fix the relay"));
+        assert_eq!(claude.zone_index, Some(2));
+        assert_eq!(claude.finished, Some(true));
+        assert_eq!(
+            claude.finished_at.as_deref(),
+            Some("2026-11-08T09:00:00.000Z")
+        );
+        assert_eq!(
+            claude.finish_reason.as_deref(),
+            Some("unattended: all landed")
+        );
+        let untitled = layout_row(&layout, "t-untitled");
+        assert_eq!(untitled.title, None);
+        assert!(
+            untitled.title_withheld,
+            "the flag reads 'the gate refused this row', title or not"
+        );
+        let shell = layout_row(&layout, "t-shell");
+        assert_eq!(shell.title.as_deref(), Some("SECRET shell title"));
+        assert!(
+            !shell.title_withheld,
+            "another tenant's row keeps its title"
+        );
+        let labels: Vec<Option<&str>> = layout.pages.iter().map(|p| p.label.as_deref()).collect();
+        assert_eq!(labels, vec![Some("Work"), Some("Shells")]);
+        assert!(layout.labels_registered);
+        assert_eq!(layout.runner.device_id.as_deref(), Some("device-1"));
+
+        // Every spelling the allow-list admits is redacted the same way: the
+        // gate matches the normalised path, as the allow-list does.
+        for spelling in [
+            "/TERMINAL-LAYOUT",
+            "/terminal-layout?x=1",
+            "\\terminal-layout",
+        ] {
+            let (bytes, layout) = relayed_layout_at(&server, spelling).await;
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(!text.contains("SECRET claude title"), "{spelling}: {text}");
+            let claude = layout_row(&layout, "t-claude");
+            assert_eq!(claude.title, None, "{spelling}");
+            assert!(claude.title_withheld, "{spelling}");
+            assert_eq!(
+                layout_row(&layout, "t-shell").title.as_deref(),
+                Some("SECRET shell title"),
+                "{spelling}"
+            );
+        }
+
+        // The same tenant flipped ON.
+        drop(refuse);
+        let _permit = pin_for(Flow::TerminalStream, tenant, Level::On);
+        let (bytes, layout) = relayed_layout(&server).await;
+        assert_eq!(
+            bytes,
+            body.as_bytes(),
+            "nothing withheld: forwarded as the local API produced it"
+        );
+        let claude = layout_row(&layout, "t-claude");
+        assert_eq!(claude.title.as_deref(), Some("SECRET claude title"));
+        assert!(!claude.title_withheld);
+
+        let seen = server.seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 5, "every read reached the local API: {seen:?}");
+        for request in &seen {
+            // `\` reaches the stub as a path separator, so a backslash
+            // spelling may arrive as `//terminal-layout`; the method and the
+            // route are what this pins.
+            let line = request.lines().next().unwrap_or("").to_ascii_lowercase();
+            assert!(
+                line.starts_with("get /")
+                    && line.contains("terminal-layout")
+                    && line.ends_with(" http/1.1"),
+                "forwarded as the read it is: {request}"
+            );
+        }
+    }
+
+    /// A row whose terminal the runner cannot attribute to a session tenant is
+    /// judged by the strictest bound tenant, never skipped; a row positively
+    /// in the device-default scope is judged there.
+    #[tokio::test]
+    async fn an_unattributable_layout_row_takes_the_strictest_bound_tenant() {
+        use crate::egress::test_support::{fake_bound_tenants, fake_session_tenant, pin_for};
+        use crate::egress::SessionScope;
+        let tenant = uuid::Uuid::from_u128(LAYOUT_TENANT);
+        let _on = pin(Flow::TerminalStream, Level::On);
+        let _off = pin_for(Flow::TerminalStream, tenant, Level::Off);
+        let _bound = fake_bound_tenants(vec![tenant]);
+        // `t-shell` and `t-untitled` are faked to nothing: unresolved.
+        let _claude = fake_session_tenant("t-claude", SessionScope::DeviceDefault);
+        let server = RecordingServer::start(layout_body());
+
+        let (bytes, layout) = relayed_layout(&server).await;
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(!text.contains("SECRET shell title"), "{text}");
+        let shell = layout_row(&layout, "t-shell");
+        assert_eq!(shell.title, None);
+        assert!(shell.title_withheld);
+        let claude = layout_row(&layout, "t-claude");
+        assert_eq!(claude.title.as_deref(), Some("SECRET claude title"));
+        assert!(!claude.title_withheld);
     }
 
     /// Re-review m5: a recognised record carrying NO run id is unattributable

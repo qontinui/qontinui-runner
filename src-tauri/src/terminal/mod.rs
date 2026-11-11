@@ -27,6 +27,7 @@ pub mod grid;
 pub mod holder_boot_sweep;
 pub mod holder_census;
 pub mod interceptor;
+pub mod layout; // The terminal↔confirmed-session join + registered tab labels behind terminal_list, GET /terminal-pages and GET /terminal-layout
 pub mod manager;
 pub mod operator_touch_watch; // Trigger 1 (idle_at_prompt, riding the context_watcher grid-scan tick) + the Notification-hook landing pad for triggers 2/3 (permission_prompt) (plan 2026-08-27-operator-touch-observation-runner-emitter, Phase B2)
 pub mod output_scan;
