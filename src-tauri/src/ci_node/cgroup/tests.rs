@@ -306,6 +306,7 @@ fn a_dispatch_whose_steps_cannot_be_placed_runs_uncontained_until_it_drops() {
         .unwrap();
     let step = || {
         rt.block_on(async {
+            // console-ok: test-only file (#![cfg(test)]), unix cgroup fixture; never built into a release binary
             let mut cmd = tokio::process::Command::new("true");
             cmd.stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
@@ -355,6 +356,7 @@ fn a_dispatch_whose_steps_are_placed_makes_no_uncontained_run() {
         .unwrap();
     for _ in 0..2 {
         rt.block_on(async {
+            // console-ok: test-only file (#![cfg(test)]), unix cgroup fixture; never built into a release binary
             let mut cmd = tokio::process::Command::new("true");
             cmd.stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
@@ -394,6 +396,7 @@ async fn a_dispatch_exceeding_memory_max_is_killed_and_fails() {
     // Gated start: the hog (`tail -n 1 /dev/zero` buffers an endless
     // "line") only begins after placement is verified, so a placement
     // failure can never leave an unbounded hog running on the host.
+    // console-ok: test-only file (#![cfg(test)]), unix cgroup fixture; never built into a release binary
     let mut cmd = tokio::process::Command::new("sh");
     cmd.args(["-c", "read x; exec tail -n 1 /dev/zero"])
         .stdin(std::process::Stdio::piped())
