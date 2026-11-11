@@ -1158,13 +1158,15 @@ impl ProviderRows {
     /// Every `(terminal id, valid session id, config dir the row was read
     /// from)`, in no particular order.
     pub fn valid(&self) -> impl Iterator<Item = (&str, &str, &Path)> {
-        self.by_terminal.iter().filter_map(|(t, e)| match &e.verdict {
-            ProviderRowValidity::Valid {
-                session_id,
-                config_dir,
-            } => Some((t.as_str(), session_id.as_str(), config_dir.as_path())),
-            _ => None,
-        })
+        self.by_terminal
+            .iter()
+            .filter_map(|(t, e)| match &e.verdict {
+                ProviderRowValidity::Valid {
+                    session_id,
+                    config_dir,
+                } => Some((t.as_str(), session_id.as_str(), config_dir.as_path())),
+                _ => None,
+            })
     }
 
     /// Every `(terminal id, anchor, verdict)` read this tick.
@@ -1922,11 +1924,7 @@ mod tests {
         let valid: Vec<_> = rows.valid().collect();
         assert_eq!(
             valid,
-            vec![(
-                "term-1",
-                "44348633-0000-4000-8000-000000000002",
-                d.path()
-            )]
+            vec![("term-1", "44348633-0000-4000-8000-000000000002", d.path())]
         );
         let (_d, rows) = rows_fixture(1_790_000_000, 1_790_000_000 - 7200);
         assert_eq!(rows.valid_id("term-1"), None);
