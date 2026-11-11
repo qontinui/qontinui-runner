@@ -20,7 +20,7 @@ tool is read-only, fleet-wide, and needs **no device-scoped JWT** — it works o
 the standard session identity (it mirrors `coord_query_ci_state`'s auth-agnostic
 handler).
 
-Two shapes:
+Three shapes:
 
 - **`/pr-status`** (no args) → `coord_pr_status(mine=true)` — the PRs authored by
   *this* session (resolved via the PR↔session worktree mapping). Renders one card
@@ -29,6 +29,13 @@ Two shapes:
   specific PR's card, including **post-land** PRs (a merged PR still answers, with
   `merged_at` + `merge_commit`; if the row aged out after branch deletion the card
   is reconstructed from `pr_events` and flagged `reconstructed_from_events`).
+- **`/pr-status <owner/repo> <head-branch>`** → `coord_pr_status(repo, head_branch)`
+  — the coord equivalent of `gh pr list --head <branch>`. Answers
+  `{cards, unservable, note}`: one card per PR coord holds on that branch (open
+  first, then newest), `unservable` for a PR it lists but cannot build a card
+  for, and `cards: []` plus a `note` when it holds none. That empty answer is a
+  statement about coord's twin, not GitHub: a PR opened moments ago may not be
+  ingested yet.
 
 ## Instructions
 
@@ -36,12 +43,17 @@ Two shapes:
    - No args → call the MCP tool `coord_pr_status` with `{ "mine": true }`.
    - `<owner/repo> <number>` → call `coord_pr_status` with
      `{ "repo": "<owner/repo>", "number": <n> }`.
+   - `<owner/repo> <anything that is not a positive integer>` → call
+     `coord_pr_status` with `{ "repo": "<owner/repo>", "head_branch": "<it>" }`
+     and render each entry of `cards` as below; list `unservable` and `note`
+     verbatim after them.
 2. **Call the tool.** `coord_pr_status` is in the read-only tool allow-set, so a
    normal session can call it directly. If it comes back
    unknown/method-not-found (per-agent allow-set masking), fall back to the HTTP
    route via `pr-status.sh`, which sits next to this SKILL.md — run it as
    `bash <path-to-this-skill-dir>/pr-status.sh --mine` (or
-   `--repo <owner/repo> --number <n>`), never through a `qontinui-claude-config`
+   `--repo <owner/repo> --number <n>`, or
+   `--repo <owner/repo> --head-branch <branch>`), never through a `qontinui-claude-config`
    checkout, which a provisioned copy of this skill does not have.
    It mirrors the `/gate` transport
    cascade: first a sweep of the runner-written `.mcp.json` proxy doors
