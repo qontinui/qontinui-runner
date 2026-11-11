@@ -8,7 +8,8 @@
 //!   * the element's own accepted verbs,
 //!   * a "did you mean" — the first synonym candidate the element ACTUALLY
 //!     accepts (so a suggestion is never a verb the element would also
-//!     reject), and
+//!     reject), with the keyboard verbs' candidates ordered by element kind
+//!     (`press` → `sendKeys` on text entry, `click` elsewhere), and
 //!   * a params hint for the suggested verb (`sendKeys` → `{"keys": ["Enter"]}`,
 //!     `type` → `{"text": "…"}`), because the right verb with the wrong params
 //!     shape is the next 400.
@@ -39,7 +40,9 @@ fn fold_verb(verb: &str) -> String {
 
 /// Requested verb → ordered candidate verbs. Lookup goes through [`fold_verb`],
 /// so each key is written once, in its folded form. The suggestion is the first
-/// candidate the element accepts.
+/// candidate the element accepts, after the keyboard verbs' candidates are
+/// ordered for the element ([`order_for_element`]); this literal order is the
+/// text-entry one.
 pub(crate) const ACTION_VERB_SYNONYMS: &[(&str, &[&str])] = &[
     // Key presses. `press` keeps its native meaning wherever the element
     // advertises `press` itself: an exact accepted match is never corrected.
@@ -87,10 +90,20 @@ pub(crate) const ACTION_VERB_SYNONYMS: &[(&str, &[&str])] = &[
 ///   1. `requested` is itself accepted (exact) → `None`; it is never corrected.
 ///   2. A spelling-only difference (`sendkeys`, `send_keys` or ` sendKeys ` →
 ///      `sendKeys`).
-///   3. The first [`ACTION_VERB_SYNONYMS`] candidate present in `accepted`.
+///   3. The first [`ACTION_VERB_SYNONYMS`] candidate present in `accepted`,
+///      with the keyboard verbs' candidates ordered for the element
+///      ([`order_for_element`]).
+///
+/// `keyboard_entry` says the element is typed into with keys although it does
+/// not accept `type`: an ARIA textbox or a contenteditable (see
+/// [`is_typed_with_keys`]). A key press there is keyboard input too.
 ///
 /// Returns `None` when nothing the element accepts fits.
-pub(crate) fn suggest_action<S: AsRef<str>>(requested: &str, accepted: &[S]) -> Option<String> {
+pub(crate) fn suggest_action<S: AsRef<str>>(
+    requested: &str,
+    accepted: &[S],
+    keyboard_entry: bool,
+) -> Option<String> {
     if requested.trim().is_empty() || accepted.iter().any(|a| a.as_ref() == requested) {
         return None;
     }
@@ -105,10 +118,65 @@ pub(crate) fn suggest_action<S: AsRef<str>>(requested: &str, accepted: &[S]) -> 
     let (_, candidates) = ACTION_VERB_SYNONYMS
         .iter()
         .find(|(from, _)| *from == folded)?;
-    candidates
-        .iter()
-        .find(|c| accepted.iter().any(|a| a.as_ref() == **c))
-        .map(|c| (*c).to_string())
+    // A candidate matches through the fold and comes back spelled as the
+    // element spells it, as the SDK's `suggestAction` does.
+    order_for_element(candidates, accepted, keyboard_entry)
+        .into_iter()
+        .find_map(|c| {
+            let wanted = fold_verb(c);
+            accepted
+                .iter()
+                .map(AsRef::as_ref)
+                .find(|a| fold_verb(a) == wanted)
+        })
+        .map(str::to_string)
+}
+
+/// The SDK element kind that is typed into with keys although it takes no
+/// `type` verb: an ARIA textbox or a contenteditable (`textbox`). Mirrors the
+/// SDK's `isTypedWithKeys` (`packages/ui-bridge/src/core/element-kind.ts`).
+pub(crate) fn is_typed_with_keys(element_type: Option<&str>) -> bool {
+    element_type == Some("textbox")
+}
+
+/// [`suggest_action`]'s `keyboard_entry` for an element as the runner's
+/// element probe holds it: the SDK serializes the element's kind as its
+/// top-level `type` (`serializeRegisteredElement`; a discover row carries the
+/// same field). `kind` is a different field (`interactive` / `content`). No
+/// probe → `false`.
+pub(crate) fn keyboard_entry_of(element: Option<&Value>) -> bool {
+    is_typed_with_keys(
+        element
+            .and_then(|elem| elem.get("type"))
+            .and_then(Value::as_str),
+    )
+}
+
+/// The keyboard verbs' candidates (`press` → `sendKeys`, `click`), ordered by
+/// what the element is (D4 of plan
+/// `2026-11-09-an-elements-advertised-verbs-depend-on-which-path-found-it`).
+/// The SDK advertises `sendKeys` on every web element, so the table's fixed
+/// order would answer `press` on a button with `sendKeys`. An element that
+/// takes text entry (it accepts `type`, or `keyboard_entry`) keeps `sendKeys`
+/// first; any other gets `click` first. The table literal is unchanged: only
+/// the suggestion reorders, as in the SDK's `orderForElement`.
+fn order_for_element<'a, S: AsRef<str>>(
+    candidates: &[&'a str],
+    accepted: &[S],
+    keyboard_entry: bool,
+) -> Vec<&'a str> {
+    let mut ordered = candidates.to_vec();
+    if keyboard_entry || accepted.iter().any(|a| fold_verb(a.as_ref()) == "type") {
+        return ordered;
+    }
+    let keys = ordered.iter().position(|c| *c == "sendKeys");
+    let click = ordered.iter().position(|c| *c == "click");
+    if let (Some(keys), Some(click)) = (keys, click) {
+        if keys < click {
+            ordered.swap(keys, click);
+        }
+    }
+    ordered
 }
 
 /// Absent, `null`, or an empty string, array or object: the caller named nothing.
@@ -249,11 +317,13 @@ fn send_keys_hint(params: Option<&Value>) -> Option<Value> {
 
 /// A params literal for `verb`, or `None` when the verb takes none worth naming
 /// or, for `sendKeys`, when [`send_keys_hint`] cannot restate the request.
+/// `verb` is read through [`fold_verb`], because a suggestion comes back spelled
+/// as the element spells it.
 pub(crate) fn params_hint(verb: &str, requested_params: Option<&Value>) -> Option<Value> {
-    match verb {
-        "sendKeys" => send_keys_hint(requested_params),
+    match fold_verb(verb).as_str() {
+        "sendkeys" => send_keys_hint(requested_params),
         "type" => Some(json!({ "text": "…" })),
-        "select" | "setValue" => Some(json!({ "value": "…" })),
+        "select" | "setvalue" => Some(json!({ "value": "…" })),
         _ => None,
     }
 }
@@ -267,12 +337,14 @@ pub(crate) struct ActionSuggestion {
 
 impl ActionSuggestion {
     /// Resolve the suggestion for `requested` against `accepted`.
+    /// `keyboard_entry` is [`suggest_action`]'s.
     pub(crate) fn resolve<S: AsRef<str>>(
         requested: &str,
         accepted: &[S],
         requested_params: Option<&Value>,
+        keyboard_entry: bool,
     ) -> Option<Self> {
-        let verb = suggest_action(requested, accepted)?;
+        let verb = suggest_action(requested, accepted, keyboard_entry)?;
         let params_hint = params_hint(&verb, requested_params);
         Some(Self { verb, params_hint })
     }
@@ -306,7 +378,7 @@ impl ActionSuggestion {
 /// in the accepted list the error names. `None` advertised list (probe failed
 /// or the element carries no action fields) → never rejects: a rejection is not
 /// manufactured from missing metadata. An explicit empty list is metadata, and
-/// rejects.
+/// rejects. `keyboard_entry` is [`suggest_action`]'s.
 pub(crate) fn deferred_unknown_action_error(
     requested: &str,
     element_id: &str,
@@ -314,6 +386,7 @@ pub(crate) fn deferred_unknown_action_error(
     action_is_registered_custom: bool,
     element_supported_actions: Option<&[String]>,
     requested_params: Option<&Value>,
+    keyboard_entry: bool,
 ) -> Option<UiBridgeError> {
     if action_is_builtin || action_is_registered_custom {
         return None;
@@ -327,19 +400,23 @@ pub(crate) fn deferred_unknown_action_error(
         element_id,
         accepted,
         requested_params,
+        keyboard_entry,
     ))
 }
 
 /// The pre-IPC `ACTION_NOT_SUPPORTED` body: a known verb the element does not
 /// advertise. Carries the element's list plus the same `didYouMean` /
-/// `paramsHint` the unknown-verb gate gives.
+/// `paramsHint` the unknown-verb gate gives. `keyboard_entry` is
+/// [`suggest_action`]'s.
 pub(crate) fn action_not_supported_error(
     requested: &str,
     element_id: &str,
     supported: &[String],
     requested_params: Option<&Value>,
+    keyboard_entry: bool,
 ) -> UiBridgeError {
-    let suggestion = ActionSuggestion::resolve(requested, supported, requested_params);
+    let suggestion =
+        ActionSuggestion::resolve(requested, supported, requested_params, keyboard_entry);
     let mut message = format!(
         "Action '{}' is not supported by element '{}'. Element advertises: {:?}.",
         requested, element_id, supported
@@ -444,7 +521,7 @@ mod tests {
     fn press_suggests_send_keys_when_accepted() {
         let accepted = list(TERMINAL_INPUT_ACTIONS);
         assert_eq!(
-            suggest_action("press", &accepted).as_deref(),
+            suggest_action("press", &accepted, false).as_deref(),
             Some("sendKeys")
         );
     }
@@ -452,72 +529,179 @@ mod tests {
     #[test]
     fn press_suggests_click_when_only_click_accepted() {
         let accepted = list(&["click", "focus"]);
-        assert_eq!(suggest_action("press", &accepted).as_deref(), Some("click"));
+        assert_eq!(
+            suggest_action("press", &accepted, false).as_deref(),
+            Some("click")
+        );
     }
 
     #[test]
-    fn keypress_suggests_send_keys() {
-        let accepted = list(&["click", "sendKeys"]);
+    fn keypress_suggests_send_keys_on_text_entry() {
+        let accepted = list(&["click", "type", "sendKeys"]);
+        for verb in ["keypress", "keyPress", "keyDown"] {
+            assert_eq!(
+                suggest_action(verb, &accepted, false).as_deref(),
+                Some("sendKeys"),
+                "{verb}"
+            );
+        }
+    }
+
+    /// D4 (plan `2026-11-09-an-elements-advertised-verbs-depend-on-which-path-found-it`):
+    /// the SDK advertises `sendKeys` on every web element, so the keyboard
+    /// verbs' candidates are ordered by element. A text-entry element (it
+    /// accepts `type`) keeps `sendKeys` first, and any other puts `click` first.
+    /// The table literal is unchanged. These are the SDK's literals
+    /// (`packages/ui-bridge/src/control/actionVocabulary.test.ts`).
+    #[test]
+    fn keyboard_candidates_are_ordered_by_element() {
+        let button_with_keys = list(&["click", "hoverClick", "sendKeys", "focus", "blur"]);
+        let input_with_click = list(&["click", "type", "sendKeys", "clear", "focus"]);
+        let suggest = |verb: &str, accepted: &[String]| suggest_action(verb, accepted, false);
         assert_eq!(
-            suggest_action("keypress", &accepted).as_deref(),
+            suggest("press", &button_with_keys).as_deref(),
+            Some("click")
+        );
+        assert_eq!(
+            suggest("press", &list(&["sendKeys", "click"])).as_deref(),
+            Some("click")
+        );
+        assert_eq!(
+            suggest("keyDown", &button_with_keys).as_deref(),
+            Some("click")
+        );
+        assert_eq!(suggest("key", &button_with_keys).as_deref(), Some("click"));
+        assert_eq!(
+            suggest("press", &input_with_click).as_deref(),
             Some("sendKeys")
         );
         assert_eq!(
-            suggest_action("keyPress", &accepted).as_deref(),
+            suggest("keypress", &input_with_click).as_deref(),
+            Some("sendKeys")
+        );
+        // `type` is read through the fold, like the SDK's.
+        assert_eq!(
+            suggest("PRESS", &list(&["TYPE", "sendKeys", "click"])).as_deref(),
+            Some("sendKeys")
+        );
+        // With only one of the two accepted, that one, whatever the element.
+        assert_eq!(
+            suggest("press", &list(&["sendKeys", "focus"])).as_deref(),
             Some("sendKeys")
         );
         assert_eq!(
-            suggest_action("keyDown", &accepted).as_deref(),
+            suggest("press", &list(&["click", "type"])).as_deref(),
+            Some("click")
+        );
+        // Other candidate lists are untouched by the reorder.
+        assert_eq!(
+            suggest("tap", &list(&["press", "click"])).as_deref(),
+            Some("click")
+        );
+    }
+
+    /// A text box typed with keys (an ARIA textbox, a contenteditable) accepts
+    /// no `type`, so only its kind says what it is: `keyboard_entry`.
+    #[test]
+    fn keyboard_entry_keeps_send_keys_first_on_a_text_box() {
+        let text_box = list(&["click", "hoverClick", "sendKeys", "focus", "blur"]);
+        assert_eq!(
+            suggest_action("press", &text_box, false).as_deref(),
+            Some("click")
+        );
+        assert_eq!(
+            suggest_action("press", &text_box, true).as_deref(),
             Some("sendKeys")
         );
+        assert_eq!(
+            suggest_action("keyDown", &text_box, true).as_deref(),
+            Some("sendKeys")
+        );
+        assert_eq!(
+            suggest_action("press", &list(&["click", "focus"]), true).as_deref(),
+            Some("click")
+        );
+        assert!(is_typed_with_keys(Some("textbox")));
+        assert!(!is_typed_with_keys(Some("input")));
+        assert!(!is_typed_with_keys(Some("generic")));
+        assert!(!is_typed_with_keys(None));
+    }
+
+    /// Gate level: the unknown-verb 400 for `press` on a button the SDK
+    /// advertises `sendKeys` on names `click`, and on a text box `sendKeys`.
+    #[test]
+    fn press_on_a_button_suggests_click_at_the_gate() {
+        let button = list(&["click", "hoverClick", "doubleClick", "sendKeys", "focus"]);
+        let did_you_mean = |keyboard_entry: bool| {
+            deferred_unknown_action_error(
+                "press",
+                "btn",
+                false,
+                false,
+                Some(&button),
+                None,
+                keyboard_entry,
+            )
+            .expect("press is not advertised, so it is rejected")
+            .context
+            .expect("context")["didYouMean"]
+                .clone()
+        };
+        assert_eq!(did_you_mean(false), json!("click"));
+        assert_eq!(did_you_mean(true), json!("sendKeys"));
+        let err = action_not_supported_error("keydown", "btn", &button, None, false);
+        assert_eq!(err.context.expect("context")["didYouMean"], json!("click"));
     }
 
     #[test]
     fn no_suggestion_when_no_candidate_is_accepted() {
         let accepted = list(&["focus", "blur"]);
-        assert_eq!(suggest_action("press", &accepted), None);
-        assert_eq!(suggest_action("slap", &accepted), None);
-        assert_eq!(suggest_action("rightclick", &accepted), None);
+        assert_eq!(suggest_action("press", &accepted, false), None);
+        assert_eq!(suggest_action("slap", &accepted, false), None);
+        assert_eq!(suggest_action("rightclick", &accepted, false), None);
     }
 
     #[test]
     fn case_only_fix() {
         let accepted = list(TERMINAL_INPUT_ACTIONS);
         assert_eq!(
-            suggest_action("sendkeys", &accepted).as_deref(),
+            suggest_action("sendkeys", &accepted, false).as_deref(),
             Some("sendKeys")
         );
         assert_eq!(
-            suggest_action("SCROLLINTOVIEW", &accepted).as_deref(),
+            suggest_action("SCROLLINTOVIEW", &accepted, false).as_deref(),
             Some("scrollIntoView")
         );
         // A case-only fix wins over the synonym table: `Click` on an element
         // accepting both `click` and `press` means `click`.
         let both = list(&["click", "press"]);
-        assert_eq!(suggest_action("Click", &both).as_deref(), Some("click"));
+        assert_eq!(
+            suggest_action("Click", &both, false).as_deref(),
+            Some("click")
+        );
     }
 
     #[test]
     fn separator_only_fix() {
         let accepted = list(TERMINAL_INPUT_ACTIONS);
         assert_eq!(
-            suggest_action("send_keys", &accepted).as_deref(),
+            suggest_action("send_keys", &accepted, false).as_deref(),
             Some("sendKeys")
         );
         assert_eq!(
-            suggest_action("send-keys", &accepted).as_deref(),
+            suggest_action("send-keys", &accepted, false).as_deref(),
             Some("sendKeys")
         );
         assert_eq!(
-            suggest_action("scroll_into_view", &accepted).as_deref(),
+            suggest_action("scroll_into_view", &accepted, false).as_deref(),
             Some("scrollIntoView")
         );
         assert_eq!(
-            suggest_action("double_click", &list(&["doubleClick"])).as_deref(),
+            suggest_action("double_click", &list(&["doubleClick"]), false).as_deref(),
             Some("doubleClick")
         );
         assert_eq!(
-            suggest_action("right-click", &list(&["rightClick"])).as_deref(),
+            suggest_action("right-click", &list(&["rightClick"]), false).as_deref(),
             Some("rightClick")
         );
     }
@@ -527,21 +711,21 @@ mod tests {
         let accepted = list(TERMINAL_INPUT_ACTIONS);
         for verb in ["key_press", "press_key", "key-down"] {
             assert_eq!(
-                suggest_action(verb, &accepted).as_deref(),
+                suggest_action(verb, &accepted, false).as_deref(),
                 Some("sendKeys"),
                 "{verb}"
             );
         }
         assert_eq!(
-            suggest_action("type_text", &accepted).as_deref(),
+            suggest_action("type_text", &accepted, false).as_deref(),
             Some("type")
         );
         assert_eq!(
-            suggest_action("context_menu", &list(&["rightClick"])).as_deref(),
+            suggest_action("context_menu", &list(&["rightClick"]), false).as_deref(),
             Some("rightClick")
         );
         assert_eq!(
-            suggest_action("scroll_to", &accepted).as_deref(),
+            suggest_action("scroll_to", &accepted, false).as_deref(),
             Some("scrollIntoView")
         );
     }
@@ -549,15 +733,15 @@ mod tests {
     #[test]
     fn builtin_aliases_suggest_the_canonical_verb() {
         assert_eq!(
-            suggest_action("double", &list(&["doubleClick"])).as_deref(),
+            suggest_action("double", &list(&["doubleClick"]), false).as_deref(),
             Some("doubleClick")
         );
         assert_eq!(
-            suggest_action("right", &list(&["rightClick"])).as_deref(),
+            suggest_action("right", &list(&["rightClick"]), false).as_deref(),
             Some("rightClick")
         );
         assert_eq!(
-            suggest_action("middle", &list(&["middleClick"])).as_deref(),
+            suggest_action("middle", &list(&["middleClick"]), false).as_deref(),
             Some("middleClick")
         );
     }
@@ -567,52 +751,74 @@ mod tests {
         // ` click ` passes as a built-in and stops at `ACTION_NOT_SUPPORTED`,
         // whose list holds `click`, so naming it is the whole answer.
         assert_eq!(
-            suggest_action(" click ", &list(&["click"])).as_deref(),
+            suggest_action(" click ", &list(&["click"]), false).as_deref(),
             Some("click")
         );
-        assert_eq!(suggest_action("   ", &list(&["click"])), None);
+        assert_eq!(suggest_action("   ", &list(&["click"]), false), None);
     }
 
     #[test]
     fn exact_accepted_match_is_never_corrected() {
         let native = list(&["press", "focus"]);
-        assert_eq!(suggest_action("press", &native), None);
+        assert_eq!(suggest_action("press", &native, false), None);
         let web = list(&["click"]);
-        assert_eq!(suggest_action("click", &web), None);
+        assert_eq!(suggest_action("click", &web, false), None);
+    }
+
+    /// A synonym candidate matches through the fold and comes back spelled as
+    /// the element spells it, as the SDK's `suggestAction` does. Its params
+    /// hint is read through the same fold.
+    #[test]
+    fn a_candidate_matches_through_the_fold() {
+        assert_eq!(
+            suggest_action("fill", &list(&["TYPE"]), false).as_deref(),
+            Some("TYPE")
+        );
+        assert_eq!(
+            suggest_action("press", &list(&["Click", "sendKeys"]), false).as_deref(),
+            Some("Click")
+        );
+        let suggestion = ActionSuggestion::resolve("fill", &list(&["TYPE"]), None, false)
+            .expect("TYPE folds to type");
+        assert_eq!(suggestion.params_hint, Some(json!({ "text": "…" })));
+        assert_eq!(
+            params_hint("send_keys", None),
+            Some(json!({ "keys": ["Enter"] }))
+        );
     }
 
     #[test]
     fn native_and_web_activation_verbs() {
         assert_eq!(
-            suggest_action("click", &list(&["press"])).as_deref(),
+            suggest_action("click", &list(&["press"]), false).as_deref(),
             Some("press")
         );
         assert_eq!(
-            suggest_action("tap", &list(&["press"])).as_deref(),
+            suggest_action("tap", &list(&["press"]), false).as_deref(),
             Some("press")
         );
         assert_eq!(
-            suggest_action("tap", &list(&["click", "press"])).as_deref(),
+            suggest_action("tap", &list(&["click", "press"]), false).as_deref(),
             Some("click")
         );
         assert_eq!(
-            suggest_action("contextMenu", &list(&["rightClick"])).as_deref(),
+            suggest_action("contextMenu", &list(&["rightClick"]), false).as_deref(),
             Some("rightClick")
         );
         assert_eq!(
-            suggest_action("middleclick", &list(&["middleClick"])).as_deref(),
+            suggest_action("middleclick", &list(&["middleClick"]), false).as_deref(),
             Some("middleClick")
         );
         assert_eq!(
-            suggest_action("dblClick", &list(&["doubleClick"])).as_deref(),
+            suggest_action("dblClick", &list(&["doubleClick"]), false).as_deref(),
             Some("doubleClick")
         );
         assert_eq!(
-            suggest_action("fill", &list(&["type"])).as_deref(),
+            suggest_action("fill", &list(&["type"]), false).as_deref(),
             Some("type")
         );
         assert_eq!(
-            suggest_action("scrollTo", &list(&["scrollIntoView"])).as_deref(),
+            suggest_action("scrollTo", &list(&["scrollIntoView"]), false).as_deref(),
             Some("scrollIntoView")
         );
     }
@@ -622,7 +828,7 @@ mod tests {
         let accepted = list(TERMINAL_INPUT_ACTIONS);
         for verb in ["mouseleave", "mouseLeave", "mouse_out", "mouseout"] {
             assert_eq!(
-                suggest_action(verb, &accepted).as_deref(),
+                suggest_action(verb, &accepted, false).as_deref(),
                 Some("unhover"),
                 "{verb}"
             );
@@ -630,7 +836,7 @@ mod tests {
         // An element whose advertised list lacks `unhover` is never told to use
         // it (the suggestion reads the raw list, not the gate's hover exemption).
         assert_eq!(
-            suggest_action("mouseleave", &list(&["hover", "click"])),
+            suggest_action("mouseleave", &list(&["hover", "click"]), false),
             None
         );
     }
@@ -639,7 +845,7 @@ mod tests {
     fn suggestion_is_always_an_accepted_verb() {
         let accepted = list(TERMINAL_INPUT_ACTIONS);
         for (from, _) in ACTION_VERB_SYNONYMS {
-            if let Some(s) = suggest_action(from, &accepted) {
+            if let Some(s) = suggest_action(from, &accepted, false) {
                 assert!(accepted.contains(&s), "'{from}' suggested unaccepted '{s}'");
             }
         }
@@ -786,6 +992,7 @@ mod tests {
             "press",
             &list(TERMINAL_INPUT_ACTIONS),
             Some(&json!({ "key": "c", "modifiers": "ctrl" })),
+            false,
         )
         .expect("sendKeys is accepted");
         assert_eq!(suggestion.verb, "sendKeys");
@@ -804,23 +1011,33 @@ mod tests {
             false,
             false,
             Some(&advertised),
-            None
+            None,
+            false
         )
         .is_none());
     }
 
     #[test]
     fn missing_metadata_never_rejects() {
-        assert!(deferred_unknown_action_error("press", "el", false, false, None, None).is_none());
+        assert!(
+            deferred_unknown_action_error("press", "el", false, false, None, None, false).is_none()
+        );
     }
 
     #[test]
     fn a_rejected_verb_never_appears_in_the_accepted_list() {
         let advertised = list(TERMINAL_INPUT_ACTIONS);
         for verb in ["press", "slap", "keydown", "rightclick", "fill"] {
-            let err =
-                deferred_unknown_action_error(verb, "el", false, false, Some(&advertised), None)
-                    .unwrap_or_else(|| panic!("{verb} must be rejected"));
+            let err = deferred_unknown_action_error(
+                verb,
+                "el",
+                false,
+                false,
+                Some(&advertised),
+                None,
+                false,
+            )
+            .unwrap_or_else(|| panic!("{verb} must be rejected"));
             let ctx = err.context.expect("context");
             let named: Vec<&str> = ctx["supportedActions"]
                 .as_array()
@@ -843,8 +1060,9 @@ mod tests {
 
     #[test]
     fn an_element_advertising_nothing_is_named_as_such() {
-        let err = deferred_unknown_action_error("press", "el", false, false, Some(&[]), None)
-            .expect("an explicit empty list is metadata, so it rejects");
+        let err =
+            deferred_unknown_action_error("press", "el", false, false, Some(&[]), None, false)
+                .expect("an explicit empty list is metadata, so it rejects");
         assert_eq!(
             err.message,
             "Unknown action 'press' for element 'el'. This element advertises no actions."
@@ -863,6 +1081,7 @@ mod tests {
             false,
             Some(&list(&["focus"])),
             None,
+            false,
         )
         .expect("slap must be rejected");
         assert!(matches!(err.code, UiBridgeErrorCode::InvalidRequest));
@@ -886,7 +1105,7 @@ mod tests {
             ("double_click", "doubleClick"),
             ("double", "doubleClick"),
         ] {
-            let err = action_not_supported_error(alias, "el", &advertised, None);
+            let err = action_not_supported_error(alias, "el", &advertised, None, false);
             let ctx = err.context.as_ref().expect("context");
             assert_eq!(ctx["didYouMean"], json!(canonical), "{alias}");
         }
@@ -894,8 +1113,13 @@ mod tests {
 
     #[test]
     fn action_not_supported_carries_did_you_mean() {
-        let err =
-            action_not_supported_error("click", "native-btn", &list(&["press", "focus"]), None);
+        let err = action_not_supported_error(
+            "click",
+            "native-btn",
+            &list(&["press", "focus"]),
+            None,
+            false,
+        );
         assert!(matches!(err.code, UiBridgeErrorCode::ActionNotSupported));
         let ctx = err.context.as_ref().expect("context");
         assert_eq!(ctx["didYouMean"], json!("press"));
@@ -906,8 +1130,52 @@ mod tests {
             err.message
         );
         // No candidate accepted → no didYouMean key at all.
-        let none = action_not_supported_error("drag", "b", &list(&["focus"]), None);
+        let none = action_not_supported_error("drag", "b", &list(&["focus"]), None, false);
         assert!(none.context.unwrap().get("didYouMean").is_none());
+    }
+
+    /// The handler's `keyboard_entry` read, against SDK-shaped element rows
+    /// (`serializeRegisteredElement`): the kind is the top-level `type`, and
+    /// `kind` (`interactive` / `content`) is a different field. A `textbox`
+    /// takes keys but no `type`, so `press` there suggests `sendKeys`. A
+    /// button the SDK gives `sendKeys` gets `click`.
+    #[test]
+    fn keyboard_entry_reads_the_probe_type_field() {
+        let keys_no_type = ["click", "hoverClick", "sendKeys", "focus", "blur"];
+        let text_box = json!({
+            "id": "editor",
+            "type": "textbox",
+            "kind": "interactive",
+            "actions": keys_no_type,
+        });
+        let button = json!({
+            "id": "save",
+            "type": "button",
+            "kind": "interactive",
+            "actions": keys_no_type,
+        });
+        assert!(keyboard_entry_of(Some(&text_box)));
+        assert!(!keyboard_entry_of(Some(&button)));
+        assert!(!keyboard_entry_of(Some(&json!({ "kind": "textbox" }))));
+        assert!(!keyboard_entry_of(None));
+        for (element, expected) in [(&text_box, "sendKeys"), (&button, "click")] {
+            let advertised = extract_supported_actions(element);
+            let detail = deferred_unknown_action_error(
+                "press",
+                element["id"].as_str().expect("id"),
+                is_builtin_action("press"),
+                false,
+                advertised.as_deref(),
+                None,
+                keyboard_entry_of(Some(element)),
+            )
+            .expect("press is not advertised, so it is rejected");
+            assert_eq!(
+                detail.context.expect("context")["didYouMean"],
+                json!(expected),
+                "{element}"
+            );
+        }
     }
 
     /// Handler-level: the 400 body `execute_action` returns for
@@ -932,6 +1200,7 @@ mod tests {
             false,
             advertised.as_deref(),
             Some(&params),
+            keyboard_entry_of(Some(&element)),
         )
         .expect("press must be rejected on the terminal input");
         let body = serde_json::to_value(api_error_detailed(detail.message.clone(), detail))

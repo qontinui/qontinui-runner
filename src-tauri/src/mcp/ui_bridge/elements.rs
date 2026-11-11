@@ -1688,6 +1688,12 @@ async fn execute_action_dispatch(
     // element accepts (`press` → `sendKeys` on a terminal input), and a verb
     // the element itself advertises is accepted here — see
     // `action_vocabulary::deferred_unknown_action_error`.
+    //
+    // The suggestion reads the element's kind as well as its list: an SDK
+    // `textbox` (ARIA textbox, contenteditable) takes keys but no `type`, so
+    // `press` there suggests `sendKeys`, not `click` (D4,
+    // `action_vocabulary::suggest_action`).
+    let keyboard_entry = super::action_vocabulary::keyboard_entry_of(element_probe.as_ref());
     if let Some(detail) = super::action_vocabulary::deferred_unknown_action_error(
         &request.action,
         &id,
@@ -1695,6 +1701,7 @@ async fn execute_action_dispatch(
         action_is_registered_custom,
         element_supported_actions.as_deref(),
         merged_params.as_ref(),
+        keyboard_entry,
     ) {
         warn!(
             "execute_action: rejecting unknown action '{}' on element {}: {}",
@@ -1767,6 +1774,7 @@ async fn execute_action_dispatch(
             &id,
             &supported,
             merged_params.as_ref(),
+            keyboard_entry,
         );
         let msg = detail.message.clone();
         return Err((
