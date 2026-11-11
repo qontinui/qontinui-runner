@@ -1,6 +1,7 @@
-//! Per-slice cgroup v2 memory and PSI telemetry for the 30 s resource sample
-//! (plan `2026-10-19-ci-nodes-run-the-tauri-runner-always-on-as-ci-node-role`,
-//! Phase 0b).
+//! Per-slice cgroup v2 memory, CPU and PSI telemetry for the 30 s resource
+//! sample (plan `2026-10-19-ci-nodes-run-the-tauri-runner-always-on-as-ci-node-role`,
+//! Phase 0b; the CPU half is plan
+//! `2026-11-05-one-free-resource-model-places-sessions-builds-and-ci`, Phase 2).
 //!
 //! # Why this exists
 //!
@@ -13,7 +14,10 @@
 //! * the `memory.events` `high` / `max` / `oom_kill` counters;
 //! * PSI `memory` / `cpu` / `io` `some` / `full` `avg10` / `avg60` from the
 //!   slice's own `*.pressure` files, and the same from `/proc/pressure/*` for
-//!   the whole system.
+//!   the whole system;
+//! * the CPU the slice used since the previous sample, from `cpu.stat`, and
+//!   the host's CPU split into session work, CI and the unattributed rest
+//!   (`cpu`, which documents what each class is made of).
 //!
 //! # Not supported is not zero
 //!
@@ -28,16 +32,25 @@
 //!
 //! # Shape on the wire
 //!
-//! Mirrors the `slice_tel_01` migration's column comments in qontinui-web:
+//! The memory keys mirror the `slice_tel_01` migration's column comments in
+//! qontinui-web, which describe `cgroup_slices` as keyed by slice. The CPU
+//! keys extend that contract: a `cpu` object inside each watched slice's
+//! entry, and `cpu_attribution`, the one top-level key that is not a slice:
 //!
 //! ```text
 //! cgroup_slices = {"ci-runners.slice": {"memory_current": N,
 //!                  "memory_high": N | "max", "memory_max": N | "max",
-//!                  "events": {"high": N, "max": N, "oom_kill": N}}}
+//!                  "events": {"high": N, "max": N, "oom_kill": N},
+//!                  "cpu": {"usage_delta_usec": N, "interval_usec": N}},
+//!                  "cpu_attribution": {"session_usec": N, "ci_usec": N, ...}}
 //! psi           = {"system": {"memory": {"some": {"avg10": f, "avg60": f},
 //!                                        "full": {...}}, "cpu": ..., "io": ...},
 //!                  "slices": {"ci-runners.slice": {"memory": ..., ...}}}
 //! ```
+//!
+//! The CPU keys are deltas over the interval since the previous read of the
+//! same root, so the first sample after a start carries none; the full
+//! `cpu_attribution` key set is in the `cpu` module.
 //!
 //! # Testability
 //!
@@ -55,6 +68,8 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 use serde_json::{json, Map, Value};
+
+mod cpu;
 
 /// The slices watched, in publish order. A slice that does not exist on the
 /// machine is absent from the published map.
@@ -252,30 +267,73 @@ fn nested_parent(slice: &str) -> Option<String> {
 /// lives on a systemd user service) -- the dash-nested path
 /// (`ci.slice/ci-runners.slice`) is tried before the flat one.
 pub(crate) fn slice_dirs(cgroup_root: &Path, slice: &str) -> Vec<PathBuf> {
+    slice_dirs_in(&slice_bases(cgroup_root).bases, slice)
+}
+
+/// The bases [`slice_dirs`] resolves a slice under ([`slice_bases`]).
+pub(crate) struct SliceBases {
+    /// In resolution order.
+    pub(crate) bases: Vec<PathBuf>,
+    /// `user.slice`, and each `user-N.slice` in it, that exists but could not
+    /// be listed in full: a user manager in it may be missing from `bases`.
+    pub(crate) unlisted: Vec<PathBuf>,
+}
+
+/// The bases a slice is looked for under, in [`slice_dirs`]' order, and the
+/// user directories that could not be listed for them.
+pub(crate) fn slice_bases(cgroup_root: &Path) -> SliceBases {
     let mut bases = vec![cgroup_root.to_path_buf(), cgroup_root.join("system.slice")];
-    if let Ok(rd) = fs::read_dir(cgroup_root.join("user.slice")) {
-        let mut users: Vec<PathBuf> = rd
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| p.is_dir())
-            .collect();
-        users.sort();
-        for u in users {
-            if let Ok(inner) = fs::read_dir(&u) {
-                let mut managers: Vec<PathBuf> = inner
-                    .filter_map(|e| e.ok())
-                    .map(|e| e.path())
-                    .filter(|p| {
-                        p.file_name()
-                            .and_then(|n| n.to_str())
-                            .is_some_and(|n| n.starts_with("user@") && n.ends_with(".service"))
-                    })
-                    .collect();
-                managers.sort();
-                bases.extend(managers);
+    let mut unlisted = Vec::new();
+    let mut users = list_dir(&cgroup_root.join("user.slice"), &mut unlisted, |p| {
+        p.is_dir()
+    });
+    users.sort();
+    for u in users {
+        let mut managers = list_dir(&u, &mut unlisted, |p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("user@") && n.ends_with(".service"))
+        });
+        managers.sort();
+        bases.extend(managers);
+    }
+    SliceBases { bases, unlisted }
+}
+
+/// The entries of `dir` that `keep` accepts, as many as could be read. `dir`
+/// goes on `unlisted` when it exists but could not be listed, in whole or in
+/// part; one that does not exist has no entries.
+fn list_dir(dir: &Path, unlisted: &mut Vec<PathBuf>, keep: impl Fn(&Path) -> bool) -> Vec<PathBuf> {
+    let rd = match fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) => {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                unlisted.push(dir.to_path_buf());
             }
+            return Vec::new();
+        }
+    };
+    let (mut out, mut whole) = (Vec::new(), true);
+    for entry in rd {
+        match entry {
+            Ok(e) => {
+                let p = e.path();
+                if keep(&p) {
+                    out.push(p);
+                }
+            }
+            Err(_) => whole = false,
         }
     }
+    if !whole {
+        unlisted.push(dir.to_path_buf());
+    }
+    out
+}
+
+/// `slice`'s candidate directories under each of `bases` in turn, the
+/// dash-nested path ([`nested_parent`]) before the flat one.
+pub(crate) fn slice_dirs_in(bases: &[PathBuf], slice: &str) -> Vec<PathBuf> {
     let parent = nested_parent(slice);
     let mut out = Vec::new();
     for base in bases {
@@ -294,20 +352,36 @@ fn resolve_slice(cgroup_root: &Path, slice: &str) -> Option<(PathBuf, Value)> {
         .find_map(|d| read_slice_memory(&d).map(|v| (d, v)))
 }
 
-/// Read every watched slice under `cgroup_root`. Returns the `cgroup_slices`
-/// map and the per-slice PSI map. A slice with no readable file is omitted.
-pub(crate) fn read_slices(cgroup_root: &Path) -> (Map<String, Value>, Map<String, Value>) {
-    let (mut mem, mut psi) = (Map::new(), Map::new());
+/// What [`read_slices`] read.
+pub(crate) struct SliceReads {
+    /// The `cgroup_slices` map. A slice with no readable file is omitted.
+    pub(crate) memory: Map<String, Value>,
+    /// The per-slice PSI map.
+    pub(crate) psi: Map<String, Value>,
+    /// The directory each slice in `memory` was read from, in
+    /// [`WATCHED_SLICES`] order, so that its `cpu` object is read from the
+    /// same cgroup ([`cpu::attach`]).
+    pub(crate) dirs: Vec<(&'static str, PathBuf)>,
+}
+
+/// Read every watched slice under `cgroup_root`.
+pub(crate) fn read_slices(cgroup_root: &Path) -> SliceReads {
+    let mut reads = SliceReads {
+        memory: Map::new(),
+        psi: Map::new(),
+        dirs: Vec::new(),
+    };
     for slice in WATCHED_SLICES {
         let Some((dir, memory)) = resolve_slice(cgroup_root, slice) else {
             continue;
         };
-        mem.insert(slice.to_string(), memory);
+        reads.memory.insert(slice.to_string(), memory);
         if let Some(p) = read_slice_psi(&dir) {
-            psi.insert(slice.to_string(), p);
+            reads.psi.insert(slice.to_string(), p);
         }
+        reads.dirs.push((slice, dir));
     }
-    (mem, psi)
+    reads
 }
 
 /// System-wide PSI from a `/proc/pressure`-shaped directory.
@@ -322,15 +396,38 @@ pub(crate) fn read_psi(proc_pressure: &Path) -> Map<String, Value> {
 }
 
 /// Assemble the three fields from the two roots. `None` fields stay `None`
-/// (unmeasured); an EMPTY slices map is a real answer: the unified hierarchy
-/// was read and none of the watched slices exists here.
+/// (unmeasured); a slices map with no watched slice in it is a real answer:
+/// the unified hierarchy was read and none of the watched slices exists here.
+/// From the second call on, such a map can still hold `cpu_attribution`.
+///
+/// The CPU keys of `cgroup_slices` are deltas since the previous call for the
+/// same `cgroup_root`, which this keeps between calls, so a first call carries
+/// none. Each watched slice's CPU is read from the directory [`read_slices`]
+/// read its memory from. `proc_pressure` is `<procfs>/pressure`: the runner's
+/// own cgroup and user are read from `<procfs>/self/cgroup` and
+/// `<procfs>/self/status` beside it. What `ci_node` has counted of its
+/// dispatches ([`crate::ci_node::cgroup::dispatch_counts`]) is read before the
+/// cgroups are listed and again after their counters are read: the session
+/// and CI split is withheld for a read across which a CI dispatch may have run
+/// where no read listed it.
 pub(crate) fn collect_from(cgroup_root: &Path, proc_pressure: &Path) -> SliceTelemetry {
     // The unified hierarchy announces itself with `cgroup.controllers` at its
     // root. Without it (cgroup v1 or hybrid) this host cannot be measured.
     if !cgroup_root.join("cgroup.controllers").is_file() {
         return SliceTelemetry::not_supported();
     }
-    let (mem, slice_psi) = read_slices(cgroup_root);
+    let SliceReads {
+        memory: mut mem,
+        psi: slice_psi,
+        dirs,
+    } = read_slices(cgroup_root);
+    cpu::attach(
+        cgroup_root,
+        proc_pressure,
+        &dirs,
+        crate::ci_node::cgroup::dispatch_counts,
+        &mut mem,
+    );
     let system = read_psi(proc_pressure);
 
     let psi = if system.is_empty() && slice_psi.is_empty() {
@@ -472,8 +569,25 @@ mod tests {
     #[test]
     fn slices_resolve_across_system_and_user_manager_paths() {
         let d = fixture_tree();
-        let (mem, psi) = read_slices(d.path());
+        let SliceReads {
+            memory: mem,
+            psi,
+            dirs,
+        } = read_slices(d.path());
         assert_eq!(mem.len(), 2, "agent-builds.slice is absent and omitted");
+        assert_eq!(
+            dirs,
+            vec![
+                ("ci-runners.slice", d.path().join("ci.slice/ci-runners.slice")),
+                (
+                    "qontinui-runner.slice",
+                    d.path().join(
+                        "user.slice/user-1000.slice/user@1000.service/qontinui.slice/qontinui-runner.slice"
+                    )
+                ),
+            ],
+            "each slice's directory, for its cpu object"
+        );
         let ci = &mem["ci-runners.slice"];
         assert_eq!(ci["memory_current"], json!(900));
         assert_eq!(ci["memory_high"], json!(1000));
@@ -510,7 +624,7 @@ mod tests {
             "7
 ",
         );
-        let (mem, _) = read_slices(d.path());
+        let mem = read_slices(d.path()).memory;
         assert_eq!(mem["agent-builds.slice"]["memory_current"], json!(7));
         assert_eq!(
             nested_parent("ci-runners.slice").as_deref(),
@@ -562,5 +676,210 @@ mod tests {
     fn off_linux_the_live_reading_is_not_supported() {
         let t = collect();
         assert_eq!(t, SliceTelemetry::not_supported());
+    }
+
+    /// The payload builder the 30 s publish reads (`publish_once` ->
+    /// `resource_sample::collect` -> `collect_host_lane` ->
+    /// `slice_telemetry::collect` -> `collect_from`) carries each watched
+    /// slice's CPU, and the session / CI split, from its second read of a root.
+    /// The first read has no previous one and carries no CPU at all.
+    #[test]
+    fn collect_from_carries_slice_cpu_deltas_from_its_second_read() {
+        // `collect_from` reads `ci_node`'s dispatch counts and its
+        // `QONTINUI_CI_CGROUP_ROOT`: every test that moves either holds this
+        // lock, and an override left in the environment would name a
+        // directory outside this fixture.
+        let _g = crate::test_env::env_lock();
+        let ci_root = crate::ci_node::cgroup::CGROUP_ROOT_ENV;
+        let _restore = crate::test_env::EnvVarRestore::capture(&[ci_root]);
+        std::env::remove_var(ci_root);
+        let d = tempfile::tempdir().unwrap();
+        let (root, procfs) = (d.path().join("cgroup"), d.path().join("proc"));
+        let mgr = "user.slice/user-1000.slice/user@1000.service";
+        let unit = format!("{mgr}/app.slice/qontinui-runner.service");
+        let pane = format!("{mgr}/app.slice/qontinui-pty-holder-p1-16f2c-18e4ca879535bc14.scope");
+        let builds = format!("{mgr}/agent.slice/agent-builds.slice");
+        write(&root, "cgroup.controllers", "cpuset cpu io memory pids\n");
+        write(&root, "ci.slice/ci-runners.slice/memory.current", "900\n");
+        write(&root, &format!("{builds}/memory.current"), "800\n");
+        write(&procfs, "self/cgroup", &format!("0::/{unit}\n"));
+        let usage = |k: u64| {
+            for (rel, usec) in [
+                ("user.slice", 40_000_000),
+                ("system.slice", 5_000_000),
+                (unit.as_str(), 4_000_000),
+                (pane.as_str(), 6_000_000),
+                (builds.as_str(), 10_000_000),
+                ("ci.slice", 30_000_000),
+                ("ci.slice/ci-runners.slice", 20_000_000),
+                ("ci.slice/ci-winvm.slice", 10_000_000),
+            ] {
+                write(
+                    &root,
+                    &format!("{rel}/cpu.stat"),
+                    &format!("usage_usec {}\n", usec * k),
+                );
+            }
+            write(
+                &root,
+                "cpu.stat",
+                &format!("usage_usec {}\n", 100_000_000 * k),
+            );
+        };
+        let pressure = procfs.join("pressure");
+
+        usage(1);
+        let first = collect_from(&root, &pressure).cgroup_slices.unwrap();
+        assert_eq!(first["ci-runners.slice"]["memory_current"], json!(900));
+        assert!(
+            first["ci-runners.slice"].get("cpu").is_none(),
+            "no previous read: no delta, not 0"
+        );
+        assert!(first.get("cpu_attribution").is_none());
+
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        usage(2);
+        let second = collect_from(&root, &pressure).cgroup_slices.unwrap();
+        let runners = &second["ci-runners.slice"];
+        assert_eq!(
+            runners["memory_current"],
+            json!(900),
+            "memory keys unchanged"
+        );
+        assert_eq!(runners["cpu"]["usage_delta_usec"], json!(20_000_000));
+        assert!(runners["cpu"]["interval_usec"].as_u64().unwrap() > 0);
+        assert_eq!(
+            second["agent-builds.slice"]["cpu"]["usage_delta_usec"],
+            json!(10_000_000)
+        );
+        let split = &second["cpu_attribution"];
+        assert_eq!(split["host_usec"], json!(100_000_000));
+        assert_eq!(
+            split["session_usec"],
+            json!(20_000_000),
+            "unit + pane + builds"
+        );
+        assert_eq!(
+            split["ci_usec"],
+            json!(30_000_000),
+            "ci.slice, winvm included"
+        );
+        assert_eq!(split["user_slice_remainder_usec"], json!(20_000_000));
+        assert_eq!(split["system_slice_remainder_usec"], json!(5_000_000));
+        assert_eq!(split["unattributed_usec"], json!(50_000_000));
+        assert_eq!(
+            split["ci_children_usec"],
+            json!({"ci-runners.slice": 20_000_000, "ci-winvm.slice": 10_000_000})
+        );
+        assert_eq!(split["pty_holder_scopes_seen"], json!(1));
+    }
+
+    /// `collect_from` hands `cpu::attach` the directory each watched slice's
+    /// memory was read from, so the slice's `cpu` object is of that cgroup and
+    /// not of a candidate tried before it that has no memory files: here
+    /// `ci.slice/ci-runners.slice`, tried before the flat `ci-runners.slice`.
+    #[test]
+    fn collect_from_reads_each_slices_cpu_where_it_read_its_memory() {
+        // As in the test above: `collect_from` reads `ci_node`'s counts and
+        // `QONTINUI_CI_CGROUP_ROOT`.
+        let _g = crate::test_env::env_lock();
+        let ci_root = crate::ci_node::cgroup::CGROUP_ROOT_ENV;
+        let _restore = crate::test_env::EnvVarRestore::capture(&[ci_root]);
+        std::env::remove_var(ci_root);
+        let d = tempfile::tempdir().unwrap();
+        let (root, procfs) = (d.path().join("cgroup"), d.path().join("proc"));
+        write(&root, "cgroup.controllers", "cpuset cpu io memory pids\n");
+        write(&root, "ci-runners.slice/memory.current", "900\n");
+        let usage = |k: u64| {
+            for (rel, usec) in [
+                ("ci.slice/ci-runners.slice", 7_000_000),
+                ("ci-runners.slice", 11_000_000),
+            ] {
+                write(
+                    &root,
+                    &format!("{rel}/cpu.stat"),
+                    &format!("usage_usec {}\n", usec * k),
+                );
+            }
+            write(
+                &root,
+                "cpu.stat",
+                &format!("usage_usec {}\n", 100_000_000 * k),
+            );
+        };
+        let pressure = procfs.join("pressure");
+
+        usage(1);
+        collect_from(&root, &pressure);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        usage(2);
+        let second = collect_from(&root, &pressure).cgroup_slices.unwrap();
+        let runners = &second["ci-runners.slice"];
+        assert_eq!(runners["memory_current"], json!(900));
+        assert_eq!(
+            runners["cpu"]["usage_delta_usec"],
+            json!(11_000_000),
+            "the cgroup the memory entry describes, not the nested candidate"
+        );
+    }
+
+    /// The live reading takes `ci_node`'s own dispatch counts: a CI job it
+    /// could not contain runs in the runner's own cgroup, beside session work,
+    /// so the split is withheld from the first read after the job started
+    /// through the first read after it ended, and published again from the
+    /// next.
+    #[test]
+    fn collect_from_withholds_the_split_while_ci_node_runs_a_job_it_could_not_contain() {
+        use crate::ci_node::cgroup::{Containment, CGROUP_ROOT_ENV};
+        // Every test that makes an uncontained run, through a `Containment`
+        // or a step it could not place, holds this lock, so only this one
+        // moves the counts while it is held.
+        let _g = crate::test_env::env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&[CGROUP_ROOT_ENV]);
+        std::env::remove_var(CGROUP_ROOT_ENV);
+        let d = tempfile::tempdir().unwrap();
+        let (root, procfs) = (d.path().join("cgroup"), d.path().join("proc"));
+        let unit = "user.slice/user-1000.slice/user@1000.service/app.slice/qontinui-runner.service";
+        write(&root, "cgroup.controllers", "cpu memory pids\n");
+        write(&procfs, "self/cgroup", &format!("0::/{unit}\n"));
+        let pressure = procfs.join("pressure");
+        let unit_stat = format!("{unit}/cpu.stat");
+        let mut reads: u64 = 0;
+        let mut read = || {
+            for (file, usec) in [
+                ("cpu.stat", 50),
+                ("user.slice/cpu.stat", 30),
+                (unit_stat.as_str(), 10),
+                ("ci.slice/cpu.stat", 20),
+            ] {
+                write(&root, file, &format!("usage_usec {}\n", usec * reads));
+            }
+            reads += 1;
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            collect_from(&root, &pressure).cgroup_slices.unwrap()
+        };
+        let split = |slices: Value| {
+            let a = &slices["cpu_attribution"];
+            assert_eq!(a["host_usec"], json!(50), "a read that measured");
+            (a.get("session_usec").cloned(), a.get("ci_usec").cloned())
+        };
+        let published = (Some(json!(10)), Some(json!(20)));
+
+        assert!(read().get("cpu_attribution").is_none(), "a first read");
+        assert_eq!(split(read()), published, "no dispatch");
+
+        std::env::set_var(CGROUP_ROOT_ENV, d.path().join("no-cgroup-here"));
+        let job = Containment::create("withheld", 1 << 20);
+        std::env::remove_var(CGROUP_ROOT_ENV);
+        assert!(matches!(job, Containment::Uncontained(_)));
+        assert_eq!(
+            split(read()),
+            (None, None),
+            "the first read after it started"
+        );
+        assert_eq!(split(read()), (None, None), "a read while it runs");
+        drop(job);
+        assert_eq!(split(read()), (None, None), "the read after it ended");
+        assert_eq!(split(read()), published, "the job is over");
     }
 }

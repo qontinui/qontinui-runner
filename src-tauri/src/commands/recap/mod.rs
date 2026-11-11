@@ -92,7 +92,7 @@ pub async fn get_task_run_recap(
             None
         });
 
-    // Get workflow verification phase results (step-based, from execute_verification_steps)
+    // Get workflow verification phase results (step-based, from execute_verification_steps_with_events)
     let workflow_verification_results = state
         .pg_db()
         .get_all_verification_phase_results(&task_run_id)

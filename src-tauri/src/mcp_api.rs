@@ -6049,6 +6049,17 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 /// tool, so there is nothing to exclude. Re-verify against coord
 /// `origin/main` when editing this paragraph.
 ///
+/// `coord_spawn_continuation` (plan
+/// `2026-10-09-coord-knows-which-box-holds-which-credential` Phase 5) is the
+/// session door that places a `run_skill` continuation on a device holding the
+/// named `required_capabilities` (e.g. `cred:aws-ssm:eu-central-1`) and answers
+/// a typed outcome (`dispatched` / `no_capable_device` /
+/// `capable_but_unavailable` / `vetoed` / `unknown`). It grants nothing new:
+/// `coord_register_gate`, already allowed here, carries the same spawn power
+/// (a `time_elapsed` gate with a `run_skill` continuation). The coord half refuses it to
+/// an anonymously minted bootstrap credential on its own side. Forwarding it
+/// ahead of the coord half landing is harmless (coord answers an unknown tool).
+///
 /// **Landed is not delivered** (plan `2026-09-03-coord-mcp-403-names-its-own-cause`
 /// Phase 3). This list is compiled into the binary, so a PR that edits it is
 /// NOT in effect on any box until that box rebuilds from a sha containing the
@@ -6258,7 +6269,18 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_signature",
     "coord_slo_metrics",
     "coord_snooze_gate",
+    "coord_spawn_continuation",
     "coord_submit_escalate_evidence",
+    // Plan 2026-11-08-subprojects-group-sessions-gates-and-plans-and-say-why-one-stalled
+    // Phase 4b: the subproject read and its two member-session writes (title /
+    // goal / next_steps_note; attach a unit or split). coord grants them on its
+    // device floor from the plan's Phases 3-4 (qontinui-coord, not on main when
+    // this landed — until then a call gets coord's unknown-tool refusal); both
+    // writes resolve the caller from the verified X-Coord-Caller-Session this
+    // proxy injects, and require membership.
+    "coord_subproject_attach",
+    "coord_subproject_get",
+    "coord_subproject_update",
     "coord_symbol_lookup",
     // Plan 2026-10-17-per-repo-tenant-binding-… Phase 6: the read twin of
     // GET /coord/repos/tenants (which tenant governs a repo), previously absent.
@@ -18303,6 +18325,19 @@ mod coord_mcp_body_gate_tests {
         );
     }
 
+    /// Plan `2026-10-09-coord-knows-which-box-holds-which-credential` Phase 5:
+    /// the capability-placed spawn door forwards, in sorted position.
+    #[test]
+    fn coord_spawn_continuation_is_allowed() {
+        assert!(coord_mcp_tool_is_allowed("coord_spawn_continuation"));
+        assert!(
+            COORD_MCP_ALLOWED_TOOLS
+                .binary_search(&"coord_spawn_continuation")
+                .is_ok(),
+            "membership is a binary_search, so the entry must sit in sorted position"
+        );
+    }
+
     /// Plan `2026-09-17-findings-carry-a-triage-stamp-and-the-steward-reads-since-last-run`
     /// Phase 2: the triage-stamp door forwards, and the source-text parser the
     /// drift verdict runs over this file reads the entry back — the comment
@@ -18414,6 +18449,46 @@ mod coord_mcp_body_gate_tests {
             assert!(
                 !coord_mcp_withholding_is_deliberate(tool),
                 "{tool} must not also be a deliberate exclusion"
+            );
+            assert_eq!(
+                parsed.allowed.iter().filter(|t| t.as_str() == tool).count(),
+                1,
+                "the parser must read {tool} exactly once: {:?}",
+                parsed.allowed
+            );
+        }
+        assert_eq!(parsed.allowed.len(), COORD_MCP_ALLOWED_TOOLS.len());
+    }
+
+    /// The subproject tools (plan
+    /// `2026-11-08-subprojects-group-sessions-gates-and-plans-and-say-why-one-stalled`
+    /// Phase 4b) must forward: without them `coord_subproject_update` — the
+    /// door the plan's Phase 7 has `/unattended` and `/finish-session` write a
+    /// session's `next_steps_note` through — is uncallable from every
+    /// runner-hosted session, and `tools/list` hides all three. The source-text parser the
+    /// drift verdict runs must read each back exactly once.
+    #[test]
+    fn subproject_tools_are_allowed_and_parse_from_source() {
+        let parsed = crate::build_drift::parse_tool_policy_consts(include_str!("mcp_api.rs"))
+            .expect("mcp_api.rs parses");
+        for tool in [
+            "coord_subproject_get",
+            "coord_subproject_update",
+            "coord_subproject_attach",
+        ] {
+            assert!(
+                COORD_MCP_ALLOWED_TOOLS.binary_search(&tool).is_ok(),
+                "{tool} must be on the list itself, not reached by a prefix"
+            );
+            assert!(coord_mcp_tool_is_allowed(tool), "{tool} must forward");
+            assert!(!coord_mcp_withholding_is_deliberate(tool));
+            assert!(
+                gate(serde_json::json!({
+                    "jsonrpc":"2.0","id":1,"method":"tools/call",
+                    "params":{"name":tool,"arguments":{}}
+                }))
+                .is_ok(),
+                "{tool} must be callable through the proxy"
             );
             assert_eq!(
                 parsed.allowed.iter().filter(|t| t.as_str() == tool).count(),

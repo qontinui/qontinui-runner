@@ -9034,6 +9034,11 @@ pub(crate) mod tests {
             c
         };
         cmd.env("TERM", "xterm-256color");
+        // An explicit cwd (coord finding d61a9247): without one portable-pty
+        // starts the child in the `USERPROFILE`/`$HOME` the builder captured,
+        // which a concurrent `IsolatedAmbient` points at a temp dir it deletes
+        // on drop, so the spawn fails or the shell refuses to run.
+        cmd.cwd(std::env::temp_dir());
 
         let mut child = pair.slave.spawn_command(cmd).expect("spawn echo child");
         let mut reader = pair.master.try_clone_reader().expect("clone reader");
