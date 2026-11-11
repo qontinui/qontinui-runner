@@ -541,10 +541,14 @@ any branch carrying the stem — one of them a plan authored the day before by t
 very step. So publish the new plan with:
 
 ```bash
-bash <workspace-root>/qontinui-claude-config/scripts/land-plan-stamp.sh \
+bash <workspace-root>/qontinui-claude-config/scripts/land-plan-stamp.sh --based-on new \
   "<plans-repo-root>" "<repo-relative plan path>" "<local plan file>" \
   "docs: add <plan-stem> (DRAFT)"
 ```
+
+`--based-on new` asserts the path is not on origin yet. Exit 7 (STALE BASE)
+means a plan already exists at that path: you are not creating it, you are
+overwriting a peer's — pick a different stem, or read that plan instead.
 
 Whether the plans repo needs a PR is decided by the helper's ruleset probe of
 its default branch, not asserted here. With no PR-requiring rule it lands the
