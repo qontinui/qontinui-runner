@@ -2844,10 +2844,12 @@ mod element_action_step_source_guard {
         let start = SRC
             .find("async fn execute_element_action(")
             .expect("execute_element_action present");
-        let end = SRC[start..]
-            .find("/// Execute a \"component_action\"")
-            .expect("component_action follows")
-            + start;
+        // Structural end: the next method of the impl block.
+        let end = SRC[start + 1..]
+            .find("\n    async fn ")
+            .expect("another method follows")
+            + start
+            + 1;
         &SRC[start..end]
     }
 

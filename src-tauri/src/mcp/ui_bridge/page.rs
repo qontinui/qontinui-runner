@@ -5093,13 +5093,30 @@ mod navigate_and_wait_window_guard {
             .expect("handler present");
         let end = SRC[start..].find("\n/// ").expect("next item") + start;
         let handler = &SRC[start..end];
-        for request_type in ["\"discover\"", "\"get_snapshot\""] {
-            let at = handler.find(request_type).expect("request present");
-            let call = &handler[at..(at + 220).min(handler.len())];
-            assert!(
-                call.contains("navigate_and_wait_window_payload("),
-                "{request_type} is not window-targeted: {call}"
-            );
+        for (request_type, base_arg) in [
+            ("\"discover\"", "serde_json::json!({\"interactive_only\": false})"),
+            ("\"get_snapshot\"", "serde_json::json!({})"),
+        ] {
+            let sites: Vec<usize> = handler.match_indices(request_type).map(|(at, _)| at).collect();
+            assert!(!sites.is_empty(), "{request_type} request not found");
+            for at in sites {
+                // Char-safe: `get` answers None instead of panicking on a
+                // multibyte boundary.
+                let call = handler
+                    .get(at..)
+                    .and_then(|rest| rest.get(..rest.len().min(400)))
+                    .or_else(|| handler.get(at..))
+                    .expect("slice at a char boundary");
+                assert!(
+                    call.contains("navigate_and_wait_window_payload("),
+                    "{request_type} is not window-targeted: {call}"
+                );
+                assert!(call.contains(base_arg), "{request_type}: wrong base payload: {call}");
+                assert!(
+                    call.contains("&req.action_extra"),
+                    "{request_type}: not given the request's own windowLabel source: {call}"
+                );
+            }
         }
     }
 }
