@@ -10,10 +10,14 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+const openUrl = vi.fn((_url: string) => Promise.resolve());
+vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: (url: string) => openUrl(url) }));
 
 import { TutorialStepBody } from "./TutorialStepBody";
 import { TutorialTooltip } from "./TutorialTooltip";
+import { CenteredTooltip } from "./ContextualTutorial";
 import { multimodalVisionTutorial } from "./data/multimodal-vision";
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -66,6 +70,25 @@ describe("TutorialStepBody", () => {
     expect(Array.from(items, (li) => li.textContent)).toEqual(["Use one file", "Second"]);
   });
 
+  it("opens a link in the system browser instead of navigating the app", () => {
+    render(createElement(TutorialStepBody, { content: "See [the docs](https://example.com/x)." }));
+    const link = container.querySelector("a")!;
+    const event = new MouseEvent("click", { bubbles: true, cancelable: true });
+    act(() => link.dispatchEvent(event));
+    expect(event.defaultPrevented).toBe(true);
+    expect(openUrl).toHaveBeenCalledWith("https://example.com/x");
+  });
+
+  it("wraps a table so it scrolls sideways inside the tooltip", () => {
+    render(createElement(TutorialStepBody, { content: "| a | b |\n|---|---|\n| 1 | 2 |" }));
+    expect(container.querySelector("table")?.parentElement?.className).toBe("overflow-x-auto");
+  });
+
+  it("does not render raw HTML", () => {
+    render(createElement(TutorialStepBody, { content: "<img src=x onerror=alert(1)>" }));
+    expect(container.querySelector("img")).toBeNull();
+  });
+
   it("renders neither block when details and tips are absent or empty", () => {
     render(createElement(TutorialStepBody, { content: "c", details: " ", tips: [] }));
     expect(container.querySelector('[data-testid="tutorial-step-details"]')).toBeNull();
@@ -101,13 +124,40 @@ describe("the tutorial tooltips show a real step's details and tips", () => {
     );
   });
 
+  it("CenteredTooltip renders them", () => {
+    const noop = () => {};
+    render(
+      createElement(CenteredTooltip, {
+        title: step!.title,
+        content: step!.content,
+        details: step!.details,
+        tips: step!.tips,
+        currentStep: 1,
+        totalSteps: 1,
+        isFirstStep: true,
+        isLastStep: true,
+        isWaiting: false,
+        isTimedOut: false,
+        hintMessage: null,
+        canSkip: false,
+        showSuccess: false,
+        onNext: noop,
+        onPrevious: noop,
+        onSkip: noop,
+        onComplete: noop,
+      }),
+    );
+    expect(container.querySelector('[data-testid="tutorial-step-content"]')).not.toBeNull();
+    expect(container.querySelector('[data-testid="tutorial-step-details"]')).not.toBeNull();
+    expect(container.querySelector('[data-testid="tutorial-step-tips"]')).not.toBeNull();
+  });
+
   it("ContextualTutorial hands details and tips to both tooltips", () => {
-    // CenteredTooltip is private to ContextualTutorial and needs the tutorial
-    // context to mount, so its wiring is pinned at the source: each of the
-    // two tooltip call sites passes the step's details and tips through.
+    // Mounting ContextualTutorial needs the whole tutorial context, so the two
+    // call sites' wiring is pinned at the source; the renders above prove
+    // each tooltip shows what it is handed.
     const src = readFileSync(join(__dirname, "ContextualTutorial.tsx"), "utf8");
     expect(src.match(/details=\{currentStep\.details\}/g)).toHaveLength(2);
     expect(src.match(/tips=\{currentStep\.tips\}/g)).toHaveLength(2);
-    expect(src).not.toMatch(/\{content\}\s*<\/(div|p)>/);
   });
 });

@@ -214,12 +214,20 @@ export function TutorialTooltip({
     }
   }, [targetSelector, position, tooltipHeight, hasPositioned]);
 
-  // Update tooltip height when content changes
+  // The tooltip element exists only once it has a position.
+  const isPositioned = tooltipPosition !== null;
+
+  // Update tooltip height when content changes, and whenever the tooltip
+  // resizes on its own (opening the step's "More details" grows it).
   useEffect(() => {
-    if (tooltipRef.current) {
-      setTooltipHeight(tooltipRef.current.offsetHeight);
-    }
-  }, [title, content, details, tips, action]);
+    const el = tooltipRef.current;
+    if (!el) return;
+    setTooltipHeight(el.offsetHeight);
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(() => setTooltipHeight(el.offsetHeight));
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [title, content, details, tips, action, isPositioned]);
 
   // Update position on mount and when dependencies change
   useEffect(() => {
@@ -246,6 +254,7 @@ export function TutorialTooltip({
       className={cn(
         "fixed z-tutorial-tooltip",
         "bg-card border border-border rounded-xl shadow-2xl",
+        "max-h-[calc(100vh-32px)] overflow-y-auto",
         "tutorial-scale-in",
         hasPositioned && "tutorial-tooltip-positioned",
       )}
