@@ -2723,6 +2723,41 @@ fn warn_untracked_backend_spawn(
     );
 }
 
+/// A failed backend create ([`create_terminal_session_backend`]): the typed
+/// failure, plus the isolated edit context the caller handed in, returned
+/// UNPARKED — a failed create parks it on no session, and a caller that
+/// allocated it is the only party that knows whether the tree may be removed
+/// (`IsolatedEditContext::remove_unspawned_unreported`). A caller that passed
+/// `None`, or does not care, takes the message through `String::from`.
+pub(crate) struct BackendSpawnFailure {
+    pub(crate) failure: crate::terminal::spawn_refusal::SpawnFailure,
+    pub(crate) isolated_ctx: Option<crate::agent_worktree::isolated_edit::IsolatedEditContext>,
+}
+
+impl std::fmt::Debug for BackendSpawnFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BackendSpawnFailure")
+            .field("failure", &self.failure)
+            .field(
+                "isolated_ctx",
+                &self.isolated_ctx.as_ref().map(|c| c.agent_id.as_str()),
+            )
+            .finish()
+    }
+}
+
+impl std::fmt::Display for BackendSpawnFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.failure.message)
+    }
+}
+
+impl From<BackendSpawnFailure> for String {
+    fn from(failure: BackendSpawnFailure) -> Self {
+        failure.failure.message
+    }
+}
+
 /// Tracked variant of [`create_terminal_session_backend`] where the capture
 /// hint is NON-OPTIONAL — the compiler, not a log line, guarantees a backend
 /// spawn is durably recorded. All backend/headless callers (gate
@@ -2745,7 +2780,7 @@ pub(crate) fn create_tracked_terminal_session_backend(
     capture_hint: SessionCaptureHint,
     page_id: Option<String>,
     resource_override: bool,
-) -> Result<(String, Option<uuid::Uuid>), String> {
+) -> Result<(String, Option<uuid::Uuid>), BackendSpawnFailure> {
     create_terminal_session_backend(
         terminal_manager,
         session_registry,
@@ -2803,7 +2838,7 @@ pub(crate) fn create_terminal_session_backend(
     // while an account-migration respawn is the continuation of a session that
     // already existed a moment ago. See each call site.
     resource_override: bool,
-) -> Result<(String, Option<uuid::Uuid>), String> {
+) -> Result<(String, Option<uuid::Uuid>), BackendSpawnFailure> {
     warn_untracked_backend_spawn(&capture_hint, &title, &working_dir);
     // The shared session-env contribution (`QONTINUI_SESSION_WORKTREES` from
     // the pre-acquired context + the configured plan directories), derived
@@ -2895,7 +2930,22 @@ pub(crate) fn create_terminal_session_backend(
             .map_or(crate::coord_drain_state::SpawnOrigin::Unknown, |h| {
                 h.spawn_origin
             }),
-    )?;
+    );
+    // A failed create hands the caller's context BACK, unparked, with the typed
+    // failure: the gate continuation decides from `child_started` whether the
+    // fresh tree it allocated may be removed (plan
+    // `2026-11-08-a-spawn-refused-after-its-worktree-allocation-leaves-the-tree-on-disk`,
+    // Phase 3). Dropping it here instead would release the claims and leave
+    // the tree on disk with nobody holding the fact that no child ran in it.
+    let info = match info {
+        Ok(info) => info,
+        Err(failure) => {
+            return Err(BackendSpawnFailure {
+                failure,
+                isolated_ctx,
+            })
+        }
+    };
 
     // Spawn name: park it on the session (so `terminal_list` and a reconnecting
     // webview can read it), record the commit `Session-Name` trailer file for the

@@ -702,6 +702,184 @@ mod tests {
         assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
+    /// The fn name a `fn` opener line declares.
+    fn fn_name(line: &str) -> String {
+        let after = line.split("fn ").nth(1).unwrap_or("");
+        after
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect()
+    }
+
+    /// Plan `2026-11-08-…-leaves-the-tree-on-disk` Phase 3: every OTHER
+    /// allocating entry point — `acquire(AcquireRequest`, `acquire_for_worker(`,
+    /// `acquire_continuation_workdir(`, `materialize_worktrees(` — is enumerated
+    /// from the source, and each production call site must be in the
+    /// disposition table below [policy: testing/coverage-is-enumerated-not-salient].
+    /// A new call site is RED until it is classified.
+    ///
+    /// A `Door` must hand its unspawned allocation to the remover: each fn the
+    /// row names must call the row's removal token (the door's own fn, or the
+    /// spawn fns it dispatches to). An `Allocator` is an internal helper whose
+    /// result is returned to a caller that is itself a row here.
+    #[test]
+    fn every_other_allocating_door_removes_an_unspawned_allocation() {
+        enum Disposition {
+            Allocator,
+            Door(&'static [&'static str], &'static str),
+        }
+        use Disposition::*;
+        // (file, enclosing fn of the call) -> disposition.
+        let table: &[(&str, &str, Disposition)] = &[
+            (
+                "agent_worktree/isolated_edit.rs",
+                "acquire_for_terminal",
+                Allocator,
+            ),
+            (
+                "agent_worktree/isolated_edit.rs",
+                "acquire_for_worker",
+                Allocator,
+            ),
+            (
+                "agent_runtime.rs",
+                "acquire_continuation_workdir",
+                Allocator,
+            ),
+            (
+                "commands/ai_session.rs",
+                "reacquire_and_restore_session_worktree",
+                Allocator,
+            ),
+            (
+                "agent_runtime.rs",
+                "run_gate_continuation_inner",
+                Door(
+                    &["run_continuation_terminal", "run_continuation_headless"],
+                    "remove_unspawned_continuation(",
+                ),
+            ),
+            (
+                "agent_runtime.rs",
+                "run_agent_subprocess",
+                Door(&["run_agent_subprocess"], "remove_unspawned_launch_trees("),
+            ),
+            (
+                "orchestration_loop/ai_session_executor.rs",
+                "dispatch_subtask",
+                Door(&["dispatch_subtask"], "remove_unspawned("),
+            ),
+        ];
+        // The resume door reaches its allocation through the Allocator row's
+        // fn, so it is checked by that fn's caller.
+        let indirect: &[(&str, &str, &str)] = &[(
+            "commands/ai_session.rs",
+            "resume_ai_sessions",
+            "remove_unspawned(",
+        )];
+        // The removal helpers themselves must reach the core.
+        let helpers: &[(&str, &str, &str)] = &[
+            (
+                "agent_runtime.rs",
+                "remove_unspawned_continuation",
+                "remove_unspawned_unreported(",
+            ),
+            (
+                "agent_runtime.rs",
+                "remove_unspawned_launch_trees",
+                "remove_unspawned_trees(",
+            ),
+        ];
+
+        // Spelled in pieces so this test's own source is never a match.
+        let calls = [
+            concat!("acquire(", "AcquireRequest"),
+            concat!("acquire_for_worker", "("),
+            concat!("acquire_continuation_workdir", "("),
+            concat!("materialize_worktrees", "("),
+        ];
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rust_sources(&root, &mut files);
+        files.sort();
+
+        let mut sources = std::collections::BTreeMap::new();
+        let mut failures = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for file in &files {
+            let rel = file
+                .strip_prefix(&root)
+                .unwrap_or(file)
+                .display()
+                .to_string()
+                .replace('\\', "/");
+            let src = std::fs::read_to_string(file).expect("read source");
+            let scanned = scan_source(&src);
+            for e in &scanned.errors {
+                failures.push(format!("{rel}: {e}"));
+            }
+            let lines = scanned.production;
+            for (idx, line) in lines.iter().enumerate() {
+                let is_call = calls.iter().any(|c| line.contains(c))
+                    && !calls
+                        .iter()
+                        .any(|c| line.contains(&format!("fn {}", c.trim_end_matches('('))));
+                if !is_call {
+                    continue;
+                }
+                let site = format!("{rel}:{}", idx + 1);
+                let Some((start, _)) = enclosing_fn(&lines, idx) else {
+                    failures.push(format!("{site}: no enclosing fn found"));
+                    continue;
+                };
+                let name = fn_name(&lines[start]);
+                if table.iter().any(|(f, n, _)| *f == rel && *n == name) {
+                    seen.insert((rel.clone(), name));
+                } else {
+                    failures.push(format!(
+                        "{site}: allocating call in `{name}` has no disposition — classify it \
+                         as a Door (with its removal) or an Allocator"
+                    ));
+                }
+            }
+            sources.insert(rel, lines);
+        }
+
+        let body_of = |file: &str, name: &str| -> Option<String> {
+            let lines = sources.get(file)?;
+            let idx = lines
+                .iter()
+                .position(|l| opens_fn(l) && fn_name(l) == name)?;
+            let (start, end) = enclosing_fn(lines, idx)?;
+            Some(lines[start..=end].join("\n"))
+        };
+        let require = |file: &str, name: &str, token: &str| match body_of(file, name) {
+            None => Some(format!("{file}: fn `{name}` not found")),
+            Some(body) if !body.contains(token) => {
+                Some(format!("{file}: `{name}` never calls `{token}`"))
+            }
+            Some(_) => None,
+        };
+        for (file, name, disposition) in table {
+            // Anti-vacuity: every row must still match a live call site.
+            if !seen.contains(&(file.to_string(), name.to_string())) {
+                failures.push(format!(
+                    "{file}: the table row for `{name}` matched no call site (stale row or a \
+                     blind scan)"
+                ));
+            }
+            if let Door(fns, token) = disposition {
+                for f in *fns {
+                    failures.extend(require(file, f, token));
+                }
+            }
+        }
+        for (file, name, token) in indirect.iter().chain(helpers) {
+            failures.extend(require(file, name, token));
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
     /// The relay's precheck sits BEFORE its grant gate, as the drain gate does,
     /// so a refusal spends no create grant.
     #[test]
