@@ -53,9 +53,13 @@ use super::types::ApiState;
 /// WS-only wrappers (which expose no HTTP server) need an entry there too.
 /// The scheme makes WS-only entries unambiguous in logs and prevents
 /// collision with real HTTP `/sdk/connect` URLs.
-fn ws_synthetic_url(app_id: &str) -> String {
-    format!("ws-app://{}", app_id)
+pub(crate) fn ws_synthetic_url(app_id: &str) -> String {
+    format!("{WS_SYNTHETIC_URL_PREFIX}{app_id}")
 }
+
+/// The prefix of every [`ws_synthetic_url`]: an active connection whose URL
+/// starts with it is a WebSocket app, whose origin is not in its URL.
+pub(crate) const WS_SYNTHETIC_URL_PREFIX: &str = "ws-app://";
 
 /// Mirror the WS-registered app into `sdk_connection` so `try_ws_dispatch`
 /// can resolve `app_id` from `active_connection()`. Returns the previous
@@ -900,14 +904,27 @@ async fn handle_inbound_text(
         }
         Ok(InboundFrame::ChangeEvent { event }) => {
             // Phase 1: log and discard. Phase 2 will wire this into the
-            // existing change-event subscriber machinery.
-            debug!("[ws-relay] changeEvent from '{}': {:?}", app_id, event);
+            // existing change-event subscriber machinery. The event is app
+            // content, so it can carry what a condition check just typed: a
+            // held condition-check secret is scrubbed from the line.
+            debug!(
+                "[ws-relay] changeEvent from '{}': {}",
+                app_id,
+                crate::condition_secrets::debug_scrubbed(&event)
+            );
         }
         Ok(InboundFrame::Other) => {
             debug!("[ws-relay] ignoring unknown frame type from '{}'", app_id);
         }
         Err(e) => {
-            warn!("[ws-relay] invalid inbound frame from '{}': {}", app_id, e);
+            // serde's error for a mistyped field quotes the value it could not
+            // read, and that value can be a condition-check secret the app
+            // echoes: scrub it before it is logged or settles a command.
+            let detail = crate::condition_secrets::scrub_text(&e.to_string()).into_owned();
+            warn!(
+                "[ws-relay] invalid inbound frame from '{}': {}",
+                app_id, detail
+            );
             // A response frame that names its command still ANSWERS it, even
             // when another field is unreadable: settle that command now
             // instead of leaving it to the 30 s timeout, which would report an
@@ -916,7 +933,7 @@ async fn handle_inbound_text(
             // the app's own failure, since what the app reported is unknown.
             if let Some(command_id) = unreadable_response_command_id(text) {
                 let outcome = relay
-                    .resolve_unreadable(conn_id, mode, &command_id, e.to_string())
+                    .resolve_unreadable(conn_id, mode, &command_id, detail)
                     .await;
                 meter_resolve_outcome(app_id, mode, principal, binding, &command_id, outcome);
             }
@@ -1296,5 +1313,109 @@ mod tests {
         ] {
             assert_eq!(unreadable_response_command_id(text), None, "{text}");
         }
+    }
+
+    /// A change event is app content, so it can carry what a condition check
+    /// just typed (plan
+    /// 2026-11-06-a-regression-test-run-is-judged-by-what-it-covered-and-a-silent-run-reads-unknown
+    /// Phase 13). Fed through the REAL inbound parser while a session holds a
+    /// secret, its debug line carries the mask, never the value.
+    #[tokio::test]
+    async fn condition_secrets_a_change_event_debug_line_never_carries_a_held_value() {
+        const SECRET: &str = "relay-change-event-secret-Rl1";
+        let held = serde_json::from_value(serde_json::json!({ "cs-relay-pw": SECRET }))
+            .expect("a secrets map");
+        let _held = crate::condition_secrets::register(
+            "run-relay-change-event",
+            "http://localhost:3001",
+            &held,
+        )
+        .expect("held");
+        let logs = crate::condition_secrets::test_support::LogCapture::start();
+        let ws = WsConnectionManager::new();
+        let (conn_id, _outbound_rx) = ws.test_register("wrapper").await;
+        let relay = CommandRelay::with_timeout(ws.clone(), RELAY_TIMEOUT);
+        let frame = serde_json::json!({
+            "type": "changeEvent",
+            "event": {"kind": "input", "elementId": "password-field", "value": SECRET},
+        });
+
+        handle_inbound_text(
+            "wrapper",
+            conn_id,
+            BindingMode::Enforce,
+            &Principal::OperatorTrust {
+                class: crate::mcp::origin_guard::OriginClass::NonBrowser,
+            },
+            &RelayBinding::new(BindingConfig::default()),
+            &relay,
+            &frame.to_string(),
+        )
+        .await;
+
+        let lines = logs.text();
+        assert!(
+            lines.contains("changeEvent from 'wrapper'"),
+            "anti-vacuity: the change event was logged: {lines}"
+        );
+        assert!(
+            lines.contains(crate::condition_secrets::REDACTED) && !lines.contains("cs-relay-pw"),
+            "{lines}"
+        );
+        assert!(
+            !lines.contains(SECRET),
+            "a log line carries the held value: {lines}"
+        );
+    }
+
+    /// serde's error for a mistyped field quotes the value it could not read,
+    /// so an app that echoes a condition-check secret into such a field would
+    /// put it in the relay's warning, and in the detail that settles the
+    /// command. Fed through the REAL inbound parser while a session holds the
+    /// secret, the warning carries the mask, never the value.
+    #[tokio::test]
+    async fn condition_secrets_an_invalid_frame_warning_never_carries_a_held_value() {
+        const SECRET: &str = "relay-invalid-frame-secret-Rl2";
+        let held = serde_json::from_value(serde_json::json!({ "cs-relay-bad": SECRET }))
+            .expect("a secrets map");
+        let _held = crate::condition_secrets::register(
+            "run-relay-invalid-frame",
+            "http://localhost:3001",
+            &held,
+        )
+        .expect("held");
+        let logs = crate::condition_secrets::test_support::LogCapture::start();
+        let ws = WsConnectionManager::new();
+        let (conn_id, _outbound_rx) = ws.test_register("wrapper").await;
+        let relay = CommandRelay::with_timeout(ws.clone(), RELAY_TIMEOUT);
+        let frame = serde_json::json!({
+            "type": "response",
+            "commandId": "c-invalid-1",
+            "success": SECRET,
+        });
+
+        handle_inbound_text(
+            "wrapper",
+            conn_id,
+            BindingMode::Enforce,
+            &Principal::OperatorTrust {
+                class: crate::mcp::origin_guard::OriginClass::NonBrowser,
+            },
+            &RelayBinding::new(BindingConfig::default()),
+            &relay,
+            &frame.to_string(),
+        )
+        .await;
+
+        let lines = logs.text();
+        assert!(
+            lines.contains("invalid inbound frame from 'wrapper'")
+                && lines.contains(crate::condition_secrets::REDACTED),
+            "anti-vacuity: the frame was refused and its quoted value masked: {lines}"
+        );
+        assert!(
+            !lines.contains(SECRET),
+            "a log line carries the held value: {lines}"
+        );
     }
 }

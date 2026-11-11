@@ -150,6 +150,13 @@ pub fn routes() -> Router<Arc<ApiState>> {
             "/ui-bridge/sdk/spec-sync/stream",
             get(handle_spec_sync_stream),
         )
+        // The `/ui-bridge/sdk/*` routes outside `sdk_client::routes()`, so
+        // they take the same condition-check secret scrub (plan
+        // 2026-11-06-a-regression-test-run-is-judged-by-what-it-covered-and-a-silent-run-reads-unknown
+        // Phase 13). LAST: `Router::layer` wraps only the routes before it.
+        .layer(axum::middleware::from_fn(
+            crate::condition_secrets::scrub_sdk_responses,
+        ))
 }
 
 pub fn route_entries() -> &'static [(&'static str, &'static str)] {
