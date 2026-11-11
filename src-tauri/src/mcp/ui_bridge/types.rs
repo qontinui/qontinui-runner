@@ -582,6 +582,7 @@ impl UiBridgeError {
         element_id: &str,
         accepted: &[S],
         requested_params: Option<&serde_json::Value>,
+        keyboard_entry: bool,
     ) -> Self {
         let names: Vec<&str> = accepted.iter().map(AsRef::as_ref).collect();
         let mut message = if names.is_empty() {
@@ -602,9 +603,12 @@ impl UiBridgeError {
             "elementId": element_id,
             "supportedActions": names,
         });
-        if let Some(suggestion) =
-            super::action_vocabulary::ActionSuggestion::resolve(unknown, accepted, requested_params)
-        {
+        if let Some(suggestion) = super::action_vocabulary::ActionSuggestion::resolve(
+            unknown,
+            accepted,
+            requested_params,
+            keyboard_entry,
+        ) {
             message.push_str(&suggestion.message_suffix());
             suggestion.attach_to(&mut context);
         }
