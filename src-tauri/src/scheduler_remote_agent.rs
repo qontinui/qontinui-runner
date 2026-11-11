@@ -412,10 +412,11 @@ pub(crate) async fn launch(
         &crate::settings::get_claude_session_permission(),
     )?;
 
-    let (mut child, preconditions) =
-        crate::agent_runtime::spawn_claude_child(&workdir_s, &prompt, None, coord_mcp, &args, true)
-            .await
-            .map_err(|e| format!("spawn scheduled session: {e:#}"))?;
+    let (mut child, preconditions) = crate::agent_runtime::spawn_claude_child(
+        &workdir_s, &prompt, None, coord_mcp, &args, true, None,
+    )
+    .await
+    .map_err(|e| format!("spawn scheduled session: {e:#}"))?;
     // The account THIS child resolved, read from its own spawn preconditions:
     // the dir a limit hit cools. Never the shared resolved dir, which a
     // sibling spawn may have repointed by the time this child exits.
