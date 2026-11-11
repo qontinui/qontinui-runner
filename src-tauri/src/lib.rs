@@ -75,6 +75,13 @@ pub mod tauri_event_payloads;
 // operator never performed).
 pub mod fs_atomic;
 
+// Bounded reads of a file's END — the one tail reader (`read_tail_lossy` for
+// transcript scans, `tail_lines` for log views). In the lib so its core can be
+// tested against a synthetic source, and so every reader of a log's end shares
+// one bound instead of growing another whole-file read. Plan
+// `2026-11-11-runner-glibc-arena-retention-and-whole-log-tail`, Phase 2.
+pub mod file_tail;
+
 // Runner instance identity from the process env (`QONTINUI_INSTANCE_NAME`) —
 // the ONE primary/secondary predicate. In the lib for the same reason as
 // `fs_atomic`: the runner bin's tier-persist guard and the `qontinui_profile`

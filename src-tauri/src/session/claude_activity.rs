@@ -90,6 +90,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::session::wind_down_observer::TerminalObservation;
+use qontinui_runner_lib::file_tail::read_tail_lossy;
 use qontinui_runner_lib::wind_down::{GridIdle, Sideband, SidebandState};
 
 /// A `busy`/`shell` session counts as `working` only when it exchanged a
@@ -425,27 +426,6 @@ pub fn last_message_ms(tail: &str) -> Option<i64> {
         chrono::DateTime::parse_from_rfc3339(ts)
             .ok()
             .map(|dt| dt.timestamp_millis())
-    })
-}
-
-/// The last `max` bytes of `path`, decoded LOSSILY: an invalid UTF-8 byte
-/// damages the line it sits in, never the whole read. When the read starts
-/// mid-file its first (partial) line is dropped. `None` only on an I/O error.
-pub fn read_tail_lossy(path: &Path, max: u64) -> Option<String> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut file = std::fs::File::open(path).ok()?;
-    let len = file.metadata().ok()?.len();
-    let start = len.saturating_sub(max);
-    file.seek(SeekFrom::Start(start)).ok()?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).ok()?;
-    let text = String::from_utf8_lossy(&bytes).into_owned();
-    if start == 0 {
-        return Some(text);
-    }
-    Some(match text.split_once('\n') {
-        Some((_, rest)) => rest.to_string(),
-        None => String::new(),
     })
 }
 
