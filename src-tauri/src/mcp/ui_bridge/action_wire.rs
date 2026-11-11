@@ -415,7 +415,6 @@ mod element_action_payload_tests {
         );
     }
 
-
     /// The headline regression: a batch step must round-trip EVERY field.
     ///
     /// This is the structural assertion the class needs — it carries an
@@ -572,7 +571,6 @@ mod element_action_payload_tests {
         );
     }
 
-
     #[test]
     fn flat_params_survive_a_bare_string_action_on_a_batch_step() {
         // The runner's own capabilities manifest documents batch-actions steps
@@ -675,7 +673,6 @@ mod element_action_payload_tests {
         );
     }
 }
-
 
 /// Test support shared by every hop's round-trip table.
 ///
@@ -919,7 +916,10 @@ mod action_missing_tests {
 
     #[test]
     fn step_action_payload_refuses_a_step_with_no_action_name() {
-        assert_refused("no action key", step_action_payload(&json!({"elementId": "e1"})));
+        assert_refused(
+            "no action key",
+            step_action_payload(&json!({"elementId": "e1"})),
+        );
         assert_refused(
             "null action",
             step_action_payload(&json!({"elementId": "e1", "action": null})),
@@ -964,7 +964,11 @@ mod action_missing_tests {
             json!({"action": "  "}),
         ] {
             let err = require_action_name(&target).expect_err("no usable name");
-            assert!(err.message().contains("`action`"), "{target}: {}", err.message());
+            assert!(
+                err.message().contains("`action`"),
+                "{target}: {}",
+                err.message()
+            );
         }
         assert_eq!(
             require_action_name(&json!({"action": "type"})).as_deref(),
@@ -1002,7 +1006,9 @@ mod action_missing_message_window_and_step_request_tests {
 
     #[test]
     fn the_http_error_envelope_carries_the_typed_code() {
-        let env = require_action_name(&json!({})).unwrap_err().error_response();
+        let env = require_action_name(&json!({}))
+            .unwrap_err()
+            .error_response();
         assert!(!env.success);
         assert_eq!(env.code.as_deref(), Some("action_missing"));
         assert!(env.error.unwrap().starts_with("action_missing:"));
