@@ -46,6 +46,8 @@ agent_runtime.rs | run_continuation_headless | autonomous | run_gate_continuatio
 agent_runtime.rs | run_continuation_terminal | autonomous | run_gate_continuation_inner
 claude_session/runner.rs | run_claude_session_interactive | helper | run_claude_session_interactive(
 claude_session/runner.rs | run_claude_session_interactive_with_retry | helper | run_claude_session_interactive_with_retry(
+claude_session/session.rs | auto_restart_on_rate_limit | exempt | restarts a chat session that exited on a rate limit under another account — the work is already running; a restart prepare freezes it (rate_limit_rotation, plan 2026-10-21-operator-prepare-for-restart-and-progressive-restore D3)
+claude_session/session.rs | promote_to_worktree | exempt | replaces a running chat session's CLI with one whose cwd is a worktree — the same session, already running, moved not started
 commands/ai_session.rs | create_ai_session | operator | -
 commands/ai_session.rs | resume_ai_sessions | autonomous | resume_ai_sessions
 commands/config.rs | get_workspace_paths_impl | exempt | only resolves the spawn script's path for display; launches nothing
@@ -91,6 +93,13 @@ session/mod.rs | start | helper | .start(intent)
 session/mod.rs | start_inner | helper | .start_inner(
 session/mod.rs | start_with_parent | helper | .start_with_parent(
 session/respawn.rs | materialize | autonomous | materialize
+# resume_one gates on the origin it is handed (plan
+# 2026-10-21-operator-prepare-for-restart-and-progressive-restore, D7): the HTTP route passes
+# resume_door::HTTP_ORIGIN (Respawn), the runner UI's operator twin
+# commands/operator_doors.rs::operator_resume_sessions passes the operator origin. The twin calls
+# the door's core (resume_sessions), not a spawn primitive or a helper token, so — like every other
+# operator twin in that file — it is no site of its own and has no row here (a row would be a ghost);
+# operator_doors::the_twins_are_not_reachable_through_the_ui_bridge_allowlist names it instead.
 session/resume_door.rs | resume_one | autonomous | resume_one
 session/transport/claude_cli.rs | start | helper | transport.start(
 session/transport/pty.rs | start | helper | transport.start(

@@ -84,7 +84,10 @@ macro_rules! ipc_group {
 
 /// Every command group. One `crate::<module>::IPC_GROUP` per module that
 /// invokes [`ipc_group!`](crate::ipc_group).
-const GROUPS: &[GroupEntry] = &[crate::commands::meta_optimizer::IPC_GROUP];
+const GROUPS: &[GroupEntry] = &[
+    crate::commands::meta_optimizer::IPC_GROUP,
+    crate::commands::restart_prep::IPC_GROUP,
+];
 
 /// Name -> owning group's handler, built once on first use.
 fn routes() -> &'static HashMap<&'static str, GroupHandler> {

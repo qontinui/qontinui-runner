@@ -34,6 +34,17 @@
 //!    `import` and `document.cookie`, but NOT `invoke`, so an expression can
 //!    call a Tauri command the allowlist never names.
 //!
+//! 3. **A mounted page's UI-Bridge COMPONENT actions are a route too.** A
+//!    `useUIComponent` action runs in the webview and may `invoke` any command;
+//!    the bridge serves it to any local caller at
+//!    `/control/component/{id}/action/{action}` (`sdk_client.rs`). Its declared
+//!    `effect` only keeps automatic walks out — nothing on the server gates a
+//!    `destructive` one. So a door that must stay operator-only must not be
+//!    wired to a component action. The restart-prep panel's actions (prepare,
+//!    cancel, extend, dismiss, held toggle) ARE wired this way on purpose: the
+//!    plan names their UI-Bridge ids and drives them through the bridge, and
+//!    each declares `destructive` (or `write` for the toggle).
+//!
 //! The honest bound on (2), recorded rather than hand-waved: on a bundled,
 //! CSP-enforcing build the route is dead — `script-src 'self'` without
 //! `unsafe-eval` refuses every expression it would evaluate. So (2) is a
@@ -52,7 +63,7 @@ use crate::mcp::types::ApiState;
 
 /// The origin every twin passes: an operator at this runner's own UI. The drain
 /// never defers it; the draining banner tells the operator what is paused.
-const OPERATOR: SpawnOrigin = SpawnOrigin::OperatorChat;
+pub(crate) const OPERATOR: SpawnOrigin = SpawnOrigin::OperatorChat;
 
 /// A door's answer: its HTTP status and JSON body.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -218,6 +229,38 @@ pub async fn operator_resume_task_run(
     ))
 }
 
+/// `POST /control/sessions/resume {ids}`, as the runner UI — the Restore button
+/// of a restart cohort's placeholder (plan
+/// `2026-10-21-operator-prepare-for-restart-and-progressive-restore`, D7).
+///
+/// The same core as the route ([`crate::session::resume_door::resume_sessions`]),
+/// gated as the operator, so a residual drain never defers the operator's
+/// click; the in-flight and live-process guards, the transcript check and
+/// `MIGRATION_CAP` apply exactly as on the route. Being the operator, it may
+/// restore a cohort row held for a hand restore, and a FINISHED cohort row,
+/// whose finish mark the core lifts once the resume is verified — a refused
+/// or failed Restore never touches it (D4). The route does neither. The door's
+/// reply is returned unchanged.
+#[tauri::command]
+pub async fn operator_resume_sessions(
+    app_handle: tauri::AppHandle,
+    ids: Vec<String>,
+    prepare_id: Option<String>,
+) -> Result<DoorReply, String> {
+    let state = api_state(&app_handle)?;
+    let request = crate::session::resume_door::ResumeRequest {
+        ids: Some(ids),
+        all: None,
+        generation: None,
+        // A placeholder's Restore names its cohort: once that cohort is
+        // dismissed, a restore still queued restores nothing.
+        prepare_id,
+    };
+    Ok(door_reply(
+        crate::session::resume_door::resume_sessions(state, request, OPERATOR).await,
+    ))
+}
+
 /// The scheduler's "Run now", as the runner UI. `POST /scheduler/tasks/{id}/run`
 /// stays an autonomous (`unknown`) caller.
 #[tauri::command]
@@ -275,6 +318,27 @@ mod tests {
         assert_eq!(unified_workflow_run_id("/prompts/run"), None);
     }
 
+    /// The restore twin passes the OPERATOR origin to the shared core — the
+    /// route passes `HTTP_ORIGIN` (`resume_door`'s own test pins that) — so a
+    /// drain defers the route's resume and never the operator's Restore click.
+    /// The gate decision itself is pinned in `resume_door`
+    /// (`a_drain_defers_the_route_and_never_the_operator_twin`); this pins
+    /// which origin the twin hands it, read off the twin's own source because
+    /// the call needs a running app.
+    #[test]
+    fn the_restore_twin_resumes_as_the_operator() {
+        let src = include_str!("operator_doors.rs");
+        let (_, rest) = src
+            .split_once("pub async fn operator_resume_sessions(")
+            .expect("the twin exists");
+        let (body, _) = rest.split_once("\n}\n").expect("the twin's body ends");
+        assert!(
+            body.contains("resume_door::resume_sessions(state, request, OPERATOR)"),
+            "the restore twin must hand the shared core the operator origin: {body}"
+        );
+        assert!(!body.contains("SpawnOrigin::Respawn") && !body.contains("HTTP_ORIGIN"));
+    }
+
     #[test]
     fn the_twins_are_not_reachable_through_the_ui_bridge_allowlist() {
         // Derived from the ROSTER, not from a hardcoded list. The list this
@@ -305,6 +369,12 @@ mod tests {
             "operator_run_composed_workflow",
             "operator_generate_unified_workflow_async",
             "operator_resume_task_run",
+            "operator_resume_sessions",
+            "restart_prep_prepare",
+            "restart_prep_cancel",
+            "restart_prep_extend",
+            "restart_prep_dismiss",
+            "restart_prep_set_held",
             "scheduler_run_task_now",
             "steward_start",
         ] {

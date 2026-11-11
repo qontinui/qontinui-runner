@@ -57,7 +57,7 @@ export interface TerminalSessionEntry {
   exitCode: number | null;
   /** Tab type discriminator from `useTerminalManager`. Defaults to
    *  `"terminal"` when undefined. */
-  type: "terminal" | "plan";
+  type: "terminal" | "plan" | "restore-placeholder";
   /** Epoch ms when the tab was created. `null` when not yet recorded. */
   createdAt: number | null;
 }

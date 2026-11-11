@@ -234,6 +234,7 @@ pub mod remote_create; // Remote terminal CREATION: the accept_remote_create pre
 pub mod remote_end; // END a session on another device under an attach grant: `remote_session_end` (plan 2026-09-30-close-remote-sessions-from-the-local-runner, Phase 3)
 pub mod remote_interactivity_probe; // The remote-interactivity probe sweep + its scheduler (plan 2026-09-20-remote-session-interactivity-is-a-query-and-both-halves-hold, A3)
 pub mod resource_guard_settings; // Settings > Resource Guard: session-protection floors + the ci_node floors (plan 2026-08-07-runner-resource-guard-and-session-protection Part B)
+pub mod restart_prep; // Operator "prepare for restart" reads (plan 2026-10-21-operator-prepare-for-restart-and-progressive-restore, Phase 1)
 pub mod saved_projects; // User-curated project registry (wizard-populated, consumed by UI Bridge panel)
 pub mod screenshot;
 pub mod screenshots;

@@ -109,7 +109,8 @@ export function classifyTabs(
     const shown = assignments[0];
     for (const t of tabs) {
       if (t.id === shown) m.set(t.id, "assigned");
-      else if (t.type === "plan" || t.sessionBacked) m.set(t.id, "offscreen-unmounted");
+      else if (t.type === "plan" || t.type === "restore-placeholder" || t.sessionBacked)
+        m.set(t.id, "offscreen-unmounted");
       else if (tmuxMounted && !tmuxMounted.has(t.id)) m.set(t.id, "offscreen-unmounted");
       else m.set(t.id, "offscreen");
     }

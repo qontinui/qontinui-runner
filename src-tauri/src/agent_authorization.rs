@@ -442,21 +442,30 @@ pub fn decide_drain(
     state: &crate::coord_drain_state::CoordDrainState,
     admission: &DrainAdmission,
 ) -> Option<SpawnDecision> {
-    decide_drain_with_role(state, None, admission)
+    decide_drain_with_role(state, None, admission, None)
 }
 
 /// PURE: [`decide_drain`] with the device's dispatch role, which defers an
 /// autonomous admission on its own when it closes the agent lane
-/// (`coord_drain_state::role_gate`).
+/// (`coord_drain_state::role_gate`), and the restart prepare's runner-local
+/// hold (`crate::coord_drain_state::gate_with_local_hold`), so an agent
+/// admission honours the same role and hold `drain_gate` does.
 pub fn decide_drain_with_role(
     state: &crate::coord_drain_state::CoordDrainState,
     role: Option<crate::coord_drain_state::DispatchRole>,
     admission: &DrainAdmission,
+    local_hold: Option<&str>,
 ) -> Option<SpawnDecision> {
     let DrainAdmission::Origin { origin, .. } = admission else {
         return None;
     };
-    match crate::coord_drain_state::gate_with_role_at(state, role, *origin, chrono::Utc::now()) {
+    match crate::coord_drain_state::gate_with_local_hold(
+        state,
+        role,
+        *origin,
+        local_hold,
+        chrono::Utc::now(),
+    ) {
         crate::coord_drain_state::DrainGate::Allow => None,
         crate::coord_drain_state::DrainGate::Defer { reason, class } => {
             Some(SpawnDecision::DeferredByDrain { reason, class })
@@ -479,10 +488,12 @@ fn drain_admission(
         );
         return None;
     }
+    let local_hold = crate::restart_prep::local_hold_reason();
     let decision = decide_drain_with_role(
         &crate::coord_drain_state::current(),
         crate::coord_drain_state::current_dispatch_role(),
         admission,
+        local_hold.as_deref(),
     )?;
     if let DrainAdmission::Origin { origin, work_key } = admission {
         let key = work_key
@@ -3837,22 +3848,33 @@ mod drain_tests {
     fn a_closing_dispatch_role_defers_autonomous_admissions_with_the_drain_clear() {
         use crate::coord_drain_state::{DeferClass, DispatchRole};
         let ci = Some(DispatchRole::CiNode);
-        let d = decide_drain_with_role(&CoordDrainState::Clear, ci, &SpawnOrigin::Steward.into())
-            .expect("deferred by the role");
+        let d = decide_drain_with_role(
+            &CoordDrainState::Clear,
+            ci,
+            &SpawnOrigin::Steward.into(),
+            None,
+        )
+        .expect("deferred by the role");
         assert_eq!(d.drain_class(), Some(DeferClass::RoleClosed));
         assert!(d.refusal().unwrap().starts_with("role_closes_agent_lane: "));
         assert_eq!(
             decide_drain_with_role(
                 &CoordDrainState::Clear,
                 ci,
-                &SpawnOrigin::OperatorTerminal.into()
+                &SpawnOrigin::OperatorTerminal.into(),
+                None
             ),
             None
         );
         // No role (or an open one): exactly decide_drain.
         for role in [None, Some(DispatchRole::Workhorse)] {
             assert_eq!(
-                decide_drain_with_role(&CoordDrainState::Clear, role, &SpawnOrigin::Steward.into()),
+                decide_drain_with_role(
+                    &CoordDrainState::Clear,
+                    role,
+                    &SpawnOrigin::Steward.into(),
+                    None
+                ),
                 None
             );
         }
