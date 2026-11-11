@@ -936,7 +936,7 @@ pub fn rekey_provider_rows(
     coord_row_for: impl Fn(&str) -> Option<Uuid>,
 ) -> Vec<(String, RekeyOutcome)> {
     let mut out = Vec::new();
-    for (terminal_id, session_id) in rows.valid() {
+    for (terminal_id, session_id, config_dir) in rows.valid() {
         let Some(coord_row) = coord_row_for(terminal_id) else {
             continue;
         };
@@ -947,6 +947,17 @@ pub fn rekey_provider_rows(
             session_id,
             RekeySource::ProviderRegistry,
         );
+        if matches!(outcome, RekeyOutcome::Queued) {
+            // Which account's registry file supplied the id: on a multi-account
+            // box this is the only record of where the re-key's evidence came from.
+            tracing::info!(
+                terminal_id = %terminal_id,
+                coord_session_id = %coord_row,
+                claude_session_id = %session_id,
+                config_dir = %config_dir.display(),
+                "provider_registry re-key: evidence read from this config dir's sessions/<pid>.json"
+            );
+        }
         out.push((terminal_id.to_string(), outcome));
     }
     out
