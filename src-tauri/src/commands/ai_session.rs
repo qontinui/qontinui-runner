@@ -2118,7 +2118,7 @@ pub async fn resume_ai_sessions(
             let session = match session {
                 Ok(session) => Arc::new(session),
                 Err(e) => {
-                    // door-scan: handed back — the failure carries the context to settle_resume_spawn
+                    // door-scan: keep(handed-back) the failure carries the context to settle_resume_spawn
                     return Err(ResumeSpawnFailure {
                         message: format!("spawn failed: {}", e.message),
                         child_started: e.child_started,
@@ -2128,7 +2128,7 @@ pub async fn resume_ai_sessions(
             };
 
             if let Err(e) = sm.register(&trid, session.clone()) {
-                // door-scan: handed back — the failure carries the context to settle_resume_spawn
+                // door-scan: keep(handed-back) the failure carries the context to settle_resume_spawn
                 return Err(ResumeSpawnFailure {
                     message: format!("register failed: {}", e),
                     child_started: true,
@@ -2157,7 +2157,7 @@ pub async fn resume_ai_sessions(
             // replay won't double-count.
             if let Some(prompt) = initial_for_spawn.as_deref() {
                 if let Err(e) = session.send_initial_prompt(prompt) {
-                    // door-scan: handed back — the failure carries the context to settle_resume_spawn
+                    // door-scan: keep(handed-back) the failure carries the context to settle_resume_spawn
                     return Err(ResumeSpawnFailure {
                         message: format!("send_initial_prompt failed: {}", e),
                         child_started: true,

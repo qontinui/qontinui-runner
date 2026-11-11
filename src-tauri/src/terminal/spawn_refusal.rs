@@ -588,6 +588,128 @@ mod tests {
     /// The marker comment a door places on its real spawn call.
     const SPAWN_MARKER: &str = "door-scan: spawn";
 
+    /// Each `acquire_for_terminal` door's REAL spawn call — the token the
+    /// first code line after its [`SPAWN_MARKER`] must carry, so the marker
+    /// cannot be moved up to empty the early-exit window.
+    const DOOR_SPAWN_TOKENS: &[(&str, &str)] = &[
+        ("commands/terminal.rs", "spawn_blocking_tracked("),
+        ("mcp/backend_relay.rs", "tm.create("),
+        ("mcp/tauri_proxy.rs", "tm.create("),
+        ("mcp/terminals.rs", "terminal_manager.create("),
+    ];
+
+    /// The line of the [`SPAWN_MARKER`] after the allocation at `alloc`
+    /// (within `..=end`), provided the first CODE line after it carries
+    /// `token`, the door's real spawn.
+    fn spawn_marker(
+        raw: &[String],
+        code: &[String],
+        alloc: usize,
+        end: usize,
+        token: &str,
+    ) -> Result<usize, String> {
+        let at = (alloc + 1..=end.min(raw.len().saturating_sub(1)))
+            .find(|&i| raw[i].contains(SPAWN_MARKER))
+            .ok_or_else(|| format!("no `{SPAWN_MARKER}` marker after the allocation"))?;
+        let next = (at + 1..=end.min(code.len().saturating_sub(1)))
+            .find(|&i| !code[i].trim().is_empty())
+            .ok_or_else(|| format!("nothing follows the `{SPAWN_MARKER}` marker"))?;
+        if code[next].contains(token) {
+            Ok(at)
+        } else {
+            Err(format!(
+                "the `{SPAWN_MARKER}` marker at line {} is not on the real spawn (`{token}`); \
+                 the code after it is `{}`",
+                at + 1,
+                code[next].trim()
+            ))
+        }
+    }
+
+    /// A marker moved up, off the real spawn, fails — it would otherwise
+    /// shrink the early-exit window to nothing.
+    #[test]
+    fn a_spawn_marker_off_the_real_spawn_is_refused() {
+        let placed: Vec<String> = [
+            "    let (wd, ctx) = acquire_for_terminal(a).await;",
+            "    let x = resolve()?;",
+            "    // door-scan: spawn",
+            "    match tm.create(",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let code = code_lines(&placed);
+        assert_eq!(spawn_marker(&placed, &code, 0, 3, "tm.create("), Ok(2));
+        let moved: Vec<String> = [
+            "    let (wd, ctx) = acquire_for_terminal(a).await;",
+            "    // door-scan: spawn",
+            "    let x = resolve()?;",
+            "    match tm.create(",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let code = code_lines(&moved);
+        assert!(spawn_marker(&moved, &code, 0, 3, "tm.create(").is_err());
+    }
+
+    /// The reasons a `door-scan: keep(<reason>)` marker may give for an exit
+    /// that legitimately leaves the allocation in place.
+    const KEEP_REASONS: &[&str] = &[
+        "post-child",        // a child ran in the tree (or may have)
+        "handed-back",       // the failure carries the context to a settle seam
+        "nothing-allocated", // the allocation did not happen on this path
+        "spawned",           // the session started and holds the context
+        "loop-exit",         // a `break`; the code after the loop settles the allocation
+    ];
+
+    /// `Ok(true)` when `line` is a well-formed keep marker, `Ok(false)` when it
+    /// is no marker at all, `Err` for a marker with an unknown reason.
+    fn keep_marker(line: &str) -> Result<bool, String> {
+        let Some(rest) = line.trim().strip_prefix("// door-scan: keep(") else {
+            return Ok(false);
+        };
+        let reason = rest.split(')').next().unwrap_or_default();
+        if KEEP_REASONS.contains(&reason) {
+            Ok(true)
+        } else {
+            Err(format!(
+                "unknown keep reason `{reason}` (allowed: {KEEP_REASONS:?})"
+            ))
+        }
+    }
+
+    /// Per line: the brace depth at its start, and the lowest depth reached
+    /// while it is read — over CODE lines, so braces in strings never count.
+    fn depth_profile(code: &[String]) -> Vec<(i64, i64)> {
+        let mut depth = 0i64;
+        code.iter()
+            .map(|l| {
+                let start = depth;
+                let mut low = depth;
+                for c in l.chars() {
+                    match c {
+                        '{' => depth += 1,
+                        '}' => {
+                            depth -= 1;
+                            low = low.min(depth);
+                        }
+                        _ => {}
+                    }
+                }
+                (start, low)
+            })
+            .collect()
+    }
+
+    /// Is the block that holds line `r` still open at line `e` — `r` in the
+    /// same block as `e` or an enclosing one, never a closed sibling?
+    fn in_scope(profile: &[(i64, i64)], r: usize, e: usize) -> bool {
+        let held = profile[r].0;
+        (r + 1..=e).all(|i| profile[i].1 >= held)
+    }
+
     /// The CODE of each line — string, char-literal and comment contents
     /// dropped — lexed in order, so state carries across lines.
     fn code_lines(lines: &[String]) -> Vec<String> {
@@ -596,7 +718,14 @@ mod tests {
     }
 
     /// The lines strictly between `from` and `to` whose code can leave the
-    /// enclosing fn early: any `return` or `continue` keyword, or any `?`.
+    /// enclosing fn early — or leave the block that holds the allocation: any
+    /// `return`, `continue` or `break` keyword (with or without a value), a
+    /// `bail!` / `ensure!` macro, or any `?`.
+    ///
+    /// `break` is counted deliberately even though it stays in the fn: whether
+    /// the code after the loop handles the allocation is exactly what a reader
+    /// must not assume, so each one carries its own removal or a
+    /// `keep(loop-exit)` marker naming where the allocation is settled.
     fn early_exits(code: &[String], from: usize, to: usize) -> Vec<usize> {
         let word = |l: &str, w: &str| {
             l.match_indices(w).any(|(i, _)| {
@@ -613,7 +742,12 @@ mod tests {
         (from + 1..to.min(code.len()))
             .filter(|&i| {
                 let l = &code[i];
-                l.contains('?') || word(l, "return") || word(l, "continue")
+                l.contains('?')
+                    || word(l, "return")
+                    || word(l, "continue")
+                    || word(l, "break")
+                    || l.contains("bail!")
+                    || l.contains("ensure!")
             })
             .collect()
     }
@@ -637,18 +771,81 @@ mod tests {
         assert_eq!(early_exits(&code_lines(&lines), 0, 5), vec![1, 3]);
     }
 
+    /// `break` (bare or with a value), `bail!` and `ensure!` are exits too; a
+    /// `breakpoint` identifier is not.
+    #[test]
+    fn break_bail_and_ensure_are_early_exits() {
+        let lines: Vec<String> = [
+            "    let ctx = acquire();",
+            "        break;",
+            "        break 'outer Some(x);",
+            "    anyhow::bail!(\"refused\");",
+            "    anyhow::ensure!(ok, \"refused\");",
+            "    let breakpoint = 1;",
+            "    let rebreak_x = 2;",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(early_exits(&code_lines(&lines), 0, 7), vec![1, 2, 3, 4]);
+    }
+
+    fn exits_of(src: &str) -> Vec<String> {
+        let raw: Vec<String> = src.lines().map(str::to_string).collect();
+        unremoved_exits("x.rs", &raw, "door", Some("acquire("))
+    }
+
     /// An exit after the anchor with no removal since the previous exit is
     /// reported; one removal earlier in the fn does not cover a later exit.
     #[test]
     fn every_door_exit_needs_its_own_removal() {
-        let src = "fn door() {\n    let ctx = acquire();\n    if a {\n        \
-                   remove_unspawned(ctx);\n        return Err(1);\n    }\n    if b {\n        \
-                   return Err(2);\n    }\n    if c {\n        // door-scan: kept, a child ran\n\
-                   \x20       return Err(3);\n    }\n}\n";
-        let raw: Vec<String> = src.lines().map(str::to_string).collect();
-        let found = unremoved_exits("x.rs", &raw, "door", Some("acquire("));
+        let found = exits_of(
+            "fn door() {\n    let ctx = acquire();\n    if a {\n        remove_unspawned(ctx);\n        \
+             return Err(1);\n    }\n    if b {\n        return Err(2);\n    }\n    if c {\n        \
+             // door-scan: keep(post-child) a child ran\n        return Err(3);\n    }\n}\n",
+        );
         assert_eq!(found.len(), 1, "{found:?}");
         assert!(found[0].contains("Err(2)"), "{found:?}");
+    }
+
+    /// A removal in a closed SIBLING block does not cover an exit; one in an
+    /// enclosing block does.
+    #[test]
+    fn a_removal_in_a_sibling_block_does_not_cover_an_exit() {
+        let sibling = exits_of(
+            "fn door() {\n    let ctx = acquire();\n    if a {\n        remove_unspawned(ctx);\n    \
+             }\n    if b {\n        return Err(2);\n    }\n}\n",
+        );
+        assert_eq!(sibling.len(), 1, "{sibling:?}");
+        let enclosing = exits_of(
+            "fn door() {\n    let ctx = acquire();\n    remove_unspawned(ctx);\n    if b {\n        \
+             return Err(2);\n    }\n}\n",
+        );
+        assert!(enclosing.is_empty(), "{enclosing:?}");
+    }
+
+    /// A keep marker counts only directly above its exit and only with a known
+    /// reason.
+    #[test]
+    fn a_keep_marker_must_be_directly_above_and_name_a_known_reason() {
+        let distant = exits_of(
+            "fn door() {\n    let ctx = acquire();\n    // door-scan: keep(post-child) here\n    \
+             let y = 1;\n    return Err(2);\n}\n",
+        );
+        assert_eq!(distant.len(), 1, "{distant:?}");
+        let unknown = exits_of(
+            "fn door() {\n    let ctx = acquire();\n    // door-scan: keep(because) trust me\n    \
+             return Err(2);\n}\n",
+        );
+        assert!(
+            unknown.iter().any(|e| e.contains("unknown keep reason")),
+            "{unknown:?}"
+        );
+        let good = exits_of(
+            "fn door() {\n    let ctx = acquire();\n    // door-scan: keep(handed-back) seam\n    \
+             return Err(2);\n}\n",
+        );
+        assert!(good.is_empty(), "{good:?}");
     }
 
     /// The production lines when each skipped test block is ended by
@@ -902,15 +1099,21 @@ mod tests {
                         lines[start].trim()
                     ));
                 }
-                let raw: Vec<&str> = src.lines().collect();
-                let marker = (idx + 1..=end).find(|&i| raw[i].contains(SPAWN_MARKER));
-                match marker {
-                    None => failures.push(format!(
-                        "{site}: no `{SPAWN_MARKER}` marker on the door's real spawn after the \
-                         allocation"
+                let raw: Vec<String> = src.lines().map(str::to_string).collect();
+                let code = code_lines(&lines);
+                let token = DOOR_SPAWN_TOKENS
+                    .iter()
+                    .find(|(f, _)| *f == rel.replace('\\', "/"))
+                    .map(|(_, t)| *t);
+                let marker = match token {
+                    None => Err(format!(
+                        "{site}: no entry in DOOR_SPAWN_TOKENS names this door's real spawn call"
                     )),
-                    Some(spawn) => {
-                        let code = code_lines(&lines);
+                    Some(token) => spawn_marker(&raw, &code, idx, end, token),
+                };
+                match marker {
+                    Err(e) => failures.push(format!("{site}: {e}")),
+                    Ok(spawn) => {
                         for i in early_exits(&code, idx, spawn) {
                             failures.push(format!(
                                 "{rel}:{}: an early exit between the allocation (line {}) \
@@ -1165,6 +1368,7 @@ mod tests {
         "remove_unspawned_trees(",
         "settle_worker_spawn(",
         "settle_resume_spawn(",
+        "abandon_before_resume_spawn(",
     ];
 
     /// Each early exit of fn `name` after `anchor` (the fn's start when
@@ -1194,15 +1398,32 @@ mod tests {
             },
         };
         let code = code_lines(&production);
+        let profile = depth_profile(&code);
         let mut out = Vec::new();
+        // The scan's own spans must agree on where this door fn is.
+        let opener = format!("fn {name}(");
+        out.extend(
+            partition_disagreement(&raw.join("\n"), &production, |l| l.contains(&opener))
+                .map(|e| format!("{file}: {e}")),
+        );
         let mut since = from;
         for e in early_exits(&code, from, end + 1) {
-            let removed = (since..=e).any(|i| REMOVAL_TOKENS.iter().any(|t| code[i].contains(t)));
-            let declared = (since..=e).any(|i| raw[i].contains("door-scan:"));
+            let removed = (since..=e).any(|r| {
+                REMOVAL_TOKENS.iter().any(|t| code[r].contains(t)) && in_scope(&profile, r, e)
+            });
+            let declared = match e.checked_sub(1).map(|a| keep_marker(&raw[a])) {
+                Some(Ok(true)) => true,
+                Some(Err(why)) => {
+                    out.push(format!("{file}:{}: {why}", e));
+                    true
+                }
+                _ => false,
+            };
             if !removed && !declared {
                 out.push(format!(
                     "{file}:{}: `{name}` can leave here holding the allocation with no removal \
-                     since line {} and no `door-scan:` marker: `{}`",
+                     in this block (or an enclosing one) since line {} and no \
+                     `door-scan: keep(<reason>)` marker directly above: `{}`",
                     e + 1,
                     since + 1,
                     production[e].trim()

@@ -8140,7 +8140,7 @@ async fn run_continuation_terminal(
                 let reason = "continuation pane was closed before the session started".to_string();
                 warn!("agent_runtime: gate-continuation terminal_id={terminal_id}: {reason}");
                 report_spawn_failed(agent_id, &reason, None, attempt.saturating_sub(1), None).await;
-                // door-scan: kept — the pane ran a child; its close already released the claim
+                // door-scan: keep(post-child) the pane ran a child; its close already released the claim
                 return Err(anyhow::anyhow!(reason));
             }
             ContinuationStart::NeverStarted(evidence) => {
@@ -8179,7 +8179,7 @@ async fn run_continuation_terminal(
                     claude_bin = spawn_blocking_tracked(resolve_claude_bin)
                         .await
                         .unwrap_or_else(|_| claude_bin_path());
-                    // door-scan: kept — the context was taken back off the dead pane for the retry
+                    // door-scan: keep(post-child) the context was taken back off the dead pane for the retry
                     continue;
                 }
                 let reason = format!("never started ({attempt} attempts): {detail}");
@@ -8193,7 +8193,7 @@ async fn run_continuation_terminal(
                 )
                 .await;
                 // `reservation` drops on this return and releases the anchor.
-                // door-scan: kept — never-started attempts ran a child in this tree; the context is parked on its pane
+                // door-scan: keep(post-child) never-started attempts ran a child in this tree; the context is parked on its pane
                 return Err(anyhow::anyhow!(reason));
             }
             ContinuationStart::Started { pty_alive } => {
@@ -8235,7 +8235,7 @@ async fn run_continuation_terminal(
                 emit_terminal_focus_request(&app, &terminal_id, continuation_spawn_origin(payload));
                 report_spawn_complete(agent_id, None, Some("gate continuation (terminal)"), None)
                     .await;
-                // door-scan: spawned — the started session holds the context
+                // door-scan: keep(spawned) the started session holds the context
                 return Ok(TerminalStart {
                     session_id: attempt_session_id,
                     exited_terminal: exited.then_some(terminal_id),
@@ -10412,7 +10412,7 @@ async fn run_agent_subprocess(
     let primary_wt = payload
         .worktrees
         .first()
-        // door-scan: nothing added — a payload with no worktrees materialized none
+        // door-scan: keep(nothing-allocated) a payload with no worktrees materialized none
         .ok_or_else(|| anyhow::anyhow!("no worktrees allocated"))?
         .worktree_path
         .clone();
@@ -10554,6 +10554,7 @@ async fn run_agent_subprocess(
         // bail without (re)spawning.
         if stop.is_cancelled() {
             final_reason = Some("stopped by operator before (re)spawn".to_string());
+            // door-scan: keep(loop-exit) the tail after the loop removes the added trees when no child ran
             break;
         }
         // Pin this attempt's Claude session id so coord can be told which
@@ -10631,6 +10632,7 @@ async fn run_agent_subprocess(
                         }
                         final_reason =
                             Some("stopped by operator (events.agent.stop_requested)".to_string());
+                        // door-scan: keep(loop-exit) the tail after the loop removes the added trees when no child ran
                         break;
                     }
                 };
@@ -10644,6 +10646,7 @@ async fn run_agent_subprocess(
                             payload.agent_id
                         );
                         final_exit_code = Some(0);
+                        // door-scan: keep(loop-exit) the tail after the loop removes the added trees when no child ran
                         break;
                     }
                     Ok(code) => {
@@ -10678,6 +10681,7 @@ async fn run_agent_subprocess(
                     // apart, so retrying would only re-post the same refusal
                     // `MAX_RESTARTS` times. Break straight to the terminal
                     // lifecycle post.
+                    // door-scan: keep(loop-exit) the tail after the loop removes the added trees when no child ran
                     break;
                 }
             }
@@ -10685,6 +10689,7 @@ async fn run_agent_subprocess(
 
         restarts += 1;
         if restarts >= MAX_RESTARTS {
+            // door-scan: keep(loop-exit) the tail after the loop removes the added trees when no child ran
             break;
         }
         // Brief back-off between restarts.
@@ -10697,7 +10702,7 @@ async fn run_agent_subprocess(
         // Clean exit was already reported via spawn-complete; nothing
         // more to send. The runner can release the claim explicitly via
         // a follow-up POST if desired.
-        // door-scan: kept — a child ran and exited cleanly
+        // door-scan: keep(post-child) a child ran and exited cleanly
         return Ok(());
     }
 
