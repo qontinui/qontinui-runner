@@ -1700,15 +1700,16 @@ impl UiBridgeHandler {
         // element id taken from one target's snapshot has to act on that
         // target. The step posts the target minus its step-addressing key
         // (`criteria`), whole, instead of rebuilding `{action, params}`.
-        let (action_endpoint, body) = match crate::mcp::ui_bridge::action_wire::element_action_request(
-            base_url,
-            step.ui_bridge_snapshot_target.as_deref(),
-            element_id,
-            &target,
-        ) {
-            Ok(request) => request,
-            Err(e) => return StepHandlerResult::failure(e),
-        };
+        let (action_endpoint, body) =
+            match crate::mcp::ui_bridge::action_wire::element_action_request(
+                base_url,
+                step.ui_bridge_snapshot_target.as_deref(),
+                element_id,
+                &target,
+            ) {
+                Ok(request) => request,
+                Err(e) => return StepHandlerResult::failure(e),
+            };
 
         match client.post(&action_endpoint).json(&body).send().await {
             Ok(resp) => {
@@ -2819,7 +2820,11 @@ mod element_action_step_wire_tests {
 
     #[test]
     fn a_target_with_no_action_name_fails_the_step_before_any_request() {
-        for target in [json!({"criteria": {}}), json!({"action": null}), json!({"action": 42})] {
+        for target in [
+            json!({"criteria": {}}),
+            json!({"action": null}),
+            json!({"action": 42}),
+        ] {
             let err = require_action_name(&target).expect_err("nameless target");
             assert!(err.message().contains("`action`"), "{target}");
         }
@@ -2856,7 +2861,10 @@ mod element_action_step_source_guard {
     #[test]
     fn the_step_posts_the_request_action_wire_built() {
         let src = handler_source();
-        assert!(src.contains("action_wire::element_action_request("), "{src}");
+        assert!(
+            src.contains("action_wire::element_action_request("),
+            "{src}"
+        );
         assert!(src.contains(".post(&action_endpoint).json(&body)"), "{src}");
     }
 
