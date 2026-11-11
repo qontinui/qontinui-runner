@@ -37,14 +37,20 @@ impl MutationRoot {
         // top-level sibling of a bare-string `action`, which the frontend
         // handler never reads — so every GraphQL element action ran with no
         // parameters at all (a `type` mutation typed nothing) while still
-        // reporting success. See `request::element_action_payload`.
-        let payload = ui_bridge::request::element_action_payload(
+        // reporting success. See `action_wire::element_action_payload`.
+        let payload = match ui_bridge::action_wire::element_action_payload(
             &element_id,
             serde_json::json!({
                 "action": action,
                 "params": params.map(|p| p.0).unwrap_or(serde_json::json!({})),
             }),
-        );
+        ) {
+            Ok(payload) => payload,
+            // A request with no action name is refused, never clicked.
+            Err(missing) => {
+                return Ok(action_result_for(Ok(missing.response()), "0".to_string()));
+            }
+        };
         bridge_mutation(state, "execute_action", payload).await
     }
 
