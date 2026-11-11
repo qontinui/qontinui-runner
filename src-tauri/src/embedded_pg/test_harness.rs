@@ -122,6 +122,13 @@ pub const EXTERNAL_URL_ENV: &str = "QONTINUI_TEST_PG_URL";
 /// pass 100. The exit-time summary reports the measured peak against it.
 pub const MAX_CONNECTIONS: u32 = 400;
 
+// Clearing PostgreSQL's default is the whole point of setting it: a compile
+// error, not a test, if it is ever lowered back to the default or below.
+const _: () = assert!(
+    MAX_CONNECTIONS > 100,
+    "MAX_CONNECTIONS must clear PostgreSQL's default of 100"
+);
+
 /// Bump when the way the template cache is BUILT changes in a way its other key
 /// inputs cannot see, so every machine rebuilds rather than reusing a cache
 /// built the old way.
@@ -2667,10 +2674,6 @@ mod tests {
         assert_eq!(
             configuration.get("max_connections"),
             Some(&MAX_CONNECTIONS.to_string())
-        );
-        assert!(
-            MAX_CONNECTIONS > 100,
-            "the point of setting it is to clear PostgreSQL's default of 100"
         );
         assert_eq!(
             configuration.get("unix_socket_directories"),
