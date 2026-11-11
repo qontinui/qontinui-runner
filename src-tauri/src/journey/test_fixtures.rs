@@ -1,10 +1,17 @@
 //! Shared test fixtures for the journey routes and the timeline consumers.
 
+use chrono::{TimeZone, Utc};
 use qontinui_types::journey::{
-    FrontierEntry, JourneyEdgeObservation, JourneyLedgerHealth, JourneyNode, LedgerState,
+    FrontierEntry, JourneyEdgeObservation, JourneyGraph, JourneyLedgerHealth, JourneyNode,
+    LedgerState,
 };
 use qontinui_vision_core::ChangeTimeline;
 use serde_json::{json, Value};
+
+use super::routes::{
+    answer_dead_ends, answer_graph, answer_prior_knowledge, answer_reachable, answer_steps,
+    AnswerCtx, ReadGaps,
+};
 
 pub(crate) fn writing() -> JourneyLedgerHealth {
     JourneyLedgerHealth {
@@ -135,4 +142,102 @@ pub(crate) fn anim(ty: &str, at: u64, name: &str) -> Value {
 /// A `page-changed` event carrying a URL with user input in its path.
 pub(crate) fn page_changed(at: u64, url: &str) -> Value {
     json!({ "type": "page-changed", "offsetMs": at, "summary": format!("navigated to {url}"), "url": url })
+}
+
+// -- A grouped read concludes what its rows would -------------------------
+
+/// An answer's `status`, which every envelope carries.
+pub(crate) fn status(v: &Value) -> &str {
+    v["status"].as_str().expect("status is always present")
+}
+
+/// What an answer concludes: everything but the size of the counts.
+pub(crate) fn verdict(v: &Value) -> Value {
+    let result = if status(v) == "measured" {
+        &v["value"]
+    } else {
+        &v["provenance"]["source"]["result"]
+    };
+    let keys = |field: &str| -> Vec<Value> {
+        result[field]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .map(|n| json!([n["nodeKey"], n["backOnly"]]))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let dimensions: Vec<Value> = v["provenance"]["coverage"]["unmeasured"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| json!([d["dimension"], d["code"]]))
+        .collect();
+    json!({
+        "status": v["status"],
+        "code": v["unknown"]["code"],
+        "deadEnds": keys("deadEnds"),
+        "unexplored": keys("unexplored"),
+        "settled": keys("nodes"),
+        "unsettled": keys("unsettled"),
+        "dimensions": dimensions,
+        "unknownDestinations": result["unknownDestinationArrivals"].as_u64().unwrap_or(0) > 0,
+    })
+}
+
+/// Every graph answer reaches the same [`verdict`] over `whole` —
+/// `build_graph` over every row of a ledger — and over `grouped` — the same
+/// ledger read with its rows before `since` grouped
+/// (`LedgerRead::build_graph`). Only the size of the counts may differ: a
+/// grouped read counts each group once in every count but the three row totals
+/// it corrects (`journey::read`'s module doc).
+///
+/// `reachable` is asked from `from`, and `steps` from `steps_from` to
+/// `steps_to`; `what` names the ledger in a failure.
+pub(crate) fn assert_same_conclusions(
+    what: &str,
+    whole: &JourneyGraph,
+    grouped: &JourneyGraph,
+    from: &str,
+    steps_from: &str,
+    steps_to: &str,
+) {
+    let c = AnswerCtx {
+        query: "q",
+        app_id: "app",
+        gaps: ReadGaps::default(),
+        evaluated_at: Utc.with_ymd_and_hms(2026, 10, 24, 12, 0, 0).unwrap(),
+    };
+    let pairs = [
+        ("graph", answer_graph(&c, whole), answer_graph(&c, grouped)),
+        (
+            "dead-ends",
+            answer_dead_ends(&c, whole),
+            answer_dead_ends(&c, grouped),
+        ),
+        (
+            "prior-knowledge",
+            answer_prior_knowledge(&c, whole),
+            answer_prior_knowledge(&c, grouped),
+        ),
+        (
+            "reachable",
+            answer_reachable(&c, whole, from),
+            answer_reachable(&c, grouped, from),
+        ),
+        (
+            "steps",
+            answer_steps(&c, whole, steps_from, steps_to),
+            answer_steps(&c, grouped, steps_from, steps_to),
+        ),
+    ];
+    for (name, a, b) in pairs {
+        assert_eq!(
+            verdict(&a),
+            verdict(&b),
+            "{what}: the {name} answer concludes differently over grouped rows \
+             than over every row\nrows {a:#}\ngroups {b:#}"
+        );
+    }
 }
