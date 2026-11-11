@@ -881,15 +881,9 @@ fn bold_span(s: &str) -> String {
 /// deliberately this narrow: a non-bare span is left to [`heading_rank`],
 /// whose sentence/title split already exists, and every other arm is
 /// untouched.
-///
-/// A bare LABEL span (`**Phase A**, near-verbatim.`, `**Phase C1** of the
-/// other plan`) is the same citation shape and is inert the same way (plan
-/// `2026-11-09-lettered-phase-headings-never-reach-coords-phase-declaration`,
-/// Phase 2: arm A's label reading includes this inertness).
 fn bold_phase_opens_a_sentence(rest: &str) -> bool {
-    static BARE_PHASE: Lazy<Regex> = Lazy::new(|| {
-        Regex::new(r"^Phase\s+(?:[0-9]+[A-Za-z]?|[A-Z][0-9]*)$").expect("valid regex")
-    });
+    static BARE_PHASE: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"^Phase\s+[0-9]+[A-Za-z]?$").expect("valid regex"));
     let Some((span, after)) = rest.split_once("**") else {
         return false;
     };
@@ -897,6 +891,21 @@ fn bold_phase_opens_a_sentence(rest: &str) -> bool {
         return false;
     }
     bold_span_continues_as_a_sentence(after)
+}
+
+/// A bare bold LABEL span (`**Phase A**, near-verbatim.`, `**Phase C1** of
+/// the other plan`) continued as sentence prose: the citation shape of
+/// [`bold_phase_opens_a_sentence`], so it declares no label (plan
+/// `2026-11-09-lettered-phase-headings-never-reach-coords-phase-declaration`,
+/// Phase 2). Unlike the numeric case it is NOT made inert: before labels
+/// existed such a line was an ordinary column-0 bold line that ended the
+/// phase list, and it still does, so numeric output is unchanged.
+fn bold_phase_label_opens_a_sentence(rest: &str) -> bool {
+    static BARE_LABEL: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"^Phase\s+[A-Z][0-9]*$").expect("valid regex"));
+    rest.split_once("**").is_some_and(|(span, after)| {
+        BARE_LABEL.is_match(span.trim()) && bold_span_continues_as_a_sentence(after)
+    })
 }
 
 /// The text after a bare bold span's closing `**` continues the line as
@@ -1273,14 +1282,18 @@ fn detect_phases(body: &str) -> DetectedPhases {
                     declare(&mut out, index, name, rank);
                 }
                 // A label is declared wherever a number in the same position
-                // would be, with the same effect on the phase-list state.
+                // would be. Its effect on the phase-list state is exactly the
+                // pre-label one (any column-0 bold line that names no number
+                // ends the list), so arms B-D declare byte-identically.
                 Some(PhaseKey::Label(label)) => {
-                    let name = bold_span(rest);
-                    let rank = heading_rank(&name);
-                    if rank == NameRank::HeadingTitle {
+                    if column0 {
                         list = PhaseList::Off;
                     }
-                    declare_label(&mut labels, label, name, rank);
+                    if !bold_phase_label_opens_a_sentence(rest) {
+                        let name = bold_span(rest);
+                        let rank = heading_rank(&name);
+                        declare_label(&mut labels, label, name, rank);
+                    }
                 }
                 None => {
                     if !bold_undeclared_mention_opens_a_sentence(rest) {
@@ -2202,11 +2215,13 @@ mod tests {
         assert_eq!(u.phase_labels[0].name, "Phase A/B testing");
     }
 
-    /// A bare bold label span continued as sentence prose is a citation, inert
-    /// exactly as `**Phase 6**, near-verbatim.` is (coord finding f4812a7f): no
-    /// label, no undeclared token, and the phase-list state is untouched.
+    /// A bare bold label span continued as sentence prose is a citation, as
+    /// `**Phase 6**, near-verbatim.` is (coord finding f4812a7f): no label and
+    /// no undeclared token. It still ends a phase list as any column-0 bold
+    /// line naming no number did before labels existed (see
+    /// `phases_a_lettered_bold_line_leaves_numeric_output_unchanged`).
     #[test]
-    fn phases_bold_bare_label_followed_by_sentence_prose_is_inert() {
+    fn phases_bold_bare_label_followed_by_sentence_prose_declares_no_label() {
         for line in [
             "**Phase A**, near-verbatim.",
             "**Phase C1** of the other plan covers this.",
@@ -2218,12 +2233,6 @@ mod tests {
             assert!(u.phases_undeclared.is_empty(), "{line}");
             assert_eq!(indices(&body), vec![1, 2], "{line}");
         }
-        let template = "# T\n\n## Phases\n\nFor each object:\n\nLINE\n\n1. probe\n2. build\n";
-        assert_eq!(
-            indices(&template.replace("LINE", "**Phase A**, near-verbatim.")),
-            indices(&template.replace("LINE", "")),
-            "inert like a blank line"
-        );
         // A bare bold label that IS a title still declares.
         for (line, name) in [
             ("**Phase A**", "Phase A"),
@@ -2234,6 +2243,30 @@ mod tests {
             assert_eq!(u.phase_labels.len(), 1, "{line}");
             assert_eq!(u.phase_labels[0].name, name, "{line}");
         }
+    }
+
+    /// Numeric output is byte-identical to the pre-label parser on a lettered
+    /// bold line: a column-0 `**Phase A …` line (a sentence, a bare citation,
+    /// or a title) ends the phase list exactly as it did when it named no
+    /// phase at all, so the numbered items after it are steps, not phases.
+    /// Fails if a label sentence or citation leaves the list armed.
+    #[test]
+    fn phases_a_lettered_bold_line_leaves_numeric_output_unchanged() {
+        for line in [
+            "**Phase A is a gate** before anything.",
+            "**Phase A**, near-verbatim.",
+            "**Phase A — the title**",
+        ] {
+            let body = format!("# T\n\n## Phases\n\n{line}\n\n1. schema\n2. wiring\n");
+            assert!(
+                indices(&body).is_empty(),
+                "{line}: {:?}",
+                parse(&body).phases
+            );
+        }
+        // An INDENTED lettered bold line changes nothing, as before.
+        let body = "# T\n\n## Phases\n\n1. schema\n  **Phase A is a gate**\n2. wiring\n";
+        assert_eq!(indices(body), vec![1, 2]);
     }
 
     /// D3: a capitalised title token that neither grammar reads is REPORTED,
@@ -2302,8 +2335,10 @@ mod tests {
     /// mixed and undeclared plans), and separately every entry it could not
     /// read (a directory-entry error, or a file that is unreadable or not
     /// UTF-8). To measure a grammar change for gained AND lost indices, run it
-    /// on both parsers (cherry-pick this test onto the old one) and diff the
-    /// row lines. Point `QONTINUI_PHASE_CENSUS_DIR` at a `plans/` directory and
+    /// on both parsers and diff only the first four tab-separated columns of
+    /// the row lines (file, indices, names). On a parser that predates
+    /// `DetectedPhases` (`detect_phases` returning `Vec<ParsedPhase>`), run the
+    /// pre-change body of this test: this one does not compile there. Point `QONTINUI_PHASE_CENSUS_DIR` at a `plans/` directory and
     /// run `cargo test -- phase_census --ignored --nocapture`.
     #[test]
     #[ignore = "measuring tool: reads QONTINUI_PHASE_CENSUS_DIR, prints and returns when it is unset"]

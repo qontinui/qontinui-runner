@@ -39,8 +39,11 @@
 //!   read them would see a label entry among numbered ones as an unreadable
 //!   declaration and un-gate the unit; a separate key is ignored by it (plan
 //!   `2026-11-09-lettered-phase-headings-never-reach-coords-phase-declaration`,
-//!   D2). Neither new key had a session or coord writer before it was added:
-//!   that plan's Phase 0 step 3 reads stored metadata for one.
+//!   D2). Roster precondition, measured: that plan's Phase 0 step 3 read
+//!   tenant `c231d9da` on 2026-11-11 and found 0 of 6006 work units carrying
+//!   `phase_labels` or `phases_undeclared` (coord finding
+//!   `4e77fe68-1d31-46a8-8c8d-daedd887746b`); the device's other bound tenants
+//!   were not read.
 //!
 //! A stale key the scanner does NOT own is its writer's to remove with
 //! `{key: null}`; the scanner cannot know whether it is stale and must not guess.
