@@ -141,17 +141,7 @@ pub fn tail_lines_from<R: Read + Seek>(
     // `first < widest` implies `start > 0`: the first window is a strict tail.
     if first < widest && lines_after_partial(&window) < n {
         let wide_start = len - widest;
-        let front = start - wide_start;
-        // Sized for the whole widened read up front, so joining the first
-        // window on never reallocates past `cap`.
-        let mut wide = Vec::with_capacity(usize::try_from(widest).unwrap_or(0));
-        src.seek(SeekFrom::Start(wide_start))?;
-        src.by_ref().take(front).read_to_end(&mut wide)?;
-        // A short read means the source shrank (rotated or truncated) between
-        // the two reads. Joining it on would splice two different files, so the
-        // first window stands on its own.
-        if wide.len() as u64 == front {
-            wide.extend_from_slice(&window);
+        if let Some(wide) = widen(src, wide_start, start, &window)? {
             return Ok(LineTail::of_window(&wide, wide_start, n, len));
         }
     }
@@ -160,10 +150,43 @@ pub fn tail_lines_from<R: Read + Seek>(
 
 /// Bytes `[start, start + count)` of `src` — fewer only when it ends first.
 fn read_range<R: Read + Seek>(src: &mut R, start: u64, count: u64) -> io::Result<Vec<u8>> {
-    src.seek(SeekFrom::Start(start))?;
     let mut bytes = Vec::with_capacity(usize::try_from(count).unwrap_or(0));
-    src.by_ref().take(count).read_to_end(&mut bytes)?;
+    read_range_into(src, start, count, &mut bytes)?;
     Ok(bytes)
+}
+
+/// [`read_range`], appended to `buf`: the one bounded read every window uses.
+fn read_range_into<R: Read + Seek>(
+    src: &mut R,
+    start: u64,
+    count: u64,
+    buf: &mut Vec<u8>,
+) -> io::Result<()> {
+    src.seek(SeekFrom::Start(start))?;
+    src.by_ref().take(count).read_to_end(buf)?;
+    Ok(())
+}
+
+/// Bytes `[wide_start, start)` of `src` with `window` (the bytes from `start`
+/// on) joined after them, in one buffer sized for both up front, so the join
+/// never reallocates. `None` when the front read came up short: the source
+/// shrank (rotated or truncated) between the two reads, and joining it on
+/// would splice two different files.
+fn widen<R: Read + Seek>(
+    src: &mut R,
+    wide_start: u64,
+    start: u64,
+    window: &[u8],
+) -> io::Result<Option<Vec<u8>>> {
+    let front = start - wide_start;
+    let joined = front + window.len() as u64;
+    let mut wide = Vec::with_capacity(usize::try_from(joined).unwrap_or(0));
+    read_range_into(src, wide_start, front, &mut wide)?;
+    if wide.len() as u64 != front {
+        return Ok(None);
+    }
+    wide.extend_from_slice(window);
+    Ok(Some(wide))
 }
 
 /// `window` after its first `\n`: the whole lines a window that starts
@@ -549,5 +572,53 @@ mod tests {
             tail_lines_from(&mut Cursor::new(&bytes), len, 100, TAIL_FIRST_WINDOW).unwrap();
         assert_eq!(shrunk.lines, first_only.lines);
         assert!(shrunk.lines.len() < 100);
+    }
+
+    /// The widened buffer is sized for the join up front: joining the first
+    /// window on never grows it past the bytes it holds. The widened range is
+    /// one byte short of the cap on purpose: a buffer grown by doubling from
+    /// empty lands on exactly 2^22, so a range of exactly `LOG_TAIL_CAP` could
+    /// not tell a pre-sized buffer from an unsized one.
+    #[test]
+    fn the_widened_buffer_is_sized_for_the_join() {
+        let mut log = CountingLog::new(1_000, 10_000);
+        let len = log.len;
+        let start = len - TAIL_FIRST_WINDOW;
+        let window = read_range(&mut log, start, TAIL_FIRST_WINDOW).unwrap();
+        let wide = widen(&mut log, len - LOG_TAIL_CAP + 1, start, &window)
+            .unwrap()
+            .expect("the source did not shrink");
+        assert_eq!(wide.len() as u64, LOG_TAIL_CAP - 1);
+        assert!(
+            wide.capacity() <= wide.len(),
+            "capacity {} for {} bytes",
+            wide.capacity(),
+            wide.len()
+        );
+    }
+
+    /// `tail_lines_from` widens through `widen`, so a revert to an inline,
+    /// unsized join fails here rather than passing silently with `widen`
+    /// left as dead code. Searches the production half's code only.
+    #[test]
+    fn tail_lines_from_widens_through_widen() {
+        let src = include_str!("file_tail.rs");
+        let (prod, _) = src.split_once("#[cfg(test)]").expect("a test module");
+        let (_, rest) = prod
+            .split_once("pub fn tail_lines_from<")
+            .expect("tail_lines_from");
+        let (body, _) = rest.split_once("\n}\n").expect("fn closed at column 0");
+        // `process_helpers::code_lexer`: comments are removed and literals
+        // emptied, so only call syntax counts.
+        use crate::process_helpers::code_lexer::{code_only_from, Lex};
+        let mut lex = Lex::Code;
+        let code: Vec<String> = body
+            .lines()
+            .map(|line| code_only_from(line, &mut lex))
+            .collect();
+        assert!(
+            code.iter().any(|line| line.contains("widen(src")),
+            "tail_lines_from must widen through widen()"
+        );
     }
 }
