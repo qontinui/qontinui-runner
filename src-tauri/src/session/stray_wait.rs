@@ -3298,10 +3298,21 @@ mod tests {
             let cmd = format!("until ! pgrep -f \"{token}\" >/dev/null; do sleep 1; done");
             let (_child, stray) = start_loop(dir.path(), &cmd, "a");
             let parent = live::read_table().unwrap()[&stray.pid].0;
-            assert_eq!(
-                live::verdicts(&[(parent, stray.pid)], 0),
-                [stray.pid].into_iter().collect::<HashSet<u32>>()
-            );
+            // The loop forks `pgrep` and `sleep` every second, and a child that has
+            // exited but is not yet reaped reads with an EMPTY argv, so one sample
+            // can land between steps and judge the loop not stray. Read until a
+            // sample lands outside that window (bounded, as in the self-matching
+            // test above); the parent check this test is about is deterministic.
+            let expected = [stray.pid].into_iter().collect::<HashSet<u32>>();
+            let mut judged = live::verdicts(&[(parent, stray.pid)], 0);
+            for _ in 0..100 {
+                if judged == expected {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+                judged = live::verdicts(&[(parent, stray.pid)], 0);
+            }
+            assert_eq!(judged, expected);
             let not_the_parent = parent.wrapping_add(1).max(1);
             assert!(live::verdicts(&[(not_the_parent, stray.pid)], 0).is_empty());
         }
