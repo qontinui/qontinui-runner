@@ -73,11 +73,35 @@ Review code changes for:
 A review READS. It never stops, kills or signals a process it did not start,
 and that includes cleanup at the end; nor does it delete a file it did not
 create. Prefer foreground commands under a `timeout`, so nothing is left to
-clean up. When you must background something, print its PID as you start it
-(`cmd >"$SCRATCH/job.log" 2>&1 & echo "pid=$!"`, since each Bash call is a
-fresh shell and `$!` does not survive to the next one; the redirect keeps the
-job off the tool's own output). Before signalling that recorded PID, confirm
-`ps -p <pid> -o args=` still shows your command, because a PID can be reused. Never kill by name or
+clean up.
+
+**Any experiment that starts a background process, or loops over a spawn,
+runs inside ONE owner-bound launcher:**
+`python3 <ccfg>/scripts/owned-run.py --max-runtime <s> -- bash -c '…'`
+(`<ccfg>` is the checkout that carries `scripts/owned-run.py`). That makes the whole tree a
+child of a subreaper, so it is torn down with the experiment, the deadline or
+the session, `setsid` escapees included (a SIGKILL of the launcher itself
+reaches only its group leader; let it end on its own bound). A recorded `$!` is NOT enough:
+under job control (`set -m`) util-linux `setsid` FORKS, so `$!` names a parent
+that has already exited while the real process runs on in a new session. On
+2026-10-31 a reviewer testing an EXIT-trap claim leaked 250 infinite
+`while :; do /bin/true; done` loops that way; the box sat at load 285 on 48
+cores for a day (plan `2026-11-02-a-cpu-burning-orphan-loop-on-linux-runs-unseen`).
+If you still record a PID for a single foreground-able job, print it as you
+start it (`cmd >"$SCRATCH/job.log" 2>&1 & echo "pid=$!"`, since each Bash call
+is a fresh shell), and before signalling it confirm `ps -p <pid> -o args=` still
+shows your command, because a PID can be reused.
+
+**An experiment that leaves survivors is not a result.** If its output reports
+survivors (a `left=N` style count above 0), or any process it started is still
+running, stop the ones you can name by a PID you recorded, or find by a parent PID you
+recorded (never 1 and never a `systemd`: a `setsid` escapee is reparented there,
+so "its parent" becomes every orphan on the box) or by a unique token you minted
+yourself and read back from each candidate's own cmdline before signalling it
+(a token scan is allowed; `pkill -f <token>` is not), and report the survivor
+count as a finding.
+Never hunt survivors with a box-wide name or pattern count. Those are processes YOU
+started, so this does not loosen the rule below. Never kill by name or
 pattern: no `pkill`, no `killall`, no `kill $(pgrep …)`, no `taskkill /IM`. The
 box you review on runs many sessions at once. A pattern like `pkill -f cargo`
 or `pkill -f nextest` matches their builds and test runs too, and `node`
@@ -88,7 +112,7 @@ way, report it and do not touch it. Served policy `production-and-cost`
 
 ## Review Process
 
-### Step 1: Measure the tree, THEN understand context
+### Step 1: Measure the tree, then begin Pass A: judge the diff BLIND
 
 **Measure FIRST — before you read a single diff.** Your report's first line is
 the tree identity you actually read, and it is only honest if it was measured
@@ -109,47 +133,42 @@ Keep that line verbatim. `head=` is the sha every read below is pinned to; a
 field reading `unknown` means the probe could not measure and is never to be
 re-spelled as `clean` or as a plausible value.
 
-Read:
+**Pass A reads these, and nothing else:**
 - What changed: `git diff <head>` — the sha the line above named, so the diff
-  you review is pinned to the tree you measured. A bare `git diff` is
+  you review is pinned to the tree you measured (for the committed range your
+  brief names, `git diff <base> <head>`). A bare `git diff` is
   unpinned: it re-resolves `HEAD` at the moment it runs, so a commit landing
   under you silently changes the subject of the review and nothing in the
-  report would say so.
-- Why it changed: the PR description, and the commit messages — which Step 1b
-  makes a SUBJECT of this review, not only context
+  report would say so. Read it in a form that prints no commit message:
+  `git diff` prints none and neither does `git show --format= <sha>`; a bare
+  `git show`, `git log` and `git log -p` do.
+- The code at `<head>` that the diff touches or depends on (a caller, a
+  definition, a test), read through the pinned read in "Pinned citations"
+  below. Code is not the author's account of the change, so it belongs to Pass
+  A; a finding that needs unchanged code is still a blind finding.
 - Project context: CLAUDE.md
 - Best practices: knowledge-base/best-practices/[language].md
+- The checklists of Steps 2–7 below, and the two knowledge-base files they
+  name (`knowledge-base/debugging/errors.md`,
+  `knowledge-base/qontinui-specific/common-pitfalls.md`). **Steps 2–7 ARE Pass
+  A**: run them over the diff before the seal (Step 7b). Every finding they
+  raise is a Pass A line.
 
-### Step 1b: The commit messages are a subject, not only context
+**Not yet: the author's account of the change.** The PR description, the
+commit messages, the plan or task goals your brief names (they say what the
+change is FOR), and the arming record your brief carries (its `reason` texts
+are the implementer's own words) are Pass B's inputs, Step 7c. Pass A judges
+the diff before any of them has said what the change is FOR. An explanation
+read first makes a defect easier to accept as intended, and a defect is a
+defect whatever a message says it was meant to do.
 
-A diff-reading review passes a correct diff under a false message, and the
-false sentence is what `git log` keeps. Two obligations, one of them mechanical:
-
-1. **Congruence.** Run check #62 over the reviewed range and read its report:
-
-   ```bash
-   python3 <workspace-root>/qontinui-claude-config/scripts/lint-commit-message-congruence.py --repo <reviewed checkout> --range <base>..<head>
-   ```
-
-   On a Windows box whose Python 3 is spelled `python` or `py -3`, use that name.
-
-   Confirm each `FLAGGED` unit against `git show <sha>`: an edit the message
-   describes and the diff does not carry is a finding. `weak` and `WITHHELD`
-   lines are leads, not findings — the check reads three lines of context and
-   no other commit. A clean report says nothing about claims of the next kind.
-
-2. **Claims about the world outside the diff.** List every factual claim that a
-   commit message makes, **or that prose the diff ADDS makes** (a comment, a
-   doc string, an assert or error message), about something the diff cannot
-   show: a version boundary, "this predates X", "confirmed by measurement", a
-   measured count, another repository's history. Mark each one:
-   - **VERIFIED** — with the command that settled it named beside it; or
-   - **STRUCK** — a required fix: the claim comes out of the message or the
-     added prose.
-
-   There is no third option. "Probably right" is not VERIFIED.
+Run Steps 2–7 now, against the diff and the code it reaches, then seal in Step
+7b. Pass B (Step 7c) comes after the seal.
 
 ### Step 2: Common Error Patterns Check
+
+*Steps 2–7 are Pass A's checklist: run them against the diff and the code it reaches, then seal
+what they find in Step 7b.*
 
 Cross-reference with **knowledge-base/debugging/errors.md**:
 
@@ -257,6 +276,77 @@ Check for:
 - [ ] Authorization checks (user can do this?)
 - [ ] Secrets in code (no hardcoded keys!)
 
+### Step 7b: Seal Pass A
+
+**Seal Pass A now, before you read anything else.** Write each Pass A finding as one
+line, `A<n> | <severity> | <path>:<line> | <the finding, in one sentence>`
+(severity `critical`, `warning` or `suggestion`, or the scale your brief names;
+the sealer checks only that the field is there), each `A<n>` used once, and pipe the lines through the sealer.
+A sealed line's `<path>:<line>` is the line at `<head>`; from Step 8 on, the
+report cites every finding — a sealed one beside its `A<n>` — in the "Pinned
+citations" grammar (`<repo>@<sha12>:<path>:<line>`), so the two contracts never
+collide. The Step 8 template abbreviates its citations to `file1.py:42` for
+brevity; a real report spells them out:
+
+```bash
+bash <workspace-root>/qontinui-claude-config/scripts/review-blind-pass.sh seal <<'PASS_A'
+A1 | critical | src/ledger.py:42 | the loop stops one entry early, so the last entry is never totalled
+PASS_A
+```
+
+It prints the sealed block: a `#### Pass A (sealed)` heading, `blind_sealed_at`
+(UTC, measured by the script), your lines, then `blind_digest`, the sha256 of
+the block's bytes without its own `blind_digest` line (UTF-8, LF line endings,
+trailing spaces and tabs stripped from each line, one final newline). Pipe nothing
+when Pass A found nothing; the block then reads `none`. Copy the printed block
+into your report VERBATIM and exactly once (Step 8 places it), and **never edit
+it afterwards**: the parent re-hashes those bytes, and an edited block is
+recorded as `blind_digest_mismatch`. When the script cannot run, say so in the
+report and write no block, never a digest computed by hand.
+
+### Step 7c: Pass B — the author's account is a SUBJECT, not context
+
+*(Step 1b before 2026-11-09.)* Only now read the PR description, the commit
+messages (before a PR exists they are the live input: `git log <base>..<head>`),
+the plan or task goals your brief names, and the arming record your brief
+carried. They are what this step CHECKS, not what settles a Pass A finding:
+
+- A Pass A finding stands unless something you VERIFIED in the tree shows it
+  wrong, never because a message says the behaviour is intended. A message
+  that argues for a defect the diff shows is a finding of its own, under
+  obligation 2 below.
+- What Pass B learns about a Pass A finding goes beside that finding in the
+  report (on its own line below the finding's heading, never after the label),
+  never into the sealed block.
+- A finding Pass B raises for the first time is `raised_in: context` (Step 8).
+
+A diff-reading review passes a correct diff under a false message, and the
+false sentence is what `git log` keeps. Two obligations, one of them mechanical:
+
+1. **Congruence.** Run check #62 over the reviewed range and read its report:
+
+   ```bash
+   python3 <workspace-root>/qontinui-claude-config/scripts/lint-commit-message-congruence.py --repo <reviewed checkout> --range <base>..<head>
+   ```
+
+   On a Windows box whose Python 3 is spelled `python` or `py -3`, use that name.
+
+   Confirm each `FLAGGED` unit against `git show <sha>`: an edit the message
+   describes and the diff does not carry is a finding. `weak` and `WITHHELD`
+   lines are leads, not findings — the check reads three lines of context and
+   no other commit. A clean report says nothing about claims of the next kind.
+
+2. **Claims about the world outside the diff.** List every factual claim that a
+   commit message makes, **or that prose the diff ADDS makes** (a comment, a
+   doc string, an assert or error message), about something the diff cannot
+   show: a version boundary, "this predates X", "confirmed by measurement", a
+   measured count, another repository's history. Mark each one:
+   - **VERIFIED** — with the command that settled it named beside it; or
+   - **STRUCK** — a required fix: the claim comes out of the message or the
+     added prose.
+
+   There is no third option. "Probably right" is not VERIFIED.
+
 ### Step 8: Generate Review Report
 
 **Re-measure the tree BEFORE you emit, and say whether it moved.** Run the same
@@ -273,9 +363,40 @@ The two lines below are the report's FIRST lines, above the heading —
 deliberately, because a leading identity line is the one line a `| head -N`
 cannot hide.
 
+**The sealed block follows them, and every finding names the pass that raised
+it.** Paste the block Step 7b printed directly below the two tree lines. Each
+finding the report raises carries exactly one label: `raised_in: blind` for a
+finding the sealed block lists (its `A<n>` immediately before the label, as in
+`` — A1, `raised_in: blind` `` — an id earlier on the line is not read as the
+citation), `raised_in: context` for one
+Pass B raised first. The label is the LAST thing on the finding's heading or
+bullet line, one per line: the parent counts only labels in that position, so
+prose that quotes the label grammar elsewhere is not counted as a finding. A sealed finding never leaves the report: when Pass B
+verified it wrong, say so on a line BELOW its heading — never after its label,
+which must stay the last thing on the heading line — and keep its label. Every finding counts
+once toward the round's total: a sealed finding Pass B verified wrong, a
+confirmed FLAGGED unit and a STRUCK claim each count, and each carries its one
+label. The parent counts the
+labels into the review record (`findings_raised_in`), and their sum is the
+round's `findings_count`, which the parent counts itself — every finding,
+labelled or not — and checks the labels against. So an unlabelled finding is
+marked as a disagreement, and a sealed finding the report dropped is one the
+parent's check names. A label inside a code fence is a quote and is not
+counted.
+
 ```markdown
 tree: root=<name> head=<sha> dirty=<digest|clean|unknown> dirty_files=<n|UNKNOWN> measured=<ISO-8601-UTC>
 tree-recheck: head=<sha> moved=<yes|no|unknown> measured=<ISO-8601-UTC>
+
+#### Pass A (sealed)
+blind_sealed_at: <exactly as review-blind-pass.sh seal printed it>
+A1 | critical | file1.py:42 | data.user is dereferenced with no None check
+A2 | critical | file2.tsx:78 | fetchData's promise has no rejection handler
+A3 | warning | file1.py:100 | process_workflow is 75 lines
+A4 | warning | file2.tsx:150 | four levels of nesting
+A5 | warning | file1.py:90 | process_data's parameter has no type hint
+A6 | suggestion | file1.py:130 | the error handling block logs nothing
+blind_digest: <exactly as review-blind-pass.sh seal printed it>
 
 ## Code Review Report
 
@@ -284,23 +405,25 @@ tree-recheck: head=<sha> moved=<yes|no|unknown> measured=<ISO-8601-UTC>
 - file2.tsx (120 lines changed)
 - file3.rs (30 lines changed)
 
-### Commit Messages (Step 1b)
+### Commit Messages (Step 7c)
 - check #62: <its closing `check #62:` summary line, verbatim>
-- FLAGGED units confirmed against `git show <sha>`: <none | sha + the claim>
+- FLAGGED units confirmed against `git show <sha>`: <none, or one line per confirmed unit:>
+  - <sha> "<the claim>" — `raised_in: context`
 - External claims:
   - VERIFIED "<claim>" — `<the command that settled it>`
-  - STRUCK "<claim>" — <the commit or file:line it must come out of>
+  - STRUCK "<claim>" — <the commit or file:line it must come out of> — `raised_in: context`
 
 ### Summary
 - ✓ 15 checks passed
 - ⚠️ 3 warnings
-- ❌ 2 issues found
+- ❌ 2 issues found, plus 1 confirmed FLAGGED unit and 1 struck claim
+- raised_in: 6 blind, 2 context
 
 ---
 
 ### Critical Issues (Fix Before Merge)
 
-#### 1. Missing None Check (file1.py:42)
+#### 1. Missing None Check (file1.py:42) — A1, `raised_in: blind`
 **Risk:** TypeError when `data.user` is None
 
 ```python
@@ -315,7 +438,7 @@ user_name = data.user.name if data.user else "Unknown"
 
 ---
 
-#### 2. Unhandled Promise (file2.tsx:78)
+#### 2. Unhandled Promise (file2.tsx:78) — A2, `raised_in: blind`
 **Risk:** Silent failures, errors not logged
 
 ```typescript
@@ -335,7 +458,7 @@ fetchData()
 
 ### Warnings (Consider Addressing)
 
-#### 1. Function Too Long (file1.py:100)
+#### 1. Function Too Long (file1.py:100) — A3, `raised_in: blind`
 **Issue:** `process_workflow` is 75 lines
 
 **Suggestion:** Extract to smaller functions:
@@ -347,7 +470,7 @@ fetchData()
 
 ---
 
-#### 2. Deep Nesting (file2.tsx:150)
+#### 2. Deep Nesting (file2.tsx:150) — A4, `raised_in: blind`
 **Issue:** 4 levels of nesting
 
 ```typescript
@@ -370,8 +493,9 @@ if (!resource.available) return null;
 
 ---
 
-#### 3. Missing Type Annotation (file1.py:90)
+#### 3. Missing Type Annotation (file1.py:90) — A5, `raised_in: blind`
 **Issue:** Parameter `data` has no type hint
+**Pass B:** VERIFIED still open — the commit message says types follow in a later PR, which settles nothing about this diff. (A Pass B note goes on its own line, like this one; after the label it would hide the label.)
 
 ```python
 # Current
@@ -420,9 +544,9 @@ def process_data(data: Dict[str, Any]) -> ProcessedData:
 - Logging at key points
 - Functions are testable
 
-**Could improve:**
-- Add logging to error handling blocks (file1.py:130, 145)
-- Extract complex conditionals for clarity (file2.tsx:150)
+**Could improve** (each NEW finding carries its id and label; a bullet that repeats one already reported points at it instead):
+- Add logging to the error handling block (file1.py:130) — A6, `raised_in: blind`
+- Extract the complex conditional for clarity (file2.tsx:150) — the same finding as A4 above, so it carries no second label
 
 ---
 
