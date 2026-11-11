@@ -301,9 +301,9 @@ pub async fn terminal_create(
     // so a CRITICAL refusal has somewhere to go — the frontend re-invokes with
     // `resource_override: true` once they pick "Start anyway".
     let create_resource_override = resource_override.unwrap_or(false);
-    // door-scan: spawn — the door's real spawn; the context is in hand until here.
     let joined = spawn_blocking_tracked(move || {
         let _create_span = tracing::debug_span!("terminal_spawn.manager_create").entered();
+        // door-scan: spawn — the door's real spawn; the context is in hand until here.
         create_manager.create(
             create_title,
             create_working_dir,
