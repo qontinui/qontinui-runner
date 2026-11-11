@@ -371,7 +371,11 @@ mod imp {
                 &mut written,
             )
         };
-        if status < 0 || (written as usize) < header {
+        // `written` is the kernel's word for how much of `buf` it filled; it
+        // can never honestly exceed the `needed` bytes it was handed, and every
+        // bound below trusts it, so a larger value is refused rather than
+        // carried into a slice that would run past `buf`.
+        if status < 0 || (written as usize) < header || written > needed {
             return None;
         }
         // SAFETY: the call succeeded, so the buffer starts with a UNICODE_STRING
@@ -1022,7 +1026,11 @@ mod tests {
     #[test]
     fn raw_command_line_returns_the_cmd_wrapper_line_verbatim() {
         use std::os::windows::process::CommandExt;
-        let body = r#"/d /s /c "ping -n 30 127.0.0.1 ^"x y^" >nul""#;
+        // The escaped text is kept AWAY from the long-running command: `ping`
+        // given a stray `"x y"` operand exits at once, and cmd with it, so the
+        // PEB read could race the exit. `echo` swallows the escapes; `ping`
+        // alone keeps cmd alive for the read.
+        let body = r#"/d /s /c "echo ^"x y^" >nul & ping -n 30 127.0.0.1 >nul""#;
         let mut child = Command::new("cmd.exe")
             .raw_arg(body)
             .stdin(Stdio::null())
