@@ -278,7 +278,11 @@ pub(crate) struct ManagerPanes(pub(crate) Arc<crate::terminal::TerminalManager>)
 
 impl PaneOps for ManagerPanes {
     fn close(&self, terminal_id: &str) -> Result<(), String> {
-        self.0.close(terminal_id)
+        // Bound to a manager-shaped name so `runner_close_sites`' scan sees
+        // this `TerminalManager::close`: `self.0.close(..)` is invisible to
+        // it, which would hide every respawn close behind the trait.
+        let manager = &self.0;
+        manager.close(terminal_id)
     }
     fn alive(&self, terminal_id: &str) -> bool {
         self.0.get(terminal_id).is_some_and(|s| s.is_alive())
