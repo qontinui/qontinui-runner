@@ -42,8 +42,10 @@ import { displayNameOf } from "@/lib/session-ledger";
  * creation-order mapping the localStorage snapshot used to drive.
  *
  * `terminal_session_list_open` returns the restorable superset: `open` records
- * (hard-crash case) PLUS in-grace `closed`/`pty-exit` records (graceful-restart
- * case, where `handleExit` flipped every live PTY to `closed`). The backend
+ * (hard-crash and runner-shutdown case: the backend refuses a `pty-exit` close
+ * once `close_all` begins, so a shutdown leaves its rows `open`) PLUS in-grace
+ * `closed`/`pty-exit` records (a PTY that died while the runner ran, and rows
+ * a pre-latch runner's `handleExit` closed at shutdown). The backend
  * owns the state/reason/grace gating, so we deliberately do NOT re-filter on
  * `state === "open"` here — that would drop the pty-exit records the backend
  * just decided are restorable.

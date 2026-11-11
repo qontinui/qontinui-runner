@@ -1705,6 +1705,8 @@ fn parse_node_major(raw: &str) -> Option<u32> {
 struct SlowHostProbes {
     powershell: bool,
     docker: bool,
+    /// `claude` resolves to a launchable executable ([`claude_launchable`]).
+    claude: bool,
 }
 
 static SLOW_HOST_PROBE_CACHE: Mutex<Option<(SlowHostProbes, std::time::Instant)>> =
@@ -1729,6 +1731,7 @@ fn slow_host_probes() -> SlowHostProbes {
     let probes = SlowHostProbes {
         powershell: powershell_on_path(),
         docker: docker_daemon_answers(),
+        claude: claude_launchable(),
     };
     if let Ok(mut g) = SLOW_HOST_PROBE_CACHE.lock() {
         *g = Some((probes, std::time::Instant::now()));
@@ -1748,15 +1751,32 @@ fn slow_host_probes() -> SlowHostProbes {
 /// BLOCKS: the heartbeat assembles its capability base
 /// ([`heartbeat_device_capabilities`], which reaches this) on the blocking pool.
 fn host_capabilities() -> Vec<String> {
-    let slow = slow_host_probes();
-    let mut caps = build_host_capabilities(
+    let mut caps = assemble_host_capabilities(
         current_os_label(),
-        slow.powershell,
-        slow.docker,
+        slow_host_probes(),
         webview_runtime_available(),
         host_mem_total_bytes(),
     );
     caps.extend(imagegen_probe::capability_tokens());
+    caps
+}
+
+/// [`host_capabilities`] minus the image probe, from the probes' results:
+/// the [`build_host_capabilities`] set plus the condition-check token, which
+/// two of the probes decide together. Pure, so a test can hand it every
+/// combination a real host produces.
+fn assemble_host_capabilities(
+    os: &str,
+    slow: SlowHostProbes,
+    webview: bool,
+    mem_total_bytes: Option<u64>,
+) -> Vec<String> {
+    let mut caps =
+        build_host_capabilities(os, slow.powershell, slow.docker, webview, mem_total_bytes);
+    caps.extend(condition_secret_substitution_capability(
+        webview,
+        slow.claude,
+    ));
     caps
 }
 
@@ -1965,6 +1985,69 @@ fn build_host_capabilities(
     }
     caps.extend(memory_tier_capabilities(mem_total_bytes));
     caps
+}
+
+/// The capability token asserting this runner substitutes a condition check's
+/// `{{secret:<ref>}}` placeholders inside its SDK `type` action
+/// ([`crate::condition_secrets`]), and can launch the session that types them.
+///
+/// Plan
+/// `2026-11-06-a-regression-test-run-is-judged-by-what-it-covered-and-a-silent-run-reads-unknown`
+/// Phase 13, D-D7a: coord places a condition group whose `auth_setup` carries
+/// a credential only on a device advertising this token, and otherwise reads
+/// the run `unknown`, never a plaintext prompt. Coord's placement verdict reads
+/// the token and NOT `claude_code_available`, so the token itself carries the
+/// launch precondition ([`condition_secret_substitution_capability`]).
+///
+/// The spelling is frozen for the same reason as
+/// [`WEBVIEW_RUNTIME_CAPABILITY`]: a respelling silently un-targets every
+/// secret-bearing condition group, with nothing red on either side.
+pub const CONDITION_SECRET_SUBSTITUTION_CAPABILITY: &str = "condition:secret_substitution";
+
+/// `Some(token)` when this runner has what a condition-check session needs
+/// from its host: a webview runtime to host its visible terminal (the first
+/// thing `agent_runtime::run_condition_check_terminal` needs) AND a `claude`
+/// that resolves to a launchable executable. Necessary, not sufficient: a
+/// launch also needs spawn authorization, a signed-in account and a workspace
+/// root, which this host fact does not see. Fail-closed like
+/// [`webview_runtime_available`]: advertising falsely sends a run carrying
+/// secrets to a device that then cannot spawn its session; not advertising
+/// only moves the run elsewhere, or reads it `unknown`. Pure.
+fn condition_secret_substitution_capability(webview: bool, claude: bool) -> Option<String> {
+    (webview && claude).then(|| CONDITION_SECRET_SUBSTITUTION_CAPABILITY.to_string())
+}
+
+/// True when what a condition-check spawn execs is the absolute path of an
+/// existing, executable file. The spawn execs `agent_runtime::resolve_claude_bin`
+/// as it is (`run_condition_check_terminal`), so a miss there, a bare name, is
+/// not a launch this runner can vouch for, and neither is an explicit
+/// `QONTINUI_CLAUDE_BIN` naming a file without its execute bit. Stats PATH, so
+/// it is cached behind `HOST_PROBE_TTL` with the other slow probes.
+fn claude_launchable() -> bool {
+    is_launchable_file(std::path::Path::new(
+        &crate::agent_runtime::resolve_claude_bin(),
+    ))
+}
+
+/// An absolute path to a regular file that, on unix, carries an execute bit.
+fn is_launchable_file(path: &std::path::Path) -> bool {
+    if !path.is_absolute() {
+        return false;
+    }
+    std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file() && has_execute_bit(&metadata))
+}
+
+#[cfg(unix)]
+fn has_execute_bit(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    metadata.permissions().mode() & 0o111 != 0
+}
+
+/// Windows has no execute bit: what launches is decided by the extension,
+/// which `agent_runtime::resolve_claude_bin`'s PATH walk restricts.
+#[cfg(not(unix))]
+fn has_execute_bit(_metadata: &std::fs::Metadata) -> bool {
+    true
 }
 
 /// Prefix of the per-repo CI allowlist token: one `ci_repo:<entry>` per
@@ -9360,6 +9443,81 @@ mod tests {",
                 .iter()
                 .any(|c| c == WEBVIEW_RUNTIME_CAPABILITY),
             "and the assembled set must not carry the token either"
+        );
+    }
+
+    /// Plan
+    /// `2026-11-06-a-regression-test-run-is-judged-by-what-it-covered-and-a-silent-run-reads-unknown`
+    /// Phase 13 (D-D7a): `condition:secret_substitution` is advertised only
+    /// when this runner can launch a condition-check session, a webview
+    /// runtime AND a launchable `claude`, because coord's placement verdict
+    /// reads the token and not `claude_code_available`.
+    #[test]
+    fn condition_secrets_capability_is_advertised_only_when_a_condition_check_can_launch() {
+        assert_eq!(
+            CONDITION_SECRET_SUBSTITUTION_CAPABILITY,
+            "condition:secret_substitution"
+        );
+        assert_eq!(
+            condition_secret_substitution_capability(true, true).as_deref(),
+            Some("condition:secret_substitution")
+        );
+        for (webview, claude) in [(true, false), (false, true), (false, false)] {
+            assert_eq!(
+                condition_secret_substitution_capability(webview, claude),
+                None,
+                "webview={webview} claude={claude}: no condition-check session can launch"
+            );
+        }
+        // The assembled set reads BOTH probes: every combination a host can
+        // produce, through the same assembly `host_capabilities` runs.
+        for (webview, claude) in [(true, true), (true, false), (false, true), (false, false)] {
+            let slow = SlowHostProbes {
+                powershell: false,
+                docker: false,
+                claude,
+            };
+            assert_eq!(
+                assemble_host_capabilities("linux", slow, webview, None)
+                    .iter()
+                    .any(|c| c == CONDITION_SECRET_SUBSTITUTION_CAPABILITY),
+                webview && claude,
+                "webview={webview} claude={claude}"
+            );
+        }
+        // A unit-test process holds no Tauri runtime, so the live set must not
+        // carry the token whatever PATH holds.
+        assert!(!webview_runtime_available());
+        assert!(
+            !host_capabilities()
+                .iter()
+                .any(|c| c == CONDITION_SECRET_SUBSTITUTION_CAPABILITY),
+            "the token was advertised by a runner that cannot launch a condition check"
+        );
+    }
+
+    /// `claude` counts as launchable only when it is an absolute, regular,
+    /// executable file: `resolve_claude_bin` hands an explicit
+    /// `QONTINUI_CLAUDE_BIN` back as it is, and a launch of a non-executable
+    /// one would fail.
+    #[cfg(unix)]
+    #[test]
+    fn condition_secrets_a_claude_without_its_execute_bit_is_not_launchable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let bin = dir.path().join("claude");
+        std::fs::write(&bin, "#!/bin/sh\n").expect("written");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o644)).expect("mode");
+        assert!(!is_launchable_file(&bin), "no execute bit");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("mode");
+        assert!(
+            is_launchable_file(&bin),
+            "anti-vacuity: an executable file is"
+        );
+        assert!(!is_launchable_file(dir.path()), "a directory is not");
+        assert!(
+            !is_launchable_file(std::path::Path::new("claude")),
+            "a bare name is not"
         );
     }
 

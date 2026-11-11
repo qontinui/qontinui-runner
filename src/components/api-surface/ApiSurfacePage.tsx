@@ -82,7 +82,10 @@ export function ApiSurfacePage() {
           // Diff is optional
         }
       } else {
-        setError(json.error ?? "Scan failed");
+        // A refusal's hint carries the next action on a development machine;
+        // the refusal sentence alone reads as final there.
+        const hint = typeof json.hint === "string" ? ` ${json.hint}` : "";
+        setError(`${json.error ?? "Scan failed"}${hint}`);
       }
     } catch (err) {
       setError(String(err));

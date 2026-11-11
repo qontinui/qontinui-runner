@@ -17,8 +17,41 @@ use super::executor_types::*;
 use super::handlers::StepHandler;
 use super::verification_context::{categorize_failure, extract_text_from_output_data};
 
+/// The `required` flag a verification step's result carries: the step's own
+/// flag when its outcome counts toward the verdict, `Some(false)` when it does
+/// not — an informational step, a `gate` marker, a contentless AI review
+/// (`ExecutionStepConfig::counts_toward_verdict`). Everything that judges a
+/// verification reads its results (the fold below, the loop's decision, the
+/// uploaded step results), so stamping the rule here keeps it one rule.
+fn result_required(step: &ExecutionStepConfig) -> Option<bool> {
+    if step.counts_toward_verdict() {
+        step.required
+    } else {
+        Some(false)
+    }
+}
+
+/// The verification phase's verdict over its step results.
+///
+/// Passed only when at least one REQUIRED step ran and every required step
+/// succeeded. Steps with `required: false` are informational: their failure
+/// doesn't trigger the agentic loop, and they cannot make a verification pass
+/// on their own — and a step that checks nothing carries `required: false`
+/// too (`result_required`). A set with no required step — an empty set
+/// included — checked nothing, so it is NOT a pass (served policy
+/// verification-and-evidence/silent-empty-is-unknown). This is the fold every
+/// verification phase shares, reached from both `VerificationExecutor` arms
+/// (`run_verification` and `run_targeted_verification`); Phase 8 of plan
+/// 2026-11-06-a-product-workflow-verification-with-nothing-to-check-never-reports-passed
+/// replaces this boolean with the shared three-state `fold_outcomes` here.
+fn required_steps_passed(step_results: &[StepExecutionResult]) -> bool {
+    let is_required = |r: &StepExecutionResult| r.required.unwrap_or(true); // default: required
+    step_results.iter().any(is_required)
+        && step_results.iter().all(|r| r.success || !is_required(r))
+}
+
 impl StepExecutor {
-    /// Execute all verification steps and return a VerificationPhaseResult
+    /// Run verification phase steps with optional event emission.
     ///
     /// This is the main entry point for the verification phase in the
     /// verification-agentic loop. It:
@@ -26,29 +59,10 @@ impl StepExecutor {
     /// 2. Captures detailed results for each step
     /// 3. Stops on critical step failure
     /// 4. Returns a summary that can be used to build AI context
-    #[tracing::instrument(
-        name = "workflow.verification.execute",
-        skip(self, steps),
-        fields(
-            step_count = %steps.len(),
-            execution_id = %execution_id,
-            iteration = %iteration
-        )
-    )]
-    pub async fn execute_verification_steps(
-        &self,
-        steps: &[ExecutionStepConfig],
-        execution_id: &str,
-        iteration: u32,
-    ) -> VerificationPhaseResult {
-        self.execute_verification_steps_with_events(steps, execution_id, iteration, None)
-            .await
-    }
-
-    /// Run verification phase steps with optional event emission.
     ///
-    /// This version emits completion events as each step finishes, allowing
-    /// the UI to show real-time progress instead of waiting until all steps complete.
+    /// It emits completion events as each step finishes (when `workflow_name`
+    /// is given), allowing the UI to show real-time progress instead of
+    /// waiting until all steps complete.
     #[tracing::instrument(
         name = "workflow.verification.with_events",
         skip(self, steps),
@@ -122,7 +136,7 @@ impl StepExecutor {
                     },
                     verification_details: None,
                     output_data: None,
-                    required: step.required,
+                    required: result_required(step),
                     resolved_inputs: None,
                     extracted_values: None,
                     failure_category: None,
@@ -562,7 +576,7 @@ impl StepExecutor {
                 },
                 verification_details,
                 output_data: step_output_data,
-                required: step.required,
+                required: result_required(step),
                 resolved_inputs: None,
                 extracted_values: None,
                 failure_category,
@@ -666,13 +680,11 @@ impl StepExecutor {
 
         let total_duration_ms = start.elapsed().as_millis() as u64;
 
-        // Determine all_passed: all required steps must succeed.
-        // Steps with required=false are informational only — their failure
-        // doesn't trigger the agentic loop.
-        let all_passed = step_results.iter().all(|r| {
-            let is_required = r.required.unwrap_or(true); // default: required
-            r.success || !is_required
-        });
+        // all_passed: at least one required step ran and every required step
+        // succeeded. Steps with required=false are informational only — their
+        // failure doesn't trigger the agentic loop, and a set with no required
+        // step (empty included) is not a pass.
+        let all_passed = required_steps_passed(&step_results);
 
         let result = VerificationPhaseResult {
             iteration,
@@ -692,5 +704,231 @@ impl StepExecutor {
 
         info!("{}", result.summary());
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::config_storage::ConfigStorage;
+    use crate::AppState;
+
+    /// A real `StepExecutor` over an in-memory `AppState` (no database, disk
+    /// or network), so a test enters the verification phase exactly where
+    /// every workflow run enters it.
+    fn executor() -> StepExecutor {
+        StepExecutor::new(
+            AppState::new_for_test(),
+            Arc::new(tokio::sync::Mutex::new(ConfigStorage::new_degraded())),
+        )
+    }
+
+    /// Both `VerificationExecutor` arms (`run_verification`,
+    /// `run_targeted_verification`) enter the verification phase here. A phase
+    /// handed no step ran nothing and checked nothing, so it does not pass.
+    #[tokio::test]
+    async fn a_verification_phase_with_no_steps_does_not_pass() {
+        let result = executor()
+            .execute_verification_steps_with_events(&[], "exec-no-steps", 1, None)
+            .await;
+        assert!(!result.all_passed);
+        assert_eq!(result.total_steps, 0);
+        assert!(result.step_results.is_empty());
+    }
+
+    /// Steps outside the verification phase are dropped before anything runs,
+    /// so a phase handed many steps can still have checked nothing.
+    #[tokio::test]
+    async fn steps_outside_the_verification_phase_check_nothing_and_do_not_pass() {
+        let steps = [
+            ExecutionStepConfig {
+                step_type: "gate".to_string(),
+                phase: Some("setup".to_string()),
+                ..Default::default()
+            },
+            ExecutionStepConfig {
+                step_type: "gate".to_string(),
+                phase: Some("agentic".to_string()),
+                ..Default::default()
+            },
+            ExecutionStepConfig {
+                step_type: "gate".to_string(),
+                phase: None,
+                ..Default::default()
+            },
+        ];
+        let result = executor()
+            .execute_verification_steps_with_events(&steps, "exec-other-phases", 1, None)
+            .await;
+        assert!(!result.all_passed);
+        assert_eq!(result.total_steps, 0);
+        assert!(result.step_results.is_empty());
+    }
+
+    /// One step result as the phase records it; `required: None` is the
+    /// workflow default (a step that does not say is required).
+    fn step_result(name: &str, required: Option<bool>, success: bool) -> StepExecutionResult {
+        let mut fixture = serde_json::json!({
+            "step_index": 0,
+            "step_type": "check",
+            "step_name": name,
+            "success": success,
+            "error": null,
+            "screenshot_path": null,
+            "duration_ms": 0,
+            "config": {},
+        });
+        if let Some(required) = required {
+            fixture["required"] = serde_json::json!(required);
+        }
+        serde_json::from_value(fixture).expect("a StepExecutionResult fixture")
+    }
+
+    /// A verification-phase step of the given type (and prompt, for a `prompt`).
+    fn verification_step(step_type: &str, prompt_content: Option<&str>) -> ExecutionStepConfig {
+        ExecutionStepConfig {
+            step_type: step_type.to_string(),
+            phase: Some("verification".to_string()),
+            prompt_content: prompt_content.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    /// The result the verification phase records for `step` with the given
+    /// outcome: its type, and the `required` flag the phase stamps on it.
+    fn executed(step: &ExecutionStepConfig, success: bool) -> StepExecutionResult {
+        let mut result = step_result(&step.step_type, None, success);
+        result.step_type = step.step_type.clone();
+        result.required = result_required(step);
+        result
+    }
+
+    #[test]
+    fn a_gate_checks_nothing() {
+        assert!(!verification_step("gate", None).checks_something());
+        assert!(verification_step("check", None).checks_something());
+    }
+
+    #[test]
+    fn a_contentless_prompt_checks_nothing() {
+        assert!(!verification_step("prompt", None).checks_something());
+        assert!(!verification_step("prompt", Some("")).checks_something());
+        assert!(
+            verification_step("prompt", Some("Is the save button visible?")).checks_something()
+        );
+    }
+
+    /// A gate is an aggregation marker that always succeeds: a verification
+    /// whose only step is one checked nothing.
+    #[test]
+    fn a_verification_of_only_a_gate_is_not_a_pass() {
+        let gate = verification_step("gate", None);
+        assert_eq!(result_required(&gate), Some(false));
+        assert!(!required_steps_passed(&[executed(&gate, true)]));
+    }
+
+    /// A verification prompt with no content returns success without asking
+    /// anything, so one or many of them checked nothing.
+    #[test]
+    fn a_verification_of_only_contentless_prompts_is_not_a_pass() {
+        let unset = verification_step("prompt", None);
+        let empty = verification_step("prompt", Some(""));
+        assert_eq!(result_required(&unset), Some(false));
+        assert!(!required_steps_passed(&[executed(&unset, true)]));
+        assert!(!required_steps_passed(&[
+            executed(&unset, true),
+            executed(&empty, true)
+        ]));
+    }
+
+    /// Beside a real check, a gate and a contentless prompt neither pass nor
+    /// block the verification: the check decides it.
+    #[test]
+    fn a_gate_and_a_contentless_prompt_beside_a_real_check_follow_the_check() {
+        let gate = verification_step("gate", None);
+        let empty_prompt = verification_step("prompt", Some(""));
+        let check = verification_step("check", None);
+        assert!(required_steps_passed(&[
+            executed(&gate, true),
+            executed(&empty_prompt, true),
+            executed(&check, true),
+        ]));
+        assert!(!required_steps_passed(&[
+            executed(&gate, true),
+            executed(&empty_prompt, true),
+            executed(&check, false),
+        ]));
+    }
+
+    #[test]
+    fn a_counting_step_keeps_its_own_required_flag() {
+        assert_eq!(result_required(&verification_step("check", None)), None);
+        let mut informational = verification_step("check", None);
+        informational.required = Some(false);
+        assert_eq!(result_required(&informational), Some(false));
+        let mut explicit = verification_step("check", None);
+        explicit.required = Some(true);
+        assert_eq!(result_required(&explicit), Some(true));
+    }
+
+    #[test]
+    fn no_step_results_is_not_a_pass() {
+        assert!(!required_steps_passed(&[]));
+    }
+
+    #[test]
+    fn one_informational_result_is_not_a_pass_whether_it_succeeded_or_not() {
+        assert!(!required_steps_passed(&[step_result(
+            "lint",
+            Some(false),
+            true
+        )]));
+        assert!(!required_steps_passed(&[step_result(
+            "lint",
+            Some(false),
+            false
+        )]));
+    }
+
+    #[test]
+    fn many_informational_results_are_not_a_pass() {
+        assert!(!required_steps_passed(&[
+            step_result("lint", Some(false), true),
+            step_result("format", Some(false), true),
+            step_result("audit", Some(false), false),
+        ]));
+    }
+
+    #[test]
+    fn one_required_success_passes() {
+        assert!(required_steps_passed(&[step_result(
+            "build",
+            Some(true),
+            true
+        )]));
+        assert!(required_steps_passed(&[step_result("build", None, true)]));
+    }
+
+    #[test]
+    fn many_required_successes_pass_beside_informational_failures() {
+        assert!(required_steps_passed(&[
+            step_result("build", Some(true), true),
+            step_result("test", None, true),
+            step_result("lint", Some(false), false),
+        ]));
+    }
+
+    #[test]
+    fn a_failed_required_step_fails_the_phase() {
+        assert!(!required_steps_passed(&[
+            step_result("build", Some(true), true),
+            step_result("test", Some(true), false),
+        ]));
+        assert!(!required_steps_passed(&[
+            step_result("test", None, false),
+            step_result("lint", Some(false), true),
+        ]));
     }
 }

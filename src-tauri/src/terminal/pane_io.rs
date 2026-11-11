@@ -752,6 +752,11 @@ mod tests {
             c
         };
         cmd.env("TERM", "xterm-256color");
+        // An explicit cwd (coord finding d61a9247): without one portable-pty
+        // starts the child in the `USERPROFILE`/`$HOME` the builder captured,
+        // which a concurrent `IsolatedAmbient` points at a temp dir it deletes
+        // on drop, so the spawn fails or the shell refuses to run.
+        cmd.cwd(std::env::temp_dir());
         // Seed a credential so the seal is exercised on the production path,
         // not only in the unit test above.
         for name in crate::terminal::CREDENTIAL_VALUE_ENV_VARS {
@@ -830,6 +835,11 @@ mod tests {
             c
         };
         cmd.env("TERM", "xterm-256color");
+        // An explicit cwd (coord finding d61a9247): without one portable-pty
+        // starts the child in the `USERPROFILE`/`$HOME` the builder captured,
+        // which a concurrent `IsolatedAmbient` points at a temp dir it deletes
+        // on drop, so the spawn fails or the shell refuses to run.
+        cmd.cwd(std::env::temp_dir());
 
         let pane: Arc<dyn PaneIo> = Arc::new(
             LocalPty::open("paneio-exit-code-test", 80, 24)
@@ -874,8 +884,23 @@ mod local_pty_kill_tests {
     /// alive later).
     fn pane_with_children(args: &[&str]) -> (Arc<LocalPty>, Vec<OwnedProcess>) {
         let opened = LocalPty::open("local-pty-kill-test", 80, 24).expect("openpty");
-        let mut cmd = CommandBuilder::new(args[0]);
+        // `CommandBuilder::new` snapshots the whole process env, and that copy
+        // decides where `cmd` and `ping` are found. Take it under the bin-wide
+        // env lock, so a sibling test's temporary `PATH` / `USERPROFILE` (an
+        // `IsolatedAmbient`, a PATH-resolution test) is never what it copies.
+        let mut cmd = {
+            let _env_lock = crate::test_env::env_lock();
+            CommandBuilder::new(args[0])
+        };
         cmd.args(&args[1..]);
+        // An EXPLICIT cwd. Without one portable-pty starts the child in the
+        // snapshotted `USERPROFILE` when it is a directory at spawn time, and
+        // a concurrent `IsolatedAmbient` points `USERPROFILE` at a temp dir it
+        // deletes on drop: the pane then failed to spawn, or cmd printed "The
+        // current directory is invalid." and exited 1 without ever starting
+        // `ping` (coord finding d61a9247). Nothing in the crate calls
+        // `set_current_dir`, so the process cwd is stable.
+        cmd.cwd(std::env::current_dir().expect("the test process cwd"));
         let pane = Arc::new(opened.spawn(ScrubbedCommand::seal(cmd)).expect("spawn"));
         assert!(
             pane.root.is_some(),

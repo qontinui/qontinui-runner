@@ -12,8 +12,8 @@
 //!
 //! ## Flow
 //!
-//! 1. **Hint** — [`super::usage_limit::UsageLimitWatchHook`] sees a
-//!    usage-limit message in the PTY stream and calls
+//! 1. **Hint** — [`super::usage_limit::scan_grids_once`] sees a usage-limit
+//!    message on a terminal's rendered screen and calls
 //!    [`handle_usage_limit_hint`] (debounced per terminal).
 //! 2. **Confirm** — re-probe every configured account
 //!    (`refresh_account_usage_snapshot`) and require the *probe* to agree the
@@ -331,9 +331,9 @@ pub struct MigrationOutcome {
     pub to_config_dir: String,
 }
 
-/// Entry point for a PTY usage-limit hint (spawned async off the reader
-/// thread). Resolves everything it needs from the global app handle, mirrors
-/// `agent_runtime`'s state-access pattern.
+/// Entry point for a usage-limit hint (spawned async by the grid scanner,
+/// [`super::usage_limit::scan_grids_once`]). Resolves everything it needs from
+/// the global app handle, mirrors `agent_runtime`'s state-access pattern.
 pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'static str) {
     use tauri::Manager;
 

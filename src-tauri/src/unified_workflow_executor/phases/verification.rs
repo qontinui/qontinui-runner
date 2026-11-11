@@ -7,7 +7,6 @@ use std::sync::Arc;
 use tracing::{debug, info, instrument, warn};
 
 use crate::config_storage::ConfigStorage;
-use crate::executor::{ExecutionOutcome, IntoOutcome};
 use crate::step_executor::{
     ExecutionStepConfig, StepExecutionResult, StepExecutor, VerificationPhaseResult,
 };
@@ -17,7 +16,6 @@ use crate::step_types::StepType;
 use crate::workflow_state::{in_stage, CheckpointManager, StepCheckpoint};
 use crate::AppState;
 
-use super::super::phase_configs::{VerificationConfig, VerificationResult};
 use super::super::phase_helpers::{
     clear_console_errors, fetch_browser_events_from_ui_bridge, fetch_console_errors_from_ui_bridge,
     fetch_health_from_ui_bridge, fetch_network_failures_from_ui_bridge,
@@ -26,6 +24,34 @@ use super::super::phase_helpers::{
 // =============================================================================
 // Verification Phase Executor
 // =============================================================================
+
+/// The result of a verification with no step to run: nothing was checked.
+///
+/// `all_passed` is `false`. Nothing passed, so the result must not say that
+/// everything did. Both empty arms return it: an empty step list,
+/// including one emptied by the `dev_mode_only` filter of a build without
+/// debug assertions, which is how the published runner is built, and a
+/// targeted run whose step indices selected nothing. The verdict on such a
+/// result is `NoVerificationSteps`, which `decide_evaluate_verification`
+/// reaches from its zero `required_steps` whatever `all_passed` says. This
+/// keeps the producer from asserting a pass it never observed.
+fn nothing_to_verify(iteration: u32) -> VerificationPhaseResult {
+    VerificationPhaseResult {
+        iteration,
+        all_passed: false,
+        critical_failure: false,
+        total_steps: 0,
+        passed_steps: 0,
+        failed_steps: 0,
+        skipped_steps: 0,
+        total_duration_ms: 0,
+        step_results: Vec::new(),
+        console_errors: None,
+        app_health: None,
+        browser_events: None,
+        network_failures: None,
+    }
+}
 
 /// Executes verification steps and determines if they all pass.
 pub struct VerificationExecutor {
@@ -86,7 +112,7 @@ impl VerificationExecutor {
         let steps: Vec<ExecutionStepConfig> = steps
             .iter()
             .filter(|step| {
-                if step.dev_mode_only.unwrap_or(false) && !cfg!(debug_assertions) {
+                if !step.runs_in_build(cfg!(debug_assertions)) {
                     info!(
                         "VERIFICATION-PHASE: Skipping dev-mode-only step: {:?}",
                         step.name
@@ -112,28 +138,10 @@ impl VerificationExecutor {
 
         if steps.is_empty() {
             info!(
-                "VERIFICATION-PHASE: No verification steps defined (iteration {})",
+                "VERIFICATION-PHASE: No verification steps to run (iteration {}) - nothing is checked",
                 iteration
             );
-            // No verification steps = verification passes
-            return (
-                VerificationPhaseResult {
-                    iteration,
-                    all_passed: true,
-                    critical_failure: false,
-                    total_steps: 0,
-                    passed_steps: 0,
-                    failed_steps: 0,
-                    skipped_steps: 0,
-                    total_duration_ms: 0,
-                    step_results: Vec::new(),
-                    console_errors: None,
-                    app_health: None,
-                    browser_events: None,
-                    network_failures: None,
-                },
-                Vec::new(),
-            );
+            return (nothing_to_verify(iteration), Vec::new());
         }
 
         // Pre-verification health check: detect if the SDK app is already broken
@@ -342,45 +350,6 @@ impl VerificationExecutor {
         (result, step_results)
     }
 
-    /// Run verification and return a unified ExecutionOutcome.
-    ///
-    /// This uses the IntoOutcome trait to convert the VerificationResult into a
-    /// standardized ExecutionOutcome, which is useful for consistent result handling.
-    ///
-    /// # Arguments
-    /// * `config` - The verification configuration
-    /// * `logger` - Logger for step events
-    ///
-    /// # Returns
-    /// An `ExecutionOutcome` summarizing the verification phase execution.
-    pub async fn run_verification_to_outcome(
-        &self,
-        config: &VerificationConfig,
-        logger: &StepEventLogger,
-    ) -> ExecutionOutcome {
-        let start = std::time::Instant::now();
-
-        let (phase_result, step_results) = self
-            .run_verification(
-                &config.steps,
-                &config.execution_id,
-                config.iteration,
-                &config.workflow_name,
-                logger,
-                None,
-            )
-            .await;
-
-        let duration_ms = start.elapsed().as_millis() as u64;
-
-        // Use the IntoOutcome trait for consistent conversion
-        let result = VerificationResult {
-            phase_result,
-            step_results,
-        };
-        result.into_outcome(duration_ms)
-    }
-
     /// Run a subset of verification steps by their indices.
     ///
     /// Used by the multi-agent fixer to run targeted verification after each
@@ -399,21 +368,7 @@ impl VerificationExecutor {
             .collect();
 
         if targeted_steps.is_empty() {
-            return VerificationPhaseResult {
-                iteration,
-                all_passed: true,
-                total_steps: 0,
-                passed_steps: 0,
-                failed_steps: 0,
-                skipped_steps: 0,
-                total_duration_ms: 0,
-                step_results: vec![],
-                critical_failure: false,
-                console_errors: None,
-                app_health: None,
-                browser_events: None,
-                network_failures: None,
-            };
+            return nothing_to_verify(iteration);
         }
 
         info!(
@@ -438,5 +393,56 @@ impl VerificationExecutor {
         );
 
         result
+    }
+}
+
+#[cfg(test)]
+mod nothing_to_verify_tests {
+    use super::nothing_to_verify;
+
+    /// Both empty arms return this result. Before plan
+    /// 2026-11-06-a-product-workflow-verification-with-nothing-to-check-never-reports-passed
+    /// they returned `all_passed: true`, which is a pass that nothing observed.
+    #[test]
+    fn an_empty_verification_does_not_report_all_passed() {
+        let result = nothing_to_verify(4);
+        assert!(
+            !result.all_passed,
+            "nothing checked must not report all_passed"
+        );
+        assert_eq!(result.iteration, 4);
+        assert_eq!(result.total_steps, 0);
+        assert_eq!(result.passed_steps, 0);
+        assert!(result.step_results.is_empty());
+        assert!(!result.critical_failure);
+    }
+
+    /// The targeted arm, entered where the multi-agent fixer enters it: when no
+    /// index names a step, nothing runs, nothing is checked, and the phase does
+    /// not pass. The executor is built over an in-memory `AppState` (no
+    /// database, disk or network), as the step executor's own tests build it.
+    #[tokio::test]
+    async fn a_targeted_verification_that_selects_no_step_does_not_pass() {
+        let app_state = crate::AppState::new_for_test();
+        let executor = super::VerificationExecutor {
+            app_state: app_state.clone(),
+            executor: super::StepExecutor::new(
+                app_state,
+                std::sync::Arc::new(tokio::sync::Mutex::new(super::ConfigStorage::new_degraded())),
+            ),
+        };
+        let gate = super::ExecutionStepConfig {
+            step_type: "gate".to_string(),
+            phase: Some("verification".to_string()),
+            ..Default::default()
+        };
+        for (steps, indices) in [(vec![], vec![]), (vec![gate], vec![7])] {
+            let result = executor
+                .run_targeted_verification(&steps, &indices, "exec-targeted", 2, "wf")
+                .await;
+            assert!(!result.all_passed, "indices {indices:?}");
+            assert_eq!(result.total_steps, 0);
+            assert!(result.step_results.is_empty());
+        }
     }
 }

@@ -8,7 +8,7 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 
 | class | rows | hits | unreviewed | fallback_correct | dev_only_surface | defect |
 |---|---:|---:|---:|---:|---:|---:|
-| `repo_layout` | 80 | 94 | 71 | 9 | 0 | 0 |
+| `repo_layout` | 74 | 88 | 65 | 9 | 0 | 0 |
 | `dev_ports` | 28 | 28 | 26 | 0 | 2 | 0 |
 | `supervisor_dependency` | 57 | 57 | 0 | 47 | 4 | 6 |
 | `tenant_literal` | 0 | 0 | 0 | 0 | 0 | 0 |
@@ -18,7 +18,7 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `plans_dir` | 34 | 35 | 34 | 0 | 0 | 0 |
 | `os_bound_tooling` | 103 | 104 | 96 | 7 | 0 | 0 |
 
-## `repo_layout` (80 rows)
+## `repo_layout` (74 rows)
 
 | file | symbol | excerpt | n | disposition | capability |
 |---|---|---|---:|---|---|
@@ -62,11 +62,10 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `src/coord_doctor.rs` | `render_onboarding_doc` | `consts, and 'coord-gates-and-access.md' in 'qontinui-claude-config'.\n\n",` | 1 | unreviewed — Surfaced by fleet-nouns.toml (A6); not yet triaged. | — (no CAPABILITY_SPECS row) |
 | `src/coord_mcp.rs` | `probe_stdio_shim` | `"no workspace root resolved, so <root>/qontinui-claude-config/scripts/\` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/coord_mcp.rs` | `resolve_stdio_shim_path` | `.join("qontinui-claude-config")` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
-| `src/database/pg/apps.rs` | `bootstrap_dev_apps` | `resolved, so no dev apps were registered. Set $QONTINUI_ROOT (or the \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/database/pg/apps.rs` | `const DEV_SIBLING_APPS` | `"qontinui-supervisor",` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/database/pg/apps.rs` | `const DEV_SIBLING_APPS` | `"qontinui-web",` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/dev_services.rs` | `get_default_dev_services` | `let web_dir = workspace.join("qontinui-web");` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
-| `src/env_agent/apply_repos.rs` | `apply_section_with` | `"Set $QONTINUI_ROOT, or the runner's 'paths.workspace_root' setting, to the \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
+| `src/env_agent/apply_repos.rs` | `const CLI_UNRESOLVED_ROOT_NOTE` | `$QONTINUI_ROOT to the folder that holds the repo checkouts, then re-run.";` | 1 | unreviewed — Acknowledged, not triaged. A standalone 'env apply --section repos' exits before the runner publishes its settings door (collectors::workspace_root_reads_setting), so it cannot read the Workspace root setting and $QONTINUI_ROOT is the true next action there; the in-runner arm renders the shared WorkspaceRootUnresolved sentence instead. Left unreviewed because whether 'env apply' is a dev_only_surface is a disposition call this change does not make. | — (no CAPABILITY_SPECS row) |
 | `src/env_agent/apply_repos.rs` | `incomparable_scope` | `'qontinui-runner env scope-root' / $QONTINUI_ROOT on one of the two \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/env_agent/collectors.rs` | `claude_md_plain_ok` | `(Some("@qontinui-claude-config/CLAUDE.md"), None)` | 1 | unreviewed — Surfaced by fleet-nouns.toml (A6); not yet triaged. | — (no CAPABILITY_SPECS row) |
 | `src/env_agent/collectors.rs` | `const HARNESS_CONFIG_REPO_DIR` | `const HARNESS_CONFIG_REPO_DIR: &str = "qontinui-claude-config";` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
@@ -81,17 +80,12 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `src/fleet.rs` | `publish_tree_state` | `QONTINUI_ROOT to override). Skipping."` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/fleet.rs` | `spawn_skill_parity_pass_if_due` | `located — set QONTINUI_ROOT or the runner's paths.workspace_root"` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/fleet_commands.rs` | `const FLEET_COMMANDS` | `("ui-bridge", UI_BRIDGE),` | 1 | unreviewed | `fleet_commands` |
-| `src/main.rs` | `run_app` | `injected. Set $QONTINUI_ROOT (or 'paths.workspace_root') to \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
-| `src/mcp/api_surface.rs` | `handle_scan` | `"Cannot locate the qontinui-runner checkout to scan. Set $QONTINUI_ROOT \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/mcp/plan_library.rs` | `const WRITE_CONTRACT` | `with (a runner scan uses '<repo>/<dir>', e.g. 'qontinui-dev-notes/prompts'). \` | 1 | unreviewed — Surfaced by fleet-nouns.toml (A6); not yet triaged. | — (no CAPABILITY_SPECS row) |
 | `src/mcp/session_recap.rs` | `analyze_handler` | `Json(api_error(format!("Cannot find qontinui-root: {}", e))),` | 1 | unreviewed — Surfaced by fleet-nouns.toml (A6); not yet triaged. | — (no CAPABILITY_SPECS row) |
 | `src/mcp/shared.rs` | `get_workspace_paths_internal` | `.join("qontinui-claude-config")` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
-| `src/mcp/task_runs.rs` | `migrate_task_run_logs` | `Set $QONTINUI_ROOT (or the 'paths.workspace_root' setting) to the \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/online_learning/context.rs` | `normalize_domain` | `if lower.contains("frontend") \|\| lower.contains("ui-bridge") {` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/orchestrator/learning_recorder.rs` | `infer_domain_tags` | `tags.insert("ui-bridge".to_string());` | 2 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/planning_bridge.rs` | `const HTN_SRC_REPOS` | `const HTN_SRC_REPOS: [&str; 2] = ["qontinui", "multistate"];` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
-| `src/planning_bridge.rs` | `execute_htn_attempt` | `$QONTINUI_ROOT to the directory holding the repo checkouts if the \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
-| `src/planning_bridge.rs` | `execute_htn_attempt` | `is already installed for this interpreter. Set $QONTINUI_ROOT to the \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/provenance.rs` | `const CANONICAL_REPO` | `const CANONICAL_REPO: &str = "qontinui-claude-config";` | 1 | fallback_correct — The repository NAME the qontinui-provenance key's canonical= field is relative to — a label in a written grammar, never a path the runner resolves on disk. | — (no CAPABILITY_SPECS row) |
 | `src/reflection/workflow.rs` | `build_ui_bridge_completion_steps` | `- Write the full plan to 'qontinui-dev-notes/ui-bridge-implementation-plan.md'` | 1 | unreviewed — Surfaced by fleet-nouns.toml (A6); not yet triaged. | — (no CAPABILITY_SPECS row) |
 | `src/routing/q_router.rs` | `Domain::from_domain_tags` | `if lower.contains("frontend") \|\| lower.contains("ui-bridge") {` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |

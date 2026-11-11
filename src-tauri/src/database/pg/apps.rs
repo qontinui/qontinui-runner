@@ -538,7 +538,7 @@ pub async fn ensure_self_registered(pg: &PgDb) {
 /// the call is safe to invoke on every boot.
 ///
 /// Paths come from the workspace root resolved by
-/// [`crate::workspace_paths::workspace_root`]. They used to be resolved at
+/// [`crate::workspace_paths::require_workspace_root`]. They used to be resolved at
 /// **compile time** from `CARGO_MANIFEST_DIR` and walked up two levels — which
 /// baked the *build* machine's sibling-repo layout into the shipped binary, the
 /// exact thing the "no-op unless `QONTINUI_DEV_BOOTSTRAP=1`" note above says we
@@ -557,14 +557,16 @@ pub async fn bootstrap_dev_apps(pg: &PgDb) -> Result<(), AppError> {
     // Opt-in dev convenience, so an unresolved root is a skip, not an error: a
     // developer who set the flag on a machine with no discoverable workspace
     // gets a line saying why, and boot continues.
-    let Some(qontinui_root) = crate::workspace_paths::workspace_root() else {
-        info!(
-            "bootstrap: QONTINUI_DEV_BOOTSTRAP=1 but no Qontinui workspace root \
-             resolved, so no dev apps were registered. Set $QONTINUI_ROOT (or the \
-             `paths.workspace_root` setting) to the directory holding the repo \
-             checkouts."
-        );
-        return Ok(());
+    let qontinui_root = match crate::workspace_paths::require_workspace_root() {
+        Ok(root) => root,
+        Err(why) => {
+            info!(
+                "bootstrap: QONTINUI_DEV_BOOTSTRAP=1 but no workspace root resolved, so \
+                 no dev apps were registered. {why} Dev apps are registered at boot, \
+                 so a change takes effect at the next runner start."
+            );
+            return Ok(());
+        }
     };
 
     let runner_dir = qontinui_root.join("qontinui-runner");

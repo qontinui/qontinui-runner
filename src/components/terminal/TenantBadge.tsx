@@ -274,6 +274,34 @@ export function tenantBadgeRendersWithoutSession(
   return showSwitcher && !!tenantId?.trim();
 }
 
+/**
+ * The runner's derived answer, as attributes a UI Bridge read can compare.
+ * `data-tenant-id` is the tab's copy of the spawn stamp, so it is absent on a
+ * no-stamp chip that names the acting tenant, and `data-tenant-credential` is
+ * one leg rather than the answer.
+ *
+ * `data-tenant-acting` is withheld whenever the display's tenant came from the
+ * spawn stamp (`source: row_stamp`, under `stamp_only` and under a `mismatch`
+ * alike): that is a record of what the spawn chose, never an observation of
+ * what the session acts as. An absent attribute is therefore "nothing to state
+ * here", not "no display": `data-tenant-display-status` alone says which.
+ * Pure, so its arms are tested without rendering; `TenantBadge.render.test.tsx`
+ * pins the spread onto the real element.
+ */
+export function tenantBadgeDisplayAttrs(tenancy: SessionTenancy | null): {
+  "data-tenant-acting": string | undefined;
+  "data-tenant-display-status": string | undefined;
+  "data-tenant-display-source": string | undefined;
+} {
+  const display = tenancy?.display ?? null;
+  return {
+    "data-tenant-acting":
+      display?.source === "row_stamp" ? undefined : (display?.tenantId ?? undefined),
+    "data-tenant-display-status": display?.status ?? undefined,
+    "data-tenant-display-source": display?.source ?? undefined,
+  };
+}
+
 interface TenantBadgeProps {
   /** The tenant this session was spawned under (`TerminalTab.tenantId`). */
   tenantId?: string;
@@ -318,6 +346,7 @@ export function TenantBadge({ tenantId, claudeSessionId, zoneIndex, className }:
       data-tenant-credential={info.body?.tenancy?.credential.tenantId ?? undefined}
       data-tenant-repo-expected={info.body?.tenancy?.repoExpected?.status ?? undefined}
       data-tenant-repo-verdict={info.body?.tenancy?.repoExpected?.verdict ?? undefined}
+      {...tenantBadgeDisplayAttrs(info.body?.tenancy ?? null)}
       className={`flex items-center gap-0.5 min-w-[18px] overflow-hidden text-[8px] px-1 py-0 rounded font-mono ${tone} ${
         className ?? ""
       }`}

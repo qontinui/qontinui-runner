@@ -2489,14 +2489,18 @@ async fn health(
         // accepted, and `lastFailure {kind, status, at}` — `kind` one of
         // server_error / rate_limited / unauthorized / rejected / not_found /
         // conflict / http_error / network / timeout. `retryingSessions` are
-        // on their own backoff; `quarantinedSessions` had their rows moved to
-        // the `<outbox>.quarantine.jsonl` sidecar after failing while coord
-        // served everything else. Three counters (process lifetime, `null`
-        // before the first tick) split the heartbeat rows the drain dropped
-        // without coord taking them, by cause: `heartbeatsSuperseded` (a newer
-        // pending heartbeat of the session replaces them), `heartbeatsMuted`
-        // (the session is quarantined and its `started`/`closed` row went to
-        // the sidecar, so none of its heartbeats will be sent), and
+        // on their own backoff; `quarantinedSessions` kept failing while coord
+        // served everything else, so their non-lifecycle, non-heartbeat rows
+        // were moved to the `<outbox>.quarantine.jsonl` sidecar — their
+        // `started`/`state_change`/`closed`/`finished` rows are never
+        // sidecarred, they stay pending and retry at the maximum backoff.
+        // `quarantineRotations` counts the times that sidecar reached its cap
+        // and was rotated to `<outbox>.quarantine.1.jsonl` (replacing the
+        // previous rotated generation) instead of dropping rows. Two counters
+        // (process lifetime, `null` before the first tick) split the heartbeat
+        // rows the drain dropped without coord taking them, by cause:
+        // `heartbeatsSuperseded` (a newer pending heartbeat of the session
+        // replaces them) and
         // `heartbeatsDroppedOnFailure` (the push failed: no answer, a 5xx, a
         // 4xx other than 409, or another non-2xx answer), with
         // `heartbeatsDroppedOnFailureByKind` mapping each `lastFailure` kind
@@ -6045,6 +6049,17 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 /// tool, so there is nothing to exclude. Re-verify against coord
 /// `origin/main` when editing this paragraph.
 ///
+/// `coord_spawn_continuation` (plan
+/// `2026-10-09-coord-knows-which-box-holds-which-credential` Phase 5) is the
+/// session door that places a `run_skill` continuation on a device holding the
+/// named `required_capabilities` (e.g. `cred:aws-ssm:eu-central-1`) and answers
+/// a typed outcome (`dispatched` / `no_capable_device` /
+/// `capable_but_unavailable` / `vetoed` / `unknown`). It grants nothing new:
+/// `coord_register_gate`, already allowed here, carries the same spawn power
+/// (a `time_elapsed` gate with a `run_skill` continuation). The coord half refuses it to
+/// an anonymously minted bootstrap credential on its own side. Forwarding it
+/// ahead of the coord half landing is harmless (coord answers an unknown tool).
+///
 /// **Landed is not delivered** (plan `2026-09-03-coord-mcp-403-names-its-own-cause`
 /// Phase 3). This list is compiled into the binary, so a PR that edits it is
 /// NOT in effect on any box until that box rebuilds from a sha containing the
@@ -6254,6 +6269,7 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_signature",
     "coord_slo_metrics",
     "coord_snooze_gate",
+    "coord_spawn_continuation",
     "coord_submit_escalate_evidence",
     "coord_symbol_lookup",
     // Plan 2026-10-17-per-repo-tenant-binding-… Phase 6: the read twin of
@@ -18296,6 +18312,19 @@ mod coord_mcp_body_gate_tests {
         assert!(
             COORD_MCP_ALLOWED_TOOLS.windows(2).all(|w| w[0] < w[1]),
             "COORD_MCP_ALLOWED_TOOLS must be sorted + deduped"
+        );
+    }
+
+    /// Plan `2026-10-09-coord-knows-which-box-holds-which-credential` Phase 5:
+    /// the capability-placed spawn door forwards, in sorted position.
+    #[test]
+    fn coord_spawn_continuation_is_allowed() {
+        assert!(coord_mcp_tool_is_allowed("coord_spawn_continuation"));
+        assert!(
+            COORD_MCP_ALLOWED_TOOLS
+                .binary_search(&"coord_spawn_continuation")
+                .is_ok(),
+            "membership is a binary_search, so the entry must sit in sorted position"
         );
     }
 

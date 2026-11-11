@@ -234,6 +234,53 @@ describe("nextActiveIdAfterIngest (auto-select on ingest)", () => {
   });
 });
 
+describe("a re-sync-added tab waits for its surface verdict", () => {
+  it("the re-sync adds a missed terminal as coalesced and awaiting its verdict", () => {
+    const next = reconcileTabsWithBackend([], [createdEvent("r-1", "p")], 1_700_000_000_000);
+    expect(next).toHaveLength(1);
+    expect(next[0].coalesced).toBe(true);
+    expect(next[0].awaitingSurfaceVerdict).toBe(true);
+  });
+
+  it("a late surface:true clears coalesced and settles the verdict", () => {
+    const tabs = reconcileTabsWithBackend([], [createdEvent("r-2", "p")], 1_700_000_000_000);
+    const info = createdEvent("r-2", "p", { surface: true });
+    const next = reduceCreatedTerminal(tabs, info);
+    expect(next).not.toBe(tabs);
+    expect(next).toHaveLength(1);
+    expect(next[0].coalesced).toBeUndefined();
+    expect(next[0].awaitingSurfaceVerdict).toBeUndefined();
+  });
+
+  it("a late surface:false keeps the tab coalesced and settles the verdict", () => {
+    const tabs = reconcileTabsWithBackend([], [createdEvent("r-3", "p")], 1_700_000_000_000);
+    const next = reduceCreatedTerminal(tabs, createdEvent("r-3", "p", { surface: false }));
+    expect(next[0].coalesced).toBe(true);
+    expect(next[0].awaitingSurfaceVerdict).toBeUndefined();
+  });
+
+  it("a payload with no surface (the page-move adopt) settles nothing", () => {
+    const tabs = reconcileTabsWithBackend([], [createdEvent("r-4", "p")], 1_700_000_000_000);
+    expect(reduceCreatedTerminal(tabs, createdEvent("r-4", "p"))).toBe(tabs);
+    // ...so the real event, arriving after it, still applies its verdict.
+    const next = reduceCreatedTerminal(tabs, createdEvent("r-4", "p", { surface: true }));
+    expect(next[0].coalesced).toBeUndefined();
+  });
+
+  it("the verdict applies once: a re-delivery after it is a no-op", () => {
+    const tabs = reconcileTabsWithBackend([], [createdEvent("r-5", "p")], 1_700_000_000_000);
+    const settled = reduceCreatedTerminal(tabs, createdEvent("r-5", "p", { surface: false }));
+    expect(reduceCreatedTerminal(settled, createdEvent("r-5", "p", { surface: true }))).toBe(
+      settled,
+    );
+  });
+
+  it("a suppressed tab ingested by the event is never flipped by a re-delivery", () => {
+    const tabs = reduceCreatedTerminal([], createdEvent("r-6", "p", { surface: false }));
+    expect(reduceCreatedTerminal(tabs, createdEvent("r-6", "p", { surface: true }))).toBe(tabs);
+  });
+});
+
 describe("applyBypassMark", () => {
   it("buffers the mark when the tab record hasn't arrived yet", () => {
     const tabs = [tab("a"), tab("b")];

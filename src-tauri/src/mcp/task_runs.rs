@@ -2002,13 +2002,10 @@ pub async fn migrate_task_run_logs(
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
 
     // Get the dev-logs directory path
-    let workspace_root = crate::workspace_paths::workspace_root().ok_or_else(|| {
+    let workspace_root = crate::workspace_paths::require_workspace_root().map_err(|why| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to resolve .dev-logs path: no Qontinui workspace root resolved. \
-             Set $QONTINUI_ROOT (or the `paths.workspace_root` setting) to the \
-             directory holding the repo checkouts."
-                .to_string(),
+            format!("Failed to resolve .dev-logs path: {why}"),
         )
     })?;
     let dev_logs_dir = dev_logs_dir_in(&workspace_root);

@@ -75,6 +75,9 @@ pub const IDLE_MIN: u64 = 15;
 const CENSUS_BUDGET: Duration = Duration::from_millis(1500);
 /// How long a close may wait to learn which strays it owes.
 const RECORD_BUDGET: Duration = Duration::from_secs(5);
+/// How long the graceful-exit child gate may wait to re-prove the strays a close
+/// recorded. The same order as [`RECORD_BUDGET`]: one table walk per stray.
+const REPROVE_BUDGET: Duration = Duration::from_secs(5);
 /// How long a close may spend ending them: SIGTERM, 5 s, SIGKILL, 2 s, per stray.
 const END_BUDGET_PER_STRAY: Duration = Duration::from_secs(10);
 const END_BUDGET_MAX: Duration = Duration::from_secs(60);
@@ -86,6 +89,10 @@ static CENSUS_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 /// cost the NEXT close its record, or that close's strays outlive it unrecorded.
 static RECORD_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 static END_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+/// Separate from [`RECORD_IN_FLIGHT`]: the child gate re-proves on the same pass
+/// as the record, so sharing its flag would make the gate wait on, or refuse
+/// behind, its own close's record.
+static REPROVE_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 /// After a census that did not answer inside [`CENSUS_BUDGET`], skip it until this
 /// unix second: on a box too loaded to walk `/proc` in time, paying the budget on
 /// every `/restart-readiness` poll would push each answer past the client timeout.
@@ -2115,7 +2122,7 @@ mod live {
     /// class. A loop whose condition flipped moves on to its post-loop commands in
     /// the same process, with the same argv and start time, so identity alone would
     /// not tell that work from the loop.
-    fn still_stray(stray: &RecordedStray, idle_min: u64) -> Result<(), String> {
+    pub(super) fn still_stray(stray: &RecordedStray, idle_min: u64) -> Result<(), String> {
         if !stray_now(stray) {
             return Err("gone".to_string());
         }
@@ -2444,6 +2451,59 @@ pub async fn record_strays(claudes: Vec<u32>) -> Vec<RecordedStray> {
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (&RECORD_IN_FLIGHT, RECORD_BUDGET);
+        Vec::new()
+    }
+}
+
+/// Of `recorded`, the strays that are STILL proven strays right now: the same
+/// process (pid, start ticks and argv) and, on a fresh process table, a stray of
+/// the same class ([`live::still_stray`], the re-proof [`end_strays`] runs before
+/// any signal).
+///
+/// The graceful-exit child gate reads this to leave a proven stray out of its
+/// count (plan `2026-11-08-wind-down-exempts-proven-strays-from-graceful-exit-child-refusal`,
+/// D2). It FAILS CLOSED: empty off Linux, past [`REPROVE_BUDGET`], while another
+/// re-proof is still running, and for every stray it cannot re-prove. A stray
+/// not kept here counts as a child, and the close stays refused.
+pub async fn reprove_strays(recorded: Vec<RecordedStray>) -> Vec<RecordedStray> {
+    reprove_strays_at(recorded, IDLE_MIN).await
+}
+
+/// [`reprove_strays`] at an explicit idle floor, so a test can judge a real loop
+/// whose polled file is seconds old.
+async fn reprove_strays_at(recorded: Vec<RecordedStray>, idle_min: u64) -> Vec<RecordedStray> {
+    if recorded.is_empty() {
+        return Vec::new();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let kept = bounded(&REPROVE_IN_FLIGHT, REPROVE_BUDGET, move || {
+            recorded
+                .into_iter()
+                .filter(|stray| match live::still_stray(stray, idle_min) {
+                    Ok(()) => true,
+                    Err(why) => {
+                        tracing::debug!(
+                            pid = stray.pid,
+                            why = %why,
+                            "stray_wait: a recorded stray is not re-proven; it counts as a child"
+                        );
+                        false
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .await;
+        if kept.is_none() {
+            tracing::warn!(
+                "stray_wait: could not re-prove this session's strays in time; each counts as a child"
+            );
+        }
+        kept.unwrap_or_default()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (recorded, idle_min, &REPROVE_IN_FLIGHT, REPROVE_BUDGET);
         Vec::new()
     }
 }
@@ -3039,6 +3099,99 @@ mod tests {
             false
         }
 
+        /// The graceful-exit child gate's re-proof (plan
+        /// `2026-11-08-wind-down-exempts-proven-strays-from-graceful-exit-child-refusal`,
+        /// D2) on real processes: it keeps a recorded stray that is still the same
+        /// process and still a stray of its class, and drops one that is gone, one
+        /// whose start ticks differ (a reused pid), one whose argv differs (an
+        /// `exec`), and one whose loop condition has flipped; and the child gate's
+        /// `ChildExemptions::admitted` over the same real stray. One test, because
+        /// the re-proof is single-flight: two running at once could read each other
+        /// BUSY.
+        #[tokio::test]
+        async fn reprove_keeps_only_a_stray_whose_identity_and_verdict_still_hold() {
+            let dir = tempfile::tempdir().unwrap();
+
+            // Class (a): judged without the idle floor, so the production entry
+            // point at IDLE_MIN keeps it.
+            let token = format!("stray-wait-reprove-{}", std::process::id());
+            let cmd = format!("until ! pgrep -f \"{token}\" >/dev/null; do sleep 1; done");
+            let (_child, stray) = start_loop(dir.path(), &cmd, "a");
+            let wrong_start = RecordedStray {
+                start: stray.start + 1,
+                ..stray.clone()
+            };
+            let mut wrong_argv = stray.clone();
+            wrong_argv.argv.push("x".to_string());
+            // Above Linux's pid_max ceiling (2^22): no process can hold it.
+            let gone = RecordedStray {
+                pid: 4_000_000_001,
+                ..stray.clone()
+            };
+            let mut wrong_class = stray.clone();
+            wrong_class.class = "b-file".to_string();
+            assert_eq!(
+                reprove_strays(vec![
+                    wrong_start,
+                    stray.clone(),
+                    wrong_argv,
+                    gone,
+                    wrong_class
+                ])
+                .await,
+                vec![stray.clone()],
+                "only the unchanged stray of the same class is re-proven"
+            );
+            assert!(reprove_strays(Vec::new()).await.is_empty());
+
+            // The graceful-exit child gate's `ProvenStray` arm, end to end over
+            // the same real stray: admitted only while it re-proves, only among
+            // the children it is asked about.
+            use crate::terminal::graceful_exit::ChildExemptions;
+            let other = stray.pid.wrapping_add(1);
+            assert_eq!(
+                ChildExemptions::from_strays(vec![stray.clone()])
+                    .admitted(&[stray.pid, other])
+                    .await,
+                std::collections::BTreeSet::from([stray.pid]),
+                "a re-proven stray among the children is admitted"
+            );
+            assert!(
+                ChildExemptions::from_strays(vec![stray.clone()])
+                    .admitted(&[other])
+                    .await
+                    .is_empty(),
+                "a stray that WOULD re-prove is not admitted when it is not a child"
+            );
+            let mut execed = stray.clone();
+            execed.argv.push("x".to_string());
+            assert!(
+                ChildExemptions::from_strays(vec![execed])
+                    .admitted(&[stray.pid, other])
+                    .await
+                    .is_empty(),
+                "a stray whose argv changed is not admitted"
+            );
+
+            // Class (b-file): a loop whose condition flipped is the same process
+            // with the same argv and start ticks, now on its way to post-loop work.
+            let other = tempfile::tempdir().unwrap();
+            let file = other.path().join("x.log");
+            std::fs::write(&file, "Compiling\n").unwrap();
+            let flips = format!("{}; sleep 3600", poll_file_loop(&file));
+            let (_flipping, polled) = start_loop(other.path(), &flips, "b-file");
+            assert_eq!(
+                reprove_strays_at(vec![polled.clone()], 0).await,
+                vec![polled.clone()],
+                "frozen at a floor of 0: still a stray"
+            );
+            std::fs::write(&file, "DONE\n").unwrap();
+            assert!(
+                reprove_strays_at(vec![polled], 0).await.is_empty(),
+                "a loop whose condition flipped is work, not a stray"
+            );
+        }
+
         #[test]
         fn a_recorded_unchanged_stray_is_ended_and_nothing_else_is() {
             let dir = tempfile::tempdir().unwrap();
@@ -3090,7 +3243,19 @@ mod tests {
                 let table = live::read_table().unwrap();
                 stray_verdict(&table, stray.pid, &live::LiveFacts::new(), 0)
             };
-            let verdict = read();
+            // The loop forks `pgrep` and `sleep` every second, and a child that has
+            // exited but is not yet reaped reads with an EMPTY argv, which the
+            // classifier rightly will not call harmless ("runs "). That is a sample
+            // of the loop between steps, not a verdict on it, so read until a
+            // sample lands outside that window (bounded, like `wait_for_argv`).
+            let mut verdict = read();
+            for _ in 0..100 {
+                if verdict.stray {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+                verdict = read();
+            }
             assert!(verdict.stray, "{verdict:?}");
             assert_eq!(verdict.class.as_deref(), Some("a"));
 
@@ -3098,14 +3263,19 @@ mod tests {
             let target = spawn(&sv(&["bash", "-c", "sleep 3600; :", &token]), 0);
             let target = Reaped(target);
             wait_for_argv(target.0.id(), &token);
-            let verdict = read();
+            // Same window as above: an unreaped child reads "runs " before the
+            // classifier ever reaches the live-pid wait.
+            let waits_on = format!("waits on live pid {}", target.0.id());
+            let mut verdict = read();
+            for _ in 0..100 {
+                if !verdict.stray && verdict.why.starts_with(&waits_on) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+                verdict = read();
+            }
             assert!(!verdict.stray, "{verdict:?}");
-            assert!(
-                verdict
-                    .why
-                    .starts_with(&format!("waits on live pid {}", target.0.id())),
-                "{verdict:?}"
-            );
+            assert!(verdict.why.starts_with(&waits_on), "{verdict:?}");
             drop(target);
 
             let lines = live::end(std::slice::from_ref(&stray), 0, Duration::from_secs(2));

@@ -288,7 +288,13 @@ async fn post_session_open(
 
     match store {
         Some(store) => {
-            record_session_open_into(&store, &req, &provider);
+            // The page the hook's pane is on NOW — the layout fact the hook
+            // itself cannot know, read from the pane rather than inherited.
+            let live_page = state
+                .app_handle
+                .try_state::<Arc<crate::terminal::TerminalManager>>()
+                .and_then(|tm| tm.live_page_of(&req.terminal_id));
+            record_session_open_into(&store, &req, &provider, live_page.as_deref());
             info!(
                 terminal_id = %req.terminal_id,
                 session_id = %req.session_id,
@@ -1201,10 +1207,19 @@ fn normalize_msys_cwd(cwd: &str) -> String {
 /// the SAME TERMINAL before falling back to the hook's own context. The terminal
 /// is the right key — the grid page and zone are properties of where the PTY
 /// sits, not of whichever session id currently owns it.
+///
+/// The PAGE is the one layout field with a better source than any record: the
+/// live pane itself. When the hook's terminal is held and alive, `live_page`
+/// (its current page, as `GET /terminals` reports it) wins over a prior
+/// record's page and over the literal `"default"` — a record inherited from a
+/// row opened before the pane was moved, or created with no prior at all,
+/// otherwise names a page the pane is not on (`/sessions/history` disagreeing
+/// with `/terminals`). `None` (no live pane known) keeps the inheritance above.
 fn record_session_open_into(
     store: &crate::session::session_lifecycle_store::SessionLifecycleStore,
     req: &SessionOpenRequest,
     provider: &str,
+    live_page: Option<&str>,
 ) {
     let existing = store.get(&req.session_id);
     // The most recent OTHER session open on this terminal, read before
@@ -1243,6 +1258,7 @@ fn record_session_open_into(
                 ("default".to_string(), 0, working_dir, title)
             }
         };
+    let page_id = live_page.map(str::to_string).unwrap_or(page_id);
     // config_dir: the hook DOES know the real account (CLAUDE_CONFIG_DIR) —
     // take it when present, but never erase a known one with None. The terminal
     // fallback is last and follows the same reasoning as the layout fields
@@ -1267,6 +1283,12 @@ fn record_session_open_into(
         provider.to_string(),
         None,
     );
+    // Every OTHER open row on this pane follows it too (a session resumed into
+    // a pane pinned to another id keeps both rows open) — the same move the
+    // boot-restore rebind makes, so no row on the pane names a stale page.
+    if let Some(live_page) = live_page {
+        store.update_page_by_terminal(&req.terminal_id, live_page);
+    }
     // CONFIRM the record (session-restore-redesign Phase 2 coordinator
     // refinement). This route is hit ONLY by a provider's SessionStart hook,
     // which fires only when a REAL provider session actually started in this
@@ -2297,7 +2319,7 @@ mod tests {
             ..session_open_req("term-after-restore", csid)
         };
         assert!(session_open_rejection(&req).is_none());
-        record_session_open_into(&store, &req, "claude");
+        record_session_open_into(&store, &req, "claude", None);
 
         let after = store.get(csid).unwrap();
         assert_eq!(after.terminal_id, "term-after-restore");
@@ -2395,7 +2417,7 @@ mod tests {
 
         // Drive the handler's own contract: reject first, write only on accept.
         if session_open_rejection(&bad).is_none() {
-            record_session_open_into(&store, &bad, "claude");
+            record_session_open_into(&store, &bad, "claude", None);
         }
 
         assert!(
@@ -2416,7 +2438,7 @@ mod tests {
         // emptiness above is the gate working rather than a broken writer.
         let good = session_open_req("term-1", "good-id_1");
         if session_open_rejection(&good).is_none() {
-            record_session_open_into(&store, &good, "claude");
+            record_session_open_into(&store, &good, "claude", None);
         }
         assert!(
             store.get("good-id_1").is_some(),
@@ -2915,7 +2937,7 @@ mod tests {
             config_dir: Some("C:/cfg".to_string()),
             cwd: Some("C:/repos/widget".to_string()),
         };
-        record_session_open_into(&store, &req, "claude");
+        record_session_open_into(&store, &req, "claude", None);
 
         let open = store.open_records();
         assert_eq!(open.len(), 1, "exactly one record written");
@@ -2943,7 +2965,7 @@ mod tests {
         // and refreshes the row rather than duplicating it.
         let mut resume = req;
         resume.source = Some("resume".to_string());
-        record_session_open_into(&store, &resume, "claude");
+        record_session_open_into(&store, &resume, "claude", None);
         assert_eq!(
             store.open_records().len(),
             1,
@@ -3016,7 +3038,7 @@ mod tests {
             config_dir: None, // hook may omit — must not erase the known one
             cwd: Some("/d/qontinui-root".to_string()),
         };
-        record_session_open_into(&store, &req, "claude");
+        record_session_open_into(&store, &req, "claude", None);
 
         let rec = store.get("sess-1").unwrap();
         assert_eq!(rec.page_id, "bf44dfd5-real-page", "page preserved");
@@ -3061,7 +3083,7 @@ mod tests {
                 config_dir: Some(config.clone()),
                 cwd: None,
             };
-            record_session_open_into(&store, &req, "claude");
+            record_session_open_into(&store, &req, "claude", None);
         };
         // Each terminal first hosts an open session, then the hook reports a
         // NEW id on it under each source.
@@ -3120,7 +3142,7 @@ mod tests {
                     config_dir: Some(config.clone()),
                     cwd: None,
                 };
-                record_session_open_into(&store, &req, "claude");
+                record_session_open_into(&store, &req, "claude", None);
             };
             // Vary which id sorts first too, so a tie-break on the id cannot
             // pass the test by accident either.
@@ -3224,7 +3246,7 @@ mod tests {
                     config_dir: Some(config.clone()),
                     cwd: None,
                 };
-                record_session_open_into(&store, &req, "claude");
+                record_session_open_into(&store, &req, "claude", None);
             };
             let (pane, resumed) = if round % 2 == 0 {
                 ("aaaa-pane", "zzzz-resumed")
@@ -3325,7 +3347,7 @@ mod tests {
             config_dir: None,
             cwd: Some("/d/qontinui-root".to_string()),
         };
-        record_session_open_into(&store, &req, "claude");
+        record_session_open_into(&store, &req, "claude", None);
 
         let rec = store
             .get("provider-adopted-id")
@@ -3416,7 +3438,7 @@ mod tests {
             config_dir: None,
             cwd: Some("/d/qontinui-root".to_string()),
         };
-        record_session_open_into(&store, &req, "claude");
+        record_session_open_into(&store, &req, "claude", None);
 
         let rec = store.get("fresh-id").expect("hook record written");
         assert_eq!(
@@ -3465,7 +3487,7 @@ mod tests {
             cwd: None,
         };
         // The handler computes `provider`; mirror its default here.
-        record_session_open_into(&store, &req, "claude");
+        record_session_open_into(&store, &req, "claude", None);
         let rec = store.get("s").unwrap();
         // No cwd ⇒ title falls back to the provider name.
         assert_eq!(rec.title.as_deref(), Some("claude"));
@@ -4697,5 +4719,148 @@ mod tests {
             "pre-sha for package.json captured synchronously: {:?}",
             ctx.pre_shas
         );
+    }
+
+    // -------------------------------------------------------------------
+    // The hook's page follows the LIVE pane (plan
+    // 2026-11-07-triage-sessions-ten-gaps-from-an-every-page-act-run, N10)
+    // -------------------------------------------------------------------
+
+    /// A live pane on `page`, held by a fresh `TerminalManager` under
+    /// `terminal_id`. The guard marks it dead again before it drops (a live
+    /// fixture's `Drop` would otherwise try to close it), including on panic.
+    struct LivePane {
+        tm: crate::terminal::TerminalManager,
+        session: Arc<crate::terminal::session::TerminalSession>,
+    }
+    impl Drop for LivePane {
+        fn drop(&mut self) {
+            self.session.set_alive_for_test(false);
+        }
+    }
+    fn live_pane(terminal_id: &str, page: &str) -> LivePane {
+        let tm = crate::terminal::TerminalManager::new();
+        let session = Arc::new(crate::terminal::session::tests::make_test_session(
+            Arc::new(std::sync::Mutex::new(Vec::new())),
+        ));
+        session.set_alive_for_test(true);
+        session.set_page(page.to_string());
+        tm.insert_for_test(terminal_id, session.clone());
+        LivePane { tm, session }
+    }
+
+    fn open_record_on(
+        terminal_id: &str,
+        csid: &str,
+        page: &str,
+    ) -> crate::session::session_lifecycle_store::TerminalSessionRecord {
+        serde_json::from_value(serde_json::json!({
+            "claudeSessionId": csid,
+            "pageId": page,
+            "zoneIndex": 2,
+            "terminalId": terminal_id,
+            "openedAt": 0,
+            "lastSeenAt": 0,
+            "state": "open",
+            "origin": "authoritative",
+        }))
+        .unwrap()
+    }
+
+    /// N10: a hook open on a live pane on page P, whose terminal's prior record
+    /// sits on `"default"`, writes P — not the prior row's page.
+    #[test]
+    fn hook_open_on_a_live_pane_takes_the_panes_page_over_a_prior_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::session::session_lifecycle_store::SessionLifecycleStore::open(
+            &dir.path().join("terminal-sessions.json"),
+        )
+        .unwrap();
+        let prior = "1a2b3c4d-0000-4000-8000-000000000001";
+        let adopted = "1a2b3c4d-0000-4000-8000-000000000002";
+        store.record_open(open_record_on("term-p", prior, "default"));
+        let pane = live_pane("term-p", "page-P");
+
+        let live_page = pane.tm.live_page_of("term-p");
+        assert_eq!(live_page.as_deref(), Some("page-P"));
+        record_session_open_into(
+            &store,
+            &session_open_req("term-p", adopted),
+            "claude",
+            live_page.as_deref(),
+        );
+
+        let rec = store.get(adopted).expect("hook record written");
+        assert_eq!(rec.page_id, "page-P", "the live pane's page wins");
+        assert_eq!(rec.zone_index, 2, "the zone is still inherited by terminal");
+    }
+
+    /// A hook open on a live pane on page P moves every OTHER open row on that
+    /// terminal to P as well, as the rebind does — not only the row it writes.
+    #[test]
+    fn hook_open_on_a_live_pane_moves_every_open_row_on_the_pane() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::session::session_lifecycle_store::SessionLifecycleStore::open(
+            &dir.path().join("terminal-sessions.json"),
+        )
+        .unwrap();
+        let pinned = "1a2b3c4d-0000-4000-8000-000000000004";
+        let resumed = "1a2b3c4d-0000-4000-8000-000000000005";
+        store.record_open(open_record_on("term-r", pinned, "default"));
+        // Confirmed, as a pane's own pinned session is once its hook fired: an
+        // unconfirmed sibling would be evicted as a phantom by the open below.
+        store.confirm_session(pinned);
+        let pane = live_pane("term-r", "page-P");
+
+        let mut req = session_open_req("term-r", resumed);
+        req.source = Some("resume".to_string());
+        record_session_open_into(
+            &store,
+            &req,
+            "claude",
+            pane.tm.live_page_of("term-r").as_deref(),
+        );
+
+        assert_eq!(store.get(resumed).unwrap().page_id, "page-P");
+        let other = store.get(pinned).unwrap();
+        assert_eq!(other.state, "open", "the pinned row stays open");
+        assert_eq!(
+            other.page_id, "page-P",
+            "the other open row follows the pane"
+        );
+    }
+
+    /// The same, for a hook naming a session that ALREADY has a record on
+    /// `"default"` (a resume onto a pane that was moved): the pane's page wins
+    /// over the record's own.
+    #[test]
+    fn hook_open_for_an_existing_record_takes_the_live_panes_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::session::session_lifecycle_store::SessionLifecycleStore::open(
+            &dir.path().join("terminal-sessions.json"),
+        )
+        .unwrap();
+        let csid = "1a2b3c4d-0000-4000-8000-000000000003";
+        store.record_open(open_record_on("term-q", csid, "default"));
+        let pane = live_pane("term-q", "page-P");
+
+        record_session_open_into(
+            &store,
+            &session_open_req("term-q", csid),
+            "claude",
+            pane.tm.live_page_of("term-q").as_deref(),
+        );
+
+        assert_eq!(store.get(csid).unwrap().page_id, "page-P");
+    }
+
+    /// A pane that is held but DEAD names no page, so the hook keeps the
+    /// inherited one rather than trusting a corpse.
+    #[test]
+    fn a_dead_pane_names_no_live_page() {
+        let pane = live_pane("term-dead", "page-P");
+        pane.session.set_alive_for_test(false);
+        assert_eq!(pane.tm.live_page_of("term-dead"), None);
+        assert_eq!(pane.tm.live_page_of("term-absent"), None);
     }
 }

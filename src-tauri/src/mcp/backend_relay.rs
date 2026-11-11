@@ -3712,7 +3712,7 @@ fn http_request_egress_refusal(request_id: &Value, raw_path: &str) -> Option<Val
         // shows session panes: the snapshot carries every element's text, page
         // health quotes the text of each element its findings flag, and the
         // occlusion sweep names the webview's elements and occluders (a
-        // relayed sweep drops their text, not their ids).
+        // relayed sweep drops those ids along with their label and text).
         _ if matches!(
             segments.join("/").as_str(),
             "ui-bridge/control/snapshot"
@@ -6515,6 +6515,7 @@ pub(crate) async fn end_admitted_terminal(
                         &graceful_id,
                         crate::terminal::graceful_exit::DEFAULT_DEADLINE,
                         None,
+                        crate::terminal::graceful_exit::ChildExemptions::none(),
                     )
                     .await
             },
