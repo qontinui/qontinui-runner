@@ -191,6 +191,7 @@ async fn refuse_headless(
                 uuid::Uuid::new_v4(),
                 Some(f.ctx),
                 &super::LaunchFrame::default(),
+                "claude".to_string(),
             )
             .await;
             (res, OBSERVED_REMOVAL.with(|slot| slot.borrow_mut().take()))
