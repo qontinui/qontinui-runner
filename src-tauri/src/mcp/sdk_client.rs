@@ -10878,6 +10878,7 @@ mod condition_secrets_dispatch_tests {
             transport_kind: None,
             physical_device_id: None,
             activated_by,
+            bearer: super::ConnectionBearer::Absent,
         }
     }
 
