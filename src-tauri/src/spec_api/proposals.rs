@@ -758,7 +758,7 @@ async fn execute_claimed(
         Ok(o) => o,
         Err(e) => {
             if let Some((status, reason, code)) = execute_skip(&e) {
-                // Nothing was spawned: the drain deferred the run or the
+                // Nothing was spawned: the drain gate deferred the run or the
                 // registry refused it. The proposal is not failed; it goes
                 // back to the queue for a later execute.
                 claim.requeue().await;
@@ -1081,18 +1081,35 @@ fn authoring_error_reason(
 }
 
 /// PURE: an execute that was never admitted — `(HTTP status, outcome reason,
-/// drain code)` — or `None` for every real authoring outcome. The device
-/// drain's deferral answers 409 with coord's drain code, as every spawn door
-/// does under a drain; a registry refusal answers 403. The reasons are the
-/// flywheel's `skipped:` vocabulary (`drained`, `not-authorized`).
+/// drain code)` — or `None` for every real authoring outcome. The drain
+/// gate's deferral answers 409 with coord's code, as every spawn door does; a
+/// registry refusal answers 403. The reasons are the flywheel's `skipped:`
+/// vocabulary: `drained` (a drained device, or an unreadable drain state),
+/// `role-closed` (the device's dispatch role closes the agent lane, which is a
+/// standing role, not a drain) and `not-authorized`.
 fn execute_skip(
     e: &crate::workflow_generation::spec_authoring::AuthoringError,
 ) -> Option<(StatusCode, &'static str, Option<&'static str>)> {
     use crate::workflow_generation::spec_authoring::AuthoringError::*;
     match e {
-        SpawnDeferred { code, .. } => Some((StatusCode::CONFLICT, "drained", Some(*code))),
+        SpawnDeferred { code, .. } => {
+            Some((StatusCode::CONFLICT, deferral_reason(code), Some(*code)))
+        }
         SpawnNotAuthorized(_) => Some((StatusCode::FORBIDDEN, "not-authorized", None)),
         _ => None,
+    }
+}
+
+/// PURE: the `skipped:` reason for a drain-gate deferral whose code is `code`.
+/// The match is exhaustive, so a new class does not compile until it names
+/// its reason.
+fn deferral_reason(code: &str) -> &'static str {
+    use crate::coord_drain_state::DeferClass;
+    match DeferClass::from_code(code) {
+        Some(DeferClass::RoleClosed) => "role-closed",
+        // A code no class has cannot come from the gate: it keeps the drain
+        // family's reason.
+        Some(DeferClass::Drained | DeferClass::Unknown) | None => "drained",
     }
 }
 
@@ -1141,7 +1158,7 @@ fn authoring_error_detail(
         MalformedAiOutput(s) => format!("malformed AI output: {}", s),
         AiDispatchFailed(s) => format!("AI dispatch failed: {}", s),
         SpawnDeferred { code, reason } => format!(
-            "the meta-workflow spawn was deferred by coord's device drain ({}): {}",
+            "the meta-workflow spawn was deferred by the drain gate ({}): {}",
             code, reason
         ),
         SpawnNotAuthorized(s) => format!(
@@ -1638,14 +1655,31 @@ mod tests {
     /// for the same refusal. Every real authoring outcome is not a skip.
     #[test]
     fn a_spawn_that_was_never_admitted_is_skipped_not_failed() {
+        use crate::coord_drain_state::DeferClass;
         use crate::workflow_generation::spec_authoring::AuthoringError;
-        for code in crate::coord_drain_state::DeferClass::ALL.map(|class| class.code()) {
+        // Each class's reason, pinned on its own: a dispatch role that closes
+        // the agent lane is a standing role, not a drain.
+        let pinned = [
+            (DeferClass::Drained, "drained"),
+            (DeferClass::Unknown, "drained"),
+            (DeferClass::RoleClosed, "role-closed"),
+        ];
+        for class in DeferClass::ALL {
+            assert!(
+                pinned
+                    .iter()
+                    .any(|(pinned_class, _)| *pinned_class == class),
+                "{class:?} has no pinned skip reason"
+            );
+        }
+        for (class, reason) in pinned {
             assert_eq!(
                 execute_skip(&AuthoringError::SpawnDeferred {
-                    code,
-                    reason: "drained".into(),
+                    code: class.code(),
+                    reason: "deferred".into(),
                 }),
-                Some((StatusCode::CONFLICT, "drained", Some(code)))
+                Some((StatusCode::CONFLICT, reason, Some(class.code()))),
+                "{class:?}"
             );
         }
         assert_eq!(

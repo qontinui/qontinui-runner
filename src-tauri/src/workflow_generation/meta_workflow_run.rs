@@ -776,27 +776,20 @@ mod tests {
     }
 
     #[test]
-    fn admission_defers_a_drained_or_unreadable_device_with_its_code() {
-        assert_eq!(
-            admission(&SpawnDecision::DeferredByDrain {
-                reason: "coord has drained this device".into(),
-                class: DeferClass::Drained,
-            }),
-            Err(MetaWorkflowError::Deferred {
-                code: "device_drained",
-                reason: "coord has drained this device".into(),
-            })
-        );
-        assert_eq!(
-            admission(&SpawnDecision::DeferredByDrain {
-                reason: "drain state unknown".into(),
-                class: DeferClass::Unknown,
-            }),
-            Err(MetaWorkflowError::Deferred {
-                code: "drain_unreadable",
-                reason: "drain state unknown".into(),
-            })
-        );
+    fn admission_defers_every_drain_gate_class_with_its_code() {
+        for class in DeferClass::ALL {
+            assert_eq!(
+                admission(&SpawnDecision::DeferredByDrain {
+                    reason: "the drain gate deferred it".into(),
+                    class,
+                }),
+                Err(MetaWorkflowError::Deferred {
+                    code: class.code(),
+                    reason: "the drain gate deferred it".into(),
+                }),
+                "{class:?}"
+            );
+        }
     }
 
     #[test]

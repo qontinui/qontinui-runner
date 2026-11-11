@@ -149,7 +149,7 @@ pub enum AuthoringError {
     /// and the proposal waits for the drain or the role to lift. `code` is
     /// coord's 409 vocabulary
     /// ([`DeferClass::code`](crate::coord_drain_state::DeferClass::code)).
-    #[error("spawn deferred by the device drain ({code}): {reason}")]
+    #[error("spawn deferred by the drain gate ({code}): {reason}")]
     SpawnDeferred { code: &'static str, reason: String },
     /// The agent registry refused the execute's `standing_continuation`
     /// spawn. NOT an authoring failure: nothing was spawned.
