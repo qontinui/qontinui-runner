@@ -9773,14 +9773,18 @@ mod tests {",
         ] {
             assert!(caps.iter().any(|c| c == token), "{token} missing: {caps:?}");
         }
-        assert!(caps.iter().any(|c| c == &format!("os:{}", current_os_label())));
+        assert!(caps
+            .iter()
+            .any(|c| c == &format!("os:{}", current_os_label())));
         // And the heartbeat really routes its join failure through it.
         let src = include_str!("fleet.rs");
         let prod = prod_part(src);
         let (_, from_fn) = prod
             .split_once("pub async fn heartbeat_to_coord(")
             .expect("heartbeat_to_coord is defined in fleet.rs");
-        let (body, _) = from_fn.split_once("\n}\n").expect("heartbeat_to_coord ends");
+        let (body, _) = from_fn
+            .split_once("\n}\n")
+            .expect("heartbeat_to_coord ends");
         assert!(
             squeezed(body).contains(
                 ".unwrap_or_else(|_|{heartbeat_join_failure_capabilities(ci.enabled,&ci.repo_allowlist)})"
