@@ -54,7 +54,7 @@
 //!
 //! # Testability
 //!
-//! The parsers and [`read_slices`] / [`read_psi`] are plain `std::fs` and take
+//! The parsers and [`read_slice_reads`] / [`read_psi`] are plain `std::fs` and take
 //! their roots as arguments, so the fixture-directory tests run on every host.
 //! Only [`collect`] picks the real `/sys/fs/cgroup` and `/proc/pressure` roots,
 //! and only under `cfg(target_os = "linux")`.
@@ -284,15 +284,20 @@ pub(crate) struct SliceBases {
 pub(crate) fn slice_bases(cgroup_root: &Path) -> SliceBases {
     let mut bases = vec![cgroup_root.to_path_buf(), cgroup_root.join("system.slice")];
     let mut unlisted = Vec::new();
-    let mut users = list_dir(&cgroup_root.join("user.slice"), &mut unlisted, |p| {
-        p.is_dir()
+    // The entry's own type, from the listing: a `user-N.slice` whose type
+    // could not be read leaves `user.slice` partly listed, never silently
+    // short of that user's managers.
+    let mut users = list_dir(&cgroup_root.join("user.slice"), &mut unlisted, |e| {
+        e.file_type().ok().map(|t| t.is_dir())
     });
     users.sort();
     for u in users {
-        let mut managers = list_dir(&u, &mut unlisted, |p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("user@") && n.ends_with(".service"))
+        let mut managers = list_dir(&u, &mut unlisted, |e| {
+            Some(
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with("user@") && n.ends_with(".service")),
+            )
         });
         managers.sort();
         bases.extend(managers);
@@ -302,8 +307,13 @@ pub(crate) fn slice_bases(cgroup_root: &Path) -> SliceBases {
 
 /// The entries of `dir` that `keep` accepts, as many as could be read. `dir`
 /// goes on `unlisted` when it exists but could not be listed, in whole or in
-/// part; one that does not exist has no entries.
-fn list_dir(dir: &Path, unlisted: &mut Vec<PathBuf>, keep: impl Fn(&Path) -> bool) -> Vec<PathBuf> {
+/// part: an entry that could not be read, or one `keep` could not judge
+/// (`None`). One that does not exist has no entries.
+fn list_dir(
+    dir: &Path,
+    unlisted: &mut Vec<PathBuf>,
+    keep: impl Fn(&fs::DirEntry) -> Option<bool>,
+) -> Vec<PathBuf> {
     let rd = match fs::read_dir(dir) {
         Ok(rd) => rd,
         Err(e) => {
@@ -316,12 +326,11 @@ fn list_dir(dir: &Path, unlisted: &mut Vec<PathBuf>, keep: impl Fn(&Path) -> boo
     let (mut out, mut whole) = (Vec::new(), true);
     for entry in rd {
         match entry {
-            Ok(e) => {
-                let p = e.path();
-                if keep(&p) {
-                    out.push(p);
-                }
-            }
+            Ok(e) => match keep(&e) {
+                Some(true) => out.push(e.path()),
+                Some(false) => {}
+                None => whole = false,
+            },
             Err(_) => whole = false,
         }
     }
@@ -352,7 +361,7 @@ fn resolve_slice(cgroup_root: &Path, slice: &str) -> Option<(PathBuf, Value)> {
         .find_map(|d| read_slice_memory(&d).map(|v| (d, v)))
 }
 
-/// What [`read_slices`] read.
+/// What [`read_slice_reads`] read.
 pub(crate) struct SliceReads {
     /// The `cgroup_slices` map. A slice with no readable file is omitted.
     pub(crate) memory: Map<String, Value>,
@@ -364,8 +373,9 @@ pub(crate) struct SliceReads {
     pub(crate) dirs: Vec<(&'static str, PathBuf)>,
 }
 
-/// Read every watched slice under `cgroup_root`.
-pub(crate) fn read_slices(cgroup_root: &Path) -> SliceReads {
+/// Read every watched slice under `cgroup_root`: its memory, its PSI, and the
+/// directory each was read from.
+pub(crate) fn read_slice_reads(cgroup_root: &Path) -> SliceReads {
     let mut reads = SliceReads {
         memory: Map::new(),
         psi: Map::new(),
@@ -382,6 +392,14 @@ pub(crate) fn read_slices(cgroup_root: &Path) -> SliceReads {
         reads.dirs.push((slice, dir));
     }
     reads
+}
+
+/// [`read_slice_reads`]' `cgroup_slices` and per-slice PSI maps, without the
+/// directories.
+#[cfg(test)]
+pub(crate) fn read_slices(cgroup_root: &Path) -> (Map<String, Value>, Map<String, Value>) {
+    let SliceReads { memory, psi, .. } = read_slice_reads(cgroup_root);
+    (memory, psi)
 }
 
 /// System-wide PSI from a `/proc/pressure`-shaped directory.
@@ -402,8 +420,8 @@ pub(crate) fn read_psi(proc_pressure: &Path) -> Map<String, Value> {
 ///
 /// The CPU keys of `cgroup_slices` are deltas since the previous call for the
 /// same `cgroup_root`, which this keeps between calls, so a first call carries
-/// none. Each watched slice's CPU is read from the directory [`read_slices`]
-/// read its memory from. `proc_pressure` is `<procfs>/pressure`: the runner's
+/// none. Each watched slice's CPU is read from the directory
+/// [`read_slice_reads`] read its memory from. `proc_pressure` is `<procfs>/pressure`: the runner's
 /// own cgroup and user are read from `<procfs>/self/cgroup` and
 /// `<procfs>/self/status` beside it. What `ci_node` has counted of its
 /// dispatches ([`crate::ci_node::cgroup::dispatch_counts`]) is read before the
@@ -420,7 +438,7 @@ pub(crate) fn collect_from(cgroup_root: &Path, proc_pressure: &Path) -> SliceTel
         memory: mut mem,
         psi: slice_psi,
         dirs,
-    } = read_slices(cgroup_root);
+    } = read_slice_reads(cgroup_root);
     cpu::attach(
         cgroup_root,
         proc_pressure,
@@ -569,25 +587,8 @@ mod tests {
     #[test]
     fn slices_resolve_across_system_and_user_manager_paths() {
         let d = fixture_tree();
-        let SliceReads {
-            memory: mem,
-            psi,
-            dirs,
-        } = read_slices(d.path());
+        let (mem, psi) = read_slices(d.path());
         assert_eq!(mem.len(), 2, "agent-builds.slice is absent and omitted");
-        assert_eq!(
-            dirs,
-            vec![
-                ("ci-runners.slice", d.path().join("ci.slice/ci-runners.slice")),
-                (
-                    "qontinui-runner.slice",
-                    d.path().join(
-                        "user.slice/user-1000.slice/user@1000.service/qontinui.slice/qontinui-runner.slice"
-                    )
-                ),
-            ],
-            "each slice's directory, for its cpu object"
-        );
         let ci = &mem["ci-runners.slice"];
         assert_eq!(ci["memory_current"], json!(900));
         assert_eq!(ci["memory_high"], json!(1000));
@@ -624,13 +625,42 @@ mod tests {
             "7
 ",
         );
-        let mem = read_slices(d.path()).memory;
+        let (mem, _) = read_slices(d.path());
         assert_eq!(mem["agent-builds.slice"]["memory_current"], json!(7));
         assert_eq!(
             nested_parent("ci-runners.slice").as_deref(),
             Some("ci.slice")
         );
         assert_eq!(nested_parent("plain.slice"), None);
+    }
+
+    /// Each watched slice's `cpu` object is read from the directory its memory
+    /// was read from: `read_slice_reads` hands `collect_from` that directory,
+    /// in [`WATCHED_SLICES`] order, for every slice it read.
+    #[test]
+    fn each_slice_is_read_from_the_directory_its_memory_came_from() {
+        let d = fixture_tree();
+        let reads = read_slice_reads(d.path());
+        assert_eq!(
+            reads.dirs,
+            vec![
+                ("ci-runners.slice", d.path().join("ci.slice/ci-runners.slice")),
+                (
+                    "qontinui-runner.slice",
+                    d.path().join(
+                        "user.slice/user-1000.slice/user@1000.service/qontinui.slice/qontinui-runner.slice"
+                    )
+                ),
+            ],
+            "each slice's directory, for its cpu object"
+        );
+        let names: std::collections::BTreeSet<&str> = reads.dirs.iter().map(|(s, _)| *s).collect();
+        let read: std::collections::BTreeSet<&str> =
+            reads.memory.keys().map(String::as_str).collect();
+        assert_eq!(
+            names, read,
+            "a directory for every slice read, and no other"
+        );
     }
 
     #[test]
