@@ -2034,11 +2034,10 @@ export function useTerminalInitialization({
           // `claude --resume <id>` would fork the live session. There is no
           // reconnectable PTY for it either (the reconnect above didn't
           // return one), so there is nothing to rebind: skip the record
-          // entirely, leaving it untouched in the registry. It stays
-          // AUTO-restorable only briefly — the lifecycle poll retires
-          // unmatched records CloseNoTerminal after 3×45 s (~2¼ min),
-          // dropping them from the restorable set — but it remains MANUALLY
-          // resumable (`claude --resume <id>`) indefinitely. When liveness is
+          // entirely, leaving it untouched in the registry. The boot-census
+          // hold keeps the row open, and the lifecycle poll watches its live
+          // host so its gate is still reported when the host exits. It remains
+          // MANUALLY resumable (`claude --resume <id>`). When liveness is
           // UNKNOWN (registry read failed), fail CLOSED toward not-respawning
           // — a missing tab is recoverable; a duplicate live session corrupts
           // the transcript.

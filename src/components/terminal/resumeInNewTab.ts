@@ -29,7 +29,7 @@ import {
   type OpenRecordTab,
   type SessionOpenArgs,
 } from "./sessionRecordArgs";
-import { runVerifiedResume } from "./useTerminalInitialization";
+import { runVerifiedResume, type ResumeGateIdentity } from "./useTerminalInitialization";
 import type { PastSession } from "./usePastSessions";
 import type { TerminalRefsMap } from "./writeWhenReady";
 
@@ -267,6 +267,9 @@ export async function resumeProfileSession(
     claudeSessionId: string;
     configDir: string | undefined;
     recordOpen: SessionOpenArgs;
+    /** The record's gate identity (plan 2026-10-07 D2): a gate continuation
+     * resumed from a profile still reports its own work outcome. */
+    gate?: ResumeGateIdentity;
   },
 ): Promise<ResumeAttempt> {
   const { tabId, claudeSessionId } = args;
@@ -308,6 +311,7 @@ export async function resumeProfileSession(
     updateTab: deps.updateTab,
     defaultConfigHome: deps.defaultConfigHome,
     recordOpen: { ...args.recordOpen, configDir: dirs.recordDir },
+    ...(args.gate ? { gate: args.gate } : {}),
   });
   return outcome === "verified"
     ? { kind: "verified", tabId }

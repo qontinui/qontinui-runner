@@ -3789,6 +3789,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             session::tracking_health::set_primary_boot_unix_millis(
                 chrono::Utc::now().timestamp_millis(),
             );
+            // Mint this process generation's identity now, before any spawn
+            // or boot restore can stamp a record with it (plan
+            // 2026-10-07-a-resumed-gate-continuation-…, D1). Random, compared
+            // for equality — never ordered by a clock.
+            info!(
+                generation = session::tracking_health::process_generation(),
+                "runner process generation minted"
+            );
 
             // Announce the agent-registry break-glass ONCE, loudly, if it is
             // set. A per-spawn warn in a busy log is not discoverable; an
@@ -4344,19 +4352,43 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                             session::session_lifecycle_store::runner_restart_report_on_close(
                                 &store,
                                 csid,
-                                session::tracking_health::primary_boot_unix_millis_or_init(),
+                                session::tracking_health::process_generation(),
                             );
-                        if let Some(report) = report {
+                        // Plan 2026-10-07 D4: the post is gated on a
+                        // live-host check — a skip-alive continuation whose
+                        // Claude process still runs is NOT reported `crashed`;
+                        // the post waits for that process to exit (as
+                        // `exit=unknown …+skip-alive-exit`). Spawned only for
+                        // a record the cheap synchronous decision above says
+                        // to report, so an ordinary close costs no snapshot.
+                        // The record's facts are captured NOW, with the
+                        // decision; the watch may outlive the row as it is.
+                        let closed = store
+                            .upgrade()
+                            .and_then(|s| s.get(csid))
+                            .map(|rec| session::gate_host_watch::ClosedRecord::of(&rec));
+                        if let (Some(report), Some(closed)) = (report, closed) {
                             tracing::info!(
                                 claude_session = %csid,
                                 gate_id = %report.gate_id,
                                 detail = %report.detail,
-                                "continuation lost to a runner restart — posting work_unreported"
+                                "continuation lost to a runner restart — checking for a live host before posting work_unreported"
                             );
-                            rt_handle.spawn(agent_runtime::post_runner_restart_unreported(
-                                report.gate_id,
-                                report.consuming_device_id,
-                                report.detail,
+                            rt_handle.spawn(session::gate_host_watch::report_on_close(
+                                store.clone(),
+                                csid.to_string(),
+                                session::tracking_health::process_generation().to_string(),
+                                report,
+                                closed,
+                                session::gate_host_watch::production_probe,
+                                |r: session::session_lifecycle_store::RunnerRestartUnreported| {
+                                    agent_runtime::post_runner_restart_unreported(
+                                        r.gate_id,
+                                        r.consuming_device_id,
+                                        r.detail,
+                                    )
+                                },
+                                session::gate_host_watch::WATCH_INTERVAL,
                             ));
                         }
                     });
@@ -4691,6 +4723,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     // uncertainty — without this it stays `open` for up to
                     // 7 days and re-qualifies for restore at every boot.
                     let mut consecutive_no_match: StdHashMap<String, u32> = StdHashMap::new();
+                    // Rows whose skip-alive host this process already watches
+                    // (plan 2026-10-07 D4), so a held row arms one watcher.
+                    let mut watched_held_rows: std::collections::HashSet<String> =
+                        std::collections::HashSet::new();
 
                     // Built ONCE, outside the loop: `discover()` walks every
                     // Claude config root, and paying that on a 45s tick scales
@@ -4851,35 +4887,34 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         // or name. An indeterminate snapshot (the fail-closed
                         // `live_pids_from_snapshot` error) degrades to "no
                         // identity data this tick", never to a blanking write.
-                        let live_identity: StdHashMap<String, session::session_lifecycle_store::SessionIdentityUpdate> =
+                        let tick_live_rows: Vec<session::claude_session_registry::LiveClaudeSession> =
                             if open.is_empty() {
-                                StdHashMap::new()
+                                Vec::new()
                             } else {
                                 match session::claude_session_registry::live_pids_from_snapshot(&snap) {
                                     Ok(live_pids) => session::claude_session_registry::read_live_sessions(
                                         &terminal::transcript::find_claude_config_dirs(),
                                         &live_pids,
-                                    )
-                                    .into_iter()
-                                    // `read_live_sessions` returns one row per
-                                    // PROCESS and several processes may report
-                                    // one session id; it is sorted stably, so
-                                    // keeping the FIRST row per id is a stable
-                                    // choice rather than a coin flip.
-                                    .fold(StdHashMap::new(), |mut acc, s| {
-                                        acc.entry(s.session_id.clone())
-                                            .or_insert_with(|| s.identity_update());
-                                        acc
-                                    }),
+                                    ),
                                     Err(e) => {
                                         tracing::debug!(
                                             error = %e,
                                             "session lifecycle poll: live-session registry indeterminate — identity refresh skipped this tick"
                                         );
-                                        StdHashMap::new()
+                                        Vec::new()
                                     }
                                 }
                             };
+                        // `read_live_sessions` returns one row per PROCESS and
+                        // several processes may report one session id; it is
+                        // sorted stably, so keeping the FIRST row per id is a
+                        // stable choice rather than a coin flip.
+                        let live_identity: StdHashMap<String, session::session_lifecycle_store::SessionIdentityUpdate> =
+                            tick_live_rows.iter().fold(StdHashMap::new(), |mut acc, s| {
+                                acc.entry(s.session_id.clone())
+                                    .or_insert_with(|| s.identity_update());
+                                acc
+                            });
 
                         // Index the live terminals ONCE per tick (plan
                         // 2026-07-28-runner-many-sessions-performance §7a/B8).
@@ -5130,6 +5165,59 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                             // restore — never closed `no-terminal` meanwhile.
                             let adoption_pending =
                                 terminal::holder_boot_sweep::adoption_pending(&rec.terminal_id);
+                            // Plan 2026-10-07 D4: a row the restore refused as
+                            // still alive never closes under the census hold,
+                            // so the close observer's watch cannot arm. Arm it
+                            // here, only for a row a live process really hosts.
+                            if tick_snapshot_ok
+                                && !watched_held_rows.contains(&rec.claude_session_id)
+                            {
+                                if let Some((gate_id, consuming_device_id)) =
+                                    session::session_lifecycle_store::held_row_gate_to_watch(
+                                        rec,
+                                        awaiting_boot_restore,
+                                        boot_hold,
+                                        info.is_some(),
+                                        adoption_pending,
+                                        session::tracking_health::process_generation(),
+                                    )
+                                {
+                                    let hosts = session::gate_host_watch::live_hosts(
+                                        &rec.claude_session_id,
+                                        &tick_live_rows,
+                                        &snap,
+                                    );
+                                    if !hosts.is_empty() {
+                                        watched_held_rows.insert(rec.claude_session_id.clone());
+                                        tauri::async_runtime::spawn(
+                                            session::gate_host_watch::watch_then_report(
+                                                std::sync::Arc::downgrade(&poll_lifecycle_store),
+                                                rec.claude_session_id.clone(),
+                                                session::tracking_health::process_generation()
+                                                    .to_string(),
+                                                session::gate_host_watch::SkipAliveWatch {
+                                                    hosts,
+                                                    gate_id,
+                                                    consuming_device_id,
+                                                    terminal_id: rec.terminal_id.clone(),
+                                                    opened_at: rec.opened_at,
+                                                    close: session::gate_host_watch::CLOSE_BOOT_HELD
+                                                        .to_string(),
+                                                },
+                                                session::gate_host_watch::production_watch_probe,
+                                                |r: session::session_lifecycle_store::RunnerRestartUnreported| {
+                                                    agent_runtime::post_runner_restart_unreported(
+                                                        r.gate_id,
+                                                        r.consuming_device_id,
+                                                        r.detail,
+                                                    )
+                                                },
+                                                session::gate_host_watch::HELD_WATCH_INTERVAL,
+                                            ),
+                                        );
+                                    }
+                                }
+                            }
                             let action = hold_for_withheld_boot_restore(
                                 classify(
                                     live_is_alive,
@@ -5258,6 +5346,54 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                                 PollAction::Skip => {
                                     // Uncertain — do NOT touch the counters.
+                                    //
+                                    // Plan 2026-10-07 D3: a restore-pending
+                                    // record is Skipped forever, so a
+                                    // prior-generation gate whose resume
+                                    // failed and was never retried would
+                                    // never close and never be reported.
+                                    // Report it once its marker is stale; the
+                                    // record stays open for a late Retry. Not
+                                    // on an indeterminate snapshot, where
+                                    // `claude_present == false` proves nothing:
+                                    // an unmatched row hard-codes `snapshot_ok`
+                                    // and `claude_present`, so the tick's own
+                                    // snapshot and the live registry decide.
+                                    // Not while the restore is withheld or a
+                                    // holder adoption is pending: those are
+                                    // waiting, not failed. The census hold
+                                    // deliberately does not count here.
+                                    if session::session_lifecycle_store::may_report_stale_failed_restore(
+                                        restore_pending,
+                                        snapshot_ok && tick_snapshot_ok,
+                                        boot_hold,
+                                        adoption_pending,
+                                    ) {
+                                        if let Some(report) = poll_lifecycle_store
+                                            .report_stale_failed_restore(
+                                                &rec.claude_session_id,
+                                                claude_present
+                                                    || live_identity
+                                                        .contains_key(&rec.claude_session_id),
+                                                session::tracking_health::process_generation(),
+                                                chrono::Utc::now().timestamp_millis(),
+                                            )
+                                        {
+                                            tracing::info!(
+                                                claude_session = %rec.claude_session_id,
+                                                gate_id = %report.gate_id,
+                                                detail = %report.detail,
+                                                "session lifecycle poll: failed restore of a gate continuation went stale — posting work_unreported"
+                                            );
+                                            tauri::async_runtime::spawn(
+                                                agent_runtime::post_runner_restart_unreported(
+                                                    report.gate_id,
+                                                    report.consuming_device_id,
+                                                    report.detail,
+                                                ),
+                                            );
+                                        }
+                                    }
                                 }
                             }
                         }

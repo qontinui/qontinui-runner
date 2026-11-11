@@ -244,6 +244,38 @@ describe("the default account's explicit path stays out of tabs and profiles", (
     expect(call.recordOpen).toEqual({ ...recordOpen, configDir: HOME });
   });
 
+  it("a zone-profile resume carries the record's gate identity to the typed resume (plan 2026-10-07 D2)", async () => {
+    const verify = vi.fn(async () => "verified" as const);
+    const profileDeps = {
+      terminalRefs: new Map(),
+      updateTab: vi.fn(),
+      verify,
+      defaultConfigHome: async () => HOME,
+      notify: vi.fn(),
+      invokeFn: vi.fn(async () => ({})),
+    };
+    const gate = {
+      gateId: "7252781b-c49c-4a83-bdc2-4fec9c3dcd91",
+      gateConsumingDeviceId: "0b9f8f4e-5d0a-4c55-9d8c-1f0e2a3b4c5d",
+    };
+    await resumeProfileSession(profileDeps, {
+      tabId: "tab-9",
+      claudeSessionId: "abc-123",
+      configDir: "/home/u/.claude-x",
+      recordOpen,
+      gate,
+    });
+    expect(verify.mock.calls[0][0].gate).toEqual(gate);
+    // A non-gate record sends no gate.
+    await resumeProfileSession(profileDeps, {
+      tabId: "tab-9",
+      claudeSessionId: "abc-123",
+      configDir: "/home/u/.claude-x",
+      recordOpen,
+    });
+    expect(verify.mock.calls[1][0]).not.toHaveProperty("gate");
+  });
+
   it("a zone-profile resume types a non-default account, and refuses an unsafe one", async () => {
     const updateTab = vi.fn();
     const verify = vi.fn(async () => "verified" as const);
