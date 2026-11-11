@@ -2092,6 +2092,21 @@ fn heartbeat_device_capabilities(ci_node: bool, repo_allowlist: &[String]) -> Ve
     build_device_capabilities(ci_node, repo_allowlist, &heartbeat_capabilities())
 }
 
+/// The capability base when the blocking assembly panicked: CI tokens, the OS
+/// fact (the one host token that needs no probe) and the credential family.
+///
+/// The vector is AUTHORITATIVE, so whatever is left out here is retracted from
+/// `coord.devices.capabilities` by this heartbeat. A panic in an unrelated host
+/// probe says nothing about this box's credentials, and leaving the family out
+/// would also drop `probes:cred`, turning the device from "probed" into
+/// "unprobed" for a tick. The read cannot block or probe: it is the same cache
+/// [`cred_capabilities`] always answers from.
+fn heartbeat_join_failure_capabilities(ci_node: bool, repo_allowlist: &[String]) -> Vec<String> {
+    let mut host = vec![format!("os:{}", current_os_label())];
+    host.extend(cred_capabilities());
+    build_device_capabilities(ci_node, repo_allowlist, &host)
+}
+
 /// Pure assembly of the whole `capabilities` vector the heartbeat sends.
 ///
 /// `ci_node` leads (it is the coarse fleet-role flag the CI filters read),
@@ -3490,11 +3505,7 @@ pub async fn heartbeat_to_coord() -> Result<crate::coord_drain_state::HeartbeatO
         spawn_blocking_tracked(move || heartbeat_device_capabilities(ci_enabled, &repo_allowlist))
             .await
             .unwrap_or_else(|_| {
-                build_device_capabilities(
-                    ci.enabled,
-                    &ci.repo_allowlist,
-                    &[format!("os:{}", current_os_label())],
-                )
+                heartbeat_join_failure_capabilities(ci.enabled, &ci.repo_allowlist)
             });
     // Skill capabilities (plan 2026-10-13-coord-expedited-land-lever-for-agents
     // Phase 3b): advertised only when the skill is served AND the bearer this
@@ -9731,6 +9742,59 @@ mod tests {",
     /// finished probe run would leave it. It never runs a probe: the cache is
     /// seeded by value, and the background refresh is suppressed under
     /// `cfg(test)`. The prior cache state is restored on every exit.
+    /// The heartbeat's join-failure arm (`heartbeat_to_coord`'s `unwrap_or_else`
+    /// over the blocking assembly) keeps the credential family. The vector is
+    /// authoritative, so dropping it there would retract every `cred:*` token
+    /// and the `probes:cred` marker because an unrelated host probe panicked.
+    #[test]
+    fn a_join_failure_heartbeat_keeps_the_credential_family() {
+        let _serial = CRED_FAMILY_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        struct Restore(Option<CredFamilyState>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                if let Some(prior) = self.0.take() {
+                    *CRED_FAMILY_CACHE.lock().unwrap_or_else(|p| p.into_inner()) = prior;
+                }
+            }
+        }
+        let mut seeded = CredFamilyState::new();
+        seeded.apply(
+            &[(CRED_GH_CAPABILITY, CredState::Present)],
+            std::time::Instant::now(),
+            HOST_PROBE_TTL,
+        );
+        let _restore = {
+            let mut g = CRED_FAMILY_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+            Restore(Some(std::mem::replace(&mut *g, seeded)))
+        };
+        let allow = vec!["qontinui-runner".to_string()];
+        let caps = heartbeat_join_failure_capabilities(true, &allow);
+        for token in [
+            "ci_node",
+            "ci_repo:qontinui-runner",
+            CRED_PROBES_MARKER,
+            CRED_GH_CAPABILITY,
+        ] {
+            assert!(caps.iter().any(|c| c == token), "{token} missing: {caps:?}");
+        }
+        assert!(caps.iter().any(|c| c == &format!("os:{}", current_os_label())));
+        // And the heartbeat really routes its join failure through it.
+        let src = include_str!("fleet.rs");
+        let prod = prod_part(src);
+        let (_, from_fn) = prod
+            .split_once("pub async fn heartbeat_to_coord(")
+            .expect("heartbeat_to_coord is defined in fleet.rs");
+        let (body, _) = from_fn.split_once("\n}\n").expect("heartbeat_to_coord ends");
+        assert!(
+            squeezed(body).contains(
+                ".unwrap_or_else(|_|{heartbeat_join_failure_capabilities(ci.enabled,&ci.repo_allowlist)})"
+            ),
+            "heartbeat_to_coord's join-failure arm must call heartbeat_join_failure_capabilities"
+        );
+    }
+
     #[test]
     fn heartbeat_payload_capabilities_carry_seeded_cred_tokens() {
         let _serial = CRED_FAMILY_CACHE_TEST_LOCK
