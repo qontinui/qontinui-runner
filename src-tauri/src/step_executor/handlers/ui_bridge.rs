@@ -1700,15 +1700,15 @@ impl UiBridgeHandler {
         // element id taken from one target's snapshot has to act on that
         // target. The step posts the target minus its step-addressing key
         // (`criteria`), whole, instead of rebuilding `{action, params}`.
-        let action_endpoint = match crate::mcp::ui_bridge::action_wire::element_action_endpoint(
+        let (action_endpoint, body) = match crate::mcp::ui_bridge::action_wire::element_action_request(
             base_url,
             step.ui_bridge_snapshot_target.as_deref(),
             element_id,
+            &target,
         ) {
-            Ok(url) => url,
+            Ok(request) => request,
             Err(e) => return StepHandlerResult::failure(e),
         };
-        let body = crate::mcp::ui_bridge::action_wire::step_element_action_body(&target);
 
         match client.post(&action_endpoint).json(&body).send().await {
             Ok(resp) => {
@@ -2831,5 +2831,38 @@ mod element_action_step_wire_tests {
             element_action_endpoint("http://127.0.0.1:9876/ui-bridge", Some("sdk"), "e1").unwrap(),
             "http://127.0.0.1:9876/ui-bridge/sdk/element/e1/action"
         );
+    }
+}
+
+#[cfg(test)]
+mod element_action_step_source_guard {
+    //! `execute_element_action` must post exactly what `action_wire` built.
+    //! The step needs a live HTTP target, so this guards the handler's source:
+    //! it fails if the step goes back to a rebuilt body or the plural route.
+    fn handler_source() -> &'static str {
+        const SRC: &str = include_str!("ui_bridge.rs");
+        let start = SRC
+            .find("async fn execute_element_action(")
+            .expect("execute_element_action present");
+        let end = SRC[start..]
+            .find("/// Execute a \"component_action\"")
+            .expect("component_action follows")
+            + start;
+        &SRC[start..end]
+    }
+
+    #[test]
+    fn the_step_posts_the_request_action_wire_built() {
+        let src = handler_source();
+        assert!(src.contains("action_wire::element_action_request("), "{src}");
+        assert!(src.contains(".post(&action_endpoint).json(&body)"), "{src}");
+    }
+
+    #[test]
+    fn the_step_does_not_rebuild_the_body_or_post_to_the_plural_route() {
+        let src = handler_source();
+        for forbidden in ["/control/elements/", "\"params\": params"] {
+            assert!(!src.contains(forbidden), "step reintroduced `{forbidden}`");
+        }
     }
 }
