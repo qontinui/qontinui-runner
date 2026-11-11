@@ -910,4 +910,37 @@ mod tests {
         assert_send_future(read_log_source(String::new()));
         assert_send_future(read_project_logs(String::new()));
     }
+
+    /// The body of the production fn whose signature starts `header`. Only
+    /// the half above the test module is searched, so this test's own text
+    /// (which names the needle) can never match.
+    fn prod_fn_body(header: &str) -> &'static str {
+        let src = include_str!("project_logs.rs");
+        let (prod, _) = src.split_once("#[cfg(test)]").expect("a test module");
+        let (_, rest) = prod
+            .split_once(header)
+            .unwrap_or_else(|| panic!("`{header}` not found"));
+        let (body, _) = rest.split_once("\n}\n").expect("fn closed at column 0");
+        body
+    }
+
+    /// Both read commands hand their body to `read_off_main_thread`, and that
+    /// helper hops to the blocking pool, so the read never runs on a tokio
+    /// worker or the main thread. `Send` alone (above) cannot see either hop
+    /// removed.
+    #[test]
+    fn the_log_read_commands_read_on_the_blocking_pool() {
+        for name in ["read_log_source", "read_project_logs"] {
+            let body = prod_fn_body(&format!("pub async fn {name}("));
+            assert!(
+                body.contains("read_off_main_thread("),
+                "{name} must read through read_off_main_thread"
+            );
+        }
+        let helper = prod_fn_body("async fn read_off_main_thread<F>(");
+        assert!(
+            helper.contains("spawn_blocking_tracked("),
+            "read_off_main_thread must hop to the blocking pool"
+        );
+    }
 }
