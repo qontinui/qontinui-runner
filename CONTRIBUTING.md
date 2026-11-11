@@ -144,7 +144,10 @@ checkout also arms every linked worktree, since worktrees share `.git/hooks`.
 regardless: `cargo fmt -- --check` and `cargo clippy` both run inside the
 required `test (ubuntu-22.04)` context, with a parallel `clippy-windows` job
 (`Clippy (windows)`) that runs `--all-targets` and so also lints `#[cfg(test)]`
-code the local gate does not compile.
+code the local gate does not compile. The toolchain-free test suites behind
+the drift guard (`gen-events-drift-attribution-test`,
+`gen-events-file-attribution-test`, `gen-events-drift-root-test` and
+`push-range-test`) also run in CI, in the `gen-events hook suites` workflow.
 The gate is a faster feedback loop, never the thing standing between a
 regression and `main`.
 
