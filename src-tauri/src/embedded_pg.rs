@@ -87,6 +87,18 @@ use std::sync::atomic::{AtomicU16, AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
+/// The PostgreSQL every Postgres-backed test in the runner's test binaries
+/// runs against: one bundled cluster per test process, booted from a cached
+/// ready data directory, with a fresh database per test. See the module doc.
+///
+/// A child of this module so it reuses [`bootstrap`], the schema transform and
+/// the port picker without widening them, and compiled outside `cfg(test)` so
+/// one harness serves the lib's tests, the bin's tests and `tests/*.rs` alike
+/// (a `cfg(test)` module compiles into one crate's test binary only). Hidden:
+/// it is test infrastructure, not part of the runner's product surface.
+#[doc(hidden)]
+pub mod test_harness;
+
 /// Holds the running managed instance for the process lifetime so it is not
 /// dropped early (which would stop the server); stopped explicitly on exit via
 /// [`stop_on_exit`].
@@ -960,11 +972,61 @@ pub async fn bootstrap(data_root: PathBuf, db_name: &str) -> Result<ManagedPg, S
     })
 }
 
+/// The canonical schema dump (`schema.pg.sql.generated`, a `pg_dump`-style dump
+/// of the full canonical schema), embedded at compile time.
+///
+/// One copy serves the bundled cluster's schema apply ([`canonical_schema_sql`])
+/// and the test harness, which keys its template cache on the rendered SQL and
+/// pins its table count against this file's `CREATE TABLE` lines — so the count
+/// is read from the file rather than written down here, where it went stale.
+const CANONICAL_SCHEMA: &str = include_str!("../schema.pg.sql.generated");
+
+/// How [`canonical_schema_sql`] renders the dump's `public.vector(N)` columns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VectorColumns {
+    /// A server that ships no pgvector — the bundled one. The two transforms
+    /// documented on [`apply_canonical_schema`] apply.
+    Bytea,
+    /// A server that ships pgvector (an external test server opted into
+    /// through the harness's `QONTINUI_TEST_PG_URL`): the dump's own column
+    /// types and indexes, with the extension created first. This is the one
+    /// shape the transform cannot emulate, and the reason that opt-in exists.
+    Native,
+}
+
+/// The canonical schema as ONE SQL batch for a fresh database.
+///
+/// Both renderings make every `CREATE SCHEMA` idempotent — the dump emits
+/// `CREATE SCHEMA public;`, which errors on a fresh database where `public`
+/// already exists — and create pgcrypto first. pgcrypto is a STANDARD contrib
+/// extension shipped with Postgres (unlike pgvector); the schema uses
+/// `public.gen_random_bytes()` / `digest()` in column DEFAULTs, which must exist
+/// before the CREATE TABLEs, and the dump does not emit the extension (the
+/// dev/CI Postgres already has it). [`VectorColumns`] decides the rest.
+fn canonical_schema_sql(vectors: VectorColumns) -> String {
+    let idempotent = CANONICAL_SCHEMA.replace("CREATE SCHEMA ", "CREATE SCHEMA IF NOT EXISTS ");
+    match vectors {
+        VectorColumns::Bytea => {
+            let body: String = idempotent
+                .replace("public.vector(384)", "bytea")
+                .replace("public.vector(512)", "bytea")
+                .lines()
+                .filter(|l| !l.contains("ivfflat") && !l.contains("public.vector_cosine_ops"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public;\n{body}")
+        }
+        VectorColumns::Native => format!(
+            "CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public;\n\
+             CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public;\n{idempotent}"
+        ),
+    }
+}
+
 /// Apply the bundled canonical schema to a freshly-created embedded database.
 ///
-/// The schema (`schema.pg.sql.generated`, a `pg_dump`-style dump of the full
-/// 362-table canonical schema) is embedded at compile time. Two transforms make
-/// it apply to a **pgvector-free** Postgres:
+/// The schema is [`CANONICAL_SCHEMA`]. Two transforms make it apply to a
+/// **pgvector-free** Postgres ([`VectorColumns::Bytea`]):
 ///
 ///   1. `public.vector(N)` column types → `bytea`. The runner stores every
 ///      embedding as `bytea` and computes cosine similarity in Rust
@@ -982,37 +1044,28 @@ pub async fn bootstrap(data_root: PathBuf, db_name: &str) -> Result<ManagedPg, S
 /// Applied whenever [`schema_applied`] reports the schema missing (fresh
 /// database, or a prior apply that crashed/rolled back).
 async fn apply_canonical_schema(url: &str) -> Result<(), String> {
-    const SCHEMA: &str = include_str!("../schema.pg.sql.generated");
-    let body: String = SCHEMA
-        .replace("public.vector(384)", "bytea")
-        .replace("public.vector(512)", "bytea")
-        // The dump emits `CREATE SCHEMA public;`, which errors on a fresh
-        // database (the `public` schema already exists). Make every schema
-        // creation idempotent so the one-shot apply cannot trip on it.
-        .replace("CREATE SCHEMA ", "CREATE SCHEMA IF NOT EXISTS ")
-        .lines()
-        .filter(|l| !l.contains("ivfflat") && !l.contains("public.vector_cosine_ops"))
-        .collect::<Vec<_>>()
-        .join("\n");
+    apply_schema_sql(
+        url,
+        &canonical_schema_sql(VectorColumns::Bytea),
+        "embedded PG",
+    )
+    .await
+}
 
-    // pgcrypto is a STANDARD contrib extension shipped with Postgres (unlike
-    // pgvector). The schema uses `public.gen_random_bytes()` / `digest()` in
-    // column DEFAULTs, which must exist before the CREATE TABLEs. The dump
-    // doesn't emit the extension (the dev/CI Postgres already has it), so
-    // provision it into `public` for the fresh embedded cluster.
-    let transformed =
-        format!("CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public;\n{body}");
-
+/// Run `sql` against the database at `url` as one batch (one implicit
+/// transaction, so a failed apply leaves nothing behind), reporting the
+/// server's own diagnosis on failure. `target` names the server in messages.
+async fn apply_schema_sql(url: &str, sql: &str, target: &str) -> Result<(), String> {
     let (client, connection) = tokio_postgres::connect(url, tokio_postgres::NoTls)
         .await
-        .map_err(|e| format!("connect to embedded PG for schema apply failed: {e}"))?;
+        .map_err(|e| format!("connect to {target} for schema apply failed: {e}"))?;
     let conn_task = tokio::spawn(async move {
         if let Err(e) = connection.await {
-            tracing::warn!("embedded PG schema-apply connection closed with error: {e}");
+            tracing::warn!("schema-apply connection closed with error: {e}");
         }
     });
 
-    let result = client.batch_execute(&transformed).await.map_err(|e| {
+    let result = client.batch_execute(sql).await.map_err(|e| {
         let detail = e
             .as_db_error()
             .map(|db| {
@@ -1029,7 +1082,7 @@ async fn apply_canonical_schema(url: &str) -> Result<(), String> {
                 )
             })
             .unwrap_or_else(|| e.to_string());
-        format!("applying canonical schema to embedded PG failed: {detail}")
+        format!("applying canonical schema to {target} failed: {detail}")
     });
 
     drop(client); // closes the connection so the driver task can finish
@@ -1222,6 +1275,76 @@ mod tests {
         assert_eq!(
             pinned_postgres_requirement("[env]\nSCCACHE_SERVER_PORT = \"4230\"\n"),
             None
+        );
+    }
+
+    // ---- The two schema renderings ----
+
+    fn create_table_lines(sql: &str) -> usize {
+        sql.lines()
+            .filter(|line| line.starts_with("CREATE TABLE "))
+            .count()
+    }
+
+    /// The bundled server's rendering holds no pgvector construct, creates
+    /// pgcrypto before anything uses it, makes every `CREATE SCHEMA`
+    /// idempotent — and drops no table on the way.
+    #[test]
+    fn the_bytea_rendering_holds_no_pgvector_and_drops_no_table() {
+        let sql = canonical_schema_sql(VectorColumns::Bytea);
+        assert!(
+            sql.starts_with("CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public;\n"),
+            "pgcrypto must come first: column DEFAULTs call its functions"
+        );
+        for pgvector_only in [
+            "public.vector(",
+            "public.vector_cosine_ops",
+            "USING ivfflat",
+            "USING hnsw",
+            "CREATE EXTENSION IF NOT EXISTS vector",
+        ] {
+            assert!(
+                !sql.contains(pgvector_only),
+                "the bytea rendering still holds {pgvector_only:?}"
+            );
+        }
+        assert!(
+            !sql.contains("CREATE SCHEMA public;"),
+            "every CREATE SCHEMA must be idempotent on a fresh database"
+        );
+        assert_eq!(
+            create_table_lines(&sql),
+            create_table_lines(CANONICAL_SCHEMA),
+            "the transform dropped a CREATE TABLE"
+        );
+    }
+
+    /// The pgvector rendering keeps the dump's own vector columns and indexes
+    /// and creates the extension before them.
+    #[test]
+    fn the_native_rendering_keeps_the_dumps_vector_columns() {
+        let sql = canonical_schema_sql(VectorColumns::Native);
+        let extension = sql
+            .find("CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public;")
+            .expect("the native rendering creates pgvector");
+        let first_vector = sql
+            .find("public.vector(")
+            .expect("the dump declares vector columns");
+        assert!(
+            extension < first_vector,
+            "pgvector must exist before a column uses it"
+        );
+        assert_eq!(
+            sql.matches("public.vector(").count(),
+            CANONICAL_SCHEMA.matches("public.vector(").count()
+        );
+        assert_eq!(
+            sql.matches("public.vector_cosine_ops").count(),
+            CANONICAL_SCHEMA.matches("public.vector_cosine_ops").count()
+        );
+        assert_eq!(
+            create_table_lines(&sql),
+            create_table_lines(CANONICAL_SCHEMA)
         );
     }
 
