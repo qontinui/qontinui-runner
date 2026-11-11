@@ -127,7 +127,7 @@ export const COMMAND_BAR_INPUT_ID = "terminal.command-bar-input";
 /**
  * Actions this input advertises.
  *
- * The registry's `inferActions('input')` yields
+ * When this list was written, the registry's `inferActions('input')` yielded
  * `focus, blur, hover, scroll, scrollIntoView, click, hoverClick, type, clear`
  * — no `sendKeys`. Both GLOBAL whitelists already carry `sendKeys` (SDK
  * `action-executor.ts`, runner `mcp/ui_bridge/elements.rs`
@@ -136,8 +136,15 @@ export const COMMAND_BAR_INPUT_ID = "terminal.command-bar-input";
  * came from the PER-ELEMENT advertised list at the pre-IPC gate
  * (`is_action_advertised`, permissive only when an element advertises nothing
  * at all). Driving the bar (type `/resume`, press Enter) is exactly a
- * `sendKeys` job, so the inferred set is simply wrong here; this restates it
- * with `sendKeys` added.
+ * `sendKeys` job, so this list restated the inferred set with `sendKeys` added.
+ *
+ * Passing `actions` REPLACES the inferred list, so this list must track it.
+ * `@qontinui/ui-bridge` 0.38.0's `inferActions('input')` is
+ * `focus, blur, hover, unhover, scroll, scrollIntoView, click, hoverClick,
+ * type, sendKeys, clear, setValue` (it gained `sendKeys`/`setValue` in
+ * ui-bridge `af1dc61e` and `unhover` with forced hover in `dd757bbb`). This
+ * list is that set verbatim, and is kept rather than deleted so the command
+ * bar keeps `sendKeys` even if a later SDK narrows its inference.
  *
  * Deliberately a plain ADVERTISEMENT and not a `customActions` entry: the
  * SDK's built-in `performSendKeys` already does the right thing for a text
@@ -152,13 +159,15 @@ export const COMMAND_BAR_INPUT_ACTIONS: StandardAction[] = [
   "focus",
   "blur",
   "hover",
+  "unhover",
   "scroll",
   "scrollIntoView",
   "click",
   "hoverClick",
   "type",
-  "clear",
   "sendKeys",
+  "clear",
+  "setValue",
 ];
 
 // Tier-3 (claude subprocess) debounce + gating. The subprocess takes
