@@ -65,6 +65,8 @@ pub(crate) fn bash() -> &'static str {
 pub(crate) fn identity_shim_cmd(shim_dir: &Path, args: &[&str], path: &str, wait: &str) -> Command {
     let shim = shim_dir.join("claude");
     write_exe(&shim, &rendered_identity_shim(shim_dir));
+    // console-ok: test-only harness — this module is `#[cfg(all(test, unix))]`
+    // (declared in intercept/mod.rs), so it is never built on Windows or in a release.
     let mut cmd = Command::new(bash());
     cmd.arg(&shim)
         .args(args)
