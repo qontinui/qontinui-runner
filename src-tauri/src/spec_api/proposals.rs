@@ -1639,7 +1639,7 @@ mod tests {
     #[test]
     fn a_spawn_that_was_never_admitted_is_skipped_not_failed() {
         use crate::workflow_generation::spec_authoring::AuthoringError;
-        for code in ["device_drained", "drain_unreadable"] {
+        for code in crate::coord_drain_state::DeferClass::ALL.map(|class| class.code()) {
             assert_eq!(
                 execute_skip(&AuthoringError::SpawnDeferred {
                     code,

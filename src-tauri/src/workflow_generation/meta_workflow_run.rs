@@ -15,8 +15,9 @@
 //!    [`authorize_spawn`](crate::agent_authorization::authorize_spawn) for the
 //!    `standing_continuation` class under the caller's [`SpawnOrigin`], answers
 //!    both questions: it runs coord's device-drain gate before it reads the
-//!    agent registry. A drained device (or an unknown drain state) DEFERS an
-//!    autonomous execute, and a registry refusal makes it NOT AUTHORIZED.
+//!    agent registry. A drained device (or an unknown drain state, or a
+//!    dispatch role that closes the agent lane) DEFERS an autonomous execute,
+//!    and a registry refusal makes it NOT AUTHORIZED.
 //!    Neither persists anything, and neither is an authoring failure: the
 //!    caller puts the proposal back in the queue. A meta-workflow outlives the
 //!    request that started it, which is what `standing_continuation` covers.
@@ -103,9 +104,10 @@ pub struct RunClaim {
 /// Why a meta-workflow run returned no output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MetaWorkflowError {
-    /// Coord has drained this device, or its drain state is unknown, and the
-    /// execute is autonomous. Not a failure: the work waits for the drain to
-    /// lift. `code` is coord's 409 vocabulary ([`DeferClass::code`]).
+    /// Coord has drained this device, its drain state is unknown, or its
+    /// dispatch role closes the agent lane, and the execute is autonomous. Not
+    /// a failure: the work waits for the drain or the role to lift. `code` is
+    /// coord's 409 vocabulary ([`DeferClass::code`]).
     Deferred { code: &'static str, reason: String },
     /// The agent registry refused the execute's `standing_continuation` spawn.
     NotAuthorized(String),
@@ -817,22 +819,26 @@ mod tests {
         );
     }
 
-    /// The production entry, end to end, on its refusal arm. Nothing in a test
-    /// process reads coord's drain, so its state is the boot `Unknown`, which
-    /// defers every autonomous spawn. The execute must answer `Deferred` before
-    /// it touches the database: this `PgDb` fails every query, so an execute
-    /// that persisted (or started) anything before asking would answer
-    /// `Failed` instead.
+    /// The production entry, end to end, on its refusal arm. The test puts the
+    /// process-global drain cache back to its boot state, `Unknown` with no
+    /// dispatch role, which defers every autonomous spawn. It holds
+    /// `ROLE_TEST_LOCK` while it does, because the tests that cache a drain
+    /// or a role into that same global hold it too. The execute must answer
+    /// `Deferred` before it touches the database: this `PgDb` fails every
+    /// query, so an execute that persisted (or started) anything before asking
+    /// would answer `Failed` instead.
     #[tokio::test]
     async fn an_execute_the_drain_defers_persists_and_starts_nothing() {
+        let _role_lock = crate::coord_drain_state::ROLE_TEST_LOCK.lock().await;
+        crate::coord_drain_state::reset_global_for_test();
         assert!(
             matches!(
                 crate::coord_drain_state::current(),
                 crate::coord_drain_state::CoordDrainState::Unknown { .. }
             ),
-            "precondition: no test folds a drain observation into this process, so \
-             its drain state is the boot Unknown"
+            "precondition: the reset leaves the boot Unknown"
         );
+        assert_eq!(crate::coord_drain_state::current_dispatch_role(), None);
         let request = crate::workflow_generation::GenerateWorkflowRequest {
             description: "Spec-authoring for a test page".to_string(),
             category: Some("spec-authoring".to_string()),

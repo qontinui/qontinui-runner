@@ -143,11 +143,12 @@ pub enum AuthoringError {
     /// stopped or overran its deadline.
     #[error("AI dispatch failed: {0}")]
     AiDispatchFailed(String),
-    /// The execute was not admitted: coord has drained this device, or its
-    /// drain state is unknown, and the execute is autonomous. NOT an authoring
-    /// failure: nothing was spawned, and the proposal waits for the drain to
-    /// lift. `code` is coord's 409 vocabulary (`device_drained` /
-    /// `drain_unreadable`).
+    /// The execute was not admitted: coord has drained this device, its drain
+    /// state is unknown, or its dispatch role closes the agent lane, and the
+    /// execute is autonomous. NOT an authoring failure: nothing was spawned,
+    /// and the proposal waits for the drain or the role to lift. `code` is
+    /// coord's 409 vocabulary
+    /// ([`DeferClass::code`](crate::coord_drain_state::DeferClass::code)).
     #[error("spawn deferred by the device drain ({code}): {reason}")]
     SpawnDeferred { code: &'static str, reason: String },
     /// The agent registry refused the execute's `standing_continuation`
