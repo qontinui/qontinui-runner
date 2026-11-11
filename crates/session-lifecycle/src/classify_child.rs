@@ -20,25 +20,34 @@
 //!   same parent, and the same membership. A pid reused between the reads, a
 //!   member that left, or one that arrived makes the child [`ChildClass::Unknown`].
 //! - **Unreadable is UNKNOWN.** A stale table, an unknown creation time, an
-//!   unreadable image or command line, or a command-line read that failed
-//!   outright — none of them can admit a child.
+//!   unreadable image or command line (or one not in its platform's [`Argv`]
+//!   form), or a command-line read that failed outright — none of them can admit
+//!   a child.
 //!
 //! [`ChildClass::Work`] is a positive reading: everything needed was read and the
-//! child matches no measured chain (or is a tool shell or nested `claude`, which
-//! are always work). [`ChildClass::Unknown`] is the absence of a reading. Both
-//! keep a session open; they are kept apart so a log can say which.
+//! child matches no measured chain — or the child's own image is a tool shell or
+//! a nested `claude`, which is always work and is settled from that image alone,
+//! so a busy shell's large or changing subtree cannot turn it into UNKNOWN.
+//! [`ChildClass::Unknown`] is the absence of a reading. Both keep a session open;
+//! they are kept apart so a log can say which.
 //!
 //! ## The measured chains
 //!
 //! - **Linux** ([`CHAIN_LINUX_SHIM`]), merytshost 2026-11-08: `claude` → one
-//!   `python3` running `/usr/bin/python3 …/scripts/coord-mcp-shim.py --credential
-//!   <path>`, with no descendants (337 of the box's 343 `claude`s held exactly
-//!   this one child; 341 of their python children ran the shim).
+//!   `python3` whose argv is `/usr/bin/python3`, `…/scripts/coord-mcp-shim.py`,
+//!   `--credential`, `<path>`, with no descendants. The argv is compared element
+//!   by element as `/proc/<pid>/cmdline` separates it ([`Argv::Elements`]), never
+//!   as a rejoined string.
 //! - **Windows** ([`CHAIN_WINDOWS_CMD_SHIM`]), spaceship 2026-11-08: Claude Code
 //!   wraps a stdio MCP server in `cmd.exe /d /s /c "<command>"`, and the
 //!   WindowsApps `python3.exe` alias adds a hop to the real interpreter, so the
 //!   subtree is `cmd.exe` → { `conhost.exe 0x4`, `python3.exe <shim>` →
-//!   `python.exe <shim>` } (93 of the box's 100 sessions held exactly this).
+//!   `python.exe <shim>` }. Each member's command line is its PEB's raw text
+//!   ([`Argv::Line`]), split here by the `CommandLineToArgvW` rules.
+//!
+//! How often each chain occurred on the host it was measured on is recorded,
+//! dated, in that fixture's `census` field — not here, where a count could not
+//! be re-measured.
 //!
 //! No message-pump chain has been measured, so none is admitted; the class keeps
 //! the clause's name so the pump joins it when one is.
@@ -50,10 +59,13 @@ pub const CHAIN_LINUX_SHIM: &str = "linux-coord-mcp-shim";
 /// The Windows chain's id.
 pub const CHAIN_WINDOWS_CMD_SHIM: &str = "windows-cmd-coord-mcp-shim";
 
-/// The path suffix every measured shim chain runs, compared with `/` separators.
-/// The suffix is the measured location, the fleet config repo's `scripts/` —
-/// not any `scripts/coord-mcp-shim.py`, so a copy elsewhere (an agent
-/// worktree's, a scratch dir's) is not the measured chain.
+/// The path suffix every measured shim chain runs, compared with `/` separators
+/// (and case-insensitively, on Windows only). It names the measured location —
+/// a `qontinui-claude-config` checkout's `scripts/` — so a copy of the script
+/// anywhere else (`/tmp/scripts/coord-mcp-shim.py`, a scratch dir's) is not the
+/// measured chain. It does NOT pin which checkout: a coord agent worktree's
+/// `agent-worktrees/<id>/qontinui-claude-config/scripts/coord-mcp-shim.py` ends
+/// with this suffix and is admitted exactly like the primary checkout's.
 const SHIM_SCRIPT_SUFFIX: &str = "/qontinui-claude-config/scripts/coord-mcp-shim.py";
 
 /// A subtree larger than this is not walked: it matches no measured chain (the
@@ -108,9 +120,11 @@ pub struct ProcRow {
     pub ppid: u32,
     /// The image name (`cmd.exe`, `python3`), when the read resolved it.
     pub image: Option<String>,
-    /// An opaque creation-time stamp, compared only for equality: the kernel's
-    /// FILETIME on Windows, epoch seconds from `/proc` on Linux. `None` (or `0`)
-    /// is UNKNOWN and binds nothing.
+    /// An opaque creation-time stamp, compared only for equality between the
+    /// two table reads, which must therefore stamp in the same unit: the
+    /// kernel's FILETIME (100 ns) on Windows, `/proc/<pid>/stat` field 22 (the
+    /// start time in clock ticks since boot) on Linux. `None` (or `0`) is
+    /// UNKNOWN and binds nothing.
     pub start: Option<u64>,
 }
 
@@ -155,6 +169,32 @@ impl ProcTable {
             .get(&pid)
             .map(|kids| kids.iter().copied().filter(|k| *k != pid).collect())
             .unwrap_or_default()
+    }
+}
+
+/// One process's command line, in the form its platform's chains were measured
+/// in. The two are never converted into each other: a form that is not the
+/// platform's own is unreadable to the matcher (UNKNOWN).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Argv {
+    /// Linux: `/proc/<pid>/cmdline` split on NUL, one element per argument and
+    /// every element kept, empty ones too — so `[a, "b c"]` and `[a, b, c]`,
+    /// which join to the same line, stay two different argvs.
+    Elements(Vec<String>),
+    /// Windows: the raw command line from the process's PEB, exactly as the
+    /// process was started with it.
+    Line(String),
+}
+
+impl Argv {
+    /// Whether this is a readable command line for `platform`'s matchers: the
+    /// platform's own form, with something in it.
+    fn readable_for(&self, platform: Platform) -> bool {
+        match (platform, self) {
+            (Platform::Linux, Argv::Elements(args)) => args.iter().any(|a| !a.is_empty()),
+            (Platform::Windows, Argv::Line(line)) => !line.trim().is_empty(),
+            _ => false,
+        }
     }
 }
 
@@ -338,16 +378,12 @@ fn confirm_binding(
     Ok(())
 }
 
-/// PURE: split a command line into arguments.
-///
-/// Windows follows the `CommandLineToArgvW` rules (quotes group, `2n`
-/// backslashes before a quote are `n` backslashes, `2n+1` are `n` and a literal
-/// quote, a `""` inside quotes is a literal quote). Linux reads a `/proc` command
-/// line the runner joined with single spaces, so it splits on whitespace.
-fn split_args(platform: Platform, line: &str) -> Vec<String> {
-    if platform != Platform::Windows {
-        return line.split_whitespace().map(str::to_string).collect();
-    }
+/// PURE: split a Windows command line into arguments by the
+/// `CommandLineToArgvW` rules: quotes group, `2n` backslashes before a quote are
+/// `n` backslashes, `2n+1` are `n` and a literal quote, and a `""` inside quotes
+/// is a literal quote. Linux never comes here: its argv arrives already split
+/// ([`Argv::Elements`]).
+fn split_windows_args(line: &str) -> Vec<String> {
     let chars: Vec<char> = line.chars().collect();
     let mut out = Vec::new();
     let mut cur = String::new();
@@ -419,26 +455,30 @@ fn argv0_image(arg: &str) -> String {
 
 /// PURE: do `args` (everything after the interpreter) run the shim exactly as
 /// measured — the shim script first, then nothing or `--credential <path>`?
-/// Returns the script path.
-fn shim_args(platform: Platform, args: &[String]) -> Option<String> {
-    let script = args.first()?;
-    let normalized = script.replace('\\', "/");
+/// `Ok` is the script path; `Err` names the rule that refused.
+fn shim_args(platform: Platform, args: &[String]) -> Result<String, &'static str> {
+    let Some((script, rest)) = args.split_first() else {
+        return Err("no script argument");
+    };
+    // Backslashes are separators on Windows only: on Linux a `\` is part of a
+    // file name, and normalizing it would match a path that is not the suffix.
     let ends = if platform == Platform::Windows {
-        normalized
+        script
+            .replace('\\', "/")
             .to_ascii_lowercase()
             .ends_with(SHIM_SCRIPT_SUFFIX)
     } else {
-        normalized.ends_with(SHIM_SCRIPT_SUFFIX)
+        script.ends_with(SHIM_SCRIPT_SUFFIX)
     };
     if !ends {
-        return None;
+        return Err("the script is not qontinui-claude-config/scripts/coord-mcp-shim.py");
     }
-    match &args[1..] {
-        [] => Some(script.clone()),
+    match rest {
+        [] => Ok(script.clone()),
         [flag, path] if flag == "--credential" && !path.is_empty() && !path.starts_with('-') => {
-            Some(script.clone())
+            Ok(script.clone())
         }
-        _ => None,
+        _ => Err("the arguments after the script are neither none nor `--credential <path>`"),
     }
 }
 
@@ -450,141 +490,159 @@ fn same_args(platform: Platform, a: &[String], b: &[String]) -> bool {
 /// What a chain matcher reads for one subtree member.
 struct Member<'a> {
     image: String,
-    argv: &'a str,
+    argv: &'a Argv,
 }
 
 /// The Linux chain: `python3 <shim> [--credential <path>]`, no descendants.
-fn matches_linux_shim(child: u32, members: &[u32], view: &HashMap<u32, Member<'_>>) -> bool {
+/// `Err` names the rule that refused.
+fn matches_linux_shim(
+    child: u32,
+    members: &[u32],
+    view: &HashMap<u32, Member<'_>>,
+) -> Result<(), &'static str> {
     if members != [child] {
-        return false;
+        return Err("the subtree is not the shim alone");
     }
     let Some(m) = view.get(&child) else {
-        return false;
+        return Err("the child's command line is unread");
     };
     if !is_python(&m.image) {
-        return false;
+        return Err("the image is not a python interpreter");
     }
-    let args = split_args(Platform::Linux, m.argv);
-    let Some(interp) = args.first() else {
-        return false;
+    let Argv::Elements(args) = m.argv else {
+        return Err("the command line is not an argv");
     };
-    is_python(&argv0_image(interp)) && shim_args(Platform::Linux, &args[1..]).is_some()
+    let Some((interp, rest)) = args.split_first() else {
+        return Err("the argv is empty");
+    };
+    if !is_python(&argv0_image(interp)) {
+        return Err("argv[0] is not a python interpreter");
+    }
+    shim_args(Platform::Linux, rest).map(|_| ())
 }
 
 /// The Windows chain: `cmd.exe /d /s /c "<python3 shim>"` → { `conhost.exe 0x4`,
-/// `python3.exe <shim>` → `python.exe <shim>` }, nothing else.
+/// `python3.exe <shim>` → `python.exe <shim>` }, nothing else. `Err` names the
+/// rule that refused.
 fn matches_windows_cmd_shim(
     child: u32,
     table: &ProcTable,
     members: &[u32],
     view: &HashMap<u32, Member<'_>>,
-) -> bool {
+) -> Result<(), &'static str> {
     const W: Platform = Platform::Windows;
+    // cmd, conhost, python3 and python: the whole subtree is four members.
     if members.len() != 4 {
-        return false;
+        return Err("the subtree does not have four members");
     }
     let Some(cmd) = view.get(&child) else {
-        return false;
+        return Err("the child's command line is unread");
     };
     if cmd.image != "cmd" {
-        return false;
+        return Err("the child is not cmd");
     }
-    let Some(inner) = cmd_inner_command(cmd.argv) else {
-        return false;
+    let Argv::Line(cmd_line) = cmd.argv else {
+        return Err("cmd's command line is not a raw line");
     };
-    let inner_args = split_args(W, &inner);
-    if inner_args.first().map(|a| argv0_image(a)).as_deref() != Some("python3") {
-        return false;
+    let Some(inner) = cmd_inner_command(cmd_line) else {
+        return Err("cmd's command line is not `cmd.exe /d /s /c \"<command>\"`");
+    };
+    let inner_args = split_windows_args(&inner);
+    let Some((inner_interp, inner_rest)) = inner_args.split_first() else {
+        return Err("cmd's command is empty");
+    };
+    if argv0_image(inner_interp) != "python3" {
+        return Err("cmd's command does not start python3");
     }
-    let Some(script) = shim_args(W, &inner_args[1..]) else {
-        return false;
+    let script = shim_args(W, inner_rest)?;
+
+    // cmd's two children are exactly one conhost and one python3 hop, in either
+    // pid order: two of either is not the chain.
+    let kids = table.children_of(child);
+    let [a, b] = kids.as_slice() else {
+        return Err("cmd does not have exactly two children");
+    };
+    let (Some(ma), Some(mb)) = (view.get(a), view.get(b)) else {
+        return Err("a child of cmd is unread");
+    };
+    let ((conhost_pid, conhost), (py3_pid, py3)) = match (ma.image.as_str(), mb.image.as_str()) {
+        ("conhost", "python3") => ((*a, ma), (*b, mb)),
+        ("python3", "conhost") => ((*b, mb), (*a, ma)),
+        _ => return Err("cmd's children are not one conhost and one python3"),
     };
 
-    let kids = table.children_of(child);
-    if kids.len() != 2 {
-        return false;
-    }
-    let mut conhost_ok = false;
-    let mut python3_pid = None;
-    for kid in kids {
-        let Some(m) = view.get(&kid) else {
-            return false;
-        };
-        match m.image.as_str() {
-            "conhost" if !conhost_ok => {
-                let args = split_args(W, m.argv);
-                conhost_ok = table.children_of(kid).is_empty()
-                    && args.len() == 2
-                    && argv0_image(&args[0]) == "conhost"
-                    && args[1] == "0x4";
-                if !conhost_ok {
-                    return false;
-                }
-            }
-            "python3" if python3_pid.is_none() => {
-                let args = split_args(W, m.argv);
-                if !same_args(W, &args, &inner_args) {
-                    return false;
-                }
-                python3_pid = Some(kid);
-            }
-            _ => return false,
-        }
-    }
-    let Some(py3) = python3_pid else {
-        return false;
+    // conhost: childless, started as `<…\conhost.exe> 0x4`.
+    let Argv::Line(conhost_line) = conhost.argv else {
+        return Err("conhost's command line is not a raw line");
     };
+    let conhost_args = split_windows_args(conhost_line);
+    let conhost_ok = table.children_of(conhost_pid).is_empty()
+        && matches!(conhost_args.as_slice(),
+            [exe, flag] if argv0_image(exe) == "conhost" && flag == "0x4");
     if !conhost_ok {
-        return false;
+        return Err("conhost is not a childless `conhost.exe 0x4`");
     }
-    let grandkids = table.children_of(py3);
+
+    // python3: the WindowsApps alias hop, started with exactly cmd's command.
+    let Argv::Line(py3_line) = py3.argv else {
+        return Err("python3's command line is not a raw line");
+    };
+    if !same_args(W, &split_windows_args(py3_line), &inner_args) {
+        return Err("python3's command line differs from cmd's command");
+    }
+
+    // python: the real interpreter, the hop's only child and childless, running
+    // the same shim with the same arguments.
+    let grandkids = table.children_of(py3_pid);
     let [real] = grandkids.as_slice() else {
-        return false;
+        return Err("python3 does not have exactly one child");
     };
     let Some(m) = view.get(real) else {
-        return false;
+        return Err("the real interpreter's command line is unread");
     };
     if m.image != "python" || !table.children_of(*real).is_empty() {
-        return false;
+        return Err("the real interpreter is not a childless python");
     }
-    let args = split_args(W, m.argv);
-    args.first().map(|a| argv0_image(a)).as_deref() == Some("python")
-        && shim_args(W, &args[1..]).is_some_and(|s| same_path(W, &s, &script))
-        && same_args(W, &args[1..], &inner_args[1..])
+    let Argv::Line(real_line) = m.argv else {
+        return Err("the real interpreter's command line is not a raw line");
+    };
+    let real_args = split_windows_args(real_line);
+    let Some((real_interp, real_rest)) = real_args.split_first() else {
+        return Err("the real interpreter's command line is empty");
+    };
+    if argv0_image(real_interp) != "python" {
+        return Err("the real interpreter's argv[0] is not python");
+    }
+    let same_script = shim_args(W, real_rest).is_ok_and(|s| same_path(W, &s, &script));
+    if !same_script || !same_args(W, real_rest, inner_rest) {
+        return Err("the real interpreter does not run the same shim with the same arguments");
+    }
+    Ok(())
 }
 
 /// PURE: the command `cmd.exe /d /s /c "<command>"` runs, with `/s`'s outer
 /// quotes stripped and cmd's `^` escapes removed. `None` for any other shape.
+/// Every cut is made by `split_once` / `split_at_checked`, so a multibyte
+/// character anywhere in the line can refuse a match but never panic.
 fn cmd_inner_command(line: &str) -> Option<String> {
     let trimmed = line.trim_start();
     // argv[0]: quoted or bare.
-    let rest = if let Some(after) = trimmed.strip_prefix('"') {
-        let end = after.find('"')?;
-        if argv0_image(&after[..end]) != "cmd" {
-            return None;
-        }
-        &after[end + 1..]
-    } else {
-        let end = trimmed.find(char::is_whitespace)?;
-        if argv0_image(&trimmed[..end]) != "cmd" {
-            return None;
-        }
-        &trimmed[end..]
+    let (argv0, rest) = match trimmed.strip_prefix('"') {
+        Some(after) => after.split_once('"')?,
+        None => trimmed.split_once(char::is_whitespace)?,
     };
+    if argv0_image(argv0) != "cmd" {
+        return None;
+    }
     let mut rest = rest.trim_start();
     for switch in ["/d", "/s", "/c"] {
-        let head = rest.get(..switch.len())?;
-        if !head.eq_ignore_ascii_case(switch) {
-            return None;
-        }
-        let after = &rest[switch.len()..];
-        if !after.starts_with(char::is_whitespace) {
+        let (head, after) = rest.split_at_checked(switch.len())?;
+        if !head.eq_ignore_ascii_case(switch) || !after.starts_with(char::is_whitespace) {
             return None;
         }
         rest = after.trim_start();
     }
-    let body = rest.trim_end();
-    let body = body.strip_prefix('"')?.strip_suffix('"')?;
+    let body = rest.trim_end().strip_prefix('"')?.strip_suffix('"')?;
     let mut out = String::with_capacity(body.len());
     let mut chars = body.chars();
     while let Some(c) = chars.next() {
@@ -599,19 +657,42 @@ fn cmd_inner_command(line: &str) -> Option<String> {
 
 /// PURE: classify one direct child of a `claude`.
 ///
-/// `first` is the table the child was found in, `argv` the command lines read
-/// after it (`None` when that read failed outright), and `fresh` a table read
-/// after the command lines, against which every subtree member is re-confirmed.
+/// `first` is the table the child was found in, `argv` the argvs read after it
+/// (in each platform's [`Argv`] form; `None` when that read failed outright),
+/// and `fresh` a table read after the argvs, against which every subtree member
+/// is re-confirmed.
 pub fn classify_child(
     platform: Platform,
     child: u32,
     first: &ProcTable,
-    argv: Option<&HashMap<u32, String>>,
+    argv: Option<&HashMap<u32, Argv>>,
     fresh: &ProcTable,
 ) -> ChildVerdict {
     use ChildClass::{ShimOrPump, Unknown, Work};
     if !first.fresh {
         return ChildVerdict::new(child, Unknown, "the process table is not a fresh read");
+    }
+    // The image rule first. It can only ever answer Work — never admit — so it
+    // needs nothing the subtree walk and the binding establish, and a busy tool
+    // shell (a subtree past the walk's bound, or one changing between the
+    // reads) reads as the work it is rather than as UNKNOWN. A cmd child on
+    // Windows is a shell to this rule but also the measured shim wrapper, so it
+    // is left to the chain below.
+    let child_image = first
+        .row(child)
+        .and_then(|r| r.image.as_deref())
+        .map(normalize_image)
+        .filter(|i| !i.is_empty());
+    if let Some(image) = &child_image {
+        if WORK_IMAGES.contains(&image.as_str())
+            && !(platform == Platform::Windows && image == "cmd")
+        {
+            return ChildVerdict::new(
+                child,
+                Work,
+                format!("{image} is a tool shell or a nested agent"),
+            );
+        }
     }
     let Some(members) = subtree(first, child) else {
         return ChildVerdict::new(
@@ -643,18 +724,8 @@ pub fn classify_child(
             }
         }
     }
-    let child_image = images[&child].clone();
-    // A cmd.exe child is a shell to the image rule, but it is also the measured
-    // Windows wrapper, so only a non-Windows cmd is settled here.
-    if WORK_IMAGES.contains(&child_image.as_str())
-        && !(platform == Platform::Windows && child_image == "cmd")
-    {
-        return ChildVerdict::new(
-            child,
-            Work,
-            format!("{child_image} is a tool shell or a nested agent"),
-        );
-    }
+    // Every member's image was read above, the child's among them.
+    let child_image = child_image.unwrap_or_default();
     if platform == Platform::Other {
         return ChildVerdict::new(child, Work, "no chain has been measured on this platform");
     }
@@ -663,7 +734,7 @@ pub fn classify_child(
     };
     let mut view: HashMap<u32, Member<'_>> = HashMap::new();
     for &pid in &members {
-        let Some(line) = argv.get(&pid).filter(|l| !l.trim().is_empty()) else {
+        let Some(line) = argv.get(&pid).filter(|a| a.readable_for(platform)) else {
             return ChildVerdict::new(
                 child,
                 Unknown,
@@ -673,32 +744,35 @@ pub fn classify_child(
         view.insert(
             pid,
             Member {
-                image: images[&pid].clone(),
+                image: images.remove(&pid).unwrap_or_default(),
                 argv: line,
             },
         );
     }
-    let chain = match platform {
-        Platform::Linux => matches_linux_shim(child, &members, &view).then_some(CHAIN_LINUX_SHIM),
-        Platform::Windows => matches_windows_cmd_shim(child, first, &members, &view)
-            .then_some(CHAIN_WINDOWS_CMD_SHIM),
-        Platform::Other => None,
+    let matched = match platform {
+        Platform::Linux => matches_linux_shim(child, &members, &view).map(|()| CHAIN_LINUX_SHIM),
+        Platform::Windows => {
+            matches_windows_cmd_shim(child, first, &members, &view).map(|()| CHAIN_WINDOWS_CMD_SHIM)
+        }
+        Platform::Other => Err("no chain has been measured on this platform"),
     };
-    match chain {
-        Some(chain) => ChildVerdict {
+    match matched {
+        Ok(chain) => ChildVerdict {
             pid: child,
             class: ShimOrPump,
             chain: Some(chain),
             reason: format!("whole subtree matches the measured {chain} chain"),
         },
-        None if child_image == "cmd" => {
-            ChildVerdict::new(child, Work, "cmd matches no measured chain (a tool shell)")
-        }
-        None => ChildVerdict::new(
+        Err(why) if child_image == "cmd" => ChildVerdict::new(
+            child,
+            Work,
+            format!("cmd matches no measured chain (a tool shell): {why}"),
+        ),
+        Err(why) => ChildVerdict::new(
             child,
             Work,
             format!(
-                "{child_image} ({} member subtree) matches no measured chain",
+                "{child_image} ({} member subtree) matches no measured chain: {why}",
                 members.len()
             ),
         ),
@@ -713,7 +787,7 @@ pub fn classify_session(
     platform: Platform,
     claude_pid: u32,
     first: &ProcTable,
-    argv: Option<&HashMap<u32, String>>,
+    argv: Option<&HashMap<u32, Argv>>,
     fresh: &ProcTable,
 ) -> SessionVerdict {
     let unbound = |why: String| SessionVerdict {

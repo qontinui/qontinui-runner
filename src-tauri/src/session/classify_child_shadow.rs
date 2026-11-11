@@ -2,24 +2,38 @@
 //! refuse if served `finished-criteria` condition 2's shim exemption were armed
 //! (plan `2026-11-04-runner-finished-close-closes-nothing-on-any-box`, Phase 2a).
 //!
-//! **This module decides nothing.** It runs beside the arm's census, logs one
-//! `classify_child would admit|refuse (<classes>)` line per FINISHED
-//! terminal-hosted session whose verdict changed, and returns. Eligibility,
-//! custody and `graceful_exit`'s any-child refusal are untouched; arming the
-//! exemption is Phase 2b, after this log has shown correct verdicts on a real
-//! runner.
+//! **This module decides nothing.** It runs beside the arm's census and logs:
+//! one `classify_child would admit|refuse (<classes>)` line per FINISHED
+//! terminal-hosted session whose verdict changed, and ONE `classify_child pass —
+//! N finished, A would admit, R would refuse (refuse classes: …)` tally per
+//! pass, so a verdict that never changes still leaves evidence after the log
+//! rotates. Eligibility, custody and `graceful_exit`'s any-child refusal are
+//! untouched; arming the exemption is Phase 2b, after this log has shown correct
+//! verdicts on a real runner.
 //!
 //! It looks at finished sessions whatever their eligibility verdict, because
 //! the sessions the exemption exists for are exactly the ones eligibility
 //! rejects today (`live_children`, the shim's `cmd.exe` on Windows).
 //!
 //! The reads follow the clause's binding rule: a fresh process table, then the
-//! RAW command lines of every member of every finished session's child subtrees
-//! (Windows: each PEB, never `sysinfo`'s rejoined argv, which loses cmd's `^"`
-//! escapes and so could never match the measured `cmd.exe /d /s /c` chain),
-//! then a SECOND fresh table every member is re-confirmed against (same pid,
-//! creation time, parent and image). The pure judgement is
-//! [`session_lifecycle::classify_session`].
+//! RAW argv of every member of every finished session's child subtrees, then a
+//! SECOND fresh table every member is re-confirmed against (same pid, creation
+//! time, parent and image). Windows reads each PEB's command line, never
+//! `sysinfo`'s rejoined argv, which loses cmd's `^"` escapes and so could never
+//! match the measured `cmd.exe /d /s /c` chain. Linux reads `/proc/<pid>/cmdline`
+//! split on NUL with every element kept, never the space-joined line, in which
+//! distinct argvs collapse into one; and both of its tables stamp a row's
+//! creation with `/proc/<pid>/stat`'s clock ticks, not the seconds derived from
+//! them. The pure judgement is [`session_lifecycle::classify_session`].
+//!
+//! **Every read is in-process only.** The tables come from
+//! [`process_tree::snapshot_process_table_fresh_in_process_only`], which never
+//! takes the process-table provider's single external-probe (PowerShell/WMI)
+//! fallback slot — so a shadow pass can neither leave the census's own failed
+//! reads without it nor open its circuit — and the argv read has no fallback at
+//! all. With the in-process read switched off
+//! (`QONTINUI_PROCESS_TABLE_IN_PROCESS=0`) every read the shadow could make is
+//! UNKNOWN, so no pass runs.
 //!
 //! It runs on its own task, spawned from the census and never awaited by it, so
 //! the arm's candidates, custody probes and closes act on the census exactly as
@@ -27,17 +41,18 @@
 //! starts none. It runs only where the arm runs a census at all (`on` or
 //! `shadow`); a box with the arm `off` produces no shadow evidence.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use session_lifecycle::{classify_session, Platform, ProcRow, ProcTable, SessionVerdict};
+use session_lifecycle::{
+    classify_session, Argv, ChildClass, Platform, ProcRow, ProcTable, SessionVerdict,
+};
 use tracing::{debug, info};
 
-use crate::process_capture::process_tree::{
-    raw_command_lines_for_pids, snapshot_process_table_fresh, ProcessSnapshot,
-};
+use crate::process_capture::process_tree::{self, ProcessSnapshot};
 use crate::session::tracking_health::{LiveClaudeProcess, SessionWorkStatus};
 
 /// The whole shadow pass is bounded, so a stuck read cannot pin the
@@ -64,8 +79,10 @@ pub fn finished_sessions(processes: &[LiveClaudeProcess]) -> Vec<(String, u32)> 
 }
 
 /// PURE: one [`ProcessSnapshot`] as the kernel's [`ProcTable`]. The creation
-/// stamp is the kernel FILETIME on Windows and `/proc`'s epoch seconds
-/// elsewhere; a missing or zero stamp stays `None` (UNKNOWN, binds nothing).
+/// stamp is the kernel FILETIME on Windows and `/proc/<pid>/stat`'s start in
+/// clock ticks elsewhere — the same unit in both of a pass's tables, since both
+/// come from the same walk; a missing or zero stamp stays `None` (UNKNOWN,
+/// binds nothing).
 pub fn proc_table(snapshot: &ProcessSnapshot) -> ProcTable {
     let mut table = ProcTable::new(!snapshot.is_unknown());
     for (&ppid, kids) in &snapshot.parent_map {
@@ -73,12 +90,7 @@ pub fn proc_table(snapshot: &ProcessSnapshot) -> ProcTable {
             let start = if cfg!(windows) {
                 snapshot.creation_filetimes.get(&pid).copied()
             } else {
-                snapshot
-                    .creation_times
-                    .get(&pid)
-                    .copied()
-                    .filter(|s| *s > 0)
-                    .map(|s| s as u64)
+                snapshot.start_ticks.get(&pid).copied()
             };
             table.insert(
                 pid,
@@ -136,6 +148,43 @@ pub fn detail(verdict: &SessionVerdict) -> String {
         .join("; ")
 }
 
+/// PURE: the per-pass tally, e.g. `7 finished, 3 would admit, 4 would refuse
+/// (refuse classes: claude_unbound=1 unknown=1 work=5)`. The refuse classes
+/// count, over the refused sessions only, every child that kept its session
+/// open by class (`work`, `unknown`) and every session whose `claude` could not
+/// be bound (`claude_unbound`); `none` when nothing was refused.
+pub fn pass_tally(judged: &[(String, SessionVerdict)]) -> String {
+    let admit = judged.iter().filter(|(_, v)| v.admit).count();
+    let mut classes: BTreeMap<&'static str, usize> = BTreeMap::new();
+    for (_, verdict) in judged.iter().filter(|(_, v)| !v.admit) {
+        if verdict.refusal.is_some() {
+            *classes.entry("claude_unbound").or_default() += 1;
+            continue;
+        }
+        for child in verdict
+            .children
+            .iter()
+            .filter(|c| c.class != ChildClass::ShimOrPump)
+        {
+            *classes.entry(child.class.word()).or_default() += 1;
+        }
+    }
+    let classes = if classes.is_empty() {
+        "none".to_string()
+    } else {
+        classes
+            .iter()
+            .map(|(class, n)| format!("{class}={n}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    format!(
+        "{} finished, {admit} would admit, {} would refuse (refuse classes: {classes})",
+        judged.len(),
+        judged.len() - admit
+    )
+}
+
 /// The last logged signature per `claude_session_id`, so a verdict is logged on
 /// its change and not on every census.
 fn last_logged() -> &'static Mutex<HashMap<String, String>> {
@@ -168,8 +217,22 @@ fn changed(
 
 /// Start a shadow pass over the finished sessions in `processes` on its own
 /// task and return at once — the caller (the arm's census) never waits on it.
-/// No pass is started while one is still running. Never fails, never acts.
+/// No pass is started while one is still running, nor at all while the
+/// in-process process-table read is switched off. Never fails, never acts.
 pub fn spawn_observe(processes: &[LiveClaudeProcess]) {
+    if process_tree::in_process_table_read_disabled() {
+        // Every read a pass makes is in-process only, so with the switch set
+        // it could only log `unknown` — and must not reach for the shared
+        // external-probe fallback the census's own reads depend on instead.
+        static SAID: AtomicBool = AtomicBool::new(false);
+        if !SAID.swap(true, Ordering::Relaxed) {
+            info!(
+                "finished_close shadow: the in-process process-table read is switched off \
+                 (QONTINUI_PROCESS_TABLE_IN_PROCESS=0) — no classify_child pass runs on this runner"
+            );
+        }
+        return;
+    }
     let sessions = finished_sessions(processes);
     if sessions.is_empty() {
         last_logged()
@@ -196,8 +259,8 @@ pub fn spawn_observe(processes: &[LiveClaudeProcess]) {
     });
 }
 
-/// Judge `sessions` and log the verdicts that changed. Bounded by
-/// [`SHADOW_BUDGET`].
+/// Judge `sessions`, log the verdicts that changed and the pass's tally.
+/// Bounded by [`SHADOW_BUDGET`].
 async fn observe(sessions: Vec<(String, u32)>) {
     let judged = match tokio::time::timeout(SHADOW_BUDGET, judge(&sessions)).await {
         Ok(judged) => judged,
@@ -224,22 +287,44 @@ async fn observe(sessions: Vec<(String, u32)>) {
         );
     }
     *last = next;
-    let admit = judged.iter().filter(|(_, v)| v.admit).count();
-    debug!(
+    drop(last);
+    info!(
         finished = judged.len(),
-        would_admit = admit,
-        would_refuse = judged.len() - admit,
-        "finished_close shadow: classify_child pass"
+        "finished_close shadow: classify_child pass — {}",
+        pass_tally(&judged)
     );
 }
 
-/// The reads and the pure judgement: table, command lines, fresh table.
+/// The reads and the pure judgement: table, argv, fresh table — all
+/// in-process only.
 async fn judge(sessions: &[(String, u32)]) -> Vec<(String, SessionVerdict)> {
-    let first = proc_table(&snapshot_process_table_fresh().await);
+    judge_with(
+        sessions,
+        process_tree::snapshot_process_table_fresh_in_process_only,
+        |pids| async move { process_tree::raw_argvs_for_pids(&pids).await },
+    )
+    .await
+}
+
+/// [`judge`] over injected reads, so a test drives the exact sequence — table,
+/// argvs of the first table's members, table again — against a provider of its
+/// own.
+async fn judge_with<T, TF, A, AF>(
+    sessions: &[(String, u32)],
+    table: T,
+    argvs: A,
+) -> Vec<(String, SessionVerdict)>
+where
+    T: Fn() -> TF,
+    TF: Future<Output = ProcessSnapshot>,
+    A: FnOnce(Vec<u32>) -> AF,
+    AF: Future<Output = Option<HashMap<u32, Argv>>>,
+{
+    let first = proc_table(&table().await);
     let claudes: Vec<u32> = sessions.iter().map(|(_, pid)| *pid).collect();
     let members = subtree_members(&first, &claudes);
-    let argv = raw_command_lines_for_pids(&members).await;
-    let fresh = proc_table(&snapshot_process_table_fresh().await);
+    let argv = argvs(members).await;
+    let fresh = proc_table(&table().await);
     let platform = Platform::current();
     sessions
         .iter()
@@ -255,18 +340,20 @@ async fn judge(sessions: &[(String, u32)]) -> Vec<(String, SessionVerdict)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use session_lifecycle::ChildVerdict;
 
-    fn snap(rows: &[(u32, u32, &str, i64, u64)]) -> ProcessSnapshot {
+    fn snap(rows: &[(u32, u32, &str, i64, u64, u64)]) -> ProcessSnapshot {
         let mut s = ProcessSnapshot {
             stale: false,
             observed_at_ms: 1,
             ..ProcessSnapshot::default()
         };
-        for &(pid, ppid, name, secs, filetime) in rows {
+        for &(pid, ppid, name, secs, filetime, ticks) in rows {
             s.parent_map.entry(ppid).or_default().push(pid);
             s.names.insert(pid, name.to_string());
             s.creation_times.insert(pid, secs);
             s.creation_filetimes.insert(pid, filetime);
+            s.start_ticks.insert(pid, ticks);
         }
         s
     }
@@ -274,21 +361,22 @@ mod tests {
     #[test]
     fn the_table_carries_parent_image_and_the_platforms_creation_stamp() {
         let t = proc_table(&snap(&[
-            (10, 1, "claude", 100, 5_000),
-            (11, 10, "python3", 101, 5_001),
+            (10, 1, "claude", 100, 5_000, 70_000),
+            (11, 10, "python3", 101, 5_001, 70_042),
         ]));
         assert!(t.fresh);
         let row = t.row(11).unwrap();
         assert_eq!(row.ppid, 10);
         assert_eq!(row.image.as_deref(), Some("python3"));
-        let expected = if cfg!(windows) { 5_001 } else { 101 };
+        // The exact stamp, never the seconds derived from it.
+        let expected = if cfg!(windows) { 5_001 } else { 70_042 };
         assert_eq!(row.start, Some(expected));
         assert_eq!(t.children_of(10), vec![11]);
     }
 
     #[test]
     fn a_zero_creation_stamp_is_unknown_and_a_stale_snapshot_is_not_fresh() {
-        let mut s = snap(&[(11, 10, "python3", 0, 0)]);
+        let mut s = snap(&[(11, 10, "python3", 0, 0, 0)]);
         assert_eq!(proc_table(&s).row(11).unwrap().start, None);
         s.stale = true;
         assert!(!proc_table(&s).fresh);
@@ -298,13 +386,13 @@ mod tests {
     #[test]
     fn members_are_every_descendant_of_every_claude_and_never_the_claude() {
         let t = proc_table(&snap(&[
-            (10, 1, "claude", 1, 1),
-            (11, 10, "cmd.exe", 1, 1),
-            (12, 11, "python3.exe", 1, 1),
-            (13, 12, "python.exe", 1, 1),
-            (20, 1, "claude", 1, 1),
-            (21, 20, "bash", 1, 1),
-            (30, 1, "unrelated", 1, 1),
+            (10, 1, "claude", 1, 1, 1),
+            (11, 10, "cmd.exe", 1, 1, 1),
+            (12, 11, "python3.exe", 1, 1, 1),
+            (13, 12, "python.exe", 1, 1, 1),
+            (20, 1, "claude", 1, 1, 1),
+            (21, 20, "bash", 1, 1, 1),
+            (30, 1, "unrelated", 1, 1, 1),
         ]));
         assert_eq!(subtree_members(&t, &[10, 20]), vec![11, 12, 13, 21]);
     }
@@ -326,5 +414,179 @@ mod tests {
         let (log, next) = changed(&next, &judged);
         assert_eq!(log, vec![0]);
         assert!(!next.contains_key("b"));
+    }
+
+    #[test]
+    fn the_pass_tally_counts_sessions_and_what_refused_them() {
+        let child = |pid: u32, class: ChildClass| ChildVerdict {
+            pid,
+            class,
+            chain: None,
+            reason: String::new(),
+        };
+        let session = |children: Vec<ChildVerdict>, refusal: Option<&str>| {
+            let admit =
+                refusal.is_none() && children.iter().all(|c| c.class == ChildClass::ShimOrPump);
+            SessionVerdict {
+                claude_pid: 1,
+                admit,
+                children,
+                refusal: refusal.map(str::to_string),
+            }
+        };
+        let judged = vec![
+            (
+                "admitted".to_string(),
+                session(vec![child(1, ChildClass::ShimOrPump)], None),
+            ),
+            ("childless".to_string(), session(Vec::new(), None)),
+            (
+                "busy".to_string(),
+                session(
+                    vec![
+                        child(2, ChildClass::ShimOrPump),
+                        child(3, ChildClass::Work),
+                        child(4, ChildClass::Work),
+                    ],
+                    None,
+                ),
+            ),
+            (
+                "unreadable".to_string(),
+                session(
+                    vec![child(5, ChildClass::Unknown), child(6, ChildClass::Work)],
+                    None,
+                ),
+            ),
+            (
+                "unbound".to_string(),
+                session(Vec::new(), Some("claude 9 is missing from a table")),
+            ),
+        ];
+        assert_eq!(
+            pass_tally(&judged),
+            "5 finished, 2 would admit, 3 would refuse \
+             (refuse classes: claude_unbound=1 unknown=1 work=3)"
+        );
+        assert_eq!(
+            pass_tally(&judged[..2]),
+            "2 finished, 2 would admit, 0 would refuse (refuse classes: none)"
+        );
+    }
+
+    /// Finding 1 of the Phase 2a review, pinned: the shadow's reads run
+    /// against a provider whose in-process walk FAILS — the case in which a
+    /// fallback-capable read would take the one external-probe slot and, on
+    /// failure, open the circuit the census's own reads share. Every verdict
+    /// is UNKNOWN (the tables are stale), and the provider is left exactly as
+    /// the census needs it: no attempt counted, the slot free, the circuit
+    /// closed. A slot the census already holds is neither waited on nor
+    /// released.
+    #[tokio::test]
+    async fn the_shadow_never_takes_the_fallback_slot_or_opens_the_circuit() {
+        use crate::process_capture::process_table::{read_in_process_only, Config, Provider};
+        let p: &'static Provider = Box::leak(Box::new(Provider::new(Config::default())));
+        let sessions = vec![("s1".to_string(), 10), ("s2".to_string(), 20)];
+        let failing = || read_in_process_only(p, || Err("scripted walk failure".to_string()));
+        for _ in 0..3 {
+            let judged = judge_with(&sessions, failing, |_| async { None }).await;
+            assert_eq!(judged.len(), 2);
+            for (id, v) in &judged {
+                assert!(!v.admit, "{id} admitted from a stale table: {v:?}");
+                assert_eq!(v.classes(), "claude unbound", "{id}: {v:?}");
+            }
+        }
+        let health = p.health_json();
+        assert_eq!(
+            health["powershellFallbacks"], 0,
+            "the shadow took the fallback slot: {health}"
+        );
+        assert!(
+            health["circuitOpenUntil"].is_null(),
+            "the shadow opened the shared circuit: {health}"
+        );
+
+        let census = p.begin_fallback().expect("the slot is free for the census");
+        let judged = judge_with(&sessions, failing, |_| async { None }).await;
+        assert!(judged.iter().all(|(_, v)| !v.admit));
+        assert!(
+            p.begin_fallback().is_none(),
+            "the census's attempt still holds the slot"
+        );
+        census.end(true, "the census's own attempt");
+        assert!(p.health_json()["circuitOpenUntil"].is_null());
+    }
+
+    /// The same sequence on a walk that succeeds: the shadow judges from the
+    /// provider's fresh tables and the argvs it was handed, and still never
+    /// touches the fallback.
+    #[tokio::test]
+    async fn the_shadow_judges_from_two_fresh_tables_and_the_argvs() {
+        use crate::process_capture::process_table::{read_in_process_only, Config, Provider};
+        let p: &'static Provider = Box::leak(Box::new(Provider::new(Config::default())));
+        let table = || {
+            read_in_process_only(p, || {
+                Ok(snap(&[
+                    (10, 1, "claude", 1, 9, 9),
+                    (11, 10, "bash", 1, 9, 9),
+                    (20, 1, "claude", 1, 9, 9),
+                ]))
+            })
+        };
+        let asked = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let seen = std::sync::Arc::clone(&asked);
+        let judged = judge_with(
+            &[("busy".to_string(), 10), ("idle".to_string(), 20)],
+            table,
+            |pids| async move {
+                *seen.lock().unwrap() = pids;
+                Some(HashMap::new())
+            },
+        )
+        .await;
+        assert_eq!(
+            *asked.lock().unwrap(),
+            vec![11],
+            "argvs of the members only"
+        );
+        assert_eq!(judged[0].1.classes(), "work=1", "{:?}", judged[0]);
+        assert!(judged[1].1.admit, "a childless claude: {:?}", judged[1]);
+        assert_eq!(p.health_json()["powershellFallbacks"], 0);
+    }
+
+    /// The production binding of the two tests above: [`judge`] reads only
+    /// through the in-process-only doors they exercise, and the shadow's code
+    /// names no fallback-capable read anywhere. A behavioural test cannot see
+    /// that binding, so its text is pinned instead.
+    #[test]
+    fn the_shadow_reads_only_through_the_in_process_only_doors() {
+        let src = include_str!("classify_child_shadow.rs");
+        let production = src.split("#[cfg(test)]").next().unwrap_or_default();
+        for door in [
+            "process_tree::snapshot_process_table_fresh_in_process_only,",
+            "process_tree::raw_argvs_for_pids(",
+            "process_tree::in_process_table_read_disabled()",
+        ] {
+            assert!(
+                production.contains(door),
+                "the shadow no longer reads through `{door}`"
+            );
+        }
+        for fallback_capable in [
+            "snapshot_process_table_fresh(",
+            "snapshot_process_table_public",
+            "command_lines_for_pids",
+            "snapshot_fresh(",
+            "snapshot(",
+            "read_with(",
+            "begin_fallback",
+            "run_fallback",
+        ] {
+            assert!(
+                !production.contains(fallback_capable),
+                "the shadow reads through `{fallback_capable}`, which can take \
+                 the process-table provider's one shared fallback slot"
+            );
+        }
     }
 }

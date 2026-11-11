@@ -4,7 +4,8 @@
     "measured_at": "2026-11-08T06:22:00Z",
     "method": "ssh merytshost 'ps -eo pid=,ppid=,etimes=,comm=,args='; subtree of one real claude; start = capture epoch - etimes (seconds, the runner's /proc granularity); coord-mcp-shim credential filenames redacted; tool-shell bodies redacted",
     "shape": "python3(),python3(MainThread(MainThread(next-server())))",
-    "census": "343 claude on the box at capture: 337 held exactly one python3 child, 341 python3 children ran `/usr/bin/python3 ~/Projects/qontinui-root/qontinui-claude-config/scripts/coord-mcp-shim.py --credential <path>`, 1 ran owned-run.py (a next dev server)"
+    "census": "343 claude on the box at capture: 337 held exactly one python3 child, 341 python3 children ran `/usr/bin/python3 ~/Projects/qontinui-root/qontinui-claude-config/scripts/coord-mcp-shim.py --credential <path>`, 1 ran owned-run.py (a next dev server)",
+    "argv_2026_11_12": "argv added 2026-11-12, when the classifier began comparing a Linux argv element by element (Phase 2a review finding 3) instead of re-splitting a space-joined line. This capture's `cmdline` is `ps -o args=`, the argv joined with single spaces, which cannot be split back exactly, so it is kept as measured and each row's `argv` is that text cut at the argument boundaries its shape implies: every argument here is free of spaces except a `bash -c` body, kept whole. The shim row's shape was re-read on merytshost 2026-11-12 from /proc/<pid>/cmdline split on NUL: all 160 live python3 shim children of a claude read exactly four elements, [/usr/bin/python3, ~/Projects/qontinui-root/qontinui-claude-config/scripts/coord-mcp-shim.py, --credential, <path>], every read ending in one NUL. `start` stays this capture's epoch seconds: a stamp is compared only for equality between two reads of one source, and the runner itself now stamps Linux rows with /proc/<pid>/stat field 22 (clock ticks since boot). The next-server row is a retitled node process. `ps` printed its comm column as `next-server (v1` (the 15-byte TASK_COMM), so the recorded `image` and `cmdline` were cut inside that column; its `argv` is the process title `next-server (v16.4.5)` as one element, an inference rather than a reading (a retitled node process rewrites its argv area as one string)."
   },
   "platform": "linux",
   "claude_pid": 2994258,
@@ -21,35 +22,82 @@
       "ppid": 2994258,
       "image": "python3",
       "start": 1794042737,
-      "cmdline": "/usr/bin/python3 /home/spinak/Projects/qontinui-root/qontinui-claude-config/scripts/coord-mcp-shim.py --credential /home/spinak/.qontinui/coord-mcp-shim/0123456789abcdef.json"
+      "cmdline": "/usr/bin/python3 /home/spinak/Projects/qontinui-root/qontinui-claude-config/scripts/coord-mcp-shim.py --credential /home/spinak/.qontinui/coord-mcp-shim/0123456789abcdef.json",
+      "argv": [
+        "/usr/bin/python3",
+        "/home/spinak/Projects/qontinui-root/qontinui-claude-config/scripts/coord-mcp-shim.py",
+        "--credential",
+        "/home/spinak/.qontinui/coord-mcp-shim/0123456789abcdef.json"
+      ]
     },
     {
       "pid": 4001809,
       "ppid": 2994258,
       "image": "python3",
       "start": 1794093342,
-      "cmdline": "python3 /home/spinak/Projects/qontinui-root/qontinui-claude-config/scripts/owned-run.py --max-runtime 28800 -- pnpm exec next dev --webpack -H 127.0.0.1 -p 3000"
+      "cmdline": "python3 /home/spinak/Projects/qontinui-root/qontinui-claude-config/scripts/owned-run.py --max-runtime 28800 -- pnpm exec next dev --webpack -H 127.0.0.1 -p 3000",
+      "argv": [
+        "python3",
+        "/home/spinak/Projects/qontinui-root/qontinui-claude-config/scripts/owned-run.py",
+        "--max-runtime",
+        "28800",
+        "--",
+        "pnpm",
+        "exec",
+        "next",
+        "dev",
+        "--webpack",
+        "-H",
+        "127.0.0.1",
+        "-p",
+        "3000"
+      ]
     },
     {
       "pid": 4001873,
       "ppid": 4001809,
       "image": "MainThread",
       "start": 1794093342,
-      "cmdline": "node /home/spinak/.nvm/versions/node/v24.19.0/bin/pnpm exec next dev --webpack -H 127.0.0.1 -p 3000"
+      "cmdline": "node /home/spinak/.nvm/versions/node/v24.19.0/bin/pnpm exec next dev --webpack -H 127.0.0.1 -p 3000",
+      "argv": [
+        "node",
+        "/home/spinak/.nvm/versions/node/v24.19.0/bin/pnpm",
+        "exec",
+        "next",
+        "dev",
+        "--webpack",
+        "-H",
+        "127.0.0.1",
+        "-p",
+        "3000"
+      ]
     },
     {
       "pid": 4002333,
       "ppid": 4001873,
       "image": "MainThread",
       "start": 1794093342,
-      "cmdline": "node ./node_modules/.bin/../next/dist/bin/next dev --webpack -H 127.0.0.1 -p 3000"
+      "cmdline": "node ./node_modules/.bin/../next/dist/bin/next dev --webpack -H 127.0.0.1 -p 3000",
+      "argv": [
+        "node",
+        "./node_modules/.bin/../next/dist/bin/next",
+        "dev",
+        "--webpack",
+        "-H",
+        "127.0.0.1",
+        "-p",
+        "3000"
+      ]
     },
     {
       "pid": 4002652,
       "ppid": 4002333,
       "image": "next-server",
       "start": 1794093342,
-      "cmdline": "(v1 next-server (v16.4.5)"
+      "cmdline": "(v1 next-server (v16.4.5)",
+      "argv": [
+        "next-server (v16.4.5)"
+      ]
     }
   ]
 }
