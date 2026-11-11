@@ -10592,7 +10592,10 @@ mod sdk_element_fallback_source_guard {
             "wait_options",
             "verify_effect",
         ] {
-            assert!(!src.contains(forbidden), "fallback reintroduced `{forbidden}`");
+            assert!(
+                !src.contains(forbidden),
+                "fallback reintroduced `{forbidden}`"
+            );
         }
     }
 }

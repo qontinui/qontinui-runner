@@ -491,9 +491,7 @@ async fn ui_bridge_navigate_and_wait_handler_dispatch(
         &req.action_extra,
     ) {
         Ok(payload) => payload,
-        Err(missing) => {
-            return Err((StatusCode::BAD_REQUEST, Json(missing.error_response())))
-        }
+        Err(missing) => return Err((StatusCode::BAD_REQUEST, Json(missing.error_response()))),
     };
     match ui_bridge_request_sync(&state, "execute_action", action_payload).await {
         Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
@@ -5047,7 +5045,8 @@ mod navigate_and_wait_wire_tests {
                 assert_eq!(payload.pointer("/action/action"), Some(&json!("type")));
             }
             "params" => {
-                let payload = payload_for_body(json!({"elementId": "e1", "params": {"text": "hi"}}));
+                let payload =
+                    payload_for_body(json!({"elementId": "e1", "params": {"text": "hi"}}));
                 assert_eq!(
                     payload.pointer("/action/params"),
                     Some(&json!({"text": "hi"}))
@@ -5094,10 +5093,16 @@ mod navigate_and_wait_window_guard {
         let end = SRC[start..].find("\n/// ").expect("next item") + start;
         let handler = &SRC[start..end];
         for (request_type, base_arg) in [
-            ("\"discover\"", "serde_json::json!({\"interactive_only\": false})"),
+            (
+                "\"discover\"",
+                "serde_json::json!({\"interactive_only\": false})",
+            ),
             ("\"get_snapshot\"", "serde_json::json!({})"),
         ] {
-            let sites: Vec<usize> = handler.match_indices(request_type).map(|(at, _)| at).collect();
+            let sites: Vec<usize> = handler
+                .match_indices(request_type)
+                .map(|(at, _)| at)
+                .collect();
             assert!(!sites.is_empty(), "{request_type} request not found");
             for at in sites {
                 // Char-safe: `get` answers None instead of panicking on a
@@ -5111,7 +5116,10 @@ mod navigate_and_wait_window_guard {
                     call.contains("navigate_and_wait_window_payload("),
                     "{request_type} is not window-targeted: {call}"
                 );
-                assert!(call.contains(base_arg), "{request_type}: wrong base payload: {call}");
+                assert!(
+                    call.contains(base_arg),
+                    "{request_type}: wrong base payload: {call}"
+                );
                 assert!(
                     call.contains("&req.action_extra"),
                     "{request_type}: not given the request's own windowLabel source: {call}"
