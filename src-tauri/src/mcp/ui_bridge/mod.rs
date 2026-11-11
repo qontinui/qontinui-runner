@@ -13,6 +13,7 @@
 //! module. All per-endpoint handlers live in their family submodules.
 
 pub mod action_vocabulary;
+pub(crate) mod action_wire;
 pub mod ai;
 pub mod ai_analyze;
 pub mod analytics;
