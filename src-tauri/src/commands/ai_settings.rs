@@ -1628,7 +1628,7 @@ struct UsageRefreshPlan {
 /// than two, by probing the account it spends, because coord's launch budget
 /// has to count it. That probe's only consumer is the report, so it runs only
 /// when `reports_lone_account`: the runner has a coord to report to and the
-/// account is its own ([`lone_account_scope`]).
+/// account is its own ([`roster_scope`]).
 fn plan_usage_refresh(
     dir_count: usize,
     caller: UsageRefreshCaller,
@@ -1654,14 +1654,14 @@ fn plan_usage_refresh(
 /// account, and when no candidate exists.
 ///
 /// `include_inherited` is true only for the primary
-/// ([`LoneAccountScope::Primary`]). A SUBJECT runner reports only a pinned
+/// ([`RosterScope::Primary`]). A SUBJECT runner reports only a pinned
 /// account. Its roster and settings sit under
 /// its instance root (`claude_accounts::claude_accounts_file_path`), so a pin
 /// is its own. The two inherited steps are not: `HOME` is not re-rooted for
 /// any runner, and its environment is its launcher's, so the inherited
 /// `CLAUDE_CONFIG_DIR` and `~/.claude` are the harness's account. Any other
 /// secondary never reaches this function for a lone account (see
-/// [`lone_account_scope`]).
+/// [`roster_scope`]).
 fn spent_account_dir(include_inherited: bool) -> Option<String> {
     if crate::model_gateway::gateway_declared() {
         return None;
@@ -1683,7 +1683,7 @@ fn spent_account_dir(include_inherited: bool) -> Option<String> {
 
 /// Which runner may report a roster as its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LoneAccountScope {
+enum RosterScope {
     /// The box's canonical runner: every step of [`spent_account_dir`],
     /// inherited ones included.
     Primary,
@@ -1714,20 +1714,24 @@ enum LoneAccountScope {
 ///   the primary already reports.
 ///
 /// The decision applies to the 2+-account roster as well as the lone account.
-/// A non-owner still probes for its own picker; it just sends nothing to coord.
-fn lone_account_scope() -> Option<LoneAccountScope> {
+/// A non-owner still probes for its own picker; it just sends no ACCOUNT rows
+/// to coord. Its prepaid half still goes: the prepaid key lives in the
+/// machine-wide keychain and the inherited env, not under any instance root,
+/// so roster ownership says nothing about it (coord keys it per device and
+/// provider, so a same-key repeat is an idempotent upsert).
+fn roster_scope() -> Option<RosterScope> {
     account_scope_from(
         crate::instance::owns_shared_root_state(),
         qontinui_runner_lib::instance_env::instance_root().is_some(),
     )
 }
 
-/// Env-free core of [`lone_account_scope`].
-fn account_scope_from(is_primary: bool, has_instance_root: bool) -> Option<LoneAccountScope> {
+/// Env-free core of [`roster_scope`].
+fn account_scope_from(is_primary: bool, has_instance_root: bool) -> Option<RosterScope> {
     if is_primary {
-        Some(LoneAccountScope::Primary)
+        Some(RosterScope::Primary)
     } else if has_instance_root {
-        Some(LoneAccountScope::Subject)
+        Some(RosterScope::Subject)
     } else {
         None
     }
@@ -1736,7 +1740,7 @@ fn account_scope_from(is_primary: bool, has_instance_root: bool) -> Option<LoneA
 async fn refresh_usage(caller: UsageRefreshCaller) -> Vec<AccountUsageInfo> {
     let mut config_dirs = crate::settings::get_claude_config_dirs();
     let report_base = usage_twin_report::report_base();
-    let scope = lone_account_scope();
+    let scope = roster_scope();
     let plan = plan_usage_refresh(
         config_dirs.len(),
         caller,
@@ -1749,7 +1753,7 @@ async fn refresh_usage(caller: UsageRefreshCaller) -> Vec<AccountUsageInfo> {
     // selection (`account_infos`, one source with the Tauri command). A lone
     // spent account is in use by construction: it is what a spawn runs on.
     let active_dirs: std::collections::HashSet<String> = if plan.probe_spent {
-        let spent = spent_account_dir(scope == Some(LoneAccountScope::Primary));
+        let spent = spent_account_dir(scope == Some(RosterScope::Primary));
         config_dirs.extend(spent.clone());
         spent.into_iter().collect()
     } else {
@@ -1775,8 +1779,9 @@ async fn refresh_usage(caller: UsageRefreshCaller) -> Vec<AccountUsageInfo> {
     // Nothing measured, nothing to say. An empty `prepaid` makes coord write
     // nothing for that half, so the accounts-only caller can never blank a
     // balance the timer reported.
-    // Account rows go to coord only from the runner that owns the roster; a
-    // secondary on the primary's machine-global roster would repeat them.
+    // Account rows go to coord only from the runner that owns the roster
+    // ([`roster_scope`]); a secondary on the primary's machine-global roster
+    // would repeat them. Prepaid is not roster-owned and is sent regardless.
     let reported: &[AccountUsageInfo] = if scope.is_some() { &results } else { &[] };
     if let Some(base) = report_base.filter(|_| !reported.is_empty() || !prepaid.is_empty()) {
         usage_twin_report::report_to_coord(&base, reported, &active_dirs, &prepaid).await;
@@ -3411,7 +3416,7 @@ mod usage_report_scope_tests {
     /// The ownership table, with no env or filesystem.
     #[test]
     fn roster_ownership_is_primary_or_under_a_root() {
-        use super::{account_scope_from, LoneAccountScope::*};
+        use super::{account_scope_from, RosterScope::*};
         assert_eq!(account_scope_from(true, false), Some(Primary));
         assert_eq!(account_scope_from(false, true), Some(Subject));
         assert_eq!(account_scope_from(false, false), None);
