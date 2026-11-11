@@ -7,11 +7,12 @@
 //! admit or refuse and acts on nothing. Arming it is that plan's Phase 2b.
 //!
 //! Nothing here performs I/O. The caller reads the process table, the command
-//! lines and a second, fresh table, and passes all three in.
+//! lines (in each platform's [`Argv`] form) and a second, fresh table, and
+//! passes all three in.
 
 pub mod classify_child;
 
 pub use classify_child::{
-    classify_child, classify_session, ChildClass, ChildVerdict, Platform, ProcRow, ProcTable,
+    classify_child, classify_session, Argv, ChildClass, ChildVerdict, Platform, ProcRow, ProcTable,
     SessionVerdict,
 };

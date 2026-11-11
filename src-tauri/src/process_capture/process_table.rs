@@ -525,7 +525,7 @@ pub(crate) fn health_json() -> serde_json::Value {
 
 /// The Windows-only kill switch (see the module docs). Off Windows the
 /// in-process read is the only read, so it is never disabled.
-fn in_process_disabled() -> bool {
+pub(crate) fn in_process_disabled() -> bool {
     static DISABLED: OnceLock<bool> = OnceLock::new();
     *DISABLED.get_or_init(|| {
         let disabled =
@@ -590,6 +590,43 @@ pub(crate) async fn snapshot_fresh() -> ProcessSnapshot {
         platform::fallback_snapshot,
     )
     .await
+}
+
+/// [`snapshot_fresh`] WITHOUT the external-probe fallback — for an OBSERVER
+/// that must never compete with the runner's acting callers for it (the
+/// `finished_close` arm's `classify_child` shadow). The walk is the provider's
+/// own (memo-less, single flight), but a walk this read leads that fails
+/// settles its flight with no table — the last good one flagged stale, or an
+/// empty stale one — exactly as [`snapshot_blocking`] settles a synchronous
+/// caller's. So this read never takes the one fallback slot (an acting
+/// caller's own failed walk finds it free), never counts an attempt, and never
+/// opens the shared circuit. Its stale answer is UNKNOWN to the observer.
+pub(crate) async fn snapshot_fresh_in_process_only() -> ProcessSnapshot {
+    read_in_process_only(provider(), walk_in_process).await
+}
+
+/// The async read behind [`snapshot_fresh_in_process_only`], generic over the
+/// provider and the walk so a test drives this exact path: `walk` on the
+/// blocking pool through [`Provider::lead_or_join`] at `max_age` zero, and a
+/// failed walk's flight settled with no table. [`Provider::begin_fallback`] is
+/// never called from here.
+pub(crate) async fn read_in_process_only<W>(p: &'static Provider, walk: W) -> ProcessSnapshot
+where
+    W: FnOnce() -> Result<ProcessSnapshot, String> + Send + 'static,
+{
+    let read = spawn_blocking_tracked(move || match p.lead_or_join(Duration::ZERO, walk) {
+        Ok(snap) => snap,
+        Err(flight) => flight.settle(None),
+    })
+    .await;
+    match read {
+        Ok(snap) => snap,
+        Err(e) => {
+            // The flight (if any) was settled by its drop during the unwind.
+            tracing::debug!("process_table: an in-process-only read did not join: {e}");
+            ProcessSnapshot::default()
+        }
+    }
 }
 
 /// The async read every snapshot goes through: `walk` on the blocking pool
@@ -703,15 +740,20 @@ pub(crate) fn command_lines_blocking(pids: &[u32]) -> Result<HashMap<u32, String
         .map_err(|_| "the in-process command-line read panicked".to_string())?
 }
 
-/// The RAW command lines of exactly `pids`, in-process, for a caller that must
-/// match the text a process was started with: Windows reads each PEB (never
+/// The RAW argv of exactly `pids`, in-process, for a caller that must match
+/// what a process was started with — in the form its platform's measured
+/// chains were recorded in ([`session_lifecycle::Argv`]). Windows reads each
+/// PEB's command line ([`Argv::Line`](session_lifecycle::Argv::Line); never
 /// `sysinfo`'s split-and-rejoined `cmd()`, which cannot reproduce cmd's `^"`
-/// escapes), Unix reads `/proc/<pid>/cmdline`. No external fallback.
+/// escapes). Unix splits `/proc/<pid>/cmdline` on NUL with every element kept
+/// ([`Argv::Elements`](session_lifecycle::Argv::Elements); never the
+/// space-joined line [`command_lines_for`] serves, in which distinct argvs
+/// collapse). No external fallback, so it never takes the fallback slot.
 ///
 /// `None` when the read could not run (the in-process kill switch is set, or
 /// the blocking task did not join): UNKNOWN. A pid that is dead or unreadable
 /// is absent from a `Some` map.
-pub(crate) async fn raw_command_lines_for(pids: &[u32]) -> Option<HashMap<u32, String>> {
+pub(crate) async fn raw_argvs_for(pids: &[u32]) -> Option<HashMap<u32, session_lifecycle::Argv>> {
     if pids.is_empty() {
         return Some(HashMap::new());
     }
@@ -719,12 +761,10 @@ pub(crate) async fn raw_command_lines_for(pids: &[u32]) -> Option<HashMap<u32, S
         return None;
     }
     let asked = pids.to_vec();
-    spawn_blocking_tracked(move || {
-        std::panic::catch_unwind(|| platform::raw_command_lines(&asked)).ok()
-    })
-    .await
-    .ok()
-    .flatten()
+    spawn_blocking_tracked(move || std::panic::catch_unwind(|| platform::raw_argvs(&asked)).ok())
+        .await
+        .ok()
+        .flatten()
 }
 
 /// Command lines for exactly `pids`: in-process, with the external probe
@@ -1035,9 +1075,10 @@ mod platform {
 
     /// The RAW command line of exactly `pids` — the PEB's, as the process was
     /// started with it ([`qontinui_runner_win32::process_tree::raw_command_line`]),
-    /// through a `PROCESS_QUERY_LIMITED_INFORMATION` handle. A pid that cannot
-    /// be opened or read is absent.
-    pub(super) fn raw_command_lines(pids: &[u32]) -> HashMap<u32, String> {
+    /// through a `PROCESS_QUERY_LIMITED_INFORMATION` handle — as
+    /// [`session_lifecycle::Argv::Line`]. A pid that cannot be opened or read
+    /// is absent.
+    pub(super) fn raw_argvs(pids: &[u32]) -> HashMap<u32, session_lifecycle::Argv> {
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::Threading::{
             OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -1059,7 +1100,7 @@ mod platform {
                 line
             };
             if let Some(line) = line.filter(|l| !l.trim().is_empty()) {
-                out.insert(pid, line);
+                out.insert(pid, session_lifecycle::Argv::Line(line));
             }
         }
         out
@@ -1139,9 +1180,14 @@ mod platform {
         None
     }
 
-    /// `/proc/<pid>/cmdline` for exactly `pids` — already the raw read here.
-    pub(super) fn raw_command_lines(pids: &[u32]) -> HashMap<u32, String> {
-        process_tree::proc_command_lines(pids)
+    /// `/proc/<pid>/cmdline` for exactly `pids`, split on NUL with every
+    /// element kept ([`process_tree::proc_argvs`]), as
+    /// [`session_lifecycle::Argv::Elements`].
+    pub(super) fn raw_argvs(pids: &[u32]) -> HashMap<u32, session_lifecycle::Argv> {
+        process_tree::proc_argvs(pids)
+            .into_iter()
+            .map(|(pid, argv)| (pid, session_lifecycle::Argv::Elements(argv)))
+            .collect()
     }
 
     /// `/proc/<pid>/cmdline` for exactly `pids`.
@@ -1630,6 +1676,51 @@ mod tests {
         assert!(
             p.health_json()["circuitOpenUntil"].is_null(),
             "a panic is not recorded as a failed attempt"
+        );
+    }
+
+    /// `read_in_process_only` (behind `snapshot_fresh_in_process_only`, the
+    /// classify_child shadow's tables): a failed walk answers stale WITHOUT the
+    /// fallback — no attempt counted, the slot left free, the circuit left
+    /// closed, however many times it fails — and a slot an acting caller holds
+    /// is neither waited on nor released, so that caller's own attempt alone
+    /// decides the circuit.
+    #[tokio::test]
+    async fn process_table_an_in_process_only_read_never_takes_the_fallback() {
+        let clock = FakeClock::new();
+        let p: &'static Provider = Box::leak(Box::new(Provider::with_clock(cfg(), clock.clock())));
+        let ok = read_in_process_only(p, || Ok(table(4))).await;
+        assert!(
+            !ok.stale && ok.names.contains_key(&4),
+            "a good walk answers"
+        );
+        for _ in 0..3 {
+            // Past the good walk's instant, so the memo-less read walks again.
+            clock.advance(Duration::from_secs(1));
+            let s = read_in_process_only(p, || Err("scripted".to_string())).await;
+            assert!(s.stale, "a failed walk is stale, never a fabricated table");
+            assert!(s.names.contains_key(&4), "the last good table, labelled");
+        }
+        let health = p.health_json();
+        assert_eq!(health["powershellFallbacks"], 0, "{health}");
+        assert!(health["circuitOpenUntil"].is_null(), "{health}");
+
+        let held = p
+            .begin_fallback()
+            .expect("an acting caller takes the free slot");
+        clock.advance(Duration::from_secs(1));
+        let s = read_in_process_only(p, || Err("scripted".to_string())).await;
+        assert!(s.stale);
+        assert!(
+            p.begin_fallback().is_none(),
+            "the acting caller still holds its slot"
+        );
+        held.end(true, "the acting caller's attempt");
+        assert!(p.health_json()["circuitOpenUntil"].is_null());
+        assert_eq!(
+            p.health_json()["powershellFallbacks"],
+            1,
+            "only its attempt"
         );
     }
 
