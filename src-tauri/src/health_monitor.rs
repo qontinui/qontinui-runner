@@ -17,8 +17,27 @@ use qontinui_runner_lib::wedge_diagnostics::{capture_thread_name_census, ThreadN
 /// Interval between health checks in seconds
 const HEALTH_CHECK_INTERVAL_SECS: u64 = 60;
 
-/// Memory threshold in MB to trigger a warning
-const MEMORY_WARNING_THRESHOLD_MB: u64 = 1024; // 1 GB
+/// Resident-memory threshold in MiB above which the health loop WARNs
+/// "possible memory leak" and `/health` reports `memory_warning: true`.
+///
+/// 8 GiB, calibrated 2026-11-11: healthy runners plateau at 3.1-3.6 GiB
+/// resident (`qontinui-dev-notes`
+/// `devops-data/2026-11-11-runner-rss-nilan/fit.md`), so 8 GiB is 2.2x the
+/// highest healthy plateau — the same NUMBER as coord's S12 absolute warn arm
+/// (plan `2026-11-11-devops-runner-self-rss-is-absent-from-the-resource-sample`),
+/// though not the same quantity: coord grades private bytes (RssAnon + swap),
+/// this compares resident memory, so the two need not fire together.
+/// The previous 1 GiB sat BELOW every healthy runner at rest, so it fired once
+/// a minute forever (~1,440 "possible memory leak" lines a day) and marked a
+/// healthy runner unhealthy: a detector that always fires detects nothing.
+/// Slow leaks below this level are coord's sustained-slope arm's to catch.
+const MEMORY_WARNING_THRESHOLD_MB: u64 = 8 * 1024;
+
+/// The one memory-warning predicate, shared by the log loop and
+/// [`HealthStatus::from_metrics`] so the two can never disagree.
+fn memory_exceeds_warning(memory_mb: u64) -> bool {
+    memory_mb > MEMORY_WARNING_THRESHOLD_MB
+}
 
 /// Thread count threshold to trigger a warning.
 /// Set to 150 to avoid false positives — the runner legitimately uses 100-130
@@ -1868,7 +1887,7 @@ fn log_metrics(metrics: &HealthMetrics) {
     );
 
     // Warn if thresholds are exceeded
-    if memory_mb > MEMORY_WARNING_THRESHOLD_MB {
+    if memory_exceeds_warning(memory_mb) {
         warn!(
             memory_mb = memory_mb,
             threshold_mb = MEMORY_WARNING_THRESHOLD_MB,
@@ -2064,7 +2083,7 @@ impl HealthStatus {
     /// Create a health status from metrics
     pub fn from_metrics(metrics: &HealthMetrics) -> Self {
         let memory_mb = metrics.memory_mb();
-        let memory_warning = memory_mb > MEMORY_WARNING_THRESHOLD_MB;
+        let memory_warning = memory_exceeds_warning(memory_mb);
         let thread_warning = metrics.thread_count > THREAD_WARNING_THRESHOLD;
 
         Self {
@@ -2097,6 +2116,46 @@ mod tests {
     /// `observe_publishes_the_failure_count_before_it_reports` read a `true`
     /// that `stopping_the_monitor_clears_the_wedge_latches` had just stored.
     static WEDGE_ATOMS_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    fn metrics_with_memory(memory_bytes: u64) -> HealthMetrics {
+        HealthMetrics {
+            timestamp: chrono::Utc::now(),
+            memory_bytes,
+            thread_count: 0,
+            agent_log_emitter_agents: 0,
+            uptime_secs: 0,
+            cpu_percent: None,
+        }
+    }
+
+    /// Pins the calibrated value (fit.md: 8 GiB) so a change to it is a
+    /// deliberate re-calibration; the behaviour is pinned by the two below.
+    #[test]
+    fn memory_warning_threshold_is_the_calibrated_8_gib() {
+        assert_eq!(MEMORY_WARNING_THRESHOLD_MB, 8192);
+    }
+
+    #[test]
+    fn a_healthy_plateau_does_not_raise_the_memory_warning() {
+        // The highest healthy plateau measured (3.6 GiB), rounded up.
+        let status = HealthStatus::from_metrics(&metrics_with_memory(3_687 * 1024 * 1024));
+        assert!(!status.memory_warning, "a 3.6 GiB healthy runner warned");
+        assert!(status.healthy);
+        // And the old 1 GiB threshold's territory is quiet too.
+        assert!(!memory_exceeds_warning(1025));
+        assert!(!memory_exceeds_warning(4 * 1024));
+    }
+
+    #[test]
+    fn the_memory_warning_boundary_is_exclusive_at_8_gib() {
+        let at = HealthStatus::from_metrics(&metrics_with_memory(8 * GIB));
+        assert!(!at.memory_warning, "exactly 8 GiB must not warn");
+        let over = HealthStatus::from_metrics(&metrics_with_memory(8 * GIB + 1024 * 1024));
+        assert!(over.memory_warning, "8 GiB + 1 MiB must warn");
+        assert!(!over.healthy, "a memory warning must mark the runner unhealthy");
+    }
 
     // sysinfo's per-process introspection (memory + thread count) returns 0
     // on macOS CI runners because the runner process lacks the entitlement
