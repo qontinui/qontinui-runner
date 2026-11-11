@@ -1492,6 +1492,30 @@ mod tests {
         }
     }
 
+    /// Enters where every runner spawn does: a `LaunchSpec.name` turned into
+    /// argv by `compose_flags`, the seam `render_argv` and `render_pty_command`
+    /// share. A long runner-own name reaches `--name` compacted; a coord name
+    /// reaches it byte-identical.
+    #[test]
+    fn compose_flags_compacts_an_overlong_session_name() {
+        let mut s = spec();
+        for (name, want) in [
+            (
+                "loop-nightly-merge-train-steward-watch-and-remediate",
+                "loop-nightly-merge-train-2c0ac670",
+            ),
+            (
+                "resume-unit-9e9b1b7b-phase-3-5-c2abbf7c",
+                "resume-unit-9e9b1b7b-phase-3-5-c2abbf7c",
+            ),
+        ] {
+            s.name = Some(name.to_string());
+            let flags = compose_flags(&s, &LaunchConfig::default());
+            assert_eq!(value_after(&flags, "--name"), Some(want), "{flags:?}");
+            assert_eq!(flags.iter().filter(|a| *a == "--name").count(), 1);
+        }
+    }
+
     #[test]
     fn sanitize_session_name_compacts_an_overlong_value_with_a_digest() {
         let cases = [
