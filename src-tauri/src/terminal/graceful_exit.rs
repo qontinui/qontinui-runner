@@ -1309,18 +1309,20 @@ pub async fn probe_claude_under_exempting(
         );
     };
     // Test builds only: a pane registered with [`fake_process_table`] under a
-    // pid no real process can hold reads its scripted view, or runs this same
-    // derivation over its scripted table, instead of the OS table. Every real
-    // pid falls through to the look below.
+    // pid no real process can hold reads its scripted view, or hands back a
+    // look over its scripted table, instead of the OS table. That look is
+    // judged by the SAME `probe_exempting` call below as a real one. Every
+    // real pid falls through to a fresh look.
     #[cfg(test)]
-    if let Some(scripted) = fake_process_table::probe(root, &tracked, exempt).await {
-        return scripted;
-    }
+    let look = match fake_process_table::probe(root, &tracked, exempt).await {
+        Some(fake_process_table::Scripted::View(probe)) => return probe,
+        Some(fake_process_table::Scripted::Table(look)) => look,
+        None => PaneLook::take_fresh(&[root]).await,
+    };
     // Never the memo: two consecutive "gone" probes must be two observations.
-    PaneLook::take_fresh(&[root])
-        .await
-        .probe_exempting(root, &tracked, exempt)
-        .await
+    #[cfg(not(test))]
+    let look = PaneLook::take_fresh(&[root]).await;
+    look.probe_exempting(root, &tracked, exempt).await
 }
 
 // ---------------------------------------------------------------------------
@@ -1683,9 +1685,9 @@ pub(crate) mod fake_process_table {
 
     static NEXT_PID: AtomicU32 = AtomicU32::new(FAKE_PID_BASE);
 
-    /// What a registered pane answers with.
+    /// What a registered pane was registered with.
     #[derive(Clone)]
-    enum Scripted {
+    enum Registered {
         /// A finished view: the derivation is skipped.
         View {
             view: PaneProcesses,
@@ -1708,12 +1710,12 @@ pub(crate) mod fake_process_table {
         pub(crate) proc_start: fn(u32) -> Option<String>,
     }
 
-    fn table() -> &'static Mutex<HashMap<u32, Scripted>> {
-        static TABLE: OnceLock<Mutex<HashMap<u32, Scripted>>> = OnceLock::new();
+    fn table() -> &'static Mutex<HashMap<u32, Registered>> {
+        static TABLE: OnceLock<Mutex<HashMap<u32, Registered>>> = OnceLock::new();
         TABLE.get_or_init(Mutex::default)
     }
 
-    fn insert(root_pid: u32, scripted: Scripted) -> FakePane {
+    fn insert(root_pid: u32, scripted: Registered) -> FakePane {
         table()
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -1743,7 +1745,7 @@ pub(crate) mod fake_process_table {
         let root_pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
         insert(
             root_pid,
-            Scripted::View {
+            Registered::View {
                 view,
                 children: None,
             },
@@ -1758,7 +1760,7 @@ pub(crate) mod fake_process_table {
         let root_pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
         insert(
             root_pid,
-            Scripted::View {
+            Registered::View {
                 view,
                 children: Some(children),
             },
@@ -1772,7 +1774,7 @@ pub(crate) mod fake_process_table {
     /// [`PaneLook::probe_exempting`]).
     pub(crate) fn register_table(build: impl FnOnce(u32) -> ScriptedTable) -> FakePane {
         let root_pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
-        let scripted = Scripted::Table(Arc::new(build(root_pid)));
+        let scripted = Registered::Table(Arc::new(build(root_pid)));
         insert(root_pid, scripted)
     }
 
@@ -1786,32 +1788,41 @@ pub(crate) mod fake_process_table {
             .unwrap_or_else(PoisonError::into_inner)
             .get(&root_pid)
             .map(|scripted| match scripted {
-                Scripted::View { children, .. } => children.clone().unwrap_or_default(),
-                Scripted::Table(_) => Vec::new(),
+                Registered::View { children, .. } => children.clone().unwrap_or_default(),
+                Registered::Table(_) => Vec::new(),
             })
     }
 
-    /// The scripted probe for `root_pid`, or `None` for any pid nobody
+    /// What a registered pane answers a probe with.
+    pub(super) enum Scripted {
+        /// A view's finished probe.
+        View(ClaudeProbe),
+        /// A look over a scripted table, with its registry read, for the
+        /// caller to judge exactly as it judges a real look.
+        Table(PaneLook),
+    }
+
+    /// The scripted answer for `root_pid`, or `None` for any pid nobody
     /// registered (every real one).
     ///
     /// For a view: of the identities asked about, those the view holds (in its
     /// subtree or as alive elsewhere) read alive, and for a pane registered
     /// with children, what `exempt` admits of them is applied as the pure
     /// probe applies it to a real table. `exempt` is consulted exactly when a
-    /// real probe would consult it: whenever it is not empty. For a table:
-    /// whatever the production derivation reads.
+    /// real probe would consult it: whenever it is not empty. For a table: a
+    /// look the production derivation then runs over.
     pub(super) async fn probe(
         root_pid: u32,
         tracked: &[ProcIdentity],
         exempt: &ChildExemptions,
-    ) -> Option<ClaudeProbe> {
+    ) -> Option<Scripted> {
         let scripted = table()
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get(&root_pid)?
             .clone();
         Some(match scripted {
-            Scripted::View { view, children } => {
+            Registered::View { view, children } => {
                 let admitted = if exempt.is_empty() {
                     BTreeSet::new()
                 } else {
@@ -1843,14 +1854,14 @@ pub(crate) mod fake_process_table {
                         (counted, exempted)
                     }
                 };
-                ClaudeProbe::Readable(PaneProcesses {
+                Scripted::View(ClaudeProbe::Readable(PaneProcesses {
                     tracked_alive,
                     top_level_children,
                     exempted_children,
                     ..view
-                })
+                }))
             }
-            Scripted::Table(scripted) => {
+            Registered::Table(scripted) => {
                 let config_dirs = scripted.config_dirs.clone();
                 let registry = super::read_registry_witness_with(
                     &[root_pid],
@@ -1861,9 +1872,11 @@ pub(crate) mod fake_process_table {
                     &super::REGISTRY_READS_IN_FLIGHT,
                 )
                 .await;
-                PaneLook::from_parts(&[root_pid], scripted.snapshot.clone(), registry)
-                    .probe_exempting(root_pid, tracked, exempt)
-                    .await
+                Scripted::Table(PaneLook::from_parts(
+                    &[root_pid],
+                    scripted.snapshot.clone(),
+                    registry,
+                ))
             }
         })
     }
@@ -2764,6 +2777,47 @@ mod tests {
             readable(&[], 0, &[]),
             "a `node` no record names is judged by its image"
         );
+    }
+
+    /// The child-gate exemptions reach the REAL look's derivation: a pane
+    /// whose top-level `claude` is a registry-named `node` (an npm-installed
+    /// Claude Code) with one direct child. Admitted, the child is left out of
+    /// the count and named; with no exemption it counts. The top-level
+    /// `claude` here is known only to the registry, so the children the
+    /// exemptions are asked about must come from the registry-aware
+    /// derivation, not the image alone.
+    #[tokio::test]
+    async fn exemptions_reach_a_registry_named_claudes_children_through_the_real_look() {
+        const CHILD: u32 = 7_101;
+        let root = tempfile::tempdir().unwrap();
+        let recorded = config_dir(root.path(), ".claude-npm", &[(NODE, npm_record(NODE, 20))]);
+        let pane = fake_process_table::register_table(|r| fake_process_table::ScriptedTable {
+            snapshot: snapshot(&[
+                (r, 1, "bash", 10),
+                (NODE, r, "node", 20),
+                (CHILD, NODE, "bash", 30),
+            ]),
+            config_dirs: vec![recorded],
+            proc_start: no_kernel,
+        });
+        let root_pid = Some(pane.root_pid);
+
+        let exempted = view_of(
+            probe_claude_under_exempting(
+                root_pid,
+                Vec::new(),
+                &ChildExemptions::admit_for_test(CHILD),
+            )
+            .await,
+        );
+        assert_eq!(exempted.subtree_claude, vec![id(NODE, 20)]);
+        assert_eq!(exempted.exempted_children, vec![CHILD]);
+        assert_eq!(exempted.top_level_children, 0);
+
+        let counted = view_of(probe_claude_under(root_pid, Vec::new()).await);
+        assert_eq!(counted.subtree_claude, vec![id(NODE, 20)]);
+        assert!(counted.exempted_children.is_empty());
+        assert_eq!(counted.top_level_children, 1);
     }
 
     /// A `sessions/` dir that exists and cannot be listed may hold the npm

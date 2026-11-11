@@ -1879,6 +1879,47 @@ mod tests {
         assert_eq!(got, ProviderRowValidity::Unknown);
     }
 
+    /// Lenient mode judges a row with no `pidDomain` by the DIRECTIONAL
+    /// `startedAt` check: inside the window it is valid, EARLIER than the
+    /// process is an earlier holder's row (stale), and LATER than the window
+    /// is a late stamp — never reuse and never proof, so unknown.
+    #[test]
+    fn lenient_mode_reads_a_late_started_at_as_unknown_never_stale() {
+        let created_ms = CREATED * 1000;
+        let row = |started_at: i64| {
+            [(
+                dir("a"),
+                format!(r#"{{"pid":7,"sessionId":"{ID_A}","startedAt":{started_at}}}"#),
+            )]
+        };
+        let clock = win_clock();
+        assert_eq!(
+            provider_row_validity(7, &row(created_ms + 1_000), &clock, ValidityMode::Lenient),
+            valid(ID_A, "a"),
+            "inside the window"
+        );
+        assert_eq!(
+            provider_row_validity(
+                7,
+                &row(created_ms - START_LEAD_MS - 1),
+                &clock,
+                ValidityMode::Lenient
+            ),
+            ProviderRowValidity::Stale,
+            "earlier than the process: an earlier holder's row"
+        );
+        assert_eq!(
+            provider_row_validity(
+                7,
+                &row(created_ms + START_LAG_MS + 1),
+                &clock,
+                ValidityMode::Lenient
+            ),
+            ProviderRowValidity::Unknown,
+            "later than the window: a late stamp, never stale"
+        );
+    }
+
     #[test]
     fn strict_mode_refuses_what_it_cannot_check_and_lenient_accepts_it() {
         let no_domain = format!(r#"{{"pid":7,"sessionId":"{ID_A}","procStart":"5000000"}}"#);
