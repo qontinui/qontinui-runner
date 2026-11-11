@@ -592,7 +592,7 @@ mod tests {
     /// first code line after its [`SPAWN_MARKER`] must carry, so the marker
     /// cannot be moved up to empty the early-exit window.
     const DOOR_SPAWN_TOKENS: &[(&str, &str)] = &[
-        ("commands/terminal.rs", "spawn_blocking_tracked("),
+        ("commands/terminal.rs", "create_manager.create("),
         ("mcp/backend_relay.rs", "tm.create("),
         ("mcp/tauri_proxy.rs", "tm.create("),
         ("mcp/terminals.rs", "terminal_manager.create("),
@@ -662,6 +662,7 @@ mod tests {
         "nothing-allocated", // the allocation did not happen on this path
         "spawned",           // the session started and holds the context
         "loop-exit",         // a `break`; the code after the loop settles the allocation
+        "retry",             // a `continue` that carries the context into the next attempt
     ];
 
     /// `Ok(true)` when `line` is a well-formed keep marker, `Ok(false)` when it
@@ -703,11 +704,46 @@ mod tests {
             .collect()
     }
 
-    /// Is the block that holds line `r` still open at line `e` — `r` in the
-    /// same block as `e` or an enclosing one, never a closed sibling?
-    fn in_scope(profile: &[(i64, i64)], r: usize, e: usize) -> bool {
-        let held = profile[r].0;
-        (r + 1..=e).all(|i| profile[i].1 >= held)
+    /// Is the block holding the removal at `(r, cr)` (line, byte column of the
+    /// token) still open at the exit at `(e, ce)` — the same block or an
+    /// enclosing one, never a closed sibling? Keyed on the depth AT the token,
+    /// so `if c { remove_unspawned(ctx); }` on one line does not cover a later
+    /// exit, and the walk stops at the exit's own column, so a `}` after it on
+    /// its line does not count against it.
+    fn in_scope(
+        code: &[String],
+        profile: &[(i64, i64)],
+        r: (usize, usize),
+        e: (usize, usize),
+    ) -> bool {
+        let braces = |l: &str, from: usize, to: usize, depth: &mut i64, low: &mut i64| {
+            for (i, c) in l.char_indices() {
+                if i < from || i >= to {
+                    continue;
+                }
+                match c {
+                    '{' => *depth += 1,
+                    '}' => {
+                        *depth -= 1;
+                        *low = (*low).min(*depth);
+                    }
+                    _ => {}
+                }
+            }
+        };
+        let (mut depth, mut scratch) = (profile[r.0].0, 0i64);
+        braces(&code[r.0], 0, r.1, &mut depth, &mut scratch);
+        let held = depth;
+        let mut low = held;
+        for line in r.0..=e.0 {
+            let from = if line == r.0 { r.1 } else { 0 };
+            let to = if line == e.0 { e.1 } else { usize::MAX };
+            if line != r.0 {
+                depth = profile[line].0;
+            }
+            braces(&code[line], from, to, &mut depth, &mut low);
+        }
+        low >= held
     }
 
     /// The CODE of each line — string, char-literal and comment contents
@@ -727,29 +763,66 @@ mod tests {
     /// must not assume, so each one carries its own removal or a
     /// `keep(loop-exit)` marker naming where the allocation is settled.
     fn early_exits(code: &[String], from: usize, to: usize) -> Vec<usize> {
-        let word = |l: &str, w: &str| {
-            l.match_indices(w).any(|(i, _)| {
-                let ident = |c: char| c.is_alphanumeric() || c == '_';
-                !l.get(..i)
-                    .and_then(|h| h.chars().next_back())
-                    .is_some_and(ident)
-                    && !l
-                        .get(i + w.len()..)
-                        .and_then(|t| t.chars().next())
-                        .is_some_and(ident)
-            })
-        };
         (from + 1..to.min(code.len()))
-            .filter(|&i| {
-                let l = &code[i];
-                l.contains('?')
-                    || word(l, "return")
-                    || word(l, "continue")
-                    || word(l, "break")
-                    || l.contains("bail!")
-                    || l.contains("ensure!")
-            })
+            .filter(|&i| exit_col(&code[i]).is_some())
             .collect()
+    }
+
+    /// The byte column of the first exit on a CODE line, if any: a `?`, a
+    /// `return` / `continue` / `break` keyword, a `bail!` / `ensure!`, or a
+    /// TAIL-POSITION `Err(` — a match arm or block whose value is the
+    /// refusal (`=> Err(..)`, or a line that is just `Err(..)` — never the
+    /// `Err(e) =>` pattern that opens an arm).
+    fn exit_col(l: &str) -> Option<usize> {
+        let ident = |c: char| c.is_alphanumeric() || c == '_';
+        let word = |w: &str| {
+            l.match_indices(w)
+                .find(|(i, _)| {
+                    !l.get(..*i)
+                        .and_then(|h| h.chars().next_back())
+                        .is_some_and(ident)
+                        && !l
+                            .get(i + w.len()..)
+                            .and_then(|t| t.chars().next())
+                            .is_some_and(ident)
+                })
+                .map(|(i, _)| i)
+        };
+        let trimmed = l.trim_start();
+        let tail_err = if trimmed.starts_with("Err(") && !l.contains("=>") {
+            Some(l.len() - trimmed.len())
+        } else {
+            l.find("=> Err(").map(|i| i + 3)
+        };
+        [
+            l.find('?'),
+            word("return"),
+            word("continue"),
+            word("break"),
+            l.find("bail!"),
+            l.find("ensure!"),
+            tail_err,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+    }
+
+    /// A tail-position `Err(..)` — an arm's or block's value — is an exit; the
+    /// `Err(e) =>` pattern that opens an arm is not.
+    #[test]
+    fn a_tail_position_err_is_an_exit_and_an_err_pattern_is_not() {
+        let lines: Vec<String> = [
+            "    let ctx = acquire();",
+            "        Err(e) => {",
+            "            Err(e)",
+            "        Err(j) => Err(format!(\"{j}\")),",
+            "        Err(_) => warn!(\"x\"),",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(early_exits(&code_lines(&lines), 0, 5), vec![2, 3]);
     }
 
     /// The window check catches what it must and nothing in strings: a
@@ -806,6 +879,50 @@ mod tests {
         );
         assert_eq!(found.len(), 1, "{found:?}");
         assert!(found[0].contains("Err(2)"), "{found:?}");
+    }
+
+    /// A tail-position refusal arm is held to its own removal: with the
+    /// removal the door is clean; delete it and the scan goes red.
+    #[test]
+    fn a_tail_refusal_arm_without_its_removal_goes_red() {
+        let with = "fn door() {\n    let ctx = acquire();\n    match spawn() {\n        Ok(c) => \
+                    {\n            // door-scan: keep(spawned) running\n            return Ok(c);\n        \
+                    }\n        Err(e) => {\n            remove_unspawned(ctx);\n            Err(e)\n        \
+                    }\n    }\n}\n";
+        assert!(exits_of(with).is_empty(), "{:?}", exits_of(with));
+        let without = with.replace("            remove_unspawned(ctx);\n", "");
+        let found = exits_of(&without);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].contains("Err(e)"), "{found:?}");
+    }
+
+    /// A door fn with no exit the scan can see is refused unless it says why.
+    #[test]
+    fn a_door_with_no_visible_exit_needs_a_no_exits_marker() {
+        let bare = "fn door() {\n    let ctx = acquire();\n    run(ctx);\n}\n";
+        assert!(
+            exits_of(bare).iter().any(|e| e.contains("NO exit")),
+            "{:?}",
+            exits_of(bare)
+        );
+        let declared = "fn door() {\n    // door-scan: no-exits(infallible) run cannot fail\n    \
+                        let ctx = acquire();\n    run(ctx);\n}\n";
+        assert!(exits_of(declared).is_empty(), "{:?}", exits_of(declared));
+    }
+
+    /// The removal's depth is taken AT its token: a one-line `if c {
+    /// remove_unspawned(ctx); }` closes before a later exit and covers nothing.
+    #[test]
+    fn a_one_line_block_removal_does_not_cover_a_later_exit() {
+        let found = exits_of(
+            "fn door() {\n    let ctx = acquire();\n    if c { remove_unspawned(ctx); }\n    \
+             return Err(2);\n}\n",
+        );
+        assert_eq!(found.len(), 1, "{found:?}");
+        let same_line = exits_of(
+            "fn door() {\n    let ctx = acquire();\n    if c { remove_unspawned(ctx); return Err(2); }\n}\n",
+        );
+        assert!(same_line.is_empty(), "{same_line:?}");
     }
 
     /// A removal in a closed SIBLING block does not cover an exit; one in an
@@ -1406,10 +1523,23 @@ mod tests {
             partition_disagreement(&raw.join("\n"), &production, |l| l.contains(&opener))
                 .map(|e| format!("{file}: {e}")),
         );
+        let exits = early_exits(&code, from, end + 1);
+        if exits.is_empty() && !(start..=end).any(|i| raw[i].contains("door-scan: no-exits(")) {
+            out.push(format!(
+                "{file}: `{name}` has NO exit after the allocation that the scan can see — a \
+                 door that can refuse always has one; if this one truly cannot, say so with \
+                 `// door-scan: no-exits(<reason>)`"
+            ));
+        }
         let mut since = from;
-        for e in early_exits(&code, from, end + 1) {
+        for e in exits {
+            let ce = exit_col(&code[e]).unwrap_or(0);
             let removed = (since..=e).any(|r| {
-                REMOVAL_TOKENS.iter().any(|t| code[r].contains(t)) && in_scope(&profile, r, e)
+                REMOVAL_TOKENS.iter().any(|t| {
+                    code[r].find(t).is_some_and(|cr| {
+                        (r, cr) < (e, ce) && in_scope(&code, &profile, (r, cr), (e, ce))
+                    })
+                })
             });
             let declared = match e.checked_sub(1).map(|a| keep_marker(&raw[a])) {
                 Some(Ok(true)) => true,

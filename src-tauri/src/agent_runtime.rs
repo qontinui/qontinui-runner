@@ -8179,7 +8179,7 @@ async fn run_continuation_terminal(
                     claude_bin = spawn_blocking_tracked(resolve_claude_bin)
                         .await
                         .unwrap_or_else(|_| claude_bin_path());
-                    // door-scan: keep(post-child) the context was taken back off the dead pane for the retry
+                    // door-scan: keep(retry) the context, taken back off the dead pane, carries into the next attempt
                     continue;
                 }
                 let reason = format!("never started ({attempt} attempts): {detail}");
@@ -9693,6 +9693,7 @@ async fn run_continuation_headless(
                 Err(e) => {
                     report_spawn_failed(agent_id, &format!("pump failure: {e}"), None, 0, None)
                         .await;
+                    // door-scan: keep(post-child) the child ran; its pump failed
                     Err(e)
                 }
             }
