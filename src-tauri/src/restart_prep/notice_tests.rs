@@ -992,7 +992,7 @@ impl HoldDoor for NoCoord {
     async fn release(&self, _: &str) -> ReleaseCall {
         panic!("a local hold is released without coord")
     }
-    async fn read_drain(&self) -> Result<DrainObservation, String> {
+    async fn read_drain(&self) -> crate::coord_drain_state::MeDrainRead {
         panic!("no read in this test")
     }
 }

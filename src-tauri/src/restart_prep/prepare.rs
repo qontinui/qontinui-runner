@@ -90,7 +90,7 @@ use super::{
     load_from, persist_to, record_path, rfc3339, running_build, HoldStatus, PrepState,
     PrepareRecord, ReleaseReport, ReleaseTrigger,
 };
-use crate::coord_drain_state::DrainObservation;
+use crate::coord_drain_state::{DrainObservation, MeDrainRead};
 
 /// Tauri event emitted on every prepare state change. Payload: [`PrepChanged`].
 pub const RESTART_PREP_CHANGED_EVENT: &str = "restart-prep-changed";
@@ -197,14 +197,14 @@ pub trait HoldDoor: Send + Sync {
     /// what the read means for the runner's own drain state is folded in by
     /// [`Self::publish_read`], which the controller calls once the record says
     /// what the read means for the cohort.
-    async fn read_drain(&self) -> Result<DrainObservation, String>;
+    async fn read_drain(&self) -> MeDrainRead;
     /// Fold a [`Self::read_drain`] answer into the runner's drain state, so the
     /// banner and the gate see it now rather than on the next heartbeat. The
     /// controller calls it AFTER recording what the read means: a release's
     /// read-back lifts the drain, and a lifted drain re-runs every deferred
     /// boot restore, so the record must already say `restoring` by then
     /// (otherwise the cohort's rows reach the auto-restore all at once).
-    fn publish_read(&self, _read: &Result<DrainObservation, String>) {}
+    fn publish_read(&self, _read: &MeDrainRead) {}
 }
 
 fn excerpt(body: &str) -> String {
@@ -272,22 +272,22 @@ pub fn parse_release_reply(status: u16, body: &str) -> ReleaseCall {
 
 /// PURE: whether a `me/drain` read confirms THIS prepare's hold. `Err` names
 /// why not.
-pub fn confirms_hold(
-    read: &Result<DrainObservation, String>,
-    prepare_id: &str,
-) -> Result<(), String> {
+pub fn confirms_hold(read: &MeDrainRead, prepare_id: &str) -> Result<(), String> {
     let marker = format!("{HOLD_REASON_PREFIX}{prepare_id}:");
     match read {
-        Ok(DrainObservation::Drained {
-            reason: Some(reason),
-            ..
-        }) if reason.starts_with(&marker) => Ok(()),
-        Ok(DrainObservation::Drained { reason, .. }) => Err(format!(
+        Ok((
+            DrainObservation::Drained {
+                reason: Some(reason),
+                ..
+            },
+            _,
+        )) if reason.starts_with(&marker) => Ok(()),
+        Ok((DrainObservation::Drained { reason, .. }, _)) => Err(format!(
             "read_back_not_this_hold: the device reads drained but its reason {:?} does not \
              name this prepare",
             reason.as_deref().unwrap_or("")
         )),
-        Ok(other) => Err(format!(
+        Ok((other, _)) => Err(format!(
             "read_back_not_drained: {}",
             observation_label(other)
         )),
@@ -307,9 +307,9 @@ fn observation_label(obs: &DrainObservation) -> String {
     }
 }
 
-fn read_back_label(read: &Result<DrainObservation, String>) -> String {
+fn read_back_label(read: &MeDrainRead) -> String {
     match read {
-        Ok(obs) => observation_label(obs),
+        Ok((obs, _)) => observation_label(obs),
         Err(e) => format!("unreadable: {e}"),
     }
 }
@@ -384,15 +384,10 @@ impl HoldDoor for LiveDoor {
         }
     }
 
-    async fn read_drain(&self) -> Result<DrainObservation, String> {
+    async fn read_drain(&self) -> MeDrainRead {
         let read = match crate::coord_drain_state::enrollment() {
-            // The dispatch role the read also carries is not this read's to
-            // fold: `fold_me_drain_read` keeps the cached role, and the next
-            // heartbeat read updates it.
             crate::coord_drain_state::Enrollment::Enrolled(base) => {
-                crate::coord_drain_state::read_me_drain(&base)
-                    .await
-                    .map(|(obs, _role)| obs)
+                crate::coord_drain_state::read_me_drain(&base).await
             }
             crate::coord_drain_state::Enrollment::NotEnrolled(why) => {
                 Err(format!("not a coord device: {why}"))
@@ -402,7 +397,7 @@ impl HoldDoor for LiveDoor {
         read
     }
 
-    fn publish_read(&self, read: &Result<DrainObservation, String>) {
+    fn publish_read(&self, read: &MeDrainRead) {
         // A fresh read is a fresh read: the banner and the gate see the hold
         // (or its release) now, not on the next heartbeat.
         crate::coord_drain_state::fold_me_drain_read(read);
@@ -509,7 +504,7 @@ fn expired_release(
     restarted: bool,
     now_ms: i64,
     outcome: &str,
-    read: Option<&Result<DrainObservation, String>>,
+    read: Option<&MeDrainRead>,
 ) -> Option<String> {
     let coord_still_holds = read.is_some_and(|r| confirms_hold(r, &rec.prepare_id).is_ok());
     (restarted && rec.hold_expired(now_ms) && !coord_still_holds).then(|| {
@@ -1016,7 +1011,7 @@ impl RestartPrep {
         trigger: ReleaseTrigger,
         now_ms: i64,
         build: &str,
-    ) -> (ReleaseReport, Option<Result<DrainObservation, String>>) {
+    ) -> (ReleaseReport, Option<MeDrainRead>) {
         let (outcome, read) = match &rec.hold {
             HoldStatus::Local | HoldStatus::LocalSecondary => ("local".to_string(), None),
             HoldStatus::ReleaseSent { outcome } => (format!("already released: {outcome}"), None),
@@ -1949,10 +1944,11 @@ mod tests {
                 outcome: "released".to_string(),
             }
         }
-        async fn read_drain(&self) -> Result<DrainObservation, String> {
-            self.drain.lock().unwrap().clone()
+        async fn read_drain(&self) -> MeDrainRead {
+            // The mock serves no dispatch role.
+            self.drain.lock().unwrap().clone().map(|obs| (obs, None))
         }
-        fn publish_read(&self, read: &Result<DrainObservation, String>) {
+        fn publish_read(&self, read: &MeDrainRead) {
             let state = self
                 .record_at
                 .lock()
@@ -2151,17 +2147,23 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
-        let near = Ok(DrainObservation::Drained {
-            until: None,
-            reason: Some(format!("{HOLD_REASON_PREFIX}{}1: x", rec.prepare_id)),
-        });
+        let near: MeDrainRead = Ok((
+            DrainObservation::Drained {
+                until: None,
+                reason: Some(format!("{HOLD_REASON_PREFIX}{}1: x", rec.prepare_id)),
+            },
+            None,
+        ));
         assert!(confirms_hold(&near, &rec.prepare_id).is_err());
-        let exact = Ok(DrainObservation::Drained {
-            until: None,
-            reason: Some(format!("{HOLD_REASON_PREFIX}{}: x", rec.prepare_id)),
-        });
+        let exact: MeDrainRead = Ok((
+            DrainObservation::Drained {
+                until: None,
+                reason: Some(format!("{HOLD_REASON_PREFIX}{}: x", rec.prepare_id)),
+            },
+            None,
+        ));
         assert!(confirms_hold(&exact, &rec.prepare_id).is_ok());
-        assert!(confirms_hold(&Ok(DrainObservation::Clear), &rec.prepare_id).is_err());
+        assert!(confirms_hold(&Ok((DrainObservation::Clear, None)), &rec.prepare_id).is_err());
     }
 
     #[tokio::test]

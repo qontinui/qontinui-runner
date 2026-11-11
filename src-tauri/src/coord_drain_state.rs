@@ -1370,14 +1370,21 @@ pub fn nudge_waiters() {
     emit_snapshot();
 }
 
+/// One `GET /coord/devices/me/drain` read: the drain observation and the
+/// dispatch role the same answer served.
+pub type MeDrainRead = Result<(DrainObservation, Option<DispatchRole>), String>;
+
 /// Fold a `GET /coord/devices/me/drain` read another module made (the restart
 /// prepare's hold read-back) into the cached state, exactly as the heartbeat
-/// folds its own: a fresh read is a fresh read, whoever asked.
-pub fn fold_me_drain_read(read: &Result<DrainObservation, String>) {
+/// folds its own: a fresh read is a fresh read, whoever asked — state AND
+/// dispatch role together ([`role_update_for`]), so a fresh `Clear` is never
+/// folded beside a role an earlier read left behind.
+pub fn fold_me_drain_read(read: &MeDrainRead) {
     match read {
-        Ok(obs) => {
+        Ok((obs, role)) => {
+            let update = role_update_for(obs, *role);
             let obs = obs.clone();
-            fold(|tr, now| tr.observe(obs, now));
+            fold_with_role(update, |tr, now| tr.observe(obs, now));
         }
         Err(e) => {
             debug!("coord_drain_state: an out-of-band me/drain read failed ({e}); not folded")
@@ -3139,6 +3146,26 @@ mod tests {
         for o in SpawnOrigin::ALL {
             assert_eq!(drain_gate(o), DrainGate::Allow, "{o:?}");
         }
+        reset_global_role().await;
+    }
+
+    /// The restart prepare's out-of-band read-back (`fold_me_drain_read`)
+    /// folds the role its answer served together with the state: a boot whose
+    /// own read failed (state `Unknown`, no role cached) and whose release
+    /// read-back says `clear` on a `ci_node` box must still defer every
+    /// autonomous spawn, never fold a fresh `clear` beside the stale `None`.
+    #[tokio::test]
+    async fn an_out_of_band_read_back_folds_its_role_with_its_state() {
+        let _g = ROLE_TEST_LOCK.lock().await;
+        reset_global_role().await;
+        note_heartbeat_failure("boot read failed");
+        assert_eq!(current_dispatch_role(), None);
+        fold_me_drain_read(&Ok((DrainObservation::Clear, Some(DispatchRole::CiNode))));
+        assert_eq!(current_dispatch_role(), Some(DispatchRole::CiNode));
+        assert_every_autonomous_origin_is_role_deferred();
+        // A failed out-of-band read folds nothing and keeps the role.
+        fold_me_drain_read(&Err("timeout".to_string()));
+        assert_eq!(current_dispatch_role(), Some(DispatchRole::CiNode));
         reset_global_role().await;
     }
 }
