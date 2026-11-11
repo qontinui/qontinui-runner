@@ -5230,9 +5230,11 @@ fn spawn_skill_parity_pass_if_due() {
             }
             None => {
                 report_skill_parity_unreached(
-                    "the workspace root did not resolve, so neither tree could be \
-                     located — set QONTINUI_ROOT or the runner's paths.workspace_root"
-                        .to_string(),
+                    format!(
+                        "the workspace root did not resolve, so neither tree could be \
+                         located — set the \"{}\" setting to the folder that holds them",
+                        qontinui_types::paths::WORKSPACE_ROOT_SETTING
+                    ),
                     None,
                 );
                 None

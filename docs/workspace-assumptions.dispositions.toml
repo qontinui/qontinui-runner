@@ -45,7 +45,9 @@
 # standalone `env apply` cannot read the "Workspace root" setting, so
 # $QONTINUI_ROOT is the true next action there. Whether `env apply` is a
 # dev-only surface is a disposition call this change does not make. Net -6.
-# 227 -> 219 (plan 2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists
+# 221 -> 212, applied on top of the 227 -> 221 above (qontinui-runner#2776,
+# rebased onto it as the second lander; ceiling read off the regenerated
+# roster, not summed from the two PRs' deltas). #2776 alone was 227 -> 219 (plan 2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists
 # Phase B3, the runner half): eight unreviewed rows are gone with the refusal
 # and log text that now renders the shared workspace-root sentence or names
 # the Workspace root setting (continuation_fallback_workdir,
@@ -55,8 +57,11 @@
 # (session_workspace_root's canary label, overlay_absent_statement's sibling
 # name, the no-root arm moving back to provision_agent_definitions) are
 # reviewed below. provision_agent_definitions_with_root, named in the line
-# above, is gone. A fall, held.
-unreviewed_ceiling = 221
+# above, is gone. The rebase also converts fleet.rs
+# spawn_skill_parity_pass_if_due's no-root report ("set QONTINUI_ROOT or the
+# runner's paths.workspace_root") to name the Workspace root setting, so the
+# runner_text_never_says_set_qontinui_root guard can hold. A fall, held.
+unreviewed_ceiling = 212
 
 # First triage pass (plan 2026-09-20-published-runner-parity-count-comes-from-a-run-not-from-reports Phase 4):
 # every supervisor_dependency, tenant_literal and machine_path key. The
