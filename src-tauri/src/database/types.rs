@@ -197,7 +197,7 @@ pub struct TaskRun {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary_generated_at: Option<String>,
 
-    /// JSON array of StateTransition objects from orchestrator (for stage-based recap)
+    /// JSON array of StageTransition objects (for stage-based recap)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transition_history_json: Option<String>,
 
@@ -1170,14 +1170,6 @@ pub struct StoredVerificationPlan {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub previous_version_id: Option<String>,
     pub created_at: String,
-}
-
-impl StoredVerificationPlan {
-    /// Parse the plan_json into a VerificationPlan struct.
-    pub fn parse_plan(&self) -> Result<crate::orchestrator::VerificationPlan, String> {
-        serde_json::from_str(&self.plan_json)
-            .map_err(|e| format!("Failed to parse verification plan: {}", e))
-    }
 }
 
 /// Stored task knowledge entry from the database.

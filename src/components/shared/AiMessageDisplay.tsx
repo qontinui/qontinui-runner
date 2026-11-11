@@ -46,7 +46,8 @@ export type { AiMessageEntry, MessageGroup, IncrementalSourceGrouper } from "./m
 // ============================================================================
 // Orchestrator Source Constants
 // ============================================================================
-// These match the source identifiers defined in orchestrator/output.rs
+// These match the source identifiers of the runner's former
+// orchestrator/output.rs emitters, deleted because none had a caller.
 
 /** Source identifier for Planning Agent output */
 export const SOURCE_PLANNING = "planning_agent";

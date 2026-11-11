@@ -2,115 +2,31 @@
 //!
 //! The wire-format DTOs (`VerificationPlan`, `SuccessCriterion`,
 //! `CriterionType`, `VerificationMethod`, `WorkerSignal`, `Finding`,
-//! `IterationVerificationResults`, `CriterionOverride`, `OverrideCollection`,
-//! `TaskCompletionResult`, `StageTransition`, and all the multi-worker
-//! support types) live in `qontinui_types::verification`; this module
-//! re-exports them so the rest of the runner can continue to
-//! `use crate::orchestrator::types::*` without change.
+//! `CriterionOverride`, `OverrideCollection`, `StageTransition`, and the
+//! multi-worker support types) live in `qontinui_types::verification`; this
+//! module re-exports the ones the runner uses, so the rest of the runner can
+//! `use crate::orchestrator::types::*`. The list is explicit: the verification
+//! result DTOs (`VerificationResult`, `DomainVerificationResult`,
+//! `IterationVerificationResults`, `TaskCompletionResult`) were filled only by
+//! the deleted orchestrator verifier and are not re-exported.
 //!
 //! Runner-side behavior (constructors that stamp timestamps / generate UUIDs,
-//! parsers that extract signals from AI output text, override-application
-//! logic, feedback-string builders, domain-assignment helpers) stays here.
-//! Because of Rust's orphan rule we can't define inherent `impl` blocks on
-//! types defined in another crate, so the methods are exposed through
-//! extension traits (`VerificationPlanExt`, `DomainAssignmentExt`,
-//! `WorkerInstanceExt`, `WorkerSignalExt`, `IterationVerificationResultsExt`,
-//! `CriterionOverrideExt`, `OverrideCollectionExt`). The traits are re-exported
-//! along with the DTOs so callers can keep using
-//! `plan.has_ai_criteria()`, `CriterionOverride::new(...)`, etc. verbatim as
-//! long as this module's contents are brought into scope.
+//! parsers that extract signals from AI output text, domain-assignment
+//! helpers) stays here. Because of Rust's orphan rule we can't define inherent
+//! `impl` blocks on types defined in another crate, so the methods are
+//! exposed through extension traits (`DomainAssignmentExt`,
+//! `WorkerInstanceExt`, `WorkerSignalExt`, `CriterionOverrideExt`,
+//! `OverrideCollectionExt`). The traits are re-exported along with the DTOs so
+//! callers can keep using `CriterionOverride::new(...)`, etc. verbatim as long
+//! as this module's contents are brought into scope.
 
 #![allow(dead_code)]
 
-pub use qontinui_types::verification::*;
-
-// ============================================================================
-// VerificationPlan behavior (extension trait)
-// ============================================================================
-
-/// Runner-side behavior for [`VerificationPlan`].
-pub trait VerificationPlanExt {
-    /// Check if this plan has any AI-evaluated criteria.
-    fn has_ai_criteria(&self) -> bool;
-    /// Get all deterministic criteria.
-    fn deterministic_criteria(&self) -> Vec<&SuccessCriterion>;
-    /// Get all AI-evaluated criteria.
-    fn ai_criteria(&self) -> Vec<&SuccessCriterion>;
-    /// Get all criteria for a specific domain.
-    fn criteria_for_domain(&self, domain_id: &str) -> Vec<&SuccessCriterion>;
-    /// Get deterministic criteria for a specific domain.
-    fn deterministic_criteria_for_domain(&self, domain_id: &str) -> Vec<&SuccessCriterion>;
-    /// Get AI criteria for a specific domain.
-    fn ai_criteria_for_domain(&self, domain_id: &str) -> Vec<&SuccessCriterion>;
-    /// Get all unique domains in this plan.
-    fn get_domains(&self) -> Vec<String>;
-    /// Check if this plan has multiple domains.
-    fn is_multi_domain(&self) -> bool;
-}
-
-impl VerificationPlanExt for VerificationPlan {
-    fn has_ai_criteria(&self) -> bool {
-        self.success_criteria
-            .iter()
-            .any(|c| c.criterion_type == CriterionType::AiEvaluated)
-    }
-
-    fn deterministic_criteria(&self) -> Vec<&SuccessCriterion> {
-        self.success_criteria
-            .iter()
-            .filter(|c| c.criterion_type == CriterionType::Deterministic)
-            .collect()
-    }
-
-    fn ai_criteria(&self) -> Vec<&SuccessCriterion> {
-        self.success_criteria
-            .iter()
-            .filter(|c| c.criterion_type == CriterionType::AiEvaluated)
-            .collect()
-    }
-
-    fn criteria_for_domain(&self, domain_id: &str) -> Vec<&SuccessCriterion> {
-        self.success_criteria
-            .iter()
-            .filter(|c| c.domain.as_deref() == Some(domain_id))
-            .collect()
-    }
-
-    fn deterministic_criteria_for_domain(&self, domain_id: &str) -> Vec<&SuccessCriterion> {
-        self.success_criteria
-            .iter()
-            .filter(|c| {
-                c.criterion_type == CriterionType::Deterministic
-                    && c.domain.as_deref() == Some(domain_id)
-            })
-            .collect()
-    }
-
-    fn ai_criteria_for_domain(&self, domain_id: &str) -> Vec<&SuccessCriterion> {
-        self.success_criteria
-            .iter()
-            .filter(|c| {
-                c.criterion_type == CriterionType::AiEvaluated
-                    && c.domain.as_deref() == Some(domain_id)
-            })
-            .collect()
-    }
-
-    fn get_domains(&self) -> Vec<String> {
-        let mut domains: Vec<String> = self
-            .success_criteria
-            .iter()
-            .filter_map(|c| c.domain.clone())
-            .collect();
-        domains.sort();
-        domains.dedup();
-        domains
-    }
-
-    fn is_multi_domain(&self) -> bool {
-        self.get_domains().len() > 1
-    }
-}
+pub use qontinui_types::verification::{
+    Confidence, CriterionOverride, CriterionType, DomainAssignment, Finding, OverrideCollection,
+    StageTransition, SuccessCriterion, VerificationMethod, VerificationPlan, WorkerDomain,
+    WorkerInstance, WorkerSignal, WorkerStatus,
+};
 
 // ============================================================================
 // DomainAssignment behavior (extension trait)
@@ -348,181 +264,6 @@ impl WorkerSignalExt for WorkerSignal {
 }
 
 // ============================================================================
-// IterationVerificationResults behavior (extension trait)
-// ============================================================================
-
-/// Runner-side behavior for [`IterationVerificationResults`].
-pub trait IterationVerificationResultsExt: Sized {
-    /// Create results indicating all verification passed.
-    fn all_passed(iteration: u32) -> Self;
-    /// Apply overrides to the verification results.
-    fn apply_overrides(&mut self, overrides: &OverrideCollection);
-    /// Check if a specific criterion was overridden.
-    fn is_overridden(&self, criterion_id: &str) -> bool;
-    /// Get the override justification for a criterion.
-    fn get_override_justification(&self, criterion_id: &str) -> Option<String>;
-    /// Build a feedback string for failed verification.
-    fn build_feedback(&self) -> String;
-}
-
-impl IterationVerificationResultsExt for IterationVerificationResults {
-    fn all_passed(iteration: u32) -> Self {
-        Self {
-            iteration,
-            deterministic_results: vec![],
-            ai_results: vec![],
-            deterministic_passed: true,
-            ai_passed: true,
-            all_passed: true,
-            failure_summary: None,
-            applied_overrides: vec![],
-            overridden_criteria: vec![],
-        }
-    }
-
-    fn apply_overrides(&mut self, overrides: &OverrideCollection) {
-        let mut newly_overridden = Vec::new();
-
-        // Check deterministic results
-        for result in &self.deterministic_results {
-            if !result.passed && overrides.has_override(&result.criterion_id) {
-                newly_overridden.push(result.criterion_id.clone());
-                // Store the override details
-                for override_ in overrides.get_overrides(&result.criterion_id) {
-                    self.applied_overrides.push(override_.clone());
-                }
-            }
-        }
-
-        // Check AI results
-        for result in &self.ai_results {
-            if !result.passed && overrides.has_override(&result.criterion_id) {
-                newly_overridden.push(result.criterion_id.clone());
-                for override_ in overrides.get_overrides(&result.criterion_id) {
-                    self.applied_overrides.push(override_.clone());
-                }
-            }
-        }
-
-        self.overridden_criteria = newly_overridden;
-
-        // Recalculate pass status considering overrides
-        recalculate_pass_status(self);
-    }
-
-    fn is_overridden(&self, criterion_id: &str) -> bool {
-        self.overridden_criteria.contains(&criterion_id.to_string())
-    }
-
-    fn get_override_justification(&self, criterion_id: &str) -> Option<String> {
-        self.applied_overrides
-            .iter()
-            .filter(|o| o.criterion_id == criterion_id)
-            .map(|o| format!("{}: {}", o.item, o.justification))
-            .collect::<Vec<_>>()
-            .first()
-            .cloned()
-    }
-
-    fn build_feedback(&self) -> String {
-        let mut feedback = String::new();
-
-        // Show overridden criteria first (if any)
-        if !self.overridden_criteria.is_empty() {
-            feedback.push_str("## Criteria Accepted via Override\n\n");
-            for override_ in &self.applied_overrides {
-                feedback.push_str(&format!(
-                    "### ✓ {} (Override)\n- **Item:** {}\n- **Justification:** {}\n\n",
-                    override_.criterion_id, override_.item, override_.justification
-                ));
-            }
-        }
-
-        if !self.deterministic_passed {
-            feedback.push_str("## Deterministic Verification Failed\n\n");
-            for result in &self.deterministic_results {
-                if !result.passed && !self.is_overridden(&result.criterion_id) {
-                    feedback.push_str(&format!("### ❌ {}\n", result.criterion_id));
-                    for issue in &result.issues {
-                        feedback.push_str(&format!("- {}\n", issue));
-                    }
-                    if let Some(output) = &result.raw_output {
-                        feedback.push_str(&format!("\n```\n{}\n```\n\n", output));
-                    }
-                }
-            }
-        }
-
-        if !self.ai_passed {
-            feedback.push_str("## AI Verification Failed\n\n");
-            for result in &self.ai_results {
-                if !result.passed && !self.is_overridden(&result.criterion_id) {
-                    feedback.push_str(&format!("### ❌ {}\n", result.criterion_id));
-                    feedback.push_str("**Observations:**\n");
-                    for obs in &result.observations {
-                        feedback.push_str(&format!("- {}\n", obs));
-                    }
-                    feedback.push_str("\n**Issues:**\n");
-                    for issue in &result.issues {
-                        feedback.push_str(&format!("- {}\n", issue));
-                    }
-                    if !result.suggestions.is_empty() {
-                        feedback.push_str("\n**Suggestions:**\n");
-                        for sug in &result.suggestions {
-                            feedback.push_str(&format!("- {}\n", sug));
-                        }
-                    }
-                    feedback.push('\n');
-                }
-            }
-        }
-
-        feedback
-    }
-}
-
-/// Recalculate pass/fail status considering overrides.
-///
-/// Previously a private method on `IterationVerificationResults`; extracted
-/// to a free function because `IterationVerificationResultsExt` is a public
-/// trait and we don't want to expose this implementation detail in its
-/// public surface.
-fn recalculate_pass_status(results: &mut IterationVerificationResults) {
-    // Deterministic: passed if all passed OR all failures are overridden
-    results.deterministic_passed = results
-        .deterministic_results
-        .iter()
-        .all(|r| r.passed || results.overridden_criteria.contains(&r.criterion_id));
-
-    // AI: passed if all passed OR all failures are overridden
-    results.ai_passed = results
-        .ai_results
-        .iter()
-        .all(|r| r.passed || results.overridden_criteria.contains(&r.criterion_id));
-
-    results.all_passed = results.deterministic_passed && results.ai_passed;
-
-    // Update failure summary if we now pass due to overrides
-    if results.all_passed && !results.overridden_criteria.is_empty() {
-        let override_note = format!(
-            "\n\n**Note:** {} criteria passed via override:\n{}",
-            results.overridden_criteria.len(),
-            results
-                .applied_overrides
-                .iter()
-                .map(|o| format!("- {}: {} ({})", o.criterion_id, o.item, o.justification))
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
-        if let Some(ref mut summary) = results.failure_summary {
-            summary.push_str(&override_note);
-        } else {
-            results.failure_summary = Some(override_note);
-        }
-    }
-}
-
-// ============================================================================
 // CriterionOverride behavior (extension trait)
 // ============================================================================
 
@@ -704,5 +445,33 @@ impl OverrideCollectionExt for OverrideCollection {
         ids.sort();
         ids.dedup();
         ids
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_worker_signal_parsing() {
+        // Test WORK_COMPLETE
+        let output = "I've fixed the bug. [WORK_COMPLETE] The validation now works.";
+        let signal = WorkerSignal::parse_from_output(output);
+        assert!(matches!(signal, Some(WorkerSignal::WorkComplete { .. })));
+
+        // Test NEED_REPLAN
+        let output = "[NEED_REPLAN] The issue is in a different service.";
+        let signal = WorkerSignal::parse_from_output(output);
+        assert!(matches!(signal, Some(WorkerSignal::NeedReplan { .. })));
+
+        // Test FINDING
+        let output = "[FINDING:bug] The login function doesn't validate email format";
+        let signal = WorkerSignal::parse_from_output(output);
+        assert!(matches!(signal, Some(WorkerSignal::Finding(_))));
+
+        // Test no signal
+        let output = "I'm still working on the problem...";
+        let signal = WorkerSignal::parse_from_output(output);
+        assert!(signal.is_none());
     }
 }
