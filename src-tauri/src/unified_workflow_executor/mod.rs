@@ -66,6 +66,11 @@ pub mod compensation;
 pub mod conditional_routing;
 pub mod convergence;
 pub mod deferred_feedback;
+mod evaluate_verification;
+// The output log's summary line and its verdict words, for the parser's tests
+// in `mcp/task_run_structured_output.rs`; the module itself stays private.
+#[cfg(test)]
+pub(crate) use evaluate_verification::{every_verdict_label, verification_summary_line};
 mod health_monitor;
 mod loop_controller;
 mod loop_handlers;

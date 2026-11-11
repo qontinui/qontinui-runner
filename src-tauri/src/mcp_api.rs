@@ -6283,6 +6283,16 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_snooze_gate",
     "coord_spawn_continuation",
     "coord_submit_escalate_evidence",
+    // Plan 2026-11-08-subprojects-group-sessions-gates-and-plans-and-say-why-one-stalled
+    // Phase 4b: the subproject read and its two member-session writes (title /
+    // goal / next_steps_note; attach a unit or split). coord grants them on its
+    // device floor from the plan's Phases 3-4 (qontinui-coord, not on main when
+    // this landed — until then a call gets coord's unknown-tool refusal); both
+    // writes resolve the caller from the verified X-Coord-Caller-Session this
+    // proxy injects, and require membership.
+    "coord_subproject_attach",
+    "coord_subproject_get",
+    "coord_subproject_update",
     "coord_symbol_lookup",
     // Plan 2026-10-17-per-repo-tenant-binding-… Phase 6: the read twin of
     // GET /coord/repos/tenants (which tenant governs a repo), previously absent.
@@ -18451,6 +18461,46 @@ mod coord_mcp_body_gate_tests {
             assert!(
                 !coord_mcp_withholding_is_deliberate(tool),
                 "{tool} must not also be a deliberate exclusion"
+            );
+            assert_eq!(
+                parsed.allowed.iter().filter(|t| t.as_str() == tool).count(),
+                1,
+                "the parser must read {tool} exactly once: {:?}",
+                parsed.allowed
+            );
+        }
+        assert_eq!(parsed.allowed.len(), COORD_MCP_ALLOWED_TOOLS.len());
+    }
+
+    /// The subproject tools (plan
+    /// `2026-11-08-subprojects-group-sessions-gates-and-plans-and-say-why-one-stalled`
+    /// Phase 4b) must forward: without them `coord_subproject_update` — the
+    /// door the plan's Phase 7 has `/unattended` and `/finish-session` write a
+    /// session's `next_steps_note` through — is uncallable from every
+    /// runner-hosted session, and `tools/list` hides all three. The source-text parser the
+    /// drift verdict runs must read each back exactly once.
+    #[test]
+    fn subproject_tools_are_allowed_and_parse_from_source() {
+        let parsed = crate::build_drift::parse_tool_policy_consts(include_str!("mcp_api.rs"))
+            .expect("mcp_api.rs parses");
+        for tool in [
+            "coord_subproject_get",
+            "coord_subproject_update",
+            "coord_subproject_attach",
+        ] {
+            assert!(
+                COORD_MCP_ALLOWED_TOOLS.binary_search(&tool).is_ok(),
+                "{tool} must be on the list itself, not reached by a prefix"
+            );
+            assert!(coord_mcp_tool_is_allowed(tool), "{tool} must forward");
+            assert!(!coord_mcp_withholding_is_deliberate(tool));
+            assert!(
+                gate(serde_json::json!({
+                    "jsonrpc":"2.0","id":1,"method":"tools/call",
+                    "params":{"name":tool,"arguments":{}}
+                }))
+                .is_ok(),
+                "{tool} must be callable through the proxy"
             );
             assert_eq!(
                 parsed.allowed.iter().filter(|t| t.as_str() == tool).count(),

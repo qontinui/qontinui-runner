@@ -78,6 +78,11 @@ mod claude_session;
 mod click_overlay;
 mod commands;
 mod comparison;
+// The secrets a condition-check frame carries: held per session, typed only
+// by the SDK `type` action, scrubbed from every `/ui-bridge/sdk/*` response
+// (plan 2026-11-06-a-regression-test-run-is-judged-by-what-it-covered-and-a-silent-run-reads-unknown,
+// Phase 13). Its own module so `agent_runtime` gains only the calls.
+mod condition_secrets;
 mod config;
 mod config_facade;
 /// In-app layered configuration report. The driver + formatter live in the lib
@@ -2743,7 +2748,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         // AppManifest is defined (`tauri-2.10.3/src/webview/mod.rs:1801-1806`).
         //
         // `ui_bridge_plugin` remains the one exception — its handler fns are
-        // non-`pub` and the frontend talks to them only via HTTP, not IPC.
+        // non-`pub`, so it stays a Tauri plugin, and the frontend reaches its
+        // artifact commands over IPC (`plugin:ui-bridge|save_artifact` and its
+        // siblings, through `@qontinui/ui-bridge`'s `IpcArtifactStore`).
         //
         // The remaining per-module `plugin()` fns are dead code; each is
         // deleted as its module moves onto `ipc_group!`.

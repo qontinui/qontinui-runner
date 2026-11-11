@@ -12,12 +12,11 @@ use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
 use crate::config_storage::ConfigStorage;
-use crate::database::pg::PgDb;
 use crate::step_executor::{ExecutionStepConfig, StepExecutor};
 use crate::AppState;
 
 use super::compensation::{CompensationAction, CompensationType};
-use super::types::{DurableStepResult, WorkflowInput, WorkflowOutput};
+use super::types::DurableStepResult;
 
 /// Re-export the shared PhaseResult so Restate consumers keep using
 /// `super::durable_executor::PhaseResult`.
@@ -29,6 +28,79 @@ pub use crate::unified_workflow_executor::types::PhaseResult;
 fn parse_batch_steps(steps_json: &str) -> Result<Vec<ExecutionStepConfig>, String> {
     crate::unified_workflow_executor::step_conversion::parse_steps_json(steps_json)
         .map_err(|e| format!("Step deserialization failed: {e}"))
+}
+
+/// The result of a batch with no step to execute.
+///
+/// A setup or completion phase with nothing to do has succeeded: no step
+/// failed. A VERIFICATION phase with nothing to run checked nothing, so it is
+/// not `all_passed`. The phase still ran (`success`), and the durable loop ends
+/// it `NoVerificationSteps` (`durable_verification_verdict`).
+fn empty_batch_result(phase_name: &str, iteration: Option<u32>) -> PhaseResult {
+    PhaseResult {
+        phase: phase_name.to_string(),
+        iteration,
+        stage_index: None,
+        success: true,
+        all_passed: phase_name != "verification",
+        step_results: vec![],
+        failure_context: None,
+        duration_ms: 0,
+        variables_set: Some(vec![]),
+        commit_hash: None,
+    }
+}
+
+/// How many of a verification batch's steps count toward the verdict, by
+/// `ExecutionStepConfig::counts_toward_verdict`: required (`required` absent
+/// counts as required) and checking something (not a `gate`, not a prompt with
+/// no content). It is the one rule the unified loop's verification phase stamps
+/// on its step results. This batch folds its own results and stamps nothing,
+/// so it applies the rule to the configs.
+fn required_verification_steps(steps: &[ExecutionStepConfig]) -> usize {
+    steps.iter().filter(|s| s.counts_toward_verdict()).count()
+}
+
+/// Whether a durable workflow's verification batch checks nothing: no step
+/// counts toward the verdict (an empty list included). That is a property of
+/// the workflow's input, so the durable loop reads it once, before the loop and
+/// outside any journalled side effect, and replay sees the same answer.
+///
+/// A batch that does not parse is NOT "nothing to check". It fails as a
+/// batch, naming the step (`parse_batch_steps`), and takes the failure path.
+pub(crate) fn verification_batch_checks_nothing(steps_json: &str) -> bool {
+    matches!(
+        parse_batch_steps(steps_json),
+        Ok(ref steps) if required_verification_steps(steps) == 0
+    )
+}
+
+/// What the durable loop does with one verification batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DurableVerificationVerdict {
+    /// Every required step passed: run completion.
+    Passed,
+    /// No required step: nothing was checked. End the run, not passed, with no
+    /// agentic iteration, because no fix can add a check.
+    NoVerificationSteps,
+    /// A required step failed: run the agentic phase and verify again.
+    Failed,
+}
+
+/// The durable loop's verdict on one verification batch. "Nothing checked" is
+/// tested first. A batch that reports `all_passed` over no required step was a
+/// pass from nothing.
+pub(crate) fn durable_verification_verdict(
+    checks_nothing: bool,
+    all_passed: bool,
+) -> DurableVerificationVerdict {
+    if checks_nothing {
+        DurableVerificationVerdict::NoVerificationSteps
+    } else if all_passed {
+        DurableVerificationVerdict::Passed
+    } else {
+        DurableVerificationVerdict::Failed
+    }
 }
 
 /// Executes a batch of steps, returning a serializable `PhaseResult`.
@@ -78,18 +150,7 @@ pub async fn execute_steps_batch(
 
     if steps.is_empty() {
         debug!("No {} steps to execute for {}", phase_name, execution_id);
-        return PhaseResult {
-            phase: phase_name.to_string(),
-            iteration,
-            stage_index: None,
-            success: true,
-            all_passed: true,
-            step_results: vec![],
-            failure_context: None,
-            duration_ms: 0,
-            variables_set: Some(vec![]),
-            commit_hash: None,
-        };
+        return empty_batch_result(phase_name, iteration);
     }
 
     // Create a step executor
@@ -171,6 +232,12 @@ pub async fn execute_steps_batch(
         }
     }
 
+    // A verification batch with no required step checked nothing, so it is
+    // not `all_passed` however its informational steps went.
+    if phase_name == "verification" && required_verification_steps(&steps) == 0 {
+        all_passed = false;
+    }
+
     // Get current git commit hash for compensation tracking
     let commit_hash = get_current_commit_hash().await;
 
@@ -196,309 +263,6 @@ pub async fn execute_steps_batch(
         duration_ms,
         variables_set: Some(variables_set),
         commit_hash,
-    }
-}
-
-/// Legacy monolithic workflow executor (retained for fallback/testing).
-///
-/// Prefer the phase-level journaled execution in `service.rs::run()` which
-/// wraps each phase in a separate `ctx.run()` for crash recovery.
-#[allow(dead_code)]
-async fn execute_workflow_monolithic(
-    app_state: &Arc<AppState>,
-    config_storage: &Arc<tokio::sync::Mutex<ConfigStorage>>,
-    input: &WorkflowInput,
-    execution_id: &str,
-    pg_db: &Arc<PgDb>,
-) -> WorkflowOutput {
-    let start = std::time::Instant::now();
-    let mut iterations_run = 0u32;
-    let mut verification_passed = false;
-    let mut critical_failure = false;
-    let mut was_stopped = false;
-    let mut files_modified = Vec::new();
-    let mut error_msg = None;
-
-    // Deserialize loop config
-    let loop_config: serde_json::Value = match serde_json::from_str(&input.loop_config_json) {
-        Ok(c) => c,
-        Err(e) => {
-            return WorkflowOutput {
-                success: false,
-                verification_passed: false,
-                iterations_run: 0,
-                critical_failure: true,
-                was_stopped: false,
-                duration_ms: 0,
-                files_modified: vec![],
-                error: Some(format!("Failed to deserialize loop config: {}", e)),
-            };
-        }
-    };
-
-    let max_iterations = loop_config
-        .get("max_iterations")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(5) as u32;
-
-    let workflow_name = loop_config
-        .get("workflow_name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown")
-        .to_string();
-
-    info!(
-        "Starting durable workflow execution: {} (id={}, max_iterations={})",
-        workflow_name, execution_id, max_iterations
-    );
-
-    // Update task run status
-    if let Err(e) = pg_db.update_task_run_status(execution_id, "running").await {
-        warn!("Failed to update task run status: {}", e);
-    }
-
-    // =========================================================================
-    // PHASE 1: SETUP
-    // =========================================================================
-    info!("Phase 1/4: Setup — execution_id={}", execution_id);
-
-    // Setup automation steps
-    let setup_result = execute_steps_batch(
-        app_state,
-        config_storage,
-        &input.setup_automation_steps_json,
-        "setup",
-        None,
-        execution_id,
-        None,
-    )
-    .await;
-
-    if !setup_result.success {
-        error!("Setup phase failed: {:?}", setup_result.failure_context);
-        return WorkflowOutput {
-            success: false,
-            verification_passed: false,
-            iterations_run: 0,
-            critical_failure: true,
-            was_stopped: false,
-            duration_ms: start.elapsed().as_millis() as u64,
-            files_modified: vec![],
-            error: setup_result.failure_context,
-        };
-    }
-
-    // Setup prompt steps (AI prompts that run after automation setup)
-    let setup_prompt_result = execute_steps_batch(
-        app_state,
-        config_storage,
-        &input.setup_prompt_steps_json,
-        "setup_prompt",
-        None,
-        execution_id,
-        None,
-    )
-    .await;
-
-    if !setup_prompt_result.success {
-        error!(
-            "Setup prompt phase failed: {:?}",
-            setup_prompt_result.failure_context
-        );
-        return WorkflowOutput {
-            success: false,
-            verification_passed: false,
-            iterations_run: 0,
-            critical_failure: true,
-            was_stopped: false,
-            duration_ms: start.elapsed().as_millis() as u64,
-            files_modified: vec![],
-            error: setup_prompt_result.failure_context,
-        };
-    }
-
-    // =========================================================================
-    // PHASE 2-3: VERIFICATION-AGENTIC LOOP
-    // =========================================================================
-    let mut iteration = 1u32;
-
-    while iteration <= max_iterations {
-        // Check for stop request
-        if is_stop_requested(app_state, execution_id).await {
-            info!("Stop requested at iteration {}", iteration);
-            was_stopped = true;
-            break;
-        }
-
-        // --- Verification ---
-        info!(
-            "Phase 2/4: Verification — iteration {}/{}, execution_id={}",
-            iteration, max_iterations, execution_id
-        );
-
-        let v_result = execute_steps_batch(
-            app_state,
-            config_storage,
-            &input.verification_steps_json,
-            "verification",
-            Some(iteration),
-            execution_id,
-            None,
-        )
-        .await;
-
-        iterations_run = iteration;
-
-        if v_result.all_passed {
-            info!(
-                "Verification PASSED at iteration {} — proceeding to completion",
-                iteration
-            );
-            verification_passed = true;
-            break;
-        }
-
-        // Build failure context for the agentic phase
-        let failure_context = v_result
-            .failure_context
-            .unwrap_or_else(|| "Verification failed".to_string());
-
-        // --- Agentic ---
-        if iteration < max_iterations {
-            info!(
-                "Phase 3/4: Agentic — iteration {}/{}, execution_id={}",
-                iteration, max_iterations, execution_id
-            );
-
-            let a_result = execute_steps_batch(
-                app_state,
-                config_storage,
-                &input.agentic_steps_json,
-                "agentic",
-                Some(iteration),
-                execution_id,
-                Some(&failure_context),
-            )
-            .await;
-
-            if !a_result.success {
-                warn!(
-                    "Agentic phase failed at iteration {}: {:?}",
-                    iteration, a_result.failure_context
-                );
-                // Continue to next iteration — the agentic phase failing
-                // doesn't mean the problem can't be fixed differently
-            }
-        }
-
-        iteration += 1;
-    }
-
-    // =========================================================================
-    // PHASE 4: COMPLETION
-    // =========================================================================
-    if verification_passed {
-        info!("Phase 4/4: Completion — execution_id={}", execution_id);
-
-        // Completion automation steps
-        let c_result = execute_steps_batch(
-            app_state,
-            config_storage,
-            &input.completion_automation_steps_json,
-            "completion",
-            None,
-            execution_id,
-            None,
-        )
-        .await;
-
-        if !c_result.success {
-            warn!(
-                "Completion automation phase had failures: {:?}",
-                c_result.failure_context
-            );
-        }
-
-        // Completion prompt steps (AI prompts after automation completion)
-        let cp_result = execute_steps_batch(
-            app_state,
-            config_storage,
-            &input.completion_prompt_steps_json,
-            "completion_prompt",
-            None,
-            execution_id,
-            None,
-        )
-        .await;
-
-        if !cp_result.success {
-            warn!(
-                "Completion prompt phase had failures: {:?}",
-                cp_result.failure_context
-            );
-        }
-    }
-
-    let duration_ms = start.elapsed().as_millis() as u64;
-    let success = verification_passed && !critical_failure && !was_stopped;
-
-    // Update task run status
-    let final_status = if success {
-        "complete"
-    } else if was_stopped {
-        "stopped"
-    } else {
-        "failed"
-    };
-
-    if let Err(e) = pg_db
-        .update_task_run_status(execution_id, final_status)
-        .await
-    {
-        warn!("Failed to update final task run status: {}", e);
-    }
-
-    info!(
-        "Durable workflow {} complete: success={}, verification_passed={}, iterations={}, {}ms",
-        workflow_name, success, verification_passed, iterations_run, duration_ms
-    );
-
-    WorkflowOutput {
-        success,
-        verification_passed,
-        iterations_run,
-        critical_failure,
-        was_stopped,
-        duration_ms,
-        files_modified,
-        error: error_msg,
-    }
-}
-
-/// Check if a stop has been requested for the current workflow.
-///
-/// The stop mechanism uses the existing execution control flow:
-/// the frontend calls `stop_execution` which signals the executor.
-/// For Restate workflows, we check if the execution status was updated to "stopped".
-async fn is_stop_requested(app_state: &AppState, execution_id: &str) -> bool {
-    // Query PG for the current task run status. The frontend sets
-    // the status to 'stopped' or 'cancelling' via the stop_execution command.
-    match app_state.pg_db.get_task_run(execution_id).await {
-        Ok(Some(task_run)) => {
-            let status = task_run.status.as_str();
-            status == "stopped" || status == "cancelling"
-        }
-        Ok(None) => {
-            warn!("is_stop_requested: task run {} not found", execution_id);
-            false
-        }
-        Err(e) => {
-            warn!(
-                "is_stop_requested: failed to query task run {}: {}",
-                execution_id, e
-            );
-            false
-        }
     }
 }
 
@@ -621,5 +385,162 @@ mod tests {
             parse_batch_steps(r#"[{"type":"ui_bridge","action":"navigate","url":"http://x"}]"#)
                 .unwrap();
         assert_eq!(ok[0].ui_bridge_url.as_deref(), Some("http://x"));
+    }
+}
+
+#[cfg(test)]
+mod nothing_checked_tests {
+    use super::{
+        durable_verification_verdict, empty_batch_result, verification_batch_checks_nothing,
+        DurableVerificationVerdict,
+    };
+
+    /// An empty VERIFICATION batch is not `all_passed`. Before plan
+    /// 2026-11-06-a-product-workflow-verification-with-nothing-to-check-never-reports-passed
+    /// it was, and the durable run stored `complete`.
+    #[test]
+    fn an_empty_verification_batch_is_not_all_passed() {
+        let result = empty_batch_result("verification", Some(1));
+        assert!(!result.all_passed);
+        assert!(result.success, "the phase ran; it checked nothing");
+        assert!(result.step_results.is_empty());
+    }
+
+    /// The durable path's own entry: `execute_steps_batch` handed an empty
+    /// VERIFICATION batch returns before it builds a step executor or touches a
+    /// database, and that batch is not all_passed. An empty setup batch is the
+    /// control. The `AppState` is the in-memory one (no database, disk or
+    /// network).
+    #[tokio::test]
+    async fn the_batch_executor_does_not_pass_an_empty_verification_batch() {
+        let app_state = crate::AppState::new_for_test();
+        let config_storage = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::config_storage::ConfigStorage::new_degraded(),
+        ));
+        let verification = super::execute_steps_batch(
+            &app_state,
+            &config_storage,
+            "[]",
+            "verification",
+            Some(1),
+            "exec-durable",
+            None,
+        )
+        .await;
+        assert!(!verification.all_passed);
+        assert!(verification.success, "the phase ran; it checked nothing");
+        assert!(verification.step_results.is_empty());
+        let setup = super::execute_steps_batch(
+            &app_state,
+            &config_storage,
+            "[]",
+            "setup",
+            None,
+            "exec-durable",
+            None,
+        )
+        .await;
+        assert!(setup.all_passed);
+    }
+
+    /// A non-empty VERIFICATION batch with no required step is not all_passed
+    /// either. A gate runs (through `execute_single_step`, which touches no
+    /// database) and succeeds, and it checks nothing.
+    #[tokio::test]
+    async fn the_batch_executor_does_not_pass_a_verification_batch_that_checks_nothing() {
+        let app_state = crate::AppState::new_for_test();
+        let config_storage = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::config_storage::ConfigStorage::new_degraded(),
+        ));
+        let gate_only = super::execute_steps_batch(
+            &app_state,
+            &config_storage,
+            r#"[{"type":"gate","name":"all"}]"#,
+            "verification",
+            Some(1),
+            "exec-durable-gate",
+            None,
+        )
+        .await;
+        assert_eq!(gate_only.step_results.len(), 1);
+        assert!(
+            gate_only.step_results[0].success,
+            "the gate itself ran and succeeded"
+        );
+        assert!(!gate_only.all_passed);
+        assert!(gate_only.success, "the phase ran; it checked nothing");
+    }
+
+    /// The control: a setup or completion phase with nothing to do succeeded.
+    #[test]
+    fn an_empty_setup_or_completion_batch_still_succeeds() {
+        assert!(empty_batch_result("setup", None).all_passed);
+        assert!(empty_batch_result("completion", None).all_passed);
+    }
+
+    #[test]
+    fn a_batch_with_no_required_step_checks_nothing() {
+        assert!(verification_batch_checks_nothing("[]"));
+        assert!(verification_batch_checks_nothing(
+            r#"[{"type":"command","name":"lint","command":"true","required":false}]"#
+        ));
+        assert!(verification_batch_checks_nothing(
+            r#"[{"type":"command","name":"lint","command":"true","required":false},
+                {"type":"command","name":"fmt","command":"true","required":false}]"#
+        ));
+    }
+
+    /// One required step (absent `required` counts as required) is a check.
+    #[test]
+    fn a_batch_with_a_required_step_checks_something() {
+        assert!(!verification_batch_checks_nothing(
+            r#"[{"type":"command","name":"tests","command":"true"}]"#
+        ));
+        assert!(!verification_batch_checks_nothing(
+            r#"[{"type":"command","name":"lint","command":"true","required":false},
+                {"type":"command","name":"tests","command":"true","required":true}]"#
+        ));
+    }
+
+    /// The shared rule (`counts_toward_verdict`) applies to the configs: a
+    /// `gate` step and a prompt with no content check nothing, and a prompt
+    /// with content checks something.
+    #[test]
+    fn gates_and_contentless_prompts_check_nothing() {
+        assert!(verification_batch_checks_nothing(
+            r#"[{"type":"gate","name":"all"}]"#
+        ));
+        assert!(verification_batch_checks_nothing(
+            r#"[{"type":"prompt","name":"review","content":""},{"type":"gate","name":"all"}]"#
+        ));
+        assert!(!verification_batch_checks_nothing(
+            r#"[{"type":"prompt","name":"review","content":"Does the page render?"}]"#
+        ));
+    }
+
+    /// A batch that does not parse fails as a batch; it is not "nothing to check".
+    #[test]
+    fn an_unparseable_batch_is_not_nothing_to_check() {
+        assert!(!verification_batch_checks_nothing("not json"));
+    }
+
+    #[test]
+    fn the_durable_verdict_tests_nothing_checked_first() {
+        assert_eq!(
+            durable_verification_verdict(true, true),
+            DurableVerificationVerdict::NoVerificationSteps
+        );
+        assert_eq!(
+            durable_verification_verdict(true, false),
+            DurableVerificationVerdict::NoVerificationSteps
+        );
+        assert_eq!(
+            durable_verification_verdict(false, true),
+            DurableVerificationVerdict::Passed
+        );
+        assert_eq!(
+            durable_verification_verdict(false, false),
+            DurableVerificationVerdict::Failed
+        );
     }
 }

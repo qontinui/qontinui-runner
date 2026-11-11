@@ -144,6 +144,10 @@ impl LoopController {
     /// For composed run children (e.g., composed-run-X-workflow-N),
     /// state is persisted under the parent composed run ID since children don't have
     /// their own task_run records.
+    ///
+    /// Every row carries the run's `NoVerificationSteps` latch
+    /// (`self.stages_checked_nothing`), stamped here. This is the one writer of
+    /// the row, so no state constructor or call site has to carry the latch.
     pub(crate) fn persist_workflow_state(&self, execution_id: &str, state: &UnifiedWorkflowState) {
         // For composed run children (e.g., composed-run-X-workflow-N),
         // persist under the parent ID since children don't have their own task_run records.
@@ -153,7 +157,9 @@ impl LoopController {
             self.app_state.pg_db.clone(),
             &persist_id,
             "unified",
-            state.clone(),
+            state
+                .clone()
+                .with_checked_nothing(self.stages_checked_nothing),
         );
 
         if let Err(e) = state_machine.persist() {

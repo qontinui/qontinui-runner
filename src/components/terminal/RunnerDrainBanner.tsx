@@ -10,7 +10,9 @@
  * mistaken for a broken one.
  *
  * Renders nothing when the drain is clear, or when this runner is not a coord
- * device at all (no drain can apply).
+ * device at all (no drain can apply) — unless coord's dispatch role for this
+ * machine (`bench` / `ci_node`) closes the agent lane, which keeps autonomous
+ * spawns off with the drain clear, and says so.
  */
 
 import { useState } from "react";
@@ -20,6 +22,8 @@ import { AdvisorySlot } from "./AdvisoryStack";
 import { useCoordDrainState, type CoordDrainSnapshot } from "@/hooks/useCoordDrainState";
 
 export interface DrainBannerModel {
+  /** What holds autonomous spawns: a drain, an unknown drain, or a dispatch role. */
+  kind: "drained" | "unknown" | "role_closed";
   status: "warning" | "error";
   heading: string;
   /** Until / reason (drained) or cause (unknown). */
@@ -59,6 +63,13 @@ export const UNKNOWN_HEADING = "drain state unknown — autonomous spawns paused
 export const RESTORE_NOTE =
   "saved session tabs are not restored while this holds — they come back when it lifts, nothing is lost";
 
+/**
+ * The restore note while a dispatch role (not a drain) holds. A role is a
+ * standing operator choice, not a window, so it does not promise a lift.
+ */
+export const ROLE_RESTORE_NOTE =
+  "saved session tabs are not restored on this machine while its role holds — nothing is lost, and they come back if the role changes";
+
 export function deferredLabel(count: number, capped = false): string | null {
   if (count <= 0) return null;
   // At the backend's cap the count is a FLOOR, not a total — say so with a `+`
@@ -80,11 +91,14 @@ export function drainBannerModel(s: CoordDrainSnapshot | null): DrainBannerModel
     if (s.until) parts.push(`until ${formatUntil(s.until)}`);
     if (s.reason) parts.push(s.reason);
     return {
+      kind: "drained",
       status: "warning",
       heading: "Runner drained by coord — autonomous spawns deferred",
       detail: parts.length > 0 ? parts.join(" · ") : null,
       deferredLabel: deferredLabel(s.deferredCount, s.deferredCapped ?? false),
-      restoreNote: RESTORE_NOTE,
+      // Lifting the drain does not lift a closing dispatch role, so do not
+      // promise that it does.
+      restoreNote: s.agentLaneClosedByRole === true ? ROLE_RESTORE_NOTE : RESTORE_NOTE,
       episodeKey: `drained|${s.until ?? ""}`,
     };
   }
@@ -93,12 +107,26 @@ export function drainBannerModel(s: CoordDrainSnapshot | null): DrainBannerModel
   if (s.state === "unknown" && s.bootReadPending) return null;
   if (s.state === "unknown") {
     return {
+      kind: "unknown",
       status: "error",
       heading: UNKNOWN_HEADING,
       detail: s.cause,
       deferredLabel: deferredLabel(s.deferredCount, s.deferredCapped ?? false),
       restoreNote: RESTORE_NOTE,
       episodeKey: `unknown|${s.since ?? ""}`,
+    };
+  }
+  // The drain is clear (or this is no coord device), but coord's dispatch role
+  // for this machine closes the agent lane, so autonomous spawns stay off.
+  if (s.agentLaneClosedByRole === true) {
+    return {
+      kind: "role_closed",
+      status: "warning",
+      heading: `Dispatch role ${s.dispatchRole ?? "unknown"} — autonomous spawns off on this machine`,
+      detail: null,
+      deferredLabel: deferredLabel(s.deferredCount, s.deferredCapped ?? false),
+      restoreNote: ROLE_RESTORE_NOTE,
+      episodeKey: `role_closed|${s.dispatchRole ?? ""}`,
     };
   }
   return null;

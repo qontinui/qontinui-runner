@@ -132,7 +132,6 @@ _handle_testing_mock_click
 _handle_testing_mock_screenshot
 _handle_testing_mock_type
 _handle_testing_run_assertion
-_handle_testing_run_test_case
 _handle_testing_set_mock_mode
 _handle_testing_start_run
 _handle_testing_traverse_to_state
