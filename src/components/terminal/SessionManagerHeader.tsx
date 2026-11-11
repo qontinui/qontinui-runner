@@ -78,24 +78,28 @@ export function sessionManagerAccountFilterId(account: string): string {
 }
 
 /**
- * Actions the search box advertises. `inferActions('input')` omits `sendKeys`,
- * which is the same per-element under-advertisement that made the command bar
- * reject a driver's keystrokes (`CommandBar.tsx`
+ * Actions the search box advertises. `inferActions('input')` once omitted
+ * `sendKeys`, the same per-element under-advertisement that made the command
+ * bar reject a driver's keystrokes (`CommandBar.tsx`
  * `COMMAND_BAR_INPUT_ACTIONS`) — filtering the session list means typing into
  * this box, so it is advertised here for the same reason and with the same
- * SDK descriptor-array contract.
+ * SDK descriptor-array contract. Passing `actions` replaces the inferred list,
+ * so this is the SDK 0.38.0 inferred input set verbatim (see the command bar's
+ * comment for its provenance).
  */
 export const SEARCH_INPUT_ACTIONS: StandardAction[] = [
   "focus",
   "blur",
   "hover",
+  "unhover",
   "scroll",
   "scrollIntoView",
   "click",
   "hoverClick",
   "type",
-  "clear",
   "sendKeys",
+  "clear",
+  "setValue",
 ];
 
 /**

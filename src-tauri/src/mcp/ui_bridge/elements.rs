@@ -670,9 +670,11 @@ pub(crate) const SUPPORTED_ACTION_NAMES: &[&str] = &[
     "blur",
     "hover",
     // Release a forced hover (`hover` puts the target into its CSS `:hover`
-    // appearance via `[data-ui-bridge-hover]` twin rules). Added SDK-side in
-    // `@qontinui/ui-bridge` the next minor after 0.35 (plan
-    // 2026-10-22-ui-bridge-hover-forces-the-css-hover-state); forwarded as-is.
+    // appearance by rewriting `:hover` selectors in place to
+    // `:is(:hover,[data-ui-bridge-pseudo-hover])` and marking the target's
+    // ancestor chain). Added SDK-side in `@qontinui/ui-bridge` 0.38.0
+    // (ui-bridge#280, plan 2026-10-22-ui-bridge-hover-forces-the-css-hover-state);
+    // forwarded as-is.
     "unhover",
     "scroll",
     "scrollIntoView",

@@ -73,6 +73,11 @@ pub(crate) const ACTION_VERB_SYNONYMS: &[(&str, &[&str])] = &[
     // Pointer / scroll.
     ("mouseover", &["hover"]),
     ("mouseenter", &["hover"]),
+    // The pointer leaving: `unhover` releases the page's held forced hover, and
+    // dispatches the leave events (`pointerout`/`mouseout`/`pointerleave`/
+    // `mouseleave`) when one is held.
+    ("mouseleave", &["unhover"]),
+    ("mouseout", &["unhover"]),
     ("scrollto", &["scrollIntoView"]),
 ];
 
@@ -368,19 +373,22 @@ mod tests {
         items.iter().map(|s| s.to_string()).collect()
     }
 
-    /// The terminal command-bar input's advertised list, as measured
-    /// (`CommandBar.tsx` `COMMAND_BAR_INPUT_ACTIONS`).
+    /// The terminal command-bar input's advertised list
+    /// (`CommandBar.tsx` `COMMAND_BAR_INPUT_ACTIONS`, the SDK 0.38.0 inferred
+    /// input set).
     const TERMINAL_INPUT_ACTIONS: &[&str] = &[
         "focus",
         "blur",
         "hover",
+        "unhover",
         "scroll",
         "scrollIntoView",
         "click",
         "hoverClick",
         "type",
-        "clear",
         "sendKeys",
+        "clear",
+        "setValue",
     ];
 
     // ── table literals ────────────────────────────────────────────────────
@@ -414,6 +422,8 @@ mod tests {
         assert_eq!(lookup("middle"), vec!["middleClick"]);
         assert_eq!(lookup("mouseover"), vec!["hover"]);
         assert_eq!(lookup("mouseenter"), vec!["hover"]);
+        assert_eq!(lookup("mouseleave"), vec!["unhover"]);
+        assert_eq!(lookup("mouseout"), vec!["unhover"]);
         assert_eq!(lookup("scrollto"), vec!["scrollIntoView"]);
     }
 
@@ -604,6 +614,24 @@ mod tests {
         assert_eq!(
             suggest_action("scrollTo", &list(&["scrollIntoView"])).as_deref(),
             Some("scrollIntoView")
+        );
+    }
+
+    #[test]
+    fn pointer_leave_verbs_suggest_unhover_only_where_accepted() {
+        let accepted = list(TERMINAL_INPUT_ACTIONS);
+        for verb in ["mouseleave", "mouseLeave", "mouse_out", "mouseout"] {
+            assert_eq!(
+                suggest_action(verb, &accepted).as_deref(),
+                Some("unhover"),
+                "{verb}"
+            );
+        }
+        // An element whose advertised list lacks `unhover` is never told to use
+        // it (the suggestion reads the raw list, not the gate's hover exemption).
+        assert_eq!(
+            suggest_action("mouseleave", &list(&["hover", "click"])),
+            None
         );
     }
 
@@ -922,8 +950,8 @@ mod tests {
             body["error"],
             json!(
                 "Unknown action 'press' for element 'terminal.command-bar-input'. \
-                 This element accepts: focus, blur, hover, scroll, scrollIntoView, click, \
-                 hoverClick, type, clear, sendKeys. Did you mean 'sendKeys'? \
+                 This element accepts: focus, blur, hover, unhover, scroll, scrollIntoView, \
+                 click, hoverClick, type, sendKeys, clear, setValue. Did you mean 'sendKeys'? \
                  (params: {\"keys\":[\"Enter\"]})"
             )
         );
