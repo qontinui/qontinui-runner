@@ -529,10 +529,14 @@ async fn ui_bridge_control_batch_execute_handler_dispatch(
                 // required", and `params` was a sibling the handler never
                 // reads. It also read only `element_id` while its sibling
                 // endpoint below read only `elementId`; the helper accepts
-                // both. See `request::element_action_payload`.
-                let payload = super::request::step_action_payload(step);
+                // both. See `action_wire::element_action_payload`. A step with
+                // no action name is refused and nothing is dispatched.
+                let dispatched = match super::action_wire::step_action_payload(step) {
+                    Ok(payload) => ui_bridge_request_sync(&state, "execute_action", payload).await,
+                    Err(missing) => Ok(missing.response()),
+                };
 
-                match ui_bridge_request_sync(&state, "execute_action", payload).await {
+                match dispatched {
                     Ok(data) => {
                         // Strict: an absent `success` is INDETERMINATE → failure.
                         let (data, outcome) = super::request::normalize_action_result(data);
@@ -1547,21 +1551,29 @@ async fn ui_bridge_control_batch_handler_dispatch(
         // {action, params} pair dropped `waitOptions`, `expectChange` and every
         // other opt-in the caller sent. Forwarding the non-reserved keys whole
         // means this hop stops being the one that loses them.
-        let payload = super::request::step_action_payload(step);
+        //
+        // A step with no action name is refused and nothing is dispatched.
+        let payload = super::action_wire::step_action_payload(step);
 
         // Echo the name that was ACTUALLY dispatched, read back off the payload
         // rather than re-derived from the step. Re-deriving would report
         // "click" for a step carrying a nested envelope (`as_str()` on an
         // object yields None), so the result would name a different action than
-        // the one that ran.
-        let action_name = payload
-            .pointer("/action/action")
-            .and_then(|v| v.as_str())
-            .unwrap_or("click")
-            .to_string();
+        // the one that ran. A refused step names none.
+        let action_name = match &payload {
+            Ok(payload) => payload
+                .pointer("/action/action")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            Err(_) => String::new(),
+        };
 
         let step_start = std::time::Instant::now();
-        let res = ui_bridge_request_sync(&state, "execute_action", payload).await;
+        let res = match payload {
+            Ok(payload) => ui_bridge_request_sync(&state, "execute_action", payload).await,
+            Err(missing) => Ok(missing.response()),
+        };
         let duration_ms = step_start.elapsed().as_secs_f64() * 1000.0;
 
         let (ok, response_value) = match res {

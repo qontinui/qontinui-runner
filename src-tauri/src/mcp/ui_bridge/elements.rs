@@ -576,10 +576,12 @@ pub async fn ui_bridge_batch_actions_handler(
         // "elementId and action are required"), and it reads `params` off the
         // action envelope, never as a top-level sibling — so the parameters
         // were unreachable even once the id was fixed. See
-        // `request::element_action_payload` for the full contract.
-        let payload = super::request::step_action_payload(step);
-
-        let result = ui_bridge_request_sync(&state, "execute_action", payload).await;
+        // `action_wire::element_action_payload` for the full contract. A step
+        // with no action name is refused and nothing is dispatched.
+        let result = match super::action_wire::step_action_payload(step) {
+            Ok(payload) => ui_bridge_request_sync(&state, "execute_action", payload).await,
+            Err(missing) => Ok(missing.response()),
+        };
 
         let (success, response) = match result {
             Ok(data) => {

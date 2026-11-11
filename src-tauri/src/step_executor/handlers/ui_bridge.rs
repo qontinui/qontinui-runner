@@ -1572,19 +1572,22 @@ impl UiBridgeHandler {
             }
         };
 
-        let action_name = target
-            .get("action")
-            .and_then(|a| a.as_str())
-            .unwrap_or("click");
+        // A target with no action name fails the step. It used to click.
+        let action_name = match crate::mcp::ui_bridge::action_wire::require_action_name(&target) {
+            Ok(name) => name,
+            Err(missing) => {
+                return StepHandlerResult::failure(format!(
+                    "element_action target has no usable `action`: {}",
+                    missing.message()
+                ));
+            }
+        };
+        let action_name = action_name.as_str();
         let criteria = target
             .get("criteria")
             .and_then(|c| c.as_object())
             .cloned()
             .unwrap_or_default();
-        let params = target
-            .get("params")
-            .cloned()
-            .unwrap_or(serde_json::json!({}));
 
         // Fetch snapshot to find element ID matching criteria
         let snapshot_target = step
@@ -1693,16 +1696,20 @@ impl UiBridgeHandler {
         };
         let element_id = element_id.as_str();
 
-        // Execute action via the SDK's action endpoint
-        let action_endpoint = format!(
-            "{}/control/elements/{}/action",
-            base_url.trim_end_matches('/'),
-            element_id
-        );
-        let body = serde_json::json!({
-            "action": action_name,
-            "params": params,
-        });
+        // Execute the action on the SAME target the snapshot above named: an
+        // element id taken from one target's snapshot has to act on that
+        // target. The step posts the target minus its step-addressing key
+        // (`criteria`), whole, instead of rebuilding `{action, params}`.
+        let (action_endpoint, body) =
+            match crate::mcp::ui_bridge::action_wire::element_action_request(
+                base_url,
+                step.ui_bridge_snapshot_target.as_deref(),
+                element_id,
+                &target,
+            ) {
+                Ok(request) => request,
+                Err(e) => return StepHandlerResult::failure(e),
+            };
 
         match client.post(&action_endpoint).json(&body).send().await {
             Ok(resp) => {
@@ -2776,5 +2783,96 @@ mod tests {
         assert_eq!(y, 9.0);
         assert_eq!(w, 9.0);
         assert_eq!(h, 9.0);
+    }
+}
+
+#[cfg(test)]
+mod element_action_step_wire_tests {
+    //! A workflow `element_action` step posts its target, minus the
+    //! step-addressing `criteria`, to the route its snapshot target names.
+    use crate::mcp::ui_bridge::action_wire::test_support::{
+        one_test_per_control_field, sample_value,
+    };
+    use crate::mcp::ui_bridge::action_wire::{
+        element_action_endpoint, require_action_name, step_element_action_body,
+    };
+    use serde_json::json;
+
+    fn field_check(key: &str) {
+        let mut target = serde_json::Map::new();
+        target.insert("criteria".into(), json!({"textContent": "Save"}));
+        target.insert("action".into(), json!("type"));
+        target.insert(key.into(), sample_value(key));
+        let target = serde_json::Value::Object(target);
+        assert!(require_action_name(&target).is_ok());
+        let body = step_element_action_body(&target);
+        assert_eq!(
+            body.get(key),
+            Some(&sample_value(key)),
+            "step body dropped `{key}`: {body}"
+        );
+        assert!(
+            body.get("criteria").is_none(),
+            "`criteria` addresses the step, not the action: {body}"
+        );
+    }
+    one_test_per_control_field!(field_check);
+
+    #[test]
+    fn a_target_with_no_action_name_fails_the_step_before_any_request() {
+        for target in [
+            json!({"criteria": {}}),
+            json!({"action": null}),
+            json!({"action": 42}),
+        ] {
+            let err = require_action_name(&target).expect_err("nameless target");
+            assert!(err.message().contains("`action`"), "{target}");
+        }
+    }
+
+    #[test]
+    fn the_step_posts_to_the_snapshot_targets_singular_route() {
+        assert_eq!(
+            element_action_endpoint("http://127.0.0.1:9876/ui-bridge", Some("sdk"), "e1").unwrap(),
+            "http://127.0.0.1:9876/ui-bridge/sdk/element/e1/action"
+        );
+    }
+}
+
+#[cfg(test)]
+mod element_action_step_source_guard {
+    //! `execute_element_action` must post exactly what `action_wire` built.
+    //! The step needs a live HTTP target, so this guards the handler's source:
+    //! it fails if the step goes back to a rebuilt body or the plural route.
+    fn handler_source() -> &'static str {
+        const SRC: &str = include_str!("ui_bridge.rs");
+        let start = SRC
+            .find("async fn execute_element_action(")
+            .expect("execute_element_action present");
+        // Structural end: the next method of the impl block.
+        let end = SRC[start + 1..]
+            .find("\n    async fn ")
+            .expect("another method follows")
+            + start
+            + 1;
+        &SRC[start..end]
+    }
+
+    #[test]
+    fn the_step_posts_the_request_action_wire_built() {
+        let src = handler_source();
+        assert!(
+            src.contains("action_wire::element_action_request("),
+            "{src}"
+        );
+        assert!(src.contains(".post(&action_endpoint).json(&body)"), "{src}");
+    }
+
+    #[test]
+    fn the_step_does_not_rebuild_the_body_or_post_to_the_plural_route() {
+        let src = handler_source();
+        for forbidden in ["/control/elements/", "\"params\": params"] {
+            assert!(!src.contains(forbidden), "step reintroduced `{forbidden}`");
+        }
     }
 }
