@@ -181,20 +181,6 @@
       "reason": "One ffmpeg frame-extraction pass per verification request, bounded by `-frames:v`. Agent-initiated, never on a timer; a transcode of a long trace legitimately takes minutes."
     },
     {
-      "site": "src-tauri/src/mcp/trace_verification.rs::run_deterministic_verification",
-      "waits": [
-        "cargo",
-        "cmd",
-        "sh"
-      ],
-      "reason_covers_waits": [
-        "cargo",
-        "cmd",
-        "sh"
-      ],
-      "reason": "Runs the workspace's own build — `npm run build` via `cmd /C` on Windows and `sh -c` elsewhere, plus `cargo check` when a Cargo.toml is present. Unbounded by nature, and the point of the check is to let it finish. One pass per agent-initiated verification request."
-    },
-    {
       "site": "src-tauri/src/orchestrator/hooks.rs::HookExecutor::execute_command",
       "waits": [
         "cmd"

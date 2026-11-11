@@ -373,7 +373,7 @@ fn checkpoint_to_recap_step(checkpoint: &StepCheckpoint) -> RecapStep {
 ///
 /// Data sources in priority order:
 /// 0. workflow_step_checkpoints - Unified workflow executor checkpoints (highest priority, most authoritative)
-/// 1. workflow_verification_phase_results - Verification step results from execute_verification_steps
+/// 1. workflow_verification_phase_results - Verification step results from execute_verification_steps_with_events
 /// 2. task_run_automation - Automation workflow records
 /// 3. AI sessions from task_run.sessions_count and output_log parsing
 /// 4. step_execution events from task_run_events
@@ -428,7 +428,7 @@ pub fn build_steps(
         info!("Total steps after checkpoint processing: {}", steps.len());
     }
 
-    // 1. Add workflow verification phase results (step-based, from execute_verification_steps)
+    // 1. Add workflow verification phase results (step-based, from execute_verification_steps_with_events)
     // These are more detailed than orchestrator criterion-based results
     if !workflow_verification_results.is_empty() {
         info!(

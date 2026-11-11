@@ -200,11 +200,13 @@ pub(crate) const RETIRED_AGENTS: &[&str] = &[
     // (`testing` coverage-is-enumerated-not-salient and a-test-must-be-able-to-fail;
     // `escalation-bar` escalation-closed-list).
     // The first five blobs are its whole history on qontinui-claude-config main,
-    // of which this directory shipped 8c23f14a, d80c5d1d and 3908f6b9. The last
-    // two are its blobs at the two commits (c0648db7, 4a60b2d4f3d4) of
-    // qontinui-claude-config#2413, which was open and editing it when it was
-    // retired.
-    "test-generator.md 3908f6b9811fea0b8f7bc68f7d0bf9022015a537 d80c5d1d620bb8f9e2acdd756eadc22b624794a0 8c23f14a7cbaaf04d35f68ad13745242f91012b6 d8d6673b504bb9f37155ec0acecb8fc02859ae95 7b5318b48ebfaaeaba1aaff7d86f99c0bbb07535 0bb59a9cea7f0a8c598f648e40f27300bcda9dde 7b6360157dc99a9c86919343a0cc3a65b8ee6091",
+    // of which this directory shipped 8c23f14a, d80c5d1d and 3908f6b9. The next
+    // two are its blobs on the branch of qontinui-claude-config#2413 (c0648db7,
+    // 4a60b2d4f3d4; its merge commit adc57b9e adds none), which was open and
+    // editing it when it was retired. The eighth is its blob after
+    // qontinui-claude-config#2528 (716c4f187, 2026-11-09), which superseded
+    // #2413 and landed an edit to it on main before the source deletion did.
+    "test-generator.md 3908f6b9811fea0b8f7bc68f7d0bf9022015a537 d80c5d1d620bb8f9e2acdd756eadc22b624794a0 8c23f14a7cbaaf04d35f68ad13745242f91012b6 d8d6673b504bb9f37155ec0acecb8fc02859ae95 7b5318b48ebfaaeaba1aaff7d86f99c0bbb07535 0bb59a9cea7f0a8c598f648e40f27300bcda9dde 7b6360157dc99a9c86919343a0cc3a65b8ee6091 565d8136ded8048c22b8ba3c5b4e771a1f6e2aac",
 ];
 
 /// `line` split into its file name and the blob ids after it.
@@ -538,7 +540,8 @@ mod tests {
                d8d6673b504bb9f37155ec0acecb8fc02859ae95 \
                7b5318b48ebfaaeaba1aaff7d86f99c0bbb07535 \
                0bb59a9cea7f0a8c598f648e40f27300bcda9dde \
-               7b6360157dc99a9c86919343a0cc3a65b8ee6091"
+               7b6360157dc99a9c86919343a0cc3a65b8ee6091 \
+               565d8136ded8048c22b8ba3c5b4e771a1f6e2aac"
             ]
         );
         assert_eq!(

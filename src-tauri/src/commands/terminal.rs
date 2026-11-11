@@ -1512,13 +1512,39 @@ fn record_open_confirmation_report(
 #[tauri::command]
 pub fn terminal_session_rebind_terminal(
     store: tauri::State<'_, Arc<SessionLifecycleStore>>,
+    terminal_manager: tauri::State<'_, Arc<TerminalManager>>,
     claude_session_id: String,
     terminal_id: String,
     zone_index: i32,
 ) -> Result<CommandResponse, String> {
-    store.rebind_terminal(&claude_session_id, &terminal_id, zone_index);
-    store.mark_restored_from_boot(
+    rebind_and_sync_page(
+        &store,
+        &terminal_manager,
         &claude_session_id,
+        &terminal_id,
+        zone_index,
+    )
+}
+
+/// The body of [`terminal_session_rebind_terminal`] over plain references, so
+/// tests drive the command's own wiring rather than a copy of it.
+pub(crate) fn rebind_and_sync_page(
+    store: &SessionLifecycleStore,
+    terminal_manager: &TerminalManager,
+    claude_session_id: &str,
+    terminal_id: &str,
+    zone_index: i32,
+) -> Result<CommandResponse, String> {
+    store.rebind_terminal(claude_session_id, terminal_id, zone_index);
+    // The page follows the pane: `rebind_terminal` moves only terminal + zone,
+    // so otherwise `/sessions/history` names a page `/terminals` does not place
+    // the session on. An unheld or dead pane names no page; the record keeps
+    // the one it had.
+    if let Some(live_page) = terminal_manager.live_page_of(terminal_id) {
+        store.update_page_by_terminal(terminal_id, &live_page);
+    }
+    store.mark_restored_from_boot(
+        claude_session_id,
         crate::session::session_lifecycle_store::RESTORE_TIER_TERMINAL_ONLY,
     );
     Ok(CommandResponse {
@@ -1830,7 +1856,7 @@ pub fn terminal_session_list_open(
     // set is withheld and the response says so. Nothing is closed or consumed;
     // the frontend re-runs the restore on `coord-drain-state-changed` once
     // autonomous spawns may run again.
-    if let crate::coord_drain_state::DrainGate::Defer { reason, .. } =
+    if let crate::coord_drain_state::DrainGate::Defer { reason, class } =
         crate::coord_drain_state::drain_gate_for_work(
             crate::coord_drain_state::SpawnOrigin::BootResume,
             "boot_resume:terminal_tabs",
@@ -1855,6 +1881,9 @@ pub fn terminal_session_list_open(
                 "sessions": [],
                 "deferredByDrain": {
                     "state": crate::coord_drain_state::current().label(),
+                    // `drained` | `unknown` | `role_closed`: what deferred it. A
+                    // dispatch role defers with the drain itself `clear`.
+                    "class": class.label(),
                     "reason": reason,
                 },
             })),
@@ -4266,5 +4295,103 @@ mod tests {
             None,
             "a whitespace config_dir must normalize to None, not persist as a blank"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // Rebind: the record's page follows the pane it is bound to (plan
+    // 2026-11-07-triage-sessions-ten-gaps-from-an-every-page-act-run, N10)
+    // ---------------------------------------------------------------------
+
+    /// A live pane on `page` under `terminal_id`, marked dead again before it
+    /// drops (a live fixture's `Drop` would otherwise close it), even on panic.
+    struct LivePaneOn {
+        tm: TerminalManager,
+        session: Arc<crate::terminal::session::TerminalSession>,
+    }
+    impl Drop for LivePaneOn {
+        fn drop(&mut self) {
+            self.session.set_alive_for_test(false);
+        }
+    }
+    fn live_pane_on(terminal_id: &str, page: &str) -> LivePaneOn {
+        let tm = TerminalManager::new();
+        let session = Arc::new(crate::terminal::session::tests::make_test_session(
+            Arc::new(std::sync::Mutex::new(Vec::new())),
+        ));
+        session.set_alive_for_test(true);
+        session.set_page(page.to_string());
+        tm.insert_for_test(terminal_id, session.clone());
+        LivePaneOn { tm, session }
+    }
+
+    /// N10: a boot-restore rebind onto a pane on page P leaves the record on
+    /// P. `rebind_terminal` alone keeps the record's old page — the defect.
+    #[test]
+    fn rebind_onto_a_pane_on_page_p_leaves_the_record_on_p() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
+        store.record_open(restore_candidate_record("sess-moved"));
+        let pane = live_pane_on("term-new", "page-P");
+
+        store.rebind_terminal("sess-moved", "term-new", 1);
+        assert_eq!(
+            store.get("sess-moved").unwrap().page_id,
+            "default",
+            "the store's re-point alone does not move the page"
+        );
+
+        rebind_and_sync_page(&store, &pane.tm, "sess-moved", "term-new", 1).unwrap();
+        let rec = store.get("sess-moved").unwrap();
+        assert_eq!(rec.terminal_id, "term-new");
+        assert_eq!(rec.zone_index, 1);
+        assert_eq!(rec.page_id, "page-P", "the record follows the live pane");
+    }
+
+    /// N10, read side: after the rebind, the `/sessions/history` row
+    /// (`build_past_sessions`, the builder `list_history` serves) names the
+    /// live pane's page, in the `pageId` the route serializes.
+    #[test]
+    fn history_row_page_id_equals_the_live_panes_page_after_rebind() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
+        store.record_open(restore_candidate_record("sess-hist"));
+        let pane = live_pane_on("term-hist", "page-P");
+
+        rebind_and_sync_page(&store, &pane.tm, "sess-hist", "term-hist", 0).unwrap();
+
+        let opts = crate::session::past_sessions::PastSessionsOpts {
+            include_shells: true,
+            ..Default::default()
+        };
+        let rows = crate::session::past_sessions::build_past_sessions(
+            &store,
+            &dir.path().join("no-snapshot-history.jsonl"),
+            &opts,
+        );
+        let row = rows
+            .iter()
+            .find(|r| r.claude_session_id == "sess-hist")
+            .expect("history row");
+        let wire = serde_json::to_value(row).unwrap();
+        assert_eq!(wire["pageId"], "page-P");
+        assert_eq!(
+            Some(wire["pageId"].as_str().unwrap().to_string()),
+            pane.tm.live_page_of("term-hist")
+        );
+    }
+
+    /// A rebind onto a pane the manager does not hold (or a dead one) keeps
+    /// the record's page rather than inventing one.
+    #[test]
+    fn rebind_onto_an_unheld_pane_keeps_the_records_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
+        let mut rec = restore_candidate_record("sess-keep");
+        rec.page_id = "page-K".to_string();
+        store.record_open(rec);
+        let tm = TerminalManager::new();
+
+        rebind_and_sync_page(&store, &tm, "sess-keep", "term-unheld", 0).unwrap();
+        assert_eq!(store.get("sess-keep").unwrap().page_id, "page-K");
     }
 }
