@@ -1715,6 +1715,21 @@ impl ClaudeSession {
         }
     }
 
+    /// Take the parked `IsolatedEditContext` back off this session, leaving
+    /// the slot empty, so a later `close()` / `Drop` does not release it.
+    /// Mirrors `TerminalSession::take_isolated_edit_ctx`. Used by a door whose
+    /// spawn failed after parking it, to hand the allocation to
+    /// `IsolatedEditContext::remove_unspawned` (which reports it) instead of
+    /// letting the close drop it unreported.
+    pub fn take_isolated_edit_ctx(
+        &self,
+    ) -> Option<crate::agent_worktree::isolated_edit::IsolatedEditContext> {
+        self.isolated_edit_ctx
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
+    }
+
     /// `(worktree_path, parent_sha)` of every coord-allocated worktree the
     /// parked `IsolatedEditContext` holds; empty for a fresh or
     /// shared-checkout session. Mirrors `TerminalSession::allocation_bases`.

@@ -1714,6 +1714,43 @@ async fn reacquire_and_restore_session_worktree(
     }
 }
 
+/// The door name the AI-session resume's removal logs and reports under.
+const RESUME_DOOR: &str = "AI session resume";
+
+/// A resumed session's spawn that failed inside the blocking closure: the
+/// failure text, whether a child may have run in the tree, and the
+/// re-acquired context, handed back so the failure arm can give it to the
+/// remover instead of dropping it unreported inside the closure.
+struct ResumeSpawnFailure {
+    message: String,
+    child_started: bool,
+    ctx: Option<crate::agent_worktree::isolated_edit::IsolatedEditContext>,
+}
+
+/// Settle a resumed session's blocking spawn (plan
+/// `2026-11-08-a-spawn-refused-after-its-worktree-allocation-leaves-the-tree-on-disk`,
+/// Phase 3): a spawn failure hands the context it carries to `remove` with its
+/// `child_started`; a join error (a panic, possibly after the CLI went live)
+/// hands nothing over. The answer keeps the shape the resume loop matches on.
+///
+/// `remove` is the seam the tests drive; the resume passes
+/// `IsolatedEditContext::remove_unspawned`.
+fn settle_resume_spawn(
+    joined: Result<Result<(), ResumeSpawnFailure>, tokio::task::JoinError>,
+    remove: impl FnOnce(crate::agent_worktree::isolated_edit::IsolatedEditContext, bool, &str),
+) -> Result<Result<(), String>, tokio::task::JoinError> {
+    match joined {
+        Ok(Ok(())) => Ok(Ok(())),
+        Ok(Err(failure)) => {
+            if let Some(ctx) = failure.ctx {
+                remove(ctx, failure.child_started, &failure.message);
+            }
+            Ok(Err(failure.message))
+        }
+        Err(join) => Err(join),
+    }
+}
+
 /// Resume interrupted AI sessions on startup.
 ///
 /// Queries for task runs with status='running' and workflow_type='chat'
@@ -1953,6 +1990,15 @@ pub async fn resume_ai_sessions(
         } else {
             let replay_prompt = build_replay_prompt(&turns, None);
             if replay_prompt.is_empty() {
+                // Refused before any spawn: no child ran in the re-acquired
+                // tree, so it is handed to the remover (removed only when it
+                // proves it holds nothing — a restored WIP keeps it) and the
+                // allocation reported, instead of dropping it on disk (plan
+                // `2026-11-08-a-spawn-refused-after-its-worktree-allocation-leaves-the-tree-on-disk`,
+                // Phase 3).
+                if let Some(ctx) = reacquired_ctx {
+                    ctx.remove_unspawned(RESUME_DOOR, false, "empty replay prompt");
+                }
                 mark_failed(
                     task_run_id.clone(),
                     "empty replay prompt".to_string(),
@@ -2019,7 +2065,7 @@ pub async fn resume_ai_sessions(
         let agent_log_emitter = coord_session_id
             .and_then(crate::claude_session::coord_register::AgentLogEmitter::start);
 
-        let spawn_result = spawn_blocking_tracked(move || -> Result<(), String> {
+        let joined = spawn_blocking_tracked(move || -> Result<(), ResumeSpawnFailure> {
             let session_ctx = AiSessionContext::setup(&trid, &name_for_ctx);
 
             // Pin/resume the CLI session id to the task_run_id. `is_resume` is
@@ -2044,13 +2090,30 @@ pub async fn resume_ai_sessions(
                 None, // tool_policy
                 Some(&cli_session_ctx),
                 agent_log_emitter, // Phase 1b/1c agent_logs emitter (None unless gated)
-            )
-            .map_err(|e| format!("spawn failed: {}", e))?;
+            );
+            // Every failure from here on hands the re-acquired context back
+            // with `child_started = true`: `ClaudeSession::spawn` answers text
+            // and fails both before and after its child (it cannot tell which),
+            // and register / the initial prompt run against a live CLI. So the
+            // tree is kept and the allocation reported, never removed.
+            let session = match session {
+                Ok(session) => Arc::new(session),
+                Err(e) => {
+                    return Err(ResumeSpawnFailure {
+                        message: format!("spawn failed: {}", e),
+                        child_started: true,
+                        ctx: reacquired_ctx_for_spawn,
+                    })
+                }
+            };
 
-            let session = Arc::new(session);
-
-            sm.register(&trid, session.clone())
-                .map_err(|e| format!("register failed: {}", e))?;
+            if let Err(e) = sm.register(&trid, session.clone()) {
+                return Err(ResumeSpawnFailure {
+                    message: format!("register failed: {}", e),
+                    child_started: true,
+                    ctx: reacquired_ctx_for_spawn,
+                });
+            }
 
             // Park the re-acquired worktree claim on the now-registered
             // session so the heartbeat lives for its lifetime and the claim
@@ -2072,9 +2135,14 @@ pub async fn resume_ai_sessions(
             // note. It does not append to output_log, so the next restart's
             // replay won't double-count.
             if let Some(prompt) = initial_for_spawn.as_deref() {
-                session
-                    .send_initial_prompt(prompt)
-                    .map_err(|e| format!("send_initial_prompt failed: {}", e))?;
+                if let Err(e) = session.send_initial_prompt(prompt) {
+                    return Err(ResumeSpawnFailure {
+                        message: format!("send_initial_prompt failed: {}", e),
+                        child_started: true,
+                        // Parked above; taken back so the remover reports it.
+                        ctx: session.take_isolated_edit_ctx(),
+                    });
+                }
             }
 
             // Emit the state event with resumed=true so the frontend can
@@ -2084,6 +2152,9 @@ pub async fn resume_ai_sessions(
             Ok(())
         })
         .await;
+        let spawn_result = settle_resume_spawn(joined, |ctx, child_started, message| {
+            ctx.remove_unspawned(RESUME_DOOR, child_started, message)
+        });
 
         // Best-effort emergent-task row for the resumed session (deconflicter
         // attaches to the assigned_session_id). Identical pattern to
@@ -2620,5 +2691,68 @@ mod failed_task_run_teardown_tests {
         // Repeat close of an already-closed session.
         teardown_coord_session_for_failed_task_run(&reg, None, &task_run_id);
         assert_eq!(reg.session_id_for(&task_run_id), None);
+    }
+}
+
+/// Plan `2026-11-08-a-spawn-refused-after-its-worktree-allocation-leaves-the-tree-on-disk`
+/// Phase 3: a spawn failure hands its context to the remover with its own
+/// `child_started`; a failure carrying no context, and a join error, hand
+/// over nothing.
+#[cfg(test)]
+mod resume_unspawned_tests {
+    use super::*;
+    use crate::agent_worktree::isolated_edit::IsolatedEditContext;
+
+    fn ctx() -> Option<IsolatedEditContext> {
+        Some(IsolatedEditContext::for_test_with_agent_id(
+            "6f1c2a7e-0000-4000-8000-00000000beef".to_string(),
+            Vec::new(),
+            Vec::new(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn a_spawn_failure_hands_its_context_to_the_remover_with_its_child_flag() {
+        for child_started in [false, true] {
+            let mut handed = Vec::new();
+            let joined = Ok(Err(ResumeSpawnFailure {
+                message: "spawn failed: boom".to_string(),
+                child_started,
+                ctx: ctx(),
+            }));
+            let out = settle_resume_spawn(joined, |c, started, msg| {
+                handed.push((c.agent_id.clone(), started, msg.to_string()))
+            });
+            assert_eq!(
+                out.expect("not a join error"),
+                Err("spawn failed: boom".to_string()),
+                "the failure text is answered"
+            );
+            assert_eq!(
+                handed,
+                vec![(
+                    "6f1c2a7e-0000-4000-8000-00000000beef".to_string(),
+                    child_started,
+                    "spawn failed: boom".to_string()
+                )]
+            );
+        }
+
+        let mut calls = 0;
+        let joined = Ok(Err(ResumeSpawnFailure {
+            message: "no ctx".to_string(),
+            child_started: false,
+            ctx: None,
+        }));
+        let _ = settle_resume_spawn(joined, |_, _, _| calls += 1);
+        assert_eq!(calls, 0, "no context, nothing to hand over");
+
+        let join = tokio::spawn(async { panic!("panicked after the CLI went live") })
+            .await
+            .expect_err("a panicking task is a join error");
+        let mut calls = 0;
+        let out = settle_resume_spawn(Err(join), |_, _, _| calls += 1);
+        assert!(out.is_err());
+        assert_eq!(calls, 0, "a join error hands nothing over");
     }
 }

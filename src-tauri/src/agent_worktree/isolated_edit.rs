@@ -245,7 +245,7 @@ impl IsolatedEditContext {
     ) -> bool {
         for worktree in &self.worktrees {
             warn!(
-                "{door}: terminal create failed after allocation {} ({} at {}); \
+                "{door}: the spawn failed after allocation {} ({} at {}); \
                  reporting it abandoned, best-effort",
                 self.agent_id,
                 worktree.repo,
@@ -330,16 +330,77 @@ impl IsolatedEditContext {
     where
         F: Fn(&Path) -> Option<PathBuf> + Clone + Send + 'static,
     {
+        let report = self
+            .remove_trees_with(child_started, error, allocated_root)
+            .await;
+        self.report_unspawned_with(door, error, post);
+        report
+    }
+
+    /// Remove the trees this allocation made for a spawn that failed from
+    /// `door` with `error`, exactly as [`Self::remove_unspawned`] does, but
+    /// awaited in place and WITHOUT the spawn-failed report — for a door that
+    /// already posts its own report for this allocation (the gate
+    /// continuation, whose `agent_id` is this context's), which calls this
+    /// BEFORE that post so the ledger agrees with the disk and the allocation
+    /// is reported once (plan
+    /// `2026-11-08-a-spawn-refused-after-its-worktree-allocation-leaves-the-tree-on-disk`,
+    /// Phase 3).
+    ///
+    /// Consumes the context, so its `Drop` releases the claims after the
+    /// removal and skips the fs-observer push and edit-effect verify for every
+    /// removed tree.
+    pub(crate) async fn remove_unspawned_unreported(
+        self,
+        door: &str,
+        child_started: bool,
+        error: &str,
+    ) -> RemovalReport {
+        self.remove_unspawned_unreported_with(
+            door,
+            child_started,
+            error,
+            super::canonical_paths::allocated_worktree_for_path,
+        )
+        .await
+    }
+
+    /// [`Self::remove_unspawned_unreported`] with the allocation-root resolver
+    /// injected — the test seam.
+    pub(crate) async fn remove_unspawned_unreported_with<F>(
+        mut self,
+        door: &str,
+        child_started: bool,
+        error: &str,
+        allocated_root: F,
+    ) -> RemovalReport
+    where
+        F: Fn(&Path) -> Option<PathBuf> + Clone + Send + 'static,
+    {
+        self.remove_trees_with(child_started, &format!("{door}: {error}"), allocated_root)
+            .await
+    }
+
+    /// The removal half shared by both forms: run the core over this
+    /// context's bases and record what it removed, so `Drop` skips it.
+    async fn remove_trees_with<F>(
+        &mut self,
+        child_started: bool,
+        reason: &str,
+        allocated_root: F,
+    ) -> RemovalReport
+    where
+        F: Fn(&Path) -> Option<PathBuf> + Clone + Send + 'static,
+    {
         let report = super::remove_unspawned::remove_unspawned_trees_with(
             &self.agent_id,
             self.unspawned_bases(),
             child_started,
-            error,
+            reason,
             allocated_root,
         )
         .await;
         self.removed_worktrees = report.removed_paths();
-        self.report_unspawned_with(door, error, post);
         report
     }
 

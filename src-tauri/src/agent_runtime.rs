@@ -7478,9 +7478,9 @@ async fn run_gate_continuation_inner(
                 &headless_prompt,
                 reservation,
                 pinned_session_id,
+                ctx,
             )
             .await;
-            drop(ctx);
             presentation_bindable_session(PresentationResult::Headless(res), pinned_session_id)
         }
     };
@@ -7788,6 +7788,8 @@ async fn run_continuation_terminal(
             let reason = "no Tauri AppHandle (runner has no webview runtime) — \
                           cannot open a visible terminal";
             warn!("agent_runtime: gate-continuation terminal: {reason}");
+            // No create was attempted: no child ran in the tree.
+            remove_unspawned_continuation(ctx, false, reason).await;
             report_spawn_failed(agent_id, reason, None, 0, None).await;
             return Err(anyhow::anyhow!(reason));
         }
@@ -7799,6 +7801,7 @@ async fn run_continuation_terminal(
         None => {
             let reason = "TerminalManager state not managed — cannot create terminal session";
             warn!("agent_runtime: gate-continuation terminal: {reason}");
+            remove_unspawned_continuation(ctx, false, reason).await;
             report_spawn_failed(agent_id, reason, None, 0, None).await;
             return Err(anyhow::anyhow!(reason));
         }
@@ -7808,6 +7811,7 @@ async fn run_continuation_terminal(
         None => {
             let reason = "SessionRegistry state not managed — cannot register terminal session";
             warn!("agent_runtime: gate-continuation terminal: {reason}");
+            remove_unspawned_continuation(ctx, false, reason).await;
             report_spawn_failed(agent_id, reason, None, 0, None).await;
             return Err(anyhow::anyhow!(reason));
         }
@@ -7899,6 +7903,7 @@ async fn run_continuation_terminal(
             "no authenticated Claude account on this runner — run /login (instance={instance})"
         );
         warn!("agent_runtime: gate-continuation terminal aborted — {reason}");
+        remove_unspawned_continuation(ctx, false, &reason).await;
         report_spawn_failed(agent_id, &reason, None, 0, None).await;
         return Err(anyhow::anyhow!(reason));
     }
@@ -8095,6 +8100,13 @@ async fn run_continuation_terminal(
         let (terminal_id, coord_session_id) = match result {
             Ok(created) => created,
             Err(e) => {
+                // The failed create hands the context back unparked. Its tree is
+                // removed before the report — once, under this continuation's
+                // own post, whose `agent_id` is the context's — when the
+                // typed failure says no child started AND this is the first
+                // attempt; see [`continuation_create_failure_handoff`].
+                let (ctx_back, child_started, message) =
+                    continuation_create_failure_handoff(e, attempt);
                 // The PTY seam returns text, so a trust-gate refusal arrives as the
                 // gate's own `spawn_blocked …` string rather than as the typed
                 // `SpawnBlocked` the headless funnel downcasts. Classify it by its
@@ -8103,9 +8115,10 @@ async fn run_continuation_terminal(
                 // child, instead of `exited`, and carries the refusal verbatim
                 // (it names the failing conjuncts) rather than wrapped as a create
                 // failure.
-                let (reason, phase) = classify_pty_spawn_error(&e);
+                let (reason, phase) = classify_pty_spawn_error(&message);
+                remove_unspawned_continuation(ctx_back, child_started, &reason).await;
                 report_spawn_failed_in_phase(agent_id, &reason, None, 0, None, phase).await;
-                return Err(anyhow::anyhow!(e));
+                return Err(anyhow::anyhow!(message));
             }
         };
 
@@ -8237,6 +8250,48 @@ fn continuation_attempt_session_id(attempt: u32, pinned: uuid::Uuid) -> uuid::Uu
     } else {
         uuid::Uuid::new_v4()
     }
+}
+
+/// The door name a gate continuation's removal logs under.
+const CONTINUATION_DOOR: &str = "gate continuation";
+
+/// Remove a gate continuation's fresh tree after a spawn that failed with
+/// `reason`, when no child ran in it (plan
+/// `2026-11-08-a-spawn-refused-after-its-worktree-allocation-leaves-the-tree-on-disk`,
+/// Phase 3). Awaited BEFORE the caller's own spawn-failed post, which is the
+/// allocation's one report — the context's `agent_id` is the continuation's —
+/// so this removes and never reports. `child_started == true` keeps every
+/// tree (logged). `None` (no worktree acquired) does nothing.
+async fn remove_unspawned_continuation(
+    ctx: Option<crate::agent_worktree::isolated_edit::IsolatedEditContext>,
+    child_started: bool,
+    reason: &str,
+) {
+    if let Some(ctx) = ctx {
+        ctx.remove_unspawned_unreported(CONTINUATION_DOOR, child_started, reason)
+            .await;
+    }
+}
+
+/// What a terminal continuation's failed create hands the remover: the
+/// context it handed in (returned unparked), whether a child may have run in
+/// the tree, and the failure text.
+///
+/// `child_started` is the typed failure's flag, OR'd with "this is not the
+/// first attempt": a retry runs only after a never-started attempt's PTY child
+/// ran in this same tree (its context was taken back off the dead pane), so
+/// the tree is no longer one no child ever ran in, whatever the retry's own
+/// create says.
+fn continuation_create_failure_handoff(
+    failure: crate::commands::terminal::BackendSpawnFailure,
+    attempt: u32,
+) -> (
+    Option<crate::agent_worktree::isolated_edit::IsolatedEditContext>,
+    bool,
+    String,
+) {
+    let child_started = failure.failure.child_started || attempt > 1;
+    (failure.isolated_ctx, child_started, failure.failure.message)
 }
 
 /// What a terminal continuation that STARTED reports back to its caller.
@@ -9172,7 +9227,7 @@ async fn run_condition_check_terminal(
             // conjuncts); anything else is the ordinary create failure. The
             // condition-run report has no phase field, so the `spawn_failed:`
             // head stays as the wire contract and the classified reason follows.
-            let (reason, _phase) = classify_pty_spawn_error(&e);
+            let (reason, _phase) = classify_pty_spawn_error(&e.failure.message);
             let reason = format!("condition-check {reason}");
             warn!("agent_runtime: {reason}");
             // The PTY was never created: release the secrets before the
@@ -9540,6 +9595,10 @@ async fn run_continuation_headless(
     // The Claude session id to pin (`--session-id`), minted by the caller
     // before the worktree allocate. See `run_gate_continuation_inner`.
     pinned_session_id: uuid::Uuid,
+    // The continuation's worktree context. Held until this fn returns (the
+    // subprocess exits), matching the agent-spawn path's heartbeat-then-release
+    // lifecycle; handed to the remover when the spawn fails before its child.
+    ctx: Option<crate::agent_worktree::isolated_edit::IsolatedEditContext>,
 ) -> anyhow::Result<HeadlessExit> {
     let log_path = agent_log_path(agent_id);
     // Select the most-available account once before spawning (pins the resolved
@@ -9634,6 +9693,11 @@ async fn run_continuation_headless(
             // A trust-gate refusal posts its own typed `spawn_blocked` with the
             // derivation, and hands back the typed reason for the lifecycle post.
             let (reason, phase) = classify_spawn_error(agent_id, &e).await;
+            // Every `spawn_claude_child` `Err` is pre-child: its refusals and
+            // checks run before the spawn, and `spawn_tokio_with_retry` errs
+            // only when no attempt produced a child (a spawned child is its
+            // `Ok`). So the fresh tree is removed before the one report.
+            remove_unspawned_continuation(ctx, false, &reason).await;
             report_spawn_failed_in_phase(agent_id, &reason, None, 0, None, phase).await;
             Err(e)
         }
@@ -10315,11 +10379,20 @@ async fn run_agent_subprocess(
         }
     };
 
-    // Step 1: materialize worktrees.
-    if let Err(e) = materialize_worktrees(&payload).await {
+    // Step 1: materialize worktrees. `added_trees` collects exactly the rows
+    // THIS call ran `git worktree add` for — never an "already exists" row —
+    // so a launch whose every attempt fails before a child can take them back
+    // off disk (plan
+    // `2026-11-08-a-spawn-refused-after-its-worktree-allocation-leaves-the-tree-on-disk`,
+    // Phase 3). A failed materialize is pre-child too: the rows added before
+    // the failing one are removed before the one report.
+    let mut added_trees = Vec::new();
+    if let Err(e) = materialize_worktrees(&payload, &mut added_trees).await {
+        let reason = format!("worktree materialization failed: {e:#}");
+        remove_unspawned_launch_trees(payload.agent_id, added_trees, false, &reason).await;
         report_spawn_failed(
             payload.agent_id,
-            &format!("worktree materialization failed: {e:#}"),
+            &reason,
             None,
             0,
             primary_push_ref.as_deref(),
@@ -10449,6 +10522,10 @@ async fn run_agent_subprocess(
     // every arm that had a child; a trust-gate refusal never started one, and
     // saying `exited` there would tell coord a process ran and stopped.
     let mut final_phase = SpawnPhase::Exited;
+    // Whether ANY attempt produced a child. Only a launch where none did may
+    // hand its added trees to the remover: a child that ran, even one that
+    // exited at once, may have written in them.
+    let mut child_ever_started = false;
 
     // Select the most-available account once before the (re)spawn loop. On a
     // mid-run rate-limit the inference path rotates via
@@ -10488,6 +10565,7 @@ async fn run_agent_subprocess(
         .await
         {
             Ok((mut child, preconditions)) => {
+                child_ever_started = true;
                 let pid = child.id().map(|p| p as i64);
                 // Exempt this headless child from the session-tracking health
                 // check for its lifetime — WS agent spawns legitimately have
@@ -10613,11 +10691,23 @@ async fn run_agent_subprocess(
         return Ok(());
     }
 
+    let final_reason = final_reason
+        .as_deref()
+        .unwrap_or("subprocess exited with no recorded reason");
+    // Before the one report, so the ledger agrees with the disk. Every
+    // `spawn_claude_child` `Err` is pre-child (see `run_continuation_headless`),
+    // so a launch none of whose attempts produced a child left its added trees
+    // holding nothing but the runner's provisioning.
+    remove_unspawned_launch_trees(
+        payload.agent_id,
+        launch_trees_to_remove(added_trees, child_ever_started),
+        false,
+        final_reason,
+    )
+    .await;
     report_spawn_failed_in_phase(
         payload.agent_id,
-        final_reason
-            .as_deref()
-            .unwrap_or("subprocess exited with no recorded reason"),
+        final_reason,
         final_exit_code,
         restarts,
         primary_push_ref.as_deref(),
@@ -10627,12 +10717,61 @@ async fn run_agent_subprocess(
     Ok(())
 }
 
+/// The trees a failed coord-dispatched launch hands to the remover: every row
+/// it added when no attempt produced a child, else none — a child that ran may
+/// have written in them, and the launch's report is then the whole answer.
+fn launch_trees_to_remove(
+    added: Vec<crate::agent_worktree::remove_unspawned::UnspawnedBase>,
+    child_ever_started: bool,
+) -> Vec<crate::agent_worktree::remove_unspawned::UnspawnedBase> {
+    if child_ever_started {
+        Vec::new()
+    } else {
+        added
+    }
+}
+
+/// Remove the trees a coord-dispatched launch added, after it failed with
+/// `reason` before any child ran — the context-less door of plan
+/// `2026-11-08-a-spawn-refused-after-its-worktree-allocation-leaves-the-tree-on-disk`
+/// (D2), through the free core. Reports nothing: the launch posts its own
+/// spawn-failed for `agent_id` right after. The agent's pusher and dirty
+/// poller are stopped first, so neither touches a tree being removed (the
+/// run's teardown stops them again, idempotently).
+async fn remove_unspawned_launch_trees(
+    agent_id: uuid::Uuid,
+    added: Vec<crate::agent_worktree::remove_unspawned::UnspawnedBase>,
+    child_started: bool,
+    reason: &str,
+) {
+    if added.is_empty() {
+        return;
+    }
+    crate::agent_daemons::stop_for_agent(agent_id);
+    crate::agent_worktree::remove_unspawned::remove_unspawned_trees(
+        &agent_id.to_string(),
+        added,
+        child_started,
+        &format!("coord agent launch: {reason}"),
+    )
+    .await;
+}
+
 /// `git worktree add` each allocated worktree from the primary checkout
 /// [`crate::agent_worktree::canonical_paths::worktree_source_checkout`] resolves
 /// for its repo — under `QONTINUI_ROOT` for a `qontinui/*` or bare slug, and
 /// wherever the operator keeps it for anyone else's. That resolver raises the
 /// unresolved-workspace-root error itself, so this no longer pre-checks it.
-async fn materialize_worktrees(payload: &LaunchPayload) -> anyhow::Result<()> {
+///
+/// Every row this call actually adds is pushed onto `added` as a
+/// [`TreeProvenance::FreshWorktree`](crate::agent_worktree::remove_unspawned::TreeProvenance)
+/// base, as it is added — so a failure on a later row still leaves the caller
+/// the earlier ones. A row whose path already exists is skipped and never
+/// pushed: that tree is not this call's.
+async fn materialize_worktrees(
+    payload: &LaunchPayload,
+    added: &mut Vec<crate::agent_worktree::remove_unspawned::UnspawnedBase>,
+) -> anyhow::Result<()> {
     // D3/D6 — the first act on a coord-delivered row is the `git worktree add`
     // below, so say here, once per row and before it, when coord did not
     // vouch for the sha. The sha is then used exactly as served (D6: no
@@ -10685,6 +10824,15 @@ async fn materialize_worktrees(payload: &LaunchPayload) -> anyhow::Result<()> {
     // dropped, the `primary_wt` its caller binds from `worktrees[0]` would be
     // a path nothing ever created, which is the spawned-into-nothing shape
     // this plan exists to close.
+    add_planned_worktrees(planned, added).await
+}
+
+/// The `git worktree add -b` half of [`materialize_worktrees`], over rows whose
+/// source checkout is already resolved. Pushes each added row onto `added`.
+async fn add_planned_worktrees(
+    planned: Vec<(&AllocatedWorktree, PathBuf)>,
+    added: &mut Vec<crate::agent_worktree::remove_unspawned::UnspawnedBase>,
+) -> anyhow::Result<()> {
     for (wt, repo_root) in planned {
         let wt_path = Path::new(&wt.worktree_path);
         if wt_path.exists() {
@@ -10723,6 +10871,13 @@ async fn materialize_worktrees(payload: &LaunchPayload) -> anyhow::Result<()> {
             "agent_runtime: materialized worktree {} at {}",
             wt.repo, wt.worktree_path
         );
+        added.push(crate::agent_worktree::remove_unspawned::UnspawnedBase {
+            worktree_path: wt_path.to_path_buf(),
+            parent_sha: wt.parent_sha.clone(),
+            provenance: crate::agent_worktree::remove_unspawned::TreeProvenance::FreshWorktree {
+                canonical: repo_root,
+            },
+        });
     }
     Ok(())
 }
@@ -17698,6 +17853,7 @@ mod tests {
             "echo gate-continuation-proof",
             AnchorReservation::none(),
             pinned,
+            None,
         )
         .await;
         assert!(
@@ -22568,5 +22724,140 @@ mod gateway_spawn_refusal_tests {
             Ok(_) => panic!("an unresolved gateway must refuse the spawn"),
             Err(err) => assert!(format!("{err:#}").contains("model gateway"), "{err:#}"),
         }
+    }
+}
+
+/// Plan `2026-11-08-a-spawn-refused-after-its-worktree-allocation-leaves-the-tree-on-disk`
+/// Phase 3: what the gate-continuation and coord-launch doors hand the remover.
+#[cfg(test)]
+mod unspawned_door_tests {
+    use super::*;
+    use crate::agent_worktree::isolated_edit::IsolatedEditContext;
+    use crate::agent_worktree::remove_unspawned::{TreeProvenance, UnspawnedBase};
+    use crate::commands::terminal::BackendSpawnFailure;
+    use crate::terminal::spawn_refusal::SpawnFailure;
+
+    const ID: &str = "6f1c2a7e-0000-4000-8000-0000000c0a7e";
+
+    fn failure(f: SpawnFailure) -> BackendSpawnFailure {
+        BackendSpawnFailure {
+            failure: f,
+            isolated_ctx: Some(IsolatedEditContext::for_test_with_agent_id(
+                ID.to_string(),
+                Vec::new(),
+                Vec::new(),
+            )),
+        }
+    }
+
+    /// The continuation's failed create hands back its context, unparked, with
+    /// `child_started` true for a post-child failure AND for any failure on a
+    /// retry (a never-started attempt's PTY child already ran in the tree).
+    #[test]
+    fn a_continuation_create_failure_hands_back_the_context_with_its_child_flag() {
+        let (ctx, started, msg) = continuation_create_failure_handoff(
+            failure(SpawnFailure::before_child("resource_guard:critical: low")),
+            1,
+        );
+        assert_eq!(ctx.map(|c| c.agent_id.clone()).as_deref(), Some(ID));
+        assert!(!started, "a pre-child refusal on attempt 1 may be removed");
+        assert_eq!(msg, "resource_guard:critical: low");
+
+        let (_, started, _) =
+            continuation_create_failure_handoff(failure(SpawnFailure::before_child("x")), 2);
+        assert!(started, "a retry's tree already hosted a child");
+
+        let (_, started, _) = continuation_create_failure_handoff(
+            failure(SpawnFailure::after_child("Sessions lock poisoned")),
+            1,
+        );
+        assert!(started, "a post-child failure is never removed");
+    }
+
+    fn base(p: &str) -> UnspawnedBase {
+        UnspawnedBase {
+            worktree_path: PathBuf::from(p),
+            parent_sha: "abc".to_string(),
+            provenance: TreeProvenance::Unrecorded,
+        }
+    }
+
+    /// A launch whose every attempt failed before a child hands every added
+    /// tree to the remover; one where any child ran hands over none.
+    #[test]
+    fn only_a_launch_no_child_ran_in_hands_its_trees_to_the_remover() {
+        let added = vec![base("/a"), base("/b")];
+        assert_eq!(launch_trees_to_remove(added.clone(), false).len(), 2);
+        assert!(launch_trees_to_remove(added, true).is_empty());
+    }
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args([
+                "-c",
+                "user.email=t@example.invalid",
+                "-c",
+                "user.name=t",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "git {args:?} failed: {out:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// `materialize_worktrees`' add half records ONLY the rows it actually
+    /// added — an "already exists; skipping add" row is not this call's tree —
+    /// each as a fresh worktree cut from its resolved checkout.
+    #[tokio::test]
+    async fn only_the_rows_a_launch_added_become_removal_bases() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let canonical = tmp.path().join("canon");
+        std::fs::create_dir_all(&canonical).unwrap();
+        git(&canonical, &["init", "-q", "-b", "main"]);
+        std::fs::write(canonical.join("README.md"), "hi\n").unwrap();
+        git(&canonical, &["add", "README.md"]);
+        git(&canonical, &["commit", "-q", "-m", "init"]);
+        let sha = git(&canonical, &["rev-parse", "HEAD"]);
+
+        let existing = tmp.path().join("wt").join(ID).join("existing");
+        std::fs::create_dir_all(&existing).unwrap();
+        let fresh = tmp.path().join("wt").join(ID).join("canon");
+        let row = |path: &Path, branch: &str| AllocatedWorktree {
+            repo: "canon".to_string(),
+            branch: branch.to_string(),
+            parent_sha: sha.clone(),
+            worktree_path: path.to_string_lossy().into_owned(),
+            status: "allocated".to_string(),
+            push_ref: None,
+            parent_sha_provenance: Default::default(),
+        };
+        let skipped = row(&existing, "agent/existing");
+        let added_row = row(&fresh, "agent/fresh");
+        let mut added = Vec::new();
+        add_planned_worktrees(
+            vec![
+                (&skipped, canonical.clone()),
+                (&added_row, canonical.clone()),
+            ],
+            &mut added,
+        )
+        .await
+        .expect("materialized");
+
+        assert_eq!(added.len(), 1, "{added:?}");
+        assert_eq!(added[0].worktree_path, fresh);
+        assert_eq!(added[0].parent_sha, sha);
+        assert_eq!(
+            added[0].provenance,
+            TreeProvenance::FreshWorktree {
+                canonical: canonical.clone()
+            }
+        );
+        assert!(fresh.join("README.md").exists());
     }
 }

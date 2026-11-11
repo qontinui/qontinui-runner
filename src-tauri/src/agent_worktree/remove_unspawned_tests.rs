@@ -515,3 +515,47 @@ async fn the_wrapper_reports_once_per_allocation_removed_or_not() {
         assert_eq!(sibling.exists(), !expect_removed);
     }
 }
+
+/// Phase 3: the unreported form (the gate continuation's, whose own post is
+/// the allocation's one report) removes a fresh, empty tree when no child
+/// started, keeps it when one did, and marks what it removed for `Drop`.
+#[tokio::test]
+async fn the_unreported_wrapper_removes_only_when_no_child_started() {
+    use crate::agent_worktree::isolated_edit::IsolatedEditContext;
+
+    for (child_started, expect_removed) in [(false, true), (true, false)] {
+        let fx = Fixture::new();
+        let id = agent();
+        let tree = fx.allocate(&id, "canon");
+        provision_scaffolding(&tree);
+        let mut ctx = IsolatedEditContext::for_test_with_agent_id(
+            id.clone(),
+            vec![crate::agent_worktree::MaterializedWorktree {
+                repo: "canon".to_string(),
+                branch: format!("agent/{id}-canon"),
+                parent_sha: fx.parent_sha.clone(),
+                worktree_path: tree.clone(),
+                push_ref: String::new(),
+                parent_sha_provenance: Default::default(),
+            }],
+            Vec::new(),
+        );
+        ctx.set_provenance_for_test(
+            &tree,
+            TreeProvenance::FreshWorktree {
+                canonical: fx.canonical.clone(),
+            },
+        );
+        let report = ctx
+            .remove_unspawned_unreported_with("test door", child_started, "refused", fx.resolver())
+            .await;
+        assert_eq!(report.removed_all(), expect_removed, "{report:?}");
+        assert_eq!(tree.exists(), !expect_removed);
+        if child_started {
+            assert_eq!(
+                only_outcome(&report),
+                &TreeOutcome::Kept(KeepReason::ChildStarted)
+            );
+        }
+    }
+}
