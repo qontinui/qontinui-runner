@@ -1050,9 +1050,18 @@ jobs:
         # by the parallel `clippy-windows` job below (`--all-targets`, off the
         # critical path); Linux-only (cfg(unix)) test code is linted only by
         # the nightly clippy-tiers.yml job.
+        #
+        # The session-lifecycle kernel crate (plan
+        # 2026-10-28-one-session-lifecycle-authority, Phase 37) is a separate
+        # workspace member that `cd src-tauri && cargo clippy` never reaches,
+        # so it is linted here, in this REQUIRED step: all targets (a small
+        # pure crate whose tests are most of it, and which compiles none of
+        # src-tauri), and `-D warnings`, so its own [lints] table's warn tiers
+        # are fatal. Pinned by src-tauri/tests/ci_rust_test_steps_split.rs.
         run: |
           cd src-tauri
           cargo clippy
+          cargo clippy -p session-lifecycle --all-targets -- -D warnings
 
       # Run the suite under DELIBERATELY POISONED ambient state, on both legs.
       #
@@ -2407,13 +2416,6 @@ jobs:
 
       - name: Clippy holder crates
         run: cargo clippy -p qontinui-pty-holder --all-targets
-
-      # The session-lifecycle kernel (plan
-      # 2026-10-28-one-session-lifecycle-authority, Phase 37): a small pure
-      # crate the `src-tauri` clippy run does not lint. Its tests run in the
-      # required `test` job's build half; this lints it, warnings fatal.
-      - name: Clippy session-lifecycle
-        run: cargo clippy -p session-lifecycle --all-targets -- -D warnings
 
   # Gating frontend unit-test lane (vitest).
   #

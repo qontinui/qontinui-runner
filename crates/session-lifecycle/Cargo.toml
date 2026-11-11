@@ -23,3 +23,25 @@ path = "src/lib.rs"
 [dev-dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# pty-holder's tiered policy, verbatim (itself the src-tauri/Cargo.toml [lints]
+# of plan 2026-07-05-lint-tiers-and-diff-scoped-gates): correctness/suspicious
+# DENY, `string_slice` DENY, style/perf warn. The workspace defines no
+# [workspace.lints], so the table is repeated here rather than inherited. Every
+# entry applies to a pure crate as it is: `disallowed_methods` reads the
+# repo-root clippy.toml, whose entries this crate never names. CI lints it with
+# `-D warnings` in the REQUIRED `test` job's ubuntu `Clippy check` step, so the
+# warn tiers are fatal here.
+[lints.rust]
+unfulfilled_lint_expectations = "deny"
+
+[lints.clippy]
+correctness = { level = "deny", priority = 1 }
+suspicious = { level = "deny", priority = 1 }
+string_slice = { level = "deny", priority = 2 }
+disallowed_methods = { level = "deny", priority = 2 }
+perf = { level = "warn", priority = 1 }
+complexity = { level = "warn", priority = 0 }
+style = { level = "warn", priority = 0 }
+pedantic = { level = "allow", priority = 0 }
+nursery = { level = "allow", priority = 0 }
