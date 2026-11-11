@@ -27,6 +27,20 @@
 //! - **Adding a key** needs two things: declare its [`AbsentRule`], and first
 //!   read stored metadata on plan-backed units (`coord_work_unit_list`) for a
 //!   session or coord writer already using that name.
+//! - **The phase declaration is three keys resolved jointly** —
+//!   `phases` (numbered), `phase_labels` (lettered, `[{"label", "name"}]`) and
+//!   `phases_undeclared` (title tokens neither grammar reads). When the scan
+//!   declares anything in any of them, ALL THREE are sent, an empty one as
+//!   `[]`; when it declares nothing, all three are omitted, so the stored
+//!   declaration is kept ([`AbsentRule::OmitJointlyWhenNothingDeclared`], the
+//!   2026-09-16 wipe guard widened to three keys). So a plan renumbered from
+//!   letters to numbers clears its stale labels, and the reverse. Labels ride
+//!   in their own key rather than inside `phases` because a coord that does not
+//!   read them would see a label entry among numbered ones as an unreadable
+//!   declaration and un-gate the unit; a separate key is ignored by it (plan
+//!   `2026-11-09-lettered-phase-headings-never-reach-coords-phase-declaration`,
+//!   D2). Neither new key had a session or coord writer before it was added:
+//!   that plan's Phase 0 step 3 reads stored metadata for one.
 //!
 //! A stale key the scanner does NOT own is its writer's to remove with
 //! `{key: null}`; the scanner cannot know whether it is stale and must not guess.
@@ -47,14 +61,24 @@ enum AbsentRule {
     /// not read the line has no information about the stored value. Header
     /// keys also ride on the archive patch, with the same rule.
     DeleteWhenAbsent,
-    /// Omitted when absent, so the stored value is kept. This is the
-    /// 2026-09-16 guard for `phases`: a scan that detects none has no
-    /// information about a good stored list, and `phases: []` would erase it.
-    ///
-    /// Accepted trade-off: a plan whose phases are removed on purpose (or
-    /// whose headings stop parsing) no longer clears the stored list from the
-    /// adapter push. A wiped list is unrecoverable; a stale one is visible.
+    /// Omitted when absent, so the stored value is kept: a scan that finds no
+    /// value has no information about a good stored one (`repos`).
     OmitWhenAbsent,
+    /// One of the three phase-declaration keys (`phases`, `phase_labels`,
+    /// `phases_undeclared`), resolved TOGETHER: when the scan declares
+    /// anything in any of them, all three are sent, an empty one as `[]`;
+    /// when it declares nothing, all three are omitted. The omission is the
+    /// 2026-09-16 guard: a scan that detects no phases at all has no
+    /// information about a good stored declaration, and `phases: []` would
+    /// erase it. Sending the empties when something IS declared is what lets
+    /// a plan renumbered from letters to numbers (or back) clear the stale
+    /// half.
+    ///
+    /// Accepted trade-off: a plan whose phases are all removed on purpose (or
+    /// whose headings all stop parsing) no longer clears the stored
+    /// declaration from the adapter push. A wiped list is unrecoverable; a
+    /// stale one is visible.
+    OmitJointlyWhenNothingDeclared,
     /// Owned by the archive scan, which sets it. The active scan always sends
     /// `null`, so a plan restored from the archive directory clears it.
     SetByArchiveScan,
@@ -98,10 +122,23 @@ const SCANNER_OWNED_KEYS: &[ScannerKey] = &[
         name: "archive_path",
         absent_rule: AbsentRule::SetByArchiveScan,
     },
-    // `detect_phases`.
+    // `detect_phases`: numbered phases, `[{"index", "name"}]`.
     ScannerKey {
         name: "phases",
-        absent_rule: AbsentRule::OmitWhenAbsent,
+        absent_rule: AbsentRule::OmitJointlyWhenNothingDeclared,
+    },
+    // `detect_phases`: lettered arm-A phases, `[{"label", "name"}]` (plan
+    // `2026-11-09-lettered-phase-headings-never-reach-coords-phase-declaration`
+    // D1/D2).
+    ScannerKey {
+        name: "phase_labels",
+        absent_rule: AbsentRule::OmitJointlyWhenNothingDeclared,
+    },
+    // `detect_phases`: arm-A phase-title tokens neither grammar reads,
+    // `["Two"]` — so coord reads the declaration as partial (same plan, D3).
+    ScannerKey {
+        name: "phases_undeclared",
+        absent_rule: AbsentRule::OmitJointlyWhenNothingDeclared,
     },
     // The plan file's `Repo(s):` / `Repos:` line (`body_push::extract_repos`).
     // `repos` has OTHER writers: sessions hand-write `metadata.repos` with
@@ -131,6 +168,12 @@ fn declaration_rejected(key: &str, u: &ParsedWorkUnit) -> bool {
     }
 }
 
+/// True when the scan declares anything in any of the three phase-declaration
+/// keys — a numbered phase, a label, or an undeclared title token.
+fn declares_any_phase(u: &ParsedWorkUnit) -> bool {
+    !u.phases.is_empty() || !u.phase_labels.is_empty() || !u.phases_undeclared.is_empty()
+}
+
 /// The values the plan file supplies, keyed by roster name. A key the file
 /// does not supply is absent here, and [`active_dir_patch`] /
 /// [`archive_dir_patch`] apply its [`AbsentRule`].
@@ -141,7 +184,8 @@ fn build_metadata(u: &ParsedWorkUnit) -> Map<String, Value> {
         Value::String(u.source_path.clone()),
     );
     m.insert("depends_on".to_string(), serde_json::json!(u.depends_on));
-    if !u.phases.is_empty() {
+    if declares_any_phase(u) {
+        // AbsentRule::OmitJointlyWhenNothingDeclared: all three, empties as `[]`.
         m.insert(
             "phases".to_string(),
             Value::Array(
@@ -150,6 +194,19 @@ fn build_metadata(u: &ParsedWorkUnit) -> Map<String, Value> {
                     .map(|p| serde_json::json!({"index": p.index, "name": p.name}))
                     .collect(),
             ),
+        );
+        m.insert(
+            "phase_labels".to_string(),
+            Value::Array(
+                u.phase_labels
+                    .iter()
+                    .map(|p| serde_json::json!({"label": p.label, "name": p.name}))
+                    .collect(),
+            ),
+        );
+        m.insert(
+            "phases_undeclared".to_string(),
+            serde_json::json!(u.phases_undeclared),
         );
     }
     if let Some(area) = &u.area {
@@ -176,7 +233,9 @@ pub fn active_dir_patch(u: &ParsedWorkUnit) -> Value {
             continue;
         }
         match key.absent_rule {
-            AbsentRule::AlwaysSent | AbsentRule::OmitWhenAbsent => {}
+            AbsentRule::AlwaysSent
+            | AbsentRule::OmitWhenAbsent
+            | AbsentRule::OmitJointlyWhenNothingDeclared => {}
             AbsentRule::DeleteWhenAbsent => {
                 if !declaration_rejected(key.name, u) {
                     patch.insert(key.name.to_string(), Value::Null);
@@ -212,7 +271,9 @@ pub fn archive_dir_patch(u: &ParsedWorkUnit) -> Value {
                     patch.insert(key.name.to_string(), Value::Null);
                 }
             },
-            AbsentRule::AlwaysSent | AbsentRule::OmitWhenAbsent => {}
+            AbsentRule::AlwaysSent
+            | AbsentRule::OmitWhenAbsent
+            | AbsentRule::OmitJointlyWhenNothingDeclared => {}
         }
     }
     Value::Object(patch)
@@ -220,7 +281,7 @@ pub fn archive_dir_patch(u: &ParsedWorkUnit) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::super::parser::{HeaderRejection, ParsedPhase};
+    use super::super::parser::{HeaderRejection, ParsedLabelPhase, ParsedPhase};
     use super::super::push::{
         push_archive_metadata, push_work_unit_with_status_write, SetDepsOutcome, StatusWrite,
         TransitionBody, UpsertBody, WorkUnitSink, ADAPTER_ACTOR,
@@ -238,6 +299,13 @@ mod tests {
         }
     }
 
+    fn label(label: &str) -> ParsedLabelPhase {
+        ParsedLabelPhase {
+            label: label.to_string(),
+            name: format!("Phase {label}"),
+        }
+    }
+
     fn unit(slug: &str, status: &str) -> ParsedWorkUnit {
         ParsedWorkUnit {
             slug: slug.to_string(),
@@ -249,6 +317,8 @@ mod tests {
             initiative_item: None,
             initiative_item_rejected: None,
             phases: vec![phase(1)],
+            phase_labels: vec![],
+            phases_undeclared: vec![],
             repos: vec![],
             source_path: format!("plans/{slug}.md"),
             content: String::new(),
@@ -644,6 +714,24 @@ mod tests {
         out
     }
 
+    /// Probe units for the phase-declaration dimension: every combination of
+    /// numbered phases, labels and undeclared tokens being present or not.
+    fn phase_declaration_probe_units() -> Vec<ParsedWorkUnit> {
+        let mut out = vec![];
+        for phases in [&[][..], &[0u32][..]] {
+            for labels in [&[][..], &["A", "B"][..]] {
+                for undeclared in [&[][..], &["Two"][..]] {
+                    out.push(ParsedWorkUnit {
+                        phase_labels: labels.iter().copied().map(label).collect(),
+                        phases_undeclared: undeclared.iter().map(|t| t.to_string()).collect(),
+                        ..phases_unit("s", phases)
+                    });
+                }
+            }
+        }
+        out
+    }
+
     /// The roster is the whole contract: every key either patch emits is in
     /// it; every always-sent, delete-when-absent and archive-owned key is on
     /// the active patch (as a value or `null`, except a rejected header
@@ -660,7 +748,10 @@ mod tests {
             "roster names are unique"
         );
 
-        for u in roster_probe_units() {
+        for u in roster_probe_units()
+            .into_iter()
+            .chain(phase_declaration_probe_units())
+        {
             let active = active_dir_patch(&u);
             let archive = archive_dir_patch(&u);
             for (which, patch) in [("active", &active), ("archive", &archive)] {
@@ -704,6 +795,17 @@ mod tests {
                         "`{}` is sent exactly when the file supplies it: {active}",
                         key.name
                     ),
+                    AbsentRule::OmitJointlyWhenNothingDeclared => {
+                        assert_eq!(
+                            present,
+                            declares_any_phase(&u),
+                            "`{}` is sent exactly when the scan declares any phase: {active}",
+                            key.name
+                        );
+                        if present {
+                            assert!(a[key.name].is_array(), "`{}` is a list: {active}", key.name);
+                        }
+                    }
                 }
             }
             assert_eq!(archive["archive_path"], serde_json::json!(u.source_path));
@@ -785,7 +887,15 @@ mod tests {
         if !u.repos.is_empty() {
             m["repos"] = serde_json::json!(u.repos);
         }
+        // Not in the frozen arms either: `phase_labels` and `phases_undeclared`
+        // postdate them (plan
+        // `2026-11-09-lettered-phase-headings-never-reach-coords-phase-declaration`).
+        // Under the joint absent rule a unit that declares numbered phases also
+        // sends both as `[]`; passed through so T5 compares every OTHER key
+        // exactly. The probe units carry no labels and no undeclared tokens.
         if !u.phases.is_empty() {
+            m["phase_labels"] = serde_json::json!([]);
+            m["phases_undeclared"] = serde_json::json!([]);
             return (Some(m), None);
         }
         let mut patch = m;
@@ -1120,5 +1230,168 @@ mod tests {
             .as_object()
             .unwrap()
             .contains_key("repos"));
+    }
+
+    // ---- phase_labels / phases_undeclared (plan
+    // `2026-11-09-lettered-phase-headings-never-reach-coords-phase-declaration`,
+    // Phase 2) -------------------------------------------------------------------
+
+    fn phase_keys(p: &Value) -> Vec<&'static str> {
+        let obj = p.as_object().expect("a patch is an object");
+        ["phases", "phase_labels", "phases_undeclared"]
+            .into_iter()
+            .filter(|k| obj.contains_key(*k))
+            .collect()
+    }
+
+    /// D2's joint absent rule on the active patch: anything declared sends all
+    /// three keys, the empty ones as `[]`; nothing declared sends none of them.
+    /// The archive patch never carries any of the three. Fails if the empties
+    /// are not sent (a renumbered plan would keep its stale half) or if the
+    /// omission is dropped (the 2026-09-16 wipe).
+    #[test]
+    fn the_phase_declaration_keys_are_sent_jointly_or_not_at_all() {
+        let labels_only = ParsedWorkUnit {
+            phase_labels: vec![label("A"), label("B")],
+            ..phases_unit("s", &[])
+        };
+        let p = active_dir_patch(&labels_only);
+        assert_eq!(p["phases"], serde_json::json!([]), "{p}");
+        assert_eq!(
+            p["phase_labels"],
+            serde_json::json!([
+                {"label": "A", "name": "Phase A"},
+                {"label": "B", "name": "Phase B"},
+            ]),
+            "{p}"
+        );
+        assert_eq!(p["phases_undeclared"], serde_json::json!([]), "{p}");
+
+        let numeric_only = phases_unit("s", &[1]);
+        let p = active_dir_patch(&numeric_only);
+        assert_eq!(p["phases"][0]["index"], 1, "{p}");
+        assert_eq!(p["phase_labels"], serde_json::json!([]), "{p}");
+        assert_eq!(p["phases_undeclared"], serde_json::json!([]), "{p}");
+
+        let undeclared_only = ParsedWorkUnit {
+            phases_undeclared: vec!["Two".to_string()],
+            ..phases_unit("s", &[])
+        };
+        let p = active_dir_patch(&undeclared_only);
+        assert_eq!(p["phases"], serde_json::json!([]), "{p}");
+        assert_eq!(p["phase_labels"], serde_json::json!([]), "{p}");
+        assert_eq!(p["phases_undeclared"], serde_json::json!(["Two"]), "{p}");
+
+        let nothing = phases_unit("s", &[]);
+        assert!(
+            phase_keys(&active_dir_patch(&nothing)).is_empty(),
+            "nothing declared, none of the three sent: {}",
+            active_dir_patch(&nothing)
+        );
+
+        for u in [&labels_only, &numeric_only, &undeclared_only, &nothing] {
+            assert!(
+                phase_keys(&archive_dir_patch(u)).is_empty(),
+                "the archive patch never carries a phase key: {}",
+                archive_dir_patch(u)
+            );
+        }
+    }
+
+    /// End to end through coord's merge, in every arm: a plan renumbered from
+    /// letters to numbers clears its stale labels, the reverse clears its
+    /// stale numbers, an undeclared token is cleared once the title parses,
+    /// and a scan that declares nothing keeps all three stored keys.
+    #[tokio::test]
+    async fn a_renumbered_plan_clears_its_stale_half_and_an_empty_scan_keeps_all_three() {
+        let indices = |v: &Value| -> Vec<u64> {
+            v["phases"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| p["index"].as_u64().unwrap())
+                .collect()
+        };
+        let labels = |v: &Value| -> Vec<String> {
+            v["phase_labels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| p["label"].as_str().unwrap().to_string())
+                .collect()
+        };
+        for arm in ARMS {
+            let model = CoordMetadataModel::default();
+            let mixed = ParsedWorkUnit {
+                phase_labels: vec![label("A"), label("B")],
+                phases_undeclared: vec!["Two".to_string()],
+                ..phases_unit("s", &[0])
+            };
+            scan(&model, &mixed, Arm::Create).await;
+            let stored = model.stored("s");
+            assert_eq!(indices(&stored), vec![0], "{stored}");
+            assert_eq!(labels(&stored), vec!["A", "B"], "{stored}");
+            assert_eq!(stored["phases_undeclared"], serde_json::json!(["Two"]));
+
+            // Letters renumbered to numbers: the stale labels and token go.
+            scan(&model, &phases_unit("s", &[1, 2]), arm).await;
+            let stored = model.stored("s");
+            assert_eq!(indices(&stored), vec![1, 2], "{arm:?}: {stored}");
+            assert!(
+                labels(&stored).is_empty(),
+                "{arm:?}: stale labels cleared: {stored}"
+            );
+            assert_eq!(
+                stored["phases_undeclared"],
+                serde_json::json!([]),
+                "{arm:?}"
+            );
+
+            // And back: the stale numbers go.
+            let lettered = ParsedWorkUnit {
+                phase_labels: vec![label("C")],
+                ..phases_unit("s", &[])
+            };
+            scan(&model, &lettered, arm).await;
+            let stored = model.stored("s");
+            assert!(
+                indices(&stored).is_empty(),
+                "{arm:?}: stale numbers cleared: {stored}"
+            );
+            assert_eq!(labels(&stored), vec!["C"], "{arm:?}: {stored}");
+
+            // A scan that declares nothing keeps all three as stored.
+            let before = model.stored("s");
+            scan(&model, &phases_unit("s", &[]), arm).await;
+            let stored = model.stored("s");
+            for k in ["phases", "phase_labels", "phases_undeclared"] {
+                assert_eq!(stored[k], before[k], "{arm:?}: `{k}` kept: {stored}");
+            }
+        }
+    }
+
+    /// Through the real parser: the census unit's shape (`### Phase 0 …`, then
+    /// `### Phase A:` … `### Phase F:`) reaches the patch as `phases: [0]`
+    /// beside `phase_labels: A..F` and an empty `phases_undeclared`.
+    #[test]
+    fn the_census_shaped_plan_reaches_the_patch_with_its_labels() {
+        use super::super::parser::{parse_work_unit, PlanConvention};
+        let body = "# T\n\n> **Status: IN PROGRESS 2026-11-11.**\n\n### Phase 0 (read-only): re-verify\n\n### Phase A: one\n\n### Phase B: two\n\n### Phase C: three\n\n### Phase D: four\n\n### Phase E: five\n\n### Phase F: six\n";
+        let u = parse_work_unit("s", "plans/s.md", body, &PlanConvention::operator_default());
+        let p = active_dir_patch(&u);
+        assert_eq!(
+            p["phases"],
+            serde_json::json!([{"index": 0, "name": "Phase 0 (read-only): re-verify"}]),
+            "{p}"
+        );
+        let got: Vec<&str> = p["phase_labels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l["label"].as_str().unwrap())
+            .collect();
+        assert_eq!(got, vec!["A", "B", "C", "D", "E", "F"], "{p}");
+        assert_eq!(p["phase_labels"][0]["name"], "Phase A: one", "{p}");
+        assert_eq!(p["phases_undeclared"], serde_json::json!([]), "{p}");
     }
 }
