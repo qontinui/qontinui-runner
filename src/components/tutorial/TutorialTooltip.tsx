@@ -215,7 +215,7 @@ export function TutorialTooltip({
   }, [targetSelector, position, tooltipHeight, hasPositioned]);
 
   // The tooltip element exists only once it has a position.
-  const isPositioned = tooltipPosition !== null;
+  const isPositioned = isVisible && tooltipPosition !== null;
 
   // Update tooltip height when content changes, and whenever the tooltip
   // resizes on its own (opening the step's "More details" grows it).
@@ -254,7 +254,6 @@ export function TutorialTooltip({
       className={cn(
         "fixed z-tutorial-tooltip",
         "bg-card border border-border rounded-xl shadow-2xl",
-        "max-h-[calc(100vh-32px)] overflow-y-auto",
         "tutorial-scale-in",
         hasPositioned && "tutorial-tooltip-positioned",
       )}
@@ -326,8 +325,8 @@ export function TutorialTooltip({
         )}
       </div>
 
-      {/* Content */}
-      <div className="p-4 space-y-3">
+      {/* Content - scrolls by itself so the arrow outside the box stays visible */}
+      <div className="p-4 space-y-3 max-h-[calc(100vh-160px)] overflow-y-auto">
         <h3 className="font-semibold text-foreground">{title}</h3>
         <TutorialStepBody content={content} details={details} tips={tips} />
 

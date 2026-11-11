@@ -43,6 +43,7 @@ function ExternalLink({ href, children }: { href?: string; children?: ReactNode 
         e.preventDefault();
         if (href) void openUrl(href).catch((err) => console.error("Failed to open link:", err));
       }}
+      onAuxClick={(e) => e.preventDefault()}
     >
       {children}
     </a>
