@@ -3368,6 +3368,50 @@ fn rotation_log_test_dir() -> std::path::PathBuf {
     dir
 }
 
+/// The COMPLETE-line prefix of the rotation log at `path`.
+///
+/// The log is the one process-wide JSONL that [`rotation_log_test_dir`]
+/// shares. Concurrent tests append to it while others read it. Each line is a
+/// single `write_all` ending in its newline, but a reader does not take the
+/// writers' lock, so a read can land mid-append and see a peer's last line
+/// before all of it is written. That produced `EOF while parsing a string` on
+/// qontinui-runner#2791's CI. The cut can also fall inside a multi-byte UTF-8
+/// character (cause texts carry em dashes), and then `read_to_string` itself
+/// fails. So this reads BYTES, keeps everything through the last newline, and
+/// decodes that prefix strictly. Writers are serialized and append in order,
+/// so only the tail can be torn, and every byte before the last newline is a
+/// finished line.
+///
+/// An absent file is the empty log (nothing emitted yet). Any other read
+/// error, or a complete prefix that is not UTF-8, panics: this narrows WHAT is
+/// read, never what is tolerated.
+#[cfg(test)]
+fn rotation_log_complete_text(path: &std::path::Path) -> String {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return String::new(),
+        Err(e) => panic!("read rotation log {}: {e}", path.display()),
+    };
+    let complete = bytes
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map_or(&bytes[..0], |end| &bytes[..=end]);
+    String::from_utf8(complete.to_vec())
+        .unwrap_or_else(|e| panic!("complete rotation-log prefix is not UTF-8: {e}"))
+}
+
+/// Every line of `text` (a [`rotation_log_complete_text`] read), parsed
+/// strictly: a line that is not JSON is a failure, never skipped.
+#[cfg(test)]
+fn rotation_log_complete_events(text: &str) -> Vec<serde_json::Value> {
+    text.lines()
+        .map(|l| {
+            serde_json::from_str::<serde_json::Value>(l)
+                .unwrap_or_else(|e| panic!("complete rotation-log line is not JSON ({e}): {l}"))
+        })
+        .collect()
+}
+
 /// Where the rotation log lives: the same dev-logs dir every other JSONL
 /// stream resolves ([`crate::paths::get_dev_logs_dir`] — settings override
 /// first, then the app-data default, instance-scoped for secondary runners).
@@ -17699,10 +17743,9 @@ mod tests {
             "reuse registers nothing: still exactly one live binding for the cwd"
         );
 
-        let raw = std::fs::read_to_string(log_dir.join(ROTATION_LOG_FILE)).unwrap();
-        let mine: Vec<serde_json::Value> = raw
-            .lines()
-            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        let raw = rotation_log_complete_text(&log_dir.join(ROTATION_LOG_FILE));
+        let mine: Vec<serde_json::Value> = rotation_log_complete_events(&raw)
+            .into_iter()
             .filter(|v| v["workdir"] == wd.as_str())
             .collect();
         let count = |event: &str| mine.iter().filter(|v| v["event"] == event).count();
@@ -18219,10 +18262,9 @@ mod tests {
             live_binding(&live).is_some(),
             "no rotation: the same binding is still live"
         );
-        let raw = std::fs::read_to_string(log_dir.join(ROTATION_LOG_FILE)).unwrap();
-        let mine: Vec<serde_json::Value> = raw
-            .lines()
-            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        let raw = rotation_log_complete_text(&log_dir.join(ROTATION_LOG_FILE));
+        let mine: Vec<serde_json::Value> = rotation_log_complete_events(&raw)
+            .into_iter()
             .filter(|v| v["workdir"] == wd.as_str())
             .collect();
         assert_eq!(
@@ -18316,10 +18358,9 @@ mod tests {
         let _second = register_proxy_nonce(&wd, Some(term.as_str()), None); // same slot → evicts `first`
         let _bare = register_proxy_nonce(&wd, None, None); // terminal-less slot → evicts nothing
 
-        let raw = std::fs::read_to_string(dir.join(ROTATION_LOG_FILE)).unwrap();
-        let mine: Vec<serde_json::Value> = raw
-            .lines()
-            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        let raw = rotation_log_complete_text(&dir.join(ROTATION_LOG_FILE));
+        let mine: Vec<serde_json::Value> = rotation_log_complete_events(&raw)
+            .into_iter()
             .filter(|v| v["workdir"] == wd.as_str())
             .collect();
         let mints: Vec<&serde_json::Value> = mine.iter().filter(|v| v["event"] == "mint").collect();
@@ -20757,10 +20798,9 @@ mod tests {
         // adjacent `write` line keeps the stream reconstructable, but only for
         // a reader who already distrusts the cause.
         let root_str = root.to_string_lossy().to_string();
-        let log = std::fs::read_to_string(rot_dir.join(ROTATION_LOG_FILE)).unwrap();
-        let adopt_causes: Vec<String> = log
-            .lines()
-            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        let log = rotation_log_complete_text(&rot_dir.join(ROTATION_LOG_FILE));
+        let adopt_causes: Vec<String> = rotation_log_complete_events(&log)
+            .into_iter()
             .filter(|v| v["workdir"] == root_str.as_str() && v["event"] == "adopt")
             .map(|v| v["cause"].as_str().unwrap_or_default().to_string())
             .collect();
@@ -20972,10 +21012,9 @@ mod tests {
             ),
         );
 
-        let raw = std::fs::read_to_string(dir.join(ROTATION_LOG_FILE)).unwrap();
-        let mine: Vec<serde_json::Value> = raw
-            .lines()
-            .map(|l| serde_json::from_str::<serde_json::Value>(l).expect("valid JSON per line"))
+        let raw = rotation_log_complete_text(&dir.join(ROTATION_LOG_FILE));
+        let mine: Vec<serde_json::Value> = rotation_log_complete_events(&raw)
+            .into_iter()
             .filter(|v| v["workdir"] == wd.as_str() || v["workdir"] == wt_str.as_str())
             .collect();
 
@@ -21035,10 +21074,9 @@ mod tests {
         log_proxy_nonce_rejected(Some(&live), "bound but gated (401)");
         log_proxy_nonce_rejected(Some(&stranger), "unregistered (401)");
 
-        let raw = std::fs::read_to_string(dir.join(ROTATION_LOG_FILE)).unwrap();
-        let rejects: Vec<serde_json::Value> = raw
-            .lines()
-            .map(|l| serde_json::from_str::<serde_json::Value>(l).expect("valid JSON per line"))
+        let raw = rotation_log_complete_text(&dir.join(ROTATION_LOG_FILE));
+        let rejects: Vec<serde_json::Value> = rotation_log_complete_events(&raw)
+            .into_iter()
             .filter(|v| v["event"] == "reject")
             .filter(|v| {
                 v["key_prefix"] == rotation_key_prefix(&live).as_str()
@@ -21101,10 +21139,10 @@ mod tests {
         log_proxy_nonce_rejected(Some(&agent_nonce), "agent slot gone (401)");
         log_proxy_nonce_rejected(Some(&stranger), "unregistered (401)");
 
-        let raw = std::fs::read_to_string(dir.join(ROTATION_LOG_FILE)).unwrap();
+        let raw = rotation_log_complete_text(&dir.join(ROTATION_LOG_FILE));
         let line_for = |n: &str| {
-            raw.lines()
-                .map(|l| serde_json::from_str::<serde_json::Value>(l).expect("valid JSON per line"))
+            rotation_log_complete_events(&raw)
+                .into_iter()
                 .filter(|v| v["event"] == "reject")
                 .find(|v| v["key_prefix"] == rotation_key_prefix(n).as_str())
                 .unwrap_or_else(|| panic!("a reject line for {}", rotation_key_prefix(n)))
@@ -21146,6 +21184,48 @@ mod tests {
         }
     }
 
+    /// A read that lands mid-append sees a peer's last line before all of it is
+    /// written: cut anywhere, including inside a multi-byte character. The
+    /// fragment is not a line and is dropped; an absent log is empty; every
+    /// complete line is still parsed strictly.
+    #[test]
+    fn rotation_log_complete_text_drops_only_a_torn_tail() {
+        let dir = std::env::temp_dir().join(format!("rot-tail-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join(ROTATION_LOG_FILE);
+
+        assert_eq!(rotation_log_complete_text(&f), "", "absent log reads empty");
+
+        // A tail cut inside a string, as on qontinui-runner#2791's CI.
+        std::fs::write(
+            &f,
+            "{\"event\":\"mint\"}\n{\"event\":\"evict\"}\n{\"event\":\"wri",
+        )
+        .unwrap();
+        let events = rotation_log_complete_events(&rotation_log_complete_text(&f));
+        assert_eq!(events.len(), 2, "the unterminated tail is not a line");
+        assert_eq!(events[0]["event"], "mint");
+        assert_eq!(events[1]["event"], "evict");
+
+        // A tail cut after the first byte of a 3-byte em dash.
+        let mut torn = b"{\"event\":\"mint\"}\n{\"cause\":\"a ".to_vec();
+        torn.push("\u{2014}".as_bytes()[0]);
+        std::fs::write(&f, &torn).unwrap();
+        assert_eq!(rotation_log_complete_text(&f), "{\"event\":\"mint\"}\n");
+
+        // A lone fragment is no line at all.
+        std::fs::write(&f, "{\"event\":\"mi").unwrap();
+        assert_eq!(rotation_log_complete_text(&f), "");
+
+        // A COMPLETE line that is not JSON is still a failure, never skipped.
+        let corrupt = std::panic::catch_unwind(|| {
+            rotation_log_complete_events("{\"event\":\"mint\"}\nnot json\n")
+        });
+        assert!(corrupt.is_err(), "a complete non-JSON line must fail");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Phase 3: the boot restore must leave a `restore` line with honest counts
     /// — on EVERY arm, the empty one included. A `restored: 0` line is the loud
     /// signal that the persisted set was dropped (the shape a store-schema
@@ -21164,16 +21244,14 @@ mod tests {
         // owns — see `restore_forensics_lock`.
         let _serial = restore_forensics_lock();
         let dir = rotation_log_test_dir();
-        let before = std::fs::read_to_string(dir.join(ROTATION_LOG_FILE))
-            .map(|s| s.lines().count())
-            .unwrap_or(0);
+        let before =
+            rotation_log_complete_events(&rotation_log_complete_text(&dir.join(ROTATION_LOG_FILE)))
+                .len();
 
         let restores_since = || -> Vec<serde_json::Value> {
-            std::fs::read_to_string(dir.join(ROTATION_LOG_FILE))
-                .unwrap()
-                .lines()
+            rotation_log_complete_events(&rotation_log_complete_text(&dir.join(ROTATION_LOG_FILE)))
+                .into_iter()
                 .skip(before)
-                .map(|l| serde_json::from_str::<serde_json::Value>(l).expect("valid JSON per line"))
                 .filter(|v| v["event"] == "restore")
                 .collect()
         };
@@ -21306,10 +21384,9 @@ mod tests {
         let agent_nonce = register_agent_proxy_nonce(&awd, agent_id);
         revoke_agent_proxy_nonces(agent_id);
 
-        let raw = std::fs::read_to_string(dir.join(ROTATION_LOG_FILE)).unwrap();
-        let revokes: Vec<serde_json::Value> = raw
-            .lines()
-            .map(|l| serde_json::from_str::<serde_json::Value>(l).expect("valid JSON per line"))
+        let raw = rotation_log_complete_text(&dir.join(ROTATION_LOG_FILE));
+        let revokes: Vec<serde_json::Value> = rotation_log_complete_events(&raw)
+            .into_iter()
             .filter(|v| v["event"] == "revoke")
             .filter(|v| v["workdir"] == wd.as_str() || v["workdir"] == awd.as_str())
             .collect();
@@ -21359,10 +21436,9 @@ mod tests {
 
         release_workdir_on_session_close(&wd);
 
-        let raw = std::fs::read_to_string(dir.join(ROTATION_LOG_FILE)).unwrap();
-        let revokes: Vec<serde_json::Value> = raw
-            .lines()
-            .map(|l| serde_json::from_str::<serde_json::Value>(l).expect("valid JSON per line"))
+        let raw = rotation_log_complete_text(&dir.join(ROTATION_LOG_FILE));
+        let revokes: Vec<serde_json::Value> = rotation_log_complete_events(&raw)
+            .into_iter()
             .filter(|v| v["event"] == "revoke" && v["workdir"] == wd.as_str())
             .collect();
         assert_eq!(
@@ -21904,10 +21980,9 @@ mod phase2_proxy_header_shape_tests {
             &coord_mcp_proxy_config_json(9876, &nonce, ProxyConfigIdentity::device(&wt_str, None)),
         );
 
-        let raw = std::fs::read_to_string(log_dir.join(ROTATION_LOG_FILE)).unwrap();
-        let writes: Vec<serde_json::Value> = raw
-            .lines()
-            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        let raw = rotation_log_complete_text(&log_dir.join(ROTATION_LOG_FILE));
+        let writes: Vec<serde_json::Value> = rotation_log_complete_events(&raw)
+            .into_iter()
             .filter(|v| v["workdir"] == wt_str.as_str() && v["event"] == "write")
             .collect();
         assert_eq!(writes.len(), 1, "one write line for this workdir");
@@ -22174,10 +22249,9 @@ mod agent_binding_census_tests {
         let wd = format!("D:/census-wt-{}", uuid::Uuid::now_v7());
         let _nonce = register_agent_proxy_nonce(&wd, agent_id);
 
-        let raw = std::fs::read_to_string(dir.join(ROTATION_LOG_FILE)).unwrap();
-        let row = raw
-            .lines()
-            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        let raw = rotation_log_complete_text(&dir.join(ROTATION_LOG_FILE));
+        let row = rotation_log_complete_events(&raw)
+            .into_iter()
             .filter(|v| v["event"] == "agent_binding_census")
             .filter_map(|v| {
                 v["bindings"]
@@ -22200,9 +22274,8 @@ mod agent_binding_census_tests {
         assert!(row["minted_at_unix"].as_u64().unwrap_or(0) > 0);
 
         // The line is aggregate: no key material, and the count is present.
-        let line = raw
-            .lines()
-            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        let line = rotation_log_complete_events(&raw)
+            .into_iter()
             .filter(|v| v["event"] == "agent_binding_census")
             .find(|v| {
                 v["bindings"].as_array().is_some_and(|b| {
@@ -22269,10 +22342,9 @@ mod agent_binding_census_tests {
             "operation timed out",
         );
 
-        let raw = std::fs::read_to_string(dir.join(ROTATION_LOG_FILE)).unwrap();
-        let mine: Vec<serde_json::Value> = raw
-            .lines()
-            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        let raw = rotation_log_complete_text(&dir.join(ROTATION_LOG_FILE));
+        let mine: Vec<serde_json::Value> = rotation_log_complete_events(&raw)
+            .into_iter()
             .filter(|v| v["event"] == "upstream-unreachable")
             .filter(|v| v["workdir"] == wd.as_str() || v["workdir"] == wd2.as_str())
             .collect();
@@ -25796,10 +25868,9 @@ mod runner_credential_tests {
         log_proxy_runner_credential_rejected(Some(&nonce), "runner_credential_dark — local");
         log_proxy_upstream_rejected(Some(&nonce), 401, "coord rejected the injected bearer");
 
-        let log = std::fs::read_to_string(dir.join(ROTATION_LOG_FILE)).unwrap_or_default();
-        let layers: Vec<String> = log
-            .lines()
-            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        let log = rotation_log_complete_text(&dir.join(ROTATION_LOG_FILE));
+        let layers: Vec<String> = rotation_log_complete_events(&log)
+            .into_iter()
             .filter(|v| {
                 v["key_prefix"] == rotation_key_prefix(&nonce) && v["event"] == "upstream-reject"
             })
@@ -25824,10 +25895,9 @@ mod runner_credential_tests {
             Some(&nonce),
             "runner_credential_unrefreshable — refused locally",
         );
-        let log = std::fs::read_to_string(dir.join(ROTATION_LOG_FILE)).unwrap_or_default();
-        let row = log
-            .lines()
-            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        let log = rotation_log_complete_text(&dir.join(ROTATION_LOG_FILE));
+        let row = rotation_log_complete_events(&log)
+            .into_iter()
             .find(|v| {
                 v["key_prefix"] == rotation_key_prefix(&nonce) && v["event"] == "upstream-reject"
             })
