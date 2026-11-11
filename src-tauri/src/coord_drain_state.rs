@@ -2656,6 +2656,7 @@ mod tests {
             last_emitted: None,
             last_local_hold: None,
             folded_once: true,
+            dispatch_role: None,
         };
         for state in [
             CoordDrainState::Clear,
@@ -3011,10 +3012,11 @@ mod tests {
             deferred: BTreeSet::new(),
             deferred_capped: false,
             last_emitted: None,
+            last_local_hold: None,
             folded_once: true,
             dispatch_role: Some(DispatchRole::CiNode),
         };
-        let snap = snapshot_of(&CoordDrainState::Clear, &inner);
+        let snap = snapshot_of(&CoordDrainState::Clear, None, &inner);
         assert_eq!(
             snap.state, "clear",
             "the role never rewrites the drain state"
@@ -3024,7 +3026,7 @@ mod tests {
         assert_eq!(snap.dispatch_role, Some("ci_node"));
 
         inner.dispatch_role = None;
-        let snap = snapshot_of(&CoordDrainState::Clear, &inner);
+        let snap = snapshot_of(&CoordDrainState::Clear, None, &inner);
         assert!(snap.autonomous_spawns_allowed);
         assert!(!snap.agent_lane_closed_by_role);
         assert_eq!(snap.dispatch_role, None);
