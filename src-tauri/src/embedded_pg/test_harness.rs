@@ -157,6 +157,8 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(300);
 const START_ATTEMPTS: usize = 3;
 /// How long the exit-time `pg_ctl stop -m immediate` waits for the server.
 const STOP_TIMEOUT_SECS: &str = "30";
+/// The hard bound on that `pg_ctl stop` itself: its own `--timeout` plus margin.
+const STOP_WAIT: Duration = Duration::from_secs(45);
 /// A `run-*` root with no readable owner record is left alone this long: it may
 /// be a live process's root, caught between its `mkdir` and its record's write.
 const OWNERLESS_GRACE: Duration = Duration::from_secs(600);
@@ -1997,7 +1999,8 @@ impl Teardown {
 impl ClusterTeardown {
     fn run(&self) -> String {
         let stopped = if self.data_dir.join(POSTMASTER_PID).exists() {
-            let status = crate::process_helpers::no_window(&self.pg_ctl)
+            let mut command = crate::process_helpers::no_window(&self.pg_ctl);
+            command
                 .arg("stop")
                 .arg("--pgdata")
                 .arg(&self.data_dir)
@@ -2009,13 +2012,24 @@ impl ClusterTeardown {
                     STOP_TIMEOUT_SECS,
                 ])
                 .arg("--silent")
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
-            match status {
-                Ok(status) if status.success() => "cluster stopped".to_string(),
-                Ok(status) => format!("pg_ctl stop exited with {status}"),
+                .stdin(std::process::Stdio::null());
+            // Bounded twice: `pg_ctl --timeout` gives up on a server that will
+            // not stop, and the wrapper kills a `pg_ctl` that will not return.
+            match crate::process_helpers::run_with_timeout(command, STOP_WAIT) {
+                Ok(crate::process_helpers::TimedOutput::Completed(output))
+                    if output.status.success() =>
+                {
+                    "cluster stopped".to_string()
+                }
+                Ok(crate::process_helpers::TimedOutput::Completed(output)) => format!(
+                    "pg_ctl stop exited with {}: {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ),
+                Ok(crate::process_helpers::TimedOutput::TimedOut { pid, .. }) => format!(
+                    "pg_ctl stop (pid {pid}) overran {} s and was killed",
+                    STOP_WAIT.as_secs()
+                ),
                 Err(e) => format!("pg_ctl stop could not run: {e}"),
             }
         } else {
