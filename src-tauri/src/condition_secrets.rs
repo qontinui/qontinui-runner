@@ -1359,8 +1359,21 @@ pub async fn refuse_unsubstituted_placeholders(request: Request, next: Next) -> 
                  placeholder ({e}); refused",
                 parts.uri.path()
             );
+            // Over the limit is 413; any other read failure (an aborted
+            // upload, a broken stream) is the request's own fault, so 400.
+            let too_large = parts
+                .headers
+                .get(header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .is_some_and(|length| length > SCRUB_BUFFER_LIMIT);
+            let status = if too_large {
+                StatusCode::PAYLOAD_TOO_LARGE
+            } else {
+                StatusCode::BAD_REQUEST
+            };
             return (
-                StatusCode::PAYLOAD_TOO_LARGE,
+                status,
                 Json(serde_json::json!({
                     "success": false,
                     "error": format!(
@@ -1375,20 +1388,40 @@ pub async fn refuse_unsubstituted_placeholders(request: Request, next: Next) -> 
                 .into_response();
         }
     };
-    if let Some(reference) = request_placeholder(parts.uri.query(), &bytes) {
+    if request_placeholder(parts.uri.query(), &bytes).is_some() {
         info!(
             "condition_secrets: refused a secret placeholder on {}, which never substitutes",
             parts.uri.path()
         );
-        let refused = SubstitutionError::UnknownRef { reference };
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
-            Json(refused.refusal(NON_SUBSTITUTING_DETAIL)),
+            Json(non_substituting_refusal()),
         )
             .into_response();
     }
     next.run(Request::from_parts(parts, Body::from(bytes)))
         .await
+}
+
+/// The refusal [`refuse_unsubstituted_placeholders`] answers. It carries the
+/// typed [`UNKNOWN_REF_CODE`] (the same code the IPC fallback answers with:
+/// nothing here will substitute the ref) but its own message, because
+/// [`SubstitutionError::refusal`]'s says no session holds the ref, which is
+/// false here while one does. It names no ref: the one sent may be held, and
+/// a held ref read back from a response could be replayed.
+fn non_substituting_refusal() -> Value {
+    serde_json::json!({
+        "success": false,
+        "error": format!(
+            "{UNKNOWN_REF_CODE}: this route carries a `{PLACEHOLDER_OPEN}<ref>{PLACEHOLDER_CLOSE}` \
+             placeholder it would send on as literal text; {NON_SUBSTITUTING_DETAIL}. \
+             Nothing was typed."
+        ),
+        "code": UNKNOWN_REF_CODE,
+        "failure_origin": crate::journey::capture::RUNNER_REJECTION_ORIGIN,
+        "detail": NON_SUBSTITUTING_DETAIL,
+        "retryable": false,
+    })
 }
 
 /// The ref named by the first placeholder in a request's query or body. The
@@ -2250,6 +2283,10 @@ mod tests {
             assert!(
                 !answer.to_string().contains("control-pw-Ct1"),
                 "a refusal never carries a value: {answer}"
+            );
+            assert!(
+                !answer.to_string().contains("cs-ctl-pw"),
+                "a refusal never names the ref, which may be held: {answer}"
             );
             assert_eq!(
                 REACHED.load(Ordering::SeqCst),
