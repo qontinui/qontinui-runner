@@ -140,6 +140,15 @@ impl QontinuiWorkflow for QontinuiWorkflowImpl {
         let mut verification_passed = false;
         let mut was_stopped = false;
         let mut iterations_run = 0u32;
+        // Set when a verification batch checked nothing (no required step):
+        // the run ends there, not passed, with no agentic iteration.
+        let mut no_verification_steps = false;
+        // A property of the workflow's input, read once and outside any
+        // journalled side effect, so a replay reads the same answer.
+        let verification_checks_nothing =
+            super::durable_executor::verification_batch_checks_nothing(
+                &input.verification_steps_json,
+            );
 
         // Update task run status
         if let Err(e) = pg_db.update_task_run_status(&execution_id, "running").await {
@@ -273,10 +282,25 @@ impl QontinuiWorkflow for QontinuiWorkflowImpl {
 
             iterations_run = iteration;
 
-            if v_result.all_passed {
-                info!(execution_id = %execution_id, iteration, "Verification PASSED");
-                verification_passed = true;
-                break;
+            match super::durable_executor::durable_verification_verdict(
+                verification_checks_nothing,
+                v_result.all_passed,
+            ) {
+                super::durable_executor::DurableVerificationVerdict::Passed => {
+                    info!(execution_id = %execution_id, iteration, "Verification PASSED");
+                    verification_passed = true;
+                    break;
+                }
+                super::durable_executor::DurableVerificationVerdict::NoVerificationSteps => {
+                    warn!(
+                        execution_id = %execution_id,
+                        iteration,
+                        "Verification CHECKED NOTHING (no required verification step): the run is not verified"
+                    );
+                    no_verification_steps = true;
+                    break;
+                }
+                super::durable_executor::DurableVerificationVerdict::Failed => {}
             }
 
             let failure_ctx = v_result
@@ -445,8 +469,10 @@ impl QontinuiWorkflow for QontinuiWorkflowImpl {
             },
         );
 
-        // If failed, execute saga compensations
-        if !success && !was_stopped {
+        // If failed, execute saga compensations — never for a run whose
+        // verification checked nothing: nothing refuted its work, so nothing
+        // is undone.
+        if !success && !was_stopped && !no_verification_steps {
             let compensations: Option<restate_sdk::serde::Json<Vec<CompensationAction>>> = ctx
                 .get(COMPENSATIONS_KEY)
                 .await
@@ -473,7 +499,10 @@ impl QontinuiWorkflow for QontinuiWorkflowImpl {
             was_stopped,
             duration_ms,
             files_modified,
-            error: None,
+            error: no_verification_steps.then(|| {
+                "No required verification step ran, so nothing was checked: the run is not verified"
+                    .to_string()
+            }),
         };
 
         info!(
@@ -509,7 +538,7 @@ impl QontinuiWorkflow for QontinuiWorkflowImpl {
 
         // SharedWorkflowContext is read-only — cannot call set().
         // Instead, signal the stop through the database. The running workflow's
-        // is_stop_requested() polls PG for status == "cancelling" || "stopped".
+        // per-iteration stop check in `run` polls PG for status == "cancelling" || "stopped".
         let app_state = get_app_state()?;
         if let Err(e) = app_state
             .pg_db

@@ -5053,6 +5053,15 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
             "/ui-bridge/control/page/type-into",
             post(ui_bridge_type_into_handler),
         )
+        // The WebSocket-app branches answer with the app's own content, so
+        // while a condition-check session holds a secret no response here
+        // carries it (`crate::condition_secrets`, plan
+        // 2026-11-06-a-regression-test-run-is-judged-by-what-it-covered-and-a-silent-run-reads-unknown
+        // Phase 13). LAST, because `Router::layer` wraps only the routes
+        // registered before it.
+        .layer(axum::middleware::from_fn(
+            crate::condition_secrets::scrub_sdk_responses,
+        ))
 }
 
 /// Static (method, path) tuples corresponding to every route registered

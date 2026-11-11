@@ -90,7 +90,11 @@ mod tests {
             // token slot (coord finding e871ac27).
             // 533 -> 531: `get_active_pr_watches` and `has_review_subtask_for_pr`
             // deleted with the PR-watch chain, which had no writer left.
-            baseline: 531,
+            // 531 -> 530: reflection.rs `evaluate_pending_fixes` reads its
+            // exposure counts with try_get (plan
+            // 2026-11-06-a-product-workflow-verification-with-nothing-to-check-never-reports-passed,
+            // Phase 4).
+            baseline: 530,
             gate_wiring: &[
                 ("clippy.toml", "disallowed-methods"),
                 ("clippy.toml", "tokio_postgres::Row::get"),
