@@ -48,9 +48,18 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { readFileSync, existsSync, mkdtempSync, readdirSync, statSync } from "node:fs";
+import {
+  readFileSync,
+  existsSync,
+  mkdtempSync,
+  readdirSync,
+  realpathSync,
+  rmSync,
+  statSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, sep, posix } from "node:path";
+import { pathToFileURL } from "node:url";
 
 // MUST be the "owner/name" webhook form — coord's join keys on it verbatim
 // (`score_for_head` / `flakiness_priors` select `WHERE repo = $1`, and
@@ -147,6 +156,26 @@ function normalizeSourcePath(absOrRel) {
   if (/\.(test|spec)\.(ts|tsx|js|jsx|mjs|cjs|mts|cts)$/.test(rel)) return null;
   if (!rel.startsWith("src/")) return null;
   return rel;
+}
+
+/**
+ * Run `fn` with a fresh `covprod-*` dir under the OS tmpdir, and remove that
+ * dir afterwards, also when `fn` throws. `fn` must read everything it needs out
+ * of the dir before returning. Without the removal every test file leaves a
+ * ~24 MB dir behind, and on a CI runner whose /tmp is a RAM-backed PrivateTmp
+ * that is RAM held for the life of the runner unit (plan
+ * 2026-11-10-devops-coverage-producer-leaves-a-covprod-dir-per-test-file-in-ram-tmp).
+ * @template T
+ * @param {(dir: string) => T} fn
+ * @returns {T}
+ */
+export function withScratchDir(fn) {
+  const dir = mkdtempSync(join(tmpdir(), "covprod-"));
+  try {
+    return fn(dir);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 }
 
 /**
@@ -290,9 +319,10 @@ async function main() {
   const junitDocs = [];
 
   for (const testFileRel of testFiles) {
-    const outDir = mkdtempSync(join(tmpdir(), "covprod-"));
     info(`running ${testFileRel}`);
-    const { filesTouched, junitXml } = runOneFile(testFileRel, outDir);
+    const { filesTouched, junitXml } = withScratchDir((outDir) =>
+      runOneFile(testFileRel, outDir),
+    );
 
     const testId = toRepoRelTestId(testFileRel);
     observations.push({
@@ -350,10 +380,17 @@ async function main() {
   return 0;
 }
 
-main()
-  .then((code) => process.exit(code))
-  .catch((e) => {
-    // Top-level guard: never fail the lane.
-    warn(`unexpected error: ${e} — exiting 0 (best-effort)`);
-    process.exit(0);
-  });
+// Run only when executed directly, so a test can import withScratchDir.
+// import.meta.url names the real path, so compare against argv[1]'s real path.
+if (
+  process.argv[1] &&
+  import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href
+) {
+  main()
+    .then((code) => process.exit(code))
+    .catch((e) => {
+      // Top-level guard: never fail the lane.
+      warn(`unexpected error: ${e} — exiting 0 (best-effort)`);
+      process.exit(0);
+    });
+}
