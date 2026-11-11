@@ -256,8 +256,8 @@ defer_classes! {
 
 impl DeferClass {
     /// The class whose [`Self::code`] is `code` — the reading a caller of a
-    /// spawn door needs to tell the door's drain deferral (a 409 whose body
-    /// carries this code) from any other refusal.
+    /// spawn door needs to tell the door's drain-gate deferral (a 409 whose
+    /// body carries this code) from any other refusal.
     pub fn from_code(code: &str) -> Option<DeferClass> {
         Self::ALL.into_iter().find(|class| class.code() == code)
     }

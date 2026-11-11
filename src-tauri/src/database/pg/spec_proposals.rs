@@ -12,8 +12,9 @@
 //! See `spec_api/proposals.rs`: the execute handler claims a `queued` row
 //! (`queued → inFlight`, one compare-and-set that writes a claim token into
 //! `metadata.execute`) and moves it on to `pendingPromotion | failed`, or back
-//! to `queued` when the device drain or the agent registry does not admit the
-//! run, or when the execute is abandoned before its outcome is written. Each
+//! to `queued` when the drain gate (coord's drain or the device's dispatch
+//! role) or the agent registry does not admit the run, or when the execute is
+//! abandoned before its outcome is written. Each
 //! of those writes lands only while the execute's claim is still held. The
 //! scan re-queues a row whose claim has outlived the claimant's own bound (an
 //! execute that died) and stops the task run that execute recorded. The

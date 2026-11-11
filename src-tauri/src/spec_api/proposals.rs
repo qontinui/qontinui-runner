@@ -20,9 +20,10 @@
 //!   Authoring runs an AI meta-workflow on the user's account, so only a
 //!   `queued` proposal is executed (`queued → inFlight` is one
 //!   compare-and-set that writes a claim token; anything else answers 409
-//!   `proposal-not-queued`), and the run is authorized first: when coord's
-//!   device drain defers it, or the agent registry refuses it, nothing is
-//!   spawned, the proposal goes back to `queued` and the answer is
+//!   `proposal-not-queued`), and the run is authorized first: when the drain
+//!   gate (coord's drain or the device's dispatch role) defers it, or the
+//!   agent registry refuses it, nothing is spawned, the proposal goes back to
+//!   `queued` and the answer is
 //!   `outcome: "skipped"`. Every write the execute makes to the row matches
 //!   its claim token. An execute whose caller goes away before its outcome is
 //!   written also puts the proposal back in the queue; one that died with its
@@ -481,7 +482,8 @@ pub(crate) async fn query_eligible_pathnames(
 
 /// `POST /apps/{app_id}/spec/proposals/{id}/execute`. An HTTP caller — a
 /// script, an agent, a UI-Bridge-driven call — is autonomous (`unknown`) under
-/// coord's device drain, as at every other spawn door.
+/// the drain gate (coord's drain and the device's dispatch role), as at every
+/// other spawn door.
 pub async fn post_execute(
     AxPath((app_id, id)): AxPath<(String, String)>,
     State(state): State<Arc<ApiState>>,
@@ -490,9 +492,9 @@ pub async fn post_execute(
 }
 
 /// Execute `app_id`'s proposal `id` on behalf of `origin`. The AI meta-workflow
-/// that authoring runs is spawned under `origin`: the device drain and the
-/// agent registry judge it there, and a spawn they do not admit leaves the
-/// proposal `queued` (see [`execute_skip`]).
+/// that authoring runs is spawned under `origin`: the drain gate and the agent
+/// registry judge it there, and a spawn they do not admit leaves the proposal
+/// `queued` (see [`execute_skip`]).
 pub async fn execute_proposal(
     state: Arc<ApiState>,
     app_id: String,
@@ -1081,7 +1083,7 @@ fn authoring_error_reason(
 }
 
 /// PURE: an execute that was never admitted — `(HTTP status, outcome reason,
-/// drain code)` — or `None` for every real authoring outcome. The drain
+/// drain-gate code)` — or `None` for every real authoring outcome. The drain
 /// gate's deferral answers 409 with coord's code, as every spawn door does; a
 /// registry refusal answers 403. The reasons are the flywheel's `skipped:`
 /// vocabulary: `drained` (a drained device, or an unreadable drain state),

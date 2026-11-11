@@ -162,8 +162,9 @@ pub(crate) fn run_door_body() -> serde_json::Value {
 
 /// PURE: the task run the run door started, or why there is none. The door
 /// answers `ApiResponse { data: { task_run_id } }` on 200. A 409 whose `code`
-/// is a drain code is the door's own drain gate deferring the run, which can
-/// happen when the drain changes between [`admission`] and the door call.
+/// is a drain-gate code is the door's own drain gate deferring the run, which
+/// can happen when the drain or the dispatch role changes between
+/// [`admission`] and the door call.
 pub(crate) fn started_task_run(reply: &DoorReply) -> Result<String, MetaWorkflowError> {
     if reply.status == 200 {
         return reply
@@ -938,17 +939,18 @@ mod tests {
     }
 
     #[test]
-    fn the_doors_own_drain_refusal_is_a_deferral_for_every_class() {
+    fn the_doors_own_drain_gate_refusal_is_a_deferral_for_every_class() {
         for class in DeferClass::ALL {
+            let reason = format!("the drain gate deferred it ({})", class.label());
             let refused = from_the_door(Err((
                 StatusCode::CONFLICT,
-                Json(api_refusal("coord has drained this device", class)),
+                Json(api_refusal(&reason, class)),
             )));
             assert_eq!(
                 started_task_run(&refused),
                 Err(MetaWorkflowError::Deferred {
                     code: class.code(),
-                    reason: "coord has drained this device".into()
+                    reason
                 }),
                 "{class:?}"
             );
