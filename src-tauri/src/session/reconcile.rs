@@ -1131,6 +1131,7 @@ struct ProviderEntry {
 
 impl ProviderRows {
     /// Rows with no anchor information (pid 0, creation unknown).
+    #[cfg(test)]
     pub fn from_pairs(pairs: impl IntoIterator<Item = (String, ProviderRowValidity)>) -> Self {
         Self::from_entries(pairs.into_iter().map(|(t, v)| (t, (0, None), v)))
     }
@@ -1147,6 +1148,7 @@ impl ProviderRows {
     }
 
     /// The session id this terminal's anchor provably runs, if any.
+    #[cfg(test)]
     pub fn valid_id(&self, terminal_id: &str) -> Option<&str> {
         match &self.by_terminal.get(terminal_id)?.verdict {
             ProviderRowValidity::Valid { session_id, .. } => Some(session_id),
@@ -1154,15 +1156,16 @@ impl ProviderRows {
         }
     }
 
-    pub fn has_valid(&self, terminal_id: &str) -> bool {
-        self.valid_id(terminal_id).is_some()
-    }
-
-    /// Every `(terminal id, valid session id)`, in no particular order.
-    pub fn valid(&self) -> impl Iterator<Item = (&str, &str)> {
-        self.by_terminal
-            .keys()
-            .filter_map(|t| self.valid_id(t).map(|id| (t.as_str(), id)))
+    /// Every `(terminal id, valid session id, config dir the row was read
+    /// from)`, in no particular order.
+    pub fn valid(&self) -> impl Iterator<Item = (&str, &str, &Path)> {
+        self.by_terminal.iter().filter_map(|(t, e)| match &e.verdict {
+            ProviderRowValidity::Valid {
+                session_id,
+                config_dir,
+            } => Some((t.as_str(), session_id.as_str(), config_dir.as_path())),
+            _ => None,
+        })
     }
 
     /// Every `(terminal id, anchor, verdict)` read this tick.
@@ -1912,10 +1915,20 @@ mod tests {
     /// the same file read against a pid reused after it is not.
     #[test]
     fn provider_rows_are_read_per_anchor_and_a_reused_pid_is_rejected() {
-        let (_d, rows) = rows_fixture(1_790_000_000, 1_790_000_000);
+        let (d, rows) = rows_fixture(1_790_000_000, 1_790_000_000);
         assert_eq!(
             rows.valid_id("term-1"),
             Some("44348633-0000-4000-8000-000000000002")
+        );
+        // The config dir the valid row was read from rides along with it.
+        let valid: Vec<_> = rows.valid().collect();
+        assert_eq!(
+            valid,
+            vec![(
+                "term-1",
+                "44348633-0000-4000-8000-000000000002",
+                d.path()
+            )]
         );
         let (_d, rows) = rows_fixture(1_790_000_000, 1_790_000_000 - 7200);
         assert_eq!(rows.valid_id("term-1"), None);
