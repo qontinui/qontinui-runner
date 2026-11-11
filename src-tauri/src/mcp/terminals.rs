@@ -338,6 +338,33 @@ pub(crate) fn edit_sibling_bad_request(
     (StatusCode::BAD_REQUEST, Json(body))
 }
 
+/// Resolve `POST /terminals`' optional account pin into the PTY trust arm and
+/// the `CLAUDE_CONFIG_DIR` to seed — or the typed refusal (400 not in the
+/// roster, 409 logged out). Pure of the allocation, so the handler runs it
+/// before `acquire_for_terminal`: a refusal must never strand a fresh tree.
+// The refusal is this module's standard handler error, kept as-is so `?`
+// returns it from the handler unchanged.
+#[allow(clippy::result_large_err)]
+fn resolve_account_pin(
+    account: Option<&str>,
+) -> Result<(crate::terminal::TrustArm, Option<String>), (StatusCode, Json<ApiResponse<()>>)> {
+    let Some(account) = account.filter(|a| !a.is_empty()) else {
+        return Ok((crate::terminal::TrustArm::AccountChosenLater, None));
+    };
+    match crate::ai_provider::resolve_requested_account(account) {
+        Ok(resolved) => Ok((
+            crate::terminal::TrustArm::Pinned(Some(resolved.config_dir.clone())),
+            Some(resolved.config_dir),
+        )),
+        Err(e @ crate::ai_provider::AccountSelectError::NotInRoster { .. }) => {
+            Err((StatusCode::BAD_REQUEST, Json(api_error(e.message()))))
+        }
+        Err(e @ crate::ai_provider::AccountSelectError::NotLoggedIn { .. }) => {
+            Err((StatusCode::CONFLICT, Json(api_error(e.message()))))
+        }
+    }
+}
+
 /// Create a new terminal session.
 pub async fn create_terminal_handler(
     State(state): State<Arc<ApiState>>,
@@ -417,6 +444,19 @@ pub async fn create_terminal_handler(
     crate::resource_guard::precheck_spawn("terminal session", false)
         .map_err(terminal_spawn_failed)?;
 
+    // Per-request account pin: resolve → validate, BEFORE the allocation below —
+    // a refusal here used to come after `acquire_for_terminal` and drop its
+    // context, leaving a fresh tree on disk with no spawn-failed report.
+    // Bogus name → 400, logged-out → 409 — same contract as /sessions/spawn.
+    // The trust arm follows the pin: a resolved account means workspace trust is
+    // DERIVED for that one account at the PTY seam (and the dial is warmed here,
+    // the async side, so the seam's sync gate does not decide on a cold cache);
+    // no account means it is chosen by whatever the caller types.
+    let (trust_arm, pinned_config_dir) = resolve_account_pin(request.account.as_deref())?;
+    if pinned_config_dir.is_some() {
+        crate::claude_session::trust_gate::warm_dial().await;
+    }
+
     // Phase 2 round 2 — route through the shared `acquire_for_terminal`
     // helper so this entry point matches the other five
     // terminal_manager.create call sites. `intent_repo == None` is a
@@ -448,28 +488,10 @@ pub async fn create_terminal_handler(
         )
         .unwrap_or_default();
 
-    // Per-request account pin: resolve → validate → pre-seed CLAUDE_CONFIG_DIR
-    // onto the PTY env (merged with the session env above, not replacing it).
-    // Bogus name → 400, logged-out → 409 — same contract as /sessions/spawn.
-    // The trust arm follows the pin: a resolved account means workspace trust is
-    // DERIVED for that one account at the PTY seam (and the dial is warmed here,
-    // the async side, so the seam's sync gate does not decide on a cold cache);
-    // no account means it is chosen by whatever the caller types.
-    let mut trust_arm = crate::terminal::TrustArm::AccountChosenLater;
-    if let Some(account) = request.account.as_deref().filter(|a| !a.is_empty()) {
-        match crate::ai_provider::resolve_requested_account(account) {
-            Ok(resolved) => {
-                trust_arm = crate::terminal::TrustArm::Pinned(Some(resolved.config_dir.clone()));
-                extra_env_vec.push(("CLAUDE_CONFIG_DIR".to_string(), resolved.config_dir));
-                crate::claude_session::trust_gate::warm_dial().await;
-            }
-            Err(e @ crate::ai_provider::AccountSelectError::NotInRoster { .. }) => {
-                return Err((StatusCode::BAD_REQUEST, Json(api_error(e.message()))));
-            }
-            Err(e @ crate::ai_provider::AccountSelectError::NotLoggedIn { .. }) => {
-                return Err((StatusCode::CONFLICT, Json(api_error(e.message()))));
-            }
-        }
+    // The account pin resolved BEFORE the allocation (above); its config dir
+    // joins the session env here, merged rather than replacing it.
+    if let Some(dir) = pinned_config_dir {
+        extra_env_vec.push(("CLAUDE_CONFIG_DIR".to_string(), dir));
     }
 
     let extra_env = if extra_env_vec.is_empty() {

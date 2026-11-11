@@ -2731,7 +2731,8 @@ fn warn_untracked_backend_spawn(
 /// `None`, or does not care, takes the message through `String::from`.
 pub(crate) struct BackendSpawnFailure {
     pub(crate) failure: crate::terminal::spawn_refusal::SpawnFailure,
-    pub(crate) isolated_ctx: Option<crate::agent_worktree::isolated_edit::IsolatedEditContext>,
+    /// Boxed: the context is large and rides only the failure arm.
+    pub(crate) isolated_ctx: Option<Box<crate::agent_worktree::isolated_edit::IsolatedEditContext>>,
 }
 
 impl std::fmt::Debug for BackendSpawnFailure {
@@ -2942,7 +2943,7 @@ pub(crate) fn create_terminal_session_backend(
         Err(failure) => {
             return Err(BackendSpawnFailure {
                 failure,
-                isolated_ctx,
+                isolated_ctx: isolated_ctx.map(Box::new),
             })
         }
     };

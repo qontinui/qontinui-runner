@@ -559,3 +559,140 @@ async fn the_unreported_wrapper_removes_only_when_no_child_started() {
         }
     }
 }
+
+/// Review fix 6: a removed tree's `agent/…` branch is safe-deleted
+/// (`git branch -d`) from the canonical checkout.
+#[tokio::test]
+async fn a_removed_trees_agent_branch_is_deleted() {
+    let fx = Fixture::new();
+    let id = agent();
+    let tree = fx.allocate(&id, "canon");
+    let branch = format!("agent/{id}-canon");
+    assert!(!git(&fx.canonical, &["branch", "--list", &branch]).is_empty());
+
+    let report = run(&fx, &id, vec![fx.fresh(&tree)], false).await;
+
+    assert_eq!(only_outcome(&report), &TreeOutcome::Removed);
+    assert!(
+        git(&fx.canonical, &["branch", "--list", &branch]).is_empty(),
+        "the agent branch `worktree add -b` cut is gone"
+    );
+}
+
+/// Review fix 4: when `git worktree remove` refuses AFTER the scaffolding was
+/// deleted (here: a locked worktree), the keep reason says the scaffolding is
+/// already gone.
+#[tokio::test]
+async fn a_refused_remove_after_scaffolding_cleanup_says_it_was_deleted() {
+    let fx = Fixture::new();
+    let id = agent();
+    let tree = fx.allocate(&id, "canon");
+    provision_scaffolding(&tree);
+    git(&fx.canonical, &["worktree", "lock", tree.to_str().unwrap()]);
+
+    let report = run(&fx, &id, vec![fx.fresh(&tree)], false).await;
+
+    match only_outcome(&report) {
+        TreeOutcome::Kept(KeepReason::RemoveFailed(why)) => {
+            assert!(why.contains("runner scaffolding already deleted"), "{why}")
+        }
+        other => panic!("expected RemoveFailed, got {other:?}"),
+    }
+    assert!(tree.exists(), "the locked tree is kept");
+    assert!(
+        !tree.join(".mcp.json").exists(),
+        "its scaffolding was deleted"
+    );
+}
+
+/// Review fix 5: with `status.showUntrackedFiles=no` the dirty probe's plain
+/// porcelain hides an operator's untracked file; the removal's own listing
+/// passes `--untracked-files=all`, so the scaffolding guard sees and refuses it
+/// (before `git worktree remove` would be the only thing left to).
+#[tokio::test]
+async fn an_untracked_file_hidden_by_show_untracked_no_still_keeps_the_tree() {
+    let fx = Fixture::new();
+    let id = agent();
+    let tree = fx.allocate(&id, "canon");
+    git(
+        &fx.canonical,
+        &["config", "status.showUntrackedFiles", "no"],
+    );
+    provision_scaffolding(&tree);
+    std::fs::write(tree.join("notes.txt"), "operator work\n").unwrap();
+
+    let report = run(&fx, &id, vec![fx.fresh(&tree)], false).await;
+
+    match only_outcome(&report) {
+        TreeOutcome::Kept(KeepReason::Scaffolding(why)) => {
+            assert!(why.contains("notes.txt"), "{why}")
+        }
+        other => panic!("expected the scaffolding listing to refuse, got {other:?}"),
+    }
+    assert!(tree.join("notes.txt").exists());
+}
+
+/// Review fix 8: an untracked `.claude` (and a `.claude/commands`) that is a
+/// SYMLINK pointing outside the tree is unlinked, never followed — the target
+/// survives the removal.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_symlinked_claude_dir_is_unlinked_and_its_target_survives() {
+    for nested in [false, true] {
+        let fx = Fixture::new();
+        let id = agent();
+        let tree = fx.allocate(&id, "canon");
+        let outside = fx
+            .worktree_root
+            .parent()
+            .unwrap()
+            .join(format!("outside-{nested}"));
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("keep.md"), "operator file\n").unwrap();
+        if nested {
+            std::fs::create_dir_all(tree.join(".claude")).unwrap();
+            std::os::unix::fs::symlink(&outside, tree.join(".claude").join("commands")).unwrap();
+        } else {
+            std::os::unix::fs::symlink(&outside, tree.join(".claude")).unwrap();
+        }
+
+        let report = run(&fx, &id, vec![fx.fresh(&tree)], false).await;
+
+        assert_eq!(
+            only_outcome(&report),
+            &TreeOutcome::Removed,
+            "nested={nested}"
+        );
+        assert!(!tree.exists());
+        assert!(
+            outside.join("keep.md").exists(),
+            "the symlink's target survives (nested={nested})"
+        );
+    }
+}
+
+/// Review fix 7: the removal waits for a credential-helper install still in
+/// flight for the allocation before it judges (and removes) anything.
+#[tokio::test]
+async fn the_removal_waits_for_an_in_flight_credential_install() {
+    let fx = Fixture::new();
+    let id = agent();
+    let tree = fx.allocate(&id, "canon");
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = done.clone();
+    crate::credential_helper::track_install(
+        &id,
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        }),
+    );
+
+    let report = run(&fx, &id, vec![fx.fresh(&tree)], false).await;
+
+    assert!(
+        done.load(std::sync::atomic::Ordering::SeqCst),
+        "the install finished before the removal returned"
+    );
+    assert_eq!(only_outcome(&report), &TreeOutcome::Removed);
+}

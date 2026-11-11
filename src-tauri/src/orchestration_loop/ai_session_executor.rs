@@ -685,7 +685,7 @@ pub async fn dispatch_subtask(
                     // cannot tell which, so the tree is treated as one a child
                     // may have run in: kept, and the allocation reported.
                     child_started: true,
-                    ctx: isolated_ctx,
+                    ctx: isolated_ctx.map(Box::new),
                 });
             }
         };
@@ -711,7 +711,7 @@ pub async fn dispatch_subtask(
                     "dispatch_subtask: register session: {e} (the spawned CLI was closed)"
                 ),
                 child_started: true,
-                ctx,
+                ctx: ctx.map(Box::new),
             });
         }
 
@@ -726,7 +726,7 @@ pub async fn dispatch_subtask(
                      unregistered)"
                 ),
                 child_started: true,
-                ctx,
+                ctx: ctx.map(Box::new),
             });
         }
 
@@ -928,7 +928,8 @@ const WORKER_DOOR: &str = "orchestration worker";
 struct WorkerSpawnFailure {
     message: String,
     child_started: bool,
-    ctx: Option<crate::agent_worktree::isolated_edit::IsolatedEditContext>,
+    /// Boxed: the context is large and rides only the failure arm.
+    ctx: Option<Box<crate::agent_worktree::isolated_edit::IsolatedEditContext>>,
 }
 
 /// Settle a worker's blocking spawn (plan
@@ -952,7 +953,7 @@ fn settle_worker_spawn(
         Ok(Ok(())) => Ok(()),
         Ok(Err(failure)) => {
             if let Some(ctx) = failure.ctx {
-                remove(ctx, failure.child_started, &failure.message);
+                remove(*ctx, failure.child_started, &failure.message);
             }
             Err(failure.message)
         }
@@ -1342,7 +1343,7 @@ mod worker_unspawned_tests {
             let joined = Ok(Err(WorkerSpawnFailure {
                 message: "spawn failed: boom".to_string(),
                 child_started,
-                ctx: ctx(),
+                ctx: ctx().map(Box::new),
             }));
             let out = settle_worker_spawn(joined, |c, started, msg| {
                 handed.push((c.agent_id.clone(), started, msg.to_string()))

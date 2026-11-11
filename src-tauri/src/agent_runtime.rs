@@ -8291,7 +8291,11 @@ fn continuation_create_failure_handoff(
     String,
 ) {
     let child_started = failure.failure.child_started || attempt > 1;
-    (failure.isolated_ctx, child_started, failure.failure.message)
+    (
+        failure.isolated_ctx.map(|c| *c),
+        child_started,
+        failure.failure.message,
+    )
 }
 
 /// What a terminal continuation that STARTED reports back to its caller.
@@ -22742,11 +22746,11 @@ mod unspawned_door_tests {
     fn failure(f: SpawnFailure) -> BackendSpawnFailure {
         BackendSpawnFailure {
             failure: f,
-            isolated_ctx: Some(IsolatedEditContext::for_test_with_agent_id(
+            isolated_ctx: Some(Box::new(IsolatedEditContext::for_test_with_agent_id(
                 ID.to_string(),
                 Vec::new(),
                 Vec::new(),
-            )),
+            ))),
         }
     }
 
