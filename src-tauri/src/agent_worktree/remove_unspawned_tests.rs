@@ -833,3 +833,52 @@ async fn an_install_that_will_not_stop_keeps_every_tree() {
     );
     assert!(tree.exists());
 }
+
+/// Review item 5. The runner's materialize writes NO `node_modules` link into a
+/// tree (only the hand-run `allocate-worktree.sh` does, and its trees never
+/// reach this removal), so there is no materialize-written ignored entry to
+/// allowlist. An ignored `node_modules` — a real directory or a symlink — is
+/// therefore never this removal's to delete: it keeps the tree as
+/// `IgnoredContent`, and a symlink's target is untouched.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_ignored_node_modules_dir_or_link_keeps_the_tree() {
+    for as_link in [false, true] {
+        let fx = Fixture::new();
+        let id = agent();
+        let tree = fx.allocate(&id, "canon");
+        std::fs::create_dir_all(fx.canonical.join(".git/info")).unwrap();
+        std::fs::write(fx.canonical.join(".git/info/exclude"), "node_modules\n").unwrap();
+        let shared = fx
+            .worktree_root
+            .parent()
+            .unwrap()
+            .join(format!("nm-{as_link}"));
+        std::fs::create_dir_all(shared.join("pkg")).unwrap();
+        std::fs::write(shared.join("pkg").join("index.js"), "x\n").unwrap();
+        if as_link {
+            std::os::unix::fs::symlink(&shared, tree.join("node_modules")).unwrap();
+        } else {
+            std::fs::create_dir_all(tree.join("node_modules").join("pkg")).unwrap();
+            std::fs::write(
+                tree.join("node_modules").join("pkg").join("index.js"),
+                "x\n",
+            )
+            .unwrap();
+        }
+
+        let report = run(&fx, &id, vec![fx.fresh(&tree)], false).await;
+
+        match only_outcome(&report) {
+            TreeOutcome::Kept(KeepReason::IgnoredContent(p)) => {
+                assert!(p.starts_with("node_modules"), "as_link={as_link}: {p}")
+            }
+            other => panic!("as_link={as_link}: expected IgnoredContent, got {other:?}"),
+        }
+        assert!(tree.join("node_modules").exists(), "as_link={as_link}");
+        assert!(
+            shared.join("pkg").join("index.js").exists(),
+            "the link target is untouched"
+        );
+    }
+}

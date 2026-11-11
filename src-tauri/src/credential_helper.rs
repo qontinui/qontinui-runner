@@ -1289,7 +1289,7 @@ fn wait_for_installs(pending: &[tokio::task::JoinHandle<()>], wait: Duration) ->
     for h in pending {
         h.abort();
     }
-    poll(std::time::Instant::now() + (wait / 10).max(Duration::from_millis(100)))
+    poll(std::time::Instant::now() + abort_grace(wait))
 }
 
 /// In-flight credential-helper installs, keyed by the agent id they install
@@ -1318,34 +1318,56 @@ fn take_installs(session_id: &str) -> Vec<tokio::task::JoinHandle<()>> {
         .unwrap_or_default()
 }
 
-/// Wait for every install still in flight for `session_id`, each up to
-/// `bound`. Called before an unspawned allocation's trees are removed, so the
-/// install's writes land before (and its credential is torn down after) the
-/// removal. An install that outlives the bound is logged and aborted, and
-/// given `bound` again for the abort to land. `false` when one is STILL
-/// running — the caller must then not judge the trees; that install is put
-/// back so the context's cleanup still waits for it.
+/// Wait for every install still in flight for `session_id` under ONE shared
+/// deadline, `bound` from now, so an agent with several installs cannot stall
+/// a refusal report for `bound` per install. Called before an unspawned
+/// allocation's trees are removed, so the installs' writes land before (and
+/// their credentials are torn down after) the removal. Whatever is still
+/// running at the deadline is logged and aborted, and all of it shares one
+/// short grace for the aborts to land ([`abort_grace`]). `false` when an
+/// install is STILL running after that — the caller must then not judge the
+/// trees; that install is put back so the context's cleanup still waits for it.
 pub(crate) async fn settle_installs(session_id: &str, bound: Duration) -> bool {
-    let mut settled = true;
+    let deadline = tokio::time::Instant::now() + bound;
+    let mut late = Vec::new();
     for mut install in take_installs(session_id) {
-        if tokio::time::timeout(bound, &mut install).await.is_ok() {
-            continue;
+        if tokio::time::timeout_at(deadline, &mut install)
+            .await
+            .is_err()
+        {
+            late.push(install);
         }
-        warn!(
-            session_id = %session_id,
-            "credential_helper: an install was still running after {bound:?}; aborting it"
-        );
+    }
+    if late.is_empty() {
+        return true;
+    }
+    warn!(
+        session_id = %session_id,
+        "credential_helper: {} install(s) still running after {bound:?}; aborting",
+        late.len()
+    );
+    for install in &late {
         install.abort();
-        if tokio::time::timeout(bound, &mut install).await.is_err() {
+    }
+    let grace = tokio::time::Instant::now() + abort_grace(bound);
+    let mut settled = true;
+    for mut install in late {
+        if tokio::time::timeout_at(grace, &mut install).await.is_err() {
             warn!(
                 session_id = %session_id,
-                "credential_helper: the aborted install has not stopped after another {bound:?}"
+                "credential_helper: an aborted install has not stopped within the grace"
             );
             settled = false;
             track_install(session_id, install);
         }
     }
     settled
+}
+
+/// The one grace an abort gets to land: a tenth of the wait, at least 100 ms
+/// and at most 2 s.
+fn abort_grace(bound: Duration) -> Duration {
+    (bound / 10).clamp(Duration::from_millis(100), Duration::from_secs(2))
 }
 
 /// Delete stale credential config files (and orphaned `.tmp-*` siblings from
@@ -1506,6 +1528,26 @@ mod tests {
             "the install wrote its config file"
         );
         assert!(!left, "the cleanup ran after the install and removed it");
+    }
+
+    /// One deadline is shared by all of an agent's installs: three that never
+    /// finish on their own cost ONE bound plus one abort grace, not three.
+    #[tokio::test]
+    async fn settling_several_installs_shares_one_deadline() {
+        let id = format!("shared-deadline-{}", uuid::Uuid::new_v4());
+        for _ in 0..3 {
+            track_install(
+                &id,
+                tokio::spawn(tokio::time::sleep(Duration::from_secs(3600))),
+            );
+        }
+        let started = std::time::Instant::now();
+        assert!(settle_installs(&id, Duration::from_millis(300)).await);
+        let took = started.elapsed();
+        assert!(
+            took < Duration::from_millis(600),
+            "one shared 300 ms deadline (+ abort grace), not one per install: took {took:?}"
+        );
     }
 
     /// Review A4: an install that never finishes is aborted after the bound
