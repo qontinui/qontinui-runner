@@ -1871,11 +1871,13 @@ async fn handle_element_action(
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
     let id = id.trim().to_string();
-    let action_name = body
-        .get("action")
-        .and_then(|v| v.as_str())
-        .unwrap_or("click")
-        .to_string();
+    // A request with no action name is refused before anything is dispatched
+    // (to an SDK app or to the runner's own webview). It used to be recorded
+    // and dispatched as a click.
+    let action_name = match crate::mcp::ui_bridge::action_wire::require_action_name(&body) {
+        Ok(name) => name,
+        Err(missing) => return Json(missing.response()),
+    };
     let start = std::time::Instant::now();
 
     // Phase 1 wrapper framework: WS-transport apps dispatch over their socket.
@@ -1950,33 +1952,17 @@ async fn handle_element_action(
                     )
                 } else {
                     acted_via_ipc = true;
-                    // Fall back to IPC — wrap action in an object to match the format
-                    // expected by the TypeScript handler (action.action, action.params, etc.)
-                    let params = body
-                        .get("params")
-                        .cloned()
-                        .unwrap_or(serde_json::json!(null));
-                    let wait_options = body
-                        .get("waitOptions")
-                        .cloned()
-                        .unwrap_or(serde_json::json!(null));
-                    // Forward the D3 effect-calculus per-request opt-in so the IPC path
-                    // matches the WS/HTTP path (which forwards the body verbatim). Without
-                    // this, `effect_check` would never receive `effectVerification` when
-                    // the executor falls back to IPC.
-                    let verify_effect = body
-                        .get("verifyEffect")
-                        .cloned()
-                        .unwrap_or(serde_json::json!(null));
-                    let payload = serde_json::json!({
-                        "elementId": id,
-                        "action": {
-                            "action": action_name,
-                            "params": params,
-                            "waitOptions": wait_options,
-                            "verifyEffect": verify_effect
-                        }
-                    });
+                    // Fall back to IPC. The body IS the SDK's `ControlActionRequest`
+                    // (the WS/HTTP arms above forward it whole), so this arm forwards
+                    // it whole too, through the one payload builder. It used to rebuild
+                    // `{action, params, waitOptions, verifyEffect}` and drop the rest.
+                    let payload = match crate::mcp::ui_bridge::action_wire::sdk_fallback_payload(
+                        &id, &body,
+                    ) {
+                        Ok(payload) => payload,
+                        // Unreachable past the check at the top; refuse rather than guess.
+                        Err(missing) => return Json(missing.response()),
+                    };
                     match ui_bridge_request_sync(&state, "execute_action", payload).await {
                         Ok(data) => {
                             let (data, success, err) = ipc_element_action_result(data);
@@ -10526,6 +10512,44 @@ mod condition_secrets_dispatch_tests {
                     .to_string()
                     .contains(SECRET));
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod sdk_element_fallback_wire_tests {
+    //! `POST /ui-bridge/sdk/element/{id}/action` with no SDK app connected falls
+    //! back to the runner's own webview. The fallback forwards the request body
+    //! whole, and a body with no action name is refused before dispatch.
+    use crate::mcp::ui_bridge::action_wire::test_support::{
+        assert_reached_ipc_payload, one_test_per_control_field, sample_value,
+    };
+    use crate::mcp::ui_bridge::action_wire::{require_action_name, sdk_fallback_payload};
+    use serde_json::json;
+
+    fn field_check(key: &str) {
+        let mut body = serde_json::Map::new();
+        body.insert("action".into(), json!("type"));
+        body.insert(key.into(), sample_value(key));
+        let body = serde_json::Value::Object(body);
+        // The handler reads the name first, then builds the fallback payload.
+        assert!(require_action_name(&body).is_ok());
+        let payload = sdk_fallback_payload("e1", &body).expect("body names an action");
+        assert_eq!(payload["elementId"], json!("e1"));
+        assert_reached_ipc_payload("sdk element fallback", key, &payload);
+    }
+    one_test_per_control_field!(field_check);
+
+    #[test]
+    fn a_body_with_no_action_name_is_refused_before_dispatch() {
+        for body in [
+            json!({}),
+            json!({"action": null}),
+            json!({"action": 42}),
+            json!({"action": {"params": {}}}),
+        ] {
+            let err = require_action_name(&body).expect_err("nameless body");
+            assert_eq!(err.response()["code"], json!("action_missing"), "{body}");
         }
     }
 }
