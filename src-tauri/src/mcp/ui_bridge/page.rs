@@ -88,6 +88,12 @@ pub struct NavigateAndWaitRequest {
     /// Overall timeout (ms) for the entire operation. Default: 8000ms.
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
+    /// Every other key of the body. It is forwarded as part of the action
+    /// envelope (`waitOptions`, `verifyEffect`, `captureAfter`, `requestId`,
+    /// `windowLabel`, ...), so a field the SDK's `ControlActionRequest` grows
+    /// later reaches the action without a change here.
+    #[serde(flatten)]
+    pub action_extra: serde_json::Map<String, serde_json::Value>,
 }
 
 impl RequestHints for NavigateAndWaitRequest {
@@ -482,13 +488,20 @@ async fn ui_bridge_navigate_and_wait_handler_dispatch(
     let stable_dur = std::time::Duration::from_millis(req.wait_for_stable_ms);
 
     // 1. Execute the action
-    let action_payload = serde_json::json!({
-        "elementId": req.element_id,
-        "action": {
-            "action": req.action,
-            "params": req.params.unwrap_or(serde_json::json!({})),
+    let action_payload = match super::action_wire::navigate_and_wait_payload(
+        &req.element_id,
+        &req.action,
+        req.params.as_ref(),
+        &req.action_extra,
+    ) {
+        Ok(payload) => payload,
+        Err(missing) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(api_error(missing.message())),
+            ))
         }
-    });
+    };
     match ui_bridge_request_sync(&state, "execute_action", action_payload).await {
         Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
         Ok(ref data) => {
@@ -4322,5 +4335,69 @@ mod set_tab_readback_tests {
             parse_set_tab_readback(r#"{"pageIdChain":"x"}"#),
             SetTabReadback::default()
         );
+    }
+}
+
+#[cfg(test)]
+mod navigate_and_wait_wire_tests {
+    //! `POST /control/navigate-and-wait` forwards the body's action half whole.
+    //! Each test enters where the population does: the JSON body is
+    //! deserialized into the route's own request type, and the payload is built
+    //! by the function the handler calls.
+    use super::NavigateAndWaitRequest;
+    use crate::mcp::ui_bridge::action_wire::navigate_and_wait_payload;
+    use crate::mcp::ui_bridge::action_wire::test_support::{
+        assert_reached_ipc_payload, one_test_per_control_field, sample_value,
+    };
+    use serde_json::json;
+
+    fn payload_for_body(body: serde_json::Value) -> serde_json::Value {
+        let req: NavigateAndWaitRequest = serde_json::from_value(body).expect("valid body");
+        navigate_and_wait_payload(
+            &req.element_id,
+            &req.action,
+            req.params.as_ref(),
+            &req.action_extra,
+        )
+        .expect("action is named")
+    }
+
+    fn field_check(key: &str) {
+        match key {
+            "action" => {
+                let payload = payload_for_body(json!({"elementId": "e1", "action": "type"}));
+                assert_eq!(payload.pointer("/action/action"), Some(&json!("type")));
+            }
+            "params" => {
+                let payload = payload_for_body(json!({"elementId": "e1", "params": {"text": "hi"}}));
+                assert_eq!(
+                    payload.pointer("/action/params"),
+                    Some(&json!({"text": "hi"}))
+                );
+            }
+            other => {
+                let mut body = serde_json::Map::new();
+                body.insert("elementId".into(), json!("e1"));
+                body.insert(other.into(), sample_value(other));
+                let payload = payload_for_body(serde_json::Value::Object(body));
+                assert_reached_ipc_payload("navigate-and-wait", other, &payload);
+            }
+        }
+    }
+    one_test_per_control_field!(field_check);
+
+    #[test]
+    fn the_documented_click_default_stays_and_route_keys_stay_out_of_the_envelope() {
+        let payload = payload_for_body(json!({
+            "elementId": "e1",
+            "waitForStableMs": 111,
+            "timeoutMs": 222
+        }));
+        assert_eq!(payload["elementId"], json!("e1"));
+        assert_eq!(payload.pointer("/action/action"), Some(&json!("click")));
+        assert_eq!(payload.pointer("/action/params"), Some(&json!({})));
+        assert!(payload.pointer("/action/waitForStableMs").is_none());
+        assert!(payload.pointer("/action/timeoutMs").is_none());
+        assert!(payload.pointer("/action/elementId").is_none());
     }
 }
