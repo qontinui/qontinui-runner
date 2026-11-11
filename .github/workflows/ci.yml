@@ -621,12 +621,12 @@ jobs:
       # (right after Node setup, before any frontend/Rust step) so a break is
       # cheap and fast to see, not discovered 40 minutes later.
       #
-      # Deliberately scoped to these two files, NOT the whole `__tests__/`
+      # Deliberately scoped to the files listed below, NOT the whole `__tests__/`
       # directory — `coverage-diff.test.mjs` and `perf-harness-lib.test.mjs`
       # predate this step and have not been verified against this job's exact
       # environment; wiring them in is a separate, separately-verified change.
-      - name: Run CI-tooling unit tests (ci-flake-analyze, ci-test-results-ingest, ci-expiry-phase-summary)
-        run: node --test scripts/__tests__/ci-flake-analyze.test.mjs scripts/__tests__/ci-test-results-ingest.test.mjs scripts/__tests__/ci-expiry-phase-summary.test.mjs
+      - name: Run CI-tooling unit tests (ci-flake-analyze, ci-test-results-ingest, ci-expiry-phase-summary, export-test-coverage)
+        run: node --test scripts/__tests__/ci-flake-analyze.test.mjs scripts/__tests__/ci-test-results-ingest.test.mjs scripts/__tests__/ci-expiry-phase-summary.test.mjs scripts/__tests__/export-test-coverage.test.mjs
 
       # Pin matches rust-toolchain.toml (channel = "1.95.0"). The toolchain
       # file overrides any other channel for every cargo invocation, so the
