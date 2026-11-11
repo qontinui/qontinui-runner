@@ -911,17 +911,26 @@ mod tests {
         assert_send_future(read_project_logs(String::new()));
     }
 
-    /// The body of the production fn whose signature starts `header`. Only
+    /// The CODE of the production fn whose signature starts `header`: only
     /// the half above the test module is searched, so this test's own text
-    /// (which names the needle) can never match.
-    fn prod_fn_body(header: &str) -> &'static str {
+    /// (which names the needle) can never match; comments are removed and
+    /// string and char literals emptied, so only call syntax can match.
+    fn prod_fn_body(header: &str) -> String {
         let src = include_str!("project_logs.rs");
         let (prod, _) = src.split_once("#[cfg(test)]").expect("a test module");
         let (_, rest) = prod
             .split_once(header)
             .unwrap_or_else(|| panic!("`{header}` not found"));
         let (body, _) = rest.split_once("\n}\n").expect("fn closed at column 0");
-        body
+        // Read through `process_helpers::code_lexer` (the lexer the lib's
+        // source guards and `ci_node::executor`'s pins use), so a removed hop
+        // cannot be satisfied by any comment or literal that still names it.
+        use crate::process_helpers::code_lexer::{code_only_from, Lex};
+        let mut lex = Lex::Code;
+        body.lines()
+            .map(|line| code_only_from(line, &mut lex))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// Both read commands hand their body to `read_off_main_thread`, and that
