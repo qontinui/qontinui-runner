@@ -2184,9 +2184,11 @@ fn tokio_no_window(program: &str) {}
 
     /// Run one step through `run_step` with a fresh fixture and a tail-only
     /// sink, and return its outcome and the sink's tail. Tail-only, not a
-    /// dead-port sink: with no device JWT the dead-port flusher waits out the
-    /// re-mint window once per line past `FLUSH_MAX_LINES`, which a 40000-line
-    /// step turns into hours of `finish()`.
+    /// dead-port sink: with no device JWT every dead-port POST waits out the
+    /// re-mint window. Since #2805 the flusher retries a failed POST once per
+    /// `FLUSH_INTERVAL` rather than once per line, but each retry, and the
+    /// final drain's two attempts, still pay that wait, so `finish()` would
+    /// take seconds per step that this test has no use for.
     #[cfg(unix)]
     async fn run_one_probe_step(dispatch_id: &str, step: CiStep) -> (StepOutcome, String) {
         let tmp = tempfile::tempdir().unwrap();
