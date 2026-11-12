@@ -1501,10 +1501,9 @@ impl PgDb {
     fn for_test_database(database: crate::embedded_pg::test_harness::TestDatabase) -> Self {
         let pool = Self::build_pool(database.url())
             .unwrap_or_else(|e| panic!("PgDb pool for the test database {}: {e}", database.name()));
-        Self {
-            pool,
-            test_database: Some(database),
-        }
+        let mut db = Self::from_pool(pool);
+        db.test_database = Some(database);
+        db
     }
 
     /// Test-only: create a PgDb with a pool that will error on any actual
