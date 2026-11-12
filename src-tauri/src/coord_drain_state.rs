@@ -1362,6 +1362,31 @@ pub async fn held_until_allowed<F: std::future::Future>(
     fut.await
 }
 
+/// The refusal text a ONE-SHOT request carries back when the drain gate
+/// defers it: the gate's state half, then what actually happened to the
+/// request.
+///
+/// The gate's `reason` ([`gate_for_at`], [`role_gate`]) is written for work
+/// that IS picked up again: "… is deferred and runs once the drain lifts", "…
+/// runs only if the role changes", "… is deferred until the state is read
+/// again". A one-shot request — a relay create, `POST /terminals` — is
+/// re-presented by nothing, so that tail would tell its caller to wait for
+/// something that never happens (coord finding `6350ee72`). The state half
+/// (coord's drain window and the operator's reason, the unknown cause, or the
+/// dispatch role) is kept, and the tail says the request was refused, not
+/// queued.
+///
+/// `request` names the refused request in the caller's words ("this terminal
+/// create"). The gate's own tail is the LAST " — " clause: the operator's
+/// drain reason or the unknown cause before it may carry one of its own.
+pub fn one_shot_refusal(reason: &str, request: &str) -> String {
+    let state = reason
+        .rsplit_once(" — ")
+        .map_or(reason, |(head, _)| head)
+        .trim();
+    format!("{state} — {request} was refused, not queued; nothing was spawned")
+}
+
 /// The HTTP refusal body for a drain deferral: the reason, with the
 /// `device_drained` / `drain_unreadable` code the deferring state implies.
 pub fn api_refusal(reason: &str, class: DeferClass) -> crate::mcp::types::ApiResponse<()> {
@@ -1653,6 +1678,53 @@ pub(crate) static ROLE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::c
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Finding `6350ee72`: the one-shot rewrite keeps the gate's state half,
+    /// drops its will-run-later tail, and names the refused request — for
+    /// every deferral the gate makes. Built from the gate's REAL reasons and
+    /// asserted as literals, so a reworded gate or rewrite reddens it.
+    #[test]
+    fn a_one_shot_refusal_keeps_the_drain_state_and_says_nothing_was_queued() {
+        let now = t0();
+        let reason_of = |gate: DrainGate| match gate {
+            DrainGate::Defer { reason, .. } => reason,
+            DrainGate::Allow => panic!("the gate should defer an autonomous create"),
+        };
+        // An operator reason carrying its own " — ": only the gate's LAST
+        // clause is the tail.
+        let drained = reason_of(gate_for_at(
+            &CoordDrainState::Drained {
+                until: None,
+                reason: Some("rebuild — phase 2".to_string()),
+            },
+            SpawnOrigin::Unknown,
+            now,
+        ));
+        assert_eq!(
+            one_shot_refusal(&drained, "this terminal create"),
+            "coord has drained this device (rebuild — phase 2) — this terminal create was \
+             refused, not queued; nothing was spawned"
+        );
+        let unknown = reason_of(gate_for_at(
+            &CoordDrainState::Unknown {
+                since: now,
+                cause: "coord drain state not read yet".to_string(),
+            },
+            SpawnOrigin::Unknown,
+            now,
+        ));
+        assert_eq!(
+            one_shot_refusal(&unknown, "this terminal create"),
+            "coord drain state unknown (coord drain state not read yet) — this terminal \
+             create was refused, not queued; nothing was spawned"
+        );
+        let role = reason_of(role_gate(Some(DispatchRole::CiNode), SpawnOrigin::Unknown));
+        assert_eq!(
+            one_shot_refusal(&role, "this remote terminal create"),
+            "coord's dispatch role for this device is `ci_node`, which closes the agent \
+             lane — this remote terminal create was refused, not queued; nothing was spawned"
+        );
+    }
 
     fn t0() -> DateTime<Utc> {
         DateTime::parse_from_rfc3339("2026-09-14T10:00:00Z")

@@ -8,7 +8,8 @@
  * The frontend records OPEN/CLOSE through three Tauri commands:
  *   - `terminal_session_record_open`  (args = {@link SessionOpenArgs})
  *   - `terminal_session_record_close` (args = {@link SessionCloseArgs})
- *   - `terminal_session_list_open`    (restore — see useTerminalInitialization)
+ *   - `terminal_session_list_open`    (restore, and readers naming themselves —
+ *                                       see {@link LIST_OPEN_PURPOSE})
  */
 
 /** A tab shape the open-record builder needs (subset of `TerminalTab`). */
@@ -394,3 +395,22 @@ export function describeRecordOpenOutcome(params: {
     `terminal_list will not surface it until ${door} confirms it`
   );
 }
+
+/**
+ * Who is reading `terminal_session_list_open`, sent as its `purpose`.
+ *
+ * Only `restore` (the boot restore's own read, `fetchRestoreSet`) may tell the
+ * backend that the boot restore was withheld or has run. Every other reader
+ * names itself, so that a read the coord drain defers is logged under its own
+ * name and at debug, while the boot restore's deferral is the one WARN (plan
+ * `2026-11-11-since-restart-roster-counts-closed-sessions-as-missing`,
+ * Phase 7). The backend acts on `restore` alone; the others are log labels.
+ */
+export const LIST_OPEN_PURPOSE = {
+  restore: "restore",
+  pageOccupancy: "page-occupancy",
+  workerAdoption: "worker-adoption",
+  treeResetReport: "tree-reset-report",
+} as const;
+
+export type ListOpenPurpose = (typeof LIST_OPEN_PURPOSE)[keyof typeof LIST_OPEN_PURPOSE];

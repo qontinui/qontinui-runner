@@ -5,6 +5,7 @@ import type { TerminalExitEvent, TerminalInfo } from "@qontinui/shared-types/tau
 import type { CommandResponse, TerminalSessionRecord } from "./types";
 import {
   buildSessionCloseArgs,
+  LIST_OPEN_PURPOSE,
   type FrontendSessionCloseReason,
   type SessionCloseArgs,
 } from "./sessionRecordArgs";
@@ -471,6 +472,20 @@ export function findWorkerRecord(
   return sessions.find(
     (rec) => rec.taskRunId === taskRunId && (rec.pageId || "default") === pageId,
   );
+}
+
+/**
+ * The worker-adoption probe's read of the durable records — `undefined` when
+ * the payload carries no `sessions` array. It names itself as the reader
+ * ({@link LIST_OPEN_PURPOSE}), so a read the coord drain defers is logged under
+ * that name rather than looking like the boot restore's own. A rejected
+ * `invoke` propagates: a failed read is not "no such worker".
+ */
+export async function readRecordsForWorkerAdoption(): Promise<TerminalSessionRecord[] | undefined> {
+  const resp = await invoke<CommandResponse>("terminal_session_list_open", {
+    purpose: LIST_OPEN_PURPOSE.workerAdoption,
+  });
+  return (resp?.data as { sessions?: TerminalSessionRecord[] } | undefined)?.sessions;
 }
 
 /**
@@ -954,8 +969,7 @@ export function useTerminalManager(
       workerProbeRef.current.set(taskRunId, { at: now, misses: probe.misses });
       let sessions: TerminalSessionRecord[] | undefined;
       try {
-        const resp = await invoke<CommandResponse>("terminal_session_list_open");
-        sessions = (resp?.data as { sessions?: TerminalSessionRecord[] } | undefined)?.sessions;
+        sessions = await readRecordsForWorkerAdoption();
       } catch (err) {
         // A failed read is not "no such worker": retry on the base cadence.
         logger.warn(`worker adoption probe for ${taskRunId} failed (will retry): ${err}`);

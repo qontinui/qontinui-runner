@@ -74,6 +74,14 @@ describe("readOccupiedPageIds (fail-closed occupancy)", () => {
     answer(okTerminals(), okSessions());
     expect(await readOccupiedPageIds()).toEqual(new Set());
   });
+
+  it("reads the restore set as `page-occupancy`, never as the boot restore", async () => {
+    answer(okTerminals(), okSessions());
+    await readOccupiedPageIds();
+    expect(invokeMock).toHaveBeenCalledWith("terminal_session_list_open", {
+      purpose: "page-occupancy",
+    });
+  });
 });
 
 describe("TerminalPageTabBar close-empty button", () => {

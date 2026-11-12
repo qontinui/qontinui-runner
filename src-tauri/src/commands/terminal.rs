@@ -1913,6 +1913,29 @@ pub async fn terminal_holder_sweep_settled() -> Result<CommandResponse, String> 
 /// The `purpose` value the boot restore passes to [`terminal_session_list_open`].
 pub const LIST_OPEN_PURPOSE_RESTORE: &str = "restore";
 
+/// How loudly one drain-deferred [`terminal_session_list_open`] read is logged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeferralLog {
+    Warn,
+    Debug,
+}
+
+/// WARN only for the boot restore's own read, and only when that read moved
+/// the boot-restore phase (`NotYetRun` → `Withheld`): the one deferral that
+/// changes what the lifecycle poll does. The boot restore asking again (another
+/// page, a re-render), and every reader that only looks at the set, log at
+/// debug, naming the reader. Measured 2026-11-11 on a drained primary: 438
+/// `restore deferred` WARN lines in five minutes, most from readers that passed
+/// no purpose (plan
+/// `2026-11-11-since-restart-roster-counts-closed-sessions-as-missing`, Phase 7).
+pub(crate) fn deferral_log(is_boot_restore: bool, phase_moved: bool) -> DeferralLog {
+    if is_boot_restore && phase_moved {
+        DeferralLog::Warn
+    } else {
+        DeferralLog::Debug
+    }
+}
+
 /// List every RESTORABLE Claude terminal session from the lifecycle registry.
 /// The grid hydrates its session tiles from this on boot instead of
 /// `localStorage`.
@@ -1928,12 +1951,14 @@ pub const LIST_OPEN_PURPOSE_RESTORE: &str = "restore";
 /// resurrects exactly the sessions that died with the runner.
 ///
 /// `purpose`: `Some("restore")` ONLY from the boot restore itself
-/// (`fetchRestoreSet`). Several other frontend readers (page reconcile, the
+/// (`fetchRestoreSet`). Several other frontend readers (page occupancy, the
 /// worker-adoption probe, tree-reset reporting) call this same command; only
 /// the restore's own call may tell the lifecycle poll that the boot restore
 /// was withheld or has run (see `BootRestorePhase`). A reader that merely
 /// LOOKS at the set must not release the poll's hold on records nobody has
-/// restored yet.
+/// restored yet. Those readers pass a purpose naming themselves
+/// (`LIST_OPEN_PURPOSE` in the webview's `sessionRecordArgs.ts`), which only
+/// labels the deferral's debug line ([`deferral_log`]).
 #[tauri::command]
 pub fn terminal_session_list_open(
     store: tauri::State<'_, Arc<SessionLifecycleStore>>,
@@ -1952,18 +1977,26 @@ pub fn terminal_session_list_open(
             "boot_resume:terminal_tabs",
         )
     {
-        tracing::warn!("terminal_session_list_open: restore deferred — {reason}");
         // Tell the lifecycle poll the boot restore is WITHHELD, so it does not
         // sweep the very records this deferral promises to restore later as
         // `no-terminal` orphans (plan
         // `2026-10-01-drain-deferred-restore-is-swept-as-orphans`). No-op once
         // the restore has run.
-        crate::session::session_lifecycle_store::apply_boot_restore_latch_event(
+        let phase_moved = crate::session::session_lifecycle_store::apply_boot_restore_latch_event(
             crate::session::session_lifecycle_store::boot_restore_latch_event(
                 is_boot_restore,
                 true,
             ),
         );
+        match deferral_log(is_boot_restore, phase_moved) {
+            DeferralLog::Warn => {
+                tracing::warn!("terminal_session_list_open: restore deferred — {reason}")
+            }
+            DeferralLog::Debug => tracing::debug!(
+                reader = purpose.as_deref().unwrap_or("unnamed"),
+                "terminal_session_list_open: restore deferred for this reader — {reason}"
+            ),
+        }
         return Ok(CommandResponse {
             success: true,
             message: Some(reason.clone()),
@@ -3454,6 +3487,26 @@ pub fn plugin() -> TauriPlugin<tauri::Wry> {
 
 #[cfg(test)]
 mod tests {
+    /// Phase 7 of plan `2026-11-11-since-restart-roster-counts-closed-sessions-as-missing`:
+    /// the restore deferral WARNs once per boot-restore phase change, for the
+    /// boot restore's own read only; every other arm is debug.
+    #[test]
+    fn the_restore_deferral_warns_only_for_the_boot_restores_read_that_moved_the_phase() {
+        use super::{deferral_log, DeferralLog};
+        assert_eq!(deferral_log(true, true), DeferralLog::Warn);
+        assert_eq!(
+            deferral_log(true, false),
+            DeferralLog::Debug,
+            "the boot restore asking again moves nothing"
+        );
+        assert_eq!(
+            deferral_log(false, true),
+            DeferralLog::Debug,
+            "a reader that only looks never warns"
+        );
+        assert_eq!(deferral_log(false, false), DeferralLog::Debug);
+    }
+
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;

@@ -5469,8 +5469,9 @@ pub fn boot_restore_phase() -> BootRestorePhase {
 
 /// Record that the boot restore was WITHHELD (drain-deferred). Only moves
 /// `NotYetRun → Withheld`: idempotent under the frontend's repeated asks, and
-/// a no-op once the restore has run.
-pub fn note_boot_restore_withheld() {
+/// a no-op once the restore has run. Returns whether THIS call moved the phase
+/// (exactly one call does, however many race).
+pub fn note_boot_restore_withheld() -> bool {
     let moved = BOOT_RESTORE_PHASE
         .compare_exchange(
             BOOT_RESTORE_NOT_YET_RUN,
@@ -5484,17 +5485,19 @@ pub fn note_boot_restore_withheld() {
             "session_lifecycle_store: boot restore WITHHELD by the coord drain — the lifecycle poll will hold prior-boot records open until it runs"
         );
     }
+    moved
 }
 
 /// Record that the boot restore has RUN (a restore set was returned).
-/// Terminal.
-pub fn note_boot_restore_ran() {
+/// Terminal. Returns whether THIS call moved the phase.
+pub fn note_boot_restore_ran() -> bool {
     let prior = BOOT_RESTORE_PHASE.swap(BOOT_RESTORE_RAN, std::sync::atomic::Ordering::AcqRel);
     if prior == BOOT_RESTORE_WITHHELD {
         info!(
             "session_lifecycle_store: withheld boot restore has now run — normal orphan handling resumes"
         );
     }
+    prior != BOOT_RESTORE_RAN
 }
 
 /// What one `terminal_session_list_open` call may do to [`BootRestorePhase`].
@@ -5525,10 +5528,12 @@ pub fn boot_restore_latch_event(is_boot_restore: bool, deferred: bool) -> BootRe
     }
 }
 
-/// Apply a [`BootRestoreLatchEvent`] to the process-global latch.
-pub fn apply_boot_restore_latch_event(event: BootRestoreLatchEvent) {
+/// Apply a [`BootRestoreLatchEvent`] to the process-global latch. Returns
+/// whether it moved the [`BootRestorePhase`]: the restore path logs its
+/// deferral at WARN only when it did.
+pub fn apply_boot_restore_latch_event(event: BootRestoreLatchEvent) -> bool {
     match event {
-        BootRestoreLatchEvent::Untouched => {}
+        BootRestoreLatchEvent::Untouched => false,
         BootRestoreLatchEvent::Withheld => note_boot_restore_withheld(),
         BootRestoreLatchEvent::Ran => note_boot_restore_ran(),
     }
@@ -13244,17 +13249,39 @@ mod tests {
 
     /// The latch is monotonic: a repeated deferral is idempotent, `Ran` is
     /// terminal, and a deferral after the restore ran does not re-arm the hold.
+    /// Each event reports whether it moved the phase, which is what limits the
+    /// restore path's deferral WARN to one per phase change.
     /// The only test that touches the process-global latch.
     #[test]
     fn boot_restore_phase_latch_is_monotonic() {
         reset_boot_restore_phase_for_test();
         assert_eq!(boot_restore_phase(), BootRestorePhase::NotYetRun);
-        note_boot_restore_withheld();
-        note_boot_restore_withheld();
+        assert!(
+            !apply_boot_restore_latch_event(BootRestoreLatchEvent::Untouched),
+            "a reader that only looks moves nothing"
+        );
+        assert!(
+            apply_boot_restore_latch_event(BootRestoreLatchEvent::Withheld),
+            "the first deferral moves NotYetRun → Withheld"
+        );
+        assert!(
+            !apply_boot_restore_latch_event(BootRestoreLatchEvent::Withheld),
+            "a repeated deferral moves nothing"
+        );
         assert_eq!(boot_restore_phase(), BootRestorePhase::Withheld);
-        note_boot_restore_ran();
+        assert!(
+            apply_boot_restore_latch_event(BootRestoreLatchEvent::Ran),
+            "Withheld → Ran"
+        );
         assert_eq!(boot_restore_phase(), BootRestorePhase::Ran);
-        note_boot_restore_withheld();
+        assert!(
+            !apply_boot_restore_latch_event(BootRestoreLatchEvent::Withheld),
+            "a deferral after the restore ran does not re-arm the hold"
+        );
+        assert!(
+            !apply_boot_restore_latch_event(BootRestoreLatchEvent::Ran),
+            "Ran is terminal"
+        );
         assert_eq!(boot_restore_phase(), BootRestorePhase::Ran);
         reset_boot_restore_phase_for_test();
     }

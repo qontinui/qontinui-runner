@@ -379,6 +379,22 @@ pub(crate) fn edit_sibling_bad_request(
     (StatusCode::BAD_REQUEST, Json(body))
 }
 
+/// `POST /terminals`'s 409 for a drain deferral. The create is one-shot:
+/// nothing re-presents it when the drain lifts, so the body keeps the gate's
+/// state and says the create was refused, not queued — never the gate's "runs
+/// once the drain lifts" (coord finding `6350ee72`). The log line says the same.
+fn drain_refused_create(
+    reason: &str,
+    class: crate::coord_drain_state::DeferClass,
+) -> (StatusCode, Json<ApiResponse<()>>) {
+    let message = crate::coord_drain_state::one_shot_refusal(reason, "this terminal create");
+    warn!("HTTP: refusing terminal create — {message}");
+    (
+        StatusCode::CONFLICT,
+        Json(crate::coord_drain_state::api_refusal(&message, class)),
+    )
+}
+
 /// Create a new terminal session.
 pub async fn create_terminal_handler(
     State(state): State<Arc<ApiState>>,
@@ -407,11 +423,7 @@ pub async fn create_terminal_handler(
             ),
         )
     {
-        warn!("HTTP: refusing terminal create — {reason}");
-        return Err((
-            StatusCode::CONFLICT,
-            Json(crate::coord_drain_state::api_refusal(&reason, class)),
-        ));
+        return Err(drain_refused_create(&reason, class));
     }
 
     // The other half of D6: a `workingDir` the runner cannot use must come
@@ -1333,6 +1345,78 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Finding `6350ee72`: `POST /terminals`'s drain refusal is one-shot. Its
+    /// 409 body keeps the gate's state, says the create was refused and NOT
+    /// queued, and carries the deferral's code. Built from the gate's real
+    /// reasons; the body text is asserted as literals.
+    #[test]
+    fn a_drain_refused_terminal_create_says_it_was_refused_not_queued() {
+        use crate::coord_drain_state::{gate_for_at, CoordDrainState, DrainGate, SpawnOrigin};
+        let refused = |state: CoordDrainState| match gate_for_at(
+            &state,
+            SpawnOrigin::Unknown,
+            chrono::Utc::now(),
+        ) {
+            DrainGate::Defer { reason, class } => drain_refused_create(&reason, class),
+            DrainGate::Allow => panic!("{state:?} should defer an HTTP terminal create"),
+        };
+
+        let (status, Json(body)) = refused(CoordDrainState::Drained {
+            until: None,
+            reason: Some("rebuild".to_string()),
+        });
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(!body.success);
+        assert_eq!(
+            body.error.as_deref(),
+            Some(
+                "coord has drained this device (rebuild) — this terminal create was refused, \
+                 not queued; nothing was spawned"
+            )
+        );
+        assert_eq!(body.code.as_deref(), Some("device_drained"));
+
+        let (status, Json(body)) = refused(CoordDrainState::Unknown {
+            since: chrono::Utc::now(),
+            cause: "coord drain state not read yet".to_string(),
+        });
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            body.error.as_deref(),
+            Some(
+                "coord drain state unknown (coord drain state not read yet) — this terminal \
+                 create was refused, not queued; nothing was spawned"
+            )
+        );
+        assert_eq!(body.code.as_deref(), Some("drain_unreadable"));
+    }
+
+    /// The handler answers a drain deferral with that refusal and nothing else:
+    /// `create_terminal_handler` needs a live `ApiState`, so the wiring is pinned
+    /// at the source level, like the list handler's below.
+    #[test]
+    fn the_create_handler_answers_a_drain_deferral_with_the_one_shot_refusal() {
+        let src = include_str!("terminals.rs");
+        let body = src
+            .split_once(concat!("pub async fn ", "create_terminal_handler("))
+            .unwrap()
+            .1
+            .split_once("\n}\n")
+            .unwrap()
+            .0;
+        assert!(
+            body.contains(concat!(
+                "return Err(drain_refused_create",
+                "(&reason, class));"
+            )),
+            "{body}"
+        );
+        assert!(
+            !body.contains(concat!("api_refusal", "(&reason")),
+            "the gate's own reason must not reach the HTTP body"
+        );
+    }
 
     /// `GET /terminals` rows: every `TerminalInfo` key unchanged, plus the
     /// camelCase `permissionRequestHook` — the contract

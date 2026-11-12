@@ -19,7 +19,12 @@ import type { TerminalTab } from "./useTerminalManager";
 import type { TerminalInstanceHandle } from "./TerminalInstance";
 import type { CommandResponse, TerminalSessionRecord } from "./types";
 import type { SaveSessionLayoutParams } from "./useSessionPersistence";
-import { noteRecordedZone, recordedZoneLedgerFor, type SessionOpenArgs } from "./sessionRecordArgs";
+import {
+  LIST_OPEN_PURPOSE,
+  noteRecordedZone,
+  recordedZoneLedgerFor,
+  type SessionOpenArgs,
+} from "./sessionRecordArgs";
 import { rememberSessionId } from "./lastKnownSessionIds";
 import { loadKnownPageIds, readPinnedPageId } from "./useTerminalPages";
 import { getPageBindings, type PageBindings } from "@/lib/pageBindings";
@@ -480,7 +485,9 @@ export async function fetchRestoreSet(
     // may tell the backend's lifecycle poll that the restore was withheld or
     // has run (plan `2026-10-01-drain-deferred-restore-is-swept-as-orphans`).
     // The other readers of this command must not.
-    resp = await invoke<CommandResponse>("terminal_session_list_open", { purpose: "restore" });
+    resp = await invoke<CommandResponse>("terminal_session_list_open", {
+      purpose: LIST_OPEN_PURPOSE.restore,
+    });
   } catch (err) {
     console.warn("[TerminalPage] terminal_session_list_open failed:", err);
     return { records: [], deferredByDrain: null };
@@ -811,7 +818,9 @@ export async function reportTreeReset(params: {
     }
     let openRecordCount: number | undefined;
     try {
-      const resp = await invoke<CommandResponse>("terminal_session_list_open");
+      const resp = await invoke<CommandResponse>("terminal_session_list_open", {
+        purpose: LIST_OPEN_PURPOSE.treeResetReport,
+      });
       const data = resp?.data as { sessions?: unknown[]; deferredByDrain?: unknown } | undefined;
       // While coord's device drain withholds the restore set, `sessions` is
       // empty by deferral, not by count — report the count as unknown.
