@@ -130,8 +130,10 @@ pub mod mcp_spill;
 // the `qontinui_profile env` CLI and the Tauri runner GUI share one code path.
 // Moved out of the binary crate at P4: the bundled cluster is now the runner's
 // ONLY database, so the lib-side consumers (env_agent's db_schema pool, the
-// `qontinui-specs` CLI) must be able to address it. It has no `crate::`
-// dependencies, so the move is mechanical.
+// `qontinui-specs` CLI) must be able to address it. It had no `crate::`
+// dependencies then, so the move was mechanical; it has gained three since:
+// `crate::instance_env` (its default data root) and, in its test harness,
+// `crate::process_helpers` and `crate::runner_breadcrumb`.
 pub mod embedded_pg;
 pub mod env_agent;
 
