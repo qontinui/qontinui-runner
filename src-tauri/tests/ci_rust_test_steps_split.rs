@@ -759,14 +759,33 @@ fn the_session_lifecycle_kernel_is_formatted_and_linted_in_the_required_job() {
     );
 
     let clippy = find_step(&steps, CLIPPY);
-    let gate = clippy
-        .get("if")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default();
-    assert!(
-        gate.contains("matrix.platform == 'ubuntu-22.04'"),
-        "`{CLIPPY}` is the ubuntu leg's blocking clippy; its gate changed to `{gate}`"
+    assert_eq!(
+        clippy.get("if").and_then(|v| v.as_str()),
+        Some("matrix.platform == 'ubuntu-22.04'"),
+        "`{CLIPPY}` is the ubuntu leg's blocking clippy, and its `if:` must stay \
+         exactly that gate: widened, it runs on a leg that is not this one; \
+         narrowed or made unsatisfiable, the session-lifecycle lint runs nowhere"
     );
+
+    // A required check that cannot fail requires nothing: `continue-on-error`
+    // on either step, or on the job, would let a red lint or an unformatted
+    // file pass `test` green.
+    let job = doc
+        .get("jobs")
+        .and_then(|j| j.get("test"))
+        .expect("ci.yml has a `test` job");
+    for (what, carrier) in [
+        ("job `test`", job),
+        (FMT, find_step(&steps, FMT)),
+        (CLIPPY, clippy),
+    ] {
+        assert!(
+            carrier.get("continue-on-error").is_none(),
+            "{what} must not carry `continue-on-error`: the session-lifecycle \
+             fmt and clippy runs are only gates while a failure fails `test`"
+        );
+    }
+
     let body = command_lines(clippy, CLIPPY);
     assert!(
         body.lines().any(|l| l.trim() == CLIPPY_LINE),
