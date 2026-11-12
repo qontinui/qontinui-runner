@@ -1,7 +1,8 @@
 //! Plan `2026-11-11-since-restart-roster-counts-closed-sessions-as-missing`,
 //! Phase 1: every bind [`run_reconcile`] makes goes through the store's
 //! write-time liveness guard ([`SessionLifecycleStore::bind_inferred`]), and a
-//! bind keeps the session's own zone.
+//! bind keeps the zone the pane sits in: the pane's own row's, else the
+//! session's while its row is on the pane's page.
 //!
 //! The shape these pin was measured on 2026-11-11 (coord finding `f0a0c310`):
 //! the boot pass read the live panes and the source panes' `claude --resume
@@ -224,7 +225,7 @@ fn a_reconcile_bind_keeps_the_sessions_zone() {
     assert_eq!(rec.zone_index, 4, "the bind keeps the session's zone");
 }
 
-/// The precedence's other half: a session whose own zone is unknown takes the
+/// The pane's own row first: a session whose own zone is unknown takes the
 /// zone the pane's own row knows (here the identity seam's provisional row,
 /// which the bind then supersedes), rather than keeping the sentinel.
 #[test]
@@ -246,4 +247,63 @@ fn a_session_with_no_known_zone_takes_the_panes_known_zone() {
     assert_eq!(rec.terminal_id, "new-pane");
     assert_eq!(rec.zone_index, 6);
     assert_eq!(store.get("seam-pin").unwrap().state, "closed");
+}
+
+/// A pane on the same page whose own row knows its zone keeps that zone, even
+/// when the session's row names another: the pane's row was written for where
+/// THIS pane sits (pre-review, the session's zone won and moved the session to
+/// a zone it is not in).
+///
+/// Mutation: the session's zone looked up before the pane's own row.
+#[test]
+fn a_panes_known_zone_wins_over_the_sessions_older_zone() {
+    let (_dir, store) = store();
+    store.record_open(row(SESSION, "gone-pane", 1, true));
+    store.record_open(row("seam-pin", "new-pane", 3, false));
+
+    run_reconcile(
+        &store,
+        &[pane("new-pane", 901)],
+        &ProcessSnapshot::default(),
+        &PrescannedTranscriptIndex::default(),
+        &resumes(&[901]),
+        &live_now(&["new-pane"]),
+    );
+
+    let rec = store.get(SESSION).unwrap();
+    assert_eq!(rec.terminal_id, "new-pane");
+    assert_eq!(rec.zone_index, 3, "the zone the pane sits in");
+}
+
+/// A session resumed by hand into a pane on ANOTHER page, with no row of its
+/// own, does not carry its old page's zone onto the new page: the bind takes the
+/// page from the pane, so the old zone would place it in a zone of a page it was
+/// never in. The sentinel is honest.
+///
+/// Mutation: the session-zone fallback's same-page filter removed.
+#[test]
+fn a_session_resumed_onto_another_page_does_not_carry_its_old_pages_zone() {
+    let (_dir, store) = store();
+    store.record_open(TerminalSessionRecord {
+        page_id: "page-1".to_string(),
+        ..row(SESSION, "gone-pane", 1, true)
+    });
+    let other_page = LivePty {
+        page_id: "page-2".to_string(),
+        ..pane("new-pane", 901)
+    };
+
+    run_reconcile(
+        &store,
+        &[other_page],
+        &ProcessSnapshot::default(),
+        &PrescannedTranscriptIndex::default(),
+        &resumes(&[901]),
+        &live_now(&["new-pane"]),
+    );
+
+    let rec = store.get(SESSION).unwrap();
+    assert_eq!(rec.terminal_id, "new-pane");
+    assert_eq!(rec.page_id, "page-2");
+    assert_eq!(rec.zone_index, UNZONED_ZONE_INDEX);
 }
