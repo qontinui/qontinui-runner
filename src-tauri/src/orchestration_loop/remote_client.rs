@@ -24,8 +24,11 @@ struct ApiResponse<T> {
 
 impl RunnerClient {
     pub fn new(port: u16) -> Self {
+        // The base URL is always the loopback runner, so an `HTTP_PROXY` in
+        // the environment must not route these requests away from it.
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(15))
+            .no_proxy()
             .build()
             .expect("Failed to create HTTP client");
 
