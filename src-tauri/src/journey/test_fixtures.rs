@@ -223,7 +223,7 @@ pub(crate) fn verdict(v: &Value) -> Value {
         // prior-knowledge answer's settled ones, which carry it as `nodeKey`.
         "nodes": each(result, "nodes", |n| {
             if n["nodeKey"].is_null() {
-                json!([n["key"], n["unconfirmedDestination"], each(n, "frontier", &open)])
+                json!([n["key"], n["unconfirmedDestination"], each(n, "frontier", open)])
             } else {
                 json!([n["nodeKey"]])
             }
