@@ -243,6 +243,16 @@ pub(crate) fn sdk_fallback_payload(element_id: &str, body: &Value) -> Result<Val
     element_action_payload(element_id, body.clone())
 }
 
+/// The runner window [`sdk_fallback_payload`] routes `body` to: its
+/// `windowLabel` when that names a pop-out window, `None` for the main window
+/// (no label, an empty one, or `main`). The SDK route keys its journey-ledger
+/// scope by this, so the ledger records the window the action actually ran in.
+pub(crate) fn sdk_fallback_window(body: &Value) -> Option<&str> {
+    body.get(TARGET_WINDOW_FIELD)
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty() && *s != super::request::MAIN_WINDOW_LABEL)
+}
+
 /// Every field of the SDK's `ControlActionRequest`, mirrored from ui-bridge's
 /// `CONTROL_ACTION_REQUEST_FIELDS` (`packages/ui-bridge/src/control/request-fields.ts`).
 ///
@@ -416,22 +426,35 @@ pub(crate) fn element_action_endpoint(
     snapshot_target: Option<&str>,
     element_id: &str,
 ) -> Result<String, String> {
-    let path = format!("element/{}/action", urlencoding::encode(element_id));
+    let root = snapshot_target_root(base_url, snapshot_target)?;
+    Ok(format!(
+        "{root}/element/{}/action",
+        urlencoding::encode(element_id)
+    ))
+}
+
+/// The UI Bridge root a workflow step's snapshot target names, with no
+/// trailing slash: `{base}/control` (the default), `{base}/sdk`, or
+/// `http://127.0.0.1:PORT/__ui-bridge/control` for `proxy:PORT`. The step's
+/// snapshot GET and its action POST both resolve through this, so they always
+/// address the same target.
+pub(crate) fn snapshot_target_root(
+    base_url: &str,
+    snapshot_target: Option<&str>,
+) -> Result<String, String> {
     let base = base_url.trim_end_matches('/');
     match snapshot_target {
-        None | Some("control") => Ok(format!("{base}/control/{path}")),
-        Some("sdk") => Ok(format!("{base}/sdk/{path}")),
+        None | Some("control") => Ok(format!("{base}/control")),
+        Some("sdk") => Ok(format!("{base}/sdk")),
         Some(t) => match t.strip_prefix("proxy:") {
             // Parse the port: raw text here would let `proxy:80@host` turn
-            // `127.0.0.1:80` into userinfo and send this state-changing POST to
-            // `host`, past the network policy (which checks only raw_url).
+            // `127.0.0.1:80` into userinfo and send the request to `host`,
+            // past the network policy (which checks only raw_url).
             Some(port) => {
                 let port: u16 = port.parse().map_err(|_| {
                     format!("Invalid proxy port in snapshot target '{t}': expected proxy:PORT")
                 })?;
-                Ok(format!(
-                    "http://127.0.0.1:{port}/__ui-bridge/control/{path}"
-                ))
+                Ok(format!("http://127.0.0.1:{port}/__ui-bridge/control"))
             }
             None => Err(format!(
                 "Unknown snapshot target: '{t}'. Use 'control', 'sdk', or 'proxy:PORT'"
@@ -789,30 +812,12 @@ mod element_action_payload_tests {
 ///
 /// The key list is a LITERAL, not the SDK's list and not a constant of the
 /// implementation: a field the SDK grows later is a red test only once someone
-/// lists it here (Phase 9 of the plan pins this list against the SDK's).
+/// lists it here (Phase 9 of the plan pins this list against the SDK's). Its
+/// one home is the `one_test_per_control_field!` table — the 13 keys of the
+/// SDK's `ControlActionRequest` plus one the runner cannot know about.
 #[cfg(test)]
 pub(crate) mod test_support {
     use serde_json::{json, Value};
-
-    /// The 13 keys of the SDK's `ControlActionRequest` plus one the runner
-    /// cannot know about.
-    #[allow(dead_code)]
-    pub(crate) const CONTROL_ACTION_REQUEST_KEYS: [&str; 14] = [
-        "action",
-        "params",
-        "waitOptions",
-        "windowLabel",
-        "requestId",
-        "captureAfter",
-        "retryOptions",
-        "waitAfter",
-        "waitAfterTimeout",
-        "waitAfterMinStable",
-        "verifyEffect",
-        "fromSnapshotId",
-        "includeResolutionAlternates",
-        "unknownFutureOptIn",
-    ];
 
     /// A value for `key` that no default could produce by accident.
     pub(crate) fn sample_value(key: &str) -> Value {
@@ -953,6 +958,29 @@ mod element_action_hop_tests {
             element_action_endpoint(base, Some("proxy:3001"), "btn-1").unwrap(),
             "http://127.0.0.1:3001/__ui-bridge/control/element/btn-1/action"
         );
+    }
+
+    #[test]
+    fn step_snapshot_root_parses_the_proxy_port_like_the_action_route() {
+        let base = "http://127.0.0.1:9876/ui-bridge/";
+        assert_eq!(
+            snapshot_target_root(base, None).unwrap(),
+            "http://127.0.0.1:9876/ui-bridge/control"
+        );
+        assert_eq!(
+            snapshot_target_root(base, Some("sdk")).unwrap(),
+            "http://127.0.0.1:9876/ui-bridge/sdk"
+        );
+        assert_eq!(
+            snapshot_target_root(base, Some("proxy:4000")).unwrap(),
+            "http://127.0.0.1:4000/__ui-bridge/control"
+        );
+        for bad in ["proxy:80@evil.example", "proxy:", "proxy:99999", "nope"] {
+            assert!(
+                snapshot_target_root(base, Some(bad)).is_err(),
+                "`{bad}` must be refused, not spliced into the URL"
+            );
+        }
     }
 
     #[test]
@@ -1147,6 +1175,29 @@ mod action_missing_message_window_and_step_request_tests {
         for rest in [Map::new(), main, empty] {
             let p = navigate_and_wait_window_payload(json!({"x": 1}), &rest);
             assert!(p.get("windowLabel").is_none(), "{p}");
+        }
+    }
+
+    /// The SDK route's journey scope names the window its fallback payload
+    /// routes to — exactly the payload root's `windowLabel`, or none.
+    #[test]
+    fn sdk_fallback_window_is_the_window_the_fallback_payload_routes_to() {
+        for (body, want) in [
+            (
+                json!({"action": "click", "windowLabel": "term-1"}),
+                Some("term-1"),
+            ),
+            (json!({"action": "click", "windowLabel": "main"}), None),
+            (json!({"action": "click", "windowLabel": ""}), None),
+            (json!({"action": "click"}), None),
+        ] {
+            assert_eq!(sdk_fallback_window(&body), want, "{body}");
+            let payload = sdk_fallback_payload("e1", &body).expect("names an action");
+            assert_eq!(
+                payload.get("windowLabel").and_then(|v| v.as_str()),
+                want,
+                "the scope must match where the payload routes: {payload}"
+            );
         }
     }
 
@@ -1375,6 +1426,19 @@ mod control_element_route_tests {
         assert!(
             !src.contains("for (k, v) in request.extra"),
             "the route folds every undeclared key into params again"
+        );
+        // A nameless request is refused before ANY IPC (the element probes,
+        // the expectChange pre-snapshot, the dispatch), so its "Nothing was
+        // dispatched" is true.
+        let gate = src
+            .find("action_wire::require_action_name(")
+            .expect("the route checks the action name");
+        let first_ipc = src
+            .find("ui_bridge_request_sync(")
+            .expect("the route dispatches over IPC");
+        assert!(
+            gate < first_ipc,
+            "the action-name gate must run before the first IPC call"
         );
     }
 }
