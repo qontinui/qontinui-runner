@@ -59,7 +59,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use session_lifecycle::{
     classify_session, Argv, ChildClass, Platform, ProcRow, ProcTable, SessionVerdict,
@@ -90,9 +90,42 @@ static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 /// The shadow's blocking reads still running on the pool, by [`LiveRead`].
 static LIVE_READS: LiveReads = LiveReads::new();
 
-/// Set once a census has logged that live reads kept it from starting a pass;
-/// cleared when a pass starts, so each stall is announced once.
-static STALL_SAID: AtomicBool = AtomicBool::new(false);
+/// When the current stall was last announced at info ([`StallLog`]).
+static STALL_LOG: StallLog = StallLog::new();
+
+/// How often a stall that never ends is announced at info again, so a runner
+/// whose log has rotated past the first announcement still says why it shows
+/// no shadow output.
+const STALL_ANNOUNCE_EVERY: Duration = Duration::from_secs(3600);
+
+/// When live reads last kept a census from starting a pass and that was said
+/// at info; `None` once a pass has started (no stall).
+struct StallLog(Mutex<Option<Instant>>);
+
+impl StallLog {
+    const fn new() -> Self {
+        StallLog(Mutex::new(None))
+    }
+
+    /// Whether a refusal at `now` is announced at info: the first refusal of a
+    /// stall, then at most one per [`STALL_ANNOUNCE_EVERY`] while it lasts.
+    /// The clock is the caller's, so a test moves it by hand.
+    fn announce(&self, now: Instant) -> bool {
+        let mut last = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        match *last {
+            Some(at) if now.saturating_duration_since(at) < STALL_ANNOUNCE_EVERY => false,
+            _ => {
+                *last = Some(now);
+                true
+            }
+        }
+    }
+
+    /// A pass started: the stall, if there was one, is over.
+    fn reset(&self) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
 
 /// A count of blocking reads still running, kept by the [`LiveRead`] guards
 /// those reads hold.
@@ -305,7 +338,8 @@ pub fn spawn_observe(processes: &[LiveClaudeProcess]) {
             .clear();
         return;
     }
-    let Some(sessions) = admit(sessions, &LIVE_READS, &IN_FLIGHT) else {
+    let now = Instant::now();
+    let Some(sessions) = admit(sessions, &LIVE_READS, &IN_FLIGHT, &STALL_LOG, now) else {
         return;
     };
     tokio::spawn(async move {
@@ -326,12 +360,15 @@ pub fn spawn_observe(processes: &[LiveClaudeProcess]) {
 /// taken the single-flight slot `in_flight`; `None` while a pass is still
 /// running, or while any blocking read counted in `live` — necessarily one an
 /// earlier pass started and abandoned at its budget — is still on the pool. A
-/// pass refused for live reads takes no slot, and the first refusal of each
-/// stall is logged at info, the rest at debug.
+/// pass refused for live reads takes no slot. A stall is logged at info on its
+/// first refusal and again at most once per [`STALL_ANNOUNCE_EVERY`] while it
+/// lasts (`stall`, read at `now`), and at debug otherwise.
 fn admit(
     sessions: Vec<(String, u32)>,
     live: &LiveReads,
     in_flight: &AtomicBool,
+    stall: &StallLog,
+    now: Instant,
 ) -> Option<Vec<(String, u32)>> {
     if in_flight.load(Ordering::Acquire) {
         debug!("finished_close shadow: a classify_child pass is still running — none started");
@@ -339,16 +376,17 @@ fn admit(
     }
     let reads = live.count();
     if reads > 0 {
-        if STALL_SAID.swap(true, Ordering::Relaxed) {
-            debug!(
-                live_reads = reads,
-                "finished_close shadow: blocking reads from an earlier classify_child pass are still running — none started"
-            );
-        } else {
+        if stall.announce(now) {
             info!(
                 live_reads = reads,
                 "finished_close shadow: {reads} blocking read(s) an earlier classify_child pass started are \
-                 still running past their budget — no pass starts until they return"
+                 still running past their budget — no pass starts until they return (said again at most \
+                 hourly while it lasts)"
+            );
+        } else {
+            debug!(
+                live_reads = reads,
+                "finished_close shadow: blocking reads from an earlier classify_child pass are still running — none started"
             );
         }
         return None;
@@ -357,7 +395,7 @@ fn admit(
         debug!("finished_close shadow: a classify_child pass is still running — none started");
         return None;
     }
-    STALL_SAID.store(false, Ordering::Relaxed);
+    stall.reset();
     Some(sessions)
 }
 
@@ -704,6 +742,8 @@ mod tests {
         use crate::process_capture::process_table::read_unshared;
         let live: &'static LiveReads = Box::leak(Box::new(LiveReads::new()));
         let in_flight: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
+        let stall = StallLog::new();
+        let t0 = Instant::now();
         let sessions = vec![("s".to_string(), 10)];
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let release_rx = std::sync::Arc::new(Mutex::new(Some(release_rx)));
@@ -723,17 +763,29 @@ mod tests {
 
         // A pass whose first walk stalls past its budget: the pass gives up
         // and ends (stale first table: nothing else is read)...
-        let first = admit(sessions.clone(), live, in_flight).expect("the first pass starts");
+        let first =
+            admit(sessions.clone(), live, in_flight, &stall, t0).expect("the first pass starts");
         let judged = judge_with(&first, table, |_| async { None }).await;
         in_flight.store(false, Ordering::Release);
         assert_eq!(judged[0].1.classes(), "claude unbound", "{judged:?}");
         // ...but its walk is still on the pool, and the next census starts none.
         assert_eq!(live.count(), 1, "the stalled walk is still counted");
-        assert_eq!(admit(sessions.clone(), live, in_flight), None);
-        assert_eq!(admit(sessions.clone(), live, in_flight), None);
+        let later = t0 + Duration::from_secs(30);
+        assert_eq!(
+            admit(sessions.clone(), live, in_flight, &stall, later),
+            None
+        );
+        assert_eq!(
+            admit(sessions.clone(), live, in_flight, &stall, later),
+            None
+        );
         assert!(
             !in_flight.load(Ordering::Acquire),
             "a pass refused for live reads takes no slot"
+        );
+        assert!(
+            !stall.announce(later),
+            "the first refusal announced the stall; the next ones inside the interval do not"
         );
 
         // Once the OS-level read returns, the guard drops and a pass may start.
@@ -743,10 +795,41 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         assert_eq!(live.count(), 0, "the guard dropped when the walk returned");
-        assert_eq!(admit(sessions.clone(), live, in_flight), Some(sessions));
+        assert_eq!(
+            admit(sessions.clone(), live, in_flight, &stall, later),
+            Some(sessions)
+        );
         assert!(
             in_flight.load(Ordering::Acquire),
             "the admitted pass took the slot"
+        );
+        assert!(
+            stall.announce(later),
+            "the admitted pass ended the stall: the next one is announced at once"
+        );
+    }
+
+    /// A stall that never ends is said again at info on a timer, never more
+    /// than once per interval, so a rotated log still shows why no shadow
+    /// output appears; a pass starting ends it. Driven by a hand-moved clock.
+    #[test]
+    fn a_stall_is_announced_at_once_then_at_most_once_per_interval() {
+        let stall = StallLog::new();
+        let t0 = Instant::now();
+        let at = |d: Duration| t0 + d;
+        assert!(stall.announce(t0), "the first refusal of a stall is said");
+        assert!(!stall.announce(at(Duration::from_secs(30))));
+        assert!(!stall.announce(at(STALL_ANNOUNCE_EVERY - Duration::from_millis(1))));
+        assert!(stall.announce(at(STALL_ANNOUNCE_EVERY)), "one interval on");
+        assert!(!stall.announce(at(STALL_ANNOUNCE_EVERY + Duration::from_secs(60))));
+        assert!(!stall.announce(at(STALL_ANNOUNCE_EVERY * 2 - Duration::from_millis(1))));
+        assert!(stall.announce(at(STALL_ANNOUNCE_EVERY * 2)), "and again");
+        // A clock read out of order never announces early.
+        assert!(!stall.announce(t0));
+        stall.reset();
+        assert!(
+            stall.announce(at(STALL_ANNOUNCE_EVERY * 2 + Duration::from_secs(1))),
+            "a stall after a pass is a new one, said at once"
         );
     }
 
@@ -793,7 +876,7 @@ mod tests {
         for door in [
             "snapshot_process_table_unshared(WALK_BUDGET, LIVE_READS.enter())",
             "raw_argvs_for_pids(&pids, ARGV_BUDGET, LIVE_READS.enter())",
-            "admit(sessions, &LIVE_READS, &IN_FLIGHT)",
+            "admit(sessions, &LIVE_READS, &IN_FLIGHT, &STALL_LOG, now)",
             "process_tree::in_process_table_read_disabled()",
         ] {
             assert!(
