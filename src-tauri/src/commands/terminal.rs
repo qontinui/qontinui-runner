@@ -844,6 +844,81 @@ pub async fn terminal_probe_claude(
     })
 }
 
+/// Which panes host an AI agent CLI of ANY provider — `claude`, `pi`
+/// (DeepSeek), `codex`, `gemini`, … — read from each pane's process subtree
+/// (`process_capture::agent_cli`).
+///
+/// WHY. The "Keep AI" button closes every pane it cannot prove hosts an AI
+/// session, and its tab-level signals are Claude-only: a `pi` session the
+/// operator started by hand in a shell carried none and was closed as a plain
+/// shell. The process table knows what is running regardless of provider.
+///
+/// `terminalIds` narrows the probe (default: every local pane). `fresh` takes
+/// a table read that began after the call — the button passes it on the click
+/// that closes, since it closes because an agent is ABSENT.
+///
+/// Returns `{ panes: { <id>: "<kind>" | "absent" | "unknown" | "none" } }`.
+/// `none` is an id with no terminal process at all (a plan-viewer tab, or a
+/// pane already gone) — nothing runs there to lose. A pane with no local pid
+/// (remote) reads `unknown`; so does every pane when the table or a needed
+/// command line could not be read. `unknown` must never be treated as
+/// `absent`.
+#[tauri::command]
+pub async fn terminal_agent_panes(
+    terminal_manager: tauri::State<'_, Arc<TerminalManager>>,
+    terminal_ids: Option<Vec<String>>,
+    fresh: Option<bool>,
+) -> Result<CommandResponse, String> {
+    use crate::process_capture::agent_cli::{classify_panes, PaneAgent};
+    use crate::process_capture::process_tree as pt;
+
+    let ids: Vec<String> = match terminal_ids {
+        Some(ids) => ids,
+        None => terminal_manager
+            .list()
+            .into_iter()
+            .map(|i| i.id.to_string())
+            .collect(),
+    };
+    let mut panes: Vec<(String, u32)> = Vec::new();
+    let mut result = serde_json::Map::new();
+    for id in ids {
+        match terminal_manager.get(&id).map(|s| s.child_pid()) {
+            Some(Some(pid)) => panes.push((id, pid)),
+            Some(None) => {
+                result.insert(id, serde_json::Value::from("unknown"));
+            }
+            None => {
+                result.insert(id, serde_json::Value::from("none"));
+            }
+        }
+    }
+    if !panes.is_empty() {
+        let snapshot = if fresh.unwrap_or(false) {
+            pt::snapshot_process_table_fresh().await
+        } else {
+            pt::snapshot_process_table_public().await
+        };
+        let verdicts = classify_panes(&panes, &snapshot, |pids| async move {
+            pt::command_lines_for_pids(&pids).await
+        })
+        .await;
+        for (id, v) in verdicts {
+            let s = match v {
+                PaneAgent::Present(kind) => kind,
+                PaneAgent::Absent => "absent",
+                PaneAgent::Unknown => "unknown",
+            };
+            result.insert(id, serde_json::Value::from(s));
+        }
+    }
+    Ok(CommandResponse {
+        success: true,
+        message: None,
+        data: Some(serde_json::json!({ "panes": serde_json::Value::Object(result) })),
+    })
+}
+
 /// Compact text-only snapshot for verifiers and external tools.
 ///
 /// Returns the rendered grid as `lines: Vec<String>` plus a single
