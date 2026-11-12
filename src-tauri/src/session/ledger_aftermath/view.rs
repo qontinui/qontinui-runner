@@ -218,8 +218,8 @@ mod tests {
         assert_eq!(s.finished_at, None, "the newest record saw it unfinished");
     }
 
-    /// Mutations: `held_now` true for any id while a read succeeded, and
-    /// `process_unknown` true for a by-design skip.
+    /// Mutation: `process_unknown` never true (an UNKNOWN read would then let
+    /// a miss read as a confident one).
     #[test]
     fn held_now_reads_only_a_fresh_read_and_only_an_unknown_read_is_unknown() {
         let held: HashSet<String> = ["s".to_string()].into_iter().collect();

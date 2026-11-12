@@ -223,9 +223,9 @@ fn a_keep_alive_through_the_fallback_match_records_nothing() {
     );
 }
 
-/// Mutation: `observe_registry` records every row, not only prior-roster ones
-/// (its roster filter removed); and, separately, the mirror keeps a close the
-/// registry no longer shows (the `if row.open { None }` arm made `row.close`).
+/// Mutations: `observe_registry` records every row, not only prior-roster ones
+/// (its roster filter removed); and, separately, the mirror sets a close but
+/// never clears one (a re-opened row keeps its recorded close).
 #[test]
 fn a_roster_ids_close_and_finish_are_recorded_with_their_reasons_and_a_non_roster_id_is_not() {
     let dir = tempfile::tempdir().unwrap();
@@ -278,8 +278,8 @@ fn a_roster_ids_close_and_finish_are_recorded_with_their_reasons_and_a_non_roste
     assert_eq!(rec.sessions["finished-one"].finished_at, None);
 }
 
-/// Mutations: `observe_tick` records a held id whatever the read (the
-/// `ProcessRead::Failed` arm made to record the previous tick's set), and
+/// Mutations: a failed read is kept as a successful empty one
+/// (`ProcessRead::Failed` mapped to an empty `TickRead::Held`), and
 /// `ProcessRead::of_tick` ignores the snapshot verdict (its `if snapshot_ok`
 /// guard removed).
 #[test]
@@ -368,8 +368,8 @@ fn a_partial_registry_read_records_what_it_found_and_leaves_the_tick_unknown() {
     );
 }
 
-/// Mutation: `observe_idle_tick` always takes a snapshot (its
-/// `wants_process_read` early return removed), and `wants_process_read` stays
+/// Mutations: `observe_idle_tick` always takes a snapshot (its
+/// `wants_process_read` early return disabled); `wants_process_read` stays
 /// armed by a settled session (`SessionAftermath::unsettled` made `true`).
 #[tokio::test]
 async fn an_idle_tick_reads_while_a_roster_session_is_unsettled_and_takes_no_snapshot_once_none_is()
@@ -427,6 +427,7 @@ async fn an_idle_tick_reads_while_a_roster_session_is_unsettled_and_takes_no_sna
 }
 
 /// An idle tick whose snapshot fails records nothing and reads UNKNOWN.
+/// Mutation: `observe_idle_tick` reporting `IdleTick::Read` whatever the read.
 #[tokio::test]
 async fn an_idle_tick_whose_snapshot_fails_records_nothing_and_reads_unknown() {
     let dir = tempfile::tempdir().unwrap();
@@ -449,8 +450,9 @@ async fn an_idle_tick_whose_snapshot_fails_records_nothing_and_reads_unknown() {
     );
 }
 
-/// Mutation: `observe_registry` drops the entries of roster ids the registry
-/// no longer holds — the record would forget a session once its row is pruned.
+/// Mutation: `observe_registry` drops the entry of a CLOSED session once the
+/// registry no longer holds its row — the record would forget a session as
+/// soon as its row is pruned.
 #[test]
 fn the_record_outlives_the_rows_prune() {
     let dir = tempfile::tempdir().unwrap();
@@ -485,9 +487,9 @@ fn the_record_outlives_the_rows_prune() {
     }
 }
 
-/// Mutation: the record's file named by a fixed stamp instead of its boot
-/// (`aftermath_file_name(boot_ms)` in `open` made `aftermath_file_name(0)`),
-/// so the second boot overwrites the first's.
+/// Mutation: a boot that finds an earlier record naming its generation
+/// writes into THAT record's file (`open`'s path keyed by the generation
+/// rather than the boot), so the second boot overwrites the first's.
 #[test]
 fn two_boots_naming_one_generation_file_keep_separate_records() {
     let dir = tempfile::tempdir().unwrap();
@@ -550,8 +552,10 @@ fn the_file_is_rewritten_only_when_it_changes() {
     assert_ne!(std::fs::read(&path).unwrap(), bytes, "a change is written");
 }
 
-/// Zero, one and many prior sessions. Mutation: `open` keeps only the first
-/// roster entry (`.take(1)` on the roster) — the many-session counts fail.
+/// Zero, one and many prior sessions. Mutations: `observe_tick` records only
+/// the first held id (`.take(1)` on the held loop) — the many-session counts
+/// fail; `SessionAftermath::unsettled` made `true` — the one-session read
+/// stays armed.
 #[test]
 fn zero_one_and_many_sessions() {
     // Zero: nothing to record, nothing to read, nothing written.
@@ -765,7 +769,7 @@ fn a_restore_stamp_from_this_boot_is_came_back_by_stamp_and_an_earlier_boots_is_
 }
 
 /// The file's wire shape, pinned (the record is read back by later boots, and
-/// by an operator).
+/// by an operator). Mutation: `SessionAftermath`'s camelCase rename removed.
 #[test]
 fn the_record_file_names_its_boot_and_generation_and_uses_camel_case_keys() {
     let dir = tempfile::tempdir().unwrap();
