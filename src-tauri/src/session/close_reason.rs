@@ -183,7 +183,7 @@ mod tests {
     }
 
     /// The stored strings are unchanged, so rows written before the enum read
-    /// the same.
+    /// the same. Mutation: as above (`PollDead => "pty-exit"`).
     #[test]
     fn the_wire_strings_are_the_ones_rows_already_carry() {
         let wire: Vec<&str> = CloseReason::ALL.iter().map(|r| r.as_str()).collect();

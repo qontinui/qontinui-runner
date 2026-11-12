@@ -2432,8 +2432,8 @@ mod tests {
     }
 
     /// `closed-since` is a deliberate close AT OR AFTER the capture (1 000
-    /// here); one before it is a miss that names its close. Mutations: the
-    /// capture-time filter removed, and `>=` made `>`.
+    /// here); one before it is a miss that names its close. Mutation: the
+    /// capture-time comparison's `>=` made `>` (the boundary).
     #[test]
     fn a_deliberate_close_before_the_capture_is_not_closed_since() {
         let prior = ledger(vec![
@@ -2457,8 +2457,8 @@ mod tests {
     }
 
     /// A session marked finished and also closed on purpose is `finished`:
-    /// finished outranks closed-since. Mutation: the closed-since arm moved
-    /// ahead of the finished one.
+    /// finished outranks closed-since. Mutation: the finished arm skipped for a
+    /// closed row (so closed-since would outrank it).
     #[test]
     fn finished_outranks_closed_since() {
         let prior = ledger(vec![
