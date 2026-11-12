@@ -604,18 +604,34 @@ pub(crate) async fn snapshot_fresh() -> ProcessSnapshot {
 /// caller leads and, if need be, falls back exactly as if this read had never
 /// happened — and a successful one is the observer's alone. A walk that fails,
 /// panics or outruns `budget` answers an empty stale table: UNKNOWN.
-pub(crate) async fn snapshot_unshared(budget: Duration) -> ProcessSnapshot {
-    read_unshared(walk_in_process, budget).await
+///
+/// `budget` bounds the caller's wait, not the walk: a walk still running when
+/// it expires keeps its blocking-pool thread until the OS-level read returns.
+/// `hold` is the caller's account of that: it is moved INTO the blocking
+/// closure and dropped there only when the walk returns (or when the closure
+/// is dropped unrun), so a caller that passes a counting guard counts exactly
+/// the walks still on the pool — past `budget`, and past its own await.
+pub(crate) async fn snapshot_unshared<H: Send + 'static>(
+    budget: Duration,
+    hold: H,
+) -> ProcessSnapshot {
+    read_unshared(walk_in_process, budget, hold).await
 }
 
 /// The read behind [`snapshot_unshared`], generic over the walk so a test
 /// drives this exact path beside a provider's own callers. A walk still running
-/// when `budget` expires finishes on the pool and its answer is dropped.
-pub(crate) async fn read_unshared<W>(walk: W, budget: Duration) -> ProcessSnapshot
+/// when `budget` expires finishes on the pool, holding `hold`, and its answer
+/// is dropped.
+pub(crate) async fn read_unshared<W, H>(walk: W, budget: Duration, hold: H) -> ProcessSnapshot
 where
     W: FnOnce() -> Result<ProcessSnapshot, String> + Send + 'static,
+    H: Send + 'static,
 {
-    let why = match tokio::time::timeout(budget, spawn_blocking_tracked(walk)).await {
+    let read = spawn_blocking_tracked(move || {
+        let _hold = hold;
+        walk()
+    });
+    let why = match tokio::time::timeout(budget, read).await {
         Ok(Ok(Ok(mut snap))) => {
             snap.stale = false;
             return snap;
@@ -749,10 +765,20 @@ pub(crate) fn command_lines_blocking(pids: &[u32]) -> Result<HashMap<u32, String
 /// space-joined line [`command_lines_for`] serves, in which distinct argvs
 /// collapse). No external fallback, so it never takes the fallback slot.
 ///
-/// `None` when the read could not run (the in-process kill switch is set, or
-/// the blocking task did not join): UNKNOWN. A pid that is dead or unreadable
-/// is absent from a `Some` map.
-pub(crate) async fn raw_argvs_for(pids: &[u32]) -> Option<HashMap<u32, session_lifecycle::Argv>> {
+/// Bounded by `budget` and accounted by `hold` exactly as
+/// [`snapshot_unshared`] is: a Linux `/proc/<pid>/cmdline` read can block while
+/// a process in uninterruptible sleep holds its memory lock, so the wait gives
+/// up at `budget` while `hold` stays on the blocking thread until the read
+/// itself returns.
+///
+/// `None` when the read could not run (the in-process kill switch is set, the
+/// blocking task did not join, or it outran `budget`): UNKNOWN. A pid that is
+/// dead or unreadable is absent from a `Some` map.
+pub(crate) async fn raw_argvs_for<H: Send + 'static>(
+    pids: &[u32],
+    budget: Duration,
+    hold: H,
+) -> Option<HashMap<u32, session_lifecycle::Argv>> {
     if pids.is_empty() {
         return Some(HashMap::new());
     }
@@ -760,10 +786,24 @@ pub(crate) async fn raw_argvs_for(pids: &[u32]) -> Option<HashMap<u32, session_l
         return None;
     }
     let asked = pids.to_vec();
-    spawn_blocking_tracked(move || std::panic::catch_unwind(|| platform::raw_argvs(&asked)).ok())
-        .await
-        .ok()
-        .flatten()
+    let read = spawn_blocking_tracked(move || {
+        let _hold = hold;
+        std::panic::catch_unwind(|| platform::raw_argvs(&asked)).ok()
+    });
+    match tokio::time::timeout(budget, read).await {
+        Ok(Ok(argvs)) => argvs,
+        Ok(Err(e)) => {
+            tracing::debug!("process_table: the raw argv read did not join: {e}");
+            None
+        }
+        Err(_) => {
+            tracing::debug!(
+                "process_table: the raw argv read was still running after {}ms",
+                budget.as_millis()
+            );
+            None
+        }
+    }
 }
 
 /// Command lines for exactly `pids`: in-process, with the external probe
@@ -1698,6 +1738,7 @@ mod tests {
                 Err("scripted unshared walk failure".to_string())
             },
             Duration::from_secs(30),
+            (),
         ));
         started_rx.await.expect("the unshared walk started");
 
@@ -1735,10 +1776,13 @@ mod tests {
 
     /// `read_unshared` is bounded: a walk still running at its budget answers
     /// stale at once (the walk finishes on the pool, its answer dropped), and a
-    /// good walk answers its own table, fresh.
+    /// good walk answers its own table, fresh. Its `hold` is held by the WALK,
+    /// not by the wait: it survives the budget and drops only once the walk on
+    /// the pool returns.
     #[tokio::test]
     async fn process_table_an_unshared_read_is_bounded_and_fresh_when_it_succeeds() {
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let token = Arc::new(());
         let began = Instant::now();
         let late = read_unshared(
             move || {
@@ -1746,6 +1790,7 @@ mod tests {
                 Ok(table(7))
             },
             Duration::from_millis(50),
+            Arc::clone(&token),
         )
         .await;
         assert!(
@@ -1757,11 +1802,25 @@ mod tests {
             "{:?}",
             began.elapsed()
         );
+        assert_eq!(
+            Arc::strong_count(&token),
+            2,
+            "the walk outlived the budget and still holds `hold`"
+        );
         let _ = release_tx.send(());
+        let give_up = Instant::now() + Duration::from_secs(5);
+        while Arc::strong_count(&token) > 1 && Instant::now() < give_up {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            Arc::strong_count(&token),
+            1,
+            "`hold` drops when the walk returns"
+        );
 
         let mut walked = table(4);
         walked.stale = true;
-        let good = read_unshared(move || Ok(walked), Duration::from_secs(30)).await;
+        let good = read_unshared(move || Ok(walked), Duration::from_secs(30), ()).await;
         assert!(
             !good.stale && good.names.contains_key(&4),
             "a good walk is fresh"

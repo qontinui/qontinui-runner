@@ -573,19 +573,30 @@ pub async fn command_lines_for_pids(pids: &[u32]) -> Option<HashMap<u32, String>
 /// kept. Use this, not [`command_lines_for_pids`], whenever the exact argv
 /// matters: that door's Windows answer is `sysinfo`'s argv rejoined, which
 /// loses cmd's `^"` escapes, and its Unix answer joins the argv with spaces, in
-/// which distinct argvs collapse. In-process only, with no fallback. `None` =
-/// UNKNOWN; a pid absent from a `Some` map is unreadable.
-pub async fn raw_argvs_for_pids(pids: &[u32]) -> Option<HashMap<u32, session_lifecycle::Argv>> {
-    super::process_table::raw_argvs_for(pids).await
+/// which distinct argvs collapse. In-process only, with no fallback, bounded by
+/// `budget`; `hold` stays on the blocking thread until the read itself returns
+/// (see [`super::process_table::snapshot_unshared`]). `None` = UNKNOWN; a pid
+/// absent from a `Some` map is unreadable.
+pub async fn raw_argvs_for_pids<H: Send + 'static>(
+    pids: &[u32],
+    budget: std::time::Duration,
+    hold: H,
+) -> Option<HashMap<u32, session_lifecycle::Argv>> {
+    super::process_table::raw_argvs_for(pids, budget, hold).await
 }
 
 /// A fresh process table for an OBSERVER, walked privately and bounded by
 /// `budget` ([`super::process_table::snapshot_unshared`]): it shares nothing
 /// with the provider every other read goes through — no walk another caller
 /// can join, no memo, no fallback slot, no circuit — so it can change nothing
-/// any other caller is served. A failed or late walk answers stale (UNKNOWN).
-pub async fn snapshot_process_table_unshared(budget: std::time::Duration) -> ProcessSnapshot {
-    super::process_table::snapshot_unshared(budget).await
+/// any other caller is served. A failed or late walk answers stale (UNKNOWN);
+/// `hold` stays on the blocking thread until the walk itself returns, so a
+/// caller can count its walks still on the pool.
+pub async fn snapshot_process_table_unshared<H: Send + 'static>(
+    budget: std::time::Duration,
+    hold: H,
+) -> ProcessSnapshot {
+    super::process_table::snapshot_unshared(budget, hold).await
 }
 
 /// Whether `QONTINUI_PROCESS_TABLE_IN_PROCESS=0` has switched the in-process
