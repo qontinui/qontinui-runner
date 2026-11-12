@@ -716,6 +716,25 @@ fn this_boot_generation() -> Option<&'static Path> {
     THIS_BOOT_GENERATION.get().and_then(|o| o.as_deref())
 }
 
+/// The file name of the generation this boot retained its prior ledger into
+/// (`None` before [`load_prior_once`], or when nothing was retained) — the
+/// file this boot's aftermath record names
+/// ([`crate::session::ledger_aftermath`]).
+pub(crate) fn this_boot_generation_file_name() -> Option<String> {
+    this_boot_generation()
+        .and_then(Path::file_name)
+        .map(|n| n.to_string_lossy().into_owned())
+}
+
+/// The file names of every generation file in `dir`, readable or not: the
+/// generations an aftermath record may name and still be retained.
+pub(crate) fn generation_file_names_in(dir: &Path) -> HashSet<String> {
+    generation_files_in(dir)
+        .into_iter()
+        .filter_map(|(_, p)| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .collect()
+}
+
 /// Retire the live ledger at `live` into a generation file stamped
 /// `rotated_at_ms`, then prune to the newest `keep`.
 ///

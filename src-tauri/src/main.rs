@@ -4546,6 +4546,11 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // runner. This makes the same information survive the kill a
                 // rebuild performs.
                 let _prior_ledger = session::session_ledger::load_prior_once();
+                // The aftermath record of this boot's prior roster (plan
+                // 2026-11-11-since-restart-roster-counts-closed-sessions-as-
+                // missing, Phase 2): opened once the prior is latched and its
+                // generation retained, and fed by the liveness poll below.
+                session::ledger_aftermath::open_for_this_boot();
                 {
                     let boot_ledger = session::session_ledger::capture(
                         &lifecycle_store,
@@ -4703,7 +4708,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         session::reconcile::DiskTranscriptIndex::discover();
 
                     loop {
-                        tokio::time::sleep(Duration::from_secs(45)).await;
+                        tokio::time::sleep(Duration::from_secs(
+                            session::ledger_aftermath::LIVENESS_POLL_INTERVAL_SECS,
+                        ))
+                        .await;
 
                         // Periodic snapshot-history heartbeat (Phase 4): the
                         // sink itself enforces the ~5-minute spacing, so
@@ -4740,6 +4748,13 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                 session::shutdown_marker::boot_classification(),
                             );
                             session::session_ledger::persist_capture(&led);
+                        }
+                        // Aftermath feed (a): this boot's restore stamps and
+                        // the prior roster's closes and finishes, read BEFORE
+                        // either prune below can drop a closed row.
+                        let aftermath = session::ledger_aftermath::process();
+                        if let Some(aftermath) = aftermath {
+                            aftermath.observe_registry(&poll_lifecycle_store.all_records());
                         }
 
                         let open = poll_lifecycle_store.open_records();
@@ -4788,10 +4803,22 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
                         if open.is_empty() && !needs_reconcile {
                             // Nothing to classify AND nothing to reconcile —
-                            // forget any stale counters and prune, then idle
-                            // WITHOUT taking the per-tick process snapshot.
+                            // forget any stale counters and prune, then idle.
+                            // The process snapshot is taken only while the
+                            // aftermath record still has a prior-roster session
+                            // a live-session read could find (unobserved,
+                            // unfinished, unclosed); otherwise the idle tick
+                            // stays snapshot-free.
                             consecutive_dead.clear();
                             consecutive_no_match.clear();
+                            if let Some(aftermath) = aftermath {
+                                aftermath
+                                    .observe_idle_tick(
+                                        crate::process_capture::process_tree::snapshot_process_table_public,
+                                        terminal::transcript::find_claude_config_dirs,
+                                    )
+                                    .await;
+                            }
                             poll_lifecycle_store.prune(
                                 chrono::Utc::now().timestamp_millis(),
                                 &live_terminal_ids,
@@ -4852,43 +4879,47 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         // or name. An indeterminate snapshot (the fail-closed
                         // `live_pids_from_snapshot` error) degrades to "no
                         // identity data this tick", never to a blanking write.
+                        //
+                        // Read on EVERY snapshot tick, with or without an open
+                        // row: the same read is the aftermath record's process
+                        // evidence (feed (b) below), so it is taken once.
+                        let live_sessions = session::ledger_aftermath::read_live_claude_sessions(
+                            &snap,
+                            terminal::transcript::find_claude_config_dirs,
+                        );
                         let live_identity: StdHashMap<String, session::session_lifecycle_store::SessionIdentityUpdate> =
-                            if open.is_empty() {
-                                StdHashMap::new()
-                            } else {
-                                match session::claude_session_registry::live_pids_from_snapshot(&snap) {
-                                    // A PARTIAL read is safe here, so the rows of
-                                    // every listable dir are used and an unlistable
-                                    // dir only costs its own: a session missing from
-                                    // this map gets no update at all (the sticky rule
-                                    // above), so a hidden row can never blank a stored
-                                    // account or name.
-                                    Ok(live_pids) => session::claude_session_registry::read_live_sessions(
-                                        &terminal::transcript::find_claude_config_dirs(),
-                                        &live_pids,
-                                        &session::claude_session_registry::may_host_claude(&snap),
-                                    )
-                                    .sessions
-                                    .into_iter()
-                                    // `read_live_sessions` returns one row per
-                                    // PROCESS and several processes may report
-                                    // one session id; it is sorted stably, so
-                                    // keeping the FIRST row per id is a stable
-                                    // choice rather than a coin flip.
-                                    .fold(StdHashMap::new(), |mut acc, s| {
-                                        acc.entry(s.session_id.clone())
-                                            .or_insert_with(|| s.identity_update());
-                                        acc
-                                    }),
-                                    Err(e) => {
-                                        tracing::debug!(
-                                            error = %e,
-                                            "session lifecycle poll: live-session registry indeterminate — identity refresh skipped this tick"
-                                        );
-                                        StdHashMap::new()
-                                    }
+                            match &live_sessions {
+                                // A PARTIAL read is safe here, so the rows of
+                                // every listable dir are used and an unlistable
+                                // dir only costs its own: a session missing from
+                                // this map gets no update at all (the sticky rule
+                                // above), so a hidden row can never blank a stored
+                                // account or name.
+                                //
+                                // `read_live_sessions` returns one row per
+                                // PROCESS and several processes may report one
+                                // session id; it is sorted stably, so keeping
+                                // the FIRST row per id is a stable choice
+                                // rather than a coin flip.
+                                Ok(read) => read.sessions.iter().fold(StdHashMap::new(), |mut acc, s| {
+                                    acc.entry(s.session_id.clone())
+                                        .or_insert_with(|| s.identity_update());
+                                    acc
+                                }),
+                                Err(e) => {
+                                    tracing::debug!(
+                                        error = %e,
+                                        "session lifecycle poll: live-session registry indeterminate — identity refresh skipped this tick"
+                                    );
+                                    StdHashMap::new()
                                 }
                             };
+                        // The rows the classify loop keeps alive this tick, with
+                        // how each matched its terminal (aftermath feed (b)).
+                        let mut kept_alive: Vec<(
+                            String,
+                            session::session_lifecycle_store::PollTerminalMatch,
+                        )> = Vec::new();
 
                         // Index the live terminals ONCE per tick (plan
                         // 2026-07-28-runner-many-sessions-performance §7a/B8).
@@ -5183,6 +5214,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                             .clear_restore_pending(&rec.claude_session_id);
                                     }
                                     poll_lifecycle_store.touch(&rec.claude_session_id);
+                                    kept_alive.push((rec.claude_session_id.clone(), terminal_match));
                                     consecutive_dead.remove(&rec.claude_session_id);
                                     consecutive_no_match.remove(&rec.claude_session_id);
                                 }
@@ -5276,6 +5308,19 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         // against them.
                         if let Some(epoch) = poll_lifecycle_store.observation_epoch() {
                             epoch.record_tick(tick_snapshot_ok, snap_captured_at_ms, &held_unjudged);
+                        }
+                        // Aftermath feed (b), at the same point: the rows kept
+                        // alive on their own terminal, and the prior-roster ids
+                        // a live claude holds — nothing from a failed read.
+                        if let Some(aftermath) = aftermath {
+                            aftermath.observe_tick(
+                                snap_captured_at_ms,
+                                &kept_alive,
+                                session::ledger_aftermath::ProcessRead::of_tick(
+                                    tick_snapshot_ok,
+                                    &live_sessions,
+                                ),
+                            );
                         }
 
                         if held_for_restore > 0 {
