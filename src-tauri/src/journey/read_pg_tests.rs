@@ -41,7 +41,15 @@
 //! `fromNode` as its `toNode` failed (f) on the graph answer's unknown
 //! destinations, but one doing so only for `changed` groups left (f) green
 //! (every prior-knowledge candidate here is unsettled already), and (a), (b),
-//! (e) and (g) caught it.
+//! (e) and (g) caught it. The verdict now also reads each graph node's open
+//! frontier entries and unconfirmed destination and each unexplored node's two
+//! flags, and (f) is still green under that last mutation.
+//!
+//! Every mutation above was a temporary edit to `read.rs`, reverted after its
+//! run, so its runs are kept with the pull request that added this module, not
+//! in the tree. Each ran before this branch was rebased onto `main` and again
+//! on the rebased branch, against the verdict as it stands now, with the same
+//! result; only the runs before the rebase also tried the replaced verdict.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
