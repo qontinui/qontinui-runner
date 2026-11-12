@@ -665,20 +665,108 @@ mod tests {
         "retry",             // a `continue` that carries the context into the next attempt
     ];
 
-    /// `Ok(true)` when `line` is a well-formed keep marker, `Ok(false)` when it
-    /// is no marker at all, `Err` for a marker with an unknown reason.
-    fn keep_marker(line: &str) -> Result<bool, String> {
-        let Some(rest) = line.trim().strip_prefix("// door-scan: keep(") else {
-            return Ok(false);
+    /// The reasons a `door-scan: no-exits(<reason>)` marker may give for a
+    /// door fn with no exit after its allocation.
+    const NO_EXIT_REASONS: &[&str] = &[
+        "infallible", // nothing after the allocation can fail
+        "handed-off", // the allocation moves into a callee that owns its removal
+    ];
+
+    /// The reason of a `// door-scan: <kind>(<reason>)` COMMENT line — a line
+    /// that is the comment and nothing else, so the text inside a string or
+    /// after code never counts. `Ok(None)` when the line is no such marker,
+    /// `Err` when its reason is not in `allowed`.
+    fn marker_reason(line: &str, kind: &str, allowed: &[&str]) -> Result<Option<String>, String> {
+        let Some(rest) = line.trim().strip_prefix(&format!("// door-scan: {kind}(")) else {
+            return Ok(None);
         };
         let reason = rest.split(')').next().unwrap_or_default();
-        if KEEP_REASONS.contains(&reason) {
-            Ok(true)
+        if allowed.contains(&reason) {
+            Ok(Some(reason.to_string()))
         } else {
             Err(format!(
-                "unknown keep reason `{reason}` (allowed: {KEEP_REASONS:?})"
+                "unknown {kind} reason `{reason}` (allowed: {allowed:?})"
             ))
         }
+    }
+
+    /// `Ok(Some(reason))` for a well-formed keep marker, `Ok(None)` for no
+    /// marker, `Err` for an unknown reason.
+    fn keep_marker(line: &str) -> Result<Option<String>, String> {
+        marker_reason(line, "keep", KEEP_REASONS)
+    }
+
+    /// The exit kind a keep reason is tied to, if any: `retry` belongs on a
+    /// `continue`, `loop-exit` on a `break`.
+    fn reason_fits_exit(reason: &str, code: &str, col: usize) -> Result<(), String> {
+        let at = code.get(col..).unwrap_or_default();
+        let need = match reason {
+            "retry" => "continue",
+            "loop-exit" => "break",
+            _ => return Ok(()),
+        };
+        if at.starts_with(need) {
+            Ok(())
+        } else {
+            Err(format!(
+                "keep({reason}) belongs on a `{need}`, not on `{}`",
+                at.trim()
+            ))
+        }
+    }
+
+    /// `retry` only marks a `continue` and `loop-exit` only a `break`.
+    #[test]
+    fn a_keep_reason_must_fit_its_exit_kind() {
+        assert!(reason_fits_exit("retry", "        continue;", 8).is_ok());
+        assert!(reason_fits_exit("retry", "        return Err(e);", 8).is_err());
+        assert!(reason_fits_exit("loop-exit", "        break;", 8).is_ok());
+        assert!(reason_fits_exit("loop-exit", "        continue;", 8).is_err());
+        assert!(reason_fits_exit("post-child", "        return Err(e);", 8).is_ok());
+        let mismatched = exits_of(
+            "fn door() {\n    let ctx = acquire();\n    // door-scan: keep(retry) next\n    \
+             return Err(2);\n}\n",
+        );
+        assert!(
+            mismatched
+                .iter()
+                .any(|e| e.contains("belongs on a `continue`")),
+            "{mismatched:?}"
+        );
+    }
+
+    /// The no-exits escape counts only as a comment line, only after the
+    /// allocation, and only with a known reason.
+    #[test]
+    fn the_no_exits_escape_is_a_comment_after_the_allocation_with_a_known_reason() {
+        let in_string = "fn door() {\n    let ctx = acquire();\n    let s = \"// door-scan: \
+                         no-exits(infallible)\";\n    run(ctx, s);\n}\n";
+        assert!(
+            exits_of(in_string).iter().any(|e| e.contains("NO exit")),
+            "{:?}",
+            exits_of(in_string)
+        );
+        let before_alloc = "fn door() {\n    // door-scan: no-exits(infallible) x\n    let ctx = \
+                            acquire();\n    run(ctx);\n}\n";
+        assert!(
+            exits_of(before_alloc).iter().any(|e| e.contains("NO exit")),
+            "{:?}",
+            exits_of(before_alloc)
+        );
+        let unknown =
+            "fn door() {\n    let ctx = acquire();\n    // door-scan: no-exits(trust-me) x\n    \
+                       run(ctx);\n}\n";
+        assert!(
+            exits_of(unknown)
+                .iter()
+                .any(|e| e.contains("unknown no-exits reason")),
+            "{:?}",
+            exits_of(unknown)
+        );
+        let good =
+            "fn door() {\n    let ctx = acquire();\n    // door-scan: no-exits(infallible) x\n    \
+                    run(ctx);\n}\n";
+        assert!(exits_of(good).is_empty(), "{:?}", exits_of(good));
     }
 
     /// Per line: the brace depth at its start, and the lowest depth reached
@@ -788,12 +876,7 @@ mod tests {
                 })
                 .map(|(i, _)| i)
         };
-        let trimmed = l.trim_start();
-        let tail_err = if trimmed.starts_with("Err(") && !l.contains("=>") {
-            Some(l.len() - trimmed.len())
-        } else {
-            l.find("=> Err(").map(|i| i + 3)
-        };
+        let tail_err = value_position_err(l);
         [
             l.find('?'),
             word("return"),
@@ -806,6 +889,78 @@ mod tests {
         .into_iter()
         .flatten()
         .min()
+    }
+
+    /// The column of the first `Err(` on a CODE line that sits in VALUE
+    /// position: at the start of the line, or right after `=>`, `{` or `;`
+    /// (whitespace-insensitive) — an arm's value or a block's tail — and is
+    /// not itself an arm PATTERN (its closing paren followed by `=>`).
+    ///
+    /// Known limit, deliberately not chased: a tail whose value is not a
+    /// literal `Err(..)` (a variable holding one, `res.map_err(..)`, a call
+    /// returning one) is not seen. The door fns' refusal arms are all written
+    /// as literal `Err(..)`, and a door with no visible exit at all fails the
+    /// zero-exit rule rather than passing silently.
+    fn value_position_err(l: &str) -> Option<usize> {
+        let ident = |c: char| c.is_alphanumeric() || c == '_' || c == ':';
+        l.match_indices("Err(").map(|(i, _)| i).find(|&i| {
+            let before = l.get(..i).unwrap_or_default().trim_end();
+            if before.chars().next_back().is_some_and(ident) {
+                return false; // `map_err(`, `io::Err(`…: not a bare `Err(`
+            }
+            let in_value = before.is_empty()
+                || before.ends_with("=>")
+                || before.ends_with('{')
+                || before.ends_with(';');
+            if !in_value {
+                return false;
+            }
+            // Find the matching `)` and refuse a pattern (`Err(e) =>`).
+            let mut depth = 0i32;
+            let mut close = None;
+            for (j, c) in l.char_indices().skip_while(|(j, _)| *j < i + 3) {
+                match c {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            close = Some(j);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let after = close
+                .and_then(|j| l.get(j + 1..))
+                .unwrap_or_default()
+                .trim_start();
+            !after.starts_with("=>")
+        })
+    }
+
+    /// The four tail forms a refusal arm is written in are all exits; a
+    /// pattern, a `map_err(` call and an `if let Err(` binding are not.
+    #[test]
+    fn every_value_position_err_form_is_an_exit() {
+        let exits = [
+            "        Err(e) => { log(e); Err(e) }",
+            "        } else { Err(x) }",
+            "        Err(j) =>Err(j),",
+            "            Err(e)",
+        ];
+        for l in exits {
+            assert!(value_position_err(l).is_some(), "an exit: {l}");
+        }
+        let not_exits = [
+            "        Err(e) => {",
+            "        let y = r.map_err(|e| x(e));",
+            "        if let Err(e) = run() {",
+            "        Err(_) => warn!(x),",
+        ];
+        for l in not_exits {
+            assert!(value_position_err(l).is_none(), "not an exit: {l}");
+        }
     }
 
     /// A tail-position `Err(..)` — an arm's or block's value — is an exit; the
@@ -905,8 +1060,8 @@ mod tests {
             "{:?}",
             exits_of(bare)
         );
-        let declared = "fn door() {\n    // door-scan: no-exits(infallible) run cannot fail\n    \
-                        let ctx = acquire();\n    run(ctx);\n}\n";
+        let declared = "fn door() {\n    let ctx = acquire();\n    \
+                        // door-scan: no-exits(infallible) run cannot fail\n    run(ctx);\n}\n";
         assert!(exits_of(declared).is_empty(), "{:?}", exits_of(declared));
     }
 
@@ -1524,7 +1679,15 @@ mod tests {
                 .map(|e| format!("{file}: {e}")),
         );
         let exits = early_exits(&code, from, end + 1);
-        if exits.is_empty() && !(start..=end).any(|i| raw[i].contains("door-scan: no-exits(")) {
+        let mut no_exits = false;
+        for line in raw.iter().take(end + 1).skip(from + 1) {
+            match marker_reason(line, "no-exits", NO_EXIT_REASONS) {
+                Ok(Some(_)) => no_exits = true,
+                Ok(None) => {}
+                Err(why) => out.push(format!("{file}: `{name}`: {why}")),
+            }
+        }
+        if exits.is_empty() && !no_exits {
             out.push(format!(
                 "{file}: `{name}` has NO exit after the allocation that the scan can see — a \
                  door that can refuse always has one; if this one truly cannot, say so with \
@@ -1542,7 +1705,12 @@ mod tests {
                 })
             });
             let declared = match e.checked_sub(1).map(|a| keep_marker(&raw[a])) {
-                Some(Ok(true)) => true,
+                Some(Ok(Some(reason))) => {
+                    if let Err(why) = reason_fits_exit(&reason, &code[e], ce) {
+                        out.push(format!("{file}:{}: {why}", e + 1));
+                    }
+                    true
+                }
                 Some(Err(why)) => {
                     out.push(format!("{file}:{}: {why}", e));
                     true
