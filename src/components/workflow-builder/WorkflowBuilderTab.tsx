@@ -35,7 +35,6 @@ import { AiGeneratePanel } from "./AiGeneratePanel";
 import { StageSelector } from "./StageSelector";
 import { ConstraintsPanel } from "./constraints";
 import { BatchDeleteDialog, ConfirmDialog } from "../ui";
-import { registerUserSkills } from "@qontinui/workflow-utils";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
 import { CompositionBuilderDialog } from "./CompositionBuilderDialog";
 import { SkillExportDialog } from "./SkillExportDialog";
@@ -212,52 +211,6 @@ function WorkflowBuilderContent({
     [state.selectedStepId, moveStep, removeStep, selectStep],
   );
 
-  const _handleForkSkill = useCallback(async (skillId: string, newName?: string) => {
-    try {
-      const response = await tracedFetch(`${getApiBase()}/skills/${skillId}/fork`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ new_name: newName || undefined }),
-      });
-      if (!response.ok) {
-        const err = await response.json();
-        console.error("Fork failed:", err);
-        return;
-      }
-      const allResponse = await tracedFetch(`${getApiBase()}/skills`);
-      if (allResponse.ok) {
-        const allSkills = await allResponse.json();
-        const nonBuiltin = allSkills.filter((s: { source: string }) => s.source !== "builtin");
-        registerUserSkills(nonBuiltin);
-      }
-    } catch (err) {
-      console.error("Fork error:", err);
-    }
-  }, []);
-
-  const _handleApproveSkill = useCallback(async (skillId: string, status: string) => {
-    try {
-      const response = await tracedFetch(`${getApiBase()}/skills/${skillId}/approve`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ status }),
-      });
-      if (!response.ok) {
-        const err = await response.json();
-        console.error("Approval failed:", err);
-        return;
-      }
-      const allResponse = await tracedFetch(`${getApiBase()}/skills`);
-      if (allResponse.ok) {
-        const allSkills = await allResponse.json();
-        const nonBuiltin = allSkills.filter((s: { source: string }) => s.source !== "builtin");
-        registerUserSkills(nonBuiltin);
-      }
-    } catch (err) {
-      console.error("Approval error:", err);
-    }
-  }, []);
-
   return (
     <div className="h-full flex">
       {wfLib.showLibrary && (
@@ -370,6 +323,24 @@ function WorkflowBuilderContent({
         {execState.executionSuccess && !execState.isExecuting && (
           <div className="px-4 py-2 bg-green-500/20 border-b border-green-500/30 text-green-400 text-sm">
             {execState.executionSuccess}
+          </div>
+        )}
+        {wfLib.skillTransferNotice && (
+          <div className="px-4 py-2 bg-amber-500/20 border-b border-amber-500/30 text-amber-400 text-sm flex items-center justify-between gap-2">
+            <span
+              data-content-role="status"
+              data-content-label="skill transfer notice"
+              className="flex-1"
+            >
+              {wfLib.skillTransferNotice}
+            </span>
+            <button
+              onClick={() => wfLib.setSkillTransferNotice(null)}
+              className="text-amber-400 hover:text-amber-300 p-1"
+              title="Dismiss"
+            >
+              &#10005;
+            </button>
           </div>
         )}
         {(state.error || execState.executionError) && !execState.isExecuting && (

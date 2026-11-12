@@ -10,10 +10,12 @@ import {
   extractLiveSessions,
   extractLiveSessionsStrict,
   fetchLiveClaudeSessionIds,
+  fetchVisibleLiveClaudeSessionIds,
   isOperatorNamed,
   registryNamesBySessionId,
   type LiveClaudeSession,
 } from "./liveClaudeSessions";
+import { resumeUnfinished } from "./unfinishedSessions";
 
 function mk(over: Partial<LiveClaudeSession> = {}): LiveClaudeSession {
   return {
@@ -272,5 +274,92 @@ describe("fetchLiveClaudeSessionIds (P1 restore-idempotence liveness source)", (
     });
     const ids = await fetchLiveClaudeSessionIds();
     expect([...ids!]).toEqual(["ok"]);
+  });
+});
+
+/**
+ * A read that succeeded but could not see everything: a `sessions/` dir that
+ * exists and cannot be listed (`unlistable`), or a live pid's record that
+ * could not be read (`unreadableRecords`). The rows it DID see are live.
+ */
+function partialRead(over: { unlistable?: unknown; unreadableRecords?: unknown } = {}) {
+  return {
+    success: true,
+    message: null,
+    data: {
+      sessions: [mk({ sessionId: "visible-live", pid: 21 })],
+      unlistable: ["/home/u/.claude-x/sessions (Permission denied)"],
+      unreadableRecords: [],
+      ...over,
+    },
+  };
+}
+
+describe("a partial live-registry read", () => {
+  beforeEach(() => {
+    mockInvoke.mockReset();
+  });
+
+  it("is indeterminate to the strict oracle the unattended restore paths use", async () => {
+    // An id MISSING from a partial read may sit in the dir that could not be
+    // read, so the drain / sweep recheck / profile resume must not respawn it.
+    mockInvoke.mockResolvedValueOnce(partialRead());
+    expect(await fetchLiveClaudeSessionIds()).toBeNull();
+    mockInvoke.mockResolvedValueOnce(
+      partialRead({ unlistable: [], unreadableRecords: ["/h/.claude/sessions/9.json (torn)"] }),
+    );
+    expect(await fetchLiveClaudeSessionIds()).toBeNull();
+    // A gap key we cannot read is a shape we do not understand.
+    mockInvoke.mockResolvedValueOnce(partialRead({ unlistable: "nope" }));
+    expect(await fetchLiveClaudeSessionIds()).toBeNull();
+  });
+
+  it("is complete when both gap lists are empty, or absent (an older runner)", async () => {
+    mockInvoke.mockResolvedValueOnce(partialRead({ unlistable: [], unreadableRecords: [] }));
+    expect([...(await fetchLiveClaudeSessionIds())!]).toEqual(["visible-live"]);
+    mockInvoke.mockResolvedValueOnce({
+      success: true,
+      message: null,
+      data: { sessions: [mk({ sessionId: "visible-live" })] },
+    });
+    expect([...(await fetchLiveClaudeSessionIds())!]).toEqual(["visible-live"]);
+  });
+
+  it("still shows the click paths every session it could see live", async () => {
+    mockInvoke.mockResolvedValueOnce(partialRead());
+    expect([...(await fetchVisibleLiveClaudeSessionIds())!]).toEqual(["visible-live"]);
+    mockInvoke.mockRejectedValueOnce(new Error("ipc down"));
+    expect(await fetchVisibleLiveClaudeSessionIds()).toBeNull();
+  });
+
+  it("makes Resume unfinished refuse a session it shows live, and ask the door only for the rest", async () => {
+    // The click path's default oracle, end to end: one unlistable dir
+    // elsewhere must not turn a visibly live session into "go ahead" — typing
+    // `--resume` for it would fork its transcript.
+    mockInvoke.mockResolvedValueOnce(partialRead());
+    const posted: string[][] = [];
+    const door = (async (_url: string, init: RequestInit) => {
+      const { ids } = JSON.parse(String(init.body)) as { ids: string[] };
+      posted.push(ids);
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          data: {
+            results: ids.map((id) => ({
+              id,
+              outcome: "resumed",
+              reason: null,
+              verdict: "resumed",
+            })),
+          },
+        }),
+      };
+    }) as unknown as typeof fetch;
+
+    const verdicts = await resumeUnfinished(["visible-live", "closed-elsewhere"], door, 1);
+
+    expect(verdicts.find((v) => v.id === "visible-live")?.verdict).toBe("skipped(already-running)");
+    expect(posted).toEqual([["closed-elsewhere"]]);
   });
 });

@@ -10,6 +10,7 @@ import { X, ChevronLeft, ChevronRight, Check, Loader2, CheckCircle2 } from "luci
 import type { TooltipPosition } from "../../types/tutorial";
 import { cn } from "../../lib/utils";
 import { getAccentColors } from "@/design-system";
+import { TutorialStepBody } from "./TutorialStepBody";
 
 interface TutorialTooltipProps {
   /** CSS selector or data-tutorial-id to position near */
@@ -18,8 +19,14 @@ interface TutorialTooltipProps {
   /** Tooltip title */
   title: string;
 
-  /** Tooltip content */
+  /** Tooltip content, as markdown */
   content: string;
+
+  /** Optional longer explanation, as markdown */
+  details?: string;
+
+  /** Optional tips */
+  tips?: string[];
 
   /** Position relative to target */
   position?: TooltipPosition;
@@ -152,6 +159,8 @@ export function TutorialTooltip({
   targetSelector,
   title,
   content,
+  details,
+  tips,
   position = "bottom",
   currentStep = 1,
   totalSteps = 1,
@@ -205,12 +214,20 @@ export function TutorialTooltip({
     }
   }, [targetSelector, position, tooltipHeight, hasPositioned]);
 
-  // Update tooltip height when content changes
+  // The tooltip element exists only once it has a position.
+  const isPositioned = isVisible && tooltipPosition !== null;
+
+  // Update tooltip height when content changes, and whenever the tooltip
+  // resizes on its own (opening the step's "More details" grows it).
   useEffect(() => {
-    if (tooltipRef.current) {
-      setTooltipHeight(tooltipRef.current.offsetHeight);
-    }
-  }, [title, content, action]);
+    const el = tooltipRef.current;
+    if (!el) return;
+    setTooltipHeight(el.offsetHeight);
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(() => setTooltipHeight(el.offsetHeight));
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [title, content, details, tips, action, isPositioned]);
 
   // Update position on mount and when dependencies change
   useEffect(() => {
@@ -308,10 +325,10 @@ export function TutorialTooltip({
         )}
       </div>
 
-      {/* Content */}
-      <div className="p-4 space-y-3">
+      {/* Content - scrolls by itself so the arrow outside the box stays visible */}
+      <div className="p-4 space-y-3 max-h-[calc(100vh-160px)] overflow-y-auto">
         <h3 className="font-semibold text-foreground">{title}</h3>
-        <p className="text-sm text-muted-foreground leading-relaxed">{content}</p>
+        <TutorialStepBody content={content} details={details} tips={tips} />
 
         {action && (
           <div

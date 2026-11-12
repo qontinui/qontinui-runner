@@ -29,6 +29,10 @@
 #     npm's placeholder stub (mid-reinstall), is re-scanned for at most QONTINUI_SHIM_RESOLVE_WAIT_SECS
 #     (default 10) before the fail-open fall-through; a resolved tool never
 #     waits, and the only output added is on STDERR, on the miss path alone.
+#   * LAUNCH FAILURE IS REPORTED: a top-level invocation that gives up on the
+#     real tool (`resolve-failed`) or cannot exec it (`exec-failed`) tells the
+#     runner so before it falls through, so the pane's session row can close
+#     `launch-failed` instead of reading as a session that died.
 #
 # Placeholders:
 #   @@TOOL@@      the wrapped provider program name (claude/gemini)
@@ -169,20 +173,77 @@ resolve_real_waiting() {
   return 1
 }
 
+# ---------------------------------------------------------------------------
+# Launch-failure beacon (plan 2026-11-10-migration-holds-for-missing-claude-cli,
+# Phase 2). When this shim gives up on the real tool (`resolve-failed`) or
+# cannot exec the one it resolved (`exec-failed`), it POSTs that to the runner
+# BEFORE its fall-through, so the pane's session row closes `launch-failed`
+# rather than reading as a session that died. `curl -fsS` waits for the reply,
+# so the runner holds the record before the exec that exits 127. Same fail-open
+# curl options as notify_shim_beacon below: no port, no curl or no runner means
+# no record, and the row keeps its old close reason (UNKNOWN, never a guess).
+# Defined up here because the guard passthrough reaches report_unresolved long
+# before notify_shim_beacon is defined.
+#
+# Only a TOP-LEVEL invocation posts. A nested `claude` (a subagent's, under an
+# INHERITED guard) must never mark its parent's pane, which may be running
+# fine. SHIM_NESTED is captured once, below, before anything here can run.
+# ---------------------------------------------------------------------------
+notify_launch_failure() {
+  [ "${SHIM_NESTED:-}" = "1" ] && return 0
+  local port="${QONTINUI_INSTALL_INTERCEPT_PORT:-}"
+  [ -z "$port" ] && return 0
+  command -v curl >/dev/null 2>&1 || return 0
+  local body
+  body="{\"terminal_id\":\"${QONTINUI_TERMINAL_ID:-}\",\"tool\":\"$TOOL\",\"event\":\"$1\",\"detail\":\"$2\"}"
+  curl -fsS --connect-timeout 3 --max-time 10 \
+      -X POST "http://127.0.0.1:$port/control/shim-beacon" \
+      -H 'Content-Type: application/json' \
+      -d "$body" >/dev/null 2>&1 || true
+}
+
+# The flags every launch-failure event carries, both read by the runner's
+# `launch-failed` decider: whether this shim delivers the SessionStart hook
+# (`settings=`, the same flag notify_shim_beacon reports) and whether the argv
+# chose its own session (`user_session_id=`: `--resume` / `--session-id`).
+# `set -u` safe on purpose: the guard passthrough reaches report_unresolved
+# before SETTINGS_ARGS and user_chose_session are assigned, and a plain
+# expansion of either there would abort the shim before its fall-through exec.
+# `[*]`, never `[@]`: a quoted "${a[@]+set}" expands to ZERO words when the
+# array is unset or empty, which leaves `[ -n ]` -- one argument, always true.
+launch_failure_flags() {
+  local settings=false user_chose=false
+  [ -n "${SETTINGS_ARGS[*]+set}" ] && settings=true
+  [ "${user_chose_session:-0}" = "1" ] && user_chose=true
+  printf 'settings=%s user_session_id=%s' "$settings" "$user_chose"
+}
+
 # The last-resort fall-through is about to dispatch by NAME — say plainly what
 # was searched, so a `not found` that follows is diagnosable from the pane.
 # When what IS on PATH is npm's placeholder stub, say so: "not found" alone
-# would hide that the reinstall's postinstall never replaced it.
+# would hide that the reinstall's postinstall never replaced it. Then tell the
+# runner the launch failed (`resolve-failed`), before the fall-through runs.
 report_unresolved() {
-  local stub
+  local stub stub_found=false
   if stub="$(scan_path placeholder)"; then
+    stub_found=true
     printf 'qontinui shim: the real %s was not found on PATH after waiting %ss; only the npm placeholder stub is there (%s), which the reinstall has not replaced. Falling back to PATH dispatch, which runs the stub. PATH searched (excluding %s): %s\n' \
       "$TOOL" "$(resolve_wait_secs)" "$stub" "$SHIM_DIR" "$PATH" >&2
-    return 0
+  else
+    printf 'qontinui shim: the real %s was not found on PATH after waiting %ss; falling back to PATH dispatch. PATH searched (excluding %s): %s\n' \
+      "$TOOL" "$(resolve_wait_secs)" "$SHIM_DIR" "$PATH" >&2
   fi
-  printf 'qontinui shim: the real %s was not found on PATH after waiting %ss; falling back to PATH dispatch. PATH searched (excluding %s): %s\n' \
-    "$TOOL" "$(resolve_wait_secs)" "$SHIM_DIR" "$PATH" >&2
+  notify_launch_failure resolve-failed \
+    "waited=$(resolve_wait_secs) stub=$stub_found $(launch_failure_flags)"
 }
+
+# Is THIS invocation nested inside another `claude` (a subagent)? Read once,
+# here, from the INHERITED environment, because the live variable cannot answer
+# it later: exec_real below runs `QONTINUI_INSTALL_INTERCEPT_GUARD=1
+# exec_with_retry …`, and bash keeps a prefix assignment in force inside the
+# function it calls, so inside exec_with_retry the guard reads 1 even for a
+# top-level invocation. Both launch-failure call sites gate on this instead.
+SHIM_NESTED="${QONTINUI_INSTALL_INTERCEPT_GUARD:-}"
 
 REAL="$(resolve_real_waiting || true)"
 
@@ -196,7 +257,8 @@ REAL="$(resolve_real_waiting || true)"
 # fires. `execfail` makes a failed exec return instead of exiting; we retry for
 # at most QONTINUI_SHIM_RESOLVE_WAIT_SECS (default 10; 0 disables -> the old
 # exit-on-failure behaviour), then exit with exec's own status. A SUCCESSFUL
-# exec replaces this process, so a healthy launch pays nothing.
+# exec replaces this process, so a healthy launch pays nothing. Giving up is a
+# launch failure, reported once (`exec-failed`) after the last attempt.
 # ---------------------------------------------------------------------------
 exec_with_retry() {
   shopt -s execfail 2>/dev/null || true
@@ -214,6 +276,8 @@ exec_with_retry() {
     fi
     sleep 0.5 2>/dev/null || sleep 1
   done
+  notify_launch_failure exec-failed \
+    "status=$rc waited=$wait_secs $(launch_failure_flags)"
   exit "$rc"
 }
 

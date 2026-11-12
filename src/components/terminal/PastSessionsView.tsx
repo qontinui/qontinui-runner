@@ -75,6 +75,24 @@ export const PAST_SESSIONS_EMPTY_SHOW_FINISHED_ID = "terminal.past-sessions-empt
  */
 const SHOW_FINISHED_KEY = "terminal.past-sessions.show-finished";
 
+/**
+ * Close reasons that need words for an operator. A reason with no entry
+ * renders as the backend wrote it.
+ */
+const CLOSE_REASON_LABELS: ReadonlyMap<string, string> = new Map([
+  // The Claude CLI never launched in its pane (the identity shim gave up on
+  // it), so the row is restorable, unlike a reason that names a death.
+  ["launch-failed", "launch failed — the Claude CLI could not be started"],
+]);
+
+/**
+ * What a card shows for `reason`. Every rendered close reason goes through
+ * here, so a reason that needs words gets them in one place.
+ */
+export function closeReasonLabel(reason: string): string {
+  return CLOSE_REASON_LABELS.get(reason) ?? reason;
+}
+
 /** Why a card shows no resume line (`resumeCommand === null`). */
 const NO_RESUME_LINE_TITLE =
   "No resume line: the session's account (or working directory) is unknown, " +
@@ -368,7 +386,9 @@ function PastSessionCard({
           className="w-2 h-2 rounded-full shrink-0"
           style={{ backgroundColor: closed ? "#565f89" : "#9ece6a" }}
           title={
-            closed ? `closed${session.closeReason ? ` — ${session.closeReason}` : ""}` : "open"
+            closed
+              ? `closed${session.closeReason ? ` — ${closeReasonLabel(session.closeReason)}` : ""}`
+              : "open"
           }
         />
         <span
@@ -402,7 +422,9 @@ function PastSessionCard({
             closed ? "bg-[#565f89]/15 text-[#565f89]" : "bg-[#9ece6a]/15 text-[#9ece6a]"
           }`}
         >
-          {closed ? `closed${session.closeReason ? ` · ${session.closeReason}` : ""}` : "open"}
+          {closed
+            ? `closed${session.closeReason ? ` · ${closeReasonLabel(session.closeReason)}` : ""}`
+            : "open"}
         </span>
         {restoreBadge && (
           <span

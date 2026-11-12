@@ -4665,8 +4665,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
                     use session::session_lifecycle_store::{
                         boot_restore_hold, boot_restore_phase, carries_boot_restore_hold, classify,
-                        close_reason_for_dead_shell, hold_for_withheld_boot_restore,
-                        match_live_terminal, PollAction, WorkerPlane,
+                        hold_for_withheld_boot_restore, match_live_terminal, PollAction,
+                        WorkerPlane,
                     };
 
                     // Reference instant for `claude_present_in_inclusive_subtree`'s
@@ -4856,10 +4856,18 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                 StdHashMap::new()
                             } else {
                                 match session::claude_session_registry::live_pids_from_snapshot(&snap) {
+                                    // A PARTIAL read is safe here, so the rows of
+                                    // every listable dir are used and an unlistable
+                                    // dir only costs its own: a session missing from
+                                    // this map gets no update at all (the sticky rule
+                                    // above), so a hidden row can never blank a stored
+                                    // account or name.
                                     Ok(live_pids) => session::claude_session_registry::read_live_sessions(
                                         &terminal::transcript::find_claude_config_dirs(),
                                         &live_pids,
+                                        &session::claude_session_registry::may_host_claude(&snap),
                                     )
+                                    .sessions
                                     .into_iter()
                                     // `read_live_sessions` returns one row per
                                     // PROCESS and several processes may report
@@ -5189,25 +5197,21 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                     );
                                 }
                                 PollAction::Close => {
-                                    // A bare shell whose last restore already
-                                    // landed `terminal-only` never hosted a
-                                    // conversation in this generation and never
-                                    // will; closing it `"poll-dead"` (restorable)
-                                    // would hand the next restore pass the same
-                                    // unresumable record, recreating the same
-                                    // blank terminal forever. See
-                                    // `close_reason_for_dead_shell`.
-                                    let reason =
-                                        close_reason_for_dead_shell(rec.restore_tier.as_deref());
-                                    poll_lifecycle_store
-                                        .record_close(&rec.claude_session_id, reason);
+                                    // `terminal-only-idle` for a tile already
+                                    // restored honestly empty, `launch-failed`
+                                    // for a pane whose Claude CLI never launched
+                                    // (plan 2026-11-10-migration-holds-for-
+                                    // missing-claude-cli, D3), else `poll-dead`.
+                                    // See `close_dead_row`.
+                                    terminal::launch_failure::close_dead_row(
+                                        &poll_lifecycle_store,
+                                        terminal::launch_failure::registry(),
+                                        rec,
+                                        &live_by_id,
+                                        chrono::Utc::now().timestamp_millis(),
+                                    );
                                     consecutive_dead.remove(&rec.claude_session_id);
                                     consecutive_no_match.remove(&rec.claude_session_id);
-                                    tracing::info!(
-                                        claude_session = %rec.claude_session_id,
-                                        reason = %reason,
-                                        "session lifecycle poll: closing dead session"
-                                    );
                                 }
                                 PollAction::CloseNeverStarted => {
                                     // Provisional record, provider never

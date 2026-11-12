@@ -355,9 +355,6 @@ on:
 # one-expression group to "", which run_is_reaper_at_risk never matches, so an
 # in-flight main run here no longer hard-blocks a land (the old per-ref group
 # resolved to exactly the prospective main-push group).
-# KNOWN coord gap: the budget-cancel candidate scan in stuck_pr_watcher.rs
-# compares groups with `=`, so every "" group matches every other one and
-# suppresses its auto re-run; the fix belongs in coord.
 concurrency:
   group: ${{ (github.event_name == 'pull_request' && github.run_attempt == 1) && format('{0}-pr-{1}', github.workflow, github.event.pull_request.number) || format('{0}-run-{1}-{2}', github.workflow, github.run_id, github.run_attempt) }}
   cancel-in-progress: false

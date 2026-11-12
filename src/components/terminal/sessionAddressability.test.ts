@@ -43,23 +43,29 @@ describe("text inputs advertise sendKeys", () => {
   });
 
   it("advertises sendKeys ALONGSIDE the inferred input actions, not instead of them", () => {
-    // `inferActions('input')` in the SDK registry. Overriding `actions` REPLACES
-    // the inferred list, so an override that forgets one of these silently
-    // un-advertises a working action.
-    for (const inferred of [
+    // `inferActions('input')` in the SDK registry at the pinned
+    // `@qontinui/ui-bridge` 0.38.0. Overriding `actions` REPLACES the inferred
+    // list, so an override that forgets one of these silently un-advertises a
+    // working action: before this list carried `unhover` and `setValue`, the
+    // runner's pre-IPC gate refused `setValue` on both inputs outright.
+    // Both lists are that set VERBATIM (same members, same order), as their
+    // comments say, so an extra or a dropped verb both fail here.
+    const INFERRED_INPUT_ACTIONS_0_38 = [
       "focus",
       "blur",
       "hover",
+      "unhover",
       "scroll",
       "scrollIntoView",
       "click",
       "hoverClick",
       "type",
+      "sendKeys",
       "clear",
-    ]) {
-      expect(COMMAND_BAR_INPUT_ACTIONS).toContain(inferred);
-      expect(SEARCH_INPUT_ACTIONS).toContain(inferred);
-    }
+      "setValue",
+    ];
+    expect(COMMAND_BAR_INPUT_ACTIONS).toEqual(INFERRED_INPUT_ACTIONS_0_38);
+    expect(SEARCH_INPUT_ACTIONS).toEqual(INFERRED_INPUT_ACTIONS_0_38);
   });
 
   it("advertises no custom action name — sendKeys keeps the SDK descriptor-array contract", () => {
@@ -82,6 +88,7 @@ describe("text inputs advertise sendKeys", () => {
       "focus",
       "blur",
       "hover",
+      "unhover",
       "scroll",
       "scrollIntoView",
       "check",

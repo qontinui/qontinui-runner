@@ -45,7 +45,23 @@
 # standalone `env apply` cannot read the "Workspace root" setting, so
 # $QONTINUI_ROOT is the true next action there. Whether `env apply` is a
 # dev-only surface is a disposition call this change does not make. Net -6.
-unreviewed_ceiling = 221
+# 221 -> 212, applied on top of the 227 -> 221 above (qontinui-runner#2776,
+# rebased onto it as the second lander; ceiling read off the regenerated
+# roster, not summed from the two PRs' deltas). #2776 alone was 227 -> 219 (plan 2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists
+# Phase B3, the runner half): eight unreviewed rows are gone with the refusal
+# and log text that now renders the shared workspace-root sentence or names
+# the Workspace root setting (continuation_fallback_workdir,
+# run_condition_check_terminal, survey, start_build,
+# persist_resolved_workspace_root, two in publish_tree_state), and
+# runner_workspace_root's canary label is now reviewed. The new rows
+# (session_workspace_root's canary label, overlay_absent_statement's sibling
+# name, the no-root arm moving back to provision_agent_definitions) are
+# reviewed below. provision_agent_definitions_with_root, named in the line
+# above, is gone. The rebase also converts fleet.rs
+# spawn_skill_parity_pass_if_due's no-root report ("set QONTINUI_ROOT or the
+# runner's paths.workspace_root") to name the Workspace root setting, so the
+# runner_text_never_says_set_qontinui_root guard can hold. A fall, held.
+unreviewed_ceiling = 212
 
 # First triage pass (plan 2026-09-20-published-runner-parity-count-comes-from-a-run-not-from-reports Phase 4):
 # every supervisor_dependency, tenant_literal and machine_path key. The
@@ -484,12 +500,13 @@ note = "Surfaced by fleet-nouns.toml (A6); not yet triaged."
 [[disposition]]
 class = "repo_layout"
 file = "src/agent_runtime.rs"
-symbol = "provision_agent_definitions_with_root"
+symbol = "provision_agent_definitions"
 disposition = "fallback_correct"
-note = "The no-root arm of agent-definition provisioning: with no qontinui-root it warns, records a capability_manifest Rung::Unresolved `agent_definitions` row naming what was skipped (the normal state on a published install), still runs the retirement pass, and lets the spawn proceed. The embedded fleet_agents floor supplies the definitions there. Reviewed when these rows moved off the provision_agent_definitions key (plan 2026-11-06-what-the-fleet-records-and-advertises-matches-what-actually-ran Phase 6)."
+note = "The no-root arm of agent-definition provisioning: with no qontinui-root it warns, records a capability_manifest Rung::Unresolved `agent_definitions` row naming what was skipped (the normal state on a published install), still runs the retirement pass, and lets the spawn proceed. The embedded fleet_agents floor supplies the definitions there. Reviewed when these rows moved off the provision_agent_definitions key (plan 2026-11-06-what-the-fleet-records-and-advertises-matches-what-actually-ran Phase 6), and again when they moved back: the arm now takes the session's WorkspaceRoot, names the rejected input, and calls the outcome the normal published-install state only when no explicit input was at fault (plan 2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists B3)."
 reviewed = [
     '"agent_runtime: no qontinui-root resolved; skipping .claude/agents \',
-    '"no qontinui-root resolved, so <root>/qontinui-claude-config/.claude/agents \',
+    '"no qontinui-root resolved ({why}), so \',
+    '<root>/qontinui-claude-config/.claude/agents cannot be located — {state}"',
 ]
 
 [[disposition]]
@@ -714,3 +731,33 @@ file = "src/env_agent/apply_repos.rs"
 symbol = "const CLI_UNRESOLVED_ROOT_NOTE"
 disposition = "unreviewed"
 note = "Acknowledged, not triaged. A standalone `env apply --section repos` exits before the runner publishes its settings door (collectors::workspace_root_reads_setting), so it cannot read the Workspace root setting and $QONTINUI_ROOT is the true next action there; the in-runner arm renders the shared WorkspaceRootUnresolved sentence instead. Left unreviewed because whether `env apply` is a dev_only_surface is a disposition call this change does not make."
+
+[[disposition]]
+class = "repo_layout"
+file = "src/workspace_paths.rs"
+symbol = "runner_workspace_root"
+disposition = "dev_only_surface"
+note = "The label passed to ambient::canary, which reads it only while the canary is armed (cfg(test), an explicit arm, or a test binary running from cargo's deps directory; a release build compiles canary to Proceed and never reads it): it names the inputs an unguarded test reached, in the deflection message. An installed runner never shows it to an operator; the resolver it guards reads its inputs through the shared qontinui_types::paths rungs and degrades to Unresolved. Plan 2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists B3."
+reviewed = [
+    "\"env QONTINUI_ROOT / QONTINUI_WORKSPACE_ROOT / settings paths.workspace_root (runner_workspace_root)\",",
+]
+
+[[disposition]]
+class = "repo_layout"
+file = "src/workspace_paths.rs"
+symbol = "session_workspace_root"
+disposition = "dev_only_surface"
+note = "The label passed to ambient::canary, which reads it only while the canary is armed (cfg(test), an explicit arm, or a test binary running from cargo's deps directory; a release build compiles canary to Proceed and never reads it): it names the inputs an unguarded test reached, in the deflection message. An installed runner never shows it to an operator; the resolver it guards reads its inputs through the shared qontinui_types::paths rungs and degrades to Unresolved. Plan 2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists B3."
+reviewed = [
+    "\"env QONTINUI_ROOT / QONTINUI_WORKSPACE_ROOT / settings paths.workspace_root (session_workspace_root)\",",
+]
+
+[[disposition]]
+class = "repo_layout"
+file = "src/agent_runtime.rs"
+symbol = "overlay_absent_statement"
+disposition = "fallback_correct"
+note = "The sibling repository NAME the agent_definitions row's sibling_checkout_absent statement carries as its discriminator. It is rendered only after the overlay was found absent, together with what serves instead (the built-in copy, the repository's own tracked definitions, a named write failure, or unsupported), so it is the statement of a fallback, never a path the runner resolves. Plan 2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists B3."
+reviewed = [
+    "const SIBLING: &str = \"qontinui-claude-config\";",
+]

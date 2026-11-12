@@ -48,19 +48,32 @@
 //!      for the message age — a weaker signal (a `busy` status stamped 40 min
 //!      ago by one long tool call reads `stale`), used only because the
 //!      stronger one is absent. No `statusUpdatedAt` either is `unknown`;
-//!    - a missing, unparseable, ambiguous or unrecognised-status record →
-//!      `unknown`, and so is a record that belongs to an EARLIER process that
-//!      held the same pid ([`RecordReading::PidReused`]): on Linux the
+//!    - a missing, unlisted, unparseable, ambiguous or unrecognised-status
+//!      record → `unknown` (`unlisted`: no record of the live process — none,
+//!      or only an earlier holder's — in any dir that could be listed, while
+//!      some `<config-dir>/sessions` exists and could not be —
+//!      [`SessionsListing`]), and so is a record that belongs to an EARLIER
+//!      process that held the same pid ([`RecordReading::PidReused`]): on Linux the
 //!      record's `procStart` is compared with `/proc/<pid>/stat` field 22
 //!      (both are the start time in clock ticks since boot — equal on every
 //!      record checked on merytshost 2026-09-29); where that cannot be read,
 //!      `startedAt` is compared with the process start the census implies
 //!      (its snapshot time minus the process age) inside the ONE-SIDED window
-//!      [`START_LEAD_MS`] / [`START_LAG_MS`]. An empty or non-numeric
+//!      [`START_LEAD_MS`] / [`START_LAG_MS`]. Only a stamp EARLIER than the
+//!      window is reuse; one LATER than it is [`RecordReading::LateStamp`] —
+//!      unknown, because a reused pid's stale record always predates the live
+//!      process, so lateness is no evidence of reuse, and it is no proof of
+//!      identity either. An empty or non-numeric
 //!      `procStart` counts as absent and falls through to that `startedAt`
 //!      check. A record neither check can reach is accepted
 //!      on its `pid` match alone — the census only lists live `claude`
 //!      processes, so a reused pid would also have to be a `claude`.
+//!
+//! The same reader is the graceful-exit probe's SECOND witness that a pid is a
+//! live `claude` (`crate::terminal::graceful_exit::RegistryWitness`), at
+//! [`RecordDepth::Identity`]: an npm-installed Claude Code runs as `node …
+//! cli.js`, which no image-name check can recognise, but it writes this record
+//! all the same.
 //!
 //! The session record is a Claude Code INTERNAL file, not a published
 //! contract. Every way it can fail to answer lands on `unknown` — never on
@@ -138,9 +151,17 @@ impl ActivityCounts {
 /// What Claude Code's record said about one pid.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecordReading {
-    /// No `<pid>.json` in any config dir.
+    /// No `<pid>.json` in any config dir, and every `sessions/` dir was
+    /// listed — a positive absence.
     Missing,
-    /// A file exists but did not parse, or named a different pid.
+    /// No record of THIS process in any dir that COULD be listed — none at
+    /// all, or only an earlier holder's — while at least one `<dir>/sessions`
+    /// exists and could not be ([`UnlistableSessionsDir`]). The live
+    /// process's record may well be in that dir, so this is UNKNOWN — never
+    /// [`Self::Missing`] or [`Self::PidReused`].
+    Unlisted,
+    /// A file exists but could not be read, did not parse, or named a
+    /// different pid.
     Unparseable,
     /// Two config dirs hold a record for this pid naming different sessions —
     /// one of them is a stale file from a crashed process. Not a guess.
@@ -148,6 +169,12 @@ pub enum RecordReading {
     /// The record's start stamp disagrees with the live process's: it was
     /// written by an earlier process that held the same pid.
     PidReused,
+    /// The record's `startedAt` is LATER than [`START_LAG_MS`] after the live
+    /// process began, and no `procStart` decided. A reused pid's stale record
+    /// is always EARLIER (it was written before the live process existed), so
+    /// this is not reuse — but nor is it proof that the record is this
+    /// process's. UNKNOWN; never [`Self::PidReused`].
+    LateStamp,
     Parsed(RecordEvidence),
 }
 
@@ -310,18 +337,53 @@ fn parse_record(bytes: &str, pid: u32) -> Result<(RawRecord, RecordEvidence), ()
     Ok((raw, evidence))
 }
 
-/// Does `raw` describe the process that holds `live.pid` NOW? `Some(false)` is
-/// a positive mismatch (pid reuse); `None` means neither check could be made.
-fn same_process(
+/// How a record's identity stamp compares with the live process holding its
+/// pid. DIRECTIONAL, because the two ways out of the window mean different
+/// things: a stamp from before the live process began is an earlier holder's
+/// record, while a stamp after the window is merely unexplained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Identity {
+    /// The same process: `procStart` agrees with the kernel, or `startedAt`
+    /// falls inside the window.
+    Same,
+    /// An earlier holder of the pid wrote it: `procStart` disagrees with the
+    /// kernel (either way — a stale record can survive a reboot, when the tick
+    /// count restarts), or `startedAt` is more than [`START_LEAD_MS`] BEFORE
+    /// the live process began. The one reading that is reuse.
+    Earlier,
+    /// `startedAt` is more than [`START_LAG_MS`] AFTER the live process began.
+    /// Never reuse (see [`RecordReading::LateStamp`]), never proof either.
+    Later,
+    /// Neither check could be made.
+    Unchecked,
+}
+
+/// Does `raw` describe the process that holds `live.pid` NOW? See
+/// [`Identity`].
+fn identity_of(
     raw: &RawRecord,
     live: LivePid,
     proc_start: &dyn Fn(u32) -> Option<String>,
-) -> Option<bool> {
+) -> Identity {
     if let (Some(recorded), Some(actual)) = (raw.proc_start(), proc_start(live.pid)) {
-        return Some(recorded == actual);
+        return if recorded == actual {
+            Identity::Same
+        } else {
+            Identity::Earlier
+        };
     }
-    let lag_ms = raw.started_at? - live.process_started_ms?;
-    Some((-START_LEAD_MS..=START_LAG_MS).contains(&lag_ms))
+    let (Some(started_at), Some(process_started)) = (raw.started_at, live.process_started_ms)
+    else {
+        return Identity::Unchecked;
+    };
+    let lag_ms = started_at - process_started;
+    if lag_ms < -START_LEAD_MS {
+        Identity::Earlier
+    } else if lag_ms > START_LAG_MS {
+        Identity::Later
+    } else {
+        Identity::Same
+    }
 }
 
 /// The kernel's start time for `pid` in clock ticks since boot — field 22 of
@@ -384,26 +446,186 @@ pub fn read_tail_lossy(path: &Path, max: u64) -> Option<String> {
     })
 }
 
+/// A `<config-dir>/sessions` that exists but could not be listed in full:
+/// `read_dir` failed with anything but `NotFound` (permission denied, an I/O
+/// error, a `sessions` that is not a directory), or the listing broke off
+/// part-way. Every record in it is UNKNOWN — never absent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnlistableSessionsDir {
+    pub sessions_dir: PathBuf,
+    pub error: String,
+}
+
+impl std::fmt::Display for UnlistableSessionsDir {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ({})", self.sessions_dir.display(), self.error)
+    }
+}
+
+/// One config dir's `sessions/` listing — typed, because an unlistable dir and
+/// an absent one mean opposite things to a liveness reader. Until Phase 15
+/// (b) of plan `2026-10-28-one-session-lifecycle-authority` every reader
+/// `continue`d on EVERY `read_dir` error ("no sessions dir on this account —
+/// normal"), so a dir it could not list read exactly like an account with no
+/// live session, and a live `claude` recorded there read as gone.
+#[derive(Debug)]
+pub enum SessionsListing {
+    /// Listed in full: the path of every entry.
+    Listed(Vec<PathBuf>),
+    /// `<dir>/sessions` does not exist — an account with no live session.
+    /// The one genuine absence.
+    Absent,
+    /// It exists and could not be listed in full. See
+    /// [`UnlistableSessionsDir`].
+    Unlistable(UnlistableSessionsDir),
+}
+
+/// List `<config_dir>/sessions`. Only `NotFound` is an absence; every other
+/// error — on opening the dir or on any entry of it — is
+/// [`SessionsListing::Unlistable`]. Blocking file I/O.
+pub fn list_sessions_dir(config_dir: &Path) -> SessionsListing {
+    let sessions_dir = config_dir.join("sessions");
+    let unlistable = |e: std::io::Error| {
+        SessionsListing::Unlistable(UnlistableSessionsDir {
+            sessions_dir: sessions_dir.clone(),
+            error: e.to_string(),
+        })
+    };
+    let entries = match std::fs::read_dir(&sessions_dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return SessionsListing::Absent,
+        Err(e) => return unlistable(e),
+    };
+    let mut paths = Vec::new();
+    for entry in entries {
+        match entry {
+            Ok(entry) => paths.push(entry.path()),
+            // A listing that broke off is not a listing: the entries it did
+            // not reach are as unknown as the whole dir would be.
+            Err(e) => return unlistable(e),
+        }
+    }
+    SessionsListing::Listed(paths)
+}
+
+/// How much of each record [`read_records`] reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordDepth {
+    /// The record alone: whose it is (the pid and start-time identity check)
+    /// and its `status`. What the graceful-exit probe's registry witness needs.
+    Identity,
+    /// The record, plus the transcript tail of every `busy`/`shell` record —
+    /// what [`classify_from_record`] needs to tell `working` from `stale`.
+    Activity,
+}
+
+/// What [`read_records`] saw.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RecordReadings {
+    /// One reading per pid asked about.
+    pub by_pid: HashMap<u32, RecordReading>,
+    /// Every `sessions/` dir that exists but could not be listed. While this
+    /// is non-empty no pid reads [`RecordReading::Missing`] or
+    /// [`RecordReading::PidReused`]: one with no record of its own process in
+    /// the dirs that WERE listed reads [`RecordReading::Unlisted`].
+    pub unlistable: Vec<UnlistableSessionsDir>,
+}
+
+/// One reader's memory of which `sessions/` dirs it has reported unlistable,
+/// so the condition is logged once per TRANSITION of each dir — a warn when a
+/// dir turns unlistable, an info when it lists again — rather than on every
+/// read. A graceful exit probes every half second and restart-readiness
+/// answers every Stop turn, so a per-read line would bury the log. Keyed per
+/// DIR rather than on the whole set: two reads may be asked about different
+/// dirs (the probe adds each candidate's own config dir), and a dir one read
+/// was not asked about is neither reported again nor declared healed.
+pub struct UnlistableLog {
+    reported: std::sync::Mutex<std::collections::BTreeSet<PathBuf>>,
+    reader: &'static str,
+    consequence: &'static str,
+}
+
+impl UnlistableLog {
+    /// `reader` names who read; `consequence` says what the condition costs it.
+    pub const fn new(reader: &'static str, consequence: &'static str) -> Self {
+        Self {
+            reported: std::sync::Mutex::new(std::collections::BTreeSet::new()),
+            reader,
+            consequence,
+        }
+    }
+
+    /// Record what one read of `config_dirs` saw, logging only a change.
+    pub fn observe(&self, config_dirs: &[PathBuf], unlistable: &[UnlistableSessionsDir]) {
+        let mut reported = self
+            .reported
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for dir in unlistable {
+            if reported.insert(dir.sessions_dir.clone()) {
+                tracing::warn!(
+                    sessions_dir = %dir.sessions_dir.display(),
+                    error = %dir.error,
+                    "{}: a Claude Code sessions dir exists but cannot be listed — {}",
+                    self.reader,
+                    self.consequence
+                );
+            }
+        }
+        for config_dir in config_dirs {
+            let sessions_dir = config_dir.join("sessions");
+            let still_unlistable = unlistable.iter().any(|u| u.sessions_dir == sessions_dir);
+            if !still_unlistable && reported.remove(&sessions_dir) {
+                tracing::info!(
+                    sessions_dir = %sessions_dir.display(),
+                    "{}: a Claude Code sessions dir that could not be listed reads again",
+                    self.reader
+                );
+            }
+        }
+    }
+
+    /// The dirs currently reported unlistable. Test builds only.
+    #[cfg(test)]
+    pub(crate) fn reported(&self) -> Vec<PathBuf> {
+        self.reported
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .cloned()
+            .collect()
+    }
+}
+
 /// Read Claude Code's record for each of `pids` across `config_dirs`.
 ///
-/// Each `sessions/` dir is listed ONCE and only the wanted `<pid>.json` files
-/// are opened; the transcript tail is read only for `busy`/`shell` records.
-/// `proc_start` is [`proc_start_ticks`] in production and injectable in tests.
-/// Blocking file I/O — call it off the async executor.
+/// Each `sessions/` dir is listed ONCE ([`list_sessions_dir`]) and only the
+/// wanted `<pid>.json` files are opened; at [`RecordDepth::Activity`] the
+/// transcript tail is read for `busy`/`shell` records too. A dir that exists
+/// and cannot be listed is reported in [`RecordReadings::unlistable`] and
+/// turns every would-be `Missing` or `PidReused` into `Unlisted`. `proc_start` is
+/// [`proc_start_ticks`] in production and injectable in tests. Blocking file
+/// I/O — call it off the async executor.
 pub fn read_records(
     config_dirs: &[PathBuf],
     pids: &[LivePid],
     proc_start: &dyn Fn(u32) -> Option<String>,
-) -> HashMap<u32, RecordReading> {
+    depth: RecordDepth,
+) -> RecordReadings {
     let wanted: std::collections::HashSet<u32> = pids.iter().map(|p| p.pid).collect();
     // pid -> every (config dir, record path) that names it.
     let mut found: HashMap<u32, Vec<(PathBuf, PathBuf)>> = HashMap::new();
+    let mut unlistable = Vec::new();
     for dir in config_dirs {
-        let Ok(entries) = std::fs::read_dir(dir.join("sessions")) else {
-            continue; // no sessions dir on this account — normal
+        let paths = match list_sessions_dir(dir) {
+            SessionsListing::Listed(paths) => paths,
+            SessionsListing::Absent => continue, // no sessions dir on this account — normal
+            SessionsListing::Unlistable(why) => {
+                unlistable.push(why);
+                continue;
+            }
         };
-        for entry in entries.flatten() {
-            let path = entry.path();
+        for path in paths {
             let Some(pid) = path
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -418,38 +640,61 @@ pub fn read_records(
         }
     }
 
-    pids.iter()
+    let by_pid = pids
+        .iter()
         .map(|&live| {
             let reading = match found.get(&live.pid) {
                 None => RecordReading::Missing,
-                Some(candidates) => read_one(live, candidates, proc_start),
+                Some(candidates) => read_one(live, candidates, proc_start, depth),
+            };
+            // While a dir is unlistable, "no record of THIS process in the
+            // dirs that listed" is all `Missing` and `PidReused` can say: the
+            // live process's own record may sit in the dir nobody could read.
+            let reading = match reading {
+                RecordReading::Missing | RecordReading::PidReused if !unlistable.is_empty() => {
+                    RecordReading::Unlisted
+                }
+                other => other,
             };
             (live.pid, reading)
         })
-        .collect()
+        .collect();
+    RecordReadings { by_pid, unlistable }
 }
 
 fn read_one(
     live: LivePid,
     candidates: &[(PathBuf, PathBuf)],
     proc_start: &dyn Fn(u32) -> Option<String>,
+    depth: RecordDepth,
 ) -> RecordReading {
     let mut parsed: Vec<(&Path, RawRecord, RecordEvidence)> = Vec::new();
     let mut reused = false;
+    let mut late = false;
+    let mut unreadable = false;
     for (dir, path) in candidates {
+        let body = match std::fs::read_to_string(path) {
+            Ok(body) => body,
+            // Listed, then gone before the open: Claude Code deletes its
+            // record when the process exits, so this one no longer exists —
+            // the same as never having been listed, not an unreadable file.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                unreadable = true;
+                continue;
+            }
+        };
         // A body that does not parse is only decisive when nothing else names
         // this pid — see the `let Some(..) else` below.
-        let Ok((raw, ev)) = std::fs::read_to_string(path)
-            .map_err(|_| ())
-            .and_then(|b| parse_record(&b, live.pid))
-        else {
+        let Ok((raw, ev)) = parse_record(&body, live.pid) else {
+            unreadable = true;
             continue;
         };
-        if same_process(&raw, live, proc_start) == Some(false) {
-            reused = true;
-            continue;
+        match identity_of(&raw, live, proc_start) {
+            Identity::Same | Identity::Unchecked => parsed.push((dir.as_path(), raw, ev)),
+            Identity::Earlier => reused = true,
+            Identity::Later => late = true,
         }
-        parsed.push((dir.as_path(), raw, ev));
     }
     let first_session = parsed
         .first()
@@ -462,15 +707,22 @@ fn read_one(
         return RecordReading::Ambiguous;
     }
     let Some((dir, raw, mut ev)) = parsed.into_iter().next() else {
-        // `candidates` is non-empty, so each one either failed to parse or
-        // belonged to an earlier holder of this pid.
-        return if reused {
+        // Each candidate failed to read or parse, was stamped late, belonged
+        // to an earlier holder of this pid, or vanished before it could be
+        // opened. A file that could not be read, or one stamped late, OUTRANKS
+        // a reused one: either may be the live process's own record, so the
+        // pid stays undecided rather than settling on "an earlier holder's".
+        return if unreadable {
+            RecordReading::Unparseable
+        } else if late {
+            RecordReading::LateStamp
+        } else if reused {
             RecordReading::PidReused
         } else {
-            RecordReading::Unparseable
+            RecordReading::Missing
         };
     };
-    if ev.status == "busy" || ev.status == "shell" {
+    if depth == RecordDepth::Activity && (ev.status == "busy" || ev.status == "shell") {
         if let (Some(cwd), Some(session_id)) = (raw.cwd.as_deref(), raw.session_id.as_deref()) {
             let transcript =
                 crate::terminal::transcript::session_transcript_path(dir, cwd, session_id);
@@ -591,17 +843,21 @@ pub fn provider_row_validity(
         let verdict = match domain_check(&raw, clock) {
             Some(v) => Some(v),
             None if mode == ValidityMode::Strict => None,
-            None => Some(
-                same_process(
-                    &raw,
-                    LivePid {
-                        pid,
-                        process_started_ms: clock.creation_secs.map(|s| s * 1000),
-                    },
-                    &|_| clock.proc_start_ticks.clone(),
-                )
-                .unwrap_or(true),
-            ),
+            // Lenient: the directional identity check, a check it cannot make
+            // accepted. A LATE stamp is never reuse and never proof
+            // ([`RecordReading::LateStamp`]), so it is unknown here too.
+            None => match identity_of(
+                &raw,
+                LivePid {
+                    pid,
+                    process_started_ms: clock.creation_secs.map(|s| s * 1000),
+                },
+                &|_| clock.proc_start_ticks.clone(),
+            ) {
+                Identity::Same | Identity::Unchecked => Some(true),
+                Identity::Earlier => Some(false),
+                Identity::Later => None,
+            },
         };
         match verdict {
             Some(true) => match raw.session_id.filter(|s| !s.trim().is_empty()) {
@@ -677,6 +933,43 @@ pub fn read_provider_rows(
             )
         })
         .collect()
+}
+
+/// Test fixture: a `sessions/` dir this process cannot list, shared by every
+/// test of a reader that must read such a dir as UNKNOWN.
+#[cfg(all(test, unix))]
+pub(crate) mod unlistable_fixture {
+    use std::path::{Path, PathBuf};
+
+    /// Make `<config_dir>/sessions` mode 000. `None` when this process can
+    /// list it anyway (it runs as root): the caller then skips its assertion
+    /// rather than asserting something false.
+    pub(crate) fn unreadable_sessions_dir(config_dir: &Path) -> Option<PermissionRestore> {
+        use std::os::unix::fs::PermissionsExt;
+        let sessions = config_dir.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let restore = PermissionRestore(sessions.clone());
+        if std::fs::read_dir(&sessions).is_ok() {
+            eprintln!(
+                "skipped: {} is still listable (running as root?)",
+                sessions.display()
+            );
+            return None;
+        }
+        Some(restore)
+    }
+
+    /// Puts the mode-000 dir back to 0755 on drop, so the temp dir can be
+    /// removed.
+    pub(crate) struct PermissionRestore(PathBuf);
+
+    impl Drop for PermissionRestore {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -784,9 +1077,11 @@ mod tests {
     fn record_missing_unparseable_ambiguous_reused_or_unknown_status_is_unknown_never_idle() {
         for reading in [
             RecordReading::Missing,
+            RecordReading::Unlisted,
             RecordReading::Unparseable,
             RecordReading::Ambiguous,
             RecordReading::PidReused,
+            RecordReading::LateStamp,
             parsed("thinking-hard", Some(1), Some(1)),
             parsed("", Some(1), Some(1)),
         ] {
@@ -1027,7 +1322,13 @@ mod tests {
             &[dir.clone(), other, root.path().join("absent")],
             &pids,
             &no_proc,
+            RecordDepth::Activity,
         );
+        assert!(
+            readings.unlistable.is_empty(),
+            "an absent config dir is an absence, not an unlistable dir"
+        );
+        let readings = readings.by_pid;
         let class = |pid: u32| classify_from_record(&readings[&pid], NOW);
         assert_eq!(class(10), Activity::Working, "{:?}", readings[&10]);
         assert_eq!(class(11), Activity::Idle);
@@ -1044,7 +1345,8 @@ mod tests {
     /// unknown: by `procStart` where the kernel's start time is readable, by
     /// `startedAt` against the census's implied process start where it is
     /// not. The `startedAt` window is one-sided (Claude Code stamps it AFTER
-    /// the process starts), and each edge is pinned.
+    /// the process starts), and each edge is pinned. Only the EARLY side is
+    /// reuse: one past the lag edge is `LateStamp`, unknown but never reuse.
     #[test]
     fn a_record_from_an_earlier_holder_of_the_pid_is_pid_reused() {
         let root = scratch("reuse");
@@ -1068,7 +1370,7 @@ mod tests {
         rec(6, "", started + 1_000); // empty procStart = absent: startedAt decides
         rec(7, "abc", started + 1_000); // non-numeric procStart = absent too
         rec(8, "", started + START_LAG_MS); // lag edge, inclusive
-        rec(9, "", started + START_LAG_MS + 1); // one past the lag edge
+        rec(9, "", started + START_LAG_MS + 1); // one past the lag edge: late, not reused
         rec(10, "", started - START_LEAD_MS); // lead edge, inclusive
         rec(11, "", started - START_LEAD_MS - 1); // one past the lead edge
         let kernel = |pid: u32| match pid {
@@ -1092,7 +1394,7 @@ mod tests {
             at(10),
             at(11),
         ];
-        let readings = read_records(&[dir], &pids, &kernel);
+        let readings = read_records(&[dir], &pids, &kernel, RecordDepth::Activity).by_pid;
         for pid in [1, 3, 5, 6, 7, 8, 10] {
             assert_eq!(
                 classify_from_record(&readings[&pid], NOW),
@@ -1101,13 +1403,42 @@ mod tests {
                 readings[&pid]
             );
         }
-        for pid in [2, 4, 9, 11] {
+        for pid in [2, 4, 11] {
             assert_eq!(readings[&pid], RecordReading::PidReused, "pid {pid}");
             assert_eq!(
                 classify_from_record(&readings[&pid], NOW),
                 Activity::Unknown
             );
         }
+        assert_eq!(readings[&9], RecordReading::LateStamp);
+        assert_eq!(classify_from_record(&readings[&9], NOW), Activity::Unknown);
+    }
+
+    /// A record stamped LATER than the lag window, beside one an earlier
+    /// holder left in another dir, is `LateStamp`: the late one may be the
+    /// live process's own record, so the pid is not settled as reused.
+    #[test]
+    fn a_late_stamp_outranks_a_reused_one() {
+        let root = scratch("late-outrank");
+        let a = root.path().join(".claude-a");
+        let b = root.path().join(".claude-b");
+        let started = NOW - 3_600_000;
+        for (dir, started_at) in [(&a, started - 86_400_000), (&b, started + 6 * MIN)] {
+            std::fs::create_dir_all(dir.join("sessions")).unwrap();
+            std::fs::write(
+                dir.join("sessions/60.json"),
+                format!(
+                    r#"{{"pid":60,"sessionId":"s60","status":"idle","startedAt":{started_at}}}"#
+                ),
+            )
+            .unwrap();
+        }
+        let live = LivePid {
+            pid: 60,
+            process_started_ms: Some(started),
+        };
+        let readings = read_records(&[a, b], &[live], &no_proc, RecordDepth::Identity);
+        assert_eq!(readings.by_pid[&60], RecordReading::LateStamp);
     }
 
     #[test]
@@ -1123,8 +1454,202 @@ mod tests {
             ),
         )
         .unwrap();
-        let readings = read_records(&[dir], &[live(20)], &no_proc);
+        let readings = read_records(&[dir], &[live(20)], &no_proc, RecordDepth::Activity).by_pid;
         assert_eq!(classify_from_record(&readings[&20], NOW), Activity::Stale);
+    }
+
+    /// Only `NotFound` is an absence. Every other `read_dir` error is a dir
+    /// that EXISTS and cannot be listed — the shape every reader used to fold
+    /// into its `continue`.
+    #[test]
+    fn a_sessions_dir_is_absent_only_on_not_found() {
+        let root = scratch("listing");
+        assert!(matches!(
+            list_sessions_dir(&root.path().join("no-such-account")),
+            SessionsListing::Absent
+        ));
+        let listed = root.path().join(".claude-listed");
+        std::fs::create_dir_all(listed.join("sessions")).unwrap();
+        std::fs::write(listed.join("sessions/7.json"), "{}").unwrap();
+        match list_sessions_dir(&listed) {
+            SessionsListing::Listed(paths) => {
+                assert_eq!(paths, vec![listed.join("sessions/7.json")]);
+            }
+            other => panic!("expected Listed, got {other:?}"),
+        }
+    }
+
+    /// A `sessions` that is not a directory cannot be listed, and says so —
+    /// it is not read as an account with no live session. Not gated on the
+    /// platform or the user, because unlike a mode-000 dir it is unlistable to
+    /// root as well. Measured on Linux; on Windows this test's CI run is the
+    /// first evidence that `read_dir` on a file is not `NotFound` there.
+    #[test]
+    fn a_sessions_path_that_is_not_a_directory_is_unlistable() {
+        let root = scratch("not-a-dir");
+        let dir = root.path().join(".claude-file");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("sessions"), "not a directory").unwrap();
+        match list_sessions_dir(&dir) {
+            SessionsListing::Unlistable(why) => {
+                assert_eq!(why.sessions_dir, dir.join("sessions"));
+                assert!(!why.error.is_empty());
+            }
+            other => panic!("expected Unlistable, got {other:?}"),
+        }
+    }
+
+    /// The defect this typed listing exists for. A live `claude`'s record sits
+    /// in a `sessions/` dir the runner cannot list: its pid reads `Unlisted`
+    /// (unknown), never `Missing`, and the dir is reported. A record in a dir
+    /// that WAS listed still reads normally beside it.
+    #[cfg(unix)]
+    #[test]
+    fn an_unlistable_sessions_dir_turns_missing_into_unlisted() {
+        let root = scratch("unlistable");
+        let readable = root.path().join(".claude-a");
+        std::fs::create_dir_all(readable.join("sessions")).unwrap();
+        std::fs::write(
+            readable.join("sessions/11.json"),
+            r#"{"pid":11,"sessionId":"s11","status":"idle"}"#,
+        )
+        .unwrap();
+        let hidden = root.path().join(".claude-b");
+        std::fs::create_dir_all(hidden.join("sessions")).unwrap();
+        std::fs::write(
+            hidden.join("sessions/12.json"),
+            r#"{"pid":12,"sessionId":"s12","status":"idle"}"#,
+        )
+        .unwrap();
+        let Some(_restore) = super::unlistable_fixture::unreadable_sessions_dir(&hidden) else {
+            return;
+        };
+
+        let readings = read_records(
+            &[readable, hidden.clone()],
+            &[live(11), live(12)],
+            &no_proc,
+            RecordDepth::Identity,
+        );
+        assert_eq!(readings.unlistable.len(), 1, "{:?}", readings.unlistable);
+        assert_eq!(readings.unlistable[0].sessions_dir, hidden.join("sessions"));
+        assert_eq!(
+            classify_from_record(&readings.by_pid[&11], NOW),
+            Activity::Idle
+        );
+        assert_eq!(readings.by_pid[&12], RecordReading::Unlisted);
+        assert_eq!(
+            classify_from_record(&readings.by_pid[&12], NOW),
+            Activity::Unknown
+        );
+    }
+
+    /// While a dir is unlistable, an earlier holder's record in a dir that
+    /// did list is `Unlisted`, not `PidReused`: it says nothing about the live
+    /// process, whose own record may be in the dir nobody could read. Not
+    /// gated: a `sessions` that is not a directory is unlistable to root too.
+    #[test]
+    fn a_reused_record_is_unlisted_while_another_dir_is_unlistable() {
+        let root = scratch("reused-unlisted");
+        let listed = root.path().join(".claude-a");
+        std::fs::create_dir_all(listed.join("sessions")).unwrap();
+        std::fs::write(
+            listed.join("sessions/70.json"),
+            r#"{"pid":70,"sessionId":"old","status":"idle","procStart":"400"}"#,
+        )
+        .unwrap();
+        let broken = root.path().join(".claude-file");
+        std::fs::create_dir_all(&broken).unwrap();
+        std::fs::write(broken.join("sessions"), "not a directory").unwrap();
+        let kernel = |_: u32| Some("500".to_string());
+        let readings = read_records(
+            &[listed.clone()],
+            &[live(70)],
+            &kernel,
+            RecordDepth::Identity,
+        );
+        assert_eq!(
+            readings.by_pid[&70],
+            RecordReading::PidReused,
+            "every dir listed"
+        );
+        let readings = read_records(
+            &[listed, broken],
+            &[live(70)],
+            &kernel,
+            RecordDepth::Identity,
+        );
+        assert_eq!(readings.by_pid[&70], RecordReading::Unlisted);
+    }
+
+    /// A record listed and then deleted before it could be opened (its
+    /// process exited) is gone — `Missing` — not an unreadable file.
+    #[test]
+    fn a_record_that_vanishes_before_the_open_is_missing() {
+        let root = scratch("vanished");
+        let dir = root.path().join(".claude");
+        let gone = dir.join("sessions/30.json");
+        assert_eq!(
+            read_one(
+                live(30),
+                &[(dir.clone(), gone)],
+                &no_proc,
+                RecordDepth::Identity
+            ),
+            RecordReading::Missing
+        );
+    }
+
+    /// Two dirs name one pid: an earlier holder's record, and one that does
+    /// not parse. The unparseable one may be the live process's own record
+    /// caught mid-write, so the pid is `Unparseable`, not `PidReused`.
+    #[test]
+    fn an_unreadable_candidate_outranks_a_reused_one() {
+        let root = scratch("outrank");
+        let a = root.path().join(".claude-a");
+        let b = root.path().join(".claude-b");
+        std::fs::create_dir_all(a.join("sessions")).unwrap();
+        std::fs::create_dir_all(b.join("sessions")).unwrap();
+        std::fs::write(
+            a.join("sessions/40.json"),
+            r#"{"pid":40,"sessionId":"old","status":"idle","procStart":"400"}"#,
+        )
+        .unwrap();
+        std::fs::write(b.join("sessions/40.json"), r#"{"pid":40,"sess"#).unwrap();
+        let kernel = |_: u32| Some("500".to_string());
+        let readings = read_records(&[a, b], &[live(40)], &kernel, RecordDepth::Identity);
+        assert_eq!(readings.by_pid[&40], RecordReading::Unparseable);
+    }
+
+    /// `Identity` never opens a transcript; `Activity` does.
+    #[test]
+    fn identity_depth_reads_no_transcript() {
+        let root = scratch("depth");
+        let dir = root.path().join(".claude");
+        std::fs::create_dir_all(dir.join("sessions")).unwrap();
+        let cwd = "/work/repo";
+        std::fs::write(
+            dir.join("sessions/50.json"),
+            format!(r#"{{"pid":50,"sessionId":"s50","cwd":"{cwd}","status":"busy"}}"#),
+        )
+        .unwrap();
+        let transcript = crate::terminal::transcript::session_transcript_path(&dir, cwd, "s50");
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        let recent = chrono::DateTime::from_timestamp_millis(NOW - MIN)
+            .unwrap()
+            .to_rfc3339();
+        std::fs::write(
+            &transcript,
+            format!("{{\"type\":\"assistant\",\"timestamp\":\"{recent}\"}}\n"),
+        )
+        .unwrap();
+        let last =
+            |depth| match &read_records(&[dir.clone()], &[live(50)], &no_proc, depth).by_pid[&50] {
+                RecordReading::Parsed(ev) => ev.last_message_ms,
+                other => panic!("expected Parsed, got {other:?}"),
+            };
+        assert_eq!(last(RecordDepth::Identity), None);
+        assert_eq!(last(RecordDepth::Activity), Some(NOW - MIN));
     }
 
     /// An invalid UTF-8 byte costs its own line, not the whole read.
@@ -1354,6 +1879,47 @@ mod tests {
         assert_eq!(got, ProviderRowValidity::Unknown);
     }
 
+    /// Lenient mode judges a row with no `pidDomain` by the DIRECTIONAL
+    /// `startedAt` check: inside the window it is valid, EARLIER than the
+    /// process is an earlier holder's row (stale), and LATER than the window
+    /// is a late stamp — never reuse and never proof, so unknown.
+    #[test]
+    fn lenient_mode_reads_a_late_started_at_as_unknown_never_stale() {
+        let created_ms = CREATED * 1000;
+        let row = |started_at: i64| {
+            [(
+                dir("a"),
+                format!(r#"{{"pid":7,"sessionId":"{ID_A}","startedAt":{started_at}}}"#),
+            )]
+        };
+        let clock = win_clock();
+        assert_eq!(
+            provider_row_validity(7, &row(created_ms + 1_000), &clock, ValidityMode::Lenient),
+            valid(ID_A, "a"),
+            "inside the window"
+        );
+        assert_eq!(
+            provider_row_validity(
+                7,
+                &row(created_ms - START_LEAD_MS - 1),
+                &clock,
+                ValidityMode::Lenient
+            ),
+            ProviderRowValidity::Stale,
+            "earlier than the process: an earlier holder's row"
+        );
+        assert_eq!(
+            provider_row_validity(
+                7,
+                &row(created_ms + START_LAG_MS + 1),
+                &clock,
+                ValidityMode::Lenient
+            ),
+            ProviderRowValidity::Unknown,
+            "later than the window: a late stamp, never stale"
+        );
+    }
+
     #[test]
     fn strict_mode_refuses_what_it_cannot_check_and_lenient_accepts_it() {
         let no_domain = format!(r#"{{"pid":7,"sessionId":"{ID_A}","procStart":"5000000"}}"#);
@@ -1412,6 +1978,33 @@ mod tests {
                 ValidityMode::Strict
             ),
             valid(ID_A, "a")
+        );
+    }
+
+    /// The unlistable log tracks each dir: one read reports a dir, a read
+    /// that was not asked about it leaves it reported, and only a read that
+    /// lists it again clears it.
+    #[test]
+    fn the_unlistable_log_tracks_each_dir_separately() {
+        let log = UnlistableLog::new("test", "nothing");
+        let a = PathBuf::from("/h/.claude-a");
+        let b = PathBuf::from("/h/.claude-b");
+        let unlistable_a = [UnlistableSessionsDir {
+            sessions_dir: a.join("sessions"),
+            error: "Permission denied".to_string(),
+        }];
+        log.observe(&[a.clone(), b.clone()], &unlistable_a);
+        assert_eq!(log.reported(), vec![a.join("sessions")]);
+        log.observe(std::slice::from_ref(&b), &[]);
+        assert_eq!(
+            log.reported(),
+            vec![a.join("sessions")],
+            "a read that never asked about a dir does not declare it healed"
+        );
+        log.observe(std::slice::from_ref(&a), &[]);
+        assert!(
+            log.reported().is_empty(),
+            "a dir that lists again is cleared"
         );
     }
 

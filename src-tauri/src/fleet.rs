@@ -1783,8 +1783,10 @@ fn assemble_host_capabilities(
 /// The heartbeat's host capability set: [`host_capabilities`] plus the
 /// credential-presence family — `probes:cred`, `cred:gh`, `cred:aws-sts` and
 /// the regional tokens coord's catalogue names — read from its own cache (see the section header above
-/// [`CRED_PROBES_MARKER`]); that read never blocks on a probe. The ONLY caller
-/// of [`cred_capabilities`], and called only by `heartbeat_to_coord`.
+/// [`CRED_PROBES_MARKER`]); that read never blocks on a probe. Called only by
+/// `heartbeat_to_coord`, on the blocking pool. The other caller of
+/// [`cred_capabilities`] is [`heartbeat_join_failure_capabilities`], which runs
+/// on the async worker, so that read must stay non-blocking.
 fn heartbeat_capabilities() -> Vec<String> {
     let mut caps = host_capabilities();
     caps.extend(cred_capabilities());
@@ -2090,6 +2092,21 @@ static CI_REPO_CAP_WARNED: std::sync::atomic::AtomicBool =
 /// heartbeat runs it on the blocking pool, never inline on its async worker.
 fn heartbeat_device_capabilities(ci_node: bool, repo_allowlist: &[String]) -> Vec<String> {
     build_device_capabilities(ci_node, repo_allowlist, &heartbeat_capabilities())
+}
+
+/// The capability base when the blocking assembly panicked: CI tokens, the OS
+/// fact (the one host token that needs no probe) and the credential family.
+///
+/// The vector is AUTHORITATIVE, so whatever is left out here is retracted from
+/// `coord.devices.capabilities` by this heartbeat. A panic in an unrelated host
+/// probe says nothing about this box's credentials, and leaving the family out
+/// would also drop `probes:cred`, turning the device from "probed" into
+/// "unprobed" for a tick. The read cannot block or probe: it is the same cache
+/// [`cred_capabilities`] always answers from.
+fn heartbeat_join_failure_capabilities(ci_node: bool, repo_allowlist: &[String]) -> Vec<String> {
+    let mut host = vec![format!("os:{}", current_os_label())];
+    host.extend(cred_capabilities());
+    build_device_capabilities(ci_node, repo_allowlist, &host)
 }
 
 /// Pure assembly of the whole `capabilities` vector the heartbeat sends.
@@ -3483,18 +3500,15 @@ pub async fn heartbeat_to_coord() -> Result<crate::coord_drain_state::HeartbeatO
     // The host probes block (a `docker version` fork, and on a cache miss a
     // bounded `GET /v1/models` of the image upstream), so the capability base
     // is assembled on the blocking pool rather than on this async task's
-    // worker. A join failure (a panicking probe) still advertises the CI tokens
-    // and the OS fact, the one host token that needs no probe.
+    // worker. A join failure (a panicking probe) still advertises the CI tokens,
+    // the OS fact (the one host token that needs no probe) and the credential
+    // family from its non-blocking cache: `heartbeat_join_failure_capabilities`.
     let (ci_enabled, repo_allowlist) = (ci.enabled, ci.repo_allowlist.clone());
     let mut capabilities =
         spawn_blocking_tracked(move || heartbeat_device_capabilities(ci_enabled, &repo_allowlist))
             .await
             .unwrap_or_else(|_| {
-                build_device_capabilities(
-                    ci.enabled,
-                    &ci.repo_allowlist,
-                    &[format!("os:{}", current_os_label())],
-                )
+                heartbeat_join_failure_capabilities(ci.enabled, &ci.repo_allowlist)
             });
     // Skill capabilities (plan 2026-10-13-coord-expedited-land-lever-for-agents
     // Phase 3b): advertised only when the skill is served AND the bearer this
@@ -5230,9 +5244,11 @@ fn spawn_skill_parity_pass_if_due() {
             }
             None => {
                 report_skill_parity_unreached(
-                    "the workspace root did not resolve, so neither tree could be \
-                     located — set QONTINUI_ROOT or the runner's paths.workspace_root"
-                        .to_string(),
+                    format!(
+                        "the workspace root did not resolve, so neither tree could be \
+                         located — set the \"{}\" setting to the folder that holds them",
+                        qontinui_types::paths::WORKSPACE_ROOT_SETTING
+                    ),
                     None,
                 );
                 None
@@ -5264,7 +5280,7 @@ fn spawn_skill_parity_pass_if_due() {
 /// `2026-08-04-remove-hardcoded-machine-paths-from-product-code`.
 ///
 /// Still `Option`: a miss means this publish pass finds no repos and says so
-/// (see the "QONTINUI_ROOT to override. Skipping." log below), which is honest
+/// (see the "no workspace root resolved" log below), which is honest
 /// degradation rather than an error.
 fn qontinui_root() -> Option<PathBuf> {
     crate::workspace_paths::workspace_root()
@@ -6490,8 +6506,9 @@ pub async fn publish_tree_state() -> Result<(), String> {
         Some(p) => p,
         None => {
             info!(
-                "fleet::tree_publisher: no qontinui-root directory found (set \
-                 QONTINUI_ROOT to override). Skipping."
+                "fleet::tree_publisher: no workspace root resolved, so there are no repos \
+                 to publish (set the \"{}\" setting to point at them). Skipping.",
+                qontinui_types::paths::WORKSPACE_ROOT_SETTING
             );
             return Ok(());
         }
@@ -9717,6 +9734,83 @@ mod tests {",
             "the OS fact must always be advertised, got {first:?}"
         );
         eprintln!("host_capabilities() on this host = {first:?}");
+    }
+
+    /// The heartbeat's join-failure arm (`heartbeat_to_coord`'s `unwrap_or_else`
+    /// over the blocking assembly) keeps the credential family. The vector is
+    /// authoritative, so dropping it there would retract every `cred:*` token
+    /// and the `probes:cred` marker because an unrelated host probe panicked.
+    #[test]
+    fn a_join_failure_heartbeat_keeps_the_credential_family() {
+        let _serial = CRED_FAMILY_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        struct Restore(Option<CredFamilyState>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                if let Some(prior) = self.0.take() {
+                    *CRED_FAMILY_CACHE.lock().unwrap_or_else(|p| p.into_inner()) = prior;
+                }
+            }
+        }
+        let mut seeded = CredFamilyState::new();
+        seeded.apply(
+            &[(CRED_GH_CAPABILITY, CredState::Present)],
+            std::time::Instant::now(),
+            HOST_PROBE_TTL,
+        );
+        let _restore = {
+            let mut g = CRED_FAMILY_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+            Restore(Some(std::mem::replace(&mut *g, seeded)))
+        };
+        let allow = vec!["qontinui-runner".to_string()];
+        let caps = heartbeat_join_failure_capabilities(true, &allow);
+        for token in [
+            "ci_node",
+            "ci_repo:qontinui-runner",
+            CRED_PROBES_MARKER,
+            CRED_GH_CAPABILITY,
+        ] {
+            assert!(caps.iter().any(|c| c == token), "{token} missing: {caps:?}");
+        }
+        assert!(caps
+            .iter()
+            .any(|c| c == &format!("os:{}", current_os_label())));
+        // And the heartbeat really routes its join failure through it.
+        let src = include_str!("fleet.rs");
+        let prod = prod_part(src);
+        let (_, from_fn) = prod
+            .split_once("pub async fn heartbeat_to_coord(")
+            .expect("heartbeat_to_coord is defined in fleet.rs");
+        let (body, _) = from_fn
+            .split_once("\n}\n")
+            .expect("heartbeat_to_coord ends");
+        assert!(
+            squeezed(body).contains(
+                ".unwrap_or_else(|_|{heartbeat_join_failure_capabilities(ci.enabled,&ci.repo_allowlist)})"
+            ),
+            "heartbeat_to_coord's join-failure arm must call heartbeat_join_failure_capabilities"
+        );
+        // That arm runs on the async worker, so the helper must reach no
+        // blocking probe — the same banned set the blocking-pool pin uses.
+        let (_, helper) = prod
+            .split_once("fn heartbeat_join_failure_capabilities(")
+            .expect("the helper is defined in fleet.rs");
+        let (helper, _) = helper.split_once("\n}\n").expect("the helper ends");
+        let helper = squeezed(helper);
+        for blocking in [
+            "heartbeat_device_capabilities",
+            "heartbeat_capabilities",
+            "host_capabilities",
+            "capability_tokens",
+            "slow_host_probes",
+            "claude_code_probe",
+        ] {
+            assert!(
+                !calls_fn(&helper, blocking),
+                "heartbeat_join_failure_capabilities runs on the async worker and must not call {blocking}(..)"
+            );
+        }
     }
 
     /// ARMING test at the heartbeat seam (plan
