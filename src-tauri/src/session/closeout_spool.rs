@@ -355,6 +355,14 @@ pub struct GateRegistrationInput {
 /// today. Refusing a blank here would be precisely the stricter-drift this
 /// block forbids — the runner does not get to decide that a gate coord would
 /// have taken is not worth keeping.
+///
+/// `expires_at` is mirrored too, because the drain replays it
+/// (`coord_sync::gate_registration_body`). coord's field is
+/// `Option<DateTime<Utc>>`: absent and `null` are accepted, and any other value
+/// is deserialized by chrono's visitor as `str::parse::<DateTime<FixedOffset>>()`
+/// (chrono 0.4.44 `datetime/serde.rs`, the version both repos lock). Running
+/// that same parse here cannot drift stricter, and spooling a value it rejects
+/// would only turn coord's immediate 422 into a gate Ack-dropped at replay.
 pub fn parse_gate_registration_body(raw: &[u8]) -> Option<GateRegistrationInput> {
     let parsed: JsonValue = serde_json::from_slice(raw).ok()?;
     let mut obj = match parsed {
@@ -366,6 +374,12 @@ pub fn parse_gate_registration_body(raw: &[u8]) -> Option<GateRegistrationInput>
     }
     if !matches!(obj.get("phase_name"), Some(JsonValue::String(_))) {
         return None;
+    }
+    match obj.get("expires_at") {
+        None | Some(JsonValue::Null) => {}
+        Some(JsonValue::String(s))
+            if s.parse::<chrono::DateTime<chrono::FixedOffset>>().is_ok() => {}
+        Some(_) => return None,
     }
     let raw_hint = obj.remove(WORK_UNIT_UPSERT_HINT_KEY);
     Some(GateRegistrationInput {
@@ -701,6 +715,12 @@ mod tests {
             // deserializes from an object and nothing else.
             br#"{"predicate": "unit_ready", "phase_name": "P1"}"#.as_slice(),
             br#"{"predicate": ["unit_ready"], "phase_name": "P1"}"#.as_slice(),
+            // An `expires_at` coord's `DateTime<Utc>` cannot parse: coord
+            // answers 422, so spooling it would only drop the gate at replay.
+            br#"{"predicate": {"kind": "unit_ready"}, "phase_name": "P1", "expires_at": "2026-12-01"}"#.as_slice(),
+            br#"{"predicate": {"kind": "unit_ready"}, "phase_name": "P1", "expires_at": "2026-12-01T00:00:00"}"#.as_slice(),
+            br#"{"predicate": {"kind": "unit_ready"}, "phase_name": "P1", "expires_at": ""}"#.as_slice(),
+            br#"{"predicate": {"kind": "unit_ready"}, "phase_name": "P1", "expires_at": 1798761600}"#.as_slice(),
         ] {
             assert!(
                 parse_gate_registration_body(raw).is_none(),
@@ -724,6 +744,19 @@ mod tests {
         )
         .expect("coord accepts a blank phase_name, so the spool must keep it");
         assert_eq!(input.body["phase_name"], json!(""));
+
+        // `expires_at` in every shape coord's `Option<DateTime<Utc>>` takes:
+        // absent (above), `null`, UTC, and a non-UTC offset. All four spool,
+        // and the value rides the payload verbatim for the replay.
+        for (raw, want) in [
+            (br#"{"predicate": {"kind": "unit_ready"}, "phase_name": "P1", "expires_at": null}"#.as_slice(), json!(null)),
+            (br#"{"predicate": {"kind": "unit_ready"}, "phase_name": "P1", "expires_at": "2026-12-01T00:00:00Z"}"#.as_slice(), json!("2026-12-01T00:00:00Z")),
+            (br#"{"predicate": {"kind": "unit_ready"}, "phase_name": "P1", "expires_at": "2026-12-01T01:00:00+01:00"}"#.as_slice(), json!("2026-12-01T01:00:00+01:00")),
+        ] {
+            let input = parse_gate_registration_body(raw)
+                .expect("coord accepts this expires_at, so the spool must keep it");
+            assert_eq!(input.body["expires_at"], want);
+        }
 
         // A predicate `kind` this runner has never heard of. The variant
         // vocabulary is coord's alone: a copy here would refuse every gate

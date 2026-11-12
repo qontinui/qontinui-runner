@@ -3160,13 +3160,15 @@ fn with_gate_caller_session(
 /// Build the `POST /coord/work-units/:slug/register-gate` body from a
 /// `gate_registration` outbox payload — coord's `UnitGateRequest` shape.
 ///
-/// Only the five body fields are forwarded: `work_unit_slug` is a PATH
-/// segment and `work_unit_upsert` is the runner-side lazy bootstrap (see
-/// [`gate_registration_upsert_body`]), so neither belongs on the wire here.
-/// `continuation_spawn` / `clearance_audience` / `gate_class` are omitted
-/// when absent OR null so coord's `#[serde(default)]` /
-/// `default_clearance_audience` apply — a literal `null` would be a
-/// deserialize error on the non-`Option` `clearance_audience`.
+/// Only `UnitGateRequest`'s six body fields are forwarded: `work_unit_slug`
+/// is a PATH segment and `work_unit_upsert` is the runner-side lazy bootstrap
+/// (see [`gate_registration_upsert_body`]), so neither belongs on the wire
+/// here. `continuation_spawn` / `clearance_audience` / `expires_at` /
+/// `gate_class` are omitted when absent OR null so coord's `#[serde(default)]`
+/// / `default_clearance_audience` apply — a literal `null` would be a
+/// deserialize error on the non-`Option` `clearance_audience`. `expires_at` was
+/// once missing here, so a gate spooled during a coord outage was replayed
+/// with no deadline and the reconciler's expiry arm could never fire for it.
 fn gate_registration_body(payload: &JsonValue) -> JsonValue {
     let mut body = serde_json::Map::new();
     // Required by coord; forwarded verbatim when present. Absent means coord
@@ -3177,7 +3179,12 @@ fn gate_registration_body(payload: &JsonValue) -> JsonValue {
             body.insert(key.to_string(), v.clone());
         }
     }
-    for key in ["continuation_spawn", "clearance_audience", "gate_class"] {
+    for key in [
+        "continuation_spawn",
+        "clearance_audience",
+        "expires_at",
+        "gate_class",
+    ] {
         if let Some(v) = payload.get(key) {
             if !v.is_null() {
                 body.insert(key.to_string(), v.clone());
@@ -9753,6 +9760,7 @@ mod tests {
             },
             "phase_name": "Phase 2",
             "clearance_audience": "agent",
+            "expires_at": "2026-12-01T00:00:00Z",
             "gate_class": "closeout",
             "work_unit_upsert": {
                 "title": "Closeout has no durable store",
@@ -9803,6 +9811,7 @@ mod tests {
         assert_eq!(body["predicate"]["pr_number"], json!(1266));
         assert_eq!(body["phase_name"], json!("Phase 2"));
         assert_eq!(body["clearance_audience"], json!("agent"));
+        assert_eq!(body["expires_at"], json!("2026-12-01T00:00:00Z"));
         assert_eq!(body["gate_class"], json!("closeout"));
         // The two runner-side fields never reach coord.
         assert!(body.get("work_unit_slug").is_none());
@@ -10170,12 +10179,22 @@ mod tests {
             "phase_name": "P1",
             "continuation_spawn": null,
             "clearance_audience": null,
+            "expires_at": null,
             "gate_class": null,
         }));
         assert_eq!(
             nulled,
             json!({"predicate": {"kind": "unit_ready"}, "phase_name": "P1"}),
             "nulls are dropped, not forwarded"
+        );
+
+        // A spooled gate keeps its deadline across the replay: coord's
+        // `UnitGateRequest` declares `expires_at`, and the orphan reconciler
+        // reaps a gate past it only if the replayed body carries it.
+        assert_eq!(
+            gate_registration_body(&gate_payload())["expires_at"],
+            json!("2026-12-01T00:00:00Z"),
+            "expires_at survives the replay"
         );
     }
 

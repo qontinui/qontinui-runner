@@ -282,6 +282,7 @@ pub enum SessionEventKind {
     ///   "phase_name":     "Phase 2",                 // required
     ///   "continuation_spawn": { … },                 // optional
     ///   "clearance_audience": "operator",            // optional
+    ///   "expires_at":         "<rfc3339>",           // optional
     ///   "gate_class":         "…",                   // optional
     ///   "work_unit_upsert":   { "title": …, "status": … } // optional bootstrap
     /// }
