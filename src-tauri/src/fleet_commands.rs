@@ -499,9 +499,37 @@ fn classify_existing(dst: &Path) -> Option<Existing> {
 /// destination is already tracked by the enclosing git repository, or the
 /// tracked-file probe could not answer inside one; both are skipped (see
 /// [`provision_fleet_commands_into`] and [`crate::provision_guard`]).
+///
+/// **And before any of that, the pass may STAND DOWN** ([`crate::provision_guard::stand_down`]):
+/// when `<workdir>/.claude/commands` is reached through a symlink, or the
+/// workdir's `.claude` resolves into the canonical `qontinui-claude-config`
+/// checkout, nothing is fetched, probed or written, and every bundled unit is
+/// recorded as skipped (`symlinked` / `canonical_source`). That decision is
+/// the FIRST statement here, so every caller inherits it.
 pub(crate) fn provision_fleet_commands_for_session(workdir: &str) {
+    provision_fleet_commands_for_session_with_root(
+        workdir,
+        crate::workspace_paths::workspace_root().as_deref(),
+    );
+}
+
+/// [`provision_fleet_commands_for_session`] with the workspace root injected —
+/// the test seam, and the only reader of the ambient root is the wrapper above.
+/// `workspace_root()` rather than `require_workspace_root()`: the stand-down
+/// only compares paths and writes nothing, and a `None` root fails open to the
+/// symlink arm alone.
+fn provision_fleet_commands_for_session_with_root(workdir: &str, root: Option<&Path>) {
+    let claude_dir = Path::new(workdir).join(".claude");
+    if let Some(reason) = crate::provision_guard::stand_down(&claude_dir, "commands", root) {
+        info!(
+            "fleet_commands: standing down for {workdir} — {}",
+            reason.describe()
+        );
+        record_whole_pass_skip(workdir, &reason);
+        return;
+    }
     let registry = crate::agent_commands::resolve_registry();
-    let commands_dir = Path::new(workdir).join(".claude").join("commands");
+    let commands_dir = claude_dir.join("commands");
 
     // The registry's own row: WHICH of `resolve_registry`'s three arms answered.
     // Recorded before the write, because it is a fact about resolution rather
@@ -543,6 +571,27 @@ pub(crate) fn provision_fleet_commands_for_session(workdir: &str) {
     }
 }
 
+/// Record that the commands pass wrote NOTHING for `workdir`, for one reason
+/// that covers the whole destination: one skip per bundled unit, so the token
+/// reads `written=0/N skipped-<reason>=N`.
+///
+/// The roster is the EMBEDDED bundle, not the account-resolved registry:
+/// resolving that would fetch overrides for a pass that writes nothing. Shared
+/// by the stand-down above and the session-level skips in
+/// `agent_worktree::isolated_edit`.
+pub(crate) fn record_whole_pass_skip(workdir: &str, reason: &capability_manifest::SkipReason) {
+    let commands_dir = Path::new(workdir).join(".claude").join("commands");
+    capability_manifest::record_provision(
+        workdir,
+        ProvisionReport::whole_pass_skip(
+            "fleet_commands",
+            commands_dir.display().to_string(),
+            FLEET_COMMANDS.iter().map(|(name, _)| format!("{name}.md")),
+            reason,
+        ),
+    );
+}
+
 /// Core of [`provision_fleet_commands_for_session`]: create `commands_dir` and
 /// write every resolved command into it, returning the counts. Split out so a
 /// unit test can drive it against a tempdir and assert the result — mirroring
@@ -552,12 +601,15 @@ pub(crate) fn provision_fleet_commands_for_session(workdir: &str) {
 /// the resolved body plus one `qontinui-provenance:` frontmatter line.
 ///
 /// Idempotent (a second pass over the same dir overwrites rather than errors),
-/// with ONE exception: a destination that already exists AND is tracked in the
-/// enclosing git repository is skipped, logged at `info!`, and counted in
-/// [`ProvisionReport::skipped`] WITH its reason. Spawning a session with such a
-/// checkout as its cwd
-/// used to replace the repo's own content with the binary's embedded copy and
-/// leave the tree dirty.
+/// with TWO exceptions. A destination that is a symlink, or sits behind one
+/// below `commands_dir`, is skipped and recorded `symlinked`: a provisioner
+/// never writes through a link. And a destination that already exists AND is
+/// tracked in the enclosing git repository is skipped, logged at `info!`, and
+/// counted in [`ProvisionReport::skipped`] WITH its reason. Spawning a session
+/// with such a checkout as its cwd used to replace the repo's own content with
+/// the binary's embedded copy and leave the tree dirty. (The whole-pass
+/// stand-down for a symlinked `.claude` or the canonical checkout is decided
+/// one level up, in [`provision_fleet_commands_for_session`], before this runs.)
 ///
 /// **This is not a narrow case.** `qontinui-claude-config` tracks all of them —
 /// so a session spawned there provisions ZERO commands, and a tracked file
@@ -598,11 +650,25 @@ pub(crate) fn provision_fleet_commands_into(
         resolved.len(),
         capability_manifest::Rung::Embedded,
     )
-    .with_destination(commands_dir.display().to_string());
+    .with_destination(commands_dir.display().to_string())
+    .with_probe(tracked.probe_state());
     let mut edited = 0usize;
     for command in &resolved {
         let file_name = command.file_name();
         let dst = commands_dir.join(&file_name);
+        // Never write THROUGH a symlink, whatever the probe says: a per-file
+        // link into a canonical checkout is invisible to `TrackedPaths`, and
+        // `std::fs::write` onto it truncates its target.
+        if let Some(why) = crate::provision_guard::symlink_below(commands_dir, &dst) {
+            let reason = capability_manifest::SkipReason::Symlinked(why);
+            info!(
+                "fleet_commands: skipping {} — {}",
+                dst.display(),
+                reason.describe()
+            );
+            out.skip(file_name, reason);
+            continue;
+        }
         if let Some(reason) = tracked.skip_reason(&dst, Path::new(&file_name)) {
             info!(
                 "fleet_commands: skipping {} — {}; overwriting it could silently \
@@ -2928,6 +2994,9 @@ mod tests {
             SkipReason::Unresolved(String::new()),
             SkipReason::Rejected(String::new()),
             SkipReason::RepoAuthored,
+            SkipReason::TreeProbeUnanswered,
+            SkipReason::CanonicalSource(String::new()),
+            SkipReason::Symlinked(String::new()),
         ];
         for reason in &roster {
             match reason {
@@ -2937,7 +3006,10 @@ mod tests {
                 | SkipReason::WriteFailed(_)
                 | SkipReason::Unresolved(_)
                 | SkipReason::Rejected(_)
-                | SkipReason::RepoAuthored => {}
+                | SkipReason::RepoAuthored
+                | SkipReason::TreeProbeUnanswered
+                | SkipReason::CanonicalSource(_)
+                | SkipReason::Symlinked(_) => {}
             }
             let spelled = format!("`{}`", reason.wire().replace('_', "-"));
             assert!(
@@ -2946,5 +3018,292 @@ mod tests {
                  (canonical: qontinui-claude-config .claude/commands/whereami.md) and re-vendor"
             );
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 3 of `2026-11-09-the-runner-provisioner-wrote-the-served-claude-config-
+    // through-the-workspace-root-symlink`: the stand-down, never writing through
+    // a symlink, and the loud ledger. Fixtures that cannot be built FAIL.
+    // ------------------------------------------------------------------
+
+    use crate::provision_guard::test_support::{
+        git_add, git_init, link_file, linked_workspace, snapshot,
+    };
+
+    /// Write every bundled command EXCEPT the first into `<claude>/commands`
+    /// (what a repo tracking the bundle holds), and return the first's file
+    /// name: the path upstream "added" that is absent on disk.
+    fn seed_repo_commands(claude: &Path) -> String {
+        let dir = claude.join("commands");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut absent = None;
+        for (i, (name, _)) in FLEET_COMMANDS.iter().enumerate() {
+            if i == 0 {
+                absent = Some(format!("{name}.md"));
+                continue;
+            }
+            std::fs::write(dir.join(format!("{name}.md")), b"the repo's own body").unwrap();
+        }
+        absent.expect("the bundle carries at least one command")
+    }
+
+    /// The report the ledger holds for `workdir`'s commands pass.
+    fn commands_report(workdir: &str) -> ProvisionReport {
+        crate::capability_manifest::session_provision_ledger(workdir)
+            .expect("the pass is recorded against this workdir")
+            .reports
+            .into_iter()
+            .rev()
+            .find(|r| r.capability == "fleet_commands")
+            .expect("a fleet_commands report")
+    }
+
+    /// T1 / T2: a non-repo workspace root whose `.claude` links into a repo that
+    /// tracks the bundle. A stand-down writes NOTHING — not a byte, not an mtime,
+    /// not the absent path — whether or not the tracked-file probe could answer.
+    fn assert_linked_workspace_is_not_written(probe_answers: bool) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (ws, repo) = linked_workspace(tmp.path(), probe_answers);
+        let absent = seed_repo_commands(&repo.join(".claude"));
+        if probe_answers {
+            git_add(&repo, Path::new(".claude"));
+        }
+        let before = snapshot(&repo.join(".claude"));
+        let wd = ws.to_str().unwrap();
+
+        provision_fleet_commands_for_session_with_root(wd, Some(&tmp.path().join("root")));
+
+        assert_eq!(
+            snapshot(&repo.join(".claude")),
+            before,
+            "a stand-down changes no byte, no mtime and creates no path"
+        );
+        assert!(
+            !repo.join(".claude/commands").join(&absent).exists(),
+            "the upstream-added path stays absent"
+        );
+        let report = commands_report(wd);
+        let n = FLEET_COMMANDS.len();
+        assert_eq!(
+            (report.written, report.expected, report.skipped.len()),
+            (0, n, n)
+        );
+        assert!(report
+            .skipped
+            .iter()
+            .all(|u| u.reason.wire() == "symlinked"));
+        assert_eq!(report.probe, capability_manifest::TrackedProbeState::NotRun);
+        assert!(report.is_stood_down(), "a stand-down reads as one");
+        assert!(
+            !report.warns(),
+            "a deliberate stand-down is not logged as degraded"
+        );
+        let line = crate::served_corpus::probe(&ws).render_line();
+        assert!(
+            line.contains(&format!(
+                "[provisioned: commands written=0/{n} skipped-symlinked={n} as-of="
+            )),
+            "{line}"
+        );
+    }
+
+    /// T1 — the 2026-10-27 shape, with the probe forced unanswered (a `.git`
+    /// file naming a missing gitdir), where the pre-stand-down arm wrote every
+    /// ABSENT path through the link.
+    #[test]
+    fn a_symlinked_workspace_claude_is_never_written_when_the_probe_cannot_answer() {
+        assert_linked_workspace_is_not_written(false);
+    }
+
+    /// T2 — the same, with a real repository whose probe answers.
+    #[test]
+    fn a_symlinked_workspace_claude_is_never_written_when_the_probe_answers() {
+        assert_linked_workspace_is_not_written(true);
+    }
+
+    /// T3 — a Windows junction is a link to `symlink_metadata`, so it stands
+    /// down too (a symlink fixture can need a privilege a junction does not).
+    #[cfg(windows)]
+    #[test]
+    fn a_junctioned_workspace_claude_is_never_written() {
+        use crate::provision_guard::test_support::link_junction;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(repo.join(".claude")).unwrap();
+        std::fs::write(
+            repo.join(".git"),
+            b"gitdir: /nonexistent/qontinui-fleet-commands-junction\n",
+        )
+        .unwrap();
+        let absent = seed_repo_commands(&repo.join(".claude"));
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        link_junction(&ws.join(".claude"), &repo.join(".claude"));
+        let before = snapshot(&repo.join(".claude"));
+        let wd = ws.to_str().unwrap();
+
+        provision_fleet_commands_for_session_with_root(wd, None);
+
+        assert_eq!(snapshot(&repo.join(".claude")), before);
+        assert!(!repo.join(".claude/commands").join(&absent).exists());
+        let report = commands_report(wd);
+        assert_eq!(report.written, 0);
+        assert!(report
+            .skipped
+            .iter()
+            .all(|u| u.reason.wire() == "symlinked"));
+    }
+
+    /// T4 — a session whose cwd IS the canonical checkout (a real directory, no
+    /// link anywhere) stands down on `canonical_source`, decided from the
+    /// injected workspace root with no git probe at all.
+    #[test]
+    fn the_canonical_source_checkout_is_never_written() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("root");
+        let ccfg = root.join("qontinui-claude-config");
+        let absent = seed_repo_commands(&ccfg.join(".claude"));
+        let before = snapshot(&ccfg.join(".claude"));
+        let wd = ccfg.to_str().unwrap();
+
+        provision_fleet_commands_for_session_with_root(wd, Some(&root));
+
+        assert_eq!(snapshot(&ccfg.join(".claude")), before);
+        assert!(!ccfg.join(".claude/commands").join(&absent).exists());
+        let report = commands_report(wd);
+        assert_eq!(report.written, 0);
+        assert_eq!(report.skipped.len(), FLEET_COMMANDS.len());
+        assert!(report
+            .skipped
+            .iter()
+            .all(|u| u.reason.wire() == "canonical_source"));
+        assert!(report.is_stood_down() && !report.warns());
+    }
+
+    /// T5 (control) — a fresh agent worktree: a repository tracking nothing
+    /// under `.claude`, no `.claude` directory. It gets EVERY bundled command,
+    /// no stand-down applies, and the token carries no `probe=` field.
+    #[test]
+    fn a_fresh_agent_worktree_gets_every_command_and_no_probe_field() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("fresh");
+        std::fs::create_dir_all(&repo).unwrap();
+        git_init(&repo);
+        std::fs::write(repo.join("README.md"), b"x").unwrap();
+        git_add(&repo, Path::new("README.md"));
+        assert_eq!(
+            crate::provision_guard::stand_down(
+                &repo.join(".claude"),
+                "commands",
+                Some(&tmp.path().join("root"))
+            ),
+            None
+        );
+
+        let report = provision_fleet_commands_into(
+            &repo.join(".claude").join("commands"),
+            &AgentCommandRegistry::new(),
+        )
+        .expect("provision");
+        let n = FLEET_COMMANDS.len();
+        assert_eq!((report.written, report.skipped.len()), (n, 0));
+        assert_eq!(
+            report.probe,
+            capability_manifest::TrackedProbeState::Answered
+        );
+        let wd = repo.to_str().unwrap();
+        capability_manifest::record_provision(wd, report);
+        let line = crate::served_corpus::probe(&repo).render_line();
+        assert!(
+            line.contains(&format!("commands written={n}/{n} as-of=")),
+            "{line}"
+        );
+        assert!(!line.contains("probe="), "{line}");
+    }
+
+    /// T6 — an ordinary `.claude/commands` in which one file is a symlink to a
+    /// file elsewhere: that file is skipped `symlinked` and its target is left
+    /// alone; every other command is written.
+    #[test]
+    fn a_per_file_symlink_is_never_written_through() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let commands_dir = tmp.path().join(".claude").join("commands");
+        std::fs::create_dir_all(&commands_dir).unwrap();
+        let external = tmp.path().join("external.md");
+        std::fs::write(&external, b"not ours").unwrap();
+        let (first, _) = FLEET_COMMANDS[0];
+        link_file(&commands_dir.join(format!("{first}.md")), &external);
+
+        let report = provision_fleet_commands_into(&commands_dir, &AgentCommandRegistry::new())
+            .expect("provision");
+
+        assert_eq!(std::fs::read(&external).unwrap(), b"not ours");
+        let n = FLEET_COMMANDS.len();
+        assert_eq!(report.written, n - 1);
+        assert_eq!(report.skipped.len(), 1);
+        assert_eq!(report.skipped[0].unit, format!("{first}.md"));
+        assert_eq!(report.skipped[0].reason.wire(), "symlinked");
+        for (name, _) in &FLEET_COMMANDS[1..] {
+            let dst = commands_dir.join(format!("{name}.md"));
+            assert!(
+                !std::fs::symlink_metadata(&dst)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "{name}.md is a regular file"
+            );
+        }
+    }
+
+    /// T7 — a probe that cannot answer inside a repository, with EVERY
+    /// destination absent. Every path is written, so the pass reads complete —
+    /// which used to render `written=N/N`, identical to a healthy fresh
+    /// provision. It now says so: the report carries the probe state, the token
+    /// renders `probe=unanswered_in_repo`, and the pass logs at `warn`.
+    #[test]
+    fn an_unanswered_probe_with_every_destination_absent_is_loud() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(
+            repo.join(".git"),
+            b"gitdir: /nonexistent/qontinui-fleet-commands-loud\n",
+        )
+        .unwrap();
+
+        let report = provision_fleet_commands_into(
+            &repo.join(".claude").join("commands"),
+            &AgentCommandRegistry::new(),
+        )
+        .expect("provision");
+
+        let n = FLEET_COMMANDS.len();
+        assert_eq!((report.written, report.skipped.len()), (n, 0));
+        assert!(report.is_complete(), "every destination was absent");
+        assert_eq!(
+            report.probe,
+            capability_manifest::TrackedProbeState::UnansweredInRepo
+        );
+        assert!(
+            report.warns(),
+            "a complete pass on an unanswered probe still warns"
+        );
+        assert!(
+            report
+                .summary()
+                .contains("tracked-file probe unanswered_in_repo"),
+            "{}",
+            report.summary()
+        );
+        let wd = repo.to_str().unwrap();
+        capability_manifest::record_provision(wd, report);
+        let line = crate::served_corpus::probe(&repo).render_line();
+        assert!(
+            line.contains(&format!(
+                "commands written={n}/{n} probe=unanswered_in_repo as-of="
+            )),
+            "{line}"
+        );
     }
 }

@@ -393,6 +393,9 @@ pub(crate) struct PassSummary {
     expected: usize,
     /// Skipped-unit counts by `SkipReason::wire()`, zero counts omitted.
     skipped: std::collections::BTreeMap<&'static str, usize>,
+    /// What the tracked-file probe did. Rendered only when it was asked and did
+    /// not answer ([`crate::capability_manifest::TrackedProbeState::is_unanswered`]).
+    probe: crate::capability_manifest::TrackedProbeState,
     /// When the pass ran, RFC 3339 UTC.
     at: String,
 }
@@ -406,13 +409,22 @@ pub(crate) struct Provisioned {
 }
 
 impl Provisioned {
-    /// `commands written=<w>/<e> skipped-<reason>=<n>… as-of=<ts>; skills …`.
+    /// `commands written=<w>/<e> skipped-<reason>=<n>… [probe=<state>] as-of=<ts>;
+    /// skills …`. `probe=` appears only for `unanswered_in_repo` and
+    /// `unanswered_outside_repo`: a pass that wrote only absent paths after a
+    /// probe that could not answer would otherwise read exactly like a healthy
+    /// fresh provision. It is never rendered for `not_run`, which every
+    /// stand-down and whole-pass skip carries, so a deliberate stand-down does
+    /// not read like a fault.
     fn render(&self) -> String {
         let one = |label: &str, p: &Probe<PassSummary>| match p {
             Probe::Measured(s) => {
                 let mut out = format!("{label} written={}/{}", s.written, s.expected);
                 for (reason, n) in &s.skipped {
                     out.push_str(&format!(" skipped-{}={n}", reason.replace('_', "-")));
+                }
+                if s.probe.is_unanswered() {
+                    out.push_str(&format!(" probe={}", s.probe.wire()));
                 }
                 out.push_str(&format!(" as-of={}", s.at));
                 out
@@ -460,6 +472,7 @@ fn provisioned_for(workdir: &Path) -> Probe<Provisioned> {
                     written: r.written,
                     expected: r.expected,
                     skipped,
+                    probe: r.probe,
                     at: r.at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
                 })
             }

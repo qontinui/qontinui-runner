@@ -1162,10 +1162,19 @@ pub(crate) fn provision_session_cwd(
     // not "writes only when it would change something" — which is exactly
     // why the guard below is needed.
     //
-    // GUARDED, unlike the three agent-path call sites. Those target a fresh
-    // agent worktree or an agent-private home dir, where an unconditional
-    // overwrite is correct and wanted. THIS chokepoint can resolve to an
-    // arbitrary operator cwd — including `qontinui-claude-config`, which
+    // GUARDED at the SESSION level, unlike the agent-path call sites (four, not
+    // three: `agent_runtime` x2, `looping_agent_supervisor`, and the scheduler's
+    // remote agent). Two of those four DO run at the workspace root, whose
+    // `.claude` is a symlink into `qontinui-claude-config`: the continuation
+    // fallback (`continuation_fallback_workdir`, when the worktree acquire
+    // fails) and `scheduler_remote_agent` (`resolve_workdir` defaults to the
+    // workspace root, which the nightly `/return-to-main` needs). Neither goes
+    // through this predicate, and it would not catch that cwd if they did (see
+    // `claude_tree_is_repo_authored`). What protects them is the stand-down that
+    // now lives in the provisioners themselves
+    // (`provision_guard::stand_down`), which every caller inherits.
+    //
+    // THIS chokepoint can resolve to an arbitrary operator cwd — including `qontinui-claude-config`, which
     // TRACKS 124 paths under `.claude/` and is the upstream these bundled
     // bodies were copied from. Provisioning there would overwrite the
     // canonical hand-authored sources with the binary's (older) snapshot,
@@ -1181,61 +1190,42 @@ pub(crate) fn provision_session_cwd(
 
 /// The guarded fleet commands + skills provisioning for one session cwd.
 ///
-/// Where the cwd's `.claude/` is repo-authored the skip is RECORDED, not only
-/// logged: one [`crate::capability_manifest::ProvisionReport`] per provisioner
-/// with every bundled unit skipped as [`SkipReason::RepoAuthored`], so the
-/// ledger — and the `[provisioned: …]` token of the session's served-corpus
+/// Where the cwd's `.claude/` is repo-authored, or the probe that would say so
+/// did not answer, the skip is RECORDED, not only logged: one
+/// [`crate::capability_manifest::ProvisionReport`] per provisioner with every
+/// bundled unit skipped as [`SkipReason::RepoAuthored`] or
+/// [`SkipReason::TreeProbeUnanswered`] (two different facts, two labels), so
+/// the ledger — and the `[provisioned: …]` token of the session's served-corpus
 /// header line — say the session got none of them and why.
 ///
 /// [`SkipReason::RepoAuthored`]: crate::capability_manifest::SkipReason::RepoAuthored
+/// [`SkipReason::TreeProbeUnanswered`]: crate::capability_manifest::SkipReason::TreeProbeUnanswered
 fn provision_fleet_for_cwd(wd: &str) {
-    if claude_tree_is_repo_authored(wd) {
-        info!(
-            workdir = %wd,
-            "fleet provisioning: skipped — this cwd's .claude/ is git-tracked, so the repo \
-             authors its own skills/commands and the bundle must not clobber them"
-        );
-        record_repo_authored_skip(wd);
-    } else {
-        crate::fleet_commands::provision_fleet_commands_for_session(wd);
-        crate::fleet_skills::provision_fleet_skills_for_session(wd);
+    let verdict = claude_tree_is_repo_authored(wd);
+    match verdict.skip_reason() {
+        Some(reason) => {
+            info!(
+                workdir = %wd,
+                reason = reason.wire(),
+                "fleet provisioning: skipped — {}; the bundle must not clobber a tree it \
+                 cannot prove is its own",
+                reason.describe()
+            );
+            record_whole_tree_skip(wd, &reason);
+        }
+        None => {
+            crate::fleet_commands::provision_fleet_commands_for_session(wd);
+            crate::fleet_skills::provision_fleet_skills_for_session(wd);
+        }
     }
 }
 
-/// Record the repo-authored skip against `wd` for both provisioners.
-///
-/// The roster is the EMBEDDED bundle — every `FLEET_COMMANDS` entry and every
-/// embedded skill file — not the account-resolved registry: resolving that
-/// would fetch overrides for a pass that writes nothing.
-fn record_repo_authored_skip(wd: &str) {
-    use crate::capability_manifest::{record_provision, ProvisionReport, Rung, SkipReason};
-
-    let commands_dir = Path::new(wd).join(".claude").join("commands");
-    let mut commands = ProvisionReport::new(
-        "fleet_commands",
-        crate::fleet_commands::FLEET_COMMANDS.len(),
-        Rung::Unresolved,
-    )
-    .with_destination(commands_dir.display().to_string());
-    for (name, _) in crate::fleet_commands::FLEET_COMMANDS {
-        commands.skip(format!("{name}.md"), SkipReason::RepoAuthored);
-    }
-    record_provision(wd, commands);
-
-    let skills_dir = Path::new(wd).join(".claude").join("skills");
-    let embedded = crate::fleet_skills::embedded_skills();
-    let mut skills = ProvisionReport::new(
-        "fleet_skills",
-        embedded.iter().map(|s| s.files.len()).sum(),
-        Rung::Unresolved,
-    )
-    .with_destination(skills_dir.display().to_string());
-    for skill in &embedded {
-        for rel in skill.files.keys() {
-            skills.skip(format!("{}/{rel}", skill.name), SkipReason::RepoAuthored);
-        }
-    }
-    record_provision(wd, skills);
+/// Record the whole-tree skip against `wd` for both provisioners, each bundled
+/// unit with `reason`. The rosters are the EMBEDDED bundle — see
+/// [`crate::fleet_commands::record_whole_pass_skip`].
+fn record_whole_tree_skip(wd: &str, reason: &crate::capability_manifest::SkipReason) {
+    crate::fleet_commands::record_whole_pass_skip(wd, reason);
+    crate::fleet_skills::record_whole_pass_skip(wd, reason);
 }
 
 /// What [`acquire_for_terminal`] does with the cwd `.mcp.json` for one spawn.
@@ -1283,19 +1273,27 @@ const CLAUDE_TREE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from
 /// `provision_coord_mcp_for_session` call spent a plan acquiring, applied to
 /// the artifact family that needs it for the same reason.
 ///
-/// TRUE means "this repo authors these files; leave them alone". Only a clean
-/// `git ls-files -- .claude` that actually names a path counts: a non-repo cwd
-/// (exit 128), an absent `.claude/`, or no `git` on PATH all yield FALSE, which
-/// is the provisioning arm — correctly, since none of those can have a tracked
-/// file to destroy.
+/// [`ClaudeTreeVerdict::Authored`] means "this repo authors these files; leave
+/// them alone". Only a clean `git ls-files -- .claude` that actually names a
+/// path counts: a non-repo cwd (exit 128), an absent `.claude/`, or no `git` on
+/// PATH all yield [`ClaudeTreeVerdict::NotAuthored`], which is the provisioning
+/// arm — correct for a cwd whose `.claude` is a real directory, since none of
+/// those can have a tracked file to destroy. It is NOT correct for a non-repo
+/// cwd whose `.claude` is a SYMLINK into a repository (the workspace root):
+/// git run at the cwd sees no repository, and the tracked files are on the far
+/// side of the link. This predicate is unchanged there, and answering
+/// `NotAuthored` is safe only because the provisioners stand down on a
+/// symlinked `.claude` themselves (`provision_guard::stand_down`).
 ///
 /// A TIMEOUT is the one failure that does NOT join them, and it is deliberately
-/// the other way. FALSE is the DESTRUCTIVE arm here — it provisions, which
-/// overwrites — so a `git` that hangs is an UNKNOWN that must not be rendered as
-/// the confident "nothing here to destroy" that the three arms above have
-/// actually established. It yields TRUE: skip provisioning this pass, leave the
-/// tree alone, and let the next pass decide once `git` answers. Skipping a
-/// provision is recoverable; clobbering a repo-authored `.claude` is not.
+/// the other way. `NotAuthored` is the DESTRUCTIVE arm here — it provisions,
+/// which overwrites — so a `git` that hangs is an UNKNOWN that must not be
+/// rendered as the confident "nothing here to destroy" that the three arms above
+/// have actually established. It yields [`ClaudeTreeVerdict::ProbeUnanswered`]:
+/// skip provisioning this pass, leave the tree alone, and let the next pass
+/// decide once `git` answers. Skipping a provision is recoverable; clobbering a
+/// repo-authored `.claude` is not. It is a different fact from `Authored`, so it
+/// is recorded under its own label (`tree_probe_unanswered`).
 ///
 /// # Why the probe is bounded, and why a TIMEOUT does not answer FALSE
 ///
@@ -1307,18 +1305,19 @@ const CLAUDE_TREE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from
 /// cwd exits 128 as a ROUTINE answer here; WARNing on every such cwd would
 /// bury the timeout WARN that actually matters.
 ///
-/// The degrade arms are NOT uniform, and that is the point. The FALSE above is
+/// The degrade arms are NOT uniform, and that is the point. The `NotAuthored` above is
 /// justified by "none of those can have a tracked file to destroy" — it is
 /// evidence of ABSENCE. [`DegradeReason::TimedOut`] and
 /// [`DegradeReason::Truncated`] are not: they are evidence of NOTHING (the
-/// `Truncated` variant says so in its own docs), so answering FALSE would
-/// extend that justification past its warrant and hand the provisioning arm a
-/// clearance it never earned — over the one artifact family this guard exists
-/// to keep from being clobbered. They answer TRUE: skip provisioning, leave
-/// the tree alone. `Status` and `SpawnError` keep FALSE, so the behaviour of
-/// every case reachable before this change is unchanged.
+/// `Truncated` variant says so in its own docs), so answering `NotAuthored`
+/// would extend that justification past its warrant and hand the provisioning
+/// arm a clearance it never earned — over the one artifact family this guard
+/// exists to keep from being clobbered. They answer `ProbeUnanswered`: skip
+/// provisioning, leave the tree alone. `Status` and `SpawnError` keep
+/// `NotAuthored`, so the behaviour of every case reachable before this change
+/// is unchanged.
 ///
-/// Resource exhaustion joins the TRUE side too (plan
+/// Resource exhaustion joins the `ProbeUnanswered` side too (plan
 /// `2026-09-23-resource-guard-floors-are-constants-and-the-runners-own-git-spawns-are-ungated`
 /// Phase 0): [`DegradeReason::CommitExhaustionSuspected`] used to arrive here as
 /// `Status`, but it is not git's answer — git never listed anything, its own
@@ -1327,11 +1326,11 @@ const CLAUDE_TREE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from
 /// `EAGAIN`, …) says the MACHINE could not start git, not that git is absent.
 /// Both are evidence of nothing, so both withhold the clearance. A `SpawnError`
 /// with no exhaustion classification (git not installed) keeps FALSE.
-fn claude_tree_is_repo_authored(workdir: &str) -> bool {
+fn claude_tree_is_repo_authored(workdir: &str) -> ClaudeTreeVerdict {
     use crate::process_helpers::run_probe_quiet;
 
     if !Path::new(workdir).join(".claude").is_dir() {
-        return false;
+        return ClaudeTreeVerdict::NotAuthored;
     }
     let mut cmd = crate::process_helpers::no_window("git");
     cmd.args(["-C", workdir, "ls-files", "--", ".claude"]);
@@ -1345,16 +1344,45 @@ fn claude_tree_is_repo_authored(workdir: &str) -> bool {
     )
 }
 
+/// What the session-level `.claude` probe established. Three values, because
+/// "the repository tracks it" and "the probe could not say" are different facts
+/// with different labels in the provisioning ledger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaudeTreeVerdict {
+    /// `git ls-files -- .claude` named a tracked path: the repo authors it.
+    Authored,
+    /// The probe did not answer (timeout, truncation, or a resource-exhausted
+    /// spawn): evidence of nothing.
+    ProbeUnanswered,
+    /// Evidence of absence: no `.claude/`, a non-repo cwd, an empty listing, or
+    /// no `git` installed.
+    NotAuthored,
+}
+
+impl ClaudeTreeVerdict {
+    /// The whole-pass skip reason this verdict records, or `None` when the
+    /// provisioners may run.
+    fn skip_reason(self) -> Option<crate::capability_manifest::SkipReason> {
+        use crate::capability_manifest::SkipReason;
+        match self {
+            ClaudeTreeVerdict::Authored => Some(SkipReason::RepoAuthored),
+            ClaudeTreeVerdict::ProbeUnanswered => Some(SkipReason::TreeProbeUnanswered),
+            ClaudeTreeVerdict::NotAuthored => None,
+        }
+    }
+}
+
 /// The verdict half of [`claude_tree_is_repo_authored`], split out so every
 /// degrade arm is settleable in a test without a git that fails on demand.
 fn repo_authored_from_outcome(
     workdir: &str,
     outcome: crate::process_helpers::ProbeOutcome,
-) -> bool {
+) -> ClaudeTreeVerdict {
     use crate::process_helpers::{DegradeReason, ProbeOutcome};
 
     match outcome {
-        ProbeOutcome::Captured(stdout) => !stdout.is_empty(),
+        ProbeOutcome::Captured(stdout) if stdout.is_empty() => ClaudeTreeVerdict::NotAuthored,
+        ProbeOutcome::Captured(_) => ClaudeTreeVerdict::Authored,
         // The machine could not start git (or git could not start its own
         // child) for want of a resource — evidence of nothing. Withhold.
         ProbeOutcome::Degraded(DegradeReason::SpawnError(f)) if f.exhaustion.is_some() => {
@@ -1364,9 +1392,9 @@ fn repo_authored_from_outcome(
                 os_code = ?f.os_code,
                 "fleet provisioning: git could not be started for the .claude tracked-file \
                  probe because this machine is out of a resource; cannot prove .claude is \
-                 untracked, so treating the tree as repo-authored and skipping provisioning"
+                 untracked, so skipping provisioning rather than risk clobbering tracked files"
             );
-            true
+            ClaudeTreeVerdict::ProbeUnanswered
         }
         ProbeOutcome::Degraded(DegradeReason::CommitExhaustionSuspected { os_code }) => {
             warn!(
@@ -1374,23 +1402,23 @@ fn repo_authored_from_outcome(
                 os_code,
                 "fleet provisioning: the .claude tracked-file probe failed because git's own \
                  child launch hit commit exhaustion (suspected); cannot prove .claude is \
-                 untracked, so treating the tree as repo-authored and skipping provisioning"
+                 untracked, so skipping provisioning rather than risk clobbering tracked files"
             );
-            true
+            ClaudeTreeVerdict::ProbeUnanswered
         }
         // Evidence of absence — keep the provisioning arm.
         ProbeOutcome::Degraded(DegradeReason::Status)
-        | ProbeOutcome::Degraded(DegradeReason::SpawnError(_)) => false,
+        | ProbeOutcome::Degraded(DegradeReason::SpawnError(_)) => ClaudeTreeVerdict::NotAuthored,
         // Evidence of nothing — withhold the clearance.
         ProbeOutcome::Degraded(DegradeReason::TimedOut { .. })
         | ProbeOutcome::Degraded(DegradeReason::Truncated(_)) => {
             warn!(
                 workdir = %workdir,
                 "fleet provisioning: the .claude tracked-file probe did not answer inside \
-                 its budget; treating the tree as repo-authored and skipping \
-                 provisioning rather than risk clobbering tracked files"
+                 its budget; skipping provisioning rather than risk clobbering \
+                 tracked files"
             );
-            true
+            ClaudeTreeVerdict::ProbeUnanswered
         }
     }
 }
@@ -1552,8 +1580,9 @@ mod tests {
         git(root, &["add", ".claude"]);
         git(root, &["commit", "-qm", "track .claude"]);
 
-        assert!(
+        assert_eq!(
             claude_tree_is_repo_authored(root.to_str().unwrap()),
+            ClaudeTreeVerdict::Authored,
             "a repo that tracks .claude/ must be left alone"
         );
     }
@@ -1573,26 +1602,80 @@ mod tests {
             os_code: Some(1455),
             exhaustion: Some(ExhaustionKind::Commit),
         };
-        assert!(repo_authored_from_outcome(
-            "wd",
-            ProbeOutcome::Degraded(DegradeReason::SpawnError(exhausted))
-        ));
-        assert!(repo_authored_from_outcome(
-            "wd",
-            ProbeOutcome::Degraded(DegradeReason::CommitExhaustionSuspected { os_code: 1455 })
-        ));
+        assert_eq!(
+            repo_authored_from_outcome(
+                "wd",
+                ProbeOutcome::Degraded(DegradeReason::SpawnError(exhausted))
+            ),
+            ClaudeTreeVerdict::ProbeUnanswered
+        );
+        assert_eq!(
+            repo_authored_from_outcome(
+                "wd",
+                ProbeOutcome::Degraded(DegradeReason::CommitExhaustionSuspected { os_code: 1455 })
+            ),
+            ClaudeTreeVerdict::ProbeUnanswered
+        );
         let not_installed = SpawnFailure {
             os_code: Some(2),
             exhaustion: None,
         };
-        assert!(!repo_authored_from_outcome(
+        assert_eq!(
+            repo_authored_from_outcome(
+                "wd",
+                ProbeOutcome::Degraded(DegradeReason::SpawnError(not_installed))
+            ),
+            ClaudeTreeVerdict::NotAuthored
+        );
+        assert_eq!(
+            repo_authored_from_outcome("wd", ProbeOutcome::Degraded(DegradeReason::Status)),
+            ClaudeTreeVerdict::NotAuthored
+        );
+    }
+
+    /// T8 — one referent per label. A session-level probe that did not answer
+    /// (a timeout here) is recorded as `tree_probe_unanswered`, never as
+    /// `repo_authored` (the repository tracks `.claude/`) and never as
+    /// `probe_unknown_in_repo` (an EXISTING destination kept while absent ones
+    /// are still written, which a whole-pass skip is not).
+    #[test]
+    fn an_unanswered_session_probe_is_recorded_as_tree_probe_unanswered() {
+        use crate::process_helpers::{DegradeReason, ProbeOutcome};
+
+        let verdict = repo_authored_from_outcome(
             "wd",
-            ProbeOutcome::Degraded(DegradeReason::SpawnError(not_installed))
-        ));
-        assert!(!repo_authored_from_outcome(
-            "wd",
-            ProbeOutcome::Degraded(DegradeReason::Status)
-        ));
+            ProbeOutcome::Degraded(DegradeReason::TimedOut {
+                pid: 1,
+                reaped: true,
+            }),
+        );
+        assert_eq!(verdict, ClaudeTreeVerdict::ProbeUnanswered);
+        let reason = verdict.skip_reason().expect("an unanswered probe skips");
+        assert_eq!(reason.wire(), "tree_probe_unanswered");
+        assert_ne!(reason.wire(), "repo_authored");
+        assert_ne!(reason.wire(), "probe_unknown_in_repo");
+        // The tracked verdict keeps its own label.
+        assert_eq!(
+            ClaudeTreeVerdict::Authored.skip_reason().map(|r| r.wire()),
+            Some("repo_authored")
+        );
+        assert!(ClaudeTreeVerdict::NotAuthored.skip_reason().is_none());
+
+        // And it is RECORDED under that label, for every bundled unit.
+        let td = tempfile::tempdir().expect("tempdir");
+        let wd = td.path().to_str().unwrap();
+        record_whole_tree_skip(wd, &reason);
+        let ledger = crate::capability_manifest::session_provision_ledger(wd)
+            .expect("the skip is recorded against this workdir");
+        assert_eq!(ledger.reports.len(), 2, "one pass per provisioner");
+        for report in &ledger.reports {
+            assert_eq!(report.written, 0);
+            assert_eq!(report.skipped.len(), report.expected);
+            assert!(report
+                .skipped
+                .iter()
+                .all(|u| u.reason.wire() == "tree_probe_unanswered"));
+        }
     }
 
     /// The repo-authored skip is recorded in the ledger — every bundled unit,
@@ -1658,15 +1741,19 @@ mod tests {
         let td = tempfile::tempdir().expect("tempdir");
         let root = td.path();
         // (a) no .claude/ at all, not even a repo
-        assert!(!claude_tree_is_repo_authored(root.to_str().unwrap()));
+        assert_eq!(
+            claude_tree_is_repo_authored(root.to_str().unwrap()),
+            ClaudeTreeVerdict::NotAuthored
+        );
 
         // (b) a repo whose .claude/ exists but is untracked — ours from a prior
         //     provision, so a refresh on runner upgrade is correct.
         git(root, &["init", "-q"]);
         std::fs::create_dir_all(root.join(".claude/skills")).unwrap();
         std::fs::write(root.join(".claude/skills/x.md"), b"ours").unwrap();
-        assert!(
-            !claude_tree_is_repo_authored(root.to_str().unwrap()),
+        assert_eq!(
+            claude_tree_is_repo_authored(root.to_str().unwrap()),
+            ClaudeTreeVerdict::NotAuthored,
             "an untracked .claude/ is the runner's own and may be refreshed"
         );
     }
@@ -1686,10 +1773,88 @@ mod tests {
         let root = td.path();
         std::fs::create_dir_all(root.join(".claude/skills")).unwrap();
         std::fs::write(root.join(".claude/skills/x.md"), b"ours").unwrap();
-        assert!(
-            !claude_tree_is_repo_authored(root.to_str().unwrap()),
-            "a non-repo cwd cannot have a tracked file to destroy, so provisioning is correct"
+        assert_eq!(
+            claude_tree_is_repo_authored(root.to_str().unwrap()),
+            ClaudeTreeVerdict::NotAuthored,
+            "a non-repo cwd whose .claude is a real directory cannot have a tracked file \
+             to destroy, so provisioning is correct"
         );
+    }
+
+    /// The workspace-root shape: a non-repo cwd whose `.claude` is a link into a
+    /// repository that tracks the bundle. The predicate answers `NotAuthored`
+    /// there and CANNOT do otherwise (git at the cwd sees no repository), so
+    /// that answer is safe ONLY because the provisioners stand down on a
+    /// symlinked `.claude`. This drives the whole chokepoint and asserts zero
+    /// writes and a `symlinked` stand-down for each capability.
+    #[test]
+    fn a_non_repo_cwd_whose_claude_is_a_symlink_into_a_repo_is_not_provisioned() {
+        use crate::provision_guard::test_support::{assert_not_in_any_repo, link_dir};
+
+        let td = tempfile::tempdir().expect("tempdir");
+        let repo = td.path().join("repo");
+        let tracked_commands = repo.join(".claude/commands");
+        let tracked_skill = repo.join(".claude/skills/page-health");
+        std::fs::create_dir_all(&tracked_commands).unwrap();
+        std::fs::create_dir_all(&tracked_skill).unwrap();
+        std::fs::write(tracked_commands.join("policy.md"), b"canonical command").unwrap();
+        std::fs::write(tracked_skill.join("SKILL.md"), b"canonical skill").unwrap();
+        git(&repo, &["init", "-q"]);
+        git(&repo, &["config", "user.email", "t@t"]);
+        git(&repo, &["config", "user.name", "t"]);
+        git(&repo, &["config", "commit.gpgsign", "false"]);
+        git(&repo, &["add", ".claude"]);
+        git(&repo, &["commit", "-qm", "track .claude"]);
+
+        let ws = td.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        assert_not_in_any_repo(&ws);
+        link_dir(&ws.join(".claude"), &repo.join(".claude"));
+        let wd = ws.to_str().unwrap();
+
+        assert_eq!(
+            claude_tree_is_repo_authored(wd),
+            ClaudeTreeVerdict::NotAuthored,
+            "git at a non-repo cwd sees nothing: the predicate cannot catch this cwd"
+        );
+        let before = std::fs::read_dir(&tracked_commands).unwrap().count();
+
+        provision_fleet_for_cwd(wd);
+
+        assert_eq!(
+            std::fs::read(tracked_commands.join("policy.md")).unwrap(),
+            b"canonical command"
+        );
+        assert_eq!(
+            std::fs::read(tracked_skill.join("SKILL.md")).unwrap(),
+            b"canonical skill"
+        );
+        assert_eq!(
+            std::fs::read_dir(&tracked_commands).unwrap().count(),
+            before,
+            "no command was created behind the link"
+        );
+        assert!(!repo.join(".claude/skills/coord-revive").exists());
+        let ledger = crate::capability_manifest::session_provision_ledger(wd)
+            .expect("the stand-down is recorded against this workdir");
+        for capability in ["fleet_commands", "fleet_skills"] {
+            let report = ledger
+                .reports
+                .iter()
+                .find(|r| r.capability == capability)
+                .unwrap_or_else(|| panic!("a {capability} report"));
+            assert_eq!(report.written, 0, "{capability} wrote through the link");
+            assert!(report.expected > 0);
+            assert_eq!(report.skipped.len(), report.expected);
+            assert!(
+                report
+                    .skipped
+                    .iter()
+                    .all(|u| u.reason.wire() == "symlinked"),
+                "{capability}: {:?}",
+                report.skipped.first()
+            );
+        }
     }
 
     /// Build a `(MaterializedWorktree, worktree-kind ActiveClaim)` pair for a

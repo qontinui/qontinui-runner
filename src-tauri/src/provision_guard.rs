@@ -19,7 +19,34 @@
 //! EXCEPT an absent, untracked path in a checkout that versions the provisioned
 //! tree (see "A checkout that versions the provisioned tree" below).
 //! Unknown ⇒ write, too — EXCEPT inside a repository (see "UNKNOWN inside a
-//! repository" below).
+//! repository" below). And before any of that, **a pass stands down** where its
+//! destination is the canonical source or sits behind a symlink (see "Standing
+//! down" below): nothing is probed, fetched or written there.
+//!
+//! ## Standing down: the destination that must never be written
+//!
+//! The probe cannot protect a destination it cannot see through. A session
+//! spawned at the WORKSPACE ROOT (a gate continuation whose worktree acquire
+//! failed, the scheduler's remote agent, an operator tab) has a `.claude` that
+//! is a symlink into the served `qontinui-claude-config` checkout, whose tracked
+//! files ARE the bundle's source. Writing there, even file by file behind the
+//! probe, overwrote them whenever the probe failed soft — a timeout reads as
+//! "nothing tracked" (measured 2026-10-27: 67 passes, 74 tracked files).
+//! [`stand_down`] decides this from filesystem metadata alone, with no git
+//! probe, so the failure that starves the probe cannot also unguard the write:
+//!
+//! - the kind's directory is reached through a symlink or a junction
+//!   ([`redirected_asset_dir`]) → [`SkipReason::Symlinked`];
+//! - the cwd's `.claude` resolves into `<workspace root>/qontinui-claude-config/
+//!   .claude` ([`destination_is_source`]) → [`SkipReason::CanonicalSource`].
+//!
+//! Each provisioner calls it as its FIRST statement and, when it names a
+//! reason, writes nothing and records one skip per bundled unit. Separately,
+//! both write loops skip any single destination file that [`symlink_below`]
+//! names, so a per-file link into a canonical checkout is never written
+//! through either. A fresh agent worktree has neither, so it is unaffected.
+//! The cost, stated: a session at the workspace root gets no bundled unit the
+//! served tree lacks.
 //!
 //! ## A checkout that versions the provisioned tree: do not create new paths
 //!
@@ -154,7 +181,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-use crate::capability_manifest::SkipReason;
+use crate::capability_manifest::{SkipReason, TrackedProbeState};
 
 /// Wall-clock bound on the one `git ls-files` the probe runs. Generous relative
 /// to a local index read (milliseconds), tight relative to a spawn the operator
@@ -221,6 +248,10 @@ pub(crate) struct TrackedPaths {
     /// EXISTING destination is skipped — see the module doc's "UNKNOWN inside a
     /// repository" section.
     unknown_in_repo: bool,
+    /// What the probe did, for the provisioning ledger.
+    /// [`TrackedProbeState::NotRun`] (the default) until [`Self::probe`]
+    /// actually spawns git.
+    state: TrackedProbeState,
     /// Set by [`Self::versioning`]: the probe answered and the repository
     /// tracks at least one path the BUNDLE carries under the probed root — it
     /// versions the provisioned tree itself. False until a provisioner asks.
@@ -263,6 +294,7 @@ impl TrackedPaths {
         Self {
             relative,
             unknown_in_repo: false,
+            state: TrackedProbeState::Answered,
             root_versioned: false,
             roster: HashSet::new(),
         }
@@ -292,9 +324,22 @@ impl TrackedPaths {
         Self {
             relative: HashSet::new(),
             unknown_in_repo,
+            state: if unknown_in_repo {
+                TrackedProbeState::UnansweredInRepo
+            } else {
+                TrackedProbeState::UnansweredOutsideRepo
+            },
             root_versioned: false,
             roster: HashSet::new(),
         }
+    }
+
+    /// What the probe did, for the provisioning ledger
+    /// ([`ProvisionReport::probe`]).
+    ///
+    /// [`ProvisionReport::probe`]: crate::capability_manifest::ProvisionReport::probe
+    pub(crate) fn probe_state(&self) -> TrackedProbeState {
+        self.state
     }
 
     /// True iff the probe could not answer for a root inside a repository.
@@ -423,6 +468,107 @@ impl KeepDecisions {
     pub(crate) fn reason(&self, name: &str) -> Option<&SkipReason> {
         self.reasons.get(name)
     }
+}
+
+/// Why a provisioner must STAND DOWN for the asset kind `kind` (`"commands"` or
+/// `"skills"`) under `claude_dir` (the session cwd's `.claude`), or `None` when
+/// it may proceed to the probe-guarded write.
+///
+/// Decided from filesystem metadata alone — no git probe, no registry fetch, no
+/// directory creation — so a pass that stands down costs nothing and cannot be
+/// defeated by the starvation that breaks the probe. In order:
+///
+/// 1. `<claude_dir>/<kind>` reached through a symlink or junction
+///    ([`redirected_asset_dir`]) → [`SkipReason::Symlinked`];
+/// 2. when `root` is `Some`, `claude_dir` resolving into
+///    `<root>/qontinui-claude-config/.claude` ([`destination_is_source`]) →
+///    [`SkipReason::CanonicalSource`]. A `None` root (no workspace root
+///    resolved) fails open to the symlink arm only.
+///
+/// Pure with respect to the process: `root` is an argument, so a test injects
+/// one.
+pub(crate) fn stand_down(claude_dir: &Path, kind: &str, root: Option<&Path>) -> Option<SkipReason> {
+    if let Some(why) = redirected_asset_dir(&claude_dir.join(kind)) {
+        return Some(SkipReason::Symlinked(why));
+    }
+    let root = root?;
+    let source = root.join("qontinui-claude-config").join(".claude");
+    destination_is_source(claude_dir, &source).map(SkipReason::CanonicalSource)
+}
+
+/// `Some(why)` when `dst` resolves to `src` or to a path inside it, following
+/// symlinks — the destination IS the canonical source a provisioner would copy
+/// from, so writing there overwrites the source. Either side may not exist yet,
+/// so each is resolved through its nearest existing ancestor
+/// ([`canonicalize_through_ancestors`]). `None` — "not the same tree" — also
+/// when either side cannot be resolved at all, which on a real filesystem means
+/// neither exists and there is nothing of the source's to overwrite.
+///
+/// Ported from qontinui-runner#1765.
+pub(crate) fn destination_is_source(dst: &Path, src: &Path) -> Option<String> {
+    let dst_real = canonicalize_through_ancestors(dst)?;
+    let src_real = canonicalize_through_ancestors(src)?;
+    dst_real.starts_with(&src_real).then(|| {
+        format!(
+            "{} resolves to {}, which is the source {} it would be copied from",
+            dst.display(),
+            dst_real.display(),
+            src_real.display()
+        )
+    })
+}
+
+/// `std::fs::canonicalize` for a path that may not exist yet: canonicalize its
+/// nearest existing ancestor and re-append the missing tail. `None` when no
+/// ancestor resolves, or the tail holds a component with no file name (`..`).
+fn canonicalize_through_ancestors(path: &Path) -> Option<PathBuf> {
+    let mut tail = Vec::new();
+    let mut current = path;
+    loop {
+        if let Ok(real) = std::fs::canonicalize(current) {
+            return Some(tail.iter().rev().fold(real, |acc, part| acc.join(part)));
+        }
+        tail.push(current.file_name()?.to_os_string());
+        current = current.parent()?;
+    }
+}
+
+/// `Some(why)` when writing `path` would pass through a symlink below `base`:
+/// some EXISTING component of `path` strictly below `base` — `path` itself
+/// included — is a symlink (a Windows junction reads as one to
+/// `symlink_metadata`), so the write would land somewhere other than its lexical
+/// destination. `base` itself is not examined. A component that does not exist
+/// ends the walk: nothing below it can be a symlink yet.
+///
+/// The rule every session-asset provisioner applies, independent of any
+/// workspace root: never write through a symlink. A per-file symlink into a
+/// canonical checkout is invisible to [`TrackedPaths`], which asks the SESSION
+/// repo, and `std::fs::write` onto a file's own target truncates it.
+pub(crate) fn symlink_below(base: &Path, path: &Path) -> Option<String> {
+    let relative = path.strip_prefix(base).ok()?;
+    let mut current = base.to_path_buf();
+    for component in relative.components() {
+        current.push(component);
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                let target = std::fs::read_link(&current)
+                    .map(|t| format!(" -> {}", t.display()))
+                    .unwrap_or_default();
+                return Some(format!("{}{target} is a symlink", current.display()));
+            }
+            Ok(_) => {}
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+/// [`symlink_below`] for a whole asset kind: `dir` is `<cwd>/.claude/<kind>`,
+/// and both `.claude` and `<kind>` are examined. `Some(why)` means the kind
+/// stands down — even `create_dir_all` would build inside the link's target.
+pub(crate) fn redirected_asset_dir(dir: &Path) -> Option<String> {
+    let cwd = dir.parent()?.parent()?;
+    symlink_below(cwd, dir)
 }
 
 /// True iff `root` or any ancestor carries a `.git` entry (a directory in a
@@ -559,7 +705,7 @@ pub(crate) mod test_support {
     //! modules that consume the guard, so they do not each re-spell `git init` +
     //! `git add`.
 
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::process::Stdio;
 
     /// Initialise a real repo in `dir` (quiet, no global config dependence).
@@ -604,6 +750,128 @@ pub(crate) mod test_support {
         assert!(ok, "git add should succeed");
     }
 
+    /// Make `link` a directory link to `target`: a symlink, falling back on
+    /// Windows to a junction (`mklink /J`) where symlink creation needs a
+    /// privilege the account lacks. PANICS when neither can be built, so a
+    /// fixture that cannot exist fails the job rather than passing as a skip.
+    pub(crate) fn link_dir(link: &Path, target: &Path) {
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink(target, link);
+        #[cfg(windows)]
+        let made = std::os::windows::fs::symlink_dir(target, link).or_else(|symlink_err| {
+            // Same shape as `orphan_target_reaper`'s `mklink_junction`.
+            let junction = Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            if junction {
+                Ok(())
+            } else {
+                Err(symlink_err)
+            }
+        });
+        made.unwrap_or_else(|e| {
+            panic!(
+                "cannot build the directory-link fixture {} -> {} (symlink and, on Windows, \
+                 junction both failed): {e}",
+                link.display(),
+                target.display()
+            )
+        });
+    }
+
+    /// Make `link` a Windows junction to `target` (`mklink /J`), with no
+    /// symlink attempt, so a test can pin that a junction reads as a link.
+    /// PANICS when it cannot be built.
+    #[cfg(windows)]
+    pub(crate) fn link_junction(link: &Path, target: &Path) {
+        let ok = Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        assert!(
+            ok,
+            "cannot build the junction fixture {} -> {}",
+            link.display(),
+            target.display()
+        );
+    }
+
+    /// The workspace-root shape: `<tmp>/repo` is a repository (a real one when
+    /// `probe_answers`, else a `.git` FILE naming a missing gitdir, which makes
+    /// every `git ls-files` fail while the filesystem still sees a repository),
+    /// and `<tmp>/ws` is a NON-repo directory whose `.claude` is a directory
+    /// link ([`link_dir`]) into `<tmp>/repo/.claude`. Returns `(ws, repo)`.
+    pub(crate) fn linked_workspace(tmp: &Path, probe_answers: bool) -> (PathBuf, PathBuf) {
+        let repo = tmp.join("repo");
+        std::fs::create_dir_all(repo.join(".claude")).unwrap();
+        if probe_answers {
+            git_init(&repo);
+        } else {
+            std::fs::write(
+                repo.join(".git"),
+                b"gitdir: /nonexistent/qontinui-provision-guard-linked-workspace\n",
+            )
+            .unwrap();
+        }
+        let ws = tmp.join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        assert_not_in_any_repo(&ws);
+        link_dir(&ws.join(".claude"), &repo.join(".claude"));
+        (ws, repo)
+    }
+
+    /// Every file under `dir` (recursively, links NOT followed) with its bytes
+    /// and mtime, so a test can prove a pass changed nothing: not a byte, not a
+    /// timestamp, and no new path.
+    pub(crate) fn snapshot(
+        dir: &Path,
+    ) -> std::collections::BTreeMap<PathBuf, (Vec<u8>, std::time::SystemTime)> {
+        fn walk(
+            dir: &Path,
+            out: &mut std::collections::BTreeMap<PathBuf, (Vec<u8>, std::time::SystemTime)>,
+        ) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                let meta = std::fs::symlink_metadata(&path).unwrap();
+                if meta.is_dir() {
+                    walk(&path, out);
+                } else {
+                    out.insert(
+                        path.clone(),
+                        (std::fs::read(&path).unwrap(), meta.modified().unwrap()),
+                    );
+                }
+            }
+        }
+        let mut out = std::collections::BTreeMap::new();
+        walk(dir, &mut out);
+        out
+    }
+
+    /// Make `link` a file symlink to `target`. PANICS when it cannot be built
+    /// (a Windows account without the symlink privilege has no junction
+    /// fallback for a FILE), so the job fails rather than skipping.
+    pub(crate) fn link_file(link: &Path, target: &Path) {
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink(target, link);
+        #[cfg(windows)]
+        let made = std::os::windows::fs::symlink_file(target, link);
+        made.unwrap_or_else(|e| {
+            panic!(
+                "cannot build the file-symlink fixture {} -> {}: {e}",
+                link.display(),
+                target.display()
+            )
+        });
+    }
+
     /// Assert `dir` is not inside ANY git repository.
     ///
     /// Guards the one test that means to exercise the "not a repository" arm:
@@ -634,7 +902,9 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::{assert_not_in_any_repo, git_add, git_init};
+    use super::test_support::{
+        assert_not_in_any_repo, git_add, git_init, link_dir, link_file, linked_workspace,
+    };
     use super::*;
 
     #[test]
@@ -798,6 +1068,140 @@ mod tests {
             Some(SkipReason::ProbeUnknownInRepo),
             "the checkout's existing file must be kept, not overwritten"
         );
+    }
+
+    /// What the probe did is a value the ledger can carry: answered, unanswered
+    /// in a repository, unanswered outside one, and never run.
+    #[test]
+    fn the_probe_state_names_what_the_probe_did() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        assert_not_in_any_repo(tmp.path());
+
+        // never run: the default, and a root that is not a directory.
+        assert_eq!(
+            TrackedPaths::default().probe_state(),
+            TrackedProbeState::NotRun
+        );
+        assert_eq!(
+            TrackedPaths::probe(&tmp.path().join("absent")).probe_state(),
+            TrackedProbeState::NotRun
+        );
+
+        // unanswered outside any repository.
+        let plain = tmp.path().join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        assert_eq!(
+            TrackedPaths::probe(&plain).probe_state(),
+            TrackedProbeState::UnansweredOutsideRepo
+        );
+
+        // unanswered inside one (a `.git` file naming a missing gitdir).
+        let broken = tmp.path().join("broken");
+        std::fs::create_dir_all(&broken).unwrap();
+        std::fs::write(
+            broken.join(".git"),
+            b"gitdir: /nonexistent/qontinui-provision-guard-state-test\n",
+        )
+        .unwrap();
+        assert_eq!(
+            TrackedPaths::probe(&broken).probe_state(),
+            TrackedProbeState::UnansweredInRepo
+        );
+
+        // answered.
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        git_init(&real);
+        assert_eq!(
+            TrackedPaths::probe(&real).probe_state(),
+            TrackedProbeState::Answered
+        );
+    }
+
+    /// The stand-down decides from the filesystem alone: a symlinked kind is
+    /// `Symlinked`, a `.claude` resolving into the canonical checkout is
+    /// `CanonicalSource`, and a fresh worktree (neither) proceeds.
+    #[test]
+    fn stand_down_names_a_symlinked_kind_the_canonical_source_and_nothing_else() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("root");
+
+        // symlinked: the workspace-root shape, whatever the root says.
+        let (ws, _repo) = linked_workspace(&tmp.path().join("a"), false);
+        let reason = stand_down(&ws.join(".claude"), "commands", None)
+            .expect("a symlinked .claude stands down");
+        assert_eq!(reason.wire(), "symlinked");
+        assert_eq!(
+            stand_down(&ws.join(".claude"), "skills", Some(&root)).map(|r| r.wire()),
+            Some("symlinked")
+        );
+
+        // symlinked: only the kind directory is a link, `.claude` is real.
+        let cwd = tmp.path().join("kindlink");
+        std::fs::create_dir_all(cwd.join(".claude")).unwrap();
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        link_dir(&cwd.join(".claude").join("commands"), &elsewhere);
+        assert_eq!(
+            stand_down(&cwd.join(".claude"), "commands", None).map(|r| r.wire()),
+            Some("symlinked")
+        );
+        assert_eq!(
+            stand_down(&cwd.join(".claude"), "skills", None),
+            None,
+            "the other kind is not behind a link"
+        );
+
+        // canonical source: a REAL `.claude` inside <root>/qontinui-claude-config.
+        let ccfg = root.join("qontinui-claude-config");
+        std::fs::create_dir_all(ccfg.join(".claude").join("commands")).unwrap();
+        let reason = stand_down(&ccfg.join(".claude"), "commands", Some(&root))
+            .expect("the canonical source stands down");
+        assert_eq!(reason.wire(), "canonical_source");
+        assert_eq!(
+            stand_down(&ccfg.join(".claude"), "commands", None),
+            None,
+            "no workspace root, no canonical-source arm (fails open to the symlink arm)"
+        );
+
+        // a fresh agent worktree: neither.
+        let fresh = tmp.path().join("fresh");
+        std::fs::create_dir_all(&fresh).unwrap();
+        assert_eq!(
+            stand_down(&fresh.join(".claude"), "commands", Some(&root)),
+            None
+        );
+        assert_eq!(
+            stand_down(&fresh.join(".claude"), "skills", Some(&root)),
+            None
+        );
+    }
+
+    /// `symlink_below` examines every EXISTING component below `base` — the
+    /// path itself included — and never `base` itself.
+    #[test]
+    fn symlink_below_examines_the_path_and_never_the_base() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("f.md"), b"x").unwrap();
+
+        // `base` itself being a link is not examined.
+        let linked_base = tmp.path().join("linked-base");
+        link_dir(&linked_base, &real);
+        assert_eq!(symlink_below(&linked_base, &linked_base.join("f.md")), None);
+
+        // a file link, and a path BEHIND a directory link, are both named.
+        let base = tmp.path().join("base");
+        std::fs::create_dir_all(&base).unwrap();
+        link_file(&base.join("file.md"), &real.join("f.md"));
+        link_dir(&base.join("dir"), &real);
+        assert!(symlink_below(&base, &base.join("file.md")).is_some());
+        assert!(symlink_below(&base, &base.join("dir").join("f.md")).is_some());
+        // an ordinary file, and an absent one, are not.
+        std::fs::write(base.join("plain.md"), b"x").unwrap();
+        assert_eq!(symlink_below(&base, &base.join("plain.md")), None);
+        assert_eq!(symlink_below(&base, &base.join("absent.md")), None);
     }
 
     /// Fail-soft: a directory that does not exist yields an empty set rather
