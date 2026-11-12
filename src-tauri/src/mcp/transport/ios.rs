@@ -76,7 +76,29 @@ pub struct IosTransport {
 struct Inner {
     child: Option<Child>,
     port: Option<u16>,
+    /// The forward ports this sidecar opened, each marked as a cable until it stops.
+    forwards: Vec<u16>,
+    /// Counts sidecar starts, so a watcher for an earlier child stops watching.
+    generation: u64,
 }
+
+impl Inner {
+    /// Forget a sidecar that is gone, and stop counting its forwards as cables:
+    /// their ports are free for anything to bind. They stay off-machine, so a
+    /// connection that withheld the bearer from one never gets it back.
+    fn forget_child(&mut self) {
+        self.child = None;
+        self.port = None;
+        for port in std::mem::take(&mut self.forwards) {
+            super::drop_cable_mark(port);
+        }
+    }
+}
+
+/// How often a running sidecar is checked for having exited on its own, which
+/// frees its forward ports. A forward to a sidecar that died is a cable for at
+/// most this long.
+const SIDECAR_EXIT_POLL: std::time::Duration = std::time::Duration::from_secs(2);
 
 impl IosTransport {
     pub fn new() -> Self {
@@ -89,11 +111,25 @@ impl IosTransport {
     /// port handshake line. Idempotent — if already running, returns the
     /// existing port.
     pub async fn start_service(&self) -> Result<u16, TransportError> {
+        self.start_service_generation().await.map(|(port, _)| port)
+    }
+
+    /// [`Self::start_service`], also returning which start the running sidecar is.
+    async fn start_service_generation(&self) -> Result<(u16, u64), TransportError> {
         {
-            let inner = self.inner.lock().await;
+            let mut inner = self.inner.lock().await;
+            // A sidecar that exited on its own freed its forward ports.
+            if inner
+                .child
+                .as_mut()
+                .is_some_and(|child| !matches!(child.try_wait(), Ok(None)))
+            {
+                warn!("ios_bridge sidecar exited; its forwards are gone");
+                inner.forget_child();
+            }
             if let Some(port) = inner.port {
                 if inner.child.is_some() {
-                    return Ok(port);
+                    return Ok((port, inner.generation));
                 }
             }
         }
@@ -159,13 +195,57 @@ impl IosTransport {
         });
 
         let mut inner = self.inner.lock().await;
+        // Another start finished while this one spawned: keep that sidecar, whose
+        // forwards are recorded against its generation, and drop this one, which
+        // `kill_on_drop` ends.
+        if let Some(running) = inner.child.as_mut() {
+            let still_running = matches!(running.try_wait(), Ok(None));
+            match inner.port {
+                Some(existing) if still_running => {
+                    info!(
+                        port = existing,
+                        "ios_bridge sidecar already running; dropping the second start"
+                    );
+                    return Ok((existing, inner.generation));
+                }
+                _ => inner.forget_child(),
+            }
+        }
         inner.child = Some(child);
         inner.port = Some(port);
+        inner.generation += 1;
+        let generation = inner.generation;
+        drop(inner);
+        self.watch_for_exit(generation);
         info!(port, "ios_bridge sidecar ready");
-        Ok(port)
+        Ok((port, generation))
     }
 
-    /// Kill the sidecar. Safe to call when not running.
+    /// Drop the forwards of the sidecar started as `generation` soon after it
+    /// exits on its own, rather than at the next start.
+    fn watch_for_exit(&self, generation: u64) {
+        let inner = self.inner.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(SIDECAR_EXIT_POLL).await;
+                let mut inner = inner.lock().await;
+                if inner.generation != generation {
+                    return;
+                }
+                let Some(child) = inner.child.as_mut() else {
+                    return;
+                };
+                if !matches!(child.try_wait(), Ok(None)) {
+                    warn!("ios_bridge sidecar exited; its forwards are gone");
+                    inner.forget_child();
+                    return;
+                }
+            }
+        });
+    }
+
+    /// Kill the sidecar. Safe to call when not running. Its forward ports are then
+    /// free for anything to bind, so they stop counting as cables.
     pub async fn stop_service(&self) {
         let mut inner = self.inner.lock().await;
         if let Some(mut child) = inner.child.take() {
@@ -173,7 +253,7 @@ impl IosTransport {
                 warn!(error = %e, "failed to kill ios_bridge child");
             }
         }
-        inner.port = None;
+        inner.forget_child();
     }
 
     /// Current sidecar port, if started.
@@ -201,9 +281,22 @@ impl IosTransport {
     }
 
     /// Open a local TCP forward for a device port. Returns the local port.
+    ///
+    /// The far end is the phone, and the sidecar holds the port while it runs, so
+    /// the port is marked as a cable. The sidecar has no close call: the mark is
+    /// dropped when it stops or exits. It is marked under the same lock that
+    /// records it, and only while the sidecar that opened it still runs, so a stop
+    /// in between leaves no mark that nothing would drop.
     pub async fn forward_port(&self, udid: &str, device_port: u16) -> Result<u16, TransportError> {
-        let port = self.start_service().await?;
-        request_forward(port, udid, device_port).await
+        let (port, generation) = self.start_service_generation().await?;
+        let local_port = request_forward(port, udid, device_port).await?;
+        if !record_forward(&mut *self.inner.lock().await, generation, local_port) {
+            return Err(TransportError::ForwardFailed {
+                device_id: udid.to_string(),
+                reason: "the ios_bridge sidecar stopped while the forward was opened".into(),
+            });
+        }
+        Ok(local_port)
     }
 
     /// Initiate pairing (triggers the 'Trust this computer' dialog).
@@ -223,6 +316,17 @@ impl Default for IosTransport {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Mark `local_port` as a cable and record it, when the sidecar started as
+/// `generation` still runs. `false` when it stopped or was replaced meanwhile.
+fn record_forward(inner: &mut Inner, generation: u64, local_port: u16) -> bool {
+    if inner.generation != generation || inner.port.is_none() {
+        return false;
+    }
+    super::mark_cable_forwarder(local_port);
+    inner.forwards.push(local_port);
+    true
 }
 
 /// Ask the sidecar on `sidecar_port` to forward `device_port`.
@@ -252,9 +356,6 @@ async fn request_forward(
             device_id: udid.to_string(),
             reason: format!("decode: {e}"),
         })?;
-    // The far end is the phone. The sidecar has no close call, so the mark stays
-    // until the process ends, even past `stop_service`. That fails closed.
-    super::mark_off_machine_forwarder(resp.local_port);
     Ok(resp.local_port)
 }
 
@@ -319,16 +420,20 @@ fn resolve_python_bin() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::request_forward;
-    use crate::mcp::transport::{is_off_machine_forwarder, ForgetForwarder};
+    use super::{record_forward, request_forward, Inner};
+    use crate::mcp::transport::{
+        is_cable_forwarder, is_off_machine_forwarder, unmark_off_machine_forwarder,
+    };
 
-    /// The port the sidecar hands back is marked before any caller sees it. The
-    /// port is held bound so no peer test can be handed it.
+    /// The port the sidecar hands back is marked as a cable forwarder while the
+    /// sidecar that opened it runs. When it stops the port stops being a cable but
+    /// stays off-machine, so a connection that withheld the bearer from it never
+    /// gets it back. A sidecar that stopped or was replaced before the answer came
+    /// back marks nothing. The port is held bound so no peer test can be handed it.
     #[tokio::test]
-    async fn a_forward_port_from_the_sidecar_is_an_off_machine_forwarder() {
+    async fn a_forward_port_from_the_sidecar_is_a_cable_while_the_sidecar_runs() {
         let held = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let forward_port = held.local_addr().expect("local addr").port();
-        let _forget = ForgetForwarder(forward_port);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let sidecar_port = listener.local_addr().unwrap().port();
@@ -346,6 +451,40 @@ mod tests {
             .await
             .expect("the sidecar answers");
         assert_eq!(opened, forward_port);
+
+        let mut inner = Inner {
+            port: Some(sidecar_port),
+            generation: 2,
+            ..Inner::default()
+        };
+        assert!(
+            !record_forward(&mut inner, 1, opened),
+            "a replaced sidecar's forward was kept"
+        );
+        assert!(!is_cable_forwarder(forward_port));
+
+        assert!(record_forward(&mut inner, 2, opened));
         assert!(is_off_machine_forwarder(forward_port));
+        assert!(is_cable_forwarder(forward_port));
+
+        inner.forget_child();
+        assert!(
+            is_off_machine_forwarder(forward_port),
+            "a stopped sidecar's forward reads as loopback, so a withheld bearer would be sent"
+        );
+        assert!(!is_cable_forwarder(forward_port));
+
+        let mut stopped = Inner {
+            generation: 2,
+            ..Inner::default()
+        };
+        assert!(
+            !record_forward(&mut stopped, 2, opened),
+            "a stopped sidecar's forward was kept"
+        );
+        assert!(!is_cable_forwarder(forward_port));
+
+        unmark_off_machine_forwarder(forward_port);
+        assert!(!is_off_machine_forwarder(forward_port));
     }
 }

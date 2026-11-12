@@ -926,14 +926,6 @@ pub struct MobileSettings {
     /// Allow plain HTTP for LAN connections (default: false, requires TLS)
     #[serde(default)]
     pub lan_allow_plaintext: bool,
-
-    /// Pairing timeout in seconds (default: 600)
-    #[serde(default = "default_pairing_timeout")]
-    pub pairing_timeout_secs: u64,
-
-    /// Known/paired physical devices
-    #[serde(default)]
-    pub paired_devices: Vec<crate::mcp::transport::pairing::PairedDeviceRecord>,
 }
 
 fn default_logcat_lines() -> u32 {
@@ -942,10 +934,6 @@ fn default_logcat_lines() -> u32 {
 
 fn default_ui_bridge_port() -> u16 {
     8087
-}
-
-fn default_pairing_timeout() -> u64 {
-    600
 }
 
 impl Default for MobileSettings {
@@ -960,8 +948,6 @@ impl Default for MobileSettings {
             ui_bridge_port: default_ui_bridge_port(),
             lan_discovery_enabled: default_true(),
             lan_allow_plaintext: false,
-            pairing_timeout_secs: default_pairing_timeout(),
-            paired_devices: Vec::new(),
         }
     }
 }

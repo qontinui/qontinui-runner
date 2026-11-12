@@ -48,7 +48,7 @@ const HEALTH: &str = r#"{"uiBridge":{"appId":"door","appName":"Door","appType":"
 /// The ambient every door test runs in. Fields drop in order: the proxy
 /// variables are restored while the env lock is still held, and the lock goes
 /// last.
-struct Door {
+pub(super) struct Door {
     _proxies: crate::test_env::EnvVarRestore,
     _adb_port: crate::test_env::EnvVarRestore,
     _no_adb: tokio::net::TcpSocket,
@@ -73,7 +73,7 @@ struct Door {
 /// - the adb server is a port nothing listens on, so a connect never reads the
 ///   developer's real adb into the process-global list;
 /// - an unexpired device JWT is stored where `connect_sdk_app` will find it.
-fn door() -> Door {
+pub(super) fn door() -> Door {
     let ambient = crate::test_env::isolated_ambient();
     // Restored by the fixture: the key is in `ambient::AMBIENT_ENV_KEYS`.
     std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
@@ -281,6 +281,21 @@ fn requests_to(seen: &Seen, authority: &str) -> Vec<Option<String>> {
         .collect()
 }
 
+/// A connect that sends the operator's bearer first asks the target's open
+/// `/ui-bridge/health` with none (`phone_health_without_bearer`), so a phone found
+/// there never gets it. Checks that request carried nothing, and returns the
+/// requests after it, which carry the connect's decision.
+fn after_the_bare_health_probe<'a>(
+    requests: &'a [Option<String>],
+    context: &str,
+) -> &'a [Option<String>] {
+    assert!(
+        matches!(requests.first(), Some(None)),
+        "{context}: the first request was not the bare health probe: {requests:?}"
+    );
+    &requests[1..]
+}
+
 /// A foreign host never receives the operator's stored bearer.
 ///
 /// `0.0.0.0` plays the foreign host. It is not a loopback literal and not a
@@ -381,11 +396,11 @@ async fn a_configured_proxy_never_sees_a_loopback_connect() {
     );
     let direct = requests_to(&app_seen, &relay);
     assert!(
-        connected.is_ok() && !direct.is_empty(),
+        connected.is_ok() && direct.len() > 1,
         "the loopback relay was not reached directly: {direct:?}"
     );
     assert!(
-        direct
+        after_the_bare_health_probe(&direct, "the loopback relay")
             .iter()
             .all(|auth| auth.as_deref().is_some_and(|a| a.starts_with("Bearer "))),
         "an admitted loopback relay gets the bearer, directly: {direct:?}"
@@ -584,14 +599,14 @@ async fn a_configured_proxy_never_sees_a_forwarder_connect() {
 
 /// Points `adb_helper` at a fake adb server until dropped, and leaves no listed
 /// forward behind. Hold the [`door`] lock around it: the variable is global.
-struct FakeAdb {
+pub(super) struct FakeAdb {
     _port: crate::test_env::EnvVarRestore,
 }
 
 impl FakeAdb {
     /// A server that answers `host:list-forward` with `list`, and `OKAY` to any
     /// other request.
-    async fn start(list: String) -> Self {
+    pub(super) async fn start(list: String) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
@@ -622,7 +637,7 @@ impl FakeAdb {
 impl Drop for FakeAdb {
     fn drop(&mut self) {
         use crate::mcp::transport::{next_adb_list_read, set_adb_listed_forwarders};
-        set_adb_listed_forwarders(next_adb_list_read(), Default::default());
+        set_adb_listed_forwarders(next_adb_list_read(), Default::default(), Default::default());
     }
 }
 
@@ -662,14 +677,15 @@ async fn a_forward_on_the_adb_servers_list_never_carries_the_stored_bearer() {
         "an adb forward carried the operator's stored bearer to the phone: {phone:?}"
     );
     let emulator = requests_to(&emulator_seen, &format!("127.0.0.1:{emulator_port}"));
+    let emulator_after = after_the_bare_health_probe(&emulator, "the local emulator");
     assert!(
-        !emulator.is_empty() && emulator.iter().all(Option::is_some),
+        !emulator_after.is_empty() && emulator_after.iter().all(Option::is_some),
         "a local emulator's forward lost the bearer: {emulator:?}"
     );
 }
 
 /// Point the adb client at a server that answers `FAIL` to everything.
-async fn start_unreadable_adb() {
+pub(super) async fn start_unreadable_adb() {
     let bad = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let bad_port = bad.local_addr().unwrap().port();
     tokio::spawn(async move {
@@ -992,7 +1008,12 @@ async fn a_switch_never_reuses_a_bearer_client_over_a_forward_made_since_the_con
         .await
         .unwrap_or_else(|e| panic!("the connect failed: {}", e.message));
     let authority = format!("127.0.0.1:{port}");
-    assert!(requests_to(&seen, &authority).iter().all(Option::is_some));
+    let connect = requests_to(&seen, &authority);
+    let after_probe = after_the_bare_health_probe(&connect, "the connect");
+    assert!(
+        !after_probe.is_empty() && after_probe.iter().all(Option::is_some),
+        "the connect did not carry the bearer: {connect:?}"
+    );
 
     let _adb = FakeAdb::start(format!("R3CN30ABCDEF tcp:{port} tcp:9876\n")).await;
     let axum::Json(answer) = crate::mcp::sdk_client::handle_switch(

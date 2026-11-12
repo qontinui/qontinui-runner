@@ -587,6 +587,10 @@ pub struct ForwardDeviceResponse {
     pub local_port: u16,
     pub device_id: String,
     pub remote_port: u16,
+    /// Whether this runner fetched the phone's pairing token over the new forward,
+    /// which is what lets it reach the same phone over Wi-Fi later. Never the
+    /// token itself.
+    pub pairing: crate::mcp::transport::pairing::LocalPairing,
 }
 
 /// Set up persistent ADB port forwarding for a mobile device.
@@ -621,11 +625,16 @@ async fn forward_device(
         "Persistent port forward: device {} remote {} -> local {}",
         req.device_id, req.remote_port, local_port
     );
+    let pairing = crate::mcp::transport::pairing::pair_over_local_forward(&format!(
+        "http://127.0.0.1:{local_port}"
+    ))
+    .await;
 
     Ok(Json(ApiResponse::success(ForwardDeviceResponse {
         local_port,
         device_id: req.device_id,
         remote_port: req.remote_port,
+        pairing,
     })))
 }
 
@@ -647,11 +656,18 @@ async fn ios_forward(
         .forward_port(&req.udid, req.device_port)
         .await
     {
-        Ok(local_port) => Ok(Json(ApiResponse::success(ForwardDeviceResponse {
-            local_port,
-            device_id: req.udid,
-            remote_port: req.device_port,
-        }))),
+        Ok(local_port) => {
+            let pairing = crate::mcp::transport::pairing::pair_over_local_forward(&format!(
+                "http://127.0.0.1:{local_port}"
+            ))
+            .await;
+            Ok(Json(ApiResponse::success(ForwardDeviceResponse {
+                local_port,
+                device_id: req.udid,
+                remote_port: req.device_port,
+                pairing,
+            })))
+        }
         Err(e) => Ok(Json(ApiResponse::error(format!("iOS forward: {e}")))),
     }
 }

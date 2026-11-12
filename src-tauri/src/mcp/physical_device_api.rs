@@ -2,12 +2,16 @@
 //!
 //! Provides routes for listing devices, connecting/disconnecting, transport
 //! inspection, pairing, and manual LAN device registration.
+//!
+//! Pairing is the phone's: `POST /ui-bridge/devices/{id}/pair` asks the phone
+//! for a token and keeps it, and every later request to that phone off a cable is
+//! signed with it ([`crate::mcp::transport::pairing`]).
 
 use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::Json,
-    routing::{delete, get, post},
+    routing::{get, post},
     Router,
 };
 use serde::{Deserialize, Serialize};
@@ -19,7 +23,7 @@ use crate::mcp::adb_helper::{self, AdbDeviceInfo};
 use crate::mcp::physical_device::{
     ActiveTransport, PhysicalDevice, PhysicalDeviceInfo, PhysicalDeviceRegistry,
 };
-use crate::mcp::transport::pairing::PairingManager;
+use crate::mcp::transport::pairing::{self, PairError};
 use crate::mcp::transport::{DeviceOs, TransportKind};
 use crate::mcp::types::{ApiResponse, ApiState};
 
@@ -49,47 +53,36 @@ struct PreferTransportRequest {
     kind: TransportKind,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PairDeviceRequest {
+    /// The 6-digit code the app's Settings shows after Pair is tapped. Not needed
+    /// over a USB cable, where the phone admits this runner as on the phone itself.
+    #[serde(default)]
+    code: Option<String>,
+    /// Replace a token this runner already holds for the device, after the app's
+    /// Settings revoked the pairing. Over a USB cable no flag is needed.
+    #[serde(default)]
+    replace: bool,
+}
+
+/// What a pairing did. The token itself is never returned: it stays in this
+/// runner's encrypted store and only ever signs requests.
+#[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct InitiatePairingRequest {
+pub(crate) struct PairDeviceResponse {
+    /// The registry row that was paired.
     device_id: String,
+    /// The phone's own id, which its token is keyed by, as its mDNS record and
+    /// its `/ui-bridge/health` publish it.
+    ui_bridge_device_id: String,
+    /// The transport the pairing went over.
     transport: TransportKind,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ConfirmPairingRequest {
-    device_id: String,
-    code: String,
-    #[serde(default = "default_display_name")]
-    display_name: String,
-    #[serde(default = "default_platform")]
-    platform: String,
-}
-
-fn default_display_name() -> String {
-    "Unknown Device".to_string()
+    paired: bool,
 }
 
 fn default_platform() -> String {
     "android".to_string()
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct PairingInitiatedResponse {
-    device_id: String,
-    code: String,
-    expires_at: i64,
-    transport: TransportKind,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct PairingConfirmedResponse {
-    device_id: String,
-    device_token: String,
-    paired_at: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -176,13 +169,16 @@ async fn list_devices(
         unauthorized_hint
     } else if count == 0 {
         Some(
-            "No devices paired. Set up a transport, then re-query: \
-             (USB) `adb forward tcp:8087 tcp:8087` and hit \
-             http://localhost:8087/ui-bridge/health; or \
-             (LAN/cloud) in qontinui-mobile enable Settings -> Developer -> \
-             \"Local UI Bridge server\" and pair via the Connection Wizard \
-             (deep link: qontinui:///connect). Release AABs are not \
-             auto-reachable until paired."
+            "No devices registered. Set up a transport, then re-query: \
+             (USB) plug the phone in with USB debugging allowed, and the runner \
+             forwards and registers it, or run `adb forward tcp:8087 tcp:8087` \
+             and hit http://localhost:8087/ui-bridge/health; or (LAN) in \
+             qontinui-mobile enable Settings -> Developer -> \"Local UI Bridge \
+             server\" and wait for the phone to appear here. An app built with \
+             @qontinui/ui-bridge-native 0.11.0 or later then needs pairing first: \
+             POST /ui-bridge/devices/{id}/pair with {} on the phone's USB row, or \
+             on Wi-Fi with the 6-digit code its Settings shows after Pair is \
+             tapped. An older app needs no pairing."
                 .to_string(),
         )
     } else {
@@ -210,32 +206,82 @@ async fn get_device(
 }
 
 /// POST /ui-bridge/devices/:id/connect
-/// Looks up the device's active proxy URL and makes it the active SDK target.
+///
+/// Makes the device the active SDK target over its best transport; see
+/// [`connect_device_over_transports`].
 async fn connect_device(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<ConnectDeviceResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let proxy_url = match state
-        .physical_device_registry
-        .get_active_proxy_url(&id)
-        .await
+    match connect_device_over_transports(
+        &state.sdk_connection,
+        &state.physical_device_registry,
+        &id,
+    )
+    .await
     {
-        Some(url) => url,
-        None => {
-            return Err((
-                StatusCode::NOT_FOUND,
-                Json(ApiResponse::error(format!(
-                    "Device '{}' not found or has no active transport",
-                    id
-                ))),
-            ));
-        }
-    };
+        Ok(resp) => Ok(Json(ApiResponse::success(resp))),
+        Err(None) => Err((
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::error(format!(
+                "Device '{}' not found or has no active transport",
+                id
+            ))),
+        )),
+        // A phone that requires pairing answered: the device is there, and this
+        // runner has to pair before it can drive it.
+        Err(Some(resp)) if refused_for_pairing(&resp) => Err((StatusCode::CONFLICT, Json(resp))),
+        Err(Some(resp)) => Err((StatusCode::BAD_GATEWAY, Json(resp))),
+    }
+}
 
-    connect_device_at(&state.sdk_connection, id, proxy_url)
-        .await
-        .map(|resp| Json(ApiResponse::success(resp)))
-        .map_err(|resp| (StatusCode::BAD_GATEWAY, Json(resp)))
+/// Connect to device `id` over its transports, the active one first. A transport
+/// whose phone requires pairing this runner has not done is passed over for the
+/// next one, so an unpaired phone on Wi-Fi is still reached over the cloud relay,
+/// which its pairing gate does not cover; the transport that answered becomes the
+/// device's active one. `Err(None)`: no such device, or one with no transport.
+/// `Err(Some(_))`: every transport failed, with the first pairing refusal when
+/// there was one, since it says what to do.
+pub(crate) async fn connect_device_over_transports(
+    sdk_connection: &tokio::sync::Mutex<crate::mcp::sdk_client::SdkConnectionManager>,
+    registry: &PhysicalDeviceRegistry,
+    id: &str,
+) -> Result<ConnectDeviceResponse, Option<ApiResponse<()>>> {
+    let transports: Vec<(TransportKind, String)> = match registry.get_device(id).await {
+        Some(device) => device
+            .transports_by_preference()
+            .into_iter()
+            .map(|t| (t.kind, t.proxy_url.clone()))
+            .collect(),
+        None => Vec::new(),
+    };
+    let mut first_refusal: Option<ApiResponse<()>> = None;
+    let mut last_error: Option<ApiResponse<()>> = None;
+    for (index, (kind, proxy_url)) in transports.iter().enumerate() {
+        match connect_device_at(sdk_connection, id.to_string(), proxy_url.clone()).await {
+            Ok(resp) => {
+                if index > 0 {
+                    info!(device_id = %id, transport = %kind, "connected over a fallback transport");
+                    registry.prefer_transport(id, *kind).await;
+                }
+                return Ok(resp);
+            }
+            Err(resp) if refused_for_pairing(&resp) => {
+                first_refusal.get_or_insert(resp);
+            }
+            Err(resp) => last_error = Some(resp),
+        }
+    }
+    Err(first_refusal.or(last_error))
+}
+
+/// Whether a connect failed because the phone requires pairing.
+fn refused_for_pairing(resp: &ApiResponse<()>) -> bool {
+    resp.hint
+        .as_ref()
+        .and_then(|hint| hint.get("authPath"))
+        .and_then(serde_json::Value::as_str)
+        == Some(crate::mcp::sdk_client::AUTH_PATH_PAIRING_REQUIRED)
 }
 
 /// Make the device at `proxy_url` the active SDK target. The handshake's
@@ -270,6 +316,9 @@ pub(crate) async fn connect_device_at(
         Err(e) => {
             warn!(device_id = %id, error = %e, auth_path = %e.auth_path, "Failed to connect physical device");
             let mut resp = ApiResponse::error(format!("Connection failed: {}", e));
+            if e.auth_path == crate::mcp::sdk_client::AUTH_PATH_PAIRING_REQUIRED {
+                resp.code = Some("PAIRING_REQUIRED".to_string());
+            }
             resp.hint = Some(serde_json::json!({ "authPath": e.auth_path }));
             Err(resp)
         }
@@ -277,39 +326,41 @@ pub(crate) async fn connect_device_at(
 }
 
 /// POST /ui-bridge/devices/:id/disconnect
+///
+/// Drops the SDK connection to every one of the device's transports, since a
+/// connect may have fallen back from the active one to another.
 async fn disconnect_device(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    // Find the proxy URL for this device
-    let proxy_url = match state
-        .physical_device_registry
-        .get_active_proxy_url(&id)
-        .await
-    {
-        Some(url) => url,
-        None => {
-            return Err((
-                StatusCode::NOT_FOUND,
-                Json(ApiResponse::error(format!("Device '{}' not found", id))),
-            ));
-        }
+    let Some(device) = state.physical_device_registry.get_device(&id).await else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::error(format!("Device '{}' not found", id))),
+        ));
     };
 
-    // Remove from SDK connection manager if it's the active connection
-    {
-        let mut manager = state.sdk_connection.lock().await;
-        manager.connections.remove(&proxy_url);
-        if manager.active_url.as_deref() == Some(&proxy_url) {
-            manager.active_url = None;
-        }
-    }
+    drop_device_connections(&state.sdk_connection, &device).await;
 
     info!(device_id = %id, "Physical device disconnected");
     Ok(Json(ApiResponse::success(serde_json::json!({
         "deviceId": id,
         "disconnected": true
     }))))
+}
+
+/// Drop the SDK connection to every one of `device`'s transports.
+async fn drop_device_connections(
+    sdk_connection: &tokio::sync::Mutex<crate::mcp::sdk_client::SdkConnectionManager>,
+    device: &PhysicalDevice,
+) {
+    let mut manager = sdk_connection.lock().await;
+    for transport in &device.transports {
+        manager.connections.remove(&transport.proxy_url);
+        if manager.active_url.as_deref() == Some(transport.proxy_url.as_str()) {
+            manager.active_url = None;
+        }
+    }
 }
 
 /// DELETE /ui-bridge/devices/:id
@@ -388,107 +439,168 @@ async fn prefer_transport(
     Path(id): Path<String>,
     Json(req): Json<PreferTransportRequest>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    // Find the URL for the requested transport kind
-    let proxy_url = {
-        match state.physical_device_registry.get_device(&id).await {
-            Some(device) => device
-                .transports
-                .iter()
-                .find(|t| t.kind == req.kind)
-                .map(|t| t.proxy_url.clone()),
-            None => None,
-        }
-    };
-
-    match proxy_url {
-        Some(url) => {
-            state
-                .physical_device_registry
-                .promote_transport(&id, req.kind, url)
-                .await;
-            Ok(Json(ApiResponse::success(serde_json::json!({
-                "deviceId": id,
-                "activeTransport": req.kind
-            }))))
-        }
-        None => Err((
+    if state
+        .physical_device_registry
+        .prefer_transport(&id, req.kind)
+        .await
+    {
+        Ok(Json(ApiResponse::success(serde_json::json!({
+            "deviceId": id,
+            "activeTransport": req.kind
+        }))))
+    } else {
+        Err((
             StatusCode::NOT_FOUND,
             Json(ApiResponse::error(format!(
                 "Device '{}' has no {} transport",
                 id, req.kind
             ))),
-        )),
+        ))
     }
 }
 
-/// POST /ui-bridge/devices/pair/initiate
-async fn initiate_pairing(
-    State(state): State<Arc<ApiState>>,
-    Json(req): Json<InitiatePairingRequest>,
-) -> Result<Json<ApiResponse<PairingInitiatedResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let pending = state
-        .pairing_manager
-        .initiate(&req.device_id, req.transport)
-        .await;
-
-    info!(
-        device_id = %req.device_id,
-        code = %pending.code,
-        "Pairing initiated"
-    );
-
-    Ok(Json(ApiResponse::success(PairingInitiatedResponse {
-        device_id: pending.device_id,
-        code: pending.code,
-        expires_at: pending.expires_at,
-        transport: pending.transport_hint,
-    })))
-}
-
-/// POST /ui-bridge/devices/pair/confirm
-async fn confirm_pairing(
-    State(state): State<Arc<ApiState>>,
-    Json(req): Json<ConfirmPairingRequest>,
-) -> Result<Json<ApiResponse<PairingConfirmedResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
-    match state
-        .pairing_manager
-        .confirm(&req.device_id, &req.code, &req.display_name, &req.platform)
-        .await
-    {
-        Ok(device) => {
-            info!(device_id = %device.device_id, "Pairing confirmed");
-            Ok(Json(ApiResponse::success(PairingConfirmedResponse {
-                device_id: device.device_id,
-                device_token: device.device_token,
-                paired_at: device.paired_at,
-            })))
-        }
-        Err(e) => Err((
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(ApiResponse::error(format!("Pairing failed: {}", e))),
-        )),
-    }
-}
-
-/// DELETE /ui-bridge/devices/:id/pairing
-async fn revoke_pairing(
+/// POST /ui-bridge/devices/:id/pair
+///
+/// Ask the phone for a token and keep it, so every later request to it off a
+/// cable is signed. Body: `{"code": "123456"}`, the code the app's Settings shows
+/// after Pair is tapped; over a USB cable send `{}` or no body, since the phone
+/// asks for no code there. A code-less pair over anything but a cable is refused
+/// before anything is sent, since only an impostor answers one off a cable. A
+/// local emulator needs no pairing: it admits this runner as on the phone itself.
+/// Pairing again is safe: the phone holds one token and hands that same one to
+/// every pairing, so a re-pair never invalidates another runner. It changes only
+/// when the app revokes pairing, after which this runner's requests are refused
+/// until it pairs again, over a cable or with `"replace": true`.
+///
+/// Goes over the device's best transport other than the cloud relay, which the
+/// phone's gate does not cover. The token is never returned. On success that
+/// transport becomes the device's active one again (a connect made while it was
+/// unpaired may have fallen back to the relay) and every live connection to the
+/// device is dropped, so the next connect goes to it, signed.
+async fn pair_device(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let removed = state.pairing_manager.revoke(&id).await;
-    if removed {
-        info!(device_id = %id, "Pairing revoked");
-        Ok(Json(ApiResponse::success(
-            serde_json::json!({ "deviceId": id, "revoked": true }),
-        )))
+    body: axum::body::Bytes,
+) -> Result<Json<ApiResponse<PairDeviceResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
+    // Parsed here rather than by axum's `Json`, whose rejection is plain text
+    // rather than this route's envelope.
+    let req = if body.iter().all(u8::is_ascii_whitespace) {
+        PairDeviceRequest::default()
     } else {
-        Err((
+        match serde_json::from_slice::<PairDeviceRequest>(&body) {
+            Ok(req) => req,
+            Err(e) => {
+                let mut resp = ApiResponse::error(format!(
+                    "The body is {{}} over a cable, or {{\"code\": \"123456\"}}: {e}"
+                ));
+                resp.code = Some("PAIRING_BODY_MALFORMED".to_string());
+                return Err((StatusCode::BAD_REQUEST, Json(resp)));
+            }
+        }
+    };
+    pair_device_with(
+        &state.sdk_connection,
+        &state.physical_device_registry,
+        &pairing::device_tokens(),
+        id,
+        req.code,
+        req.replace,
+    )
+    .await
+    .map(|paired| Json(ApiResponse::success(paired)))
+    .map_err(|(status, resp)| (status, Json(resp)))
+}
+
+/// What `POST /ui-bridge/devices/{id}/pair` does, with the token store passed in.
+pub(crate) async fn pair_device_with(
+    sdk_connection: &tokio::sync::Mutex<crate::mcp::sdk_client::SdkConnectionManager>,
+    registry: &PhysicalDeviceRegistry,
+    store: &pairing::DeviceTokenStore,
+    id: String,
+    code: Option<String>,
+    replace: bool,
+) -> Result<PairDeviceResponse, (StatusCode, ApiResponse<()>)> {
+    let refuse = |status: StatusCode, code: &str, message: String| {
+        let mut resp = ApiResponse::error(message);
+        resp.code = Some(code.to_string());
+        (status, resp)
+    };
+    if let Some(code) = &code {
+        if code.len() != 6 || !code.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(refuse(
+                StatusCode::BAD_REQUEST,
+                "PAIRING_CODE_MALFORMED",
+                "The pairing code is the 6 digits the app's Settings shows".to_string(),
+            ));
+        }
+    }
+    let Some(device) = registry.get_device(&id).await else {
+        return Err(refuse(
             StatusCode::NOT_FOUND,
-            Json(ApiResponse::error(format!(
-                "No pairing found for device '{}'",
-                id
-            ))),
-        ))
+            "DEVICE_NOT_FOUND",
+            format!("Device '{id}' not found"),
+        ));
+    };
+    let Some(transport) = device
+        .transports_by_preference()
+        .into_iter()
+        .find(|t| t.kind != TransportKind::Cloud)
+        .cloned()
+    else {
+        return Err(refuse(
+            StatusCode::CONFLICT,
+            "PAIRING_NOT_APPLICABLE",
+            format!(
+                "Device '{id}' is reached only over the cloud relay, which needs no pairing. \
+                 Pairing is for a phone reached on the local network."
+            ),
+        ));
+    };
+
+    let over_cable = crate::mcp::transport::is_cable_url_now(&transport.proxy_url).await;
+    if code.is_none() && !over_cable {
+        return Err(refuse(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "PAIRING_CODE_REQUIRED",
+            format!(
+                "Device '{id}' is reached over {}, not a USB cable, so pairing needs the 6-digit \
+                 code the app's Settings shows after Pair is tapped: send it as \
+                 {{\"code\": \"123456\"}}.",
+                transport.kind
+            ),
+        ));
+    }
+    let options = pairing::PairOptions {
+        code: code.as_deref(),
+        explicit: true,
+        expected_device_id: None,
+        may_replace: replace || over_cable,
+    };
+    match pairing::pair_with_device(&transport.proxy_url, store, options).await {
+        Ok(paired) => {
+            registry.prefer_transport(&id, transport.kind).await;
+            drop_device_connections(sdk_connection, &device).await;
+            info!(device_id = %id, ui_bridge_device_id = %paired.device_id, transport = %transport.kind, "device paired");
+            Ok(PairDeviceResponse {
+                device_id: id,
+                ui_bridge_device_id: paired.device_id,
+                transport: transport.kind,
+                paired: true,
+            })
+        }
+        Err(e) => {
+            warn!(device_id = %id, code = e.code(), "pairing failed");
+            let status = match &e {
+                PairError::AppTooOld | PairError::TokenHeld { .. } => StatusCode::CONFLICT,
+                PairError::Refused { status: 429, .. } => StatusCode::TOO_MANY_REQUESTS,
+                // The phone's secure store is not ready: worth a retry, not a new code.
+                PairError::Refused { status: 503, .. } => StatusCode::SERVICE_UNAVAILABLE,
+                PairError::Refused { .. } => StatusCode::UNPROCESSABLE_ENTITY,
+                PairError::Unreachable(_) | PairError::BadAnswer(_) => StatusCode::BAD_GATEWAY,
+                PairError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            Err(refuse(status, e.code(), e.message()))
+        }
     }
 }
 
@@ -548,7 +660,6 @@ async fn register_lan_device(
         app_id: Some(discovered.app_id),
         ui_bridge_version: discovered.version,
         first_seen_at: now,
-        pairing_token: None,
     };
 
     let transport = ActiveTransport {
@@ -601,9 +712,7 @@ pub fn routes() -> Router<Arc<ApiState>> {
             "/ui-bridge/devices/{id}/transport/prefer",
             post(prefer_transport),
         )
-        .route("/ui-bridge/devices/pair/initiate", post(initiate_pairing))
-        .route("/ui-bridge/devices/pair/confirm", post(confirm_pairing))
-        .route("/ui-bridge/devices/{id}/pairing", delete(revoke_pairing))
+        .route("/ui-bridge/devices/{id}/pair", post(pair_device))
         .route("/ui-bridge/devices/register-lan", post(register_lan_device))
 }
 

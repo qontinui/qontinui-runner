@@ -318,8 +318,6 @@ pub struct ApiState {
     /// `RelayState` extracted from this state). Plan
     /// `2026-09-17-ui-bridge-relay-registration-is-unauthenticated`.
     pub relay_binding: Arc<crate::mcp::relay_binding::RelayBinding>,
-    /// Pairing manager for LAN and Cloud device authentication
-    pub pairing_manager: Arc<crate::mcp::transport::pairing::PairingManager>,
     /// Rathole tunnel client (Plan 1B). Singleton — only one tunnel active.
     pub tunnel_client: Arc<crate::tunnel::RatholeClient>,
     /// iOS transport sidecar (Plan 2). Started lazily on first iOS request.

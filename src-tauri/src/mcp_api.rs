@@ -12372,7 +12372,6 @@ pub fn create_router(
         relay_binding: crate::mcp::relay_binding::RelayBinding::new(
             crate::mcp::relay_binding::BindingConfig::from_env(),
         ),
-        pairing_manager: Arc::new(crate::mcp::transport::pairing::PairingManager::new()),
         tunnel_client: Arc::new(crate::tunnel::RatholeClient::new()),
         ios_transport: Arc::new(crate::mcp::transport::ios::IosTransport::new()),
         ui_bridge_invoke_store: Arc::new(crate::ui_bridge_invoke::InvokeRequestStore::new()),
@@ -13592,13 +13591,35 @@ pub fn create_router(
                         .await
                     {
                         Ok(local_port) => {
-                            // Quick health check
+                            // Quick health check, direct: the port is this machine's.
                             let client = reqwest::Client::builder()
+                                .no_proxy()
                                 .timeout(std::time::Duration::from_secs(2))
                                 .build()
                                 .unwrap_or_else(|_| reqwest::Client::new());
-                            let url = format!("http://127.0.0.1:{}/ui-bridge/health", local_port);
-                            if client.get(&url).send().await.is_ok() {
+                            let base_url = format!("http://127.0.0.1:{}", local_port);
+                            let url = format!("{base_url}/ui-bridge/health");
+                            if let Ok(resp) = client.get(&url).send().await {
+                                // Over the forward the phone admits this runner as on the
+                                // phone itself, and so hands over its pairing token with no
+                                // code: fetch it now, so the same phone is reachable over
+                                // Wi-Fi once the cable is out.
+                                let gate = resp.json::<serde_json::Value>().await.ok().and_then(
+                                    |health| {
+                                        crate::mcp::transport::pairing::DeviceGate::from_health(
+                                            &health,
+                                        )
+                                    },
+                                );
+                                if let Some(gate) = gate.filter(|gate| gate.admits_as_local()) {
+                                    if let Some(ui_bridge_id) = gate.device_id {
+                                        crate::mcp::transport::pairing::spawn_token_fetch(
+                                            base_url.clone(),
+                                            ui_bridge_id,
+                                            true,
+                                        );
+                                    }
+                                }
                                 let now = chrono::Utc::now().timestamp_millis();
                                 let info = crate::mcp::physical_device::PhysicalDeviceInfo {
                                     id: device_id.clone(),
@@ -13608,7 +13629,6 @@ pub fn create_router(
                                     app_id: None,
                                     ui_bridge_version: None,
                                     first_seen_at: now,
-                                    pairing_token: None,
                                 };
                                 let transport = crate::mcp::physical_device::ActiveTransport {
                                     kind: crate::mcp::transport::TransportKind::Usb,
@@ -13754,8 +13774,17 @@ pub fn create_router(
                                     device.device_id,
                                     device.display_name
                                 );
-                                // Skip if already registered (any transport)
-                                if registry.get_device(&device.device_id).await.is_some() {
+                                // Skip a device that already has a cloud tunnel. One known
+                                // only over LAN or USB still gets one: a phone on Wi-Fi that
+                                // requires pairing this runner has not done is reached over
+                                // the relay instead, which its pairing gate does not cover.
+                                if registry
+                                    .has_transport_kind(
+                                        &device.device_id,
+                                        crate::mcp::transport::TransportKind::Cloud,
+                                    )
+                                    .await
+                                {
                                     continue;
                                 }
                                 // Open a cloud tunnel for this device so the registry
@@ -13781,7 +13810,6 @@ pub fn create_router(
                                                 },
                                                 ui_bridge_version: None,
                                                 first_seen_at: now,
-                                                pairing_token: None,
                                             };
                                         let transport =
                                             crate::mcp::physical_device::ActiveTransport {
@@ -13877,7 +13905,6 @@ pub fn create_router(
                                 app_id: info.txt_records.get("app_id").cloned(),
                                 ui_bridge_version: info.txt_records.get("version").cloned(),
                                 first_seen_at: now,
-                                pairing_token: info.txt_records.get("pairing_token").cloned(),
                             };
                             let transport = crate::mcp::physical_device::ActiveTransport {
                                 kind: crate::mcp::transport::TransportKind::Lan,

@@ -70,7 +70,6 @@ DELETE /ui-bridge/control/network/stubs ui_bridge_clear_network_stubs_handler
 DELETE /ui-bridge/control/network/stubs/{id} ui_bridge_delete_network_stub_handler
 DELETE /ui-bridge/design/style-guide ui_bridge_design_clear_style_guide_handler
 DELETE /ui-bridge/devices/{id} unregister_device
-DELETE /ui-bridge/devices/{id}/pairing revoke_pairing
 DELETE /ui-bridge/integration/{id} handle_delete_integration
 DELETE /ui-bridge/render-log handle_clear_render_log
 DELETE /ui-bridge/sdk/ai/bookmark/{name} handle_ct_delete_bookmark
@@ -1536,11 +1535,10 @@ POST /ui-bridge/design/evaluate/diff ui_bridge_design_evaluate_diff_handler
 POST /ui-bridge/design/responsive ui_bridge_design_responsive_handler
 POST /ui-bridge/design/snapshot ui_bridge_design_snapshot_handler
 POST /ui-bridge/design/style-guide/load ui_bridge_design_load_style_guide_handler
-POST /ui-bridge/devices/pair/confirm confirm_pairing
-POST /ui-bridge/devices/pair/initiate initiate_pairing
 POST /ui-bridge/devices/register-lan register_lan_device
 POST /ui-bridge/devices/{id}/connect connect_device
 POST /ui-bridge/devices/{id}/disconnect disconnect_device
+POST /ui-bridge/devices/{id}/pair pair_device
 POST /ui-bridge/devices/{id}/transport/prefer prefer_transport
 POST /ui-bridge/discover-states discover_states_from_renders
 POST /ui-bridge/explore start_ui_bridge_exploration
