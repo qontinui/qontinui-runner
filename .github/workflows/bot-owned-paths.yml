@@ -8,11 +8,18 @@ name: bot-owned-paths
 # Plan: qontinui-dev-notes plans/2026-11-04-runner-generated-and-ledger-files-are-
 # merge-neutral-and-land-behind-a-drain.md, Phase 0 and Design decision 4.
 #
-# ADVISORY FIRST. The job is named `bot-owned-paths (advisory)` and is NOT in
-# ruleset `main-merge-gates`' required checks. It reds a violating PR but holds
-# nothing for its first week. Promoting it to a required check is an operator
-# action the plan surfaces. When that happens, drop "(advisory)" from the job name
-# in the same change, because a required context is matched by name.
+# NOT REQUIRED BY GITHUB; COORD STILL HOLDS ON IT. The job is named
+# `bot-owned-paths (advisory)` and is NOT in ruleset `main-merge-gates`' required
+# checks, so its red never blocks a GitHub merge. Coord's merge train is another
+# matter. Any red check, required or not, makes coord's CI rollup red, so coord
+# will not land a violating PR. Its verdict is usually `ci-not-green`. The hold ends
+# when this check passes, because the bot-owned path left the PR or one of the
+# script's arms holds. It also ends if an operator attests coord's advisory-CI
+# override for the PR's current head (a new push cancels it), which coord honours
+# only while it can confirm every required check passes. Promoting it to a
+# required check is an operator action the plan surfaces. When that happens, drop
+# "(advisory)" from the job name in the same change, because a required context
+# is matched by name.
 #
 # THE VERDICT RUNS MAIN'S SCRIPT, IN A JOB THAT RUNS NO PR CODE. A `pull_request`
 # run checks out the PR's merge ref, so a PR could otherwise loosen the rule in its
