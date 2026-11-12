@@ -1159,33 +1159,65 @@ fn cluster_settings(
 }
 
 /// `pg_ctl start` on a free loopback port, retrying on a fresh port when the one
-/// picked was taken in between. On a failed attempt the dropped `PostgreSQL`
-/// stops whatever came up in OUR data directory, which is ours to stop.
+/// picked was taken in between ([`retry_port_collisions`]). On a failed attempt
+/// the dropped `PostgreSQL` stops whatever came up in OUR data directory, which
+/// is ours to stop.
 async fn start_on_free_port(base: &Settings) -> Result<(PostgreSQL, Duration), String> {
-    let log = base.data_dir.join(START_LOG);
+    retry_port_collisions(&base.data_dir.join(START_LOG), |port| {
+        let mut settings = base.clone();
+        settings.port = port;
+        async move {
+            let mut cluster = PostgreSQL::new(settings);
+            let starting = Instant::now();
+            match cluster.start().await {
+                Ok(()) => Ok((cluster, starting.elapsed())),
+                Err(e) => Err((e.to_string(), cluster)),
+            }
+        }
+    })
+    .await
+}
+
+/// Run `start` on a free loopback port up to [`START_ATTEMPTS`] times, again only
+/// while it fails because another process took the port in between.
+///
+/// Each failure is judged by the lines its own attempt wrote to `log`. Every
+/// attempt appends to that log (`pg_ctl -l`), so the length it had before the
+/// attempt is where the attempt's lines begin: an earlier attempt's collision
+/// must not make a later attempt's different failure look like one, and be
+/// retried instead of reported. `start` hands back what a failed attempt left
+/// (`G`), which is dropped only once the log is read: dropping a cluster that
+/// did come up stops it, and its shutdown lines would follow the failure's.
+async fn retry_port_collisions<T, G, Fut>(
+    log: &Path,
+    mut start: impl FnMut(u16) -> Fut,
+) -> Result<T, String>
+where
+    Fut: std::future::Future<Output = Result<T, (String, G)>>,
+{
     let mut last_failure = String::new();
     for _ in 0..START_ATTEMPTS {
-        let mut settings = base.clone();
-        settings.port =
-            free_loopback_port().ok_or_else(|| "no free loopback TCP port".to_string())?;
-        let port = settings.port;
-        let mut cluster = PostgreSQL::new(settings);
-        let starting = Instant::now();
-        match cluster.start().await {
-            Ok(()) => return Ok((cluster, starting.elapsed())),
-            Err(e) => {
-                let tail = log_tail(&log);
+        let port = free_loopback_port().ok_or_else(|| "no free loopback TCP port".to_string())?;
+        let written_before = log_len(log);
+        match start(port).await {
+            Ok(started) => return Ok(started),
+            Err((e, failed)) => {
+                let tail = log_tail(log, written_before);
+                drop(failed);
                 last_failure =
                     format!("pg_ctl start on port {port} failed: {e}; server log: {tail}");
-                let bind_collision =
-                    tail.contains("could not bind") || tail.contains("could not create any TCP");
-                if !bind_collision {
+                if !is_port_collision(&tail) {
                     return Err(last_failure);
                 }
             }
         }
     }
     Err(last_failure)
+}
+
+/// Whether a start attempt's server log says the port was already taken.
+fn is_port_collision(log: &str) -> bool {
+    log.contains("could not bind") || log.contains("could not create any TCP")
 }
 
 async fn boot_external(raw: String) -> Result<Server, String> {
@@ -2306,12 +2338,24 @@ fn make_private(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// The end of a server log, on one line, for a boot error.
-fn log_tail(path: &Path) -> String {
+/// How long a server log is now, in bytes: where whatever is written to it next
+/// begins. A log that does not exist yet is empty.
+fn log_len(path: &Path) -> u64 {
+    std::fs::metadata(path).map_or(0, |metadata| metadata.len())
+}
+
+/// The end of what a server log gained after its first `from` bytes
+/// ([`log_len`]), on one line, for a boot error. A log shorter than `from` was
+/// replaced rather than appended to, so it is read whole.
+fn log_tail(path: &Path, from: u64) -> String {
     match std::fs::read(path) {
         Ok(bytes) => {
-            let start = bytes.len().saturating_sub(LOG_TAIL_BYTES);
-            String::from_utf8_lossy(&bytes[start..])
+            let written = usize::try_from(from)
+                .ok()
+                .and_then(|from| bytes.get(from..))
+                .unwrap_or(&bytes);
+            let start = written.len().saturating_sub(LOG_TAIL_BYTES);
+            String::from_utf8_lossy(&written[start..])
                 .trim()
                 .replace(['\r', '\n'], " | ")
         }
@@ -3448,6 +3492,56 @@ mod tests {
         assert!(
             make_private(&dir.join("not-there")).is_err(),
             "a directory whose mode cannot be read must be reported, not passed over"
+        );
+    }
+
+    /// A start attempt's failure is judged by the lines that attempt wrote to the
+    /// server log, which every attempt appends to: a port collision is retried,
+    /// and a different failure in the attempt after it is reported, carrying
+    /// only that attempt's lines — not retried because the collision is still in
+    /// the log.
+    #[tokio::test]
+    async fn a_start_failure_is_judged_by_what_its_own_attempt_logged() {
+        use std::io::Write as _;
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let log = scratch.path().join(START_LOG);
+        let append = |line: &str| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log)
+                .and_then(|mut file| file.write_all(line.as_bytes()))
+                .expect("append to the server log");
+        };
+        let attempts = std::cell::Cell::new(0);
+        let failure = retry_port_collisions::<(), (), _>(&log, |_port| {
+            attempts.set(attempts.get() + 1);
+            append(if attempts.get() == 1 {
+                "LOG:  could not bind IPv4 address \"127.0.0.1\": Address already in use\n\
+                 FATAL:  could not create any TCP/IP sockets\n"
+            } else {
+                "FATAL:  data directory \"pg-data\" has invalid permissions\n"
+            });
+            std::future::ready(Err(("the server did not start".to_string(), ())))
+        })
+        .await
+        .expect_err("no attempt starts a server");
+        assert_eq!(
+            attempts.get(),
+            2,
+            "a collision is retried once, and the different failure after it is reported, not \
+             retried: {failure}"
+        );
+        assert!(
+            failure.contains("invalid permissions") && !failure.contains("could not bind"),
+            "the report must carry the failing attempt's lines and not the earlier collision's: \
+             {failure}"
+        );
+
+        let whole = log_tail(&log, u64::MAX);
+        assert!(
+            whole.contains("could not bind") && whole.contains("invalid permissions"),
+            "a log shorter than the offset (replaced, not appended to) is read whole: {whole}"
         );
     }
 
