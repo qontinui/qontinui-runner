@@ -330,6 +330,9 @@ repos:
       # `npm install` in qontinui-schemas as an explicit step, so the only lane
       # that ever runs this codegen against a bare sibling is the local pre-push
       # hook — and nothing runs that in CI. This test is the whole gate on it.
+      # CI cannot run the codegen against a bare sibling, but it can run this
+      # test: `.github/workflows/pre-commit-hook-tests.yml` does, so the gate
+      # holds for an author whose local hooks are not armed.
       #
       # Toolchain-free: throwaway trees under $TMPDIR with FAKE npm packages.
       # No Rust, no schemas checkout, no network — the one rung that needs a

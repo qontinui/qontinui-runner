@@ -148,7 +148,10 @@ code the local gate does not compile. The toolchain-free test suites behind
 the drift guard (hook ids `gen-events-attribution-test`, whose script is
 `gen-events-drift-attribution-test.sh`; `gen-events-file-attribution-test`;
 `gen-events-drift-root-test`; `push-range-test`) also run in CI, in the
-`gen-events hook suites` workflow.
+`gen-events hook suites` workflow. Every other `.pre-commit-hooks/*-test.sh`
+suite runs in the `pre-commit hook tests` workflow, which finds the suites by
+glob, so a new suite is covered without editing a list. Both workflows fail a
+suite that passed nothing or skipped an arm the runner should run.
 The gate is a faster feedback loop, never the thing standing between a
 regression and `main`.
 
