@@ -3057,10 +3057,12 @@ mod tests {
     /// A test process that is KILLED runs no exit-time teardown, so its
     /// postmaster outlives it, and the next boot's sweep must STOP that
     /// postmaster (`pg_ctl stop -m immediate`), not kill it: a stopped
-    /// postmaster removes its System V shared memory segment as it exits, and a
-    /// killed one leaves the segment behind for good once the sweep has removed
-    /// its data directory. On Linux the segment itself is checked, in
-    /// `/proc/sysvipc/shm`: listed while the child runs, gone after the sweep.
+    /// postmaster removes its System V segment and its dynamic shared memory
+    /// as it exits, and a killed one leaves both behind for good once the sweep
+    /// has removed its data directory. On Linux both are checked — the segment
+    /// in `/proc/sysvipc/shm`, and the `/dev/shm` files the postmaster maps —
+    /// present while the child runs and gone after the sweep. What a failing
+    /// run leaves is removed before anything is asserted.
     ///
     /// The child boots in the shared harness directory, where another boot
     /// running this same code — another test's child — may sweep the root
@@ -3110,7 +3112,7 @@ mod tests {
         let facts = parse_facts(&text)
             .unwrap_or_else(|| panic!("the child's report is malformed: {text:?}\n{}", output()));
         #[cfg(target_os = "linux")]
-        let segment = {
+        let (segment, shm_files) = {
             let segment = sysv_segment_of(&facts.data_dir).unwrap_or_else(|| {
                 panic!(
                     "{} names no System V segment, so nothing can show the stop freed it",
@@ -3122,7 +3124,14 @@ mod tests {
                 "the running postmaster's segment {segment:?} is not in /proc/sysvipc/shm, so \
                  its absence after the sweep would prove nothing"
             );
-            segment
+            let shm_files = shm_files_mapped_by(facts.postmaster_pid);
+            assert!(
+                !shm_files.is_empty(),
+                "postmaster {} maps no /dev/shm/PostgreSQL.* file, so nothing can show the stop \
+                 freed its dynamic shared memory",
+                facts.postmaster_pid
+            );
+            (segment, shm_files)
         };
 
         child.0.kill().expect("kill the hang child");
@@ -3141,8 +3150,29 @@ mod tests {
             .expect("a root lives in the harness directory");
         let swept = sweep_dead_roots(dir);
         let root = facts.root.display().to_string();
+        let postmaster_gone = wait_for(|| !postmaster_alive(&facts), DEATH_WAIT);
+        #[cfg(target_os = "linux")]
+        let (segment_left, files_left) = {
+            let segment_left = sysv_segment_listed(segment);
+            let files_left: Vec<&PathBuf> = shm_files.iter().filter(|file| file.exists()).collect();
+            if postmaster_gone {
+                if segment_left {
+                    // SAFETY: `shmctl(IPC_RMID)` with a null buffer only marks
+                    // the segment for removal. It is the segment the dead
+                    // postmaster above created, which nothing attaches now
+                    // that it is gone.
+                    unsafe {
+                        libc::shmctl(segment.1, libc::IPC_RMID, std::ptr::null_mut());
+                    }
+                }
+                for file in &files_left {
+                    let _ = std::fs::remove_file(file);
+                }
+            }
+            (segment_left, files_left)
+        };
         assert!(
-            wait_for(|| !postmaster_alive(&facts), DEATH_WAIT),
+            postmaster_gone,
             "postmaster {} of the killed child is still running after the sweep ({swept:?})",
             facts.postmaster_pid
         );
@@ -3157,23 +3187,28 @@ mod tests {
             );
         }
         #[cfg(target_os = "linux")]
-        {
-            let leaked = sysv_segment_listed(segment);
-            if leaked {
-                // SAFETY: `shmctl(IPC_RMID)` with a null buffer only marks the
-                // segment for removal. This is the segment the dead postmaster
-                // above created, which nothing attaches now that it is gone;
-                // removing it keeps a failing run from leaking it as well.
-                unsafe {
-                    libc::shmctl(segment.1, libc::IPC_RMID, std::ptr::null_mut());
-                }
-            }
-            assert!(
-                !leaked,
-                "the killed child's postmaster left its System V segment {segment:?} behind, \
-                 so it was not stopped ({swept:?})"
-            );
-        }
+        assert!(
+            !segment_left && files_left.is_empty(),
+            "the killed child's postmaster was not stopped: its System V segment {segment:?} \
+             left behind: {segment_left}; its /dev/shm files left behind: {files_left:?} \
+             ({swept:?})"
+        );
+    }
+
+    /// The `/dev/shm` files a running postmaster maps: its dynamic shared
+    /// memory control segment, and any segment it still holds.
+    #[cfg(target_os = "linux")]
+    fn shm_files_mapped_by(pid: u32) -> Vec<PathBuf> {
+        let maps = std::fs::read_to_string(format!("/proc/{pid}/maps")).unwrap_or_default();
+        let mut files: Vec<PathBuf> = maps
+            .lines()
+            .filter_map(|line| line.split_whitespace().nth(5))
+            .filter(|path| path.starts_with("/dev/shm/PostgreSQL."))
+            .map(PathBuf::from)
+            .collect();
+        files.sort();
+        files.dedup();
+        files
     }
 
     /// The System V segment a running postmaster's `postmaster.pid` names: its
