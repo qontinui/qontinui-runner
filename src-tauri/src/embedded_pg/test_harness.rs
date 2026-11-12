@@ -151,7 +151,10 @@ const _: () = assert!(
 /// Bump when the way the template cache is BUILT changes in a way its other key
 /// inputs cannot see, so every machine rebuilds rather than reusing a cache
 /// built the old way.
-const HARNESS_VERSION: &str = "1";
+///
+/// `2`: a cache is created private (0700 on Unix), so a `1` cache, created with
+/// the default mode around its superuser password, is never entered again.
+const HARNESS_VERSION: &str = "2";
 
 /// The `postgresql_embedded` release a cache was built with — a key input,
 /// because its `initdb` invocation shapes the data directory. Pinned against
@@ -751,12 +754,7 @@ async fn boot_embedded() -> Result<Server, String> {
     let booting = Instant::now();
     keep_std_handles_out_of_children();
     let dir = harness_dir()?;
-    create_private_dir_all(&dir).map_err(|e| {
-        format!(
-            "could not create the harness directory {}: {e}",
-            dir.display()
-        )
-    })?;
+    prepare_harness_dir(&dir)?;
     for line in sweep_dead_roots(&dir) {
         say(line);
     }
@@ -870,8 +868,8 @@ async fn boot_embedded() -> Result<Server, String> {
 /// directory, then removed each other's cache in turn until neither became
 /// ready.
 ///
-/// Either way the cache is marked used ([`LAST_USED_FILE`]) as it is entered,
-/// under the same lock.
+/// Either way the cache is marked used ([`LAST_USED_FILE`]) and made private
+/// ([`ensure_private`]) as it is entered, under the same lock.
 async fn enter_or_build<T, Built>(
     cache_lock: &std::fs::File,
     template_dir: &Path,
@@ -890,6 +888,7 @@ where
     cache_lock.lock_shared().map_err(lock_failed)?;
     if template_dir.join(READY_FILE).is_file() {
         touch_last_used(template_dir);
+        ensure_private(template_dir);
         let entered = enter();
         let _ = cache_lock.unlock();
         return entered.map(|entered| (entered, None));
@@ -904,6 +903,7 @@ where
             Some(build().await?)
         };
         touch_last_used(template_dir);
+        ensure_private(template_dir);
         enter().map(|entered| (entered, built))
     }
     .await;
@@ -2147,6 +2147,55 @@ fn private_dir_builder() -> std::fs::DirBuilder {
     builder
 }
 
+/// Enter the harness directory: create it private if it is missing, and make
+/// it private if it is not ([`ensure_private`]).
+fn prepare_harness_dir(dir: &Path) -> Result<(), String> {
+    create_private_dir_all(dir).map_err(|e| {
+        format!(
+            "could not create the harness directory {}: {e}",
+            dir.display()
+        )
+    })?;
+    ensure_private(dir);
+    Ok(())
+}
+
+/// [`make_private`], saying what it could not do and carrying on: a directory
+/// whose mode this process cannot change, another user's say, still works.
+fn ensure_private(dir: &Path) {
+    if let Err(problem) = make_private(dir) {
+        say(format!("{problem}; carrying on with it as it is"));
+    }
+}
+
+/// Set a directory that is not private to 0700 on Unix; one already private is
+/// left as it is. A directory that exists keeps its mode when it is created
+/// again ([`create_private_dir_all`]), and the harness directory and every
+/// template cache hold a cluster's superuser password (`tpl-*/pg-pass`), so
+/// each is made private whenever the harness enters it, however it was made.
+fn make_private(dir: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(dir)
+            .map_err(|e| format!("could not read the mode of {}: {e}", dir.display()))?
+            .permissions()
+            .mode()
+            & 0o777;
+        if mode & 0o077 != 0 {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
+                format!(
+                    "could not make {} private (it is {mode:o}): {e}",
+                    dir.display()
+                )
+            })?;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
+}
+
 /// The end of a server log, on one line, for a boot error.
 fn log_tail(path: &Path) -> String {
     match std::fs::read(path) {
@@ -3072,6 +3121,87 @@ mod tests {
         assert!(
             create_private_dir_all(&file).is_err(),
             "a file where the harness directory goes must be an error"
+        );
+    }
+
+    /// A harness directory and template caches that already exist with a wider
+    /// mode — made before the harness made them private, or by hand — are made
+    /// private as the harness enters them, a READY cache and a just-built one
+    /// alike: creating a directory that exists leaves its mode as it is, and
+    /// every cache holds its cluster's superuser password (`pg-pass`).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_existing_harness_directory_and_cache_are_made_private_on_entry() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode_of = |path: &Path| {
+            std::fs::metadata(path)
+                .unwrap_or_else(|e| panic!("read the mode of {}: {e}", path.display()))
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        let widen = |path: &Path| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o775))
+                .unwrap_or_else(|e| panic!("widen {}: {e}", path.display()));
+            assert_eq!(mode_of(path), 0o775, "{} was not widened", path.display());
+        };
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let dir = scratch.path().join("qontinui-test-pg");
+        let ready = dir.join(format!("{TEMPLATE_PREFIX}ready"));
+        std::fs::create_dir_all(&ready).expect("plant the READY cache");
+        std::fs::write(ready.join(READY_FILE), "built before caches were private\n")
+            .expect("mark it READY");
+        widen(&dir);
+        widen(&ready);
+
+        prepare_harness_dir(&dir).expect("enter the harness directory");
+        assert_eq!(
+            mode_of(&dir),
+            0o700,
+            "entering the harness directory left it readable to other users"
+        );
+
+        let lock = open_lock(&dir).expect("the cache lock");
+        enter_or_build(
+            &lock,
+            &ready,
+            || async { Err::<Duration, _>("a READY cache is never rebuilt".to_string()) },
+            || Ok(()),
+        )
+        .await
+        .expect("enter the READY cache");
+        assert_eq!(
+            mode_of(&ready),
+            0o700,
+            "entering a READY cache left it, and its pg-pass, readable to other users"
+        );
+
+        let missing = dir.join(format!("{TEMPLATE_PREFIX}missing"));
+        let building: &Path = &missing;
+        enter_or_build(
+            &lock,
+            building,
+            move || async move {
+                std::fs::create_dir(building).map_err(|e| e.to_string())?;
+                std::fs::set_permissions(building, std::fs::Permissions::from_mode(0o775))
+                    .map_err(|e| e.to_string())?;
+                std::fs::write(building.join(READY_FILE), "built by the test\n")
+                    .map_err(|e| e.to_string())?;
+                Ok::<_, String>(Duration::from_millis(1))
+            },
+            || Ok(()),
+        )
+        .await
+        .expect("build and enter the missing cache");
+        assert_eq!(
+            mode_of(&missing),
+            0o700,
+            "entering the cache it built left it readable to other users"
+        );
+
+        assert!(
+            make_private(&dir.join("not-there")).is_err(),
+            "a directory whose mode cannot be read must be reported, not passed over"
         );
     }
 
