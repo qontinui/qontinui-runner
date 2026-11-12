@@ -5528,6 +5528,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                 &live_ptys,
                                 &look,
                                 "periodic",
+                                &|| session::reconcile::live_panes_of(&poll_tm),
                             )
                             .await;
                             emit_session_bound(&poll_app_handle, &actions);
@@ -5642,7 +5643,12 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     let provider_rows =
                         session::reconcile::compute_provider_rows(&live, &boot_look).await;
                     let actions =
-                        session::reconcile::run_at_boot(&reconcile_lifecycle_store, live).await;
+                        session::reconcile::run_at_boot(
+                            &reconcile_lifecycle_store,
+                            live,
+                            &|| session::reconcile::live_panes_of(&reconcile_tm),
+                        )
+                        .await;
                     // Config-dir repair (D2), from the same provider rows. A
                     // record the boot bind (or a migration racing it) wrote is
                     // past `pre_evidence`, so it waits for the periodic tick.
