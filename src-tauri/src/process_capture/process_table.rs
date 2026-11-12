@@ -2221,11 +2221,19 @@ mod tests {
             .expect("spawn child");
         let pid = child.id();
         // The process may not have published its command line the instant
-        // it is created; give it a bounded moment.
+        // it is created; give it a bounded moment. Wait for the id to PARSE,
+        // not merely to appear: a read racing the child's exec can see a
+        // half-switched argv that already holds the id but not its flag
+        // (measured: `/home/spinak/Projects/qontinui-r <id>`), and stopping
+        // there failed the assertion below on a line the child never had.
+        let parsed = |l: &str| {
+            crate::process_capture::process_tree::parse_session_id_from_cmdline(l).as_deref()
+                == Some(id)
+        };
         let mut line = None;
         for _ in 0..50 {
             line = command_lines_blocking(&[pid]).expect("read").remove(&pid);
-            if line.as_deref().is_some_and(|l| l.contains(id)) {
+            if line.as_deref().is_some_and(parsed) {
                 break;
             }
             std::thread::sleep(Duration::from_millis(50));
