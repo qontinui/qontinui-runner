@@ -11348,8 +11348,8 @@ mod tests {
             RekeySource, SourceCounts,
         };
         use crate::session::reconcile::{
-            run_reconcile, BindOrigin, LivePty, PrescannedTranscriptIndex, ReconcileAction,
-            TranscriptCandidate, TranscriptIndex,
+            every_listed_pty_is_live, run_reconcile, BindOrigin, LivePty,
+            PrescannedTranscriptIndex, ReconcileAction, TranscriptCandidate, TranscriptIndex,
         };
         use crate::session::session_lifecycle_store::SessionLifecycleStore;
 
@@ -11850,6 +11850,7 @@ mod tests {
                 &crate::process_capture::process_tree::ProcessSnapshot::default(),
                 &PrescannedTranscriptIndex::default(),
                 &cmdlines,
+                &every_listed_pty_is_live(&live),
             );
             apply_reconcile_tick(&reg, &actions, |t| (t == "pane-1").then_some(row));
             coord.drain_once_for_test().await;
@@ -11879,6 +11880,7 @@ mod tests {
                 &crate::process_capture::process_tree::ProcessSnapshot::default(),
                 &PrescannedTranscriptIndex::default(),
                 &cmdlines,
+                &every_listed_pty_is_live(&live),
             );
             apply_reconcile_tick(&reg, &again, |t| (t == "pane-1").then_some(row));
             coord.drain_once_for_test().await;
@@ -11944,6 +11946,7 @@ mod tests {
                     &snap,
                     &PrescannedTranscriptIndex::default(),
                     &cmdlines,
+                    &every_listed_pty_is_live(&live),
                 );
                 apply_reconcile_tick_with(&reg, &actions, &rows, |t| {
                     (t == "pane-1").then_some(row)
@@ -12004,7 +12007,14 @@ mod tests {
             let snapshot = crate::process_capture::process_tree::ProcessSnapshot::default();
             let lookup = |t: &str| (t == "pane-1").then_some(row);
 
-            let first = run_reconcile(&store, &live, &snapshot, &index, &cmdlines);
+            let first = run_reconcile(
+                &store,
+                &live,
+                &snapshot,
+                &index,
+                &cmdlines,
+                &every_listed_pty_is_live(&live),
+            );
             assert!(
                 first.iter().any(|a| matches!(
                     a,
@@ -12020,7 +12030,14 @@ mod tests {
             assert_eq!(coord.rekeys().counts(RekeySource::Rung2).refused, 1);
             assert_eq!(coord_rekey_patches(&*rec.lock().await, row), 1);
 
-            let second = run_reconcile(&store, &live, &snapshot, &index, &cmdlines);
+            let second = run_reconcile(
+                &store,
+                &live,
+                &snapshot,
+                &index,
+                &cmdlines,
+                &every_listed_pty_is_live(&live),
+            );
             assert!(
                 second
                     .iter()
@@ -12072,14 +12089,28 @@ mod tests {
             let index = TranscriptOnDisk(LIVE);
             let snapshot = crate::process_capture::process_tree::ProcessSnapshot::default();
 
-            let first = run_reconcile(&store, &live, &snapshot, &index, &cmdlines);
+            let first = run_reconcile(
+                &store,
+                &live,
+                &snapshot,
+                &index,
+                &cmdlines,
+                &every_listed_pty_is_live(&live),
+            );
             let outcome = apply_reconcile_tick(&reg, &first, |_| None);
             assert_eq!(
                 outcome,
                 vec![("pane-1".to_string(), RekeyOutcome::NoCoordRow)]
             );
 
-            let second = run_reconcile(&store, &live, &snapshot, &index, &cmdlines);
+            let second = run_reconcile(
+                &store,
+                &live,
+                &snapshot,
+                &index,
+                &cmdlines,
+                &every_listed_pty_is_live(&live),
+            );
             apply_reconcile_tick(&reg, &second, |t| (t == "pane-1").then_some(row));
             coord.drain_once_for_test().await;
             assert_eq!(coord.rekeys().counts(RekeySource::Rung2).landed, 1);

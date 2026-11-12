@@ -5332,6 +5332,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                 &live_ptys,
                                 &snap,
                                 "periodic",
+                                &|| session::reconcile::live_panes_of(&poll_tm),
                             )
                             .await;
                             emit_session_bound(&poll_app_handle, &actions);
@@ -5410,8 +5411,12 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         crate::process_capture::process_tree::snapshot_process_table_public().await;
                     let provider_rows =
                         session::reconcile::compute_provider_rows(&live, &boot_snap).await;
-                    let actions =
-                        session::reconcile::run_at_boot(&reconcile_lifecycle_store, live).await;
+                    let actions = session::reconcile::run_at_boot(
+                        &reconcile_lifecycle_store,
+                        live,
+                        &|| session::reconcile::live_panes_of(&reconcile_tm),
+                    )
+                    .await;
                     emit_session_bound(&reconcile_app_handle, &actions);
                     session::coord_identity::apply_reconcile_tick_in_app(
                         &reconcile_app_handle,

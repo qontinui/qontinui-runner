@@ -62,6 +62,9 @@ use crate::session::observation_epoch::{ObservationEpoch, Observed};
 use crate::session::restore_record_emitter::RestoreRecordEmitter;
 use crate::session::snapshot_history::{SnapshotHistory, SnapshotSession, TranscriptProbe};
 
+mod inferred_bind;
+pub use inferred_bind::InferredBind;
+
 /// The runner's own app-data root, `~/.qontinui/runner`, keeping the existing
 /// "." fallback for a home-less environment. Base for the instance-scoped
 /// path helpers below.
@@ -1755,6 +1758,45 @@ impl SessionLifecycleStore {
     /// A brand-new record sets `opened_at == last_seen_at == now`. Atomic-
     /// writes after mutating.
     pub fn record_open(&self, rec: TerminalSessionRecord) {
+        let _ = self.record_open_guarded(rec, None);
+    }
+
+    /// The reconcile binder's write: [`Self::record_open`] behind a write-time
+    /// liveness guard ([`inferred_bind::refusal`]), asked under the same lock
+    /// acquisition as the merge, so no other writer can move the row between
+    /// the check and the write.
+    ///
+    /// A bind the binder INFERS rests on evidence read before this call: its
+    /// pass captures the live panes and their claude command lines, then waits
+    /// up to 30 s on a transcript prescan. So the bind is refused when the pane
+    /// it names is not live now, or when it would move an OPEN row off a pane
+    /// that is live now. A row on a pane that is gone still binds to the live
+    /// pane holding its id (the dead-to-live heal). A refusal writes nothing.
+    ///
+    /// The liveness is passed in, as [`Self::mark_awaiting_account`]'s is, so
+    /// the store stays free of the `TerminalManager`. Callers read the
+    /// manager's live set immediately BEFORE this call, never under this lock.
+    ///
+    /// Authoritative writers (the account migration's own spawn write, a
+    /// SessionStart hook) keep [`Self::record_open`]. They are `authoritative`
+    /// by origin, as the binder's rung-2 bind is, so the store could not tell
+    /// them apart by the record alone.
+    pub fn bind_inferred(
+        &self,
+        rec: TerminalSessionRecord,
+        terminal_is_live: &dyn Fn(&str) -> bool,
+    ) -> InferredBind {
+        self.record_open_guarded(rec, Some(terminal_is_live))
+    }
+
+    /// [`Self::record_open`]'s body. `terminal_is_live`, when given, is
+    /// [`Self::bind_inferred`]'s guard, asked under the lock before anything
+    /// is merged.
+    fn record_open_guarded(
+        &self,
+        rec: TerminalSessionRecord,
+        terminal_is_live: Option<&dyn Fn(&str) -> bool>,
+    ) -> InferredBind {
         // Normalize a stray empty/whitespace-only config_dir to None: it must
         // never become a bogus `CLAUDE_CONFIG_DIR=""` on resume, and the sticky
         // guard below must treat "no account reported" uniformly as None (so an
@@ -1796,9 +1838,18 @@ impl SessionLifecycleStore {
                 Ok(m) => m,
                 Err(e) => {
                     warn!(error = %e, "session_lifecycle_store: lock poisoned on record_open");
-                    return;
+                    return InferredBind::StoreUnavailable;
                 }
             };
+            if let Some(terminal_is_live) = terminal_is_live {
+                if let Some(refused) = inferred_bind::refusal(
+                    m.get(&rec.claude_session_id),
+                    &rec.terminal_id,
+                    terminal_is_live,
+                ) {
+                    return refused;
+                }
+            }
             // W-B: a BRAND-NEW record binding a terminal inherits the spawn-time
             // device default another open record on that terminal already
             // carries. The seam records a provisional row at spawn; an account
@@ -2038,6 +2089,7 @@ impl SessionLifecycleStore {
         // Phase 4 cloud mirror — emit AFTER the durable local write, from
         // the MERGED record (origin/confirmation preservation applied).
         self.mirror_restore_record(&merged);
+        InferredBind::Bound
     }
 
     /// Mark an open session closed. No-op (no error) if the session is
