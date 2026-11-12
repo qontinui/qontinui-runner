@@ -2,8 +2,13 @@
  * PhysicalDeviceManager.tsx
  *
  * UI for managing physical device connections in the runner.
- * Supports viewing connected devices, pairing via LAN code, and manual LAN registration.
+ * Supports viewing connected devices, pairing a device, and manual LAN registration.
  * Fetches from the runner's /ui-bridge/devices/* API endpoints.
+ *
+ * Pairing is the phone's: the runner asks it for a token
+ * (POST /ui-bridge/devices/{id}/pair) and signs every later request to it with
+ * that token. Over USB the phone asks no code. On Wi-Fi it asks for the 6-digit
+ * code its Settings shows after Pair is tapped. The token never reaches this UI.
  */
 
 import { useState, useEffect, useCallback } from "react";
@@ -44,7 +49,6 @@ interface PhysicalDevice {
     appId?: string;
     uiBridgeVersion?: string;
     firstSeenAt: number;
-    pairingToken?: string;
   };
   transports: DeviceTransport[];
   activeTransportIdx: number;
@@ -55,6 +59,7 @@ interface ApiResponse<T> {
   success: boolean;
   data?: T;
   error?: string;
+  code?: string;
 }
 
 interface DeviceListData {
@@ -62,9 +67,24 @@ interface DeviceListData {
   count: number;
 }
 
-interface PairInitiateData {
-  pairingCode: string;
-  expiresAt: number;
+interface PairResult {
+  deviceId: string;
+  uiBridgeDeviceId: string;
+  transport: "usb" | "lan" | "cloud";
+  paired: boolean;
+}
+
+interface PairNotice {
+  deviceId: string;
+  ok: boolean;
+  text: string;
+  /**
+   * Set when the runner refused to replace the token it holds for the phone
+   * (`PAIRING_TOKEN_HELD`). The phone spent the code on that pairing, so a retry
+   * with `replace: true` needs a new one. The operator should replace only if they
+   * revoked the pairing in the app's Settings.
+   */
+  offerReplace?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -92,6 +112,18 @@ function transportBadgeClass(kind: "usb" | "lan" | "cloud") {
       return "bg-purple-500/15 text-purple-400 border border-purple-500/20";
   }
 }
+
+/**
+ * The transport a pairing goes over: the best one other than the cloud relay,
+ * which needs no pairing. Mirrors the runner's own choice in POST .../pair.
+ */
+function pairingTransportOf(device: PhysicalDevice): DeviceTransport | null {
+  const active = device.transports[device.activeTransportIdx];
+  const rest = device.transports.filter((_, idx) => idx !== device.activeTransportIdx);
+  return [active, ...rest].find((t) => t !== undefined && t.kind !== "cloud") ?? null;
+}
+
+const PAIRING_CODE = /^\d{6}$/;
 
 function healthDotClass(state: "healthy" | "degraded" | "unreachable") {
   switch (state) {
@@ -135,12 +167,15 @@ export function PhysicalDeviceManager() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  // Pairing state
-  const [showPairSection, setShowPairSection] = useState(false);
   const [showWizard, setShowWizard] = useState(false);
-  const [pairingCode, setPairingCode] = useState<string | null>(null);
-  const [pairingError, setPairingError] = useState<string | null>(null);
-  const [pairingLoading, setPairingLoading] = useState(false);
+
+  // Pairing state: which card shows the code entry, and the last outcome.
+  const [pairOpenId, setPairOpenId] = useState<string | null>(null);
+  const [pairCode, setPairCode] = useState("");
+  const [pairBusyId, setPairBusyId] = useState<string | null>(null);
+  const [pairNotice, setPairNotice] = useState<PairNotice | null>(null);
+  // The device whose next code pairing replaces the token the runner holds.
+  const [replaceId, setReplaceId] = useState<string | null>(null);
 
   // Manual LAN registration
   const [showLanSection, setShowLanSection] = useState(false);
@@ -209,6 +244,12 @@ export function PhysicalDeviceManager() {
         },
       );
       const json: ApiResponse<unknown> = await res.json();
+      if (!json.success && json.code === "PAIRING_REQUIRED") {
+        // The phone requires pairing: open its code entry rather than an error banner.
+        setPairOpenId(id);
+        setPairNotice({ deviceId: id, ok: false, text: json.error ?? "Pairing required" });
+        return;
+      }
       if (!json.success) {
         throw new Error(json.error ?? "Connect failed");
       }
@@ -245,33 +286,70 @@ export function PhysicalDeviceManager() {
   // Pairing
   // ---------------------------------------------------------------------------
 
-  const initiatePairing = async () => {
-    setPairingLoading(true);
-    setPairingError(null);
-    setPairingCode(null);
+  const pairDevice = async (id: string, code?: string, replace = false) => {
+    setPairBusyId(id);
+    setPairNotice(null);
     try {
-      const res = await tracedFetch(`${getApiBase()}/ui-bridge/devices/pair/initiate`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ transport: "lan" }),
-      });
-      const json: ApiResponse<PairInitiateData> = await res.json();
+      const res = await tracedFetch(
+        `${getApiBase()}/ui-bridge/devices/${encodeURIComponent(id)}/pair`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ ...(code ? { code } : {}), ...(replace ? { replace } : {}) }),
+        },
+      );
+      const json: ApiResponse<PairResult> = await res.json();
       if (json.success && json.data) {
-        setPairingCode(json.data.pairingCode);
+        // A pair makes the paired transport active and drops the device's live
+        // connections, so the list changes and the next Connect goes to it, signed.
+        setPairNotice({
+          deviceId: id,
+          ok: true,
+          text: `Paired over ${json.data.transport.toUpperCase()}. Connect to drive it.`,
+        });
+        setPairOpenId(null);
+        setPairCode("");
+        setReplaceId(null);
+        await fetchDevices();
       } else {
-        setPairingError(json.error ?? "Failed to initiate pairing");
+        // A code-less pair the phone answers with "a code is needed" (whatever the
+        // transport) opens the code entry, so the operator can type the one the
+        // app's Settings shows after Pair is tapped.
+        if (!code && (json.code === "PAIRING_CODE_REQUIRED" || json.code === "PAIRING_NOT_ARMED")) {
+          setPairOpenId(id);
+          setPairCode("");
+        }
+        // The phone spent its code on a pairing the runner refused to keep, so the
+        // code entry is cleared for a new one.
+        if (json.code === "PAIRING_TOKEN_HELD") {
+          setPairOpenId(id);
+          setPairCode("");
+        }
+        setPairNotice({
+          deviceId: id,
+          ok: false,
+          text: json.error ?? "Pairing failed",
+          offerReplace: json.code === "PAIRING_TOKEN_HELD",
+        });
       }
     } catch (err) {
-      setPairingError(`Pairing request failed: ${err}`);
+      setPairNotice({ deviceId: id, ok: false, text: `Pairing request failed: ${err}` });
     } finally {
-      setPairingLoading(false);
+      setPairBusyId(null);
     }
   };
 
-  const cancelPairing = () => {
-    setPairingCode(null);
-    setPairingError(null);
-    setShowPairSection(false);
+  const startPairing = (device: PhysicalDevice) => {
+    const transport = pairingTransportOf(device);
+    if (transport?.kind === "usb") {
+      // Over a cable the phone asks no code.
+      void pairDevice(device.info.id);
+      return;
+    }
+    setPairOpenId((open) => (open === device.info.id ? null : device.info.id));
+    setPairCode("");
+    setPairNotice(null);
+    setReplaceId(null);
   };
 
   // ---------------------------------------------------------------------------
@@ -290,11 +368,13 @@ export function PhysicalDeviceManager() {
       const res = await tracedFetch(`${getApiBase()}/ui-bridge/devices/register-lan`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ip: lanIp.trim(), port: parseInt(lanPort, 10) || 8087 }),
+        // The route takes one `address`, "IP:port".
+        body: JSON.stringify({ address: `${lanIp.trim()}:${parseInt(lanPort, 10) || 8087}` }),
       });
-      const json: ApiResponse<{ deviceId: string }> = await res.json();
+      const json: ApiResponse<PhysicalDevice> = await res.json();
       if (json.success) {
-        setLanSuccess(`Device registered${json.data?.deviceId ? ` (${json.data.deviceId})` : ""}`);
+        const registeredId = json.data?.info.id;
+        setLanSuccess(`Device registered${registeredId ? ` (${registeredId})` : ""}`);
         setLanIp("");
         await fetchDevices();
       } else {
@@ -370,7 +450,7 @@ export function PhysicalDeviceManager() {
           <Tablet className="w-8 h-8 text-muted-foreground/40" />
           <p className="text-xs text-muted-foreground">No physical devices registered.</p>
           <p className="text-[10px] text-muted-foreground/70">
-            Use "Pair New Device" or add a LAN device below.
+            Use the Connection Wizard or add a LAN device below.
           </p>
         </div>
       ) : (
@@ -379,6 +459,9 @@ export function PhysicalDeviceManager() {
             const activeTransport = activeTransportOf(device);
             const isBusy = connectingDeviceId === device.info.id;
             const isConnected = activeTransport !== null && device.healthState !== "unreachable";
+            const pairingTransport = pairingTransportOf(device);
+            const isPairing = pairBusyId === device.info.id;
+            const notice = pairNotice?.deviceId === device.info.id ? pairNotice : null;
 
             return (
               <div
@@ -453,8 +536,91 @@ export function PhysicalDeviceManager() {
                   </p>
                 )}
 
-                {/* Connect / Disconnect button */}
-                <div className="flex justify-end pt-1">
+                {/* Pairing code entry (Wi-Fi), and the last pairing outcome */}
+                {pairOpenId === device.info.id && (
+                  <div className="space-y-2 rounded-md bg-muted/30 border border-border/50 p-2.5">
+                    <p className="text-[10px] text-muted-foreground">
+                      {replaceId === device.info.id
+                        ? "Tap Pair in the app's Settings again and enter the new code: the last one is spent. Pressing Replace keeps the token the phone answers with, in place of the one this runner holds."
+                        : "Tap Pair in the app's Settings and enter the 6-digit code it shows."}
+                    </p>
+                    <div className="flex gap-2">
+                      <input
+                        aria-label="Pairing code"
+                        type="text"
+                        inputMode="numeric"
+                        autoComplete="one-time-code"
+                        maxLength={6}
+                        value={pairCode}
+                        onChange={(e) => setPairCode(e.target.value.replace(/\D/g, ""))}
+                        placeholder="123456"
+                        className="w-28 px-2.5 py-1.5 font-mono text-sm tracking-[0.3em] bg-muted/50 rounded-md placeholder:text-muted-foreground outline-hidden focus:ring-1 focus:ring-primary/50"
+                      />
+                      <button
+                        onClick={() =>
+                          pairDevice(device.info.id, pairCode, replaceId === device.info.id)
+                        }
+                        disabled={isPairing || !PAIRING_CODE.test(pairCode)}
+                        className="px-3 py-1.5 text-xs font-medium rounded-md bg-primary text-primary-foreground hover:bg-primary/90 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        {isPairing
+                          ? "Pairing..."
+                          : replaceId === device.info.id
+                            ? "Replace"
+                            : "Pair"}
+                      </button>
+                      <button
+                        onClick={() => {
+                          setPairOpenId(null);
+                          setReplaceId(null);
+                        }}
+                        className="px-3 py-1.5 text-xs font-medium rounded-md bg-muted text-muted-foreground hover:text-foreground hover:bg-muted/80 transition-colors"
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                )}
+                {notice && (
+                  <p className={`text-[10px] ${notice.ok ? "text-green-400" : "text-destructive"}`}>
+                    {notice.text}
+                  </p>
+                )}
+                {notice?.offerReplace && replaceId !== device.info.id && (
+                  <div className="flex justify-end">
+                    <button
+                      onClick={() => {
+                        // The refused pairing spent the code, so this only arms the
+                        // next one: the operator enters a new code to replace.
+                        setReplaceId(device.info.id);
+                        setPairOpenId(device.info.id);
+                        setPairCode("");
+                      }}
+                      disabled={isPairing}
+                      title="Only if you revoked this runner's pairing in the app's Settings"
+                      className="px-2.5 py-1 text-xs rounded-md border border-destructive/30 text-destructive hover:bg-destructive/10 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      I revoked it in the app: replace the pairing
+                    </button>
+                  </div>
+                )}
+
+                {/* Pair + Connect / Disconnect buttons */}
+                <div className="flex justify-end gap-2 pt-1">
+                  {pairingTransport && (
+                    <button
+                      onClick={() => startPairing(device)}
+                      disabled={isPairing}
+                      title={
+                        pairingTransport.kind === "usb"
+                          ? "Fetch this phone's pairing token over USB (no code needed)"
+                          : "Pair over Wi-Fi with the code the app shows"
+                      }
+                      className="flex items-center gap-1.5 px-2.5 py-1 text-xs rounded-md border border-border bg-transparent text-foreground hover:bg-muted/30 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      {isPairing ? "Pairing..." : "Pair"}
+                    </button>
+                  )}
                   {isConnected ? (
                     <button
                       onClick={() => disconnectDevice(device.info.id)}
@@ -487,79 +653,18 @@ export function PhysicalDeviceManager() {
           <div>
             <h5 className="text-sm font-medium">Pair New Device</h5>
             <p className="text-[10px] text-muted-foreground mt-0.5">
-              Generate a pairing code the device app can enter to connect via LAN.
+              Connect a phone, then pair it in its row above: over USB no code is needed, and on
+              Wi-Fi the app&apos;s Settings shows a 6-digit code after Pair is tapped.
             </p>
           </div>
-          {!showPairSection && (
-            <div className="flex items-center gap-2">
-              <button
-                onClick={() => setShowWizard(true)}
-                className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md bg-primary text-primary-foreground hover:bg-primary/90 transition-colors"
-              >
-                <Plus className="w-3 h-3" />
-                Connection Wizard
-              </button>
-              <button
-                onClick={() => {
-                  setShowPairSection(true);
-                  initiatePairing();
-                }}
-                className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md border border-border bg-transparent text-foreground hover:bg-muted/30 transition-colors"
-              >
-                Pair by code
-              </button>
-            </div>
-          )}
+          <button
+            onClick={() => setShowWizard(true)}
+            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md bg-primary text-primary-foreground hover:bg-primary/90 transition-colors"
+          >
+            <Plus className="w-3 h-3" />
+            Connection Wizard
+          </button>
         </div>
-
-        {showPairSection && (
-          <div className="space-y-3">
-            {pairingLoading && (
-              <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                <RefreshCw className="w-3 h-3 animate-spin" />
-                Generating pairing code...
-              </div>
-            )}
-
-            {pairingError && (
-              <div className="flex items-start gap-2 p-2.5 rounded-md bg-destructive/10 border border-destructive/20">
-                <AlertCircle className="w-4 h-4 text-destructive shrink-0 mt-0.5" />
-                <p className="text-xs text-destructive">{pairingError}</p>
-              </div>
-            )}
-
-            {pairingCode && (
-              <div className="flex flex-col items-center gap-2 p-4 rounded-lg bg-muted/30 border border-border/50">
-                <p className="text-xs text-muted-foreground">
-                  Enter this code on the device app to complete pairing:
-                </p>
-                <div className="font-mono text-3xl font-bold tracking-[0.3em] text-foreground select-all">
-                  {pairingCode}
-                </div>
-                <p className="text-[10px] text-muted-foreground">
-                  Waiting for device confirmation…
-                </p>
-              </div>
-            )}
-
-            <div className="flex gap-2 justify-end">
-              {!pairingLoading && !pairingCode && (
-                <button
-                  onClick={initiatePairing}
-                  className="px-3 py-1.5 text-xs font-medium rounded-md bg-primary text-primary-foreground hover:bg-primary/90 transition-colors"
-                >
-                  Retry
-                </button>
-              )}
-              <button
-                onClick={cancelPairing}
-                className="px-3 py-1.5 text-xs font-medium rounded-md bg-muted text-muted-foreground hover:text-foreground hover:bg-muted/80 transition-colors"
-              >
-                Cancel
-              </button>
-            </div>
-          </div>
-        )}
       </div>
 
       {/* Manual LAN Registration */}

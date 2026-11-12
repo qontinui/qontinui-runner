@@ -1910,6 +1910,98 @@ impl Default for SecureStorage {
     }
 }
 
+/// A second encrypted file beside `auth_tokens.enc`, holding one serde value of
+/// the caller's choosing.
+///
+/// It has that store's key, cross-process lock, owner-only atomic write and
+/// refusal to rewrite an unreadable file from blank, and the same security model
+/// (see the module docs). It is a separate file so that nothing which clears
+/// `auth_tokens.enc` reaches it: sign-out ([`SecureStorage::clear_tokens`]) and
+/// [`SecureStorage::delete_storage`] work on that file only. The first holder is
+/// the runner's UI Bridge device-pairing tokens, which must outlive a sign-out.
+pub struct EncryptedJsonFile {
+    store: SecureStorage,
+}
+
+impl EncryptedJsonFile {
+    /// `file_name` in the secure storage directory, created if absent.
+    pub fn in_storage_dir(file_name: &str) -> Result<Self> {
+        let data_dir =
+            crate::instance_env::secure_storage_dir().context("Failed to get data directory")?;
+        fs::create_dir_all(&data_dir).context("Failed to create data directory")?;
+        let storage_path = data_dir.join(file_name);
+        let lock_file = lock_path_for(&storage_path);
+        Ok(Self {
+            store: SecureStorage {
+                storage_path,
+                lock_file,
+            },
+        })
+    }
+
+    /// A file at `storage_path`, for tests. Gated as [`SecureStorage::with_path`] is.
+    #[cfg(any(test, debug_assertions))]
+    #[doc(hidden)]
+    pub fn with_path(storage_path: PathBuf) -> Result<Self> {
+        Ok(Self {
+            store: SecureStorage::with_path(storage_path)?,
+        })
+    }
+
+    /// The value on disk: `T::default()` when the file does not exist, and an
+    /// error when it exists but cannot be decrypted or parsed, which is not the
+    /// same fact as "empty".
+    pub fn load<T: serde::de::DeserializeOwned + Default>(&self) -> Result<T> {
+        let path = &self.store.storage_path;
+        if !path.exists() {
+            return Ok(T::default());
+        }
+        let encrypted = fs::read(path).context("Failed to read encrypted file")?;
+        let decrypted = self.store.decrypt(&encrypted)?;
+        serde_json::from_slice(&decrypted).context("Failed to parse encrypted file")
+    }
+
+    /// One locked read-modify-write. Over a file that exists but cannot be read,
+    /// it refuses, unless `rebuild_unreadable` is set, in which case it starts from
+    /// `T::default()` and says so. Only an explicit act by the operator (a
+    /// pairing) should set it: a background writer would discard what it could
+    /// not read.
+    pub fn update<T, R>(
+        &self,
+        rebuild_unreadable: bool,
+        modify: impl FnOnce(&mut T) -> R,
+    ) -> Result<R>
+    where
+        T: serde::de::DeserializeOwned + Serialize + Default,
+    {
+        let _guard = self.store.lock_store()?;
+        let mut value = match self.load::<T>() {
+            Ok(value) => value,
+            Err(e) if rebuild_unreadable => {
+                warn!(
+                    "encrypted file {} is present but unreadable ({e}); an explicit write is \
+                     rebuilding it from blank [{}]",
+                    self.store.storage_path.display(),
+                    process_attribution()
+                );
+                T::default()
+            }
+            Err(e) => {
+                return Err(e.context(format!(
+                    "encrypted file {} is present but unreadable; refusing to overwrite it",
+                    self.store.storage_path.display()
+                )))
+            }
+        };
+        let out = modify(&mut value);
+        let json = serde_json::to_vec(&value).context("Failed to serialize encrypted file")?;
+        let encrypted = self.store.encrypt(&json)?;
+        crate::fs_atomic::atomic_write_owner_only(&self.store.storage_path, &encrypted)
+            .context("Failed to write encrypted file")?;
+        Ok(out)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3474,6 +3566,101 @@ mod tests {
         assert_eq!(
             inits, 1,
             "two constructions of one storage path must log the init line exactly once:\n{logs}"
+        );
+    }
+
+    fn encrypted_json_file(test_name: &str) -> (EncryptedJsonFile, PathBuf) {
+        let path = crate::test_env::process_scratch_dir("qontinui_test_encrypted_json")
+            .join(format!("{test_name}.enc"));
+        let _ = fs::remove_file(&path);
+        (EncryptedJsonFile::with_path(path.clone()).unwrap(), path)
+    }
+
+    #[test]
+    fn encrypted_json_file_round_trips_and_is_not_plaintext() {
+        let (file, path) = encrypted_json_file("round_trip");
+        let empty: std::collections::BTreeMap<String, String> = file.load().unwrap();
+        assert!(empty.is_empty(), "an absent file reads as the default");
+
+        file.update(
+            false,
+            |map: &mut std::collections::BTreeMap<String, String>| {
+                map.insert("phone".into(), "s3cr3t-token-value".into());
+            },
+        )
+        .unwrap();
+
+        let map: std::collections::BTreeMap<String, String> = file.load().unwrap();
+        assert_eq!(
+            map.get("phone").map(String::as_str),
+            Some("s3cr3t-token-value")
+        );
+        let raw = fs::read(&path).unwrap();
+        assert!(
+            !String::from_utf8_lossy(&raw).contains("s3cr3t-token-value"),
+            "the value must not be on disk in plaintext"
+        );
+    }
+
+    #[test]
+    fn encrypted_json_file_refuses_to_blank_an_unreadable_file_unless_told() {
+        let (file, path) = encrypted_json_file("unreadable");
+        fs::write(&path, b"not ciphertext at all, but long enough").unwrap();
+
+        assert!(
+            file.load::<std::collections::BTreeMap<String, String>>()
+                .is_err(),
+            "a present but unreadable file is an error, not empty"
+        );
+        let refused = file.update(
+            false,
+            |map: &mut std::collections::BTreeMap<String, String>| {
+                map.insert("a".into(), "b".into());
+            },
+        );
+        assert!(
+            refused.is_err(),
+            "a background write must not blank the file"
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            b"not ciphertext at all, but long enough",
+            "a refused write leaves the bytes alone"
+        );
+
+        file.update(
+            true,
+            |map: &mut std::collections::BTreeMap<String, String>| {
+                map.insert("a".into(), "b".into());
+            },
+        )
+        .unwrap();
+        let map: std::collections::BTreeMap<String, String> = file.load().unwrap();
+        assert_eq!(map.get("a").map(String::as_str), Some("b"));
+    }
+
+    #[test]
+    fn clearing_the_auth_store_leaves_an_encrypted_json_file_alone() {
+        let dir = crate::test_env::process_scratch_dir("qontinui_test_encrypted_json_sibling");
+        let auth = SecureStorage::with_path(dir.join("auth_tokens.enc")).unwrap();
+        let file = EncryptedJsonFile::with_path(dir.join("ui_bridge_device_tokens.enc")).unwrap();
+        auth.store_tokens("access", "refresh").unwrap();
+        file.update(
+            false,
+            |map: &mut std::collections::BTreeMap<String, String>| {
+                map.insert("phone".into(), "token".into());
+            },
+        )
+        .unwrap();
+
+        auth.clear_tokens().unwrap();
+        auth.delete_storage().unwrap();
+
+        let map: std::collections::BTreeMap<String, String> = file.load().unwrap();
+        assert_eq!(
+            map.get("phone").map(String::as_str),
+            Some("token"),
+            "sign-out must not reach the sibling file"
         );
     }
 }

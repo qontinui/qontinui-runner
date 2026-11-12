@@ -321,6 +321,18 @@ pub async fn forward_tcp(serial: String, local_port: u16, remote_port: u16) -> R
     .await
 }
 
+/// Whether a forward to `serial` reaches a phone over a USB cable: a device that
+/// leaves this machine and is not `adb connect`ed over the network. A network serial
+/// is `host:port`, or an mDNS service name for wireless debugging
+/// (`adb-<id>._adb-tls-connect._tcp`). Legacy `adb tcpip` traffic is plain TCP that
+/// the adb host never authenticates, so what answers a forward to one is whatever
+/// holds that address on the LAN. A USB serial is reported by the device, so this
+/// trusts a phone on a cable not to name itself a network device, which only makes
+/// it ask for a pairing code.
+fn forward_is_a_usb_cable(serial: &str) -> bool {
+    forward_leaves_this_machine(serial) && !serial.contains(':') && !serial.contains("._adb")
+}
+
 /// Whether a forward to `serial` delivers to a different machine: a phone on a
 /// cable, or a device `adb connect`ed over the network. Only a local emulator
 /// (`emulator-5554`) is on this machine. A USB serial is reported by the device,
@@ -356,6 +368,9 @@ const FORWARD_LIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// this machine. Its list then replaces this machine's server's: a forward on the
 /// local server goes unseen, and a port it lists for anything but a local-emulator
 /// serial is withheld from here too.
+///
+/// Only a server on this machine's loopback lists cables: a forward on another
+/// host's server binds that host's `127.0.0.1`, not this one's.
 pub async fn refresh_adb_listed_forwarders() -> bool {
     let read = crate::mcp::transport::next_adb_list_read();
     let Some((host, port)) = adb_server() else {
@@ -365,8 +380,15 @@ pub async fn refresh_adb_listed_forwarders() -> bool {
     let answer = tokio::time::timeout(FORWARD_LIST_TIMEOUT, read_forward_list(&host, port)).await;
     match answer {
         Ok(Ok(list)) => match ports_forwarding_off_this_machine(&list) {
-            Some(ports) => {
-                crate::mcp::transport::set_adb_listed_forwarders(read, ports);
+            Some(mut listed) => {
+                if !is_loopback_host(&host) {
+                    listed.cables.clear();
+                }
+                crate::mcp::transport::set_adb_listed_forwarders(
+                    read,
+                    listed.off_machine,
+                    listed.cables,
+                );
                 true
             }
             None => {
@@ -375,7 +397,11 @@ pub async fn refresh_adb_listed_forwarders() -> bool {
             }
         },
         Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
-            crate::mcp::transport::set_adb_listed_forwarders(read, BTreeSet::new());
+            crate::mcp::transport::set_adb_listed_forwarders(
+                read,
+                BTreeSet::new(),
+                BTreeSet::new(),
+            );
             true
         }
         Ok(Err(e)) => {
@@ -420,20 +446,32 @@ async fn read_forward_list(host: &str, port: u16) -> std::io::Result<String> {
     Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
+/// The local TCP ports of one `host:list-forward` body.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ListedForwards {
+    /// Ports whose device is not on this machine.
+    off_machine: BTreeSet<u16>,
+    /// The subset whose device is on a USB cable ([`forward_is_a_usb_cable`]).
+    cables: BTreeSet<u16>,
+}
+
 /// The local TCP ports in a `host:list-forward` body whose device is not on this
 /// machine, or `None` if a line cannot be read, since it might name any port.
-fn ports_forwarding_off_this_machine(list: &str) -> Option<BTreeSet<u16>> {
-    let mut ports = BTreeSet::new();
+fn ports_forwarding_off_this_machine(list: &str) -> Option<ListedForwards> {
+    let mut listed = ListedForwards::default();
     for line in list.lines().filter(|line| !line.is_empty()) {
         let (serial, local) = split_forward_line(line)?;
         if let Some(port) = local.strip_prefix("tcp:") {
             let port: u16 = port.parse().ok()?;
             if forward_leaves_this_machine(&serial) {
-                ports.insert(port);
+                listed.off_machine.insert(port);
+            }
+            if forward_is_a_usb_cable(&serial) {
+                listed.cables.insert(port);
             }
         }
     }
-    Some(ports)
+    Some(listed)
 }
 
 /// The `(serial, local)` of a `<serial> <local> <remote>` line. The serial is the
@@ -647,17 +685,25 @@ mod tests {
     }
 
     /// A forward list names a port only for a device off this machine, and skips
-    /// a local end that is not a TCP port.
+    /// a local end that is not a TCP port. Only a USB serial is a cable: an
+    /// `adb connect`ed device and a wireless-debugging one leave this machine over
+    /// the network.
     #[test]
     fn the_forward_list_yields_the_ports_that_leave_this_machine() {
         let list = "R3CN30ABCDEF tcp:6100 tcp:9876\n\
                     emulator-5554 tcp:6101 tcp:9876\n\
                     192.168.1.5:5555 tcp:6102 tcp:9876\n\
                     R3CN30ABCDEF localabstract:foo tcp:9876\n\
-                    serial with spaces tcp:6103 tcp:9876\n";
+                    serial with spaces tcp:6103 tcp:9876\n\
+                    adb-R3CN30-x1._adb-tls-connect._tcp tcp:6104 tcp:9876\n";
+        let listed = super::ports_forwarding_off_this_machine(list).expect("readable");
         assert_eq!(
-            super::ports_forwarding_off_this_machine(list),
-            Some(std::collections::BTreeSet::from([6100, 6102, 6103]))
+            listed.off_machine,
+            std::collections::BTreeSet::from([6100, 6102, 6103, 6104])
+        );
+        assert_eq!(
+            listed.cables,
+            std::collections::BTreeSet::from([6100, 6103])
         );
     }
 
@@ -666,7 +712,8 @@ mod tests {
     #[test]
     fn a_forward_line_is_read_by_its_local_end_or_not_at_all() {
         assert_eq!(
-            super::ports_forwarding_off_this_machine("R3CN30ABCDEF tcp:6100 localabstract:a b\n"),
+            super::ports_forwarding_off_this_machine("R3CN30ABCDEF tcp:6100 localabstract:a b\n")
+                .map(|listed| listed.off_machine),
             Some(std::collections::BTreeSet::from([6100]))
         );
         for unreadable in [
