@@ -1989,8 +1989,10 @@ async fn handle_element_action(
     // body's `params`, which carries typed text.
     // The IPC fallback acted on the runner's own webview, in the window the
     // body's `windowLabel` names (the payload builder routes it there), so the
-    // scope is that window, as the control route keys it; the relay tab scope
-    // does not apply there.
+    // scope is that window; the main window (no label, or `main`) is unscoped,
+    // which is how the snapshot cursor keys it. The control route still keys
+    // an explicit `main` as `Some("main")`, so the two routes are not yet one
+    // cursor for that spelling. The relay tab scope does not apply here.
     let (journey_app, app_version, scope) = match (acted_via_ipc, active_app) {
         (false, Some((app_id, version))) => (app_id, version, tab_id),
         (true, _) => (
