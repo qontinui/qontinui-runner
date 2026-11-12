@@ -3121,6 +3121,35 @@ mod tests {
         assert_linked_workspace_is_not_written(true);
     }
 
+    /// T1' — the 2026-10-27 shape through the REAL entry point
+    /// (`provision_fleet_commands_for_session`, which reads the ambient
+    /// workspace root), not the `_with_root` seam. The symlink arm needs no root,
+    /// so the ambient root is irrelevant here: a stand-down that stops being the
+    /// entry's first statement writes through the link and fails this test.
+    #[test]
+    fn a_symlinked_workspace_claude_is_never_written_through_the_real_entry() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (ws, repo) = linked_workspace(tmp.path(), false);
+        let absent = seed_repo_commands(&repo.join(".claude"));
+        let before = snapshot(&repo.join(".claude"));
+        let wd = ws.to_str().unwrap();
+
+        provision_fleet_commands_for_session(wd);
+
+        assert_eq!(snapshot(&repo.join(".claude")), before);
+        assert!(!repo.join(".claude/commands").join(&absent).exists());
+        let report = commands_report(wd);
+        let n = FLEET_COMMANDS.len();
+        assert_eq!(
+            (report.written, report.expected, report.skipped.len()),
+            (0, n, n)
+        );
+        assert!(report
+            .skipped
+            .iter()
+            .all(|u| u.reason.wire() == "symlinked"));
+    }
+
     /// T3 — a Windows junction is a link to `symlink_metadata`, so it stands
     /// down too (a symlink fixture can need a privilege a junction does not).
     #[cfg(windows)]

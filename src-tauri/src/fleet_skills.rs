@@ -2326,6 +2326,32 @@ mod tests {
         assert_linked_workspace_skills_are_not_written(true);
     }
 
+    /// The same through the REAL entry point (`provision_fleet_skills_for_session`,
+    /// ambient workspace root); the symlink arm needs no root.
+    #[test]
+    fn a_symlinked_workspace_claude_gets_no_skill_through_the_real_entry() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (ws, repo) = linked_workspace(tmp.path(), false);
+        let (_tracked, absent) = seed_repo_skills(&repo.join(".claude"));
+        let before = snapshot(&repo.join(".claude"));
+        let wd = ws.to_str().unwrap();
+
+        provision_fleet_skills_for_session(wd);
+
+        assert_eq!(snapshot(&repo.join(".claude")), before);
+        assert!(!repo.join(".claude/skills").join(&absent).exists());
+        let report = skills_report(wd);
+        let n = embedded_file_total();
+        assert_eq!(
+            (report.written, report.expected, report.skipped.len()),
+            (0, n, n)
+        );
+        assert!(report
+            .skipped
+            .iter()
+            .all(|u| u.reason.wire() == "symlinked"));
+    }
+
     #[cfg(windows)]
     #[test]
     fn a_junctioned_workspace_claude_gets_no_skill() {

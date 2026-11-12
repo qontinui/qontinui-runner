@@ -1857,6 +1857,62 @@ mod tests {
         }
     }
 
+    /// The same shape driven through the REAL chokepoint `provision_session_cwd`
+    /// (not `provision_fleet_for_cwd`). It takes no app handle: with no managed
+    /// AppState the coord-mcp half fails closed, and the fleet half still runs
+    /// the provisioners' own stand-down. Asserts zero writes behind the link.
+    #[test]
+    fn a_symlinked_cwd_claude_is_never_written_through_provision_session_cwd() {
+        use crate::provision_guard::test_support::{assert_not_in_any_repo, link_dir};
+
+        let td = tempfile::tempdir().expect("tempdir");
+        let repo = td.path().join("repo");
+        let tracked_commands = repo.join(".claude/commands");
+        std::fs::create_dir_all(&tracked_commands).unwrap();
+        std::fs::write(tracked_commands.join("policy.md"), b"canonical command").unwrap();
+        git(&repo, &["init", "-q"]);
+        git(&repo, &["config", "user.email", "t@t"]);
+        git(&repo, &["config", "user.name", "t"]);
+        git(&repo, &["config", "commit.gpgsign", "false"]);
+        git(&repo, &["add", ".claude"]);
+        git(&repo, &["commit", "-qm", "track .claude"]);
+        let ws = td.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        assert_not_in_any_repo(&ws);
+        link_dir(&ws.join(".claude"), &repo.join(".claude"));
+        let wd = ws.to_str().unwrap();
+        let before = std::fs::read_dir(&tracked_commands).unwrap().count();
+
+        provision_session_cwd(wd, false, None);
+
+        assert_eq!(
+            std::fs::read(tracked_commands.join("policy.md")).unwrap(),
+            b"canonical command"
+        );
+        assert_eq!(
+            std::fs::read_dir(&tracked_commands).unwrap().count(),
+            before
+        );
+        assert!(
+            !repo.join(".claude/skills").exists(),
+            "no skill behind the link"
+        );
+        let ledger = crate::capability_manifest::session_provision_ledger(wd)
+            .expect("the stand-down is recorded against this workdir");
+        for capability in ["fleet_commands", "fleet_skills"] {
+            let report = ledger
+                .reports
+                .iter()
+                .find(|r| r.capability == capability)
+                .unwrap_or_else(|| panic!("a {capability} report"));
+            assert_eq!(report.written, 0, "{capability} wrote through the link");
+            assert!(report
+                .skipped
+                .iter()
+                .all(|u| u.reason.wire() == "symlinked"));
+        }
+    }
+
     /// Build a `(MaterializedWorktree, worktree-kind ActiveClaim)` pair for a
     /// `worktree` allocation of `repo`, with the claim keyed on the agent
     /// worktree path exactly as the acquire side derives it — so

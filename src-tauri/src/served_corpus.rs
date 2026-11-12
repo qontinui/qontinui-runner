@@ -1721,6 +1721,38 @@ mod tests {
     use crate::provision_guard::test_support::assert_not_in_any_repo;
     use std::process::{Command, Stdio};
 
+    /// Reviewer note A3, decided as intended: a routine pass outside any repo
+    /// (git always fails there) records `unanswered_outside_repo`, and the line
+    /// RENDERS `probe=unanswered_outside_repo` for it. That is deliberate, so a
+    /// pass that wrote only absent paths never reads like a healthy provision.
+    /// `not_run` and `answered` render no `probe=` field.
+    #[test]
+    fn the_outside_repo_probe_state_renders_as_intended() {
+        use crate::capability_manifest::TrackedProbeState as P;
+        let pass = |probe| {
+            Probe::Measured(PassSummary {
+                written: 3,
+                expected: 3,
+                skipped: std::collections::BTreeMap::new(),
+                probe,
+                at: "T".to_string(),
+            })
+        };
+        let line = |probe| {
+            Provisioned {
+                commands: pass(probe),
+                skills: pass(P::NotRun),
+            }
+            .render()
+        };
+        assert_eq!(
+            line(P::UnansweredOutsideRepo),
+            "commands written=3/3 probe=unanswered_outside_repo as-of=T; skills written=3/3 as-of=T"
+        );
+        assert!(!line(P::NotRun).contains("probe="));
+        assert!(!line(P::Answered).contains("probe="));
+    }
+
     /// Run git in `dir` with no dependence on the user's global hooks or
     /// signing config.
     fn git(dir: &Path, args: &[&str]) -> String {

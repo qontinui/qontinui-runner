@@ -483,7 +483,7 @@ impl KeepDecisions {
 /// 2. when `root` is `Some`, `claude_dir` resolving into
 ///    `<root>/qontinui-claude-config/.claude` ([`destination_is_source`]) →
 ///    [`SkipReason::CanonicalSource`]. A `None` root (no workspace root
-///    resolved) fails open to the symlink arm only.
+///    resolved) leaves the symlink arm only, and warns once per process.
 ///
 /// Pure with respect to the process: `root` is an argument, so a test injects
 /// one.
@@ -491,7 +491,15 @@ pub(crate) fn stand_down(claude_dir: &Path, kind: &str, root: Option<&Path>) -> 
     if let Some(why) = redirected_asset_dir(&claude_dir.join(kind)) {
         return Some(SkipReason::Symlinked(why));
     }
-    let root = root?;
+    let Some(root) = root else {
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::warn!(
+                "provision_guard: canonical-source arm disabled, no workspace root resolved;                  only the symlink arm stands down"
+            );
+        }
+        return None;
+    };
     let source = root.join("qontinui-claude-config").join(".claude");
     destination_is_source(claude_dir, &source).map(SkipReason::CanonicalSource)
 }
@@ -538,14 +546,21 @@ fn canonicalize_through_ancestors(path: &Path) -> Option<PathBuf> {
 /// included — is a symlink (a Windows junction reads as one to
 /// `symlink_metadata`), so the write would land somewhere other than its lexical
 /// destination. `base` itself is not examined. A component that does not exist
-/// ends the walk: nothing below it can be a symlink yet.
+/// (`NotFound`) ends the walk: nothing below it can be a symlink yet. Any other
+/// metadata error, or a `path` not below `base`, fails CLOSED (`Some(reason)`).
 ///
 /// The rule every session-asset provisioner applies, independent of any
 /// workspace root: never write through a symlink. A per-file symlink into a
 /// canonical checkout is invisible to [`TrackedPaths`], which asks the SESSION
 /// repo, and `std::fs::write` onto a file's own target truncates it.
 pub(crate) fn symlink_below(base: &Path, path: &Path) -> Option<String> {
-    let relative = path.strip_prefix(base).ok()?;
+    let Ok(relative) = path.strip_prefix(base) else {
+        return Some(format!(
+            "{} is not below {}, so it cannot be proven free of symlinks",
+            path.display(),
+            base.display()
+        ));
+    };
     let mut current = base.to_path_buf();
     for component in relative.components() {
         current.push(component);
@@ -557,7 +572,13 @@ pub(crate) fn symlink_below(base: &Path, path: &Path) -> Option<String> {
                 return Some(format!("{}{target} is a symlink", current.display()));
             }
             Ok(_) => {}
-            Err(_) => return None,
+            // Absent: nothing to write through yet.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            // Any other failure means the component could not be examined, so
+            // the unit is skipped (fail closed) rather than written blind.
+            Err(e) => {
+                return Some(format!("{} could not be examined: {e}", current.display()));
+            }
         }
     }
     None
@@ -1202,6 +1223,28 @@ mod tests {
         std::fs::write(base.join("plain.md"), b"x").unwrap();
         assert_eq!(symlink_below(&base, &base.join("plain.md")), None);
         assert_eq!(symlink_below(&base, &base.join("absent.md")), None);
+        // A path not below the base cannot be proven clean: fail closed.
+        assert!(symlink_below(&base.join("a"), &base.join("b")).is_some());
+    }
+
+    /// A metadata error that is not `NotFound` fails CLOSED: the component could
+    /// not be examined, so the unit is skipped. Unix: a path whose parent is a
+    /// file (`NotADirectory`). Windows: a component with an illegal character
+    /// (`ERROR_INVALID_NAME`), which is not `NotFound` either.
+    #[test]
+    fn symlink_below_fails_closed_on_an_unexaminable_component() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().join("base");
+        std::fs::create_dir_all(&base).unwrap();
+        #[cfg(unix)]
+        let bad = {
+            std::fs::write(base.join("file"), b"x").unwrap();
+            base.join("file").join("child.md")
+        };
+        #[cfg(windows)]
+        let bad = base.join("a*b").join("child.md");
+        let why = symlink_below(&base, &bad).expect("an unexaminable path must fail closed");
+        assert!(why.contains("could not be examined"), "{why}");
     }
 
     /// Fail-soft: a directory that does not exist yields an empty set rather
