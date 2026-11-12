@@ -795,6 +795,57 @@ impl ResourceSample {
         self.boot_id = a.boot_id.clone();
         self.measured = (!a.measured.is_empty()).then(|| a.measured.clone());
     }
+
+    /// Overwrite each flat `psi_<res>_*` group from `psi.system.<res>` when
+    /// that resource is present there, so a row never carries two
+    /// disagreeing readings of system PSI. A resource absent from
+    /// `psi.system` keeps the value [`Self::set_host_axes`] wrote.
+    pub(crate) fn align_flat_psi_with_system(&mut self) {
+        let Some(system) = self.psi.as_ref().and_then(|p| p.get("system")).cloned() else {
+            return;
+        };
+        let pick = |res: &str, line: &str, avg: &str| {
+            system
+                .get(res)
+                .and_then(|r| r.get(line))
+                .and_then(|l| l.get(avg))
+                .and_then(serde_json::Value::as_f64)
+        };
+        let group = |res: &str| {
+            system.get(res).map(|_| {
+                (
+                    pick(res, "some", "avg10"),
+                    pick(res, "some", "avg60"),
+                    pick(res, "full", "avg10"),
+                    pick(res, "full", "avg60"),
+                )
+            })
+        };
+        if let Some(g) = group("memory") {
+            (
+                self.psi_memory_some_avg10,
+                self.psi_memory_some_avg60,
+                self.psi_memory_full_avg10,
+                self.psi_memory_full_avg60,
+            ) = g;
+        }
+        if let Some(g) = group("cpu") {
+            (
+                self.psi_cpu_some_avg10,
+                self.psi_cpu_some_avg60,
+                self.psi_cpu_full_avg10,
+                self.psi_cpu_full_avg60,
+            ) = g;
+        }
+        if let Some(g) = group("io") {
+            (
+                self.psi_io_some_avg10,
+                self.psi_io_some_avg60,
+                self.psi_io_full_avg10,
+                self.psi_io_full_avg60,
+            ) = g;
+        }
+    }
 }
 
 /// Wire shape of `POST /coord/devices/{device_id}/resource-sample`.
@@ -1312,6 +1363,10 @@ fn collect_host_lane() -> ResourceSample {
     s.cgroup_slices = t.cgroup_slices;
     s.psi = t.psi;
     s.slice_source = t.slice_source;
+    // One reading per row: the flat `psi_*` columns and `psi.system` describe
+    // the same quantity, so where the slice reader saw system PSI the flat
+    // fields are taken from it rather than from host_axes' earlier read.
+    s.align_flat_psi_with_system();
 
     s
 }
@@ -2020,6 +2075,36 @@ fn warn_once(msg: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One row never carries two readings of system PSI: `psi.system` wins
+    /// for every resource it names, and a resource it omits keeps the
+    /// host_axes value.
+    #[test]
+    fn flat_psi_aligns_with_psi_system() {
+        let mut s = ResourceSample::empty(Lane::Host, None);
+        s.psi_memory_some_avg10 = Some(9.0);
+        s.psi_memory_full_avg60 = Some(9.0);
+        s.psi_io_some_avg10 = Some(7.0);
+        s.psi = Some(serde_json::json!({"system": {
+            "memory": {"some": {"avg10": 1.5, "avg60": 2.25}},
+            "cpu": {"some": {"avg10": 3.0, "avg60": 4.0}}
+        }}));
+        s.align_flat_psi_with_system();
+        assert_eq!(s.psi_memory_some_avg10, Some(1.5));
+        assert_eq!(s.psi_memory_some_avg60, Some(2.25));
+        // `full` absent in the reading: UNKNOWN, not the stale 9.0.
+        assert_eq!(s.psi_memory_full_avg60, None);
+        assert_eq!(s.psi_cpu_some_avg60, Some(4.0));
+        assert_eq!(s.psi_cpu_full_avg10, None);
+        // io absent from psi.system: the host_axes value stands.
+        assert_eq!(s.psi_io_some_avg10, Some(7.0));
+
+        // No psi at all: nothing changes.
+        let mut t = ResourceSample::empty(Lane::Host, None);
+        t.psi_cpu_some_avg10 = Some(5.0);
+        t.align_flat_psi_with_system();
+        assert_eq!(t.psi_cpu_some_avg10, Some(5.0));
+    }
 
     #[test]
     fn cpu_temp_parse_millidegrees() {
