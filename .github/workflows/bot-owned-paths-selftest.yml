@@ -1,0 +1,61 @@
+name: bot-owned-paths selftest
+
+# The fixture suite for scripts/ci/bot-owned-paths.sh, split out of
+# bot-owned-paths.yml so it does not run on label events.
+#
+# WHY A SEPARATE WORKFLOW. bot-owned-paths.yml must trigger on `labeled` /
+# `unlabeled`, because two arms of its verdict are labels. GitHub cannot filter
+# those events by label name at the trigger, and coord applies `coord:*` labels
+# constantly, so every label cost a hosted job for this suite as well. The suite
+# runs the PR's own scripts/ci and reads no labels, so a label cannot change its
+# result. The trade-off: a label-triggered run also re-checked out a fresh merge
+# ref, so the suite no longer re-tests against a moved main on label churn; it
+# refreshes on code events, `edited` and `reopened`, and on every merge-candidate
+# push, which is where coord validates. Narrowing it with a job-level `if:` would publish a `skipped` check run
+# that coord counts as passing, flipping a red suite green (ci.yml states that
+# trap). A workflow that never triggers on a label publishes no row at all, so the
+# conclusion from the last code event stands.
+#
+# TRIGGERS are bot-owned-paths.yml's, minus `labeled` / `unlabeled`. `edited` is
+# kept because a base re-target changes the merge ref this suite checks out.
+# Closed PRs are skipped, as in bot-owned-paths.yml.
+#
+# Plan: qontinui-dev-notes plans/2026-11-04-runner-generated-and-ledger-files-are-
+# merge-neutral-and-land-behind-a-drain.md, Phase 0.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, edited]
+  push:
+    branches:
+      - main
+      - develop
+      - 'merge-candidate/**'
+      - 'merge-candidate-spec/**'
+      - 'merge-candidate-batch/**'
+
+permissions:
+  contents: read
+
+# PR-SCOPED SUPERSESSION, same one-expression form as bot-owned-paths.yml: a
+# first-attempt PR run replaces the older run for the same PR. Push runs (main,
+# merge-candidate) each get their own group and are never cancelled.
+concurrency:
+  group: ${{ (github.event_name == 'pull_request' && github.run_attempt == 1) && format('{0}-pr-{1}', github.workflow, github.event.pull_request.number) || format('{0}-run-{1}-{2}', github.workflow, github.run_id, github.run_attempt) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && github.run_attempt == 1 }}
+
+jobs:
+  selftest:
+    name: bot-owned-paths selftest
+    if: github.event_name != 'pull_request' || github.event.pull_request.state != 'closed'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts/ci
+
+      - name: Fixture suite (no network)
+        shell: bash
+        run: bash scripts/ci/bot-owned-paths-test.sh
