@@ -540,7 +540,8 @@ async fn a_since_read_on_postgres_partitions_every_row() {
     assert_eq!(
         (read.edges.len(), read.older_rows(), read.older_groups.len()),
         (5, 18, 9),
-        "(a) (rows in full, rows grouped, groups)"
+        "(a) this ledger's read at `since` is 5 rows in full and 18 rows in 9 older groups \
+         (rows in full, rows grouped, groups)"
     );
     assert_places_every_row("(a)", &read, &timed, &expected(&[5, 4, 3, 2, 1]));
 }
@@ -653,8 +654,9 @@ async fn no_row_of_another_app_reaches_either_since_read() {
 
 /// (d) The older groups are a function of the ledger: two reads return them
 /// identically, ordered by their representative's id — the smallest id among
-/// each group's rows — however the rows were written or their transitions
-/// sort.
+/// each group's rows, which (a) checks — however the rows were written or
+/// their transitions sort. Which groups there are is (a)'s concern, so a
+/// changed set of groups does not red this test.
 #[tokio::test]
 async fn older_groups_read_the_same_twice_in_min_id_order() {
     let pg = seeded().await;
@@ -670,12 +672,29 @@ async fn older_groups_read_the_same_twice_in_min_id_order() {
         .iter()
         .map(|g| g.edge.id.as_str())
         .collect();
-    let in_min_id_order: Vec<String> = (101..=109).map(id).collect();
+    let mut ascending = ids.clone();
+    ascending.sort_unstable();
+    ascending.dedup();
     assert_eq!(
         ids,
-        in_min_id_order,
-        "(d) the older groups are not ordered by min(id::text): {:?}",
+        ascending,
+        "(d) the older groups are not in strictly ascending min(id::text) order: {:?}",
         labels(first.older_groups.iter().map(|g| &g.edge))
+    );
+    // Not vacuous: sorted by transition — the group key, which is the order a
+    // sort-based aggregate with no `ORDER BY` returns — the same groups are in
+    // another order.
+    let mut keyed: Vec<(String, &str)> = first
+        .older_groups
+        .iter()
+        .map(|g| (transition(&g.edge), g.edge.id.as_str()))
+        .collect();
+    keyed.sort_unstable();
+    let ids_by_transition: Vec<&str> = keyed.into_iter().map(|(_, group)| group).collect();
+    assert_ne!(
+        ids_by_transition, ids,
+        "the seed's groups are in min(id::text) order when sorted by transition too, so \
+         (d) would hold with no ORDER BY"
     );
 
     let timed = read_timed_since(&pg, since()).await;
