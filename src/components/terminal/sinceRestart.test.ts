@@ -475,6 +475,75 @@ describe("strip copy", () => {
   });
 });
 
+/**
+ * A `missing` outcome carrying the backend's restore-owed verdict (plan
+ * `2026-11-11-since-restart-roster-counts-closed-sessions-as-missing`, D3):
+ * `true` while a restore in this process may still bring it back, `false` when
+ * none will (it closed since the boot, or is in no restore set), `null` when
+ * that cannot be read. `LedgerOutcome` gains the field in that plan's Phase 4;
+ * until then it rides on the object under a widened type.
+ */
+function owed(
+  id: string,
+  restoreOwed: boolean | null,
+  over: Partial<LedgerOutcome> = {},
+): LedgerOutcome {
+  const withVerdict: LedgerOutcome & { restoreOwed: boolean | null } = {
+    ...outcome(id, over),
+    restoreOwed,
+  };
+  return withVerdict;
+}
+
+/** How many rows the strip says are waiting, whichever form it takes. */
+function waitingIn(model: ReturnType<typeof stripModel>): number {
+  return model?.kind === "deferred" || model?.kind === "some-missing" ? model.waiting : 0;
+}
+
+// Plan 2026-11-11-since-restart-roster-counts-closed-sessions-as-missing,
+// Phase 0: "waiting" must mean a restore is still owed (D3). Red until Phase 5.
+describe("a row no restore is owed is never waiting", () => {
+  it("the drain-deferred strip counts as waiting only the rows still owed a restore", () => {
+    // Two misses on the drain-deferred page: a restore in this process will
+    // still bring one back; the other closed `explicit` since the boot, and no
+    // restore will.
+    const r = report([
+      generation("g", {
+        returned: [back("a")],
+        missing: [owed("owed", true), owed("closed", false)],
+      }),
+    ]);
+    expect(waitingIn(stripModel(r, ctx({ complete: [], deferred: ["p1"] })))).toBe(1);
+  });
+
+  it("the drain-deferred strip says nothing is waiting when no miss is owed a restore", () => {
+    const r = report([
+      generation("g", { returned: [back("a")], missing: [owed("closed", false)] }),
+    ]);
+    expect(waitingIn(stripModel(r, ctx({ complete: [], deferred: ["p1"] })))).toBe(0);
+  });
+
+  it("buildRow does not label a row no restore is owed waiting-drain", () => {
+    // Control: a row a restore still owes IS waiting on the drain.
+    expect(buildRow(owed("o", true), ctx({ deferred: ["p1"] })).state).toBe("waiting-drain");
+
+    const row = buildRow(owed("d", false), ctx({ deferred: ["p1"] }));
+    expect(row.state).not.toMatch(/^waiting/);
+    expect(row.label).not.toMatch(/^waiting/);
+    expect(row.state).toBe("missing");
+  });
+
+  it("buildRow does not label a row no restore is owed waiting-page", () => {
+    // Control: a row a restore still owes IS waiting on its unopened page.
+    expect(buildRow(owed("o", true, { pageId: "p2" }), ctx()).state).toBe("waiting-page");
+
+    const row = buildRow(owed("w", false, { pageId: "p2" }), ctx());
+    expect(row.state).not.toMatch(/^waiting/);
+    expect(row.label).not.toMatch(/^waiting/);
+    expect(row.state).toBe("missing");
+  });
+});
+
 describe("the sequential resume queue", () => {
   it("runs one at a time and continues after a failure and a throw", async () => {
     const events: string[] = [];
