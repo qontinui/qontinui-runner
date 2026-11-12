@@ -10,7 +10,11 @@
 //!
 //! These tests live in a file of their own, with their own recorders, so that a
 //! whole-file revert of `sdk_client.rs` (the "without the change" run of the
-//! arming record) keeps them.
+//! arming record) keeps them. That holds only while every symbol imported below
+//! survives the revert. `spawn_stored_bearer_recheck` and
+//! `STORED_BEARER_RECHECK_WORKER` were added with the supervised re-check, so a
+//! revert to before it has to keep those two, or the whole file stops compiling and
+//! every test here goes red at once.
 
 use std::sync::{Arc, Mutex};
 
@@ -20,8 +24,8 @@ use tokio::net::{TcpListener, TcpStream};
 use crate::mcp::adb_helper::{forward_remove, forward_tcp, refresh_adb_listed_forwarders};
 use crate::mcp::physical_device_api::connect_device_at;
 use crate::mcp::sdk_client::{
-    connect_or_reuse, connect_sdk_app, recheck_stored_bearers, ConnectHints, ConnectResponse,
-    SdkConnectionManager,
+    connect_or_reuse, connect_sdk_app, recheck_stored_bearers, spawn_stored_bearer_recheck,
+    ConnectHints, ConnectResponse, SdkConnectionManager, STORED_BEARER_RECHECK_WORKER,
 };
 use crate::mcp::transport::cloud::CloudTransport;
 use crate::mcp::transport::lan::LanTransport;
@@ -860,6 +864,49 @@ async fn the_recheck_settles_stored_connections_and_keeps_their_target() {
     let manager = manager.lock().await;
     assert!(!manager.connections.contains_key(&url));
     assert_eq!(manager.active_url, None);
+}
+
+/// The re-check runs by itself, started the way `create_router` starts it: once the
+/// adb server lists a stored bearer client's port, the client is dropped with no
+/// connect or switch, and the loop is one the panic supervisor holds.
+#[tokio::test]
+async fn the_supervised_recheck_drops_a_bearer_client_the_adb_list_names() {
+    let _door = door();
+    let (port, seen) = spawn_app().await;
+    let url = format!("http://127.0.0.1:{port}");
+    let manager = Arc::new(tokio::sync::Mutex::new(SdkConnectionManager::new()));
+    connect_sdk_app(&manager, &url, None, None, None, None, None)
+        .await
+        .unwrap_or_else(|e| panic!("the connect failed: {}", e.message));
+    let handshake = requests_to(&seen, &format!("127.0.0.1:{port}"));
+    assert!(
+        !handshake.is_empty() && handshake.iter().all(Option::is_some),
+        "the fixture's connect carries the bearer: {handshake:?}"
+    );
+
+    let _adb = FakeAdb::start(format!("R3CN30ABCDEF tcp:{port} tcp:9876\n")).await;
+    let recheck =
+        spawn_stored_bearer_recheck(manager.clone(), std::time::Duration::from_millis(20));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while manager.lock().await.connections.contains_key(&url) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the re-check never dropped a bearer client on a listed port"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        qontinui_runner_lib::worker_supervisor::snapshot()
+            .iter()
+            .any(|row| row.name == STORED_BEARER_RECHECK_WORKER),
+        "the re-check is not registered with the panic supervisor"
+    );
+    assert_eq!(manager.lock().await.active_url, None);
+
+    // Stop it while the door still holds the adb environment, so no later pass reads
+    // the developer's own adb server into the process-global list.
+    recheck.abort();
+    let _ = recheck.await;
 }
 
 /// A forward that goes for a moment, as one does when a cable is pulled, must not

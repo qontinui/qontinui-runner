@@ -13479,17 +13479,12 @@ pub fn create_router(
 
     // Stored SDK connections' bearer re-check (30-second interval)
     // Nothing else re-reads the adb forward list and settles stored clients between
-    // connects. A loop of its own, so neither it nor the device scan can stall the other.
-    {
-        let sdk_connection = api_state.sdk_connection.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
-            loop {
-                interval.tick().await;
-                crate::mcp::sdk_client::recheck_stored_bearers(&sdk_connection).await;
-            }
-        });
-    }
+    // connects. A loop of its own, so neither it nor the device scan can stall the other,
+    // and supervised, so a panicking pass does not end it.
+    crate::mcp::sdk_client::spawn_stored_bearer_recheck(
+        api_state.sdk_connection.clone(),
+        crate::mcp::sdk_client::STORED_BEARER_RECHECK_PERIOD,
+    );
 
     // Physical device USB scanner (30-second interval)
     // Discovers ADB-attached Android devices and registers them with PhysicalDeviceRegistry.
@@ -24308,6 +24303,27 @@ mod supervised_workers_health_tests {
         assert!(
             src.contains(".route(\"/health\", get(health))"),
             "`/health` must still be served by `health`"
+        );
+    }
+
+    /// `create_router` starts the stored SDK bearer re-check through its supervised
+    /// door. No test builds the router, so deleting the call leaves every behaviour
+    /// test green, and this pin is what goes red. A pass called from a bare loop
+    /// there would escape the supervisor, which is the other thing it refuses.
+    #[test]
+    fn create_router_starts_the_supervised_stored_bearer_recheck() {
+        let region = crate::mcp_api::mcp_api_item_source("fn create_router(")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            region.contains("crate::mcp::sdk_client::spawn_stored_bearer_recheck("),
+            "create_router must start the re-check with spawn_stored_bearer_recheck"
+        );
+        assert!(
+            !region.contains("recheck_stored_bearers("),
+            "create_router must not run a re-check pass outside the supervised loop"
         );
     }
 }
