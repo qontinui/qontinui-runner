@@ -41,13 +41,23 @@
 //!
 //! It runs on its own task, spawned from the census and never awaited by it, so
 //! the arm's candidates, custody probes and closes act on the census exactly as
-//! fresh as before. One pass at a time: a census that finds a pass still running
-//! starts none. It runs only where the arm runs a census at all (`on` or
+//! fresh as before. It runs only where the arm runs a census at all (`on` or
 //! `shadow`); a box with the arm `off` produces no shadow evidence.
+//!
+//! **One pass at a time, and no pass while an earlier one's reads still run.**
+//! A read's budget bounds the pass's wait, not the read: a walk or argv read
+//! past its budget keeps its blocking-pool thread until the OS-level read
+//! returns (a `/proc/<pid>/cmdline` read can block behind a process in
+//! uninterruptible sleep). Each read therefore carries a [`LiveRead`] guard
+//! INSIDE its blocking closure, dropped only when that read returns, and a
+//! census starts no pass while any is still alive — so a hung read costs at
+//! most the reads of the one pass that met it, never one more per census.
+//! A pass whose first table is not a fresh read makes no further read at all:
+//! every verdict would be UNKNOWN whatever the argv read and second walk found.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -59,17 +69,61 @@ use tracing::{debug, info};
 use crate::process_capture::process_tree::{self, ProcessSnapshot};
 use crate::session::tracking_health::{LiveClaudeProcess, SessionWorkStatus};
 
-/// The whole shadow pass is bounded, so a stuck read cannot pin the
-/// single-flight flag and silence every later census.
-const SHADOW_BUDGET: Duration = Duration::from_secs(10);
-
-/// Each of a pass's two private table walks is bounded on its own, so both fit
-/// inside [`SHADOW_BUDGET`] with the argv read; a walk past it reads stale
-/// (UNKNOWN) rather than spending the whole pass.
+/// Each of a pass's two private table walks is bounded on its own; a walk past
+/// it reads stale (UNKNOWN) rather than spending the whole pass.
 const WALK_BUDGET: Duration = Duration::from_secs(4);
+
+/// The argv read's own bound; past it the argv read is UNKNOWN.
+const ARGV_BUDGET: Duration = Duration::from_secs(2);
+
+/// The whole shadow pass is bounded too — its three reads' budgets and a
+/// second for the judgement — so nothing in it can pin the single-flight flag
+/// and silence every later census.
+const SHADOW_BUDGET: Duration = WALK_BUDGET
+    .saturating_mul(2)
+    .saturating_add(ARGV_BUDGET)
+    .saturating_add(Duration::from_secs(1));
 
 /// Set while a shadow pass runs; a census that finds it set starts none.
 static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+/// The shadow's blocking reads still running on the pool, by [`LiveRead`].
+static LIVE_READS: LiveReads = LiveReads::new();
+
+/// Set once a census has logged that live reads kept it from starting a pass;
+/// cleared when a pass starts, so each stall is announced once.
+static STALL_SAID: AtomicBool = AtomicBool::new(false);
+
+/// A count of blocking reads still running, kept by the [`LiveRead`] guards
+/// those reads hold.
+struct LiveReads(AtomicUsize);
+
+impl LiveReads {
+    const fn new() -> Self {
+        LiveReads(AtomicUsize::new(0))
+    }
+
+    /// Count one read in. The guard goes INTO the read's blocking closure (a
+    /// read door's `hold`), so it is dropped — and the read counted out — only
+    /// when the OS-level read returns, or when the closure is dropped unrun.
+    fn enter(&'static self) -> LiveRead {
+        self.0.fetch_add(1, Ordering::AcqRel);
+        LiveRead(self)
+    }
+
+    fn count(&self) -> usize {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+/// One blocking read, counted in [`LiveReads`] until it is dropped.
+struct LiveRead(&'static LiveReads);
+
+impl Drop for LiveRead {
+    fn drop(&mut self) {
+        self.0 .0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 /// Subtree members gathered per session; past this the session is skipped as
 /// UNKNOWN (a real shim subtree has at most four members).
@@ -226,7 +280,8 @@ fn changed(
 
 /// Start a shadow pass over the finished sessions in `processes` on its own
 /// task and return at once — the caller (the arm's census) never waits on it.
-/// No pass is started while one is still running, nor at all while the
+/// No pass is started while one is still running or a blocking read an
+/// earlier pass started is still on the pool ([`admit`]), nor at all while the
 /// in-process process-table read is switched off. Never fails, never acts.
 pub fn spawn_observe(processes: &[LiveClaudeProcess]) {
     if process_tree::in_process_table_read_disabled() {
@@ -250,10 +305,9 @@ pub fn spawn_observe(processes: &[LiveClaudeProcess]) {
             .clear();
         return;
     }
-    if IN_FLIGHT.swap(true, Ordering::AcqRel) {
-        debug!("finished_close shadow: a classify_child pass is still running — none started");
+    let Some(sessions) = admit(sessions, &LIVE_READS, &IN_FLIGHT) else {
         return;
-    }
+    };
     tokio::spawn(async move {
         // Cleared on drop, so a pass that panics does not silence every later
         // census.
@@ -266,6 +320,45 @@ pub fn spawn_observe(processes: &[LiveClaudeProcess]) {
         let _clear = Clear;
         observe(sessions).await;
     });
+}
+
+/// The pass gate: `Some(sessions)` when a census may start a pass now, having
+/// taken the single-flight slot `in_flight`; `None` while a pass is still
+/// running, or while any blocking read counted in `live` — necessarily one an
+/// earlier pass started and abandoned at its budget — is still on the pool. A
+/// pass refused for live reads takes no slot, and the first refusal of each
+/// stall is logged at info, the rest at debug.
+fn admit(
+    sessions: Vec<(String, u32)>,
+    live: &LiveReads,
+    in_flight: &AtomicBool,
+) -> Option<Vec<(String, u32)>> {
+    if in_flight.load(Ordering::Acquire) {
+        debug!("finished_close shadow: a classify_child pass is still running — none started");
+        return None;
+    }
+    let reads = live.count();
+    if reads > 0 {
+        if STALL_SAID.swap(true, Ordering::Relaxed) {
+            debug!(
+                live_reads = reads,
+                "finished_close shadow: blocking reads from an earlier classify_child pass are still running — none started"
+            );
+        } else {
+            info!(
+                live_reads = reads,
+                "finished_close shadow: {reads} blocking read(s) an earlier classify_child pass started are \
+                 still running past their budget — no pass starts until they return"
+            );
+        }
+        return None;
+    }
+    if in_flight.swap(true, Ordering::AcqRel) {
+        debug!("finished_close shadow: a classify_child pass is still running — none started");
+        return None;
+    }
+    STALL_SAID.store(false, Ordering::Relaxed);
+    Some(sessions)
 }
 
 /// Judge `sessions`, log the verdicts that changed and the pass's tally.
@@ -305,19 +398,24 @@ async fn observe(sessions: Vec<(String, u32)>) {
 }
 
 /// The reads and the pure judgement: table, argv, fresh table — each one
-/// in-process and private to the shadow.
+/// in-process, private to the shadow, bounded, and counted in [`LIVE_READS`]
+/// until its blocking read returns.
 async fn judge(sessions: &[(String, u32)]) -> Vec<(String, SessionVerdict)> {
     judge_with(
         sessions,
-        || process_tree::snapshot_process_table_unshared(WALK_BUDGET),
-        |pids| async move { process_tree::raw_argvs_for_pids(&pids).await },
+        || process_tree::snapshot_process_table_unshared(WALK_BUDGET, LIVE_READS.enter()),
+        |pids| async move {
+            process_tree::raw_argvs_for_pids(&pids, ARGV_BUDGET, LIVE_READS.enter()).await
+        },
     )
     .await
 }
 
 /// [`judge`] over injected reads, so a test drives the exact sequence — table,
-/// argvs of the first table's members, table again — against a provider of its
-/// own.
+/// argvs of the first table's members, table again — with reads of its own. A
+/// first table that is not a fresh read ends the pass there: every verdict is
+/// UNKNOWN whatever the argv read and a second walk would find, so neither is
+/// made.
 async fn judge_with<T, TF, A, AF>(
     sessions: &[(String, u32)],
     table: T,
@@ -329,12 +427,23 @@ where
     A: FnOnce(Vec<u32>) -> AF,
     AF: Future<Output = Option<HashMap<u32, Argv>>>,
 {
+    let platform = Platform::current();
     let first = proc_table(&table().await);
+    if !first.fresh {
+        return sessions
+            .iter()
+            .map(|(id, pid)| {
+                (
+                    id.clone(),
+                    classify_session(platform, *pid, &first, None, &first),
+                )
+            })
+            .collect();
+    }
     let claudes: Vec<u32> = sessions.iter().map(|(_, pid)| *pid).collect();
     let members = subtree_members(&first, &claudes);
     let argv = argvs(members).await;
     let fresh = proc_table(&table().await);
-    let platform = Platform::current();
     sessions
         .iter()
         .map(|(id, pid)| {
@@ -511,6 +620,7 @@ mod tests {
                     Err("scripted shadow walk failure".to_string())
                 },
                 Duration::from_secs(30),
+                (),
             )
         };
         let sessions = vec![("s1".to_string(), 10), ("s2".to_string(), 20)];
@@ -560,6 +670,7 @@ mod tests {
                     ]))
                 },
                 Duration::from_secs(30),
+                (),
             )
         };
         let asked = std::sync::Arc::new(Mutex::new(Vec::new()));
@@ -582,6 +693,95 @@ mod tests {
         assert!(judged[1].1.admit, "a childless claude: {:?}", judged[1]);
     }
 
+    /// A pass's read that outlives its budget keeps its blocking-pool thread
+    /// until the OS-level read returns, and while it does no census starts
+    /// another pass — so a hung read can never pile up one more read per
+    /// census. The guard each read holds INSIDE its blocking closure is what
+    /// counts it: the pass that met the stall is long over by the time the next
+    /// census asks.
+    #[tokio::test]
+    async fn a_stalled_blocking_read_keeps_the_next_pass_from_starting_until_it_returns() {
+        use crate::process_capture::process_table::read_unshared;
+        let live: &'static LiveReads = Box::leak(Box::new(LiveReads::new()));
+        let in_flight: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
+        let sessions = vec![("s".to_string(), 10)];
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = std::sync::Arc::new(Mutex::new(Some(release_rx)));
+        let table = move || {
+            let stall = release_rx.lock().unwrap_or_else(|e| e.into_inner()).take();
+            read_unshared(
+                move || {
+                    if let Some(release) = stall {
+                        let _ = release.recv_timeout(Duration::from_secs(10));
+                    }
+                    Ok(snap(&[(10, 1, "claude", 1, 9, 9)]))
+                },
+                Duration::from_millis(50),
+                live.enter(),
+            )
+        };
+
+        // A pass whose first walk stalls past its budget: the pass gives up
+        // and ends (stale first table: nothing else is read)...
+        let first = admit(sessions.clone(), live, in_flight).expect("the first pass starts");
+        let judged = judge_with(&first, table, |_| async { None }).await;
+        in_flight.store(false, Ordering::Release);
+        assert_eq!(judged[0].1.classes(), "claude unbound", "{judged:?}");
+        // ...but its walk is still on the pool, and the next census starts none.
+        assert_eq!(live.count(), 1, "the stalled walk is still counted");
+        assert_eq!(admit(sessions.clone(), live, in_flight), None);
+        assert_eq!(admit(sessions.clone(), live, in_flight), None);
+        assert!(
+            !in_flight.load(Ordering::Acquire),
+            "a pass refused for live reads takes no slot"
+        );
+
+        // Once the OS-level read returns, the guard drops and a pass may start.
+        release_tx.send(()).expect("release the stalled walk");
+        let give_up = std::time::Instant::now() + Duration::from_secs(5);
+        while live.count() > 0 && std::time::Instant::now() < give_up {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(live.count(), 0, "the guard dropped when the walk returned");
+        assert_eq!(admit(sessions.clone(), live, in_flight), Some(sessions));
+        assert!(
+            in_flight.load(Ordering::Acquire),
+            "the admitted pass took the slot"
+        );
+    }
+
+    /// A first table that is not a fresh read decides every verdict (UNKNOWN),
+    /// so the pass makes no argv read and no second walk — no blocking read it
+    /// does not need.
+    #[tokio::test]
+    async fn a_first_table_that_is_not_fresh_makes_no_argv_read_and_no_second_walk() {
+        let walks = std::sync::Arc::new(AtomicUsize::new(0));
+        let argv_reads = std::sync::Arc::new(AtomicUsize::new(0));
+        let w = std::sync::Arc::clone(&walks);
+        let a = std::sync::Arc::clone(&argv_reads);
+        let mut stale = snap(&[(10, 1, "claude", 1, 9, 9), (11, 10, "python3", 1, 9, 9)]);
+        stale.stale = true;
+        let judged = judge_with(
+            &[("s1".to_string(), 10), ("s2".to_string(), 20)],
+            move || {
+                w.fetch_add(1, Ordering::SeqCst);
+                let table = stale.clone();
+                async move { table }
+            },
+            move |_| {
+                a.fetch_add(1, Ordering::SeqCst);
+                async { Some(HashMap::new()) }
+            },
+        )
+        .await;
+        assert_eq!(walks.load(Ordering::SeqCst), 1, "one walk, not two");
+        assert_eq!(argv_reads.load(Ordering::SeqCst), 0, "no argv read");
+        for (id, v) in &judged {
+            assert!(!v.admit, "{id}: {v:?}");
+            assert_eq!(v.classes(), "claude unbound", "{id}: {v:?}");
+        }
+    }
+
     /// The production binding of the two tests above: [`judge`] reads only
     /// through the private doors they exercise, and the shadow's code names no
     /// shared read anywhere. A behavioural test cannot see that binding, so its
@@ -591,8 +791,9 @@ mod tests {
         let src = include_str!("classify_child_shadow.rs");
         let production = src.split("#[cfg(test)]").next().unwrap_or_default();
         for door in [
-            "process_tree::snapshot_process_table_unshared(WALK_BUDGET)",
-            "process_tree::raw_argvs_for_pids(",
+            "snapshot_process_table_unshared(WALK_BUDGET, LIVE_READS.enter())",
+            "raw_argvs_for_pids(&pids, ARGV_BUDGET, LIVE_READS.enter())",
+            "admit(sessions, &LIVE_READS, &IN_FLIGHT)",
             "process_tree::in_process_table_read_disabled()",
         ] {
             assert!(
