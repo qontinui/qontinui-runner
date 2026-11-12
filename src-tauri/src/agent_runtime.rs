@@ -22907,6 +22907,73 @@ mod unspawned_door_tests {
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
+    /// Arms the planned-worktree seam through its real caller: a coord launch
+    /// payload is materialized under an isolated workspace root holding a real
+    /// repo, which the source-checkout resolver finds as `<root>/canon`. Of two
+    /// rows, the one whose path already exists is skipped; only the other is
+    /// added, on disk and in the returned bases, cut from that checkout.
+    #[tokio::test]
+    async fn materialize_worktrees_hands_back_only_the_launch_rows_it_added() {
+        let _amb = crate::test_env::isolated_ambient();
+        let ws = crate::workspace_paths::runner_workspace_root()
+            .into_root()
+            .expect("the isolated ambient workspace root");
+        let canonical = ws.join("canon");
+        std::fs::create_dir_all(&canonical).unwrap();
+        git(&canonical, &["init", "-q", "-b", "main"]);
+        std::fs::write(canonical.join("README.md"), "hi\n").unwrap();
+        git(&canonical, &["add", "README.md"]);
+        git(&canonical, &["commit", "-q", "-m", "init"]);
+        let sha = git(&canonical, &["rev-parse", "HEAD"]);
+        assert_eq!(
+            crate::agent_worktree::canonical_paths::worktree_source_checkout("canon").ok(),
+            Some(canonical.clone()),
+            "the resolver finds the repo placed under the isolated root"
+        );
+
+        let agent = uuid::Uuid::new_v4();
+        let base = ws.join("wt").join(agent.to_string());
+        let existing = base.join("existing");
+        std::fs::create_dir_all(&existing).unwrap();
+        let fresh = base.join("canon");
+        let row = |path: &Path, branch: &str| {
+            serde_json::json!({
+                "repo": "canon",
+                "branch": branch,
+                "parent_sha": sha,
+                "worktree_path": path.to_string_lossy(),
+                "status": "allocated",
+            })
+        };
+        let payload: LaunchPayload = serde_json::from_value(serde_json::json!({
+            "agent_id": agent,
+            "target_device_id": uuid::Uuid::new_v4(),
+            "worktrees": [row(&existing, "agent/existing"), row(&fresh, "agent/fresh")],
+            "initial_prompt": "p",
+            "claim_token": "t",
+        }))
+        .expect("a launch payload");
+
+        let mut added = Vec::new();
+        materialize_worktrees(&payload, &mut added)
+            .await
+            .expect("materialized");
+
+        assert_eq!(added.len(), 1, "{added:?}");
+        assert_eq!(added[0].worktree_path, fresh);
+        assert_eq!(added[0].parent_sha, sha);
+        let placed = format!("{:?}", added[0].provenance);
+        assert!(
+            placed.contains("FreshWorktree") && placed.contains(&*canonical.to_string_lossy()),
+            "{placed}"
+        );
+        assert!(fresh.join("README.md").exists(), "the added row is on disk");
+        assert!(
+            !existing.join("README.md").exists(),
+            "the existing row is untouched"
+        );
+    }
+
     /// `materialize_worktrees`' add half records ONLY the rows it actually
     /// added — an "already exists; skipping add" row is not this call's tree —
     /// each as a fresh worktree cut from its resolved checkout.
