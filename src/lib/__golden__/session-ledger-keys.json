@@ -43,6 +43,7 @@
     "displayName",
     "finished",
     "lastSeenAt",
+    "laterClosed",
     "nameSource",
     "outcome",
     "pageId",
@@ -64,12 +65,13 @@
     "zoneIndex"
   ],
   "ResumeAccount": ["configDir", "known"],
+  "LaterClosed": ["atMs", "deliberate", "reason"],
   "LedgerGeneration": [
     "bootAtMs",
     "capturedAt",
     "capturedAtMs",
     "cleanShutdown",
-    "closedByUser",
+    "closedSince",
     "file",
     "finished",
     "missing",
@@ -78,10 +80,11 @@
     "rotatedAtMs",
     "sessionCount",
     "thisBoot",
+    "unknownReasons",
     "verdict"
   ],
   "LedgerReport": [
-    "closedByUser",
+    "closedSince",
     "current",
     "expected",
     "finished",
@@ -96,6 +99,7 @@
     "savedAtMs",
     "savedMatchesCurrent",
     "status",
+    "unknownReasons",
     "verdict"
   ],
   "LedgerCapture": ["ledger", "path", "persisted"]

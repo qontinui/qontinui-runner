@@ -3961,7 +3961,7 @@ mod tests {
             .register_sniffed_session(&csid, "Terminal 1", None)
             .unwrap();
 
-        store.record_close(&csid, "poll-dead");
+        store.record_close(&csid, crate::session::close_reason::CloseReason::PollDead);
 
         // Index evicted + a Closed row enqueued for the coord id.
         assert!(reg.session_id_for(&csid).is_none());
@@ -3973,7 +3973,7 @@ mod tests {
 
         // A repeat close is a no-op (observer only fires on a REAL
         // transition): still exactly one Closed row.
-        store.record_close(&csid, "poll-dead");
+        store.record_close(&csid, crate::session::close_reason::CloseReason::PollDead);
         let closed_count = reg
             .inner
             .outbox

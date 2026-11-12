@@ -19,19 +19,66 @@ import { invoke } from "@tauri-apps/api/core";
 export type LedgerVerdict = "match" | "partial" | "mismatch" | "unknown";
 
 /**
- * What became of one prior session: it is open (or was restored) again, it
- * did not come back and was unfinished, or it was marked finished and is not
- * expected back (never counted as missing).
+ * What became of one prior session:
+ * - `back` — it came back after the restart, by any path the runner observed
+ *   (it may have closed since: see {@link LedgerOutcome.laterClosed});
+ * - `missing` — unfinished, and it did not come back;
+ * - `finished` — marked finished, not expected back (never counted as missing);
+ * - `closed-since` — closed on purpose after the roster was captured, without
+ *   coming back; not expected back (never counted as missing).
  */
-export type LedgerOutcomeClass = "back" | "missing" | "finished" | "closed-by-user";
+export type LedgerOutcomeClass = "back" | "missing" | "finished" | "closed-since";
 
 /**
- * Why a `missing` session is missing:
+ * Why a `missing` session is missing (and, for `closed-since`, which close):
+ * - `closed:<reason>` — its row closed, with that stored close reason
+ *   (`closed:pty-exit`, `closed:no-terminal`, …; a `closed-since` outcome
+ *   carries its deliberate one, `closed:explicit`);
+ * - `record-gone` — neither the registry nor any aftermath record still has
+ *   it, so whether it came back is UNKNOWN (counted as "up to");
  * - `no-attempt` — it was resumable and nothing brought it back;
  * - `not-restorable` — it was never identity-restorable;
  * - `restorability-unknown` — could not be determined; NOT evidence either way.
  */
-export type LedgerMissingReason = "no-attempt" | "not-restorable" | "restorability-unknown";
+export type LedgerMissingReason =
+  | `closed:${string}`
+  | "record-gone"
+  | "no-attempt"
+  | "not-restorable"
+  | "restorability-unknown";
+
+/**
+ * Why a verdict reads `unknown` — every one that applies, in
+ * {@link LedgerReport.unknownReasons} / {@link LedgerGeneration.unknownReasons}:
+ * - `no_prior_ledger` — no ledger from the previous boot is on disk;
+ * - `lifecycle_store_unavailable` — the session registry could not be read;
+ * - `restore_stamps_unavailable` — the restore census or the live-terminal
+ *   list could not be read, so the miss count is an upper bound;
+ * - `process_census_unavailable` — the newest poll tick could not read which
+ *   sessions a live `claude` holds (failed, not run yet, or stale);
+ * - `record_gone` — a miss has no registry row and no aftermath record left.
+ */
+export type LedgerUnknownReason =
+  | "no_prior_ledger"
+  | "lifecycle_store_unavailable"
+  | "restore_stamps_unavailable"
+  | "process_census_unavailable"
+  | "record_gone";
+
+/** How a session that came back after the restart was closed later. */
+export interface LaterClosed {
+  /** Unix millis of the close; null only for a closed row that recorded none. */
+  atMs: number | null;
+  /** The stored close reason, verbatim (`explicit`, `pty-exit`, `no-terminal`, …). */
+  reason: string;
+  /**
+   * `true` when the runner's typed close-reason set classifies the reason as
+   * deliberate (today only `explicit`); `null` otherwise — never `false`: a
+   * `pty-exit` from `DELETE /terminals/{id}` and one from a crash are the same
+   * string, so the reason cannot say.
+   */
+  deliberate: true | null;
+}
 
 /** One session on the roster, as it stood when a ledger was captured. */
 export interface LedgerEntry {
@@ -126,11 +173,16 @@ export interface LedgerOutcome {
   /** Unix millis — see {@link LedgerEntry.lastSeenAt}. */
   lastSeenAt: number | null;
   restorable: boolean | null;
-  /** Finished as of NOW when the registry still holds the row, else as captured. */
+  /**
+   * Finished as of NOW when the registry still holds the row, else as the
+   * aftermath record last saw it, else as captured.
+   */
   finished: boolean;
   outcome: LedgerOutcomeClass;
-  /** Set only for `missing`. */
+  /** Set for `missing` (why) and `closed-since` (`closed:<reason>`); null otherwise. */
   reason: LedgerMissingReason | null;
+  /** Set only for `back`: it came back, then its row was closed. */
+  laterClosed: LaterClosed | null;
   /**
    * The directory a resume opens in — the recorded `workingDir` (Claude Code
    * scopes sessions by the exact launch dir), else the worktree root. THE rule,
@@ -165,18 +217,25 @@ export interface LedgerGeneration {
   cleanShutdown: boolean | null;
   sessionCount: number;
   verdict: LedgerVerdict;
+  /** Every reason that applies when {@link verdict} is `unknown`; empty otherwise. */
+  unknownReasons: LedgerUnknownReason[];
   returned: LedgerOutcome[];
   missing: LedgerOutcome[];
   finished: LedgerOutcome[];
-  /** Unfinished sessions the operator has since closed on purpose — not expected back. */
-  closedByUser: LedgerOutcome[];
+  /** Closed on purpose since the capture without coming back — not expected back. */
+  closedSince: LedgerOutcome[];
 }
 
 /** The roster report — `session_ledger_report` / `GET /control/sessions/ledger`. */
 export interface LedgerReport {
   status: "ok" | "unavailable";
-  /** Present whenever status is not `ok` or the verdict is `unknown`. */
+  /**
+   * Present whenever status is not `ok` or the verdict is `unknown`: the first
+   * of {@link unknownReasons}.
+   */
   reason: string | null;
+  /** Every reason that applies when the verdict is `unknown`; empty otherwise. */
+  unknownReasons: LedgerUnknownReason[];
   generatedAt: number;
   priorCapturedAt: string | null;
   priorReason: string | null;
@@ -187,8 +246,8 @@ export interface LedgerReport {
   missing: LedgerOutcome[];
   /** Finished sessions that did not come back — not expected back. */
   finished: LedgerOutcome[];
-  /** Unfinished sessions the operator has since closed on purpose — not expected back. */
-  closedByUser: LedgerOutcome[];
+  /** Closed on purpose since the capture without coming back — not expected back. */
+  closedSince: LedgerOutcome[];
   verdict: LedgerVerdict;
   /** The roster right now — what would come back if the runner restarted. */
   current: SessionLedger;

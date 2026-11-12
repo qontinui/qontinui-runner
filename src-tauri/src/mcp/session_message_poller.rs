@@ -2356,7 +2356,10 @@ mod tests {
         // record in any state but `open` must resolve nothing.
         let (_dir, store) = lifecycle_fixture();
         store.record_open(open_record("csid-c", "term-c"));
-        store.record_close("csid-c", "test");
+        store.record_close(
+            "csid-c",
+            crate::session::close_reason::CloseReason::Explicit,
+        );
         assert_eq!(
             store.get("csid-c").map(|r| r.state),
             Some("closed".to_string()),

@@ -61,6 +61,7 @@ pub mod classify_child_shadow; // `classify_child` in SHADOW beside the finished
 pub mod claude_activity; // The ACTIVITY axis of a live `claude` (working/idle/stale/unknown) — report-only, rendered as /restart-readiness live_claude.by_activity (plan 2026-09-29-quiet-is-measured-by-session-existence-and-machine-wide-so-a-24x7-box-never-gets-one, Phase 6)
 pub mod claude_hook;
 pub mod claude_session_registry;
+pub mod close_reason; // The TYPED close-reason set every production close writes, with the exhaustive deliberate classification (plan 2026-11-11-since-restart-roster-counts-closed-sessions-as-missing, D2 / Phase 3)
 pub mod closeout_spool; // Producer for the two closeout outbox kinds — the loopback coord-write forwarders spool here when coord is UNREACHABLE (plan 2026-08-28-closeout-has-no-durable-store-when-the-runner-is-offline, Phase 3)
 pub mod coord_identity; // THE seam that re-keys a pane's coord row to the harness id pid-exact evidence names — hook, rung 2, R2 resume (plan 2026-10-23-a-hookless-resume-in-a-runner-pane-leaves-the-session-with-no-active-coord-row, D1)
 pub mod coord_sync;

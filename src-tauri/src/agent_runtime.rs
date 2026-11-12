@@ -21577,7 +21577,7 @@ mod tests {
 
         // Now its death is this generation's: a later non-restorable close is
         // NOT reported by the close observer (the exit hook / reaper own it).
-        store.record_close(csid, "no-terminal");
+        store.record_close(csid, crate::session::close_reason::CloseReason::NoTerminal);
         assert_eq!(
             runner_restart_unreported_report(&store.get(csid).unwrap(), this_boot),
             None

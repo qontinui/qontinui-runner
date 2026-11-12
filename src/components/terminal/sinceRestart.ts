@@ -225,7 +225,10 @@ export function buildRow(outcome: LedgerOutcome, ctx: RowContext): SinceRestartR
     state = "finished";
     label = "finished";
     detail = "marked finished — not expected back";
-  } else if (outcome.outcome === "closed-by-user") {
+  } else if (outcome.outcome === "closed-since") {
+    // The ledger's `closed-since` class (closed on purpose since the capture,
+    // without coming back). Its own row state and label arrive with the
+    // strip's Phase 5; until then it keeps the closed-on-purpose row.
     state = "closed-by-user";
     label = "closed by you";
     detail = "you closed it after this roster was captured — not expected back";
@@ -255,7 +258,12 @@ export function buildRow(outcome: LedgerOutcome, ctx: RowContext): SinceRestartR
       state === "needs-account" ? "choose an account first" : `nothing to resume: ${label}`;
   } else if (!account.known) {
     blockedReason = "the account it ran under is unknown";
-  } else if (outcome.reason === "not-restorable") {
+  } else if (
+    outcome.reason === "not-restorable" ||
+    (state === "missing" && outcome.restorable === false)
+  ) {
+    // `restorable` is the capture-time verdict itself: a never-restorable miss
+    // whose reason now names its close (`closed:<reason>`) is still blocked.
     blockedReason = "never identity-restorable — use Copy command to try by hand";
   } else if (!SESSION_ID_RE.test(id)) {
     blockedReason = "the session id is not shell-safe";
@@ -278,7 +286,7 @@ export function buildRow(outcome: LedgerOutcome, ctx: RowContext): SinceRestartR
 
 /** Every row of a generation, the ones needing attention first. */
 export function buildRows(gen: LedgerGeneration, ctx: RowContext): SinceRestartRow[] {
-  return [...gen.missing, ...gen.returned, ...gen.closedByUser, ...gen.finished]
+  return [...gen.missing, ...gen.returned, ...gen.closedSince, ...gen.finished]
     .map((o) => buildRow(o, ctx))
     .sort(
       (a, b) =>
@@ -332,9 +340,10 @@ export const EMPTY_SELECTION: SelectionState = {
  * operator's own checks and un-checks are never overridden.
  *
  * `precheck` is false for every generation but the NEWEST: an older
- * generation's sessions may have been closed or superseded since (the ledger
- * records no user-close), so nothing there is ticked for the operator — they
- * may still tick rows themselves.
+ * generation's sessions may have been closed, superseded or resumed in a later
+ * life, which its own aftermath record (the boot that observed it) does not
+ * cover, so nothing there is ticked for the operator — they may still tick rows
+ * themselves.
  */
 export function reconcileSelection(
   prev: SelectionState,
@@ -398,10 +407,11 @@ export function selectedResumable(
  * operator has not marked reviewed. `null` — the normal running state — means
  * the panel shows the current roster (the pre-rebuild preview) instead.
  *
- * Never an OLDER generation: its sessions may have been closed or finished in
- * a later life, and the ledger records no user-close, so opening on it would
- * offer back sessions the operator already dealt with. Older generations stay
- * reachable through the selector.
+ * Never an OLDER generation: its sessions may have been closed, finished or
+ * resumed in a later life, which its own aftermath record (the boot that
+ * observed it) does not cover, so opening on it would offer back sessions the
+ * operator already dealt with. Older generations stay reachable through the
+ * selector.
  */
 export function defaultGenerationFile(
   report: LedgerReport | null,

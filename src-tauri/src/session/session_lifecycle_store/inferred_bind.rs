@@ -271,7 +271,10 @@ mod tests {
         assert_eq!(store.get("new").unwrap().terminal_id, "pane-n");
 
         store.record_open(row("was-closed", "old-pane", 0, true));
-        store.record_close("was-closed", "poll-dead");
+        store.record_close(
+            "was-closed",
+            crate::session::close_reason::CloseReason::PollDead,
+        );
         assert_eq!(
             store.bind_inferred(
                 row("was-closed", "pane-t", 0, true),

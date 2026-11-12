@@ -985,8 +985,10 @@ async fn get_sessions_restore_census(
 /// { "success": true, "data": {
 ///     "status": "ok", "verdict": "partial",
 ///     "priorCapturedAt": "2026-08-24T09:02:11Z", "priorReason": "pre-rebuild",
+///     "unknownReasons": [ /* every reason, when the verdict is unknown */ ],
 ///     "expected": [ /* all N */ ],
-///     "returned": [ /* the ones open again */ ],
+///     "returned": [ /* the ones that came back, by any observed path; a
+///                     later close rides along as "laterClosed" */ ],
 ///     "missing": [
 ///       { "claudeSessionId": "aaaa…", "sessionName": "amber-otter",
 ///         "worktreePath": "D:/qontinui-root/_wt/foo",
@@ -997,6 +999,7 @@ async fn get_sessions_restore_census(
 ///         "resumeCommand": "cd \"D:/…/foo\" && CLAUDE_CONFIG_DIR=\"C:/claude/.claude-gmail\" claude --resume aaaa…" }
 ///     ],
 ///     "finished": [ /* marked finished — never counted as missing */ ],
+///     "closedSince": [ /* closed on purpose since, never back — not missing */ ],
 ///     "current": { /* the roster right now */ },
 ///     "generations": [ /* every retained prior boot, newest first */ ] } }
 /// ```
@@ -2713,7 +2716,10 @@ mod tests {
         );
 
         // The session ends before anything could confirm the resume.
-        store.record_close("mid-restore", "pty-exit");
+        store.record_close(
+            "mid-restore",
+            crate::session::close_reason::CloseReason::PtyExit,
+        );
 
         let probe = FakeProbe(std::collections::HashSet::new());
         let failed_only = parse_restore_health_include(Some("failed")).unwrap();

@@ -5252,7 +5252,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                     // retire it non-restorably rather than
                                     // reporting a phantom `poll-dead`.
                                     poll_lifecycle_store
-                                        .record_close(&rec.claude_session_id, "never-started");
+                                        .record_close(&rec.claude_session_id, session::close_reason::CloseReason::NeverStarted);
                                     consecutive_dead.remove(&rec.claude_session_id);
                                     consecutive_no_match.remove(&rec.claude_session_id);
                                     tracing::info!(
@@ -5284,7 +5284,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                     // a ghost inherited from a prior process).
                                     // `"no-terminal"` is non-restorable.
                                     poll_lifecycle_store
-                                        .record_close(&rec.claude_session_id, "no-terminal");
+                                        .record_close(&rec.claude_session_id, session::close_reason::CloseReason::NoTerminal);
                                     consecutive_dead.remove(&rec.claude_session_id);
                                     consecutive_no_match.remove(&rec.claude_session_id);
                                     tracing::info!(

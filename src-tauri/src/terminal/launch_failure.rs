@@ -57,6 +57,7 @@ use std::sync::{LazyLock, Mutex, MutexGuard};
 use lru::LruCache;
 use tracing::info;
 
+use crate::session::close_reason::CloseReason;
 use crate::session::session_lifecycle_store::{
     close_reason_for_dead_shell, CloseOutcome, SessionLifecycleStore, TerminalSessionRecord,
 };
@@ -69,15 +70,16 @@ pub const EVENT_RESOLVE_FAILED: &str = "resolve-failed";
 /// The `claude` the shim resolved would not exec within its retry bound.
 pub const EVENT_EXEC_FAILED: &str = "exec-failed";
 
-/// The close reason of a pane whose Claude CLI never launched. Restorable
-/// exactly like `poll-dead` (`RESTORABLE_LAUNCH_FAILED_MS` in the lifecycle
-/// store) and deliberately absent from `NON_RESTORABLE_CLOSE_REASONS`: nothing
-/// ran, so the conversation is exactly as it was.
-pub const LAUNCH_FAILED: &str = "launch-failed";
+/// The stored wire string of [`CloseReason::LaunchFailed`], the close reason of
+/// a pane whose Claude CLI never launched. Restorable exactly like `poll-dead`
+/// (`RESTORABLE_LAUNCH_FAILED_MS` in the lifecycle store) and deliberately
+/// absent from `NON_RESTORABLE_CLOSE_REASONS`: nothing ran, so the
+/// conversation is exactly as it was.
+pub const LAUNCH_FAILED: &str = CloseReason::LaunchFailed.as_str();
 
 /// The only close reasons the verdict may rewrite: the two restorable "the
 /// session died" closes.
-const DEATH_CLOSE_REASONS: [&str; 2] = ["poll-dead", "pty-exit"];
+const DEATH_CLOSE_REASONS: [CloseReason; 2] = [CloseReason::PollDead, CloseReason::PtyExit];
 
 /// How long a report stays evidence: one hour.
 const ENTRY_TTL_MS: i64 = 3_600_000;
@@ -143,8 +145,8 @@ fn detail_flag(detail: &str, key: &str) -> bool {
 /// A close this process already recorded for a session, before something
 /// re-opened its row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PriorClose<'a> {
-    pub reason: &'a str,
+pub struct PriorClose {
+    pub reason: CloseReason,
     pub at_ms: i64,
 }
 
@@ -159,14 +161,14 @@ pub struct PriorClose<'a> {
 /// - `terminal_created_at_ms`: that terminal's spawn time, from an EXACT
 ///   terminal-id match only (`None` when no such match was made);
 /// - `last_session_start_at` / `last_alive_at`: the row's own stamps.
-pub fn close_reason_for_launch<'a>(
-    proposed: &'a str,
-    prior_reason: Option<PriorClose<'_>>,
+pub fn close_reason_for_launch(
+    proposed: CloseReason,
+    prior_reason: Option<PriorClose>,
     failure: Option<&LaunchFailure>,
     terminal_created_at_ms: Option<i64>,
     last_session_start_at: Option<i64>,
     last_alive_at: Option<i64>,
-) -> &'a str {
+) -> CloseReason {
     if !DEATH_CLOSE_REASONS.contains(&proposed) {
         return proposed;
     }
@@ -174,11 +176,11 @@ pub fn close_reason_for_launch<'a>(
     // hook nor the poll has seen the CLI since.
     if let Some(prior) = prior_reason {
         let since_prior = |stamp: Option<i64>| stamp.is_some_and(|at| at >= prior.at_ms);
-        if prior.reason == LAUNCH_FAILED
+        if prior.reason == CloseReason::LaunchFailed
             && !since_prior(last_session_start_at)
             && !since_prior(last_alive_at)
         {
-            return LAUNCH_FAILED;
+            return CloseReason::LaunchFailed;
         }
     }
     // 1. A resume-shaped launch failure, reported while the shim delivered
@@ -200,14 +202,14 @@ pub fn close_reason_for_launch<'a>(
     if last_alive_at.is_some_and(|at| at >= failure.at_ms) {
         return proposed;
     }
-    LAUNCH_FAILED
+    CloseReason::LaunchFailed
 }
 
 /// The reason one death close records, and what rewrote it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LaunchCloseVerdict<'a> {
+pub struct LaunchCloseVerdict {
     /// The reason to record.
-    pub reason: &'a str,
+    pub reason: CloseReason,
     /// Set only when the verdict rewrote the proposed reason: the evidence
     /// behind it, for the close's log line.
     pub evidence: Option<String>,
@@ -271,13 +273,13 @@ impl LaunchFailureRegistry {
     /// The verdict for one death close of `rec`: [`close_reason_for_launch`]
     /// fed from this registry and the row's own stamps. Pure apart from the
     /// reads; [`Self::settle`] records the outcome once the close has landed.
-    pub fn verdict<'a>(
+    pub fn verdict(
         &self,
-        proposed: &'a str,
+        proposed: CloseReason,
         rec: &TerminalSessionRecord,
         terminal_created_at_ms: Option<i64>,
         now_ms: i64,
-    ) -> LaunchCloseVerdict<'a> {
+    ) -> LaunchCloseVerdict {
         let failure = self.get(&rec.terminal_id, now_ms);
         let prior_at = fresh(
             &mut lock(&self.launch_failed_closes),
@@ -289,7 +291,7 @@ impl LaunchFailureRegistry {
         let reason = close_reason_for_launch(
             proposed,
             prior_at.map(|at_ms| PriorClose {
-                reason: LAUNCH_FAILED,
+                reason: CloseReason::LaunchFailed,
                 at_ms,
             }),
             failure.as_ref(),
@@ -316,11 +318,11 @@ impl LaunchFailureRegistry {
     /// line may claim.
     pub fn settle(
         &self,
-        verdict: &LaunchCloseVerdict<'_>,
+        verdict: &LaunchCloseVerdict,
         outcome: &CloseOutcome,
         now_ms: i64,
     ) -> bool {
-        if verdict.reason != LAUNCH_FAILED {
+        if verdict.reason != CloseReason::LaunchFailed {
             return false;
         }
         let Some(closed) = closed_session(outcome) else {
@@ -378,7 +380,7 @@ pub fn close_dead_row(
     rec: &TerminalSessionRecord,
     live_by_id: &HashMap<&str, &TerminalInfo>,
     now_ms: i64,
-) -> (&'static str, CloseOutcome) {
+) -> (CloseReason, CloseOutcome) {
     let proposed = close_reason_for_dead_shell(rec.restore_tier.as_deref());
     let terminal_created_at_ms = live_by_id
         .get(rec.terminal_id.as_str())
@@ -604,13 +606,16 @@ mod tests {
         ];
         // (proposed, what it records when all three conditions are met)
         let proposed_reasons = [
-            ("poll-dead", "launch-failed"),
-            ("pty-exit", "launch-failed"),
-            ("terminal-only-idle", "terminal-only-idle"),
-            ("never-started", "never-started"),
-            ("no-terminal", "no-terminal"),
-            ("explicit", "explicit"),
-            ("superseded-terminal-reuse", "superseded-terminal-reuse"),
+            (CloseReason::PollDead, CloseReason::LaunchFailed),
+            (CloseReason::PtyExit, CloseReason::LaunchFailed),
+            (CloseReason::TerminalOnlyIdle, CloseReason::TerminalOnlyIdle),
+            (CloseReason::NeverStarted, CloseReason::NeverStarted),
+            (CloseReason::NoTerminal, CloseReason::NoTerminal),
+            (CloseReason::Explicit, CloseReason::Explicit),
+            (
+                CloseReason::SupersededTerminalReuse,
+                CloseReason::SupersededTerminalReuse,
+            ),
         ];
         for (proposed, when_met) in proposed_reasons {
             for (arm, failure, created, start, alive) in arms {
@@ -635,19 +640,26 @@ mod tests {
     fn every_tie_keeps_the_proposed_reason() {
         let f = resume_failure();
         let decide = |start, alive| {
-            close_reason_for_launch("poll-dead", None, Some(&f), Some(CREATED), start, alive)
+            close_reason_for_launch(
+                CloseReason::PollDead,
+                None,
+                Some(&f),
+                Some(CREATED),
+                start,
+                alive,
+            )
         };
-        assert_eq!(decide(Some(CREATED - 1), None), "launch-failed");
-        assert_eq!(decide(Some(CREATED), None), "poll-dead");
+        assert_eq!(decide(Some(CREATED - 1), None), CloseReason::LaunchFailed);
+        assert_eq!(decide(Some(CREATED), None), CloseReason::PollDead);
         assert_eq!(
             decide(None, Some(FAILED - 1)),
-            "launch-failed",
+            CloseReason::LaunchFailed,
             "seen alive during the shim's own wait is not alive after the failure"
         );
-        assert_eq!(decide(None, Some(FAILED)), "poll-dead");
+        assert_eq!(decide(None, Some(FAILED)), CloseReason::PollDead);
         assert_eq!(
             decide(None, None),
-            "launch-failed",
+            CloseReason::LaunchFailed,
             "a row never stamped at all"
         );
     }
@@ -665,29 +677,29 @@ mod tests {
         .unwrap();
         assert_eq!(
             close_reason_for_launch(
-                "poll-dead",
+                CloseReason::PollDead,
                 None,
                 Some(&failure),
                 Some(1_794_283_435_546),
                 Some(1_794_263_400_000),
                 None,
             ),
-            "launch-failed"
+            CloseReason::LaunchFailed
         );
         let first_close = PriorClose {
-            reason: "launch-failed",
+            reason: CloseReason::LaunchFailed,
             at_ms: 1_794_283_481_928,
         };
         assert_eq!(
             close_reason_for_launch(
-                "poll-dead",
+                CloseReason::PollDead,
                 Some(first_close),
                 None,
                 None,
                 Some(1_794_263_400_000),
                 None,
             ),
-            "launch-failed"
+            CloseReason::LaunchFailed
         );
     }
 
@@ -697,33 +709,39 @@ mod tests {
     #[test]
     fn a_reclose_keeps_launch_failed_only_while_nothing_ran_since() {
         let prior = PriorClose {
-            reason: "launch-failed",
+            reason: CloseReason::LaunchFailed,
             at_ms: FAILED + 36_758,
         };
         let reclose = |prior, start, alive| {
-            close_reason_for_launch("poll-dead", prior, None, None, start, alive)
+            close_reason_for_launch(CloseReason::PollDead, prior, None, None, start, alive)
         };
-        assert_eq!(reclose(Some(prior), Some(HOOK), None), "launch-failed");
-        assert_eq!(reclose(Some(prior), None, None), "launch-failed");
+        assert_eq!(
+            reclose(Some(prior), Some(HOOK), None),
+            CloseReason::LaunchFailed
+        );
+        assert_eq!(reclose(Some(prior), None, None), CloseReason::LaunchFailed);
         assert_eq!(
             reclose(Some(prior), Some(prior.at_ms), None),
-            "poll-dead",
+            CloseReason::PollDead,
             "a SessionStart stamp since the prior close: the CLI ran"
         );
         assert_eq!(
             reclose(Some(prior), None, Some(prior.at_ms + 1)),
-            "poll-dead",
+            CloseReason::PollDead,
             "seen alive since the prior close"
         );
         let prior_death = PriorClose {
-            reason: "poll-dead",
+            reason: CloseReason::PollDead,
             ..prior
         };
-        assert_eq!(reclose(Some(prior_death), None, None), "poll-dead");
-        assert_eq!(reclose(None, None, None), "poll-dead");
         assert_eq!(
-            close_reason_for_launch("no-terminal", Some(prior), None, None, None, None),
-            "no-terminal"
+            reclose(Some(prior_death), None, None),
+            CloseReason::PollDead
+        );
+        assert_eq!(reclose(None, None, None), CloseReason::PollDead);
+        assert_eq!(
+            close_reason_for_launch(CloseReason::NoTerminal, Some(prior), None, None, None, None),
+            CloseReason::NoTerminal
         );
     }
 
@@ -732,14 +750,14 @@ mod tests {
     fn a_non_restorable_reason_is_never_rewritten() {
         let f = resume_failure();
         let prior = PriorClose {
-            reason: "launch-failed",
+            reason: CloseReason::LaunchFailed,
             at_ms: FAILED,
         };
         for reason in [
-            "no-terminal",
-            "never-started",
-            "terminal-only-idle",
-            "explicit",
+            CloseReason::NoTerminal,
+            CloseReason::NeverStarted,
+            CloseReason::TerminalOnlyIdle,
+            CloseReason::Explicit,
         ] {
             assert_eq!(
                 close_reason_for_launch(reason, Some(prior), Some(&f), Some(CREATED), None, None),
@@ -811,12 +829,12 @@ mod tests {
 
         let first_at = failed + 36_758;
         let verdict = registry.verdict(
-            "poll-dead",
+            CloseReason::PollDead,
             &store.get(id).unwrap(),
             Some(created),
             first_at,
         );
-        assert_eq!(verdict.reason, "launch-failed");
+        assert_eq!(verdict.reason, CloseReason::LaunchFailed);
         assert_eq!(
             verdict.evidence.as_deref(),
             Some("resolve-failed waited=10 stub=false settings=true user_session_id=true")
@@ -839,13 +857,13 @@ mod tests {
         for created_at in [Some(created), None] {
             assert_eq!(
                 registry
-                    .verdict("poll-dead", &reopened, created_at, second_at)
+                    .verdict(CloseReason::PollDead, &reopened, created_at, second_at)
                     .reason,
-                "launch-failed",
+                CloseReason::LaunchFailed,
                 "created_at {created_at:?}"
             );
         }
-        let verdict = registry.verdict("poll-dead", &reopened, None, second_at);
+        let verdict = registry.verdict(CloseReason::PollDead, &reopened, None, second_at);
         let outcome = store.record_close_checked(id, None, verdict.reason);
         registry.settle(&verdict, &outcome, second_at);
         assert_eq!(
@@ -911,7 +929,7 @@ mod tests {
             &live_by_id,
             now,
         );
-        assert_eq!(reason, "poll-dead");
+        assert_eq!(reason, CloseReason::PollDead);
         assert_eq!(
             outcome,
             CloseOutcome::Closed {
@@ -930,7 +948,7 @@ mod tests {
             &live_by_id,
             now,
         );
-        assert_eq!(reason, "launch-failed");
+        assert_eq!(reason, CloseReason::LaunchFailed);
         assert_eq!(
             store.get("sess-c").unwrap().close_reason.as_deref(),
             Some("launch-failed")
@@ -951,7 +969,7 @@ mod tests {
         registry.record_beacon(Some(term), "resolve-failed", RESUME_FAILED, failed);
         let first_at = failed + 36_758;
         let verdict = registry.verdict(
-            "poll-dead",
+            CloseReason::PollDead,
             &store.get(id).unwrap(),
             Some(created),
             first_at,
@@ -966,9 +984,9 @@ mod tests {
         for created_at in [Some(created), None] {
             assert_eq!(
                 registry
-                    .verdict("poll-dead", &reopened, created_at, later)
+                    .verdict(CloseReason::PollDead, &reopened, created_at, later)
                     .reason,
-                "poll-dead",
+                CloseReason::PollDead,
                 "created_at {created_at:?}"
             );
         }
@@ -999,7 +1017,7 @@ mod tests {
         );
         let rec = store.get(id).unwrap();
         assert!(rec.last_session_start_at.is_some_and(|at| at >= created));
-        for proposed in ["poll-dead", "pty-exit"] {
+        for proposed in [CloseReason::PollDead, CloseReason::PtyExit] {
             let verdict = registry.verdict(proposed, &rec, Some(created), failed + 40_000);
             assert_eq!((verdict.reason, verdict.evidence), (proposed, None));
         }
@@ -1015,11 +1033,11 @@ mod tests {
             ..test_open_record(id)
         };
         let launch_failed = LaunchCloseVerdict {
-            reason: "launch-failed",
+            reason: CloseReason::LaunchFailed,
             evidence: Some("resolve-failed".to_string()),
         };
         let death = LaunchCloseVerdict {
-            reason: "poll-dead",
+            reason: CloseReason::PollDead,
             evidence: None,
         };
         registry.settle(
@@ -1047,23 +1065,27 @@ mod tests {
         );
         let reclose = |id: &str| {
             registry
-                .verdict("poll-dead", &rec(id), None, T0 + 60_000)
+                .verdict(CloseReason::PollDead, &rec(id), None, T0 + 60_000)
                 .reason
         };
-        assert_eq!(reclose("a"), "poll-dead", "an AlreadyClosed closed nothing");
+        assert_eq!(
+            reclose("a"),
+            CloseReason::PollDead,
+            "an AlreadyClosed closed nothing"
+        );
         assert_eq!(
             reclose("b"),
-            "poll-dead",
+            CloseReason::PollDead,
             "a poll-dead close is not remembered"
         );
         assert_eq!(
             reclose("c"),
-            "launch-failed",
+            CloseReason::LaunchFailed,
             "the row a redirect actually closed"
         );
         assert_eq!(
             reclose("x"),
-            "poll-dead",
+            CloseReason::PollDead,
             "not the row the caller merely named"
         );
     }
@@ -1101,7 +1123,7 @@ mod tests {
                 true,
                 down_id,
                 Some(down_term.as_str()),
-                "pty-exit",
+                CloseReason::PtyExit,
                 Some(created)
             ),
             CloseOutcome::IgnoredDuringShutdown {
@@ -1119,7 +1141,7 @@ mod tests {
                 false,
                 live_id,
                 Some(live_term.as_str()),
-                "pty-exit",
+                CloseReason::PtyExit,
                 Some(created)
             ),
             CloseOutcome::Closed {

@@ -9,6 +9,7 @@ use tracing::{debug, info, warn};
 
 use crate::commands::CommandResponse;
 use crate::error::AppError;
+use crate::session::close_reason::{CloseReason, UnknownCloseReason};
 use crate::session::pane_store::{PaneKey, PaneSessionStore};
 use crate::session::session_lifecycle_store::{
     CloseOutcome, SessionLifecycleStore, TerminalSessionRecord,
@@ -1759,6 +1760,10 @@ pub fn terminal_session_clear_restore_pending(
 /// close of this terminal's own record (`alreadyClosed`) is a no-op, not a
 /// failure, and so is a close naming a terminal whose session already moved to
 /// a new PTY (`terminalSuperseded` — the account-migration hand-off).
+///
+/// `reason` must be a wire string of the typed close-reason set
+/// ([`CloseReason`]); anything else is refused with an error and closes
+/// nothing.
 #[tauri::command]
 pub fn terminal_session_record_close(
     store: tauri::State<'_, Arc<SessionLifecycleStore>>,
@@ -1767,20 +1772,48 @@ pub fn terminal_session_record_close(
     terminal_id: Option<String>,
     reason: String,
 ) -> Result<CommandResponse, String> {
-    let outcome = record_close_for(
+    let outcome = record_close_request(
         &terminal_manager,
         &store,
         &claude_session_id,
         terminal_id.as_deref(),
         &reason,
-    );
+    )?;
     Ok(close_outcome_response(&outcome))
 }
 
-/// The body of [`terminal_session_record_close`]: the close behind THIS
-/// manager's shutdown latch, so a `pty-exit` that arrives after
-/// [`TerminalManager::close_all`] began leaves its row as it was (plan
-/// `2026-10-28-force-exited-runner-restore-set-follow-ups`, Phase 6).
+/// The IPC door's body: the webview's `reason` PARSED into the typed
+/// close-reason set (plan
+/// `2026-11-11-since-restart-roster-counts-closed-sessions-as-missing`, D2) —
+/// a string outside it is refused and nothing is closed — then
+/// [`record_close_for`].
+pub(crate) fn record_close_request(
+    terminal_manager: &TerminalManager,
+    store: &SessionLifecycleStore,
+    claude_session_id: &str,
+    terminal_id: Option<&str>,
+    reason: &str,
+) -> Result<CloseOutcome, String> {
+    let reason: CloseReason = reason.parse().map_err(|e: UnknownCloseReason| {
+        warn!(
+            claude_session_id,
+            error = %e,
+            "terminal_session_record_close: refused a close reason outside the typed set — nothing closed"
+        );
+        format!("terminal_session_record_close refused: {e}")
+    })?;
+    Ok(record_close_for(
+        terminal_manager,
+        store,
+        claude_session_id,
+        terminal_id,
+        reason,
+    ))
+}
+
+/// The close behind THIS manager's shutdown latch, so a `pty-exit` that
+/// arrives after [`TerminalManager::close_all`] began leaves its row as it was
+/// (plan `2026-10-28-force-exited-runner-restore-set-follow-ups`, Phase 6).
 ///
 /// The named terminal's spawn time goes along for the `launch-failed` close
 /// rule (plan `2026-11-10-migration-holds-for-missing-claude-cli`, D3), read
@@ -1791,7 +1824,7 @@ pub(crate) fn record_close_for(
     store: &SessionLifecycleStore,
     claude_session_id: &str,
     terminal_id: Option<&str>,
-    reason: &str,
+    reason: CloseReason,
 ) -> CloseOutcome {
     let terminal_created_at_ms = terminal_id
         .and_then(|t| terminal_manager.get(t))
@@ -3676,20 +3709,38 @@ mod tests {
         }
         let tm = TerminalManager::new();
 
-        let before = record_close_for(&tm, &store, "before", Some("term-before"), "pty-exit");
+        let before = record_close_for(
+            &tm,
+            &store,
+            "before",
+            Some("term-before"),
+            CloseReason::PtyExit,
+        );
         assert!(matches!(before, CloseOutcome::Closed { .. }), "{before:?}");
         assert_eq!(store.get("before").unwrap().state, "closed");
 
         let _ = tm.close_all(std::time::Instant::now());
 
-        let after = record_close_for(&tm, &store, "after", Some("term-after"), "pty-exit");
+        let after = record_close_for(
+            &tm,
+            &store,
+            "after",
+            Some("term-after"),
+            CloseReason::PtyExit,
+        );
         assert!(
             matches!(after, CloseOutcome::IgnoredDuringShutdown { .. }),
             "{after:?}"
         );
         assert_eq!(store.get("after").unwrap().state, "open");
 
-        let user = record_close_for(&tm, &store, "user", Some("term-user"), "explicit");
+        let user = record_close_for(
+            &tm,
+            &store,
+            "user",
+            Some("term-user"),
+            CloseReason::Explicit,
+        );
         assert!(matches!(user, CloseOutcome::Closed { .. }), "{user:?}");
     }
 
@@ -3719,11 +3770,44 @@ mod tests {
         let tm = TerminalManager::new();
         assert!(tm.get(&term).is_none(), "the pane is gone from the manager");
 
-        let out = record_close_for(&tm, &store, &id, Some(term.as_str()), "pty-exit");
+        let out = record_close_for(&tm, &store, &id, Some(term.as_str()), CloseReason::PtyExit);
         assert!(matches!(out, CloseOutcome::Closed { .. }), "{out:?}");
         assert_eq!(
             store.get(&id).unwrap().close_reason.as_deref(),
             Some("pty-exit")
+        );
+    }
+
+    /// Plan `2026-11-11-since-restart-roster-counts-closed-sessions-as-missing`,
+    /// Phase 3: the IPC door parses the webview's reason into the typed
+    /// close-reason set and refuses a string outside it, closing nothing — the
+    /// dead `user-close` key included. Mutation: `record_close_request` mapping
+    /// an unknown string to `CloseReason::Explicit` instead of refusing it.
+    #[test]
+    fn the_close_door_refuses_a_reason_outside_the_typed_set_and_closes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
+        let mut r = restore_candidate_record("s");
+        r.terminal_id = "term-s".to_string();
+        store.record_open(r);
+        let tm = TerminalManager::new();
+
+        for bad in ["user-close", "migrated", "", "EXPLICIT"] {
+            let err = record_close_request(&tm, &store, "s", Some("term-s"), bad).unwrap_err();
+            assert!(err.contains("unknown close reason"), "{bad:?}: {err}");
+            assert_eq!(
+                store.get("s").unwrap().state,
+                "open",
+                "{bad:?} closed nothing"
+            );
+        }
+
+        let ok = record_close_request(&tm, &store, "s", Some("term-s"), "explicit").unwrap();
+        assert!(matches!(ok, CloseOutcome::Closed { .. }), "{ok:?}");
+        assert_eq!(
+            store.get("s").unwrap().close_reason.as_deref(),
+            Some("explicit"),
+            "the wire string is stored unchanged"
         );
     }
 

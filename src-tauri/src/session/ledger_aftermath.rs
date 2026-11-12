@@ -812,5 +812,8 @@ pub fn process() -> Option<&'static Arc<LedgerAftermath>> {
     PROCESS.get()
 }
 
+mod view;
+pub use view::{AftermathView, RecordedSession};
+
 #[cfg(test)]
 mod tests;
