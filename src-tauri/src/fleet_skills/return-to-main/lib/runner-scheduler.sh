@@ -512,6 +512,63 @@ cron_hhmm() { # <cron> -> HH:MM when it is one fixed daily time, else empty
     [ "${f[2]}" = '*' ] && [ "${f[3]}" = '*' ] && [ "${f[4]}" = '*' ] || return 0
     printf '%02d:%02d' "$((10#${f[1]}))" "$((10#${f[0]}))"
 }
+# ---- overdue / waiting (plan 2026-10-30-runner-scheduler-parked-condition-task-
+# spends-the-only-seat-and-starves-due-tasks, Phase 2) -----------------------
+# `--check` answers "is the task registered", which stayed green through a
+# two-day stoppage in which no task started. So it also reports the OUTPUT: an
+# enabled task whose nextRun is more than RS_OVERDUE_AFTER_SECS in the past is
+# OVERDUE. nextRun is a slot time, so now - nextRun measures lateness whatever
+# the cron's period, with no cron parsing. 12 h clears the worst legitimate
+# queue on a maxConcurrent:1 box (the live task timeouts sum to 10.2 h).
+# The doctor (capability-doctor.sh sched_overdue_all) keeps the same constant.
+RS_OVERDUE_AFTER_SECS=43200
+rs_iso_epoch() { # <RFC 3339> -> epoch seconds; empty when unconvertible
+    local iso="$1" out
+    out="$(date -d "$iso" +%s 2>/dev/null)" && [[ $out =~ ^[0-9]+$ ]] && { printf '%s' "$out"; return 0; }
+    if [[ $iso =~ ^([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$ ]]; then
+        local base="${BASH_REMATCH[1]}" off="${BASH_REMATCH[3]}"
+        [ "$off" = Z ] && off="+00:00"
+        out="$(date -j -f '%Y-%m-%dT%H:%M:%S%z' "$base${off/:/}" +%s 2>/dev/null)" && [[ $out =~ ^[0-9]+$ ]] && printf '%s' "$out"
+    fi
+    return 0
+}
+# report_liveness <task json> <enabled> <nextRun>: the `waiting:` / `overdue:`
+# lines of --check. A task carrying conditionStatus is parked on its conditions
+# as designed (task_is_due keeps it due, a Condition or a Cron schedule alike):
+# it is WAITING, never overdue. An unreadable clock or nextRun is UNKNOWN, never
+# "not overdue".
+report_liveness() {
+    local c="$1" en="$2" next="$3" since detail ep now late settings why
+    [ "$en" = true ] || return 0
+    if [[ $c =~ \"conditionStatus\":\{ ]]; then
+        since="$(jstr "$c" waitingSince)" || since="<unreadable>"
+        detail="$(jstr "$c" probeDetail)" || detail="no probe detail"
+        printf '  waiting:           WAITING since %s (%s) -- parked on its conditions as designed, not overdue\n' "$since" "$detail"
+        return 0
+    fi
+    [ -n "$next" ] || return 0
+    ep="$(rs_iso_epoch "$next")"
+    now="$(date +%s 2>/dev/null)"
+    if [ -z "$ep" ] || ! [[ $now =~ ^[0-9]+$ ]]; then
+        printf '  overdue:           UNKNOWN -- could not compare nextRun %s with the clock on this machine\n' "$next"
+        return 0
+    fi
+    late=$((now - ep))
+    [ "$late" -gt "$RS_OVERDUE_AFTER_SECS" ] || return 0
+    printf '  overdue:           OVERDUE -- nextRun %s is %s h past (threshold %s h): an enabled task that did not start for that long means the scheduler is not starting tasks\n' \
+        "$next" "$((late / 3600))" "$((RS_OVERDUE_AFTER_SECS / 3600))"
+    if api GET /scheduler/settings && [ "$API_CODE" = 200 ]; then
+        settings="$(jscalar "$API_BODY" enabled)" || settings=""
+        case "$settings" in
+            false) why="the scheduler itself is DISABLED (GET /scheduler/settings enabled=false), so no task starts" ;;
+            true)  why="the scheduler is enabled (GET /scheduler/settings), so look at the seat (maxConcurrent) and the runner log" ;;
+            *)     why="GET /scheduler/settings answered without a readable enabled field -- UNKNOWN" ;;
+        esac
+    else
+        why="GET /scheduler/settings was unreadable -- whether the scheduler is enabled is UNKNOWN"
+    fi
+    printf '  overdue_cause:     %s; a coord device drain also holds AI tasks due with no record (GET /coord/fleet/drain)\n' "$why"
+}
 # report_task <task json>: the --check body for one task.
 report_task() {
     local c="$1" id en prompt cron wd mt ts cp next lhm chm tz
@@ -548,6 +605,7 @@ report_task() {
     else
         lhm="$(local_hhmm "$next")"
         printf '  next_run:          %s%s\n' "$next" "${lhm:+ = $lhm local}"
+        report_liveness "$c" "$en" "$next"
         if [ -z "$chm" ]; then
             tz="not checked -- the cron is not one fixed daily time"
         elif [ -z "$lhm" ]; then
