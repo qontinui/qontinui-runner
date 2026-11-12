@@ -868,12 +868,63 @@ describe("spawn admission", () => {
     status: 500,
     json: { success: false, error: "resource_guard:critical:thread_count: 31950 >= 30000" },
   };
-  test("a resource-guard 500 is the ONE retryable refusal", () => {
+  test("a resource-guard 500 (an older runner build) is retried as admission", () => {
     assert.deepEqual(classifyTerminalSpawn(guard), {
       kind: "admission",
       retry: true,
       detail: "resource_guard:critical:thread_count: 31950 >= 30000",
     });
+  });
+  // The shape a current runner answers: `spawn_refusal_answer` and the
+  // pre-allocation `precheck_spawn` in src-tauri/src/mcp/terminals.rs.
+  const guard503 = {
+    status: 503,
+    json: {
+      success: false,
+      error: "resource_guard:critical:thread_count: 31950 >= 30000",
+      code: "RESOURCE_GUARD_CRITICAL",
+    },
+  };
+  test("a typed 503 RESOURCE_GUARD_CRITICAL is retried as admission", () => {
+    assert.deepEqual(classifyTerminalSpawn(guard503), {
+      kind: "admission",
+      retry: true,
+      detail: "RESOURCE_GUARD_CRITICAL: resource_guard:critical:thread_count: 31950 >= 30000",
+    });
+    // The code alone decides, whatever the message text says.
+    assert.equal(
+      classifyTerminalSpawn({
+        status: 503,
+        json: { error: "spawn refused", code: "RESOURCE_GUARD_CRITICAL" },
+      }).retry,
+      true,
+    );
+    assert.equal(
+      planSpawnRetry({ classification: classifyTerminalSpawn(guard503), attempt: 0, elapsedMs: 0 })
+        .retry,
+      true,
+    );
+  });
+  test("a 503 SPAWN_BLOCKED_DIAL_UNREAD is retried; a 409 SPAWN_BLOCKED is not", () => {
+    const dial = classifyTerminalSpawn({
+      status: 503,
+      json: { error: "trust gate: tenant dial unread", code: "SPAWN_BLOCKED_DIAL_UNREAD" },
+    });
+    assert.equal(dial.kind, "dial-unread");
+    assert.equal(dial.retry, true);
+    const blocked = classifyTerminalSpawn({
+      status: 409,
+      json: { error: "trust gate: workspace not trusted", code: "SPAWN_BLOCKED" },
+    });
+    assert.equal(blocked.kind, "refused");
+    assert.equal(blocked.retry, false);
+    assert.match(blocked.detail, /^SPAWN_BLOCKED: /);
+    // A 503 with any other code, or none, is not an admission refusal.
+    assert.equal(
+      classifyTerminalSpawn({ status: 503, json: { error: "x", code: "SOMETHING_ELSE" } }).retry,
+      false,
+    );
+    assert.equal(classifyTerminalSpawn({ status: 503, json: { error: "x" } }).kind, "error");
   });
   test("roster 400, not-logged-in 409 and any other 500 are not retried", () => {
     assert.equal(
@@ -1142,7 +1193,7 @@ describe("compareBadgeElement", () => {
     assert.equal(statuses(r).acting, "UNKNOWN");
     assert.match(
       r.findings.find((f) => f.check === "acting").detail,
-      /build 1731000000-ce1235d33 predates PR #2510/,
+      /build 1731000000-ce1235d33 predates the badge display attributes \(PR #2787, which carried #2510\)/,
     );
   });
   test("diverged session: the label must start TENANT MISMATCH", () => {

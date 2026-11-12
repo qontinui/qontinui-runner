@@ -1100,12 +1100,21 @@ export const SPAWN_RETRY_CAP_MS = 15_000;
  * Classify a `POST /terminals` answer. Pure.
  *
  * - 2xx → `{kind:"ok"}`;
- * - 500 whose error names `resource_guard:` → `{kind:"admission", retry:true}`:
- *   the runner's spawn admission refused for load (e.g.
- *   `resource_guard:critical:thread_count: …`), which passes;
+ * - the runner's spawn admission refusing for load → `{kind:"admission",
+ *   retry:true}`, which passes. A current runner answers it as
+ *   `503 RESOURCE_GUARD_CRITICAL` (`spawn_refusal_answer`,
+ *   `src-tauri/src/mcp/terminals.rs`, also the pre-allocation
+ *   `precheck_spawn`); an older build answered `500` with a
+ *   `resource_guard:` error (e.g. `resource_guard:critical:thread_count: …`),
+ *   so both are recognised;
+ * - `503 SPAWN_BLOCKED_DIAL_UNREAD` → `{kind:"dial-unread", retry:true}`: the
+ *   trust gate's block rested on a tenant dial coord could not answer, which
+ *   the runner documents as worth retrying;
  * - 400 `not in roster` → `{kind:"roster"}`;
- * - 409 → `{kind:"not-logged-in"}`;
- * - anything else → `{kind:"error"}`. Only `admission` is ever retried.
+ * - a 409 carrying a typed `code` (`SPAWN_BLOCKED`, a device-drain refusal) →
+ *   `{kind:"refused"}`, naming the code; a 409 with none → `{kind:"not-logged-in"}`;
+ * - anything else → `{kind:"error"}`. Only `admission` and `dial-unread` are
+ *   ever retried.
  *
  * @param {{status:number, ok?:boolean, text?:string, json?:any, error?:string|null}} res
  */
@@ -1117,13 +1126,22 @@ export function classifyTerminalSpawn(res) {
       : typeof res?.text === "string"
         ? res.text
         : String(res?.error ?? "");
+  const code = typeof res?.json?.code === "string" ? res.json.code : "";
+  const named = (text) => (code ? `${code}: ${text}` : text);
   if (status >= 200 && status < 300) return { kind: "ok", retry: false, detail: "" };
-  if (status === 500 && /resource_guard:/.test(body)) {
-    return { kind: "admission", retry: true, detail: body.trim() };
+  if (
+    (status === 503 && code === "RESOURCE_GUARD_CRITICAL") ||
+    ((status === 500 || status === 503) && /resource_guard:/.test(body))
+  ) {
+    return { kind: "admission", retry: true, detail: named(body.trim()) };
+  }
+  if (status === 503 && code === "SPAWN_BLOCKED_DIAL_UNREAD") {
+    return { kind: "dial-unread", retry: true, detail: named(body.trim()) };
   }
   if (status === 400 && /not in roster/i.test(body)) {
     return { kind: "roster", retry: false, detail: body.trim() };
   }
+  if (status === 409 && code) return { kind: "refused", retry: false, detail: named(body.trim()) };
   if (status === 409) return { kind: "not-logged-in", retry: false, detail: body.trim() };
   return {
     kind: "error",
@@ -1196,12 +1214,12 @@ export function openResidue(openRows, owned) {
 // ===========================================================================
 
 /**
- * The badge's per-zone UI Bridge id. This is a DEPENDENCY on PR-A of this plan
- * (plan D1): PR-A adds `tenantBadgeElementId` to
- * `src/components/terminal/TenantBadge.tsx`, which is NOT yet on this branch —
- * until PR-A lands the runner still stamps the legacy shared id, and this
- * literal is the shape the oracle expects it to produce. Kept literal because
- * the oracle reads a runner it does not import from; the per-zone family
+ * The badge's per-zone UI Bridge id (plan D1). It mirrors
+ * `tenantBadgeElementId` in `src/components/terminal/TenantBadge.tsx`, which
+ * landed with PR-A (qontinui-runner #2743, `c07f28aaa`); a runner build that
+ * predates it still stamps the legacy shared id, which this shape does not
+ * match. Kept literal because the oracle reads a runner it does not import
+ * from (a build under test may be older than this checkout); the per-zone family
  * (`terminal-zone-header-<n>`, `terminal-session-info-<field>-<n>`) is spelled
  * the same way.
  *
@@ -1324,9 +1342,10 @@ function badgeLabel(element) {
  * - diverged — `data-tenant-diverged` equals `tenancy.diverged`;
  * - acting — `data-tenant-acting` is ABSENT when `display.source` is
  *   `row_stamp` (a record of the spawn's choice, never an observation), else
- *   `display.tenantId` (open PR #2510's `tenantBadgeDisplayAttrs` rule). A
+ *   `display.tenantId` (the rule of `tenantBadgeDisplayAttrs` in `TenantBadge.tsx`,
+ *   which landed with qontinui-runner #2787, `a90c9cc3d`, carrying #2510). A
  *   badge without `data-tenant-display-status` is from a build that predates
- *   #2510: the acting comparison is UNKNOWN naming the build, never PASS.
+ *   it: the acting comparison is UNKNOWN naming the build, never PASS.
  *
  * An `unknown` expectation renders the whole arm UNKNOWN with its reason.
  * Overall: any FAIL → FAIL; else any UNKNOWN → UNKNOWN; else PASS.
@@ -1414,7 +1433,7 @@ export function compareBadgeElement(element, expectation, tenancy, opts = {}) {
     add(
       "acting",
       "UNKNOWN",
-      `${who}: no data-tenant-display-status — runner build ${build} predates PR #2510's display attributes, so data-tenant-acting cannot be compared`,
+      `${who}: no data-tenant-display-status — runner build ${build} predates the badge display attributes (PR #2787, which carried #2510), so data-tenant-acting cannot be compared`,
     );
   } else {
     const actingAttr = readAttr(element, "data-tenant-acting");

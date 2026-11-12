@@ -24,6 +24,13 @@ export const ZONE_BACKSTOP_DEBOUNCE_MS = 300;
  * has read and placed nothing yet: its reconnected tabs still sit in
  * localStorage / auto-fill zones, and the deferred re-run will read the
  * durable record. So a deferred page is NOT complete here.
+ *
+ * A deferral is not always brief. Besides a coord drain, a page is deferred
+ * for as long as the box's dispatch role closes it (`role_closed`, e.g. a
+ * ci_node or bench box; see `RunnerDrainBanner.tsx`), so on such a box the
+ * first-seen zone sync never runs and a session the typed-line sniff recorded
+ * keeps zone 0. That fails safe: no record is overwritten with a guess, and
+ * the HTTP spawns this sync exists for are refused there anyway.
  */
 export function zoneSyncRestoreComplete(
   restoreCompletePages: ReadonlySet<string>,
