@@ -35,7 +35,8 @@
 //!   extracted bundled install plus a cleanly shut-down data directory whose
 //!   `qontinui_template` database holds the transformed schema. The key hashes
 //!   the bundled PostgreSQL release, the `postgresql_embedded` release, the
-//!   rendered schema SQL and [`HARNESS_VERSION`]. Built under an exclusive lock
+//!   rendered schema SQL, the OS and architecture it was built for, and
+//!   [`HARNESS_VERSION`]. Built under an exclusive lock
 //!   on `.lock`, and entered by its builder before that lock is released
 //!   ([`enter_or_build`]); entered by every other process under a shared one,
 //!   which keeps a collection from removing it mid-copy. Every entry marks it
@@ -762,7 +763,11 @@ async fn boot_embedded() -> Result<Server, String> {
 
     let defaults = bundled_defaults();
     let version = defaults.version.to_string();
-    let key = cache_key(&version, &canonical_schema_sql(VectorColumns::Bytea));
+    let key = cache_key(
+        PLATFORM,
+        &version,
+        &canonical_schema_sql(VectorColumns::Bytea),
+    );
     let template_dir = dir.join(format!("{TEMPLATE_PREFIX}{key}"));
     let stats = Arc::new(Stats::new(Some(MAX_CONNECTIONS)));
     let cache_lock = open_lock(&dir)?;
@@ -1559,13 +1564,34 @@ fn is_identifier(name: &str) -> bool {
 // The cache and the per-process root
 // ---------------------------------------------------------------------------
 
+/// The operating system and architecture a template cache is built for.
+#[derive(Clone, Copy, Debug)]
+struct Platform {
+    os: &'static str,
+    arch: &'static str,
+}
+
+/// The platform this test binary was built for, and so runs on.
+const PLATFORM: Platform = Platform {
+    os: std::env::consts::OS,
+    arch: std::env::consts::ARCH,
+};
+
 /// The cache key: every input that shapes a cached template, hashed.
-fn cache_key(pg_version: &str, schema_sql: &str) -> String {
+///
+/// The platform is one. A cache holds that platform's extracted binaries and a
+/// data directory in its layout, and a target directory can be shared across
+/// platforms (a Windows checkout's, read from WSL): without it in the key, a
+/// process on one would enter the other's cache, find no `pg_ctl` it can run
+/// ([`installed_dir`]), and be told to delete a cache the other still uses.
+fn cache_key(platform: Platform, pg_version: &str, schema_sql: &str) -> String {
     let mut hasher = Sha256::new();
     for part in [
         "qontinui-test-pg",
         HARNESS_VERSION,
         POSTGRESQL_EMBEDDED_VERSION,
+        platform.os,
+        platform.arch,
         pg_version,
     ] {
         hasher.update(part.as_bytes());
@@ -1614,7 +1640,8 @@ fn harness_dir() -> Result<PathBuf, String> {
 /// well when it creates it, so the harness lands in
 /// `<target>/<triple>/qontinui-test-pg`. That is intended: the template cache
 /// holds the extracted bundled PostgreSQL, which `postgresql_embedded` bundles
-/// for the target triple, and the cache key does not name the triple. Found
+/// for the target triple, and the cache key names only the triple's OS and
+/// architecture ([`PLATFORM`]), not its environment (`gnu` or `musl`). Found
 /// from the binary rather than `CARGO_TARGET_TMPDIR`, which cargo sets for
 /// integration tests and benches only — this module serves every test binary.
 fn cargo_target_dir_of(exe: &Path) -> Option<PathBuf> {
@@ -2899,11 +2926,26 @@ mod tests {
 
     #[test]
     fn every_cache_key_input_changes_the_key() {
-        let key = cache_key("=18.6.0", "CREATE TABLE t ();");
+        let linux = Platform {
+            os: "linux",
+            arch: "x86_64",
+        };
+        let key = cache_key(linux, "=18.6.0", "CREATE TABLE t ();");
         assert_eq!(key.len(), 16);
-        assert_eq!(key, cache_key("=18.6.0", "CREATE TABLE t ();"));
-        assert_ne!(key, cache_key("=18.6.1", "CREATE TABLE t ();"));
-        assert_ne!(key, cache_key("=18.6.0", "CREATE TABLE u ();"));
+        assert_eq!(key, cache_key(linux, "=18.6.0", "CREATE TABLE t ();"));
+        assert_ne!(key, cache_key(linux, "=18.6.1", "CREATE TABLE t ();"));
+        assert_ne!(key, cache_key(linux, "=18.6.0", "CREATE TABLE u ();"));
+        // One target directory can serve a Windows process and a WSL one.
+        let windows = Platform {
+            os: "windows",
+            ..linux
+        };
+        assert_ne!(key, cache_key(windows, "=18.6.0", "CREATE TABLE t ();"));
+        let arm = Platform {
+            arch: "aarch64",
+            ..linux
+        };
+        assert_ne!(key, cache_key(arm, "=18.6.0", "CREATE TABLE t ();"));
     }
 
     #[test]
