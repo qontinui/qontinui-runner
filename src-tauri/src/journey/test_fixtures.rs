@@ -161,30 +161,42 @@ pub(crate) fn status(v: &Value) -> &str {
     v["status"].as_str().expect("status is always present")
 }
 
-/// What an answer concludes: everything but the size of the counts.
+/// What an answer concludes, as the grouped-read oracle compares it.
 ///
-/// Each conclusion is read by its identity, so two answers that list the same
-/// NUMBER of things but different things never agree:
+/// Each listed thing is read by its identity, so two answers that list the
+/// same NUMBER of things but different things never agree. Exactly these are
+/// compared:
 ///
-/// - a listed node by its key — `nodeKey` on every listing but the graph's own
-///   nodes (`JourneyGraphNode`), which carry it as `key` — and `backOnly`;
-/// - a graph edge by `(fromKey, toKey, trigger, outcome)`, never by how often or
-///   when it was observed;
+/// - the answer's `status`, its `unknown` code, and each unmeasured coverage
+///   dimension with its code;
+/// - a graph node (the graph answer's `nodes`, `JourneyGraphNode`) by its
+///   `key`, its `unconfirmedDestination`, and each open `frontier` entry at it
+///   by `(affordanceFingerprint, affordanceRole, declaredEffect, reason)`;
+/// - a graph edge by `(fromKey, toKey, trigger, outcome)`;
+/// - a dead end by `nodeKey` and `backOnly`;
+/// - an unexplored node by `nodeKey`, `unconfirmedDestination` and
+///   `unsettledByGraph`;
+/// - a prior-knowledge node, settled (`nodes`) or not (`unsettled`), by
+///   `nodeKey`;
 /// - a node `reachable` lists, with its distance;
-/// - the `steps` answer's distance, and its path as `(fromKey, toKey)` steps.
+/// - the `steps` answer's distance, and its path as `(fromKey, toKey)` steps;
+/// - whether any arrival's destination is unknown
+///   (`unknownDestinationArrivals > 0`).
+///
+/// Nothing else is. Not the counts, which a grouped read may change: how
+/// often an edge was observed, `openByReason`, `arrivals`, `arrivalDoubt`, the
+/// departure tallies, the frontier and coverage totals. Not when anything was
+/// seen, nor in which run. Not the representative `node` a graph node or a
+/// frontier entry carries. And not these non-count fields, so a grouped read
+/// that changed one of them would still agree: which reasons `openByReason`
+/// and which triggers `arrivals` name, the graph's `rejected` rows, the
+/// `frontier` block's nodes, `fromObserved` / `toObserved`, and an unsettled
+/// prior-knowledge node's `unconfirmedDestination` and `ledgerNotWriting`.
 pub(crate) fn verdict(v: &Value) -> Value {
     let result = if status(v) == "measured" {
         &v["value"]
     } else {
         &v["provenance"]["source"]["result"]
-    };
-    let node = |n: &Value| {
-        let key = if n["nodeKey"].is_null() {
-            &n["key"]
-        } else {
-            &n["nodeKey"]
-        };
-        json!([key, n["backOnly"]])
     };
     let dimensions: Vec<Value> = v["provenance"]["coverage"]["unmeasured"]
         .as_array()
@@ -192,14 +204,31 @@ pub(crate) fn verdict(v: &Value) -> Value {
         .iter()
         .map(|d| json!([d["dimension"], d["code"]]))
         .collect();
+    let open = |f: &Value| {
+        json!([
+            f["affordanceFingerprint"],
+            f["affordanceRole"],
+            f["declaredEffect"],
+            f["reason"]
+        ])
+    };
     json!({
         "status": v["status"],
         "code": v["unknown"]["code"],
-        "deadEnds": each(result, "deadEnds", node),
-        "unexplored": each(result, "unexplored", node),
-        // The graph answer's nodes; the prior-knowledge answer's settled ones.
-        "nodes": each(result, "nodes", node),
-        "unsettled": each(result, "unsettled", node),
+        "deadEnds": each(result, "deadEnds", |n| json!([n["nodeKey"], n["backOnly"]])),
+        "unexplored": each(result, "unexplored", |n| {
+            json!([n["nodeKey"], n["unconfirmedDestination"], n["unsettledByGraph"]])
+        }),
+        // The graph answer's nodes, which carry their key as `key`; the
+        // prior-knowledge answer's settled ones, which carry it as `nodeKey`.
+        "nodes": each(result, "nodes", |n| {
+            if n["nodeKey"].is_null() {
+                json!([n["key"], n["unconfirmedDestination"], each(n, "frontier", &open)])
+            } else {
+                json!([n["nodeKey"]])
+            }
+        }),
+        "unsettled": each(result, "unsettled", |n| json!([n["nodeKey"]])),
         "edges": each(result, "edges", |e| {
             json!([e["fromKey"], e["toKey"], e["trigger"], e["outcome"]])
         }),
@@ -381,6 +410,118 @@ fn the_verdict_tells_apart_answers_that_list_as_many_different_things() {
             &key("d"),
         ),
     );
+}
+
+/// `answer` with one field of one listed entry set to `to`: the entry of
+/// `listing` whose `id_field` is `id`, the field at `pointer` within it. The
+/// field must already be there, and hold something else: setting an absent one
+/// would prove only that the verdict reads a name no answer carries.
+fn with_field(
+    answer: &Value,
+    listing: &str,
+    id_field: &str,
+    id: &str,
+    pointer: &str,
+    to: Value,
+) -> Value {
+    let mut changed = answer.clone();
+    let result = if status(&changed) == "measured" {
+        &mut changed["value"]
+    } else {
+        &mut changed["provenance"]["source"]["result"]
+    };
+    let entry = result[listing]
+        .as_array_mut()
+        .unwrap_or_else(|| panic!("the answer lists no `{listing}`: {answer:#}"))
+        .iter_mut()
+        .find(|entry| entry[id_field] == id)
+        .unwrap_or_else(|| panic!("`{listing}` has no entry whose {id_field} is {id}: {answer:#}"));
+    let slot = entry
+        .pointer_mut(pointer)
+        .unwrap_or_else(|| panic!("`{listing}` entry {id} has no {pointer}: {answer:#}"));
+    assert_ne!(
+        *slot, to,
+        "`{listing}` entry {id} already has {pointer} = {to}"
+    );
+    *slot = to;
+    changed
+}
+
+/// Each non-count field the verdict reads beside an identity is read: an
+/// answer that differs from another in that one field alone, as a grouped read
+/// that got the field wrong would, never agrees with it.
+#[test]
+fn the_verdict_reads_each_non_count_field_it_names() {
+    let c = answer_ctx();
+    let (rows, open) = (
+        vec![edge(1, "a", Some("x"), "affordance", "changed", "fp")],
+        vec![frontier("x", "fp-x")],
+    );
+    let graph = answer_graph(&c, &graph_of(rows.clone(), open.clone()));
+    // X has no way out and an affordance nobody activated, so it is unexplored.
+    let dead_ends = answer_dead_ends(&c, &graph_of(rows, open));
+    let x = key("x");
+    for (what, answer, listing, id_field, pointer, to) in [
+        (
+            "a graph node's open affordance, by fingerprint",
+            &graph,
+            "nodes",
+            "key",
+            "/frontier/0/affordanceFingerprint",
+            json!("fp-y"),
+        ),
+        (
+            "a graph node's open affordance, by role",
+            &graph,
+            "nodes",
+            "key",
+            "/frontier/0/affordanceRole",
+            json!("button"),
+        ),
+        (
+            "a graph node's open affordance, by declared effect",
+            &graph,
+            "nodes",
+            "key",
+            "/frontier/0/declaredEffect",
+            json!("write"),
+        ),
+        (
+            "a graph node's open affordance, by the reason it is open",
+            &graph,
+            "nodes",
+            "key",
+            "/frontier/0/reason",
+            json!("budget_exhausted"),
+        ),
+        (
+            "a graph node, its destination confirmed or not",
+            &graph,
+            "nodes",
+            "key",
+            "/unconfirmedDestination",
+            json!(true),
+        ),
+        (
+            "an unexplored node, its destination confirmed or not",
+            &dead_ends,
+            "unexplored",
+            "nodeKey",
+            "/unconfirmedDestination",
+            json!(true),
+        ),
+        (
+            "an unexplored node, unsettled by the graph or not",
+            &dead_ends,
+            "unexplored",
+            "nodeKey",
+            "/unsettledByGraph",
+            json!(true),
+        ),
+    ] {
+        let changed = with_field(answer, listing, id_field, &x, pointer, to);
+        differ_only_in(what, &[listing], answer, &changed);
+    }
 }
 
 /// How often, and when, an edge was observed is a count, not a conclusion:
