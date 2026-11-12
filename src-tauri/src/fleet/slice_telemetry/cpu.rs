@@ -12,7 +12,7 @@
 //! delegation is needed. Each sample reads it for:
 //!
 //! * each watched slice ([`WATCHED_SLICES`]), from the directory its memory
-//!   entry was read from ([`read_slices`](super::read_slices)), else from its
+//!   entry was read from ([`read_slice_reads`](super::read_slice_reads)), else from its
 //!   first candidate that is a cgroup;
 //! * the runner's own unit cgroup, from the `0::` line of `/proc/self/cgroup`
 //!   (today `app.slice/qontinui-runner.service` under a user manager);
@@ -79,6 +79,12 @@
 //! not as the dispatch's: under docker's defaults (`system.slice`, or a
 //! `docker` cgroup under the root, by its cgroup driver) it is in the
 //! `system.slice` remainder or in `unattributed_usec`, not in the CI total.
+//! The same holds for anything a step moves out of its dispatch cgroup
+//! itself, `systemd-run --user --scope` the commonest way: such a scope is in
+//! the user manager it was started in, so its time is session work, or in the
+//! `user.slice` remainder, not CI. `cargo-guard`'s builds are the case in
+//! point: they land in `agent-builds.slice`, which is session work, so a CI
+//! step that builds through `cargo-guard` charges that build to sessions.
 //!
 //! A dispatch cgroup this read could not list is withheld like one no read
 //! listed (below). When `QONTINUI_CI_CGROUP_ROOT`, where `ci_node` makes every
@@ -782,7 +788,7 @@ fn find_holders(root: &Path, manager: &str, runner_unit: Option<&str>) -> Option
 }
 
 /// Each watched slice's directory: the one its memory entry was read from
-/// (`memory_dirs`, from [`read_slices`](super::read_slices)), which is not
+/// (`memory_dirs`, from [`read_slice_reads`](super::read_slice_reads)), which is not
 /// looked for again, so its `cpu` object is of the same cgroup; for a slice
 /// with no memory entry, its first candidate under `bases` ([`slice_bases`])
 /// that is a cgroup.
@@ -805,8 +811,18 @@ fn find_watched(
         .collect()
 }
 
-/// `ci.slice`, its named children (name, path) and how many were not named.
-type CiPlacement = (Option<String>, Option<Vec<(String, String)>>, usize);
+/// Where [`find_ci`] found `ci.slice` and its `ci-*.slice` children.
+struct CiPlacement {
+    /// `ci.slice`'s path relative to the root; `None` when it is not here.
+    ci_slice: Option<String>,
+    /// Its named children, (name, path). `None` means `ci.slice` could not be
+    /// listed, so its children are UNKNOWN; `Some` of an empty list means they
+    /// are known to be none, which is also the answer when there is no
+    /// `ci.slice` at all.
+    children: Option<Vec<(String, String)>>,
+    /// How many `ci-*.slice` children were listed but not named.
+    omitted: usize,
+}
 
 /// `ci.slice` under `bases` ([`slice_bases`]), its `ci-*.slice` children by
 /// name, and how many of those were not named: at most [`MAX_CI_CHILDREN`]
@@ -818,11 +834,19 @@ fn find_ci(root: &Path, bases: &[PathBuf]) -> CiPlacement {
         .into_iter()
         .find(|d| is_cgroup(d))
     else {
-        return (None, Some(Vec::new()), 0);
+        return CiPlacement {
+            ci_slice: None,
+            children: Some(Vec::new()),
+            omitted: 0,
+        };
     };
     let ci_slice = rel_of(root, &dir);
     let Some(children) = child_dirs(&dir) else {
-        return (ci_slice, None, 0);
+        return CiPlacement {
+            ci_slice,
+            children: None,
+            omitted: 0,
+        };
     };
     let (mut named, mut omitted) = (Vec::new(), 0);
     for (name, child) in children {
@@ -839,7 +863,11 @@ fn find_ci(root: &Path, bases: &[PathBuf]) -> CiPlacement {
             _ => omitted += 1,
         }
     }
-    (ci_slice, Some(named), omitted)
+    CiPlacement {
+        ci_slice,
+        children: Some(named),
+        omitted,
+    }
 }
 
 /// The root's direct child cgroups; `None` when the root could not be listed.
@@ -894,7 +922,11 @@ impl Placement {
             .iter()
             .map(|dir| rel_of(root, dir).unwrap_or_else(|| "user.slice".to_string()))
             .collect();
-        let (ci_slice, ci_children, ci_children_omitted) = find_ci(root, &bases);
+        let CiPlacement {
+            ci_slice,
+            children: ci_children,
+            omitted: ci_children_omitted,
+        } = find_ci(root, &bases);
         let mut placement = Self {
             runner_unit,
             manager,
@@ -1494,7 +1526,7 @@ fn report(
 /// unit, holder scope or own cgroup, and so publishes no session total, and no
 /// CI total, remainder or `unattributed_usec` unless `ci_cgroup_root` is
 /// followed. `ci_cgroup_root` is `QONTINUI_CI_CGROUP_ROOT`. `memory_dirs` is
-/// the directory [`read_slices`](super::read_slices) read each watched slice's
+/// the directory [`read_slice_reads`](super::read_slice_reads) read each watched slice's
 /// memory from, which is where that slice's CPU is read ([`find_watched`]).
 /// `dispatches` says what `ci_node` has counted; it is called before the
 /// cgroups are listed and again after their counters are read

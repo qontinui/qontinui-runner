@@ -50,7 +50,7 @@ import {
   createDefaultWorkflow,
   isWorkflowEmpty,
 } from "../../types";
-import { registerUserSkills } from "@qontinui/workflow-utils";
+import { registerRunnableUserSkills } from "./runnableUserSkills";
 import {
   DEFAULT_STAGE_FLAGS,
   DEFAULT_WORKFLOW_FLAGS,
@@ -779,7 +779,7 @@ function RunnerWorkflowBuilderInner({
   const refreshSkills = useCallback(async () => {
     try {
       const skills = (await runnerDataAdapter.fetchSkills?.()) ?? [];
-      registerUserSkills(skills);
+      registerRunnableUserSkills(skills);
     } catch {
       // Skills loading is non-critical
     }

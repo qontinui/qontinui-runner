@@ -131,7 +131,11 @@ mod tests {
             // 93a2ca093 pinned 434 against a measured 430.
             // 428 -> 424: the PR-watch chain deleted, which took 2 attributes;
             // the other 2 were slack, 426 measured before the deletion.
-            baseline: 424,
+            // 424 -> 423: the dead playbook loader (`skills/playbook_parser.rs`)
+            // deleted with its 2 attributes; `split_frontmatter`'s moved into
+            // prompt_library.rs (plan
+            // 2026-11-06-what-the-fleet-records-and-advertises-matches-what-actually-ran, 7).
+            baseline: 423,
             gate_wiring: &[
                 ("src-tauri/Cargo.toml", "string_slice = { level = \"deny\""),
                 (

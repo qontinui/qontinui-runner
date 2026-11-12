@@ -272,7 +272,7 @@ $SKIP_ROUTES = @{
 # on its own: only the router fallback's answer for one of these routes is a
 # SKIP carrying its reason, and ANY other answer is a FAIL. The fallback is
 # recognised by its own signature, never by the bare fact of a 404:
-# `not_found_handler` in src-tauri/src/mcp_api.rs answers every unmatched route
+# `not_found_handler` in src-tauri/src/mcp_api/serve.rs answers every unmatched route
 # with a JSON 404 whose error starts with "No route for <METHOD> <path>"
 # (`not_found_message`), so a 404 carrying that error for the request the probe
 # sent is a SKIP. A 404 a landed handler answers itself is a FAIL: the entry is

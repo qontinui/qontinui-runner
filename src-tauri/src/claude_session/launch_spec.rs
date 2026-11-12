@@ -249,24 +249,71 @@ pub struct LaunchSpec {
 /// Maximum length (chars) of a `--name` value.
 pub const MAX_SESSION_NAME_CHARS: usize = 40;
 
+/// Bytes of SHA-256 an over-long name ends in, written as 8 lowercase hex chars.
+const SESSION_NAME_DIGEST_BYTES: usize = 4;
+
+/// Chars an over-long name keeps ahead of its `-<digest>`: 31 at a 40-char cap.
+const SESSION_NAME_HEAD_CHARS: usize = MAX_SESSION_NAME_CHARS - 1 - 2 * SESSION_NAME_DIGEST_BYTES;
+
 /// Make `raw` safe to hand to `claude --name`: control characters and newlines
-/// become spaces, whitespace runs collapse to one space, leading `-` is stripped
-/// (a value starting with `-` could be parsed as a flag), and the result is
-/// capped at [`MAX_SESSION_NAME_CHARS`] chars. `None` when nothing is left.
+/// become spaces, whitespace runs collapse to one space, and leading `-` is
+/// stripped (a value starting with `-` could be parsed as a flag). `None` when
+/// nothing is left.
+///
+/// A cleaned value of at most [`MAX_SESSION_NAME_CHARS`] chars is returned
+/// unchanged, so every name coord authors passes through byte-identical. A
+/// longer one is compacted, never cut silently: it becomes its longest run of
+/// leading whole tokens (split on `-` or ` `) that fits in 31 chars — a first
+/// token that alone overflows is cut by chars to 31 — followed by `-` and the
+/// first 8 lowercase hex of the SHA-256 of the whole cleaned value. The result
+/// fits the cap, stays distinct from a value that differs only past the cut,
+/// and never marks the cut with `…`. It is the session's name on every surface
+/// (`--name`, `~/.qontinui/session-names/<id>`, the tab), and
+/// `continuation-session.py` will not use a name ending in `…`, which reads as
+/// cut from a longer value that no surface holds. It also sanitises to itself,
+/// which `compose_flags` relies on when it re-sanitises a call site's name. Plan
+/// `2026-11-09-gate-continuations-get-a-display-truncated-name-so-the-visible-hand-off-refuses-them`
+/// D5.
 pub fn sanitize_session_name(raw: &str) -> Option<String> {
     let spaced: String = raw
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect();
     let collapsed = spaced.split_whitespace().collect::<Vec<_>>().join(" ");
-    let trimmed = collapsed.trim_start_matches(|c: char| c == '-' || c.is_whitespace());
-    let capped: String = trimmed.chars().take(MAX_SESSION_NAME_CHARS).collect();
-    let capped = capped.trim_end().to_string();
-    if capped.is_empty() {
+    let cleaned = collapsed.trim_start_matches(|c: char| c == '-' || c.is_whitespace());
+    if cleaned.is_empty() {
         None
+    } else if cleaned.chars().count() <= MAX_SESSION_NAME_CHARS {
+        Some(cleaned.to_string())
     } else {
-        Some(capped)
+        Some(compact_session_name(cleaned))
     }
+}
+
+/// [`sanitize_session_name`]'s form for a cleaned value over the cap:
+/// `<whole leading tokens>-<digest>`.
+fn compact_session_name(cleaned: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let is_sep = |c: char| c == '-' || c == ' ';
+    // Counted in chars throughout, never sliced by byte (`clippy::string_slice`).
+    let window: String = cleaned.chars().take(SESSION_NAME_HEAD_CHARS).collect();
+    let window_ends_a_token = cleaned
+        .chars()
+        .nth(SESSION_NAME_HEAD_CHARS)
+        .is_some_and(is_sep);
+    // Whole tokens only: a token the window ends inside is dropped, and so are
+    // the separators ahead of it. `cleaned` never starts with a separator, so a
+    // window holding none is a first token that alone overflows, cut by chars.
+    let head = if window_ends_a_token {
+        window.trim_end_matches(is_sep)
+    } else {
+        window
+            .rsplit_once(is_sep)
+            .map_or(window.as_str(), |(kept, _)| kept.trim_end_matches(is_sep))
+    };
+    let digest = Sha256::digest(cleaned.as_bytes());
+    let digest = hex::encode(&digest[..SESSION_NAME_DIGEST_BYTES]);
+    format!("{head}-{digest}")
 }
 
 /// A parsed template flag and the value tokens that follow it (arity inferred:
@@ -1416,6 +1463,225 @@ mod tests {
             sanitize_session_name(&multi).unwrap().chars().count(),
             MAX_SESSION_NAME_CHARS
         );
+    }
+
+    // Plan `2026-11-09-gate-continuations-get-a-display-truncated-name-so-the-
+    // visible-hand-off-refuses-them`, D5 / Phase 3. Every expected string below
+    // was computed from an independent model of the rule, never from this
+    // function's output.
+
+    /// Every name coord authors fits the cap, so the runner hands it on byte for
+    /// byte: `--name`, the session-names file and the tab carry coord's string.
+    #[test]
+    fn sanitize_session_name_passes_every_coord_spawn_name_through_byte_identical() {
+        for name in [
+            "resume-terminal-titlebar-shows-f5782ab5",
+            "impl-terminal-titlebar-shows-694ae308",
+            "post-merge-a-very-long-8295759e#12345",
+            "fix-an-extraordinarily-ea25dfe5#123456",
+            "shepherd-an-ea25dfe5#123456",
+            "review-an-ea25dfe5#123456",
+            "red-main-an-extraordinarily-ea25dfe5",
+            "respond-red-main-an-ea25dfe5",
+            "respond-stall-an-ea25dfe5",
+            "resume-unit-9e9b1b7b-phase-3-5-c2abbf7c",
+            "resume-finding-b31b377d",
+            "resume-terminal-titlebar-shows-44b98580",
+        ] {
+            assert_eq!(sanitize_session_name(name).as_deref(), Some(name));
+        }
+    }
+
+    /// Enters where every runner spawn does: a `LaunchSpec.name` turned into
+    /// argv by `compose_flags`, the seam `render_argv` and `render_pty_command`
+    /// share. A long runner-own name reaches `--name` compacted; a coord name
+    /// reaches it byte-identical.
+    #[test]
+    fn compose_flags_compacts_an_overlong_session_name() {
+        let mut s = spec();
+        for (name, want) in [
+            (
+                "loop-nightly-merge-train-steward-watch-and-remediate",
+                "loop-nightly-merge-train-2c0ac670",
+            ),
+            (
+                "resume-unit-9e9b1b7b-phase-3-5-c2abbf7c",
+                "resume-unit-9e9b1b7b-phase-3-5-c2abbf7c",
+            ),
+        ] {
+            s.name = Some(name.to_string());
+            let flags = compose_flags(&s, &LaunchConfig::default());
+            assert_eq!(value_after(&flags, "--name"), Some(want), "{flags:?}");
+            assert_eq!(flags.iter().filter(|a| *a == "--name").count(), 1);
+        }
+    }
+
+    #[test]
+    fn sanitize_session_name_compacts_an_overlong_value_with_a_digest() {
+        let cases = [
+            ("x".repeat(100), format!("{}-09ecb6eb", "x".repeat(31))),
+            ("é".repeat(100), format!("{}-f42ec48e", "é".repeat(31))),
+            // `loop-nightly-merge-train-steward` is 32 > 31 chars: `-steward` goes.
+            (
+                "loop-nightly-merge-train-steward-watch-and-remediate".to_string(),
+                "loop-nightly-merge-train-2c0ac670".to_string(),
+            ),
+            // The cap is inclusive: 40 is kept whole, 41 is compacted.
+            ("a".repeat(40), "a".repeat(40)),
+            ("a".repeat(41), format!("{}-c0f8bd4d", "a".repeat(31))),
+            // A first token that alone overflows is cut by chars to 31.
+            (
+                format!("{}-tail-tokens", "x".repeat(35)),
+                format!("{}-15d13ceb", "x".repeat(31)),
+            ),
+            // Separators after the last kept token are dropped, not doubled.
+            (
+                format!("fix this - {}", "y".repeat(40)),
+                "fix this-bd4a7d26".to_string(),
+            ),
+            // A space splits tokens too, and stays verbatim inside the head.
+            (
+                "check-login page renders the dashboard with all widgets".to_string(),
+                "check-login page renders the-d7458ca1".to_string(),
+            ),
+        ];
+        for (raw, want) in cases {
+            assert_eq!(sanitize_session_name(&raw), Some(want), "{raw:?}");
+        }
+    }
+
+    /// The digest covers the CLEANED value: leading dashes, control chars and
+    /// whitespace runs are normalised first, exactly as for a short name.
+    #[test]
+    fn sanitize_session_name_digests_the_cleaned_value() {
+        assert_eq!(
+            sanitize_session_name("  --loop-nightly-merge-train-steward-watch-and-remediate"),
+            Some("loop-nightly-merge-train-2c0ac670".to_string())
+        );
+        assert_eq!(
+            sanitize_session_name("loop-nightly\tmerge   train\u{7}steward watch-and-remediate"),
+            Some("loop-nightly merge train-3a0b0f5d".to_string())
+        );
+    }
+
+    /// The silent cut this replaces gave both of these
+    /// `loop-nightly-merge-train-steward-watch-a`.
+    #[test]
+    fn sanitize_session_name_keeps_names_that_differ_past_the_cut_distinct() {
+        let remediate =
+            sanitize_session_name("loop-nightly-merge-train-steward-watch-and-remediate");
+        let report = sanitize_session_name("loop-nightly-merge-train-steward-watch-and-report");
+        assert_eq!(report.as_deref(), Some("loop-nightly-merge-train-51629b35"));
+        assert_ne!(remediate, report);
+    }
+
+    /// Fixed-seed xorshift64, so a failing sweep input replays exactly.
+    fn xorshift(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    /// The first property the sweep's inputs violate, or `None`. A function of
+    /// the sanitiser so the sweep can be shown to REJECT a `…`-marked cut.
+    fn session_name_sweep_violation(
+        sanitize: fn(&str) -> Option<String>,
+        inputs: &[String],
+    ) -> Option<String> {
+        for raw in inputs {
+            let Some(out) = sanitize(raw) else { continue };
+            if out.contains('\u{2026}') {
+                return Some(format!("{raw:?} -> {out:?} carries U+2026"));
+            }
+            if out.chars().count() > MAX_SESSION_NAME_CHARS {
+                return Some(format!("{raw:?} -> {out:?} exceeds the cap"));
+            }
+            if out.starts_with('-') || out.starts_with(char::is_whitespace) {
+                return Some(format!("{raw:?} -> {out:?} starts with a dash or blank"));
+            }
+            // `compose_flags` sanitises a call site's already-sanitised name
+            // again, so `--name` matches the tab and the file only at a fixed point.
+            if sanitize(&out).as_deref() != Some(out.as_str()) {
+                return Some(format!("{raw:?} -> {out:?} is not a fixed point"));
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn sanitize_session_name_never_emits_an_ellipsis() {
+        // No piece carries `…`, so any in an output was introduced by the
+        // function; the dirty pieces exercise the cleanup ahead of the cap.
+        let long: &str = &"x".repeat(33);
+        let mut pieces: Vec<&str> = "a bb unit 9e9b1b7b é 日本語 🦀 #12345".split(' ').collect();
+        pieces.extend(["-", "--", " ", "   ", "\t", "\r\n", "\u{7}", long]);
+        let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+        let inputs: Vec<String> = (0..500)
+            .map(|_| {
+                let len = 41 + (xorshift(&mut seed) % 160) as usize;
+                let mut raw = String::new();
+                while raw.chars().count() < len {
+                    raw.push_str(pieces[(xorshift(&mut seed) % pieces.len() as u64) as usize]);
+                }
+                raw
+            })
+            .collect();
+        assert_eq!(
+            session_name_sweep_violation(sanitize_session_name, &inputs),
+            None
+        );
+        // Negative control: the sweep catches the `…` cut coord used to author.
+        fn cut_with_ellipsis(raw: &str) -> Option<String> {
+            let kept: String = raw.chars().take(MAX_SESSION_NAME_CHARS - 1).collect();
+            Some(format!("{kept}\u{2026}"))
+        }
+        let caught = session_name_sweep_violation(cut_with_ellipsis, &inputs).unwrap_or_default();
+        assert!(caught.ends_with("carries U+2026"), "{caught:?}");
+    }
+
+    /// Clean long inputs (tokens joined by single `-`/` `), so the cleaned value
+    /// IS the input and the compacted form can be checked exactly.
+    #[test]
+    fn sanitize_session_name_compacts_to_whole_leading_tokens_and_the_digest() {
+        use sha2::{Digest, Sha256};
+        let is_sep = |c: char| c == '-' || c == ' ';
+        let long: &str = &"y".repeat(34);
+        let mut tokens: Vec<&str> = "a bb loop nightly 9e9b1b7b é 日本語 🦀 #12345"
+            .split(' ')
+            .collect();
+        tokens.push(long);
+        let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
+        for _ in 0..500 {
+            let mut raw = String::new();
+            loop {
+                raw.push_str(tokens[(xorshift(&mut seed) % tokens.len() as u64) as usize]);
+                if raw.chars().count() > MAX_SESSION_NAME_CHARS {
+                    break;
+                }
+                raw.push(['-', ' '][(xorshift(&mut seed) % 2) as usize]);
+            }
+            let out = sanitize_session_name(&raw).unwrap();
+            let (head, digest) = out.rsplit_once('-').unwrap();
+            let want_digest = hex::encode(&Sha256::digest(raw.as_bytes())[..4]);
+            assert_eq!(digest, want_digest, "{raw:?} -> {out:?}");
+            let Some(rest) = raw.strip_prefix(head) else {
+                panic!("{raw:?} -> {out:?}: the head is not a prefix of the input");
+            };
+            let kept = head.chars().count();
+            if rest.starts_with(is_sep) {
+                // Whole tokens up to a token end; the next whole token does not fit.
+                let seps = rest.chars().take_while(|&c| is_sep(c)).count();
+                let next = rest.chars().skip(seps).take_while(|&c| !is_sep(c)).count();
+                assert!(
+                    !head.ends_with(is_sep) && kept <= 31 && kept + seps + next > 31,
+                    "{raw:?} -> {out:?}"
+                );
+            } else {
+                // The first token alone overflows: cut by chars to 31.
+                assert!(!head.contains(is_sep) && kept == 31, "{raw:?} -> {out:?}");
+            }
+        }
     }
 
     #[test]

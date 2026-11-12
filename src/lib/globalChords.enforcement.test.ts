@@ -510,6 +510,7 @@ const KEY_FIELD_ROSTER: readonly string[] = [
   "components/workflow-builder/StageSelector.tsx",
   "components/workflow-builder/StepItem.tsx",
   "components/workflow-builder/WorkflowBuilderTab.tsx",
+  "components/workflow-builder/skillTransferNotice.ts",
   "components/workflow-builder/step-config/CommandConfig.tsx",
   "components/workflow-builder/step-config/DataFlowSection.tsx",
   "components/workflow-versions/WorkflowVersionLineage.tsx",

@@ -10864,13 +10864,17 @@ fn provision_agent_definitions_retiring(
     // (a different commit) over it, which left every such worktree dirty and fed
     // the wip-custody snapshots a stream of junk refs. Same guard, same probe, as
     // `fleet_commands` and `fleet_skills`.
-    let tracked = crate::provision_guard::TrackedPaths::probe(&dst_dir);
-    let mut candidates = crate::fleet_agents::embedded_agent_names();
-    // Retired names are candidates too, so a retired copy the repository tracks
-    // is kept by the retirement pass below exactly as the layers keep theirs.
-    candidates.extend(crate::fleet_agents::retired_agent_names(retired));
+    //
+    // The directory is created BEFORE the probe (the floor below creates it
+    // anyway): a probe of a missing directory answers "nothing tracked", so a
+    // checkout that versions `.claude/agents` but had the whole directory
+    // deleted would otherwise read as unversioned — the same order
+    // `fleet_commands` and `fleet_skills` use. Fail-soft: an error here leaves
+    // the probe's own fail-soft answer.
+    let _ = std::fs::create_dir_all(&dst_dir);
+    let mut written_names = crate::fleet_agents::embedded_agent_names();
     if let Ok(entries) = std::fs::read_dir(&src_dir) {
-        candidates.extend(
+        written_names.extend(
             entries
                 .filter_map(Result::ok)
                 .map(|e| e.path())
@@ -10878,6 +10882,37 @@ fn provision_agent_definitions_retiring(
                 .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())),
         );
     }
+    // Versioned iff the repo tracks a definition a layer would WRITE (an
+    // embedded or overlay name), never merely "anything under .claude/agents":
+    // qontinui-forge and its siblings track a repo-local clone-implementer.md
+    // and must still receive code-reviewer and the rest (provision_guard).
+    // The roster is what a commit of the repo can add: the embedded names, and
+    // the overlay names the overlay's SOURCE checkout tracks. An untracked
+    // local `.md` in that checkout is a path no commit will deliver, so it is
+    // outside the roster and is written even in a versioned checkout. When the
+    // source probe cannot answer inside a repository, every overlay name stays
+    // in the roster: withholding is the safe side, since writing an
+    // upstream-added one is exactly the fast-forward wedge. The cost, stated:
+    // that wider roster also decides versioning, so a checkout tracking only a
+    // repo-local agent whose name collides with an untracked overlay file reads
+    // as versioned while the source probe is UNKNOWN, and withholds its absent
+    // embedded agents for that pass.
+    let overlay_tracked = crate::provision_guard::TrackedPaths::probe(&src_dir);
+    let embedded_names = crate::fleet_agents::embedded_agent_names();
+    let tracked = crate::provision_guard::TrackedPaths::probe(&dst_dir).versioning(
+        written_names
+            .iter()
+            .filter(|n| {
+                embedded_names.contains(n)
+                    || overlay_tracked.is_unknown_in_repo()
+                    || overlay_tracked.contains(Path::new(n.as_str()))
+            })
+            .map(PathBuf::from),
+    );
+    let mut candidates = written_names;
+    // Retired names are candidates too, so a retired copy the repository tracks
+    // is kept by the retirement pass below exactly as the layers keep theirs.
+    candidates.extend(crate::fleet_agents::retired_agent_names(retired));
     let keep = crate::provision_guard::KeepDecisions::decide(
         &tracked,
         &dst_dir,
@@ -15615,6 +15650,152 @@ mod tests {
             "the overlay reports exactly the tracked definition it kept"
         );
         assert_eq!(report.written, 1, "only loose.md is overlaid");
+    }
+
+    /// Plan `2026-11-09-a-provisioned-copy-of-an-upstream-added-file-wedges-the-served-checkout-fast-forward`
+    /// Phase 2, both agent layers: a checkout that tracks a BUNDLED definition
+    /// versions `.claude/agents`, so neither the embedded floor nor the checkout
+    /// overlay CREATES an absent definition there (an untracked copy at a path
+    /// upstream adds wedges that checkout's fast-forward), while a tracked
+    /// definition the user deleted is still written.
+    #[test]
+    fn provision_agent_defs_create_nothing_new_in_a_root_versioned_checkout() {
+        use crate::provision_guard::test_support::{git_add, git_init};
+
+        let root = tempfile::tempdir().unwrap();
+        let src = root
+            .path()
+            .join("qontinui-claude-config")
+            .join(".claude")
+            .join("agents");
+        std::fs::create_dir_all(&src).unwrap();
+        // The primary checkout TRACKS overlay-only.md (it reached it upstream),
+        // so the worktree's own history can add it: it is in the roster. It
+        // holds local-only.md untracked, which no commit will ever deliver.
+        let primary = root.path().join("qontinui-claude-config");
+        git_init(&primary);
+        std::fs::write(src.join("overlay-only.md"), "# PRIMARY overlay-only").unwrap();
+        git_add(&primary, &src.join("overlay-only.md"));
+        std::fs::write(src.join("local-only.md"), "# PRIMARY untracked").unwrap();
+
+        let embedded = crate::fleet_agents::embedded_agent_names();
+        assert!(
+            embedded.len() >= 2,
+            "fixture needs two embedded definitions"
+        );
+        let deleted = embedded[0].clone();
+        let upstream_added = embedded[1].clone();
+
+        let wt = tempfile::tempdir().unwrap();
+        git_init(wt.path());
+        let dst = wt.path().join(".claude").join("agents");
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::write(dst.join(&deleted), "# WORKTREE's own").unwrap();
+        git_add(wt.path(), &dst.join(&deleted));
+        std::fs::remove_file(dst.join(&deleted)).unwrap();
+
+        let wt_cwd = wt.path().to_string_lossy().into_owned();
+        let report = provision_agent_definitions_from_root(root.path(), &wt_cwd);
+
+        assert!(
+            !dst.join(&upstream_added).exists(),
+            "the floor must not create an untracked {upstream_added} in a checkout that versions the tree"
+        );
+        assert!(
+            !dst.join("overlay-only.md").exists(),
+            "the overlay must not create one either"
+        );
+        assert!(
+            dst.join("local-only.md").exists(),
+            "an overlay file its source does not track is outside the roster, so it is written"
+        );
+        assert!(
+            dst.join(&deleted).exists(),
+            "a tracked-but-deleted definition is still written"
+        );
+        assert!(
+            report
+                .skipped
+                .iter()
+                .any(|s| s.unit == "overlay-only.md" && s.reason.wire() == "root_versioned"),
+            "the overlay records the skip as root_versioned, got {:?}",
+            report.skipped
+        );
+    }
+
+    /// When the probe of the overlay's SOURCE checkout cannot answer inside a
+    /// repository, every overlay name stays in the roster: in a versioned
+    /// checkout an overlay file is then withheld rather than written, since
+    /// writing an upstream-added one is the fast-forward wedge itself.
+    #[test]
+    fn provision_agent_defs_withhold_overlay_when_the_source_probe_is_unknown() {
+        use crate::provision_guard::test_support::{git_add, git_init};
+
+        let root = tempfile::tempdir().unwrap();
+        let primary = root.path().join("qontinui-claude-config");
+        let src = primary.join(".claude").join("agents");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            primary.join(".git"),
+            b"gitdir: /nonexistent/qontinui-agent-overlay-unknown-probe-test\n",
+        )
+        .unwrap();
+        std::fs::write(src.join("overlay-unknown.md"), "# PRIMARY overlay").unwrap();
+
+        let embedded = crate::fleet_agents::embedded_agent_names();
+        let wt = tempfile::tempdir().unwrap();
+        git_init(wt.path());
+        let dst = wt.path().join(".claude").join("agents");
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::write(dst.join(&embedded[0]), "# WORKTREE's own").unwrap();
+        git_add(wt.path(), &dst.join(&embedded[0]));
+
+        let wt_cwd = wt.path().to_string_lossy().into_owned();
+        let report = provision_agent_definitions_from_root(root.path(), &wt_cwd);
+
+        assert!(
+            !dst.join("overlay-unknown.md").exists(),
+            "an UNKNOWN source probe must not let the overlay create an untracked file"
+        );
+        assert!(
+            report
+                .skipped
+                .iter()
+                .any(|s| s.unit == "overlay-unknown.md" && s.reason.wire() == "root_versioned"),
+            "got {:?}",
+            report.skipped
+        );
+    }
+
+    /// A repository that tracks only a definition of its OWN (qontinui-forge,
+    /// qontinui-cloud and qontinui-clone-factory each track a repo-local
+    /// `clone-implementer.md`) does not version the bundle, so it still receives
+    /// every embedded definition — `code-reviewer.md` above all.
+    #[test]
+    fn provision_agent_defs_still_floor_a_repo_tracking_only_its_own_agent() {
+        use crate::provision_guard::test_support::{git_add, git_init};
+
+        let root = tempfile::tempdir().unwrap();
+        let wt = tempfile::tempdir().unwrap();
+        git_init(wt.path());
+        let dst = wt.path().join(".claude").join("agents");
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::write(dst.join("clone-implementer.md"), "# repo-local").unwrap();
+        git_add(wt.path(), &dst.join("clone-implementer.md"));
+
+        let wt_cwd = wt.path().to_string_lossy().into_owned();
+        let _ = provision_agent_definitions_from_root(root.path(), &wt_cwd);
+
+        for name in crate::fleet_agents::embedded_agent_names() {
+            assert!(
+                dst.join(&name).exists(),
+                "{name} must still be provisioned into a repo tracking only its own agent"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(dst.join("clone-implementer.md")).unwrap(),
+            "# repo-local"
+        );
     }
 
     /// The probe-UNKNOWN arm inside a repository: existing definitions are

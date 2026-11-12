@@ -1,6 +1,7 @@
 import { useState, useCallback, useEffect, useMemo, useRef } from "react";
+import { skillExportNotice, skillImportNotice } from "./skillTransferNotice";
 import type { UnifiedWorkflow, WorkflowExport } from "../../types";
-import { registerUserSkills } from "@qontinui/workflow-utils";
+import { registerRunnableUserSkills } from "./runnableUserSkills";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
 import { instanceStorage } from "@/lib/instance-storage";
 import { createLogger } from "@/lib/logger";
@@ -26,6 +27,9 @@ export function useWorkflowLibrary(
 
   const [isExportingWorkflow, setIsExportingWorkflow] = useState(false);
   const [workflowImportError, setWorkflowImportError] = useState<string | null>(null);
+  // Outside the library panel's state: a skill import or export is started
+  // from the toolbar, so its notice must show whether or not the panel is open.
+  const [skillTransferNotice, setSkillTransferNotice] = useState<string | null>(null);
 
   const [isExportingSkills, setIsExportingSkills] = useState(false);
   const [isImportingSkills, setIsImportingSkills] = useState(false);
@@ -292,6 +296,7 @@ export function useWorkflowLibrary(
       const data = await response.json();
       if (data.success && data.data) {
         const exportData = data.data;
+        setSkillTransferNotice(skillExportNotice(exportData.withheld));
         const blob = new Blob([JSON.stringify(exportData, null, 2)], {
           type: "application/json",
         });
@@ -304,6 +309,7 @@ export function useWorkflowLibrary(
         URL.revokeObjectURL(url);
       } else {
         console.error("Failed to export skills:", data.error);
+        setSkillTransferNotice(`Skill export failed: ${data.error ?? "unknown error"}`);
       }
     } catch (error) {
       console.error("Failed to export skills:", error);
@@ -355,6 +361,7 @@ export function useWorkflowLibrary(
       const result = await response.json();
       if (result.success && result.data) {
         const { imported, skipped, overwritten, errors } = result.data;
+        setSkillTransferNotice(skillImportNotice(result.data));
         log.debug(
           `Skills imported: ${imported}, skipped: ${skipped}, overwritten: ${overwritten}`,
           errors.length > 0 ? `Errors: ${errors.join(", ")}` : "",
@@ -366,13 +373,14 @@ export function useWorkflowLibrary(
             const skillsData = await skillsRes.json();
             const allSkills = skillsData.data ?? skillsData ?? [];
             const nonBuiltin = allSkills.filter((s: { source: string }) => s.source !== "builtin");
-            registerUserSkills(nonBuiltin);
+            registerRunnableUserSkills(nonBuiltin);
           } catch {
             // Skill refresh is non-critical
           }
         }
       } else {
         console.error("Failed to import skills:", result.error);
+        setSkillTransferNotice(`Skill import failed: ${result.error ?? "unknown error"}`);
       }
     } catch (error) {
       console.error("Failed to import skills:", error);
@@ -419,6 +427,8 @@ export function useWorkflowLibrary(
     isExportingWorkflow,
     workflowImportError,
     setWorkflowImportError,
+    skillTransferNotice,
+    setSkillTransferNotice,
     isExportingSkills,
     isImportingSkills,
     skillFileInputRef,

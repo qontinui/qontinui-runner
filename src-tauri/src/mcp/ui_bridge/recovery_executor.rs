@@ -879,6 +879,7 @@ mod tests {
             "blur",
             "scrollIntoView",
             "hover",
+            "unhover",
             "discover",
         ] {
             assert!(

@@ -3,8 +3,8 @@
 //! Tests for [`super`], the `cpu.stat` attribution, over fixture cgroup trees
 //! in temporary directories. The three named fixture tests of the plan's
 //! Phase 2 gate are marked GATE. The gate's fixture process table belongs to
-//! the Windows arm, which waits on runner#2468; until it lands the gate is met
-//! for Linux only.
+//! the Windows arm, which waits on runner#2468; until it lands only the Linux
+//! half of the gate can be met.
 
 use std::time::{Duration, Instant};
 
@@ -114,10 +114,10 @@ impl Machine {
         )
     }
 
-    /// Where `read_slices` reads each watched slice's memory from, which
+    /// Where `read_slice_reads` reads each watched slice's memory from, which
     /// `collect_from` hands to [`attach`].
     fn memory_dirs(&self) -> Vec<(&'static str, PathBuf)> {
-        super::super::read_slices(&self.root).dirs
+        super::super::read_slice_reads(&self.root).dirs
     }
 
     /// Two reads 30 s apart, with `first` and then `second` written before each.
@@ -991,6 +991,47 @@ fn a_runner_inside_a_holder_scope_is_counted_once() {
         r.attribution["pty_holder_scopes_seen"],
         json!(1),
         "the runner's own scope is its unit, not a pane"
+    );
+}
+
+/// Every counter reset between two reads: nothing has a delta, so nothing was
+/// measured. The counts and names a read notes beside its times (the runner's
+/// unit, the holder scopes seen) are not published on their own, since an
+/// object of counts with no time in it would read as a measured read.
+#[test]
+fn an_attribution_holding_only_counts_and_names_is_not_published() {
+    let (u, h) = (unit(), holder("p1"));
+    let m = Machine::new(Some(&u));
+    let t0 = Instant::now();
+    let all = |k: u64| {
+        [
+            ("", 1_000_000_000 * k),
+            ("user.slice", 500_000_000 * k),
+            (u.as_str(), 300_000_000 * k),
+            (h.as_str(), 100_000_000 * k),
+            ("ci.slice", 50_000_000 * k),
+        ]
+    };
+    m.usages(&all(2));
+    let (s, _) = m.read(None, t0);
+    // The placement the read notes is all there.
+    let p = m.placement();
+    assert!(p.runner_unit.is_some() && p.holders.is_some(), "{p:?}");
+    m.usages(&all(1));
+    let r = m
+        .read(Some(&s), t0 + Duration::from_secs(30))
+        .1
+        .expect("a second read reports");
+    assert!(
+        r.attribution.is_empty(),
+        "no time was measured, so nothing is published: {:?}",
+        r.attribution
+    );
+    let mut slices = Map::new();
+    apply(&r, &mut slices);
+    assert!(
+        !slices.contains_key(ATTRIBUTION_KEY),
+        "and no cpu_attribution key: {slices:?}"
     );
 }
 
@@ -2655,7 +2696,7 @@ fn the_published_map_stays_inside_coords_caps_on_a_crowded_machine() {
         |k: u64| -> Vec<(&str, u64)> { cgroups.iter().map(|(c, v)| (c.as_str(), v * k)).collect() };
     let r = m.two_reads(&at(1), &at(2));
 
-    let mut slices = super::super::read_slices(&m.root).memory;
+    let mut slices = super::super::read_slice_reads(&m.root).memory;
     apply(&r, &mut slices);
     let doc = Value::Object(slices);
     let bytes = serde_json::to_vec(&doc).unwrap();
@@ -2727,4 +2768,24 @@ fn every_withheld_reason_is_listed_once_in_the_order_it_is_published() {
     );
     let keys: BTreeSet<&str> = Why::ALL.iter().map(|w| w.key()).collect();
     assert_eq!(keys.len(), Why::ALL.len(), "{keys:?}");
+    // `Why::ALL` is kept by hand. This match has no wildcard arm, so a variant
+    // added to `Why` stops this test compiling until it is given a position
+    // here, which puts this list in front of whoever adds it. It does not
+    // prove the new variant was added to `ALL` too: the loop visits only what
+    // `ALL` holds. A reason sits in `ALL` at its declaration position, since
+    // `withheld` is published in `Why`'s `Ord` order, so a variant declared
+    // mid-enum shifts the arms after it. The assertion below checks every
+    // listed reason sits where its arm says.
+    for why in Why::ALL {
+        let at = match why {
+            Why::CgroupGone => 0,
+            Why::UserSliceUnlisted => 1,
+            Why::DispatchStarted => 2,
+            Why::DispatchUncontained => 3,
+            Why::DispatchDirUnlisted => 4,
+            Why::CiCgroupRootNotFollowed => 5,
+            Why::OwnCgroupUnknown => 6,
+        };
+        assert_eq!(Why::ALL[at], why, "{why:?} is listed at {at}");
+    }
 }
