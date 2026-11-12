@@ -121,10 +121,11 @@ repos:
       # here is the fast copy: it runs before the commit exists, instead of
       # after the PR does. A red from that job on a commit where this hook did
       # not fail means one of three things. The hook was not armed. Or its
-      # narrower `files:` filter did not fire: the workflow's `paths:` also
-      # covers `src-tauri/src/**`, `crates/**`, `vendor/**` and every
-      # `Cargo.toml`. Or the suite depends on something that differs between
-      # your box and ubuntu-latest.
+      # narrower `files:` filter did not fire: the workflow's `paths:` is much
+      # wider, because the suites also read the real Rust tree. The list is
+      # kept only in that workflow's `on:` block, and its header says why it is
+      # that wide. Or the suite depends on something that differs between your
+      # box and ubuntu-latest.
       #
       # Triggered ONLY by edits to the decision, its test, the drift hook
       # (whose MINE message the test now pins through the library's renderer),
@@ -329,6 +330,9 @@ repos:
       # `npm install` in qontinui-schemas as an explicit step, so the only lane
       # that ever runs this codegen against a bare sibling is the local pre-push
       # hook — and nothing runs that in CI. This test is the whole gate on it.
+      # CI cannot run the codegen against a bare sibling, but it can run this
+      # test: `.github/workflows/pre-commit-hook-tests.yml` does, so the gate
+      # holds for an author whose local hooks are not armed.
       #
       # Toolchain-free: throwaway trees under $TMPDIR with FAKE npm packages.
       # No Rust, no schemas checkout, no network — the one rung that needs a
