@@ -66,7 +66,7 @@ pub(crate) const ACTION_VERB_SYNONYMS: &[(&str, &[&str])] = &[
     ("contextmenu", &["rightClick"]),
     ("middleclick", &["middleClick"]),
     ("dblclick", &["doubleClick"]),
-    // Built-in aliases (`SUPPORTED_ACTION_NAMES`) the SDK does not infer into an
+    // Built-in aliases (`SUPPORTED_ACTION_ALIASES`) the SDK does not infer into an
     // element's list. They pass the unknown-verb gate and stop at
     // `ACTION_NOT_SUPPORTED`, so without these the 400 for `double` would name no
     // suggestion.
