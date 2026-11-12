@@ -23,6 +23,13 @@
 //! - (f) every graph answer over the since read reaches the verdict it
 //!   reaches over every row, and the three corrected row totals are equal;
 //! - (g) Postgres accepts every edge-case bind [`since_bind`] makes.
+//!
+//! Each assertion the plan names a mutation for was seen to fail against it,
+//! with its own message: (b) when `<` became `<=` in `OLDER_EDGE_GROUPS_SQL`'s
+//! partition, (c) when `e.app_id = $1` became `$1::text IS NOT NULL` in the
+//! three since queries, and (e) when `(e.invalidated_at IS NOT NULL)` left that
+//! query's `GROUP BY`. (a), (f) and (g) went red under all three; (d), which
+//! asserts only stability and order, under none.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
