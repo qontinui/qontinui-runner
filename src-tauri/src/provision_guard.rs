@@ -733,7 +733,7 @@ pub(crate) mod test_support {
     //! `git add`.
 
     use std::path::{Path, PathBuf};
-    use std::process::Stdio;
+    use std::process::{Command, Stdio};
 
     /// Initialise a real repo in `dir` (quiet, no global config dependence).
     ///

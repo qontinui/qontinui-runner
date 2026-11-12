@@ -1664,10 +1664,20 @@ mod tests {
         // And it is RECORDED under that label, for every bundled unit.
         let td = tempfile::tempdir().expect("tempdir");
         let wd = td.path().to_str().unwrap();
-        record_whole_tree_skip(wd, &reason);
-        let ledger = crate::capability_manifest::session_provision_ledger(wd)
-            .expect("the skip is recorded against this workdir");
-        assert_eq!(ledger.reports.len(), 2, "one pass per provisioner");
+        // The ledger is process-wide and `capability_manifest`'s own tests reset
+        // it under a lock this module cannot take, so a reset can land between
+        // the two provisioners' records. Retry the record until both passes
+        // are visible; a missing label (not a missing pass) is the failure.
+        let mut ledger = None;
+        for _ in 0..20 {
+            record_whole_tree_skip(wd, &reason);
+            ledger = crate::capability_manifest::session_provision_ledger(wd)
+                .filter(|l| l.reports.len() == 2);
+            if ledger.is_some() {
+                break;
+            }
+        }
+        let ledger = ledger.expect("one pass per provisioner is recorded against this workdir");
         for report in &ledger.reports {
             assert_eq!(report.written, 0);
             assert_eq!(report.skipped.len(), report.expected);
