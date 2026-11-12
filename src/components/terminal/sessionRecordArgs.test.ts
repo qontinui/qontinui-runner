@@ -16,6 +16,7 @@ import {
   buildSessionCloseArgs,
   buildSessionOpenArgs,
   describeRecordOpenOutcome,
+  LIST_OPEN_PURPOSE,
   noteRecordedZone,
   planZoneReemits,
   readRecordOpenReport,
@@ -28,7 +29,11 @@ import {
   type SessionOpenArgs,
   type SessionOrigin,
 } from "./sessionRecordArgs";
-import { buildSessionCloseRecord, type TerminalTab } from "./useTerminalManager";
+import {
+  buildSessionCloseRecord,
+  readRecordsForWorkerAdoption,
+  type TerminalTab,
+} from "./useTerminalManager";
 
 const mockInvoke = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({
@@ -520,5 +525,40 @@ describe("describeRecordOpenOutcome (written vs bound)", () => {
       expect(line).not.toContain("PROVISIONAL");
       expect(line).not.toContain("BOUND");
     }
+  });
+});
+
+// Plan 2026-11-11-since-restart-roster-counts-closed-sessions-as-missing,
+// Phase 7: every reader of `terminal_session_list_open` names itself, and only
+// the boot restore's own read is `restore` — the one read the backend lets move
+// its boot-restore latch, and the one deferral it logs at WARN.
+describe("terminal_session_list_open readers name themselves", () => {
+  it("spells each reader's purpose as the backend logs it", () => {
+    expect(LIST_OPEN_PURPOSE).toEqual({
+      restore: "restore",
+      pageOccupancy: "page-occupancy",
+      workerAdoption: "worker-adoption",
+      treeResetReport: "tree-reset-report",
+    });
+    const names = Object.values(LIST_OPEN_PURPOSE);
+    expect(new Set(names).size).toBe(names.length);
+  });
+
+  it("the worker-adoption probe reads as `worker-adoption`, never as the boot restore", async () => {
+    mockInvoke.mockReset();
+    mockInvoke.mockResolvedValue({ success: true, data: { sessions: [] } });
+    expect(await readRecordsForWorkerAdoption()).toEqual([]);
+    expect(mockInvoke).toHaveBeenCalledTimes(1);
+    expect(mockInvoke).toHaveBeenCalledWith("terminal_session_list_open", {
+      purpose: "worker-adoption",
+    });
+  });
+
+  it("the worker-adoption read answers undefined for a payload with no sessions, and rethrows a failed invoke", async () => {
+    mockInvoke.mockReset();
+    mockInvoke.mockResolvedValue({ success: true, data: {} });
+    expect(await readRecordsForWorkerAdoption()).toBeUndefined();
+    mockInvoke.mockRejectedValue(new Error("ipc down"));
+    await expect(readRecordsForWorkerAdoption()).rejects.toThrow("ipc down");
   });
 });

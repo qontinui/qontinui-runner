@@ -6,6 +6,7 @@ import { instanceStorage } from "@/lib/instance-storage";
 import { getPageBindings, subscribePageBindings } from "@/lib/pageBindings";
 import { getPerfCaps, getPerfCapsLoadState, loadPerfCaps } from "@/lib/perfCaps";
 import { DEFAULT_PAGE_NAME, nextAutoPageName, renameRefusal, uniquePageName } from "./pageNaming";
+import { LIST_OPEN_PURPOSE } from "./sessionRecordArgs";
 import { MAIN_WINDOW_LABEL, readWindowLabel } from "@/lib/windowLabel";
 import {
   PAGES_VERSION,
@@ -513,7 +514,7 @@ export async function readOccupiedPageIds(): Promise<OccupancyRead> {
   try {
     const resp = await invoke<{
       data?: { sessions?: Array<{ pageId?: string }>; deferredByDrain?: unknown };
-    }>("terminal_session_list_open");
+    }>("terminal_session_list_open", { purpose: LIST_OPEN_PURPOSE.pageOccupancy });
     const sessions = resp?.data?.sessions;
     if (Array.isArray(sessions)) {
       for (const id of pageIdsFromSessions(sessions)) ids.add(id);
