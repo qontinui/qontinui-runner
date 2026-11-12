@@ -748,6 +748,7 @@ fn a_restore_stamp_from_this_boot_is_came_back_by_stamp_and_an_earlier_boots_is_
     let a = open_at(dir.path(), BOOT, &roster(&["restored", "old-stamp"]));
     let stamped = |id: &str, at: i64| TerminalSessionRecord {
         restored_from_boot_at: Some(at),
+        restore_tier: Some(RESTORE_TIER_RESUMED.to_string()),
         ..row(id)
     };
 
@@ -766,6 +767,64 @@ fn a_restore_stamp_from_this_boot_is_came_back_by_stamp_and_an_earlier_boots_is_
         rec.sessions["old-stamp"].came_back_at, None,
         "a stamp from an earlier boot says nothing about this one"
     );
+}
+
+/// A boot restore that was only ATTEMPTED is not a return. The store's own
+/// writers stamp the rows: `mark_restore_pending(boot = true)` (attempt
+/// recorded, landing unproven), then either `clear_restore_pending` (the
+/// verified handshake: lands) or a close (`reap_restore_marker_on_close`
+/// demotes the unconfirmed tier). Only the landed one is recorded back, and the
+/// died one stays unobserved after its row is pruned.
+///
+/// Mutation: `restore_landed` returns `true` (any stamp from this boot latches
+/// `came_back_by: stamp`, the pre-review behaviour).
+#[test]
+fn an_attempted_boot_restore_is_not_came_back_until_it_lands() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = open_at(dir.path(), BOOT, &roster(&["landed", "attempted", "died"]));
+    let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
+    for id in ["landed", "attempted", "died"] {
+        store.record_open(row(id));
+        store.mark_restore_pending(id, true);
+    }
+    let stamped: Vec<TerminalSessionRecord> = store.all_records();
+    a.observe_registry(&stamped);
+    let rec = this_boot(&a);
+    for id in ["landed", "attempted", "died"] {
+        assert_eq!(
+            rec.sessions.get(id).and_then(|s| s.came_back_at),
+            None,
+            "{id}: a stamp written when the resume was attempted is not a return"
+        );
+    }
+
+    store.clear_restore_pending("landed");
+    store.record_close("died", crate::session::close_reason::CloseReason::PtyExit);
+    a.observe_registry(&store.all_records());
+
+    let rec = this_boot(&a);
+    assert_eq!(
+        rec.sessions["landed"].came_back_by,
+        Some(CameBackBy::Stamp),
+        "the verified handshake promoted the restore to `resumed`"
+    );
+    assert!(rec.sessions["landed"].came_back_at.is_some());
+    assert_eq!(
+        rec.sessions.get("attempted").and_then(|s| s.came_back_at),
+        None
+    );
+    assert_eq!(
+        rec.sessions["died"].came_back_at, None,
+        "a resume that died and closed never came back"
+    );
+    assert_eq!(
+        rec.sessions["died"].close_reason.as_deref(),
+        Some("pty-exit")
+    );
+
+    // The row is pruned: the record still says it never came back.
+    a.observe_registry(&[]);
+    assert_eq!(this_boot(&a).sessions["died"].came_back_at, None);
 }
 
 /// The file's wire shape, pinned (the record is read back by later boots, and
