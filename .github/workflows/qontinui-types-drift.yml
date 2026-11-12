@@ -166,6 +166,48 @@ permissions:
   contents: read
   pull-requests: read
 
+# Only a FIRST-ATTEMPT `pull_request` run ever cancels, and it cancels only the
+# run already in its per-PR group. A `synchronize` cancels the older head's run;
+# a `reopened` cancels the same-head run it re-does, if that run is still in
+# flight. This is ci.yml's block verbatim, and ci.yml's comment carries the
+# general reasoning and its residuals (two runs created out of order; a re-run
+# of a superseded head running to completion). Without it, a push made while an
+# earlier head's run is still going leaves that run to finish a full
+# `export_schemas` build and regenerate-and-check for a head nobody will land.
+# Plan: 2026-10-03-ccfg-pr-ci-never-cancels-superseded-heads-and-saturates-the-org-runner-pool
+# (Phase 3).
+#
+# Why this is safe for THIS workflow's consumers specifically:
+#
+# - `push` and `workflow_dispatch` are never grouped. Each keys on its own
+#   `run_id` + `run_attempt`, so it is the only member of its group, and
+#   `cancel-in-progress` is false for it anyway. This matters more here than
+#   anywhere else. coord's main baseline is set by `push` runs alone (see the
+#   trigger comment above), and qontinui-types-drift-wait-audit.yml reads
+#   `event=push&branch=main` runs and reds on one whose drift check failed
+#   and that ended before the decide step reached a verdict. So a cancelled
+#   push run would be a lost verdict, not lost waste.
+# - Re-runs (`run_attempt > 1`) are never grouped either. There is no `labeled`
+#   trigger, and ci-rerun-on-declaration.yml re-runs only ci.yml, so a
+#   declaration label added after a PR run started is read here only by a new
+#   push, a close+reopen, or a re-run of this workflow. A re-run can neither
+#   cancel the current head's first-attempt run nor be cancelled by it.
+#   coord's bot re-runs of a red push run are covered by the same rule.
+# - coord reads `check-drift` rows per head sha, so a `cancelled` row on a
+#   superseded head never reaches the current head's verdict. A `reopened` (a
+#   hand close+reopen, as coord's `ci-abandoned` block advises, or coord's App
+#   refresh in pr_refresh.rs) does leave a `cancelled` row on the LIVE sha.
+#   That is safe because coord.pr_check_runs_latest ranks a `cancelled`/`stale`
+#   attempt after every other attempt of the same check on that sha, an
+#   in-progress one included. So once the reopened run's row is ingested, it
+#   is the one read.
+# - No `workflow_run` workflow listens to this one (measured on main fa7b0b33,
+#   2026-11-12). A future listener must tolerate `cancelled` on a superseded
+#   head, or it will need its own exemption here.
+concurrency:
+  group: ${{ (github.event_name == 'pull_request' && github.run_attempt == 1) && format('{0}-pr-{1}', github.workflow, github.event.pull_request.number) || format('{0}-run-{1}-{2}', github.workflow, github.run_id, github.run_attempt) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && github.run_attempt == 1 }}
+
 env:
   # generate_types.sh runs `cargo build --bin export_schemas`, which compiles
   # the `postgresql_embedded` (bundled) build script → a compile-time GitHub API
