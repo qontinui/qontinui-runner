@@ -28,11 +28,12 @@
 //!     match records nothing: it "does not make it the row's terminal", and a
 //!     sticky record would make that misattribution permanent;
 //!   - `stamp`: this boot's restore stamp (`restored_from_boot_at`), once the
-//!     restore LANDED — its pending marker cleared and its tier promoted to
-//!     `resumed`. `mark_restore_pending` writes the stamp the moment a resume is
-//!     ATTEMPTED (tier `failed`, marker set), and a close demotes an unconfirmed
-//!     `failed` to `terminal-only`, so a bare stamp is an attempt, not a return;
-//!     latching it would record a restore that died as back for good;
+//!     restore LANDED (tier `resumed`,
+//!     [`session_lifecycle_store::boot_restore_landed`]). `mark_restore_pending`
+//!     writes the stamp the moment a resume is ATTEMPTED (tier `failed`), and a
+//!     close demotes an unconfirmed `failed` to `terminal-only`, so a bare stamp
+//!     is an attempt, not a return; latching it would record a restore that
+//!     died as back for good;
 //!   - `process`: a live `claude` holds the session id in Claude Code's own
 //!     `<config_dir>/sessions/<pid>.json` — the registry read the poll's
 //!     `live_identity` already makes ([`read_live_claude_sessions`]). That
@@ -88,9 +89,7 @@ use crate::session::claude_session_registry::{
     live_pids_from_snapshot, may_host_claude, read_live_sessions, LiveSessions,
 };
 use crate::session::session_ledger::{self, SessionLedger, LEDGER_GENERATIONS_KEPT};
-use crate::session::session_lifecycle_store::{
-    PollTerminalMatch, TerminalSessionRecord, RESTORE_TIER_RESUMED,
-};
+use crate::session::session_lifecycle_store::{self, PollTerminalMatch, TerminalSessionRecord};
 
 /// Bumped only on a shape change a reader must branch on. A record of another
 /// version is never half-parsed: it is not read, and it is pruned.
@@ -144,7 +143,7 @@ pub enum CameBackBy {
     /// The poll `KeepAlive`d its row on the row's own terminal.
     Bound,
     /// This boot's restore stamped it (`restored_from_boot_at`) and the
-    /// restore landed ([`restore_landed`]).
+    /// restore landed ([`session_lifecycle_store::boot_restore_landed`]).
     Stamp,
     /// A live `claude` held its id in Claude Code's own session registry.
     Process,
@@ -433,21 +432,9 @@ struct RowNow {
     close: Option<Close>,
     finished_at: Option<i64>,
     /// The earliest restore stamp from this boot on a row whose restore
-    /// landed ([`restore_landed`]).
+    /// landed ([`session_lifecycle_store::boot_restore_landed`]). The record
+    /// outlives the row, so an attempt latched here would read back for good.
     stamped_at: Option<i64>,
-}
-
-/// Did this row's boot restore LAND? Only then is its `restored_from_boot_at`
-/// evidence that the session came back. `mark_restore_pending(boot = true)`
-/// stamps `restored_from_boot_at` together with `restore_pending_at` and tier
-/// `failed` BEFORE the resume is typed; only the verified handshake or the
-/// poll's `KeepAlive` self-heal (`clear_restore_pending`) clears the marker and
-/// promotes `failed` to `resumed`, and a close demotes an unconfirmed `failed`
-/// to `terminal-only` (`reap_restore_marker_on_close`). So a stamp with the
-/// marker still set, or with any tier but `resumed`, records an attempt, and
-/// the record — which outlives the row — must not make it a return.
-fn restore_landed(r: &TerminalSessionRecord) -> bool {
-    r.restore_pending_at.is_none() && r.restore_tier.as_deref() == Some(RESTORE_TIER_RESUMED)
 }
 
 impl LedgerAftermath {
@@ -521,7 +508,7 @@ impl LedgerAftermath {
             row.finished_at = row.finished_at.max(r.finished_at);
             if let Some(at) = r
                 .restored_from_boot_at
-                .filter(|at| *at >= self.boot_ms && restore_landed(r))
+                .filter(|at| *at >= self.boot_ms && session_lifecycle_store::boot_restore_landed(r))
             {
                 row.stamped_at = Some(row.stamped_at.map_or(at, |cur| cur.min(at)));
             }

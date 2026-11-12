@@ -374,6 +374,31 @@ pub fn describe_restore_status(
     }
 }
 
+/// Did this row's BOOT restore land? Only then is its `restored_from_boot_at`
+/// evidence that the session came back after the restart.
+///
+/// [`SessionLifecycleStore::mark_restore_pending`]`(boot = true)` stamps
+/// `restored_from_boot_at` together with `restore_pending_at` and tier
+/// [`RESTORE_TIER_FAILED`] BEFORE the resume is typed, so a bare stamp records
+/// an ATTEMPT. [`SessionLifecycleStore::clear_restore_pending`] promotes a
+/// stamped `failed` to [`RESTORE_TIER_RESUMED`]; a close demotes an unconfirmed
+/// `failed` to [`RESTORE_TIER_TERMINAL_ONLY`] (`reap_restore_marker_on_close`),
+/// and a `resumed` survives the close. So the tier alone answers: `resumed` is
+/// a landed resume, every other tier is not one. A fresh boot restore resets
+/// the tier to `failed`, so a `resumed` left by an earlier boot cannot pass for
+/// this one's (callers still compare the stamp against the boot instant).
+///
+/// The promotion has three callers, so `resumed` is as good as they are: the
+/// webview's verified resume handshake, the liveness poll's `KeepAlive`
+/// self-heal (a live `claude` observed in the pane), and the drain-skip arm
+/// (`applyDrainSkip` in `useTerminalInitialization.ts`), which clears the
+/// marker for a skip-alive / skip-unknown row whose resume was never typed —
+/// after its rebind, which fails soft. A rebind failure there therefore
+/// promotes a restore that typed nothing; the webview documents that ordering.
+pub fn boot_restore_landed(rec: &TerminalSessionRecord) -> bool {
+    rec.restore_tier.as_deref() == Some(RESTORE_TIER_RESUMED)
+}
+
 /// Reap the restore-pending marker on a record that is about to become
 /// `closed`, demoting a still-pessimistic `failed` tier to
 /// [`RESTORE_TIER_TERMINAL_ONLY`].

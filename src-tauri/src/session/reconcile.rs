@@ -364,8 +364,8 @@ pub fn is_phantom_record(
 /// corrected the record, saw no further change against its own ledger, and
 /// never re-emitted — so `placement.zoneIndex` read `-1` for every session in
 /// the store and the session-info dropdown could not report where a session
-/// lives. The caller passes the zone the terminal's existing open record
-/// carries, else the session's own zone when its row is on the pane's page (see
+/// lives. The caller passes the session's own zone when its row is on the
+/// pane's page, else the one the terminal's existing open record carries (see
 /// [`run_reconcile`]), so an unknown never overwrites a known value.
 fn bind_record(
     pty: &LivePty,
@@ -535,31 +535,28 @@ pub fn run_reconcile<I: TranscriptIndex>(
                 origin,
                 confirmed,
             } => {
-                // Where the pane sits, as best known. The pane's own open row
-                // first: it was written for THIS pane (a provisional seam row,
-                // the frontend's record), so its zone is where the PTY sits, and
-                // it survives a bind superseding that differently-keyed row.
-                // The pane a session moves to often has no row of its own yet,
-                // and a zone read off the terminal alone then found nothing and
-                // wrote the sentinel over the session's real zone (coord finding
-                // f0a0c310). So the session's own zone is the fallback — but
-                // only while its row sits on the pane's page: a respawn
-                // (account migration, restore, holder adoption) reopens "on the
-                // same grid page/zone" (`account_migration.rs`), while a hand
-                // resume into a pane on another page would otherwise record the
-                // old page's zone against the new one (`bind_record` takes the
-                // page from the pane). Neither known ⇒ the sentinel, which is
-                // honest rather than lossy.
-                let zone_index = existing
-                    .as_ref()
+                // The session's own zone first, while its row is on the pane's
+                // page. A respawn (account migration, restore, holder adoption)
+                // reopens "on the same grid page/zone" (`account_migration.rs`),
+                // while the pane a session moves to usually carries only the
+                // identity seam's spawn row, whose zone is a literal 0 nothing
+                // revises for an id no tab carries (`terminal/session.rs`, the
+                // `record_pinned_session_open` call) — so a zone read off the
+                // pane alone wrote 0, or the sentinel, over the session's real
+                // zone (coord finding f0a0c310). Only on the pane's page: the
+                // bind takes the page from the pane (`bind_record`), so a hand
+                // resume into a pane on another page must not carry the old
+                // page's zone onto it. The pane's own open row is the fallback:
+                // a session with no known zone on that page takes whatever the
+                // pane's row records (for a seam row, that placeholder 0 — a
+                // known gap in the seam, not in this pass). Neither ⇒ the
+                // sentinel, which is honest rather than lossy.
+                let zone_index = store
+                    .get(&session_id)
+                    .filter(|r| r.page_id == pty.page_id)
                     .map(|r| r.zone_index)
                     .filter(|z| *z != UNZONED_ZONE_INDEX)
-                    .or_else(|| {
-                        store
-                            .get(&session_id)
-                            .filter(|r| r.page_id == pty.page_id)
-                            .map(|r| r.zone_index)
-                    })
+                    .or_else(|| existing.as_ref().map(|r| r.zone_index))
                     .unwrap_or(UNZONED_ZONE_INDEX);
                 // A confirmed bind is written CONFIRMED (see `bind_record`) so
                 // `record_open`'s supersede retires the identity seam's
@@ -2704,8 +2701,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
 
-        // The seam's spawn-time row, already resolved into a real zone by the
-        // frontend backstop.
+        // A seam-keyed row on the pane that records a real zone (the seam's own
+        // spawn write records 0; this pins the carry-forward, whatever wrote
+        // the zone).
         store.record_open(TerminalSessionRecord {
             claude_session_id: "seam-pin".to_string(),
             config_dir: None,

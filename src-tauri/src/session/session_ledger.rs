@@ -1901,8 +1901,12 @@ pub fn capture_now(store: &SessionLifecycleStore, reason: &str) -> LedgerCapture
 /// previous process `open`, so "open" counted the whole cohort back and hid
 /// exactly the rows the boot restore did NOT bring back — a `needs-account`
 /// row waiting for its account, a skipped one, one on a page not opened yet.
-/// Only a live terminal binding (`live_terminal_ids`) or this boot's restore
-/// stamp is evidence that it returned.
+/// Only a live terminal binding (`live_terminal_ids`) or this boot's LANDED
+/// restore stamp is evidence that it returned. The stamp alone is written when
+/// the resume is ATTEMPTED, so it counts only once the restore landed
+/// ([`crate::session::session_lifecycle_store::boot_restore_landed`]) — the
+/// same rule the aftermath record latches by, so the two arms the
+/// classification unions never disagree about one session.
 pub fn observed_back(
     store: &SessionLifecycleStore,
     boot_at_ms: Option<i64>,
@@ -1920,8 +1924,9 @@ pub fn observed_back(
         .filter(|r| {
             let live_bound = r.state == "open"
                 && live_terminal_ids.is_some_and(|live| live.contains(&r.terminal_id));
-            let restored_this_boot =
-                boot_at_ms.is_some_and(|boot| r.restored_from_boot_at.is_some_and(|at| at >= boot));
+            let restored_this_boot = boot_at_ms
+                .is_some_and(|boot| r.restored_from_boot_at.is_some_and(|at| at >= boot))
+                && crate::session::session_lifecycle_store::boot_restore_landed(r);
             live_bound || restored_this_boot
         })
         .map(|r| r.claude_session_id)
@@ -3127,6 +3132,35 @@ mod tests {
         assert_eq!(
             observed_back(&store, Some(boot), None),
             vec!["restored".to_string()]
+        );
+    }
+
+    /// A boot restore that was only ATTEMPTED is not back. The store's own
+    /// writers stamp the rows: `mark_restore_pending(boot = true)` stamps
+    /// `restored_from_boot_at` with tier `failed` before the resume is typed;
+    /// `clear_restore_pending` (the verified handshake) promotes it to
+    /// `resumed`; a close demotes an unconfirmed `failed`. Only the landed one
+    /// reads back — the same rule the aftermath record latches by, so the two
+    /// arms `classify` unions agree before and after the row is pruned.
+    ///
+    /// Mutation: `boot_restore_landed` dropped from the stamp arm (any stamp
+    /// from this boot reads back, the pre-review behaviour).
+    #[test]
+    fn a_boot_restore_stamp_reads_back_only_once_the_restore_landed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
+        let boot = chrono::Utc::now().timestamp_millis() - 60_000;
+        for id in ["landed", "in-flight", "died"] {
+            store.record_open(store_rec(id));
+            store.mark_restore_pending(id, true);
+        }
+        store.clear_restore_pending("landed");
+        store.record_close("died", crate::session::close_reason::CloseReason::PtyExit);
+
+        // No live view, so only the stamp arm can call a row back.
+        assert_eq!(
+            observed_back(&store, Some(boot), None),
+            vec!["landed".to_string()]
         );
     }
 

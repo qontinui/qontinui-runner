@@ -1,8 +1,7 @@
 //! Plan `2026-11-11-since-restart-roster-counts-closed-sessions-as-missing`,
 //! Phase 1: every bind [`run_reconcile`] makes goes through the store's
 //! write-time liveness guard ([`SessionLifecycleStore::bind_inferred`]), and a
-//! bind keeps the zone the pane sits in: the pane's own row's, else the
-//! session's while its row is on the pane's page.
+//! bind keeps the session's own zone while its row is on the pane's page.
 //!
 //! The shape these pin was measured on 2026-11-11 (coord finding `f0a0c310`):
 //! the boot pass read the live panes and the source panes' `claude --resume
@@ -225,7 +224,7 @@ fn a_reconcile_bind_keeps_the_sessions_zone() {
     assert_eq!(rec.zone_index, 4, "the bind keeps the session's zone");
 }
 
-/// The pane's own row first: a session whose own zone is unknown takes the
+/// The precedence's other half: a session whose own zone is unknown takes the
 /// zone the pane's own row knows (here the identity seam's provisional row,
 /// which the bind then supersedes), rather than keeping the sentinel.
 #[test]
@@ -249,17 +248,17 @@ fn a_session_with_no_known_zone_takes_the_panes_known_zone() {
     assert_eq!(store.get("seam-pin").unwrap().state, "closed");
 }
 
-/// A pane on the same page whose own row knows its zone keeps that zone, even
-/// when the session's row names another: the pane's row was written for where
-/// THIS pane sits (pre-review, the session's zone won and moved the session to
-/// a zone it is not in).
+/// The pane's own row as production writes it: the identity seam's spawn row
+/// (`record_pinned_session_open` with a literal zone 0, unconfirmed), which
+/// nothing revises for an id no tab carries. Its placeholder never overwrites
+/// the session's known zone on the same page.
 ///
-/// Mutation: the session's zone looked up before the pane's own row.
+/// Mutation: the pane's own row looked up before the session's zone.
 #[test]
-fn a_panes_known_zone_wins_over_the_sessions_older_zone() {
+fn a_seam_spawn_rows_placeholder_zone_never_overwrites_the_sessions_same_page_zone() {
     let (_dir, store) = store();
-    store.record_open(row(SESSION, "gone-pane", 1, true));
-    store.record_open(row("seam-pin", "new-pane", 3, false));
+    store.record_open(row(SESSION, "gone-pane", 4, true));
+    seam_spawn_row(&store, "new-pane", "default");
 
     run_reconcile(
         &store,
@@ -272,15 +271,17 @@ fn a_panes_known_zone_wins_over_the_sessions_older_zone() {
 
     let rec = store.get(SESSION).unwrap();
     assert_eq!(rec.terminal_id, "new-pane");
-    assert_eq!(rec.zone_index, 3, "the zone the pane sits in");
+    assert_eq!(rec.zone_index, 4, "the session's zone, not the seam's 0");
 }
 
-/// A session resumed by hand into a pane on ANOTHER page, with no row of its
-/// own, does not carry its old page's zone onto the new page: the bind takes the
-/// page from the pane, so the old zone would place it in a zone of a page it was
-/// never in. The sentinel is honest.
+/// A session resumed by hand into a pane on ANOTHER page does not carry its old
+/// page's zone onto the new page: the bind takes the page from the pane, so the
+/// old zone would place it in a zone of a page it was never in. The pane's own
+/// row (the seam's spawn row, as production writes it) is the fallback; its
+/// zone is the seam's placeholder 0, a known gap in the seam rather than in
+/// this pass.
 ///
-/// Mutation: the session-zone fallback's same-page filter removed.
+/// Mutation: the session-zone lookup's same-page filter removed.
 #[test]
 fn a_session_resumed_onto_another_page_does_not_carry_its_old_pages_zone() {
     let (_dir, store) = store();
@@ -288,6 +289,7 @@ fn a_session_resumed_onto_another_page_does_not_carry_its_old_pages_zone() {
         page_id: "page-1".to_string(),
         ..row(SESSION, "gone-pane", 1, true)
     });
+    seam_spawn_row(&store, "new-pane", "page-2");
     let other_page = LivePty {
         page_id: "page-2".to_string(),
         ..pane("new-pane", 901)
@@ -305,5 +307,26 @@ fn a_session_resumed_onto_another_page_does_not_carry_its_old_pages_zone() {
     let rec = store.get(SESSION).unwrap();
     assert_eq!(rec.terminal_id, "new-pane");
     assert_eq!(rec.page_id, "page-2");
-    assert_eq!(rec.zone_index, UNZONED_ZONE_INDEX);
+    assert_ne!(
+        rec.zone_index, 1,
+        "the old page's zone never lands on page-2"
+    );
+    assert_eq!(rec.zone_index, 0, "the pane's own row's zone");
+}
+
+/// The identity seam's spawn write for a pane (`terminal/session.rs`): an
+/// unconfirmed, seam-keyed row with the literal zone 0.
+fn seam_spawn_row(store: &SessionLifecycleStore, terminal_id: &str, page_id: &str) {
+    crate::commands::terminal::record_pinned_session_open(
+        store,
+        format!("seam-{terminal_id}"),
+        terminal_id.to_string(),
+        None,
+        "C:/repo".to_string(),
+        "claude".to_string(),
+        page_id.to_string(),
+        0,
+        DEFAULT_PROVIDER.to_string(),
+        None,
+    );
 }
