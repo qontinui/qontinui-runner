@@ -243,6 +243,117 @@ pub(crate) fn sdk_fallback_payload(element_id: &str, body: &Value) -> Result<Val
     element_action_payload(element_id, body.clone())
 }
 
+/// Every field of the SDK's `ControlActionRequest`, mirrored from ui-bridge's
+/// `CONTROL_ACTION_REQUEST_FIELDS` (`packages/ui-bridge/src/control/request-fields.ts`).
+///
+/// The control element route ([`control_element_action`]) hoists each of these
+/// keys onto the action envelope when a caller sends it at the body's top
+/// level, and folds every OTHER flat key into `params`. The mirror is pinned
+/// key-for-key against the SDK's own list by
+/// `sdk_contract_pins::control_action_request_fields_match_the_sdk`, so a field
+/// the SDK adds turns that test red instead of being misrouted into `params`.
+pub(crate) const CONTROL_ACTION_REQUEST_FIELDS: [&str; 13] = [
+    "action",
+    "params",
+    "waitOptions",
+    "windowLabel",
+    "requestId",
+    "captureAfter",
+    "retryOptions",
+    "waitAfter",
+    "waitAfterTimeout",
+    "waitAfterMinStable",
+    "verifyEffect",
+    "fromSnapshotId",
+    "includeResolutionAlternates",
+];
+
+/// What `POST /ui-bridge/control/element/{id}/action` dispatches, split out of
+/// its body by [`control_element_action`].
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ControlElementAction {
+    /// `params` with the body's UNLISTED flat keys folded in (explicit
+    /// `params` keys win). This is what the route's pre-checks read.
+    pub(crate) params: Option<Value>,
+    /// The `ControlActionRequest` envelope to hand to
+    /// [`element_action_payload`]: `action`, the merged `params`,
+    /// `waitOptions`, every listed request field the body carried at its top
+    /// level, and `windowLabel` when the route resolved one.
+    pub(crate) envelope: Value,
+}
+
+/// Remove a body-level `windowLabel` from the route's undeclared keys and
+/// return it. The route resolves its target window as the `?windowLabel=`
+/// query first, then this; [`control_element_action`] puts the resolved label
+/// back on the envelope, where [`element_action_payload`] routes it.
+pub(crate) fn take_body_window_label(extra: &mut Map<String, Value>) -> Option<String> {
+    extra
+        .remove(TARGET_WINDOW_FIELD)
+        .and_then(|v| v.as_str().map(String::from))
+}
+
+/// Split the control element route's body into its action envelope and the
+/// merged params its pre-checks read.
+///
+/// `action`, `params` and `waitOptions` are the route's typed fields; `extra`
+/// is every other top-level key (the request's `#[serde(flatten)]` map), minus
+/// the `windowLabel` [`take_body_window_label`] already took. Each key of
+/// [`CONTROL_ACTION_REQUEST_FIELDS`] found in `extra` is HOISTED onto the
+/// envelope. Every unlisted key is folded into `params`, which keeps the
+/// documented flat-param format (`{"action":"drag","targetPosition":{...}}`,
+/// a flat `text` on `type`); an explicit `params` key wins a collision.
+///
+/// The route used to fold EVERY undeclared key into `params`, so the SDK's
+/// `verifyEffect`, `captureAfter`, `retryOptions`, `requestId`, `waitAfter*`,
+/// `fromSnapshotId` and `includeResolutionAlternates` reached the SDK as
+/// params, where nothing reads them.
+pub(crate) fn control_element_action(
+    action: &str,
+    params: Option<Value>,
+    wait_options: Option<Value>,
+    window_label: Option<&str>,
+    extra: Map<String, Value>,
+) -> ControlElementAction {
+    let (listed, flat): (Vec<(String, Value)>, Vec<(String, Value)>) = extra
+        .into_iter()
+        .partition(|(key, _)| CONTROL_ACTION_REQUEST_FIELDS.contains(&key.as_str()));
+
+    let params = if flat.is_empty() {
+        params
+    } else {
+        let mut base = match params {
+            Some(Value::Object(m)) => m,
+            _ => Map::new(),
+        };
+        for (key, value) in flat {
+            base.entry(key).or_insert(value);
+        }
+        Some(Value::Object(base))
+    };
+
+    let mut envelope = Map::new();
+    envelope.insert("action".to_string(), Value::String(action.to_string()));
+    envelope.insert("params".to_string(), params.clone().unwrap_or(Value::Null));
+    envelope.insert(
+        "waitOptions".to_string(),
+        wait_options.unwrap_or(Value::Null),
+    );
+    for (key, value) in listed {
+        envelope.entry(key).or_insert(value);
+    }
+    if let Some(label) = window_label.filter(|s| !s.is_empty()) {
+        envelope.insert(
+            TARGET_WINDOW_FIELD.to_string(),
+            Value::String(label.to_string()),
+        );
+    }
+
+    ControlElementAction {
+        params,
+        envelope: Value::Object(envelope),
+    }
+}
+
 /// The IPC payload for `POST /ui-bridge/control/navigate-and-wait`.
 ///
 /// The route's own keys (`elementId`, `waitForStableMs`, `timeoutMs`) are typed
@@ -1066,5 +1177,204 @@ mod action_missing_message_window_and_step_request_tests {
             })
         );
         assert!(!url.contains("/elements/"));
+    }
+}
+
+/// `POST /ui-bridge/control/element/{id}/action`: the route's body split
+/// (`control_element_action`) — plan
+/// `2026-11-11-ui-bridge-request-path-loses-fields-successor-runner-twins-and-non-recurrence`
+/// Phase 5. Every expected key is a LITERAL, never read from
+/// `CONTROL_ACTION_REQUEST_FIELDS`, so a key dropped from the mirror reds here.
+#[cfg(test)]
+mod control_element_route_tests {
+    use super::test_support::{
+        assert_reached_ipc_payload, one_test_per_control_field, sample_value,
+    };
+    use super::*;
+    use crate::mcp::ui_bridge::types::UIBridgeActionRequest;
+    use serde_json::json;
+
+    /// Run `body` through the route's split in the handler's order: parse,
+    /// take the body `windowLabel` (the query wins), split, build the payload.
+    /// Returns the merged params the pre-checks read and the IPC payload.
+    fn post(body: Value, query_window: Option<&str>) -> (Option<Value>, Value) {
+        let mut request: UIBridgeActionRequest =
+            serde_json::from_value(body).expect("body parses as the route's request");
+        let body_window = take_body_window_label(&mut request.extra);
+        let window_label = query_window.map(String::from).or(body_window);
+        let window_label = window_label.as_deref().filter(|s| !s.is_empty());
+        let split = control_element_action(
+            &request.action,
+            request.params,
+            request.wait_options,
+            window_label,
+            request.extra,
+        );
+        let payload = element_action_payload("e1", split.envelope).expect("names an action");
+        (split.params, payload)
+    }
+
+    /// One field posted at the body's TOP LEVEL. A listed SDK field must land
+    /// on the envelope and not in `params`; an unlisted one (the macro's
+    /// `unknownFutureOptIn`) must land in `params` — the flat-param contract.
+    fn top_level_field_check(key: &str) {
+        let mut body = serde_json::Map::new();
+        body.insert("action".into(), json!("type"));
+        body.insert(key.into(), sample_value(key));
+        let (params, payload) = post(Value::Object(body), None);
+        if key == "unknownFutureOptIn" {
+            assert_eq!(
+                payload.pointer("/action/params/unknownFutureOptIn"),
+                Some(&sample_value(key)),
+                "an unlisted flat key must be folded into params: {payload}"
+            );
+            assert!(
+                payload.pointer("/action/unknownFutureOptIn").is_none(),
+                "an unlisted flat key must not be hoisted: {payload}"
+            );
+            assert_eq!(
+                params.as_ref().and_then(|p| p.get("unknownFutureOptIn")),
+                Some(&sample_value(key)),
+                "the pre-checks read the merged params"
+            );
+            return;
+        }
+        assert_reached_ipc_payload("control element route", key, &payload);
+        assert!(
+            payload.pointer(&format!("/action/params/{key}")).is_none(),
+            "`{key}` was folded into params, where the SDK never reads it: {payload}"
+        );
+        assert!(
+            params.as_ref().and_then(|p| p.get(key)).is_none(),
+            "`{key}` leaked into the merged params the pre-checks read: {params:?}"
+        );
+    }
+    mod top_level_field {
+        use super::*;
+        one_test_per_control_field!(top_level_field_check);
+    }
+
+    #[test]
+    fn a_flat_target_position_is_folded_into_params() {
+        let (params, payload) = post(
+            json!({"action": "drag", "targetPosition": {"x": 10, "y": 20}}),
+            None,
+        );
+        assert_eq!(
+            payload.pointer("/action/params/targetPosition"),
+            Some(&json!({"x": 10, "y": 20})),
+            "{payload}"
+        );
+        assert!(
+            payload.pointer("/action/targetPosition").is_none(),
+            "{payload}"
+        );
+        assert_eq!(params, Some(json!({"targetPosition": {"x": 10, "y": 20}})));
+    }
+
+    #[test]
+    fn a_flat_text_is_folded_into_params_beside_the_explicit_ones() {
+        let (params, payload) = post(
+            json!({"action": "type", "params": {"clear": true}, "text": "hi"}),
+            None,
+        );
+        assert_eq!(
+            payload.pointer("/action/params"),
+            Some(&json!({"clear": true, "text": "hi"})),
+            "{payload}"
+        );
+        assert_eq!(params, Some(json!({"clear": true, "text": "hi"})));
+    }
+
+    #[test]
+    fn an_explicit_params_key_wins_over_a_flat_one() {
+        let (_, payload) = post(
+            json!({
+                "action": "drag",
+                "params": {"targetPosition": {"x": 1, "y": 1}},
+                "targetPosition": {"x": 9, "y": 9}
+            }),
+            None,
+        );
+        assert_eq!(
+            payload.pointer("/action/params/targetPosition"),
+            Some(&json!({"x": 1, "y": 1})),
+            "{payload}"
+        );
+    }
+
+    #[test]
+    fn a_body_with_no_flat_keys_keeps_its_params_as_sent() {
+        let (params, payload) = post(json!({"action": "click"}), None);
+        assert_eq!(params, None);
+        assert_eq!(
+            payload,
+            json!({
+                "elementId": "e1",
+                "action": {"action": "click", "params": null, "waitOptions": null}
+            })
+        );
+    }
+
+    #[test]
+    fn the_query_window_wins_and_the_body_label_never_reaches_params() {
+        let (params, payload) = post(
+            json!({"action": "click", "windowLabel": "term-2", "text": "x"}),
+            Some("term-1"),
+        );
+        assert_eq!(
+            payload.get("windowLabel"),
+            Some(&json!("term-1")),
+            "{payload}"
+        );
+        assert!(
+            payload.pointer("/action/windowLabel").is_none(),
+            "{payload}"
+        );
+        assert!(
+            params.as_ref().and_then(|p| p.get("windowLabel")).is_none(),
+            "{params:?}"
+        );
+    }
+
+    #[test]
+    fn a_main_window_label_leaves_the_payload_unrouted() {
+        let (_, payload) = post(json!({"action": "click", "windowLabel": "main"}), None);
+        assert!(payload.get("windowLabel").is_none(), "{payload}");
+        assert!(
+            payload.pointer("/action/windowLabel").is_none(),
+            "{payload}"
+        );
+    }
+
+    #[test]
+    fn a_nameless_action_is_refused_not_dispatched() {
+        let split = control_element_action("", None, None, None, Map::new());
+        assert!(element_action_payload("e1", split.envelope).is_err());
+    }
+
+    /// The handler needs an `ApiState` with a Tauri app handle, so this guards
+    /// its source: it must dispatch the split through `element_action_payload`
+    /// and never fold the whole flatten map into params again.
+    #[test]
+    fn the_route_dispatches_the_split_through_the_action_wire_payload() {
+        const SRC: &str = include_str!("elements.rs");
+        let start = SRC
+            .find("async fn execute_action_dispatch(")
+            .expect("execute_action_dispatch present");
+        let rest = SRC.get(start..).expect("`find` returns a char boundary");
+        // Structural end: the next top-level item's doc comment.
+        let end = rest.find("\n/// ").expect("another item follows");
+        let src = rest.get(..end).expect("`find` returns a char boundary");
+        assert!(
+            src.contains("action_wire::control_element_action("),
+            "{src}"
+        );
+        assert!(src.contains("action_wire::element_action_payload(&id, split.envelope)"));
+        assert!(src.contains("action_wire::take_body_window_label(&mut request.extra)"));
+        assert!(
+            !src.contains("for (k, v) in request.extra"),
+            "the route folds every undeclared key into params again"
+        );
     }
 }
