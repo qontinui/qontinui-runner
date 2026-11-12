@@ -41,11 +41,89 @@ import {
   useSessionInfo,
   type SessionTenancy,
   type TenancyRepoExpected,
+  type TenantDisplay,
 } from "./useSessionInfo";
 
 /** The chip's discriminating stem: uuids share a long tail. */
 function stem(tenantId: string): string {
   return tenantId.length > 8 ? tenantId.slice(0, 8) : tenantId;
+}
+
+function sameTenant(a: string | null | undefined, b: string | null | undefined): boolean {
+  return !!a?.trim() && !!b?.trim() && a.trim().toLowerCase() === b.trim().toLowerCase();
+}
+
+/** `N tenant(s)`, so a single binding does not read as a plural. */
+function tenantCount(n: number): string {
+  return `${n} tenant${n === 1 ? "" : "s"}`;
+}
+
+/**
+ * The bound-set half of `tenancy.display`, for the badge's title: the same
+ * fact the session-info Tenant row states in its suffix (`boundSuffix`,
+ * `useSessionInfo.ts`), read from the same derived block so the two surfaces
+ * cannot disagree. `named` is the tenant the badge names; membership is said
+ * only when it is the display's own tenant, since `actingInBoundSet` is about
+ * that one. Every arm is stated, including a measured "in", so that no badge
+ * reads the set by silence. `null` only when the runner sent no display, in
+ * which case the badge reads nothing of the set at all. Pure; exported for the
+ * unit test.
+ */
+export function badgeBoundSetText(
+  display: TenantDisplay | null | undefined,
+  named: string | null | undefined,
+): string | null {
+  if (!display) return null;
+  const bound = display.bound;
+  if (bound.status !== "measured") {
+    return `The tenants this runner is bound to could not be read (${bound.reason ?? "no reason given"}).`;
+  }
+  const n = bound.tenantIds.length;
+  // An absent binding store, which is per runner instance: it holds nothing,
+  // whatever membership claims.
+  if (n === 0) return "This runner has no bound tenants.";
+  if (!sameTenant(named, display.tenantId)) return `This runner is bound to ${tenantCount(n)}.`;
+  const id = stem((named as string).trim());
+  const who = `Tenant ${id}`;
+  // "the one tenant" on a single binding, "the N tenants" otherwise.
+  const set = n === 1 ? "the one tenant" : `the ${tenantCount(n)}`;
+  if (display.actingInBoundSet === false) {
+    return n === 1
+      ? `${who} is NOT ${set} this runner is bound to.`
+      : `${who} is NOT among ${set} this runner is bound to.`;
+  }
+  if (display.actingInBoundSet !== true) {
+    return n === 1
+      ? `Whether tenant ${id} is ${set} this runner is bound to is unknown.`
+      : `Whether tenant ${id} is among ${set} this runner is bound to is unknown.`;
+  }
+  return n === 1
+    ? `${who} is ${set} this runner is bound to.`
+    : `${who} is 1 of ${set} this runner is bound to.`;
+}
+
+/** The named tenant was MEASURED outside a non-empty bound set — the row's
+ * `not among N bound`. An unknown set or membership is not this. */
+function measuredOutsideBoundSet(
+  display: TenantDisplay | null | undefined,
+  named: string | null | undefined,
+): boolean {
+  return (
+    !!display &&
+    display.bound.status === "measured" &&
+    display.bound.tenantIds.length > 0 &&
+    display.actingInBoundSet === false &&
+    sameTenant(named, display.tenantId)
+  );
+}
+
+/** ` <sentence>` for a title, or "" when the runner sent no display. */
+function boundSetClause(
+  display: TenantDisplay | null | undefined,
+  named: string | null | undefined,
+): string {
+  const text = badgeBoundSetText(display, named);
+  return text ? ` ${text}` : "";
 }
 
 /**
@@ -110,6 +188,10 @@ export interface TenantBadgeLabel {
   diverged: boolean;
   /** The credential tenant could not be established. */
   credentialUnknown: boolean;
+  /** The named tenant was measured OUTSIDE the runner's (non-empty) bound
+   * set — the session-info row's `not among N bound`. Rendered in the same
+   * attention tone as an unknown credential, never as a plain label. */
+  outsideBoundSet: boolean;
 }
 
 /**
@@ -183,7 +265,17 @@ export function tenantBadgeLabel(
       `Repo in the working directory belongs to: ${repoExpectedText(tenancy.repoExpected)}`,
       `Coord session row: ${coordRowText(tenancy)}`,
     ];
-    return { text, title: lines.join("\n"), diverged: true, credentialUnknown };
+    // Membership is the display's acting tenant's, so the line says which leg.
+    const boundText = badgeBoundSetText(display, display?.tenantId);
+    if (boundText)
+      lines.push(`Bound set${display?.tenantId ? " (acting tenant)" : ""}: ${boundText}`);
+    return {
+      text,
+      title: lines.join("\n"),
+      diverged: true,
+      credentialUnknown,
+      outsideBoundSet: measuredOutsideBoundSet(display, display?.tenantId),
+    };
   }
 
   // No stamp, but the runner resolved the tenant the session ACTS as.
@@ -210,23 +302,29 @@ export function tenantBadgeLabel(
       text: credentialUnknown ? `${stem(resolvedActing)}?` : stem(resolvedActing),
       title: `This session acts as tenant ${resolvedActing}${
         display.tenantSlug ? ` (${display.tenantSlug})` : ""
-      } ${how}. Its spawn chose no tenant (device default).${unknownCredential}${unconfirmed} ${fixed}`,
+      } ${how}. Its spawn chose no tenant (device default).${boundSetClause(
+        display,
+        resolvedActing,
+      )}${unknownCredential}${unconfirmed} ${fixed}`,
       diverged: false,
       credentialUnknown,
+      outsideBoundSet: measuredOutsideBoundSet(display, resolvedActing),
     };
   }
 
   // `stamped` is non-null here: every null case returned above.
   const acting = stamped as string;
+  const outsideBoundSet = measuredOutsideBoundSet(display, acting);
   if (credentialUnknown && tenancy) {
     return {
       text: `${stem(acting)}?`,
       title:
         `This session was spawned for tenant ${acting}, but the tenant its ` +
-        `coord-mcp writes go to is UNKNOWN (${tenancy.credential.reason ?? "no reason given"}). ` +
-        fixed,
+        `coord-mcp writes go to is UNKNOWN (${tenancy.credential.reason ?? "no reason given"}).` +
+        `${boundSetClause(display, acting)} ${fixed}`,
       diverged: false,
       credentialUnknown: true,
+      outsideBoundSet,
     };
   }
   // `diverged: false` alone is not agreement: a comparison with an unknown
@@ -240,9 +338,13 @@ export function tenantBadgeLabel(
     : "";
   return {
     text: stem(acting),
-    title: `This session is acting as tenant ${acting}.${unconfirmed}${repoLine} ${fixed}`,
+    title: `This session is acting as tenant ${acting}.${unconfirmed}${repoLine}${boundSetClause(
+      display,
+      acting,
+    )} ${fixed}`,
     diverged: false,
     credentialUnknown: false,
+    outsideBoundSet,
   };
 }
 
@@ -285,6 +387,17 @@ export function tenantBadgeRendersWithoutSession(
  * alike): that is a record of what the spawn chose, never an observation of
  * what the session acts as. An absent attribute is therefore "nothing to state
  * here", not "no display": `data-tenant-display-status` alone says which.
+ *
+ * `data-tenant-bound-membership` is the display's own tenant
+ * (`tenancy.display.tenantId`) against the runner's bound set, in the
+ * session-info row's terms (`boundSuffix`): `in`, `out` (the row's `not among
+ * N bound`), `unknown`, `no-bound-tenants` (a measured empty set, whatever
+ * membership claims) or `set-unread`. Its subject is the ROW's, which is not
+ * always the tenant the chip names: a tab stamped for another tenant can read
+ * `out` here while its chip keeps the plain tone, because the attention tone
+ * is set only when the named tenant is the display's own (`outsideBoundSet`).
+ * It is absent only when there is no display, or a NON-EMPTY measured set with
+ * no display tenant to place in it.
  * Pure, so its arms are tested without rendering; `TenantBadge.render.test.tsx`
  * pins the spread onto the real element.
  */
@@ -292,6 +405,7 @@ export function tenantBadgeDisplayAttrs(tenancy: SessionTenancy | null): {
   "data-tenant-acting": string | undefined;
   "data-tenant-display-status": string | undefined;
   "data-tenant-display-source": string | undefined;
+  "data-tenant-bound-membership": string | undefined;
 } {
   const display = tenancy?.display ?? null;
   return {
@@ -299,7 +413,18 @@ export function tenantBadgeDisplayAttrs(tenancy: SessionTenancy | null): {
       display?.source === "row_stamp" ? undefined : (display?.tenantId ?? undefined),
     "data-tenant-display-status": display?.status ?? undefined,
     "data-tenant-display-source": display?.source ?? undefined,
+    "data-tenant-bound-membership": boundMembership(display),
   };
+}
+
+function boundMembership(display: TenantDisplay | null): string | undefined {
+  if (!display) return undefined;
+  if (display.bound.status !== "measured") return "set-unread";
+  if (display.bound.tenantIds.length === 0) return "no-bound-tenants";
+  if (!display.tenantId?.trim()) return undefined;
+  if (display.actingInBoundSet === false) return "out";
+  if (display.actingInBoundSet === true) return "in";
+  return "unknown";
 }
 
 interface TenantBadgeProps {
@@ -326,7 +451,7 @@ export function TenantBadge({ tenantId, claudeSessionId, zoneIndex, className }:
 
   const tone = label.diverged
     ? "text-[#f7768e] bg-[#f7768e]/15"
-    : label.credentialUnknown
+    : label.credentialUnknown || label.outsideBoundSet
       ? "text-[#e0af68] bg-[#e0af68]/15"
       : "text-[#7aa2f7] bg-[#7aa2f7]/15";
 
