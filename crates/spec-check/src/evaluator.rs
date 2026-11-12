@@ -27,9 +27,9 @@ use crate::diff::compute_miss;
 use crate::fetch::{compute_content_sha256, millis_to_iso8601};
 use crate::snapshot::{ElementIdx, IndexedSnapshot};
 use crate::{
-    AssertionMiss, AssertionOutcome, AssertionResult, AssertionSeverityCounts, BridgeFingerprint,
-    MatchOutcome, MatchedElement, SpecCheckResult, SpecCheckSummary, SpecValidation,
-    StateMatchResult, ThresholdConfig, UIBridgeSnapshot,
+    AssertionResult, AssertionSeverityCounts, BridgeFingerprint, MatchOutcome, MatchedElement,
+    SpecAssertionVerdict, SpecCheckResult, SpecCheckSummary, SpecValidation, StateMatchResult,
+    ThresholdConfig, UIBridgeSnapshot, UnknownCode,
 };
 
 /// `recommendation_reason` value set when the matcher refuses to recommend
@@ -258,7 +258,7 @@ fn evaluate_state(indexed: &IndexedSnapshot, state: &IrState) -> StateMatchResul
     let total = assertions.len();
     let passed = assertions
         .iter()
-        .filter(|a| matches!(a.outcome, AssertionOutcome::Pass { .. }))
+        .filter(|a| matches!(a.outcome, SpecAssertionVerdict::Pass { .. }))
         .count();
 
     // Per Plan §Step 4 acceptance: empty enabled-assertion set → 0.0
@@ -283,11 +283,12 @@ fn evaluate_assertion(indexed: &IndexedSnapshot, assertion: &IrAssertion) -> Ass
     let crit = parse_criteria(&assertion.target.criteria);
     let outcome = match crit {
         Ok(crit) => run_two_phase_match(indexed, &crit),
-        Err(_) => AssertionOutcome::Fail {
-            miss: AssertionMiss {
-                reason: crate::MissReason::NoCandidates,
-                candidates: Vec::new(),
-            },
+        // Criteria that do not parse leave nothing to judge the page against:
+        // the assertion was never evaluated, so it is unknown — not a
+        // `NoCandidates` miss, which would claim the page was looked at and
+        // lacked the element.
+        Err(_) => SpecAssertionVerdict::Unknown {
+            code: UnknownCode::NoExpectation,
         },
     };
 
@@ -304,8 +305,8 @@ fn evaluate_assertion(indexed: &IndexedSnapshot, assertion: &IrAssertion) -> Ass
 /// into a strongly-typed [`IrElementCriteria`]. The IR keeps the criteria
 /// loose at the schema layer so synthesis can emit partial criteria
 /// without tripping `deny_unknown_fields`; the matcher takes the strict
-/// view. Unparseable criteria → error → assertion fails with
-/// `MissReason::NoCandidates`.
+/// view. Unparseable criteria → error → the assertion is
+/// `Unknown { code: no_expectation }`.
 fn parse_criteria(value: &serde_json::Value) -> Result<IrElementCriteria, serde_json::Error> {
     // `null` or omitted criteria deserialize to the default (every field
     // None), which `matches_all` treats as "any element matches".
@@ -318,15 +319,18 @@ fn parse_criteria(value: &serde_json::Value) -> Result<IrElementCriteria, serde_
 /// Two-phase matcher core:
 /// - Phase 1: `narrow_candidates` → first `matches_all` winner → Pass.
 /// - Phase 2: `compute_miss` → Fail with structured AssertionMiss.
-fn run_two_phase_match(indexed: &IndexedSnapshot, crit: &IrElementCriteria) -> AssertionOutcome {
+fn run_two_phase_match(
+    indexed: &IndexedSnapshot,
+    crit: &IrElementCriteria,
+) -> SpecAssertionVerdict {
     for idx in narrow_candidates(indexed, crit) {
         if matches_all(indexed, crit, idx) {
-            return AssertionOutcome::Pass {
+            return SpecAssertionVerdict::Pass {
                 matched: matched_from(indexed, idx),
             };
         }
     }
-    AssertionOutcome::Fail {
+    SpecAssertionVerdict::Fail {
         miss: compute_miss(indexed, crit),
     }
 }
@@ -412,7 +416,7 @@ fn match_outcome_for(state_results: &[StateMatchResult]) -> MatchOutcome {
     for s in state_results {
         for a in &s.assertions {
             total += 1;
-            if matches!(a.outcome, AssertionOutcome::Pass { .. }) {
+            if matches!(a.outcome, SpecAssertionVerdict::Pass { .. }) {
                 passed += 1;
             }
         }
@@ -432,7 +436,10 @@ fn match_outcome_for(state_results: &[StateMatchResult]) -> MatchOutcome {
     }
 }
 
-/// Aggregate failure counts across every state. Unknown severity strings
+/// Aggregate failure counts across every state. Only decided `Fail`
+/// verdicts count: an `Unknown` verdict is not a failure of any severity
+/// (the policy conjunct's `Indeterminate` and the per-result verdict carry
+/// it). Unknown severity strings
 /// route to the `error` bucket (the "least restrictive" choice — visible to
 /// policy gates that fail on `error` and above, but doesn't escalate to
 /// `critical`).
@@ -440,7 +447,7 @@ fn aggregate_severity_counts(state_results: &[StateMatchResult]) -> AssertionSev
     let mut counts = AssertionSeverityCounts::default();
     for s in state_results {
         for a in &s.assertions {
-            if !matches!(a.outcome, AssertionOutcome::Fail { .. }) {
+            if !matches!(a.outcome, SpecAssertionVerdict::Fail { .. }) {
                 continue;
             }
             // Severity matching is case-insensitive — wire is free-form but
@@ -1037,6 +1044,56 @@ mod tests {
         assert_eq!(result.summary.severity_counts.error, 1);
         assert_eq!(result.summary.severity_counts.critical, 0);
         assert_eq!(result.summary.severity_counts.warning, 0);
+    }
+
+    // ----- Unknown verdicts (plan
+    // 2026-11-06-no-verification-instrument-reads-an-absence-as-a-pass D4) -----
+
+    /// Criteria that do not parse leave nothing to judge the page against,
+    /// so the verdict is `Unknown { no_expectation }` — not a
+    /// `NoCandidates` miss that claims the page lacked the element.
+    /// Mutation: restoring the `Fail { NoCandidates }` arm reds this.
+    #[test]
+    fn unparseable_criteria_answer_unknown_no_expectation() {
+        // An element that WOULD match a well-formed `role: "button"` is
+        // present, so a Fail here could only be the parse arm's doing.
+        let s = snap(vec![elem("ok", "#ok", Some("button"), Some("Save"), true)]);
+        let a = assertion("a1", "critical", json!({ "role": 42 }), true);
+        let st = state("s1", "Loaded", Some(true), vec![a]);
+        let spec = page_spec("page-1", vec![st]);
+
+        let result = evaluate(&s, &spec);
+        let outcome = &result.state_results[0].assertions[0].outcome;
+        assert!(
+            matches!(
+                outcome,
+                SpecAssertionVerdict::Unknown {
+                    code: UnknownCode::NoExpectation
+                }
+            ),
+            "{outcome:?}"
+        );
+    }
+
+    /// An `Unknown` is not a failure of any severity: the severity tally
+    /// counts decided `Fail`s only. Mutation: counting non-`Pass` verdicts
+    /// (the pre-D4 two-state reading) reds this.
+    #[test]
+    fn severity_counts_skip_unknown_verdicts() {
+        let s = snap(vec![]);
+        let unknown = assertion("a1", "critical", json!({ "role": 42 }), true);
+        let failed = assertion("a2", "warning", json!({ "role": "button" }), true);
+        let st = state("s1", "Loaded", Some(true), vec![unknown, failed]);
+        let spec = page_spec("page-1", vec![st]);
+
+        let result = evaluate(&s, &spec);
+        assert!(matches!(
+            result.state_results[0].assertions[0].outcome,
+            SpecAssertionVerdict::Unknown { .. }
+        ));
+        assert_eq!(result.summary.severity_counts.critical, 0);
+        assert_eq!(result.summary.severity_counts.error, 0);
+        assert_eq!(result.summary.severity_counts.warning, 1);
     }
 
     #[test]

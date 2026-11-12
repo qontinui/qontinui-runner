@@ -705,7 +705,11 @@ pub fn export_all_schemas() -> Value {
     add!("SpecCheckConfidence", qsc::Confidence);
     add!("StateMatchResult", qsc::StateMatchResult);
     add!("AssertionResult", qsc::AssertionResult);
-    add!("AssertionOutcome", qsc::AssertionOutcome);
+    // Renamed from `AssertionOutcome` (plan
+    // 2026-11-06-no-verification-instrument-reads-an-absence-as-a-pass D4) so
+    // the generated `AssertionOutcome` name is the shared three-state enum
+    // registered from `qontinui_types::outcome` below.
+    add!("SpecAssertionVerdict", qsc::SpecAssertionVerdict);
     add!("MatchedElement", qsc::MatchedElement);
     add!("AssertionMiss", qsc::AssertionMiss);
     add!("CandidateMiss", qsc::CandidateMiss);
@@ -982,6 +986,21 @@ pub fn export_all_schemas() -> Value {
         add!("UnmeasuredDimension", qob::UnmeasuredDimension);
         add!("CacheProvenance", qob::CacheProvenance);
     }
+    // ── qontinui-types: outcome (plan
+    // 2026-11-06-no-verification-instrument-reads-an-absence-as-a-pass D1-D3).
+    // The shared three-state verdict and its fold. `UnknownCode` keeps its ONE
+    // registration above (vision-core's MIT twin); the two Rust copies are
+    // held to one schema by `outcome_twins_have_identical_schemas` below,
+    // because each `add!` is its own `schema_for!` root and the drift check
+    // compares regenerated bindings with committed ones only. `Verdict` (the
+    // fold's INPUT) has a hand-written schema impl but is not registered: no
+    // binding consumer reads it yet. (3) ──
+    {
+        use qontinui_types::outcome as qout;
+        add!("AssertionOutcome", qout::AssertionOutcome);
+        add!("OutcomeCounts", qout::OutcomeCounts);
+        add!("FoldedOutcome", qout::FoldedOutcome);
+    }
     // ── qontinui-types: page (plan
     // 2026-09-05-every-bounded-read-is-a-page-that-reads-as-a-corpus,
     // qontinui-schemas#186). The bounded-read wire contract every list
@@ -1108,8 +1127,22 @@ mod tests {
         // RecurringAgentStatusReport — plan
         // 2026-10-29-recurring-agents-declared-in-coord-reconciled-by-runner
         // Phase 4a) = 624.
-        // The codegen's "Processing N top-level types" line should read 624 here.
-        assert_eq!(obj.len(), 624, "Expected 624 schema entries");
+        // + the 3 shared-verdict types (AssertionOutcome, OutcomeCounts,
+        // FoldedOutcome — plan
+        // 2026-11-06-no-verification-instrument-reads-an-absence-as-a-pass
+        // Phase 1c; spec-check's `AssertionOutcome` is renamed
+        // `SpecAssertionVerdict`, so it adds none) = 627.
+        // The codegen's "Processing N top-level types" line should read 627 here.
+        assert_eq!(obj.len(), 627, "Expected 627 schema entries");
+        for verdict in [
+            "SpecAssertionVerdict",
+            "AssertionOutcome",
+            "OutcomeCounts",
+            "FoldedOutcome",
+            "UnknownCode",
+        ] {
+            assert!(obj.contains_key(verdict), "Missing {verdict} schema");
+        }
         for recurring in [
             "ManagedBy",
             "RecurringAgentTarget",
@@ -1189,5 +1222,52 @@ mod tests {
             schema_str.contains("ExecutorEvent") || schema_str.contains("event_type"),
             "AppEvent schema should reference its variants"
         );
+    }
+
+    /// The two Rust copies of the shared vocabulary — qontinui-types' AGPL
+    /// `outcome` module and vision-core's MIT twin (plan
+    /// 2026-11-06-no-verification-instrument-reads-an-absence-as-a-pass D2) —
+    /// must serialize to ONE schema. Only `UnknownCode` from vision-core is
+    /// registered, and qontinui-types' `FoldedOutcome` / `SpecAssertionVerdict`
+    /// reference it by name, so a member present in one copy and not the
+    /// other would generate bindings that silently disagree with half the
+    /// Rust. This is the one crate that links both copies, so the pin lives
+    /// here.
+    #[test]
+    fn outcome_twins_have_identical_schemas() {
+        let types_code =
+            serde_json::to_value(schema_for!(qontinui_types::outcome::UnknownCode)).unwrap();
+        let vision_code =
+            serde_json::to_value(schema_for!(qontinui_vision_core::UnknownCode)).unwrap();
+        assert_eq!(
+            types_code, vision_code,
+            "UnknownCode: qontinui-types and vision-core schemas diverged"
+        );
+
+        let types_outcome =
+            serde_json::to_value(schema_for!(qontinui_types::outcome::AssertionOutcome)).unwrap();
+        let vision_outcome =
+            serde_json::to_value(schema_for!(qontinui_vision_core::AssertionOutcome)).unwrap();
+        assert_eq!(
+            types_outcome, vision_outcome,
+            "AssertionOutcome: qontinui-types and vision-core schemas diverged"
+        );
+    }
+
+    /// The pin above compares two schemas, so it is only as strong as what a
+    /// schema carries: prove a dropped member WOULD change it, without
+    /// editing either crate.
+    #[test]
+    fn unknown_code_schema_names_every_member() {
+        let schema =
+            serde_json::to_value(schema_for!(qontinui_types::outcome::UnknownCode)).unwrap();
+        let text = schema.to_string();
+        for code in qontinui_types::outcome::UnknownCode::ALL {
+            assert!(
+                text.contains(&format!("\"{}\"", code.as_str())),
+                "UnknownCode schema omits {}",
+                code.as_str()
+            );
+        }
     }
 }
