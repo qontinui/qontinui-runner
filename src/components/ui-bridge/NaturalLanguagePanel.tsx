@@ -16,6 +16,7 @@
 
 import { useState, useCallback, useEffect, useMemo, useRef } from "react";
 import { instanceStorage } from "@/lib/instance-storage";
+import { answersToNamedType } from "@/lib/ui-bridge/namedType";
 import { Button } from "../ui/Button";
 import { Badge } from "../ui/Badge";
 import {
@@ -327,7 +328,7 @@ function calculateSimilarity(a: string, b: string): number {
  *
  * Also checks against persisted element descriptions for enhanced matching.
  */
-function findMatchingElements(
+export function findMatchingElements(
   targetDescription: string,
   elements: ExternalElement[],
   descriptions?: Map<string, PersistedElementDescription>,
@@ -475,8 +476,10 @@ function findMatchingElements(
       }
     }
 
-    // Check type match (e.g., "button", "input") - use synonyms
-    if (targetWords.includes(element.type)) {
+    // Check type match (e.g., "button", "input") - use synonyms. A typed word
+    // NAMES a type, so it answers for the name's family: "input" also finds a
+    // `textbox`, "select" a `combobox` (`answersToNamedType`).
+    if (targetWords.some((word) => answersToNamedType(element.type, word))) {
       score += 0.3;
       reasons.push("Type matches");
     } else {
@@ -497,8 +500,12 @@ function findMatchingElements(
       select: getElementSynonyms("dropdown"),
     };
 
+    // Each key names a type, so an element answers to it by family: since
+    // `@qontinui/ui-bridge` 0.46 an ARIA textbox is kinded `textbox` and a
+    // combobox `combobox`, which the registry used to report as `input` and
+    // `select`.
     for (const [type, keywords] of Object.entries(typeKeywords)) {
-      if (element.type === type) {
+      if (answersToNamedType(element.type, type)) {
         for (const keyword of keywords) {
           if (lowerTarget.includes(keyword)) {
             score += 0.2;
