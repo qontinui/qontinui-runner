@@ -335,6 +335,15 @@ pub(crate) fn element_declared_effect(element: &serde_json::Value) -> Option<IrE
     }
 }
 
+/// An element is an affordance when it declares a custom action, or advertises
+/// built-in actions and is not a content or media row.
+///
+/// The classification arm is load-bearing since `@qontinui/ui-bridge` 0.46:
+/// every kind advertises the every-element verbs, a media row included (a
+/// canvas takes `sendKeys`), so a non-empty `actions` no longer separates an
+/// image from a button — and counting every `<img>` would put it in the digest
+/// and the frontier as an unexplored control. See
+/// [`crate::mcp::ui_bridge::element_kind::is_content_or_media_row`].
 fn element_is_interactive(element: &serde_json::Value) -> bool {
     let non_empty = |key: &str| {
         element
@@ -342,12 +351,20 @@ fn element_is_interactive(element: &serde_json::Value) -> bool {
             .and_then(|a| a.as_array())
             .is_some_and(|a| !a.is_empty())
     };
-    non_empty("actions") || non_empty("customActions")
+    non_empty("customActions")
+        || (non_empty("actions")
+            && !crate::mcp::ui_bridge::element_kind::is_content_or_media_row(element))
 }
 
 /// True for an element whose text is USER INPUT rather than an app-declared
-/// label: `input` / `textarea` (by `type` or `tagName`), a contenteditable
-/// element, or a `combobox` / `searchbox` / `textbox` role.
+/// label: `input` / `textarea` / `textbox` (by `type` or `tagName`), a
+/// contenteditable element, or a `combobox` / `searchbox` / `textbox` role.
+///
+/// `textbox` is in the `type` arm because `@qontinui/ui-bridge` 0.46 kinds an
+/// ARIA textbox and a contenteditable `textbox` where the registry used to say
+/// `input` — and a contenteditable `<div>` carries no implicit ARIA role, so
+/// without it the row would fall through every arm and fold what the user
+/// typed into its fingerprint.
 pub(crate) fn is_input_like(element: &serde_json::Value) -> bool {
     let lower = |key: &str| {
         element
@@ -355,7 +372,9 @@ pub(crate) fn is_input_like(element: &serde_json::Value) -> bool {
             .and_then(|v| v.as_str())
             .map(|s| s.trim().to_ascii_lowercase())
     };
-    let kind = |k: Option<String>| k.is_some_and(|t| matches!(t.as_str(), "input" | "textarea"));
+    let kind = |k: Option<String>| {
+        k.is_some_and(|t| matches!(t.as_str(), "input" | "textarea" | "textbox"))
+    };
     let editable = ["contenteditable", "contentEditable", "isContentEditable"]
         .iter()
         .any(|k| {
@@ -658,6 +677,14 @@ mod tests {
             journey_element_fingerprint(&searchbox("a")),
             journey_element_fingerprint(&searchbox("b"))
         );
+        // `@qontinui/ui-bridge` 0.46 kinds a contenteditable `textbox` (the
+        // registry said `input`), and a contenteditable `<div>` has no implied
+        // ARIA role to fall back on.
+        let editable = |v: &str| json!({"id": "n", "type": "textbox", "tagName": "div", "text": v});
+        assert_eq!(
+            journey_element_fingerprint(&editable("draft one")),
+            journey_element_fingerprint(&editable("draft two"))
+        );
         // A button's text is an app-declared label: it still counts, and the
         // co-occurrence fingerprint is untouched.
         let button = |t: &str| json!({"id": "b", "type": "button", "text": t});
@@ -712,6 +739,60 @@ mod tests {
             "component:grid:refresh"
         );
         assert_eq!(idx.distinct().len(), 4);
+    }
+
+    #[test]
+    fn a_media_row_advertising_the_every_element_verbs_is_not_an_affordance() {
+        // `@qontinui/ui-bridge` 0.46 serves a media row the table's every-element
+        // list (ui-bridge `9f373a12` `core/element-kind.ts` `EVERY_ELEMENT`)
+        // where it used to serve `[]`. The digest and the frontier must not
+        // start counting every image as an unexplored control because of it.
+        let every_element = json!([
+            "click",
+            "hoverClick",
+            "doubleClick",
+            "rightClick",
+            "middleClick",
+            "sendKeys",
+            "focus",
+            "blur",
+            "hover",
+            "unhover",
+            "scroll",
+            "scrollIntoView",
+            "drag"
+        ]);
+        let with_media = json!({"elements": [
+            {"id": "btn", "type": "button", "label": "Save", "category": "interactive",
+             "actions": every_element},
+            {"id": "logo", "type": "image", "label": "Logo", "category": "media",
+             "actions": every_element},
+            {"id": "chart", "type": "canvas", "category": "media", "actions": every_element},
+            {"id": "h1", "type": "heading", "label": "Title", "category": "content",
+             "kind": "content", "actions": []}
+        ]});
+        let without_media = json!({"elements": [
+            {"id": "btn", "type": "button", "label": "Save", "category": "interactive",
+             "actions": every_element}
+        ]});
+        let idx = extract_affordances(&with_media);
+        assert_eq!(
+            idx.elements.keys().collect::<Vec<_>>(),
+            vec!["btn"],
+            "only the button is an affordance"
+        );
+        assert_eq!(
+            affordance_digest(&idx),
+            affordance_digest(&extract_affordances(&without_media)),
+            "media and content rows leave the digest unchanged"
+        );
+
+        // A custom action on a media row IS an affordance: an app declared it.
+        let declared = extract_affordances(&json!({"elements": [
+            {"id": "pad", "type": "canvas", "category": "media", "actions": every_element,
+             "customActions": [{"id": "draw", "effect": "write"}]}
+        ]}));
+        assert!(declared.elements.contains_key("pad"));
     }
 
     #[test]

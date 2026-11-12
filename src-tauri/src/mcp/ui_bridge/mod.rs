@@ -27,6 +27,7 @@ pub mod diagnostics;
 #[cfg(test)]
 mod doc_route_agreement;
 pub mod effects;
+pub mod element_kind;
 pub mod elements;
 pub mod errors;
 pub mod exploration;

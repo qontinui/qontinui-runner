@@ -145,9 +145,17 @@ pub fn narrow_candidates(snapshot: &IndexedSnapshot, crit: &IrElementCriteria) -
 // Phase 2 — per-field fuzzy scoring
 // ===========================================================================
 
-/// 1.0 on exact match (post-normalization), 0.5 when declared and observed
+/// 1.0 on exact match (post-normalization) or when the observed role answers
+/// to the declared one's named-type family, 0.5 when declared and observed
 /// roles share an ARIA category but differ literally, 0.0 otherwise (or when
 /// observed is absent).
+///
+/// The family arm is the SDK's named-type rule ([`crate::named_type`]): a
+/// declared role is a name a spec author wrote, and the observed role can be
+/// read off the element's `type` ([`derive::role`]'s fallback), which
+/// `@qontinui/ui-bridge` 0.46 re-kinded (`select` → `combobox`, `input` →
+/// `textbox`). So `{role: "select"}` keeps matching a combobox and
+/// `{role: "combobox"}` a listbox.
 pub fn score_role(declared: &str, observed: &Option<String>) -> f32 {
     let Some(obs) = observed else {
         return 0.0;
@@ -157,7 +165,7 @@ pub fn score_role(declared: &str, observed: &Option<String>) -> f32 {
     if d.is_empty() && o.is_empty() {
         return 1.0;
     }
-    if d == o {
+    if d == o || crate::named_type::answers_to_named_type(Some(&o), &d) {
         1.0
     } else if same_category(&d, &o) {
         0.5
@@ -1078,6 +1086,49 @@ mod tests {
             "expected the email input to derive role=textbox"
         );
         assert!(matches_all(&idx, &crit, cands[0]));
+    }
+
+    #[test]
+    fn a_named_role_finds_the_kind_ui_bridge_0_46_moved_it_to() {
+        // `@qontinui/ui-bridge` 0.46 re-kinded role="combobox" `select` ->
+        // `combobox` and contenteditable `input` -> `textbox`, and with no
+        // top-level role the derived role is the kind itself. A spec that NAMES
+        // the old spelling still finds the element: both the role index
+        // (narrowing) and `score_role` (Phase 1) apply the named-type family.
+        let s = snap(vec![
+            live_elem("cb", "div", "combobox", Some("Country"), None),
+            live_elem("ce", "div", "textbox", Some("Notes"), None),
+            live_elem("btn", "div", "button", Some("Go"), None),
+        ]);
+        let idx = IndexedSnapshot::new(&s);
+        for (named, expected) in [
+            ("select", "cb"),
+            ("combobox", "cb"),
+            ("listbox", "cb"),
+            ("textbox", "ce"),
+            ("input", "ce"),
+        ] {
+            let crit = IrElementCriteria {
+                role: Some(named.to_string()),
+                ..Default::default()
+            };
+            let cands = narrow_candidates(&idx, &crit);
+            let matched: Vec<&str> = cands
+                .iter()
+                .filter(|i| matches_all(&idx, &crit, **i))
+                .map(|i| idx.element(*i).id.as_str())
+                .collect();
+            assert_eq!(matched, vec![expected], "role {named:?}");
+        }
+    }
+
+    #[test]
+    fn score_role_family_is_exact_and_stops_at_its_edge() {
+        assert_eq!(score_role("select", &Some("combobox".into())), 1.0);
+        assert_eq!(score_role("Combobox", &Some("listbox".into())), 1.0);
+        assert_eq!(score_role("textbox", &Some("input".into())), 1.0);
+        // `checkbox` shares textbox's ARIA category but not its family.
+        assert_eq!(score_role("textbox", &Some("checkbox".into())), 0.5);
     }
 
     #[test]

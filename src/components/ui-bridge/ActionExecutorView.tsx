@@ -150,9 +150,21 @@ export function ActionExecutorView({
   const getAvailableActions = useCallback((): ActionConfig[] => {
     if (!element) return [];
 
-    const actions: ActionConfig[] = [...COMMON_ACTIONS];
+    // An element that advertises its verbs gets exactly the ones it advertises.
+    // Since `@qontinui/ui-bridge` 0.46 every producer reads them from ONE table
+    // that also reads the node's structure (`core/element-kind.ts`), so the list
+    // is authoritative — a `<input role="combobox">` takes `type` AND `select`,
+    // which no switch on `type` would offer — and the runner refuses anything
+    // outside it anyway.
+    if (element.actions && element.actions.length > 0) {
+      const advertised = element.actions;
+      return [...COMMON_ACTIONS, ...INPUT_ACTIONS, ...CHECKBOX_ACTIONS, ...SELECT_ACTIONS].filter(
+        (a) => advertised.includes(a.id),
+      );
+    }
 
-    // Add type-specific actions
+    // No advertised list: guess from the kind.
+    const actions: ActionConfig[] = [...COMMON_ACTIONS];
     switch (element.type) {
       case "input":
       case "textarea":
@@ -163,15 +175,10 @@ export function ActionExecutorView({
         actions.push(...CHECKBOX_ACTIONS);
         break;
       case "select":
+      case "combobox":
         actions.push(...SELECT_ACTIONS);
         break;
     }
-
-    // Filter to only available actions if element specifies them
-    if (element.actions && element.actions.length > 0) {
-      return actions.filter((a) => element.actions!.includes(a.id));
-    }
-
     return actions;
   }, [element]);
 

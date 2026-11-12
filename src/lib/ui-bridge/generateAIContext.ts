@@ -102,6 +102,14 @@ function isInteractive(element: ExternalElement): boolean {
     return element.is_interactive;
   }
 
+  // A content or media row is never a control, whatever it advertises: since
+  // `@qontinui/ui-bridge` 0.46 a media row carries the every-element verbs
+  // (`click`, `sendKeys`, …), so the "has actions" arm below would list every
+  // image. Same classification as the SDK's `interactive_only` filter.
+  if (element.category === "content" || element.category === "media") {
+    return false;
+  }
+
   // Fallback: check based on type/role
   const interactiveRoles = [
     "button",
