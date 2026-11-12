@@ -3,11 +3,14 @@
  * `2026-10-04-runner-session-roster-restore-picker`, Phases 4-5).
  *
  * Reviewing a restart: one row per session on that boot's roster — name,
- * account, worktree / plan, WIP, what became of it (`back` / `missing:
- * <reason>` / `needs-account` / `finished` / `waiting: …`) and when it was
- * last seen — with a checkbox (pre-checked for unfinished, missing, resumable
- * rows), "Resume selected (n)" (sequential, per-row progress, Retry), an
- * account chooser for a session whose account is unknown, and Finish/Unfinish.
+ * account, worktree / plan, WIP, what became of it (`back` / `came back ·
+ * later closed <time> (<reason>)` / `missing: <reason>` / `needs-account` /
+ * `unknown: may still be restored` / `closed since the restart` / `finished` /
+ * `waiting: …`, the last only while this runner's restore still owes it) and
+ * when it was last seen — with a checkbox (pre-checked for unfinished,
+ * missing, resumable rows), "Resume selected (n)" (sequential, per-row
+ * progress, Retry), an account chooser for a session whose account is
+ * unknown, and Finish/Unfinish.
  *
  * In the normal running state (no restart left to review) it is the
  * pre-rebuild preview instead: what a restart NOW would bring back, when the
@@ -35,6 +38,7 @@ import {
   finishButtonModel,
   formatAgo,
   previewModel,
+  rowSummary,
   sinceRestartAccountId,
   sinceRestartCheckId,
   sinceRestartFinishId,
@@ -53,10 +57,12 @@ const DEFAULT_ACCOUNT = "__default__";
 
 const CHIP: Record<RowState, string> = {
   back: "bg-[#9ece6a]/15 text-[#9ece6a]",
+  "back-later-closed": "bg-[#9ece6a]/10 text-[#a9b1d6]",
   missing: "bg-[#e0af68]/15 text-[#e0af68]",
+  unknown: "bg-[#e0af68]/10 text-[#a9b1d6]",
   "needs-account": "bg-[#f7768e]/15 text-[#f7768e]",
   finished: "bg-[#565f89]/15 text-[#565f89]",
-  "closed-by-user": "bg-[#565f89]/15 text-[#a9b1d6]",
+  "closed-since": "bg-[#565f89]/15 text-[#a9b1d6]",
   "waiting-page": "bg-[#7aa2f7]/15 text-[#7aa2f7]",
   "waiting-drain": "bg-[#7aa2f7]/15 text-[#7aa2f7]",
 };
@@ -89,24 +95,6 @@ function accountText(label: string | null, account: ResumeAccount): string {
   if (label) return label;
   if (!account.known) return "account unknown";
   return account.configDir ? basename(account.configDir) : "default";
-}
-
-/**
- * "2 back · 3 did not come back · 1 waiting · 1 finished" — waiting rows (a
- * page not opened yet, or a drain) are not counted as misses.
- */
-function rowSummary(rows: readonly SinceRestartRow[]): string {
-  const count = (pred: (r: SinceRestartRow) => boolean) => rows.filter(pred).length;
-  const parts = [
-    `${count((r) => r.state === "back")} back`,
-    `${count((r) => r.state === "missing" || r.state === "needs-account")} did not come back`,
-  ];
-  const waiting = count((r) => r.state === "waiting-page" || r.state === "waiting-drain");
-  if (waiting > 0) parts.push(`${waiting} waiting`);
-  const closedByUser = count((r) => r.state === "closed-by-user");
-  if (closedByUser > 0) parts.push(`${closedByUser} closed by you`);
-  parts.push(`${count((r) => r.state === "finished")} finished`);
-  return parts.join(" · ");
 }
 
 function generationLabel(g: LedgerGeneration): string {
@@ -433,7 +421,7 @@ export function SinceRestartSection() {
             {roster.generation.verdict === "unknown" && (
               <span
                 className="ml-1 text-[#e0af68]"
-                title="This boot latched no restore census, so a session that came back and was then closed counts as missing"
+                title="Part of what this runner observed since the restart could not be read, so a session counted as not back may have come back unseen"
               >
                 (misses are an upper bound)
               </span>

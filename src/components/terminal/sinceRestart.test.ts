@@ -1,9 +1,11 @@
 /**
  * The "Since restart" roster model (plan
- * `2026-10-04-runner-session-roster-restore-picker`, Phases 4-5): pre-check
- * selection, the sequential resume queue, the strip's copy, Finish/Unfinish
- * row state, and the pre-rebuild preview. Pure — the runner's vitest env is
- * `node` — plus a source read pinning the stable UI-Bridge ids.
+ * `2026-10-04-runner-session-roster-restore-picker`, Phases 4-5; the counts
+ * per plan `2026-11-11-since-restart-roster-counts-closed-sessions-as-missing`,
+ * Phase 5): pre-check selection, the sequential resume queue, the strip's
+ * copy, Finish/Unfinish row state, and the pre-rebuild preview. Pure — the
+ * runner's vitest env is `node` — plus a source read pinning the stable
+ * UI-Bridge ids.
  */
 
 import { readFileSync } from "node:fs";
@@ -21,6 +23,7 @@ import {
   EMPTY_SELECTION,
   buildRow,
   buildRows,
+  clockTime,
   defaultGenerationFile,
   describeProgress,
   finishButtonModel,
@@ -34,6 +37,7 @@ import {
   resumeTargetFor,
   ResumeQueue,
   RESUME_CANCELLED,
+  rowSummary,
   runResumeQueue,
   selectedResumable,
   sinceRestartCheckId,
@@ -42,6 +46,7 @@ import {
   thisBootGeneration,
   type ResumeProgress,
   type RowContext,
+  type RowState,
 } from "./sinceRestart";
 
 function outcome(id: string, over: Partial<LedgerOutcome> = {}): LedgerOutcome {
@@ -71,6 +76,8 @@ function outcome(id: string, over: Partial<LedgerOutcome> = {}): LedgerOutcome {
     outcome: "missing",
     reason: "no-attempt",
     laterClosed: null,
+    // A miss this runner's restore still owes, unless a test says otherwise.
+    restoreOwed: true,
     resumeDir: "D:/repo/sub",
     resumeCommand: `cd "D:/repo/sub" && CLAUDE_CONFIG_DIR="C:/claude/.claude-gmail" claude --resume ${id}`,
     resumeAccount: { known: true, configDir: "C:/claude/.claude-gmail" },
@@ -79,10 +86,22 @@ function outcome(id: string, over: Partial<LedgerOutcome> = {}): LedgerOutcome {
 }
 
 const back = (id: string, over: Partial<LedgerOutcome> = {}) =>
-  outcome(id, { outcome: "back", reason: null, ...over });
-const finished = (id: string) => outcome(id, { outcome: "finished", reason: null, finished: true });
+  outcome(id, { outcome: "back", reason: null, restoreOwed: null, ...over });
+const finished = (id: string) =>
+  outcome(id, { outcome: "finished", reason: null, finished: true, restoreOwed: false });
 const closedSince = (id: string) =>
-  outcome(id, { outcome: "closed-since", reason: "closed:explicit" });
+  outcome(id, { outcome: "closed-since", reason: "closed:explicit", restoreOwed: false });
+/** A miss no restore in this runner will bring back (it closed since the boot). */
+const lost = (id: string, over: Partial<LedgerOutcome> = {}) =>
+  outcome(id, { reason: "closed:pty-exit", restoreOwed: false, ...over });
+/** A session that came back and was then closed. */
+const backLaterClosed = (
+  id: string,
+  closed: Partial<NonNullable<LedgerOutcome["laterClosed"]>> = {},
+) =>
+  back(id, {
+    laterClosed: { atMs: 1_700_000_090_000, reason: "explicit", deliberate: true, ...closed },
+  });
 
 /**
  * The serde field name of a generation's size. Spelled through a constant
@@ -279,10 +298,13 @@ describe("rows", () => {
     expect(buildRow(outcome("b", { resumeDir: "D:/repo" }), ctx()).resumeDir).toBe("D:/repo");
   });
 
-  it("labels a session the operator closed since as `closed by you` — tickable, never missing", () => {
+  it("labels a session closed on purpose since as `closed since the restart` — tickable, never missing", () => {
     const row = buildRow(closedSince("c"), ctx());
-    expect(row.state).toBe("closed-by-user");
-    expect(row.label).toBe("closed by you");
+    expect(row.state).toBe("closed-since");
+    expect(row.label).toBe("closed since the restart");
+    expect(row.detail).toBe(
+      "closed (explicit) after this roster was captured, without coming back — not expected back",
+    );
     expect(row.selectable).toBe(true);
     const unknown = buildRow(
       outcome("u", {
@@ -382,7 +404,7 @@ describe("which generation the panel opens on", () => {
 });
 
 describe("strip copy", () => {
-  it("K > 0: N of M are back · K didn't come back", () => {
+  it("K > 0: N of M came back · K didn't come back", () => {
     const r = report([
       generation("g", { returned: [back("a"), back("b")], missing: [outcome("m")] }),
     ]);
@@ -391,15 +413,15 @@ describe("strip copy", () => {
       back: 2,
       total: 3,
       missing: 1,
-      text: "2 of 3 sessions from before the restart are back · 1 didn't come back",
+      text: "2 of 3 sessions from before the restart came back · 1 didn't come back",
     });
   });
 
-  it("K = 0: all M are back", () => {
+  it("K = 0: all M came back", () => {
     const r = report([generation("g", { returned: [back("a"), back("b")] })]);
-    expect(stripModel(r, ctx())?.text).toBe("All 2 sessions from before the restart are back");
+    expect(stripModel(r, ctx())?.text).toBe("All 2 sessions from before the restart came back");
     const one = report([generation("g", { returned: [back("a")] })]);
-    expect(stripModel(one, ctx())?.text).toBe("The session from before the restart is back");
+    expect(stripModel(one, ctx())?.text).toBe("The session from before the restart came back");
   });
 
   it("finished sessions are neither back nor missing", () => {
@@ -412,7 +434,7 @@ describe("strip copy", () => {
       generation("g", { returned: [back("a")], missing: [outcome("m")] }, "unknown"),
     ]);
     expect(stripModel(r, ctx())?.text).toBe(
-      "1 of 2 sessions from before the restart are back · up to 1 didn't come back",
+      "1 of 2 sessions from before the restart came back · up to 1 didn't come back",
     );
   });
 
@@ -439,7 +461,7 @@ describe("strip copy", () => {
     });
   });
 
-  it("closed-by-user sessions are neither back nor missing", () => {
+  it("closed-since sessions are neither back nor missing", () => {
     const r = report([generation("g", { returned: [back("a")], closedSince: [closedSince("c")] })]);
     expect(stripModel(r, ctx())).toMatchObject({ kind: "all-back", total: 1 });
   });
@@ -458,12 +480,12 @@ describe("strip copy", () => {
       kind: "some-missing",
       missing: 0,
       waiting: 1,
-      text: "1 of 2 sessions from before the restart are back · 1 waiting on a page not opened yet",
+      text: "1 of 2 sessions from before the restart came back · 1 waiting on a page not opened yet",
     });
     expect(stripModel(r, ctx({ complete: ["p1", "p2"] }))).toMatchObject({
       missing: 1,
       waiting: 0,
-      text: "1 of 2 sessions from before the restart are back · 1 didn't come back",
+      text: "1 of 2 sessions from before the restart came back · 1 didn't come back",
     });
   });
 
@@ -482,19 +504,14 @@ describe("strip copy", () => {
  * `2026-11-11-since-restart-roster-counts-closed-sessions-as-missing`, D3):
  * `true` while a restore in this process may still bring it back, `false` when
  * none will (it closed since the boot, or is in no restore set), `null` when
- * that cannot be read. `LedgerOutcome` gains the field in that plan's Phase 4;
- * until then it rides on the object under a widened type.
+ * that cannot be read.
  */
 function owed(
   id: string,
   restoreOwed: boolean | null,
   over: Partial<LedgerOutcome> = {},
 ): LedgerOutcome {
-  const withVerdict: LedgerOutcome & { restoreOwed: boolean | null } = {
-    ...outcome(id, over),
-    restoreOwed,
-  };
-  return withVerdict;
+  return outcome(id, { ...over, restoreOwed });
 }
 
 /** How many rows the strip says are waiting, whichever form it takes. */
@@ -503,7 +520,8 @@ function waitingIn(model: ReturnType<typeof stripModel>): number {
 }
 
 // Plan 2026-11-11-since-restart-roster-counts-closed-sessions-as-missing,
-// Phase 0: "waiting" must mean a restore is still owed (D3). Red until Phase 5.
+// Phase 0: "waiting" must mean a restore is still owed (D3). Red until Phase 5
+// made them green.
 describe("a row no restore is owed is never waiting", () => {
   it("the drain-deferred strip counts as waiting only the rows still owed a restore", () => {
     // Two misses on the drain-deferred page: a restore in this process will
@@ -543,6 +561,254 @@ describe("a row no restore is owed is never waiting", () => {
     expect(row.state).not.toMatch(/^waiting/);
     expect(row.label).not.toMatch(/^waiting/);
     expect(row.state).toBe("missing");
+  });
+});
+
+// Plan 2026-11-11-since-restart-roster-counts-closed-sessions-as-missing,
+// Phase 5: the strip and the panel read `restoreOwed` and `laterClosed`.
+describe("owed, lost and closed-since rows", () => {
+  it("labels every RowState", () => {
+    const owedOnDrain = owed("drain", true, { pageId: "p2" });
+    const cases: [LedgerOutcome, RowContext, RowState, string][] = [
+      [back("b"), ctx(), "back", "back"],
+      [
+        backLaterClosed("lc", { atMs: null }),
+        ctx(),
+        "back-later-closed",
+        "came back · later closed (explicit)",
+      ],
+      [outcome("m"), ctx(), "missing", "missing: no-attempt"],
+      [lost("l", { pageId: "p2" }), ctx(), "missing", "missing: closed:pty-exit"],
+      [owed("u", null, { pageId: "p2" }), ctx(), "unknown", "unknown: may still be restored"],
+      [
+        outcome("n", { resumeAccount: { known: false, configDir: null } }),
+        ctx(),
+        "needs-account",
+        "needs-account",
+      ],
+      [finished("f"), ctx(), "finished", "finished"],
+      [closedSince("c"), ctx(), "closed-since", "closed since the restart"],
+      [owed("w", true, { pageId: "p2" }), ctx(), "waiting-page", "waiting: page not opened"],
+      [
+        owedOnDrain,
+        ctx({ deferred: ["p2"] }),
+        "waiting-drain",
+        "waiting: restore deferred by drain",
+      ],
+    ];
+    for (const [o, c, state, label] of cases) {
+      const row = buildRow(o, c);
+      expect([o.claudeSessionId, row.state, row.label]).toEqual([o.claudeSessionId, state, label]);
+    }
+    const covered = new Set(cases.map(([o, c]) => buildRow(o, c).state));
+    const every: RowState[] = [
+      "back",
+      "back-later-closed",
+      "missing",
+      "unknown",
+      "needs-account",
+      "finished",
+      "closed-since",
+      "waiting-page",
+      "waiting-drain",
+    ];
+    expect([...covered].sort()).toEqual([...every].sort());
+  });
+
+  it("a lost miss on an unopened page says no restore will bring it back", () => {
+    const row = buildRow(lost("l", { pageId: "p2" }), ctx());
+    expect(row.state).toBe("missing");
+    expect(row.detail).toBe("no restore in this runner will bring it back");
+    expect(row.selectable).toBe(true);
+  });
+
+  it("a session that came back and later closed names when and why — tickable, never pre-checked", () => {
+    const at = 1_700_000_090_000;
+    const row = buildRow(backLaterClosed("lc", { atMs: at }), ctx());
+    expect(row.state).toBe("back-later-closed");
+    expect(row.label).toBe(`came back · later closed ${clockTime(at)} (explicit)`);
+    expect(row.detail).toBe("it came back after the restart, then was closed on purpose");
+    expect(row.selectable).toBe(true);
+    const pty = buildRow(backLaterClosed("p", { reason: "pty-exit", deliberate: null }), ctx());
+    expect(pty.detail).toBe(
+      "it came back after the restart, then its row closed (pty-exit); that reason does not say whether on purpose",
+    );
+    expect([...preCheckedIds([row, pty])]).toEqual([]);
+    // A back row that is still open has nothing to resume.
+    expect(buildRow(back("b"), ctx()).blockedReason).toBe("nothing to resume: back");
+  });
+
+  it("pre-checks the same rows: missing and known-resumable — never unknown, waiting, closed-since or later-closed", () => {
+    const gen = generation("g", {
+      returned: [back("b"), backLaterClosed("lc")],
+      missing: [
+        outcome("missed"),
+        lost("lost", { pageId: "p2" }),
+        owed("unknown", null, { pageId: "p2" }),
+        owed("waiting", true, { pageId: "p2" }),
+      ],
+      closedSince: [closedSince("closed")],
+      finished: [finished("f")],
+    });
+    const rows = buildRows(gen, ctx());
+    expect([...preCheckedIds(rows)].sort()).toEqual(["lost", "missed"]);
+    expect(rows.filter((r) => r.selectable).map((r) => r.outcome.claudeSessionId)).toEqual([
+      "lost",
+      "missed",
+      "unknown",
+      "lc",
+      "closed",
+    ]);
+  });
+
+  it("the strip counts 0, 1 and many owed rows as waiting and lost rows as didn't come back", () => {
+    const strip = (missing: LedgerOutcome[]) =>
+      stripModel(report([generation("g", { returned: [back("a")], missing })]), ctx());
+    // 0 owed, 0 lost: all back.
+    expect(strip([])?.text).toBe("The session from before the restart came back");
+    // 1 owed (waiting), 0 lost.
+    expect(strip([owed("w", true, { pageId: "p2" })])?.text).toBe(
+      "1 of 2 sessions from before the restart came back · 1 waiting on a page not opened yet",
+    );
+    // 0 owed, 1 lost on the SAME unopened page: never waiting.
+    expect(strip([lost("l", { pageId: "p2" })])?.text).toBe(
+      "1 of 2 sessions from before the restart came back · 1 didn't come back",
+    );
+    // many of each.
+    expect(
+      strip([
+        owed("w1", true, { pageId: "p2" }),
+        owed("w2", true, { pageId: "p2" }),
+        lost("l1", { pageId: "p2" }),
+        lost("l2"),
+        lost("l3"),
+      ]),
+    ).toMatchObject({
+      kind: "some-missing",
+      back: 1,
+      total: 6,
+      missing: 3,
+      waiting: 2,
+      upperBound: false,
+      text: "1 of 6 sessions from before the restart came back · 3 didn't come back · 2 waiting on pages not opened yet",
+    });
+  });
+
+  it("closed-since rows are neither waiting nor missing; finished ones neither", () => {
+    const r = report([
+      generation("g", {
+        returned: [back("a")],
+        closedSince: [closedSince("c1"), closedSince("c2")],
+        finished: [finished("f")],
+      }),
+    ]);
+    expect(stripModel(r, ctx())).toMatchObject({
+      kind: "all-back",
+      total: 1,
+      text: "The session from before the restart came back",
+    });
+  });
+
+  it("adds `· C later closed` to either form", () => {
+    const all = report([
+      generation("g", { returned: [back("a"), backLaterClosed("b"), backLaterClosed("c")] }),
+    ]);
+    expect(stripModel(all, ctx())).toMatchObject({
+      kind: "all-back",
+      laterClosed: 2,
+      text: "All 3 sessions from before the restart came back · 2 later closed",
+    });
+    const some = report([
+      generation("g", { returned: [back("a"), backLaterClosed("b")], missing: [lost("l")] }),
+    ]);
+    expect(stripModel(some, ctx())?.text).toBe(
+      "2 of 3 sessions from before the restart came back · 1 later closed · 1 didn't come back",
+    );
+    const one = report([generation("g", { returned: [backLaterClosed("b")] })]);
+    expect(stripModel(one, ctx())?.text).toBe(
+      "The session from before the restart came back · 1 later closed",
+    );
+  });
+
+  it("an unknown restoreOwed is never waiting and makes K an upper bound", () => {
+    const r = report([
+      generation("g", {
+        returned: [back("a")],
+        missing: [owed("u", null, { pageId: "p2" }), lost("l")],
+      }),
+    ]);
+    expect(stripModel(r, ctx())).toMatchObject({
+      kind: "some-missing",
+      missing: 2,
+      waiting: 0,
+      upperBound: true,
+      text: "1 of 3 sessions from before the restart came back · up to 2 didn't come back",
+    });
+    // Unknown on a page that already restored is still a miss whose fate was not read.
+    const settled = report([
+      generation("g", { returned: [back("a")], missing: [owed("u", null)] }),
+    ]);
+    expect(stripModel(settled, ctx())?.text).toBe(
+      "1 of 2 sessions from before the restart came back · up to 1 didn't come back",
+    );
+    expect(buildRow(owed("u", null), ctx()).detail).toBe(
+      "it was resumable and nothing brought it back; whether this runner's restore still owes it could not be read",
+    );
+  });
+
+  it("a record-gone miss is an upper bound too", () => {
+    const r = report([
+      generation("g", { returned: [back("a")], missing: [lost("g", { reason: "record-gone" })] }),
+    ]);
+    expect(stripModel(r, ctx())?.text).toBe(
+      "1 of 2 sessions from before the restart came back · up to 1 didn't come back",
+    );
+  });
+
+  it("the deferred form with 0 owed rows falls through to the ordinary forms", () => {
+    // p1 restored; p2 is deferred by the drain and holds only a lost session.
+    const r = report([
+      generation("g", { returned: [back("a")], missing: [lost("l", { pageId: "p2" })] }),
+    ]);
+    expect(stripModel(r, ctx({ complete: ["p1"], deferred: ["p2"] }))).toMatchObject({
+      kind: "some-missing",
+      missing: 1,
+      waiting: 0,
+      text: "1 of 2 sessions from before the restart came back · 1 didn't come back",
+    });
+    // ...and to nothing while no page has restored yet.
+    expect(stripModel(r, ctx({ complete: [], deferred: ["p1", "p2"] }))).toBeNull();
+    // The threshold: one owed row on the deferred page brings the deferred form back.
+    const withOwed = report([
+      generation("g", {
+        returned: [back("a")],
+        missing: [lost("l", { pageId: "p2" }), owed("w", true, { pageId: "p2" })],
+      }),
+    ]);
+    expect(stripModel(withOwed, ctx({ complete: ["p1"], deferred: ["p2"] }))).toMatchObject({
+      kind: "deferred",
+      waiting: 1,
+      text: "Restore deferred by drain — 1 session waiting",
+    });
+  });
+
+  it("the panel summary counts came back, later closed, not back, waiting, closed since and finished", () => {
+    const gen = generation("g", {
+      returned: [back("b1"), back("b2"), backLaterClosed("lc")],
+      missing: [outcome("m"), lost("l", { pageId: "p2" }), owed("w", true, { pageId: "p2" })],
+      closedSince: [closedSince("c")],
+      finished: [finished("f")],
+    });
+    expect(rowSummary(buildRows(gen, ctx()))).toBe(
+      "3 came back (1 later closed) · 2 did not come back · 1 waiting · 1 closed since the restart · 1 finished",
+    );
+    const unknown = generation("g", {
+      returned: [back("b")],
+      missing: [owed("u", null, { pageId: "p2" })],
+    });
+    expect(rowSummary(buildRows(unknown, ctx()))).toBe(
+      "1 came back · up to 1 did not come back · 0 finished",
+    );
   });
 });
 
