@@ -1987,11 +1987,18 @@ async fn handle_element_action(
     // users-path-and-the-passage-of-time, D3): open a pending edge for the app
     // acted on. Only the action NAME and the element id are read — never the
     // body's `params`, which carries typed text.
-    // The IPC fallback acted on the runner's own webview (its main window),
-    // so the relay tab scope does not apply there.
+    // The IPC fallback acted on the runner's own webview, in the window the
+    // body's `windowLabel` names (the payload builder routes it there), so the
+    // scope is that window, as the control route keys it; the relay tab scope
+    // does not apply there.
     let (journey_app, app_version, scope) = match (acted_via_ipc, active_app) {
         (false, Some((app_id, version))) => (app_id, version, tab_id),
-        _ => (
+        (true, _) => (
+            crate::spec_api::storage::RUNNER_APP_ID.to_string(),
+            None,
+            crate::mcp::ui_bridge::action_wire::sdk_fallback_window(&body),
+        ),
+        (false, None) => (
             crate::spec_api::storage::RUNNER_APP_ID.to_string(),
             None,
             None,
@@ -10576,6 +10583,17 @@ mod sdk_element_fallback_source_guard {
         assert!(src.contains("action_wire::sdk_fallback_payload("), "{src}");
         assert!(
             src.contains("ui_bridge_request_sync(&state, \"execute_action\", payload)"),
+            "{src}"
+        );
+    }
+
+    /// The fallback acts in the window the body's `windowLabel` names, so the
+    /// journey ledger must key its scope by that window, not the main one.
+    #[test]
+    fn the_fallback_journey_scope_is_the_window_it_acted_in() {
+        let src = handler_source();
+        assert!(
+            src.contains("action_wire::sdk_fallback_window(&body)"),
             "{src}"
         );
     }

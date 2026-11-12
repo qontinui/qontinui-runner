@@ -1284,6 +1284,17 @@ async fn execute_action_dispatch(
         }
     };
 
+    // ── Action-name gate ────────────────────────────────────────────────
+    // A request that names no action is refused here, before the element
+    // probes, the expectChange pre-snapshot or any IPC, so the refusal's
+    // "Nothing was dispatched" holds. Same rule as every other hop
+    // (`action_wire::require_action_name`); it used to be dispatched.
+    if let Err(missing) = super::action_wire::require_action_name(&serde_json::json!({
+        "action": &request.action
+    })) {
+        return Err((StatusCode::BAD_REQUEST, Json(missing.error_response())));
+    }
+
     // Target pop-out window (`?windowLabel=term-1`); scopes the action AND its
     // detector/validation queries below so the element id resolves in the right
     // window's registry. Owned so it survives the awaits without borrowing query.
@@ -1556,6 +1567,8 @@ async fn execute_action_dispatch(
     let merged_params = split.params;
     let payload = match super::action_wire::element_action_payload(&id, split.envelope) {
         Ok(payload) => payload,
+        // Unreachable past the action-name gate at the top; refuse rather
+        // than guess.
         Err(missing) => return Err((StatusCode::BAD_REQUEST, Json(missing.error_response()))),
     };
 

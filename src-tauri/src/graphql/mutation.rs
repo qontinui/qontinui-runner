@@ -47,9 +47,7 @@ impl MutationRoot {
         ) {
             Ok(payload) => payload,
             // A request with no action name is refused, never clicked.
-            Err(missing) => {
-                return Ok(action_result_for(Ok(missing.response()), "0".to_string()));
-            }
+            Err(missing) => return Ok(action_missing_result(&missing)),
         };
         bridge_mutation(state, "execute_action", payload).await
     }
@@ -643,6 +641,31 @@ fn action_result_for(
     }
 }
 
+/// The [`ActionResult`] for a mutation that names no action: a caller error
+/// (`MISSING_PARAM` on the `action` field), settled before anything is
+/// dispatched. Routed through [`action_result_for`] it would be classified from
+/// its prose and land as `INTERNAL_ERROR`, which reads as a runner fault.
+fn action_missing_result(missing: &ui_bridge::action_wire::ActionMissing) -> ActionResult {
+    let message = missing.message();
+    ActionResult {
+        success: false,
+        data: Some(Json(missing.response())),
+        error: Some(error_detail_from(
+            ui_bridge::UiBridgeError {
+                code: ui_bridge::types::UiBridgeErrorCode::MissingParam,
+                message: message.clone(),
+                recovery: Some(ui_bridge::RecoveryHint::Unrecoverable),
+                context: Some(serde_json::json!({
+                    "field": "action",
+                    "code": ui_bridge::action_wire::ACTION_MISSING_CODE,
+                })),
+            },
+            message,
+        )),
+        duration_ms: "0".to_string(),
+    }
+}
+
 /// Convert GraphQL finding status enum to domain enum.
 fn gql_status_to_domain(status: GqlFindingStatus) -> crate::findings::types::FindingStatus {
     use crate::findings::types::FindingStatus;
@@ -692,6 +715,31 @@ mod tests {
 
     fn run(result: std::result::Result<serde_json::Value, String>) -> ActionResult {
         action_result_for(result, "0".into())
+    }
+
+    /// A mutation that names no action is a caller error, not a runner fault:
+    /// `MISSING_PARAM` on the `action` field, never `INTERNAL_ERROR`.
+    #[test]
+    fn a_nameless_action_is_a_missing_param_not_an_internal_error() {
+        let missing = ui_bridge::action_wire::element_action_payload("e1", json!({"action": ""}))
+            .expect_err("an empty action name is refused");
+        let out = action_missing_result(&missing);
+        assert!(!out.success);
+        let detail = out.error.expect("a refusal carries an error");
+        assert_eq!(detail.code, UiBridgeErrorCode::MissingParam);
+        assert!(
+            detail.message.starts_with("action_missing: "),
+            "{}",
+            detail.message
+        );
+        assert_eq!(
+            detail.context.map(|j| j.0),
+            Some(json!({"field": "action", "code": "action_missing"}))
+        );
+        assert_eq!(
+            out.data.map(|j| j.0["code"].clone()),
+            Some(json!("action_missing"))
+        );
     }
 
     /// A frontend refusal arrives as `Ok({success:false, error, code})`, not

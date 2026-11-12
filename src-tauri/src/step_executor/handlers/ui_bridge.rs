@@ -577,6 +577,41 @@ fn component_action_endpoint(
     }
 }
 
+/// Whether an action route's response reports success: a 2xx status, no
+/// top-level `success: false` (the SDK routes answer a refused action with
+/// HTTP 200), and no nested `data.success: false` (the control route wraps the
+/// app's own reply in `ApiResponse::success(value)`). Shared by the
+/// `component_action` and `element_action` steps.
+fn action_response_succeeded(status: reqwest::StatusCode, body: &serde_json::Value) -> bool {
+    let refused = |v: &serde_json::Value| v.get("success").and_then(|s| s.as_bool()) == Some(false);
+    status.is_success() && !refused(body) && !body.get("data").is_some_and(refused)
+}
+
+/// The step result for an `element_action` response, with the same refusal
+/// shapes as [`component_action_result`]: the `sdk` target's route answers a
+/// failed action with HTTP 200 and `success: false` in the body, so a
+/// status-only check passed the step.
+fn element_action_result(
+    action_name: &str,
+    element_id: &str,
+    status: reqwest::StatusCode,
+    body: serde_json::Value,
+) -> StepHandlerResult {
+    if action_response_succeeded(status, &body) {
+        StepHandlerResult::success_with_data(serde_json::json!({
+            "action": "element_action",
+            "elementAction": action_name,
+            "elementId": element_id,
+            "result": body,
+        }))
+    } else {
+        StepHandlerResult::failure(format!(
+            "Action {} failed on element '{}': {} - {}",
+            action_name, element_id, status, body
+        ))
+    }
+}
+
 /// The step result for a component-action response. Fails on a non-2xx
 /// status, on a top-level `success: false` (the SDK route answers a refused
 /// action with HTTP 200), and on a nested `data.success: false` (the control
@@ -587,9 +622,7 @@ fn component_action_result(
     status: reqwest::StatusCode,
     body: serde_json::Value,
 ) -> StepHandlerResult {
-    let refused = |v: &serde_json::Value| v.get("success").and_then(|s| s.as_bool()) == Some(false);
-    let nested_refused = body.get("data").is_some_and(refused);
-    if status.is_success() && !refused(&body) && !nested_refused {
+    if action_response_succeeded(status, &body) {
         StepHandlerResult::success_with_data(serde_json::json!({
             "action": "component_action",
             "componentId": target.component_id,
@@ -1551,10 +1584,6 @@ impl UiBridgeHandler {
 
     /// Execute an "element_action" — find element by criteria and perform an action.
     /// Target JSON: { "action": "click"|"type", "criteria": {...}, "params": {...} }
-    #[expect(
-        clippy::string_slice,
-        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
-    )]
     async fn execute_element_action(
         &self,
         step: &ExecutionStepConfig,
@@ -1589,21 +1618,15 @@ impl UiBridgeHandler {
             .cloned()
             .unwrap_or_default();
 
-        // Fetch snapshot to find element ID matching criteria
-        let snapshot_target = step
-            .ui_bridge_snapshot_target
-            .as_deref()
-            .unwrap_or("control");
-        let snapshot_endpoint = match snapshot_target {
-            "sdk" => format!("{}/sdk/snapshot", base_url.trim_end_matches('/')),
-            "control" => format!("{}/control/snapshot", base_url.trim_end_matches('/')),
-            t if t.starts_with("proxy:") => {
-                let port = &t["proxy:".len()..];
-                format!("http://127.0.0.1:{}/__ui-bridge/control/snapshot", port)
-            }
-            other => {
-                return StepHandlerResult::failure(format!("Unknown snapshot target: '{}'", other));
-            }
+        // Fetch snapshot to find element ID matching criteria. The same target
+        // resolution the action POST below uses, so a `proxy:PORT` target's
+        // port is parsed, never spliced into the URL raw.
+        let snapshot_endpoint = match crate::mcp::ui_bridge::action_wire::snapshot_target_root(
+            base_url,
+            step.ui_bridge_snapshot_target.as_deref(),
+        ) {
+            Ok(root) => format!("{root}/snapshot"),
+            Err(e) => return StepHandlerResult::failure(e),
         };
 
         let client = match reqwest::Client::builder()
@@ -1716,19 +1739,7 @@ impl UiBridgeHandler {
                 let status = resp.status();
                 let resp_body: serde_json::Value =
                     resp.json().await.unwrap_or(serde_json::json!({}));
-                if status.is_success() {
-                    StepHandlerResult::success_with_data(serde_json::json!({
-                        "action": "element_action",
-                        "elementAction": action_name,
-                        "elementId": element_id,
-                        "result": resp_body,
-                    }))
-                } else {
-                    StepHandlerResult::failure(format!(
-                        "Action {} failed on element '{}': {} - {}",
-                        action_name, element_id, status, resp_body
-                    ))
-                }
+                element_action_result(action_name, element_id, status, resp_body)
             }
             Err(e) => StepHandlerResult::failure(format!(
                 "Failed to execute action {}: {}",
@@ -2830,6 +2841,48 @@ mod element_action_step_wire_tests {
         }
     }
 
+    /// The `sdk` target's route answers a failed action with HTTP 200 and
+    /// `success: false` in the body; the control route nests the app's reply
+    /// under `data`. Every refusal shape must fail the step.
+    #[test]
+    fn element_action_result_fails_on_every_refusal_shape() {
+        use reqwest::StatusCode;
+        let ok = super::element_action_result(
+            "click",
+            "e1",
+            StatusCode::OK,
+            json!({"success": true, "data": {"success": true}}),
+        );
+        assert!(ok.success, "{:?}", ok.error);
+        assert_eq!(ok.output_data.unwrap()["elementId"], "e1");
+        for (status, body, why) in [
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"success": true}),
+                "non-2xx",
+            ),
+            (
+                StatusCode::OK,
+                json!({"success": false, "error": "element not found"}),
+                "top-level success:false (the sdk route)",
+            ),
+            (
+                StatusCode::OK,
+                json!({"success": true, "data": {"success": false, "error": "refused"}}),
+                "nested data.success:false",
+            ),
+        ] {
+            let r = super::element_action_result("click", "e1", status, body);
+            assert!(!r.success, "{why} must fail the step");
+            assert!(
+                r.error
+                    .unwrap()
+                    .starts_with("Action click failed on element 'e1'"),
+                "{why}"
+            );
+        }
+    }
+
     #[test]
     fn the_step_posts_to_the_snapshot_targets_singular_route() {
         assert_eq!(
@@ -2870,6 +2923,14 @@ mod element_action_step_source_guard {
             "{src}"
         );
         assert!(src.contains(".post(&action_endpoint).json(&body)"), "{src}");
+        // The response is judged by the shared refusal check, not by status
+        // alone, and the snapshot GET resolves its target like the POST.
+        assert!(
+            src.contains("element_action_result(action_name, element_id, status, resp_body)"),
+            "{src}"
+        );
+        assert!(src.contains("action_wire::snapshot_target_root("), "{src}");
+        assert!(!src.contains("t[\"proxy:\".len()..]"), "{src}");
     }
 
     #[test]

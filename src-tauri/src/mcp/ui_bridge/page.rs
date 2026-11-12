@@ -5106,13 +5106,16 @@ mod navigate_and_wait_window_guard {
                 .collect();
             assert!(!sites.is_empty(), "{request_type} request not found");
             for at in sites {
-                // Char-safe: `get` answers None instead of panicking on a
-                // multibyte boundary.
-                let call = handler
-                    .get(at..)
-                    .and_then(|rest| rest.get(..rest.len().min(400)))
-                    .or_else(|| handler.get(at..))
-                    .expect("slice at a char boundary");
+                // The 400 bytes after the call site, backed off to the nearest
+                // char boundary (`truncate_str`) rather than widened to the
+                // rest of the handler, which would let a later call satisfy
+                // this one's assertions.
+                let call = crate::str_utils::truncate_str(
+                    handler
+                        .get(at..)
+                        .expect("`match_indices` returns a char boundary"),
+                    400,
+                );
                 assert!(
                     call.contains("navigate_and_wait_window_payload("),
                     "{request_type} is not window-targeted: {call}"
