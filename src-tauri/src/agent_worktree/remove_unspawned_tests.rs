@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 use super::*;
 
 fn git(dir: &Path, args: &[&str]) -> String {
-    let out = std::process::Command::new("git")
-        .arg("-C")
+    let mut cmd = crate::process_helpers::no_window("git");
+    cmd.arg("-C")
         .arg(dir)
         .args([
             "-c",
@@ -22,8 +22,8 @@ fn git(dir: &Path, args: &[&str]) -> String {
             "-c",
             "commit.gpgsign=false",
         ])
-        .args(args)
-        .output()
+        .args(args);
+    let out = crate::process_helpers::output_with_timeout(cmd, std::time::Duration::from_secs(60))
         .expect("git runs");
     assert!(out.status.success(), "git {args:?} failed: {out:?}");
     String::from_utf8_lossy(&out.stdout).trim().to_string()
