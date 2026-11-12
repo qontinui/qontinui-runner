@@ -61,12 +61,15 @@
 //! |---|---|---|
 //! | every test passed (`main` returns) | `atexit`: `pg_ctl stop -m immediate`, then the root is removed | the same |
 //! | a test failed (libtest calls `process::exit`) | the same `atexit` | `process::exit` is `ExitProcess`, and whether the C runtime runs `atexit` handlers then is not established here (the failing-child self-test logs which happened): either way the postmaster dies — stopped by `atexit` if it runs, killed by the kill-on-close job if not — and a root `atexit` did not remove waits for the next sweep |
-//! | killed or crashed | the postmaster is orphaned; the next boot's sweep kills it and removes the root | the job kills the postmaster; the next sweep removes the root |
+//! | killed or crashed | the postmaster is orphaned; the next boot's sweep stops it (`pg_ctl stop -m immediate`, so it frees its shared memory; a kill only if that fails) and removes the root | the job kills the postmaster; the next sweep removes the root |
 //! | any of these, on an external server ([`EXTERNAL_URL_ENV`]) | `atexit`, where it runs, drops this process's `qtpl_<nonce>*` and `qtest_<nonce>_*` databases; a killed or crashed process leaves them, and a later boot only reports them | the same, and a failed test process leaves them too if `atexit` did not run |
 //!
 //! The sweep runs at every boot: a `run-*` root whose recorded owner pid is gone
-//! has its postmaster killed — after checking that the pid really is that
-//! root's postmaster — and is removed. A pid is judged only in the PID
+//! has its postmaster stopped — after checking that the pid really is that
+//! root's postmaster — and is removed. The stop is `pg_ctl stop -m immediate`,
+//! which lets the postmaster remove its System V and dynamic shared memory
+//! segments as it exits; a postmaster that does not stop is killed, which
+//! leaves them behind. A pid is judged only in the PID
 //! namespace that recorded it: a root whose owner recorded another one (a
 //! container sharing the target directory, a second WSL distro) is presumed
 //! live until its record is [`FOREIGN_OWNER_GRACE`] old, because its pid names
@@ -204,10 +207,15 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(300);
 /// boot failure. The port comes from binding port 0 and releasing it, so another
 /// process can take it in between.
 const START_ATTEMPTS: usize = 3;
-/// How long the exit-time `pg_ctl stop -m immediate` waits for the server.
+/// How long a `pg_ctl stop -m immediate` ([`stop_immediately`]) waits for the
+/// server: at exit, on this process's cluster, and in the sweep, on a dead
+/// root's.
 const STOP_TIMEOUT_SECS: &str = "30";
 /// The hard bound on that `pg_ctl stop` itself: its own `--timeout` plus margin.
 const STOP_WAIT: Duration = Duration::from_secs(45);
+/// How long a postmaster may take to be gone once `pg_ctl` reported it stopped,
+/// or once it was killed.
+const POSTMASTER_EXIT_WAIT: Duration = Duration::from_secs(10);
 /// A `run-*` root with no readable owner record is left alone this long: it may
 /// be a live process's root, caught between its `mkdir` and its record's write.
 const OWNERLESS_GRACE: Duration = Duration::from_secs(600);
@@ -1984,13 +1992,21 @@ fn modified_before(path: &Path, age: Duration) -> bool {
         .is_some_and(|elapsed| elapsed > age)
 }
 
-/// Kill the postmaster still running in `root/pg-data`, if there is one: the pid
+/// End the postmaster still running in `root/pg-data`, if there is one: the pid
 /// its `postmaster.pid` names, and `recorded` (the owner record's). A pid is
-/// killed only once [`is_postmaster_of`] confirms it is that data directory's
+/// acted on only once [`is_postmaster_of`] confirms it is that data directory's
 /// postmaster, so a recycled pid is never touched.
+///
+/// It is stopped first ([`stop_postmaster`]): an immediate stop lets the
+/// postmaster run its own exit cleanup, which removes its System V interlock
+/// segment and its dynamic shared memory control segment. A kill skips that,
+/// and with the data directory removed straight after, no later start could
+/// reclaim them. Only a postmaster the stop did not end is killed, once it is
+/// proven again to be this directory's.
 fn reap_postmaster(root: &Path, recorded: Option<u32>) -> String {
     let data_dir = root.join(DATA_DIR);
-    let mut candidates: Vec<u32> = read_postmaster_pid(&data_dir).into_iter().collect();
+    let named = read_postmaster_pid(&data_dir);
+    let mut candidates: Vec<u32> = named.into_iter().collect();
     if let Some(pid) = recorded {
         if !candidates.contains(&pid) {
             candidates.push(pid);
@@ -2007,10 +2023,31 @@ fn reap_postmaster(root: &Path, recorded: Option<u32>) -> String {
             ));
             continue;
         }
-        notes.push(if kill_and_wait(pid) {
-            format!("killed its postmaster {pid}")
+        // `pg_ctl` signals whichever pid `postmaster.pid` names, so it is used
+        // only when that is the pid just proven to be this directory's.
+        let not_stopped = if named == Some(pid) {
+            match stop_postmaster(pid, &data_dir) {
+                Ok(()) => {
+                    notes.push(format!(
+                        "stopped its postmaster {pid} (pg_ctl stop -m immediate)"
+                    ));
+                    continue;
+                }
+                Err(e) => e,
+            }
         } else {
-            format!("its postmaster {pid} would not die")
+            "postmaster.pid does not name it, so pg_ctl cannot stop it".to_string()
+        };
+        // While the stop ran, the postmaster may have exited and its pid been
+        // taken by another process.
+        if !(crate::runner_breadcrumb::pid_is_live(pid) && is_postmaster_of(pid, &data_dir)) {
+            notes.push(format!("its postmaster {pid} exited ({not_stopped})"));
+            continue;
+        }
+        notes.push(if kill_and_wait(pid) {
+            format!("killed its postmaster {pid} ({not_stopped})")
+        } else {
+            format!("its postmaster {pid} would not die ({not_stopped})")
         });
     }
     if notes.is_empty() {
@@ -2056,8 +2093,81 @@ fn same_dir(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// Stop the postmaster `pid` of `data_dir` with `pg_ctl stop -m immediate`
+/// ([`stop_immediately`]), run from the install the postmaster itself runs
+/// from. `Ok` once the pid is gone.
+fn stop_postmaster(pid: u32, data_dir: &Path) -> Result<(), String> {
+    let pg_ctl = executable_of(pid)
+        .and_then(|exe| {
+            exe.parent()
+                .map(|bin| bin.join(format!("pg_ctl{}", std::env::consts::EXE_SUFFIX)))
+        })
+        .filter(|pg_ctl| pg_ctl.is_file())
+        .ok_or_else(|| "no pg_ctl beside its executable".to_string())?;
+    stop_immediately(&pg_ctl, data_dir)?;
+    if wait_for(
+        || !crate::runner_breadcrumb::pid_is_live(pid),
+        POSTMASTER_EXIT_WAIT,
+    ) {
+        Ok(())
+    } else {
+        Err("pg_ctl stop reported it stopped, but it is still running".to_string())
+    }
+}
+
+/// The executable `pid` runs, where this process can read it.
+fn executable_of(pid: u32) -> Option<PathBuf> {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+    let pid = Pid::from_u32(pid);
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        true,
+        ProcessRefreshKind::new().with_exe(UpdateKind::Always),
+    );
+    system.process(pid)?.exe().map(Path::to_path_buf)
+}
+
+/// `pg_ctl stop -m immediate` on `data_dir`. Bounded twice: `pg_ctl --timeout`
+/// gives up on a server that will not stop, and the wrapper kills a `pg_ctl`
+/// that will not return. `Ok` when `pg_ctl` reports the server stopped. The
+/// exit-time teardown stops this process's own cluster with it, and the sweep a
+/// dead root's ([`stop_postmaster`]).
+fn stop_immediately(pg_ctl: &Path, data_dir: &Path) -> Result<(), String> {
+    let mut command = crate::process_helpers::no_window(pg_ctl);
+    command
+        .arg("stop")
+        .arg("--pgdata")
+        .arg(data_dir)
+        .args([
+            "--mode",
+            "immediate",
+            "--wait",
+            "--timeout",
+            STOP_TIMEOUT_SECS,
+        ])
+        .arg("--silent")
+        .stdin(std::process::Stdio::null());
+    match crate::process_helpers::run_with_timeout(command, STOP_WAIT) {
+        Ok(crate::process_helpers::TimedOutput::Completed(output)) if output.status.success() => {
+            Ok(())
+        }
+        Ok(crate::process_helpers::TimedOutput::Completed(output)) => Err(format!(
+            "pg_ctl stop exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )),
+        Ok(crate::process_helpers::TimedOutput::TimedOut { pid, .. }) => Err(format!(
+            "pg_ctl stop (pid {pid}) overran {} s and was killed",
+            STOP_WAIT.as_secs()
+        )),
+        Err(e) => Err(format!("pg_ctl stop could not run: {e}")),
+    }
+}
+
 /// Kill `pid` outright and wait for it to go. Only ever applied to a postmaster
-/// whose data directory is being thrown away; its workers exit when it does.
+/// whose data directory is being thrown away, and that a stop could not end;
+/// its workers exit when it does.
 fn kill_and_wait(pid: u32) -> bool {
     use sysinfo::{Pid, ProcessesToUpdate, System};
     let target = Pid::from_u32(pid);
@@ -2068,7 +2178,7 @@ fn kill_and_wait(pid: u32) -> bool {
     }
     wait_for(
         || !crate::runner_breadcrumb::pid_is_live(pid),
-        Duration::from_secs(10),
+        POSTMASTER_EXIT_WAIT,
     )
 }
 
@@ -2348,38 +2458,9 @@ impl Teardown {
 impl ClusterTeardown {
     fn run(&self) -> String {
         let stopped = if self.data_dir.join(POSTMASTER_PID).exists() {
-            let mut command = crate::process_helpers::no_window(&self.pg_ctl);
-            command
-                .arg("stop")
-                .arg("--pgdata")
-                .arg(&self.data_dir)
-                .args([
-                    "--mode",
-                    "immediate",
-                    "--wait",
-                    "--timeout",
-                    STOP_TIMEOUT_SECS,
-                ])
-                .arg("--silent")
-                .stdin(std::process::Stdio::null());
-            // Bounded twice: `pg_ctl --timeout` gives up on a server that will
-            // not stop, and the wrapper kills a `pg_ctl` that will not return.
-            match crate::process_helpers::run_with_timeout(command, STOP_WAIT) {
-                Ok(crate::process_helpers::TimedOutput::Completed(output))
-                    if output.status.success() =>
-                {
-                    "cluster stopped".to_string()
-                }
-                Ok(crate::process_helpers::TimedOutput::Completed(output)) => format!(
-                    "pg_ctl stop exited with {}: {}",
-                    output.status,
-                    String::from_utf8_lossy(&output.stderr).trim()
-                ),
-                Ok(crate::process_helpers::TimedOutput::TimedOut { pid, .. }) => format!(
-                    "pg_ctl stop (pid {pid}) overran {} s and was killed",
-                    STOP_WAIT.as_secs()
-                ),
-                Err(e) => format!("pg_ctl stop could not run: {e}"),
+            match stop_immediately(&self.pg_ctl, &self.data_dir) {
+                Ok(()) => "cluster stopped".to_string(),
+                Err(e) => e,
             }
         } else {
             "no cluster was running".to_string()
@@ -2735,6 +2816,9 @@ mod tests {
     /// - `pass`: boot, report where the cluster is, and pass.
     /// - `fail`: the same, then fail, so libtest exits through
     ///   `std::process::exit` (on Windows, `ExitProcess`).
+    /// - `hang`: boot, report, and wait to be killed — failing if it is not
+    ///   within [`CHILD_TIMEOUT`]. Its report is renamed into place, so a parent
+    ///   polling for it never reads half of one.
     /// - `boot-failure`: ask for a database from a harness that cannot boot.
     #[test]
     fn child_helper() {
@@ -2754,6 +2838,19 @@ mod tests {
                          exits through process::exit"
                     );
                 }
+            }
+            "hang" => {
+                let _database = fresh_database_blocking();
+                let facts = embedded_facts().expect("the child runs on the bundled cluster");
+                let report = PathBuf::from(std::env::var(CHILD_REPORT_ENV).expect("report path"));
+                let partial = report.with_extension("partial");
+                std::fs::write(&partial, render_facts(&facts)).expect("write the child report");
+                std::fs::rename(&partial, &report).expect("move the child report into place");
+                std::thread::sleep(CHILD_TIMEOUT);
+                panic!(
+                    "child_helper: the hang child was not killed within {} s",
+                    CHILD_TIMEOUT.as_secs()
+                );
             }
             "boot-failure" => {
                 let database = fresh_database_blocking();
@@ -2911,6 +3008,155 @@ mod tests {
             facts.root.display(),
             run.output
         );
+    }
+
+    /// A test process that is KILLED runs no exit-time teardown, so its
+    /// postmaster outlives it, and the next boot's sweep must STOP that
+    /// postmaster (`pg_ctl stop -m immediate`), not kill it: a stopped
+    /// postmaster removes its System V shared memory segment as it exits, and a
+    /// killed one leaves the segment behind for good once the sweep has removed
+    /// its data directory. On Linux the segment itself is checked, in
+    /// `/proc/sysvipc/shm`: listed while the child runs, gone after the sweep.
+    ///
+    /// The child boots in the shared harness directory, where another boot
+    /// running this same code — another test's child — may sweep the root
+    /// first. So the end state is asserted, and this sweep's own line only when
+    /// it is the one that took the root: it must not say the postmaster was
+    /// killed.
+    #[cfg(unix)]
+    #[test]
+    fn a_killed_test_process_has_its_postmaster_stopped_by_the_next_sweep() {
+        /// Kills the hang child if the test ends before it is killed on purpose.
+        struct Hanging(std::process::Child);
+        impl Drop for Hanging {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let report = scratch.path().join("child-report");
+        let output_path = scratch.path().join("child-output");
+        let output_file = std::fs::File::create(&output_path).expect("the child's output file");
+        let exe = std::env::current_exe().expect("this test binary's path");
+        let mut command = crate::process_helpers::no_window(&exe);
+        command
+            .arg(child_test_name())
+            .args(["--exact", "--test-threads=1"])
+            .env(CHILD_MODE_ENV, "hang")
+            .env(CHILD_REPORT_ENV, &report)
+            .env_remove(EXTERNAL_URL_ENV)
+            .stdin(std::process::Stdio::null())
+            .stdout(output_file.try_clone().expect("share the output file"))
+            .stderr(output_file);
+        let mut child = Hanging(command.spawn().expect("spawn the hang child"));
+        let output = || {
+            format!(
+                "--- child output ---\n{}",
+                std::fs::read_to_string(&output_path).unwrap_or_default()
+            )
+        };
+        wait_for(
+            || report.is_file() || !matches!(child.0.try_wait(), Ok(None)),
+            CHILD_TIMEOUT,
+        );
+        let text = std::fs::read_to_string(&report)
+            .unwrap_or_else(|e| panic!("the hang child wrote no report ({e}):\n{}", output()));
+        let facts = parse_facts(&text)
+            .unwrap_or_else(|| panic!("the child's report is malformed: {text:?}\n{}", output()));
+        #[cfg(target_os = "linux")]
+        let segment = {
+            let segment = sysv_segment_of(&facts.data_dir).unwrap_or_else(|| {
+                panic!(
+                    "{} names no System V segment, so nothing can show the stop freed it",
+                    facts.data_dir.join(POSTMASTER_PID).display()
+                )
+            });
+            assert!(
+                sysv_segment_listed(segment),
+                "the running postmaster's segment {segment:?} is not in /proc/sysvipc/shm, so \
+                 its absence after the sweep would prove nothing"
+            );
+            segment
+        };
+
+        child.0.kill().expect("kill the hang child");
+        child.0.wait().expect("reap the hang child");
+        assert!(
+            postmaster_alive(&facts),
+            "postmaster {} died with the killed child, so the sweep has nothing to stop and \
+             this test proves nothing:\n{}",
+            facts.postmaster_pid,
+            output()
+        );
+
+        let dir = facts
+            .root
+            .parent()
+            .expect("a root lives in the harness directory");
+        let swept = sweep_dead_roots(dir);
+        let root = facts.root.display().to_string();
+        assert!(
+            wait_for(|| !postmaster_alive(&facts), DEATH_WAIT),
+            "postmaster {} of the killed child is still running after the sweep ({swept:?})",
+            facts.postmaster_pid
+        );
+        assert!(
+            !facts.root.exists(),
+            "the killed child's root {root} survived the sweep ({swept:?})"
+        );
+        for line in swept.iter().filter(|line| line.contains(&root)) {
+            assert!(
+                !line.contains("killed its postmaster") && !line.contains("would not die"),
+                "the sweep did not stop the killed child's postmaster: {line}"
+            );
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let leaked = sysv_segment_listed(segment);
+            if leaked {
+                // SAFETY: `shmctl(IPC_RMID)` with a null buffer only marks the
+                // segment for removal. This is the segment the dead postmaster
+                // above created, which nothing attaches now that it is gone;
+                // removing it keeps a failing run from leaking it as well.
+                unsafe {
+                    libc::shmctl(segment.1, libc::IPC_RMID, std::ptr::null_mut());
+                }
+            }
+            assert!(
+                !leaked,
+                "the killed child's postmaster left its System V segment {segment:?} behind, \
+                 so it was not stopped ({swept:?})"
+            );
+        }
+    }
+
+    /// The System V segment a running postmaster's `postmaster.pid` names: its
+    /// seventh line holds the segment's key, then its id. The file writes the
+    /// key as an unsigned long and `/proc/sysvipc/shm` as a signed int, so it
+    /// is compared as the 32 bits of a `key_t`.
+    #[cfg(target_os = "linux")]
+    fn sysv_segment_of(data_dir: &Path) -> Option<(u32, i32)> {
+        let contents = std::fs::read_to_string(data_dir.join(POSTMASTER_PID)).ok()?;
+        let mut fields = contents.lines().nth(6)?.split_whitespace();
+        let key = fields.next()?.parse::<u64>().ok()? as u32;
+        Some((key, fields.next()?.parse().ok()?))
+    }
+
+    /// Whether the kernel still holds the System V segment `(key, id)`.
+    #[cfg(target_os = "linux")]
+    fn sysv_segment_listed((key, id): (u32, i32)) -> bool {
+        std::fs::read_to_string("/proc/sysvipc/shm")
+            .expect("read /proc/sysvipc/shm")
+            .lines()
+            .skip(1)
+            .any(|line| {
+                let mut fields = line.split_whitespace();
+                let listed_key = fields.next().and_then(|field| field.parse::<i64>().ok());
+                listed_key.map(|listed| listed as u32) == Some(key)
+                    && fields.next().and_then(|field| field.parse().ok()) == Some(id)
+            })
     }
 
     /// A harness that cannot boot FAILS the test that asked it for a database,
