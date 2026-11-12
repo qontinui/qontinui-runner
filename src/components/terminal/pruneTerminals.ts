@@ -43,6 +43,47 @@ export interface PruneSignals {
   sessionStates?: Readonly<Record<string, SessionState>>;
   /** Epoch ms "now", for the {@link RECENT_TAB_GRACE_MS} window. */
   now?: number;
+  /**
+   * The runner's process-table reading per pane (`terminal_agent_panes`): an
+   * agent kind (`"claude"`, `"pi"`, `"codex"`, …), `"absent"`, `"none"` (no
+   * terminal process: a plan viewer), or `"unknown"`. A pane missing from the
+   * map has not been probed yet.
+   */
+  agentPanes?: Readonly<Record<string, string>>;
+}
+
+/** Probe readings that prove there is nothing agent-shaped to lose. */
+const NO_AGENT = new Set(["absent", "none"]);
+
+/**
+ * Does the process-table probe keep this pane? It does for a NAMED agent and
+ * for `"unknown"` — a pane whose subtree could not be read may be running one,
+ * and the button errs toward keeping. Only `"absent"` / `"none"` and a pane not
+ * probed yet leave the decision to the other signals; the closing click
+ * re-probes every pane it would close anyway ({@link panesSafeToClose}).
+ */
+export function probeKeeps(id: string, agentPanes?: Readonly<Record<string, string>>): boolean {
+  const v = agentPanes?.[id];
+  return v !== undefined && !NO_AGENT.has(v);
+}
+
+/**
+ * The ids from `closeIds` that a FRESH probe positively read as hosting no
+ * agent — `"absent"` (a shell with no agent CLI in it) or `"none"` (no
+ * terminal process at all: a plan viewer) — the only panes the closing click
+ * may close. An agent found since the plan was drawn, an unreadable pane, and
+ * a pane the probe did not answer for are all kept: closing a shell kills
+ * whatever runs in it.
+ */
+export function panesSafeToClose(
+  closeIds: readonly string[],
+  freshAgentPanes: Readonly<Record<string, string>> | null,
+): string[] {
+  if (!freshAgentPanes) return [];
+  return closeIds.filter((id) => {
+    const v = freshAgentPanes[id];
+    return v !== undefined && NO_AGENT.has(v);
+  });
 }
 
 /**
@@ -65,12 +106,19 @@ export interface PruneSignals {
  * `needs-input` (a Claude UI mid-turn or awaiting approval; a busy plain shell
  * is kept too, which is the safe direction).
  *
+ * Every field above is Claude-shaped. A pane where the operator launched a
+ * different agent CLI by hand — `pi` on DeepSeek, `codex`, `gemini` — carries
+ * none of them and the detector does not read its UI, so the process table is
+ * asked too: a pane whose subtree runs a known agent CLI, or could not be
+ * read, is kept (`agentPanes`, from the runner's `terminal_agent_panes`).
+ *
  * Errs toward KEEPING: a tab is closed only when no signal says otherwise.
  */
 export function hasAiSession(tab: PruneTab, signals: PruneSignals = {}): boolean {
   if (tab.claudeSessionId || tab.sessionBacked === true || tab.taskRunId || tab.remote != null) {
     return true;
   }
+  if (probeKeeps(tab.id, signals.agentPanes)) return true;
   const state = signals.sessionStates?.[tab.id];
   if (state === "working" || state === "needs-input") return true;
   const { now } = signals;
