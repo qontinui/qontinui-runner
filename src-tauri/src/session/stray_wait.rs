@@ -82,6 +82,16 @@ const REPROVE_BUDGET: Duration = Duration::from_secs(5);
 const END_BUDGET_PER_STRAY: Duration = Duration::from_secs(10);
 const END_BUDGET_MAX: Duration = Duration::from_secs(60);
 
+/// Why a loop is not judged stray while one of its children has exited and is not
+/// yet reaped: such a child reads with an EMPTY argv, so the sample landed between
+/// two of the loop's own steps and says nothing about the loop. One sample is not a
+/// verdict on it: the close's record and its re-check both read again.
+pub const BETWEEN_STEPS: &str = "runs a child with no command line (exited, not yet reaped)";
+/// How many fresh tables a re-check reads past [`BETWEEN_STEPS`], and how far apart.
+/// A reap is milliseconds behind an exit; a loop still there after this is refused.
+const BETWEEN_STEPS_RESAMPLES: u32 = 10;
+const BETWEEN_STEPS_GAP: Duration = Duration::from_millis(30);
+
 /// A blocking read cannot be cancelled, so a stuck one must not be joined by
 /// another. One flag per path: a poll of the census must not cost a close its record.
 static CENSUS_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
@@ -1823,6 +1833,9 @@ pub fn stray_verdict(table: &ProcTable, pid: u32, facts: &dyn Facts, idle_min: u
         if dv == argv.as_slice() {
             continue;
         }
+        if dv.is_empty() {
+            return not_stray(BETWEEN_STEPS);
+        }
         let harmless = dv.first().is_some_and(|head| {
             let base = exe_base(head);
             allowed.contains(&base)
@@ -1906,7 +1919,9 @@ pub struct RecordedStray {
 #[cfg(target_os = "linux")]
 mod live {
     use super::wait_loop;
-    use super::{exe_base, PROBES, SNAPSHOT};
+    use super::{
+        exe_base, BETWEEN_STEPS, BETWEEN_STEPS_GAP, BETWEEN_STEPS_RESAMPLES, PROBES, SNAPSHOT,
+    };
     use super::{stray_verdict, subtree, Facts, FileStat, ProcTable, RecordedStray, FILE_MAX};
     use std::cell::OnceCell;
     use std::collections::{HashMap, HashSet};
@@ -2084,28 +2099,51 @@ mod live {
         let Some(table) = read_table() else {
             return Vec::new();
         };
-        let facts = LiveFacts::new();
-        let mut out = Vec::new();
+        let mut shells: Vec<(u32, Vec<String>)> = Vec::new();
         for &claude in claudes {
             for pid in subtree(&table, claude) {
-                let Some((_, argv)) = table.get(&pid) else {
-                    continue;
+                if let Some((_, argv)) = table.get(&pid).filter(|(_, a)| is_tool_shell(a)) {
+                    shells.push((pid, argv.clone()));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        let mut table = table;
+        // A shell sampled between two of its loop's steps (see [`BETWEEN_STEPS`]) is
+        // judged again on a fresh table, bounded: a stray left out here is never
+        // ended, because the close ends only what it recorded.
+        for pass in 0..=BETWEEN_STEPS_RESAMPLES {
+            if pass > 0 {
+                std::thread::sleep(BETWEEN_STEPS_GAP);
+                let Some(fresh) = read_table() else {
+                    break;
                 };
-                if !is_tool_shell(argv) {
+                table = fresh;
+            }
+            let facts = LiveFacts::new();
+            let mut between = Vec::new();
+            for (pid, argv) in shells {
+                if table.get(&pid).map(|(_, a)| a) != Some(&argv) {
                     continue;
                 }
                 let verdict = stray_verdict(&table, pid, &facts, idle_min);
-                if let (true, Some(class), Some(start)) =
+                if verdict.why == BETWEEN_STEPS {
+                    between.push((pid, argv));
+                } else if let (true, Some(class), Some(start)) =
                     (verdict.stray, verdict.class, proc_start(pid))
                 {
                     out.push(RecordedStray {
                         pid,
                         start,
-                        argv: argv.clone(),
+                        argv,
                         class,
                     });
                 }
             }
+            if between.is_empty() {
+                break;
+            }
+            shells = between;
         }
         out
     }
@@ -2126,10 +2164,34 @@ mod live {
         if !stray_now(stray) {
             return Err("gone".to_string());
         }
-        let Some(table) = read_table().filter(|t| t.contains_key(&stray.pid)) else {
+        let judge = || {
+            let table = read_table().filter(|t| t.contains_key(&stray.pid))?;
+            Some(stray_verdict(
+                &table,
+                stray.pid,
+                &LiveFacts::new(),
+                idle_min,
+            ))
+        };
+        let Some(mut verdict) = judge() else {
             return Err("process table unreadable at re-check".to_string());
         };
-        let verdict = stray_verdict(&table, stray.pid, &LiveFacts::new(), idle_min);
+        // A loop forks its probe and its sleep every pass, and a sample that lands
+        // while one has exited unreaped is not a verdict on the loop: read again,
+        // bounded, rather than leave a real stray running past its pane's close.
+        for _ in 0..BETWEEN_STEPS_RESAMPLES {
+            if verdict.why != BETWEEN_STEPS {
+                break;
+            }
+            std::thread::sleep(BETWEEN_STEPS_GAP);
+            if !stray_now(stray) {
+                return Err("gone".to_string());
+            }
+            let Some(next) = judge() else {
+                return Err("process table unreadable at re-check".to_string());
+            };
+            verdict = next;
+        }
         if !verdict.stray || verdict.class.as_deref() != Some(stray.class.as_str()) {
             let why: String = verdict.why.chars().take(80).collect();
             return Err(format!("no longer a {} stray ({why})", stray.class));
@@ -2808,6 +2870,19 @@ mod tests {
         assert!(!one("x", &[], &[], &[], SLEEP).stray);
     }
 
+    /// A child that has exited but is not reaped reads with an empty argv: the loop
+    /// is judged not stray on that sample, with the one reason the re-check reads past.
+    #[test]
+    fn a_child_with_no_command_line_is_between_steps_not_work() {
+        let cmd = "until ! pgrep -f \"stray-between-steps\" >/dev/null; do sleep 1; done";
+        assert!(one(cmd, &[], &[], &[], SLEEP).stray);
+        let between = one(cmd, &[], &[], &[], &[&[]]);
+        assert!(!between.stray, "{between:?}");
+        assert_eq!(between.why, BETWEEN_STEPS);
+        let real = one(cmd, &[], &[], &[], &[&["cargo", "test"]]);
+        assert!(!real.stray && real.why != BETWEEN_STEPS, "{real:?}");
+    }
+
     #[test]
     fn the_case_table() {
         let task: &'static str = Box::leak(format!("{TDIR}/brm8jg1o0.output").into_boxed_str());
@@ -3245,7 +3320,7 @@ mod tests {
             };
             // The loop forks `pgrep` and `sleep` every second, and a child that has
             // exited but is not yet reaped reads with an EMPTY argv, which the
-            // classifier rightly will not call harmless ("runs "). That is a sample
+            // classifier rightly will not call harmless ([`BETWEEN_STEPS`]). That is a sample
             // of the loop between steps, not a verdict on it, so read until a
             // sample lands outside that window (bounded, like `wait_for_argv`).
             let mut verdict = read();
@@ -3263,7 +3338,7 @@ mod tests {
             let target = spawn(&sv(&["bash", "-c", "sleep 3600; :", &token]), 0);
             let target = Reaped(target);
             wait_for_argv(target.0.id(), &token);
-            // Same window as above: an unreaped child reads "runs " before the
+            // Same window as above: an unreaped child reads BETWEEN_STEPS before the
             // classifier ever reaches the live-pid wait.
             let waits_on = format!("waits on live pid {}", target.0.id());
             let mut verdict = read();
@@ -3287,6 +3362,28 @@ mod tests {
                 )]
             );
             assert!(reaped_shortly(&mut child));
+        }
+
+        /// A close records the strays under its claude on one walk, and the loops it
+        /// samples between steps are read again rather than left out: a stray the
+        /// record misses is never ended. Repeated so a sample in the window is likely.
+        #[test]
+        fn a_close_records_a_real_stray_under_its_claude() {
+            let dir = tempfile::tempdir().unwrap();
+            let token = format!("stray-wait-record-{}", std::process::id());
+            let cmd = format!("until ! pgrep -f \"{token}\" >/dev/null; do sleep 1; done");
+            let (_child, stray) = start_loop(dir.path(), &cmd, "a");
+            for _ in 0..40 {
+                let recorded = live::record(&[std::process::id()], 0);
+                assert_eq!(
+                    recorded
+                        .into_iter()
+                        .filter(|r| r.pid == stray.pid)
+                        .collect::<Vec<_>>(),
+                    vec![stray.clone()]
+                );
+                std::thread::sleep(Duration::from_millis(25));
+            }
         }
 
         /// The census judges a candidate only while the fresh table still names the
