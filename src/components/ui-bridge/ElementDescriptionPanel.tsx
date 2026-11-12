@@ -137,7 +137,11 @@ function generateHeuristicDescription(element: ExternalElement): ElementDescript
       purpose = "Trigger an action when clicked";
       break;
 
+    // `textbox` is an ARIA textbox or a contenteditable: `@qontinui/ui-bridge`
+    // 0.46 kinds it apart from a native `input`, and reported it as `input`
+    // before. Same for `combobox` / `listbox` against `select` below.
     case "input":
+    case "textbox":
       parts.push("A text input field");
       if (element.label) {
         parts.push(`for "${element.label}"`);
@@ -160,6 +164,8 @@ function generateHeuristicDescription(element: ExternalElement): ElementDescript
       break;
 
     case "select":
+    case "combobox":
+    case "listbox":
       parts.push("A dropdown select menu");
       if (element.label) {
         parts.push(`for "${element.label}"`);
@@ -504,12 +510,15 @@ export function ElementDescriptionPanel({
   const getDefaultAction = useCallback((element: ExternalElement): AutomationAction => {
     switch (element.type) {
       case "input":
+      case "textbox":
       case "textarea":
         return "fill";
       case "checkbox":
       case "radio":
         return "check";
       case "select":
+      case "combobox":
+      case "listbox":
         return "select";
       default:
         return "click";
@@ -650,8 +659,11 @@ export function ElementDescriptionPanel({
     const interactiveTypes = [
       "button",
       "input",
+      "textbox",
       "textarea",
       "select",
+      "combobox",
+      "listbox",
       "checkbox",
       "radio",
       "link",
@@ -858,6 +870,7 @@ export function ElementDescriptionPanel({
       case "button":
         return <MousePointer className="w-4 h-4" />;
       case "input":
+      case "textbox":
       case "textarea":
         return <Type className="w-4 h-4" />;
       case "link":

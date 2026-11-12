@@ -399,7 +399,10 @@ fn evaluate_snapshot_assertion(
 /// - "id" / "elementId": exact match against element.id
 /// - "testId": exact match against element.identifier.testId
 /// - "htmlId": exact match against element.identifier.htmlId
-/// - "type": exact match against element.type
+/// - "type": the named type's family against element.type, case-insensitive
+///   (`input` also matches a `textbox`, `select` a `combobox` or `listbox`)
+/// - "role": substring match of any member of the named role's family against
+///   element.type or element.state.role, case-insensitive
 /// - "label": substring match against element.label
 fn element_matches_criteria(
     element: &serde_json::Value,
@@ -448,20 +451,39 @@ fn element_matches_criteria(
                 html_id == expected
             }
             "type" => {
-                let el_type = element.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                el_type == expected
+                // A criterion NAMES a type, so it matches the name's family
+                // (`input`↔`textbox`, `select`↔`combobox`↔`listbox`) — see
+                // `element_kind`.
+                let el_type = element.get("type").and_then(|t| t.as_str());
+                crate::mcp::ui_bridge::element_kind::answers_to_named_type(el_type, expected)
             }
             "role" => {
                 // Check element.type first (AutoRegister maps role/tag to type),
                 // then fall back to state.role for elements that set it explicitly.
-                let el_type = element.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                //
+                // Substring match against every member of the named role's
+                // family: `@qontinui/ui-bridge` 0.46 re-kinded role="combobox"
+                // `select` -> `combobox` and role="textbox"/contenteditable
+                // `input` -> `textbox`, so `{role: "select"}` must still find a
+                // combobox and `{role: "textbox"}` a native input. A name in no
+                // family is its own one-member family, i.e. the plain substring
+                // match this always was.
+                let el_type = element
+                    .get("type")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("")
+                    .to_lowercase();
                 let state_role = element
                     .get("state")
                     .and_then(|s| s.get("role"))
                     .and_then(|r| r.as_str())
-                    .unwrap_or("");
-                el_type.to_lowercase().contains(&expected.to_lowercase())
-                    || state_role.to_lowercase().contains(&expected.to_lowercase())
+                    .unwrap_or("")
+                    .to_lowercase();
+                crate::mcp::ui_bridge::element_kind::named_type_family(expected)
+                    .iter()
+                    .any(|named| {
+                        el_type.contains(named.as_str()) || state_role.contains(named.as_str())
+                    })
             }
             "label" => {
                 let label = element.get("label").and_then(|l| l.as_str()).unwrap_or("");
@@ -2776,5 +2798,75 @@ mod tests {
         assert_eq!(y, 9.0);
         assert_eq!(w, 9.0);
         assert_eq!(h, 9.0);
+    }
+
+    // --- element_matches_criteria: the named-type family ---
+
+    fn criteria(pairs: &[(&str, &str)]) -> serde_json::Map<String, serde_json::Value> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string())))
+            .collect()
+    }
+
+    #[test]
+    fn a_named_role_finds_the_kind_ui_bridge_0_46_moved_it_to() {
+        use serde_json::json;
+        // `@qontinui/ui-bridge` 0.46 types role="combobox" `combobox` (was
+        // `select`) and role="textbox"/contenteditable `textbox` (was `input`).
+        let combobox = json!({"id": "c", "type": "combobox"});
+        let textbox = json!({"id": "t", "type": "textbox"});
+        let native_input = json!({"id": "i", "type": "input"});
+        for named in ["select", "combobox", "listbox", "Select"] {
+            assert!(
+                element_matches_criteria(&combobox, &criteria(&[("role", named)])),
+                "role {named}"
+            );
+            assert!(
+                element_matches_criteria(&combobox, &criteria(&[("type", named)])),
+                "type {named}"
+            );
+        }
+        for named in ["input", "textbox"] {
+            for el in [&textbox, &native_input] {
+                assert!(
+                    element_matches_criteria(el, &criteria(&[("role", named)])),
+                    "role {named} on {el}"
+                );
+                assert!(
+                    element_matches_criteria(el, &criteria(&[("type", named)])),
+                    "type {named} on {el}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_role_matcher_stays_a_substring_match_outside_the_families() {
+        use serde_json::json;
+        let menuitem = json!({"id": "m", "type": "menuitem"});
+        // A substring that names no family keeps matching by substring...
+        assert!(element_matches_criteria(
+            &menuitem,
+            &criteria(&[("role", "menu")])
+        ));
+        assert!(element_matches_criteria(
+            &json!({"id": "x", "type": "generic", "state": {"role": "tablist"}}),
+            &criteria(&[("role", "tab")])
+        ));
+        // ...and a family does not reach past its members.
+        assert!(!element_matches_criteria(
+            &json!({"id": "cb", "type": "checkbox"}),
+            &criteria(&[("role", "input")])
+        ));
+        assert!(!element_matches_criteria(
+            &json!({"id": "o", "type": "option"}),
+            &criteria(&[("type", "select")])
+        ));
+        // `type` is family equality, not a substring match.
+        assert!(!element_matches_criteria(
+            &menuitem,
+            &criteria(&[("type", "menu")])
+        ));
     }
 }

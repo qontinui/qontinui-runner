@@ -933,15 +933,17 @@ pub(crate) fn is_action_advertised(action: &str, supported: &Option<Vec<String>>
         Some(list) => {
             list.iter().any(|s| s == action)
                 // `hoverClick` is a click-variant — it reveals a hover-gated
-                // control then clicks it. Any element that advertises `click`
-                // can be hover-clicked, even when the SDK's inferActions didn't
-                // enumerate `hoverClick` explicitly on this element. Without
-                // this, hover-revealed toolbar buttons (which advertise `click`
-                // but not `hoverClick`) would be rejected here pre-IPC.
+                // control then clicks it, so any element that advertises
+                // `click` can be hover-clicked. Since `@qontinui/ui-bridge`
+                // 0.46 every INFERRED list carries `hoverClick` (the
+                // every-element row of `core/element-kind.ts`), so this arm
+                // now serves a list a registration DECLARED — the runner's own
+                // `useUIElement({ actions: ["click"] })` hover-revealed toolbar
+                // buttons among them — and one served by a pre-0.46 SDK.
                 || (action == "hoverClick" && list.iter().any(|s| s == "click"))
                 // `unhover` releases what `hover` forced, so it is allowed
-                // wherever `hover` is advertised even when the element's
-                // action list predates the SDK's `unhover`.
+                // wherever `hover` is advertised: an inferred 0.46 list carries
+                // both, a declared or pre-0.46 list may carry only `hover`.
                 || (action == "unhover" && list.iter().any(|s| s == "hover"))
         }
         // Unknown supported list (fetch failed or element didn't advertise
@@ -6818,6 +6820,77 @@ mod action_not_supported_tests {
     fn is_action_advertised_unknown_supported_list_is_permissive() {
         // None → we don't know what the element supports; never accuse.
         assert!(is_action_advertised("setValue", &None));
+    }
+
+    /// The `actions` `@qontinui/ui-bridge` 0.46.0 serves for an
+    /// `<input type="text">` outside a form, in its canonical order:
+    /// `EVERY_ELEMENT` plus `structuralActions`' text-entry verbs (`type`,
+    /// `clear`, `setValue`, `autocomplete`), from `inferActions` in
+    /// `packages/ui-bridge/src/core/element-kind.ts` at ui-bridge `9f373a12`.
+    /// The runner frontend test `src/lib/ui-bridge/autoRegisterVerbs.dom.test.tsx`
+    /// asserts the SDK, mounted the way `App.tsx` mounts it, serves exactly
+    /// this list for an auto-registered text input — so this literal and the
+    /// live SDK cannot drift apart unnoticed.
+    const TEXT_INPUT_ACTIONS_0_46: &[&str] = &[
+        "click",
+        "hoverClick",
+        "doubleClick",
+        "rightClick",
+        "middleClick",
+        "type",
+        "sendKeys",
+        "clear",
+        "focus",
+        "blur",
+        "hover",
+        "unhover",
+        "scroll",
+        "scrollIntoView",
+        "setValue",
+        "drag",
+        "autocomplete",
+    ];
+
+    #[test]
+    fn a_0_46_text_input_passes_the_pre_ipc_gate_for_set_value() {
+        // Plan 2026-11-09-an-elements-advertised-verbs-depend-on-which-path-found-it,
+        // Phase 5's gate: before 0.46 an auto-registered `<input>` advertised
+        // no `setValue`, so this gate answered ACTION_NOT_SUPPORTED for it.
+        let supported = Some(
+            TEXT_INPUT_ACTIONS_0_46
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        for verb in [
+            "setValue",
+            "sendKeys",
+            "type",
+            "clear",
+            "autocomplete",
+            "hoverClick",
+        ] {
+            assert!(is_action_advertised(verb, &supported), "{verb}");
+        }
+        // The table still withholds what a text input does not perform.
+        for verb in ["select", "check", "uncheck", "toggle", "submit", "reset"] {
+            assert!(!is_action_advertised(verb, &supported), "{verb}");
+        }
+    }
+
+    #[test]
+    fn a_0_46_content_row_advertises_nothing_and_the_gate_refuses_every_verb() {
+        // `registerContentElement` and the executor's content find row keep
+        // `actions: []` in 0.46 — the one producer outside the verb table. The
+        // Rust gate reads an explicit empty list as refuse-all (only `None`,
+        // "we don't know", is permissive). See the PR's "Which runner gate
+        // governs `[]`" for why the frontend gate reads `[]` the other way.
+        let elem = json!({ "id": "heading-title", "category": "content", "actions": [] });
+        let supported = extract_supported_actions(&elem);
+        assert_eq!(supported, Some(vec![]));
+        for verb in ["click", "sendKeys", "scrollIntoView", "focus"] {
+            assert!(!is_action_advertised(verb, &supported), "{verb}");
+        }
     }
 
     // ── Custom-action reachability via the /control/ route ──────────────

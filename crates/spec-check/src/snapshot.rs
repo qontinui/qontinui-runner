@@ -78,10 +78,17 @@ impl<'a> IndexedSnapshot<'a> {
             //    `element_type` keyword) so a `{role: "heading"}` criterion
             //    finds `<h1>` even when the SDK didn't populate top-level
             //    role. See `crate::derive::role`.
+            //    Indexed under every member of the role's named-type family
+            //    (`crate::named_type`) so `lookup_by_role("select")` also
+            //    finds a combobox, the way `criteria::score_role` scores it.
+            //    The families partition the names, so indexing the OBSERVED
+            //    role's family is the same as looking up the DECLARED one's.
             if let Some(role) = derive::role(el) {
                 let key = normalize_text(&role);
                 if !key.is_empty() {
-                    by_role.entry(key).or_default().push(idx);
+                    for member in crate::named_type::named_type_family(&key) {
+                        by_role.entry(member).or_default().push(idx);
+                    }
                 }
             }
 

@@ -372,8 +372,12 @@ export function useStateExploration(
        */
       const filterExplorable = (els: ExternalElement[]): ExternalElement[] => {
         return els.filter((el) => {
-          // Must be interactive
-          if (!el.actions || el.actions.length === 0) return false;
+          // Must be an interactive control. `is_interactive` is the SDK's own
+          // classification (`mapSdkElement` → `isInteractiveElementRow`), not
+          // "has actions": since `@qontinui/ui-bridge` 0.46 a media row
+          // advertises the every-element verbs too, and the explorer must not
+          // click every image on the page.
+          if (!el.is_interactive) return false;
           // Must be visible and enabled
           if (!el.visible || !el.enabled) return false;
           // Skip global zones (header, footer, fixed areas)
@@ -480,7 +484,7 @@ export function useStateExploration(
                 name.includes("close") ||
                 name.includes("cancel") ||
                 name.includes("return")) &&
-              el.actions.length > 0 &&
+              el.is_interactive &&
               el.visible &&
               el.enabled
             );

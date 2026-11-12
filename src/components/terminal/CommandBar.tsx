@@ -39,7 +39,7 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
-import { useUIElement, type StandardAction } from "@qontinui/ui-bridge";
+import { useUIElement } from "@qontinui/ui-bridge";
 
 import { instanceStorage } from "@/lib/instance-storage";
 import { GLOBAL_CHORDS, matchesChord } from "@/lib/globalChords";
@@ -125,50 +125,34 @@ function suggestionElementId(slash: string): string {
 export const COMMAND_BAR_INPUT_ID = "terminal.command-bar-input";
 
 /**
- * Actions this input advertises.
+ * The command bar input's bridge registration. Exported so the regression test
+ * registers exactly what this component registers.
  *
- * When this list was written, the registry's `inferActions('input')` yielded
- * `focus, blur, hover, scroll, scrollIntoView, click, hoverClick, type, clear`
- * — no `sendKeys`. Both GLOBAL whitelists already carry `sendKeys` (SDK
- * `action-executor.ts`, runner `mcp/ui_bridge/elements.rs`
- * `SUPPORTED_ACTION_NAMES`), so the rejection a driver actually hit —
- * `ACTION_NOT_SUPPORTED`, "Action 'sendKeys' is not supported by element …" —
- * came from the PER-ELEMENT advertised list at the pre-IPC gate
- * (`is_action_advertised`, permissive only when an element advertises nothing
- * at all). Driving the bar (type `/resume`, press Enter) is exactly a
- * `sendKeys` job, so this list restated the inferred set with `sendKeys` added.
+ * It carries NO `actions` override, deliberately. Before `@qontinui/ui-bridge`
+ * 0.46 the registry inferred an `input`'s list as `focus, blur, hover, scroll,
+ * scrollIntoView, click, hoverClick, type, clear` — no `sendKeys` — and the
+ * runner's pre-IPC gate (`is_action_advertised`, `mcp/ui_bridge/elements.rs`)
+ * refuses any verb an element does not advertise, so driving the bar (type
+ * `/resume`, press Enter) answered `ACTION_NOT_SUPPORTED`. This registration
+ * used to restate that list with `sendKeys` added. 0.46 reads every producer's
+ * verbs from ONE table (`core/element-kind.ts`): every kind takes `sendKeys`,
+ * and this node's structure adds what it performs — a text `<input>` takes
+ * `type`, `clear`, `setValue`, `autocomplete`; its `role="combobox"` takes
+ * `select`; its `aria-expanded` takes `toggle`. That is a superset of the old
+ * override, so the override would now only take verbs away.
  *
- * Passing `actions` REPLACES the inferred list, so this list must track it.
- * `@qontinui/ui-bridge` 0.38.0's `inferActions('input')` is
- * `focus, blur, hover, unhover, scroll, scrollIntoView, click, hoverClick,
- * type, sendKeys, clear, setValue` (it gained `sendKeys`/`setValue` in
- * ui-bridge `af1dc61e` and `unhover` with forced hover in `dd757bbb`). This
- * list is that set verbatim, and is kept rather than deleted so the command
- * bar keeps `sendKeys` even if a later SDK narrows its inference.
- *
- * Deliberately a plain ADVERTISEMENT and not a `customActions` entry: the
- * SDK's built-in `performSendKeys` already does the right thing for a text
- * input, and a registered custom action WINS over a same-named built-in on
- * that element (ui-bridge `bc591af`). `TerminalInstance.tsx` already registers
- * a custom `sendKeys` on the terminal PANE whose `keys` param is a plain string
- * written straight to the PTY — a second, incompatible meaning for the name.
- * A third would make `sendKeys` unpredictable per element, so the command bar
- * keeps the SDK's descriptor-array contract (`keys: [{key, modifiers?}]`).
+ * `sendKeys` here stays the SDK's built-in (`keys: [{key, modifiers?}]`), not a
+ * `customActions` entry: a registered custom action WINS over a same-named
+ * built-in on that element (ui-bridge `bc591af`), and `TerminalInstance.tsx`
+ * already registers a custom `sendKeys` on the terminal PANE whose `keys` param
+ * is a plain string written straight to the PTY. A third meaning would make
+ * `sendKeys` unpredictable per element.
  */
-export const COMMAND_BAR_INPUT_ACTIONS: StandardAction[] = [
-  "focus",
-  "blur",
-  "hover",
-  "unhover",
-  "scroll",
-  "scrollIntoView",
-  "click",
-  "hoverClick",
-  "type",
-  "sendKeys",
-  "clear",
-  "setValue",
-];
+export const COMMAND_BAR_INPUT_ELEMENT = {
+  id: COMMAND_BAR_INPUT_ID,
+  type: "input",
+  label: "Command bar",
+} as const satisfies Parameters<typeof useUIElement>[0];
 
 // Tier-3 (claude subprocess) debounce + gating. The subprocess takes
 // ~1.5-3s; we don't want to fire it on every keystroke. 600ms is long
@@ -280,14 +264,9 @@ export function CommandBar() {
 
   const inputRef = useRef<HTMLInputElement>(null);
   // Register the input as an addressable bridge element so a driver can
-  // `sendKeys` at it — see `COMMAND_BAR_INPUT_ACTIONS` for why the inferred
-  // action set is not enough.
-  const { ref: bridgeInputRef } = useUIElement({
-    id: COMMAND_BAR_INPUT_ID,
-    type: "input",
-    label: "Command bar",
-    actions: COMMAND_BAR_INPUT_ACTIONS,
-  });
+  // `sendKeys` at it — see `COMMAND_BAR_INPUT_ELEMENT` for why it takes the
+  // SDK's inferred verbs as they are.
+  const { ref: bridgeInputRef } = useUIElement(COMMAND_BAR_INPUT_ELEMENT);
   const blurTimerRef = useRef<number | null>(null);
   /** Monotonic id of the latest `execute` — see `paint` inside it. */
   const runIdRef = useRef(0);

@@ -444,6 +444,18 @@ async fn execute_action(
 // Element Filtering
 // =============================================================================
 
+/// Whether `el` is a control the explorer may click: it advertises at least
+/// one built-in action and is not a content or media row
+/// ([`crate::mcp::ui_bridge::element_kind::is_content_or_media_row`] — the
+/// SDK's own `interactive_only` classification).
+fn is_explorable_control(el: &Value) -> bool {
+    let has_actions = el
+        .get("actions")
+        .and_then(|v| v.as_array())
+        .is_some_and(|a| !a.is_empty());
+    has_actions && !crate::mcp::ui_bridge::element_kind::is_content_or_media_row(el)
+}
+
 /// Filter elements to those eligible for exploration clicks.
 /// Returns (element_id, label, fingerprint_hash) tuples.
 fn filter_explorable(
@@ -466,13 +478,11 @@ fn filter_explorable(
             continue;
         }
 
-        // Must have actions
-        let actions = el
-            .get("actions")
-            .and_then(|v| v.as_array())
-            .map(|a| a.len())
-            .unwrap_or(0);
-        if actions == 0 {
+        // Must be a control: advertise actions and not be a content or media
+        // row. Since `@qontinui/ui-bridge` 0.46 a media row advertises the
+        // every-element verbs (a canvas takes `sendKeys`), so "has actions"
+        // alone would send the explorer clicking every image on the page.
+        if !is_explorable_control(el) {
             continue;
         }
 
@@ -591,13 +601,7 @@ fn find_back_navigation(elements: &[Value]) -> Option<(String, String)> {
             .unwrap_or("")
             .to_lowercase();
 
-        let has_actions = el
-            .get("actions")
-            .and_then(|v| v.as_array())
-            .map(|a| !a.is_empty())
-            .unwrap_or(false);
-
-        if !has_actions {
+        if !is_explorable_control(el) {
             continue;
         }
 
@@ -609,4 +613,75 @@ fn find_back_navigation(elements: &[Value]) -> Option<(String, String)> {
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// The every-element verbs `@qontinui/ui-bridge` 0.46 serves on every kind,
+    /// a media row included (ui-bridge `9f373a12` `core/element-kind.ts`
+    /// `EVERY_ELEMENT`).
+    fn every_element() -> Value {
+        json!([
+            "click",
+            "hoverClick",
+            "doubleClick",
+            "rightClick",
+            "middleClick",
+            "sendKeys",
+            "focus",
+            "blur",
+            "hover",
+            "unhover",
+            "scroll",
+            "scrollIntoView",
+            "drag"
+        ])
+    }
+
+    fn row(id: &str, kind: &str, category: &str, label: &str) -> Value {
+        json!({
+            "id": id,
+            "type": kind,
+            "category": category,
+            "label": label,
+            "actions": if category == "content" { json!([]) } else { every_element() },
+            "state": {"visible": true, "enabled": true,
+                      "rect": {"x": 100.0, "y": 500.0, "width": 80.0, "height": 30.0}}
+        })
+    }
+
+    #[test]
+    fn media_and_content_rows_are_never_explored_however_many_verbs_they_advertise() {
+        let elements = vec![
+            row("btn", "button", "interactive", "Open"),
+            row("logo", "image", "media", "Logo"),
+            row("plot", "canvas", "media", "Plot"),
+            row("intro", "generic", "content", "Intro"),
+        ];
+        let explorable = filter_explorable(
+            &elements,
+            &std::collections::HashMap::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &FingerprintConfig::default(),
+            &[],
+        );
+        let ids: Vec<&str> = explorable.iter().map(|(id, _, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["btn"]);
+    }
+
+    #[test]
+    fn back_navigation_skips_a_media_row_named_back() {
+        let elements = vec![
+            row("back-art", "image", "media", "Back"),
+            row("back-btn", "button", "interactive", "Back"),
+        ];
+        assert_eq!(
+            find_back_navigation(&elements).map(|(id, _)| id),
+            Some("back-btn".to_string())
+        );
+    }
 }
