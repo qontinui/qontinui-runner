@@ -579,13 +579,13 @@ pub async fn raw_argvs_for_pids(pids: &[u32]) -> Option<HashMap<u32, session_lif
     super::process_table::raw_argvs_for(pids).await
 }
 
-/// [`snapshot_process_table_fresh`] for an OBSERVER that must never compete
-/// with the runner's acting callers for the one external-probe fallback
-/// ([`super::process_table::snapshot_fresh_in_process_only`]): a walk that
-/// fails answers stale instead of taking the fallback slot or touching its
-/// circuit.
-pub async fn snapshot_process_table_fresh_in_process_only() -> ProcessSnapshot {
-    super::process_table::snapshot_fresh_in_process_only().await
+/// A fresh process table for an OBSERVER, walked privately and bounded by
+/// `budget` ([`super::process_table::snapshot_unshared`]): it shares nothing
+/// with the provider every other read goes through — no walk another caller
+/// can join, no memo, no fallback slot, no circuit — so it can change nothing
+/// any other caller is served. A failed or late walk answers stale (UNKNOWN).
+pub async fn snapshot_process_table_unshared(budget: std::time::Duration) -> ProcessSnapshot {
+    super::process_table::snapshot_unshared(budget).await
 }
 
 /// Whether `QONTINUI_PROCESS_TABLE_IN_PROCESS=0` has switched the in-process

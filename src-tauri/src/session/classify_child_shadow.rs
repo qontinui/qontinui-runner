@@ -26,12 +26,16 @@
 //! creation with `/proc/<pid>/stat`'s clock ticks, not the seconds derived from
 //! them. The pure judgement is [`session_lifecycle::classify_session`].
 //!
-//! **Every read is in-process only.** The tables come from
-//! [`process_tree::snapshot_process_table_fresh_in_process_only`], which never
-//! takes the process-table provider's single external-probe (PowerShell/WMI)
-//! fallback slot — so a shadow pass can neither leave the census's own failed
-//! reads without it nor open its circuit — and the argv read has no fallback at
-//! all. With the in-process read switched off
+//! **It touches no shared read state.** Its tables come from
+//! [`process_tree::snapshot_process_table_unshared`]: a private in-process walk
+//! on the blocking pool, bounded by [`WALK_BUDGET`], entirely outside the
+//! process-table provider every other read goes through. It leads no walk
+//! another caller could join, reads and writes no memo, never takes the single
+//! external-probe (PowerShell/WMI) fallback slot and moves no counter or
+//! circuit — so no census read, and no other caller's, can be served a shadow
+//! walk's failure, delayed by it, or lose the fallback to it, and a failed
+//! shadow walk leaves no trace. The argv read is in-process too, with no
+//! fallback. With the in-process read switched off
 //! (`QONTINUI_PROCESS_TABLE_IN_PROCESS=0`) every read the shadow could make is
 //! UNKNOWN, so no pass runs.
 //!
@@ -58,6 +62,11 @@ use crate::session::tracking_health::{LiveClaudeProcess, SessionWorkStatus};
 /// The whole shadow pass is bounded, so a stuck read cannot pin the
 /// single-flight flag and silence every later census.
 const SHADOW_BUDGET: Duration = Duration::from_secs(10);
+
+/// Each of a pass's two private table walks is bounded on its own, so both fit
+/// inside [`SHADOW_BUDGET`] with the argv read; a walk past it reads stale
+/// (UNKNOWN) rather than spending the whole pass.
+const WALK_BUDGET: Duration = Duration::from_secs(4);
 
 /// Set while a shadow pass runs; a census that finds it set starts none.
 static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
@@ -295,12 +304,12 @@ async fn observe(sessions: Vec<(String, u32)>) {
     );
 }
 
-/// The reads and the pure judgement: table, argv, fresh table — all
-/// in-process only.
+/// The reads and the pure judgement: table, argv, fresh table — each one
+/// in-process and private to the shadow.
 async fn judge(sessions: &[(String, u32)]) -> Vec<(String, SessionVerdict)> {
     judge_with(
         sessions,
-        process_tree::snapshot_process_table_fresh_in_process_only,
+        || process_tree::snapshot_process_table_unshared(WALK_BUDGET),
         |pids| async move { process_tree::raw_argvs_for_pids(&pids).await },
     )
     .await
@@ -474,64 +483,84 @@ mod tests {
         );
     }
 
-    /// Finding 1 of the Phase 2a review, pinned: the shadow's reads run
-    /// against a provider whose in-process walk FAILS — the case in which a
-    /// fallback-capable read would take the one external-probe slot and, on
-    /// failure, open the circuit the census's own reads share. Every verdict
-    /// is UNKNOWN (the tables are stale), and the provider is left exactly as
-    /// the census needs it: no attempt counted, the slot free, the circuit
-    /// closed. A slot the census already holds is neither waited on nor
-    /// released.
+    /// Finding 1 of the Phase 2a review, pinned at the shadow: a census-side
+    /// memoized read that asks WHILE a shadow pass is walking, and that walk is
+    /// failing, is never handed the shadow's failure. The census leads its own
+    /// walk on its own provider and, when that fails too, still gets the
+    /// fallback; the shadow's verdicts are UNKNOWN (stale tables); and the one
+    /// fallback attempt the provider counts is the census's own.
     #[tokio::test]
-    async fn the_shadow_never_takes_the_fallback_slot_or_opens_the_circuit() {
-        use crate::process_capture::process_table::{read_in_process_only, Config, Provider};
+    async fn a_census_read_during_a_failing_shadow_pass_still_gets_its_fallback() {
+        use crate::process_capture::process_table::{
+            read_unshared, read_with, Config, Provider, MEMO_TTL,
+        };
         let p: &'static Provider = Box::leak(Box::new(Provider::new(Config::default())));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        // The pass's first walk signals, then stalls until released; every walk
+        // the pass makes fails.
+        let gate = std::sync::Arc::new(Mutex::new(Some((started_tx, release_rx))));
+        let table = move || {
+            let gate = gate.lock().unwrap_or_else(|e| e.into_inner()).take();
+            read_unshared(
+                move || {
+                    if let Some((started, release)) = gate {
+                        let _ = started.send(());
+                        let _ = release.recv_timeout(Duration::from_secs(10));
+                    }
+                    Err("scripted shadow walk failure".to_string())
+                },
+                Duration::from_secs(30),
+            )
+        };
         let sessions = vec![("s1".to_string(), 10), ("s2".to_string(), 20)];
-        let failing = || read_in_process_only(p, || Err("scripted walk failure".to_string()));
-        for _ in 0..3 {
-            let judged = judge_with(&sessions, failing, |_| async { None }).await;
-            assert_eq!(judged.len(), 2);
-            for (id, v) in &judged {
-                assert!(!v.admit, "{id} admitted from a stale table: {v:?}");
-                assert_eq!(v.classes(), "claude unbound", "{id}: {v:?}");
-            }
+        let pass =
+            tokio::spawn(async move { judge_with(&sessions, table, |_| async { None }).await });
+        started_rx.await.expect("the shadow's walk started");
+
+        let census = read_with(
+            p,
+            MEMO_TTL,
+            || Err("scripted census walk failure".to_string()),
+            || async { Some(snap(&[(10, 1, "claude", 1, 9, 9)])) },
+        )
+        .await;
+        assert!(
+            !census.stale && census.names.contains_key(&10),
+            "the census read was served its own fallback's table"
+        );
+
+        release_tx.send(()).expect("release the shadow's walk");
+        let judged = pass.await.expect("the shadow pass joined");
+        assert_eq!(judged.len(), 2);
+        for (id, v) in &judged {
+            assert!(!v.admit, "{id} admitted from a stale table: {v:?}");
+            assert_eq!(v.classes(), "claude unbound", "{id}: {v:?}");
         }
         let health = p.health_json();
         assert_eq!(
-            health["powershellFallbacks"], 0,
-            "the shadow took the fallback slot: {health}"
+            health["powershellFallbacks"], 1,
+            "only the census's own attempt is counted: {health}"
         );
-        assert!(
-            health["circuitOpenUntil"].is_null(),
-            "the shadow opened the shared circuit: {health}"
-        );
-
-        let census = p.begin_fallback().expect("the slot is free for the census");
-        let judged = judge_with(&sessions, failing, |_| async { None }).await;
-        assert!(judged.iter().all(|(_, v)| !v.admit));
-        assert!(
-            p.begin_fallback().is_none(),
-            "the census's attempt still holds the slot"
-        );
-        census.end(true, "the census's own attempt");
-        assert!(p.health_json()["circuitOpenUntil"].is_null());
+        assert!(health["circuitOpenUntil"].is_null(), "{health}");
     }
 
-    /// The same sequence on a walk that succeeds: the shadow judges from the
-    /// provider's fresh tables and the argvs it was handed, and still never
-    /// touches the fallback.
+    /// The same sequence on walks that succeed: the shadow judges from two
+    /// fresh private tables and the argvs of the first one's members.
     #[tokio::test]
     async fn the_shadow_judges_from_two_fresh_tables_and_the_argvs() {
-        use crate::process_capture::process_table::{read_in_process_only, Config, Provider};
-        let p: &'static Provider = Box::leak(Box::new(Provider::new(Config::default())));
+        use crate::process_capture::process_table::read_unshared;
         let table = || {
-            read_in_process_only(p, || {
-                Ok(snap(&[
-                    (10, 1, "claude", 1, 9, 9),
-                    (11, 10, "bash", 1, 9, 9),
-                    (20, 1, "claude", 1, 9, 9),
-                ]))
-            })
+            read_unshared(
+                || {
+                    Ok(snap(&[
+                        (10, 1, "claude", 1, 9, 9),
+                        (11, 10, "bash", 1, 9, 9),
+                        (20, 1, "claude", 1, 9, 9),
+                    ]))
+                },
+                Duration::from_secs(30),
+            )
         };
         let asked = std::sync::Arc::new(Mutex::new(Vec::new()));
         let seen = std::sync::Arc::clone(&asked);
@@ -551,19 +580,18 @@ mod tests {
         );
         assert_eq!(judged[0].1.classes(), "work=1", "{:?}", judged[0]);
         assert!(judged[1].1.admit, "a childless claude: {:?}", judged[1]);
-        assert_eq!(p.health_json()["powershellFallbacks"], 0);
     }
 
     /// The production binding of the two tests above: [`judge`] reads only
-    /// through the in-process-only doors they exercise, and the shadow's code
-    /// names no fallback-capable read anywhere. A behavioural test cannot see
-    /// that binding, so its text is pinned instead.
+    /// through the private doors they exercise, and the shadow's code names no
+    /// shared read anywhere. A behavioural test cannot see that binding, so its
+    /// text is pinned instead.
     #[test]
-    fn the_shadow_reads_only_through_the_in_process_only_doors() {
+    fn the_shadow_reads_only_through_private_doors() {
         let src = include_str!("classify_child_shadow.rs");
         let production = src.split("#[cfg(test)]").next().unwrap_or_default();
         for door in [
-            "process_tree::snapshot_process_table_fresh_in_process_only,",
+            "process_tree::snapshot_process_table_unshared(WALK_BUDGET)",
             "process_tree::raw_argvs_for_pids(",
             "process_tree::in_process_table_read_disabled()",
         ] {
@@ -572,20 +600,22 @@ mod tests {
                 "the shadow no longer reads through `{door}`"
             );
         }
-        for fallback_capable in [
-            "snapshot_process_table_fresh(",
+        for shared in [
+            "snapshot_process_table_fresh",
             "snapshot_process_table_public",
             "command_lines_for_pids",
-            "snapshot_fresh(",
+            "snapshot_fresh",
             "snapshot(",
             "read_with(",
+            "lead_or_join",
             "begin_fallback",
             "run_fallback",
+            "provider()",
         ] {
             assert!(
-                !production.contains(fallback_capable),
-                "the shadow reads through `{fallback_capable}`, which can take \
-                 the process-table provider's one shared fallback slot"
+                !production.contains(shared),
+                "the shadow reads through `{shared}`, a door into the process-table \
+                 provider's shared state (its single flight, memo or fallback slot)"
             );
         }
     }

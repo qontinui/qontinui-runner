@@ -31,7 +31,9 @@
 //! fork guard, the orphan reclaim's kill — uses [`snapshot_fresh`], which never
 //! serves the memo and joins only a walk that began after the call. A caller
 //! never waits on another caller's walk longer than [`JOIN_WAIT_MAX`]; past it
-//! the answer is the last good snapshot flagged `stale`.
+//! the answer is the last good snapshot flagged `stale`. One read stays out of
+//! all of this on purpose: [`snapshot_unshared`], an observer's private walk,
+//! which no other caller can join, be served from, or lose the fallback to.
 //!
 //! **The external probe is the fallback, behind one circuit.** On Windows the
 //! PowerShell/WMI queries run only when the in-process read fails (Unix has no
@@ -592,41 +594,38 @@ pub(crate) async fn snapshot_fresh() -> ProcessSnapshot {
     .await
 }
 
-/// [`snapshot_fresh`] WITHOUT the external-probe fallback — for an OBSERVER
-/// that must never compete with the runner's acting callers for it (the
-/// `finished_close` arm's `classify_child` shadow). The walk is the provider's
-/// own (memo-less, single flight), but a walk this read leads that fails
-/// settles its flight with no table — the last good one flagged stale, or an
-/// empty stale one — exactly as [`snapshot_blocking`] settles a synchronous
-/// caller's. So this read never takes the one fallback slot (an acting
-/// caller's own failed walk finds it free), never counts an attempt, and never
-/// opens the shared circuit. Its stale answer is UNKNOWN to the observer.
-pub(crate) async fn snapshot_fresh_in_process_only() -> ProcessSnapshot {
-    read_in_process_only(provider(), walk_in_process).await
+/// A fresh process table walked PRIVATELY, for an OBSERVER whose reads must
+/// change nothing any other caller is served (the `finished_close` arm's
+/// `classify_child` shadow). It is the same in-process walk the provider runs
+/// ([`walk_in_process`]), on the blocking pool and bounded by `budget`, but
+/// entirely outside the provider: it leads no walk another caller can join,
+/// reads and writes no memo, never takes the external-probe fallback slot and
+/// moves no counter or circuit. So a failed walk leaves no trace — every other
+/// caller leads and, if need be, falls back exactly as if this read had never
+/// happened — and a successful one is the observer's alone. A walk that fails,
+/// panics or outruns `budget` answers an empty stale table: UNKNOWN.
+pub(crate) async fn snapshot_unshared(budget: Duration) -> ProcessSnapshot {
+    read_unshared(walk_in_process, budget).await
 }
 
-/// The async read behind [`snapshot_fresh_in_process_only`], generic over the
-/// provider and the walk so a test drives this exact path: `walk` on the
-/// blocking pool through [`Provider::lead_or_join`] at `max_age` zero, and a
-/// failed walk's flight settled with no table. [`Provider::begin_fallback`] is
-/// never called from here.
-pub(crate) async fn read_in_process_only<W>(p: &'static Provider, walk: W) -> ProcessSnapshot
+/// The read behind [`snapshot_unshared`], generic over the walk so a test
+/// drives this exact path beside a provider's own callers. A walk still running
+/// when `budget` expires finishes on the pool and its answer is dropped.
+pub(crate) async fn read_unshared<W>(walk: W, budget: Duration) -> ProcessSnapshot
 where
     W: FnOnce() -> Result<ProcessSnapshot, String> + Send + 'static,
 {
-    let read = spawn_blocking_tracked(move || match p.lead_or_join(Duration::ZERO, walk) {
-        Ok(snap) => snap,
-        Err(flight) => flight.settle(None),
-    })
-    .await;
-    match read {
-        Ok(snap) => snap,
-        Err(e) => {
-            // The flight (if any) was settled by its drop during the unwind.
-            tracing::debug!("process_table: an in-process-only read did not join: {e}");
-            ProcessSnapshot::default()
+    let why = match tokio::time::timeout(budget, spawn_blocking_tracked(walk)).await {
+        Ok(Ok(Ok(mut snap))) => {
+            snap.stale = false;
+            return snap;
         }
-    }
+        Ok(Ok(Err(why))) => why,
+        Ok(Err(e)) => format!("did not join: {e}"),
+        Err(_) => format!("still walking after {}ms", budget.as_millis()),
+    };
+    tracing::debug!("process_table: an unshared read answered stale: {why}");
+    ProcessSnapshot::default()
 }
 
 /// The async read every snapshot goes through: `walk` on the blocking pool
@@ -1679,48 +1678,93 @@ mod tests {
         );
     }
 
-    /// `read_in_process_only` (behind `snapshot_fresh_in_process_only`, the
-    /// classify_child shadow's tables): a failed walk answers stale WITHOUT the
-    /// fallback — no attempt counted, the slot left free, the circuit left
-    /// closed, however many times it fails — and a slot an acting caller holds
-    /// is neither waited on nor released, so that caller's own attempt alone
-    /// decides the circuit.
+    /// `read_unshared` (behind `snapshot_unshared`, the classify_child shadow's
+    /// tables) is invisible to every other caller. While a FAILING unshared
+    /// read is still walking, a memoized `read_with` caller does not join it
+    /// and inherit its failure: it leads its own walk and, when that fails too,
+    /// takes the fallback and is served the fallback's table. The unshared read
+    /// then answers stale and leaves no trace — the caller's attempt is the only
+    /// one counted, and the circuit stays closed.
     #[tokio::test]
-    async fn process_table_an_in_process_only_read_never_takes_the_fallback() {
-        let clock = FakeClock::new();
-        let p: &'static Provider = Box::leak(Box::new(Provider::with_clock(cfg(), clock.clock())));
-        let ok = read_in_process_only(p, || Ok(table(4))).await;
-        assert!(
-            !ok.stale && ok.names.contains_key(&4),
-            "a good walk answers"
-        );
-        for _ in 0..3 {
-            // Past the good walk's instant, so the memo-less read walks again.
-            clock.advance(Duration::from_secs(1));
-            let s = read_in_process_only(p, || Err("scripted".to_string())).await;
-            assert!(s.stale, "a failed walk is stale, never a fabricated table");
-            assert!(s.names.contains_key(&4), "the last good table, labelled");
-        }
-        let health = p.health_json();
-        assert_eq!(health["powershellFallbacks"], 0, "{health}");
-        assert!(health["circuitOpenUntil"].is_null(), "{health}");
+    async fn process_table_a_memo_caller_beside_a_failing_unshared_read_still_gets_the_fallback() {
+        let p: &'static Provider = Box::leak(Box::new(Provider::new(cfg())));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let unshared = tokio::spawn(read_unshared(
+            move || {
+                let _ = started_tx.send(());
+                // Stands in for a slow in-process walk that then fails.
+                let _ = release_rx.recv_timeout(Duration::from_secs(10));
+                Err("scripted unshared walk failure".to_string())
+            },
+            Duration::from_secs(30),
+        ));
+        started_rx.await.expect("the unshared walk started");
 
-        let held = p
-            .begin_fallback()
-            .expect("an acting caller takes the free slot");
-        clock.advance(Duration::from_secs(1));
-        let s = read_in_process_only(p, || Err("scripted".to_string())).await;
-        assert!(s.stale);
+        let fallbacks = Arc::new(AtomicUsize::new(0));
+        let ran = Arc::clone(&fallbacks);
+        let served = read_with(
+            p,
+            MEMO_TTL,
+            || Err("scripted".to_string()),
+            || async move {
+                ran.fetch_add(1, Ordering::SeqCst);
+                Some(table(9))
+            },
+        )
+        .await;
         assert!(
-            p.begin_fallback().is_none(),
-            "the acting caller still holds its slot"
+            !served.stale && served.names.contains_key(&9),
+            "the memoized caller was served its own fallback's table"
         );
-        held.end(true, "the acting caller's attempt");
-        assert!(p.health_json()["circuitOpenUntil"].is_null());
+        assert_eq!(fallbacks.load(Ordering::SeqCst), 1);
+
+        release_tx.send(()).expect("release the unshared walk");
+        let observed = unshared.await.expect("the unshared read joined");
+        assert!(
+            observed.stale,
+            "a failed unshared walk is stale, never fabricated"
+        );
+        let health = p.health_json();
         assert_eq!(
-            p.health_json()["powershellFallbacks"],
-            1,
-            "only its attempt"
+            health["powershellFallbacks"], 1,
+            "only the caller's own attempt is counted: {health}"
+        );
+        assert!(health["circuitOpenUntil"].is_null(), "{health}");
+    }
+
+    /// `read_unshared` is bounded: a walk still running at its budget answers
+    /// stale at once (the walk finishes on the pool, its answer dropped), and a
+    /// good walk answers its own table, fresh.
+    #[tokio::test]
+    async fn process_table_an_unshared_read_is_bounded_and_fresh_when_it_succeeds() {
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let began = Instant::now();
+        let late = read_unshared(
+            move || {
+                let _ = release_rx.recv_timeout(Duration::from_secs(10));
+                Ok(table(7))
+            },
+            Duration::from_millis(50),
+        )
+        .await;
+        assert!(
+            late.stale && late.names.is_empty(),
+            "past its budget: UNKNOWN"
+        );
+        assert!(
+            began.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            began.elapsed()
+        );
+        let _ = release_tx.send(());
+
+        let mut walked = table(4);
+        walked.stale = true;
+        let good = read_unshared(move || Ok(walked), Duration::from_secs(30)).await;
+        assert!(
+            !good.stale && good.names.contains_key(&4),
+            "a good walk is fresh"
         );
     }
 
