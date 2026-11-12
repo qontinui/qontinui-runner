@@ -233,8 +233,14 @@ fn a_roster_ids_close_and_finish_are_recorded_with_their_reasons_and_a_non_roste
     for id in ["closed-one", "finished-one", "stranger"] {
         store.record_open(row(id));
     }
-    store.record_close("closed-one", "explicit");
-    store.record_close("stranger", "explicit");
+    store.record_close(
+        "closed-one",
+        crate::session::close_reason::CloseReason::Explicit,
+    );
+    store.record_close(
+        "stranger",
+        crate::session::close_reason::CloseReason::Explicit,
+    );
     store
         .set_finished("finished-one", true, None)
         .expect("a known session");
@@ -453,7 +459,10 @@ fn the_record_outlives_the_rows_prune() {
     let a = open_at(dir.path(), BOOT, &roster(&["came-back"]));
     a.observe_registry(&store.all_records());
     a.observe_tick(3_000, &[("came-back".to_string(), Direct)], held(&[]));
-    store.record_close("came-back", "explicit");
+    store.record_close(
+        "came-back",
+        crate::session::close_reason::CloseReason::Explicit,
+    );
     a.observe_registry(&store.all_records());
 
     store.prune(
@@ -801,4 +810,101 @@ fn the_record_file_names_its_boot_and_generation_and_uses_camel_case_keys() {
         parse_aftermath_file_name("session-ledger-aftermath.2000.json.tmp.1"),
         None
     );
+}
+
+/// MEASUREMENT of what the record adds to one liveness-poll tick, at a roster
+/// larger than any measured on the operator box (Reading 1: 342 prior
+/// sessions): feed (a) over 400 registry rows, feed (b) with 200 kept-alive
+/// rows and a 200-id read, and the idle tick's `wants_process_read`; then the
+/// same with a change to write, and the report's `inputs`. Prints the numbers;
+/// the bound fails only an order-of-magnitude regression on a loaded box. Run:
+/// `cargo-guard.sh test -- session::ledger_aftermath::tests::measure --ignored --nocapture`.
+#[test]
+#[ignore = "measurement: run with --ignored --nocapture"]
+fn measure_the_per_tick_cost() {
+    use std::time::{Duration, Instant};
+    let dir = tempfile::tempdir().unwrap();
+    let ids: Vec<String> = (0..400)
+        .map(|i| format!("{i:08x}-0000-4000-8000-000000000000"))
+        .collect();
+    let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+    let a = open_at(dir.path(), BOOT, &roster(&refs[..350]));
+    let rows: Vec<TerminalSessionRecord> = ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| {
+            if i % 3 == 0 {
+                closed_row(id, 3_000, "explicit")
+            } else {
+                row(id)
+            }
+        })
+        .collect();
+    let kept: Vec<(String, PollTerminalMatch)> =
+        ids[..200].iter().map(|id| (id.clone(), Direct)).collect();
+    let held_ids: Vec<String> = ids[100..300].to_vec();
+    a.observe_registry(&rows);
+    a.observe_tick(4_000, &kept, ProcessRead::Held(held_ids.clone()));
+
+    let ticks = 200u32;
+    let t = Instant::now();
+    for i in 0..ticks {
+        a.observe_registry(&rows);
+        a.observe_tick(
+            5_000 + i64::from(i),
+            &kept,
+            ProcessRead::Held(held_ids.clone()),
+        );
+        let _ = a.wants_process_read();
+    }
+    let steady = t.elapsed() / ticks;
+
+    let writes = 50u32;
+    let t = Instant::now();
+    for i in 0..writes {
+        let mut changed = rows.clone();
+        changed[1] = closed_row(&ids[1], 10_000 + i64::from(i), "pty-exit");
+        assert!(a.observe_registry(&changed), "each change is written");
+    }
+    let writing = t.elapsed() / writes;
+
+    let reads = 100u32;
+    let t = Instant::now();
+    for _ in 0..reads {
+        let _ = a.inputs(6_000);
+    }
+    let inputs = t.elapsed() / reads;
+    let bytes = std::fs::metadata(dir.path().join(aftermath_file_name(BOOT)))
+        .unwrap()
+        .len();
+    eprintln!(
+        "aftermath per-tick cost (350 roster ids, 400 rows, 200 kept alive, 200 held): \
+         steady tick (no write) {steady:?}; tick with a change (one atomic write of \
+         {bytes} bytes) {writing:?}; report inputs() {inputs:?}"
+    );
+    assert!(steady < Duration::from_millis(50), "{steady:?}");
+}
+
+/// MEASUREMENT of the one cost an idle tick adds while a prior-roster session
+/// is unsettled: a real process-table snapshot and live-session read on this
+/// machine (read-only). Run as `measure_the_per_tick_cost` is.
+#[tokio::test]
+#[ignore = "measurement: run with --ignored --nocapture"]
+async fn measure_the_idle_tick_snapshot_and_read() {
+    use std::time::{Duration, Instant};
+    let t = Instant::now();
+    let snap = crate::process_capture::process_tree::snapshot_process_table_public().await;
+    let snapshot = t.elapsed();
+    let t = Instant::now();
+    let read =
+        read_live_claude_sessions(&snap, crate::terminal::transcript::find_claude_config_dirs);
+    let reading = t.elapsed();
+    eprintln!(
+        "idle tick: process snapshot {snapshot:?} ({} processes, stale={}); live-session read \
+         {reading:?} ({} live sessions)",
+        snap.names.len(),
+        snap.stale,
+        read.as_ref().map_or(0, |r| r.sessions.len())
+    );
+    assert!(snapshot + reading < Duration::from_secs(30));
 }

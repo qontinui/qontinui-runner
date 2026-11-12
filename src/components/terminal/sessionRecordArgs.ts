@@ -238,12 +238,15 @@ export function buildSessionOpenArgs(params: {
 /**
  * Durable-close reasons a FRONTEND caller may record. Mirrors
  * `useTerminalManager`'s `FrontendCloseReason` — both arms have a live tab, so
- * a frontend writer can only ever be recording one of these two. The backend
- * additionally mints reasons no frontend can (`poll-dead`, `never-started`,
- * `no-terminal`, `migrated`, `superseded-terminal-reuse`, `launch-failed`);
- * they are deliberately NOT in this union. A `pty-exit` sent here may itself
- * be RECORDED as `launch-failed`: the backend rewrites a death close whose
- * pane never launched the Claude CLI (`terminal::launch_failure`).
+ * a frontend writer can only ever be recording one of these two. Every close
+ * reason is one typed set in the backend (`session::close_reason::CloseReason`),
+ * which `terminal_session_record_close` parses this string into and refuses
+ * anything outside; the backend alone mints the rest (`poll-dead`,
+ * `no-terminal`, `never-started`, `terminal-only-idle`, `superseded`,
+ * `superseded-terminal-reuse`, `launch-failed`, the orchestration worker's
+ * teardown), so they are deliberately NOT in this union. A `pty-exit` sent
+ * here may itself be RECORDED as `launch-failed`: the backend rewrites a death
+ * close whose pane never launched the Claude CLI (`terminal::launch_failure`).
  */
 export type FrontendSessionCloseReason = "explicit" | "pty-exit";
 

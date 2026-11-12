@@ -21,6 +21,7 @@ import {
   displayNameOf,
   getSessionLedgerReport,
   setSessionFinished,
+  type LaterClosed,
   type LedgerCapture,
   type LedgerEntry,
   type LedgerGeneration,
@@ -91,11 +92,14 @@ const outcome: LedgerOutcome = {
   finished: false,
   outcome: "missing",
   reason: "no-attempt",
+  laterClosed: null,
   resumeDir: "D:/repo/sub",
   resumeCommand:
     'cd "D:/repo/sub" && CLAUDE_CONFIG_DIR="C:/claude/.claude-gmail" claude --resume aaaa-1111',
   resumeAccount: { known: true, configDir: "C:/claude/.claude-gmail" },
 };
+
+const laterClosed: LaterClosed = { atMs: 1_700_000_090_000, reason: "explicit", deliberate: true };
 
 const generation: LedgerGeneration = {
   file: "session-ledger.1700000000000.json",
@@ -108,15 +112,17 @@ const generation: LedgerGeneration = {
   cleanShutdown: true,
   sessionCount: 1,
   verdict: "mismatch",
+  unknownReasons: [],
   returned: [],
   missing: [outcome],
   finished: [],
-  closedByUser: [],
+  closedSince: [],
 };
 
 const report: LedgerReport = {
   status: "ok",
   reason: null,
+  unknownReasons: [],
   generatedAt: 1_700_000_100_000,
   priorCapturedAt: "2023-11-14T21:58:20+00:00",
   priorReason: "poll",
@@ -124,7 +130,7 @@ const report: LedgerReport = {
   returned: [],
   missing: [outcome],
   finished: [],
-  closedByUser: [],
+  closedSince: [],
   verdict: "mismatch",
   current: ledger,
   generations: [generation],
@@ -144,6 +150,7 @@ describe("session-ledger types match the Rust serde golden", () => {
     ["SessionLedger", ledger],
     ["LedgerOutcome", outcome],
     ["ResumeAccount", outcome.resumeAccount],
+    ["LaterClosed", laterClosed],
     ["LedgerGeneration", generation],
     ["LedgerReport", report],
     ["LedgerCapture", capture],

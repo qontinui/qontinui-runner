@@ -1,34 +1,35 @@
-//! Phase 0 of plan `2026-11-11-since-restart-roster-counts-closed-sessions-as-missing`:
-//! the "Since restart" accounting defects, pinned as tests that are RED on the
-//! code they were written against.
+//! The "Since restart" accounting of plan
+//! `2026-11-11-since-restart-roster-counts-closed-sessions-as-missing`: Phase 0
+//! pinned its defects as tests RED on the code they were written against
+//! (`since_restart_*`, the first five); Phases 2 and 3 turned them green, and
+//! the Phase 3 tests below them pin the classification that did it.
 //!
 //! Every test enters the way production does:
 //!
 //! - a real [`SessionLifecycleStore`] in a tempdir;
 //! - the previous process's roster captured by the production [`capture`];
-//! - the liveness poll's observation of a live session as the `touch` its
-//!   `KeepAlive` writes (`main.rs`, the lifecycle poll's classify loop);
+//! - the liveness poll's ticks ([`Restart::poll_tick`]): the aftermath record
+//!   ([`crate::session::ledger_aftermath`]) fed from the registry after the
+//!   ledger capture, then with the rows the classify loop kept alive on their
+//!   own pane (the `touch` its `KeepAlive` writes) and the tick's live-session
+//!   read — the two points `main.rs`'s lifecycle poll feeds it;
 //! - closes through the production [`SessionLifecycleStore::record_close`] with
 //!   the reasons production writes (`explicit`, `pty-exit`, `no-terminal`);
-//! - the classification through [`observed_back`] + [`registry_now`] +
-//!   [`diff`] / [`generation_reports`] — the sequence [`report`] runs. `report`
-//!   itself is not callable here: it reads the process-global ledger
-//!   generations and the latched boot census.
+//! - the classification through [`observed_back`] + [`registry_now`] + the
+//!   record's inputs + [`diff`] / [`generation_reports`] — the sequence
+//!   [`report`] runs. `report` itself is not callable here: it reads the
+//!   process-global ledger generations, the latched boot census and the
+//!   process's own record.
 //!
-//! Each assertion states the INTENDED behaviour (the plan's D1 and D2), never
-//! today's output, and each test asserts a control first: a session nothing
-//! brought back stays `missing`, so a fix cannot pass by reporting nothing
-//! missing at all.
-//!
-//! Phases 2 and 3 turn them green. Phase 2's aftermath record is fed where these
-//! tests observe a session alive ([`Restart::poll_saw_alive`], the poll's
-//! `KeepAlive`) and from the live session registry (test 3's
-//! `read_live_sessions` fixture); Phase 3's `classify` reads that record, which
-//! is the input [`Restart::report`] gains.
+//! Each assertion states the INTENDED behaviour (the plan's D1, D2 and D4),
+//! and each test asserts a control first: a session nothing brought back stays
+//! `missing`, so a fix cannot pass by reporting nothing missing at all.
 
 use super::*;
 use crate::session::claude_session_registry::read_live_sessions;
-use crate::session::session_lifecycle_store::TerminalSessionRecord;
+use crate::session::close_reason::CloseReason;
+use crate::session::ledger_aftermath::{LedgerAftermath, ProcessRead};
+use crate::session::session_lifecycle_store::{PollTerminalMatch, TerminalSessionRecord};
 
 /// The generation file the restart under test rotated its prior roster into.
 const GENERATION_FILE: &str = "session-ledger.1000.json";
@@ -125,6 +126,8 @@ struct Restart {
     /// This process's boot instant: after the capture, before anything a test
     /// does next.
     boot_at_ms: i64,
+    /// This boot's aftermath record, fed where the liveness poll feeds it.
+    aftermath: LedgerAftermath,
 }
 
 impl Restart {
@@ -149,6 +152,16 @@ impl Restart {
             "fixture: every prior session is on the captured roster"
         );
         let boot_at_ms = first_ms_after(captured_at_ms);
+        // This boot retained the prior roster into GENERATION_FILE and opened
+        // its aftermath record beside it, as `open_for_this_boot` does.
+        let retained: HashSet<String> = [GENERATION_FILE.to_string()].into_iter().collect();
+        let aftermath = LedgerAftermath::open(
+            dir.path(),
+            boot_at_ms,
+            Some(GENERATION_FILE.to_string()),
+            Some(&prior),
+            &retained,
+        );
         // Everything a test does next happens strictly after the boot.
         first_ms_after(boot_at_ms);
         Self {
@@ -156,24 +169,51 @@ impl Restart {
             store,
             prior,
             boot_at_ms,
+            aftermath,
         }
     }
 
-    /// The liveness poll found `id` alive this boot: its row matched a live pane
-    /// and was `KeepAlive`d, which is the `touch` the poll writes. Phase 2's
-    /// aftermath record is fed from the same observation.
-    fn poll_saw_alive(&self, id: &str) {
-        self.store.touch(id);
+    /// One liveness-poll tick, as `main.rs` feeds the aftermath record: (a) the
+    /// registry right after the ledger capture, then (b) the rows the classify
+    /// loop kept alive on their own pane and the tick's live-session read.
+    fn poll_tick(&self, kept_alive: &[&str], process: ProcessRead) {
+        self.aftermath.observe_registry(&self.store.all_records());
+        let kept: Vec<(String, PollTerminalMatch)> = kept_alive
+            .iter()
+            .map(|id| (id.to_string(), PollTerminalMatch::Direct))
+            .collect();
+        self.aftermath
+            .observe_tick(chrono::Utc::now().timestamp_millis(), &kept, process);
     }
 
-    /// `GET /control/sessions/ledger` as [`report`] builds it, with `live_panes`
-    /// the PTYs alive in this process now. The boot census is latched and the
-    /// terminal manager answers, so a miss count here is a claim, not an upper
-    /// bound (`restore_stamps_available` is true, as in `report`).
-    fn report(&self, live_panes: &[&str]) -> LedgerReport {
+    /// The liveness poll found `id` alive this boot: its row matched its own
+    /// live pane and was `KeepAlive`d — the `touch` the poll writes, in a tick
+    /// that feeds the aftermath record the same observation.
+    fn poll_saw_alive(&self, id: &str) {
+        self.store.touch(id);
+        self.poll_tick(&[id], ProcessRead::Held(Vec::new()));
+    }
+
+    /// `GET /control/sessions/ledger` as [`report`] builds it, after one more
+    /// poll tick whose live-session read found `held` held by a live `claude`;
+    /// `live_panes` are the PTYs alive in this process now. The boot census is
+    /// latched and the terminal manager answers, so a miss count here is a
+    /// claim, not an upper bound (`restore_stamps_available` is true, as in
+    /// `report`).
+    fn report(&self, live_panes: &[&str], held: &[String]) -> LedgerReport {
+        self.report_after(live_panes, ProcessRead::Held(held.to_vec()))
+    }
+
+    /// [`Self::report`] after a poll tick whose live-session read was
+    /// `process`.
+    fn report_after(&self, live_panes: &[&str], process: ProcessRead) -> LedgerReport {
+        self.poll_tick(&[], process);
         let live: HashSet<String> = live_panes.iter().map(|t| t.to_string()).collect();
         let back = observed_back(&self.store, Some(self.boot_at_ms), Some(&live));
-        let now_state = registry_now(&self.store);
+        let now_state = AfterRestart {
+            registry: registry_now(&self.store),
+            aftermath: self.aftermath.inputs(chrono::Utc::now().timestamp_millis()),
+        };
         let current = capture(
             &self.store,
             &NoTranscripts,
@@ -199,8 +239,7 @@ impl Restart {
 }
 
 /// Where `id` landed in one set of buckets. `closed` is the deliberate-close
-/// bucket, named here by the plan's D2 class (`closed-since`); today's report
-/// field for it is `closed_by_user`, which Phase 3 renames `closed_since`.
+/// bucket, the plan's D2 class (`closed-since`).
 fn bucket_in(
     returned: &[LedgerOutcome],
     missing: &[LedgerOutcome],
@@ -234,14 +273,14 @@ fn buckets(report: &LedgerReport, id: &str) -> (&'static str, &'static str) {
             &report.returned,
             &report.missing,
             &report.finished,
-            &report.closed_by_user,
+            &report.closed_since,
             id,
         ),
         bucket_in(
             &generation.returned,
             &generation.missing,
             &generation.finished,
-            &generation.closed_by_user,
+            &generation.closed_since,
             id,
         ),
     )
@@ -256,9 +295,11 @@ fn buckets(report: &LedgerReport, id: &str) -> (&'static str, &'static str) {
 fn since_restart_a_session_seen_alive_then_closed_explicit_is_back_not_missing() {
     let restart = Restart::new(&["came-back", "lost"]);
     restart.poll_saw_alive("came-back");
-    restart.store.record_close("came-back", "explicit");
+    restart
+        .store
+        .record_close("came-back", CloseReason::Explicit);
 
-    let report = restart.report(&[UNRELATED_LIVE_PANE]);
+    let report = restart.report(&[UNRELATED_LIVE_PANE], &[]);
 
     assert_eq!(
         buckets(&report, "lost"),
@@ -278,14 +319,17 @@ fn since_restart_a_session_seen_alive_then_closed_explicit_is_back_not_missing()
 /// (Reading 1's 6). A close cannot undo a return, whatever its reason.
 #[test]
 fn since_restart_a_session_seen_alive_then_closed_pty_exit_or_no_terminal_is_back() {
-    let closes = [("exited", "pty-exit"), ("orphaned", "no-terminal")];
+    let closes = [
+        ("exited", CloseReason::PtyExit),
+        ("orphaned", CloseReason::NoTerminal),
+    ];
     let restart = Restart::new(&["exited", "orphaned", "lost"]);
     for (id, reason) in closes {
         restart.poll_saw_alive(id);
         restart.store.record_close(id, reason);
     }
 
-    let report = restart.report(&[UNRELATED_LIVE_PANE]);
+    let report = restart.report(&[UNRELATED_LIVE_PANE], &[]);
 
     assert_eq!(
         buckets(&report, "lost"),
@@ -294,7 +338,7 @@ fn since_restart_a_session_seen_alive_then_closed_pty_exit_or_no_terminal_is_bac
     );
     let not_back: Vec<(&str, &str, (&str, &str))> = closes
         .iter()
-        .map(|(id, reason)| (*id, *reason, buckets(&report, id)))
+        .map(|(id, reason)| (*id, reason.as_str(), buckets(&report, id)))
         .filter(|(_, _, placed)| *placed != ("back", "back"))
         .collect();
     assert!(
@@ -313,14 +357,10 @@ fn since_restart_a_session_seen_alive_then_closed_pty_exit_or_no_terminal_is_bac
 /// `live_identity` from on every snapshot tick. Intended (D1): back, on that
 /// evidence, whatever terminal the row points at.
 ///
-/// Why the evidence is not injected into the classification: at `origin/main`
-/// none of the three classification calls takes process evidence.
-/// `observed_back` reads the store, this boot's instant and the live TERMINAL
-/// set; `registry_now` reads the store; `diff` / `generation_reports` take the
-/// resulting `back` list. The fixture below is the real reader's real input,
-/// asserted to read as live. Phase 2 records it in the aftermath record from
-/// the poll's `live_identity`, and Phase 3's `classify` reads that record;
-/// handing `held` to [`Restart::report`] then turns this test green.
+/// The fixture below is the real reader's real input, asserted to read as
+/// live; it is handed to the poll tick [`Restart::report`] runs, which records
+/// it in the aftermath record (`process`) and as the newest tick's process
+/// evidence — the two arms `classify` reads besides "back now".
 #[test]
 fn since_restart_a_row_on_an_exited_pane_whose_id_a_live_claude_holds_is_back() {
     let restart = Restart::new(&["migrated", "lost"]);
@@ -347,7 +387,7 @@ fn since_restart_a_row_on_an_exited_pane_whose_id_a_live_claude_holds_is_back() 
         "fixture: the production registry reader reads the session as held by a live claude"
     );
 
-    let report = restart.report(&["term-new-pane", UNRELATED_LIVE_PANE]);
+    let report = restart.report(&["term-new-pane", UNRELATED_LIVE_PANE], &held);
 
     assert_eq!(
         buckets(&report, "lost"),
@@ -362,18 +402,24 @@ fn since_restart_a_row_on_an_exited_pane_whose_id_a_live_claude_holds_is_back() 
     );
 }
 
-/// Defect 2 ("Why" 2): the closed-on-purpose class never fires. A session that
-/// never came back and was then closed `explicit` (the webview's tab close) reads
-/// `missing`, because `registry_now` files a session as closed on purpose only
-/// for `user-close`, which no production code writes. Intended (D2): not
-/// missing, in the deliberate-close bucket (`closed-since`).
+/// Defect 2 ("Why" 2): the closed-on-purpose class never fired. A session that
+/// never came back and was then closed `explicit` (the webview's tab close) read
+/// `missing`, because the overlay filed a session as closed on purpose only for
+/// `user-close`, which no production code writes. Intended (D2): not missing,
+/// in the deliberate-close bucket (`closed-since`), by the typed close-reason
+/// set's classification of `explicit`.
 #[test]
 fn since_restart_a_session_closed_explicit_without_coming_back_is_closed_since_not_missing() {
     let restart = Restart::new(&["closed-on-purpose", "lost"]);
-    restart.store.record_close("closed-on-purpose", "explicit");
+    restart
+        .store
+        .record_close("closed-on-purpose", CloseReason::Explicit);
 
-    let report = restart.report(&[UNRELATED_LIVE_PANE]);
-    let overlay = registry_now(&restart.store).closed_by_user;
+    let report = restart.report(&[UNRELATED_LIVE_PANE], &[]);
+    let close = registry_now(&restart.store)
+        .closed
+        .get("closed-on-purpose")
+        .cloned();
 
     assert_eq!(
         buckets(&report, "lost"),
@@ -384,7 +430,7 @@ fn since_restart_a_session_closed_explicit_without_coming_back_is_closed_since_n
         buckets(&report, "closed-on-purpose"),
         ("closed-since", "closed-since"),
         "a session closed `explicit` after the capture without coming back is closed on \
-         purpose, never missing (registry_now's closed-on-purpose overlay holds: {overlay:?})"
+         purpose, never missing (the registry's close of it: {close:?})"
     );
 }
 
@@ -396,7 +442,9 @@ fn since_restart_a_session_closed_explicit_without_coming_back_is_closed_since_n
 fn since_restart_a_session_that_came_back_stays_back_after_its_closed_row_is_pruned() {
     let restart = Restart::new(&["came-back", "lost"]);
     restart.poll_saw_alive("came-back");
-    restart.store.record_close("came-back", "explicit");
+    restart
+        .store
+        .record_close("came-back", CloseReason::Explicit);
     restart.store.prune(
         chrono::Utc::now().timestamp_millis() + TWO_DAYS_MS,
         &HashSet::new(),
@@ -410,7 +458,7 @@ fn since_restart_a_session_that_came_back_stays_back_after_its_closed_row_is_pru
         "fixture: the same prune keeps an open row seen two days ago"
     );
 
-    let report = restart.report(&[UNRELATED_LIVE_PANE]);
+    let report = restart.report(&[UNRELATED_LIVE_PANE], &[]);
 
     assert_eq!(
         buckets(&report, "lost"),
@@ -422,4 +470,252 @@ fn since_restart_a_session_that_came_back_stays_back_after_its_closed_row_is_pru
         ("back", "back"),
         "a session that came back stays back after the registry prunes its closed row"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3: the classification reads what was observed
+// ---------------------------------------------------------------------------
+
+/// The ids in one bucket, in roster order.
+fn ids(outcomes: &[LedgerOutcome]) -> Vec<&str> {
+    outcomes
+        .iter()
+        .map(|o| o.claude_session_id.as_str())
+        .collect()
+}
+
+/// A process read that failed leaves a session the read might have found
+/// `missing`, never back, and makes the verdict `unknown` — on the top-level
+/// report and on this boot's generation. Control: the same read succeeding
+/// without the id is a confident `partial`.
+#[test]
+fn since_restart_a_failed_held_id_read_leaves_the_session_missing_and_the_verdict_unknown() {
+    let restart = Restart::new(&["migrated", "kept"]);
+    restart
+        .store
+        .record_open(prior_row("migrated", "term-exited-source"));
+    restart.poll_saw_alive("kept");
+
+    let read_ok = restart.report(&["term-kept", UNRELATED_LIVE_PANE], &[]);
+    assert_eq!(buckets(&read_ok, "migrated"), ("missing", "missing"));
+    assert_eq!(
+        read_ok.verdict, VERDICT_PARTIAL,
+        "control: a read that worked"
+    );
+    assert!(read_ok.unknown_reasons.is_empty());
+
+    let failed = restart.report_after(&["term-kept", UNRELATED_LIVE_PANE], ProcessRead::Failed);
+    assert_eq!(
+        buckets(&failed, "migrated"),
+        ("missing", "missing"),
+        "a failed read is never evidence that it came back"
+    );
+    assert_eq!(buckets(&failed, "kept"), ("back", "back"));
+    for (verdict, reasons) in [
+        (&failed.verdict, &failed.unknown_reasons),
+        (
+            &failed.generations[0].verdict,
+            &failed.generations[0].unknown_reasons,
+        ),
+    ] {
+        assert_eq!(verdict, VERDICT_UNKNOWN);
+        assert_eq!(
+            reasons,
+            &vec![UNKNOWN_PROCESS_CENSUS_UNAVAILABLE.to_string()]
+        );
+    }
+    assert_eq!(
+        failed.reason.as_deref(),
+        Some(UNKNOWN_PROCESS_CENSUS_UNAVAILABLE)
+    );
+    assert!(failed.note.contains("UPPER BOUND"), "{}", failed.note);
+}
+
+/// D4: a session that came back and was then closed stays `back` and carries
+/// `laterClosed` — deliberate for `explicit`, unknown (`null`) for any other
+/// reason — while `closedSince` holds only the session closed on purpose that
+/// never came back, and a non-deliberate close of one that never came back is
+/// `missing` with its close named.
+#[test]
+fn since_restart_a_back_session_that_later_closed_carries_later_closed_and_closed_since_holds_only_sessions_that_never_came_back(
+) {
+    let restart = Restart::new(&[
+        "back-explicit",
+        "back-pty",
+        "closed-on-purpose",
+        "orphaned",
+        "lost",
+    ]);
+    restart.poll_saw_alive("back-explicit");
+    restart.poll_saw_alive("back-pty");
+    restart
+        .store
+        .record_close("back-explicit", CloseReason::Explicit);
+    restart.store.record_close("back-pty", CloseReason::PtyExit);
+    restart
+        .store
+        .record_close("closed-on-purpose", CloseReason::Explicit);
+    restart
+        .store
+        .record_close("orphaned", CloseReason::NoTerminal);
+
+    let report = restart.report(&[UNRELATED_LIVE_PANE], &[]);
+
+    for (returned, closed_since, missing) in [
+        (&report.returned, &report.closed_since, &report.missing),
+        (
+            &report.generations[0].returned,
+            &report.generations[0].closed_since,
+            &report.generations[0].missing,
+        ),
+    ] {
+        assert_eq!(ids(returned), vec!["back-explicit", "back-pty"]);
+        assert_eq!(ids(closed_since), vec!["closed-on-purpose"]);
+        assert_eq!(ids(missing), vec!["lost", "orphaned"]);
+        let later = |id: &str| {
+            returned
+                .iter()
+                .find(|o| o.claude_session_id == id)
+                .and_then(|o| o.later_closed.clone())
+        };
+        let explicit = later("back-explicit").expect("a later close");
+        assert_eq!(explicit.reason, "explicit");
+        assert_eq!(explicit.deliberate, Some(true));
+        assert_eq!(
+            explicit.at_ms,
+            restart.store.get("back-explicit").unwrap().closed_at
+        );
+        let pty = later("back-pty").expect("a later close");
+        assert_eq!(pty.reason, "pty-exit");
+        assert_eq!(
+            pty.deliberate, None,
+            "a pty-exit is not known to be deliberate, nor known not to be"
+        );
+        let closed = &closed_since[0];
+        assert_eq!(closed.outcome, OUTCOME_CLOSED_SINCE);
+        assert_eq!(closed.reason.as_deref(), Some("closed:explicit"));
+        assert_eq!(closed.later_closed, None);
+        let orphaned = missing
+            .iter()
+            .find(|o| o.claude_session_id == "orphaned")
+            .unwrap();
+        assert_eq!(orphaned.reason.as_deref(), Some("closed:no-terminal"));
+    }
+}
+
+/// The amendment of 2026-11-12: a session that came back, was finished and
+/// then closed still reads finished after the registry prunes its row (from
+/// the aftermath record, which `/resume-unfinished` relies on to skip it).
+#[test]
+fn since_restart_a_session_that_came_back_finished_and_closed_still_reads_finished_after_the_prune()
+{
+    let restart = Restart::new(&["done", "lost"]);
+    restart.poll_saw_alive("done");
+    restart
+        .store
+        .set_finished("done", true, None)
+        .expect("a known session");
+    restart.poll_tick(&[], ProcessRead::Held(Vec::new()));
+    restart.store.record_close("done", CloseReason::PtyExit);
+    restart.poll_tick(&[], ProcessRead::Held(Vec::new()));
+    restart.store.prune(
+        chrono::Utc::now().timestamp_millis() + TWO_DAYS_MS,
+        &HashSet::new(),
+    );
+    assert!(restart.store.get("done").is_none(), "fixture: pruned");
+
+    let report = restart.report(&[UNRELATED_LIVE_PANE], &[]);
+
+    assert_eq!(buckets(&report, "done"), ("back", "back"));
+    let done = report
+        .returned
+        .iter()
+        .find(|o| o.claude_session_id == "done")
+        .unwrap();
+    assert!(
+        done.finished,
+        "finished as recorded, though the row is gone"
+    );
+    assert_eq!(
+        done.later_closed.as_ref().map(|c| c.reason.as_str()),
+        Some("pty-exit")
+    );
+}
+
+/// A session whose row is gone and that no record has is UNKNOWN: `missing`
+/// with reason `record-gone`, and the verdict `unknown` (counted as "up to"),
+/// never a confident miss.
+#[test]
+fn since_restart_a_pruned_session_no_record_has_is_record_gone_and_the_verdict_unknown() {
+    let restart = Restart::new(&["gone", "lost"]);
+    restart.store.record_close("gone", CloseReason::PtyExit);
+    restart.store.prune(
+        chrono::Utc::now().timestamp_millis() + TWO_DAYS_MS,
+        &HashSet::new(),
+    );
+    assert!(restart.store.get("gone").is_none(), "fixture: pruned");
+
+    let report = restart.report(&[UNRELATED_LIVE_PANE], &[]);
+
+    let reason = |id: &str| {
+        report
+            .missing
+            .iter()
+            .find(|o| o.claude_session_id == id)
+            .and_then(|o| o.reason.clone())
+    };
+    assert_eq!(reason("gone").as_deref(), Some(MISSING_RECORD_GONE));
+    assert_ne!(
+        reason("lost").as_deref(),
+        Some(MISSING_RECORD_GONE),
+        "control: a row the registry still holds is not record-gone"
+    );
+    assert_eq!(report.verdict, VERDICT_UNKNOWN);
+    assert_eq!(
+        report.unknown_reasons,
+        vec![UNKNOWN_RECORD_GONE.to_string()]
+    );
+    assert_eq!(report.generations[0].verdict, VERDICT_UNKNOWN);
+}
+
+/// The note's numbers are the buckets' sizes.
+#[test]
+fn since_restart_the_notes_numbers_equal_the_buckets() {
+    let restart = Restart::new(&["back", "back-closed", "missed", "finished", "closed"]);
+    restart.poll_saw_alive("back");
+    restart.poll_saw_alive("back-closed");
+    restart
+        .store
+        .record_close("back-closed", CloseReason::Explicit);
+    restart
+        .store
+        .set_finished("finished", true, None)
+        .expect("a known session");
+    restart.store.record_close("closed", CloseReason::Explicit);
+
+    let report = restart.report(&["term-back", UNRELATED_LIVE_PANE], &[]);
+
+    let later = report
+        .returned
+        .iter()
+        .filter(|o| o.later_closed.is_some())
+        .count();
+    let (back, missing, finished, closed) = (
+        report.returned.len(),
+        report.missing.len(),
+        report.finished.len(),
+        report.closed_since.len(),
+    );
+    assert_eq!((back, later, missing, finished, closed), (2, 1, 1, 1, 1));
+    let headline = format!(
+        "{back} of {} sessions open before the last shutdown came back ({later} later closed); \
+         {missing} did not;",
+        back + missing
+    );
+    assert!(report.note.starts_with(&headline), "{}", report.note);
+    let tail = format!(
+        "{finished} finished and {closed} closed since the restart without coming back are not \
+         expected back."
+    );
+    assert!(report.note.contains(&tail), "{}", report.note);
 }

@@ -70,6 +70,7 @@ function outcome(id: string, over: Partial<LedgerOutcome> = {}): LedgerOutcome {
     finished: false,
     outcome: "missing",
     reason: "no-attempt",
+    laterClosed: null,
     resumeDir: "D:/repo/sub",
     resumeCommand: `cd "D:/repo/sub" && CLAUDE_CONFIG_DIR="C:/claude/.claude-gmail" claude --resume ${id}`,
     resumeAccount: { known: true, configDir: "C:/claude/.claude-gmail" },
@@ -80,7 +81,8 @@ function outcome(id: string, over: Partial<LedgerOutcome> = {}): LedgerOutcome {
 const back = (id: string, over: Partial<LedgerOutcome> = {}) =>
   outcome(id, { outcome: "back", reason: null, ...over });
 const finished = (id: string) => outcome(id, { outcome: "finished", reason: null, finished: true });
-const closedByUser = (id: string) => outcome(id, { outcome: "closed-by-user", reason: null });
+const closedSince = (id: string) =>
+  outcome(id, { outcome: "closed-since", reason: "closed:explicit" });
 
 /**
  * The serde field name of a generation's size. Spelled through a constant
@@ -95,14 +97,14 @@ function generation(
     returned?: LedgerOutcome[];
     missing?: LedgerOutcome[];
     finished?: LedgerOutcome[];
-    closedByUser?: LedgerOutcome[];
+    closedSince?: LedgerOutcome[];
   },
   verdict: LedgerGeneration["verdict"] = "partial",
 ): LedgerGeneration {
   const returned = parts.returned ?? [];
   const missing = parts.missing ?? [];
   const fin = parts.finished ?? [];
-  const closed = parts.closedByUser ?? [];
+  const closed = parts.closedSince ?? [];
   return {
     file,
     rotatedAtMs: 5_000,
@@ -114,10 +116,11 @@ function generation(
     cleanShutdown: true,
     [SESSION_COUNT]: returned.length + missing.length + fin.length + closed.length,
     verdict,
+    unknownReasons: [],
     returned,
     missing,
     finished: fin,
-    closedByUser: closed,
+    closedSince: closed,
   };
 }
 
@@ -166,7 +169,8 @@ function report(
     returned: [],
     missing: [],
     finished: [],
-    closedByUser: [],
+    closedSince: [],
+    unknownReasons: [],
     verdict: "partial",
     current: {
       ledgerVersion: 1,
@@ -276,14 +280,14 @@ describe("rows", () => {
   });
 
   it("labels a session the operator closed since as `closed by you` — tickable, never missing", () => {
-    const row = buildRow(closedByUser("c"), ctx());
+    const row = buildRow(closedSince("c"), ctx());
     expect(row.state).toBe("closed-by-user");
     expect(row.label).toBe("closed by you");
     expect(row.selectable).toBe(true);
     const unknown = buildRow(
       outcome("u", {
-        outcome: "closed-by-user",
-        reason: null,
+        outcome: "closed-since",
+        reason: "closed:explicit",
         resumeAccount: { known: false, configDir: null },
       }),
       ctx(),
@@ -306,7 +310,7 @@ describe("pre-check selection", () => {
       outcome("waiting", { pageId: "p2" }),
     ],
     finished: [finished("f")],
-    closedByUser: [closedByUser("closed")],
+    closedSince: [closedSince("closed")],
   });
 
   it("pre-checks only unfinished, missing, KNOWN-resumable rows — never one closed by the user", () => {
@@ -436,9 +440,7 @@ describe("strip copy", () => {
   });
 
   it("closed-by-user sessions are neither back nor missing", () => {
-    const r = report([
-      generation("g", { returned: [back("a")], closedByUser: [closedByUser("c")] }),
-    ]);
+    const r = report([generation("g", { returned: [back("a")], closedSince: [closedSince("c")] })]);
     expect(stripModel(r, ctx())).toMatchObject({ kind: "all-back", total: 1 });
   });
 
