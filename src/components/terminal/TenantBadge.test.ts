@@ -16,6 +16,7 @@ import {
   tenantBadgeLabel,
   tenantBadgeRendersWithoutSession,
 } from "./TenantBadge";
+import { tenantBoundMembership } from "./useSessionInfo";
 import type { SessionTenancy, TenancyRepoExpected, TenantDisplay } from "./useSessionInfo";
 import {
   explicitSpawnTenant,
@@ -648,6 +649,57 @@ describe("tenantBadgeDisplayAttrs — what a UI Bridge read sees", () => {
         }),
       ),
     ).toBe("set-unread");
+  });
+
+  it("is the row's classification: attribute, tone and title agree with tenantBoundMembership", () => {
+    const cases: TenantDisplay[] = [
+      shownAs(),
+      shownAs({ bound: WITHOUT_A, actingInBoundSet: false }),
+      shownAs({ actingInBoundSet: null }),
+      shownAs({
+        bound: { status: "measured", tenantIds: [], reason: null },
+        multiBound: false,
+        actingInBoundSet: false,
+      }),
+      shownAs({
+        bound: { status: "unknown", tenantIds: [], reason: "paired_user_unreadable" },
+        multiBound: null,
+        actingInBoundSet: null,
+      }),
+      // Unread beside a confident flag (the normalizer would null it): the
+      // badge must still not claim membership, in the classifier's order.
+      ...[true, false].map((actingInBoundSet) =>
+        shownAs({
+          bound: { status: "unknown", tenantIds: [], reason: "paired_user_unreadable" },
+          multiBound: null,
+          actingInBoundSet,
+        }),
+      ),
+      shownAs({ status: "unknown", tenantId: null, source: null, actingInBoundSet: false }),
+    ];
+    // The title's arm for each classification, on the acting (no-stamp) chip.
+    const titleArm: Record<string, RegExp> = {
+      in: /Tenant 6b1f4b0e is 1 of the 2 tenants/,
+      out: /Tenant 6b1f4b0e is NOT among the 2 tenants/,
+      unknown: /Whether tenant 6b1f4b0e is among the 2 tenants .* is unknown/,
+      "no-bound-tenants": /This runner has no bound tenants\./,
+      "set-unread": /could not be read \(paired_user_unreadable\)/,
+    };
+    for (const display of cases) {
+      const membership = tenantBoundMembership(display);
+      const t = tenancy({ credential: A, diverged: false, display });
+      expect(tenantBadgeDisplayAttrs(t)["data-tenant-bound-membership"]).toBe(
+        membership ?? undefined,
+      );
+      const label = tenantBadgeLabel(undefined, true, t);
+      if (display.status !== "resolved") {
+        // Nothing names a tenant: the badge does not render at all.
+        expect(label).toBeNull();
+        continue;
+      }
+      expect(label?.outsideBoundSet).toBe(membership === "out");
+      expect(label?.title).toMatch(titleArm[membership as string]);
+    }
   });
 
   it("claims nothing when the runner sent no display", () => {
