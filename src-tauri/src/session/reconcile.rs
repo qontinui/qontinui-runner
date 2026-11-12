@@ -1170,6 +1170,13 @@ impl ProviderRows {
             })
     }
 
+    /// The anchor (pid + creation time) this tick read this terminal's
+    /// provider files for, whatever the verdict. `None` when this tick read
+    /// none for it.
+    pub fn anchor(&self, terminal_id: &str) -> Option<(u32, Option<i64>)> {
+        self.by_terminal.get(terminal_id).map(|e| e.anchor)
+    }
+
     /// Every `(terminal id, anchor, verdict)` read this tick.
     pub fn entries(
         &self,
@@ -1928,9 +1935,15 @@ mod tests {
             valid,
             vec![("term-1", "44348633-0000-4000-8000-000000000002", d.path())]
         );
+        // The anchor the row was read for is looked up by terminal.
+        assert_eq!(rows.anchor("term-1"), Some((31524, Some(1_790_000_000))));
+        assert_eq!(rows.anchor("term-absent"), None);
         let (_d, rows) = rows_fixture(1_790_000_000, 1_790_000_000 - 7200);
         assert_eq!(rows.valid_id("term-1"), None);
         assert_eq!(rows.valid().count(), 0);
+        // A non-Valid verdict still carries its anchor: the suppression memory
+        // is keyed on it.
+        assert_eq!(rows.anchor("term-1"), Some((31524, Some(1_790_000_000))));
     }
 
     /// B6 end-to-end over the store: `refresh_titles` routes the provider name
