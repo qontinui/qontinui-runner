@@ -110,7 +110,7 @@ Each assertion is one request body for the target runner's \`POST /ui-bridge/con
 ]
 \`\`\`
 
-The runner posts each one on its own and evaluates it against the live DOM. An assertion the endpoint refuses (an unknown field shape, an unknown \`assertion\`) comes back as a failed result carrying an \`error\` that names the refusal.`,
+The runner posts each one on its own and evaluates it against the live DOM. An assertion the endpoint refuses (a missing \`query\` or \`assertion\`, an unknown \`assertion\` or \`queryType\`; extra fields are ignored) comes back as a failed result carrying an \`error\` that names the refusal.`,
     },
 
     // =========================================================================
