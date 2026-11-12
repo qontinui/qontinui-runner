@@ -545,8 +545,20 @@ Phase 4.)* `declare_intent` sees only sessions currently DECLARING, and its
 `prior_realizations_status != "ok"` — a prose `work_unit_id` returns
 `not_slug_shaped` and the lookup never runs. Neither sees an OPEN PR from a
 finished session. `coord_query_train_health` does: read its
-`candidates_in_flight[].branch` for each repo the work touches and scan the
-branch names against your intent. A branch such as
+`candidates_in_flight[].branch` AND its `queued_conflicting_head_details[].branch`
+for each repo the work touches and scan the branch names against your intent.
+Both lists, because a queued proposal whose PR GitHub reports conflicting at its
+own head is parked by the dequeue claim and is listed ONLY in the second one (plan
+`2026-10-31-conflicting-head-exclusion-is-invisible-to-the-reads-that-report-the-queue`);
+a parked PR is still open work by a peer. A coord build that serves no
+`queued_conflicting_head_details` key still lists parked rows in
+`candidates_in_flight`, so reading the one list there loses nothing. A key that
+is PRESENT but `null` is different: that build already dropped parked rows from
+`candidates_in_flight`, and the advisory read that lists them failed
+(`queued_conflicting_head_details_error` says why) — so the parked half of the
+scan is UNKNOWN, and an empty scan is not "no peer branch". The list is also
+bounded (50 rows): when `queued_conflicting_head` exceeds its length, a branch
+absent from it proves nothing. A branch such as
 `fix/untimed-subprocess-isolated-edit` beside an intent to fix that very
 function means the work is already in flight — stop and coordinate. On
 2026-09-02 a session wrote a duplicate fix to `claude_tree_is_repo_authored`
@@ -610,22 +622,28 @@ every task that starts here instead (a post-merge follow-up, a no-plan
 dispatch), which otherwise reaches its rebase with no baseline at all.
 
 - **Record whenever a task reaches a repo the session has not recorded yet;
-  a second `record` MERGES.** A repo already in the baseline keeps its sha (a
-  baseline never moves forward past what a peer landed in between), a repo
+  a second `record` MERGES, per repo and per ref.** A repo already in the
+  baseline under the same ref keeps its sha (a baseline never moves forward
+  past what a peer landed in between), a repo recorded under a different ref
+  has only its own entry replaced (`replaced <repo>: ref Y -> X`), a repo
   named for the first time is added at the sha just fetched, and the globs are
-  unioned — `kept <repo> <sha>` names each baseline left alone. Until
+  unioned — `kept <repo> <sha>` names each baseline left alone. A repo whose
+  default branch is not `main` (e.g. `master`) needs no `--ref`: each repo is
+  recorded at its own default branch. Until
   2026-09-19 this bullet said *"record ONCE per session — a second record
   overwrites"*, which left a session running a second plan in a second repo
   with no baseline it was allowed to take (measured on a `/vet-imp` session:
   round-1 runner globs, a round-3 coord plan, `check` INCOMPLETE).
 - `record` exits `0` when every glob's repo was fetched and pinned, `3`
-  (INCOMPLETE) when, e.g., a glob reached no checkout, a fetch failed or the file
-  could not be written — the baseline
+  (INCOMPLETE) when, e.g., a glob reached no checkout, a repo's default branch is
+  unresolvable, a fetch failed or the file could not be written — the baseline
   then covers less than you asked, which is UNKNOWN rather than clear — and `2`
   on usage errors, including **no session id**.
 - The matching `landed-since.sh check` (no globs: it reuses these) runs **before
   every rebase**: exit `1` names the commits, files and PR numbers that landed
-  into your paths; exit `3` is INCOMPLETE and never an all-clear.
+  into your paths; exit `3` is INCOMPLETE and never an all-clear. It reads each
+  repo at the ref it was recorded under; an explicit `--ref` overrides that for
+  every repo in the run, and must be `origin/<branch>` (anything else exits 2).
 - The baseline lives at `~/.qontinui/landed-since/<session-id>.json`, keyed on
   `$QONTINUI_AGENT_SESSION_ID`, else `$CLAUDE_CODE_SESSION_ID`. A `check` from a
   different session — or the same work under the other variable — reads no
@@ -803,7 +821,7 @@ coord_claim_acquire(kind="file_glob", resource_key="<glob>", ttl_seconds=900)   
   while the loop
   keeps renewing the others; when no renewable row is left the loop ends, and
   `status` reads `STOLEN` if any row was stolen, `MAX_RUNTIME` if its runtime
-  bound ended it, `OWNER_GONE` if owner death ended it, otherwise `DEAD`.
+  bound ended it, `OWNER_GONE` if the loop released its rows because the owner was gone (its pid died, its transcript went idle or missing, or coord closed or finished the session), otherwise `DEAD`.
   **Only `LIVE` means the claims are held.** The other seven mean the claim is
   **UNKNOWN** (`STALE` usually self-heals on the next beat; re-acquiring
   anyway is harmless — a held claim answers `renewed`), which is a re-acquire and a line in the report, never a shrug — a
