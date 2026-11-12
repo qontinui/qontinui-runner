@@ -4,7 +4,7 @@
 // processing throws. Run: node --test scripts/__tests__/export-test-coverage.test.mjs
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readdirSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, rmSync, utimesSync, writeFileSync, existsSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -14,6 +14,7 @@ const scriptPath = join(dirname(fileURLToPath(import.meta.url)), "..", "export-t
 const sandbox = mkdtempSync(join(tmpdir(), "covprod-test-sandbox-"));
 const savedTmp = { TMPDIR: process.env.TMPDIR, TMP: process.env.TMP, TEMP: process.env.TEMP };
 let withScratchDir;
+let sweepStaleScratchDirs;
 /** @type {import("node:child_process").SpawnSyncReturns<string>} */
 let guardProbe;
 
@@ -36,7 +37,7 @@ before(async () => {
 
   // os.tmpdir() reads these on every call, so the helper's dirs land here.
   process.env.TMPDIR = process.env.TMP = process.env.TEMP = sandbox;
-  ({ withScratchDir } = await import("../export-test-coverage.mjs"));
+  ({ withScratchDir, sweepStaleScratchDirs } = await import("../export-test-coverage.mjs"));
 });
 
 after(() => {
@@ -82,5 +83,23 @@ test("the scratch dir is removed when the run throws, and the error propagates",
 
 test("many runs leave nothing behind", () => {
   for (let i = 0; i < 25; i++) withScratchDir((dir) => writeFileSync(join(dir, "f"), "x"));
+  assert.deepEqual(leftovers(), []);
+});
+
+test("the startup sweep removes only covprod- dirs older than the threshold", () => {
+  const old = join(sandbox, "covprod-killedrun");
+  const fresh = join(sandbox, "covprod-inflight");
+  const other = join(sandbox, "unrelated-old");
+  for (const d of [old, fresh, other]) mkdirSync(d);
+  writeFileSync(join(old, "junit.xml"), "<x/>");
+  const twoHoursAgo = (Date.now() - 2 * 60 * 60 * 1000) / 1000;
+  utimesSync(old, twoHoursAgo, twoHoursAgo);
+  utimesSync(other, twoHoursAgo, twoHoursAgo);
+  assert.equal(sweepStaleScratchDirs(), 1);
+  assert.equal(existsSync(old), false);
+  assert.equal(existsSync(fresh), true);
+  assert.equal(existsSync(other), true);
+  rmSync(fresh, { recursive: true });
+  rmSync(other, { recursive: true });
   assert.deepEqual(leftovers(), []);
 });
