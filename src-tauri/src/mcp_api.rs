@@ -10973,9 +10973,22 @@ struct GateSpoolPlan {
 /// register-gate body that carried the runner-only
 /// [`crate::session::closeout_spool::WORK_UNIT_UPSERT_HINT_KEY`], which is
 /// stripped and re-serialized so a key coord's `UnitGateRequest` does not model
-/// never crosses the wire. (Coord ignores unknown fields, so this is hygiene
-/// rather than a fix — but "forwarded verbatim" should stay true of everything
-/// the caller can actually observe upstream.)
+/// never crosses the wire. On the LIVE forward that strip is load-bearing, not
+/// hygiene: coord's `UnitGateRequest` is `deny_unknown_fields` behind
+/// `StrictJson` (qontinui-coord#1899), so an unstripped body is answered
+/// `400 unknown_body_field`, which this forwarder returns rather than spools.
+/// The REPLAY leg never sends the stored payload as-is: the drain rebuilds the
+/// POST from a key allowlist (`coord_sync::gate_registration_body`), and that
+/// allowlist is what keeps the runner-only keys off the wire there. A spooled
+/// body coord does refuse at replay is Ack-dropped as `Permanent` on the first
+/// 4xx, except a 404 `work_unit_not_found`: that runs the recorded bootstrap
+/// and registers again, or with no bootstrap is dropped as `Acked`.
+///
+/// Once plan `2026-11-12-coord-gate-predicate-refuses-unknown-fields` lands,
+/// coord also refuses an undeclared key INSIDE `predicate`
+/// (`unknown_predicate_field`). This function deliberately does not check that:
+/// the spool does not mirror predicate vocabulary (see
+/// [`crate::session::closeout_spool::parse_gate_registration_body`]).
 ///
 /// `None` for the plan — forward with no durable fallback — when the target is
 /// not a register-gate, when no spool is installed (the session subsystem never
@@ -11008,8 +11021,10 @@ fn plan_gate_registration_spool(
         match serde_json::to_vec(&serde_json::Value::Object(input.body.clone())) {
             Ok(bytes) => axum::body::Bytes::from(bytes),
             // Unreachable for a map that just came out of serde_json, but a
-            // failure here must not lose the request: forward what we were
-            // given (coord ignores the extra key) rather than panicking.
+            // failure here must not lose the request silently: forward what we
+            // were given rather than panicking. Coord answers that body
+            // `400 unknown_body_field`, which reaches the caller as a visible
+            // refusal, not a lost write.
             Err(_) => body,
         }
     } else {
@@ -11285,8 +11300,10 @@ async fn forward_coord_write(
     // A 5xx is the OTHER half of the retryable class — coord (or a gateway in
     // front of it) did not reach a verdict on the content, so the write is
     // still worth keeping. A 4xx is NOT: that is coord refusing the body, and
-    // spooling it would replay a guaranteed failure three times and then
-    // Ack-drop it silently. The split is the shared classifier both this
+    // spooling it would replay a guaranteed failure once and Ack-drop it
+    // silently on that first refusal (the one exception, a register-gate 404
+    // `work_unit_not_found` with a recorded bootstrap, is documented on
+    // `plan_gate_registration_spool`). The split is the shared classifier both this
     // forwarder and the `coord_sync` drain read, so the two cannot disagree.
     if let Some(plan) = spool {
         let status_code =
