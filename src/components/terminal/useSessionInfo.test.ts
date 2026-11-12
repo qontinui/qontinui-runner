@@ -41,9 +41,11 @@ import {
   normalizeTenancy,
   normalizeTenantDisplay,
   spawnStampRow,
+  tenantBoundMembership,
   tenantRow,
   TENANT_DISPLAY_ABSENT_TEXT,
   type SessionTenancy,
+  type TenantBoundMembership,
   type TenantDisplay,
   LOADING_STATE,
   sessionInfoSnapshot,
@@ -1417,6 +1419,105 @@ describe("tenantRow — the acting tenant, never the spawn stamp", () => {
   });
 });
 
+describe("tenantBoundMembership — the one bound-set classification", () => {
+  const EMPTY = { status: "measured" as const, tenantIds: [], reason: null };
+  const UNREAD = { status: "unknown" as const, tenantIds: [], reason: "paired_user_unreadable" };
+
+  it("classifies each measured membership", () => {
+    expect(tenantBoundMembership(display())).toBe("in");
+    expect(
+      tenantBoundMembership(
+        display({
+          bound: { status: "measured", tenantIds: [MERYTS], reason: null },
+          actingInBoundSet: false,
+        }),
+      ),
+    ).toBe("out");
+    expect(tenantBoundMembership(display({ actingInBoundSet: null }))).toBe("unknown");
+  });
+
+  it("never claims membership of a set it could not read", () => {
+    // Even a confident flag beside an unread set: the normalizer nulls it, and
+    // the classifier does not depend on that.
+    expect(tenantBoundMembership(display({ bound: UNREAD, actingInBoundSet: true }))).toBe(
+      "set-unread",
+    );
+    expect(tenantBoundMembership(display({ bound: UNREAD, actingInBoundSet: false }))).toBe(
+      "set-unread",
+    );
+  });
+
+  it("reads a measured empty set as no bound tenants, whatever membership claims", () => {
+    for (const actingInBoundSet of [true, false, null]) {
+      expect(tenantBoundMembership(display({ bound: EMPTY, actingInBoundSet }))).toBe(
+        "no-bound-tenants",
+      );
+    }
+  });
+
+  it("places nothing in a non-empty set when the display names no tenant", () => {
+    expect(
+      tenantBoundMembership(
+        display({ status: "unknown", tenantId: null, actingInBoundSet: false }),
+      ),
+    ).toBeNull();
+    expect(tenantBoundMembership(display({ tenantId: "   ", actingInBoundSet: false }))).toBeNull();
+  });
+
+  it("gives the row no tenant, and so no membership, for a blank display id", () => {
+    // Before, a whitespace id reached the suffix and read `· not among 1 bound`
+    // while the badge stated no membership for it.
+    const row = tenantRow(
+      tenancyWith(
+        display({
+          tenantId: "   ",
+          bound: { status: "measured", tenantIds: [MERYTS], reason: null },
+          actingInBoundSet: false,
+        }),
+      ),
+    );
+    expect(row.value).toBeNull();
+    expect(row.display).toBe("unknown — no reason given");
+  });
+
+  it("is the classification the Tenant row's suffix switches on, arm for arm", () => {
+    const suffix: Record<TenantBoundMembership, string> = {
+      in: " · 1 of 4 bound",
+      out: " · not among 1 bound",
+      unknown: " · 4 bound, membership unknown",
+      "no-bound-tenants": " · this runner has no bound tenants",
+      "set-unread": " · bound set unknown — paired_user_unreadable",
+    };
+    const cases: TenantDisplay[] = [
+      display(),
+      display({
+        bound: { status: "measured", tenantIds: [MERYTS], reason: null },
+        actingInBoundSet: false,
+      }),
+      display({ actingInBoundSet: null }),
+      display({ bound: EMPTY, multiBound: false, actingInBoundSet: false }),
+      display({ bound: UNREAD, multiBound: null, actingInBoundSet: null }),
+      // Unread beside a confident flag, which the normalizer would null: the
+      // row must still not claim membership, so it holds the classifier's order.
+      display({ bound: UNREAD, multiBound: null, actingInBoundSet: true }),
+      display({ bound: UNREAD, multiBound: null, actingInBoundSet: false }),
+    ];
+    const seen = new Set<TenantBoundMembership>();
+    for (const d of cases) {
+      const membership = tenantBoundMembership(d);
+      expect(membership).not.toBeNull();
+      seen.add(membership as TenantBoundMembership);
+      expect(tenantRow(tenancyWith(d)).display).toBe(
+        `c231d9da · via credential${suffix[membership as TenantBoundMembership]}`,
+      );
+    }
+    // Every arm in `suffix` was exercised. A NEW arm is caught by the compiler
+    // instead: `boundSuffix`'s switch is exhaustive (test files are not
+    // typechecked, so this table cannot catch one).
+    expect([...seen].sort()).toEqual(Object.keys(suffix).sort());
+  });
+});
+
 describe("spawnStampRow — the spawn stamp on its own row", () => {
   it("shows the stamp when the spawn chose a tenant", () => {
     expect(spawnStampRow(tenancyWith(display(), BAUHAUS))).toEqual({
@@ -1448,6 +1549,16 @@ describe("spawnStampRow — the spawn stamp on its own row", () => {
 });
 
 describe("normalizeTenantDisplay", () => {
+  it("trims the display tenant once, so a blank id names no tenant to any reader", () => {
+    expect(normalizeTenantDisplay({ ...display(), tenantId: "   " })?.tenantId).toBeNull();
+    expect(normalizeTenantDisplay({ ...display(), tenantId: ` ${QONTINUI} ` })?.tenantId).toBe(
+      QONTINUI,
+    );
+    const blank = normalizeTenantDisplay({ ...display(), tenantId: "   " });
+    expect(blank).not.toBeNull();
+    expect(tenantBoundMembership(blank as TenantDisplay)).toBeNull();
+  });
+
   it("rejects an unrecognised status rather than guessing one", () => {
     expect(normalizeTenantDisplay({ ...display(), status: "maybe" })).toBeNull();
     expect(normalizeTenantDisplay(null)).toBeNull();
