@@ -73,7 +73,8 @@ const SHIM_SCRIPT_SUFFIX: &str = "/qontinui-claude-config/scripts/coord-mcp-shim
 const MAX_SUBTREE: usize = 64;
 
 /// Images that are always work: the shells Claude Code's Bash tool runs commands
-/// under, and a nested agent. Normalized (lowercase, no path, no `.exe`).
+/// under, and a nested agent, as [`image_name`] yields them: a Windows image
+/// matches case-insensitively without its `.exe`, any other image exactly.
 const WORK_IMAGES: [&str; 14] = [
     "bash",
     "sh",
@@ -284,8 +285,16 @@ impl SessionVerdict {
     }
 }
 
-/// PURE: an image name lowercased, path and `.exe` stripped.
-fn normalize_image(image: &str) -> String {
+/// PURE: the name an image or an argv[0] is compared by, under its platform's
+/// file-name rules. Windows: the basename after the last `\` or `/`, trimmed,
+/// lowercased, one `.exe` stripped — both are separators there, and names are
+/// case-insensitive. Everywhere else: the basename after the last `/`, exactly
+/// as written — a `\` is part of a file name, case matters, and `.exe` is no
+/// suffix of anything.
+fn image_name(platform: Platform, image: &str) -> String {
+    if platform != Platform::Windows {
+        return image.rsplit('/').next().unwrap_or(image).to_string();
+    }
     let base = image
         .rsplit(['/', '\\'])
         .next()
@@ -297,10 +306,10 @@ fn normalize_image(image: &str) -> String {
         .unwrap_or(base)
 }
 
-/// PURE: is `image` (normalized) a Python interpreter name: `python`, `python3`,
+/// PURE: is `name` (an [`image_name`]) a Python interpreter name: `python`, `python3`,
 /// or `python3.<minor>`?
-fn is_python(normalized: &str) -> bool {
-    match normalized.strip_prefix("python") {
+fn is_python(name: &str) -> bool {
+    match name.strip_prefix("python") {
         Some("") | Some("3") => true,
         Some(rest) => rest
             .strip_prefix("3.")
@@ -448,11 +457,6 @@ fn same_path(platform: Platform, a: &str, b: &str) -> bool {
     }
 }
 
-/// PURE: the basename of an argv[0], normalized as an image is.
-fn argv0_image(arg: &str) -> String {
-    normalize_image(arg)
-}
-
 /// PURE: do `args` (everything after the interpreter) run the shim exactly as
 /// measured — the shim script first, then nothing or `--credential <path>`?
 /// `Ok` is the script path; `Err` names the rule that refused.
@@ -515,7 +519,7 @@ fn matches_linux_shim(
     let Some((interp, rest)) = args.split_first() else {
         return Err("the argv is empty");
     };
-    if !is_python(&argv0_image(interp)) {
+    if !is_python(&image_name(Platform::Linux, interp)) {
         return Err("argv[0] is not a python interpreter");
     }
     shim_args(Platform::Linux, rest).map(|_| ())
@@ -551,7 +555,7 @@ fn matches_windows_cmd_shim(
     let Some((inner_interp, inner_rest)) = inner_args.split_first() else {
         return Err("cmd's command is empty");
     };
-    if argv0_image(inner_interp) != "python3" {
+    if image_name(W, inner_interp) != "python3" {
         return Err("cmd's command does not start python3");
     }
     let script = shim_args(W, inner_rest)?;
@@ -578,7 +582,7 @@ fn matches_windows_cmd_shim(
     let conhost_args = split_windows_args(conhost_line);
     let conhost_ok = table.children_of(conhost_pid).is_empty()
         && matches!(conhost_args.as_slice(),
-            [exe, flag] if argv0_image(exe) == "conhost" && flag == "0x4");
+            [exe, flag] if image_name(W, exe) == "conhost" && flag == "0x4");
     if !conhost_ok {
         return Err("conhost is not a childless `conhost.exe 0x4`");
     }
@@ -610,7 +614,7 @@ fn matches_windows_cmd_shim(
     let Some((real_interp, real_rest)) = real_args.split_first() else {
         return Err("the real interpreter's command line is empty");
     };
-    if argv0_image(real_interp) != "python" {
+    if image_name(W, real_interp) != "python" {
         return Err("the real interpreter's argv[0] is not python");
     }
     let same_script = shim_args(W, real_rest).is_ok_and(|s| same_path(W, &s, &script));
@@ -631,7 +635,7 @@ fn cmd_inner_command(line: &str) -> Option<String> {
         Some(after) => after.split_once('"')?,
         None => trimmed.split_once(char::is_whitespace)?,
     };
-    if argv0_image(argv0) != "cmd" {
+    if image_name(Platform::Windows, argv0) != "cmd" {
         return None;
     }
     let mut rest = rest.trim_start();
@@ -681,7 +685,7 @@ pub fn classify_child(
     let child_image = first
         .row(child)
         .and_then(|r| r.image.as_deref())
-        .map(normalize_image)
+        .map(|i| image_name(platform, i))
         .filter(|i| !i.is_empty());
     if let Some(image) = &child_image {
         if WORK_IMAGES.contains(&image.as_str())
@@ -709,7 +713,7 @@ pub fn classify_child(
         let image = first
             .row(pid)
             .and_then(|r| r.image.as_deref())
-            .map(normalize_image)
+            .map(|i| image_name(platform, i))
             .filter(|i| !i.is_empty());
         match image {
             Some(image) => {
