@@ -1293,14 +1293,10 @@ async fn execute_action_dispatch(
     // body field. The SDK's `ControlActionRequest` and the `windowScope` facade
     // send the label in the body (like `page_evaluate` and the read/convenience
     // family), so without this fallback a body-only label would silently run in
-    // the main window. Removed from `extra` so it never leaks into the merged
-    // action params.
-    let window_label = query.window_label.clone().or_else(|| {
-        request
-            .extra
-            .remove("windowLabel")
-            .and_then(|v| v.as_str().map(String::from))
-    });
+    // the main window. Always removed from `extra` (even when the query wins)
+    // so it never leaks into the merged action params.
+    let body_window_label = super::action_wire::take_body_window_label(&mut request.extra);
+    let window_label = query.window_label.clone().or(body_window_label);
     let window_label = window_label.as_deref().filter(|s| !s.is_empty());
 
     // ── Unknown-window gate ─────────────────────────────────────────────
@@ -1544,35 +1540,24 @@ async fn execute_action_dispatch(
             None
         };
 
-    // Merge flat top-level fields into params so actions like drag work with
-    // both {"action":"drag","params":{"targetPosition":{...}}} and
-    // {"action":"drag","targetPosition":{...}} formats.
-    let merged_params = if request.extra.is_empty() {
-        request.params
-    } else {
-        let mut base = match request.params {
-            Some(serde_json::Value::Object(m)) => m,
-            _ => serde_json::Map::new(),
-        };
-        for (k, v) in request.extra {
-            base.entry(k).or_insert(v);
-        }
-        Some(serde_json::Value::Object(base))
-    };
-
-    let action_obj = serde_json::json!({
-        "action": action_name,
-        "params": merged_params,
-        "waitOptions": request.wait_options
-    });
-
-    let payload = super::request::target_window_payload(
-        serde_json::json!({
-            "elementId": id,
-            "action": action_obj.clone()
-        }),
+    // Hoist the SDK's listed request fields (`verifyEffect`, `captureAfter`,
+    // `requestId`, ...) onto the envelope and merge only the remaining flat
+    // top-level fields into params, so actions like drag work with both
+    // {"action":"drag","params":{"targetPosition":{...}}} and
+    // {"action":"drag","targetPosition":{...}} formats. See
+    // `action_wire::control_element_action`.
+    let split = super::action_wire::control_element_action(
+        &action_name,
+        request.params,
+        request.wait_options,
         window_label,
+        request.extra,
     );
+    let merged_params = split.params;
+    let payload = match super::action_wire::element_action_payload(&id, split.envelope) {
+        Ok(payload) => payload,
+        Err(missing) => return Err((StatusCode::BAD_REQUEST, Json(missing.error_response()))),
+    };
 
     // ── Issue 2: Disabled-state detection ──────────────────────────────
     // Before dispatching the action, fetch the element state and reject
@@ -1893,13 +1878,14 @@ async fn execute_action_dispatch(
                             {
                                 info!("execute_action: stable ref resolved {} -> {}", id, new_id);
                                 // Retry with the resolved ID
-                                let retry_payload = super::request::target_window_payload(
-                                    serde_json::json!({
-                                        "elementId": new_id,
-                                        "action": action_obj
-                                    }),
-                                    window_label,
-                                );
+                                // The same dispatched payload, re-addressed.
+                                let mut retry_payload = payload.clone();
+                                if let Some(obj) = retry_payload.as_object_mut() {
+                                    obj.insert(
+                                        "elementId".to_string(),
+                                        serde_json::Value::String(new_id.to_string()),
+                                    );
+                                }
                                 let retry_result = wrap_ipc_result(
                                     ui_bridge_request_sync(&state, "execute_action", retry_payload)
                                         .await,
