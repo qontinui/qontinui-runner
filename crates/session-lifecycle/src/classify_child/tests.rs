@@ -212,15 +212,40 @@ fn windows_a_direct_conhost_child_is_not_admitted() {
 
 #[test]
 fn a_chain_is_admitted_only_on_the_platform_it_was_measured_on() {
-    for (name, wrong) in [
-        ("linux-shim", Platform::Windows),
-        ("windows-shim-chain", Platform::Linux),
+    // Each fixture classified on a platform it was NOT measured on, with its
+    // command lines in that platform's own form, so no refusal is for an
+    // unreadable command line. The refusal named is the one that platform's
+    // rules actually give, and asserted as such.
+    for (name, wrong, refusal) in [
+        // The Linux python3 child runs through the Windows cmd chain's matcher.
+        (
+            "linux-shim",
+            Platform::Windows,
+            "python3 (1 member subtree) matches no measured chain: \
+             the subtree does not have four members",
+        ),
+        // On Linux `cmd.exe` is not the shell `cmd` (names are exact there), so
+        // the image rule does not settle it and the Linux matcher reads the
+        // four-member subtree.
+        (
+            "windows-shim-chain",
+            Platform::Linux,
+            "cmd.exe (4 member subtree) matches no measured chain: \
+             the subtree is not the shim alone",
+        ),
+        (
+            "linux-shim",
+            Platform::Other,
+            "no chain has been measured on this platform",
+        ),
+        (
+            "windows-shim-chain",
+            Platform::Other,
+            "no chain has been measured on this platform",
+        ),
     ] {
         let f = fixture(name);
         let t = table_of(&f.table);
-        // The fixture's command lines in the WRONG platform's own form, so the
-        // matcher runs and it is that platform's chain that refuses — not an
-        // unreadable command line.
         let argv: HashMap<u32, Argv> = f
             .table
             .iter()
@@ -239,8 +264,10 @@ fn a_chain_is_admitted_only_on_the_platform_it_was_measured_on() {
         let v = classify_session(wrong, f.claude_pid, &t, Some(&argv), &t);
         assert!(!v.admit, "{name} admitted on {wrong:?}: {v:?}");
         assert_eq!(v.classes(), "work=1", "{name} on {wrong:?}: {v:?}");
-        let v = classify_session(Platform::Other, f.claude_pid, &t, Some(&argv), &t);
-        assert!(!v.admit, "{name} admitted on Other");
+        assert_eq!(
+            v.children[0].reason, refusal,
+            "{name} on {wrong:?} was refused by another rule"
+        );
     }
 }
 
@@ -579,9 +606,19 @@ fn a_busy_tool_shell_is_work_not_unknown() {
     let fresh = busy_shell("cmd.exe", 3);
     let v = classify_child(Platform::Windows, 11, &first, Some(&none), &fresh);
     assert_eq!(v.class, ChildClass::Unknown, "windows cmd: {v:?}");
-    // Off Windows `cmd` is only a shell name.
+    // Off Windows `cmd` is only a shell name, matched exactly.
+    let first = busy_shell("cmd", 2);
+    let fresh = busy_shell("cmd", 3);
     let v = classify_child(Platform::Linux, 11, &first, Some(&none), &fresh);
     assert_eq!(v.class, ChildClass::Work, "linux cmd: {v:?}");
+    // ...so a Linux process named `BASH` or `bash.exe` is no shell name, and
+    // its changing subtree is read like any other child's: UNKNOWN.
+    for not_a_shell in ["BASH", "bash.exe"] {
+        let first = busy_shell(not_a_shell, 2);
+        let fresh = busy_shell(not_a_shell, 3);
+        let v = classify_child(Platform::Linux, 11, &first, Some(&none), &fresh);
+        assert_eq!(v.class, ChildClass::Unknown, "linux {not_a_shell}: {v:?}");
+    }
 }
 
 // --- the chain must match WHOLE ------------------------------------------------
@@ -929,6 +966,59 @@ fn a_linux_backslash_is_part_of_a_file_name_not_a_separator() {
         a[1] = "/home/x/qontinui-claude-config\\scripts/coord-mcp-shim.py".into();
     });
     assert_eq!(v.class, ChildClass::Work, "{v:?}");
+}
+
+#[test]
+fn image_names_follow_their_platforms_file_name_rules() {
+    let w = |s: &str| image_name(Platform::Windows, s);
+    assert_eq!(w(r"C:\Python\Python3.EXE"), "python3");
+    assert_eq!(w("/c/Windows/System32/cmd.exe"), "cmd");
+    assert_eq!(w(r"\??\C:\WINDOWS\system32\conhost.exe"), "conhost");
+    assert_eq!(w(" bash.exe "), "bash");
+    // Linux (and every non-Windows platform): the basename after the last `/`,
+    // exactly — no case folding, no `\` separator, no `.exe` stripping.
+    for p in [Platform::Linux, Platform::Other] {
+        let l = |s: &str| image_name(p, s);
+        assert_eq!(l("/usr/bin/python3"), "python3");
+        assert_eq!(l("python3"), "python3");
+        assert_eq!(l("/usr/bin/Python3"), "Python3");
+        assert_eq!(l("/usr/bin/python3.exe"), "python3.exe");
+        assert_eq!(l(r"/opt/py\python3"), r"py\python3");
+        assert_eq!(l(r"C:\x\python3.exe"), r"C:\x\python3.exe");
+        assert_eq!(l("next-server (v1"), "next-server (v1");
+    }
+}
+
+#[test]
+fn linux_names_are_exact_basenames_after_the_last_slash() {
+    // Each of these would read as `python3` under the Windows rules; on Linux
+    // none of them is a python interpreter name, so none is the shim.
+    for argv0 in [
+        "/usr/bin/Python3",
+        "/usr/bin/PYTHON3",
+        "/usr/bin/python3.exe",
+        r"/opt/py\python3",
+        r"C:\Python\python3",
+    ] {
+        let v = linux_shim_with_argv(|a| a[0] = argv0.to_string());
+        assert_eq!(v.class, ChildClass::Work, "{argv0}: {v:?}");
+        assert!(
+            v.reason.contains("argv[0] is not a python interpreter"),
+            "{argv0}: {}",
+            v.reason
+        );
+    }
+    for comm in ["Python3", "python3.exe"] {
+        let v = mutate_chain("linux-shim", |r| {
+            row_by_image(r, "python3").image = comm.to_string()
+        });
+        assert_eq!(v.class, ChildClass::Work, "{comm}: {v:?}");
+        assert!(
+            v.reason.contains("the image is not a python interpreter"),
+            "{comm}: {}",
+            v.reason
+        );
+    }
 }
 
 #[test]
