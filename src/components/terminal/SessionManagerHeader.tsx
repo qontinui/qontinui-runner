@@ -82,12 +82,12 @@ export function sessionManagerAccountFilterId(account: string): string {
  * registers exactly what this component registers.
  *
  * No `actions` override, for the reason `CommandBar.tsx`
- * `COMMAND_BAR_INPUT_ELEMENT` gives: the override used to add the `sendKeys`
- * that the pre-0.46 registry left off an `input`, and `@qontinui/ui-bridge`
- * 0.46's one verb table gives a text `<input>` `sendKeys`, `type`, `clear`,
- * `setValue` and `autocomplete` by itself — a superset of what the override
- * listed. Filtering the session list means typing into this box, with the
- * SDK's descriptor-array `sendKeys` contract.
+ * `COMMAND_BAR_INPUT_ELEMENT` gives: the override was written to add the
+ * `sendKeys` the registry of its day left off an `input`, and
+ * `@qontinui/ui-bridge` 0.46's one verb table gives a text `<input>`
+ * `sendKeys`, `type`, `clear`, `setValue` and `autocomplete` by itself — a
+ * superset of what the override listed. Filtering the session list means
+ * typing into this box, with the SDK's descriptor-array `sendKeys` contract.
  */
 export const SEARCH_INPUT_ELEMENT = {
   id: SESSION_MANAGER_HEADER_IDS.search,

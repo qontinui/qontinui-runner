@@ -18,7 +18,7 @@ import type {
 import { createLogger } from "@/lib/logger";
 
 const log = createLogger("useStateExploration");
-import { mapSdkElement } from "./utils";
+import { advertisesExplorationClick, EXPLORATION_VERB, mapSdkElement } from "./utils";
 import {
   generateFingerprints,
   extractFingerprintHashes,
@@ -372,12 +372,13 @@ export function useStateExploration(
        */
       const filterExplorable = (els: ExternalElement[]): ExternalElement[] => {
         return els.filter((el) => {
-          // Must be an interactive control. `is_interactive` is the SDK's own
-          // classification (`mapSdkElement` → `isInteractiveElementRow`), not
-          // "has actions": since `@qontinui/ui-bridge` 0.46 a media row
+          // Must be a control that advertises the verb the explorer sends.
+          // Not "has actions": since `@qontinui/ui-bridge` 0.46 a media row
           // advertises the every-element verbs too, and the explorer must not
-          // click every image on the page.
-          if (!el.is_interactive) return false;
+          // click every image on the page; and not `is_interactive`, which
+          // also counts a registration declaring `actions: []` that the
+          // runner's door would refuse.
+          if (!advertisesExplorationClick(el)) return false;
           // Must be visible and enabled
           if (!el.visible || !el.enabled) return false;
           // Skip global zones (header, footer, fixed areas)
@@ -439,7 +440,7 @@ export function useStateExploration(
 
         // Execute click — creates a capture with triggeredBy for transition tracking
         // and returns the post-action elements (avoids duplicate fetchLatestElements call)
-        currentElements = await executeExplorationAction(element.id, "click");
+        currentElements = await executeExplorationAction(element.id, EXPLORATION_VERB);
         const afterFingerprints = new Set(extractFingerprintHashes(currentElements));
 
         // Detect significant change: more than 30% of fingerprints changed
@@ -484,7 +485,7 @@ export function useStateExploration(
                 name.includes("close") ||
                 name.includes("cancel") ||
                 name.includes("return")) &&
-              el.is_interactive &&
+              advertisesExplorationClick(el) &&
               el.visible &&
               el.enabled
             );
@@ -494,7 +495,7 @@ export function useStateExploration(
             log.debug(
               `Attempting to navigate back via "${backElement.accessibleName || backElement.label || backElement.text || backElement.id}"`,
             );
-            currentElements = await executeExplorationAction(backElement.id, "click");
+            currentElements = await executeExplorationAction(backElement.id, EXPLORATION_VERB);
 
             // Check if we returned to baseline
             const returnedFingerprints = new Set(extractFingerprintHashes(currentElements));

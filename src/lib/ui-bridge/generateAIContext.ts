@@ -6,6 +6,7 @@
  */
 
 import type { ExternalElement } from "../../types/ui-bridge-types";
+import { isContentOrMediaRow } from "../../hooks/sdk-ui-bridge/utils";
 
 export interface AIContextOptions {
   /** Page title (optional) */
@@ -106,7 +107,7 @@ function isInteractive(element: ExternalElement): boolean {
   // `@qontinui/ui-bridge` 0.46 a media row carries the every-element verbs
   // (`click`, `sendKeys`, …), so the "has actions" arm below would list every
   // image. Same classification as the SDK's `interactive_only` filter.
-  if (element.category === "content" || element.category === "media") {
+  if (isContentOrMediaRow(element)) {
     return false;
   }
 

@@ -6923,46 +6923,16 @@ mod action_not_supported_tests {
         assert!(is_action_advertised("setValue", &None));
     }
 
-    /// The `actions` `@qontinui/ui-bridge` 0.46.0 serves for an
-    /// `<input type="text">` outside a form, in its canonical order:
-    /// `EVERY_ELEMENT` plus `structuralActions`' text-entry verbs (`type`,
-    /// `clear`, `setValue`, `autocomplete`), from `inferActions` in
-    /// `packages/ui-bridge/src/core/element-kind.ts` at ui-bridge `9f373a12`.
-    /// The runner frontend test `src/lib/ui-bridge/autoRegisterVerbs.dom.test.tsx`
-    /// asserts the SDK, mounted the way `App.tsx` mounts it, serves exactly
-    /// this list for an auto-registered text input — so this literal and the
-    /// live SDK cannot drift apart unnoticed.
-    const TEXT_INPUT_ACTIONS_0_46: &[&str] = &[
-        "click",
-        "hoverClick",
-        "doubleClick",
-        "rightClick",
-        "middleClick",
-        "type",
-        "sendKeys",
-        "clear",
-        "focus",
-        "blur",
-        "hover",
-        "unhover",
-        "scroll",
-        "scrollIntoView",
-        "setValue",
-        "drag",
-        "autocomplete",
-    ];
-
     #[test]
     fn a_0_46_text_input_passes_the_pre_ipc_gate_for_set_value() {
         // Plan 2026-11-09-an-elements-advertised-verbs-depend-on-which-path-found-it,
         // Phase 5's gate: before 0.46 an auto-registered `<input>` advertised
-        // no `setValue`, so this gate answered ACTION_NOT_SUPPORTED for it.
-        let supported = Some(
-            TEXT_INPUT_ACTIONS_0_46
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
-        );
+        // `focus, blur, type, clear, click` (measured on 0.38.0) — no
+        // `setValue`, no `sendKeys` — so this gate answered
+        // ACTION_NOT_SUPPORTED for them.
+        let supported = Some(crate::mcp::ui_bridge::element_kind::served_actions_0_46(
+            "autoRegisteredTextInput",
+        ));
         for verb in [
             "setValue",
             "sendKeys",
@@ -6981,11 +6951,21 @@ mod action_not_supported_tests {
 
     #[test]
     fn a_0_46_content_row_advertises_nothing_and_the_gate_refuses_every_verb() {
-        // `registerContentElement` and the executor's content find row keep
-        // `actions: []` in 0.46 — the one producer outside the verb table. The
-        // Rust gate reads an explicit empty list as refuse-all (only `None`,
-        // "we don't know", is permissive). See the PR's "Which runner gate
-        // governs `[]`" for why the frontend gate reads `[]` the other way.
+        // Which runner gate governs `[]`: two per-element gates read it
+        // oppositely. THIS one (`is_action_advertised`, pre-IPC in
+        // `execute_action_dispatch`, reading the `get_element` reply) treats
+        // `Some([])` as refuse-all and only `None` as permissive; the
+        // frontend's `isElementActionAllowed` (`useControlEvents.ts`, registered
+        // elements only) treats `[]` as permissive. `POST
+        // /control/element/{id}/action` passes this gate first, so here `[]`
+        // refuses every built-in verb; every other door that sends the
+        // `execute_action` IPC (the batch routes, action-plan,
+        // navigate-and-wait, the SDK route's IPC fallback, the Tauri command,
+        // GraphQL) meets only the frontend gate, where `[]` lets the SDK
+        // dispatcher decide. Since 0.46 `[]` is carried only by content rows
+        // (`registerContentElement`, the executor's content find row) and by
+        // registrations that declare it (the terminal proxy pane, which also
+        // registers custom actions, so neither gate sees an empty list there).
         let elem = json!({ "id": "heading-title", "category": "content", "actions": [] });
         let supported = extract_supported_actions(&elem);
         assert_eq!(supported, Some(vec![]));

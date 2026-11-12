@@ -8,7 +8,12 @@
 
 import { describe, expect, it } from "vitest";
 
-import { isContentOrMediaRow, isInteractiveElementRow, mapSdkElement } from "./utils";
+import {
+  advertisesExplorationClick,
+  isContentOrMediaRow,
+  isInteractiveElementRow,
+  mapSdkElement,
+} from "./utils";
 
 /** `EVERY_ELEMENT` at ui-bridge `9f373a12` — served on every kind, media included. */
 const EVERY_ELEMENT = [
@@ -71,5 +76,29 @@ describe("isInteractiveElementRow", () => {
   it("mapSdkElement carries the row's category", () => {
     expect(mapSdkElement({ id: "m", type: "image", category: "media" }).category).toBe("media");
     expect(mapSdkElement({ id: "x", type: "button", category: "bogus" }).category).toBeUndefined();
+  });
+});
+
+describe("advertisesExplorationClick", () => {
+  it("queues a control that advertises click", () => {
+    expect(
+      advertisesExplorationClick({
+        type: "button",
+        category: "interactive",
+        actions: EVERY_ELEMENT,
+      }),
+    ).toBe(true);
+  });
+
+  it("negative controls: a declared `actions: []` control and a media row are not queued", () => {
+    // The terminal proxy pane registers `type: "textarea", actions: []`: a
+    // control for display (`isInteractiveElementRow`), but the runner's door
+    // refuses a click on it.
+    const proxy = { type: "textarea", category: "interactive", actions: [] };
+    expect(isInteractiveElementRow(proxy)).toBe(true);
+    expect(advertisesExplorationClick(proxy)).toBe(false);
+    expect(
+      advertisesExplorationClick({ type: "image", category: "media", actions: EVERY_ELEMENT }),
+    ).toBe(false);
   });
 });

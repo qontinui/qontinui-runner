@@ -450,23 +450,15 @@ mod tests {
         items.iter().map(|s| s.to_string()).collect()
     }
 
-    /// The terminal command-bar input's advertised list
-    /// (`CommandBar.tsx` `COMMAND_BAR_INPUT_ACTIONS`, the SDK 0.38.0 inferred
-    /// input set).
-    const TERMINAL_INPUT_ACTIONS: &[&str] = &[
-        "focus",
-        "blur",
-        "hover",
-        "unhover",
-        "scroll",
-        "scrollIntoView",
-        "click",
-        "hoverClick",
-        "type",
-        "sendKeys",
-        "clear",
-        "setValue",
-    ];
+    /// The terminal command-bar input's advertised list: what
+    /// `@qontinui/ui-bridge` 0.46 serves for `CommandBar.tsx`'s registered
+    /// `<input role="combobox" aria-expanded>`, MEASURED by
+    /// `src/components/terminal/sessionAddressability.test.ts` against the real
+    /// SDK and read here from the same fixture
+    /// (`element_kind::served_actions_0_46`).
+    fn terminal_input_actions() -> Vec<String> {
+        crate::mcp::ui_bridge::element_kind::served_actions_0_46("commandBarInput")
+    }
 
     // ── table literals ────────────────────────────────────────────────────
 
@@ -519,9 +511,27 @@ mod tests {
 
     #[test]
     fn press_suggests_send_keys_when_accepted() {
-        let accepted = list(TERMINAL_INPUT_ACTIONS);
+        let accepted = terminal_input_actions();
         assert_eq!(
             suggest_action("press", &accepted, false).as_deref(),
+            Some("sendKeys")
+        );
+    }
+
+    #[test]
+    fn press_reads_the_0_46_served_lists() {
+        // With `@qontinui/ui-bridge` 0.46 every element advertises `sendKeys`
+        // AND `click`, so D4's ordering decides: a button (no text entry)
+        // gets `click`, the command-bar input (takes `type`) gets `sendKeys`.
+        let button =
+            crate::mcp::ui_bridge::element_kind::served_actions_0_46("autoRegisteredButton");
+        assert!(button.contains(&"sendKeys".to_string()));
+        assert_eq!(
+            suggest_action("press", &button, false).as_deref(),
+            Some("click")
+        );
+        assert_eq!(
+            suggest_action("press", &terminal_input_actions(), false).as_deref(),
             Some("sendKeys")
         );
     }
@@ -663,7 +673,7 @@ mod tests {
 
     #[test]
     fn case_only_fix() {
-        let accepted = list(TERMINAL_INPUT_ACTIONS);
+        let accepted = terminal_input_actions();
         assert_eq!(
             suggest_action("sendkeys", &accepted, false).as_deref(),
             Some("sendKeys")
@@ -683,7 +693,7 @@ mod tests {
 
     #[test]
     fn separator_only_fix() {
-        let accepted = list(TERMINAL_INPUT_ACTIONS);
+        let accepted = terminal_input_actions();
         assert_eq!(
             suggest_action("send_keys", &accepted, false).as_deref(),
             Some("sendKeys")
@@ -708,7 +718,7 @@ mod tests {
 
     #[test]
     fn table_lookup_ignores_separators() {
-        let accepted = list(TERMINAL_INPUT_ACTIONS);
+        let accepted = terminal_input_actions();
         for verb in ["key_press", "press_key", "key-down"] {
             assert_eq!(
                 suggest_action(verb, &accepted, false).as_deref(),
@@ -825,7 +835,7 @@ mod tests {
 
     #[test]
     fn pointer_leave_verbs_suggest_unhover_only_where_accepted() {
-        let accepted = list(TERMINAL_INPUT_ACTIONS);
+        let accepted = terminal_input_actions();
         for verb in ["mouseleave", "mouseLeave", "mouse_out", "mouseout"] {
             assert_eq!(
                 suggest_action(verb, &accepted, false).as_deref(),
@@ -843,7 +853,7 @@ mod tests {
 
     #[test]
     fn suggestion_is_always_an_accepted_verb() {
-        let accepted = list(TERMINAL_INPUT_ACTIONS);
+        let accepted = terminal_input_actions();
         for (from, _) in ACTION_VERB_SYNONYMS {
             if let Some(s) = suggest_action(from, &accepted, false) {
                 assert!(accepted.contains(&s), "'{from}' suggested unaccepted '{s}'");
@@ -990,7 +1000,7 @@ mod tests {
     fn no_hint_still_names_the_verb() {
         let suggestion = ActionSuggestion::resolve(
             "press",
-            &list(TERMINAL_INPUT_ACTIONS),
+            &terminal_input_actions(),
             Some(&json!({ "key": "c", "modifiers": "ctrl" })),
             false,
         )
@@ -1026,7 +1036,7 @@ mod tests {
 
     #[test]
     fn a_rejected_verb_never_appears_in_the_accepted_list() {
-        let advertised = list(TERMINAL_INPUT_ACTIONS);
+        let advertised = terminal_input_actions();
         for verb in ["press", "slap", "keydown", "rightclick", "fill"] {
             let err = deferred_unknown_action_error(
                 verb,
@@ -1187,7 +1197,7 @@ mod tests {
     fn press_on_terminal_input_400_body() {
         let element = json!({
             "id": "terminal.command-bar-input",
-            "actions": TERMINAL_INPUT_ACTIONS,
+            "actions": terminal_input_actions(),
         });
         let params = json!({ "key": "Enter" });
         let advertised = extract_supported_actions(&element);
@@ -1212,17 +1222,17 @@ mod tests {
         let ctx = &ed["context"];
         assert_eq!(ctx["action"], json!("press"));
         assert_eq!(ctx["elementId"], json!("terminal.command-bar-input"));
-        assert_eq!(ctx["supportedActions"], json!(TERMINAL_INPUT_ACTIONS));
+        assert_eq!(ctx["supportedActions"], json!(terminal_input_actions()));
         assert_eq!(ctx["didYouMean"], json!("sendKeys"));
         assert_eq!(ctx["paramsHint"], json!({ "keys": ["Enter"] }));
         assert_eq!(
             body["error"],
-            json!(
+            json!(format!(
                 "Unknown action 'press' for element 'terminal.command-bar-input'. \
-                 This element accepts: focus, blur, hover, unhover, scroll, scrollIntoView, \
-                 click, hoverClick, type, sendKeys, clear, setValue. Did you mean 'sendKeys'? \
-                 (params: {\"keys\":[\"Enter\"]})"
-            )
+                 This element accepts: {}. Did you mean 'sendKeys'? \
+                 (params: {{\"keys\":[\"Enter\"]}})",
+                terminal_input_actions().join(", ")
+            ))
         );
     }
 }

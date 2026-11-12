@@ -150,7 +150,9 @@ export function ActionExecutorView({
   const getAvailableActions = useCallback((): ActionConfig[] => {
     if (!element) return [];
 
-    // An element that advertises its verbs gets exactly the ones it advertises.
+    // An element that advertises its verbs is offered each verb this view has a
+    // control for (the COMMON / INPUT / CHECKBOX / SELECT configs above) that it
+    // advertises, and no other.
     // Since `@qontinui/ui-bridge` 0.46 every producer reads them from ONE table
     // that also reads the node's structure (`core/element-kind.ts`), so the list
     // is authoritative — a `<input role="combobox">` takes `type` AND `select`,

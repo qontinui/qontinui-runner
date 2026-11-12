@@ -32,8 +32,16 @@ export function isContentOrMediaRow(raw: ElementRowFields): boolean {
  * 0.46: every kind advertises the verbs every element takes (`click`,
  * `sendKeys`, `scroll`, …), a media row included because a canvas takes
  * keyboard input, so an `<img>` read as a control by its list. The Rust
- * readers (the exploration engine, the journey affordance index) classify the
- * same way — `src-tauri/src/mcp/ui_bridge/element_kind.rs`.
+ * readers (the exploration engine, the journey affordance index) exclude
+ * content and media rows by the same classification
+ * (`src-tauri/src/mcp/ui_bridge/element_kind.rs`) but have no
+ * `INTERACTIVE_ELEMENT_TYPES` arm: they read what a row advertises.
+ *
+ * This is the DISPLAY classification (the inspector, the AI context). A
+ * reader that is about to SEND a verb asks {@link advertisesExplorationClick}
+ * instead: a registration that declares `actions: []` is a control of its
+ * kind here, but the runner's element-action door refuses every built-in verb
+ * on it.
  */
 export function isInteractiveElementRow(raw: ElementRowFields): boolean {
   if (isContentOrMediaRow(raw)) return false;
@@ -41,6 +49,25 @@ export function isInteractiveElementRow(raw: ElementRowFields): boolean {
   return (
     (type !== undefined && INTERACTIVE_ELEMENT_TYPES.has(type)) ||
     (Array.isArray(raw.actions) && raw.actions.length > 0)
+  );
+}
+
+/** The verb the state explorer dispatches on every element it explores. */
+export const EXPLORATION_VERB = "click";
+
+/**
+ * Whether the state explorer may queue this row: a control (not a content or
+ * media row) that ADVERTISES the verb the explorer sends. The runner's
+ * element-action door refuses a verb an element does not advertise, so a row
+ * that advertises no `click` — a registration declaring `actions: []`, such as
+ * a terminal proxy pane — would only be refused. The Rust exploration engine
+ * applies the same rule (`exploration/engine.rs` `is_explorable_control`).
+ */
+export function advertisesExplorationClick(raw: ElementRowFields): boolean {
+  return (
+    !isContentOrMediaRow(raw) &&
+    Array.isArray(raw.actions) &&
+    raw.actions.includes(EXPLORATION_VERB)
   );
 }
 

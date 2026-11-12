@@ -128,18 +128,23 @@ export const COMMAND_BAR_INPUT_ID = "terminal.command-bar-input";
  * The command bar input's bridge registration. Exported so the regression test
  * registers exactly what this component registers.
  *
- * It carries NO `actions` override, deliberately. Before `@qontinui/ui-bridge`
- * 0.46 the registry inferred an `input`'s list as `focus, blur, hover, scroll,
+ * It carries NO `actions` override, deliberately. The override was written
+ * (plan `2026-07-19-session-titles-ansi-and-ui-bridge-friction`) when the SDK
+ * registry inferred an `input`'s list as `focus, blur, hover, scroll,
  * scrollIntoView, click, hoverClick, type, clear` — no `sendKeys` — and the
  * runner's pre-IPC gate (`is_action_advertised`, `mcp/ui_bridge/elements.rs`)
  * refuses any verb an element does not advertise, so driving the bar (type
- * `/resume`, press Enter) answered `ACTION_NOT_SUPPORTED`. This registration
- * used to restate that list with `sendKeys` added. 0.46 reads every producer's
- * verbs from ONE table (`core/element-kind.ts`): every kind takes `sendKeys`,
- * and this node's structure adds what it performs — a text `<input>` takes
- * `type`, `clear`, `setValue`, `autocomplete`; its `role="combobox"` takes
- * `select`; its `aria-expanded` takes `toggle`. That is a superset of the old
- * override, so the override would now only take verbs away.
+ * `/resume`, press Enter) answered `ACTION_NOT_SUPPORTED`. By 0.38 the
+ * registry's `input` row already carried `type, sendKeys, clear, setValue`;
+ * the list still missing `sendKeys` and `setValue` was the auto-register
+ * hook's own table, which served an auto-registered `<input>` just `focus,
+ * blur, type, clear, click`. `@qontinui/ui-bridge` 0.46 reads every
+ * producer's verbs from ONE table (`core/element-kind.ts`): every kind takes
+ * `sendKeys`, and this node's structure adds what it performs — a text
+ * `<input>` takes `type`, `clear`, `setValue`, `autocomplete`; its
+ * `role="combobox"` takes `select`; its `aria-expanded` takes `toggle`. That
+ * is a superset of the old override, so the override would now only take
+ * verbs away.
  *
  * `sendKeys` here stays the SDK's built-in (`keys: [{key, modifiers?}]`), not a
  * `customActions` entry: a registered custom action WINS over a same-named
